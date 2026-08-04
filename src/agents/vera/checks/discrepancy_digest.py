@@ -420,6 +420,7 @@ def run_discrepancy_digest() -> int:
     subject, body, html_body = render_digest_report(digest, discrepancies, unchecked)
 
     from src.services.email import send_alert
+    from src.services.vera_slack import post_vera_report
 
     recipients = report_recipients()
     if not recipients:
@@ -429,6 +430,8 @@ def run_discrepancy_digest() -> int:
             send_alert(subject, body, html_body=html_body, to=addr)
         except Exception as exc:
             logger.warning("[Vera] failed to send promise digest to %s: %s", addr, exc)
+
+    post_vera_report(subject, body)
 
     logger.info(
         "[Vera] promise digest complete: discrepancies=%d open_promises=%d overdue=%d",

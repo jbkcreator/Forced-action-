@@ -12,10 +12,16 @@ Secondary helpers (backwards compat):
 
 Config is stored in the `counties` + `county_sources` DB tables (admin-managed).
 Cache TTL is 5 minutes so live admin edits propagate without a restart.
+
+Since CLONE-v2.2 / CL3 each county belongs to a venture (counties.venture_key)
+and inherits its `state` and bankruptcy court from that venture's row rather
+than from Florida-shaped literals in this module — see
+src/utils/venture_config.py.
 """
 
 import logging
 import time
+from contextlib import contextmanager
 from typing import Any
 from urllib.parse import urlparse
 
@@ -35,12 +41,31 @@ def _origin(url: str) -> str:
     return f"{p.scheme}://{p.netloc}" if p.scheme and p.netloc else ""
 
 
-def _load_from_db(county_id: str) -> dict:
-    """Query DB and return the full config dict for county_id."""
-    from src.core.database import get_db_context
-    from src.core.models import County, CountySource
+@contextmanager
+def _session_scope(session):
+    """Yield `session` if the caller supplied one, otherwise check out a new
+    one and close it on the way out."""
+    if session is not None:
+        yield session
+        return
 
-    with get_db_context() as session:
+    from src.core.database import get_db_context
+
+    with get_db_context() as own_session:
+        yield own_session
+
+
+def _load_from_db(county_id: str, session=None) -> dict:
+    """Query DB and return the full config dict for county_id.
+
+    Pass `session` to read on an already-open session instead of checking out
+    a new one — used by callers that are mid-transaction, and by tests, so a
+    county can be resolved without committing it first.
+    """
+    from src.core.models import County, CountySource
+    from src.utils.venture_config import get_venture_config
+
+    with _session_scope(session) as session:
         county = (
             session.query(County)
             .filter_by(county_id=county_id, is_active=True)
@@ -80,10 +105,24 @@ def _load_from_db(county_id: str) -> dict:
             if src.is_active
         }
 
+        # Venture this county belongs to (CLONE-v2.2 / CL3). Supplies the
+        # state and bankruptcy court that used to be hardcoded to Florida
+        # below. Resolved on the open session so this doesn't check out a
+        # second connection, and separately cached for 5 minutes of its own.
+        venture = get_venture_config(county.venture_key, session=session)
+
         # Derive commonly-needed URLs from sources so scrapers don't have to
         _court_url   = sources.get("court_records", {}).get("url", "")
         _clerk_base  = _origin(_court_url)
         _tax_base    = _origin(sources.get("tax_delinquency", {}).get("url", ""))
+
+        # An explicit `probate` source wins over the derived path: the
+        # {clerk_base}/Probate/dailyfilings/ layout is the Hillsborough
+        # clerk's, and a county on a different clerk platform needs to
+        # configure its own URL rather than inherit that shape.
+        _probate_url = sources.get("probate", {}).get("url", "") or (
+            f"{_clerk_base}/Probate/dailyfilings/" if _clerk_base else ""
+        )
 
         # Backwards-compat "urls" sub-dict (mirrors config.constants shape)
         urls: dict[str, str] = {
@@ -91,7 +130,7 @@ def _load_from_db(county_id: str) -> dict:
             "permit":       sources.get("permits",         {}).get("url", ""),
             "violation":    sources.get("violations",      {}).get("url", ""),
             "civil":        _court_url,
-            "probate":      f"{_clerk_base}/Probate/dailyfilings/" if _clerk_base else "",
+            "probate":      _probate_url,
             "clerk_base":   _clerk_base,
             "clerk_access": sources.get("liens",           {}).get("url", ""),
             "tax":          sources.get("tax_delinquency", {}).get("url", ""),
@@ -109,8 +148,12 @@ def _load_from_db(county_id: str) -> dict:
             # nws_zone may be comma-separated (e.g. "FLZ151,FLZ251") for
             # counties that span multiple NWS forecast zones.
             "nws_zones":           [z.strip() for z in county.nws_zone.split(",")] if county.nws_zone else [],
-            "state":               "FL",
-            "zip_prefixes":        [],
+            # Venture-derived, not hardcoded to Florida since CL3. `state` is
+            # read by the flood/insurance/storm scrapers for NWS + FEMA
+            # lookups; `court` by bankruptcy_engine.
+            "venture_key":         county.venture_key,
+            "state":               venture.state,
+            "zip_prefixes":        county.zip_prefixes or [],
             "parcel_id_format":    county.parcel_id_format or "folio",
             "bankruptcy_division": county.bankruptcy_division,
             "city_filer_keywords": county.city_filer_keywords or [],
@@ -119,8 +162,8 @@ def _load_from_db(county_id: str) -> dict:
             "file_prefix":         county.county_id,
             # court sub-dict expected by bankruptcy_engine
             "court": {
-                "bankruptcy_code":  "flmb",
-                "division_prefix":  county.bankruptcy_division or "8:",
+                "bankruptcy_code":  venture.bankruptcy_court_code,
+                "division_prefix":  county.bankruptcy_division or venture.default_bankruptcy_division,
             },
             "sources": sources,
             "urls":    urls,

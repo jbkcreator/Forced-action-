@@ -193,6 +193,16 @@ def render_weekly_html(report: dict) -> str:
     t = report["tiers"]
     vb = report.get("vertical_breakdown", {})
     total_vb = vb.pop("_total", 0) if "_total" in vb else sum(d["count"] for d in vb.values())
+    signup_rows = ""
+    for row in report.get("signup_source_breakdown", []):
+        rate = f"{row['paid_conversion_rate']:.1f}%" if row["paid_conversion_rate"] is not None else "--"
+        signup_rows += f"""<tr>
+            {_td(row['signup_source'], 'left')}
+            {_td(f"{row['free_signups']:,}")}
+            {_td(f"{row['paid_conversions']:,}")}
+            {_td(rate)}
+        </tr>"""
+    dropoff = report.get("activation_dropoff", {})
 
     gold_total = t.get("Ultra Platinum", 0) + t.get("Platinum", 0) + t.get("Gold", 0)
 
@@ -291,6 +301,22 @@ def render_weekly_html(report: dict) -> str:
         <table style="width:100%;border-collapse:collapse;">
             <tr>{_th('Source', 'left')}{_th('Scraped')}{_th('Matched')}{_th('Runs')}</tr>
             {scraper_rows}
+        </table>
+
+        <h2 style="color:#fbbf24;font-size:15px;margin:20px 0 8px;border-bottom:1px solid #2a2a3a;padding-bottom:6px;">Signup Source Breakdown (Trailing 30 Days)</h2>
+        <table style="width:100%;border-collapse:collapse;">
+            <tr>{_th('Signup Source', 'left')}{_th('Free Signups')}{_th('Paid Conversions')}{_th('Paid Conversion Rate')}</tr>
+            {signup_rows}
+        </table>
+
+        <h2 style="color:#fbbf24;font-size:15px;margin:20px 0 8px;border-bottom:1px solid #2a2a3a;padding-bottom:6px;">Paid Onboarding Funnel (Trailing 30 Days)</h2>
+        <table style="width:100%;border-collapse:collapse;">
+            <tr>{_th('Checkpoint', 'left')}{_th('Count')}</tr>
+            <tr>{_td('Paid signups', 'left')}{_td(f"{dropoff.get('paid_signups', 0):,}")}</tr>
+            <tr>{_td('Welcome email sent', 'left')}{_td(f"{dropoff.get('welcome_email_sent', 0):,}")}</tr>
+            <tr>{_td('Magic link redeemed', 'left')}{_td(f"{dropoff.get('magic_link_redeemed', 0):,}")}</tr>
+            <tr>{_td('Onboarding completed', 'left')}{_td(f"{dropoff.get('onboarding_completed', 0):,}")}</tr>
+            <tr>{_td('First unlock', 'left')}{_td(f"{dropoff.get('first_unlock', 0):,}")}</tr>
         </table>
 
         {alerts_html}

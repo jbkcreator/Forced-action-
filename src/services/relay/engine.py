@@ -28,12 +28,11 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from config.settings import get_settings
 from src.services.relay import guards, queue
 from src.services.relay.channels import DISPATCHERS
-from src.services.relay.config import KILL_SWITCH_FEATURE
 from src.services.relay.queue import QueueItem
 from src.services.kill_switch_service import get_kill_switch_status
+from src.utils.venture_config import get_venture_config
 
 logger = logging.getLogger(__name__)
 
@@ -48,20 +47,27 @@ class BatchResult:
     processed_ids: list[int] = field(default_factory=list)
 
 
-def _kill_switch_is_red() -> bool:
-    status = get_kill_switch_status(KILL_SWITCH_FEATURE)
+def _kill_switch_is_red(feature: str) -> bool:
+    status = get_kill_switch_status(feature)
     return status.get("color") == "red"
 
 
-def execute_batch(items: list[QueueItem], *, batch_id: str, now: datetime | None = None) -> BatchResult:
+def execute_batch(
+    items: list[QueueItem],
+    *,
+    batch_id: str,
+    now: datetime | None = None,
+    venture=None,
+) -> BatchResult:
     """Execute a batch of already-approved queue rows deterministically.
 
     Each item must already be status='approved' (the caller — the cron
     sweep — is responsible for selecting only approved rows). For every
     item, in order:
-      1. Re-check the relay_global kill switch; on red, stop immediately.
-         Undispatched items are left untouched (still 'approved',
-         unclaimed) so the next sweep tick safely resumes them.
+      1. Re-check the venture's kill switch (relay_global unless the venture
+         opts into its own key); on red, stop immediately. Undispatched
+         items are left untouched (still 'approved', unclaimed) so the next
+         sweep tick safely resumes them.
       2. Run guards.evaluate() — send window, execution-time suppression
          recheck. DEFER leaves the row untouched (still 'approved',
          unclaimed) for a later sweep; BLOCK marks it 'skipped', terminal.
@@ -84,32 +90,40 @@ def execute_batch(items: list[QueueItem], *, batch_id: str, now: datetime | None
     `now` defaults to the real clock; tests inject a fixed value so guard
     behavior (and every pre-R3 test unrelated to guards) doesn't depend on
     what time of day the suite happens to run.
+
+    `venture` is the resolved VentureConfig governing this batch (CLONE-v2.2
+    / CL3) — it supplies the kill-switch key, send window and daily ceiling.
+    Omitted, venture #1 is resolved, which reads the same values Relay used
+    before CL3. A batch must be homogeneous: the caller (sweep.run_sweep)
+    selects rows for one venture and passes that venture's config.
     """
     result = BatchResult()
 
-    if _kill_switch_is_red():
+    venture = venture if venture is not None else get_venture_config()
+    kill_switch_feature = venture.kill_switch_feature
+
+    if _kill_switch_is_red(kill_switch_feature):
         logger.warning(
             "[Relay] kill switch RED at batch preflight (feature=%s) — "
-            "executing zero items", KILL_SWITCH_FEATURE,
+            "executing zero items", kill_switch_feature,
         )
         result.halted = True
         return result
 
     now = now if now is not None else datetime.now(timezone.utc)
-    settings = get_settings()
 
     for item in items:
-        if _kill_switch_is_red():
+        if _kill_switch_is_red(kill_switch_feature):
             remaining = len(items) - len(result.processed_ids)
             logger.warning(
                 "[Relay] kill switch RED mid-batch (feature=%s) — halting; "
                 "%d/%d items left unclaimed for the next sweep",
-                KILL_SWITCH_FEATURE, remaining, len(items),
+                kill_switch_feature, remaining, len(items),
             )
             result.halted = True
             break
 
-        verdict = guards.evaluate(item, now=now)
+        verdict = guards.evaluate(item, now=now, venture=venture)
         if verdict.outcome == guards.DEFER:
             logger.info("[Relay] item %d deferred: %s", item.id, verdict.reason)
             result.deferred += 1
@@ -121,7 +135,7 @@ def execute_batch(items: list[QueueItem], *, batch_id: str, now: datetime | None
             result.processed_ids.append(item.id)
             continue
 
-        if not guards.reserve_daily_slot(item.channel, now, settings):
+        if not guards.reserve_daily_slot(item.channel, now, venture):
             logger.info(
                 "[Relay] item %d deferred: daily ceiling reached (or Redis unavailable) for channel %s",
                 item.id, item.channel,
@@ -134,14 +148,14 @@ def execute_batch(items: list[QueueItem], *, batch_id: str, now: datetime | None
                 "[Relay] item %d already claimed/moved — leaving untouched for its owner (idempotency)",
                 item.id,
             )
-            guards.release_daily_slot(item.channel, now, settings)
+            guards.release_daily_slot(item.channel, now, venture)
             result.skipped += 1
             result.processed_ids.append(item.id)
             continue
 
         dispatcher = DISPATCHERS.get(item.channel)
         if dispatcher is None:
-            guards.release_daily_slot(item.channel, now, settings)
+            guards.release_daily_slot(item.channel, now, venture)
             queue.mark_failed(item.id, f"unknown_channel:{item.channel}", batch_id=batch_id)
             logger.error(
                 "[Relay] item %d has unknown channel %r — marked failed",
@@ -154,7 +168,7 @@ def execute_batch(items: list[QueueItem], *, batch_id: str, now: datetime | None
         try:
             dispatcher(item)
         except Exception as exc:
-            guards.release_daily_slot(item.channel, now, settings)
+            guards.release_daily_slot(item.channel, now, venture)
             queue.mark_failed(item.id, str(exc), batch_id=batch_id)
             logger.error(
                 "[Relay] item %d dispatch failed on channel %r: %s",

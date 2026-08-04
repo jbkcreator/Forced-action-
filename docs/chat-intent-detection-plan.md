@@ -15,7 +15,7 @@ Backend (`concierge_chat.py`) is not modified.
    `WalletTopupModal` (`src/components/dashboard/WalletTopupModal.jsx`) and
    `POST /api/wallet/topup` (PaymentIntent, not Checkout redirect).
 4. **Annual trigger — both modes**, injects an inline assistant message with
-   a `mailto:support@forcedaction.ai` link. No Stripe.
+   a `mailto:support@forcedactionleads.com` link. No Stripe.
 
 ### Effective v1 trigger map
 
@@ -82,7 +82,7 @@ const submit = (text) => {
   } else if (intent?.kind === 'annual') {
     onInjectAssistantMessage(
       "Annual pricing depends on your tier and ZIP count — " +
-      "email [support@forcedaction.ai](mailto:support@forcedaction.ai) " +
+      "email [support@forcedactionleads.com](mailto:support@forcedactionleads.com) " +
       "and they'll set it up."
     );
     // Skip onSend — injected message stands in for the bot reply

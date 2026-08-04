@@ -25,6 +25,28 @@ from config.settings import get_settings
 logger = logging.getLogger(__name__)
 
 
+def _create_message_outcome(db, *, to: str, tracking: dict):
+    from datetime import datetime, timezone
+    from src.core.models import MessageOutcome
+
+    outcome = MessageOutcome(
+        subscriber_id=tracking.get("subscriber_id"),
+        message_type="email",
+        template_id=tracking.get("template_id"),
+        channel=tracking.get("channel") or "mandrill",
+        recipient_email=to.strip().lower(),
+        sent_at=datetime.now(timezone.utc),
+        # Pre-send row; flips to 'sent' on SMTP accept, 'failed' on error.
+        # Must be a value allowed by the check_mo_send_status constraint
+        # ('pending' is NOT allowed — see apply_fa060).
+        send_status="scheduled",
+        context_snapshot=tracking.get("context_snapshot"),
+    )
+    db.add(outcome)
+    db.flush()
+    return outcome
+
+
 def send_email(
     to: str,
     subject: str,
@@ -33,6 +55,8 @@ def send_email(
     attachments: Optional[List[Union[str, Path]]] = None,
     cc: Optional[List[str]] = None,
     list_unsubscribe_url: Optional[str] = None,
+    headers: Optional[dict[str, str]] = None,
+    tracking: Optional[dict] = None,
     db=None,
 ) -> bool:
     """
@@ -80,6 +104,20 @@ def send_email(
 
     from_addr = settings.email_from or settings.smtp_user
     password = settings.smtp_pass.get_secret_value()
+
+    # Attribution: create the MessageOutcome BEFORE sending so its id can ride
+    # along as Mandrill metadata (X-MC-Metadata). The webhook resolves events
+    # back to this exact send by that id — never by "latest email for
+    # recipient", which mis-attributes out-of-order bounce callbacks.
+    outcome = None
+    if tracking is not None and db is not None:
+        try:
+            from src.services.transactional_email_tracking import _email_tracking_columns_ready
+            if _email_tracking_columns_ready(db):
+                outcome = _create_message_outcome(db, to=to, tracking=tracking)
+        except Exception as exc:
+            logger.warning("Could not create MessageOutcome for %s: %s", to, exc)
+            outcome = None
 
     try:
         # Use mixed multipart whenever attachments are present; alternative
@@ -130,16 +168,34 @@ def send_email(
             # instead of rewriting To: per-recipient (default ESP behaviour).
             msg["X-MC-PreserveRecipients"] = "true"
 
+        # Mandrill echoes X-MC-Metadata back on every webhook event as
+        # msg.metadata — this is how a bounce/open/click is matched to the
+        # exact send that produced it.
+        if outcome is not None:
+            import json as _json
+            msg["X-MC-Metadata"] = _json.dumps({"message_outcome_id": outcome.id})
+
         all_recipients = [to] + (cc or [])
         with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=10) as server:
             server.starttls()
             server.login(settings.smtp_user, password)
             server.sendmail(from_addr, all_recipients, msg.as_string())
 
+        if outcome is not None:
+            outcome.send_status = "sent"
+            db.flush()
+
         logger.info("Email sent → %s cc=%s | %s", to, cc or [], subject)
         return True
 
     except Exception as exc:
+        if outcome is not None:
+            try:
+                outcome.send_status = "failed"
+                outcome.failure_reason = "smtp_send_error"
+                db.flush()
+            except Exception:
+                pass
         logger.error("Failed to send email to %s (%s): %s", to, subject, exc)
         # Fire ops alert — but only if this isn't already an alert email (avoid loops)
         if settings.alert_email and to != settings.alert_email:
@@ -207,7 +263,7 @@ def send_alert(
     return sent
 
 
-def send_welcome_email(subscriber, magic_link_url: Optional[str] = None) -> None:
+def send_welcome_email(subscriber, magic_link_url: Optional[str] = None, db=None) -> bool:
     """
     Send the dashboard-link welcome email for any new subscriber (free or paid).
 
@@ -221,9 +277,14 @@ def send_welcome_email(subscriber, magic_link_url: Optional[str] = None) -> None
     route.
 
     Non-blocking — caller must wrap in try/except if needed.
+
+    Returns True only if the email was actually accepted by SMTP. Callers MUST
+    gate stamp_welcome_email_sent() on this — stamping unconditionally marks a
+    welcome email "sent" even when SMTP was down or the recipient suppressed,
+    which then pages ops to chase a subscriber who never got a login link.
     """
     if not subscriber.email:
-        return
+        return False
 
     _settings = get_settings()
 
@@ -267,7 +328,7 @@ def send_welcome_email(subscriber, magic_link_url: Optional[str] = None) -> None
         f"{magic_link_note_text}"
         f"New distressed property leads matching your territory and vertical will appear "
         f"here automatically as our scrapers run each day.\n\n"
-        f"Questions? Reply to this email or reach us at support@forcedaction.io\n\n"
+        f"Questions? Reply to this email or reach us at support@forcedactionleads.com\n\n"
         f"— Forced Action Team"
     )
 
@@ -330,8 +391,8 @@ def send_welcome_email(subscriber, magic_link_url: Optional[str] = None) -> None
             {magic_link_note_html}
             <p style="margin:0;font-size:13px;color:#64748b;">
               Questions? Reply to this email or reach us at
-              <a href="mailto:support@forcedaction.io" style="color:#fbbf24;text-decoration:none;">
-                support@forcedaction.io
+              <a href="mailto:support@forcedactionleads.com" style="color:#fbbf24;text-decoration:none;">
+                support@forcedactionleads.com
               </a>
             </p>
           </td>
@@ -340,7 +401,7 @@ def send_welcome_email(subscriber, magic_link_url: Optional[str] = None) -> None
           <td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.08);
                      font-size:12px;color:#475569;text-align:center;">
             Forced Action &mdash; Hillsborough County Property Intelligence<br/>
-            <a href="{_settings.app_base_url}" style="color:#475569;">forcedaction.io</a>
+            <a href="{_settings.app_base_url}" style="color:#475569;">forcedactionleads.com</a>
           </td>
         </tr>
       </table>
@@ -349,16 +410,32 @@ def send_welcome_email(subscriber, magic_link_url: Optional[str] = None) -> None
 </body>
 </html>"""
 
-    send_email(
+    sent = send_email(
         to=subscriber.email,
         subject=subject,
         body_text=body_text,
         body_html=body_html,
+        tracking={
+            "subscriber_id": subscriber.id,
+            "template_id": "welcome_email",
+            "channel": "mandrill",
+            "context_snapshot": {
+                "magic_link_included": bool(magic_link_url),
+                "tier": subscriber.tier,
+                "vertical": subscriber.vertical,
+                "founding_member": bool(subscriber.founding_member),
+            },
+        },
+        db=db,
     )
-    logger.info("Welcome email sent → %s (subscriber=%s)", subscriber.email, subscriber.id)
+    if sent:
+        logger.info("Welcome email sent → %s (subscriber=%s)", subscriber.email, subscriber.id)
+    else:
+        logger.warning("Welcome email NOT sent → %s (subscriber=%s)", subscriber.email, subscriber.id)
+    return sent
 
 
-def send_upgrade_confirmation_email(subscriber) -> None:
+def send_upgrade_confirmation_email(subscriber, db=None) -> bool:
     """
     Confirm a plan upgrade for a subscriber who already has dashboard access
     (e.g. a free-tier subscriber upgrading from their own dashboard).
@@ -374,7 +451,7 @@ def send_upgrade_confirmation_email(subscriber) -> None:
     Non-blocking — caller must wrap in try/except if needed.
     """
     if not subscriber.email:
-        return
+        return False
 
     _settings = get_settings()
 
@@ -401,7 +478,7 @@ def send_upgrade_confirmation_email(subscriber) -> None:
         f"{founding_line}\n"
         f"Your new territory is locked and new leads will start appearing in your feed:\n"
         f"{feed_url}\n\n"
-        f"Questions? Reply to this email or reach us at support@forcedaction.io\n\n"
+        f"Questions? Reply to this email or reach us at support@forcedactionleads.com\n\n"
         f"— Forced Action Team"
     )
 
@@ -455,8 +532,8 @@ def send_upgrade_confirmation_email(subscriber) -> None:
             </table>
             <p style="margin:0;font-size:13px;color:#64748b;">
               Questions? Reply to this email or reach us at
-              <a href="mailto:support@forcedaction.io" style="color:#fbbf24;text-decoration:none;">
-                support@forcedaction.io
+              <a href="mailto:support@forcedactionleads.com" style="color:#fbbf24;text-decoration:none;">
+                support@forcedactionleads.com
               </a>
             </p>
           </td>
@@ -465,7 +542,7 @@ def send_upgrade_confirmation_email(subscriber) -> None:
           <td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.08);
                      font-size:12px;color:#475569;text-align:center;">
             Forced Action &mdash; Hillsborough County Property Intelligence<br/>
-            <a href="{_settings.app_base_url}" style="color:#475569;">forcedaction.io</a>
+            <a href="{_settings.app_base_url}" style="color:#475569;">forcedactionleads.com</a>
           </td>
         </tr>
       </table>
@@ -474,10 +551,25 @@ def send_upgrade_confirmation_email(subscriber) -> None:
 </body>
 </html>"""
 
-    send_email(
+    sent = send_email(
         to=subscriber.email,
         subject=subject,
         body_text=body_text,
         body_html=body_html,
+        tracking={
+            "subscriber_id": subscriber.id,
+            "template_id": "upgrade_confirmation_email",
+            "channel": "mandrill",
+            "context_snapshot": {
+                "tier": subscriber.tier,
+                "vertical": subscriber.vertical,
+                "founding_member": bool(subscriber.founding_member),
+            },
+        },
+        db=db,
     )
-    logger.info("Upgrade confirmation email sent → %s (subscriber=%s)", subscriber.email, subscriber.id)
+    if sent:
+        logger.info("Upgrade confirmation email sent → %s (subscriber=%s)", subscriber.email, subscriber.id)
+    else:
+        logger.warning("Upgrade confirmation email NOT sent → %s (subscriber=%s)", subscriber.email, subscriber.id)
+    return sent

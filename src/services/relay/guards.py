@@ -25,6 +25,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from config.settings import get_settings
+from config.venture_template import DEFAULT_VENTURE_KEY
 from src.core.database import get_db_context
 from src.core.redis_client import rdecr, rincr
 from src.services.compliance_gator import validate_outbound
@@ -69,8 +70,11 @@ def _suppression_reason(item: QueueItem) -> str | None:
     return None   # 'noop' and any future non-contact channel
 
 
-def evaluate(item: QueueItem, *, now: datetime) -> Verdict:
-    settings = get_settings()
+def evaluate(item: QueueItem, *, now: datetime, venture=None) -> Verdict:
+    """`venture` is the resolved VentureConfig for the batch (CLONE-v2.2 /
+    CL3) — its send window governs the check. Omitted, the check falls back
+    to config/settings.py, which is where the window lived before CL3."""
+    settings = venture if venture is not None else get_settings()
 
     if not _within_send_window(now, settings):
         return Verdict(DEFER, REASON_OUTSIDE_SEND_WINDOW)
@@ -83,8 +87,20 @@ def evaluate(item: QueueItem, *, now: datetime) -> Verdict:
 
 
 def _daily_slot_key(channel: str, now: datetime, settings) -> str:
+    """Redis key holding today's send count for one (venture, channel).
+
+    Scoped by venture (CLONE-v2.2 / CL3) because the ceiling is a per-sender
+    reputation limit, not a platform-wide one: two ventures sending from two
+    different addresses each get their own cap, and without the venture in
+    the key they would silently share one.
+
+    `settings` may be a VentureConfig (what Relay passes) or a plain settings
+    object (any pre-CL3 caller), hence the getattr — a settings object has no
+    venture_key and belongs to venture #1 by definition.
+    """
+    venture_key = getattr(settings, "venture_key", DEFAULT_VENTURE_KEY)
     local_date = now.astimezone(ZoneInfo(settings.relay_send_window_timezone)).date()
-    return f"relay_daily_sent:{channel}:{local_date.isoformat()}"
+    return f"relay_daily_sent:{venture_key}:{channel}:{local_date.isoformat()}"
 
 
 def reserve_daily_slot(channel: str, now: datetime, settings) -> bool:

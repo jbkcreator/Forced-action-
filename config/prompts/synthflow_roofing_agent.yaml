@@ -27,7 +27,7 @@ voicemail_action: "leave_message"  # use voicemail_script below
 
 # ── Webhook (post-call) ───────────────────────────────────────
 webhook:
-  url: "https://YOUR_DOMAIN/webhooks/synthflow"
+  url: "https://forcedactionleads.com/webhooks/synthflow"
   method: POST
   # Synthflow will POST: call_id, to, call_status, duration, recording_url
   # Plus any variables set by the agent during the call (outcome, zip_code, etc.)
@@ -40,7 +40,7 @@ tools:
       for the roofing vertical. Call this BEFORE delivering the bridge line
       so [X] is accurate.
     method: GET
-    url: "https://YOUR_DOMAIN/api/synthflow/lead-count"
+    url: "https://forcedactionleads.com/api/synthflow/lead-count"
     parameters:
       zip_code:
         type: string
@@ -64,8 +64,9 @@ variables:
 # ── First message (spoken immediately when prospect picks up) ──
 first_message: >
   Hi, is this {{prospect_name}}? Great — my name is Alex, I'm calling from
-  Forced Action. I have something quick that might be worth 30 seconds of
-  your time if you're a roofing contractor in Tampa. Is now okay?
+  Forced Action, and this call may be recorded. I have something quick that
+  might be worth 30 seconds of your time if you're a roofing contractor in
+  Tampa. Is now okay?
 
 # ── System prompt ─────────────────────────────────────────────
 # Paste this entire block into the "System Prompt" field in Finetuner.ai.

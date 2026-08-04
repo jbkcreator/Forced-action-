@@ -1159,7 +1159,7 @@ def _checkout_completed_deferred(db: Session, subscriber, session: dict, is_new_
             # the plan change.
             try:
                 from src.services.email import send_upgrade_confirmation_email
-                send_upgrade_confirmation_email(subscriber)
+                send_upgrade_confirmation_email(subscriber, db=db)
             except Exception:
                 logger.error(
                     "Upgrade confirmation email failed for subscriber %s", subscriber.id, exc_info=True,
@@ -1167,13 +1167,14 @@ def _checkout_completed_deferred(db: Session, subscriber, session: dict, is_new_
         elif subscriber.email:
             from src.services.email import send_welcome_email
             from src.services import subscriber_auth
+            from src.services.activation_tracking import stamp_welcome_email_sent
             # Magic-link login — issue a fresh one-time link for the welcome
             # email. No password is ever generated or emailed.
             magic_url = None
             try:
-                with db.begin_nested():
-                    raw = subscriber_auth.issue_magic_link(subscriber, db)
-                magic_url = subscriber_auth.magic_link_url(raw)
+                magic_url = subscriber_auth.issue_magic_link_url_with_retry(
+                    subscriber, db, context="paid_checkout_welcome"
+                )
             except Exception:
                 magic_url = None
                 logger.warning(
@@ -1181,7 +1182,10 @@ def _checkout_completed_deferred(db: Session, subscriber, session: dict, is_new_
                     subscriber.id, exc_info=True,
                 )
             try:
-                send_welcome_email(subscriber, magic_link_url=magic_url)
+                if send_welcome_email(subscriber, magic_link_url=magic_url, db=db):
+                    stamp_welcome_email_sent(subscriber.id, db)
+                else:
+                    logger.warning("Welcome email not sent for subscriber %s — not stamping welcome_email_sent", subscriber.id)
             except Exception:
                 logger.error("Welcome email failed for subscriber %s", subscriber.id, exc_info=True)
 
@@ -1742,8 +1746,8 @@ def _on_payment_succeeded(invoice: dict, db: Session) -> None:
 
             <p style="margin:0;font-size:13px;color:#64748b;">
               Questions? Reply to this email or reach us at
-              <a href="mailto:support@forcedaction.io" style="color:#fbbf24;text-decoration:none;">
-                support@forcedaction.io
+              <a href="mailto:support@forcedactionleads.com" style="color:#fbbf24;text-decoration:none;">
+                support@forcedactionleads.com
               </a>
             </p>
           </td>
@@ -1754,7 +1758,7 @@ def _on_payment_succeeded(invoice: dict, db: Session) -> None:
           <td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.08);
                      font-size:12px;color:#475569;text-align:center;">
             Forced Action &mdash; Hillsborough County Property Intelligence<br/>
-            <a href="{settings.app_base_url}" style="color:#475569;">forcedaction.io</a>
+            <a href="{settings.app_base_url}" style="color:#475569;">forcedactionleads.com</a>
           </td>
         </tr>
 
@@ -1773,7 +1777,7 @@ def _on_payment_succeeded(invoice: dict, db: Session) -> None:
                 f"Plan: {subscriber.tier.title()} / {subscriber.vertical.title()}\n"
                 f"Next billing date: {billing_str}\n\n"
                 f"Access your lead feed:\n{feed_url}\n\n"
-                f"Questions? support@forcedaction.io\n\n"
+                f"Questions? support@forcedactionleads.com\n\n"
                 f"— Forced Action Team"
             ),
             body_html=payment_html,
@@ -1893,7 +1897,7 @@ def _on_payment_failed(invoice: dict, db: Session) -> None:
             f"Update your card:\n{feed_url}\n\n"
             f"If payment is not resolved within 48 hours, your subscription will enter "
             f"a grace period and your territories may be released.\n\n"
-            f"Questions? support@forcedaction.io\n\n"
+            f"Questions? support@forcedactionleads.com\n\n"
             f"— Forced Action Team"
         )
         body_html = f"""<!DOCTYPE html>
@@ -1941,7 +1945,7 @@ def _on_payment_failed(invoice: dict, db: Session) -> None:
               </tr>
             </table>
             <p style="margin:0;font-size:13px;color:#64748b;">
-              Questions? <a href="mailto:support@forcedaction.io" style="color:#fbbf24;text-decoration:none;">support@forcedaction.io</a>
+              Questions? <a href="mailto:support@forcedactionleads.com" style="color:#fbbf24;text-decoration:none;">support@forcedactionleads.com</a>
             </p>
           </td>
         </tr>
@@ -2115,7 +2119,7 @@ def _on_subscription_updated(subscription: dict, db: Session) -> None:
               </tr>
             </table>
             <p style="margin:0;font-size:13px;color:#64748b;">
-              Questions? <a href="mailto:support@forcedaction.io" style="color:#fbbf24;text-decoration:none;">support@forcedaction.io</a>
+              Questions? <a href="mailto:support@forcedactionleads.com" style="color:#fbbf24;text-decoration:none;">support@forcedactionleads.com</a>
             </p>
           </td>
         </tr>
@@ -2135,7 +2139,7 @@ def _on_subscription_updated(subscription: dict, db: Session) -> None:
             f"Stripe is automatically retrying your payment. You keep full access during the retry window.\n\n"
             f"If all retries fail, your subscription will be cancelled and your territory locks released.\n\n"
             f"To resolve this now, update your payment method:\n{feed_url}\n\n"
-            f"Questions? support@forcedaction.io\n\n"
+            f"Questions? support@forcedactionleads.com\n\n"
             f"— Forced Action Team"
         )
         send_email(
@@ -2214,7 +2218,7 @@ def _on_subscription_updated(subscription: dict, db: Session) -> None:
               </tr>
             </table>
             <p style="margin:0;font-size:13px;color:#64748b;">
-              Questions? <a href="mailto:support@forcedaction.io" style="color:#fbbf24;text-decoration:none;">support@forcedaction.io</a>
+              Questions? <a href="mailto:support@forcedactionleads.com" style="color:#fbbf24;text-decoration:none;">support@forcedactionleads.com</a>
             </p>
           </td>
         </tr>
@@ -2239,7 +2243,7 @@ def _on_subscription_updated(subscription: dict, db: Session) -> None:
                 f"You'll keep full access to your ZIP territories and lead feed until then.\n"
                 f"{founding_line}\n"
                 f"Changed your mind? Reactivate before {cancel_str}:\n{feed_url}\n\n"
-                f"Questions? support@forcedaction.io\n\n"
+                f"Questions? support@forcedactionleads.com\n\n"
                 f"— Forced Action Team"
             ),
             body_html=body_html,
@@ -2325,6 +2329,27 @@ def _on_subscription_deleted(subscription: dict, db: Session) -> None:
     except Exception:
         logger.error(
             "GHL stage 7 push failed for subscriber %s",
+            subscriber.id,
+            exc_info=True,
+        )
+
+    try:
+        from src.services.fleet_event_bus import PRIORITY_URGENT, emit_fleet_event
+        emit_fleet_event(
+            db,
+            event_type="subscription.cancelled",
+            source_component="stripe_webhooks",
+            priority=PRIORITY_URGENT,
+            subscriber_id=subscriber.id,
+            payload={
+                "stripe_customer_id": stripe_customer_id,
+                "stripe_subscription_id": subscription.get("id"),
+                "churn_tag": churn_tag,
+            },
+        )
+    except Exception:
+        logger.warning(
+            "fleet event emit failed for subscription.cancelled subscriber=%s",
             subscriber.id,
             exc_info=True,
         )
@@ -2444,7 +2469,7 @@ def _on_subscription_deleted(subscription: dict, db: Session) -> None:
               </tr>
             </table>
             <p style="margin:0;font-size:13px;color:#64748b;">
-              Questions? <a href="mailto:support@forcedaction.io" style="color:#fbbf24;text-decoration:none;">support@forcedaction.io</a>
+              Questions? <a href="mailto:support@forcedactionleads.com" style="color:#fbbf24;text-decoration:none;">support@forcedactionleads.com</a>
             </p>
           </td>
         </tr>
@@ -2469,7 +2494,7 @@ def _on_subscription_deleted(subscription: dict, db: Session) -> None:
                 f"grace period expires on:\n{grace_str}\n"
                 f"{founding_line}\n"
                 f"Changed your mind? Reactivate before the grace period ends:\n{feed_url}\n\n"
-                f"Questions? support@forcedaction.io\n\n"
+                f"Questions? support@forcedactionleads.com\n\n"
                 f"— Forced Action Team"
             ),
             body_html=body_html,
@@ -2910,17 +2935,22 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
         if first_unlock <= 1:
             from src.services.email import send_welcome_email
             from src.services import subscriber_auth as _sub_auth
+            from src.services.activation_tracking import stamp_welcome_email_sent
             magic_url = None
             try:
-                raw = _sub_auth.issue_magic_link(subscriber, db)
-                magic_url = _sub_auth.magic_link_url(raw)
+                magic_url = _sub_auth.issue_magic_link_url_with_retry(
+                    subscriber, db, context="lead_unlock_welcome"
+                )
             except Exception:
                 magic_url = None
                 logger.warning(
-                    "lead_unlock: magic-link issuance failed for sub=%s",
+                    "lead_unlock: magic-link issuance helper failed for sub=%s",
                     subscriber.id, exc_info=True,
                 )
-            send_welcome_email(subscriber, magic_link_url=magic_url)
+            if send_welcome_email(subscriber, magic_link_url=magic_url, db=db):
+                stamp_welcome_email_sent(subscriber.id, db)
+            else:
+                logger.warning("lead_unlock: welcome email not sent sub=%s — not stamping", subscriber.id)
     except Exception as exc:
         logger.warning("lead_unlock: welcome email failed sub=%s: %s",
                        subscriber.id, exc)
@@ -4647,8 +4677,8 @@ def _send_lead_pack_email(
 
             <p style="margin:0;font-size:13px;color:#64748b;">
               Questions? Reply to this email or reach us at
-              <a href="mailto:support@forcedaction.io" style="color:#fbbf24;text-decoration:none;">
-                support@forcedaction.io
+              <a href="mailto:support@forcedactionleads.com" style="color:#fbbf24;text-decoration:none;">
+                support@forcedactionleads.com
               </a>
             </p>
           </td>
@@ -4659,7 +4689,7 @@ def _send_lead_pack_email(
           <td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.08);
                      font-size:12px;color:#475569;text-align:center;">
             Forced Action &mdash; Hillsborough County Property Intelligence<br/>
-            <a href="{_settings.app_base_url}" style="color:#475569;">forcedaction.io</a>
+            <a href="{_settings.app_base_url}" style="color:#475569;">forcedactionleads.com</a>
           </td>
         </tr>
 
@@ -4679,7 +4709,7 @@ def _send_lead_pack_email(
             + "\n".join(lead_lines) +
             f"\nThese leads are exclusively yours until {exclusive_until_str}.\n\n"
             f"View full lead details:\n{dashboard_url}\n\n"
-            f"Questions? support@forcedaction.io\n\n"
+            f"Questions? support@forcedactionleads.com\n\n"
             f"— Forced Action Team"
         ),
         body_html=body_html,
@@ -4788,7 +4818,7 @@ def _send_lead_pack_refund_email(
             f"Your $99 has been fully refunded — it should appear on your statement "
             f"within 5–10 business days. No leads were locked to your account.\n\n"
             f"You're welcome to try again shortly, or reach us at "
-            f"support@forcedaction.io if you'd like help.\n\n"
+            f"support@forcedactionleads.com if you'd like help.\n\n"
             f"— Forced Action Team"
         ),
     )

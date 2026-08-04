@@ -61,6 +61,7 @@ from typing import Optional
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
+from config.venture_template import DEFAULT_VENTURE_KEY
 from src.core.database import get_db_context
 from src.core.models import RelayApprovalQueueItem
 from src.services.relay.config import (
@@ -90,6 +91,11 @@ class QueueItem:
     error: Optional[str]
     dispatched_at: Optional[datetime]
     created_at: datetime
+    # Which venture proposed this action (CLONE-v2.2 / CL3). Defaulted, and
+    # last in the field order, so every existing construction of QueueItem
+    # keeps working unchanged; _COLUMNS_SQL below picks the column up
+    # automatically from the dataclass fields.
+    venture_key: str = DEFAULT_VENTURE_KEY
 
 
 _QUEUE_ITEM_COLUMNS = tuple(f.name for f in fields(QueueItem))
@@ -107,6 +113,7 @@ def enqueue(
     recipient: str,
     payload: dict,
     thread_id: Optional[str] = None,
+    venture_key: str = DEFAULT_VENTURE_KEY,
 ) -> QueueItem:
     """Write a new 'pending' row. Called by Cora (Phase 2) and by R1's
     --seed CLI today — identical call, zero code change when Cora lands.
@@ -114,6 +121,10 @@ def enqueue(
     If idempotency_key already exists (e.g. a caller retries the same
     proposed action), returns the existing row instead of raising or
     creating a duplicate.
+
+    `venture_key` decides which Slack channel this is posted to, which
+    Instantly campaign it sends through, and whose daily ceiling it counts
+    against — see src/utils/venture_config.py.
     """
     try:
         with get_db_context() as session:
@@ -124,6 +135,7 @@ def enqueue(
                 payload=payload,
                 thread_id=thread_id,
                 status=STATUS_PENDING,
+                venture_key=venture_key,
             )
             session.add(item)
             session.flush()
@@ -203,16 +215,29 @@ def record_decision(item_id: int, *, approved: bool, decided_by: str) -> Optiona
     return get_item(item_id)
 
 
-def approved_batch(limit: int = 50) -> list[QueueItem]:
+def approved_batch(limit: int = 50, *, venture_key: Optional[str] = None) -> list[QueueItem]:
     """All status='approved' rows, oldest first — what the cron sweep
-    hands to the execution engine."""
+    hands to the execution engine.
+
+    `venture_key=None` returns every venture's rows (the pre-CL3 behavior,
+    kept so any caller that does not care about ventures is unaffected).
+    Pass a key to restrict the batch to one venture, which the sweep does —
+    a batch must be homogeneous, since one resolved VentureConfig governs
+    the send window, ceiling and channel for every item in it.
+    """
+    where = "status = :status"
+    params: dict = {"status": STATUS_APPROVED, "limit": limit}
+    if venture_key is not None:
+        where += " AND venture_key = :venture_key"
+        params["venture_key"] = venture_key
+
     with get_db_context() as session:
         rows = session.execute(
             text(
                 f"SELECT {_COLUMNS_SQL} FROM relay_approval_queue "
-                "WHERE status = :status ORDER BY created_at ASC LIMIT :limit"
+                f"WHERE {where} ORDER BY created_at ASC LIMIT :limit"
             ),
-            {"status": STATUS_APPROVED, "limit": limit},
+            params,
         ).mappings().all()
         return [_row_to_item(dict(r)) for r in rows]
 

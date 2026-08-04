@@ -13,7 +13,7 @@ Event envelope (example):
             "zip_code": "33647",
             "credits_spent": 42,
             "lock_threshold": 40,
-            "cta_url": "https://app.forcedaction.io/checkout?...",
+            "cta_url": "https://app.forcedactionleads.com/checkout?...",
         },
     }
 """

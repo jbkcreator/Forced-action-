@@ -95,6 +95,32 @@ class TaxDeedAuctionLoader(BaseLoader):
                         or (new_sold_to is not None and new_sold_to != existing.sold_to)
                         or (new_opening_bid is not None and new_opening_bid != existing.opening_bid)
                     )
+                    # A winner CORRECTION, not a first-time reveal: existing.sold_to
+                    # was already resolved (or attempted) once. src.agents.hunter.
+                    # auction_resolution only re-examines rows with
+                    # buyer_resolution_status IS NULL, so leaving that column and
+                    # the stale buyer_entity_links row in place would permanently
+                    # attribute this auction to the old (wrong) winner. Reset both
+                    # in the same UPDATE/transaction as the sold_to correction so
+                    # there's no window where they disagree.
+                    sold_to_corrected = (
+                        new_sold_to is not None
+                        and existing.sold_to is not None
+                        and new_sold_to != existing.sold_to
+                    )
+                    if sold_to_corrected:
+                        self.session.execute(
+                            sa_text(
+                                "DELETE FROM buyer_entity_links "
+                                "WHERE source_table = 'tax_deed_auctions' AND source_id = :id"
+                            ),
+                            {"id": existing.id},
+                        )
+                        logger.info(
+                            "[%s] TaxDeedAuction case=%s: sold_to changed %r -> %r — "
+                            "cleared buyer_resolution_status + stale buyer_entity_links link for re-resolution",
+                            self.county_id, case_number, existing.sold_to, new_sold_to,
+                        )
                     if changed:
                         self.session.execute(
                             sa_text(
@@ -111,7 +137,9 @@ class TaxDeedAuctionLoader(BaseLoader):
                                 "sold_to = COALESCE(:sold_to, sold_to), "
                                 "opening_bid = COALESCE(:opening_bid, opening_bid), "
                                 "certificate_number = COALESCE(:certificate_number, certificate_number), "
-                                "raw_fields = COALESCE(CAST(:raw_fields AS JSONB), raw_fields) "
+                                "raw_fields = COALESCE(CAST(:raw_fields AS JSONB), raw_fields), "
+                                "buyer_resolution_status = CASE WHEN :sold_to_corrected THEN NULL "
+                                "ELSE buyer_resolution_status END "
                                 "WHERE id = :id"
                             ),
                             {
@@ -121,6 +149,7 @@ class TaxDeedAuctionLoader(BaseLoader):
                                 "opening_bid": new_opening_bid,
                                 "certificate_number": new_certificate_number,
                                 "raw_fields": json.dumps(raw_fields_val) if raw_fields_val is not None else None,
+                                "sold_to_corrected": sold_to_corrected,
                                 "id": existing.id,
                             },
                         )

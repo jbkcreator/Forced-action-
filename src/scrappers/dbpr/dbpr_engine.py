@@ -56,9 +56,12 @@ _DOWNLOAD_DIR = Path("data/dbpr")
 # License type code → platform vertical
 _LICENSE_TO_VERTICAL: dict[str, str] = {
     "CCC": "roofing",
-    "CRC": "roofing",          # Registered roofing
+    "RC": "roofing",           # Registered roofing
     "CGC": "general",
     "CBC": "general",
+    "CRC": "general",          # Certified Residential — general residential
+                                # construction, not roofing-specific (previously
+                                # mismapped to "roofing", confused with RC above)
     "RGC": "general",          # Registered general
     "RBC": "general",          # Registered building
     "CFC": "plumbing",

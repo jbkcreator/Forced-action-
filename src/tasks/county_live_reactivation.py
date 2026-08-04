@@ -62,7 +62,7 @@ def send_reactivation_sms(entry: WaitlistEntry, slots_remaining: int, db: Sessio
 
     body = (
         f"{entry.name}, {entry.county_id} is LIVE! You waited {wait_label}. "
-        f"{scarcity} for {entry.vertical}. Lock yours: https://forcedaction.io"
+        f"{scarcity} for {entry.vertical}. Lock yours: https://forcedactionleads.com"
     )
 
     try:
@@ -115,7 +115,7 @@ def fire_reactivation_wave(db: Session, county_id: str) -> dict:
         slots = compute_slots_remaining(db, county_id, entry.vertical)
         body = (
             f"{entry.name}, {county_id} is live! {slots} {entry.vertical} ZIPs available. "
-            f"Lock yours: https://forcedaction.io"
+            f"Lock yours: https://forcedactionleads.com"
         )
         try:
             from src.services.email import send_email

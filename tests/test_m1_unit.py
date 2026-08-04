@@ -242,6 +242,31 @@ class TestOnCheckoutCompleted:
         assert founding_row.count == 4
 
     @patch("src.services.stripe_webhooks.push_subscriber_to_ghl")
+    def test_founding_count_increments_by_one_regardless_of_zip_count(self, mock_ghl):
+        """Multi-ZIP founding checkout must still consume exactly ONE founding spot.
+        Regression for the bug where row.count += len(zip_codes) was used instead
+        of row.count += 1, mixing per-customer and per-ZIP semantics in the counter.
+        """
+        from src.services.stripe_webhooks import _on_checkout_completed
+
+        founding_row = _make_founding_count(count=5)
+
+        db = MagicMock()
+        db.execute.return_value.scalar_one_or_none.side_effect = [
+            founding_row,  # founding count row
+            None,          # no existing subscriber by stripe_customer_id
+            None,          # no existing subscriber by email → create new
+            None,          # territory 1 → create new
+            None,          # territory 2 → create new
+            None,          # territory 3 → create new
+        ]
+
+        # Three ZIPs — counter must still advance by exactly 1, not 3.
+        _on_checkout_completed(self._session_data(is_founding=True, zip_codes="33601,33602,33603"), db)
+
+        assert founding_row.count == 6
+
+    @patch("src.services.stripe_webhooks.push_subscriber_to_ghl")
     def test_zip_territories_locked(self, mock_ghl):
         """Both ZIPs win the atomic INSERT ... ON CONFLICT DO NOTHING outright
         (first-ever claim, no existing row) — no ORM ZipTerritory add, no

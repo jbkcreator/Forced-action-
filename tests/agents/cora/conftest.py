@@ -99,6 +99,7 @@ def mock_claude(monkeypatch):
         "src.agents.cora.subgraphs.outreach.call_claude_with_usage",
         "src.agents.cora.subgraphs.reply.call_claude_with_usage",
         "src.agents.cora.subgraphs.pre_call.call_claude_with_usage",
+        "src.agents.cora.subgraphs.post_call_recap.call_claude_with_usage",
     ):
         monkeypatch.setattr(module_path, mock)
     return mock

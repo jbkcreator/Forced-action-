@@ -134,8 +134,8 @@ def _send_waitlist_email(zip_code: str, vertical: str, county_id: str, emails: L
 
             <p style="margin:0;font-size:13px;color:#64748b;">
               Questions? Reply to this email or reach us at
-              <a href="mailto:support@forcedaction.io" style="color:#fbbf24;text-decoration:none;">
-                support@forcedaction.io
+              <a href="mailto:support@forcedactionleads.com" style="color:#fbbf24;text-decoration:none;">
+                support@forcedactionleads.com
               </a>
             </p>
           </td>
@@ -146,7 +146,7 @@ def _send_waitlist_email(zip_code: str, vertical: str, county_id: str, emails: L
           <td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.08);
                      font-size:12px;color:#475569;text-align:center;">
             Forced Action &mdash; Hillsborough County Property Intelligence<br/>
-            <a href="{app_base_url}" style="color:#475569;">forcedaction.io</a>
+            <a href="{app_base_url}" style="color:#475569;">forcedactionleads.com</a>
           </td>
         </tr>
 

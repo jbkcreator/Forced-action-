@@ -2,7 +2,7 @@
 Signed landing links — short-lived HMAC tokens for missed-call / onboarding URLs.
 
 A subscriber arrives at the landing page via a link like:
-    https://app.forcedaction.io/?signup_source=missed_call&token=eyJ...
+    https://app.forcedactionleads.com/?signup_source=missed_call&token=eyJ...
 
 The frontend POSTs the token to /api/landing/resolve-token; this module
 verifies the signature, decodes the payload, and returns the underlying

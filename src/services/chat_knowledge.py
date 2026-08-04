@@ -20,17 +20,17 @@ _FAQ: list[tuple[re.Pattern, str]] = [
     (
         re.compile(r"\b(price|pricing|cost|how much)\b", re.I),
         "Pricing depends on the plan and number of ZIPs. "
-        "See the pricing page on forcedaction.ai, or email support@forcedaction.ai "
+        "See the pricing page on forcedactionleads.com, or email support@forcedactionleads.com "
         "and we'll send current rates.",
     ),
     (
         re.compile(r"\b(support|contact|email|help desk)\b", re.I),
-        "You can reach support at support@forcedaction.ai. "
+        "You can reach support at support@forcedactionleads.com. "
         "Include your account email and a short description and we'll get back to you.",
     ),
     (
         re.compile(r"\b(refund|cancel|cancellation)\b", re.I),
-        "For refunds or cancellation, email support@forcedaction.ai with your "
+        "For refunds or cancellation, email support@forcedactionleads.com with your "
         "account email and we'll handle it.",
     ),
 ]

@@ -11,7 +11,7 @@ Implemented in `src/services/concierge_chat.py` (`_SYSTEM_TEMPLATE`).
 | Guardrail | Trigger | Bot response |
 |---|---|---|
 | Refund redirect | asks about refund / cancellation / billing dispute | Fixed copy → email support |
-| ZIP availability | asks if a specific ZIP is available/taken | "I can't confirm in chat" → forcedaction.ai / support |
+| ZIP availability | asks if a specific ZIP is available/taken | "I can't confirm in chat" → forcedactionleads.com / support |
 | Competitive comparison | names a competitor or alternative (PropStream, MLS, etc.) | Hard decline + product pivot |
 | Abusive user | abusive / threatening language | Warning once → canned refusal on all subsequent turns (soft end) |
 
@@ -24,7 +24,7 @@ Implemented in `src/services/concierge_chat.py` (`_SYSTEM_TEMPLATE`).
 > **User:** I want a refund for my last payment, this isn't working.
 >
 > **Bot:** Refund and cancellation requests are handled by our support team —
-> email support@forcedaction.ai with your account email and they'll respond
+> email support@forcedactionleads.com with your account email and they'll respond
 > within one business day.
 
 ### B2 · ZIP availability guardrail
@@ -32,7 +32,7 @@ Implemented in `src/services/concierge_chat.py` (`_SYSTEM_TEMPLATE`).
 > **User:** Is ZIP 33601 available? I'm a roofer in Tampa.
 >
 > **Bot:** I can't confirm ZIP availability in chat — check the live map at
-> forcedaction.ai or email support@forcedaction.ai. They can tell you what's
+> forcedactionleads.com or email support@forcedactionleads.com. They can tell you what's
 > open in your area right now.
 
 ### B3 · Competitive comparison guardrail
@@ -61,12 +61,12 @@ Implemented in `src/services/concierge_chat.py` (`_SYSTEM_TEMPLATE`).
 > **User:** [continues abuse]
 >
 > **Bot:** I'm not able to continue this conversation. Please email
-> support@forcedaction.ai if you need assistance.
+> support@forcedactionleads.com if you need assistance.
 >
 > **User:** [any further message]
 >
 > **Bot:** I'm not able to continue this conversation. Please email
-> support@forcedaction.ai if you need assistance.
+> support@forcedactionleads.com if you need assistance.
 
 ### B5 · Happy-path signup
 
@@ -84,7 +84,7 @@ Implemented in `src/services/concierge_chat.py` (`_SYSTEM_TEMPLATE`).
 >
 > **User:** How do I sign up?
 >
-> **Bot:** Head to forcedaction.ai — you can choose your plan, pick your ZIPs,
+> **Bot:** Head to forcedactionleads.com — you can choose your plan, pick your ZIPs,
 > and check if founding-member rates are still available. The whole setup takes
 > a few minutes.
 
@@ -142,7 +142,7 @@ Detect on `input` change (or `onSubmit`), before the message is sent to the API.
 |---|---|---|---|
 | `wallet` | both | "wallet", "add credits", "buy credits", "top up", "credits" | Open wallet plan selector → `/api/checkout` with wallet SKU |
 | `lock` | `post_signup` only | "lock", "territory lock", "lock my zip", "add zip", "another zip", "expand territory" | Open territory lock flow → `/api/checkout` with lock SKU + ZIP selector |
-| `annual` | both | "annual", "yearly", "pay yearly", "year contract" | Inline message: "Annual pricing varies by plan — email support@forcedaction.ai with your current plan and they'll set it up." + mailto link |
+| `annual` | both | "annual", "yearly", "pay yearly", "year contract" | Inline message: "Annual pricing varies by plan — email support@forcedactionleads.com with your current plan and they'll set it up." + mailto link |
 | `unlock` | — | — | **Out of scope v1.** Belongs in dashboard lead-card UI. |
 
 ### End-to-end flow (wallet, pre_signup)

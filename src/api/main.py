@@ -7,7 +7,6 @@ Endpoints:
     GET  /api/founding-spots       — Founding countdown for landing page
     GET  /api/zip-check            — ZIP availability checker for landing page
     POST /api/checkout             — Create Stripe checkout session
-    GET  /api/test/starter-checkout-link — TEMP: mints a fresh live Starter checkout link on each visit
     GET  /api/feed/{uuid}          — Event Feed for subscribers (paginated leads, sort, search, filter)
     GET  /api/feed/{uuid}/stats    — Aggregate stats for the subscriber's feed
     POST /api/resend-confirmation  — Re-send welcome/confirmation email by feed_uuid
@@ -15,11 +14,16 @@ Endpoints:
 """
 
 import functools
+import base64
+import hashlib
+import hmac
 import json
 import logging
+import math
 import re
 import time
 import uuid
+from urllib.parse import parse_qsl
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -40,6 +44,7 @@ from src.core.database import get_db_context
 from src.core.models import ConsentAcceptance, FoundingSubscriberCount, ZipTerritory, Subscriber, Property, DistressScore, Incident, LeadPackPurchase, ScraperRunStats, EnrichedContact, Owner, SentLead, WaitlistEntry, SmsOptIn, ExpansionCandidate, County, LeadExclusivity
 from src.agents.events.ingestion import publish_lifecycle_event
 from src.services.stripe_webhooks import handle_webhook
+from src.services.transactional_email_tracking import record_mandrill_event
 from src.services.stripe_service import get_price_id_for_checkout, get_price_id_for_preview, _price_ids
 from src.services import lead_exclusivity
 from config.settings import get_settings
@@ -88,6 +93,86 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _haversine_miles(a: tuple[float, float], b: tuple[float, float]) -> float:
+    """Approximate great-circle distance between two lat/lon points."""
+    lat1, lon1 = a
+    lat2, lon2 = b
+    r = 3958.8
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    h = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(math.radians(lat1))
+        * math.cos(math.radians(lat2))
+        * math.sin(dlon / 2) ** 2
+    )
+    return 2 * r * math.asin(math.sqrt(h))
+
+
+def _zip_has_sellable_inventory(db: Session, zip_code: str, vertical: str, county_id: str) -> bool:
+    """Whether a ZIP/vertical currently clears the lead-pack sellability floor."""
+    from src.services.lead_exclusivity import get_exclusive_property_ids
+    from src.services.lead_pool_service import sellable_lead_filters
+    from src.utils.lead_filters import phone_priority_order
+
+    now = datetime.now(timezone.utc)
+    excl_ids = get_exclusive_property_ids(db, county_id, now, zip_code=zip_code)
+    score_col = DistressScore.vertical_scores[vertical].as_float()
+    filters = sellable_lead_filters(_s)
+    filters.append(Property.zip == zip_code)
+    filters.append(Property.county_id == county_id)
+    if excl_ids:
+        filters.append(Property.id.not_in(excl_ids))
+
+    candidate_ids = db.execute(
+        select(Property.id)
+        .join(DistressScore, DistressScore.property_id == Property.id)
+        .outerjoin(Owner, Owner.property_id == Property.id)
+        .where(and_(*filters))
+        .order_by(*phone_priority_order(score_col))
+        .limit(5)
+    ).scalars().all()
+    return len(candidate_ids) >= 5
+
+
+def _find_adjacent_zip_suggestion(db: Session, zip_code: str, vertical: str, county_id: str) -> Optional[dict]:
+    """Return the nearest same-county available ZIP that still clears the inventory floor."""
+    from src.utils.zip_centroids import get_county_zip_centroids
+
+    origin = get_county_zip_centroids(county_id).get(zip_code)
+    if origin is None:
+        return None
+
+    centroids = get_county_zip_centroids(county_id)
+    territory_rows = db.execute(
+        select(ZipTerritory.zip_code, ZipTerritory.status).where(
+            ZipTerritory.vertical == vertical,
+            ZipTerritory.county_id == county_id,
+        )
+    ).all()
+    status_by_zip = {row[0]: row[1] for row in territory_rows}
+
+    best: Optional[dict] = None
+    for candidate_zip, coords in centroids.items():
+        if candidate_zip == zip_code:
+            continue
+        if status_by_zip.get(candidate_zip, "available") != "available":
+            continue
+
+        miles = _haversine_miles(origin, coords)
+        if miles > 10:
+            continue
+        if not _zip_has_sellable_inventory(db, candidate_zip, vertical, county_id):
+            continue
+
+        if best is None or miles < best["distance_miles"]:
+            best = {
+                "zip_code": candidate_zip,
+                "distance_miles": round(miles, 1),
+            }
+    return best
 
 
 @app.middleware("http")
@@ -144,12 +229,14 @@ from src.api.revenue_metrics_router import router as revenue_metrics_router  # n
 from src.api.admin_leads_router import router as admin_leads_router  # noqa: E402
 from src.api.funnel_analytics_router import router as funnel_analytics_router  # noqa: E402
 from src.api.operator_dashboard_router import router as operator_dashboard_router  # noqa: E402
+from src.api.vera_router import router as vera_router  # noqa: E402
 app.include_router(metrics_router)
 app.include_router(alert_webhook_router)
 app.include_router(revenue_metrics_router)
 app.include_router(admin_leads_router)
 app.include_router(funnel_analytics_router)
 app.include_router(operator_dashboard_router)
+app.include_router(vera_router)
 
 from src.api.bankruptcy_alert_router import router as bankruptcy_alert_router  # noqa: E402
 app.include_router(bankruptcy_alert_router)
@@ -250,6 +337,75 @@ def health_check(db: Session = Depends(get_db)):
     except Exception:
         raise HTTPException(status_code=503, detail="db_unavailable")
     return {"status": "ok"}
+
+
+def _verify_mandrill_signature(raw_body: bytes, signature: Optional[str], request: Request) -> bool:
+    """Verify Mandrill's webhook signature against the configured key."""
+    settings = get_settings()
+    key = settings.mandrill_webhook_key.get_secret_value() if settings.mandrill_webhook_key else None
+    if not key:
+        logger.error("[mandrill] webhook key not configured - rejecting event")
+        return False
+    if not signature:
+        return False
+
+    pieces = [str(request.url).split("?", 1)[0]]
+    for k, v in sorted(parse_qsl(raw_body.decode("utf-8"), keep_blank_values=True)):
+        pieces.extend([k, v])
+    signed_data = "".join(pieces).encode("utf-8")
+    digest = hmac.new(key.encode("utf-8"), signed_data, hashlib.sha1).digest()
+    expected = base64.b64encode(digest).decode("utf-8")
+    return hmac.compare_digest(expected, signature)
+
+
+@app.post("/webhooks/mandrill", status_code=200, include_in_schema=False)
+async def mandrill_webhook(
+    request: Request,
+    x_mandrill_signature: Optional[str] = Header(None, alias="x-mandrill-signature"),
+):
+    raw_body = await request.body()
+    if not _verify_mandrill_signature(raw_body, x_mandrill_signature, request):
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "webhook_invalid", "message": "Invalid Mandrill signature"},
+        )
+
+    form = dict(parse_qsl(raw_body.decode("utf-8"), keep_blank_values=True))
+    try:
+        events = json.loads(form.get("mandrill_events") or "[]")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "webhook_invalid", "message": "Invalid mandrill_events payload"},
+        ) from exc
+
+    if not isinstance(events, list):
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "webhook_invalid", "message": "mandrill_events must be a JSON array"},
+        )
+
+    with get_db_context() as db:
+        try:
+            for event in events:
+                if isinstance(event, dict):
+                    record_mandrill_event(db, event)
+            db.commit()
+        except OperationalError:
+            logger.error("DB error processing Mandrill webhook", exc_info=True)
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "service_unavailable", "message": "Database temporarily unavailable"},
+            )
+        except Exception as exc:
+            db.rollback()
+            logger.error("Unhandled Mandrill webhook handler error", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail={"error": "internal_server_error", "message": f"Webhook processing failed: {exc}"},
+            )
+
+    return {"status": "ok", "processed": len(events)}
 
 
 _HEALTH_SEVERITY = {"ok": 0, "warning": 1, "degraded": 2, "critical": 3}
@@ -617,7 +773,7 @@ def _fetch_pricing_from_stripe() -> dict:
     all_prices = _price_ids()
 
     pricing_info = {}
-    for tier in ("starter", "pro", "dominator", "annual_lock"):
+    for tier in ("starter", "pro", "founder", "annual_lock"):
         founding_id = all_prices.get(tier, {}).get("founding")
         regular_id = all_prices.get(tier, {}).get("regular")
 
@@ -755,7 +911,7 @@ def _attribution_stripe_metadata(request: Request, attribution: Optional[dict]) 
 
 
 class CheckoutRequest(BaseModel):
-    tier: str        # starter | pro | dominator | founder
+    tier: str        # starter | pro | founder | annual_lock
     vertical: str    # roofing | remediation | investor
     county_id: str   # hillsborough
     zip_codes: list[str] = []  # ZIP territories to lock on purchase
@@ -838,7 +994,7 @@ class CheckoutRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_zip_count(self) -> "CheckoutRequest":
-        limits = {"starter": 1, "pro": 3, "dominator": 10, "annual_lock": 1, "founder": 10}
+        limits = {"starter": 1, "pro": 3, "annual_lock": 1, "founder": 10}
         limit = limits.get(self.tier)
         if limit and len(self.zip_codes) != limit:
             raise ValueError(f"{self.tier.title()} plan requires exactly {limit} ZIP code{'s' if limit > 1 else ''}.")
@@ -1165,65 +1321,6 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
         "amount_total_cents": session.amount_total,
         "is_founding": is_founding,
     }
-
-
-# ---------------------------------------------------------------------------
-# GET /api/test/starter-checkout-link — E2E test router (temporary)
-#
-# A stable, non-expiring URL for manual click-through testing of the Starter
-# purchase path. Stripe Checkout Session URLs expire (hosted-mode sessions
-# max out at 24h), so a link to this endpoint mints a fresh live session on
-# every visit and redirects into it — the endpoint URL itself never goes stale.
-# Hardcodes tier=starter/vertical=roofing so a query-string caller can't spin
-# up a higher-priced live session; only the ZIP is caller-supplied.
-# Remove once the manual live-checkout E2E test is done.
-# ---------------------------------------------------------------------------
-
-@app.get("/api/test/starter-checkout-link")
-def starter_checkout_test_link(
-    zip_code: str = Query(..., alias="zip"),
-    county_id: str = Query("hillsborough"),
-    db: Session = Depends(get_db),
-):
-    if not _ZIP_RE.match(zip_code):
-        raise HTTPException(status_code=400, detail={"error": "invalid_zip", "message": "zip must be 5 digits"})
-
-    _s = get_settings()
-    stripe.api_key = _s.active_stripe_secret_key.get_secret_value()
-
-    try:
-        price_id, _ = get_price_id_for_checkout(db, "starter", "roofing", county_id, "monthly")
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail={"error": "invalid_configuration", "message": str(e)})
-    except OperationalError:
-        logger.error("DB error resolving price for starter test checkout link", exc_info=True)
-        raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
-
-    try:
-        session = stripe.checkout.Session.create(
-            mode="subscription",
-            ui_mode="hosted",
-            line_items=[{"price": price_id, "quantity": 1}],
-            allow_promotion_codes=True,
-            phone_number_collection={"enabled": True},
-            success_url=f"{_s.app_base_url}/success?session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{_s.app_base_url}/",
-            metadata={
-                "tier": "starter",
-                "vertical": "roofing",
-                "county_id": county_id,
-                "zip_codes": zip_code,
-                "manual_test_link": "true",
-            },
-        )
-    except stripe.error.StripeError as e:
-        logger.error("Stripe error creating starter test checkout link: %s", str(e), exc_info=True)
-        raise HTTPException(
-            status_code=502,
-            detail={"error": "payment_gateway_error", "message": "Payment gateway error — please try again"},
-        )
-
-    return RedirectResponse(url=session.url, status_code=307)
 
 
 # ---------------------------------------------------------------------------
@@ -1568,7 +1665,7 @@ async def stripe_wl_webhook(
 # founding-summary used before this was extracted, just named and reused.
 # ---------------------------------------------------------------------------
 
-_FOUNDING_TIERS = ["starter", "pro", "dominator"]
+_FOUNDING_TIERS = ["starter", "pro", "founder"]
 
 
 def _county_founding_deadline(db: Session, county_id: str) -> Optional[datetime]:
@@ -1712,7 +1809,7 @@ def founding_spots(
 
 # _ZIP_RE and _FLORIDA_PREFIXES imported from src.api.deps
 
-_ZIP_PRICING_TIERS = ("starter", "pro", "dominator", "annual_lock")
+_ZIP_PRICING_TIERS = ("starter", "pro", "founder", "annual_lock")
 
 
 def _cohort_adjusted_pricing(county_id: str, vertical: str, db: Session) -> dict:
@@ -1841,11 +1938,13 @@ def zip_check(
             "pricing": _cohort_adjusted_pricing(county_id, vertical, db),
         }
 
+    suggestion = _find_adjacent_zip_suggestion(db, zip_code, vertical, county_id)
     return {
         "zip_code": zip_code,
         "vertical": vertical,
         "status": "taken",
         "message": "This ZIP is locked by another subscriber",
+        "adjacent_zip_suggestion": suggestion,
     }
 
 
@@ -2213,6 +2312,7 @@ def event_feed(
     min_score: Optional[float] = Query(default=None, ge=0.0, le=100.0),
     incident_type: Optional[str] = Query(default=None),
     search: Optional[str] = Query(default=None, max_length=100),
+    county: Optional[str] = Query(default=None),
     db: Session = Depends(get_db),
     _auth=Depends(get_current_subscriber),
 ):
@@ -2234,6 +2334,9 @@ def event_feed(
 
     if not subscriber:
         raise HTTPException(status_code=404, detail={"error": "not_found", "message": "Feed not found"})
+
+    # Demo accounts can switch county via ?county= param; regular subscribers always use their own.
+    effective_county_id = county if (subscriber.is_demo and county) else subscriber.county_id
 
     if subscriber.status == "paused":
         return {
@@ -2280,16 +2383,24 @@ def event_feed(
     if subscriber.status not in ("active", "grace", "disputed", "past_due"):
         raise HTTPException(status_code=403, detail={"error": "subscription_inactive", "message": "Subscription is not active"})
 
-    # 2. Get subscriber's locked ZIP codes
+    # 2. Get subscriber's locked ZIP codes (demo accounts see all county ZIPs)
     try:
-        locked_zips = db.execute(
-            select(ZipTerritory.zip_code).where(
-                and_(
-                    ZipTerritory.subscriber_id == subscriber.id,
-                    ZipTerritory.status.in_(["locked", "grace"]),
+        if subscriber.is_demo:
+            locked_zips = db.execute(
+                select(Property.zip).where(
+                    Property.county_id == effective_county_id,
+                    Property.zip.isnot(None),
+                ).distinct()
+            ).scalars().all()
+        else:
+            locked_zips = db.execute(
+                select(ZipTerritory.zip_code).where(
+                    and_(
+                        ZipTerritory.subscriber_id == subscriber.id,
+                        ZipTerritory.status.in_(["locked", "grace"]),
+                    )
                 )
-            )
-        ).scalars().all()
+            ).scalars().all()
     except OperationalError:
         logger.error("DB error fetching locked ZIPs for feed", exc_info=True)
         raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
@@ -2410,7 +2521,7 @@ def event_feed(
             with db.begin_nested():
                 from src.services.proof_moment import get_blurred_stack as _get_blurred_stack
                 _blurred_stack = _get_blurred_stack(
-                    subscriber.id, subscriber.vertical, subscriber.county_id, db, limit=5,
+                    subscriber.id, subscriber.vertical, effective_county_id, db, limit=5,
                 )
         except Exception as exc:
             logger.warning("blurred_stack failed for sub=%s: %s", subscriber.id, exc)
@@ -2461,6 +2572,8 @@ def event_feed(
                 "tier": subscriber.tier,
                 "vertical": subscriber.vertical,
                 "county_id": subscriber.county_id,
+                "active_county_id": effective_county_id,
+                "is_demo": subscriber.is_demo,
                 "locked_zips": [],
                 "founding_member": subscriber.founding_member,
                 "status": subscriber.status,
@@ -2511,7 +2624,7 @@ def event_feed(
 
     filters = [
         Property.zip.in_(locked_zips),
-        Property.county_id == subscriber.county_id,
+        Property.county_id == effective_county_id,
         DistressScore.qualified == True,
     ]
 
@@ -2544,7 +2657,7 @@ def event_feed(
     from src.services.lead_exclusivity import get_exclusive_property_ids
     now = datetime.now(timezone.utc)
     excl_ids = get_exclusive_property_ids(
-        db, subscriber.county_id, now, exclude_trade=subscriber.vertical
+        db, effective_county_id, now, exclude_trade=subscriber.vertical
     )
     if excl_ids:
         filters.append(Property.id.not_in(excl_ids))
@@ -2657,7 +2770,7 @@ def event_feed(
     _portfolio_map = portfolio_sizes_for_names(
         db,
         (owner.owner_name for _, _, owner in rows if owner),
-        county_id=subscriber.county_id,
+        county_id=effective_county_id,
     )
 
     outcome_by_prop = _outcome_state_by_property(db, subscriber.id, list(property_ids))
@@ -2744,6 +2857,8 @@ def event_feed(
             "tier": subscriber.tier,
             "vertical": subscriber.vertical,
             "county_id": subscriber.county_id,
+            "active_county_id": effective_county_id,
+            "is_demo": subscriber.is_demo,
             "locked_zips": list(locked_zips),
             "founding_member": subscriber.founding_member,
             "status": subscriber.status,
@@ -2811,14 +2926,22 @@ def feed_stats(feed_uuid: str, db: Session = Depends(get_db), _auth=Depends(get_
         raise HTTPException(status_code=403, detail={"error": "subscription_inactive", "message": "Subscription is not active"})
 
     try:
-        locked_zips = db.execute(
-            select(ZipTerritory.zip_code).where(
-                and_(
-                    ZipTerritory.subscriber_id == subscriber.id,
-                    ZipTerritory.status.in_(["locked", "grace"]),
+        if subscriber.is_demo:
+            locked_zips = db.execute(
+                select(Property.zip).where(
+                    Property.county_id == subscriber.county_id,
+                    Property.zip.isnot(None),
+                ).distinct()
+            ).scalars().all()
+        else:
+            locked_zips = db.execute(
+                select(ZipTerritory.zip_code).where(
+                    and_(
+                        ZipTerritory.subscriber_id == subscriber.id,
+                        ZipTerritory.status.in_(["locked", "grace"]),
+                    )
                 )
-            )
-        ).scalars().all()
+            ).scalars().all()
     except OperationalError:
         raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
 
@@ -2916,7 +3039,7 @@ def resend_confirmation(payload: ResendConfirmationRequest, db: Session = Depend
         from src.services.email import send_welcome_email
         from src.services import subscriber_auth as _sub_auth
         magic_url = _sub_auth.magic_link_url(_sub_auth.issue_magic_link(subscriber, db))
-        send_welcome_email(subscriber, magic_link_url=magic_url)
+        send_welcome_email(subscriber, magic_link_url=magic_url, db=db)
     except Exception:
         logger.error("Failed to resend confirmation for feed %s", payload.feed_uuid, exc_info=True)
         raise HTTPException(status_code=500, detail={"error": "send_failed", "message": "Failed to send email"})
@@ -3891,12 +4014,20 @@ def insurance_distress_availability(feed_uuid: str, db: Session = Depends(get_db
         raise HTTPException(status_code=404, detail={"error": "not_found", "message": "Feed not found"})
 
     try:
-        locked_zips = db.execute(
-            select(ZipTerritory.zip_code).where(
-                ZipTerritory.subscriber_id == subscriber.id,
-                ZipTerritory.status.in_(["locked", "grace"]),
-            )
-        ).scalars().all()
+        if subscriber.is_demo:
+            locked_zips = db.execute(
+                select(Property.zip).where(
+                    Property.county_id == subscriber.county_id,
+                    Property.zip.isnot(None),
+                ).distinct()
+            ).scalars().all()
+        else:
+            locked_zips = db.execute(
+                select(ZipTerritory.zip_code).where(
+                    ZipTerritory.subscriber_id == subscriber.id,
+                    ZipTerritory.status.in_(["locked", "grace"]),
+                )
+            ).scalars().all()
     except OperationalError:
         logger.error("DB error fetching locked ZIPs for insurance-distress availability", exc_info=True)
         raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
@@ -5713,7 +5844,7 @@ def upgrade(req: UpgradeRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=503, detail=f"Stripe price not configured for {req.tier}")
 
     # Settle every guarantee cycle that already closed on the outgoing tier —
-    # otherwise switching sub.tier off starter/pro/dominator drops it from
+    # otherwise switching sub.tier off starter/pro/founder drops it from
     # the daily sweep's tier filter and any closed cycle is never evaluated.
     # evaluate_subscriber_guarantee() only advances one cycle per call, so a
     # subscriber sitting on a backlog of several closed cycles (sweep
@@ -6847,7 +6978,7 @@ def wallet_topup_endpoint(
     if sub.status == "disputed":
         raise HTTPException(
             status_code=403,
-            detail="Account on hold for review. Email support@forcedaction.io.",
+            detail="Account on hold for review. Email support@forcedactionleads.com.",
         )
 
     credits = WALLET_TOPUP_PACKAGES[req.amount_cents]
@@ -7114,7 +7245,7 @@ def premium_purchase_endpoint(
     if sub.status == "disputed":
         raise HTTPException(
             status_code=403,
-            detail="Account on hold for review. Email support@forcedaction.io.",
+            detail="Account on hold for review. Email support@forcedactionleads.com.",
         )
 
     cfg = PREMIUM_CREDITS[req.sku]
@@ -7694,6 +7825,117 @@ h1{{font-size:1.5rem}}a.cta{{display:inline-block;margin-top:24px;padding:12px 2
 </body>
 </html>"""
     return HTMLResponse(content=html)
+
+
+# ---------------------------------------------------------------------------
+# POST /api/vertical/probe
+# POST /api/vertical/presell-confirm
+# GET  /api/vertical/verdict/{verdict_id}
+# ---------------------------------------------------------------------------
+
+class _VerticalProbeRequest(BaseModel):
+    vertical_candidate_packet_id: int
+
+
+class _PresellConfirmRequest(BaseModel):
+    verdict_id: int
+
+
+@app.post("/api/vertical/probe")
+def api_vertical_probe(
+    payload: _VerticalProbeRequest,
+    db: Session = Depends(get_db),
+    _admin: dict = Depends(get_current_admin),
+):
+    """Run probe loop for a VerticalCandidatePacket. Idempotent per packet per day."""
+    from src.services.vertical_autopilot import run_probe
+    try:
+        probe = run_probe(payload.vertical_candidate_packet_id, db)
+        db.commit()
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"error": "probe_error", "message": str(exc)})
+    except OperationalError:
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+    except Exception:
+        logger.error("api_vertical_probe: unexpected error", exc_info=True)
+        raise HTTPException(status_code=500, detail={"error": "internal_error", "message": "Probe failed unexpectedly"})
+
+    return {
+        "probe_id": probe.id,
+        "vertical_name": probe.vertical_name,
+        "status": probe.status,
+        "sends_count": probe.sends_count,
+        "reply_count": probe.reply_count,
+        "reply_rate": float(probe.reply_rate),
+        "idempotency_key": probe.idempotency_key,
+        "started_at": probe.started_at.isoformat() if probe.started_at else None,
+        "completed_at": probe.completed_at.isoformat() if probe.completed_at else None,
+    }
+
+
+@app.post("/api/vertical/presell-confirm")
+def api_vertical_presell_confirm(
+    payload: _PresellConfirmRequest,
+    db: Session = Depends(get_db),
+    _admin: dict = Depends(get_current_admin),
+):
+    """Confirm presell for a VerticalVerdict. Unblocks dev queue entry."""
+    from src.services.vertical_autopilot import confirm_presell
+    try:
+        verdict = confirm_presell(payload.verdict_id, db)
+        db.commit()
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail={"error": "not_found", "message": str(exc)})
+    except OperationalError:
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+    except Exception:
+        logger.error("api_vertical_presell_confirm: unexpected error", exc_info=True)
+        raise HTTPException(status_code=500, detail={"error": "internal_error", "message": "Confirm presell failed unexpectedly"})
+
+    return {
+        "verdict_id": verdict.id,
+        "vertical_name": verdict.vertical_name,
+        "presell_confirmed": verdict.presell_confirmed,
+        "verdict": verdict.verdict,
+        "package_id": verdict.package_id,
+    }
+
+
+@app.get("/api/vertical/verdict/{verdict_id}")
+def api_vertical_verdict(
+    verdict_id: int,
+    db: Session = Depends(get_db),
+    _admin: dict = Depends(get_current_admin),
+):
+    """Return a VerticalVerdict by ID."""
+    from sqlalchemy import select as _select
+    from src.core.models import VerticalVerdict
+    try:
+        verdict = db.execute(
+            _select(VerticalVerdict).where(VerticalVerdict.id == verdict_id)
+        ).scalar_one_or_none()
+    except OperationalError:
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+
+    if verdict is None:
+        raise HTTPException(status_code=404, detail={"error": "not_found", "message": "Verdict not found"})
+
+    return {
+        "id": verdict.id,
+        "vertical_name": verdict.vertical_name,
+        "vertical_probe_id": verdict.vertical_probe_id,
+        "vertical_candidate_packet_id": verdict.vertical_candidate_packet_id,
+        "verdict": verdict.verdict,
+        "verdict_at": verdict.verdict_at.isoformat() if verdict.verdict_at else None,
+        "rule_fired": verdict.rule_fired,
+        "reply_rate_at_verdict": float(verdict.reply_rate_at_verdict),
+        "presell_confirmed": verdict.presell_confirmed,
+        "package_generated": verdict.package_generated,
+        "package_id": verdict.package_id,
+        "clone_status": verdict.clone_status,
+        "source_county": verdict.source_county,
+        "handoff_payload": verdict.handoff_payload,
+    }
 
 
 # ---------------------------------------------------------------------------

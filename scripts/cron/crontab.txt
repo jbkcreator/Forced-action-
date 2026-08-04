@@ -125,8 +125,8 @@ COUNTY_ID=hillsborough
 # (>=5 answers, 0 paid signups) and expands winners (LLM variations, pool cap 30,
 # replace-worst). Weekly to match the one-keyword/day scrape throughput. Runs
 # clear of the 04:00–08:00 scrape/CDS/skip-trace/GHL chain. See docs/adr/0021.
-# DISABLED alongside quora_s6_orchestrator — this loop only scores/expands
-# Quora Seed Keywords, which stop moving once the scraper feeding them is off.
+# Active — depends on quora_s6_orchestrator being live (line above, also active).
+# Only scores/expands Quora Seed Keywords; safe to disable by commenting out quora_s6_orchestrator first.
 0 9 * * 0 $PROJECT/scripts/cron/run.sh src.tasks.autonomous_tuning_worker
 
 # ── PINELLAS DAILY ────────────────────────────────────────────
@@ -197,6 +197,15 @@ COUNTY_ID=hillsborough
 #     in src/tasks/heartbeat_monitor.py — no false positives.
 */15 7-23 * * * $PROJECT/scripts/cron/run.sh src.tasks.heartbeat_monitor
 
+# QUALITY-v2.2 Q4 — Revenue-path canaries (checkout / payment_link /
+# entitlement / delivery / mail / model_api). Every 5 minutes, all day —
+# revenue can break at any hour, unlike scraper freshness which only
+# matters during scrape windows. Always Stripe TEST mode (decision E2);
+# see src/services/revenue_canary.py's module docstring. 1h alert cooldown
+# per check (revenue_canary_alert_log) — the first alert on a new break
+# still fires within 5 minutes.
+*/5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.revenue_canary_sweep
+
 # 19. Anomaly Pager — 08:05 AM UTC Mon-Sat (after CDS rescore 07:00, skip-tracing
 #     07:30, lead_quality_monitor 07:35; avoids the 08:00 spike with ghl_sync).
 #     Daily volume/coverage rules against 7-day baseline. 12h dedup per rule.
@@ -256,6 +265,11 @@ COUNTY_ID=hillsborough
 # → outcome_snapshot + outcome_loss_autopsy (dead+lead-fault only). Both
 # idempotent. Decouples the buyer's one-tap outcome from score recalculation.
 1-59/2 * * * * $PROJECT/scripts/cron/run.sh src.tasks.outcome_dispatch_sweep
+
+# QUALITY-v2.2 Q1 — fleet event-trigger dispatcher. Every 2 minutes, staggered
+# 1 minute off outcome_dispatch_sweep/loan_lane_sweep so all three don't fire
+# in the same tick.
+0-59/2 * * * * $PROJECT/scripts/cron/run.sh src.tasks.fleet_event_sweep
 
 # Lifecycle anomaly check — volume + no-answer rate monitor — every 15 min
 */15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lifecycle_anomaly_check
@@ -819,21 +833,29 @@ COUNTY_ID=hillsborough
 # DOR SDF download+ingestion for that period (manual admin upload, not on
 # cron — see src/connectors/dor_sale_outcomes.py). Runs AFTER outcome_label_layer
 # (08:25/08:26) so a same-day DOR ingestion still gets promoted same-day.
-# SLA 131040 min (~91 days + grace — DOR posts 3 rolls/year). enabled=False in
-# registry.py pending go-live decision — this entry is prepared, not yet
-# installed on any real crontab (see report/july-16-report.md).
+# SLA 131040 min (~91 days + grace — DOR posts 3 rolls/year). enabled=True in
+# registry.py as of PR #170 — connector is live and this cron entry is active.
 0 9 2 * * $PROJECT/scripts/cron/run.sh src.connectors.dor_sale_outcomes --county-id $COUNTY_ID
 1 9 2 * * $PROJECT/scripts/cron/run.sh src.connectors.dor_sale_outcomes --county-id pinellas
 
-# ── HUNTER-01/02 — BUYER ENTITY RESOLUTION + WHALE DETECTION (H3, W2) ────────
+# ── HUNTER-01/02/03/04 — BUYER ENTITY RESOLUTION + WHALE DETECTION +
+# BUYER-TYPE CLASSIFICATION + PORTFOLIO PROFILING (H3, W2) ───────────────────
 # Nightly sweep — daily, after outcome_label_layer (08:25/08:26) so the same
 # day's newly-promoted deed activity is available to resolve against. Runs
 # H2's incremental resolver against buyer_entities (never a full re-cluster —
-# entity IDs stay stable), then portfolio aggregation, then whale-flag
-# scoring, in that dependency order. Does not yet write to
-# /shared/facts/enriched/ — see src/tasks/hunter_nightly_sweep.py docstring.
+# entity IDs stay stable), then portfolio aggregation, whale-flag scoring,
+# portfolio profiling (HUNTER-04: cadence/capacity/hold-time), and buyer-type
+# classification (HUNTER-03), in that dependency order, scoped to just the
+# entities this run's resolution step actually touched. Does not yet write
+# to /shared/facts/enriched/ — see src/tasks/hunter_nightly_sweep.py docstring.
 30 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.hunter_nightly_sweep --county-id $COUNTY_ID
 31 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.hunter_nightly_sweep --county-id pinellas
+
+# NBRA opportunity-score population (REVINT I1) — fills opportunity_scores from
+# freshly-refreshed whale flags so get_ranked_queue() has rows to rank. Must run
+# AFTER hunter_nightly_sweep (above) which updates whale flags.
+32 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.nbra_populate_sweep --county-id $COUNTY_ID
+33 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.nbra_populate_sweep --county-id pinellas
 
 # Auction-winner fast-follow (W2) — runs just after the nightly sweep as a
 # supplementary <24h latency check on distressed-acquisition deeds
@@ -843,6 +865,15 @@ COUNTY_ID=hillsborough
 # the next scheduled sweep if this entry's cadence is ever tightened.
 35 8 * * * $PROJECT/scripts/cron/run.sh src.connectors.whale_auction_fast_follow --county-id $COUNTY_ID
 36 8 * * * $PROJECT/scripts/cron/run.sh src.connectors.whale_auction_fast_follow --county-id pinellas
+
+# HUNTER-05 — direct tax-deed-auction-winner resolution. Separate from the
+# nightly sweep above (triggered by new tax_deed_auctions.sold_to rows, not a
+# buyer_entities-wide rescan); staggered just after the fast-follow entries.
+# Foreclosure winners are NOT resolved here — Foreclosure.sold_to carries no
+# real bidder identity (see src/agents/hunter/auction_resolution.py's
+# docstring), so they stay on the fast-follow proxy above permanently.
+40 8 * * * $PROJECT/scripts/cron/run.sh src.agents.hunter.auction_resolution --county-id $COUNTY_ID
+41 8 * * * $PROJECT/scripts/cron/run.sh src.agents.hunter.auction_resolution --county-id pinellas
 
 # ── CDS SCORING RETUNE (client Q9 — closed loop) ─────────────
 # Weekly Sunday @ 11:00 UTC. Runs B→C→D→E→F end to end: builds the training
@@ -860,12 +891,12 @@ COUNTY_ID=hillsborough
 # 5+ minutes with no Telnyx message.finalized delivery-status callback.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.owner_alert_sweep
 # Tiered volume guarantee shortfall sweep — INTENTIONALLY NOT scheduled yet.
-# config/guarantees.py TIER_LEAD_QUOTAS are placeholder lead-per-cycle counts
-# pending a business decision; enabling this cron would issue real Stripe
-# balance credits off unconfirmed numbers. Re-enable only once all three are
-# true: (1) lead_delivery_sweep has run one full 30-day cycle with real
-# deliveries landing, (2) a --dry-run credit total has been reviewed and
-# approved in writing, (3) Stripe is confirmed in live mode.
+# Quotas confirmed (starter 15 / pro 40 / founder 40 per 30-day cycle) but
+# enabling this cron would issue real Stripe balance credits before we have a
+# full cycle of verified delivery data. Re-enable only once all three are true:
+# (1) lead_delivery_sweep has run one full 30-day cycle with real deliveries
+# landing, (2) a --dry-run credit total has been reviewed and approved in
+# writing by Josh, (3) Stripe is confirmed in live mode.
 # 0 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.guarantee_shortfall_sweep
 
 # ── AGENT LANE: RELAY ────────────────────────────────────────────────────────
@@ -877,7 +908,30 @@ COUNTY_ID=hillsborough
 # Email channel (Instantly, R2) is registered but inert until
 # RELAY_INSTANTLY_CAMPAIGN_ID is configured — see --setup-email-channel.
 # Ops reference: docs/PLATFORM-OPERATIONS-GUIDE.md ("Relay Execution Service").
+# ONE SWEEP RUN = ONE VENTURE (CLONE-v2.2 / CL3). This line covers venture #1
+# (--venture defaults to hillsborough_distress). Send window, daily ceiling,
+# Slack channel and kill-switch key are all per-venture, so a second venture
+# needs its own line rather than a wider batch — uncomment and set the key
+# after provisioning it (docs/venture-onboarding.md):
+#   */30 * * * * $PROJECT/scripts/cron/run.sh src.services.relay --sweep --venture venture_two
 */30 * * * * $PROJECT/scripts/cron/run.sh src.services.relay --sweep
+
+# ── AGENT LANE: VENTURE LADDER (CLONE-v2.2 / CL4) ────────────────────────────
+# Venture ladder evaluator — daily 09:30 UTC. Walks every venture (active AND
+# inactive: a radar candidate is an inactive row), evaluates its rung's gates,
+# advances the ones that are all green, runs the auto-double rule, and posts a
+# digest to Slack. Thresholds: config/venture_ladder.py. Runbook:
+# docs/venture-ladder.md.
+#
+# Deliberately at 09:30, clear of the 04:00-08:00 scraper -> CDS -> skip-trace
+# -> GHL chain and after the 08:10 daily report, so the unit-economics rung
+# reads a settled day rather than one mid-ingest.
+#
+# cell -> spin_up is NOT advanced here even when every gate is green — spin-up
+# buys a domain, mailbox warmup, an Instantly seat and proxy capacity. The
+# presell gate authorises that spend; a human releases it by running the task
+# with --advance-spin-up.
+30 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.venture_ladder_evaluator
 
 # T-B12-07 — Deal-of-the-day daily pick (idempotent, one row per date).
 # Runs after CDS scoring so today's top-CDS undelivered lead is available.
@@ -893,5 +947,31 @@ COUNTY_ID=hillsborough
 # the checkout webhook (transient wallet/DB error). Idempotent, cheap;
 # every 15 min is generous relative to how rarely this should fire.
 */15 * * * * $PROJECT/scripts/cron/run.sh src.services.winback_offers --reconcile
+
+# THROUGH-v2.2 T4 — Monthly standing-order digest. 1st of each month, 9am:
+# posts every active auto-approval rule to Slack with Keep/Archive buttons so
+# Josh can prune. Inaction = keep (no auto-expire).
+0 9 1 * * $PROJECT/scripts/cron/run.sh src.services.cora_throughput.standing_order_digest
+
+# DNC re-scrub — subscribers target (Section 2.5 voice-compliance gate:
+# self-signup phones never get a dnc_phone_checks row today, so every outbound
+# voice call to them fail-closes with reason='dnc_check_required' in
+# compliance_gator.py). Tracerfy is already the vendor (same account used for
+# skip-trace); this just adds the target that was never scheduled.
+#
+# Runs 1st AND 15th, NOT monthly. compliance_gator.py:74,84 blocks when
+# checked_at is older than settings.dnc_recheck_days (default 30). A
+# once-monthly run leaves a 31-day gap in 31-day months, so the check would go
+# stale ~1 day before its own refresh and silently block all voice dispatch
+# for that day, 7 months a year. Twice-monthly keeps the worst-case gap at 16
+# days — comfortably inside the window. Do NOT raise DNC_RECHECK_DAYS to
+# compensate: the FTC safe harbour is 31 days, so 30 is deliberately
+# conservative.
+#
+# Cost: $0.02/phone/run, all non-null subscriber phones re-scrubbed each run
+# (no per-phone staleness tracking). 56 phones today = ~$1.12/run, ~$2.24/mo.
+# Verified via: PYTHONPATH=. python -m src.tasks.dnc_refresh --targets subscribers --dry-run
+# Sign-off received — enabled 2026-07-28.
+0 2 1,15 * * $PROJECT/scripts/cron/run.sh src.tasks.dnc_refresh --targets subscribers
 
 # === END FORCED-ACTION-PLATFORM ===

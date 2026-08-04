@@ -699,7 +699,7 @@ def push_subscriber_to_ghl(
                 "contactId":       contact_id,
                 "name":            f"Subscriber — {subscriber.tier} / {subscriber.vertical}",
                 "status":          "open" if stage == 5 else "lost",
-                "monetaryValue":   {"starter": 600, "pro": 1100, "dominator": 2000}.get(
+                "monetaryValue":   {"starter": 299, "pro": 499, "founder": 1100}.get(
                     subscriber.tier, 0
                 ),
             }

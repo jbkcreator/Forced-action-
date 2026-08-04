@@ -18,7 +18,7 @@ import logging
 import secrets
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional, Literal
+from typing import Any, Dict, List, Optional, Literal
 
 import pandas as pd
 import stripe
@@ -30,6 +30,7 @@ from sqlalchemy import and_, case, distinct, func, or_, select, text
 from sqlalchemy.orm import Session
 
 from config.settings import settings
+from config.venture_template import DEFAULT_VENTURE_KEY
 from src.api.deps import get_db
 from src.core.database import get_db_context
 from src.core.models import (
@@ -147,6 +148,42 @@ def _run_tax_enrichment(county_id: str, df: "pd.DataFrame") -> None:
         logger.info("[Admin] Tax enrichment (background) complete: %s", result)
     except Exception:
         logger.exception("[Admin] Tax enrichment (background) failed for county=%s", county_id)
+
+
+@router.post("/entitlements/resync")
+def resync_entitlements(
+    plan_id: Optional[str] = None,
+    dry_run: bool = False,
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """Re-propagate `plans.entitlements` onto stale per-account snapshots.
+
+    The snapshot is only written at subscription-activation time, so a plan-catalog
+    edit leaves existing accounts stale and silently excluded from lead delivery.
+    Run this after any catalog change made outside the seed scripts. Scope with
+    `plan_id` to limit the blast radius; `dry_run` reports drift without writing.
+    Returns {drifted, updated, dry_run, plans[]}.
+    """
+    from src.services.entitlement_sync import resync_lead_entitlements
+
+    try:
+        result = resync_lead_entitlements(
+            db, plan_ids=[plan_id] if plan_id else None, dry_run=dry_run
+        )
+        if not dry_run:
+            db.commit()
+    except Exception:
+        db.rollback()
+        logger.error("[Admin] entitlement resync failed", exc_info=True)
+        raise HTTPException(status_code=500, detail="Entitlement resync failed")
+
+    return {
+        "drifted": len(result.drifted),
+        "updated": result.updated,
+        "dry_run": result.dry_run,
+        "plans": sorted(result.plan_ids),
+    }
 
 
 @router.post("/import/founder-portfolio")
@@ -689,14 +726,23 @@ def synthflow_config(_admin: dict = Depends(get_current_admin)):
     import yaml
 
     agents = []
-    for fname in ["finetuner_roofing_agent.json", "finetuner_remediation_agent.json"]:
+    for fname in [
+        "finetuner_roofing_agent.json",
+        "finetuner_remediation_agent.json",
+        "finetuner_revenue_recovery_agent.json",
+    ]:
         p = _CONFIG_DIR / fname
         if not p.exists():
             continue
         data = json.loads(p.read_text(encoding="utf-8"))
         cfg = data.get("configuration", {})
         meta = data.get("source_metadata", {})
-        vertical = "roofing" if "roofing" in fname else "remediation"
+        if "roofing" in fname:
+            vertical = "roofing"
+        elif "remediation" in fname:
+            vertical = "remediation"
+        else:
+            vertical = "revenue_recovery"
         agents.append({
             "vertical": vertical,
             "agent_id": meta.get("agent_id"),
@@ -713,7 +759,11 @@ def synthflow_config(_admin: dict = Depends(get_current_admin)):
 
     campaigns = []
     prompts = []
-    for fname in ["synthflow_roofing_agent.yaml", "synthflow_remediation_agent.yaml"]:
+    for fname in [
+        "synthflow_roofing_agent.yaml",
+        "synthflow_remediation_agent.yaml",
+        "synthflow_revenue_recovery_agent.yaml",
+    ]:
         p = _CONFIG_DIR / "prompts" / fname
         if not p.exists():
             continue
@@ -1291,25 +1341,64 @@ def _slack_ephemeral(text: str) -> dict:
     return {"response_type": "ephemeral", "text": text}
 
 
-@router.post("/slack/county-launch/interact")
-async def slack_county_launch_interact(request: Request, db: Session = Depends(get_db)):
+def _parse_slack_interactive_payload(raw: bytes) -> dict:
+    """Shared by every Block Kit button endpoint below (not /slack/kill,
+    which is a slash command with a differently-shaped body)."""
+    try:
+        payload_str = parse_qs(raw.decode("utf-8")).get("payload", ["{}"])[0]
+        return json.loads(payload_str)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Malformed payload")
+
+
+@router.post("/slack/interact")
+async def slack_interact(request: Request, db: Session = Depends(get_db)):
     """
-    Receives Slack interactive component payloads for county-launch approval buttons.
+    Single Interactivity Request URL for every Slack Block Kit button in
+    this app. Slack allows exactly one Interactivity Request URL per app —
+    county-launch, relay-decision, and win-story previously each tried to
+    register their own, which meant at most one of the three was ever
+    actually reachable from Slack. This endpoint is the one Request URL
+    Slack's Interactivity setting should point at; it dispatches on the
+    clicked button's action_id.
     Auth: Slack HMAC-SHA256 signature (no JWT — Slack signature IS the auth).
     """
     raw = await request.body()
     if not _verify_slack_signature(dict(request.headers), raw):
         raise HTTPException(status_code=401, detail="Invalid Slack signature")
 
-    try:
-        payload_str = parse_qs(raw.decode("utf-8")).get("payload", ["{}"])[0]
-        payload = json.loads(payload_str)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Malformed payload")
+    payload = _parse_slack_interactive_payload(raw)
+    actions = payload.get("actions", [])
+    action_id = actions[0].get("action_id") if actions else None
 
+    if action_id == "county_launch_decision":
+        return _handle_county_launch_interact(payload, db)
+    if action_id in ("approve", "reject"):
+        return _handle_relay_decision(payload)
+    if action_id in ("approve_win_story", "dismiss_win_story"):
+        return _handle_win_story_interact(payload, db)
+
+    return _slack_ephemeral(f"Unrecognized action: {action_id}")
+
+
+@router.post("/slack/county-launch/interact")
+async def slack_county_launch_interact(request: Request, db: Session = Depends(get_db)):
+    """Deprecated individual URL — kept as an alias until the Slack app's
+    Interactivity Request URL is cut over to /slack/interact."""
+    raw = await request.body()
+    if not _verify_slack_signature(dict(request.headers), raw):
+        raise HTTPException(status_code=401, detail="Invalid Slack signature")
+    return _handle_county_launch_interact(_parse_slack_interactive_payload(raw), db)
+
+
+def _handle_county_launch_interact(payload: dict, db: Session) -> dict:
+    """Approve/Skip a county-launch candidate."""
     user_id = payload.get("user", {}).get("id", "")
     approvers = settings.county_launch_approvers
-    if approvers and user_id not in approvers:
+    # Fail CLOSED: an empty/unset COUNTY_LAUNCH_APPROVERS must mean nobody is
+    # authorized, not everybody — this endpoint hadn't received the fix
+    # already applied to _relay_approver_authorized (PR #179 finding #3).
+    if not approvers or user_id not in approvers:
         return _slack_ephemeral("Not authorized to approve county launches.")
 
     actions = payload.get("actions", [])
@@ -1399,7 +1488,7 @@ def _update_slack_message(candidate: "ExpansionCandidate", reply_text: str) -> N
 # RELAY — APPROVAL QUEUE DECISION + KILL COMMAND (RELAY-v2.2 sub-task R1)
 # ===========================================================================
 
-def _relay_approver_authorized(user_id: str) -> bool:
+def _relay_approver_authorized(user_id: str, venture_key: Optional[str] = None) -> bool:
     """Fail CLOSED: an empty/unset RELAY_APPROVERS means NOBODY is
     authorized, not everybody (PR #179 review finding #3). The previous
     per-endpoint checks (`if approvers and user_id not in approvers`)
@@ -1408,16 +1497,59 @@ def _relay_approver_authorized(user_id: str) -> bool:
     (a valid Slack signature only proves the request came from Slack for
     this app -- it says nothing about which workspace member sent it).
     Shared by both /slack/relay-decision and /slack/kill so the fix lives
-    in one place rather than two easily-desynced copies."""
-    approvers = settings.relay_approvers
-    return bool(approvers) and user_id in approvers
+    in one place rather than two easily-desynced copies.
+
+    `venture_key` widens the list for one venture (CLONE-v2.2 / CL3):
+    RELAY_APPROVERS is the FLEET operator list and authorizes every venture,
+    while a venture's own ventures.relay_approvers adds approvers for just
+    that venture. Union of the two, so venture A's venture-specific approvers
+    still cannot decide venture B's items. Omitted for the fleet-wide
+    /slack/kill command, which has no item and therefore no venture.
+
+    The fleet list is checked FIRST, deliberately: it reads this module's own
+    `settings` binding, needs no DB, and cannot be skewed by
+    get_venture_config()'s 5-minute cache. Both empty still means NOBODY is
+    authorized. (A venture-specific approver removal takes up to that cache
+    TTL to take effect — remove them from the fleet list too if it must be
+    immediate.)
+    """
+    if not user_id:
+        return False
+
+    fleet_approvers = settings.relay_approvers or ()
+    if user_id in fleet_approvers:
+        return True
+
+    if venture_key is None:
+        return False
+
+    from src.utils.venture_config import get_venture_config
+
+    venture_approvers = get_venture_config(venture_key).relay_approvers or ()
+    return user_id in venture_approvers
 
 
-def _update_relay_slack_message(slack_message_ts: str, reply_text: str) -> None:
+def _update_relay_slack_message(
+    slack_message_ts: str, reply_text: str, venture_key: str = DEFAULT_VENTURE_KEY,
+) -> None:
     """Replace the Approve/Reject buttons with the decision outcome, in
-    place. Mirrors _update_slack_message's county-launch pattern."""
+    place. Mirrors _update_slack_message's county-launch pattern.
+
+    The channel must be the venture's own (CLONE-v2.2 / CL3) — a ts from one
+    channel cannot be edited in another, so using a single global channel here
+    would fail every edit for every venture but the first.
+    """
+    from src.utils.venture_config import get_venture_config
+
     token = settings.slack_bot_token
-    channel = settings.relay_slack_channel
+    # `or settings.relay_slack_channel` rather than relying on the resolver's
+    # own settings fallback: the resolver reads config.settings.get_settings(),
+    # which can be a different object from this module's `settings` binding
+    # (see the note in tests/test_relay_slack_endpoints.py's fixture).
+    channel = (
+        get_venture_config(venture_key).relay_slack_channel
+        or settings.relay_slack_channel
+    )
     if not token or not channel or not slack_message_ts:
         return
     try:
@@ -1435,26 +1567,20 @@ def _update_relay_slack_message(slack_message_ts: str, reply_text: str) -> None:
 
 @router.post("/slack/relay-decision")
 async def slack_relay_decision(request: Request):
-    """
-    Receives Slack interactive component payloads for Relay approval-queue
-    Approve/Reject buttons (build spec §1.1.13 tap surface).
-    Auth: Slack HMAC-SHA256 signature (no JWT — Slack signature IS the auth).
-    """
-    from src.services.relay import queue as relay_queue
-
+    """Deprecated individual URL — kept as an alias until the Slack app's
+    Interactivity Request URL is cut over to /slack/interact."""
     raw = await request.body()
     if not _verify_slack_signature(dict(request.headers), raw):
         raise HTTPException(status_code=401, detail="Invalid Slack signature")
+    return _handle_relay_decision(_parse_slack_interactive_payload(raw))
 
-    try:
-        payload_str = parse_qs(raw.decode("utf-8")).get("payload", ["{}"])[0]
-        payload = json.loads(payload_str)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Malformed payload")
+
+def _handle_relay_decision(payload: dict) -> dict:
+    """Approve/Reject a pending Relay approval-queue item (build spec
+    §1.1.13 tap surface)."""
+    from src.services.relay import queue as relay_queue
 
     user_id = payload.get("user", {}).get("id", "")
-    if not _relay_approver_authorized(user_id):
-        return _slack_ephemeral("Not authorized to approve Relay sends.")
 
     actions = payload.get("actions", [])
     if not actions:
@@ -1470,6 +1596,16 @@ async def slack_relay_decision(request: Request):
     if not item_id or action not in ("approve", "reject"):
         raise HTTPException(status_code=400, detail="Invalid action data")
 
+    # Authorization is scoped to the item's own venture (CLONE-v2.2 / CL3), so
+    # the row has to be read before the check. An unknown id falls back to
+    # venture #1's approver list rather than skipping the check.
+    existing = relay_queue.get_item(item_id)
+    venture_key = existing.venture_key if existing is not None else DEFAULT_VENTURE_KEY
+    if not _relay_approver_authorized(user_id, venture_key):
+        return _slack_ephemeral("Not authorized to approve Relay sends.")
+    if existing is None:
+        return _slack_ephemeral(f"Item #{item_id} not found.")
+
     item = relay_queue.record_decision(item_id, approved=(action == "approve"), decided_by=user_id)
     if item is None:
         return _slack_ephemeral(f"Item #{item_id} was already decided (not still pending).")
@@ -1480,9 +1616,221 @@ async def slack_relay_decision(request: Request):
         else f":no_entry: Rejected by <@{user_id}>."
     )
     if item.slack_message_ts:
-        _update_relay_slack_message(item.slack_message_ts, reply_text)
+        _update_relay_slack_message(item.slack_message_ts, reply_text, item.venture_key)
 
     return {"ok": True}
+
+
+# ===========================================================================
+# THROUGH-v2.2 — BATCH-APPROVAL SLACK INTERACTION (T1)
+# ===========================================================================
+
+def _through_approver_authorized(user_id: str) -> bool:
+    """Fail CLOSED, same reasoning as _relay_approver_authorized: an empty/
+    unset CORA_THROUGHPUT_APPROVERS means nobody is authorized, not
+    everybody."""
+    approvers = settings.cora_throughput_approvers
+    return bool(approvers) and user_id in approvers
+
+
+@router.post("/slack/cora-batch/interact")
+async def slack_cora_batch_interact(request: Request, db: Session = Depends(get_db)):
+    """
+    Receives Slack interactive component payloads for THROUGH-v2.2's batch
+    review ("Approve Batch" / per-item "Reject") and standing-order
+    proposals ("Ratify" / "Decline") — two different action families on the
+    same endpoint, distinguished by whether the button's value carries a
+    batch_id or a standing_order_id.
+    Auth: Slack HMAC-SHA256 signature (no JWT — Slack signature IS the auth).
+    """
+    from src.services.cora_throughput import batch_slack as through_slack
+    from src.services.cora_throughput.decisions import record_batch_decision, record_standing_order_decision
+
+    raw = await request.body()
+    if not _verify_slack_signature(dict(request.headers), raw):
+        raise HTTPException(status_code=401, detail="Invalid Slack signature")
+
+    try:
+        payload_str = parse_qs(raw.decode("utf-8")).get("payload", ["{}"])[0]
+        payload = json.loads(payload_str)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Malformed payload")
+
+    user_id = payload.get("user", {}).get("id", "")
+    if not _through_approver_authorized(user_id):
+        return _slack_ephemeral("Not authorized to approve Cora batches.")
+
+    actions = payload.get("actions", [])
+    if not actions:
+        return _slack_ephemeral("No action found in payload.")
+
+    try:
+        action_data = json.loads(actions[0].get("value", "{}"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid action value")
+
+    action = action_data.get("action")
+
+    if action == "keep_standing_order":
+        # Monthly-digest "Keep" button — inaction means keep. Ack only.
+        return {"ok": True}
+
+    if action in ("ratify_standing_order", "decline_standing_order", "archive_standing_order"):
+        standing_order_id = action_data.get("standing_order_id")
+        if not standing_order_id:
+            raise HTTPException(status_code=400, detail="Invalid action data")
+        result = record_standing_order_decision(db, standing_order_id, action, decided_by=user_id)
+        db.commit()
+        if not result.get("ok"):
+            return _slack_ephemeral(f"Standing order #{standing_order_id}: {result.get('reason', 'could not be decided')}.")
+        reply_text = {
+            "ratify_standing_order": f":white_check_mark: Standing order ratified by <@{user_id}>.",
+            "decline_standing_order": f":no_entry: Standing order declined by <@{user_id}>.",
+            "archive_standing_order": f":wastebasket: Standing order archived by <@{user_id}>.",
+        }[action]
+        if result.get("slack_message_ts"):
+            through_slack.update_batch_slack_message(result["slack_message_ts"], reply_text)
+        return {"ok": True}
+
+    batch_id = action_data.get("batch_id")
+    draft_id = action_data.get("draft_id")
+    if not batch_id or action not in ("approve_all", "reject_item"):
+        raise HTTPException(status_code=400, detail="Invalid action data")
+
+    result = record_batch_decision(db, batch_id, action, decided_by=user_id, draft_id=draft_id)
+    db.commit()
+
+    if not result.get("ok"):
+        return _slack_ephemeral(f"Batch {batch_id[:8]}: {result.get('reason', 'could not be decided')}.")
+
+    slack_message_ts_row = db.execute(
+        text("SELECT slack_message_ts FROM cora_draft_batches WHERE batch_id = :batch_id"),
+        {"batch_id": batch_id},
+    ).first()
+    slack_message_ts = slack_message_ts_row[0] if slack_message_ts_row else None
+
+    if action == "approve_all":
+        reply_text = (
+            f":white_check_mark: Batch approved by <@{user_id}> — "
+            f"{result['approved_count']} sent to Relay, {result['rejected_count']} exception-rejected."
+        )
+    else:
+        reply_text = f":no_entry: Draft `{draft_id[:8]}` exception-rejected by <@{user_id}> — rest of the batch still open."
+
+    if slack_message_ts:
+        through_slack.update_batch_slack_message(slack_message_ts, reply_text)
+
+    return {"ok": True}
+
+
+# ===========================================================================
+# THROUGH-v2.2 — QUEUE VISIBILITY (read-only — all decisions happen in Slack)
+# ===========================================================================
+
+@router.get("/cora-batches")
+def get_cora_batches(
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    Read-only visibility into THROUGH-v2.2's batch queue and standing orders
+    — approve/reject/ratify/decline only ever happen via the Slack tap
+    (POST /admin/slack/cora-batch/interact). This endpoint has no mutation
+    path, deliberately: the founder-facing "one tap" flow stays in Slack.
+    """
+    batches = db.execute(
+        text(
+            """
+            SELECT b.batch_id, b.status, b.created_at, b.decided_by, b.decided_at,
+                   (SELECT count(*) FROM cora_batch_items WHERE cora_batch_items.batch_id = b.batch_id) AS item_count,
+                   (SELECT count(*) FROM cora_batch_items
+                    WHERE cora_batch_items.batch_id = b.batch_id AND cora_batch_items.decision = 'exception_rejected') AS rejected_count
+            FROM cora_draft_batches b
+            ORDER BY b.created_at DESC
+            LIMIT 20
+            """
+        )
+    ).mappings().all()
+
+    standing_orders = db.execute(
+        text(
+            "SELECT id, cell_id, rule_text, active, created_by, created_at "
+            "FROM cora_standing_orders ORDER BY created_at DESC LIMIT 20"
+        )
+    ).mappings().all()
+
+    return {
+        "batches": [dict(r) for r in batches],
+        "standing_orders": [dict(r) for r in standing_orders],
+    }
+
+
+# ===========================================================================
+# THROUGH-v2.2 — CLOSING COCKPIT (T3)
+# ===========================================================================
+
+@router.get("/closing-cockpit/{opportunity_thread_id}")
+def get_closing_cockpit(
+    opportunity_thread_id: str,
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    One-screen call-time reference: prospect identity, latest pre-call brief
+    (objections/recommended offer/pricing/links — already built by Cora's
+    pre_call subgraph, no new brief logic here), and best-effort call
+    history. The SynthflowCall/CloserCall join is phone-based, not an FK —
+    none exists linking either table back to opportunity_thread_id — so a
+    miss here means "no match found," never an error.
+    """
+    from src.agents.cora import store
+    from src.agents.cora.tools.read_tools import get_buyer_entity_by_opportunity_thread_id, get_contact_channel
+    from src.services.phone_utils import normalize as normalize_phone
+
+    buyer_entity = get_buyer_entity_by_opportunity_thread_id(db, opportunity_thread_id)
+    if buyer_entity is None:
+        raise HTTPException(status_code=404, detail="Opportunity thread not found")
+
+    briefs = sorted(
+        store.read_pre_call_briefs(opportunity_thread_id=opportunity_thread_id),
+        key=lambda b: b.get("created_at") or "",
+    )
+    latest_brief = briefs[-1] if briefs else None
+
+    contact = get_contact_channel(db, buyer_entity["id"])
+    normalized_phone = normalize_phone(contact.get("phone"))
+
+    synthflow_calls: List[Dict[str, Any]] = []
+    closer_calls: List[Dict[str, Any]] = []
+    if normalized_phone:
+        synthflow_rows = db.execute(
+            text(
+                "SELECT id, outcome, vertical, call_date, duration_seconds, recording_url "
+                "FROM synthflow_calls WHERE prospect_phone = :phone ORDER BY call_date DESC LIMIT 10"
+            ),
+            {"phone": normalized_phone},
+        ).mappings().all()
+        synthflow_calls = [dict(r) for r in synthflow_rows]
+
+        closer_rows = db.execute(
+            text(
+                "SELECT id, closer_name, direction, started_at, ended_at, call_outcome, "
+                "sentiment, objections, objection_resolved "
+                "FROM closer_calls WHERE dialed_e164 = :phone ORDER BY started_at DESC LIMIT 10"
+            ),
+            {"phone": normalized_phone},
+        ).mappings().all()
+        closer_calls = [dict(r) for r in closer_rows]
+
+    return {
+        "opportunity_thread_id": opportunity_thread_id,
+        "buyer_entity": buyer_entity,
+        "contact": {"email": contact.get("email"), "phone": normalized_phone},
+        "pre_call_brief": latest_brief.get("content") if latest_brief else None,
+        "call_history_match": "phone" if normalized_phone else "none",
+        "synthflow_calls": synthflow_calls,
+        "closer_calls": closer_calls,
+    }
 
 
 @router.post("/slack/kill")
@@ -1544,7 +1892,7 @@ def approve_win_story(
     Sets is_public=True and records the approver's email.
     """
     row = db.execute(
-        sa_text("SELECT id, is_public FROM win_story_assets WHERE id = :id FOR UPDATE"),
+        text("SELECT id, is_public FROM win_story_assets WHERE id = :id FOR UPDATE"),
         {"id": asset_id},
     ).fetchone()
     if not row:
@@ -1552,7 +1900,7 @@ def approve_win_story(
     if row.is_public:
         return {"ok": True, "detail": "already_public"}
     db.execute(
-        sa_text("""
+        text("""
             UPDATE win_story_assets
                SET is_public = true, approved_by = :by
              WHERE id = :id
@@ -1566,20 +1914,16 @@ def approve_win_story(
 
 @router.post("/slack/win-story/interact")
 async def slack_win_story_interact(request: Request, db: Session = Depends(get_db)):
-    """
-    Receives Slack interactive payloads for win-story Approve/Dismiss buttons.
-    Auth: Slack HMAC-SHA256 signature.
-    """
+    """Deprecated individual URL — kept as an alias until the Slack app's
+    Interactivity Request URL is cut over to /slack/interact."""
     raw = await request.body()
     if not _verify_slack_signature(dict(request.headers), raw):
         raise HTTPException(status_code=401, detail="Invalid Slack signature")
+    return _handle_win_story_interact(_parse_slack_interactive_payload(raw), db)
 
-    try:
-        payload_str = parse_qs(raw.decode("utf-8")).get("payload", ["{}"])[0]
-        payload = json.loads(payload_str)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Malformed payload")
 
+def _handle_win_story_interact(payload: dict, db: Session) -> dict:
+    """Approve/Dismiss a staged win-story asset."""
     actions = payload.get("actions", [])
     if not actions:
         return _slack_ephemeral("No action in payload.")
@@ -1597,7 +1941,7 @@ async def slack_win_story_interact(request: Request, db: Session = Depends(get_d
         raise HTTPException(status_code=400, detail="Invalid action data")
 
     row = db.execute(
-        sa_text("SELECT id, is_public, proof_text FROM win_story_assets WHERE id = :id FOR UPDATE"),
+        text("SELECT id, is_public, proof_text FROM win_story_assets WHERE id = :id FOR UPDATE"),
         {"id": asset_id},
     ).fetchone()
 
@@ -1608,7 +1952,7 @@ async def slack_win_story_interact(request: Request, db: Session = Depends(get_d
 
     if action == "approve":
         db.execute(
-            sa_text("""
+            text("""
                 UPDATE win_story_assets
                    SET is_public = true, approved_by = :by
                  WHERE id = :id
@@ -2081,10 +2425,14 @@ def dev_ping(_admin: dict = Depends(get_current_admin)):
 class CountyCreateRequest(BaseModel):
     county_id: str
     display_name: str
+    # Which venture owns this county (CLONE-v2.2 / CL3). Defaults to venture
+    # #1 so existing callers are unaffected.
+    venture_key: str = DEFAULT_VENTURE_KEY
     fips: Optional[str] = None
     nws_zone: Optional[str] = None
     parcel_id_format: str = "folio"
     bankruptcy_division: Optional[str] = None
+    zip_prefixes: list[str] = []
     city_filer_keywords: list[str] = []
     code_lien_type_map: dict = {}
     landing_featured_testimonials: Optional[list[dict]] = None
@@ -2093,10 +2441,12 @@ class CountyCreateRequest(BaseModel):
 
 class CountyUpdateRequest(BaseModel):
     display_name: Optional[str] = None
+    venture_key: Optional[str] = None
     fips: Optional[str] = None
     nws_zone: Optional[str] = None
     parcel_id_format: Optional[str] = None
     bankruptcy_division: Optional[str] = None
+    zip_prefixes: Optional[list[str]] = None
     city_filer_keywords: Optional[list[str]] = None
     code_lien_type_map: Optional[dict] = None
     is_active: Optional[bool] = None
@@ -2145,14 +2495,34 @@ class CountySourceUpdateRequest(BaseModel):
     scrape_mode: Optional[ScrapeMode] = None
 
 
+def _require_venture(venture_key: str, db: Session) -> None:
+    """422 if venture_key names no active venture (CLONE-v2.2 / CL3).
+
+    counties.venture_key is a real foreign key, so without this check a typo'd
+    key surfaces as an IntegrityError and a 500 instead of a message the
+    admin can act on.
+    """
+    exists = db.execute(
+        text("SELECT 1 FROM ventures WHERE venture_key = :key AND is_active = true"),
+        {"key": venture_key},
+    ).first()
+    if not exists:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown or inactive venture '{venture_key}'",
+        )
+
+
 def _county_to_dict(county: County) -> dict:
     return {
         "county_id":           county.county_id,
         "display_name":        county.display_name,
+        "venture_key":         county.venture_key,
         "fips":                county.fips,
         "nws_zone":            county.nws_zone,
         "parcel_id_format":    county.parcel_id_format,
         "bankruptcy_division": county.bankruptcy_division,
+        "zip_prefixes":        county.zip_prefixes or [],
         "city_filer_keywords": county.city_filer_keywords or [],
         "code_lien_type_map":  county.code_lien_type_map or {},
         "landing_featured_testimonials": county.landing_featured_testimonials or [],
@@ -2207,14 +2577,17 @@ def create_county(
 ):
     if db.query(County).filter_by(county_id=body.county_id).first():
         raise HTTPException(status_code=409, detail=f"County '{body.county_id}' already exists")
+    _require_venture(body.venture_key, db)
 
     county = County(
         county_id=body.county_id,
         display_name=body.display_name,
+        venture_key=body.venture_key,
         fips=body.fips,
         nws_zone=body.nws_zone,
         parcel_id_format=body.parcel_id_format,
         bankruptcy_division=body.bankruptcy_division,
+        zip_prefixes=body.zip_prefixes,
         city_filer_keywords=body.city_filer_keywords,
         code_lien_type_map=body.code_lien_type_map,
         landing_featured_testimonials=body.landing_featured_testimonials,
@@ -2253,6 +2626,8 @@ def update_county(
         raise HTTPException(status_code=404, detail=f"County '{county_id}' not found")
 
     updates = body.model_dump(exclude_unset=True)
+    if "venture_key" in updates:
+        _require_venture(updates["venture_key"], db)
     for field, value in updates.items():
         setattr(county, field, value)
 

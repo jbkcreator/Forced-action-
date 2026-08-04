@@ -14,6 +14,7 @@ from sqlalchemy import text
 
 from config.settings import get_settings
 from src.core.database import get_db_context
+from src.services.entitlement_sync import resync_lead_entitlements
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 logger = logging.getLogger("seed_s1_plans")
@@ -59,11 +60,18 @@ def main() -> int:
     with get_db_context() as db:
         for p in plans:
             db.execute(_UPSERT, p)
+
+        # A catalog edit does not reach existing accounts on its own — the per-account
+        # lead_entitlement snapshot is only written at subscription-activation time.
+        # Without this, re-seeding looks successful while every existing account keeps
+        # a stale snapshot and stays excluded from lead delivery.
+        result = resync_lead_entitlements(db, plan_ids=[p["plan_id"] for p in plans])
         db.commit()
 
     if not starter_price_id:
         logger.warning("STRIPE_PRICE_STARTER_REGULAR not set — starter.stripe_price_id is NULL")
     logger.info("seeded plans: free_trial, starter")
+    logger.info("resynced %d existing account entitlement snapshot(s)", result.updated)
     return 0
 
 
