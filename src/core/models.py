@@ -9925,3 +9925,49 @@ class SourceFailoverLog(Base):
         ),
         Index("idx_source_failover_log_lookup", "source_type", "county_id", "occurred_at"),
     )
+
+
+class ExperimentAttribution(Base):
+    """LEARN-v2.2 Layer 2 — one attribution row per fleet event credited to
+    an experiment arm.
+
+    Written by the nightly experiment_attribution_sweep. Idempotent on
+    (fleet_event_id, assignment_id) — re-running the sweep never double-counts.
+
+    attribution_method: 'draft_match' when a draft on the same thread was
+    found within window_days; 'last_touch' when the assignment itself is
+    within window_days but no matching draft exists.
+    """
+    __tablename__ = "experiment_attributions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    fleet_event_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("fleet_events.id"), nullable=False
+    )
+    assignment_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("agent_lane_experiment_assignments.id"), nullable=False
+    )
+    test_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("agent_lane_experiments.id"), nullable=False, index=True
+    )
+    opportunity_thread_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    variant: Mapped[str] = mapped_column(String(10), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    attribution_method: Mapped[str] = mapped_column(String(20), nullable=False)
+    window_days: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    attributed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint("fleet_event_id", "assignment_id", name="uq_experiment_attribution"),
+        Index("idx_experiment_attribution_test", "test_id", "event_type", "attributed_at"),
+        Index("idx_experiment_attribution_thread", "opportunity_thread_id"),
+        CheckConstraint(
+            "attribution_method IN ('draft_match','last_touch')",
+            name="ck_experiment_attribution_method",
+        ),
+    )
