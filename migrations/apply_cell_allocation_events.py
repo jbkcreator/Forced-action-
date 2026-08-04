@@ -15,9 +15,9 @@ from __future__ import annotations
 
 import logging
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
-from config.settings import get_settings
+from src.core.database import get_db_context
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -49,11 +49,8 @@ ALTER TABLE venture_ladder_events
 
 
 def main() -> None:
-    settings = get_settings()
-    engine = create_engine(settings.database_url, pool_pre_ping=True)
-
-    with engine.begin() as conn:
-        already = conn.execute(text(_CHECK_ALREADY_PRESENT)).first()
+    with get_db_context() as db:
+        already = db.execute(text(_CHECK_ALREADY_PRESENT)).first()
         if already:
             logger.info(
                 "venture_ladder_events CHECK already contains 'auto_throttle' — skipping."
@@ -61,10 +58,11 @@ def main() -> None:
             return
 
         logger.info("Dropping existing decision CHECK constraint …")
-        conn.execute(text(_DROP_CONSTRAINT))
+        db.execute(text(_DROP_CONSTRAINT))
 
         logger.info("Adding widened decision CHECK constraint …")
-        conn.execute(text(_ADD_CONSTRAINT))
+        db.execute(text(_ADD_CONSTRAINT))
+        db.commit()
 
     logger.info("apply_cell_allocation_events complete.")
 
