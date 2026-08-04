@@ -5,10 +5,10 @@ One daily job that codes both terminal outcomes it can infer without a human:
 
   1. Wins from payment.received fleet events (sweep_payment_wins) —
      NULL-tolerant; codes nothing until a payment.received carries a thread_id.
-  2. no_response losses by timeout — a thread that had >=1 outbound draft, has
-     never received a reply.received fleet event, has no outcome row yet, and
-     whose most recent draft is older than NO_RESPONSE_DAYS (30) is terminal
-     lost/no_response.
+  2. no_response losses by timeout — a thread that had >=1 DISPATCHED send
+     (relay_approval_queue.dispatched_at), has never received a reply.received
+     fleet event, has no outcome row yet, and whose most recent dispatch is
+     older than NO_RESPONSE_DAYS (30) is terminal lost/no_response.
 
 Loss reasons other than no_response are supplied by a human via the admin tap
 endpoint — never inferred here.
@@ -45,14 +45,24 @@ NO_RESPONSE_DAYS = 30
 
 
 def _find_no_response_threads(db) -> list[str]:
-    """Threads that timed out with no reply: >=1 draft, no reply.received, no
-    outcome row, newest draft older than NO_RESPONSE_DAYS."""
+    """Threads that timed out with no reply: >=1 dispatched send, no
+    reply.received, no outcome row, last dispatch older than NO_RESPONSE_DAYS.
+
+    "Contacted" means an actually-dispatched relay_approval_queue row
+    (dispatched_at IS NOT NULL) — not a draft, which may be
+    rejected/expired/superseded/approved_pending_send and never sent. Mirrors
+    venture_ladder._CELL_REPLY_RATES' definition of a send, and anchors the
+    timeout on MAX(q.dispatched_at) (the last actual send)."""
     rows = db.execute(text("""
         SELECT d.opportunity_thread_id
         FROM outbound_drafts d
+        JOIN relay_approval_queue q
+               ON q.thread_id = d.opportunity_thread_id
+              AND q.venture_key = d.venture_key
+              AND q.dispatched_at IS NOT NULL
         WHERE d.opportunity_thread_id IS NOT NULL
         GROUP BY d.opportunity_thread_id
-        HAVING MAX(d.created_at) < NOW() - (:days || ' days')::interval
+        HAVING MAX(q.dispatched_at) < NOW() - (:days || ' days')::interval
            AND NOT EXISTS (
                SELECT 1 FROM fleet_events fe
                WHERE fe.opportunity_thread_id = d.opportunity_thread_id
