@@ -21,6 +21,7 @@ import sys
 
 from sqlalchemy import text
 
+from config.challenger_floor import validate_challenger_config
 from config.settings import get_settings
 from src.core.database import get_db_context
 from src.services.challenger_floor import ChallengerFloorReport, evaluate_floor
@@ -57,6 +58,15 @@ def run_sweep(dry_run: bool = False) -> dict:
         "errors": 0,
     }
     under_floor_reports: list[ChallengerFloorReport] = []
+
+    # Fail loudly on a malformed floor before touching the DB, matching
+    # cell_allocation.sweep — a bad threshold should not silently propose
+    # nonsense (see validate_challenger_config's own rationale).
+    config_errors = validate_challenger_config()
+    if config_errors:
+        for err in config_errors:
+            logger.error("[challenger_floor_sweep] config invalid: %s", err)
+        raise RuntimeError(f"challenger_floor config invalid: {config_errors[0]}")
 
     with get_db_context() as db:
         venture_keys = _eligible_venture_keys(db)

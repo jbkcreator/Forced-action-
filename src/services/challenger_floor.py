@@ -13,10 +13,16 @@ is a COHORT reserve, not a per-cell guarantee — L3 kill/throttle (see
 src/services/cell_allocation.py) still governs each individual challenger cell;
 the floor protects the cohort as a whole, not any one cell.
 
+NOTE ON "CHALLENGER" (spec fidelity): the spec (line 238) names a distinct
+Opportunity Challenger Board, engine-fit scored. Pre-launch, with no engine-fit
+score or GP data, this build measures the floor over a DERIVED proxy population —
+active campaign cells that L3 has not yet judged — not the literal Challenger
+Board. When engine-fit scoring / a real board exist, that becomes the population;
+the floor math here is unchanged by that swap.
+
 Public surface:
     compute_share(challenger_sends, total_sends, floor_pct, min_total) -> tuple
     classify_cells(db, venture_key, stats) -> tuple[set[str], set[str]]
-    cell_has_verdict(db, venture_key, cell_id) -> bool
     evaluate_floor(db, venture_key, *, now=None) -> ChallengerFloorReport
 """
 from __future__ import annotations
@@ -53,15 +59,6 @@ FROM venture_ladder_events
 WHERE venture_key = :key
   AND decision = ANY(:decisions)
   AND gate_results->>'cell_id' IS NOT NULL
-"""
-
-_ONE_VERDICT = """
-SELECT 1
-FROM venture_ladder_events
-WHERE venture_key = :key
-  AND decision = ANY(:decisions)
-  AND gate_results->>'cell_id' = :cell_id
-LIMIT 1
 """
 
 
@@ -109,20 +106,6 @@ def compute_share(
         else f"challenger cohort at {share_pct}% — under {floor_pct}% floor by {shortfall_pct}%"
     )
     return share_pct, under_floor, shortfall_pct, note
-
-
-def cell_has_verdict(db: Session, venture_key: str, cell_id: str) -> bool:
-    """True if L3 has issued a verdict on this cell.
-
-    Single-cell EXISTS query. Prefer the bulk lookup in classify_cells() when
-    checking many cells — this exists for callers that need one cell only, to
-    avoid a query-in-loop (CLAUDE.md).
-    """
-    row = db.execute(
-        text(_ONE_VERDICT),
-        {"key": venture_key, "decisions": list(VERDICT_DECISIONS), "cell_id": cell_id},
-    ).first()
-    return row is not None
 
 
 def classify_cells(
