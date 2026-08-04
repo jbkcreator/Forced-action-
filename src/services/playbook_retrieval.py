@@ -50,7 +50,7 @@ RETRIEVAL_STATUSES = ("recommended", "adopted")
 MAX_LESSONS = 5
 
 _FETCH_SQL = """
-SELECT id, lesson, entry_kind, confidence, scope
+SELECT id, description AS lesson, entry_kind, confidence, scope
 FROM lifecycle_playbook
 WHERE agent_domain = :agent_domain
   AND status IN :statuses
