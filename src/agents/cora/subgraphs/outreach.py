@@ -132,16 +132,10 @@ def _make_node_price_variant(db: Optional[Session]):
         # arm we didn't assign — "we showed test $X; control $Y was the road not
         # taken". Offer-level counterfactuals ("subscription over pack") need the
         # producer to surface its runner-up cell and are out of scope here.
-        alt_cents = (
-            experiment.control_price_cents
-            if variant.get("arm") == "test"
-            else experiment.test_price_cents
-        )
-        leading_alternative = (
-            f"{'control' if variant.get('arm') == 'test' else 'test'}_price_{alt_cents}"
-            if alt_cents is not None
-            else None
-        )
+        chose_test = variant.get("arm") == "test"
+        alt_arm = "control" if chose_test else "test"
+        alt_cents = experiment.control_price_cents if chose_test else experiment.test_price_cents
+        leading_alternative = f"{alt_arm}_price_{alt_cents}" if alt_cents is not None else None
         record_decision_snapshot(
             thread_id, experiment.test_name, db,
             message_angle=state.get("angle"),
