@@ -365,6 +365,16 @@ def _make_node_persist(db: Optional[Session]):
 
         if state.get("status") == "pending_approval" and state.get("opportunity_thread_id"):
             opportunity_state.mark_replied(state["opportunity_thread_id"], reason="reply_received")
+            if db is not None:
+                try:
+                    from src.services.agent_lane_experiment_engine import record_outcome
+                    from config.prompt_variants import PROMPT_EXPERIMENT_NAME
+                    record_outcome(state["opportunity_thread_id"], PROMPT_EXPERIMENT_NAME, "reply", db)
+                except Exception:
+                    logger.warning(
+                        "reply: failed to record prompt-experiment outcome for thread=%s — continuing",
+                        state.get("opportunity_thread_id"), exc_info=True,
+                    )
             fleet_event = contracts.make_fleet_event(
                 "action.ready", state["opportunity_thread_id"], reply_id=state["reply_id"],
             )
