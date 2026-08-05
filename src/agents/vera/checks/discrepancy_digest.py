@@ -38,6 +38,7 @@ from src.agents.vera.checks._shared import (
     html_shell,
     html_table,
     report_recipients,
+    validate_finding,
 )
 from src.agents.vera.config import FRESHNESS_STATIC, KILL_SWITCH_FEATURE
 from src.agents.vera.db import vera_db
@@ -432,6 +433,26 @@ def run_discrepancy_digest() -> int:
             logger.warning("[Vera] failed to send promise digest to %s: %s", addr, exc)
 
     post_vera_report(subject, body)
+
+    # Validate actionable findings via Vera→Dev contract (spec §1.1.10).
+    if discrepancies:
+        validate_finding(
+            {
+                "issue": subject,
+                "evidence": body[:600],
+                "repro": "python -m src.agents.vera --promise-digest",
+                "suspected_cause": (
+                    "Webhook delivery gap, migration not applied, or data sync divergence"
+                ),
+                "proposed_fix": (
+                    f"Investigate {len(discrepancies)} open discrepancy(ies): "
+                    + ", ".join(d.source for d in discrepancies[:3])
+                ),
+                "effort": "low",
+                "risk": "high",
+            },
+            source="discrepancy_digest",
+        )
 
     logger.info(
         "[Vera] promise digest complete: discrepancies=%d open_promises=%d overdue=%d",

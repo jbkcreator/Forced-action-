@@ -40,6 +40,7 @@ def rate_handoff(
                 (boundary, rater_seat, ratee_seat, reference_id, score, notes)
             VALUES
                 (:boundary, :rater_seat, :ratee_seat, :reference_id, :score, :notes)
+            ON CONFLICT (boundary, reference_id) DO NOTHING
             RETURNING id
         """),
         {
@@ -47,7 +48,7 @@ def rate_handoff(
             "reference_id": reference_id, "score": score, "notes": notes,
         },
     ).fetchone()
-    return row.id
+    return row.id if row else -1
 
 
 def get_average_rating(
