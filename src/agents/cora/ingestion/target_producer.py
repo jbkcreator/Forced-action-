@@ -332,25 +332,37 @@ def produce_auction_fast_follow_targets(
 
 
 def run_periodic(stop_event: threading.Event, interval_seconds: int = DEFAULT_INTERVAL_SECONDS) -> None:
+    from config.settings import get_settings
     from src.core.database import get_db_context
 
     logger.info("target_producer: starting periodic sweep every %ds", interval_seconds)
     while not stop_event.is_set():
-        try:
-            with get_db_context() as db:
-                produce_targets(db)
-        except Exception:  # noqa: BLE001
-            logger.exception("target_producer: founder_tier_blitz sweep failed — will retry next interval")
-        try:
-            with get_db_context() as db:
-                produce_auction_fast_follow_targets(db)
-        except Exception:  # noqa: BLE001
-            logger.exception("target_producer: auction_fast_follow sweep failed — will retry next interval")
-        try:
-            from src.agents.cora.ingestion.win_back_producer import produce_win_back_targets
-            with get_db_context() as db:
-                produce_win_back_targets(db)
-        except Exception:  # noqa: BLE001
-            logger.exception("target_producer: win_back sweep failed — will retry next interval")
+        mode = get_settings().cora_target_mode
+        if mode == "dbpr_storm":
+            # Aug 2026 blitz: DBPR storm/restoration contractors instead of whales.
+            # Flip CORA_TARGET_MODE back to "whale" (or remove it) after August.
+            try:
+                from src.agents.cora.ingestion.dbpr_storm_producer import run_dbpr_storm_sweep
+                with get_db_context() as db:
+                    run_dbpr_storm_sweep(db)
+            except Exception:  # noqa: BLE001
+                logger.exception("target_producer: dbpr_storm sweep failed — will retry next interval")
+        else:
+            try:
+                with get_db_context() as db:
+                    produce_targets(db)
+            except Exception:  # noqa: BLE001
+                logger.exception("target_producer: founder_tier_blitz sweep failed — will retry next interval")
+            try:
+                with get_db_context() as db:
+                    produce_auction_fast_follow_targets(db)
+            except Exception:  # noqa: BLE001
+                logger.exception("target_producer: auction_fast_follow sweep failed — will retry next interval")
+            try:
+                from src.agents.cora.ingestion.win_back_producer import produce_win_back_targets
+                with get_db_context() as db:
+                    produce_win_back_targets(db)
+            except Exception:  # noqa: BLE001
+                logger.exception("target_producer: win_back sweep failed — will retry next interval")
         stop_event.wait(interval_seconds)
     logger.info("target_producer: stopped")

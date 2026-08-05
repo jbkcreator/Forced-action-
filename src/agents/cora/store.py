@@ -155,7 +155,7 @@ class FactUsed:
 class OutboundDraftRecord:
     draft_id: str
     opportunity_thread_id: str
-    buyer_entity_id: int
+    buyer_entity_id: Optional[int]
     cell_id: str
     offer: str
     avenue: str

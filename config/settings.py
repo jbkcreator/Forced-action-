@@ -255,6 +255,9 @@ class AppSettings(BaseSettings):
 	# either one, it silently no-ops every poll rather than raising.
 	cora_gmail_service_account_key_path: Optional[str] = Field(default=None, env="CORA_GMAIL_SERVICE_ACCOUNT_KEY_PATH")
 	cora_reply_mailbox_address: Optional[str] = Field(default=None, env="CORA_REPLY_MAILBOX_ADDRESS")
+	# "whale" = Hunter→buyer_entity flow (default). "dbpr_storm" = Aug blitz targeting
+	# storm/restoration contractors from dbpr_contacts. Flip in env, no code deploy.
+	cora_target_mode: str = Field(default="whale", env="CORA_TARGET_MODE")
 
 
 	# ── Mode-aware helpers ────────────────────────────────────────────────────

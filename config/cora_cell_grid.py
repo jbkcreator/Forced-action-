@@ -45,15 +45,17 @@ AVENUES = (
     "buy_and_hold",
     "wholesalers",
     "lender_types",
+    "storm_restoration_contractors",  # Aug 2026 DBPR blitz — licensed roofers/remediation in FL
 )
 
 ANGLES = (
-    "scarcity_seat_number",       # founder-tier numbered-seat framing
-    "why_now_catalyst",           # fresh filing/lien/auction date framing
-    "portfolio_recognition",      # "we noticed your N purchases" framing
-    "auction_congrats",           # auction-winner fast-follow framing
-    "win_back_offer",             # lapsed/abandoned win-back framing
-    "post_call_recap",            # follow-up after a completed call
+    "scarcity_seat_number",           # founder-tier numbered-seat framing
+    "why_now_catalyst",               # fresh filing/lien/auction date framing
+    "portfolio_recognition",          # "we noticed your N purchases" framing
+    "auction_congrats",               # auction-winner fast-follow framing
+    "win_back_offer",                 # lapsed/abandoned win-back framing
+    "post_call_recap",                # follow-up after a completed call
+    "storm_damage_lead_pipeline",     # Aug 2026 DBPR blitz — storm-damaged property leads pitch
 )
 
 CELL_GRID: dict[str, Cell] = {
@@ -104,6 +106,16 @@ CELL_GRID: dict[str, Cell] = {
         "angle": "post_call_recap",
         "label": "Post-call recap — follow-up draft after a completed call, offer TBD per-call context",
         "launch_group": None,
+    },
+    # Aug 2026 blitz: storm/restoration contractors from DBPR (roofing + remediation verticals).
+    # Enabled when CORA_TARGET_MODE=dbpr_storm. Remove this cell after August — see dbpr_storm_producer.py.
+    "dbpr_storm_blitz": {
+        "cell_id": "dbpr_storm_blitz",
+        "offer": "founder_tier",
+        "avenue": "storm_restoration_contractors",
+        "angle": "storm_damage_lead_pipeline",
+        "label": "DBPR Storm/Restoration Blitz — Aug 2026, Hillsborough + Pinellas",
+        "launch_group": "aug_2026_blitz",
     },
 }
 
