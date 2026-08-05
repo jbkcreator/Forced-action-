@@ -42,6 +42,7 @@ from src.agents.vera.checks._shared import (
     html_table,
     html_warning,
     report_recipients,
+    validate_finding,
 )
 from src.agents.vera.config import FRESHNESS_STATIC, KILL_SWITCH_FEATURE
 from src.agents.vera.db import vera_db
@@ -719,6 +720,35 @@ def run_live_state() -> int:
     post_vera_report(subject, body)
 
     stale_count = sum(1 for b in cron_beats if b.is_stale)
+
+    # Validate actionable findings via Vera→Dev contract (spec §1.1.10).
+    # Only assembles a finding when something requires dev attention — clean
+    # reports (in_sync, no stale, no zero-ingest) skip this entirely.
+    is_actionable = (
+        deploy["drift"] not in ("in_sync", "unknown")
+        or bool(deploy["pending_migrations"])
+        or stale_count > 0
+        or bool(silent["zero_ingest"])
+    )
+    if is_actionable:
+        validate_finding(
+            {
+                "issue": subject,
+                "evidence": body[:600],
+                "repro": "python -m src.agents.vera --live-state",
+                "suspected_cause": (
+                    "Cron job failure, scraper crash, or pending deployment"
+                ),
+                "proposed_fix": (
+                    f"Apply pending migrations: {deploy['pending_migrations'] or 'none'}; "
+                    f"investigate {stale_count} stale source(s); verify deploy status"
+                ),
+                "effort": "low",
+                "risk": "high" if deploy["pending_migrations"] else "medium",
+            },
+            source="live_state",
+        )
+
     logger.info(
         "[Vera] live-state report complete: drift=%s stale=%d/%d zero_ingest=%d unscheduled=%d",
         deploy["drift"], stale_count, len(cron_beats),

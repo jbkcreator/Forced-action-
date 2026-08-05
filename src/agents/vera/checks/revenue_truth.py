@@ -43,6 +43,7 @@ from src.agents.vera.checks._shared import (
     html_table,
     html_warning,
     report_recipients,
+    validate_finding,
 )
 from src.agents.vera.config import FRESHNESS_REVENUE_24H, KILL_SWITCH_FEATURE
 from src.agents.vera.db import vera_db
@@ -935,6 +936,35 @@ def run_revenue_truth() -> int:
             logger.warning("[Vera] failed to send revenue-truth report to %s: %s", addr, exc)
 
     post_vera_report(subject, body)
+
+    # Validate actionable findings via Vera→Dev contract (spec §1.1.10).
+    # Only fires when Stripe was reachable (stripe_ok=True) and there are real
+    # mismatches — a Stripe outage is an ops issue, not a code bug for Dev.
+    is_actionable = (
+        reconciliation.stripe_ok and (
+            reconciliation.paying_no_access_count > 0
+            or reconciliation.access_not_paying_count > 0
+        )
+    ) or (mrr.stripe_ok and mrr.drift_cents != 0)
+    if is_actionable:
+        validate_finding(
+            {
+                "issue": subject,
+                "evidence": body[:600],
+                "repro": "python -m src.agents.vera --revenue-truth",
+                "suspected_cause": (
+                    "Stripe webhook delivery gap or Subscriber table divergence from Stripe state"
+                ),
+                "proposed_fix": (
+                    f"Audit {reconciliation.paying_no_access_count} paying-no-access and "
+                    f"{reconciliation.access_not_paying_count} access-not-paying subscribers; "
+                    f"reconcile MRR drift of ${mrr.drift_cents / 100:,.2f}"
+                ),
+                "effort": "medium",
+                "risk": "high",
+            },
+            source="revenue_truth",
+        )
 
     logger.info(
         "[Vera] revenue truth report complete: paying_no_access=%d access_not_paying=%d "

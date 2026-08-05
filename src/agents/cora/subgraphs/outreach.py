@@ -312,6 +312,45 @@ def _after_compose(state: OutreachState) -> str:
     return "persist" if state.get("terminal_status") else "resolve_links"
 
 
+def _score_hunter_enrichment(inputs: Dict[str, Any]) -> int:
+    """Rate Hunter's enrichment completeness 1–5 (spec §1.4 / QUALITY-v2.2 Q3).
+    1 = target arrived at all; +1 each for canonical_name, confidence >= 50,
+    facts_used non-empty, contact channel present."""
+    be = inputs.get("buyer_entity") or {}
+    score = 1
+    if be.get("canonical_name"):
+        score += 1
+    if int(be.get("confidence_score") or 0) >= 50:
+        score += 1
+    if inputs.get("facts_used"):
+        score += 1
+    if inputs.get("contact_email") or inputs.get("contact_phone"):
+        score += 1
+    return score
+
+
+def _rate_hunter_handoff(inputs: Dict[str, Any], db: Session) -> None:
+    from src.agents.contracts.handoff_quality import rate_handoff
+
+    thread_id = (inputs.get("buyer_entity") or {}).get("opportunity_thread_id") or "unknown"
+    score = _score_hunter_enrichment(inputs)
+    try:
+        with db.begin_nested():
+            rate_handoff(
+                db,
+                boundary="hunter_to_cora",
+                rater_seat="cora",
+                ratee_seat="hunter",
+                reference_id=thread_id,
+                score=score,
+            )
+    except Exception:
+        logger.warning(
+            "[Cora] could not write Hunter->Cora quality rating thread_id=%s score=%d",
+            thread_id, score, exc_info=True,
+        )
+
+
 def build_outreach_graph(db: Optional[Session] = None) -> StateGraph:
     # `db` is captured by closure into the two nodes that need it, never placed
     # in graph state — state must stay msgpack-serializable end-to-end since a
@@ -336,6 +375,8 @@ def run_outreach(inputs: Dict[str, Any], db: Optional[Session] = None) -> Dict[s
     """Convenience wrapper: compile + invoke (no checkpointer — called directly by tests/CLI)."""
     inputs = dict(inputs)
     inputs.pop("db", None)
+    if db is not None:
+        _rate_hunter_handoff(inputs, db)
     graph = build_outreach_graph(db).compile()
     final = graph.invoke(inputs)
     return dict(final)

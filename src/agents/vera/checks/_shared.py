@@ -9,6 +9,9 @@ imported across a module-private boundary.
 from __future__ import annotations
 
 import html as _html
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def report_recipients() -> list[str]:
@@ -128,3 +131,28 @@ def html_list(items: list) -> str:
         for item in items
     )
     return f'<ul style="margin:6px 0;padding-left:20px;">{lis}</ul>'
+
+
+def validate_finding(finding_dict: dict, *, source: str) -> bool:
+    """Validate a Vera finding dict against the 7-field Vera→Dev contract
+    (spec §1.1.10) before it leaves Vera.
+
+    On failure: logs a warning and posts to the quality-contracts Slack channel
+    per decision D2. Returns False. The main monitoring report posted by each
+    check's run_*() is never suppressed — this is an additive gate only.
+    Returns True when all 7 fields pass.
+    """
+    from src.agents.contracts.vera_to_dev import check_finding
+    from src.agents.contracts.base import HandoffRejected, notify_slack_rejection
+
+    result = check_finding(finding_dict)
+    if not result.ok:
+        logger.warning("[Vera] incomplete finding from %s: %s", source, result.missing_fields)
+        exc = HandoffRejected("vera_to_dev", result.missing_fields, reference_id=source)
+        notify_slack_rejection(exc)
+        return False
+    logger.info(
+        "[Vera] finding from %s passed contract validation — ready for Dev handoff",
+        source,
+    )
+    return True
