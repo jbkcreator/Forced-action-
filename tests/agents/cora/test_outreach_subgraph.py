@@ -380,6 +380,74 @@ def test_second_venture_reply_rate_is_not_attributed_to_the_default_venture(
     assert leaked == 0
 
 
+# ── Hunter quality rating guards ─────────────────────────────────────────────
+
+def _rating_count(db, thread_id: str) -> int:
+    return db.execute(
+        text("SELECT COUNT(*) FROM handoff_quality_ratings WHERE reference_id = :t"),
+        {"t": thread_id},
+    ).scalar()
+
+
+def test_rejected_attempt_does_not_create_hunter_rating(suppressed_db, mock_claude):
+    """Suppression rejection must not pollute Hunter's scorecard."""
+    whale = WHALES[3]
+    result = _run(whale, suppressed_db, mock_claude)
+    assert result["terminal_status"] == "rejected"
+    assert _rating_count(suppressed_db, whale["opportunity_thread_id"]) == 0
+
+
+def test_low_confidence_rejection_does_not_create_hunter_rating(not_suppressed_db, mock_claude):
+    whale = WHALES[8]
+    result = _run(whale, not_suppressed_db, mock_claude)
+    assert result["terminal_status"] == "rejected"
+    assert _rating_count(not_suppressed_db, whale["opportunity_thread_id"]) == 0
+
+
+def test_successful_outreach_creates_exactly_one_hunter_rating(not_suppressed_db, mock_claude):
+    whale = dict(WHALES[0], opportunity_thread_id="OPP-RATE-TEST-0001")
+    result = _run(whale, not_suppressed_db, mock_claude)
+    assert result["terminal_status"] == "completed"
+    not_suppressed_db.commit()
+    assert _rating_count(not_suppressed_db, "OPP-RATE-TEST-0001") == 1
+
+
+def test_followup_does_not_create_additional_hunter_rating(not_suppressed_db, mock_claude):
+    """Follow-ups are not new Hunter handoffs — each follow-up run must not add a rating."""
+    whale = dict(WHALES[1], opportunity_thread_id="OPP-RATE-TEST-0002")
+    first = _run(whale, not_suppressed_db, mock_claude)
+    assert first["terminal_status"] == "completed"
+    not_suppressed_db.commit()
+    assert _rating_count(not_suppressed_db, "OPP-RATE-TEST-0002") == 1
+
+    # Simulate follow-up run for same thread.
+    mock_claude.return_value = compose_result("followup subj", "followup body")
+    outreach.run_outreach(
+        {
+            "buyer_entity": whale, "cell_id": CELL_ID,
+            "facts_used": [], "contact_email": "prospect@example.com",
+            "contact_phone": None, "is_followup": True, "followup_sequence": 1,
+        },
+        db=not_suppressed_db,
+    )
+    not_suppressed_db.commit()
+    assert _rating_count(not_suppressed_db, "OPP-RATE-TEST-0002") == 1
+
+
+def test_retry_of_completed_thread_does_not_duplicate_rating(not_suppressed_db, mock_claude):
+    """Retrying run_outreach for a thread that already produced a rating is idempotent."""
+    whale = dict(WHALES[2], opportunity_thread_id="OPP-RATE-TEST-0003")
+    first = _run(whale, not_suppressed_db, mock_claude)
+    assert first["terminal_status"] == "completed"
+    not_suppressed_db.commit()
+
+    # Second attempt: gate rejects as duplicate_actionable, so terminal_status='rejected'.
+    # Either way, no second rating row should appear.
+    _run(whale, not_suppressed_db, mock_claude)
+    not_suppressed_db.commit()
+    assert _rating_count(not_suppressed_db, "OPP-RATE-TEST-0003") == 1
+
+
 @pytest.mark.integration
 def test_real_claude_draft_grounds_facts_no_invention(fresh_db):
     """Best-effort no-hallucination check against the REAL Claude API — not mocked."""

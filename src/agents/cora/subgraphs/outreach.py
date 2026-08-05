@@ -375,8 +375,8 @@ def run_outreach(inputs: Dict[str, Any], db: Optional[Session] = None) -> Dict[s
     """Convenience wrapper: compile + invoke (no checkpointer — called directly by tests/CLI)."""
     inputs = dict(inputs)
     inputs.pop("db", None)
-    if db is not None:
-        _rate_hunter_handoff(inputs, db)
     graph = build_outreach_graph(db).compile()
     final = graph.invoke(inputs)
+    if db is not None and not inputs.get("is_followup") and final.get("terminal_status") == "completed":
+        _rate_hunter_handoff(inputs, db)
     return dict(final)
