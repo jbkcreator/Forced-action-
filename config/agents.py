@@ -117,6 +117,18 @@ class AgentsSettings(AppSettings):
 		default=True,
 		env="AGENTS_EVENT_SOURCE_POSTGRES",
 	)
+	lifecycle_queue_stale_processing_seconds: int = Field(
+		default=600,
+		env="LIFECYCLE_QUEUE_STALE_SECONDS",
+		description=(
+			"A lifecycle_event_queue row stuck at status='processing' longer than this "
+			"is treated as an abandoned claim (crashed worker) and reclaimed by the next "
+			"sweep. Must stay comfortably longer than the slowest legitimate graph run — "
+			"live agent_decisions data is too thin to derive this empirically yet (26 "
+			"completed rows, max 1.6s), so 600s is a conservative placeholder, not a "
+			"measured value. Raise it if a real run is ever observed to approach it."
+		),
+	)
 
 	# ── Helpers ───────────────────────────────────────────────────────────────
 	@property
