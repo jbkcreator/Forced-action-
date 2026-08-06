@@ -29,7 +29,7 @@ from src.agents.cora import queue, store
 logger = logging.getLogger(__name__)
 
 CELL_ID = "dbpr_storm_blitz"
-_SENDABLE_VERTICALS = ("roofing", "remediation")
+_SENDABLE_VERTICALS = ("roofing",)
 _TARGET_COUNTIES = ("hillsborough", "pinellas")
 
 
