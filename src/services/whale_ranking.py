@@ -16,6 +16,13 @@ itself. Fields:
     entity's linked `owners` rows (source_table='owners' buyer_entity_links),
     never invented here; confidence is the best per-phone `score` any linked
     owner record carries in Owner.phone_metadata (0 if no scored contact)
+  - phone / email                                   -- the actual dial-able
+    value backing contact_channel (item 49 — a closer needs a number, not
+    just a label). phone is whichever linked owner's phone_1 carries the
+    highest phone_score; email is whichever linked owner has one set. Either
+    may be None even when contact_channel says otherwise is impossible by
+    construction: contact_channel is derived from the same has_phone/has_email
+    this pulls from.
   - why_now                                         -- the qualifying
     catalyst in one line: which rule tripped (purchase-count vs cash-volume,
     or both) plus the most recent linked deed, so a drafted outreach message
@@ -71,6 +78,8 @@ class RankedWhale:
     total_cash_volume: Decimal
     contact_channel: str          # "phone" | "email" | "none"
     contact_confidence: int       # 0-100; 0 when contact_channel == "none"
+    phone: Optional[str]          # dial-able value backing contact_channel=="phone"
+    email: Optional[str]          # dial-able value backing contact_channel=="email"
     why_now: str
     whale_flagged_at: Optional[datetime]
     acquisition_velocity: Optional[float]  # distinct properties/year; None when not computable (HUNTER-04)
@@ -111,19 +120,27 @@ def get_ranked_whales(session: Session, limit: int = DEFAULT_LIMIT, county_id: O
         text(f"""
             WITH owner_contacts AS (
                 SELECT bel.buyer_entity_id,
-                       o.phone_1 IS NOT NULL AS has_phone,
-                       o.email_1 IS NOT NULL AS has_email,
+                       o.phone_1,
+                       o.email_1,
                        COALESCE((o.phone_metadata->'phone_1'->>'score')::int, 0) AS phone_score
                 FROM buyer_entity_links bel
                 JOIN owners o ON o.id = bel.source_id AND bel.source_table = 'owners'
             ),
-            best_contact AS (
-                SELECT buyer_entity_id,
-                       BOOL_OR(has_phone) AS has_phone,
-                       BOOL_OR(has_email) AS has_email,
-                       MAX(phone_score) AS phone_score
+            best_phone AS (
+                -- One row per entity: the linked owner with the highest-scored phone.
+                SELECT DISTINCT ON (buyer_entity_id) buyer_entity_id, phone_1, phone_score
                 FROM owner_contacts
-                GROUP BY buyer_entity_id
+                WHERE phone_1 IS NOT NULL
+                ORDER BY buyer_entity_id, phone_score DESC
+            ),
+            best_email AS (
+                -- One row per entity: any linked owner with an email (tie-broken the
+                -- same way as best_phone for determinism, not because score means
+                -- anything for email).
+                SELECT DISTINCT ON (buyer_entity_id) buyer_entity_id, email_1
+                FROM owner_contacts
+                WHERE email_1 IS NOT NULL
+                ORDER BY buyer_entity_id, phone_score DESC
             ),
             recent_purchases AS (
                 SELECT bel.buyer_entity_id,
@@ -155,15 +172,16 @@ def get_ranked_whales(session: Session, limit: int = DEFAULT_LIMIT, county_id: O
                    be.confidence_score,
                    be.county_id, be.total_purchase_count, be.total_cash_volume,
                    be.whale_flagged_at,
-                   COALESCE(bc.has_phone, false) AS has_phone,
-                   COALESCE(bc.has_email, false) AS has_email,
-                   COALESCE(bc.phone_score, 0) AS phone_score,
+                   bp.phone_1 AS phone,
+                   be_email.email_1 AS email,
+                   COALESCE(bp.phone_score, 0) AS phone_score,
                    COALESCE(rp.recent_count, 0) AS recent_count,
                    rp.first_purchase_date,
                    ld.deed_type AS last_deed_type,
                    ld.record_date AS last_purchase_date
             FROM buyer_entities be
-            LEFT JOIN best_contact bc ON bc.buyer_entity_id = be.id
+            LEFT JOIN best_phone bp ON bp.buyer_entity_id = be.id
+            LEFT JOIN best_email be_email ON be_email.buyer_entity_id = be.id
             LEFT JOIN recent_purchases rp ON rp.buyer_entity_id = be.id
             LEFT JOIN last_deed ld ON ld.buyer_entity_id = be.id
             WHERE be.is_whale {county_filter}
@@ -176,9 +194,9 @@ def get_ranked_whales(session: Session, limit: int = DEFAULT_LIMIT, county_id: O
 
     ranked = []
     for i, r in enumerate(rows, start=1):
-        if r.has_phone:
+        if r.phone:
             channel, confidence = "phone", r.phone_score
-        elif r.has_email:
+        elif r.email:
             channel, confidence = "email", 0
         else:
             channel, confidence = "none", 0
@@ -194,6 +212,8 @@ def get_ranked_whales(session: Session, limit: int = DEFAULT_LIMIT, county_id: O
             total_cash_volume=r.total_cash_volume,
             contact_channel=channel,
             contact_confidence=confidence,
+            phone=r.phone,
+            email=r.email,
             why_now=_why_now(r.recent_count, r.total_cash_volume, r.last_deed_type, r.last_purchase_date),
             whale_flagged_at=r.whale_flagged_at,
             acquisition_velocity=_acquisition_velocity(r.total_purchase_count, r.first_purchase_date, r.last_purchase_date),

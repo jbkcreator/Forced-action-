@@ -14,7 +14,11 @@ Run:
     python -m src.scrappers.dbpr.dbpr_engine
     python -m src.scrappers.dbpr.dbpr_engine --source registered
     python -m src.scrappers.dbpr.dbpr_engine --dry-run
-    python -m src.scrappers.dbpr.dbpr_engine --county hillsborough
+
+Target counties are read from the DBPR_TARGET_COUNTIES env var (comma-separated
+county_ids, e.g. "hillsborough,pinellas,polk") — see config/settings.py. When
+unset/empty, falls back to hillsborough,pinellas. Unrecognized county_ids are
+skipped with a warning, not raised.
 
 Cron (weekly, Sunday 02:00 UTC — before enrichment job):
     0 2 * * 0 cd /app && python -m src.scrappers.dbpr.dbpr_engine >> /var/log/cron/dbpr.log 2>&1
@@ -118,6 +122,22 @@ def _zip_to_county(zip_code: str, zip_county_map: dict[str, str]) -> Optional[st
     return zip_county_map.get(zip_code)
 
 
+# UGC zone -> county_id (extend when new counties are activated)
+_UGC_TO_COUNTY: dict[str, str] = {
+    "FLC057": "hillsborough",
+    "FLC103": "pinellas",
+    "FLC101": "pasco",
+    "FLC105": "polk",
+    "FLC081": "manatee",
+}
+
+# Every county_id this engine can currently resolve ZIPs for.
+_SUPPORTED_COUNTIES: frozenset[str] = frozenset(_UGC_TO_COUNTY.values())
+
+# Counties targeted when DBPR_TARGET_COUNTIES is unset/empty.
+_DEFAULT_COUNTIES: tuple[str, ...] = ("hillsborough", "pinellas")
+
+
 def _build_zip_county_map() -> dict[str, str]:
     """Build ZIP -> county_id lookup from the NWS same-to-zip crosswalk.
 
@@ -127,21 +147,43 @@ def _build_zip_county_map() -> dict[str, str]:
     """
     from src.services.nws_same_to_zip import UGC_TO_ZIPS
 
-    # UGC zone -> county_id (extend when new counties are activated)
-    ugc_to_county = {
-        "FLC057": "hillsborough",
-        "FLC103": "pinellas",
-        "FLC101": "pasco",
-        "FLC105": "polk",
-        "FLC081": "manatee",
-    }
     zip_map: dict[str, str] = {}
     for ugc, zips in UGC_TO_ZIPS.items():
-        county_id = ugc_to_county.get(ugc)
+        county_id = _UGC_TO_COUNTY.get(ugc)
         if county_id:
             for z in zips:
                 zip_map[z] = county_id
     return zip_map
+
+
+def _resolve_target_counties() -> list[str]:
+    """
+    Read DBPR_TARGET_COUNTIES (comma-separated county_ids) from settings.
+    Empty/unset falls back to _DEFAULT_COUNTIES. Unrecognized county_ids are
+    logged and dropped rather than raised, so a typo in the env var degrades
+    to "skip that county" instead of crashing the whole run.
+    """
+    raw = get_settings().dbpr_target_counties or ""
+    requested = [c.strip().lower() for c in raw.split(",") if c.strip()]
+    if not requested:
+        requested = list(_DEFAULT_COUNTIES)
+
+    valid, unknown = [], []
+    seen: set[str] = set()
+    for county in requested:
+        if county in seen:
+            continue
+        seen.add(county)
+        (valid if county in _SUPPORTED_COUNTIES else unknown).append(county)
+
+    if unknown:
+        logger.warning("[DBPR] Unknown county_id(s) %s — skipping (supported: %s)",
+                        ", ".join(unknown), ", ".join(sorted(_SUPPORTED_COUNTIES)))
+
+    if not valid:
+        logger.error("[DBPR] No valid target counties resolved from DBPR_TARGET_COUNTIES=%r", raw)
+
+    return valid
 
 
 # ---------------------------------------------------------------------------
@@ -264,16 +306,16 @@ def _parse_file(path: Path, source: str = "certified") -> list[dict]:
 # Filter
 # ---------------------------------------------------------------------------
 
-def _filter_to_county(records: list[dict], target_county: str,
-                       zip_county_map: dict[str, str]) -> list[dict]:
-    """Keep only records whose ZIP maps to target_county. Sets county_id."""
+def _filter_to_counties(records: list[dict], target_counties: set[str],
+                         zip_county_map: dict[str, str]) -> list[dict]:
+    """Keep only records whose ZIP maps to one of target_counties. Sets county_id."""
     filtered = []
     for r in records:
         county = _zip_to_county(r["zip_code"] or "", zip_county_map)
-        if county == target_county:
+        if county in target_counties:
             r["county_id"] = county
             filtered.append(r)
-    logger.info("[DBPR] %d records match county=%s", len(filtered), target_county)
+    logger.info("[DBPR] %d records match counties=%s", len(filtered), ", ".join(sorted(target_counties)))
     return filtered
 
 
@@ -363,16 +405,17 @@ def _upsert_records(records: list[dict], db) -> tuple[int, int]:
 
 def run_dbpr_engine(
     source: str = "certified",
-    county: str = "hillsborough",
     local_file: Optional[str] = None,
     dry_run: bool = False,
 ) -> dict:
     """
     Full pipeline: download → parse → filter → upsert.
 
+    Target counties come from DBPR_TARGET_COUNTIES (see config/settings.py),
+    not a function argument — falls back to hillsborough,pinellas when unset.
+
     Args:
         source:     'certified' or 'registered'
-        county:     target county_id to filter to
         local_file: skip download and use this local file path instead
         dry_run:    parse and log without writing to DB
 
@@ -381,7 +424,7 @@ def run_dbpr_engine(
     sync_started_at = datetime.now(timezone.utc)
     stats = {
         "source": source,
-        "county": county,
+        "counties": [],
         "parsed": 0,
         "filtered": 0,
         "inserted": 0,
@@ -389,6 +432,14 @@ def run_dbpr_engine(
         "purged": 0,
         "errors": 0,
     }
+
+    # Step 0 — resolve target counties (before downloading, so a bad env var
+    # doesn't waste a multi-MB download)
+    target_counties = _resolve_target_counties()
+    stats["counties"] = target_counties
+    if not target_counties:
+        stats["errors"] += 1
+        return stats
 
     # Step 1 — get file
     if local_file:
@@ -410,9 +461,9 @@ def run_dbpr_engine(
         stats["errors"] += 1
         return stats
 
-    # Step 3 — filter to county
+    # Step 3 — filter to target counties
     zip_county_map = _build_zip_county_map()
-    records = _filter_to_county(records, county, zip_county_map)
+    records = _filter_to_counties(records, set(target_counties), zip_county_map)
     stats["filtered"] = len(records)
 
     if dry_run:
@@ -446,8 +497,9 @@ def run_dbpr_engine(
             logger.warning("[DBPR] Could not delete file %s: %s", file_path.name, e)
 
     logger.info(
-        "[DBPR] Complete -- parsed=%d filtered=%d inserted=%d updated=%d errors=%d",
-        stats["parsed"], stats["filtered"], stats["inserted"], stats["updated"], stats["errors"],
+        "[DBPR] Complete -- counties=%s parsed=%d filtered=%d inserted=%d updated=%d errors=%d",
+        ", ".join(stats["counties"]), stats["parsed"], stats["filtered"],
+        stats["inserted"], stats["updated"], stats["errors"],
     )
     return stats
 
@@ -459,7 +511,6 @@ def run_dbpr_engine(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="DBPR contractor license loader")
     parser.add_argument("--source", choices=["certified", "registered"], default="certified")
-    parser.add_argument("--county", default="hillsborough")
     parser.add_argument("--file", dest="local_file", default=None,
                         help="Use a local file instead of downloading")
     parser.add_argument("--dry-run", action="store_true",
@@ -468,7 +519,6 @@ if __name__ == "__main__":
 
     result = run_dbpr_engine(
         source=args.source,
-        county=args.county,
         local_file=args.local_file,
         dry_run=args.dry_run,
     )

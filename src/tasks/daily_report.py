@@ -663,6 +663,66 @@ def _build_signal_composition(session, run_date: date, county_id: str) -> dict:
     return result
 
 
+STALE_DRAFT_HOURS = 24
+
+
+def _build_cora_throughput_health(session, errors: list) -> dict:
+    """
+    Block 12 — Cora Throughput health (global, not county-scoped: one draft
+    queue feeds every county). Report-only visibility for the exact failure
+    mode discovered 2026-08-06: build_batch() locks in a 'pending' batch
+    before trying to post it to Slack, so a missing SLACK_BOT_TOKEN leaves
+    that batch permanently un-approvable and blocks every later batch until
+    CORA_BATCH_EXPIRY_HOURS finally expires it — silently, since nothing
+    about it raises or shows up on a dashboard. Surfaced here instead of via
+    Slack because Slack being unconfigured is the failure itself.
+    """
+    pending = session.execute(
+        text("""
+            SELECT batch_id, created_at, slack_message_ts
+            FROM cora_draft_batches
+            WHERE status = 'pending'
+            ORDER BY created_at ASC
+            LIMIT 1
+        """)
+    ).fetchone()
+
+    stuck = session.execute(
+        text("""
+            SELECT COUNT(*) AS cnt, MIN(created_at) AS oldest
+            FROM outbound_drafts
+            WHERE status = 'draft'
+        """)
+    ).fetchone()
+
+    now = datetime.now(stuck.oldest.tzinfo) if stuck.oldest else None
+    oldest_draft_age_hours = (now - stuck.oldest).total_seconds() / 3600 if stuck.oldest else None
+
+    health = {
+        "pending_batch_id":       str(pending.batch_id) if pending else None,
+        "pending_batch_posted":   bool(pending.slack_message_ts) if pending else None,
+        "pending_batch_age_hours": (
+            (datetime.now(pending.created_at.tzinfo) - pending.created_at).total_seconds() / 3600
+            if pending else None
+        ),
+        "stuck_draft_count":       int(stuck.cnt or 0),
+        "oldest_stuck_draft_hours": oldest_draft_age_hours,
+    }
+
+    if pending and not pending.slack_message_ts:
+        errors.append(
+            f"cora_throughput: pending batch {str(pending.batch_id)[:8]} was never posted to "
+            f"Slack (missing SLACK_BOT_TOKEN?) — blocking all drafts until it auto-expires"
+        )
+    if oldest_draft_age_hours is not None and oldest_draft_age_hours > STALE_DRAFT_HOURS:
+        errors.append(
+            f"cora_throughput: {health['stuck_draft_count']} draft(s) stuck in status='draft', "
+            f"oldest {oldest_draft_age_hours:.0f}h old"
+        )
+
+    return health
+
+
 def _build_inbound_velocity_section(session) -> dict:
     """
     Block 11 / B11-04 — inbound response-time report section. Global metric
@@ -701,6 +761,7 @@ def build_report(run_date: date, county_id: str) -> dict:
         gold_delta              = _build_gold_delta(session, run_date, county_id)
         phone_coverage          = _build_phone_coverage(session, run_date, county_id)
         inbound_velocity        = _build_inbound_velocity_section(session)
+        cora_throughput_health  = _build_cora_throughput_health(session, errors)
 
     return {
         "run_date":              run_date,
@@ -719,6 +780,7 @@ def build_report(run_date: date, county_id: str) -> dict:
         "gold_delta":            gold_delta,
         "phone_coverage":        phone_coverage,
         "inbound_velocity":      inbound_velocity,
+        "cora_throughput_health": cora_throughput_health,
         "errors":                errors,
     }
 
@@ -906,6 +968,20 @@ def write_csv(report: dict, path: Path) -> None:
             w.writerow(["p95 time-to-callback", f"{p95:.0f}s" if p95 is not None else "—"])
         else:
             w.writerow(["No hot inbound calls recorded."])
+        w.writerow([])
+
+        # ── Section 12: Cora Throughput Health (global) ──────────────────
+        w.writerow(["CORA THROUGHPUT HEALTH (draft batching — global, not county-scoped)"])
+        ch = report.get("cora_throughput_health") or {}
+        if ch.get("pending_batch_id"):
+            posted = "posted to Slack" if ch["pending_batch_posted"] else "NEVER POSTED (stuck)"
+            w.writerow(["Pending batch", f"{ch['pending_batch_id'][:8]} — {posted}, "
+                        f"{ch['pending_batch_age_hours']:.0f}h old"])
+        else:
+            w.writerow(["Pending batch", "none"])
+        w.writerow(["Drafts stuck in status='draft'", f"{ch.get('stuck_draft_count', 0):,}"])
+        oldest = ch.get("oldest_stuck_draft_hours")
+        w.writerow(["Oldest stuck draft", f"{oldest:.0f}h old" if oldest is not None else "—"])
 
 
 # ---------------------------------------------------------------------------

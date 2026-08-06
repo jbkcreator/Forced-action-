@@ -10,13 +10,18 @@ Routes:
   GET  /api/lane-stage-config                   — broker: stage config for dropdown
   POST /api/admin/lanes/{lane_id}/assign-broker — admin: initial broker assignment (unassigned only)
   POST /api/admin/lanes/{lane_id}/fee-config    — admin: flip the RESPA fee gate (fee_config_flag)
+  POST /api/admin/lanes/seed-pool               — admin: seed pool from top financing_intent_scores
+  GET  /api/admin/financing-intent/export       — admin: lender-pitch CSV export (no lane required)
 """
 from __future__ import annotations
 
+import csv
+import io
 import logging
+from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from sqlalchemy import text as sa_text
@@ -434,3 +439,85 @@ def seed_pool_from_financing_intent(
         "errors": errors,
         "lane_type": lane_type,
     }
+
+
+# ---------------------------------------------------------------------------
+# Admin: GET /api/admin/financing-intent/export
+# Lender-pitch CSV export — the financing_intent_scores population as a flat
+# list, not routed through a lane at all (client item 69). Same latest-per-
+# property query as seed-pool above, plus the owner/address join lane_query.py
+# already uses so no new join pattern is introduced.
+# ---------------------------------------------------------------------------
+
+@router.get("/api/admin/financing-intent/export")
+def export_financing_intent(
+    intent_tier: Optional[str] = Query(default=None),
+    min_score: Optional[float] = Query(default=None),
+    county: Optional[str] = Query(default=None),
+    contact_only: bool = Query(default=False, description="Only rows with a phone or email on file"),
+    limit: int = Query(default=2000, ge=1, le=10000),
+    db: Session = Depends(get_db),
+    _admin: dict = Depends(get_current_admin),
+):
+    """Lender-pitch export — top financing-intent-scored properties with owner contact.
+
+    Does not touch lanes/leads — this is a standalone list for pitching a
+    lender partner, independent of whether a property has ever entered the
+    loan-lane pipeline.
+
+    Restricted to the two real counties: a handful of pytest fixture rows
+    (county_id='test_<hash>') persist in financing_intent_scores from tests
+    whose commits escaped a savepoint, and they score high enough to sort
+    to the top of an unfiltered export.
+    """
+    rows = db.execute(
+        sa_text("""
+            WITH latest AS (
+                SELECT DISTINCT ON (property_id)
+                    property_id, financing_intent_score, intent_tier, score_date
+                FROM financing_intent_scores
+                ORDER BY property_id, score_date DESC
+            )
+            SELECT
+                l.property_id,
+                pr.address, pr.city, pr.state, pr.zip, pr.county_id AS county,
+                o.owner_name, o.phone_1 AS phone, o.email_1 AS email,
+                l.financing_intent_score, l.intent_tier, l.score_date
+            FROM latest l
+            JOIN properties pr ON pr.id = l.property_id
+            LEFT JOIN owners o ON o.property_id = l.property_id
+            WHERE pr.county_id IN ('hillsborough', 'pinellas')
+              AND (:intent_tier IS NULL OR l.intent_tier = :intent_tier)
+              AND (:min_score IS NULL OR l.financing_intent_score >= :min_score)
+              AND (:county IS NULL OR pr.county_id = :county)
+              AND (:contact_only = false OR o.phone_1 IS NOT NULL OR o.email_1 IS NOT NULL)
+            ORDER BY l.financing_intent_score DESC
+            LIMIT :limit
+        """),
+        {
+            "intent_tier": intent_tier,
+            "min_score": min_score,
+            "county": county,
+            "contact_only": contact_only,
+            "limit": limit,
+        },
+    ).fetchall()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([f"# Financing Intent Export — {datetime.now().strftime('%Y-%m-%d')} — {len(rows)} row(s)"])
+    writer.writerow([
+        "Property ID", "Address", "City", "State", "ZIP", "County",
+        "Owner Name", "Phone", "Email", "Financing Intent Score", "Intent Tier", "Score Date",
+    ])
+    for r in rows:
+        writer.writerow([
+            r.property_id, r.address, r.city, r.state, r.zip, r.county,
+            r.owner_name, r.phone, r.email, r.financing_intent_score, r.intent_tier, r.score_date,
+        ])
+
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="financing_intent_export.csv"'},
+    )

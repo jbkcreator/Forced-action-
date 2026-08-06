@@ -249,6 +249,12 @@ class AppSettings(BaseSettings):
 
 	clay_dbpr_webhook_url: Optional[str] = Field(default=None, env="CLAY_DBPR_WEBHOOK_URL")
 
+	# DBPR contractor registry — comma-separated county_ids to filter to
+	# (e.g. "hillsborough,pinellas,polk"). Empty (default) falls back to
+	# hillsborough,pinellas. Unrecognized county_ids are skipped with a
+	# warning at run time, not raised.
+	dbpr_target_counties: str = Field(default="", env="DBPR_TARGET_COUNTIES")
+
 	# Cora reply-mailbox ingestion (Gmail API, service account + domain-wide
 	# delegation, gmail.readonly scope only). Both must be set for
 	# src.agents.cora.ingestion.reply_mailbox_poller to activate — absent

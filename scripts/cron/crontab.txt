@@ -481,10 +481,13 @@ COUNTY_ID=hillsborough
 # ── DBPR CONTRACTOR REGISTRY ─────────────────────────────────────────────────
 # Weekly file sync — Sunday 02:00 AM UTC (before enrichment jobs start).
 # Downloads certified + registered files, deduplicates by license_number,
-# filters to Hillsborough ZIPs, upserts dbpr_contacts, purges stale registered
-# rows (revoked/upgraded licenses), deletes downloaded file after load.
-0 2 * * 0 $PROJECT/scripts/cron/run.sh src.scrappers.dbpr.dbpr_engine --source certified --county $COUNTY_ID
-15 2 * * 0 $PROJECT/scripts/cron/run.sh src.scrappers.dbpr.dbpr_engine --source registered --county $COUNTY_ID
+# filters to target counties (DBPR_TARGET_COUNTIES env var — comma-separated
+# county_ids; empty falls back to hillsborough,pinellas, see config/settings.py
+# and dbpr_engine.py), upserts dbpr_contacts, purges stale registered rows
+# (revoked/upgraded licenses), deletes downloaded file after load. One run
+# covers every configured county — no per-county cron entry needed.
+0 2 * * 0  $PROJECT/scripts/cron/run.sh src.scrappers.dbpr.dbpr_engine --source certified
+15 2 * * 0 $PROJECT/scripts/cron/run.sh src.scrappers.dbpr.dbpr_engine --source registered
 # Company name (DBA) scrape — Sunday 02:30 UTC, after the file sync creates new
 # rows. Per-license lookup on myfloridalicense.com (the bulk file has no DBA).
 # Table-wide (not county-scoped); fills company_name_status pending/failed,

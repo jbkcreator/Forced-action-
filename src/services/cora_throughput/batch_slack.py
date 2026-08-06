@@ -46,9 +46,10 @@ def post_batch_for_approval(
     token = settings.slack_bot_token
     channel = settings.cora_throughput_slack_channel
     if not token or not channel:
-        logger.info(
+        logger.warning(
             "[Through] Slack not configured (cora_throughput_slack_channel/slack_bot_token "
-            "unset) — batch %s stays pending without a posted message", batch_id,
+            "unset) — batch %s stays pending without a posted message and will block every "
+            "later batch until it expires (CORA_BATCH_EXPIRY_HOURS)", batch_id,
         )
         return None
 

@@ -110,6 +110,10 @@ def _notify_batch_expired(batch_id: str, item_count: int, expiry_hours: int) -> 
     token = settings.slack_bot_token
     channel = settings.cora_throughput_slack_channel
     if not token or not channel:
+        logger.warning(
+            "[Through] batch %s expired after %dh (%d item(s) re-queued) but Slack is not "
+            "configured — no notification sent", batch_id, expiry_hours, item_count,
+        )
         return
     try:
         from slack_sdk import WebClient

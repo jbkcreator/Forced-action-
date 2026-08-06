@@ -7389,10 +7389,16 @@ class CloserCall(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
 
-    # Identity & correlation
+    # Identity & correlation. Exactly one of subscriber_id/buyer_entity_id is
+    # set (ck_closer_calls_one_identity) — a call is either with an existing
+    # customer or a cold whale prospect sourced from Hunter's ranked queue
+    # (item 49), never both, never neither.
     aircall_call_id: Mapped[str] = mapped_column(String(40), nullable=False, unique=True, index=True)
-    subscriber_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("subscribers.id"), nullable=False, index=True
+    subscriber_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), nullable=True, index=True
+    )
+    buyer_entity_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("buyer_entities.id"), nullable=True, index=True
     )
     escalation_id: Mapped[Optional[int]] = mapped_column(
         Integer, ForeignKey("human_close_escalations.id"), nullable=True
@@ -7439,8 +7445,13 @@ class CloserCall(Base):
 
     __table_args__ = (
         Index("idx_closer_calls_subscriber", "subscriber_id"),
+        Index("idx_closer_calls_buyer_entity", "buyer_entity_id"),
         Index("idx_closer_calls_closer_started", "closer_aircall_user_id", "started_at"),
         Index("idx_closer_calls_tagged_at", "tagged_at"),
+        CheckConstraint(
+            "(subscriber_id IS NOT NULL) != (buyer_entity_id IS NOT NULL)",
+            name="ck_closer_calls_one_identity",
+        ),
         CheckConstraint(
             "lead_quality_rating IS NULL OR (lead_quality_rating BETWEEN 1 AND 5)",
             name="ck_closer_calls_lead_quality",
