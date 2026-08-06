@@ -29,10 +29,10 @@ import time
 from datetime import datetime, timezone
 
 from config.settings import get_settings
-from sqlalchemy import exists, func
+from sqlalchemy import exists, func, select
 
 from src.core.database import get_db_context
-from src.core.models import DBPRContact, EmailOptOut
+from src.core.models import DBPRContact, EmailOptOut, OutboundDraft
 from src.services.dbpr_email_template import render_subject, render_text, render_html, unsubscribe_url
 from src.services.email import send_email
 from src.utils.logger import setup_logging, get_logger
@@ -92,6 +92,17 @@ def run_dbpr_email_sender(
                     func.lower(DBPRContact.email),
                     func.lower(DBPRContact.work_email),
                 ])),
+                # Exclude contacts already in the Cora blitz pipeline (draft exists
+                # but Relay hasn't dispatched yet — prevents duplicate outreach).
+                ~(
+                    select(OutboundDraft.draft_id)
+                    .where(
+                        OutboundDraft.opportunity_thread_id == func.concat("DBPR-", DBPRContact.id),
+                        OutboundDraft.status.notin_(["rejected", "expired"]),
+                    )
+                    .correlate(DBPRContact)
+                    .exists()
+                ),
             )
             .order_by(DBPRContact.created_at.asc())
             .limit(limit)

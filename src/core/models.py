@@ -9269,7 +9269,7 @@ class OutboundDraft(Base):
 
     draft_id: Mapped[str] = mapped_column(String(36), primary_key=True)
     opportunity_thread_id: Mapped[str] = mapped_column(String(64), nullable=False)
-    buyer_entity_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    buyer_entity_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     # Which venture produced this draft (CL4). relay_approval_queue already
     # carries venture_key, but a draft is created before a queue row exists
     # and the per-cell reply rate must be attributable without depending on
