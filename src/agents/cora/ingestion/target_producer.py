@@ -337,6 +337,15 @@ def run_periodic(stop_event: threading.Event, interval_seconds: int = DEFAULT_IN
 
     logger.info("target_producer: starting periodic sweep every %ds", interval_seconds)
     while not stop_event.is_set():
+        # Sync DBPR contacts whose Relay send completed — runs regardless of mode so the
+        # status is finalized even after CORA_TARGET_MODE is flipped back to "whale".
+        try:
+            from src.agents.cora.ingestion.dbpr_storm_producer import _sync_relay_sent_statuses
+            with get_db_context() as db:
+                _sync_relay_sent_statuses(db)
+        except Exception:  # noqa: BLE001
+            logger.exception("target_producer: dbpr relay sync failed — will retry next interval")
+
         mode = get_settings().cora_target_mode
         if mode == "dbpr_storm":
             # Aug 2026 blitz: DBPR storm/restoration contractors instead of whales.

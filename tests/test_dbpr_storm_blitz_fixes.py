@@ -96,13 +96,17 @@ LICENSE_PREFIX = "STGBLITZ-"
 def _cleanup():
     from src.core.database import get_db_context
     from src.core.models import DBPRContact, OutboundDraft
+    from sqlalchemy import text
     with get_db_context() as db:
-        # Remove any drafts referencing our test contacts first (FK order)
         contacts = db.query(DBPRContact).filter(
             DBPRContact.license_number.like(f"{LICENSE_PREFIX}%")
         ).all()
         if contacts:
             thread_ids = [f"DBPR-{c.id}" for c in contacts]
+            # Remove Relay queue rows before contacts (no FK, but keeps DB clean)
+            db.execute(
+                text("DELETE FROM relay_approval_queue WHERE idempotency_key LIKE 'stgblitz-%'")
+            )
             db.query(OutboundDraft).filter(
                 OutboundDraft.opportunity_thread_id.in_(thread_ids)
             ).delete(synchronize_session=False)
@@ -230,17 +234,18 @@ def test_sync_relay_sent_statuses_marks_contact_sent(cleanup_blitz):
         db.flush()
         contact_id = contact.id
 
-        # Simulate a Relay queue row in 'sent' state for this contact
+        # Simulate a Relay queue row in 'sent' state for this contact.
+        # relay_approval_queue has no subject column — subject/body live in payload JSON.
         from sqlalchemy import text
         db.execute(text("""
             INSERT INTO relay_approval_queue
-              (channel, recipient, thread_id, subject, payload, status,
+              (idempotency_key, channel, recipient, thread_id, payload, status,
                dispatched_at, created_at, updated_at, venture_key)
             VALUES
-              ('email', 'stgblitz-sync@example.com', :thread_id,
-               'Storm leads', '{}', 'sent',
+              (:idem, 'email', 'stgblitz-sync@example.com', :thread_id,
+               '{"subject": "Storm leads", "body": "Hello"}', 'sent',
                now(), now(), now(), 'hillsborough_distress')
-        """), {"thread_id": f"DBPR-{contact_id}"})
+        """), {"thread_id": f"DBPR-{contact_id}", "idem": f"stgblitz-sync-{contact_id}"})
         db.commit()
 
     with get_db_context() as db:
@@ -284,13 +289,13 @@ def test_sync_relay_sent_statuses_ignores_pending_rows(cleanup_blitz):
         from sqlalchemy import text
         db.execute(text("""
             INSERT INTO relay_approval_queue
-              (channel, recipient, thread_id, subject, payload, status,
+              (idempotency_key, channel, recipient, thread_id, payload, status,
                created_at, updated_at, venture_key)
             VALUES
-              ('email', 'stgblitz-pending@example.com', :thread_id,
-               'Storm leads', '{}', 'pending',
+              (:idem, 'email', 'stgblitz-pending@example.com', :thread_id,
+               '{"subject": "Storm leads", "body": "Hello"}', 'pending',
                now(), now(), 'hillsborough_distress')
-        """), {"thread_id": f"DBPR-{contact_id}"})
+        """), {"thread_id": f"DBPR-{contact_id}", "idem": f"stgblitz-pending-{contact_id}"})
         db.commit()
 
     with get_db_context() as db:

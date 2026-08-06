@@ -145,7 +145,6 @@ def run_dbpr_storm_sweep(
     publish target.ready events for each. Returns the opportunity_thread_ids
     published this pass.
     """
-    _sync_relay_sent_statuses(db)
     contacts = _fetch_sendable(db, batch_size)
     if not contacts:
         logger.info("dbpr_storm_producer: no sendable contacts — sweep done")
