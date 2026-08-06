@@ -11,6 +11,7 @@ Does NOT:
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Any
 
 from sqlalchemy import text as sa_text
@@ -23,6 +24,9 @@ from config.broker_states import (
     requires_close_payload,
     validate_transition,
 )
+from src.services.event_bus import emit_event
+from src.services.prospect_service import get_or_create_prospect
+
 logger = logging.getLogger(__name__)
 
 _SOURCE = "broker_state_machine"
@@ -112,6 +116,51 @@ def _insert_transition(
     return str(row.transition_id)
 
 
+def _emit_transition_event(
+    session: Session,
+    *,
+    lane_id: str,
+    transition_id: str,
+    broker_id: str,
+    from_state: str,
+    to_state: str,
+    reason_code: str,
+    actor: str,
+    gross_amount_cents: int | None = None,
+    split_config_id: str | None = None,
+) -> None:
+    """Emit broker.transition — the module/function docstrings already
+    promise every state change does this; loan_lane_sweep.py's two
+    consumers (handle_lane_closer, handle_commission_poster) poll
+    exactly this event_type and no other caller writes it."""
+    property_id = session.execute(
+        sa_text("SELECT property_id FROM lanes WHERE lane_id = CAST(:lid AS uuid)"),
+        {"lid": str(lane_id)},
+    ).scalar()
+    prospect_id = get_or_create_prospect(session, property_id)
+
+    payload: dict[str, Any] = {
+        "lane_id": str(lane_id),
+        "transition_id": transition_id,
+        "broker_id": str(broker_id),
+        "prospect_id": prospect_id,
+        "from_state": from_state,
+        "to_state": to_state,
+        "reason_code": reason_code,
+    }
+    if gross_amount_cents is not None:
+        payload["gross_amount_cents"] = gross_amount_cents
+    if split_config_id is not None:
+        payload["split_config_id"] = split_config_id
+
+    emit_event(
+        session,
+        event_type="broker.transition",
+        actor=actor,
+        source_component=_SOURCE,
+        prospect_id=uuid.UUID(prospect_id),
+        payload=payload,
+    )
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -201,6 +250,10 @@ def assign_broker(
         reason_code="qualified",
         actor=_actor,
     )
+    _emit_transition_event(
+        session, lane_id=str(row.lane_id), transition_id=tid, broker_id=broker_id,
+        from_state="unassigned", to_state="assigned", reason_code="qualified", actor=_actor,
+    )
     logger.info("[BrokerSM] claimed lane_id=%s broker_id=%s tid=%s", lane_id, broker_id, tid)
     return True
 
@@ -246,6 +299,10 @@ def reassign_lane(session: Session, lane_id: str, broker_id: str, actor: str) ->
         to_state="assigned",
         reason_code="qualified",
         actor=actor,
+    )
+    _emit_transition_event(
+        session, lane_id=str(lane_id), transition_id=tid, broker_id=broker_id,
+        from_state=from_state, to_state="assigned", reason_code="qualified", actor=actor,
     )
     logger.info(
         "[BrokerSM] reassigned lane_id=%s broker_id=%s actor=%s from=%s tid=%s",
@@ -317,6 +374,7 @@ def transition(
             f"Broker {broker_id!r} does not own lane {lane_id!r}."
         )
 
+    _actor = actor or str(broker_id)
     tid = _insert_transition(
         session,
         lane_id=lane_id,
@@ -324,7 +382,19 @@ def transition(
         from_state=from_state,
         to_state=to_state,
         reason_code=reason_code,
-        actor=actor or str(broker_id),
+        actor=_actor,
+    )
+    _emit_transition_event(
+        session,
+        lane_id=str(lane_id),
+        transition_id=tid,
+        broker_id=broker_id,
+        from_state=from_state,
+        to_state=to_state,
+        reason_code=reason_code,
+        actor=_actor,
+        gross_amount_cents=gross_amount_cents,
+        split_config_id=split_config_id,
     )
 
     session.execute(

@@ -12,17 +12,19 @@ Auth pattern:
   - Returns 503 if admin env vars are not configured
 """
 
+import csv
 import io
 import json
 import logging
 import secrets
+import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Literal
 
 import pandas as pd
 import stripe
-from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Query, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, Field, model_validator
@@ -31,7 +33,7 @@ from sqlalchemy.orm import Session
 
 from config.settings import settings
 from config.venture_template import DEFAULT_VENTURE_KEY
-from src.api.deps import get_db
+from src.api.deps import get_db, VALID_TIERS, VALID_VERTICALS, ZIP_RE
 from src.core.database import get_db_context
 from src.core.models import (
     County,
@@ -51,6 +53,7 @@ from src.core.models import (
 )
 from src.loaders.tax import TaxDelinquencyLoader
 from src.loaders.voter_registry import VoterRegistryLoader
+from src.services.zip_territory import claim_zip_territory
 from src.utils.county_config import invalidate_cache
 from src.utils.quora_attribution import campaign_slug, clamp_cooldown as quora_clamp_cooldown
 
@@ -523,6 +526,225 @@ def issue_unlock_refund(
         "status": refund.status,
         "sent_lead_id": sent_lead_id,
     }
+
+
+# ---------------------------------------------------------------------------
+# POST /api/admin/manual-invoice/provision — provision a customer who paid
+# via a manually-sent Stripe Invoice, before self-serve checkout ships.
+# ---------------------------------------------------------------------------
+
+class ManualInvoiceProvisionRequest(BaseModel):
+    stripe_invoice_id: str
+    tier: str
+    vertical: str
+    county_id: str
+    zip_codes: list[str]
+    is_founding: bool = False
+    founding_price_id: Optional[str] = None
+
+
+@router.post("/manual-invoice/provision")
+def provision_from_manual_invoice(
+    body: ManualInvoiceProvisionRequest,
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Provision a subscriber from a manually-sent Stripe Invoice paid outside
+    Checkout (e.g. a customer wired money before self-serve checkout shipped).
+
+    Verifies the invoice is actually paid in Stripe before creating anything.
+    Idempotent on stripe_customer_id — re-posting the same invoice returns the
+    already-provisioned subscriber instead of erroring or duplicating.
+
+    Mirrors _on_checkout_completed's new-subscriber field set and ZIP-lock
+    all-or-nothing semantics (src/services/stripe_webhooks.py) so a manually
+    invoiced customer ends up in the same state a Checkout customer would.
+    """
+    if body.tier not in VALID_TIERS:
+        raise HTTPException(status_code=400, detail=f"Invalid tier: {body.tier}")
+    if body.vertical not in VALID_VERTICALS:
+        raise HTTPException(status_code=400, detail=f"Invalid vertical: {body.vertical}")
+    if not body.zip_codes or not all(ZIP_RE.match(z) for z in body.zip_codes):
+        raise HTTPException(status_code=400, detail="zip_codes must be a non-empty list of 5-digit ZIPs")
+
+    if not settings.active_stripe_secret_key:
+        raise HTTPException(status_code=503, detail="Stripe not configured")
+    stripe.api_key = settings.active_stripe_secret_key.get_secret_value()
+
+    try:
+        invoice = stripe.Invoice.retrieve(body.stripe_invoice_id)
+    except stripe.error.StripeError as exc:
+        raise HTTPException(status_code=502, detail=f"Stripe error: {exc.user_message or str(exc)}")
+
+    if invoice.get("status") != "paid" or invoice.get("amount_remaining", 0) != 0:
+        raise HTTPException(
+            status_code=402,
+            detail=f"Invoice {body.stripe_invoice_id} is not fully paid (status={invoice.get('status')})",
+        )
+
+    stripe_customer_id = invoice.get("customer")
+    if not stripe_customer_id:
+        raise HTTPException(status_code=422, detail="Invoice has no customer attached")
+
+    existing = db.execute(
+        select(Subscriber).where(Subscriber.stripe_customer_id == stripe_customer_id)
+    ).scalar_one_or_none()
+    if existing:
+        return {
+            "already_provisioned": True,
+            "subscriber_id": existing.id,
+            "event_feed_uuid": existing.event_feed_uuid,
+        }
+
+    try:
+        customer = stripe.Customer.retrieve(stripe_customer_id)
+    except stripe.error.StripeError as exc:
+        raise HTTPException(status_code=502, detail=f"Stripe error fetching customer: {exc.user_message or str(exc)}")
+
+    now = datetime.now(timezone.utc)
+    subscriber = Subscriber(
+        stripe_customer_id=stripe_customer_id,
+        stripe_subscription_id=invoice.get("subscription"),
+        tier=body.tier,
+        vertical=body.vertical,
+        county_id=body.county_id,
+        founding_member=body.is_founding,
+        founding_price_id=body.founding_price_id if body.is_founding else None,
+        rate_locked_at=now if body.is_founding else None,
+        status="active",
+        event_feed_uuid=str(uuid.uuid4()),
+        email=(customer.get("email") or "").lower().strip() or None,
+        name=customer.get("name"),
+        phone=customer.get("phone"),
+        ghl_stage=5,
+        signup_source="admin",
+    )
+    db.add(subscriber)
+    db.flush()  # need subscriber.id before ZIP claims
+
+    unclaimed = [
+        zip_code for zip_code in body.zip_codes
+        if not claim_zip_territory(
+            db, zip_code=zip_code, vertical=body.vertical, county_id=body.county_id,
+            subscriber_id=subscriber.id, now=now,
+        )
+    ]
+    if unclaimed:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"ZIP(s) already claimed by another subscriber: {', '.join(unclaimed)}. "
+                "Nothing was provisioned — retry with different ZIPs."
+            ),
+        )
+
+    db.commit()
+
+    logger.info(
+        "[Admin] Manual-invoice provisioning: subscriber=%s invoice=%s customer=%s tier=%s zips=%s admin=%s",
+        subscriber.id, body.stripe_invoice_id, stripe_customer_id, body.tier, body.zip_codes, _admin.get("sub"),
+    )
+    return {
+        "already_provisioned": False,
+        "subscriber_id": subscriber.id,
+        "event_feed_uuid": subscriber.event_feed_uuid,
+        "zip_codes_locked": body.zip_codes,
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /api/admin/dbpr-contacts/export — ranked contractor lead export (item 39)
+#
+# There is no distress-style score for DBPR contractor rows (unlike
+# properties/CDS) — "ranked" here is an explicit, invented completeness/
+# outreach-readiness proxy (0-4: has phone, has email, company name resolved,
+# not DNC-flagged), not a predictive score. Labeled as such in the CSV header
+# so it's never mistaken for something it isn't.
+# ---------------------------------------------------------------------------
+
+@router.get("/dbpr-contacts/export")
+def export_dbpr_contacts(
+    vertical: Optional[str] = Query(default=None),
+    county: Optional[str] = Query(default=None),
+    min_score: Optional[int] = Query(default=None, ge=0, le=4),
+    exclude_suppressed: bool = Query(default=True, description="Exclude opted-out/bounced/already-signed-up contacts"),
+    limit: int = Query(default=5000, ge=1, le=20000),
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """CSV export of DBPR contractors with an outreach-readiness proxy score.
+
+    Score (0-4), one point each for: has a phone, has an email, company name
+    resolved (company_name_status='found'), not DNC/litigator-flagged. A
+    contact with no DNC check on file scores the point (unchecked is not the
+    same as confirmed bad) — dnc_status is reported separately so that
+    distinction stays visible rather than baked silently into the number.
+    """
+    rows = db.execute(
+        text("""
+            WITH scored AS (
+                SELECT
+                    d.id, d.full_name, d.company_name, d.company_name_status,
+                    d.vertical, d.zip_code, d.county_id, d.data_source,
+                    d.is_opted_out, d.is_hard_bounced, d.is_signed_up,
+                    COALESCE(d.mobile_phone, d.landline_phone, d.phone) AS phone,
+                    COALESCE(d.work_email, d.email) AS email,
+                    CASE
+                        WHEN dnc.phone IS NULL THEN 'unchecked'
+                        WHEN dnc.national_dnc OR dnc.litigator THEN 'flagged'
+                        ELSE 'clean'
+                    END AS dnc_status,
+                    (
+                        (CASE WHEN COALESCE(d.mobile_phone, d.landline_phone, d.phone) IS NOT NULL THEN 1 ELSE 0 END) +
+                        (CASE WHEN COALESCE(d.work_email, d.email) IS NOT NULL THEN 1 ELSE 0 END) +
+                        (CASE WHEN d.company_name_status = 'found' THEN 1 ELSE 0 END) +
+                        (CASE WHEN dnc.phone IS NOT NULL AND (dnc.national_dnc OR dnc.litigator) THEN 0 ELSE 1 END)
+                    ) AS completeness_score
+                FROM dbpr_contacts d
+                LEFT JOIN dnc_phone_checks dnc
+                       ON dnc.phone = COALESCE(d.mobile_phone, d.landline_phone, d.phone)
+            )
+            SELECT * FROM scored
+            WHERE (:vertical IS NULL OR vertical = :vertical)
+              AND (:county IS NULL OR county_id = :county)
+              AND (:min_score IS NULL OR completeness_score >= :min_score)
+              AND (:exclude_suppressed = false OR (NOT is_opted_out AND NOT is_hard_bounced AND NOT is_signed_up))
+            ORDER BY completeness_score DESC, full_name
+            LIMIT :limit
+        """),
+        {
+            "vertical": vertical,
+            "county": county,
+            "min_score": min_score,
+            "exclude_suppressed": exclude_suppressed,
+            "limit": limit,
+        },
+    ).fetchall()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        f"# DBPR Contractor Export — {datetime.now().strftime('%Y-%m-%d')} — {len(rows)} row(s) — "
+        "'Score' is an outreach-readiness proxy (phone + email + company resolved + not DNC-flagged), "
+        "not a predictive/distress score"
+    ])
+    writer.writerow([
+        "Name", "Company", "Phone", "Email", "ZIP", "County", "Vertical",
+        "Score", "DNC Status", "Company Name Status", "Data Source",
+    ])
+    for r in rows:
+        writer.writerow([
+            r.full_name, r.company_name, r.phone, r.email, r.zip_code, r.county_id, r.vertical,
+            r.completeness_score, r.dnc_status, r.company_name_status, r.data_source,
+        ])
+
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="dbpr_contacts_export.csv"'},
+    )
 
 
 # ---------------------------------------------------------------------------

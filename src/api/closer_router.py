@@ -1,10 +1,12 @@
 """Closer Cockpit router (Sprint S1b).
 
-  POST /api/admin/closer-calls                  — dial-time correlation (pending row)
-  POST /api/admin/closer-calls/{id}/feedback    — one-tap closer feedback
-  GET  /api/admin/closer-calls                  — list/filter
-  GET  /api/admin/subscribers/{id}/closer-calls — per-subscriber call timeline
-  GET  /api/admin/closer-calls/{id}/recording   — on-demand fresh Aircall playback URL
+  POST /api/admin/closer-calls                    — dial-time correlation (pending row)
+  POST /api/admin/closer-calls/{id}/feedback      — one-tap closer feedback
+  GET  /api/admin/closer-calls                    — list/filter
+  GET  /api/admin/subscribers/{id}/closer-calls   — per-subscriber call timeline
+  GET  /api/admin/buyer-entities/{id}/closer-calls — per-whale call timeline (item 49)
+  GET  /api/admin/closer-calls/whale-queue        — Hunter's ranked whale queue, dial-ready (item 49)
+  GET  /api/admin/closer-calls/{id}/recording     — on-demand fresh Aircall playback URL
 """
 from __future__ import annotations
 
@@ -29,7 +31,7 @@ from config.closer import (
 )
 from src.api.admin_router import get_current_admin
 from src.api.deps import get_db
-from src.core.models import CloserCall, LifecycleTrainingOverride, Subscriber
+from src.core.models import BuyerEntity, CloserCall, LifecycleTrainingOverride, Subscriber
 from src.services import aircall_client
 from src.services.cds_engine import MultiVerticalScorer as CDSEngine
 from src.services.phone_utils import normalize_closer as normalize_phone
@@ -45,6 +47,7 @@ def _row_to_dict(r) -> dict:
         "id": r.id,
         "aircall_call_id": r.aircall_call_id,
         "subscriber_id": r.subscriber_id,
+        "buyer_entity_id": r.buyer_entity_id,
         "escalation_id": r.escalation_id,
         "closer_aircall_user_id": r.closer_aircall_user_id,
         "closer_name": r.closer_name,
@@ -68,7 +71,7 @@ def _row_to_dict(r) -> dict:
 
 
 _LIST_COLS = (
-    "id, aircall_call_id, subscriber_id, escalation_id, closer_aircall_user_id, "
+    "id, aircall_call_id, subscriber_id, buyer_entity_id, escalation_id, closer_aircall_user_id, "
     "closer_name, direction, dialed_e164, duration_sec, started_at, ended_at, "
     "sentiment, topics, objections, objection_resolved, call_outcome, follow_ups, "
     "tagged_at, objection_type, pitch_variant, lead_quality_rating, "
@@ -78,7 +81,8 @@ _LIST_COLS = (
 
 class CorrelateCallRequest(BaseModel):
     aircall_call_id: str
-    subscriber_id: int
+    subscriber_id: Optional[int] = None
+    buyer_entity_id: Optional[int] = None
     escalation_id: Optional[int] = None
     dialed_e164: Optional[str] = None
 
@@ -88,6 +92,7 @@ def _serialize(row: CloserCall) -> dict:
         "id": row.id,
         "aircall_call_id": row.aircall_call_id,
         "subscriber_id": row.subscriber_id,
+        "buyer_entity_id": row.buyer_entity_id,
         "escalation_id": row.escalation_id,
         "status": "tagged" if row.tagged_at else "pending",
         "created_at": row.created_at.isoformat() if row.created_at else None,
@@ -103,14 +108,25 @@ def correlate_call(
 ):
     """Create (or return existing) pending closer_calls row at dial time.
 
+    Exactly one of subscriber_id/buyer_entity_id must be set — a call is
+    either with an existing customer or a cold whale prospect sourced from
+    Hunter's ranked queue (item 49), matching ck_closer_calls_one_identity.
     Idempotent: a re-fired dial event for the same aircall_call_id returns the
     existing row (200) instead of erroring.
     """
     if not req.aircall_call_id:
         raise HTTPException(status_code=422, detail="aircall_call_id required")
 
-    if not db.get(Subscriber, req.subscriber_id):
+    if bool(req.subscriber_id) == bool(req.buyer_entity_id):
+        raise HTTPException(
+            status_code=422,
+            detail="exactly one of subscriber_id or buyer_entity_id is required",
+        )
+
+    if req.subscriber_id is not None and not db.get(Subscriber, req.subscriber_id):
         raise HTTPException(status_code=404, detail="subscriber not found")
+    if req.buyer_entity_id is not None and not db.get(BuyerEntity, req.buyer_entity_id):
+        raise HTTPException(status_code=404, detail="buyer entity not found")
 
     existing = db.execute(
         select(CloserCall).where(CloserCall.aircall_call_id == req.aircall_call_id)
@@ -122,6 +138,7 @@ def correlate_call(
     row = CloserCall(
         aircall_call_id=req.aircall_call_id,
         subscriber_id=req.subscriber_id,
+        buyer_entity_id=req.buyer_entity_id,
         escalation_id=req.escalation_id,
         direction="outbound",
         dialed_e164=normalize_phone(req.dialed_e164) if req.dialed_e164 else None,
@@ -129,8 +146,8 @@ def correlate_call(
     db.add(row)
     db.flush()
     logger.info(
-        "[closer] correlated call aircall_call_id=%s sub=%s esc=%s",
-        req.aircall_call_id, req.subscriber_id, req.escalation_id,
+        "[closer] correlated call aircall_call_id=%s sub=%s buyer_entity=%s esc=%s",
+        req.aircall_call_id, req.subscriber_id, req.buyer_entity_id, req.escalation_id,
     )
     response.status_code = 201
     return _serialize(row)
@@ -183,6 +200,7 @@ def submit_feedback(
 def list_closer_calls(
     closer: Optional[str] = Query(None, description="closer_aircall_user_id"),
     subscriber_id: Optional[int] = Query(None),
+    buyer_entity_id: Optional[int] = Query(None),
     from_: Optional[str] = Query(None, alias="from", description="ISO; started_at >="),
     to: Optional[str] = Query(None, description="ISO; started_at <"),
     limit: int = Query(50, ge=1, le=200),
@@ -199,6 +217,9 @@ def list_closer_calls(
     if subscriber_id is not None:
         where.append("subscriber_id = :sid")
         params["sid"] = subscriber_id
+    if buyer_entity_id is not None:
+        where.append("buyer_entity_id = :beid")
+        params["beid"] = buyer_entity_id
     if from_:
         where.append("started_at >= :from_ts")
         params["from_ts"] = from_
@@ -238,6 +259,44 @@ def subscriber_closer_calls(
     ).all()
     return {"subscriber_id": subscriber_id, "count": len(rows),
             "items": [_row_to_dict(r) for r in rows]}
+
+
+@router.get("/buyer-entities/{buyer_entity_id}/closer-calls")
+def buyer_entity_closer_calls(
+    buyer_entity_id: int,
+    limit: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_db),
+    _admin: dict = Depends(get_current_admin),
+):
+    """All closer calls for one whale/buyer entity, newest first (item 49)."""
+    rows = db.execute(
+        text(
+            f"SELECT {_LIST_COLS} FROM closer_calls WHERE buyer_entity_id = :beid "
+            "ORDER BY started_at DESC NULLS LAST, id DESC LIMIT :limit"
+        ),
+        {"beid": buyer_entity_id, "limit": limit},
+    ).all()
+    return {"buyer_entity_id": buyer_entity_id, "count": len(rows),
+            "items": [_row_to_dict(r) for r in rows]}
+
+
+@router.get("/closer-calls/whale-queue")
+def whale_call_queue(
+    limit: int = Query(25, ge=1, le=100),
+    county_id: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    _admin: dict = Depends(get_current_admin),
+):
+    """Hunter's ranked whale queue, dial-ready for closers (item 49).
+
+    Read-only passthrough to get_ranked_whales() — a closer works this list
+    top to bottom, then POSTs /closer-calls with buyer_entity_id=entity_id to
+    log the call against the same identity.
+    """
+    from src.services.whale_ranking import get_ranked_whales
+
+    whales = get_ranked_whales(db, limit=limit, county_id=county_id)
+    return {"count": len(whales), "items": whales}
 
 
 @router.get("/closer-calls/{call_id}/recording")
