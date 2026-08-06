@@ -76,7 +76,8 @@ def send_email(item: QueueItem) -> None:
     if result is None:
         raise RuntimeError(f"item {item.id}: Instantly add_leads call failed (see logs)")
 
-    if result.get("leads_skipped", 0):
+    duplicated = result.get("duplicated_leads", 0) or result.get("leads_skipped", 0)
+    if duplicated:
         raise RuntimeError(
             f"item {item.id}: Instantly skipped {item.recipient} — already a "
             f"member of venture {item.venture_key}'s passthrough campaign (duplicate-contact "
@@ -84,7 +85,8 @@ def send_email(item: QueueItem) -> None:
             f"not yet built, see RELAY-R2-Implementation-Plan.md Locked decision #2)"
         )
 
-    if result.get("leads_created", 0) == 0:
+    created = result.get("leads_uploaded", 0) or result.get("leads_created", 0)
+    if created == 0:
         raise RuntimeError(f"item {item.id}: Instantly reported 0 leads created for {item.recipient}")
 
 
