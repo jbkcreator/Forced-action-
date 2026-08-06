@@ -4,7 +4,9 @@ Tests for the 2 write tools: send_sms and log_decision.
 send_sms tests exercise:
   - Registration as write + idempotent + requires_compliance
   - Missing opt-in short-circuits with reason='no_phone'
-  - Duplicate (subscriber, campaign, variant) within 24h returns reason='duplicate'
+  - Duplicate (subscriber, template_id, variant, message_type, send_date) —
+    enforced by the atomic uq_message_outcomes_dedup index, not a proactive
+    SELECT — returns reason='duplicate'
   - Compliance failure returns reason='opted_out_or_twilio_error'
   - Happy path writes a MessageOutcome row
 
@@ -59,7 +61,12 @@ def test_log_decision_registered_as_write_idempotent_no_compliance():
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _mock_query_returning(*, opt_in=None, duplicate=None):
-	"""Session mock where the first .first() returns opt_in, second returns duplicate."""
+	"""
+	Session mock: opt-in lookup returns `opt_in`. If `duplicate` is set, the
+	atomic insert (s.begin_nested()/s.flush()) raises IntegrityError —
+	simulating a real uq_message_outcomes_dedup conflict — and the
+	post-conflict lookup (_find_duplicate_outcome) returns `duplicate`.
+	"""
 	sess = MagicMock()
 	sess.execute.return_value.first.return_value = None
 	opt_in_q = MagicMock()
@@ -67,12 +74,20 @@ def _mock_query_returning(*, opt_in=None, duplicate=None):
 	opt_in_q.order_by.return_value = opt_in_q
 	opt_in_q.first.return_value = opt_in
 
-	dup_q = MagicMock()
-	dup_q.filter.return_value = dup_q
-	dup_q.first.return_value = duplicate
+	if duplicate is not None:
+		from sqlalchemy.exc import IntegrityError
+		sess.flush.side_effect = IntegrityError("insert", {}, Exception("duplicate key"))
+		# MagicMock's default __exit__ return value is truthy, which would
+		# silently swallow the exception instead of propagating it — real
+		# SQLAlchemy savepoints don't do that, so this must be explicit.
+		sess.begin_nested.return_value.__exit__.return_value = False
 
-	# First .query() returns opt-in query, second returns duplicate-check query.
-	sess.query.side_effect = [opt_in_q, dup_q, MagicMock()]
+		dup_q = MagicMock()
+		dup_q.filter.return_value = dup_q
+		dup_q.first.return_value = duplicate
+		sess.query.side_effect = [opt_in_q, dup_q]
+	else:
+		sess.query.side_effect = [opt_in_q, MagicMock()]
 	return sess
 
 
