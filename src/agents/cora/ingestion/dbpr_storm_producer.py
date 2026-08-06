@@ -1,7 +1,7 @@
 """
-DBPR storm/restoration contractor producer — Aug 2026 blitz.
+DBPR roofing contractor producer — Aug 2026 blitz.
 
-Reads dbpr_contacts (roofing + remediation verticals, Hillsborough + Pinellas)
+Reads dbpr_contacts (roofing vertical, Hillsborough + Pinellas)
 and publishes target.ready events into Cora's queue, identical in shape to what
 target_producer.py produces for whales. Cora drafts, posts to Slack approval,
 and Relay fires via Instantly — the same pipeline, just a different prospect source.
