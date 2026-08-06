@@ -69,8 +69,10 @@ def send_email(item: QueueItem) -> None:
 
     result = instantly.add_leads(campaign_id, [{
         "email": item.recipient,
-        "ra_subject": subject,
-        "ra_body": body,
+        "variables": {
+            "ra_subject": subject,
+            "ra_body": body,
+        },
     }])
 
     if result is None:
