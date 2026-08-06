@@ -43,7 +43,7 @@ from src.services.phone_utils import normalize as normalize_phone
 
 logger = logging.getLogger(__name__)
 
-_THREAD_ID_RE = re.compile(r"^OPP-\d{4}-\d{5}$")
+_THREAD_ID_RE = re.compile(r"^(OPP-\d{4}-\d{5}|DBPR-\d+)$")
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _SOFT_CELL_TAG_FIELDS = ("cell_id", "offer", "avenue", "angle")
 

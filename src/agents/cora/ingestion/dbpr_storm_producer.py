@@ -35,9 +35,9 @@ _TARGET_COUNTIES = ("hillsborough", "pinellas")
 
 def _idempotency_key(contact_id: int) -> str:
     content_hash = hashlib.sha256(
-        f"dbpr-{contact_id}:{CELL_ID}:{date.today().isoformat()}".encode()
+        f"DBPR-{contact_id}:{CELL_ID}:{date.today().isoformat()}".encode()
     ).hexdigest()[:16]
-    return queue.make_idempotency_key("target.ready", f"dbpr-{contact_id}", content_hash)
+    return queue.make_idempotency_key("target.ready", f"DBPR-{contact_id}", content_hash)
 
 
 def _has_active_draft(db: Session, contact_id: int) -> bool:
@@ -48,9 +48,31 @@ def _has_active_draft(db: Session, contact_id: int) -> bool:
               AND status NOT IN ('rejected', 'expired')
             LIMIT 1
         """),
-        {"thread_id": f"dbpr-{contact_id}"},
+        {"thread_id": f"DBPR-{contact_id}"},
     ).first()
     return row is not None
+
+
+def _sync_relay_sent_statuses(db: Session) -> int:
+    """Mark dbpr_contacts as sent where Relay has already dispatched the blitz email.
+
+    Runs at the top of each sweep so the next _fetch_sendable won't re-pick contacts
+    whose Relay dispatch completed since the last run.
+    """
+    result = db.execute(text("""
+        UPDATE dbpr_contacts dc
+        SET email_status = 'sent',
+            email_sent_at = raq.dispatched_at,
+            updated_at    = now()
+        FROM relay_approval_queue raq
+        WHERE raq.thread_id  = 'DBPR-' || dc.id::text
+          AND raq.status     = 'sent'
+          AND dc.email_status = 'not_sent'
+    """))
+    count: int = result.rowcount  # type: ignore[union-attr]
+    if count:
+        logger.info("dbpr_storm_producer: synced %d contact(s) to sent from Relay", count)
+    return count
 
 
 def _fetch_sendable(db: Session, batch_size: int):
@@ -123,6 +145,7 @@ def run_dbpr_storm_sweep(
     publish target.ready events for each. Returns the opportunity_thread_ids
     published this pass.
     """
+    _sync_relay_sent_statuses(db)
     contacts = _fetch_sendable(db, batch_size)
     if not contacts:
         logger.info("dbpr_storm_producer: no sendable contacts — sweep done")
@@ -132,7 +155,7 @@ def run_dbpr_storm_sweep(
     published: List[str] = []
 
     for contact in contacts:
-        thread_id = f"dbpr-{contact.id}"
+        thread_id = f"DBPR-{contact.id}"
 
         if _has_active_draft(db, contact.id):
             logger.debug("dbpr_storm_producer: active draft exists for contact_id=%s — skipping", contact.id)
