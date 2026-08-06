@@ -40,9 +40,9 @@ def _property(session) -> int:
     ).scalar()
 
 
-def _prospect(session) -> str:
+def _prospect(session) -> tuple[int, str]:
     prop_id = _property(session)
-    return str(session.execute(
+    prospect_id = str(session.execute(
         sa_text("""
             INSERT INTO prospects (prospect_id, property_id, contactability_state)
             VALUES (gen_random_uuid(), :pid, 'contactable')
@@ -50,6 +50,7 @@ def _prospect(session) -> str:
         """),
         {"pid": prop_id},
     ).scalar())
+    return prop_id, prospect_id
 
 
 def _broker(session, *, active: bool = True) -> str:
@@ -64,8 +65,8 @@ def _broker(session, *, active: bool = True) -> str:
 
 
 def _lane(session) -> tuple[str, str]:
-    pid = _prospect(session)
-    lane_id = enter_lane(session, pid, lane_type=LANE_TYPE)
+    prop_id, pid = _prospect(session)
+    lane_id = enter_lane(session, prop_id, lane_type=LANE_TYPE)
     return lane_id, pid
 
 

@@ -121,7 +121,10 @@ def _emit_transition_event(
     *,
     lane_id: str,
     transition_id: str,
+    broker_id: str,
+    from_state: str,
     to_state: str,
+    reason_code: str,
     actor: str,
     gross_amount_cents: int | None = None,
     split_config_id: str | None = None,
@@ -130,21 +133,25 @@ def _emit_transition_event(
     promise every state change does this; loan_lane_sweep.py's two
     consumers (handle_lane_closer, handle_commission_poster) poll
     exactly this event_type and no other caller writes it."""
-    payload: dict[str, Any] = {
-        "lane_id": str(lane_id),
-        "transition_id": transition_id,
-        "to_state": to_state,
-    }
-    if gross_amount_cents is not None:
-        payload["gross_amount_cents"] = gross_amount_cents
-    if split_config_id is not None:
-        payload["split_config_id"] = split_config_id
-
     property_id = session.execute(
         sa_text("SELECT property_id FROM lanes WHERE lane_id = CAST(:lid AS uuid)"),
         {"lid": str(lane_id)},
     ).scalar()
     prospect_id = get_or_create_prospect(session, property_id)
+
+    payload: dict[str, Any] = {
+        "lane_id": str(lane_id),
+        "transition_id": transition_id,
+        "broker_id": str(broker_id),
+        "prospect_id": prospect_id,
+        "from_state": from_state,
+        "to_state": to_state,
+        "reason_code": reason_code,
+    }
+    if gross_amount_cents is not None:
+        payload["gross_amount_cents"] = gross_amount_cents
+    if split_config_id is not None:
+        payload["split_config_id"] = split_config_id
 
     emit_event(
         session,
@@ -244,7 +251,8 @@ def assign_broker(
         actor=_actor,
     )
     _emit_transition_event(
-        session, lane_id=str(row.lane_id), transition_id=tid, to_state="assigned", actor=_actor,
+        session, lane_id=str(row.lane_id), transition_id=tid, broker_id=broker_id,
+        from_state="unassigned", to_state="assigned", reason_code="qualified", actor=_actor,
     )
     logger.info("[BrokerSM] claimed lane_id=%s broker_id=%s tid=%s", lane_id, broker_id, tid)
     return True
@@ -293,7 +301,8 @@ def reassign_lane(session: Session, lane_id: str, broker_id: str, actor: str) ->
         actor=actor,
     )
     _emit_transition_event(
-        session, lane_id=str(lane_id), transition_id=tid, to_state="assigned", actor=actor,
+        session, lane_id=str(lane_id), transition_id=tid, broker_id=broker_id,
+        from_state=from_state, to_state="assigned", reason_code="qualified", actor=actor,
     )
     logger.info(
         "[BrokerSM] reassigned lane_id=%s broker_id=%s actor=%s from=%s tid=%s",
@@ -379,7 +388,10 @@ def transition(
         session,
         lane_id=str(lane_id),
         transition_id=tid,
+        broker_id=broker_id,
+        from_state=from_state,
         to_state=to_state,
+        reason_code=reason_code,
         actor=_actor,
         gross_amount_cents=gross_amount_cents,
         split_config_id=split_config_id,

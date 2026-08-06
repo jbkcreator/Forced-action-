@@ -44,9 +44,9 @@ def _property(session) -> int:
     ).scalar()
 
 
-def _prospect(session) -> str:
+def _prospect(session) -> tuple[int, str]:
     prop_id = _property(session)
-    return str(session.execute(
+    prospect_id = str(session.execute(
         sa_text("""
             INSERT INTO prospects (prospect_id, property_id, contactability_state)
             VALUES (gen_random_uuid(), :pid, 'contactable')
@@ -54,6 +54,7 @@ def _prospect(session) -> str:
         """),
         {"pid": prop_id},
     ).scalar())
+    return prop_id, prospect_id
 
 
 def _broker(session) -> str:
@@ -68,8 +69,8 @@ def _broker(session) -> str:
 
 
 def _lane(session) -> tuple[str, str]:
-    pid = _prospect(session)
-    lane_id = enter_lane(session, pid, lane_type=LANE_TYPE)
+    prop_id, pid = _prospect(session)
+    lane_id = enter_lane(session, prop_id, lane_type=LANE_TYPE)
     return lane_id, pid
 
 
@@ -101,7 +102,7 @@ def _last_event(session, event_type: str) -> dict | None:
 
 class TestClosedWonPath:
     def test_assign_emits_broker_transition_event(self, fresh_db):
-        with patch("src.services.loan_lane_service.emit_event"):
+        with patch("src.services.broker_state_machine.emit_event"):
             lane_id, _ = _lane(fresh_db)
         broker_id = _broker(fresh_db)
 
@@ -116,7 +117,7 @@ class TestClosedWonPath:
 
     def test_full_happy_path_event_payload(self, fresh_db):
         """closed_won event carries all required payload fields."""
-        with patch("src.services.loan_lane_service.emit_event"):
+        with patch("src.services.broker_state_machine.emit_event"):
             lane_id, pid = _lane(fresh_db)
         broker_id = _broker(fresh_db)
 
@@ -141,11 +142,11 @@ class TestClosedWonPath:
         assert ev["split_config_id"] == SPLIT
 
     def test_lane_closer_sets_outcome_funded_on_closed_won(self, fresh_db):
-        with patch("src.services.loan_lane_service.emit_event"):
+        with patch("src.services.broker_state_machine.emit_event"):
             lane_id, _ = _lane(fresh_db)
 
         event_row = _make_event_row({"to_state": "closed_won", "lane_id": lane_id})
-        with patch("src.services.loan_lane_service.emit_event"):
+        with patch("src.services.broker_state_machine.emit_event"):
             handle_lane_closer(fresh_db, event_row)
 
         outcome = fresh_db.execute(
@@ -156,12 +157,12 @@ class TestClosedWonPath:
 
     def test_lane_closer_idempotent(self, fresh_db):
         """Calling handle_lane_closer twice on a funded lane is safe."""
-        with patch("src.services.loan_lane_service.emit_event"):
+        with patch("src.services.broker_state_machine.emit_event"):
             lane_id, _ = _lane(fresh_db)
             set_lane_outcome(fresh_db, lane_id, "funded", actor="test")
 
         event_row = _make_event_row({"to_state": "closed_won", "lane_id": lane_id})
-        with patch("src.services.loan_lane_service.emit_event"):
+        with patch("src.services.broker_state_machine.emit_event"):
             handle_lane_closer(fresh_db, event_row)  # must not raise
 
         outcome = fresh_db.execute(
@@ -171,9 +172,7 @@ class TestClosedWonPath:
         assert outcome == "funded"
 
     def test_commission_poster_writes_ledger_entry(self, fresh_db):
-        with patch("src.services.loan_lane_service.emit_event"), \
-             patch("src.services.broker_state_machine.emit_event"), \
-             patch("src.services.commission_ledger.emit_event"):
+        with patch("src.services.broker_state_machine.emit_event"):
             lane_id, _ = _lane(fresh_db)
             broker_id = _broker(fresh_db)
             assign_broker(fresh_db, lane_id, broker_id)
@@ -191,8 +190,7 @@ class TestClosedWonPath:
             "gross_amount_cents": GROSS,
             "split_config_id": SPLIT,
         })
-        with patch("src.services.commission_ledger.emit_event"):
-            handle_commission_poster(fresh_db, event_row)
+        handle_commission_poster(fresh_db, event_row)
 
         row = fresh_db.execute(
             sa_text(
@@ -206,9 +204,7 @@ class TestClosedWonPath:
 
     def test_commission_poster_idempotent_via_consumer(self, fresh_db):
         """Running handle_commission_poster twice inserts exactly one row."""
-        with patch("src.services.loan_lane_service.emit_event"), \
-             patch("src.services.broker_state_machine.emit_event"), \
-             patch("src.services.commission_ledger.emit_event"):
+        with patch("src.services.broker_state_machine.emit_event"):
             lane_id, _ = _lane(fresh_db)
             broker_id = _broker(fresh_db)
             assign_broker(fresh_db, lane_id, broker_id)
@@ -226,9 +222,8 @@ class TestClosedWonPath:
             "gross_amount_cents": GROSS,
             "split_config_id": SPLIT,
         })
-        with patch("src.services.commission_ledger.emit_event"):
-            handle_commission_poster(fresh_db, event_row)
-            handle_commission_poster(fresh_db, event_row)  # replay
+        handle_commission_poster(fresh_db, event_row)
+        handle_commission_poster(fresh_db, event_row)  # replay
 
         count = fresh_db.execute(
             sa_text(
@@ -244,11 +239,11 @@ class TestClosedWonPath:
 
 class TestClosedLostPath:
     def test_lane_closer_sets_outcome_dead_on_closed_lost(self, fresh_db):
-        with patch("src.services.loan_lane_service.emit_event"):
+        with patch("src.services.broker_state_machine.emit_event"):
             lane_id, _ = _lane(fresh_db)
 
         event_row = _make_event_row({"to_state": "closed_lost", "lane_id": lane_id})
-        with patch("src.services.loan_lane_service.emit_event"):
+        with patch("src.services.broker_state_machine.emit_event"):
             handle_lane_closer(fresh_db, event_row)
 
         outcome = fresh_db.execute(
@@ -258,7 +253,7 @@ class TestClosedLostPath:
         assert outcome == "dead"
 
     def test_closed_lost_event_payload(self, fresh_db):
-        with patch("src.services.loan_lane_service.emit_event"):
+        with patch("src.services.broker_state_machine.emit_event"):
             lane_id, pid = _lane(fresh_db)
         broker_id = _broker(fresh_db)
 
@@ -283,11 +278,11 @@ class TestClosedLostPath:
         assert count == 0
 
     def test_lane_closer_ignores_intermediate_state(self, fresh_db):
-        with patch("src.services.loan_lane_service.emit_event"):
+        with patch("src.services.broker_state_machine.emit_event"):
             lane_id, _ = _lane(fresh_db)
 
         event_row = _make_event_row({"to_state": "working", "lane_id": lane_id})
-        with patch("src.services.loan_lane_service.emit_event"):
+        with patch("src.services.broker_state_machine.emit_event"):
             handle_lane_closer(fresh_db, event_row)
 
         row = fresh_db.execute(
