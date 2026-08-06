@@ -236,6 +236,7 @@ def process_call_outcome(
     zip_code: str,
     prospect_name: str = "",
     notes: str = "",
+    call_id: Optional[str] = None,
 ) -> dict:
     """
     Called by POST /webhooks/synthflow after each Synthflow call completes.
@@ -280,6 +281,8 @@ def process_call_outcome(
             zip_code=zip_code,
         )
         created = True
+        if contact_id:
+            _apply_tags_to_contact(contact_id, tags)
         logger.info(
             "[Synthflow] new contact created: %s outcome=%s tags=%s",
             contact_id, outcome, tags,
@@ -346,6 +349,7 @@ def process_call_outcome(
                 zip_code=zip_code or None,
                 contact_id=contact_id,
                 call_date=_date.today(),
+                call_id=call_id or None,
             ))
     except Exception as _exc:
         logger.warning("[Synthflow] failed to log call: %s", _exc)

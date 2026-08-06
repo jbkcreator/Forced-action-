@@ -4690,6 +4690,21 @@ async def synthflow_webhook(request: Request):
 
     v = payload._vars
     lead = payload.lead or {}
+    call_id = payload.resolved_call_id
+
+    # Dedup: Synthflow retries on network errors — skip if already processed
+    if call_id:
+        from src.core.database import get_db_context
+        from src.core.models import SynthflowCall
+        with get_db_context() as _dedup_db:
+            existing = _dedup_db.execute(
+                text("SELECT 1 FROM synthflow_calls WHERE call_id = :cid LIMIT 1"),
+                {"cid": call_id},
+            ).fetchone()
+        if existing:
+            logger.info("[Synthflow webhook] duplicate call_id=%s — skipping", call_id)
+            return {"status": "duplicate"}
+
     from src.services.synthflow_service import process_call_outcome
     try:
         result = process_call_outcome(
@@ -4699,6 +4714,7 @@ async def synthflow_webhook(request: Request):
             zip_code=payload.zip_code or v.get("zip_code") or v.get("zip") or "",
             prospect_name=payload.prospect_name or v.get("prospect_name") or lead.get("name") or "",
             notes=payload.notes or v.get("notes") or "",
+            call_id=call_id,
         )
     except Exception:
         logger.error("[Synthflow webhook] processing error for %s", phone, exc_info=True)
