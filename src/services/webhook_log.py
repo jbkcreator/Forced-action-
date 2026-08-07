@@ -225,8 +225,16 @@ def _telnyx(payload: Dict[str, Any]) -> dict:
     }
 
 
+def _checkout_started(payload: Dict[str, Any]) -> dict:
+    """Our own pre-built checkout-creation metadata (tier/product/etc.) —
+    not a raw Stripe Event, so it must not go through _stripe's Event-shaped
+    extraction. Already free of PII by construction — stored as-is."""
+    return payload
+
+
 _SANITIZERS = {
     "stripe":              _stripe,
+    "checkout_started":    _checkout_started,
     "ghl":                 _ghl,
     "ghl_inbound":         _ghl,
     "ghl_outbound":        _ghl,

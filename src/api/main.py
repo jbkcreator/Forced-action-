@@ -4407,6 +4407,7 @@ def hot_lead_unlock(payload: HotLeadUnlockRequest, db: Session = Depends(get_db)
             lead_id=payload.lead_id,
             reduced=reduced,
             customer_email=subscriber.email,
+            db=db,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
