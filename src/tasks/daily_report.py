@@ -723,6 +723,50 @@ def _build_cora_throughput_health(session, errors: list) -> dict:
     return health
 
 
+def _build_cora_throughput_volume(session, run_date: date) -> dict:
+    """
+    Block 13 — Cora Throughput volume (global, not county-scoped: mirrors
+    _build_cora_throughput_health's scope). Daily counts, not queue health:
+    drafts produced, batches approved/rejected, and items actually dispatched
+    to Relay for run_date. Zeros included when nothing happened that day.
+    """
+    drafts_created = session.execute(
+        text("""
+            SELECT COUNT(*) AS cnt
+            FROM outbound_drafts
+            WHERE date(created_at) = :run_date
+        """),
+        {"run_date": run_date},
+    ).scalar() or 0
+
+    batch_decisions = session.execute(
+        text("""
+            SELECT status, COUNT(*) AS cnt
+            FROM cora_draft_batches
+            WHERE date(decided_at) = :run_date
+            GROUP BY status
+        """),
+        {"run_date": run_date},
+    ).fetchall()
+    batches_by_status = {row.status: int(row.cnt) for row in batch_decisions}
+
+    items_sent = session.execute(
+        text("""
+            SELECT COUNT(*) AS cnt
+            FROM relay_approval_queue
+            WHERE status = 'sent' AND date(dispatched_at) = :run_date
+        """),
+        {"run_date": run_date},
+    ).scalar() or 0
+
+    return {
+        "drafts_created":      int(drafts_created),
+        "batches_approved":    batches_by_status.get("approved", 0),
+        "batches_rejected":    batches_by_status.get("rejected", 0),
+        "items_sent_to_relay": int(items_sent),
+    }
+
+
 def _build_inbound_velocity_section(session) -> dict:
     """
     Block 11 / B11-04 — inbound response-time report section. Global metric
@@ -762,6 +806,7 @@ def build_report(run_date: date, county_id: str) -> dict:
         phone_coverage          = _build_phone_coverage(session, run_date, county_id)
         inbound_velocity        = _build_inbound_velocity_section(session)
         cora_throughput_health  = _build_cora_throughput_health(session, errors)
+        cora_throughput_volume  = _build_cora_throughput_volume(session, run_date)
 
     return {
         "run_date":              run_date,
@@ -781,6 +826,7 @@ def build_report(run_date: date, county_id: str) -> dict:
         "phone_coverage":        phone_coverage,
         "inbound_velocity":      inbound_velocity,
         "cora_throughput_health": cora_throughput_health,
+        "cora_throughput_volume": cora_throughput_volume,
         "errors":                errors,
     }
 
@@ -982,6 +1028,15 @@ def write_csv(report: dict, path: Path) -> None:
         w.writerow(["Drafts stuck in status='draft'", f"{ch.get('stuck_draft_count', 0):,}"])
         oldest = ch.get("oldest_stuck_draft_hours")
         w.writerow(["Oldest stuck draft", f"{oldest:.0f}h old" if oldest is not None else "—"])
+        w.writerow([])
+
+        # ── Section 13: Cora Throughput Volume (global) ───────────────────
+        w.writerow(["CORA THROUGHPUT VOLUME (draft batching — global, not county-scoped)"])
+        cv = report.get("cora_throughput_volume") or {}
+        w.writerow(["Drafts created today", f"{cv.get('drafts_created', 0):,}"])
+        w.writerow(["Batches approved today", f"{cv.get('batches_approved', 0):,}"])
+        w.writerow(["Batches rejected today", f"{cv.get('batches_rejected', 0):,}"])
+        w.writerow(["Items sent to Relay today", f"{cv.get('items_sent_to_relay', 0):,}"])
 
 
 # ---------------------------------------------------------------------------

@@ -32,6 +32,32 @@ from src.core.models import County, FoundingSubscriberCount, Plan
 
 logger = logging.getLogger(__name__)
 
+
+def _log_checkout_started(
+    db: Optional[Session],
+    session_id: str,
+    product: str,
+    metadata: dict,
+) -> None:
+    """
+    Audit row for a created Stripe Checkout Session — the only place
+    "checkouts started" becomes queryable (Stripe's own SDK call only logs
+    to stdout, no DB row). Thin wrapper over the existing unified webhook
+    audit logger (best-effort, never raises; rides the caller's transaction
+    if db is given, else opens its own short-lived session).
+    """
+    from src.services.webhook_log import log_webhook_event
+    log_webhook_event(
+        source="stripe",
+        event_type="checkout.session.created",
+        direction="outbound",
+        source_event_id=session_id,
+        status="processed",
+        payload={"product": product, **metadata},
+        payload_kind="checkout_started",
+        db=db,
+    )
+
 def _founding_limit() -> int:
     """Read from env (FOUNDING_SPOT_LIMIT) — changeable without redeploy."""
     from config.settings import get_settings
@@ -369,6 +395,9 @@ def create_subscription_checkout(
         "Stripe checkout session created: %s tier=%s founding=%s",
         session.id, tier, is_founding,
     )
+    _log_checkout_started(db, session.id, "subscription", {
+        "tier": tier, "vertical": vertical, "county_id": county_id, "is_founding": is_founding,
+    })
     return {
         "session_id": session.id,
         "url": session.url,
@@ -382,12 +411,17 @@ def create_lead_pack_checkout(
     cancel_url: str,
     subscriber_stripe_customer_id: str,
     zip_code: str,
+    db: Optional[Session] = None,
 ) -> dict:
     """
     One-time $99 lead pack — 5 leads, 72hr exclusivity, 15min delivery.
     Raises RuntimeError if Stripe is not configured.
     Raises ValueError if STRIPE_PRICE_LEAD_PACK is not set.
     Raises stripe.error.StripeError on Stripe API failure.
+
+    db is optional and only used to log a "checkouts started" audit row —
+    pass the caller's session if one is available; omitting it just skips
+    that logging, no other behavior changes.
     """
     if not _init_stripe():
         raise RuntimeError("Stripe not configured")
@@ -422,6 +456,7 @@ def create_lead_pack_checkout(
         )
         raise
 
+    _log_checkout_started(db, session.id, "lead_pack", {"zip_code": zip_code})
     return {"session_id": session.id, "url": session.url}
 
 
@@ -430,6 +465,7 @@ def create_hot_lead_unlock_link(
     lead_id: str,
     reduced: bool = False,
     customer_email: Optional[str] = None,
+    db: Optional[Session] = None,
 ) -> dict:
     """
     Dynamic one-time Stripe payment link for hot lead unlock.
@@ -438,6 +474,10 @@ def create_hot_lead_unlock_link(
     Raises RuntimeError if Stripe is not configured.
     Raises ValueError if required price env vars are not set.
     Raises stripe.error.StripeError on Stripe API failure.
+
+    db is optional and only used to log a "checkouts started" audit row —
+    pass the caller's session if one is available; omitting it just skips
+    that logging, no other behavior changes.
     """
     if not _init_stripe():
         raise RuntimeError("Stripe not configured")
@@ -493,6 +533,9 @@ def create_hot_lead_unlock_link(
         )
         raise
 
+    _log_checkout_started(db, session.id, "hot_lead_unlock", {
+        "lead_id": lead_id, "reduced_rate": reduced,
+    })
     return {"session_id": session.id, "url": session.url}
 
 

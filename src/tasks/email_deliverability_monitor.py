@@ -3,7 +3,7 @@ Email deliverability monitor for the shared sending domain.
 
 V1 scope:
   - cold-outbound bounce rate from campaign_daily_analytics
-  - transactional bounce + complaint rate from MessageOutcome / Mandrill events
+  - transactional bounce + complaint rate from MessageOutcome / Mailchimp events
   - Instantly warm-up health score for connected mailboxes
 
 Alerts reuse ScraperAlertLog dedup semantics and default to soft-launch
@@ -175,7 +175,7 @@ def _transactional_trips(session, today: date) -> list[Trip]:
         session.execute(
             select(func.count()).select_from(MessageOutcome).where(
                 MessageOutcome.message_type == "email",
-                MessageOutcome.channel == "mandrill",
+                MessageOutcome.channel == "mailchimp",
                 MessageOutcome.sent_at >= start_dt,
             )
         ).scalar_one() or 0
@@ -187,7 +187,7 @@ def _transactional_trips(session, today: date) -> list[Trip]:
         session.execute(
             select(func.count()).select_from(MessageOutcome).where(
                 MessageOutcome.message_type == "email",
-                MessageOutcome.channel == "mandrill",
+                MessageOutcome.channel == "mailchimp",
                 MessageOutcome.sent_at >= start_dt,
                 MessageOutcome.failure_reason.in_(("hard_bounce", "soft_bounce", "reject")),
             )
@@ -197,7 +197,7 @@ def _transactional_trips(session, today: date) -> list[Trip]:
         session.execute(
             select(func.count()).select_from(MessageOutcome).where(
                 MessageOutcome.message_type == "email",
-                MessageOutcome.channel == "mandrill",
+                MessageOutcome.channel == "mailchimp",
                 MessageOutcome.sent_at >= start_dt,
                 MessageOutcome.failure_reason == "spam",
             )

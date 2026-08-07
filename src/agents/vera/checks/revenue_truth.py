@@ -937,6 +937,15 @@ def run_revenue_truth() -> int:
 
     post_vera_report(subject, body)
 
+    # Standalone one-line daily reconciliation post (spec item 7.1) — the full
+    # report above already carries this number buried in its MRR section;
+    # this is a slim, easy-to-scan companion post, not a replacement.
+    post_vera_report(
+        f"[Vera] Daily Reconciliation — {today.isoformat()}",
+        f"Stripe vs. subscribers drift: ${mrr.drift_cents / 100:,.2f} "
+        f"(drift_cents={mrr.drift_cents}, stripe_ok={mrr.stripe_ok})",
+    )
+
     # Validate actionable findings via Vera→Dev contract (spec §1.1.10).
     # Only fires when Stripe was reachable (stripe_ok=True) and there are real
     # mismatches — a Stripe outage is an ops issue, not a code bug for Dev.

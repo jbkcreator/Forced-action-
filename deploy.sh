@@ -142,22 +142,15 @@ systemctl restart cora || fail "systemctl restart cora"
 
 RESTART_TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-echo "== 6/7 verify lifecycle + cora health =="
+echo "== 6/7 verify service health =="
 sleep 2
 systemctl is-active --quiet lifecycle || fail "lifecycle service not active after restart"
 systemctl is-active --quiet cora || fail "cora service not active after restart"
 systemctl restart cora_throughput || fail "systemctl restart cora_throughput"
+sleep 2
+systemctl is-active --quiet cora_throughput || fail "cora_throughput service not active after restart"
 
 RESTART_TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-echo "== 6/7 verify service health, retire legacy cora unit =="
-sleep 2
-systemctl is-active --quiet lifecycle || fail "lifecycle service not active after restart"
-systemctl is-active --quiet cora_throughput || fail "cora_throughput service not active after restart"
-if systemctl list-unit-files cora.service &>/dev/null; then
-    systemctl stop cora || echo "WARNING: failed to stop legacy cora.service" >&2
-    systemctl disable cora || echo "WARNING: failed to disable legacy cora.service" >&2
-fi
 
 echo "== 7/7 refresh Prometheus/Alertmanager config (if installed) =="
 # Best-effort — only runs on boxes where Prometheus is actually deployed.
@@ -171,7 +164,7 @@ if [ -d /etc/prometheus ]; then
         promtool check config /etc/prometheus/prometheus.yml || fail "promtool check config"
         promtool check rules /etc/prometheus/rules/alert_rules.yml || fail "promtool check rules"
     fi
-    systemctl reload prometheus || fail "systemctl reload prometheus"
+    systemctl reload prometheus || echo "WARNING: prometheus reload failed — config updated on disk but service needs manual reload" >&2
 fi
 if [ -d /etc/alertmanager ]; then
     # Render, don't copy: alertmanager.yml carries placeholder tokens for the
@@ -185,7 +178,7 @@ if [ -d /etc/alertmanager ]; then
     sed -e "s|prom-wh-s3cr3t-fa-stage10|${AM_WEBHOOK_SECRET}|g" \
         -e "s|https://hooks.slack.com/services/REPLACE_ME|${AM_SLACK_WEBHOOK_URL}|g" \
         deploy/prometheus/alertmanager.yml > /etc/alertmanager/alertmanager.yml || fail "render alertmanager.yml"
-    systemctl reload alertmanager || fail "systemctl reload alertmanager"
+    systemctl reload alertmanager || echo "WARNING: alertmanager reload failed — config updated on disk but service needs manual reload" >&2
 fi
 
 echo "$AFTER" > "$LAST_GOOD_FILE"
@@ -201,5 +194,5 @@ else
     printf '  %s\n' "${PENDING[@]}"
 fi
 echo "Live crontab:"
-crontab -l
+crontab -l 2>/dev/null || echo "  (no crontab installed)"
 echo "=================================================="
