@@ -4581,6 +4581,32 @@ class SynthflowWebhookPayload(BaseModel):
         return self.call_id or (self.call or {}).get("call_id")
 
     @property
+    def resolved_transcript(self) -> Optional[str]:
+        """Full call transcript — Finetuner nests it under `call.transcript`."""
+        call = self.call or {}
+        return self.notes or call.get("transcript") or self._vars.get("transcript")
+
+    @property
+    def resolved_recording_url(self) -> Optional[str]:
+        """Audio recording URL — Finetuner nests it under `call.recording_url`."""
+        call = self.call or {}
+        return (
+            self.recording_url
+            or call.get("recording_url")
+            or call.get("recording_short_url")
+        )
+
+    @property
+    def resolved_duration(self) -> Optional[int]:
+        """Call duration in seconds — flat `duration` or `call.duration`."""
+        call = self.call or {}
+        d = self.duration if self.duration is not None else call.get("duration")
+        try:
+            return int(d) if d is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @property
     def resolved_outcome(self) -> str:
         """
         Map Finetuner/Synthflow call disposition to our outcome taxonomy.
@@ -4638,6 +4664,30 @@ def synthflow_sample_leads_text(
     return {"message": message, "lead_count": len(leads)}
 
 
+@app.post("/webhooks/synthflow/inbound-call-router", status_code=200)
+async def synthflow_inbound_call_router(request: Request):
+    """
+    Pre-answer call routing gate for Synthflow inbound agents.
+
+    Synthflow POSTs a `call_inbound` event within 10s of an inbound call arriving
+    and requires an updated `call_inbound` object back to keep routing the call —
+    an empty/missing object disconnects the call. We don't do dynamic per-call
+    routing today, so always echo back override_model_id="" to keep the call on
+    whichever agent the DID is already bound to.
+    """
+    raw_body = await request.body()
+    try:
+        raw_json = json.loads(raw_body.decode("utf-8") or "{}")
+    except Exception:
+        raw_json = {"_unparseable": raw_body.decode("utf-8", errors="replace")[:2000]}
+
+    logger.info(
+        "[Synthflow inbound-call-router] call_id=%s from=%s to=%s",
+        raw_json.get("call_id"), raw_json.get("from_number"), raw_json.get("to_number"),
+    )
+    return {"call_inbound": {"override_model_id": ""}}
+
+
 @app.post("/webhooks/synthflow", status_code=200)
 async def synthflow_webhook(request: Request):
     """
@@ -4690,6 +4740,21 @@ async def synthflow_webhook(request: Request):
 
     v = payload._vars
     lead = payload.lead or {}
+    call_id = payload.resolved_call_id
+
+    # Dedup: Synthflow retries on network errors — skip if already processed
+    if call_id:
+        from src.core.database import get_db_context
+        from src.core.models import SynthflowCall
+        with get_db_context() as _dedup_db:
+            existing = _dedup_db.execute(
+                text("SELECT 1 FROM synthflow_calls WHERE call_id = :cid LIMIT 1"),
+                {"cid": call_id},
+            ).fetchone()
+        if existing:
+            logger.info("[Synthflow webhook] duplicate call_id=%s — skipping", call_id)
+            return {"status": "duplicate"}
+
     from src.services.synthflow_service import process_call_outcome
     try:
         result = process_call_outcome(
@@ -4699,6 +4764,10 @@ async def synthflow_webhook(request: Request):
             zip_code=payload.zip_code or v.get("zip_code") or v.get("zip") or "",
             prospect_name=payload.prospect_name or v.get("prospect_name") or lead.get("name") or "",
             notes=payload.notes or v.get("notes") or "",
+            call_id=call_id,
+            transcript_text=payload.resolved_transcript,
+            recording_url=payload.resolved_recording_url,
+            duration_seconds=payload.resolved_duration,
         )
     except Exception:
         logger.error("[Synthflow webhook] processing error for %s", phone, exc_info=True)

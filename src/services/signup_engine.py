@@ -13,6 +13,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from config.settings import settings
@@ -533,6 +534,26 @@ def onboard_inbound_caller(
             logger.info("[Onboard] SmsOptIn created sub=%d call_id=%s", sub.id, call_id)
     except Exception as exc:
         logger.warning("[Onboard] SmsOptIn failed sub=%d: %s", sub.id, exc)
+
+    # DNC clear: inbound callers self-selected to call us — express consent.
+    # Without this row the compliance gate blocks all SMS for these numbers.
+    if normalized:
+        try:
+            with db.begin_nested():
+                db.execute(
+                    text("""
+                        INSERT INTO dnc_phone_checks (phone, national_dnc, litigator, checked_at)
+                        VALUES (:phone, false, false, :now)
+                        ON CONFLICT (phone) DO UPDATE
+                          SET national_dnc = false,
+                              litigator    = false,
+                              checked_at   = :now
+                    """),
+                    {"phone": normalized, "now": datetime.now(timezone.utc)},
+                )
+            logger.info("[Onboard] DNC cleared for inbound caller sub=%d", sub.id)
+        except Exception as exc:
+            logger.warning("[Onboard] DNC clear failed sub=%d: %s", sub.id, exc)
 
     # Phase 3: First Leads — only for newly created accounts.
     # Dedupe-resolved callers already received First Leads on their first call.

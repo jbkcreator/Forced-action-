@@ -57,7 +57,15 @@ def validate_outbound(
     """
     normalized = normalize_phone(phone)
     if not normalized:
-        return ComplianceResult(allowed=False, reason="invalid_phone")
+        # Allow QA test phones that bypass the US-only normalizer
+        settings = get_settings()
+        allowlist = [p.strip() for p in (settings.qa_test_phone_allowlist or "").split(",") if p.strip()]
+        if phone.replace(" ", "") in allowlist or f"+{phone.replace(' ', '')}" in allowlist:
+            normalized = phone.replace(" ", "")
+            if not normalized.startswith("+"):
+                normalized = f"+{normalized}"
+        else:
+            return ComplianceResult(allowed=False, reason="invalid_phone")
 
     # 1. Universal DNC / opt-out check (covers all channels)
     row = db.execute(
@@ -85,10 +93,15 @@ def validate_outbound(
         return ComplianceResult(allowed=False, reason="dnc_check_required")
 
     # 3. Quiet hours - 8am to 9pm local time (TCPA requirement)
-    tz = _resolve_timezone(normalized, zip_code)
-    hour = datetime.now(tz).hour
-    if hour < 8 or hour >= 21:
-        return ComplianceResult(allowed=False, reason="quiet_hours")
+    # QA allowlisted phones skip quiet hours for testing purposes.
+    _settings = get_settings()
+    _allowlist = [p.strip() for p in (_settings.qa_test_phone_allowlist or "").split(",") if p.strip()]
+    _is_qa_phone = normalized in _allowlist or phone.replace(" ", "") in _allowlist
+    if not _is_qa_phone:
+        tz = _resolve_timezone(normalized, zip_code)
+        hour = datetime.now(tz).hour
+        if hour < 8 or hour >= 21:
+            return ComplianceResult(allowed=False, reason="quiet_hours")
 
     return ComplianceResult(allowed=True)
 

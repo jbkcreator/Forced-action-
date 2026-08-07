@@ -22,7 +22,46 @@ def _settings_mock(agent_id="agent_123", api_key="sf_key"):
     s.synthflow_api_key.get_secret_value.return_value = api_key
     s.synthflow_api_base = "https://api.synthflow.ai/v2"
     s.synthflow_outbound_agent_roofing = agent_id
+    s.app_base_url = "https://forcedactionleads.com"
     return s
+
+
+class TestExternalWebhookUrl:
+    """initiate_call must attach external_webhook_url pointing at our handler."""
+
+    def test_webhook_url_in_payload(self):
+        from src.services.synthflow_client import initiate_call
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"call_id": "call_xyz"}
+        mock_resp.raise_for_status = MagicMock()
+        req_mock = MagicMock()
+        req_mock.post.return_value = mock_resp
+
+        with patch.dict(sys.modules, {"requests": req_mock}), \
+             patch("config.settings.get_settings", return_value=_settings_mock()):
+            result = initiate_call("+13135550101", "agent_123", {"foo": "bar"})
+
+        assert result == "call_xyz"
+        _, kwargs = req_mock.post.call_args
+        payload = kwargs["json"]
+        assert payload["external_webhook_url"] == "https://forcedactionleads.com/webhooks/synthflow"
+
+    def test_webhook_url_strips_trailing_slash(self):
+        from src.services.synthflow_client import initiate_call
+        s = _settings_mock()
+        s.app_base_url = "https://forcedactionleads.com/"  # trailing slash
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"call_id": "c1"}
+        mock_resp.raise_for_status = MagicMock()
+        req_mock = MagicMock()
+        req_mock.post.return_value = mock_resp
+
+        with patch.dict(sys.modules, {"requests": req_mock}), \
+             patch("config.settings.get_settings", return_value=s):
+            initiate_call("+13135550101", "agent_123", {})
+
+        _, kwargs = req_mock.post.call_args
+        assert kwargs["json"]["external_webhook_url"] == "https://forcedactionleads.com/webhooks/synthflow"
 
 
 # ─── synthflow_client tests ───────────────────────────────────────────────────
@@ -36,7 +75,7 @@ class TestSynthflowClient:
         httpx_mock = MagicMock()
         httpx_mock.post.return_value = mock_resp
 
-        with patch.dict(sys.modules, {"httpx": httpx_mock}), \
+        with patch.dict(sys.modules, {"requests": httpx_mock}), \
              patch("config.settings.get_settings", return_value=_settings_mock()):
             result = initiate_call("+13135550101", "agent_123", {"foo": "bar"})
 
@@ -57,7 +96,7 @@ class TestSynthflowClient:
         httpx_mock = MagicMock()
         httpx_mock.post.side_effect = Exception("timeout")
 
-        with patch.dict(sys.modules, {"httpx": httpx_mock}), \
+        with patch.dict(sys.modules, {"requests": httpx_mock}), \
              patch("config.settings.get_settings", return_value=_settings_mock()):
             result = initiate_call("+13135550101", "agent_123", {})
 
@@ -72,7 +111,7 @@ class TestSynthflowClient:
         httpx_mock = MagicMock()
         httpx_mock.post.return_value = mock_resp
 
-        with patch.dict(sys.modules, {"httpx": httpx_mock}), \
+        with patch.dict(sys.modules, {"requests": httpx_mock}), \
              patch("config.settings.get_settings", return_value=_settings_mock()):
             result = initiate_call("+13135550101", "agent_123", {})
 
@@ -87,12 +126,15 @@ class TestSynthflowClient:
         httpx_mock.post.return_value = mock_resp
         ctx = {"subscriber_id": 7, "vertical": "roofing"}
 
-        with patch.dict(sys.modules, {"httpx": httpx_mock}), \
+        with patch.dict(sys.modules, {"requests": httpx_mock}), \
              patch("config.settings.get_settings", return_value=_settings_mock()):
             initiate_call("+13135550101", "agent_123", ctx)
 
         _, kwargs = httpx_mock.post.call_args
-        assert kwargs["json"]["metadata"] == ctx
+        # v2 schema carries context as custom_variables [{name,value}], not metadata
+        cv = {d["name"]: d["value"] for d in kwargs["json"]["custom_variables"]}
+        assert cv["subscriber_id"] == "7"
+        assert cv["vertical"] == "roofing"
 
 
 # ─── VoiceDropGraph tests ────────────────────────────────────────────────────
