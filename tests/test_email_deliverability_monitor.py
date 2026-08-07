@@ -85,7 +85,7 @@ def test_evaluate_trips_transactional_bounce_and_complaint(fresh_db):
                 subscriber_id=sub.id,
                 message_type="email",
                 template_id="welcome_email",
-                channel="mandrill",
+                channel="mailchimp",
                 recipient_email=f"txn{i}@example.com",
                 sent_at=now - timedelta(hours=i),
                 send_status="sent",
