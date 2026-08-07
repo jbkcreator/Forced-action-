@@ -1377,7 +1377,17 @@ async def slack_interact(request: Request, db: Session = Depends(get_db)):
         return _handle_relay_decision(payload)
     if action_id in ("approve_win_story", "dismiss_win_story"):
         return _handle_win_story_interact(payload, db)
-    if action_id == "approve_all" or (action_id and action_id.startswith("reject_")):
+    # Cora batch: "approve_all" / "reject_{draft_id}" (batch buttons) and
+    # "ratify_standing_order" / "decline_standing_order" (exact) plus
+    # "archive_standing_order_{id}" / "keep_standing_order_{id}" (id-suffixed).
+    # All four standing-order action_ids route to the same handler, which
+    # disambiguates on the button's value JSON — they were previously unreachable
+    # because only approve_all/reject_* were listed here.
+    _CORA_EXACT = frozenset({"approve_all", "ratify_standing_order", "decline_standing_order"})
+    _CORA_PREFIXES = ("reject_", "archive_standing_order_", "keep_standing_order_")
+    if action_id in _CORA_EXACT or (
+        action_id and any(action_id.startswith(p) for p in _CORA_PREFIXES)
+    ):
         return _handle_cora_batch_interact(payload, db)
 
     return _slack_ephemeral(f"Unrecognized action: {action_id}")
