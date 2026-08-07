@@ -39,6 +39,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from config.settings import get_settings
 from src.core.database import get_db_context
 from src.core.models import DBPRContact
+from src.utils.http_helpers import get_requests_proxies
 from src.utils.logger import setup_logging, get_logger
 
 setup_logging()
@@ -224,6 +225,7 @@ def _download_file(source: str = "certified", dry_run: bool = False) -> Optional
                 headers=headers,
                 timeout=(10, 120),
                 stream=True,
+                proxies=get_requests_proxies(),
             )
             if resp.status_code == 416:
                 # Range not satisfiable — file already complete
