@@ -3025,6 +3025,10 @@ class MessageOutcome(Base):
     message_type: Mapped[str] = mapped_column(String(20), nullable=False)  # sms/email/voice
     template_id: Mapped[Optional[str]] = mapped_column(String(100))
     variant_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)  # A/B test variant
+    # Discrete calendar-day bucket backing uq_message_outcomes_dedup — a real
+    # unique index can't express the old rolling-24h dup_q window directly.
+    # See Follow-on 4 of system_decisions/lifecycle-notify-sweep-double-processing.md.
+    send_date: Mapped[Optional[date]] = mapped_column(Date)
     channel: Mapped[Optional[str]] = mapped_column(String(50))  # twilio/ses/synthflow
     recipient_email: Mapped[Optional[str]] = mapped_column(String(255), index=True)
     provider_message_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)
@@ -3071,6 +3075,19 @@ class MessageOutcome(Base):
         CheckConstraint("message_type IN ('sms', 'email', 'voice')", name="check_message_type"),
         Index("idx_msg_outcome_sub_sent", "subscriber_id", "sent_at"),
         Index("idx_msg_outcome_vertical_segment", "trade_vertical", "behavioral_segment"),
+        # Atomic send-dedup (Follow-on 4, Direction 1a). COALESCE(variant_id, '')
+        # because Postgres never treats NULL = NULL as a match in a plain unique
+        # index — a non-A/B-tested send (variant_id IS NULL, the common case)
+        # would otherwise get zero protection. message_type is included because
+        # the old check-then-insert dup_q never filtered on it, letting an SMS
+        # and an email sharing a template_id/variant_id false-positive on each
+        # other. See system_decisions/lifecycle-notify-sweep-double-processing.md.
+        Index(
+            "uq_message_outcomes_dedup",
+            "subscriber_id", "template_id", text("COALESCE(variant_id, '')"),
+            "message_type", "send_date",
+            unique=True,
+        ),
     )
 
     def __repr__(self):

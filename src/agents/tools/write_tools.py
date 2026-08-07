@@ -25,6 +25,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Generator, Optional
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src.agents.override_reasons import normalize_override_reason_code
@@ -55,6 +56,33 @@ def _session(provided: Optional[Session]) -> Generator[Session, None, None]:
 		return
 	with db.session_scope() as s:
 		yield s
+
+
+def _find_duplicate_outcome(
+	s: Session,
+	*,
+	subscriber_id: int,
+	campaign: str,
+	variant_id: Optional[str],
+	message_type: str,
+	send_date,
+) -> Optional[MessageOutcome]:
+	"""
+	Look up the row that won uq_message_outcomes_dedup after a caught
+	IntegrityError on our own insert attempt — the conflict itself proves a
+	matching row exists and is already committed, so this is a plain read,
+	not a race (see Follow-on 4 of
+	system_decisions/lifecycle-notify-sweep-double-processing.md).
+	"""
+	q = (
+		s.query(MessageOutcome)
+		.filter(MessageOutcome.subscriber_id == subscriber_id)
+		.filter(MessageOutcome.template_id == campaign)
+		.filter(MessageOutcome.message_type == message_type)
+		.filter(MessageOutcome.send_date == send_date)
+	)
+	q = q.filter(MessageOutcome.variant_id == variant_id) if variant_id else q.filter(MessageOutcome.variant_id.is_(None))
+	return q.first()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -116,28 +144,6 @@ def send_sms(
 
         phone = opt_in.phone
         now = datetime.now(timezone.utc)
-        cutoff = now - timedelta(hours=24)
-
-        dup_q = (
-            s.query(MessageOutcome)
-            .filter(MessageOutcome.subscriber_id == subscriber_id)
-            .filter(MessageOutcome.template_id == campaign)
-            .filter(MessageOutcome.created_at >= cutoff)
-        )
-
-        if variant_id:
-            dup_q = dup_q.filter(MessageOutcome.variant_id == variant_id)
-
-        duplicate = dup_q.first()
-        if duplicate is not None:
-            return {
-                "sent": False,
-                "reason": "duplicate",
-                "subscriber_id": subscriber_id,
-                "campaign": campaign,
-                "variant_id": variant_id,
-                "message_outcome_id": duplicate.id,
-            }
 
         ctx = personalization_context or {}
 
@@ -158,6 +164,7 @@ def send_sms(
             message_type="sms",
             template_id=campaign,
             variant_id=variant_id,
+            send_date=now.date(),
             channel="telnyx",
             decision_id=decision_id,
             send_status="pending_review" if requires_review else "approved",
@@ -178,8 +185,28 @@ def send_sms(
                 "phone": phone,
             },
         )
-        s.add(outcome)
-        s.flush()
+        # The atomic insert IS the dedup check (uq_message_outcomes_dedup) —
+        # replaces the old check-then-insert race. begin_nested() (a SAVEPOINT)
+        # matters here specifically because `s` may be a caller-owned session
+        # with other pending work (_session() yields it as-is when provided) —
+        # a bare s.rollback() on conflict would wipe that out too.
+        try:
+            with s.begin_nested():
+                s.add(outcome)
+                s.flush()
+        except IntegrityError:
+            duplicate = _find_duplicate_outcome(
+                s, subscriber_id=subscriber_id, campaign=campaign, variant_id=variant_id,
+                message_type="sms", send_date=now.date(),
+            )
+            return {
+                "sent": False,
+                "reason": "duplicate",
+                "subscriber_id": subscriber_id,
+                "campaign": campaign,
+                "variant_id": variant_id,
+                "message_outcome_id": duplicate.id if duplicate else None,
+            }
 
         if requires_review:
             return {
@@ -276,27 +303,6 @@ def send_email(
             }
 
         now = datetime.now(timezone.utc)
-        cutoff = now - timedelta(hours=24)
-
-        dup_q = (
-            s.query(MessageOutcome)
-            .filter(MessageOutcome.subscriber_id == subscriber_id)
-            .filter(MessageOutcome.template_id == campaign)
-            .filter(MessageOutcome.created_at >= cutoff)
-        )
-        if variant_id:
-            dup_q = dup_q.filter(MessageOutcome.variant_id == variant_id)
-
-        duplicate = dup_q.first()
-        if duplicate is not None:
-            return {
-                "sent": False,
-                "reason": "duplicate",
-                "subscriber_id": subscriber_id,
-                "campaign": campaign,
-                "variant_id": variant_id,
-                "message_outcome_id": duplicate.id,
-            }
 
         ctx = personalization_context or {}
 
@@ -308,6 +314,7 @@ def send_email(
             message_type="email",
             template_id=campaign,
             variant_id=variant_id,
+            send_date=now.date(),
             channel="mailchimp",
             decision_id=decision_id,
             send_status="pending_review" if requires_review else "approved",
@@ -326,8 +333,25 @@ def send_email(
                 "recipient_email": recipient_email,
             },
         )
-        s.add(outcome)
-        s.flush()
+        # See send_sms() above for why this is begin_nested() rather than a
+        # bare try/except with s.rollback() — s may be a caller-owned session.
+        try:
+            with s.begin_nested():
+                s.add(outcome)
+                s.flush()
+        except IntegrityError:
+            duplicate = _find_duplicate_outcome(
+                s, subscriber_id=subscriber_id, campaign=campaign, variant_id=variant_id,
+                message_type="email", send_date=now.date(),
+            )
+            return {
+                "sent": False,
+                "reason": "duplicate",
+                "subscriber_id": subscriber_id,
+                "campaign": campaign,
+                "variant_id": variant_id,
+                "message_outcome_id": duplicate.id if duplicate else None,
+            }
 
         if requires_review:
             return {
