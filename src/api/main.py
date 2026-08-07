@@ -4664,6 +4664,30 @@ def synthflow_sample_leads_text(
     return {"message": message, "lead_count": len(leads)}
 
 
+@app.post("/webhooks/synthflow/inbound-call-router", status_code=200)
+async def synthflow_inbound_call_router(request: Request):
+    """
+    Pre-answer call routing gate for Synthflow inbound agents.
+
+    Synthflow POSTs a `call_inbound` event within 10s of an inbound call arriving
+    and requires an updated `call_inbound` object back to keep routing the call —
+    an empty/missing object disconnects the call. We don't do dynamic per-call
+    routing today, so always echo back override_model_id="" to keep the call on
+    whichever agent the DID is already bound to.
+    """
+    raw_body = await request.body()
+    try:
+        raw_json = json.loads(raw_body.decode("utf-8") or "{}")
+    except Exception:
+        raw_json = {"_unparseable": raw_body.decode("utf-8", errors="replace")[:2000]}
+
+    logger.info(
+        "[Synthflow inbound-call-router] call_id=%s from=%s to=%s",
+        raw_json.get("call_id"), raw_json.get("from_number"), raw_json.get("to_number"),
+    )
+    return {"call_inbound": {"override_model_id": ""}}
+
+
 @app.post("/webhooks/synthflow", status_code=200)
 async def synthflow_webhook(request: Request):
     """
