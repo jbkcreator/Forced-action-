@@ -24,6 +24,12 @@ class Event:
 		source           — where the event originated ('redis' | 'postgres' | 'cron' | 'admin')
 		decision_id      — UUID. Wave 2 uses Wave 1's id; others generate one.
 		idempotency_key  — supervisor-level dedup key (defaults to decision_id)
+		queue_row_id     — lifecycle_event_queue.id, set only when this event came off the
+		                   Postgres fallback (live NOTIFY or the 60s sweep). Lets
+		                   dispatch_event() atomically claim the row itself, which is the
+		                   single coordination point that stops the live-NOTIFY path and the
+		                   sweep from both dispatching the same row — see
+		                   system_decisions/lifecycle-notify-sweep-double-processing.md.
 	"""
 	event_type: str
 	subscriber_id: Optional[int] = None
@@ -31,6 +37,7 @@ class Event:
 	source: str = "unknown"
 	decision_id: Optional[str] = None
 	idempotency_key: Optional[str] = None
+	queue_row_id: Optional[int] = None
 
 	def to_dispatch_dict(self) -> Dict[str, Any]:
 		"""Return the dict shape that src.agents.supervisor.dispatch_event expects."""
@@ -43,4 +50,6 @@ class Event:
 			d["decision_id"] = self.decision_id
 		if self.idempotency_key:
 			d["idempotency_key"] = self.idempotency_key
+		if self.queue_row_id is not None:
+			d["queue_row_id"] = self.queue_row_id
 		return d

@@ -25,7 +25,7 @@ import json
 import logging
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Optional
 
 from sqlalchemy import text
@@ -118,9 +118,13 @@ def _publish_via_postgres(event: Dict[str, Any]) -> None:
 			)
 			session.add(row)
 			session.flush()
+			# row.id must ride along in the NOTIFY payload — without it the live
+			# listener has no row to claim/update, and the 60s sweep independently
+			# dispatches the same row a second time. See
+			# system_decisions/lifecycle-notify-sweep-double-processing.md (Issue 1).
 			session.execute(
 				text("SELECT pg_notify('lifecycle_events', :payload)"),
-				{"payload": json.dumps(event, default=str)},
+				{"payload": json.dumps({**event, "queue_row_id": row.id}, default=str)},
 			)
 	except Exception as exc:
 		logger.error("publish_lifecycle_event: Postgres fallback also failed: %s", exc)
@@ -146,47 +150,71 @@ def ingest_cron_event(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _sweep_postgres_queue() -> int:
 	"""
-	Sweep lifecycle_event_queue for pending events and dispatch them.
-	Called on listener startup and every 60s to catch events published
-	while the listener was offline. Returns the count of events processed.
+	Sweep lifecycle_event_queue for pending events — plus abandoned 'processing'
+	claims left by a crashed worker (Follow-on 1 of the double-processing fix)
+	— and dispatch them. Called on listener startup and every 60s to catch
+	events published while the listener was offline.
+
+	Selects candidates in a short transaction and closes it BEFORE dispatching
+	any of them. dispatch_event() does its own atomic per-row claim
+	(supervisor._claim_queue_row) — this function must never hold a row locked
+	across that call, or dispatch_event()'s claim query blocks on (or loses to)
+	this transaction's still-uncommitted status write, silently no-op'ing a
+	legitimate dispatch. See
+	system_decisions/lifecycle-notify-sweep-double-processing.md.
+
+	Returns the count of events processed.
 	"""
 	from src.core.database import get_db_context
 	from src.core.models import LifecycleEventQueue
 
-	processed = 0
+	stale_seconds = get_agents_settings().lifecycle_queue_stale_processing_seconds
+	stale_cutoff = datetime.now(timezone.utc) - timedelta(seconds=stale_seconds)
+
+	candidates = []
 	try:
 		with get_db_context() as session:
 			rows = (
 				session.query(LifecycleEventQueue)
-				.filter(LifecycleEventQueue.status == "pending")
+				.filter(
+					(LifecycleEventQueue.status == "pending")
+					| (
+						(LifecycleEventQueue.status == "processing")
+						& (LifecycleEventQueue.processed_at < stale_cutoff)
+					)
+				)
 				.order_by(LifecycleEventQueue.created_at)
 				.with_for_update(skip_locked=True)
 				.limit(100)
 				.all()
 			)
-			for row in rows:
-				try:
-					row.status = "processing"
-					session.flush()
-					event = {
-						"event_type": row.event_type,
-						"subscriber_id": row.subscriber_id,
-						"payload": row.payload or {},
-						"idempotency_key": row.idempotency_key,
-						"decision_id": row.decision_id,
-					}
-					dispatch_event(event)
-					row.status = "done"
-					row.processed_at = datetime.now(timezone.utc)
-					processed += 1
-				except Exception as exc:
-					row.status = "failed"
-					row.error = str(exc)[:500]
-					logger.exception("_sweep_postgres_queue: dispatch failed for id=%s: %s", row.id, exc)
+			candidates = [
+				{
+					"id": row.id,
+					"event_type": row.event_type,
+					"subscriber_id": row.subscriber_id,
+					"payload": row.payload or {},
+					"idempotency_key": row.idempotency_key,
+					"decision_id": row.decision_id,
+				}
+				for row in rows
+			]
 	except Exception as exc:
-		logger.error("_sweep_postgres_queue: sweep failed: %s", exc)
+		logger.error("_sweep_postgres_queue: candidate select failed: %s", exc)
+		return 0
+
+	processed = 0
+	for c in candidates:
+		try:
+			dispatch_event({**c, "queue_row_id": c["id"]})
+			processed += 1
+		except Exception as exc:
+			# dispatch_event() catches its own graph-run exceptions and reverts
+			# the row to 'pending' itself; reaching here means something failed
+			# outside that (e.g. the claim query itself) — nothing left to mark.
+			logger.exception("_sweep_postgres_queue: dispatch failed for id=%s: %s", c["id"], exc)
 	if processed:
-		logger.info("_sweep_postgres_queue: dispatched %d pending event(s)", processed)
+		logger.info("_sweep_postgres_queue: dispatched %d event(s)", processed)
 	return processed
 
 

@@ -47,6 +47,7 @@ def _coerce(raw: Union[str, bytes, Dict[str, Any]], source: str) -> Event:
 		source=source,
 		decision_id=data.get("decision_id"),
 		idempotency_key=data.get("idempotency_key"),
+		queue_row_id=data.get("queue_row_id"),
 	)
 
 
