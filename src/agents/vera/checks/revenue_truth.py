@@ -164,6 +164,8 @@ def _fetch_stripe_subscriptions_by_status(status: str) -> Optional[dict]:
         return None
     result: dict = {}
     for sub in subs:
+        if not sub.get("livemode", False):
+            continue
         customer = sub["customer"]
         customer_id = customer.id if hasattr(customer, "id") else customer
         result[customer_id] = sub
