@@ -4581,6 +4581,32 @@ class SynthflowWebhookPayload(BaseModel):
         return self.call_id or (self.call or {}).get("call_id")
 
     @property
+    def resolved_transcript(self) -> Optional[str]:
+        """Full call transcript — Finetuner nests it under `call.transcript`."""
+        call = self.call or {}
+        return self.notes or call.get("transcript") or self._vars.get("transcript")
+
+    @property
+    def resolved_recording_url(self) -> Optional[str]:
+        """Audio recording URL — Finetuner nests it under `call.recording_url`."""
+        call = self.call or {}
+        return (
+            self.recording_url
+            or call.get("recording_url")
+            or call.get("recording_short_url")
+        )
+
+    @property
+    def resolved_duration(self) -> Optional[int]:
+        """Call duration in seconds — flat `duration` or `call.duration`."""
+        call = self.call or {}
+        d = self.duration if self.duration is not None else call.get("duration")
+        try:
+            return int(d) if d is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @property
     def resolved_outcome(self) -> str:
         """
         Map Finetuner/Synthflow call disposition to our outcome taxonomy.
@@ -4715,6 +4741,9 @@ async def synthflow_webhook(request: Request):
             prospect_name=payload.prospect_name or v.get("prospect_name") or lead.get("name") or "",
             notes=payload.notes or v.get("notes") or "",
             call_id=call_id,
+            transcript_text=payload.resolved_transcript,
+            recording_url=payload.resolved_recording_url,
+            duration_seconds=payload.resolved_duration,
         )
     except Exception:
         logger.error("[Synthflow webhook] processing error for %s", phone, exc_info=True)

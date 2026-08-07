@@ -210,3 +210,109 @@ class TestOutboundWebhookDedup:
         # dedup DB ctx should NOT have been opened (no call_id)
         mock_ctx_fn.assert_not_called()
         mock_process.assert_called_once()
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Fix 5 — transcript / recording / duration persistence
+# ────────────────────────────────────────────────────────────────────────────
+
+class TestTranscriptPersistence:
+    """process_call_outcome must write transcript_text, recording_url and
+    duration_seconds onto the SynthflowCall row when provided."""
+
+    def test_transcript_fields_saved_on_call_row(self):
+        mock_ctx, mock_session = _make_db_ctx_session()
+
+        with (
+            patch("src.services.synthflow_service._find_ghl_contact_by_phone", return_value="ghl-1"),
+            patch("src.services.synthflow_service._apply_tags_to_contact"),
+            patch("src.services.synthflow_service.get_settings"),
+            patch("src.core.database.get_db_context", return_value=mock_ctx),
+        ):
+            from src.services.synthflow_service import process_call_outcome
+            process_call_outcome(
+                prospect_phone="+18135550101",
+                outcome="voicemail",
+                vertical="roofing",
+                zip_code="33602",
+                call_id="call-tx-001",
+                transcript_text="Agent: Hi... Prospect: not interested.",
+                recording_url="https://synthflow.example/rec/abc.mp3",
+                duration_seconds=113,
+            )
+
+        # Find the SynthflowCall object added to the session
+        added = [c.args[0] for c in mock_session.add.call_args_list]
+        synth_rows = [o for o in added if type(o).__name__ == "SynthflowCall"]
+        assert synth_rows, "no SynthflowCall row added"
+        row = synth_rows[0]
+        assert row.transcript_text == "Agent: Hi... Prospect: not interested."
+        assert row.recording_url == "https://synthflow.example/rec/abc.mp3"
+        assert row.duration_seconds == 113
+
+    def test_transcript_fields_null_when_absent(self):
+        """Backward compat — omitting the fields saves NULLs, no error."""
+        mock_ctx, mock_session = _make_db_ctx_session()
+
+        with (
+            patch("src.services.synthflow_service._find_ghl_contact_by_phone", return_value="ghl-1"),
+            patch("src.services.synthflow_service._apply_tags_to_contact"),
+            patch("src.services.synthflow_service.get_settings"),
+            patch("src.core.database.get_db_context", return_value=mock_ctx),
+        ):
+            from src.services.synthflow_service import process_call_outcome
+            process_call_outcome(
+                prospect_phone="+18135550101",
+                outcome="no_answer",
+                vertical="roofing",
+                zip_code="33602",
+                call_id="call-tx-002",
+            )
+
+        added = [c.args[0] for c in mock_session.add.call_args_list]
+        synth_rows = [o for o in added if type(o).__name__ == "SynthflowCall"]
+        assert synth_rows
+        row = synth_rows[0]
+        assert row.transcript_text is None
+        assert row.recording_url is None
+        assert row.duration_seconds is None
+
+
+class TestWebhookPayloadResolvers:
+    """SynthflowWebhookPayload must extract transcript/recording/duration from
+    both the nested Finetuner `call` object and flat legacy fields."""
+
+    def test_nested_finetuner_shape(self):
+        from src.api.main import SynthflowWebhookPayload
+        p = SynthflowWebhookPayload(
+            call={
+                "call_id": "c1",
+                "transcript": "full convo text",
+                "recording_url": "https://rec/x.mp3",
+                "duration": 87,
+            }
+        )
+        assert p.resolved_transcript == "full convo text"
+        assert p.resolved_recording_url == "https://rec/x.mp3"
+        assert p.resolved_duration == 87
+
+    def test_flat_legacy_shape(self):
+        from src.api.main import SynthflowWebhookPayload
+        p = SynthflowWebhookPayload(
+            recording_url="https://rec/y.mp3",
+            duration=42,
+            notes="short transcript snippet",
+        )
+        assert p.resolved_recording_url == "https://rec/y.mp3"
+        assert p.resolved_duration == 42
+        assert p.resolved_transcript == "short transcript snippet"
+
+    def test_recording_short_url_fallback(self):
+        from src.api.main import SynthflowWebhookPayload
+        p = SynthflowWebhookPayload(call={"recording_short_url": "https://rec/short"})
+        assert p.resolved_recording_url == "https://rec/short"
+
+    def test_duration_non_numeric_returns_none(self):
+        from src.api.main import SynthflowWebhookPayload
+        p = SynthflowWebhookPayload(call={"duration": "not-a-number"})
+        assert p.resolved_duration is None
