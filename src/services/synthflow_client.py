@@ -38,11 +38,17 @@ def initiate_call(
         for k, v in context.items() if v not in (None, "")
     ]
     callee_name = context.get("subscriber_name") or "there"
+    # Set the post-call webhook per-call so transcript/recording/outcome always
+    # route back to our unified /webhooks/synthflow handler — independent of
+    # each agent's dashboard config (which is invisible and easy to lose).
+    # APP_BASE_URL must be the public prod domain (e.g. https://forcedactionleads.com).
+    webhook_url = f"{settings.app_base_url.rstrip('/')}/webhooks/synthflow"
     payload = {
         "model_id": agent_id,
         "phone": phone,
         "name": callee_name,
         "custom_variables": custom_variables,
+        "external_webhook_url": webhook_url,
     }
 
     try:
