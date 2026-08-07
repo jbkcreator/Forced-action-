@@ -171,14 +171,17 @@ if [ -d /etc/alertmanager ]; then
     # webhook auth secret and the Slack incoming-webhook URL. A plain cp would
     # overwrite the live config with those git-committed placeholders on every
     # deploy, silently downgrading webhook auth and killing Slack delivery.
-    AM_WEBHOOK_SECRET=$(grep -E '^PROMETHEUS_ALERT_WEBHOOK_SECRET=' "$PROJECT_DIR/.env" | cut -d'=' -f2- | tr -d '"' | tr -d "'")
-    AM_SLACK_WEBHOOK_URL=$(grep -E '^ALERTMANAGER_SLACK_WEBHOOK_URL=' "$PROJECT_DIR/.env" | cut -d'=' -f2- | tr -d '"' | tr -d "'")
-    [ -z "$AM_WEBHOOK_SECRET" ] && fail "PROMETHEUS_ALERT_WEBHOOK_SECRET not found in $PROJECT_DIR/.env"
-    [ -z "$AM_SLACK_WEBHOOK_URL" ] && fail "ALERTMANAGER_SLACK_WEBHOOK_URL not found in $PROJECT_DIR/.env"
-    sed -e "s|prom-wh-s3cr3t-fa-stage10|${AM_WEBHOOK_SECRET}|g" \
-        -e "s|https://hooks.slack.com/services/REPLACE_ME|${AM_SLACK_WEBHOOK_URL}|g" \
-        deploy/prometheus/alertmanager.yml > /etc/alertmanager/alertmanager.yml || fail "render alertmanager.yml"
-    systemctl reload alertmanager || echo "WARNING: alertmanager reload failed — config updated on disk but service needs manual reload" >&2
+    AM_WEBHOOK_SECRET=$(grep -E '^PROMETHEUS_ALERT_WEBHOOK_SECRET=' "$PROJECT_DIR/.env" | cut -d'=' -f2- | tr -d '"' | tr -d "'" || true)
+    AM_SLACK_WEBHOOK_URL=$(grep -E '^ALERTMANAGER_SLACK_WEBHOOK_URL=' "$PROJECT_DIR/.env" | cut -d'=' -f2- | tr -d '"' | tr -d "'" || true)
+    if [ -z "$AM_WEBHOOK_SECRET" ] || [ -z "$AM_SLACK_WEBHOOK_URL" ]; then
+        echo "WARNING: alertmanager secrets missing from .env — skipping alertmanager config render" >&2
+    else
+        sed -e "s|prom-wh-s3cr3t-fa-stage10|${AM_WEBHOOK_SECRET}|g" \
+            -e "s|https://hooks.slack.com/services/REPLACE_ME|${AM_SLACK_WEBHOOK_URL}|g" \
+            deploy/prometheus/alertmanager.yml > /etc/alertmanager/alertmanager.yml \
+            || echo "WARNING: render alertmanager.yml failed" >&2
+        systemctl reload alertmanager || echo "WARNING: alertmanager reload failed — config updated on disk but service needs manual reload" >&2
+    fi
 fi
 
 echo "$AFTER" > "$LAST_GOOD_FILE"
