@@ -110,6 +110,7 @@ def compute_confirmed_delivery_margin(db: Session, frm: datetime, to: datetime) 
             WHERE product_type = ANY(:product_types)
               AND refunded_at IS NULL
               AND occurred_at >= :frm AND occurred_at < :to
+              AND (subscriber_id IS NULL OR subscriber_id NOT IN (SELECT id FROM subscribers WHERE is_test = TRUE))
         ),
         cost_by_subscriber_property AS (
             SELECT subscriber_id, property_id, SUM(attributed_cost_cents) AS cost_cents
@@ -226,6 +227,7 @@ def compute_zip_territory_margin(db: Session) -> list[dict]:
             SELECT DISTINCT subscriber_id
             FROM zip_territories
             WHERE status IN ('locked', 'grace') AND subscriber_id IS NOT NULL
+              AND subscriber_id NOT IN (SELECT id FROM subscribers WHERE is_test = TRUE)
         ),
         ownership_counts AS (
             SELECT subscriber_id, COUNT(DISTINCT property_id) AS territory_leads_count

@@ -35,18 +35,23 @@ def compute_revenue_metrics(db: Session, frm: datetime, to: datetime) -> dict:
     """
     p = {"frm": frm, "to": to}
 
+    _NOT_TEST = (
+        "AND (subscriber_id IS NULL OR subscriber_id NOT IN "
+        "(SELECT id FROM subscribers WHERE is_test = TRUE))"
+    )
+
     # ── snapshot (current state) ─────────────────────────────────────────────
     mrr_cents = db.execute(text(
-        "SELECT COALESCE(SUM(mrr_cents),0) FROM customer_accounts WHERE status = 'active'"
+        f"SELECT COALESCE(SUM(mrr_cents),0) FROM customer_accounts WHERE status = 'active' {_NOT_TEST}"
     )).scalar()
     active_accounts = db.execute(text(
-        "SELECT count(*) FROM customer_accounts WHERE status = 'active'"
+        f"SELECT count(*) FROM customer_accounts WHERE status = 'active' {_NOT_TEST}"
     )).scalar()
     past_due_count = db.execute(text(
-        "SELECT count(*) FROM customer_accounts WHERE status = 'past_due'"
+        f"SELECT count(*) FROM customer_accounts WHERE status = 'past_due' {_NOT_TEST}"
     )).scalar()
     at_risk_mrr_cents = db.execute(text(
-        "SELECT COALESCE(SUM(mrr_cents),0) FROM customer_accounts WHERE status = 'past_due'"
+        f"SELECT COALESCE(SUM(mrr_cents),0) FROM customer_accounts WHERE status = 'past_due' {_NOT_TEST}"
     )).scalar()
 
     # ── period: MRR movements ────────────────────────────────────────────────
@@ -81,6 +86,7 @@ def compute_revenue_metrics(db: Session, frm: datetime, to: datetime) -> dict:
         SELECT COALESCE(SUM((value)::int), 0)
         FROM customer_accounts ca, jsonb_each_text(ca.lead_entitlement)
         WHERE ca.status = 'active'
+          AND (ca.subscriber_id IS NULL OR ca.subscriber_id NOT IN (SELECT id FROM subscribers WHERE is_test = TRUE))
     """)).scalar() or 0
     entitlement_utilization = round(leads_delivered / capacity, 4) if capacity else 0.0
 
@@ -203,6 +209,7 @@ def compute_channel_metrics(db: Session, frm: datetime, to: datetime) -> list[di
             JOIN customer_accounts ca ON ca.account_id = mm.account_id
             LEFT JOIN subscribers s ON s.id = ca.subscriber_id
             WHERE mm.movement_type = 'new' AND mm.effective_at >= :frm AND mm.effective_at < :to
+              AND (s.is_test IS NOT TRUE)
             GROUP BY channel
         """), p).fetchall()
     }
@@ -215,6 +222,7 @@ def compute_channel_metrics(db: Session, frm: datetime, to: datetime) -> list[di
             LEFT JOIN subscribers s ON s.id = ca.subscriber_id
             WHERE mm.movement_type IN ('new', 'expansion')
               AND mm.effective_at >= :frm AND mm.effective_at < :to
+              AND (s.is_test IS NOT TRUE)
             GROUP BY channel
         """), p).fetchall()
     }
@@ -228,6 +236,7 @@ def compute_channel_metrics(db: Session, frm: datetime, to: datetime) -> list[di
             JOIN customer_accounts ca ON ca.account_id = mm.account_id
             LEFT JOIN subscribers s ON s.id = ca.subscriber_id
             WHERE mm.movement_type = 'churn' AND mm.effective_at >= :frm AND mm.effective_at < :to
+              AND (s.is_test IS NOT TRUE)
             GROUP BY channel
         """), p).fetchall()
     }
@@ -240,6 +249,7 @@ def compute_channel_metrics(db: Session, frm: datetime, to: datetime) -> list[di
             FROM customer_accounts ca
             LEFT JOIN subscribers s ON s.id = ca.subscriber_id
             WHERE ca.status = 'active'
+              AND (s.is_test IS NOT TRUE)
             GROUP BY channel
         """), p).fetchall()
     }

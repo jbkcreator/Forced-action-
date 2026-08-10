@@ -646,6 +646,56 @@ def provision_from_manual_invoice(
         "[Admin] Manual-invoice provisioning: subscriber=%s invoice=%s customer=%s tier=%s zips=%s admin=%s",
         subscriber.id, body.stripe_invoice_id, stripe_customer_id, body.tier, body.zip_codes, _admin.get("sub"),
     )
+
+    # ── Welcome email + first-leads email (inline — admin path, no BackgroundTasks needed) ──
+    if subscriber.email:
+        from src.services.email import send_welcome_email
+        from src.services import subscriber_auth
+        from src.services.activation_tracking import stamp_welcome_email_sent
+
+        magic_url = None
+        try:
+            magic_url = subscriber_auth.issue_magic_link_url_with_retry(
+                subscriber, db, context="paid_checkout_welcome"
+            )
+        except Exception:
+            logger.warning(
+                "[Admin] Magic-link issuance failed for subscriber %s — sending welcome without it",
+                subscriber.id, exc_info=True,
+            )
+        try:
+            if send_welcome_email(subscriber, magic_link_url=magic_url, db=db):
+                stamp_welcome_email_sent(subscriber.id, db)
+            else:
+                logger.warning(
+                    "[Admin] Welcome email not sent for subscriber %s", subscriber.id
+                )
+        except Exception:
+            logger.error(
+                "[Admin] Welcome email failed for subscriber %s", subscriber.id, exc_info=True
+            )
+
+    if subscriber.email and body.zip_codes:
+        try:
+            from src.tasks.subscriber_email import query_top_leads, send_subscriber_lead_email
+            leads = query_top_leads(db, subscriber, body.zip_codes, limit=10)
+            if leads:
+                send_subscriber_lead_email(
+                    subscriber,
+                    leads,
+                    subject_prefix="Here are your first leads",
+                    zip_codes=body.zip_codes,
+                )
+            else:
+                logger.info(
+                    "[Admin] No existing leads for subscriber %s (zips=%s) — skipping first-leads email",
+                    subscriber.id, body.zip_codes,
+                )
+        except Exception:
+            logger.error(
+                "[Admin] First-leads email failed for subscriber %s", subscriber.id, exc_info=True
+            )
+
     return {
         "already_provisioned": False,
         "subscriber_id": subscriber.id,
