@@ -9,15 +9,21 @@ existing whale drafts continue to carry a real buyer_entity_id.
 Postgres executes DROP NOT NULL instantly — no row rewrite, no table lock.
 """
 import logging
-import os
 
 import psycopg2
+
+from config.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
 
 def run() -> None:
-    conn = psycopg2.connect(os.environ["DATABASE_URL"])
+    # Reads through get_settings() (which loads .env) rather than os.environ:
+    # deploy.sh never exports DATABASE_URL into the shell, so the previous
+    # os.environ["DATABASE_URL"] raised KeyError and aborted the deploy step
+    # that would have applied this. Every other migration in this directory
+    # goes through settings for the same reason.
+    conn = psycopg2.connect(get_settings().database_url)
     try:
         with conn.cursor() as cur:
             cur.execute("""
