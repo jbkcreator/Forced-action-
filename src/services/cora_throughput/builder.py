@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy import text
 
@@ -43,6 +43,85 @@ def _active_standing_order_cell_ids(db: Any) -> set:
         text("SELECT DISTINCT cell_id FROM cora_standing_orders WHERE active = true")
     ).all()
     return {r[0] for r in rows}
+
+
+def _unposted_pending_batch_id(db: Any) -> Optional[str]:
+    """batch_id of the oldest pending batch whose Slack message never posted."""
+    row = db.execute(
+        text(
+            "SELECT batch_id FROM cora_draft_batches "
+            "WHERE status = 'pending' AND slack_message_ts IS NULL "
+            "ORDER BY created_at ASC LIMIT 1"
+        )
+    ).first()
+    return row[0] if row else None
+
+
+def repost_unposted_batch(db: Any) -> bool:
+    """
+    Retry the Slack post for a pending batch that never got one. True if a
+    batch was posted on this pass.
+
+    build_batch() inserts the batch row first and posts to Slack second, so a
+    Slack outage at creation time strands a pending batch with no message:
+    permanently un-approvable, and blocking every later batch (the
+    _has_pending_batch guard) until CORA_BATCH_EXPIRY_HOURS finally expires it.
+    Without this retry the only recovery is waiting out that expiry even after
+    Slack is healthy again — which is exactly what happened between Aug 6 and
+    Aug 10 2026, when an installed bot token predated its own chat:write scope.
+
+    Runs before build_batch in the sweep so a recovered batch is posted on the
+    first pass after Slack comes back, rather than one expiry-cycle later.
+    """
+    batch_id = _unposted_pending_batch_id(db)
+    if batch_id is None:
+        return False
+
+    drafts = db.execute(
+        text(
+            """
+            SELECT d.draft_id, d.opportunity_thread_id, d.cell_id,
+                   d.recommended_channel, d.subject
+            FROM cora_batch_items bi
+            JOIN outbound_drafts d ON d.draft_id = bi.draft_id
+            WHERE bi.batch_id = :batch_id AND bi.decision = 'included'
+            ORDER BY bi.id ASC
+            """
+        ),
+        {"batch_id": batch_id},
+    ).mappings().all()
+    if not drafts:
+        logger.warning(
+            "[Through] pending batch %s has no included items to re-post — "
+            "leaving it for expire_stale_batches", batch_id,
+        )
+        return False
+
+    extra_blocks = power_block.render_power_block_blocks(power_block.assemble_power_block(db))
+    slack_message_ts = batch_slack.post_batch_for_approval(
+        batch_id, [dict(d) for d in drafts], extra_blocks=extra_blocks
+    )
+    if not slack_message_ts:
+        # post_batch_for_approval already logged why. Stay pending and retry
+        # next sweep — no state change, so this is safe to run every interval.
+        return False
+
+    from config.settings import get_settings
+    db.execute(
+        text(
+            "UPDATE cora_draft_batches SET slack_message_ts = :ts, slack_channel = :channel "
+            "WHERE batch_id = :batch_id"
+        ),
+        {
+            "ts": slack_message_ts,
+            "channel": get_settings().cora_throughput_slack_channel,
+            "batch_id": batch_id,
+        },
+    )
+    logger.info(
+        "[Through] re-posted stranded batch %s to Slack with %d item(s)", batch_id, len(drafts),
+    )
+    return True
 
 
 def build_batch(db: Any) -> Dict[str, Any]:
@@ -174,6 +253,7 @@ def run_periodic(stop_event: threading.Event, interval_seconds: int = DEFAULT_IN
                 expired = expire_stale_batches(db)
                 if expired:
                     logger.info("cora_throughput.builder: expired %d stale batch(es)", expired)
+                repost_unposted_batch(db)
                 result = build_batch(db)
                 if result.get("created"):
                     logger.info(

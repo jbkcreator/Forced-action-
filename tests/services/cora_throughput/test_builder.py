@@ -107,3 +107,102 @@ def test_expire_stale_batches_expires_old_pending_batch(fresh_db):
     assert expired == 1
     assert _batch_row(fresh_db, "BATCH-STALE-1")["status"] == "expired"
     assert _batch_row(fresh_db, "BATCH-FRESH-1")["status"] == "pending"
+
+
+# repost_unposted_batch is exercised against a fake session rather than
+# `fresh_db`: that fixture binds to the app's real DATABASE_URL, and this
+# function deliberately targets "the oldest pending batch with no Slack
+# message" — which in a shared database is whatever real batch happens to be
+# waiting, not the one the test seeded.
+class _FakeResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def first(self):
+        return self._rows[0] if self._rows else None
+
+    def mappings(self):
+        return self
+
+    def all(self):
+        return self._rows
+
+
+class _FakeDB:
+    def __init__(self, batch_id, draft_rows):
+        self._batch_id = batch_id
+        self._draft_rows = draft_rows
+        self.updates = []
+
+    def execute(self, statement, params=None):
+        sql = " ".join(str(statement).split())
+        if sql.startswith("SELECT batch_id FROM cora_draft_batches"):
+            return _FakeResult([(self._batch_id,)] if self._batch_id else [])
+        if "FROM cora_batch_items bi" in sql:
+            return _FakeResult(self._draft_rows)
+        if sql.startswith("UPDATE cora_draft_batches"):
+            self.updates.append(params)
+            return _FakeResult([])
+        raise AssertionError(f"unexpected SQL: {sql}")
+
+
+def _draft_row(draft_id="D1"):
+    return {
+        "draft_id": draft_id, "opportunity_thread_id": "DBPR-1",
+        "cell_id": "dbpr_storm_blitz", "recommended_channel": "email", "subject": "Hi",
+    }
+
+
+def _stub_power_block(monkeypatch):
+    monkeypatch.setattr(builder.power_block, "assemble_power_block", lambda db: {})
+    monkeypatch.setattr(builder.power_block, "render_power_block_blocks", lambda blk: [])
+
+
+def test_repost_unposted_batch_recovers_a_batch_stranded_by_a_slack_outage(monkeypatch):
+    """A batch built while Slack was down must post once Slack recovers, rather
+    than sitting un-approvable until CORA_BATCH_EXPIRY_HOURS expires it."""
+    _stub_power_block(monkeypatch)
+    monkeypatch.setattr(builder.batch_slack, "post_batch_for_approval", lambda *a, **k: "1786.0001")
+    db = _FakeDB("BATCH-STRANDED", [_draft_row()])
+
+    assert builder.repost_unposted_batch(db) is True
+    assert len(db.updates) == 1
+    assert db.updates[0]["ts"] == "1786.0001"
+    assert db.updates[0]["batch_id"] == "BATCH-STRANDED"
+
+
+def test_repost_unposted_batch_noop_when_no_unposted_batch(monkeypatch):
+    _stub_power_block(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        builder.batch_slack, "post_batch_for_approval", lambda *a, **k: calls.append(1) or "ts",
+    )
+    db = _FakeDB(None, [])
+
+    assert builder.repost_unposted_batch(db) is False
+    assert calls == []
+    assert db.updates == []
+
+
+def test_repost_unposted_batch_leaves_state_untouched_while_slack_still_down(monkeypatch):
+    """Slack still failing must not stamp a ts — the batch stays pending and
+    retries next sweep, so the call is safe to run every interval."""
+    _stub_power_block(monkeypatch)
+    monkeypatch.setattr(builder.batch_slack, "post_batch_for_approval", lambda *a, **k: None)
+    db = _FakeDB("BATCH-STRANDED", [_draft_row()])
+
+    assert builder.repost_unposted_batch(db) is False
+    assert db.updates == []
+
+
+def test_repost_unposted_batch_skips_batch_with_no_included_items(monkeypatch):
+    _stub_power_block(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        builder.batch_slack, "post_batch_for_approval", lambda *a, **k: calls.append(1) or "ts",
+    )
+    db = _FakeDB("BATCH-EMPTY", [])
+
+    assert builder.repost_unposted_batch(db) is False
+    assert calls == []
+    assert db.updates == []

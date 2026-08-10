@@ -49,8 +49,10 @@ def _cmd_build() -> None:
 
     with get_db_context() as db:
         expired = builder.expire_stale_batches(db)
+        reposted = builder.repost_unposted_batch(db)
         result = builder.build_batch(db)
     print(f"cora_throughput: expired {expired} stale batch(es)")
+    print(f"cora_throughput: re-posted stranded batch: {reposted}")
     print(f"cora_throughput: {result}")
 
 
