@@ -20,7 +20,7 @@ import stripe
 from sqlalchemy import text
 
 from config.settings import get_settings
-from src.core.database import SessionLocal
+from src.core.database import get_db_session
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -62,7 +62,7 @@ def main():
     if settings.active_stripe_secret_key:
         stripe.api_key = settings.active_stripe_secret_key.get_secret_value()
 
-    db = SessionLocal()
+    db = get_db_session()
     try:
         rows = find_qa_rows(db)
         logger.info("Found %d QA subscriber rows with is_test=FALSE", len(rows))
@@ -83,8 +83,8 @@ def main():
                 try:
                     stripe.Subscription.cancel(r.stripe_subscription_id)
                     logger.info("Cancelled Stripe subscription %s", r.stripe_subscription_id)
-                except stripe.error.InvalidRequestError as exc:
-                    logger.warning("Stripe cancel failed for %s: %s", r.stripe_subscription_id, exc)
+                except stripe.error.StripeError as exc:
+                    logger.warning("Stripe cancel skipped for %s: %s", r.stripe_subscription_id, exc)
 
             # Mark is_test + cancelled in DB
             db.execute(text("""
