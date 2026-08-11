@@ -1312,6 +1312,7 @@ class Subscriber(Base):
     is_trial: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False, default=False)
     trial_ends_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     is_demo: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False, default=False)
+    is_test: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False, default=False)
 
     # ── S0: Reactivation cooldown gate ───────────────────────────────────────
     last_reactivation_attempt_at: Mapped[Optional[datetime]] = mapped_column(

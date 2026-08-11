@@ -506,7 +506,6 @@ COUNTY_ID=hillsborough
 # ── NON-BUYER NURTURE ────────────────────────────────────────────────────────
 # Daily sweep — finds free-signup/checkout-abandon/waitlist non-buyers aged
 # 24h-90d, enrolls up to the daily cap into the shared Instantly campaign.
-# PROD BLOCKER: requires NON_BUYER_NURTURE_CAMPAIGN_ID on a warmed dedicated domain.
 30 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.non_buyer_nurture_sweep
 # Daily sync — pulls per-lead status, maps unsubscribe/bounce to terminal state.
 0 21 * * * $PROJECT/scripts/cron/run.sh src.tasks.non_buyer_nurture_sync
