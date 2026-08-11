@@ -137,10 +137,9 @@ def _post_slack_digest(totals: dict) -> None:
             channel=channel,
             text="\n".join(lines),
             blocks=[
-                {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": "\n".join(lines)},
-                }
+                {"type": "header", "text": {"type": "plain_text", "text": "⚙️ Cell Allocation Sweep", "emoji": True}},
+                {"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines)}},
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": "Runs daily 06:00 UTC — blast-radius cap: 3 throttles/run"}]},
             ],
         )
     except Exception:

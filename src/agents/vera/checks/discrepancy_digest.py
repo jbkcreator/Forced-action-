@@ -432,7 +432,10 @@ def run_discrepancy_digest() -> int:
         except Exception as exc:
             logger.warning("[Vera] failed to send promise digest to %s: %s", addr, exc)
 
-    post_vera_report(subject, body)
+    from src.services.vera_slack import build_digest_blocks
+    _today = datetime.now(timezone.utc).date()
+    slack_blocks = build_digest_blocks(subject, discrepancies, digest, report_date=str(_today))
+    post_vera_report(subject, body, blocks=slack_blocks)
 
     # Validate actionable findings via Vera→Dev contract (spec §1.1.10).
     if discrepancies:

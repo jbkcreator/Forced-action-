@@ -937,15 +937,19 @@ def run_revenue_truth() -> int:
         except Exception as exc:
             logger.warning("[Vera] failed to send revenue-truth report to %s: %s", addr, exc)
 
-    post_vera_report(subject, body)
+    from src.services.vera_slack import build_revenue_truth_blocks, build_reconciliation_blocks
+    slack_blocks = build_revenue_truth_blocks(
+        subject, reconciliation, mrr, new_yesterday_cents, payments, refunds_disputes,
+        report_date=today.isoformat(),
+    )
+    post_vera_report(subject, body, blocks=slack_blocks)
 
-    # Standalone one-line daily reconciliation post (spec item 7.1) — the full
-    # report above already carries this number buried in its MRR section;
-    # this is a slim, easy-to-scan companion post, not a replacement.
+    # Standalone slim daily reconciliation post (spec item 7.1)
     post_vera_report(
         f"[Vera] Daily Reconciliation — {today.isoformat()}",
         f"Stripe vs. subscribers drift: ${mrr.drift_cents / 100:,.2f} "
         f"(drift_cents={mrr.drift_cents}, stripe_ok={mrr.stripe_ok})",
+        blocks=build_reconciliation_blocks(today.isoformat(), mrr.drift_cents, mrr.stripe_ok),
     )
 
     # Validate actionable findings via Vera→Dev contract (spec §1.1.10).
