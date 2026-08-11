@@ -136,6 +136,7 @@ Single `Dockerfile` at project root. `docker-compose.yml` runs `api` and `lifecy
 - **Alembic is retired** (ADR 0024) — schema changes go through an idempotent apply script against the single shared DB, never new alembic revisions. **Write new apply scripts to `migrations/apply_*.py`** (pre-existing ones stay in `scripts/apply_*.py` — do not relocate them). Old migrations live in `legacy/alembic/`; the orphaned `alembic_version` table is left in place, harmless.
 - **Lead Pack MVP status**: Partially sellable. Missing: county launch gate at checkout, minimum 5-lead count enforcement, 80% enrichment threshold check, `SentLead` rows in webhook fulfillment. Zero test coverage for lead pack flow.
 - Required env: `DATABASE_URL`, `ANTHROPIC_API_KEY`, `REDIS_URL`. Feature-gated: Stripe, GHL, Synthflow, Telnyx, Oxylabs, LangSmith.
+- **Test/QA accounts auto-flag via `is_test`** — `src/utils/test_account.py:is_test_subscriber()` stamps `Subscriber.is_test` at every creation site from Stripe `livemode=False` (test-key accounts) OR an internal email domain (`@heu.ai`/`@example.com`, for staff testing with the LIVE key). `is_test` is a REVENUE-REPORTING filter only — flagged accounts still function fully (email/leads/dashboard); they're excluded from revenue_metrics/telemetry, Vera MRR reconciliation, and win-back automation. To test live features, use a flagged internal-email account: everything works, it just won't show in MRR.
 
 ## Implementation Standards
 

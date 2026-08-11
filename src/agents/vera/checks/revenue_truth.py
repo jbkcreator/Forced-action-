@@ -242,7 +242,7 @@ def check_subscriber_reconciliation() -> ReconciliationResult:
 
     with vera_db.session_scope() as session:
         rows = session.execute(
-            text("SELECT stripe_customer_id, stripe_subscription_id, status FROM subscribers")
+            text("SELECT stripe_customer_id, stripe_subscription_id, status FROM subscribers WHERE is_test IS NOT TRUE")
         ).mappings().all()
 
     if active_subs_by_customer is None:
@@ -372,10 +372,10 @@ def _db_mrr(session) -> tuple:
     AND plan_price IS NOT NULL — so V3's number matches what's already on the
     operator dashboard, not a competing definition."""
     total = session.execute(
-        text("SELECT SUM(plan_price) FROM subscribers WHERE status='active' AND plan_price IS NOT NULL")
+        text("SELECT SUM(plan_price) FROM subscribers WHERE status='active' AND plan_price IS NOT NULL AND is_test IS NOT TRUE")
     ).scalar()
     null_count = session.execute(
-        text("SELECT COUNT(*) FROM subscribers WHERE status='active' AND plan_price IS NULL")
+        text("SELECT COUNT(*) FROM subscribers WHERE status='active' AND plan_price IS NULL AND is_test IS NOT TRUE")
     ).scalar()
     total_cents = int(round((total or Decimal("0")) * 100))
     return total_cents, int(null_count or 0)

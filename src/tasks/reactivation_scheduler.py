@@ -269,6 +269,7 @@ def _lapsed_subscriber_ids(db: Session) -> list[int]:
     return list(db.execute(text("""
         SELECT id FROM subscribers
         WHERE churned_at IS NOT NULL
+          AND is_test IS NOT TRUE
         ORDER BY churned_at DESC
     """)).scalars().all())
 

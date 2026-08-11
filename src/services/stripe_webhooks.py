@@ -35,6 +35,7 @@ from src.core.models import (
     ZipTerritory,
 )
 from src.services.ghl_webhook import push_subscriber_to_ghl
+from src.utils.test_account import is_test_subscriber
 from src.services import lead_exclusivity
 
 logger = logging.getLogger(__name__)
@@ -650,6 +651,7 @@ def _on_checkout_completed(
             phone=customer_phone,
             ghl_stage=5,
             signup_source="landing_page" if (meta.get("utm_source") or meta.get("campaign_id")) else "direct",
+            is_test=is_test_subscriber(customer_email, stripe_livemode=session.get("livemode")),
         )
         db.add(subscriber)
     else:
@@ -660,6 +662,7 @@ def _on_checkout_completed(
         subscriber.tier    = tier
         subscriber.status  = "active"
         subscriber.ghl_stage = 5
+        subscriber.is_test = is_test_subscriber(customer_email, stripe_livemode=session.get("livemode"))
         # Backfill phone if Stripe collected one and we don't have it yet.
         if customer_phone and not subscriber.phone:
             subscriber.phone = customer_phone
