@@ -55,6 +55,7 @@ from src.loaders.tax import TaxDelinquencyLoader
 from src.loaders.voter_registry import VoterRegistryLoader
 from src.services.zip_territory import claim_zip_territory
 from src.utils.county_config import invalidate_cache
+from src.utils.test_account import is_test_subscriber
 from src.utils.quora_attribution import campaign_slug, clamp_cooldown as quora_clamp_cooldown
 
 logger = logging.getLogger(__name__)
@@ -619,6 +620,10 @@ def provision_from_manual_invoice(
         phone=customer.get("phone"),
         ghl_stage=5,
         signup_source="admin",
+        is_test=is_test_subscriber(
+            (customer.get("email") or "").lower().strip() or None,
+            stripe_livemode=invoice.get("livemode"),
+        ),
     )
     db.add(subscriber)
     db.flush()  # need subscriber.id before ZIP claims

@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from config.settings import settings
 from config.vertical_display import DEFAULT_VERTICAL
 from src.core.models import Subscriber
+from src.utils.test_account import is_test_subscriber
 from src.services.sms_compliance import can_send, send_sms
 
 logger = logging.getLogger(__name__)
@@ -282,6 +283,7 @@ def create_free_account_by_email(
 		name=name,
 		phone=normalized_phone,
 		founding_member=False,
+		is_test=is_test_subscriber(email),
 		status="active",
 		event_feed_uuid=str(uuid.uuid4()),
 		referral_code=f"REF{uuid.uuid4().hex[:5].upper()}",
