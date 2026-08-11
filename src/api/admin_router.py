@@ -1648,20 +1648,15 @@ async def slack_interact(request: Request, db: Session = Depends(get_db)):
     actions = payload.get("actions", [])
     action_id = actions[0].get("action_id") if actions else None
 
+    _CORA_EXACT = frozenset({"approve_all", "ratify_standing_order", "decline_standing_order"})
+    _CORA_PREFIXES = ("reject_", "view_", "archive_standing_order_", "keep_standing_order_")
+
     if action_id == "county_launch_decision":
         return _handle_county_launch_interact(payload, db)
     if action_id in ("approve", "reject"):
         return _handle_relay_decision(payload)
     if action_id in ("approve_win_story", "dismiss_win_story"):
         return _handle_win_story_interact(payload, db)
-    # Cora batch: "approve_all" / "reject_{draft_id}" (batch buttons) and
-    # "ratify_standing_order" / "decline_standing_order" (exact) plus
-    # "archive_standing_order_{id}" / "keep_standing_order_{id}" (id-suffixed).
-    # All four standing-order action_ids route to the same handler, which
-    # disambiguates on the button's value JSON — they were previously unreachable
-    # because only approve_all/reject_* were listed here.
-    _CORA_EXACT = frozenset({"approve_all", "ratify_standing_order", "decline_standing_order"})
-    _CORA_PREFIXES = ("reject_", "archive_standing_order_", "keep_standing_order_")
     if action_id in _CORA_EXACT or (
         action_id and any(action_id.startswith(p) for p in _CORA_PREFIXES)
     ):
@@ -1961,6 +1956,19 @@ def _handle_cora_batch_interact(payload: dict, db: Session) -> dict:
             through_slack.update_batch_slack_message(result["slack_message_ts"], reply_text)
         return {"ok": True}
 
+    if action == "view_draft":
+        draft_id = action_data.get("draft_id")
+        if not draft_id:
+            raise HTTPException(status_code=400, detail="Invalid action data")
+        row = db.execute(
+            text("SELECT draft_id, subject, body, contact_email, opportunity_thread_id FROM outbound_drafts WHERE draft_id = :id"),
+            {"id": draft_id},
+        ).mappings().first()
+        if not row:
+            return _slack_ephemeral(f"Draft {draft_id[:8]} not found.")
+        through_slack.open_draft_modal(payload.get("trigger_id", ""), dict(row))
+        return {"ok": True}
+
     batch_id = action_data.get("batch_id")
     draft_id = action_data.get("draft_id")
     if not batch_id or action not in ("approve_all", "reject_item"):
@@ -1978,14 +1986,33 @@ def _handle_cora_batch_interact(payload: dict, db: Session) -> dict:
     ).first()
     slack_message_ts = slack_message_ts_row[0] if slack_message_ts_row else None
 
-    if action == "approve_all":
-        reply_text = (
-            f":white_check_mark: Batch approved by <@{user_id}> — "
-            f"{result['approved_count']} sent to Relay, {result['rejected_count']} exception-rejected."
-        )
-    else:
-        reply_text = f":no_entry: Draft `{draft_id[:8]}` exception-rejected by <@{user_id}> — rest of the batch still open."
+    if action == "reject_item":
+        # Refresh the card: rejected item shown as struck-out, rest still actionable.
+        active = db.execute(
+            text(
+                "SELECT d.draft_id, d.opportunity_thread_id, d.cell_id, d.recommended_channel, "
+                "d.subject, d.body, d.contact_email "
+                "FROM cora_batch_items bi JOIN outbound_drafts d ON d.draft_id = bi.draft_id "
+                "WHERE bi.batch_id = :batch_id AND bi.decision = 'included' ORDER BY bi.id ASC"
+            ),
+            {"batch_id": batch_id},
+        ).mappings().all()
+        rejected_ids = [
+            r[0] for r in db.execute(
+                text(
+                    "SELECT draft_id FROM cora_batch_items "
+                    "WHERE batch_id = :batch_id AND decision = 'exception_rejected'"
+                ),
+                {"batch_id": batch_id},
+            ).all()
+        ]
+        through_slack.refresh_batch_card(slack_message_ts, batch_id, [dict(d) for d in active], rejected_ids)
+        return {"ok": True}
 
+    reply_text = (
+        f":white_check_mark: Batch approved by <@{user_id}> — "
+        f"{result['approved_count']} sent to Relay, {result['rejected_count']} exception-rejected."
+    )
     if slack_message_ts:
         through_slack.update_batch_slack_message(slack_message_ts, reply_text)
 
