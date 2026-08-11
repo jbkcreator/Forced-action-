@@ -662,6 +662,7 @@ def _on_checkout_completed(
         subscriber.tier    = tier
         subscriber.status  = "active"
         subscriber.ghl_stage = 5
+        subscriber.is_test = is_test_subscriber(customer_email, stripe_livemode=session.get("livemode"))
         # Backfill phone if Stripe collected one and we don't have it yet.
         if customer_phone and not subscriber.phone:
             subscriber.phone = customer_phone
