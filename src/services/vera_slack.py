@@ -39,6 +39,19 @@ def _section(text: str) -> dict:
 def _context(text: str) -> dict:
     return {"type": "context", "elements": [{"type": "mrkdwn", "text": text}]}
 
+def _capped_lines(lines: list, budget: int) -> str:
+    """Join lines, dropping trailing ones (with a count note) rather than
+    letting _section's char cap slice an item in half with no indication."""
+    out = []
+    used = 0
+    for i, line in enumerate(lines):
+        used += len(line) + 1
+        if used > budget:
+            out.append(f"_...{len(lines) - i} more (see email for full list)_")
+            break
+        out.append(line)
+    return "\n".join(out)
+
 
 # ── Per-report Block Kit builders ─────────────────────────────────────────────
 
@@ -123,11 +136,21 @@ def build_revenue_truth_blocks(subject: str, reconciliation, mrr, new_yesterday_
             f"{'✅' if pna == 0 else '🚨'} Paying but no access: `{pna}`\n"
             f"{'✅' if anp == 0 else '⚠️'} Access but not paying: `{anp}`"
         )
+        if pna > 0:
+            pna_ids = reconciliation.paying_no_access_sample_ids
+            pna_lines = [f"• `{cid}`" for cid in pna_ids]
+            if pna > len(pna_ids):
+                pna_lines.append(f"_(sample capped at {len(pna_ids)} of {pna} total — see email for full list)_")
+            recon_text += "\n" + _capped_lines(pna_lines, budget=1200)
         if anp > 0:
-            recon_text += "\n" + "\n".join(
+            anp_details = reconciliation.access_not_paying_details
+            anp_lines = [
                 f"• `{d['customer_id']}` — {d['reason']} ({d.get('stripe_status', '?')})"
-                for d in reconciliation.access_not_paying_details
-            )
+                for d in anp_details
+            ]
+            if anp > len(anp_details):
+                anp_lines.append(f"_(sample capped at {len(anp_details)} of {anp} total — see email for full list)_")
+            recon_text += "\n" + _capped_lines(anp_lines, budget=1200)
         blocks.append(_section(recon_text))
     blocks.append(_divider())
 
@@ -185,7 +208,8 @@ def build_reconciliation_blocks(report_date: str, drift_cents: int, stripe_ok: b
     ]
 
 
-def build_digest_blocks(subject: str, discrepancies: list, digest, report_date: str) -> list:
+def build_digest_blocks(subject: str, discrepancies: list, digest, report_date: str,
+                         unchecked: Optional[list] = None) -> list:
     """Block Kit layout for the Promise & Discrepancy Digest."""
     blocks = [
         _header(f"Vera — Promise & Discrepancy Digest {report_date}"),
@@ -193,8 +217,12 @@ def build_digest_blocks(subject: str, discrepancies: list, digest, report_date: 
             f"*Open discrepancies:* `{len(discrepancies)}`   "
             f"*Open promises:* `{digest.open_count}` ({len(digest.overdue)} overdue)"
         ),
-        _divider(),
     ]
+    if unchecked:
+        blocks.append(_section(
+            f"⚠️ *NOT CHECKED TODAY* — no fresh fact for: {', '.join(unchecked)}"
+        ))
+    blocks.append(_divider())
 
     # Discrepancies
     disc_text = "*🔍 DISCREPANCIES* (Doc claims X; live shows Y)\n"

@@ -434,7 +434,7 @@ def run_discrepancy_digest() -> int:
 
     from src.services.vera_slack import build_digest_blocks
     _today = datetime.now(timezone.utc).date()
-    slack_blocks = build_digest_blocks(subject, discrepancies, digest, report_date=str(_today))
+    slack_blocks = build_digest_blocks(subject, discrepancies, digest, report_date=str(_today), unchecked=unchecked)
     post_vera_report(subject, body, blocks=slack_blocks)
 
     # Validate actionable findings via Vera→Dev contract (spec §1.1.10).
