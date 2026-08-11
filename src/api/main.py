@@ -3317,16 +3317,36 @@ def get_landing_data(
     ]
 
     # ── territory availability ───────────────────────────────────────────────
+    # Per-vertical and lead-gated so it agrees with /api/territory-map: both read
+    # the zip_territories universe (not the centroid list), and a ZIP only counts
+    # as "available" if it is not locked/grace AND has >= 1 qualified lead for this
+    # vertical (same Silver-floor sellability bar as the feed). Empty territories
+    # are not advertised as available.
+    from config.scoring import LEAD_TIER_THRESHOLDS
+    _silver_floor = next(score for score, tier in LEAD_TIER_THRESHOLDS if tier == "Silver")
     terr_row = db.execute(
         text("""
+            WITH lead_zips AS (
+                SELECT DISTINCT p.zip
+                FROM properties p
+                JOIN distress_scores ds ON ds.property_id = p.id
+                WHERE p.county_id = :cid
+                  AND ds.qualified = true
+                  AND ds.is_guess_lead = false
+                  AND (ds.vertical_scores ->> :vertical)::float >= :floor
+            )
             SELECT
-                COUNT(DISTINCT zip_code) AS total_zips,
-                COUNT(DISTINCT zip_code) FILTER (WHERE status = 'locked') AS locked_zips,
-                COUNT(DISTINCT zip_code) FILTER (WHERE status NOT IN ('locked','grace')) AS available_zips
-            FROM zip_territories
-            WHERE county_id = :cid
+                COUNT(DISTINCT zt.zip_code) AS total_zips,
+                COUNT(DISTINCT zt.zip_code) FILTER (WHERE zt.status = 'locked') AS locked_zips,
+                COUNT(DISTINCT zt.zip_code) FILTER (
+                    WHERE zt.status NOT IN ('locked','grace')
+                      AND zt.zip_code IN (SELECT zip FROM lead_zips)
+                ) AS available_zips
+            FROM zip_territories zt
+            WHERE zt.county_id = :cid
+              AND zt.vertical = :vertical
         """),
-        {"cid": county_id},
+        {"cid": county_id, "vertical": vertical, "floor": _silver_floor},
     ).mappings().first()
 
     territory_availability = {
@@ -5988,10 +6008,11 @@ def territory_map(
     Response cached 60s in Redis.
     """
     import json
+    from config.scoring import LEAD_TIER_THRESHOLDS
     from src.core.models import ZipTerritory, Property as _Prop, DistressScore as _DS
     from src.core.redis_client import redis_available, rget, rset
     from src.services.urgency_engine import get_active_count
-    from src.utils.zip_centroids import get_county_zip_centroids, get_zip_centroid, get_county_map_config
+    from src.utils.zip_centroids import get_zip_centroid, get_county_map_config
 
     cache_key = f"territory_map:{county_id}:{vertical}"
     if redis_available():
@@ -6007,17 +6028,28 @@ def territory_map(
     ).scalars().all()
     territory_db = {zt.zip_code: zt for zt in zip_rows}
 
-    # Always show all known ZIPs for this county; default to 'available' if not yet locked.
-    # For non-hillsborough counties fall back to only the rows that exist in zip_territories.
-    county_centroids = get_county_zip_centroids(county_id)
-    known_zips = sorted(county_centroids.keys()) if county_centroids else sorted(territory_db.keys())
+    # Canonical ZIP universe = the configured zip_territories rows for this
+    # county/vertical — NOT the static centroid list. The centroid dict is only
+    # map-marker geometry and over-counts by including ZIPs never offered for
+    # sale, which is what made the map (53) disagree with the banner (43).
+    known_zips = sorted(territory_db.keys())
 
-    # Single GROUP BY query for lead counts across all known ZIPs
+    # Per-vertical *qualified* lead counts (same sellability bar as the feed /
+    # checkout: qualified, non-guess, vertical score >= Silver floor). Raw
+    # property counts are wrong here — they include unscored/load-test rows.
+    silver_floor = next(score for score, tier in LEAD_TIER_THRESHOLDS if tier == "Silver")
     lead_counts: dict = {}
     if known_zips:
         lead_counts = dict(db.execute(
-            select(_Prop.zip, func.count().label("cnt"))
-            .where(_Prop.zip.in_(known_zips), _Prop.county_id == county_id)
+            select(_Prop.zip, func.count(func.distinct(_Prop.id)).label("cnt"))
+            .join(_DS, _DS.property_id == _Prop.id)
+            .where(
+                _Prop.zip.in_(known_zips),
+                _Prop.county_id == county_id,
+                _DS.qualified == True,  # noqa: E712
+                _DS.is_guess_lead.is_(False),
+                _DS.vertical_scores[vertical].as_float() >= silver_floor,
+            )
             .group_by(_Prop.zip)
         ).all())
 
@@ -6027,6 +6059,11 @@ def territory_map(
         zt = territory_db.get(zip_code)
         status = zt.status if zt else "available"
         lead_count = lead_counts.get(zip_code, 0)
+        # Don't offer an empty territory for sale: a ZIP that would be
+        # "available" but has zero qualified leads is shown as no_active_leads
+        # (visible on the map, not purchasable) until inventory exists.
+        if status == "available" and lead_count == 0:
+            status = "no_active_leads"
 
         active_viewers = 0
         try:
