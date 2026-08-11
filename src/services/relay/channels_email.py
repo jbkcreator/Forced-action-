@@ -25,6 +25,8 @@ never see a real unsubscribe event to sync back.
 """
 from __future__ import annotations
 
+from html import escape as _html_escape
+
 from src.services import instantly_service as instantly
 from src.services.email_unsubscribe import unsubscribe_url
 from src.services.relay.channels import register
@@ -62,7 +64,7 @@ def send_email(item: QueueItem) -> None:
     if not body:
         raise RuntimeError(f"item {item.id}: payload missing 'body' for email channel")
 
-    nl_to_br = body.replace("\r\n", "\n").replace("\n", "<br>\n")
+    nl_to_br = _html_escape(body).replace("\r\n", "\n").replace("\n", "<br>\n")
     unsub = unsubscribe_url(item.recipient)
     body = (
         f'<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.6;max-width:600px">'
