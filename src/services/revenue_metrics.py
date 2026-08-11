@@ -55,30 +55,45 @@ def compute_revenue_metrics(db: Session, frm: datetime, to: datetime) -> dict:
     )).scalar()
 
     # ── period: MRR movements ────────────────────────────────────────────────
-    new_mrr_cents = db.execute(text(
-        "SELECT COALESCE(SUM(delta_cents),0) FROM mrr_movements "
-        "WHERE movement_type = 'new' AND effective_at >= :frm AND effective_at < :to"
-    ), p).scalar()
+    new_mrr_cents = db.execute(text("""
+        SELECT COALESCE(SUM(mm.delta_cents),0)
+        FROM mrr_movements mm
+        JOIN customer_accounts ca ON ca.account_id = mm.account_id
+        LEFT JOIN subscribers s ON s.id = ca.subscriber_id
+        WHERE mm.movement_type = 'new' AND mm.effective_at >= :frm AND mm.effective_at < :to
+          AND (s.is_test IS NOT TRUE)
+    """), p).scalar()
     churn = db.execute(text("""
         SELECT
-          COALESCE(SUM(CASE WHEN is_involuntary     THEN -delta_cents ELSE 0 END), 0) AS involuntary,
-          COALESCE(SUM(CASE WHEN NOT is_involuntary THEN -delta_cents ELSE 0 END), 0) AS voluntary,
+          COALESCE(SUM(CASE WHEN mm.is_involuntary     THEN -mm.delta_cents ELSE 0 END), 0) AS involuntary,
+          COALESCE(SUM(CASE WHEN NOT mm.is_involuntary THEN -mm.delta_cents ELSE 0 END), 0) AS voluntary,
           count(*) AS churned_count
-        FROM mrr_movements
-        WHERE movement_type = 'churn' AND effective_at >= :frm AND effective_at < :to
+        FROM mrr_movements mm
+        JOIN customer_accounts ca ON ca.account_id = mm.account_id
+        LEFT JOIN subscribers s ON s.id = ca.subscriber_id
+        WHERE mm.movement_type = 'churn' AND mm.effective_at >= :frm AND mm.effective_at < :to
+          AND (s.is_test IS NOT TRUE)
     """), p).fetchone()
 
     # ── period: deliveries (by grade, by account) ────────────────────────────
-    by_grade = {r.grade: r.n for r in db.execute(text(
-        "SELECT grade, count(*) AS n FROM deliveries "
-        "WHERE status = 'delivered' AND delivered_at >= :frm AND delivered_at < :to "
-        "GROUP BY grade"
-    ), p).fetchall()}
-    by_account = {str(r.account_id): r.n for r in db.execute(text(
-        "SELECT account_id, count(*) AS n FROM deliveries "
-        "WHERE status = 'delivered' AND delivered_at >= :frm AND delivered_at < :to "
-        "GROUP BY account_id"
-    ), p).fetchall()}
+    by_grade = {r.grade: r.n for r in db.execute(text("""
+        SELECT d.grade, count(*) AS n
+        FROM deliveries d
+        JOIN customer_accounts ca ON ca.account_id = d.account_id
+        LEFT JOIN subscribers s ON s.id = ca.subscriber_id
+        WHERE d.status = 'delivered' AND d.delivered_at >= :frm AND d.delivered_at < :to
+          AND (s.is_test IS NOT TRUE)
+        GROUP BY d.grade
+    """), p).fetchall()}
+    by_account = {str(r.account_id): r.n for r in db.execute(text("""
+        SELECT d.account_id, count(*) AS n
+        FROM deliveries d
+        JOIN customer_accounts ca ON ca.account_id = d.account_id
+        LEFT JOIN subscribers s ON s.id = ca.subscriber_id
+        WHERE d.status = 'delivered' AND d.delivered_at >= :frm AND d.delivered_at < :to
+          AND (s.is_test IS NOT TRUE)
+        GROUP BY d.account_id
+    """), p).fetchall()}
     leads_delivered = sum(by_grade.values())
 
     # ── entitlement utilization = delivered (period) / capacity owed (active) ─
@@ -91,19 +106,31 @@ def compute_revenue_metrics(db: Session, frm: datetime, to: datetime) -> dict:
     entitlement_utilization = round(leads_delivered / capacity, 4) if capacity else 0.0
 
     # ── free→paid (§12.8) ────────────────────────────────────────────────────
-    conversions = db.execute(text(
-        "SELECT count(*) FROM free_to_paid_attribution "
-        "WHERE free_leads_count > 0 AND converted_at >= :frm AND converted_at < :to"
-    ), p).scalar()
-    free_lead_accounts = db.execute(text(
-        "SELECT count(DISTINCT account_id) FROM deliveries WHERE billing_period_end IS NULL"
-    )).scalar() or 0
+    conversions = db.execute(text("""
+        SELECT count(*)
+        FROM free_to_paid_attribution a
+        JOIN customer_accounts ca ON ca.account_id = a.account_id
+        LEFT JOIN subscribers s ON s.id = ca.subscriber_id
+        WHERE a.free_leads_count > 0 AND a.converted_at >= :frm AND a.converted_at < :to
+          AND (s.is_test IS NOT TRUE)
+    """), p).scalar()
+    free_lead_accounts = db.execute(text("""
+        SELECT count(DISTINCT d.account_id)
+        FROM deliveries d
+        JOIN customer_accounts ca ON ca.account_id = d.account_id
+        LEFT JOIN subscribers s ON s.id = ca.subscriber_id
+        WHERE d.billing_period_end IS NULL
+          AND (s.is_test IS NOT TRUE)
+    """)).scalar() or 0
     free_to_paid_rate = round(conversions / free_lead_accounts, 4) if free_lead_accounts else 0.0
     avg_days = db.execute(text("""
         SELECT AVG(EXTRACT(EPOCH FROM (a.converted_at - d.delivered_at)) / 86400.0)
         FROM free_to_paid_attribution a
         JOIN deliveries d ON d.id = a.first_free_delivery_id
+        JOIN customer_accounts ca ON ca.account_id = a.account_id
+        LEFT JOIN subscribers s ON s.id = ca.subscriber_id
         WHERE a.free_leads_count > 0 AND a.converted_at >= :frm AND a.converted_at < :to
+          AND (s.is_test IS NOT TRUE)
     """), p).scalar()
     avg_time_to_convert_days = round(float(avg_days), 2) if avg_days is not None else None
 

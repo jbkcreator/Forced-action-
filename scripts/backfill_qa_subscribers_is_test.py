@@ -77,16 +77,40 @@ def main():
             logger.info("Dry run — no changes made")
             return
 
+        failed = []
+
         for r in rows:
             # Cancel Stripe subscription if active
+            stripe_ok = True
             if r.stripe_subscription_id and r.status not in ("cancelled", "churned"):
                 try:
                     stripe.Subscription.cancel(r.stripe_subscription_id)
                     logger.info("Cancelled Stripe subscription %s", r.stripe_subscription_id)
+                except stripe.error.AuthenticationError as exc:
+                    # Expired/invalid key — fake test environment, safe to skip cancel
+                    logger.warning(
+                        "Stripe auth error for %s (treating as fake sub, skipping cancel): %s",
+                        r.stripe_subscription_id, exc,
+                    )
                 except stripe.error.StripeError as exc:
-                    logger.warning("Stripe cancel skipped for %s: %s", r.stripe_subscription_id, exc)
+                    if r.stripe_subscription_id.startswith("sub_test_"):
+                        # Test-prefixed sub ID — fake, no real billing risk
+                        logger.warning(
+                            "Stripe error for test-prefixed sub %s (skipping cancel): %s",
+                            r.stripe_subscription_id, exc,
+                        )
+                    else:
+                        logger.error(
+                            "Stripe cancel FAILED for %s (id=%s): %s — skipping DB update",
+                            r.stripe_subscription_id, r.id, exc,
+                        )
+                        failed.append(r)
+                        stripe_ok = False
 
-            # Mark is_test + cancelled in DB
+            if not stripe_ok:
+                continue
+
+            # Only write to DB after Stripe cancel succeeded (or no cancel needed)
             db.execute(text("""
                 UPDATE subscribers
                 SET is_test = TRUE, status = 'cancelled'
@@ -94,7 +118,17 @@ def main():
             """), {"id": r.id})
 
         db.commit()
-        logger.info("Backfill complete — %d rows updated", len(rows))
+        updated = len(rows) - len(failed)
+        logger.info("Backfill complete — %d rows updated", updated)
+
+        if failed:
+            logger.error(
+                "FAILED to cancel %d Stripe subscription(s) — DB NOT updated for these rows:",
+                len(failed),
+            )
+            for r in failed:
+                logger.error("  id=%s sub=%s", r.id, r.stripe_subscription_id)
+            sys.exit(1)
     finally:
         db.close()
 

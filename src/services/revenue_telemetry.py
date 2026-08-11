@@ -181,9 +181,11 @@ _ZIP_CANDIDATE_OWNERSHIP_CTE = """
         JOIN properties p
             ON p.zip = zt.zip_code AND p.county_id = zt.county_id
         JOIN latest_score ls ON ls.property_id = p.id
+        LEFT JOIN subscribers s ON s.id = zt.subscriber_id
         WHERE zt.status IN ('locked', 'grace')
           AND zt.subscriber_id IS NOT NULL
           AND ls.vertical_scores ? zt.vertical
+          AND (s.is_test IS NOT TRUE OR s.id IS NULL)
     )
 """
 
