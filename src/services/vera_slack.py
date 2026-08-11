@@ -23,28 +23,248 @@ from config.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
+# ── Block Kit helpers ─────────────────────────────────────────────────────────
+
+def _header(text: str) -> dict:
+    return {"type": "header", "text": {"type": "plain_text", "text": text[:150], "emoji": True}}
+
+def _divider() -> dict:
+    return {"type": "divider"}
+
+def _section(text: str) -> dict:
+    # Slack caps mrkdwn section text at 3000 chars
+    text = text[:2950] + "…" if len(text) > 2950 else text
+    return {"type": "section", "text": {"type": "mrkdwn", "text": text}}
+
+def _context(text: str) -> dict:
+    return {"type": "context", "elements": [{"type": "mrkdwn", "text": text}]}
+
+def _capped_lines(lines: list, budget: int) -> str:
+    """Join lines, dropping trailing ones (with a count note) rather than
+    letting _section's char cap slice an item in half with no indication."""
+    out = []
+    used = 0
+    for i, line in enumerate(lines):
+        used += len(line) + 1
+        if used > budget:
+            out.append(f"_...{len(lines) - i} more (see email for full list)_")
+            break
+        out.append(line)
+    return "\n".join(out)
+
+
+# ── Per-report Block Kit builders ─────────────────────────────────────────────
+
+def build_live_state_blocks(subject: str, deploy: dict, cron_beats: list, silent: dict,
+                             one_number_line: str, report_date: str) -> list:
+    """Block Kit layout for the Live-State report."""
+    stale = [b for b in cron_beats if b.is_stale]
+    fresh_count = len(cron_beats) - len(stale)
+    drift = deploy.get("drift", "unknown")
+    drift_icon = "✅" if drift == "in_sync" else ("⚠️" if drift == "unknown" else "🚨")
+    pending = deploy.get("pending_migrations", [])
+
+    # One number
+    one_number_value = one_number_line.split(": ", 1)[-1] if ": " in one_number_line else one_number_line
+
+    blocks = [
+        _header(f"Vera — Live-State Report {report_date}"),
+        _section(f"*💰 New MRR added yesterday:* `{one_number_value}`"),
+        _divider(),
+        _section(
+            f"*🚀 DEPLOY*\n"
+            f"{drift_icon} Drift: `{drift}`\n"
+            f"Prod HEAD: `{deploy.get('head_sha', 'unknown')[:12] if deploy.get('head_sha') else 'unknown'}`  "
+            f"Dev HEAD: `{deploy.get('dev_head_sha', 'unknown')[:12] if deploy.get('dev_head_sha') else 'unknown'}`\n"
+            + (f"⚠️ Pending migrations: {len(pending)}\n```{chr(10).join(pending[:5])}{'...' if len(pending) > 5 else ''}```"
+               if pending else "Pending migrations: none")
+        ),
+        _divider(),
+    ]
+
+    # Cron freshness
+    cron_text = f"*📡 CRON FRESHNESS*  {fresh_count}/{len(cron_beats)} sources fresh\n"
+    if stale:
+        for b in sorted(stale, key=lambda x: x.label()):
+            cron_text += f"❌ `{b.label()}` — age {b.age_label()} (SLA {b.sla_minutes // 60}h)\n"
+    else:
+        cron_text += "✅ All sources fresh"
+    blocks.append(_section(cron_text))
+    blocks.append(_divider())
+
+    # Silent failures
+    zero = silent.get("zero_ingest", [])
+    unscheduled = silent.get("unscheduled", [])
+    sf_text = f"*🔇 SILENT FAILURES*\n"
+    if zero:
+        sf_text += f"Scheduled-but-writing-nothing ({len(zero)}):\n"
+        sf_text += "\n".join(f"• `{r['source_type']}/{r['county_id']}`" for r in zero)
+    else:
+        sf_text += "✅ Scheduled-but-writing-nothing: none\n"
+    if unscheduled:
+        sf_text += f"\nEnabled-but-unscheduled ({len(unscheduled)}):\n"
+        sf_text += "\n".join(f"• `{s}`" for s in unscheduled)
+    else:
+        sf_text += "\n✅ Enabled-but-unscheduled: none"
+    blocks.append(_section(sf_text))
+    blocks.append(_context("— Vera."))
+    return blocks
+
+
+def build_revenue_truth_blocks(subject: str, reconciliation, mrr, new_yesterday_cents,
+                                payments, refunds_disputes, report_date: str) -> list:
+    """Block Kit layout for the Revenue Truth report."""
+    if new_yesterday_cents is not None:
+        one_number = f"${new_yesterday_cents / 100:,.2f}"
+    else:
+        one_number = "no prior day to compare (first run)"
+
+    blocks = [
+        _header(f"Vera — Revenue Truth Report {report_date}"),
+        _section(f"*💰 New MRR added yesterday:* `{one_number}`"),
+        _divider(),
+    ]
+
+    # Reconciliation
+    if not reconciliation.stripe_ok:
+        blocks.append(_section("*🔁 RECONCILIATION*\n🚨 Stripe unreachable — could not verify today."))
+    else:
+        pna = reconciliation.paying_no_access_count
+        anp = reconciliation.access_not_paying_count
+        recon_text = (
+            f"*🔁 RECONCILIATION*\n"
+            f"{'✅' if pna == 0 else '🚨'} Paying but no access: `{pna}`\n"
+            f"{'✅' if anp == 0 else '⚠️'} Access but not paying: `{anp}`"
+        )
+        if pna > 0:
+            pna_ids = reconciliation.paying_no_access_sample_ids
+            pna_lines = [f"• `{cid}`" for cid in pna_ids]
+            if pna > len(pna_ids):
+                pna_lines.append(f"_(sample capped at {len(pna_ids)} of {pna} total — see email for full list)_")
+            recon_text += "\n" + _capped_lines(pna_lines, budget=1200)
+        if anp > 0:
+            anp_details = reconciliation.access_not_paying_details
+            anp_lines = [
+                f"• `{d['customer_id']}` — {d['reason']} ({d.get('stripe_status', '?')})"
+                for d in anp_details
+            ]
+            if anp > len(anp_details):
+                anp_lines.append(f"_(sample capped at {len(anp_details)} of {anp} total — see email for full list)_")
+            recon_text += "\n" + _capped_lines(anp_lines, budget=1200)
+        blocks.append(_section(recon_text))
+    blocks.append(_divider())
+
+    # MRR
+    mrr_text = f"*📊 MRR*\nDB: `${mrr.db_total_cents / 100:,.2f}`\n"
+    if not mrr.stripe_ok:
+        mrr_text += "🚨 Stripe unreachable — drift unknown"
+    else:
+        drift_icon = "✅" if mrr.drift_cents == 0 else "⚠️"
+        mrr_text += (
+            f"Stripe: `${mrr.stripe_total_cents / 100:,.2f}`\n"
+            f"{drift_icon} Drift: `${mrr.drift_cents / 100:,.2f}`"
+        )
+    if mrr.active_null_plan_price_count:
+        mrr_text += f"\n_⚠️ {mrr.active_null_plan_price_count} active subscriber(s) have NULL plan_price_"
+    blocks.append(_section(mrr_text))
+    blocks.append(_divider())
+
+    # Payments
+    if not payments.stripe_ok:
+        blocks.append(_section("*💳 PAYMENTS TODAY*\n🚨 Stripe unreachable"))
+    else:
+        blocks.append(_section(
+            f"*💳 PAYMENTS TODAY*\n"
+            f"New: `{payments.new_count}` (`${payments.new_amount_cents / 100:,.2f}`) "
+            f"— subscription `{payments.subscription_count}`, one-time `{payments.one_time_count}`\n"
+            f"Failed: `{payments.failed_count}` (`${payments.failed_amount_cents / 100:,.2f}`)"
+        ))
+    blocks.append(_divider())
+
+    # Refunds & disputes
+    if not refunds_disputes.stripe_ok:
+        blocks.append(_section("*↩️ REFUNDS & DISPUTES*\n🚨 Stripe unreachable"))
+    else:
+        rd_icon = "✅" if refunds_disputes.disputes_count == 0 else "🚨"
+        blocks.append(_section(
+            f"*↩️ REFUNDS & DISPUTES*\n"
+            f"Refunds: `{refunds_disputes.refunds_count}` (`${refunds_disputes.refunds_amount_cents / 100:,.2f}`)\n"
+            f"{rd_icon} Disputes: `{refunds_disputes.disputes_count}` (`${refunds_disputes.disputes_amount_cents / 100:,.2f}`)"
+        ))
+
+    blocks.append(_context("— Vera."))
+    return blocks
+
+
+def build_reconciliation_blocks(report_date: str, drift_cents: int, stripe_ok: bool) -> list:
+    """Slim daily reconciliation companion post."""
+    icon = "✅" if drift_cents == 0 and stripe_ok else ("🚨" if not stripe_ok else "⚠️")
+    return [
+        _section(
+            f"{icon} *[Vera] Daily Reconciliation — {report_date}*\n"
+            f"Stripe vs. subscribers drift: `${drift_cents / 100:,.2f}` "
+            f"({'stripe reachable' if stripe_ok else 'stripe unreachable'})"
+        ),
+    ]
+
+
+def build_digest_blocks(subject: str, discrepancies: list, digest, report_date: str,
+                         unchecked: Optional[list] = None) -> list:
+    """Block Kit layout for the Promise & Discrepancy Digest."""
+    blocks = [
+        _header(f"Vera — Promise & Discrepancy Digest {report_date}"),
+        _section(
+            f"*Open discrepancies:* `{len(discrepancies)}`   "
+            f"*Open promises:* `{digest.open_count}` ({len(digest.overdue)} overdue)"
+        ),
+    ]
+    if unchecked:
+        blocks.append(_section(
+            f"⚠️ *NOT CHECKED TODAY* — no fresh fact for: {', '.join(unchecked)}"
+        ))
+    blocks.append(_divider())
+
+    # Discrepancies
+    disc_text = "*🔍 DISCREPANCIES* (Doc claims X; live shows Y)\n"
+    if discrepancies:
+        for d in discrepancies:
+            disc_text += f"• *Claim:* {d.claim}\n  *Live:* {d.live}\n"
+    else:
+        disc_text += "✅ none — every checked claim matches live state."
+    blocks.append(_section(disc_text))
+    blocks.append(_divider())
+
+    # Overdue promises
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    overdue_text = "*🔴 OVERDUE PROMISES*\n"
+    if digest.overdue:
+        for p in digest.overdue:
+            mrr = f"${p.mrr_at_risk_cents / 100:,.2f}" if p.mrr_at_risk_cents else "—"
+            overdue_text += f"• [{p.owner}] {p.description} — {p.age_days(now)}d old, MRR-at-risk {mrr}\n"
+    else:
+        overdue_text += "✅ none"
+    blocks.append(_section(overdue_text))
+
+    # Pending promises
+    if digest.pending:
+        pending_text = "*🟡 OPEN PROMISES (not yet due)*\n"
+        for p in digest.pending:
+            mrr = f"${p.mrr_at_risk_cents / 100:,.2f}" if p.mrr_at_risk_cents else "—"
+            pending_text += f"• [{p.owner}] {p.description} — due {p.due_at.date().isoformat() if p.due_at else '—'}, MRR {mrr}\n"
+        blocks.append(_section(pending_text))
+
+    blocks.append(_context("— Vera."))
+    return blocks
+
 
 def _default_blocks(subject: str, body: str) -> list:
-    """Minimal block-kit layout: header + body text + Vera sign-off.
-
-    Per Vera's constitution: numbers first, then evidence, then unresolved.
-    Callers may pass richer blocks; this is the safe fallback.
-    """
-    # Slack block text is capped at 3000 chars per section.
+    """Fallback block-kit layout used when no richer blocks are supplied."""
     body_truncated = body[:2900] + "\n…(truncated)" if len(body) > 2900 else body
     return [
-        {
-            "type": "header",
-            "text": {"type": "plain_text", "text": subject[:150]},
-        },
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": body_truncated},
-        },
-        {
-            "type": "context",
-            "elements": [{"type": "mrkdwn", "text": "— Vera."}],
-        },
+        _header(subject),
+        _section(body_truncated),
+        _context("— Vera."),
     ]
 
 

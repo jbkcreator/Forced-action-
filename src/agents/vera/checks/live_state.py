@@ -717,7 +717,14 @@ def run_live_state() -> int:
         except Exception as exc:
             logger.warning("[Vera] failed to send live-state report to %s: %s", addr, exc)
 
-    post_vera_report(subject, body)
+    from src.services.vera_slack import build_live_state_blocks
+    _report_date = datetime.now(timezone.utc).date()
+    slack_blocks = build_live_state_blocks(
+        subject, deploy, cron_beats, silent,
+        one_number_line=_the_one_number_line(one_number_fact_row),
+        report_date=str(_report_date),
+    )
+    post_vera_report(subject, body, blocks=slack_blocks)
 
     stale_count = sum(1 for b in cron_beats if b.is_stale)
 

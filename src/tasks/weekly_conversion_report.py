@@ -57,7 +57,11 @@ def _post_slack(text: str) -> None:
         WebClient(token=token.get_secret_value()).chat_postMessage(
             channel=channel,
             text=text,
-            blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": text[:3000]}}],
+            blocks=[
+                {"type": "header", "text": {"type": "plain_text", "text": "📊 Weekly CDS Tier Conversion Report", "emoji": True}},
+                {"type": "section", "text": {"type": "mrkdwn", "text": text[:3000]}},
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": "Runs every Monday 07:00 UTC — 90-day rolling window"}]},
+            ],
         )
     except Exception:
         logger.warning("[weekly_conversion] Slack post failed", exc_info=True)

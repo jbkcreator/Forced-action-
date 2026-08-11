@@ -151,10 +151,9 @@ def _post_slack_digest(
             channel=channel,
             text="\n".join(lines),
             blocks=[
-                {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": "\n".join(lines)},
-                }
+                {"type": "header", "text": {"type": "plain_text", "text": "Challenger Floor Sweep — Weekly Proposal", "emoji": True}},
+                {"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines)}},
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": "Proposal only — nothing applied automatically"}]},
             ],
         )
     except Exception:

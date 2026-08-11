@@ -23,6 +23,34 @@ THROUGHPUT_UNIT_DST="/etc/systemd/system/cora_throughput.service"
 
 cd "$PROJECT_DIR"
 
+# Failsafe: export .env into this script's own shell. Standard practice is
+# still config/settings.py reading .env itself (works regardless of caller),
+# but deploy.sh is a bare SSH shell, not a systemd unit with EnvironmentFile=,
+# so anything that reads os.environ directly (in violation of that standard,
+# but a mistake that will recur) would otherwise see nothing and fail the
+# deploy — see migrations/apply_add_subscriber_is_test.py incident 2026-08-11.
+#
+# Parsed with python-dotenv (what config/settings.py's env_file loading uses)
+# and re-quoted with shlex, NOT plain `source` — several values (e.g.
+# RELAY_APPROVERS=["U0..."]) contain quotes bash's own quote-removal would
+# strip, corrupting them, and pydantic-settings gives real env vars priority
+# over the .env file, so a corrupted export would silently win over the
+# correct value config/settings.py would otherwise parse.
+if [ -f "$PROJECT_DIR/.env" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    eval "$("$VENV/python" -c '
+import shlex
+from dotenv import dotenv_values
+for k, v in dotenv_values(".env").items():
+    if v is not None:
+        print(f"export {k}={shlex.quote(v)}")
+')"
+    set +a
+else
+    echo "WARNING: $PROJECT_DIR/.env not found — scripts reading os.environ directly will fail" >&2
+fi
+
 # Restarts whichever agent-runtime unit is actually installed on this box —
 # "lifecycle" post-rename, "cora" pre-rename — so a rollback that checks out
 # a pre-rename commit doesn't fail trying to restart a unit name that was
