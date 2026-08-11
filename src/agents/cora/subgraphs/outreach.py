@@ -257,6 +257,22 @@ def _make_node_persist(db: Optional[Session]):
             return {"terminal_status": state.get("terminal_status", "rejected")}
 
         buyer_entity = state["buyer_entity"]
+        channel = state.get("recommended_channel", "email")
+        contact_email = state.get("contact_email")
+        contact_phone = state.get("contact_phone")
+        if channel == "email" and not contact_email:
+            logger.warning(
+                "[cora.outreach] draft skipped — no contact_email for thread %s channel=email",
+                buyer_entity.get("opportunity_thread_id"),
+            )
+            return {"terminal_status": "no_recipient"}
+        if channel in ("sms", "voice") and not contact_phone:
+            logger.warning(
+                "[cora.outreach] draft skipped — no contact_phone for thread %s channel=%s",
+                buyer_entity.get("opportunity_thread_id"), channel,
+            )
+            return {"terminal_status": "no_recipient"}
+
         venture_key = state.get("venture_key") or store.venture_key_for_county(
             db, buyer_entity.get("county_id")
         )
@@ -273,14 +289,14 @@ def _make_node_persist(db: Optional[Session]):
             body=state["body"],
             facts_used=state.get("facts_used", []),
             source_refs=[f.get("source_ref") for f in state.get("facts_used", [])],
-            recommended_channel=state["recommended_channel"],
+            recommended_channel=channel,
             confidence_score=int(buyer_entity.get("confidence_score", 0) or 0),
             booking_link=state.get("booking_link"),
             payment_link=state.get("payment_link"),
             is_followup=bool(state.get("is_followup", False)),
             followup_sequence=state.get("followup_sequence"),
-            contact_email=state.get("contact_email"),
-            contact_phone=state.get("contact_phone"),
+            contact_email=contact_email,
+            contact_phone=contact_phone,
             venture_key=venture_key,
             price_cents=state.get("price_cents"),
             experiment_assignment_id=state.get("experiment_assignment_id"),
