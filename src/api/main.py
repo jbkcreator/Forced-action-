@@ -4779,8 +4779,19 @@ async def synthflow_webhook(request: Request):
                 ),
                 "prompt_variables": pv if isinstance(pv, dict) else {},
             }
+            # Action-extracted outcomes (demo_requested, sample_requested, ...)
+            # live in executed_actions[*].return_value and collected_variables on
+            # the GET /calls/{id} record — carry them over so _vars can surface
+            # `outcome` instead of falling through to a generic `completed`.
+            _exec = detail.get("executed_actions")
+            if isinstance(_exec, dict):
+                payload.executed_actions = _exec
+            _collected = detail.get("collected_variables")
+            if isinstance(_collected, dict):
+                payload.collected_variables = _collected
             # Top-level `outcome` on the thin ping is the raw end_call_reason —
-            # drop it so resolved_outcome maps end_call_reason via our taxonomy.
+            # drop it so resolved_outcome prefers the action-extracted outcome
+            # (via _vars) and otherwise maps end_call_reason through our taxonomy.
             payload.outcome = None
             phone = payload.resolved_phone
 
