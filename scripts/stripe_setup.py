@@ -33,14 +33,14 @@ TIERS = {
     "starter": {
         "name":        "Forced Action Starter",
         "description": "1 ZIP territory — daily lead feed, CDS scoring, all event types",
-        "founding":    60_000,   # $600
-        "regular":     29_900,   # $299
+        "founding":    29_900,   # $299 (first 10 subscribers)
+        "regular":     49_900,   # $499 (after first 10)
     },
     "pro": {
         "name":        "Forced Action Pro",
         "description": "3 ZIP territories — priority delivery, skip-traced phones",
-        "founding":    110_000,  # $1,100
-        "regular":     49_900,   # $499
+        "founding":    49_900,   # $499 (first 10 subscribers)
+        "regular":     89_900,   # $899 (after first 10)
     },
     # dominator tier retired — see migrations/apply_retire_dominator_tier.py
 }
