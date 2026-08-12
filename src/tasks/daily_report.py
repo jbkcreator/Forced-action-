@@ -666,6 +666,53 @@ def _build_signal_composition(session, run_date: date, county_id: str) -> dict:
 STALE_DRAFT_HOURS = 24
 
 
+def _build_machine_pulse(session, run_date: date) -> dict:
+    """
+    Four-number machine-learning health summary for run_date (global, not county-scoped).
+
+    enriched_leads   — successful skip-trace hits written to enriched_contacts today.
+    cora_batches     — outbound_drafts created today (Cora output).
+    playbook_decisions — agent_decisions rows with a non-NULL playbook_id started today;
+                         zero here means the learning layer has no evidence to work from.
+    relay_sends      — relay_approval_queue rows dispatched today.
+    """
+    enriched_leads = session.execute(
+        text("""
+            SELECT COUNT(*) FROM enriched_contacts
+            WHERE DATE(enriched_at) = :run_date AND match_success = true
+        """),
+        {"run_date": run_date},
+    ).scalar() or 0
+
+    playbook_decisions = session.execute(
+        text("""
+            SELECT COUNT(*) FROM agent_decisions
+            WHERE playbook_id IS NOT NULL AND DATE(started_at) = :run_date
+        """),
+        {"run_date": run_date},
+    ).scalar() or 0
+
+    cora_batches = session.execute(
+        text("SELECT COUNT(*) FROM outbound_drafts WHERE DATE(created_at) = :run_date"),
+        {"run_date": run_date},
+    ).scalar() or 0
+
+    relay_sends = session.execute(
+        text("""
+            SELECT COUNT(*) FROM relay_approval_queue
+            WHERE status = 'sent' AND DATE(dispatched_at) = :run_date
+        """),
+        {"run_date": run_date},
+    ).scalar() or 0
+
+    return {
+        "enriched_leads":      int(enriched_leads),
+        "cora_batches":        int(cora_batches),
+        "playbook_decisions":  int(playbook_decisions),
+        "relay_sends":         int(relay_sends),
+    }
+
+
 def _build_cora_throughput_health(session, errors: list) -> dict:
     """
     Block 12 — Cora Throughput health (global, not county-scoped: one draft
@@ -807,6 +854,7 @@ def build_report(run_date: date, county_id: str) -> dict:
         inbound_velocity        = _build_inbound_velocity_section(session)
         cora_throughput_health  = _build_cora_throughput_health(session, errors)
         cora_throughput_volume  = _build_cora_throughput_volume(session, run_date)
+        machine_pulse           = _build_machine_pulse(session, run_date)
 
     return {
         "run_date":              run_date,
@@ -827,6 +875,7 @@ def build_report(run_date: date, county_id: str) -> dict:
         "inbound_velocity":      inbound_velocity,
         "cora_throughput_health": cora_throughput_health,
         "cora_throughput_volume": cora_throughput_volume,
+        "machine_pulse":         machine_pulse,
         "errors":                errors,
     }
 
@@ -1037,6 +1086,17 @@ def write_csv(report: dict, path: Path) -> None:
         w.writerow(["Batches approved today", f"{cv.get('batches_approved', 0):,}"])
         w.writerow(["Batches rejected today", f"{cv.get('batches_rejected', 0):,}"])
         w.writerow(["Items sent to Relay today", f"{cv.get('items_sent_to_relay', 0):,}"])
+        w.writerow([])
+
+        # ── Section 14: Machine-Learning Pulse (global) ───────────────────
+        mp = report.get("machine_pulse") or {}
+        w.writerow(["MACHINE PULSE (global — is the machine learning, not just running?)"])
+        w.writerow([
+            f"Enriched leads: {mp.get('enriched_leads', 0):,} · "
+            f"Cora batches drafted: {mp.get('cora_batches', 0):,} · "
+            f"Decisions w/ playbook_id: {mp.get('playbook_decisions', 0):,} · "
+            f"Relay sends: {mp.get('relay_sends', 0):,}"
+        ])
 
 
 # ---------------------------------------------------------------------------
@@ -1076,12 +1136,17 @@ def generate_report(run_date: date, county_id: str) -> Path:
     s = report["scoring"]
     t = report["tiers"]
     vb = report["vertical_breakdown"]
+    mp = report.get("machine_pulse") or {}
     print(
         f"\nForced Action Daily Report — {run_date}\n"
         f"  Ingest  : {report['total_scraped']:,} scraped | {report['total_matched']:,} matched ({report['match_pct']:.1f}%)\n"
         f"  Leads   : {s['leads_new']:,} new | {s['leads_updated']:,} updated | {s['leads_unchanged']:,} unchanged\n"
         f"  Gold+   : Ultra Plat {t['Ultra Platinum']:,} | Plat {t['Platinum']:,} | Gold {t['Gold']:,}\n"
         f"  Verticals: " + " | ".join(f"{b} {d['count']:,}" for b, d in vb.items()) + "\n"
+        f"  Machine : {mp.get('enriched_leads', 0):,} enriched leads · "
+        f"{mp.get('cora_batches', 0):,} Cora batches · "
+        f"{mp.get('playbook_decisions', 0):,} decisions w/ playbook · "
+        f"{mp.get('relay_sends', 0):,} Relay sends\n"
         f"  Alerts  : {len(report['errors'])} error(s)\n"
         f"  Saved   : {output_path}\n"
     )
