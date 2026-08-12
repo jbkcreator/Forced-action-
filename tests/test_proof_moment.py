@@ -171,7 +171,9 @@ class TestGetProofLeadsUnit:
         result = get_proof_leads("investor", "hillsborough", db)
         assert result["blurred"][0]["contact"] is None
 
-    def test_revealed_contact_populated_when_enriched_exists(self):
+    def test_revealed_contact_is_none_without_paid_unlock(self):
+        # Contact is only returned for leads the visitor has paid to unlock.
+        # The free preview lead (i=0) must not expose phone/email server-side.
         prop = MagicMock()
         prop.id = 1
         prop.address = "100 Elm St"
@@ -185,17 +187,16 @@ class TestGetProofLeadsUnit:
         score.vertical_scores = {}
         score.distress_types = {}
 
-        enriched = MagicMock()
-        enriched.mobile_phone = "+18135550100"
-        enriched.email = "owner@example.com"
-        enriched.mailing_address = "123 PO Box"
+        owner = MagicMock()
+        owner.owner_name = "John Smith"
 
         db = MagicMock()
         db.execute.return_value.all.return_value = [(prop, score)]
-        db.execute.return_value.scalar_one_or_none.return_value = enriched
+        db.execute.return_value.scalar_one_or_none.return_value = owner
 
         result = get_proof_leads("roofing", "hillsborough", db)
-        assert result["revealed"]["contact"]["mobile_phone"] == "+18135550100"
+        assert result["revealed"]["contact"] is None
+        assert result["revealed"]["owner_name"] == "J."
 
     def test_unknown_vertical_falls_back_gracefully(self):
         db = self._make_db(rows=[])

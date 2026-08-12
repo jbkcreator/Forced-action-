@@ -146,20 +146,19 @@ def get_proof_leads(
             "urgency_level": score.urgency_level,
         }
 
-        # Address + owner name are public-record — return unblurred for every
-        # lead. Phone/email (skip-trace enrichment) stay behind the paywall.
         owner_row = db.execute(
             select(Owner).where(Owner.property_id == prop.id).limit(1)
         ).scalar_one_or_none()
-        lead["owner_name"] = (
-            owner_row.owner_name if owner_row and getattr(owner_row, "owner_name", None)
-            else None
-        )
 
         is_paid_unlock = prop.id in unlocked_ids
-        # The first (top-scored) lead is the FREE preview; others are blurred
-        # unless this subscriber has paid to unlock them.
-        reveal_contact = (i == 0) or is_paid_unlock
+
+        # Owner name and contact are gated on paid unlock. Anonymous/free-preview
+        # leads receive a masked name (first initial only) and no contact data,
+        # so the raw PII is never present in the API response.
+        raw_name = owner_row.owner_name if owner_row and getattr(owner_row, "owner_name", None) else None
+        lead["owner_name"] = raw_name if is_paid_unlock else _mask_owner_name(raw_name)
+
+        reveal_contact = is_paid_unlock
 
         if reveal_contact:
             enriched = db.execute(
@@ -296,3 +295,13 @@ def _blur_address(address: Optional[str]) -> str:
     # Keep house number, mask street name and suffix
     masked = [parts[0]] + ["*" * max(3, len(p)) for p in parts[1:]]
     return " ".join(masked)
+
+
+def _mask_owner_name(name: Optional[str]) -> Optional[str]:
+    """Reduce owner name to first initial only, e.g. 'John Smith' → 'J.'"""
+    if not name:
+        return None
+    parts = name.strip().split()
+    if not parts:
+        return None
+    return f"{parts[0][0].upper()}."
