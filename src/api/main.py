@@ -4645,6 +4645,8 @@ class SynthflowWebhookPayload(BaseModel):
             return "no_answer"
         if end_reason == "human_pick_up_cut_off":
             return "no_answer"
+        if end_reason in ("agent_goodbye", "user_goodbye", "completed"):
+            return "completed"
 
         status_map = {
             "no_answer":        "no_answer",
@@ -4751,7 +4753,37 @@ async def synthflow_webhook(request: Request):
         )
         return {"status": "error", "reason": "invalid_payload"}
 
+    call_id = payload.resolved_call_id
     phone = payload.resolved_phone
+
+    # Classic Synthflow sends a thin post-call ping (call_id, status,
+    # end_call_reason, duration) with no phone/transcript/recording/variables.
+    # Those live only on GET /calls/{id} — enrich from the API when missing.
+    if call_id and (not phone or not payload.resolved_transcript):
+        from src.services.synthflow_client import get_call_details
+        detail = get_call_details(call_id)
+        if detail:
+            pv = detail.get("prompt_variables") or {}
+            payload.call = {
+                "call_id": call_id,
+                "transcript": detail.get("transcript"),
+                "recording_url": detail.get("recording_url"),
+                "duration": detail.get("duration"),
+                "end_call_reason": detail.get("end_call_reason"),
+                "status": detail.get("status"),
+            }
+            payload.lead = {
+                "phone_number": (
+                    pv.get("user_phone_number") or pv.get("to_phone_number")
+                    or detail.get("phone_number_to")
+                ),
+                "prompt_variables": pv if isinstance(pv, dict) else {},
+            }
+            # Top-level `outcome` on the thin ping is the raw end_call_reason —
+            # drop it so resolved_outcome maps end_call_reason via our taxonomy.
+            payload.outcome = None
+            phone = payload.resolved_phone
+
     if not phone:
         logger.warning(
             "[Synthflow webhook] no phone resolved — top_level_keys=%s var_keys=%s",
@@ -4761,7 +4793,6 @@ async def synthflow_webhook(request: Request):
 
     v = payload._vars
     lead = payload.lead or {}
-    call_id = payload.resolved_call_id
 
     # Dedup: Synthflow retries on network errors — skip if already processed
     if call_id:

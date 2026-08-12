@@ -6294,7 +6294,7 @@ class SynthflowCall(Base):
     contact_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     call_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, unique=True)
     transcript_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    recording_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    recording_url: Mapped[Optional[str]] = mapped_column(String(2000), nullable=True)
     duration_seconds: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     call_date: Mapped[date] = mapped_column(Date, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
