@@ -345,11 +345,19 @@ def process_call_outcome(
         from src.services.phone_utils import normalize as _normalize_phone
         from sqlalchemy import text as _text
         with get_db_context() as _session:
-            # Look up DBPR contractor by normalized phone
+            # Look up DBPR contractor by phone (strip to digits for comparison
+            # since dbpr_contacts stores raw Tracerfy output, not normalized)
             _normalized = _normalize_phone(prospect_phone)
+            _digits = _normalized.lstrip("+")
             _dbpr_row = _session.execute(
-                _text("SELECT id FROM dbpr_contacts WHERE phone = :phone LIMIT 1"),
-                {"phone": _normalized},
+                _text("""
+                    SELECT id FROM dbpr_contacts
+                    WHERE regexp_replace(phone, '[^0-9]', '', 'g') = :digits
+                       OR regexp_replace(mobile_phone, '[^0-9]', '', 'g') = :digits
+                       OR regexp_replace(landline_phone, '[^0-9]', '', 'g') = :digits
+                    LIMIT 1
+                """),
+                {"digits": _digits},
             ).fetchone()
             _dbpr_contact_id = _dbpr_row[0] if _dbpr_row else None
 
