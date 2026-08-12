@@ -882,6 +882,7 @@ def get_annual_signup_experiment_config():
 _ATTRIBUTION_META_KEYS = (
     "utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term",
     "campaign_id", "attribution_token", "fbclid", "ref",
+    "landing_path", "referrer", "ga_client_id",
 )
 # Stripe caps each metadata value at 500 chars.
 _MAX_META_VALUE_LEN = 480
@@ -918,7 +919,7 @@ class CheckoutRequest(BaseModel):
     email: str       # collected before checkout — used to block duplicate subscriptions
     interval: str = "monthly"  # monthly | annual — only meaningful for founder (picks its price)
     consent_acceptance: Optional[ConsentAcceptanceRequest] = None
-    attribution: Optional[dict] = None  # Meta Ads attribution (utm_*, campaign_id, fbclid, ...)
+    attribution: Optional[dict] = None  # Meta Ads attribution (utm_*, campaign_id, fbclid, landing_path, referrer, ga_client_id)
     # True when the buyer already has an authenticated dashboard session (e.g.
     # a free-tier subscriber upgrading from their dashboard), as opposed to an
     # anonymous landing-page visitor who has never seen their dashboard yet.
@@ -6747,6 +6748,10 @@ class FreeSignupRequest(BaseModel):
     utm_source: Optional[str] = None
     utm_medium: Optional[str] = None
     utm_campaign: Optional[str] = None
+    utm_content: Optional[str] = None
+    utm_term: Optional[str] = None
+    landing_path: Optional[str] = None
+    referrer: Optional[str] = None
     campaign_id: Optional[str] = None
     attribution_token: Optional[str] = None
     # fa081: affiliate ?aff= token, captured client-side and forwarded here.
@@ -6827,6 +6832,22 @@ def free_signup(req: FreeSignupRequest, request: Request, db: Session = Depends(
         referral_source=req.referral_source,
         send_welcome=not defer_welcome,
     )
+
+    # Push free-signup contact to GHL with UTM attribution (best-effort)
+    try:
+        from src.services.ghl_webhook import push_subscriber_to_ghl
+        utm_data = {
+            "utm_source":   req.utm_source,
+            "utm_medium":   req.utm_medium,
+            "utm_campaign": req.utm_campaign,
+            "utm_content":  req.utm_content,
+            "utm_term":     req.utm_term,
+            "landing_path": req.landing_path,
+            "referrer":     req.referrer,
+        }
+        push_subscriber_to_ghl(sub, stage=None, utm_data=utm_data, db=db)
+    except Exception:
+        logger.warning("GHL free-signup push failed (non-fatal):", exc_info=True)
 
     if req.consent_acceptance and req.consent_acceptance.terms_accepted:
         try:
