@@ -126,10 +126,9 @@ system_prompt: |
 
   ── FOUNDING CLOSE (only if they engage positively) ──
   "There are [X] founding spots left for remediation companies in
-  Hillsborough. The founding rate is $600 a month — locked for life.
-  One company per ZIP. After spots fill it goes to $800, then $1,100
-  at six months. [Their ZIP] is [available / already taken — adjacent
-  ZIPs are still open]."
+  Hillsborough. The founding rate is $299 a month — locked for life.
+  One company per ZIP. After spots fill it goes to $499.
+  [Their ZIP] is [available / already taken — adjacent ZIPs are still open]."
 
   ── DEMO CLOSE ──
   "I can set you up with a quick call with Josh — he can pull up live
@@ -141,7 +140,7 @@ system_prompt: |
 
   ── OBJECTION HANDLING ──
   "How much does it cost?" →
-    "Founding rate is $600/month, one company per ZIP. One job from a
+    "Founding rate is $299/month, one company per ZIP. One job from a
     flood or fire call typically covers months of the subscription. But
     want to see the free leads first before we talk price?"
 

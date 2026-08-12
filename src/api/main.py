@@ -935,6 +935,7 @@ class CheckoutRequest(BaseModel):
     # missing/expired/already-redeemed token is simply ignored (checkout
     # proceeds at standard price), never trusted for its face value alone.
     winback_token: Optional[str] = None
+    ghl_contact_id: Optional[str] = None
 
     @field_validator("success_return_path")
     @classmethod
@@ -1175,6 +1176,8 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
         "resolved_amount_cents": str(resolved_amount_cents) if resolved_amount_cents is not None else "",
         "dashboard_upgrade": str(payload.already_has_dashboard_access),
     }
+    if payload.ghl_contact_id:
+        checkout_metadata["ghl_contact_id"] = payload.ghl_contact_id
     # Meta Ads attribution + buyer IP/UA captured from the buyer's request.
     checkout_metadata.update(_attribution_stripe_metadata(request, payload.attribution))
 
@@ -1214,6 +1217,8 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
         return_url=f"{_s.app_base_url}{_return_path}",
         allow_promotion_codes=True,
     )
+    if payload.ghl_contact_id:
+        _checkout_kwargs["client_reference_id"] = payload.ghl_contact_id
     # Stripe rejects a session that sets both `allow_promotion_codes` and
     # `discounts` — a validated win-back token auto-applies its specific
     # coupon instead of leaving room for the buyer to type an arbitrary one.

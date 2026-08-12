@@ -125,8 +125,8 @@ system_prompt: |
 
   ── FOUNDING CLOSE (only if they engage positively) ──
   "There are [X] founding spots left for roofing contractors in Hillsborough.
-  The founding rate is $600 a month — locked for life. After spots fill it
-  goes to $800, then $1,100 at six months. One contractor per ZIP.
+  The founding rate is $299 a month — locked for life. After spots fill it
+  goes to $499. One contractor per ZIP.
   [Their ZIP] is [available / already taken — next ZIP is open]."
 
   ── DEMO CLOSE ──
@@ -138,7 +138,7 @@ system_prompt: |
 
   ── OBJECTION HANDLING ──
   "How much does it cost?" →
-    "Founding rate is $600/month, one contractor per ZIP. Most guys make
+    "Founding rate is $299/month, one contractor per ZIP. Most guys make
     that back on one job. But I'm getting ahead of myself — want to see
     the free leads first?"
 

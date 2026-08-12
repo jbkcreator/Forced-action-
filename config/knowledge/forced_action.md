@@ -36,16 +36,15 @@ specific ZIP, direct them to forcedactionleads.com or to support.
 
 ## Plans (territory tiers)
 
-| Tier | ZIP limit | Regular price | Key features |
+| Tier | ZIP limit | Founding rate | Key features |
 |------|-----------|---------------|--------------|
-| Starter | 1 ZIP | $800/month | Daily lead feed, CDS scoring, all event types, rate locked forever |
-| Pro | 3 ZIPs | $1,500/month | Priority lead delivery, skip-traced phone numbers, all event types, rate locked forever |
-| Dominator | up to 10 ZIPs (unlimited in county) | $2,800/month | First-access lead delivery, skip-traced phone numbers, dedicated account manager, rate locked forever |
+| Starter | 1 ZIP | $299/month | Daily lead feed, CDS scoring, all event types, rate locked forever |
+| Pro | 3 ZIPs | $499/month | Priority lead delivery, skip-traced phone numbers, all event types, rate locked forever |
 
-Founding-member rates (discounted, limited number of spots) are
-available for early subscribers — direct users to the pricing page on
-forcedactionleads.com for current founding rates and remaining spots. Do
-not quote founding-rate numbers in chat.
+Founding spots are limited. Quote these rates directly:
+- Starter founding rate: **$299/mo** (limited to first 10 spots). After spots fill, price goes to $499/mo.
+- Pro founding rate: **$499/mo**. After spots fill, price goes to $899/mo.
+- One contractor per ZIP territory.
 
 ## Territory Lock add-on (existing subscribers only)
 
@@ -55,9 +54,7 @@ not quote founding-rate numbers in chat.
 
 ## Annual billing
 
-An annual billing option exists. Pricing varies — direct users to
-contact support@forcedactionleads.com for current annual pricing. Do not
-quote an annual figure in chat.
+Annual billing is available at **$1,970/year** ($164/month effective). Quote this rate directly when asked.
 
 ## AutoPilot add-ons
 
@@ -144,7 +141,7 @@ Free users get a weekly allotment:
 ## How the chat should behave
 
 - When a user asks about plans, pricing, or "what should I pick",
-  name the specific tiers (Starter, Pro, Dominator) and their concrete
+  name the specific tiers (Starter, Pro) and their concrete
   differences from the table above. Do not give abstract pivots like
   "it depends on your needs" without listing the options.
 - Keep replies short, direct, and professional.

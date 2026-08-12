@@ -342,7 +342,17 @@ def process_call_outcome(
         from datetime import date as _date
         from src.core.database import get_db_context
         from src.core.models import MessageOutcome, SynthflowCall
+        from src.services.phone_utils import normalize as _normalize_phone
+        from sqlalchemy import text as _text
         with get_db_context() as _session:
+            # Look up DBPR contractor by normalized phone
+            _normalized = _normalize_phone(prospect_phone)
+            _dbpr_row = _session.execute(
+                _text("SELECT id FROM dbpr_contacts WHERE phone = :phone LIMIT 1"),
+                {"phone": _normalized},
+            ).fetchone()
+            _dbpr_contact_id = _dbpr_row[0] if _dbpr_row else None
+
             _session.add(MessageOutcome(
                 message_type="voice",
                 channel="synthflow",
@@ -354,6 +364,7 @@ def process_call_outcome(
                 vertical=vertical or None,
                 zip_code=zip_code or None,
                 contact_id=contact_id,
+                dbpr_contact_id=_dbpr_contact_id,
                 call_date=_date.today(),
                 call_id=call_id or None,
                 transcript_text=transcript_text or None,
