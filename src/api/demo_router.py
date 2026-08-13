@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from sqlalchemy import select, text
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
@@ -22,6 +23,7 @@ from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from src.api.deps import VALID_VERTICALS, ZIP_RE, get_db, resolve_phone_with_quality
 from src.core.models import DemoSession, DistressScore, Owner, Property, Subscriber
 from src.services.proof_moment import _blur_address
+from src.services.subscriber_auth import verify_access_token
 from src.utils.lead_filters import has_contact_filter, phone_priority_order
 from config.settings import get_settings
 
@@ -30,19 +32,38 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/demo", tags=["demo"])
 
 GOLD_PLUS_TIERS = {"Gold", "Platinum", "Ultra Platinum"}
-# Featured lead looks back further than the zip-reveal list to maximise coverage
 _FEATURED_LEAD_DAYS = 30
 
+_bearer = HTTPBearer(auto_error=False)
+
 
 # ---------------------------------------------------------------------------
-# Shared auth guard — all three endpoints require is_demo=true
+# Shared auth guard — JWT required + is_demo=true
 # ---------------------------------------------------------------------------
 
-def _require_demo_sub(feed_uuid: str, db) -> Subscriber:
+def _require_demo_sub(
+    feed_uuid: str,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+    db=Depends(get_db),
+) -> Subscriber:
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        payload = verify_access_token(credentials.credentials)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    token_sub_id = int(payload["sub"])
     sub = db.execute(
-        select(Subscriber).where(Subscriber.event_feed_uuid == feed_uuid)
+        select(Subscriber).where(
+            Subscriber.id == token_sub_id,
+            Subscriber.event_feed_uuid == feed_uuid,
+        )
     ).scalar_one_or_none()
-    if not sub or not sub.is_demo:
+
+    if not sub:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if not sub.is_demo:
         raise HTTPException(status_code=403, detail="Demo access only")
     return sub
 
@@ -53,14 +74,13 @@ def _require_demo_sub(feed_uuid: str, db) -> Subscriber:
 
 @router.get("/zip-reveal")
 def zip_reveal(
-    feed_uuid: str,
     zip_code: str,
     county_id: str = "hillsborough",
     days: int = Query(default=7, ge=1, le=30),
+    _sub: Subscriber = Depends(_require_demo_sub),
     db=Depends(get_db),
 ):
     """Full-screen list of distress-scored properties in a ZIP for the past N days."""
-    _require_demo_sub(feed_uuid, db)
 
     if not ZIP_RE.match(zip_code):
         raise HTTPException(status_code=422, detail="Invalid ZIP code")
@@ -132,17 +152,18 @@ def zip_reveal(
 # ---------------------------------------------------------------------------
 
 class PrepareCallBody(BaseModel):
-    feed_uuid: str
     zip_code: str
     vertical: str
     county_id: str = "hillsborough"
 
 
 @router.post("/prepare-call")
-def prepare_call(body: PrepareCallBody, db=Depends(get_db)):
+def prepare_call(
+    body: PrepareCallBody,
+    sub: Subscriber = Depends(_require_demo_sub),
+    db=Depends(get_db),
+):
     """Store the top Gold+ lead for this demo session (masked address)."""
-    sub = _require_demo_sub(body.feed_uuid, db)
-
     if not ZIP_RE.match(body.zip_code):
         raise HTTPException(status_code=422, detail="Invalid ZIP code")
     if body.vertical not in VALID_VERTICALS:
@@ -255,9 +276,12 @@ def _prep_response(s: DemoSession, county_fallback: bool = False) -> dict[str, A
 # ---------------------------------------------------------------------------
 
 @router.post("/reveal-lead/{prep_id}")
-def reveal_lead(prep_id: int, feed_uuid: str, db=Depends(get_db)):
+def reveal_lead(
+    prep_id: int,
+    sub: Subscriber = Depends(_require_demo_sub),
+    db=Depends(get_db),
+):
     """Record reveal moment and return full address + PII."""
-    sub = _require_demo_sub(feed_uuid, db)
 
     try:
         session_row = db.execute(
