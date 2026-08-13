@@ -86,6 +86,19 @@ class AppSettings(BaseSettings):
 	ghl_cf_fa_zip: Optional[str] = Field(default=None, env="GHL_CF_FA_ZIP")
 	ghl_cf_fa_founding: Optional[str] = Field(default=None, env="GHL_CF_FA_FOUNDING")
 	ghl_cf_fa_dashboard_url: Optional[str] = Field(default=None, env="GHL_CF_FA_DASHBOARD_URL")
+	# UTM attribution custom fields (Part 2 — GA4/UTM tracking spec)
+	ghl_cf_utm_source: Optional[str] = Field(default=None, env="GHL_CF_UTM_SOURCE")
+	ghl_cf_utm_medium: Optional[str] = Field(default=None, env="GHL_CF_UTM_MEDIUM")
+	ghl_cf_utm_campaign: Optional[str] = Field(default=None, env="GHL_CF_UTM_CAMPAIGN")
+	ghl_cf_utm_content: Optional[str] = Field(default=None, env="GHL_CF_UTM_CONTENT")
+	ghl_cf_utm_term: Optional[str] = Field(default=None, env="GHL_CF_UTM_TERM")
+	ghl_cf_utm_landing_path: Optional[str] = Field(default=None, env="GHL_CF_UTM_LANDING_PATH")
+	ghl_cf_utm_referrer: Optional[str] = Field(default=None, env="GHL_CF_UTM_REFERRER")
+
+	# GA4 Measurement Protocol (Part 3 — server-side purchase event from Stripe webhook)
+	# API secret generated in GA4 → Admin → Data Streams → Measurement Protocol API secrets
+	ga4_measurement_id: str = Field(default="G-LJJ4W7082K", env="GA4_MEASUREMENT_ID")
+	ga4_api_secret: Optional[SecretStr] = Field(default=None, env="GA4_API_SECRET")
 
 	# Instantly.ai email campaign integration (optional — feature disabled if not set)
 	instantly_api_key: Optional[SecretStr] = Field(default=None, env="INSTANTLY_API_KEY")
