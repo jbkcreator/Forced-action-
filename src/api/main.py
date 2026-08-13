@@ -299,6 +299,8 @@ from src.api.account_router import router as account_router  # noqa: E402
 app.include_router(account_router)
 from src.api.scarcity_router import router as scarcity_router  # noqa: E402
 app.include_router(scarcity_router)
+from src.api.deal_room_router import router as deal_room_router  # noqa: E402
+app.include_router(deal_room_router)
 
 
 # ---------------------------------------------------------------------------
@@ -936,6 +938,10 @@ class CheckoutRequest(BaseModel):
     # proceeds at standard price), never trusted for its face value alone.
     winback_token: Optional[str] = None
     ghl_contact_id: Optional[str] = None
+    # 3m deal-room: opaque hold token from the prefilled checkout URL
+    # (`/?start_tier=X&zip=Y&hold=<token>`). Threaded into Stripe metadata so the
+    # subscription webhook can refund the $97 hold deposit on conversion (ADR 0035).
+    hold_token: Optional[str] = None
 
     @field_validator("success_return_path")
     @classmethod
@@ -1178,6 +1184,9 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
     }
     if payload.ghl_contact_id:
         checkout_metadata["ghl_contact_id"] = payload.ghl_contact_id
+    # 3m deal-room: carry the hold token so the webhook refunds the $97 (ADR 0035).
+    if payload.hold_token:
+        checkout_metadata["hold"] = payload.hold_token
     # Meta Ads attribution + buyer IP/UA captured from the buyer's request.
     checkout_metadata.update(_attribution_stripe_metadata(request, payload.attribution))
 

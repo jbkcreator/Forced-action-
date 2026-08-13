@@ -250,6 +250,12 @@ COUNTY_ID=hillsborough
 # Grace Expiry (ZIP territories + subscribers) — every 15 min
 */15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.grace_expiry
 
+# Hold Expiry (3M Deal-Room) — every 15 min. Sweeps deal_rooms where
+# expires_at < now and held_at IS NOT NULL and not yet converted; releases
+# zip_territories.status back to 'available' and forfeits the $97 deposit.
+# Never touches 'grace' rows. Fires Slack alert per expired hold.
+*/15 * * * * cd /root/Forced-action- && PYTHONPATH=. python src/tasks/expire_holds_task.py >> /var/log/fa/expire_holds.log 2>&1
+
 # Lead Pack fulfillment sweep (ADR 0018) — every 2 min. Picks up paid+reserved
 # packs (status='enriching'), runs Tracerfy Hot-Enrichment on the 5 reserved
 # leads, enforces the 100% Quality Floor, then delivers (SentLead + email) or

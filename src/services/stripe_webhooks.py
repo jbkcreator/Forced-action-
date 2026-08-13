@@ -208,12 +208,18 @@ def handle_webhook(raw_body: bytes, sig_header: str, db: Session, background_tas
         raise ValueError("Stripe webhook secret not set")
 
     try:
-        event = stripe.Webhook.construct_event(
+        stripe.Webhook.construct_event(
             raw_body, sig_header, secret.get_secret_value()
         )
     except stripe.error.SignatureVerificationError as exc:
         logger.warning("Stripe webhook signature invalid: %s", exc)
         raise ValueError("Invalid signature") from exc
+
+    # stripe SDK >=15 returns an Event that is no longer a dict subclass, so
+    # `.get()` on it (and its nested objects) raises AttributeError. Downstream
+    # code treats the event and its nested objects as plain dicts, so parse the
+    # already-signature-verified body into plain dicts — SDK-version independent.
+    event = json.loads(raw_body)
 
     event_type = event["type"]
     event_id   = event["id"]
@@ -460,6 +466,39 @@ def _on_checkout_completed(
     # payment_intent_data) — nothing to do here, and falling through would
     # log a false "missing required metadata" error.
     if meta.get("product") == "hot_lead_unlock":
+        return
+
+    # ── Hold deposit branch ─────────────────────────────────────────────────
+    # A one-time payment checkout created by the 3m Deal-Room flow.
+    # Identified by `deal_room_token` in session metadata + mode='payment'.
+    # Store the PaymentIntent id on the DealRoom FIRST (the refund helper
+    # needs it) then delegate to apply_hold_payment for the atomic ZIP-flip.
+    _deal_room_token = meta.get("deal_room_token")
+    if _deal_room_token and session.get("mode") == "payment":
+        try:
+            from src.services.hold_lifecycle_service import apply_hold_payment
+            _pi_id = session.get("payment_intent")
+            if isinstance(_pi_id, dict):
+                logger.warning(
+                    "checkout.session.completed: payment_intent is expanded object for token=%s — extracting id",
+                    _deal_room_token,
+                )
+                _pi_id = _pi_id.get("id")
+            if _pi_id:
+                db.execute(
+                    text(
+                        "UPDATE deal_rooms SET stripe_payment_intent_id = :pi "
+                        "WHERE token = :token AND stripe_payment_intent_id IS NULL"
+                    ),
+                    {"pi": _pi_id, "token": _deal_room_token},
+                )
+                db.flush()
+            apply_hold_payment(db, stripe, token=_deal_room_token)
+        except Exception:
+            logger.error(
+                "checkout.session.completed: hold deposit handler failed for token=%s",
+                _deal_room_token, exc_info=True,
+            )
         return
 
     tier        = meta.get("tier")
@@ -1436,6 +1475,22 @@ def _checkout_completed_deferred(db: Session, subscriber, session: dict, is_new_
             subscriber.id,
             exc_info=True,
         )
+
+    # ── Hold deposit refund on subscription conversion ─────────────────────
+    # If this subscription checkout was initiated by a prospect who paid a
+    # $97 hold deposit, the metadata carries `hold=<deal_room_token>`.
+    # Refund the deposit now that the subscription is confirmed.
+    _hold_token = meta.get("hold")
+    if _hold_token:
+        try:
+            from src.services.hold_lifecycle_service import refund_on_conversion
+            refund_on_conversion(db, stripe, token=_hold_token)
+        except Exception:
+            logger.error(
+                "checkout.session.completed deferred: refund_on_conversion failed for "
+                "hold_token=%s subscriber=%s — non-fatal",
+                _hold_token, subscriber.id, exc_info=True,
+            )
 
     logger.info(
         "checkout.session.completed: deferred work finished — subscriber=%s tier=%s vertical=%s",
