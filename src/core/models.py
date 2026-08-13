@@ -1499,6 +1499,29 @@ class SentLead(Base):
         return f"<SentLead(subscriber_id={self.subscriber_id}, property_id={self.property_id})>"
 
 
+class DemoSession(Base):
+    """One per demo call. Records the ZIP searched, the featured lead, and when it was revealed."""
+    __tablename__ = "demo_sessions"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(ForeignKey("subscribers.id"), nullable=False)
+    zip_code: Mapped[str] = mapped_column(String(10), nullable=False)
+    vertical: Mapped[str] = mapped_column(String(50), nullable=False)
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False, default="hillsborough")
+    property_id: Mapped[Optional[int]] = mapped_column(ForeignKey("properties.id"), nullable=True)
+    masked_address: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    lead_tier: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    distress_types: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    revealed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        Index("idx_demo_sessions_sub", "subscriber_id", "created_at"),
+    )
+
+
 class LeadQualitySnapshot(Base):
     """
     30-day post-send snapshot for each Gold+ lead delivered to a subscriber.

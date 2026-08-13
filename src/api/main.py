@@ -299,6 +299,8 @@ from src.api.account_router import router as account_router  # noqa: E402
 app.include_router(account_router)
 from src.api.scarcity_router import router as scarcity_router  # noqa: E402
 app.include_router(scarcity_router)
+from src.api.demo_router import router as demo_router  # noqa: E402
+app.include_router(demo_router)
 
 
 # ---------------------------------------------------------------------------

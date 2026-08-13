@@ -117,7 +117,12 @@ def login(body: LoginRequest, request: Request, db=Depends(get_db)):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     token = auth.create_access_token(sub.id, sub.event_feed_uuid)
-    return {"access_token": token, "token_type": "bearer", "feed_uuid": sub.event_feed_uuid}
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "feed_uuid": sub.event_feed_uuid,
+        "is_demo": bool(sub.is_demo),
+    }
 
 
 @router.post("/forgot-password")
