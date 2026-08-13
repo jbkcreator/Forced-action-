@@ -71,3 +71,38 @@ def initiate_call(
         body = getattr(getattr(exc, "response", None), "text", "")
         logger.error("synthflow initiate_call failed: %s | body=%s", exc, body[:500])
         return None
+
+
+def get_call_details(call_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Fetch a completed call's full record from Synthflow's GET /calls/{id}.
+
+    The post-call webhook Synthflow sends is a thin notification (call_id,
+    status, end_call_reason, duration_sec) — phone, transcript, recording_url
+    and the per-call variables live ONLY on this endpoint. Returns the single
+    call dict, or None on failure.
+    """
+    from config.settings import get_settings as _get_settings
+
+    settings = _get_settings()
+    if not settings.synthflow_api_key or not call_id:
+        return None
+
+    api_key = settings.synthflow_api_key.get_secret_value()
+    base = settings.synthflow_api_base.rstrip("/")
+
+    try:
+        import requests as _requests  # noqa: PLC0415
+        resp = _requests.get(
+            f"{base}/calls/{call_id}",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        calls = (data.get("response") or {}).get("calls") or []
+        return calls[0] if calls else None
+    except Exception as exc:
+        body = getattr(getattr(exc, "response", None), "text", "")
+        logger.error("synthflow get_call_details failed call_id=%s: %s | body=%s", call_id, exc, body[:500])
+        return None
