@@ -66,8 +66,11 @@ def _is_fire_incident(description: str) -> bool:
     return any(kw in desc_lower for kw in FIRE_KEYWORDS)
 
 
-def _fetch_incidents() -> List[Dict]:
-    """Fetch all incidents from Tampa Fire Rescue API via proxy."""
+def _fetch_incidents() -> Tuple[List[Dict], Optional[str]]:
+    """Fetch all incidents from Tampa Fire Rescue API via proxy.
+
+    Returns (incidents, error) — error is set if the API call itself failed.
+    """
     try:
         resp = requests_get_with_retry(
             _TFR_URL,
@@ -75,10 +78,10 @@ def _fetch_incidents() -> List[Dict]:
             timeout=20,
             use_proxy=True,
         )
-        return resp.json().get("data", [])
+        return resp.json().get("data", []), None
     except Exception as exc:
         logger.error("[fire] Tampa Fire Rescue API fetch failed: %s", exc)
-        return []
+        return [], str(exc)
 
 
 def _filter_fire_incidents(
@@ -187,11 +190,15 @@ def scrape_fire_incidents(
     since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
 
     logger.info("[fire] %s: fetching Tampa Fire Rescue incidents since %s", county_id, since.date())
-    all_incidents = _fetch_incidents()
+    all_incidents, fetch_error = _fetch_incidents()
 
     if not all_incidents:
-        logger.warning("[fire] %s: no data from API", county_id)
-        _record_stats(county_id, 0, 0, 0, 0)
+        if fetch_error:
+            logger.warning("[fire] %s: API fetch failed", county_id)
+            _record_stats(county_id, 0, 0, 0, 0, error=fetch_error)
+        else:
+            logger.warning("[fire] %s: no data from API", county_id)
+            _record_stats(county_id, 0, 0, 0, 0)
         return 0
 
     fire_incidents = _filter_fire_incidents(all_incidents, since)
@@ -253,17 +260,34 @@ def scrape_fire_incidents(
     return created
 
 
-def _record_stats(county_id: str, total: int, matched: int, unmatched: int, skipped: int) -> None:
+def _record_stats(county_id: str, total: int, matched: int, unmatched: int, skipped: int,
+                   error: Optional[str] = None) -> None:
     try:
         from src.utils.scraper_db_helper import record_scraper_stats
-        record_scraper_stats(
-            source_type="fire_incidents",
-            total_scraped=total,
-            matched=matched,
-            unmatched=unmatched,
-            skipped=skipped,
-            county_id=county_id,
-        )
+        if error:
+            # The API fetch itself failed — this is NOT a confirmed no-data
+            # day, don't let it masquerade as one.
+            record_scraper_stats(
+                source_type="fire_incidents",
+                total_scraped=0,
+                matched=0,
+                unmatched=0,
+                skipped=0,
+                county_id=county_id,
+                run_success=False,
+                error_type="scraper_error",
+                error_message=error[:500],
+            )
+        else:
+            record_scraper_stats(
+                source_type="fire_incidents",
+                total_scraped=total,
+                matched=matched,
+                unmatched=unmatched,
+                skipped=skipped,
+                county_id=county_id,
+                error_type="no_data" if not total else "none",
+            )
     except Exception as exc:
         logger.warning("[fire] Could not record scraper stats: %s", exc)
 

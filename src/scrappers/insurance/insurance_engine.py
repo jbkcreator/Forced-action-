@@ -59,13 +59,17 @@ _FEMA_BATCH = 1000
 _FEMA_MAX_PAGES = 20
 
 
-def _fetch_fema_ia_registrants(state: str, county_display: str) -> List[Dict]:
+def _fetch_fema_ia_registrants(state: str, county_display: str) -> Tuple[List[Dict], Optional[str]]:
     """
     Fetch FEMA Housing Assistance Owners records for a specific county (grouped by ZIP).
 
     Filters by both state and county name to avoid pulling 22k+ statewide rows.
     Paginates with $skip until all pages are collected (county counts: ~1,150–1,500).
     Returns newest disasters first ($orderby=disasterNumber desc).
+
+    Returns (results, error). `error` is only set if the API failed before any
+    page returned data — a failure on a later page still leaves the earlier
+    results usable, so it isn't a full-fetch failure.
     """
     # Build query string manually — requests.params URL-encodes $ which breaks FEMA API
     base = (
@@ -76,6 +80,7 @@ def _fetch_fema_ia_registrants(state: str, county_display: str) -> List[Dict]:
         f"&$top={_FEMA_BATCH}&$format=json"
     )
     results: List[Dict] = []
+    error = None
     for page in range(_FEMA_MAX_PAGES):
         url = base if page == 0 else f"{base}&$skip={page * _FEMA_BATCH}"
         try:
@@ -89,8 +94,10 @@ def _fetch_fema_ia_registrants(state: str, county_display: str) -> List[Dict]:
                 break
         except Exception as e:
             logger.warning("[insurance] FEMA IA API failed (page %d): %s", page, e, exc_info=True)
+            if not results:
+                error = str(e)
             break
-    return results
+    return results, error
 
 
 def _get_insurance_permits(db, county_id: str, start_date: date, end_date: date) -> List:
@@ -170,7 +177,7 @@ def scrape_insurance_claims(
         db.commit()
 
         # ── Source 2: FEMA IA registrants → match by ZIP ──────────────────
-        fema_registrants = _fetch_fema_ia_registrants(state, county_display)
+        fema_registrants, fema_error = _fetch_fema_ia_registrants(state, county_display)
 
         # FEMA is scoped to county by filter; the DB query below also scopes by
         # Property.county_id == county_id for an extra safety guard.
@@ -249,14 +256,41 @@ def scrape_insurance_claims(
 
     try:
         from src.utils.scraper_db_helper import record_scraper_stats
-        record_scraper_stats(
-            source_type='insurance_claims',
-            total_scraped=created + skipped_duplicate,
-            matched=created,
-            unmatched=0,
-            skipped=skipped_duplicate,
-            county_id=county_id,
-        )
+        _total = created + skipped_duplicate
+        if _total:
+            record_scraper_stats(
+                source_type='insurance_claims',
+                total_scraped=_total,
+                matched=created,
+                unmatched=0,
+                skipped=skipped_duplicate,
+                county_id=county_id,
+                error_type="none",
+            )
+        elif fema_error:
+            # The FEMA IA fetch itself failed — this is NOT a confirmed
+            # no-data day, don't let it masquerade as one.
+            record_scraper_stats(
+                source_type='insurance_claims',
+                total_scraped=0,
+                matched=0,
+                unmatched=0,
+                skipped=0,
+                county_id=county_id,
+                run_success=False,
+                error_type="scraper_error",
+                error_message=fema_error[:500],
+            )
+        else:
+            record_scraper_stats(
+                source_type='insurance_claims',
+                total_scraped=0,
+                matched=0,
+                unmatched=0,
+                skipped=0,
+                county_id=county_id,
+                error_type="no_data",
+            )
     except Exception as stats_err:
         logger.warning("⚠ Could not record scraper stats (non-critical): %s", stats_err)
     return created

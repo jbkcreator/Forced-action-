@@ -102,7 +102,10 @@ def test_render_live_state_report_includes_the_one_number_placeholder():
         "migration_statuses": {"apply_x.py": "applied"},
     }
     beats = [CronBeat("violations", "hillsborough", 1500, datetime.now(timezone.utc), 10, False)]
-    silent = {"zero_ingest": [], "unscheduled": []}
+    silent = {
+        "zero_ingest": [], "zero_ingest_confirmed_no_data": [],
+        "zero_ingest_unexplained": [], "unscheduled": [],
+    }
 
     subject, body, html_body = render_live_state_report(
         deploy, beats, silent, report_date=date(2026, 7, 23),
@@ -129,6 +132,8 @@ def test_render_live_state_report_surfaces_stale_and_unrecognized():
     stale_beat = CronBeat("violations", "pinellas", 1500, None, None, True)
     silent = {
         "zero_ingest": [{"source_type": "permits", "county_id": "hillsborough", "total_scraped": 0}],
+        "zero_ingest_confirmed_no_data": [],
+        "zero_ingest_unexplained": [{"source_type": "permits", "county_id": "hillsborough", "total_scraped": 0}],
         "unscheduled": ["insurance_claims"],
     }
 
@@ -153,7 +158,10 @@ def test_render_live_state_report_never_run_beat_shows_never_run_not_minutes():
         "drift": "in_sync", "pending_migrations": [], "migration_statuses": {},
     }
     stale_beat = CronBeat("violations", "pinellas", 1500, None, None, True)
-    silent = {"zero_ingest": [], "unscheduled": []}
+    silent = {
+        "zero_ingest": [], "zero_ingest_confirmed_no_data": [],
+        "zero_ingest_unexplained": [], "unscheduled": [],
+    }
 
     body = render_live_state_report(deploy, [stale_beat], silent, report_date=date(2026, 7, 23))[1]
     assert "age=never run" in body
@@ -167,7 +175,10 @@ def test_render_live_state_report_formats_age_in_hours_not_raw_minutes():
     # 1834 minutes ago — should render as ~30.6h, not "1834 min".
     old = datetime.now(timezone.utc) - timedelta(minutes=1834)
     stale_beat = CronBeat("probate", "pinellas", 1500, old, 1834, True)
-    silent = {"zero_ingest": [], "unscheduled": []}
+    silent = {
+        "zero_ingest": [], "zero_ingest_confirmed_no_data": [],
+        "zero_ingest_unexplained": [], "unscheduled": [],
+    }
 
     body = render_live_state_report(deploy, [stale_beat], silent, report_date=date(2026, 7, 23))[1]
     assert "1834 min" not in body
@@ -213,7 +224,10 @@ def test_render_live_state_report_explains_missing_repo_dir_instead_of_bare_unkn
         "repo_dir": "/root/Forced-action-", "repo_dir_missing": True,
     }
     beats = []
-    silent = {"zero_ingest": [], "unscheduled": []}
+    silent = {
+        "zero_ingest": [], "zero_ingest_confirmed_no_data": [],
+        "zero_ingest_unexplained": [], "unscheduled": [],
+    }
 
     body, html_body = render_live_state_report(deploy, beats, silent, report_date=date(2026, 7, 23))[1:]
 

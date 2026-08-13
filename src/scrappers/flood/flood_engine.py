@@ -47,7 +47,7 @@ FLOOD_NWS_EVENTS = [
 ]
 
 
-def _fetch_fema_declarations(state: str, county_fips: str, start_date: date) -> List[Dict]:
+def _fetch_fema_declarations(state: str, county_fips: str, start_date: date) -> Tuple[List[Dict], Optional[str]]:
     """Fetch FEMA flood disaster declarations for a state/county since start_date."""
     url = (
         f"{_FEMA_DISASTERS_URL}"
@@ -58,13 +58,13 @@ def _fetch_fema_declarations(state: str, county_fips: str, start_date: date) -> 
     try:
         resp = requests.get(url, headers={"Accept": "application/json"}, timeout=15)
         resp.raise_for_status()
-        return resp.json().get("DisasterDeclarationsSummaries", [])
+        return resp.json().get("DisasterDeclarationsSummaries", []), None
     except Exception as e:
         logger.warning("[flood] FEMA disasters API failed: %s", e, exc_info=True)
-        return []
+        return [], str(e)
 
 
-def _fetch_nfip_claims(state: str, county_fips: str, start_date: date) -> List[Tuple[str, date]]:
+def _fetch_nfip_claims(state: str, county_fips: str, start_date: date) -> Tuple[List[Tuple[str, date]], Optional[str]]:
     """
     Fetch FEMA NFIP paid flood-claim records for a state/county since start_date.
     Returns distinct (zip, date_of_loss) pairs.
@@ -85,6 +85,7 @@ def _fetch_nfip_claims(state: str, county_fips: str, start_date: date) -> List[T
         f"&$top=1000&$format=json"
     )
     pairs = set()
+    error = None
     try:
         resp = requests.get(url, headers={"Accept": "application/json"}, timeout=20)
         resp.raise_for_status()
@@ -100,12 +101,17 @@ def _fetch_nfip_claims(state: str, county_fips: str, start_date: date) -> List[T
             pairs.add((str(zip_code)[:5], loss_date))
     except Exception as e:
         logger.warning("[flood] FEMA NFIP claims API failed: %s", e)
-    return sorted(pairs)
+        error = str(e)
+    return sorted(pairs), error
 
 
-def _fetch_nws_flood_alerts_by_zones(zone_ids: List[str]) -> List[Dict]:
-    """Fetch active NWS flood-event alert features for specific zone IDs."""
+def _fetch_nws_flood_alerts_by_zones(zone_ids: List[str]) -> Tuple[List[Dict], Optional[str]]:
+    """Fetch active NWS flood-event alert features for specific zone IDs.
+
+    Returns (features, error) — error is set only if EVERY zone failed.
+    """
     features = []
+    errors = []
     for zone_id in zone_ids:
         try:
             resp = requests.get(
@@ -120,7 +126,9 @@ def _fetch_nws_flood_alerts_by_zones(zone_ids: List[str]) -> List[Dict]:
                     features.append(feature)
         except Exception as e:
             logger.warning("[flood] NWS zone fetch failed for %s: %s", zone_id, e)
-    return features
+            errors.append(f"{zone_id}: {e}")
+    error = "; ".join(errors) if errors and len(errors) == len(zone_ids) else None
+    return features, error
 
 
 def _process_nfip_claims(db, county_id: str, claims: List[Tuple[str, date]]) -> Tuple[int, int, int]:
@@ -196,7 +204,7 @@ def scrape_flood_damage(
     # Source 1: FEMA disaster declarations — informational only (county-level,
     # no ZIP resolution → no incidents; see module docstring).
     county_fips3 = (fips[2:] if len(fips) >= 5 else fips).zfill(3)
-    all_declarations = _fetch_fema_declarations(state, county_fips3, start_date)
+    all_declarations, declarations_error = _fetch_fema_declarations(state, county_fips3, start_date)
     _FLOOD_INCIDENT_TYPES = {"Flood", "Hurricane", "Coastal Storm", "Severe Storm", "Typhoon"}
     fema_declarations = [
         d for d in all_declarations
@@ -215,7 +223,10 @@ def scrape_flood_damage(
     non_qualifying = 0
 
     # Source 2: NWS active flood alerts — idempotent backstop for nws_poll.
-    flood_features = _fetch_nws_flood_alerts_by_zones(nws_zones) if nws_zones else []
+    if nws_zones:
+        flood_features, flood_error = _fetch_nws_flood_alerts_by_zones(nws_zones)
+    else:
+        flood_features, flood_error = [], None
     if flood_features:
         from src.services.nws_webhook import process_alert
         with get_db_context() as db:
@@ -240,7 +251,7 @@ def scrape_flood_damage(
                     )
 
     # Source 3: FEMA NFIP paid claims → synthetic alerts + targeted tagging.
-    nfip_claims = _fetch_nfip_claims(state, fips, start_date)
+    nfip_claims, nfip_error = _fetch_nfip_claims(state, fips, start_date)
     if nfip_claims:
         with get_db_context() as db:
             n_new, n_dup, n_tagged = _process_nfip_claims(db, county_id, nfip_claims)
@@ -259,14 +270,47 @@ def scrape_flood_damage(
     )
     try:
         from src.utils.scraper_db_helper import record_scraper_stats
-        record_scraper_stats(
-            source_type='flood_damage',
-            total_scraped=len(flood_features) + len(nfip_claims),
-            matched=tagged,
-            unmatched=0,
-            skipped=duplicates,
-            county_id=county_id,
-        )
+        _total = len(flood_features) + len(nfip_claims)
+        # declarations_error deliberately excluded: FEMA disaster declarations
+        # are informational-only (never counted in _total, see module
+        # docstring), so a failure there alone must not mask a confirmed
+        # no-data day when NWS + NFIP — the two sources that DO count toward
+        # _total — both genuinely succeeded with zero results.
+        _fetch_error = flood_error or nfip_error
+        if _total:
+            record_scraper_stats(
+                source_type='flood_damage',
+                total_scraped=_total,
+                matched=tagged,
+                unmatched=0,
+                skipped=duplicates,
+                county_id=county_id,
+                error_type="none",
+            )
+        elif _fetch_error:
+            # A source fetch actually failed — this is NOT a confirmed
+            # no-data day, don't let it masquerade as one.
+            record_scraper_stats(
+                source_type='flood_damage',
+                total_scraped=0,
+                matched=0,
+                unmatched=0,
+                skipped=0,
+                county_id=county_id,
+                run_success=False,
+                error_type="scraper_error",
+                error_message=_fetch_error[:500],
+            )
+        else:
+            record_scraper_stats(
+                source_type='flood_damage',
+                total_scraped=0,
+                matched=0,
+                unmatched=0,
+                skipped=0,
+                county_id=county_id,
+                error_type="no_data",
+            )
     except Exception as stats_err:
         logger.warning("⚠ Could not record scraper stats (non-critical): %s", stats_err)
     return tagged
