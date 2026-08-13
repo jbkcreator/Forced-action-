@@ -52,40 +52,60 @@ class _FakeRefunds:
         return {"id": "re_fake_" + str(uuid.uuid4())[:8]}
 
 
-def _seed_zip(db, zip_code: str = "33601", status: str = "available") -> None:
-    """Ensure at least one zip_territories row exists for zip_code with the given status.
+def _seed_zip(
+    db,
+    zip_code: str = "33601",
+    status: str = "available",
+    *,
+    vertical: str = "general",
+    county_id: str = "1",
+) -> None:
+    """Upsert the specific (zip_code, vertical, county_id) territory row to `status`.
 
-    If real rows exist for the ZIP, updates ALL of them to the requested status.
-    If no real rows exist, inserts a minimal row so service guards see the intended status.
+    Scoped to one territory row so other verticals/counties for the same ZIP are
+    left untouched — the whole point of the bug #3 fix.
     """
-    updated = db.execute(
+    db.execute(
         text(
-            "UPDATE zip_territories SET status = :status, updated_at = NOW() "
-            "WHERE zip_code = :zip"
+            "INSERT INTO zip_territories "
+            "(zip_code, vertical, county_id, status, updated_at) "
+            "VALUES (:zip, :v, :c, :status, NOW()) "
+            "ON CONFLICT (zip_code, vertical, county_id) "
+            "DO UPDATE SET status = :status, updated_at = NOW()"
         ),
-        {"zip": zip_code, "status": status},
-    ).rowcount
-    if updated == 0:
-        db.execute(
-            text(
-                "INSERT INTO zip_territories "
-                "(zip_code, vertical, county_id, status, updated_at) "
-                "VALUES (:zip, 'general', 1, :status, NOW())"
-            ),
-            {"zip": zip_code, "status": status},
-        )
+        {"zip": zip_code, "v": vertical, "c": county_id, "status": status},
+    )
     db.flush()
 
 
-def _make_deal_room(db, zip_code: str = "33601", *, stripe_pi: str | None = None):
-    """Create a deal-room record, bypassing the ZIP guard by temporarily marking the ZIP available."""
-    # Temporarily ensure the ZIP is available so create_deal_room doesn't block.
-    _seed_zip(db, zip_code, "available")
+def _zip_status(db, zip_code, *, vertical="general", county_id="1"):
+    row = db.execute(
+        text(
+            "SELECT status FROM zip_territories "
+            "WHERE zip_code = :zip AND vertical = :v AND county_id = :c"
+        ),
+        {"zip": zip_code, "v": vertical, "c": county_id},
+    ).fetchone()
+    return row.status if row else None
+
+
+def _make_deal_room(
+    db,
+    zip_code: str = "33601",
+    *,
+    stripe_pi: str | None = None,
+    vertical: str = "general",
+    county_id: str = "1",
+):
+    """Create a deal-room record, seeding the specific territory row as available."""
+    _seed_zip(db, zip_code, "available", vertical=vertical, county_id=county_id)
     deal_room = create_deal_room(
         db,
         prospect_name="Test Prospect",
         prospect_email="prospect@example.com",
         zip_code=zip_code,
+        vertical=vertical,
+        county_id=county_id,
         tier="starter",
         job_value=5000.0,
         close_rate=0.3,
@@ -120,6 +140,8 @@ class TestCreateDealRoom:
                 prospect_name="Jane",
                 prospect_email="jane@example.com",
                 zip_code="33601",
+                vertical="general",
+                county_id="1",
                 tier="starter",
                 job_value=3000.0,
                 close_rate=0.25,
@@ -135,6 +157,8 @@ class TestCreateDealRoom:
                 prospect_name="Jane",
                 prospect_email="jane@example.com",
                 zip_code="33602",
+                vertical="general",
+                county_id="1",
                 tier="starter",
                 job_value=3000.0,
                 close_rate=0.25,
@@ -150,6 +174,8 @@ class TestCreateDealRoom:
                 prospect_name="Jane",
                 prospect_email="jane@example.com",
                 zip_code="99999",
+                vertical="general",
+                county_id="1",
                 tier="starter",
                 job_value=3000.0,
                 close_rate=0.25,
@@ -164,6 +190,8 @@ class TestCreateDealRoom:
             prospect_name="Bob",
             prospect_email="bob@example.com",
             zip_code="33603",
+            vertical="general",
+            county_id="1",
             tier="pro",
             job_value=8000.0,
             close_rate=0.4,
@@ -194,11 +222,8 @@ class TestApplyHoldPayment:
         assert dr.expires_at is not None
         assert dr.expires_at > dr.held_at
 
-        # ZIP status should be 'held'
-        row = fresh_db.execute(
-            text("SELECT status FROM zip_territories WHERE zip_code = '33610'")
-        ).fetchone()
-        assert row.status == "held"
+        # The exact (zip, vertical, county) territory should now be 'held'.
+        assert _zip_status(fresh_db, "33610") == "held"
 
         # No refund should have been issued
         assert len(stripe.refund_calls) == 0

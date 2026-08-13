@@ -485,6 +485,9 @@ def _on_checkout_completed(
                 )
                 _pi_id = _pi_id.get("id")
             if _pi_id:
+                # Store the PI only when none is recorded yet — a second, distinct
+                # PI must NOT clobber the original (apply_hold_payment refunds it
+                # as an overpayment instead). Bug #1.
                 db.execute(
                     text(
                         "UPDATE deal_rooms SET stripe_payment_intent_id = :pi "
@@ -493,7 +496,9 @@ def _on_checkout_completed(
                     {"pi": _pi_id, "token": _deal_room_token},
                 )
                 db.flush()
-            apply_hold_payment(db, stripe, token=_deal_room_token)
+            apply_hold_payment(
+                db, stripe, token=_deal_room_token, payment_intent_id=_pi_id,
+            )
         except Exception:
             logger.error(
                 "checkout.session.completed: hold deposit handler failed for token=%s",
@@ -908,11 +913,31 @@ def _on_checkout_completed(
     # rolls back this entire transaction — no subscriber, no account
     # activation, no MRR record for this event.
     from src.services.zip_territory import ZipTerritoryUnavailableError, claim_zip_territory
+
+    # Bug #4 — the holder converting their own 3m Deal-Room hold may claim the
+    # 'held' territory. Resolve the exact (zip, vertical, county) this hold token
+    # legitimately reserves (held, not expired) so ONLY that row is claimable
+    # from 'held'; every other 'held' row stays unavailable.
+    _held_ok: set = set()
+    _hold_token = meta.get("hold")
+    if _hold_token:
+        _held_row = db.execute(
+            text(
+                "SELECT zip_code, vertical, county_id FROM deal_rooms "
+                "WHERE token = :t AND held_at IS NOT NULL "
+                "AND (expires_at IS NULL OR expires_at > :now)"
+            ),
+            {"t": _hold_token, "now": now},
+        ).fetchone()
+        if _held_row is not None:
+            _held_ok.add((_held_row.zip_code, _held_row.vertical, _held_row.county_id))
+
     unclaimed = [
         zip_code for zip_code in zip_codes
         if not claim_zip_territory(
             db, zip_code=zip_code, vertical=vertical, county_id=county_id,
             subscriber_id=subscriber.id, now=now,
+            hold_ok=(zip_code, vertical, county_id) in _held_ok,
         )
     ]
     if unclaimed:
@@ -982,6 +1007,22 @@ def _on_checkout_completed(
     if locked_zips_out is not None:
         for _zip_code in zip_codes:
             locked_zips_out.append((_zip_code, vertical, county_id))
+
+    # Bug #2 — durably record the hold-refund obligation in THIS committed
+    # transaction. The actual Stripe refund is best-effort (deferred task below)
+    # but a crash/deploy before it runs no longer silently drops the refund:
+    # pending_refund_sweep retries any row left in 'pending'/'refund_failed'.
+    if _hold_token:
+        try:
+            with db.begin_nested():
+                from src.services.hold_lifecycle_service import mark_conversion_pending
+                mark_conversion_pending(db, token=_hold_token)
+        except Exception:
+            logger.error(
+                "checkout.session.completed: mark_conversion_pending failed for "
+                "hold_token=%s subscriber=%s — non-fatal (sweep is a further backstop)",
+                _hold_token, subscriber.id, exc_info=True,
+            )
 
     logger.info(
         "checkout.session.completed: fast path done — subscriber=%s tier=%s vertical=%s"

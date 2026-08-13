@@ -57,6 +57,19 @@ def _slack_alert(metric_name: str, severity: str, action_summary: str, **extra: 
         logger.warning("[hold_lifecycle] Slack alert failed", exc_info=True)
 
 
+def _issue_refund(stripe_client: Any, pi_id: str) -> None:
+    """Issue an idempotent Stripe refund for a PaymentIntent.
+
+    The idempotency_key is derived from the PI, so retrying a refund (e.g. the
+    durable pending-refund sweep re-running after a crash) never double-refunds.
+    Raises on Stripe failure — callers decide how to record it.
+    """
+    stripe_client.refunds.create(
+        payment_intent=pi_id,
+        idempotency_key=f"hold-refund-{pi_id}",
+    )
+
+
 def _refund_hold(db: Session, stripe_client: Any, deal_room: DealRoom) -> None:
     """Issue a Stripe refund for the hold PaymentIntent.
 
@@ -84,7 +97,7 @@ def _refund_hold(db: Session, stripe_client: Any, deal_room: DealRoom) -> None:
         return
 
     try:
-        stripe_client.refunds.create(payment_intent=pi_id)
+        _issue_refund(stripe_client, pi_id)
         deal_room.refund_status = "refunded"
         db.flush()
         logger.info(
@@ -123,6 +136,8 @@ def create_deal_room(
     prospect_name: str,
     prospect_email: str,
     zip_code: str,
+    vertical: str,
+    county_id: str,
     tier: str,
     job_value: float,
     close_rate: float,
@@ -130,36 +145,34 @@ def create_deal_room(
 ) -> DealRoom:
     """Create a deal-room record for a prospect.
 
-    Raises HTTPException(409) if the ZIP is not 'available'.
+    A hold is scoped to one (zip_code, vertical, county_id) territory row — other
+    verticals/counties for the same ZIP are independent and must be unaffected.
+    Raises HTTPException(409) if THAT specific territory row is not 'available'.
     The caller is responsible for building the properties_snapshot before calling.
     """
-    # Block if the ZIP doesn't exist at all, or if ANY territory row is non-available
-    # (held/locked/grace means someone already has or is closing on this ZIP).
-    any_row = db.execute(
-        text("SELECT status FROM zip_territories WHERE zip_code = :zip LIMIT 1"),
-        {"zip": zip_code},
-    ).fetchone()
-
-    if any_row is None:
-        raise HTTPException(
-            status_code=409,
-            detail=f"ZIP {zip_code} is not available for a hold deposit (current status: not_found).",
-        )
-
-    blocked_row = db.execute(
+    territory = db.execute(
         text(
             "SELECT status FROM zip_territories "
-            "WHERE zip_code = :zip AND status != 'available' LIMIT 1"
+            "WHERE zip_code = :zip AND vertical = :v AND county_id = :c LIMIT 1"
         ),
-        {"zip": zip_code},
+        {"zip": zip_code, "v": vertical, "c": county_id},
     ).fetchone()
 
-    if blocked_row is not None:
+    if territory is None:
         raise HTTPException(
             status_code=409,
             detail=(
-                f"ZIP {zip_code} is not available for a hold deposit "
-                f"(current status: {blocked_row.status})."
+                f"ZIP {zip_code} ({vertical}/{county_id}) is not available for a "
+                "hold deposit (current status: not_found)."
+            ),
+        )
+
+    if territory.status != "available":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"ZIP {zip_code} ({vertical}/{county_id}) is not available for a "
+                f"hold deposit (current status: {territory.status})."
             ),
         )
 
@@ -168,6 +181,8 @@ def create_deal_room(
         prospect_name=prospect_name,
         prospect_email=prospect_email,
         zip_code=zip_code,
+        vertical=vertical,
+        county_id=county_id,
         tier=tier,
         job_value=job_value,
         close_rate=close_rate,
@@ -176,21 +191,31 @@ def create_deal_room(
     db.add(deal_room)
     db.flush()
     logger.info(
-        "[hold_lifecycle] DealRoom created: token=%s ZIP=%s tier=%s",
+        "[hold_lifecycle] DealRoom created: token=%s ZIP=%s vertical=%s county=%s tier=%s",
         deal_room.token,
         zip_code,
+        vertical,
+        county_id,
         tier,
     )
     return deal_room
 
 
-def apply_hold_payment(db: Session, stripe_client: Any, *, token: str) -> bool:
+def apply_hold_payment(
+    db: Session, stripe_client: Any, *, token: str, payment_intent_id: str | None = None
+) -> bool:
     """Process a confirmed hold-deposit payment.
 
-    Atomically flips zip_territories.status from 'available' → 'held'.
+    Atomically flips the (zip_code, vertical, county_id) territory row from
+    'available' → 'held' — never the whole ZIP.
     Winner (rowcount=1): sets held_at + expires_at, fires Slack, returns True.
     Loser (rowcount=0): refunds the deposit (race carve-out), returns False.
-    Idempotent: if held_at is already set (duplicate webhook), returns True immediately.
+
+    Idempotency / double-charge guard (bug #1): if the room is already held,
+    compare the incoming PaymentIntent to the recorded one. Same PI (duplicate
+    webhook) → no-op True. A *different* paid PI is an OVERPAYMENT — refund the
+    incoming PI without clobbering the original — and still returns True (the
+    hold itself stands).
     """
     deal_room: DealRoom | None = db.execute(
         text("SELECT * FROM deal_rooms WHERE token = :token"),
@@ -204,21 +229,69 @@ def apply_hold_payment(db: Session, stripe_client: Any, *, token: str) -> bool:
     # Re-fetch as ORM instance to mutate
     deal_room_obj: DealRoom = db.get(DealRoom, deal_room.id)  # type: ignore[arg-type]
 
-    # Idempotency guard — duplicate webhook
+    # Idempotency / overpayment guard — room already held
     if deal_room_obj.held_at is not None:
+        recorded_pi = deal_room_obj.stripe_payment_intent_id
+        if (
+            payment_intent_id
+            and recorded_pi
+            and payment_intent_id != recorded_pi
+        ):
+            logger.warning(
+                "[hold_lifecycle] apply_hold_payment: token %s already held with PI %s — "
+                "incoming PI %s is an OVERPAYMENT, refunding it (original untouched)",
+                token, recorded_pi, payment_intent_id,
+            )
+            _slack_alert(
+                metric_name="hold_overpayment",
+                severity="warning",
+                action_summary=(
+                    f"Overpayment on deal_room {token} (ZIP {deal_room_obj.zip_code}): "
+                    f"second PaymentIntent {payment_intent_id} refunded; original hold "
+                    f"PI {recorded_pi} kept."
+                ),
+                action_taken="overpayment_refund",
+            )
+            try:
+                _issue_refund(stripe_client, payment_intent_id)
+            except Exception:
+                logger.error(
+                    "[hold_lifecycle] apply_hold_payment: overpayment refund FAILED for "
+                    "token %s PI %s — manual refund required",
+                    token, payment_intent_id, exc_info=True,
+                )
+                _slack_alert(
+                    metric_name="hold_overpayment_refund_failure",
+                    severity="critical",
+                    action_summary=(
+                        f"Overpayment refund FAILED for deal_room {token} "
+                        f"(PI {payment_intent_id}). Manual refund required."
+                    ),
+                    action_taken="overpayment_refund_failed",
+                )
+            return True
         logger.info(
             "[hold_lifecycle] apply_hold_payment: token %s already held — idempotent no-op",
             token,
         )
         return True
 
+    # Record the PI that is paying for this hold if not already stored.
+    if payment_intent_id and not deal_room_obj.stripe_payment_intent_id:
+        deal_room_obj.stripe_payment_intent_id = payment_intent_id
+
     now = _now()
     result = db.execute(
         text(
             "UPDATE zip_territories SET status = 'held' "
-            "WHERE zip_code = :zip AND status = 'available'"
+            "WHERE zip_code = :zip AND vertical = :v AND county_id = :c "
+            "AND status = 'available'"
         ),
-        {"zip": deal_room_obj.zip_code},
+        {
+            "zip": deal_room_obj.zip_code,
+            "v": deal_room_obj.vertical,
+            "c": deal_room_obj.county_id,
+        },
     )
     rows_affected = result.rowcount
 
@@ -282,7 +355,7 @@ def expire_holds(db: Session, stripe_client: Any) -> int:
     expired_rows = db.execute(
         text(
             """
-            SELECT id, token, zip_code, prospect_email, expires_at
+            SELECT id, token, zip_code, vertical, county_id, prospect_email, expires_at
             FROM deal_rooms
             WHERE expires_at < :now
               AND held_at IS NOT NULL
@@ -296,17 +369,17 @@ def expire_holds(db: Session, stripe_client: Any) -> int:
     if not expired_rows:
         return 0
 
-    zip_codes = [row.zip_code for row in expired_rows]
-    expired_ids = [row.id for row in expired_rows]
-
-    # Batch-release all expired ZIPs in one UPDATE
-    db.execute(
-        text(
-            "UPDATE zip_territories SET status = 'available' "
-            "WHERE zip_code = ANY(:zips) AND status = 'held'"
-        ),
-        {"zips": zip_codes},
-    )
+    # Release only the exact (zip, vertical, county) each hold reserved — never
+    # every row for the ZIP (other verticals/counties are independent holds).
+    for row in expired_rows:
+        db.execute(
+            text(
+                "UPDATE zip_territories SET status = 'available' "
+                "WHERE zip_code = :zip AND vertical = :v AND county_id = :c "
+                "AND status = 'held'"
+            ),
+            {"zip": row.zip_code, "v": row.vertical, "c": row.county_id},
+        )
 
     db.flush()
 
@@ -357,3 +430,75 @@ def refund_on_conversion(db: Session, stripe_client: Any, *, token: str) -> None
     deal_room_obj.converted_at = _now()
     db.flush()
     _refund_hold(db, stripe_client, deal_room_obj)
+
+
+def mark_conversion_pending(db: Session, *, token: str) -> bool:
+    """Durably mark a hold as converted with a refund owed — no Stripe call.
+
+    Called SYNCHRONOUSLY in the committed webhook path when a hold converts, so
+    the refund obligation survives a crash/deploy that kills the best-effort
+    deferred BackgroundTask (bug #2). The actual refund is issued either by the
+    deferred task (fast path) or by pending_refund_sweep (durable retry).
+
+    Sets converted_at (if unset) and refund_status='pending' unless the deposit
+    is already 'refunded'. Returns True if a pending refund is now owed.
+    """
+    deal_room: DealRoom | None = db.execute(
+        text("SELECT * FROM deal_rooms WHERE token = :token"),
+        {"token": token},
+    ).fetchone()
+
+    if deal_room is None:
+        logger.error("[hold_lifecycle] mark_conversion_pending: unknown token %s", token)
+        return False
+
+    deal_room_obj: DealRoom = db.get(DealRoom, deal_room.id)  # type: ignore[arg-type]
+
+    if deal_room_obj.converted_at is None:
+        deal_room_obj.converted_at = _now()
+
+    if deal_room_obj.refund_status == "refunded":
+        db.flush()
+        return False
+
+    deal_room_obj.refund_status = "pending"
+    db.flush()
+    logger.info(
+        "[hold_lifecycle] mark_conversion_pending: token %s marked pending refund",
+        token,
+    )
+    return True
+
+
+def sweep_pending_refunds(db: Session, stripe_client: Any) -> int:
+    """Durably retry hold-deposit refunds owed but not yet confirmed.
+
+    Picks up every converted deal_room stuck in refund_status IN
+    ('pending', 'refund_failed') and re-attempts the refund. Idempotent: the
+    Stripe refund carries a PI-derived idempotency_key, so a refund that already
+    succeeded (but whose 'refunded' write was lost) is never double-issued.
+    Returns the number of rows processed.
+    """
+    pending_rows = db.execute(
+        text(
+            """
+            SELECT id, token
+            FROM deal_rooms
+            WHERE refund_status IN ('pending', 'refund_failed')
+              AND converted_at IS NOT NULL
+            """
+        ),
+    ).fetchall()
+
+    if not pending_rows:
+        return 0
+
+    processed = 0
+    for row in pending_rows:
+        deal_room_obj: DealRoom = db.get(DealRoom, row.id)  # type: ignore[arg-type]
+        _refund_hold(db, stripe_client, deal_room_obj)
+        processed += 1
+
+    db.flush()
+    logger.info("[hold_lifecycle] sweep_pending_refunds: processed %d row(s)", processed)
+    return processed

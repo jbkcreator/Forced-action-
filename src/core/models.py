@@ -1478,6 +1478,10 @@ class DealRoom(Base):
     prospect_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     prospect_email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     zip_code: Mapped[Optional[str]] = mapped_column(String(10), nullable=True, index=True)
+    # Territory scope — a hold is on one (zip_code, vertical, county_id) row of
+    # zip_territories, never the whole ZIP (one ZIP has many vertical/county rows).
+    vertical: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)
+    county_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     tier: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
 
     # Economics shown in the room (point-in-time snapshot)
@@ -1495,7 +1499,9 @@ class DealRoom(Base):
     # Stripe hold payment intent — populated by the webhook after payment
     stripe_payment_intent_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
 
-    # Refund state: null = not yet refunded, 'refunded' = successful, 'refund_failed' = failed
+    # Refund state: null = not yet refunded, 'pending' = conversion recorded but
+    # refund not yet confirmed (durable — swept by pending_refund_sweep),
+    # 'refunded' = successful, 'refund_failed' = failed (retried by the sweep).
     refund_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True, default=None)
 
     created_at: Mapped[datetime] = mapped_column(
@@ -1504,7 +1510,7 @@ class DealRoom(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "refund_status IS NULL OR refund_status IN ('refunded', 'refund_failed')",
+            "refund_status IS NULL OR refund_status IN ('pending', 'refunded', 'refund_failed')",
             name="check_deal_room_refund_status",
         ),
     )

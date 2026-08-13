@@ -14,14 +14,15 @@ from typing import Any, Dict, List, Literal, Optional
 import secrets
 
 from fastapi import APIRouter, Depends, Header, HTTPException
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from config.settings import get_settings
-from src.api.deps import get_db
+from src.api.deps import VALID_VERTICALS, get_db
 from src.services.hold_lifecycle_service import create_deal_room
 from src.services.lead_pool_service import get_lead_pool
+from src.services import pricing_truth
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +136,22 @@ def get_deal_room(token: str, db: Session = Depends(get_db)) -> Dict[str, Any]:
     Performs a live ZIP property query on every call. The properties_snapshot
     audit column is never included in the response.
     """
+    try:
+        pt_result = pricing_truth.check()
+        if not pt_result.get("ok"):
+            raise HTTPException(
+                status_code=503,
+                detail={"detail": "Pricing inconsistency detected", "mismatches": pt_result.get("mismatches", [])},
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.error("[deal_room] pricing_truth.check raised unexpectedly", exc_info=True)
+        raise HTTPException(
+            status_code=503,
+            detail={"detail": "Pricing inconsistency detected", "mismatches": []},
+        )
+
     row = db.execute(
         text(
             """
@@ -216,9 +233,20 @@ class _CreateDealRoomRequest(BaseModel):
     prospect_name: str = Field(..., min_length=1)
     prospect_email: EmailStr
     zip_code: str = Field(..., pattern=r"^\d{5}$")
+    # A hold is on one (zip, vertical, county) territory — vertical is required,
+    # county defaults to hillsborough (the only launched county today).
+    vertical: str = Field(..., min_length=1)
+    county_id: str = Field(default="hillsborough", min_length=1)
     tier: Literal["starter", "pro", "founder"]
     job_value: float = Field(..., gt=0)
     close_rate: float = Field(..., gt=0, le=1)
+
+    @field_validator("vertical")
+    @classmethod
+    def _validate_vertical(cls, v: str) -> str:
+        if v not in VALID_VERTICALS:
+            raise ValueError(f"Unknown vertical: {v!r}")
+        return v
 
 
 class _CreateDealRoomResponse(BaseModel):
@@ -248,6 +276,8 @@ def demo_create_deal_room(
         prospect_name=body.prospect_name,
         prospect_email=str(body.prospect_email),
         zip_code=body.zip_code,
+        vertical=body.vertical,
+        county_id=body.county_id,
         tier=body.tier,
         job_value=body.job_value,
         close_rate=body.close_rate,
@@ -259,13 +289,16 @@ def demo_create_deal_room(
     token = deal_room.token
 
     logger.info(
-        "[deal_room] demo created deal_room token=%s ZIP=%s tier=%s",
-        token, body.zip_code, body.tier,
+        "[deal_room] demo created deal_room token=%s ZIP=%s vertical=%s county=%s tier=%s",
+        token, body.zip_code, body.vertical, body.county_id, body.tier,
     )
 
     return _CreateDealRoomResponse(
         deal_room_url=f"{base}/deal-room/{token}",
-        prefilled_checkout_url=f"{base}/?start_tier={body.tier}&zip={body.zip_code}&hold={token}",
+        prefilled_checkout_url=(
+            f"{base}/?start_tier={body.tier}&zip={body.zip_code}"
+            f"&vertical={body.vertical}&county={body.county_id}&hold={token}"
+        ),
     )
 
 
