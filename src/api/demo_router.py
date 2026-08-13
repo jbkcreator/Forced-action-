@@ -17,7 +17,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 from src.api.deps import VALID_VERTICALS, ZIP_RE, get_db, resolve_phone_with_quality
@@ -97,7 +97,7 @@ def zip_reveal(
                   AND county_id = :county_id
                 GROUP BY property_id
             )
-            SELECT DISTINCT ON (p.id)
+            SELECT
                 p.id          AS property_id,
                 p.address,
                 p.city,
@@ -115,7 +115,7 @@ def zip_reveal(
               AND p.county_id = :county_id
               AND ds.qualified = true
               AND ds.is_guess_lead = false
-            ORDER BY p.id, ds.final_cds_score DESC NULLS LAST
+            ORDER BY ds.final_cds_score DESC NULLS LAST
             LIMIT 25
             """),
             {"zip_code": zip_code, "county_id": county_id, "days": days},
@@ -140,9 +140,6 @@ def zip_reveal(
             "cds_score":      float(r.final_cds_score or 0),
             "scored_at":      r.score_date.isoformat() if r.score_date else None,
         })
-
-    # Sort by score descending after dedup (DISTINCT ON preserves insertion order)
-    leads.sort(key=lambda x: x["cds_score"], reverse=True)
 
     return {"zip_code": zip_code, "county_id": county_id, "total": len(leads), "leads": leads}
 
@@ -180,6 +177,7 @@ def prepare_call(
                 DemoSession.subscriber_id == sub.id,
                 DemoSession.zip_code == body.zip_code,
                 DemoSession.vertical == body.vertical,
+                DemoSession.county_id == body.county_id,
                 DemoSession.created_at >= cutoff,
             )
             .order_by(DemoSession.created_at.desc())
@@ -229,11 +227,23 @@ def _find_featured_lead(db, zip_code: Optional[str], vertical: str, county_id: s
     cutoff = datetime.now(timezone.utc) - timedelta(days=_FEATURED_LEAD_DAYS)
     contact_clause = has_contact_filter(get_settings())
 
+    # Subquery: latest score_date per property in the window.
+    # Without this, an older Gold row can be selected even when the property
+    # was later downgraded or disqualified on a subsequent scoring run.
+    latest_sq = (
+        select(
+            DistressScore.property_id,
+            func.max(DistressScore.score_date).label("max_date"),
+        )
+        .where(DistressScore.score_date >= cutoff)
+        .group_by(DistressScore.property_id)
+        .subquery()
+    )
+
     filters = [
         DistressScore.lead_tier.in_(GOLD_PLUS_TIERS),
         DistressScore.qualified == True,  # noqa: E712
         DistressScore.is_guess_lead == False,  # noqa: E712
-        DistressScore.score_date >= cutoff,
         Property.county_id == county_id,
     ]
     if zip_code:
@@ -244,6 +254,11 @@ def _find_featured_lead(db, zip_code: Optional[str], vertical: str, county_id: s
     row = db.execute(
         select(Property, DistressScore)
         .join(DistressScore, DistressScore.property_id == Property.id)
+        .join(
+            latest_sq,
+            (latest_sq.c.property_id == DistressScore.property_id)
+            & (latest_sq.c.max_date == DistressScore.score_date),
+        )
         .outerjoin(Owner, Owner.property_id == Property.id)
         .where(*filters)
         .order_by(*phone_priority_order(score_col))
