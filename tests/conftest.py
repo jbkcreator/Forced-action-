@@ -80,12 +80,18 @@ def fresh_db(pg_engine):
     """
     Fresh DB session per test — uses real Postgres, rolls back after each test.
     Skips if Postgres is not available.
+
+    SA 2.0 pattern: bind the Session to a connection-level transaction so that
+    all ORM flushes and raw text() executes share one connection, and the outer
+    rollback undoes everything regardless of flush calls inside service functions.
     """
     if pg_engine is None:
         pytest.skip("DATABASE_URL not configured — skipping ORM test")
-    Session = sessionmaker(bind=pg_engine)
-    session = Session()
-    session.begin_nested()
+    from sqlalchemy.orm import Session as SASession
+    connection = pg_engine.connect()
+    trans = connection.begin()
+    session = SASession(bind=connection)
     yield session
-    session.rollback()
     session.close()
+    trans.rollback()
+    connection.close()

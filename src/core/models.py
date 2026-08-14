@@ -1434,7 +1434,7 @@ class ZipTerritory(Base):
 
     # Ownership
     subscriber_id: Mapped[Optional[int]] = mapped_column(ForeignKey("subscribers.id"), nullable=True, index=True)
-    status: Mapped[str] = mapped_column(String(20), default='available', nullable=False)  # available | locked | grace
+    status: Mapped[str] = mapped_column(String(20), default='available', nullable=False)  # available | locked | grace | held
 
     # Timing
     locked_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
@@ -1455,11 +1455,68 @@ class ZipTerritory(Base):
         UniqueConstraint("zip_code", "vertical", "county_id", name="uq_zip_vertical_county"),
         Index("idx_zip_territory_status", "status"),
         Index("idx_zip_territory_county_id", "county_id"),
-        CheckConstraint("status IN ('available', 'locked', 'grace')", name="check_zip_status"),
+        CheckConstraint("status IN ('available', 'locked', 'grace', 'held')", name="check_zip_status"),
     )
 
     def __repr__(self):
         return f"<ZipTerritory(zip='{self.zip_code}', vertical='{self.vertical}', status='{self.status}')>"
+
+
+class DealRoom(Base):
+    """
+    One deal-room session per prospect hold-deposit interaction.
+    Created when a prospect pays a refundable deposit to hold a ZIP while
+    evaluating a deal room. Audit-only — the properties_snapshot is never
+    mutated after creation.
+    """
+    __tablename__ = "deal_rooms"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    token: Mapped[str] = mapped_column(PG_UUID(as_uuid=False), nullable=False, unique=True)
+
+    # Prospect identity
+    prospect_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    prospect_email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    zip_code: Mapped[Optional[str]] = mapped_column(String(10), nullable=True, index=True)
+    # Territory scope — a hold is on one (zip_code, vertical, county_id) row of
+    # zip_territories, never the whole ZIP (one ZIP has many vertical/county rows).
+    vertical: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)
+    county_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    tier: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+
+    # Economics shown in the room (point-in-time snapshot)
+    job_value: Mapped[Optional[Decimal]] = mapped_column(Numeric, nullable=True)
+    close_rate: Mapped[Optional[Decimal]] = mapped_column(Numeric, nullable=True)
+
+    # Audit snapshot of leads shown — never mutated post-creation
+    properties_snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False)
+
+    # Hold lifecycle
+    held_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    converted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Stripe hold payment intent — populated by the webhook after payment
+    stripe_payment_intent_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
+
+    # Refund state: null = not yet refunded, 'pending' = conversion recorded but
+    # refund not yet confirmed (durable — swept by pending_refund_sweep),
+    # 'refunded' = successful, 'refund_failed' = failed (retried by the sweep).
+    refund_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True, default=None)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "refund_status IS NULL OR refund_status IN ('pending', 'refunded', 'refund_failed')",
+            name="check_deal_room_refund_status",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return f"<DealRoom(id={self.id}, zip='{self.zip_code}', token='{self.token}', refund_status={self.refund_status!r})>"
 
 
 class SentLead(Base):
