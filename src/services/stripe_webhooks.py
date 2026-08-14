@@ -322,6 +322,7 @@ def handle_webhook(raw_body: bytes, sig_header: str, db: Session, background_tas
 
     handlers = {
         "checkout.session.completed":    _on_checkout_completed,
+        "invoice.paid":                  _on_payment_succeeded,
         "invoice.payment_succeeded":     _on_payment_succeeded,
         "invoice.payment_failed":        _on_payment_failed,
         "customer.subscription.updated": _on_subscription_updated,
@@ -517,6 +518,12 @@ def _on_checkout_completed(
     # needs it) then delegate to apply_hold_payment for the atomic ZIP-flip.
     _deal_room_token = meta.get("deal_room_token")
     if _deal_room_token and session.get("mode") == "payment":
+        if not session.get("livemode", True):
+            logger.warning(
+                "checkout.session.completed: skipping hold deposit — test-mode Stripe event for token=%s",
+                _deal_room_token,
+            )
+            return
         try:
             from src.services.hold_lifecycle_service import apply_hold_payment
             _pi_id = session.get("payment_intent")
