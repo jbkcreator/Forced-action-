@@ -1133,40 +1133,12 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
             },
         )
 
-    if payload.consent_acceptance and payload.consent_acceptance.terms_accepted:
-        try:
-            from datetime import datetime
-
-            def _parse_iso_co(s):
-                if not s:
-                    return None
-                try:
-                    return datetime.fromisoformat(s.replace("Z", "+00:00"))
-                except (ValueError, TypeError):
-                    return None
-
-            _co_tcpa = bool(payload.consent_acceptance.tcpa_accepted)
-            ca = ConsentAcceptance(
-                email=payload.email,
-                terms_version=payload.consent_acceptance.terms_version or "2026.06",
-                privacy_version=payload.consent_acceptance.privacy_version or "2026.06",
-                accepted_at=datetime.now(timezone.utc),
-                source_flow="checkout",
-                user_agent=payload.consent_acceptance.user_agent,
-                modal_opened_at=_parse_iso_co(payload.consent_acceptance.modal_opened_at),
-                modal_scrolled_to_end_at=_parse_iso_co(payload.consent_acceptance.modal_scrolled_to_end_at),
-                accepted_text_hash=payload.consent_acceptance.accepted_text_hash or "",
-                tcpa_consent_text=payload.consent_acceptance.tcpa_consent_text if _co_tcpa else None,
-                tcpa_consent_version=payload.consent_acceptance.tcpa_consent_version if _co_tcpa else None,
-                tcpa_checked_at=datetime.now(timezone.utc) if _co_tcpa else None,
-                consent_scope="marketing" if _co_tcpa else None,
-                not_condition_of_purchase_ack=_co_tcpa or None,
-                county_id=payload.county_id,
-            )
-            db.add(ca)
-            db.commit()
-        except Exception:
-            logger.warning("ConsentAcceptance write failed in checkout (non-fatal):", exc_info=True)
+    # Consent is persisted once, after the Stripe session exists, so the row
+    # carries checkout_session_id (for webhook subscriber-linking) and the
+    # resolved voice-consent fields (B0-06). See the write block below the
+    # stripe.checkout.Session.create call — do not add an earlier duplicate
+    # write here, or two source_flow='checkout' rows are created and the voice
+    # consent lands on only one of them.
 
     # Cohort-adjusted pricing: /api/zip-check shows the customer a cohort price
     # when one is active for this county+vertical+tier. Resolve the same cohort
