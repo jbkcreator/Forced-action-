@@ -961,13 +961,18 @@ def _on_checkout_completed(
     _held_ok: set = set()
     _hold_token = meta.get("hold")
     if _hold_token:
+        # Use a 2-minute grace window so a session completed seconds before
+        # expiry isn't rejected by a webhook that arrives seconds after.
+        # Stripe's webhook delivery SLA is well under 2 minutes, so the
+        # window is tight enough not to allow genuinely expired holds through.
+        _hold_grace_cutoff = now - timedelta(minutes=2)
         _held_row = db.execute(
             text(
                 "SELECT zip_code, vertical, county_id FROM deal_rooms "
                 "WHERE token = :t AND held_at IS NOT NULL "
-                "AND (expires_at IS NULL OR expires_at > :now)"
+                "AND (expires_at IS NULL OR expires_at > :grace)"
             ),
-            {"t": _hold_token, "now": now},
+            {"t": _hold_token, "grace": _hold_grace_cutoff},
         ).fetchone()
         if _held_row is not None:
             _held_ok.add((_held_row.zip_code, _held_row.vertical, _held_row.county_id))
