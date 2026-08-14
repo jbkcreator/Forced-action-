@@ -301,7 +301,10 @@ def test_stripe_webhook_link_is_idempotent_on_replay(fresh_db):
 # This IS the Definition of Done for B0-06.
 
 def _make_sub_profile(sub_id=1, phone="+13135550101", vertical="roofing"):
-    return {"id": sub_id, "name": "Test User", "phone": phone, "vertical": vertical}
+    return {
+        "id": sub_id, "name": "Test User", "phone": phone,
+        "vertical": vertical, "ghl_contact_id": "ghl_123",
+    }
 
 
 def _settings_mock(agent_id="agent_123"):
@@ -314,8 +317,7 @@ def _settings_mock(agent_id="agent_123"):
     return s
 
 
-def _invoke_voice_drop(*, has_voice_consent, call_id="c1"):
-    import sys
+def _invoke_voice_drop(*, has_voice_consent):
     from unittest.mock import MagicMock
     from src.agents.graphs import synthflow_voice_drop as vd
     from src.services.compliance_gator import ComplianceResult
@@ -325,12 +327,9 @@ def _invoke_voice_drop(*, has_voice_consent, call_id="c1"):
     db_ctx.__enter__ = MagicMock(return_value=db_ctx)
     db_ctx.__exit__ = MagicMock(return_value=False)
     db_ctx.execute.return_value.first.return_value = None  # no recent dedup drop
-    db_ctx.add = MagicMock()
-    db_ctx.commit = MagicMock()
 
     hierarchy_result = {"action_allowed": True, "kill_switch_color": "green"}
-    sms_module = MagicMock()
-    sms_module.send_sms = MagicMock(return_value=True)
+    apply_tags = MagicMock(return_value=True)
 
     with patch("src.agents.tools.read_tools.get_subscriber_profile", return_value=profile), \
          patch.object(vd, "get_subscriber_profile", return_value=profile), \
@@ -338,10 +337,7 @@ def _invoke_voice_drop(*, has_voice_consent, call_id="c1"):
          patch.object(vd, "run_decision_hierarchy", return_value=hierarchy_result), \
          patch.object(vd, "validate_outbound", return_value=ComplianceResult(allowed=True)), \
          patch.object(vd, "has_voice_consent", return_value=has_voice_consent), \
-         patch.object(vd, "initiate_call", return_value=call_id) as mock_initiate, \
-         patch("src.services.allotment_engine.consume", return_value=True), \
-         patch.object(vd, "allotment_consume", return_value=True), \
-         patch.dict(sys.modules, {"src.services.sms_compliance": sms_module}), \
+         patch("src.services.synthflow_service._apply_tags_to_contact", apply_tags), \
          patch("config.settings.get_settings", return_value=_settings_mock()):
         graph = vd.build_synthflow_voice_drop_graph().compile()
         result = graph.invoke({
@@ -350,22 +346,27 @@ def _invoke_voice_drop(*, has_voice_consent, call_id="c1"):
             "event_type": "high_intent_no_convert",
             "event_payload": {"vertical": "roofing"},
         })
-    result["_initiate_mock"] = mock_initiate
+    result["_apply_tags"] = apply_tags
     return result
 
 
 def test_voice_drop_aborts_without_voice_consent():
     result = _invoke_voice_drop(has_voice_consent=False)
     assert result["terminal_status"] == "aborted"
+    assert result["sent"] is False
     assert result["failure_reason"] == "voice_consent_required"
-    result["_initiate_mock"].assert_not_called()
+    result["_apply_tags"].assert_not_called()
 
 
-def test_voice_drop_proceeds_with_voice_consent():
+def test_voice_drop_never_dials_even_with_voice_consent():
+    # 3f policy: the score-based drop is blocked entirely and always routed to
+    # the human-dial queue — an AI call never fires, consent or not.
     result = _invoke_voice_drop(has_voice_consent=True)
-    assert result["sent"] is True
-    assert result["call_id"] == "c1"
-    result["_initiate_mock"].assert_called_once()
+    assert result["terminal_status"] == "aborted"
+    assert result["sent"] is False
+    assert result["call_id"] is None
+    assert result["failure_reason"] == "compliance:cold_dial_human_only"
+    result["_apply_tags"].assert_called_once_with("ghl_123", ["cold_dial_human_required"])
 
 
 # ── the real consent query, exercised against a real DB ─────────────────────

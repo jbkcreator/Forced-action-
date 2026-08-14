@@ -96,8 +96,11 @@ class TestVoiceDropGraph:
         assert "dedup" in result.get("failure_reason", "")
 
     def test_followup_sms_skipped_when_human_routed(self):
+        # The drop always terminates at the human-routing abort, so the
+        # follow-up SMS node short-circuits on terminal_status and never sends.
         result = self._invoke()
-        assert result.get("followup_skipped_reason") == "voice_drop_not_sent"
+        assert result["terminal_status"] == "aborted"
+        assert result.get("followup_sent") is not True
 
     def test_compliance_gate_still_blocks_before_tagging(self):
         result = self._invoke(compliance_allowed=False)
