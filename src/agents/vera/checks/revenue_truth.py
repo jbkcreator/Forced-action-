@@ -381,6 +381,18 @@ def _db_mrr(session) -> tuple:
     return total_cents, int(null_count or 0)
 
 
+def _test_customer_ids(session) -> set:
+    """stripe_customer_id set for is_test subscribers — internal/QA accounts
+    (see src/utils/test_account.py) that may hold a real live-mode Stripe
+    subscription. DB MRR already excludes them via is_test IS NOT TRUE; the
+    Stripe pull has no such filter (Stripe doesn't know about our is_test
+    flag), so _stripe_mrr excludes them here to match."""
+    rows = session.execute(
+        text("SELECT stripe_customer_id FROM subscribers WHERE is_test IS TRUE AND stripe_customer_id IS NOT NULL")
+    ).scalars().all()
+    return set(rows)
+
+
 def _stripe_mrr(active_subs_by_customer: dict) -> int:
     """Sum normalized_monthly_price() across each active subscription's first
     line item — same field-access pattern as price_escalation.py:128."""
@@ -408,6 +420,7 @@ def check_mrr(active_subs_by_customer: Optional[dict]) -> MrrResult:
     as a false drift/churn signal."""
     with vera_db.session_scope() as session:
         db_total_cents, null_count = _db_mrr(session)
+        test_customer_ids = _test_customer_ids(session)
 
     if active_subs_by_customer is None:
         return MrrResult(
@@ -415,7 +428,10 @@ def check_mrr(active_subs_by_customer: Optional[dict]) -> MrrResult:
             stripe_total_cents=0, drift_cents=0, stripe_ok=False,
         )
 
-    stripe_total_cents = _stripe_mrr(active_subs_by_customer)
+    billable_subs_by_customer = {
+        cid: sub for cid, sub in active_subs_by_customer.items() if cid not in test_customer_ids
+    }
+    stripe_total_cents = _stripe_mrr(billable_subs_by_customer)
     return MrrResult(
         db_total_cents=db_total_cents,
         active_null_plan_price_count=null_count,
@@ -500,7 +516,7 @@ def _write_mrr_facts(mrr: MrrResult, new_yesterday_cents: Optional[int]) -> None
     write_fact(
         "revenue.mrr.stripe_total", str(mrr.stripe_total_cents),
         value_numeric=Decimal(mrr.stripe_total_cents), source="stripe",
-        method="sum of normalized_monthly_price() across active subscriptions",
+        method="sum of normalized_monthly_price() across active subscriptions, excluding is_test customers",
         freshness_class=FRESHNESS_REVENUE_24H,
     )
     write_fact(
