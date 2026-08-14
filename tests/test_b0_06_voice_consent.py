@@ -73,12 +73,13 @@ def test_free_signup_captures_voice_consent_when_accepted(client, fresh_db):
     })
     assert r.status_code == 201, r.text
 
+    from src.api.deps import VOICE_CONSENT_DISCLOSURES
     row = fresh_db.execute(text(
         "SELECT voice_consent_at, voice_consent_text, voice_consent_version "
         "FROM consent_acceptances WHERE email = :email"
     ), {"email": email}).first()
     assert row.voice_consent_at is not None
-    assert row.voice_consent_text == "I agree to receive automated/AI voice calls..."
+    assert row.voice_consent_text == VOICE_CONSENT_DISCLOSURES["2026.07"]
     assert row.voice_consent_version == "2026.07"
 
 
@@ -129,12 +130,13 @@ def test_checkout_captures_voice_consent_when_accepted(client, fresh_db, monkeyp
     })
     assert r.status_code == 200, r.text
 
+    from src.api.deps import VOICE_CONSENT_DISCLOSURES
     row = fresh_db.execute(text(
         "SELECT voice_consent_at, voice_consent_text, voice_consent_version "
         "FROM consent_acceptances WHERE email = :email AND source_flow = 'checkout'"
     ), {"email": email}).first()
     assert row.voice_consent_at is not None
-    assert row.voice_consent_text == "I agree to receive automated/AI voice calls..."
+    assert row.voice_consent_text == VOICE_CONSENT_DISCLOSURES["2026.07"]
     assert row.voice_consent_version == "2026.07"
 
 
@@ -389,9 +391,10 @@ def test_has_voice_consent_true_when_consent_row_present(fresh_db):
     fresh_db.execute(text("""
         INSERT INTO consent_acceptances
             (email, subscriber_id, terms_version, privacy_version, accepted_at,
-             source_flow, accepted_text_hash, voice_consent_at, created_at)
+             source_flow, accepted_text_hash, voice_consent_at, voice_consent_text,
+             voice_consent_version, created_at)
         VALUES (:email, :sid, '2026.06', '2026.06', now(),
-                'checkout', 'h', now(), now())
+                'checkout', 'h', now(), 'I consent to AI voice calls.', '2026.06', now())
     """), {"email": email, "sid": sid})
     fresh_db.flush()
     assert has_voice_consent(sid, fresh_db) is True

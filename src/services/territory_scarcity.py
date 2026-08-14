@@ -69,6 +69,37 @@ def _resolve_zip_status(
     return min(statuses, key=lambda s: _STATUS_PRECEDENCE.get(s, 99))
 
 
+def zip_vertical_status(db: Session, zip_code: str, vertical: str) -> Optional[dict]:
+    """Return live availability for one ZIP x vertical pair.
+
+    Returns None when no matching territory row exists. Any non-available raw
+    status is treated as taken for display purposes.
+    """
+    row = db.execute(
+        sa_text(
+            """
+            SELECT county_id, status
+              FROM zip_territories
+             WHERE zip_code = :zip AND vertical = :vertical
+             LIMIT 1
+            """
+        ),
+        {"zip": zip_code, "vertical": vertical},
+    ).first()
+    if not row:
+        return None
+
+    raw_status = row.status if hasattr(row, "status") else row[1]
+    county_id = row.county_id if hasattr(row, "county_id") else row[0]
+    return {
+        "zip_code": zip_code,
+        "vertical": vertical,
+        "county_id": county_id,
+        "status": "available" if raw_status == "available" else "taken",
+        "raw_status": raw_status,
+    }
+
+
 def county_scarcity(
     db: Session,
     zip_code: str,
