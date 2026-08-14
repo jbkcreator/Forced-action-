@@ -73,12 +73,13 @@ def test_free_signup_captures_voice_consent_when_accepted(client, fresh_db):
     })
     assert r.status_code == 201, r.text
 
+    from src.api.deps import VOICE_CONSENT_DISCLOSURES
     row = fresh_db.execute(text(
         "SELECT voice_consent_at, voice_consent_text, voice_consent_version "
         "FROM consent_acceptances WHERE email = :email"
     ), {"email": email}).first()
     assert row.voice_consent_at is not None
-    assert row.voice_consent_text == "I agree to receive automated/AI voice calls..."
+    assert row.voice_consent_text == VOICE_CONSENT_DISCLOSURES["2026.07"]
     assert row.voice_consent_version == "2026.07"
 
 
@@ -129,12 +130,13 @@ def test_checkout_captures_voice_consent_when_accepted(client, fresh_db, monkeyp
     })
     assert r.status_code == 200, r.text
 
+    from src.api.deps import VOICE_CONSENT_DISCLOSURES
     row = fresh_db.execute(text(
         "SELECT voice_consent_at, voice_consent_text, voice_consent_version "
         "FROM consent_acceptances WHERE email = :email AND source_flow = 'checkout'"
     ), {"email": email}).first()
     assert row.voice_consent_at is not None
-    assert row.voice_consent_text == "I agree to receive automated/AI voice calls..."
+    assert row.voice_consent_text == VOICE_CONSENT_DISCLOSURES["2026.07"]
     assert row.voice_consent_version == "2026.07"
 
 
@@ -180,21 +182,28 @@ def _stub_construct_event(event):
 def _post_checkout_completed(event, db):
     from src.services.stripe_webhooks import handle_webhook
     raw = json.dumps(event).encode("utf-8")
+    # The handler enriches the subscriber from Stripe (subscription price for
+    # trial/MRR, saved-card lookup). Those calls are non-fatal, but stub them so
+    # the test is hermetic — no network, no dependence on live test-mode objects.
+    fake_sub = {"items": {"data": []}, "trial_end": None}
     with _stub_init_stripe(), _stub_settings_secret(), _stub_construct_event(event), \
          patch("src.services.stripe_webhooks.push_subscriber_to_ghl"), \
          patch("src.services.email.send_welcome_email"), \
-         patch("src.services.stripe_webhooks._send_first_leads_email"):
+         patch("src.services.stripe_webhooks._send_first_leads_email"), \
+         patch("src.services.stripe_webhooks.stripe.Subscription.retrieve", return_value=fake_sub), \
+         patch("src.services.stripe_webhooks.stripe.Customer.retrieve", return_value=MagicMock()), \
+         patch("src.services.stripe_webhooks.stripe.PaymentMethod.list", return_value=MagicMock(data=[])):
         return handle_webhook(raw, sig_header="t=stub,v1=stub", db=db)
 
 
-def _make_checkout_completed_event(*, customer_id, sub_id, email, zip_code):
+def _make_checkout_completed_event(*, customer_id, sub_id, email, zip_code, session_id):
     return {
         "id": f"evt_vc_{uuid.uuid4().hex[:8]}",
         "type": "checkout.session.completed",
         "created": int(datetime.now(timezone.utc).timestamp()),
         "data": {
             "object": {
-                "id": f"cs_{uuid.uuid4().hex[:8]}",
+                "id": session_id,
                 "customer": customer_id,
                 "subscription": sub_id,
                 "payment_status": "paid",
@@ -211,19 +220,22 @@ def _make_checkout_completed_event(*, customer_id, sub_id, email, zip_code):
 def test_stripe_webhook_links_subscriber_id_onto_checkout_consent_row(fresh_db):
     uid = uuid.uuid4().hex[:8]
     email = f"vc_link_{uid}@example.com"
+    session_id = f"cs_{uid}"
 
     # Simulate the checkout consent row already written (no subscriber yet).
+    # Linking is keyed on checkout_session_id, so the row must carry it.
     fresh_db.execute(text("""
         INSERT INTO consent_acceptances
-            (email, terms_version, privacy_version, accepted_at, source_flow,
+            (email, terms_version, privacy_version, accepted_at, source_flow, checkout_session_id,
              accepted_text_hash, voice_consent_at, voice_consent_text, voice_consent_version, created_at)
-        VALUES (:email, '2026.06', '2026.06', now(), 'checkout',
+        VALUES (:email, '2026.06', '2026.06', now(), 'checkout', :session_id,
                 'hash123', now(), 'I agree to voice calls...', '2026.07', now())
-    """), {"email": email})
+    """), {"email": email, "session_id": session_id})
     fresh_db.commit()
 
     event = _make_checkout_completed_event(
         customer_id=f"cus_{uid}", sub_id=f"sub_{uid}", email=email, zip_code="99996",
+        session_id=session_id,
     )
     _post_checkout_completed(event, fresh_db)
     fresh_db.commit()
@@ -234,52 +246,57 @@ def test_stripe_webhook_links_subscriber_id_onto_checkout_consent_row(fresh_db):
 
     row = fresh_db.execute(text(
         "SELECT subscriber_id FROM consent_acceptances "
-        "WHERE email = :email AND source_flow = 'checkout'"
-    ), {"email": email}).first()
+        "WHERE checkout_session_id = :session_id AND source_flow = 'checkout'"
+    ), {"session_id": session_id}).first()
     assert row.subscriber_id == sub_id
 
 
 def test_stripe_webhook_links_despite_email_case_mismatch(fresh_db):
-    """Checkout lowercases the email (payload validator); Stripe may echo a
-    different case. The backfill must still link, case-insensitively."""
+    """Linking is by checkout_session_id, not email — so a different-case email
+    echoed by Stripe must not prevent the link."""
     uid = uuid.uuid4().hex[:8]
     stored_email = f"vc_case_{uid}@example.com"          # as stored at checkout
     stripe_email = f"VC_Case_{uid}@Example.com"          # as Stripe echoes it
+    session_id = f"cs_{uid}"
 
     fresh_db.execute(text("""
         INSERT INTO consent_acceptances
-            (email, terms_version, privacy_version, accepted_at, source_flow,
+            (email, terms_version, privacy_version, accepted_at, source_flow, checkout_session_id,
              accepted_text_hash, voice_consent_at, created_at)
-        VALUES (:email, '2026.06', '2026.06', now(), 'checkout', 'h', now(), now())
-    """), {"email": stored_email})
+        VALUES (:email, '2026.06', '2026.06', now(), 'checkout', :session_id, 'h', now(), now())
+    """), {"email": stored_email, "session_id": session_id})
     fresh_db.commit()
 
     event = _make_checkout_completed_event(
         customer_id=f"cus_{uid}", sub_id=f"sub_{uid}", email=stripe_email, zip_code="99994",
+        session_id=session_id,
     )
     _post_checkout_completed(event, fresh_db)
     fresh_db.commit()
 
     row = fresh_db.execute(text(
         "SELECT subscriber_id FROM consent_acceptances "
-        "WHERE email = :email AND source_flow = 'checkout'"
-    ), {"email": stored_email}).first()
+        "WHERE checkout_session_id = :session_id AND source_flow = 'checkout'"
+    ), {"session_id": session_id}).first()
     assert row.subscriber_id is not None
 
 
 def test_stripe_webhook_link_is_idempotent_on_replay(fresh_db):
     uid = uuid.uuid4().hex[:8]
     email = f"vc_link_replay_{uid}@example.com"
+    session_id = f"cs_{uid}"
 
     fresh_db.execute(text("""
         INSERT INTO consent_acceptances
-            (email, terms_version, privacy_version, accepted_at, source_flow, accepted_text_hash, created_at)
-        VALUES (:email, '2026.06', '2026.06', now(), 'checkout', 'hash123', now())
-    """), {"email": email})
+            (email, terms_version, privacy_version, accepted_at, source_flow, checkout_session_id,
+             accepted_text_hash, created_at)
+        VALUES (:email, '2026.06', '2026.06', now(), 'checkout', :session_id, 'hash123', now())
+    """), {"email": email, "session_id": session_id})
     fresh_db.commit()
 
     event = _make_checkout_completed_event(
         customer_id=f"cus_{uid}", sub_id=f"sub_{uid}", email=email, zip_code="99995",
+        session_id=session_id,
     )
     _post_checkout_completed(event, fresh_db)
     fresh_db.commit()
@@ -289,8 +306,8 @@ def test_stripe_webhook_link_is_idempotent_on_replay(fresh_db):
 
     rows = fresh_db.execute(text(
         "SELECT subscriber_id FROM consent_acceptances "
-        "WHERE email = :email AND source_flow = 'checkout'"
-    ), {"email": email}).fetchall()
+        "WHERE checkout_session_id = :session_id AND source_flow = 'checkout'"
+    ), {"session_id": session_id}).fetchall()
     assert len(rows) == 1
     assert rows[0].subscriber_id is not None
 
@@ -299,7 +316,10 @@ def test_stripe_webhook_link_is_idempotent_on_replay(fresh_db):
 # This IS the Definition of Done for B0-06.
 
 def _make_sub_profile(sub_id=1, phone="+13135550101", vertical="roofing"):
-    return {"id": sub_id, "name": "Test User", "phone": phone, "vertical": vertical}
+    return {
+        "id": sub_id, "name": "Test User", "phone": phone,
+        "vertical": vertical, "ghl_contact_id": "ghl_123",
+    }
 
 
 def _settings_mock(agent_id="agent_123"):
@@ -312,8 +332,7 @@ def _settings_mock(agent_id="agent_123"):
     return s
 
 
-def _invoke_voice_drop(*, has_voice_consent, call_id="c1"):
-    import sys
+def _invoke_voice_drop(*, has_voice_consent):
     from unittest.mock import MagicMock
     from src.agents.graphs import synthflow_voice_drop as vd
     from src.services.compliance_gator import ComplianceResult
@@ -323,12 +342,9 @@ def _invoke_voice_drop(*, has_voice_consent, call_id="c1"):
     db_ctx.__enter__ = MagicMock(return_value=db_ctx)
     db_ctx.__exit__ = MagicMock(return_value=False)
     db_ctx.execute.return_value.first.return_value = None  # no recent dedup drop
-    db_ctx.add = MagicMock()
-    db_ctx.commit = MagicMock()
 
     hierarchy_result = {"action_allowed": True, "kill_switch_color": "green"}
-    sms_module = MagicMock()
-    sms_module.send_sms = MagicMock(return_value=True)
+    apply_tags = MagicMock(return_value=True)
 
     with patch("src.agents.tools.read_tools.get_subscriber_profile", return_value=profile), \
          patch.object(vd, "get_subscriber_profile", return_value=profile), \
@@ -336,10 +352,7 @@ def _invoke_voice_drop(*, has_voice_consent, call_id="c1"):
          patch.object(vd, "run_decision_hierarchy", return_value=hierarchy_result), \
          patch.object(vd, "validate_outbound", return_value=ComplianceResult(allowed=True)), \
          patch.object(vd, "has_voice_consent", return_value=has_voice_consent), \
-         patch.object(vd, "initiate_call", return_value=call_id) as mock_initiate, \
-         patch("src.services.allotment_engine.consume", return_value=True), \
-         patch.object(vd, "allotment_consume", return_value=True), \
-         patch.dict(sys.modules, {"src.services.sms_compliance": sms_module}), \
+         patch("src.services.synthflow_service._apply_tags_to_contact", apply_tags), \
          patch("config.settings.get_settings", return_value=_settings_mock()):
         graph = vd.build_synthflow_voice_drop_graph().compile()
         result = graph.invoke({
@@ -348,22 +361,27 @@ def _invoke_voice_drop(*, has_voice_consent, call_id="c1"):
             "event_type": "high_intent_no_convert",
             "event_payload": {"vertical": "roofing"},
         })
-    result["_initiate_mock"] = mock_initiate
+    result["_apply_tags"] = apply_tags
     return result
 
 
 def test_voice_drop_aborts_without_voice_consent():
     result = _invoke_voice_drop(has_voice_consent=False)
     assert result["terminal_status"] == "aborted"
+    assert result["sent"] is False
     assert result["failure_reason"] == "voice_consent_required"
-    result["_initiate_mock"].assert_not_called()
+    result["_apply_tags"].assert_not_called()
 
 
-def test_voice_drop_proceeds_with_voice_consent():
+def test_voice_drop_never_dials_even_with_voice_consent():
+    # 3f policy: the score-based drop is blocked entirely and always routed to
+    # the human-dial queue — an AI call never fires, consent or not.
     result = _invoke_voice_drop(has_voice_consent=True)
-    assert result["sent"] is True
-    assert result["call_id"] == "c1"
-    result["_initiate_mock"].assert_called_once()
+    assert result["terminal_status"] == "aborted"
+    assert result["sent"] is False
+    assert result["call_id"] is None
+    assert result["failure_reason"] == "compliance:cold_dial_human_only"
+    result["_apply_tags"].assert_called_once_with("ghl_123", ["cold_dial_human_required"])
 
 
 # ── the real consent query, exercised against a real DB ─────────────────────
@@ -389,9 +407,10 @@ def test_has_voice_consent_true_when_consent_row_present(fresh_db):
     fresh_db.execute(text("""
         INSERT INTO consent_acceptances
             (email, subscriber_id, terms_version, privacy_version, accepted_at,
-             source_flow, accepted_text_hash, voice_consent_at, created_at)
+             source_flow, accepted_text_hash, voice_consent_at, voice_consent_text,
+             voice_consent_version, created_at)
         VALUES (:email, :sid, '2026.06', '2026.06', now(),
-                'checkout', 'h', now(), now())
+                'checkout', 'h', now(), 'I consent to AI voice calls.', '2026.06', now())
     """), {"email": email, "sid": sid})
     fresh_db.flush()
     assert has_voice_consent(sid, fresh_db) is True

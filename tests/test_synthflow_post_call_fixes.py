@@ -316,3 +316,95 @@ class TestWebhookPayloadResolvers:
         from src.api.main import SynthflowWebhookPayload
         p = SynthflowWebhookPayload(call={"duration": "not-a-number"})
         assert p.resolved_duration is None
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Fix 6 — thin-webhook enrichment must carry action-extracted outcomes
+# ────────────────────────────────────────────────────────────────────────────
+
+class TestThinWebhookOutcomeEnrichment:
+    """
+    A thin Synthflow post-call ping (call_id + status only) must enrich from
+    GET /calls/{id} WITHOUT discarding executed_actions / collected_variables.
+    Those carry action-extracted outcomes (demo_requested, sample_requested);
+    dropping them makes the outcome fall through to a generic `completed`.
+    """
+
+    def _post_thin_webhook(self, detail: dict, outcome_seen: dict):
+        """
+        Drive POST /webhooks/synthflow with a thin ping, mock the API detail,
+        and capture the outcome that reaches process_call_outcome.
+        """
+        dedup_session = MagicMock()
+        dedup_session.execute.return_value.fetchone.return_value = None
+        dedup_ctx = MagicMock()
+        dedup_ctx.__enter__ = lambda s: dedup_session
+        dedup_ctx.__exit__ = MagicMock(return_value=False)
+
+        def _capture(**kwargs):
+            outcome_seen["outcome"] = kwargs.get("outcome")
+            return {
+                "contact_id": "ghl-001",
+                "tags_applied": ["synthflow-called", kwargs.get("outcome")],
+                "created": False,
+                "sms_sent": None,
+            }
+
+        with (
+            patch("src.core.database.get_db_context", return_value=dedup_ctx),
+            patch("src.services.synthflow_client.get_call_details", return_value=detail),
+            patch("src.services.synthflow_service.process_call_outcome", side_effect=_capture),
+            patch("src.services.owner_alert.notify_owner"),
+            patch("src.services.webhook_log.log_webhook_event"),
+        ):
+            from fastapi.testclient import TestClient
+            from src.api.main import app
+            client = TestClient(app)
+            # Thin ping: call_id + status only, no phone/transcript/variables.
+            return client.post(
+                "/webhooks/synthflow",
+                json={"call_id": "call-thin-001", "status": "completed"},
+            )
+
+    def test_demo_requested_via_executed_actions(self):
+        outcome_seen: dict = {}
+        detail = {
+            "call_id": "call-thin-001",
+            "phone_number_to": "+18135550101",
+            "transcript": "Agent: ... Prospect: yes send me a demo.",
+            "end_call_reason": "agent_goodbye",
+            "executed_actions": {
+                "capture_intent": {"return_value": {"outcome": "demo_requested"}}
+            },
+        }
+        resp = self._post_thin_webhook(detail, outcome_seen)
+        assert resp.status_code == 200
+        assert outcome_seen["outcome"] == "demo_requested"
+
+    def test_sample_requested_via_collected_variables(self):
+        outcome_seen: dict = {}
+        detail = {
+            "call_id": "call-thin-001",
+            "phone_number_to": "+18135550101",
+            "transcript": "Agent: ... Prospect: text me the samples.",
+            "end_call_reason": "agent_goodbye",
+            "collected_variables": {
+                "outcome": {"value": "sample_requested", "collected": True}
+            },
+        }
+        resp = self._post_thin_webhook(detail, outcome_seen)
+        assert resp.status_code == 200
+        assert outcome_seen["outcome"] == "sample_requested"
+
+    def test_no_action_outcome_falls_back_to_taxonomy(self):
+        """Control: without an action outcome, end_call_reason still maps."""
+        outcome_seen: dict = {}
+        detail = {
+            "call_id": "call-thin-001",
+            "phone_number_to": "+18135550101",
+            "transcript": "Agent: ... Prospect: goodbye.",
+            "end_call_reason": "voicemail_message_left",
+        }
+        resp = self._post_thin_webhook(detail, outcome_seen)
+        assert resp.status_code == 200
+        assert outcome_seen["outcome"] == "voicemail"

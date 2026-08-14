@@ -17,7 +17,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from src.api.deps import ZIP_RE, VALID_VERTICALS, get_db
-from src.services.territory_scarcity import county_scarcity
+from src.services.territory_scarcity import county_scarcity, zip_vertical_status
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,12 @@ class CountyScarcityResponse(BaseModel):
     total_count: int
 
 
+class ZipScarcityResponse(BaseModel):
+    zip_code: str
+    vertical: str
+    status: str
+
+
 @router.get("/county", response_model=CountyScarcityResponse)
 def get_county_scarcity(
     zip: str = Query(..., description="5-digit ZIP to derive the county from"),
@@ -52,3 +58,25 @@ def get_county_scarcity(
     if result is None:
         raise HTTPException(status_code=404, detail="ZIP not found in any territory")
     return result
+
+
+@router.get("/zip", response_model=ZipScarcityResponse)
+def get_zip_scarcity(
+    zip: str = Query(..., description="5-digit ZIP to check"),
+    vertical: str = Query(..., description="Vertical to scope the ZIP to"),
+    db: Session = Depends(get_db),
+):
+    """Return availability for one ZIP x vertical territory."""
+    if not ZIP_RE.match(zip):
+        raise HTTPException(status_code=400, detail="Invalid ZIP: must be 5 digits")
+    if vertical not in VALID_VERTICALS:
+        raise HTTPException(status_code=400, detail="Invalid vertical")
+
+    result = zip_vertical_status(db, zip, vertical)
+    if result is None:
+        raise HTTPException(status_code=404, detail="ZIP x vertical not found in territory inventory")
+    return {
+        "zip_code": result["zip_code"],
+        "vertical": result["vertical"],
+        "status": result["status"],
+    }

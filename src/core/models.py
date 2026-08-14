@@ -1519,6 +1519,26 @@ class DealRoom(Base):
         return f"<DealRoom(id={self.id}, zip='{self.zip_code}', token='{self.token}', refund_status={self.refund_status!r})>"
 
 
+class DemoUser(Base):
+    """
+    Login for the standalone deal-room demo generator (/demo/deal-room).
+    Replaces the shared X-Demo-Passcode with email + bcrypt-hashed password,
+    stored in the DB. The plaintext password is never stored.
+    """
+    __tablename__ = "demo_users"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    email: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    is_active: Mapped[bool] = mapped_column(default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+    )
+
+    def __repr__(self) -> str:
+        return f"<DemoUser(id={self.id}, email='{self.email}', active={self.is_active})>"
+
+
 class SentLead(Base):
     """
     Tracks which property leads have been emailed to which subscriber.
@@ -6352,7 +6372,7 @@ class SynthflowCall(Base):
     dbpr_contact_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("dbpr_contacts.id"), nullable=True, index=True)
     call_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, unique=True)
     transcript_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    recording_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    recording_url: Mapped[Optional[str]] = mapped_column(String(2000), nullable=True)
     duration_seconds: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     call_date: Mapped[date] = mapped_column(Date, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
