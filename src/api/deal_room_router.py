@@ -13,15 +13,18 @@ from typing import Any, Dict, List, Literal, Optional
 
 import secrets
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from config.settings import get_settings
+from src.api.admin_router import create_access_token, verify_token
 from src.api.deps import VALID_VERTICALS, get_db
 from src.services.hold_lifecycle_service import create_deal_room
 from src.services.lead_pool_service import get_lead_pool
+from src.services.subscriber_auth import verify_password
 from src.services import pricing_truth
 from src.utils.test_account import is_test_subscriber
 from src.utils.county_config import is_county_launched
@@ -138,21 +141,20 @@ def get_deal_room(token: str, db: Session = Depends(get_db)) -> Dict[str, Any]:
     Performs a live ZIP property query on every call. The properties_snapshot
     audit column is never included in the response.
     """
+    # Advisory pricing-config check — surfaces broken/unsellable price config
+    # for monitoring but never blocks the room. The displayed prices come from
+    # Stripe itself (GET /api/pricing), and a genuinely bad price reveals itself
+    # at charge time in /api/checkout — refusing to load the room here only
+    # created false outages over stale constants (see pricing_truth docstring).
     try:
         pt_result = pricing_truth.check()
         if not pt_result.get("ok"):
-            raise HTTPException(
-                status_code=503,
-                detail={"detail": "Pricing inconsistency detected", "mismatches": pt_result.get("mismatches", [])},
+            logger.warning(
+                "[deal_room] pricing config problems (advisory, not blocking): %s",
+                pt_result.get("problems"),
             )
-    except HTTPException:
-        raise
     except Exception:
-        logger.error("[deal_room] pricing_truth.check raised unexpectedly", exc_info=True)
-        raise HTTPException(
-            status_code=503,
-            detail={"detail": "Pricing inconsistency detected", "mismatches": []},
-        )
+        logger.warning("[deal_room] pricing_truth.check failed (advisory)", exc_info=True)
 
     row = db.execute(
         text(
@@ -214,21 +216,47 @@ def get_deal_room(token: str, db: Session = Depends(get_db)) -> Dict[str, Any]:
 
 # ---------------------------------------------------------------------------
 # Demo generator — POST /api/demo/deal-room
-# Gated by a shared passcode header (X-Demo-Passcode), NOT the admin JWT.
+# Gated by email + password login (demo_users table), issuing a demo-scoped JWT.
 # ---------------------------------------------------------------------------
 
+_demo_bearer = HTTPBearer(auto_error=True)
 
-def require_demo_passcode(x_demo_passcode: str = Header(None)) -> None:
-    """Authorize the standalone demo deal-room generator via a shared passcode.
 
-    503 if no passcode is configured; 401 if the header is missing or wrong.
+class _DemoLoginRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(..., min_length=1)
+
+
+class _DemoLoginResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+@router.post("/api/demo/login", response_model=_DemoLoginResponse, tags=["deal-room"])
+def demo_login(body: _DemoLoginRequest, db: Session = Depends(get_db)) -> _DemoLoginResponse:
+    """Exchange demo credentials (email + password) for a demo-scoped JWT.
+
+    Credentials are stored in demo_users (bcrypt hash). 401 on bad credentials.
     """
-    settings = get_settings()
-    if not settings.demo_passcode:
-        raise HTTPException(status_code=503, detail="Demo generator not configured.")
-    expected = settings.demo_passcode.get_secret_value()
-    if not x_demo_passcode or not secrets.compare_digest(x_demo_passcode, expected):
-        raise HTTPException(status_code=401, detail="Invalid demo passcode.")
+    row = db.execute(
+        text("SELECT password_hash, is_active FROM demo_users WHERE lower(email) = lower(:e) LIMIT 1"),
+        {"e": str(body.email)},
+    ).fetchone()
+    if row is None or not row.is_active or not verify_password(body.password, row.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid demo credentials.")
+    token = create_access_token({"sub": str(body.email).lower(), "scope": "demo"})
+    logger.info("[deal_room] demo login ok for %s", str(body.email).lower())
+    return _DemoLoginResponse(access_token=token)
+
+
+def require_demo_auth(
+    credentials: HTTPAuthorizationCredentials = Depends(_demo_bearer),
+) -> dict:
+    """Authorize the demo generator via a demo-scoped JWT (from /api/demo/login)."""
+    claims = verify_token(credentials.credentials)  # 401 on invalid/expired
+    if claims.get("scope") != "demo":
+        raise HTTPException(status_code=403, detail="Not a demo token.")
+    return claims
 
 
 class _CreateDealRoomRequest(BaseModel):
@@ -260,12 +288,12 @@ class _CreateDealRoomResponse(BaseModel):
 def demo_create_deal_room(
     body: _CreateDealRoomRequest,
     db: Session = Depends(get_db),
-    _auth: None = Depends(require_demo_passcode),
+    _auth: dict = Depends(require_demo_auth),
 ) -> _CreateDealRoomResponse:
     """Create a deal-room for a prospect and return both copy-able links.
 
-    Gated by the demo passcode (X-Demo-Passcode header).
-    Raises 409 if the ZIP is not 'available'.
+    Authorized by a demo-scoped bearer token from POST /api/demo/login.
+    Raises 409 if the (zip, vertical, county) territory is not 'available'.
     Tier must be starter | pro | founder (Dominator is retired).
     """
     if not is_county_launched(body.county_id, db):

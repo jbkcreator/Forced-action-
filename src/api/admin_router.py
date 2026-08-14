@@ -93,7 +93,13 @@ def verify_token(token: str) -> dict:
 def get_current_admin(
     credentials: HTTPAuthorizationCredentials = Depends(_bearer),
 ) -> dict:
-    return verify_token(credentials.credentials)
+    # A valid signature is not enough: demo tokens (scope="demo") are signed
+    # with this same secret, so require an explicit admin scope or a demo user
+    # could authorize against every /api/admin/* route. Allowlist, not denylist.
+    claims = verify_token(credentials.credentials)
+    if claims.get("scope") != "admin":
+        raise HTTPException(status_code=403, detail="Admin scope required")
+    return claims
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +138,7 @@ def admin_login(body: LoginRequest):
     if not (username_ok and password_ok):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    token = create_access_token({"sub": body.username})
+    token = create_access_token({"sub": body.username, "scope": "admin"})
     logger.info("[Admin] Login successful for user: %s", body.username)
     return TokenResponse(access_token=token)
 

@@ -25,7 +25,7 @@ def admin_headers(monkeypatch):
     monkeypatch.setattr(settings, "admin_jwt_secret", SecretStr("test-jwt-secret"))
     monkeypatch.setattr(settings, "admin_password", SecretStr("test-admin-pass"))
     from src.api.admin_router import create_access_token
-    return {"Authorization": f"Bearer {create_access_token({'sub': 'admin'})}"}
+    return {"Authorization": f"Bearer {create_access_token({'sub': 'admin', 'scope': 'admin'})}"}
 
 
 def _override_db(rows):
