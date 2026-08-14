@@ -197,8 +197,10 @@ def _process_candidate_message(service: Any, message_id: str, db: Session) -> Op
     Returns:
         True  - published successfully. Safe to mark seen, safe to let the
                 caller advance the watermark past this message.
-        False - handled terminally with nothing to publish (already seen, or
-                an unmatched sender). Also safe to advance the watermark past.
+        False - handled terminally with nothing to publish (already seen, an
+                unmatched sender, or a Gmail 404 — the message itself is gone
+                and messages.get() will never succeed on retry). Also safe to
+                advance the watermark past.
         None  - a retryable failure (queue.publish() unavailable, or a
                 transient error fetching/processing the message). The caller
                 MUST NOT advance the watermark past this message, or it can
@@ -247,7 +249,18 @@ def _process_candidate_message(service: Any, message_id: str, db: Session) -> Op
 
         _mark_seen(message_id)  # only now — after a confirmed successful publish
         return True
-    except Exception:
+    except Exception as exc:
+        status = getattr(getattr(exc, "resp", None), "status", None)
+        if status == 404:
+            # The message itself no longer exists (deleted/expunged) — permanent,
+            # not transient. Treating it as retryable pins the watermark on a
+            # message that can never succeed, blocking every reply behind it.
+            logger.warning(
+                "reply_mailbox_poller: message_id=%s no longer exists (404) — treating as terminal, marking seen",
+                message_id,
+            )
+            _mark_seen(message_id)
+            return False
         logger.exception("reply_mailbox_poller: failed to process message id=%s — will retry next poll", message_id)
         return None
 
