@@ -322,6 +322,7 @@ def handle_webhook(raw_body: bytes, sig_header: str, db: Session, background_tas
 
     handlers = {
         "checkout.session.completed":    _on_checkout_completed,
+        "invoice.paid":                  _on_payment_succeeded,
         "invoice.payment_succeeded":     _on_payment_succeeded,
         "invoice.payment_failed":        _on_payment_failed,
         "customer.subscription.updated": _on_subscription_updated,
