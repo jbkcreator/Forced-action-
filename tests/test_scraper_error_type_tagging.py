@@ -129,6 +129,22 @@ def test_flood_partial_zone_failure_reports_scraper_error_not_no_data(monkeypatc
     assert "FLZ151" in kwargs["error_message"]
 
 
+def test_flood_no_nws_zones_configured_and_nfip_fails_reports_run_failure(monkeypatch):
+    # No NWS zones configured (e.g. a county not yet backstopped by NWS) means
+    # NFIP is the ONLY flood source. If NFIP fails, the run genuinely failed —
+    # "no zones to fail" must not be conflated with "the zone source succeeded"
+    # (PR #232 review, issue 3).
+    no_zone_config = {**_COUNTY_CONFIG, "nws_zones": []}
+    monkeypatch.setattr(flood_engine, "get_county", lambda cid: no_zone_config)
+    monkeypatch.setattr(flood_engine, "_fetch_fema_declarations", lambda *a: ([], None))
+    monkeypatch.setattr(flood_engine, "_fetch_nfip_claims", lambda *a: ([], "FEMA NFIP down"))
+    with _patched_stats() as mock_stats:
+        flood_engine.scrape_flood_damage(county_id="hillsborough")
+    kwargs = mock_stats.call_args.kwargs
+    assert kwargs["error_type"] == "scraper_error"
+    assert kwargs["run_success"] is False
+
+
 # ── insurance_engine ──────────────────────────────────────────────────────
 
 def test_insurance_fetch_failure_reports_scraper_error(monkeypatch):

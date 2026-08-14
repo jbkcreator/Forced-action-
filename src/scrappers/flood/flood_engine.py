@@ -290,7 +290,10 @@ def scrape_flood_damage(
                 unmatched=0,
                 skipped=duplicates,
                 county_id=county_id,
-                run_success=not (flood_total_fetch_failure and nfip_error is not None),
+                # No NWS zones configured is equivalent to a total NWS failure
+                # here — either way NFIP is the only source left, so its
+                # failure alone must fail the run, not look like a clean one.
+                run_success=not ((not nws_zones or flood_total_fetch_failure) and nfip_error is not None),
                 error_type="scraper_error",
                 error_message=_fetch_error[:500],
             )
