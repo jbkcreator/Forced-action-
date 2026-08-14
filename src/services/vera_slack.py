@@ -93,14 +93,25 @@ def build_live_state_blocks(subject: str, deploy: dict, cron_beats: list, silent
     blocks.append(_divider())
 
     # Silent failures
-    zero = silent.get("zero_ingest", [])
+    confirmed_no_data = silent.get("zero_ingest_confirmed_no_data", [])
+    unexplained = silent.get("zero_ingest_unexplained", [])
     unscheduled = silent.get("unscheduled", [])
     sf_text = f"*🔇 SILENT FAILURES*\n"
-    if zero:
-        sf_text += f"Scheduled-but-writing-nothing ({len(zero)}):\n"
-        sf_text += "\n".join(f"• `{r['source_type']}/{r['county_id']}`" for r in zero)
+    if confirmed_no_data:
+        sf_text += f"ℹ️ No new data today (confirmed — nothing to report) ({len(confirmed_no_data)}):\n"
+        sf_text += _capped_lines(
+            [f"• `{r['source_type']}/{r['county_id']}`" for r in confirmed_no_data], 800
+        )
+        sf_text += "\n"
     else:
-        sf_text += "✅ Scheduled-but-writing-nothing: none\n"
+        sf_text += "✅ No new data today (confirmed): none\n"
+    if unexplained:
+        sf_text += f"🔧 Scheduled-but-writing-nothing — needs investigation ({len(unexplained)}):\n"
+        sf_text += _capped_lines(
+            [f"• `{r['source_type']}/{r['county_id']}`" for r in unexplained], 800
+        )
+    else:
+        sf_text += "✅ Scheduled-but-writing-nothing: none"
     if unscheduled:
         sf_text += f"\nEnabled-but-unscheduled ({len(unscheduled)}):\n"
         sf_text += "\n".join(f"• `{s}`" for s in unscheduled)

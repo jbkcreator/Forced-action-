@@ -95,6 +95,19 @@ class TestClassifyScraperIssues:
         assert len(errors) == 1
         assert errors[0]["message"] == "Read timed out"
 
+    def test_scraper_error_is_a_real_error_even_when_run_success_true(self):
+        """storm/flood zone-fetch helpers mark a partial-zone outage as
+        error_type='scraper_error' with run_success=True (another zone/NFIP
+        still produced usable data) — this must never be downgraded to the
+        informational zero_rows_unclassified bucket."""
+        errors, data_unavailable = _classify_scraper_issues([
+            _row("flood_damage", "scraper_error", "FLZ151: connection reset", True),
+        ])
+        assert data_unavailable == []
+        assert len(errors) == 1
+        assert errors[0]["error_type"] == "scraper_error"
+        assert errors[0]["message"] == "FLZ151: connection reset"
+
     def test_null_error_type_failure_defaults_to_scraper_error_label(self):
         errors, _ = _classify_scraper_issues([
             _row("sunbiz", None, "unhandled exception", False),

@@ -108,7 +108,8 @@ def _stamp_received(received_time: str) -> Optional[datetime]:
 # Fetch
 # ---------------------------------------------------------------------------
 
-def _fetch_active_calls() -> List[Dict]:
+def _fetch_active_calls() -> Tuple[List[Dict], Optional[str]]:
+    """Returns (calls, error) — error is set if the CAD feed call itself failed."""
     try:
         resp = requests_get_with_retry(
             _PINELLAS_911_URL,
@@ -116,10 +117,10 @@ def _fetch_active_calls() -> List[Dict]:
             timeout=20,
             use_proxy=False,
         )
-        return resp.json().get("CallInfo", [])
+        return resp.json().get("CallInfo", []), None
     except Exception as exc:
         logger.error("[pinellas_fire] CAD fetch failed: %s", exc)
-        return []
+        return [], str(exc)
 
 
 def _filter_fire_calls(all_calls: List[Dict]) -> List[Dict]:
@@ -271,11 +272,15 @@ def scrape_pinellas_fire_incidents(
         return 0
 
     logger.info("[pinellas_fire] %s: fetching Pinellas 911 CAD active calls", county_id)
-    all_calls = _fetch_active_calls()
+    all_calls, fetch_error = _fetch_active_calls()
 
     if not all_calls:
-        logger.warning("[pinellas_fire] %s: no data from CAD feed", county_id)
-        _record_stats(county_id, 0, 0, 0, 0)
+        if fetch_error:
+            logger.warning("[pinellas_fire] %s: CAD feed fetch failed", county_id)
+            _record_stats(county_id, 0, 0, 0, 0, error=fetch_error)
+        else:
+            logger.warning("[pinellas_fire] %s: no data from CAD feed", county_id)
+            _record_stats(county_id, 0, 0, 0, 0)
         return 0
 
     fire_calls = _filter_fire_calls(all_calls)
@@ -346,17 +351,34 @@ def scrape_pinellas_fire_incidents(
     return created
 
 
-def _record_stats(county_id: str, total: int, matched: int, unmatched: int, skipped: int) -> None:
+def _record_stats(county_id: str, total: int, matched: int, unmatched: int, skipped: int,
+                   error: Optional[str] = None) -> None:
     try:
         from src.utils.scraper_db_helper import record_scraper_stats
-        record_scraper_stats(
-            source_type="fire_incidents",
-            total_scraped=total,
-            matched=matched,
-            unmatched=unmatched,
-            skipped=skipped,
-            county_id=county_id,
-        )
+        if error:
+            # The CAD feed fetch itself failed — this is NOT a confirmed
+            # no-data day, don't let it masquerade as one.
+            record_scraper_stats(
+                source_type="fire_incidents",
+                total_scraped=0,
+                matched=0,
+                unmatched=0,
+                skipped=0,
+                county_id=county_id,
+                run_success=False,
+                error_type="scraper_error",
+                error_message=error[:500],
+            )
+        else:
+            record_scraper_stats(
+                source_type="fire_incidents",
+                total_scraped=total,
+                matched=matched,
+                unmatched=unmatched,
+                skipped=skipped,
+                county_id=county_id,
+                error_type="no_data" if not total else "none",
+            )
     except Exception as exc:
         logger.warning("[pinellas_fire] Could not record scraper stats: %s", exc)
 

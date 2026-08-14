@@ -736,7 +736,7 @@ async def run_lien_pipeline(
     scrape_mode = source.get("scrape_mode", "")
     use_ai_fallback = False
 
-    if playwright_code:
+    if playwright_code and scrape_mode != "ai_only":
         logger.info("[Pipeline] playwright_code found — using Playwright selector mode")
         df = await _scrape_with_playwright(
             playwright_code, source, start_str, end_str, RAW_LIEN_DIR,
@@ -758,7 +758,7 @@ async def run_lien_pipeline(
             _record_stats(0, True, _t0, county_id)
             return True
 
-    if not playwright_code or use_ai_fallback:
+    if not playwright_code or scrape_mode == "ai_only" or use_ai_fallback:
         task = build_agent_task(source, start_str, end_str)
         history, start_time = await run_browser_agent(
             task, RAW_LIEN_DIR,
@@ -896,6 +896,11 @@ def _record_stats(total: int, success: bool, t0: float, county_id: str,
             duration_seconds=round(time.monotonic() - t0, 2),
             county_id=county_id,
         )
+        if success and total == 0:
+            # Genuine zero-result run (e.g. Playwright/AI scrape completed
+            # cleanly but found no records) — distinguish from a real failure
+            # so Vera doesn't page on a legitimate no-data day.
+            kwargs["error_type"] = "no_data"
         if error:
             kwargs["error_message"] = error[:500]
         record_scraper_stats(**kwargs)
