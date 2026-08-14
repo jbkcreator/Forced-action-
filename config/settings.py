@@ -86,6 +86,19 @@ class AppSettings(BaseSettings):
 	ghl_cf_fa_zip: Optional[str] = Field(default=None, env="GHL_CF_FA_ZIP")
 	ghl_cf_fa_founding: Optional[str] = Field(default=None, env="GHL_CF_FA_FOUNDING")
 	ghl_cf_fa_dashboard_url: Optional[str] = Field(default=None, env="GHL_CF_FA_DASHBOARD_URL")
+	# UTM attribution custom fields (Part 2 — GA4/UTM tracking spec)
+	ghl_cf_utm_source: Optional[str] = Field(default=None, env="GHL_CF_UTM_SOURCE")
+	ghl_cf_utm_medium: Optional[str] = Field(default=None, env="GHL_CF_UTM_MEDIUM")
+	ghl_cf_utm_campaign: Optional[str] = Field(default=None, env="GHL_CF_UTM_CAMPAIGN")
+	ghl_cf_utm_content: Optional[str] = Field(default=None, env="GHL_CF_UTM_CONTENT")
+	ghl_cf_utm_term: Optional[str] = Field(default=None, env="GHL_CF_UTM_TERM")
+	ghl_cf_utm_landing_path: Optional[str] = Field(default=None, env="GHL_CF_UTM_LANDING_PATH")
+	ghl_cf_utm_referrer: Optional[str] = Field(default=None, env="GHL_CF_UTM_REFERRER")
+
+	# GA4 Measurement Protocol (Part 3 — server-side purchase event from Stripe webhook)
+	# API secret generated in GA4 → Admin → Data Streams → Measurement Protocol API secrets
+	ga4_measurement_id: str = Field(default="G-LJJ4W7082K", env="GA4_MEASUREMENT_ID")
+	ga4_api_secret: Optional[SecretStr] = Field(default=None, env="GA4_API_SECRET")
 
 	# Instantly.ai email campaign integration (optional — feature disabled if not set)
 	instantly_api_key: Optional[SecretStr] = Field(default=None, env="INSTANTLY_API_KEY")
@@ -157,6 +170,8 @@ class AppSettings(BaseSettings):
 	stripe_price_autopilot_pro: Optional[str] = Field(default=None, env="STRIPE_PRICE_AUTOPILOT_PRO")
 	stripe_price_annual_lock: Optional[str] = Field(default=None, env="STRIPE_PRICE_ANNUAL_LOCK")
 	stripe_price_auto_mode: Optional[str] = Field(default=None, env="STRIPE_PRICE_AUTO_MODE")
+	hold_deposit_price_id: str = Field(default="", env="HOLD_DEPOSIT_PRICE_ID")
+	stripe_test_price_hold_deposit: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_HOLD_DEPOSIT")
 	stripe_price_partner: Optional[str] = Field(default=None, env="STRIPE_PRICE_PARTNER")
 	# 2B: Bundles
 	stripe_price_bundle_weekend: Optional[str] = Field(default=None, env="STRIPE_PRICE_BUNDLE_WEEKEND")
@@ -280,6 +295,13 @@ class AppSettings(BaseSettings):
 	@property
 	def active_stripe_publishable_key(self) -> Optional[str]:
 		return self.stripe_test_publishable_key if self.stripe_test_mode else self.stripe_publishable_key
+
+	@property
+	def active_hold_deposit_price_id(self) -> Optional[str]:
+		"""Mode-aware $97 hold-deposit price: test price in test mode, else live."""
+		if self.stripe_test_mode:
+			return self.stripe_test_price_hold_deposit
+		return self.hold_deposit_price_id or None
 
 	def active_stripe_price(self, name: str) -> Optional[str]:
 		"""Return the mode-aware price ID for a given price name (e.g. 'lead_pack', 'starter_founding')."""
@@ -544,6 +566,10 @@ class AppSettings(BaseSettings):
 	admin_password: Optional[SecretStr] = Field(default=None, env="ADMIN_PASSWORD")
 	admin_jwt_secret: Optional[SecretStr] = Field(default=None, env="ADMIN_JWT_SECRET")
 
+	# Demo deal-room generator — standalone /demo/deal-room page, gated by a
+	# shared passcode (not the admin JWT). Unset => the demo endpoint returns 503.
+	demo_passcode: Optional[SecretStr] = Field(default=None, env="DEMO_PASSCODE")
+
 	# Broker portal auth — separate secret so broker and admin tokens are independently
 	# rotatable and cannot be cross-accepted. Required when broker portal is in use.
 	broker_jwt_secret: Optional[SecretStr] = Field(default=None, env="BROKER_JWT_SECRET")
@@ -709,6 +735,11 @@ class AppSettings(BaseSettings):
 	#   Authorization: Bearer <CLAY_HTTP_API_SECRET>
 	# When unset, those endpoints return 503 (refuse to run unauthenticated).
 	clay_http_api_secret: Optional[SecretStr] = Field(default=None, env="CLAY_HTTP_API_SECRET")
+
+	# ── 3M Deal-Room ROI config ─────────────────────────────────────────────
+	# Cost of a single shared Angi lead — shown in the per-tier ROI comparison.
+	# Editable without code deploy.
+	angi_shared_lead_cost: int = Field(default=65, env="ANGI_SHARED_LEAD_COST")
 
 	# ── Subscriber feed auth (fa061) ────────────────────────────────────────
 	# JWT secret for subscriber feed login. Separate from admin/WL so it's

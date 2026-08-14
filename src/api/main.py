@@ -301,6 +301,8 @@ from src.api.scarcity_router import router as scarcity_router  # noqa: E402
 app.include_router(scarcity_router)
 from src.api.demo_router import router as demo_router  # noqa: E402
 app.include_router(demo_router)
+from src.api.deal_room_router import router as deal_room_router  # noqa: E402
+app.include_router(deal_room_router)
 
 
 # ---------------------------------------------------------------------------
@@ -884,6 +886,7 @@ def get_annual_signup_experiment_config():
 _ATTRIBUTION_META_KEYS = (
     "utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term",
     "campaign_id", "attribution_token", "fbclid", "ref",
+    "landing_path", "referrer", "ga_client_id",
 )
 # Stripe caps each metadata value at 500 chars.
 _MAX_META_VALUE_LEN = 480
@@ -920,7 +923,7 @@ class CheckoutRequest(BaseModel):
     email: str       # collected before checkout — used to block duplicate subscriptions
     interval: str = "monthly"  # monthly | annual — only meaningful for founder (picks its price)
     consent_acceptance: Optional[ConsentAcceptanceRequest] = None
-    attribution: Optional[dict] = None  # Meta Ads attribution (utm_*, campaign_id, fbclid, ...)
+    attribution: Optional[dict] = None  # Meta Ads attribution (utm_*, campaign_id, fbclid, landing_path, referrer, ga_client_id)
     # True when the buyer already has an authenticated dashboard session (e.g.
     # a free-tier subscriber upgrading from their dashboard), as opposed to an
     # anonymous landing-page visitor who has never seen their dashboard yet.
@@ -938,6 +941,10 @@ class CheckoutRequest(BaseModel):
     # proceeds at standard price), never trusted for its face value alone.
     winback_token: Optional[str] = None
     ghl_contact_id: Optional[str] = None
+    # 3m deal-room: opaque hold token from the prefilled checkout URL
+    # (`/?start_tier=X&zip=Y&hold=<token>`). Threaded into Stripe metadata so the
+    # subscription webhook can refund the $97 hold deposit on conversion (ADR 0035).
+    hold_token: Optional[str] = None
 
     @field_validator("success_return_path")
     @classmethod
@@ -1059,17 +1066,39 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
     # were locked between zip-check and payment completion are silently dropped —
     # leaving them with fewer territories than they paid for.
     try:
-        taken_zips = db.execute(
-            select(ZipTerritory.zip_code).where(
+        taken_rows = db.execute(
+            select(ZipTerritory.zip_code, ZipTerritory.status).where(
                 ZipTerritory.zip_code.in_(payload.zip_codes),
                 ZipTerritory.vertical == payload.vertical,
                 ZipTerritory.county_id == payload.county_id,
-                ZipTerritory.status == "locked",
+                ZipTerritory.status.in_(["locked", "held"]),
             )
-        ).scalars().all()
+        ).all()
     except OperationalError:
         logger.error("DB error checking ZIP availability at checkout", exc_info=True)
         raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+
+    # Bug #4 — a 'held' territory is unavailable to OTHER buyers, but the holder
+    # converting their own 3m Deal-Room hold may proceed. If this checkout carries
+    # a hold token matching a held, unexpired deal room for this exact
+    # (zip, vertical, county), that ZIP is not counted as taken for this buyer.
+    _allowed_held_zip = None
+    if payload.hold_token:
+        _held_row = db.execute(
+            text(
+                "SELECT zip_code FROM deal_rooms "
+                "WHERE token = :t AND vertical = :v AND county_id = :c "
+                "AND held_at IS NOT NULL AND (expires_at IS NULL OR expires_at > NOW())"
+            ),
+            {"t": payload.hold_token, "v": payload.vertical, "c": payload.county_id},
+        ).fetchone()
+        if _held_row is not None:
+            _allowed_held_zip = _held_row.zip_code
+
+    taken_zips = [
+        r.zip_code for r in taken_rows
+        if not (r.status == "held" and r.zip_code == _allowed_held_zip)
+    ]
 
     if taken_zips:
         raise HTTPException(
@@ -1180,6 +1209,9 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
     }
     if payload.ghl_contact_id:
         checkout_metadata["ghl_contact_id"] = payload.ghl_contact_id
+    # 3m deal-room: carry the hold token so the webhook refunds the $97 (ADR 0035).
+    if payload.hold_token:
+        checkout_metadata["hold"] = payload.hold_token
     # Meta Ads attribution + buyer IP/UA captured from the buyer's request.
     checkout_metadata.update(_attribution_stripe_metadata(request, payload.attribution))
 
@@ -6791,6 +6823,10 @@ class FreeSignupRequest(BaseModel):
     utm_source: Optional[str] = None
     utm_medium: Optional[str] = None
     utm_campaign: Optional[str] = None
+    utm_content: Optional[str] = None
+    utm_term: Optional[str] = None
+    landing_path: Optional[str] = None
+    referrer: Optional[str] = None
     campaign_id: Optional[str] = None
     attribution_token: Optional[str] = None
     # fa081: affiliate ?aff= token, captured client-side and forwarded here.
@@ -6871,6 +6907,22 @@ def free_signup(req: FreeSignupRequest, request: Request, db: Session = Depends(
         referral_source=req.referral_source,
         send_welcome=not defer_welcome,
     )
+
+    # Push free-signup contact to GHL with UTM attribution (best-effort)
+    try:
+        from src.services.ghl_webhook import push_subscriber_to_ghl
+        utm_data = {
+            "utm_source":   req.utm_source,
+            "utm_medium":   req.utm_medium,
+            "utm_campaign": req.utm_campaign,
+            "utm_content":  req.utm_content,
+            "utm_term":     req.utm_term,
+            "landing_path": req.landing_path,
+            "referrer":     req.referrer,
+        }
+        push_subscriber_to_ghl(sub, stage=None, utm_data=utm_data, db=db)
+    except Exception:
+        logger.warning("GHL free-signup push failed (non-fatal):", exc_info=True)
 
     if req.consent_acceptance and req.consent_acceptance.terms_accepted:
         try:

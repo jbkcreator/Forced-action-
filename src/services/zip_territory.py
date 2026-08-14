@@ -34,7 +34,7 @@ class ZipTerritoryUnavailableError(Exception):
 
 def claim_zip_territory(
     db: Session, *, zip_code: str, vertical: str, county_id: str,
-    subscriber_id: int, now: datetime,
+    subscriber_id: int, now: datetime, hold_ok: bool = False,
 ) -> bool:
     """Lock (zip_code, vertical, county_id) to subscriber_id.
 
@@ -42,6 +42,12 @@ def claim_zip_territory(
     already locked to a different subscriber (a real caller MUST check this —
     silently proceeding as if the claim succeeded is the exact TOCTOU bug this
     module exists to close). Safe to call repeatedly for the same subscriber.
+
+    hold_ok=True marks this claim as the legitimate holder converting their own
+    3m Deal-Room hold (verified upstream by matching the hold token to this exact
+    territory): a 'held' row is then flipped to 'locked' for this subscriber
+    instead of being treated as taken. Non-holders (hold_ok=False) still see a
+    'held' row as unavailable — bug #4.
     """
     from src.core.models import ZipTerritory
 
@@ -82,6 +88,14 @@ def claim_zip_territory(
         return True  # already held by this same subscriber — idempotent re-call
 
     if territory.status in ("available", "grace"):
+        territory.subscriber_id = subscriber_id
+        territory.status = "locked"
+        territory.locked_at = now
+        territory.grace_expires_at = None
+        return True
+
+    if territory.status == "held" and hold_ok:
+        # The legitimate holder is converting their own hold — flip held → locked.
         territory.subscriber_id = subscriber_id
         territory.status = "locked"
         territory.locked_at = now
