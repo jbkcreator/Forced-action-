@@ -102,6 +102,12 @@ VOICE_CONSENT_DISCLOSURES: dict[str, str] = {
         "account and available leads. Consent is not required to purchase. "
         "Message/data rates may apply."
     ),
+    "2026.07": (
+        "I agree to receive recurring automated marketing calls and text messages, "
+        "including calls that use an automated or AI-generated voice, from Forced Action "
+        "at the phone number provided. Consent is not a condition of purchase. "
+        "Msg & data rates may apply. Reply STOP to opt out."
+    ),
 }
 
 
