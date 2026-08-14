@@ -1,14 +1,15 @@
 """
-Tests for pricing_truth gate on GET /api/deal-room/{token}.
+Tests for the advisory pricing_truth check on GET /api/deal-room/{token}.
 
-No real DB or Stripe calls — DB (via dependency override) and pricing_truth are mocked.
+The check is advisory (option C): it logs broken price config but must never
+block the deal-room from loading. No real DB or Stripe calls — DB (via
+dependency override) and pricing_truth are mocked.
 """
 from __future__ import annotations
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import pytest
 from fastapi.testclient import TestClient
 
 
@@ -40,50 +41,41 @@ def _make_db_override(row):
 TOKEN = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 
 
-# ---------------------------------------------------------------------------
-# pricing_truth.check returns mismatch → 503
-# ---------------------------------------------------------------------------
-
-def test_get_deal_room_pricing_mismatch_returns_503():
+def _get_room(pt_patch):
     from src.api.main import app
     from src.api.deps import get_db
 
-    mismatch = {"surface": "subscription", "tier": "starter_founding",
-                 "displayed_cents": 60000, "stripe_cents": 59900}
-    pt_result = {"ok": False, "mismatches": [mismatch]}
-
     app.dependency_overrides[get_db] = _make_db_override(_fake_db_row())
     try:
-        with patch("src.services.pricing_truth.check", return_value=pt_result):
-            resp = TestClient(app).get(f"/api/deal-room/{TOKEN}")
+        with pt_patch, \
+             patch("src.api.deal_room_router.get_lead_pool", return_value=[]), \
+             patch("src.api.deal_room_router._distress_type_map", return_value={}):
+            return TestClient(app).get(f"/api/deal-room/{TOKEN}")
     finally:
         app.dependency_overrides.pop(get_db, None)
 
-    assert resp.status_code == 503
-    body = resp.json()
-    assert body["detail"]["detail"] == "Pricing inconsistency detected"
-    assert body["detail"]["mismatches"] == [mismatch]
+
+# ---------------------------------------------------------------------------
+# pricing_truth reports problems → still 200 (advisory, does NOT block)
+# ---------------------------------------------------------------------------
+
+def test_get_deal_room_pricing_problem_does_not_block():
+    pt_result = {"ok": False, "problems": [
+        {"name": "annual_lock", "surface": "subscription", "tier": "annual_lock",
+         "price_id": "price_dead", "reason": "not_found"},
+    ]}
+    resp = _get_room(patch("src.services.pricing_truth.check", return_value=pt_result))
+    assert resp.status_code == 200
+    assert resp.json()["token"] == TOKEN
 
 
 # ---------------------------------------------------------------------------
-# pricing_truth.check returns ok=True → 200
+# pricing_truth ok → 200
 # ---------------------------------------------------------------------------
 
 def test_get_deal_room_pricing_ok_returns_200():
-    from src.api.main import app
-    from src.api.deps import get_db
-
-    pt_result = {"ok": True, "mismatches": []}
-
-    app.dependency_overrides[get_db] = _make_db_override(_fake_db_row())
-    try:
-        with patch("src.services.pricing_truth.check", return_value=pt_result), \
-             patch("src.api.deal_room_router.get_lead_pool", return_value=[]), \
-             patch("src.api.deal_room_router._distress_type_map", return_value={}):
-            resp = TestClient(app).get(f"/api/deal-room/{TOKEN}")
-    finally:
-        app.dependency_overrides.pop(get_db, None)
-
+    pt_result = {"ok": True, "problems": []}
+    resp = _get_room(patch("src.services.pricing_truth.check", return_value=pt_result))
     assert resp.status_code == 200
     body = resp.json()
     assert body["token"] == TOKEN
@@ -91,21 +83,11 @@ def test_get_deal_room_pricing_ok_returns_200():
 
 
 # ---------------------------------------------------------------------------
-# pricing_truth.check raises exception → 503 (fail closed)
+# pricing_truth raises → still 200 (advisory failure is swallowed)
 # ---------------------------------------------------------------------------
 
-def test_get_deal_room_pricing_exception_returns_503():
-    from src.api.main import app
-    from src.api.deps import get_db
-
-    app.dependency_overrides[get_db] = _make_db_override(_fake_db_row())
-    try:
-        with patch("src.services.pricing_truth.check", side_effect=RuntimeError("Stripe down")):
-            resp = TestClient(app).get(f"/api/deal-room/{TOKEN}")
-    finally:
-        app.dependency_overrides.pop(get_db, None)
-
-    assert resp.status_code == 503
-    body = resp.json()
-    assert body["detail"]["detail"] == "Pricing inconsistency detected"
-    assert body["detail"]["mismatches"] == []
+def test_get_deal_room_pricing_exception_does_not_block():
+    resp = _get_room(patch("src.services.pricing_truth.check",
+                           side_effect=RuntimeError("Stripe down")))
+    assert resp.status_code == 200
+    assert resp.json()["token"] == TOKEN

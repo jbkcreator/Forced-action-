@@ -139,21 +139,20 @@ def get_deal_room(token: str, db: Session = Depends(get_db)) -> Dict[str, Any]:
     Performs a live ZIP property query on every call. The properties_snapshot
     audit column is never included in the response.
     """
+    # Advisory pricing-config check — surfaces broken/unsellable price config
+    # for monitoring but never blocks the room. The displayed prices come from
+    # Stripe itself (GET /api/pricing), and a genuinely bad price reveals itself
+    # at charge time in /api/checkout — refusing to load the room here only
+    # created false outages over stale constants (see pricing_truth docstring).
     try:
         pt_result = pricing_truth.check()
         if not pt_result.get("ok"):
-            raise HTTPException(
-                status_code=503,
-                detail={"detail": "Pricing inconsistency detected", "mismatches": pt_result.get("mismatches", [])},
+            logger.warning(
+                "[deal_room] pricing config problems (advisory, not blocking): %s",
+                pt_result.get("problems"),
             )
-    except HTTPException:
-        raise
     except Exception:
-        logger.error("[deal_room] pricing_truth.check raised unexpectedly", exc_info=True)
-        raise HTTPException(
-            status_code=503,
-            detail={"detail": "Pricing inconsistency detected", "mismatches": []},
-        )
+        logger.warning("[deal_room] pricing_truth.check failed (advisory)", exc_info=True)
 
     row = db.execute(
         text(

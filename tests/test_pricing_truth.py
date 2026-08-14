@@ -1,5 +1,5 @@
 """
-Unit tests for src/services/pricing_truth.py
+Unit tests for src/services/pricing_truth.py (advisory config diagnostic).
 
 All Stripe API calls and settings are mocked — no network, no DB required.
 
@@ -8,172 +8,151 @@ Run:
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import pytest
 import stripe
 
 from src.services.pricing_truth import check, _PRICE_TABLE
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+def _make_settings(price_map=None, no_key=False):
+    """Return a MagicMock mimicking AppSettings.
 
-
-def _make_settings(**overrides):
-    """Return a MagicMock mimicking AppSettings with all price IDs set."""
+    price_map: optional {name -> price_id} override. By default every price
+    name resolves to f'price_{name}'.
+    """
     s = MagicMock()
-    # active_stripe_secret_key is a SecretStr mock
-    sk = MagicMock()
-    sk.get_secret_value.return_value = "sk_test_fake"
-    s.active_stripe_secret_key = sk
+    if no_key:
+        s.active_stripe_secret_key = None
+    else:
+        sk = MagicMock()
+        sk.get_secret_value.return_value = "sk_test_fake"
+        s.active_stripe_secret_key = sk
 
-    # Set every price attr in _PRICE_TABLE to a fake price_id by default.
-    for attr, _surface, tier, _cents in _PRICE_TABLE:
-        setattr(s, attr, f"price_{tier}")
+    resolved = {name: f"price_{name}" for name, _, _ in _PRICE_TABLE}
+    if price_map is not None:
+        resolved.update(price_map)
 
-    # Apply per-test overrides
-    for k, v in overrides.items():
-        setattr(s, k, v)
+    s.active_stripe_price = lambda name: resolved.get(name)
+    s.active_hold_deposit_price_id = resolved.get("hold_deposit")
     return s
 
 
-def _stripe_price(unit_amount: int) -> dict:
-    """Minimal Stripe Price object shape."""
-    return {"object": "price", "unit_amount": unit_amount}
+def _price(active=True, unit_amount=9900):
+    return SimpleNamespace(object="price", active=active, unit_amount=unit_amount)
 
 
 # ---------------------------------------------------------------------------
-# All prices match → ok=True, mismatches=[]
+# All configured prices resolve, active, priced → ok=True
 # ---------------------------------------------------------------------------
 
-
-def test_all_match():
+def test_all_prices_ok():
     settings = _make_settings()
-
-    # Build a retrieve side_effect that returns the correct unit_amount for
-    # each price_id so every comparison passes.
-    price_map = {f"price_{tier}": _stripe_price(cents) for _, _, tier, cents in _PRICE_TABLE}
-
-    def fake_retrieve(price_id, api_key=None):
-        return price_map[price_id]
-
     with patch("src.services.pricing_truth.get_settings", return_value=settings), \
-         patch("src.services.pricing_truth.stripe.Price.retrieve", side_effect=fake_retrieve):
+         patch("stripe.Price.retrieve", return_value=_price()):
         result = check()
-
     assert result["ok"] is True
-    assert result["mismatches"] == []
+    assert result["problems"] == []
 
 
 # ---------------------------------------------------------------------------
-# One price disagrees → ok=False, mismatches contains correct detail
+# A price not configured in this env is skipped (not a problem)
 # ---------------------------------------------------------------------------
 
+def test_unconfigured_price_skipped():
+    # annual_lock resolves to None → skipped silently.
+    settings = _make_settings(price_map={"annual_lock": None})
+    with patch("src.services.pricing_truth.get_settings", return_value=settings), \
+         patch("stripe.Price.retrieve", return_value=_price()):
+        result = check()
+    assert result["ok"] is True
+    assert all(p["name"] != "annual_lock" for p in result["problems"])
 
-def test_single_mismatch():
+
+# ---------------------------------------------------------------------------
+# A Stripe 404 on a configured price → reason=not_found, ok=False
+# ---------------------------------------------------------------------------
+
+def test_not_found_reported():
     settings = _make_settings()
 
-    # starter_founding is the first row in _PRICE_TABLE
-    _attr, surface, tier, displayed_cents = _PRICE_TABLE[0]
-    wrong_amount = displayed_cents + 500  # deliberately different
-
-    price_map = {f"price_{t}": _stripe_price(c) for _, _, t, c in _PRICE_TABLE}
-    price_map[f"price_{tier}"] = _stripe_price(wrong_amount)
-
-    def fake_retrieve(price_id, api_key=None):
-        return price_map[price_id]
+    def retrieve(price_id, api_key=None):
+        if price_id == "price_annual_lock":
+            raise stripe.InvalidRequestError("No such price", param="id")
+        return _price()
 
     with patch("src.services.pricing_truth.get_settings", return_value=settings), \
-         patch("src.services.pricing_truth.stripe.Price.retrieve", side_effect=fake_retrieve):
+         patch("stripe.Price.retrieve", side_effect=retrieve):
         result = check()
-
     assert result["ok"] is False
-    assert len(result["mismatches"]) == 1
-    mm = result["mismatches"][0]
-    assert mm["surface"] == surface
-    assert mm["tier"] == tier
-    assert mm["displayed_cents"] == displayed_cents
-    assert mm["stripe_cents"] == wrong_amount
+    probs = [p for p in result["problems"] if p["reason"] == "not_found"]
+    assert probs and probs[0]["name"] == "annual_lock"
 
 
 # ---------------------------------------------------------------------------
-# Stripe API raises an exception → ok=False, mismatches=[]  (fail closed)
+# Archived price → reason=inactive
 # ---------------------------------------------------------------------------
 
-
-def test_stripe_api_error_fails_closed():
+def test_inactive_reported():
     settings = _make_settings()
+
+    def retrieve(price_id, api_key=None):
+        return _price(active=(price_id != "price_pro_regular"))
 
     with patch("src.services.pricing_truth.get_settings", return_value=settings), \
-         patch(
-             "src.services.pricing_truth.stripe.Price.retrieve",
-             side_effect=stripe.AuthenticationError("Invalid API key"),
-         ):
+         patch("stripe.Price.retrieve", side_effect=retrieve):
         result = check()
-
     assert result["ok"] is False
-    assert result["mismatches"] == []
+    assert any(p["reason"] == "inactive" and p["name"] == "pro_regular"
+               for p in result["problems"])
 
 
 # ---------------------------------------------------------------------------
-# No Stripe key configured → ok=False, mismatches=[]
+# Price with no fixed unit_amount → reason=no_amount
 # ---------------------------------------------------------------------------
 
-
-def test_no_api_key_fails_closed():
+def test_no_amount_reported():
     settings = _make_settings()
-    settings.active_stripe_secret_key = None
 
+    def retrieve(price_id, api_key=None):
+        return _price(unit_amount=(None if price_id == "price_hold_deposit" else 9900))
+
+    with patch("src.services.pricing_truth.get_settings", return_value=settings), \
+         patch("stripe.Price.retrieve", side_effect=retrieve):
+        result = check()
+    assert result["ok"] is False
+    assert any(p["reason"] == "no_amount" and p["name"] == "hold_deposit"
+               for p in result["problems"])
+
+
+# ---------------------------------------------------------------------------
+# All problems collected (no short-circuit on the first bad price)
+# ---------------------------------------------------------------------------
+
+def test_collects_all_problems():
+    settings = _make_settings()
+    bad = {"price_annual_lock", "price_wallet_power"}
+
+    def retrieve(price_id, api_key=None):
+        if price_id in bad:
+            raise stripe.InvalidRequestError("No such price", param="id")
+        return _price()
+
+    with patch("src.services.pricing_truth.get_settings", return_value=settings), \
+         patch("stripe.Price.retrieve", side_effect=retrieve):
+        result = check()
+    names = {p["name"] for p in result["problems"]}
+    assert {"annual_lock", "wallet_power"} <= names
+
+
+# ---------------------------------------------------------------------------
+# No Stripe key configured → ok=True (nothing to diagnose; advisory)
+# ---------------------------------------------------------------------------
+
+def test_no_key_returns_ok():
+    settings = _make_settings(no_key=True)
     with patch("src.services.pricing_truth.get_settings", return_value=settings):
         result = check()
-
-    assert result["ok"] is False
-    assert result["mismatches"] == []
-
-
-# ---------------------------------------------------------------------------
-# Price IDs that are None/empty in settings are silently skipped
-# ---------------------------------------------------------------------------
-
-
-def test_unconfigured_price_ids_are_skipped():
-    settings = _make_settings()
-    # Blank out all ICP prices
-    for attr, surface, _tier, _cents in _PRICE_TABLE:
-        if surface == "icp":
-            setattr(settings, attr, None)
-
-    # Only non-ICP prices are checked; they all match.
-    price_map = {
-        f"price_{tier}": _stripe_price(cents)
-        for _, surface, tier, cents in _PRICE_TABLE
-        if surface != "icp"
-    }
-
-    def fake_retrieve(price_id, api_key=None):
-        return price_map[price_id]
-
-    with patch("src.services.pricing_truth.get_settings", return_value=settings), \
-         patch("src.services.pricing_truth.stripe.Price.retrieve", side_effect=fake_retrieve):
-        result = check()
-
     assert result["ok"] is True
-    assert result["mismatches"] == []
-
-
-# ---------------------------------------------------------------------------
-# Unexpected exception (non-Stripe) → fail closed
-# ---------------------------------------------------------------------------
-
-
-def test_unexpected_exception_fails_closed():
-    with patch(
-        "src.services.pricing_truth.get_settings",
-        side_effect=RuntimeError("boom"),
-    ):
-        result = check()
-
-    assert result["ok"] is False
-    assert result["mismatches"] == []
+    assert result["problems"] == []
