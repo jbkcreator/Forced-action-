@@ -161,7 +161,7 @@ class TestIcpApiStateMachine:
         from src.api.main import app
         from src.api.admin_router import create_access_token
 
-        token = create_access_token({"sub": "test_admin"})
+        token = create_access_token({"sub": "test_admin", "scope": "admin"})
         client = TestClient(app)
         r = client.post("/api/admin/icp-channels/contractor/kill",
                         json={"reason": "test"},
@@ -175,7 +175,7 @@ class TestIcpApiStateMachine:
         from src.api.admin_router import create_access_token
         from src.core.database import get_db_context
 
-        token = create_access_token({"sub": "test_admin"})
+        token = create_access_token({"sub": "test_admin", "scope": "admin"})
         client = TestClient(app)
 
         # Patch DB so we don't need real DB

@@ -77,7 +77,7 @@ def admin_token(monkeypatch):
     from config.settings import settings
     monkeypatch.setattr(settings, "admin_jwt_secret", SecretStr("test-jwt-secret"))
     from src.api.admin_router import create_access_token
-    return create_access_token({"sub": "ops@heu.ai"})
+    return create_access_token({"sub": "ops@heu.ai", "scope": "admin"})
 
 
 @pytest.fixture

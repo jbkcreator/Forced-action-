@@ -48,7 +48,7 @@ def admin_token(monkeypatch):
     monkeypatch.setattr(settings, "admin_password", SecretStr("test-admin-pass"))
 
     from src.api.admin_router import create_access_token
-    return create_access_token({"sub": "admin"})
+    return create_access_token({"sub": "admin", "scope": "admin"})
 
 
 @pytest.fixture

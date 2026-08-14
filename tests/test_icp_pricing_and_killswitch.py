@@ -51,7 +51,7 @@ class TestValidateIcpCheckout:
         from src.core.database import get_db_context
         from contextlib import contextmanager
 
-        token = create_access_token({"sub": "test_admin"})
+        token = create_access_token({"sub": "test_admin", "scope": "admin"})
 
         @contextmanager
         def fake_db():
