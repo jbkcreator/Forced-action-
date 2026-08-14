@@ -161,6 +161,46 @@ def _fire_capi_for_pi(payment_intent, subscriber, source: str, event_id: str, db
         logger.warning("Meta CAPI %s purchase failed — non-fatal", source, exc_info=True)
 
 
+def _fire_ga4_purchase(
+    transaction_id: str,
+    amount: float,
+    tier: Optional[str],
+    zip_count: int,
+    ga_client_id: Optional[str],
+) -> None:
+    """Fire a GA4 Measurement Protocol purchase event. No-op when API secret not configured."""
+    from config.settings import get_settings as _gs
+    s = _gs()
+    if not s.ga4_api_secret:
+        logger.debug("GA4 MP skipped — GA4_API_SECRET not set")
+        return
+
+    import requests as _req
+    payload = {
+        "client_id": ga_client_id or "server",
+        "events": [{
+            "name": "purchase",
+            "params": {
+                "transaction_id": transaction_id,
+                "value": amount,
+                "currency": "USD",
+                "tier": tier or "",
+                "zip_count": zip_count,
+            },
+        }],
+    }
+    resp = _req.post(
+        "https://www.google-analytics.com/mp/collect",
+        params={
+            "measurement_id": s.ga4_measurement_id,
+            "api_secret": s.ga4_api_secret.get_secret_value(),
+        },
+        json=payload,
+        timeout=5,
+    )
+    logger.info("GA4 MP purchase fired: transaction=%s status=%s", transaction_id, resp.status_code)
+
+
 def _mark_sold_out_losers_for(locked_zips: list) -> None:
     """Run mark_sold_out_losers for each (zip, vertical, county) tuple a
     checkout locked — called only after the checkout's own transaction has
@@ -1219,11 +1259,21 @@ def _checkout_completed_deferred(db: Session, subscriber, session: dict, is_new_
     # ── Push to GHL stage 5 ────────────────────────────────────────────────
     try:
         with db.begin_nested():
+            utm_data = {
+                "utm_source":   meta.get("utm_source"),
+                "utm_medium":   meta.get("utm_medium"),
+                "utm_campaign": meta.get("utm_campaign"),
+                "utm_content":  meta.get("utm_content"),
+                "utm_term":     meta.get("utm_term"),
+                "landing_path": meta.get("landing_path"),
+                "referrer":     meta.get("referrer"),
+            }
             push_subscriber_to_ghl(
                 subscriber,
                 stage=5,
                 zip_codes=list(zip_codes),
                 is_founding=is_founding,
+                utm_data=utm_data,
                 db=db,
             )
     except Exception:
@@ -1438,6 +1488,18 @@ def _checkout_completed_deferred(db: Session, subscriber, session: dict, is_new_
         )
     except Exception:
         logger.warning("Meta CAPI subscription purchase failed sub=%s — non-fatal", subscriber.id, exc_info=True)
+
+    # ── GA4 Measurement Protocol: server-side purchase event (Part 3) ────────
+    try:
+        _fire_ga4_purchase(
+            transaction_id=session.get("id", ""),
+            amount=round((session.get("amount_total") or 0) / 100, 2),
+            tier=tier,
+            zip_count=len(zip_codes),
+            ga_client_id=meta.get("ga_client_id"),
+        )
+    except Exception:
+        logger.warning("GA4 MP purchase failed sub=%s — non-fatal", subscriber.id, exc_info=True)
 
     # Campaign conversion attribution (B6)
     try:

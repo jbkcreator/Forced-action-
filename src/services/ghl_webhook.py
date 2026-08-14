@@ -534,6 +534,7 @@ def push_subscriber_to_ghl(
     tags: Optional[List[str]] = None,
     zip_codes: Optional[List[str]] = None,
     is_founding: bool = False,
+    utm_data: Optional[dict] = None,
     db=None,
 ) -> bool:
     """
@@ -596,11 +597,19 @@ def push_subscriber_to_ghl(
     base_url = settings.app_base_url.rstrip("/")
     dashboard_url = f"{base_url}/dashboard/{subscriber.event_feed_uuid}" if subscriber.event_feed_uuid else ""
 
+    utm = utm_data or {}
     cf_map = [
         (settings.ghl_cf_fa_tier,          getattr(subscriber, "tier", "") or ""),
         (settings.ghl_cf_fa_zip,            ",".join(zip_codes) if zip_codes else ""),
         (settings.ghl_cf_fa_founding,       "true" if is_founding else "false"),
         (settings.ghl_cf_fa_dashboard_url,  dashboard_url),
+        (settings.ghl_cf_utm_source,        utm.get("utm_source") or ""),
+        (settings.ghl_cf_utm_medium,        utm.get("utm_medium") or ""),
+        (settings.ghl_cf_utm_campaign,      utm.get("utm_campaign") or ""),
+        (settings.ghl_cf_utm_content,       utm.get("utm_content") or ""),
+        (settings.ghl_cf_utm_term,          utm.get("utm_term") or ""),
+        (settings.ghl_cf_utm_landing_path,  utm.get("landing_path") or ""),
+        (settings.ghl_cf_utm_referrer,      utm.get("referrer") or ""),
     ]
     for field_id, value in cf_map:
         if field_id:

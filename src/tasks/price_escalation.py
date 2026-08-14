@@ -1,16 +1,17 @@
 """
 6-month founding rate escalation task.
 
-Finds founding members whose rate lock has been in place for ≥ 6 months
-and whose subscription has NOT yet been escalated, then:
-  1. Updates their Stripe subscription to the current regular price.
-  2. Sets subscriber.escalated_at = now().
-  3. Sends a notification email.
+** DISABLED (2026-08-12) **
+Founding member rate escalation has been permanently disabled. Founding
+members keep their locked rate indefinitely. run_price_escalation() returns
+immediately with no DB or Stripe calls.
 
-Run weekly via cron (Monday at 8 AM so it never runs on a billing weekend):
-    0 8 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.price_escalation
-
-Supports --dry-run to preview eligible subscribers without making changes.
+Original behaviour (kept for reference):
+  Finds founding members whose rate lock has been in place for ≥ 6 months
+  and whose subscription has NOT yet been escalated, then:
+    1. Updates their Stripe subscription to the current regular price.
+    2. Sets subscriber.escalated_at = now().
+    3. Sends a notification email.
 """
 
 import logging
@@ -39,12 +40,14 @@ _SIX_MONTHS = timedelta(days=183)
 
 def run_price_escalation(dry_run: bool = False) -> dict:
     """
-    Escalate founding members who have passed the 6-month rate lock window.
-
-    Returns:
-        dict with keys: checked, eligible, escalated, failed, dry_run
+    No-op. Price escalation is permanently disabled (2026-08-12).
+    Founding members keep their rate lock indefinitely.
     """
-    settings = get_settings()
+    logger.info("[PriceEscalation] DISABLED — founding member rate escalation is permanently off. No action taken.")
+    return {"checked": 0, "eligible": 0, "escalated": 0, "failed": 0, "dry_run": dry_run, "disabled": True}
+
+    # --- original implementation preserved below, never reached ---
+    settings = get_settings()  # noqa: F841
     stats = {"checked": 0, "eligible": 0, "escalated": 0, "failed": 0, "dry_run": dry_run}
 
     if not settings.active_stripe_secret_key:

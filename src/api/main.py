@@ -884,6 +884,7 @@ def get_annual_signup_experiment_config():
 _ATTRIBUTION_META_KEYS = (
     "utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term",
     "campaign_id", "attribution_token", "fbclid", "ref",
+    "landing_path", "referrer", "ga_client_id",
 )
 # Stripe caps each metadata value at 500 chars.
 _MAX_META_VALUE_LEN = 480
@@ -920,7 +921,7 @@ class CheckoutRequest(BaseModel):
     email: str       # collected before checkout — used to block duplicate subscriptions
     interval: str = "monthly"  # monthly | annual — only meaningful for founder (picks its price)
     consent_acceptance: Optional[ConsentAcceptanceRequest] = None
-    attribution: Optional[dict] = None  # Meta Ads attribution (utm_*, campaign_id, fbclid, ...)
+    attribution: Optional[dict] = None  # Meta Ads attribution (utm_*, campaign_id, fbclid, landing_path, referrer, ga_client_id)
     # True when the buyer already has an authenticated dashboard session (e.g.
     # a free-tier subscriber upgrading from their dashboard), as opposed to an
     # anonymous landing-page visitor who has never seen their dashboard yet.
@@ -4681,6 +4682,8 @@ class SynthflowWebhookPayload(BaseModel):
             return "no_answer"
         if end_reason == "human_pick_up_cut_off":
             return "no_answer"
+        if end_reason in ("agent_goodbye", "user_goodbye", "completed"):
+            return "completed"
 
         status_map = {
             "no_answer":        "no_answer",
@@ -4787,7 +4790,48 @@ async def synthflow_webhook(request: Request):
         )
         return {"status": "error", "reason": "invalid_payload"}
 
+    call_id = payload.resolved_call_id
     phone = payload.resolved_phone
+
+    # Classic Synthflow sends a thin post-call ping (call_id, status,
+    # end_call_reason, duration) with no phone/transcript/recording/variables.
+    # Those live only on GET /calls/{id} — enrich from the API when missing.
+    if call_id and (not phone or not payload.resolved_transcript):
+        from src.services.synthflow_client import get_call_details
+        detail = get_call_details(call_id)
+        if detail:
+            pv = detail.get("prompt_variables") or {}
+            payload.call = {
+                "call_id": call_id,
+                "transcript": detail.get("transcript"),
+                "recording_url": detail.get("recording_url"),
+                "duration": detail.get("duration"),
+                "end_call_reason": detail.get("end_call_reason"),
+                "status": detail.get("status"),
+            }
+            payload.lead = {
+                "phone_number": (
+                    pv.get("user_phone_number") or pv.get("to_phone_number")
+                    or detail.get("phone_number_to")
+                ),
+                "prompt_variables": pv if isinstance(pv, dict) else {},
+            }
+            # Action-extracted outcomes (demo_requested, sample_requested, ...)
+            # live in executed_actions[*].return_value and collected_variables on
+            # the GET /calls/{id} record — carry them over so _vars can surface
+            # `outcome` instead of falling through to a generic `completed`.
+            _exec = detail.get("executed_actions")
+            if isinstance(_exec, dict):
+                payload.executed_actions = _exec
+            _collected = detail.get("collected_variables")
+            if isinstance(_collected, dict):
+                payload.collected_variables = _collected
+            # Top-level `outcome` on the thin ping is the raw end_call_reason —
+            # drop it so resolved_outcome prefers the action-extracted outcome
+            # (via _vars) and otherwise maps end_call_reason through our taxonomy.
+            payload.outcome = None
+            phone = payload.resolved_phone
+
     if not phone:
         logger.warning(
             "[Synthflow webhook] no phone resolved — top_level_keys=%s var_keys=%s",
@@ -4797,7 +4841,6 @@ async def synthflow_webhook(request: Request):
 
     v = payload._vars
     lead = payload.lead or {}
-    call_id = payload.resolved_call_id
 
     # Dedup: Synthflow retries on network errors — skip if already processed
     if call_id:
@@ -6778,6 +6821,10 @@ class FreeSignupRequest(BaseModel):
     utm_source: Optional[str] = None
     utm_medium: Optional[str] = None
     utm_campaign: Optional[str] = None
+    utm_content: Optional[str] = None
+    utm_term: Optional[str] = None
+    landing_path: Optional[str] = None
+    referrer: Optional[str] = None
     campaign_id: Optional[str] = None
     attribution_token: Optional[str] = None
     # fa081: affiliate ?aff= token, captured client-side and forwarded here.
@@ -6858,6 +6905,22 @@ def free_signup(req: FreeSignupRequest, request: Request, db: Session = Depends(
         referral_source=req.referral_source,
         send_welcome=not defer_welcome,
     )
+
+    # Push free-signup contact to GHL with UTM attribution (best-effort)
+    try:
+        from src.services.ghl_webhook import push_subscriber_to_ghl
+        utm_data = {
+            "utm_source":   req.utm_source,
+            "utm_medium":   req.utm_medium,
+            "utm_campaign": req.utm_campaign,
+            "utm_content":  req.utm_content,
+            "utm_term":     req.utm_term,
+            "landing_path": req.landing_path,
+            "referrer":     req.referrer,
+        }
+        push_subscriber_to_ghl(sub, stage=None, utm_data=utm_data, db=db)
+    except Exception:
+        logger.warning("GHL free-signup push failed (non-fatal):", exc_info=True)
 
     if req.consent_acceptance and req.consent_acceptance.terms_accepted:
         try:
