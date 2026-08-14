@@ -171,6 +171,30 @@ def record_batch_decision(
         store.mark_draft_status(db, draft_id, "rejected", reject_reason="batch_exception_reject")
         return {"ok": True, "action": "reject_item", "batch_id": batch_id, "draft_id": draft_id}
 
+    if action == "reject_batch":
+        if batch["status"] != "pending":
+            return {"ok": False, "reason": "batch_already_decided"}
+
+        items = _get_batch_items_with_drafts(db, batch_id)
+        rejected_count = 0
+        for item in items:
+            if item["decision"] != "included":
+                continue
+            db.execute(
+                text("UPDATE cora_batch_items SET decision = 'exception_rejected', decided_at = now() WHERE id = :id"),
+                {"id": item["item_id"]},
+            )
+            store.mark_draft_status(db, item["draft_id"], "rejected", reject_reason="batch_rejected")
+            rejected_count += 1
+        db.execute(
+            text(
+                "UPDATE cora_draft_batches SET status = 'rejected', decided_by = :decided_by, decided_at = now() "
+                "WHERE batch_id = :batch_id"
+            ),
+            {"decided_by": decided_by, "batch_id": batch_id},
+        )
+        return {"ok": True, "action": "reject_batch", "batch_id": batch_id, "rejected_count": rejected_count}
+
     if action == "approve_all":
         if batch["status"] != "pending":
             return {"ok": False, "reason": "batch_already_decided"}

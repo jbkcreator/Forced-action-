@@ -141,12 +141,27 @@ def reject_and_notify(
     """Records the rejection row, posts Slack, and returns the exception for
     the caller to raise or just log -- callers decide their own control flow
     (Cora->Relay's enqueue() raises; Hunter->Cora's target_producer.py logs
-    and skips the one bad row rather than crashing the whole sweep)."""
+    and skips the one bad row rather than crashing the whole sweep).
+
+    Deduplicates within 24 hours: if the same reference_id+boundary was
+    already rejected recently, skips both the DB insert and the Slack post so
+    a periodic sweep doesn't flood the channel with the same rejection."""
+    already = session.execute(
+        sa_text(
+            "SELECT id FROM handoff_rejections "
+            "WHERE boundary = :boundary AND reference_id = :reference_id "
+            "AND rejected_at >= NOW() - INTERVAL '24 hours' "
+            "LIMIT 1"
+        ),
+        {"boundary": boundary, "reference_id": reference_id},
+    ).first()
+    exc = HandoffRejected(boundary, missing_fields, reference_id)
+    if already:
+        return exc
     record_rejection(
         session, boundary=boundary, missing_fields=missing_fields,
         reference_id=reference_id, payload_snapshot=payload_snapshot,
     )
-    exc = HandoffRejected(boundary, missing_fields, reference_id)
     notify_slack_rejection(exc)
     return exc
 

@@ -111,6 +111,19 @@ def post_batch_for_approval(
             "action_id": "approve_all",
             "value": json.dumps({"batch_id": batch_id, "action": "approve_all"}),
         },
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Reject Batch"},
+            "style": "danger",
+            "action_id": "reject_batch",
+            "value": json.dumps({"batch_id": batch_id, "action": "reject_batch"}),
+            "confirm": {
+                "title": {"type": "plain_text", "text": "Reject entire batch?"},
+                "text": {"type": "mrkdwn", "text": "This will reject *all* drafts in this batch."},
+                "confirm": {"type": "plain_text", "text": "Yes, reject all"},
+                "deny": {"type": "plain_text", "text": "Cancel"},
+            },
+        },
     ]
     for draft in drafts:
         actions_elements.append({
@@ -176,6 +189,19 @@ def refresh_batch_card(
             "style": "primary",
             "action_id": "approve_all",
             "value": json.dumps({"batch_id": batch_id, "action": "approve_all"}),
+        },
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Reject Batch"},
+            "style": "danger",
+            "action_id": "reject_batch",
+            "value": json.dumps({"batch_id": batch_id, "action": "reject_batch"}),
+            "confirm": {
+                "title": {"type": "plain_text", "text": "Reject entire batch?"},
+                "text": {"type": "mrkdwn", "text": "This will reject *all* remaining drafts in this batch."},
+                "confirm": {"type": "plain_text", "text": "Yes, reject all"},
+                "deny": {"type": "plain_text", "text": "Cancel"},
+            },
         },
     ]
     for draft in active_drafts:

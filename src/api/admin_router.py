@@ -1629,7 +1629,7 @@ def _parse_slack_interactive_payload(raw: bytes) -> dict:
 
 
 @router.post("/slack/interact")
-async def slack_interact(request: Request, db: Session = Depends(get_db)):
+async def slack_interact(request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     """
     Single Interactivity Request URL for every Slack Block Kit button in
     this app. Slack allows exactly one Interactivity Request URL per app —
@@ -1648,7 +1648,7 @@ async def slack_interact(request: Request, db: Session = Depends(get_db)):
     actions = payload.get("actions", [])
     action_id = actions[0].get("action_id") if actions else None
 
-    _CORA_EXACT = frozenset({"approve_all", "ratify_standing_order", "decline_standing_order"})
+    _CORA_EXACT = frozenset({"approve_all", "reject_batch", "ratify_standing_order", "decline_standing_order"})
     _CORA_PREFIXES = ("reject_", "view_", "archive_standing_order_", "keep_standing_order_")
 
     if action_id == "county_launch_decision":
@@ -1660,7 +1660,7 @@ async def slack_interact(request: Request, db: Session = Depends(get_db)):
     if action_id in _CORA_EXACT or (
         action_id and any(action_id.startswith(p) for p in _CORA_PREFIXES)
     ):
-        return _handle_cora_batch_interact(payload, db)
+        return _handle_cora_batch_interact(payload, db, background_tasks)
 
     return _slack_ephemeral(f"Unrecognized action: {action_id}")
 
@@ -1917,9 +1917,63 @@ def _through_approver_authorized(user_id: str) -> bool:
     return bool(approvers) and user_id in approvers
 
 
-def _handle_cora_batch_interact(payload: dict, db: Session) -> dict:
+def _bg_batch_decision(batch_id: str, action: str, user_id: str, draft_id: Optional[str]) -> None:
+    """Background task: run the actual batch decision + Slack update after the endpoint has ACKed Slack."""
     from src.services.cora_throughput import batch_slack as through_slack
-    from src.services.cora_throughput.decisions import record_batch_decision, record_standing_order_decision
+    from src.services.cora_throughput.decisions import record_batch_decision
+
+    with get_db_context() as bg_db:
+        result = record_batch_decision(bg_db, batch_id, action, decided_by=user_id, draft_id=draft_id)
+        bg_db.commit()
+        if not result.get("ok"):
+            logger.warning("[Through] bg batch decision %s/%s failed: %s", batch_id[:8], action, result.get("reason"))
+            return
+
+        slack_message_ts = bg_db.execute(
+            text("SELECT slack_message_ts FROM cora_draft_batches WHERE batch_id = :batch_id"),
+            {"batch_id": batch_id},
+        ).scalar()
+
+        if action == "reject_item":
+            active = bg_db.execute(
+                text(
+                    "SELECT d.draft_id, d.opportunity_thread_id, d.cell_id, d.recommended_channel, "
+                    "d.subject, d.body, d.contact_email "
+                    "FROM cora_batch_items bi JOIN outbound_drafts d ON d.draft_id = bi.draft_id "
+                    "WHERE bi.batch_id = :batch_id AND bi.decision = 'included' ORDER BY bi.id ASC"
+                ),
+                {"batch_id": batch_id},
+            ).mappings().all()
+            rejected_ids = [
+                r[0] for r in bg_db.execute(
+                    text(
+                        "SELECT draft_id FROM cora_batch_items "
+                        "WHERE batch_id = :batch_id AND decision = 'exception_rejected'"
+                    ),
+                    {"batch_id": batch_id},
+                ).all()
+            ]
+            if slack_message_ts:
+                through_slack.refresh_batch_card(slack_message_ts, batch_id, [dict(d) for d in active], rejected_ids)
+        elif action == "reject_batch":
+            reply_text = (
+                f":no_entry: Batch rejected by <@{user_id}> — "
+                f"{result['rejected_count']} draft(s) rejected."
+            )
+            if slack_message_ts:
+                through_slack.update_batch_slack_message(slack_message_ts, reply_text)
+        else:
+            reply_text = (
+                f":white_check_mark: Batch approved by <@{user_id}> — "
+                f"{result['approved_count']} sent to Relay, {result['rejected_count']} exception-rejected."
+            )
+            if slack_message_ts:
+                through_slack.update_batch_slack_message(slack_message_ts, reply_text)
+
+
+def _handle_cora_batch_interact(payload: dict, db: Session, background_tasks: BackgroundTasks) -> dict:
+    from src.services.cora_throughput import batch_slack as through_slack
+    from src.services.cora_throughput.decisions import record_standing_order_decision
 
     user_id = payload.get("user", {}).get("id", "")
     if not _through_approver_authorized(user_id):
@@ -1971,51 +2025,21 @@ def _handle_cora_batch_interact(payload: dict, db: Session) -> dict:
 
     batch_id = action_data.get("batch_id")
     draft_id = action_data.get("draft_id")
-    if not batch_id or action not in ("approve_all", "reject_item"):
+    if not batch_id or action not in ("approve_all", "reject_batch", "reject_item"):
         raise HTTPException(status_code=400, detail="Invalid action data")
 
-    result = record_batch_decision(db, batch_id, action, decided_by=user_id, draft_id=draft_id)
-    db.commit()
-
-    if not result.get("ok"):
-        return _slack_ephemeral(f"Batch {batch_id[:8]}: {result.get('reason', 'could not be decided')}.")
-
-    slack_message_ts_row = db.execute(
-        text("SELECT slack_message_ts FROM cora_draft_batches WHERE batch_id = :batch_id"),
+    # Quick idempotency check — give instant feedback on stale/decided batches.
+    batch_status = db.execute(
+        text("SELECT status FROM cora_draft_batches WHERE batch_id = :batch_id"),
         {"batch_id": batch_id},
-    ).first()
-    slack_message_ts = slack_message_ts_row[0] if slack_message_ts_row else None
+    ).scalar()
+    if batch_status is None:
+        return _slack_ephemeral(f"Batch {batch_id[:8]}: not found.")
+    if batch_status != "pending":
+        return _slack_ephemeral(f"Batch {batch_id[:8]}: already {batch_status}.")
 
-    if action == "reject_item":
-        # Refresh the card: rejected item shown as struck-out, rest still actionable.
-        active = db.execute(
-            text(
-                "SELECT d.draft_id, d.opportunity_thread_id, d.cell_id, d.recommended_channel, "
-                "d.subject, d.body, d.contact_email "
-                "FROM cora_batch_items bi JOIN outbound_drafts d ON d.draft_id = bi.draft_id "
-                "WHERE bi.batch_id = :batch_id AND bi.decision = 'included' ORDER BY bi.id ASC"
-            ),
-            {"batch_id": batch_id},
-        ).mappings().all()
-        rejected_ids = [
-            r[0] for r in db.execute(
-                text(
-                    "SELECT draft_id FROM cora_batch_items "
-                    "WHERE batch_id = :batch_id AND decision = 'exception_rejected'"
-                ),
-                {"batch_id": batch_id},
-            ).all()
-        ]
-        through_slack.refresh_batch_card(slack_message_ts, batch_id, [dict(d) for d in active], rejected_ids)
-        return {"ok": True}
-
-    reply_text = (
-        f":white_check_mark: Batch approved by <@{user_id}> — "
-        f"{result['approved_count']} sent to Relay, {result['rejected_count']} exception-rejected."
-    )
-    if slack_message_ts:
-        through_slack.update_batch_slack_message(slack_message_ts, reply_text)
-
+    # ACK Slack within the 3-second window; relay enqueue + Slack update run in background.
+    background_tasks.add_task(_bg_batch_decision, batch_id, action, user_id, draft_id)
     return {"ok": True}
 
 
