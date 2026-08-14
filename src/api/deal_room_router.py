@@ -23,6 +23,7 @@ from src.api.deps import VALID_VERTICALS, get_db
 from src.services.hold_lifecycle_service import create_deal_room
 from src.services.lead_pool_service import get_lead_pool
 from src.services import pricing_truth
+from src.utils.test_account import is_test_subscriber
 
 logger = logging.getLogger(__name__)
 
@@ -334,6 +335,13 @@ def create_hold_checkout(body: _HoldCheckoutRequest, db: Session = Depends(get_d
         raise HTTPException(status_code=404, detail="Deal room not found.")
     if not row.zip_code:
         raise HTTPException(status_code=409, detail="Deal room has no ZIP — cannot create hold checkout.")
+
+    if is_test_subscriber(row.prospect_email):
+        logger.warning(
+            "[hold_checkout] blocked test-account email=%s for token=%s",
+            row.prospect_email, body.deal_room_token,
+        )
+        raise HTTPException(status_code=403, detail="Hold checkout not available for test accounts.")
 
     price_id = settings.active_hold_deposit_price_id
     if not price_id:
