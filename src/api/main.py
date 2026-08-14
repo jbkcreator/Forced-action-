@@ -462,7 +462,12 @@ def _classify_scraper_issues(issue_rows) -> tuple[list, list]:
             data_unavailable.append({**entry, "reason": "no_data"})
         elif r.error_type == "rate_limited":
             data_unavailable.append({**entry, "reason": "rate_limited"})
-        elif not r.run_success:
+        elif not r.run_success or r.error_type == "scraper_error":
+            # error_type='scraper_error' is always a real, actionable error
+            # even when run_success=True — the storm/flood zone-fetch
+            # helpers mark a partial-zone outage this way (some zones still
+            # produced usable data), and that must never be downgraded to
+            # the informational "zero_rows_unclassified" bucket below.
             real_errors.append({
                 **entry,
                 "error_type": r.error_type or "scraper_error",
