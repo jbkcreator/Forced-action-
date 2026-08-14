@@ -50,9 +50,15 @@ STORM_EVENT_TYPES = [
 ]
 
 
-def _fetch_nws_alerts_by_zones(zone_ids: List[str]) -> List[Dict]:
-    """Fetch active NWS alerts for a list of NWS zone IDs (preferred — precise)."""
+def _fetch_nws_alerts_by_zones(zone_ids: List[str]) -> Tuple[List[Dict], List[str]]:
+    """Fetch active NWS alerts for a list of NWS zone IDs (preferred — precise).
+
+    Returns (features, failed_zone_ids). A zone that failed never checked for
+    alerts, so it must be surfaced even when other zones succeeded — a partial
+    outage is not the same as a clean run.
+    """
     features = []
+    failed_zones = []
     for zone_id in zone_ids:
         try:
             resp = requests.get(
@@ -65,11 +71,15 @@ def _fetch_nws_alerts_by_zones(zone_ids: List[str]) -> List[Dict]:
             features.extend(resp.json().get("features", []))
         except Exception as e:
             logger.warning("[storm] NWS zone fetch failed for %s: %s", zone_id, e)
-    return features
+            failed_zones.append(f"{zone_id}: {e}")
+    return features, failed_zones
 
 
-def _fetch_nws_alerts(state: str = "FL") -> List[Dict]:
-    """Fetch active NWS alerts for a state (fallback when no zone IDs configured)."""
+def _fetch_nws_alerts(state: str = "FL") -> Tuple[List[Dict], Optional[str]]:
+    """Fetch active NWS alerts for a state (fallback when no zone IDs configured).
+
+    Returns (features, error) — error is set if the API call itself failed.
+    """
     try:
         resp = requests.get(
             _NWS_ALERTS_URL,
@@ -78,10 +88,10 @@ def _fetch_nws_alerts(state: str = "FL") -> List[Dict]:
             timeout=15,
         )
         resp.raise_for_status()
-        return resp.json().get("features", [])
+        return resp.json().get("features", []), None
     except Exception as e:
         logger.warning("[storm] NWS API fetch failed: %s", e, exc_info=True)
-        return []
+        return [], str(e)
 
 
 def scrape_storm_damage(
@@ -106,10 +116,13 @@ def scrape_storm_damage(
 
     if nws_zones:
         logger.info("[storm] %s: fetching alerts via %d zone(s): %s", county_id, len(nws_zones), nws_zones)
-        alerts = _fetch_nws_alerts_by_zones(nws_zones)
+        alerts, failed_zones = _fetch_nws_alerts_by_zones(nws_zones)
+        fetch_error = "; ".join(failed_zones) if failed_zones else None
+        total_fetch_failure = len(failed_zones) == len(nws_zones)
     else:
         logger.info("[storm] %s: no nws_zones configured, falling back to state-level fetch", county_id)
-        alerts = _fetch_nws_alerts(state)
+        alerts, fetch_error = _fetch_nws_alerts(state)
+        total_fetch_failure = bool(fetch_error)
 
     qualifying = [
         a for a in alerts
@@ -149,14 +162,41 @@ def scrape_storm_damage(
     )
     try:
         from src.utils.scraper_db_helper import record_scraper_stats
-        record_scraper_stats(
-            source_type='storm_damage',
-            total_scraped=len(qualifying),
-            matched=tagged,
-            unmatched=0,
-            skipped=duplicates,
-            county_id=county_id,
-        )
+        if fetch_error:
+            # A zone (or the state-level fetch) failed — real signals may
+            # have been missed, so this can never be reported as a clean
+            # run or a confirmed no-data day, even if other zones succeeded.
+            record_scraper_stats(
+                source_type='storm_damage',
+                total_scraped=len(qualifying),
+                matched=tagged,
+                unmatched=0,
+                skipped=duplicates,
+                county_id=county_id,
+                run_success=not total_fetch_failure,
+                error_type="scraper_error",
+                error_message=fetch_error[:500],
+            )
+        elif qualifying:
+            record_scraper_stats(
+                source_type='storm_damage',
+                total_scraped=len(qualifying),
+                matched=tagged,
+                unmatched=0,
+                skipped=duplicates,
+                county_id=county_id,
+                error_type="none",
+            )
+        else:
+            record_scraper_stats(
+                source_type='storm_damage',
+                total_scraped=0,
+                matched=0,
+                unmatched=0,
+                skipped=0,
+                county_id=county_id,
+                error_type="no_data",
+            )
     except Exception as stats_err:
         logger.warning("⚠ Could not record scraper stats (non-critical): %s", stats_err)
     return tagged

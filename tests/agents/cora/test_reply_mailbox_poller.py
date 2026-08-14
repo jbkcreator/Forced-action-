@@ -336,6 +336,83 @@ def test_one_publish_failure_does_not_block_other_messages_in_same_poll(fresh_db
     assert poller._already_seen("msg-ok") is True
 
 
+# ── Gmail 404 on messages.get() must be terminal, not retryable — else the
+# watermark gets stuck on a message that will never succeed on retry. ───────
+
+def test_a_404_on_messages_get_is_terminal_not_retryable(fresh_db, monkeypatch):
+    class _FakeHttpError(Exception):
+        def __init__(self):
+            self.resp = MagicMock(status=404)
+
+    service = MagicMock()
+    service.users.return_value.messages.return_value.get.return_value.execute.side_effect = _FakeHttpError()
+
+    result = poller._process_candidate_message(service, "msg-gone", fresh_db)
+
+    assert result is False
+    assert poller._already_seen("msg-gone") is True
+
+
+def test_history_poll_advances_watermark_past_a_404_message(fresh_db, monkeypatch):
+    _seed_draft_for(fresh_db, "OPP-404-HIST", "prospect@example.com")
+    poller._save_history_id("hid-before-404")
+
+    class _FakeHttpError(Exception):
+        def __init__(self):
+            self.resp = MagicMock(status=404)
+
+    service = MagicMock()
+    service.users.return_value.history.return_value.list.return_value.execute.return_value = {
+        "historyId": "hid-after-404",
+        "history": [{"messagesAdded": [{"message": {"id": "msg-dead"}}]}],
+    }
+    service.users.return_value.messages.return_value.get.return_value.execute.side_effect = _FakeHttpError()
+    monkeypatch.setattr(poller, "_build_gmail_service", lambda: service)
+
+    published = poller.poll_once(fresh_db)
+
+    assert published == 0
+    # The watermark must advance even though every message in this batch was
+    # a permanently-gone 404 — a stuck cursor here would silently block every
+    # real reply that arrived after it too.
+    assert poller._get_saved_history_id() == "hid-after-404"
+    assert poller._already_seen("msg-dead") is True
+
+
+def test_a_404_message_does_not_block_a_real_message_in_the_same_batch(fresh_db, monkeypatch):
+    _seed_draft_for(fresh_db, "OPP-404-MIXED", "good@example.com")
+    poller._save_history_id("hid-existing")
+
+    class _FakeHttpError(Exception):
+        def __init__(self):
+            self.resp = MagicMock(status=404)
+
+    service = MagicMock()
+    service.users.return_value.history.return_value.list.return_value.execute.return_value = {
+        "historyId": "hid-next",
+        "history": [{"messagesAdded": [
+            {"message": {"id": "msg-dead"}},
+            {"message": {"id": "msg-good"}},
+        ]}],
+    }
+
+    def _get(userId, id, format):
+        result = MagicMock()
+        if id == "msg-dead":
+            result.execute.side_effect = _FakeHttpError()
+        else:
+            result.execute.return_value = _fake_message("msg-good", "good@example.com", "Re:", "hi")
+        return result
+
+    service.users.return_value.messages.return_value.get.side_effect = _get
+    monkeypatch.setattr(poller, "_build_gmail_service", lambda: service)
+
+    published = poller.poll_once(fresh_db)
+
+    assert published == 1
+    assert poller._get_saved_history_id() == "hid-next"
+
+
 # ── MIME decoding (unchanged by the redesign) ────────────────────────────────
 
 def test_decode_body_walks_multipart_preferring_plain_text():

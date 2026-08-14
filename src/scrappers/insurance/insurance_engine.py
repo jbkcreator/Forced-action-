@@ -59,13 +59,17 @@ _FEMA_BATCH = 1000
 _FEMA_MAX_PAGES = 20
 
 
-def _fetch_fema_ia_registrants(state: str, county_display: str) -> List[Dict]:
+def _fetch_fema_ia_registrants(state: str, county_display: str) -> Tuple[List[Dict], Optional[str]]:
     """
     Fetch FEMA Housing Assistance Owners records for a specific county (grouped by ZIP).
 
     Filters by both state and county name to avoid pulling 22k+ statewide rows.
     Paginates with $skip until all pages are collected (county counts: ~1,150–1,500).
     Returns newest disasters first ($orderby=disasterNumber desc).
+
+    Returns (results, error). `error` is set whenever a page failed — even
+    one after earlier pages succeeded — since the un-fetched pages' records
+    are silently missing and the caller must not report this as a clean run.
     """
     # Build query string manually — requests.params URL-encodes $ which breaks FEMA API
     base = (
@@ -76,6 +80,7 @@ def _fetch_fema_ia_registrants(state: str, county_display: str) -> List[Dict]:
         f"&$top={_FEMA_BATCH}&$format=json"
     )
     results: List[Dict] = []
+    error = None
     for page in range(_FEMA_MAX_PAGES):
         url = base if page == 0 else f"{base}&$skip={page * _FEMA_BATCH}"
         try:
@@ -89,8 +94,9 @@ def _fetch_fema_ia_registrants(state: str, county_display: str) -> List[Dict]:
                 break
         except Exception as e:
             logger.warning("[insurance] FEMA IA API failed (page %d): %s", page, e, exc_info=True)
+            error = f"page {page}: {e}"
             break
-    return results
+    return results, error
 
 
 def _get_insurance_permits(db, county_id: str, start_date: date, end_date: date) -> List:
@@ -170,7 +176,7 @@ def scrape_insurance_claims(
         db.commit()
 
         # ── Source 2: FEMA IA registrants → match by ZIP ──────────────────
-        fema_registrants = _fetch_fema_ia_registrants(state, county_display)
+        fema_registrants, fema_error = _fetch_fema_ia_registrants(state, county_display)
 
         # FEMA is scoped to county by filter; the DB query below also scopes by
         # Property.county_id == county_id for an extra safety guard.
@@ -249,14 +255,43 @@ def scrape_insurance_claims(
 
     try:
         from src.utils.scraper_db_helper import record_scraper_stats
-        record_scraper_stats(
-            source_type='insurance_claims',
-            total_scraped=created + skipped_duplicate,
-            matched=created,
-            unmatched=0,
-            skipped=skipped_duplicate,
-            county_id=county_id,
-        )
+        _total = created + skipped_duplicate
+        if fema_error:
+            # A FEMA IA page failed — even if earlier pages produced usable
+            # records, the un-fetched pages' claims are silently missing, so
+            # this can never be reported as a clean run or a confirmed
+            # no-data day.
+            record_scraper_stats(
+                source_type='insurance_claims',
+                total_scraped=_total,
+                matched=created,
+                unmatched=0,
+                skipped=skipped_duplicate,
+                county_id=county_id,
+                run_success=bool(fema_registrants),
+                error_type="scraper_error",
+                error_message=fema_error[:500],
+            )
+        elif _total:
+            record_scraper_stats(
+                source_type='insurance_claims',
+                total_scraped=_total,
+                matched=created,
+                unmatched=0,
+                skipped=skipped_duplicate,
+                county_id=county_id,
+                error_type="none",
+            )
+        else:
+            record_scraper_stats(
+                source_type='insurance_claims',
+                total_scraped=0,
+                matched=0,
+                unmatched=0,
+                skipped=0,
+                county_id=county_id,
+                error_type="no_data",
+            )
     except Exception as stats_err:
         logger.warning("⚠ Could not record scraper stats (non-critical): %s", stats_err)
     return created

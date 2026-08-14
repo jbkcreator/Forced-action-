@@ -28,6 +28,7 @@ from src.agents.vera.checks.revenue_truth import (
     _select_prior_day_row,
     _stripe_mrr,
     _summarize_refunds_disputes,
+    check_mrr,
     check_subscriber_reconciliation,
     render_revenue_truth_report,
 )
@@ -595,3 +596,64 @@ def test_check_subscriber_reconciliation_abstains_when_trialing_pull_fails(monke
 
     assert result.stripe_ok is False
     assert result.access_not_paying_count == 0
+
+
+@contextmanager
+def _fake_mrr_session_scope(db_total, null_count, test_customer_ids):
+    class _ScalarResult:
+        def __init__(self, value):
+            self._value = value
+
+        def scalar(self):
+            return self._value
+
+    class _ScalarsResult:
+        def __init__(self, values):
+            self._values = values
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return self._values
+
+    class _Session:
+        def execute(self, stmt, *_args, **_kwargs):
+            sql = str(stmt)
+            if "SUM(plan_price)" in sql:
+                return _ScalarResult(db_total)
+            if "COUNT(*)" in sql:
+                return _ScalarResult(null_count)
+            return _ScalarsResult(test_customer_ids)
+
+    yield _Session()
+
+
+def test_check_mrr_excludes_is_test_customers_from_stripe_side(monkeypatch):
+    # A subscriber flagged is_test (internal/QA account, e.g. @heu.ai) is
+    # already excluded from DB MRR by the SUM(...) query's is_test filter.
+    # Stripe has no concept of is_test, so a live-mode subscription checked
+    # out on such an account must be excluded here too, or it shows up as
+    # pure drift (Stripe MRR > DB MRR) with no real cause.
+    monkeypatch.setattr(
+        revenue_truth.vera_db, "session_scope",
+        lambda: _fake_mrr_session_scope(Decimal("49.00"), 0, ["cus_test_account"]),
+    )
+    active_subs_by_customer = {
+        "cus_real": {
+            "items": {"data": [{
+                "price": {"unit_amount": 4900, "recurring": {"interval": "month"}},
+            }]},
+        },
+        "cus_test_account": {
+            "items": {"data": [{
+                "price": {"unit_amount": 29900, "recurring": {"interval": "month"}},
+            }]},
+        },
+    }
+
+    result = check_mrr(active_subs_by_customer)
+
+    assert result.db_total_cents == 4900
+    assert result.stripe_total_cents == 4900
+    assert result.drift_cents == 0

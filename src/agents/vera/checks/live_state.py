@@ -448,12 +448,22 @@ def check_silent_failures(
     with vera_db.session_scope() as session:
         rows = session.execute(
             text(
-                "SELECT source_type, county_id, total_scraped FROM scraper_run_stats "
+                "SELECT source_type, county_id, total_scraped, error_type FROM scraper_run_stats "
                 "WHERE run_date = :run_date AND run_success = true AND total_scraped = 0"
             ),
             {"run_date": run_date},
         ).mappings().all()
     zero_ingest = [dict(row) for row in rows]
+    # Mirrors src/api/main.py:_classify_scraper_issues — a scraper that ran
+    # fine and legitimately found nothing (error_type='no_data'/'rate_limited')
+    # is not the same signal as one that reported success with zero rows and
+    # no explanation at all.
+    zero_ingest_confirmed_no_data = [
+        row for row in zero_ingest if row.get("error_type") in ("no_data", "rate_limited")
+    ]
+    zero_ingest_unexplained = [
+        row for row in zero_ingest if row.get("error_type") not in ("no_data", "rate_limited")
+    ]
 
     unscheduled: list[str] = []
     if crontab_path.exists():
@@ -469,7 +479,12 @@ def check_silent_failures(
             crontab_path,
         )
 
-    return {"zero_ingest": zero_ingest, "unscheduled": unscheduled}
+    return {
+        "zero_ingest": zero_ingest,
+        "zero_ingest_confirmed_no_data": zero_ingest_confirmed_no_data,
+        "zero_ingest_unexplained": zero_ingest_unexplained,
+        "unscheduled": unscheduled,
+    }
 
 
 def _write_silent_failure_facts(silent: dict) -> None:
@@ -631,15 +646,29 @@ def render_live_state_report(
 
     # ── SILENT FAILURES ───────────────────────────────────────────────────
     lines += ["", "SILENT FAILURES"]
-    if silent["zero_ingest"]:
-        lines.append("  Scheduled-but-writing-nothing today:")
-        for row in silent["zero_ingest"]:
+    confirmed_no_data = silent["zero_ingest_confirmed_no_data"]
+    unexplained = silent["zero_ingest_unexplained"]
+
+    if confirmed_no_data:
+        lines.append("  ℹ️ No new data today (confirmed — nothing to report):")
+        for row in confirmed_no_data:
             lines.append(f"    - {row['source_type']}/{row['county_id']}")
-        zero_ingest_html = html_list(
-            f"{row['source_type']}/{row['county_id']}" for row in silent["zero_ingest"]
+        confirmed_no_data_html = html_list(
+            [f"{row['source_type']}/{row['county_id']}" for row in confirmed_no_data]
         )
     else:
-        lines.append("  Scheduled-but-writing-nothing: none")
+        lines.append("  ℹ️ No new data today (confirmed): none")
+        confirmed_no_data_html = html_note("No new data today (confirmed): none")
+
+    if unexplained:
+        lines.append("  \U0001f527 Scheduled-but-writing-nothing — needs investigation:")
+        for row in unexplained:
+            lines.append(f"    - {row['source_type']}/{row['county_id']}")
+        zero_ingest_html = html_list(
+            [f"{row['source_type']}/{row['county_id']}" for row in unexplained]
+        )
+    else:
+        lines.append("  \U0001f527 Scheduled-but-writing-nothing: none")
         zero_ingest_html = html_note("Scheduled-but-writing-nothing: none")
 
     if silent["unscheduled"]:
@@ -656,7 +685,7 @@ def render_live_state_report(
 
     subject = (
         f"[Vera] Live-State Report {report_date.isoformat()} — "
-        f"drift={deploy['drift']}, {len(stale)} stale, {len(silent['zero_ingest'])} zero-ingest"
+        f"drift={deploy['drift']}, {len(stale)} stale, {len(unexplained)} zero-ingest"
     )
 
     html_body = html_shell(
@@ -668,7 +697,9 @@ def render_live_state_report(
             + html_section("Cron Freshness", cron_html)
             + html_section(
                 "Silent Failures",
-                "<p style=\"color:#94a3b8;font-size:12px;margin:4px 0;\">Scheduled-but-writing-nothing:</p>"
+                "<p style=\"color:#94a3b8;font-size:12px;margin:4px 0;\">No new data today (confirmed — nothing to report):</p>"
+                + confirmed_no_data_html
+                + "<p style=\"color:#94a3b8;font-size:12px;margin:8px 0 4px;\">Scheduled-but-writing-nothing — needs investigation:</p>"
                 + zero_ingest_html
                 + "<p style=\"color:#94a3b8;font-size:12px;margin:8px 0 4px;\">Enabled-but-unscheduled:</p>"
                 + unscheduled_html
@@ -735,7 +766,7 @@ def run_live_state() -> int:
         deploy["drift"] not in ("in_sync", "unknown")
         or bool(deploy["pending_migrations"])
         or stale_count > 0
-        or bool(silent["zero_ingest"])
+        or bool(silent["zero_ingest_unexplained"])
     )
     if is_actionable:
         validate_finding(
