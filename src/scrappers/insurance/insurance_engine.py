@@ -67,9 +67,9 @@ def _fetch_fema_ia_registrants(state: str, county_display: str) -> Tuple[List[Di
     Paginates with $skip until all pages are collected (county counts: ~1,150–1,500).
     Returns newest disasters first ($orderby=disasterNumber desc).
 
-    Returns (results, error). `error` is only set if the API failed before any
-    page returned data — a failure on a later page still leaves the earlier
-    results usable, so it isn't a full-fetch failure.
+    Returns (results, error). `error` is set whenever a page failed — even
+    one after earlier pages succeeded — since the un-fetched pages' records
+    are silently missing and the caller must not report this as a clean run.
     """
     # Build query string manually — requests.params URL-encodes $ which breaks FEMA API
     base = (
@@ -94,8 +94,7 @@ def _fetch_fema_ia_registrants(state: str, county_display: str) -> Tuple[List[Di
                 break
         except Exception as e:
             logger.warning("[insurance] FEMA IA API failed (page %d): %s", page, e, exc_info=True)
-            if not results:
-                error = str(e)
+            error = f"page {page}: {e}"
             break
     return results, error
 
@@ -257,7 +256,23 @@ def scrape_insurance_claims(
     try:
         from src.utils.scraper_db_helper import record_scraper_stats
         _total = created + skipped_duplicate
-        if _total:
+        if fema_error:
+            # A FEMA IA page failed — even if earlier pages produced usable
+            # records, the un-fetched pages' claims are silently missing, so
+            # this can never be reported as a clean run or a confirmed
+            # no-data day.
+            record_scraper_stats(
+                source_type='insurance_claims',
+                total_scraped=_total,
+                matched=created,
+                unmatched=0,
+                skipped=skipped_duplicate,
+                county_id=county_id,
+                run_success=bool(fema_registrants),
+                error_type="scraper_error",
+                error_message=fema_error[:500],
+            )
+        elif _total:
             record_scraper_stats(
                 source_type='insurance_claims',
                 total_scraped=_total,
@@ -266,20 +281,6 @@ def scrape_insurance_claims(
                 skipped=skipped_duplicate,
                 county_id=county_id,
                 error_type="none",
-            )
-        elif fema_error:
-            # The FEMA IA fetch itself failed — this is NOT a confirmed
-            # no-data day, don't let it masquerade as one.
-            record_scraper_stats(
-                source_type='insurance_claims',
-                total_scraped=0,
-                matched=0,
-                unmatched=0,
-                skipped=0,
-                county_id=county_id,
-                run_success=False,
-                error_type="scraper_error",
-                error_message=fema_error[:500],
             )
         else:
             record_scraper_stats(
