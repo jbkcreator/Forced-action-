@@ -1088,10 +1088,11 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
     # a hold token matching a held, unexpired deal room for this exact
     # (zip, vertical, county), that ZIP is not counted as taken for this buyer.
     _allowed_held_zip = None
+    _hold_expires_at = None
     if payload.hold_token:
         _held_row = db.execute(
             text(
-                "SELECT zip_code FROM deal_rooms "
+                "SELECT zip_code, expires_at FROM deal_rooms "
                 "WHERE token = :t AND vertical = :v AND county_id = :c "
                 "AND held_at IS NOT NULL AND (expires_at IS NULL OR expires_at > NOW())"
             ),
@@ -1099,6 +1100,20 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
         ).fetchone()
         if _held_row is not None:
             _allowed_held_zip = _held_row.zip_code
+            _hold_expires_at = _held_row.expires_at
+            # Reject if fewer than 30 minutes remain on the hold — a Stripe
+            # session opened this close to expiry would likely complete after
+            # the hold lapses, leaving the buyer charged with no territory.
+            if _hold_expires_at is not None:
+                _remaining = (_hold_expires_at - datetime.now(timezone.utc)).total_seconds()
+                if _remaining < 1800:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "error": "hold_expiring_soon",
+                            "message": "Your territory hold is expiring soon and cannot be used for checkout. Please contact support.",
+                        },
+                    )
 
     taken_zips = [
         r.zip_code for r in taken_rows
@@ -1214,8 +1229,10 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
     }
     if payload.ghl_contact_id:
         checkout_metadata["ghl_contact_id"] = payload.ghl_contact_id
-    # 3m deal-room: carry the hold token so the webhook refunds the $97 (ADR 0035).
-    if payload.hold_token:
+    # 3m deal-room: carry the hold token only when the hold was validated above.
+    # Passing an invalid/expired token would let refund_on_conversion trigger
+    # against an unrelated or forfeited deposit.
+    if payload.hold_token and _allowed_held_zip is not None:
         checkout_metadata["hold"] = payload.hold_token
     # Meta Ads attribution + buyer IP/UA captured from the buyer's request.
     checkout_metadata.update(_attribution_stripe_metadata(request, payload.attribution))
@@ -1256,6 +1273,13 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
         return_url=f"{_s.app_base_url}{_return_path}",
         allow_promotion_codes=True,
     )
+    # Tie session lifetime to the hold so the session can't complete after the
+    # hold lapses. Stripe accepts expires_at in [30m, 24h] from now.
+    if _hold_expires_at is not None:
+        _now_ts = datetime.now(timezone.utc)
+        _max_stripe_expiry = _now_ts + timedelta(hours=24)
+        _session_expiry = min(_hold_expires_at, _max_stripe_expiry)
+        _checkout_kwargs["expires_at"] = int(_session_expiry.timestamp())
     if payload.ghl_contact_id:
         _checkout_kwargs["client_reference_id"] = payload.ghl_contact_id
     # Stripe rejects a session that sets both `allow_promotion_codes` and

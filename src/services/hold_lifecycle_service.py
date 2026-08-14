@@ -427,7 +427,19 @@ def refund_on_conversion(db: Session, stripe_client: Any, *, token: str) -> None
         )
         return
 
-    deal_room_obj.converted_at = _now()
+    # Guard: an expired hold is forfeited — do not refund it. The checkout
+    # endpoint only writes the hold token into Stripe metadata when the hold
+    # is valid, but this check catches any path that bypasses that gate.
+    now = _now()
+    if deal_room_obj.expires_at is not None and deal_room_obj.expires_at < now:
+        logger.warning(
+            "[hold_lifecycle] refund_on_conversion: token %s is expired (expires_at=%s) "
+            "— deposit forfeited, refusing refund",
+            token, deal_room_obj.expires_at,
+        )
+        return
+
+    deal_room_obj.converted_at = now
     db.flush()
     _refund_hold(db, stripe_client, deal_room_obj)
 

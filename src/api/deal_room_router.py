@@ -23,6 +23,7 @@ from src.api.deps import VALID_VERTICALS, get_db
 from src.services.hold_lifecycle_service import create_deal_room
 from src.services.lead_pool_service import get_lead_pool
 from src.services import pricing_truth
+from src.utils.county_config import is_county_launched
 
 logger = logging.getLogger(__name__)
 
@@ -266,6 +267,9 @@ def demo_create_deal_room(
     Raises 409 if the ZIP is not 'available'.
     Tier must be starter | pro | founder (Dominator is retired).
     """
+    if not is_county_launched(body.county_id, db):
+        raise HTTPException(status_code=400, detail="county_not_launched")
+
     settings = get_settings()
 
     properties = get_lead_pool(zip_code=body.zip_code, limit=100)

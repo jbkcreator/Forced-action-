@@ -367,7 +367,8 @@ def handle_webhook(raw_body: bytes, sig_header: str, db: Session, background_tas
     locked_zips: list = []
     try:
         if handler is _on_checkout_completed:
-            handler(data, db, background_tasks=background_tasks, locked_zips_out=locked_zips)
+            event_created_at = datetime.fromtimestamp(event.get("created", time.time()), tz=timezone.utc)
+            handler(data, db, background_tasks=background_tasks, locked_zips_out=locked_zips, event_created_at=event_created_at)
         else:
             handler(data, db)
         # Plant the dedupe row in the SAME transaction as the handler writes,
@@ -411,6 +412,7 @@ def handle_webhook(raw_body: bytes, sig_header: str, db: Session, background_tas
 def _on_checkout_completed(
     session: dict, db: Session, background_tasks=None,
     locked_zips_out: Optional[list] = None,
+    event_created_at: Optional[datetime] = None,
 ) -> None:
     """
     FAST PATH — synchronous, runs inside the webhook request's transaction.
@@ -961,13 +963,18 @@ def _on_checkout_completed(
     _held_ok: set = set()
     _hold_token = meta.get("hold")
     if _hold_token:
+        # Validate the hold against when the customer completed checkout
+        # (Stripe event.created), not server webhook-receipt time. This
+        # correctly handles delayed delivery and retries without a fixed
+        # grace window that could still strand customers on longer delays.
+        _completion_time = event_created_at or now
         _held_row = db.execute(
             text(
                 "SELECT zip_code, vertical, county_id FROM deal_rooms "
                 "WHERE token = :t AND held_at IS NOT NULL "
-                "AND (expires_at IS NULL OR expires_at > :now)"
+                "AND (expires_at IS NULL OR expires_at > :completed_at)"
             ),
-            {"t": _hold_token, "now": now},
+            {"t": _hold_token, "completed_at": _completion_time},
         ).fetchone()
         if _held_row is not None:
             _held_ok.add((_held_row.zip_code, _held_row.vertical, _held_row.county_id))
