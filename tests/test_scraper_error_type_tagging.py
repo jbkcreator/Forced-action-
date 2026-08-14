@@ -31,10 +31,17 @@ def _patched_stats():
 
 
 # ── storm_engine ──────────────────────────────────────────────────────────
+# _fetch_nws_alerts_by_zones/_fetch_nws_flood_alerts_by_zones now return
+# (features, failed_zone_ids) instead of (features, error_or_None) — a
+# single bad zone among several must be surfaced even when others succeed
+# (PR #232 review, issue 1), so "no error" is an empty list, not None.
+
+_TWO_ZONE_CONFIG = {**_COUNTY_CONFIG, "nws_zones": ["FLZ151", "FLZ251"]}
+
 
 def test_storm_fetch_failure_reports_scraper_error(monkeypatch):
     monkeypatch.setattr(storm_engine, "get_county", lambda cid: _COUNTY_CONFIG)
-    monkeypatch.setattr(storm_engine, "_fetch_nws_alerts_by_zones", lambda zones: ([], "boom: connection reset"))
+    monkeypatch.setattr(storm_engine, "_fetch_nws_alerts_by_zones", lambda zones: ([], ["FLZ151: boom: connection reset"]))
     with _patched_stats() as mock_stats:
         storm_engine.scrape_storm_damage(county_id="hillsborough")
     kwargs = mock_stats.call_args.kwargs
@@ -45,7 +52,7 @@ def test_storm_fetch_failure_reports_scraper_error(monkeypatch):
 
 def test_storm_genuine_zero_result_reports_no_data(monkeypatch):
     monkeypatch.setattr(storm_engine, "get_county", lambda cid: _COUNTY_CONFIG)
-    monkeypatch.setattr(storm_engine, "_fetch_nws_alerts_by_zones", lambda zones: ([], None))
+    monkeypatch.setattr(storm_engine, "_fetch_nws_alerts_by_zones", lambda zones: ([], []))
     with _patched_stats() as mock_stats:
         storm_engine.scrape_storm_damage(county_id="hillsborough")
     kwargs = mock_stats.call_args.kwargs
@@ -53,12 +60,25 @@ def test_storm_genuine_zero_result_reports_no_data(monkeypatch):
     assert kwargs["error_type"] == "no_data"
 
 
+def test_storm_partial_zone_failure_reports_scraper_error_not_no_data(monkeypatch):
+    # One of two zones failed — the other returned zero alerts. Must not be
+    # reported as a confirmed no-data day (PR #232 review, issue 1).
+    monkeypatch.setattr(storm_engine, "get_county", lambda cid: _TWO_ZONE_CONFIG)
+    monkeypatch.setattr(storm_engine, "_fetch_nws_alerts_by_zones", lambda zones: ([], ["FLZ151: boom"]))
+    with _patched_stats() as mock_stats:
+        storm_engine.scrape_storm_damage(county_id="hillsborough")
+    kwargs = mock_stats.call_args.kwargs
+    assert kwargs["error_type"] == "scraper_error"
+    assert kwargs["run_success"] is True  # the other zone still succeeded
+    assert "FLZ151" in kwargs["error_message"]
+
+
 # ── flood_engine ──────────────────────────────────────────────────────────
 
 def test_flood_all_sources_fail_reports_scraper_error(monkeypatch):
     monkeypatch.setattr(flood_engine, "get_county", lambda cid: _COUNTY_CONFIG)
     monkeypatch.setattr(flood_engine, "_fetch_fema_declarations", lambda *a: ([], None))
-    monkeypatch.setattr(flood_engine, "_fetch_nws_flood_alerts_by_zones", lambda zones: ([], "NWS down"))
+    monkeypatch.setattr(flood_engine, "_fetch_nws_flood_alerts_by_zones", lambda zones: ([], ["FLZ151: NWS down"]))
     monkeypatch.setattr(flood_engine, "_fetch_nfip_claims", lambda *a: ([], "FEMA NFIP down"))
     with _patched_stats() as mock_stats:
         flood_engine.scrape_flood_damage(county_id="hillsborough")
@@ -73,7 +93,7 @@ def test_flood_informational_source_failure_alone_is_still_no_data(monkeypatch):
     # no-data day when NWS + NFIP both genuinely succeeded with zero results.
     monkeypatch.setattr(flood_engine, "get_county", lambda cid: _COUNTY_CONFIG)
     monkeypatch.setattr(flood_engine, "_fetch_fema_declarations", lambda *a: ([], "declarations API down"))
-    monkeypatch.setattr(flood_engine, "_fetch_nws_flood_alerts_by_zones", lambda zones: ([], None))
+    monkeypatch.setattr(flood_engine, "_fetch_nws_flood_alerts_by_zones", lambda zones: ([], []))
     monkeypatch.setattr(flood_engine, "_fetch_nfip_claims", lambda *a: ([], None))
     with _patched_stats() as mock_stats:
         flood_engine.scrape_flood_damage(county_id="hillsborough")
@@ -85,13 +105,28 @@ def test_flood_informational_source_failure_alone_is_still_no_data(monkeypatch):
 def test_flood_genuine_zero_result_reports_no_data(monkeypatch):
     monkeypatch.setattr(flood_engine, "get_county", lambda cid: _COUNTY_CONFIG)
     monkeypatch.setattr(flood_engine, "_fetch_fema_declarations", lambda *a: ([], None))
-    monkeypatch.setattr(flood_engine, "_fetch_nws_flood_alerts_by_zones", lambda zones: ([], None))
+    monkeypatch.setattr(flood_engine, "_fetch_nws_flood_alerts_by_zones", lambda zones: ([], []))
     monkeypatch.setattr(flood_engine, "_fetch_nfip_claims", lambda *a: ([], None))
     with _patched_stats() as mock_stats:
         flood_engine.scrape_flood_damage(county_id="hillsborough")
     kwargs = mock_stats.call_args.kwargs
     assert kwargs.get("run_success", True) is True
     assert kwargs["error_type"] == "no_data"
+
+
+def test_flood_partial_zone_failure_reports_scraper_error_not_no_data(monkeypatch):
+    # One of two zones failed — the other + NFIP genuinely returned zero.
+    # Must not be reported as a confirmed no-data day (PR #232 review, issue 1).
+    monkeypatch.setattr(flood_engine, "get_county", lambda cid: _TWO_ZONE_CONFIG)
+    monkeypatch.setattr(flood_engine, "_fetch_fema_declarations", lambda *a: ([], None))
+    monkeypatch.setattr(flood_engine, "_fetch_nws_flood_alerts_by_zones", lambda zones: ([], ["FLZ151: boom"]))
+    monkeypatch.setattr(flood_engine, "_fetch_nfip_claims", lambda *a: ([], None))
+    with _patched_stats() as mock_stats:
+        flood_engine.scrape_flood_damage(county_id="hillsborough")
+    kwargs = mock_stats.call_args.kwargs
+    assert kwargs["error_type"] == "scraper_error"
+    assert kwargs["run_success"] is True  # the other zone + NFIP still succeeded
+    assert "FLZ151" in kwargs["error_message"]
 
 
 # ── insurance_engine ──────────────────────────────────────────────────────
