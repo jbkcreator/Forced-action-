@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 from config.settings import get_settings
 from src.api.admin_router import create_access_token, verify_token
 from src.api.deps import VALID_VERTICALS, get_db
+from src.services import subscriber_auth as _sub_auth
 from src.services.hold_lifecycle_service import create_deal_room
 from src.services.lead_pool_service import get_lead_pool
 from src.services.subscriber_auth import verify_password
@@ -251,16 +252,32 @@ def demo_login(body: _DemoLoginRequest, db: Session = Depends(get_db)) -> _DemoL
 
 def require_demo_auth(
     credentials: HTTPAuthorizationCredentials = Depends(_demo_bearer),
+    db: Session = Depends(get_db),
 ) -> dict:
     """Authorize the demo generator via either:
     - a demo-scoped JWT (from /api/demo/login), or
-    - a subscriber JWT where is_demo=True (closer already logged in via subscriber flow).
+    - a subscriber JWT for an is_demo=True subscriber (closer already logged in).
     """
-    claims = verify_token(credentials.credentials)  # 401 on invalid/expired
-    if claims.get("scope") == "demo":
-        return claims
-    if claims.get("is_demo"):
-        return claims
+    token = credentials.credentials
+    # Try demo-scoped JWT first (admin secret)
+    try:
+        claims = verify_token(token)
+        if claims.get("scope") == "demo":
+            return claims
+    except Exception:
+        pass
+    # Try subscriber JWT (subscriber secret)
+    try:
+        sub_claims = _sub_auth.verify_access_token(token)
+        subscriber_id = int(sub_claims["sub"])
+        row = db.execute(
+            text("SELECT is_demo FROM subscribers WHERE id = :id"),
+            {"id": subscriber_id},
+        ).fetchone()
+        if row and row.is_demo:
+            return sub_claims
+    except Exception:
+        pass
     raise HTTPException(status_code=403, detail="Not a demo token.")
 
 
