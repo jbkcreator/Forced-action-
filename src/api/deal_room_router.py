@@ -252,11 +252,16 @@ def demo_login(body: _DemoLoginRequest, db: Session = Depends(get_db)) -> _DemoL
 def require_demo_auth(
     credentials: HTTPAuthorizationCredentials = Depends(_demo_bearer),
 ) -> dict:
-    """Authorize the demo generator via a demo-scoped JWT (from /api/demo/login)."""
+    """Authorize the demo generator via either:
+    - a demo-scoped JWT (from /api/demo/login), or
+    - a subscriber JWT where is_demo=True (closer already logged in via subscriber flow).
+    """
     claims = verify_token(credentials.credentials)  # 401 on invalid/expired
-    if claims.get("scope") != "demo":
-        raise HTTPException(status_code=403, detail="Not a demo token.")
-    return claims
+    if claims.get("scope") == "demo":
+        return claims
+    if claims.get("is_demo"):
+        return claims
+    raise HTTPException(status_code=403, detail="Not a demo token.")
 
 
 class _CreateDealRoomRequest(BaseModel):
