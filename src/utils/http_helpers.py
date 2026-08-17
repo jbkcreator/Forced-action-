@@ -227,11 +227,14 @@ def requests_get_with_retry(
         except requests.HTTPError as e:
             status = e.response.status_code if e.response is not None else 0
             if status in _RETRYABLE_STATUS_CODES and attempt < max_retries:
+                wait = retry_delay
+                if status == 429 and e.response is not None:
+                    wait = int(e.response.headers.get("Retry-After", retry_delay))
                 logger.warning(
                     f"Request attempt {attempt}/{max_retries} got HTTP {status}: {e}"
-                    f" — retrying in {retry_delay}s..."
+                    f" — retrying in {wait}s..."
                 )
-                time.sleep(retry_delay)
+                time.sleep(wait)
                 continue
             logger.error(f"HTTP error (not retried): {e}")
             raise
