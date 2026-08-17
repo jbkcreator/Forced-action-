@@ -9632,6 +9632,8 @@ class VerticalProbe(Base):
     )
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    instantly_campaign_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="running"
     )  # "running" | "completed" | "killed" | "aborted"

@@ -526,15 +526,16 @@ class TestProbeLoop:
         assert verdict.package_generated is True
         assert verdict.package_id is not None
 
-    def test_run_probe_fails_closed_without_stub(self, fresh_db):
-        """Review fix: a real caller (no monkeypatched _execute_sends) must
-        never fabricate a completed/"won" verdict — it should raise instead."""
+    def test_run_probe_fails_closed_on_campaign_error(self, fresh_db):
+        """_execute_sends raises RuntimeError when Instantly campaign creation fails.
+        No verdict must be recorded in that case."""
         from src.services.vertical_autopilot import run_probe
 
         packet = self._make_eligible_packet(fresh_db)
 
-        with patch("src.services.vertical_autopilot._run_compliance_preflight", return_value=True):
-            with pytest.raises(NotImplementedError):
+        with patch("src.services.vertical_autopilot._run_compliance_preflight", return_value=True), \
+             patch("src.services.instantly_service.create_campaign", return_value=None):
+            with pytest.raises(RuntimeError):
                 run_probe(packet.id, fresh_db)
 
         from sqlalchemy import select
@@ -555,9 +556,10 @@ class TestProbeLoop:
             probe1 = run_probe(packet.id, fresh_db)
         assert probe1.status == "aborted"
 
-        # Second call same day: should reuse the row and succeed (send stub raises NotImplementedError)
-        with patch("src.services.vertical_autopilot._run_compliance_preflight", return_value=True):
-            with pytest.raises(NotImplementedError):
+        # Second call same day: reuses same row; campaign creation fails → RuntimeError
+        with patch("src.services.vertical_autopilot._run_compliance_preflight", return_value=True), \
+             patch("src.services.instantly_service.create_campaign", return_value=None):
+            with pytest.raises(RuntimeError):
                 run_probe(packet.id, fresh_db)
 
         # Must be same probe row, not a second insert
@@ -574,8 +576,9 @@ class TestProbeLoop:
 
         packet = self._make_eligible_packet(fresh_db)
 
-        with patch("src.services.vertical_autopilot._run_compliance_preflight", return_value=True):
-            with pytest.raises(NotImplementedError):
+        with patch("src.services.vertical_autopilot._run_compliance_preflight", return_value=True), \
+             patch("src.services.instantly_service.create_campaign", return_value=None):
+            with pytest.raises(RuntimeError):
                 run_probe(packet.id, fresh_db)
 
         from sqlalchemy import select

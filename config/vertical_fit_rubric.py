@@ -55,6 +55,37 @@ PROBE_SEND_CEILING = 400
 # rather than auto-killing.  Flip only after the client ratifies the thresholds.
 VERTICAL_AUTO_KILL_ENABLED: bool = False
 
+# ── Probe campaign schedule (mirrors Relay send window) ───────────────────────
+PROBE_CAMPAIGN_SEND_FROM = "11:00"
+PROBE_CAMPAIGN_SEND_TO   = "18:00"
+PROBE_CAMPAIGN_TIMEZONE  = "America/New_York"
+PROBE_CAMPAIGN_DAYS: dict = {
+    "monday": True, "tuesday": True, "wednesday": True,
+    "thursday": True, "friday": True,
+    "saturday": False, "sunday": False,
+}
+
+# DBPR contractor trades to target per probe vertical
+PROBE_DBPR_VERTICAL_MAP: dict[str, list[str]] = {
+    "tax_lien":        ["general", "roofing", "hvac"],
+    "lis_pendens":     ["general", "roofing"],
+    "probate":         ["general"],
+    "pre_foreclosure": ["general", "roofing"],
+    "auction":         ["general", "roofing", "hvac"],
+}
+
+# Probe outreach copy — {first_name} and {vertical} are interpolated at send time
+PROBE_EMAIL_SUBJECT = "Distressed property leads — {vertical} contractors in your area"
+PROBE_EMAIL_BODY = (
+    "Hi {first_name},\n\n"
+    "We surface distressed property opportunities in Hillsborough and Pinellas — "
+    "homeowners facing {vertical} damage, liens, or pre-foreclosure who need work done fast.\n\n"
+    "Testing whether our lead flow fits your business. Would a list of 5–10 "
+    "verified distressed properties in your area be useful this week?\n\n"
+    "Reply yes or no — takes 5 seconds.\n\n"
+    "— Forced Action"
+)
+
 # ── Dim 5: Buyer evidence signals ─────────────────────────────────────────────
 
 # Money evidence signals — at least one required for Dim 5 to score
