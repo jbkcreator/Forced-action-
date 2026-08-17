@@ -61,17 +61,23 @@ def _utcnow_naive() -> datetime:
 
 
 def _fa078_applied() -> bool:
-    with get_db_context() as session:
-        return bool(session.execute(text(
-            "SELECT 1 FROM information_schema.columns "
-            "WHERE table_name = 'owners' AND column_name = 'contactability_detail'"
-        )).scalar())
+    # No DATABASE_URL / unreachable Postgres (e.g. a bare CI runner) must not
+    # crash collection for the whole suite — treat it the same as "not applied"
+    # so these scenario tests skip instead of erroring out at import time.
+    try:
+        with get_db_context() as session:
+            return bool(session.execute(text(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_name = 'owners' AND column_name = 'contactability_detail'"
+            )).scalar())
+    except Exception:
+        return False
 
 
 _HAS_FA078 = _fa078_applied()
 require_fa078 = pytest.mark.skipif(
     not _HAS_FA078,
-    reason="owners.contactability_detail missing — run "
+    reason="owners.contactability_detail missing or DB unavailable — run "
            "scripts/apply_contactability_detail_migration.py first",
 )
 

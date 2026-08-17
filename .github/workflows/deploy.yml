@@ -6,7 +6,41 @@ on:
   workflow_dispatch:
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run test suite
+        env:
+          # Dummy values — config/settings.py's AppSettings requires these
+          # three (Field(...), no default) just to import cleanly; nothing
+          # needs to actually be reachable/valid. database_url/redis_url
+          # already have built-in defaults so aren't needed here, but are
+          # set anyway for clarity and to keep any DB-touching test's
+          # inevitable failure fast (localhost refuses instantly) rather
+          # than hanging on a real host's network timeout.
+          ANTHROPIC_API_KEY: sk-test-dummy
+          FIRECRAWL_API_KEY: fc-test-dummy
+          COURT_LISTENER_API_KEY: cl-test-dummy
+          DATABASE_URL: postgresql://test:test@localhost:5432/test
+          REDIS_URL: redis://localhost:6379/0
+        run: pytest tests/ --junitxml=pytest-results.xml
+      - name: Upload test results (PASS/FAIL receipt)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-results-${{ github.sha }}
+          path: pytest-results.xml
+          retention-days: 90
+
   deploy:
+    needs: test
     runs-on: ubuntu-latest
 
     steps:
