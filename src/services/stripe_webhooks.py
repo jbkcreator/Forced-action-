@@ -1687,6 +1687,17 @@ def _on_payment_succeeded(invoice: dict, db: Session) -> None:
             stripe_customer_id, exc,
         )
 
+    # Refresh plan_price on every successful payment so MRR stays accurate across
+    # plan changes, price overrides, and accounts that pre-date the checkout fix.
+    # invoice.amount_paid is the actual charge for this billing period (cents).
+    _inv_interval = "annual" if (
+        invoice.get("lines", {}).get("data", [{}])[0].get("plan", {}).get("interval_count", 1) == 12
+        or invoice.get("lines", {}).get("data", [{}])[0].get("plan", {}).get("interval") == "year"
+    ) else "monthly"
+    _inv_paid = invoice.get("amount_paid") or 0
+    if _inv_paid > 0:
+        subscriber.plan_price = normalized_monthly_price(_inv_paid, _inv_interval)
+
     # Clear recovery state on successful payment
     had_failed_payment = subscriber.payment_failed_at is not None
     subscriber.payment_failed_at = None
