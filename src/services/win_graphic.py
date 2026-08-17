@@ -124,6 +124,7 @@ def proof_wall_payload(db: Session, limit: int = 50, county_id: str | None = Non
         select(DealOutcome, Subscriber)
         .join(Subscriber, Subscriber.id == DealOutcome.subscriber_id)
         .where(DealOutcome.deal_size_bucket != "skip")
+        .where(Subscriber.is_test.is_(False))
     )
     if county_id:
         q = q.where(Subscriber.county_id == county_id)
