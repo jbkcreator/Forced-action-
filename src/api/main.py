@@ -340,7 +340,14 @@ def health_check(db: Session = Depends(get_db)):
         db.execute(select(1))
     except Exception:
         raise HTTPException(status_code=503, detail="db_unavailable")
-    return {"status": "ok"}
+    try:
+        import subprocess
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
+        ).decode().strip()
+    except Exception:
+        sha = "unknown"
+    return {"status": "ok", "sha": sha}
 
 
 def _verify_mandrill_signature(raw_body: bytes, signature: Optional[str], request: Request) -> bool:
