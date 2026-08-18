@@ -14,6 +14,7 @@ import uuid
 from config.venture_template import DEFAULT_VENTURE_KEY
 from src.services.relay import queue
 from src.services.relay.engine import BatchResult, execute_batch
+from src.services.relay.slack_post import post_completion_receipt
 from src.services.relay.suppression_sync import sync_unsubscribes
 from src.utils.venture_config import get_venture_config
 
@@ -82,4 +83,6 @@ def run_sweep(*, limit: int = 50, venture_key: str = DEFAULT_VENTURE_KEY) -> Bat
         "[Relay] sweep: executing %d approved item(s) for venture %s as %s",
         len(items), venture_key, batch_id,
     )
-    return execute_batch(items, batch_id=batch_id, venture=venture)
+    result = execute_batch(items, batch_id=batch_id, venture=venture)
+    post_completion_receipt(batch_id, result, venture_key=venture_key)
+    return result
