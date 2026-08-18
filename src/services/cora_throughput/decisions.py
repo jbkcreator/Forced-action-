@@ -17,10 +17,11 @@ button-press or a retried webhook can't double-enqueue or double-reject.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import text
 
+from src.agents.contracts.base import HandoffRejected
 from src.agents.cora import contracts, store
 from src.services.relay import queue as relay_queue
 
@@ -59,10 +60,11 @@ def _get_batch_items_with_drafts(db: Any, batch_id: str) -> List[Dict[str, Any]]
 _RELAY_SUPPORTED_CHANNELS = frozenset({"email"})
 
 
-def _enqueue_to_relay(item: Dict[str, Any], decided_by: str) -> bool:
-    """Returns True if a Relay queue item was enqueued+approved, False if
-    skipped (e.g. no recipient, or unsupported channel — logged, not raised,
-    since one bad draft in a batch must never block the rest)."""
+def _enqueue_to_relay(item: Dict[str, Any], decided_by: str) -> Tuple[bool, Optional[str]]:
+    """Returns (True, None) if a Relay queue item was enqueued+approved.
+    Returns (False, reason) if skipped — reason is one of
+    'unsupported_channel', 'no_recipient', 'handoff_rejected' — logged, not
+    raised, since one bad draft in a batch must never block the rest."""
     channel = item["recommended_channel"]
     if channel not in _RELAY_SUPPORTED_CHANNELS:
         # SMS (and any future channel) has no registered Relay dispatcher yet.
@@ -75,7 +77,7 @@ def _enqueue_to_relay(item: Dict[str, Any], decided_by: str) -> bool:
             "skipping enqueue until dispatcher is registered",
             item["draft_id"], channel,
         )
-        return False
+        return False, "unsupported_channel"
 
     recipient = item["contact_email"] if channel == "email" else item["contact_phone"]
     if not recipient:
@@ -83,7 +85,7 @@ def _enqueue_to_relay(item: Dict[str, Any], decided_by: str) -> bool:
             "cora_throughput.decisions: draft %s has no recipient for channel=%s — skipping Relay enqueue",
             item["draft_id"], channel,
         )
-        return False
+        return False, "no_recipient"
 
     payload = dict(contracts.to_relay_handoff_payload({
         "draft_id": item["draft_id"],
@@ -97,15 +99,33 @@ def _enqueue_to_relay(item: Dict[str, Any], decided_by: str) -> bool:
     payload["approved_by"] = decided_by
     payload["approved_at"] = store.now().isoformat()
 
-    queue_item = relay_queue.enqueue(
-        idempotency_key=f"cora_draft:{item['draft_id']}",
-        channel=item["recommended_channel"],
-        recipient=recipient,
-        payload=payload,
-        thread_id=item["opportunity_thread_id"],
-    )
+    try:
+        queue_item = relay_queue.enqueue(
+            idempotency_key=f"cora_draft:{item['draft_id']}",
+            channel=item["recommended_channel"],
+            recipient=recipient,
+            payload=payload,
+            thread_id=item["opportunity_thread_id"],
+        )
+    except HandoffRejected as exc:
+        # e.g. a NULL/malformed opportunity_thread_id fails the cora_to_relay
+        # contract's regex. Previously this propagated straight out of a
+        # Slack-triggered BackgroundTask with nothing to catch it — an
+        # approval that silently never happened. The contract layer has
+        # already written a handoff_rejections audit row and posted to Slack
+        # (reject_and_notify); here we just stop it from taking down the rest
+        # of the batch and park the draft instead of leaving it dangling in
+        # 'included' to be silently retried forever.
+        logger.warning(
+            "cora_throughput.decisions: draft %s rejected by cora_to_relay handoff contract "
+            "missing/invalid fields=%s — see handoff_rejections for boundary=cora_to_relay "
+            "reference_id=cora_draft:%s",
+            item["draft_id"], exc.missing_fields, item["draft_id"],
+        )
+        return False, "handoff_rejected"
+
     relay_queue.record_decision(queue_item.id, approved=True, decided_by=decided_by)
-    return True
+    return True, None
 
 
 def auto_approve_draft(db: Any, draft: Dict[str, Any], decided_by: str = "standing_order") -> bool:
@@ -127,7 +147,8 @@ def auto_approve_draft(db: Any, draft: Dict[str, Any], decided_by: str = "standi
         "contact_email": draft.get("contact_email"),
         "contact_phone": draft.get("contact_phone"),
     }
-    if _enqueue_to_relay(item, decided_by):
+    sent = _enqueue_to_relay(item, decided_by)[0]
+    if sent:
         store.mark_draft_status(db, draft["draft_id"], "approved_pending_send")
         return True
     return False
@@ -204,10 +225,11 @@ def record_batch_decision(
         for item in items:
             if item["decision"] != "included":
                 continue
-            if _enqueue_to_relay(item, decided_by):
+            sent, reason = _enqueue_to_relay(item, decided_by)
+            if sent:
                 store.mark_draft_status(db, item["draft_id"], "approved_pending_send")
                 approved_count += 1
-            elif item["recommended_channel"] not in _RELAY_SUPPORTED_CHANNELS:
+            elif reason == "unsupported_channel":
                 # Channel has no Relay dispatcher yet. Park the draft off
                 # status='draft' so builder.build_batch() stops re-selecting it
                 # every sweep and re-showing it to the founder forever.
@@ -215,6 +237,19 @@ def record_batch_decision(
                 # is an enrichment gap on a supported channel, and its prior
                 # behaviour (draft untouched, retried next sweep) is unchanged.
                 store.mark_draft_status(db, item["draft_id"], "pending_channel_support")
+            elif reason == "handoff_rejected":
+                # Failed the cora_to_relay contract (e.g. NULL opportunity_thread_id).
+                # This is not retryable by a later sweep on its own — mark the
+                # draft rejected and the batch item exception_rejected so the
+                # batch's own status (below) reflects that not everything sent,
+                # instead of silently reporting 'approved'.
+                store.mark_draft_status(db, item["draft_id"], "rejected", reject_reason="handoff_contract_rejected")
+                db.execute(
+                    text("UPDATE cora_batch_items SET decision = 'exception_rejected', decided_at = now() WHERE id = :id"),
+                    {"id": item["item_id"]},
+                )
+                item["decision"] = "exception_rejected"
+                continue
             else:
                 continue
             # decision stays 'included' — the standing-order compiler derives
