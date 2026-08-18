@@ -811,6 +811,17 @@ def _fetch_pricing_from_stripe() -> dict:
             **TIER_DISPLAY[tier],
         }
 
+    # Fetch annual prices for starter and pro (new SKUs — separate from founding/regular).
+    for tier in ("starter", "pro"):
+        annual_id = _s.active_stripe_price(f"{tier}_annual")
+        if annual_id:
+            try:
+                p = stripe.Price.retrieve(annual_id)
+                if p.unit_amount is not None:
+                    pricing_info[tier]["annual_amount"] = p.unit_amount // 100
+            except Exception as e:
+                logger.error("Error retrieving annual price for tier '%s': %s", tier, e, exc_info=True)
+
     # Founder is a flat premium tier with a monthly/annual split (not
     # founding/regular). Its amounts are sourced from the seeded `plans` rows —
     # the single source of truth — so this resolves regardless of Stripe mode.

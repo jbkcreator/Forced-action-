@@ -153,6 +153,17 @@ def get_price_id_for_checkout(
         logger.info("Checkout price selected: tier=founder interval=%s (flat rate)", interval)
         return price_id, False
 
+    # Annual billing for starter/pro — flat-rate, no founding mechanic.
+    if interval == "annual" and tier in ("starter", "pro"):
+        price_id = settings.active_stripe_price(f"{tier}_annual")
+        if not price_id:
+            raise ValueError(
+                f"Stripe price_id not configured for {tier}_annual. "
+                f"Set STRIPE_PRICE_{tier.upper()}_ANNUAL in env."
+            )
+        logger.info("Checkout price selected: tier=%s interval=annual (flat rate)", tier)
+        return price_id, False
+
     if tier not in prices:
         raise ValueError(
             f"Unknown tier '{tier}'. Valid tiers: {list(prices.keys())}"
