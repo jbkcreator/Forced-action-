@@ -1133,6 +1133,27 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
             },
         )
 
+    # Sellable-inventory gate: each requested ZIP must have ≥5 scored leads
+    # before we open a Stripe session. Mirrors the floor used in ZIP suggestions
+    # (_zip_has_sellable_inventory). A ZIP not yet in zip_territories with zero
+    # scored leads would otherwise be claimed as a locked row with nothing behind it.
+    no_inventory_zips = [
+        z for z in payload.zip_codes
+        if not _zip_has_sellable_inventory(db, z, payload.vertical, payload.county_id)
+    ]
+    if no_inventory_zips:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "zips_no_inventory",
+                "message": (
+                    f"ZIP code(s) {', '.join(sorted(no_inventory_zips))} do not have enough "
+                    "leads available yet. Please select a different ZIP code."
+                ),
+                "unavailable_zips": sorted(no_inventory_zips),
+            },
+        )
+
     # Consent is persisted once, after the Stripe session exists, so the row
     # carries checkout_session_id (for webhook subscriber-linking) and the
     # resolved voice-consent fields (B0-06). See the write block below the

@@ -305,3 +305,113 @@ class TestReplayIdempotency:
         fresh_db.refresh(sub)
         assert sub.disputed_count == 2
         assert sub.status == "disputed"
+
+
+# ── plan_price MRR accuracy (proration fix) ──────────────────────────────────
+
+
+def _invoice_payment_succeeded_event(
+    customer_id: str,
+    *,
+    amount_paid: int,
+    billing_reason: str = "subscription_cycle",
+    lines: list[dict],
+) -> dict:
+    return {
+        "id": f"evt_inv_{uuid.uuid4().hex[:8]}",
+        "type": "invoice.payment_succeeded",
+        "created": int(datetime.now(timezone.utc).timestamp()),
+        "data": {
+            "object": {
+                "id": f"in_{uuid.uuid4().hex[:8]}",
+                "customer": customer_id,
+                "subscription": f"sub_{uuid.uuid4().hex[:8]}",
+                "amount_paid": amount_paid,
+                "billing_reason": billing_reason,
+                "lines": {"data": lines},
+            }
+        },
+    }
+
+
+def _line(
+    *,
+    unit_amount: int,
+    interval: str = "month",
+    interval_count: int = 1,
+    proration: bool = False,
+    period_end: int | None = None,
+) -> dict:
+    return {
+        "proration": proration,
+        "price": {
+            "unit_amount": unit_amount,
+            "recurring": {"interval": interval, "interval_count": interval_count},
+        },
+        "plan": {"interval": interval, "interval_count": interval_count},
+        "period": {"end": period_end or int(datetime.now(timezone.utc).timestamp())},
+    }
+
+
+class TestPlanPriceMRR:
+    """plan_price must reflect the recurring rate, not a prorated charge."""
+
+    def test_full_renewal_invoice_updates_plan_price(self, fresh_db):
+        """Normal monthly renewal: plan_price set to the recurring unit amount."""
+        sub = _seed_subscriber(fresh_db, stripe_customer_id="cus_mrr_renewal")
+        fresh_db.commit()
+
+        event = _invoice_payment_succeeded_event(
+            "cus_mrr_renewal",
+            amount_paid=29900,
+            billing_reason="subscription_cycle",
+            lines=[_line(unit_amount=29900)],
+        )
+        _post(event, fresh_db)
+        fresh_db.refresh(sub)
+
+        assert sub.plan_price == 299.0
+
+    def test_mid_cycle_monthly_upgrade_proration_ignored(self, fresh_db):
+        """Mid-cycle upgrade produces a $50 proration invoice for a $200/mo plan.
+        plan_price must be $200, not $50.
+        """
+        sub = _seed_subscriber(fresh_db, stripe_customer_id="cus_mrr_prorate")
+        sub.plan_price = 99.0
+        fresh_db.commit()
+
+        event = _invoice_payment_succeeded_event(
+            "cus_mrr_prorate",
+            amount_paid=5000,   # proration charge: $50
+            billing_reason="subscription_update",
+            lines=[
+                _line(unit_amount=0, proration=True),   # credit line for old plan
+                _line(unit_amount=20000, proration=False),  # $200/mo new plan
+            ],
+        )
+        _post(event, fresh_db)
+        fresh_db.refresh(sub)
+
+        assert sub.plan_price == 200.0
+
+    def test_mid_cycle_switch_to_annual_uses_monthly_rate(self, fresh_db):
+        """Switch to $1,200/yr annual plan: plan_price must be $100/mo (1200/12),
+        not the prorated invoice amount.
+        """
+        sub = _seed_subscriber(fresh_db, stripe_customer_id="cus_mrr_annual")
+        sub.plan_price = 99.0
+        fresh_db.commit()
+
+        event = _invoice_payment_succeeded_event(
+            "cus_mrr_annual",
+            amount_paid=60000,   # prorated partial-period adjustment ($600)
+            billing_reason="subscription_update",
+            lines=[
+                _line(unit_amount=120000, interval="year", interval_count=1, proration=False),
+            ],
+        )
+        _post(event, fresh_db)
+        fresh_db.refresh(sub)
+
+        # $1,200/yr ÷ 12 = $100/mo
+        assert sub.plan_price == 100.0
