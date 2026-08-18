@@ -81,38 +81,43 @@ def fetch_bankruptcy_filings(lookback_days: int = 1, court_code: str = COURT_COD
 		"User-Agent": API_USER_AGENT,
 	}
 	
-	try:
-		response = requests_get_with_retry(
-			COURTLISTENER_API_URL,
-			params=params,
-			headers=headers,
-			timeout=REQUEST_TIMEOUT_DEFAULT,
-		)
-		logger.debug(f"Successfully fetched API response (status code: {response.status_code})")
-		
-	except requests.Timeout as e:
-		logger.error(f"Request timed out while fetching bankruptcy filings: {e}")
-		raise
-	except requests.HTTPError as e:
-		logger.error(f"HTTP error occurred while fetching bankruptcy filings: {e}")
-		logger.error(f"Response content: {response.text}")
-		raise
-	except requests.RequestException as e:
-		logger.error(f"Request error occurred while fetching bankruptcy filings: {e}")
-		raise
-	
-	try:
-		data = response.json()
-		results = data.get('results', [])
-		
-		logger.info(f"Fetched {len(results)} bankruptcy dockets from API")
-		logger.debug(f"API response includes {data.get('count', 0)} total results")
-		
-		return results
-		
-	except ValueError as e:
-		logger.error(f"Failed to parse JSON response: {e}")
-		raise
+	all_results = []
+	url = COURTLISTENER_API_URL
+	page_params = params.copy()
+
+	while url:
+		try:
+			response = requests_get_with_retry(
+				url,
+				params=page_params if url == COURTLISTENER_API_URL else None,
+				headers=headers,
+				timeout=REQUEST_TIMEOUT_DEFAULT,
+			)
+		except requests.Timeout as e:
+			logger.error(f"Request timed out while fetching bankruptcy filings: {e}")
+			raise
+		except requests.HTTPError as e:
+			logger.error(f"HTTP error occurred while fetching bankruptcy filings: {e}")
+			raise
+		except requests.RequestException as e:
+			logger.error(f"Request error occurred while fetching bankruptcy filings: {e}")
+			raise
+
+		try:
+			data = response.json()
+		except ValueError as e:
+			logger.error(f"Failed to parse JSON response: {e}")
+			raise
+
+		page_results = data.get('results', [])
+		all_results.extend(page_results)
+		logger.debug(f"Page fetched: {len(page_results)} results (total so far: {len(all_results)} of {data.get('count', '?')})")
+
+		url = data.get('next')  # None when last page reached
+		page_params = None       # next URL already includes params
+
+	logger.info(f"Fetched {len(all_results)} bankruptcy dockets from API")
+	return all_results
 
 
 def filter_tampa_bankruptcies(dockets: List[Dict[str, Any]], division_prefix: str = TAMPA_DIVISION_PREFIX) -> List[Dict[str, Any]]:

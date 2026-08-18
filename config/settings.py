@@ -149,6 +149,10 @@ class AppSettings(BaseSettings):
 	stripe_price_starter_regular: Optional[str] = Field(default=None, env="STRIPE_PRICE_STARTER_REGULAR")
 	stripe_price_pro_founding: Optional[str] = Field(default=None, env="STRIPE_PRICE_PRO_FOUNDING")
 	stripe_price_pro_regular: Optional[str] = Field(default=None, env="STRIPE_PRICE_PRO_REGULAR")
+	stripe_price_starter_annual: Optional[str] = Field(default=None, env="STRIPE_PRICE_STARTER_ANNUAL")
+	stripe_price_pro_annual: Optional[str] = Field(default=None, env="STRIPE_PRICE_PRO_ANNUAL")
+	stripe_price_desk_setup: Optional[str] = Field(default=None, env="STRIPE_PRICE_DESK_SETUP")
+	stripe_price_desk_monthly: Optional[str] = Field(default=None, env="STRIPE_PRICE_DESK_MONTHLY")
 	stripe_price_founder_monthly: Optional[str] = Field(default=None, env="STRIPE_PRICE_FOUNDER_MONTHLY")
 	stripe_price_founder_annual: Optional[str] = Field(default=None, env="STRIPE_PRICE_FOUNDER_ANNUAL")
 	stripe_price_lead_pack: Optional[str] = Field(default=None, env="STRIPE_PRICE_LEAD_PACK")
@@ -231,6 +235,10 @@ class AppSettings(BaseSettings):
 	stripe_test_price_starter_regular: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_STARTER_REGULAR")
 	stripe_test_price_pro_founding: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_PRO_FOUNDING")
 	stripe_test_price_pro_regular: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_PRO_REGULAR")
+	stripe_test_price_starter_annual: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_STARTER_ANNUAL")
+	stripe_test_price_pro_annual: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_PRO_ANNUAL")
+	stripe_test_price_desk_setup: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_DESK_SETUP")
+	stripe_test_price_desk_monthly: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_DESK_MONTHLY")
 	# Not read by get_price_id_for_checkout (founder resolves via plans.stripe_price_id,
 	# not this env var) — kept for mapping-table parity with every other tier only.
 	stripe_test_price_founder_monthly: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_FOUNDER_MONTHLY")
@@ -474,9 +482,6 @@ class AppSettings(BaseSettings):
 
 	# Human close routing (Phase A)
 	slack_human_close_webhook: Optional[str] = Field(default=None, env="SLACK_HUMAN_CLOSE_WEBHOOK")
-
-	# Lifecycle / fleet incident Slack channel (QUALITY-v2.2 Q1 dead-letter alerting)
-	lifecycle_incident_slack_channel: Optional[str] = Field(default=None, env="LIFECYCLE_INCIDENT_SLACK_CHANNEL")
 
 	# Accelerated Wallet Push (fa016) — master kill switch.
 	# Detector, sweep, Lifecycle graph, and API endpoints all skip when False.

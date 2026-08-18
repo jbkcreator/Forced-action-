@@ -340,7 +340,14 @@ def health_check(db: Session = Depends(get_db)):
         db.execute(select(1))
     except Exception:
         raise HTTPException(status_code=503, detail="db_unavailable")
-    return {"status": "ok"}
+    try:
+        import subprocess
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
+        ).decode().strip()
+    except Exception:
+        sha = "unknown"
+    return {"status": "ok", "sha": sha}
 
 
 def _verify_mandrill_signature(raw_body: bytes, signature: Optional[str], request: Request) -> bool:
@@ -811,6 +818,17 @@ def _fetch_pricing_from_stripe() -> dict:
             **TIER_DISPLAY[tier],
         }
 
+    # Fetch annual prices for starter and pro (new SKUs — separate from founding/regular).
+    for tier in ("starter", "pro"):
+        annual_id = _s.active_stripe_price(f"{tier}_annual")
+        if annual_id:
+            try:
+                p = stripe.Price.retrieve(annual_id)
+                if p.unit_amount is not None:
+                    pricing_info[tier]["annual_amount"] = p.unit_amount // 100
+            except Exception as e:
+                logger.error("Error retrieving annual price for tier '%s': %s", tier, e, exc_info=True)
+
     # Founder is a flat premium tier with a monthly/annual split (not
     # founding/regular). Its amounts are sourced from the seeded `plans` rows —
     # the single source of truth — so this resolves regardless of Stripe mode.
@@ -1133,6 +1151,27 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
             },
         )
 
+    # Sellable-inventory gate: each requested ZIP must have ≥5 scored leads
+    # before we open a Stripe session. Mirrors the floor used in ZIP suggestions
+    # (_zip_has_sellable_inventory). A ZIP not yet in zip_territories with zero
+    # scored leads would otherwise be claimed as a locked row with nothing behind it.
+    no_inventory_zips = [
+        z for z in payload.zip_codes
+        if not _zip_has_sellable_inventory(db, z, payload.vertical, payload.county_id)
+    ]
+    if no_inventory_zips:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "zips_no_inventory",
+                "message": (
+                    f"ZIP code(s) {', '.join(sorted(no_inventory_zips))} do not have enough "
+                    "leads available yet. Please select a different ZIP code."
+                ),
+                "unavailable_zips": sorted(no_inventory_zips),
+            },
+        )
+
     # Consent is persisted once, after the Stripe session exists, so the row
     # carries checkout_session_id (for webhook subscriber-linking) and the
     # resolved voice-consent fields (B0-06). See the write block below the
@@ -1150,7 +1189,12 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
     line_item = {"price": price_id, "quantity": 1}
     resolved_amount_cents = None
     cohort_source = "base_price"
-    if payload.tier in _ZIP_PRICING_TIERS:
+    # Cohort pricing is a MONTHLY-only mechanic: pricing_cohorts stores one fixed
+    # monthly amount and regular_amount below is the monthly price. Annual
+    # starter/pro use a flat annual price (no founding/cohort mechanic) — applying
+    # the monthly cohort amount to the annual price_id's yearly interval would
+    # bill a full year at one month's price. Skip the block for annual.
+    if payload.interval != "annual" and payload.tier in _ZIP_PRICING_TIERS:
         tier_base = _cached_pricing_info().get(payload.tier) or {}
         regular_amount = tier_base.get("regular_amount")
         founding_amount = tier_base.get("founding_amount")

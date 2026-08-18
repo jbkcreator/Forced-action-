@@ -27,6 +27,10 @@ from src.connectors.outcomes import (
     EVENT_TYPE_AUCTION_CANCELLED,
     EVENT_TYPE_AUCTION_REVERTED_TO_LENDER,
     EVENT_TYPE_AUCTION_SOLD_THIRD_PARTY,
+    EVENT_TYPE_DEED_FLIP,
+    EVENT_TYPE_LIEN_SALE,
+    EVENT_TYPE_LP_SOLD_PRE_AUCTION,
+    EVENT_TYPE_PROBATE_SALE,
     EVENT_TYPE_QUALIFIED_SALE,
     EVENT_TYPE_TAX_DEED_REDEEMED,
     EVENT_TYPE_TAX_DEED_SOLD,
@@ -50,6 +54,14 @@ class TestEventMapping:
     def test_lost_events(self):
         for event in (EVENT_TYPE_AUCTION_REVERTED_TO_LENDER, EVENT_TYPE_TAX_DEED_REDEEMED):
             assert PIPELINE_STAGE_BY_EVENT[event] == "closed_lost"
+
+    def test_cde_03_05_08_connector_events_promote_as_won(self):
+        # deed flip / lis-pendens / probate / lien connectors landed after this
+        # map was first written; each stages a completed arms-length resale, so
+        # all promote as closed_won rather than falling through unrecognized.
+        for event in (EVENT_TYPE_DEED_FLIP, EVENT_TYPE_LP_SOLD_PRE_AUCTION,
+                      EVENT_TYPE_PROBATE_SALE, EVENT_TYPE_LIEN_SALE):
+            assert PIPELINE_STAGE_BY_EVENT[event] == "closed_won"
 
     def test_every_registered_event_type_is_accounted_for(self):
         # A promoted set and a skip set that together cover the whole event
@@ -145,6 +157,27 @@ class TestPGPromotion:
         assert row.county_id == "hillsborough"
         assert row.confidence_tier == "public_record_inferred"
         assert row.outcome_source == "foreclosure_outcomes"
+        assert _candidate_consumed(fresh_db, cid)
+
+    def test_probate_sale_promotes_as_won(self, fresh_db):
+        # Regression: probate/lien/deed-flip/lis-pendens connectors are live and
+        # stage event types this map didn't recognize, so every row they staged
+        # was left unconsumed and re-failed each daily run. A NULL sale price
+        # (common for these resale-inferred outcomes) must still promote.
+        prop = _mk_property(fresh_db, "CDE10-LL-009")
+        cid = _stage(fresh_db, prop, event_type=EVENT_TYPE_PROBATE_SALE,
+                     source_id=9_000_109, source_type="probate_lien_outcomes",
+                     source_table="legal_proceedings", amount=None)
+
+        promote_candidates(fresh_db, "hillsborough")
+
+        sref = source_ref_for("probate_lien_outcomes", "legal_proceedings", 9_000_109, date(2026, 6, 15))
+        rows = _outcome_rows(fresh_db, sref)
+        assert len(rows) == 1
+        assert rows[0].pipeline_stage == "closed_won"
+        assert rows[0].deal_amount is None
+        assert rows[0].deal_size_bucket is None
+        assert rows[0].outcome_source == "probate_lien_outcomes"
         assert _candidate_consumed(fresh_db, cid)
 
     def test_lost_candidate_gets_skip_bucket(self, fresh_db):
