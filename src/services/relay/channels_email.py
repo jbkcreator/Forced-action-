@@ -36,6 +36,25 @@ from src.utils.venture_config import get_venture_config
 PASSTHROUGH_CAMPAIGN_NAME = "Relay Passthrough (RELAY-v2.2 R2)"
 
 
+def build_passthrough_body(body_text: str, recipient: str, venture) -> str:
+    """Wrap plain-text body in the passthrough campaign's required HTML shell.
+
+    Escapes the text, converts newlines to <br>, and appends the CAN-SPAM
+    footer (venture brand + postal address + one-click unsubscribe). Shared
+    by the Relay send channel and the Vertical Autopilot probe so both carry
+    an identical, compliant footer through the same passthrough campaign.
+    """
+    nl_to_br = _html_escape(body_text).replace("\r\n", "\n").replace("\n", "<br>\n")
+    unsub = unsubscribe_url(recipient)
+    return (
+        f'<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.6;max-width:600px">'
+        f"{nl_to_br}"
+        f'<br><br>--<br>{venture.brand_name}<br>{venture.postal_address}<br><br>'
+        f'<a href="{unsub}" style="color:#888;font-size:12px">Unsubscribe</a>'
+        f"</div>"
+    )
+
+
 def send_email(item: QueueItem) -> None:
     """Dispatch one approved item through its venture's passthrough campaign.
 
@@ -64,15 +83,7 @@ def send_email(item: QueueItem) -> None:
     if not body:
         raise RuntimeError(f"item {item.id}: payload missing 'body' for email channel")
 
-    nl_to_br = _html_escape(body).replace("\r\n", "\n").replace("\n", "<br>\n")
-    unsub = unsubscribe_url(item.recipient)
-    body = (
-        f'<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.6;max-width:600px">'
-        f"{nl_to_br}"
-        f'<br><br>--<br>{venture.brand_name}<br>{venture.postal_address}<br><br>'
-        f'<a href="{unsub}" style="color:#888;font-size:12px">Unsubscribe</a>'
-        f"</div>"
-    )
+    body = build_passthrough_body(body, item.recipient, venture)
 
     result = instantly.add_leads(campaign_id, [{
         "email": item.recipient,
