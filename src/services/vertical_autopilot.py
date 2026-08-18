@@ -238,22 +238,24 @@ def _run_compliance_preflight(probe: VerticalProbe) -> bool:
 
 
 def _execute_sends(probe: VerticalProbe, db: Session) -> None:
-    """Create a dedicated Instantly campaign for this probe and add DBPR contacts as leads.
+    """Add DBPR contacts as leads to the existing Relay passthrough campaign.
 
     Pulls up to PROBE_MAX_SENDS_PER_RUN contacts whose trade vertical maps to
-    probe.vertical_name, preferring work_email over raw email. Creates a fresh
-    Instantly campaign per probe run so reply attribution is clean (the shared
-    Relay passthrough campaign's aggregate stats would conflate probe replies
-    with all prior Relay sends).
+    probe.vertical_name, preferring work_email over raw email. Adds them to the
+    shared Relay Instantly campaign (RELAY_INSTANTLY_CAMPAIGN_ID) so no new
+    campaign is created per probe. Stores the sent email list in probe.probe_emails
+    for per-probe reply attribution at refresh time.
 
-    Sets probe.instantly_campaign_id and probe.sends_count. Reply ingestion
-    happens separately via refresh_probe_replies().
+    Sets probe.instantly_campaign_id (= relay campaign id) and probe.sends_count.
+    Reply ingestion happens separately via refresh_probe_replies().
     """
     from config.settings import get_settings
     from src.services import instantly_service
 
     settings = get_settings()
-    sender_email = settings.relay_instantly_sender_email
+    relay_campaign_id = settings.relay_instantly_campaign_id
+    if not relay_campaign_id:
+        raise RuntimeError("RELAY_INSTANTLY_CAMPAIGN_ID not configured — cannot send probes")
 
     target_trades = PROBE_DBPR_VERTICAL_MAP.get(probe.vertical_name, [])
     if not target_trades:
@@ -274,7 +276,9 @@ def _execute_sends(probe: VerticalProbe, db: Session) -> None:
             f"FROM dbpr_contacts "
             f"WHERE vertical IN ({placeholders}) "
             f"  AND COALESCE(work_email, email) IS NOT NULL "
-            f"  AND enrichment_status != 'dnc' "
+            f"  AND NOT is_opted_out "
+            f"  AND NOT is_hard_bounced "
+            f"  AND NOT is_signed_up "
             f"ORDER BY id "
             f"LIMIT :limit"
         ),
@@ -290,60 +294,30 @@ def _execute_sends(probe: VerticalProbe, db: Session) -> None:
         probe.sends_count = 0
         return
 
-    campaign_name = f"probe-{probe.vertical_name}-{probe.id}-{datetime.now(timezone.utc).date()}"
-    schedule = {
-        "schedules": [
-            {
-                "name": "Probe window",
-                "timing": {"from": PROBE_CAMPAIGN_SEND_FROM, "to": PROBE_CAMPAIGN_SEND_TO},
-                "days": PROBE_CAMPAIGN_DAYS,
-                "timezone": PROBE_CAMPAIGN_TIMEZONE,
-            }
-        ],
-        "start_date": datetime.now(timezone.utc).date().isoformat(),
-    }
-    sequence_steps = [
-        {
-            "step_number": 1,
-            "subject": PROBE_EMAIL_SUBJECT.format(vertical=probe.vertical_name),
-            "body": PROBE_EMAIL_BODY.format(
-                first_name="{first_name}",  # Instantly personalisation token
-                vertical=probe.vertical_name,
-            ),
-            "delay_days": 0,
-        }
-    ]
-
-    campaign = instantly_service.create_campaign(
-        name=campaign_name,
-        schedule=schedule,
-        sequence_steps=sequence_steps,
-        email_list=[sender_email],
-    )
-    if not campaign or not campaign.get("id"):
-        logger.error(
-            "vertical_autopilot._execute_sends: Instantly campaign creation failed for probe=%d",
-            probe.id,
-        )
-        raise RuntimeError(f"Instantly campaign creation failed for probe {probe.id}")
-
-    campaign_id = campaign["id"]
-    probe.instantly_campaign_id = campaign_id
-
     leads = []
     for row in rows:
         first_name = (row.full_name or "").split()[0] if row.full_name else ""
         leads.append({"email": row.send_email, "first_name": first_name})
 
-    result = instantly_service.add_leads(campaign_id, leads)
-    created = (result or {}).get("leads_created", len(leads))
+    result = instantly_service.add_leads(relay_campaign_id, leads)
+    if result is None:
+        raise RuntimeError(f"Instantly add_leads failed for probe {probe.id} — API returned None")
+    created = result.get("leads_created", 0)
+    if created == 0:
+        raise RuntimeError(
+            f"Instantly add_leads rejected all leads for probe {probe.id} "
+            f"(skipped={result.get('leads_skipped', 0)})"
+        )
+
+    probe.instantly_campaign_id = relay_campaign_id
+    probe.probe_emails = [row.send_email for row in rows[:created]]
     probe.sends_count = created
 
     logger.info(
-        "vertical_autopilot._execute_sends: probe=%d vertical=%r campaign=%s leads_added=%d",
+        "vertical_autopilot._execute_sends: probe=%d vertical=%r relay_campaign=%s leads_added=%d",
         probe.id,
         probe.vertical_name,
-        campaign_id,
+        relay_campaign_id,
         created,
     )
 
@@ -361,15 +335,18 @@ def _cumulative_sends(packet_id: int, db: Session) -> tuple[int, int]:
     return int(row[0]), int(row[1])
 
 
+_INSTANTLY_REPLY_STATUSES = frozenset({"interested", "not interested", "not_interested"})
+
+
 def refresh_probe_replies(probe_id: int, db: Session) -> VerticalProbe:
-    """Poll Instantly analytics for a probe's campaign and update reply metrics.
+    """Poll Instantly for probe-specific reply counts via per-lead status lookup.
 
-    Fetches reply_count_unique from get_analytics_overview, writes reply_count
-    and reply_rate back to the probe row, then re-evaluates the verdict using
-    cumulative totals across all completed probes for the same packet.
+    Paginates list_leads on the Relay passthrough campaign, counts leads whose
+    email is in probe.probe_emails and whose interest_status indicates a reply.
+    Updates probe.reply_count + reply_rate, re-evaluates verdict.
 
-    Safe to call repeatedly — idempotent on the analytics values returned.
-    No-ops if probe has no instantly_campaign_id (sends not yet wired).
+    Safe to call repeatedly — idempotent on the values returned by Instantly.
+    No-ops if probe has no instantly_campaign_id or no probe_emails recorded.
     """
     from sqlalchemy import select as _select
     from src.services import instantly_service
@@ -380,27 +357,35 @@ def refresh_probe_replies(probe_id: int, db: Session) -> VerticalProbe:
     if probe is None:
         raise ValueError(f"VerticalProbe {probe_id} not found")
 
-    if not probe.instantly_campaign_id:
+    if not probe.instantly_campaign_id or not probe.probe_emails:
         logger.info(
-            "vertical_autopilot.refresh_probe_replies: probe=%d has no campaign — skipping",
-            probe_id,
-        )
-        return probe
-
-    analytics = instantly_service.get_analytics_overview([probe.instantly_campaign_id])
-    if not analytics:
-        logger.warning(
-            "vertical_autopilot.refresh_probe_replies: no analytics returned for probe=%d campaign=%s",
+            "vertical_autopilot.refresh_probe_replies: probe=%d not ready for poll "
+            "(campaign_id=%s probe_emails=%s) — skipping",
             probe_id,
             probe.instantly_campaign_id,
+            bool(probe.probe_emails),
         )
         return probe
 
-    row = analytics[0]
-    reply_count = int(row.get("reply_count_unique") or row.get("replies") or 0)
-    probe.reply_count = reply_count
+    probe_email_set = set(probe.probe_emails)
+    reply_count = 0
+    cursor = None
+
+    while True:
+        page = instantly_service.list_leads(probe.instantly_campaign_id, cursor=cursor)
+        if not page:
+            break
+        for lead in page.get("leads") or []:
+            email = (lead.get("email") or "").lower()
+            status = (lead.get("interest_status") or "").lower()
+            if email in probe_email_set and status in _INSTANTLY_REPLY_STATUSES:
+                reply_count += 1
+        cursor = page.get("next_starting_after")
+        if not cursor:
+            break
 
     sends = probe.sends_count or 0
+    probe.reply_count = reply_count
     probe.reply_rate = float(reply_count) / float(sends) if sends > 0 else 0.0
 
     db.flush()
@@ -413,9 +398,8 @@ def refresh_probe_replies(probe_id: int, db: Session) -> VerticalProbe:
         db.flush()
 
     logger.info(
-        "vertical_autopilot.refresh_probe_replies: probe=%d campaign=%s reply_count=%d reply_rate=%.4f",
+        "vertical_autopilot.refresh_probe_replies: probe=%d reply_count=%d reply_rate=%.4f",
         probe_id,
-        probe.instantly_campaign_id,
         reply_count,
         probe.reply_rate,
     )
@@ -555,6 +539,17 @@ def evaluate_verdict(
       6. Below any floor → running (keep collecting data).
     """
     from sqlalchemy import select as _select
+
+    # Return existing terminal verdict — repeated polls must not create duplicates.
+    existing = db.execute(
+        _select(VerticalVerdict)
+        .where(VerticalVerdict.vertical_probe_id == probe.id)
+        .where(VerticalVerdict.verdict.in_(["won", "killed", "awaiting_ruling"]))
+        .order_by(VerticalVerdict.id.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing
 
     reply_rate = float(probe.reply_rate)
     at_kill_floor = cumulative_sends >= PROBE_MIN_SAMPLE_KILL
