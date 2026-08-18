@@ -43,6 +43,10 @@ from src.connectors.outcomes import (
     EVENT_TYPE_AUCTION_CANCELLED,
     EVENT_TYPE_AUCTION_REVERTED_TO_LENDER,
     EVENT_TYPE_AUCTION_SOLD_THIRD_PARTY,
+    EVENT_TYPE_DEED_FLIP,
+    EVENT_TYPE_LIEN_SALE,
+    EVENT_TYPE_LP_SOLD_PRE_AUCTION,
+    EVENT_TYPE_PROBATE_SALE,
     EVENT_TYPE_QUALIFIED_SALE,
     EVENT_TYPE_TAX_DEED_CANCELLED,
     EVENT_TYPE_TAX_DEED_REDEEMED,
@@ -60,6 +64,16 @@ PIPELINE_STAGE_BY_EVENT = {
     EVENT_TYPE_AUCTION_SOLD_THIRD_PARTY: "closed_won",
     EVENT_TYPE_TAX_DEED_SOLD: "closed_won",
     EVENT_TYPE_QUALIFIED_SALE: "closed_won",
+    # CDE-03/05/08 connectors (deed flip, lis-pendens, probate/lien) landed
+    # after this map was first written and stage their own terminal-sale
+    # events; each is a completed arms-length resale (property changed hands),
+    # so all map to closed_won. Absent these, every row those live connectors
+    # staged fell through to the "unrecognized event_type" branch and was left
+    # unconsumed, re-failing every daily run.
+    EVENT_TYPE_DEED_FLIP: "closed_won",
+    EVENT_TYPE_LP_SOLD_PRE_AUCTION: "closed_won",
+    EVENT_TYPE_PROBATE_SALE: "closed_won",
+    EVENT_TYPE_LIEN_SALE: "closed_won",
     EVENT_TYPE_AUCTION_REVERTED_TO_LENDER: "closed_lost",
     EVENT_TYPE_TAX_DEED_REDEEMED: "closed_lost",
 }
