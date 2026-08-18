@@ -134,6 +134,33 @@ def test_auto_approve_draft_skips_when_no_recipient(fresh_db, monkeypatch):
     assert _draft_status(fresh_db, "DRAFT-NORECIP-1") == "draft"  # never touched
 
 
+def test_auto_approve_draft_handoff_rejection_is_parked_not_raised(fresh_db, monkeypatch):
+    """Standing-order auto-approval (builder.py's build_batch loop) hits the
+    same cora_to_relay contract as approve_all, but never reaches Slack.
+    Without parking, a NULL-thread_id draft would stay at status='draft' and
+    be silently re-selected into every future sweep forever."""
+
+    def _fake_enqueue(**kw):
+        raise HandoffRejected("cora_to_relay", ["thread_id: does not match OPP-YYYY-##### format"], kw["idempotency_key"])
+
+    monkeypatch.setattr(decisions.relay_queue, "enqueue", _fake_enqueue)
+
+    seed_draft(fresh_db, "DRAFT-BADTHREAD-AUTO-1", contact_email="a@b.com")
+    draft = {
+        "draft_id": "DRAFT-BADTHREAD-AUTO-1", "opportunity_thread_id": None,
+        "recommended_channel": "email", "subject": "s", "body": "b",
+        "contact_email": "a@b.com", "contact_phone": None,
+    }
+
+    result = decisions.auto_approve_draft(fresh_db, draft)
+
+    assert result is False
+    assert _draft_status(fresh_db, "DRAFT-BADTHREAD-AUTO-1") == "rejected"
+    # Not left at 'draft' — otherwise build_batch() re-selects it every sweep forever.
+    eligible_ids = {d["draft_id"] for d in store.read_drafts(fresh_db, status="draft")}
+    assert "DRAFT-BADTHREAD-AUTO-1" not in eligible_ids
+
+
 def test_approve_all_handoff_rejection_is_parked_not_raised(fresh_db, monkeypatch):
     """A draft with a NULL/malformed opportunity_thread_id fails the
     cora_to_relay handoff contract inside relay_queue.enqueue(). Before this

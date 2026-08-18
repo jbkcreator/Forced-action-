@@ -147,10 +147,17 @@ def auto_approve_draft(db: Any, draft: Dict[str, Any], decided_by: str = "standi
         "contact_email": draft.get("contact_email"),
         "contact_phone": draft.get("contact_phone"),
     }
-    sent = _enqueue_to_relay(item, decided_by)[0]
+    sent, reason = _enqueue_to_relay(item, decided_by)
     if sent:
         store.mark_draft_status(db, draft["draft_id"], "approved_pending_send")
         return True
+    if reason == "handoff_rejected":
+        # Same contract failure as approve_all's — without this, a draft that
+        # fails the cora_to_relay contract (e.g. NULL opportunity_thread_id)
+        # stays at status='draft' and store.read_drafts() re-selects it into
+        # every future build_batch() sweep forever, since standing-order
+        # drafts never reach a human via Slack to reject it explicitly.
+        store.mark_draft_status(db, draft["draft_id"], "rejected", reject_reason="handoff_contract_rejected")
     return False
 
 
