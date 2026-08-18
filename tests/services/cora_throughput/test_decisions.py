@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from sqlalchemy import text
 
+from src.agents.contracts.base import HandoffRejected
 from src.agents.cora import store
 from src.services.cora_throughput import decisions
 from tests.services.cora_throughput.conftest import fake_queue_item, seed_draft
@@ -131,6 +132,63 @@ def test_auto_approve_draft_skips_when_no_recipient(fresh_db, monkeypatch):
     assert result is False
     assert enqueue_calls == []
     assert _draft_status(fresh_db, "DRAFT-NORECIP-1") == "draft"  # never touched
+
+
+def test_auto_approve_draft_handoff_rejection_is_parked_not_raised(fresh_db, monkeypatch):
+    """Standing-order auto-approval (builder.py's build_batch loop) hits the
+    same cora_to_relay contract as approve_all, but never reaches Slack.
+    Without parking, a NULL-thread_id draft would stay at status='draft' and
+    be silently re-selected into every future sweep forever."""
+
+    def _fake_enqueue(**kw):
+        raise HandoffRejected("cora_to_relay", ["thread_id: does not match OPP-YYYY-##### format"], kw["idempotency_key"])
+
+    monkeypatch.setattr(decisions.relay_queue, "enqueue", _fake_enqueue)
+
+    seed_draft(fresh_db, "DRAFT-BADTHREAD-AUTO-1", contact_email="a@b.com")
+    draft = {
+        "draft_id": "DRAFT-BADTHREAD-AUTO-1", "opportunity_thread_id": None,
+        "recommended_channel": "email", "subject": "s", "body": "b",
+        "contact_email": "a@b.com", "contact_phone": None,
+    }
+
+    result = decisions.auto_approve_draft(fresh_db, draft)
+
+    assert result is False
+    assert _draft_status(fresh_db, "DRAFT-BADTHREAD-AUTO-1") == "rejected"
+    # Not left at 'draft' — otherwise build_batch() re-selects it every sweep forever.
+    eligible_ids = {d["draft_id"] for d in store.read_drafts(fresh_db, status="draft")}
+    assert "DRAFT-BADTHREAD-AUTO-1" not in eligible_ids
+
+
+def test_approve_all_handoff_rejection_is_parked_not_raised(fresh_db, monkeypatch):
+    """A draft with a NULL/malformed opportunity_thread_id fails the
+    cora_to_relay handoff contract inside relay_queue.enqueue(). Before this
+    fix that HandoffRejected propagated uncaught out of record_batch_decision
+    (which runs inside a Slack-triggered FastAPI BackgroundTask with nothing
+    to catch it) -- the approval died silently. It must instead be parked as
+    a visible rejection and let the rest of the batch proceed."""
+
+    def _fake_enqueue(**kw):
+        if kw["idempotency_key"] == "cora_draft:DRAFT-BADTHREAD-1":
+            raise HandoffRejected("cora_to_relay", ["thread_id: does not match OPP-YYYY-##### format"], kw["idempotency_key"])
+        return fake_queue_item()
+
+    monkeypatch.setattr(decisions.relay_queue, "enqueue", _fake_enqueue)
+    monkeypatch.setattr(decisions.relay_queue, "record_decision", lambda *a, **k: None)
+
+    _make_batch_with_items(fresh_db, "BATCH-BADTHREAD-1", ["DRAFT-BADTHREAD-1", "DRAFT-OK-1"])
+
+    result = decisions.record_batch_decision(fresh_db, "BATCH-BADTHREAD-1", "approve_all", decided_by="U123")
+
+    assert result["ok"] is True
+    assert result["approved_count"] == 1
+    assert result["rejected_count"] == 1
+    assert _batch_status(fresh_db, "BATCH-BADTHREAD-1") == "partial"
+    assert _draft_status(fresh_db, "DRAFT-BADTHREAD-1") == "rejected"
+    assert _item_decision(fresh_db, "BATCH-BADTHREAD-1", "DRAFT-BADTHREAD-1") == "exception_rejected"
+    # The good draft in the same batch still goes through.
+    assert _draft_status(fresh_db, "DRAFT-OK-1") == "approved_pending_send"
 
 
 def test_record_batch_decision_batch_not_found(fresh_db):
