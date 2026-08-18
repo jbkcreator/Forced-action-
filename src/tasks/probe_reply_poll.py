@@ -1,9 +1,15 @@
 """
 Vertical Autopilot probe reply poller (REVINT-v2.2 I4).
 
-Polls Instantly analytics for every probe in 'running' status that has an
-instantly_campaign_id and whose sends were dispatched ≥ MIN_HOURS_AFTER_SEND
-hours ago.  Updates reply_count + reply_rate and re-evaluates the verdict.
+Polls Instantly for every probe in 'completed' status that has an
+instantly_campaign_id, completed ≥ MIN_HOURS_AFTER_SEND hours ago, and does
+not yet have a terminal verdict.  Updates reply_count + reply_rate and
+re-evaluates the verdict.
+
+run_probe() marks a probe 'completed' the moment its sends go out — the probe
+is not "running" during the wait for replies — so the poll window is keyed off
+completed_at, and terminal probes (won/killed/awaiting_ruling) are excluded so
+a settled vertical is never re-polled.
 
 Run via cron every 6 hours:
     0 */6 * * * $PROJECT/scripts/cron/run.sh src.tasks.probe_reply_poll
@@ -29,11 +35,16 @@ def run() -> None:
     with get_db_context() as db:
         rows = db.execute(
             text(
-                "SELECT id FROM vertical_probes "
-                "WHERE status = 'running' "
-                "  AND instantly_campaign_id IS NOT NULL "
-                "  AND updated_at <= :cutoff "
-                "ORDER BY id"
+                "SELECT p.id FROM vertical_probes p "
+                "WHERE p.status = 'completed' "
+                "  AND p.instantly_campaign_id IS NOT NULL "
+                "  AND p.completed_at <= :cutoff "
+                "  AND NOT EXISTS ("
+                "      SELECT 1 FROM vertical_verdicts v "
+                "      WHERE v.vertical_probe_id = p.id "
+                "        AND v.verdict IN ('won','killed','awaiting_ruling')"
+                "  ) "
+                "ORDER BY p.id"
             ),
             {"cutoff": datetime.now(timezone.utc) - timedelta(hours=MIN_HOURS_AFTER_SEND)},
         ).fetchall()

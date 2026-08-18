@@ -331,16 +331,31 @@ def _execute_sends(probe: VerticalProbe, db: Session) -> None:
         raise RuntimeError(
             f"Instantly add_leads created 0 leads for probe {probe.id} (skipped={skipped})"
         )
-    if skipped:
-        logger.warning(
-            "vertical_autopilot._execute_sends: probe=%d had %d contacts skipped by "
-            "Instantly duplicate guard — reply attribution counts created leads only",
-            probe.id, skipped,
+
+    # Attribute replies only to contacts Instantly confirms it created for THIS
+    # probe. A skipped contact is already a member of the shared Relay campaign;
+    # counting its prior reply as a probe reply would inflate the verdict.
+    created_emails = [
+        (r.get("email") or "").strip().lower()
+        for r in (result.get("created_leads") or [])
+        if r.get("email")
+    ]
+    if created_emails:
+        probe.probe_emails = created_emails
+        probe.sends_count = len(created_emails)
+    elif skipped:
+        # No per-lead detail AND some were skipped — cannot attribute safely.
+        raise RuntimeError(
+            f"Instantly add_leads skipped {skipped} contacts for probe {probe.id} "
+            "and returned no created_leads detail — cannot attribute replies safely"
         )
+    else:
+        # No per-lead detail but nothing skipped — every selected row was created.
+        probe.probe_emails = [(row.send_email or "").strip().lower() for row in rows]
+        probe.sends_count = created
 
     probe.instantly_campaign_id = relay_campaign_id
-    probe.probe_emails = [row.send_email for row in rows]
-    probe.sends_count = created
+    created = probe.sends_count
 
     logger.info(
         "vertical_autopilot._execute_sends: probe=%d vertical=%r relay_campaign=%s leads_added=%d",
@@ -351,16 +366,26 @@ def _execute_sends(probe: VerticalProbe, db: Session) -> None:
     )
 
 
-def _cumulative_sends(packet_id: int, db: Session) -> tuple[int, int]:
-    """Return (total_sends, total_replies) across all completed probes for a packet."""
-    row = db.execute(
-        text(
-            "SELECT COALESCE(SUM(sends_count), 0), COALESCE(SUM(reply_count), 0) "
-            "FROM vertical_probes "
-            "WHERE vertical_candidate_packet_id = :pid AND status = 'completed'"
-        ),
-        {"pid": packet_id},
-    ).one()
+def _cumulative_sends(
+    packet_id: int, db: Session, exclude_probe_id: int | None = None
+) -> tuple[int, int]:
+    """Return (total_sends, total_replies) across all completed probes for a packet.
+
+    Pass exclude_probe_id to leave a specific probe out of the totals — used by
+    refresh_probe_replies so the probe being refreshed (already 'completed', so
+    already in this sum) is not counted twice when its own sends/replies are
+    added back on top.
+    """
+    sql = (
+        "SELECT COALESCE(SUM(sends_count), 0), COALESCE(SUM(reply_count), 0) "
+        "FROM vertical_probes "
+        "WHERE vertical_candidate_packet_id = :pid AND status = 'completed'"
+    )
+    params: dict = {"pid": packet_id}
+    if exclude_probe_id is not None:
+        sql += " AND id <> :exclude_id"
+        params["exclude_id"] = exclude_probe_id
+    row = db.execute(text(sql), params).one()
     return int(row[0]), int(row[1])
 
 
@@ -402,8 +427,14 @@ def refresh_probe_replies(probe_id: int, db: Session) -> VerticalProbe:
 
     while True:
         page = instantly_service.list_leads(probe.instantly_campaign_id, cursor=cursor)
-        if not page:
-            break
+        if page is None:
+            # None = config/API failure (an empty campaign returns {"leads": []}).
+            # Raise so the caller logs and retries later — never overwrite existing
+            # reply metrics with a fabricated zero.
+            raise RuntimeError(
+                f"Instantly list_leads failed for probe {probe_id} "
+                f"(campaign={probe.instantly_campaign_id}) — leaving metrics unchanged"
+            )
         for lead in page.get("leads") or []:
             email = (lead.get("email") or "").lower()
             status = (lead.get("interest_status") or "").lower()
@@ -419,7 +450,11 @@ def refresh_probe_replies(probe_id: int, db: Session) -> VerticalProbe:
 
     db.flush()
 
-    prior_sends, prior_replies = _cumulative_sends(probe.vertical_candidate_packet_id, db)
+    # Exclude this probe (already 'completed', so already in the sum) and add its
+    # freshly-polled sends/replies back exactly once.
+    prior_sends, prior_replies = _cumulative_sends(
+        probe.vertical_candidate_packet_id, db, exclude_probe_id=probe.id
+    )
     cumulative_sends = prior_sends + sends
     cumulative_replies = prior_replies + reply_count
     if cumulative_sends > 0:

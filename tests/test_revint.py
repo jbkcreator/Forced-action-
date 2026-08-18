@@ -863,6 +863,152 @@ class TestProbeRelayPassthrough:
         ).scalar()
         assert count == 1, "repeat poll must not create a second verdict row"
 
+    # ── review-round-2 fixes ──────────────────────────────────────────────────
+
+    def test_poller_selects_completed_unsettled_probe(self, fresh_db):
+        """Poller SQL must select a completed, aged, un-settled probe — and
+        exclude running probes and probes with a terminal verdict. Validates the
+        exact columns (completed_at, not updated_at) against the live schema."""
+        from datetime import timedelta
+        from sqlalchemy import text
+
+        packet = self._make_packet(fresh_db)
+        ready = self._make_probe(
+            fresh_db, packet, status="completed",
+            instantly_campaign_id="camp_relay_1", probe_emails=["x@example.com"],
+            sends_count=1,
+            completed_at=datetime.now(timezone.utc) - timedelta(hours=72),
+        )
+        # too recent — excluded by 48h cutoff
+        self._make_probe(
+            fresh_db, packet, status="completed",
+            instantly_campaign_id="camp_relay_1", probe_emails=["y@example.com"],
+            sends_count=1, completed_at=datetime.now(timezone.utc),
+        )
+        # still running — excluded
+        self._make_probe(
+            fresh_db, packet, status="running",
+            instantly_campaign_id="camp_relay_1", probe_emails=["z@example.com"],
+            sends_count=1,
+        )
+        # completed + aged but already settled — excluded
+        settled = self._make_probe(
+            fresh_db, packet, status="completed",
+            instantly_campaign_id="camp_relay_1", probe_emails=["w@example.com"],
+            sends_count=1,
+            completed_at=datetime.now(timezone.utc) - timedelta(hours=72),
+        )
+        fresh_db.add(VerticalVerdict(
+            vertical_probe_id=settled.id,
+            vertical_candidate_packet_id=packet.id,
+            vertical_name=packet.vertical_name,
+            verdict="killed", verdict_at=datetime.now(timezone.utc),
+            rule_fired="test", reply_rate_at_verdict=0.0,
+            presell_confirmed=False, package_generated=False,
+        ))
+        fresh_db.flush()
+
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
+        rows = fresh_db.execute(
+            text(
+                "SELECT p.id FROM vertical_probes p "
+                "WHERE p.status = 'completed' "
+                "  AND p.instantly_campaign_id IS NOT NULL "
+                "  AND p.completed_at <= :cutoff "
+                "  AND NOT EXISTS (SELECT 1 FROM vertical_verdicts v "
+                "    WHERE v.vertical_probe_id = p.id "
+                "      AND v.verdict IN ('won','killed','awaiting_ruling')) "
+                "  AND p.vertical_candidate_packet_id = :pid "
+                "ORDER BY p.id"
+            ),
+            {"cutoff": cutoff, "pid": packet.id},
+        ).scalars().all()
+
+        assert rows == [ready.id]
+
+    def test_skipped_lead_not_attributed(self, fresh_db):
+        """A contact skipped by Instantly's duplicate guard must not land in
+        probe_emails — only confirmed created_leads are attributed."""
+        from src.services.vertical_autopilot import _execute_sends
+
+        packet = self._make_packet(fresh_db)
+        probe = self._make_probe(fresh_db, packet)
+        e_ok = "ok-skiptest@example.com"
+        e_dup = "dup-skiptest@example.com"
+        self._seed_contact(fresh_db, e_ok)
+        self._seed_contact(fresh_db, e_dup)
+
+        def fake_add_leads(cid, leads):
+            # e_dup already a campaign member → skipped; only e_ok created
+            return {"leads_uploaded": 1, "duplicated_leads": 1,
+                    "created_leads": [{"index": 0, "id": "l1", "email": e_ok}]}
+
+        with patch.dict("src.services.vertical_autopilot.PROBE_DBPR_VERTICAL_MAP",
+                        {packet.vertical_name: [self.TEST_TRADE]}, clear=False), \
+             patch("src.utils.venture_config.get_venture_config", return_value=self._fake_venture()), \
+             patch("src.services.instantly_service.add_leads", side_effect=fake_add_leads), \
+             patch("src.services.relay.channels_email.unsubscribe_url", return_value="https://u/x"):
+            _execute_sends(probe, fresh_db)
+
+        assert probe.probe_emails == [e_ok]
+        assert e_dup not in probe.probe_emails
+        assert probe.sends_count == 1
+
+    def test_refresh_raises_and_preserves_metrics_on_poll_failure(self, fresh_db):
+        """list_leads returning None (API/config failure) must raise and leave
+        existing reply metrics untouched — never overwrite with a fake zero."""
+        from src.services.vertical_autopilot import refresh_probe_replies
+
+        packet = self._make_packet(fresh_db)
+        probe = self._make_probe(
+            fresh_db, packet, status="completed",
+            instantly_campaign_id="camp_relay_1",
+            probe_emails=["a@example.com", "b@example.com"],
+            sends_count=2, reply_count=5, reply_rate=0.5,
+            completed_at=datetime.now(timezone.utc),
+        )
+
+        with patch("src.services.instantly_service.list_leads", return_value=None):
+            with pytest.raises(RuntimeError, match="list_leads failed"):
+                refresh_probe_replies(probe.id, fresh_db)
+
+        fresh_db.refresh(probe)
+        assert probe.reply_count == 5, "reply metrics must survive a poll failure"
+
+    def test_refresh_counts_current_probe_once(self, fresh_db):
+        """Cumulative reply rate must count the refreshed probe exactly once,
+        not double it via _cumulative_sends + manual re-add."""
+        from src.services.vertical_autopilot import refresh_probe_replies
+
+        packet = self._make_packet(fresh_db)
+        # prior completed probe: 100 sends, 4 replies
+        self._make_probe(
+            fresh_db, packet, status="completed",
+            sends_count=100, reply_count=4, reply_rate=0.04,
+            completed_at=datetime.now(timezone.utc),
+        )
+        a, b = "a-once@example.com", "b-once@example.com"
+        current = self._make_probe(
+            fresh_db, packet, status="completed",
+            instantly_campaign_id="camp_relay_1",
+            probe_emails=[a, b], sends_count=2,
+            completed_at=datetime.now(timezone.utc),
+        )
+
+        page = {"leads": [
+            {"email": a, "interest_status": "interested"},
+            {"email": b, "interest_status": "interested"},
+        ], "next_starting_after": None}
+
+        with patch("src.services.instantly_service.list_leads", return_value=page):
+            refresh_probe_replies(current.id, fresh_db)
+
+        fresh_db.refresh(current)
+        # cumulative = prior(100,4) + current(2,2) = 102 sends, 6 replies.
+        # Double-counting would give 8/104 = 0.0769; single count = 0.0588
+        # (reply_rate is Numeric(6,4), so compare at 4-dp).
+        assert float(current.reply_rate) == pytest.approx(round(6 / 102, 4), abs=1e-4)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 8. Price band drift guard — floors must match live prices
