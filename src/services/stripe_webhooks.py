@@ -1687,16 +1687,42 @@ def _on_payment_succeeded(invoice: dict, db: Session) -> None:
             stripe_customer_id, exc,
         )
 
-    # Refresh plan_price on every successful payment so MRR stays accurate across
-    # plan changes, price overrides, and accounts that pre-date the checkout fix.
-    # invoice.amount_paid is the actual charge for this billing period (cents).
-    _inv_interval = "annual" if (
-        invoice.get("lines", {}).get("data", [{}])[0].get("plan", {}).get("interval_count", 1) == 12
-        or invoice.get("lines", {}).get("data", [{}])[0].get("plan", {}).get("interval") == "year"
-    ) else "monthly"
-    _inv_paid = invoice.get("amount_paid") or 0
-    if _inv_paid > 0:
-        subscriber.plan_price = normalized_monthly_price(_inv_paid, _inv_interval)
+    # Refresh plan_price from the subscription's recurring price item so MRR
+    # always reflects the full recurring monthly rate, not a prorated charge.
+    # invoice.amount_paid is wrong for mid-cycle upgrades/downgrades because
+    # Stripe emits only the prorated difference (e.g. $50 for a $200/mo plan).
+    # Strategy: read unit_amount + interval from the first non-proration line
+    # item that has a price attached. Fall back to amount_paid only when every
+    # line is a proration or adjustment (no recurring price item present).
+    _plan_price_updated = False
+    for _line in (invoice.get("lines") or {}).get("data", []):
+        if _line.get("proration"):
+            continue
+        _price = _line.get("price") or {}
+        _unit = _price.get("unit_amount") or 0
+        _recurring = _price.get("recurring") or {}
+        _interval = _recurring.get("interval", "month")
+        _interval_count = _recurring.get("interval_count", 1)
+        if _unit > 0:
+            _norm_interval = "annual" if (
+                _interval == "year" or (_interval == "month" and _interval_count == 12)
+            ) else "monthly"
+            subscriber.plan_price = normalized_monthly_price(_unit, _norm_interval)
+            _plan_price_updated = True
+            break
+    if not _plan_price_updated:
+        # All lines are prorations/adjustments — fall back to amount_paid only
+        # if this looks like a genuine full-cycle charge (billing_reason is
+        # subscription_cycle or subscription_create, not subscription_update).
+        _billing_reason = invoice.get("billing_reason", "")
+        _inv_paid = invoice.get("amount_paid") or 0
+        if _inv_paid > 0 and _billing_reason in ("subscription_cycle", "subscription_create"):
+            _line0 = (invoice.get("lines") or {}).get("data", [{}])[0]
+            _fallback_interval = "annual" if (
+                (_line0.get("plan") or {}).get("interval_count", 1) == 12
+                or (_line0.get("plan") or {}).get("interval") == "year"
+            ) else "monthly"
+            subscriber.plan_price = normalized_monthly_price(_inv_paid, _fallback_interval)
 
     # Clear recovery state on successful payment
     had_failed_payment = subscriber.payment_failed_at is not None
