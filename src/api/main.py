@@ -1161,7 +1161,12 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
     line_item = {"price": price_id, "quantity": 1}
     resolved_amount_cents = None
     cohort_source = "base_price"
-    if payload.tier in _ZIP_PRICING_TIERS:
+    # Cohort pricing is a MONTHLY-only mechanic: pricing_cohorts stores one fixed
+    # monthly amount and regular_amount below is the monthly price. Annual
+    # starter/pro use a flat annual price (no founding/cohort mechanic) — applying
+    # the monthly cohort amount to the annual price_id's yearly interval would
+    # bill a full year at one month's price. Skip the block for annual.
+    if payload.interval != "annual" and payload.tier in _ZIP_PRICING_TIERS:
         tier_base = _cached_pricing_info().get(payload.tier) or {}
         regular_amount = tier_base.get("regular_amount")
         founding_amount = tier_base.get("founding_amount")
