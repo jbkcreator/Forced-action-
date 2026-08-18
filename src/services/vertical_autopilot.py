@@ -31,10 +31,6 @@ from config.vertical_fit_rubric import (
     LEGAL_RISK_BLOCKLIST_CATEGORIES,
     MIN_MONTHLY_RECORDS,
     MONEY_EVIDENCE_SIGNALS,
-    PROBE_CAMPAIGN_DAYS,
-    PROBE_CAMPAIGN_SEND_FROM,
-    PROBE_CAMPAIGN_SEND_TO,
-    PROBE_CAMPAIGN_TIMEZONE,
     PROBE_DBPR_VERTICAL_MAP,
     PROBE_EMAIL_BODY,
     PROBE_EMAIL_SUBJECT,
@@ -238,24 +234,35 @@ def _run_compliance_preflight(probe: VerticalProbe) -> bool:
 
 
 def _execute_sends(probe: VerticalProbe, db: Session) -> None:
-    """Add DBPR contacts as leads to the existing Relay passthrough campaign.
+    """Send this probe's outreach through the shared Relay passthrough campaign.
+
+    The Relay passthrough campaign's single sequence step is the merge tags
+    {{ra_subject}}/{{ra_body}} — every send carries its own content via
+    custom_variables, so the probe reuses that exact campaign with its own
+    probe template (config.vertical_fit_rubric.PROBE_EMAIL_*) plus the same
+    CAN-SPAM footer the Relay send channel appends. No per-probe campaign is
+    created (see src/services/relay/channels_email.py).
 
     Pulls up to PROBE_MAX_SENDS_PER_RUN contacts whose trade vertical maps to
-    probe.vertical_name, preferring work_email over raw email. Adds them to the
-    shared Relay Instantly campaign (RELAY_INSTANTLY_CAMPAIGN_ID) so no new
-    campaign is created per probe. Stores the sent email list in probe.probe_emails
+    probe.vertical_name, excluding global suppression AND any contact already
+    probed for this packet (the passthrough campaign's per-campaign duplicate
+    guard silently skips repeats). Stores the sent emails in probe.probe_emails
     for per-probe reply attribution at refresh time.
 
     Sets probe.instantly_campaign_id (= relay campaign id) and probe.sends_count.
     Reply ingestion happens separately via refresh_probe_replies().
     """
-    from config.settings import get_settings
     from src.services import instantly_service
+    from src.services.relay.channels_email import build_passthrough_body
+    from src.utils.venture_config import get_venture_config
 
-    settings = get_settings()
-    relay_campaign_id = settings.relay_instantly_campaign_id
+    venture = get_venture_config()
+    relay_campaign_id = venture.relay_instantly_campaign_id
     if not relay_campaign_id:
-        raise RuntimeError("RELAY_INSTANTLY_CAMPAIGN_ID not configured — cannot send probes")
+        raise RuntimeError(
+            "Relay passthrough campaign not configured for the default venture — "
+            "cannot send probes"
+        )
 
     target_trades = PROBE_DBPR_VERTICAL_MAP.get(probe.vertical_name, [])
     if not target_trades:
@@ -268,6 +275,7 @@ def _execute_sends(probe: VerticalProbe, db: Session) -> None:
 
     placeholders = ", ".join(f":t{i}" for i in range(len(target_trades)))
     params: dict = {f"t{i}": v for i, v in enumerate(target_trades)}
+    params["pid"] = probe.vertical_candidate_packet_id
     params["limit"] = PROBE_MAX_SENDS_PER_RUN
 
     rows = db.execute(
@@ -279,6 +287,12 @@ def _execute_sends(probe: VerticalProbe, db: Session) -> None:
             f"  AND NOT is_opted_out "
             f"  AND NOT is_hard_bounced "
             f"  AND NOT is_signed_up "
+            f"  AND COALESCE(work_email, email) NOT IN ("
+            f"      SELECT jsonb_array_elements_text(probe_emails) "
+            f"      FROM vertical_probes "
+            f"      WHERE vertical_candidate_packet_id = :pid "
+            f"        AND probe_emails IS NOT NULL"
+            f"  ) "
             f"ORDER BY id "
             f"LIMIT :limit"
         ),
@@ -287,30 +301,45 @@ def _execute_sends(probe: VerticalProbe, db: Session) -> None:
 
     if not rows:
         logger.warning(
-            "vertical_autopilot._execute_sends: no usable DBPR contacts for vertical=%r trades=%r",
+            "vertical_autopilot._execute_sends: no fresh DBPR contacts for vertical=%r trades=%r",
             probe.vertical_name,
             target_trades,
         )
         probe.sends_count = 0
         return
 
+    subject = PROBE_EMAIL_SUBJECT.format(vertical=probe.vertical_name)
     leads = []
     for row in rows:
         first_name = (row.full_name or "").split()[0] if row.full_name else ""
-        leads.append({"email": row.send_email, "first_name": first_name})
+        body_text = PROBE_EMAIL_BODY.format(first_name=first_name, vertical=probe.vertical_name)
+        leads.append({
+            "email": row.send_email,
+            "custom_variables": {
+                "ra_subject": subject,
+                "ra_body": build_passthrough_body(body_text, row.send_email, venture),
+            },
+        })
 
     result = instantly_service.add_leads(relay_campaign_id, leads)
     if result is None:
         raise RuntimeError(f"Instantly add_leads failed for probe {probe.id} — API returned None")
-    created = result.get("leads_created", 0)
+
+    skipped = result.get("duplicated_leads", 0) or result.get("leads_skipped", 0)
+    created = result.get("leads_uploaded", 0) or result.get("leads_created", 0)
     if created == 0:
         raise RuntimeError(
-            f"Instantly add_leads rejected all leads for probe {probe.id} "
-            f"(skipped={result.get('leads_skipped', 0)})"
+            f"Instantly add_leads created 0 leads for probe {probe.id} (skipped={skipped})"
+        )
+    if skipped:
+        logger.warning(
+            "vertical_autopilot._execute_sends: probe=%d had %d contacts skipped by "
+            "Instantly duplicate guard — reply attribution counts created leads only",
+            probe.id, skipped,
         )
 
     probe.instantly_campaign_id = relay_campaign_id
-    probe.probe_emails = [row.send_email for row in rows[:created]]
+    probe.probe_emails = [row.send_email for row in rows]
     probe.sends_count = created
 
     logger.info(

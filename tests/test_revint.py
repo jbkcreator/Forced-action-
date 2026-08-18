@@ -527,14 +527,15 @@ class TestProbeLoop:
         assert verdict.package_id is not None
 
     def test_run_probe_fails_closed_on_campaign_error(self, fresh_db):
-        """_execute_sends raises RuntimeError when Instantly campaign creation fails.
+        """_execute_sends raises RuntimeError when the Instantly send fails.
         No verdict must be recorded in that case."""
         from src.services.vertical_autopilot import run_probe
 
         packet = self._make_eligible_packet(fresh_db)
 
         with patch("src.services.vertical_autopilot._run_compliance_preflight", return_value=True), \
-             patch("src.services.instantly_service.create_campaign", return_value=None):
+             patch("src.services.vertical_autopilot._execute_sends",
+                   side_effect=RuntimeError("Instantly add_leads failed")):
             with pytest.raises(RuntimeError):
                 run_probe(packet.id, fresh_db)
 
@@ -556,9 +557,10 @@ class TestProbeLoop:
             probe1 = run_probe(packet.id, fresh_db)
         assert probe1.status == "aborted"
 
-        # Second call same day: reuses same row; campaign creation fails → RuntimeError
+        # Second call same day: reuses same row; send fails → RuntimeError
         with patch("src.services.vertical_autopilot._run_compliance_preflight", return_value=True), \
-             patch("src.services.instantly_service.create_campaign", return_value=None):
+             patch("src.services.vertical_autopilot._execute_sends",
+                   side_effect=RuntimeError("Instantly add_leads failed")):
             with pytest.raises(RuntimeError):
                 run_probe(packet.id, fresh_db)
 
@@ -577,7 +579,8 @@ class TestProbeLoop:
         packet = self._make_eligible_packet(fresh_db)
 
         with patch("src.services.vertical_autopilot._run_compliance_preflight", return_value=True), \
-             patch("src.services.instantly_service.create_campaign", return_value=None):
+             patch("src.services.vertical_autopilot._execute_sends",
+                   side_effect=RuntimeError("Instantly add_leads failed")):
             with pytest.raises(RuntimeError):
                 run_probe(packet.id, fresh_db)
 
@@ -671,6 +674,194 @@ class TestProbeLoop:
 
         fresh_db.refresh(packet)
         assert packet.status == "awaiting_ruling"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7b. Probe outreach rides the shared Relay passthrough campaign
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestProbeRelayPassthrough:
+    """Probe sends through the ONE Relay passthrough campaign via the
+    {{ra_subject}}/{{ra_body}} merge tags — no per-probe campaign created.
+
+    The vertical→trade map is patched to a unique test trade so the shared
+    DB's real dbpr_contacts don't leak into the deterministic assertions.
+    """
+
+    TEST_TRADE = "__probe_relay_test_trade__"
+
+    def _make_packet(self, db, vertical="pre_foreclosure"):
+        packet = VerticalCandidatePacket(
+            vertical_name=vertical,
+            total_score=6,
+            legal_status="approved",
+            eligible_for_probe=True,
+            status="candidate",
+            created_at=datetime.now(timezone.utc),
+        )
+        db.add(packet)
+        db.flush()
+        return packet
+
+    def _make_probe(self, db, packet, **overrides):
+        import uuid
+        probe = VerticalProbe(
+            vertical_candidate_packet_id=packet.id,
+            vertical_name=packet.vertical_name,
+            idempotency_key=f"relay-{uuid.uuid4().hex[:10]}",
+            status=overrides.get("status", "running"),
+            started_at=datetime.now(timezone.utc),
+            **{k: v for k, v in overrides.items() if k != "status"},
+        )
+        db.add(probe)
+        db.flush()
+        return probe
+
+    def _seed_contact(self, db, email, **flags):
+        import uuid
+        from src.core.models import DBPRContact
+        c = DBPRContact(
+            license_number=f"LIC-{uuid.uuid4().hex[:12]}",
+            license_type_code="CGC",
+            full_name="Bob Roofer",
+            vertical=self.TEST_TRADE,
+            work_email=email,
+            is_opted_out=flags.get("is_opted_out", False),
+            is_hard_bounced=flags.get("is_hard_bounced", False),
+            is_signed_up=flags.get("is_signed_up", False),
+        )
+        db.add(c)
+        db.flush()
+        return c
+
+    def _fake_venture(self):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            relay_instantly_campaign_id="camp_relay_1",
+            brand_name="Forced Action",
+            postal_address="123 Main St, Tampa FL",
+        )
+
+    def test_execute_sends_uses_relay_passthrough(self, fresh_db):
+        import uuid
+        from src.services.vertical_autopilot import _execute_sends
+
+        packet = self._make_packet(fresh_db)
+        probe = self._make_probe(fresh_db, packet)
+
+        e_ok = f"ok-{uuid.uuid4().hex[:8]}@example.com"
+        e_opt = f"opt-{uuid.uuid4().hex[:8]}@example.com"
+        e_bounce = f"bnc-{uuid.uuid4().hex[:8]}@example.com"
+        self._seed_contact(fresh_db, e_ok)
+        self._seed_contact(fresh_db, e_opt, is_opted_out=True)
+        self._seed_contact(fresh_db, e_bounce, is_hard_bounced=True)
+
+        captured = {}
+
+        def fake_add_leads(cid, leads):
+            captured["cid"] = cid
+            captured["leads"] = leads
+            return {"leads_uploaded": len(leads)}
+
+        with patch.dict("src.services.vertical_autopilot.PROBE_DBPR_VERTICAL_MAP",
+                        {packet.vertical_name: [self.TEST_TRADE]}, clear=False), \
+             patch("src.utils.venture_config.get_venture_config", return_value=self._fake_venture()), \
+             patch("src.services.instantly_service.add_leads", side_effect=fake_add_leads), \
+             patch("src.services.relay.channels_email.unsubscribe_url", return_value="https://u/x"):
+            _execute_sends(probe, fresh_db)
+
+        assert captured["cid"] == "camp_relay_1"
+        emails = {l["email"] for l in captured["leads"]}
+        assert emails == {e_ok}, "only the non-suppressed contact should be sent"
+        lead = captured["leads"][0]
+        assert lead["custom_variables"]["ra_subject"]
+        assert "Unsubscribe" in lead["custom_variables"]["ra_body"]
+        assert "Forced Action" in lead["custom_variables"]["ra_body"]
+        assert probe.instantly_campaign_id == "camp_relay_1"
+        assert probe.sends_count == 1
+        assert probe.probe_emails == [e_ok]
+
+    def test_execute_sends_excludes_already_probed_contacts(self, fresh_db):
+        import uuid
+        from src.services.vertical_autopilot import _execute_sends
+
+        packet = self._make_packet(fresh_db)
+        e1 = f"e1-{uuid.uuid4().hex[:8]}@example.com"
+        e2 = f"e2-{uuid.uuid4().hex[:8]}@example.com"
+        self._seed_contact(fresh_db, e1)
+        self._seed_contact(fresh_db, e2)
+
+        # Prior completed probe already reached e1.
+        self._make_probe(fresh_db, packet, status="completed",
+                         sends_count=1, probe_emails=[e1],
+                         completed_at=datetime.now(timezone.utc))
+        probe2 = self._make_probe(fresh_db, packet)
+
+        captured = {}
+
+        def fake_add_leads(cid, leads):
+            captured["leads"] = leads
+            return {"leads_uploaded": len(leads)}
+
+        with patch.dict("src.services.vertical_autopilot.PROBE_DBPR_VERTICAL_MAP",
+                        {packet.vertical_name: [self.TEST_TRADE]}, clear=False), \
+             patch("src.utils.venture_config.get_venture_config", return_value=self._fake_venture()), \
+             patch("src.services.instantly_service.add_leads", side_effect=fake_add_leads), \
+             patch("src.services.relay.channels_email.unsubscribe_url", return_value="https://u/x"):
+            _execute_sends(probe2, fresh_db)
+
+        emails = {l["email"] for l in captured["leads"]}
+        assert emails == {e2}, "e1 already probed — only e2 is fresh"
+
+    def test_refresh_counts_only_probe_emails(self, fresh_db):
+        import uuid
+        from src.services.vertical_autopilot import refresh_probe_replies
+
+        packet = self._make_packet(fresh_db)
+        a = f"a-{uuid.uuid4().hex[:8]}@example.com"
+        b = f"b-{uuid.uuid4().hex[:8]}@example.com"
+        probe = self._make_probe(
+            fresh_db, packet,
+            instantly_campaign_id="camp_relay_1",
+            probe_emails=[a, b],
+            sends_count=2,
+        )
+
+        page = {
+            "leads": [
+                {"email": a, "interest_status": "interested"},
+                {"email": b, "interest_status": ""},
+                {"email": "relay-lead@example.com", "interest_status": "interested"},
+            ],
+            "next_starting_after": None,
+        }
+
+        with patch("src.services.instantly_service.list_leads", return_value=page):
+            refresh_probe_replies(probe.id, fresh_db)
+
+        fresh_db.refresh(probe)
+        assert probe.reply_count == 1, "only probe email 'a' replied; relay lead excluded"
+
+    def test_evaluate_verdict_idempotent_on_repeat_poll(self, fresh_db):
+        from sqlalchemy import select, func
+        from src.services.vertical_autopilot import evaluate_verdict
+
+        packet = self._make_packet(fresh_db)
+        probe = self._make_probe(
+            fresh_db, packet, status="completed",
+            sends_count=100, reply_count=100, reply_rate=1.0,
+            completed_at=datetime.now(timezone.utc),
+        )
+
+        v1 = evaluate_verdict(probe, fresh_db, cumulative_sends=100)
+        v2 = evaluate_verdict(probe, fresh_db, cumulative_sends=100)
+
+        assert v1.id == v2.id
+        count = fresh_db.execute(
+            select(func.count()).select_from(VerticalVerdict)
+            .where(VerticalVerdict.vertical_probe_id == probe.id)
+        ).scalar()
+        assert count == 1, "repeat poll must not create a second verdict row"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
