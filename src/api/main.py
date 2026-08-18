@@ -818,6 +818,17 @@ def _fetch_pricing_from_stripe() -> dict:
             **TIER_DISPLAY[tier],
         }
 
+    # Fetch annual prices for starter and pro (new SKUs — separate from founding/regular).
+    for tier in ("starter", "pro"):
+        annual_id = _s.active_stripe_price(f"{tier}_annual")
+        if annual_id:
+            try:
+                p = stripe.Price.retrieve(annual_id)
+                if p.unit_amount is not None:
+                    pricing_info[tier]["annual_amount"] = p.unit_amount // 100
+            except Exception as e:
+                logger.error("Error retrieving annual price for tier '%s': %s", tier, e, exc_info=True)
+
     # Founder is a flat premium tier with a monthly/annual split (not
     # founding/regular). Its amounts are sourced from the seeded `plans` rows —
     # the single source of truth — so this resolves regardless of Stripe mode.
@@ -1178,7 +1189,12 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
     line_item = {"price": price_id, "quantity": 1}
     resolved_amount_cents = None
     cohort_source = "base_price"
-    if payload.tier in _ZIP_PRICING_TIERS:
+    # Cohort pricing is a MONTHLY-only mechanic: pricing_cohorts stores one fixed
+    # monthly amount and regular_amount below is the monthly price. Annual
+    # starter/pro use a flat annual price (no founding/cohort mechanic) — applying
+    # the monthly cohort amount to the annual price_id's yearly interval would
+    # bill a full year at one month's price. Skip the block for annual.
+    if payload.interval != "annual" and payload.tier in _ZIP_PRICING_TIERS:
         tier_base = _cached_pricing_info().get(payload.tier) or {}
         regular_amount = tier_base.get("regular_amount")
         founding_amount = tier_base.get("founding_amount")
