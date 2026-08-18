@@ -232,33 +232,40 @@ async def _run_playwright_batch(
                 try:
                     html, snap = await _scrape_entity_detail(page, search_name)
                 except Exception as e:
-                    consecutive_timeouts += 1
-                    if consecutive_timeouts >= _CIRCUIT_BREAKER_THRESHOLD:
-                        logger.warning(
-                            "[Sunbiz] %d consecutive Playwright failures — Sunbiz likely "
-                            "throttling this session. Backing off %ds and retrying '%s' once.",
-                            consecutive_timeouts, _CIRCUIT_BREAKER_BACKOFF_SECONDS, name,
-                        )
-                        await asyncio.sleep(_CIRCUIT_BREAKER_BACKOFF_SECONDS)
-                        try:
-                            html, snap = await _scrape_entity_detail(page, search_name)
-                            consecutive_timeouts = 0
-                        except Exception as e2:
-                            stats["rate_limited"] = True
-                            stats["remaining_unprocessed"] = total - idx
-                            logger.error(
-                                "[Sunbiz] Still failing after backoff — aborting run with "
-                                "%d owner(s) unprocessed; will resume next cron run. "
-                                "Last error: %s",
-                                stats["remaining_unprocessed"], e2,
+                    # Per-lookup retry: wait briefly and try once more before
+                    # marking parser_failed — handles transient portal hiccups
+                    # that cause the same company to fail every run otherwise.
+                    await asyncio.sleep(3)
+                    try:
+                        html, snap = await _scrape_entity_detail(page, search_name)
+                    except Exception as e2:
+                        consecutive_timeouts += 1
+                        if consecutive_timeouts >= _CIRCUIT_BREAKER_THRESHOLD:
+                            logger.warning(
+                                "[Sunbiz] %d consecutive Playwright failures — Sunbiz likely "
+                                "throttling this session. Backing off %ds and retrying '%s' once.",
+                                consecutive_timeouts, _CIRCUIT_BREAKER_BACKOFF_SECONDS, name,
                             )
-                            break
-                    else:
-                        logger.warning("[Sunbiz] Playwright failed for '%s': %s", name, e)
-                        if not dry_run:
-                            _mark_status(session, owner, "parser_failed")
-                        stats["failed"] += 1
-                        continue
+                            await asyncio.sleep(_CIRCUIT_BREAKER_BACKOFF_SECONDS)
+                            try:
+                                html, snap = await _scrape_entity_detail(page, search_name)
+                                consecutive_timeouts = 0
+                            except Exception as e3:
+                                stats["rate_limited"] = True
+                                stats["remaining_unprocessed"] = total - idx
+                                logger.error(
+                                    "[Sunbiz] Still failing after backoff — aborting run with "
+                                    "%d owner(s) unprocessed; will resume next cron run. "
+                                    "Last error: %s",
+                                    stats["remaining_unprocessed"], e3,
+                                )
+                                break
+                        else:
+                            logger.warning("[Sunbiz] Playwright failed for '%s': %s", name, e2)
+                            if not dry_run:
+                                _mark_status(session, owner, "parser_failed")
+                            stats["failed"] += 1
+                            continue
 
                 consecutive_timeouts = 0
 

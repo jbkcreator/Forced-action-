@@ -4,12 +4,32 @@ HTTP request helpers with built-in retry logic.
 
 import logging
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Optional
 from uuid import uuid4
 
 import requests
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_retry_after(value: Optional[str], default: int) -> int:
+    """Parse a Retry-After header: either delta-seconds or an HTTP-date (RFC 7231)."""
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        target = parsedate_to_datetime(value)
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=timezone.utc)
+        return max(0, int((target - datetime.now(timezone.utc)).total_seconds()))
+    except (TypeError, ValueError):
+        logger.warning(f"Unparseable Retry-After header {value!r} — using default {default}s")
+        return default
 
 # ---------------------------------------------------------------------------
 # Stealth constants — import these instead of defining locally in each scraper
@@ -227,11 +247,14 @@ def requests_get_with_retry(
         except requests.HTTPError as e:
             status = e.response.status_code if e.response is not None else 0
             if status in _RETRYABLE_STATUS_CODES and attempt < max_retries:
+                wait = retry_delay
+                if status == 429 and e.response is not None:
+                    wait = _parse_retry_after(e.response.headers.get("Retry-After"), retry_delay)
                 logger.warning(
                     f"Request attempt {attempt}/{max_retries} got HTTP {status}: {e}"
-                    f" — retrying in {retry_delay}s..."
+                    f" — retrying in {wait}s..."
                 )
-                time.sleep(retry_delay)
+                time.sleep(wait)
                 continue
             logger.error(f"HTTP error (not retried): {e}")
             raise
