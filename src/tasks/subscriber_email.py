@@ -383,7 +383,7 @@ def render_lead_email(
     vertical_label = _VERTICAL_LABELS.get(subscriber.vertical or "", subscriber.vertical or "")
     name           = subscriber.name or "there"
     n_leads        = len(leads)
-    today_str      = datetime.now(timezone.utc).strftime("%A, %B %-d")
+    today_str      = datetime.now(timezone.utc).strftime("%A, %B %d").replace(" 0", " ")
     zip_str        = ", ".join(zip_codes or []) if zip_codes else "your territory"
     tier_label     = (subscriber.tier or "").title()
 
