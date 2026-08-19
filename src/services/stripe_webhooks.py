@@ -37,6 +37,7 @@ from src.core.models import (
 from src.services.ghl_webhook import push_subscriber_to_ghl
 from src.utils.test_account import is_test_subscriber
 from src.services import lead_exclusivity
+from src.services.email_shell import render_email_shell, paragraph, lead_row, ACCENT
 
 logger = logging.getLogger(__name__)
 
@@ -1873,112 +1874,27 @@ def _on_payment_succeeded(invoice: dict, db: Session) -> None:
             f"{settings.app_base_url}/dashboard/{subscriber.event_feed_uuid}"
             if subscriber.event_feed_uuid else settings.app_base_url
         )
-        payment_html = f"""<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
-<body style="margin:0;padding:0;background:#0f172a;font-family:Inter,Arial,sans-serif;color:#e2e8f0;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;padding:40px 0;">
-    <tr><td align="center">
-      <table width="560" cellpadding="0" cellspacing="0"
-             style="background:#1e293b;border:1px solid rgba(255,255,255,0.08);border-radius:16px;overflow:hidden;max-width:560px;width:100%;">
-
-        <!-- Header -->
-        <tr>
-          <td style="padding:32px 40px 24px;border-bottom:1px solid rgba(255,255,255,0.08);">
-            <p style="margin:0;font-size:22px;font-weight:800;color:#ffffff;">
-              Forced <span style="color:#fbbf24;">Action</span>
-            </p>
-          </td>
-        </tr>
-
-        <!-- Success banner -->
-        <tr>
-          <td style="padding:0;">
-            <table width="100%" cellpadding="0" cellspacing="0"
-                   style="background:rgba(34,197,94,0.12);border-bottom:1px solid rgba(34,197,94,0.25);">
-              <tr>
-                <td style="padding:14px 40px;font-size:14px;font-weight:700;color:#4ade80;text-align:center;">
-                  &#10003; &nbsp;Payment confirmed
-                </td>
-              </tr>
-            </table>
-          </td>
-        </tr>
-
-        <!-- Body -->
-        <tr>
-          <td style="padding:32px 40px;">
-            <h1 style="margin:0 0 8px;font-size:24px;font-weight:800;color:#ffffff;">
-              Thanks, {subscriber.name or 'there'}.
-            </h1>
-            <p style="margin:0 0 28px;color:#94a3b8;font-size:15px;">
-              Your payment has been processed successfully. Here are the details:
-            </p>
-
-            <!-- Payment details table -->
-            <table width="100%" cellpadding="0" cellspacing="0"
-                   style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);
-                          border-radius:12px;margin-bottom:28px;">
-              <tr>
-                <td style="padding:16px 24px;border-bottom:1px solid rgba(255,255,255,0.08);
-                           font-size:13px;color:#94a3b8;width:40%;">Plan</td>
-                <td style="padding:16px 24px;border-bottom:1px solid rgba(255,255,255,0.08);
-                           font-size:14px;font-weight:600;color:#ffffff;">
-                  {subscriber.tier.title()} &middot; {subscriber.vertical.title()}
-                </td>
-              </tr>
-              <tr>
-                <td style="padding:16px 24px;border-bottom:1px solid rgba(255,255,255,0.08);
-                           font-size:13px;color:#94a3b8;">Amount</td>
-                <td style="padding:16px 24px;border-bottom:1px solid rgba(255,255,255,0.08);
-                           font-size:14px;font-weight:600;color:#ffffff;">
-                  See invoice from Stripe
-                </td>
-              </tr>
-              <tr>
-                <td style="padding:16px 24px;font-size:13px;color:#94a3b8;">Next billing date</td>
-                <td style="padding:16px 24px;font-size:14px;font-weight:600;color:#ffffff;">
-                  {billing_str}
-                </td>
-              </tr>
-            </table>
-
-            <!-- CTA -->
-            <table cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
-              <tr>
-                <td style="background:#fbbf24;border-radius:8px;">
-                  <a href="{feed_url}"
-                     style="display:inline-block;padding:14px 28px;color:#0f172a;font-size:15px;
-                            font-weight:700;text-decoration:none;">
-                    Access Your Lead Feed &rarr;
-                  </a>
-                </td>
-              </tr>
-            </table>
-
-            <p style="margin:0;font-size:13px;color:#64748b;">
-              Questions? Reply to this email or reach us at
-              <a href="mailto:support@forcedactionleads.com" style="color:#fbbf24;text-decoration:none;">
-                support@forcedactionleads.com
-              </a>
-            </p>
-          </td>
-        </tr>
-
-        <!-- Footer -->
-        <tr>
-          <td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.08);
-                     font-size:12px;color:#475569;text-align:center;">
-            Forced Action &mdash; Hillsborough County Property Intelligence<br/>
-            <a href="{settings.app_base_url}" style="color:#475569;">forcedactionleads.com</a>
-          </td>
-        </tr>
-
-      </table>
-    </td></tr>
-  </table>
-</body>
-</html>"""
+        payment_html = render_email_shell(
+            headline=f"Thanks, {subscriber.name or 'there'}.",
+            subhead="Payment confirmed",
+            preheader="Your payment has been processed successfully.",
+            inner_html=(
+                paragraph("Your payment has been processed successfully. Here are the details:")
+                + lead_row(
+                    title=f"{subscriber.tier.title()} &middot; {subscriber.vertical.title()}",
+                    sub="Amount: See invoice from Stripe",
+                    meta=f"Next billing date: {billing_str}",
+                )
+                + paragraph(
+                    'Questions? Reply to this email or reach us at '
+                    '<a href="mailto:support@forcedactionleads.com" '
+                    f'style="color:{ACCENT};text-decoration:none;">support@forcedactionleads.com</a>',
+                    muted=True,
+                )
+            ),
+            cta_text="Access Your Lead Feed",
+            cta_url=feed_url,
+        )
 
         send_email(
             to=subscriber.email,
@@ -2112,65 +2028,35 @@ def _on_payment_failed(invoice: dict, db: Session) -> None:
             f"Questions? support@forcedactionleads.com\n\n"
             f"— Forced Action Team"
         )
-        body_html = f"""<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
-<body style="margin:0;padding:0;background:#0f172a;font-family:Inter,Arial,sans-serif;color:#e2e8f0;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;padding:40px 0;">
-    <tr><td align="center">
-      <table width="560" cellpadding="0" cellspacing="0"
-             style="background:#1e293b;border:1px solid rgba(255,255,255,0.08);border-radius:16px;overflow:hidden;max-width:560px;width:100%;">
-        <tr>
-          <td style="padding:32px 40px 24px;border-bottom:1px solid rgba(255,255,255,0.08);">
-            <p style="margin:0;font-size:22px;font-weight:800;color:#ffffff;">
-              Forced <span style="color:#fbbf24;">Action</span>
-            </p>
-          </td>
-        </tr>
-        <tr>
-          <td style="padding:32px 40px;">
-            <!-- Alert banner -->
-            <p style="margin:0 0 24px;padding:12px 16px;background:#450a0a;border:1px solid #7f1d1d;
-                      border-radius:8px;color:#fca5a5;font-size:14px;font-weight:600;">
-              ⚠️ &nbsp;Action required — payment failed
-            </p>
-            <h1 style="margin:0 0 8px;font-size:24px;font-weight:800;color:#ffffff;">
-              We couldn't process your payment
-            </h1>
-            <p style="margin:0 0 24px;color:#94a3b8;font-size:15px;">
-              Hi {name}, your <strong style="color:#ffffff;">{tier}</strong> subscription payment failed.
-              Please update your payment method to keep your territories locked.
-            </p>
-            {"<p style='margin:0 0 24px;padding:10px 16px;background:#451a03;border:1px solid #92400e;border-radius:8px;color:#fbbf24;font-size:14px;'>⭐ Your founding rate lock is at risk — it cannot be reclaimed if your subscription lapses.</p>" if subscriber.founding_member else ""}
-            <p style="margin:0 0 12px;font-size:14px;color:#94a3b8;">
-              You have <strong style="color:#ffffff;">48 hours</strong> before your ZIP territories enter grace period.
-            </p>
-            <table cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
-              <tr>
-                <td style="background:#ef4444;border-radius:8px;">
-                  <a href="{feed_url}"
-                     style="display:inline-block;padding:14px 28px;color:#ffffff;font-size:15px;
-                            font-weight:700;text-decoration:none;">
-                    Update Payment Method &rarr;
-                  </a>
-                </td>
-              </tr>
-            </table>
-            <p style="margin:0;font-size:13px;color:#64748b;">
-              Questions? <a href="mailto:support@forcedactionleads.com" style="color:#fbbf24;text-decoration:none;">support@forcedactionleads.com</a>
-            </p>
-          </td>
-        </tr>
-        <tr>
-          <td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.08);font-size:12px;color:#475569;text-align:center;">
-            Forced Action &mdash; Hillsborough County Property Intelligence
-          </td>
-        </tr>
-      </table>
-    </td></tr>
-  </table>
-</body>
-</html>"""
+        founding_html = (
+            paragraph(
+                "&#11088; Your founding rate lock is at risk — it cannot be reclaimed if your subscription lapses."
+            )
+            if subscriber.founding_member else ""
+        )
+        body_html = render_email_shell(
+            headline="We couldn't process your payment",
+            subhead="Action required — payment failed",
+            preheader="Action required — your payment failed. Update your card to keep your territories.",
+            inner_html=(
+                paragraph(
+                    f"Hi {name}, your <strong style=\"color:#f0f2f5;\">{tier}</strong> subscription "
+                    "payment failed. Please update your payment method to keep your territories locked."
+                )
+                + founding_html
+                + paragraph(
+                    "You have <strong style=\"color:#f0f2f5;\">48 hours</strong> before your ZIP "
+                    "territories enter grace period."
+                )
+                + paragraph(
+                    'Questions? <a href="mailto:support@forcedactionleads.com" '
+                    f'style="color:{ACCENT};text-decoration:none;">support@forcedactionleads.com</a>',
+                    muted=True,
+                )
+            ),
+            cta_text="Update Payment Method",
+            cta_url=feed_url,
+        )
         send_email(
             to=subscriber.email,
             subject="Action required — payment failed for your Forced Action subscription",
@@ -2275,76 +2161,38 @@ def _on_subscription_updated(subscription: dict, db: Session) -> None:
             if subscriber.event_feed_uuid else _settings.app_base_url
         )
         founding_html = (
-            '<p style="margin:0 0 16px;padding:10px 16px;background:#451a03;'
-            'border:1px solid #92400e;border-radius:8px;color:#fbbf24;font-size:14px;">'
-            "⭐ Founding Member — your locked rate will be permanently lost if your subscription lapses."
-            "</p>"
+            paragraph(
+                "&#11088; Founding Member — your locked rate will be permanently lost if your subscription lapses."
+            )
             if subscriber.founding_member else ""
         )
-        body_html = f"""<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
-<body style="margin:0;padding:0;background:#0f172a;font-family:Inter,Arial,sans-serif;color:#e2e8f0;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;padding:40px 0;">
-    <tr><td align="center">
-      <table width="560" cellpadding="0" cellspacing="0"
-             style="background:#1e293b;border:1px solid rgba(255,255,255,0.08);border-radius:16px;overflow:hidden;max-width:560px;width:100%;">
-        <tr>
-          <td style="padding:32px 40px 24px;border-bottom:1px solid rgba(255,255,255,0.08);">
-            <p style="margin:0;font-size:22px;font-weight:800;color:#ffffff;">
-              Forced <span style="color:#fbbf24;">Action</span>
-            </p>
-          </td>
-        </tr>
-        <tr>
-          <td style="padding:32px 40px;">
-            <p style="margin:0 0 24px;padding:12px 16px;background:#450a0a;border:1px solid #7f1d1d;
-                      border-radius:8px;color:#fca5a5;font-size:14px;font-weight:600;">
-              ⚠️ &nbsp;Your subscription is past due
-            </p>
-            <h1 style="margin:0 0 8px;font-size:24px;font-weight:800;color:#ffffff;">
-              Payment still outstanding, {name}.
-            </h1>
-            <p style="margin:0 0 24px;color:#94a3b8;font-size:15px;">
-              Your <strong style="color:#ffffff;">{tier}</strong> subscription has entered past due status.
-              Stripe is automatically retrying your payment — you don't need to do anything if your card is valid.
-            </p>
-            {founding_html}
-            <p style="margin:0 0 8px;font-size:14px;color:#94a3b8;font-weight:600;">What happens next:</p>
-            <ul style="margin:0 0 24px;padding-left:20px;color:#94a3b8;font-size:14px;line-height:1.7;">
-              <li>Stripe will retry your payment over the next several days.</li>
-              <li>You keep full platform access during the retry window.</li>
-              <li>If all retries fail, your subscription will be cancelled and territory locks released.</li>
-            </ul>
-            <p style="margin:0 0 20px;font-size:14px;color:#94a3b8;">
-              To resolve this now, update your payment method:
-            </p>
-            <table cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
-              <tr>
-                <td style="background:#ef4444;border-radius:8px;">
-                  <a href="{feed_url}"
-                     style="display:inline-block;padding:14px 28px;color:#ffffff;font-size:15px;
-                            font-weight:700;text-decoration:none;">
-                    Update Payment Method &rarr;
-                  </a>
-                </td>
-              </tr>
-            </table>
-            <p style="margin:0;font-size:13px;color:#64748b;">
-              Questions? <a href="mailto:support@forcedactionleads.com" style="color:#fbbf24;text-decoration:none;">support@forcedactionleads.com</a>
-            </p>
-          </td>
-        </tr>
-        <tr>
-          <td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.08);font-size:12px;color:#475569;text-align:center;">
-            Forced Action &mdash; Hillsborough County Property Intelligence
-          </td>
-        </tr>
-      </table>
-    </td></tr>
-  </table>
-</body>
-</html>"""
+        body_html = render_email_shell(
+            headline=f"Payment still outstanding, {name}.",
+            subhead="Your subscription is past due",
+            preheader="Your subscription is past due — Stripe is retrying your payment.",
+            inner_html=(
+                paragraph(
+                    f"Your <strong style=\"color:#f0f2f5;\">{tier}</strong> subscription has entered "
+                    "past due status. Stripe is automatically retrying your payment — you don't need "
+                    "to do anything if your card is valid."
+                )
+                + founding_html
+                + paragraph("<strong style=\"color:#f0f2f5;\">What happens next:</strong>")
+                + paragraph(
+                    "&bull; Stripe will retry your payment over the next several days.<br/>"
+                    "&bull; You keep full platform access during the retry window.<br/>"
+                    "&bull; If all retries fail, your subscription will be cancelled and territory locks released."
+                )
+                + paragraph("To resolve this now, update your payment method:")
+                + paragraph(
+                    'Questions? <a href="mailto:support@forcedactionleads.com" '
+                    f'style="color:{ACCENT};text-decoration:none;">support@forcedactionleads.com</a>',
+                    muted=True,
+                )
+            ),
+            cta_text="Update Payment Method",
+            cta_url=feed_url,
+        )
         body_text = (
             f"Hi {name},\n\n"
             f"Your Forced Action {tier} subscription is now past due.\n\n"
@@ -2384,67 +2232,33 @@ def _on_subscription_updated(subscription: dict, db: Session) -> None:
         name = subscriber.name or "there"
         tier = (subscriber.tier or "starter").title()
         founding_html = (
-            '<p style="margin:0 0 16px;padding:10px 16px;background:#451a03;'
-            'border:1px solid #92400e;border-radius:8px;color:#fbbf24;font-size:14px;">'
-            "⭐ Founding Member — your locked rate will be permanently lost if you don't reactivate."
-            "</p>"
+            paragraph(
+                "&#11088; Founding Member — your locked rate will be permanently lost if you don't reactivate."
+            )
             if subscriber.founding_member else ""
         )
-        body_html = f"""<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
-<body style="margin:0;padding:0;background:#0f172a;font-family:Inter,Arial,sans-serif;color:#e2e8f0;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;padding:40px 0;">
-    <tr><td align="center">
-      <table width="560" cellpadding="0" cellspacing="0"
-             style="background:#1e293b;border:1px solid rgba(255,255,255,0.08);border-radius:16px;overflow:hidden;max-width:560px;width:100%;">
-        <tr>
-          <td style="padding:32px 40px 24px;border-bottom:1px solid rgba(255,255,255,0.08);">
-            <p style="margin:0;font-size:22px;font-weight:800;color:#ffffff;">
-              Forced <span style="color:#fbbf24;">Action</span>
-            </p>
-          </td>
-        </tr>
-        <tr>
-          <td style="padding:32px 40px;">
-            <h1 style="margin:0 0 8px;font-size:24px;font-weight:800;color:#ffffff;">
-              Cancellation scheduled, {name}.
-            </h1>
-            <p style="margin:0 0 24px;color:#94a3b8;font-size:15px;">
-              Your {tier} subscription will end on <strong style="color:#ffffff;">{cancel_str}</strong>.
-              You keep full access until then.
-            </p>
-            {founding_html}
-            <p style="margin:0 0 20px;font-size:14px;color:#94a3b8;">
-              Changed your mind? Reactivate before {cancel_str} to keep your territory and leads:
-            </p>
-            <table cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
-              <tr>
-                <td style="background:#fbbf24;border-radius:8px;">
-                  <a href="{feed_url}"
-                     style="display:inline-block;padding:14px 28px;color:#0f172a;font-size:15px;
-                            font-weight:700;text-decoration:none;">
-                    Reactivate My Subscription &rarr;
-                  </a>
-                </td>
-              </tr>
-            </table>
-            <p style="margin:0;font-size:13px;color:#64748b;">
-              Questions? <a href="mailto:support@forcedactionleads.com" style="color:#fbbf24;text-decoration:none;">support@forcedactionleads.com</a>
-            </p>
-          </td>
-        </tr>
-        <tr>
-          <td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.08);
-                     font-size:12px;color:#475569;text-align:center;">
-            Forced Action &mdash; Hillsborough County Property Intelligence
-          </td>
-        </tr>
-      </table>
-    </td></tr>
-  </table>
-</body>
-</html>"""
+        body_html = render_email_shell(
+            headline=f"Cancellation scheduled, {name}.",
+            subhead=f"Your subscription ends {cancel_str}",
+            preheader=f"Your subscription will end on {cancel_str}.",
+            inner_html=(
+                paragraph(
+                    f"Your {tier} subscription will end on "
+                    f"<strong style=\"color:#f0f2f5;\">{cancel_str}</strong>. You keep full access until then."
+                )
+                + founding_html
+                + paragraph(
+                    f"Changed your mind? Reactivate before {cancel_str} to keep your territory and leads:"
+                )
+                + paragraph(
+                    'Questions? <a href="mailto:support@forcedactionleads.com" '
+                    f'style="color:{ACCENT};text-decoration:none;">support@forcedactionleads.com</a>',
+                    muted=True,
+                )
+            ),
+            cta_text="Reactivate My Subscription",
+            cta_url=feed_url,
+        )
         send_email(
             to=subscriber.email,
             subject="Your Forced Action subscription has been cancelled",
@@ -2635,67 +2449,31 @@ def _on_subscription_deleted(subscription: dict, db: Session) -> None:
             if subscriber.founding_member else ""
         )
         founding_html = (
-            '<p style="margin:0 0 16px;padding:10px 16px;background:#451a03;'
-            'border:1px solid #92400e;border-radius:8px;color:#fbbf24;font-size:14px;">'
-            "⭐ Founding Member — your locked rate will be permanently lost if you don't reactivate before the grace period ends."
-            "</p>"
+            paragraph(
+                "&#11088; Founding Member — your locked rate will be permanently lost if you don't reactivate before the grace period ends."
+            )
             if subscriber.founding_member else ""
         )
-        body_html = f"""<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
-<body style="margin:0;padding:0;background:#0f172a;font-family:Inter,Arial,sans-serif;color:#e2e8f0;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;padding:40px 0;">
-    <tr><td align="center">
-      <table width="560" cellpadding="0" cellspacing="0"
-             style="background:#1e293b;border:1px solid rgba(255,255,255,0.08);border-radius:16px;overflow:hidden;max-width:560px;width:100%;">
-        <tr>
-          <td style="padding:32px 40px 24px;border-bottom:1px solid rgba(255,255,255,0.08);">
-            <p style="margin:0;font-size:22px;font-weight:800;color:#ffffff;">
-              Forced <span style="color:#fbbf24;">Action</span>
-            </p>
-          </td>
-        </tr>
-        <tr>
-          <td style="padding:32px 40px;">
-            <h1 style="margin:0 0 8px;font-size:24px;font-weight:800;color:#ffffff;">
-              Subscription cancelled, {name}.
-            </h1>
-            <p style="margin:0 0 24px;color:#94a3b8;font-size:15px;">
-              Your {tier} subscription has been cancelled. Your 48-hour grace period runs until
-              <strong style="color:#ffffff;">{grace_str}</strong> — you keep full access until then.
-            </p>
-            {founding_html}
-            <p style="margin:0 0 20px;font-size:14px;color:#94a3b8;">
-              Changed your mind? Reactivate before your grace period expires:
-            </p>
-            <table cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
-              <tr>
-                <td style="background:#fbbf24;border-radius:8px;">
-                  <a href="{feed_url}"
-                     style="display:inline-block;padding:14px 28px;color:#0f172a;font-size:15px;
-                            font-weight:700;text-decoration:none;">
-                    Reactivate My Subscription &rarr;
-                  </a>
-                </td>
-              </tr>
-            </table>
-            <p style="margin:0;font-size:13px;color:#64748b;">
-              Questions? <a href="mailto:support@forcedactionleads.com" style="color:#fbbf24;text-decoration:none;">support@forcedactionleads.com</a>
-            </p>
-          </td>
-        </tr>
-        <tr>
-          <td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.08);
-                     font-size:12px;color:#475569;text-align:center;">
-            Forced Action &mdash; Hillsborough County Property Intelligence
-          </td>
-        </tr>
-      </table>
-    </td></tr>
-  </table>
-</body>
-</html>"""
+        body_html = render_email_shell(
+            headline=f"Subscription cancelled, {name}.",
+            subhead=f"Grace period runs until {grace_str}",
+            preheader=f"Your grace period runs until {grace_str} — reactivate to keep your territory.",
+            inner_html=(
+                paragraph(
+                    f"Your {tier} subscription has been cancelled. Your 48-hour grace period runs until "
+                    f"<strong style=\"color:#f0f2f5;\">{grace_str}</strong> — you keep full access until then."
+                )
+                + founding_html
+                + paragraph("Changed your mind? Reactivate before your grace period expires:")
+                + paragraph(
+                    'Questions? <a href="mailto:support@forcedactionleads.com" '
+                    f'style="color:{ACCENT};text-decoration:none;">support@forcedactionleads.com</a>',
+                    muted=True,
+                )
+            ),
+            cta_text="Reactivate My Subscription",
+            cta_url=feed_url,
+        )
         send_email(
             to=subscriber.email,
             subject="Your Forced Action subscription has been cancelled",
@@ -3272,33 +3050,24 @@ def _send_lead_unlock_email(subscriber, prop, score, owner, enriched) -> None:
         "Card saved — next unlock is one tap.\n"
     )
 
-    html_body = f"""<!DOCTYPE html>
-<html><body style="margin:0;padding:0;background:#0f172a;font-family:Inter,Arial,sans-serif;color:#e2e8f0;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;padding:40px 0;">
-    <tr><td align="center">
-      <table width="560" cellpadding="0" cellspacing="0" style="background:#111827;border:1px solid rgba(255,255,255,0.08);border-radius:14px;padding:28px;">
-        <tr><td>
-          <h2 style="margin:0 0 4px;color:#fbbf24;font-size:22px;">Lead unlocked</h2>
-          <p style="margin:0 0 18px;color:#94a3b8;font-size:13px;">Card saved — next unlock is one tap.</p>
-          <table width="100%" cellpadding="0" cellspacing="0"
-                 style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);
-                        border-left:4px solid #fbbf24;border-radius:10px;padding:18px 20px;">
-            <tr><td>
-              <p style="margin:0 0 6px;font-size:16px;font-weight:700;color:#ffffff;">{prop.address or '—'}</p>
-              <p style="margin:0 0 10px;font-size:13px;color:#94a3b8;">{(prop.city or '—')}, {(prop.state or 'FL')} {prop.zip or ''}</p>
-              <p style="margin:0 0 4px;font-size:13px;color:#e2e8f0;"><b>Owner:</b> {owner_name}</p>
-              <p style="margin:0 0 4px;font-size:13px;color:#e2e8f0;"><b>Tier:</b> <span style="color:#fbbf24;">{tier}</span>  &middot; <b>Score:</b> {score_str}</p>
-              <p style="margin:0 0 4px;font-size:13px;color:#e2e8f0;"><b>Distress:</b> {distress}</p>
-              <p style="margin:0 0 4px;font-size:13px;color:#e2e8f0;"><b>Phone:</b> {phone}</p>
-              <p style="margin:0;font-size:13px;color:#e2e8f0;"><b>Email:</b> {email_addr}</p>
-            </td></tr>
-          </table>
-          {('<p style="margin:24px 0 0;text-align:center;"><a href="' + dashboard_url + '" style="background:#fbbf24;color:#0f172a;padding:12px 22px;border-radius:8px;text-decoration:none;font-weight:700;">Open your dashboard</a></p>') if dashboard_url else ''}
-        </td></tr>
-      </table>
-    </td></tr>
-  </table>
-</body></html>"""
+    html_body = render_email_shell(
+        headline="Lead unlocked",
+        subhead="Card saved — next unlock is one tap.",
+        preheader="Card saved — next unlock is one tap.",
+        inner_html=lead_row(
+            title=f"{prop.address or '—'}",
+            sub=f"{(prop.city or '—')}, {(prop.state or 'FL')} {prop.zip or ''}",
+            meta=(
+                f"<b>Owner:</b> {owner_name}<br/>"
+                f"<b>Tier:</b> <span style=\"color:{ACCENT};\">{tier}</span> &middot; <b>Score:</b> {score_str}<br/>"
+                f"<b>Distress:</b> {distress}<br/>"
+                f"<b>Phone:</b> {phone}<br/>"
+                f"<b>Email:</b> {email_addr}"
+            ),
+        ),
+        cta_text="Open your dashboard" if dashboard_url else None,
+        cta_url=dashboard_url if dashboard_url else None,
+    )
 
     send_email(
         to=subscriber.email,
@@ -4803,114 +4572,34 @@ def _send_lead_pack_email(
         if _settings.app_base_url else ""
     )
 
-    # Build HTML lead cards
+    # Build HTML lead rows via the shared branded shell.
     lead_cards_html = ""
     for i, (prop, score) in enumerate(top_leads, start=1):
         v_score = score.vertical_scores.get(subscriber.vertical) if score.vertical_scores else None
         score_str = f"{v_score:.1f}" if v_score is not None else "N/A"
         tier = score.lead_tier or "N/A"
         distress = ", ".join(score.distress_types or []) or "N/A"
-        border_color = "#c084fc" if tier in ("Ultra Platinum", "Platinum") else "#fbbf24"
-        lead_cards_html += f"""
-            <table width="100%" cellpadding="0" cellspacing="0"
-                   style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);
-                          border-left:4px solid {border_color};border-radius:10px;
-                          padding:16px 20px;margin-bottom:12px;">
-              <tr><td>
-                <p style="margin:0 0 4px;font-size:14px;font-weight:700;color:#ffffff;">
-                  {i}. {prop.address}, {prop.city}, FL {prop.zip}
-                </p>
-                <p style="margin:0;font-size:13px;color:#94a3b8;">
-                  Score: <span style="color:#fbbf24;font-weight:600;">{score_str}</span>
-                  &nbsp;&middot;&nbsp; Tier: <span style="color:{border_color};font-weight:600;">{tier}</span>
-                  &nbsp;&middot;&nbsp; Type: {distress}
-                </p>
-              </td></tr>
-            </table>"""
+        lead_cards_html += lead_row(
+            title=f"{i}. {prop.address}, {prop.city}, FL {prop.zip}",
+            sub=(f'<span style="font-weight:600;color:{ACCENT};letter-spacing:0.04em;'
+                 f'text-transform:uppercase;">{tier}</span>'
+                 f'<span style="color:#ffffff18;"> &nbsp;|&nbsp; </span>{distress}'),
+            meta=f'CDS <span style="color:{ACCENT};font-weight:600;">{score_str}</span>',
+        )
 
-    body_html = f"""<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
-<body style="margin:0;padding:0;background:#0f172a;font-family:Inter,Arial,sans-serif;color:#e2e8f0;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;padding:40px 0;">
-    <tr><td align="center">
-      <table width="560" cellpadding="0" cellspacing="0"
-             style="background:#1e293b;border:1px solid rgba(255,255,255,0.08);border-radius:16px;overflow:hidden;max-width:560px;width:100%;">
-
-        <!-- Header -->
-        <tr>
-          <td style="padding:32px 40px 24px;border-bottom:1px solid rgba(255,255,255,0.08);">
-            <p style="margin:0;font-size:22px;font-weight:800;color:#ffffff;">
-              Forced <span style="color:#fbbf24;">Action</span>
-            </p>
-          </td>
-        </tr>
-
-        <!-- Body -->
-        <tr>
-          <td style="padding:32px 40px;">
-            <h1 style="margin:0 0 8px;font-size:26px;font-weight:800;color:#ffffff;">
-              Your Lead Pack is ready.
-            </h1>
-            <p style="margin:0 0 24px;color:#94a3b8;font-size:15px;">
-              5 exclusive leads for ZIP <strong style="color:#ffffff;">{purchase.zip_code}</strong>
-              &nbsp;&middot;&nbsp; {subscriber.vertical.title() if subscriber.vertical else 'General'}
-            </p>
-
-            <!-- Exclusivity badge -->
-            <table width="100%" cellpadding="0" cellspacing="0"
-                   style="background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.25);
-                          border-radius:10px;padding:14px 20px;margin-bottom:24px;">
-              <tr><td>
-                <p style="margin:0;font-size:13px;font-weight:700;color:#fbbf24;">
-                  &#128274; Exclusive Access
-                </p>
-                <p style="margin:4px 0 0;font-size:13px;color:#94a3b8;">
-                  These leads are exclusively yours until <strong style="color:#ffffff;">{exclusive_until_str}</strong>.
-                  No other subscriber will receive them.
-                </p>
-              </td></tr>
-            </table>
-
-            <!-- Lead Cards -->
-            {lead_cards_html}
-
-            <!-- CTA -->
-            <table cellpadding="0" cellspacing="0" style="margin:28px 0 28px;">
-              <tr>
-                <td style="background:#fbbf24;border-radius:8px;">
-                  <a href="{dashboard_url}"
-                     style="display:inline-block;padding:14px 28px;color:#0f172a;font-size:15px;
-                            font-weight:700;text-decoration:none;">
-                    View Full Lead Details &rarr;
-                  </a>
-                </td>
-              </tr>
-            </table>
-
-            <p style="margin:0;font-size:13px;color:#64748b;">
-              Questions? Reply to this email or reach us at
-              <a href="mailto:support@forcedactionleads.com" style="color:#fbbf24;text-decoration:none;">
-                support@forcedactionleads.com
-              </a>
-            </p>
-          </td>
-        </tr>
-
-        <!-- Footer -->
-        <tr>
-          <td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.08);
-                     font-size:12px;color:#475569;text-align:center;">
-            Forced Action &mdash; Hillsborough County Property Intelligence<br/>
-            <a href="{_settings.app_base_url}" style="color:#475569;">forcedactionleads.com</a>
-          </td>
-        </tr>
-
-      </table>
-    </td></tr>
-  </table>
-</body>
-</html>"""
+    vertical_label = subscriber.vertical.title() if subscriber.vertical else "General"
+    exclusivity_note = (
+        f"&#128274; Exclusive Access — these leads are exclusively yours until "
+        f"<strong>{exclusive_until_str}</strong>. No other subscriber will receive them."
+    )
+    body_html = render_email_shell(
+        headline="Your Lead Pack is ready.",
+        subhead=f"5 exclusive leads for ZIP {purchase.zip_code} &middot; {vertical_label}",
+        inner_html=lead_cards_html,
+        cta_text="View Full Lead Details" if dashboard_url else None,
+        cta_url=dashboard_url or None,
+        footer_note=exclusivity_note,
+    )
 
     send_email(
         to=subscriber.email,

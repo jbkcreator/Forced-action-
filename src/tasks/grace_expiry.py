@@ -32,6 +32,7 @@ from sqlalchemy.orm import Session
 from src.core.database import get_db_context
 from src.core.models import Subscriber, ZipTerritory
 from src.services.email import send_email
+from src.services.email_shell import ACCENT, paragraph, render_email_shell
 from src.tasks.sold_out_reactivation import reactivate_for_zip
 
 logger = logging.getLogger(__name__)
@@ -61,100 +62,33 @@ def _send_waitlist_email(zip_code: str, vertical: str, county_id: str, emails: L
         f"— Forced Action Team"
     )
 
-    body_html = f"""<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
-<body style="margin:0;padding:0;background:#0f172a;font-family:Inter,Arial,sans-serif;color:#e2e8f0;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;padding:40px 0;">
-    <tr><td align="center">
-      <table width="560" cellpadding="0" cellspacing="0"
-             style="background:#1e293b;border:1px solid rgba(255,255,255,0.08);border-radius:16px;overflow:hidden;max-width:560px;width:100%;">
-
-        <!-- Header -->
-        <tr>
-          <td style="padding:32px 40px 24px;border-bottom:1px solid rgba(255,255,255,0.08);">
-            <p style="margin:0;font-size:22px;font-weight:800;color:#ffffff;">
-              Forced <span style="color:#fbbf24;">Action</span>
-            </p>
-          </td>
-        </tr>
-
-        <!-- Green celebration banner -->
-        <tr>
-          <td style="background:rgba(34,197,94,0.12);border-bottom:1px solid rgba(34,197,94,0.25);
-                     padding:14px 40px;text-align:center;">
-            <p style="margin:0;font-size:15px;font-weight:700;color:#4ade80;">
-              &#127881; A territory you wanted just opened up!
-            </p>
-          </td>
-        </tr>
-
-        <!-- Body -->
-        <tr>
-          <td style="padding:32px 40px;">
-            <h1 style="margin:0 0 12px;font-size:26px;font-weight:800;color:#ffffff;">
-              ZIP {zip_code} is available
-            </h1>
-            <p style="margin:0 0 24px;color:#94a3b8;font-size:15px;">
-              Great news &mdash; ZIP code <strong style="color:#ffffff;">{zip_code}</strong>
-              in the <strong style="color:#ffffff;">{vertical.title()}</strong> vertical
-              for <strong style="color:#ffffff;">{county_id}</strong> has just been released
-              and is open for a new subscriber.
-            </p>
-
-            <!-- Urgency -->
-            <table width="100%" cellpadding="0" cellspacing="0"
-                   style="background:rgba(251,191,36,0.06);border:1px solid rgba(251,191,36,0.2);
-                          border-radius:12px;padding:16px 20px;margin-bottom:28px;">
-              <tr>
-                <td>
-                  <p style="margin:0;font-size:14px;color:#fbbf24;font-weight:700;">
-                    &#9888;&#65039; First come, first served
-                  </p>
-                  <p style="margin:6px 0 0;font-size:13px;color:#94a3b8;">
-                    Territories are exclusive &mdash; only one subscriber per ZIP per vertical.
-                    Lock it now to make sure no one else grabs it.
-                  </p>
-                </td>
-              </tr>
-            </table>
-
-            <!-- CTA button -->
-            <table cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
-              <tr>
-                <td style="background:#fbbf24;border-radius:8px;">
-                  <a href="{deep_link}"
-                     style="display:inline-block;padding:14px 28px;color:#0f172a;font-size:15px;
-                            font-weight:700;text-decoration:none;">
-                    Lock ZIP {zip_code} Now &rarr;
-                  </a>
-                </td>
-              </tr>
-            </table>
-
-            <p style="margin:0;font-size:13px;color:#64748b;">
-              Questions? Reply to this email or reach us at
-              <a href="mailto:support@forcedactionleads.com" style="color:#fbbf24;text-decoration:none;">
-                support@forcedactionleads.com
-              </a>
-            </p>
-          </td>
-        </tr>
-
-        <!-- Footer -->
-        <tr>
-          <td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.08);
-                     font-size:12px;color:#475569;text-align:center;">
-            Forced Action &mdash; Hillsborough County Property Intelligence<br/>
-            <a href="{app_base_url}" style="color:#475569;">forcedactionleads.com</a>
-          </td>
-        </tr>
-
-      </table>
-    </td></tr>
-  </table>
-</body>
-</html>"""
+    inner_html = (
+        paragraph(
+            f"Great news &mdash; ZIP code <strong>{zip_code}</strong> in the "
+            f"<strong>{vertical.title()}</strong> vertical for "
+            f"<strong>{county_id}</strong> has just been released and is open "
+            f"for a new subscriber."
+        )
+        + paragraph(
+            "First come, first served. Territories are exclusive &mdash; only one "
+            "subscriber per ZIP per vertical. Lock it now to make sure no one else "
+            "grabs it."
+        )
+        + paragraph(
+            "Questions? Reply to this email or reach us at "
+            "<a href=\"mailto:support@forcedactionleads.com\" "
+            f"style=\"color:{ACCENT};text-decoration:none;\">support@forcedactionleads.com</a>.",
+            muted=True,
+        )
+    )
+    body_html = render_email_shell(
+        headline=f"ZIP {zip_code} is available",
+        subhead="A territory you wanted just opened up",
+        inner_html=inner_html,
+        cta_text=f"Lock ZIP {zip_code} now",
+        cta_url=deep_link,
+        preheader=f"ZIP {zip_code} ({vertical.title()}) just opened up.",
+    )
 
     for addr in emails:
         send_email(to=addr, subject=subject, body_text=body, body_html=body_html)

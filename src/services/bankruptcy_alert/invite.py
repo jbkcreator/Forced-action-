@@ -39,6 +39,7 @@ from config.bankruptcy_alert_config import (
     PRICE_MONTHLY_CENTS,
 )
 from config.settings import get_settings
+from src.services.email_shell import paragraph, render_email_shell
 
 logger = logging.getLogger(__name__)
 
@@ -96,17 +97,28 @@ def _email_body(name: Optional[str], link: str) -> tuple[str, str]:
         f"You'll only be charged if you complete checkout. Reply with any questions.\n\n"
         f"— Forced Action"
     )
-    html_body = (
-        f"<p>{greeting}</p>"
-        f"<p>Thanks for signing up. We also run <strong>Daily Bankruptcy Filing Alerts</strong> — "
-        f"the moment a Chapter 7, 11, or 13 bankruptcy is filed in your market, you get an email "
-        f"(and optional SMS) with the case number, chapter, filer, and filing date. "
-        f"Built for attorneys, investors, and lenders who need to move first.</p>"
-        f"<p style='font-size:16px;'><strong>{price}</strong></p>"
-        f"<p><a href='{link}' style='display:inline-block;padding:10px 18px;background:#1a1a2e;"
-        f"color:#fff;text-decoration:none;border-radius:6px;'>Start your subscription</a></p>"
-        f"<p style='color:#888;font-size:12px;'>You'll only be charged if you complete checkout. "
-        f"Reply with any questions. — Forced Action</p>"
+    inner_html = (
+        paragraph(greeting)
+        + paragraph(
+            "Thanks for signing up. We also run <strong>Daily Bankruptcy Filing "
+            "Alerts</strong> — the moment a Chapter 7, 11, or 13 bankruptcy is filed "
+            "in your market, you get an email (and optional SMS) with the case number, "
+            "chapter, filer, and filing date. Built for attorneys, investors, and "
+            "lenders who need to move first."
+        )
+        + paragraph(f"<strong>{price}</strong>")
+        + paragraph(
+            "You'll only be charged if you complete checkout. Reply with any questions.",
+            muted=True,
+        )
+    )
+    html_body = render_email_shell(
+        headline="Daily Bankruptcy Filing Alerts",
+        subhead=price,
+        inner_html=inner_html,
+        cta_text="Start your subscription",
+        cta_url=link,
+        preheader="Get every Chapter 7, 11, or 13 filing in your market.",
     )
     return text_body, html_body
 

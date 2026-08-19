@@ -34,6 +34,7 @@ from src.core.models import (
     WaitlistEntry,
 )
 from src.services.email import send_email
+from src.services.email_shell import paragraph, render_email_shell
 from src.services.sms_compliance import send_sms
 
 logger = logging.getLogger(__name__)
@@ -73,19 +74,31 @@ Get started here: {url}
 To unsubscribe, reply STOP.)
 """
 
-_EMAIL_HTML = """\
-<p>Hi {name},</p>
-<p>Great news — <strong>{county} County</strong> is now live on Forced Action.</p>
-<p>Your <strong>{vertical}</strong> territory is open and ready to claim.
-Lock it in before another contractor beats you to it.</p>
-<p><a href="{url}" style="display:inline-block;padding:12px 24px;
-background:#facc15;color:#000;font-weight:bold;border-radius:8px;
-text-decoration:none;">Claim your territory</a></p>
-<p>— The Forced Action Team</p>
-<p style="color:#666;font-size:12px;">
-You're receiving this because you joined the waitlist for {county} County.
-</p>
-"""
+def _email_html(ctx: dict) -> str:
+    inner_html = (
+        paragraph(f"Hi {ctx['name']},")
+        + paragraph(
+            f"Great news — <strong>{ctx['county']} County</strong> is now live on "
+            "Forced Action."
+        )
+        + paragraph(
+            f"Your <strong>{ctx['vertical']}</strong> territory is open and ready to "
+            "claim. Lock it in before another contractor beats you to it."
+        )
+        + paragraph(
+            f"You're receiving this because you joined the waitlist for "
+            f"{ctx['county']} County.",
+            muted=True,
+        )
+    )
+    return render_email_shell(
+        headline=f"{ctx['county']} is now live",
+        subhead="Your waitlist spot is ready",
+        inner_html=inner_html,
+        cta_text="Claim your territory",
+        cta_url=ctx["url"],
+        preheader=f"{ctx['county']} County just opened — claim your territory.",
+    )
 
 
 def run_waitlist_notifier(dry_run: bool = False) -> dict:
@@ -164,7 +177,7 @@ def _notify_county(
                         to=entry.email,
                         subject=_EMAIL_SUBJECT.format(**ctx),
                         body_text=_EMAIL_TEXT.format(**ctx),
-                        body_html=_EMAIL_HTML.format(**ctx),
+                        body_html=_email_html(ctx),
                     )
                     entry.notified_email_at = now
                 sent_email += 1

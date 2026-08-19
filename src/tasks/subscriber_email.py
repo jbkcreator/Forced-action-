@@ -27,6 +27,7 @@ from src.core.models import (
     Subscriber, ZipTerritory,
 )
 from src.services.email import send_alert, send_email
+from src.services.email_shell import ACCENT, lead_row, render_email_shell
 from src.utils.logger import setup_logging
 
 setup_logging()
@@ -388,8 +389,47 @@ def render_lead_email(
 
     subject = f"{subject_prefix} — {n_leads} {vertical_label} leads in {zip_str}"
 
-    # Lead cards HTML
-    cards_html = "".join(_lead_card_html(lead, i + 1) for i, lead in enumerate(leads))
+    # Lead rows — branded shell, mirroring new_distress_digest._render_subscriber_digest
+    def _row_sub(lead: dict) -> str:
+        signals = " &middot; ".join(lead["signals"]) if lead["signals"] else "Distressed property"
+        sub = (
+            f'<span style="font-weight:600;color:{ACCENT};letter-spacing:0.04em;">'
+            f'{lead["lead_tier"]}</span>'
+            f'<span style="color:#ffffff18;"> &nbsp;|&nbsp; </span>{signals}'
+            f'{_permit_detail_html(lead)}'
+        )
+        owner_bits = []
+        if lead["owner_name"]:
+            absentee_tag = " (absentee)" if lead["absentee"] else ""
+            otype = lead.get("owner_type") or ""
+            otype_tag = f" ({otype})" if otype and otype != "Individual" else ""
+            owner_bits.append(f'{lead["owner_name"]}{absentee_tag}{otype_tag}')
+        if lead["phone"]:
+            owner_bits.append(lead["phone"])
+        if lead["email"]:
+            owner_bits.append(lead["email"])
+        if owner_bits:
+            sub += (f'<div style="margin-top:5px;color:#8a93a6;">'
+                    f'{" &middot; ".join(owner_bits)}</div>')
+        return sub
+
+    def _row_meta(lead: dict) -> str:
+        score = int(lead["vertical_score"])
+        meta = f'CDS <span style="color:{ACCENT};font-weight:600;">{score}/100</span>'
+        if lead["urgency"]:
+            meta += f' &middot; {lead["urgency"]}'
+        return meta
+
+    rows_html = "".join(
+        lead_row(
+            title=(f'{lead["address"]} '
+                   f'<span style="font-size:13px;font-weight:400;color:#6b7280;">'
+                   f'{lead["city"]}, {lead["zip"]}</span>'),
+            sub=_row_sub(lead),
+            meta=_row_meta(lead),
+        )
+        for lead in leads
+    )
 
     # Plain text fallback
     lines = [
@@ -413,94 +453,23 @@ def render_lead_email(
     _settings = get_settings()
     feed_url = (
         f"{_settings.app_base_url}/dashboard/{subscriber.event_feed_uuid}"
-        if subscriber.event_feed_uuid else _settings.app_base_url
+        if subscriber.event_feed_uuid else None
     )
 
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-</head>
-<body style="margin:0;padding:0;background:#0f172a;font-family:Inter,Arial,sans-serif;color:#e2e8f0;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;padding:32px 0;">
-    <tr><td align="center">
-      <table width="580" cellpadding="0" cellspacing="0"
-             style="max-width:580px;width:100%;">
+    subhead = f"{today_str} &middot; {tier_label} plan &middot; {zip_str}"
+    if subscriber.founding_member:
+        subhead += f' &middot; <span style="color:{ACCENT};">Founding Member</span>'
 
-        <!-- Header -->
-        <tr>
-          <td style="padding:0 0 20px;">
-            <table width="100%" cellpadding="0" cellspacing="0">
-              <tr>
-                <td>
-                  <p style="margin:0;font-size:20px;font-weight:800;color:#ffffff;">
-                    Forced <span style="color:#fbbf24;">Action</span>
-                  </p>
-                </td>
-                <td align="right">
-                  <span style="font-size:12px;color:#475569;">{today_str}</span>
-                </td>
-              </tr>
-            </table>
-          </td>
-        </tr>
-
-        <!-- Headline -->
-        <tr>
-          <td style="padding:0 0 20px;">
-            <h1 style="margin:0 0 6px;font-size:24px;font-weight:800;color:#ffffff;">
-              {n_leads} {vertical_label} lead{'s' if n_leads != 1 else ''} in your territory
-            </h1>
-            <p style="margin:0;font-size:14px;color:#64748b;">
-              {tier_label} plan &middot; {zip_str}
-              {' &middot; <span style="color:#fbbf24;">Founding Member</span>' if subscriber.founding_member else ''}
-            </p>
-          </td>
-        </tr>
-
-        <!-- Lead cards -->
-        <tr>
-          <td>
-            {cards_html}
-          </td>
-        </tr>
-
-        <!-- CTA -->
-        <tr>
-          <td style="padding:20px 0 0;">
-            <table cellpadding="0" cellspacing="0">
-              <tr>
-                <td style="background:#fbbf24;border-radius:8px;">
-                  <a href="{feed_url}"
-                     style="display:inline-block;padding:13px 28px;color:#0f172a;
-                            font-size:14px;font-weight:700;text-decoration:none;">
-                    View All Leads &rarr;
-                  </a>
-                </td>
-              </tr>
-            </table>
-          </td>
-        </tr>
-
-        <!-- Footer -->
-        <tr>
-          <td style="padding:32px 0 0;font-size:12px;color:#334155;border-top:1px solid rgba(255,255,255,0.06);margin-top:32px;">
-            <p style="margin:0 0 4px;">
-              Forced Action &mdash; Hillsborough County Distressed Property Intelligence
-            </p>
-            <p style="margin:0;">
-              You're receiving this because you're subscribed to the {vertical_label} vertical.
-              <a href="{_settings.app_base_url}" style="color:#475569;text-decoration:none;">forcedactionleads.com</a>
-            </p>
-          </td>
-        </tr>
-
-      </table>
-    </td></tr>
-  </table>
-</body>
-</html>"""
+    html = render_email_shell(
+        headline=(f'{n_leads} {vertical_label} lead{"s" if n_leads != 1 else ""} in '
+                  f'<span style="color:{ACCENT};">{zip_str}</span>'),
+        subhead=subhead,
+        inner_html=rows_html,
+        cta_text="View All Leads" if feed_url else None,
+        cta_url=feed_url,
+        footer_note=(f"You're receiving this because you're subscribed to the "
+                     f"{vertical_label} vertical."),
+    )
 
     return subject, html, plain_text
 

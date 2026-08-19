@@ -21,6 +21,12 @@ from pathlib import Path
 from typing import List, Optional, Union
 
 from config.settings import get_settings
+from src.services.email_shell import (
+    ACCENT,
+    lead_row,
+    paragraph,
+    render_email_shell,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -333,82 +339,41 @@ def send_welcome_email(subscriber, magic_link_url: Optional[str] = None, db=None
     )
 
     founding_badge = (
-        '<p style="margin:0 0 16px;padding:10px 16px;background:#451a03;'
-        'border:1px solid #92400e;border-radius:8px;color:#fbbf24;font-size:14px;">'
-        "⭐ Founding Member — your rate is locked for life."
-        "</p>"
+        lead_row(
+            title="⭐ Founding Member",
+            sub="Your rate is locked for life.",
+        )
         if founding else ""
     )
     magic_link_note_html = (
-        '<p style="margin:-16px 0 24px;font-size:12px;color:#64748b;">'
-        "This link expires shortly and can only be used once.</p>"
+        paragraph(
+            "This link expires shortly and can only be used once.",
+            muted=True,
+        )
         if magic_link_url else ""
     )
-    body_html = f"""<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
-<body style="margin:0;padding:0;background:#0f172a;font-family:Inter,Arial,sans-serif;color:#e2e8f0;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;padding:40px 0;">
-    <tr><td align="center">
-      <table width="560" cellpadding="0" cellspacing="0"
-             style="background:#1e293b;border:1px solid rgba(255,255,255,0.08);border-radius:16px;overflow:hidden;max-width:560px;width:100%;">
-        <tr>
-          <td style="padding:32px 40px 24px;border-bottom:1px solid rgba(255,255,255,0.08);">
-            <p style="margin:0;font-size:22px;font-weight:800;color:#ffffff;">
-              Forced <span style="color:#fbbf24;">Action</span>
-            </p>
-          </td>
-        </tr>
-        <tr>
-          <td style="padding:32px 40px;">
-            <h1 style="margin:0 0 8px;font-size:26px;font-weight:800;color:#ffffff;">
-              You&rsquo;re in, {name}.
-            </h1>
-            <p style="margin:0 0 24px;color:#94a3b8;font-size:15px;">
-              Your Event Feed is live and your territory is reserved.
-            </p>
-            {founding_badge}
-            <p style="margin:0 0 24px;">
-              <span style="display:inline-block;background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.3);
-                           color:#fbbf24;font-size:13px;font-weight:700;padding:5px 14px;border-radius:999px;">
-                {tier} &middot; {vertical}
-              </span>
-            </p>
-            <p style="margin:0 0 12px;font-size:14px;color:#94a3b8;">
-              Your private feed link — bookmark it:
-            </p>
-            <table cellpadding="0" cellspacing="0" style="margin-bottom:8px;">
-              <tr>
-                <td style="background:#fbbf24;border-radius:8px;">
-                  <a href="{cta_url}"
-                     style="display:inline-block;padding:14px 28px;color:#0f172a;font-size:15px;
-                            font-weight:700;text-decoration:none;">
-                    Open My Event Feed &rarr;
-                  </a>
-                </td>
-              </tr>
-            </table>
-            {magic_link_note_html}
-            <p style="margin:0;font-size:13px;color:#64748b;">
-              Questions? Reply to this email or reach us at
-              <a href="mailto:support@forcedactionleads.com" style="color:#fbbf24;text-decoration:none;">
-                support@forcedactionleads.com
-              </a>
-            </p>
-          </td>
-        </tr>
-        <tr>
-          <td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.08);
-                     font-size:12px;color:#475569;text-align:center;">
-            Forced Action &mdash; Hillsborough County Property Intelligence<br/>
-            <a href="{_settings.app_base_url}" style="color:#475569;">forcedactionleads.com</a>
-          </td>
-        </tr>
-      </table>
-    </td></tr>
-  </table>
-</body>
-</html>"""
+    inner_html = (
+        lead_row(title=f"{tier} &middot; {vertical}", sub="Your reserved plan and vertical")
+        + founding_badge
+        + paragraph("Your Event Feed is live and your territory is reserved.")
+        + paragraph("Your private feed link is below — bookmark it once you're in.")
+        + magic_link_note_html
+        + paragraph(
+            "Questions? Reply to this email or reach us at "
+            f'<a href="mailto:support@forcedactionleads.com" style="color:{ACCENT};text-decoration:none;">'
+            "support@forcedactionleads.com</a>.",
+            muted=True,
+        )
+    )
+    body_html = render_email_shell(
+        headline=f"You're in, {name}.",
+        subhead=f"{tier} &middot; {vertical}",
+        inner_html=inner_html,
+        cta_text="Open My Event Feed",
+        cta_url=cta_url,
+        footer_note="Forced Action — Hillsborough County Property Intelligence",
+        preheader="Your private Event Feed is ready.",
+    )
 
     sent = send_email(
         to=subscriber.email,
@@ -483,73 +448,33 @@ def send_upgrade_confirmation_email(subscriber, db=None) -> bool:
     )
 
     founding_badge = (
-        '<p style="margin:0 0 16px;padding:10px 16px;background:#451a03;'
-        'border:1px solid #92400e;border-radius:8px;color:#fbbf24;font-size:14px;">'
-        "⭐ Founding Member — your rate is locked for life."
-        "</p>"
+        lead_row(
+            title="⭐ Founding Member",
+            sub="Your rate is locked for life.",
+        )
         if founding else ""
     )
-    body_html = f"""<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
-<body style="margin:0;padding:0;background:#0f172a;font-family:Inter,Arial,sans-serif;color:#e2e8f0;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;padding:40px 0;">
-    <tr><td align="center">
-      <table width="560" cellpadding="0" cellspacing="0"
-             style="background:#1e293b;border:1px solid rgba(255,255,255,0.08);border-radius:16px;overflow:hidden;max-width:560px;width:100%;">
-        <tr>
-          <td style="padding:32px 40px 24px;border-bottom:1px solid rgba(255,255,255,0.08);">
-            <p style="margin:0;font-size:22px;font-weight:800;color:#ffffff;">
-              Forced <span style="color:#fbbf24;">Action</span>
-            </p>
-          </td>
-        </tr>
-        <tr>
-          <td style="padding:32px 40px;">
-            <h1 style="margin:0 0 8px;font-size:26px;font-weight:800;color:#ffffff;">
-              You&rsquo;re on {tier} now, {name}.
-            </h1>
-            <p style="margin:0 0 24px;color:#94a3b8;font-size:15px;">
-              Your plan has been upgraded and your new territory is locked.
-            </p>
-            {founding_badge}
-            <p style="margin:0 0 24px;">
-              <span style="display:inline-block;background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.3);
-                           color:#fbbf24;font-size:13px;font-weight:700;padding:5px 14px;border-radius:999px;">
-                {tier} &middot; {vertical}
-              </span>
-            </p>
-            <table cellpadding="0" cellspacing="0" style="margin-bottom:8px;">
-              <tr>
-                <td style="background:#fbbf24;border-radius:8px;">
-                  <a href="{feed_url}"
-                     style="display:inline-block;padding:14px 28px;color:#0f172a;font-size:15px;
-                            font-weight:700;text-decoration:none;">
-                    Open My Event Feed &rarr;
-                  </a>
-                </td>
-              </tr>
-            </table>
-            <p style="margin:0;font-size:13px;color:#64748b;">
-              Questions? Reply to this email or reach us at
-              <a href="mailto:support@forcedactionleads.com" style="color:#fbbf24;text-decoration:none;">
-                support@forcedactionleads.com
-              </a>
-            </p>
-          </td>
-        </tr>
-        <tr>
-          <td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.08);
-                     font-size:12px;color:#475569;text-align:center;">
-            Forced Action &mdash; Hillsborough County Property Intelligence<br/>
-            <a href="{_settings.app_base_url}" style="color:#475569;">forcedactionleads.com</a>
-          </td>
-        </tr>
-      </table>
-    </td></tr>
-  </table>
-</body>
-</html>"""
+    inner_html = (
+        lead_row(title=f"{tier} &middot; {vertical}", sub="Your upgraded plan and vertical")
+        + founding_badge
+        + paragraph("Your plan has been upgraded and your new territory is locked.")
+        + paragraph("New leads will start appearing in your feed — open it below.")
+        + paragraph(
+            "Questions? Reply to this email or reach us at "
+            f'<a href="mailto:support@forcedactionleads.com" style="color:{ACCENT};text-decoration:none;">'
+            "support@forcedactionleads.com</a>.",
+            muted=True,
+        )
+    )
+    body_html = render_email_shell(
+        headline=f"You're on {tier} now, {name}.",
+        subhead=f"{tier} &middot; {vertical}",
+        inner_html=inner_html,
+        cta_text="Open My Event Feed",
+        cta_url=feed_url,
+        footer_note="Forced Action — Hillsborough County Property Intelligence",
+        preheader="Your plan upgrade is confirmed.",
+    )
 
     sent = send_email(
         to=subscriber.email,

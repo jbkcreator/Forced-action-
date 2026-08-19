@@ -27,6 +27,7 @@ from config.settings import get_settings
 from src.core.database import get_db_context
 from src.core.models import WaitlistEntry
 from src.services.email import send_email
+from src.services.email_shell import paragraph, render_email_shell
 from src.services.sms_compliance import can_send, send_sms
 from src.services import telnyx_sms
 
@@ -49,21 +50,24 @@ def _send_waitlist_email(entry, zip_code: str, vertical: str,
         f"goes to whoever locks it first.\n\n"
         f"Lock it here: {url}\n"
     )
-    body_html = f"""<html>
-<body style="font-family: Arial, sans-serif; color: #222; line-height: 1.5;">
-  <p>{entry.name},</p>
-  <p>A slot just opened for <strong>{zip_code} {vertical}</strong> in {county_id}.</p>
-  <p>{slots_competing} contractor(s) were waiting on this territory &mdash; it goes to
-     whoever locks it first.</p>
-  <p>
-    <a href="{url}"
-       style="display: inline-block; padding: 10px 18px; background: #1F3352;
-              color: #fff; text-decoration: none; border-radius: 4px;">
-      Lock this territory
-    </a>
-  </p>
-</body>
-</html>"""
+    inner_html = (
+        paragraph(f"{entry.name},")
+        + paragraph(
+            f"A slot just opened for <strong>{zip_code} {vertical}</strong> in {county_id}."
+        )
+        + paragraph(
+            f"{slots_competing} contractor(s) were waiting on this territory &mdash; "
+            "it goes to whoever locks it first."
+        )
+    )
+    body_html = render_email_shell(
+        headline=f"{zip_code} {vertical} just opened up",
+        subhead="First to lock it wins",
+        inner_html=inner_html,
+        cta_text="Lock this territory",
+        cta_url=url,
+        preheader=f"A slot opened for {zip_code} {vertical} in {county_id}.",
+    )
     return send_email(to=entry.email, subject=subject, body_text=body_text,
                       body_html=body_html, db=db)
 
