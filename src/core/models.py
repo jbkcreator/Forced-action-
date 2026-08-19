@@ -8185,6 +8185,7 @@ class Delivery(Base):
     delivered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     source: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'sweep'"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    notified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True)
 
     __table_args__ = (
         UniqueConstraint("property_id", "account_id", name="uq_delivery_property_account"),
