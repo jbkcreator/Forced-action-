@@ -94,6 +94,7 @@ class AppSettings(BaseSettings):
 	ghl_cf_utm_term: Optional[str] = Field(default=None, env="GHL_CF_UTM_TERM")
 	ghl_cf_utm_landing_path: Optional[str] = Field(default=None, env="GHL_CF_UTM_LANDING_PATH")
 	ghl_cf_utm_referrer: Optional[str] = Field(default=None, env="GHL_CF_UTM_REFERRER")
+	ghl_cf_vertical: Optional[str] = Field(default=None, env="GHL_CF_VERTICAL")
 
 	# GA4 Measurement Protocol (Part 3 — server-side purchase event from Stripe webhook)
 	# API secret generated in GA4 → Admin → Data Streams → Measurement Protocol API secrets

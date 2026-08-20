@@ -610,6 +610,7 @@ def push_subscriber_to_ghl(
         (settings.ghl_cf_utm_term,          utm.get("utm_term") or ""),
         (settings.ghl_cf_utm_landing_path,  utm.get("landing_path") or ""),
         (settings.ghl_cf_utm_referrer,      utm.get("referrer") or ""),
+        (settings.ghl_cf_vertical,          getattr(subscriber, "vertical", "") or ""),
     ]
     for field_id, value in cf_map:
         if field_id:
