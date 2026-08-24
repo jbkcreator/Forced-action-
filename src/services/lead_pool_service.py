@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import and_, exists, or_, text
+from sqlalchemy import and_, exists, or_, select, text
 from sqlalchemy.orm import Session
 
 from config.triangulation import PACK_CONTACTABLE_LABELS, PACK_MIN_CONTACTABLE_PCT
@@ -91,6 +91,55 @@ def sellable_lead_filters(settings: Any) -> List[Any]:
     if contact_clause is not None:
         filters.append(contact_clause)
     return filters
+
+
+# Minimum sellable, exclusive leads a ZIP must have before it can be sold.
+# The lead-pack checkout gate (main.py) and the demo deal-room generator
+# (deal_room_router.py) both gate on this same number via count_available_leads
+# so a demo can never represent inventory the real checkout would then reject.
+MIN_EXCLUSIVE_LEADS = 5
+
+
+def count_available_leads(
+    db: Session,
+    *,
+    county_id: str,
+    zip_code: str,
+    segment: Optional[str],
+    now: datetime,
+    limit: int = MIN_EXCLUSIVE_LEADS,
+) -> int:
+    """
+    Count sellable, exclusive leads for a (county, zip[, segment]) combination,
+    capped at `limit` — callers only need to know "is there at least N", never
+    the true total. Same predicate as the lead-pack checkout gate and webhook
+    reservation (ADR 0032 D5): qualified, non-guess, contactable,
+    cross-trade-exclusive, segment-filtered. `qualified` is computed from the
+    overall CDS score (cds_engine.py), not per-vertical, so this count is not
+    scoped by vertical either — matching the existing checkout gate exactly.
+    """
+    from config.settings import get_settings
+    from src.core.models import DistressScore, Owner, Property
+    from src.services.lead_exclusivity import get_exclusive_property_ids
+
+    settings = get_settings()
+    excl_ids = get_exclusive_property_ids(db, county_id, now, zip_code=zip_code)
+
+    filters = sellable_lead_filters(settings)
+    filters.append(Property.zip == zip_code)
+    filters.append(Property.county_id == county_id)
+    if excl_ids:
+        filters.append(Property.id.not_in(excl_ids))
+    apply_segment_filter(filters, segment, now)
+
+    rows = db.execute(
+        select(Property.id)
+        .join(DistressScore, DistressScore.property_id == Property.id)
+        .outerjoin(Owner, Owner.property_id == Property.id)
+        .where(and_(*filters))
+        .limit(limit)
+    ).scalars().all()
+    return len(rows)
 
 
 def get_lead_pool(

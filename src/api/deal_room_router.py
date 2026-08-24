@@ -24,7 +24,7 @@ from src.api.admin_router import create_access_token, verify_token
 from src.api.deps import VALID_VERTICALS, get_db
 from src.services import subscriber_auth as _sub_auth
 from src.services.hold_lifecycle_service import create_deal_room
-from src.services.lead_pool_service import get_lead_pool
+from src.services.lead_pool_service import count_available_leads, get_lead_pool, MIN_EXCLUSIVE_LEADS
 from src.services.subscriber_auth import verify_password
 from src.services import pricing_truth
 from src.utils.test_account import is_test_subscriber
@@ -316,10 +316,24 @@ def demo_create_deal_room(
 
     Authorized by a demo-scoped bearer token from POST /api/demo/login.
     Raises 409 if the (zip, vertical, county) territory is not 'available'.
+    Raises 422 if the ZIP has fewer than MIN_EXCLUSIVE_LEADS sellable,
+    exclusive leads — the same gate the live lead-pack checkout uses, so a
+    demo can never represent inventory checkout would then reject.
     Tier must be starter | pro | founder (Dominator is retired).
     """
     if not is_county_launched(body.county_id, db):
         raise HTTPException(status_code=400, detail="county_not_launched")
+
+    now = datetime.now(timezone.utc)
+    available = count_available_leads(
+        db, county_id=body.county_id, zip_code=body.zip_code,
+        segment=None, now=now,
+    )
+    if available < MIN_EXCLUSIVE_LEADS:
+        raise HTTPException(status_code=422, detail={
+            "error": "insufficient_leads",
+            "message": f"Only {available} qualified leads available for this ZIP/vertical combination",
+        })
 
     settings = get_settings()
 
