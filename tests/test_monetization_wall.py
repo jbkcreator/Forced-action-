@@ -163,7 +163,10 @@ class TestGetRoiFrameUnit:
         assert result["vertical"] == "roofing"
         assert result["live_lead_count"] == 150
         assert "headline" in result
-        assert "avg_job_value" in result
+        # ROI/job-value + monthly-revenue projections were removed from the wall.
+        assert "avg_job_value" not in result
+        assert "avg_deal_value" not in result
+        assert "monthly_revenue" not in result
 
     def test_unknown_vertical_uses_default(self):
         db = MagicMock()
