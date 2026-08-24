@@ -40,8 +40,10 @@ from typing import Optional
 
 from sqlalchemy import text
 
+from config.settings import get_settings
 from src.core.database import get_db_context
 from src.services.email import send_email
+from src.services.email_shell import ACCENT, lead_row, paragraph, render_email_shell
 from src.services.proof_moment import _blur_address
 from src.utils.logger import setup_logging
 
@@ -126,30 +128,53 @@ def _new_leads_for_subscriber(db, subscriber, zip_codes: list[str]) -> list[dict
     return leads
 
 
+def _dashboard_url(subscriber) -> Optional[str]:
+    """Subscriber dashboard link, or None when the account has no feed UUID
+    (never build a broken /dashboard/None link)."""
+    feed_uuid = getattr(subscriber, "event_feed_uuid", None)
+    if not feed_uuid:
+        return None
+    return f"{get_settings().app_base_url.rstrip('/')}/dashboard/{feed_uuid}"
+
+
 def _render_subscriber_digest(subscriber, leads: list[dict], zip_codes: list[str]) -> tuple[str, str, str]:
     vertical_label = _VERTICAL_LABELS.get(subscriber.vertical or "", subscriber.vertical or "")
     zip_str = ", ".join(zip_codes) if zip_codes else "your territory"
     n = len(leads)
     subject = f"{n} new distressed propert{'y' if n == 1 else 'ies'} in {zip_str}"
+    dashboard_url = _dashboard_url(subscriber)
+    today = datetime.now(timezone.utc).strftime("%B %d, %Y").replace(" 0", " ")
 
     rows_html = "".join(
-        f'<tr><td style="padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.08);">'
-        f'<b style="color:#ffffff;">{l["address"]}</b>, {l["city"]} {l["zip"]} '
-        f'&mdash; <span style="color:#fbbf24;">{l["lead_tier"]}</span> '
-        f'({int(l["score"])}/100)<br/>'
-        f'<span style="color:#94a3b8;font-size:12px;">{", ".join(l["signals"]) or "Distressed property"}</span>'
-        f'</td></tr>'
+        lead_row(
+            title=(f'{l["address"]} '
+                   f'<span style="font-size:13px;font-weight:400;color:#6b7280;">'
+                   f'{l["city"]}, {l["zip"]}</span>'),
+            sub=(f'<span style="font-weight:600;color:{ACCENT};letter-spacing:0.04em;">'
+                 f'{l["lead_tier"]}</span>'
+                 f'<span style="color:#ffffff18;"> &nbsp;|&nbsp; </span>'
+                 f'{", ".join(l["signals"]) or "Distressed property"}'),
+            meta=f'CDS <span style="color:{ACCENT};font-weight:600;">{int(l["score"])}/100</span>',
+        )
         for l in leads
     )
-    html = f"""<!DOCTYPE html><html><body style="background:#0f172a;color:#e2e8f0;font-family:Arial,sans-serif;">
-    <table width="580" cellpadding="0" cellspacing="0" style="margin:0 auto;padding:24px 0;">
-      <tr><td><h2 style="color:#ffffff;">{n} new {vertical_label} lead{'s' if n != 1 else ''} in {zip_str}</h2></td></tr>
-      <tr><td><table width="100%">{rows_html}</table></td></tr>
-    </table></body></html>"""
+
+    cta = ("View All {n} Lead{s} in Your Territory".format(n=n, s="" if n == 1 else "s")
+           if dashboard_url else None)
+    html = render_email_shell(
+        headline=(f'{n} new {vertical_label} lead{"" if n == 1 else "s"} in '
+                  f'<span style="color:{ACCENT};">{zip_str}</span>'),
+        subhead=f"{today} &middot; New properties scored in your territory",
+        inner_html=rows_html,
+        cta_text=cta,
+        cta_url=dashboard_url,
+    )
 
     lines = [f"{n} new {vertical_label} leads in {zip_str}", ""]
     for l in leads:
         lines.append(f"[{l['lead_tier']}] {int(l['score'])}/100 — {l['address']}, {l['city']} {l['zip']}")
+    if dashboard_url:
+        lines += ["", f"View all {n} leads in your dashboard: {dashboard_url}"]
     plain_text = "\n".join(lines)
     return subject, html, plain_text
 
@@ -242,19 +267,31 @@ def _render_waitlist_teaser(entry, count: int, example: dict) -> tuple[str, str,
     vertical_label = _VERTICAL_LABELS.get(entry.vertical or "", entry.vertical or "")
     masked = _blur_address(example.get("address"))
     subject = f"{count} new distressed propert{'y' if count == 1 else 'ies'} in {entry.zip_code} — unlock to see"
+    unlock_url = f"{get_settings().app_base_url.rstrip('/')}/?zip={entry.zip_code}"
 
-    html = f"""<!DOCTYPE html><html><body style="background:#0f172a;color:#e2e8f0;font-family:Arial,sans-serif;">
-    <table width="580" cellpadding="0" cellspacing="0" style="margin:0 auto;padding:24px 0;">
-      <tr><td>
-        <h2 style="color:#ffffff;">{count} new {vertical_label} lead{'s' if count != 1 else ''} in {entry.zip_code}</h2>
-        <p style="color:#94a3b8;">Example: <b style="color:#fbbf24;filter:blur(3px);">{masked}</b></p>
-        <p style="color:#94a3b8;">Unlock {entry.zip_code} to see full addresses, owner contacts, and scores.</p>
-      </td></tr>
-    </table></body></html>"""
+    inner = (
+        lead_row(
+            title=f'<span style="filter:blur(4px);color:{ACCENT};">{masked}</span>',
+            sub="Example property — unlock to reveal the full address",
+        )
+        + paragraph(
+            f"Unlock {entry.zip_code} to see full addresses, owner contacts, and scores.",
+            muted=True,
+        )
+    )
+    html = render_email_shell(
+        headline=(f'{count} new {vertical_label} lead{"" if count == 1 else "s"} in '
+                  f'<span style="color:{ACCENT};">{entry.zip_code}</span>'),
+        subhead="Locked — unlock your territory to see them all",
+        inner_html=inner,
+        cta_text=f"Unlock {entry.zip_code}",
+        cta_url=unlock_url,
+    )
 
     plain_text = (
         f"{count} new distressed properties in {entry.zip_code} — unlock to see.\n"
         f"Example: {masked}\n"
+        f"Unlock {entry.zip_code}: {unlock_url}\n"
     )
     return subject, html, plain_text
 

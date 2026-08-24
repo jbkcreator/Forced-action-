@@ -47,6 +47,7 @@ def maybe_send_deal_win_social_proof_prompt(subscriber, outcome, db) -> bool:
         )
         return False
 
+    from src.services.email_shell import ACCENT, paragraph, render_email_shell
     from src.services.referral_engine import ensure_referral_code
     from src.services.signed_links import encode_prompt_attribution_token
     from src.services.email import send_email
@@ -91,41 +92,32 @@ def maybe_send_deal_win_social_proof_prompt(subscriber, outcome, db) -> bool:
         "We read every reply.\n\n"
         "- Forced Action Team"
     )
-    body_html = f"""<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
-<body style="margin:0;padding:0;background:#0f172a;font-family:Arial,sans-serif;color:#e2e8f0;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;padding:40px 0;">
-    <tr><td align="center">
-      <table width="560" cellpadding="0" cellspacing="0"
-             style="background:#1e293b;border:1px solid rgba(255,255,255,0.08);border-radius:16px;overflow:hidden;max-width:560px;width:100%;">
-        <tr>
-          <td style="padding:32px 40px;">
-            <h1 style="margin:0 0 12px;font-size:28px;color:#ffffff;">Huge win.</h1>
-            <p style="margin:0 0 20px;font-size:16px;color:#cbd5e1;">
-              Congrats on the {amount_text} close.
-            </p>
-            <p style="margin:0 0 12px;font-size:15px;color:#e2e8f0;">
-              Hit reply and send us:
-            </p>
-            <p style="margin:0 0 20px;font-size:15px;color:#e2e8f0;">
-              1. A short testimonial about what Forced Action helped you close.<br/>
-              2. The approximate dollar amount you made on the deal.
-            </p>
-            <p style="margin:0 0 16px;font-size:15px;color:#94a3b8;">
-              If you know another operator who should see deals like this, share your referral link too:
-            </p>
-            <p style="margin:0 0 24px;">
-              <a href="{share_url}" style="color:#fbbf24;text-decoration:none;font-weight:700;">{share_url}</a>
-            </p>
-            <p style="margin:0;font-size:13px;color:#64748b;">We read every reply.</p>
-          </td>
-        </tr>
-      </table>
-    </td></tr>
-  </table>
-</body>
-</html>"""
+    inner_html = (
+        paragraph(f"Congrats on the {amount_text} close.")
+        + paragraph("Hit reply and send us:")
+        + paragraph(
+            "1. A short testimonial about what Forced Action helped you close.<br/>"
+            "2. The approximate dollar amount you made on the deal."
+        )
+        + paragraph(
+            "If you know another operator who should see deals like this, share "
+            "your referral link too:",
+            muted=True,
+        )
+        + paragraph(
+            f'<a href="{share_url}" style="color:{ACCENT};text-decoration:none;'
+            f'font-weight:700;">{share_url}</a>'
+        )
+        + paragraph("We read every reply.", muted=True)
+    )
+    body_html = render_email_shell(
+        headline="Huge win.",
+        subhead=f"Congrats on the {amount_text} close",
+        inner_html=inner_html,
+        cta_text="Share your referral link",
+        cta_url=share_url,
+        preheader="Can we feature your win?",
+    )
 
     email_sent = False
     try:

@@ -37,6 +37,7 @@ from config.settings import get_settings
 from src.core.database import get_db
 from src.core.models import Subscriber
 from src.services.email import send_alert, send_email
+from src.services.email_shell import paragraph, render_email_shell
 from src.services.transactional_email_tracking import log_transactional_email_send
 
 logger = logging.getLogger(__name__)
@@ -189,15 +190,21 @@ def send_magic_link_email(
             f"This link expires in {_MAGIC_LINK_EXPIRE_MINUTES} minutes and can only "
             f"be used once. If you didn't request this, ignore this email.\n\n— Forced Action"
         ),
-        body_html=(
-            f"<p>{greeting}</p>"
-            f"<p>Click below to access your feed — no password needed:</p>"
-            f"<p><a href='{verify_url}' style='display:inline-block;padding:10px 18px;"
-            f"background:#1a1a2e;color:#fff;text-decoration:none;border-radius:6px;'>"
-            f"Open my feed</a></p>"
-            f"<p style='color:#888;font-size:12px;'>This link expires in "
-            f"{_MAGIC_LINK_EXPIRE_MINUTES} minutes and can only be used once. "
-            f"If you didn't request this, ignore this email.</p>"
+        body_html=render_email_shell(
+            headline="Your login link",
+            subhead="No password needed",
+            inner_html=(
+                paragraph(greeting)
+                + paragraph("Click below to access your feed — no password needed.")
+                + paragraph(
+                    f"This link expires in {_MAGIC_LINK_EXPIRE_MINUTES} minutes and "
+                    "can only be used once. If you didn't request this, ignore this email.",
+                    muted=True,
+                )
+            ),
+            cta_text="Open my feed",
+            cta_url=verify_url,
+            preheader="Your one-time login link for Forced Action.",
         ),
         tracking={
             "subscriber_id": subscriber_id,
@@ -261,14 +268,19 @@ def send_subscriber_password_reset_email(
             f"This link expires in {_RESET_EXPIRE_HOURS} hours. If you didn't request "
             f"this, ignore this email.\n\n— Forced Action"
         ),
-        body_html=(
-            f"<p>{greeting}</p>"
-            f"<p>Reset your Forced Action feed password:</p>"
-            f"<p><a href='{reset_url}' style='display:inline-block;padding:10px 18px;"
-            f"background:#1a1a2e;color:#fff;text-decoration:none;border-radius:6px;'>"
-            f"Reset password</a></p>"
-            f"<p style='color:#888;font-size:12px;'>Link expires in {_RESET_EXPIRE_HOURS} hours. "
-            f"If you didn't request this, ignore this email.</p>"
+        body_html=render_email_shell(
+            headline="Reset your password",
+            subhead=greeting,
+            inner_html=(
+                paragraph("Reset your Forced Action feed password with the button below.")
+                + paragraph(
+                    f"Link expires in {_RESET_EXPIRE_HOURS} hours. "
+                    "If you didn't request this, ignore this email.",
+                    muted=True,
+                )
+            ),
+            cta_text="Reset Password",
+            cta_url=reset_url,
         ),
         tracking={
             "subscriber_id": subscriber_id,
