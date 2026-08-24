@@ -26,43 +26,28 @@ logger = logging.getLogger(__name__)
 _WALL_TTL = 24 * 3600       # 24h session window
 _COUNTDOWN_SEC = 15 * 60    # 15-min payment countdown
 
+# ROI/job-value and monthly-revenue projections were removed from the wall
+# (earnings-claim / credibility risk). Frames now carry only a non-financial
+# headline; the live qualified-lead count is added at request time.
 _ROI_FRAMES: dict = {
     "roofing": {
-        "headline": "Roofers in Hillsborough close 12+ storm/distress jobs/mo",
-        "avg_job_value": 8500,
-        "avg_jobs_month": 12,
-        "monthly_revenue": 102000,
+        "headline": "Roofers win storm & distress jobs from these leads",
     },
     "remediation": {
-        "headline": "Remediation contractors average 8 distress calls/mo at ~$6,500 each",
-        "avg_job_value": 6500,
-        "avg_jobs_month": 8,
-        "monthly_revenue": 52000,
+        "headline": "Remediation contractors turn distress calls into booked jobs",
     },
     "investor": {
-        "headline": "Distressed-property investors average 2 deals/mo at $22K profit each",
-        "avg_deal_value": 22000,
-        "avg_deals_month": 2,
-        "monthly_revenue": 44000,
+        "headline": "Distressed-property investors source off-market deals here",
     },
     "plumbing": {
-        "headline": "Plumbers on distressed leads average 15 emergency jobs/mo",
-        "avg_job_value": 3200,
-        "avg_jobs_month": 15,
-        "monthly_revenue": 48000,
+        "headline": "Plumbers win emergency jobs from distressed-property leads",
     },
     "hvac": {
-        "headline": "HVAC contractors find 10+ urgent replacements/mo via distress leads",
-        "avg_job_value": 4800,
-        "avg_jobs_month": 10,
-        "monthly_revenue": 48000,
+        "headline": "HVAC contractors find urgent replacements via distress leads",
     },
 }
 _DEFAULT_ROI = {
-    "headline": "Contractors using Forced Action data close 30–50% more distressed jobs",
-    "avg_job_value": 5000,
-    "avg_jobs_month": 10,
-    "monthly_revenue": 50000,
+    "headline": "Contractors using Forced Action data close more distressed jobs",
 }
 
 
