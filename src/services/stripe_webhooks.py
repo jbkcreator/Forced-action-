@@ -34,7 +34,7 @@ from src.core.models import (
     StripeWebhookEvent,
     ZipTerritory,
 )
-from src.services.ghl_webhook import push_subscriber_to_ghl
+from src.services.ghl_webhook import add_contact_tags, push_subscriber_to_ghl
 from src.utils.test_account import is_test_subscriber
 from src.services import lead_exclusivity
 from src.services.email_shell import render_email_shell, paragraph, lead_row, ACCENT
@@ -3001,13 +3001,19 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
     except Exception:
         logger.warning("lead_unlock: publish_lifecycle_event failed sub=%s", subscriber.id, exc_info=True)
 
-    # Upsert the buyer's GHL contact and tag the unlock so speed-to-lead
-    # automations have a trigger to fire on. Best-effort — a GHL failure must
-    # never roll back a completed payment.
+    # Tag the buyer's GHL contact so speed-to-lead automations have a trigger.
+    # Tag-only when the contact already exists — a full push_subscriber_to_ghl
+    # here would re-serialize every custom field and wipe the subscriber's
+    # ZIP / founding-member / attribution context to empty. Only fall back to a
+    # full push when there is no contact yet (nothing to clobber). Best-effort —
+    # a GHL failure must never roll back a completed payment.
     try:
-        push_subscriber_to_ghl(subscriber, stage=None, tags=["lead-unlocked"], db=db)
+        if getattr(subscriber, "ghl_contact_id", None):
+            add_contact_tags(subscriber.ghl_contact_id, ["lead-unlocked"])
+        else:
+            push_subscriber_to_ghl(subscriber, stage=None, tags=["lead-unlocked"], db=db)
     except Exception:
-        logger.warning("lead_unlock: GHL push failed sub=%s", subscriber.id, exc_info=True)
+        logger.warning("lead_unlock: GHL tag failed sub=%s", subscriber.id, exc_info=True)
 
     _fire_capi_for_pi(
         payment_intent, subscriber, "lead_unlock",
