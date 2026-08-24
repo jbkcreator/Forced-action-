@@ -6965,7 +6965,16 @@ def free_signup(req: FreeSignupRequest, request: Request, db: Session = Depends(
             "landing_path": req.landing_path,
             "referrer":     req.referrer,
         }
-        push_subscriber_to_ghl(sub, stage=None, utm_data=utm_data, db=db)
+        # create_free_account_by_email is idempotent on email and returns an
+        # existing subscriber of ANY tier. Only push + tag genuinely free-tier
+        # subscribers: tagging a returning paid/churned customer `free-signup`
+        # would drop them into new-lead speed-to-lead automations, and the full
+        # upsert would clobber their ZIP / founding / attribution context.
+        if (getattr(sub, "tier", "") or "").lower() in ("", "free"):
+            # Tag `free-signup` so the segment is findable in GHL and speed-to-lead
+            # has a trigger (a stage-less, tag-less upsert lands invisibly among
+            # property-owner contacts).
+            push_subscriber_to_ghl(sub, stage=None, tags=["free-signup"], utm_data=utm_data, db=db)
     except Exception:
         logger.warning("GHL free-signup push failed (non-fatal):", exc_info=True)
 

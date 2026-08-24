@@ -99,6 +99,33 @@ def _headers() -> Dict[str, str]:
     }
 
 
+def add_contact_tags(contact_id: str, tags: List[str]) -> bool:
+    """
+    Add tags to an existing GHL contact without touching any other field.
+
+    PUTs only `{"tags": [...]}` — GHL merges tags (append, not replace). Unlike
+    push_subscriber_to_ghl, this never serializes custom fields, so it cannot
+    clobber a subscriber's ZIP / founding-member / attribution context. Use this
+    when all you want is to stamp a tag on a contact that already exists.
+
+    Returns True on success, False on any failure. Raises nothing.
+    """
+    if not _is_configured() or not contact_id or not tags:
+        return False
+    try:
+        resp = _ghl_request(
+            "PUT",
+            f"{_GHL_BASE}/contacts/{contact_id}",
+            headers=_headers(),
+            json={"tags": tags},
+        )
+        resp.raise_for_status()
+        return True
+    except Exception as exc:
+        logger.warning("[GHL] add_contact_tags failed for contact %s: %s", contact_id, exc)
+        return False
+
+
 def _stage_id_for_urgency(urgency: str) -> Optional[str]:
     """Map urgency level to configured GHL pipeline stage ID."""
     mapping = {
