@@ -3001,6 +3001,14 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
     except Exception:
         logger.warning("lead_unlock: publish_lifecycle_event failed sub=%s", subscriber.id, exc_info=True)
 
+    # Upsert the buyer's GHL contact and tag the unlock so speed-to-lead
+    # automations have a trigger to fire on. Best-effort — a GHL failure must
+    # never roll back a completed payment.
+    try:
+        push_subscriber_to_ghl(subscriber, stage=None, tags=["lead-unlocked"], db=db)
+    except Exception:
+        logger.warning("lead_unlock: GHL push failed sub=%s", subscriber.id, exc_info=True)
+
     _fire_capi_for_pi(
         payment_intent, subscriber, "lead_unlock",
         f"unlock_{_attr(payment_intent, 'id') or ''}", db,

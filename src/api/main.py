@@ -6965,7 +6965,10 @@ def free_signup(req: FreeSignupRequest, request: Request, db: Session = Depends(
             "landing_path": req.landing_path,
             "referrer":     req.referrer,
         }
-        push_subscriber_to_ghl(sub, stage=None, utm_data=utm_data, db=db)
+        # Tag the contact `free-signup` so the segment is findable in GHL and
+        # speed-to-lead automations have a trigger to fire on (a stage-less,
+        # tag-less upsert lands invisibly among property-owner contacts).
+        push_subscriber_to_ghl(sub, stage=None, tags=["free-signup"], utm_data=utm_data, db=db)
     except Exception:
         logger.warning("GHL free-signup push failed (non-fatal):", exc_info=True)
 
