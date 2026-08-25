@@ -555,7 +555,34 @@ def _fake_session_scope(rows):
         def mappings(self):
             return self
 
+        def scalars(self):
+            return self
+
         def all(self):
+            # For _test_customer_ids: returns stripe_customer_id values from rows where is_test=True.
+            # For subscriber rows query: returns the full rows.
+            # Both call .all() — scalars() path needs plain values, mappings() path needs dicts.
+            # We detect context by whether scalars() was called (tracked via _scalars flag).
+            return self._scalar_values if getattr(self, "_scalars", False) else rows
+
+        def __init__(self):
+            self._scalars = False
+
+    class _Result:  # noqa: F811 — redefine with __init__
+        def __init__(self):
+            self._scalars = False
+
+        def mappings(self):
+            return self
+
+        def scalars(self):
+            self._scalars = True
+            return self
+
+        def all(self):
+            if self._scalars:
+                # _test_customer_ids — return stripe_customer_id for is_test rows
+                return [r["stripe_customer_id"] for r in rows if r.get("is_test")]
             return rows
 
     class _Session:
@@ -575,7 +602,7 @@ def test_check_subscriber_reconciliation_merges_trialing_into_entitled_set(monke
         lambda: {"cus_trial": {}},
     )
     rows = [
-        {"stripe_customer_id": "cus_trial", "stripe_subscription_id": "sub_trial", "status": "active"},
+        {"stripe_customer_id": "cus_trial", "stripe_subscription_id": "sub_trial", "status": "active", "tier": "starter"},
     ]
     monkeypatch.setattr(revenue_truth.vera_db, "session_scope", lambda: _fake_session_scope(rows))
 
