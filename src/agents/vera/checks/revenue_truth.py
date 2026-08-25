@@ -164,7 +164,7 @@ def _fetch_stripe_subscriptions_by_status(status: str) -> Optional[dict]:
         return None
     result: dict = {}
     for sub in subs:
-        if not sub.get("livemode", False):
+        if not _field(sub, "livemode", False):
             continue
         customer = sub["customer"]
         customer_id = customer.id if hasattr(customer, "id") else customer
@@ -242,8 +242,9 @@ def check_subscriber_reconciliation() -> ReconciliationResult:
 
     with vera_db.session_scope() as session:
         rows = session.execute(
-            text("SELECT stripe_customer_id, stripe_subscription_id, status FROM subscribers WHERE is_test IS NOT TRUE")
+            text("SELECT stripe_customer_id, stripe_subscription_id, status, tier FROM subscribers WHERE is_test IS NOT TRUE")
         ).mappings().all()
+        test_customer_ids = _test_customer_ids(session)
 
     if active_subs_by_customer is None:
         # Stripe couldn't be reached — abstain rather than report every real
@@ -277,11 +278,27 @@ def check_subscriber_reconciliation() -> ReconciliationResult:
 
     entitled_subs_by_customer = {**active_subs_by_customer, **trialing_subs_by_customer}
 
-    subscriber_by_customer = {row["stripe_customer_id"]: dict(row) for row in rows}
-    active_db_subscribers = [dict(row) for row in rows if row["status"] == "active"]
+    # Strip test accounts from the Stripe side so the paying_no_access check
+    # operates on the same population as the DB side (which excludes is_test).
+    billable_subs_by_customer = {
+        cid: sub for cid, sub in active_subs_by_customer.items()
+        if cid not in test_customer_ids
+    }
+    billable_entitled_by_customer = {
+        cid: sub for cid, sub in entitled_subs_by_customer.items()
+        if cid not in test_customer_ids
+    }
 
-    paying_no_access = _classify_paying_no_access(active_subs_by_customer, subscriber_by_customer)
-    access_not_paying = _classify_access_not_paying(entitled_subs_by_customer, active_db_subscribers)
+    subscriber_by_customer = {row["stripe_customer_id"]: dict(row) for row in rows}
+    # Exclude free-tier subscribers from access_not_paying: they legitimately
+    # have status='active' with no Stripe subscription by design.
+    active_db_subscribers = [
+        dict(row) for row in rows
+        if row["status"] == "active" and row["tier"] != "free"
+    ]
+
+    paying_no_access = _classify_paying_no_access(billable_subs_by_customer, subscriber_by_customer)
+    access_not_paying = _classify_access_not_paying(billable_entitled_by_customer, active_db_subscribers)
 
     details = []
     for item in access_not_paying[:SAMPLE_CAP]:
