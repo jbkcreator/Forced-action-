@@ -195,6 +195,7 @@ def requests_get_with_retry(
     max_retries: int = 5,
     retry_delay: int = 5,
     use_proxy: bool = False,
+    max_retry_delay: Optional[int] = None,
     **kwargs,
 ) -> requests.Response:
     """
@@ -250,6 +251,13 @@ def requests_get_with_retry(
                 wait = retry_delay
                 if status == 429 and e.response is not None:
                     wait = _parse_retry_after(e.response.headers.get("Retry-After"), retry_delay)
+                # Cap absurd Retry-After values (some APIs return multi-hour bans)
+                # so a caller with a tight schedule fails fast instead of hanging.
+                if max_retry_delay is not None and wait > max_retry_delay:
+                    logger.warning(
+                        f"Retry-After {wait}s exceeds cap {max_retry_delay}s — giving up early"
+                    )
+                    raise
                 logger.warning(
                     f"Request attempt {attempt}/{max_retries} got HTTP {status}: {e}"
                     f" — retrying in {wait}s..."

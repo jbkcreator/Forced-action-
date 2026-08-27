@@ -42,6 +42,26 @@ from src.utils.db_deduplicator import filter_new_records
 setup_logging()
 logger = get_logger(__name__)
 
+# CourtListener rate-limit handling. The token is on the free tier: 50 requests
+# per HOUR and 5 per MINUTE (confirmed from the API's 429 bodies). PR #245 added
+# an unthrottled page-walk over the whole Middle-District docket set, which blew
+# past both caps and 429'd every run since 2026-08-25. We stay under them by
+# fetching a large page_size (fewer pages) and sleeping >12s between pages so a
+# multi-page day never exceeds 5/min. Tampa filtering stays client-side —
+# CourtListener's dockets filterset rejects docket_number__startswith / order_by
+# with HTTP 400, so those cannot be pushed server-side.
+COURTLISTENER_PAGE_SIZE = 100
+COURTLISTENER_PAGE_DELAY_SECONDS = 13.0
+# Hard cap on pages walked per run. The free token cannot afford to page the whole
+# Middle District (a busy day is many pages) without tripping 50/hour + 5/min and
+# earning a multi-hour ban, so we take the most recent COURTLISTENER_MAX_PAGES
+# pages (page_size=100 each) and filter Tampa client-side. This matches the small
+# request footprint the scraper had before PR #245's unbounded walk.
+COURTLISTENER_MAX_PAGES = 5
+# If CourtListener hands back a Retry-After longer than this, fail the run fast
+# (cron retries next cycle) rather than hang for hours or hammer into a longer ban.
+COURTLISTENER_MAX_RETRY_DELAY_SECONDS = 120
+
 
 def fetch_bankruptcy_filings(lookback_days: int = 1, court_code: str = COURT_CODE_FLORIDA_MIDDLE_BANKRUPTCY) -> List[Dict[str, Any]]:
 	"""
@@ -70,10 +90,15 @@ def fetch_bankruptcy_filings(lookback_days: int = 1, court_code: str = COURT_COD
 	
 	logger.info(f"Fetching bankruptcy filings from CourtListener API since {start_date}")
 	
-	# Construct API URL with query parameters
+	# Construct API URL with query parameters. Only fields CourtListener's dockets
+	# filterset actually accepts — court + date_filed__gte + page_size. A large
+	# page_size keeps the page count (and therefore request count) low so the free
+	# tier's 50/hour + 5/min caps aren't tripped; Tampa filtering is applied
+	# client-side in filter_tampa_bankruptcies().
 	params = {
 		"court": court_code,
 		"date_filed__gte": start_date,
+		"page_size": COURTLISTENER_PAGE_SIZE,
 	}
 	
 	headers = {
@@ -84,6 +109,7 @@ def fetch_bankruptcy_filings(lookback_days: int = 1, court_code: str = COURT_COD
 	all_results = []
 	url = COURTLISTENER_API_URL
 	page_params = params.copy()
+	page_num = 0
 
 	while url:
 		try:
@@ -92,6 +118,7 @@ def fetch_bankruptcy_filings(lookback_days: int = 1, court_code: str = COURT_COD
 				params=page_params if url == COURTLISTENER_API_URL else None,
 				headers=headers,
 				timeout=REQUEST_TIMEOUT_DEFAULT,
+				max_retry_delay=COURTLISTENER_MAX_RETRY_DELAY_SECONDS,
 			)
 		except requests.Timeout as e:
 			logger.error(f"Request timed out while fetching bankruptcy filings: {e}")
@@ -111,12 +138,26 @@ def fetch_bankruptcy_filings(lookback_days: int = 1, court_code: str = COURT_COD
 
 		page_results = data.get('results', [])
 		all_results.extend(page_results)
+		page_num += 1
 		logger.debug(f"Page fetched: {len(page_results)} results (total so far: {len(all_results)} of {data.get('count', '?')})")
 
 		url = data.get('next')  # None when last page reached
 		page_params = None       # next URL already includes params
 
-	logger.info(f"Fetched {len(all_results)} bankruptcy dockets from API")
+		if page_num >= COURTLISTENER_MAX_PAGES:
+			logger.warning(
+				f"CourtListener page cap ({COURTLISTENER_MAX_PAGES}) hit for court={court_code} "
+				f"since {start_date}; stopping with {len(all_results)} dockets collected"
+			)
+			break
+
+		# Throttle between pages so a multi-page day stays under CourtListener's
+		# per-minute rate limit instead of bursting and getting 429'd (the
+		# unthrottled walk added in PR #245 is what started the daily 429s).
+		if url:
+			time.sleep(COURTLISTENER_PAGE_DELAY_SECONDS)
+
+	logger.info(f"Fetched {len(all_results)} bankruptcy dockets from API ({page_num} page(s))")
 	return all_results
 
 
