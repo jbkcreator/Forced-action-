@@ -57,6 +57,33 @@ def normalized_monthly_price(amount_cents: int, interval: str) -> float:
     return round(amount_cents / 100 / months, 2)
 
 
+def _recurring_monthly_price_from_subscription(sub_expanded) -> float | None:
+    """Monthly run-rate from a subscription's recurring price, or None.
+
+    This is the authoritative source for `plan_price`: it reads the recurring
+    `unit_amount` + `interval` of the first subscription item, so it is immune to
+    a discounted or prorated first charge (e.g. a $10 founding first month on a
+    $299/mo plan). Returns None when no subscription/price is available, so the
+    caller can fall back to the period charge.
+    """
+    if not sub_expanded:
+        return None
+    items = (sub_expanded.get("items") or {}).get("data") or []
+    if not items:
+        return None
+    price = items[0].get("price") or {}
+    unit = price.get("unit_amount") or 0
+    if unit <= 0:
+        return None
+    recurring = price.get("recurring") or {}
+    interval = recurring.get("interval", "month")
+    interval_count = recurring.get("interval_count", 1)
+    norm_interval = "annual" if (
+        interval == "year" or (interval == "month" and interval_count == 12)
+    ) else "monthly"
+    return normalized_monthly_price(unit, norm_interval)
+
+
 def _attr(obj, key: str, default=None):
     """Read `key` from a Stripe SDK object or a plain dict.
 
@@ -756,7 +783,13 @@ def _on_checkout_completed(
         subscriber.tier    = tier
         subscriber.status  = "active"
         subscriber.ghl_stage = 5
-        subscriber.is_test = is_test_subscriber(customer_email, stripe_livemode=session.get("livemode"))
+        # is_test is sticky (never downgrade a flagged account) and evaluated
+        # against BOTH the checkout email and the row's stored email — the stored
+        # internal-domain email (e.g. @heu.ai) may have been set after the
+        # original checkout, which is how an internal seat can leak into MRR.
+        subscriber.is_test = bool(subscriber.is_test) or is_test_subscriber(
+            customer_email or subscriber.email, stripe_livemode=session.get("livemode")
+        )
         # Backfill phone if Stripe collected one and we don't have it yet.
         if customer_phone and not subscriber.phone:
             subscriber.phone = customer_phone
@@ -809,14 +842,16 @@ def _on_checkout_completed(
     # Each still gets its own db.begin_nested() savepoint so a failure in one
     # can't poison the subscriber/ZIP-lock commit or each other.
     #
-    # amount_total is in cents = the charge for this billing period. `plan_price`
-    # is read as MONTHLY recurring revenue across the app, so an annual charge
-    # (a full year prepaid up front, e.g. founder annual) must be normalized to a
-    # monthly run-rate — otherwise it inflates MRR ~12x for every annual sub.
+    # `plan_price` is read as MONTHLY recurring revenue across the app. Its
+    # authoritative source is the subscription's recurring price — NOT
+    # session.amount_total, which is the charge for this billing period and can be
+    # discounted or prorated (e.g. a $10 founding first month on a $299/mo plan
+    # would otherwise persist $10 as the run-rate and understate MRR). An annual
+    # recurring price is normalized to a monthly run-rate inside the helpers so it
+    # does not inflate MRR ~12x. amount_total is used only as a fallback when the
+    # subscription (and therefore its recurring price) cannot be retrieved.
     _interval = (meta.get("interval") or "monthly").lower()
     _amount_total = session.get("amount_total") or 0
-    if _amount_total > 0:
-        subscriber.plan_price = normalized_monthly_price(_amount_total, _interval)
 
     # Trial/price detection AND revenue_engine's price-based plan resolution
     # below both need the subscription expanded with its price — fetch once,
@@ -833,22 +868,23 @@ def _on_checkout_completed(
                 stripe_subscription_id, exc_info=True,
             )
 
-    if _sub_expanded is not None and _amount_total == 0:
+    _recurring_price = _recurring_monthly_price_from_subscription(_sub_expanded)
+    if _recurring_price is not None:
+        subscriber.plan_price = _recurring_price
+    elif _amount_total > 0:
+        subscriber.plan_price = normalized_monthly_price(_amount_total, _interval)
+
+    if _sub_expanded is not None:
         # Trial detection: Stripe sets amount_total=0 when trial_period_days > 0.
         try:
             with db.begin_nested():
-                _items = (_sub_expanded.get("items") or {}).get("data") or []
-                if _items:
-                    _unit = (_items[0].get("price") or {}).get("unit_amount") or 0
-                    if _unit:
-                        subscriber.plan_price = normalized_monthly_price(_unit, _interval)
                 _trial_end = _sub_expanded.get("trial_end")
                 if _trial_end:
                     subscriber.is_trial = True
                     subscriber.trial_ends_at = datetime.fromtimestamp(_trial_end, tz=timezone.utc)
         except Exception:
             logger.warning(
-                "checkout: trial/price extraction failed for subscription %s",
+                "checkout: trial extraction failed for subscription %s",
                 stripe_subscription_id, exc_info=True,
             )
 
