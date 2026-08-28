@@ -1243,8 +1243,24 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
         "resolved_amount_cents": str(resolved_amount_cents) if resolved_amount_cents is not None else "",
         "dashboard_upgrade": str(payload.already_has_dashboard_access),
     }
-    if payload.ghl_contact_id:
-        checkout_metadata["ghl_contact_id"] = payload.ghl_contact_id
+    # H-16: the free-signup step (moments earlier, in this same funnel) already
+    # pushed this email to GHL and saved the returned contact id on our own
+    # Subscriber row — read it back rather than depending on the frontend or
+    # any external link to carry it.
+    ghl_contact_id = payload.ghl_contact_id
+    if not ghl_contact_id:
+        try:
+            existing_ghl_id = db.execute(
+                select(Subscriber.ghl_contact_id)
+                .where(Subscriber.email == payload.email, Subscriber.ghl_contact_id.isnot(None))
+                .order_by(Subscriber.id.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+            ghl_contact_id = existing_ghl_id
+        except OperationalError:
+            logger.warning("DB error resolving existing ghl_contact_id for checkout email=%s", payload.email)
+    if ghl_contact_id:
+        checkout_metadata["ghl_contact_id"] = ghl_contact_id
     # 3m deal-room: carry the hold token only when the hold was validated above.
     # Passing an invalid/expired token would let refund_on_conversion trigger
     # against an unrelated or forfeited deposit.
@@ -2134,21 +2150,29 @@ def zip_availability(
 
     lead_counts = {r[0]: r[1] for r in lead_rows}
 
+    # Same sellability floor enforced at checkout (_zip_has_sellable_inventory,
+    # min 5 leads) — a ZIP under that floor is never offered as purchasable
+    # inventory, so it can't be selected only to be rejected at checkout.
+    MIN_SELLABLE_LEADS = 5
+
     result = []
     open_zip_count = 0
     for zip_code in all_zips:
         status = taken_map.get(zip_code)
+        zip_lead_count = lead_counts.get(zip_code, 0)
         if status == "locked":
             availability = "taken"
         elif status == "grace":
             availability = "grace"
+        elif zip_lead_count < MIN_SELLABLE_LEADS:
+            availability = "no_inventory"
         else:
             availability = "available"
             open_zip_count += 1
 
         # lead_count is a value signal, not the scarcity signal (ADR 0029) —
-        # only surfaced for available ZIPs, and only when non-zero.
-        lead_count = lead_counts.get(zip_code, 0) if availability == "available" else 0
+        # only surfaced for available/no_inventory ZIPs, and only when non-zero.
+        lead_count = zip_lead_count if availability in ("available", "no_inventory") else 0
 
         result.append({
             "zip_code": zip_code,
@@ -4512,6 +4536,7 @@ def hot_lead_unlock(payload: HotLeadUnlockRequest, db: Session = Depends(get_db)
             reduced=reduced,
             customer_email=subscriber.email,
             db=db,
+            feed_uuid=subscriber.event_feed_uuid,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

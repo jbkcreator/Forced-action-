@@ -1541,14 +1541,17 @@ def _checkout_completed_deferred(db: Session, subscriber, session: dict, is_new_
         logger.warning("Meta CAPI subscription purchase failed sub=%s — non-fatal", subscriber.id, exc_info=True)
 
     # ── GA4 Measurement Protocol: server-side purchase event (Part 3) ────────
+    # H-08: test/QA checkouts (is_test) must never reach GA4 — same exclusion
+    # already applied to revenue_metrics/telemetry elsewhere in this codebase.
     try:
-        _fire_ga4_purchase(
-            transaction_id=session.get("id", ""),
-            amount=round((session.get("amount_total") or 0) / 100, 2),
-            tier=tier,
-            zip_count=len(zip_codes),
-            ga_client_id=meta.get("ga_client_id"),
-        )
+        if not subscriber.is_test:
+            _fire_ga4_purchase(
+                transaction_id=session.get("id", ""),
+                amount=round((session.get("amount_total") or 0) / 100, 2),
+                tier=tier,
+                zip_count=len(zip_codes),
+                ga_client_id=meta.get("ga_client_id"),
+            )
     except Exception:
         logger.warning("GA4 MP purchase failed sub=%s — non-fatal", subscriber.id, exc_info=True)
 
