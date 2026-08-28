@@ -477,6 +477,7 @@ def create_hot_lead_unlock_link(
     reduced: bool = False,
     customer_email: Optional[str] = None,
     db: Optional[Session] = None,
+    feed_uuid: Optional[str] = None,
 ) -> dict:
     """
     Dynamic one-time Stripe payment link for hot lead unlock.
@@ -503,14 +504,30 @@ def create_hot_lead_unlock_link(
     # Use lead pack price ($99) as the reduced rate
     price = settings.stripe_price_lead_pack if reduced else price_hot_lead_unlock
 
+    # There is no standalone /leads/:id route in the SPA — send the visitor
+    # back to their dashboard (if known) so the completed unlock actually
+    # lands somewhere real and can fire its GA4 completion event there.
+    unlock_amount = 99 if reduced else 150
+    success_url = (
+        f"{settings.app_base_url}/dashboard/{feed_uuid}"
+        f"?hot_unlock=true&lead_id={lead_id}&price={unlock_amount}"
+        if feed_uuid
+        else f"{settings.app_base_url}/leads/{lead_id}?unlocked=true"
+    )
+    cancel_url = (
+        f"{settings.app_base_url}/dashboard/{feed_uuid}"
+        if feed_uuid
+        else f"{settings.app_base_url}/leads/{lead_id}"
+    )
+
     try:
         session = stripe.checkout.Session.create(
             mode="payment",
             payment_method_types=["card"],
             customer=subscriber_stripe_customer_id,
             line_items=[{"price": price, "quantity": 1}],
-            success_url=f"{settings.app_base_url}/leads/{lead_id}?unlocked=true",
-            cancel_url=f"{settings.app_base_url}/leads/{lead_id}",
+            success_url=success_url,
+            cancel_url=cancel_url,
             expires_at=int(time.time()) + 23 * 3600,  # Stripe caps expires_at at 24hr from creation
             metadata={
                 "product": "hot_lead_unlock",

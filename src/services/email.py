@@ -294,7 +294,9 @@ def send_welcome_email(subscriber, magic_link_url: Optional[str] = None, db=None
 
     _settings = get_settings()
 
-    name = subscriber.name or "there"
+    name = subscriber.name or None
+    greeting = f"Hi {name}," if name else "Hi,"
+    headline_greeting = f"You're in, {name}." if name else "You're in."
     tier = (subscriber.tier or "free").title()
     vertical = (subscriber.vertical or "").replace("_", " ").title()
     founding = subscriber.founding_member
@@ -325,7 +327,7 @@ def send_welcome_email(subscriber, magic_link_url: Optional[str] = None, db=None
         if magic_link_url else ""
     )
     body_text = (
-        f"Hi {name},\n\n"
+        f"{greeting}\n\n"
         f"Welcome to Forced Action.\n"
         f"{founding_line}\n"
         f"Plan: {tier} — {vertical}\n\n"
@@ -366,7 +368,7 @@ def send_welcome_email(subscriber, magic_link_url: Optional[str] = None, db=None
         )
     )
     body_html = render_email_shell(
-        headline=f"You're in, {name}.",
+        headline=headline_greeting,
         subhead=f"{tier} &middot; {vertical}",
         inner_html=inner_html,
         cta_text="Open My Event Feed",
@@ -420,10 +422,12 @@ def send_upgrade_confirmation_email(subscriber, db=None) -> bool:
 
     _settings = get_settings()
 
-    name = subscriber.name or "there"
+    name = subscriber.name or None
+    greeting = f"Hi {name}," if name else "Hi,"
     tier = (subscriber.tier or "free").title()
     vertical = (subscriber.vertical or "").replace("_", " ").title()
     founding = subscriber.founding_member
+    headline_greeting = f"You're on {tier} now, {name}." if name else f"You're on {tier} now."
 
     feed_url = (
         f"{_settings.app_base_url}/dashboard/{subscriber.event_feed_uuid}"
@@ -438,7 +442,7 @@ def send_upgrade_confirmation_email(subscriber, db=None) -> bool:
         if founding else ""
     )
     body_text = (
-        f"Hi {name},\n\n"
+        f"{greeting}\n\n"
         f"Your plan has been upgraded to {tier} ({vertical}).\n"
         f"{founding_line}\n"
         f"Your new territory is locked and new leads will start appearing in your feed:\n"
@@ -467,7 +471,7 @@ def send_upgrade_confirmation_email(subscriber, db=None) -> bool:
         )
     )
     body_html = render_email_shell(
-        headline=f"You're on {tier} now, {name}.",
+        headline=headline_greeting,
         subhead=f"{tier} &middot; {vertical}",
         inner_html=inner_html,
         cta_text="Open My Event Feed",
