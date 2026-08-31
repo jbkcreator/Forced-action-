@@ -60,7 +60,7 @@ COURTLISTENER_PAGE_DELAY_SECONDS = 13.0
 COURTLISTENER_MAX_PAGES = 5
 # If CourtListener hands back a Retry-After longer than this, fail the run fast
 # (cron retries next cycle) rather than hang for hours or hammer into a longer ban.
-COURTLISTENER_MAX_RETRY_DELAY_SECONDS = 120
+COURTLISTENER_MAX_RETRY_DELAY_SECONDS = 600
 
 
 def fetch_bankruptcy_filings(lookback_days: int = 1, court_code: str = COURT_CODE_FLORIDA_MIDDLE_BANKRUPTCY) -> List[Dict[str, Any]]:

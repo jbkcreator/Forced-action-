@@ -100,6 +100,7 @@ async def _launch_edge(
 
     import sys as _sys
     xvfb_proc = None
+    _display_set = False
     if not headless and not os.environ.get("DISPLAY") and _sys.platform != "win32":
         try:
             xvfb_proc = _subprocess.Popen(
@@ -108,6 +109,7 @@ async def _launch_edge(
                 stderr=_subprocess.DEVNULL,
             )
             os.environ["DISPLAY"] = ":99"
+            _display_set = True
             await _asyncio.sleep(0.5)
         except FileNotFoundError:
             logger.warning("[cf_bypass] Xvfb not installed — falling back to headless "
@@ -142,6 +144,8 @@ async def _launch_edge(
                 xvfb_proc.wait(timeout=3)
             except Exception:
                 pass
+        if _display_set:
+            os.environ.pop("DISPLAY", None)
 
 
 @asynccontextmanager

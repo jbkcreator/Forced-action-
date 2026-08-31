@@ -222,6 +222,7 @@ async def _validate_profile(profile_name: str, portal_url: str) -> bool:
     )
 
     _xvfb_proc = None
+    _display_set = False
     if not _os.environ.get("DISPLAY") and _sys.platform != "win32":
         try:
             _xvfb_proc = _subprocess.Popen(
@@ -230,6 +231,7 @@ async def _validate_profile(profile_name: str, portal_url: str) -> bool:
                 stderr=_subprocess.DEVNULL,
             )
             _os.environ["DISPLAY"] = ":99"
+            _display_set = True
             await asyncio.sleep(0.5)
         except FileNotFoundError:
             pass
@@ -281,6 +283,8 @@ async def _validate_profile(profile_name: str, portal_url: str) -> bool:
                 _xvfb_proc.wait(timeout=3)
             except Exception:
                 pass
+        if _display_set:
+            _os.environ.pop("DISPLAY", None)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -317,6 +321,7 @@ async def _auto_warm(profile_name: str, portal_url: str) -> bool:
     import sys as _sys
     import subprocess as _subprocess
     _xvfb_proc = None
+    _display_set = False
     if not _os.environ.get("DISPLAY") and _sys.platform != "win32":
         try:
             _xvfb_proc = _subprocess.Popen(
@@ -325,6 +330,7 @@ async def _auto_warm(profile_name: str, portal_url: str) -> bool:
                 stderr=_subprocess.DEVNULL,
             )
             _os.environ["DISPLAY"] = ":99"
+            _display_set = True
             await asyncio.sleep(0.5)
             logger.info("[CFSess] %s: started Xvfb on :99 for nodriver headful warm", profile_name)
         except FileNotFoundError:
@@ -377,6 +383,8 @@ async def _auto_warm(profile_name: str, portal_url: str) -> bool:
                 _xvfb_proc.wait(timeout=3)
             except Exception:
                 pass
+        if _display_set:
+            _os.environ.pop("DISPLAY", None)
 
 
 def _patch_nodriver_cookie_parser() -> None:

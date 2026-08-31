@@ -174,6 +174,8 @@ async def run_browser_agent(task: str, headful: bool = False) -> tuple:
         disable_security=True,
         user_agent=STEALTH_UA,
         ignore_default_args=["--enable-automation"],
+        minimum_wait_page_load_time=3.0,
+        wait_between_actions=1.5,
         args=STEALTH_ARGS,
     )
     await browser.start()
