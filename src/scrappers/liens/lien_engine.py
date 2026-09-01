@@ -45,6 +45,7 @@ from config.constants import (
     BROWSER_MODEL,
     BROWSER_TEMPERATURE,
 )
+from src.utils.action_sequence import PlaywrightCodeError
 from src.utils.county_config import get_county_config
 from src.utils.http_helpers import (
     STEALTH_UA, STEALTH_ARGS, apply_stealth_to_browser_use,
@@ -481,6 +482,161 @@ async def _scrape_with_playwright(
 
 
 # ---------------------------------------------------------------------------
+# nodriver selector mode (scrape_mode in {"nodriver_only", "nodriver_then_ai"})
+# ---------------------------------------------------------------------------
+# Playwright's CDP automation fingerprint gets a fresh Cloudflare Turnstile
+# challenge on *every* navigation, even against an already-warmed persistent
+# Edge profile — cookie/profile reuse across engines stopped being enough
+# once Cloudflare tightened Turnstile enforcement on Pinellas Clerk's portal
+# (see docs/PINELLAS_CLOUDFLARE_BYPASS.md). nodriver is the only driver in
+# this codebase that reliably clears the challenge (same driver
+# cf_session_manager uses to warm/validate the profile).
+#
+# This function only launches the browser and hands off to the DB-stored
+# `playwright_code` for the actual portal scrape steps, exactly like
+# _scrape_with_playwright() does for the Playwright driver — see
+# docs/MULTI_COUNTY_SCRAPING_ARCHITECTURE.md Section 5. `execute_playwright_code()`
+# is driver-agnostic: it just calls the stored run_scrape(page, ...) with
+# whatever `page`-like object it's given, so a nodriver Tab works exactly like
+# a Playwright Page. Portal-specific selectors/steps belong in the stored
+# code (DB-editable, versioned, audited) — never hardcoded here.
+
+async def _scrape_with_nodriver(
+    playwright_code: str,
+    source: dict,
+    start_str: str,
+    end_str: str,
+    download_dir: Path,
+    cf_profile: dict,
+) -> tuple:
+    """Returns (df, outcome, error_message). outcome/error_message are None on
+    success (df not None) — mirrors run_browser_agent's (history, start_time,
+    error) triple so the caller can classify_exception()-quality failures
+    instead of guessing from a bare None (see ScraperOutcome)."""
+    import nodriver as uc
+    from src.utils.action_sequence import execute_playwright_code
+    from src.utils.cf_session_manager import _patch_nodriver_cookie_parser
+
+    _patch_nodriver_cookie_parser()
+
+    url = source.get("url", "")
+    county_id = source.get("county_id", "")
+    edge_path = cf_profile["edge_path"]
+    profile_dir = cf_profile["profile_dir"]
+
+    import os as _os
+    import subprocess as _subprocess
+    xvfb_proc = None
+    if not _os.environ.get("DISPLAY"):
+        try:
+            xvfb_proc = _subprocess.Popen(
+                ["Xvfb", ":99", "-screen", "0", "1920x1080x24"],
+                stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL,
+            )
+            _os.environ["DISPLAY"] = ":99"
+            await asyncio.sleep(0.5)
+            logger.info("[CF/ND] Started Xvfb on :99 for nodriver scrape")
+        except FileNotFoundError:
+            logger.warning("[CF/ND] Xvfb not installed — nodriver may hit a fresh CF challenge")
+
+    debug_dir = download_dir / "debug"
+
+    async def _dump_debug(page, label: str) -> None:
+        try:
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            shot = debug_dir / f"liens_nd_debug_{label}_{ts}.jpg"
+            html = debug_dir / f"liens_nd_debug_{label}_{ts}.html"
+            await page.save_screenshot(filename=str(shot), full_page=True)
+            content = await page.get_content()
+            html.write_text(content or "", encoding="utf-8")
+            logger.error("[CF/ND] Debug capture: %s | %s", shot, html)
+        except Exception as exc:
+            logger.warning("[CF/ND] Debug capture failed: %s", exc)
+
+    browser = None
+    page = None
+    try:
+        browser = await uc.start(
+            headless=False,
+            browser_executable_path=edge_path,
+            user_data_dir=profile_dir,
+        )
+        page = await browser.get(url)
+
+        df = await execute_playwright_code(
+            playwright_code,
+            page,
+            download_dir,
+            placeholders={"url": url, "start_date": start_str, "end_date": end_str},
+            county_id=county_id,
+        )
+        logger.info("[CF/ND] Scraped %d rows", len(df) if df is not None else 0)
+        return df, None, None
+    except PlaywrightCodeError as exc:
+        msg = str(exc)
+        if "CF_CHALLENGE_NOT_CLEARED" in msg:
+            # Not a code-quality failure — the stored scraper is fine, the
+            # warmed profile just went stale (see cf_session_manager's
+            # mark_failed_during_scrape). Do NOT clear_playwright_code() for
+            # this; the caller re-warms the profile on the next run instead.
+            # Cloudflare's own wall rejected the warmed profile — a
+            # source-side gate, same bucket as the cf_bypass_failed case
+            # above, not our internal bug or a bare timeout.
+            logger.error("[CF/ND] Turnstile challenge never cleared: %s", exc)
+            try:
+                from src.utils.cf_session_manager import mark_failed_during_scrape
+                mark_failed_during_scrape(
+                    source.get("cf_bypass_profile_name") or f"{county_id}_clerk",
+                    reason="turnstile_not_cleared",
+                )
+            except Exception:
+                logger.warning("[CF/ND] failed to mark profile expired (non-critical)")
+            outcome = ScraperOutcome.SOURCE_ERROR.value
+        else:
+            # A genuine code-quality failure (portal layout changed, download
+            # never landed, etc.) — follow the documented self-heal cycle:
+            # clear the stored code so an operator sees a to-do in
+            # playwright_code_history (reason="cleared") and the next run
+            # falls back to AI (nodriver_then_ai) or aborts (nodriver_only)
+            # until a human re-authors and re-approves fresh code. Bucketed
+            # as INTERNAL_ERROR — our stored selectors need a fix, same as
+            # column_mapping_failed / no_edge_binary above.
+            logger.error("[CF/ND] Stored playwright_code failed: %s", exc)
+            source_id = source.get("source_id")
+            if source_id is not None:
+                try:
+                    from src.utils.action_sequence import clear_playwright_code
+                    clear_playwright_code(county_id, source_id)
+                except Exception:
+                    logger.warning("[CF/ND] failed to clear playwright_code (non-critical)")
+            outcome = ScraperOutcome.INTERNAL_ERROR.value
+        if page is not None:
+            await _dump_debug(page, "code_error")
+        return None, outcome, msg[:500]
+    except Exception as e:
+        logger.error("[CF/ND] nodriver scrape failed: %s", e)
+        logger.debug(traceback.format_exc())
+        if page is not None:
+            await _dump_debug(page, "launch_error")
+        return None, classify_exception(e), str(e)[:500]
+    finally:
+        if browser is not None:
+            try:
+                result = browser.stop()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                pass
+        if xvfb_proc is not None:
+            try:
+                xvfb_proc.terminate()
+                xvfb_proc.wait(timeout=3)
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # Download file detection
 # ---------------------------------------------------------------------------
 
@@ -739,37 +895,70 @@ async def run_lien_pipeline(
 
             cf_profile = {"edge_path": edge_path, "profile_dir": str(profile_dir)}
 
-        # --- Playwright selector mode OR browser-use agent ----------------------
+        # --- Dispatch on scrape_mode (DB-driven — see
+        # docs/MULTI_COUNTY_SCRAPING_ARCHITECTURE.md Section 4/9) --------------
+        # nodriver_only / nodriver_then_ai: CF-protected portals (Cloudflare
+        #   Turnstile defeats Playwright's CDP fingerprint even on a warmed
+        #   profile) — same stored playwright_code contract, different browser
+        #   driver. playwright_only / playwright_then_ai: standard Playwright
+        #   selector mode. Both "_then_ai" variants fall back to the browser-use
+        #   agent on failure; both "_only" variants abort.
         playwright_code = source.get("playwright_code") or ""
         scrape_mode = source.get("scrape_mode", "")
         use_ai_fallback = False
 
-        if playwright_code and scrape_mode != "ai_only":
-            logger.info("[Pipeline] playwright_code found — using Playwright selector mode")
+        used_selector_mode = False
+        nd_outcome = nd_error = None
+        if scrape_mode in ("nodriver_only", "nodriver_then_ai") and playwright_code:
+            if cf_profile is None:
+                logger.error("[Pipeline] scrape_mode=%s requires cf_bypass_required=true", scrape_mode)
+                run.fail(
+                    ScraperOutcome.INTERNAL_ERROR.value,
+                    error_message=f"nodriver_mode_missing_cf_profile: scrape_mode={scrape_mode}",
+                )
+                return False
+            logger.info("[Pipeline] Using nodriver selector mode (%s)", scrape_mode)
+            df, nd_outcome, nd_error = await _scrape_with_nodriver(
+                playwright_code, source, start_str, end_str, RAW_LIEN_DIR, cf_profile=cf_profile,
+            )
+            used_selector_mode = True
+        elif scrape_mode in ("playwright_only", "playwright_then_ai") and playwright_code:
+            logger.info("[Pipeline] Using Playwright selector mode (%s)", scrape_mode)
             df = await _scrape_with_playwright(
                 playwright_code, source, start_str, end_str, RAW_LIEN_DIR,
                 headful=headful, cf_profile=cf_profile, no_proxy=no_proxy,
             )
+            used_selector_mode = True
+
+        if used_selector_mode:
             if df is None:
-                if scrape_mode == "playwright_then_ai":
+                if scrape_mode in ("nodriver_then_ai", "playwright_then_ai"):
                     logger.warning(
-                        "[Pipeline] Playwright failed for '%s' — falling back to browser-use AI agent",
+                        "[Pipeline] Selector scrape failed for '%s' — falling back to browser-use AI agent",
                         county_id,
                     )
                     use_ai_fallback = True
                 else:
-                    logger.error("[Pipeline] Playwright scrape failed")
-                    # _scrape_with_playwright swallows its own exception and
-                    # returns None either way — can't tell empty-but-clean
-                    # from actually-broken here.
-                    run.fail(ScraperOutcome.UNKNOWN.value, error_message="playwright_scrape_failed (ambiguous: empty result vs scrape failure)")
+                    logger.error("[Pipeline] Selector scrape failed")
+                    if nd_outcome is not None:
+                        # _scrape_with_nodriver classifies its own failures
+                        # (CF challenge vs stored-code bug) — trust it.
+                        run.fail(nd_outcome, error_message=nd_error)
+                    else:
+                        # _scrape_with_playwright swallows its own exception and
+                        # returns None either way — can't tell empty-but-clean
+                        # from actually-broken here.
+                        run.fail(
+                            ScraperOutcome.UNKNOWN.value,
+                            error_message="selector_scrape_failed (ambiguous: empty result vs scrape failure)",
+                        )
                     return False
             elif df.empty:
-                logger.info("[Pipeline] Playwright scrape returned no records")
+                logger.info("[Pipeline] Selector scrape returned no records")
                 run.no_data()
                 return True
 
-        if not playwright_code or scrape_mode == "ai_only" or use_ai_fallback:
+        if not used_selector_mode or use_ai_fallback:
             task = build_agent_task(source, start_str, end_str)
             history, start_time, agent_exc = await run_browser_agent(
                 task, RAW_LIEN_DIR,

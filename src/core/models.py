@@ -5262,8 +5262,16 @@ class CountySource(Base):
     special_flags: Mapped[Optional[dict]] = mapped_column(JSONB, default=dict)
     # Scrape-mode enum (DB-side CHECK constraint enforces values):
     #   ai_only            — browser-use Agent only
-    #   playwright_only    — execute cached playwright_code only; no AI fallback
-    #   playwright_then_ai — try cached code first, fall back to AI on failure
+    #   playwright_only    — execute cached playwright_code (Playwright driver) only; no AI fallback
+    #   playwright_then_ai — try cached code (Playwright driver) first, fall back to AI on failure
+    #   nodriver_only      — execute cached playwright_code (nodriver driver) only; no AI fallback
+    #   nodriver_then_ai   — try cached code (nodriver driver) first, fall back to AI on failure
+    #   nodriver_* is for CF-protected portals where Playwright's CDP fingerprint
+    #   re-triggers Cloudflare Turnstile even on a warmed profile (see
+    #   docs/MULTI_COUNTY_SCRAPING_ARCHITECTURE.md Section 4). The stored
+    #   playwright_code contract is identical either way — execute_playwright_code()
+    #   is driver-agnostic, it just hands the code whatever page-like object the
+    #   engine launched (Playwright Page or nodriver Tab).
     scrape_mode: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
@@ -5317,7 +5325,8 @@ class CountySource(Base):
         Index("idx_county_sources_signal_type", "signal_type"),
         Index("idx_county_sources_is_active", "is_active"),
         CheckConstraint(
-            "scrape_mode IN ('ai_only','playwright_only','playwright_then_ai','static_download','api')",
+            "scrape_mode IN ('ai_only','playwright_only','playwright_then_ai',"
+            "'nodriver_only','nodriver_then_ai','static_download','api')",
             name="ck_county_sources_scrape_mode",
         ),
         CheckConstraint(
