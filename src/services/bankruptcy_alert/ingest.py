@@ -56,6 +56,7 @@ class IngestResult:
     pages_read: int = 0
     success: bool = True
     error: Optional[str] = None
+    outcome: Optional[str] = None  # config.scraper_outcomes.ScraperOutcome value, set on failure
     new_filing_ids: list = field(default_factory=list)
 
 
@@ -221,12 +222,16 @@ def ingest_filings(
             result.duplicates, result.pages_read,
         )
     except (requests.HTTPError, requests.Timeout, requests.ConnectionError, requests.RequestException) as exc:
+        from src.utils.scraper_outcome_classifier import classify_exception
         result.success = False
         result.error = f"CourtListener API error: {exc}"
+        result.outcome = classify_exception(exc)
         logger.error("[bk-ingest] %s", result.error, exc_info=True)
     except Exception as exc:  # noqa: BLE001 — ingest must surface, not crash the cron
+        from src.utils.scraper_outcome_classifier import classify_exception
         result.success = False
         result.error = f"Unexpected ingest error: {exc}"
+        result.outcome = classify_exception(exc)
         logger.error("[bk-ingest] %s", result.error, exc_info=True)
 
     return result

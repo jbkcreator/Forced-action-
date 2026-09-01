@@ -22,10 +22,9 @@ import logging
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional, Tuple, List, Dict
 
-import requests
-
 from src.core.database import get_db_context
 from src.utils.county_config import get_county
+from src.utils.http_helpers import requests_get_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +55,7 @@ def _fetch_fema_declarations(state: str, county_fips: str, start_date: date) -> 
         f"&$orderby=declarationDate desc&$top=50&$format=json"
     )
     try:
-        resp = requests.get(url, headers={"Accept": "application/json"}, timeout=15)
+        resp = requests_get_with_retry(url, headers={"Accept": "application/json"}, timeout=25)
         resp.raise_for_status()
         return resp.json().get("DisasterDeclarationsSummaries", []), None
     except Exception as e:
@@ -64,7 +63,7 @@ def _fetch_fema_declarations(state: str, county_fips: str, start_date: date) -> 
         return [], str(e)
 
 
-def _fetch_nfip_claims(state: str, county_fips: str, start_date: date) -> Tuple[List[Tuple[str, date]], Optional[str]]:
+def _fetch_nfip_claims(state: str, county_fips: str, start_date: date) -> Tuple[List[Tuple[str, date]], Optional[BaseException]]:
     """
     Fetch FEMA NFIP paid flood-claim records for a state/county since start_date.
     Returns distinct (zip, date_of_loss) pairs.
@@ -85,9 +84,9 @@ def _fetch_nfip_claims(state: str, county_fips: str, start_date: date) -> Tuple[
         f"&$top=1000&$format=json"
     )
     pairs = set()
-    error = None
+    error: Optional[BaseException] = None
     try:
-        resp = requests.get(url, headers={"Accept": "application/json"}, timeout=20)
+        resp = requests_get_with_retry(url, headers={"Accept": "application/json"}, timeout=30)
         resp.raise_for_status()
         for claim in resp.json().get("FimaNfipClaims", []):
             zip_code = claim.get("reportedZipCode")
@@ -101,25 +100,28 @@ def _fetch_nfip_claims(state: str, county_fips: str, start_date: date) -> Tuple[
             pairs.add((str(zip_code)[:5], loss_date))
     except Exception as e:
         logger.warning("[flood] FEMA NFIP claims API failed: %s", e)
-        error = str(e)
+        error = e
     return sorted(pairs), error
 
 
-def _fetch_nws_flood_alerts_by_zones(zone_ids: List[str]) -> Tuple[List[Dict], List[str]]:
+def _fetch_nws_flood_alerts_by_zones(zone_ids: List[str]) -> Tuple[List[Dict], List[Tuple[str, BaseException]]]:
     """Fetch active NWS flood-event alert features for specific zone IDs.
 
-    Returns (features, failed_zone_ids). A zone that failed never checked for
-    alerts, so it must be surfaced even when other zones succeeded — a partial
-    outage is not the same as a clean run.
+    Returns (features, failed_zones) where failed_zones is [(zone_id, exc), ...] —
+    the real exception object per failed zone, not just its formatted string, so
+    the caller can classify what actually happened (src.utils.scraper_outcome_classifier)
+    instead of guessing from text. A zone that failed never checked for alerts, so
+    it must be surfaced even when other zones succeeded — a partial outage is not
+    the same as a clean run.
     """
     features = []
-    failed_zones = []
+    failed_zones: List[Tuple[str, BaseException]] = []
     for zone_id in zone_ids:
         try:
-            resp = requests.get(
+            resp = requests_get_with_retry(
                 _NWS_ZONE_URL.format(zone_id=zone_id),
                 headers={"User-Agent": "ForcedAction/1.0", "Accept": "application/geo+json"},
-                timeout=15,
+                timeout=20,
             )
             resp.raise_for_status()
             for feature in resp.json().get("features", []):
@@ -128,7 +130,7 @@ def _fetch_nws_flood_alerts_by_zones(zone_ids: List[str]) -> Tuple[List[Dict], L
                     features.append(feature)
         except Exception as e:
             logger.warning("[flood] NWS zone fetch failed for %s: %s", zone_id, e)
-            failed_zones.append(f"{zone_id}: {e}")
+            failed_zones.append((zone_id, e))
     return features, failed_zones
 
 
@@ -226,10 +228,10 @@ def scrape_flood_damage(
     # Source 2: NWS active flood alerts — idempotent backstop for nws_poll.
     if nws_zones:
         flood_features, failed_zones = _fetch_nws_flood_alerts_by_zones(nws_zones)
-        flood_error = "; ".join(failed_zones) if failed_zones else None
-        flood_total_fetch_failure = len(failed_zones) == len(nws_zones)
+        flood_error = "; ".join(f"{z}: {e}" for z, e in failed_zones) if failed_zones else None
+        nws_exc: Optional[BaseException] = failed_zones[0][1] if failed_zones else None
     else:
-        flood_features, flood_error, flood_total_fetch_failure = [], None, False
+        flood_features, flood_error, nws_exc = [], None, None
     if flood_features:
         from src.services.nws_webhook import process_alert
         with get_db_context() as db:
@@ -273,30 +275,70 @@ def scrape_flood_damage(
     )
     try:
         from src.utils.scraper_db_helper import record_scraper_stats
+        from src.utils.scraper_outcome_classifier import classify_exception
         _total = len(flood_features) + len(nfip_claims)
         # declarations_error deliberately excluded: FEMA disaster declarations
         # are informational-only (never counted in _total, see module
         # docstring), so a failure there alone must not affect classification
         # of NWS + NFIP — the two sources that DO count toward _total.
-        _fetch_error = "; ".join(e for e in (flood_error, nfip_error) if e) or None
+        _fetch_error = "; ".join(e for e in (flood_error, str(nfip_error) if nfip_error else None) if e) or None
         if _fetch_error:
             # A zone (or NFIP) fetch failed — real signals may have been
             # missed, so this can never be reported as a clean run or a
-            # confirmed no-data day, even if the other source succeeded.
-            record_scraper_stats(
-                source_type='flood_damage',
-                total_scraped=_total,
-                matched=tagged,
-                unmatched=0,
-                skipped=duplicates,
-                county_id=county_id,
-                # No NWS zones configured is equivalent to a total NWS failure
-                # here — either way NFIP is the only source left, so its
-                # failure alone must fail the run, not look like a clean one.
-                run_success=not ((not nws_zones or flood_total_fetch_failure) and nfip_error is not None),
-                error_type="scraper_error",
-                error_message=_fetch_error[:500],
-            )
+            # confirmed no-data day. But two independent sources feed this
+            # scraper (NWS zones, NFIP claims); if EITHER still produced real,
+            # confirmed coverage this run, that's a partial — not total —
+            # failure, and stays run_success=True by deliberate design (PR
+            # #232, tested in tests/test_weather_insurance_partial_fetch_errors.py)
+            # so Vera's freshness check doesn't treat a genuinely
+            # partial-but-useful run as "never ran." error_type='scraper_error'
+            # still drives real investigation regardless of run_success (see
+            # src/api/main.py:_classify_scraper_issues). outcome= is only
+            # passed (forcing the derived run_success) when NEITHER source
+            # contributed anything this run — a genuine total failure.
+            nws_covered = bool(nws_zones) and len(failed_zones) < len(nws_zones)
+            nfip_covered = nfip_error is None
+            is_total_failure = not nws_covered and not nfip_covered
+
+            if is_total_failure:
+                # NFIP preferred as the representative exception when both
+                # failed: it's the more complete signal per the module
+                # docstring (catches events that never triggered an active
+                # NWS alert), so its failure mode is the more informative one
+                # to classify and surface.
+                representative_exc = nfip_error or nws_exc
+                if representative_exc is not None:
+                    outcome = classify_exception(representative_exc)
+                else:
+                    # _fetch_error is truthy here, so this path should be
+                    # unreachable (flood_error/nfip_error only get set
+                    # alongside nws_exc/nfip_error being set too) — UNKNOWN
+                    # rather than a silent success if that assumption is ever
+                    # wrong.
+                    from config.scraper_outcomes import ScraperOutcome as _SO
+                    outcome = _SO.UNKNOWN.value
+                record_scraper_stats(
+                    source_type='flood_damage',
+                    total_scraped=_total,
+                    matched=tagged,
+                    unmatched=0,
+                    skipped=duplicates,
+                    county_id=county_id,
+                    outcome=outcome,
+                    error_message=_fetch_error[:500],
+                )
+            else:
+                record_scraper_stats(
+                    source_type='flood_damage',
+                    total_scraped=_total,
+                    matched=tagged,
+                    unmatched=0,
+                    skipped=duplicates,
+                    county_id=county_id,
+                    run_success=True,
+                    error_type='scraper_error',
+                    error_message=_fetch_error[:500],
+                )
         elif _total:
             record_scraper_stats(
                 source_type='flood_damage',
@@ -305,9 +347,9 @@ def scrape_flood_damage(
                 unmatched=0,
                 skipped=duplicates,
                 county_id=county_id,
-                error_type="none",
             )
         else:
+            from config.scraper_outcomes import ScraperOutcome
             record_scraper_stats(
                 source_type='flood_damage',
                 total_scraped=0,
@@ -315,7 +357,7 @@ def scrape_flood_damage(
                 unmatched=0,
                 skipped=0,
                 county_id=county_id,
-                error_type="no_data",
+                outcome=ScraperOutcome.NO_DATA.value,
             )
     except Exception as stats_err:
         logger.warning("⚠ Could not record scraper stats (non-critical): %s", stats_err)

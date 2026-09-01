@@ -35,6 +35,9 @@ from config.constants import (
 from src.utils.county_config import get_county_config
 from src.utils.logger import setup_logging, get_logger
 from src.utils.http_helpers import STEALTH_UA, STEALTH_ARGS, apply_stealth_to_browser_use
+from src.utils.scraper_run_tracking import scraper_run
+from src.utils.scraper_outcome_classifier import classify_exception
+from config.scraper_outcomes import ScraperOutcome
 
 setup_logging()
 logger = get_logger(__name__)
@@ -163,7 +166,10 @@ async def run_browser_agent(task: str, headful: bool = False) -> tuple:
     """
     Run a browser-use Agent that navigates the portal and returns extracted data.
 
-    Returns (history, None). Caller reads history.final_result() for the JSON payload.
+    Returns (history, error) — error is the real exception object if the agent
+    run itself raised, so the caller can classify what happened instead of
+    guessing from a bare None. Caller reads history.final_result() for the
+    JSON payload on success.
     """
     from browser_use import Agent, Browser
 
@@ -199,7 +205,7 @@ async def run_browser_agent(task: str, headful: bool = False) -> tuple:
     except Exception as e:
         logger.error("[Agent] Run failed: %s", e)
         logger.debug(traceback.format_exc())
-        return None, None
+        return None, e
 
 
 # ---------------------------------------------------------------------------
@@ -360,18 +366,6 @@ async def _scrape_with_playwright(
 
 
 # ---------------------------------------------------------------------------
-# Stats helper
-# ---------------------------------------------------------------------------
-
-def _record_stats(source_type: str, **kwargs):
-    try:
-        from src.utils.scraper_db_helper import record_scraper_stats
-        record_scraper_stats(source_type=source_type, **kwargs)
-    except Exception as e:
-        logger.warning("[Stats] Could not record scraper stats (non-critical): %s", e)
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -386,7 +380,9 @@ async def main(args):
         source = {"url": portal_url, "signal_type": "violations"}
 
     # PRR-only counties (e.g. Pinellas) require a manual public-records request —
-    # automated scraping is not possible; skip with a clear log.
+    # automated scraping is not possible; skip with a clear log. Not a scraper
+    # attempt at all, so no scraper_run_stats row (deliberate, permanent skip,
+    # not a failure or a no-data day).
     if source.get("prr_only"):
         logger.info(
             "[Main] %s violations source is PRR-only (manual public-records request required). "
@@ -395,139 +391,146 @@ async def main(args):
         )
         return
 
-    if args.end_date:
-        end_dt = datetime.strptime(args.end_date, "%Y-%m-%d")
-    else:
-        end_dt = datetime.now()
-    if args.start_date:
-        start_dt = datetime.strptime(args.start_date, "%Y-%m-%d")
-    else:
-        start_dt = end_dt - timedelta(days=1)
+    with scraper_run("violations", county_id) as run:
+        if args.end_date:
+            end_dt = datetime.strptime(args.end_date, "%Y-%m-%d")
+        else:
+            end_dt = datetime.now()
+        if args.start_date:
+            start_dt = datetime.strptime(args.start_date, "%Y-%m-%d")
+        else:
+            start_dt = end_dt - timedelta(days=1)
 
-    start_str = start_dt.strftime("%m/%d/%Y")
-    end_str = end_dt.strftime("%m/%d/%Y")
+        start_str = start_dt.strftime("%m/%d/%Y")
+        end_str = end_dt.strftime("%m/%d/%Y")
 
-    download_dir = RAW_VIOLATIONS_DIR / county_id
-    download_dir.mkdir(parents=True, exist_ok=True)
+        download_dir = RAW_VIOLATIONS_DIR / county_id
+        download_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info("=" * 60)
-    logger.info("%s CODE VIOLATIONS — DATA COLLECTION", county_cfg["display_name"].upper())
-    logger.info("Date range: %s → %s", start_str, end_str)
-    logger.info("=" * 60)
-
-    scrape_mode = source.get("scrape_mode", "ai_only")
-    logger.info("[Main] scrape_mode=%s", scrape_mode)
-
-    df = None
-
-    if scrape_mode in ("playwright_only", "playwright_then_ai"):
-        playwright_code = source.get("playwright_code")
-        if playwright_code:
-            raw_df = await _scrape_with_playwright(
-                playwright_code, source, start_str, end_str, download_dir,
-                headful=args.headful, county_id=county_id,
-            )
-            if raw_df is not None and not raw_df.empty:
-                df = _normalize_columns(raw_df.to_dict("records"), source)
-
-        if df is None and scrape_mode == "playwright_only":
-            logger.warning("[Main] playwright_only returned no data — aborting (no AI fallback)")
-            return
-
-    if df is None:  # ai_only, or playwright_then_ai falling back to agent
-        if scrape_mode == "playwright_then_ai":
-            logger.info("[Main] Playwright returned no data — falling back to browser-use agent")
-        task = build_agent_task(source, start_str, end_str)
-        history, _ = await run_browser_agent(task, headful=args.headful)
-
-        if history is None:
-            logger.error("[Main] Agent run returned no history — aborting")
-            return
-
-        final_result = history.final_result()
-        if not final_result:
-            logger.error("[Main] Agent returned empty result — aborting")
-            return
-
-        logger.info("[Main] Agent result length: %d chars", len(str(final_result)))
-        rows = _parse_agent_result(str(final_result))
-
-        if not rows:
-            logger.info("[Main] 0 violation records extracted for this date range")
-            return
-
-        df = _normalize_columns(rows, source)
-
-    logger.info("[Main] %d total records after normalization", len(df))
-
-    today_str = datetime.now().strftime("%Y%m%d")
-    out_dir = RAW_VIOLATIONS_DIR / county_id / "new"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = out_dir / f"violations_{county_id}_{today_str}.csv"
-    df.to_csv(csv_path, index=False)
-    logger.info("[Main] Saved %d records → %s", len(df), csv_path)
-
-    if not args.load_to_db:
-        logger.info("[Main] Skipping DB load (pass --load-to-db to enable)")
-        return
-
-    logger.info("[Main] Loading violations into database...")
-    from src.core.database import get_db_context
-    from src.loaders.violations import ViolationLoader
-
-    try:
-        with get_db_context() as session:
-            loader = ViolationLoader(session, county_id)
-            matched, unmatched, skipped = loader.load_from_csv(
-                str(csv_path),
-                skip_duplicates=True,
-            )
-            session.commit()
-
-        total = matched + unmatched + skipped
-        match_rate = (matched / total * 100) if total > 0 else 0
         logger.info("=" * 60)
-        logger.info("DATABASE LOAD SUMMARY")
-        logger.info("  Matched:    %6d", matched)
-        logger.info("  Unmatched:  %6d", unmatched)
-        logger.info("  Skipped:    %6d", skipped)
-        logger.info("  Match Rate: %5.1f%%", match_rate)
+        logger.info("%s CODE VIOLATIONS — DATA COLLECTION", county_cfg["display_name"].upper())
+        logger.info("Date range: %s → %s", start_str, end_str)
         logger.info("=" * 60)
 
-        # Rescore affected properties
+        scrape_mode = source.get("scrape_mode", "ai_only")
+        logger.info("[Main] scrape_mode=%s", scrape_mode)
+
+        df = None
+
+        if scrape_mode in ("playwright_only", "playwright_then_ai"):
+            playwright_code = source.get("playwright_code")
+            if playwright_code:
+                raw_df = await _scrape_with_playwright(
+                    playwright_code, source, start_str, end_str, download_dir,
+                    headful=args.headful, county_id=county_id,
+                )
+                if raw_df is not None and not raw_df.empty:
+                    df = _normalize_columns(raw_df.to_dict("records"), source)
+
+            if df is None and scrape_mode == "playwright_only":
+                logger.warning("[Main] playwright_only returned no data — aborting (no AI fallback)")
+                # _scrape_with_playwright collapses "ran clean, 0 rows" and "code
+                # broke" into the same None — can't tell which happened here.
+                run.fail(
+                    ScraperOutcome.UNKNOWN.value,
+                    error_message="playwright_only mode returned no data (ambiguous: empty result vs scrape failure)",
+                )
+                return
+
+        if df is None:  # ai_only, or playwright_then_ai falling back to agent
+            if scrape_mode == "playwright_then_ai":
+                logger.info("[Main] Playwright returned no data — falling back to browser-use agent")
+            task = build_agent_task(source, start_str, end_str)
+            history, agent_exc = await run_browser_agent(task, headful=args.headful)
+
+            if history is None:
+                logger.error("[Main] Agent run returned no history — aborting")
+                outcome = classify_exception(agent_exc) if agent_exc is not None else ScraperOutcome.UNKNOWN.value
+                run.fail(
+                    outcome,
+                    error_message=str(agent_exc)[:500] if agent_exc is not None else "agent run failed with no exception captured",
+                )
+                return
+
+            final_result = history.final_result()
+            if not final_result:
+                logger.error("[Main] Agent returned empty result — aborting")
+                run.no_data()
+                return
+
+            logger.info("[Main] Agent result length: %d chars", len(str(final_result)))
+            rows = _parse_agent_result(str(final_result))
+
+            if not rows:
+                logger.info("[Main] 0 violation records extracted for this date range")
+                run.no_data()
+                return
+
+            df = _normalize_columns(rows, source)
+
+        logger.info("[Main] %d total records after normalization", len(df))
+
+        today_str = datetime.now().strftime("%Y%m%d")
+        out_dir = RAW_VIOLATIONS_DIR / county_id / "new"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = out_dir / f"violations_{county_id}_{today_str}.csv"
+        df.to_csv(csv_path, index=False)
+        logger.info("[Main] Saved %d records → %s", len(df), csv_path)
+
+        if not args.load_to_db:
+            logger.info("[Main] Skipping DB load (pass --load-to-db to enable)")
+            run.success(total_scraped=len(df))
+            return
+
+        logger.info("[Main] Loading violations into database...")
+        from src.core.database import get_db_context
+        from src.loaders.violations import ViolationLoader
+
         try:
             with get_db_context() as session:
-                loader2 = ViolationLoader(session, county_id)
-            affected_ids = loader.get_affected_property_ids() if hasattr(loader, "get_affected_property_ids") else []
-            if affected_ids:
-                logger.info("[Rescore] Triggering CDS rescore for %d properties...", len(affected_ids))
-                from src.services.cds_engine import MultiVerticalScorer
-                with get_db_context() as score_session:
-                    scorer = MultiVerticalScorer(score_session)
-                    scorer.score_properties_by_ids(affected_ids, save_to_db=True, county_id=county_id)
-                    score_session.commit()
-                logger.info("[Rescore] CDS rescore completed")
-        except Exception as score_err:
-            logger.warning("[Rescore] CDS rescore failed (non-critical): %s", score_err)
+                loader = ViolationLoader(session, county_id)
+                matched, unmatched, skipped = loader.load_from_csv(
+                    str(csv_path),
+                    skip_duplicates=True,
+                )
+                session.commit()
 
-        _record_stats(
-            source_type="violations",
-            county_id=county_id,
-            total_scraped=total,
-            matched=matched,
-            unmatched=unmatched,
-            skipped=skipped,
-        )
+            total = matched + unmatched + skipped
+            match_rate = (matched / total * 100) if total > 0 else 0
+            logger.info("=" * 60)
+            logger.info("DATABASE LOAD SUMMARY")
+            logger.info("  Matched:    %6d", matched)
+            logger.info("  Unmatched:  %6d", unmatched)
+            logger.info("  Skipped:    %6d", skipped)
+            logger.info("  Match Rate: %5.1f%%", match_rate)
+            logger.info("=" * 60)
 
-        try:
-            csv_path.unlink()
-            logger.info("[Main] CSV deleted after successful DB insertion")
-        except Exception:
-            pass
+            # Rescore affected properties
+            try:
+                affected_ids = loader.get_affected_property_ids() if hasattr(loader, "get_affected_property_ids") else []
+                if affected_ids:
+                    logger.info("[Rescore] Triggering CDS rescore for %d properties...", len(affected_ids))
+                    from src.services.cds_engine import MultiVerticalScorer
+                    with get_db_context() as score_session:
+                        scorer = MultiVerticalScorer(score_session)
+                        scorer.score_properties_by_ids(affected_ids, save_to_db=True, county_id=county_id)
+                        score_session.commit()
+                    logger.info("[Rescore] CDS rescore completed")
+            except Exception as score_err:
+                logger.warning("[Rescore] CDS rescore failed (non-critical): %s", score_err)
 
-    except Exception as e:
-        logger.error("[Main] DB load failed: %s", e)
-        logger.debug(traceback.format_exc())
+            run.success(total_scraped=total, matched=matched, unmatched=unmatched, skipped=skipped)
+
+            try:
+                csv_path.unlink()
+                logger.info("[Main] CSV deleted after successful DB insertion")
+            except Exception:
+                pass
+
+        except Exception as e:
+            logger.error("[Main] DB load failed: %s", e)
+            logger.debug(traceback.format_exc())
+            run.fail(classify_exception(e), error_message=str(e)[:500])
 
 
 if __name__ == "__main__":

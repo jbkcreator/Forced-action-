@@ -335,6 +335,7 @@ def _log_run_stats(
     rate_limited: bool = False, remaining_unprocessed: int = 0,
 ) -> None:
     from src.utils.scraper_db_helper import record_scraper_stats
+    from config.scraper_outcomes import ScraperOutcome
 
     total = updated + skipped + errors
     try:
@@ -343,6 +344,11 @@ def _log_run_stats(
             # repeated hard failures. Untouched properties stay
             # hcpa_last_refreshed unset/stale and are picked up automatically
             # by tomorrow's new-only/refresh run.
+            # outcome deliberately omitted (same shape as sunbiz_engine.py's
+            # sunbiz_run_verdict rate_limited branch): passing SOURCE_ERROR
+            # here would force run_success=False via derive_run_success,
+            # regressing this branch's deliberate "informational, resumes
+            # next run" design.
             record_scraper_stats(
                 source_type="property_appraiser",
                 total_scraped=total,
@@ -374,6 +380,12 @@ def _log_run_stats(
                 skipped=skipped,
                 run_success=run_success,
                 error_type=None if run_success else "scraper_error",
+                # No live exception here — errors is an aggregate per-parcel
+                # failure count from many independent scrape attempts (see
+                # the ThreadPoolExecutor loop above), not one classifiable
+                # exception. SOURCE_ERROR fits the site-wide-failure framing
+                # of the existing error_message better than UNKNOWN would.
+                outcome=None if run_success else ScraperOutcome.SOURCE_ERROR.value,
                 error_message=(
                     None if run_success else
                     f"{errors} of {total} parcel(s) failed to scrape ({failure_rate:.0%} failure rate)"

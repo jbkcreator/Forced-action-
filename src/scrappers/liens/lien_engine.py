@@ -51,6 +51,9 @@ from src.utils.http_helpers import (
     get_playwright_proxy, get_browser_use_proxy,
 )
 from src.utils.logger import setup_logging, get_logger
+from src.utils.scraper_run_tracking import scraper_run
+from src.utils.scraper_outcome_classifier import classify_exception
+from config.scraper_outcomes import ScraperOutcome
 
 setup_logging()
 logger = get_logger(__name__)
@@ -225,7 +228,9 @@ async def run_browser_agent(
       - No proxy, no stealth init script — both would disturb the fingerprint
         Cloudflare hashed when issuing the cookie.
 
-    Returns (history, start_time).
+    Returns (history, start_time, error) — error is the real exception object
+    if the agent run itself raised, so the caller can classify what happened
+    instead of guessing from a bare None.
     """
     from browser_use import Agent, Browser
 
@@ -294,11 +299,11 @@ async def run_browser_agent(
         history = await agent.run()
         if not history.is_done():
             logger.warning("[Agent] Agent did not complete within step budget")
-        return history, start_time
+        return history, start_time, None
     except Exception as e:
         logger.error("[Agent] Run failed: %s", e)
         logger.debug(traceback.format_exc())
-        return None, start_time
+        return None, start_time, e
 
 
 # ---------------------------------------------------------------------------
@@ -690,156 +695,167 @@ async def run_lien_pipeline(
         logger.info("[%s] Liens source is PRR-only — load CSV manually", county_id)
         return False
 
-    _today    = datetime.now()
-    _end_dt   = datetime.strptime(end_date,   "%Y-%m-%d") if end_date   else _today
-    _start_dt = datetime.strptime(start_date, "%Y-%m-%d") if start_date else _end_dt
-    start_str = _start_dt.strftime("%m/%d/%Y")
-    end_str   = _end_dt.strftime("%m/%d/%Y")
+    with scraper_run("lien_unknown", county_id) as run:
+        _today    = datetime.now()
+        _end_dt   = datetime.strptime(end_date,   "%Y-%m-%d") if end_date   else _today
+        _start_dt = datetime.strptime(start_date, "%Y-%m-%d") if start_date else _end_dt
+        start_str = _start_dt.strftime("%m/%d/%Y")
+        end_str   = _end_dt.strftime("%m/%d/%Y")
 
-    cf_required = bool(source.get("cf_bypass_required"))
+        cf_required = bool(source.get("cf_bypass_required"))
 
-    logger.info("=" * 70)
-    logger.info("LIEN/DEED/JUDGMENT PIPELINE — %s", county_cfg["display_name"].upper())
-    logger.info("Date range: %s → %s  headful=%s  load_to_db=%s  cf_bypass=%s",
-                start_str, end_str, headful, load_to_db, cf_required)
-    logger.info("=" * 70)
+        logger.info("=" * 70)
+        logger.info("LIEN/DEED/JUDGMENT PIPELINE — %s", county_cfg["display_name"].upper())
+        logger.info("Date range: %s → %s  headful=%s  load_to_db=%s  cf_bypass=%s",
+                    start_str, end_str, headful, load_to_db, cf_required)
+        logger.info("=" * 70)
 
-    # --- Warm / validate Cloudflare profile if portal requires it ------------
-    cf_profile: Optional[dict] = None
-    if cf_required:
-        from src.utils.cf_session_manager import ensure_ready, CFBypassFailedError
-        from src.utils.cf_persistent_browser import find_edge_binary, profile_dir_for
+        # --- Warm / validate Cloudflare profile if portal requires it ------------
+        cf_profile: Optional[dict] = None
+        if cf_required:
+            from src.utils.cf_session_manager import ensure_ready, CFBypassFailedError
+            from src.utils.cf_persistent_browser import find_edge_binary, profile_dir_for
 
-        profile_name = source.get("cf_bypass_profile_name") or f"{county_id}_clerk"
-        portal_url = source.get("url", "")
-        try:
-            profile_dir = await ensure_ready(
-                profile_name=profile_name,
-                county_id=county_id,
-                portal_url=portal_url,
-            )
-        except CFBypassFailedError as exc:
-            logger.error("[CF] Profile unusable for %s: %s", profile_name, exc)
-            _record_stats(0, False, _t0, county_id, error=f"cf_bypass_failed: {exc}")
-            return False
-
-        edge_path = find_edge_binary()
-        if not edge_path:
-            logger.error("[CF] No Edge binary found — set CF_BYPASS_BROWSER_PATH")
-            _record_stats(0, False, _t0, county_id, error="no_edge_binary")
-            return False
-
-        cf_profile = {"edge_path": edge_path, "profile_dir": str(profile_dir)}
-
-    # --- Playwright selector mode OR browser-use agent ----------------------
-    playwright_code = source.get("playwright_code") or ""
-    scrape_mode = source.get("scrape_mode", "")
-    use_ai_fallback = False
-
-    if playwright_code and scrape_mode != "ai_only":
-        logger.info("[Pipeline] playwright_code found — using Playwright selector mode")
-        df = await _scrape_with_playwright(
-            playwright_code, source, start_str, end_str, RAW_LIEN_DIR,
-            headful=headful, cf_profile=cf_profile, no_proxy=no_proxy,
-        )
-        if df is None:
-            if scrape_mode == "playwright_then_ai":
-                logger.warning(
-                    "[Pipeline] Playwright failed for '%s' — falling back to browser-use AI agent",
-                    county_id,
+            profile_name = source.get("cf_bypass_profile_name") or f"{county_id}_clerk"
+            portal_url = source.get("url", "")
+            try:
+                profile_dir = await ensure_ready(
+                    profile_name=profile_name,
+                    county_id=county_id,
+                    portal_url=portal_url,
                 )
-                use_ai_fallback = True
-            else:
-                logger.error("[Pipeline] Playwright scrape failed")
-                _record_stats(0, False, _t0, county_id, error="playwright_scrape_failed")
+            except CFBypassFailedError as exc:
+                logger.error("[CF] Profile unusable for %s: %s", profile_name, exc)
+                # Cloudflare's own anti-bot wall rejected the warmed profile —
+                # a source-side gate, not our internal bug or a bare timeout.
+                run.fail(ScraperOutcome.SOURCE_ERROR.value, error_message=f"cf_bypass_failed: {exc}"[:500])
                 return False
-        elif df.empty:
-            logger.info("[Pipeline] Playwright scrape returned no records")
-            _record_stats(0, True, _t0, county_id)
-            return True
 
-    if not playwright_code or scrape_mode == "ai_only" or use_ai_fallback:
-        task = build_agent_task(source, start_str, end_str)
-        history, start_time = await run_browser_agent(
-            task, RAW_LIEN_DIR,
-            headful=headful,
-            cf_profile=cf_profile,
-            no_proxy=no_proxy,
-        )
+            edge_path = find_edge_binary()
+            if not edge_path:
+                logger.error("[CF] No Edge binary found — set CF_BYPASS_BROWSER_PATH")
+                run.fail(ScraperOutcome.INTERNAL_ERROR.value, error_message="no_edge_binary: CF_BYPASS_BROWSER_PATH not set")
+                return False
 
-        if history is None:
-            logger.error("[Pipeline] Agent failed to run")
-            _record_stats(0, False, _t0, county_id, error="Agent run failed")
-            return False
+            cf_profile = {"edge_path": edge_path, "profile_dir": str(profile_dir)}
 
-        await asyncio.sleep(5)
+        # --- Playwright selector mode OR browser-use agent ----------------------
+        playwright_code = source.get("playwright_code") or ""
+        scrape_mode = source.get("scrape_mode", "")
+        use_ai_fallback = False
 
-        downloaded_file = _locate_download(RAW_LIEN_DIR, start_time)
-        if not downloaded_file:
-            logger.error("[Pipeline] No download detected after agent run")
-            _record_stats(0, False, _t0, county_id, error="No download file found")
-            return False
+        if playwright_code and scrape_mode != "ai_only":
+            logger.info("[Pipeline] playwright_code found — using Playwright selector mode")
+            df = await _scrape_with_playwright(
+                playwright_code, source, start_str, end_str, RAW_LIEN_DIR,
+                headful=headful, cf_profile=cf_profile, no_proxy=no_proxy,
+            )
+            if df is None:
+                if scrape_mode == "playwright_then_ai":
+                    logger.warning(
+                        "[Pipeline] Playwright failed for '%s' — falling back to browser-use AI agent",
+                        county_id,
+                    )
+                    use_ai_fallback = True
+                else:
+                    logger.error("[Pipeline] Playwright scrape failed")
+                    # _scrape_with_playwright swallows its own exception and
+                    # returns None either way — can't tell empty-but-clean
+                    # from actually-broken here.
+                    run.fail(ScraperOutcome.UNKNOWN.value, error_message="playwright_scrape_failed (ambiguous: empty result vs scrape failure)")
+                    return False
+            elif df.empty:
+                logger.info("[Pipeline] Playwright scrape returned no records")
+                run.no_data()
+                return True
 
+        if not playwright_code or scrape_mode == "ai_only" or use_ai_fallback:
+            task = build_agent_task(source, start_str, end_str)
+            history, start_time, agent_exc = await run_browser_agent(
+                task, RAW_LIEN_DIR,
+                headful=headful,
+                cf_profile=cf_profile,
+                no_proxy=no_proxy,
+            )
+
+            if history is None:
+                logger.error("[Pipeline] Agent failed to run")
+                outcome = classify_exception(agent_exc) if agent_exc is not None else ScraperOutcome.UNKNOWN.value
+                run.fail(outcome, error_message=str(agent_exc)[:500] if agent_exc is not None else "agent run failed with no exception captured")
+                return False
+
+            await asyncio.sleep(5)
+
+            downloaded_file = _locate_download(RAW_LIEN_DIR, start_time)
+            if not downloaded_file:
+                logger.error("[Pipeline] No download detected after agent run")
+                run.fail(ScraperOutcome.UNKNOWN.value, error_message="agent completed but no downloaded file was located")
+                return False
+
+            try:
+                df = process_lien_data(downloaded_file)
+            except Exception as e:
+                logger.error("[Pipeline] Failed to process downloaded file: %s", e)
+                run.fail(classify_exception(e), error_message=str(e)[:500])
+                return False
+
+            if df.empty:
+                logger.info("[Pipeline] Downloaded file is empty — no records for this date range")
+                run.no_data()
+                return True
+
+        # Resolve the ColumnMapping for this source. Renames, BookPage split, doc-
+        # type value normalisation, and row routing all happen inside ColumnMapper.
+        from src.loaders.column_mapper import ColumnMapper, NeedsMappingError, SkipMapping
+        source_id = source.get("source_id")
         try:
-            df = process_lien_data(downloaded_file)
-        except Exception as e:
-            logger.error("[Pipeline] Failed to process downloaded file: %s", e)
-            _record_stats(0, False, _t0, county_id, error=str(e))
+            mapper = ColumnMapper()
+            # Trigger the LLM auto-map only when no approved/pending mapping exists
+            # for this source. The synthesized migration row keeps the legacy
+            # Hillsborough / Pinellas configs working without an LLM call.
+            mapper.get_or_create("liens", source_id, df)
+            # Pass the scraped columns so a stale approved mapping (different shape)
+            # falls back to a matching pending row instead of being returned as-is.
+            mapping_row = ColumnMapper.fetch_mapping_row(
+                source_id, raw_cols=list(df.columns)
+            )
+        except (NeedsMappingError, SkipMapping) as exc:
+            logger.error("[Pipeline] ColumnMapper unavailable: %s", exc)
+            # Missing/broken admin-configured mapping — our-side setup issue.
+            run.fail(ScraperOutcome.INTERNAL_ERROR.value, error_message=f"column_mapping_failed: {exc}"[:500])
             return False
 
-        if df.empty:
-            logger.info("[Pipeline] Downloaded file is empty — no records for this date range")
-            _record_stats(0, True, _t0, county_id)
-            return True
+        if mapping_row is None:
+            logger.error("[Pipeline] No CountyColumnMapping for source_id=%s", source_id)
+            run.fail(ScraperOutcome.INTERNAL_ERROR.value, error_message="no_column_mapping")
+            return False
 
-    # Resolve the ColumnMapping for this source. Renames, BookPage split, doc-
-    # type value normalisation, and row routing all happen inside ColumnMapper.
-    from src.loaders.column_mapper import ColumnMapper, NeedsMappingError, SkipMapping
-    source_id = source.get("source_id")
-    try:
-        mapper = ColumnMapper()
-        # Trigger the LLM auto-map only when no approved/pending mapping exists
-        # for this source. The synthesized migration row keeps the legacy
-        # Hillsborough / Pinellas configs working without an LLM call.
-        mapper.get_or_create("liens", source_id, df)
-        # Pass the scraped columns so a stale approved mapping (different shape)
-        # falls back to a matching pending row instead of being returned as-is.
-        mapping_row = ColumnMapper.fetch_mapping_row(
-            source_id, raw_cols=list(df.columns)
+        buckets = ColumnMapper.apply_transformations(df, mapping_row)
+        logger.info(
+            "[Pipeline] Routed %d records into %d buckets: %s",
+            sum(len(b) for b in buckets.values()),
+            len(buckets),
+            {k: len(v) for k, v in buckets.items()},
         )
-    except (NeedsMappingError, SkipMapping) as exc:
-        logger.error("[Pipeline] ColumnMapper unavailable: %s", exc)
-        _record_stats(0, False, _t0, county_id, error=f"column_mapping_failed: {exc}")
-        return False
 
-    if mapping_row is None:
-        logger.error("[Pipeline] No CountyColumnMapping for source_id=%s", source_id)
-        _record_stats(0, False, _t0, county_id, error="no_column_mapping")
-        return False
+        file_counts = _save_buckets(buckets, county_cfg)
+        total = sum(file_counts.values())
 
-    buckets = ColumnMapper.apply_transformations(df, mapping_row)
-    logger.info(
-        "[Pipeline] Routed %d records into %d buckets: %s",
-        sum(len(b) for b in buckets.values()),
-        len(buckets),
-        {k: len(v) for k, v in buckets.items()},
-    )
+        logger.info("=" * 70)
+        logger.info("LIEN PIPELINE COMPLETE — %d records categorised", total)
+        logger.info("=" * 70)
 
-    file_counts = _save_buckets(buckets, county_cfg)
-    total = sum(file_counts.values())
-
-    logger.info("=" * 70)
-    logger.info("LIEN PIPELINE COMPLETE — %d records categorised", total)
-    logger.info("=" * 70)
-
-    if load_to_db:
-        # Per-subtype stats are written inside _load_to_database via
-        # scraper_db_helper:_record_load_stats — one row each for
-        # lien_tcl/lien_ccl/lien_hoa/lien_ml/lien_tl/lis_pendens plus
-        # 'no_data' rows for absent subtypes. Calling _record_stats here
-        # would write a duplicate aggregate that clobbers them via the
-        # (run_date, source_type, county_id) upsert.
-        _load_to_database(county_id, _t0)
+        if load_to_db:
+            # Per-subtype stats are written inside _load_to_database via
+            # scraper_db_helper:_record_load_stats — one row each for
+            # lien_tcl/lien_ccl/lien_hoa/lien_ml/lien_tl/lis_pendens plus
+            # 'no_data' rows for absent subtypes. Suppress the wrapper's own
+            # completion write so it doesn't clobber those via the
+            # (run_date, source_type, county_id) upsert.
+            _load_to_database(county_id, _t0)
+            run.suppress_completion_write()
+        else:
+            run.success(total_scraped=total)
 
     return True
 
@@ -871,41 +887,6 @@ def _load_to_database(county_id: str, t0: float) -> None:
         else:
             logger.info("[DB] No new %s records to load", label)
 
-
-
-def _record_stats(total: int, success: bool, t0: float, county_id: str,
-                  source_type: str = "lien_unknown", error: str = None):
-    """Record a single scraper_run_stats row.
-
-    source_type defaults to 'lien_unknown' so engine-level failures (CF bypass,
-    column mapping, etc.) that happen before any subtype is known surface as a
-    visible non-zero row.  Real per-subtype stats are written by the breakdown
-    path in src/utils/scraper_db_helper.py:_record_load_stats — this function
-    must NOT be called on the success path or it would clobber those rows via
-    the (run_date, source_type, county_id) unique constraint.
-    """
-    try:
-        from src.utils.scraper_db_helper import record_scraper_stats
-        kwargs = dict(
-            source_type=source_type,
-            total_scraped=total,
-            matched=0,
-            unmatched=0,
-            skipped=0,
-            run_success=success,
-            duration_seconds=round(time.monotonic() - t0, 2),
-            county_id=county_id,
-        )
-        if success and total == 0:
-            # Genuine zero-result run (e.g. Playwright/AI scrape completed
-            # cleanly but found no records) — distinguish from a real failure
-            # so Vera doesn't page on a legitimate no-data day.
-            kwargs["error_type"] = "no_data"
-        if error:
-            kwargs["error_message"] = error[:500]
-        record_scraper_stats(**kwargs)
-    except Exception as e:
-        logger.warning("[Stats] Could not record scraper stats: %s", e)
 
 
 # ---------------------------------------------------------------------------

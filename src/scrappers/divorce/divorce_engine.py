@@ -441,13 +441,15 @@ def run_divorce_pipeline(
                 "[divorce] Pinellas civil filing export unavailable this run "
                 "(Excel export/grid did not load in time) — 0 cases collected"
             )
-            _record_stats(0, 0, 0, 0, False, t0, county_id, error="export_unavailable")
+            from config.scraper_outcomes import ScraperOutcome
+            _record_stats(0, 0, 0, 0, False, t0, county_id, error="export_unavailable", outcome=ScraperOutcome.TIMEOUT.value)
             return False
         df = filter_divorce_cases(file_path, county_id=county_id)
 
         if df.empty:
             logger.info("[divorce] No dissolution-of-marriage cases in today's civil filing")
-            _record_stats(0, 0, 0, 0, True, t0, county_id)
+            from config.scraper_outcomes import ScraperOutcome
+            _record_stats(0, 0, 0, 0, True, t0, county_id, outcome=ScraperOutcome.NO_DATA.value)
             return True
 
         if "CaseNumber" in df.columns and "Case Number" not in df.columns:
@@ -473,11 +475,18 @@ def run_divorce_pipeline(
     except Exception as exc:
         logger.error("[divorce] Pipeline failed: %s", exc)
         logger.debug(traceback.format_exc())
-        _record_stats(0, 0, 0, 0, False, t0, county_id, error=str(exc))
+        from src.utils.scraper_outcome_classifier import classify_exception
+        # success=None (not False) on purpose: a ScraperNoDataError
+        # (download_latest_civil_filing's "no civil filing found for date")
+        # legitimately reaches this branch, and record_scraper_stats derives
+        # the real run_success from outcome= below — passing None instead of
+        # a hardcoded False avoids a spurious mismatch warning on that path
+        # while every other exception still correctly derives to False.
+        _record_stats(0, 0, 0, 0, None, t0, county_id, error=str(exc), outcome=classify_exception(exc))
         return False
 
 
-def _record_stats(total, matched, skipped, unmatched, success, t0, county_id, error=None):
+def _record_stats(total, matched, skipped, unmatched, success, t0, county_id, error=None, outcome=None):
     try:
         from src.utils.scraper_db_helper import record_scraper_stats
         kwargs = dict(
@@ -487,6 +496,7 @@ def _record_stats(total, matched, skipped, unmatched, success, t0, county_id, er
             unmatched=unmatched,
             skipped=skipped,
             run_success=success,
+            outcome=outcome,
             duration_seconds=round(time.monotonic() - t0, 2),
             county_id=county_id,
         )

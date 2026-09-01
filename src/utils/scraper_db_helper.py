@@ -89,12 +89,13 @@ def record_scraper_stats(
     unmatched: int,
     skipped: int,
     scored: int = 0,
-    run_success: bool = True,
+    run_success: Optional[bool] = None,
     error_type: Optional[str] = None,
     error_message: Optional[str] = None,
     duration_seconds: Optional[float] = None,
     run_date=None,
     county_id: str = 'hillsborough',
+    outcome: Optional[str] = None,
 ) -> None:
     """
     Upsert a row into scraper_run_stats for today's run.
@@ -107,23 +108,63 @@ def record_scraper_stats(
         total_scraped: Total rows scraped from the source.
         matched/unmatched/skipped: Loader output counts.
         scored: Number of properties rescored by CDS after this load.
-        run_success: False if the run errored out.
+        run_success: False if the run errored out. Defaults to True when
+            omitted and outcome is also omitted (legacy behavior). Ignored
+            (overridden) when outcome is provided — see below; omit it
+            entirely on outcome-based calls so a caller that only knows the
+            outcome doesn't have to separately compute the matching bool.
         error_type: 'none' | 'no_data' | 'scraper_error'. None defaults to 'none'
-            on success or 'scraper_error' on failure when not explicitly set.
+            on success or 'scraper_error' on failure when not explicitly set,
+            UNLESS outcome is provided, in which case it defaults from
+            config.scraper_outcomes.LEGACY_ERROR_TYPE_MAP instead. Passing
+            both keeps this exact string (legacy reader compatibility, e.g.
+            a more specific 'rate_limited') while outcome_category still
+            records the real category.
         error_message: Short error description on failure.
         duration_seconds: Wall-clock seconds for the load+rescore step.
         run_date: datetime.date; defaults to today.
         county_id: County this run applies to.
+        outcome: One of config.scraper_outcomes.ScraperOutcome's values (or
+            None for a clean success with real data) — see
+            src.utils.scraper_outcome_classifier for how to derive this from
+            a caught exception instead of hand-picking error_type. When
+            provided, run_success is FORCED to
+            config.scraper_outcomes.derive_run_success(outcome), regardless
+            of what run_success was passed — this is what makes run_success
+            trustworthy by construction for migrated call sites (a caller
+            can no longer claim run_success=True while outcome=TIMEOUT).
     """
     from sqlalchemy.dialects.postgresql import insert as pg_insert
+    from config.scraper_outcomes import OUTCOME_VALUES, LEGACY_ERROR_TYPE_MAP, derive_run_success
     from src.core.models import ScraperRunStats
 
     if run_date is None:
         run_date = date_type.today()
 
-    # Derive error_type when not explicitly provided
-    if error_type is None:
-        error_type = 'none' if run_success else 'scraper_error'
+    if outcome is not None:
+        if outcome not in OUTCOME_VALUES:
+            raise ValueError(f"record_scraper_stats: unknown outcome {outcome!r}")
+        derived_success = derive_run_success(outcome)
+        # run_success defaults to None (not passed) — only warn when the
+        # caller explicitly passed a value that disagrees with the derived
+        # one. Comparing against the plain bool default of True would fire
+        # on every outcome-based call that (correctly) omits run_success,
+        # since True != derived_success for every non-NO_DATA outcome.
+        if run_success is not None and run_success != derived_success:
+            logger.warning(
+                "record_scraper_stats: %s/%s passed run_success=%s but outcome=%s implies %s "
+                "— using the derived value",
+                source_type, county_id, run_success, outcome, derived_success,
+            )
+        run_success = derived_success
+        if error_type is None:
+            error_type = LEGACY_ERROR_TYPE_MAP[outcome]
+    else:
+        if run_success is None:
+            run_success = True  # legacy default, unchanged for callers not yet migrated
+        if error_type is None:
+            # Legacy default-derivation, unchanged for callers not yet migrated.
+            error_type = 'none' if run_success else 'scraper_error'
 
     try:
         from sqlalchemy import func
@@ -141,6 +182,8 @@ def record_scraper_stats(
                 error_type=error_type,
                 error_message=error_message,
                 duration_seconds=duration_seconds,
+                outcome_category=outcome,
+                completed_at=func.now(),
                 updated_at=func.now(),
             )
             # On re-run within the same day (e.g. 3x/day permits, retries),
@@ -150,8 +193,11 @@ def record_scraper_stats(
             #   • duration_seconds → GREATEST so a fast retry doesn't hide a
             #     slow earlier run.
             #   • run_success → logical OR (any successful run wins).
-            #   • error_type / error_message → keep the latest non-null value
-            #     so the most recent failure detail is visible.
+            #   • error_type / error_message / outcome_category → keep the
+            #     latest non-null value so the most recent outcome is visible
+            #     (excluded is never actually NULL for error_type given the
+            #     derivation above, so this is effectively last-call-wins).
+            #   • completed_at → always the latest write's timestamp.
             excluded = stmt.excluded
             existing = ScraperRunStats.__table__.c
             stmt = stmt.on_conflict_do_update(
@@ -165,10 +211,19 @@ def record_scraper_stats(
                     run_success=existing.run_success.op('OR')(excluded.run_success),
                     error_type=func.coalesce(excluded.error_type, existing.error_type),
                     error_message=func.coalesce(excluded.error_message, existing.error_message),
+                    # NOT coalesced, unlike error_type/error_message — outcome_category
+                    # must reflect the MOST RECENT call's classification unconditionally,
+                    # including clearing back to NULL when that call is a real success.
+                    # A coalesce here would let a stale TIMEOUT/etc. from an earlier
+                    # same-day attempt survive a later genuine success indefinitely,
+                    # since a success call passes outcome=None (a real None, not a
+                    # derived non-null value the way error_type always gets one).
+                    outcome_category=excluded.outcome_category,
                     duration_seconds=func.greatest(
                         func.coalesce(existing.duration_seconds, 0),
                         func.coalesce(excluded.duration_seconds, 0),
                     ),
+                    completed_at=excluded.completed_at,
                     updated_at=excluded.updated_at,
                 )
             )
@@ -177,6 +232,62 @@ def record_scraper_stats(
             logger.info(f"✓ Scraper stats recorded: {source_type} | scraped={total_scraped} matched={matched} unmatched={unmatched} skipped={skipped} scored={scored}")
     except Exception as e:
         logger.warning(f"⚠ Could not record scraper stats for {source_type} (non-critical): {e}")
+
+
+def mark_scraper_attempt_started(
+    source_type: str,
+    county_id: str = 'hillsborough',
+    run_date=None,
+) -> None:
+    """
+    Stamp attempt_started_at for today's (run_date, source_type, county_id)
+    row — a heartbeat independent of the completion write, so "genuinely
+    never ran" (no row, attempt_started_at never set) can finally be told
+    apart from "ran and crashed before ever reaching record_scraper_stats"
+    (attempt_started_at set, completed_at still NULL). Called by
+    src.utils.scraper_run_tracking.scraper_run()'s __enter__, before any
+    network/browser work begins.
+
+    Always overwrites to the most recent attempt, matching this table's
+    existing "latest write wins" convention for completed_at/updated_at — a
+    later successful retry clears an earlier attempt's apparent crash rather
+    than leaving a stale, resolved alarm.
+
+    Never raises — a heartbeat failing to write must not block the scrape
+    it's timing.
+    """
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    from sqlalchemy import func
+    from src.core.models import ScraperRunStats
+
+    if run_date is None:
+        run_date = date_type.today()
+
+    try:
+        with get_db_context() as session:
+            # run_success=False (not the column's own True default) — this row
+            # exists only to mark "an attempt began." If the process crashes
+            # hard before ever reaching record_scraper_stats(), this row must
+            # NOT read as a confirmed fresh success; it must read as exactly
+            # what it is, an unfinished attempt. A later real success this
+            # same day flips it True via record_scraper_stats()'s OR-merge.
+            stmt = pg_insert(ScraperRunStats).values(
+                run_date=run_date,
+                source_type=source_type,
+                county_id=county_id,
+                total_scraped=0, matched=0, unmatched=0, skipped=0, scored=0,
+                run_success=False,
+                attempt_started_at=func.now(),
+                updated_at=func.now(),
+            )
+            stmt = stmt.on_conflict_do_update(
+                constraint='uq_scraper_run_stats',
+                set_={"attempt_started_at": stmt.excluded.attempt_started_at, "updated_at": stmt.excluded.updated_at},
+            )
+            session.execute(stmt)
+            session.commit()
+    except Exception as e:
+        logger.warning(f"⚠ Could not mark scraper attempt started for {source_type} (non-critical): {e}")
 
 
 def load_scraped_data_to_db(

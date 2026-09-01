@@ -57,6 +57,7 @@ from src.utils.http_helpers import (
     get_playwright_proxy,
 )
 from src.utils.scraper_db_helper import record_scraper_stats
+from config.scraper_outcomes import ScraperOutcome
 from src.utils.logger import setup_logging, get_logger
 
 setup_logging()
@@ -271,15 +272,20 @@ async def _run(limit: Optional[int], dry_run: bool, headless: bool, debug: bool)
 
 def _record_stats(stats: dict, duration: float) -> None:
     """Write the run to scraper_run_stats (source_type='dbpr_company')."""
+    # aborted means _MAX_CONSECUTIVE_FAILURES per-license lookups failed in a
+    # row (site likely down/blocking, per this module's docstring) — a
+    # source-side condition, not our bug. run_success is already False in
+    # that branch (not stats["aborted"]), which agrees with SOURCE_ERROR's
+    # forced derivation, so no override conflict.
     record_scraper_stats(
         source_type="dbpr_company",
         total_scraped=stats["scanned"],
         matched=stats["found"],          # DBA found
         unmatched=stats["failed"],       # mismatch / error / zero-result (retried)
         skipped=stats["none"],           # license legitimately has no DBA
-        run_success=not stats["aborted"],
         error_type="scraper_error" if stats["aborted"] else "none",
         error_message="aborted after consecutive failures" if stats["aborted"] else None,
+        outcome=ScraperOutcome.SOURCE_ERROR.value if stats["aborted"] else None,
         duration_seconds=round(duration, 2),
         county_id="all",
     )

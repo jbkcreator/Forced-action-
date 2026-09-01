@@ -56,8 +56,12 @@ def _capped_lines(lines: list, budget: int) -> str:
 # ── Per-report Block Kit builders ─────────────────────────────────────────────
 
 def build_live_state_blocks(subject: str, deploy: dict, cron_beats: list, silent: dict,
-                             one_number_line: str, report_date: str) -> list:
-    """Block Kit layout for the Live-State report."""
+                             one_number_line: str, report_date: str,
+                             crashed: Optional[list] = None) -> list:
+    """Block Kit layout for the Live-State report. `crashed` (from
+    live_state.check_crashed_before_completion()) defaults to None -> treated
+    as empty, so existing callers/tests predating it are unaffected."""
+    crashed = crashed or []
     stale = [b for b in cron_beats if b.is_stale]
     fresh_count = len(cron_beats) - len(stale)
     drift = deploy.get("drift", "unknown")
@@ -118,6 +122,18 @@ def build_live_state_blocks(subject: str, deploy: dict, cron_beats: list, silent
     else:
         sf_text += "\n✅ Enabled-but-unscheduled: none"
     blocks.append(_section(sf_text))
+    blocks.append(_divider())
+
+    # Crashed mid-run — only meaningful for scraper_run()-wrapped sources
+    cm_text = "*💥 CRASHED MID-RUN*\n"
+    if crashed:
+        cm_text += f"Started but never completed ({len(crashed)}):\n"
+        cm_text += _capped_lines(
+            [f"• `{r['source_type']}/{r['county_id']}`" for r in crashed], 800
+        )
+    else:
+        cm_text += "✅ Started but never completed: none"
+    blocks.append(_section(cm_text))
     blocks.append(_context("— Vera."))
     return blocks
 

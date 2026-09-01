@@ -395,14 +395,25 @@ async def run_foreclosure_pipeline(
 	if not csv_file:
 		logger.info("No new foreclosure records — nothing to load")
 		from src.utils.scraper_db_helper import record_scraper_stats
+		from config.scraper_outcomes import ScraperOutcome
+		# _parse_agent_result returns None both when the agent genuinely found
+		# 0 auctions AND when it crashed/returned no history/no parseable
+		# result — _run_agent_with_proxy_failover's retry loop doesn't surface
+		# the underlying exception, so these two cases are indistinguishable
+		# here. UNKNOWN rather than the previous hardcoded no_data, which
+		# risked masking a real failure as a confirmed empty day. error_type
+		# left unset on purpose — a stale 'no_data' string would keep legacy
+		# readers (e.g. Vera's error_type-based fallback check) fooled even
+		# after outcome_category correctly flags this as UNKNOWN; it now
+		# derives to 'scraper_error' via LEGACY_ERROR_TYPE_MAP instead.
 		record_scraper_stats(
 			source_type="foreclosures",
 			total_scraped=0,
 			matched=0,
 			unmatched=0,
 			skipped=0,
-			run_success=True,
-			error_type="no_data",
+			outcome=ScraperOutcome.UNKNOWN.value,
+			error_message="no CSV produced (ambiguous: empty auction list vs agent/parse failure)",
 			county_id=county_id,
 		)
 		return None

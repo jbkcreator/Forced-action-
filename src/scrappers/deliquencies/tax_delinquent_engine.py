@@ -688,10 +688,11 @@ if __name__ == "__main__":
         logger.error("Pipeline failed: %s", e)
         logger.debug(traceback.format_exc())
         try:
+            from src.utils.scraper_outcome_classifier import classify_exception
             record_scraper_stats(
                 source_type="tax_delinquencies",
                 total_scraped=0, matched=0, unmatched=0, skipped=0,
-                run_success=False,
+                outcome=classify_exception(e),
                 error_message=str(e)[:500],
                 duration_seconds=round(time.monotonic() - _t0, 2),
                 county_id=args.county_id,

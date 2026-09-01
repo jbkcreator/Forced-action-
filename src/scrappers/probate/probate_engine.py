@@ -483,9 +483,10 @@ def run_probate_pipeline(
             )
             try:
                 from src.utils.scraper_db_helper import record_scraper_stats
+                from config.scraper_outcomes import ScraperOutcome
                 record_scraper_stats(
                     source_type="probate", total_scraped=0, matched=0, unmatched=0, skipped=0,
-                    run_success=False, error_type="export_unavailable",
+                    error_type="export_unavailable", outcome=ScraperOutcome.TIMEOUT.value,
                     duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id,
                 )
             except Exception as _se:
@@ -505,9 +506,17 @@ def run_probate_pipeline(
         logger.debug(traceback.format_exc())
         try:
             from src.utils.scraper_db_helper import record_scraper_stats
+            from src.utils.scraper_outcome_classifier import classify_exception
+            # No hardcoded run_success=False here on purpose: a ScraperNoDataError
+            # (download_latest_probate_filing's "no probate filing found for
+            # date") legitimately reaches this branch, and forcing False would
+            # misreport a genuine no-data day as a failure. Note: this function's
+            # own return contract stays a plain bool (no pre-existing "no_data"
+            # tri-state to preserve, unlike evictions_engine.py) — only the DB
+            # row's classification changes here.
             record_scraper_stats(
                 source_type="probate", total_scraped=0, matched=0, unmatched=0, skipped=0,
-                run_success=False, error_message=str(e)[:500],
+                outcome=classify_exception(e), error_message=str(e)[:500],
                 duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id,
             )
         except Exception as _se:

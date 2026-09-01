@@ -66,10 +66,12 @@ def _is_fire_incident(description: str) -> bool:
     return any(kw in desc_lower for kw in FIRE_KEYWORDS)
 
 
-def _fetch_incidents() -> Tuple[List[Dict], Optional[str]]:
+def _fetch_incidents() -> Tuple[List[Dict], Optional[str], Optional[BaseException]]:
     """Fetch all incidents from Tampa Fire Rescue API via proxy.
 
-    Returns (incidents, error) — error is set if the API call itself failed.
+    Returns (incidents, error, exc) — error/exc are set if the API call
+    itself failed; exc is the real exception object so the caller can
+    classify what happened instead of guessing from the formatted string.
     """
     try:
         resp = requests_get_with_retry(
@@ -78,10 +80,10 @@ def _fetch_incidents() -> Tuple[List[Dict], Optional[str]]:
             timeout=20,
             use_proxy=True,
         )
-        return resp.json().get("data", []), None
+        return resp.json().get("data", []), None, None
     except Exception as exc:
         logger.error("[fire] Tampa Fire Rescue API fetch failed: %s", exc)
-        return [], str(exc)
+        return [], str(exc), exc
 
 
 def _filter_fire_incidents(
@@ -190,12 +192,12 @@ def scrape_fire_incidents(
     since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
 
     logger.info("[fire] %s: fetching Tampa Fire Rescue incidents since %s", county_id, since.date())
-    all_incidents, fetch_error = _fetch_incidents()
+    all_incidents, fetch_error, fetch_exc = _fetch_incidents()
 
     if not all_incidents:
         if fetch_error:
             logger.warning("[fire] %s: API fetch failed", county_id)
-            _record_stats(county_id, 0, 0, 0, 0, error=fetch_error)
+            _record_stats(county_id, 0, 0, 0, 0, error=fetch_error, exc=fetch_exc)
         else:
             logger.warning("[fire] %s: no data from API", county_id)
             _record_stats(county_id, 0, 0, 0, 0)
@@ -261,12 +263,15 @@ def scrape_fire_incidents(
 
 
 def _record_stats(county_id: str, total: int, matched: int, unmatched: int, skipped: int,
-                   error: Optional[str] = None) -> None:
+                   error: Optional[str] = None, exc: Optional[BaseException] = None) -> None:
     try:
         from src.utils.scraper_db_helper import record_scraper_stats
+        from src.utils.scraper_outcome_classifier import classify_exception
+        from config.scraper_outcomes import ScraperOutcome
         if error:
             # The API fetch itself failed — this is NOT a confirmed no-data
             # day, don't let it masquerade as one.
+            outcome = classify_exception(exc) if exc is not None else ScraperOutcome.UNKNOWN.value
             record_scraper_stats(
                 source_type="fire_incidents",
                 total_scraped=0,
@@ -274,8 +279,8 @@ def _record_stats(county_id: str, total: int, matched: int, unmatched: int, skip
                 unmatched=0,
                 skipped=0,
                 county_id=county_id,
-                run_success=False,
                 error_type="scraper_error",
+                outcome=outcome,
                 error_message=error[:500],
             )
         else:
@@ -287,9 +292,10 @@ def _record_stats(county_id: str, total: int, matched: int, unmatched: int, skip
                 skipped=skipped,
                 county_id=county_id,
                 error_type="no_data" if not total else "none",
+                outcome=ScraperOutcome.NO_DATA.value if not total else None,
             )
-    except Exception as exc:
-        logger.warning("[fire] Could not record scraper stats: %s", exc)
+    except Exception as stats_err:
+        logger.warning("[fire] Could not record scraper stats: %s", stats_err)
 
 
 if __name__ == "__main__":

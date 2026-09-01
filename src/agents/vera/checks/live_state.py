@@ -438,6 +438,17 @@ def _scheduled_source_types(crontab_text: str) -> set[str]:
     return scheduled
 
 
+def _is_confirmed_no_data(row: Mapping) -> bool:
+    """Dual-read: outcome_category (enforced vocabulary) first, falling back
+    to the unconstrained legacy error_type string only when outcome_category
+    is NULL (source not yet migrated to the outcome-classification system).
+    Pure function — no I/O."""
+    outcome = row.get("outcome_category")
+    if outcome is not None:
+        return outcome == "NO_DATA"
+    return row.get("error_type") in ("no_data", "rate_limited")
+
+
 def check_silent_failures(
     run_date: Optional[date] = None,
     crontab_path: Optional[Path] = None,
@@ -448,7 +459,8 @@ def check_silent_failures(
     with vera_db.session_scope() as session:
         rows = session.execute(
             text(
-                "SELECT source_type, county_id, total_scraped, error_type FROM scraper_run_stats "
+                "SELECT source_type, county_id, total_scraped, error_type, outcome_category "
+                "FROM scraper_run_stats "
                 "WHERE run_date = :run_date AND run_success = true AND total_scraped = 0"
             ),
             {"run_date": run_date},
@@ -458,12 +470,18 @@ def check_silent_failures(
     # fine and legitimately found nothing (error_type='no_data'/'rate_limited')
     # is not the same signal as one that reported success with zero rows and
     # no explanation at all.
-    zero_ingest_confirmed_no_data = [
-        row for row in zero_ingest if row.get("error_type") in ("no_data", "rate_limited")
-    ]
-    zero_ingest_unexplained = [
-        row for row in zero_ingest if row.get("error_type") not in ("no_data", "rate_limited")
-    ]
+    #
+    # Dual-read: outcome_category is the enforced (CheckConstraint), single
+    # source of truth for migrated sources — checked first. error_type is
+    # unconstrained free text (two undocumented values already leaked into
+    # prod before this system existed — see the plan's Context #3), so it's
+    # only trusted as a fallback for sources that haven't migrated yet
+    # (outcome_category IS NULL). A row with outcome_category=NO_DATA always
+    # gets error_type='no_data' too (record_scraper_stats' derivation), so
+    # this dual-read doesn't change today's behavior for migrated sources —
+    # it's forward cover against error_type drifting out of sync.
+    zero_ingest_confirmed_no_data = [row for row in zero_ingest if _is_confirmed_no_data(row)]
+    zero_ingest_unexplained = [row for row in zero_ingest if not _is_confirmed_no_data(row)]
 
     unscheduled: list[str] = []
     if crontab_path.exists():
@@ -487,6 +505,32 @@ def check_silent_failures(
     }
 
 
+def check_crashed_before_completion(run_date: Optional[date] = None) -> list[dict]:
+    """Sources with a heartbeat (attempt_started_at) stamped today but no
+    completion write (completed_at still NULL) — the process started and
+    never reached record_scraper_stats() (hard crash, OOM kill, killed
+    process, etc.), as distinct from "genuinely never ran" (no row at all,
+    attempt_started_at never set) and from a normal completion of any kind
+    (success/no-data/failure — completed_at is always set on that path).
+
+    Only meaningful for sources migrated onto
+    src.utils.scraper_run_tracking.scraper_run(), which is the only thing
+    that stamps attempt_started_at via mark_scraper_attempt_started(). An
+    un-migrated source can never appear here — that's simply not yet
+    observable for it, not a false negative."""
+    run_date = run_date or datetime.now(timezone.utc).date()
+    with vera_db.session_scope() as session:
+        rows = session.execute(
+            text(
+                "SELECT source_type, county_id, attempt_started_at FROM scraper_run_stats "
+                "WHERE run_date = :run_date "
+                "AND attempt_started_at IS NOT NULL AND completed_at IS NULL"
+            ),
+            {"run_date": run_date},
+        ).mappings().all()
+    return [dict(row) for row in rows]
+
+
 def _write_silent_failure_facts(silent: dict) -> None:
     for row in silent["zero_ingest"]:
         write_fact(
@@ -499,6 +543,16 @@ def _write_silent_failure_facts(silent: dict) -> None:
         write_fact(
             f"silent.unscheduled.{source_type}", "true",
             source="crontab", method="no active run.sh line maps to this source_type",
+            freshness_class=FRESHNESS_STATIC,
+        )
+
+
+def _write_crashed_facts(crashed: list[dict]) -> None:
+    for row in crashed:
+        write_fact(
+            f"crashed.{row['source_type']}", "true",
+            county_id=row["county_id"], source="scraper_run_stats",
+            method="attempt_started_at IS NOT NULL AND completed_at IS NULL for today",
             freshness_class=FRESHNESS_STATIC,
         )
 
@@ -545,15 +599,20 @@ def render_live_state_report(
     silent: dict,
     report_date: Optional[date] = None,
     one_number_fact_row: Optional[Mapping] = None,
+    crashed: Optional[list[dict]] = None,
 ) -> tuple[str, str, str]:
     """Returns (subject, body, html_body). Numbers first, Vera's voice.
     Pure — no DB access; `one_number_fact_row` is pre-fetched by the caller
     (run_live_state()) so this function stays testable without a live
     connection. Defaults to None (renders the V3-pending placeholder), which
     is exactly what every existing caller/test that doesn't pass it gets.
+    `crashed` (check_crashed_before_completion()'s output) also defaults to
+    None -> treated as empty, so every existing caller/test that predates it
+    is unaffected.
     Plain text and HTML are built together from the same data so they can't
     silently drift apart from each other over time."""
     report_date = report_date or datetime.now(timezone.utc).date()
+    crashed = crashed or []
     stale = [b for b in cron_beats if b.is_stale]
     fresh_count = len(cron_beats) - len(stale)
     one_number_line = _the_one_number_line(one_number_fact_row)
@@ -680,12 +739,29 @@ def render_live_state_report(
         lines.append("  Enabled-but-unscheduled: none")
         unscheduled_html = html_note("Enabled-but-unscheduled: none")
 
+    # ── CRASHED MID-RUN ────────────────────────────────────────────────────
+    # Only meaningful for scraper_run()-wrapped sources — un-migrated sources
+    # never stamp attempt_started_at, so they can't appear here (not a false
+    # negative, just not yet observable for them).
+    lines += ["", "CRASHED MID-RUN"]
+    if crashed:
+        lines.append("  Started but never completed (heartbeat set, no completion write):")
+        for row in crashed:
+            lines.append(f"    - {row['source_type']}/{row['county_id']}")
+        crashed_html = html_list(
+            [f"{row['source_type']}/{row['county_id']}" for row in crashed]
+        )
+    else:
+        lines.append("  Started but never completed: none")
+        crashed_html = html_note("Started but never completed: none")
+
     lines += ["", "— Vera."]
     body = "\n".join(lines)
 
     subject = (
         f"[Vera] Live-State Report {report_date.isoformat()} — "
         f"drift={deploy['drift']}, {len(stale)} stale, {len(unexplained)} zero-ingest"
+        + (f", {len(crashed)} crashed" if crashed else "")
     )
 
     html_body = html_shell(
@@ -704,6 +780,7 @@ def render_live_state_report(
                 + "<p style=\"color:#94a3b8;font-size:12px;margin:8px 0 4px;\">Enabled-but-unscheduled:</p>"
                 + unscheduled_html
             )
+            + html_section("Crashed Mid-Run", crashed_html)
         ),
     )
     return subject, body, html_body
@@ -723,17 +800,19 @@ def run_live_state() -> int:
     deploy = check_deploy_drift()
     cron_beats = check_cron_freshness()
     silent = check_silent_failures()
+    crashed = check_crashed_before_completion()
 
     _write_deploy_facts(deploy)
     _write_cron_facts(cron_beats)
     _write_off_day_facts(_off_day_pairs())
     _write_silent_failure_facts(silent)
+    _write_crashed_facts(crashed)
 
     one_number_rows = read_facts("revenue.mrr.new_yesterday", fresh_only=True, limit=1)
     one_number_fact_row = one_number_rows[0] if one_number_rows else None
 
     subject, body, html_body = render_live_state_report(
-        deploy, cron_beats, silent, one_number_fact_row=one_number_fact_row,
+        deploy, cron_beats, silent, one_number_fact_row=one_number_fact_row, crashed=crashed,
     )
 
     from src.services.email import send_alert
@@ -754,6 +833,7 @@ def run_live_state() -> int:
         subject, deploy, cron_beats, silent,
         one_number_line=_the_one_number_line(one_number_fact_row),
         report_date=str(_report_date),
+        crashed=crashed,
     )
     post_vera_report(subject, body, blocks=slack_blocks)
 
@@ -761,12 +841,15 @@ def run_live_state() -> int:
 
     # Validate actionable findings via Vera→Dev contract (spec §1.1.10).
     # Only assembles a finding when something requires dev attention — clean
-    # reports (in_sync, no stale, no zero-ingest) skip this entirely.
+    # reports (in_sync, no stale, no zero-ingest, no crashed) skip this
+    # entirely. A crashed-mid-run source is unambiguously actionable — it's
+    # not "no data," it's a process that started and never finished.
     is_actionable = (
         deploy["drift"] not in ("in_sync", "unknown")
         or bool(deploy["pending_migrations"])
         or stale_count > 0
         or bool(silent["zero_ingest_unexplained"])
+        or bool(crashed)
     )
     if is_actionable:
         validate_finding(
@@ -779,17 +862,18 @@ def run_live_state() -> int:
                 ),
                 "proposed_fix": (
                     f"Apply pending migrations: {deploy['pending_migrations'] or 'none'}; "
-                    f"investigate {stale_count} stale source(s); verify deploy status"
+                    f"investigate {stale_count} stale source(s); "
+                    f"investigate {len(crashed)} crashed-mid-run source(s); verify deploy status"
                 ),
                 "effort": "low",
-                "risk": "high" if deploy["pending_migrations"] else "medium",
+                "risk": "high" if (deploy["pending_migrations"] or crashed) else "medium",
             },
             source="live_state",
         )
 
     logger.info(
-        "[Vera] live-state report complete: drift=%s stale=%d/%d zero_ingest=%d unscheduled=%d",
+        "[Vera] live-state report complete: drift=%s stale=%d/%d zero_ingest=%d unscheduled=%d crashed=%d",
         deploy["drift"], stale_count, len(cron_beats),
-        len(silent["zero_ingest"]), len(silent["unscheduled"]),
+        len(silent["zero_ingest"]), len(silent["unscheduled"]), len(crashed),
     )
     return 0

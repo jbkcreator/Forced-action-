@@ -2048,6 +2048,18 @@ class ScraperRunStats(Base):
     error_message: Mapped[Optional[str]] = mapped_column(Text)
     duration_seconds: Mapped[Optional[float]] = mapped_column(Numeric(10, 2))
 
+    # Outcome classification (replaces free-text error_type going forward —
+    # see config/scraper_outcomes.py). NULL = clean success with real data,
+    # same role error_type=NULL/'none' already played. Additive: old callers
+    # that never pass outcome= keep writing error_type exactly as before;
+    # nothing here is populated until a call site opts in.
+    outcome_category: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    # Heartbeat pair distinguishing "genuinely never ran" from "ran and
+    # crashed before ever reaching the completion write" — only populated by
+    # call sites using src.utils.scraper_run_tracking.scraper_run().
+    attempt_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
     # Audit
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
@@ -2072,6 +2084,11 @@ class ScraperRunStats(Base):
             "'deed_flip_outcomes', 'probate_lien_outcomes', 'lis_pendens_outcomes'"
             ")",
             name="check_run_stats_source_type",
+        ),
+        CheckConstraint(
+            "outcome_category IS NULL OR outcome_category IN "
+            "('NO_DATA','TIMEOUT','SOURCE_ERROR','INTERNAL_ERROR','UNKNOWN')",
+            name="check_run_stats_outcome_category",
         ),
     )
 
