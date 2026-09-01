@@ -56,6 +56,23 @@ _CODE_PATH = Path(__file__).resolve().parent / "assets" / "pinellas_liens_nodriv
 
 _PROMPT_VERSION = "nodriver-v1"
 
+_PRE_MIGRATION_MODE = "playwright_then_ai"
+
+
+def _should_migrate_source(current_mode: str) -> bool:
+    """True only when current_mode is still the known pre-migration value.
+
+    Pure function — no I/O — so this guard is directly unit-testable
+    without touching the live county_sources row it's actually applied
+    against. Any other value — nodriver_then_ai (already migrated), or
+    ai_only/playwright_only/etc. an operator deliberately set afterward
+    (e.g. as a mitigation, or a manually approved fix) — must be left
+    untouched. Without this guard, re-running this "safe to re-run"
+    migration would silently stomp an operator's intentional mode change
+    and replace their approved playwright_code with this migration's own
+    version — found in PR review."""
+    return current_mode == _PRE_MIGRATION_MODE
+
 
 def run() -> None:
     code = _CODE_PATH.read_text(encoding="utf-8")
@@ -81,10 +98,11 @@ def run() -> None:
             return
 
         source_id, current_mode = row
-        if current_mode == "nodriver_then_ai":
+        if not _should_migrate_source(current_mode):
             logger.info(
-                "[migration] pinellas/liens already on nodriver_then_ai (source_id=%s) — skipping source update",
-                source_id,
+                "[migration] pinellas/liens is on scrape_mode=%r (source_id=%s), not the "
+                "pre-migration %r — skipping source update to preserve operator config",
+                current_mode, source_id, _PRE_MIGRATION_MODE,
             )
         else:
             db.execute(

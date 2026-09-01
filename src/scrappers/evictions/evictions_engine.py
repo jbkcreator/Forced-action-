@@ -1167,4 +1167,5 @@ if __name__ == "__main__":
         else:
             logger.warning("[evictions] no docket detail JSON found — skipping detail apply")
 
-    sys.exit(0 if pipeline_ok else 1)
+    from src.utils.scraper_run_tracking import pipeline_exit_code
+    sys.exit(pipeline_exit_code(result))

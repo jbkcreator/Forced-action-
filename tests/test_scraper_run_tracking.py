@@ -81,21 +81,32 @@ class TestScraperRunContextManager:
         assert row["run_success"] is False
         assert row["outcome_category"] == "TIMEOUT"
 
-    def test_suppress_completion_write_on_success_path_writes_nothing(self, _cleanup):
+    def test_suppress_completion_write_stamps_completed_at_without_aggregate(self, _cleanup):
+        """Regression for a real bug found in PR review: suppress used to
+        leave completed_at permanently NULL, which is indistinguishable
+        from a genuine crash to check_crashed_before_completion() — every
+        successful suppressed run (e.g. lien_engine.py's scheduled
+        --load-to-db path) would eventually get flagged "crashed" once
+        enough time passed. suppress_completion_write() must now stamp
+        completed_at (via mark_scraper_attempt_completed()) without writing
+        a misleading total_scraped/matched aggregate."""
         with scraper_run(_SOURCE_TYPE, "hillsborough", run_date=_FAKE_DATE) as run:
             run.suppress_completion_write()
         row = _row()
-        # Heartbeat still stamped on __enter__, but no completion write.
         assert row is not None
         assert row["attempt_started_at"] is not None
-        assert row["completed_at"] is None
+        assert row["completed_at"] is not None
+        assert row["run_success"] is True
         assert row["outcome_category"] is None
 
     def test_suppress_completion_write_also_honored_on_exception_path(self, _cleanup):
         """Regression for a real gap found in self-review: __exit__'s
         exception branch didn't check self._suppressed, so a caller that
         suppresses before a later fallible operation would still get a
-        fallback row written out from under it."""
+        fallback row written out from under it. completed_at is still
+        stamped (suppress_completion_write() marks it immediately, not
+        deferred to __exit__), so this doesn't reopen the crashed-mid-run
+        false positive either."""
         with pytest.raises(ValueError):
             with scraper_run(_SOURCE_TYPE, "hillsborough", run_date=_FAKE_DATE) as run:
                 run.suppress_completion_write()
@@ -103,7 +114,7 @@ class TestScraperRunContextManager:
         row = _row()
         assert row is not None
         assert row["attempt_started_at"] is not None
-        assert row["completed_at"] is None
+        assert row["completed_at"] is not None
         assert row["outcome_category"] is None
 
     def test_no_data_writes_no_data_outcome(self, _cleanup):
@@ -120,3 +131,46 @@ class TestScraperRunContextManager:
         row = _row()
         assert row["run_success"] is False
         assert row["outcome_category"] == "INTERNAL_ERROR"
+
+    def test_suppressed_run_is_never_flagged_crashed_by_vera(self, _cleanup):
+        """End-to-end regression tying the fix directly to the symptom a PR
+        reviewer reported: lien_engine.py's scheduled --load-to-db path
+        calls suppress_completion_write(), and every successful run of it
+        was showing up in Vera's live-state report as "crashed mid-run."
+        Mirrors check_crashed_before_completion()'s own query directly
+        (rather than importing Vera, which needs VERA_DATABASE_URL) to keep
+        this test self-contained."""
+        with scraper_run(_SOURCE_TYPE, "hillsborough", run_date=_FAKE_DATE) as run:
+            run.suppress_completion_write()
+        with get_db_context() as s:
+            still_looks_crashed = s.execute(
+                text(
+                    "SELECT 1 FROM scraper_run_stats WHERE run_date = :d "
+                    "AND source_type = :st AND county_id = 'hillsborough' "
+                    "AND attempt_started_at IS NOT NULL AND completed_at IS NULL"
+                ),
+                {"d": _FAKE_DATE, "st": _SOURCE_TYPE},
+            ).first()
+        assert still_looks_crashed is None
+
+
+class TestPipelineExitCode:
+    """pipeline_exit_code() — shared exit-code logic for the tri-state
+    (True/False/"no_data") CLI contract used by evictions_engine.py,
+    probate_engine.py, and divorce_engine.py. Regression for a real bug: a
+    prior fix correctly derived a pipeline_ok variable in probate/divorce
+    but their final sys.exit() still read the stricter success variable, so
+    a genuine no-data day exited 1 and run.sh's retry/alert logic paged on
+    a clean run."""
+
+    def test_true_exits_zero(self):
+        from src.utils.scraper_run_tracking import pipeline_exit_code
+        assert pipeline_exit_code(True) == 0
+
+    def test_no_data_exits_zero(self):
+        from src.utils.scraper_run_tracking import pipeline_exit_code
+        assert pipeline_exit_code("no_data") == 0
+
+    def test_false_exits_one(self):
+        from src.utils.scraper_run_tracking import pipeline_exit_code
+        assert pipeline_exit_code(False) == 1

@@ -41,7 +41,9 @@ import time
 from datetime import date as date_type
 from typing import Optional
 
-from src.utils.scraper_db_helper import mark_scraper_attempt_started, record_scraper_stats
+from src.utils.scraper_db_helper import (
+    mark_scraper_attempt_completed, mark_scraper_attempt_started, record_scraper_stats,
+)
 from src.utils.scraper_outcome_classifier import classify_exception
 
 logger = logging.getLogger(__name__)
@@ -59,8 +61,17 @@ class ScraperRun:
     def suppress_completion_write(self) -> None:
         """Call before returning when the real outcome rows were already
         written elsewhere (lien_engine.py's per-subtype path via
-        load_scraped_data_to_db()) — __exit__ then writes nothing rather
-        than clobbering them with a generic aggregate."""
+        load_scraped_data_to_db()) — __exit__ then writes no aggregate row
+        rather than clobbering/duplicating them.
+
+        Still stamps completed_at (via mark_scraper_attempt_completed(),
+        without touching total_scraped/matched/etc.) so this row doesn't
+        look like a crashed mid-run to
+        src.agents.vera.checks.live_state.check_crashed_before_completion() —
+        a permanently-NULL completed_at is indistinguishable from a genuine
+        crash once enough time passes, and this call means the attempt
+        genuinely finished successfully."""
+        mark_scraper_attempt_completed(self.source_type, self.county_id, self.run_date)
         self._suppressed = True
 
     def _duration(self) -> float:
@@ -124,3 +135,19 @@ class ScraperRun:
 
 def scraper_run(source_type: str, county_id: str = "hillsborough", run_date=None) -> ScraperRun:
     return ScraperRun(source_type, county_id, run_date)
+
+
+def pipeline_exit_code(result) -> int:
+    """Exit code for a scraper CLI's tri-state pipeline result
+    (True / False / "no_data") — 0 for True or "no_data" (both a clean
+    run), 1 only for a genuine False failure.
+
+    Shared by every engine using this contract (evictions_engine.py,
+    probate_engine.py, divorce_engine.py) so the exit-code logic can't
+    silently drift out of sync between them the way it did once already: a
+    prior fix correctly derived a `pipeline_ok` variable but the final
+    `sys.exit()` line still read the stricter `success` variable, so a
+    genuine no-data day exited 1 and run.sh's retry/alert logic paged on a
+    clean run. Centralizing this removes the chance of that exact mistake
+    recurring per-file."""
+    return 0 if result is not False else 1

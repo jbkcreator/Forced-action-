@@ -290,6 +290,64 @@ def mark_scraper_attempt_started(
         logger.warning(f"⚠ Could not mark scraper attempt started for {source_type} (non-critical): {e}")
 
 
+def mark_scraper_attempt_completed(
+    source_type: str,
+    county_id: str = 'hillsborough',
+    run_date=None,
+) -> None:
+    """
+    Stamp completed_at (and flip run_success True) for today's
+    (run_date, source_type, county_id) row WITHOUT touching total_scraped/
+    matched/unmatched/skipped/outcome_category — for a caller whose real
+    outcome data was already written to a *different* row (e.g.
+    lien_engine.py's per-subtype rows via load_scraped_data_to_db(), while
+    this aggregate row is source_type='lien_unknown') and only needs to
+    signal "this attempt finished" without a misleading duplicate/empty
+    aggregate.
+
+    This is what src.utils.scraper_run_tracking.ScraperRun.suppress_completion_write()
+    calls instead of leaving completed_at permanently NULL. A permanently-
+    NULL completed_at is indistinguishable from a genuine crash to
+    src.agents.vera.checks.live_state.check_crashed_before_completion() —
+    every successful suppressed run would eventually get flagged "crashed"
+    once enough time passed, which is exactly the false-alarm failure mode
+    this whole classification system exists to close.
+
+    Never raises — a completion marker failing to write must not block the
+    scrape it's timing.
+    """
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    from sqlalchemy import func
+    from src.core.models import ScraperRunStats
+
+    if run_date is None:
+        run_date = date_type.today()
+
+    try:
+        with get_db_context() as session:
+            stmt = pg_insert(ScraperRunStats).values(
+                run_date=run_date,
+                source_type=source_type,
+                county_id=county_id,
+                total_scraped=0, matched=0, unmatched=0, skipped=0, scored=0,
+                run_success=True,
+                completed_at=func.now(),
+                updated_at=func.now(),
+            )
+            stmt = stmt.on_conflict_do_update(
+                constraint='uq_scraper_run_stats',
+                set_={
+                    "run_success": stmt.excluded.run_success,
+                    "completed_at": stmt.excluded.completed_at,
+                    "updated_at": stmt.excluded.updated_at,
+                },
+            )
+            session.execute(stmt)
+            session.commit()
+    except Exception as e:
+        logger.warning(f"⚠ Could not mark scraper attempt completed for {source_type} (non-critical): {e}")
+
+
 def load_scraped_data_to_db(
     data_type: str,
     csv_path: Path,
@@ -514,9 +572,18 @@ def load_scraped_data_to_db(
             return matched, unmatched, skipped
 
     except Exception as e:
-        from src.utils.scraper_exceptions import ScraperNoDataError
+        from src.utils.scraper_outcome_classifier import classify_exception
         duration = round(time.monotonic() - t_start, 2)
-        exc_error_type = 'no_data' if isinstance(e, ScraperNoDataError) else 'scraper_error'
+        # No hardcoded run_success=False here on purpose: a ScraperNoDataError
+        # reaching this generic except (no loader raises it today, but this
+        # is the shared load path for every data_type in LOADER_MAP, so a
+        # future one plausibly could) legitimately means a confirmed no-data
+        # day, and forcing False would misreport it as a failure — the exact
+        # bug class this whole classification system exists to close, found
+        # via the same self-contradiction here: this block already computed
+        # error_type='no_data' for that case while still hardcoding
+        # run_success=False right next to it.
+        outcome = classify_exception(e)
         # Record the failure in stats (non-critical — don't let it mask original error)
         source_type_key = DATA_TYPE_TO_SOURCE.get(data_type)
         if source_type_key:
@@ -527,8 +594,7 @@ def load_scraped_data_to_db(
                 unmatched=0,
                 skipped=0,
                 scored=0,
-                run_success=False,
-                error_type=exc_error_type,
+                outcome=outcome,
                 error_message=str(e)[:500],
                 duration_seconds=duration,
                 county_id=county_id,

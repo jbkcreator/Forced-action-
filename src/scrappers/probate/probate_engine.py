@@ -590,4 +590,8 @@ if __name__ == "__main__":
         else:
             logger.warning("[probate] no docket detail JSON found — skipping detail apply")
 
-    sys.exit(0 if success else 1)
+    # pipeline_ok (True or "no_data"), not success — a genuine no-data day is
+    # not a failure and must exit 0, or run.sh's retry/alert logic pages on
+    # a clean run.
+    from src.utils.scraper_run_tracking import pipeline_exit_code
+    sys.exit(pipeline_exit_code(result))
