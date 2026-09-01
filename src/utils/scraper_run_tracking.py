@@ -105,7 +105,7 @@ class ScraperRun:
 
     def __exit__(self, exc_type, exc, tb) -> bool:
         if exc is not None:
-            if not self._recorded:
+            if not self._recorded and not self._suppressed:
                 outcome = classify_exception(exc)
                 self.fail(outcome, error_message=str(exc)[:500])
             return False  # never swallow the original exception

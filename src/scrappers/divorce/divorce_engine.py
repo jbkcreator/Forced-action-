@@ -418,8 +418,14 @@ def filter_divorce_cases(file_path: Path, county_id: str = "hillsborough") -> pd
 def run_divorce_pipeline(
     target_date: str = None, county_id: str = "hillsborough",
     headful: bool = False, no_proxy: bool = False,
-) -> bool:
-    """Full pipeline: download → filter → dedup → save. Returns True on success."""
+):
+    """Full pipeline: download → filter → dedup → save.
+
+    Returns True when new records were written (caller should load them),
+    "no_data" when the run succeeded but genuinely found nothing (not a
+    failure — exit code should still be 0, but there is no CSV to load), or
+    False on an actual pipeline failure. Mirrors evictions_engine.py's
+    tri-state contract."""
     t0 = time.monotonic()
     logger.info("=" * 60)
     logger.info("%s DIVORCE / DISSOLUTION FILINGS", county_id.upper())
@@ -476,14 +482,20 @@ def run_divorce_pipeline(
         logger.error("[divorce] Pipeline failed: %s", exc)
         logger.debug(traceback.format_exc())
         from src.utils.scraper_outcome_classifier import classify_exception
+        from config.scraper_outcomes import ScraperOutcome
         # success=None (not False) on purpose: a ScraperNoDataError
         # (download_latest_civil_filing's "no civil filing found for date")
         # legitimately reaches this branch, and record_scraper_stats derives
         # the real run_success from outcome= below — passing None instead of
         # a hardcoded False avoids a spurious mismatch warning on that path
         # while every other exception still correctly derives to False.
-        _record_stats(0, 0, 0, 0, None, t0, county_id, error=str(exc), outcome=classify_exception(exc))
-        return False
+        classified = classify_exception(exc)
+        _record_stats(0, 0, 0, 0, None, t0, county_id, error=str(exc), outcome=classified)
+        # Match the DB row's classification: a NO_DATA-classified exception is
+        # a clean no-data day, not a pipeline failure — keep the return value
+        # and the stats row in agreement (mirrors evictions_engine.py's
+        # tri-state contract).
+        return "no_data" if classified == ScraperOutcome.NO_DATA.value else False
 
 
 def _record_stats(total, matched, skipped, unmatched, success, t0, county_id, error=None, outcome=None):
@@ -524,10 +536,12 @@ if __name__ == "__main__":
     add_load_to_db_arg(parser)
     args = parser.parse_args()
 
-    success = run_divorce_pipeline(
+    result = run_divorce_pipeline(
         target_date=args.date, county_id=args.county_id,
         headful=args.headful, no_proxy=args.no_proxy,
     )
+    success = result is True           # new records were written — proceed to load
+    pipeline_ok = result is not False  # True or "no_data" both count as a clean run
 
     if success and args.load_to_db:
         try:
@@ -543,8 +557,10 @@ if __name__ == "__main__":
         except Exception as exc:
             logger.error("[divorce] DB load failed: %s", exc)
             sys.exit(1)
-    elif args.load_to_db:
+    elif args.load_to_db and not pipeline_ok:
         logger.warning("[divorce] Skipping DB load due to scraping failure")
+    elif args.load_to_db:
+        logger.info("[divorce] No new dissolution cases today — nothing to load")
 
     # Stage 2 — apply docket detail scraped during the merged search (no re-search/captcha).
     if success and args.load_to_db and args.county_id == "pinellas" and not args.skip_docket:

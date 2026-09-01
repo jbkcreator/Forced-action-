@@ -25,7 +25,7 @@ import logging
 import re
 import subprocess
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Mapping, Optional
@@ -505,7 +505,14 @@ def check_silent_failures(
     }
 
 
-def check_crashed_before_completion(run_date: Optional[date] = None) -> list[dict]:
+_CRASHED_MIN_AGE_MINUTES = 120
+
+
+def check_crashed_before_completion(
+    run_date: Optional[date] = None,
+    min_age_minutes: int = _CRASHED_MIN_AGE_MINUTES,
+    now: Optional[datetime] = None,
+) -> list[dict]:
     """Sources with a heartbeat (attempt_started_at) stamped today but no
     completion write (completed_at still NULL) — the process started and
     never reached record_scraper_stats() (hard crash, OOM kill, killed
@@ -513,12 +520,22 @@ def check_crashed_before_completion(run_date: Optional[date] = None) -> list[dic
     attempt_started_at never set) and from a normal completion of any kind
     (success/no-data/failure — completed_at is always set on that path).
 
+    Requires attempt_started_at to be at least min_age_minutes old (default
+    120) before flagging — without this, a source still legitimately mid-run
+    when this check happens to fire (a slow Playwright/nodriver source, a
+    manual trigger, a run caught mid-stagger-window) would be reported as
+    "crashed" just for still being in progress. That's the exact false-alarm
+    failure mode this whole classification system exists to close, so a
+    genuinely-running source must never trip it.
+
     Only meaningful for sources migrated onto
     src.utils.scraper_run_tracking.scraper_run(), which is the only thing
     that stamps attempt_started_at via mark_scraper_attempt_started(). An
     un-migrated source can never appear here — that's simply not yet
     observable for it, not a false negative."""
     run_date = run_date or datetime.now(timezone.utc).date()
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(minutes=min_age_minutes)
     with vera_db.session_scope() as session:
         rows = session.execute(
             text(
@@ -528,7 +545,20 @@ def check_crashed_before_completion(run_date: Optional[date] = None) -> list[dic
             ),
             {"run_date": run_date},
         ).mappings().all()
-    return [dict(row) for row in rows]
+    # Age-filter in Python, not SQL: attempt_started_at is a naive DateTime
+    # column (stores UTC via func.now(), same convention as last_success in
+    # check_cron_freshness() above) — comparing it directly against a
+    # timezone-aware bind parameter risks a driver-level mismatch, so this
+    # mirrors check_cron_freshness()'s existing naive->aware conversion
+    # instead of pushing the comparison into SQL.
+    crashed = []
+    for row in rows:
+        started_at = row["attempt_started_at"]
+        if started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=timezone.utc)
+        if started_at < cutoff:
+            crashed.append(dict(row))
+    return crashed
 
 
 def _write_silent_failure_facts(silent: dict) -> None:
