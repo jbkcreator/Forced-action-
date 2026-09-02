@@ -198,6 +198,26 @@ _DEFAULT_ALERT_COUNTY = "hillsborough"
 DEDUP_COOLDOWN_HOURS    = 24
 DEMO_STALE_AGE_HOURS    = 48  # how old the synthetic row is when --kill-source used
 
+# Aggregate freshness-regression alert — distinct from the per-source alerts
+# above. Compares the CURRENT fleet-wide fresh/stale split against the split
+# BASELINE_DAYS ago, reusing compute_heartbeats()'s own `now` parameter (the
+# underlying scraper_run_stats history doesn't change based on when you ask,
+# so calling it with an older `now` genuinely recomputes historical
+# freshness — no new time-series table needed). Catches the "several sources
+# went stale together" shape of failure — a shared dependency, a deploy, the
+# cron daemon itself — that per-source alerts each report individually but
+# never flag as a pattern. 4-day baseline (not 24h) so a source with a
+# non-daily/weekly-ish cadence isn't mistaken for a regression on its own
+# normal schedule gap.
+FRESHNESS_REGRESSION_BASELINE_DAYS   = 4
+FRESHNESS_REGRESSION_MIN_NEWLY_STALE = 3
+
+# source_type/county_id are NOT NULL on scraper_alert_log, but this alert is
+# about the fleet as a whole, not one (source, county) pair — sentinel
+# values for its dedup row.
+_FLEET_ALERT_SOURCE = "_fleet_freshness"
+_FLEET_ALERT_COUNTY = "_fleet_freshness"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data model
@@ -324,10 +344,96 @@ def compute_heartbeats(now: Optional[datetime] = None) -> list[Heartbeat]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Aggregate freshness regression
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class FreshnessRegression:
+    now_fresh_count: int
+    now_total_count: int
+    baseline_fresh_count: int
+    baseline_total_count: int
+    baseline_days: int
+    newly_stale: list[str]
+
+    @property
+    def is_regression(self) -> bool:
+        return len(self.newly_stale) >= FRESHNESS_REGRESSION_MIN_NEWLY_STALE
+
+    def alert_subject(self) -> str:
+        return (
+            f"[FA][HEARTBEAT] Freshness regression: {len(self.newly_stale)} source(s) "
+            f"newly stale ({self.now_fresh_count}/{self.now_total_count} vs "
+            f"{self.baseline_fresh_count}/{self.baseline_total_count} "
+            f"{self.baseline_days}d ago)"
+        )
+
+    def alert_body(self) -> str:
+        lines = [
+            f"Fresh sources now:                    {self.now_fresh_count}/{self.now_total_count}",
+            f"Fresh sources {self.baseline_days}d ago:                 "
+            f"{self.baseline_fresh_count}/{self.baseline_total_count}",
+            "",
+            f"Newly stale since the {self.baseline_days}-day baseline ({len(self.newly_stale)}):",
+        ]
+        lines += [f"  - {label}" for label in sorted(self.newly_stale)]
+        lines += [
+            "",
+            f"Tripped at: {datetime.now(timezone.utc).isoformat(timespec='seconds')}",
+            "",
+            "This is an AGGREGATE signal — several sources went stale together, which\n"
+            "usually points at a shared dependency (deploy, cron daemon, proxy pool,\n"
+            "shared API key/quota) rather than N independent per-source failures. Check\n"
+            "the individual per-source heartbeat alerts for detail, then check the host:\n"
+            "is cron alive, when was the last deploy, are shared credentials still valid.",
+        ]
+        return "\n".join(lines)
+
+
+def newly_stale_labels(beats_now: Iterable["Heartbeat"], beats_baseline: Iterable["Heartbeat"]) -> list[str]:
+    """Labels present in both snapshots that were fresh at baseline and are
+    stale now. Duck-typed on `.label()`/`.is_stale` so Vera's CronBeat can
+    reuse it too, not just heartbeat_monitor's own Heartbeat. A label absent
+    from the baseline snapshot (e.g. skipped there for an off-day) is
+    skipped, not counted — there's nothing to compare it against."""
+    baseline_by_label = {b.label(): b for b in beats_baseline}
+    out: list[str] = []
+    for b in beats_now:
+        baseline = baseline_by_label.get(b.label())
+        if baseline is None:
+            continue
+        if b.is_stale and not baseline.is_stale:
+            out.append(b.label())
+    return out
+
+
+def check_freshness_regression(
+    beats_now: list[Heartbeat],
+    now: Optional[datetime] = None,
+    baseline_days: int = FRESHNESS_REGRESSION_BASELINE_DAYS,
+) -> FreshnessRegression:
+    """Diffs the current heartbeat snapshot against one recomputed
+    `baseline_days` ago via compute_heartbeats()'s own `now=` parameter — no
+    new storage needed, since scraper_run_stats' history is permanent and
+    doesn't change based on when you ask."""
+    now = now or datetime.now(timezone.utc)
+    beats_baseline = compute_heartbeats(now=now - timedelta(days=baseline_days))
+    newly_stale = newly_stale_labels(beats_now, beats_baseline)
+    return FreshnessRegression(
+        now_fresh_count=sum(1 for b in beats_now if not b.is_stale),
+        now_total_count=len(beats_now),
+        baseline_fresh_count=sum(1 for b in beats_baseline if not b.is_stale),
+        baseline_total_count=len(beats_baseline),
+        baseline_days=baseline_days,
+        newly_stale=newly_stale,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Dedup
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _recently_alerted(source_type: str, county_id: str) -> bool:
+def _recently_alerted(source_type: str, county_id: str, alert_type: str = "heartbeat_missed") -> bool:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=DEDUP_COOLDOWN_HOURS)
     try:
         with get_db_context() as session:
@@ -336,7 +442,7 @@ def _recently_alerted(source_type: str, county_id: str) -> bool:
                 .filter(
                     ScraperAlertLog.source_type == source_type,
                     ScraperAlertLog.county_id == county_id,
-                    ScraperAlertLog.alert_type == "heartbeat_missed",
+                    ScraperAlertLog.alert_type == alert_type,
                     ScraperAlertLog.alerted_at >= cutoff,
                 )
                 .first()
@@ -347,13 +453,13 @@ def _recently_alerted(source_type: str, county_id: str) -> bool:
         return False
 
 
-def _record_alerted(source_type: str, county_id: str) -> None:
+def _record_alerted(source_type: str, county_id: str, alert_type: str = "heartbeat_missed") -> None:
     try:
         with get_db_context() as session:
             session.add(ScraperAlertLog(
                 source_type=source_type,
                 county_id=county_id,
-                alert_type="heartbeat_missed",
+                alert_type=alert_type,
             ))
     except Exception as exc:
         logger.warning("[Heartbeat] could not write dedup row: %s", exc)
@@ -441,6 +547,40 @@ def run_once(dry_run: bool = False) -> list[Heartbeat]:
         len(beats), len(stale),
         ", ".join(b.label() for b in stale) or "—",
     )
+
+    regression = check_freshness_regression(beats)
+    if regression.is_regression:
+        logger.warning(
+            "[Heartbeat] freshness regression: %d newly stale vs %dd baseline (%s)",
+            len(regression.newly_stale), regression.baseline_days,
+            ", ".join(sorted(regression.newly_stale)),
+        )
+        if _recently_alerted(_FLEET_ALERT_SOURCE, _FLEET_ALERT_COUNTY, alert_type="freshness_regression"):
+            logger.info(
+                "[Heartbeat] freshness regression already alerted in the last %dh — skipping",
+                DEDUP_COOLDOWN_HOURS,
+            )
+        elif dry_run:
+            logger.info(
+                "[Heartbeat][DRY] would send:\n%s\n\n%s",
+                regression.alert_subject(), regression.alert_body(),
+            )
+        else:
+            try:
+                sent = send_alert(regression.alert_subject(), regression.alert_body())
+                if sent:
+                    _record_alerted(_FLEET_ALERT_SOURCE, _FLEET_ALERT_COUNTY, alert_type="freshness_regression")
+                    logger.info(
+                        "[Heartbeat] FRESHNESS REGRESSION ALERT SENT (%d newly stale)",
+                        len(regression.newly_stale),
+                    )
+                else:
+                    logger.error(
+                        "[Heartbeat] freshness regression alert delivery returned False; "
+                        "dedup row NOT recorded so the next tick will retry"
+                    )
+            except Exception as exc:
+                logger.error("[Heartbeat] failed to send freshness regression alert: %s", exc)
 
     # Wipe dedup rows for any source that's no longer stale — so the NEXT
     # failure gets an immediate alert instead of being suppressed by the

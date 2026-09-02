@@ -2,8 +2,10 @@
 information the email report includes (unchecked sources, paying-no-access
 IDs, truncation visibility)."""
 from src.agents.vera.checks.discrepancy_digest import PromiseDigest
+from src.agents.vera.checks.live_state import CronBeat
 from src.agents.vera.checks.revenue_truth import ReconciliationResult
-from src.services.vera_slack import build_digest_blocks, build_revenue_truth_blocks
+from src.services.vera_slack import build_digest_blocks, build_live_state_blocks, build_revenue_truth_blocks
+from src.tasks.heartbeat_monitor import FreshnessRegression
 
 
 def _blocks_text(blocks: list) -> str:
@@ -14,6 +16,56 @@ def _blocks_text(blocks: list) -> str:
         elif b["type"] == "context":
             out.extend(e["text"] for e in b["elements"])
     return "\n".join(out)
+
+
+_IN_SYNC_DEPLOY = {
+    "head_sha": "a" * 40, "last_good_sha": "a" * 40, "dev_head_sha": "a" * 40,
+    "drift": "in_sync", "pending_migrations": [],
+}
+_EMPTY_SILENT = {
+    "zero_ingest": [], "zero_ingest_confirmed_no_data": [],
+    "zero_ingest_unexplained": [], "unscheduled": [],
+}
+
+
+def test_live_state_blocks_omit_regression_banner_when_none_passed():
+    blocks = build_live_state_blocks(
+        "subject", _IN_SYNC_DEPLOY, [], _EMPTY_SILENT,
+        one_number_line="THE ONE NUMBER: n/a", report_date="2026-09-02",
+    )
+    assert "FRESHNESS REGRESSION" not in _blocks_text(blocks)
+
+
+def test_live_state_blocks_omit_regression_banner_below_threshold():
+    regression = FreshnessRegression(
+        now_fresh_count=40, now_total_count=41, baseline_fresh_count=41,
+        baseline_total_count=41, baseline_days=4, newly_stale=["permits"],
+    )
+    blocks = build_live_state_blocks(
+        "subject", _IN_SYNC_DEPLOY, [], _EMPTY_SILENT,
+        one_number_line="THE ONE NUMBER: n/a", report_date="2026-09-02",
+        regression=regression,
+    )
+    assert "FRESHNESS REGRESSION" not in _blocks_text(blocks)
+
+
+def test_live_state_blocks_show_regression_banner_at_threshold():
+    regression = FreshnessRegression(
+        now_fresh_count=38, now_total_count=41, baseline_fresh_count=41,
+        baseline_total_count=41, baseline_days=4,
+        newly_stale=["permits", "foreclosures", "sunbiz"],
+    )
+    blocks = build_live_state_blocks(
+        "subject", _IN_SYNC_DEPLOY, [], _EMPTY_SILENT,
+        one_number_line="THE ONE NUMBER: n/a", report_date="2026-09-02",
+        regression=regression,
+    )
+    text = _blocks_text(blocks)
+    assert "FRESHNESS REGRESSION" in text
+    assert "38/41" in text
+    assert "41/41" in text
+    for label in regression.newly_stale:
+        assert label in text
 
 
 def test_digest_blocks_warn_on_unchecked_sources():

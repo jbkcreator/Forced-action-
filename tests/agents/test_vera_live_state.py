@@ -16,9 +16,11 @@ from src.agents.vera.checks.live_state import (
     _extract_migration_targets,
     _off_day_pairs,
     _scheduled_source_types,
+    check_freshness_regression,
     format_outcome_label,
     render_live_state_report,
 )
+from src.tasks.heartbeat_monitor import FreshnessRegression
 
 
 def test_classify_drift_in_sync():
@@ -343,3 +345,75 @@ def test_render_live_state_report_shows_category_on_silent_failure_entries():
     body = render_live_state_report(deploy, [], silent, report_date=date(2026, 9, 2))[1]
 
     assert "storm_damage/hillsborough  [NO_DATA]" in body
+
+
+_EMPTY_SILENT = {
+    "zero_ingest": [], "zero_ingest_confirmed_no_data": [],
+    "zero_ingest_unexplained": [], "unscheduled": [],
+}
+_IN_SYNC_DEPLOY = {
+    "head_sha": "a" * 40, "last_good_sha": "a" * 40, "dev_head_sha": "a" * 40,
+    "drift": "in_sync", "pending_migrations": [], "migration_statuses": {},
+}
+
+
+def test_render_live_state_report_omits_banner_when_no_regression_passed():
+    """Backward-compat: `regression` defaults to None -> no banner, exactly
+    like every pre-existing caller/test in this file that doesn't pass it."""
+    body, html_body = render_live_state_report(
+        _IN_SYNC_DEPLOY, [], _EMPTY_SILENT, report_date=date(2026, 9, 2),
+    )[1:]
+    assert "FRESHNESS REGRESSION" not in body
+    assert "FRESHNESS REGRESSION" not in html_body
+
+
+def test_render_live_state_report_omits_banner_below_threshold():
+    """A FreshnessRegression with fewer than the minimum newly-stale sources
+    must not render a banner — is_regression is False, not just "small"."""
+    regression = FreshnessRegression(
+        now_fresh_count=40, now_total_count=41, baseline_fresh_count=41,
+        baseline_total_count=41, baseline_days=4, newly_stale=["permits"],
+    )
+    body = render_live_state_report(
+        _IN_SYNC_DEPLOY, [], _EMPTY_SILENT, report_date=date(2026, 9, 2),
+        regression=regression,
+    )[1]
+    assert "FRESHNESS REGRESSION" not in body
+
+
+def test_render_live_state_report_shows_banner_and_subject_at_threshold():
+    regression = FreshnessRegression(
+        now_fresh_count=38, now_total_count=41, baseline_fresh_count=41,
+        baseline_total_count=41, baseline_days=4,
+        newly_stale=["permits", "foreclosures", "sunbiz"],
+    )
+    subject, body, html_body = render_live_state_report(
+        _IN_SYNC_DEPLOY, [], _EMPTY_SILENT, report_date=date(2026, 9, 2),
+        regression=regression,
+    )
+    assert "FRESHNESS REGRESSION" in body
+    assert "38/41" in body
+    assert "41/41" in body
+    for label in regression.newly_stale:
+        assert label in body
+    assert "REGRESSION(3)" in subject
+    assert "FRESHNESS REGRESSION" in html_body
+
+
+def test_check_freshness_regression_diffs_against_four_day_baseline(monkeypatch):
+    calls = []
+
+    def fake_check_cron_freshness(now=None):
+        calls.append(now)
+        is_baseline = len(calls) == 2
+        return [CronBeat("permits", "hillsborough", 1500, None, 0, is_stale=not is_baseline)]
+
+    monkeypatch.setattr(live_state, "check_cron_freshness", fake_check_cron_freshness)
+    now = datetime(2026, 9, 2, tzinfo=timezone.utc)
+
+    result = check_freshness_regression(now=now)
+
+    assert result.baseline_days == 4
+    assert calls[0] == now
+    assert calls[1] == now - timedelta(days=4)
+    assert result.newly_stale == ["permits/hillsborough"]

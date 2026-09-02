@@ -47,7 +47,14 @@ from src.agents.vera.checks._shared import (
 from src.agents.vera.config import FRESHNESS_STATIC, KILL_SWITCH_FEATURE
 from src.agents.vera.db import vera_db
 from src.agents.vera.facts import read_facts, write_fact
-from src.tasks.heartbeat_monitor import HEARTBEAT_SLAS, MULTI_COUNTY_SOURCES, SOURCE_OFF_DAYS
+from src.tasks.heartbeat_monitor import (
+    FRESHNESS_REGRESSION_BASELINE_DAYS,
+    HEARTBEAT_SLAS,
+    MULTI_COUNTY_SOURCES,
+    SOURCE_OFF_DAYS,
+    FreshnessRegression,
+    newly_stale_labels,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -439,6 +446,33 @@ def check_cron_freshness(now: Optional[datetime] = None) -> list[CronBeat]:
     return beats
 
 
+def check_freshness_regression(
+    now: Optional[datetime] = None,
+    baseline_days: int = FRESHNESS_REGRESSION_BASELINE_DAYS,
+) -> FreshnessRegression:
+    """Vera's read-only mirror of heartbeat_monitor.check_freshness_regression()
+    — reuses check_cron_freshness()'s own `now=` parameter the same way
+    heartbeat_monitor reuses compute_heartbeats(), through Vera's own
+    read-only session (vera_db), never the app-role path. Report-only: this
+    never sends an alert itself — heartbeat_monitor already pages ops on
+    this exact signal every 15 minutes, and Vera never double-alerts (same
+    split as check_cron_freshness()). It only feeds
+    render_live_state_report()'s banner, so the routine daily reader sees
+    the regression too, not just whoever's on-call for the loud alert."""
+    now = now or datetime.now(timezone.utc)
+    beats_now = check_cron_freshness(now=now)
+    beats_baseline = check_cron_freshness(now=now - timedelta(days=baseline_days))
+    newly_stale = newly_stale_labels(beats_now, beats_baseline)
+    return FreshnessRegression(
+        now_fresh_count=sum(1 for b in beats_now if not b.is_stale),
+        now_total_count=len(beats_now),
+        baseline_fresh_count=sum(1 for b in beats_baseline if not b.is_stale),
+        baseline_total_count=len(beats_baseline),
+        baseline_days=baseline_days,
+        newly_stale=newly_stale,
+    )
+
+
 def _off_day_pairs(now: Optional[datetime] = None) -> list[tuple[str, Optional[str]]]:
     """(source_type, county_id) pairs skipped today by SOURCE_OFF_DAYS — the
     same sources check_cron_freshness() skips over. Pure function, no I/O."""
@@ -707,6 +741,7 @@ def render_live_state_report(
     report_date: Optional[date] = None,
     one_number_fact_row: Optional[Mapping] = None,
     crashed: Optional[list[dict]] = None,
+    regression: Optional[FreshnessRegression] = None,
 ) -> tuple[str, str, str]:
     """Returns (subject, body, html_body). Numbers first, Vera's voice.
     Pure — no DB access; `one_number_fact_row` is pre-fetched by the caller
@@ -715,7 +750,8 @@ def render_live_state_report(
     is exactly what every existing caller/test that doesn't pass it gets.
     `crashed` (check_crashed_before_completion()'s output) also defaults to
     None -> treated as empty, so every existing caller/test that predates it
-    is unaffected.
+    is unaffected. `regression` (check_freshness_regression()'s output) also
+    defaults to None -> banner omitted, same backward-compat pattern.
     Plain text and HTML are built together from the same data so they can't
     silently drift apart from each other over time."""
     report_date = report_date or datetime.now(timezone.utc).date()
@@ -724,15 +760,32 @@ def render_live_state_report(
     fresh_count = len(cron_beats) - len(stale)
     one_number_line = _the_one_number_line(one_number_fact_row)
 
+    # ── FRESHNESS REGRESSION (banner, near the top — "I found this by
+    # reading a number; it should have raised a notice" is exactly the gap
+    # this closes, so it can't be buried inside CRON FRESHNESS's per-source
+    # detail where a routine reader would have to notice the pattern
+    # themselves) ────────────────────────────────────────────────────────
+    regression_line = None
+    if regression is not None and regression.is_regression:
+        regression_line = (
+            f"🚨 FRESHNESS REGRESSION — {len(regression.newly_stale)} source(s) newly stale "
+            f"vs {regression.baseline_days}d ago "
+            f"({regression.now_fresh_count}/{regression.now_total_count} now vs "
+            f"{regression.baseline_fresh_count}/{regression.baseline_total_count} "
+            f"{regression.baseline_days}d ago): "
+            + ", ".join(sorted(regression.newly_stale))
+        )
+
     # ── DEPLOY ────────────────────────────────────────────────────────────
     lines = [
         f"Vera — Live-State Report — {report_date.isoformat()}",
         "=" * 60,
         "",
         one_number_line,
-        "",
-        "DEPLOY",
     ]
+    if regression_line:
+        lines += ["", regression_line]
+    lines += ["", "DEPLOY"]
     if deploy.get("repo_dir_missing"):
         deploy_note = (
             f"Repo path {deploy.get('repo_dir', '(unknown)')} not found on this host — "
@@ -888,6 +941,8 @@ def render_live_state_report(
         f"[Vera] Live-State Report {report_date.isoformat()} — "
         f"drift={deploy['drift']}, {len(stale)} stale, {len(unexplained)} zero-ingest"
         + (f", {len(crashed)} crashed" if crashed else "")
+        + (f", REGRESSION({len(regression.newly_stale)})"
+           if regression is not None and regression.is_regression else "")
     )
 
     html_body = html_shell(
@@ -895,6 +950,7 @@ def render_live_state_report(
         subtitle=report_date.isoformat(),
         body_html=(
             html_headline("THE ONE NUMBER", one_number_line.split(": ", 1)[-1])
+            + (html_warning(regression_line) if regression_line else "")
             + html_section("Deploy", deploy_html)
             + html_section("Cron Freshness", cron_html)
             + html_section(
@@ -927,6 +983,7 @@ def run_live_state() -> int:
     cron_beats = check_cron_freshness()
     silent = check_silent_failures()
     crashed = check_crashed_before_completion()
+    regression = check_freshness_regression()
 
     _write_deploy_facts(deploy)
     _write_cron_facts(cron_beats)
@@ -939,6 +996,7 @@ def run_live_state() -> int:
 
     subject, body, html_body = render_live_state_report(
         deploy, cron_beats, silent, one_number_fact_row=one_number_fact_row, crashed=crashed,
+        regression=regression,
     )
 
     from src.services.email import send_alert
@@ -960,6 +1018,7 @@ def run_live_state() -> int:
         one_number_line=_the_one_number_line(one_number_fact_row),
         report_date=str(_report_date),
         crashed=crashed,
+        regression=regression,
     )
     post_vera_report(subject, body, blocks=slack_blocks)
 
@@ -976,6 +1035,7 @@ def run_live_state() -> int:
         or stale_count > 0
         or bool(silent["zero_ingest_unexplained"])
         or bool(crashed)
+        or regression.is_regression
     )
     if is_actionable:
         validate_finding(
@@ -984,22 +1044,35 @@ def run_live_state() -> int:
                 "evidence": body[:600],
                 "repro": "python -m src.agents.vera --live-state",
                 "suspected_cause": (
+                    "Cron job failure, scraper crash, pending deployment, or a shared "
+                    "dependency (deploy/cron daemon/proxy/API key) taking multiple "
+                    "sources down together"
+                    if regression.is_regression else
                     "Cron job failure, scraper crash, or pending deployment"
                 ),
                 "proposed_fix": (
                     f"Apply pending migrations: {deploy['pending_migrations'] or 'none'}; "
                     f"investigate {stale_count} stale source(s); "
+                    f"investigate {len(crashed)} crashed-mid-run source(s); "
+                    f"investigate freshness regression ({len(regression.newly_stale)} newly "
+                    f"stale since {regression.baseline_days}d ago: "
+                    f"{', '.join(sorted(regression.newly_stale))}); verify deploy status"
+                    if regression.is_regression else
+                    f"Apply pending migrations: {deploy['pending_migrations'] or 'none'}; "
+                    f"investigate {stale_count} stale source(s); "
                     f"investigate {len(crashed)} crashed-mid-run source(s); verify deploy status"
                 ),
                 "effort": "low",
-                "risk": "high" if (deploy["pending_migrations"] or crashed) else "medium",
+                "risk": "high" if (deploy["pending_migrations"] or crashed or regression.is_regression) else "medium",
             },
             source="live_state",
         )
 
     logger.info(
-        "[Vera] live-state report complete: drift=%s stale=%d/%d zero_ingest=%d unscheduled=%d crashed=%d",
+        "[Vera] live-state report complete: drift=%s stale=%d/%d zero_ingest=%d unscheduled=%d "
+        "crashed=%d regression=%s",
         deploy["drift"], stale_count, len(cron_beats),
         len(silent["zero_ingest"]), len(silent["unscheduled"]), len(crashed),
+        regression.is_regression,
     )
     return 0
