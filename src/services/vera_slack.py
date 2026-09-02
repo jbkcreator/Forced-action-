@@ -22,6 +22,7 @@ from typing import Mapping, Optional
 
 from config.settings import get_settings
 from src.agents.vera.checks.live_state import format_outcome_label
+from src.tasks.heartbeat_monitor import FreshnessRegression
 
 logger = logging.getLogger(__name__)
 
@@ -59,10 +60,13 @@ def _capped_lines(lines: list, budget: int) -> str:
 
 def build_live_state_blocks(subject: str, deploy: dict, cron_beats: list, silent: dict,
                              one_number_line: str, report_date: str,
-                             crashed: Optional[list] = None) -> list:
+                             crashed: Optional[list] = None,
+                             regression: Optional[FreshnessRegression] = None) -> list:
     """Block Kit layout for the Live-State report. `crashed` (from
     live_state.check_crashed_before_completion()) defaults to None -> treated
-    as empty, so existing callers/tests predating it are unaffected."""
+    as empty, so existing callers/tests predating it are unaffected.
+    `regression` (from live_state.check_freshness_regression()) also
+    defaults to None -> banner omitted, same backward-compat pattern."""
     crashed = crashed or []
     stale = [b for b in cron_beats if b.is_stale]
     fresh_count = len(cron_beats) - len(stale)
@@ -76,17 +80,32 @@ def build_live_state_blocks(subject: str, deploy: dict, cron_beats: list, silent
     blocks = [
         _header(f"Vera — Live-State Report {report_date}"),
         _section(f"*💰 New MRR added yesterday:* `{one_number_value}`"),
-        _divider(),
-        _section(
-            f"*🚀 DEPLOY*\n"
-            f"{drift_icon} Drift: `{drift}`\n"
-            f"Prod HEAD: `{deploy.get('head_sha', 'unknown')[:12] if deploy.get('head_sha') else 'unknown'}`  "
-            f"Dev HEAD: `{deploy.get('dev_head_sha', 'unknown')[:12] if deploy.get('dev_head_sha') else 'unknown'}`\n"
-            + (f"⚠️ Pending migrations: {len(pending)}\n```{chr(10).join(pending[:5])}{'...' if len(pending) > 5 else ''}```"
-               if pending else "Pending migrations: none")
-        ),
-        _divider(),
     ]
+
+    # Freshness regression banner — near the top, same reasoning as
+    # render_live_state_report()'s plain-text version: an aggregate
+    # "several sources went stale together" signal must not read as just
+    # another line inside CRON FRESHNESS's per-source detail.
+    if regression is not None and regression.is_regression:
+        blocks.append(_section(
+            f"*🚨 FRESHNESS REGRESSION*  {len(regression.newly_stale)} source(s) newly stale "
+            f"vs {regression.baseline_days}d ago "
+            f"(`{regression.now_fresh_count}/{regression.now_total_count}` now vs "
+            f"`{regression.baseline_fresh_count}/{regression.baseline_total_count}` "
+            f"{regression.baseline_days}d ago)\n"
+            + "\n".join(f"• `{label}`" for label in sorted(regression.newly_stale))
+        ))
+
+    blocks.append(_divider())
+    blocks.append(_section(
+        f"*🚀 DEPLOY*\n"
+        f"{drift_icon} Drift: `{drift}`\n"
+        f"Prod HEAD: `{deploy.get('head_sha', 'unknown')[:12] if deploy.get('head_sha') else 'unknown'}`  "
+        f"Dev HEAD: `{deploy.get('dev_head_sha', 'unknown')[:12] if deploy.get('dev_head_sha') else 'unknown'}`\n"
+        + (f"⚠️ Pending migrations: {len(pending)}\n```{chr(10).join(pending[:5])}{'...' if len(pending) > 5 else ''}```"
+           if pending else "Pending migrations: none")
+    ))
+    blocks.append(_divider())
 
     # Cron freshness — "last recorded outcome" says *why*, not just *that*,
     # a source is stale (see CronBeat.last_attempt_label / format_outcome_label).
