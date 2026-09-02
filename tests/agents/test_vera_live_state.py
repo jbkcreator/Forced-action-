@@ -16,6 +16,7 @@ from src.agents.vera.checks.live_state import (
     _extract_migration_targets,
     _off_day_pairs,
     _scheduled_source_types,
+    format_outcome_label,
     render_live_state_report,
 )
 
@@ -236,3 +237,109 @@ def test_render_live_state_report_explains_missing_repo_dir_instead_of_bare_unkn
     # The old bare "unknown" wall must not appear alongside the new explanation.
     assert "Prod HEAD:" not in body
     assert "not found on this host" in html_body
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# format_outcome_label() — the shared "never confused about which taxonomy
+# a label belongs to" tag, used in ZERO-INGEST SOURCES and CRON FRESHNESS's
+# "last recorded outcome".
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_format_outcome_label_prefers_real_outcome_category():
+    assert format_outcome_label("TIMEOUT", "scraper_error") == "[TIMEOUT]"
+
+
+def test_format_outcome_label_falls_back_to_legacy_error_type_labeled_as_such():
+    # Explicitly tagged "legacy:" so it can never be mistaken for one of the
+    # 5 enforced outcome_category values.
+    assert format_outcome_label(None, "scraper_error") == "[legacy: scraper_error]"
+
+
+def test_format_outcome_label_unclassified_when_neither_present():
+    assert format_outcome_label(None, None) == "[UNCLASSIFIED]"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CronBeat.last_attempt_label() — "why" a stale source is stale, not just
+# "that" it is.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_last_attempt_label_none_when_no_attempt_row_at_all():
+    beat = CronBeat("violations", "pinellas", 1500, None, None, True)
+    assert beat.last_attempt_label() is None
+
+
+def test_last_attempt_label_distinguishes_long_dead_silence_from_a_recent_failure():
+    # The exact scenario that motivated this feature: a source whose LAST
+    # recorded row is a clean no_data day from days ago must not be
+    # confused with "it's actively finding nothing every day."
+    now = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
+    beat = CronBeat(
+        "lien_ccl", "pinellas", 1500, None, 7200, True,
+        last_attempt_run_date=date(2026, 8, 28),
+        last_attempt_outcome_category="NO_DATA",
+        last_attempt_error_type="no_data",
+        last_attempt_error_message=None,
+    )
+    label = beat.last_attempt_label(now=now)
+    assert "[NO_DATA]" in label
+    assert "2026-08-28" in label
+    assert "5d ago" in label
+    assert "no runs recorded since" in label
+
+
+def test_last_attempt_label_shows_todays_real_failure_with_message():
+    now = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
+    beat = CronBeat(
+        "bankruptcy", "hillsborough", 1500, None, 1519, True,
+        last_attempt_run_date=date(2026, 9, 2),
+        last_attempt_outcome_category=None,
+        last_attempt_error_type="scraper_error",
+        last_attempt_error_message="429 Client Error: Too Many Requests for url: https://www.courtlistener.com/...",
+    )
+    label = beat.last_attempt_label(now=now)
+    assert "[legacy: scraper_error]" in label
+    assert "today" in label
+    assert "429 Client Error" in label
+
+
+def test_render_live_state_report_shows_last_attempt_on_stale_lines():
+    deploy = {
+        "head_sha": "a" * 40, "last_good_sha": "a" * 40, "dev_head_sha": "a" * 40,
+        "drift": "in_sync", "pending_migrations": [], "migration_statuses": {},
+    }
+    stale_beat = CronBeat(
+        "bankruptcy", "hillsborough", 1500, None, 1519, True,
+        last_attempt_run_date=date(2026, 9, 2),
+        last_attempt_outcome_category="SOURCE_ERROR",
+        last_attempt_error_type="scraper_error",
+        last_attempt_error_message="429 Client Error: Too Many Requests",
+    )
+    silent = {
+        "zero_ingest": [], "zero_ingest_confirmed_no_data": [],
+        "zero_ingest_unexplained": [], "unscheduled": [],
+    }
+
+    body = render_live_state_report(deploy, [stale_beat], silent, report_date=date(2026, 9, 2))[1]
+
+    assert "last recorded outcome: [SOURCE_ERROR]" in body
+    assert "429 Client Error" in body
+
+
+def test_render_live_state_report_shows_category_on_silent_failure_entries():
+    deploy = {
+        "head_sha": "a" * 40, "last_good_sha": "a" * 40, "dev_head_sha": "a" * 40,
+        "drift": "in_sync", "pending_migrations": [], "migration_statuses": {},
+    }
+    silent = {
+        "zero_ingest": [{"source_type": "storm_damage", "county_id": "hillsborough",
+                          "total_scraped": 0, "outcome_category": "NO_DATA", "error_type": "no_data"}],
+        "zero_ingest_confirmed_no_data": [{"source_type": "storm_damage", "county_id": "hillsborough",
+                                            "total_scraped": 0, "outcome_category": "NO_DATA", "error_type": "no_data"}],
+        "zero_ingest_unexplained": [],
+        "unscheduled": [],
+    }
+
+    body = render_live_state_report(deploy, [], silent, report_date=date(2026, 9, 2))[1]
+
+    assert "storm_damage/hillsborough  [NO_DATA]" in body

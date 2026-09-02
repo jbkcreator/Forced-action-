@@ -17,9 +17,11 @@ Usage:
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Mapping, Optional
 
 from config.settings import get_settings
+from src.agents.vera.checks.live_state import format_outcome_label
 
 logger = logging.getLogger(__name__)
 
@@ -86,34 +88,41 @@ def build_live_state_blocks(subject: str, deploy: dict, cron_beats: list, silent
         _divider(),
     ]
 
-    # Cron freshness
+    # Cron freshness — "last recorded outcome" says *why*, not just *that*,
+    # a source is stale (see CronBeat.last_attempt_label / format_outcome_label).
     cron_text = f"*📡 CRON FRESHNESS*  {fresh_count}/{len(cron_beats)} sources fresh\n"
     if stale:
         for b in sorted(stale, key=lambda x: x.label()):
-            cron_text += f"❌ `{b.label()}` — age {b.age_label()} (SLA {b.sla_minutes // 60}h)\n"
+            last_attempt = b.last_attempt_label() or "none — genuinely never run"
+            cron_text += (
+                f"❌ `{b.label()}` — age {b.age_label()} (SLA {b.sla_minutes // 60}h)\n"
+                f"     last recorded outcome: {last_attempt}\n"
+            )
     else:
         cron_text += "✅ All sources fresh"
     blocks.append(_section(cron_text))
     blocks.append(_divider())
 
     # Silent failures
+    def _silent_line(r: Mapping) -> str:
+        label = format_outcome_label(r.get("outcome_category"), r.get("error_type"))
+        msg = r.get("error_message")
+        base = f"• `{r['source_type']}/{r['county_id']}`  {label}"
+        return f"{base} — {msg[:160]}" if msg else base
+
     confirmed_no_data = silent.get("zero_ingest_confirmed_no_data", [])
     unexplained = silent.get("zero_ingest_unexplained", [])
     unscheduled = silent.get("unscheduled", [])
-    sf_text = f"*🔇 SILENT FAILURES*\n"
+    sf_text = f"*🔇 ZERO-INGEST SOURCES*\n"
     if confirmed_no_data:
         sf_text += f"ℹ️ No new data today (confirmed — nothing to report) ({len(confirmed_no_data)}):\n"
-        sf_text += _capped_lines(
-            [f"• `{r['source_type']}/{r['county_id']}`" for r in confirmed_no_data], 800
-        )
+        sf_text += _capped_lines([_silent_line(r) for r in confirmed_no_data], 800)
         sf_text += "\n"
     else:
         sf_text += "✅ No new data today (confirmed): none\n"
     if unexplained:
         sf_text += f"🔧 Scheduled-but-writing-nothing — needs investigation ({len(unexplained)}):\n"
-        sf_text += _capped_lines(
-            [f"• `{r['source_type']}/{r['county_id']}`" for r in unexplained], 800
-        )
+        sf_text += _capped_lines([_silent_line(r) for r in unexplained], 800)
     else:
         sf_text += "✅ Scheduled-but-writing-nothing: none"
     if unscheduled:
@@ -124,13 +133,24 @@ def build_live_state_blocks(subject: str, deploy: dict, cron_beats: list, silent
     blocks.append(_section(sf_text))
     blocks.append(_divider())
 
-    # Crashed mid-run — only meaningful for scraper_run()-wrapped sources
+    # Crashed mid-run — only meaningful for scraper_run()-wrapped sources.
+    # No category shown — a crashed row has no completion write by
+    # definition, so there's nothing classified; how long it's been stuck
+    # is the useful signal instead.
+    def _crashed_line(r: Mapping) -> str:
+        started = r.get("attempt_started_at")
+        if started is None:
+            return f"• `{r['source_type']}/{r['county_id']}`"
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        hours = (datetime.now(timezone.utc) - started).total_seconds() / 3600
+        duration = f"{hours:.1f}h" if hours < 48 else f"{hours / 24:.1f}d"
+        return f"• `{r['source_type']}/{r['county_id']}` — started {duration} ago, still no completion"
+
     cm_text = "*💥 CRASHED MID-RUN*\n"
     if crashed:
         cm_text += f"Started but never completed ({len(crashed)}):\n"
-        cm_text += _capped_lines(
-            [f"• `{r['source_type']}/{r['county_id']}`" for r in crashed], 800
-        )
+        cm_text += _capped_lines([_crashed_line(r) for r in crashed], 800)
     else:
         cm_text += "✅ Started but never completed: none"
     blocks.append(_section(cm_text))

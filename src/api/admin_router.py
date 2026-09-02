@@ -2870,7 +2870,11 @@ class CountyUpdateRequest(BaseModel):
     founding_price_deadline_at: Optional[datetime] = None
 
 
-ScrapeMode = Literal["ai_only", "playwright_only", "playwright_then_ai", "static_download", "api"]
+ScrapeMode = Literal[
+    "ai_only", "playwright_only", "playwright_then_ai",
+    "nodriver_only", "nodriver_then_ai",
+    "static_download", "api",
+]
 
 
 class CountySourceCreateRequest(BaseModel):

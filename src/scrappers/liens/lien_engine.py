@@ -28,7 +28,7 @@ import time
 import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import pandas as pd
 
@@ -1035,14 +1035,31 @@ async def run_lien_pipeline(
         logger.info("=" * 70)
 
         if load_to_db:
-            # Per-subtype stats are written inside _load_to_database via
-            # scraper_db_helper:_record_load_stats — one row each for
-            # lien_tcl/lien_ccl/lien_hoa/lien_ml/lien_tl/lis_pendens plus
-            # 'no_data' rows for absent subtypes. Suppress the wrapper's own
-            # completion write so it doesn't clobber those via the
-            # (run_date, source_type, county_id) upsert.
-            _load_to_database(county_id, _t0)
-            run.suppress_completion_write()
+            all_ok, load_error = _load_to_database(county_id, _t0)
+            if all_ok:
+                # Per-subtype stats are written inside _load_to_database via
+                # scraper_db_helper:_record_load_stats — one row each for
+                # lien_tcl/lien_ccl/lien_hoa/lien_ml/lien_tl/lis_pendens plus
+                # 'no_data' rows for absent subtypes. Suppress the wrapper's
+                # own completion write so it doesn't clobber those via the
+                # (run_date, source_type, county_id) upsert.
+                run.suppress_completion_write()
+            else:
+                # At least one DB-load target failed. deeds/judgments each
+                # have a DATA_TYPE_TO_SOURCE entry, so load_scraped_data_to_db
+                # already wrote their own failure row — but 'liens' does not
+                # (its success path is split per-document-type instead, with
+                # no equivalent failure-path breakdown), so a liens load
+                # crash would otherwise write NO row anywhere at all: the
+                # exact silent-row bug class this whole system exists to
+                # close, found in PR review. Recording it here, under the
+                # wrapper's own pre-subtype-known 'lien_unknown' aggregate,
+                # is what actually closes that gap.
+                outcome = classify_exception(load_error) if load_error is not None else ScraperOutcome.UNKNOWN.value
+                run.fail(
+                    outcome,
+                    error_message=str(load_error)[:500] if load_error is not None else "one or more lien/deed/judgment DB loads failed",
+                )
         else:
             run.success(total_scraped=total)
 
@@ -1053,7 +1070,12 @@ async def run_lien_pipeline(
 # DB loader
 # ---------------------------------------------------------------------------
 
-def _load_to_database(county_id: str, t0: float) -> None:
+def _load_to_database(county_id: str, t0: float) -> Tuple[bool, Optional[BaseException]]:
+    """Attempts each load target independently — one target failing must
+    not block the others from loading. Returns (all_ok, first_error) so the
+    caller can record a failure for targets that have no self-reporting
+    path of their own (see 'liens' in the caller's comment).
+    """
     from src.utils.scraper_db_helper import load_scraped_data_to_db
 
     load_targets = [
@@ -1062,6 +1084,8 @@ def _load_to_database(county_id: str, t0: float) -> None:
         ("judgments", PROCESSED_JUDGMENTS_DIR, "judgments"),
     ]
 
+    all_ok = True
+    first_error: Optional[BaseException] = None
     for label, type_dir, data_type in load_targets:
         new_dir = type_dir / "new"
         csv_files = sorted(new_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True) \
@@ -1073,8 +1097,13 @@ def _load_to_database(county_id: str, t0: float) -> None:
                                         county_id=county_id)
             except Exception as e:
                 logger.error("[DB] Failed to load %s: %s", label, e)
+                all_ok = False
+                if first_error is None:
+                    first_error = e
         else:
             logger.info("[DB] No new %s records to load", label)
+
+    return all_ok, first_error
 
 
 

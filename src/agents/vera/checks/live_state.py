@@ -51,6 +51,31 @@ from src.tasks.heartbeat_monitor import HEARTBEAT_SLAS, MULTI_COUNTY_SOURCES, SO
 
 logger = logging.getLogger(__name__)
 
+
+def format_outcome_label(outcome_category: Optional[str], error_type: Optional[str]) -> str:
+    """One consistent, self-explanatory tag for a scraper_run_stats row's
+    classification, used everywhere Vera's reports show a source's status
+    (ZERO-INGEST SOURCES, CRON FRESHNESS's "last recorded outcome"). Visually
+    distinguishes three states so a reader never has to guess which one
+    they're looking at:
+      - A migrated source's real, enforced outcome_category -> "[TIMEOUT]"
+        etc. — one of the 5 real categories, confident and specific.
+      - An un-migrated source's legacy error_type string -> "[legacy:
+        scraper_error]" — explicitly labeled as the OLD, coarse,
+        un-enforced convention (a catch-all for any failure, not a real
+        category), so it's never mistaken for one of the 5 enforced values.
+      - Neither present -> "[UNCLASSIFIED]" — stated outright rather than
+        left blank, so absence of data reads as absence of data, not as an
+        omission.
+    Pure function — no I/O — importable from both live_state.py's own
+    plain-text renderer and src.services.vera_slack's Block Kit renderer so
+    the two can never drift into showing different labels for the same row."""
+    if outcome_category:
+        return f"[{outcome_category}]"
+    if error_type:
+        return f"[legacy: {error_type}]"
+    return "[UNCLASSIFIED]"
+
 # Same hardcoded prod path convention as scripts/cron/run.sh / deploy.sh
 # (neither reads this from settings/env either — Vera runs from the same
 # checkout). Overridable per-call for testing.
@@ -292,6 +317,15 @@ class CronBeat:
     last_success_at: Optional[datetime]
     age_minutes: Optional[int]
     is_stale: bool
+    # Populated only for stale beats (see check_cron_freshness) — the most
+    # recent row for this source regardless of run_success, so a STALE line
+    # can say *why* instead of just *that*. Added at the end with defaults
+    # so every existing positional CronBeat(...) call site (tests included)
+    # keeps working unchanged.
+    last_attempt_run_date: Optional[date] = None
+    last_attempt_outcome_category: Optional[str] = None
+    last_attempt_error_type: Optional[str] = None
+    last_attempt_error_message: Optional[str] = None
 
     def label(self) -> str:
         return f"{self.source_type}/{self.county_id}" if self.county_id else self.source_type
@@ -310,6 +344,26 @@ class CronBeat:
             return f"{hours:.1f}h"
         return f"{hours / 24:.1f}d"
 
+    def last_attempt_label(self, now: Optional[datetime] = None) -> Optional[str]:
+        """"[CATEGORY] on YYYY-MM-DD (Nd ago — no runs recorded since)" for a
+        stale beat, or None if no attempt row exists at all (a source that
+        has genuinely never run). Distinguishes "this failed recently" from
+        "this hasn't run in days and the last thing it ever said was fine"
+        — collapsing those into one bare STALE line is exactly the
+        confusion this method exists to remove."""
+        if self.last_attempt_run_date is None:
+            return None
+        label = format_outcome_label(self.last_attempt_outcome_category, self.last_attempt_error_type)
+        now = now or datetime.now(timezone.utc)
+        days_since = (now.date() - self.last_attempt_run_date).days
+        when = (
+            "today" if days_since == 0
+            else "yesterday" if days_since == 1
+            else f"on {self.last_attempt_run_date.isoformat()} ({days_since}d ago — no runs recorded since)"
+        )
+        suffix = f" — {self.last_attempt_error_message[:160]}" if self.last_attempt_error_message else ""
+        return f"{label} {when}{suffix}"
+
 
 def _last_success(session, source_type: str, county_id: Optional[str]) -> Optional[datetime]:
     query = (
@@ -321,6 +375,23 @@ def _last_success(session, source_type: str, county_id: Optional[str]) -> Option
         query += " AND county_id = :county_id"
         params["county_id"] = county_id
     return session.execute(text(query), params).scalar()
+
+
+def _last_attempt_outcome(session, source_type: str, county_id: Optional[str]) -> Optional[Mapping]:
+    """The single most recent row for this source regardless of
+    run_success — only called for beats already determined stale (a small,
+    bounded set), so this is one extra targeted query per stale source, not
+    a change to the main freshness scan's cost."""
+    query = (
+        "SELECT run_date, outcome_category, error_type, error_message "
+        "FROM scraper_run_stats WHERE source_type = :source_type"
+    )
+    params = {"source_type": source_type}
+    if county_id is not None:
+        query += " AND county_id = :county_id"
+        params["county_id"] = county_id
+    query += " ORDER BY run_date DESC, created_at DESC LIMIT 1"
+    return session.execute(text(query), params).mappings().first()
 
 
 def check_cron_freshness(now: Optional[datetime] = None) -> list[CronBeat]:
@@ -354,9 +425,15 @@ def check_cron_freshness(now: Optional[datetime] = None) -> list[CronBeat]:
                     age_minutes = int((now - last_success).total_seconds() // 60)
                     is_stale = age_minutes > sla_minutes
 
+                last_attempt = _last_attempt_outcome(session, source_type, county_id) if is_stale else None
+
                 beats.append(CronBeat(
                     source_type=source_type, county_id=county_id, sla_minutes=sla_minutes,
                     last_success_at=last_success, age_minutes=age_minutes, is_stale=is_stale,
+                    last_attempt_run_date=last_attempt["run_date"] if last_attempt else None,
+                    last_attempt_outcome_category=last_attempt["outcome_category"] if last_attempt else None,
+                    last_attempt_error_type=last_attempt["error_type"] if last_attempt else None,
+                    last_attempt_error_message=last_attempt["error_message"] if last_attempt else None,
                 ))
 
     return beats
@@ -459,7 +536,7 @@ def check_silent_failures(
     with vera_db.session_scope() as session:
         rows = session.execute(
             text(
-                "SELECT source_type, county_id, total_scraped, error_type, outcome_category "
+                "SELECT source_type, county_id, total_scraped, error_type, outcome_category, error_message "
                 "FROM scraper_run_stats "
                 "WHERE run_date = :run_date AND run_success = true AND total_scraped = 0"
             ),
@@ -719,10 +796,15 @@ def render_live_state_report(
     if stale:
         for beat in sorted(stale, key=lambda b: b.label()):
             age = beat.age_label()
+            last_attempt = beat.last_attempt_label()
             lines.append(
                 f"  STALE  {beat.label():<30} age={age:<10} sla={beat.sla_minutes / 60:.0f}h"
+                + (f"   last recorded outcome: {last_attempt}" if last_attempt else "   last recorded outcome: none — genuinely never run")
             )
-            cron_rows_html.append((beat.label(), age, f"{beat.sla_minutes / 60:.0f}h"))
+            cron_rows_html.append((
+                beat.label(), age, f"{beat.sla_minutes / 60:.0f}h",
+                last_attempt or "none — genuinely never run",
+            ))
     summary_line = f"{fresh_count}/{len(cron_beats)} sources fresh"
     lines.append(f"  {summary_line}")
     sla_legend = "SLA = max time allowed since last successful run before a source is flagged stale."
@@ -730,21 +812,25 @@ def render_live_state_report(
 
     cron_html = ""
     if cron_rows_html:
-        cron_html += html_table(["Source", "Age", "SLA"], cron_rows_html)
+        cron_html += html_table(["Source", "Age", "SLA", "Last recorded outcome"], cron_rows_html)
     cron_html += html_note(summary_line) + html_note(sla_legend)
 
-    # ── SILENT FAILURES ───────────────────────────────────────────────────
-    lines += ["", "SILENT FAILURES"]
+    # ── ZERO-INGEST SOURCES ────────────────────────────────────────────────
+    lines += ["", "ZERO-INGEST SOURCES"]
     confirmed_no_data = silent["zero_ingest_confirmed_no_data"]
     unexplained = silent["zero_ingest_unexplained"]
+
+    def _silent_entry(row: Mapping) -> str:
+        label = format_outcome_label(row.get("outcome_category"), row.get("error_type"))
+        msg = row.get("error_message")
+        base = f"{row['source_type']}/{row['county_id']}  {label}"
+        return f"{base} — {msg[:160]}" if msg else base
 
     if confirmed_no_data:
         lines.append("  ℹ️ No new data today (confirmed — nothing to report):")
         for row in confirmed_no_data:
-            lines.append(f"    - {row['source_type']}/{row['county_id']}")
-        confirmed_no_data_html = html_list(
-            [f"{row['source_type']}/{row['county_id']}" for row in confirmed_no_data]
-        )
+            lines.append(f"    - {_silent_entry(row)}")
+        confirmed_no_data_html = html_list(_silent_entry(row) for row in confirmed_no_data)
     else:
         lines.append("  ℹ️ No new data today (confirmed): none")
         confirmed_no_data_html = html_note("No new data today (confirmed): none")
@@ -752,10 +838,8 @@ def render_live_state_report(
     if unexplained:
         lines.append("  \U0001f527 Scheduled-but-writing-nothing — needs investigation:")
         for row in unexplained:
-            lines.append(f"    - {row['source_type']}/{row['county_id']}")
-        zero_ingest_html = html_list(
-            [f"{row['source_type']}/{row['county_id']}" for row in unexplained]
-        )
+            lines.append(f"    - {_silent_entry(row)}")
+        zero_ingest_html = html_list(_silent_entry(row) for row in unexplained)
     else:
         lines.append("  \U0001f527 Scheduled-but-writing-nothing: none")
         zero_ingest_html = html_note("Scheduled-but-writing-nothing: none")
@@ -772,15 +856,27 @@ def render_live_state_report(
     # ── CRASHED MID-RUN ────────────────────────────────────────────────────
     # Only meaningful for scraper_run()-wrapped sources — un-migrated sources
     # never stamp attempt_started_at, so they can't appear here (not a false
-    # negative, just not yet observable for them).
+    # negative, just not yet observable for them). No category shown here —
+    # a crashed row has no completion write by definition, so there is
+    # nothing classified to show; "started N ago, still nothing" already
+    # says exactly what's known.
+    def _crashed_entry(row: Mapping) -> str:
+        started = row.get("attempt_started_at")
+        if started is None:
+            return f"{row['source_type']}/{row['county_id']}"
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        stuck_for = datetime.now(timezone.utc) - started
+        hours = stuck_for.total_seconds() / 3600
+        duration = f"{hours:.1f}h" if hours < 48 else f"{hours / 24:.1f}d"
+        return f"{row['source_type']}/{row['county_id']} (started {duration} ago, still no completion)"
+
     lines += ["", "CRASHED MID-RUN"]
     if crashed:
         lines.append("  Started but never completed (heartbeat set, no completion write):")
         for row in crashed:
-            lines.append(f"    - {row['source_type']}/{row['county_id']}")
-        crashed_html = html_list(
-            [f"{row['source_type']}/{row['county_id']}" for row in crashed]
-        )
+            lines.append(f"    - {_crashed_entry(row)}")
+        crashed_html = html_list(_crashed_entry(row) for row in crashed)
     else:
         lines.append("  Started but never completed: none")
         crashed_html = html_note("Started but never completed: none")
@@ -802,7 +898,7 @@ def render_live_state_report(
             + html_section("Deploy", deploy_html)
             + html_section("Cron Freshness", cron_html)
             + html_section(
-                "Silent Failures",
+                "Zero-Ingest Sources",
                 "<p style=\"color:#94a3b8;font-size:12px;margin:4px 0;\">No new data today (confirmed — nothing to report):</p>"
                 + confirmed_no_data_html
                 + "<p style=\"color:#94a3b8;font-size:12px;margin:8px 0 4px;\">Scheduled-but-writing-nothing — needs investigation:</p>"

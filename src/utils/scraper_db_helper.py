@@ -282,7 +282,21 @@ def mark_scraper_attempt_started(
             )
             stmt = stmt.on_conflict_do_update(
                 constraint='uq_scraper_run_stats',
-                set_={"attempt_started_at": stmt.excluded.attempt_started_at, "updated_at": stmt.excluded.updated_at},
+                set_={
+                    "attempt_started_at": stmt.excluded.attempt_started_at,
+                    "updated_at": stmt.excluded.updated_at,
+                    # Reset on every heartbeat, not just the first insert of
+                    # the day — without this, a source scraped more than
+                    # once per run_date (e.g. permit_engine.py, 3x/day) keeps
+                    # an earlier run's completed_at timestamp on this row
+                    # even after a later run starts. If that later run then
+                    # crashes before its own completion write,
+                    # completed_at IS NOT NULL still holds (from the earlier
+                    # run), so check_crashed_before_completion() never
+                    # matches it — the exact crash it exists to catch
+                    # becomes invisible. Found in PR review.
+                    "completed_at": None,
+                },
             )
             session.execute(stmt)
             session.commit()
@@ -517,6 +531,7 @@ def load_scraped_data_to_db(
                     # Write no_data rows for expected subtypes absent from today's combined download
                     # so load_validator always sees a row for every subtype (e.g. lien_tcl on days
                     # with zero Tampa Code Liens in the county portal export).
+                    from config.scraper_outcomes import ScraperOutcome
                     for src in set(LIEN_DOCTYPE_TO_SOURCE.values()):
                         if src not in agg:
                             record_scraper_stats(
@@ -526,7 +541,7 @@ def load_scraped_data_to_db(
                                 unmatched=0,
                                 skipped=0,
                                 scored=0,
-                                error_type='no_data',
+                                outcome=ScraperOutcome.NO_DATA.value,
                                 duration_seconds=duration,
                                 county_id=county_id,
                             )

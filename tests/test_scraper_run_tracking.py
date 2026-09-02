@@ -174,3 +174,53 @@ class TestPipelineExitCode:
     def test_false_exits_one(self):
         from src.utils.scraper_run_tracking import pipeline_exit_code
         assert pipeline_exit_code(False) == 1
+
+
+class TestMultiRunPerDayCrashDetection:
+    """Regression for a Critical finding in PR review:
+    mark_scraper_attempt_started()'s heartbeat UPSERT never reset
+    completed_at on a re-run, so a source scraped more than once per
+    run_date (e.g. permit_engine.py, 3x/day per crontab.txt) kept an
+    earlier run's completed_at timestamp on the row even after a later run
+    started. If that later run then crashed before its own completion
+    write, completed_at IS NOT NULL still held (from the earlier run), so
+    check_crashed_before_completion() never matched it — the exact crash it
+    exists to catch became invisible."""
+
+    def test_second_heartbeat_clears_a_stale_completed_at(self, _cleanup):
+        # Run 1: completes successfully, sets completed_at.
+        with scraper_run(_SOURCE_TYPE, "hillsborough", run_date=_FAKE_DATE) as run:
+            run.success()
+        row = _row()
+        assert row["completed_at"] is not None
+
+        # Run 2 (same run_date/source_type/county_id, simulating a
+        # multi-run-per-day source): __enter__'s heartbeat must reset
+        # completed_at back to NULL, not leave run 1's stale value.
+        with scraper_run(_SOURCE_TYPE, "hillsborough", run_date=_FAKE_DATE) as run:
+            row = _row()
+            assert row["attempt_started_at"] is not None
+            assert row["completed_at"] is None
+            run.success()
+
+    def test_crash_on_second_run_is_now_detectable(self, _cleanup):
+        """End-to-end: run 1 completes successfully (sets completed_at).
+        Run 2's process then dies right after the heartbeat, before
+        __exit__ ever runs — a TRUE hard crash (OOM kill, SIGKILL), not a
+        caught Python exception (the wrapper already classifies and
+        completes those correctly on its own via __exit__, which is why
+        this test calls __enter__() directly with no matching __exit__,
+        rather than raising inside a `with` block). The row must look
+        exactly like a crashed mid-run (attempt_started_at set,
+        completed_at NULL), not a stale success held over from run 1."""
+        with scraper_run(_SOURCE_TYPE, "hillsborough", run_date=_FAKE_DATE) as run:
+            run.success()
+        row = _row()
+        assert row["completed_at"] is not None  # run 1 completed normally
+
+        run2 = scraper_run(_SOURCE_TYPE, "hillsborough", run_date=_FAKE_DATE)
+        run2.__enter__()  # heartbeat only — simulates the process dying here
+
+        row = _row()
+        assert row["attempt_started_at"] is not None
+        assert row["completed_at"] is None
