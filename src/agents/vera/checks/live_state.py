@@ -53,6 +53,7 @@ from src.tasks.heartbeat_monitor import (
     MULTI_COUNTY_SOURCES,
     SOURCE_OFF_DAYS,
     FreshnessRegression,
+    effective_sla_minutes,
     newly_stale_labels,
 )
 
@@ -372,12 +373,20 @@ class CronBeat:
         return f"{label} {when}{suffix}"
 
 
-def _last_success(session, source_type: str, county_id: Optional[str]) -> Optional[datetime]:
+def _last_success(session, source_type: str, county_id: Optional[str], now: datetime) -> Optional[datetime]:
+    """Bounded by created_at <= now so a caller evaluating a PAST `now`
+    (check_freshness_regression()'s historical baseline) can't pick up a
+    success recorded after that point and read as fresher than the source
+    actually was at that moment (PR review finding: "historical baseline
+    includes future runs"). created_at is stored as naive UTC, so the bound
+    is stripped to naive UTC too — mirrors heartbeat_monitor._beat_for()'s
+    identical fix."""
+    now_bound = now.replace(tzinfo=None) if now.tzinfo is not None else now
     query = (
         "SELECT MAX(created_at) FROM scraper_run_stats "
-        "WHERE source_type = :source_type AND run_success = true"
+        "WHERE source_type = :source_type AND run_success = true AND created_at <= :now"
     )
-    params = {"source_type": source_type}
+    params = {"source_type": source_type, "now": now_bound}
     if county_id is not None:
         query += " AND county_id = :county_id"
         params["county_id"] = county_id
@@ -401,27 +410,41 @@ def _last_attempt_outcome(session, source_type: str, county_id: Optional[str]) -
     return session.execute(text(query), params).mappings().first()
 
 
-def check_cron_freshness(now: Optional[datetime] = None) -> list[CronBeat]:
+def check_cron_freshness(now: Optional[datetime] = None, include_off_days: bool = False) -> list[CronBeat]:
     """Reuses heartbeat_monitor's HEARTBEAT_SLAS / SOURCE_OFF_DAYS /
     MULTI_COUNTY_SOURCES registries (single source of truth for SLA numbers)
     but re-runs the freshness query through Vera's own read-only session
     (vera_db) instead of heartbeat_monitor.compute_heartbeats(), which reads
     via the app role. Reports only — heartbeat_monitor already pages ops;
-    Vera never double-alerts."""
+    Vera never double-alerts.
+
+    include_off_days=True (used only by check_freshness_regression()'s
+    baseline call, same as heartbeat_monitor.compute_heartbeats()): don't
+    skip a source just because `now` lands on its off-day, and extend its
+    effective SLA via effective_sla_minutes() the same way heartbeat_monitor
+    does — without both of these, a baseline landing on an off-day (e.g. a
+    4-day lookback from Thursday falls on Sunday, the off-day for nearly
+    the whole Mon-Sat fleet) either omits those sources from the baseline
+    entirely or falsely reads them as already-stale, both of which hide a
+    real same-week regression (PR review finding: "Thursday baseline
+    excludes most of the monitored fleet")."""
     now = now or datetime.now(timezone.utc)
     today_wd = now.weekday()
     beats: list[CronBeat] = []
 
     with vera_db.session_scope() as session:
         for source_type, sla_minutes in HEARTBEAT_SLAS.items():
-            if today_wd in SOURCE_OFF_DAYS.get(source_type, set()):
+            off_days = SOURCE_OFF_DAYS.get(source_type, set())
+            if today_wd in off_days and not include_off_days:
                 continue
+
+            effective_sla = effective_sla_minutes(today_wd, off_days, sla_minutes)
 
             counties = MULTI_COUNTY_SOURCES.get(source_type)
             county_list = sorted(counties) if counties else [None]
 
             for county_id in county_list:
-                last_success = _last_success(session, source_type, county_id)
+                last_success = _last_success(session, source_type, county_id, now)
                 if last_success is not None and last_success.tzinfo is None:
                     last_success = last_success.replace(tzinfo=timezone.utc)
 
@@ -430,7 +453,7 @@ def check_cron_freshness(now: Optional[datetime] = None) -> list[CronBeat]:
                     is_stale = True
                 else:
                     age_minutes = int((now - last_success).total_seconds() // 60)
-                    is_stale = age_minutes > sla_minutes
+                    is_stale = age_minutes > effective_sla
 
                 last_attempt = _last_attempt_outcome(session, source_type, county_id) if is_stale else None
 
@@ -461,7 +484,9 @@ def check_freshness_regression(
     the regression too, not just whoever's on-call for the loud alert."""
     now = now or datetime.now(timezone.utc)
     beats_now = check_cron_freshness(now=now)
-    beats_baseline = check_cron_freshness(now=now - timedelta(days=baseline_days))
+    beats_baseline = check_cron_freshness(
+        now=now - timedelta(days=baseline_days), include_off_days=True,
+    )
     newly_stale = newly_stale_labels(beats_now, beats_baseline)
     return FreshnessRegression(
         now_fresh_count=sum(1 for b in beats_now if not b.is_stale),

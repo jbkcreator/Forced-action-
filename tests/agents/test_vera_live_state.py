@@ -403,8 +403,8 @@ def test_render_live_state_report_shows_banner_and_subject_at_threshold():
 def test_check_freshness_regression_diffs_against_four_day_baseline(monkeypatch):
     calls = []
 
-    def fake_check_cron_freshness(now=None):
-        calls.append(now)
+    def fake_check_cron_freshness(now=None, include_off_days=False):
+        calls.append((now, include_off_days))
         is_baseline = len(calls) == 2
         return [CronBeat("permits", "hillsborough", 1500, None, 0, is_stale=not is_baseline)]
 
@@ -414,6 +414,10 @@ def test_check_freshness_regression_diffs_against_four_day_baseline(monkeypatch)
     result = check_freshness_regression(now=now)
 
     assert result.baseline_days == 4
-    assert calls[0] == now
-    assert calls[1] == now - timedelta(days=4)
+    assert calls[0] == (now, False)
+    # include_off_days=True on the baseline call — regression for the
+    # "Thursday baseline excludes most of the monitored fleet" finding:
+    # without it, a baseline landing on a source's off-day silently omits
+    # that source, and it can never be flagged newly stale.
+    assert calls[1] == (now - timedelta(days=4), True)
     assert result.newly_stale == ["permits/hillsborough"]

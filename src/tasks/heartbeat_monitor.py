@@ -174,19 +174,33 @@ MULTI_COUNTY_SOURCES: Dict[str, set] = {
 _WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
 
-def _consecutive_offdays_before(today_wd: int, off_days: set) -> int:
-    """Count consecutive off-days immediately preceding today (looking backward).
+def effective_sla_minutes(weekday: int, off_days: set, sla_minutes: int) -> int:
+    """Extends `sla_minutes` by 1 day for every consecutive off-day the
+    evaluation point falls within or immediately follows.
 
-    Example: today=Mon (0), off_days={6} (Sunday) → returns 1.
-    Used to extend the SLA window so a M-Sat scraper doesn't false-alert on
-    Monday morning before its first run of the week.
+    Two cases, both handled by the same walk-backward logic:
+      - `weekday` is a normal working day right after off-day(s) (e.g.
+        Monday after a Sunday off) → extends so a M-Sat scraper's last
+        Saturday run doesn't false-alert Monday morning before that day's
+        run has had a chance to execute. (Original _consecutive_offdays_before
+        behavior — example: weekday=Mon(0), off_days={6} → 1 day extension.)
+      - `weekday` IS itself an off-day (e.g. evaluating a historical
+        baseline snapshot that happens to land on a Sunday —
+        check_freshness_regression()'s 4-day lookback) → extends from that
+        day too, so the snapshot doesn't read a source as "stale" purely
+        because no run was ever expected on its own off-day. Without this,
+        a baseline landing on an off-day either skips the source entirely
+        (if include_off_days=False) or, once included, would falsely show
+        it as already-stale — both hide a real same-week regression on
+        exactly the day the fix is meant to catch (PR review finding:
+        "Thursday baseline excludes most of the monitored fleet").
     """
-    count = 0
-    wd = (today_wd - 1) % 7
+    skip_days = 0
+    wd = weekday if weekday in off_days else (weekday - 1) % 7
     while wd in off_days:
-        count += 1
+        skip_days += 1
         wd = (wd - 1) % 7
-    return count
+    return sla_minutes + skip_days * 1440
 
 # County used in scraper_alert_log for source-wide (non-multi-county) beats.
 _DEFAULT_ALERT_COUNTY = "hillsborough"
@@ -277,10 +291,19 @@ class Heartbeat:
 
 def _beat_for(session, source_type: str, sla_minutes: int, county_id: Optional[str],
               now: datetime) -> Heartbeat:
-    """Build one Heartbeat from the last successful run of (source_type[, county])."""
+    """Build one Heartbeat from the last successful run of (source_type[, county])
+    as of `now` — bounded by created_at <= now so a caller evaluating a PAST
+    `now` (e.g. check_freshness_regression()'s historical baseline) can't pick
+    up a success recorded AFTER that point and read as fresher than the
+    source actually was at that moment (PR review finding: "historical
+    baseline includes future runs"). created_at is stored as naive UTC
+    (see ScraperRunStats.created_at's tz-aware-but-DateTime-column default),
+    so the bound is stripped to naive UTC too, matching what's in the DB."""
+    now_bound = now.replace(tzinfo=None) if now.tzinfo is not None else now
     query = session.query(func.max(ScraperRunStats.created_at)).filter(
         ScraperRunStats.source_type == source_type,
         ScraperRunStats.run_success.is_(True),
+        ScraperRunStats.created_at <= now_bound,
     )
     if county_id is not None:
         query = query.filter(ScraperRunStats.county_id == county_id)
@@ -303,12 +326,20 @@ def _beat_for(session, source_type: str, sla_minutes: int, county_id: Optional[s
     )
 
 
-def compute_heartbeats(now: Optional[datetime] = None) -> list[Heartbeat]:
+def compute_heartbeats(now: Optional[datetime] = None, include_off_days: bool = False) -> list[Heartbeat]:
     """Compute heartbeat status for every source in HEARTBEAT_SLAS.
 
-    Sources whose entry in SOURCE_OFF_DAYS includes today's weekday are skipped
-    entirely — they're not expected to have run, so a "stale" alert would be
-    a false positive.
+    Sources whose entry in SOURCE_OFF_DAYS includes today's weekday are
+    skipped entirely by default — they're not expected to have run, so a
+    "stale" alert would be a false positive. `include_off_days=True`
+    disables that skip: used only for check_freshness_regression()'s
+    historical baseline snapshot, where "today" is really some past date
+    and off-day sources still need to be evaluated (not silently absent)
+    for the fleet-wide diff to see them — see effective_sla_minutes()'s
+    docstring for why this doesn't reopen the false-stale-on-an-off-day
+    problem the skip originally existed to prevent. Live per-source
+    alerting (run_once()) keeps the default False — an off-day source
+    genuinely shouldn't page today.
 
     Sources listed in MULTI_COUNTY_SOURCES are checked once per expected county
     (a separate Heartbeat per county), so one county's success can't mask
@@ -321,18 +352,14 @@ def compute_heartbeats(now: Optional[datetime] = None) -> list[Heartbeat]:
     with get_db_context() as session:
         for source_type, sla_minutes in HEARTBEAT_SLAS.items():
             off_days = SOURCE_OFF_DAYS.get(source_type, set())
-            if today_wd in off_days:
+            if today_wd in off_days and not include_off_days:
                 logger.info(
                     "[Heartbeat] %s skipped — %s is an off-day for this source",
                     source_type, _WEEKDAY_NAMES[today_wd],
                 )
                 continue
 
-            # Extend SLA by one day per consecutive off-day immediately before today
-            # so a M-Sat scraper's last Saturday run doesn't trip the 25h SLA on
-            # Monday morning before that day's run has had a chance to execute.
-            skip_days = _consecutive_offdays_before(today_wd, off_days)
-            effective_sla = sla_minutes + skip_days * 1440
+            effective_sla = effective_sla_minutes(today_wd, off_days, sla_minutes)
 
             counties = MULTI_COUNTY_SOURCES.get(source_type)
             if counties:
@@ -415,9 +442,17 @@ def check_freshness_regression(
     """Diffs the current heartbeat snapshot against one recomputed
     `baseline_days` ago via compute_heartbeats()'s own `now=` parameter — no
     new storage needed, since scraper_run_stats' history is permanent and
-    doesn't change based on when you ask."""
+    doesn't change based on when you ask. include_off_days=True for the
+    baseline call: a fixed N-day lookback can land on a source's own
+    off-day (e.g. a 4-day baseline from Thursday falls on Sunday, the
+    off-day for nearly the whole Mon-Sat fleet) — without this, those
+    sources would be silently absent from the baseline and could never be
+    flagged as newly stale, exactly hiding the shared-dependency outage
+    this check exists to catch."""
     now = now or datetime.now(timezone.utc)
-    beats_baseline = compute_heartbeats(now=now - timedelta(days=baseline_days))
+    beats_baseline = compute_heartbeats(
+        now=now - timedelta(days=baseline_days), include_off_days=True,
+    )
     newly_stale = newly_stale_labels(beats_now, beats_baseline)
     return FreshnessRegression(
         now_fresh_count=sum(1 for b in beats_now if not b.is_stale),
