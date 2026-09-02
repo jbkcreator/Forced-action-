@@ -23,6 +23,8 @@ from sqlalchemy.orm import Session
 from src.connectors.registry import get_spec
 from src.core.database import get_db_context
 from src.utils.scraper_db_helper import record_scraper_stats
+from src.utils.scraper_outcome_classifier import classify_exception
+from config.scraper_outcomes import ScraperOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +69,7 @@ def run_connector(source_type: str, county_id: str, work_fn: WorkFn, dry_run: bo
     result = ConnectorRunResult()
     success = True
     error_message: str | None = None
+    outcome: str | None = None
 
     try:
         with get_db_context() as session:
@@ -78,6 +81,14 @@ def run_connector(source_type: str, county_id: str, work_fn: WorkFn, dry_run: bo
     except Exception as e:
         success = False
         error_message = str(e)[:500]
+        outcome = classify_exception(e)
+        if outcome == ScraperOutcome.NO_DATA.value:
+            # Unlike evictions_engine.py/flood_engine.py, this runner's own
+            # contract (see docstring) treats ANY raise as a total connector
+            # failure — no ScraperNoDataError carve-out. Passing NO_DATA
+            # through would make record_scraper_stats force run_success=True,
+            # silently disagreeing with the failure exit code below.
+            outcome = ScraperOutcome.UNKNOWN.value
         logger.exception(
             "[%s] connector run failed (county=%s): %s", source_type, county_id, e
         )
@@ -89,6 +100,10 @@ def run_connector(source_type: str, county_id: str, work_fn: WorkFn, dry_run: bo
         error_message = (
             f"{result.errors} row(s) failed to process — see logs for row ids"
         )
+        # No exception was raised — work_fn caught these per-record, so this
+        # is our own processing/matching logic failing on rows we already
+        # read, not a source-side or timeout condition.
+        outcome = ScraperOutcome.INTERNAL_ERROR.value
         logger.error(
             "[%s] completed with %d per-record errors (county=%s, source=%s) — "
             "marking run as failed for retry/alert.",
@@ -104,6 +119,7 @@ def run_connector(source_type: str, county_id: str, work_fn: WorkFn, dry_run: bo
         run_success=success,
         error_type="connector_error" if not success else None,
         error_message=error_message,
+        outcome=outcome,
         duration_seconds=round(duration, 2),
         county_id=county_id,
     )

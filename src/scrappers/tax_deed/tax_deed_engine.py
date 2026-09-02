@@ -30,6 +30,8 @@ from src.utils.logger import setup_logging, get_logger
 from src.utils.county_config import get_county_config
 from src.utils.scraper_db_helper import record_scraper_stats
 from src.utils.http_helpers import get_playwright_proxy
+from src.utils.scraper_outcome_classifier import classify_exception
+from config.scraper_outcomes import ScraperOutcome
 from config.constants import RAW_TAX_DEED_DIR
 
 setup_logging()
@@ -212,6 +214,7 @@ def run_tax_deed_pipeline(
 
     t0 = time.monotonic()
     all_rows: list[dict] = []
+    scrape_exc: Optional[Exception] = None
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True, proxy=get_playwright_proxy())
@@ -229,17 +232,34 @@ def run_tax_deed_pipeline(
         except Exception as exc:
             logger.error("[%s] Scrape failed: %s", county_id, exc)
             logger.debug(traceback.format_exc())
+            scrape_exc = exc
         finally:
             browser.close()
 
     duration_s = time.monotonic() - t0
+
+    if scrape_exc is not None:
+        # Previously this exception was only logged — no scraper_run_stats row
+        # at all, so a real crash was indistinguishable from "never ran."
+        # Whatever partial rows were collected before the crash are dropped
+        # rather than reported as a clean success — a walk that broke midway
+        # is not a confirmed no-data day or a trustworthy result.
+        record_scraper_stats(
+            source_type="tax_deed_auction",
+            total_scraped=0, matched=0, unmatched=0, skipped=0,
+            outcome=classify_exception(scrape_exc),
+            error_message=str(scrape_exc)[:500],
+            duration_seconds=round(duration_s, 2),
+            county_id=county_id,
+        )
+        return None
 
     if not all_rows:
         logger.info("[%s] No auction items found", county_id)
         record_scraper_stats(
             source_type="tax_deed_auction",
             total_scraped=0, matched=0, unmatched=0, skipped=0,
-            run_success=True, error_type="no_data",
+            run_success=True, error_type="no_data", outcome=ScraperOutcome.NO_DATA.value,
             duration_seconds=round(duration_s, 2),
             county_id=county_id,
         )

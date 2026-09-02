@@ -173,6 +173,21 @@ MULTI_COUNTY_SOURCES: Dict[str, set] = {
 
 _WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
+
+def _consecutive_offdays_before(today_wd: int, off_days: set) -> int:
+    """Count consecutive off-days immediately preceding today (looking backward).
+
+    Example: today=Mon (0), off_days={6} (Sunday) → returns 1.
+    Used to extend the SLA window so a M-Sat scraper doesn't false-alert on
+    Monday morning before its first run of the week.
+    """
+    count = 0
+    wd = (today_wd - 1) % 7
+    while wd in off_days:
+        count += 1
+        wd = (wd - 1) % 7
+    return count
+
 # County used in scraper_alert_log for source-wide (non-multi-county) beats.
 _DEFAULT_ALERT_COUNTY = "hillsborough"
 
@@ -285,19 +300,26 @@ def compute_heartbeats(now: Optional[datetime] = None) -> list[Heartbeat]:
 
     with get_db_context() as session:
         for source_type, sla_minutes in HEARTBEAT_SLAS.items():
-            if today_wd in SOURCE_OFF_DAYS.get(source_type, set()):
+            off_days = SOURCE_OFF_DAYS.get(source_type, set())
+            if today_wd in off_days:
                 logger.info(
                     "[Heartbeat] %s skipped — %s is an off-day for this source",
                     source_type, _WEEKDAY_NAMES[today_wd],
                 )
                 continue
 
+            # Extend SLA by one day per consecutive off-day immediately before today
+            # so a M-Sat scraper's last Saturday run doesn't trip the 25h SLA on
+            # Monday morning before that day's run has had a chance to execute.
+            skip_days = _consecutive_offdays_before(today_wd, off_days)
+            effective_sla = sla_minutes + skip_days * 1440
+
             counties = MULTI_COUNTY_SOURCES.get(source_type)
             if counties:
                 for county_id in sorted(counties):
-                    out.append(_beat_for(session, source_type, sla_minutes, county_id, now))
+                    out.append(_beat_for(session, source_type, effective_sla, county_id, now))
             else:
-                out.append(_beat_for(session, source_type, sla_minutes, None, now))
+                out.append(_beat_for(session, source_type, effective_sla, None, now))
     return out
 
 

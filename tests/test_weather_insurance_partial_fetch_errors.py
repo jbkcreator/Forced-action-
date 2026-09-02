@@ -26,7 +26,7 @@ class TestStormPartialZoneFailure:
     def test_one_zone_fails_one_zone_empty_is_scraper_error_not_no_data(self):
         """FLZ151 raises, FLZ251 returns zero alerts -> scraper_error, not no_data."""
         with patch("src.scrappers.storm.storm_engine.get_county", return_value=_mock_county(["FLZ151", "FLZ251"])), \
-             patch("src.scrappers.storm.storm_engine.requests.get") as mock_get, \
+             patch("src.scrappers.storm.storm_engine.requests_get_with_retry") as mock_get, \
              patch("src.utils.scraper_db_helper.record_scraper_stats") as mock_stats:
 
             def side_effect(url, **kwargs):
@@ -52,7 +52,7 @@ class TestFloodPartialZoneFailure:
         with patch("src.scrappers.flood.flood_engine.get_county", return_value=_mock_county(["FLZ151", "FLZ251"])), \
              patch("src.scrappers.flood.flood_engine._fetch_fema_declarations", return_value=([], None)), \
              patch("src.scrappers.flood.flood_engine._fetch_nfip_claims", return_value=([], None)), \
-             patch("src.scrappers.flood.flood_engine.requests.get") as mock_get, \
+             patch("src.scrappers.flood.flood_engine.requests_get_with_retry") as mock_get, \
              patch("src.utils.scraper_db_helper.record_scraper_stats") as mock_stats:
 
             def side_effect(url, **kwargs):

@@ -1044,9 +1044,10 @@ def run_eviction_pipeline(
             )
             try:
                 from src.utils.scraper_db_helper import record_scraper_stats
+                from config.scraper_outcomes import ScraperOutcome
                 record_scraper_stats(
                     source_type="evictions", total_scraped=0, matched=0, unmatched=0, skipped=0,
-                    run_success=False, error_type="export_unavailable",
+                    error_type="export_unavailable", outcome=ScraperOutcome.TIMEOUT.value,
                     duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id,
                 )
             except Exception as _se:
@@ -1059,9 +1060,10 @@ def run_eviction_pipeline(
             logger.warning("[evictions] No eviction cases found")
             try:
                 from src.utils.scraper_db_helper import record_scraper_stats
+                from config.scraper_outcomes import ScraperOutcome
                 record_scraper_stats(
                     source_type="evictions", total_scraped=0, matched=0, unmatched=0, skipped=0,
-                    run_success=True, error_type="no_data",
+                    error_type="no_data", outcome=ScraperOutcome.NO_DATA.value,
                     duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id,
                 )
             except Exception as _se:
@@ -1080,16 +1082,27 @@ def run_eviction_pipeline(
     except Exception as e:
         logger.error("[evictions] Pipeline failed: %s", e)
         logger.debug(traceback.format_exc())
+        from src.utils.scraper_outcome_classifier import classify_exception
+        from config.scraper_outcomes import ScraperOutcome
+        classified = classify_exception(e)
         try:
             from src.utils.scraper_db_helper import record_scraper_stats
+            # No hardcoded run_success=False here on purpose: a ScraperNoDataError
+            # (e.g. download_latest_civil_filing's "no civil filing found for
+            # date") legitimately reaches this branch, and forcing False would
+            # misreport a genuine no-data day as a failure — the same bug class
+            # this whole classification system exists to close.
             record_scraper_stats(
                 source_type="evictions", total_scraped=0, matched=0, unmatched=0, skipped=0,
-                run_success=False, error_message=str(e)[:500],
+                outcome=classified, error_message=str(e)[:500],
                 duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id,
             )
         except Exception as _se:
             logger.warning("[evictions] Could not record scraper stats: %s", _se)
-        return False
+        # Match the DB row's classification: a NO_DATA-classified exception is
+        # a clean no-data day per this pipeline's own tri-state contract, not a
+        # pipeline failure — keep the return value and the stats row in agreement.
+        return "no_data" if classified == ScraperOutcome.NO_DATA.value else False
 
 
 if __name__ == "__main__":
@@ -1154,4 +1167,5 @@ if __name__ == "__main__":
         else:
             logger.warning("[evictions] no docket detail JSON found — skipping detail apply")
 
-    sys.exit(0 if pipeline_ok else 1)
+    from src.utils.scraper_run_tracking import pipeline_exit_code
+    sys.exit(pipeline_exit_code(result))

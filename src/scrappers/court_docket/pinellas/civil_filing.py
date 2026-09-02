@@ -483,7 +483,7 @@ async def scrape_pinellas_civil_with_detail(
                             await dl.save_as(str(excel_path))
                             logger.info("[%s] Excel exported: %s", tag, excel_path.name)
                     # re-ensure the grid is still present for the click-through
-                    await page.wait_for_selector("a[href*='CaseDetails']", timeout=15000)
+                    await page.wait_for_selector("a[href*='CaseDetails']", timeout=45000)
                 except Exception as exc:
                     logger.warning("[%s] Excel export issue (detail continues): %s", tag, exc)
 

@@ -433,18 +433,26 @@ def enrich_llc_owners(
     return stats
 
 
-def sunbiz_run_verdict(stats: dict) -> Tuple[bool, Optional[str], Optional[str]]:
+def sunbiz_run_verdict(stats: dict) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
     """Single source of truth for a Sunbiz run's health verdict.
 
-    Returns ``(run_success, error_type, error_message)``. Three outcomes:
+    Returns ``(run_success, error_type, error_message, outcome)``. Three outcomes:
 
       - **rate_limited** — Sunbiz throttled the session (circuit breaker tripped
         on consecutive timeouts). Unprocessed owners keep sunbiz_status='pending'
         and resume next run, so this is informational: ``run_success=True``.
+        ``outcome=None`` deliberately — this is a genuine source-side condition,
+        but config.scraper_outcomes.derive_run_success would force run_success
+        to False for any of the 5 real categories (SOURCE_ERROR included),
+        which would regress the exact false-alarm bug this verdict function
+        was written to fix (see below). It stays a legacy-only (error_type)
+        signal rather than joining the enforced outcome_category vocabulary.
       - **broken** — failures are frequent (``failed >= 3`` AND ``> 15%`` rate),
-        i.e. a real site-wide problem: ``run_success=False``.
+        i.e. a real site-wide problem: ``run_success=False``,
+        ``outcome=SOURCE_ERROR`` (site-wide Playwright failures, not our bug).
       - **healthy** — everything else, including the routine 1-2 no-match /
-        one-off Playwright hiccups seen at ~200 owners/day: ``run_success=True``.
+        one-off Playwright hiccups seen at ~200 owners/day: ``run_success=True``,
+        ``outcome=None`` (clean success — no reclassification needed).
 
     Both entry points (the ``sunbiz_enrichment`` cron task and this standalone
     engine) call this, so the verdict can never drift. It did drift before: the
@@ -457,16 +465,17 @@ def sunbiz_run_verdict(stats: dict) -> Tuple[bool, Optional[str], Optional[str]]
             f"consecutive timeouts — aborted with "
             f"{stats.get('remaining_unprocessed', 0)} owner(s) unprocessed; "
             f"will resume next run"
-        )
+        ), None
     processed = stats.get("processed", 0)
     failed = stats.get("failed", 0)
     failure_rate = failed / processed if processed else 0
     if failed >= 3 and failure_rate > 0.15:
+        from config.scraper_outcomes import ScraperOutcome
         return False, "scraper_error", (
             f"{failed} owner(s) failed Playwright scrape "
             f"({failure_rate:.0%} failure rate)"
-        )
-    return True, None, None
+        ), ScraperOutcome.SOURCE_ERROR.value
+    return True, None, None, None
 
 
 def run_sunbiz_pipeline(
@@ -523,7 +532,7 @@ def run_sunbiz_pipeline(
         try:
             from src.utils.scraper_db_helper import record_scraper_stats
 
-            run_success, error_type, error_message = sunbiz_run_verdict(stats)
+            run_success, error_type, error_message, outcome = sunbiz_run_verdict(stats)
             record_scraper_stats(
                 source_type="sunbiz",
                 total_scraped=stats["processed"],
@@ -533,6 +542,7 @@ def run_sunbiz_pipeline(
                 run_success=run_success,
                 error_type=error_type,
                 error_message=error_message,
+                outcome=outcome,
                 county_id=county_id,
             )
         except Exception as e:

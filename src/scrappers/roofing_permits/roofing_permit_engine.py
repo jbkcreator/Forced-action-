@@ -89,48 +89,65 @@ def scrape_roofing_permits(
     skipped_no_property = 0
     skipped_duplicate = 0
 
-    with get_db_context() as db:
-        permits = db.execute(
-            select(BuildingPermit)
-            .where(
-                and_(
-                    BuildingPermit.county_id == county_id,
-                    BuildingPermit.issue_date >= start_date,
-                    BuildingPermit.issue_date <= end_date,
-                    _keyword_filter(county_id),
-                )
-            )
-        ).scalars().all()
-
-        for permit in permits:
-            if not permit.property_id:
-                skipped_no_property += 1
-                continue
-
-            existing = db.execute(
-                select(Incident).where(
+    try:
+        with get_db_context() as db:
+            permits = db.execute(
+                select(BuildingPermit)
+                .where(
                     and_(
-                        Incident.property_id == permit.property_id,
-                        Incident.incident_type == "roofing_permit",
-                        Incident.incident_date == permit.issue_date,
+                        BuildingPermit.county_id == county_id,
+                        BuildingPermit.issue_date >= start_date,
+                        BuildingPermit.issue_date <= end_date,
+                        _keyword_filter(county_id),
                     )
                 )
-            ).scalars().first()
+            ).scalars().all()
 
-            if existing:
-                skipped_duplicate += 1
-                continue
+            for permit in permits:
+                if not permit.property_id:
+                    skipped_no_property += 1
+                    continue
 
-            incident = Incident(
-                property_id=permit.property_id,
-                incident_type="roofing_permit",
-                incident_date=permit.issue_date,
+                existing = db.execute(
+                    select(Incident).where(
+                        and_(
+                            Incident.property_id == permit.property_id,
+                            Incident.incident_type == "roofing_permit",
+                            Incident.incident_date == permit.issue_date,
+                        )
+                    )
+                ).scalars().first()
+
+                if existing:
+                    skipped_duplicate += 1
+                    continue
+
+                incident = Incident(
+                    property_id=permit.property_id,
+                    incident_type="roofing_permit",
+                    incident_date=permit.issue_date,
+                    county_id=county_id,
+                )
+                db.add(incident)
+                created += 1
+
+            db.commit()
+    except Exception as exc:
+        # Previously uncaught here — a real DB/query failure escaped with NO
+        # scraper_run_stats row at all, indistinguishable from "never ran."
+        logger.error("[roofing_permits] Pipeline failed: %s", exc)
+        try:
+            from src.utils.scraper_db_helper import record_scraper_stats
+            from src.utils.scraper_outcome_classifier import classify_exception
+            record_scraper_stats(
+                source_type='roofing_permits',
+                total_scraped=0, matched=0, unmatched=0, skipped=0,
+                outcome=classify_exception(exc), error_message=str(exc)[:500],
                 county_id=county_id,
             )
-            db.add(incident)
-            created += 1
-
-        db.commit()
+        except Exception as stats_err:
+            logger.warning("⚠ Could not record scraper stats (non-critical): %s", stats_err)
+        raise
 
     if skipped_no_property:
         logger.warning(

@@ -159,7 +159,7 @@ def run(
             # Shared verdict with the standalone engine — tolerant of the routine
             # 1-2 no-match/one-off Playwright failures at 200 owners/day. The old
             # zero-tolerance `stats["failed"] == 0` rule false-alarmed daily.
-            run_success, error_type, error_message = sunbiz_run_verdict(stats)
+            run_success, error_type, error_message, outcome = sunbiz_run_verdict(stats)
             record_scraper_stats(
                 source_type="sunbiz",
                 total_scraped=stats["processed"],
@@ -169,6 +169,7 @@ def run(
                 run_success=run_success,
                 error_type=error_type,
                 error_message=error_message,
+                outcome=outcome,
                 county_id=county_id,
             )
 

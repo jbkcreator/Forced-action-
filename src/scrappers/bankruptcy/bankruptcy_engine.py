@@ -60,7 +60,7 @@ COURTLISTENER_PAGE_DELAY_SECONDS = 13.0
 COURTLISTENER_MAX_PAGES = 5
 # If CourtListener hands back a Retry-After longer than this, fail the run fast
 # (cron retries next cycle) rather than hang for hours or hammer into a longer ban.
-COURTLISTENER_MAX_RETRY_DELAY_SECONDS = 120
+COURTLISTENER_MAX_RETRY_DELAY_SECONDS = 600
 
 
 def fetch_bankruptcy_filings(lookback_days: int = 1, court_code: str = COURT_CODE_FLORIDA_MIDDLE_BANKRUPTCY) -> List[Dict[str, Any]]:
@@ -330,8 +330,9 @@ def run_bankruptcy_pipeline(lookback_days: int = 1, county_id: str = "hillsborou
 		if not dockets:
 			logger.warning("No bankruptcy filings found in the specified date range")
 			try:
+				from config.scraper_outcomes import ScraperOutcome
 				from src.utils.scraper_db_helper import record_scraper_stats
-				record_scraper_stats(source_type='bankruptcy', total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=True, error_type='no_data', duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id)
+				record_scraper_stats(source_type='bankruptcy', total_scraped=0, matched=0, unmatched=0, skipped=0, outcome=ScraperOutcome.NO_DATA.value, duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id)
 			except Exception as _se:
 				logger.warning("Could not record scraper stats: %s", _se)
 			return False
@@ -343,8 +344,9 @@ def run_bankruptcy_pipeline(lookback_days: int = 1, county_id: str = "hillsborou
 		if not tampa_leads:
 			logger.warning("No Tampa bankruptcy cases found - pipeline completed but no data to save")
 			try:
+				from config.scraper_outcomes import ScraperOutcome
 				from src.utils.scraper_db_helper import record_scraper_stats
-				record_scraper_stats(source_type='bankruptcy', total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=True, error_type='no_data', duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id)
+				record_scraper_stats(source_type='bankruptcy', total_scraped=0, matched=0, unmatched=0, skipped=0, outcome=ScraperOutcome.NO_DATA.value, duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id)
 			except Exception as _se:
 				logger.warning("Could not record scraper stats: %s", _se)
 			return False
@@ -358,8 +360,14 @@ def run_bankruptcy_pipeline(lookback_days: int = 1, county_id: str = "hillsborou
 		if not output_path:
 			logger.error("Failed to save bankruptcy leads")
 			try:
+				# save_bankruptcy_leads() catches its own PermissionError/IOError/
+				# Exception internally and just returns None — the real exception
+				# never reaches this call site, so this is classified directly as
+				# INTERNAL_ERROR (a local disk/permission failure is unambiguously
+				# our fault, not the vendor's) rather than needing classify_exception().
+				from config.scraper_outcomes import ScraperOutcome
 				from src.utils.scraper_db_helper import record_scraper_stats
-				record_scraper_stats(source_type='bankruptcy', total_scraped=len(tampa_leads), matched=0, unmatched=0, skipped=0, run_success=False, error_message='Failed to save bankruptcy leads CSV', duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id)
+				record_scraper_stats(source_type='bankruptcy', total_scraped=len(tampa_leads), matched=0, unmatched=0, skipped=0, outcome=ScraperOutcome.INTERNAL_ERROR.value, error_message='Failed to save bankruptcy leads CSV', duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id)
 			except Exception as _se:
 				logger.warning("Could not record scraper stats: %s", _se)
 			return False
@@ -381,7 +389,8 @@ def run_bankruptcy_pipeline(lookback_days: int = 1, county_id: str = "hillsborou
 		logger.error("=" * 80)
 		try:
 			from src.utils.scraper_db_helper import record_scraper_stats
-			record_scraper_stats(source_type='bankruptcy', total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=False, error_message=str(e)[:500], duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id)
+			from src.utils.scraper_outcome_classifier import classify_exception
+			record_scraper_stats(source_type='bankruptcy', total_scraped=0, matched=0, unmatched=0, skipped=0, outcome=classify_exception(e), error_message=str(e)[:500], duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id)
 		except Exception as _se:
 			logger.warning("Could not record scraper stats: %s", _se)
 		return False

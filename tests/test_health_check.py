@@ -46,7 +46,18 @@ class TestEscalate:
 
 # ── _classify_scraper_issues ─────────────────────────────────────────────────
 
-def _row(source_type, error_type, error_message, run_success, d=date(2026, 7, 8)):
+def _row(source_type, error_type, error_message, run_success, d=date(2026, 7, 8),
+         outcome_category=None):
+    return SimpleNamespace(
+        source_type=source_type, error_type=error_type,
+        error_message=error_message, run_date=d, run_success=run_success,
+        outcome_category=outcome_category,
+    )
+
+
+def _legacy_row(source_type, error_type, error_message, run_success, d=date(2026, 7, 8)):
+    """A row shaped like it predates outcome_category entirely (no attribute
+    at all, not just None) — exercises the getattr(...) default fallback."""
     return SimpleNamespace(
         source_type=source_type, error_type=error_type,
         error_message=error_message, run_date=d, run_success=run_success,
@@ -114,6 +125,41 @@ class TestClassifyScraperIssues:
         ])
         assert len(errors) == 1
         assert errors[0]["error_type"] == "scraper_error"
+
+    def test_outcome_category_no_data_wins_even_with_mismatched_error_type(self):
+        """outcome_category is the enforced, authoritative signal for migrated
+        sources — checked before error_type, not just alongside it."""
+        errors, data_unavailable = _classify_scraper_issues([
+            _row("flood_damage", "scraper_error", "stale legacy label", False,
+                 outcome_category="NO_DATA"),
+        ])
+        assert errors == []
+        assert len(data_unavailable) == 1
+        assert data_unavailable[0]["reason"] == "no_data"
+
+    def test_outcome_category_timeout_is_a_real_error(self):
+        """A migrated source's TIMEOUT/SOURCE_ERROR/INTERNAL_ERROR/UNKNOWN
+        outcome forces run_success=False by construction, so it already lands
+        in real_errors via the existing `not r.run_success` branch — no
+        special-casing needed beyond the NO_DATA carve-out."""
+        errors, data_unavailable = _classify_scraper_issues([
+            _row("flood_damage", "scraper_error", "FEMA read timed out", False,
+                 outcome_category="TIMEOUT"),
+        ])
+        assert data_unavailable == []
+        assert len(errors) == 1
+        assert errors[0]["message"] == "FEMA read timed out"
+
+    def test_unmigrated_source_falls_back_to_legacy_error_type_when_no_attribute(self):
+        """A row from before outcome_category existed (no attribute at all,
+        not just None) must not crash — falls back to the legacy error_type
+        string check exactly as before."""
+        errors, data_unavailable = _classify_scraper_issues([
+            _legacy_row("evictions", "no_data", None, True),
+        ])
+        assert errors == []
+        assert len(data_unavailable) == 1
+        assert data_unavailable[0]["reason"] == "no_data"
 
     def test_unclassified_zero_rows_is_data_unavailable_not_an_error(self):
         """run_success=True + 0 rows + no explicit no_data marker (e.g. a

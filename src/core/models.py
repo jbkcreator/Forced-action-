@@ -2048,6 +2048,18 @@ class ScraperRunStats(Base):
     error_message: Mapped[Optional[str]] = mapped_column(Text)
     duration_seconds: Mapped[Optional[float]] = mapped_column(Numeric(10, 2))
 
+    # Outcome classification (replaces free-text error_type going forward —
+    # see config/scraper_outcomes.py). NULL = clean success with real data,
+    # same role error_type=NULL/'none' already played. Additive: old callers
+    # that never pass outcome= keep writing error_type exactly as before;
+    # nothing here is populated until a call site opts in.
+    outcome_category: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    # Heartbeat pair distinguishing "genuinely never ran" from "ran and
+    # crashed before ever reaching the completion write" — only populated by
+    # call sites using src.utils.scraper_run_tracking.scraper_run().
+    attempt_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
     # Audit
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
@@ -2072,6 +2084,11 @@ class ScraperRunStats(Base):
             "'deed_flip_outcomes', 'probate_lien_outcomes', 'lis_pendens_outcomes'"
             ")",
             name="check_run_stats_source_type",
+        ),
+        CheckConstraint(
+            "outcome_category IS NULL OR outcome_category IN "
+            "('NO_DATA','TIMEOUT','SOURCE_ERROR','INTERNAL_ERROR','UNKNOWN')",
+            name="check_run_stats_outcome_category",
         ),
     )
 
@@ -5245,8 +5262,16 @@ class CountySource(Base):
     special_flags: Mapped[Optional[dict]] = mapped_column(JSONB, default=dict)
     # Scrape-mode enum (DB-side CHECK constraint enforces values):
     #   ai_only            — browser-use Agent only
-    #   playwright_only    — execute cached playwright_code only; no AI fallback
-    #   playwright_then_ai — try cached code first, fall back to AI on failure
+    #   playwright_only    — execute cached playwright_code (Playwright driver) only; no AI fallback
+    #   playwright_then_ai — try cached code (Playwright driver) first, fall back to AI on failure
+    #   nodriver_only      — execute cached playwright_code (nodriver driver) only; no AI fallback
+    #   nodriver_then_ai   — try cached code (nodriver driver) first, fall back to AI on failure
+    #   nodriver_* is for CF-protected portals where Playwright's CDP fingerprint
+    #   re-triggers Cloudflare Turnstile even on a warmed profile (see
+    #   docs/MULTI_COUNTY_SCRAPING_ARCHITECTURE.md Section 4). The stored
+    #   playwright_code contract is identical either way — execute_playwright_code()
+    #   is driver-agnostic, it just hands the code whatever page-like object the
+    #   engine launched (Playwright Page or nodriver Tab).
     scrape_mode: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
@@ -5300,7 +5325,8 @@ class CountySource(Base):
         Index("idx_county_sources_signal_type", "signal_type"),
         Index("idx_county_sources_is_active", "is_active"),
         CheckConstraint(
-            "scrape_mode IN ('ai_only','playwright_only','playwright_then_ai','static_download','api')",
+            "scrape_mode IN ('ai_only','playwright_only','playwright_then_ai',"
+            "'nodriver_only','nodriver_then_ai','static_download','api')",
             name="ck_county_sources_scrape_mode",
         ),
         CheckConstraint(

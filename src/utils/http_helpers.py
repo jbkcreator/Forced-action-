@@ -187,7 +187,18 @@ def get_requests_proxies(rotate: bool = False) -> Optional[dict]:
 
 
 # Retry on network-level failures and server errors; never retry on client errors (4xx)
-_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+def _scale_timeout(timeout, multiplier: float):
+    """Scale a requests `timeout` value (a number, or a (connect, read) tuple) by
+    `multiplier`, preserving whichever shape the caller passed. None passes through
+    unchanged — there's nothing to escalate if no timeout was set to begin with."""
+    if timeout is None:
+        return None
+    if isinstance(timeout, tuple):
+        return tuple(round(t * multiplier, 1) if t is not None else None for t in timeout)
+    return round(timeout * multiplier, 1)
 
 
 def requests_get_with_retry(
@@ -196,6 +207,7 @@ def requests_get_with_retry(
     retry_delay: int = 5,
     use_proxy: bool = False,
     max_retry_delay: Optional[int] = None,
+    timeout_backoff_multiplier: float = 2.0,
     **kwargs,
 ) -> requests.Response:
     """
@@ -208,12 +220,22 @@ def requests_get_with_retry(
     Does NOT retry on:
       - 4xx client errors (except 429)
 
+    On a plain requests.Timeout specifically (not ConnectionError, not an HTTP
+    status), the `timeout` kwarg — if the caller passed one — is multiplied by
+    timeout_backoff_multiplier before the next attempt. Retrying with the exact
+    same ceiling just reproduces the same timeout against a source that's merely
+    slow rather than down; a source genuinely down still exhausts max_retries and
+    raises normally, since ConnectionError isn't escalated. Bounded automatically
+    by max_retries — no separate cap needed.
+
     Args:
-        url:         Target URL.
-        max_retries: Number of attempts before giving up (default 5).
-        retry_delay: Seconds to wait between attempts (default 5).
-        use_proxy:   Route through Oxylabs proxy if credentials are configured.
-        **kwargs:    Forwarded to requests.get (headers, params, timeout, etc.).
+        url:                      Target URL.
+        max_retries:              Number of attempts before giving up (default 5).
+        retry_delay:              Seconds to wait between attempts (default 5).
+        use_proxy:                Route through Oxylabs proxy if credentials are configured.
+        timeout_backoff_multiplier: Growth factor applied to `timeout` after each
+                                   plain Timeout (default 2.0 — doubles each retry).
+        **kwargs:                 Forwarded to requests.get (headers, params, timeout, etc.).
 
     Returns:
         requests.Response
@@ -222,20 +244,37 @@ def requests_get_with_retry(
         requests.HTTPError, requests.Timeout, requests.ConnectionError, etc.
     """
     _proxy_warned = False
+    request_kwargs = dict(kwargs)
     for attempt in range(1, max_retries + 1):
-        request_kwargs = kwargs
+        call_kwargs = request_kwargs
         if use_proxy:
             proxies = get_requests_proxies()
             if proxies:
-                request_kwargs = {**kwargs, "proxies": proxies}
+                call_kwargs = {**request_kwargs, "proxies": proxies}
             elif not _proxy_warned:
                 logger.warning("[Proxy] use_proxy=True but OXYLABS_USERNAME/PASSWORD not set — sending direct")
                 _proxy_warned = True
         try:
-            response = requests.get(url, **request_kwargs)  # type: ignore[arg-type]
+            response = requests.get(url, **call_kwargs)  # type: ignore[arg-type]
             response.raise_for_status()
             return response
-        except (requests.Timeout, requests.ConnectionError) as e:
+        except requests.Timeout as e:
+            if attempt < max_retries:
+                old_timeout = request_kwargs.get("timeout")
+                new_timeout = _scale_timeout(old_timeout, timeout_backoff_multiplier)
+                if new_timeout is not None:
+                    request_kwargs = {**request_kwargs, "timeout": new_timeout}
+                logger.warning(
+                    f"Request attempt {attempt}/{max_retries} timed out ({e}) — "
+                    f"retrying in {retry_delay}s"
+                    + (f" with timeout {old_timeout}->{new_timeout}" if new_timeout is not None else "")
+                    + "..."
+                )
+                time.sleep(retry_delay)
+                continue
+            logger.error(f"All {max_retries} request attempts exhausted: {e}")
+            raise
+        except requests.ConnectionError as e:
             if attempt < max_retries:
                 logger.warning(
                     f"Request attempt {attempt}/{max_retries} failed ({type(e).__name__}): {e}"
@@ -247,7 +286,7 @@ def requests_get_with_retry(
             raise
         except requests.HTTPError as e:
             status = e.response.status_code if e.response is not None else 0
-            if status in _RETRYABLE_STATUS_CODES and attempt < max_retries:
+            if status in RETRYABLE_STATUS_CODES and attempt < max_retries:
                 wait = retry_delay
                 if status == 429 and e.response is not None:
                     wait = _parse_retry_after(e.response.headers.get("Retry-After"), retry_delay)
@@ -296,7 +335,7 @@ def requests_post_with_retry(
             raise
         except requests.HTTPError as e:
             status = e.response.status_code if e.response is not None else 0
-            if status in _RETRYABLE_STATUS_CODES and attempt < max_retries:
+            if status in RETRYABLE_STATUS_CODES and attempt < max_retries:
                 logger.warning(
                     f"POST attempt {attempt}/{max_retries} got HTTP {status}: {e}"
                     f" — retrying in {retry_delay}s..."

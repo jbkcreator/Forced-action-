@@ -457,8 +457,14 @@ def save_processed_probate(df: pd.DataFrame, county_id: str = "hillsborough", ou
 def run_probate_pipeline(
     target_date: str = None, county_id: str = "hillsborough",
     headful: bool = False, no_proxy: bool = False,
-) -> bool:
-    """Full pipeline: download → process → dedup → save. Returns True on success."""
+):
+    """Full pipeline: download → process → dedup → save.
+
+    Returns True when new records were written (caller should load them),
+    "no_data" when the run succeeded but genuinely found nothing (not a
+    failure — exit code should still be 0, but there is no CSV to load), or
+    False on an actual pipeline failure. Mirrors evictions_engine.py's
+    tri-state contract."""
     t0 = time.monotonic()
     county_cfg = get_county_config(county_id)
     logger.info("=" * 60)
@@ -483,9 +489,10 @@ def run_probate_pipeline(
             )
             try:
                 from src.utils.scraper_db_helper import record_scraper_stats
+                from config.scraper_outcomes import ScraperOutcome
                 record_scraper_stats(
                     source_type="probate", total_scraped=0, matched=0, unmatched=0, skipped=0,
-                    run_success=False, error_type="export_unavailable",
+                    error_type="export_unavailable", outcome=ScraperOutcome.TIMEOUT.value,
                     duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id,
                 )
             except Exception as _se:
@@ -503,16 +510,27 @@ def run_probate_pipeline(
     except Exception as e:
         logger.error("[probate] Pipeline failed: %s", e)
         logger.debug(traceback.format_exc())
+        from src.utils.scraper_outcome_classifier import classify_exception
+        from config.scraper_outcomes import ScraperOutcome
+        # No hardcoded run_success=False here on purpose: a ScraperNoDataError
+        # (download_latest_probate_filing's "no probate filing found for
+        # date") legitimately reaches this branch, and forcing False would
+        # misreport a genuine no-data day as a failure.
+        classified = classify_exception(e)
         try:
             from src.utils.scraper_db_helper import record_scraper_stats
             record_scraper_stats(
                 source_type="probate", total_scraped=0, matched=0, unmatched=0, skipped=0,
-                run_success=False, error_message=str(e)[:500],
+                outcome=classified, error_message=str(e)[:500],
                 duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id,
             )
         except Exception as _se:
             logger.warning("[probate] Could not record scraper stats: %s", _se)
-        return False
+        # Match the DB row's classification: a NO_DATA-classified exception is
+        # a clean no-data day, not a pipeline failure — keep the return value
+        # and the stats row in agreement (mirrors evictions_engine.py's
+        # tri-state contract).
+        return "no_data" if classified == ScraperOutcome.NO_DATA.value else False
 
 
 if __name__ == "__main__":
@@ -533,10 +551,12 @@ if __name__ == "__main__":
     add_load_to_db_arg(parser)
     args = parser.parse_args()
 
-    success = run_probate_pipeline(
+    result = run_probate_pipeline(
         target_date=args.date, county_id=args.county_id,
         headful=args.headful, no_proxy=args.no_proxy,
     )
+    success = result is True           # new records were written — proceed to load
+    pipeline_ok = result is not False  # True or "no_data" both count as a clean run
 
     if success and args.load_to_db:
         try:
@@ -552,8 +572,10 @@ if __name__ == "__main__":
         except Exception as e:
             logger.error("[probate] DB load failed: %s", e)
             sys.exit(1)
-    elif args.load_to_db:
+    elif args.load_to_db and not pipeline_ok:
         logger.warning("[probate] Skipping database load due to scraping failure")
+    elif args.load_to_db:
+        logger.info("[probate] No new probate cases today — nothing to load")
 
     # Stage 2 — court-docket detail enrichment (Pinellas only, same daily run).
     # Forward-only (today's rows); never fails the run (enrich returns, never raises).
@@ -568,4 +590,8 @@ if __name__ == "__main__":
         else:
             logger.warning("[probate] no docket detail JSON found — skipping detail apply")
 
-    sys.exit(0 if success else 1)
+    # pipeline_ok (True or "no_data"), not success — a genuine no-data day is
+    # not a failure and must exit 0, or run.sh's retry/alert logic pages on
+    # a clean run.
+    from src.utils.scraper_run_tracking import pipeline_exit_code
+    sys.exit(pipeline_exit_code(result))

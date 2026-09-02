@@ -54,7 +54,10 @@ def _ops_alert(subject: str, body: str) -> None:
         logger.warning("[bk-task] failed to send ops alert", exc_info=True)
 
 
-def _record_stats(*, total: int, matched: int, success: bool, error: Optional[str], duration: float) -> None:
+def _record_stats(
+    *, total: int, matched: int, success: bool, error: Optional[str],
+    duration: float, outcome: Optional[str] = None,
+) -> None:
     try:
         from src.utils.scraper_db_helper import record_scraper_stats
         record_scraper_stats(
@@ -63,8 +66,9 @@ def _record_stats(*, total: int, matched: int, success: bool, error: Optional[st
             matched=matched,
             unmatched=0,
             skipped=0,
-            run_success=success,
+            run_success=success if outcome is None else None,
             error_message=(error[:500] if error else None),
+            outcome=outcome,
             duration_seconds=round(duration, 2),
             county_id="hillsborough",
         )
@@ -136,6 +140,7 @@ def run(
             success=ingest_result.success,
             error=ingest_result.error,
             duration=duration,
+            outcome=ingest_result.outcome,
         )
 
     logger.info("[bk-task] %s", json.dumps(summary, default=str))

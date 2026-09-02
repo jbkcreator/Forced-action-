@@ -115,7 +115,8 @@ scrapers.
 
 ```sql
 CHECK (scrape_mode IN (
-  'ai_only', 'playwright_only', 'playwright_then_ai', 'static_download', 'api'
+  'ai_only', 'playwright_only', 'playwright_then_ai',
+  'nodriver_only', 'nodriver_then_ai', 'static_download', 'api'
 ))
 ```
 
@@ -175,6 +176,28 @@ back to the browser-use AI agent.
 **Use when:** Playwright is preferred for speed and consistency, but AI recovery is
 acceptable as a safety net. Example: violations engine — Accela portal scraping where
 a DOM change should not halt the entire daily run.
+
+### `nodriver_only` / `nodriver_then_ai`
+
+Identical semantics to `playwright_only` / `playwright_then_ai` — execute the stored
+`playwright_code`, abort or fall back to AI on failure — but the engine launches
+`nodriver` (the CDP-driven, undetected-chromedriver successor) instead of Playwright
+to host the page. `execute_playwright_code()` (in `action_sequence.py`) is
+driver-agnostic: it just calls the stored `run_scrape(page, ...)` function with
+whatever page-like object it's handed, so the same function contract, storage,
+validation, versioning, and approval workflow apply unchanged — only the object
+passed as `page` differs (a nodriver `Tab`, not a Playwright `Page`), which means
+`page`-level calls in the stored code must use nodriver's API (`select()`,
+`.click()`, `.send_keys()`, `verify_cf()`, ...) — see the nodriver quick reference
+in Section 5.
+
+**Use when:** The portal is fronted by a bot-detection layer (e.g. Cloudflare
+Turnstile) that keeps re-challenging Playwright's CDP fingerprint even against an
+already-warmed persistent browser profile — nodriver's automation-marker patching
+clears these challenges where Playwright cannot. Requires
+`special_flags.cf_bypass_required = true` (see Section 6) so the engine warms/
+validates a persistent profile via `cf_session_manager` before launching. Example:
+Pinellas Clerk Official Records (`lien_engine.py`).
 
 ### `ai_only`
 
@@ -314,6 +337,60 @@ LLM self-regeneration of cleared code is DEFERRED (see above) — the human is t
 self-heal mechanism. Monitor `playwright_code_history` for `reason="cleared"`
 events; each one is a to-do for a developer.
 
+### nodriver API Quick Reference (`nodriver_only` / `nodriver_then_ai` sources)
+
+`page` is a nodriver `Tab`, not a Playwright `Page` — method names and failure modes
+differ. These gotchas are critical and must be followed exactly in any
+`playwright_code` targeting a `nodriver_*` scrape mode:
+
+**`select()` returns `None` on timeout — it does NOT raise:**
+```python
+el = await page.select("#someField", timeout=15)
+if el is None:
+    raise RuntimeError("PORTAL_LAYOUT_CHANGED - #someField not found")
+```
+Never call `.click()` / `.send_keys()` on a `select()` result without a `None` check
+first — Playwright's `wait_for_selector` raises on timeout, nodriver's `select()`
+just returns `None`, so the same guard pattern used elsewhere (`page.fill()`
+throwing) does not apply here.
+
+**Clearing an interactive Cloudflare Turnstile checkbox — text polling is not
+enough:**
+```python
+challenge_markers = ("just a moment", "checking your browser", "verify you are human")
+for attempt in range(5):
+    title = await page.evaluate("document.title")
+    body = await page.evaluate("document.body ? document.body.innerText.slice(0,500) : ''")
+    text = (str(title) + " " + str(body)).lower()
+    if not any(m in text for m in challenge_markers):
+        break
+    await page.verify_cf()   # real synthetic mouse click via CDP Input — requires
+                              # opencv-python(-headless) installed for template matching
+    await page.sleep(6)
+```
+A JS auto-challenge clearing (title stops saying "Just a moment...") is not the same
+as an interactive checkbox being solved — always confirm by waiting for the actual
+target element (e.g. via `select()`), not just the absence of challenge text.
+`verify_cf()` silently no-ops if `opencv-python` isn't installed in the venv — it
+raises nothing, so a missing dependency here looks identical to a portal that never
+serves a checkbox at all unless you check for it.
+
+**Distinguish a stale CF profile from a genuine code bug — raise, don't swallow:**
+Unlike the general "catch internally, return `pd.DataFrame()`" guidance for
+recoverable errors (Section 5, Return value), a `nodriver_*` source's `run_scrape`
+should `raise RuntimeError("CF_CHALLENGE_NOT_CLEARED - ...")` when the Turnstile
+checkbox never resolves, rather than returning an empty DataFrame. The engine's
+nodriver launcher (`_scrape_with_nodriver` in `lien_engine.py`) specifically catches
+this via the exception message and calls `cf_session_manager.mark_failed_during_scrape()`
+to force a profile re-warm on the next run — without it, a stale profile silently
+reports as "zero results today" indefinitely instead of self-healing. A plain
+`pd.DataFrame()` return here would be indistinguishable from a legitimate no-data day.
+
+**Downloads:** call `await page.set_download_path(str(download_dir))` once before
+triggering any export click — nodriver has no `expect_download()` context manager
+like Playwright; locate the new file afterward by diffing `download_dir.glob("*.csv")`
+before/after the click.
+
 ### Accela .NET WebForms Patterns
 
 Most active portals (Hillsborough, Pinellas) run on Accela Automation (ACA), an
@@ -425,6 +502,14 @@ First-class columns always override any stale legacy key in `special_flags`.
 
 | Key | Type | Description |
 |---|---|---|
+| `prr_only` | `bool` | If `true`, skip automated scraping — county requires a manual public-records request |
+
+#### `lien_engine` (signal_type `liens`)
+
+| Key | Type | Description |
+|---|---|---|
+| `cf_bypass_required` | `bool` | If `true`, engine warms/validates a persistent browser profile via `cf_session_manager.ensure_ready()` before scraping, and `nodriver_only`/`nodriver_then_ai` become usable for this source (see Section 4) |
+| `cf_bypass_profile_name` | `str` | Profile identity in `cf_bypass_profiles` (default `f"{county_id}_clerk"`) |
 | `prr_only` | `bool` | If `true`, skip automated scraping — county requires a manual public-records request |
 
 #### `master_engine` (signal_type `master_data`)
@@ -804,6 +889,61 @@ in `pa_scraper.py`. Adding a PA source for a new county means either:
 - Writing a new scraper class with a `scrape_property(parcel_id)` method
 
 **special_flags consumed:** `pa_scraper`
+
+---
+
+### `lien_engine.py` (signal_type `liens`)
+
+```
+cf_required = source["cf_bypass_required"]  (bool, from special_flags)
+
+if cf_required:
+  cf_session_manager.ensure_ready(profile_name, county_id, portal_url)
+    -> warms/validates the persistent browser profile (nodriver-driven warm/
+       validate — see docs/PINELLAS_CLOUDFLARE_BYPASS.md), returns profile_dir
+  find_edge_binary() -> cf_profile = {edge_path, profile_dir}
+  (raises CFBypassFailedError -> abort with cf_bypass_failed error, if the
+   profile can't be made ready)
+
+scrape_mode
+  nodriver_only / nodriver_then_ai   (requires cf_required=true + playwright_code)
+    -> _scrape_with_nodriver(playwright_code, source, ..., cf_profile)
+         launches nodriver against the warmed profile (no Turnstile-solving
+         logic here — that lives in the stored playwright_code, see Section 5's
+         nodriver quick reference)
+         -> execute_playwright_code(code, page=<nodriver Tab>, ...) [driver-agnostic]
+    on PlaywrightCodeError containing "CF_CHALLENGE_NOT_CLEARED":
+         cf_session_manager.mark_failed_during_scrape() — profile re-warms next run;
+         playwright_code is NOT cleared (the code isn't the problem)
+    on any other PlaywrightCodeError:
+         clear_playwright_code() [DB NULL] — same documented failure cycle as
+         Section 5; a playwright_code_history row records reason="cleared"
+    nodriver_only:     no data / error -> abort
+    nodriver_then_ai:  no data / error -> fall through to AI agent
+
+  playwright_only / playwright_then_ai  (requires playwright_code)
+    -> _scrape_with_playwright(playwright_code, source, ..., cf_profile)
+         calls execute_playwright_code() from action_sequence.py
+    playwright_only:     no data / error -> abort
+    playwright_then_ai:  no data / error -> fall through to AI agent
+
+  ai_only (or *_then_ai fallback)
+    -> build_agent_task(source, start_str, end_str)
+         LLM generates step-by-step browser-use task instructions
+    -> run_browser_agent(task, headful, cf_profile)
+         browser-use Agent runs Chromium (bundled, NOT the warmed CF profile —
+         AI fallback for a CF-protected source has no special bypass and may
+         itself get challenged; it is a last resort, not a guaranteed recovery)
+    -> process_lien_data(downloaded_file) -> raw DataFrame
+
+ColumnMapper.get_or_create("liens", source_id, df) -> mapping_row
+ColumnMapper.apply_transformations(df, mapping_row)
+  -> row_routing splits the ORI export into liens / deeds / judgments buckets
+  -> _sub_categorise_liens() further splits the liens bucket into
+     HOA / TAX / MECHANICS / CODE LIEN labels via county_cfg filer keywords
+```
+
+**special_flags consumed:** `cf_bypass_required`, `cf_bypass_profile_name`, `prr_only`
 
 ---
 

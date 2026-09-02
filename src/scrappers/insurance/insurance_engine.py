@@ -59,7 +59,7 @@ _FEMA_BATCH = 1000
 _FEMA_MAX_PAGES = 20
 
 
-def _fetch_fema_ia_registrants(state: str, county_display: str) -> Tuple[List[Dict], Optional[str]]:
+def _fetch_fema_ia_registrants(state: str, county_display: str) -> Tuple[List[Dict], Optional[str], Optional[BaseException]]:
     """
     Fetch FEMA Housing Assistance Owners records for a specific county (grouped by ZIP).
 
@@ -67,9 +67,11 @@ def _fetch_fema_ia_registrants(state: str, county_display: str) -> Tuple[List[Di
     Paginates with $skip until all pages are collected (county counts: ~1,150–1,500).
     Returns newest disasters first ($orderby=disasterNumber desc).
 
-    Returns (results, error). `error` is set whenever a page failed — even
+    Returns (results, error, exc). `error` is set whenever a page failed — even
     one after earlier pages succeeded — since the un-fetched pages' records
     are silently missing and the caller must not report this as a clean run.
+    `exc` is the real exception object (not just its formatted string) so the
+    caller can classify what actually happened instead of guessing from text.
     """
     # Build query string manually — requests.params URL-encodes $ which breaks FEMA API
     base = (
@@ -81,6 +83,7 @@ def _fetch_fema_ia_registrants(state: str, county_display: str) -> Tuple[List[Di
     )
     results: List[Dict] = []
     error = None
+    exc: Optional[BaseException] = None
     for page in range(_FEMA_MAX_PAGES):
         url = base if page == 0 else f"{base}&$skip={page * _FEMA_BATCH}"
         try:
@@ -95,8 +98,9 @@ def _fetch_fema_ia_registrants(state: str, county_display: str) -> Tuple[List[Di
         except Exception as e:
             logger.warning("[insurance] FEMA IA API failed (page %d): %s", page, e, exc_info=True)
             error = f"page {page}: {e}"
+            exc = e
             break
-    return results, error
+    return results, error, exc
 
 
 def _get_insurance_permits(db, county_id: str, start_date: date, end_date: date) -> List:
@@ -176,7 +180,7 @@ def scrape_insurance_claims(
         db.commit()
 
         # ── Source 2: FEMA IA registrants → match by ZIP ──────────────────
-        fema_registrants, fema_error = _fetch_fema_ia_registrants(state, county_display)
+        fema_registrants, fema_error, fema_exc = _fetch_fema_ia_registrants(state, county_display)
 
         # FEMA is scoped to county by filter; the DB query below also scopes by
         # Property.county_id == county_id for an extra safety guard.
@@ -255,23 +259,49 @@ def scrape_insurance_claims(
 
     try:
         from src.utils.scraper_db_helper import record_scraper_stats
+        from src.utils.scraper_outcome_classifier import classify_exception
+        from config.scraper_outcomes import ScraperOutcome
         _total = created + skipped_duplicate
         if fema_error:
-            # A FEMA IA page failed — even if earlier pages produced usable
-            # records, the un-fetched pages' claims are silently missing, so
-            # this can never be reported as a clean run or a confirmed
-            # no-data day.
-            record_scraper_stats(
-                source_type='insurance_claims',
-                total_scraped=_total,
-                matched=created,
-                unmatched=0,
-                skipped=skipped_duplicate,
-                county_id=county_id,
-                run_success=bool(fema_registrants),
-                error_type="scraper_error",
-                error_message=fema_error[:500],
-            )
+            # A FEMA IA page failed — the un-fetched pages' claims are
+            # silently missing, so this can never be reported as a clean run
+            # or a confirmed no-data day. But if an EARLIER page still
+            # succeeded (fema_registrants non-empty), that's a partial — not
+            # total — failure: matches the same deliberate PR #232 contract
+            # storm_engine.py/flood_engine.py use (tested in
+            # tests/test_weather_insurance_partial_fetch_errors.py). Stays
+            # run_success=True so Vera's freshness check doesn't treat a
+            # genuinely partial-but-useful run as "never ran," while
+            # error_type='scraper_error' still drives real investigation
+            # regardless of run_success (see
+            # src/api/main.py:_classify_scraper_issues). outcome= is only
+            # passed (forcing the derived run_success) when NO page ever
+            # succeeded — a genuine total failure.
+            is_total_failure = not fema_registrants
+            if is_total_failure:
+                outcome = classify_exception(fema_exc) if fema_exc is not None else ScraperOutcome.UNKNOWN.value
+                record_scraper_stats(
+                    source_type='insurance_claims',
+                    total_scraped=_total,
+                    matched=created,
+                    unmatched=0,
+                    skipped=skipped_duplicate,
+                    county_id=county_id,
+                    outcome=outcome,
+                    error_message=fema_error[:500],
+                )
+            else:
+                record_scraper_stats(
+                    source_type='insurance_claims',
+                    total_scraped=_total,
+                    matched=created,
+                    unmatched=0,
+                    skipped=skipped_duplicate,
+                    county_id=county_id,
+                    run_success=True,
+                    error_type="scraper_error",
+                    error_message=fema_error[:500],
+                )
         elif _total:
             record_scraper_stats(
                 source_type='insurance_claims',
@@ -291,6 +321,7 @@ def scrape_insurance_claims(
                 skipped=0,
                 county_id=county_id,
                 error_type="no_data",
+                outcome=ScraperOutcome.NO_DATA.value,
             )
     except Exception as stats_err:
         logger.warning("⚠ Could not record scraper stats (non-critical): %s", stats_err)

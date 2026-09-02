@@ -439,6 +439,21 @@ def _classify_scraper_issues(issue_rows) -> tuple[list, list]:
     "errors" bucket (actionable) vs a "data_unavailable" bucket (informational
     only — a confirmed empty day, or a zero-row day with no crash reported).
 
+    Dual-read (mirrors src.agents.vera.checks.live_state.check_silent_failures
+    — both change together, per that module's docstring): outcome_category is
+    the enforced (CheckConstraint), single source of truth for migrated
+    sources, checked first via row.outcome_category == 'NO_DATA'. error_type
+    is unconstrained free text (two undocumented values already leaked into
+    prod before this system existed) and is only trusted as a fallback for
+    sources with outcome_category IS NULL (not yet migrated). A row with
+    outcome_category=NO_DATA always gets error_type='no_data' too
+    (record_scraper_stats' derivation), so this doesn't change today's
+    behavior for migrated sources — it's forward cover against error_type
+    drifting out of sync. Every other outcome_category value (TIMEOUT,
+    SOURCE_ERROR, INTERNAL_ERROR, UNKNOWN) forces run_success=False by
+    construction, so it already falls into the `not r.run_success` branch
+    below without any additional dual-read needed here.
+
     error_type='no_data' is always data_unavailable regardless of how
     run_success was flagged — a few call sites (e.g. the generic
     ScraperNoDataError handler in scraper_db_helper.load_scraped_data_to_db)
@@ -461,7 +476,9 @@ def _classify_scraper_issues(issue_rows) -> tuple[list, list]:
 
     Args:
         issue_rows: iterable of objects with .source_type, .error_type,
-            .error_message, .run_date (a date), .run_success attributes.
+            .error_message, .run_date (a date), .run_success attributes, and
+            optionally .outcome_category (rows selected before this dual-read
+            landed won't carry it — see the getattr default below).
 
     Returns:
         (real_errors, data_unavailable) — each a list of dicts.
@@ -469,7 +486,9 @@ def _classify_scraper_issues(issue_rows) -> tuple[list, list]:
     real_errors, data_unavailable = [], []
     for r in issue_rows:
         entry = {"source": r.source_type, "date": r.run_date.isoformat()}
-        if r.error_type == "no_data":
+        outcome = getattr(r, "outcome_category", None)
+        is_no_data = (outcome == "NO_DATA") if outcome is not None else (r.error_type == "no_data")
+        if is_no_data:
             data_unavailable.append({**entry, "reason": "no_data"})
         elif r.error_type == "rate_limited":
             data_unavailable.append({**entry, "reason": "rate_limited"})
@@ -664,7 +683,7 @@ def health_check_detailed(db: Session = Depends(get_db)):
             select(
                 ScraperRunStats.source_type, ScraperRunStats.error_type,
                 ScraperRunStats.error_message, ScraperRunStats.run_date,
-                ScraperRunStats.run_success,
+                ScraperRunStats.run_success, ScraperRunStats.outcome_category,
             )
             .where(
                 or_(

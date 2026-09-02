@@ -27,7 +27,7 @@ import time
 import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import pandas as pd
 
@@ -45,6 +45,9 @@ from config.constants import (
 )
 from src.utils.county_config import get_county_config
 from src.utils.logger import setup_logging, get_logger
+from src.utils.scraper_run_tracking import scraper_run
+from src.utils.scraper_outcome_classifier import classify_exception
+from config.scraper_outcomes import ScraperOutcome
 
 setup_logging()
 logger = get_logger(__name__)
@@ -233,8 +236,10 @@ async def run_browser_agent(
     """
     Run a browser-use Agent that triggers a file download (export button).
 
-    Returns (history, start_time). Caller uses start_time with _locate_download()
-    to find the file the agent downloaded.
+    Returns (history, start_time, error) — start_time is used with
+    _locate_download() to find the file the agent downloaded; error is the
+    real exception object if the agent run itself raised, so the caller can
+    classify what happened instead of guessing from a bare None.
     """
     from browser_use import Agent, Browser
 
@@ -268,11 +273,11 @@ async def run_browser_agent(
         history = await agent.run()
         if not history.is_done():
             logger.warning("[Agent] Agent did not complete within step budget")
-        return history, start_time
+        return history, start_time, None
     except Exception as e:
         logger.error("[Agent] Run failed: %s", e)
         logger.debug(traceback.format_exc())
-        return None, start_time
+        return None, start_time, e
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +289,7 @@ async def _scrape_download_direct(
     start_dt: datetime,
     end_dt: datetime,
     download_dir: Path,
-) -> Optional[Path]:
+) -> Tuple[Optional[Path], Optional[BaseException]]:
     """
     Download permit data via a plain HTTP request — no browser launched.
 
@@ -298,14 +303,16 @@ async def _scrape_download_direct(
                             (default "%Y-%m-%d").
       download_headers      Optional dict of extra HTTP headers.
 
-    Returns the saved Path on success, None on failure.
+    Returns (Path, None) on success, (None, exc) on a real request failure,
+    or (None, None) when source.download_url is missing (a config problem,
+    not something classify_exception() can classify).
     """
     import requests
 
     download_url = source.get("download_url")
     if not download_url:
         logger.error("[DirectDL] scrape_mode=download_direct requires source.download_url")
-        return None
+        return None, None
 
     method = source.get("download_method", "GET").upper()
     raw_params = source.get("download_params") or {}
@@ -331,7 +338,7 @@ async def _scrape_download_direct(
         resp.raise_for_status()
     except Exception as exc:
         logger.error("[DirectDL] Request failed: %s", exc)
-        return None
+        return None, exc
 
     content_type = resp.headers.get("Content-Type", "")
     if "spreadsheetml" in content_type or "excel" in content_type or download_url.endswith(".xlsx"):
@@ -345,7 +352,7 @@ async def _scrape_download_direct(
     dest = download_dir / f"direct_{stamp}{ext}"
     dest.write_bytes(resp.content)
     logger.info("[DirectDL] Saved %d bytes → %s", len(resp.content), dest)
-    return dest
+    return dest, None
 
 
 # ---------------------------------------------------------------------------
@@ -566,23 +573,10 @@ def _parse_extract_result(history, county_id: str) -> Optional[pd.DataFrame]:
 
 
 # ---------------------------------------------------------------------------
-# Stats helper
-# ---------------------------------------------------------------------------
-
-def _record_stats(source_type: str, **kwargs):
-    try:
-        from src.utils.scraper_db_helper import record_scraper_stats
-        record_scraper_stats(source_type=source_type, **kwargs)
-    except Exception as e:
-        logger.warning("[Stats] Could not record scraper stats (non-critical): %s", e)
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 async def main(args):
-    t0 = time.monotonic()
     county_id = args.county_id
     county_cfg = get_county_config(county_id)
 
@@ -591,179 +585,190 @@ async def main(args):
         portal_url = county_cfg.get("urls", {}).get("permit") or PERMIT_SEARCH_URL
         source = {"url": portal_url, "signal_type": "permits"}
 
-    if args.end_date:
-        end_dt = datetime.strptime(args.end_date, "%Y-%m-%d")
-    else:
-        end_dt = datetime.now()
-    if args.start_date:
-        start_dt = datetime.strptime(args.start_date, "%Y-%m-%d")
-    else:
-        start_dt = end_dt - timedelta(days=1)
+    with scraper_run("permits", county_id) as run:
+        if args.end_date:
+            end_dt = datetime.strptime(args.end_date, "%Y-%m-%d")
+        else:
+            end_dt = datetime.now()
+        if args.start_date:
+            start_dt = datetime.strptime(args.start_date, "%Y-%m-%d")
+        else:
+            start_dt = end_dt - timedelta(days=1)
 
-    start_str = start_dt.strftime("%m/%d/%Y")
-    end_str = end_dt.strftime("%m/%d/%Y")
+        start_str = start_dt.strftime("%m/%d/%Y")
+        end_str = end_dt.strftime("%m/%d/%Y")
 
-    logger.info("=" * 60)
-    logger.info("%s BUILDING PERMITS — DATA COLLECTION", county_cfg["display_name"].upper())
-    logger.info("Date range: %s → %s", start_str, end_str)
-    logger.info("=" * 60)
+        logger.info("=" * 60)
+        logger.info("%s BUILDING PERMITS — DATA COLLECTION", county_cfg["display_name"].upper())
+        logger.info("Date range: %s → %s", start_str, end_str)
+        logger.info("=" * 60)
 
-    download_dir = RAW_PERMIT_DIR / county_id / "downloads"
-    download_dir.mkdir(parents=True, exist_ok=True)
+        download_dir = RAW_PERMIT_DIR / county_id / "downloads"
+        download_dir.mkdir(parents=True, exist_ok=True)
 
-    scrape_mode = _get_scrape_mode(source)
-    logger.info("[Main] scrape_mode=%s", scrape_mode)
+        scrape_mode = _get_scrape_mode(source)
+        logger.info("[Main] scrape_mode=%s", scrape_mode)
 
-    today_str = datetime.now().strftime("%Y%m%d")
-    out_dir = RAW_PERMIT_DIR / county_id / "new"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = out_dir / f"permits_{county_id}_{today_str}.csv"
+        today_str = datetime.now().strftime("%Y%m%d")
+        out_dir = RAW_PERMIT_DIR / county_id / "new"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = out_dir / f"permits_{county_id}_{today_str}.csv"
 
-    temp_file: Optional[Path] = None  # tracks any temp download for cleanup
+        temp_file: Optional[Path] = None  # tracks any temp download for cleanup
 
-    if scrape_mode == "download_direct":
-        temp_file = await _scrape_download_direct(source, start_dt, end_dt, download_dir)
-        if temp_file is None:
-            logger.error("[Main] Direct download failed — aborting")
-            return
-        df = _load_file(temp_file)
-        if df.empty:
-            logger.warning("[Main] Direct download returned 0 rows — nothing to load")
-            temp_file.unlink(missing_ok=True)
-            return
+        if scrape_mode == "download_direct":
+            temp_file, dl_exc = await _scrape_download_direct(source, start_dt, end_dt, download_dir)
+            if temp_file is None:
+                logger.error("[Main] Direct download failed — aborting")
+                if dl_exc is not None:
+                    run.fail(classify_exception(dl_exc), error_message=str(dl_exc)[:500])
+                else:
+                    run.fail(ScraperOutcome.INTERNAL_ERROR.value, error_message="download_direct missing source.download_url config")
+                return
+            df = _load_file(temp_file)
+            if df.empty:
+                logger.warning("[Main] Direct download returned 0 rows — nothing to load")
+                temp_file.unlink(missing_ok=True)
+                run.no_data()
+                return
 
-    elif scrape_mode == "selector":
-        try:
-            df = await _scrape_selector(
-                source, start_str, end_str, download_dir,
-                headful=args.headful, county_id=county_id,
-            )
-        except Exception as sel_err:
-            logger.warning(
-                "[Selector] Playwright selectors failed (%s) — falling back to browser_use download",
-                sel_err,
-            )
-            task = build_download_task(source, start_str, end_str)
-            history, start_time = await run_browser_agent(task, download_dir, headful=args.headful)
+        elif scrape_mode == "selector":
+            agent_exc = None
+            try:
+                df = await _scrape_selector(
+                    source, start_str, end_str, download_dir,
+                    headful=args.headful, county_id=county_id,
+                )
+            except Exception as sel_err:
+                logger.warning(
+                    "[Selector] Playwright selectors failed (%s) — falling back to browser_use download",
+                    sel_err,
+                )
+                task = build_download_task(source, start_str, end_str)
+                history, start_time, agent_exc = await run_browser_agent(task, download_dir, headful=args.headful)
+                if history is None:
+                    logger.error("[Main] Browser-use fallback also failed — aborting")
+                    outcome = classify_exception(agent_exc) if agent_exc is not None else classify_exception(sel_err)
+                    run.fail(outcome, error_message=f"selector failed: {sel_err}; browser-use fallback failed: {agent_exc}"[:500])
+                    return
+                await asyncio.sleep(5)
+                temp_file = _locate_download(download_dir, start_time)
+                if temp_file is None:
+                    logger.error("[Main] No file found after browser-use fallback — aborting")
+                    run.fail(ScraperOutcome.UNKNOWN.value, error_message="browser-use fallback completed but no downloaded file was located")
+                    return
+                df = _load_file(temp_file)
+            if df.empty:
+                logger.warning("[Main] Selector mode returned 0 rows — nothing to load")
+                if temp_file and temp_file.exists():
+                    temp_file.unlink(missing_ok=True)
+                run.no_data()
+                return
+
+        elif scrape_mode == "extract":
+            # browser-use reads table rows directly and returns JSON — no file download
+            task = build_agent_task(source, start_str, end_str)
+            history, _, agent_exc = await run_browser_agent(task, download_dir, headful=args.headful)
+            df = _parse_extract_result(history, county_id)
+            if df is None:
+                logger.error("[Main] Extract failed — agent returned no parseable result")
+                outcome = classify_exception(agent_exc) if agent_exc is not None else ScraperOutcome.UNKNOWN.value
+                run.fail(outcome, error_message=str(agent_exc)[:500] if agent_exc is not None else "agent returned unparseable result")
+                return
+            if df.empty:
+                logger.info("[Main] Extract returned 0 records — nothing to load")
+                run.no_data()
+                return
+
+        else:  # "download" — browser-use clicks export button, waits for file
+            task = build_agent_task(source, start_str, end_str)
+            history, start_time, agent_exc = await run_browser_agent(task, download_dir, headful=args.headful)
             if history is None:
-                logger.error("[Main] Browser-use fallback also failed — aborting")
+                logger.error("[Main] Agent run returned no history — aborting")
+                outcome = classify_exception(agent_exc) if agent_exc is not None else ScraperOutcome.UNKNOWN.value
+                run.fail(outcome, error_message=str(agent_exc)[:500] if agent_exc is not None else "agent run failed with no exception captured")
                 return
             await asyncio.sleep(5)
             temp_file = _locate_download(download_dir, start_time)
             if temp_file is None:
-                logger.error("[Main] No file found after browser-use fallback — aborting")
+                logger.error("[Main] No downloaded file found — aborting")
+                run.fail(ScraperOutcome.UNKNOWN.value, error_message="agent completed but no downloaded file was located")
                 return
             df = _load_file(temp_file)
-        if df.empty:
-            logger.warning("[Main] Selector mode returned 0 rows — nothing to load")
-            if temp_file and temp_file.exists():
+            if df.empty:
+                logger.error(
+                    "[Main] Downloaded CSV has 0 rows — Accela export session likely expired. "
+                    "Try a shorter date range or set scrape_mode=extract in county source special_flags."
+                )
                 temp_file.unlink(missing_ok=True)
+                run.fail(ScraperOutcome.SOURCE_ERROR.value, error_message="downloaded CSV had 0 rows — export session likely expired")
+                return
+
+        # Clean up temp download before saving canonical CSV
+        if temp_file and temp_file.exists():
+            try:
+                temp_file.unlink()
+            except Exception:
+                pass
+
+        logger.info("[Main] %d total records", len(df))
+        df.to_csv(csv_path, index=False)
+        logger.info("[Main] Saved → %s", csv_path)
+
+        if not args.load_to_db:
+            logger.info("[Main] Skipping DB load (pass --load-to-db to enable)")
+            run.success(total_scraped=len(df))
             return
 
-    elif scrape_mode == "extract":
-        # browser-use reads table rows directly and returns JSON — no file download
-        task = build_agent_task(source, start_str, end_str)
-        history, _ = await run_browser_agent(task, download_dir, headful=args.headful)
-        df = _parse_extract_result(history, county_id)
-        if df is None:
-            logger.error("[Main] Extract failed — agent returned no parseable result")
-            return
-        if df.empty:
-            logger.info("[Main] Extract returned 0 records — nothing to load")
-            return
-
-    else:  # "download" — browser-use clicks export button, waits for file
-        task = build_agent_task(source, start_str, end_str)
-        history, start_time = await run_browser_agent(task, download_dir, headful=args.headful)
-        if history is None:
-            logger.error("[Main] Agent run returned no history — aborting")
-            return
-        await asyncio.sleep(5)
-        temp_file = _locate_download(download_dir, start_time)
-        if temp_file is None:
-            logger.error("[Main] No downloaded file found — aborting")
-            return
-        df = _load_file(temp_file)
-        if df.empty:
-            logger.error(
-                "[Main] Downloaded CSV has 0 rows — Accela export session likely expired. "
-                "Try a shorter date range or set scrape_mode=extract in county source special_flags."
-            )
-            temp_file.unlink(missing_ok=True)
-            return
-
-    # Clean up temp download before saving canonical CSV
-    if temp_file and temp_file.exists():
-        try:
-            temp_file.unlink()
-        except Exception:
-            pass
-
-    logger.info("[Main] %d total records", len(df))
-    df.to_csv(csv_path, index=False)
-    logger.info("[Main] Saved → %s", csv_path)
-
-    if not args.load_to_db:
-        logger.info("[Main] Skipping DB load (pass --load-to-db to enable)")
-        return
-
-    logger.info("[Main] Loading permits into database...")
-    from src.core.database import get_db_context
-    from src.loaders.permits import PermitLoader
-
-    try:
-        with get_db_context() as session:
-            loader = PermitLoader(session, county_id)
-            matched, unmatched, skipped = loader.load_from_csv(
-                str(csv_path),
-                skip_duplicates=True,
-            )
-            session.commit()
-
-        total = matched + unmatched + skipped
-        match_rate = (matched / total * 100) if total > 0 else 0
-        logger.info("=" * 60)
-        logger.info("DATABASE LOAD SUMMARY")
-        logger.info("  Matched:    %6d", matched)
-        logger.info("  Unmatched:  %6d", unmatched)
-        logger.info("  Skipped:    %6d", skipped)
-        logger.info("  Match Rate: %5.1f%%", match_rate)
-        logger.info("=" * 60)
-
-        # Rescore affected properties
-        try:
-            affected_ids = loader.get_affected_property_ids() if hasattr(loader, "get_affected_property_ids") else []
-            if affected_ids:
-                logger.info("[Rescore] Triggering CDS rescore for %d properties...", len(affected_ids))
-                from src.services.cds_engine import MultiVerticalScorer
-                with get_db_context() as score_session:
-                    scorer = MultiVerticalScorer(score_session)
-                    scorer.score_properties_by_ids(affected_ids, save_to_db=True, county_id=county_id)
-                    score_session.commit()
-                logger.info("[Rescore] CDS rescore completed")
-        except Exception as score_err:
-            logger.warning("[Rescore] CDS rescore failed (non-critical): %s", score_err)
-
-        _record_stats(
-            source_type="permits",
-            county_id=county_id,
-            total_scraped=total,
-            matched=matched,
-            unmatched=unmatched,
-            skipped=skipped,
-            run_success=True,
-            duration_seconds=round(time.monotonic() - t0, 2),
-        )
+        logger.info("[Main] Loading permits into database...")
+        from src.core.database import get_db_context
+        from src.loaders.permits import PermitLoader
 
         try:
-            csv_path.unlink()
-            logger.info("[Main] CSV deleted after successful DB insertion")
-        except Exception:
-            pass
+            with get_db_context() as session:
+                loader = PermitLoader(session, county_id)
+                matched, unmatched, skipped = loader.load_from_csv(
+                    str(csv_path),
+                    skip_duplicates=True,
+                )
+                session.commit()
 
-    except Exception as e:
-        logger.error("[Main] DB load failed: %s", e)
-        logger.debug(traceback.format_exc())
+            total = matched + unmatched + skipped
+            match_rate = (matched / total * 100) if total > 0 else 0
+            logger.info("=" * 60)
+            logger.info("DATABASE LOAD SUMMARY")
+            logger.info("  Matched:    %6d", matched)
+            logger.info("  Unmatched:  %6d", unmatched)
+            logger.info("  Skipped:    %6d", skipped)
+            logger.info("  Match Rate: %5.1f%%", match_rate)
+            logger.info("=" * 60)
+
+            # Rescore affected properties
+            try:
+                affected_ids = loader.get_affected_property_ids() if hasattr(loader, "get_affected_property_ids") else []
+                if affected_ids:
+                    logger.info("[Rescore] Triggering CDS rescore for %d properties...", len(affected_ids))
+                    from src.services.cds_engine import MultiVerticalScorer
+                    with get_db_context() as score_session:
+                        scorer = MultiVerticalScorer(score_session)
+                        scorer.score_properties_by_ids(affected_ids, save_to_db=True, county_id=county_id)
+                        score_session.commit()
+                    logger.info("[Rescore] CDS rescore completed")
+            except Exception as score_err:
+                logger.warning("[Rescore] CDS rescore failed (non-critical): %s", score_err)
+
+            run.success(total_scraped=total, matched=matched, unmatched=unmatched, skipped=skipped)
+
+            try:
+                csv_path.unlink()
+                logger.info("[Main] CSV deleted after successful DB insertion")
+            except Exception:
+                pass
+
+        except Exception as e:
+            logger.error("[Main] DB load failed: %s", e)
+            logger.debug(traceback.format_exc())
+            run.fail(classify_exception(e), error_message=str(e)[:500])
 
 
 if __name__ == "__main__":

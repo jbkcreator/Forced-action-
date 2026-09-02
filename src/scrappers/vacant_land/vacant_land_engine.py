@@ -28,6 +28,8 @@ sys.path.insert(0, str(project_root))
 from src.utils.logger import setup_logging, get_logger
 from src.utils.county_config import get_county_config
 from src.utils.scraper_db_helper import record_scraper_stats
+from src.utils.scraper_outcome_classifier import classify_exception
+from config.scraper_outcomes import ScraperOutcome
 from config.constants import RAW_VACANT_LAND_DIR
 
 setup_logging()
@@ -278,7 +280,7 @@ def run_vacant_land_pipeline(
         record_scraper_stats(
             source_type="vacant_land",
             total_scraped=0, matched=0, unmatched=0, skipped=0,
-            run_success=False, error_type="scraper_error",
+            error_type="scraper_error", outcome=classify_exception(exc),
             error_message=str(exc)[:500],
             duration_seconds=round(time.monotonic() - t0, 2),
             county_id=county_id,
@@ -292,7 +294,7 @@ def run_vacant_land_pipeline(
         record_scraper_stats(
             source_type="vacant_land",
             total_scraped=0, matched=0, unmatched=0, skipped=0,
-            run_success=True, error_type="no_data",
+            error_type="no_data", outcome=ScraperOutcome.NO_DATA.value,
             duration_seconds=round(duration_s, 2),
             county_id=county_id,
         )
