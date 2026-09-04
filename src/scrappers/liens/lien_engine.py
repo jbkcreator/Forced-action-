@@ -155,7 +155,7 @@ Requirements:
 - Leave the document type field EMPTY or unselected (to retrieve ALL document types).
 - Set the filed-from date to start_date and filed-to date to end_date (MM/DD/YYYY format).
 - Submit the search and wait for results to load.
-- If an error appears saying results exceed 6000, note it and still attempt the export.
+- If an error appears saying results exceed 5000, note it and still attempt the export.
 - Click the "Export to Spreadsheet" or "Export Results" button to download the CSV.
 - Wait at least 15 seconds for the download to complete before finishing.
 - Do not navigate away or open new tabs during the download.
@@ -320,7 +320,7 @@ async def _scrape_with_playwright(
     headful: bool = False,
     cf_profile: Optional[dict] = None,
     no_proxy: bool = False,
-) -> Optional[pd.DataFrame]:
+) -> tuple:
     """
     Execute stored playwright_code against a Playwright page.
 
@@ -412,6 +412,26 @@ async def _scrape_with_playwright(
             )
             # --- DEBUG: capture page state when result is empty ---
             if df is None or df.empty:
+                # Check for the portal's 5000-record cap before generic debug capture.
+                # The clerk portal renders #ErrorWin/#ErrorMsg and never shows the
+                # CSV export button when the date range hits >5000 rows.
+                try:
+                    _page_content = await page.content()
+                    if "is not allowed to exceed" in _page_content:
+                        import re as _re
+                        _m = _re.search(
+                            r'id=["\']ErrorMsg["\'][^>]*>\s*(.*?)\s*</div>',
+                            _page_content, _re.DOTALL | _re.IGNORECASE,
+                        )
+                        _portal_msg = (
+                            _m.group(1).strip() if _m
+                            else "result count exceeds 5000 — narrow the date range"
+                        )
+                        logger.error("[liens][playwright] Portal 5000-record cap: %s", _portal_msg)
+                        return None, ScraperOutcome.SOURCE_ERROR.value, f"portal_5000_limit: {_portal_msg[:300]}"
+                except Exception as _cap_exc:
+                    logger.debug("[liens][playwright] 5000-cap check failed: %s", _cap_exc)
+
                 try:
                     import datetime as _dt
                     import re as _re
@@ -450,10 +470,12 @@ async def _scrape_with_playwright(
                     logger.error("[liens][debug] Debug capture failed: %s", _dbg_exc)
             # --- END DEBUG ---
             logger.info("[Playwright] Scraped %d rows", len(df) if df is not None else 0)
-            return df
+            return df, None, None
         except Exception as e:
             logger.error("[Playwright] Scrape failed: %s", e)
             logger.debug(traceback.format_exc())
+            _exc_outcome = classify_exception(e)
+            _exc_msg = str(e)[:500]
             # --- DEBUG: capture on unexpected exception bubble-up ---
             try:
                 import datetime as _dt
@@ -464,10 +486,23 @@ async def _scrape_with_playwright(
                 _shot = _dbg / f"liens_debug_{county_id}_{_ts}.png"
                 await page.screenshot(path=str(_shot), full_page=True)
                 logger.error("[liens][debug] Screenshot: %s", _shot)
+                # A timeout waiting for the CSV button can be caused by the 5000-cap
+                # dialog blocking it — check here too so the classification is correct.
+                _exc_content = await page.content()
+                if "is not allowed to exceed" in _exc_content:
+                    import re as _re
+                    _m = _re.search(
+                        r'id=["\']ErrorMsg["\'][^>]*>\s*(.*?)\s*</div>',
+                        _exc_content, _re.DOTALL | _re.IGNORECASE,
+                    )
+                    _portal_msg = _m.group(1).strip() if _m else "result count exceeds 5000"
+                    logger.error("[liens][playwright] Portal 5000-record cap caused failure: %s", _portal_msg)
+                    _exc_outcome = ScraperOutcome.SOURCE_ERROR.value
+                    _exc_msg = f"portal_5000_limit: {_portal_msg[:300]}"
             except Exception as _dbg_exc:
                 logger.error("[liens][debug] Debug capture failed: %s", _dbg_exc)
             # --- END DEBUG ---
-            return None
+            return None, _exc_outcome, _exc_msg
         finally:
             try:
                 await context.close()
@@ -572,6 +607,30 @@ async def _scrape_with_nodriver(
             county_id=county_id,
         )
         logger.info("[CF/ND] Scraped %d rows", len(df) if df is not None else 0)
+
+        # When the portal rejects a query that would return >5000 rows it renders
+        # #ErrorWin/#ErrorMsg and never shows the CSV export button. Detect this
+        # before returning so the run is classified SOURCE_ERROR (query too broad)
+        # rather than UNKNOWN/UNCLASSIFIED.
+        if (df is None or df.empty) and page is not None:
+            try:
+                import re as _re
+                _content = await page.get_content() or ""
+                if "is not allowed to exceed" in _content:
+                    _m = _re.search(
+                        r'id=["\']ErrorMsg["\'][^>]*>\s*(.*?)\s*</div>',
+                        _content, _re.DOTALL | _re.IGNORECASE,
+                    )
+                    _portal_msg = (
+                        _m.group(1).strip() if _m
+                        else "result count exceeds 5000 — narrow the date range"
+                    )
+                    logger.error("[CF/ND] Portal 5000-record cap: %s", _portal_msg)
+                    await _dump_debug(page, "no_csv_btn")
+                    return None, ScraperOutcome.SOURCE_ERROR.value, f"portal_5000_limit: {_portal_msg[:300]}"
+            except Exception as _chk_exc:
+                logger.debug("[CF/ND] Could not check for 5000-cap error: %s", _chk_exc)
+
         return df, None, None
     except PlaywrightCodeError as exc:
         msg = str(exc)
@@ -821,6 +880,81 @@ def process_lien_data(file_path: Path) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Single-span scrape dispatcher (called once per day in the split loop)
+# ---------------------------------------------------------------------------
+
+async def _dispatch_scrape(
+    source: dict,
+    start_str: str,
+    end_str: str,
+    scrape_mode: str,
+    playwright_code: str,
+    cf_profile: Optional[dict],
+    headful: bool,
+    no_proxy: bool,
+) -> tuple:
+    """Run one scrape for a single date span. Returns (df, outcome, error_msg).
+
+    Success: (df, None, None) — df may be empty (no records that day).
+    Failure: (None, outcome, error_msg).
+    """
+    used_selector_mode = False
+    nd_outcome = nd_error = None
+    df = None
+
+    if scrape_mode in ("nodriver_only", "nodriver_then_ai") and playwright_code:
+        df, nd_outcome, nd_error = await _scrape_with_nodriver(
+            playwright_code, source, start_str, end_str, RAW_LIEN_DIR, cf_profile=cf_profile,
+        )
+        used_selector_mode = True
+    elif scrape_mode in ("playwright_only", "playwright_then_ai") and playwright_code:
+        df, nd_outcome, nd_error = await _scrape_with_playwright(
+            playwright_code, source, start_str, end_str, RAW_LIEN_DIR,
+            headful=headful, cf_profile=cf_profile, no_proxy=no_proxy,
+        )
+        used_selector_mode = True
+
+    use_ai_fallback = False
+    if used_selector_mode:
+        if df is None:
+            if scrape_mode in ("nodriver_then_ai", "playwright_then_ai"):
+                logger.warning(
+                    "[Pipeline] Selector scrape failed for %s→%s — falling back to AI agent",
+                    start_str, end_str,
+                )
+                use_ai_fallback = True
+            else:
+                return (
+                    None,
+                    nd_outcome or ScraperOutcome.UNKNOWN.value,
+                    nd_error or "selector_scrape_failed (ambiguous: empty result vs scrape failure)",
+                )
+        # df.empty is a clean "no records" result — caller handles it as no_data.
+
+    if not used_selector_mode or use_ai_fallback:
+        task = build_agent_task(source, start_str, end_str)
+        history, start_time, agent_exc = await run_browser_agent(
+            task, RAW_LIEN_DIR, headful=headful, cf_profile=cf_profile, no_proxy=no_proxy,
+        )
+        if history is None:
+            outcome = classify_exception(agent_exc) if agent_exc is not None else ScraperOutcome.UNKNOWN.value
+            err = str(agent_exc)[:500] if agent_exc is not None else "agent run failed with no exception captured"
+            return None, outcome, err
+
+        await asyncio.sleep(5)
+        downloaded_file = _locate_download(RAW_LIEN_DIR, start_time)
+        if not downloaded_file:
+            return None, ScraperOutcome.UNKNOWN.value, "agent completed but no downloaded file was located"
+
+        try:
+            df = process_lien_data(downloaded_file)
+        except Exception as e:
+            return None, classify_exception(e), str(e)[:500]
+
+    return df, None, None
+
+
+# ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 
@@ -897,18 +1031,10 @@ async def run_lien_pipeline(
 
         # --- Dispatch on scrape_mode (DB-driven — see
         # docs/MULTI_COUNTY_SCRAPING_ARCHITECTURE.md Section 4/9) --------------
-        # nodriver_only / nodriver_then_ai: CF-protected portals (Cloudflare
-        #   Turnstile defeats Playwright's CDP fingerprint even on a warmed
-        #   profile) — same stored playwright_code contract, different browser
-        #   driver. playwright_only / playwright_then_ai: standard Playwright
-        #   selector mode. Both "_then_ai" variants fall back to the browser-use
-        #   agent on failure; both "_only" variants abort.
         playwright_code = source.get("playwright_code") or ""
         scrape_mode = source.get("scrape_mode", "")
-        use_ai_fallback = False
 
-        used_selector_mode = False
-        nd_outcome = nd_error = None
+        # nodriver modes require cf_bypass_required=true — validate once before the loop.
         if scrape_mode in ("nodriver_only", "nodriver_then_ai") and playwright_code:
             if cf_profile is None:
                 logger.error("[Pipeline] scrape_mode=%s requires cf_bypass_required=true", scrape_mode)
@@ -917,81 +1043,53 @@ async def run_lien_pipeline(
                     error_message=f"nodriver_mode_missing_cf_profile: scrape_mode={scrape_mode}",
                 )
                 return False
-            logger.info("[Pipeline] Using nodriver selector mode (%s)", scrape_mode)
-            df, nd_outcome, nd_error = await _scrape_with_nodriver(
-                playwright_code, source, start_str, end_str, RAW_LIEN_DIR, cf_profile=cf_profile,
+
+        # The clerk portal caps results at 5000 rows per query. A multi-day range
+        # can exceed this even when a single day cannot. Split into two single-day
+        # calls so each stays within the cap. Both days run independently — one
+        # hitting SOURCE_ERROR doesn't block the other.
+        _needs_split = _start_dt.date() != _end_dt.date()
+        _day_pairs = (
+            [
+                (_start_dt.strftime("%m/%d/%Y"), _start_dt.strftime("%m/%d/%Y")),
+                (_end_dt.strftime("%m/%d/%Y"),   _end_dt.strftime("%m/%d/%Y")),
+            ]
+            if _needs_split
+            else [(start_str, end_str)]
+        )
+
+        collected: list = []
+        day_errors: list = []
+
+        for _s, _e in _day_pairs:
+            if _needs_split:
+                logger.info("[Pipeline] Scraping single day %s", _s)
+            _df, _day_outcome, _day_err = await _dispatch_scrape(
+                source, _s, _e, scrape_mode, playwright_code, cf_profile, headful, no_proxy,
             )
-            used_selector_mode = True
-        elif scrape_mode in ("playwright_only", "playwright_then_ai") and playwright_code:
-            logger.info("[Pipeline] Using Playwright selector mode (%s)", scrape_mode)
-            df = await _scrape_with_playwright(
-                playwright_code, source, start_str, end_str, RAW_LIEN_DIR,
-                headful=headful, cf_profile=cf_profile, no_proxy=no_proxy,
-            )
-            used_selector_mode = True
+            if _df is not None and not _df.empty:
+                collected.append(_df)
+            elif _day_outcome is not None:
+                day_errors.append(f"{_s}: {_day_outcome} — {_day_err}")
+                logger.error("[Pipeline] Scrape failed for %s: %s — %s", _s, _day_outcome, _day_err)
+            else:
+                logger.info("[Pipeline] No records for %s", _s)
 
-        if used_selector_mode:
-            if df is None:
-                if scrape_mode in ("nodriver_then_ai", "playwright_then_ai"):
-                    logger.warning(
-                        "[Pipeline] Selector scrape failed for '%s' — falling back to browser-use AI agent",
-                        county_id,
-                    )
-                    use_ai_fallback = True
-                else:
-                    logger.error("[Pipeline] Selector scrape failed")
-                    if nd_outcome is not None:
-                        # _scrape_with_nodriver classifies its own failures
-                        # (CF challenge vs stored-code bug) — trust it.
-                        run.fail(nd_outcome, error_message=nd_error)
-                    else:
-                        # _scrape_with_playwright swallows its own exception and
-                        # returns None either way — can't tell empty-but-clean
-                        # from actually-broken here.
-                        run.fail(
-                            ScraperOutcome.UNKNOWN.value,
-                            error_message="selector_scrape_failed (ambiguous: empty result vs scrape failure)",
-                        )
-                    return False
-            elif df.empty:
-                logger.info("[Pipeline] Selector scrape returned no records")
-                run.no_data()
-                return True
-
-        if not used_selector_mode or use_ai_fallback:
-            task = build_agent_task(source, start_str, end_str)
-            history, start_time, agent_exc = await run_browser_agent(
-                task, RAW_LIEN_DIR,
-                headful=headful,
-                cf_profile=cf_profile,
-                no_proxy=no_proxy,
-            )
-
-            if history is None:
-                logger.error("[Pipeline] Agent failed to run")
-                outcome = classify_exception(agent_exc) if agent_exc is not None else ScraperOutcome.UNKNOWN.value
-                run.fail(outcome, error_message=str(agent_exc)[:500] if agent_exc is not None else "agent run failed with no exception captured")
+        if not collected:
+            if day_errors:
+                combined_err = "; ".join(day_errors)
+                all_cap = all("portal_5000_limit" in e for e in day_errors)
+                run.fail(
+                    ScraperOutcome.SOURCE_ERROR.value if all_cap else ScraperOutcome.UNKNOWN.value,
+                    error_message=combined_err[:500],
+                )
                 return False
+            run.no_data()
+            return True
 
-            await asyncio.sleep(5)
-
-            downloaded_file = _locate_download(RAW_LIEN_DIR, start_time)
-            if not downloaded_file:
-                logger.error("[Pipeline] No download detected after agent run")
-                run.fail(ScraperOutcome.UNKNOWN.value, error_message="agent completed but no downloaded file was located")
-                return False
-
-            try:
-                df = process_lien_data(downloaded_file)
-            except Exception as e:
-                logger.error("[Pipeline] Failed to process downloaded file: %s", e)
-                run.fail(classify_exception(e), error_message=str(e)[:500])
-                return False
-
-            if df.empty:
-                logger.info("[Pipeline] Downloaded file is empty — no records for this date range")
-                run.no_data()
-                return True
+        df = pd.concat(collected, ignore_index=True)
+        if _needs_split:
+            logger.info("[Pipeline] Combined %d records from %d day(s)", len(df), len(collected))
 
         # Resolve the ColumnMapping for this source. Renames, BookPage split, doc-
         # type value normalisation, and row routing all happen inside ColumnMapper.

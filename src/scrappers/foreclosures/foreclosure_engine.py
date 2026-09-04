@@ -202,7 +202,7 @@ async def run_browser_agent(task: str, headful: bool = False, no_proxy: bool = F
 		task=task,
 		llm=llm,
 		browser=browser,
-		max_steps=80,
+		max_steps=150,
 		max_failures=3,
 		use_judge=False,
 	)
