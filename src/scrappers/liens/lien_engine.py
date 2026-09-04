@@ -155,7 +155,7 @@ Requirements:
 - Leave the document type field EMPTY or unselected (to retrieve ALL document types).
 - Set the filed-from date to start_date and filed-to date to end_date (MM/DD/YYYY format).
 - Submit the search and wait for results to load.
-- If an error appears saying results exceed 6000, note it and still attempt the export.
+- If an error appears saying results exceed 5000, note it and still attempt the export.
 - Click the "Export to Spreadsheet" or "Export Results" button to download the CSV.
 - Wait at least 15 seconds for the download to complete before finishing.
 - Do not navigate away or open new tabs during the download.
@@ -320,7 +320,7 @@ async def _scrape_with_playwright(
     headful: bool = False,
     cf_profile: Optional[dict] = None,
     no_proxy: bool = False,
-) -> Optional[pd.DataFrame]:
+) -> tuple:
     """
     Execute stored playwright_code against a Playwright page.
 
@@ -412,6 +412,26 @@ async def _scrape_with_playwright(
             )
             # --- DEBUG: capture page state when result is empty ---
             if df is None or df.empty:
+                # Check for the portal's 5000-record cap before generic debug capture.
+                # The clerk portal renders #ErrorWin/#ErrorMsg and never shows the
+                # CSV export button when the date range hits >5000 rows.
+                try:
+                    _page_content = await page.content()
+                    if "is not allowed to exceed" in _page_content:
+                        import re as _re
+                        _m = _re.search(
+                            r'id=["\']ErrorMsg["\'][^>]*>\s*(.*?)\s*</div>',
+                            _page_content, _re.DOTALL | _re.IGNORECASE,
+                        )
+                        _portal_msg = (
+                            _m.group(1).strip() if _m
+                            else "result count exceeds 5000 — narrow the date range"
+                        )
+                        logger.error("[liens][playwright] Portal 5000-record cap: %s", _portal_msg)
+                        return None, ScraperOutcome.SOURCE_ERROR.value, f"portal_5000_limit: {_portal_msg[:300]}"
+                except Exception as _cap_exc:
+                    logger.debug("[liens][playwright] 5000-cap check failed: %s", _cap_exc)
+
                 try:
                     import datetime as _dt
                     import re as _re
@@ -450,10 +470,12 @@ async def _scrape_with_playwright(
                     logger.error("[liens][debug] Debug capture failed: %s", _dbg_exc)
             # --- END DEBUG ---
             logger.info("[Playwright] Scraped %d rows", len(df) if df is not None else 0)
-            return df
+            return df, None, None
         except Exception as e:
             logger.error("[Playwright] Scrape failed: %s", e)
             logger.debug(traceback.format_exc())
+            _exc_outcome = classify_exception(e)
+            _exc_msg = str(e)[:500]
             # --- DEBUG: capture on unexpected exception bubble-up ---
             try:
                 import datetime as _dt
@@ -464,10 +486,23 @@ async def _scrape_with_playwright(
                 _shot = _dbg / f"liens_debug_{county_id}_{_ts}.png"
                 await page.screenshot(path=str(_shot), full_page=True)
                 logger.error("[liens][debug] Screenshot: %s", _shot)
+                # A timeout waiting for the CSV button can be caused by the 5000-cap
+                # dialog blocking it — check here too so the classification is correct.
+                _exc_content = await page.content()
+                if "is not allowed to exceed" in _exc_content:
+                    import re as _re
+                    _m = _re.search(
+                        r'id=["\']ErrorMsg["\'][^>]*>\s*(.*?)\s*</div>',
+                        _exc_content, _re.DOTALL | _re.IGNORECASE,
+                    )
+                    _portal_msg = _m.group(1).strip() if _m else "result count exceeds 5000"
+                    logger.error("[liens][playwright] Portal 5000-record cap caused failure: %s", _portal_msg)
+                    _exc_outcome = ScraperOutcome.SOURCE_ERROR.value
+                    _exc_msg = f"portal_5000_limit: {_portal_msg[:300]}"
             except Exception as _dbg_exc:
                 logger.error("[liens][debug] Debug capture failed: %s", _dbg_exc)
             # --- END DEBUG ---
-            return None
+            return None, _exc_outcome, _exc_msg
         finally:
             try:
                 await context.close()
@@ -572,6 +607,30 @@ async def _scrape_with_nodriver(
             county_id=county_id,
         )
         logger.info("[CF/ND] Scraped %d rows", len(df) if df is not None else 0)
+
+        # When the portal rejects a query that would return >5000 rows it renders
+        # #ErrorWin/#ErrorMsg and never shows the CSV export button. Detect this
+        # before returning so the run is classified SOURCE_ERROR (query too broad)
+        # rather than UNKNOWN/UNCLASSIFIED.
+        if (df is None or df.empty) and page is not None:
+            try:
+                import re as _re
+                _content = await page.get_content() or ""
+                if "is not allowed to exceed" in _content:
+                    _m = _re.search(
+                        r'id=["\']ErrorMsg["\'][^>]*>\s*(.*?)\s*</div>',
+                        _content, _re.DOTALL | _re.IGNORECASE,
+                    )
+                    _portal_msg = (
+                        _m.group(1).strip() if _m
+                        else "result count exceeds 5000 — narrow the date range"
+                    )
+                    logger.error("[CF/ND] Portal 5000-record cap: %s", _portal_msg)
+                    await _dump_debug(page, "no_csv_btn")
+                    return None, ScraperOutcome.SOURCE_ERROR.value, f"portal_5000_limit: {_portal_msg[:300]}"
+            except Exception as _chk_exc:
+                logger.debug("[CF/ND] Could not check for 5000-cap error: %s", _chk_exc)
+
         return df, None, None
     except PlaywrightCodeError as exc:
         msg = str(exc)
@@ -924,7 +983,7 @@ async def run_lien_pipeline(
             used_selector_mode = True
         elif scrape_mode in ("playwright_only", "playwright_then_ai") and playwright_code:
             logger.info("[Pipeline] Using Playwright selector mode (%s)", scrape_mode)
-            df = await _scrape_with_playwright(
+            df, nd_outcome, nd_error = await _scrape_with_playwright(
                 playwright_code, source, start_str, end_str, RAW_LIEN_DIR,
                 headful=headful, cf_profile=cf_profile, no_proxy=no_proxy,
             )
