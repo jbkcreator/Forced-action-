@@ -26,6 +26,7 @@ import asyncio
 import json
 import time
 import traceback
+from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Tuple
@@ -773,7 +774,7 @@ def _sub_categorise_liens(df: pd.DataFrame, county_cfg: dict) -> pd.DataFrame:
     code_lien_type_map: dict = county_cfg.get("code_lien_type_map") or {}
 
     def label_row(row) -> str:
-        doc_type = str(row.get("DocType", "") or "").strip().upper()
+        doc_type = str(row.get("DocType") or row.get("document_type") or "").strip().upper()
         grantor = str(row.get("Grantor", "") or "").upper()
         grantee = str(row.get("Grantee", "") or "").upper()
 
@@ -1044,36 +1045,45 @@ async def run_lien_pipeline(
                 )
                 return False
 
-        # The clerk portal caps results at 5000 rows per query. A multi-day range
-        # can exceed this even when a single day cannot. Split into two single-day
-        # calls so each stays within the cap. Both days run independently — one
-        # hitting SOURCE_ERROR doesn't block the other.
-        _needs_split = _start_dt.date() != _end_dt.date()
-        _day_pairs = (
-            [
-                (_start_dt.strftime("%m/%d/%Y"), _start_dt.strftime("%m/%d/%Y")),
-                (_end_dt.strftime("%m/%d/%Y"),   _end_dt.strftime("%m/%d/%Y")),
-            ]
-            if _needs_split
-            else [(start_str, end_str)]
-        )
-
+        # Reactive work queue — starts as the full date range in one item.
+        # Expands into per-day items only when the portal's 5000-row cap is
+        # actually hit on a multi-day span; a single-day cap hit cannot be
+        # split further and is recorded as a plain error.
+        _work_queue: deque = deque([(_start_dt, _end_dt)])
         collected: list = []
         day_errors: list = []
 
-        for _s, _e in _day_pairs:
-            if _needs_split:
-                logger.info("[Pipeline] Scraping single day %s", _s)
+        while _work_queue:
+            _ws, _we = _work_queue.popleft()
+            _ws_str = _ws.strftime("%m/%d/%Y")
+            _we_str = _we.strftime("%m/%d/%Y")
+
             _df, _day_outcome, _day_err = await _dispatch_scrape(
-                source, _s, _e, scrape_mode, playwright_code, cf_profile, headful, no_proxy,
+                source, _ws_str, _we_str, scrape_mode, playwright_code, cf_profile, headful, no_proxy,
             )
+
+            _is_cap_error = _day_outcome is not None and "portal_5000_limit" in (_day_err or "")
+            _is_multi_day = _ws.date() != _we.date()
+
             if _df is not None and not _df.empty:
                 collected.append(_df)
+            elif _is_cap_error and _is_multi_day:
+                logger.info(
+                    "[Pipeline] Portal cap hit on %s → %s — splitting into per-day entries",
+                    _ws_str, _we_str,
+                )
+                _day_items = []
+                _cur = _ws.date()
+                while _cur <= _we.date():
+                    _cur_dt = datetime(_cur.year, _cur.month, _cur.day)
+                    _day_items.append((_cur_dt, _cur_dt))
+                    _cur += timedelta(days=1)
+                _work_queue.extendleft(reversed(_day_items))
             elif _day_outcome is not None:
-                day_errors.append(f"{_s}: {_day_outcome} — {_day_err}")
-                logger.error("[Pipeline] Scrape failed for %s: %s — %s", _s, _day_outcome, _day_err)
+                day_errors.append(f"{_ws_str}: {_day_outcome} — {_day_err}")
+                logger.error("[Pipeline] Scrape failed for %s: %s — %s", _ws_str, _day_outcome, _day_err)
             else:
-                logger.info("[Pipeline] No records for %s", _s)
+                logger.info("[Pipeline] No records for %s", _ws_str)
 
         if not collected:
             if day_errors:
@@ -1088,8 +1098,8 @@ async def run_lien_pipeline(
             return True
 
         df = pd.concat(collected, ignore_index=True)
-        if _needs_split:
-            logger.info("[Pipeline] Combined %d records from %d day(s)", len(df), len(collected))
+        if len(collected) > 1:
+            logger.info("[Pipeline] Combined %d records from %d segment(s)", len(df), len(collected))
 
         # Resolve the ColumnMapping for this source. Renames, BookPage split, doc-
         # type value normalisation, and row routing all happen inside ColumnMapper.
