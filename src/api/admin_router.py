@@ -2249,6 +2249,13 @@ def get_closing_cockpit(
     }
 
 
+_RELAY_KILL_TARGETS = ("ALL", "RELAY", "VERA", "HUNTER", "CORA")
+
+
+def _kill_feature_for_target(target: str) -> str:
+    return "global" if target == "ALL" else f"{target.lower()}_global"
+
+
 @router.post("/slack/kill")
 async def slack_kill_command(request: Request):
     """
@@ -2256,6 +2263,12 @@ async def slack_kill_command(request: Request):
     accepts VERA/HUNTER/CORA, same <agent>_global convention). Sets the shared
     Redis kill-switch override that src.services.kill_switch_service reads
     fleet-wide — build spec §9.1: "the kill command instantly."
+
+    Optional second token 'FOREVER' (e.g. '/relay-kill CORA FOREVER') sets
+    the override with no TTL instead of the default auto-expiring one — it
+    stays red until /slack/resume (the '/relay-resume' command) explicitly
+    clears it. Without FOREVER, behavior is unchanged: auto-clears after
+    KILL_OVERRIDE_TTL_SECONDS.
 
     Slash-command bodies are plain form-encoded (NOT wrapped in a "payload"
     field like interactive-component callbacks) — parsed directly here.
@@ -2278,18 +2291,59 @@ async def slack_kill_command(request: Request):
     if not _relay_approver_authorized(user_id):
         return _slack_ephemeral("Not authorized to issue kill commands.")
 
-    text_arg = form.get("text", [""])[0].strip().upper()
-    if text_arg not in ("ALL", "RELAY", "VERA", "HUNTER", "CORA"):
+    tokens = form.get("text", [""])[0].strip().upper().split()
+    target = tokens[0] if tokens else ""
+    forever = len(tokens) == 2 and tokens[1] == "FOREVER"
+    if target not in _RELAY_KILL_TARGETS or not (len(tokens) == 1 or forever):
         return _slack_ephemeral(
-            "Usage: /relay-kill ALL | RELAY | VERA | HUNTER | CORA"
+            "Usage: /relay-kill ALL | RELAY | VERA | HUNTER | CORA [FOREVER]"
         )
 
-    feature = "global" if text_arg == "ALL" else f"{text_arg.lower()}_global"
-    rset(f"kill_switch_override:{feature}", "red", ttl_seconds=KILL_OVERRIDE_TTL_SECONDS)
-    return _slack_ephemeral(
-        f"\U0001F6D1 STOP {text_arg} — kill switch RED for "
-        f"{KILL_OVERRIDE_TTL_SECONDS // 60} min. Auto-clears on expiry."
+    feature = _kill_feature_for_target(target)
+    rset(
+        f"kill_switch_override:{feature}", "red",
+        ttl_seconds=None if forever else KILL_OVERRIDE_TTL_SECONDS,
     )
+    if forever:
+        reply = f"\U0001F6D1 STOP {target} — kill switch RED until /relay-resume {target} is run."
+    else:
+        reply = (
+            f"\U0001F6D1 STOP {target} — kill switch RED for "
+            f"{KILL_OVERRIDE_TTL_SECONDS // 60} min. Auto-clears on expiry."
+        )
+    return _slack_ephemeral(reply)
+
+
+@router.post("/slack/resume")
+async def slack_resume_command(request: Request):
+    """
+    Slack slash command: '/relay-resume ALL' or '/relay-resume CORA' (also
+    RELAY/VERA/HUNTER). Clears a manual kill-switch override set by
+    /relay-kill — the only way to bring back a target killed with FOREVER,
+    and also usable to end an in-progress auto-expiring kill early.
+    """
+    from src.core.redis_client import rdelete
+
+    raw = await request.body()
+    if not _verify_slack_signature(dict(request.headers), raw):
+        raise HTTPException(status_code=401, detail="Invalid Slack signature")
+
+    form = parse_qs(raw.decode("utf-8"))
+    user_id = form.get("user_id", [""])[0]
+    if not _relay_approver_authorized(user_id):
+        return _slack_ephemeral("Not authorized to issue resume commands.")
+
+    target = form.get("text", [""])[0].strip().upper()
+    if target not in _RELAY_KILL_TARGETS:
+        return _slack_ephemeral("Usage: /relay-resume ALL | RELAY | VERA | HUNTER | CORA")
+
+    feature = _kill_feature_for_target(target)
+    if not rdelete(f"kill_switch_override:{feature}"):
+        return _slack_ephemeral(
+            f"⚠️ Failed to clear kill switch for {target} — Redis unavailable. "
+            "Override may still be active. Try again or clear it directly."
+        )
+    return _slack_ephemeral(f"✅ RESUME {target} — kill switch override cleared.")
 
 
 # ===========================================================================

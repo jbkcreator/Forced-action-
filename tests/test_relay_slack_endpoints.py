@@ -115,6 +115,23 @@ def _post_kill(client, text: str, user_id: str = "U_APPROVER", ts_offset: int = 
     )
 
 
+def _post_resume(client, text: str, user_id: str = "U_APPROVER", ts_offset: int = 0, bad_sig: bool = False):
+    body = urlencode({"text": text, "user_id": user_id}).encode()
+    if bad_sig:
+        ts, sig = str(int(time.time())), "v0=badsig"
+    else:
+        ts, sig = _sign(body, "test-signing-secret", ts_offset=ts_offset)
+    return client.post(
+        "/api/admin/slack/resume",
+        content=body,
+        headers={
+            "content-type": "application/x-www-form-urlencoded",
+            "x-slack-request-timestamp": ts,
+            "x-slack-signature": sig,
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # /slack/relay-decision
 # ---------------------------------------------------------------------------
@@ -217,6 +234,41 @@ def test_kill_cora_sets_cora_global_override(app_client, monkeypatch):
     assert mock_rset.call_args[0][1] == "red"
 
 
+def test_kill_cora_forever_sets_no_ttl(app_client, monkeypatch):
+    mock_rset = MagicMock(return_value=True)
+    monkeypatch.setattr("src.core.redis_client.rset", mock_rset)
+
+    resp = _post_kill(app_client, "CORA FOREVER")
+
+    assert resp.status_code == 200
+    assert mock_rset.call_args[0][0] == "kill_switch_override:cora_global"
+    assert mock_rset.call_args[0][1] == "red"
+    assert mock_rset.call_args.kwargs["ttl_seconds"] is None
+    assert "/relay-resume" in resp.json()["text"]
+
+
+def test_kill_forever_invalid_second_token_returns_usage(app_client, monkeypatch):
+    mock_rset = MagicMock()
+    monkeypatch.setattr("src.core.redis_client.rset", mock_rset)
+
+    resp = _post_kill(app_client, "CORA BOGUS")
+
+    assert resp.status_code == 200
+    assert "Usage" in resp.json()["text"]
+    mock_rset.assert_not_called()
+
+
+def test_kill_forever_rejects_extra_tokens(app_client, monkeypatch):
+    mock_rset = MagicMock()
+    monkeypatch.setattr("src.core.redis_client.rset", mock_rset)
+
+    resp = _post_kill(app_client, "CORA FOREVER EXTRA")
+
+    assert resp.status_code == 200
+    assert "Usage" in resp.json()["text"]
+    mock_rset.assert_not_called()
+
+
 def test_kill_non_approver_rejected(app_client, monkeypatch):
     mock_rset = MagicMock()
     monkeypatch.setattr("src.core.redis_client.rset", mock_rset)
@@ -277,3 +329,82 @@ def test_empty_approvers_rejects_every_user_on_kill(app_client, monkeypatch):
 def test_kill_invalid_signature_returns_401(app_client):
     resp = _post_kill(app_client, "ALL", bad_sig=True)
     assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# /slack/resume
+# ---------------------------------------------------------------------------
+
+def test_resume_cora_clears_override(app_client, monkeypatch):
+    mock_rdelete = MagicMock()
+    monkeypatch.setattr("src.core.redis_client.rdelete", mock_rdelete)
+
+    resp = _post_resume(app_client, "CORA")
+
+    assert resp.status_code == 200
+    mock_rdelete.assert_called_once_with("kill_switch_override:cora_global")
+    assert "RESUME CORA" in resp.json()["text"]
+
+
+def test_resume_non_approver_rejected(app_client, monkeypatch):
+    mock_rdelete = MagicMock()
+    monkeypatch.setattr("src.core.redis_client.rdelete", mock_rdelete)
+
+    resp = _post_resume(app_client, "CORA", user_id="U_RANDO")
+
+    assert resp.status_code == 200
+    assert "Not authorized" in resp.json()["text"]
+    mock_rdelete.assert_not_called()
+
+
+def test_resume_invalid_arg_returns_usage(app_client, monkeypatch):
+    mock_rdelete = MagicMock()
+    monkeypatch.setattr("src.core.redis_client.rdelete", mock_rdelete)
+
+    resp = _post_resume(app_client, "BOGUS")
+
+    assert resp.status_code == 200
+    assert "Usage" in resp.json()["text"]
+    mock_rdelete.assert_not_called()
+
+
+def test_empty_approvers_rejects_every_user_on_resume(app_client, monkeypatch):
+    monkeypatch.setattr("src.api.admin_router.settings.relay_approvers", [])
+    mock_rdelete = MagicMock()
+    monkeypatch.setattr("src.core.redis_client.rdelete", mock_rdelete)
+
+    resp = _post_resume(app_client, "CORA", user_id="U_ANYONE")
+
+    assert resp.status_code == 200
+    assert "Not authorized" in resp.json()["text"]
+    mock_rdelete.assert_not_called()
+
+
+def test_resume_invalid_signature_returns_401(app_client):
+    resp = _post_resume(app_client, "CORA", bad_sig=True)
+    assert resp.status_code == 401
+
+
+def test_resume_reports_failure_when_redis_unavailable(app_client, monkeypatch):
+    # rdelete() returns False when _get_client() is None (Redis unreachable) —
+    # the endpoint must not claim success in that case.
+    monkeypatch.setattr("src.core.redis_client.rdelete", MagicMock(return_value=False))
+
+    resp = _post_resume(app_client, "CORA")
+
+    assert resp.status_code == 200
+    text = resp.json()["text"]
+    assert "Failed" in text or "unavailable" in text.lower()
+    assert "cleared" not in text.lower()
+
+
+def test_resume_reports_failure_when_delete_raises(app_client, monkeypatch):
+    # rdelete() also returns False (rather than raising) when client.delete()
+    # itself raises — same false-success risk, covered separately since it's
+    # a different internal branch of rdelete().
+    monkeypatch.setattr("src.core.redis_client.rdelete", MagicMock(return_value=False))
+
+    resp = _post_resume(app_client, "ALL")
+
+    assert resp.status_code == 200
+    assert "cleared" not in resp.json()["text"].lower()
