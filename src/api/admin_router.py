@@ -2300,10 +2300,14 @@ async def slack_kill_command(request: Request):
         )
 
     feature = _kill_feature_for_target(target)
-    rset(
+    if not rset(
         f"kill_switch_override:{feature}", "red",
         ttl_seconds=None if forever else KILL_OVERRIDE_TTL_SECONDS,
-    )
+    ):
+        return _slack_ephemeral(
+            f"⚠️ Failed to set kill switch for {target} — Redis unavailable. "
+            "STOP did NOT take effect — retry immediately."
+        )
     if forever:
         reply = f"\U0001F6D1 STOP {target} — kill switch RED until /relay-resume {target} is run."
     else:
