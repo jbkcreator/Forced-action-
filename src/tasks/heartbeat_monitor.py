@@ -91,24 +91,31 @@ HEARTBEAT_SLAS: Dict[str, int] = {
 # skips them on those days so a M-Sat scraper isn't reported as "stale" on a
 # Sunday morning by design. Python weekday(): Mon=0, Tue=1, ..., Sat=5, Sun=6.
 #
-# Everything except foreclosures runs M-Sat in cron, so Sunday (6) is their
-# off-day. foreclosures runs daily and has no entry here → checked every day.
+# Court-record scrapers get {5, 6} (Sat+Sun) because the courthouse and
+# clerk's office are closed on weekends — the cron still runs on Saturday but
+# finds no filings (NO_DATA), so Saturday is treated as a valid off-day to
+# avoid false-stale alerts over the full weekend gap.
+# Real-time / weather scrapers keep {6} (Sun only) — data flows every day.
+# foreclosures runs daily and has no entry → checked every day.
 # Keep this in sync with scripts/cron/crontab.txt.
 SOURCE_OFF_DAYS: Dict[str, set] = {
+    # ── Property / permit portals (Mon-Sat, data can arrive on Saturday) ──
     "violations":       {6},
     "permits":          {6},
     "roofing_permits":  {6},
-    "probate":          {6},
-    "evictions":        {6},
-    "divorce_filings":  {6},
-    "bankruptcy":       {6},
-    "lien_ml":          {6},
-    "lien_tcl":         {6},
-    "lien_ccl":         {6},
-    "lien_hoa":         {6},
-    "lien_tl":          {6},
-    "judgments":        {6},
-    "sunbiz":           {6},
+    # ── Court-record scrapers (courthouse closed weekends) ────────────────
+    "probate":          {5, 6},
+    "evictions":        {5, 6},
+    "divorce_filings":  {5, 6},
+    "bankruptcy":       {5, 6},
+    "lien_ml":          {5, 6},
+    "lien_tcl":         {5, 6},
+    "lien_ccl":         {5, 6},
+    "lien_hoa":         {5, 6},
+    "lien_tl":          {5, 6},
+    "judgments":        {5, 6},
+    "sunbiz":           {5, 6},
+    # ── Real-time / weather scrapers (data can arrive any day) ────────────
     "storm_damage":     {6},
     "fire_incidents":   {6},
     "flood_damage":     {6},
