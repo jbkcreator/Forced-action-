@@ -206,6 +206,17 @@ def test_kill_relay_sets_relay_global_override(app_client, monkeypatch):
     assert mock_rset.call_args[0][0] == "kill_switch_override:relay_global"
 
 
+def test_kill_cora_sets_cora_global_override(app_client, monkeypatch):
+    mock_rset = MagicMock(return_value=True)
+    monkeypatch.setattr("src.core.redis_client.rset", mock_rset)
+
+    resp = _post_kill(app_client, "CORA")
+
+    assert resp.status_code == 200
+    assert mock_rset.call_args[0][0] == "kill_switch_override:cora_global"
+    assert mock_rset.call_args[0][1] == "red"
+
+
 def test_kill_non_approver_rejected(app_client, monkeypatch):
     mock_rset = MagicMock()
     monkeypatch.setattr("src.core.redis_client.rset", mock_rset)

@@ -2253,7 +2253,7 @@ def get_closing_cockpit(
 async def slack_kill_command(request: Request):
     """
     Slack slash command: '/relay-kill ALL' or '/relay-kill RELAY' (also
-    accepts VERA/HUNTER, same <agent>_global convention). Sets the shared
+    accepts VERA/HUNTER/CORA, same <agent>_global convention). Sets the shared
     Redis kill-switch override that src.services.kill_switch_service reads
     fleet-wide — build spec §9.1: "the kill command instantly."
 
@@ -2279,9 +2279,9 @@ async def slack_kill_command(request: Request):
         return _slack_ephemeral("Not authorized to issue kill commands.")
 
     text_arg = form.get("text", [""])[0].strip().upper()
-    if text_arg not in ("ALL", "RELAY", "VERA", "HUNTER"):
+    if text_arg not in ("ALL", "RELAY", "VERA", "HUNTER", "CORA"):
         return _slack_ephemeral(
-            "Usage: /relay-kill ALL | RELAY | VERA | HUNTER"
+            "Usage: /relay-kill ALL | RELAY | VERA | HUNTER | CORA"
         )
 
     feature = "global" if text_arg == "ALL" else f"{text_arg.lower()}_global"
