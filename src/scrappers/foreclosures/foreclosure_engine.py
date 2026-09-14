@@ -261,7 +261,7 @@ def _parse_agent_result(
 	auctions = data.get("auctions", [])
 	if not auctions:
 		logger.info(f"[Parse] No auctions for {auction_date} — none scheduled or all cancelled")
-		return None
+		return "NO_DATA"
 
 	logger.info(f"[Parse] Agent extracted {len(auctions)} auction records")
 
@@ -393,29 +393,34 @@ async def run_foreclosure_pipeline(
 	csv_file = _parse_agent_result(history, auction_date, county_id)
 
 	if not csv_file:
-		logger.info("No new foreclosure records — nothing to load")
 		from src.utils.scraper_db_helper import record_scraper_stats
 		from config.scraper_outcomes import ScraperOutcome
-		# _parse_agent_result returns None both when the agent genuinely found
-		# 0 auctions AND when it crashed/returned no history/no parseable
-		# result — _run_agent_with_proxy_failover's retry loop doesn't surface
-		# the underlying exception, so these two cases are indistinguishable
-		# here. UNKNOWN rather than the previous hardcoded no_data, which
-		# risked masking a real failure as a confirmed empty day. error_type
-		# left unset on purpose — a stale 'no_data' string would keep legacy
-		# readers (e.g. Vera's error_type-based fallback check) fooled even
-		# after outcome_category correctly flags this as UNKNOWN; it now
-		# derives to 'scraper_error' via LEGACY_ERROR_TYPE_MAP instead.
-		record_scraper_stats(
-			source_type="foreclosures",
-			total_scraped=0,
-			matched=0,
-			unmatched=0,
-			skipped=0,
-			outcome=ScraperOutcome.UNKNOWN.value,
-			error_message="no CSV produced (ambiguous: empty auction list vs agent/parse failure)",
-			county_id=county_id,
-		)
+		if csv_file == "NO_DATA":
+			# Agent ran successfully and confirmed no auctions are listed for
+			# this date — clean empty day, not a failure.
+			logger.info("No foreclosure auctions scheduled for %s — nothing to load", auction_date)
+			record_scraper_stats(
+				source_type="foreclosures",
+				total_scraped=0,
+				matched=0,
+				unmatched=0,
+				skipped=0,
+				outcome=ScraperOutcome.NO_DATA.value,
+				county_id=county_id,
+			)
+		else:
+			# None — agent crashed, produced no JSON, or JSON was unparseable.
+			logger.warning("No CSV produced — agent or parse failure for %s", auction_date)
+			record_scraper_stats(
+				source_type="foreclosures",
+				total_scraped=0,
+				matched=0,
+				unmatched=0,
+				skipped=0,
+				outcome=ScraperOutcome.UNKNOWN.value,
+				error_message="no CSV produced (agent or parse failure)",
+				county_id=county_id,
+			)
 		return None
 
 	if load_to_db:
