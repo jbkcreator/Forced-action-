@@ -92,12 +92,16 @@ def redis_available() -> bool:
     return _get_client() is not None
 
 
-def rset(key: str, value: str, ttl_seconds: int = 300) -> bool:
+def rset(key: str, value: str, ttl_seconds: Optional[int] = 300) -> bool:
+    """ttl_seconds=None means no expiry — the key persists until rdelete()."""
     client = _get_client()
     if client is None:
         return False
     try:
-        client.setex(key, ttl_seconds, value)
+        if ttl_seconds is None:
+            client.set(key, value)
+        else:
+            client.setex(key, ttl_seconds, value)
         return True
     except Exception as exc:
         logger.warning("Redis rset failed for %s: %s", key, exc)

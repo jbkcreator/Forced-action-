@@ -551,10 +551,17 @@ no separate app needed.
    buttons dispatch through that same endpoint, nothing further to add here.
 2. Add a slash command `/relay-kill` with Request URL:
    `https://<your-host>/api/admin/slack/kill`
-   (usage: `/relay-kill ALL | RELAY | VERA | HUNTER` — sets the fleet-wide
-   kill-switch override, auto-expires after `KILL_OVERRIDE_TTL_SECONDS`, 1 hour default)
+   (usage: `/relay-kill ALL | RELAY | VERA | HUNTER | CORA [FOREVER]` — sets
+   the fleet-wide kill-switch override. Without `FOREVER` it auto-expires
+   after `KILL_OVERRIDE_TTL_SECONDS`, 1 hour default; with `FOREVER` it has no
+   TTL and stays red until cleared with `/relay-resume`.)
    Slash commands get their own Request URL slot in Slack, separate from
    Interactivity, so this one is unaffected by the single-URL constraint above.
+3. Add a slash command `/relay-resume` with Request URL:
+   `https://<your-host>/api/admin/slack/resume`
+   (usage: `/relay-resume ALL | RELAY | VERA | HUNTER | CORA` — clears a
+   kill-switch override, the only way to bring back a target killed with
+   `FOREVER`; also usable to end an in-progress auto-expiring kill early.)
 
 ### One-time email channel setup
 Before any email can send, the Relay passthrough Instantly campaign must exist:
