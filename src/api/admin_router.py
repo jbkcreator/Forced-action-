@@ -2338,7 +2338,11 @@ async def slack_resume_command(request: Request):
         return _slack_ephemeral("Usage: /relay-resume ALL | RELAY | VERA | HUNTER | CORA")
 
     feature = _kill_feature_for_target(target)
-    rdelete(f"kill_switch_override:{feature}")
+    if not rdelete(f"kill_switch_override:{feature}"):
+        return _slack_ephemeral(
+            f"⚠️ Failed to clear kill switch for {target} — Redis unavailable. "
+            "Override may still be active. Try again or clear it directly."
+        )
     return _slack_ephemeral(f"✅ RESUME {target} — kill switch override cleared.")
 
 

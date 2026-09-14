@@ -148,14 +148,19 @@ def rdecr(key: str) -> int:
         return 0
 
 
-def rdelete(key: str) -> None:
+def rdelete(key: str) -> bool:
+    """Returns True once the delete actually reached Redis, False if Redis
+    is unavailable or the delete call raised — callers that must not report
+    success on a silent no-op (e.g. /relay-resume) should check this."""
     client = _get_client()
     if client is None:
-        return
+        return False
     try:
         client.delete(key)
+        return True
     except Exception as exc:
         logger.warning("Redis rdelete failed for %s: %s", key, exc)
+        return False
 
 
 def rttl(key: str) -> Optional[int]:

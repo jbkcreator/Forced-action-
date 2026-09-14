@@ -383,3 +383,28 @@ def test_empty_approvers_rejects_every_user_on_resume(app_client, monkeypatch):
 def test_resume_invalid_signature_returns_401(app_client):
     resp = _post_resume(app_client, "CORA", bad_sig=True)
     assert resp.status_code == 401
+
+
+def test_resume_reports_failure_when_redis_unavailable(app_client, monkeypatch):
+    # rdelete() returns False when _get_client() is None (Redis unreachable) —
+    # the endpoint must not claim success in that case.
+    monkeypatch.setattr("src.core.redis_client.rdelete", MagicMock(return_value=False))
+
+    resp = _post_resume(app_client, "CORA")
+
+    assert resp.status_code == 200
+    text = resp.json()["text"]
+    assert "Failed" in text or "unavailable" in text.lower()
+    assert "cleared" not in text.lower()
+
+
+def test_resume_reports_failure_when_delete_raises(app_client, monkeypatch):
+    # rdelete() also returns False (rather than raising) when client.delete()
+    # itself raises — same false-success risk, covered separately since it's
+    # a different internal branch of rdelete().
+    monkeypatch.setattr("src.core.redis_client.rdelete", MagicMock(return_value=False))
+
+    resp = _post_resume(app_client, "ALL")
+
+    assert resp.status_code == 200
+    assert "cleared" not in resp.json()["text"].lower()

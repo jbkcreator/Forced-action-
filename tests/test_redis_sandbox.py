@@ -69,8 +69,21 @@ def test_rincr_applies_ttl_on_first_increment(sandbox_redis):
 
 def test_rdelete_removes_key(sandbox_redis):
 	redis_client.rset("deletable", "bye", ttl_seconds=60)
-	redis_client.rdelete("deletable")
+	assert redis_client.rdelete("deletable") is True
 	assert redis_client.rget("deletable") is None
+
+
+def test_rdelete_returns_false_when_redis_unavailable(no_redis):
+	# Callers like /relay-resume must be able to tell "nothing happened"
+	# apart from "deleted" — a bare None return can't distinguish them.
+	assert redis_client.rdelete("anything") is False
+
+
+def test_rset_no_ttl_persists_without_expiry(sandbox_redis):
+	assert redis_client.rset("persistent:key", "red", ttl_seconds=None) is True
+	client = redis_client.get_redis()
+	assert client.get("persistent:key") == "red"
+	assert redis_client.rttl("persistent:key") is None
 
 
 def test_ttl_expires_keys(sandbox_redis):
