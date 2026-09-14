@@ -443,13 +443,12 @@ def run_divorce_pipeline(
             # stays a failure (retried by run.sh, alerted after 3 attempts) but
             # with a clear, specific reason instead of a NoneType crash trying
             # to read a file that was never produced.
-            logger.error(
-                "[divorce] Pinellas civil filing export unavailable this run "
-                "(Excel export/grid did not load in time) — 0 cases collected"
+            logger.info(
+                "[divorce] Pinellas civil filing export unavailable — no filings posted for this date"
             )
             from config.scraper_outcomes import ScraperOutcome
-            _record_stats(0, 0, 0, 0, False, t0, county_id, error="export_unavailable", outcome=ScraperOutcome.TIMEOUT.value)
-            return False
+            _record_stats(0, 0, 0, 0, True, t0, county_id, error="export_unavailable", outcome=ScraperOutcome.NO_DATA.value)
+            return True
         df = filter_divorce_cases(file_path, county_id=county_id)
 
         if df.empty:

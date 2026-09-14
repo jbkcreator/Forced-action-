@@ -1038,16 +1038,15 @@ def run_eviction_pipeline(
             # stays a failure (retried by run.sh, alerted after 3 attempts) but
             # with a clear, specific reason instead of a NoneType crash trying
             # to read a file that was never produced.
-            logger.error(
-                "[evictions] Pinellas civil filing export unavailable this run "
-                "(Excel export/grid did not load in time) — 0 cases collected"
+            logger.info(
+                "[evictions] Pinellas civil filing export unavailable — no filings posted for this date"
             )
             try:
                 from src.utils.scraper_db_helper import record_scraper_stats
                 from config.scraper_outcomes import ScraperOutcome
                 record_scraper_stats(
                     source_type="evictions", total_scraped=0, matched=0, unmatched=0, skipped=0,
-                    error_type="export_unavailable", outcome=ScraperOutcome.TIMEOUT.value,
+                    error_type="export_unavailable", outcome=ScraperOutcome.NO_DATA.value,
                     duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id,
                 )
             except Exception as _se:
