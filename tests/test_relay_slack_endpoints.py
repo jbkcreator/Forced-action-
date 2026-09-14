@@ -269,6 +269,30 @@ def test_kill_forever_rejects_extra_tokens(app_client, monkeypatch):
     mock_rset.assert_not_called()
 
 
+def test_kill_reports_failure_when_redis_unavailable(app_client, monkeypatch):
+    # rset() returns False when Redis is unavailable or the write fails —
+    # the endpoint must not claim STOP succeeded in that case.
+    monkeypatch.setattr("src.core.redis_client.rset", MagicMock(return_value=False))
+
+    resp = _post_kill(app_client, "CORA")
+
+    assert resp.status_code == 200
+    text = resp.json()["text"]
+    assert "Failed" in text or "unavailable" in text.lower()
+    assert "STOP CORA" not in text
+
+
+def test_kill_forever_reports_failure_when_redis_unavailable(app_client, monkeypatch):
+    monkeypatch.setattr("src.core.redis_client.rset", MagicMock(return_value=False))
+
+    resp = _post_kill(app_client, "CORA FOREVER")
+
+    assert resp.status_code == 200
+    text = resp.json()["text"]
+    assert "Failed" in text or "unavailable" in text.lower()
+    assert "STOP CORA" not in text
+
+
 def test_kill_non_approver_rejected(app_client, monkeypatch):
     mock_rset = MagicMock()
     monkeypatch.setattr("src.core.redis_client.rset", mock_rset)
