@@ -32,6 +32,7 @@ python -m src.services.cds_engine --rescore-all
 PYTHONPATH=. python migrations/apply_<name>.py  # NEW scripts go here; apply one idempotent DDL script to the shared DB
 PYTHONPATH=. python scripts/apply_<name>.py     # pre-existing scripts only — stay in scripts/, do not move
 PYTHONPATH=. python migrations/apply_fa_max_state_engine.py  # FA Max WP-1 durable state schema (idempotent, safe to re-run)
+PYTHONPATH=. python migrations/apply_fa_max_wp2_queues.py   # FA Max WP-2 queue columns + consent table + fa_max_lending venture (idempotent, run after WP-1)
 
 # Tests
 pytest tests/                                  # default (excludes scenario)

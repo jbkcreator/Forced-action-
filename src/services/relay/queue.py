@@ -96,6 +96,13 @@ class QueueItem:
     # keeps working unchanged; _COLUMNS_SQL below picks the column up
     # automatically from the dataclass fields.
     venture_key: str = DEFAULT_VENTURE_KEY
+    # FA Max WP-2: operating lane, acting agent, autonomy tier. All three are
+    # nullable so non-FA-Max items (venture_key != 'fa_max_lending') are
+    # unaffected; their columns return NULL and the defaults below keep every
+    # existing call site working with zero changes.
+    lane: Optional[str] = None            # MONEY | EXCEPTIONS | RELATIONSHIPS
+    agent_name: Optional[str] = None      # e.g. "vera", "hunter", "cora"
+    autonomy_tier_at_send: Optional[str] = None  # A | B | C
 
 
 _QUEUE_ITEM_COLUMNS = tuple(f.name for f in fields(QueueItem))
@@ -114,6 +121,9 @@ def enqueue(
     payload: dict,
     thread_id: Optional[str] = None,
     venture_key: str = DEFAULT_VENTURE_KEY,
+    lane: Optional[str] = None,
+    agent_name: Optional[str] = None,
+    autonomy_tier_at_send: Optional[str] = None,
     skip_contract_validation: bool = False,
 ) -> QueueItem:
     """Write a new 'pending' row. Called by Cora/THROUGH (Phase 2) and by
@@ -165,6 +175,9 @@ def enqueue(
                 thread_id=thread_id,
                 status=STATUS_PENDING,
                 venture_key=venture_key,
+                lane=lane,
+                agent_name=agent_name,
+                autonomy_tier_at_send=autonomy_tier_at_send,
             )
             session.add(item)
             session.flush()

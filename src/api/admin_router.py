@@ -1867,8 +1867,20 @@ async def slack_relay_decision(request: Request):
 
 def _handle_relay_decision(payload: dict) -> dict:
     """Approve/Reject a pending Relay approval-queue item (build spec
-    §1.1.13 tap surface)."""
+    §1.1.13 tap surface).
+
+    For FA Max items (venture_key='fa_max_lending'): if the approved item's
+    payload contains a 'fa_max_transition' key, calls state_engine.transition()
+    to advance the FA Max person/opportunity state as part of the same approval.
+    The transition is best-effort — a failed state update does NOT roll back the
+    Slack approval (the item is still marked approved and will be dispatched).
+    """
+    import logging as _logging
+
     from src.services.relay import queue as relay_queue
+
+    _log = _logging.getLogger(__name__)
+    _FA_MAX_VENTURE = "fa_max_lending"
 
     user_id = payload.get("user", {}).get("id", "")
 
@@ -1900,11 +1912,100 @@ def _handle_relay_decision(payload: dict) -> dict:
     if item is None:
         return _slack_ephemeral(f"Item #{item_id} was already decided (not still pending).")
 
+    # FA Max: if the payload includes a state transition spec, execute it now
+    # so the person/opportunity state advances atomically with the approval.
+    if (
+        action == "approve"
+        and item.venture_key == _FA_MAX_VENTURE
+        and isinstance(item.payload, dict)
+        and item.payload.get("fa_max_transition")
+    ):
+        spec = item.payload["fa_max_transition"]
+        try:
+            from src.services.state_engine import (
+                get_opportunity_state,
+                get_person_state,
+                transition,
+                TransitionOutcome,
+            )
+            from src.core.database import get_db_context as _get_db
+
+            entity_type = spec.get("entity_type", "person")
+            entity_uuid = spec["entity_uuid"]
+
+            with _get_db() as _db:
+                # Load current state now, at approval time, rather than trusting
+                # spec["from_state"] — that value was written into the payload
+                # when the item was enqueued, which can be hours or days before
+                # Josh actually presses Approve, and the entity may have moved
+                # via a different path (another agent, another Slack lane) in
+                # the meantime. transition() is a CAS write keyed on from_state:
+                # a stale value here silently reports already_advanced instead
+                # of applying the transition Josh actually approved.
+                if entity_type == "opportunity":
+                    current = get_opportunity_state(session=_db, opportunity_id=entity_uuid)
+                    current_from_state = current.get("current_stage") if current else None
+                else:
+                    current = get_person_state(session=_db, person_id=entity_uuid)
+                    current_from_state = current.get("lifecycle_state") if current else None
+
+                if current is None:
+                    _log.error(
+                        "FA Max state transition on relay approval: entity not found "
+                        "item=%d entity_type=%s entity_uuid=%s",
+                        item.id, entity_type, entity_uuid,
+                    )
+                    return {"ok": True}
+
+                if current_from_state != spec.get("from_state"):
+                    _log.warning(
+                        "FA Max state transition on relay approval: stale from_state "
+                        "in payload (expected %r, actual %r) — proceeding with actual "
+                        "current state item=%d entity=%s",
+                        spec.get("from_state"), current_from_state, item.id, entity_uuid,
+                    )
+
+                # person_id must be stamped on every event row regardless of
+                # entity_type (person or opportunity) — it is the borrower-
+                # history partition key get_person_history() reads. Both
+                # get_person_state() and get_opportunity_state() return
+                # "person_id" in their dict for exactly this reason. Omitting
+                # it here would silently make this transition invisible to
+                # the borrower's history — no error, just a missing row.
+                person_id_for_event = current.get("person_id")
+
+                result = transition(
+                    entity_type=entity_type,
+                    entity_uuid=entity_uuid,
+                    from_state=current_from_state,
+                    to_state=spec["to_state"],
+                    actor=f"slack_approver:{user_id}",
+                    idempotency_key=spec.get("idempotency_key"),
+                    decision_id=spec.get("decision_id"),
+                    person_id=person_id_for_event,
+                    session=_db,
+                )
+            if result.outcome != TransitionOutcome.succeeded and result.outcome != TransitionOutcome.idempotent_skip:
+                _log.warning(
+                    "FA Max state transition on relay approval non-OK: "
+                    "item=%d outcome=%s entity=%s %s->%s",
+                    item.id, result.outcome, entity_uuid,
+                    current_from_state, spec.get("to_state"),
+                )
+        except Exception as exc:
+            # Transition failure must not block the approval — log and continue.
+            _log.error(
+                "FA Max state transition failed on relay approval item=%d: %s",
+                item.id, exc,
+            )
+
     reply_text = (
         f":white_check_mark: Approved by <@{user_id}>."
         if action == "approve"
         else f":no_entry: Rejected by <@{user_id}>."
     )
+    if item.lane:
+        reply_text += f"  Lane: `{item.lane}`"
     if item.slack_message_ts:
         _update_relay_slack_message(item.slack_message_ts, reply_text, item.venture_key)
 

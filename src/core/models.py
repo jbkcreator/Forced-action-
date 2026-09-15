@@ -9113,6 +9113,13 @@ class RelayApprovalQueueItem(Base):
     decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     dispatched_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # FA Max WP-2: operating lane, acting agent, and autonomy tier at send time.
+    # All three are NULL for non-FA-Max items so existing rows are unchanged.
+    lane: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    # MONEY | EXCEPTIONS | RELATIONSHIPS
+    agent_name: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    autonomy_tier_at_send: Mapped[Optional[str]] = mapped_column(String(1), nullable=True)
+    # A | B | C — stamped at dispatch time, never after
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
         default=lambda: datetime.now(timezone.utc), server_default=func.now(),
@@ -9135,6 +9142,14 @@ class RelayApprovalQueueItem(Base):
         CheckConstraint(
             "status IN ('pending', 'approved', 'rejected', 'sent', 'failed', 'skipped')",
             name="ck_relay_approval_queue_status",
+        ),
+        CheckConstraint(
+            "lane IS NULL OR lane IN ('MONEY', 'EXCEPTIONS', 'RELATIONSHIPS')",
+            name="ck_relay_approval_queue_lane",
+        ),
+        CheckConstraint(
+            "autonomy_tier_at_send IS NULL OR autonomy_tier_at_send IN ('A', 'B', 'C')",
+            name="ck_relay_approval_queue_tier",
         ),
     )
 
@@ -10951,4 +10966,44 @@ class FaMaxWorkQueue(Base):
         return (
             f"<FaMaxWorkQueue(work_item_id={self.work_item_id!r}, "
             f"queue={self.queue_name!r}, status={self.status!r})>"
+        )
+
+
+# ============================================================================
+# FA Max WP-2 — Consent per contact per channel
+# ============================================================================
+
+class FaMaxPersonConsent(Base):
+    """Opt-in consent record for one FA Max person on one channel."""
+    __tablename__ = "fa_max_person_consent"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    person_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_persons.person_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    channel: Mapped[str] = mapped_column(String(20), nullable=False)
+    consented: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    source: Mapped[str] = mapped_column(String(120), nullable=False)
+    consented_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "channel IN ('email', 'sms', 'voice')",
+            name="ck_fa_max_person_consent_channel",
+        ),
+        UniqueConstraint("person_id", "channel", name="uq_fa_max_person_consent_person_channel"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<FaMaxPersonConsent(person={self.person_id!r}, "
+            f"channel={self.channel!r}, consented={self.consented!r})>"
         )

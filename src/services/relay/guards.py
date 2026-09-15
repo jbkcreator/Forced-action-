@@ -24,8 +24,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import logging
+
 from config.settings import get_settings
 from config.venture_template import DEFAULT_VENTURE_KEY
+
+logger = logging.getLogger(__name__)
+
+_FA_MAX_VENTURE = "fa_max_lending"
 from src.core.database import get_db_context
 from src.core.redis_client import rdecr, rincr
 from src.services.compliance_gator import validate_outbound
@@ -70,6 +76,31 @@ def _suppression_reason(item: QueueItem) -> str | None:
     return None   # 'noop' and any future non-contact channel
 
 
+def _fa_max_compliance_reason(item: QueueItem) -> str | None:
+    """FA Max-specific pre-send compliance checks (WP-2).
+
+    Returns a block reason string if the item must not be sent, or None if
+    clear. Called before _suppression_reason so 10DLC block is visible in
+    the refusal log even when the contact is also suppressed.
+
+    Only applies to items with venture_key='fa_max_lending'.
+    """
+    if item.venture_key != _FA_MAX_VENTURE:
+        return None
+
+    if item.channel == "sms":
+        settings = get_settings()
+        if not settings.fa_max_10dlc_registered:
+            logger.warning(
+                "FA Max SMS blocked: fa_max_10dlc_registered=False "
+                "item_id=%s recipient=%s",
+                item.id, item.recipient,
+            )
+            return "fa_max_10dlc_not_registered"
+
+    return None
+
+
 def evaluate(item: QueueItem, *, now: datetime, venture=None) -> Verdict:
     """`venture` is the resolved VentureConfig for the batch (CLONE-v2.2 /
     CL3) — its send window governs the check. Omitted, the check falls back
@@ -78,6 +109,12 @@ def evaluate(item: QueueItem, *, now: datetime, venture=None) -> Verdict:
 
     if not _within_send_window(now, settings):
         return Verdict(DEFER, REASON_OUTSIDE_SEND_WINDOW)
+
+    # FA Max compliance check must run before suppression so 10DLC block
+    # appears in the refusal log even when the contact is also suppressed.
+    fa_cause = _fa_max_compliance_reason(item)
+    if fa_cause is not None:
+        return Verdict(BLOCK, f"{REASON_SUPPRESSED}:{fa_cause}")
 
     cause = _suppression_reason(item)
     if cause is not None:

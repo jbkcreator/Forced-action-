@@ -781,6 +781,19 @@ class AppSettings(BaseSettings):
 	seo_site_base_url: str = Field(default="https://forcedactionleads.com", env="SEO_SITE_BASE_URL")
 	seo_retire_hysteresis_runs: int = Field(default=2, env="SEO_RETIRE_HYSTERESIS_RUNS")
 
+	# ── FA Max WP-2 — Slack Operating Queues & Send Governance ───────────────
+	# 10DLC registration must be confirmed before ANY FA Max SMS can be sent.
+	# Defaults to False (fail-closed). Flip to True only after 10DLC campaign
+	# registration is complete and confirmed with Telnyx/carrier.
+	fa_max_10dlc_registered: bool = Field(default=False, env="FA_MAX_10DLC_REGISTERED")
+
+	# Lane-specific Slack channels for FA Max operating queues.
+	# Empty string = channel not configured; relay will no-op the post (same
+	# as existing relay_slack_channel behaviour when unconfigured).
+	fa_max_slack_channel_money: str = Field(default="", env="FA_MAX_SLACK_CHANNEL_MONEY")
+	fa_max_slack_channel_exceptions: str = Field(default="", env="FA_MAX_SLACK_CHANNEL_EXCEPTIONS")
+	fa_max_slack_channel_relationships: str = Field(default="", env="FA_MAX_SLACK_CHANNEL_RELATIONSHIPS")
+
 
 @lru_cache
 def get_settings() -> AppSettings:

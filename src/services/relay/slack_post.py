@@ -35,25 +35,49 @@ def _summary_text(item: QueueItem) -> str:
     )
 
 
+_FA_MAX_VENTURE = "fa_max_lending"
+
+_LANE_CHANNEL_ATTR = {
+    "MONEY": "fa_max_slack_channel_money",
+    "EXCEPTIONS": "fa_max_slack_channel_exceptions",
+    "RELATIONSHIPS": "fa_max_slack_channel_relationships",
+}
+
+
+def _resolve_channel(item: QueueItem, settings) -> str:
+    """Return the Slack channel for this item.
+
+    FA Max items with a lane route to their lane-specific channel from
+    settings. All other items (and FA Max items with no lane) fall back to
+    the venture's relay_slack_channel.
+    """
+    if item.venture_key == _FA_MAX_VENTURE and item.lane:
+        attr = _LANE_CHANNEL_ATTR.get(item.lane)
+        if attr:
+            lane_channel = getattr(settings, attr, "")
+            if lane_channel:
+                return lane_channel
+    return get_venture_config(item.venture_key).relay_slack_channel
+
+
 def post_for_approval(item: QueueItem) -> None:
     """Post an interactive Approve/Reject Slack message for a pending item.
 
-    The channel comes from the item's venture (CLONE-v2.2 / CL3) so each
-    venture's approvals land in its own channel — one shared channel would
-    make it impossible to tell whose prospect an approve button belongs to.
-    The bot token stays fleet-wide (one Slack app, per RELAY-v2.2 R1).
+    For FA Max items, routes to the lane-specific channel (MONEY /
+    EXCEPTIONS / RELATIONSHIPS) from settings. Other ventures use the
+    venture's relay_slack_channel as before (CLONE-v2.2 / CL3).
 
     No-ops (logs and returns) if Slack isn't configured — this keeps --seed
     usable in local/dev environments without a live Slack app.
     """
     settings = get_settings()
     token = settings.slack_bot_token
-    channel = get_venture_config(item.venture_key).relay_slack_channel
+    channel = _resolve_channel(item, settings)
     if not token or not channel:
         logger.info(
-            "[Relay] Slack not configured for venture %s (no slack channel or "
+            "[Relay] Slack not configured for venture %s lane %s (no slack channel or "
             "bot token) — item %d stays pending without a posted message",
-            item.venture_key, item.id,
+            item.venture_key, item.lane, item.id,
         )
         return
 
