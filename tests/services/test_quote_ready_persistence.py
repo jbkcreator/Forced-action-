@@ -55,6 +55,19 @@ def test_input_hash_ignores_opportunity_id():
     assert compute_input_hash(_full_input()) == compute_input_hash(other)
 
 
+def test_input_hash_canonicalizes_equal_decimals():
+    # 0.80 == 0.8 and 320000 == 320000.00 must hash identically
+    a = _full_input(max_ltc=Decimal("0.80"), arv=Decimal("320000"))
+    b = _full_input(max_ltc=Decimal("0.8"), arv=Decimal("320000.00"))
+    assert compute_input_hash(a) == compute_input_hash(b)
+
+
+def test_input_hash_zero_scale_and_sign_collapse():
+    a = _full_input(rehab_estimate=Decimal("0"))
+    b = _full_input(rehab_estimate=Decimal("0.00"))
+    assert compute_input_hash(a) == compute_input_hash(b)
+
+
 # --- status ---
 
 def test_status_computed_when_whole():
@@ -129,6 +142,15 @@ def test_build_row_shape_and_provenance():
     assert isinstance(row["outputs"]["project_cost"]["raw"], str)
     # basis high + rehab job_estimator (medium) → cost medium → overall medium
     assert row["confidence"]["overall"] == "medium"
+
+
+def test_build_row_persists_effective_rehab_confidence():
+    # rehab_confidence omitted → default from source (job_estimator → medium)
+    inp = _full_input(rehab_source="job_estimator")
+    assert inp.rehab_confidence is None
+    row = build_result_row(inp, compute_quote_ready(inp), computed_by="system:quote_ready")
+    # provenance records the confidence actually used, not null
+    assert row["provenance"]["rehab"]["confidence"] == "medium"
 
 
 def test_build_row_carries_supersedes():

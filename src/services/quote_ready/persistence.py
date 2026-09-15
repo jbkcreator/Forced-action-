@@ -12,9 +12,16 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Literal, Optional, Protocol
 
-from .models import Confidence, QuoteReadyInput, QuoteReadyResult, min_confidence
+from .models import (
+    Confidence,
+    QuoteReadyInput,
+    QuoteReadyResult,
+    default_rehab_confidence,
+    min_confidence,
+)
 
 # Bump when compute logic (formula, rounding, precedence) changes. Old rows are
 # never overwritten — a new version yields a new input_hash key dimension.
@@ -41,12 +48,21 @@ _HASH_FIELDS = (
 )
 
 
+def _canon(value) -> Optional[str]:
+    """Canonical string for hashing. Numerically equal Decimals hash equal:
+    0.80 == 0.8, 100 == 100.00, and signed zero collapses to "0"."""
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        if value == 0:
+            return "0"
+        return str(value.normalize())
+    return str(value)
+
+
 def compute_input_hash(inp: QuoteReadyInput) -> str:
-    """Deterministic sha256 over normalized effective inputs (Decimals as str)."""
-    payload = {}
-    for name in _HASH_FIELDS:
-        value = getattr(inp, name)
-        payload[name] = None if value is None else str(value)
+    """Deterministic sha256 over canonicalized effective inputs."""
+    payload = {name: _canon(getattr(inp, name)) for name in _HASH_FIELDS}
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -129,10 +145,13 @@ def build_result_row(
             ("ltv", result.ltv),
         )
     }
-    inputs = {name: getattr(inp, name) for name in _HASH_FIELDS}
-    inputs_json = {k: (None if v is None else str(v)) for k, v in inputs.items()}
+    inputs_json = {name: _canon(getattr(inp, name)) for name in _HASH_FIELDS}
+    # Persist the EFFECTIVE rehab confidence actually used by the calculation,
+    # not the raw nullable field — otherwise the audit record contradicts the
+    # computed confidence when the caller omits rehab_confidence.
+    effective_rehab_conf = inp.rehab_confidence or default_rehab_confidence(inp.rehab_source)
     provenance = {
-        "rehab": {"source": inp.rehab_source, "confidence": inp.rehab_confidence},
+        "rehab": {"source": inp.rehab_source, "confidence": effective_rehab_conf},
         "arv": {"source": inp.arv_source, "confidence": inp.arv_confidence},
     }
     confidence = {
