@@ -9338,6 +9338,14 @@ class BuyerEntityMergeLog(Base):
     absorbed_id carries no FK because the row it referenced has been deleted.
     restored_id is populated by unmerge_entity() with the new PK assigned to
     the restored entity (old PK cannot be reused safely).
+
+    moved_link_ids is the exact set of buyer_entity_links.id values reassigned
+    to surviving_id at merge time. unmerge_entity() restores precisely these
+    IDs -- never a timestamp heuristic, which cannot distinguish links moved
+    by this merge from the survivor's own pre-existing links (both predate
+    merged_at). A log row with moved_link_ids IS NULL (logged before this
+    column existed) cannot be safely unmerged; unmerge_entity() raises rather
+    than guess.
     """
     __tablename__ = "buyer_entity_merge_log"
 
@@ -9348,6 +9356,7 @@ class BuyerEntityMergeLog(Base):
     absorbed_id: Mapped[int] = mapped_column(Integer, nullable=False)
     absorbed_snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False)
     links_moved: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    moved_link_ids: Mapped[Optional[list]] = mapped_column(JSONB)
     merged_by: Mapped[str] = mapped_column(String(100), nullable=False)
     merge_reason: Mapped[Optional[str]] = mapped_column(Text)
     merged_at: Mapped[datetime] = mapped_column(

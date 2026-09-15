@@ -16,7 +16,8 @@ the resolver only creates new entities and attaches links.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
+from decimal import Decimal
 from typing import Optional
 
 from sqlalchemy import text
@@ -25,6 +26,12 @@ from sqlalchemy.orm import Session
 from src.core.models import BuyerEntity, BuyerEntityMergeLog
 
 logger = logging.getLogger(__name__)
+
+# BuyerEntity columns typed Numeric/Decimal -- absorbed_snapshot is stored as
+# JSONB, which has no native Decimal type, so these round-trip through str()
+# on the way in and Decimal() on the way back out (unmerge_entity). Keep this
+# in sync with any new Numeric column added to BuyerEntity.
+_DECIMAL_FIELDS = ("total_cash_volume", "cadence_purchases_per_year")
 
 
 def merge_entities(
@@ -63,7 +70,7 @@ def merge_entities(
         raise ValueError(f"absorbed buyer_entity id={absorbed_id} not found")
 
     absorbed_snapshot = {
-        k: (v.isoformat() if isinstance(v, datetime) else v)
+        k: (v.isoformat() if isinstance(v, datetime) else str(v) if isinstance(v, Decimal) else v)
         for k, v in dict(absorbed).items()
     }
 
@@ -72,10 +79,12 @@ def merge_entities(
             UPDATE buyer_entity_links
                SET buyer_entity_id = :surviving_id
              WHERE buyer_entity_id = :absorbed_id
+             RETURNING id
         """),
         {"surviving_id": surviving_id, "absorbed_id": absorbed_id},
     )
-    links_moved = result.rowcount
+    moved_link_ids = [row[0] for row in result.fetchall()]
+    links_moved = len(moved_link_ids)
 
     session.execute(
         text("DELETE FROM buyer_entities WHERE id = :id"),
@@ -92,6 +101,7 @@ def merge_entities(
         absorbed_id=absorbed_id,
         absorbed_snapshot=absorbed_snapshot,
         links_moved=links_moved,
+        moved_link_ids=moved_link_ids,
         merged_by=merged_by,
         merge_reason=reason,
     )
@@ -115,11 +125,17 @@ def unmerge_entity(
 
     The absorbed entity is re-inserted with a new PK (the old ID was deleted
     and may have been reused). The new ID is stored in merge_log.restored_id.
-    buyer_entity_links rows that were moved during the merge are identified by
-    their linked_at timestamp (≤ merged_at) and reassigned back to the restored
-    entity. The merge log row is stamped reversed_at/reversed_by.
+    buyer_entity_links rows that were moved during the merge are restored by
+    the EXACT ids recorded in moved_link_ids at merge time -- never by a
+    timestamp heuristic, which cannot distinguish links moved by this merge
+    from the survivor's own pre-existing links (both predate merged_at) and
+    would silently steal the survivor's original links on unmerge. The merge
+    log row is stamped reversed_at/reversed_by.
 
-    Raises ValueError if the log row does not exist or was already reversed.
+    Raises ValueError if the log row does not exist, was already reversed, or
+    has no moved_link_ids (a merge logged before that column existed --
+    restoring it safely is not possible without guessing, so this refuses
+    rather than risk corrupting the surviving entity's own links).
     Does not commit — caller controls the transaction boundary.
     """
     log = session.execute(
@@ -130,6 +146,12 @@ def unmerge_entity(
         raise ValueError(f"merge_log id={merge_log_id} not found")
     if log["reversed_at"] is not None:
         raise ValueError(f"merge_log id={merge_log_id} was already reversed at {log['reversed_at']}")
+    moved_link_ids = log["moved_link_ids"]
+    if moved_link_ids is None:
+        raise ValueError(
+            f"merge_log id={merge_log_id} has no moved_link_ids recorded -- "
+            f"cannot safely unmerge without risking the surviving entity's own links",
+        )
 
     snap: dict = dict(log["absorbed_snapshot"])
     snap.pop("id", None)
@@ -143,28 +165,40 @@ def unmerge_entity(
             except ValueError:
                 snap[ts_field] = None
 
+    for decimal_field in _DECIMAL_FIELDS:
+        raw = snap.get(decimal_field)
+        if isinstance(raw, str):
+            try:
+                snap[decimal_field] = Decimal(raw)
+            except (ValueError, ArithmeticError):
+                snap[decimal_field] = None
+
     restored = BuyerEntity(**{k: v for k, v in snap.items() if hasattr(BuyerEntity, k)})
     session.add(restored)
     session.flush()
-
-    merged_at: datetime = log["merged_at"]
-    if merged_at.tzinfo is None:
-        merged_at = merged_at.replace(tzinfo=timezone.utc)
 
     result = session.execute(
         text("""
             UPDATE buyer_entity_links
                SET buyer_entity_id = :restored_id
-             WHERE buyer_entity_id = :surviving_id
-               AND linked_at <= :merged_at
+             WHERE id = ANY(:moved_link_ids)
+               AND buyer_entity_id = :surviving_id
+             RETURNING id
         """),
         {
             "restored_id": restored.id,
+            "moved_link_ids": moved_link_ids,
             "surviving_id": log["surviving_id"],
-            "merged_at": merged_at,
         },
     )
-    links_returned = result.rowcount
+    links_returned = len(result.fetchall())
+    if links_returned != len(moved_link_ids):
+        logger.warning(
+            "unmerge_entity: merge_log %d recorded %d moved links but only %d were "
+            "found still on surviving entity %d -- some may have been re-merged or "
+            "reassigned since",
+            merge_log_id, len(moved_link_ids), links_returned, log["surviving_id"],
+        )
 
     session.execute(
         text("""
