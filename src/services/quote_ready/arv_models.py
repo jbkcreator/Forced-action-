@@ -36,6 +36,7 @@ class CandidateSale(BaseModel):
     baths: Optional[Decimal] = None
     property_use_code: str
     building_condition: int = Field(ge=1, le=5)
+    condition_inferred: bool = False  # True when source condition was missing/unrecognized
     subdivision: Optional[str] = None
     hcpa_neighborhood_code: Optional[str] = None
     zip: Optional[str] = None
@@ -49,6 +50,7 @@ class SelectedComp(BaseModel):
     sale_mo: int
     sqft: int
     building_condition: int
+    condition_inferred: bool = False
     locality_tier: str
     price_per_sqft: Decimal
     adjusted_value: Decimal
@@ -74,6 +76,7 @@ class ARVResult(BaseModel):
     locality_tier: LocalityTier = "none"
     recency_window_months: int = 12
     after_repair_condition: Optional[int] = None
+    inferred_condition_count: int = 0  # selected comps whose condition was inferred
     selected_comps: list[SelectedComp] = Field(default_factory=list)
     arv_unknown: bool = False
     unknown_reason: Optional[str] = None

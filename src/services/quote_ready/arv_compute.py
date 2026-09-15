@@ -64,7 +64,7 @@ def _filter_comps(
             continue
         if c.sale_price <= _ZERO:
             continue
-        if c.qual_cd in config.excluded_qual_codes:
+        if c.qual_cd not in config.qualified_qual_codes:
             continue
         if c.property_use_code != subject.property_use_code:
             continue
@@ -96,6 +96,7 @@ def _adjust_comp(comp: CandidateSale, subject: SubjectProperty, tier: str, confi
         sale_mo=comp.sale_mo,
         sqft=comp.sqft,
         building_condition=comp.building_condition,
+        condition_inferred=comp.condition_inferred,
         locality_tier=tier,
         price_per_sqft=price_per_sqft,
         adjusted_value=adjusted_value,
@@ -195,6 +196,19 @@ def compute_arv(inp: ARVInput) -> ARVResult:
     spread = (high - low) / point if point > _ZERO else _ZERO
     confidence, weak_comp = _assign_confidence(len(selected), tier, spread, config)
 
+    # Condition-quality downgrade: an inferred (guessed) condition must not
+    # masquerade as known. Material inference → weak_comp and no "high".
+    inferred_count = sum(1 for s in selected if s.condition_inferred)
+    if config.inferred_condition_downgrades and inferred_count:
+        material = (
+            len(selected) < config.min_comps
+            or inferred_count * 2 > len(selected)
+        )
+        if material:
+            weak_comp = True
+            if confidence == "high":
+                confidence = "medium"
+
     # Cast tier to LocalityTier
     locality_tier: LocalityTier = tier if tier in ("subdivision", "neighborhood", "zip", "county") else "none"  # type: ignore[assignment]
 
@@ -208,6 +222,7 @@ def compute_arv(inp: ARVInput) -> ARVResult:
         locality_tier=locality_tier,
         recency_window_months=window,
         after_repair_condition=subject.after_repair_condition,
+        inferred_condition_count=inferred_count,
         selected_comps=selected,
         arv_unknown=False,
     )

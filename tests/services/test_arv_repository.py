@@ -12,8 +12,11 @@ from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
 
+from sqlalchemy.exc import OperationalError
+
 from src.core.models import DorSale, Property
 from src.services.quote_ready.arv_repository import (
+    _condition_with_flag,
     _row_to_candidate,
     _row_to_subject,
     _sqft_of,
@@ -204,7 +207,8 @@ def test_null_price_comp_excluded(db):
 
     cands = fetch_candidate_sales(
         db, subject_property_id=2000, county_id=county,
-        property_use_code="0100", as_of_yr=2025, as_of_mo=9,
+        property_use_code="0100", qualified_qual_codes=["01","02","03","04","05","06"],
+        as_of_yr=2025, as_of_mo=9,
     )
     ids = {c.property_id for c in cands}
     assert ids == {2001, 2002}
@@ -219,7 +223,8 @@ def test_different_use_code_not_fetched(db):
 
     cands = fetch_candidate_sales(
         db, subject_property_id=3000, county_id=county,
-        property_use_code="0100", as_of_yr=2025, as_of_mo=9,
+        property_use_code="0100", qualified_qual_codes=["01","02","03","04","05","06"],
+        as_of_yr=2025, as_of_mo=9,
     )
     assert cands == []
 
@@ -234,7 +239,8 @@ def test_other_county_not_fetched(db):
 
     cands = fetch_candidate_sales(
         db, subject_property_id=4000, county_id=county,
-        property_use_code="0100", as_of_yr=2025, as_of_mo=9,
+        property_use_code="0100", qualified_qual_codes=["01","02","03","04","05","06"],
+        as_of_yr=2025, as_of_mo=9,
     )
     assert cands == []
 
@@ -248,7 +254,8 @@ def test_stale_sale_not_fetched(db):
 
     cands = fetch_candidate_sales(
         db, subject_property_id=5000, county_id=county,
-        property_use_code="0100", as_of_yr=2025, as_of_mo=9, months=24,
+        property_use_code="0100", qualified_qual_codes=["01","02","03","04","05","06"],
+        as_of_yr=2025, as_of_mo=9, months=24,
     )
     assert cands == []
 
@@ -274,3 +281,71 @@ def test_subject_missing_sqft_returns_unknown(db):
     )
     assert result.arv_unknown is True
     assert result.unknown_reason == "subject_unavailable"
+
+
+# ---------------------------------------------------------------------------
+# Finding 1 — SQL admits only qualified codes (01-06)
+# ---------------------------------------------------------------------------
+
+def test_sql_excludes_disqualified_code_11(db):
+    county = "county-qual"
+    _prop(db, 7000, county, subdivision="ALPHA")
+    _prop(db, 7001, county, subdivision="ALPHA")
+    _prop(db, 7002, county, subdivision="ALPHA")
+    _sale(db, 7001, county, qual_cd="01", parcel_id_dor="strap-7001")
+    _sale(db, 7002, county, qual_cd="11", parcel_id_dor="strap-7002")  # disqualified
+    db.flush()
+
+    cands = fetch_candidate_sales(
+        db, subject_property_id=7000, county_id=county,
+        property_use_code="0100",
+        qualified_qual_codes=["01", "02", "03", "04", "05", "06"],
+        as_of_yr=2025, as_of_mo=9,
+    )
+    ids = {c.property_id for c in cands}
+    assert ids == {7001}
+
+
+# ---------------------------------------------------------------------------
+# Finding 4 — infra failure is distinct from missing data
+# ---------------------------------------------------------------------------
+
+def test_source_failure_distinct_from_subject_unavailable(db):
+    class _BoomSession:
+        def execute(self, *a, **k):
+            raise OperationalError("SELECT 1", {}, Exception("db down"))
+
+    result = compute_arv_for_property(
+        _BoomSession(), subject_property_id=8000, as_of_yr=2025, as_of_mo=9,
+        after_repair_condition=4,
+    )
+    assert result.arv_unknown is True
+    assert result.unknown_reason == "source_failure"
+    assert result.after_repair_condition == 4
+
+
+# ---------------------------------------------------------------------------
+# Finding 5 — unknown condition is flagged inferred
+# ---------------------------------------------------------------------------
+
+def test_condition_with_flag_marks_inferred():
+    assert _condition_with_flag("Good") == (4, False)
+    assert _condition_with_flag(None) == (3, True)
+    assert _condition_with_flag("wat") == (3, True)
+
+
+def test_null_condition_comp_marked_inferred(db):
+    county = "county-cond"
+    _prop(db, 9000, county, subdivision="ALPHA")
+    _prop(db, 9001, county, subdivision="ALPHA", building_condition=None)
+    _sale(db, 9001, county, parcel_id_dor="strap-9001")
+    db.flush()
+
+    cands = fetch_candidate_sales(
+        db, subject_property_id=9000, county_id=county,
+        property_use_code="0100",
+        qualified_qual_codes=["01", "02", "03", "04", "05", "06"],
+        as_of_yr=2025, as_of_mo=9,
+    )
+    assert len(cands) == 1
+    assert cands[0].condition_inferred is True

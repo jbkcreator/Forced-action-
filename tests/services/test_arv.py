@@ -41,7 +41,7 @@ def _subject(**kwargs) -> SubjectProperty:
 
 
 def _sale(property_id: int, sale_price: Decimal, *, sqft: int = 1500,
-          building_condition: int = 3, qual_cd: str = "Q1",
+          building_condition: int = 3, qual_cd: str = "01",
           sale_yr: int = 2026, sale_mo: int = 3,
           property_use_code: str = "01",
           subdivision: str = "OAK_GROVE",
@@ -433,3 +433,86 @@ def test_config_unknown_locality_tier_rejected():
 def test_config_empty_locality_tiers_rejected():
     with pytest.raises(ValidationError):
         ARVConfig(locality_tiers=[])
+
+
+# ---------------------------------------------------------------------------
+# Slice 20 — qualification is an ALLOWLIST (01-06 only) (Finding 1)
+# ---------------------------------------------------------------------------
+
+def test_qualified_codes_admitted():
+    comps = [
+        _sale(10, Decimal("290000"), qual_cd="01"),
+        _sale(11, Decimal("300000"), qual_cd="03"),
+        _sale(12, Decimal("310000"), qual_cd="06"),
+    ]
+    result = compute_arv(_inp(comps))
+    assert result.arv_unknown is False
+    assert result.comp_count == 3
+
+
+def test_disqualified_code_11_excluded():
+    # Code "11" is a disqualification reason — not arm's-length. Three of them
+    # must NOT produce a confident ARV; they are excluded entirely.
+    comps = [
+        _sale(10, Decimal("950000"), qual_cd="11"),
+        _sale(11, Decimal("950000"), qual_cd="11"),
+        _sale(12, Decimal("950000"), qual_cd="11"),
+    ]
+    result = compute_arv(_inp(comps))
+    assert result.arv_unknown is True
+    assert result.comp_count == 0
+
+
+def test_pending_codes_excluded():
+    comps = [
+        _sale(10, Decimal("300000"), qual_cd="98"),
+        _sale(11, Decimal("300000"), qual_cd="99"),
+    ]
+    result = compute_arv(_inp(comps))
+    assert result.arv_unknown is True
+
+
+# ---------------------------------------------------------------------------
+# Slice 21 — inferred condition downgrades confidence (Finding 5)
+# ---------------------------------------------------------------------------
+
+def test_all_inferred_condition_downgrades_from_high():
+    # Three tight same-subdivision comps that would otherwise be "high", but all
+    # have inferred condition → must not read as high, and weak_comp flips True.
+    comps = []
+    for pid, price in ((10, "290000"), (11, "300000"), (12, "310000")):
+        c = _sale(pid, Decimal(price))
+        c = c.model_copy(update={"condition_inferred": True})
+        comps.append(c)
+    result = compute_arv(_inp(comps))
+
+    assert result.comp_count == 3
+    assert result.inferred_condition_count == 3
+    assert result.confidence != "high"
+    assert result.weak_comp is True
+
+
+def test_known_condition_still_high():
+    comps = [
+        _sale(10, Decimal("290000")),
+        _sale(11, Decimal("300000")),
+        _sale(12, Decimal("310000")),
+    ]
+    result = compute_arv(_inp(comps))
+    assert result.inferred_condition_count == 0
+    assert result.confidence == "high"
+    assert result.weak_comp is False
+
+
+def test_majority_inferred_downgrades():
+    # 2 of 3 inferred (>50%) → downgrade.
+    comps = []
+    for pid, price, inferred in (
+        (10, "290000", True), (11, "300000", True), (12, "310000", False)
+    ):
+        c = _sale(pid, Decimal(price)).model_copy(update={"condition_inferred": inferred})
+        comps.append(c)
+    result = compute_arv(_inp(comps))
+    assert result.inferred_condition_count == 2
+    assert result.confidence != "high"
+    assert result.weak_comp is True

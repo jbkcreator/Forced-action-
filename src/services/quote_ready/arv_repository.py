@@ -16,7 +16,8 @@ import logging
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Optional
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from .arv_compute import compute_arv
@@ -78,24 +79,37 @@ _CANDIDATES_SQL = text(
       AND d.sale_price IS NOT NULL
       AND d.sale_price > 0
       AND p.property_use_code = :use_code
+      AND d.qual_cd IN :qual_codes
       AND ((:as_of_yr * 12 + :as_of_mo) - (d.sale_yr * 12 + d.sale_mo))
           BETWEEN 0 AND :months
     """
-)
+).bindparams(bindparam("qual_codes", expanding=True))
 
 
 # ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------
 
+def _condition_with_flag(raw: Optional[str]) -> tuple[int, bool]:
+    """Map an HCPA condition string to (1-5 scale, inferred?).
+
+    Case-insensitive. Missing or unrecognized → (Average 3, inferred=True) so
+    the caller can downgrade confidence rather than treat a guess as known.
+    """
+    if raw is None:
+        return _DEFAULT_CONDITION, True
+    mapped = _CONDITION_TO_INT.get(str(raw).strip().lower())
+    if mapped is None:
+        return _DEFAULT_CONDITION, True
+    return mapped, False
+
+
 def condition_to_int(raw: Optional[str]) -> int:
     """Map an HCPA building-condition string to the engine's 1-5 scale.
 
     Case-insensitive; unknown or missing values fall back to Average (3).
     """
-    if raw is None:
-        return _DEFAULT_CONDITION
-    return _CONDITION_TO_INT.get(str(raw).strip().lower(), _DEFAULT_CONDITION)
+    return _condition_with_flag(raw)[0]
 
 
 def _sqft_of(heated: Any, gross: Any) -> Optional[int]:
@@ -141,6 +155,7 @@ def _row_to_candidate(row: Mapping[str, Any]) -> Optional[CandidateSale]:
     use_code = row.get("property_use_code")
     if use_code is None:
         return None
+    condition, condition_inferred = _condition_with_flag(row.get("building_condition"))
     return CandidateSale(
         property_id=int(row["property_id"]),
         sale_price=sale_price,
@@ -151,7 +166,8 @@ def _row_to_candidate(row: Mapping[str, Any]) -> Optional[CandidateSale]:
         beds=_to_int(row.get("beds")),
         baths=_to_decimal(row.get("baths")),
         property_use_code=str(use_code),
-        building_condition=condition_to_int(row.get("building_condition")),
+        building_condition=condition,
+        condition_inferred=condition_inferred,
         subdivision=row.get("subdivision"),
         hcpa_neighborhood_code=row.get("hcpa_neighborhood_code"),
         zip=row.get("zip"),
@@ -191,14 +207,11 @@ def _row_to_subject(
 def load_subject_property(
     session: Session, property_id: int, after_repair_condition: int
 ) -> Optional[SubjectProperty]:
-    try:
-        row = session.execute(_SUBJECT_SQL, {"pid": property_id}).mappings().first()
-    except Exception:
-        logger.warning(
-            "arv_repository: subject load failed for property_id=%s", property_id,
-            exc_info=True,
-        )
-        return None
+    """Load subject attributes. Returns None only when the row is genuinely
+    absent — infrastructure (SQLAlchemy) errors propagate to the caller so a
+    real outage is never mistaken for missing data.
+    """
+    row = session.execute(_SUBJECT_SQL, {"pid": property_id}).mappings().first()
     if row is None:
         return None
     return _row_to_subject(row, after_repair_condition)
@@ -210,27 +223,24 @@ def fetch_candidate_sales(
     subject_property_id: int,
     county_id: str,
     property_use_code: str,
+    qualified_qual_codes: list[str],
     as_of_yr: int,
     as_of_mo: int,
     months: int = 24,
 ) -> list[CandidateSale]:
+    """Fetch a superset of candidate sales. Infrastructure errors propagate;
+    an empty list means genuinely no matching rows, not a swallowed failure.
+    """
     params = {
         "county": county_id,
         "subject_id": subject_property_id,
         "use_code": property_use_code,
+        "qual_codes": list(qualified_qual_codes),
         "as_of_yr": as_of_yr,
         "as_of_mo": as_of_mo,
         "months": months,
     }
-    try:
-        rows = session.execute(_CANDIDATES_SQL, params).mappings().all()
-    except Exception:
-        logger.warning(
-            "arv_repository: candidate fetch failed for subject_property_id=%s",
-            subject_property_id,
-            exc_info=True,
-        )
-        return []
+    rows = session.execute(_CANDIDATES_SQL, params).mappings().all()
     candidates = [_row_to_candidate(r) for r in rows]
     return [c for c in candidates if c is not None]
 
@@ -255,6 +265,7 @@ def build_arv_input(
         subject_property_id=subject_property_id,
         county_id=subject.county or "",
         property_use_code=subject.property_use_code,
+        qualified_qual_codes=cfg.qualified_qual_codes,
         as_of_yr=as_of_yr,
         as_of_mo=as_of_mo,
         months=cfg.recency_months_extended,
@@ -277,14 +288,27 @@ def compute_arv_for_property(
     after_repair_condition: int,
     config: Optional[ARVConfig] = None,
 ) -> ARVResult:
-    inp = build_arv_input(
-        session,
-        subject_property_id=subject_property_id,
-        as_of_yr=as_of_yr,
-        as_of_mo=as_of_mo,
-        after_repair_condition=after_repair_condition,
-        config=config,
-    )
+    try:
+        inp = build_arv_input(
+            session,
+            subject_property_id=subject_property_id,
+            as_of_yr=as_of_yr,
+            as_of_mo=as_of_mo,
+            after_repair_condition=after_repair_condition,
+            config=config,
+        )
+    except SQLAlchemyError:
+        # Infrastructure failure — distinct from a genuinely missing property.
+        logger.error(
+            "arv_repository: source failure computing ARV for property_id=%s",
+            subject_property_id,
+            exc_info=True,
+        )
+        return ARVResult(
+            arv_unknown=True,
+            unknown_reason="source_failure",
+            after_repair_condition=after_repair_condition,
+        )
     if inp is None:
         return ARVResult(
             arv_unknown=True,
