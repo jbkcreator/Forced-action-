@@ -115,6 +115,12 @@ COUNTY_ID=hillsborough
 # Distinct --log-name so the two counties don't share one log/.status file.
 32 6 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.load_validator pinellas --log-name load_validator_pinellas
 
+# WP-6 Repeat & Maturity Engine — 06:45 UTC daily (after scrapers + load validator,
+# before CDS scoring). Reads borrower_ledger_events + buyer_entities for 4 monitors
+# (loan_maturity, next_project, dscr_day120, portfolio_expansion). Posts to
+# RELATIONSHIPS_SLACK_CHANNEL. Idempotent — borrower_monitor_log deduplicates.
+45 6 * * * cd $PROJECT && PYTHONPATH=. python scripts/run_repeat_maturity_engine.py >> /var/log/fa/repeat_maturity.log 2>&1
+
 # Quora S6 organic-answer pipeline — 06:35 AM UTC daily (after load validator).
 # Picks one keyword via DB rotation (quora_topics + cooldown_days), scrapes Quora,
 # publishes to Cora for classification + answer drafting, upserts to quora_questions.

@@ -694,6 +694,10 @@ class AppSettings(BaseSettings):
 	# above, same convention as relay_slack_channel/lifecycle_incident_slack_channel.
 	quality_contracts_slack_channel: Optional[str] = Field(default=None, env="QUALITY_CONTRACTS_SLACK_CHANNEL")
 
+	# Forced Action MAX — WP-6 Repeat & Maturity Engine. Alert channel for
+	# borrower relationship touchpoints (loan maturity, next project, DSCR, expansion).
+	relationships_slack_channel: Optional[str] = Field(default=None, env="RELATIONSHIPS_SLACK_CHANNEL")
+
 	# Stage 10 — Prometheus metrics exposition (fa055).
 	# When true, GET /metrics returns Prometheus text format with kill-switch
 	# business metrics and variant slot performance.
