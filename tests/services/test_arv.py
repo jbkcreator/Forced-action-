@@ -103,9 +103,13 @@ def test_three_strong_comps_high_confidence():
 # ---------------------------------------------------------------------------
 
 def test_one_comp_weak_and_low_confidence():
+    # DECISION A: a single qualified comp is SHOWN (flagged weak, low confidence),
+    # never arv_unknown — the floor for unknown is zero comps. This pins the
+    # client done-when "one weak one" and must not regress to unknown for <min.
     comps = [_sale(10, Decimal("300000"))]
     result = compute_arv(_inp(comps))
 
+    assert result.arv_unknown is False
     assert result.comp_count == 1
     assert result.weak_comp is True
     assert result.confidence == "low"
@@ -318,6 +322,37 @@ def test_iqr_trimming_removes_outlier():
     assert result.high < Decimal("500000")
 
 
+def test_four_comps_high_outlier_trimmed():
+    # n=4, k=1: symmetric trim drops both the top and bottom observation.
+    # sorted [280k,290k,300k,1M] → low=290k, high=300k (1M excluded).
+    comps = [
+        _sale(10, Decimal("280000")),
+        _sale(11, Decimal("290000")),
+        _sale(12, Decimal("300000")),
+        _sale(13, Decimal("1000000")),  # high outlier
+    ]
+    result = compute_arv(_inp(comps))
+
+    assert result.high == Decimal("300000")
+    assert result.high < Decimal("1000000")
+    assert result.low == Decimal("290000")
+
+
+def test_four_comps_low_outlier_trimmed():
+    # sorted [50k,290k,300k,310k] → low=290k (50k excluded), high=300k.
+    comps = [
+        _sale(10, Decimal("50000")),  # low outlier
+        _sale(11, Decimal("290000")),
+        _sale(12, Decimal("300000")),
+        _sale(13, Decimal("310000")),
+    ]
+    result = compute_arv(_inp(comps))
+
+    assert result.low == Decimal("290000")
+    assert result.low > Decimal("50000")
+    assert result.high == Decimal("300000")
+
+
 # ---------------------------------------------------------------------------
 # Slice 15 — ARVConfig overrides work (custom min_comps=1)
 # ---------------------------------------------------------------------------
@@ -516,3 +551,19 @@ def test_majority_inferred_downgrades():
     assert result.inferred_condition_count == 2
     assert result.confidence != "high"
     assert result.weak_comp is True
+
+
+def test_single_inferred_caps_confidence_without_suppressing():
+    # 1 of 3 inferred: not "high" (a guessed condition can't read as fully
+    # strong), but weak_comp stays False — one guess must not trigger the WP-7
+    # full-range suppression that weak_comp drives (D6 contract).
+    comps = []
+    for pid, price, inferred in (
+        (10, "290000", True), (11, "300000", False), (12, "310000", False)
+    ):
+        c = _sale(pid, Decimal(price)).model_copy(update={"condition_inferred": inferred})
+        comps.append(c)
+    result = compute_arv(_inp(comps))
+    assert result.inferred_condition_count == 1
+    assert result.confidence == "medium"
+    assert result.weak_comp is False

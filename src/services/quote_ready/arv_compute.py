@@ -115,11 +115,12 @@ def _derive_range(adjusted_values: list[Decimal]) -> tuple[Decimal, Decimal, Dec
         low = sorted_vals[0]
         high = sorted_vals[-1]
     else:
-        q1_idx = n // 4
-        q3_idx = (3 * n) // 4
-        trimmed = sorted_vals[q1_idx:q3_idx + 1]
-        low = trimmed[0] if trimmed else sorted_vals[0]
-        high = trimmed[-1] if trimmed else sorted_vals[-1]
+        # Symmetric IQR-style trim: drop k = n//4 observations from EACH end so
+        # a single anomalous sale — high OR low — cannot blow the range open. An
+        # asymmetric slice (e.g. [k : 3n//4 + 1]) would keep the top outlier.
+        k = n // 4
+        low = sorted_vals[k]
+        high = sorted_vals[n - 1 - k]
 
     return low, point, high
 
@@ -171,7 +172,19 @@ def compute_arv(inp: ARVInput) -> ARVResult:
         if best is not None:
             break
 
-    # If never found enough, use widest tier + extended window with whatever we have
+    # If no tier reached min_comps, fall back to the widest tier + extended
+    # window with whatever qualified comps remain.
+    #
+    # DECISION A (team, 2026-09): the floor for arv_unknown is ZERO comps, not
+    # min_comps. A single qualified comp still returns a SHOWN ARV flagged
+    # weak_comp=True at low confidence — never arv_unknown. This satisfies the
+    # client done-when: "tell whether the ARV came from three strong
+    # comparables OR one weak one" — which is impossible if one comp is hidden
+    # as unknown. The borrower-facing risk is handled downstream: the WP-7
+    # consumer suppresses the range whenever weak_comp is True (D6 contract),
+    # while the internal Quote Ready dossier still shows it, flagged, which is
+    # exactly where Josh wants to see "this rests on one weak comp". Only a
+    # genuinely empty pool → arv_unknown="no_qualified_comps".
     if best is None:
         widest_tier = tiers[-1]
         fallback = _filter_comps(
@@ -196,18 +209,24 @@ def compute_arv(inp: ARVInput) -> ARVResult:
     spread = (high - low) / point if point > _ZERO else _ZERO
     confidence, weak_comp = _assign_confidence(len(selected), tier, spread, config)
 
-    # Condition-quality downgrade: an inferred (guessed) condition must not
-    # masquerade as known. Material inference → weak_comp and no "high".
+    # Condition-quality downgrade: a guessed condition must not read as fully
+    # known. ANY inferred comp caps confidence below "high"; only MATERIAL
+    # inference additionally flips weak_comp.
     inferred_count = sum(1 for s in selected if s.condition_inferred)
     if config.inferred_condition_downgrades and inferred_count:
+        # Any inference → no "high" (surfaces the caveat without hiding the range).
+        if confidence == "high":
+            confidence = "medium"
+        # We deliberately do NOT flip weak_comp for a single inferred-of-many:
+        # per the locked D6 contract, weak_comp makes the WP-7 consumer suppress
+        # the ENTIRE range on the borrower-facing page, which is too aggressive
+        # for one guessed condition. Reserve that for material inference.
         material = (
             len(selected) < config.min_comps
             or inferred_count * 2 > len(selected)
         )
         if material:
             weak_comp = True
-            if confidence == "high":
-                confidence = "medium"
 
     # Cast tier to LocalityTier
     locality_tier: LocalityTier = tier if tier in ("subdivision", "neighborhood", "zip", "county") else "none"  # type: ignore[assignment]
