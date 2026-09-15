@@ -9434,6 +9434,14 @@ class BuyerEntityMatchException(Base):
     __table_args__ = (
         UniqueConstraint("kind", "left_ref", "right_ref", name="uq_match_exception_pair"),
         Index("idx_match_exception_open", "first_seen_at", postgresql_where=text("status = 'open'")),
+        CheckConstraint(
+            "kind IN ('ambiguous_pair', 'multi_anchor_conflict', 'llm_different')",
+            name="buyer_entity_match_exception_kind_check",
+        ),
+        CheckConstraint(
+            "status IN ('open', 'merged', 'rejected', 'stale')",
+            name="buyer_entity_match_exception_status_check",
+        ),
     )
 
 
