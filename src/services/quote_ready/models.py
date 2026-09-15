@@ -1,6 +1,7 @@
 from __future__ import annotations
 from decimal import Decimal
 from typing import Literal, Optional
+from uuid import UUID
 
 from pydantic import BaseModel, Field
 
@@ -36,7 +37,10 @@ class Figure(BaseModel):
 
 
 class QuoteReadyInput(BaseModel):
-    property_id: str
+    # Result belongs to the opportunity (Dev 1 spine contract); a scenario may
+    # reference a property but the opportunity owns the result.
+    opportunity_id: UUID
+    property_id: Optional[int] = None  # legacy properties.id; nullable for portfolio scenarios
     max_ltc: Decimal = Field(ge=0)
     max_ltv: Decimal = Field(ge=0)
 
@@ -55,11 +59,13 @@ class QuoteReadyInput(BaseModel):
     rehab_confidence: Optional[Confidence] = None
 
     # ARV — contract input for WP-8A; comp-derived ARV is WP-8B.
-    # arv_source + arv_confidence carry the ARV's provenance through to
-    # every ARV-dependent figure (proposed_loan, ltv).
+    # Precedence (caller resolves): WP-8B manual override → WP-8B comp range →
+    # legacy financials.arv (fallback, low confidence) → unknown.
+    # Default reflects the legacy fallback; caller upgrades source/confidence
+    # when WP-8B supplies a comp-supported ARV.
     arv: Optional[Decimal] = Field(default=None, ge=0)
-    arv_source: str = "financial.arv"
-    arv_confidence: Confidence = "high"
+    arv_source: str = "legacy_financial.arv"
+    arv_confidence: Confidence = "low"
 
 
 class QuoteReadyResult(BaseModel):
