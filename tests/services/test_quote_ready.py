@@ -5,6 +5,9 @@ No DB, no network, no mocks. Fixture in, object out.
 """
 from decimal import Decimal
 
+import pytest
+from pydantic import ValidationError
+
 from src.services.quote_ready import compute_quote_ready, QuoteReadyInput
 
 
@@ -30,11 +33,9 @@ def test_full_inputs_produces_all_figures():
     assert result.proposed_loan.raw == Decimal("200000")
     assert result.proposed_loan.display == "$200,000"
 
-    # ltc = 200_000 / 250_000 = 0.80
     assert result.ltc.raw == Decimal("0.80")
     assert result.ltc.display == "80.0%"
 
-    # ltv = 200_000 / 320_000 = 0.625
     assert result.ltv.raw == Decimal("0.625")
     assert result.ltv.display == "62.5%"
 
@@ -59,15 +60,14 @@ def test_arv_absent_degrades_to_ltc_only():
     assert result.project_cost.raw == Decimal("180000")
     assert result.proposed_loan.raw == Decimal("135000")
     assert result.ltv is None
-    assert "arv" in result.missing
-    assert "ltv" in result.missing
+    assert result.missing == ["arv", "ltv"]
 
 
 # ---------------------------------------------------------------------------
-# Slice 3 — rehab absent: cost/LTC/loan missing
+# Slice 3 — rehab absent: cost/LTC/loan/ltv all missing (complete list)
 # ---------------------------------------------------------------------------
 
-def test_rehab_absent_missing_cost_and_ltc():
+def test_rehab_absent_missing_is_complete():
     inp = QuoteReadyInput(
         property_id="prop-003",
         purchase_price=Decimal("100000"),
@@ -79,12 +79,11 @@ def test_rehab_absent_missing_cost_and_ltc():
     result = compute_quote_ready(inp)
 
     assert result.project_cost is None
-    assert "rehab_estimate" in result.missing
-    assert "project_cost" in result.missing
-    assert "ltc" in result.missing
     assert result.proposed_loan is None
-    assert "proposed_loan" in result.missing
+    assert result.ltc is None
     assert result.ltv is None
+    # ltv must appear even though ARV was supplied — it is still underivable
+    assert result.missing == ["ltc", "ltv", "project_cost", "proposed_loan", "rehab_estimate"]
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +93,6 @@ def test_rehab_absent_missing_cost_and_ltc():
 def test_purchase_fallback_to_estimated_value():
     inp = QuoteReadyInput(
         property_id="prop-004",
-        purchase_price=None,
         estimated_value=Decimal("180000"),
         rehab_estimate=Decimal("20000"),
         arv=Decimal("250000"),
@@ -104,19 +102,18 @@ def test_purchase_fallback_to_estimated_value():
     result = compute_quote_ready(inp)
 
     assert result.project_cost.raw == Decimal("200000")
-    assert result.project_cost.source == "estimated_value"
+    assert result.project_cost.source.startswith("estimated_value")
+    # basis medium, rehab job_estimator medium → medium
     assert result.project_cost.confidence == "medium"
 
 
 # ---------------------------------------------------------------------------
-# Slice 5 — purchase fallback to assessed_value_mkt (low confidence)
+# Slice 5 — fallback to assessed_value_mkt (low confidence)
 # ---------------------------------------------------------------------------
 
 def test_purchase_fallback_to_assessed_value_mkt_low_confidence():
     inp = QuoteReadyInput(
         property_id="prop-005",
-        purchase_price=None,
-        estimated_value=None,
         assessed_value_mkt=Decimal("120000"),
         rehab_estimate=Decimal("15000"),
         arv=Decimal("185000"),
@@ -125,20 +122,17 @@ def test_purchase_fallback_to_assessed_value_mkt_low_confidence():
     )
     result = compute_quote_ready(inp)
 
-    assert result.project_cost.source == "assessed_value_mkt"
+    assert result.project_cost.source.startswith("assessed_value_mkt")
     assert result.project_cost.confidence == "low"
 
 
 # ---------------------------------------------------------------------------
-# Slice 6 — purchase fallback to last_sale_price (low confidence)
+# Slice 6 — fallback to last_sale_price (low confidence)
 # ---------------------------------------------------------------------------
 
-def test_purchase_fallback_to_last_sale_price_low_confidence():
+def test_purchase_fallback_to_last_sale_price():
     inp = QuoteReadyInput(
         property_id="prop-006",
-        purchase_price=None,
-        estimated_value=None,
-        assessed_value_mkt=None,
         last_sale_price=Decimal("110000"),
         rehab_estimate=Decimal("20000"),
         arv=Decimal("185000"),
@@ -147,7 +141,7 @@ def test_purchase_fallback_to_last_sale_price_low_confidence():
     )
     result = compute_quote_ready(inp)
 
-    assert result.project_cost.source == "last_sale_price"
+    assert result.project_cost.source.startswith("last_sale_price")
     assert result.project_cost.confidence == "low"
 
 
@@ -158,8 +152,6 @@ def test_purchase_fallback_to_last_sale_price_low_confidence():
 def test_assessed_value_mkt_before_last_sale_price():
     inp = QuoteReadyInput(
         property_id="prop-007",
-        purchase_price=None,
-        estimated_value=None,
         assessed_value_mkt=Decimal("100000"),
         last_sale_price=Decimal("90000"),
         rehab_estimate=Decimal("10000"),
@@ -169,20 +161,17 @@ def test_assessed_value_mkt_before_last_sale_price():
     )
     result = compute_quote_ready(inp)
 
-    assert result.project_cost.source == "assessed_value_mkt"
+    assert result.project_cost.source.startswith("assessed_value_mkt")
     assert result.project_cost.raw == Decimal("110000")
 
 
 # ---------------------------------------------------------------------------
-# Slice 8 — confidence propagates: low-confidence basis → low-confidence
-#           derived figures (loan, ltc, ltv)
+# Slice 8 — low-confidence basis propagates to ALL derived figures
 # ---------------------------------------------------------------------------
 
 def test_low_confidence_basis_propagates_to_derived_figures():
     inp = QuoteReadyInput(
         property_id="prop-008",
-        purchase_price=None,
-        estimated_value=None,
         assessed_value_mkt=Decimal("80000"),
         rehab_estimate=Decimal("30000"),
         arv=Decimal("160000"),
@@ -198,31 +187,56 @@ def test_low_confidence_basis_propagates_to_derived_figures():
 
 
 # ---------------------------------------------------------------------------
-# Slice 9 — zero project cost: no division crash, goes to missing[]
+# Slice 9 — low-confidence ARV drags LTV (and loan) down, not the LTC side
 # ---------------------------------------------------------------------------
 
-def test_zero_project_cost_does_not_crash():
+def test_low_confidence_arv_propagates():
     inp = QuoteReadyInput(
         property_id="prop-009",
-        purchase_price=Decimal("0"),
-        rehab_estimate=Decimal("0"),
+        purchase_price=Decimal("100000"),
+        rehab_estimate=Decimal("20000"),
+        arv=Decimal("300000"),
+        arv_confidence="low",
+        max_ltc=Decimal("0.80"),
+        max_ltv=Decimal("0.70"),
+    )
+    result = compute_quote_ready(inp)
+
+    # LTC binds (0.80*120_000=96_000 < 0.70*300_000=210_000) → loan=96_000
+    # basis high + rehab medium → cost medium; arv low → loan min(medium,low)=low
+    assert result.project_cost.confidence == "medium"
+    assert result.proposed_loan.confidence == "low"
+    assert result.ltv.confidence == "low"
+
+
+# ---------------------------------------------------------------------------
+# Slice 10 — rehab override is high confidence (distinguished from estimator)
+# ---------------------------------------------------------------------------
+
+def test_rehab_override_confidence_and_source():
+    inp = QuoteReadyInput(
+        property_id="prop-010",
+        purchase_price=Decimal("100000"),
+        rehab_estimate=Decimal("20000"),
+        rehab_source="override",
         arv=Decimal("200000"),
         max_ltc=Decimal("0.80"),
         max_ltv=Decimal("0.70"),
     )
     result = compute_quote_ready(inp)
-    # project_cost = 0; treated as invalid denominator → proposed_loan missing
-    assert result.proposed_loan is None
-    assert "proposed_loan" in result.missing
+
+    # basis high + rehab override high → cost high
+    assert result.project_cost.confidence == "high"
+    assert "override" in result.project_cost.source
 
 
 # ---------------------------------------------------------------------------
-# Slice 10 — zero ARV: no crash, ltv missing
+# Slice 11 — zero ARV: not silently ignored; arv + ltv flagged missing
 # ---------------------------------------------------------------------------
 
-def test_zero_arv_does_not_crash():
+def test_zero_arv_flagged_missing_not_silent():
     inp = QuoteReadyInput(
-        property_id="prop-010",
+        property_id="prop-011",
         purchase_price=Decimal("100000"),
         rehab_estimate=Decimal("30000"),
         arv=Decimal("0"),
@@ -230,18 +244,70 @@ def test_zero_arv_does_not_crash():
         max_ltv=Decimal("0.70"),
     )
     result = compute_quote_ready(inp)
-    # arv=0 treated as invalid; loan falls back to ltc_cap
+
+    # loan still derivable from LTC cap
     assert result.proposed_loan is not None
     assert result.ltv is None
+    assert "arv" in result.missing
+    assert "ltv" in result.missing
 
 
 # ---------------------------------------------------------------------------
-# Slice 11 — display precision: whole dollars, 1-decimal %
+# Slice 12 — zero project cost: no crash, downstream all missing
+# ---------------------------------------------------------------------------
+
+def test_zero_project_cost_downstream_all_missing():
+    inp = QuoteReadyInput(
+        property_id="prop-012",
+        purchase_price=Decimal("0"),
+        rehab_estimate=Decimal("0"),
+        arv=Decimal("200000"),
+        max_ltc=Decimal("0.80"),
+        max_ltv=Decimal("0.70"),
+    )
+    result = compute_quote_ready(inp)
+
+    assert result.project_cost is None
+    assert result.proposed_loan is None
+    assert result.ltc is None
+    assert result.ltv is None
+    for name in ("project_cost", "proposed_loan", "ltc", "ltv"):
+        assert name in result.missing
+
+
+# ---------------------------------------------------------------------------
+# Slice 13 — negative caps / inputs rejected at construction (boundary)
+# ---------------------------------------------------------------------------
+
+def test_negative_cap_rejected():
+    with pytest.raises(ValidationError):
+        QuoteReadyInput(
+            property_id="prop-013",
+            purchase_price=Decimal("100000"),
+            rehab_estimate=Decimal("20000"),
+            max_ltc=Decimal("-0.80"),
+            max_ltv=Decimal("0.70"),
+        )
+
+
+def test_negative_monetary_input_rejected():
+    with pytest.raises(ValidationError):
+        QuoteReadyInput(
+            property_id="prop-013b",
+            purchase_price=Decimal("-100000"),
+            rehab_estimate=Decimal("20000"),
+            max_ltc=Decimal("0.80"),
+            max_ltv=Decimal("0.70"),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Slice 14 — display precision: whole dollars, 1-decimal %
 # ---------------------------------------------------------------------------
 
 def test_display_precision():
     inp = QuoteReadyInput(
-        property_id="prop-011",
+        property_id="prop-014",
         purchase_price=Decimal("100000"),
         rehab_estimate=Decimal("33333"),
         arv=Decimal("200000"),
@@ -259,12 +325,12 @@ def test_display_precision():
 
 
 # ---------------------------------------------------------------------------
-# Slice 12 — determinism
+# Slice 15 — determinism
 # ---------------------------------------------------------------------------
 
 def test_determinism():
     inp = QuoteReadyInput(
-        property_id="prop-012",
+        property_id="prop-015",
         purchase_price=Decimal("175000"),
         rehab_estimate=Decimal("40000"),
         arv=Decimal("280000"),
@@ -274,8 +340,4 @@ def test_determinism():
     r1 = compute_quote_ready(inp)
     r2 = compute_quote_ready(inp)
 
-    assert r1.project_cost.raw == r2.project_cost.raw
-    assert r1.proposed_loan.raw == r2.proposed_loan.raw
-    assert r1.ltc.raw == r2.ltc.raw
-    assert r1.ltv.raw == r2.ltv.raw
-    assert r1.missing == r2.missing
+    assert r1.model_dump() == r2.model_dump()
