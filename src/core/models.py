@@ -17,9 +17,11 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
+    Identity,
     Integer,
     LargeBinary as sa_LargeBinary,
     Numeric,
+    Sequence,
     SmallInteger,
     String,
     Text,
@@ -38,6 +40,9 @@ from sqlalchemy.orm import DeclarativeBase, relationship, Mapped, mapped_column
 class Base(DeclarativeBase):
     """Base class for all models."""
     pass
+
+
+FA_MAX_TIMELINE_SEQUENCE = Sequence("fa_max_timeline_seq")
 
 
 # ============================================================================
@@ -10290,6 +10295,12 @@ class FaMaxPerson(Base):
     )
     source: Mapped[str] = mapped_column(String(60), nullable=False)
     source_reference: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # CAS optimistic-concurrency guard — incremented on every successful transition().
+    # Callers must supply the current value when calling transition(); a mismatched
+    # version (stale read) produces already_advanced without a state mutation.
+    state_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -10384,7 +10395,9 @@ class FaMaxOpportunity(Base):
         nullable=False,
     )
     opportunity_type: Mapped[str] = mapped_column(String(30), nullable=False)
-    current_stage: Mapped[str] = mapped_column(String(50), nullable=False)
+    current_stage: Mapped[str] = mapped_column(
+        String(50), nullable=False, server_default=text("'new'")
+    )
     outcome: Mapped[str] = mapped_column(
         String(20), nullable=False, server_default=text("'open'")
     )
@@ -10401,6 +10414,10 @@ class FaMaxOpportunity(Base):
     maturity_months: Mapped[Optional[int]] = mapped_column(SmallInteger, nullable=True)
     backflip_ref: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     assigned_to: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    # CAS optimistic-concurrency guard — same pattern as FaMaxPerson.state_version.
+    state_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -10560,6 +10577,25 @@ class FaMaxStateTransitionEvent(Base):
     occurred_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    # Monotonic ordering column — occurred_at uses NOW() (frozen at
+    # transaction start), so a transaction that waits at the advisory lock
+    # and commits later can carry an earlier occurred_at than one that
+    # started later. seq is allocated at actual INSERT execution time and
+    # is authoritative for reconstructing true event order; occurred_at
+    # remains for human-readable attribution. IDENTITY here (not the
+    # migration's BIGSERIAL) is the modern SQLAlchemy/Postgres equivalent —
+    # functionally the same (auto-incrementing, unique, non-null); the
+    # migration's ADD COLUMN IF NOT EXISTS is a no-op against a
+    # create_all-built table where this column already exists.
+    seq: Mapped[int] = mapped_column(
+        BigInteger, Identity(always=False), nullable=False, unique=True
+    )
+    timeline_seq: Mapped[int] = mapped_column(
+        BigInteger,
+        FA_MAX_TIMELINE_SEQUENCE,
+        server_default=FA_MAX_TIMELINE_SEQUENCE.next_value(),
+        nullable=False,
+    )
 
     __table_args__ = (
         CheckConstraint(
@@ -10571,10 +10607,313 @@ class FaMaxStateTransitionEvent(Base):
         Index("ix_fa_max_ste_person_id_occurred", "person_id", "occurred_at"),
         Index("ix_fa_max_ste_decision_id", "decision_id",
               postgresql_where=text("decision_id IS NOT NULL")),
+        Index("ix_fa_max_ste_person_id_seq", "person_id", "seq"),
+        Index("ix_fa_max_ste_entity_uuid_seq", "entity_uuid", "seq"),
+        Index("ix_fa_max_ste_person_timeline_seq", "person_id", "timeline_seq"),
     )
 
     def __repr__(self) -> str:
         return (
             f"<FaMaxStateTransitionEvent(entity={self.entity_uuid!r}, "
             f"{self.from_state!r}->{self.to_state!r}, actor={self.actor!r})>"
+        )
+# ============================================================================
+# FA Max WP-1 remaining — Partners, Interactions, Property Associations,
+# and the Durable Work Queue
+# ============================================================================
+
+
+class FaMaxPartner(Base):
+    """Canonical partner/referral source record for FA Max.
+
+    One row per unique referral relationship. status ∈ {identified, active,
+    inactive} is a lightweight 3-state machine; transitions go through
+    transition() with entity_type='partner' and CAS on state_version.
+
+    DNC / suppression lives on fa_max_persons (person/consent boundary) and
+    is never duplicated here. No financial data fields of any kind.
+    """
+
+    __tablename__ = "fa_max_partners"
+
+    partner_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=text("generate_uuidv7()")
+    )
+    person_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_persons.person_id", name="fk_fa_max_partner_person"),
+        nullable=False,
+    )
+    partner_class: Mapped[str] = mapped_column(String(60), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default=text("'identified'")
+    )
+    rank: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    source: Mapped[str] = mapped_column(String(60), nullable=False)
+    state_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('identified', 'active', 'inactive')",
+            name="ck_fa_max_partner_status",
+        ),
+        Index("ix_fa_max_partner_person_id", "person_id"),
+        Index("ix_fa_max_partner_status", "status"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<FaMaxPartner(partner_id={self.partner_id!r}, "
+            f"person={self.person_id!r}, class={self.partner_class!r}, "
+            f"status={self.status!r})>"
+        )
+
+
+class FaMaxInteraction(Base):
+    """Write-once record of a single communication interaction.
+
+    Append-only — never updated after creation (enforced by a DB trigger
+    installed by apply_fa_max_wp1_remaining.py). Contributes to the unified
+    borrower timeline via get_borrower_timeline().
+
+    approved_bool: True when the outbound draft was approved as-written,
+    False when materially edited before send (edit rate tracking for
+    autonomy-tier graduation evidence). NULL for inbound interactions.
+
+    autonomy_tier_at_time: A/B/C at the moment of the send, for graduation
+    evidence. NULL for inbound interactions where no tier applies.
+
+    No body/content column — no PII storage obligation. Use body_redacted
+    for a content-free summary (e.g., "initial outreach email") if needed.
+    """
+
+    __tablename__ = "fa_max_interactions"
+
+    interaction_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=text("generate_uuidv7()")
+    )
+    person_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_persons.person_id", name="fk_fa_max_interaction_person"),
+        nullable=False,
+    )
+    channel: Mapped[str] = mapped_column(String(20), nullable=False)
+    direction: Mapped[str] = mapped_column(String(10), nullable=False)
+    actor: Mapped[str] = mapped_column(String(120), nullable=False)
+    approved_bool: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    autonomy_tier_at_time: Mapped[Optional[str]] = mapped_column(String(5), nullable=True)
+    body_redacted: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    # Monotonic ordering for unified timeline — allocated at INSERT time.
+    seq: Mapped[int] = mapped_column(
+        BigInteger, Identity(always=False), nullable=False, unique=True
+    )
+    timeline_seq: Mapped[int] = mapped_column(
+        BigInteger,
+        FA_MAX_TIMELINE_SEQUENCE,
+        server_default=FA_MAX_TIMELINE_SEQUENCE.next_value(),
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "channel IN ('email', 'sms', 'voice', 'slack', 'linkedin')",
+            name="ck_fa_max_interaction_channel",
+        ),
+        CheckConstraint(
+            "direction IN ('inbound', 'outbound')",
+            name="ck_fa_max_interaction_direction",
+        ),
+        CheckConstraint(
+            "autonomy_tier_at_time IS NULL OR autonomy_tier_at_time IN ('A', 'B', 'C')",
+            name="ck_fa_max_interaction_tier",
+        ),
+        Index("ix_fa_max_interaction_person_id", "person_id"),
+        Index("ix_fa_max_interaction_person_seq", "person_id", "seq"),
+        Index("ix_fa_max_interaction_person_timeline_seq", "person_id", "timeline_seq"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<FaMaxInteraction(interaction_id={self.interaction_id!r}, "
+            f"person={self.person_id!r}, channel={self.channel!r}, "
+            f"direction={self.direction!r})>"
+        )
+
+
+class FaMaxPropertyAssociation(Base):
+    """Temporal association between a person and a property.
+
+    Not a state machine — valid_from/valid_to is a temporal link pattern.
+    valid_to=NULL means the association is current. Closing an association
+    sets valid_to=NOW() via close_property_association(); it is never deleted.
+
+    property_id is an integer FK to properties.id (the canonical property
+    PK), not a text reference. The entity registry stores property native_id
+    as text (matching properties.id cast to text) for polymorphic FK bookkeeping.
+
+    Compliance: no financial data, no pricing/term/commitment fields.
+    """
+
+    __tablename__ = "fa_max_property_associations"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    person_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_persons.person_id", name="fk_fa_max_prop_assoc_person"),
+        nullable=False,
+    )
+    property_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("properties.id", name="fk_fa_max_prop_assoc_property"),
+        nullable=False,
+    )
+    opportunity_id: Mapped[Optional[Any]] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_opportunities.opportunity_id", name="fk_fa_max_prop_assoc_opp"),
+        nullable=True,
+    )
+    role: Mapped[str] = mapped_column(
+        String(30), nullable=False, server_default=text("'subject'")
+    )
+    valid_from: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    valid_to: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    source: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    timeline_seq: Mapped[int] = mapped_column(
+        BigInteger,
+        FA_MAX_TIMELINE_SEQUENCE,
+        server_default=FA_MAX_TIMELINE_SEQUENCE.next_value(),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "role IN ('subject', 'collateral', 'current_project', 'exit_property', 'owned')",
+            name="ck_fa_max_prop_assoc_role",
+        ),
+        Index("ix_fa_max_prop_assoc_person_id", "person_id"),
+        Index("ix_fa_max_prop_assoc_property_id", "property_id"),
+        Index("ix_fa_max_prop_assoc_person_timeline_seq", "person_id", "timeline_seq"),
+        Index(
+            "ix_fa_max_prop_assoc_current",
+            "person_id",
+            "property_id",
+            postgresql_where=text("valid_to IS NULL"),
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<FaMaxPropertyAssociation(person={self.person_id!r}, "
+            f"property={self.property_id!r}, role={self.role!r}, "
+            f"valid_to={self.valid_to!r})>"
+        )
+
+
+class FaMaxWorkQueue(Base):
+    """Durable leased work queue for FA Max background operations.
+
+    Designed for exactly-once processing with crash recovery:
+    - claim_next() acquires a row using FOR UPDATE SKIP LOCKED, sets
+      status='claimed', and writes a lease_expires_at deadline.
+    - If the worker dies, reclaim_expired() returns rows with
+      lease_expires_at < NOW() and status='claimed' back to 'available',
+      incrementing attempt_count.
+    - Workers must write status='done' before their lease expires.
+    - idempotency_key prevents duplicate enqueuing of the same logical work.
+
+    WP-1 Done When: a worker killed mid-task leaves state recoverable by a
+    fresh instance — proven by test_real_worker_kill_work_queue_recovered.
+    """
+
+    __tablename__ = "fa_max_work_queue"
+
+    work_item_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=text("generate_uuidv7()")
+    )
+    person_id: Mapped[Optional[Any]] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_persons.person_id", name="fk_fa_max_work_queue_person"),
+        nullable=True,
+    )
+    queue_name: Mapped[str] = mapped_column(String(60), nullable=False)
+    payload: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default=text("'available'")
+    )
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    claimed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    done_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    worker_id: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('available', 'claimed', 'done', 'failed')",
+            name="ck_fa_max_work_queue_status",
+        ),
+        Index(
+            "uq_fa_max_work_queue_idempotency",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text("idempotency_key IS NOT NULL"),
+        ),
+        Index("ix_fa_max_work_queue_queue_name", "queue_name"),
+        Index(
+            "ix_fa_max_work_queue_claimable",
+            "queue_name",
+            "available_at",
+            postgresql_where=text("status = 'available'"),
+        ),
+        Index(
+            "ix_fa_max_work_queue_expired_leases",
+            "lease_expires_at",
+            postgresql_where=text("status = 'claimed'"),
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<FaMaxWorkQueue(work_item_id={self.work_item_id!r}, "
+            f"queue={self.queue_name!r}, status={self.status!r})>"
         )

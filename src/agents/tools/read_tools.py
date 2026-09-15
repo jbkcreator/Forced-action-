@@ -695,19 +695,35 @@ def get_fa_max_person_state(
 def get_fa_max_person_history(
 	person_id: str,
 	limit: int = 100,
+	after_seq: Optional[int] = None,
 	session: Optional[Session] = None,
 ) -> Dict[str, Any]:
-	"""Return the complete ordered state-transition history for an FA Max person.
+	"""Return one page of the unified ordered history for an FA Max person.
 
 	Covers all entity types associated with this person (their opportunities,
 	linked properties, interactions) via the person_id partition key on
 	fa_max_state_transition_events.
 
+	Returns one page (up to `limit` events, oldest first) plus `has_more`
+	and `next_cursor` for callers that need the complete history. Pass the
+	returned cursor back as `after_seq` to continue.
+
 	Satisfies WP-1 Done When: 'complete ordered history of a borrower can be
 	queried.'
 	"""
-	from src.services.state_engine import get_person_history
+	from src.services.state_engine import get_borrower_timeline
 
 	with _session(session) as s:
-		events = get_person_history(session=s, person_id=person_id, limit=limit)
-		return {"person_id": person_id, "events": events, "count": len(events)}
+		page = get_borrower_timeline(
+			session=s,
+			person_id=person_id,
+			limit=limit,
+			after_seq=after_seq,
+		)
+		return {
+			"person_id": person_id,
+			"events": page["events"],
+			"count": len(page["events"]),
+			"has_more": page["has_more"],
+			"next_cursor": page["next_cursor"],
+		}

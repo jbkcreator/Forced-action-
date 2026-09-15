@@ -57,26 +57,33 @@ STATEMENTS = [
     """,
 
     # ------------------------------------------------------------------
-    # 3. Seed person lifecycle stages (SOT.md 12-stage progression)
-    #    Insert only if table is empty to support re-runs.
+    # 3. Seed the settled SOT lifecycle (12 progression + 3 control states).
     # ------------------------------------------------------------------
     """
     INSERT INTO fa_max_person_lifecycle_stage_config
         (stage_key, display_name, order_index, allowed_next, is_terminal, is_active)
     VALUES
-        ('identified',     'Identified',          1,  '["qualifying","suppressed","dead"]'::jsonb,         FALSE, TRUE),
-        ('qualifying',     'Qualifying',          2,  '["warm","cold","suppressed","dead"]'::jsonb,        FALSE, TRUE),
-        ('warm',           'Warm',                3,  '["active","cold","suppressed","dead"]'::jsonb,      FALSE, TRUE),
-        ('cold',           'Cold',                4,  '["warm","active","suppressed","dead"]'::jsonb,      FALSE, TRUE),
-        ('active',         'Active — Opportunity',5,  '["submitted","warm","cold","suppressed","dead"]'::jsonb, FALSE, TRUE),
-        ('submitted',      'Submitted to Backflip',6, '["funded","declined","active","suppressed"]'::jsonb,FALSE, TRUE),
-        ('funded',         'Funded',              7,  '["repeat","suppressed"]'::jsonb,                   TRUE,  TRUE),
-        ('declined',       'Declined',            8,  '["active","suppressed","dead"]'::jsonb,             FALSE, TRUE),
-        ('repeat',         'Repeat Borrower',     9,  '["active","suppressed","dead"]'::jsonb,             FALSE, TRUE),
-        ('suppressed',     'Suppressed',          10, '[]'::jsonb,                                         TRUE,  TRUE),
-        ('dead',           'Dead',                11, '[]'::jsonb,                                         TRUE,  TRUE),
-        ('do_not_contact', 'Do Not Contact',      12, '[]'::jsonb,                                         TRUE,  TRUE)
-    ON CONFLICT (stage_key) DO NOTHING
+        ('identified', 'Identified', 1, '["enriched","suppressed","dead","do_not_contact"]'::jsonb, FALSE, TRUE),
+        ('enriched', 'Enriched', 2, '["contacted","suppressed","dead","do_not_contact"]'::jsonb, FALSE, TRUE),
+        ('contacted', 'Contacted', 3, '["engaged","suppressed","dead","do_not_contact"]'::jsonb, FALSE, TRUE),
+        ('engaged', 'Engaged', 4, '["qualified","suppressed","dead","do_not_contact"]'::jsonb, FALSE, TRUE),
+        ('qualified', 'Qualified', 5, '["portal_started","suppressed","dead","do_not_contact"]'::jsonb, FALSE, TRUE),
+        ('portal_started', 'Portal Started', 6, '["application_submitted","suppressed","dead","do_not_contact"]'::jsonb, FALSE, TRUE),
+        ('application_submitted', 'Application Submitted', 7, '["term_sheet_issued","suppressed","dead","do_not_contact"]'::jsonb, FALSE, TRUE),
+        ('term_sheet_issued', 'Term Sheet Issued', 8, '["locked","suppressed","dead","do_not_contact"]'::jsonb, FALSE, TRUE),
+        ('locked', 'Locked', 9, '["funded","suppressed","dead","do_not_contact"]'::jsonb, FALSE, TRUE),
+        ('funded', 'Funded', 10, '["matured","suppressed","dead","do_not_contact"]'::jsonb, FALSE, TRUE),
+        ('matured', 'Matured', 11, '["repeat","suppressed","dead","do_not_contact"]'::jsonb, FALSE, TRUE),
+        ('repeat', 'Repeat Borrower', 12, '["engaged","suppressed","dead","do_not_contact"]'::jsonb, FALSE, TRUE),
+        ('suppressed', 'Suppressed', 13, '[]'::jsonb, TRUE, TRUE),
+        ('dead', 'Dead', 14, '[]'::jsonb, TRUE, TRUE),
+        ('do_not_contact', 'Do Not Contact', 15, '[]'::jsonb, TRUE, TRUE)
+    ON CONFLICT (stage_key) DO UPDATE
+        SET display_name = EXCLUDED.display_name,
+            order_index = EXCLUDED.order_index,
+            allowed_next = EXCLUDED.allowed_next,
+            is_terminal = EXCLUDED.is_terminal,
+            is_active = EXCLUDED.is_active
     """,
 
     # ------------------------------------------------------------------
@@ -171,6 +178,10 @@ STATEMENTS = [
         )
     )
     """,
+    # Repair databases initially created from ORM metadata before the ORM
+    # declared this server default. CREATE TABLE IF NOT EXISTS alone cannot
+    # correct an existing column definition.
+    "ALTER TABLE fa_max_opportunities ALTER COLUMN current_stage SET DEFAULT 'new'",
     "CREATE INDEX IF NOT EXISTS ix_fa_max_opp_person_id ON fa_max_opportunities (person_id)",
     "CREATE INDEX IF NOT EXISTS ix_fa_max_opp_stage ON fa_max_opportunities (current_stage)",
     """
@@ -230,6 +241,25 @@ STATEMENTS = [
     """,
     # GIN index on context JSONB for flexible audit queries
     "CREATE INDEX IF NOT EXISTS ix_fa_max_ste_context_gin ON fa_max_state_transition_events USING GIN (context)",
+
+    # ------------------------------------------------------------------
+    # 8b. Monotonic sequence for reliable history ordering (code-review fix)
+    # ------------------------------------------------------------------
+    # occurred_at uses DEFAULT NOW(), which is frozen at TRANSACTION START,
+    # not at actual INSERT execution time. Two problems follow: (1) multiple
+    # transitions inside one transaction get identical occurred_at values
+    # with no defined relative order, and (2) a transaction that waits at
+    # the pg_advisory_xact_lock and commits LATER can carry an EARLIER
+    # occurred_at than a transaction that started later but didn't wait —
+    # ORDER BY occurred_at alone can then contradict the real transition
+    # order. seq is a BIGSERIAL, allocated at actual statement-execution
+    # time (after the advisory lock is held), so ordering by seq reflects
+    # true execution order regardless of transaction start time. occurred_at
+    # is kept for human-readable attribution; seq is authoritative for
+    # reconstructing order.
+    "ALTER TABLE fa_max_state_transition_events ADD COLUMN IF NOT EXISTS seq BIGSERIAL",
+    "CREATE INDEX IF NOT EXISTS ix_fa_max_ste_person_id_seq ON fa_max_state_transition_events (person_id, seq)",
+    "CREATE INDEX IF NOT EXISTS ix_fa_max_ste_entity_uuid_seq ON fa_max_state_transition_events (entity_uuid, seq)",
 ]
 
 

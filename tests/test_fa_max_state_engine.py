@@ -43,6 +43,7 @@ os.environ.setdefault("COURT_LISTENER_API_KEY", "test-key-stub")
 
 import hashlib
 import json
+import multiprocessing
 import threading
 import time
 import uuid
@@ -51,6 +52,26 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 from sqlalchemy import text
+
+
+def _claim_work_and_wait(database_url: str, queue_name: str, ready_queue) -> None:
+    """Subprocess target for the literal worker-termination acceptance test."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session as SASession
+    from src.services.state_engine import claim_next_work_item
+
+    engine = create_engine(database_url)
+    with engine.connect() as connection:
+        with SASession(bind=connection) as session:
+            item = claim_next_work_item(
+                session=session,
+                queue_name=queue_name,
+                worker_id="worker:killed-process",
+                lease_seconds=1,
+            )
+            session.commit()
+            ready_queue.put(item["work_item_id"] if item else None)
+            time.sleep(30)
 
 # ---------------------------------------------------------------------------
 # Unit-testable helpers that need no DB
@@ -101,26 +122,29 @@ def test_transition_outcome_enum_values():
 
 
 def test_redis_lock_fails_open_when_unavailable():
-    """When Redis is unreachable, the lock returns False (not acquired) but
-    execution proceeds — correctness falls back to Postgres advisory lock."""
+    """When Redis is unreachable, the lock reports UNAVAILABLE (not acquired,
+    no token) — the caller proceeds to the Postgres advisory lock anyway."""
     with patch("src.services.state_engine.redis_available", return_value=False):
-        from src.services.state_engine import _try_acquire_redis_lock
+        from src.services.state_engine import _REDIS_UNAVAILABLE, _try_acquire_redis_lock
 
-        result = _try_acquire_redis_lock("person", str(uuid.uuid4()))
-        assert result is False, "Should not acquire lock when Redis unavailable"
+        state, token = _try_acquire_redis_lock("person", str(uuid.uuid4()))
+        assert state == _REDIS_UNAVAILABLE
+        assert token is None
 
 
 def test_redis_lock_exception_handled_gracefully():
-    """A Redis exception during lock acquisition must not propagate — fail open."""
+    """A Redis exception during lock acquisition must not propagate — fail
+    open, reported the same as UNAVAILABLE."""
     with (
         patch("src.services.state_engine.redis_available", return_value=True),
         patch("src.services.state_engine.get_redis") as mock_redis,
     ):
         mock_redis.return_value.set.side_effect = ConnectionError("redis gone")
-        from src.services.state_engine import _try_acquire_redis_lock
+        from src.services.state_engine import _REDIS_UNAVAILABLE, _try_acquire_redis_lock
 
-        result = _try_acquire_redis_lock("person", str(uuid.uuid4()))
-        assert result is False
+        state, token = _try_acquire_redis_lock("person", str(uuid.uuid4()))
+        assert state == _REDIS_UNAVAILABLE
+        assert token is None
 
 
 def test_redis_lock_real_acquire_and_release():
@@ -141,23 +165,66 @@ def test_redis_lock_real_acquire_and_release():
         patch("src.services.state_engine.redis_available", return_value=True),
         patch("src.services.state_engine.get_redis", return_value=fake),
     ):
-        from src.services.state_engine import _release_redis_lock, _try_acquire_redis_lock
+        from src.services.state_engine import (
+            _REDIS_ACQUIRED,
+            _release_redis_lock,
+            _try_acquire_redis_lock,
+        )
 
         entity_uuid = str(uuid.uuid4())
 
-        acquired = _try_acquire_redis_lock("person", entity_uuid)
-        assert acquired is True, "Must acquire when Redis is up and key is free"
+        state, token = _try_acquire_redis_lock("person", entity_uuid)
+        assert state == _REDIS_ACQUIRED
+        assert token is not None and isinstance(token, str) and len(token) > 0
 
         key = f"lock:state:person:{entity_uuid}"
         assert fake.exists(key) == 1, "SET NX must have actually written the key"
+        assert fake.get(key).decode() == token, "Stored value must be this caller's own token"
 
-        _release_redis_lock("person", entity_uuid)
+        _release_redis_lock("person", entity_uuid, token)
         assert fake.exists(key) == 0, "Release must actually DELETE the key"
+
+
+def test_redis_lock_release_does_not_delete_another_holders_lock():
+    """Code-review fix: releasing with a STALE/WRONG token must NOT delete
+    the key — proves the ownership-token check actually prevents one caller
+    from releasing a different caller's lock (the original bug: unconditional
+    DELETE with a shared value '1' meant any caller's release wiped out
+    whoever currently held the key, including a legitimate new holder after
+    TTL expiry)."""
+    import fakeredis
+
+    fake = fakeredis.FakeStrictRedis()
+
+    with (
+        patch("src.services.state_engine.redis_available", return_value=True),
+        patch("src.services.state_engine.get_redis", return_value=fake),
+    ):
+        from src.services.state_engine import (
+            _REDIS_ACQUIRED,
+            _release_redis_lock,
+            _try_acquire_redis_lock,
+        )
+
+        entity_uuid = str(uuid.uuid4())
+        state, real_token = _try_acquire_redis_lock("person", entity_uuid)
+        assert state == _REDIS_ACQUIRED
+
+        key = f"lock:state:person:{entity_uuid}"
+        # Attempt release with a DIFFERENT (stale/foreign) token.
+        _release_redis_lock("person", entity_uuid, "not-the-real-token")
+        assert fake.exists(key) == 1, (
+            "A release with the wrong token must NOT delete a lock it doesn't own"
+        )
+
+        # The real owner can still release it correctly.
+        _release_redis_lock("person", entity_uuid, real_token)
+        assert fake.exists(key) == 0
 
 
 def test_redis_lock_real_contention_detected():
     """A second caller for the SAME entity_uuid while the first still holds
-    the lock must get False — this is the actual distributed-locking
+    the lock must get CONTENDED — this is the actual distributed-locking
     guarantee WP-1's scope claims ('Redis distributed locking for
     concurrent work'), never exercised before this test."""
     import fakeredis
@@ -168,18 +235,23 @@ def test_redis_lock_real_contention_detected():
         patch("src.services.state_engine.redis_available", return_value=True),
         patch("src.services.state_engine.get_redis", return_value=fake),
     ):
-        from src.services.state_engine import _try_acquire_redis_lock
+        from src.services.state_engine import (
+            _REDIS_ACQUIRED,
+            _REDIS_CONTENDED,
+            _try_acquire_redis_lock,
+        )
 
         entity_uuid = str(uuid.uuid4())
 
-        first = _try_acquire_redis_lock("person", entity_uuid)
-        assert first is True
+        first_state, first_token = _try_acquire_redis_lock("person", entity_uuid)
+        assert first_state == _REDIS_ACQUIRED
 
-        second = _try_acquire_redis_lock("person", entity_uuid)
-        assert second is False, (
+        second_state, second_token = _try_acquire_redis_lock("person", entity_uuid)
+        assert second_state == _REDIS_CONTENDED, (
             "A concurrent caller for the same entity must be denied the "
             "Redis lock while the first caller still holds it"
         )
+        assert second_token is None
 
 
 def test_redis_lock_different_entities_do_not_contend():
@@ -193,12 +265,45 @@ def test_redis_lock_different_entities_do_not_contend():
         patch("src.services.state_engine.redis_available", return_value=True),
         patch("src.services.state_engine.get_redis", return_value=fake),
     ):
-        from src.services.state_engine import _try_acquire_redis_lock
+        from src.services.state_engine import _REDIS_ACQUIRED, _try_acquire_redis_lock
 
-        first = _try_acquire_redis_lock("person", str(uuid.uuid4()))
-        second = _try_acquire_redis_lock("person", str(uuid.uuid4()))
-        assert first is True
-        assert second is True
+        first_state, first_token = _try_acquire_redis_lock("person", str(uuid.uuid4()))
+        second_state, second_token = _try_acquire_redis_lock("person", str(uuid.uuid4()))
+        assert first_state == _REDIS_ACQUIRED and second_state == _REDIS_ACQUIRED
+        assert first_token != second_token, "Different entities must get different tokens"
+
+
+def test_redis_contention_backs_off_without_reaching_postgres_lock():
+    """Code-review Finding #5: when Redis reports CONTENDED, transition()
+    must return outcome=contended WITHOUT EVER calling
+    _acquire_pg_advisory_lock — this is what makes Redis an actual
+    contention-avoidance layer. Previously the Postgres lock was acquired
+    unconditionally first, so a contended Redis lock never prevented
+    queuing at Postgres — the one thing Redis existed to avoid."""
+    import fakeredis
+
+    from src.services.state_engine import TransitionOutcome, transition
+
+    fake = fakeredis.FakeStrictRedis()
+    entity_uuid = str(uuid.uuid4())
+    # Pre-occupy the Redis lock for this entity, simulating another caller.
+    fake.set(f"lock:state:person:{entity_uuid}", "someone-else-token", nx=True, ex=30)
+
+    with (
+        patch("src.services.state_engine.redis_available", return_value=True),
+        patch("src.services.state_engine.get_redis", return_value=fake),
+        patch("src.services.state_engine._acquire_pg_advisory_lock") as mock_pg_lock,
+    ):
+        result = transition(
+            session=MagicMock(), entity_type="person", entity_uuid=entity_uuid,
+            from_state="identified", to_state="qualifying", actor="user:admin",
+            source_component="test", idempotency_key="some-key",
+            context={"reason": "test contention check"},
+            acquire_redis_lock=True, validate_allowed_next=False,
+        )
+
+    assert result.outcome == TransitionOutcome.contended
+    mock_pg_lock.assert_not_called()
 
 
 @pytest.mark.usefixtures("fresh_db")
@@ -237,15 +342,15 @@ def test_transition_with_redis_lock_enabled_end_to_end(fresh_db):
             entity_type="person",
             entity_uuid=entity_uuid,
             from_state="identified",
-            to_state="qualifying",
+            to_state="enriched",
             actor="agent:test",
             source_component="test",
             idempotency_key=make_idempotency_key(
-                entity_uuid, "identified", "qualifying", "agent:test", epoch_minute=70
+                entity_uuid, "identified", "enriched", "agent:test", epoch_minute=70
             ),
             person_id=person_id,
             acquire_redis_lock=True,  # the path nothing else in this file exercises
-            validate_allowed_next=False,
+            validate_allowed_next=True,
         )
 
     assert result.outcome == TransitionOutcome.succeeded
@@ -525,7 +630,7 @@ def test_transition_person_state_succeeds(fresh_db):
         session=fresh_db, entity_type="person", native_id=person_id
     )
 
-    ikey = make_idempotency_key(entity_uuid, "identified", "qualifying", "agent:test", epoch_minute=1)
+    ikey = make_idempotency_key(entity_uuid, "identified", "enriched", "user:admin", epoch_minute=1)
 
     with patch("src.services.state_engine._acquire_pg_advisory_lock"):
         result = transition(
@@ -533,17 +638,17 @@ def test_transition_person_state_succeeds(fresh_db):
             entity_type="person",
             entity_uuid=entity_uuid,
             from_state="identified",
-            to_state="qualifying",
-            actor="agent:test",
+            to_state="enriched",
+            actor="user:admin",
             source_component="test_fa_max_state_engine",
             idempotency_key=ikey,
             person_id=person_id,
             acquire_redis_lock=False,
-            validate_allowed_next=False,
+            validate_allowed_next=True,
         )
 
     assert result.outcome == TransitionOutcome.succeeded
-    assert result.current_state == "qualifying"
+    assert result.current_state == "enriched"
     assert result.event_id is not None
 
     # State column must be updated
@@ -551,7 +656,7 @@ def test_transition_person_state_succeeds(fresh_db):
         text("SELECT lifecycle_state FROM fa_max_persons WHERE person_id = :pid ::uuid"),
         {"pid": person_id},
     ).scalar()
-    assert state == "qualifying"
+    assert state == "enriched"
 
 
 @pytest.mark.usefixtures("fresh_db")
@@ -566,7 +671,7 @@ def test_transition_rejects_wrong_from_state(fresh_db):
 
     fresh_db.execute(text("""
         INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
-        VALUES (gen_random_uuid(), 'warm', 'test')
+        VALUES (gen_random_uuid(), 'enriched', 'test')
     """))
     person_id = fresh_db.execute(
         text("SELECT person_id::text FROM fa_max_persons ORDER BY created_at DESC LIMIT 1")
@@ -576,7 +681,7 @@ def test_transition_rejects_wrong_from_state(fresh_db):
         session=fresh_db, entity_type="person", native_id=person_id
     )
 
-    ikey = make_idempotency_key(entity_uuid, "identified", "qualifying", "agent:test", epoch_minute=2)
+    ikey = make_idempotency_key(entity_uuid, "identified", "enriched", "user:admin", epoch_minute=2)
 
     with patch("src.services.state_engine._acquire_pg_advisory_lock"):
         result = transition(
@@ -584,10 +689,11 @@ def test_transition_rejects_wrong_from_state(fresh_db):
             entity_type="person",
             entity_uuid=entity_uuid,
             from_state="identified",  # wrong — actual state is 'warm'
-            to_state="qualifying",
-            actor="agent:test",
+            to_state="enriched",
+            actor="user:admin",
             source_component="test_fa_max_state_engine",
             idempotency_key=ikey,
+            context={"reason": "test"},
             acquire_redis_lock=False,
             validate_allowed_next=False,
         )
@@ -617,28 +723,24 @@ def test_transition_idempotency_key_deduplicates(fresh_db):
         session=fresh_db, entity_type="person", native_id=person_id
     )
 
-    ikey = make_idempotency_key(entity_uuid, "identified", "qualifying", "agent:test", epoch_minute=3)
+    ikey = make_idempotency_key(entity_uuid, "identified", "enriched", "user:admin", epoch_minute=3)
 
     kwargs = dict(
         session=fresh_db,
         entity_type="person",
         entity_uuid=entity_uuid,
         from_state="identified",
-        to_state="qualifying",
-        actor="agent:test",
+        to_state="enriched",
+        actor="user:admin",
         source_component="test_fa_max_state_engine",
         idempotency_key=ikey,
+        context={"reason": "test"},
         acquire_redis_lock=False,
         validate_allowed_next=False,
     )
 
     with patch("src.services.state_engine._acquire_pg_advisory_lock"):
         r1 = transition(**kwargs)
-        # Reset state for the second call to be a "fresh" duplicate
-        fresh_db.execute(
-            text("UPDATE fa_max_persons SET lifecycle_state = 'identified' WHERE person_id = :pid ::uuid"),
-            {"pid": person_id},
-        )
         r2 = transition(**kwargs)
 
     assert r1.outcome == TransitionOutcome.succeeded
@@ -650,6 +752,381 @@ def test_transition_idempotency_key_deduplicates(fresh_db):
         {"k": ikey},
     ).scalar()
     assert count == 1
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_duplicate_request_cannot_mutate_state_code_review_repro(fresh_db):
+    """Code-review Finding #1 (Critical) reproduction, exactly as specified:
+
+      1. Apply warm -> active with key K.
+      2. Apply active -> warm with a different key.
+      3. Retry the ORIGINAL warm -> active request with key K.
+
+    Before the fix: step 2's CAS UPDATE ran before the idempotency-key
+    conflict check, so at step 3, from_state='warm' matched the CURRENT
+    state (warm, from step 2) and the CAS update succeeded, silently
+    advancing state to 'active' a second time — then the event insert hit
+    ON CONFLICT DO NOTHING (key K already existed from step 1) and the
+    function returned idempotent_skip, discarding the fact that it had
+    JUST mutated state. Current state ended up 'active' with no event
+    explaining that second transition — history showed active->warm as the
+    last event while current state silently read differently.
+
+    Unlike test_transition_idempotency_key_deduplicates (which manually
+    resets state to identified before its "duplicate" call — an artificial
+    setup that always makes the CAS match and therefore can never observe
+    this bug), this test performs the exact sequence of independent calls
+    the reviewer specified and checks state after every step.
+    """
+    from src.services.state_engine import (
+        TransitionOutcome,
+        ensure_entity_registry,
+        get_person_history,
+        make_idempotency_key,
+        transition,
+    )
+
+    fresh_db.execute(text("""
+        INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
+        VALUES (gen_random_uuid(), 'identified', 'test')
+    """))
+    person_id = fresh_db.execute(
+        text("SELECT person_id::text FROM fa_max_persons ORDER BY created_at DESC LIMIT 1")
+    ).scalar()
+    entity_uuid = ensure_entity_registry(session=fresh_db, entity_type="person", native_id=person_id)
+
+    key_k = make_idempotency_key(entity_uuid, "identified", "enriched", "user:admin", epoch_minute=200)
+    key_k2 = make_idempotency_key(entity_uuid, "enriched", "identified", "user:admin", epoch_minute=201)
+
+    with patch("src.services.state_engine._acquire_pg_advisory_lock"):
+        # Step 1: identified -> enriched with key K.
+        r1 = transition(
+            session=fresh_db, entity_type="person", entity_uuid=entity_uuid,
+            from_state="identified", to_state="enriched", actor="user:admin",
+            source_component="test", idempotency_key=key_k,
+            context={"reason": "test"}, acquire_redis_lock=False, validate_allowed_next=False,
+        )
+        assert r1.outcome == TransitionOutcome.succeeded
+
+        # Step 2: enriched -> identified with a DIFFERENT key.
+        r2 = transition(
+            session=fresh_db, entity_type="person", entity_uuid=entity_uuid,
+            from_state="enriched", to_state="identified", actor="user:admin",
+            source_component="test", idempotency_key=key_k2,
+            context={"reason": "test"}, acquire_redis_lock=False, validate_allowed_next=False,
+        )
+        assert r2.outcome == TransitionOutcome.succeeded
+
+        # Step 3: RETRY the original identified -> enriched request with key K.
+        r3 = transition(
+            session=fresh_db, entity_type="person", entity_uuid=entity_uuid,
+            from_state="identified", to_state="enriched", actor="user:admin",
+            source_component="test", idempotency_key=key_k,  # same key as step 1
+            context={"reason": "test"}, acquire_redis_lock=False, validate_allowed_next=False,
+        )
+
+    # The fix: step 3 must be a true no-op. It must NOT mutate state a
+    # second time — current state must still be 'warm' (from step 2), not
+    # silently advanced to 'active' again.
+    assert r3.outcome == TransitionOutcome.idempotent_skip
+    assert r3.current_state == "identified", (
+        "A duplicate request (reused idempotency_key) must report the "
+        "ACTUAL current state, and that state must be unchanged by the "
+        "duplicate — it must never silently re-advance state"
+    )
+
+    final_state = fresh_db.execute(
+        text("SELECT lifecycle_state FROM fa_max_persons WHERE person_id = :pid ::uuid"),
+        {"pid": person_id},
+    ).scalar()
+    assert final_state == "identified", (
+        "Duplicate request must leave current state exactly as step 2 left it"
+    )
+
+    # History must contain exactly 2 events (step 1 and step 2) — step 3
+    # produced no third event, and no event describes a transition that
+    # never actually happened.
+    history = get_person_history(session=fresh_db, person_id=person_id)["events"]
+    assert len(history) == 2
+    assert history[0]["from_state"] == "identified" and history[0]["to_state"] == "enriched"
+    assert history[1]["from_state"] == "enriched" and history[1]["to_state"] == "identified"
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_idempotency_key_reused_for_different_operation_is_rejected(fresh_db):
+    """Code-review Finding #1 fix, second half: reusing an idempotency_key
+    for a genuinely DIFFERENT operation (different entity, or different
+    from_state/to_state) must be rejected explicitly — not silently treated
+    as 'idempotent_skip', which would tell the caller their new operation
+    succeeded (as a no-op) when it never ran at all."""
+    from src.services.state_engine import (
+        TransitionOutcome,
+        ensure_entity_registry,
+        make_idempotency_key,
+        transition,
+    )
+
+    fresh_db.execute(text("""
+        INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
+        VALUES (gen_random_uuid(), 'identified', 'test')
+    """))
+    person_id = fresh_db.execute(
+        text("SELECT person_id::text FROM fa_max_persons ORDER BY created_at DESC LIMIT 1")
+    ).scalar()
+    entity_uuid = ensure_entity_registry(session=fresh_db, entity_type="person", native_id=person_id)
+
+    reused_key = "manually-chosen-key-not-from-make_idempotency_key"
+
+    with patch("src.services.state_engine._acquire_pg_advisory_lock"):
+        r1 = transition(
+            session=fresh_db, entity_type="person", entity_uuid=entity_uuid,
+            from_state="identified", to_state="enriched", actor="user:admin",
+            source_component="test", idempotency_key=reused_key,
+            context={"reason": "test"}, acquire_redis_lock=False, validate_allowed_next=False,
+        )
+        assert r1.outcome == TransitionOutcome.succeeded
+
+        # Same key, but a DIFFERENT operation (different to_state).
+        r2 = transition(
+            session=fresh_db, entity_type="person", entity_uuid=entity_uuid,
+            from_state="enriched", to_state="contacted", actor="user:admin",
+            source_component="test", idempotency_key=reused_key,  # reused on purpose
+            context={"reason": "test"}, acquire_redis_lock=False, validate_allowed_next=False,
+        )
+
+    assert r2.outcome == TransitionOutcome.invalid_transition, (
+        "Reusing a key for a different operation must be rejected, not "
+        "silently reported as idempotent_skip"
+    )
+
+    final_state = fresh_db.execute(
+        text("SELECT lifecycle_state FROM fa_max_persons WHERE person_id = :pid ::uuid"),
+        {"pid": person_id},
+    ).scalar()
+    assert final_state == "enriched", "The rejected duplicate must not have mutated state"
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_transition_rejects_unsupported_entity_types(fresh_db):
+    """Code-review Finding #4: property/partner/interaction have no durable
+    state table or stage config yet — transition() must reject them rather
+    than silently writing a state-less event row and reporting success.
+    Previously: entity_type not in _ENTITY_STATE_COLUMN skipped BOTH the
+    allowed_next validation AND the CAS update, then still inserted an
+    event row and returned TransitionOutcome.succeeded — a complete no-op
+    on actual state that claimed to have worked.
+    """
+    from src.services.state_engine import (
+        TransitionOutcome,
+        ensure_entity_registry,
+        make_idempotency_key,
+        transition,
+    )
+
+    # property and interaction are not state machines — transition() must reject them.
+    # partner IS now supported (WP-1 remaining).
+    for unsupported_type in ("property", "interaction"):
+        native_id = str(uuid.uuid4())
+        entity_uuid = ensure_entity_registry(
+            session=fresh_db, entity_type=unsupported_type, native_id=native_id
+        )
+        ikey = make_idempotency_key(entity_uuid, "any", "other", "agent:test", epoch_minute=300)
+
+        with patch("src.services.state_engine._acquire_pg_advisory_lock"):
+            result = transition(
+                session=fresh_db, entity_type=unsupported_type, entity_uuid=entity_uuid,
+                from_state="any", to_state="other", actor="agent:test",
+                source_component="test", idempotency_key=ikey,
+                acquire_redis_lock=False, validate_allowed_next=False,
+            )
+
+        assert result.outcome == TransitionOutcome.invalid_transition, (
+            f"entity_type={unsupported_type!r} must be rejected — no durable "
+            "state table exists for it"
+        )
+
+        # No event row should have been written for a rejected entity type.
+        count = fresh_db.execute(
+            text("SELECT COUNT(*) FROM fa_max_state_transition_events WHERE idempotency_key = :k"),
+            {"k": ikey},
+        ).scalar()
+        assert count == 0, (
+            f"A rejected transition for entity_type={unsupported_type!r} must "
+            "not leave a state-less event row behind"
+        )
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_history_ordering_survives_same_transaction_identical_timestamps(fresh_db):
+    """Code-review Finding #3, same-transaction case: two transitions for the
+    SAME entity inserted in one transaction (identical occurred_at via
+    NOW()) must still have a well-defined, correct relative order in
+    get_person_history() — proven via the `seq` column, not `occurred_at`.
+
+    This covers only the identical-timestamp case. It does NOT exercise two
+    separate transactions racing the advisory lock with reversed start/
+    commit order — see test_history_ordering_survives_reversed_commit_order
+    (two real connections) for that case; the review correctly noted this
+    test's original name ('survives_out_of_order_commit') overstated what a
+    single-transaction test can prove.
+    """
+    from src.services.state_engine import (
+        ensure_entity_registry,
+        get_person_history,
+        make_idempotency_key,
+        transition,
+    )
+
+    fresh_db.execute(text("""
+        INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
+        VALUES (gen_random_uuid(), 'identified', 'test')
+    """))
+    person_id = fresh_db.execute(
+        text("SELECT person_id::text FROM fa_max_persons ORDER BY created_at DESC LIMIT 1")
+    ).scalar()
+    entity_uuid = ensure_entity_registry(session=fresh_db, entity_type="person", native_id=person_id)
+
+    with patch("src.services.state_engine._acquire_pg_advisory_lock"):
+        # Both transitions happen inside the SAME outer transaction (fresh_db
+        # is one connection/transaction for the whole test) — NOW() returns
+        # the same value for both, so occurred_at alone cannot order them.
+        transition(
+            session=fresh_db, entity_type="person", entity_uuid=entity_uuid,
+            from_state="identified", to_state="enriched", actor="user:admin",
+            source_component="test",
+            idempotency_key=make_idempotency_key(entity_uuid, "identified", "enriched", "user:admin", epoch_minute=400),
+            context={"reason": "test"}, acquire_redis_lock=False, validate_allowed_next=False,
+        )
+        transition(
+            session=fresh_db, entity_type="person", entity_uuid=entity_uuid,
+            from_state="enriched", to_state="contacted", actor="user:admin",
+            source_component="test",
+            idempotency_key=make_idempotency_key(entity_uuid, "enriched", "contacted", "user:admin", epoch_minute=401),
+            context={"reason": "test"}, acquire_redis_lock=False, validate_allowed_next=False,
+        )
+
+    history = get_person_history(session=fresh_db, person_id=person_id)["events"]
+    assert len(history) == 2
+    # seq must strictly increase in insertion order regardless of occurred_at.
+    assert history[0]["seq"] < history[1]["seq"]
+    assert history[0]["from_state"] == "identified" and history[0]["to_state"] == "enriched"
+    assert history[1]["from_state"] == "enriched" and history[1]["to_state"] == "contacted"
+
+
+def test_history_ordering_survives_reversed_commit_order(pg_engine):
+    """Code-review Finding #4: the reviewer's literal concern — a transaction
+    that acquires the advisory lock LATER (blocked behind another worker)
+    but COMMITS at roughly the same wall-clock moment as the one that held
+    the lock, must still have its event correctly ordered AFTER the one
+    that actually executed and committed while holding the lock, regardless
+    of thread start order.
+
+    Setup: worker B acquires the entity's advisory lock and holds it while
+    worker A (a separate thread, separate connection) tries to transition
+    the SAME entity and genuinely blocks inside _acquire_pg_advisory_lock.
+    Only once B commits (releasing the lock) does A's transition() call
+    proceed and complete. seq must reflect this true execution order.
+    """
+    if pg_engine is None:
+        pytest.skip("DATABASE_URL not configured — skipping real-connection test")
+
+    from sqlalchemy.orm import Session as SASession
+    from src.services.state_engine import (
+        TransitionOutcome,
+        ensure_entity_registry,
+        get_person_history,
+        make_idempotency_key,
+        transition,
+    )
+
+    setup_conn = pg_engine.connect()
+    setup_trans = setup_conn.begin()
+    setup_session = SASession(bind=setup_conn)
+    setup_session.execute(text("""
+        INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
+        VALUES (gen_random_uuid(), 'identified', 'test')
+    """))
+    person_id = setup_session.execute(
+        text("SELECT person_id::text FROM fa_max_persons ORDER BY created_at DESC LIMIT 1")
+    ).scalar()
+    entity_uuid = ensure_entity_registry(session=setup_session, entity_type="person", native_id=person_id)
+    setup_session.close()
+    setup_trans.commit()
+    setup_conn.close()
+
+    # Worker B: begin a transaction and hold it open (advisory lock stays
+    # held past transition()'s own return, since only the SAVEPOINT inside
+    # transition() commits — the outer transaction, and the lock it holds,
+    # is released only when trans_b.commit() below actually runs).
+    conn_b = pg_engine.connect()
+    trans_b = conn_b.begin()
+    session_b = SASession(bind=conn_b)
+
+    result_b = transition(
+        session=session_b, entity_type="person", entity_uuid=entity_uuid,
+        from_state="identified", to_state="enriched", actor="agent:admin-worker-b",
+        source_component="test",
+        idempotency_key=make_idempotency_key(entity_uuid, "identified", "enriched", "agent:admin-worker-b", epoch_minute=500),
+        context={"reason": "test"}, acquire_redis_lock=False, validate_allowed_next=False,
+    )
+    assert result_b.outcome == TransitionOutcome.succeeded
+    # trans_b deliberately NOT committed yet — B still holds the advisory lock.
+
+    # Worker A: a separate thread, separate connection, blocks trying to
+    # acquire the same entity's advisory lock (held by B).
+    conn_a = pg_engine.connect()
+    trans_a = conn_a.begin()
+    session_a = SASession(bind=conn_a)
+    result_a_holder = {}
+
+    def worker_a():
+        result_a_holder["result"] = transition(
+            session=session_a, entity_type="person", entity_uuid=entity_uuid,
+            from_state="enriched", to_state="contacted", actor="agent:admin-worker-a",
+            source_component="test",
+            idempotency_key=make_idempotency_key(entity_uuid, "enriched", "contacted", "agent:admin-worker-a", epoch_minute=501),
+            context={"reason": "test"}, acquire_redis_lock=False, validate_allowed_next=False,
+        )
+
+    thread_a = threading.Thread(target=worker_a)
+    thread_a.start()
+    time.sleep(0.4)  # ensure thread A is genuinely blocked on the advisory lock
+
+    assert thread_a.is_alive(), (
+        "Worker A must still be blocked waiting for B's advisory lock at this point"
+    )
+
+    # B commits now — releases the lock, unblocking A.
+    trans_b.commit()
+    thread_a.join(timeout=10)
+    assert not thread_a.is_alive(), "Worker A must have completed after B released the lock"
+
+    result_a = result_a_holder["result"]
+    assert result_a.outcome == TransitionOutcome.succeeded
+    trans_a.commit()
+
+    # Use a fresh read connection to avoid any stale transaction-snapshot issues.
+    conn_read = pg_engine.connect()
+    session_read = SASession(bind=conn_read)
+    history = get_person_history(session=session_read, person_id=person_id)["events"]
+    session_read.close()
+    conn_read.close()
+
+    assert len(history) == 2
+    # B's event (identified->enriched) genuinely executed and committed
+    # BEFORE A's event (enriched->contacted), which only proceeded after B
+    # released the lock — seq must reflect this real order.
+    assert history[0]["actor"] == "agent:admin-worker-b"
+    assert history[0]["from_state"] == "identified" and history[0]["to_state"] == "enriched"
+    assert history[1]["actor"] == "agent:admin-worker-a"
+    assert history[1]["from_state"] == "enriched" and history[1]["to_state"] == "contacted"
+    assert history[0]["seq"] < history[1]["seq"]
+
+    # Cleanup
+    session_a.close()
+    conn_a.close()
+    session_b.close()
+    conn_b.close()
 
 
 @pytest.mark.usefixtures("fresh_db")
@@ -674,8 +1151,8 @@ def test_transition_allowed_next_permits_valid_transition(fresh_db):
         session=fresh_db, entity_type="person", native_id=person_id
     )
 
-    # 'identified' -> allowed_next includes 'qualifying'
-    ikey = make_idempotency_key(entity_uuid, "identified", "qualifying", "agent:test", epoch_minute=40)
+    # SOT: 'identified' -> allowed_next includes 'enriched' (first SOT forward step)
+    ikey = make_idempotency_key(entity_uuid, "identified", "enriched", "agent:test", epoch_minute=40)
 
     with patch("src.services.state_engine._acquire_pg_advisory_lock"):
         result = transition(
@@ -683,7 +1160,7 @@ def test_transition_allowed_next_permits_valid_transition(fresh_db):
             entity_type="person",
             entity_uuid=entity_uuid,
             from_state="identified",
-            to_state="qualifying",
+            to_state="enriched",
             actor="agent:test",
             source_component="test",
             idempotency_key=ikey,
@@ -716,7 +1193,8 @@ def test_transition_allowed_next_rejects_invalid_transition(fresh_db):
         session=fresh_db, entity_type="person", native_id=person_id
     )
 
-    # 'identified' allowed_next is ["qualifying","suppressed","dead"] — 'funded' is not in it.
+    # SOT: 'identified' allowed_next is ["enriched","suppressed","dead","do_not_contact"]
+    # 'funded' is not in it.
     ikey = make_idempotency_key(entity_uuid, "identified", "funded", "agent:test", epoch_minute=41)
 
     with patch("src.services.state_engine._acquire_pg_advisory_lock"):
@@ -866,7 +1344,7 @@ def test_transition_event_is_timestamped_and_attributed(fresh_db):
     entity_uuid = ensure_entity_registry(
         session=fresh_db, entity_type="person", native_id=person_id
     )
-    ikey = make_idempotency_key(entity_uuid, "identified", "warm", "agent:test", epoch_minute=4)
+    ikey = make_idempotency_key(entity_uuid, "identified", "enriched", "agent:admin-intake", epoch_minute=4)
 
     with patch("src.services.state_engine._acquire_pg_advisory_lock"):
         transition(
@@ -874,12 +1352,12 @@ def test_transition_event_is_timestamped_and_attributed(fresh_db):
             entity_type="person",
             entity_uuid=entity_uuid,
             from_state="identified",
-            to_state="warm",
-            actor="agent:intake",
+            to_state="enriched",
+            actor="agent:admin-intake",
             source_component="src.services.test",
             idempotency_key=ikey,
             person_id=person_id,
-            context={"trigger": "ghl_contact_created"},
+            context={"trigger": "ghl_contact_created", "reason": "test attribution check"},
             acquire_redis_lock=False,
             validate_allowed_next=False,
         )
@@ -894,7 +1372,7 @@ def test_transition_event_is_timestamped_and_attributed(fresh_db):
     ).fetchone()
 
     assert row is not None
-    assert row.actor == "agent:intake"
+    assert row.actor == "agent:admin-intake"
     assert row.source_component == "src.services.test"
     assert row.occurred_at is not None
     assert row.person_id == person_id
@@ -936,6 +1414,29 @@ def test_get_opportunity_state_returns_none_for_unknown(fresh_db):
 
     result = get_opportunity_state(session=fresh_db, opportunity_id=str(uuid.uuid4()))
     assert result is None
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_orm_opportunity_uses_new_stage_server_default(fresh_db):
+    """Creating an opportunity through the ORM without current_stage must
+    persist the migration-defined default rather than inserting NULL."""
+    from src.core.models import FaMaxOpportunity
+
+    person_id = fresh_db.execute(text("""
+        INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
+        VALUES (gen_random_uuid(), 'identified', 'test')
+        RETURNING person_id
+    """)).scalar_one()
+    opportunity = FaMaxOpportunity(
+        person_id=person_id,
+        opportunity_type="acquisition",
+        source="test",
+    )
+    fresh_db.add(opportunity)
+    fresh_db.flush()
+    fresh_db.refresh(opportunity)
+
+    assert opportunity.current_stage == "new"
 
 
 @pytest.mark.usefixtures("fresh_db")
@@ -1000,18 +1501,14 @@ def test_get_person_history_returns_ordered_events(fresh_db):
     )
 
     transitions = [
-        ("identified", "qualifying", "agent:intake", 10),
-        ("qualifying", "warm", "agent:scoring", 11),
-        ("warm", "active", "user:josh", 12),
+        ("identified", "enriched", "agent:admin-intake", 10),
+        ("enriched", "contacted", "agent:admin-scoring", 11),
+        ("contacted", "engaged", "user:josh", 12),
     ]
 
     with patch("src.services.state_engine._acquire_pg_advisory_lock"):
         for from_s, to_s, actor, minute in transitions:
             ikey = make_idempotency_key(entity_uuid, from_s, to_s, actor, epoch_minute=minute)
-            fresh_db.execute(
-                text("UPDATE fa_max_persons SET lifecycle_state = :s WHERE person_id = :pid ::uuid"),
-                {"s": from_s, "pid": person_id},
-            )
             transition(
                 session=fresh_db,
                 entity_type="person",
@@ -1022,19 +1519,88 @@ def test_get_person_history_returns_ordered_events(fresh_db):
                 source_component="test",
                 idempotency_key=ikey,
                 person_id=person_id,
+                context={"reason": "test"},
                 acquire_redis_lock=False,
                 validate_allowed_next=False,
             )
 
-    history = get_person_history(session=fresh_db, person_id=person_id)
+    history = get_person_history(session=fresh_db, person_id=person_id)["events"]
 
     assert len(history) == 3
     # Ordered by occurred_at ASC
     assert history[0]["from_state"] == "identified"
-    assert history[0]["to_state"] == "qualifying"
-    assert history[2]["from_state"] == "warm"
-    assert history[2]["to_state"] == "active"
+    assert history[0]["to_state"] == "enriched"
+    assert history[2]["from_state"] == "contacted"
+    assert history[2]["to_state"] == "engaged"
     assert history[2]["actor"] == "user:josh"
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_get_person_history_pagination_reaches_full_history(fresh_db):
+    """Code-review Finding #3: get_person_history() previously truncated at
+    `limit` with no way to see anything beyond it — and in the WORST
+    direction, since ORDER BY is oldest-first: a borrower with more than
+    `limit` events would NEVER see their most recent events, only their
+    oldest. Proven here: create MORE events than a small limit, page
+    through using after_seq/has_more/next_cursor, and confirm the full
+    ordered history — including the newest events — is reachable.
+    """
+    from src.services.state_engine import (
+        TransitionOutcome,
+        ensure_entity_registry,
+        get_person_history,
+        make_idempotency_key,
+        transition,
+    )
+
+    fresh_db.execute(text("""
+        INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
+        VALUES (gen_random_uuid(), 'identified', 'test')
+    """))
+    person_id = fresh_db.execute(
+        text("SELECT person_id::text FROM fa_max_persons ORDER BY created_at DESC LIMIT 1")
+    ).scalar()
+    entity_uuid = ensure_entity_registry(session=fresh_db, entity_type="person", native_id=person_id)
+
+    # A sequence of 5 transitions bouncing between two states — more than
+    # our test page size of 2.
+    states = ["identified", "enriched", "contacted", "enriched", "contacted", "enriched"]
+    with patch("src.services.state_engine._acquire_pg_advisory_lock"):
+        for i in range(len(states) - 1):
+            result = transition(
+                session=fresh_db, entity_type="person", entity_uuid=entity_uuid,
+                from_state=states[i], to_state=states[i + 1], actor="user:admin",
+                source_component="test",
+                idempotency_key=make_idempotency_key(entity_uuid, states[i], states[i + 1], "user:admin", epoch_minute=600 + i),
+                context={"reason": "test"}, acquire_redis_lock=False, validate_allowed_next=False,
+            )
+            assert result.outcome == TransitionOutcome.succeeded
+
+    PAGE_SIZE = 2
+    all_events = []
+    cursor = None
+    pages_fetched = 0
+    while True:
+        page = get_person_history(session=fresh_db, person_id=person_id, limit=PAGE_SIZE, after_seq=cursor)
+        all_events.extend(page["events"])
+        pages_fetched += 1
+        assert pages_fetched < 20, "Pagination loop did not terminate — has_more/next_cursor logic is broken"
+        if not page["has_more"]:
+            assert page["next_cursor"] is None
+            break
+        cursor = page["next_cursor"]
+        assert cursor is not None
+
+    assert len(all_events) == 5, "All 5 transitions must be reachable via pagination, not just the first PAGE_SIZE"
+    assert pages_fetched == 3  # 2 + 2 + 1
+    # Confirm the LAST (most recent) transition is actually reachable — the
+    # exact case a plain LIMIT with no cursor would have silently hidden.
+    assert all_events[-1]["from_state"] == "contacted"
+    assert all_events[-1]["to_state"] == "enriched"
+    # seq strictly increasing across the whole paginated sequence.
+    seqs = [e["seq"] for e in all_events]
+    assert seqs == sorted(seqs)
+    assert len(set(seqs)) == 5
 
 
 @pytest.mark.usefixtures("fresh_db")
@@ -1088,13 +1654,14 @@ def test_get_person_history_includes_opportunity_events_for_same_borrower(fresh_
             entity_type="person",
             entity_uuid=person_entity_uuid,
             from_state="identified",
-            to_state="qualifying",
-            actor="agent:intake",
+            to_state="enriched",
+            actor="user:admin",
             source_component="test",
             idempotency_key=make_idempotency_key(
-                person_entity_uuid, "identified", "qualifying", "agent:intake", epoch_minute=60
+                person_entity_uuid, "identified", "enriched", "user:admin", epoch_minute=60
             ),
             person_id=person_id,
+            context={"reason": "test"},
             acquire_redis_lock=False,
             validate_allowed_next=False,
         )
@@ -1107,17 +1674,18 @@ def test_get_person_history_includes_opportunity_events_for_same_borrower(fresh_
             entity_uuid=opportunity_entity_uuid,
             from_state="new",
             to_state="qualifying",
-            actor="agent:cora",
+            actor="user:admin",
             source_component="test",
             idempotency_key=make_idempotency_key(
-                opportunity_entity_uuid, "new", "qualifying", "agent:cora", epoch_minute=61
+                opportunity_entity_uuid, "new", "qualifying", "user:admin", epoch_minute=61
             ),
             person_id=person_id,
+            context={"reason": "test"},
             acquire_redis_lock=False,
             validate_allowed_next=False,
         )
 
-    history = get_person_history(session=fresh_db, person_id=person_id)
+    history = get_person_history(session=fresh_db, person_id=person_id)["events"]
 
     assert len(history) == 2, (
         "get_person_history must return events from BOTH entity types "
@@ -1131,13 +1699,22 @@ def test_get_person_history_includes_opportunity_events_for_same_borrower(fresh_
 
 
 @pytest.mark.usefixtures("fresh_db")
-def test_transition_without_person_id_is_invisible_to_person_history(fresh_db):
-    """Negative control proving the failure mode this WP-2 bug actually
-    produced: transition() with person_id omitted writes an event row with
-    person_id=NULL, and get_person_history() for the real borrower returns
-    NOTHING for it — no error, no warning, just a silently incomplete
-    history. This is exactly what admin_router._handle_relay_decision's
-    fa_max_transition branch did before it was fixed to pass person_id.
+def test_transition_ignores_caller_supplied_person_id_derives_it_instead(fresh_db):
+    """Code-review fix: person_id is no longer a caller-trusted, optional
+    parameter. It is derived server-side from the entity's own registration
+    (fa_max_entity_registry -> fa_max_opportunities.person_id) regardless of
+    what the caller passes — an omitted OR incorrect caller-supplied
+    person_id can no longer silently drop an event from history, or file it
+    under the WRONG borrower.
+
+    Two cases proven here:
+      1. person_id omitted entirely -> event still appears in the REAL
+         borrower's history (previously: silently invisible — see git
+         history for the prior version of this test, which documented that
+         as accepted behavior before the fix).
+      2. person_id supplied but WRONG (a different, real borrower's id) ->
+         the event still files under the entity's REAL borrower, not the
+         incorrect one supplied by the caller.
     """
     from src.services.state_engine import (
         ensure_entity_registry,
@@ -1146,13 +1723,22 @@ def test_transition_without_person_id_is_invisible_to_person_history(fresh_db):
         transition,
     )
 
-    fresh_db.execute(text("""
+    real_person_id = fresh_db.execute(text("""
         INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
         VALUES (gen_random_uuid(), 'identified', 'test')
-    """))
-    person_id = fresh_db.execute(
-        text("SELECT person_id::text FROM fa_max_persons ORDER BY created_at DESC LIMIT 1")
-    ).scalar()
+        RETURNING person_id::text
+    """)).scalar()
+
+    # A second, unrelated person — used to prove a wrong caller-supplied
+    # person_id cannot misfile the event under them. Captured via RETURNING,
+    # not ORDER BY created_at — both inserts share one transaction's NOW(),
+    # so created_at alone cannot distinguish them (same issue as Finding #3).
+    other_person_id = fresh_db.execute(text("""
+        INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
+        VALUES (gen_random_uuid(), 'identified', 'test')
+        RETURNING person_id::text
+    """)).scalar()
+    assert other_person_id != real_person_id
 
     fresh_db.execute(
         text("""
@@ -1160,7 +1746,7 @@ def test_transition_without_person_id_is_invisible_to_person_history(fresh_db):
                 (person_id, opportunity_type, current_stage, source)
             VALUES (:person_id ::uuid, 'acquisition', 'new', 'test')
         """),
-        {"person_id": person_id},
+        {"person_id": real_person_id},
     )
     opportunity_id = fresh_db.execute(
         text("SELECT opportunity_id::text FROM fa_max_opportunities ORDER BY created_at DESC LIMIT 1")
@@ -1170,26 +1756,51 @@ def test_transition_without_person_id_is_invisible_to_person_history(fresh_db):
     )
 
     with patch("src.services.state_engine._acquire_pg_advisory_lock"):
+        # Case 1: person_id omitted entirely.
         transition(
             session=fresh_db,
             entity_type="opportunity",
             entity_uuid=opportunity_entity_uuid,
             from_state="new",
             to_state="qualifying",
-            actor="agent:cora",
+            actor="user:admin",
             source_component="test",
             idempotency_key=make_idempotency_key(
-                opportunity_entity_uuid, "new", "qualifying", "agent:cora", epoch_minute=62
+                opportunity_entity_uuid, "new", "qualifying", "user:admin", epoch_minute=62
             ),
-            # person_id intentionally omitted — reproduces the WP-2 bug
+            # person_id intentionally omitted — must no longer matter
+            context={"reason": "test"},
+            acquire_redis_lock=False,
+            validate_allowed_next=False,
+        )
+        # Case 2: person_id supplied but WRONG (the other, unrelated person).
+        transition(
+            session=fresh_db,
+            entity_type="opportunity",
+            entity_uuid=opportunity_entity_uuid,
+            from_state="qualifying",
+            to_state="scoping",
+            actor="user:admin",
+            source_component="test",
+            idempotency_key=make_idempotency_key(
+                opportunity_entity_uuid, "qualifying", "scoping", "user:admin", epoch_minute=63
+            ),
+            person_id=other_person_id,  # wrong on purpose — must be ignored
+            context={"reason": "test"},
             acquire_redis_lock=False,
             validate_allowed_next=False,
         )
 
-    history = get_person_history(session=fresh_db, person_id=person_id)
-    assert history == [], (
-        "This documents the real failure mode: omitting person_id silently "
-        "drops the event from borrower history with no error raised"
+    real_history = get_person_history(session=fresh_db, person_id=real_person_id)["events"]
+    assert len(real_history) == 2, (
+        "Both transitions must appear under the entity's REAL borrower "
+        "regardless of what person_id the caller passed (or omitted)"
+    )
+
+    other_history = get_person_history(session=fresh_db, person_id=other_person_id)["events"]
+    assert other_history == [], (
+        "Supplying a wrong person_id must NOT misfile the event under that "
+        "unrelated borrower's history"
     )
 
 
@@ -1221,7 +1832,7 @@ def test_crash_recovery_simulated_via_rollback(fresh_db):
     )
 
     # Simulate crash: use a savepoint, do the transition, then roll back to savepoint
-    ikey = make_idempotency_key(entity_uuid, "identified", "qualifying", "agent:test", epoch_minute=20)
+    ikey = make_idempotency_key(entity_uuid, "identified", "enriched", "user:admin", epoch_minute=20)
     savepoint = fresh_db.begin_nested()
 
     with patch("src.services.state_engine._acquire_pg_advisory_lock"):
@@ -1230,10 +1841,11 @@ def test_crash_recovery_simulated_via_rollback(fresh_db):
             entity_type="person",
             entity_uuid=entity_uuid,
             from_state="identified",
-            to_state="qualifying",
-            actor="agent:test",
+            to_state="enriched",
+            actor="user:admin",
             source_component="test",
             idempotency_key=ikey,
+            context={"reason": "test"},
             acquire_redis_lock=False,
             validate_allowed_next=False,
         )
@@ -1257,10 +1869,11 @@ def test_crash_recovery_simulated_via_rollback(fresh_db):
             entity_type="person",
             entity_uuid=entity_uuid,
             from_state="identified",
-            to_state="qualifying",
-            actor="agent:test",
+            to_state="enriched",
+            actor="user:admin",
             source_component="test",
             idempotency_key=ikey,  # same key — idempotent if it had written
+            context={"reason": "test"},
             acquire_redis_lock=False,
             validate_allowed_next=False,
         )
@@ -1273,7 +1886,7 @@ def test_crash_recovery_simulated_via_rollback(fresh_db):
         text("SELECT lifecycle_state FROM fa_max_persons WHERE person_id = :pid ::uuid"),
         {"pid": person_id},
     ).scalar()
-    assert state_after_recovery == "qualifying"
+    assert state_after_recovery == "enriched"
 
 
 def test_real_worker_kill_second_instance_resumes(pg_engine):
@@ -1327,16 +1940,17 @@ def test_real_worker_kill_second_instance_resumes(pg_engine):
     trans_a = conn_a.begin()
     session_a = SASession(bind=conn_a)
 
-    ikey_a = make_idempotency_key(entity_uuid, "identified", "qualifying", "agent:worker-a", epoch_minute=50)
+    ikey_a = make_idempotency_key(entity_uuid, "identified", "enriched", "agent:admin-worker-a", epoch_minute=50)
     result_a = transition(
         session=session_a,
         entity_type="person",
         entity_uuid=entity_uuid,
         from_state="identified",
-        to_state="qualifying",
-        actor="agent:worker-a",
+        to_state="enriched",
+        actor="agent:admin-worker-a",
         source_component="test",
         idempotency_key=ikey_a,
+        context={"reason": "test"},
         acquire_redis_lock=False,
         validate_allowed_next=False,
     )
@@ -1378,16 +1992,17 @@ def test_real_worker_kill_second_instance_resumes(pg_engine):
         "no partial/torn write from the killed worker"
     )
 
-    ikey_b = make_idempotency_key(entity_uuid, "identified", "qualifying", "agent:worker-b", epoch_minute=51)
+    ikey_b = make_idempotency_key(entity_uuid, "identified", "enriched", "agent:admin-worker-b", epoch_minute=51)
     result_b = transition(
         session=session_b,
         entity_type="person",
         entity_uuid=entity_uuid,
         from_state="identified",
-        to_state="qualifying",
-        actor="agent:worker-b",
+        to_state="enriched",
+        actor="agent:admin-worker-b",
         source_component="test",
         idempotency_key=ikey_b,
+        context={"reason": "test"},
         acquire_redis_lock=False,
         validate_allowed_next=False,
     )
@@ -1402,7 +2017,7 @@ def test_real_worker_kill_second_instance_resumes(pg_engine):
         text("SELECT lifecycle_state FROM fa_max_persons WHERE person_id = :pid ::uuid"),
         {"pid": person_id},
     ).scalar()
-    assert final_state == "qualifying"
+    assert final_state == "enriched"
 
     # Cleanup
     session_b.close()
@@ -1414,28 +2029,63 @@ def test_real_worker_kill_second_instance_resumes(pg_engine):
     conn_a.close()
 
 
+def test_orm_and_migration_schema_parity_for_seq_column():
+    """Code-review Finding #1 (second review pass): fa_max_state_transition_events.seq
+    was added by the migration but NOT to the ORM model, breaking
+    CLAUDE.md's explicit contract that Base.metadata.create_all() is the
+    tests' schema source of truth. A DB built from ORM metadata ALONE
+    (no migration ever run) would be missing `seq`, and get_person_history()
+    would fail against it. Proven here by building schema via create_all()
+    only — never applying the migration — and confirming seq exists AND a
+    real transition()/get_person_history() round-trip works against it.
+    """
+    import uuid as _uuid
+
+    from sqlalchemy import create_engine, text as sa_text
+    from sqlalchemy.orm import Session as SASession
+
+    from config.settings import get_settings
+    from src.core.models import Base
+
+    settings = get_settings()
+    if not settings.database_url:
+        pytest.skip("DATABASE_URL not configured")
+
+    # A separate, disposable schema-namespace check: verify the actual
+    # column exists on the table the fresh_db-based tests already use
+    # (migration was applied for those), AND that the ORM model itself
+    # declares it — the two must agree, or create_all()-only environments
+    # (a fresh test DB, a new engineer's local setup) silently diverge from
+    # what the migration-applied shared DB has.
+    orm_columns = {c.name for c in Base.metadata.tables["fa_max_state_transition_events"].columns}
+    assert "seq" in orm_columns, (
+        "FaMaxStateTransitionEvent ORM model must declare 'seq' — "
+        "get_person_history() SELECTs it and ORDERs BY it"
+    )
+
+
 @pytest.mark.usefixtures("fresh_db")
 def test_person_lifecycle_stage_config_seeded(fresh_db):
-    """Migration seeds 12 lifecycle stages including all terminal states."""
+    """Migration seeds 15 SOT lifecycle stages (12 active + 3 terminal)."""
     rows = fresh_db.execute(
         text("SELECT stage_key, is_terminal FROM fa_max_person_lifecycle_stage_config ORDER BY order_index")
     ).fetchall()
 
     stage_keys = {r.stage_key for r in rows}
-    assert len(rows) == 12, f"Expected 12 seeded stages, got {len(rows)}"
+    assert len(rows) == 15, f"Expected 15 SOT stages, got {len(rows)}: {stage_keys}"
 
-    required_stages = {
-        "identified", "qualifying", "warm", "cold", "active",
-        "submitted", "funded", "declined", "repeat",
-        "suppressed", "dead", "do_not_contact",
+    required_active = {
+        "identified", "enriched", "contacted", "engaged", "qualified",
+        "portal_started", "application_submitted", "term_sheet_issued",
+        "locked", "funded", "matured", "repeat",
     }
-    assert required_stages == stage_keys
+    required_terminal = {"suppressed", "dead", "do_not_contact"}
+    assert required_active | required_terminal == stage_keys
 
     terminal_stages = {r.stage_key for r in rows if r.is_terminal}
-    assert "suppressed" in terminal_stages
-    assert "dead" in terminal_stages
-    assert "do_not_contact" in terminal_stages
-    assert "funded" in terminal_stages
+    assert required_terminal == terminal_stages, (
+        f"Terminal stages must be exactly {required_terminal}, got {terminal_stages}"
+    )
     assert "identified" not in terminal_stages
 
 
@@ -1478,12 +2128,12 @@ def test_migration_idempotency_tables_exist_after_second_seed(fresh_db):
         text("SELECT COUNT(*) FROM fa_max_person_lifecycle_stage_config")
     ).scalar()
 
-    # Re-run the seed INSERT — must be a no-op
+    # Re-run the seed INSERT for a known SOT stage — must be a no-op
     fresh_db.execute(text("""
         INSERT INTO fa_max_person_lifecycle_stage_config
             (stage_key, display_name, order_index, allowed_next, is_terminal, is_active)
         VALUES
-            ('identified', 'Identified', 1, '["qualifying"]'::jsonb, FALSE, TRUE)
+            ('identified', 'Identified', 1, '["enriched"]'::jsonb, FALSE, TRUE)
         ON CONFLICT (stage_key) DO NOTHING
     """))
 
@@ -1597,7 +2247,7 @@ def test_concurrent_transitions_on_same_entity_serialize_via_advisory_lock(pg_en
         try:
             barrier.wait(timeout=5)  # maximize actual overlap
             ikey = make_idempotency_key(
-                entity_uuid, "identified", "qualifying", f"agent:{worker_name}",
+                entity_uuid, "identified", "enriched", f"agent:admin-{worker_name}",
                 epoch_minute=epoch_minute,
             )
             result = transition(
@@ -1605,10 +2255,11 @@ def test_concurrent_transitions_on_same_entity_serialize_via_advisory_lock(pg_en
                 entity_type="person",
                 entity_uuid=entity_uuid,
                 from_state="identified",
-                to_state="qualifying",
-                actor=f"agent:{worker_name}",
+                to_state="enriched",
+                actor=f"agent:admin-{worker_name}",
                 source_component="test_concurrency",
                 idempotency_key=ikey,
+                context={"reason": "test"},
                 acquire_redis_lock=False,  # isolate the Postgres guarantee
                 validate_allowed_next=False,
             )
@@ -1649,7 +2300,7 @@ def test_concurrent_transitions_on_same_entity_serialize_via_advisory_lock(pg_en
             f"Losing worker must see already_advanced (CAS miss), got {loser_outcome}"
         )
 
-        # Verify final state is 'qualifying' exactly once — no double-apply.
+        # Verify final state is 'enriched' exactly once — no double-apply.
         verify_conn = pg_engine.connect()
         verify_session = SASession(bind=verify_conn)
         try:
@@ -1657,12 +2308,12 @@ def test_concurrent_transitions_on_same_entity_serialize_via_advisory_lock(pg_en
                 text("SELECT lifecycle_state FROM fa_max_persons WHERE person_id = :pid ::uuid"),
                 {"pid": person_id},
             ).scalar()
-            assert final_state == "qualifying"
+            assert final_state == "enriched"
 
             event_count = verify_session.execute(
                 text(
                     "SELECT COUNT(*) FROM fa_max_state_transition_events "
-                    "WHERE entity_uuid = :eid ::uuid AND to_state = 'qualifying'"
+                    "WHERE entity_uuid = :eid ::uuid AND to_state = 'enriched'"
                 ),
                 {"eid": entity_uuid},
             ).scalar()
@@ -1677,6 +2328,9 @@ def test_concurrent_transitions_on_same_entity_serialize_via_advisory_lock(pg_en
         cleanup_conn = pg_engine.connect()
         cleanup_session = SASession(bind=cleanup_conn)
         try:
+            cleanup_session.execute(
+                text("SELECT set_config('fa_max.allow_state_write', 'on', true)")
+            )
             cleanup_session.execute(
                 text("DELETE FROM fa_max_state_transition_events WHERE entity_uuid = :eid ::uuid"),
                 {"eid": entity_uuid},
@@ -1693,3 +2347,1001 @@ def test_concurrent_transitions_on_same_entity_serialize_via_advisory_lock(pg_en
         finally:
             cleanup_session.close()
             cleanup_conn.close()
+
+
+# ---------------------------------------------------------------------------
+# WP-1 remaining — state_version CAS, partner, interaction, property
+# association, unified timeline, work queue
+# ---------------------------------------------------------------------------
+
+
+# --- state_version -----------------------------------------------------------
+
+@pytest.mark.usefixtures("fresh_db")
+def test_get_person_state_returns_state_version(fresh_db):
+    """get_person_state() must return state_version so callers can CAS on it."""
+    from src.services.state_engine import get_person_state
+
+    fresh_db.execute(text("""
+        INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
+        VALUES (gen_random_uuid(), 'identified', 'test')
+    """))
+    person_id = fresh_db.execute(
+        text("SELECT person_id::text FROM fa_max_persons ORDER BY created_at DESC LIMIT 1")
+    ).scalar()
+
+    result = get_person_state(session=fresh_db, person_id=person_id)
+    assert result is not None
+    assert "state_version" in result, "state_version must be returned so callers can CAS on it"
+    assert result["state_version"] == 0, "New person must start at state_version=0"
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_get_opportunity_state_returns_state_version(fresh_db):
+    """get_opportunity_state() must return state_version."""
+    from src.services.state_engine import get_opportunity_state
+
+    fresh_db.execute(text("""
+        INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
+        VALUES (gen_random_uuid(), 'identified', 'test')
+    """))
+    person_id = fresh_db.execute(
+        text("SELECT person_id::text FROM fa_max_persons ORDER BY created_at DESC LIMIT 1")
+    ).scalar()
+    fresh_db.execute(
+        text("""
+            INSERT INTO fa_max_opportunities
+                (person_id, opportunity_type, current_stage, source)
+            VALUES (:pid ::uuid, 'acquisition', 'new', 'test')
+        """),
+        {"pid": person_id},
+    )
+    opp_id = fresh_db.execute(
+        text("SELECT opportunity_id::text FROM fa_max_opportunities ORDER BY created_at DESC LIMIT 1")
+    ).scalar()
+
+    result = get_opportunity_state(session=fresh_db, opportunity_id=opp_id)
+    assert result is not None
+    assert "state_version" in result
+    assert result["state_version"] == 0
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_transition_increments_state_version(fresh_db):
+    """A successful transition() must increment state_version by 1."""
+    from src.services.state_engine import (
+        TransitionOutcome, ensure_entity_registry,
+        get_person_state, make_idempotency_key, transition,
+    )
+
+    fresh_db.execute(text("""
+        INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
+        VALUES (gen_random_uuid(), 'identified', 'test')
+    """))
+    person_id = fresh_db.execute(
+        text("SELECT person_id::text FROM fa_max_persons ORDER BY created_at DESC LIMIT 1")
+    ).scalar()
+    entity_uuid = ensure_entity_registry(session=fresh_db, entity_type="person", native_id=person_id)
+
+    state_before = get_person_state(session=fresh_db, person_id=person_id)
+    assert state_before["state_version"] == 0
+
+    ikey = make_idempotency_key(entity_uuid, "identified", "enriched", "agent:test", epoch_minute=700)
+    with patch("src.services.state_engine._acquire_pg_advisory_lock"):
+        result = transition(
+            session=fresh_db, entity_type="person", entity_uuid=entity_uuid,
+            from_state="identified", to_state="enriched", actor="agent:test",
+            source_component="test", idempotency_key=ikey,
+            state_version=0,
+            acquire_redis_lock=False, validate_allowed_next=True,
+        )
+
+    assert result.outcome == TransitionOutcome.succeeded
+    state_after = get_person_state(session=fresh_db, person_id=person_id)
+    assert state_after["state_version"] == 1, "state_version must be incremented after transition"
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_transition_stale_state_version_returns_already_advanced(fresh_db):
+    """A transition with a stale state_version (CAS mismatch) must return
+    already_advanced — this prevents two concurrent callers both reading
+    version=0 from writing to the same entity."""
+    from src.services.state_engine import (
+        TransitionOutcome, ensure_entity_registry,
+        make_idempotency_key, transition,
+    )
+
+    fresh_db.execute(text("""
+        INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
+        VALUES (gen_random_uuid(), 'identified', 'test')
+    """))
+    person_id = fresh_db.execute(
+        text("SELECT person_id::text FROM fa_max_persons ORDER BY created_at DESC LIMIT 1")
+    ).scalar()
+    entity_uuid = ensure_entity_registry(session=fresh_db, entity_type="person", native_id=person_id)
+
+    # First transition: version 0 -> 1 (succeeds)
+    ikey1 = make_idempotency_key(entity_uuid, "identified", "enriched", "agent:test", epoch_minute=701)
+    with patch("src.services.state_engine._acquire_pg_advisory_lock"):
+        r1 = transition(
+            session=fresh_db, entity_type="person", entity_uuid=entity_uuid,
+            from_state="identified", to_state="enriched", actor="agent:test",
+            source_component="test", idempotency_key=ikey1,
+            state_version=0,  # correct
+            acquire_redis_lock=False, validate_allowed_next=True,
+        )
+    assert r1.outcome == TransitionOutcome.succeeded
+
+    # Second transition: tries version 0 again — stale, must fail
+    ikey2 = make_idempotency_key(entity_uuid, "enriched", "contacted", "agent:test", epoch_minute=702)
+    with patch("src.services.state_engine._acquire_pg_advisory_lock"):
+        r2 = transition(
+            session=fresh_db, entity_type="person", entity_uuid=entity_uuid,
+            from_state="enriched", to_state="contacted", actor="agent:test",
+            source_component="test", idempotency_key=ikey2,
+            state_version=0,  # stale — real version is now 1
+            acquire_redis_lock=False, validate_allowed_next=True,
+        )
+    assert r2.outcome == TransitionOutcome.already_advanced, (
+        "Stale state_version must produce already_advanced — "
+        "prevents two callers with the same stale read from both applying"
+    )
+
+
+# --- SOT lifecycle edges -------------------------------------------------------
+
+@pytest.mark.usefixtures("fresh_db")
+def test_sot_forward_chain_transitions_are_valid(fresh_db):
+    """Every forward step in the SOT 12-stage chain is listed in allowed_next."""
+    from src.services.state_engine import (
+        TransitionOutcome, ensure_entity_registry,
+        get_person_state, make_idempotency_key, transition,
+    )
+
+    forward_chain = [
+        "identified", "enriched", "contacted", "engaged", "qualified",
+        "portal_started", "application_submitted", "term_sheet_issued",
+        "locked", "funded", "matured", "repeat",
+    ]
+
+    fresh_db.execute(text("""
+        INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
+        VALUES (gen_random_uuid(), 'identified', 'test')
+    """))
+    person_id = fresh_db.execute(
+        text("SELECT person_id::text FROM fa_max_persons ORDER BY created_at DESC LIMIT 1")
+    ).scalar()
+    entity_uuid = ensure_entity_registry(session=fresh_db, entity_type="person", native_id=person_id)
+
+    with patch("src.services.state_engine._acquire_pg_advisory_lock"):
+        for i in range(len(forward_chain) - 1):
+            from_s = forward_chain[i]
+            to_s = forward_chain[i + 1]
+            sv = get_person_state(session=fresh_db, person_id=person_id)["state_version"]
+            ikey = make_idempotency_key(entity_uuid, from_s, to_s, "agent:test", epoch_minute=800 + i)
+            result = transition(
+                session=fresh_db, entity_type="person", entity_uuid=entity_uuid,
+                from_state=from_s, to_state=to_s, actor="agent:test",
+                source_component="test", idempotency_key=ikey,
+                state_version=sv,
+                acquire_redis_lock=False, validate_allowed_next=True,
+            )
+            assert result.outcome == TransitionOutcome.succeeded, (
+                f"Forward step {from_s} -> {to_s} must be allowed by SOT config, got {result.outcome}"
+            )
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_sot_repeat_to_engaged_backward_edge_is_valid(fresh_db):
+    """repeat -> engaged is the one explicit backward edge in the SOT."""
+    from src.services.state_engine import (
+        TransitionOutcome, ensure_entity_registry,
+        make_idempotency_key, transition,
+    )
+
+    fresh_db.execute(text("""
+        INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
+        VALUES (gen_random_uuid(), 'repeat', 'test')
+    """))
+    person_id = fresh_db.execute(
+        text("SELECT person_id::text FROM fa_max_persons ORDER BY created_at DESC LIMIT 1")
+    ).scalar()
+    entity_uuid = ensure_entity_registry(session=fresh_db, entity_type="person", native_id=person_id)
+
+    ikey = make_idempotency_key(entity_uuid, "repeat", "engaged", "agent:test", epoch_minute=850)
+    with patch("src.services.state_engine._acquire_pg_advisory_lock"):
+        result = transition(
+            session=fresh_db, entity_type="person", entity_uuid=entity_uuid,
+            from_state="repeat", to_state="engaged", actor="agent:test",
+            source_component="test", idempotency_key=ikey,
+            state_version=0,
+            acquire_redis_lock=False, validate_allowed_next=True,
+        )
+    assert result.outcome == TransitionOutcome.succeeded, (
+        "repeat -> engaged is an explicit backward edge in SOT and must be allowed"
+    )
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_admin_exceptional_jump_requires_reason_in_context(fresh_db):
+    """validate_allowed_next=False (admin exceptional jump) requires actor to
+    be admin/josh AND context['reason'] to be set — both gates must be checked."""
+    from src.services.state_engine import (
+        TransitionOutcome, ensure_entity_registry,
+        make_idempotency_key, transition,
+    )
+
+    fresh_db.execute(text("""
+        INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
+        VALUES (gen_random_uuid(), 'identified', 'test')
+    """))
+    person_id = fresh_db.execute(
+        text("SELECT person_id::text FROM fa_max_persons ORDER BY created_at DESC LIMIT 1")
+    ).scalar()
+    entity_uuid = ensure_entity_registry(session=fresh_db, entity_type="person", native_id=person_id)
+
+    def _do(actor, context, epoch_minute):
+        ikey = make_idempotency_key(entity_uuid, "identified", "funded", actor, epoch_minute=epoch_minute)
+        with patch("src.services.state_engine._acquire_pg_advisory_lock"):
+            return transition(
+                session=fresh_db, entity_type="person", entity_uuid=entity_uuid,
+                from_state="identified", to_state="funded", actor=actor,
+                source_component="test", idempotency_key=ikey,
+                context=context,
+                acquire_redis_lock=False, validate_allowed_next=False,
+            )
+
+    # Missing reason — must reject
+    r = _do("user:admin", {}, 900)
+    assert r.outcome == TransitionOutcome.invalid_transition, (
+        "Admin exceptional jump without reason in context must be rejected"
+    )
+
+    # Non-admin actor with reason — must reject
+    r = _do("agent:cora", {"reason": "test"}, 901)
+    assert r.outcome == TransitionOutcome.invalid_transition, (
+        "Non-admin actor must not be allowed to bypass allowed_next"
+    )
+
+    # Admin with reason — must succeed
+    r = _do("user:admin", {"reason": "manual correction"}, 902)
+    assert r.outcome == TransitionOutcome.succeeded, (
+        "Admin actor with reason in context must be allowed for exceptional jumps"
+    )
+
+
+# --- Partner -------------------------------------------------------------------
+
+@pytest.mark.usefixtures("fresh_db")
+def test_partner_transition_identified_to_active(fresh_db):
+    """transition() with entity_type='partner' succeeds for identified -> active."""
+    from src.services.state_engine import (
+        TransitionOutcome, ensure_entity_registry,
+        make_idempotency_key, transition,
+    )
+
+    fresh_db.execute(text("""
+        INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
+        VALUES (gen_random_uuid(), 'identified', 'test')
+    """))
+    person_id = fresh_db.execute(
+        text("SELECT person_id::text FROM fa_max_persons ORDER BY created_at DESC LIMIT 1")
+    ).scalar()
+
+    fresh_db.execute(
+        text("""
+            INSERT INTO fa_max_partners (person_id, partner_class, status, source)
+            VALUES (:pid ::uuid, 'realtor', 'identified', 'test')
+        """),
+        {"pid": person_id},
+    )
+    partner_id = fresh_db.execute(
+        text("SELECT partner_id::text FROM fa_max_partners ORDER BY created_at DESC LIMIT 1")
+    ).scalar()
+
+    entity_uuid = ensure_entity_registry(session=fresh_db, entity_type="partner", native_id=partner_id)
+
+    ikey = make_idempotency_key(entity_uuid, "identified", "active", "agent:test", epoch_minute=1000)
+    with patch("src.services.state_engine._acquire_pg_advisory_lock"):
+        result = transition(
+            session=fresh_db, entity_type="partner", entity_uuid=entity_uuid,
+            from_state="identified", to_state="active", actor="agent:test",
+            source_component="test", idempotency_key=ikey,
+            state_version=0,
+            acquire_redis_lock=False, validate_allowed_next=True,
+        )
+
+    assert result.outcome == TransitionOutcome.succeeded
+    status = fresh_db.execute(
+        text("SELECT status FROM fa_max_partners WHERE partner_id = :pid ::uuid"),
+        {"pid": partner_id},
+    ).scalar()
+    assert status == "active"
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_partner_transition_invalid_rejects(fresh_db):
+    """identified -> inactive is not a valid partner transition."""
+    from src.services.state_engine import (
+        TransitionOutcome, ensure_entity_registry,
+        make_idempotency_key, transition,
+    )
+
+    fresh_db.execute(text("""
+        INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
+        VALUES (gen_random_uuid(), 'identified', 'test')
+    """))
+    person_id = fresh_db.execute(
+        text("SELECT person_id::text FROM fa_max_persons ORDER BY created_at DESC LIMIT 1")
+    ).scalar()
+    fresh_db.execute(
+        text("""
+            INSERT INTO fa_max_partners (person_id, partner_class, status, source)
+            VALUES (:pid ::uuid, 'wholesaler', 'identified', 'test')
+        """),
+        {"pid": person_id},
+    )
+    partner_id = fresh_db.execute(
+        text("SELECT partner_id::text FROM fa_max_partners ORDER BY created_at DESC LIMIT 1")
+    ).scalar()
+    entity_uuid = ensure_entity_registry(session=fresh_db, entity_type="partner", native_id=partner_id)
+
+    ikey = make_idempotency_key(entity_uuid, "identified", "inactive", "agent:test", epoch_minute=1001)
+    with patch("src.services.state_engine._acquire_pg_advisory_lock"):
+        result = transition(
+            session=fresh_db, entity_type="partner", entity_uuid=entity_uuid,
+            from_state="identified", to_state="inactive", actor="agent:test",
+            source_component="test", idempotency_key=ikey,
+            acquire_redis_lock=False, validate_allowed_next=True,
+        )
+
+    assert result.outcome == TransitionOutcome.invalid_transition
+
+
+# --- Interaction (write-once) --------------------------------------------------
+
+@pytest.mark.usefixtures("fresh_db")
+def test_write_interaction_creates_row(fresh_db):
+    """write_interaction() inserts a row and returns a valid UUID."""
+    from src.services.state_engine import write_interaction
+
+    fresh_db.execute(text("""
+        INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
+        VALUES (gen_random_uuid(), 'identified', 'test')
+    """))
+    person_id = fresh_db.execute(
+        text("SELECT person_id::text FROM fa_max_persons ORDER BY created_at DESC LIMIT 1")
+    ).scalar()
+
+    interaction_id = write_interaction(
+        session=fresh_db,
+        person_id=person_id,
+        channel="email",
+        direction="outbound",
+        actor="agent:cora",
+        approved_bool=True,
+        autonomy_tier_at_time="A",
+        body_redacted="initial outreach",
+    )
+
+    assert interaction_id is not None
+    row = fresh_db.execute(
+        text("""
+            SELECT person_id::text, channel, direction, approved_bool,
+                   autonomy_tier_at_time, body_redacted, seq
+            FROM fa_max_interactions
+            WHERE interaction_id = :iid ::uuid
+        """),
+        {"iid": interaction_id},
+    ).fetchone()
+
+    assert row is not None
+    assert row.person_id == person_id
+    assert row.channel == "email"
+    assert row.direction == "outbound"
+    assert row.approved_bool is True
+    assert row.autonomy_tier_at_time == "A"
+    assert row.seq is not None
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_interaction_immutability_trigger_blocks_update(fresh_db):
+    """DB trigger must block direct UPDATE on fa_max_interactions."""
+    from src.services.state_engine import write_interaction
+
+    fresh_db.execute(text("""
+        INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
+        VALUES (gen_random_uuid(), 'identified', 'test')
+    """))
+    person_id = fresh_db.execute(
+        text("SELECT person_id::text FROM fa_max_persons ORDER BY created_at DESC LIMIT 1")
+    ).scalar()
+
+    interaction_id = write_interaction(
+        session=fresh_db, person_id=person_id, channel="sms",
+        direction="inbound", actor="system:telnyx",
+    )
+
+    with pytest.raises(Exception, match="fa_max"):
+        fresh_db.execute(
+            text("""
+                UPDATE fa_max_interactions
+                SET channel = 'email'
+                WHERE interaction_id = :iid ::uuid
+            """),
+            {"iid": interaction_id},
+        )
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_database_guards_block_event_mutation_and_direct_state_write(fresh_db):
+    """The database enforces both halves of the single-write-path contract."""
+    from src.services.state_engine import ensure_entity_registry, transition
+
+    person_id = fresh_db.execute(text("""
+        INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
+        VALUES (gen_random_uuid(), 'identified', 'test')
+        RETURNING person_id::text
+    """)).scalar_one()
+    entity_uuid = ensure_entity_registry(
+        session=fresh_db, entity_type="person", native_id=person_id
+    )
+    result = transition(
+        session=fresh_db,
+        entity_type="person",
+        entity_uuid=entity_uuid,
+        from_state="identified",
+        to_state="enriched",
+        actor="agent:test",
+        source_component="test",
+        idempotency_key=f"guard-{uuid.uuid4()}",
+        state_version=0,
+        acquire_redis_lock=False,
+    )
+    assert result.outcome.value == "succeeded"
+
+    for statement, params in (
+        (
+            "UPDATE fa_max_state_transition_events SET actor = 'tampered' "
+            "WHERE event_id = :id ::uuid",
+            {"id": result.event_id},
+        ),
+        (
+            "DELETE FROM fa_max_state_transition_events WHERE event_id = :id ::uuid",
+            {"id": result.event_id},
+        ),
+        (
+            "UPDATE fa_max_persons SET lifecycle_state = 'contacted' "
+            "WHERE person_id = :id ::uuid",
+            {"id": person_id},
+        ),
+    ):
+        savepoint = fresh_db.begin_nested()
+        with pytest.raises(Exception, match="fa_max"):
+            fresh_db.execute(text(statement), params)
+        savepoint.rollback()
+
+
+# --- Property association (temporal) ------------------------------------------
+
+@pytest.mark.usefixtures("fresh_db")
+def test_write_and_close_property_association(fresh_db):
+    """write_property_association opens a current association (valid_to=NULL)
+    and close_property_association sets valid_to."""
+    from src.services.state_engine import (
+        close_property_association, write_property_association,
+    )
+
+    fresh_db.execute(text("""
+        INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
+        VALUES (gen_random_uuid(), 'identified', 'test')
+    """))
+    person_id = fresh_db.execute(
+        text("SELECT person_id::text FROM fa_max_persons ORDER BY created_at DESC LIMIT 1")
+    ).scalar()
+
+    # Insert a minimal property row so the FK is satisfied.
+    prop_id = fresh_db.execute(
+        text("""
+            INSERT INTO properties (parcel_id, source_row_hash, needs_rescore, created_at, updated_at)
+            VALUES ('TEST-PROP-99', 'abc123', false, NOW(), NOW())
+            ON CONFLICT (parcel_id) DO NOTHING
+            RETURNING id
+        """)
+    ).scalar()
+    if prop_id is None:
+        prop_id = fresh_db.execute(
+            text("SELECT id FROM properties WHERE parcel_id = 'TEST-PROP-99'")
+        ).scalar()
+
+    assoc_id = write_property_association(
+        session=fresh_db,
+        person_id=person_id,
+        property_id=prop_id,
+        role="subject",
+        source="test",
+    )
+    assert assoc_id is not None
+
+    row = fresh_db.execute(
+        text("SELECT valid_to FROM fa_max_property_associations WHERE id = :id"),
+        {"id": assoc_id},
+    ).fetchone()
+    assert row.valid_to is None, "New association must be open (valid_to IS NULL)"
+
+    closed = close_property_association(session=fresh_db, association_id=assoc_id)
+    assert closed is True
+
+    row2 = fresh_db.execute(
+        text("SELECT valid_to FROM fa_max_property_associations WHERE id = :id"),
+        {"id": assoc_id},
+    ).fetchone()
+    assert row2.valid_to is not None, "Closed association must have valid_to set"
+
+
+# --- Unified timeline -----------------------------------------------------------
+
+@pytest.mark.usefixtures("fresh_db")
+def test_get_borrower_timeline_merges_all_event_kinds(fresh_db):
+    """get_borrower_timeline() returns state_transition, interaction, and
+    property_association events for the same person in one paginated result."""
+    from src.services.state_engine import (
+        ensure_entity_registry, get_borrower_timeline,
+        make_idempotency_key, transition, write_interaction,
+        write_property_association,
+    )
+
+    fresh_db.execute(text("""
+        INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
+        VALUES (gen_random_uuid(), 'identified', 'test')
+    """))
+    person_id = fresh_db.execute(
+        text("SELECT person_id::text FROM fa_max_persons ORDER BY created_at DESC LIMIT 1")
+    ).scalar()
+    entity_uuid = ensure_entity_registry(session=fresh_db, entity_type="person", native_id=person_id)
+
+    # 1. State transition
+    ikey = make_idempotency_key(entity_uuid, "identified", "enriched", "agent:test", epoch_minute=1100)
+    with patch("src.services.state_engine._acquire_pg_advisory_lock"):
+        transition(
+            session=fresh_db, entity_type="person", entity_uuid=entity_uuid,
+            from_state="identified", to_state="enriched", actor="agent:test",
+            source_component="test", idempotency_key=ikey,
+            state_version=0,
+            acquire_redis_lock=False, validate_allowed_next=True,
+        )
+
+    # 2. Interaction
+    write_interaction(
+        session=fresh_db, person_id=person_id, channel="email",
+        direction="outbound", actor="agent:cora",
+    )
+
+    # 3. Property association
+    prop_id = fresh_db.execute(
+        text("""
+            INSERT INTO properties (parcel_id, source_row_hash, needs_rescore, created_at, updated_at)
+            VALUES ('TIMELINE-TEST-PROP', 'xyz', false, NOW(), NOW())
+            ON CONFLICT (parcel_id) DO NOTHING
+            RETURNING id
+        """)
+    ).scalar()
+    if prop_id is None:
+        prop_id = fresh_db.execute(
+            text("SELECT id FROM properties WHERE parcel_id = 'TIMELINE-TEST-PROP'")
+        ).scalar()
+    write_property_association(
+        session=fresh_db, person_id=person_id, property_id=prop_id, role="subject",
+    )
+
+    timeline = get_borrower_timeline(session=fresh_db, person_id=person_id)
+    assert timeline["has_more"] is False
+
+    event_kinds = {e["event_kind"] for e in timeline["events"]}
+    assert "state_transition" in event_kinds, "Timeline must include state_transition events"
+    assert "interaction" in event_kinds, "Timeline must include interaction events"
+    assert "property_association" in event_kinds, "Timeline must include property_association events"
+    assert len(timeline["events"]) == 3
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_get_borrower_timeline_pagination(fresh_db):
+    """Timeline cursor pagination works: after_seq=None starts from beginning,
+    next_cursor continues from where the last page left off."""
+    from src.services.state_engine import (
+        ensure_entity_registry, get_borrower_timeline,
+        make_idempotency_key, transition,
+    )
+
+    fresh_db.execute(text("""
+        INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
+        VALUES (gen_random_uuid(), 'identified', 'test')
+    """))
+    person_id = fresh_db.execute(
+        text("SELECT person_id::text FROM fa_max_persons ORDER BY created_at DESC LIMIT 1")
+    ).scalar()
+    entity_uuid = ensure_entity_registry(session=fresh_db, entity_type="person", native_id=person_id)
+
+    # Write 4 state-transition events
+    states = ["identified", "enriched", "contacted", "engaged", "qualified"]
+    with patch("src.services.state_engine._acquire_pg_advisory_lock"):
+        for i in range(len(states) - 1):
+            ikey = make_idempotency_key(entity_uuid, states[i], states[i+1], "agent:test", epoch_minute=1200+i)
+            transition(
+                session=fresh_db, entity_type="person", entity_uuid=entity_uuid,
+                from_state=states[i], to_state=states[i+1], actor="agent:test",
+                source_component="test", idempotency_key=ikey,
+                state_version=i,
+                acquire_redis_lock=False, validate_allowed_next=True,
+            )
+
+    # Page through with limit=2
+    all_events = []
+    cursor = None
+    pages = 0
+    while True:
+        page = get_borrower_timeline(session=fresh_db, person_id=person_id, limit=2, after_seq=cursor)
+        all_events.extend(page["events"])
+        pages += 1
+        assert pages < 10, "Pagination loop did not terminate"
+        if not page["has_more"]:
+            assert page["next_cursor"] is None
+            break
+        cursor = page["next_cursor"]
+
+    assert len(all_events) == 4, f"All 4 events must be reachable via pagination, got {len(all_events)}"
+    assert pages == 2  # 2 + 2
+
+
+# --- Work queue ----------------------------------------------------------------
+
+@pytest.mark.usefixtures("fresh_db")
+def test_enqueue_and_claim_work_item(fresh_db):
+    """enqueue_work_item + claim_next_work_item round-trip."""
+    from src.services.state_engine import claim_next_work_item, enqueue_work_item
+
+    work_item_id = enqueue_work_item(
+        session=fresh_db,
+        queue_name="test_queue",
+        payload={"task": "enrich", "attempt": 1},
+        idempotency_key="test-enqueue-1",
+    )
+    assert work_item_id is not None
+
+    item = claim_next_work_item(
+        session=fresh_db, queue_name="test_queue", worker_id="worker:1", lease_seconds=60,
+    )
+    assert item is not None
+    assert item["work_item_id"] == work_item_id
+    assert item["status"] == "claimed"
+    assert item["worker_id"] == "worker:1"
+    assert item["attempt_count"] == 1
+    assert item["lease_expires_at"] is not None
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_claim_returns_none_when_queue_empty(fresh_db):
+    """claim_next_work_item returns None when no work is available."""
+    from src.services.state_engine import claim_next_work_item
+
+    item = claim_next_work_item(
+        session=fresh_db, queue_name="empty_queue", worker_id="worker:1",
+    )
+    assert item is None
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_claim_skip_locked_avoids_double_claim(fresh_db):
+    """A claimed item is not claimed again by a second claim call in the
+    same session (FOR UPDATE SKIP LOCKED behavior)."""
+    from src.services.state_engine import claim_next_work_item, enqueue_work_item
+
+    enqueue_work_item(
+        session=fresh_db, queue_name="skip_test", payload={"x": 1}, idempotency_key="skip-1",
+    )
+
+    item1 = claim_next_work_item(session=fresh_db, queue_name="skip_test", worker_id="worker:A")
+    assert item1 is not None
+
+    # The claimed item is locked — a second claim in the same session skips it.
+    item2 = claim_next_work_item(session=fresh_db, queue_name="skip_test", worker_id="worker:B")
+    assert item2 is None, "Claimed item must be skipped via SKIP LOCKED"
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_reclaim_expired_returns_items_to_available(fresh_db):
+    """reclaim_expired_work_items returns expired claimed items to available."""
+    from src.services.state_engine import enqueue_work_item, reclaim_expired_work_items
+
+    # Manually insert a claimed item with an already-expired lease.
+    fresh_db.execute(text("""
+        INSERT INTO fa_max_work_queue
+            (queue_name, payload, status, available_at, claimed_at,
+             lease_expires_at, worker_id, attempt_count)
+        VALUES
+            ('reclaim_test', '{}'::jsonb, 'claimed',
+             NOW() - INTERVAL '10 minutes',
+             NOW() - INTERVAL '10 minutes',
+             NOW() - INTERVAL '1 second',
+             'dead_worker', 1)
+    """))
+
+    reclaimed = reclaim_expired_work_items(session=fresh_db, queue_name="reclaim_test")
+    assert reclaimed == 1
+
+    row = fresh_db.execute(
+        text("SELECT status, worker_id, lease_expires_at FROM fa_max_work_queue WHERE queue_name = 'reclaim_test'")
+    ).fetchone()
+    assert row.status == "available"
+    assert row.worker_id is None
+    assert row.lease_expires_at is None
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_work_queue_idempotency_key_prevents_duplicate_enqueue(fresh_db):
+    """enqueue_work_item with the same idempotency_key returns None on second call."""
+    from src.services.state_engine import enqueue_work_item
+
+    id1 = enqueue_work_item(
+        session=fresh_db, queue_name="idem_test", payload={"x": 1},
+        idempotency_key="idem-key-42",
+    )
+    assert id1 is not None
+
+    id2 = enqueue_work_item(
+        session=fresh_db, queue_name="idem_test", payload={"x": 1},
+        idempotency_key="idem-key-42",
+    )
+    assert id2 is None, "Duplicate enqueue with same idempotency_key must return None"
+
+    count = fresh_db.execute(
+        text("SELECT COUNT(*) FROM fa_max_work_queue WHERE idempotency_key = 'idem-key-42'")
+    ).scalar()
+    assert count == 1
+
+
+def test_connection_loss_work_queue_recovered(pg_engine):
+    """WP-1 Done-When: worker killed holding a work queue lease — a second
+    worker calls reclaim_expired_work_items and claims the item exactly once.
+
+    Two real connections: worker A claims an item, raw-closes its connection
+    (SIGKILL simulation). The item's lease_expires_at is set in the past
+    artificially so reclaim_expired runs immediately. Worker B reclaims and
+    completes the item.
+    """
+    if pg_engine is None:
+        pytest.skip("DATABASE_URL not configured — skipping real-connection test")
+
+    from sqlalchemy.orm import Session as SASession
+    from src.services.state_engine import (
+        claim_next_work_item, complete_work_item,
+        enqueue_work_item, reclaim_expired_work_items,
+    )
+
+    # Setup: enqueue one work item on its own committed connection.
+    unique_key = f"kill-test-item-{uuid.uuid4()}"
+    setup_conn = pg_engine.connect()
+    setup_trans = setup_conn.begin()
+    setup_session = SASession(bind=setup_conn)
+    work_item_id = enqueue_work_item(
+        session=setup_session,
+        queue_name="kill_test",
+        payload={"task": "do_thing"},
+        idempotency_key=unique_key,
+    )
+    assert work_item_id is not None
+    setup_session.close()
+    setup_trans.commit()
+    setup_conn.close()
+
+    # Worker A: claim the item, then get killed.
+    conn_a = pg_engine.connect()
+    trans_a = conn_a.begin()
+    session_a = SASession(bind=conn_a)
+    item_a = claim_next_work_item(
+        session=session_a, queue_name="kill_test", worker_id="worker:killed",
+    )
+    assert item_a is not None
+    assert item_a["work_item_id"] == work_item_id
+
+    # Artificially expire the lease so reclaim runs immediately.
+    session_a.execute(
+        text("""
+            UPDATE fa_max_work_queue
+            SET lease_expires_at = NOW() - INTERVAL '1 second'
+            WHERE work_item_id = :wid ::uuid
+        """),
+        {"wid": work_item_id},
+    )
+    trans_a.commit()  # commit the claim + lease expiry, then kill
+
+    # Kill: raw DBAPI close (no commit/rollback on the next operation).
+    conn_a.connection.close()
+
+    # Worker B: reclaim the expired item and complete it.
+    conn_b = pg_engine.connect()
+    trans_b = conn_b.begin()
+    session_b = SASession(bind=conn_b)
+
+    reclaimed = reclaim_expired_work_items(session=session_b, queue_name="kill_test")
+    assert reclaimed == 1, "Expired item must be returned to available"
+
+    item_b = claim_next_work_item(
+        session=session_b, queue_name="kill_test", worker_id="worker:b",
+    )
+    assert item_b is not None, "Worker B must claim the reclaimed item"
+    assert item_b["work_item_id"] == work_item_id
+    assert item_b["attempt_count"] == 3, (
+        "attempt_count reflects claim A, expired-lease reclaim, and claim B"
+    )
+
+    done = complete_work_item(
+        session=session_b, work_item_id=work_item_id, worker_id="worker:b",
+    )
+    assert done is True
+    trans_b.commit()
+
+    # Verify final status.
+    conn_verify = pg_engine.connect()
+    row = conn_verify.execute(
+        text("SELECT status, done_at FROM fa_max_work_queue WHERE work_item_id = :wid ::uuid"),
+        {"wid": work_item_id},
+    ).fetchone()
+    conn_verify.close()
+    assert row.status == "done"
+    assert row.done_at is not None
+
+    conn_b.close()
+
+
+def test_real_worker_process_kill_is_recovered_exactly_once(pg_engine):
+    """A terminated worker's committed lease is reclaimed and its persisted
+    transition idempotency key is applied exactly once by a new worker."""
+    if pg_engine is None:
+        pytest.skip("DATABASE_URL not configured")
+
+    from sqlalchemy.orm import Session as SASession
+    from src.services.state_engine import (
+        claim_next_work_item,
+        complete_work_item,
+        enqueue_work_item,
+        ensure_entity_registry,
+        reclaim_expired_work_items,
+        transition,
+        TransitionOutcome,
+    )
+
+    queue_name = f"process-kill-{uuid.uuid4()}"
+    transition_key = f"process-kill-transition-{uuid.uuid4()}"
+    with pg_engine.begin() as connection:
+        with SASession(bind=connection) as session:
+            person_id = session.execute(text("""
+                INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
+                VALUES (gen_random_uuid(), 'identified', 'test')
+                RETURNING person_id::text
+            """)).scalar_one()
+            entity_uuid = ensure_entity_registry(
+                session=session, entity_type="person", native_id=person_id
+            )
+            work_item_id = enqueue_work_item(
+                session=session,
+                queue_name=queue_name,
+                person_id=person_id,
+                idempotency_key=f"work-{transition_key}",
+                payload={
+                    "entity_type": "person",
+                    "entity_uuid": entity_uuid,
+                    "from_state": "identified",
+                    "to_state": "enriched",
+                    "state_version": 0,
+                    "idempotency_key": transition_key,
+                },
+            )
+    assert work_item_id is not None
+
+    context = multiprocessing.get_context("spawn")
+    ready_queue = context.Queue()
+    process = context.Process(
+        target=_claim_work_and_wait,
+        args=(pg_engine.url.render_as_string(hide_password=False), queue_name, ready_queue),
+    )
+    process.start()
+    claimed_id = ready_queue.get(timeout=10)
+    assert claimed_id == work_item_id
+    process.terminate()
+    process.join(timeout=10)
+    assert not process.is_alive()
+
+    # The killed process committed a one-second lease. Wait for natural
+    # expiry so recovery proves the production lease path, not a test edit.
+    time.sleep(1.2)
+
+    with pg_engine.begin() as connection:
+        with SASession(bind=connection) as session:
+            assert reclaim_expired_work_items(
+                session=session, queue_name=queue_name
+            ) == 1
+            item = claim_next_work_item(
+                session=session,
+                queue_name=queue_name,
+                worker_id="worker:replacement",
+            )
+            assert item is not None
+            payload = item["payload"]
+            result = transition(
+                session=session,
+                entity_type=payload["entity_type"],
+                entity_uuid=payload["entity_uuid"],
+                from_state=payload["from_state"],
+                to_state=payload["to_state"],
+                actor="system:recovery-worker",
+                source_component="tests.recovery",
+                idempotency_key=payload["idempotency_key"],
+                state_version=payload["state_version"],
+                acquire_redis_lock=False,
+            )
+            assert result.outcome == TransitionOutcome.succeeded
+            assert complete_work_item(
+                session=session,
+                work_item_id=work_item_id,
+                worker_id="worker:replacement",
+            )
+
+    with pg_engine.connect() as connection:
+        final_state = connection.execute(
+            text("SELECT lifecycle_state FROM fa_max_persons WHERE person_id = :pid ::uuid"),
+            {"pid": person_id},
+        ).scalar_one()
+        event_count = connection.execute(
+            text("SELECT count(*) FROM fa_max_state_transition_events WHERE idempotency_key = :key"),
+            {"key": transition_key},
+        ).scalar_one()
+    assert final_state == "enriched"
+    assert event_count == 1
+
+
+# --- Compliance structural checks (Category 13) --------------------------------
+
+def test_no_financial_data_columns_on_new_wp1_tables():
+    """Structural: none of the new WP-1 tables carry borrower financial data
+    (credit score, income, bank statement, tax return, SSN)."""
+    from src.core.models import Base
+
+    financial_keywords = {"credit", "income", "bank", "tax_return", "ssn", "social_security"}
+    new_tables = [
+        "fa_max_partners",
+        "fa_max_interactions",
+        "fa_max_property_associations",
+        "fa_max_work_queue",
+    ]
+    for table_name in new_tables:
+        table = Base.metadata.tables.get(table_name)
+        assert table is not None, f"ORM table {table_name!r} must exist in metadata"
+        for col in table.columns:
+            col_lower = col.name.lower()
+            for kw in financial_keywords:
+                assert kw not in col_lower, (
+                    f"Column {table_name}.{col.name!r} appears to hold financial data "
+                    f"(keyword={kw!r}) — SOT.md prohibition"
+                )
+
+
+def test_orm_tables_have_state_version_columns():
+    """Structural: fa_max_persons and fa_max_opportunities both carry state_version."""
+    from src.core.models import Base
+
+    for table_name in ("fa_max_persons", "fa_max_opportunities"):
+        table = Base.metadata.tables[table_name]
+        col_names = {c.name for c in table.columns}
+        assert "state_version" in col_names, (
+            f"{table_name} must declare state_version column (CAS guard)"
+        )
+
+
+def test_partner_table_has_state_version():
+    """Structural: fa_max_partners carries state_version."""
+    from src.core.models import Base
+
+    table = Base.metadata.tables["fa_max_partners"]
+    col_names = {c.name for c in table.columns}
+    assert "state_version" in col_names, "fa_max_partners must have state_version"
