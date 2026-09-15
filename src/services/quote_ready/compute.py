@@ -14,8 +14,8 @@ from .models import (
     Figure,
     QuoteReadyInput,
     QuoteReadyResult,
+    default_rehab_confidence,
     min_confidence,
-    rehab_confidence,
 )
 
 _ZERO = Decimal("0")
@@ -83,17 +83,18 @@ def compute_quote_ready(inp: QuoteReadyInput) -> QuoteReadyResult:
     project_cost_val: Optional[Decimal] = None
     project_cost_conf: Optional[Confidence] = None
 
+    cost_source: Optional[str] = None
     if basis is not None and rehab_usable:
         cost = basis.value + inp.rehab_estimate  # type: ignore[operator]
         if cost > _ZERO:
+            rehab_conf = inp.rehab_confidence or default_rehab_confidence(inp.rehab_source)
             project_cost_val = cost
-            project_cost_conf = min_confidence(
-                basis.confidence, rehab_confidence(inp.rehab_source)
-            )
+            project_cost_conf = min_confidence(basis.confidence, rehab_conf)
+            cost_source = f"{basis.source}+{inp.rehab_source}"
             project_cost_fig = Figure(
                 raw=cost,
                 display=_fmt_dollars(cost),
-                source=f"{basis.source}+{inp.rehab_source}",
+                source=cost_source,
                 confidence=project_cost_conf,
             )
 
@@ -106,12 +107,16 @@ def compute_quote_ready(inp: QuoteReadyInput) -> QuoteReadyResult:
         ltc_cap = inp.max_ltc * project_cost_val
         if arv_usable:
             ltv_cap = inp.max_ltv * inp.arv  # type: ignore[operator]
-            proposed_loan_val = min(ltc_cap, ltv_cap)
-            loan_source = "min(ltc_cap,ltv_cap)"
+            if ltc_cap <= ltv_cap:
+                proposed_loan_val = ltc_cap
+                loan_source = f"ltc_cap[{cost_source}]"
+            else:
+                proposed_loan_val = ltv_cap
+                loan_source = f"ltv_cap[{inp.arv_source}]"
             proposed_loan_conf = min_confidence(project_cost_conf, inp.arv_confidence)  # type: ignore[arg-type]
         else:
             proposed_loan_val = ltc_cap
-            loan_source = "ltc_cap_only"
+            loan_source = f"ltc_cap[{cost_source}]"
             proposed_loan_conf = project_cost_conf  # type: ignore[assignment]
 
         proposed_loan_fig = Figure(
@@ -128,7 +133,7 @@ def compute_quote_ready(inp: QuoteReadyInput) -> QuoteReadyResult:
         ltc_fig = Figure(
             raw=ltc_val,
             display=_fmt_pct(ltc_val),
-            source="computed",
+            source=f"loan/[{cost_source}]",
             confidence=proposed_loan_conf,  # type: ignore[arg-type]
         )
 
@@ -139,7 +144,7 @@ def compute_quote_ready(inp: QuoteReadyInput) -> QuoteReadyResult:
         ltv_fig = Figure(
             raw=ltv_val,
             display=_fmt_pct(ltv_val),
-            source="computed",
+            source=f"loan/[{inp.arv_source}]",
             confidence=min_confidence(proposed_loan_conf, inp.arv_confidence),  # type: ignore[arg-type]
         )
 

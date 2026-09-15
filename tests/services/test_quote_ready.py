@@ -231,6 +231,64 @@ def test_rehab_override_confidence_and_source():
 
 
 # ---------------------------------------------------------------------------
+# Slice 10b — caller-supplied confidence overrides source-based default
+# ---------------------------------------------------------------------------
+
+def test_low_confidence_manual_override_not_promoted():
+    inp = QuoteReadyInput(
+        property_id="prop-010b",
+        purchase_price=Decimal("100000"),
+        rehab_estimate=Decimal("20000"),
+        rehab_source="override",
+        rehab_confidence="low",  # uncertain manual override
+        arv=Decimal("200000"),
+        max_ltc=Decimal("0.80"),
+        max_ltv=Decimal("0.70"),
+    )
+    result = compute_quote_ready(inp)
+    # override would default to high, but caller said low → not promoted
+    assert result.project_cost.confidence == "low"
+    assert result.proposed_loan.confidence == "low"
+
+
+def test_high_confidence_estimator_configurable():
+    inp = QuoteReadyInput(
+        property_id="prop-010c",
+        purchase_price=Decimal("100000"),
+        rehab_estimate=Decimal("20000"),
+        rehab_source="job_estimator",
+        rehab_confidence="high",  # strong estimator run
+        arv=Decimal("200000"),
+        max_ltc=Decimal("0.80"),
+        max_ltv=Decimal("0.70"),
+    )
+    result = compute_quote_ready(inp)
+    # estimator would default to medium, but caller said high
+    assert result.project_cost.confidence == "high"
+
+
+# ---------------------------------------------------------------------------
+# Slice 10d — ARV source is preserved through ARV-dependent figures
+# ---------------------------------------------------------------------------
+
+def test_arv_source_preserved_in_ltv_and_binding_loan():
+    inp = QuoteReadyInput(
+        property_id="prop-010d",
+        purchase_price=Decimal("300000"),
+        rehab_estimate=Decimal("50000"),
+        arv=Decimal("200000"),
+        arv_source="comp_derived",
+        max_ltc=Decimal("0.90"),  # ltc_cap = 315_000
+        max_ltv=Decimal("0.70"),  # ltv_cap = 140_000 → LTV binds
+    )
+    result = compute_quote_ready(inp)
+    # LTV binds → loan source names the ARV origin
+    assert "comp_derived" in result.proposed_loan.source
+    # ltv figure traces back to the ARV source, not a generic "computed"
+    assert "comp_derived" in result.ltv.source
+
+
+# ---------------------------------------------------------------------------
 # Slice 11 — zero ARV: not silently ignored; arv + ltv flagged missing
 # ---------------------------------------------------------------------------
 
