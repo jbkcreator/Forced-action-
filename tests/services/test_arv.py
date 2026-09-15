@@ -6,6 +6,7 @@ No DB, no network, no mocks. Fixture in, object out.
 from decimal import Decimal
 
 import pytest
+from pydantic import ValidationError
 
 from src.services.quote_ready import (
     ARVInput,
@@ -33,6 +34,9 @@ def _subject(**kwargs) -> SubjectProperty:
         county="HILLSBOROUGH",
     )
     defaults.update(kwargs)
+    # Default the after-repair target to match current condition so existing
+    # tests keep their condition-adjustment intent (delta unchanged).
+    defaults.setdefault("after_repair_condition", defaults["building_condition"])
     return SubjectProperty(**defaults)
 
 
@@ -327,3 +331,105 @@ def test_config_override_min_comps():
     assert result.arv_unknown is False
     assert result.comp_count == 1
     assert result.point == Decimal("300000")
+
+
+# ---------------------------------------------------------------------------
+# Slice 16 — ARV normalizes to AFTER-REPAIR condition, not as-is (Finding 1)
+# ---------------------------------------------------------------------------
+
+def test_arv_adjusts_toward_after_repair_condition():
+    # Distressed subject: currently condition 2, will be repaired to condition 5.
+    # Comp is a renovated sale at condition 5. ARV must value the subject at its
+    # repaired state, so the comp is adjusted UP toward after-repair (delta +3),
+    # never down toward the subject's current distressed state.
+    subject = _subject(building_condition=2, after_repair_condition=5, sqft=1500)
+    comp = _sale(10, Decimal("300000"), sqft=1500, building_condition=5)
+    result = compute_arv(_inp([comp], subject=subject))
+
+    sc = result.selected_comps[0]
+    size_normalized = sc.price_per_sqft * Decimal(subject.sqft)
+    # delta = after_repair(5) - comp(5) = 0 → no downward pull from as-is condition 2
+    assert sc.adjusted_value >= size_normalized
+    assert result.after_repair_condition == 5
+
+    # Contrast: a comp below the repaired target is adjusted UP toward it.
+    lower_comp = _sale(11, Decimal("300000"), sqft=1500, building_condition=3)
+    r2 = compute_arv(_inp([lower_comp], subject=subject))
+    sc2 = r2.selected_comps[0]
+    assert sc2.condition_adjustment > Decimal("0")  # delta = 5-3 = +2 → up
+
+
+# ---------------------------------------------------------------------------
+# Slice 17 — zero-price sales rejected as non-market (Finding 5)
+# ---------------------------------------------------------------------------
+
+def test_zero_price_comps_excluded_unknown():
+    comps = [
+        _sale(10, Decimal("0")),
+        _sale(11, Decimal("0")),
+        _sale(12, Decimal("0")),
+    ]
+    result = compute_arv(_inp(comps))
+
+    assert result.arv_unknown is True
+    assert result.comp_count == 0
+
+
+def test_mixed_zero_and_valid_uses_only_valid():
+    comps = [
+        _sale(10, Decimal("290000")),
+        _sale(11, Decimal("300000")),
+        _sale(12, Decimal("310000")),
+        _sale(13, Decimal("0")),
+        _sale(14, Decimal("0")),
+    ]
+    result = compute_arv(_inp(comps))
+
+    assert result.arv_unknown is False
+    assert result.comp_count == 3
+    assert all(sc.sale_price > Decimal("0") for sc in result.selected_comps)
+
+
+# ---------------------------------------------------------------------------
+# Slice 18 — median stays exact Decimal, no float artifact (Finding 6)
+# ---------------------------------------------------------------------------
+
+def test_median_is_exact_decimal():
+    # Two comps whose adjusted values average to a value a float round-trip would
+    # corrupt (0.1 + 0.2 → 0.30000000000000004 in float). sqft=1 for subject and
+    # comps + matching condition make adjusted_value == sale_price exactly, so the
+    # median operates on Decimal("0.10")/Decimal("0.20") directly.
+    subject = _subject(building_condition=3, after_repair_condition=3, sqft=1)
+    comps = [
+        _sale(10, Decimal("0.10"), sqft=1, building_condition=3),
+        _sale(11, Decimal("0.20"), sqft=1, building_condition=3),
+    ]
+    result = compute_arv(_inp(comps, subject=subject))
+
+    # Exact Decimal midpoint — a float round-trip would yield 0.15000000000000002.
+    assert result.point == Decimal("0.15")
+    assert result.point.normalize() == Decimal("0.15")
+
+
+# ---------------------------------------------------------------------------
+# Slice 19 — invalid ARVConfig fails fast (Finding 7)
+# ---------------------------------------------------------------------------
+
+def test_config_min_comps_zero_rejected():
+    with pytest.raises(ValidationError):
+        ARVConfig(min_comps=0)
+
+
+def test_config_extended_below_primary_rejected():
+    with pytest.raises(ValidationError):
+        ARVConfig(recency_months_primary=24, recency_months_extended=12)
+
+
+def test_config_unknown_locality_tier_rejected():
+    with pytest.raises(ValidationError):
+        ARVConfig(locality_tiers=["subdivision", "galaxy"])
+
+
+def test_config_empty_locality_tiers_rejected():
+    with pytest.raises(ValidationError):
+        ARVConfig(locality_tiers=[])

@@ -17,7 +17,8 @@ class SubjectProperty(BaseModel):
     beds: Optional[int] = None
     baths: Optional[Decimal] = None
     property_use_code: str
-    building_condition: int = Field(ge=1, le=5)
+    building_condition: int = Field(ge=1, le=5)  # current/as-is condition
+    after_repair_condition: int = Field(ge=1, le=5)  # target repaired condition; ARV normalizes to this
     subdivision: Optional[str] = None
     hcpa_neighborhood_code: Optional[str] = None
     zip: Optional[str] = None
@@ -72,6 +73,7 @@ class ARVResult(BaseModel):
     weak_comp: bool = True
     locality_tier: LocalityTier = "none"
     recency_window_months: int = 12
+    after_repair_condition: Optional[int] = None
     selected_comps: list[SelectedComp] = Field(default_factory=list)
     arv_unknown: bool = False
     unknown_reason: Optional[str] = None

@@ -62,6 +62,8 @@ def _filter_comps(
     for c in candidates:
         if c.property_id == subject.property_id:
             continue
+        if c.sale_price <= _ZERO:
+            continue
         if c.qual_cd in config.excluded_qual_codes:
             continue
         if c.property_use_code != subject.property_use_code:
@@ -83,7 +85,7 @@ def _adjust_comp(comp: CandidateSale, subject: SubjectProperty, tier: str, confi
     size_normalized = price_per_sqft * Decimal(subject.sqft)
     sqft_adjustment = size_normalized - comp.sale_price
 
-    condition_delta = subject.building_condition - comp.building_condition
+    condition_delta = subject.after_repair_condition - comp.building_condition
     condition_adjustment = size_normalized * (Decimal(condition_delta) * config.condition_adjustment_per_step)
     adjusted_value = size_normalized + condition_adjustment
 
@@ -106,7 +108,7 @@ def _derive_range(adjusted_values: list[Decimal]) -> tuple[Decimal, Decimal, Dec
     """Return (low, point, high) from adjusted comp values."""
     sorted_vals = sorted(adjusted_values)
     n = len(sorted_vals)
-    point = Decimal(str(median([float(v) for v in sorted_vals])))
+    point = median(sorted_vals)
 
     if n < 4:
         low = sorted_vals[0]
@@ -181,6 +183,7 @@ def compute_arv(inp: ARVInput) -> ARVResult:
                 unknown_reason="no_qualified_comps",
                 locality_tier="none",
                 recency_window_months=config.recency_months_extended,
+                after_repair_condition=subject.after_repair_condition,
             )
         best = (fallback, widest_tier, config.recency_months_extended)
 
@@ -204,6 +207,7 @@ def compute_arv(inp: ARVInput) -> ARVResult:
         weak_comp=weak_comp,
         locality_tier=locality_tier,
         recency_window_months=window,
+        after_repair_condition=subject.after_repair_condition,
         selected_comps=selected,
         arv_unknown=False,
     )
