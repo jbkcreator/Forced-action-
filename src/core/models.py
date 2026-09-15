@@ -10178,3 +10178,403 @@ class AgentLaneOpportunityOutcome(Base):
             name="ck_alo_reason_code",
         ),
     )
+
+
+# ============================================================================
+# FA MAX — DURABLE STATE ENGINE (WP-1)
+# ============================================================================
+
+
+class FaMaxEntityRegistry(Base):
+    """Single canonical UUID for every FA Max-tracked object.
+
+    Resolves the polymorphic-FK problem: state_transition_events.entity_uuid
+    is a real FK into this table, not a bare text reference with no DB
+    enforcement. One row per tracked entity, created once at first FA Max
+    contact.
+
+    entity_type values:
+        person       — canonical borrower identity (persons.person_id)
+        property     — existing properties.id (stored as text)
+        opportunity  — fa_max_opportunities.opportunity_id
+        partner      — future partner/referral entity
+        interaction  — future interaction record
+
+    native_id is text to accommodate both int PKs (properties.id) and UUID
+    PKs; the type+native_id pair uniquely identifies the backing row.
+    """
+
+    __tablename__ = "fa_max_entity_registry"
+
+    entity_uuid: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=text("generate_uuidv7()")
+    )
+    entity_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    native_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "entity_type IN ('person','property','opportunity','partner','interaction')",
+            name="ck_fa_max_entity_registry_type",
+        ),
+        UniqueConstraint("entity_type", "native_id", name="uq_fa_max_entity_registry_type_native"),
+        Index("ix_fa_max_entity_registry_type", "entity_type"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<FaMaxEntityRegistry(uuid={self.entity_uuid!r}, "
+            f"type={self.entity_type!r}, native={self.native_id!r})>"
+        )
+
+
+class FaMaxPersonLifecycleStageConfig(Base):
+    """Config-as-data stage definitions for FA Max person lifecycle.
+
+    Mirrors LaneStageConfig's pattern but is its own table — LaneStageConfig
+    carries sms_allowed and lane_type semantics that belong to the Agent Lane
+    broker marketplace, not FA Max's borrower lifecycle.
+
+    Seeded by migration with the 12-stage SOT progression. Editable with no
+    deploy.
+    """
+
+    __tablename__ = "fa_max_person_lifecycle_stage_config"
+
+    stage_key: Mapped[str] = mapped_column(String(50), primary_key=True)
+    display_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    order_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    allowed_next: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    is_terminal: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("true")
+    )
+
+    def __repr__(self) -> str:
+        return f"<FaMaxPersonLifecycleStageConfig(stage={self.stage_key!r}, order={self.order_index})>"
+
+
+class FaMaxPerson(Base):
+    """Canonical FA Max borrower/person identity record.
+
+    One row per unique real-world person Josh is working with as a potential
+    borrower. Cross-property, cross-session, permanent. merged_into_id
+    supports WP-4 identity resolution — when two rows are proven to be the
+    same person the surviving row's person_id is canonical and this field
+    carries the link on the merged row.
+
+    Compliance: NO financial data columns. No credit score, income, bank
+    statement, tax return, SSN, or any field that holds borrower financial
+    information. This is an absolute prohibition from SOT.md.
+    """
+
+    __tablename__ = "fa_max_persons"
+
+    person_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=text("generate_uuidv7()")
+    )
+    lifecycle_state: Mapped[str] = mapped_column(
+        String(50), nullable=False, server_default=text("'identified'")
+    )
+    merged_into_id: Mapped[Optional[str]] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_persons.person_id", name="fk_fa_max_persons_merged_into"),
+        nullable=True,
+    )
+    source: Mapped[str] = mapped_column(String(60), nullable=False)
+    source_reference: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["lifecycle_state"],
+            ["fa_max_person_lifecycle_stage_config.stage_key"],
+            name="fk_fa_max_persons_lifecycle_state",
+        ),
+        CheckConstraint(
+            "merged_into_id IS NULL OR merged_into_id <> person_id",
+            name="ck_fa_max_persons_no_self_merge",
+        ),
+        Index("ix_fa_max_persons_lifecycle_state", "lifecycle_state"),
+        Index(
+            "ix_fa_max_persons_not_merged",
+            "person_id",
+            postgresql_where=text("merged_into_id IS NULL"),
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<FaMaxPerson(person_id={self.person_id!r}, "
+            f"state={self.lifecycle_state!r})>"
+        )
+
+
+class FaMaxOpportunityStageConfig(Base):
+    """Config-as-data stage definitions for FA Max opportunities.
+
+    Separate from LaneStageConfig and from FaMaxPersonLifecycleStageConfig.
+    Opportunity stages track the loan/deal pipeline; person lifecycle stages
+    track the borrower relationship arc. They move at different cadences.
+    """
+
+    __tablename__ = "fa_max_opportunity_stage_config"
+
+    stage_key: Mapped[str] = mapped_column(String(50), primary_key=True)
+    display_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    order_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    allowed_next: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    is_terminal: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("true")
+    )
+
+    def __repr__(self) -> str:
+        return f"<FaMaxOpportunityStageConfig(stage={self.stage_key!r}, order={self.order_index})>"
+
+
+class FaMaxOpportunity(Base):
+    """FA Max canonical opportunity/loan record.
+
+    One row per distinct loan/deal occurrence for a person. Deliberately NOT
+    unique on (person_id, property_id) — the same borrower can have an
+    acquisition opportunity and a later rehab loan on the same property, and
+    a repeat borrower gets a new row per project.
+
+    Dedup against duplicate ingest events is handled by idempotency_key
+    (partial unique index — only when non-NULL), not by a compound constraint
+    on business keys.
+
+    opportunity_type values mirror SOT.md's loan product taxonomy:
+        acquisition, rehab, construction, extension, refinance,
+        dscr_takeout, repeat
+
+    Compliance: no pricing fields (rate, term, LTV commitment) to borrower.
+    loan_amount_cents and maturity_months are internal working fields only —
+    never surfaced in any outbound communication.
+
+    backflip_ref: opaque reference to the Backflip portal/application. NULL
+    until Josh submits. Nothing populates this without Josh's explicit action.
+    """
+
+    __tablename__ = "fa_max_opportunities"
+
+    opportunity_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=text("generate_uuidv7()")
+    )
+    person_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_persons.person_id", name="fk_fa_max_opp_person"),
+        nullable=False,
+    )
+    opportunity_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    current_stage: Mapped[str] = mapped_column(String(50), nullable=False)
+    outcome: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default=text("'open'")
+    )
+    source: Mapped[str] = mapped_column(String(60), nullable=False)
+    source_reference: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    expected_need_date: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    actual_funded_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    loan_amount_cents: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    maturity_months: Mapped[Optional[int]] = mapped_column(SmallInteger, nullable=True)
+    backflip_ref: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    assigned_to: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["current_stage"],
+            ["fa_max_opportunity_stage_config.stage_key"],
+            name="fk_fa_max_opp_stage_config",
+        ),
+        CheckConstraint(
+            "opportunity_type IN ('acquisition','rehab','construction','extension',"
+            "'refinance','dscr_takeout','repeat')",
+            name="ck_fa_max_opp_type",
+        ),
+        CheckConstraint(
+            "outcome IN ('open','funded','dead','recycled','referred')",
+            name="ck_fa_max_opp_outcome",
+        ),
+        Index(
+            "uq_fa_max_opp_idempotency_key",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text("idempotency_key IS NOT NULL"),
+        ),
+        Index("ix_fa_max_opp_person_id", "person_id"),
+        Index("ix_fa_max_opp_stage", "current_stage"),
+        Index(
+            "ix_fa_max_opp_open",
+            "outcome",
+            postgresql_where=text("outcome = 'open'"),
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<FaMaxOpportunity(opportunity_id={self.opportunity_id!r}, "
+            f"person_id={self.person_id!r}, type={self.opportunity_type!r}, "
+            f"stage={self.current_stage!r})>"
+        )
+
+
+class FaMaxOpportunityProperty(Base):
+    """N:N link between FA Max opportunities and properties.
+
+    Kept as a link table (not a FK on fa_max_opportunities) because:
+    - Pre-property borrower conversations are valid opportunities with no
+      property yet (simply no rows here).
+    - Portfolio/multi-property transactions link multiple properties.
+    - role distinguishes subject property from collateral, exit asset, etc.
+    """
+
+    __tablename__ = "fa_max_opportunity_properties"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    opportunity_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_opportunities.opportunity_id", name="fk_fa_max_opp_prop_opp"),
+        nullable=False,
+    )
+    property_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("properties.id", name="fk_fa_max_opp_prop_property"),
+        nullable=False,
+    )
+    role: Mapped[str] = mapped_column(
+        String(30), nullable=False, server_default=text("'subject'")
+    )
+    source: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
+    linked_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "role IN ('subject','collateral','current_project','exit_property')",
+            name="ck_fa_max_opp_prop_role",
+        ),
+        UniqueConstraint(
+            "opportunity_id", "property_id", "role",
+            name="uq_fa_max_opp_prop_role",
+        ),
+        Index("ix_fa_max_opp_prop_opp_id", "opportunity_id"),
+        Index("ix_fa_max_opp_prop_property_id", "property_id"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<FaMaxOpportunityProperty(opp={self.opportunity_id!r}, "
+            f"prop={self.property_id!r}, role={self.role!r})>"
+        )
+
+
+class FaMaxStateTransitionEvent(Base):
+    """Append-only audit of every FA Max state change — the event spine for WP-1.
+
+    Written in the same transaction as the state-column update on the owning
+    entity. Never updated, never deleted. The full ordered history of any
+    entity's state changes is reconstructable by querying this table filtered
+    on entity_uuid + occurred_at.
+
+    entity_uuid is a real FK into fa_max_entity_registry — not a polymorphic
+    text reference. This preserves referential integrity regardless of entity
+    type. person_id is denormalized here as the borrower-history partition key
+    (NULL when the entity has no person association, e.g. a property-only
+    enrichment event).
+
+    idempotency_key = ON CONFLICT DO NOTHING guard. Callers must supply a
+    deterministic key (e.g. sha256 of entity_uuid+from_state+to_state+actor+
+    epoch-minute) so retried transitions are safe no-ops.
+
+    actor: who/what caused this transition. Format: 'agent:<name>' for
+    autonomous agents, 'user:josh' for Josh, 'system:<component>' for
+    scheduled jobs.
+
+    source_component: the specific module that wrote the row. For tracing.
+
+    decision_id: FK into agent_decisions when the transition was driven by an
+    agent decision. NULL for system/human-initiated transitions.
+    """
+
+    __tablename__ = "fa_max_state_transition_events"
+
+    event_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=text("generate_uuidv7()")
+    )
+    entity_uuid: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey(
+            "fa_max_entity_registry.entity_uuid",
+            name="fk_fa_max_ste_entity_uuid",
+        ),
+        nullable=False,
+    )
+    person_id: Mapped[Optional[str]] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_persons.person_id", name="fk_fa_max_ste_person_id"),
+        nullable=True,
+    )
+    entity_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    from_state: Mapped[str] = mapped_column(String(50), nullable=False)
+    to_state: Mapped[str] = mapped_column(String(50), nullable=False)
+    actor: Mapped[str] = mapped_column(String(120), nullable=False)
+    source_component: Mapped[str] = mapped_column(String(120), nullable=False)
+    decision_id: Mapped[Optional[str]] = mapped_column(
+        String(36),
+        ForeignKey("agent_decisions.decision_id", name="fk_fa_max_ste_decision_id"),
+        nullable=True,
+    )
+    context: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "entity_type IN ('person','property','opportunity','partner','interaction')",
+            name="ck_fa_max_ste_entity_type",
+        ),
+        UniqueConstraint("idempotency_key", name="uq_fa_max_ste_idempotency_key"),
+        Index("ix_fa_max_ste_entity_uuid_occurred", "entity_uuid", "occurred_at"),
+        Index("ix_fa_max_ste_person_id_occurred", "person_id", "occurred_at"),
+        Index("ix_fa_max_ste_decision_id", "decision_id",
+              postgresql_where=text("decision_id IS NOT NULL")),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<FaMaxStateTransitionEvent(entity={self.entity_uuid!r}, "
+            f"{self.from_state!r}->{self.to_state!r}, actor={self.actor!r})>"
+        )

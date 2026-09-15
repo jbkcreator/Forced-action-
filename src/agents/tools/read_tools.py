@@ -665,3 +665,49 @@ def get_subscriber_memory_timeline(
 
 	with _session(session) as s:
 		return get_subscriber_memory(s, subscriber_id, limit=limit)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FA MAX — Person state (WP-1)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@tool(category="read")
+def get_fa_max_person_state(
+	person_id: str,
+	session: Optional[Session] = None,
+) -> Dict[str, Any]:
+	"""Load FA Max person lifecycle state. Returns empty dict when not found.
+
+	Use as the first node in any FA Max LangGraph graph: call this, abort
+	processing if the result is empty (person not registered), then proceed.
+	This matches the _node_load_profile abort-if-not-found pattern.
+
+	Compliance: the returned dict contains NO financial data fields.
+	"""
+	from src.services.state_engine import get_person_state
+
+	with _session(session) as s:
+		result = get_person_state(session=s, person_id=person_id)
+		return result if result is not None else {}
+
+
+@tool(category="read")
+def get_fa_max_person_history(
+	person_id: str,
+	limit: int = 100,
+	session: Optional[Session] = None,
+) -> Dict[str, Any]:
+	"""Return the complete ordered state-transition history for an FA Max person.
+
+	Covers all entity types associated with this person (their opportunities,
+	linked properties, interactions) via the person_id partition key on
+	fa_max_state_transition_events.
+
+	Satisfies WP-1 Done When: 'complete ordered history of a borrower can be
+	queried.'
+	"""
+	from src.services.state_engine import get_person_history
+
+	with _session(session) as s:
+		events = get_person_history(session=s, person_id=person_id, limit=limit)
+		return {"person_id": person_id, "events": events, "count": len(events)}
