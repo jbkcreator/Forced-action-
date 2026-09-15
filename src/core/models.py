@@ -9166,6 +9166,21 @@ class BuyerEntity(Base):
     canonical_name: Mapped[str] = mapped_column(Text, nullable=False)
     entity_type: Mapped[str] = mapped_column(String(20), nullable=False)   # Individual | LLC | Trust | Corporate
     primary_mailing_address: Mapped[Optional[str]] = mapped_column(String(255))
+    # Modal (most common) normalized email/phone across the cluster's member
+    # records -- denormalized the same way canonical_name/primary_mailing_address
+    # already are, so run_incremental's existing-entity anchors (see
+    # load_existing_entity_candidates in buyer_entity_resolution.py) can be
+    # contact-matched against a new owners/deeds row without a fresh query.
+    # phone is always via src/services/phone_utils.normalize (E.164).
+    primary_email: Mapped[Optional[str]] = mapped_column(Text)
+    primary_phone: Mapped[Optional[str]] = mapped_column(String(20))
+    # The controlling PERSON's name for an entity resolved via Sunbiz LLC
+    # piercing (e.g. an entity whose canonical_name is an LLC because no
+    # Individual/Trust candidate was in the cluster still has principal_name
+    # set to the pierced managing member). NULL when the entity was never
+    # pierced -- an LLC entity with no known principal. See
+    # buyer_entity_resolution.canonical_name()/find_structural_edges().
+    principal_name: Mapped[Optional[str]] = mapped_column(Text)
     confidence_score: Mapped[int] = mapped_column(Integer, nullable=False)
     verification_status: Mapped[str] = mapped_column(String(20), nullable=False, default="unverified")
     total_purchase_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -9310,7 +9325,7 @@ class BuyerEntityLink(Base):
         ),
         CheckConstraint(
             "match_method IN ('sunbiz_llc_piercing', 'exact_name_address', 'fuzzy_name', 'llm_adjudicated', 'manual', "
-            "'exact_name_only', 'auction_name_only_unverified')",
+            "'exact_name_only', 'auction_name_only_unverified', 'singleton_no_edge')",
             name="check_buyer_entity_link_match_method",
         ),
         CheckConstraint(
@@ -9374,6 +9389,51 @@ class BuyerEntityMergeLog(Base):
         Index("idx_merge_log_surviving", "surviving_id"),
         Index("idx_merge_log_absorbed", "absorbed_id"),
         Index("idx_merge_log_active", "id", postgresql_where=text("reversed_at IS NULL")),
+    )
+
+
+class BuyerEntityMatchException(Base):
+    """
+    Durable record of a resolver decision that correctly refused to
+    auto-merge -- an ambiguous pair, a cluster touching 2+ existing
+    buyer_entities anchors, or an LLM tie-break that came back DIFFERENT on
+    a high-name-score pair. Previously these were logger.warning only and
+    forgotten. Client spec: "Identity resolution is uncertain. Records stay
+    separate and a possible-match flag routes to EXCEPTIONS."
+
+    Also the missing input to merge_entities() (buyer_entity_merge.py),
+    which had no caller before this table existed -- an admin resolving one
+    of these rows to 'merged' is expected to call merge_entities() and stamp
+    merge_log_id here in the same transaction.
+
+    Upserted on (kind, left_ref, right_ref): the nightly sweep re-seeing the
+    same ambiguous pair every run bumps last_seen_at rather than creating a
+    new row per run.
+    """
+    __tablename__ = "buyer_entity_match_exception"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)   # ambiguous_pair | multi_anchor_conflict | llm_different
+    left_ref: Mapped[str] = mapped_column(Text, nullable=False)    # e.g. 'owners#4412'
+    right_ref: Mapped[str] = mapped_column(Text, nullable=False)   # e.g. 'buyer_entities#88'
+    entity_ids: Mapped[Optional[list]] = mapped_column(JSONB)      # anchors, for multi_anchor_conflict
+    name_score: Mapped[Optional[int]] = mapped_column(Integer)
+    address_score: Mapped[Optional[int]] = mapped_column(Integer)
+    explanation: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="open")  # open|merged|rejected|stale
+    resolved_by: Mapped[Optional[str]] = mapped_column(String(100))
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    merge_log_id: Mapped[Optional[int]] = mapped_column(ForeignKey("buyer_entity_merge_log.id"))
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+
+    __table_args__ = (
+        UniqueConstraint("kind", "left_ref", "right_ref", name="uq_match_exception_pair"),
+        Index("idx_match_exception_open", "first_seen_at", postgresql_where=text("status = 'open'")),
     )
 
 

@@ -27,6 +27,11 @@ from src.agents.hunter.gating import verification_status
 from src.core.models import BuyerEntity, BuyerEntityLink
 from src.loaders.base import BaseLoader
 from src.services import phone_utils
+from src.services.buyer_entity_exceptions import (
+    DEFAULT_MAX_NEW_EXCEPTIONS_PER_RUN,
+    record_exception,
+    record_exceptions_batch,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -81,15 +86,25 @@ class CandidateRecord:
     entity_type_hint: Optional[str]      # Individual | LLC | Trust | Estate | Corporate (owners.owner_type); None for deed-sourced candidates
     managing_members: Optional[list]     # only populated for LLC-type owners rows
     county_id: Optional[str]
-    email: Optional[str] = None          # lowercased email_1 from owners; None for deed-sourced candidates
-    phone: Optional[str] = None          # E.164 phone_1 from owners via phone_utils.normalize; None for deed-sourced
+    # All contact slots, not just the primary one -- email_1/email_2,
+    # phone_1/phone_2/phone_3 from owners. Empty for deed-sourced candidates
+    # (deeds carries no contact columns). frozenset so score_candidate_pair
+    # can intersect two candidates' contacts directly rather than comparing
+    # a single scalar per side, which would miss a match where the shared
+    # number sits in a different slot on each record (e.g. current phone_1
+    # on one owner row, an older phone_2 still current on another). Phones
+    # always via src/services/phone_utils.normalize (E.164); emails lowercased
+    # and stripped.
+    emails: frozenset[str] = frozenset()
+    phones: frozenset[str] = frozenset()
 
 
 def _owners_query(only_unresolved: bool) -> str:
     where_unresolved = "AND bel.id IS NULL" if only_unresolved else ""
     return f"""
         SELECT o.id, o.owner_name, o.mailing_address, o.owner_type,
-               o.managing_members, o.county_id, o.email_1, o.phone_1
+               o.managing_members, o.county_id,
+               o.email_1, o.email_2, o.phone_1, o.phone_2, o.phone_3
         FROM owners o
         LEFT JOIN buyer_entity_links bel
             ON bel.source_table = 'owners' AND bel.source_id = o.id
@@ -131,6 +146,14 @@ def extract_owner_candidates(
     result = session.execute(text(_owners_query(only_unresolved))).yield_per(_STREAM_BATCH)
     for row in result:
         raw_name = row.owner_name or ""
+        emails = frozenset(
+            e.lower().strip() for e in (row.email_1, row.email_2) if e and e.strip()
+        )
+        phones = frozenset(
+            p for p in (phone_utils.normalize(row.phone_1),
+                        phone_utils.normalize(row.phone_2),
+                        phone_utils.normalize(row.phone_3)) if p
+        )
         yield CandidateRecord(
             source_table="owners",
             source_id=row.id,
@@ -140,8 +163,8 @@ def extract_owner_candidates(
             entity_type_hint=row.owner_type,
             managing_members=row.managing_members,
             county_id=row.county_id,
-            email=(row.email_1 or "").lower().strip() or None,
-            phone=phone_utils.normalize(row.phone_1),
+            emails=emails,
+            phones=phones,
         )
 
 
@@ -188,6 +211,15 @@ class MatchVerdict:
     confidence: int    # 0-100
     method: str        # sunbiz_llc_piercing | exact_name_address | fuzzy_name | llm_adjudicated
     explanation: str = ""
+    # The controlling PERSON's name, when this edge is Sunbiz LLC-piercing --
+    # e.g. "FLAIG SUSAN" for an edge linking "BARNZ WEST LLC" and "BARNZ LLC"
+    # via a shared managing member. None for every other method (name/address/
+    # contact edges are between two records of a KNOWN type already, not a
+    # piercing fact). Carried through build_evidence_index into
+    # _new_entity_from_cluster so an LLC-only cluster can be named after its
+    # actual principal instead of after whichever LLC name happens to be
+    # longest -- see canonical_name().
+    principal_name: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -312,6 +344,12 @@ def find_structural_edges(
                     f"{b.source.source_table}#{b.source.source_id} "
                     f"(token_set_ratio={score})"
                 )
+                # The longer of the two spellings, on the same "prefer the
+                # more complete rendering" logic as canonical_name() below --
+                # e.g. "FLAIG GUNTHER SUSAN" over "FLAIG SUSAN".
+                principal_name = max(
+                    (a.person_name_normalized, b.person_name_normalized), key=len,
+                )
                 edges.append((
                     a.source, b.source,
                     MatchVerdict(
@@ -319,6 +357,7 @@ def find_structural_edges(
                         confidence=SUNBIZ_STRUCTURAL_CONFIDENCE,
                         method="sunbiz_llc_piercing",
                         explanation=explanation,
+                        principal_name=principal_name,
                     ),
                 ))
     return edges
@@ -340,6 +379,23 @@ def _block_key_tokens(normalized_name: str) -> set[str]:
     return {t for t in normalized_name.split(" ") if len(t) >= _MIN_BLOCK_TOKEN_LEN}
 
 
+_CONTACT_KEY_PREFIXES = ("email:", "phone:")
+
+
+def is_contact_block_key(key: str) -> bool:
+    """True for a block key minted from a shared email/phone rather than a
+    name token — used by score_blocked_pairs to bypass the co-occurrence
+    gate for contact-corroborated pairs."""
+    return key.startswith(_CONTACT_KEY_PREFIXES)
+
+
+def _contact_key_tokens(cand: CandidateRecord) -> set[str]:
+    """Blocking keys minted from a candidate's own contacts (never blended
+    with name tokens — email:/phone: prefixes keep the two namespaces
+    disjoint so a contact value can never collide with a name token)."""
+    return {f"email:{e}" for e in cand.emails} | {f"phone:{p}" for p in cand.phones}
+
+
 def block_candidates(
     candidates: Iterable[CandidateRecord],
 ) -> dict[tuple[str, Optional[str]], list[CandidateRecord]]:
@@ -351,22 +407,41 @@ def block_candidates(
     its ZIP (or None if no address is available — typical for deed-sourced
     candidates whose property has no matching current owner).
 
-    Tokens appearing in more than MAX_BLOCK_FREQUENCY candidates are excluded
-    as blocking keys entirely — the same institutional mega-names that force
-    this cap in find_structural_edges (a REIT's officers, common words like
-    "FLORIDA") apply here too, since this blocks on the same candidate pool.
+    A SECOND blocking dimension is added here: a candidate also contributes
+    to one block per shared email/phone it holds, keyed by the contact value
+    itself (zip_code component is always None for these — the contact IS
+    the corroborating signal, not a zip pairing). This is the only way two
+    records with the same person at two different mailing addresses (and
+    therefore two different ZIPs) can ever be COMPARED at all — the
+    name-token+ZIP blocking above would never put them in the same group.
+    Confirmed necessary against real data: 202 of 430 owner groups sharing a
+    normalized phone span more than one ZIP.
+
+    Tokens (name tokens AND contact values) appearing in more than
+    MAX_BLOCK_FREQUENCY candidates are excluded as blocking keys entirely —
+    the same institutional mega-names that force this cap in
+    find_structural_edges (a REIT's officers, common words like "FLORIDA")
+    apply here too, since this blocks on the same candidate pool. A shared
+    office phone line or an `info@` mailbox is exactly this case for
+    contacts — the cap keeps either from creating a runaway comparison group.
     """
     candidates = list(candidates)  # consumed twice below -- must not be a one-shot generator
-    token_sets = [_block_key_tokens(c.normalized_name) for c in candidates]
-    token_freq = _token_frequencies(token_sets)
+    name_token_sets = [_block_key_tokens(c.normalized_name) for c in candidates]
+    contact_token_sets = [_contact_key_tokens(c) for c in candidates]
+    all_token_sets = [n | c for n, c in zip(name_token_sets, contact_token_sets)]
+    token_freq = _token_frequencies(all_token_sets)
 
     blocks: dict[tuple[str, Optional[str]], list[CandidateRecord]] = defaultdict(list)
-    for cand, tokens in zip(candidates, token_sets):
+    for cand, name_tokens, contact_tokens in zip(candidates, name_token_sets, contact_token_sets):
         zip_code = _extract_zip(cand.mailing_address)
-        for token in tokens:
+        for token in name_tokens:
             if token_freq[token] > MAX_BLOCK_FREQUENCY:
                 continue
             blocks[(token, zip_code)].append(cand)
+        for token in contact_tokens:
+            if token_freq[token] > MAX_BLOCK_FREQUENCY:
+                continue
+            blocks[(token, None)].append(cand)
     return blocks
 
 
@@ -443,12 +518,12 @@ def score_candidate_pair(a: CandidateRecord, b: CandidateRecord) -> MatchVerdict
             explanation=f"name={name_score} but address clearly disagrees (street={address_score})",
         )
 
-    email_match = bool(a.email and b.email and a.email == b.email)
-    phone_match = bool(a.phone and b.phone and a.phone == b.phone)
-    contact_corroborated = email_match or phone_match
+    matching_emails = a.emails & b.emails
+    matching_phones = a.phones & b.phones
+    contact_corroborated = bool(matching_emails or matching_phones)
     contact_detail = (
-        f"email={a.email!r} matches" if email_match
-        else (f"phone={a.phone!r} matches" if phone_match else "")
+        f"email={next(iter(matching_emails))!r} matches" if matching_emails
+        else (f"phone={next(iter(matching_phones))!r} matches" if matching_phones else "")
     )
 
     if name_score >= NAME_AUTO_MATCH_MIN and address_score is not None and address_score >= ADDRESS_AGREE_MIN:
@@ -498,11 +573,14 @@ def score_blocked_pairs(
     Score candidate pairs generated by blocking — but not every co-occurring
     pair earns a score. A pair is only scored if it has real corroborating
     evidence: either it co-occurred in a block with a genuine (non-None)
-    ZIP, or it shares at least two distinct name tokens.
+    ZIP, it shares at least two distinct name tokens, or it co-occurred in a
+    CONTACT block (shared email/phone) — a contact match is stronger
+    evidence than either of the other two gates on its own, so it always
+    bypasses this gate rather than needing a second co-occurrence to clear it.
 
-    Confirmed against real data: without this gate, two unrelated people
-    sharing only one common, possibly-generic first name (e.g. two
-    different "PATRICIA ..." owners, neither with an address to
+    Confirmed against real data: without the name/ZIP half of this gate, two
+    unrelated people sharing only one common, possibly-generic first name
+    (e.g. two different "PATRICIA ..." owners, neither with an address to
     corroborate — typical for deed-sourced candidates) flood the ambiguous
     band with pairs that are almost certainly not the same person, which
     would make H2.4's LLM tie-break prohibitively expensive at real volume.
@@ -513,8 +591,10 @@ def score_blocked_pairs(
     pair_records: dict[tuple, tuple[CandidateRecord, CandidateRecord]] = {}
     pair_token_count: dict[tuple, int] = defaultdict(int)
     pair_has_zip: dict[tuple, bool] = defaultdict(bool)
+    pair_from_contact: dict[tuple, bool] = defaultdict(bool)
 
-    for (_, zip_code), group in blocks.items():
+    for (block_key, zip_code), group in blocks.items():
+        from_contact = is_contact_block_key(block_key)
         for i in range(len(group)):
             for j in range(i + 1, len(group)):
                 a, b = group[i], group[j]
@@ -526,10 +606,13 @@ def score_blocked_pairs(
                 pair_token_count[pair_key] += 1
                 if zip_code is not None:
                     pair_has_zip[pair_key] = True
+                if from_contact:
+                    pair_from_contact[pair_key] = True
 
     results: list[tuple[CandidateRecord, CandidateRecord, MatchVerdict]] = []
     for pair_key, (a, b) in pair_records.items():
-        if not (pair_has_zip[pair_key] or pair_token_count[pair_key] >= 2):
+        if not (pair_has_zip[pair_key] or pair_token_count[pair_key] >= 2
+                or pair_from_contact[pair_key]):
             continue
         verdict = score_candidate_pair(a, b)
         if verdict.method != "no_match":
@@ -549,9 +632,10 @@ be a variant spelling, maiden name, joint-ownership listing, or trustee \
 designation of the other. Do not guess — if genuinely uncertain, say DIFFERENT \
 and give a low confidence rather than inventing certainty.
 
-Respond with EXACTLY two lines and nothing else:
+Respond with two or three lines and nothing else:
 SAME or DIFFERENT
-<a confidence number from 0 to 100>"""
+<a confidence number from 0 to 100>
+<optional: one short sentence explaining your reasoning, for a human audit trail>"""
 
 _CONFIDENCE_RE = re.compile(r"\d+")
 
@@ -565,6 +649,12 @@ def _format_candidate_for_prompt(c: CandidateRecord) -> str:
 
 
 def _parse_llm_verdict(response: str) -> Optional[MatchVerdict]:
+    """Parses the 2-line contract (verdict, confidence) exactly as before --
+    a 3rd reasoning line, when present, is appended to explanation for
+    human audit only and never affects is_match/confidence. Absence of the
+    3rd line (or any response the model returns that omits it) is fully
+    backward-compatible: this fails safe exactly as it did before that line
+    was requested."""
     lines = [ln.strip() for ln in response.strip().splitlines() if ln.strip()]
     if len(lines) < 2:
         return None
@@ -575,11 +665,14 @@ def _parse_llm_verdict(response: str) -> Optional[MatchVerdict]:
     if match is None:
         return None
     confidence = max(0, min(100, int(match.group())))
+    explanation = f"LLM returned {verdict_word} confidence={confidence}"
+    if len(lines) >= 3 and lines[2]:
+        explanation += f": {lines[2]!r}"
     return MatchVerdict(
         is_match=(verdict_word == "SAME"),
         confidence=confidence if verdict_word == "SAME" else 0,
         method="llm_adjudicated",
-        explanation=f"LLM: {verdict_word} confidence={confidence}",
+        explanation=explanation,
     )
 
 
@@ -610,7 +703,7 @@ def llm_adjudicate_pair(
             task_type="buyer_entity_match",
             messages=[{"role": "user", "content": prompt}],
             system=_LLM_TIE_BREAK_SYSTEM_PROMPT,
-            max_tokens=20,
+            max_tokens=80,  # was 20 -- the optional 3rd reasoning line needs room
             db=db,
         )
     except Exception as exc:
@@ -736,13 +829,24 @@ def find_singletons(
     return [[c] for c in candidates if _record_key(c) not in clustered_keys]
 
 
-def canonical_name(cluster: list[CandidateRecord]) -> str:
+def canonical_name(cluster: list[CandidateRecord], principal_name: Optional[str] = None) -> str:
     """Prefer an Individual/Trust name (more recognizable to a human
     reviewer) over an LLC name; among same-type candidates, prefer the
-    longest (most complete) raw name."""
+    longest (most complete) raw name.
+
+    An LLC-only cluster (no Individual/Trust candidate) with a known
+    Sunbiz-pierced principal_name uses that instead of the longest LLC
+    name -- otherwise a cluster of e.g. nine LLCs sharing one managing
+    member is named after whichever LLC name is longest, when the actual
+    person's name was already known from the piercing edge. An LLC-only
+    cluster with NO pierced principal (principal_name is None) keeps the
+    prior behavior exactly."""
     individual_like = [c for c in cluster if c.entity_type_hint in ("Individual", "Trust")]
-    pool = individual_like if individual_like else cluster
-    return max(pool, key=lambda c: len(c.raw_name)).raw_name
+    if individual_like:
+        return max(individual_like, key=lambda c: len(c.raw_name)).raw_name
+    if principal_name:
+        return principal_name
+    return max(cluster, key=lambda c: len(c.raw_name)).raw_name
 
 
 def entity_type_for_cluster(cluster: list[CandidateRecord]) -> str:
@@ -758,6 +862,25 @@ def primary_mailing_address(cluster: list[CandidateRecord]) -> Optional[str]:
     if not addresses:
         return None
     return Counter(addresses).most_common(1)[0][0]
+
+
+def primary_email(cluster: list[CandidateRecord]) -> Optional[str]:
+    """Modal email across the cluster's member records -- denormalized onto
+    buyer_entities.primary_email so run_incremental's existing-entity
+    anchors can be contact-matched against a new owners/deeds row."""
+    emails = [e for c in cluster for e in c.emails]
+    if not emails:
+        return None
+    return Counter(emails).most_common(1)[0][0]
+
+
+def primary_phone(cluster: list[CandidateRecord]) -> Optional[str]:
+    """Modal phone across the cluster's member records -- same rationale as
+    primary_email. Already E.164-normalized on the way in (phone_utils)."""
+    phones = [p for c in cluster for p in c.phones]
+    if not phones:
+        return None
+    return Counter(phones).most_common(1)[0][0]
 
 
 def _cluster_index_by_key(clusters: list[list[CandidateRecord]]) -> dict[tuple[str, int], int]:
@@ -812,14 +935,14 @@ def compute_cluster_confidences(
 
 def build_evidence_index(
     edges: list[tuple[CandidateRecord, CandidateRecord, MatchVerdict]],
-) -> dict[tuple[str, int], tuple[str, str, int]]:
+) -> dict[tuple[str, int], tuple[str, str, int, Optional[str]]]:
     """
-    record_key -> its single best (method, explanation, confidence) across
-    every edge it appears in. Built in ONE pass over all edges so per-record
-    lookup is O(1) — looping the full edge list per record would be
-    O(records x edges), infeasible at real dataset scale.
+    record_key -> its single best (method, explanation, confidence,
+    principal_name) across every edge it appears in. Built in ONE pass over
+    all edges so per-record lookup is O(1) — looping the full edge list per
+    record would be O(records x edges), infeasible at real dataset scale.
     """
-    best_by_key: dict[tuple[str, int], tuple[str, str, int]] = {}
+    best_by_key: dict[tuple[str, int], tuple[str, str, int, Optional[str]]] = {}
     for a, b, verdict in edges:
         if not verdict.is_match:
             continue
@@ -827,15 +950,40 @@ def build_evidence_index(
             key = _record_key(rec)
             current = best_by_key.get(key)
             if current is None or verdict.confidence > current[2]:
-                best_by_key[key] = (verdict.method, verdict.explanation, verdict.confidence)
+                best_by_key[key] = (
+                    verdict.method, verdict.explanation, verdict.confidence, verdict.principal_name,
+                )
     return best_by_key
 
 
-def _new_entity_from_cluster(cluster: list[CandidateRecord], confidence: int) -> BuyerEntity:
+def _cluster_principal_name(
+    records: list[CandidateRecord],
+    evidence_index: dict[tuple[str, int], tuple[str, str, int, Optional[str]]],
+) -> Optional[str]:
+    """Modal principal_name across a cluster's records' best evidence, or
+    None if no record in the cluster was linked via Sunbiz piercing. Used
+    to name an LLC-only cluster after its actual controlling person instead
+    of after an LLC's name -- see canonical_name()."""
+    names = [
+        evidence_index[_record_key(rec)][3]
+        for rec in records
+        if _record_key(rec) in evidence_index and evidence_index[_record_key(rec)][3]
+    ]
+    if not names:
+        return None
+    return Counter(names).most_common(1)[0][0]
+
+
+def _new_entity_from_cluster(
+    cluster: list[CandidateRecord], confidence: int, principal_name: Optional[str] = None,
+) -> BuyerEntity:
     return BuyerEntity(
-        canonical_name=canonical_name(cluster),
+        canonical_name=canonical_name(cluster, principal_name=principal_name),
         entity_type=entity_type_for_cluster(cluster),
         primary_mailing_address=primary_mailing_address(cluster),
+        primary_email=primary_email(cluster),
+        primary_phone=primary_phone(cluster),
+        principal_name=principal_name,
         confidence_score=confidence,
         verification_status=verification_status(confidence),
         county_id=cluster[0].county_id,
@@ -854,16 +1002,23 @@ def load_existing_entity_candidates(
 ) -> list[CandidateRecord]:
     """
     Represent each existing buyer_entities row as a CandidateRecord (using
-    its denormalized canonical_name/primary_mailing_address), so the SAME
-    blocking/scoring/clustering pipeline used for raw records can also match
-    new candidates against already-resolved entities. source_table=
-    'buyer_entities' marks these as entity anchors, not raw source rows —
-    find_structural_edges already skips non-'owners' candidates, so anchors
-    never contribute spurious new structural facts of their own.
+    its denormalized canonical_name/primary_mailing_address/primary_email/
+    primary_phone), so the SAME blocking/scoring/clustering pipeline used
+    for raw records can also match new candidates against already-resolved
+    entities. source_table='buyer_entities' marks these as entity anchors,
+    not raw source rows — find_structural_edges already skips non-'owners'
+    candidates, so anchors never contribute spurious new structural facts
+    of their own.
+
+    Without primary_email/primary_phone here, a new owners/deeds row could
+    never contact-match an EXISTING entity in incremental (nightly) mode —
+    only two records seen together in the same run could ever contact-
+    corroborate, since block_candidates() only sees what's passed to it.
     """
     where_county = "WHERE county_id = :county_id" if county_id else ""
     rows = session.execute(
-        text(f"SELECT id, canonical_name, primary_mailing_address, entity_type, county_id "
+        text(f"SELECT id, canonical_name, primary_mailing_address, entity_type, "
+             f"county_id, primary_email, primary_phone "
              f"FROM buyer_entities {where_county}"),
         {"county_id": county_id} if county_id else {},
     )
@@ -878,13 +1033,15 @@ def load_existing_entity_candidates(
             entity_type_hint=row.entity_type,
             managing_members=None,
             county_id=row.county_id,
+            emails=frozenset({row.primary_email}) if row.primary_email else frozenset(),
+            phones=frozenset({row.primary_phone}) if row.primary_phone else frozenset(),
         ))
     return result
 
 
 def cluster_against_anchors(
     combined: list[CandidateRecord],
-) -> tuple[list[list[CandidateRecord]], list[int], dict]:
+) -> tuple[list[list[CandidateRecord]], list[int], dict, list[tuple[CandidateRecord, CandidateRecord, MatchVerdict]]]:
     """
     Shared structural+blocking+scoring+clustering pass over a combined set
     of new/unresolved CandidateRecords plus existing buyer_entities anchors
@@ -892,8 +1049,16 @@ def cluster_against_anchors(
     (H2.7) and run_backfill (H2.6) so "does this new record match something
     that already exists" is answered identically in both places rather than
     two divergent implementations. Returns (relevant_clusters, confidences,
-    evidence_index) -- relevant_clusters excludes pure-anchor singletons
-    (existing entities matching nothing new need no action).
+    evidence_index, ambiguous_pairs) -- relevant_clusters excludes
+    pure-anchor singletons (existing entities matching nothing new need no
+    action). ambiguous_pairs are the verdicts this pass correctly declined
+    to link — callers write these to buyer_entity_match_exception (WI-4) so
+    the client's "possible-match flag routes to EXCEPTIONS" is durable, not
+    forgotten the moment this function returns.
+
+    Stays a pure function -- no DB access, no side effects. Recording
+    exceptions is the DB-sweep layer's job (run_incremental / run_backfill),
+    same separation the module's own docstring already establishes.
     """
     structural_edges = find_structural_edges(combined)
     blocks = block_candidates(combined)
@@ -902,6 +1067,7 @@ def cluster_against_anchors(
     # evidence). Ambiguous verdicts already carry is_match=False, so this
     # filter naturally excludes them without calling adjudicate_ambiguous_pairs.
     all_edges = structural_edges + [e for e in scored if e[2].is_match]
+    ambiguous_pairs = [e for e in scored if e[2].method == "ambiguous"]
 
     clusters = build_clusters(all_edges)
     all_singletons = find_singletons(combined, clusters)
@@ -912,7 +1078,7 @@ def cluster_against_anchors(
     relevant_clusters = clusters + new_singletons
     confidences = compute_cluster_confidences(relevant_clusters, all_edges)
     evidence_index = build_evidence_index(all_edges)
-    return relevant_clusters, confidences, evidence_index
+    return relevant_clusters, confidences, evidence_index, ambiguous_pairs
 
 
 def attach_or_create_entities(
@@ -956,11 +1122,29 @@ def attach_or_create_entities(
             continue  # existing entities matching each other -- not this run's concern
 
         if len(entity_anchors) > 1:
+            anchor_ids = sorted(a.source_id for a in entity_anchors)
             logger.warning(
                 "attach_or_create_entities: cluster touches %d existing entities (ids=%s) -- "
                 "potential merge, not auto-resolving; new records left unresolved: %s",
-                len(entity_anchors), [a.source_id for a in entity_anchors],
+                len(entity_anchors), anchor_ids,
                 [(r.source_table, r.source_id) for r in new_records],
+            )
+            # Representative refs for the unique key -- an N-anchor conflict
+            # doesn't reduce to a natural pair, so left_ref is the sorted
+            # anchor set (the actual conflict) and right_ref is the first new
+            # record that bridged them (entity_ids on the row carries the
+            # full anchor list for an admin UI; this is just for uniqueness).
+            left_ref = f"buyer_entities#{','.join(str(i) for i in anchor_ids)}"
+            first_new = new_records[0]
+            right_ref = f"{first_new.source_table}#{first_new.source_id}"
+            record_exception(
+                session, kind="multi_anchor_conflict", left_ref=left_ref, right_ref=right_ref,
+                entity_ids=anchor_ids,
+                explanation=(
+                    f"cluster touches {len(entity_anchors)} existing entities "
+                    f"(ids={anchor_ids}) via {len(new_records)} new record(s) "
+                    f"starting with {right_ref} -- potential merge, not auto-resolved"
+                ),
             )
             conflicts += 1
             continue
@@ -968,7 +1152,8 @@ def attach_or_create_entities(
         if len(entity_anchors) == 1:
             entity_id = entity_anchors[0].source_id
         else:
-            entity = _new_entity_from_cluster(cluster, confidence)
+            principal = _cluster_principal_name(new_records, evidence_index)
+            entity = _new_entity_from_cluster(cluster, confidence, principal_name=principal)
             session.add(entity)
             session.flush()
             entity_id = entity.id
@@ -976,8 +1161,14 @@ def attach_or_create_entities(
 
         changed_entity_ids.add(entity_id)
         for rec in new_records:
-            method, explanation, link_confidence = evidence_index.get(
-                _record_key(rec), ("manual", "", 100),
+            # 'singleton_no_edge', not 'manual' -- this fallback fires for a
+            # record with no corroborating edge in evidence_index (a
+            # single-record cluster), not a human decision. 'manual' means
+            # exactly what it says and is reserved for an actual human-set
+            # link (e.g. an admin merge/reject action) -- see WI-5.
+            method, explanation, link_confidence, _principal_name = evidence_index.get(
+                _record_key(rec),
+                ("singleton_no_edge", "single-record cluster; no corroborating edge", 100, None),
             )
             session.execute(insert(BuyerEntityLink).values(
                 buyer_entity_id=entity_id,
@@ -995,6 +1186,58 @@ def attach_or_create_entities(
         "conflicts": conflicts,
         "changed_entity_ids": sorted(changed_entity_ids),
     }
+
+
+def record_ambiguous_pair_exceptions(
+    session: Session,
+    ambiguous_pairs: list[tuple[CandidateRecord, CandidateRecord, MatchVerdict]],
+    max_new: int = DEFAULT_MAX_NEW_EXCEPTIONS_PER_RUN,
+) -> int:
+    """
+    Write every ambiguous verdict cluster_against_anchors declined to link
+    into buyer_entity_match_exception (kind='ambiguous_pair') -- the
+    client's "possible-match flag routes to EXCEPTIONS" requirement.
+    Written as ONE batched upsert (record_exceptions_batch), not one INSERT
+    per pair -- run_incremental scores the entire anchor table against every
+    new candidate (pre-existing design), so a single sweep routinely
+    produces hundreds of these; a per-row round trip would make every
+    incremental sweep call meaningfully slower for no benefit. Idempotent:
+    a pair re-seen on a later sweep just bumps last_seen_at rather than
+    creating a duplicate row.
+
+    max_new caps how many pairs from THIS CALL get processed -- a first
+    full backfill over ~810k entities must not attempt a million writes in
+    one sweep. Does not commit — caller controls the transaction boundary.
+    Returns the count actually recorded (for logging).
+    """
+    capped = ambiguous_pairs[:max_new]
+    if len(ambiguous_pairs) > max_new:
+        logger.warning(
+            "record_ambiguous_pair_exceptions: %d ambiguous pairs this run, "
+            "capped to %d -- remaining %d will be re-evaluated (and recorded, "
+            "if still ambiguous) on the next sweep",
+            len(ambiguous_pairs), max_new, len(ambiguous_pairs) - max_new,
+        )
+    rows = []
+    for a, b, verdict in capped:
+        name_score = int(fuzz.token_set_ratio(a.normalized_name, b.normalized_name))
+        address_score: Optional[int] = None
+        if a.mailing_address and b.mailing_address:
+            address_score = int(fuzz.token_set_ratio(
+                _street_portion(a.mailing_address).casefold(),
+                _street_portion(b.mailing_address).casefold(),
+            ))
+        left_key, right_key = _record_key(a), _record_key(b)
+        left_ref, right_ref = f"{left_key[0]}#{left_key[1]}", f"{right_key[0]}#{right_key[1]}"
+        if right_ref < left_ref:  # canonical order -- keeps the unique constraint from
+            left_ref, right_ref = right_ref, left_ref  # treating (X,Y) and (Y,X) as distinct
+        rows.append({
+            "kind": "ambiguous_pair", "left_ref": left_ref, "right_ref": right_ref,
+            "explanation": verdict.explanation or f"name={name_score}, no further detail",
+            "name_score": name_score, "address_score": address_score,
+        })
+    record_exceptions_batch(session, rows)
+    return len(capped)
 
 
 def run_incremental(session: Session, county_id: Optional[str] = None) -> dict:
@@ -1031,11 +1274,12 @@ def run_incremental(session: Session, county_id: Optional[str] = None) -> dict:
     existing_entities = load_existing_entity_candidates(session, county_id=None)
     combined = new_candidates + existing_entities
 
-    relevant_clusters, confidences, evidence_index = cluster_against_anchors(combined)
+    relevant_clusters, confidences, evidence_index, ambiguous_pairs = cluster_against_anchors(combined)
     stats = attach_or_create_entities(session, relevant_clusters, confidences, evidence_index)
+    exceptions_recorded = record_ambiguous_pair_exceptions(session, ambiguous_pairs)
 
     session.commit()
-    return {**stats, "processed": len(new_candidates)}
+    return {**stats, "processed": len(new_candidates), "exceptions_recorded": exceptions_recorded}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
