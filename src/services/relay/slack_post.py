@@ -31,7 +31,8 @@ def _summary_text(item: QueueItem) -> str:
     return (
         f"*Relay approval needed* (#{item.id})\n"
         f"Channel: `{item.channel}`  ·  To: `{item.recipient}`\n"
-        f"{preview}"
+        f"{preview}\n"
+        "Reply in this thread with `approve` or `reject`, or use the buttons below."
     )
 
 
@@ -168,3 +169,24 @@ def post_completion_receipt(
             "[Relay] completion receipt post failed for %s: %s",
             batch_id, exc, exc_info=True,
         )
+
+
+def post_blocked_action(item: QueueItem, reason: str) -> None:
+    """Surface a send-layer refusal in the owning FA Max Slack lane.
+
+    This is deliberately called after the durable queue row has been marked
+    skipped.  A Slack outage therefore cannot turn a prohibited send back
+    into an executable one.
+    """
+    settings = get_settings()
+    token = settings.slack_bot_token
+    channel = _resolve_channel(item, settings)
+    if not token or not channel:
+        logger.warning("[Relay] blocked item %d (%s); Slack not configured", item.id, reason)
+        return
+    message = f"🛑 *Relay send blocked* (#{item.id})\nTo: `{item.recipient}`\nReason: `{reason}`"
+    try:
+        from slack_sdk import WebClient
+        WebClient(token=token.get_secret_value()).chat_postMessage(channel=channel, text=message)
+    except Exception as exc:
+        logger.error("[Relay] blocked-action post failed for item %d: %s", item.id, exc, exc_info=True)

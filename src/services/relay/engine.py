@@ -130,6 +130,11 @@ def execute_batch(
             continue
         if verdict.outcome == guards.BLOCK:
             queue.mark_skipped(item.id, verdict.reason)
+            if item.venture_key == "fa_max_lending":
+                # Notification is observability only.  The durable skipped
+                # transition above is the enforcement boundary.
+                from src.services.relay.slack_post import post_blocked_action
+                post_blocked_action(item, verdict.reason)
             logger.warning("[Relay] item %d blocked: %s", item.id, verdict.reason)
             result.skipped += 1
             result.processed_ids.append(item.id)

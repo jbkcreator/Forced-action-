@@ -71,7 +71,13 @@ def app_and_client(monkeypatch):
     )
     monkeypatch.setattr("src.api.admin_router.settings.relay_slack_channel", "#agent-daily")
 
-    from src.api.main import app
+    # These are router-contract tests.  Loading the entire application also
+    # imports optional LangGraph agent graphs, which are unrelated to Slack
+    # HMAC/interactivity and need not be installed to validate this boundary.
+    from fastapi import FastAPI
+    from src.api.admin_router import router
+    app = FastAPI()
+    app.include_router(router)
     return app, TestClient(app)
 
 
@@ -92,6 +98,23 @@ def _post_decision(client, payload: dict, ts_offset: int = 0, bad_sig: bool = Fa
         content=body,
         headers={
             "content-type": "application/x-www-form-urlencoded",
+            "x-slack-request-timestamp": ts,
+            "x-slack-signature": sig,
+        },
+    )
+
+
+def _post_event(client, payload: dict, ts_offset: int = 0, bad_sig: bool = False):
+    body = json.dumps(payload).encode()
+    if bad_sig:
+        ts, sig = str(int(time.time())), "v0=badsig"
+    else:
+        ts, sig = _sign(body, "test-signing-secret", ts_offset=ts_offset)
+    return client.post(
+        "/api/admin/slack/events",
+        content=body,
+        headers={
+            "content-type": "application/json",
             "x-slack-request-timestamp": ts,
             "x-slack-signature": sig,
         },
@@ -166,6 +189,7 @@ def test_reject_calls_record_decision_with_approved_false(app_client, monkeypatc
 def test_non_approver_rejected(app_client, monkeypatch):
     mock_record_decision = MagicMock()
     monkeypatch.setattr("src.services.relay.queue.record_decision", mock_record_decision)
+    monkeypatch.setattr("src.services.relay.queue.get_item", MagicMock(return_value=_make_item()))
 
     resp = _post_decision(app_client, _interactive_payload("U_RANDO", 1, "approve"))
 
@@ -194,6 +218,46 @@ def test_double_click_returns_already_decided(app_client, monkeypatch):
 
     assert resp.status_code == 200
     assert "already decided" in resp.json()["text"]
+
+
+# ---------------------------------------------------------------------------
+# /slack/events — Relay thread actions
+# ---------------------------------------------------------------------------
+
+def test_thread_reply_approve_becomes_durable_relay_decision(app_client, monkeypatch):
+    item = _make_item(status="pending", slack_message_ts="1710000000.000100")
+    approved = _make_item(status="approved", slack_message_ts=item.slack_message_ts)
+    record = MagicMock(return_value=approved)
+    monkeypatch.setattr("src.services.relay.queue.get_item_by_slack_message_ts", MagicMock(return_value=item))
+    monkeypatch.setattr("src.services.relay.queue.get_item", MagicMock(return_value=item))
+    monkeypatch.setattr("src.services.relay.queue.record_decision", record)
+    monkeypatch.setattr("src.api.admin_router._update_relay_slack_message", MagicMock())
+
+    response = _post_event(app_client, {
+        "type": "event_callback",
+        "event": {
+            "type": "message", "subtype": None, "user": "U_APPROVER",
+            "thread_ts": item.slack_message_ts, "text": "approve",
+        },
+    })
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    record.assert_called_once_with(item.id, approved=True, decided_by="U_APPROVER")
+
+
+def test_thread_reply_ignores_non_action_text(app_client, monkeypatch):
+    finder = MagicMock()
+    monkeypatch.setattr("src.services.relay.queue.get_item_by_slack_message_ts", finder)
+
+    response = _post_event(app_client, {
+        "type": "event_callback",
+        "event": {"type": "message", "user": "U_APPROVER", "thread_ts": "171.1", "text": "make it shorter"},
+    })
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    finder.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +392,7 @@ def test_empty_approvers_rejects_every_user_on_decision(app_client, monkeypatch)
     monkeypatch.setattr("src.api.admin_router.settings.relay_approvers", [])
     mock_record_decision = MagicMock()
     monkeypatch.setattr("src.services.relay.queue.record_decision", mock_record_decision)
+    monkeypatch.setattr("src.services.relay.queue.get_item", MagicMock(return_value=_make_item()))
 
     resp = _post_decision(app_client, _interactive_payload("U_ANYONE", 1, "approve"))
 

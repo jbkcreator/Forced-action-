@@ -1671,6 +1671,53 @@ async def slack_interact(request: Request, background_tasks: BackgroundTasks, db
     return _slack_ephemeral(f"Unrecognized action: {action_id}")
 
 
+@router.post("/slack/events")
+async def slack_events(request: Request):
+    """Slack Events API endpoint for Relay card thread actions.
+
+    The same HMAC verification used for button interactivity applies here.
+    Only exact ``approve`` and ``reject`` replies are commands; normal
+    conversation in a queue-card thread is deliberately left untouched.
+    """
+    raw = await request.body()
+    if not _verify_slack_signature(dict(request.headers), raw):
+        raise HTTPException(status_code=401, detail="Invalid Slack signature")
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Malformed payload")
+    if payload.get("type") == "url_verification":
+        return {"challenge": payload.get("challenge", "")}
+    if payload.get("type") == "event_callback":
+        _handle_relay_thread_action(payload)
+    return {"ok": True}
+
+
+def _handle_relay_thread_action(payload: dict) -> None:
+    """Turn an authorized exact command in a Relay card thread into a
+    regular durable Relay decision."""
+    event = payload.get("event") or {}
+    if event.get("type") != "message" or event.get("subtype") or event.get("bot_id"):
+        return
+    command = str(event.get("text") or "").strip().casefold()
+    if command not in {"approve", "reject"}:
+        return
+    thread_ts = event.get("thread_ts")
+    user_id = event.get("user")
+    if not thread_ts or not user_id:
+        return
+    from src.services.relay import queue as relay_queue
+    item = relay_queue.get_item_by_slack_message_ts(str(thread_ts))
+    if item is None or not _relay_approver_authorized(str(user_id), item.venture_key):
+        return
+    # Reuse the normal decision path, including its pending-row CAS, state
+    # transition transaction, interaction audit, and Slack-card update.
+    _handle_relay_decision({
+        "user": {"id": str(user_id)},
+        "actions": [{"value": json.dumps({"item_id": item.id, "action": command})}],
+    })
+
+
 @router.post("/slack/county-launch/interact")
 async def slack_county_launch_interact(request: Request, db: Session = Depends(get_db)):
     """Deprecated individual URL — kept as an alias until the Slack app's

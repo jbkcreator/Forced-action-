@@ -260,6 +260,24 @@ def get_item_by_idempotency_key(idempotency_key: str) -> Optional[QueueItem]:
         return _row_to_item(dict(row)) if row else None
 
 
+def get_item_by_slack_message_ts(slack_message_ts: str) -> Optional[QueueItem]:
+    """Resolve the root Slack card for a thread reply.
+
+    Slack identifies a thread by the root message's ``ts``.  Looking up that
+    persisted value keeps thread actions on the same durable queue row as the
+    button action; it never trusts an item id supplied in free-form text.
+    """
+    with get_db_context() as session:
+        row = session.execute(
+            text(
+                f"SELECT {_COLUMNS_SQL} FROM relay_approval_queue "
+                "WHERE slack_message_ts = :ts"
+            ),
+            {"ts": slack_message_ts},
+        ).mappings().first()
+        return _row_to_item(dict(row)) if row else None
+
+
 def set_slack_message_ts(item_id: int, slack_message_ts: str) -> None:
     """Record the posted Slack message's ts so the decision webhook can
     edit that message in place once Josh responds."""
