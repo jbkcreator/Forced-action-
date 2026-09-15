@@ -22,7 +22,8 @@ def min_confidence(*levels: Confidence) -> Confidence:
     return min(levels, key=lambda c: _CONFIDENCE_RANK[c])
 
 
-def rehab_confidence(source: RehabSource) -> Confidence:
+def default_rehab_confidence(source: RehabSource) -> Confidence:
+    """Fallback confidence when the caller does not supply one explicitly."""
     return _REHAB_CONFIDENCE[source]
 
 
@@ -47,13 +48,17 @@ class QuoteReadyInput(BaseModel):
     last_sale_price: Optional[Decimal] = Field(default=None, ge=0)
 
     # Rehab — pre-filled from job_estimator by caller; caller may override.
-    # rehab_source records provenance so the estimate vs override is visible.
+    # rehab_source records provenance (estimate vs override); rehab_confidence
+    # is caller-supplied and, when omitted, defaults from the source.
     rehab_estimate: Optional[Decimal] = Field(default=None, ge=0)
     rehab_source: RehabSource = "job_estimator"
+    rehab_confidence: Optional[Confidence] = None
 
     # ARV — contract input for WP-8A; comp-derived ARV is WP-8B.
-    # arv_confidence lets the caller carry the ARV's provenance strength.
+    # arv_source + arv_confidence carry the ARV's provenance through to
+    # every ARV-dependent figure (proposed_loan, ltv).
     arv: Optional[Decimal] = Field(default=None, ge=0)
+    arv_source: str = "financial.arv"
     arv_confidence: Confidence = "high"
 
 
