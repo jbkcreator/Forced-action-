@@ -88,15 +88,29 @@ def _fa_max_compliance_reason(item: QueueItem) -> str | None:
     if item.venture_key != _FA_MAX_VENTURE:
         return None
 
-    if item.channel == "sms":
-        settings = get_settings()
-        if not settings.fa_max_10dlc_registered:
-            logger.warning(
-                "FA Max SMS blocked: fa_max_10dlc_registered=False "
-                "item_id=%s recipient=%s",
-                item.id, item.recipient,
-            )
-            return "fa_max_10dlc_not_registered"
+    if item.channel == "sms" and not get_settings().fa_max_10dlc_registered:
+        return "fa_max_10dlc_not_registered"
+
+    from src.services.fa_max_autonomy import check_tier_gate
+    from src.services.fa_max_send_governance import (
+        GovernanceBlocked,
+        require_consent,
+        validate_safe_payload,
+    )
+
+    if not item.person_id or not item.agent_name or not item.autonomy_tier_at_send or not item.lane:
+        return "missing_governance_fields"
+    try:
+        validate_safe_payload(item.payload or {})
+    except GovernanceBlocked as exc:
+        return exc.reason
+    with get_db_context() as db:
+        consent = require_consent(db, person_id=item.person_id, channel=item.channel)
+        if not consent.allowed:
+            return consent.reason
+        gate = check_tier_gate(item.agent_name, item.autonomy_tier_at_send, db)
+        if not gate.allowed:
+            return f"autonomy_gate:{gate.outcome.value}"
 
     return None
 

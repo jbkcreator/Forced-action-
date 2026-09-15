@@ -9120,6 +9120,16 @@ class RelayApprovalQueueItem(Base):
     agent_name: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
     autonomy_tier_at_send: Mapped[Optional[str]] = mapped_column(String(1), nullable=True)
     # A | B | C — stamped at dispatch time, never after
+    person_id: Mapped[Optional[Any]] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("fa_max_persons.person_id"), nullable=True
+    )
+    autonomy_gate_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    decision_interaction_id: Mapped[Optional[Any]] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("fa_max_interactions.interaction_id"), nullable=True
+    )
+    send_interaction_id: Mapped[Optional[Any]] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("fa_max_interactions.interaction_id"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
         default=lambda: datetime.now(timezone.utc), server_default=func.now(),
@@ -9151,6 +9161,13 @@ class RelayApprovalQueueItem(Base):
             "autonomy_tier_at_send IS NULL OR autonomy_tier_at_send IN ('A', 'B', 'C')",
             name="ck_relay_approval_queue_tier",
         ),
+        CheckConstraint(
+            "venture_key <> 'fa_max_lending' OR "
+            "(lane IS NOT NULL AND agent_name IS NOT NULL AND "
+            "autonomy_tier_at_send IS NOT NULL AND person_id IS NOT NULL)",
+            name="ck_relay_fa_max_governance_fields",
+        ),
+        Index("ix_relay_approval_queue_person_id", "person_id"),
     )
 
     def __repr__(self) -> str:

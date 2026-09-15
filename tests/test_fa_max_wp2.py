@@ -355,7 +355,7 @@ class TestGuards10DLC:
             assert "fa_max_10dlc_not_registered" in verdict.reason
 
     def test_fa_max_sms_allowed_when_10dlc_registered(self):
-        from src.services.relay.guards import evaluate, ALLOW
+        from src.services.relay.guards import evaluate, BLOCK
 
         item = self._fa_max_sms_item()
         with (
@@ -370,7 +370,8 @@ class TestGuards10DLC:
             gs.return_value = settings
 
             verdict = evaluate(item, now=self._window_now())
-            assert verdict.outcome == ALLOW
+            assert verdict.outcome == BLOCK
+            assert "missing_governance_fields" in verdict.reason
 
     def test_non_fa_max_sms_not_affected_by_10dlc_flag(self):
         """10DLC check must NOT apply to hillsborough_distress SMS sends."""
@@ -528,6 +529,30 @@ class TestWp2Integration:
         from src.services.relay.queue import enqueue, get_item_by_idempotency_key
 
         key = f"wp2-test-{uuid.uuid4()}"
+        person_id = str(uuid.uuid4())
+        agent_name = f"vera-{uuid.uuid4()}"
+        with get_db_context() as session:
+            session.execute(
+                text("INSERT INTO fa_max_persons (person_id, lifecycle_state, source) "
+                     "VALUES (CAST(:person_id AS uuid), 'identified', 'wp2_test')"),
+                {"person_id": person_id},
+            )
+            session.execute(
+                text("INSERT INTO fa_max_person_consent "
+                     "(person_id, channel, consented, source) "
+                     "VALUES (CAST(:person_id AS uuid), 'email', true, 'wp2_test')"),
+                {"person_id": person_id},
+            )
+            session.execute(
+                text("INSERT INTO relay_approval_queue "
+                     "(idempotency_key, channel, recipient, payload, status, venture_key, "
+                     "lane, agent_name, autonomy_tier_at_send, person_id, dispatched_at) "
+                     "SELECT :prefix || n, 'noop', 'audit-only', '{}'::jsonb, 'sent', "
+                     "'fa_max_lending', 'MONEY', :agent, 'A', CAST(:person_id AS uuid), now() "
+                     "FROM generate_series(1, 25) n"),
+                {"prefix": f"wp2-history-{uuid.uuid4()}-", "agent": agent_name,
+                 "person_id": person_id},
+            )
         item = enqueue(
             idempotency_key=key,
             channel="email",
@@ -535,23 +560,70 @@ class TestWp2Integration:
             payload={"subject": "Hi", "body": "Test"},
             venture_key="fa_max_lending",
             lane="MONEY",
-            agent_name="vera",
+            agent_name=agent_name,
             autonomy_tier_at_send="A",
+            person_id=person_id,
             skip_contract_validation=True,
         )
 
         assert item.lane == "MONEY"
-        assert item.agent_name == "vera"
+        assert item.agent_name == agent_name
         assert item.autonomy_tier_at_send == "A"
         assert item.venture_key == "fa_max_lending"
 
         # Clean up
         with get_db_context() as session:
-            session.execute(
-                text("DELETE FROM relay_approval_queue WHERE idempotency_key = :k"),
-                {"k": key},
-            )
+            session.execute(text("DELETE FROM relay_approval_queue WHERE person_id = CAST(:p AS uuid)"), {"p": person_id})
+            session.execute(text("DELETE FROM fa_max_persons WHERE person_id = CAST(:p AS uuid)"), {"p": person_id})
             session.commit()
+
+
+class TestWp2ClosureGuards:
+    def test_prohibited_financial_payload_is_rejected(self):
+        from src.services.fa_max_send_governance import GovernanceBlocked, validate_safe_payload
+
+        with pytest.raises(GovernanceBlocked, match="prohibited_financial_field"):
+            validate_safe_payload({"body": "hello", "credit_score": 720})
+        with pytest.raises(GovernanceBlocked, match="prohibited_financial_content"):
+            validate_safe_payload({"body": "Your interest rate is ready"})
+
+    @_skip_no_phonenumbers
+    def test_dispatch_gate_requires_fa_max_identity(self):
+        from src.services.relay.guards import _fa_max_compliance_reason
+
+        item = _make_queue_item(venture_key="fa_max_lending", lane="MONEY")
+        assert _fa_max_compliance_reason(item) == "missing_governance_fields"
+
+    def test_absent_withdrawn_and_cross_channel_consent_fail_closed(self):
+        from types import SimpleNamespace
+        from src.services.fa_max_send_governance import require_consent
+
+        session = MagicMock()
+        session.execute.return_value.fetchone.return_value = None
+        assert require_consent(session, person_id="p", channel="email").reason == "consent_absent"
+        session.execute.return_value.fetchone.return_value = SimpleNamespace(consented=False)
+        assert require_consent(session, person_id="p", channel="sms").reason == "consent_withdrawn"
+        session.execute.return_value.fetchone.return_value = SimpleNamespace(consented=True)
+        assert require_consent(session, person_id="p", channel="email").allowed
+        params = session.execute.call_args.args[1]
+        assert params["channel"] == "email"
+
+    def test_admin_approval_uses_one_transaction_and_required_source(self):
+        from pathlib import Path
+
+        source = (Path(__file__).parent.parent / "src" / "api" / "admin_router.py").read_text(encoding="utf-8")
+        approval = source[source.index("def _handle_relay_decision"):source.index("# THROUGH-v2.2")]
+        assert 'source_component="src.api.admin_router"' in approval
+        assert "record_decision(\n                    item_id, approved=True, decided_by=user_id, session=_db" in approval
+        assert "Approval held: required state transition failed" in approval
+
+    def test_lane_message_update_reuses_posting_resolver(self):
+        from pathlib import Path
+
+        source = (Path(__file__).parent.parent / "src" / "api" / "admin_router.py").read_text(encoding="utf-8")
+        update = source[source.index("def _update_relay_slack_message"):source.index("@router.post(\"/slack/relay-decision\")")]
+        assert "_resolve_channel(item, settings)" in update
+        assert "ts=item.slack_message_ts" in update
 
     def test_suppression_bypass_impossible_via_second_path(self):
         """Structural: no module other than relay/engine.py can originate a

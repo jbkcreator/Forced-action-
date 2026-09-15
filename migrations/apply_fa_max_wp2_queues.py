@@ -1,12 +1,12 @@
 """FA Max WP-2 — Slack Operating Queues & Send Governance: schema migration.
 
 Idempotent. Safe to re-run (ADD COLUMN IF NOT EXISTS / CREATE TABLE IF NOT
-EXISTS / ON CONFLICT DO NOTHING). Apply AFTER apply_fa_max_state_engine.py
-(WP-1) because fa_max_person_consent has a FK to fa_max_persons.
+EXISTS / ON CONFLICT DO NOTHING). Apply after both WP-1 migrations because
+consent and audit references depend on WP-1 person and interaction tables.
 
 What this does:
-1. Extends relay_approval_queue with three nullable audit columns:
-   lane (MONEY|EXCEPTIONS|RELATIONSHIPS), agent_name, autonomy_tier_at_send.
+1. Extends relay_approval_queue with lane, person, agent, autonomy evidence,
+   and immutable interaction references used by the send audit.
 2. Creates fa_max_person_consent (consent per FA Max person per channel).
 3. Seeds the fa_max_lending venture row (venture_key is the FK that scopes
    every relay item — FA Max items use this venture, not hillsborough_distress).
@@ -40,6 +40,17 @@ STATEMENTS: list[tuple[str, str]] = [
                 CHECK (autonomy_tier_at_send IS NULL OR autonomy_tier_at_send IN ('A', 'B', 'C'));
         """,
     ),
+    (
+        "ADD FA Max governance audit fields to relay_approval_queue",
+        """
+        ALTER TABLE relay_approval_queue ADD COLUMN IF NOT EXISTS person_id UUID;
+        ALTER TABLE relay_approval_queue ADD COLUMN IF NOT EXISTS autonomy_gate_reason TEXT;
+        ALTER TABLE relay_approval_queue ADD COLUMN IF NOT EXISTS decision_interaction_id UUID;
+        ALTER TABLE relay_approval_queue ADD COLUMN IF NOT EXISTS send_interaction_id UUID;
+        CREATE INDEX IF NOT EXISTS ix_relay_approval_queue_person_id
+            ON relay_approval_queue (person_id);
+        """,
+    ),
     # ── fa_max_person_consent ─────────────────────────────────────────────────
     (
         "CREATE fa_max_person_consent",
@@ -63,6 +74,30 @@ STATEMENTS: list[tuple[str, str]] = [
         """
         CREATE INDEX IF NOT EXISTS ix_fa_max_person_consent_person_id
             ON fa_max_person_consent (person_id);
+        """,
+    ),
+    (
+        "ADD FA Max queue governance constraints",
+        """
+        DO $$ BEGIN
+            ALTER TABLE relay_approval_queue ADD CONSTRAINT fk_relay_fa_max_person
+                FOREIGN KEY (person_id) REFERENCES fa_max_persons(person_id);
+        EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+        DO $$ BEGIN
+            ALTER TABLE relay_approval_queue ADD CONSTRAINT fk_relay_fa_max_decision_interaction
+                FOREIGN KEY (decision_interaction_id) REFERENCES fa_max_interactions(interaction_id);
+        EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+        DO $$ BEGIN
+            ALTER TABLE relay_approval_queue ADD CONSTRAINT fk_relay_fa_max_send_interaction
+                FOREIGN KEY (send_interaction_id) REFERENCES fa_max_interactions(interaction_id);
+        EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+        DO $$ BEGIN
+            ALTER TABLE relay_approval_queue ADD CONSTRAINT ck_relay_fa_max_governance_fields
+                CHECK (venture_key <> 'fa_max_lending' OR
+                       (lane IS NOT NULL AND agent_name IS NOT NULL AND
+                        autonomy_tier_at_send IS NOT NULL AND person_id IS NOT NULL))
+                NOT VALID;
+        EXCEPTION WHEN duplicate_object THEN NULL; END $$;
         """,
     ),
     # ── fa_max_lending venture row ────────────────────────────────────────────
