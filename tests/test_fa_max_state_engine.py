@@ -123,6 +123,137 @@ def test_redis_lock_exception_handled_gracefully():
         assert result is False
 
 
+def test_redis_lock_real_acquire_and_release():
+    """The actual SET-NX-EX acquire + DELETE release path, against fakeredis
+    (per CLAUDE.md: 'Use fakeredis in tests/sandbox') — not mocked-out.
+
+    This is the path every prior test skipped: all 20+ transition() calls
+    in this file use acquire_redis_lock=False, so _try_acquire_redis_lock's
+    actual success case and _release_redis_lock were previously exercised
+    by zero tests — only the fail-open (Redis down) and exception-handling
+    branches were covered.
+    """
+    import fakeredis
+
+    fake = fakeredis.FakeStrictRedis()
+
+    with (
+        patch("src.services.state_engine.redis_available", return_value=True),
+        patch("src.services.state_engine.get_redis", return_value=fake),
+    ):
+        from src.services.state_engine import _release_redis_lock, _try_acquire_redis_lock
+
+        entity_uuid = str(uuid.uuid4())
+
+        acquired = _try_acquire_redis_lock("person", entity_uuid)
+        assert acquired is True, "Must acquire when Redis is up and key is free"
+
+        key = f"lock:state:person:{entity_uuid}"
+        assert fake.exists(key) == 1, "SET NX must have actually written the key"
+
+        _release_redis_lock("person", entity_uuid)
+        assert fake.exists(key) == 0, "Release must actually DELETE the key"
+
+
+def test_redis_lock_real_contention_detected():
+    """A second caller for the SAME entity_uuid while the first still holds
+    the lock must get False — this is the actual distributed-locking
+    guarantee WP-1's scope claims ('Redis distributed locking for
+    concurrent work'), never exercised before this test."""
+    import fakeredis
+
+    fake = fakeredis.FakeStrictRedis()
+
+    with (
+        patch("src.services.state_engine.redis_available", return_value=True),
+        patch("src.services.state_engine.get_redis", return_value=fake),
+    ):
+        from src.services.state_engine import _try_acquire_redis_lock
+
+        entity_uuid = str(uuid.uuid4())
+
+        first = _try_acquire_redis_lock("person", entity_uuid)
+        assert first is True
+
+        second = _try_acquire_redis_lock("person", entity_uuid)
+        assert second is False, (
+            "A concurrent caller for the same entity must be denied the "
+            "Redis lock while the first caller still holds it"
+        )
+
+
+def test_redis_lock_different_entities_do_not_contend():
+    """Two different entity_uuids must not block each other — the lock key
+    is scoped per entity, not global."""
+    import fakeredis
+
+    fake = fakeredis.FakeStrictRedis()
+
+    with (
+        patch("src.services.state_engine.redis_available", return_value=True),
+        patch("src.services.state_engine.get_redis", return_value=fake),
+    ):
+        from src.services.state_engine import _try_acquire_redis_lock
+
+        first = _try_acquire_redis_lock("person", str(uuid.uuid4()))
+        second = _try_acquire_redis_lock("person", str(uuid.uuid4()))
+        assert first is True
+        assert second is True
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_transition_with_redis_lock_enabled_end_to_end(fresh_db):
+    """End-to-end: transition(acquire_redis_lock=True) — the parameter every
+    other test in this file sets to False — actually acquires and releases
+    the Redis lock as part of a real transition, against fakeredis."""
+    import fakeredis
+
+    from src.services.state_engine import (
+        TransitionOutcome,
+        ensure_entity_registry,
+        make_idempotency_key,
+        transition,
+    )
+
+    fresh_db.execute(text("""
+        INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
+        VALUES (gen_random_uuid(), 'identified', 'test')
+    """))
+    person_id = fresh_db.execute(
+        text("SELECT person_id::text FROM fa_max_persons ORDER BY created_at DESC LIMIT 1")
+    ).scalar()
+    entity_uuid = ensure_entity_registry(session=fresh_db, entity_type="person", native_id=person_id)
+
+    fake = fakeredis.FakeStrictRedis()
+    key = f"lock:state:person:{entity_uuid}"
+
+    with (
+        patch("src.services.state_engine._acquire_pg_advisory_lock"),
+        patch("src.services.state_engine.redis_available", return_value=True),
+        patch("src.services.state_engine.get_redis", return_value=fake),
+    ):
+        result = transition(
+            session=fresh_db,
+            entity_type="person",
+            entity_uuid=entity_uuid,
+            from_state="identified",
+            to_state="qualifying",
+            actor="agent:test",
+            source_component="test",
+            idempotency_key=make_idempotency_key(
+                entity_uuid, "identified", "qualifying", "agent:test", epoch_minute=70
+            ),
+            person_id=person_id,
+            acquire_redis_lock=True,  # the path nothing else in this file exercises
+            validate_allowed_next=False,
+        )
+
+    assert result.outcome == TransitionOutcome.succeeded
+    # The lock must be released after the transition completes — held locks
+    # that never release would starve every subsequent worker on this entity.
+    assert fake.exists(key) == 0, "Redis lock must be released after transition completes"
+
+
 # ---------------------------------------------------------------------------
 # Category 13 — Compliance boundary: NO financial columns on FA Max tables
 # ---------------------------------------------------------------------------
@@ -799,6 +930,54 @@ def test_get_person_state_returns_row(fresh_db):
 
 
 @pytest.mark.usefixtures("fresh_db")
+def test_get_opportunity_state_returns_none_for_unknown(fresh_db):
+    """get_opportunity_state returns None when opportunity_id does not exist."""
+    from src.services.state_engine import get_opportunity_state
+
+    result = get_opportunity_state(session=fresh_db, opportunity_id=str(uuid.uuid4()))
+    assert result is None
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_get_opportunity_state_returns_row(fresh_db):
+    """get_opportunity_state reads current_stage — the CAS from_state callers
+    must load before calling transition() rather than trusting a stale
+    caller-supplied value (WP-2's Slack-approval caller depends on this)."""
+    from src.services.state_engine import get_opportunity_state
+
+    fresh_db.execute(text("""
+        INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
+        VALUES (gen_random_uuid(), 'identified', 'test')
+    """))
+    person_id = fresh_db.execute(
+        text("SELECT person_id::text FROM fa_max_persons ORDER BY created_at DESC LIMIT 1")
+    ).scalar()
+
+    fresh_db.execute(
+        text("""
+            INSERT INTO fa_max_opportunities
+                (person_id, opportunity_type, current_stage, source)
+            VALUES (:person_id ::uuid, 'acquisition', 'new', 'test')
+        """),
+        {"person_id": person_id},
+    )
+    opportunity_id = fresh_db.execute(
+        text("SELECT opportunity_id::text FROM fa_max_opportunities ORDER BY created_at DESC LIMIT 1")
+    ).scalar()
+
+    result = get_opportunity_state(session=fresh_db, opportunity_id=opportunity_id)
+    assert result is not None
+    assert result["opportunity_id"] == opportunity_id
+    assert result["person_id"] == person_id
+    assert result["current_stage"] == "new"
+    assert result["opportunity_type"] == "acquisition"
+    assert result["outcome"] == "open"
+    # Internal-only scenario fields must never be returned from this read path.
+    assert "loan_amount_cents" not in result
+    assert "maturity_months" not in result
+
+
+@pytest.mark.usefixtures("fresh_db")
 def test_get_person_history_returns_ordered_events(fresh_db):
     """WP-1 Done-When: 'complete ordered history of a borrower can be queried.'"""
     from src.services.state_engine import (
@@ -856,6 +1035,162 @@ def test_get_person_history_returns_ordered_events(fresh_db):
     assert history[2]["from_state"] == "warm"
     assert history[2]["to_state"] == "active"
     assert history[2]["actor"] == "user:josh"
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_get_person_history_includes_opportunity_events_for_same_borrower(fresh_db):
+    """WP-1 Done-When claims 'complete ordered history' — the docstring on
+    get_person_history explicitly claims this includes opportunities/
+    properties/interactions via the person_id partition key, not just
+    entity_type='person' events. This must be tested with a REAL opportunity
+    transition, not just three person-type transitions (the only case the
+    original test covered) — person_id is an optional kwarg on transition()
+    and a caller that forgets to pass it produces an event invisible to this
+    query with no error raised anywhere.
+    """
+    from src.services.state_engine import (
+        ensure_entity_registry,
+        get_person_history,
+        make_idempotency_key,
+        transition,
+    )
+
+    fresh_db.execute(text("""
+        INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
+        VALUES (gen_random_uuid(), 'identified', 'test')
+    """))
+    person_id = fresh_db.execute(
+        text("SELECT person_id::text FROM fa_max_persons ORDER BY created_at DESC LIMIT 1")
+    ).scalar()
+    person_entity_uuid = ensure_entity_registry(
+        session=fresh_db, entity_type="person", native_id=person_id
+    )
+
+    fresh_db.execute(
+        text("""
+            INSERT INTO fa_max_opportunities
+                (person_id, opportunity_type, current_stage, source)
+            VALUES (:person_id ::uuid, 'acquisition', 'new', 'test')
+        """),
+        {"person_id": person_id},
+    )
+    opportunity_id = fresh_db.execute(
+        text("SELECT opportunity_id::text FROM fa_max_opportunities ORDER BY created_at DESC LIMIT 1")
+    ).scalar()
+    opportunity_entity_uuid = ensure_entity_registry(
+        session=fresh_db, entity_type="opportunity", native_id=opportunity_id
+    )
+
+    with patch("src.services.state_engine._acquire_pg_advisory_lock"):
+        # One person-type transition
+        transition(
+            session=fresh_db,
+            entity_type="person",
+            entity_uuid=person_entity_uuid,
+            from_state="identified",
+            to_state="qualifying",
+            actor="agent:intake",
+            source_component="test",
+            idempotency_key=make_idempotency_key(
+                person_entity_uuid, "identified", "qualifying", "agent:intake", epoch_minute=60
+            ),
+            person_id=person_id,
+            acquire_redis_lock=False,
+            validate_allowed_next=False,
+        )
+        # One opportunity-type transition for the SAME borrower — this is
+        # the case admin_router._handle_relay_decision's fa_max_transition
+        # branch exercises. person_id must be passed explicitly here.
+        transition(
+            session=fresh_db,
+            entity_type="opportunity",
+            entity_uuid=opportunity_entity_uuid,
+            from_state="new",
+            to_state="qualifying",
+            actor="agent:cora",
+            source_component="test",
+            idempotency_key=make_idempotency_key(
+                opportunity_entity_uuid, "new", "qualifying", "agent:cora", epoch_minute=61
+            ),
+            person_id=person_id,
+            acquire_redis_lock=False,
+            validate_allowed_next=False,
+        )
+
+    history = get_person_history(session=fresh_db, person_id=person_id)
+
+    assert len(history) == 2, (
+        "get_person_history must return events from BOTH entity types "
+        "(person and opportunity) for this borrower — got only "
+        f"{len(history)} event(s): {[h['entity_type'] for h in history]}"
+    )
+    entity_types_seen = {h["entity_type"] for h in history}
+    assert entity_types_seen == {"person", "opportunity"}, (
+        f"Expected both person and opportunity events, got {entity_types_seen}"
+    )
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_transition_without_person_id_is_invisible_to_person_history(fresh_db):
+    """Negative control proving the failure mode this WP-2 bug actually
+    produced: transition() with person_id omitted writes an event row with
+    person_id=NULL, and get_person_history() for the real borrower returns
+    NOTHING for it — no error, no warning, just a silently incomplete
+    history. This is exactly what admin_router._handle_relay_decision's
+    fa_max_transition branch did before it was fixed to pass person_id.
+    """
+    from src.services.state_engine import (
+        ensure_entity_registry,
+        get_person_history,
+        make_idempotency_key,
+        transition,
+    )
+
+    fresh_db.execute(text("""
+        INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
+        VALUES (gen_random_uuid(), 'identified', 'test')
+    """))
+    person_id = fresh_db.execute(
+        text("SELECT person_id::text FROM fa_max_persons ORDER BY created_at DESC LIMIT 1")
+    ).scalar()
+
+    fresh_db.execute(
+        text("""
+            INSERT INTO fa_max_opportunities
+                (person_id, opportunity_type, current_stage, source)
+            VALUES (:person_id ::uuid, 'acquisition', 'new', 'test')
+        """),
+        {"person_id": person_id},
+    )
+    opportunity_id = fresh_db.execute(
+        text("SELECT opportunity_id::text FROM fa_max_opportunities ORDER BY created_at DESC LIMIT 1")
+    ).scalar()
+    opportunity_entity_uuid = ensure_entity_registry(
+        session=fresh_db, entity_type="opportunity", native_id=opportunity_id
+    )
+
+    with patch("src.services.state_engine._acquire_pg_advisory_lock"):
+        transition(
+            session=fresh_db,
+            entity_type="opportunity",
+            entity_uuid=opportunity_entity_uuid,
+            from_state="new",
+            to_state="qualifying",
+            actor="agent:cora",
+            source_component="test",
+            idempotency_key=make_idempotency_key(
+                opportunity_entity_uuid, "new", "qualifying", "agent:cora", epoch_minute=62
+            ),
+            # person_id intentionally omitted — reproduces the WP-2 bug
+            acquire_redis_lock=False,
+            validate_allowed_next=False,
+        )
+
+    history = get_person_history(session=fresh_db, person_id=person_id)
+    assert history == [], (
+        "This documents the real failure mode: omitting person_id silently "
+        "drops the event from borrower history with no error raised"
+    )
 
 
 @pytest.mark.usefixtures("fresh_db")
@@ -939,6 +1274,144 @@ def test_crash_recovery_simulated_via_rollback(fresh_db):
         {"pid": person_id},
     ).scalar()
     assert state_after_recovery == "qualifying"
+
+
+def test_real_worker_kill_second_instance_resumes(pg_engine):
+    """WP-1 Done-When (literal reading): a worker is actually killed mid-task —
+    its DB connection is dropped with an open, uncommitted transaction — and a
+    SECOND, independent worker instance (its own connection/session) resumes
+    and completes the work.
+
+    Unlike test_crash_recovery_simulated_via_rollback (which reuses one
+    session and calls .rollback() itself — not a real kill, and never proves
+    a second instance can proceed), this test:
+      1. Opens two genuinely separate connections (worker A, worker B).
+      2. Has worker A acquire the pg_advisory_xact_lock via transition() and
+         NOT commit.
+      3. Proves, from worker B, that the lock is actually held (a real
+         pg_try_advisory_xact_lock attempt fails) while A is alive.
+      4. Kills worker A's connection outright (raw DBAPI .close(), no commit,
+         no rollback call — simulating SIGKILL, not graceful shutdown).
+      5. Proves worker B can now acquire the lock and complete the transition
+         that A never finished, and that A's uncommitted write left no trace.
+    """
+    if pg_engine is None:
+        pytest.skip("DATABASE_URL not configured — skipping real-connection test")
+
+    from sqlalchemy.orm import Session as SASession
+    from src.services.state_engine import (
+        TransitionOutcome,
+        ensure_entity_registry,
+        make_idempotency_key,
+        transition,
+    )
+
+    # Setup on its own committed connection so it's visible to both workers.
+    setup_conn = pg_engine.connect()
+    setup_trans = setup_conn.begin()
+    setup_session = SASession(bind=setup_conn)
+    setup_session.execute(text("""
+        INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
+        VALUES (gen_random_uuid(), 'identified', 'test')
+    """))
+    person_id = setup_session.execute(
+        text("SELECT person_id::text FROM fa_max_persons ORDER BY created_at DESC LIMIT 1")
+    ).scalar()
+    entity_uuid = ensure_entity_registry(session=setup_session, entity_type="person", native_id=person_id)
+    setup_session.close()
+    setup_trans.commit()
+    setup_conn.close()
+
+    # --- Worker A: acquire the lock, start a transition, never commit -------
+    conn_a = pg_engine.connect()
+    trans_a = conn_a.begin()
+    session_a = SASession(bind=conn_a)
+
+    ikey_a = make_idempotency_key(entity_uuid, "identified", "qualifying", "agent:worker-a", epoch_minute=50)
+    result_a = transition(
+        session=session_a,
+        entity_type="person",
+        entity_uuid=entity_uuid,
+        from_state="identified",
+        to_state="qualifying",
+        actor="agent:worker-a",
+        source_component="test",
+        idempotency_key=ikey_a,
+        acquire_redis_lock=False,
+        validate_allowed_next=False,
+    )
+    assert result_a.outcome == TransitionOutcome.succeeded
+    # Deliberately NOT committing trans_a — worker A is about to "die".
+
+    # --- Prove the lock is genuinely held while worker A is alive -----------
+    conn_probe = pg_engine.connect()
+    lock_held = conn_probe.execute(
+        text("SELECT pg_try_advisory_xact_lock(hashtext(:key))"),
+        {"key": str(entity_uuid)},
+    ).scalar()
+    conn_probe.close()  # releases the probe's own xact scope regardless
+    assert lock_held is False, (
+        "pg_try_advisory_xact_lock must fail while worker A's transaction "
+        "still holds pg_advisory_xact_lock on this entity_uuid"
+    )
+
+    # --- Kill worker A: raw connection close, no commit/rollback call -------
+    # This simulates SIGKILL — Postgres itself aborts the backend's open
+    # transaction and releases every advisory lock it held, without any
+    # cooperation from application code.
+    raw_dbapi_conn = conn_a.connection
+    raw_dbapi_conn.close()
+
+    # --- Worker B: a second, independent instance resumes -------------------
+    conn_b = pg_engine.connect()
+    trans_b = conn_b.begin()
+    session_b = SASession(bind=conn_b)
+
+    # State must still read 'identified' — worker A's write was never
+    # committed, so it left no trace for worker B to see.
+    state_before_b = session_b.execute(
+        text("SELECT lifecycle_state FROM fa_max_persons WHERE person_id = :pid ::uuid"),
+        {"pid": person_id},
+    ).scalar()
+    assert state_before_b == "identified", (
+        "Worker A's uncommitted transition must not be visible — "
+        "no partial/torn write from the killed worker"
+    )
+
+    ikey_b = make_idempotency_key(entity_uuid, "identified", "qualifying", "agent:worker-b", epoch_minute=51)
+    result_b = transition(
+        session=session_b,
+        entity_type="person",
+        entity_uuid=entity_uuid,
+        from_state="identified",
+        to_state="qualifying",
+        actor="agent:worker-b",
+        source_component="test",
+        idempotency_key=ikey_b,
+        acquire_redis_lock=False,
+        validate_allowed_next=False,
+    )
+    assert result_b.outcome == TransitionOutcome.succeeded, (
+        "Worker B must be able to acquire the advisory lock and complete "
+        "the transition after worker A was killed — this is the actual "
+        "'another instance resumes with no loss' guarantee"
+    )
+    trans_b.commit()
+
+    final_state = conn_b.execute(
+        text("SELECT lifecycle_state FROM fa_max_persons WHERE person_id = :pid ::uuid"),
+        {"pid": person_id},
+    ).scalar()
+    assert final_state == "qualifying"
+
+    # Cleanup
+    session_b.close()
+    conn_b.close()
+    try:
+        trans_a.rollback()
+    except Exception:
+        pass  # connection already closed — expected
+    conn_a.close()
 
 
 @pytest.mark.usefixtures("fresh_db")

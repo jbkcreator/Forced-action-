@@ -203,6 +203,46 @@ def get_person_state(*, session: Session, person_id: str) -> Optional[Dict[str, 
     return dict(row._mapping)
 
 
+def get_opportunity_state(*, session: Session, opportunity_id: str) -> Optional[Dict[str, Any]]:
+    """Load the current stage for an opportunity. Returns None if not found.
+
+    Callers (e.g. admin_router._handle_relay_decision's fa_max_transition
+    branch) must load current_stage here BEFORE calling transition() with
+    entity_type='opportunity' — transition() is a CAS write keyed on the
+    caller-supplied from_state, so a stale/guessed from_state produces a
+    silent already_advanced outcome instead of the intended transition.
+
+    Mirrors get_person_state's shape and the _node_load_profile
+    abort-if-not-found pattern from src/agents/graphs/retention.py.
+
+    loan_amount_cents/maturity_months are intentionally excluded from the
+    returned dict — internal-only scenario fields, never surfaced outside
+    the module that computes them (SOT.md: no pricing/term output).
+    """
+    row = session.execute(
+        text("""
+            SELECT
+                o.opportunity_id::text,
+                o.person_id::text,
+                o.opportunity_type,
+                o.current_stage,
+                o.outcome,
+                o.source,
+                o.source_reference,
+                o.created_at,
+                o.updated_at
+            FROM fa_max_opportunities o
+            WHERE o.opportunity_id = :opportunity_id ::uuid
+        """),
+        {"opportunity_id": opportunity_id},
+    ).fetchone()
+
+    if row is None:
+        return None
+
+    return dict(row._mapping)
+
+
 def get_person_history(
     *, session: Session, person_id: str, limit: int = 100
 ) -> list[Dict[str, Any]]:
