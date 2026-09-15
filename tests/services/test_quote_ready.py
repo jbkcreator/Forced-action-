@@ -4,6 +4,7 @@ Seam: compute_quote_ready(QuoteReadyInput) → QuoteReadyResult
 No DB, no network, no mocks. Fixture in, object out.
 """
 from decimal import Decimal
+from uuid import UUID
 
 import pytest
 from pydantic import ValidationError
@@ -17,7 +18,8 @@ from src.services.quote_ready import compute_quote_ready, QuoteReadyInput
 
 def test_full_inputs_produces_all_figures():
     inp = QuoteReadyInput(
-        property_id="prop-001",
+        opportunity_id=UUID("00000000-0000-0000-0000-000000000001"),
+        property_id=1,
         purchase_price=Decimal("200000"),
         rehab_estimate=Decimal("50000"),
         arv=Decimal("320000"),
@@ -48,7 +50,8 @@ def test_full_inputs_produces_all_figures():
 
 def test_arv_absent_degrades_to_ltc_only():
     inp = QuoteReadyInput(
-        property_id="prop-002",
+        opportunity_id=UUID("00000000-0000-0000-0000-000000000002"),
+        property_id=2,
         purchase_price=Decimal("150000"),
         rehab_estimate=Decimal("30000"),
         arv=None,
@@ -69,7 +72,8 @@ def test_arv_absent_degrades_to_ltc_only():
 
 def test_rehab_absent_missing_is_complete():
     inp = QuoteReadyInput(
-        property_id="prop-003",
+        opportunity_id=UUID("00000000-0000-0000-0000-000000000003"),
+        property_id=3,
         purchase_price=Decimal("100000"),
         rehab_estimate=None,
         arv=Decimal("200000"),
@@ -92,7 +96,8 @@ def test_rehab_absent_missing_is_complete():
 
 def test_purchase_fallback_to_estimated_value():
     inp = QuoteReadyInput(
-        property_id="prop-004",
+        opportunity_id=UUID("00000000-0000-0000-0000-000000000004"),
+        property_id=4,
         estimated_value=Decimal("180000"),
         rehab_estimate=Decimal("20000"),
         arv=Decimal("250000"),
@@ -113,7 +118,8 @@ def test_purchase_fallback_to_estimated_value():
 
 def test_purchase_fallback_to_assessed_value_mkt_low_confidence():
     inp = QuoteReadyInput(
-        property_id="prop-005",
+        opportunity_id=UUID("00000000-0000-0000-0000-000000000005"),
+        property_id=5,
         assessed_value_mkt=Decimal("120000"),
         rehab_estimate=Decimal("15000"),
         arv=Decimal("185000"),
@@ -132,7 +138,8 @@ def test_purchase_fallback_to_assessed_value_mkt_low_confidence():
 
 def test_purchase_fallback_to_last_sale_price():
     inp = QuoteReadyInput(
-        property_id="prop-006",
+        opportunity_id=UUID("00000000-0000-0000-0000-000000000006"),
+        property_id=6,
         last_sale_price=Decimal("110000"),
         rehab_estimate=Decimal("20000"),
         arv=Decimal("185000"),
@@ -151,7 +158,8 @@ def test_purchase_fallback_to_last_sale_price():
 
 def test_assessed_value_mkt_before_last_sale_price():
     inp = QuoteReadyInput(
-        property_id="prop-007",
+        opportunity_id=UUID("00000000-0000-0000-0000-000000000007"),
+        property_id=7,
         assessed_value_mkt=Decimal("100000"),
         last_sale_price=Decimal("90000"),
         rehab_estimate=Decimal("10000"),
@@ -171,7 +179,8 @@ def test_assessed_value_mkt_before_last_sale_price():
 
 def test_low_confidence_basis_propagates_to_derived_figures():
     inp = QuoteReadyInput(
-        property_id="prop-008",
+        opportunity_id=UUID("00000000-0000-0000-0000-000000000008"),
+        property_id=8,
         assessed_value_mkt=Decimal("80000"),
         rehab_estimate=Decimal("30000"),
         arv=Decimal("160000"),
@@ -192,7 +201,8 @@ def test_low_confidence_basis_propagates_to_derived_figures():
 
 def test_low_confidence_arv_propagates():
     inp = QuoteReadyInput(
-        property_id="prop-009",
+        opportunity_id=UUID("00000000-0000-0000-0000-000000000009"),
+        property_id=9,
         purchase_price=Decimal("100000"),
         rehab_estimate=Decimal("20000"),
         arv=Decimal("300000"),
@@ -215,7 +225,8 @@ def test_low_confidence_arv_propagates():
 
 def test_rehab_override_confidence_and_source():
     inp = QuoteReadyInput(
-        property_id="prop-010",
+        opportunity_id=UUID("00000000-0000-0000-0000-000000000010"),
+        property_id=10,
         purchase_price=Decimal("100000"),
         rehab_estimate=Decimal("20000"),
         rehab_source="override",
@@ -236,7 +247,8 @@ def test_rehab_override_confidence_and_source():
 
 def test_low_confidence_manual_override_not_promoted():
     inp = QuoteReadyInput(
-        property_id="prop-010b",
+        opportunity_id=UUID("00000000-0000-0000-0000-000000000010"),
+        property_id=10,
         purchase_price=Decimal("100000"),
         rehab_estimate=Decimal("20000"),
         rehab_source="override",
@@ -253,7 +265,8 @@ def test_low_confidence_manual_override_not_promoted():
 
 def test_high_confidence_estimator_configurable():
     inp = QuoteReadyInput(
-        property_id="prop-010c",
+        opportunity_id=UUID("00000000-0000-0000-0000-000000000010"),
+        property_id=10,
         purchase_price=Decimal("100000"),
         rehab_estimate=Decimal("20000"),
         rehab_source="job_estimator",
@@ -273,7 +286,8 @@ def test_high_confidence_estimator_configurable():
 
 def test_arv_source_preserved_in_ltv_and_binding_loan():
     inp = QuoteReadyInput(
-        property_id="prop-010d",
+        opportunity_id=UUID("00000000-0000-0000-0000-000000000010"),
+        property_id=10,
         purchase_price=Decimal("300000"),
         rehab_estimate=Decimal("50000"),
         arv=Decimal("200000"),
@@ -294,7 +308,8 @@ def test_arv_source_preserved_in_ltv_and_binding_loan():
 
 def test_zero_arv_flagged_missing_not_silent():
     inp = QuoteReadyInput(
-        property_id="prop-011",
+        opportunity_id=UUID("00000000-0000-0000-0000-000000000011"),
+        property_id=11,
         purchase_price=Decimal("100000"),
         rehab_estimate=Decimal("30000"),
         arv=Decimal("0"),
@@ -316,7 +331,8 @@ def test_zero_arv_flagged_missing_not_silent():
 
 def test_zero_project_cost_downstream_all_missing():
     inp = QuoteReadyInput(
-        property_id="prop-012",
+        opportunity_id=UUID("00000000-0000-0000-0000-000000000012"),
+        property_id=12,
         purchase_price=Decimal("0"),
         rehab_estimate=Decimal("0"),
         arv=Decimal("200000"),
@@ -340,7 +356,8 @@ def test_zero_project_cost_downstream_all_missing():
 def test_negative_cap_rejected():
     with pytest.raises(ValidationError):
         QuoteReadyInput(
-            property_id="prop-013",
+            opportunity_id=UUID("00000000-0000-0000-0000-000000000013"),
+        property_id=13,
             purchase_price=Decimal("100000"),
             rehab_estimate=Decimal("20000"),
             max_ltc=Decimal("-0.80"),
@@ -351,7 +368,8 @@ def test_negative_cap_rejected():
 def test_negative_monetary_input_rejected():
     with pytest.raises(ValidationError):
         QuoteReadyInput(
-            property_id="prop-013b",
+            opportunity_id=UUID("00000000-0000-0000-0000-000000000013"),
+        property_id=13,
             purchase_price=Decimal("-100000"),
             rehab_estimate=Decimal("20000"),
             max_ltc=Decimal("0.80"),
@@ -365,7 +383,8 @@ def test_negative_monetary_input_rejected():
 
 def test_display_precision():
     inp = QuoteReadyInput(
-        property_id="prop-014",
+        opportunity_id=UUID("00000000-0000-0000-0000-000000000014"),
+        property_id=14,
         purchase_price=Decimal("100000"),
         rehab_estimate=Decimal("33333"),
         arv=Decimal("200000"),
@@ -388,7 +407,8 @@ def test_display_precision():
 
 def test_determinism():
     inp = QuoteReadyInput(
-        property_id="prop-015",
+        opportunity_id=UUID("00000000-0000-0000-0000-000000000015"),
+        property_id=15,
         purchase_price=Decimal("175000"),
         rehab_estimate=Decimal("40000"),
         arv=Decimal("280000"),
