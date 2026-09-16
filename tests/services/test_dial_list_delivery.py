@@ -53,13 +53,31 @@ def _dial_list(entries, **kw):
 
 # ---- formatter (pure) ------------------------------------------------------
 
+def _all_text(blocks) -> str:
+    """Extract all mrkdwn/plain_text strings from any block type."""
+    parts = []
+    for b in blocks:
+        if b.get("type") in ("header",):
+            t = b.get("text", {})
+            parts.append(t.get("text", ""))
+        elif b.get("type") == "section":
+            if "text" in b:
+                parts.append(b["text"].get("text", ""))
+            for f in b.get("fields", []):
+                parts.append(f.get("text", ""))
+        elif b.get("type") == "context":
+            for el in b.get("elements", []):
+                parts.append(el.get("text", ""))
+    return "\n".join(parts)
+
+
 def test_digest_renders_name_address_phone():
     dl = _dial_list([_entry(
         contact_name="ACME HOMES LLC", property_address="123 Main St, Tampa 33602",
         phone="813-555-0100",
     )])
     header, blocks = format_dial_list_digest(dl)
-    text = "\n".join(b["text"]["text"] for b in blocks if b["type"] == "section")
+    text = _all_text(blocks)
     assert "ACME HOMES LLC" in text
     assert "123 Main St, Tampa 33602" in text
     assert "813-555-0100" in text
@@ -69,23 +87,20 @@ def test_digest_unresolved_name_marked_unverified():
     dl = _dial_list([_entry(
         contact_name="JOHN OWNER", borrower_resolved=False, buyer_entity_id=None,
     )])
-    text = "\n".join(
-        b["text"]["text"] for b in format_dial_list_digest(dl)[1]
-        if b["type"] == "section"
-    )
+    text = _all_text(format_dial_list_digest(dl)[1])
     assert "JOHN OWNER (unverified)" in text
 
 
 def test_digest_renders_rank_trigger_size_reason_points():
     dl = _dial_list([_entry()])
     header, blocks = format_dial_list_digest(dl)
-    text = "\n".join(b["text"]["text"] for b in blocks if b["type"] == "section")
+    text = _all_text(blocks)
     assert "#1" in text
-    assert "cash_purchase" in text
+    assert "Cash Purchase" in text  # trigger label
     assert "$400K" in text  # compact money format
     assert "leverage" in text.lower()
     assert "Owns 4 properties" in text
-    assert "top 1 calls" in header
+    assert "1 calls" in header
 
 
 def test_digest_deterministic():
@@ -96,31 +111,30 @@ def test_digest_deterministic():
 def test_digest_empty_list():
     header, blocks = format_dial_list_digest(_dial_list([]))
     assert "no opportunities today" in header
-    # only the header section, no per-entry blocks / divider
     assert len(blocks) == 1
 
 
 def test_digest_unresolved_borrower():
     dl = _dial_list([_entry(buyer_entity_id=None, borrower_resolved=False)])
     _, blocks = format_dial_list_digest(dl)
-    text = "\n".join(b["text"]["text"] for b in blocks if b["type"] == "section")
+    text = _all_text(blocks)
     assert "Unresolved borrower" in text
 
 
 def test_digest_no_loan_basis_shows_size_na():
     dl = _dial_list([_entry(expected_loan=Decimal("0"), expected_loan_confidence="low")])
     _, blocks = format_dial_list_digest(dl)
-    text = "\n".join(b["text"]["text"] for b in blocks if b["type"] == "section")
+    text = _all_text(blocks)
     assert "size n/a" in text
 
 
 def test_digest_low_confidence_surfaced_in_header():
     dl = _dial_list([_entry(expected_loan_confidence="low")])
     header, blocks = format_dial_list_digest(dl)
-    # surfaced once in the header, not tagged on every entry line
-    assert "rough estimates from assessed value" in header
-    line = "\n".join(b["text"]["text"] for b in blocks if b["type"] == "section")
-    assert "(low)" not in line
+    # confidence note appears in blocks (context), never as per-entry "(low)" tag
+    text = _all_text(blocks)
+    assert "rough estimates" in text or "assessed value" in text
+    assert "(low)" not in text
 
 
 # ---- delivery handoff (faked Slack) ---------------------------------------

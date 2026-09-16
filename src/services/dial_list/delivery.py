@@ -62,19 +62,63 @@ def _size_label(entry: DialListEntry) -> str:
     return f"~{_money_short(entry.expected_loan)}"
 
 
-def _entry_line(entry: DialListEntry) -> str:
-    triggers = ", ".join(entry.triggers) if entry.triggers else "—"
-    phone = f" · :phone: {entry.phone}" if entry.phone else ""
-    line = (
-        f"*#{entry.rank}* — *{_name_label(entry)}*{phone}\n"
-        f"  {_property_label(entry)}\n"
-        f"  _{triggers}_ · Est. {_size_label(entry)}\n"
-        f"  {entry.reason}"
-    )
+def _trigger_label(trigger: str) -> str:
+    _LABELS = {
+        "cash_purchase": "💵 Cash Purchase",
+        "stalled_flip": "🔨 Stalled Flip",
+        "permits_no_financing": "📋 Permits / No Financing",
+        "auction_probate": "⚖️ Auction / Probate",
+        "out_of_state": "✈️ Out-of-State",
+        "financing_intent": "💬 Financing Intent",
+        "builder": "🏗️ Builder",
+        "maturities": "⏰ Maturity Approaching",
+        "exchange_1031": "🔄 1031 Exchange",
+        "price_drop": "📉 Price Drop",
+        "expired_listing": "❌ Expired Listing",
+    }
+    return _LABELS.get(trigger, trigger.replace("_", " ").title())
+
+
+def _entry_blocks(entry: DialListEntry, as_of: object, interactive: bool) -> List[Dict[str, Any]]:
+    name = _name_label(entry)
+    phone = entry.phone or "—"
+    address = _property_label(entry)
+    size = _size_label(entry)
+    triggers = "  ".join(_trigger_label(t) for t in entry.triggers) if entry.triggers else "—"
+
+    blocks: List[Dict[str, Any]] = [
+        {"type": "divider"},
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*#{entry.rank} — {name}*\n📞 {phone}"},
+                {"type": "mrkdwn", "text": f"*Property*\n{address}"},
+            ],
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Est. Loan*\n{size}"},
+                {"type": "mrkdwn", "text": f"*Signals*\n{triggers}"},
+            ],
+        },
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": f"_{entry.reason}_"}],
+        },
+    ]
+
     if entry.talking_points:
-        points = "\n".join(f"    • {p}" for p in entry.talking_points)
-        line = f"{line}\n{points}"
-    return line
+        points_text = "   •   ".join(entry.talking_points)
+        blocks.append({
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": f"💡  {points_text}"}],
+        })
+
+    if interactive:
+        blocks.append(_actions_block(entry, as_of))
+
+    return blocks
 
 
 def _entry_value(entry: DialListEntry, as_of: object, **extra: object) -> str:
@@ -116,58 +160,69 @@ def _actions_block(entry: DialListEntry, as_of: object) -> Dict[str, Any]:
                 ],
             },
             {
-                "type": "button", "action_id": ACTION_SKIP,
-                "text": {"type": "plain_text", "text": ":fast_forward: Skip"},
+                "type": "button", "action_id": ACTION_SKIP, "style": "danger",
+                "text": {"type": "plain_text", "text": "⏭ Skip"},
                 "value": base,
             },
         ],
     }
 
 
-def _header_text(dial_list: DialList) -> str:
+def _header_blocks(dial_list: DialList) -> Tuple[str, List[Dict[str, Any]]]:
     n = len(dial_list.entries)
+    date_str = dial_list.generated_for.strftime("%A, %B ") + str(dial_list.generated_for.day)
     if n == 0:
-        return f"*Dial List — {dial_list.generated_for}* — no opportunities today"
-    header = (
-        f"*Dial List — {dial_list.generated_for}* — top {n} calls "
-        f"({dial_list.candidate_count} candidates · {dial_list.config_version})"
-    )
-    if any(
+        fallback = f"📞 Dial List — {date_str} — no opportunities today"
+        return fallback, [{"type": "section", "text": {"type": "mrkdwn", "text": fallback}}]
+
+    fallback = f"📞 Dial List — {date_str} — {n} calls"
+    low_conf = any(
         e.expected_loan_confidence == "low" and e.expected_loan > _ZERO
         for e in dial_list.entries
-    ):
-        header += (
-            "\n_Sizes are rough estimates from assessed value "
-            "(ARV comps pending)._"
-        )
-    return header
+    )
+    size_note = "\n_⚠️ Some loan sizes are rough estimates (assessed value fallback — ARV comps pending)._" if low_conf else ""
+    header_text = (
+        f"*📞 Dial List — {date_str}*\n"
+        f"{n} calls  ·  {dial_list.candidate_count} candidates scored{size_note}"
+    )
+    blocks: List[Dict[str, Any]] = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": f"📞 Today's Call List — {date_str}"},
+        },
+        {
+            "type": "context",
+            "elements": [
+                {"type": "mrkdwn",
+                 "text": f"*{n} calls*  ·  {dial_list.candidate_count} candidates scored  ·  `{dial_list.config_version}`"},
+            ],
+        },
+    ]
+    if low_conf:
+        blocks.append({
+            "type": "context",
+            "elements": [{"type": "mrkdwn",
+                          "text": "⚠️ _Some loan sizes are rough estimates (assessed value fallback — ARV comps pending)._"}],
+        })
+    return fallback, blocks
 
 
 def format_dial_list_digest(
     dial_list: DialList, *, interactive: bool = False
 ) -> Tuple[str, List[Dict[str, Any]]]:
-    """Render a ``DialList`` into (header_text, Slack blocks). Pure, no I/O.
+    """Render a ``DialList`` into (fallback_text, Slack blocks). Pure, no I/O.
 
-    ``header_text`` is the message fallback/notification text; ``blocks`` is the
-    rich digest. Deterministic — same list in, same payload out. When
-    ``interactive`` is set, each entry is followed by a Called/Won/Lost/Skip
-    actions block (the read-only digest is the default).
+    When ``interactive`` is set, each entry card carries Called/Won/Lost/Skip buttons.
     """
-    header = _header_text(dial_list)
-    blocks: List[Dict[str, Any]] = [
-        {"type": "section", "text": {"type": "mrkdwn", "text": header}},
-    ]
+    fallback, blocks = _header_blocks(dial_list)
     if not dial_list.entries:
-        return header, blocks
+        return fallback, blocks
+
+    for entry in dial_list.entries:
+        blocks.extend(_entry_blocks(entry, dial_list.generated_for, interactive))
 
     blocks.append({"type": "divider"})
-    for entry in dial_list.entries:
-        blocks.append(
-            {"type": "section", "text": {"type": "mrkdwn", "text": _entry_line(entry)}}
-        )
-        if interactive:
-            blocks.append(_actions_block(entry, dial_list.generated_for))
-    return header, blocks
+    return fallback, blocks
 
 
 def _resolve_channel(explicit: Optional[str]) -> str:
