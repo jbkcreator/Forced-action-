@@ -57,6 +57,14 @@ def run(
             dial_list, ts = generate_and_deliver(
                 db, as_of=effective_as_of, county_id=county_id, interactive=True
             )
+            # A list with entries but no posted ts = Slack delivery failed (or
+            # posted only partially). Fail loud so the cron exits non-zero and
+            # monitoring does not read a broken run as success.
+            if dial_list.entries and ts is None:
+                raise RuntimeError(
+                    f"dial list delivery failed for {effective_as_of} "
+                    f"({len(dial_list.entries)} entries generated, none confirmed posted)"
+                )
             logger.info(
                 "[DialList] %s — %d entries posted (ts=%s)",
                 effective_as_of, len(dial_list.entries), ts,
