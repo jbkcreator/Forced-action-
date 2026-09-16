@@ -9344,6 +9344,8 @@ class BuyerEntityLink(Base):
         default=lambda: datetime.now(timezone.utc), server_default=func.now(),
     )
 
+    match_explanation: Mapped[Optional[str]] = mapped_column(Text)
+
     buyer_entity: Mapped["BuyerEntity"] = relationship("BuyerEntity", back_populates="links")
 
     __table_args__ = (
@@ -9367,6 +9369,127 @@ class BuyerEntityLink(Base):
         return (
             f"<BuyerEntityLink(entity_id={self.buyer_entity_id}, "
             f"source={self.source_table}:{self.source_id}, method={self.match_method!r})>"
+        )
+
+
+class BuyerEntityMergeLog(Base):
+    """
+    Append-only audit log for manual buyer entity merges and their reversals.
+
+    A merge collapses two buyer_entities rows into one by reassigning all
+    buyer_entity_links from the absorbed entity to the surviving entity, then
+    deleting the absorbed row. The absorbed row's full state is snapshotted
+    into absorbed_snapshot before deletion so an unmerge can restore it.
+
+    absorbed_id carries no FK because the row it referenced has been deleted.
+    restored_id is populated by unmerge_entity() with the new PK assigned to
+    the restored entity (old PK cannot be reused safely).
+    """
+    __tablename__ = "buyer_entity_merge_log"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    surviving_id: Mapped[int] = mapped_column(
+        ForeignKey("buyer_entities.id"), nullable=False, index=True,
+    )
+    absorbed_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    absorbed_snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    links_moved: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    merged_by: Mapped[str] = mapped_column(String(100), nullable=False)
+    merge_reason: Mapped[Optional[str]] = mapped_column(Text)
+    merged_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+    reversed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    reversed_by: Mapped[Optional[str]] = mapped_column(String(100))
+    restored_id: Mapped[Optional[int]] = mapped_column(Integer)
+    # Append-only history rows reassigned absorbed→surviving during the merge, so
+    # unmerge can move exactly those back (they carry no linked_at heuristic and
+    # would otherwise be lost to the buyer_entities ON DELETE CASCADE).
+    moved_ledger_event_ids: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb"),
+    )
+    moved_monitor_log_ids: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb"),
+    )
+
+    surviving_entity: Mapped["BuyerEntity"] = relationship(
+        "BuyerEntity", foreign_keys="[BuyerEntityMergeLog.surviving_id]",
+    )
+
+    __table_args__ = (
+        Index("idx_merge_log_surviving", "surviving_id"),
+        Index("idx_merge_log_absorbed", "absorbed_id"),
+        Index("idx_merge_log_active", "id", postgresql_where=text("reversed_at IS NULL")),
+    )
+
+
+class BorrowerLedgerEvent(Base):
+    """
+    Append-only longitudinal event timeline for a canonical buyer/borrower.
+
+    One row per meaningful event in a borrower's history — deed acquisitions,
+    foreclosures, permits, liens, legal proceedings, tax delinquencies, and
+    opportunities. Each row traces back to the raw source record via
+    (source_table, source_id), making the backfill idempotent and every
+    event auditable.
+
+    buyer_entity_id is the identity anchor (buyer_entities.id). property_id
+    is nullable because some events are person-level rather than
+    property-specific (e.g. opportunity_opened).
+
+    Never update rows — append only. Source data corrections produce a new
+    event, not a mutation of existing history.
+    """
+    __tablename__ = "borrower_ledger_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    buyer_entity_id: Mapped[int] = mapped_column(
+        ForeignKey("buyer_entities.id", ondelete="CASCADE"), nullable=False, index=True,
+    )
+    event_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    event_date: Mapped[date] = mapped_column(Date, nullable=False)
+    property_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("properties.id", ondelete="SET NULL"), nullable=True,
+    )
+    source_table: Mapped[str] = mapped_column(String(40), nullable=False)
+    source_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    summary: Mapped[Optional[str]] = mapped_column(Text)
+    amount: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 2))
+    meta: Mapped[Optional[dict]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+
+    buyer_entity: Mapped["BuyerEntity"] = relationship("BuyerEntity")
+    property: Mapped[Optional["Property"]] = relationship("Property")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "source_table", "source_id", "event_type", "buyer_entity_id",
+            name="uq_ble_source_event_entity",
+        ),
+        CheckConstraint(
+            "event_type IN ("
+            "'deed_acquisition','deed_sale',"
+            "'foreclosure_filed','foreclosure_resolved',"
+            "'permit_filed','permit_closed',"
+            "'lien_filed','lien_released',"
+            "'legal_proceeding_filed',"
+            "'tax_delinquency',"
+            "'opportunity_opened','opportunity_closed'"
+            ")",
+            name="ck_ble_event_type",
+        ),
+        Index("idx_ble_entity_date", "buyer_entity_id", "event_date"),
+        Index("idx_ble_property", "property_id", postgresql_where=text("property_id IS NOT NULL")),
+        Index("idx_ble_event_type", "event_type"),
+        Index("idx_ble_event_date", "event_date"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<BorrowerLedgerEvent(id={self.id}, entity={self.buyer_entity_id}, "
+            f"type={self.event_type!r}, date={self.event_date})>"
         )
 
 

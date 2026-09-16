@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 from src.agents.hunter.gating import verification_status
 from src.core.models import BuyerEntity, BuyerEntityLink
 from src.loaders.base import BaseLoader
+from src.services import phone_utils
 
 logger = logging.getLogger(__name__)
 
@@ -80,13 +81,15 @@ class CandidateRecord:
     entity_type_hint: Optional[str]      # Individual | LLC | Trust | Estate | Corporate (owners.owner_type); None for deed-sourced candidates
     managing_members: Optional[list]     # only populated for LLC-type owners rows
     county_id: Optional[str]
+    email: Optional[str] = None          # lowercased email_1 from owners; None for deed-sourced candidates
+    phone: Optional[str] = None          # E.164 phone_1 from owners via phone_utils.normalize; None for deed-sourced
 
 
 def _owners_query(only_unresolved: bool) -> str:
     where_unresolved = "AND bel.id IS NULL" if only_unresolved else ""
     return f"""
         SELECT o.id, o.owner_name, o.mailing_address, o.owner_type,
-               o.managing_members, o.county_id
+               o.managing_members, o.county_id, o.email_1, o.phone_1
         FROM owners o
         LEFT JOIN buyer_entity_links bel
             ON bel.source_table = 'owners' AND bel.source_id = o.id
@@ -137,6 +140,8 @@ def extract_owner_candidates(
             entity_type_hint=row.owner_type,
             managing_members=row.managing_members,
             county_id=row.county_id,
+            email=(row.email_1 or "").lower().strip() or None,
+            phone=phone_utils.normalize(row.phone_1),
         )
 
 
@@ -182,6 +187,7 @@ class MatchVerdict:
     is_match: bool
     confidence: int    # 0-100
     method: str        # sunbiz_llc_piercing | exact_name_address | fuzzy_name | llm_adjudicated
+    explanation: str = ""
 
 
 @dataclass(frozen=True)
@@ -299,9 +305,21 @@ def find_structural_edges(
                 if score < SUNBIZ_STRUCTURAL_MIN:
                     continue
                 seen_pairs.add(pair_key)
+                explanation = (
+                    f"Sunbiz managing_member '{a.person_name_normalized}' on "
+                    f"{a.source.source_table}#{a.source.source_id} matches "
+                    f"'{b.person_name_normalized}' on "
+                    f"{b.source.source_table}#{b.source.source_id} "
+                    f"(token_set_ratio={score})"
+                )
                 edges.append((
                     a.source, b.source,
-                    MatchVerdict(is_match=True, confidence=SUNBIZ_STRUCTURAL_CONFIDENCE, method="sunbiz_llc_piercing"),
+                    MatchVerdict(
+                        is_match=True,
+                        confidence=SUNBIZ_STRUCTURAL_CONFIDENCE,
+                        method="sunbiz_llc_piercing",
+                        explanation=explanation,
+                    ),
                 ))
     return edges
 
@@ -394,6 +412,13 @@ def score_candidate_pair(a: CandidateRecord, b: CandidateRecord) -> MatchVerdict
     'ambiguous' rather than an instant reject, since that's the one
     legitimate case this would otherwise wrongly kill — e.g. the same
     government entity filed under two valid mailing addresses.
+
+    Email and phone are corroboration signals only — an exact match on
+    either boosts a borderline name score (NAME_FUZZY_MIN ≤ score <
+    NAME_AUTO_MATCH_MIN) up to the exact_name_address tier, and confirms
+    a high name score (≥ NAME_AUTO_MATCH_MIN) even when no address is
+    available. Neither signal alone overrides a clearly disagreeing address
+    or a name score below the ambiguous floor.
     """
     name_score = fuzz.token_set_ratio(a.normalized_name, b.normalized_name)
 
@@ -403,23 +428,67 @@ def score_candidate_pair(a: CandidateRecord, b: CandidateRecord) -> MatchVerdict
     address_score: Optional[int] = None
     if a.mailing_address and b.mailing_address:
         address_score = fuzz.token_set_ratio(
-            _street_portion(a.mailing_address).casefold(), _street_portion(b.mailing_address).casefold(),
+            _street_portion(a.mailing_address).casefold(),
+            _street_portion(b.mailing_address).casefold(),
         )
 
     if address_score is not None and address_score < ADDRESS_DISAGREE_MAX:
         if name_score >= NAME_NEAR_IDENTICAL:
-            return MatchVerdict(is_match=False, confidence=0, method="ambiguous")
-        return MatchVerdict(is_match=False, confidence=0, method="no_match")
+            return MatchVerdict(
+                is_match=False, confidence=0, method="ambiguous",
+                explanation=f"name={name_score} (near-identical) but address disagrees (street={address_score})",
+            )
+        return MatchVerdict(
+            is_match=False, confidence=0, method="no_match",
+            explanation=f"name={name_score} but address clearly disagrees (street={address_score})",
+        )
+
+    email_match = bool(a.email and b.email and a.email == b.email)
+    phone_match = bool(a.phone and b.phone and a.phone == b.phone)
+    contact_corroborated = email_match or phone_match
+    contact_detail = (
+        f"email={a.email!r} matches" if email_match
+        else (f"phone={a.phone!r} matches" if phone_match else "")
+    )
 
     if name_score >= NAME_AUTO_MATCH_MIN and address_score is not None and address_score >= ADDRESS_AGREE_MIN:
+        explanation = f"name={name_score}, street={address_score}"
+        if contact_detail:
+            explanation += f", {contact_detail}"
         return MatchVerdict(
-            is_match=True, confidence=round((name_score + address_score) / 2), method="exact_name_address",
+            is_match=True,
+            confidence=round((name_score + address_score) / 2),
+            method="exact_name_address",
+            explanation=explanation,
+        )
+
+    if name_score >= NAME_AUTO_MATCH_MIN and contact_corroborated:
+        return MatchVerdict(
+            is_match=True, confidence=name_score, method="exact_name_address",
+            explanation=f"name={name_score}, {contact_detail} (no address)",
+        )
+
+    if name_score >= NAME_FUZZY_MIN and contact_corroborated:
+        return MatchVerdict(
+            is_match=True, confidence=name_score, method="exact_name_address",
+            explanation=f"name={name_score} boosted by {contact_detail}",
         )
 
     if name_score >= NAME_FUZZY_MIN:
-        return MatchVerdict(is_match=True, confidence=name_score, method="fuzzy_name")
+        addr_note = (
+            f", street={address_score}" if address_score is not None
+            else ", no address to corroborate"
+        )
+        return MatchVerdict(
+            is_match=True, confidence=name_score, method="fuzzy_name",
+            explanation=f"name={name_score}{addr_note}",
+        )
 
-    return MatchVerdict(is_match=False, confidence=0, method="ambiguous")
+    addr_note = f", street={address_score}" if address_score is not None else ""
+    return MatchVerdict(
+        is_match=False, confidence=0, method="ambiguous",
+        explanation=f"name={name_score}{addr_note}, below auto-match floors",
+    )
 
 
 def score_blocked_pairs(
@@ -510,6 +579,7 @@ def _parse_llm_verdict(response: str) -> Optional[MatchVerdict]:
         is_match=(verdict_word == "SAME"),
         confidence=confidence if verdict_word == "SAME" else 0,
         method="llm_adjudicated",
+        explanation=f"LLM: {verdict_word} confidence={confidence}",
     )
 
 
@@ -742,22 +812,22 @@ def compute_cluster_confidences(
 
 def build_evidence_index(
     edges: list[tuple[CandidateRecord, CandidateRecord, MatchVerdict]],
-) -> dict[tuple[str, int], tuple[str, int]]:
+) -> dict[tuple[str, int], tuple[str, str, int]]:
     """
-    record_key -> its single best (method, confidence) across every edge it
-    appears in. Built in ONE pass over all edges so per-record lookup is
-    O(1) — looping the full edge list per record would be O(records x
-    edges), infeasible at real dataset scale.
+    record_key -> its single best (method, explanation, confidence) across
+    every edge it appears in. Built in ONE pass over all edges so per-record
+    lookup is O(1) — looping the full edge list per record would be
+    O(records x edges), infeasible at real dataset scale.
     """
-    best_by_key: dict[tuple[str, int], tuple[str, int]] = {}
+    best_by_key: dict[tuple[str, int], tuple[str, str, int]] = {}
     for a, b, verdict in edges:
         if not verdict.is_match:
             continue
         for rec in (a, b):
             key = _record_key(rec)
             current = best_by_key.get(key)
-            if current is None or verdict.confidence > current[1]:
-                best_by_key[key] = (verdict.method, verdict.confidence)
+            if current is None or verdict.confidence > current[2]:
+                best_by_key[key] = (verdict.method, verdict.explanation, verdict.confidence)
     return best_by_key
 
 
@@ -906,13 +976,16 @@ def attach_or_create_entities(
 
         changed_entity_ids.add(entity_id)
         for rec in new_records:
-            method, link_confidence = evidence_index.get(_record_key(rec), ("manual", 100))
+            method, explanation, link_confidence = evidence_index.get(
+                _record_key(rec), ("manual", "", 100),
+            )
             session.execute(insert(BuyerEntityLink).values(
                 buyer_entity_id=entity_id,
                 source_table=rec.source_table,
                 source_id=rec.source_id,
                 match_confidence=link_confidence,
                 match_method=method,
+                match_explanation=explanation or None,
             ))
             new_links_created += 1
 
