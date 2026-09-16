@@ -490,6 +490,15 @@ SLACK_SIGNING_SECRET=...
 > ever be Slack's actual configured URL at a time, silently breaking the
 > other two.
 
+For Relay card thread replies, enable **Event Subscriptions** separately and
+set its Request URL to `https://<your-host>/api/admin/slack/events`. Subscribe
+to the message event for each conversation type where Relay cards are posted,
+grant the corresponding history scope, invite the bot to those channels, and
+reinstall the app after changing scopes. This route handles exact `approve`
+and `reject` replies in a card thread; it is distinct from Interactivity.
+Verify Slack accepts the URL challenge and delivers a signed test event before
+relying on thread replies as an approval path.
+
 ### Adding a candidate county
 ```sql
 INSERT INTO expansion_candidates (county_id, priority, status)
@@ -549,6 +558,10 @@ no separate app needed.
 1. Interactivity is already covered by the single `/api/admin/slack/interact`
    Request URL set up under County Launch above — Relay's Approve/Reject
    buttons dispatch through that same endpoint, nothing further to add here.
+   Grant `channels:history` (and `groups:history` for a private queue) so the
+   FA Max retry worker can reconcile a card accepted by Slack before a local
+   crash. Run `python -m src.services.relay --post-pending-fa-max` every five
+   minutes; the checked-in crontab includes this worker.
 2. Add a slash command `/relay-kill` with Request URL:
    `https://<your-host>/api/admin/slack/kill`
    (usage: `/relay-kill ALL | RELAY | VERA | HUNTER | CORA [FOREVER]` — sets
@@ -592,3 +605,18 @@ call Cora (Phase 2) will make once built.
 ```bash
 python -m src.services.relay --sweep
 ```
+
+### FA Max Backflip campaign suppression
+
+FA Max email and SMS fail closed until a current Backflip active-campaign
+snapshot has been imported. Bailey's final feed contract is still pending, so
+the adapter accepts a provisional CSV with `email` and/or `phone` columns:
+
+```bash
+python scripts/import_backflip_suppression_csv.py path/to/active_campaigns.csv
+```
+
+Each import atomically replaces the active snapshot; contacts absent from the
+next snapshot stop being campaign-suppressed. It never writes campaign members
+to permanent opt-out tables. The default freshness limit is 24 hours and can
+be changed with `FA_MAX_BACKFLIP_FEED_MAX_AGE_HOURS`.

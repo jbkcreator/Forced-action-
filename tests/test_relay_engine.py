@@ -14,6 +14,7 @@ per-item failure isolation.
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -73,8 +74,9 @@ class _FakeQueueBackend:
         self.failed[item_id] = error
         self.failed_batch_ids[item_id] = batch_id
 
-    def mark_skipped(self, item_id: int, reason: str) -> None:
+    def mark_skipped(self, item_id: int, reason: str) -> bool:
         self.skipped[item_id] = reason
+        return True
 
 
 @pytest.fixture
@@ -281,6 +283,26 @@ def test_blocked_item_marked_skipped_never_claimed(fake_backend, unlimited_ceili
     assert calls == []
     assert fake_backend.claimed == set()
     assert fake_backend.skipped[1] == "suppressed:email_opt_out"
+
+
+def test_fa_max_block_is_surfaced_to_its_slack_lane(fake_backend, unlimited_ceiling, green_kill_switch, monkeypatch):
+    """A send-layer refusal is durable first, then visible to the operator."""
+    item = replace(_make_item(1), venture_key="fa_max_lending", lane="EXCEPTIONS")
+    post = []
+    monkeypatch.setattr(
+        relay_engine.guards, "evaluate",
+        lambda item, **kw: relay_engine.guards.Verdict(relay_engine.guards.BLOCK, "suppressed:consent_withdrawn"),
+    )
+    monkeypatch.setattr(
+        "src.services.relay.slack_post.post_blocked_action",
+        lambda queue_item, reason: post.append((queue_item.id, reason)),
+    )
+
+    result = relay_engine.execute_batch([item], batch_id="b1", now=_IN_WINDOW_NOW)
+
+    assert result.skipped == 1
+    assert fake_backend.skipped[1] == "suppressed:consent_withdrawn"
+    assert post == [(1, "suppressed:consent_withdrawn")]
 
 
 # ---------------------------------------------------------------------------
