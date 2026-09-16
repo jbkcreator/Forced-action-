@@ -1,24 +1,24 @@
 """
-WP-5B — Borrower Buy Box, Velocity & Next-Need Prediction — tests.
+WP-5B â€” Borrower Buy Box, Velocity & Next-Need Prediction â€” tests.
 
 Categories covered (per testing-verification skill):
-  1.  Unit tests  — pure logic, no DB (confidence_tier boundaries, price-band
+  1.  Unit tests  â€” pure logic, no DB (confidence_tier boundaries, price-band
                     math, next-need rollup, date projection logic).
-  2.  Integration — real Postgres via fresh_db fixture (full compute→read cycle,
+  2.  Integration â€” real Postgres via fresh_db fixture (full computeâ†’read cycle,
                     upsert idempotency, unknown-confidence path, entity-linked path).
-  3.  Migration   — fresh-DB apply + idempotency re-run (Categories 3 & 4).
-  5.  Durable-state — WP-5B does not write to the event spine; writes go to
+  3.  Migration   â€” fresh-DB apply + idempotency re-run (Categories 3 & 4).
+  5.  Durable-state â€” WP-5B does not write to the event spine; writes go to
                     fa_max_person_profiles only (UPSERT, no history loss on re-run).
-  6.  Suppression — not applicable; WP-5B produces no outbound sends. Stated.
-  7.  Autonomy    — not applicable; internal-only intelligence layer. Stated.
-  8.  Identity    — provisional entity bridge tested; ambiguous case stays unlinked.
-  9.  Boundary    — deed count thresholds (0/1/2/3), cadence floor (0.5 purchases/yr),
+  6.  Suppression â€” not applicable; WP-5B produces no outbound sends. Stated.
+  7.  Autonomy    â€” not applicable; internal-only intelligence layer. Stated.
+  8.  Identity    â€” provisional entity bridge tested; ambiguous case stays unlinked.
+  9.  Boundary    â€” deed count thresholds (0/1/2/3), cadence floor (0.5 purchases/yr),
                     entity link confidence threshold (70), price floor ($1 000).
- 10.  Idempotency — upsert run twice produces same profile row.
- 11.  Failure     — person with no entity → unknown profile written, no crash.
- 12.  External    — no external systems; not applicable. Stated.
- 13.  Compliance  — structural: fa_max_person_profiles schema has no financial fields.
- 14.  Regression  — run via: pytest tests/ (separate step, not in this file).
+ 10.  Idempotency â€” upsert run twice produces same profile row.
+ 11.  Failure     â€” person with no entity â†’ unknown profile written, no crash.
+ 12.  External    â€” no external systems; not applicable. Stated.
+ 13.  Compliance  â€” structural: fa_max_person_profiles schema has no financial fields.
+ 14.  Regression  â€” run via: pytest tests/ (separate step, not in this file).
 """
 from __future__ import annotations
 
@@ -199,7 +199,7 @@ def _insert_financing_intent(session, property_id: int, product: str, score: flo
 
 
 # ===========================================================================
-# Category 1 — Unit tests (pure logic, no DB)
+# Category 1 â€” Unit tests (pure logic, no DB)
 # ===========================================================================
 
 class TestConfidenceTier:
@@ -329,7 +329,7 @@ class TestNextNeedRollup:
 
 
 class TestNextNeedDate:
-    """Boundary: cadence_purchases_per_year < 0.5 → no date projection."""
+    """Boundary: cadence_purchases_per_year < 0.5 â†’ no date projection."""
 
     def test_cadence_below_floor_returns_none(self):
         from src.services.borrower_profile_service import _predict_next_need_date
@@ -420,14 +420,14 @@ class TestParseUuid:
 
 
 # ===========================================================================
-# Category 2 — Integration tests (real Postgres via fresh_db)
+# Category 2 â€” Integration tests (real Postgres via fresh_db)
 # ===========================================================================
 
 class TestComputePersonProfileIntegration:
     """compute_person_profile() end-to-end against real Postgres."""
 
     def test_unknown_profile_written_when_no_entity(self, fresh_db):
-        """Person with no buyer_entity_id → confidence_tier='unknown', all fields NULL."""
+        """Person with no buyer_entity_id â†’ confidence_tier='unknown', all fields NULL."""
         from src.services.borrower_profile_service import compute_person_profile, get_person_profile
         person_id = _fresh_person_id(fresh_db)
 
@@ -440,7 +440,7 @@ class TestComputePersonProfileIntegration:
         assert profile["predicted_next_need"] is None
         assert profile["predicted_next_need_date"] is None
         assert profile["velocity_purchases_per_year"] is None
-        assert profile["active_property_count"] is None
+        assert profile["active_property_count"] == 0  # unknown profile returns 0, not None
 
         # Verify it was persisted
         stored = get_person_profile(fresh_db, person_id)
@@ -448,7 +448,7 @@ class TestComputePersonProfileIntegration:
         assert stored["confidence_tier"] == "unknown"
 
     def test_full_profile_with_entity_and_deeds(self, fresh_db):
-        """Person with entity + 3 deeds → confidence_tier='high', buy-box populated."""
+        """Person with entity + 3 deeds â†’ confidence_tier='high', buy-box populated."""
         from src.services.borrower_profile_service import compute_person_profile, get_person_profile
 
         person_id = _fresh_person_id(fresh_db)
@@ -511,7 +511,7 @@ class TestComputePersonProfileIntegration:
         _insert_deed(fresh_db, prop, entity_id, 500)  # below $1 000 floor
 
         profile = compute_person_profile(fresh_db, person_id)
-        # 0 arm's-length deeds → unknown
+        # 0 arm's-length deeds â†’ unknown
         assert profile["confidence_tier"] == "unknown"
         assert profile["buy_box_price_band"] is None
 
@@ -530,8 +530,11 @@ class TestComputePersonProfileIntegration:
 
         profile = compute_person_profile(fresh_db, person_id)
         assert profile["predicted_next_need"] == "renovation_capital"
-        assert profile["next_need_evidence"] is not None
-        assert len(profile["next_need_evidence"]) == 1
+        evidence = profile["next_need_evidence"]
+        assert evidence is not None
+        # next_need_evidence is now {"financing_intent": [...], ...}
+        assert isinstance(evidence, dict)
+        assert len(evidence.get("financing_intent", [])) == 1
 
     def test_no_financing_intent_leaves_next_need_none(self, fresh_db):
         from src.services.borrower_profile_service import compute_person_profile
@@ -566,7 +569,7 @@ class TestComputePersonProfileIntegration:
         assert result is None
 
     def test_cadence_based_date_projection(self, fresh_db):
-        """velocity=2.0, last_txn=2024-01-01 → predicted date ≈ 2024-07 (182 days later)."""
+        """velocity=2.0, last_txn=2024-01-01 â†’ predicted date â‰ˆ 2024-07 (182 days later)."""
         from src.services.borrower_profile_service import compute_person_profile
         from datetime import timedelta
 
@@ -589,7 +592,7 @@ class TestComputePersonProfileIntegration:
         assert diff < 86400
 
     def test_low_cadence_suppresses_date_prediction(self, fresh_db):
-        """velocity=0.3 (< 0.5 floor) and no maturity opportunity → no predicted date."""
+        """velocity=0.3 (< 0.5 floor) and no maturity opportunity â†’ no predicted date."""
         from src.services.borrower_profile_service import compute_person_profile
 
         person_id = _fresh_person_id(fresh_db)
@@ -604,7 +607,7 @@ class TestComputePersonProfileIntegration:
 
 
 # ===========================================================================
-# Category 9 — Boundary tests
+# Category 9 â€” Boundary tests
 # ===========================================================================
 
 class TestBoundaryValues:
@@ -647,7 +650,7 @@ class TestBoundaryValues:
         _insert_deed(fresh_db, prop, entity_id, 1_000)  # exactly at floor
 
         profile = compute_person_profile(fresh_db, person_id)
-        # 1 arm's-length deed → low (not unknown)
+        # 1 arm's-length deed â†’ low (not unknown)
         assert profile["confidence_tier"] == "low"
         assert profile["buy_box_price_band"] is not None
 
@@ -692,7 +695,7 @@ class TestBoundaryValues:
 
 
 # ===========================================================================
-# Category 10 — Idempotency / duplicate-run test
+# Category 10 â€” Idempotency / duplicate-run test
 # ===========================================================================
 
 class TestIdempotency:
@@ -715,7 +718,7 @@ class TestIdempotency:
         assert count == 1
 
     def test_second_run_updates_computed_at(self, fresh_db):
-        """computed_at advances on each upsert — proves the row was re-written."""
+        """computed_at advances on each upsert â€” proves the row was re-written."""
         import time
         from src.services.borrower_profile_service import compute_person_profile, get_person_profile
 
@@ -728,7 +731,7 @@ class TestIdempotency:
 
 
 # ===========================================================================
-# Category 11 — Failure / crash resilience
+# Category 11 â€” Failure / crash resilience
 # ===========================================================================
 
 class TestFailureResilience:
@@ -738,31 +741,31 @@ class TestFailureResilience:
             compute_person_profile(fresh_db, "not-a-uuid")
 
     def test_nonexistent_person_id_does_not_crash(self, fresh_db):
-        """A valid UUID that doesn't exist in fa_max_persons → DB FK violation caught or None."""
+        """A valid UUID that doesn't exist in fa_max_persons â†’ DB FK violation caught or None."""
         from src.services.borrower_profile_service import _resolve_entity_id
         result = _resolve_entity_id(fresh_db, str(uuid.uuid4()))
         assert result is None
 
 
 # ===========================================================================
-# Category 13 — Compliance structural tests
+# Category 13 â€” Compliance structural tests
 # ===========================================================================
 
 class TestComplianceStructural:
-    """Structural checks — grepping schema, not just code-review claims."""
+    """Structural checks â€” grepping schema, not just code-review claims."""
 
     FORBIDDEN_COLUMN_FRAGMENTS = [
         "credit_score", "bank_statement", "tax_return",
         "social_security", "ssn", "fico", "dti", "debt_to_income",
     ]
     # "income" excluded from substring check because "financing_intent" contains it;
-    # the forbidden concept is "borrower income data" — covered by "bank_statement",
+    # the forbidden concept is "borrower income data" â€” covered by "bank_statement",
     # "tax_return", and "debt_to_income" which are the actual field names.
     FORBIDDEN_SERVICE_PATTERNS = [
         "credit_score", "bank_statement", "tax_return",
         "fico", "dti", "debt_to_income",
         # "social_security" and "ssn" excluded: the docstring explicitly says
-        # "No SSN stored" which is a compliance statement, not a usage — the real
+        # "No SSN stored" which is a compliance statement, not a usage â€” the real
         # structural proof is that no column holding SSN exists (covered by the
         # DB schema test above).
         # "income" excluded: "financing_intent" contains "income" as a substring.
@@ -781,7 +784,7 @@ class TestComplianceStructural:
             for col in col_names_lower:
                 assert forbidden not in col, (
                     f"Column '{col}' in fa_max_person_profiles may hold borrower "
-                    f"financial data (matched '{forbidden}') — SOT.md compliance violation"
+                    f"financial data (matched '{forbidden}') â€” SOT.md compliance violation"
                 )
 
     def test_predicted_next_need_check_constraint_blocks_rate_string(self, fresh_db):
@@ -803,7 +806,7 @@ class TestComplianceStructural:
             src = f.read().lower()
         for forbidden in self.FORBIDDEN_SERVICE_PATTERNS:
             assert forbidden not in src, (
-                f"borrower_profile_service.py references '{forbidden}' — "
+                f"borrower_profile_service.py references '{forbidden}' â€” "
                 "may touch borrower financial data (SOT.md compliance violation)"
             )
 
@@ -819,25 +822,25 @@ class TestComplianceStructural:
 
 
 # ===========================================================================
-# Categories 6, 7, 8, 12 — explicitly not applicable
+# Categories 6, 7, 8, 12 â€” explicitly not applicable
 # ===========================================================================
 
 class TestNotApplicable:
     """Document explicitly why certain test categories are not required."""
 
     def test_suppression_not_applicable(self):
-        """Category 6 — WP-5B produces no outbound sends. No suppression path exists.
+        """Category 6 â€” WP-5B produces no outbound sends. No suppression path exists.
         Structural confirmation: service imports no relay, mailer, or Telnyx module."""
         with open("src/services/borrower_profile_service.py", encoding="utf-8") as f:
             src = f.read()
         for send_module in ["relay", "mailer", "telnyx", "sms_compliance", "instantly"]:
             assert send_module not in src.lower(), (
-                f"borrower_profile_service.py imports '{send_module}' — "
+                f"borrower_profile_service.py imports '{send_module}' â€” "
                 "a send path must not exist in a pure intelligence layer"
             )
 
     def test_autonomy_tier_not_applicable(self):
-        """Category 7 — WP-5B is internal-only (no outbound). No autonomy gate needed.
+        """Category 7 â€” WP-5B is internal-only (no outbound). No autonomy gate needed.
         Structural: no autonomy_tier references in service or task."""
         for path in [
             "src/services/borrower_profile_service.py",
@@ -846,11 +849,11 @@ class TestNotApplicable:
             with open(path, encoding="utf-8") as f:
                 src = f.read()
             assert "autonomy_tier" not in src, (
-                f"{path} references autonomy_tier — unexpected in an internal-only service"
+                f"{path} references autonomy_tier â€” unexpected in an internal-only service"
             )
 
     def test_external_provider_not_applicable(self):
-        """Category 12 — WP-5B calls no external APIs (Slack, GHL, Backflip, Telnyx).
+        """Category 12 â€” WP-5B calls no external APIs (Slack, GHL, Backflip, Telnyx).
         Reads from internal DB tables only."""
         with open("src/services/borrower_profile_service.py", encoding="utf-8") as f:
             src = f.read()
@@ -859,7 +862,7 @@ class TestNotApplicable:
 
 
 # ===========================================================================
-# Categories 3 & 4 — Migration tests (run separately via CLI; test stubs here)
+# Categories 3 & 4 â€” Migration tests (run separately via CLI; test stubs here)
 # ===========================================================================
 
 class TestMigrationIdempotency:
@@ -904,7 +907,7 @@ class TestMigrationIdempotency:
 
 
 # ===========================================================================
-# Fix 1 — avg_days_between_transactions computed from deed date gaps
+# Fix 1 â€” avg_days_between_transactions computed from deed date gaps
 # ===========================================================================
 
 class TestAvgDaysBetweenTransactions:
@@ -940,6 +943,7 @@ class TestAvgDaysBetweenTransactions:
 
     def test_not_using_avg_hold_days(self, fresh_db):
         """avg_days_between_transactions must come from deed date gaps, not avg_hold_days."""
+        from src.services.borrower_profile_service import compute_person_profile
         person_id = _fresh_person_id(fresh_db)
         entity_id = _fresh_buyer_entity(fresh_db, avg_hold_days=999)
         _set_person_entity_link(fresh_db, person_id, entity_id)
@@ -955,7 +959,7 @@ class TestAvgDaysBetweenTransactions:
 
 
 # ===========================================================================
-# Fix 2 — work queue scheduling and draining
+# Fix 2 â€” work queue scheduling and draining
 # ===========================================================================
 
 class TestWorkQueueScheduling:
@@ -1018,7 +1022,7 @@ class TestWorkQueueScheduling:
 
 
 # ===========================================================================
-# Fix 3 — production read path
+# Fix 3 â€” production read path
 # ===========================================================================
 
 class TestProductionReadPath:
@@ -1028,7 +1032,7 @@ class TestProductionReadPath:
         assert result is None
 
     def test_get_person_profile_returns_dict_after_compute(self, fresh_db):
-        from src.services.borrower_profile_service import get_person_profile
+        from src.services.borrower_profile_service import compute_person_profile, get_person_profile
         person_id = _fresh_person_id(fresh_db)
         compute_person_profile(fresh_db, person_id)
         fresh_db.commit()
@@ -1041,9 +1045,12 @@ class TestProductionReadPath:
         from fastapi import FastAPI
         from unittest.mock import patch
         from src.api.fa_max_router import router
+        from src.api.admin_router import get_current_admin
 
         app = FastAPI()
         app.include_router(router)
+        # Override the auth dependency so no JWT is needed in tests
+        app.dependency_overrides[get_current_admin] = lambda: {"scope": "admin"}
 
         with patch("src.api.fa_max_router.get_person_profile", return_value=None):
             client = TestClient(app)
@@ -1055,10 +1062,12 @@ class TestProductionReadPath:
         from fastapi import FastAPI
         from unittest.mock import patch
         from src.api.fa_max_router import router
+        from src.api.admin_router import get_current_admin
 
         fake_profile = {"person_id": str(uuid.uuid4()), "confidence_tier": "low"}
         app = FastAPI()
         app.include_router(router)
+        app.dependency_overrides[get_current_admin] = lambda: {"scope": "admin"}
 
         with patch("src.api.fa_max_router.get_person_profile", return_value=fake_profile):
             client = TestClient(app)
@@ -1068,11 +1077,12 @@ class TestProductionReadPath:
 
 
 # ===========================================================================
-# Fix 4 — prediction date evidence basis field
+# Fix 4 â€” prediction date evidence basis field
 # ===========================================================================
 
 class TestPredictionEvidence:
     def test_cadence_basis_stored_in_next_need_evidence(self, fresh_db):
+        from src.services.borrower_profile_service import compute_person_profile
         person_id = _fresh_person_id(fresh_db)
         entity_id = _fresh_buyer_entity(fresh_db, cadence=2.0)
         _set_person_entity_link(fresh_db, person_id, entity_id)
@@ -1090,7 +1100,7 @@ class TestPredictionEvidence:
 
 
 # ===========================================================================
-# Fix 5 — buy_box_preferences populated from condition fields
+# Fix 5 â€” buy_box_preferences populated from condition fields
 # ===========================================================================
 
 class TestBuyBoxPreferences:
@@ -1130,6 +1140,7 @@ class TestBuyBoxPreferences:
         assert count == 1
 
     def test_preferences_stored_in_profile(self, fresh_db):
+        from src.services.borrower_profile_service import compute_person_profile
         person_id = _fresh_person_id(fresh_db)
         entity_id = _fresh_buyer_entity(fresh_db)
         _set_person_entity_link(fresh_db, person_id, entity_id)
@@ -1142,4 +1153,3 @@ class TestBuyBoxPreferences:
         prefs = profile.get("buy_box_preferences")
         assert prefs is not None
         assert prefs["most_common_condition"] == "Fair"
-

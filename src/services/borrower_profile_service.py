@@ -107,6 +107,7 @@ def get_person_profile(session: Session, person_id: str) -> Optional[Dict[str, A
                 buy_box_geography,
                 buy_box_property_types,
                 buy_box_price_band,
+                buy_box_preferences,
                 velocity_purchases_per_year,
                 last_transaction_date,
                 avg_days_between_transactions,
@@ -592,7 +593,7 @@ def schedule_profile_recompute(session: Session, person_id: str, reason: str) ->
                 'profile_recompute', :ikey, :person_id,
                 CAST(:payload AS jsonb), 'available', NOW()
             )
-            ON CONFLICT (queue_name, idempotency_key) DO NOTHING
+            ON CONFLICT (idempotency_key) DO NOTHING
         """),
         {
             "ikey": idempotency_key,
