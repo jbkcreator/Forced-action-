@@ -1089,6 +1089,59 @@ class TestWorkQueueScheduling:
         ).scalar()
         assert count == 1, "Second event after drain must be available for reprocessing"
 
+    def test_new_event_while_item_claimed_creates_new_available_item(self, fresh_db):
+        """A material event that arrives while a profile job is claimed must not
+        be silently dropped.  The worker mid-compute cannot see the new event, so
+        schedule_profile_recompute must create a NEW available item.
+
+        Regression for the six-step race:
+        1. Worker claims the profile job.
+        2. Worker begins computing.
+        3. New deed/permit/interaction commits for Person A.
+        4. Enqueue sees the claimed row → must NOT discard the event.
+        5. Worker completes the old calculation.
+        6. New available item exists and will be picked up on the next drain.
+        """
+        from src.services.borrower_profile_service import schedule_profile_recompute
+
+        person_id = _fresh_person_id(fresh_db)
+        schedule_profile_recompute(fresh_db, person_id, "first_event")
+        fresh_db.commit()
+
+        # Simulate worker claiming the item (status → claimed)
+        fresh_db.execute(
+            text("""
+                UPDATE fa_max_work_queue
+                SET status = 'claimed',
+                    claimed_at = NOW(),
+                    lease_expires_at = NOW() + INTERVAL '5 minutes',
+                    worker_id = 'worker:test'
+                WHERE queue_name = 'profile_recompute'
+                  AND person_id = :pid
+            """),
+            {"pid": person_id},
+        )
+        fresh_db.commit()
+
+        # New event arrives while item is claimed
+        schedule_profile_recompute(fresh_db, person_id, "new_event_while_claimed")
+        fresh_db.commit()
+
+        # There must be an available item covering the new event
+        available = fresh_db.execute(
+            text("""
+                SELECT COUNT(*) FROM fa_max_work_queue
+                WHERE queue_name = 'profile_recompute'
+                  AND person_id = :pid
+                  AND status = 'available'
+            """),
+            {"pid": person_id},
+        ).scalar()
+        assert available == 1, (
+            "A new material event while the profile job is claimed must produce "
+            "an available item, not be silently discarded"
+        )
+
     def test_crash_recovery_reclaims_expired_lease(self, fresh_db):
         """Items whose worker died (lease expired) must be returned to
         available by the next drain call, not stranded permanently as claimed."""

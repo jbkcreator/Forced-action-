@@ -52,7 +52,7 @@ import math
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -581,15 +581,28 @@ def _jsonb(value: Any) -> Optional[str]:
 def schedule_profile_recompute(session: Session, person_id: str, reason: str) -> None:
     """Enqueue a profile recomputation for person_id via fa_max_work_queue.
 
-    Coalesces concurrent events: if an available/claimed item already exists for
-    this person it is left untouched (the pending work covers the new event).
-    If the existing item is done/failed (a previous cycle already completed it),
-    it is reactivated so the new event triggers a fresh recompute — preventing
-    the permanent-deduplication bug where the first run's idempotency key blocks
-    all future events for the same person.
+    Three cases handled atomically:
+
+    1. No existing item → insert (available).
+    2. Existing item is done/failed → reactivate it (available) so the new
+       event triggers a fresh recompute; prevents permanent deduplication where
+       the first drain blocks all future events for the same person.
+    3. Existing item is available → leave it; pending work covers this event.
+    4. Existing item is claimed (worker mid-compute) → the worker will complete
+       before seeing this event.  Insert a NEW item with an event-specific key
+       so the event is never silently lost.
     """
     idempotency_key = f"profile_recompute:{person_id}"
-    session.execute(
+    payload_json = _jsonb({"reason": reason})
+    params = {
+        "ikey": idempotency_key,
+        "person_id": person_id,
+        "payload": payload_json,
+    }
+
+    # Statement 1: insert or reactivate a done/failed item.
+    # Returns a row when an insert or a reactivation actually happened.
+    row = session.execute(
         text("""
             INSERT INTO fa_max_work_queue (
                 queue_name, idempotency_key, person_id, payload, status,
@@ -606,11 +619,40 @@ def schedule_profile_recompute(session: Session, person_id: str, reason: str) ->
                    done_at    = NULL,
                    updated_at = NOW()
              WHERE fa_max_work_queue.status IN ('done', 'failed')
+            RETURNING work_item_id
+        """),
+        params,
+    ).fetchone()
+
+    if row is not None:
+        return  # inserted or reactivated — done
+
+    # Statement 2: the conflict row is available (fine) or claimed (must not
+    # drop the event).  Insert a new item only when the conflict row is
+    # currently claimed — a unique per-event key avoids a second conflict.
+    session.execute(
+        text("""
+            INSERT INTO fa_max_work_queue (
+                queue_name, idempotency_key, person_id, payload, status,
+                created_at, updated_at
+            )
+            SELECT 'profile_recompute',
+                   :fallback_key,
+                   :person_id ::uuid,
+                   CAST(:payload AS jsonb),
+                   'available',
+                   NOW(), NOW()
+            WHERE EXISTS (
+                SELECT 1 FROM fa_max_work_queue
+                WHERE idempotency_key = :ikey
+                  AND status = 'claimed'
+            )
         """),
         {
-            "ikey": idempotency_key,
+            "fallback_key": f"{idempotency_key}:retry:{uuid4()}",
             "person_id": person_id,
-            "payload": _jsonb({"reason": reason}),
+            "payload": payload_json,
+            "ikey": idempotency_key,
         },
     )
 
