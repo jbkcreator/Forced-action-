@@ -20,6 +20,7 @@ import re
 import unittest.mock as mock
 from dataclasses import replace
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import MagicMock, patch
 
@@ -901,3 +902,42 @@ class TestWp2ClosureGuards:
                     raise AssertionError(
                         f"fa_max_autonomy.py calls a send function: {node.func.id!r}"
                     )
+
+
+class TestFaMaxSocketMode:
+    def test_socket_listener_acks_and_reuses_durable_relay_handler(self, monkeypatch):
+        """Socket Mode must reach the same decision handler as HTTP, not a
+        parallel approval implementation."""
+        from src.services.relay import socket_listener
+
+        client = MagicMock()
+        request = SimpleNamespace(
+            envelope_id="env-1",
+            type="interactive",
+            payload={
+                "type": "block_actions",
+                "user": {"id": "U_APPROVER"},
+                "actions": [{"action_id": "approve", "value": '{"item_id": 12, "action": "approve"}'}],
+            },
+        )
+        decision = MagicMock(return_value={"ok": True})
+        monkeypatch.setattr("src.api.admin_router._handle_relay_decision", decision)
+
+        assert socket_listener.handle_socket_request(client, request) is True
+        client.send_socket_mode_response.assert_called_once()
+        decision.assert_called_once_with(request.payload)
+
+    def test_socket_listener_acks_but_ignores_other_app_actions(self, monkeypatch):
+        from src.services.relay import socket_listener
+
+        client = MagicMock()
+        request = SimpleNamespace(
+            envelope_id="env-2", type="interactive",
+            payload={"type": "block_actions", "actions": [{"action_id": "approve_win_story"}]},
+        )
+        decision = MagicMock()
+        monkeypatch.setattr("src.api.admin_router._handle_relay_decision", decision)
+
+        assert socket_listener.handle_socket_request(client, request) is False
+        client.send_socket_mode_response.assert_called_once()
+        decision.assert_not_called()
