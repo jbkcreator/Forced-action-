@@ -581,21 +581,31 @@ def _jsonb(value: Any) -> Optional[str]:
 def schedule_profile_recompute(session: Session, person_id: str, reason: str) -> None:
     """Enqueue a profile recomputation for person_id via fa_max_work_queue.
 
-    Idempotent: uses ON CONFLICT DO NOTHING on (queue_name, idempotency_key).
-    Multiple callers scheduling the same person before the sweep runs is safe.
+    Coalesces concurrent events: if an available/claimed item already exists for
+    this person it is left untouched (the pending work covers the new event).
+    If the existing item is done/failed (a previous cycle already completed it),
+    it is reactivated so the new event triggers a fresh recompute — preventing
+    the permanent-deduplication bug where the first run's idempotency key blocks
+    all future events for the same person.
     """
     idempotency_key = f"profile_recompute:{person_id}"
     session.execute(
         text("""
             INSERT INTO fa_max_work_queue (
-                queue_name, idempotency_key, person_id, payload, status, created_at
+                queue_name, idempotency_key, person_id, payload, status,
+                created_at, updated_at
             ) VALUES (
-                'profile_recompute', :ikey, :person_id,
-                CAST(:payload AS jsonb), 'available', NOW()
+                'profile_recompute', :ikey, :person_id ::uuid,
+                CAST(:payload AS jsonb), 'available', NOW(), NOW()
             )
             ON CONFLICT (idempotency_key)
             WHERE idempotency_key IS NOT NULL
-            DO NOTHING
+            DO UPDATE
+               SET status     = 'available',
+                   payload    = CAST(:payload AS jsonb),
+                   done_at    = NULL,
+                   updated_at = NOW()
+             WHERE fa_max_work_queue.status IN ('done', 'failed')
         """),
         {
             "ikey": idempotency_key,

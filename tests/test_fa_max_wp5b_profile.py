@@ -1058,6 +1058,82 @@ class TestWorkQueueScheduling:
         ).scalar()
         assert count == 0
 
+    def test_second_event_after_drain_reactivates_item(self, fresh_db):
+        """A second material event after the first has been drained must
+        produce a new recompute, not be silently discarded by the permanent
+        idempotency key."""
+        from src.services.borrower_profile_service import schedule_profile_recompute
+        from src.tasks.fa_max_profile_sweep import _drain_recompute_queue
+
+        person_id = _fresh_person_id(fresh_db)
+        entity_id = _fresh_buyer_entity(fresh_db)
+        _set_person_entity_link(fresh_db, person_id, entity_id)
+
+        # First event: enqueue, drain to done
+        schedule_profile_recompute(fresh_db, person_id, "first_event")
+        fresh_db.commit()
+        _drain_recompute_queue(fresh_db)
+
+        # Second event after drain: must produce an available item again
+        schedule_profile_recompute(fresh_db, person_id, "second_event")
+        fresh_db.commit()
+
+        count = fresh_db.execute(
+            text("""
+                SELECT COUNT(*) FROM fa_max_work_queue
+                WHERE queue_name = 'profile_recompute'
+                  AND person_id = :pid
+                  AND status = 'available'
+            """),
+            {"pid": person_id},
+        ).scalar()
+        assert count == 1, "Second event after drain must be available for reprocessing"
+
+    def test_crash_recovery_reclaims_expired_lease(self, fresh_db):
+        """Items whose worker died (lease expired) must be returned to
+        available by the next drain call, not stranded permanently as claimed."""
+        from src.services.borrower_profile_service import schedule_profile_recompute
+        from src.tasks.fa_max_profile_sweep import _drain_recompute_queue
+
+        person_id = _fresh_person_id(fresh_db)
+        _fresh_buyer_entity(fresh_db)
+        schedule_profile_recompute(fresh_db, person_id, "crash_test")
+        fresh_db.commit()
+
+        # Simulate a claimed item with an already-expired lease (worker died)
+        fresh_db.execute(
+            text("""
+                UPDATE fa_max_work_queue
+                SET status = 'claimed',
+                    claimed_at = NOW() - INTERVAL '10 minutes',
+                    lease_expires_at = NOW() - INTERVAL '1 second',
+                    worker_id = 'dead_worker'
+                WHERE queue_name = 'profile_recompute'
+                  AND person_id = :pid
+            """),
+            {"pid": person_id},
+        )
+        fresh_db.commit()
+
+        # Drain must reclaim the expired item and process it
+        entity_id = fresh_db.execute(
+            text("SELECT id FROM buyer_entities ORDER BY id DESC LIMIT 1")
+        ).scalar()
+        _set_person_entity_link(fresh_db, person_id, entity_id)
+        fresh_db.commit()
+        drained = _drain_recompute_queue(fresh_db)
+        assert drained >= 1, "Expired claimed item must be reclaimed and processed"
+
+        status = fresh_db.execute(
+            text("""
+                SELECT status FROM fa_max_work_queue
+                WHERE queue_name = 'profile_recompute' AND person_id = :pid
+                ORDER BY updated_at DESC LIMIT 1
+            """),
+            {"pid": person_id},
+        ).scalar()
+        assert status == "done", f"Expected done after recovery, got {status!r}"
+
 
 # ===========================================================================
 # Fix 3 â€” production read path

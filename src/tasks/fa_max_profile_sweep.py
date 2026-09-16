@@ -39,6 +39,11 @@ from sqlalchemy import text
 
 from src.core.database import get_db_context
 from src.services.borrower_profile_service import compute_person_profile
+from src.services.state_engine import (
+    claim_next_work_item,
+    complete_work_item,
+    reclaim_expired_work_items,
+)
 from src.utils.logger import get_logger, setup_logging
 
 _QUEUE_NAME = "profile_recompute"
@@ -123,54 +128,47 @@ def run_sweep(*, force_all: bool = False) -> dict:
     return stats
 
 
+_WORKER_ID = "fa_max_profile_sweep"
+_LEASE_SECONDS = 300  # 5 minutes — generous for a single profile compute
+
+
 def _drain_recompute_queue(session) -> int:
     """Claim and process all available 'profile_recompute' work-queue items.
 
-    Uses SKIP LOCKED so concurrent runs (if any) don't race the same items.
-    Marks each item 'done' on success and 'failed' on error; per-person
-    commit/rollback so one bad profile does not discard the rest.
+    Uses WP-1's claim_next_work_item (SKIP LOCKED + lease) so concurrent runs
+    don't race the same items and a crashed worker's items recover automatically
+    via reclaim_expired_work_items. Per-person commit/rollback; one bad profile
+    does not discard the rest.
     """
+    # Return any items whose worker died without completing them.
+    reclaim_expired_work_items(session=session, queue_name=_QUEUE_NAME)
+    session.commit()
+
     drained = 0
     while True:
-        rows = session.execute(
-            text("""
-                UPDATE fa_max_work_queue
-                SET status = 'claimed', claimed_at = NOW()
-                WHERE work_item_id IN (
-                    SELECT work_item_id FROM fa_max_work_queue
-                    WHERE queue_name = :qname AND status = 'available'
-                    ORDER BY created_at
-                    LIMIT :batch
-                    FOR UPDATE SKIP LOCKED
-                )
-                RETURNING work_item_id, person_id::text
-            """),
-            {"qname": _QUEUE_NAME, "batch": _QUEUE_BATCH},
-        ).mappings().all()
+        item = claim_next_work_item(
+            session=session,
+            queue_name=_QUEUE_NAME,
+            worker_id=_WORKER_ID,
+            lease_seconds=_LEASE_SECONDS,
+        )
         session.commit()
 
-        if not rows:
+        if item is None:
             break
 
-        for row in rows:
-            item_id = row["work_item_id"]
-            person_id = row["person_id"]
-            try:
-                compute_person_profile(session, person_id)
-                session.execute(
-                    text("UPDATE fa_max_work_queue SET status='done', done_at=NOW() WHERE work_item_id=:id"),
-                    {"id": item_id},
-                )
-                session.commit()
-                drained += 1
-            except Exception:
-                session.rollback()
-                session.execute(
-                    text("UPDATE fa_max_work_queue SET status='failed' WHERE work_item_id=:id"),
-                    {"id": item_id},
-                )
-                session.commit()
-                logger.exception("[FA Max ProfileSweep] queue drain error for person %s (item %s)", person_id, item_id)
+        item_id = item["work_item_id"]
+        person_id = item["person_id"]
+        try:
+            compute_person_profile(session, person_id)
+            complete_work_item(session=session, work_item_id=item_id, worker_id=_WORKER_ID, status="done")
+            session.commit()
+            drained += 1
+        except Exception:
+            session.rollback()
+            complete_work_item(session=session, work_item_id=item_id, worker_id=_WORKER_ID, status="failed")
+            session.commit()
+            logger.exception("[FA Max ProfileSweep] queue drain error for person %s (item %s)", person_id, item_id)
 
     return drained
 
