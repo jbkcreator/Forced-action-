@@ -936,6 +936,10 @@ COUNTY_ID=hillsborough
 # after provisioning it (docs/venture-onboarding.md):
 #   */30 * * * * $PROJECT/scripts/cron/run.sh src.services.relay --sweep --venture venture_two
 */30 * * * * $PROJECT/scripts/cron/run.sh src.services.relay --sweep
+# Retry pending FA Max cards independently of send execution. A card post
+# interrupted after Slack acceptance is reconciled from channel history.
+*/5 * * * * $PROJECT/scripts/cron/run.sh src.services.relay --post-pending-fa-max
+*/30 * * * * $PROJECT/scripts/cron/run.sh src.services.relay --sweep --venture fa_max_lending
 
 # ── AGENT LANE: VENTURE LADDER (CLONE-v2.2 / CL4) ────────────────────────────
 # Venture ladder evaluator — daily 09:30 UTC. Walks every venture (active AND
