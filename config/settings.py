@@ -654,6 +654,12 @@ class AppSettings(BaseSettings):
 	# review surface.
 	learning_hygiene_slack_channel: str = Field(default="", env="LEARNING_HYGIENE_SLACK_CHANNEL")
 
+	# WP-9 Dial List daily digest — the "MONEY" queue (FA MAX amendment 1).
+	# Reuses slack_bot_token above; its own channel, not cora_throughput's
+	# (cold-outreach draft approvals) nor relay's (per-item sends) — the dial
+	# list is a read-only ranked calling aid, a distinct review surface.
+	dial_list_slack_channel: str = Field(default="", env="DIAL_LIST_SLACK_CHANNEL")
+
 	# Relay email channel (RELAY-v2.2 sub-task R2). relay_instantly_campaign_id
 	# is set once after running `python -m src.services.relay --setup-email-channel`
 	# (see src/services/relay/channels_email.py) — unset means the email
