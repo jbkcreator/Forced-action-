@@ -53,6 +53,29 @@ def _dial_list(entries, **kw):
 
 # ---- formatter (pure) ------------------------------------------------------
 
+def test_digest_renders_name_address_phone():
+    dl = _dial_list([_entry(
+        contact_name="ACME HOMES LLC", property_address="123 Main St, Tampa 33602",
+        phone="813-555-0100",
+    )])
+    header, blocks = format_dial_list_digest(dl)
+    text = "\n".join(b["text"]["text"] for b in blocks if b["type"] == "section")
+    assert "ACME HOMES LLC" in text
+    assert "123 Main St, Tampa 33602" in text
+    assert "813-555-0100" in text
+
+
+def test_digest_unresolved_name_marked_unverified():
+    dl = _dial_list([_entry(
+        contact_name="JOHN OWNER", borrower_resolved=False, buyer_entity_id=None,
+    )])
+    text = "\n".join(
+        b["text"]["text"] for b in format_dial_list_digest(dl)[1]
+        if b["type"] == "section"
+    )
+    assert "JOHN OWNER (unverified)" in text
+
+
 def test_digest_renders_rank_trigger_size_reason_points():
     dl = _dial_list([_entry()])
     header, blocks = format_dial_list_digest(dl)

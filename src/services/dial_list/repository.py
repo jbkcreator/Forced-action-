@@ -71,6 +71,17 @@ def _is_residential(use_code: Optional[object]) -> bool:
     return code.zfill(4)[:2] in _RESIDENTIAL_USE_PREFIXES
 
 
+def _compose_address(
+    street: Optional[object], city: Optional[object], zip_: Optional[object]
+) -> Optional[str]:
+    street_s = str(street).strip() if street else ""
+    locality = " ".join(
+        p for p in (str(city).strip() if city else "", str(zip_).strip() if zip_ else "") if p
+    )
+    parts = [p for p in (street_s, locality) if p]
+    return ", ".join(parts) if parts else None
+
+
 # ---------------------------------------------------------------------------
 # Detectors — each returns {property_id: Optional[urgency_date]}
 # ---------------------------------------------------------------------------
@@ -206,10 +217,16 @@ _ENRICH_SQL = text(
     SELECT
         p.id                     AS property_id,
         p.property_use_code      AS property_use_code,
+        p.address                AS address,
+        p.city                   AS city,
+        p.zip                    AS zip,
+        o.owner_name             AS owner_name,
+        o.phone_1                AS phone_1,
         f.assessed_value_mkt     AS assessed_value_mkt,
         f.last_sale_price        AS last_sale_price,
         f.last_sale_date         AS last_sale_date,
         bel.buyer_entity_id      AS buyer_entity_id,
+        be.canonical_name        AS canonical_name,
         be.opportunity_thread_id AS opportunity_thread_id,
         be.total_purchase_count  AS total_purchase_count
     FROM properties p
@@ -409,6 +426,7 @@ def assemble_dial_candidates(
         if not _is_residential(e.get("property_use_code")):
             continue
         last_sale_date = _as_date(e.get("last_sale_date"))
+        address = _compose_address(e.get("address"), e.get("city"), e.get("zip"))
         last_deal_months = None
         if last_sale_date is not None:
             last_deal_months = max((as_of - last_sale_date).days // 30, 0)
@@ -428,6 +446,10 @@ def assemble_dial_candidates(
                 last_sale_price=_dec(e.get("last_sale_price")),
                 is_builder=a.is_builder,
                 urgency_date=a.urgency_date,
+                borrower_name=e.get("canonical_name"),
+                owner_name=e.get("owner_name"),
+                property_address=address,
+                phone=e.get("phone_1"),
                 properties_owned=e.get("total_purchase_count"),
                 last_deal_months_ago=last_deal_months,
             )

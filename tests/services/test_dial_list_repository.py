@@ -248,6 +248,30 @@ def test_residential_use_code_kept(db):
     assert len(cands) == 1 and "cash_purchase" in cands[0].triggers
 
 
+def test_name_address_phone_populated(db):
+    _borrower(db, 900, canonical_name="ACME HOMES LLC", total_purchase_count=3)
+    pid = _prop(db, address="123 Main St", city="Tampa", zip="33602")
+    o = _owner(db, pid, owner_name="ACME HOMES LLC", phone_1="813-555-0100",
+               absentee_status="Out-of-State")
+    _link_borrower(db, o.id, 900)
+    db.flush()
+    c = assemble_dial_candidates(db, as_of=AS_OF)[0]
+    assert c.borrower_name == "ACME HOMES LLC"
+    assert c.owner_name == "ACME HOMES LLC"
+    assert c.property_address == "123 Main St, Tampa 33602"
+    assert c.phone == "813-555-0100"
+
+
+def test_owner_name_fallback_when_unresolved(db):
+    pid = _prop(db, address="9 Oak Ave", city="Tampa", zip="33605")
+    _owner(db, pid, owner_name="JANE DOE", phone_1="813-555-0200",
+           absentee_status="Out-of-State")
+    db.flush()
+    c = assemble_dial_candidates(db, as_of=AS_OF)[0]
+    assert c.borrower_name is None  # unresolved entity
+    assert c.owner_name == "JANE DOE"  # fallback name available
+
+
 def test_unresolved_candidate_still_appears(db):
     pid = _prop(db)
     _owner(db, pid, owner_name="NOENTITY", absentee_status="Out-of-State")

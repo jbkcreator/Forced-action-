@@ -44,6 +44,12 @@ class DialCandidate(BaseModel):
     is_builder: bool = False
     urgency_date: Optional[date] = None  # nearest actionable date
 
+    # who to call + where (client wants "ranked names", not IDs)
+    borrower_name: Optional[str] = None   # canonical entity name (resolved)
+    owner_name: Optional[str] = None      # parcel owner (fallback when unresolved)
+    property_address: Optional[str] = None
+    phone: Optional[str] = None
+
     # relationship facts for the reason line
     properties_owned: Optional[int] = None
     last_deal_months_ago: Optional[int] = None
@@ -62,6 +68,11 @@ class DialListEntry(BaseModel):
     urgency: Decimal
     expected_loan_confidence: LoanConfidence
     borrower_resolved: bool
+
+    # display fields — the "name / property / phone" Josh calls from
+    contact_name: Optional[str] = None
+    property_address: Optional[str] = None
+    phone: Optional[str] = None
 
     reason: str
     talking_points: List[str] = Field(default_factory=list)
