@@ -538,8 +538,8 @@ RELAY_APPROVERS=["U01ABC123","U02DEF456"]   # Slack user IDs — MUST be JSON-ar
                                              # startup (pydantic-settings parses list
                                              # fields as JSON, not CSV).
 RELAY_SLACK_CHANNEL=#agent-daily
-SLACK_BOT_TOKEN=xoxb-...        # reused from County Launch above — no separate app
-SLACK_SIGNING_SECRET=...        # reused from County Launch above
+SLACK_BOT_TOKEN=xoxb-...        # posts and updates approval cards
+RELAY_SLACK_APP_TOKEN=xapp-...  # Socket Mode, requires connections:write
 
 # Email channel (Instantly) — set after running the one-time setup command below
 RELAY_INSTANTLY_CAMPAIGN_ID=
@@ -553,15 +553,26 @@ RELAY_DAILY_CEILING=20          # per channel, per calendar day
 ```
 
 ### Slack app setup
-Reuses the same Slack app as County Launch (`SLACK_BOT_TOKEN`/`SLACK_SIGNING_SECRET`) —
-no separate app needed.
-1. Interactivity is already covered by the single `/api/admin/slack/interact`
-   Request URL set up under County Launch above — Relay's Approve/Reject
-   buttons dispatch through that same endpoint, nothing further to add here.
-   Grant `channels:history` (and `groups:history` for a private queue) so the
-   FA Max retry worker can reconcile a card accepted by Slack before a local
-   crash. Run `python -m src.services.relay --post-pending-fa-max` every five
-   minutes; the checked-in crontab includes this worker.
+Relay approvals use Slack Socket Mode so they work with the existing shared
+Slack app without a public callback URL. Enable Socket Mode and create an
+app-level `xapp-...` token with `connections:write`; store it as
+`RELAY_SLACK_APP_TOKEN`. Install and run the listener:
+
+```bash
+cp deploy/systemd/fa-relay-slack-listener.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now fa-relay-slack-listener
+```
+
+Run exactly one Socket Mode listener for a shared Slack app's interactive
+actions. Slack can deliver a payload to any active listener connection, so
+separate action-specific listeners must be consolidated into one dispatcher
+before they share the same production app.
+
+Grant `channels:history` (and `groups:history` for a private queue) so the
+FA Max retry worker can reconcile a card accepted by Slack before a local
+crash. Run `python -m src.services.relay --post-pending-fa-max` every five
+minutes; the checked-in crontab includes this worker.
 2. Add a slash command `/relay-kill` with Request URL:
    `https://<your-host>/api/admin/slack/kill`
    (usage: `/relay-kill ALL | RELAY | VERA | HUNTER | CORA [FOREVER]` — sets
