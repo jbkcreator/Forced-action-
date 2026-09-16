@@ -598,7 +598,7 @@ class MultiVerticalScorer:
 
         # 7. Building permits — enforcement permits get their own higher-weighted signal type.
         #    Skip non-enforcement permits whose work is already complete (no ongoing distress).
-        _CLOSED_PERMIT_STATUSES = {"issued", "final", "finaled", "closed", "completed"}
+        _CLOSED_PERMIT_STATUSES = {"issued", "final", "finaled", "closed", "complete", "completed"}
         for bp in (prop.building_permits or []):
             if (
                 not bp.is_enforcement_permit
@@ -1100,6 +1100,10 @@ class MultiVerticalScorer:
             not bp.is_enforcement_permit
             and bp.permit_type
             and "roof" in bp.permit_type.lower()
+            and not (
+                bp.status
+                and bp.status.strip().lower() in _CLOSED_PERMIT_STATUSES
+            )
             for bp in (prop.building_permits or [])
         )
         if _routine_roofing:

@@ -41,6 +41,7 @@ _DSCR_SEASONING_DAYS = 120
 _DSCR_WINDOW_DAYS = 7                 # fire within 7-day window around day 120
 _EXPANSION_MILESTONES = {3, 5, 10}
 _EXPANSION_LOOKBACK_DAYS = 7
+_NEXT_PROJECT_RETRY_DAYS = 30
 
 MONITOR_TYPES = ("loan_maturity", "next_project", "dscr_day120", "portfolio_expansion")
 
@@ -132,6 +133,7 @@ def _check_next_project(session: Session, today: date) -> list[MonitorAlert]:
     deed_sale or permit_closed events from yesterday, buyer has prior acquisitions.
     """
     yesterday = today - timedelta(days=1)
+    retry_cutoff = today - timedelta(days=_NEXT_PROJECT_RETRY_DAYS)
 
     rows = session.execute(text("""
         SELECT
@@ -150,7 +152,7 @@ def _check_next_project(session: Session, today: date) -> list[MonitorAlert]:
         JOIN buyer_entities be ON be.id = ble.buyer_entity_id
         LEFT JOIN properties p ON p.id = ble.property_id
         WHERE ble.event_type IN ('deed_sale', 'permit_closed')
-          AND ble.event_date = :yesterday
+          AND ble.event_date BETWEEN :retry_cutoff AND :yesterday
           AND be.total_purchase_count >= 1
           AND NOT EXISTS (
               SELECT 1 FROM borrower_monitor_log bml
@@ -158,7 +160,7 @@ def _check_next_project(session: Session, today: date) -> list[MonitorAlert]:
                 AND bml.monitor_type = 'next_project'
                 AND bml.source_event_id = ble.id
           )
-    """), {"yesterday": yesterday}).mappings().all()
+    """), {"retry_cutoff": retry_cutoff, "yesterday": yesterday}).mappings().all()
 
     alerts = []
     for r in rows:

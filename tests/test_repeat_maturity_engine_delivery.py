@@ -65,3 +65,15 @@ def test_successful_delivery_is_marked_fired(monkeypatch):
     engine.run_monitors(Mock(), today=date(2026, 9, 16))
 
     record.assert_called_once_with(record.call_args.args[0], alert, "123.456")
+
+
+def test_next_project_query_keeps_recent_undelivered_events_retryable():
+    session = Mock()
+    session.execute.return_value.mappings.return_value.all.return_value = []
+
+    engine._check_next_project(session, date(2026, 9, 17))
+
+    query = str(session.execute.call_args.args[0])
+    params = session.execute.call_args.args[1]
+    assert "ble.event_date BETWEEN :retry_cutoff AND :yesterday" in query
+    assert params["retry_cutoff"] == date(2026, 8, 18)

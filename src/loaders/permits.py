@@ -25,12 +25,6 @@ _ENFORCEMENT_STATUS_VALUES = frozenset({
     "expired", "revoked",
 })
 
-# Status values that indicate completed work — not a lead, skip entirely
-_SKIP_STATUS_VALUES = frozenset({
-    "complete",
-})
-
-
 def _is_enforcement(permit_type: str | None, status: str | None, expire_date) -> bool:
     """Return True if this permit qualifies as an enforcement permit."""
     pt = (permit_type or "").lower()
@@ -130,12 +124,6 @@ class BuildingPermitLoader(BaseLoader):
                     skipped += 1
                     continue
             
-            # Skip completed permits — work is done, not a distress signal
-            raw_status = str(row.get('Status') or "").lower().strip()
-            if raw_status in _SKIP_STATUS_VALUES:
-                logger.debug(f"Skipping completed permit: {record_number}")
-                skipped += 1
-                continue
 
             # Match by address — extract ZIP from raw address if present
             property_record = None
