@@ -47,7 +47,16 @@ def handle_socket_request(client: Any, request: Any) -> bool:
     # Imports stay local so a worker startup does not create an API server.
     from src.api.admin_router import _handle_relay_decision
 
-    _handle_relay_decision(payload)
+    result = _handle_relay_decision(payload)
+    # HTTP can return an ephemeral refusal directly to Slack. Socket Mode has
+    # already acknowledged the envelope, so retain the same result in logs for
+    # an operator to diagnose an authorization or state-transition refusal.
+    if (result or {}).get("ok") is not True:
+        logger.warning(
+            "[RelaySocket] approval left pending for Slack user %s: %s",
+            payload.get("user", {}).get("id", "unknown"),
+            (result or {}).get("text", "no result detail"),
+        )
     return True
 
 
