@@ -137,6 +137,29 @@ def test_digest_low_confidence_surfaced_in_header():
     assert "(low)" not in text
 
 
+def test_digest_stale_sources_warning_in_header():
+    dl = _dial_list([_entry()], stale_sources=["deeds", "probate"])
+    _, blocks = format_dial_list_digest(dl)
+    text = _all_text(blocks)
+    assert "Stale sources" in text
+    assert "deeds" in text and "probate" in text
+
+
+def test_digest_from_cache_warning_in_header():
+    dl = _dial_list([_entry()], from_cache=True)
+    _, blocks = format_dial_list_digest(dl)
+    text = _all_text(blocks)
+    assert "cached state" in text
+
+
+def test_digest_no_stale_warning_when_fresh():
+    dl = _dial_list([_entry()])  # no stale_sources, not from cache
+    _, blocks = format_dial_list_digest(dl)
+    text = _all_text(blocks)
+    assert "Stale sources" not in text
+    assert "cached state" not in text
+
+
 # ---- delivery handoff (faked Slack) ---------------------------------------
 
 class _FakeResp(dict):
@@ -218,3 +241,63 @@ def test_deliver_logs_and_returns_none_on_post_failure(monkeypatch, caplog):
         ts = deliver_dial_list(_dial_list([_entry()]))
     assert ts is None
     assert any("Slack post failed" in r.message for r in caplog.records)
+
+
+# ---- cached fallback (generate_and_deliver) --------------------------------
+
+def test_generate_and_deliver_falls_back_to_cache(monkeypatch):
+    from sqlalchemy.exc import SQLAlchemyError
+
+    import src.services.dial_list.repository as repo
+    from src.services.dial_list.delivery import generate_and_deliver
+
+    _install_fakes(monkeypatch)
+    cached = _dial_list([_entry()], from_cache=True)
+
+    def _boom(*a, **k):
+        raise SQLAlchemyError("db down")
+
+    monkeypatch.setattr(repo, "generate_dial_list", _boom)
+    monkeypatch.setattr(repo, "load_latest_dial_list_snapshot",
+                        lambda session, county_id=None: cached)
+
+    dial_list, ts = generate_and_deliver(object(), as_of=AS_OF)
+    assert dial_list.from_cache is True
+    assert ts == "1700000000.0001"  # posted the cached list
+
+
+def test_generate_and_deliver_reraises_when_no_cache(monkeypatch):
+    from sqlalchemy.exc import SQLAlchemyError
+
+    import src.services.dial_list.repository as repo
+    from src.services.dial_list.delivery import generate_and_deliver
+
+    _install_fakes(monkeypatch)
+
+    def _boom(*a, **k):
+        raise SQLAlchemyError("db down")
+
+    monkeypatch.setattr(repo, "generate_dial_list", _boom)
+    monkeypatch.setattr(repo, "load_latest_dial_list_snapshot",
+                        lambda session, county_id=None: None)
+
+    with pytest.raises(SQLAlchemyError):
+        generate_and_deliver(object(), as_of=AS_OF)
+
+
+def test_generate_and_deliver_snapshots_on_success(monkeypatch):
+    import src.services.dial_list.repository as repo
+    from src.services.dial_list.delivery import generate_and_deliver
+
+    _install_fakes(monkeypatch)
+    fresh = _dial_list([_entry()])
+    written = {}
+
+    monkeypatch.setattr(repo, "generate_dial_list",
+                        lambda session, **k: fresh)
+    monkeypatch.setattr(repo, "write_dial_list_snapshot",
+                        lambda session, dl, county_id=None: written.update(dl=dl))
+
+    dial_list, ts = generate_and_deliver(object(), as_of=AS_OF)
+    assert written["dl"] is fresh  # success path snapshots the fresh list
+    assert ts == "1700000000.0001"

@@ -204,6 +204,19 @@ def _header_blocks(dial_list: DialList) -> Tuple[str, List[Dict[str, Any]]]:
             "elements": [{"type": "mrkdwn",
                           "text": "⚠️ _Some loan sizes are rough estimates (assessed value fallback — ARV comps pending)._"}],
         })
+    if dial_list.from_cache:
+        blocks.append({
+            "type": "context",
+            "elements": [{"type": "mrkdwn",
+                          "text": "♻️ _Posted from cached state — live generation failed; data may be stale._"}],
+        })
+    if dial_list.stale_sources:
+        srcs = ", ".join(dial_list.stale_sources)
+        blocks.append({
+            "type": "context",
+            "elements": [{"type": "mrkdwn",
+                          "text": f"⚠️ _Stale sources (data may be behind): {srcs}._"}],
+        })
     return fallback, blocks
 
 
@@ -303,11 +316,43 @@ def generate_and_deliver(
     The convenience the daily cron calls: assemble candidates from the DB,
     rank them, and post the digest. Delegates ranking to the pure core via
     ``repository.generate_dial_list`` — this function adds only delivery.
-    """
-    from .repository import generate_dial_list
 
-    dial_list = generate_dial_list(
-        session, as_of=as_of, county_id=county_id, config=config
+    Failure behavior (amendment): if live generation fails, fall back to the
+    last cached snapshot and post that (flagged from-cache) so the morning list
+    still goes out. On success the fresh list is snapshotted for a future
+    fallback. If generation fails AND no snapshot exists, the error propagates.
+    """
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from .repository import (
+        generate_dial_list,
+        load_latest_dial_list_snapshot,
+        write_dial_list_snapshot,
     )
+
+    try:
+        dial_list = generate_dial_list(
+            session, as_of=as_of, county_id=county_id, config=config
+        )
+    except SQLAlchemyError:
+        logger.error(
+            "[DialList] live generation failed for %s — attempting cached fallback",
+            as_of, exc_info=True,
+        )
+        dial_list = load_latest_dial_list_snapshot(session, county_id=county_id)
+        if dial_list is None:
+            logger.error("[DialList] no cached snapshot to fall back to")
+            raise
+    else:
+        # Snapshot the fresh list best-effort — a snapshot-write failure must
+        # never discard a good live list or trigger the cached fallback.
+        try:
+            write_dial_list_snapshot(session, dial_list, county_id=county_id)
+        except SQLAlchemyError:
+            logger.warning(
+                "[DialList] snapshot write failed for %s (live list still posts)",
+                as_of, exc_info=True,
+            )
+
     ts = deliver_dial_list(dial_list, channel=channel, interactive=interactive)
     return dial_list, ts

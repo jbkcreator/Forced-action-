@@ -91,3 +91,9 @@ class DialList(BaseModel):
     entries: List[DialListEntry] = Field(default_factory=list)
     candidate_count: int = 0
     config_version: str
+    # sources whose scraper feed is behind SLA when this list was built —
+    # surfaced in the digest so Josh knows the data may be stale.
+    stale_sources: List[str] = Field(default_factory=list)
+    # True when live generation failed and this list was served from the last
+    # cached snapshot (failure-behavior fallback).
+    from_cache: bool = False

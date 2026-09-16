@@ -21,6 +21,9 @@ from src.core.models import (
     BuyerEntity,
     BuyerEntityLink,
     Deed,
+    DialListNeedsEnrichment,
+    DialListSnapshot,
+    DialListTouch,
     Financial,
     FinancingIntentScore,
     Foreclosure,
@@ -28,6 +31,7 @@ from src.core.models import (
     LegalProceeding,
     Owner,
     Property,
+    ScraperRunStats,
     TaxDeedAuction,
 )
 from src.services.dial_list import (
@@ -68,6 +72,10 @@ def db():
         BuyerEntity.__table__,
         BuyerEntityLink.__table__,
         AgentLaneOpportunityOutcome.__table__,
+        DialListSnapshot.__table__,
+        DialListTouch.__table__,
+        DialListNeedsEnrichment.__table__,
+        ScraperRunStats.__table__,
     ]
     for t in tables:
         t.create(bind=engine)
@@ -82,13 +90,20 @@ def db():
 _pid_seq = [0]
 
 
-def _prop(session, county="hillsborough", property_use_code="0100", **kw):
+def _prop(session, county="hillsborough", property_use_code="0100",
+          with_owner=True, **kw):
     _pid_seq[0] += 1
     pid = _pid_seq[0]
     p = Property(id=pid, parcel_id=f"parcel-{pid}", county_id=county,
                  property_use_code=property_use_code, **kw)
     session.add(p)
     session.flush()
+    # Default contact so the candidate clears the needs-enrichment gate; tests
+    # that manage their own owner (dedup, link, contact-rendering) pass
+    # with_owner=False to avoid a duplicate owner row.
+    if with_owner:
+        session.add(Owner(property_id=pid, owner_name=f"OWNER {pid}"))
+        session.flush()
     return pid
 
 
@@ -158,7 +173,7 @@ def test_financed_purchase_not_cash(db):
 
 def test_won_opportunity_excluded_next_day(db):
     # A candidate whose borrower thread is already coded won must not resurface.
-    pid = _prop(db)
+    pid = _prop(db, with_owner=False)
     db.add(Deed(property_id=pid, instrument_number="IW", sale_price=Decimal("300000"),
                 mortgage_amount=None, record_date=AS_OF - timedelta(days=30),
                 county_id="hillsborough"))
@@ -181,7 +196,7 @@ def test_won_opportunity_excluded_next_day(db):
 def test_unrelated_terminal_outcome_does_not_exclude(db):
     # A won outcome for a DIFFERENT thread must not filter this candidate out
     # (guards the scoped-query fix against over-broad exclusion).
-    pid = _prop(db)
+    pid = _prop(db, with_owner=False)
     db.add(Deed(property_id=pid, instrument_number="IK", sale_price=Decimal("300000"),
                 mortgage_amount=None, record_date=AS_OF - timedelta(days=30),
                 county_id="hillsborough"))
@@ -198,7 +213,7 @@ def test_unrelated_terminal_outcome_does_not_exclude(db):
 
 
 def test_out_of_state_flag(db):
-    pid = _prop(db)
+    pid = _prop(db, with_owner=False)
     _owner(db, pid, owner_name="ABSENTEE LLC", absentee_status="Out-of-State")
     cands = assemble_dial_candidates(db, as_of=AS_OF)
     assert len(cands) == 1
@@ -247,12 +262,12 @@ def test_probate_detected(db):
 def test_union_dedup_by_borrower(db):
     # two properties, same borrower, different triggers → core collapses to one
     _borrower(db, 500, total_purchase_count=6)
-    p1 = _prop(db)
+    p1 = _prop(db, with_owner=False)
     o1 = _owner(db, p1, owner_name="X", absentee_status="Out-of-State")
     _link_borrower(db, o1.id, 500)
     _fin(db, p1, assessed_value_mkt=Decimal("400000"))
 
-    p2 = _prop(db)
+    p2 = _prop(db, with_owner=False)
     o2 = _owner(db, p2, owner_name="X")
     _link_borrower(db, o2.id, 500)
     db.add(Deed(property_id=p2, instrument_number="I9", sale_price=Decimal("250000"),
@@ -344,7 +359,7 @@ def test_residential_use_code_kept(db):
 
 def test_name_address_phone_populated(db):
     _borrower(db, 900, canonical_name="ACME HOMES LLC", total_purchase_count=3)
-    pid = _prop(db, address="123 Main St", city="Tampa", zip="33602")
+    pid = _prop(db, address="123 Main St", city="Tampa", zip="33602", with_owner=False)
     o = _owner(db, pid, owner_name="ACME HOMES LLC", phone_1="813-555-0100",
                absentee_status="Out-of-State")
     _link_borrower(db, o.id, 900)
@@ -357,7 +372,7 @@ def test_name_address_phone_populated(db):
 
 
 def test_owner_name_fallback_when_unresolved(db):
-    pid = _prop(db, address="9 Oak Ave", city="Tampa", zip="33605")
+    pid = _prop(db, address="9 Oak Ave", city="Tampa", zip="33605", with_owner=False)
     _owner(db, pid, owner_name="JANE DOE", phone_1="813-555-0200",
            absentee_status="Out-of-State")
     db.flush()
@@ -367,7 +382,7 @@ def test_owner_name_fallback_when_unresolved(db):
 
 
 def test_unresolved_candidate_still_appears(db):
-    pid = _prop(db)
+    pid = _prop(db, with_owner=False)
     _owner(db, pid, owner_name="NOENTITY", absentee_status="Out-of-State")
     # no BuyerEntityLink → unresolved
     cands = assemble_dial_candidates(db, as_of=AS_OF)
@@ -403,3 +418,81 @@ def test_source_failure_propagates(db, caplog):
     with pytest.raises(SQLAlchemyError):
         assemble_dial_candidates(_Boom(), as_of=AS_OF)
     assert any("dial_list retrieval failed" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Failure-behavior hardening: needs-enrichment, staleness, snapshots
+# ---------------------------------------------------------------------------
+
+def test_no_contact_candidate_held_for_enrichment(db):
+    # residential + a trigger, but enrichment yields no owner/name/phone
+    pid = _prop(db, with_owner=False)
+    db.add(Deed(property_id=pid, instrument_number="INC", sale_price=Decimal("300000"),
+                mortgage_amount=None, record_date=AS_OF - timedelta(days=30),
+                county_id="hillsborough"))
+    db.flush()
+    cands = assemble_dial_candidates(db, as_of=AS_OF)
+    assert cands == []  # not surfaced with a guessed contact
+    rows = db.query(DialListNeedsEnrichment).all()
+    assert len(rows) == 1
+    assert rows[0].property_id == pid
+    assert rows[0].reason == "no_contact"
+    assert rows[0].retry_count == 0
+    # re-run → retry_count increments (retried on next batch)
+    assemble_dial_candidates(db, as_of=AS_OF + timedelta(days=1))
+    db.expire_all()
+    row = db.query(DialListNeedsEnrichment).filter_by(property_id=pid).one()
+    assert row.retry_count == 1
+    assert row.last_seen == AS_OF + timedelta(days=1)
+
+
+def _run_stats(db, source_type, run_date, run_success=True, _seq=[0]):
+    _seq[0] += 1
+    db.add(ScraperRunStats(id=_seq[0], source_type=source_type, county_id="hillsborough",
+                           run_date=run_date, run_success=run_success))
+    db.flush()
+
+
+def test_stale_source_detected_and_fresh_not(db):
+    from src.services.dial_list.repository import stale_dial_list_sources
+    # deeds fresh (yesterday), foreclosures stale (10 days ago)
+    _run_stats(db, "deeds", AS_OF - timedelta(days=1))
+    _run_stats(db, "foreclosures", AS_OF - timedelta(days=10))
+    stale = stale_dial_list_sources(db, as_of=AS_OF, sla_days=2, county_id="hillsborough")
+    assert "foreclosures" in stale
+    assert "deeds" not in stale
+    # sources that never ran are stale too
+    assert "probate" in stale
+
+
+def test_snapshot_write_and_load_roundtrip(db):
+    from src.services.dial_list.repository import (
+        load_latest_dial_list_snapshot, write_dial_list_snapshot,
+    )
+    from src.services.dial_list.models import DialList, DialListEntry
+    dl = DialList(generated_for=AS_OF, entries=[], candidate_count=3,
+                 config_version="wp9-1.0.0")
+    write_dial_list_snapshot(db, dl, county_id="hillsborough")
+    loaded = load_latest_dial_list_snapshot(db, county_id="hillsborough")
+    assert loaded is not None
+    assert loaded.generated_for == AS_OF
+    assert loaded.candidate_count == 3
+    assert loaded.from_cache is True  # marked as cache-served
+
+
+def test_snapshot_load_none_when_empty(db):
+    from src.services.dial_list.repository import load_latest_dial_list_snapshot
+    assert load_latest_dial_list_snapshot(db, county_id="nowhere") is None
+
+
+def test_generate_dial_list_populates_stale_sources(db):
+    pid = _prop(db)
+    db.add(Deed(property_id=pid, instrument_number="IGEN", sale_price=Decimal("300000"),
+                mortgage_amount=None, record_date=AS_OF - timedelta(days=30),
+                county_id="hillsborough"))
+    _run_stats(db, "deeds", AS_OF - timedelta(days=1))  # fresh
+    db.flush()
+    dl = generate_dial_list(db, as_of=AS_OF, county_id="hillsborough")
+    # probate/permits/foreclosures/tax_deed never ran → stale
+    assert "deeds" not in dl.stale_sources
+    assert "probate" in dl.stale_sources

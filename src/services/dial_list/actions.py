@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from src.services.opportunity_outcome import LOSS_REASON_CODES
@@ -50,6 +52,47 @@ _STATUS_LABEL = {
     "unauthorized": ":no_entry: Ignored (not the approver)",
     "no_thread": ":warning: No opportunity thread — can't code outcome",
 }
+
+# Durable record of a non-terminal Called/Skip tap (audit + idempotency).
+_TOUCH_UPSERT_SQL = text(
+    """
+    INSERT INTO dial_list_touch
+        (opportunity_thread_id, property_id, action, actor, generation_date)
+    VALUES (:thread, :property_id, :action, :actor, :generation_date)
+    ON CONFLICT (property_id, generation_date, action) DO NOTHING
+    """
+)
+
+
+def _record_touch(
+    session: Session,
+    *,
+    thread: Optional[str],
+    property_id: Optional[int],
+    action: str,
+    actor: Optional[str],
+    generation_date: date,
+) -> None:
+    """Persist a Called/Skip touch. Best effort — a write failure must never
+    break the card update the operator just performed."""
+    try:
+        session.execute(
+            _TOUCH_UPSERT_SQL,
+            {
+                "thread": thread,
+                "property_id": property_id,
+                "action": action,
+                "actor": actor,
+                "generation_date": generation_date,
+            },
+        )
+        session.commit()
+    except SQLAlchemyError:
+        session.rollback()
+        logger.warning(
+            "[DialList] touch write failed (property_id=%s action=%s)",
+            property_id, action, exc_info=True,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,9 +191,11 @@ def handle_action(
             logger.warning("[DialList] chat_update failed for %s", thread, exc_info=True)
         return new_blocks
 
-    # non-terminal: called / skip — no outcome row
+    # non-terminal: called / skip — no outcome row, but a durable touch record
     if action_id in _NON_TERMINAL:
         kind = _NON_TERMINAL[action_id]
+        _record_touch(session, thread=thread, property_id=data.get("property_id"),
+                      action=kind, actor=user_id, generation_date=as_of)
         updated = _apply_update(kind)
         return ActionResult(status="touched", kind=kind,
                             opportunity_thread_id=thread, updated_blocks=updated)

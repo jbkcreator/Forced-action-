@@ -292,3 +292,36 @@ class TestHandleThreadReply:
         sess = MagicMock()
         result = handle_thread_reply("nice property", sess, opportunity_thread_id=_THREAD)
         assert result.status == "ignored"
+
+
+# ---------------------------------------------------------------------------
+# Touch durability (#3a) — Called/Skip persist to dial_list_touch
+# ---------------------------------------------------------------------------
+
+class TestTouchDurability:
+    def _real_session(self):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from src.core.models import DialListTouch
+        engine = create_engine("sqlite:///:memory:")
+        DialListTouch.__table__.create(bind=engine)
+        return sessionmaker(bind=engine)(), DialListTouch
+
+    def test_called_writes_touch_row(self):
+        sess, DialListTouch = self._real_session()
+        payload = _payload(ACTION_CALLED, _value(property_id=42))
+        with patch("src.services.dial_list.actions.record_dial_disposition"):
+            handle_action(payload, sess, approver_id=_APPROVER)
+        rows = sess.query(DialListTouch).all()
+        assert len(rows) == 1
+        assert rows[0].property_id == 42
+        assert rows[0].action == "called"
+        assert rows[0].actor == _APPROVER
+
+    def test_duplicate_touch_is_idempotent(self):
+        sess, DialListTouch = self._real_session()
+        payload = _payload(ACTION_CALLED, _value(property_id=42))
+        with patch("src.services.dial_list.actions.record_dial_disposition"):
+            handle_action(payload, sess, approver_id=_APPROVER)
+            handle_action(payload, sess, approver_id=_APPROVER)
+        assert sess.query(DialListTouch).count() == 1  # UNIQUE dedup

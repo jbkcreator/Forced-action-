@@ -10178,3 +10178,68 @@ class AgentLaneOpportunityOutcome(Base):
             name="ck_alo_reason_code",
         ),
     )
+
+
+class DialListSnapshot(Base):
+    """WP-9 failure-behavior — last successfully generated dial list per
+    county/day. Served when live generation fails so the morning list "still
+    posts from cached state" (amendment failure-behavior)."""
+    __tablename__ = "dial_list_snapshot"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True, autoincrement=True,
+    )
+    county_id: Mapped[Optional[str]] = mapped_column(Text)
+    generated_for: Mapped[date] = mapped_column(Date, nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("idx_dial_list_snapshot_county_date", "county_id", "generated_for"),
+    )
+
+
+class DialListTouch(Base):
+    """WP-9 failure-behavior — durable record of a non-terminal Called/Skip tap.
+    One row per (property, generation day, action) for audit + idempotency."""
+    __tablename__ = "dial_list_touch"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True, autoincrement=True,
+    )
+    opportunity_thread_id: Mapped[Optional[str]] = mapped_column(Text)
+    property_id: Mapped[Optional[int]] = mapped_column(BigInteger)
+    action: Mapped[str] = mapped_column(Text, nullable=False)  # 'called' | 'skipped'
+    actor: Mapped[Optional[str]] = mapped_column(Text)
+    generation_date: Mapped[date] = mapped_column(Date, nullable=False)
+    touched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "property_id", "generation_date", "action",
+            name="uq_dial_list_touch_prop_day_action",
+        ),
+    )
+
+
+class DialListNeedsEnrichment(Base):
+    """WP-9 failure-behavior — a candidate whose enrichment returned no contact.
+    Held out of the callable list (never surfaced with a guessed contact) and
+    retried on the next daily batch."""
+    __tablename__ = "dial_list_needs_enrichment"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True, autoincrement=True,
+    )
+    property_id: Mapped[int] = mapped_column(BigInteger, nullable=False, unique=True)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    first_seen: Mapped[date] = mapped_column(Date, nullable=False)
+    last_seen: Mapped[date] = mapped_column(Date, nullable=False)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

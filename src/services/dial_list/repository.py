@@ -16,6 +16,7 @@ so there is no per-property round trip.
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import date, timedelta
 from decimal import Decimal
@@ -24,6 +25,10 @@ from typing import Dict, List, Optional, Set
 from sqlalchemy import bindparam, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
+
+from config.settings import get_settings
+
+from src.core.models import DialListSnapshot
 
 from .config import DEFAULT_CONFIG, DialListConfig
 from .models import DialCandidate, DialList
@@ -253,6 +258,46 @@ _TERMINAL_OUTCOMES_SQL = text(
       AND opportunity_thread_id IN :thread_ids
     """
 ).bindparams(bindparam("thread_ids", expanding=True))
+
+# Scraper source_types that feed the dial-list detectors (real values from the
+# scraper engines). If one is behind SLA the digest flags it stale.
+_DIAL_LIST_SOURCE_TYPES = (
+    "deeds", "permits", "foreclosures", "tax_deed_auction", "probate",
+)
+
+# Most-recent successful run per source; a source with no successful run at all
+# is absent from the result (treated as stale by the caller).
+_SOURCE_FRESHNESS_SQL = text(
+    """
+    SELECT source_type, MAX(run_date) AS last_success
+    FROM scraper_run_stats
+    WHERE source_type IN :source_types
+      AND run_success = TRUE
+      AND (:county IS NULL OR county_id = :county)
+    GROUP BY source_type
+    """
+).bindparams(bindparam("source_types", expanding=True))
+
+_NEEDS_ENRICHMENT_UPSERT_SQL = text(
+    """
+    INSERT INTO dial_list_needs_enrichment
+        (property_id, reason, first_seen, last_seen, retry_count)
+    VALUES (:pid, 'no_contact', :as_of, :as_of, 0)
+    ON CONFLICT (property_id) DO UPDATE
+        SET last_seen = :as_of,
+            retry_count = dial_list_needs_enrichment.retry_count + 1
+    """
+)
+
+_SNAPSHOT_LATEST_SQL = text(
+    """
+    SELECT payload
+    FROM dial_list_snapshot
+    WHERE (:county IS NULL OR county_id = :county)
+    ORDER BY generated_for DESC, created_at DESC
+    LIMIT 1
+    """
+)
 
 _ENRICH_SQL = text(
     """
@@ -514,6 +559,7 @@ def assemble_dial_candidates(
         raise
 
     candidates: List[DialCandidate] = []
+    needs_enrichment: List[int] = []
     for pid, a in acc.items():
         e = enrich.get(pid, {})
         # Scope to residential-investor property types. Commercial / industrial
@@ -523,6 +569,12 @@ def assemble_dial_candidates(
             continue
         thread_id = e.get("opportunity_thread_id")
         if thread_id and thread_id in terminal_threads:
+            continue
+        # Enrichment returned no usable contact — never surface a call with a
+        # guessed contact. Hold it in the needs-enrichment queue for retry on
+        # the next batch (amendment failure-behavior).
+        if not (e.get("phone_1") or e.get("canonical_name") or e.get("owner_name")):
+            needs_enrichment.append(pid)
             continue
         last_sale_date = _as_date(e.get("last_sale_date"))
         address = _compose_address(e.get("address"), e.get("city"), e.get("zip"))
@@ -553,7 +605,101 @@ def assemble_dial_candidates(
                 last_deal_months_ago=last_deal_months,
             )
         )
+
+    if needs_enrichment:
+        _record_needs_enrichment(session, needs_enrichment, as_of)
+        logger.info(
+            "dial_list: %d candidate(s) held for enrichment (no contact) — "
+            "not surfaced, will retry next batch", len(needs_enrichment),
+        )
     return candidates
+
+
+def _record_needs_enrichment(
+    session: Session, property_ids: List[int], as_of: date
+) -> None:
+    """Upsert no-contact candidates into the needs-enrichment queue. Best
+    effort — a bookkeeping failure must not sink the whole list."""
+    try:
+        for pid in property_ids:
+            session.execute(
+                _NEEDS_ENRICHMENT_UPSERT_SQL, {"pid": pid, "as_of": as_of}
+            )
+        session.commit()
+    except SQLAlchemyError:
+        session.rollback()
+        logger.warning(
+            "dial_list: needs-enrichment bookkeeping failed for %d property(ies)",
+            len(property_ids), exc_info=True,
+        )
+
+
+def stale_dial_list_sources(
+    session: Session,
+    *,
+    as_of: date,
+    sla_days: int,
+    county_id: Optional[str] = None,
+) -> List[str]:
+    """Return dial-list source_types whose last successful scraper run is older
+    than the SLA (or that never succeeded). Never raises — staleness reporting
+    must not break the digest."""
+    try:
+        cutoff = as_of - timedelta(days=sla_days)
+        fresh: Dict[str, Optional[date]] = {}
+        for row in session.execute(
+            _SOURCE_FRESHNESS_SQL,
+            {"source_types": list(_DIAL_LIST_SOURCE_TYPES), "county": county_id},
+        ).mappings():
+            fresh[row["source_type"]] = _as_date(row["last_success"])
+        stale: List[str] = []
+        for src in _DIAL_LIST_SOURCE_TYPES:
+            last = fresh.get(src)
+            if last is None or last < cutoff:
+                stale.append(src)
+        return stale
+    except SQLAlchemyError:
+        logger.warning("dial_list: source-staleness check failed", exc_info=True)
+        return []
+
+
+def write_dial_list_snapshot(session: Session, dial_list: DialList,
+                             *, county_id: Optional[str] = None) -> None:
+    """Persist a successfully generated list so a future failed run can still
+    post from cached state. Best effort — never sinks the live post."""
+    try:
+        session.add(
+            DialListSnapshot(
+                county_id=county_id,
+                generated_for=dial_list.generated_for,
+                payload=dial_list.model_dump(mode="json"),
+            )
+        )
+        session.commit()
+    except SQLAlchemyError:
+        session.rollback()
+        logger.warning("dial_list: snapshot write failed", exc_info=True)
+
+
+def load_latest_dial_list_snapshot(
+    session: Session, *, county_id: Optional[str] = None
+) -> Optional[DialList]:
+    """Load the most recent cached list for the failure-fallback path."""
+    try:
+        row = session.execute(
+            _SNAPSHOT_LATEST_SQL, {"county": county_id}
+        ).mappings().first()
+    except SQLAlchemyError:
+        logger.warning("dial_list: snapshot load failed", exc_info=True)
+        return None
+    if row is None:
+        return None
+    payload = row["payload"]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    dial_list = DialList.model_validate(payload)
+    dial_list.from_cache = True
+    return dial_list
 
 
 def generate_dial_list(
@@ -568,4 +714,9 @@ def generate_dial_list(
     candidates = assemble_dial_candidates(
         session, as_of=as_of, county_id=county_id, config=cfg
     )
-    return rank_dial_list(candidates, as_of, cfg)
+    dial_list = rank_dial_list(candidates, as_of, cfg)
+    dial_list.stale_sources = stale_dial_list_sources(
+        session, as_of=as_of, sla_days=get_settings().dial_list_source_sla_days,
+        county_id=county_id,
+    )
+    return dial_list

@@ -670,6 +670,12 @@ class AppSettings(BaseSettings):
 	dial_list_approver_user_id: str = Field(
 		default="", env="DIAL_LIST_APPROVER_USER_ID"
 	)
+	# A dial-list source (deeds, permits, foreclosures, tax_deed_auction,
+	# probate) whose last successful scraper run is older than this many days is
+	# flagged "stale" in the digest header (failure-behavior visibility).
+	dial_list_source_sla_days: int = Field(
+		default=2, env="DIAL_LIST_SOURCE_SLA_DAYS"
+	)
 
 	# Relay email channel (RELAY-v2.2 sub-task R2). relay_instantly_campaign_id
 	# is set once after running `python -m src.services.relay --setup-email-channel`
