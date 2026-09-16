@@ -293,6 +293,9 @@ from src.api.broker_router import router as broker_router  # noqa: E402
 app.include_router(broker_router)
 from src.api.loan_lane_router import router as loan_lane_router  # noqa: E402
 app.include_router(loan_lane_router)
+
+from src.api.fa_max_router import router as fa_max_router  # noqa: E402
+app.include_router(fa_max_router)
 from src.api.commission_router import router as commission_router  # noqa: E402
 app.include_router(commission_router)
 from src.api.account_router import router as account_router  # noqa: E402

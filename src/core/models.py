@@ -11131,6 +11131,11 @@ class FaMaxPersonProfile(Base):
         nullable=True,
         comment="arm's-length sale price stats: {min_cents, median_cents, max_cents, sample_count}",
     )
+    buy_box_preferences: Mapped[Optional[Any]] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment="property condition/size preferences: condition distribution, year_built range, beds/baths/lot averages",
+    )
 
     # --- Deal velocity (mirrored from BuyerEntity cadence fields) ------------
     velocity_purchases_per_year: Mapped[Optional[Decimal]] = mapped_column(Numeric(6, 2), nullable=True)

@@ -50,7 +50,8 @@ def _fresh_person_id(session) -> str:
     return row
 
 
-def _fresh_buyer_entity(session, name: str = "Smith John A") -> int:
+def _fresh_buyer_entity(session, name: str = "Smith John A",
+                         cadence: float = None, avg_hold_days: int = None) -> int:
     """Insert a minimal buyer_entities row and return its id."""
     eid = session.execute(
         text("""
@@ -63,10 +64,24 @@ def _fresh_buyer_entity(session, name: str = "Smith John A") -> int:
         {"name": name},
     ).scalar()
     session.flush()
+    if cadence is not None or avg_hold_days is not None:
+        session.execute(
+            text("""
+                UPDATE buyer_entities SET
+                    cadence_purchases_per_year = COALESCE(:cadence, cadence_purchases_per_year),
+                    avg_hold_days = COALESCE(:hold, avg_hold_days)
+                WHERE id = :eid
+            """),
+            {"cadence": cadence, "hold": avg_hold_days, "eid": eid},
+        )
+        session.flush()
     return eid
 
 
-def _insert_property(session, parcel_id: str = None) -> int:
+def _insert_property(session, parcel_id: str = None,
+                      building_condition: str = None, year_built: int = None,
+                      beds: float = None, baths: float = None,
+                      lot_size: float = None) -> int:
     if parcel_id is None:
         parcel_id = f"TEST-{uuid.uuid4().hex[:8]}"
     pid = session.execute(
@@ -84,6 +99,21 @@ def _insert_property(session, parcel_id: str = None) -> int:
             {"pid": parcel_id},
         ).scalar()
     session.flush()
+    if any(v is not None for v in [building_condition, year_built, beds, baths, lot_size]):
+        session.execute(
+            text("""
+                UPDATE properties SET
+                    building_condition = COALESCE(:bc, building_condition),
+                    year_built         = COALESCE(:yb, year_built),
+                    beds               = COALESCE(:beds, beds),
+                    baths              = COALESCE(:baths, baths),
+                    lot_size           = COALESCE(:ls, lot_size)
+                WHERE id = :pid
+            """),
+            {"bc": building_condition, "yb": year_built, "beds": beds,
+             "baths": baths, "ls": lot_size, "pid": pid},
+        )
+        session.flush()
     return pid
 
 
@@ -305,25 +335,28 @@ class TestNextNeedDate:
         from src.services.borrower_profile_service import _predict_next_need_date
         session = MagicMock()
         session.execute.return_value.mappings.return_value.first.return_value = None
-        result = _predict_next_need_date(
+        predicted, evidence = _predict_next_need_date(
             session=session,
             person_uuid="00000000-0000-0000-0000-000000000001",
             last_txn_date=date(2024, 1, 1),
             velocity=Decimal("0.4"),  # below 0.5 floor
         )
-        assert result is None
+        assert predicted is None
+        assert evidence is None
 
     def test_cadence_at_floor_returns_date(self):
         from src.services.borrower_profile_service import _predict_next_need_date
         session = MagicMock()
         session.execute.return_value.mappings.return_value.first.return_value = None
-        result = _predict_next_need_date(
+        predicted, evidence = _predict_next_need_date(
             session=session,
             person_uuid="00000000-0000-0000-0000-000000000001",
             last_txn_date=date(2024, 1, 1),
             velocity=Decimal("0.5"),  # exactly at floor
         )
-        assert result is not None
+        assert predicted is not None
+        assert evidence is not None
+        assert evidence["basis"] == "cadence"
 
     def test_cadence_projection_math(self):
         from src.services.borrower_profile_service import _predict_next_need_date
@@ -331,28 +364,31 @@ class TestNextNeedDate:
         session = MagicMock()
         session.execute.return_value.mappings.return_value.first.return_value = None
         last = date(2024, 1, 1)
-        result = _predict_next_need_date(
+        predicted, evidence = _predict_next_need_date(
             session=session,
             person_uuid="00000000-0000-0000-0000-000000000001",
             last_txn_date=last,
             velocity=Decimal("2.0"),  # 365/2 = 182.5 days
         )
-        assert result is not None
+        assert predicted is not None
         expected_date = datetime(2024, 1, 1, tzinfo=timezone.utc) + timedelta(days=182.5)
-        diff = abs((result - expected_date).total_seconds())
+        diff = abs((predicted - expected_date).total_seconds())
         assert diff < 86400  # within 1 day
+        assert evidence["basis"] == "cadence"
+        assert evidence["days_projected"] in (182, 183)  # round(182.5) is 182 in Python (banker's rounding)
 
     def test_no_last_txn_returns_none(self):
         from src.services.borrower_profile_service import _predict_next_need_date
         session = MagicMock()
         session.execute.return_value.mappings.return_value.first.return_value = None
-        result = _predict_next_need_date(
+        predicted, evidence = _predict_next_need_date(
             session=session,
             person_uuid="00000000-0000-0000-0000-000000000001",
             last_txn_date=None,
             velocity=Decimal("2.0"),
         )
-        assert result is None
+        assert predicted is None
+        assert evidence is None
 
 
 class TestJsonbHelper:
@@ -632,25 +668,27 @@ class TestBoundaryValues:
         from src.services.borrower_profile_service import _predict_next_need_date
         session = MagicMock()
         session.execute.return_value.mappings.return_value.first.return_value = None
-        result = _predict_next_need_date(
+        predicted, evidence = _predict_next_need_date(
             session=session,
             person_uuid=str(uuid.uuid4()),
             last_txn_date=date(2024, 1, 1),
             velocity=Decimal("0.5"),  # exactly at floor
         )
-        assert result is not None
+        assert predicted is not None
+        assert evidence is not None
 
     def test_cadence_just_below_0_5_suppresses_date(self):
         from src.services.borrower_profile_service import _predict_next_need_date
         session = MagicMock()
         session.execute.return_value.mappings.return_value.first.return_value = None
-        result = _predict_next_need_date(
+        predicted, evidence = _predict_next_need_date(
             session=session,
             person_uuid=str(uuid.uuid4()),
             last_txn_date=date(2024, 1, 1),
             velocity=Decimal("0.49"),
         )
-        assert result is None
+        assert predicted is None
+        assert evidence is None
 
 
 # ===========================================================================
@@ -862,3 +900,246 @@ class TestMigrationIdempotency:
                 {"pid": person_id},
             )
             fresh_db.flush()
+
+
+
+# ===========================================================================
+# Fix 1 — avg_days_between_transactions computed from deed date gaps
+# ===========================================================================
+
+class TestAvgDaysBetweenTransactions:
+    def test_single_deed_returns_none(self):
+        from src.services.borrower_profile_service import _compute_avg_days_between_transactions
+        deeds = [{"record_date": date(2024, 1, 1)}]
+        assert _compute_avg_days_between_transactions(deeds) is None
+
+    def test_two_deeds_correct_gap(self):
+        from src.services.borrower_profile_service import _compute_avg_days_between_transactions
+        deeds = [
+            {"record_date": date(2024, 1, 1)},
+            {"record_date": date(2024, 7, 1)},  # 182 days later
+        ]
+        result = _compute_avg_days_between_transactions(deeds)
+        assert result is not None
+        assert float(result) == pytest.approx(182.0, abs=1)
+
+    def test_three_deeds_average_gap(self):
+        from src.services.borrower_profile_service import _compute_avg_days_between_transactions
+        deeds = [
+            {"record_date": date(2022, 1, 1)},
+            {"record_date": date(2023, 1, 1)},  # 365 days
+            {"record_date": date(2023, 7, 1)},  # 181 days
+        ]
+        result = _compute_avg_days_between_transactions(deeds)
+        assert result is not None
+        assert float(result) == pytest.approx(273.0, abs=1)
+
+    def test_empty_deeds_returns_none(self):
+        from src.services.borrower_profile_service import _compute_avg_days_between_transactions
+        assert _compute_avg_days_between_transactions([]) is None
+
+    def test_not_using_avg_hold_days(self, fresh_db):
+        """avg_days_between_transactions must come from deed date gaps, not avg_hold_days."""
+        person_id = _fresh_person_id(fresh_db)
+        entity_id = _fresh_buyer_entity(fresh_db, avg_hold_days=999)
+        _set_person_entity_link(fresh_db, person_id, entity_id)
+        prop1 = _insert_property(fresh_db)
+        prop2 = _insert_property(fresh_db)
+        _insert_deed(fresh_db, prop1, entity_id, 200_000, record_date=date(2023, 1, 1))
+        _insert_deed(fresh_db, prop2, entity_id, 250_000, record_date=date(2023, 7, 1))
+        fresh_db.commit()
+
+        profile = compute_person_profile(fresh_db, person_id)
+        avg = float(profile["avg_days_between_transactions"])
+        assert avg < 400, f"avg_days_between_transactions={avg} looks like avg_hold_days=999 leaked in"
+
+
+# ===========================================================================
+# Fix 2 — work queue scheduling and draining
+# ===========================================================================
+
+class TestWorkQueueScheduling:
+    def test_schedule_enqueues_row(self, fresh_db):
+        from src.services.borrower_profile_service import schedule_profile_recompute
+        person_id = _fresh_person_id(fresh_db)
+        schedule_profile_recompute(fresh_db, person_id, "test_reason")
+        fresh_db.commit()
+
+        count = fresh_db.execute(
+            text("""
+                SELECT COUNT(*) FROM fa_max_work_queue
+                WHERE queue_name = 'profile_recompute'
+                  AND person_id = :pid
+                  AND status = 'available'
+            """),
+            {"pid": person_id},
+        ).scalar()
+        assert count == 1
+
+    def test_schedule_idempotent(self, fresh_db):
+        from src.services.borrower_profile_service import schedule_profile_recompute
+        person_id = _fresh_person_id(fresh_db)
+        schedule_profile_recompute(fresh_db, person_id, "first")
+        fresh_db.commit()
+        schedule_profile_recompute(fresh_db, person_id, "second")
+        fresh_db.commit()
+
+        count = fresh_db.execute(
+            text("""
+                SELECT COUNT(*) FROM fa_max_work_queue
+                WHERE queue_name = 'profile_recompute' AND person_id = :pid
+            """),
+            {"pid": person_id},
+        ).scalar()
+        assert count == 1, "Duplicate schedule must be a no-op"
+
+    def test_drain_marks_items_done(self, fresh_db):
+        from src.services.borrower_profile_service import schedule_profile_recompute
+        from src.tasks.fa_max_profile_sweep import _drain_recompute_queue
+
+        person_id = _fresh_person_id(fresh_db)
+        entity_id = _fresh_buyer_entity(fresh_db)
+        _set_person_entity_link(fresh_db, person_id, entity_id)
+        schedule_profile_recompute(fresh_db, person_id, "drain_test")
+        fresh_db.commit()
+
+        drained = _drain_recompute_queue(fresh_db)
+        assert drained >= 1
+
+        status = fresh_db.execute(
+            text("""
+                SELECT status FROM fa_max_work_queue
+                WHERE queue_name = 'profile_recompute' AND person_id = :pid
+                ORDER BY created_at DESC LIMIT 1
+            """),
+            {"pid": person_id},
+        ).scalar()
+        assert status == "done"
+
+
+# ===========================================================================
+# Fix 3 — production read path
+# ===========================================================================
+
+class TestProductionReadPath:
+    def test_get_person_profile_returns_none_when_absent(self, fresh_db):
+        from src.services.borrower_profile_service import get_person_profile
+        result = get_person_profile(fresh_db, str(uuid.uuid4()))
+        assert result is None
+
+    def test_get_person_profile_returns_dict_after_compute(self, fresh_db):
+        from src.services.borrower_profile_service import get_person_profile
+        person_id = _fresh_person_id(fresh_db)
+        compute_person_profile(fresh_db, person_id)
+        fresh_db.commit()
+        result = get_person_profile(fresh_db, person_id)
+        assert result is not None
+        assert result["person_id"] == person_id
+
+    def test_api_router_404_on_missing_profile(self):
+        from fastapi.testclient import TestClient
+        from fastapi import FastAPI
+        from unittest.mock import patch
+        from src.api.fa_max_router import router
+
+        app = FastAPI()
+        app.include_router(router)
+
+        with patch("src.api.fa_max_router.get_person_profile", return_value=None):
+            client = TestClient(app)
+            resp = client.get(f"/api/fa-max/persons/{uuid.uuid4()}/profile")
+        assert resp.status_code == 404
+
+    def test_api_router_200_when_profile_exists(self):
+        from fastapi.testclient import TestClient
+        from fastapi import FastAPI
+        from unittest.mock import patch
+        from src.api.fa_max_router import router
+
+        fake_profile = {"person_id": str(uuid.uuid4()), "confidence_tier": "low"}
+        app = FastAPI()
+        app.include_router(router)
+
+        with patch("src.api.fa_max_router.get_person_profile", return_value=fake_profile):
+            client = TestClient(app)
+            resp = client.get(f"/api/fa-max/persons/{fake_profile['person_id']}/profile")
+        assert resp.status_code == 200
+        assert resp.json()["confidence_tier"] == "low"
+
+
+# ===========================================================================
+# Fix 4 — prediction date evidence basis field
+# ===========================================================================
+
+class TestPredictionEvidence:
+    def test_cadence_basis_stored_in_next_need_evidence(self, fresh_db):
+        person_id = _fresh_person_id(fresh_db)
+        entity_id = _fresh_buyer_entity(fresh_db, cadence=2.0)
+        _set_person_entity_link(fresh_db, person_id, entity_id)
+        prop1 = _insert_property(fresh_db)
+        prop2 = _insert_property(fresh_db)
+        _insert_deed(fresh_db, prop1, entity_id, 200_000, record_date=date(2023, 1, 1))
+        _insert_deed(fresh_db, prop2, entity_id, 250_000, record_date=date(2024, 1, 1))
+        fresh_db.commit()
+
+        profile = compute_person_profile(fresh_db, person_id)
+        evidence = profile.get("next_need_evidence") or {}
+        date_pred = evidence.get("date_prediction", {})
+        assert date_pred.get("basis") == "cadence"
+        assert "velocity_purchases_per_year" in date_pred
+
+
+# ===========================================================================
+# Fix 5 — buy_box_preferences populated from condition fields
+# ===========================================================================
+
+class TestBuyBoxPreferences:
+    def test_compute_preferences_with_data(self):
+        from src.services.borrower_profile_service import _compute_preferences
+        deeds = [
+            {"building_condition": "Good", "year_built": 2000, "beds": 3.0,
+             "baths": 2.0, "lot_size": 5000.0},
+            {"building_condition": "Good", "year_built": 2005, "beds": 4.0,
+             "baths": 2.0, "lot_size": 6000.0},
+        ]
+        prefs = _compute_preferences(deeds)
+        assert prefs is not None
+        assert prefs["most_common_condition"] == "Good"
+        assert prefs["year_built_min"] == 2000
+        assert prefs["year_built_max"] == 2005
+        assert prefs["beds_avg"] == pytest.approx(3.5)
+
+    def test_compute_preferences_empty_returns_none(self):
+        from src.services.borrower_profile_service import _compute_preferences
+        assert _compute_preferences([]) is None
+
+    def test_compute_preferences_all_null_fields_returns_none(self):
+        from src.services.borrower_profile_service import _compute_preferences
+        deeds = [{"building_condition": None, "year_built": None, "beds": None,
+                  "baths": None, "lot_size": None}]
+        assert _compute_preferences(deeds) is None
+
+    def test_buy_box_preferences_column_exists(self, fresh_db):
+        count = fresh_db.execute(
+            text("""
+                SELECT COUNT(*) FROM information_schema.columns
+                WHERE table_name = 'fa_max_person_profiles'
+                  AND column_name = 'buy_box_preferences'
+            """)
+        ).scalar()
+        assert count == 1
+
+    def test_preferences_stored_in_profile(self, fresh_db):
+        person_id = _fresh_person_id(fresh_db)
+        entity_id = _fresh_buyer_entity(fresh_db)
+        _set_person_entity_link(fresh_db, person_id, entity_id)
+        prop = _insert_property(fresh_db, building_condition="Fair", year_built=1990,
+                                beds=2, baths=1, lot_size=3000)
+        _insert_deed(fresh_db, prop, entity_id, 150_000)
+        fresh_db.commit()
+
+        profile = compute_person_profile(fresh_db, person_id)
+        prefs = profile.get("buy_box_preferences")
+        assert prefs is not None
+        assert prefs["most_common_condition"] == "Fair"
+

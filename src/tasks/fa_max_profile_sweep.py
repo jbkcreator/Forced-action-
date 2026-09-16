@@ -41,6 +41,9 @@ from src.core.database import get_db_context
 from src.services.borrower_profile_service import compute_person_profile
 from src.utils.logger import get_logger, setup_logging
 
+_QUEUE_NAME = "profile_recompute"
+_QUEUE_BATCH = 200
+
 setup_logging()
 logger = get_logger(__name__)
 
@@ -59,7 +62,12 @@ def run_sweep(*, force_all: bool = False) -> dict:
         # Step 1: best-effort entity discovery for unlinked persons
         linked_count = _link_unlinked_persons(session)
 
-        # Step 2: collect persons to profile
+        # Step 2: drain event-triggered recomputes (material events like funded
+        # opportunities or new deeds enqueue here via schedule_profile_recompute)
+        queue_drained = _drain_recompute_queue(session)
+
+        # Step 3: collect persons to profile
+        # Persons drained above already have fresh profiles; exclude from staleness sweep
         if force_all:
             where_clause = "merged_into_id IS NULL"
         else:
@@ -108,10 +116,63 @@ def run_sweep(*, force_all: bool = False) -> dict:
         "computed": computed,
         "errors": errors,
         "newly_linked": linked_count,
+        "queue_drained": queue_drained,
         "force_all": force_all,
     }
     logger.info("[FA Max ProfileSweep] %s", stats)
     return stats
+
+
+def _drain_recompute_queue(session) -> int:
+    """Claim and process all available 'profile_recompute' work-queue items.
+
+    Uses SKIP LOCKED so concurrent runs (if any) don't race the same items.
+    Marks each item 'done' on success and 'failed' on error; per-person
+    commit/rollback so one bad profile does not discard the rest.
+    """
+    drained = 0
+    while True:
+        rows = session.execute(
+            text("""
+                UPDATE fa_max_work_queue
+                SET status = 'claimed', claimed_at = NOW()
+                WHERE id IN (
+                    SELECT id FROM fa_max_work_queue
+                    WHERE queue_name = :qname AND status = 'available'
+                    ORDER BY created_at
+                    LIMIT :batch
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING id, person_id::text
+            """),
+            {"qname": _QUEUE_NAME, "batch": _QUEUE_BATCH},
+        ).mappings().all()
+        session.commit()
+
+        if not rows:
+            break
+
+        for row in rows:
+            item_id = row["id"]
+            person_id = row["person_id"]
+            try:
+                compute_person_profile(session, person_id)
+                session.execute(
+                    text("UPDATE fa_max_work_queue SET status='done', done_at=NOW() WHERE id=:id"),
+                    {"id": item_id},
+                )
+                session.commit()
+                drained += 1
+            except Exception:
+                session.rollback()
+                session.execute(
+                    text("UPDATE fa_max_work_queue SET status='failed' WHERE id=:id"),
+                    {"id": item_id},
+                )
+                session.commit()
+                logger.exception("[FA Max ProfileSweep] queue drain error for person %s (item %s)", person_id, item_id)
+
+    return drained
 
 
 def _link_unlinked_persons(session) -> int:

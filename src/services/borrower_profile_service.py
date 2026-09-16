@@ -170,10 +170,11 @@ def _build_unknown_profile(person_uuid: str) -> Dict[str, Any]:
         "buy_box_geography": None,
         "buy_box_property_types": None,
         "buy_box_price_band": None,
+        "buy_box_preferences": None,
         "velocity_purchases_per_year": None,
         "last_transaction_date": None,
         "avg_days_between_transactions": None,
-        "active_property_count": None,
+        "active_property_count": 0,
         "predicted_next_need": None,
         "predicted_next_need_date": None,
         "next_need_evidence": None,
@@ -195,31 +196,43 @@ def _build_profile(
     buy_box_price_band = _compute_price_band(deeds)
     deed_count = len(deeds)
 
-    # 2. Velocity from BuyerEntity cadence fields ----------------------------
+    # 2. Velocity from deed date history (fix: purchase-to-purchase intervals,
+    #    not avg_hold_days which measures acquisition-to-exit hold duration)
     cadence = _fetch_cadence(session, entity_id)
     _raw_velocity = cadence.get("cadence_purchases_per_year")
     velocity = Decimal(str(_raw_velocity)) if _raw_velocity is not None else None
-    avg_hold = cadence.get("avg_hold_days")
-    avg_days = Decimal(str(avg_hold)) if avg_hold is not None else None
+    avg_days = _compute_avg_days_between_transactions(deeds)
     portfolio_evidence = cadence.get("portfolio_evidence") or {}
     still_held = portfolio_evidence.get("still_held_count", 0)
-    active_property_count = still_held if still_held > 0 else None
+    active_property_count = still_held if still_held is not None else 0
 
     last_txn_date = _last_transaction_date(deeds)
 
-    # 3. Predicted next need from FinancingIntentScore -----------------------
+    # 3. Buy-box condition/preferences from property attributes ---------------
+    buy_box_preferences = _compute_preferences(deeds)
+
+    # 4. Predicted next need from FinancingIntentScore -----------------------
     intent_rows = _fetch_financing_intent(session, entity_id)
     predicted_need, next_need_evidence = _rollup_next_need(intent_rows)
 
-    # 4. Predicted next-need date -------------------------------------------
-    predicted_date = _predict_next_need_date(
+    # 5. Predicted next-need date with stored evidence -----------------------
+    predicted_date, date_evidence = _predict_next_need_date(
         session=session,
         person_uuid=person_uuid,
         last_txn_date=last_txn_date,
         velocity=velocity,
     )
 
-    # 5. Confidence tier ----------------------------------------------------
+    # Merge date prediction basis into next_need_evidence
+    if date_evidence:
+        combined_evidence = {
+            "financing_intent": next_need_evidence or [],
+            "date_prediction": date_evidence,
+        }
+    else:
+        combined_evidence = {"financing_intent": next_need_evidence or []} if next_need_evidence else None
+
+    # 6. Confidence tier ----------------------------------------------------
     confidence_tier = _confidence_tier(deed_count)
 
     return {
@@ -228,13 +241,14 @@ def _build_profile(
         "buy_box_geography": buy_box_geography,
         "buy_box_property_types": buy_box_property_types,
         "buy_box_price_band": buy_box_price_band,
+        "buy_box_preferences": buy_box_preferences,
         "velocity_purchases_per_year": velocity,
         "last_transaction_date": last_txn_date,
         "avg_days_between_transactions": avg_days,
         "active_property_count": active_property_count,
         "predicted_next_need": predicted_need,
         "predicted_next_need_date": predicted_date,
-        "next_need_evidence": next_need_evidence,
+        "next_need_evidence": combined_evidence,
         "confidence_tier": confidence_tier,
         "computed_at": now,
     }
@@ -253,7 +267,12 @@ def _fetch_entity_deeds(session: Session, entity_id: int) -> List[Dict[str, Any]
                 p.zip,
                 p.county_id,
                 p.property_type,
-                p.property_use_code
+                p.property_use_code,
+                p.year_built,
+                p.beds,
+                p.baths,
+                p.lot_size,
+                p.building_condition
             FROM buyer_entity_links bel
             JOIN deeds d ON bel.source_id = d.id
             JOIN properties p ON d.property_id = p.id
@@ -312,6 +331,60 @@ def _compute_price_band(deeds: List[Dict]) -> Optional[Dict[str, Any]]:
         "max_cents": prices[-1],
         "sample_count": n,
     }
+
+
+def _compute_avg_days_between_transactions(deeds: List[Dict]) -> Optional[Decimal]:
+    """Average gap in days between consecutive purchase dates (NOT hold time)."""
+    dates = sorted(
+        d["record_date"] for d in deeds if d.get("record_date") is not None
+    )
+    if len(dates) < 2:
+        return None
+    gaps = [(dates[i + 1] - dates[i]).days for i in range(len(dates) - 1)]
+    return Decimal(str(round(sum(gaps) / len(gaps), 2)))
+
+
+def _compute_preferences(deeds: List[Dict]) -> Optional[Dict[str, Any]]:
+    """Aggregate property condition/size preferences from deed-joined property fields."""
+    conditions: List[str] = []
+    years: List[int] = []
+    beds_list: List[float] = []
+    baths_list: List[float] = []
+    lot_sizes: List[float] = []
+
+    for d in deeds:
+        if d.get("building_condition"):
+            conditions.append(d["building_condition"])
+        if d.get("year_built") is not None:
+            years.append(int(d["year_built"]))
+        if d.get("beds") is not None:
+            beds_list.append(float(d["beds"]))
+        if d.get("baths") is not None:
+            baths_list.append(float(d["baths"]))
+        if d.get("lot_size") is not None:
+            lot_sizes.append(float(d["lot_size"]))
+
+    if not any([conditions, years, beds_list, baths_list, lot_sizes]):
+        return None
+
+    result: Dict[str, Any] = {}
+    if conditions:
+        from collections import Counter
+        counts = Counter(conditions)
+        result["condition_distribution"] = dict(counts.most_common())
+        result["most_common_condition"] = counts.most_common(1)[0][0]
+    if years:
+        result["year_built_min"] = min(years)
+        result["year_built_max"] = max(years)
+        result["year_built_avg"] = round(sum(years) / len(years))
+    if beds_list:
+        result["beds_avg"] = round(sum(beds_list) / len(beds_list), 1)
+    if baths_list:
+        result["baths_avg"] = round(sum(baths_list) / len(baths_list), 1)
+    if lot_sizes:
+        result["lot_size_avg_sqft"] = round(sum(lot_sizes) / len(lot_sizes))
+    result["sample_count"] = len(deeds)
+    return result
 
 
 def _fetch_cadence(session: Session, entity_id: int) -> Dict[str, Any]:
@@ -382,8 +455,12 @@ def _predict_next_need_date(
     person_uuid: str,
     last_txn_date: Optional[date],
     velocity: Optional[Decimal],
-) -> Optional[datetime]:
-    """Maturity-based projection first; cadence-based fallback."""
+) -> tuple[Optional[datetime], Optional[Dict[str, Any]]]:
+    """Maturity-based projection first; cadence-based fallback.
+
+    Returns (predicted_date, evidence_dict) where evidence_dict records the
+    basis used so callers can store it alongside next_need_evidence.
+    """
     # Priority 1: open opportunity with actual_funded_at + maturity_months
     maturity_row = session.execute(
         text("""
@@ -401,18 +478,35 @@ def _predict_next_need_date(
 
     if maturity_row:
         from dateutil.relativedelta import relativedelta
-        return maturity_row["actual_funded_at"] + relativedelta(
+        predicted = maturity_row["actual_funded_at"] + relativedelta(
             months=int(maturity_row["maturity_months"])
         )
+        evidence = {
+            "basis": "maturity",
+            "opportunity_funded_at": maturity_row["actual_funded_at"].isoformat()
+            if hasattr(maturity_row["actual_funded_at"], "isoformat")
+            else str(maturity_row["actual_funded_at"]),
+            "maturity_months": int(maturity_row["maturity_months"]),
+        }
+        return predicted, evidence
 
     # Priority 2: cadence projection
     if velocity and float(velocity) >= 0.5 and last_txn_date:
         days_per_deal = 365.0 / float(velocity)
         from datetime import timedelta
         last_dt = datetime.combine(last_txn_date, datetime.min.time()).replace(tzinfo=timezone.utc)
-        return last_dt + timedelta(days=days_per_deal)
+        predicted = last_dt + timedelta(days=days_per_deal)
+        evidence = {
+            "basis": "cadence",
+            "last_transaction_date": last_txn_date.isoformat()
+            if hasattr(last_txn_date, "isoformat")
+            else str(last_txn_date),
+            "velocity_purchases_per_year": str(velocity),
+            "days_projected": round(days_per_deal),
+        }
+        return predicted, evidence
 
-    return None
+    return None, None
 
 
 def _confidence_tier(deed_count: int) -> str:
@@ -432,6 +526,7 @@ def _upsert_profile(session: Session, profile: Dict[str, Any]) -> None:
             INSERT INTO fa_max_person_profiles (
                 person_id, buyer_entity_id,
                 buy_box_geography, buy_box_property_types, buy_box_price_band,
+                buy_box_preferences,
                 velocity_purchases_per_year, last_transaction_date,
                 avg_days_between_transactions, active_property_count,
                 predicted_next_need, predicted_next_need_date, next_need_evidence,
@@ -439,7 +534,7 @@ def _upsert_profile(session: Session, profile: Dict[str, Any]) -> None:
             ) VALUES (
                 :person_id, :buyer_entity_id,
                 CAST(:buy_box_geography AS jsonb), CAST(:buy_box_property_types AS jsonb),
-                CAST(:buy_box_price_band AS jsonb),
+                CAST(:buy_box_price_band AS jsonb), CAST(:buy_box_preferences AS jsonb),
                 :velocity_purchases_per_year, :last_transaction_date,
                 :avg_days_between_transactions, :active_property_count,
                 :predicted_next_need, :predicted_next_need_date,
@@ -451,6 +546,7 @@ def _upsert_profile(session: Session, profile: Dict[str, Any]) -> None:
                 buy_box_geography             = EXCLUDED.buy_box_geography,
                 buy_box_property_types        = EXCLUDED.buy_box_property_types,
                 buy_box_price_band            = EXCLUDED.buy_box_price_band,
+                buy_box_preferences           = EXCLUDED.buy_box_preferences,
                 velocity_purchases_per_year   = EXCLUDED.velocity_purchases_per_year,
                 last_transaction_date         = EXCLUDED.last_transaction_date,
                 avg_days_between_transactions = EXCLUDED.avg_days_between_transactions,
@@ -467,6 +563,7 @@ def _upsert_profile(session: Session, profile: Dict[str, Any]) -> None:
             "buy_box_geography": _jsonb(profile["buy_box_geography"]),
             "buy_box_property_types": _jsonb(profile["buy_box_property_types"]),
             "buy_box_price_band": _jsonb(profile["buy_box_price_band"]),
+            "buy_box_preferences": _jsonb(profile.get("buy_box_preferences")),
             "next_need_evidence": _jsonb(profile["next_need_evidence"]),
         },
     )
@@ -478,3 +575,28 @@ def _jsonb(value: Any) -> Optional[str]:
         return None
     import json
     return json.dumps(value, default=str)
+
+
+def schedule_profile_recompute(session: Session, person_id: str, reason: str) -> None:
+    """Enqueue a profile recomputation for person_id via fa_max_work_queue.
+
+    Idempotent: uses ON CONFLICT DO NOTHING on (queue_name, idempotency_key).
+    Multiple callers scheduling the same person before the sweep runs is safe.
+    """
+    idempotency_key = f"profile_recompute:{person_id}"
+    session.execute(
+        text("""
+            INSERT INTO fa_max_work_queue (
+                queue_name, idempotency_key, person_id, payload, status, created_at
+            ) VALUES (
+                'profile_recompute', :ikey, :person_id,
+                CAST(:payload AS jsonb), 'available', NOW()
+            )
+            ON CONFLICT (queue_name, idempotency_key) DO NOTHING
+        """),
+        {
+            "ikey": idempotency_key,
+            "person_id": person_id,
+            "payload": _jsonb({"reason": reason}),
+        },
+    )

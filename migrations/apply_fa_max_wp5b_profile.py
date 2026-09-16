@@ -86,6 +86,11 @@ _DDL = [
         updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     """,
+    # Add buy_box_preferences column (idempotent, safe if table already exists)
+    """
+    ALTER TABLE fa_max_person_profiles
+        ADD COLUMN IF NOT EXISTS buy_box_preferences JSONB;
+    """,
     """
     CREATE INDEX IF NOT EXISTS ix_fa_max_person_profile_buyer_entity
         ON fa_max_person_profiles (buyer_entity_id)
