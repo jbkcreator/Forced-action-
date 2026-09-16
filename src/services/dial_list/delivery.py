@@ -11,17 +11,28 @@ and talking points — no rate, term, commitment, or borrower-facing message.
 """
 from __future__ import annotations
 
+import json
 import logging
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 from config.settings import get_settings
+from src.services.opportunity_outcome import LOSS_REASON_CODES
 
 from .models import DialList, DialListEntry
 
 logger = logging.getLogger(__name__)
 
 _ZERO = Decimal("0")
+
+# Interactive card action IDs (Banks button model, re-labelled for a call list).
+ACTION_CALLED = "dial_called"
+ACTION_WON = "dial_won"
+ACTION_LOST = "dial_lost"
+ACTION_SKIP = "dial_skip"
+# Prefix for the per-entry actions block_id, so the handler can locate and
+# replace exactly the tapped card's action row inside the digest message.
+ACTIONS_BLOCK_PREFIX = "dial_act:"
 
 
 def _name_label(entry: DialListEntry) -> str:
@@ -66,6 +77,53 @@ def _entry_line(entry: DialListEntry) -> str:
     return line
 
 
+def _entry_value(entry: DialListEntry, as_of: object, **extra: object) -> str:
+    """JSON payload carried on each button/select — thread id + context."""
+    data: Dict[str, Any] = {
+        "thread": entry.opportunity_id,
+        "property_id": entry.property_id,
+        "as_of": str(as_of),
+    }
+    data.update(extra)
+    return json.dumps(data, separators=(",", ":"))
+
+
+def _actions_block(entry: DialListEntry, as_of: object) -> Dict[str, Any]:
+    base = _entry_value(entry, as_of)
+    return {
+        "type": "actions",
+        "block_id": f"{ACTIONS_BLOCK_PREFIX}{entry.property_id}",
+        "elements": [
+            {
+                "type": "button", "action_id": ACTION_CALLED,
+                "text": {"type": "plain_text", "text": ":phone: Called"},
+                "value": base,
+            },
+            {
+                "type": "button", "action_id": ACTION_WON, "style": "primary",
+                "text": {"type": "plain_text", "text": ":white_check_mark: Won"},
+                "value": base,
+            },
+            {
+                "type": "static_select", "action_id": ACTION_LOST,
+                "placeholder": {"type": "plain_text", "text": "Lost — reason…"},
+                "options": [
+                    {
+                        "text": {"type": "plain_text", "text": code},
+                        "value": _entry_value(entry, as_of, loss_code=code),
+                    }
+                    for code in LOSS_REASON_CODES
+                ],
+            },
+            {
+                "type": "button", "action_id": ACTION_SKIP,
+                "text": {"type": "plain_text", "text": ":fast_forward: Skip"},
+                "value": base,
+            },
+        ],
+    }
+
+
 def _header_text(dial_list: DialList) -> str:
     n = len(dial_list.entries)
     if n == 0:
@@ -85,11 +143,15 @@ def _header_text(dial_list: DialList) -> str:
     return header
 
 
-def format_dial_list_digest(dial_list: DialList) -> Tuple[str, List[Dict[str, Any]]]:
+def format_dial_list_digest(
+    dial_list: DialList, *, interactive: bool = False
+) -> Tuple[str, List[Dict[str, Any]]]:
     """Render a ``DialList`` into (header_text, Slack blocks). Pure, no I/O.
 
     ``header_text`` is the message fallback/notification text; ``blocks`` is the
-    rich digest. Deterministic — same list in, same payload out.
+    rich digest. Deterministic — same list in, same payload out. When
+    ``interactive`` is set, each entry is followed by a Called/Won/Lost/Skip
+    actions block (the read-only digest is the default).
     """
     header = _header_text(dial_list)
     blocks: List[Dict[str, Any]] = [
@@ -103,6 +165,8 @@ def format_dial_list_digest(dial_list: DialList) -> Tuple[str, List[Dict[str, An
         blocks.append(
             {"type": "section", "text": {"type": "mrkdwn", "text": _entry_line(entry)}}
         )
+        if interactive:
+            blocks.append(_actions_block(entry, dial_list.generated_for))
     return header, blocks
 
 
@@ -116,6 +180,7 @@ def deliver_dial_list(
     dial_list: DialList,
     *,
     channel: Optional[str] = None,
+    interactive: bool = False,
 ) -> Optional[str]:
     """Post the daily dial-list digest to the MONEY Slack channel.
 
@@ -123,7 +188,7 @@ def deliver_dial_list(
     (logs and returns None) when Slack isn't configured — mirrors
     ``relay.slack_post.post_for_approval`` so local/dev without Slack still
     runs the pipeline end to end. Never raises: a failed post must not fail
-    the daily job.
+    the daily job. When ``interactive`` is set, cards carry action buttons.
     """
     settings = get_settings()
     token = settings.slack_bot_token
@@ -136,7 +201,7 @@ def deliver_dial_list(
         )
         return None
 
-    header, blocks = format_dial_list_digest(dial_list)
+    header, blocks = format_dial_list_digest(dial_list, interactive=interactive)
     try:
         from slack_sdk import WebClient
 
@@ -162,6 +227,7 @@ def generate_and_deliver(
     county_id: Optional[str] = None,
     config: Optional[Any] = None,
     channel: Optional[str] = None,
+    interactive: bool = False,
 ) -> Tuple[DialList, Optional[str]]:
     """Chain retrieval → rank → deliver. Returns (dial_list, posted_ts).
 
@@ -174,5 +240,5 @@ def generate_and_deliver(
     dial_list = generate_dial_list(
         session, as_of=as_of, county_id=county_id, config=config
     )
-    ts = deliver_dial_list(dial_list, channel=channel)
+    ts = deliver_dial_list(dial_list, channel=channel, interactive=interactive)
     return dial_list, ts

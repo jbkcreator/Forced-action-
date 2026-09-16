@@ -212,6 +212,39 @@ _OUT_OF_STATE_SQL = text(
     """
 )
 
+# Config-gated, off by default (client item 13). No true loan-maturity field
+# exists; heuristic = a mortgage lien (document_type ML) whose filing_date +
+# an assumed hard-money term lands inside the "approaching" window. Enable via
+# config.enable_maturities_trigger once real origination/maturity data lands.
+_MATURITIES_SQL = text(
+    """
+    SELECT property_id AS property_id, MAX(filing_date) AS urgency_date
+    FROM legal_and_liens
+    WHERE filing_date IS NOT NULL
+      AND filing_date >= :mat_since AND filing_date <= :mat_until
+      AND (UPPER(COALESCE(document_type, '')) = 'ML'
+           OR UPPER(COALESCE(document_type, '')) LIKE '%MORTGAGE%')
+      AND (:county IS NULL OR county_id = :county)
+    GROUP BY property_id
+    """
+)
+
+# Config-gated, off by default. No 1031 field exists; weak text signal only
+# (grantee mentions 1031 / exchange — a handful of rows fleet-wide). Enable via
+# config.enable_1031_trigger if a real exchange signal is ingested.
+_EXCHANGE_1031_SQL = text(
+    """
+    SELECT property_id AS property_id, MAX(record_date) AS urgency_date
+    FROM deeds
+    WHERE record_date IS NOT NULL
+      AND record_date <= :as_of AND record_date >= :since
+      AND (LOWER(COALESCE(grantee, '')) LIKE '%1031%'
+           OR LOWER(COALESCE(grantee, '')) LIKE '%exchange%')
+      AND (:county IS NULL OR county_id = :county)
+    GROUP BY property_id
+    """
+)
+
 _ENRICH_SQL = text(
     """
     SELECT
@@ -290,12 +323,14 @@ def assemble_dial_candidates(
     *,
     as_of: date,
     county_id: Optional[str] = None,
+    config: Optional[DialListConfig] = None,
 ) -> List[DialCandidate]:
     """Run the live detectors, union + resolve, return ranking-ready candidates.
 
     Raises `SQLAlchemyError` (after logging) on any DB failure — a daily batch
     should fail loud, not silently emit an empty list that reads as "no calls".
     """
+    cfg = config or DEFAULT_CONFIG
     try:
         acc: Dict[int, _Acc] = {}
 
@@ -399,6 +434,40 @@ def assemble_dial_candidates(
         ).mappings():
             _bucket(row["property_id"]).triggers.add("out_of_state")
 
+        # 8) maturities approaching (config-gated, off by default — heuristic on
+        #    mortgage-lien filing_date + assumed hard-money term; no true field).
+        if cfg.enable_maturities_trigger:
+            term_days = cfg.maturity_assumed_term_months * 30
+            mat_since = as_of - timedelta(days=term_days)
+            mat_until = as_of + timedelta(days=cfg.maturity_window_days - term_days)
+            for row in session.execute(
+                _MATURITIES_SQL,
+                {"mat_since": mat_since, "mat_until": mat_until, "county": county_id},
+            ).mappings():
+                a = _bucket(row["property_id"])
+                a.triggers.add("maturities")
+                a.add_date(row["urgency_date"])
+
+        # 9) 1031 exchange (config-gated, off by default — weak grantee text
+        #    signal only; no dedicated field).
+        if cfg.enable_1031_trigger:
+            for row in session.execute(
+                _EXCHANGE_1031_SQL,
+                {"as_of": as_of, "since": cash_since, "county": county_id},
+            ).mappings():
+                a = _bucket(row["property_id"])
+                a.triggers.add("exchange_1031")
+                a.add_date(row["urgency_date"])
+
+        # 10) price drops / expired investor listings (config-gated, off) — NO
+        #     data source: there is no MLS/listing table. Declared so they light
+        #     up when a listing feed lands; no detector query can run until then.
+        if cfg.enable_price_drop_trigger or cfg.enable_expired_listing_trigger:
+            logger.warning(
+                "dial_list: price_drop/expired_listing enabled but no listing "
+                "data source exists — no candidates produced for them."
+            )
+
         if not acc:
             return []
 
@@ -466,5 +535,7 @@ def generate_dial_list(
 ) -> DialList:
     """Assemble candidates from the DB and rank them with the pure core."""
     cfg = config or DEFAULT_CONFIG
-    candidates = assemble_dial_candidates(session, as_of=as_of, county_id=county_id)
+    candidates = assemble_dial_candidates(
+        session, as_of=as_of, county_id=county_id, config=cfg
+    )
     return rank_dial_list(candidates, as_of, cfg)

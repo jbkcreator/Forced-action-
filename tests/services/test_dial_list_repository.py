@@ -23,12 +23,14 @@ from src.core.models import (
     Financial,
     FinancingIntentScore,
     Foreclosure,
+    LegalAndLien,
     LegalProceeding,
     Owner,
     Property,
     TaxDeedAuction,
 )
 from src.services.dial_list import (
+    DialListConfig,
     assemble_dial_candidates,
     generate_dial_list,
 )
@@ -57,6 +59,7 @@ def db():
         Financial.__table__,
         Deed.__table__,
         LegalProceeding.__table__,
+        LegalAndLien.__table__,
         Foreclosure.__table__,
         BuildingPermit.__table__,
         FinancingIntentScore.__table__,
@@ -225,6 +228,49 @@ def test_union_dedup_by_borrower(db):
     entry = dl.entries[0]
     assert entry.buyer_entity_id == 500
     assert set(entry.triggers) >= {"out_of_state", "cash_purchase"}
+
+
+def test_maturities_trigger_gated_off_by_default(db):
+    pid = _prop(db)
+    db.add(LegalAndLien(property_id=pid, record_type="Lien", document_type="ML",
+                        filing_date=AS_OF - timedelta(days=330),
+                        county_id="hillsborough"))
+    db.flush()
+    assert assemble_dial_candidates(db, as_of=AS_OF) == []  # off by default
+
+
+def test_maturities_trigger_when_enabled(db):
+    pid = _prop(db)
+    db.add(LegalAndLien(property_id=pid, record_type="Lien", document_type="ML",
+                        filing_date=AS_OF - timedelta(days=330),  # ~11mo, 12mo term
+                        county_id="hillsborough"))
+    db.flush()
+    cfg = DialListConfig(enable_maturities_trigger=True)
+    cands = assemble_dial_candidates(db, as_of=AS_OF, config=cfg)
+    assert len(cands) == 1
+    assert "maturities" in cands[0].triggers
+
+
+def test_1031_trigger_when_enabled(db):
+    pid = _prop(db)
+    db.add(Deed(property_id=pid, instrument_number="IX", grantee="ACME 1031 EXCHANGE LLC",
+                sale_price=Decimal("400000"), mortgage_amount=Decimal("1"),
+                record_date=AS_OF - timedelta(days=30), county_id="hillsborough"))
+    db.flush()
+    off = assemble_dial_candidates(db, as_of=AS_OF)
+    assert off == []  # off by default (mortgage present → no cash trigger either)
+    cfg = DialListConfig(enable_1031_trigger=True)
+    cands = assemble_dial_candidates(db, as_of=AS_OF, config=cfg)
+    assert len(cands) == 1
+    assert "exchange_1031" in cands[0].triggers
+
+
+def test_listing_triggers_have_no_source(db):
+    # enabling them is a no-op (no MLS/listing table) — must not crash
+    _prop(db)  # a bare property, no other trigger
+    cfg = DialListConfig(enable_price_drop_trigger=True,
+                         enable_expired_listing_trigger=True)
+    assert assemble_dial_candidates(db, as_of=AS_OF, config=cfg) == []
 
 
 def test_commercial_use_code_filtered_out(db):

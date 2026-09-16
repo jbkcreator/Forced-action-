@@ -659,6 +659,17 @@ class AppSettings(BaseSettings):
 	# (cold-outreach draft approvals) nor relay's (per-item sends) — the dial
 	# list is a read-only ranked calling aid, a distinct review surface.
 	dial_list_slack_channel: str = Field(default="", env="DIAL_LIST_SLACK_CHANNEL")
+	# App-level token (xapp-…, scope connections:write) for the dial-list action
+	# listener's Socket Mode connection — only the interactive button/thread
+	# handler needs it; the read-only digest does not. Unset → listener no-ops.
+	dial_list_slack_app_token: Optional[SecretStr] = Field(
+		default=None, env="DIAL_LIST_SLACK_APP_TOKEN"
+	)
+	# The single operator (Josh) allowed to act on dial-list cards; a tap from
+	# anyone else is ignored. Unset → no gate (dev/local only).
+	dial_list_approver_user_id: str = Field(
+		default="", env="DIAL_LIST_APPROVER_USER_ID"
+	)
 
 	# Relay email channel (RELAY-v2.2 sub-task R2). relay_instantly_campaign_id
 	# is set once after running `python -m src.services.relay --setup-email-channel`

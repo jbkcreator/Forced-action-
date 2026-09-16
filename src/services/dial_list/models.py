@@ -20,6 +20,13 @@ TriggerType = Literal[
     "out_of_state",
     "financing_intent",
     "builder",
+    # config-gated, off by default — see DialListConfig + repository detectors.
+    # maturities/1031 have partial heuristic sources; price_drop/expired_listing
+    # have no data source at all (no MLS/listing table exists yet).
+    "maturities",
+    "exchange_1031",
+    "price_drop",
+    "expired_listing",
 ]
 
 IntentTier = Literal["high", "medium", "low"]

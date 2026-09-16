@@ -43,14 +43,35 @@ class DialListConfig(BaseModel):
     urgency_weights: Dict[str, Decimal] = Field(
         default_factory=lambda: {
             "auction_probate": Decimal("1.5"),
+            "maturities": Decimal("1.4"),
+            "builder": Decimal("1.3"),
             "cash_purchase": Decimal("1.2"),
+            "exchange_1031": Decimal("1.2"),
+            "price_drop": Decimal("1.1"),
             "stalled_flip": Decimal("1.1"),
             "permits_no_financing": Decimal("1.0"),
             "financing_intent": Decimal("1.0"),
-            "builder": Decimal("1.3"),
+            "expired_listing": Decimal("0.9"),
             "out_of_state": Decimal("0.8"),
         }
     )
+
+    # --- config-gated triggers (client item 13, off by default) --------------
+    # maturities approaching: no true loan-maturity/term field exists. Heuristic
+    # source = legal_and_liens mortgage records (document_type ML) filed ~term
+    # months ago, assuming a typical hard-money term. Enable once real loan
+    # origination/maturity data lands.
+    enable_maturities_trigger: bool = False
+    maturity_assumed_term_months: int = Field(default=12, ge=1)
+    maturity_window_days: int = Field(default=60, ge=1)  # "approaching" band
+    # 1031 exchange: no dedicated field; only a weak deeds.grantee text signal
+    # (~3 rows fleet-wide today). Off until a real exchange signal exists.
+    enable_1031_trigger: bool = False
+    # price drops / expired investor listings: NO MLS/listing table exists at
+    # all. Declared here so they light up when a listing feed lands; there is no
+    # detector query to run until then.
+    enable_price_drop_trigger: bool = False
+    enable_expired_listing_trigger: bool = False
     # a candidate with no recognised trigger urgency falls back to this
     urgency_default: Decimal = Field(default=Decimal("1.0"), gt=0)
     # date-proximity boost: an urgency_date within this window scales urgency up

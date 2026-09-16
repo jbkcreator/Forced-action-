@@ -108,8 +108,12 @@ def _merge_triggers(existing: List[str], incoming: List[str]) -> List[str]:
 
 _REASON_BY_TRIGGER: Tuple[Tuple[str, str], ...] = (
     ("builder", "Builder / new-construction signal — larger loan likely."),
+    ("maturities", "Loan maturity approaching — may need a refinance or takeout."),
     ("cash_purchase", "Cash purchase, no financing — may want leverage next deal."),
     ("auction_probate", "Bought at auction/probate — fresh project likely forming."),
+    ("exchange_1031", "1031 exchange activity — likely acquiring, may need financing."),
+    ("price_drop", "Investor listing price drop — deal may be stalling, offer leverage."),
+    ("expired_listing", "Investor listing expired — unsold, may need a bridge."),
     ("stalled_flip", "Stalled flip (open permit, no completion) — may need a bridge/takeout."),
     ("permits_no_financing", "Permits pulled, no recorded financing — funding work out of pocket."),
     ("out_of_state", "Out-of-state owner — likely needs a local lending relationship."),

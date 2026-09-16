@@ -1,3 +1,10 @@
+from .actions import (
+    ActionResult,
+    ThreadIntent,
+    handle_action,
+    handle_thread_reply,
+    parse_thread_reply,
+)
 from .config import DEFAULT_CONFIG, DialListConfig
 from .delivery import (
     deliver_dial_list,
@@ -18,6 +25,11 @@ __all__ = [
     "generate_and_deliver",
     "record_dial_disposition",
     "DispositionResult",
+    "handle_action",
+    "handle_thread_reply",
+    "parse_thread_reply",
+    "ActionResult",
+    "ThreadIntent",
     "DialCandidate",
     "DialList",
     "DialListEntry",
