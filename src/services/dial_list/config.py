@@ -30,6 +30,11 @@ class DialListConfig(BaseModel):
 
     # expected loan fallback when no ARV/max_ltc available
     expected_loan_fallback_fraction: Decimal = Field(default=Decimal("0.70"), gt=0)
+    # sanity cap on the estimated loan — hard-money residential deals don't run
+    # to eight figures; without it a commercial-scale assessed value (or bad
+    # data) dominates the dollar-ranking. Estimates above this are clipped and
+    # flagged low-confidence.
+    max_expected_loan: Decimal = Field(default=Decimal("5000000"), gt=0)
 
     # commission (permitted post client-Q18 — business-purpose hard money)
     commission_rate: Decimal = Field(default=Decimal("0.015"), gt=0)

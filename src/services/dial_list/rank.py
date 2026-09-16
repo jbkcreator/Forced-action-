@@ -39,6 +39,15 @@ def _probability(c: DialCandidate, config: DialListConfig) -> Decimal:
 
 
 def _expected_loan(c: DialCandidate, config: DialListConfig) -> Tuple[Decimal, LoanConfidence]:
+    loan, conf = _raw_expected_loan(c, config)
+    if loan > config.max_expected_loan:
+        # clip an implausible (commercial-scale / bad-data) estimate; the
+        # bounded figure is never trustworthy, so force low confidence.
+        return config.max_expected_loan, "low"
+    return loan, conf
+
+
+def _raw_expected_loan(c: DialCandidate, config: DialListConfig) -> Tuple[Decimal, LoanConfidence]:
     if c.arv is not None and c.arv > _ZERO and c.max_ltc is not None and c.max_ltc > _ZERO:
         return c.max_ltc * c.arv, "high"
     if c.assessed_value_mkt is not None and c.assessed_value_mkt > _ZERO:

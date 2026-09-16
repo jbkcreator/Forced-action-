@@ -77,10 +77,11 @@ def db():
 _pid_seq = [0]
 
 
-def _prop(session, county="hillsborough", **kw):
+def _prop(session, county="hillsborough", property_use_code="0100", **kw):
     _pid_seq[0] += 1
     pid = _pid_seq[0]
-    p = Property(id=pid, parcel_id=f"parcel-{pid}", county_id=county, **kw)
+    p = Property(id=pid, parcel_id=f"parcel-{pid}", county_id=county,
+                 property_use_code=property_use_code, **kw)
     session.add(p)
     session.flush()
     return pid
@@ -224,6 +225,27 @@ def test_union_dedup_by_borrower(db):
     entry = dl.entries[0]
     assert entry.buyer_entity_id == 500
     assert set(entry.triggers) >= {"out_of_state", "cash_purchase"}
+
+
+def test_commercial_use_code_filtered_out(db):
+    # a commercial parcel (store, code 11xx) with a live trigger must NOT surface
+    pid = _prop(db, property_use_code="1100")
+    db.add(Deed(property_id=pid, instrument_number="IC", sale_price=Decimal("9000000"),
+                mortgage_amount=None, record_date=AS_OF - timedelta(days=20),
+                county_id="hillsborough"))
+    db.flush()
+    assert assemble_dial_candidates(db, as_of=AS_OF) == []
+
+
+def test_residential_use_code_kept(db):
+    # condo (code 04xx) with a cash purchase stays in scope
+    pid = _prop(db, property_use_code="0400")
+    db.add(Deed(property_id=pid, instrument_number="IR", sale_price=Decimal("300000"),
+                mortgage_amount=None, record_date=AS_OF - timedelta(days=20),
+                county_id="hillsborough"))
+    db.flush()
+    cands = assemble_dial_candidates(db, as_of=AS_OF)
+    assert len(cands) == 1 and "cash_purchase" in cands[0].triggers
 
 
 def test_unresolved_candidate_still_appears(db):

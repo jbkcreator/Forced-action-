@@ -197,6 +197,15 @@ def test_fallback_loan_basis_flags_low_confidence():
     assert "Est. loan size low-confidence (fallback basis)" in entry.talking_points
 
 
+# 16 — implausible loan basis is clipped to the cap and flagged low-confidence
+def test_expected_loan_capped():
+    huge = _cand(property_id=1, buyer_entity_id=1, intent_tier="high",
+                 assessed_value_mkt=Decimal("944000000"))  # 0.70× → 660M
+    entry = rank_dial_list([huge], AS_OF).entries[0]
+    assert entry.expected_loan == Decimal("5000000")  # default max_expected_loan
+    assert entry.expected_loan_confidence == "low"
+
+
 def test_invalid_config_rejected():
     with pytest.raises(Exception):
         DialListConfig(list_size=0)

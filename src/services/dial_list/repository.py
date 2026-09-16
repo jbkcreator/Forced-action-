@@ -53,6 +53,23 @@ _NEW_CONSTRUCTION_PATTERNS = (
     "%new sfr%",
 )
 
+# DOR major use-code prefixes that are in-scope for hard-money residential
+# lending (flips + new construction): vacant residential, single family,
+# mobile home, condo, misc residential, multi-family under 10 units. Excludes
+# 03 (10+ unit apartments) and the commercial/industrial/ag/institutional/govt
+# ranges — those are not Backflip's borrower and their assessed values would
+# otherwise dominate the dollar-ranking. See src/loaders/dor_use_codes.py.
+_RESIDENTIAL_USE_PREFIXES = frozenset({"00", "01", "02", "04", "07", "08"})
+
+
+def _is_residential(use_code: Optional[object]) -> bool:
+    if use_code is None:
+        return False
+    code = str(use_code).strip()
+    if not code.isdigit():
+        return False
+    return code.zfill(4)[:2] in _RESIDENTIAL_USE_PREFIXES
+
 
 # ---------------------------------------------------------------------------
 # Detectors — each returns {property_id: Optional[urgency_date]}
@@ -188,6 +205,7 @@ _ENRICH_SQL = text(
     """
     SELECT
         p.id                     AS property_id,
+        p.property_use_code      AS property_use_code,
         f.assessed_value_mkt     AS assessed_value_mkt,
         f.last_sale_price        AS last_sale_price,
         f.last_sale_date         AS last_sale_date,
@@ -385,6 +403,11 @@ def assemble_dial_candidates(
     candidates: List[DialCandidate] = []
     for pid, a in acc.items():
         e = enrich.get(pid, {})
+        # Scope to residential-investor property types. Commercial / industrial
+        # / apartment / ag parcels are not hard-money borrowers and their
+        # assessed values would otherwise top the dollar-ranked list.
+        if not _is_residential(e.get("property_use_code")):
+            continue
         last_sale_date = _as_date(e.get("last_sale_date"))
         last_deal_months = None
         if last_sale_date is not None:
