@@ -1477,3 +1477,65 @@ def test_schedule_recompute_claimed_to_done_race(pg_engine):
         "A material event that arrives while a profile job is claimed must "
         "always leave an available recompute item after both workers commit"
     )
+
+
+# ===========================================================================
+# Savepoint isolation regression — schedule_profile_recompute failure must
+# never abort the surrounding state transition transaction
+# ===========================================================================
+
+def test_recompute_failure_does_not_abort_surrounding_transaction():
+    """Regression: _maybe_enqueue_profile_recompute wrapped in begin_nested().
+
+    If schedule_profile_recompute raises (e.g. deadlock, transient error),
+    the savepoint must roll back only the recompute insert, leaving the
+    session fully usable so the caller's commit (for the state transition
+    itself) still succeeds.
+
+    This is the CLAUDE.md pattern: deferred DB-touching blocks use
+    begin_nested() savepoints, not bare try/except.
+    """
+    from src.services.state_engine import _maybe_enqueue_profile_recompute
+
+    # Build a mock session that tracks savepoint calls.
+    mock_sp = MagicMock()
+    mock_session = MagicMock()
+    mock_session.begin_nested.return_value = mock_sp
+
+    with patch(
+        "src.services.borrower_profile_service.schedule_profile_recompute",
+        side_effect=Exception("simulated deadlock"),
+    ):
+        # Must not raise — failure is absorbed by savepoint.
+        _maybe_enqueue_profile_recompute(
+            session=mock_session,
+            entity_type="opportunity",
+            to_state="funded",
+            person_id="00000000-0000-0000-0000-000000000001",
+        )
+
+    # Savepoint was opened and rolled back — session never poisoned.
+    mock_session.begin_nested.assert_called_once()
+    mock_sp.rollback.assert_called_once()
+    mock_sp.commit.assert_not_called()
+
+
+def test_recompute_success_commits_savepoint():
+    """Savepoint is committed (not rolled back) on a clean recompute enqueue."""
+    from src.services.state_engine import _maybe_enqueue_profile_recompute
+
+    mock_sp = MagicMock()
+    mock_session = MagicMock()
+    mock_session.begin_nested.return_value = mock_sp
+
+    with patch("src.services.borrower_profile_service.schedule_profile_recompute"):
+        _maybe_enqueue_profile_recompute(
+            session=mock_session,
+            entity_type="opportunity",
+            to_state="funded",
+            person_id="00000000-0000-0000-0000-000000000001",
+        )
+
+    mock_session.begin_nested.assert_called_once()
+    mock_sp.commit.assert_called_once()
+    mock_sp.rollback.assert_not_called()

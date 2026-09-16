@@ -791,6 +791,8 @@ def _do_transition(
 
     # WP-5B: queue a profile recompute whenever an opportunity reaches a
     # material state (funded or matured) so the buy-box prediction stays fresh.
+    # Isolated in its own savepoint so a failure here never poisons the
+    # surrounding transaction that already committed the state transition above.
     _maybe_enqueue_profile_recompute(
         session=session,
         entity_type=entity_type,
@@ -825,10 +827,13 @@ def _maybe_enqueue_profile_recompute(
         return
     if not person_id:
         return
+    sp = session.begin_nested()
     try:
         from src.services.borrower_profile_service import schedule_profile_recompute
         schedule_profile_recompute(session, person_id, reason=f"opportunity_transition:{to_state}")
+        sp.commit()
     except Exception:
+        sp.rollback()
         logger.warning(
             "Failed to enqueue profile recompute for person %s after opportunity->%s",
             person_id, to_state, exc_info=True,
@@ -902,10 +907,14 @@ def write_interaction(
     ).fetchone()
 
     # WP-5B: new interaction may shift next-need prediction; enqueue recompute.
+    # Savepoint isolates this so a failure never aborts the interaction insert above.
+    sp = session.begin_nested()
     try:
         from src.services.borrower_profile_service import schedule_profile_recompute
         schedule_profile_recompute(session, person_id, reason="new_interaction")
+        sp.commit()
     except Exception:
+        sp.rollback()
         logger.warning(
             "Failed to enqueue profile recompute for person %s after write_interaction",
             person_id, exc_info=True,
