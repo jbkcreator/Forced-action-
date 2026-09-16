@@ -74,8 +74,9 @@ class _FakeQueueBackend:
         self.failed[item_id] = error
         self.failed_batch_ids[item_id] = batch_id
 
-    def mark_skipped(self, item_id: int, reason: str) -> None:
+    def mark_skipped(self, item_id: int, reason: str) -> bool:
         self.skipped[item_id] = reason
+        return True
 
 
 @pytest.fixture

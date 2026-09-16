@@ -237,6 +237,10 @@ def main(argv: list[str] | None = None) -> int:
         help="Seed one 'pending' row and post it to Slack for approval (Cora's Phase 2 stand-in) and exit",
     )
     parser.add_argument(
+        "--post-pending-fa-max", action="store_true",
+        help="Retry pending FA Max Slack cards that have not been posted",
+    )
+    parser.add_argument(
         "--setup-email-channel", action="store_true",
         help="Find or create the Relay passthrough Instantly campaign and print its id (one-time setup) and exit",
     )
@@ -260,6 +264,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.sweep:
         return cmd_sweep(args.venture)
+
+    if args.post_pending_fa_max:
+        from src.services.relay.slack_post import post_unposted_fa_max_cards
+        _line(f"FA Max pending cards checked: {post_unposted_fa_max_cards()}")
+        return 0
 
     if args.seed:
         if not args.recipient:

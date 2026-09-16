@@ -9107,8 +9107,10 @@ class RelayApprovalQueueItem(Base):
     recipient: Mapped[str] = mapped_column(Text, nullable=False)  # phone via phone_utils.normalize
     payload: Mapped[dict] = mapped_column(JSONB, nullable=False)  # subject/body/etc — exactly what's proposed/approved
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
-    # pending | approved | rejected | sent | failed | skipped
+    # pending | approved | rejected | sent | failed | skipped | uncertain
     slack_message_ts: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    slack_post_attempted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    slack_post_lease_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     decided_by: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
     decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -9150,7 +9152,7 @@ class RelayApprovalQueueItem(Base):
         # is never inflated by approved-but-unsent drafts.
         Index("ix_relay_approval_queue_thread_venture", "thread_id", "venture_key"),
         CheckConstraint(
-            "status IN ('pending', 'approved', 'rejected', 'sent', 'failed', 'skipped')",
+            "status IN ('pending', 'approved', 'rejected', 'sent', 'failed', 'skipped', 'uncertain')",
             name="ck_relay_approval_queue_status",
         ),
         CheckConstraint(
@@ -9166,6 +9168,13 @@ class RelayApprovalQueueItem(Base):
             "(lane IS NOT NULL AND agent_name IS NOT NULL AND "
             "autonomy_tier_at_send IS NOT NULL AND person_id IS NOT NULL)",
             name="ck_relay_fa_max_governance_fields",
+        ),
+        CheckConstraint(
+            "venture_key <> 'fa_max_lending' OR "
+            "payload::text !~* '(ssn|social.security|credit.score|fico|income|"
+            "bank.statement|tax.return|debt.to.income|interest.rate|loan.rate|"
+            "loan.term|commitment)'",
+            name="ck_relay_fa_max_no_financial_payload",
         ),
         Index("ix_relay_approval_queue_person_id", "person_id"),
     )
@@ -10649,6 +10658,80 @@ class FaMaxStateTransitionEvent(Base):
             f"<FaMaxStateTransitionEvent(entity={self.entity_uuid!r}, "
             f"{self.from_state!r}->{self.to_state!r}, actor={self.actor!r})>"
         )
+
+
+# ============================================================================
+# FA Max WP-2 — Consent per contact per channel
+# ============================================================================
+
+class FaMaxPersonConsent(Base):
+    """Opt-in consent record for one FA Max person on one channel.
+
+    One row per (person_id, channel). Upserted when consent changes —
+    source and consented_at always reflect the most recent event.
+    No financial data; no rate/term/commitment fields.
+    """
+    __tablename__ = "fa_max_person_consent"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    person_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_persons.person_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    channel: Mapped[str] = mapped_column(String(20), nullable=False)
+    # email | sms | voice
+    consented: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    source: Mapped[str] = mapped_column(String(120), nullable=False)
+    # e.g. "opt_in_form", "import", "backflip_campaign_csv"
+    consented_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "channel IN ('email', 'sms', 'voice')",
+            name="ck_fa_max_person_consent_channel",
+        ),
+        UniqueConstraint("person_id", "channel", name="uq_fa_max_person_consent_person_channel"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<FaMaxPersonConsent(person={self.person_id!r}, "
+            f"channel={self.channel!r}, consented={self.consented!r})>"
+        )
+
+
+class FaMaxBackflipCampaignContact(Base):
+    """Current Backflip campaign membership; separate from permanent opt-outs."""
+    __tablename__ = "fa_max_backflip_campaign_contacts"
+
+    identifier_kind: Mapped[str] = mapped_column(String(10), primary_key=True)
+    identifier_value: Mapped[str] = mapped_column(Text, primary_key=True)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    imported_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint("identifier_kind IN ('email', 'phone')", name="ck_fa_max_backflip_identifier_kind"),
+        Index("ix_fa_max_backflip_active_contact", "identifier_kind", "identifier_value", postgresql_where=text("active")),
+    )
+
+
+class FaMaxBackflipCampaignFeed(Base):
+    """Last complete campaign snapshot, used to fail closed on stale data."""
+    __tablename__ = "fa_max_backflip_campaign_feed"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    last_success_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (CheckConstraint("id = 1", name="ck_fa_max_backflip_feed_singleton"),)
+
+
 # ============================================================================
 # FA Max WP-1 remaining — Partners, Interactions, Property Associations,
 # and the Durable Work Queue
@@ -10983,44 +11066,4 @@ class FaMaxWorkQueue(Base):
         return (
             f"<FaMaxWorkQueue(work_item_id={self.work_item_id!r}, "
             f"queue={self.queue_name!r}, status={self.status!r})>"
-        )
-
-
-# ============================================================================
-# FA Max WP-2 — Consent per contact per channel
-# ============================================================================
-
-class FaMaxPersonConsent(Base):
-    """Opt-in consent record for one FA Max person on one channel."""
-    __tablename__ = "fa_max_person_consent"
-
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    person_id: Mapped[Any] = mapped_column(
-        PG_UUID(as_uuid=True),
-        ForeignKey("fa_max_persons.person_id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    channel: Mapped[str] = mapped_column(String(20), nullable=False)
-    consented: Mapped[bool] = mapped_column(Boolean, nullable=False)
-    source: Mapped[str] = mapped_column(String(120), nullable=False)
-    consented_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now(),
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now(),
-    )
-
-    __table_args__ = (
-        CheckConstraint(
-            "channel IN ('email', 'sms', 'voice')",
-            name="ck_fa_max_person_consent_channel",
-        ),
-        UniqueConstraint("person_id", "channel", name="uq_fa_max_person_consent_person_channel"),
-    )
-
-    def __repr__(self) -> str:
-        return (
-            f"<FaMaxPersonConsent(person={self.person_id!r}, "
-            f"channel={self.channel!r}, consented={self.consented!r})>"
         )

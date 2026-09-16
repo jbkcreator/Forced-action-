@@ -51,6 +51,33 @@ STATEMENTS: list[tuple[str, str]] = [
             ON relay_approval_queue (person_id);
         """,
     ),
+    (
+        "ADD durable Slack post lease to relay_approval_queue",
+        """
+        ALTER TABLE relay_approval_queue ADD COLUMN IF NOT EXISTS slack_post_attempted_at TIMESTAMPTZ;
+        ALTER TABLE relay_approval_queue ADD COLUMN IF NOT EXISTS slack_post_lease_until TIMESTAMPTZ;
+        CREATE INDEX IF NOT EXISTS ix_relay_fa_max_unposted
+            ON relay_approval_queue (created_at)
+            WHERE venture_key = 'fa_max_lending' AND status = 'pending' AND slack_message_ts IS NULL;
+        """,
+    ),
+    (
+        "ALLOW uncertain provider outcome on relay_approval_queue",
+        """
+        DO $$ BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'ck_relay_approval_queue_status'
+                  AND conrelid = 'relay_approval_queue'::regclass
+                  AND pg_get_constraintdef(oid) LIKE '%uncertain%'
+            ) THEN
+                ALTER TABLE relay_approval_queue DROP CONSTRAINT IF EXISTS ck_relay_approval_queue_status;
+                ALTER TABLE relay_approval_queue ADD CONSTRAINT ck_relay_approval_queue_status
+                    CHECK (status IN ('pending', 'approved', 'rejected', 'sent', 'failed', 'skipped', 'uncertain'));
+            END IF;
+        END $$;
+        """,
+    ),
     # ── fa_max_person_consent ─────────────────────────────────────────────────
     (
         "CREATE fa_max_person_consent",
@@ -77,6 +104,28 @@ STATEMENTS: list[tuple[str, str]] = [
         """,
     ),
     (
+        "CREATE active Backflip campaign suppression store",
+        """
+        CREATE TABLE IF NOT EXISTS fa_max_backflip_campaign_contacts (
+            identifier_kind VARCHAR(10) NOT NULL,
+            identifier_value TEXT NOT NULL,
+            active BOOLEAN NOT NULL DEFAULT true,
+            imported_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (identifier_kind, identifier_value),
+            CONSTRAINT ck_fa_max_backflip_identifier_kind
+                CHECK (identifier_kind IN ('email', 'phone'))
+        );
+        CREATE INDEX IF NOT EXISTS ix_fa_max_backflip_active_contact
+            ON fa_max_backflip_campaign_contacts (identifier_kind, identifier_value)
+            WHERE active;
+        CREATE TABLE IF NOT EXISTS fa_max_backflip_campaign_feed (
+            id INTEGER PRIMARY KEY,
+            last_success_at TIMESTAMPTZ NOT NULL,
+            CONSTRAINT ck_fa_max_backflip_feed_singleton CHECK (id = 1)
+        );
+        """,
+    ),
+    (
         "ADD FA Max queue governance constraints",
         """
         DO $$ BEGIN
@@ -96,6 +145,12 @@ STATEMENTS: list[tuple[str, str]] = [
                 CHECK (venture_key <> 'fa_max_lending' OR
                        (lane IS NOT NULL AND agent_name IS NOT NULL AND
                         autonomy_tier_at_send IS NOT NULL AND person_id IS NOT NULL))
+                NOT VALID;
+        EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+        DO $$ BEGIN
+            ALTER TABLE relay_approval_queue ADD CONSTRAINT ck_relay_fa_max_no_financial_payload
+                CHECK (venture_key <> 'fa_max_lending' OR
+                       payload::text !~* '(ssn|social.security|credit.score|fico|income|bank.statement|tax.return|debt.to.income|interest.rate|loan.rate|loan.term|commitment)')
                 NOT VALID;
         EXCEPTION WHEN duplicate_object THEN NULL; END $$;
         """,

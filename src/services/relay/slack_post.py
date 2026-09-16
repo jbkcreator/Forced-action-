@@ -10,6 +10,7 @@ Mirrors the existing county-launch approval pattern
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 from typing import TYPE_CHECKING
 
@@ -29,11 +30,17 @@ def _summary_text(item: QueueItem) -> str:
     subject = item.payload.get("subject") if isinstance(item.payload, dict) else None
     preview = subject or str(item.payload)[:120]
     return (
-        f"*Relay approval needed* (#{item.id})\n"
+        f"*Relay approval needed* (#{item.id})  Ref: `{_card_ref(item)}`\n"
         f"Channel: `{item.channel}`  ·  To: `{item.recipient}`\n"
         f"{preview}\n"
         "Reply in this thread with `approve` or `reject`, or use the buttons below."
     )
+
+
+def _card_ref(item: QueueItem) -> str:
+    """Opaque queue-row identity for cross-environment Slack reconciliation."""
+    material = f"{item.idempotency_key}:{item.created_at.isoformat()}".encode()
+    return hashlib.sha256(material).hexdigest()[:20]
 
 
 _FA_MAX_VENTURE = "fa_max_lending"
@@ -72,6 +79,8 @@ def post_for_approval(item: QueueItem) -> None:
     usable in local/dev environments without a live Slack app.
     """
     settings = get_settings()
+    if item.status != "pending" or item.slack_message_ts:
+        return
     token = settings.slack_bot_token
     channel = _resolve_channel(item, settings)
     if not token or not channel:
@@ -85,9 +94,36 @@ def post_for_approval(item: QueueItem) -> None:
     approve_value = json.dumps({"item_id": item.id, "action": "approve"})
     reject_value = json.dumps({"item_id": item.id, "action": "reject"})
 
+    lease_until = None
+    if item.venture_key == _FA_MAX_VENTURE:
+        lease_until = queue.claim_slack_post(item.id)
+        if lease_until is None:
+            return
+
     try:
         from slack_sdk import WebClient
         client = WebClient(token=token.get_secret_value())
+        if lease_until is not None:
+            # Reconcile the uncertain window where Slack accepted the card but
+            # the process died before the database saved its timestamp.
+            cursor = None
+            while True:
+                page = client.conversations_history(
+                    channel=channel, oldest=str(item.created_at.timestamp() - 1),
+                    limit=200, **({"cursor": cursor} if cursor else {}),
+                )
+                for message in page.get("messages", []):
+                    if ("Relay approval needed" in message.get("text", "")
+                            and f"(#{item.id})" in message.get("text", "")
+                            and f"Ref: `{_card_ref(item)}`" in message.get("text", "")):
+                        queue.set_slack_message_ts(
+                            item.id, message["ts"], lease_until=lease_until,
+                        )
+                        logger.info("[Relay] reconciled existing Slack card for item %d", item.id)
+                        return
+                cursor = page.get("response_metadata", {}).get("next_cursor")
+                if not cursor:
+                    break
         response = client.chat_postMessage(
             channel=channel,
             text=_summary_text(item),
@@ -114,9 +150,20 @@ def post_for_approval(item: QueueItem) -> None:
                 },
             ],
         )
-        queue.set_slack_message_ts(item.id, response["ts"])
+        queue.set_slack_message_ts(item.id, response["ts"], lease_until=lease_until)
     except Exception as exc:
         logger.error("[Relay] Slack post failed for item %d: %s", item.id, exc, exc_info=True)
+    finally:
+        if lease_until is not None:
+            queue.release_slack_post(item.id, lease_until)
+
+
+def post_unposted_fa_max_cards(*, limit: int = 50) -> int:
+    """Retry committed, pending FA Max cards after Slack or process failure."""
+    items = queue.unposted_fa_max_items(limit=limit)
+    for item in items:
+        post_for_approval(item)
+    return len(items)
 
 
 def post_completion_receipt(
@@ -190,3 +237,22 @@ def post_blocked_action(item: QueueItem, reason: str) -> None:
         WebClient(token=token.get_secret_value()).chat_postMessage(channel=channel, text=message)
     except Exception as exc:
         logger.error("[Relay] blocked-action post failed for item %d: %s", item.id, exc, exc_info=True)
+
+
+def post_uncertain_action(item: QueueItem) -> None:
+    """Ask an operator to reconcile an ambiguous provider result; never retry it."""
+    settings = get_settings()
+    token = settings.slack_bot_token
+    channel = _resolve_channel(item, settings)
+    if not token or not channel:
+        logger.error("[Relay] uncertain provider result for item %d; Slack unavailable", item.id)
+        return
+    try:
+        from slack_sdk import WebClient
+        WebClient(token=token.get_secret_value()).chat_postMessage(
+            channel=channel,
+            text=(f":warning: *Relay send outcome uncertain* (#{item.id}). "
+                  "The provider may have accepted it. Check the provider before any retry."),
+        )
+    except Exception:
+        logger.exception("[Relay] uncertain-result alert failed for item %d", item.id)

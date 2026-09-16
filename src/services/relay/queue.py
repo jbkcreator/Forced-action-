@@ -71,6 +71,7 @@ from src.services.relay.config import (
     STATUS_REJECTED,
     STATUS_SENT,
     STATUS_SKIPPED,
+    STATUS_UNCERTAIN,
 )
 
 
@@ -107,6 +108,8 @@ class QueueItem:
     autonomy_gate_reason: Optional[str] = None
     decision_interaction_id: Optional[str] = None
     send_interaction_id: Optional[str] = None
+    slack_post_attempted_at: Optional[datetime] = None
+    slack_post_lease_until: Optional[datetime] = None
 
 
 _QUEUE_ITEM_COLUMNS = tuple(f.name for f in fields(QueueItem))
@@ -194,6 +197,8 @@ def enqueue(
                     raise GovernanceBlocked("missing_governance_fields:" + ",".join(missing))
                 if lane not in LANES:
                     raise GovernanceBlocked(f"invalid_lane:{lane}")
+                if channel not in ("email", "sms"):
+                    raise GovernanceBlocked(f"unsupported_fa_max_channel:{channel}")
                 validate_safe_payload(payload)
                 consent = require_consent(
                     session, person_id=str(person_id), channel=channel,
@@ -207,8 +212,10 @@ def enqueue(
                     raise GovernanceBlocked(f"suppressed:{suppressed}")
                 gate = check_tier_gate(str(agent_name), str(autonomy_tier_at_send), session)
                 gate_reason = gate.outcome.value
-                if not gate.allowed:
-                    raise GovernanceBlocked(f"autonomy_gate:{gate_reason}")
+                # Pending items need a Slack human decision. Graduation gates
+                # autonomous sends, not drafts Josh explicitly approves.
+                if gate_reason == "unknown_tier":
+                    raise GovernanceBlocked("unknown_autonomy_tier")
 
             item = RelayApprovalQueueItem(
                 idempotency_key=idempotency_key,
@@ -234,7 +241,51 @@ def enqueue(
         raise
     item = get_item(item_id)
     assert item is not None  # just inserted in the same call
+    if venture_key == "fa_max_lending":
+        # The row is committed before contacting Slack. A failed post stays
+        # pending and the posting sweep can retry it after a restart.
+        from src.services.relay.slack_post import post_for_approval
+        post_for_approval(item)
     return item
+
+
+def unposted_fa_max_items(limit: int = 50) -> list[QueueItem]:
+    """Pending FA Max cards eligible for a posting retry."""
+    with get_db_context() as session:
+        rows = session.execute(
+            text(f"SELECT {_COLUMNS_SQL} FROM relay_approval_queue "
+                 "WHERE venture_key = 'fa_max_lending' AND status = 'pending' "
+                 "AND slack_message_ts IS NULL "
+                 "AND (slack_post_lease_until IS NULL OR slack_post_lease_until < now()) "
+                 "ORDER BY created_at LIMIT :limit"),
+            {"limit": limit},
+        ).mappings().all()
+        return [_row_to_item(dict(row)) for row in rows]
+
+
+def claim_slack_post(item_id: int) -> Optional[datetime]:
+    """Lease one unposted card across concurrent posting workers."""
+    with get_db_context() as session:
+        return session.execute(
+            text("UPDATE relay_approval_queue SET "
+                 "slack_post_attempted_at = now(), "
+                 "slack_post_lease_until = now() + interval '10 minutes', updated_at = now() "
+                 "WHERE id = :id AND venture_key = 'fa_max_lending' "
+                 "AND status = 'pending' AND slack_message_ts IS NULL "
+                 "AND (slack_post_lease_until IS NULL OR slack_post_lease_until < now()) "
+                 "RETURNING slack_post_lease_until"),
+            {"id": item_id},
+        ).scalar_one_or_none()
+
+
+def release_slack_post(item_id: int, lease_until: datetime) -> None:
+    with get_db_context() as session:
+        session.execute(
+            text("UPDATE relay_approval_queue SET slack_post_lease_until = NULL "
+                 "WHERE id = :id AND slack_post_lease_until = :lease_until "
+                 "AND slack_message_ts IS NULL"),
+            {"id": item_id, "lease_until": lease_until},
+        )
 
 
 def get_item(item_id: int) -> Optional[QueueItem]:
@@ -278,16 +329,21 @@ def get_item_by_slack_message_ts(slack_message_ts: str) -> Optional[QueueItem]:
         return _row_to_item(dict(row)) if row else None
 
 
-def set_slack_message_ts(item_id: int, slack_message_ts: str) -> None:
+def set_slack_message_ts(
+    item_id: int, slack_message_ts: str, *, lease_until: Optional[datetime] = None,
+) -> None:
     """Record the posted Slack message's ts so the decision webhook can
     edit that message in place once Josh responds."""
+    condition = " AND slack_post_lease_until = :lease_until" if lease_until is not None else ""
+    params = {"ts": slack_message_ts, "id": item_id}
+    if lease_until is not None:
+        params["lease_until"] = lease_until
     with get_db_context() as session:
         session.execute(
-            text(
-                "UPDATE relay_approval_queue SET slack_message_ts = :ts, "
-                "updated_at = now() WHERE id = :id"
-            ),
-            {"ts": slack_message_ts, "id": item_id},
+            text("UPDATE relay_approval_queue SET slack_message_ts = :ts, "
+                 "slack_post_lease_until = NULL, updated_at = now() "
+                 "WHERE id = :id AND slack_message_ts IS NULL" + condition),
+            params,
         )
 
 
@@ -406,12 +462,28 @@ def try_claim_for_batch(item_id: int, batch_id: str, *, stale_after_minutes: int
                 "UPDATE relay_approval_queue "
                 "SET batch_id = :batch_id, updated_at = now() "
                 "WHERE id = :id AND status = :approved "
-                "AND (batch_id IS NULL OR updated_at < now() - make_interval(mins => :stale_after))"
+                "AND (batch_id IS NULL OR (venture_key <> 'fa_max_lending' "
+                "AND updated_at < now() - make_interval(mins => :stale_after)))"
             ),
             {
                 "batch_id": batch_id, "id": item_id, "approved": STATUS_APPROVED,
                 "stale_after": stale_after_minutes,
             },
+        )
+        return result.rowcount > 0
+
+
+def mark_uncertain_if_stale(item_id: int, *, stale_after_minutes: int = 10) -> bool:
+    """Park a previously claimed FA Max send whose provider result is unknown."""
+    with get_db_context() as session:
+        result = session.execute(
+            text("UPDATE relay_approval_queue SET status = :uncertain, "
+                 "error = 'provider_result_uncertain', updated_at = now() "
+                 "WHERE id = :id AND venture_key = 'fa_max_lending' "
+                 "AND status = :approved AND batch_id IS NOT NULL "
+                 "AND updated_at < now() - make_interval(mins => :stale_after)"),
+            {"id": item_id, "uncertain": STATUS_UNCERTAIN,
+             "approved": STATUS_APPROVED, "stale_after": stale_after_minutes},
         )
         return result.rowcount > 0
 
@@ -502,7 +574,7 @@ def mark_failed(item_id: int, error: str, *, batch_id: str) -> None:
         )
 
 
-def mark_skipped(item_id: int, reason: str) -> None:
+def mark_skipped(item_id: int, reason: str) -> bool:
     """Transitions an 'approved' row to 'skipped' -- guarded so a row that
     has already reached a terminal state (sent/failed/skipped) can never be
     downgraded. Without this guard, calling mark_skipped() on a row an
@@ -515,11 +587,13 @@ def mark_skipped(item_id: int, reason: str) -> None:
     fake models 'sent' and 'skipped' as two independent dicts rather than
     one mutually-exclusive status column."""
     with get_db_context() as session:
-        session.execute(
+        result = session.execute(
             text(
                 "UPDATE relay_approval_queue SET status = :status, "
                 "error = :error, updated_at = now() "
-                "WHERE id = :id AND status = :approved"
+                "WHERE id = :id AND status = :approved "
+                "AND (venture_key <> 'fa_max_lending' OR batch_id IS NULL)"
             ),
             {"status": STATUS_SKIPPED, "error": reason, "id": item_id, "approved": STATUS_APPROVED},
         )
+        return result.rowcount > 0

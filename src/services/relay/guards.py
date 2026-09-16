@@ -91,27 +91,33 @@ def _fa_max_compliance_reason(item: QueueItem) -> str | None:
     if item.channel == "sms" and not get_settings().fa_max_10dlc_registered:
         return "fa_max_10dlc_not_registered"
 
-    from src.services.fa_max_autonomy import check_tier_gate
+    if item.channel not in ("email", "sms"):
+        return "unsupported_fa_max_channel"
+
     from src.services.fa_max_send_governance import (
         GovernanceBlocked,
+        backflip_campaign_reason,
         require_consent,
         validate_safe_payload,
     )
 
     if not item.person_id or not item.agent_name or not item.autonomy_tier_at_send or not item.lane:
         return "missing_governance_fields"
+    if not item.decided_by or not item.decision_interaction_id:
+        return "human_approval_required"
     try:
         validate_safe_payload(item.payload or {})
     except GovernanceBlocked as exc:
         return exc.reason
     with get_db_context() as db:
+        campaign_reason = backflip_campaign_reason(
+            db, recipient=item.recipient, channel=item.channel,
+        )
+        if campaign_reason:
+            return campaign_reason
         consent = require_consent(db, person_id=item.person_id, channel=item.channel)
         if not consent.allowed:
             return consent.reason
-        gate = check_tier_gate(item.agent_name, item.autonomy_tier_at_send, db)
-        if not gate.allowed:
-            return f"autonomy_gate:{gate.outcome.value}"
-
     return None
 
 

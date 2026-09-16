@@ -123,14 +123,21 @@ def execute_batch(
             result.halted = True
             break
 
+        if item.venture_key == "fa_max_lending" and queue.mark_uncertain_if_stale(item.id):
+            from src.services.relay.slack_post import post_uncertain_action
+            post_uncertain_action(item)
+            result.failed += 1
+            result.processed_ids.append(item.id)
+            continue
+
         verdict = guards.evaluate(item, now=now, venture=venture)
         if verdict.outcome == guards.DEFER:
             logger.info("[Relay] item %d deferred: %s", item.id, verdict.reason)
             result.deferred += 1
             continue
         if verdict.outcome == guards.BLOCK:
-            queue.mark_skipped(item.id, verdict.reason)
-            if item.venture_key == "fa_max_lending":
+            skipped = queue.mark_skipped(item.id, verdict.reason)
+            if skipped and item.venture_key == "fa_max_lending":
                 # Notification is observability only.  The durable skipped
                 # transition above is the enforcement boundary.
                 from src.services.relay.slack_post import post_blocked_action

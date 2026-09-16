@@ -243,6 +243,62 @@ class TestGhlSyncBoundary:
         assert detect_field_conflict("qualifying", "qualifying", "lifecycle_state") is False
 
 
+class TestFaMaxCardRecovery:
+    def test_slack_history_reconciles_card_after_crash_without_reposting(self):
+        from types import SimpleNamespace
+        from src.services.relay.slack_post import _card_ref, post_for_approval
+
+        item = _make_queue_item(venture_key="fa_max_lending", lane="MONEY")
+        lease = datetime.now(timezone.utc)
+        settings = SimpleNamespace(slack_bot_token=MagicMock(get_secret_value=lambda: "xoxb-test"))
+        with patch("src.services.relay.slack_post.get_settings", return_value=settings), \
+             patch("src.services.relay.slack_post._resolve_channel", return_value="C_TEST"), \
+             patch("src.services.relay.slack_post.queue.claim_slack_post", return_value=lease), \
+             patch("src.services.relay.slack_post.queue.set_slack_message_ts") as saved, \
+             patch("src.services.relay.slack_post.queue.release_slack_post") as released, \
+             patch("slack_sdk.WebClient") as client_type:
+            client = client_type.return_value
+            client.conversations_history.return_value = {
+                "messages": [{"text": f"*Relay approval needed* (#1)  Ref: `{_card_ref(item)}`", "ts": "123.456"}],
+                "response_metadata": {"next_cursor": ""},
+            }
+            post_for_approval(item)
+            client.chat_postMessage.assert_not_called()
+            saved.assert_called_once_with(1, "123.456", lease_until=lease)
+            released.assert_called_once_with(1, lease)
+
+    def test_slack_failure_leaves_card_retryable(self):
+        from types import SimpleNamespace
+        from src.services.relay.slack_post import post_for_approval
+
+        item = _make_queue_item(venture_key="fa_max_lending", lane="MONEY")
+        lease = datetime.now(timezone.utc)
+        settings = SimpleNamespace(slack_bot_token=MagicMock(get_secret_value=lambda: "xoxb-test"))
+        with patch("src.services.relay.slack_post.get_settings", return_value=settings), \
+             patch("src.services.relay.slack_post._resolve_channel", return_value="C_TEST"), \
+             patch("src.services.relay.slack_post.queue.claim_slack_post", return_value=lease), \
+             patch("src.services.relay.slack_post.queue.set_slack_message_ts") as saved, \
+             patch("src.services.relay.slack_post.queue.release_slack_post") as released, \
+             patch("slack_sdk.WebClient") as client_type:
+            client = client_type.return_value
+            client.conversations_history.return_value = {"messages": [], "response_metadata": {}}
+            client.chat_postMessage.side_effect = RuntimeError("Slack unavailable")
+            post_for_approval(item)
+            saved.assert_not_called()
+            released.assert_called_once_with(1, lease)
+
+
+def test_fa_max_dispatch_rejects_row_without_durable_human_approval():
+    from src.services.relay.guards import _fa_max_compliance_reason
+
+    item = _make_queue_item(
+        venture_key="fa_max_lending", lane="MONEY", agent_name="vera",
+        autonomy_tier_at_send="A", channel="email",
+    )
+    item = replace(item, person_id="00000000-0000-0000-0000-000000000001")
+    assert _fa_max_compliance_reason(item) == "human_approval_required"
+
+
 # ===========================================================================
 # 3. Lane routing — slack_post._resolve_channel
 # ===========================================================================
@@ -572,6 +628,10 @@ class TestWp2Integration:
                 {"person_id": person_id},
             )
             session.execute(
+                text("INSERT INTO fa_max_backflip_campaign_feed (id, last_success_at) "
+                     "VALUES (1, now()) ON CONFLICT (id) DO UPDATE SET last_success_at = now()")
+            )
+            session.execute(
                 text("INSERT INTO relay_approval_queue "
                      "(idempotency_key, channel, recipient, payload, status, venture_key, "
                      "lane, agent_name, autonomy_tier_at_send, person_id, dispatched_at) "
@@ -603,7 +663,171 @@ class TestWp2Integration:
         with get_db_context() as session:
             session.execute(text("DELETE FROM relay_approval_queue WHERE person_id = CAST(:p AS uuid)"), {"p": person_id})
             session.execute(text("DELETE FROM fa_max_persons WHERE person_id = CAST(:p AS uuid)"), {"p": person_id})
+            session.execute(text("DELETE FROM fa_max_backflip_campaign_feed WHERE id = 1"))
             session.commit()
+
+    def test_new_agent_can_queue_human_review_before_tier_a_graduation(self):
+        import uuid
+        from sqlalchemy import text
+        from src.core.database import get_db_context
+        from src.services.relay.queue import enqueue
+
+        person_id = str(uuid.uuid4())
+        with get_db_context() as session:
+            session.execute(text("INSERT INTO fa_max_persons (person_id, lifecycle_state, source) "
+                                 "VALUES (CAST(:p AS uuid), 'identified', 'wp2_test')"), {"p": person_id})
+            session.execute(text("INSERT INTO fa_max_person_consent "
+                                 "(person_id, channel, consented, source) "
+                                 "VALUES (CAST(:p AS uuid), 'email', true, 'wp2_test')"), {"p": person_id})
+            session.execute(text("INSERT INTO fa_max_backflip_campaign_feed (id, last_success_at) "
+                                 "VALUES (1, now()) ON CONFLICT (id) DO UPDATE SET last_success_at = now()"))
+        try:
+            item = enqueue(
+                idempotency_key=f"wp2-new-agent-{uuid.uuid4()}", channel="email",
+                recipient=f"wp2-{uuid.uuid4()}@example.com",
+                payload={"subject": "Review", "body": "Hello"},
+                venture_key="fa_max_lending", lane="MONEY", agent_name=f"new-{uuid.uuid4()}",
+                autonomy_tier_at_send="A", person_id=person_id,
+                skip_contract_validation=True,
+            )
+            assert item.status == "pending"
+            assert item.autonomy_gate_reason == "below_send_threshold"
+        finally:
+            with get_db_context() as session:
+                session.execute(text("DELETE FROM relay_approval_queue WHERE person_id = CAST(:p AS uuid)"), {"p": person_id})
+                session.execute(text("DELETE FROM fa_max_persons WHERE person_id = CAST(:p AS uuid)"), {"p": person_id})
+                session.execute(text("DELETE FROM fa_max_backflip_campaign_feed WHERE id = 1"))
+
+    def test_campaign_snapshot_replaces_membership_and_stale_feed_blocks(self, tmp_path):
+        """Campaign removal must not erase a real opt-out or leave stale sends open."""
+        import uuid
+        from sqlalchemy import text
+        from src.core.database import get_db_context
+        from src.services.fa_max_send_governance import backflip_campaign_reason
+        from scripts.import_backflip_suppression_csv import run
+
+        first = f"wp2-{uuid.uuid4()}@example.com"
+        second = f"wp2-{uuid.uuid4()}@example.com"
+        csv_path = tmp_path / "campaign.csv"
+        try:
+            csv_path.write_text(f"email\n{first}\n", encoding="utf-8")
+            assert run(csv_path) == 1
+            with get_db_context() as session:
+                assert backflip_campaign_reason(session, recipient=first, channel="email") == "backflip_active_campaign"
+                assert session.execute(text("SELECT 1 FROM email_opt_outs WHERE email = :e"), {"e": first}).first() is None
+
+            csv_path.write_text(f"email\n{second}\n", encoding="utf-8")
+            assert run(csv_path) == 1
+            with get_db_context() as session:
+                assert backflip_campaign_reason(session, recipient=first, channel="email") is None
+                assert backflip_campaign_reason(session, recipient=second, channel="email") == "backflip_active_campaign"
+                session.execute(text("UPDATE fa_max_backflip_campaign_feed "
+                                     "SET last_success_at = now() - interval '2 days' WHERE id = 1"))
+            with get_db_context() as session:
+                assert backflip_campaign_reason(session, recipient=first, channel="email") == "backflip_feed_stale"
+            csv_path.write_text("email\n", encoding="utf-8")
+            with pytest.raises(ValueError, match="empty campaign snapshot"):
+                run(csv_path)
+        finally:
+            with get_db_context() as session:
+                session.execute(text("DELETE FROM fa_max_backflip_campaign_contacts "
+                                     "WHERE identifier_value IN (:a, :b)"), {"a": first, "b": second})
+                session.execute(text("DELETE FROM fa_max_backflip_campaign_feed WHERE id = 1"))
+
+    def test_database_rejects_financial_payload_even_on_direct_insert(self):
+        import uuid
+        from sqlalchemy import text
+        from sqlalchemy.exc import IntegrityError
+        from src.core.database import get_db_context
+
+        person_id = str(uuid.uuid4())
+        with get_db_context() as session:
+            session.execute(text("INSERT INTO fa_max_persons (person_id, lifecycle_state, source) "
+                                 "VALUES (CAST(:p AS uuid), 'identified', 'wp2_test')"), {"p": person_id})
+        try:
+            with pytest.raises(IntegrityError):
+                with get_db_context() as session:
+                    session.execute(
+                        text("INSERT INTO relay_approval_queue "
+                             "(idempotency_key, channel, recipient, payload, status, venture_key, "
+                             "lane, agent_name, autonomy_tier_at_send, person_id) "
+                             "VALUES (:k, 'noop', 'audit-only', "
+                             "'{\"ssn\":\"123-45-6789\"}'::jsonb, 'pending', 'fa_max_lending', "
+                             "'MONEY', 'vera', 'A', CAST(:p AS uuid))"),
+                        {"k": f"wp2-financial-{uuid.uuid4()}", "p": person_id},
+                    )
+        finally:
+            with get_db_context() as session:
+                session.execute(text("DELETE FROM fa_max_persons WHERE person_id = CAST(:p AS uuid)"), {"p": person_id})
+
+    def test_stale_claim_is_parked_uncertain_without_second_dispatch(self):
+        import uuid
+        from sqlalchemy import text
+        from src.core.database import get_db_context
+        from src.services.relay.queue import mark_uncertain_if_stale, try_claim_for_batch
+
+        person_id = str(uuid.uuid4())
+        with get_db_context() as session:
+            session.execute(text("INSERT INTO fa_max_persons (person_id, lifecycle_state, source) "
+                                 "VALUES (CAST(:p AS uuid), 'identified', 'wp2_test')"), {"p": person_id})
+            item_id = session.execute(
+                text("INSERT INTO relay_approval_queue "
+                     "(idempotency_key, channel, recipient, payload, status, venture_key, "
+                     "lane, agent_name, autonomy_tier_at_send, person_id, batch_id, updated_at) "
+                     "VALUES (:k, 'noop', 'audit-only', '{}'::jsonb, 'approved', "
+                     "'fa_max_lending', 'MONEY', 'vera', 'A', CAST(:p AS uuid), "
+                     "'crashed-worker', now() - interval '20 minutes') RETURNING id"),
+                {"k": f"wp2-uncertain-{uuid.uuid4()}", "p": person_id},
+            ).scalar_one()
+        try:
+            assert not try_claim_for_batch(item_id, "retry-worker")
+            assert mark_uncertain_if_stale(item_id)
+            assert not try_claim_for_batch(item_id, "retry-worker")
+            with get_db_context() as session:
+                row = session.execute(text("SELECT status, error FROM relay_approval_queue WHERE id = :id"),
+                                      {"id": item_id}).one()
+                assert row.status == "uncertain"
+                assert row.error == "provider_result_uncertain"
+        finally:
+            with get_db_context() as session:
+                session.execute(text("DELETE FROM relay_approval_queue WHERE id = :id"), {"id": item_id})
+                session.execute(text("DELETE FROM fa_max_persons WHERE person_id = CAST(:p AS uuid)"), {"p": person_id})
+
+    def test_card_lease_and_timestamp_are_durable(self):
+        import uuid
+        from sqlalchemy import text
+        from src.core.database import get_db_context
+        from src.services.relay.queue import (
+            claim_slack_post, set_slack_message_ts, unposted_fa_max_items,
+        )
+
+        person_id = str(uuid.uuid4())
+        with get_db_context() as session:
+            session.execute(text("INSERT INTO fa_max_persons (person_id, lifecycle_state, source) "
+                                 "VALUES (CAST(:p AS uuid), 'identified', 'wp2_test')"), {"p": person_id})
+            item_id = session.execute(
+                text("INSERT INTO relay_approval_queue "
+                     "(idempotency_key, channel, recipient, payload, status, venture_key, "
+                     "lane, agent_name, autonomy_tier_at_send, person_id) "
+                     "VALUES (:k, 'noop', 'audit-only', '{}'::jsonb, 'pending', "
+                     "'fa_max_lending', 'MONEY', 'vera', 'A', CAST(:p AS uuid)) RETURNING id"),
+                {"k": f"wp2-card-{uuid.uuid4()}", "p": person_id},
+            ).scalar_one()
+        try:
+            assert any(item.id == item_id for item in unposted_fa_max_items())
+            lease = claim_slack_post(item_id)
+            assert lease is not None
+            assert claim_slack_post(item_id) is None
+            set_slack_message_ts(item_id, "123.456", lease_until=lease)
+            with get_db_context() as session:
+                row = session.execute(text("SELECT slack_message_ts, slack_post_lease_until "
+                                           "FROM relay_approval_queue WHERE id = :id"), {"id": item_id}).one()
+                assert row.slack_message_ts == "123.456"
+                assert row.slack_post_lease_until is None
+        finally:
+            with get_db_context() as session:
+                session.execute(text("DELETE FROM relay_approval_queue WHERE id = :id"), {"id": item_id})
+                session.execute(text("DELETE FROM fa_max_persons WHERE person_id = CAST(:p AS uuid)"), {"p": person_id})
 
 
 class TestWp2ClosureGuards:

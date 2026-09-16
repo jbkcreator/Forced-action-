@@ -70,6 +70,9 @@ def require_consent(session: Session, *, person_id: str, channel: str) -> Consen
 
 def suppression_reason(session: Session, *, recipient: str, channel: str) -> str | None:
     """First suppression gate, using the same stores as Relay's send gate."""
+    campaign_reason = backflip_campaign_reason(session, recipient=recipient, channel=channel)
+    if campaign_reason:
+        return campaign_reason
     if channel == "email":
         from src.services.email_suppression import is_email_suppressed
         return "email_opt_out" if is_email_suppressed(session, recipient) else None
@@ -78,6 +81,36 @@ def suppression_reason(session: Session, *, recipient: str, channel: str) -> str
         result = validate_outbound(recipient, channel, session)
         return None if result.allowed else (result.reason or "compliance_blocked")
     return None
+
+
+def backflip_campaign_reason(session: Session, *, recipient: str, channel: str) -> str | None:
+    """Fail closed when the latest complete Backflip campaign snapshot is stale."""
+    if channel not in CONTACT_CHANNELS:
+        return None
+    from config.settings import get_settings
+    from src.services.phone_utils import normalize
+
+    max_age = get_settings().fa_max_backflip_feed_max_age_hours
+    fresh = session.execute(
+        text("SELECT last_success_at >= now() - make_interval(hours => :max_age) "
+             "FROM fa_max_backflip_campaign_feed WHERE id = 1"),
+        {"max_age": max_age},
+    ).scalar_one_or_none()
+    if fresh is None:
+        return "backflip_feed_unavailable"
+    if not fresh:
+        return "backflip_feed_stale"
+    value = recipient.strip().lower() if channel == "email" else normalize(recipient)
+    if value is None:
+        return "invalid_contact_identifier"
+    kind = "email" if channel == "email" else "phone"
+    active = session.execute(
+        text("SELECT 1 FROM fa_max_backflip_campaign_contacts "
+             "WHERE identifier_kind = :kind AND identifier_value = :value "
+             "AND active LIMIT 1"),
+        {"kind": kind, "value": value},
+    ).scalar_one_or_none()
+    return "backflip_active_campaign" if active else None
 
 
 def set_consent(

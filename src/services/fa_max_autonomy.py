@@ -1,8 +1,8 @@
 """FA Max autonomy-tier gating (WP-2 — send governance).
 
-Autonomy tiers gate FA Max outbound sends. Internal-only agents (sourcing,
-enrichment, dedup, scoring) need no gate. Any agent that produces outbound
-contact must pass check_tier_gate() before a relay item is enqueued.
+Autonomy tiers gate autonomous FA Max outbound sends. Internal-only agents
+(sourcing, enrichment, dedup, scoring) need no gate. A draft below the
+graduation threshold may still be queued for explicit human approval.
 
 Tiers (per SOT.md Part 2 / Requirement Two):
     A — Replies in threads Josh started, follow-ups, own funded-borrower
@@ -23,8 +23,8 @@ flag in the payload, set by the Slack approve handler when it detects the body
 was changed.
 
 This module reads live counts from the DB — graduation state is never
-hard-coded. A v1 that starts gates below threshold must never send; there is
-no "grace period" or "let a few through to bootstrap."
+hard-coded. The Relay execution path currently requires a durable human
+approval for every FA Max item; autonomous dispatch is not enabled by WP-2.
 
 All reads use sqlalchemy.text() per CLAUDE.md.
 """

@@ -28,6 +28,7 @@ STATUS_APPROVED = "approved"  # decided, not yet executed
 STATUS_REJECTED = "rejected"  # decided, will never execute
 STATUS_SENT = "sent"          # dispatcher succeeded
 STATUS_FAILED = "failed"      # dispatcher raised
+STATUS_UNCERTAIN = "uncertain"  # provider may have accepted; human reconciliation required
 STATUS_SKIPPED = "skipped"    # idempotency: same key already processed, or picked up twice
 
 # Spec §1.1.13 ("Tap surface") — Decision Packets render as interactive
