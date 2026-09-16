@@ -11067,3 +11067,123 @@ class FaMaxWorkQueue(Base):
             f"<FaMaxWorkQueue(work_item_id={self.work_item_id!r}, "
             f"queue={self.queue_name!r}, status={self.status!r})>"
         )
+
+
+# ============================================================================
+# WP-5B — Borrower Buy Box, Velocity & Next-Need Prediction
+# ============================================================================
+
+class FaMaxPersonProfile(Base):
+    """Per-person intelligence profile: buy-box, velocity, and predicted next
+    financing need.
+
+    Keyed on fa_max_persons.person_id (WP-1 canonical anchor). Updated nightly
+    by src/tasks/fa_max_profile_sweep.py, which joins through the Hunter
+    buyer_entities/buyer_entity_links resolution layer to aggregate deed/permit/
+    financing-intent signals into a borrower-level view.
+
+    Compliance: contains NO borrower financial data (no credit score, income,
+    bank statements, tax returns, SSN). buy_box_price_band derives entirely
+    from public-record deed sale prices (>$1 000 nominal-consideration floor,
+    same as Hunter's portfolio_profiling). predicted_next_need is an internal
+    product-category label; it is never a rate, term, or commitment to a
+    borrower.
+
+    buyer_entity_id is a provisional FK to buyer_entities.id populated by
+    WP-5B's profile sweep when a matching BuyerEntity is found. WP-3/WP-4
+    (person identity + entity-to-principal graph) will formalize this bridge
+    with reversible-merge logging once those work packages ship. Until then
+    the sweep does a best-effort name/address match and sets confidence_tier
+    to 'low' or 'unknown' when no entity link is established.
+    """
+
+    __tablename__ = "fa_max_person_profiles"
+
+    person_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_persons.person_id", name="fk_fa_max_profile_person"),
+        primary_key=True,
+    )
+
+    # --- Provisional entity bridge (WP-3/WP-4 will formalize) ---------------
+    # NULL when no BuyerEntity has been resolved for this person yet.
+    buyer_entity_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("buyer_entities.id", name="fk_fa_max_profile_buyer_entity"),
+        nullable=True,
+        index=True,
+    )
+
+    # --- Buy-box profile (from deed history via entity links) ----------------
+    # All three are NULL when confidence_tier = 'unknown'.
+    buy_box_geography: Mapped[Optional[Any]] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment="city/county distribution: [{city, county_id, count}]",
+    )
+    buy_box_property_types: Mapped[Optional[Any]] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment="property type distribution: [{property_type, property_use_code, count}]",
+    )
+    buy_box_price_band: Mapped[Optional[Any]] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment="arm's-length sale price stats: {min_cents, median_cents, max_cents, sample_count}",
+    )
+
+    # --- Deal velocity (mirrored from BuyerEntity cadence fields) ------------
+    velocity_purchases_per_year: Mapped[Optional[Decimal]] = mapped_column(Numeric(6, 2), nullable=True)
+    last_transaction_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    avg_days_between_transactions: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 1), nullable=True)
+    active_property_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    # --- Predicted next need (rolled up from FinancingIntentScore per-property) ---
+    # Product category only — never a rate, term, or commitment.
+    predicted_next_need: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    predicted_next_need_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_need_evidence: Mapped[Optional[Any]] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment="top-3 source properties with financing_intent signal details",
+    )
+
+    # --- Confidence / data-sufficiency ---------------------------------------
+    confidence_tier: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        server_default=text("'unknown'"),
+    )
+
+    computed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "confidence_tier IN ('high', 'medium', 'low', 'unknown')",
+            name="ck_fa_max_person_profile_confidence_tier",
+        ),
+        CheckConstraint(
+            "predicted_next_need IS NULL OR predicted_next_need IN ("
+            "'bridge', 'hard_money_purchase', 'renovation_capital', "
+            "'heloc', 'cash_out_refi', 'buyout_refi')",
+            name="ck_fa_max_person_profile_next_need",
+        ),
+        Index("ix_fa_max_person_profile_buyer_entity", "buyer_entity_id",
+              postgresql_where=text("buyer_entity_id IS NOT NULL")),
+        Index("ix_fa_max_person_profile_confidence", "confidence_tier"),
+        Index("ix_fa_max_person_profile_computed_at", "computed_at",
+              postgresql_where=text("computed_at IS NOT NULL")),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<FaMaxPersonProfile(person_id={self.person_id!r}, "
+            f"confidence={self.confidence_tier!r}, "
+            f"next_need={self.predicted_next_need!r})>"
+        )
