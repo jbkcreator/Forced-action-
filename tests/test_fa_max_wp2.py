@@ -178,7 +178,7 @@ class TestAutonomyTierGate:
 
 
 # ===========================================================================
-# 2. GHL sync boundary — always returns blocked (stub)
+# 2. GHL sync ownership boundary
 # ===========================================================================
 
 class TestGhlSyncBoundary:
@@ -192,7 +192,7 @@ class TestGhlSyncBoundary:
             actor="test",
         )
         assert result.outcome == SyncOutcome.blocked
-        assert "SOT.md clarification #16" in result.message
+        assert "live field mapping" in result.message
 
     def test_pull_from_ghl_returns_blocked(self):
         from src.services.fa_max_ghl_sync import SyncOutcome, pull_contact_fields_from_ghl
@@ -202,7 +202,35 @@ class TestGhlSyncBoundary:
             fields=["first_name", "phone"],
             actor="test",
         )
+        assert result.outcome == SyncOutcome.conflict
+        assert result.conflict_fields == ["first_name", "phone"]
+
+    def test_ghl_cannot_overwrite_relationship_or_contact_fields(self):
+        from src.services.fa_max_ghl_sync import (
+            SyncOutcome, ghl_may_update_field, pull_contact_fields_from_ghl,
+        )
+
+        for field in ("borrower_id", "first_name", "email", "phone",
+                      "relationship_state", "lifecycle_state", "opportunity_stage"):
+            assert not ghl_may_update_field(field)
+            result = pull_contact_fields_from_ghl(
+                ghl_contact_id="ghl-123", fields=[field], actor="test",
+            )
+            assert result.outcome == SyncOutcome.conflict
+            assert result.fields_synced == []
+            assert result.conflict_fields == [field]
+
+    def test_ghl_loan_status_is_allowlisted_but_no_adapter_writes_it(self):
+        from src.services.fa_max_ghl_sync import (
+            SyncOutcome, ghl_may_update_field, pull_contact_fields_from_ghl,
+        )
+
+        assert ghl_may_update_field("backflip_loan_status")
+        result = pull_contact_fields_from_ghl(
+            ghl_contact_id="ghl-123", fields=["backflip_loan_status"], actor="test",
+        )
         assert result.outcome == SyncOutcome.blocked
+        assert result.fields_synced == []
 
     def test_detect_conflict_true_when_different(self):
         from src.services.fa_max_ghl_sync import detect_field_conflict

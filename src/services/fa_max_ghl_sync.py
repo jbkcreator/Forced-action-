@@ -1,24 +1,19 @@
 """FA Max ↔ GoHighLevel relationship-state sync boundary (WP-2).
 
-IMPORTANT — BLOCKED ON OPEN CLARIFICATION:
-    SOT.md clarification #16 (GHL/FA field-ownership conflict rule) is
-    unanswered as of 2026-09-15. This module is a FAIL-CLOSED interface:
-    it defines the boundary but does NOT auto-resolve conflicts. Both
-    directions (push to GHL, pull from GHL) are documented here as stubs
-    that log their intent and fail closed until #16 is answered and a real
-    Fake/Live implementation is built behind this boundary.
+SOT.md clarification #16 is answered: Forced Action owns borrower, prospect,
+and relationship data. Backflip GHL owns the status of a submitted loan in
+its own system. This module remains a fail-closed integration boundary until
+the GHL field mapping and live adapter are implemented.
 
     Do NOT call any GHL API directly from business logic. Wire calls through
     this module only so the boundary stays checkable by a structural test.
 
-Ownership rule (interim, until #16 is resolved):
-    - FA Max is authoritative for: lifecycle_state, opportunity stage,
-      and any field WP-1 manages (person_id, opportunity_id).
-    - GHL is authoritative for: contact first/last name, raw phone, raw
-      email as received from the lead source.
-    - CONFLICT: any field both systems may write is currently BLOCKED — this
-      module logs the conflict and returns SyncResult.conflict without
-      writing to either system.
+Ownership rule:
+    - Forced Action is authoritative for all borrower, prospect, contact,
+      relationship, lifecycle, and opportunity fields it stores.
+    - Backflip GHL is authoritative only for Backflip loan status. That
+      status may be recorded as external loan status, never as a replacement
+      for the Forced Action relationship record.
 
 This boundary is NOT the single-sender relay. It never produces outbound
 contact to a borrower; it is a CRM sync operation only.
@@ -28,9 +23,18 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+# Explicit allowlist: a new GHL field must not silently gain write access to
+# the Forced Action relationship record.
+GHL_OWNED_FIELDS = frozenset({"backflip_loan_status"})
+
+
+def ghl_may_update_field(field_name: str) -> bool:
+    """Whether a GHL-origin update may enter the external-loan-status path."""
+    return field_name in GHL_OWNED_FIELDS
 
 
 class SyncDirection(str, Enum):
@@ -65,12 +69,10 @@ def push_lifecycle_state_to_ghl(
 ) -> SyncResult:
     """Push an FA Max lifecycle state change to GHL custom field.
 
-    STUB — blocked on SOT.md clarification #16.
-    Returns SyncResult(outcome=blocked) without touching GHL until the
-    field-ownership conflict rule is resolved and a Live adapter is built.
+    STUB — no live field mapping or adapter exists yet. No GHL write occurs.
     """
     logger.warning(
-        "fa_max_ghl_sync.push_lifecycle_state_to_ghl: STUB (blocked on SOT#16) "
+        "fa_max_ghl_sync.push_lifecycle_state_to_ghl: no live adapter "
         "person=%s ghl_contact=%s state=%s actor=%s",
         person_id, ghl_contact_id, new_lifecycle_state, actor,
     )
@@ -80,11 +82,8 @@ def push_lifecycle_state_to_ghl(
         person_id=person_id,
         ghl_contact_id=ghl_contact_id,
         fields_synced=[],
-        conflict_fields=["lifecycle_state"],
-        message=(
-            "GHL sync blocked: SOT.md clarification #16 (field-ownership "
-            "conflict rule) is unanswered. No data written to GHL."
-        ),
+        conflict_fields=[],
+        message="GHL sync blocked: live field mapping and adapter are not configured. No data written to GHL.",
     )
 
 
@@ -96,26 +95,25 @@ def pull_contact_fields_from_ghl(
 ) -> SyncResult:
     """Pull specified GHL contact fields into FA Max.
 
-    STUB — blocked on SOT.md clarification #16.
-    Returns SyncResult(outcome=blocked) without reading from GHL until
-    the ownership rule is confirmed.
+    Rejects any attempt to import GHL contact or relationship fields. Even
+    allowed loan status remains blocked until an external-status adapter is
+    implemented; this function never writes the Forced Action record.
     """
     logger.warning(
-        "fa_max_ghl_sync.pull_contact_fields_from_ghl: STUB (blocked on SOT#16) "
+        "fa_max_ghl_sync.pull_contact_fields_from_ghl: no live adapter "
         "ghl_contact=%s fields=%s actor=%s",
         ghl_contact_id, fields, actor,
     )
+    forbidden = [field for field in fields if not ghl_may_update_field(field)]
     return SyncResult(
-        outcome=SyncOutcome.blocked,
+        outcome=SyncOutcome.conflict if forbidden else SyncOutcome.blocked,
         direction=SyncDirection.ghl_to_fa,
         person_id=None,
         ghl_contact_id=ghl_contact_id,
         fields_synced=[],
-        conflict_fields=fields,
-        message=(
-            "GHL sync blocked: SOT.md clarification #16 (field-ownership "
-            "conflict rule) is unanswered. No data read from GHL."
-        ),
+        conflict_fields=forbidden,
+        message=("GHL cannot overwrite Forced Action owned fields. No data imported."
+                 if forbidden else "GHL loan status adapter is not configured. No data imported."),
     )
 
 
@@ -126,8 +124,8 @@ def detect_field_conflict(
 ) -> bool:
     """Return True if FA Max and GHL hold different values for the same field.
 
-    Caller is responsible for deciding what to do with a conflict —
-    this module never auto-resolves (fail-closed per SOT#16 pending answer).
+    Caller is responsible for applying the ownership rule; this function
+    is diagnostic only and never authorizes a write.
     """
     if fa_value != ghl_value:
         logger.info(
