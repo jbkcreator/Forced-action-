@@ -1020,6 +1020,50 @@ class TestWorkQueueScheduling:
         ).scalar()
         assert status == "done"
 
+    def test_schedule_for_property_enqueues_linked_person(self, fresh_db):
+        from src.services.borrower_profile_service import schedule_profile_recompute_for_property
+        person_id = _fresh_person_id(fresh_db)
+        entity_id = _fresh_buyer_entity(fresh_db)
+        _set_person_entity_link(fresh_db, person_id, entity_id)
+        prop_id = _insert_property(fresh_db)
+        # Link the entity to the property via buyer_entity_links (source_table='properties')
+        fresh_db.execute(
+            text("""
+                INSERT INTO buyer_entity_links (buyer_entity_id, source_table, source_id,
+                                                match_confidence, match_method)
+                VALUES (:eid, 'properties', :prop_id, 90, 'exact_name_address')
+                ON CONFLICT (source_table, source_id) DO NOTHING
+            """),
+            {"eid": entity_id, "prop_id": prop_id},
+        )
+        fresh_db.commit()
+
+        schedule_profile_recompute_for_property(fresh_db, prop_id, "new_deed")
+        fresh_db.commit()
+
+        count = fresh_db.execute(
+            text("""
+                SELECT COUNT(*) FROM fa_max_work_queue
+                WHERE queue_name = 'profile_recompute'
+                  AND person_id = :pid
+                  AND status = 'available'
+            """),
+            {"pid": person_id},
+        ).scalar()
+        assert count == 1
+
+    def test_schedule_for_property_noop_when_no_link(self, fresh_db):
+        from src.services.borrower_profile_service import schedule_profile_recompute_for_property
+        prop_id = _insert_property(fresh_db)
+        fresh_db.commit()
+        # No buyer_entity_links → no persons → no queue rows added
+        schedule_profile_recompute_for_property(fresh_db, prop_id, "new_deed")
+        fresh_db.commit()
+        count = fresh_db.execute(
+            text("SELECT COUNT(*) FROM fa_max_work_queue WHERE queue_name = 'profile_recompute'"),
+        ).scalar()
+        assert count == 0
+
 
 # ===========================================================================
 # Fix 3 â€” production read path

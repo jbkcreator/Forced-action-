@@ -198,6 +198,15 @@ class DeedLoader(BaseLoader):
 
                         if self.safe_add(deed_record):
                             matched += 1
+                            try:
+                                from src.services.borrower_profile_service import (
+                                    schedule_profile_recompute_for_property,
+                                )
+                                schedule_profile_recompute_for_property(
+                                    self.session, property_record.id, "new_deed"
+                                )
+                            except Exception:
+                                pass
                         else:
                             unmatched += 1
 

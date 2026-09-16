@@ -593,7 +593,9 @@ def schedule_profile_recompute(session: Session, person_id: str, reason: str) ->
                 'profile_recompute', :ikey, :person_id,
                 CAST(:payload AS jsonb), 'available', NOW()
             )
-            ON CONFLICT (idempotency_key) DO NOTHING
+            ON CONFLICT (idempotency_key)
+            WHERE idempotency_key IS NOT NULL
+            DO NOTHING
         """),
         {
             "ikey": idempotency_key,
@@ -601,3 +603,28 @@ def schedule_profile_recompute(session: Session, person_id: str, reason: str) ->
             "payload": _jsonb({"reason": reason}),
         },
     )
+
+
+def schedule_profile_recompute_for_property(
+    session: Session, property_id: int, reason: str
+) -> None:
+    """Enqueue profile recomputes for all fa_max_persons linked to property_id.
+
+    Looks up persons via buyer_entity_links → fa_max_persons. No-op if no
+    persons are linked (pre-WP-3/WP-4 state). Each enqueue is idempotent.
+    """
+    rows = session.execute(
+        text("""
+            SELECT DISTINCT p.person_id
+            FROM fa_max_persons p
+            JOIN buyer_entity_links bel
+              ON bel.buyer_entity_id = p.buyer_entity_id
+             AND bel.source_table = 'properties'
+             AND bel.source_id = :prop_id
+            WHERE p.buyer_entity_id IS NOT NULL
+              AND p.merged_into IS NULL
+        """),
+        {"prop_id": property_id},
+    ).mappings().all()
+    for row in rows:
+        schedule_profile_recompute(session, str(row["person_id"]), reason)
