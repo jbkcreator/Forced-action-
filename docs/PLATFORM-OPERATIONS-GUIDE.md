@@ -490,6 +490,15 @@ SLACK_SIGNING_SECRET=...
 > ever be Slack's actual configured URL at a time, silently breaking the
 > other two.
 
+For Relay card thread replies, enable **Event Subscriptions** separately and
+set its Request URL to `https://<your-host>/api/admin/slack/events`. Subscribe
+to the message event for each conversation type where Relay cards are posted,
+grant the corresponding history scope, invite the bot to those channels, and
+reinstall the app after changing scopes. This route handles exact `approve`
+and `reject` replies in a card thread; it is distinct from Interactivity.
+Verify Slack accepts the URL challenge and delivers a signed test event before
+relying on thread replies as an approval path.
+
 ### Adding a candidate county
 ```sql
 INSERT INTO expansion_candidates (county_id, priority, status)

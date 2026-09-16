@@ -87,14 +87,15 @@ def app_client(app_and_client):
     return client
 
 
-def _post_decision(client, payload: dict, ts_offset: int = 0, bad_sig: bool = False):
+def _post_decision(client, payload: dict, ts_offset: int = 0, bad_sig: bool = False,
+                   path: str = "/api/admin/slack/relay-decision"):
     body = urlencode({"payload": json.dumps(payload)}).encode()
     if bad_sig:
         ts, sig = str(int(time.time())), "v0=badsig"
     else:
         ts, sig = _sign(body, "test-signing-secret", ts_offset=ts_offset)
     return client.post(
-        "/api/admin/slack/relay-decision",
+        path,
         content=body,
         headers={
             "content-type": "application/x-www-form-urlencoded",
@@ -186,6 +187,32 @@ def test_reject_calls_record_decision_with_approved_false(app_client, monkeypatc
     mock_record_decision.assert_called_once_with(1, approved=False, decided_by="U_APPROVER")
 
 
+@pytest.mark.parametrize("action,approved", [("approve", True), ("reject", False)])
+def test_shared_interactivity_url_routes_relay_buttons(app_client, monkeypatch, action, approved):
+    """Exercise the URL configured in Slack, not only the deprecated alias."""
+    decided = _make_item(status="approved" if approved else "rejected")
+    record = MagicMock(return_value=decided)
+    monkeypatch.setattr("src.services.relay.queue.get_item", MagicMock(return_value=_make_item()))
+    monkeypatch.setattr("src.services.relay.queue.record_decision", record)
+
+    response = _post_decision(
+        app_client, _interactive_payload("U_APPROVER", 1, action),
+        path="/api/admin/slack/interact",
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    record.assert_called_once_with(1, approved=approved, decided_by="U_APPROVER")
+
+
+def test_shared_interactivity_url_rejects_invalid_signature(app_client):
+    response = _post_decision(
+        app_client, _interactive_payload("U_APPROVER", 1, "approve"),
+        bad_sig=True, path="/api/admin/slack/interact",
+    )
+    assert response.status_code == 401
+
+
 def test_non_approver_rejected(app_client, monkeypatch):
     mock_record_decision = MagicMock()
     monkeypatch.setattr("src.services.relay.queue.record_decision", mock_record_decision)
@@ -223,6 +250,16 @@ def test_double_click_returns_already_decided(app_client, monkeypatch):
 # ---------------------------------------------------------------------------
 # /slack/events — Relay thread actions
 # ---------------------------------------------------------------------------
+
+def test_events_url_verification_challenge(app_client):
+    response = _post_event(app_client, {"type": "url_verification", "challenge": "test-challenge"})
+    assert response.status_code == 200
+    assert response.json() == {"challenge": "test-challenge"}
+
+
+def test_events_rejects_invalid_signature(app_client):
+    response = _post_event(app_client, {"type": "event_callback", "event": {}}, bad_sig=True)
+    assert response.status_code == 401
 
 def test_thread_reply_approve_becomes_durable_relay_decision(app_client, monkeypatch):
     item = _make_item(status="pending", slack_message_ts="1710000000.000100")
