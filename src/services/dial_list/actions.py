@@ -155,6 +155,16 @@ def handle_action(
         return ActionResult(status="touched", kind=kind,
                             opportunity_thread_id=thread, updated_blocks=updated)
 
+    # Fail closed on terminal outcomes when no approver gate is configured.
+    # Called/Skip above are non-terminal and harmless; Won/Lost write canonical
+    # outcomes and must be gated even in dev when approver_id is unset.
+    if not approver_id:
+        logger.warning(
+            "[DialList] terminal action %r rejected — "
+            "DIAL_LIST_APPROVER_USER_ID not configured", action_id
+        )
+        return ActionResult(status="ignored", message="no approver configured")
+
     # terminal: won / lost
     if action_id == ACTION_WON:
         outcome, loss_code = "won", None
@@ -171,16 +181,26 @@ def handle_action(
     try:
         disp = record_dial_disposition(
             session, opportunity_thread_id=thread, outcome=outcome,
-            loss_code=loss_code, actor=_ACTOR, as_of=as_of,
+            loss_code=loss_code, actor=user_id or _ACTOR, as_of=as_of,
         )
     except ValueError as exc:
         logger.warning("[DialList] invalid disposition for %s: %s", thread, exc)
         return ActionResult(status="error", kind=outcome,
                             opportunity_thread_id=thread, message=str(exc))
 
-    updated = _apply_update(outcome, detail=loss_code or "")
-    return ActionResult(status="recorded", kind=outcome, opportunity_thread_id=thread,
-                        loss_code=loss_code, disposition=disp, updated_blocks=updated)
+    # If already terminal (inserted=False), show the canonical stored outcome
+    # on the card — not the newly attempted action — so Slack and DB never diverge.
+    canonical_outcome = disp.outcome if not disp.inserted else outcome
+    canonical_code = disp.reason_code if not disp.inserted else loss_code
+    if not disp.inserted:
+        logger.info(
+            "[DialList] thread %s already terminal (%s) — card updated to canonical outcome",
+            thread, disp.outcome,
+        )
+    updated = _apply_update(canonical_outcome, detail=canonical_code or "")
+    return ActionResult(status="recorded", kind=canonical_outcome,
+                        opportunity_thread_id=thread, loss_code=canonical_code,
+                        disposition=disp, updated_blocks=updated)
 
 
 # ---------------------------------------------------------------------------

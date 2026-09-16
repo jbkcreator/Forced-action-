@@ -16,6 +16,7 @@ from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
 
 from src.core.models import (
+    AgentLaneOpportunityOutcome,
     BuildingPermit,
     BuyerEntity,
     BuyerEntityLink,
@@ -66,6 +67,7 @@ def db():
         TaxDeedAuction.__table__,
         BuyerEntity.__table__,
         BuyerEntityLink.__table__,
+        AgentLaneOpportunityOutcome.__table__,
     ]
     for t in tables:
         t.create(bind=engine)
@@ -227,7 +229,12 @@ def test_union_dedup_by_borrower(db):
     assert len(dl.entries) == 1  # pure core dedups by borrower
     entry = dl.entries[0]
     assert entry.buyer_entity_id == 500
-    assert set(entry.triggers) >= {"out_of_state", "cash_purchase"}
+    # Fix 7: triggers are NOT merged across different properties under the same
+    # borrower — only the retained property's own signals are shown so Josh
+    # gets accurate context for the actual property he's calling about.
+    # p1 (out_of_state, assessed $400K) scores higher → its trigger is kept.
+    assert "out_of_state" in entry.triggers
+    assert "cash_purchase" not in entry.triggers
 
 
 def test_maturities_trigger_gated_off_by_default(db):

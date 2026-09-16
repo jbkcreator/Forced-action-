@@ -245,6 +245,15 @@ _EXCHANGE_1031_SQL = text(
     """
 )
 
+_TERMINAL_OUTCOMES_SQL = text(
+    """
+    SELECT opportunity_thread_id
+    FROM agent_lane_opportunity_outcomes
+    WHERE outcome IN ('won', 'lost')
+      AND opportunity_thread_id IS NOT NULL
+    """
+)
+
 _ENRICH_SQL = text(
     """
     SELECT
@@ -479,6 +488,14 @@ def assemble_dial_candidates(
             # a property with >1 owner link could appear twice; first wins
             enrich.setdefault(row["property_id"], dict(row))
 
+        # Exclude opportunities already coded won/lost — they should not
+        # resurface on the next day's list.
+        terminal_threads: set = {
+            row[0]
+            for row in session.execute(_TERMINAL_OUTCOMES_SQL)
+            if row[0] is not None
+        }
+
     except SQLAlchemyError:
         logger.error(
             "dial_list retrieval failed (as_of=%s, county=%s)",
@@ -493,6 +510,9 @@ def assemble_dial_candidates(
         # / apartment / ag parcels are not hard-money borrowers and their
         # assessed values would otherwise top the dollar-ranked list.
         if not _is_residential(e.get("property_use_code")):
+            continue
+        thread_id = e.get("opportunity_thread_id")
+        if thread_id and thread_id in terminal_threads:
             continue
         last_sale_date = _as_date(e.get("last_sale_date"))
         address = _compose_address(e.get("address"), e.get("city"), e.get("zip"))

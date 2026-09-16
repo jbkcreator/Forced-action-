@@ -173,18 +173,21 @@ def _install_fakes(monkeypatch, settings=None):
     monkeypatch.setattr(slack_sdk, "WebClient", _FakeClient)
 
 
-def test_deliver_posts_once_with_formatted_payload(monkeypatch):
+def test_deliver_posts_header_then_entries_as_thread(monkeypatch):
     _install_fakes(monkeypatch)
-    dl = _dial_list([_entry()])
+    dl = _dial_list([_entry(), _entry(property_id=2, rank=2)])
     ts = deliver_dial_list(dl)
     assert ts == "1700000000.0001"
-    assert len(_FakeClient.instances) == 1
-    call = _FakeClient.instances[0].calls
-    assert len(call) == 1
-    assert call[0]["channel"] == "#fa-max-money"
-    header, blocks = format_dial_list_digest(dl)
-    assert call[0]["text"] == header
-    assert call[0]["blocks"] == blocks
+    client = _FakeClient.instances[0]
+    calls = client.calls
+    # 1 header call + 1 call per entry
+    assert len(calls) == 3
+    # First call is the header (no thread_ts)
+    assert "thread_ts" not in calls[0]
+    assert calls[0]["channel"] == "#fa-max-money"
+    # Entry calls are threaded under the header ts
+    assert calls[1]["thread_ts"] == "1700000000.0001"
+    assert calls[2]["thread_ts"] == "1700000000.0001"
 
 
 def test_deliver_explicit_channel_overrides_setting(monkeypatch):

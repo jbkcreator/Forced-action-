@@ -99,11 +99,11 @@ def run() -> None:
 def _resolve_thread(event: dict) -> str | None:
     """Map a Slack thread reply back to an opportunity_thread_id.
 
-    The digest posts all entries in one message, so a reply's ``thread_ts`` maps
-    to the digest, not a single entry. Resolving which entry a free-text reply
-    targets needs a message-ts → entry mapping (a listener-state concern, out of
-    this v1). Returns None until that mapping exists, so button taps — which
-    already carry the thread id in their payload — remain the primary path.
+    v1 limitation: the digest posts a header in the channel and per-entry cards
+    as thread replies. A reply to the header thread cannot be unambiguously
+    mapped to a single entry without a ts→opportunity store (not yet built).
+    Returns None → all thread replies are no-ops in v1; button taps are the
+    primary action path. Implement the ts→opportunity mapping when needed.
     """
     return None
 

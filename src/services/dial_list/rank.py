@@ -110,7 +110,7 @@ _REASON_BY_TRIGGER: Tuple[Tuple[str, str], ...] = (
     ("builder", "Builder / new-construction signal — larger loan likely."),
     ("maturities", "Loan maturity approaching — may need a refinance or takeout."),
     ("cash_purchase", "Cash purchase, no financing — may want leverage next deal."),
-    ("auction_probate", "Bought at auction/probate — fresh project likely forming."),
+    ("auction_probate", "Auction/probate activity detected — distressed asset, project likely forming."),
     ("exchange_1031", "1031 exchange activity — likely acquiring, may need financing."),
     ("price_drop", "Investor listing price drop — deal may be stalling, offer leverage."),
     ("expired_listing", "Investor listing expired — unsold, may need a bridge."),
@@ -160,10 +160,22 @@ def rank_dial_list(
             best[key] = (c, s, list(c.triggers))
         else:
             keep_c, keep_s, keep_triggers = best[key]
-            merged = _merge_triggers(keep_triggers, c.triggers)
+            # Only merge triggers when the same physical property appears under
+            # multiple detectors. When two different properties share a buyer
+            # entity, do NOT merge — that would show property-B's signals on
+            # property-A's card, giving Josh false context on the call.
+            same_property = keep_c.property_id == c.property_id
             if s.expected_revenue > keep_s.expected_revenue:
-                best[key] = (c, s, _merge_triggers(list(c.triggers), keep_triggers))
+                new_triggers = (
+                    _merge_triggers(list(c.triggers), keep_triggers)
+                    if same_property else list(c.triggers)
+                )
+                best[key] = (c, s, new_triggers)
             else:
+                merged = (
+                    _merge_triggers(keep_triggers, c.triggers)
+                    if same_property else keep_triggers
+                )
                 best[key] = (keep_c, keep_s, merged)
 
     # 2) sort — expected_revenue desc, deterministic tiebreak by

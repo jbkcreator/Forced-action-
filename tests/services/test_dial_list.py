@@ -80,7 +80,9 @@ def test_no_value_base_still_ranks_at_floor():
 
 
 # 6 — dedup by resolved borrower: merge triggers, keep highest score
-def test_dedup_by_borrower_merges_triggers():
+def test_dedup_by_borrower_keeps_winning_property_triggers_only():
+    # Two different properties, same borrower. Fix 7: triggers are NOT merged
+    # across properties — only the retained property's signals are shown.
     hi = _cand(property_id=1, buyer_entity_id=77, triggers=["cash_purchase"],
                intent_tier="high", assessed_value_mkt=Decimal("500000"))
     lo = _cand(property_id=2, buyer_entity_id=77, triggers=["out_of_state"],
@@ -89,8 +91,9 @@ def test_dedup_by_borrower_merges_triggers():
     assert len(result.entries) == 1
     entry = result.entries[0]
     assert entry.buyer_entity_id == 77
-    assert set(entry.triggers) == {"cash_purchase", "out_of_state"}
     assert entry.property_id == 1  # higher-scoring candidate kept
+    assert "cash_purchase" in entry.triggers   # property 1's own trigger
+    assert "out_of_state" not in entry.triggers  # property 2's trigger NOT merged
 
 
 # 7 — unresolved borrowers dedup by property, distinct properties both appear

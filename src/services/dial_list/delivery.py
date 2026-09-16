@@ -256,17 +256,31 @@ def deliver_dial_list(
         )
         return None
 
-    header, blocks = format_dial_list_digest(dial_list, interactive=interactive)
+    fallback, header_blocks = _header_blocks(dial_list)
     try:
         from slack_sdk import WebClient
 
         client = WebClient(token=token.get_secret_value())
-        response = client.chat_postMessage(channel=target, text=header, blocks=blocks)
-        logger.info(
-            "[DialList] digest posted for %s (%d entries)",
-            dial_list.generated_for, len(dial_list.entries),
+        # Post header as the channel message (single clean notification)
+        resp = client.chat_postMessage(
+            channel=target, text=fallback, blocks=header_blocks
         )
-        return response["ts"]
+        thread_ts = resp["ts"]
+        # Post each entry as a threaded reply — keeps the channel clean and
+        # stays well under Slack's 50-block-per-message limit (each card ≤ 6 blocks).
+        for entry in dial_list.entries:
+            entry_blocks = _entry_blocks(entry, dial_list.generated_for, interactive)
+            client.chat_postMessage(
+                channel=target,
+                text=f"#{entry.rank} — {_name_label(entry)}",
+                blocks=entry_blocks,
+                thread_ts=thread_ts,
+            )
+        logger.info(
+            "[DialList] digest posted for %s (%d entries, thread_ts=%s)",
+            dial_list.generated_for, len(dial_list.entries), thread_ts,
+        )
+        return thread_ts
     except Exception as exc:
         logger.error(
             "[DialList] Slack post failed for %s: %s",
