@@ -156,6 +156,47 @@ def test_financed_purchase_not_cash(db):
     assert cands == []  # mortgage present → no cash trigger, no other signal
 
 
+def test_won_opportunity_excluded_next_day(db):
+    # A candidate whose borrower thread is already coded won must not resurface.
+    pid = _prop(db)
+    db.add(Deed(property_id=pid, instrument_number="IW", sale_price=Decimal("300000"),
+                mortgage_amount=None, record_date=AS_OF - timedelta(days=30),
+                county_id="hillsborough"))
+    o = _owner(db, pid, owner_name="WON LLC")
+    _borrower(db, 900, opportunity_thread_id="THREAD-WON")
+    _link_borrower(db, o.id, 900)
+    db.flush()
+    # first: it appears
+    assert len(assemble_dial_candidates(db, as_of=AS_OF)) == 1
+    # code it won, then it disappears
+    db.add(AgentLaneOpportunityOutcome(
+        id=9001, opportunity_thread_id="THREAD-WON", outcome="won",
+        coded_by="dial_list:test", coded_at=datetime(2026, 9, 16),
+        created_at=datetime(2026, 9, 16),
+    ))
+    db.flush()
+    assert assemble_dial_candidates(db, as_of=AS_OF) == []
+
+
+def test_unrelated_terminal_outcome_does_not_exclude(db):
+    # A won outcome for a DIFFERENT thread must not filter this candidate out
+    # (guards the scoped-query fix against over-broad exclusion).
+    pid = _prop(db)
+    db.add(Deed(property_id=pid, instrument_number="IK", sale_price=Decimal("300000"),
+                mortgage_amount=None, record_date=AS_OF - timedelta(days=30),
+                county_id="hillsborough"))
+    o = _owner(db, pid, owner_name="KEEP LLC")
+    _borrower(db, 901, opportunity_thread_id="THREAD-KEEP")
+    _link_borrower(db, o.id, 901)
+    db.add(AgentLaneOpportunityOutcome(
+        id=9002, opportunity_thread_id="THREAD-OTHER", outcome="won",
+        coded_by="dial_list:test", coded_at=datetime(2026, 9, 16),
+        created_at=datetime(2026, 9, 16),
+    ))
+    db.flush()
+    assert len(assemble_dial_candidates(db, as_of=AS_OF)) == 1
+
+
 def test_out_of_state_flag(db):
     pid = _prop(db)
     _owner(db, pid, owner_name="ABSENTEE LLC", absentee_status="Out-of-State")

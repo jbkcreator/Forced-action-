@@ -250,9 +250,9 @@ _TERMINAL_OUTCOMES_SQL = text(
     SELECT opportunity_thread_id
     FROM agent_lane_opportunity_outcomes
     WHERE outcome IN ('won', 'lost')
-      AND opportunity_thread_id IS NOT NULL
+      AND opportunity_thread_id IN :thread_ids
     """
-)
+).bindparams(bindparam("thread_ids", expanding=True))
 
 _ENRICH_SQL = text(
     """
@@ -489,12 +489,22 @@ def assemble_dial_candidates(
             enrich.setdefault(row["property_id"], dict(row))
 
         # Exclude opportunities already coded won/lost — they should not
-        # resurface on the next day's list.
-        terminal_threads: set = {
-            row[0]
-            for row in session.execute(_TERMINAL_OUTCOMES_SQL)
-            if row[0] is not None
+        # resurface on the next day's list. Scope the lookup to this run's
+        # candidate threads so the query never scans the full outcomes table.
+        candidate_threads = {
+            e["opportunity_thread_id"]
+            for e in enrich.values()
+            if e.get("opportunity_thread_id")
         }
+        terminal_threads: Set[str] = set()
+        if candidate_threads:
+            terminal_threads = {
+                row[0]
+                for row in session.execute(
+                    _TERMINAL_OUTCOMES_SQL, {"thread_ids": list(candidate_threads)}
+                )
+                if row[0] is not None
+            }
 
     except SQLAlchemyError:
         logger.error(
