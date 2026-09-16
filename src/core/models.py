@@ -10178,3 +10178,51 @@ class AgentLaneOpportunityOutcome(Base):
             name="ck_alo_reason_code",
         ),
     )
+
+
+class FaMaxArvResult(Base):
+    """WP-8B canonical ARV result — one row per computed valuation of a property.
+
+    Property-keyed and spine-independent (no dependency on WP-1 opportunities).
+    New computations that change the determinative inputs INSERT a new row and
+    mark the prior row status='superseded'; an identical recompute is a no-op.
+    `low`/`high`/`point` are stored ALREADY rounded to the nearest $5,000 (single
+    rounding site, per the D6-WP7 contract). `selected_comps` + `locality_tier`
+    are internal-only and never projected onto the borrower-facing PublishedARV.
+    """
+
+    __tablename__ = "fa_max_arv_results"
+
+    arv_result_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=text("generate_uuidv7()")
+    )
+    property_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    computed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    low: Mapped[Optional[float]] = mapped_column(Numeric(14, 2))
+    high: Mapped[Optional[float]] = mapped_column(Numeric(14, 2))
+    point: Mapped[Optional[float]] = mapped_column(Numeric(14, 2))
+    confidence: Mapped[Optional[str]] = mapped_column(String(10))  # high | medium | low
+    comp_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    weak_comp: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    locality_tier: Mapped[Optional[str]] = mapped_column(String(20))  # internal only
+    selected_comps: Mapped[Optional[list]] = mapped_column(JSONB)     # internal only
+    source: Mapped[str] = mapped_column(String(50), nullable=False)
+    arv_unknown: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+    calculation_version: Mapped[str] = mapped_column(String(20), nullable=False)
+    input_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default=text("'computed'")
+    )
+    supersedes_result_id: Mapped[Optional[str]] = mapped_column(PG_UUID(as_uuid=True))
+
+    __table_args__ = (
+        Index("idx_fa_max_arv_property_computed", "property_id", "computed_at"),
+        Index("idx_fa_max_arv_property_status", "property_id", "status"),
+        CheckConstraint(
+            "status IN ('computed','superseded')", name="ck_fa_max_arv_status"
+        ),
+    )
