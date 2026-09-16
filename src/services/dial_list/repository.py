@@ -269,12 +269,12 @@ _DIAL_LIST_SOURCE_TYPES = (
 # is absent from the result (treated as stale by the caller).
 _SOURCE_FRESHNESS_SQL = text(
     """
-    SELECT source_type, MAX(run_date) AS last_success
+    SELECT source_type, county_id,
+           MAX(CASE WHEN run_success THEN run_date END) AS last_success
     FROM scraper_run_stats
     WHERE source_type IN :source_types
-      AND run_success = TRUE
       AND (:county IS NULL OR county_id = :county)
-    GROUP BY source_type
+    GROUP BY source_type, county_id
     """
 ).bindparams(bindparam("source_types", expanding=True))
 
@@ -293,7 +293,7 @@ _SNAPSHOT_LATEST_SQL = text(
     """
     SELECT payload
     FROM dial_list_snapshot
-    WHERE (:county IS NULL OR county_id = :county)
+    WHERE ((:county IS NULL AND county_id IS NULL) OR county_id = :county)
     ORDER BY generated_for DESC, created_at DESC
     LIMIT 1
     """
@@ -573,7 +573,7 @@ def assemble_dial_candidates(
         # Enrichment returned no usable contact — never surface a call with a
         # guessed contact. Hold it in the needs-enrichment queue for retry on
         # the next batch (amendment failure-behavior).
-        if not (e.get("phone_1") or e.get("canonical_name") or e.get("owner_name")):
+        if not e.get("phone_1"):
             needs_enrichment.append(pid)
             continue
         last_sale_date = _as_date(e.get("last_sale_date"))
@@ -646,17 +646,28 @@ def stale_dial_list_sources(
     must not break the digest."""
     try:
         cutoff = as_of - timedelta(days=sla_days)
-        fresh: Dict[str, Optional[date]] = {}
+        fresh: Dict[tuple[str, Optional[str]], Optional[date]] = {}
+        counties: Set[Optional[str]] = set()
         for row in session.execute(
             _SOURCE_FRESHNESS_SQL,
             {"source_types": list(_DIAL_LIST_SOURCE_TYPES), "county": county_id},
         ).mappings():
-            fresh[row["source_type"]] = _as_date(row["last_success"])
+            source = row["source_type"]
+            row_county = row["county_id"]
+            fresh[(source, row_county)] = _as_date(row["last_success"])
+            counties.add(row_county)
         stale: List[str] = []
-        for src in _DIAL_LIST_SOURCE_TYPES:
-            last = fresh.get(src)
-            if last is None or last < cutoff:
-                stale.append(src)
+        scope_counties = {county_id} if county_id is not None else counties
+        if not scope_counties:
+            scope_counties = {None}
+        for scope_county in scope_counties:
+            for src in _DIAL_LIST_SOURCE_TYPES:
+                last = fresh.get((src, scope_county))
+                if last is None or last < cutoff:
+                    stale.append(
+                        src if county_id is not None or scope_county is None
+                        else f"{src}/{scope_county}"
+                    )
         return stale
     except SQLAlchemyError:
         logger.warning("dial_list: source-staleness check failed", exc_info=True)

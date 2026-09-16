@@ -10220,12 +10220,6 @@ class DialListTouch(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
-    __table_args__ = (
-        UniqueConstraint(
-            "property_id", "generation_date", "action",
-            name="uq_dial_list_touch_prop_day_action",
-        ),
-    )
 
 
 class DialListNeedsEnrichment(Base):

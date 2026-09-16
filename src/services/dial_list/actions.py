@@ -59,7 +59,6 @@ _TOUCH_UPSERT_SQL = text(
     INSERT INTO dial_list_touch
         (opportunity_thread_id, property_id, action, actor, generation_date)
     VALUES (:thread, :property_id, :action, :actor, :generation_date)
-    ON CONFLICT (property_id, generation_date, action) DO NOTHING
     """
 )
 
@@ -72,7 +71,7 @@ def _record_touch(
     action: str,
     actor: Optional[str],
     generation_date: date,
-) -> None:
+) -> bool:
     """Persist a Called/Skip touch. Best effort — a write failure must never
     break the card update the operator just performed."""
     try:
@@ -87,12 +86,14 @@ def _record_touch(
             },
         )
         session.commit()
+        return True
     except SQLAlchemyError:
         session.rollback()
         logger.warning(
             "[DialList] touch write failed (property_id=%s action=%s)",
             property_id, action, exc_info=True,
         )
+        return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,8 +195,11 @@ def handle_action(
     # non-terminal: called / skip — no outcome row, but a durable touch record
     if action_id in _NON_TERMINAL:
         kind = _NON_TERMINAL[action_id]
-        _record_touch(session, thread=thread, property_id=data.get("property_id"),
-                      action=kind, actor=user_id, generation_date=as_of)
+        if not _record_touch(session, thread=thread, property_id=data.get("property_id"),
+                             action=kind, actor=user_id, generation_date=as_of):
+            return ActionResult(status="error", kind=kind,
+                                opportunity_thread_id=thread,
+                                message="touch persistence failed")
         updated = _apply_update(kind)
         return ActionResult(status="touched", kind=kind,
                             opportunity_thread_id=thread, updated_blocks=updated)

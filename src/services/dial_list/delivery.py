@@ -270,6 +270,7 @@ def deliver_dial_list(
         return None
 
     fallback, header_blocks = _header_blocks(dial_list)
+    posted_timestamps: List[str] = []
     try:
         from slack_sdk import WebClient
 
@@ -279,22 +280,33 @@ def deliver_dial_list(
             channel=target, text=fallback, blocks=header_blocks
         )
         thread_ts = resp["ts"]
+        posted_timestamps.append(thread_ts)
         # Post each entry as a threaded reply — keeps the channel clean and
         # stays well under Slack's 50-block-per-message limit (each card ≤ 6 blocks).
         for entry in dial_list.entries:
             entry_blocks = _entry_blocks(entry, dial_list.generated_for, interactive)
-            client.chat_postMessage(
+            entry_response = client.chat_postMessage(
                 channel=target,
                 text=f"#{entry.rank} — {_name_label(entry)}",
                 blocks=entry_blocks,
                 thread_ts=thread_ts,
             )
+            posted_timestamps.append(entry_response["ts"])
         logger.info(
             "[DialList] digest posted for %s (%d entries, thread_ts=%s)",
             dial_list.generated_for, len(dial_list.entries), thread_ts,
         )
         return thread_ts
     except Exception as exc:
+        # Avoid leaving a partial queue that a retry would duplicate. Delete
+        # children first, then the header; cleanup is best effort because the
+        # original Slack failure may also affect deletion.
+        for posted_ts in reversed(posted_timestamps):
+            try:
+                client.chat_delete(channel=target, ts=posted_ts)
+            except Exception:
+                logger.warning("[DialList] partial-post cleanup failed for %s", posted_ts,
+                               exc_info=True)
         logger.error(
             "[DialList] Slack post failed for %s: %s",
             dial_list.generated_for, exc, exc_info=True,
@@ -327,6 +339,7 @@ def generate_and_deliver(
     from .repository import (
         generate_dial_list,
         load_latest_dial_list_snapshot,
+        stale_dial_list_sources,
         write_dial_list_snapshot,
     )
 
@@ -339,10 +352,19 @@ def generate_and_deliver(
             "[DialList] live generation failed for %s — attempting cached fallback",
             as_of, exc_info=True,
         )
+        session.rollback()
         dial_list = load_latest_dial_list_snapshot(session, county_id=county_id)
         if dial_list is None:
             logger.error("[DialList] no cached snapshot to fall back to")
             raise
+        # Snapshot data describes the last good list, but source health must
+        # describe the current failed run so Slack can name stale feeds.
+        dial_list.stale_sources = stale_dial_list_sources(
+            session,
+            as_of=as_of,
+            sla_days=get_settings().dial_list_source_sla_days,
+            county_id=county_id,
+        )
     else:
         # Snapshot the fresh list best-effort — a snapshot-write failure must
         # never discard a good live list or trigger the cached fallback.

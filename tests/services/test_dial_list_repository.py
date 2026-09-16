@@ -102,7 +102,7 @@ def _prop(session, county="hillsborough", property_use_code="0100",
     # that manage their own owner (dedup, link, contact-rendering) pass
     # with_owner=False to avoid a duplicate owner row.
     if with_owner:
-        session.add(Owner(property_id=pid, owner_name=f"OWNER {pid}"))
+        session.add(Owner(property_id=pid, owner_name=f"OWNER {pid}", phone_1=f"813555{pid:04d}"))
         session.flush()
     return pid
 
@@ -113,6 +113,7 @@ def _fin(session, pid, **kw):
 
 
 def _owner(session, pid, **kw):
+    kw.setdefault("phone_1", f"813555{pid:04d}")
     o = Owner(property_id=pid, **kw)
     session.add(o)
     session.flush()
@@ -446,9 +447,20 @@ def test_no_contact_candidate_held_for_enrichment(db):
     assert row.last_seen == AS_OF + timedelta(days=1)
 
 
-def _run_stats(db, source_type, run_date, run_success=True, _seq=[0]):
+def test_name_without_phone_is_held_for_enrichment(db):
+    pid = _prop(db, with_owner=False)
+    _owner(db, pid, owner_name="NAME ONLY", phone_1=None)
+    db.add(Deed(property_id=pid, instrument_number="NAMEONLY", sale_price=Decimal("300000"),
+                mortgage_amount=None, record_date=AS_OF - timedelta(days=30),
+                county_id="hillsborough"))
+    db.flush()
+    assert assemble_dial_candidates(db, as_of=AS_OF) == []
+    assert db.query(DialListNeedsEnrichment).filter_by(property_id=pid).one().reason == "no_contact"
+
+
+def _run_stats(db, source_type, run_date, run_success=True, county_id="hillsborough", _seq=[0]):
     _seq[0] += 1
-    db.add(ScraperRunStats(id=_seq[0], source_type=source_type, county_id="hillsborough",
+    db.add(ScraperRunStats(id=_seq[0], source_type=source_type, county_id=county_id,
                            run_date=run_date, run_success=run_success))
     db.flush()
 
@@ -463,6 +475,17 @@ def test_stale_source_detected_and_fresh_not(db):
     assert "deeds" not in stale
     # sources that never ran are stale too
     assert "probate" in stale
+
+
+def test_fleet_staleness_reports_the_stale_county(db):
+    from src.services.dial_list.repository import stale_dial_list_sources
+    _run_stats(db, "deeds", AS_OF - timedelta(days=1), county_id="hillsborough")
+    _run_stats(db, "deeds", AS_OF - timedelta(days=10), county_id="pinellas")
+
+    stale = stale_dial_list_sources(db, as_of=AS_OF, sla_days=2, county_id=None)
+
+    assert "deeds/hillsborough" not in stale
+    assert "deeds/pinellas" in stale
 
 
 def test_snapshot_write_and_load_roundtrip(db):
@@ -483,6 +506,16 @@ def test_snapshot_write_and_load_roundtrip(db):
 def test_snapshot_load_none_when_empty(db):
     from src.services.dial_list.repository import load_latest_dial_list_snapshot
     assert load_latest_dial_list_snapshot(db, county_id="nowhere") is None
+
+
+def test_fleet_snapshot_does_not_load_newer_county_snapshot(db):
+    from src.services.dial_list.repository import load_latest_dial_list_snapshot, write_dial_list_snapshot
+    from src.services.dial_list.models import DialList
+    fleet = DialList(generated_for=AS_OF, entries=[], candidate_count=30, config_version="test")
+    county = DialList(generated_for=AS_OF + timedelta(days=1), entries=[], candidate_count=1, config_version="test")
+    write_dial_list_snapshot(db, fleet, county_id=None)
+    write_dial_list_snapshot(db, county, county_id="hillsborough")
+    assert load_latest_dial_list_snapshot(db, county_id=None).candidate_count == 30
 
 
 def test_generate_dial_list_populates_stale_sources(db):

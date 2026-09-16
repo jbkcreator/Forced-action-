@@ -318,10 +318,21 @@ class TestTouchDurability:
         assert rows[0].action == "called"
         assert rows[0].actor == _APPROVER
 
-    def test_duplicate_touch_is_idempotent(self):
+    def test_repeated_touches_are_all_retained(self):
         sess, DialListTouch = self._real_session()
         payload = _payload(ACTION_CALLED, _value(property_id=42))
         with patch("src.services.dial_list.actions.record_dial_disposition"):
             handle_action(payload, sess, approver_id=_APPROVER)
             handle_action(payload, sess, approver_id=_APPROVER)
-        assert sess.query(DialListTouch).count() == 1  # UNIQUE dedup
+        assert sess.query(DialListTouch).count() == 2
+
+    def test_touch_write_failure_does_not_update_card(self):
+        sess = MagicMock()
+        sess.execute.side_effect = __import__("sqlalchemy").exc.SQLAlchemyError("db down")
+        client = MagicMock()
+        result = handle_action(
+            _payload(ACTION_CALLED, _value(property_id=42)), sess,
+            approver_id=_APPROVER, client=client,
+        )
+        assert result.status == "error"
+        client.chat_update.assert_not_called()

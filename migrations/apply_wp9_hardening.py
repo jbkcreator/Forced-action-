@@ -52,8 +52,7 @@ DDL = [
         touched_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     """,
-    "CREATE UNIQUE INDEX IF NOT EXISTS uq_dial_list_touch_prop_day_action "
-    "ON dial_list_touch (property_id, generation_date, action);",
+    "DROP INDEX IF EXISTS uq_dial_list_touch_prop_day_action;",
     """
     CREATE TABLE IF NOT EXISTS dial_list_needs_enrichment (
         id BIGSERIAL PRIMARY KEY,

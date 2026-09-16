@@ -187,6 +187,7 @@ class _SecretToken:
 class _Settings:
     slack_bot_token = _SecretToken()
     dial_list_slack_channel = "#fa-max-money"
+    dial_list_source_sla_days = 2
 
 
 def _install_fakes(monkeypatch, settings=None):
@@ -243,6 +244,31 @@ def test_deliver_logs_and_returns_none_on_post_failure(monkeypatch, caplog):
     assert any("Slack post failed" in r.message for r in caplog.records)
 
 
+def test_deliver_removes_partial_thread_on_entry_failure(monkeypatch):
+    class _PartialClient(_FakeClient):
+        def __init__(self, token=None):
+            super().__init__(token)
+            self.deletes = []
+
+        def chat_postMessage(self, **kw):
+            self.calls.append(kw)
+            if len(self.calls) == 3:
+                raise RuntimeError("entry post failed")
+            return _FakeResp(ts=f"1700000000.000{len(self.calls)}")
+
+        def chat_delete(self, **kw):
+            self.deletes.append(kw)
+
+    _FakeClient.instances = []
+    monkeypatch.setattr(delivery_mod, "get_settings", lambda: _Settings())
+    import slack_sdk
+    monkeypatch.setattr(slack_sdk, "WebClient", _PartialClient)
+
+    assert deliver_dial_list(_dial_list([_entry(), _entry(property_id=2, rank=2)])) is None
+    client = _FakeClient.instances[0]
+    assert [call["ts"] for call in client.deletes] == ["1700000000.0002", "1700000000.0001"]
+
+
 # ---- cached fallback (generate_and_deliver) --------------------------------
 
 def test_generate_and_deliver_falls_back_to_cache(monkeypatch):
@@ -261,9 +287,25 @@ def test_generate_and_deliver_falls_back_to_cache(monkeypatch):
     monkeypatch.setattr(repo, "load_latest_dial_list_snapshot",
                         lambda session, county_id=None: cached)
 
-    dial_list, ts = generate_and_deliver(object(), as_of=AS_OF)
+    session = pytest.importorskip("unittest.mock").MagicMock()
+    dial_list, ts = generate_and_deliver(session, as_of=AS_OF)
     assert dial_list.from_cache is True
     assert ts == "1700000000.0001"  # posted the cached list
+
+
+def test_cached_fallback_rolls_back_failed_transaction(monkeypatch):
+    from sqlalchemy.exc import SQLAlchemyError
+    import src.services.dial_list.repository as repo
+    from src.services.dial_list.delivery import generate_and_deliver
+
+    _install_fakes(monkeypatch)
+    cached = _dial_list([_entry()], from_cache=True)
+    session = pytest.importorskip("unittest.mock").MagicMock()
+    monkeypatch.setattr(repo, "generate_dial_list", lambda *a, **k: (_ for _ in ()).throw(SQLAlchemyError("db down")))
+    monkeypatch.setattr(repo, "load_latest_dial_list_snapshot", lambda *a, **k: cached)
+
+    generate_and_deliver(session, as_of=AS_OF)
+    session.rollback.assert_called_once()
 
 
 def test_generate_and_deliver_reraises_when_no_cache(monkeypatch):
@@ -282,7 +324,7 @@ def test_generate_and_deliver_reraises_when_no_cache(monkeypatch):
                         lambda session, county_id=None: None)
 
     with pytest.raises(SQLAlchemyError):
-        generate_and_deliver(object(), as_of=AS_OF)
+        generate_and_deliver(pytest.importorskip("unittest.mock").MagicMock(), as_of=AS_OF)
 
 
 def test_generate_and_deliver_snapshots_on_success(monkeypatch):
