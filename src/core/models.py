@@ -11258,3 +11258,132 @@ class FaMaxWorkQueue(Base):
             f"<FaMaxWorkQueue(work_item_id={self.work_item_id!r}, "
             f"queue={self.queue_name!r}, status={self.status!r})>"
         )
+
+
+# ============================================================================
+# WP-7 — Self-serve pre-fill path (tracked links)
+# ============================================================================
+
+class TrackedLink(Base):
+    """A partner/campaign/mailer-specific URL into the self-serve pre-fill flow.
+
+    `property_id` is set for per-property mailers (the primary v1 experience —
+    instant recognition on click) and NULL for generic partner/campaign links,
+    which fall back to address entry resolved through BaseLoader's matching
+    waterfall. See tasks/FA_Max_build/dev2_wp7_selfserve_prefill_plan.md WI-1.
+    """
+    __tablename__ = "tracked_links"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    slug: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    label: Mapped[str] = mapped_column(Text, nullable=False)
+    partner_ref: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    campaign_ref: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    property_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("properties.id"), nullable=True
+    )
+    destination: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_by: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "kind IN ('partner', 'campaign', 'source', 'property_mailer')",
+            name="ck_tracked_links_kind",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return f"<TrackedLink(id={self.id}, slug={self.slug!r}, kind={self.kind!r})>"
+
+
+class TrackedLinkClick(Base):
+    """One row per click on a TrackedLink. `ip_hash` is a salted hash, never
+    the raw IP. `session_token` ties this click to the selfserve session the
+    borrower then fills out."""
+    __tablename__ = "tracked_link_clicks"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    tracked_link_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("tracked_links.id"), nullable=False
+    )
+    clicked_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+    ip_hash: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    user_agent: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    referer: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    session_token: Mapped[str] = mapped_column(Text, nullable=False)
+
+    __table_args__ = (
+        Index("idx_link_clicks_link", "tracked_link_id", "clicked_at"),
+        Index("idx_link_clicks_session", "session_token"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<TrackedLinkClick(id={self.id}, link={self.tracked_link_id})>"
+
+
+class SelfserveSession(Base):
+    """One self-serve pre-fill session (WP-7 WI-3).
+
+    Two identity FKs, not one — a real, confirmed gap in this codebase, not
+    speculative design (see plan §1.5): `buyer_entity_id` is the WP-3/WP-4
+    deed-side identity (BuyerEntity), `person_id` is the WP-1 governance-side
+    identity (FaMaxPerson, required by relay_approval_queue's live CHECK
+    constraint for any outbound send this session later triggers). Nothing in
+    this codebase bridges the two yet — both are resolved independently here.
+
+    `prefill_snapshot` is immutable after creation — same discipline as
+    DealRoom.properties_snapshot, and for the same reason: the audit record of
+    what the borrower was actually shown.
+    """
+    __tablename__ = "selfserve_sessions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    token: Mapped[str] = mapped_column(PG_UUID(as_uuid=False), nullable=False, unique=True)
+    tracked_link_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("tracked_links.id"), nullable=True
+    )
+    property_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("properties.id"), nullable=True
+    )
+    buyer_entity_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("buyer_entities.id"), nullable=True
+    )
+    person_id: Mapped[Optional[str]] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("fa_max_persons.person_id"), nullable=True
+    )
+    prefill_snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    corrections: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    confirmations: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    contact: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="started")
+    handoff_ref: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    handed_off_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+    last_activity_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('started', 'prefilled', 'confirmed', 'handed_off', 'abandoned')",
+            name="ck_selfserve_sessions_status",
+        ),
+        Index("idx_selfserve_status", "status", "started_at"),
+        Index("idx_selfserve_person", "person_id"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<SelfserveSession(id={self.id}, token={self.token!r}, status={self.status!r})>"
