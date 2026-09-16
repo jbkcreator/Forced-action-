@@ -2,16 +2,18 @@
 Manual merge and unmerge operations for buyer entities.
 
 merge_entities()   — collapses two buyer_entities rows into one, moving all
-                     buyer_entity_links, borrower_ledger_events, and
-                     borrower_monitor_log rows from the absorbed entity to the
-                     surviving entity (both ledger/monitor FKs are ON DELETE
-                     CASCADE, so this must happen before the absorbed row is
-                     deleted or its whole history is destroyed), snapshotting
-                     the absorbed row, then deleting it.
+                     buyer_entity_links, borrower_ledger_events,
+                     borrower_monitor_log, and closer_calls rows from the
+                     absorbed entity to the surviving entity (the ledger/
+                     monitor FKs are ON DELETE CASCADE and would silently
+                     destroy history; closer_calls.buyer_entity_id has no
+                     ondelete clause at all, so an unmoved row there raises a
+                     raw FK violation on the DELETE below), snapshotting the
+                     absorbed row, then deleting it.
 
 unmerge_entity()   — reverses a logged merge: restores the absorbed entity from
-                     its snapshot, moves its links/ledger events/monitor log
-                     rows back, and marks the log row reversed.
+                     its snapshot, moves its links/ledger events/monitor log/
+                     closer_calls rows back, and marks the log row reversed.
 
 These functions are for manual corrections and admin-driven operations only.
 The nightly resolver (buyer_entity_resolution.run_incremental) never calls them —
@@ -126,6 +128,21 @@ def merge_entities(
     )
     moved_monitor_log_ids = [row[0] for row in monitor_result.fetchall()]
 
+    # closer_calls.buyer_entity_id has no ondelete clause at all (defaults to
+    # Postgres NO ACTION) -- an unmoved row here isn't silently lost like the
+    # cascaded tables above, it raises a raw FK violation on the DELETE below.
+    # Uniqued only on aircall_call_id, so reassignment can never conflict.
+    closer_call_result = session.execute(
+        text("""
+            UPDATE closer_calls
+               SET buyer_entity_id = :surviving_id
+             WHERE buyer_entity_id = :absorbed_id
+             RETURNING id
+        """),
+        {"surviving_id": surviving_id, "absorbed_id": absorbed_id},
+    )
+    moved_closer_call_ids = [row[0] for row in closer_call_result.fetchall()]
+
     session.execute(
         text("DELETE FROM buyer_entities WHERE id = :id"),
         {"id": absorbed_id},
@@ -144,6 +161,7 @@ def merge_entities(
         moved_link_ids=moved_link_ids,
         moved_ledger_event_ids=moved_ledger_event_ids,
         moved_monitor_log_ids=moved_monitor_log_ids,
+        moved_closer_call_ids=moved_closer_call_ids,
         merged_by=merged_by,
         merge_reason=reason,
     )
@@ -152,9 +170,9 @@ def merge_entities(
 
     logger.info(
         "merge_entities: absorbed entity %d into %d (%d links, %d ledger events, "
-        "%d monitor log rows moved) by %s",
+        "%d monitor log rows, %d closer calls moved) by %s",
         absorbed_id, surviving_id, links_moved, len(moved_ledger_event_ids),
-        len(moved_monitor_log_ids), merged_by,
+        len(moved_monitor_log_ids), len(moved_closer_call_ids), merged_by,
     )
     return log
 
@@ -244,9 +262,10 @@ def unmerge_entity(
             merge_log_id, len(moved_link_ids), links_returned, log["surviving_id"],
         )
 
-    # moved_ledger_event_ids / moved_monitor_log_ids are None for merges logged
-    # before these columns existed -- nothing to restore, not an error (the
-    # links restore above is the load-bearing part for those legacy rows).
+    # moved_ledger_event_ids / moved_monitor_log_ids / moved_closer_call_ids
+    # are None for merges logged before these columns existed -- nothing to
+    # restore, not an error (the links restore above is the load-bearing
+    # part for those legacy rows).
     moved_ledger_event_ids = log["moved_ledger_event_ids"]
     if moved_ledger_event_ids:
         session.execute(
@@ -275,6 +294,22 @@ def unmerge_entity(
             {
                 "restored_id": restored.id,
                 "moved_monitor_log_ids": moved_monitor_log_ids,
+                "surviving_id": log["surviving_id"],
+            },
+        )
+
+    moved_closer_call_ids = log["moved_closer_call_ids"]
+    if moved_closer_call_ids:
+        session.execute(
+            text("""
+                UPDATE closer_calls
+                   SET buyer_entity_id = :restored_id
+                 WHERE id = ANY(:moved_closer_call_ids)
+                   AND buyer_entity_id = :surviving_id
+            """),
+            {
+                "restored_id": restored.id,
+                "moved_closer_call_ids": moved_closer_call_ids,
                 "surviving_id": log["surviving_id"],
             },
         )

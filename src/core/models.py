@@ -9374,6 +9374,7 @@ class BuyerEntityMergeLog(Base):
     moved_link_ids: Mapped[Optional[list]] = mapped_column(JSONB)
     moved_ledger_event_ids: Mapped[Optional[list]] = mapped_column(JSONB)
     moved_monitor_log_ids: Mapped[Optional[list]] = mapped_column(JSONB)
+    moved_closer_call_ids: Mapped[Optional[list]] = mapped_column(JSONB)
     merged_by: Mapped[str] = mapped_column(String(100), nullable=False)
     merge_reason: Mapped[Optional[str]] = mapped_column(Text)
     merged_at: Mapped[datetime] = mapped_column(

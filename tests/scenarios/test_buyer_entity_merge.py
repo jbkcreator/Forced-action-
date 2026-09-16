@@ -275,6 +275,86 @@ def test_merge_then_unmerge_moves_ledger_events_and_monitor_log():
         _cleanup(entity_ids, merge_log_ids)
 
 
+def test_merge_then_unmerge_moves_closer_calls():
+    """
+    Regression: closer_calls.buyer_entity_id has NO ondelete clause at all
+    (Postgres default NO ACTION, unlike the CASCADE FKs above) -- before the
+    fix, merging an absorbed entity with call history didn't move its
+    closer_calls rows first, so DELETE FROM buyer_entities raised a raw FK
+    violation and the merge failed outright (surfaced to the admin as a
+    generic 500). unmerge_entity() must move the row back to the restored
+    entity.
+    """
+    token = f"ZMERGECALL{_uid()}".upper()
+    entity_ids: list[int] = []
+    merge_log_ids: list[int] = []
+    closer_call_ids: list[int] = []
+    try:
+        with get_db_context() as session:
+            survivor_id, _ = _make_entity(session, canonical_name=f"{token} SURVIVOR", n_links=1)
+            absorbed_id, _ = _make_entity(session, canonical_name=f"{token} ABSORBED", n_links=1)
+        entity_ids.extend([survivor_id, absorbed_id])
+
+        with get_db_context() as session:
+            closer_call_id = session.execute(
+                text("""
+                    INSERT INTO closer_calls (aircall_call_id, buyer_entity_id)
+                    VALUES (:call_id, :eid)
+                    RETURNING id
+                """),
+                {"call_id": f"ztest-{_uid()}", "eid": absorbed_id},
+            ).scalar_one()
+            session.commit()
+        closer_call_ids.append(closer_call_id)
+
+        with get_db_context() as session:
+            # Before the fix this raised sqlalchemy.exc.IntegrityError (FK
+            # violation on closer_calls_buyer_entity_id_fkey) instead of
+            # returning a log row.
+            log = merge_entities(
+                session, surviving_id=survivor_id, absorbed_id=absorbed_id,
+                merged_by="test:wp4", reason="closer_calls regression test",
+            )
+            merge_log_id = log.id
+            session.commit()
+        merge_log_ids.append(merge_log_id)
+
+        with get_db_context() as session:
+            log_row = session.execute(
+                text("SELECT moved_closer_call_ids FROM buyer_entity_merge_log WHERE id = :id"),
+                {"id": merge_log_id},
+            ).mappings().one()
+            assert log_row["moved_closer_call_ids"] == [closer_call_id]
+
+            owner = session.execute(
+                text("SELECT buyer_entity_id FROM closer_calls WHERE id = :id"),
+                {"id": closer_call_id},
+            ).scalar_one()
+            assert owner == survivor_id, "closer call must move to survivor, not block the merge"
+
+        with get_db_context() as session:
+            restored = unmerge_entity(session, merge_log_id=merge_log_id, reversed_by="test:wp4")
+            restored_id = restored.id
+            session.commit()
+        entity_ids.append(restored_id)
+
+        with get_db_context() as session:
+            owner_after = session.execute(
+                text("SELECT buyer_entity_id FROM closer_calls WHERE id = :id"),
+                {"id": closer_call_id},
+            ).scalar_one()
+            assert owner_after == restored_id, "unmerge must return the closer call to the restored entity"
+    finally:
+        with get_db_context() as session:
+            if closer_call_ids:
+                session.execute(
+                    text("DELETE FROM closer_calls WHERE id = ANY(:ids)"),
+                    {"ids": closer_call_ids},
+                )
+            session.commit()
+        _cleanup(entity_ids, merge_log_ids)
+
+
 def test_unmerge_raises_when_moved_link_ids_missing():
     """A merge_log row logged before moved_link_ids existed (NULL) must refuse
     to unmerge rather than fall back to a timestamp guess that could steal
