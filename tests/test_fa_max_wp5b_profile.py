@@ -1026,16 +1026,10 @@ class TestWorkQueueScheduling:
         entity_id = _fresh_buyer_entity(fresh_db)
         _set_person_entity_link(fresh_db, person_id, entity_id)
         prop_id = _insert_property(fresh_db)
-        # Link the entity to the property via buyer_entity_links (source_table='properties')
-        fresh_db.execute(
-            text("""
-                INSERT INTO buyer_entity_links (buyer_entity_id, source_table, source_id,
-                                                match_confidence, match_method)
-                VALUES (:eid, 'properties', :prop_id, 90, 'exact_name_address')
-                ON CONFLICT (source_table, source_id) DO NOTHING
-            """),
-            {"eid": entity_id, "prop_id": prop_id},
-        )
+        # Insert a deed for this property, then link the entity to that deed row
+        # (buyer_entity_links.source_table='deeds' is the valid link type for
+        #  deed-discovered entities; 'properties' violates the CHECK constraint)
+        deed_id = _insert_deed(fresh_db, prop_id, entity_id, 300_000)
         fresh_db.commit()
 
         schedule_profile_recompute_for_property(fresh_db, prop_id, "new_deed")

@@ -206,7 +206,10 @@ class DeedLoader(BaseLoader):
                                     self.session, property_record.id, "new_deed"
                                 )
                             except Exception:
-                                pass
+                                logger.warning(
+                                    "Failed to schedule profile recompute for property %s after deed %s",
+                                    property_record.id, instrument,
+                                )
                         else:
                             unmatched += 1
 

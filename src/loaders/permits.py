@@ -182,7 +182,10 @@ class BuildingPermitLoader(BaseLoader):
                                 self.session, property_record.id, "new_permit"
                             )
                         except Exception:
-                            pass
+                            logger.warning(
+                                "Failed to schedule profile recompute for property %s after permit %s",
+                                property_record.id, record_number,
+                            )
                     else:
                         unmatched += 1
 

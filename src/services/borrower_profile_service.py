@@ -610,8 +610,11 @@ def schedule_profile_recompute_for_property(
 ) -> None:
     """Enqueue profile recomputes for all fa_max_persons linked to property_id.
 
-    Looks up persons via buyer_entity_links → fa_max_persons. No-op if no
-    persons are linked (pre-WP-3/WP-4 state). Each enqueue is idempotent.
+    Resolves persons via the deed-link path:
+      buyer_entity_links(source_table='deeds') → deeds.property_id → fa_max_persons
+
+    No-op when no persons are linked (pre-WP-3/WP-4 state). Each enqueue is
+    idempotent via the partial unique index on idempotency_key.
     """
     rows = session.execute(
         text("""
@@ -619,10 +622,11 @@ def schedule_profile_recompute_for_property(
             FROM fa_max_persons p
             JOIN buyer_entity_links bel
               ON bel.buyer_entity_id = p.buyer_entity_id
-             AND bel.source_table = 'properties'
-             AND bel.source_id = :prop_id
-            WHERE p.buyer_entity_id IS NOT NULL
-              AND p.merged_into IS NULL
+             AND bel.source_table = 'deeds'
+            JOIN deeds d ON d.id = bel.source_id
+            WHERE d.property_id = :prop_id
+              AND p.buyer_entity_id IS NOT NULL
+              AND p.merged_into_id IS NULL
         """),
         {"prop_id": property_id},
     ).mappings().all()

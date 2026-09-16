@@ -136,14 +136,14 @@ def _drain_recompute_queue(session) -> int:
             text("""
                 UPDATE fa_max_work_queue
                 SET status = 'claimed', claimed_at = NOW()
-                WHERE id IN (
-                    SELECT id FROM fa_max_work_queue
+                WHERE work_item_id IN (
+                    SELECT work_item_id FROM fa_max_work_queue
                     WHERE queue_name = :qname AND status = 'available'
                     ORDER BY created_at
                     LIMIT :batch
                     FOR UPDATE SKIP LOCKED
                 )
-                RETURNING id, person_id::text
+                RETURNING work_item_id, person_id::text
             """),
             {"qname": _QUEUE_NAME, "batch": _QUEUE_BATCH},
         ).mappings().all()
@@ -153,12 +153,12 @@ def _drain_recompute_queue(session) -> int:
             break
 
         for row in rows:
-            item_id = row["id"]
+            item_id = row["work_item_id"]
             person_id = row["person_id"]
             try:
                 compute_person_profile(session, person_id)
                 session.execute(
-                    text("UPDATE fa_max_work_queue SET status='done', done_at=NOW() WHERE id=:id"),
+                    text("UPDATE fa_max_work_queue SET status='done', done_at=NOW() WHERE work_item_id=:id"),
                     {"id": item_id},
                 )
                 session.commit()
@@ -166,7 +166,7 @@ def _drain_recompute_queue(session) -> int:
             except Exception:
                 session.rollback()
                 session.execute(
-                    text("UPDATE fa_max_work_queue SET status='failed' WHERE id=:id"),
+                    text("UPDATE fa_max_work_queue SET status='failed' WHERE work_item_id=:id"),
                     {"id": item_id},
                 )
                 session.commit()
