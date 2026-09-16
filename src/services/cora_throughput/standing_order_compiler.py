@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy import text
 
 from config.settings import get_settings
+from src.agents.cora.kill_switch import cora_halted
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +135,15 @@ def _post_standing_order_proposal(standing_order_id: int, cell_id: str, rule_tex
 
 
 def compile_standing_orders(db: Any) -> Dict[str, Any]:
-    """One sweep pass. Returns a dict of what was proposed, for logging/tests."""
+    """One sweep pass. Returns a dict of what was proposed, for logging/tests.
+
+    Gated on Cora's kill switch (cora_halted()) — proposing new standing
+    orders (which post to the same approvals channel) while Cora is stopped
+    makes no sense and would keep the channel noisy after a "STOP CORA".
+    """
+    if cora_halted():
+        return {"proposed": []}
+
     proposed: List[Dict[str, Any]] = []
     for cell_id in _cell_ids_with_decided_history(db):
         if _has_existing_proposal(db, cell_id):
