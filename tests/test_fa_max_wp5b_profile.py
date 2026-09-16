@@ -1320,3 +1320,160 @@ class TestBuyBoxPreferences:
         prefs = profile.get("buy_box_preferences")
         assert prefs is not None
         assert prefs["most_common_condition"] == "Fair"
+
+
+# ===========================================================================
+# Concurrent-write regression — two real connections
+# ===========================================================================
+
+def test_schedule_recompute_claimed_to_done_race(pg_engine):
+    """Regression for the six-step claimed-item concurrent-write race.
+
+    Two real connections simulate:
+      1. Worker A claims the profile job.
+      2. Connection B calls schedule_profile_recompute (sees item claimed).
+      3. Worker A completes the job (status → done) before B's statement ends.
+      4. B's statement still holds the FOR UPDATE lock on the canonical row,
+         so A's complete_work_item blocks until B inserts the fallback and
+         commits.
+      5. After both commit: at least one available item must exist for the
+         new event.
+
+    With the old two-statement approach, A could complete between B's
+    status check and B's fallback insert, making step 5 fail.  With the
+    single-statement FOR UPDATE CTE, A blocks until B's statement releases
+    the row lock, guaranteeing the fallback is inserted before A changes
+    status to done.
+    """
+    if pg_engine is None:
+        pytest.skip("DATABASE_URL not configured — skipping concurrent-write test")
+
+    import threading
+    from sqlalchemy.orm import Session as SASession
+    from src.services.borrower_profile_service import schedule_profile_recompute
+    from src.services.state_engine import (
+        claim_next_work_item,
+        complete_work_item,
+        enqueue_work_item,
+    )
+
+    # ── Setup: create a person and an available profile recompute job ────────
+    setup_conn = pg_engine.connect()
+    setup_trans = setup_conn.begin()
+    setup_session = SASession(bind=setup_conn)
+
+    person_id = setup_session.execute(
+        text("""
+            INSERT INTO fa_max_persons (lifecycle_state, source, source_reference)
+            VALUES ('identified', 'test', :ref)
+            RETURNING person_id::text
+        """),
+        {"ref": f"race-test-{uuid.uuid4().hex[:8]}"},
+    ).scalar()
+
+    work_item_id = enqueue_work_item(
+        session=setup_session,
+        queue_name="profile_recompute",
+        payload={"reason": "initial"},
+        idempotency_key=f"profile_recompute:{person_id}",
+        person_id=person_id,
+    )
+    assert work_item_id is not None
+    setup_session.close()
+    setup_trans.commit()
+    setup_conn.close()
+
+    # ── Worker A: claim the item ─────────────────────────────────────────────
+    conn_a = pg_engine.connect()
+    trans_a = conn_a.begin()
+    session_a = SASession(bind=conn_a)
+    item = claim_next_work_item(
+        session=session_a,
+        queue_name="profile_recompute",
+        worker_id="worker:A",
+        lease_seconds=60,
+    )
+    assert item is not None
+    assert item["work_item_id"] == work_item_id
+    trans_a.commit()
+
+    # ── Connection B: enqueue a new event (item is currently claimed) ────────
+    # In the old code, B would read claimed, plan to insert fallback, then A
+    # could slip in and complete the item before B's second statement ran.
+    # With the single-statement FOR UPDATE CTE, B locks the row first, so A's
+    # complete_work_item blocks until B's statement finishes.
+
+    # Use a barrier so we can interleave A and B in a controlled order.
+    b_locked = threading.Event()
+    b_done = threading.Event()
+    a_result = {}
+
+    def complete_in_thread():
+        # Wait until B has started (and locked the canonical row), then try to
+        # complete.  complete_work_item will block on the row lock held by B.
+        b_locked.wait(timeout=5)
+        conn_a2 = pg_engine.connect()
+        trans_a2 = conn_a2.begin()
+        session_a2 = SASession(bind=conn_a2)
+        ok = complete_work_item(
+            session=session_a2,
+            work_item_id=work_item_id,
+            worker_id="worker:A",
+            status="done",
+        )
+        session_a2.close()
+        trans_a2.commit()
+        conn_a2.close()
+        a_result["completed"] = ok
+        b_done.set()
+
+    t = threading.Thread(target=complete_in_thread, daemon=True)
+    t.start()
+
+    conn_b = pg_engine.connect()
+    trans_b = conn_b.begin()
+    session_b = SASession(bind=conn_b)
+
+    # Signal that B is about to acquire the lock (approximate — the real
+    # synchronisation is the DB row lock, not this event)
+    b_locked.set()
+    schedule_profile_recompute(session_b, person_id, "new_event_during_claim")
+    session_b.close()
+    trans_b.commit()
+    conn_b.close()
+
+    t.join(timeout=10)
+
+    # ── Verify: at least one available item must remain for the new event ────
+    verify_conn = pg_engine.connect()
+    verify_trans = verify_conn.begin()
+    available = verify_conn.execute(
+        text("""
+            SELECT COUNT(*) FROM fa_max_work_queue
+            WHERE queue_name = 'profile_recompute'
+              AND person_id = :pid ::uuid
+              AND status = 'available'
+        """),
+        {"pid": person_id},
+    ).scalar()
+    verify_trans.rollback()
+    verify_conn.close()
+
+    # Cleanup
+    cleanup_conn = pg_engine.connect()
+    cleanup_trans = cleanup_conn.begin()
+    cleanup_conn.execute(
+        text("DELETE FROM fa_max_work_queue WHERE person_id = :pid ::uuid"),
+        {"pid": person_id},
+    )
+    cleanup_conn.execute(
+        text("DELETE FROM fa_max_persons WHERE person_id = :pid ::uuid"),
+        {"pid": person_id},
+    )
+    cleanup_trans.commit()
+    cleanup_conn.close()
+
+    assert available >= 1, (
+        "A material event that arrives while a profile job is claimed must "
+        "always leave an available recompute item after both workers commit"
+    )

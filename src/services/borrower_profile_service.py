@@ -581,78 +581,79 @@ def _jsonb(value: Any) -> Optional[str]:
 def schedule_profile_recompute(session: Session, person_id: str, reason: str) -> None:
     """Enqueue a profile recomputation for person_id via fa_max_work_queue.
 
-    Three cases handled atomically:
+    Four cases handled in a single atomic SQL statement:
 
-    1. No existing item → insert (available).
-    2. Existing item is done/failed → reactivate it (available) so the new
-       event triggers a fresh recompute; prevents permanent deduplication where
-       the first drain blocks all future events for the same person.
-    3. Existing item is available → leave it; pending work covers this event.
-    4. Existing item is claimed (worker mid-compute) → the worker will complete
-       before seeing this event.  Insert a NEW item with an event-specific key
-       so the event is never silently lost.
+    1. No canonical row exists → INSERT a fresh available item.  ON CONFLICT
+       handles the rare concurrent-first-insert race.
+    2. Canonical row is done/failed → reactivate it (set status='available').
+    3. Canonical row is available → leave it untouched; pending work covers
+       this event.
+    4. Canonical row is claimed (worker mid-compute) → INSERT a fallback row
+       with a per-event key so the event is not lost.
+
+    Cases 2-4 first lock the canonical row with FOR UPDATE in the `canonical`
+    CTE, which prevents a concurrent complete_work_item() from changing the
+    status between the lock acquisition and the fallback INSERT.  The entire
+    decision runs inside one SQL statement and one lock scope.
     """
     idempotency_key = f"profile_recompute:{person_id}"
     payload_json = _jsonb({"reason": reason})
-    params = {
-        "ikey": idempotency_key,
-        "person_id": person_id,
-        "payload": payload_json,
-    }
-
-    # Statement 1: insert or reactivate a done/failed item.
-    # Returns a row when an insert or a reactivation actually happened.
-    row = session.execute(
-        text("""
-            INSERT INTO fa_max_work_queue (
-                queue_name, idempotency_key, person_id, payload, status,
-                created_at, updated_at
-            ) VALUES (
-                'profile_recompute', :ikey, :person_id ::uuid,
-                CAST(:payload AS jsonb), 'available', NOW(), NOW()
-            )
-            ON CONFLICT (idempotency_key)
-            WHERE idempotency_key IS NOT NULL
-            DO UPDATE
-               SET status     = 'available',
-                   payload    = CAST(:payload AS jsonb),
-                   done_at    = NULL,
-                   updated_at = NOW()
-             WHERE fa_max_work_queue.status IN ('done', 'failed')
-            RETURNING work_item_id
-        """),
-        params,
-    ).fetchone()
-
-    if row is not None:
-        return  # inserted or reactivated — done
-
-    # Statement 2: the conflict row is available (fine) or claimed (must not
-    # drop the event).  Insert a new item only when the conflict row is
-    # currently claimed — a unique per-event key avoids a second conflict.
     session.execute(
         text("""
+            WITH canonical AS (
+                -- Lock the canonical row (if any) for the duration of this
+                -- statement.  Prevents complete_work_item() from slipping
+                -- between our status check and the fallback insert.
+                SELECT work_item_id, status
+                FROM fa_max_work_queue
+                WHERE idempotency_key = :ikey
+                  AND idempotency_key IS NOT NULL
+                FOR UPDATE
+            ),
+            reactivate AS (
+                UPDATE fa_max_work_queue wq
+                SET status     = 'available',
+                    payload    = CAST(:payload AS jsonb),
+                    done_at    = NULL,
+                    updated_at = NOW()
+                FROM canonical c
+                WHERE wq.work_item_id = c.work_item_id
+                  AND c.status IN ('done', 'failed')
+            ),
+            fallback AS (
+                INSERT INTO fa_max_work_queue (
+                    queue_name, idempotency_key, person_id, payload, status,
+                    created_at, updated_at
+                )
+                SELECT 'profile_recompute',
+                       :fallback_key,
+                       :person_id ::uuid,
+                       CAST(:payload AS jsonb),
+                       'available',
+                       NOW(), NOW()
+                FROM canonical c
+                WHERE c.status = 'claimed'
+            )
             INSERT INTO fa_max_work_queue (
                 queue_name, idempotency_key, person_id, payload, status,
                 created_at, updated_at
             )
             SELECT 'profile_recompute',
-                   :fallback_key,
+                   :ikey,
                    :person_id ::uuid,
                    CAST(:payload AS jsonb),
                    'available',
                    NOW(), NOW()
-            WHERE EXISTS (
-                SELECT 1 FROM fa_max_work_queue
-                WHERE idempotency_key = :ikey
-                  AND status = 'claimed'
-            )
+            WHERE NOT EXISTS (SELECT 1 FROM canonical)
+            ON CONFLICT (idempotency_key)
+            WHERE idempotency_key IS NOT NULL
+            DO NOTHING
         """),
         {
+            "ikey": idempotency_key,
             "fallback_key": f"{idempotency_key}:retry:{uuid4()}",
             "person_id": person_id,
             "payload": payload_json,
-            "ikey": idempotency_key,
         },
     )
 
