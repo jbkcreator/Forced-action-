@@ -102,6 +102,23 @@ def test_rerun_is_idempotent(db):
     assert _count(db) == 1
 
 
+def test_conflicting_tap_returns_canonical_stored_outcome(db):
+    # Thread is coded 'won'; a later 'lost' tap is a no-op write, but the
+    # result must report the CANONICAL stored outcome ('won'), not the attempt
+    # ('lost') — so a Slack card updated from it cannot diverge from the DB.
+    record_dial_disposition(
+        db, opportunity_thread_id="T6", outcome="won", as_of=AS_OF
+    )
+    conflicting = record_dial_disposition(
+        db, opportunity_thread_id="T6", outcome="lost",
+        loss_code="price", as_of=AS_OF,
+    )
+    assert conflicting.inserted is False
+    assert conflicting.outcome == "won"       # stored, not the attempted 'lost'
+    assert conflicting.reason_code is None     # the 'won' row carries no code
+    assert _count(db) == 1
+
+
 def test_source_ref_is_deterministic(db):
     a = record_dial_disposition(
         db, opportunity_thread_id="T4", outcome="won", as_of=AS_OF

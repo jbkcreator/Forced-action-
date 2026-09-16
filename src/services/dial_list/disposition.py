@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Optional
 
+from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -114,10 +115,28 @@ def record_dial_disposition(
         )
         raise
 
+    # When nothing was inserted the thread was already terminal — report the
+    # CANONICAL stored outcome, not the attempted one, so a caller updating a
+    # Slack card shows the real DB state (a later 'lost' tap on a 'won' thread
+    # must not display 'lost'). record_win/record_loss return only a bool, so
+    # read the persisted row back here.
+    result_outcome, result_code = outcome, loss_code
+    if not inserted:
+        stored = session.execute(
+            text(
+                "SELECT outcome, reason_code FROM agent_lane_opportunity_outcomes "
+                "WHERE opportunity_thread_id = :tid"
+            ),
+            {"tid": opportunity_thread_id},
+        ).mappings().first()
+        if stored is not None:
+            result_outcome = stored["outcome"]
+            result_code = stored["reason_code"]
+
     return DispositionResult(
         opportunity_thread_id=opportunity_thread_id,
-        outcome=outcome,
-        reason_code=loss_code,
+        outcome=result_outcome,
+        reason_code=result_code,
         source_ref=source_ref,
         inserted=inserted,
     )

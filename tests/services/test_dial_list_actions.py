@@ -216,6 +216,34 @@ class TestHandleAction:
                           approver_id=_APPROVER, client=client)
         client.chat_update.assert_called_once()
 
+    def test_conflicting_tap_shows_canonical_not_attempted(self):
+        # Thread already 'won'; a 'lost' tap returns inserted=False with the
+        # canonical stored outcome. The card + result must show 'won', not 'lost'.
+        from src.services.dial_list.disposition import DispositionResult
+        sess = self._fake_session()
+        client = MagicMock()
+        canonical = DispositionResult(
+            opportunity_thread_id=_THREAD, outcome="won", reason_code=None,
+            source_ref="dial_list:OPP-XYZ:2026-09-16", inserted=False,
+        )
+        lost_payload = {
+            "user": {"id": _APPROVER},
+            "channel": {"id": "C123"},
+            "message": {"ts": "111.222",
+                        "blocks": [{"type": "actions", "block_id": "dial_act:1"}]},
+            "actions": [{"action_id": ACTION_LOST, "block_id": "dial_act:1",
+                         "selected_option": {"value": _value(loss_code="price")}}],
+        }
+        with patch("src.services.dial_list.actions.record_dial_disposition",
+                   return_value=canonical):
+            result = handle_action(lost_payload, sess, approver_id=_APPROVER, client=client)
+        assert result.kind == "won"          # canonical stored, not attempted 'lost'
+        assert result.loss_code is None
+        # the card status block was rendered with the canonical 'won'
+        _, kwargs = client.chat_update.call_args
+        rendered = json.dumps(kwargs["blocks"])
+        assert "Won" in rendered and "Lost" not in rendered
+
 
 # ---------------------------------------------------------------------------
 # parse_thread_reply tests
