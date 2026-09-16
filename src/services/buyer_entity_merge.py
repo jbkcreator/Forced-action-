@@ -19,7 +19,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
 
 from src.core.models import BuyerEntity, BuyerEntityMergeLog
@@ -77,6 +77,42 @@ def merge_entities(
     )
     links_moved = result.rowcount
 
+    # Reassign the absorbed entity's append-only history BEFORE deleting it —
+    # borrower_ledger_events and borrower_monitor_log both FK buyer_entities with
+    # ON DELETE CASCADE, so a bare delete would silently wipe the audit trail the
+    # module is meant to preserve. Capture the moved ids so unmerge can reverse.
+    moved_ledger_ids = [
+        r[0] for r in session.execute(
+            text("SELECT id FROM borrower_ledger_events WHERE buyer_entity_id = :absorbed_id"),
+            {"absorbed_id": absorbed_id},
+        ).all()
+    ]
+    if moved_ledger_ids:
+        session.execute(
+            text("""
+                UPDATE borrower_ledger_events
+                   SET buyer_entity_id = :surviving_id
+                 WHERE buyer_entity_id = :absorbed_id
+            """),
+            {"surviving_id": surviving_id, "absorbed_id": absorbed_id},
+        )
+
+    moved_monitor_ids = [
+        r[0] for r in session.execute(
+            text("SELECT id FROM borrower_monitor_log WHERE buyer_entity_id = :absorbed_id"),
+            {"absorbed_id": absorbed_id},
+        ).all()
+    ]
+    if moved_monitor_ids:
+        session.execute(
+            text("""
+                UPDATE borrower_monitor_log
+                   SET buyer_entity_id = :surviving_id
+                 WHERE buyer_entity_id = :absorbed_id
+            """),
+            {"surviving_id": surviving_id, "absorbed_id": absorbed_id},
+        )
+
     session.execute(
         text("DELETE FROM buyer_entities WHERE id = :id"),
         {"id": absorbed_id},
@@ -94,13 +130,17 @@ def merge_entities(
         links_moved=links_moved,
         merged_by=merged_by,
         merge_reason=reason,
+        moved_ledger_event_ids=moved_ledger_ids,
+        moved_monitor_log_ids=moved_monitor_ids,
     )
     session.add(log)
     session.flush()
 
     logger.info(
-        "merge_entities: absorbed entity %d into %d (%d links moved) by %s",
-        absorbed_id, surviving_id, links_moved, merged_by,
+        "merge_entities: absorbed entity %d into %d (%d links, %d ledger events, "
+        "%d monitor rows moved) by %s",
+        absorbed_id, surviving_id, links_moved,
+        len(moved_ledger_ids), len(moved_monitor_ids), merged_by,
     )
     return log
 
@@ -165,6 +205,29 @@ def unmerge_entity(
         },
     )
     links_returned = result.rowcount
+
+    # Move the exact append-only history rows that were reassigned during the
+    # merge back onto the restored entity.
+    moved_ledger_ids = list(log["moved_ledger_event_ids"] or [])
+    if moved_ledger_ids:
+        session.execute(
+            text("""
+                UPDATE borrower_ledger_events
+                   SET buyer_entity_id = :restored_id
+                 WHERE id IN :ids
+            """).bindparams(bindparam("ids", expanding=True)),
+            {"restored_id": restored.id, "ids": moved_ledger_ids},
+        )
+    moved_monitor_ids = list(log["moved_monitor_log_ids"] or [])
+    if moved_monitor_ids:
+        session.execute(
+            text("""
+                UPDATE borrower_monitor_log
+                   SET buyer_entity_id = :restored_id
+                 WHERE id IN :ids
+            """).bindparams(bindparam("ids", expanding=True)),
+            {"restored_id": restored.id, "ids": moved_monitor_ids},
+        )
 
     session.execute(
         text("""

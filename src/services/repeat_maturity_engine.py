@@ -244,14 +244,23 @@ def _check_dscr_day120(session: Session, today: date) -> list[MonitorAlert]:
 
 def _check_portfolio_expansion(session: Session, today: date) -> list[MonitorAlert]:
     """
-    Buyers whose total_purchase_count just crossed a milestone (3, 5, 10) via a
-    deed_acquisition in the last 7 days.
+    Buyers who have CROSSED a milestone (3, 5, 10) via a deed_acquisition in the
+    last 7 days.
+
+    total_purchase_count is a batch recompute (refresh_portfolio_aggregates), so
+    a single sweep can jump an active buyer past a milestone (2→4, 4→6) without
+    ever landing exactly on it. Matching on `>=` the highest crossed milestone —
+    and deduping on the highest milestone already alerted (stored monitor_value)
+    — means a skipped milestone still fires, and each milestone fires at most
+    once per entity.
     """
     lookback = today - timedelta(days=_EXPANSION_LOOKBACK_DAYS)
     milestones = list(_EXPANSION_MILESTONES)
+    min_milestone = min(milestones)
 
-    # DISTINCT ON (buyer_entity_id) — take only the latest acquisition per entity
-    # so one entity crossing a milestone emits at most one alert per run.
+    # DISTINCT ON (buyer_entity_id) — one alert per entity per run. `milestone`
+    # is the highest configured milestone the current count has reached; the
+    # NOT EXISTS suppresses it only if an equal-or-higher milestone already fired.
     rows = session.execute(text("""
         SELECT DISTINCT ON (ble.buyer_entity_id)
             ble.id              AS event_id,
@@ -263,21 +272,30 @@ def _check_portfolio_expansion(session: Session, today: date) -> list[MonitorAle
             be.total_purchase_count,
             be.total_cash_volume,
             be.buyer_type,
-            be.financing_signal
+            be.financing_signal,
+            (SELECT max(m) FROM unnest(:milestones) AS m
+                 WHERE m <= be.total_purchase_count) AS milestone
         FROM borrower_ledger_events ble
         JOIN buyer_entities be ON be.id = ble.buyer_entity_id
         LEFT JOIN properties p ON p.id = ble.property_id
         WHERE ble.event_type = 'deed_acquisition'
           AND ble.event_date >= :lookback
-          AND be.total_purchase_count = ANY(:milestones)
+          AND be.total_purchase_count >= :min_milestone
           AND NOT EXISTS (
               SELECT 1 FROM borrower_monitor_log bml
               WHERE bml.buyer_entity_id = ble.buyer_entity_id
                 AND bml.monitor_type = 'portfolio_expansion'
-                AND bml.source_event_id = ble.id
+                AND bml.monitor_value >= (
+                    SELECT max(m) FROM unnest(:milestones) AS m
+                        WHERE m <= be.total_purchase_count
+                )
           )
         ORDER BY ble.buyer_entity_id, ble.id DESC
-    """), {"lookback": lookback, "milestones": milestones}).mappings().all()
+    """), {
+        "lookback": lookback,
+        "milestones": milestones,
+        "min_milestone": min_milestone,
+    }).mappings().all()
 
     alerts = []
     for r in rows:
@@ -293,7 +311,7 @@ def _check_portfolio_expansion(session: Session, today: date) -> list[MonitorAle
             total_cash_volume=float(r["total_cash_volume"] or 0),
             buyer_type=r["buyer_type"],
             financing_signal=r["financing_signal"],
-            extra={"milestone": r["total_purchase_count"]},
+            extra={"milestone": r["milestone"]},
         ))
     return alerts
 
@@ -409,14 +427,15 @@ def _post_alert(alert: MonitorAlert) -> Optional[str]:
 def _record_fired(session: Session, alert: MonitorAlert, slack_ts: Optional[str]) -> None:
     session.execute(text("""
         INSERT INTO borrower_monitor_log
-            (buyer_entity_id, monitor_type, source_event_id, slack_ts)
+            (buyer_entity_id, monitor_type, source_event_id, monitor_value, slack_ts)
         VALUES
-            (:entity_id, :monitor_type, :source_event_id, :slack_ts)
+            (:entity_id, :monitor_type, :source_event_id, :monitor_value, :slack_ts)
         ON CONFLICT (buyer_entity_id, monitor_type, source_event_id) DO NOTHING
     """), {
         "entity_id": alert.buyer_entity_id,
         "monitor_type": alert.monitor_type,
         "source_event_id": alert.source_event_id,
+        "monitor_value": alert.extra.get("milestone"),
         "slack_ts": slack_ts,
     })
 

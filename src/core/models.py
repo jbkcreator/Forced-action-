@@ -9356,6 +9356,15 @@ class BuyerEntityMergeLog(Base):
     reversed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     reversed_by: Mapped[Optional[str]] = mapped_column(String(100))
     restored_id: Mapped[Optional[int]] = mapped_column(Integer)
+    # Append-only history rows reassigned absorbed→surviving during the merge, so
+    # unmerge can move exactly those back (they carry no linked_at heuristic and
+    # would otherwise be lost to the buyer_entities ON DELETE CASCADE).
+    moved_ledger_event_ids: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb"),
+    )
+    moved_monitor_log_ids: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb"),
+    )
 
     surviving_entity: Mapped["BuyerEntity"] = relationship(
         "BuyerEntity", foreign_keys="[BuyerEntityMergeLog.surviving_id]",
