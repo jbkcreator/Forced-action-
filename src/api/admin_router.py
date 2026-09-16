@@ -1671,6 +1671,53 @@ async def slack_interact(request: Request, background_tasks: BackgroundTasks, db
     return _slack_ephemeral(f"Unrecognized action: {action_id}")
 
 
+@router.post("/slack/events")
+async def slack_events(request: Request):
+    """Slack Events API endpoint for Relay card thread actions.
+
+    The same HMAC verification used for button interactivity applies here.
+    Only exact ``approve`` and ``reject`` replies are commands; normal
+    conversation in a queue-card thread is deliberately left untouched.
+    """
+    raw = await request.body()
+    if not _verify_slack_signature(dict(request.headers), raw):
+        raise HTTPException(status_code=401, detail="Invalid Slack signature")
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Malformed payload")
+    if payload.get("type") == "url_verification":
+        return {"challenge": payload.get("challenge", "")}
+    if payload.get("type") == "event_callback":
+        _handle_relay_thread_action(payload)
+    return {"ok": True}
+
+
+def _handle_relay_thread_action(payload: dict) -> None:
+    """Turn an authorized exact command in a Relay card thread into a
+    regular durable Relay decision."""
+    event = payload.get("event") or {}
+    if event.get("type") != "message" or event.get("subtype") or event.get("bot_id"):
+        return
+    command = str(event.get("text") or "").strip().casefold()
+    if command not in {"approve", "reject"}:
+        return
+    thread_ts = event.get("thread_ts")
+    user_id = event.get("user")
+    if not thread_ts or not user_id:
+        return
+    from src.services.relay import queue as relay_queue
+    item = relay_queue.get_item_by_slack_message_ts(str(thread_ts))
+    if item is None or not _relay_approver_authorized(str(user_id), item.venture_key):
+        return
+    # Reuse the normal decision path, including its pending-row CAS, state
+    # transition transaction, interaction audit, and Slack-card update.
+    _handle_relay_decision({
+        "user": {"id": str(user_id)},
+        "actions": [{"value": json.dumps({"item_id": item.id, "action": command})}],
+    })
+
+
 @router.post("/slack/county-launch/interact")
 async def slack_county_launch_interact(request: Request, db: Session = Depends(get_db)):
     """Deprecated individual URL — kept as an alias until the Slack app's
@@ -1820,7 +1867,7 @@ def _relay_approver_authorized(user_id: str, venture_key: Optional[str] = None) 
 
 
 def _update_relay_slack_message(
-    slack_message_ts: str, reply_text: str, venture_key: str = DEFAULT_VENTURE_KEY,
+    item, reply_text: str,
 ) -> None:
     """Replace the Approve/Reject buttons with the decision outcome, in
     place. Mirrors _update_slack_message's county-launch pattern.
@@ -1829,25 +1876,18 @@ def _update_relay_slack_message(
     channel cannot be edited in another, so using a single global channel here
     would fail every edit for every venture but the first.
     """
-    from src.utils.venture_config import get_venture_config
+    from src.services.relay.slack_post import _resolve_channel
 
     token = settings.slack_bot_token
-    # `or settings.relay_slack_channel` rather than relying on the resolver's
-    # own settings fallback: the resolver reads config.settings.get_settings(),
-    # which can be a different object from this module's `settings` binding
-    # (see the note in tests/test_relay_slack_endpoints.py's fixture).
-    channel = (
-        get_venture_config(venture_key).relay_slack_channel
-        or settings.relay_slack_channel
-    )
-    if not token or not channel or not slack_message_ts:
+    channel = _resolve_channel(item, settings)
+    if not token or not channel or not item.slack_message_ts:
         return
     try:
         from slack_sdk import WebClient
         client = WebClient(token=token.get_secret_value())
         client.chat_update(
             channel=channel,
-            ts=slack_message_ts,
+            ts=item.slack_message_ts,
             text=reply_text,
             blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": reply_text}}],
         )
@@ -1867,8 +1907,20 @@ async def slack_relay_decision(request: Request):
 
 def _handle_relay_decision(payload: dict) -> dict:
     """Approve/Reject a pending Relay approval-queue item (build spec
-    §1.1.13 tap surface)."""
+    §1.1.13 tap surface).
+
+    For FA Max items (venture_key='fa_max_lending'): if the approved item's
+    payload contains a 'fa_max_transition' key, calls state_engine.transition()
+    to advance the FA Max person/opportunity state as part of the same approval.
+    Approval and its required state transition commit atomically. A failed
+    transition leaves the queue item pending and returns a refusal reason.
+    """
+    import logging as _logging
+
     from src.services.relay import queue as relay_queue
+
+    _log = _logging.getLogger(__name__)
+    _FA_MAX_VENTURE = "fa_max_lending"
 
     user_id = payload.get("user", {}).get("id", "")
 
@@ -1896,17 +1948,124 @@ def _handle_relay_decision(payload: dict) -> dict:
     if existing is None:
         return _slack_ephemeral(f"Item #{item_id} not found.")
 
-    item = relay_queue.record_decision(item_id, approved=(action == "approve"), decided_by=user_id)
-    if item is None:
-        return _slack_ephemeral(f"Item #{item_id} was already decided (not still pending).")
+    has_fa_transition = (
+        action == "approve"
+        and existing.venture_key == _FA_MAX_VENTURE
+        and isinstance(existing.payload, dict)
+        and existing.payload.get("fa_max_transition")
+    )
+    if has_fa_transition:
+        # Lock the queue row, perform the state transition, and persist approval
+        # in one transaction. Any failure rolls both operations back, leaving
+        # the card pending and therefore impossible for Relay to dispatch.
+        spec = existing.payload["fa_max_transition"]
+        try:
+            from src.services.state_engine import (
+                get_opportunity_state,
+                get_person_state,
+                transition,
+                TransitionOutcome,
+            )
+            from src.core.database import get_db_context as _get_db
+
+            entity_type = spec.get("entity_type", "person")
+            entity_uuid = spec["entity_uuid"]
+
+            with _get_db() as _db:
+                item = relay_queue.get_item_for_update(item_id, session=_db)
+                if item is None or item.status != "pending":
+                    return _slack_ephemeral(
+                        f"Item #{item_id} was already decided (not still pending)."
+                    )
+                spec = item.payload["fa_max_transition"]
+                # Load current state now, at approval time, rather than trusting
+                # spec["from_state"] — that value was written into the payload
+                # when the item was enqueued, which can be hours or days before
+                # Josh actually presses Approve, and the entity may have moved
+                # via a different path (another agent, another Slack lane) in
+                # the meantime. transition() is a CAS write keyed on from_state:
+                # a stale value here silently reports already_advanced instead
+                # of applying the transition Josh actually approved.
+                if entity_type == "opportunity":
+                    current = get_opportunity_state(session=_db, opportunity_id=entity_uuid)
+                    current_from_state = current.get("current_stage") if current else None
+                else:
+                    current = get_person_state(session=_db, person_id=entity_uuid)
+                    current_from_state = current.get("lifecycle_state") if current else None
+
+                if current is None:
+                    _log.error(
+                        "FA Max state transition on relay approval: entity not found "
+                        "item=%d entity_type=%s entity_uuid=%s",
+                        item.id, entity_type, entity_uuid,
+                    )
+                    raise ValueError("transition entity not found")
+
+                if current_from_state != spec.get("from_state"):
+                    _log.warning(
+                        "FA Max state transition on relay approval: stale from_state "
+                        "in payload (expected %r, actual %r) — proceeding with actual "
+                        "current state item=%d entity=%s",
+                        spec.get("from_state"), current_from_state, item.id, entity_uuid,
+                    )
+
+                # person_id must be stamped on every event row regardless of
+                # entity_type (person or opportunity) — it is the borrower-
+                # history partition key get_person_history() reads. Both
+                # get_person_state() and get_opportunity_state() return
+                # "person_id" in their dict for exactly this reason. Omitting
+                # it here would silently make this transition invisible to
+                # the borrower's history — no error, just a missing row.
+                person_id_for_event = current.get("person_id")
+
+                result = transition(
+                    entity_type=entity_type,
+                    entity_uuid=entity_uuid,
+                    from_state=current_from_state,
+                    to_state=spec["to_state"],
+                    actor=f"slack_approver:{user_id}",
+                    source_component="src.api.admin_router",
+                    idempotency_key=spec.get("idempotency_key"),
+                    state_version=current.get("state_version"),
+                    decision_id=spec.get("decision_id"),
+                    person_id=person_id_for_event,
+                    session=_db,
+                )
+                if result.outcome not in (
+                    TransitionOutcome.succeeded, TransitionOutcome.idempotent_skip,
+                ):
+                    raise ValueError(f"state transition refused: {result.outcome.value}")
+                item = relay_queue.record_decision(
+                    item_id, approved=True, decided_by=user_id, session=_db,
+                )
+                if item is None:
+                    raise ValueError("queue item is no longer pending")
+        except Exception as exc:
+            _log.error(
+                "FA Max state transition failed on relay approval item=%d: %s",
+                item_id, exc,
+            )
+            return _slack_ephemeral(
+                f"Approval held: required state transition failed for item #{item_id}."
+            )
+    else:
+        item = relay_queue.record_decision(
+            item_id, approved=(action == "approve"), decided_by=user_id,
+        )
+        if item is None:
+            return _slack_ephemeral(
+                f"Item #{item_id} was already decided (not still pending)."
+            )
 
     reply_text = (
         f":white_check_mark: Approved by <@{user_id}>."
         if action == "approve"
         else f":no_entry: Rejected by <@{user_id}>."
     )
+    if item.lane:
+        reply_text += f"  Lane: `{item.lane}`"
     if item.slack_message_ts:
-        _update_relay_slack_message(item.slack_message_ts, reply_text, item.venture_key)
+        _update_relay_slack_message(item, reply_text)
 
     return {"ok": True}
 

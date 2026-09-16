@@ -24,8 +24,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import logging
+
 from config.settings import get_settings
 from config.venture_template import DEFAULT_VENTURE_KEY
+
+logger = logging.getLogger(__name__)
+
+_FA_MAX_VENTURE = "fa_max_lending"
 from src.core.database import get_db_context
 from src.core.redis_client import rdecr, rincr
 from src.services.compliance_gator import validate_outbound
@@ -70,6 +76,51 @@ def _suppression_reason(item: QueueItem) -> str | None:
     return None   # 'noop' and any future non-contact channel
 
 
+def _fa_max_compliance_reason(item: QueueItem) -> str | None:
+    """FA Max-specific pre-send compliance checks (WP-2).
+
+    Returns a block reason string if the item must not be sent, or None if
+    clear. Called before _suppression_reason so 10DLC block is visible in
+    the refusal log even when the contact is also suppressed.
+
+    Only applies to items with venture_key='fa_max_lending'.
+    """
+    if item.venture_key != _FA_MAX_VENTURE:
+        return None
+
+    if item.channel == "sms" and not get_settings().fa_max_10dlc_registered:
+        return "fa_max_10dlc_not_registered"
+
+    if item.channel not in ("email", "sms"):
+        return "unsupported_fa_max_channel"
+
+    from src.services.fa_max_send_governance import (
+        GovernanceBlocked,
+        backflip_campaign_reason,
+        require_consent,
+        validate_safe_payload,
+    )
+
+    if not item.person_id or not item.agent_name or not item.autonomy_tier_at_send or not item.lane:
+        return "missing_governance_fields"
+    if not item.decided_by or not item.decision_interaction_id:
+        return "human_approval_required"
+    try:
+        validate_safe_payload(item.payload or {})
+    except GovernanceBlocked as exc:
+        return exc.reason
+    with get_db_context() as db:
+        campaign_reason = backflip_campaign_reason(
+            db, recipient=item.recipient, channel=item.channel,
+        )
+        if campaign_reason:
+            return campaign_reason
+        consent = require_consent(db, person_id=item.person_id, channel=item.channel)
+        if not consent.allowed:
+            return consent.reason
+    return None
+
+
 def evaluate(item: QueueItem, *, now: datetime, venture=None) -> Verdict:
     """`venture` is the resolved VentureConfig for the batch (CLONE-v2.2 /
     CL3) — its send window governs the check. Omitted, the check falls back
@@ -78,6 +129,12 @@ def evaluate(item: QueueItem, *, now: datetime, venture=None) -> Verdict:
 
     if not _within_send_window(now, settings):
         return Verdict(DEFER, REASON_OUTSIDE_SEND_WINDOW)
+
+    # FA Max compliance check must run before suppression so 10DLC block
+    # appears in the refusal log even when the contact is also suppressed.
+    fa_cause = _fa_max_compliance_reason(item)
+    if fa_cause is not None:
+        return Verdict(BLOCK, f"{REASON_SUPPRESSED}:{fa_cause}")
 
     cause = _suppression_reason(item)
     if cause is not None:
