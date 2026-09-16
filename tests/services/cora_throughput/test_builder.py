@@ -65,6 +65,35 @@ def test_build_batch_no_eligible_drafts(fresh_db):
     assert result == {"created": False, "reason": "no_eligible_drafts"}
 
 
+def test_build_batch_skips_when_cora_is_killed(fresh_db, monkeypatch):
+    """STOP CORA / STOP CORA FOREVER must stop new batches from being built
+    and posted to the approvals channel — not just Cora's own worker loop."""
+    monkeypatch.setattr(builder, "cora_halted", lambda: True)
+    posted = []
+    monkeypatch.setattr(builder.batch_slack, "post_batch_for_approval", lambda *a, **k: posted.append(1) or None)
+    seed_draft(fresh_db, "DRAFT-KILLED-1")
+
+    result = builder.build_batch(fresh_db)
+
+    assert result == {"created": False, "reason": "cora_halted"}
+    assert posted == []
+
+
+def test_expire_stale_batches_skips_when_cora_is_killed(fresh_db, monkeypatch):
+    monkeypatch.setattr(builder, "cora_halted", lambda: True)
+    fresh_db.execute(
+        text(
+            "INSERT INTO cora_draft_batches (batch_id, status, created_at) "
+            "VALUES ('BATCH-STALE-KILLED', 'pending', now() - interval '73 hours')"
+        ),
+    )
+
+    expired = builder.expire_stale_batches(fresh_db)
+
+    assert expired == 0
+    assert _batch_row(fresh_db, "BATCH-STALE-KILLED")["status"] == "pending"
+
+
 def test_build_batch_auto_approves_standing_order_covered_drafts(fresh_db, monkeypatch):
     monkeypatch.setattr(builder.batch_slack, "post_batch_for_approval", lambda *a, **k: None)
     enqueue_calls = []
@@ -202,6 +231,20 @@ def test_repost_unposted_batch_skips_batch_with_no_included_items(monkeypatch):
         builder.batch_slack, "post_batch_for_approval", lambda *a, **k: calls.append(1) or "ts",
     )
     db = _FakeDB("BATCH-EMPTY", [])
+
+    assert builder.repost_unposted_batch(db) is False
+    assert calls == []
+    assert db.updates == []
+
+
+def test_repost_unposted_batch_skips_when_cora_is_killed(monkeypatch):
+    _stub_power_block(monkeypatch)
+    monkeypatch.setattr(builder, "cora_halted", lambda: True)
+    calls = []
+    monkeypatch.setattr(
+        builder.batch_slack, "post_batch_for_approval", lambda *a, **k: calls.append(1) or "ts",
+    )
+    db = _FakeDB("BATCH-STRANDED", [_draft_row()])
 
     assert builder.repost_unposted_batch(db) is False
     assert calls == []

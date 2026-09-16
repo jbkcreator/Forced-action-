@@ -665,3 +665,65 @@ def get_subscriber_memory_timeline(
 
 	with _session(session) as s:
 		return get_subscriber_memory(s, subscriber_id, limit=limit)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FA MAX — Person state (WP-1)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@tool(category="read")
+def get_fa_max_person_state(
+	person_id: str,
+	session: Optional[Session] = None,
+) -> Dict[str, Any]:
+	"""Load FA Max person lifecycle state. Returns empty dict when not found.
+
+	Use as the first node in any FA Max LangGraph graph: call this, abort
+	processing if the result is empty (person not registered), then proceed.
+	This matches the _node_load_profile abort-if-not-found pattern.
+
+	Compliance: the returned dict contains NO financial data fields.
+	"""
+	from src.services.state_engine import get_person_state
+
+	with _session(session) as s:
+		result = get_person_state(session=s, person_id=person_id)
+		return result if result is not None else {}
+
+
+@tool(category="read")
+def get_fa_max_person_history(
+	person_id: str,
+	limit: int = 100,
+	after_seq: Optional[int] = None,
+	session: Optional[Session] = None,
+) -> Dict[str, Any]:
+	"""Return one page of the unified ordered history for an FA Max person.
+
+	Covers all entity types associated with this person (their opportunities,
+	linked properties, interactions) via the person_id partition key on
+	fa_max_state_transition_events.
+
+	Returns one page (up to `limit` events, oldest first) plus `has_more`
+	and `next_cursor` for callers that need the complete history. Pass the
+	returned cursor back as `after_seq` to continue.
+
+	Satisfies WP-1 Done When: 'complete ordered history of a borrower can be
+	queried.'
+	"""
+	from src.services.state_engine import get_borrower_timeline
+
+	with _session(session) as s:
+		page = get_borrower_timeline(
+			session=s,
+			person_id=person_id,
+			limit=limit,
+			after_seq=after_seq,
+		)
+		return {
+			"person_id": person_id,
+			"events": page["events"],
+			"count": len(page["events"]),
+			"has_more": page["has_more"],
+			"next_cursor": page["next_cursor"],
+		}

@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy import text
 
 from src.agents.cora import store
+from src.agents.cora.kill_switch import cora_halted
 from src.services.cora_throughput import batch_slack, power_block
 from src.services.cora_throughput.decisions import auto_approve_draft
 
@@ -72,7 +73,13 @@ def repost_unposted_batch(db: Any) -> bool:
 
     Runs before build_batch in the sweep so a recovered batch is posted on the
     first pass after Slack comes back, rather than one expiry-cycle later.
+
+    Gated on Cora's kill switch (cora_halted()) — this posts new content to
+    the approvals channel, so "STOP CORA" must silence it same as build_batch.
     """
+    if cora_halted():
+        return False
+
     batch_id = _unposted_pending_batch_id(db)
     if batch_id is None:
         return False
@@ -129,7 +136,15 @@ def build_batch(db: Any) -> Dict[str, Any]:
     Runs one batch-construction pass. Returns a dict describing what
     happened (for logging/tests) — never raises for the normal "nothing to
     do" case.
+
+    Gated on Cora's kill switch (cora_halted()) first: this is the only
+    THROUGH-v2.2 entry point that both creates new content in the approvals
+    channel AND bypasses it entirely (standing-order auto-approve straight
+    to Relay), so it must stop "STOP CORA" / "STOP CORA FOREVER" the same
+    way src.agents.cora.worker/validation already do for Cora's own runtime.
     """
+    if cora_halted():
+        return {"created": False, "reason": "cora_halted"}
     if _has_pending_batch(db):
         return {"created": False, "reason": "batch_already_pending"}
 
@@ -216,7 +231,15 @@ def expire_stale_batches(db: Any) -> int:
     (only an approve/reject decision ever changes that), so they are automatically
     eligible for the next build_batch() pass. A Slack nudge is posted so the
     founder knows a batch was re-queued.
+
+    Gated on Cora's kill switch (cora_halted()) — also posts to the
+    approvals channel; while halted, build_batch() won't re-queue expired
+    items into a new batch anyway, so expiring here would just be a Slack
+    notification about a re-queue that isn't happening.
     """
+    if cora_halted():
+        return 0
+
     from config.settings import get_settings
     expiry_hours = get_settings().cora_batch_expiry_hours
 

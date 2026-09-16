@@ -71,6 +71,7 @@ from src.services.relay.config import (
     STATUS_REJECTED,
     STATUS_SENT,
     STATUS_SKIPPED,
+    STATUS_UNCERTAIN,
 )
 
 
@@ -96,6 +97,19 @@ class QueueItem:
     # keeps working unchanged; _COLUMNS_SQL below picks the column up
     # automatically from the dataclass fields.
     venture_key: str = DEFAULT_VENTURE_KEY
+    # FA Max WP-2: operating lane, acting agent, autonomy tier. All three are
+    # nullable so non-FA-Max items (venture_key != 'fa_max_lending') are
+    # unaffected; their columns return NULL and the defaults below keep every
+    # existing call site working with zero changes.
+    lane: Optional[str] = None            # MONEY | EXCEPTIONS | RELATIONSHIPS
+    agent_name: Optional[str] = None      # e.g. "vera", "hunter", "cora"
+    autonomy_tier_at_send: Optional[str] = None  # A | B | C
+    person_id: Optional[str] = None
+    autonomy_gate_reason: Optional[str] = None
+    decision_interaction_id: Optional[str] = None
+    send_interaction_id: Optional[str] = None
+    slack_post_attempted_at: Optional[datetime] = None
+    slack_post_lease_until: Optional[datetime] = None
 
 
 _QUEUE_ITEM_COLUMNS = tuple(f.name for f in fields(QueueItem))
@@ -103,7 +117,9 @@ _COLUMNS_SQL = ", ".join(_QUEUE_ITEM_COLUMNS)
 
 
 def _row_to_item(row: dict) -> QueueItem:
-    return QueueItem(**{col: row[col] for col in _QUEUE_ITEM_COLUMNS})
+    # Old/fake rows used by non-FA-Max callers may predate optional WP-2
+    # columns. Dataclass defaults preserve that compatibility.
+    return QueueItem(**{col: row[col] for col in _QUEUE_ITEM_COLUMNS if col in row})
 
 
 def enqueue(
@@ -114,6 +130,10 @@ def enqueue(
     payload: dict,
     thread_id: Optional[str] = None,
     venture_key: str = DEFAULT_VENTURE_KEY,
+    lane: Optional[str] = None,
+    agent_name: Optional[str] = None,
+    autonomy_tier_at_send: Optional[str] = None,
+    person_id: Optional[str] = None,
     skip_contract_validation: bool = False,
 ) -> QueueItem:
     """Write a new 'pending' row. Called by Cora/THROUGH (Phase 2) and by
@@ -157,6 +177,46 @@ def enqueue(
 
     try:
         with get_db_context() as session:
+            gate_reason = None
+            if venture_key == "fa_max_lending":
+                from src.services.fa_max_autonomy import check_tier_gate
+                from src.services.fa_max_send_governance import (
+                    GovernanceBlocked,
+                    LANES,
+                    require_consent,
+                    suppression_reason,
+                    validate_safe_payload,
+                )
+
+                missing = [name for name, value in (
+                    ("lane", lane), ("agent_name", agent_name),
+                    ("autonomy_tier_at_send", autonomy_tier_at_send),
+                    ("person_id", person_id),
+                ) if not value]
+                if missing:
+                    raise GovernanceBlocked("missing_governance_fields:" + ",".join(missing))
+                if lane not in LANES:
+                    raise GovernanceBlocked(f"invalid_lane:{lane}")
+                if channel not in ("email", "sms"):
+                    raise GovernanceBlocked(f"unsupported_fa_max_channel:{channel}")
+                validate_safe_payload(payload)
+                consent = require_consent(
+                    session, person_id=str(person_id), channel=channel,
+                )
+                if not consent.allowed:
+                    raise GovernanceBlocked(consent.reason)
+                suppressed = suppression_reason(
+                    session, recipient=recipient, channel=channel,
+                )
+                if suppressed:
+                    raise GovernanceBlocked(f"suppressed:{suppressed}")
+                gate = check_tier_gate(str(agent_name), str(autonomy_tier_at_send), session)
+                gate_reason = gate.outcome.value
+                # Pending items need a Slack human decision. Graduation gates
+                # autonomous sends, not drafts Josh explicitly approves.
+                if gate_reason == "unknown_tier":
+                    raise GovernanceBlocked("unknown_autonomy_tier")
+
             item = RelayApprovalQueueItem(
                 idempotency_key=idempotency_key,
                 channel=channel,
@@ -165,6 +225,11 @@ def enqueue(
                 thread_id=thread_id,
                 status=STATUS_PENDING,
                 venture_key=venture_key,
+                lane=lane,
+                agent_name=agent_name,
+                autonomy_tier_at_send=autonomy_tier_at_send,
+                person_id=person_id,
+                autonomy_gate_reason=gate_reason,
             )
             session.add(item)
             session.flush()
@@ -176,7 +241,51 @@ def enqueue(
         raise
     item = get_item(item_id)
     assert item is not None  # just inserted in the same call
+    if venture_key == "fa_max_lending":
+        # The row is committed before contacting Slack. A failed post stays
+        # pending and the posting sweep can retry it after a restart.
+        from src.services.relay.slack_post import post_for_approval
+        post_for_approval(item)
     return item
+
+
+def unposted_fa_max_items(limit: int = 50) -> list[QueueItem]:
+    """Pending FA Max cards eligible for a posting retry."""
+    with get_db_context() as session:
+        rows = session.execute(
+            text(f"SELECT {_COLUMNS_SQL} FROM relay_approval_queue "
+                 "WHERE venture_key = 'fa_max_lending' AND status = 'pending' "
+                 "AND slack_message_ts IS NULL "
+                 "AND (slack_post_lease_until IS NULL OR slack_post_lease_until < now()) "
+                 "ORDER BY created_at LIMIT :limit"),
+            {"limit": limit},
+        ).mappings().all()
+        return [_row_to_item(dict(row)) for row in rows]
+
+
+def claim_slack_post(item_id: int) -> Optional[datetime]:
+    """Lease one unposted card across concurrent posting workers."""
+    with get_db_context() as session:
+        return session.execute(
+            text("UPDATE relay_approval_queue SET "
+                 "slack_post_attempted_at = now(), "
+                 "slack_post_lease_until = now() + interval '10 minutes', updated_at = now() "
+                 "WHERE id = :id AND venture_key = 'fa_max_lending' "
+                 "AND status = 'pending' AND slack_message_ts IS NULL "
+                 "AND (slack_post_lease_until IS NULL OR slack_post_lease_until < now()) "
+                 "RETURNING slack_post_lease_until"),
+            {"id": item_id},
+        ).scalar_one_or_none()
+
+
+def release_slack_post(item_id: int, lease_until: datetime) -> None:
+    with get_db_context() as session:
+        session.execute(
+            text("UPDATE relay_approval_queue SET slack_post_lease_until = NULL "
+                 "WHERE id = :id AND slack_post_lease_until = :lease_until "
+                 "AND slack_message_ts IS NULL"),
+            {"id": item_id, "lease_until": lease_until},
+        )
 
 
 def get_item(item_id: int) -> Optional[QueueItem]:
@@ -202,20 +311,54 @@ def get_item_by_idempotency_key(idempotency_key: str) -> Optional[QueueItem]:
         return _row_to_item(dict(row)) if row else None
 
 
-def set_slack_message_ts(item_id: int, slack_message_ts: str) -> None:
+def get_item_by_slack_message_ts(slack_message_ts: str) -> Optional[QueueItem]:
+    """Resolve the root Slack card for a thread reply.
+
+    Slack identifies a thread by the root message's ``ts``.  Looking up that
+    persisted value keeps thread actions on the same durable queue row as the
+    button action; it never trusts an item id supplied in free-form text.
+    """
+    with get_db_context() as session:
+        row = session.execute(
+            text(
+                f"SELECT {_COLUMNS_SQL} FROM relay_approval_queue "
+                "WHERE slack_message_ts = :ts"
+            ),
+            {"ts": slack_message_ts},
+        ).mappings().first()
+        return _row_to_item(dict(row)) if row else None
+
+
+def set_slack_message_ts(
+    item_id: int, slack_message_ts: str, *, lease_until: Optional[datetime] = None,
+) -> None:
     """Record the posted Slack message's ts so the decision webhook can
     edit that message in place once Josh responds."""
+    condition = " AND slack_post_lease_until = :lease_until" if lease_until is not None else ""
+    params = {"ts": slack_message_ts, "id": item_id}
+    if lease_until is not None:
+        params["lease_until"] = lease_until
     with get_db_context() as session:
         session.execute(
-            text(
-                "UPDATE relay_approval_queue SET slack_message_ts = :ts, "
-                "updated_at = now() WHERE id = :id"
-            ),
-            {"ts": slack_message_ts, "id": item_id},
+            text("UPDATE relay_approval_queue SET slack_message_ts = :ts, "
+                 "slack_post_lease_until = NULL, updated_at = now() "
+                 "WHERE id = :id AND slack_message_ts IS NULL" + condition),
+            params,
         )
 
 
-def record_decision(item_id: int, *, approved: bool, decided_by: str) -> Optional[QueueItem]:
+def get_item_for_update(item_id: int, *, session) -> Optional[QueueItem]:
+    """Lock and return one queue row inside the caller's transaction."""
+    row = session.execute(
+        text(f"SELECT {_COLUMNS_SQL} FROM relay_approval_queue WHERE id = :id FOR UPDATE"),
+        {"id": item_id},
+    ).mappings().first()
+    return _row_to_item(dict(row)) if row else None
+
+
+def record_decision(
+    item_id: int, *, approved: bool, decided_by: str, session=None,
+) -> Optional[QueueItem]:
     """Flip a 'pending' row to approved/rejected. Called by the Slack
     decision webhook.
 
@@ -224,13 +367,14 @@ def record_decision(item_id: int, *, approved: bool, decided_by: str) -> Optiona
     retry from re-deciding an already-decided row.
     """
     new_status = STATUS_APPROVED if approved else STATUS_REJECTED
-    with get_db_context() as session:
-        result = session.execute(
+    def apply(decision_session) -> Optional[QueueItem]:
+        row = decision_session.execute(
             text(
                 "UPDATE relay_approval_queue "
                 "SET status = :new_status, decided_by = :decided_by, "
                 "    decided_at = now(), updated_at = now() "
-                "WHERE id = :id AND status = :pending"
+                "WHERE id = :id AND status = :pending "
+                f"RETURNING {_COLUMNS_SQL}"
             ),
             {
                 "new_status": new_status,
@@ -238,10 +382,35 @@ def record_decision(item_id: int, *, approved: bool, decided_by: str) -> Optiona
                 "id": item_id,
                 "pending": STATUS_PENDING,
             },
-        )
-        if result.rowcount == 0:
+        ).mappings().first()
+        if row is None:
             return None
-    return get_item(item_id)
+        values = dict(row)
+        if values.get("venture_key") == "fa_max_lending" and values.get("person_id"):
+            from src.services.state_engine import write_interaction
+
+            interaction_id = write_interaction(
+                session=decision_session,
+                person_id=str(values["person_id"]),
+                channel="slack",
+                direction="inbound",
+                actor=f"slack_approver:{decided_by}",
+                approved_bool=approved,
+                autonomy_tier_at_time=values.get("autonomy_tier_at_send"),
+                body_redacted="relay action approved" if approved else "relay action rejected",
+            )
+            decision_session.execute(
+                text("UPDATE relay_approval_queue SET decision_interaction_id = CAST(:interaction_id AS uuid) "
+                     "WHERE id = :id"),
+                {"interaction_id": interaction_id, "id": item_id},
+            )
+            values["decision_interaction_id"] = interaction_id
+        return _row_to_item(values)
+
+    if session is not None:
+        return apply(session)
+    with get_db_context() as owned_session:
+        return apply(owned_session)
 
 
 def approved_batch(limit: int = 50, *, venture_key: Optional[str] = None) -> list[QueueItem]:
@@ -293,12 +462,28 @@ def try_claim_for_batch(item_id: int, batch_id: str, *, stale_after_minutes: int
                 "UPDATE relay_approval_queue "
                 "SET batch_id = :batch_id, updated_at = now() "
                 "WHERE id = :id AND status = :approved "
-                "AND (batch_id IS NULL OR updated_at < now() - make_interval(mins => :stale_after))"
+                "AND (batch_id IS NULL OR (venture_key <> 'fa_max_lending' "
+                "AND updated_at < now() - make_interval(mins => :stale_after)))"
             ),
             {
                 "batch_id": batch_id, "id": item_id, "approved": STATUS_APPROVED,
                 "stale_after": stale_after_minutes,
             },
+        )
+        return result.rowcount > 0
+
+
+def mark_uncertain_if_stale(item_id: int, *, stale_after_minutes: int = 10) -> bool:
+    """Park a previously claimed FA Max send whose provider result is unknown."""
+    with get_db_context() as session:
+        result = session.execute(
+            text("UPDATE relay_approval_queue SET status = :uncertain, "
+                 "error = 'provider_result_uncertain', updated_at = now() "
+                 "WHERE id = :id AND venture_key = 'fa_max_lending' "
+                 "AND status = :approved AND batch_id IS NOT NULL "
+                 "AND updated_at < now() - make_interval(mins => :stale_after)"),
+            {"id": item_id, "uncertain": STATUS_UNCERTAIN,
+             "approved": STATUS_APPROVED, "stale_after": stale_after_minutes},
         )
         return result.rowcount > 0
 
@@ -343,14 +528,33 @@ def mark_sent(item_id: int, *, batch_id: str) -> None:
     worker's call simply no-ops (0 rows match) instead of silently
     overwriting a completed receipt."""
     with get_db_context() as session:
-        session.execute(
+        row = session.execute(
             text(
                 "UPDATE relay_approval_queue SET status = :status, "
                 "dispatched_at = now(), updated_at = now() "
                 "WHERE id = :id AND status = :approved AND batch_id = :batch_id"
+                " RETURNING venture_key, person_id::text, channel, agent_name, "
+                "autonomy_tier_at_send, payload"
             ),
             {"status": STATUS_SENT, "id": item_id, "approved": STATUS_APPROVED, "batch_id": batch_id},
-        )
+        ).mappings().first()
+        if row and row["venture_key"] == "fa_max_lending" and row["person_id"]:
+            from src.services.state_engine import write_interaction
+
+            interaction_id = write_interaction(
+                session=session,
+                person_id=row["person_id"],
+                channel=row["channel"],
+                direction="outbound",
+                actor=f"agent:{row['agent_name']}",
+                approved_bool=not bool((row["payload"] or {}).get("edited_before_approval")),
+                autonomy_tier_at_time=row["autonomy_tier_at_send"],
+                body_redacted="relay outbound send",
+            )
+            session.execute(
+                text("UPDATE relay_approval_queue SET send_interaction_id = CAST(:iid AS uuid) WHERE id = :id"),
+                {"iid": interaction_id, "id": item_id},
+            )
 
 
 def mark_failed(item_id: int, error: str, *, batch_id: str) -> None:
@@ -370,7 +574,7 @@ def mark_failed(item_id: int, error: str, *, batch_id: str) -> None:
         )
 
 
-def mark_skipped(item_id: int, reason: str) -> None:
+def mark_skipped(item_id: int, reason: str) -> bool:
     """Transitions an 'approved' row to 'skipped' -- guarded so a row that
     has already reached a terminal state (sent/failed/skipped) can never be
     downgraded. Without this guard, calling mark_skipped() on a row an
@@ -383,11 +587,13 @@ def mark_skipped(item_id: int, reason: str) -> None:
     fake models 'sent' and 'skipped' as two independent dicts rather than
     one mutually-exclusive status column."""
     with get_db_context() as session:
-        session.execute(
+        result = session.execute(
             text(
                 "UPDATE relay_approval_queue SET status = :status, "
                 "error = :error, updated_at = now() "
-                "WHERE id = :id AND status = :approved"
+                "WHERE id = :id AND status = :approved "
+                "AND (venture_key <> 'fa_max_lending' OR batch_id IS NULL)"
             ),
             {"status": STATUS_SKIPPED, "error": reason, "id": item_id, "approved": STATUS_APPROVED},
         )
+        return result.rowcount > 0

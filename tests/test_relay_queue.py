@@ -38,6 +38,10 @@ def test_enqueue_signature_matches_documented_contract():
         # CLONE-v2.2 / CL3 — which venture proposed the action.
         "venture_key",
         "skip_contract_validation",
+        "lane",
+        "agent_name",
+        "autonomy_tier_at_send",
+        "person_id",
     }
 
     required = {name for name, p in params.items() if p.default is inspect.Parameter.empty}
