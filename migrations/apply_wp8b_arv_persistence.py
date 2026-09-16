@@ -55,6 +55,8 @@ DDL = [
     "ON fa_max_arv_results (property_id, computed_at DESC);",
     "CREATE INDEX IF NOT EXISTS idx_fa_max_arv_property_status "
     "ON fa_max_arv_results (property_id, status);",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_fa_max_arv_one_computed_per_property "
+    "ON fa_max_arv_results (property_id) WHERE status = 'computed';",
 ]
 
 

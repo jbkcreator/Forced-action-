@@ -11,7 +11,8 @@ import uuid
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, text
+from sqlalchemy.exc import IntegrityError
 
 # psycopg2 binds Decimal to NUMERIC natively; SQLite's DBAPI does not. Register a
 # test-only adapter so the prod code can keep passing Decimal unchanged.
@@ -55,11 +56,27 @@ def test_input_hash_stable_and_sensitive():
     assert compute_arv_input_hash(a) != compute_arv_input_hash(c)
 
 
-def test_hash_ignores_sub_5k_noise():
-    # 300000 and 302400 both round to 300000 -> same hash
-    assert compute_arv_input_hash(_result(low="300000")) == compute_arv_input_hash(
+def test_hash_detects_unrounded_valuation_change():
+    assert compute_arv_input_hash(_result(low="300000")) != compute_arv_input_hash(
         _result(low="302400")
     )
+
+
+def test_hash_detects_changed_comp_provenance_and_repair_assumption():
+    original = _result(low="300100", high="300100", point="300100", comps=[_comp(1)])
+    changed_comp = _comp(1).model_copy(
+        update={
+            "sale_price": Decimal("302400"),
+            "building_condition": 4,
+            "adjusted_value": Decimal("302400"),
+        }
+    )
+    changed = _result(
+        low="302400", high="302400", point="302400", comps=[changed_comp]
+    ).model_copy(update={"after_repair_condition": 5})
+
+    assert round_to_5k(original.low) == round_to_5k(changed.low)
+    assert compute_arv_input_hash(original) != compute_arv_input_hash(changed)
 
 
 def test_decide_persistence():
@@ -175,6 +192,26 @@ def test_idempotent_repersist_is_noop(db):
         )
     ).scalar_one()
     assert rows == 1
+
+
+def test_database_rejects_two_computed_rows_for_one_property(db):
+    persist_arv_result(db, property_id=88, result=_result(), computed_by="t")
+
+    with pytest.raises(IntegrityError):
+        db.execute(
+            text(
+                """
+                INSERT INTO fa_max_arv_results
+                    (property_id, source, arv_unknown, calculation_version,
+                     input_hash, status)
+                VALUES
+                    (88, 'wp8b_comparable_sales', false, 'other', 'other',
+                     'computed')
+                """
+            )
+        )
+        db.commit()
+    db.rollback()
 
 
 def test_supersede_on_change(db):

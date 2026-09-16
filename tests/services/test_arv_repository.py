@@ -245,6 +245,33 @@ def test_repeated_sales_for_one_property_count_as_one_comp(db):
     assert result.confidence == "low"
 
 
+def test_multi_parcel_sale_is_not_used_as_a_comp(db):
+    county = "county-multi-parcel"
+    _prop(db, 1200, county, subdivision="ALPHA")
+    _prop(db, 1201, county, subdivision="ALPHA")
+    _sale(
+        db,
+        1201,
+        county,
+        sale_price=Decimal("900000"),
+        multi_par_sal="C",
+        parcel_id_dor="strap-1201",
+    )
+    db.flush()
+
+    candidates = fetch_candidate_sales(
+        db,
+        subject_property_id=1200,
+        county_id=county,
+        property_use_code="0100",
+        qualified_qual_codes=["01", "02", "03", "04", "05", "06"],
+        as_of_yr=2025,
+        as_of_mo=9,
+    )
+
+    assert candidates == []
+
+
 def test_null_price_comp_excluded(db):
     county = "county-nullprice"
     _prop(db, 2000, county, subdivision="ALPHA")

@@ -83,6 +83,7 @@ _CANDIDATES_SQL = text(
           AND d.property_id != :subject_id
           AND d.sale_price IS NOT NULL
           AND d.sale_price > 0
+          AND COALESCE(TRIM(d.multi_par_sal), '') = ''
           AND p.property_use_code = :use_code
           AND d.qual_cd IN :qual_codes
           AND ((:as_of_yr * 12 + :as_of_mo) - (d.sale_yr * 12 + d.sale_mo))

@@ -69,21 +69,32 @@ def _canon(value) -> Optional[str]:
 def compute_arv_input_hash(result: ARVResult) -> str:
     """Deterministic sha256 over the determinative fields of a computed ARV.
 
-    Two computations that yield the same valuation (same rounded range, comp
-    set, tier, confidence) hash equal, so a re-persist is a no-op rather than a
-    churned row.
+    Two computations with the same unrounded valuation and full comp
+    provenance hash equal, so a true retry is a no-op. Display rounding is not
+    applied here: materially different inputs must remain separately auditable
+    even when they happen to round to the same published $5,000 increment.
     """
+    selected_comps = sorted(
+        (comp.model_dump(mode="json") for comp in result.selected_comps),
+        key=lambda comp: (
+            comp["property_id"], comp["sale_yr"], comp["sale_mo"]
+        ),
+    )
     payload = {
-        "low": _canon(round_to_5k(result.low)),
-        "high": _canon(round_to_5k(result.high)),
-        "point": _canon(round_to_5k(result.point)),
+        "low": _canon(result.low),
+        "high": _canon(result.high),
+        "point": _canon(result.point),
         "confidence": _canon(result.confidence),
         "comp_count": _canon(result.comp_count),
         "weak_comp": _canon(result.weak_comp),
         "locality_tier": _canon(result.locality_tier),
+        "recency_window_months": _canon(result.recency_window_months),
+        "after_repair_condition": _canon(result.after_repair_condition),
+        "inferred_condition_count": _canon(result.inferred_condition_count),
         "arv_unknown": _canon(result.arv_unknown),
+        "unknown_reason": _canon(result.unknown_reason),
         "source": _canon(result.source),
-        "comp_ids": sorted(c.property_id for c in result.selected_comps),
+        "selected_comps": selected_comps,
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -157,6 +168,8 @@ _LATEST_COMPUTED_SQL = text(
     """
 )
 
+_LOCK_PROPERTY_SQL = text("SELECT pg_advisory_xact_lock(:pid)")
+
 _INSERT_SQL = text(
     """
     INSERT INTO fa_max_arv_results (
@@ -204,6 +217,11 @@ def persist_arv_result(
     """
     new_hash = compute_arv_input_hash(result)
     try:
+        # Serialize recomputes for one property. Without this, two workers can
+        # both read the same current row and each create a new canonical row.
+        if session.get_bind().dialect.name == "postgresql":
+            session.execute(_LOCK_PROPERTY_SQL, {"pid": property_id})
+
         row = session.execute(
             _LATEST_COMPUTED_SQL, {"pid": property_id}
         ).mappings().first()
@@ -240,12 +258,12 @@ def persist_arv_result(
             "input_hash": new_hash,
             "supersedes_result_id": decision.supersedes_result_id,
         }
-        new_id = session.execute(_INSERT_SQL, params).scalar_one()
-
         if decision.action == "insert_supersede":
             session.execute(
                 _MARK_SUPERSEDED_SQL, {"rid": decision.supersedes_result_id}
             )
+
+        new_id = session.execute(_INSERT_SQL, params).scalar_one()
 
         session.commit()
         logger.info(

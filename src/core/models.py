@@ -10222,6 +10222,13 @@ class FaMaxArvResult(Base):
     __table_args__ = (
         Index("idx_fa_max_arv_property_computed", "property_id", "computed_at"),
         Index("idx_fa_max_arv_property_status", "property_id", "status"),
+        Index(
+            "uq_fa_max_arv_one_computed_per_property",
+            "property_id",
+            unique=True,
+            postgresql_where=text("status = 'computed'"),
+            sqlite_where=text("status = 'computed'"),
+        ),
         CheckConstraint(
             "status IN ('computed','superseded')", name="ck_fa_max_arv_status"
         ),
