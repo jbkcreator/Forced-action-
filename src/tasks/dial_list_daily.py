@@ -55,7 +55,7 @@ def run(
                 )
         else:
             dial_list, ts = generate_and_deliver(
-                db, as_of=effective_as_of, county_id=county_id
+                db, as_of=effective_as_of, county_id=county_id, interactive=True
             )
             logger.info(
                 "[DialList] %s — %d entries posted (ts=%s)",
