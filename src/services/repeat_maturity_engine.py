@@ -423,11 +423,20 @@ def _record_fired(session: Session, alert: MonitorAlert, slack_ts: Optional[str]
 # Orchestrator
 # --------------------------------------------------------------------------- #
 
-def run_monitors(session: Session, today: Optional[date] = None) -> list[MonitorAlert]:
+def run_monitors(
+    session: Session,
+    today: Optional[date] = None,
+    *,
+    dry_run: bool = False,
+) -> list[MonitorAlert]:
     """
     Run all 4 monitors, post Slack alerts, record fired events.
     Returns the list of MonitorAlert objects that fired.
     Does not commit — caller controls the transaction boundary.
+
+    dry_run=True skips _post_alert() and _record_fired() entirely -- rolling
+    back the transaction afterward only undoes the DB writes, it can never
+    un-send a Slack message already posted.
     """
     if today is None:
         today = date.today()
@@ -449,12 +458,18 @@ def run_monitors(session: Session, today: Optional[date] = None) -> list[Monitor
             continue
 
         for alert in alerts:
-            slack_ts = _post_alert(alert)
-            _record_fired(session, alert, slack_ts)
+            if dry_run:
+                logger.info(
+                    "[repeat_maturity] (dry-run, no Slack post) would fire %s for entity %d (%s)",
+                    alert.monitor_type, alert.buyer_entity_id, alert.canonical_name,
+                )
+            else:
+                slack_ts = _post_alert(alert)
+                _record_fired(session, alert, slack_ts)
+                logger.info(
+                    "[repeat_maturity] fired %s for entity %d (%s)",
+                    alert.monitor_type, alert.buyer_entity_id, alert.canonical_name,
+                )
             all_alerts.append(alert)
-            logger.info(
-                "[repeat_maturity] fired %s for entity %d (%s)",
-                alert.monitor_type, alert.buyer_entity_id, alert.canonical_name,
-            )
 
     return all_alerts

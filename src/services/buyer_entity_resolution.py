@@ -1207,19 +1207,17 @@ def record_ambiguous_pair_exceptions(
 
     max_new caps how many pairs from THIS CALL get processed -- a first
     full backfill over ~810k entities must not attempt a million writes in
-    one sweep. Does not commit — caller controls the transaction boundary.
-    Returns the count actually recorded (for logging).
+    one sweep. Pairs already recorded in a prior sweep are deprioritized
+    below the cap (they're already in EXCEPTIONS -- re-upserting them just
+    bumps last_seen_at) so a persistent ambiguity set can never crowd out
+    a not-yet-seen pair forever; every pair reaches the queue within
+    ceil(unseen_count / max_new) sweeps instead of never. Does not commit —
+    caller controls the transaction boundary. Returns the count actually
+    recorded (for logging).
     """
-    capped = ambiguous_pairs[:max_new]
-    if len(ambiguous_pairs) > max_new:
-        logger.warning(
-            "record_ambiguous_pair_exceptions: %d ambiguous pairs this run, "
-            "capped to %d -- remaining %d will be re-evaluated (and recorded, "
-            "if still ambiguous) on the next sweep",
-            len(ambiguous_pairs), max_new, len(ambiguous_pairs) - max_new,
-        )
     rows = []
-    for a, b, verdict in capped:
+    refs = []
+    for a, b, verdict in ambiguous_pairs:
         name_score = int(fuzz.token_set_ratio(a.normalized_name, b.normalized_name))
         address_score: Optional[int] = None
         if a.mailing_address and b.mailing_address:
@@ -1231,13 +1229,43 @@ def record_ambiguous_pair_exceptions(
         left_ref, right_ref = f"{left_key[0]}#{left_key[1]}", f"{right_key[0]}#{right_key[1]}"
         if right_ref < left_ref:  # canonical order -- keeps the unique constraint from
             left_ref, right_ref = right_ref, left_ref  # treating (X,Y) and (Y,X) as distinct
+        refs.append((left_ref, right_ref))
         rows.append({
             "kind": "ambiguous_pair", "left_ref": left_ref, "right_ref": right_ref,
             "explanation": verdict.explanation or f"name={name_score}, no further detail",
             "name_score": name_score, "address_score": address_score,
         })
+
+    if len(rows) > max_new:
+        existing = set()
+        if refs:
+            # ANY(:left_refs) narrows to candidate rows in one round trip; the
+            # exact (left_ref, right_ref) match happens below in Python since
+            # left_ref alone can't distinguish which right_ref paired with it.
+            candidate_rows = session.execute(
+                text("""
+                    SELECT left_ref, right_ref FROM buyer_entity_match_exception
+                     WHERE kind = 'ambiguous_pair'
+                       AND left_ref = ANY(:left_refs)
+                """),
+                {"left_refs": [lr for lr, _ in refs]},
+            ).mappings()
+            existing = {(r["left_ref"], r["right_ref"]) for r in candidate_rows}
+        # unseen pairs sort first so they win the cap; already-recorded pairs
+        # (stable sort keeps their original relative order) fill any remainder.
+        order = sorted(
+            range(len(rows)), key=lambda i: refs[i] in existing,
+        )
+        rows = [rows[i] for i in order[:max_new]]
+        logger.warning(
+            "record_ambiguous_pair_exceptions: %d ambiguous pairs this run, "
+            "capped to %d (unseen pairs prioritized) -- remaining %d will be "
+            "re-evaluated on the next sweep",
+            len(refs), max_new, len(refs) - max_new,
+        )
+
     record_exceptions_batch(session, rows)
-    return len(capped)
+    return len(rows)
 
 
 def run_incremental(session: Session, county_id: Optional[str] = None) -> dict:

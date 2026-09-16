@@ -11,6 +11,10 @@ via property_id for all property-linked tables).
 Idempotent: ON CONFLICT (source_table, source_id) DO NOTHING means re-running
 produces the same result. Run dry-run first, then --apply against prod.
 
+Each source query streams via yield_per(_COMMIT_BATCH) (server-side cursor)
+rather than materializing the full result set -- these source tables can run
+into the hundreds of thousands of rows.
+
 Usage:
     PYTHONPATH=. python scripts/backfill_borrower_ledger.py            # dry-run
     PYTHONPATH=. python scripts/backfill_borrower_ledger.py --apply    # write to DB
@@ -76,7 +80,7 @@ def _backfill_deed_acquisitions(session: Session, dry_run: bool) -> BackfillStat
             ON bel.source_table = 'deeds' AND bel.source_id = d.id
         WHERE d.record_date IS NOT NULL
         ORDER BY d.id
-    """)).mappings().all()
+    """).execution_options(yield_per=_COMMIT_BATCH)).mappings()
 
     for r in rows:
         stats.attempted += 1
@@ -129,7 +133,9 @@ def _backfill_via_owner_link(
     The query is responsible for joining to the owner-resolution path.
     """
     stats = BackfillStats(f"{source_table}/{event_type}")
-    rows = session.execute(text(query)).mappings().all()
+    rows = session.execute(
+        text(query).execution_options(yield_per=_COMMIT_BATCH),
+    ).mappings()
 
     for r in rows:
         stats.attempted += 1

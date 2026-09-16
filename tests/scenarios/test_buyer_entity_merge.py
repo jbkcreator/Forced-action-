@@ -166,6 +166,115 @@ def test_merge_then_unmerge_preserves_survivor_own_links():
         _cleanup(entity_ids, merge_log_ids)
 
 
+def test_merge_then_unmerge_moves_ledger_events_and_monitor_log():
+    """
+    Regression for the ledger/monitor data-loss bug: borrower_ledger_events
+    and borrower_monitor_log both carry buyer_entity_id ON DELETE CASCADE,
+    so merge_entities() must move those rows to the survivor BEFORE deleting
+    the absorbed buyer_entities row, or the absorbed entity's whole history
+    (and its monitor idempotency log) is destroyed instead of transferred.
+    unmerge_entity() must move them back onto the restored entity.
+    """
+    token = f"ZMERGELEDGER{_uid()}".upper()
+    entity_ids: list[int] = []
+    merge_log_ids: list[int] = []
+    ledger_event_ids: list[int] = []
+    monitor_log_ids: list[int] = []
+    try:
+        with get_db_context() as session:
+            survivor_id, _ = _make_entity(session, canonical_name=f"{token} SURVIVOR", n_links=1)
+            absorbed_id, _ = _make_entity(session, canonical_name=f"{token} ABSORBED", n_links=1)
+        entity_ids.extend([survivor_id, absorbed_id])
+
+        with get_db_context() as session:
+            ledger_event_id = session.execute(
+                text("""
+                    INSERT INTO borrower_ledger_events
+                        (buyer_entity_id, event_type, event_date, source_table, source_id, summary)
+                    VALUES (:eid, 'deed_acquisition', CURRENT_DATE, 'deeds', :sid, 'test event')
+                    RETURNING id
+                """),
+                {"eid": absorbed_id, "sid": int(uuid.uuid4().int % 2_000_000_000)},
+            ).scalar_one()
+            monitor_log_id = session.execute(
+                text("""
+                    INSERT INTO borrower_monitor_log
+                        (buyer_entity_id, monitor_type, source_event_id)
+                    VALUES (:eid, 'loan_maturity', :sid)
+                    RETURNING id
+                """),
+                {"eid": absorbed_id, "sid": ledger_event_id},
+            ).scalar_one()
+            session.commit()
+        ledger_event_ids.append(ledger_event_id)
+        monitor_log_ids.append(monitor_log_id)
+
+        with get_db_context() as session:
+            log = merge_entities(
+                session, surviving_id=survivor_id, absorbed_id=absorbed_id,
+                merged_by="test:wp4", reason="ledger regression test",
+            )
+            merge_log_id = log.id
+            session.commit()
+        merge_log_ids.append(merge_log_id)
+
+        with get_db_context() as session:
+            log_row = session.execute(
+                text("""
+                    SELECT moved_ledger_event_ids, moved_monitor_log_ids
+                      FROM buyer_entity_merge_log WHERE id = :id
+                """),
+                {"id": merge_log_id},
+            ).mappings().one()
+            assert log_row["moved_ledger_event_ids"] == [ledger_event_id]
+            assert log_row["moved_monitor_log_ids"] == [monitor_log_id]
+
+            owner = session.execute(
+                text("SELECT buyer_entity_id FROM borrower_ledger_events WHERE id = :id"),
+                {"id": ledger_event_id},
+            ).scalar_one()
+            assert owner == survivor_id, "ledger event must move to survivor, not be cascade-deleted"
+
+            monitor_owner = session.execute(
+                text("SELECT buyer_entity_id FROM borrower_monitor_log WHERE id = :id"),
+                {"id": monitor_log_id},
+            ).scalar_one()
+            assert monitor_owner == survivor_id, "monitor log must move to survivor, not be cascade-deleted"
+
+        with get_db_context() as session:
+            restored = unmerge_entity(session, merge_log_id=merge_log_id, reversed_by="test:wp4")
+            restored_id = restored.id
+            session.commit()
+        entity_ids.append(restored_id)
+
+        with get_db_context() as session:
+            owner_after = session.execute(
+                text("SELECT buyer_entity_id FROM borrower_ledger_events WHERE id = :id"),
+                {"id": ledger_event_id},
+            ).scalar_one()
+            assert owner_after == restored_id, "unmerge must return the ledger event to the restored entity"
+
+            monitor_owner_after = session.execute(
+                text("SELECT buyer_entity_id FROM borrower_monitor_log WHERE id = :id"),
+                {"id": monitor_log_id},
+            ).scalar_one()
+            assert monitor_owner_after == restored_id, "unmerge must return the monitor log row to the restored entity"
+    finally:
+        with get_db_context() as session:
+            if monitor_log_ids:
+                session.execute(
+                    text("DELETE FROM borrower_monitor_log WHERE id = ANY(:ids)"),
+                    {"ids": monitor_log_ids},
+                )
+            if ledger_event_ids:
+                session.execute(
+                    text("DELETE FROM borrower_ledger_events WHERE id = ANY(:ids)"),
+                    {"ids": ledger_event_ids},
+                )
+            session.commit()
+        _cleanup(entity_ids, merge_log_ids)
+
+
 def test_unmerge_raises_when_moved_link_ids_missing():
     """A merge_log row logged before moved_link_ids existed (NULL) must refuse
     to unmerge rather than fall back to a timestamp guess that could steal

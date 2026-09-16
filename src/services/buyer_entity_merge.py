@@ -2,12 +2,16 @@
 Manual merge and unmerge operations for buyer entities.
 
 merge_entities()   — collapses two buyer_entities rows into one, moving all
-                     buyer_entity_links from the absorbed entity to the surviving
-                     entity, snapshotting the absorbed row, then deleting it.
+                     buyer_entity_links, borrower_ledger_events, and
+                     borrower_monitor_log rows from the absorbed entity to the
+                     surviving entity (both ledger/monitor FKs are ON DELETE
+                     CASCADE, so this must happen before the absorbed row is
+                     deleted or its whole history is destroyed), snapshotting
+                     the absorbed row, then deleting it.
 
 unmerge_entity()   — reverses a logged merge: restores the absorbed entity from
-                     its snapshot, moves its links back, and marks the log row
-                     reversed.
+                     its snapshot, moves its links/ledger events/monitor log
+                     rows back, and marks the log row reversed.
 
 These functions are for manual corrections and admin-driven operations only.
 The nightly resolver (buyer_entity_resolution.run_incremental) never calls them —
@@ -86,6 +90,42 @@ def merge_entities(
     moved_link_ids = [row[0] for row in result.fetchall()]
     links_moved = len(moved_link_ids)
 
+    # borrower_ledger_events.buyer_entity_id and borrower_monitor_log.buyer_entity_id
+    # are both ON DELETE CASCADE -- deleting the absorbed row without moving these
+    # first destroys the absorbed entity's whole history instead of transferring it.
+    ledger_result = session.execute(
+        text("""
+            UPDATE borrower_ledger_events
+               SET buyer_entity_id = :surviving_id
+             WHERE buyer_entity_id = :absorbed_id
+             RETURNING id
+        """),
+        {"surviving_id": surviving_id, "absorbed_id": absorbed_id},
+    )
+    moved_ledger_event_ids = [row[0] for row in ledger_result.fetchall()]
+
+    # borrower_monitor_log is uniqued on (buyer_entity_id, monitor_type,
+    # source_event_id) -- a row can't move onto the survivor if the survivor
+    # already fired the identical monitor for the identical source event.
+    # That's a duplicate idempotency record, not history, so it's left to be
+    # cascade-deleted with the absorbed row rather than moved.
+    monitor_result = session.execute(
+        text("""
+            UPDATE borrower_monitor_log AS bml
+               SET buyer_entity_id = :surviving_id
+             WHERE bml.buyer_entity_id = :absorbed_id
+               AND NOT EXISTS (
+                   SELECT 1 FROM borrower_monitor_log survivor_row
+                    WHERE survivor_row.buyer_entity_id = :surviving_id
+                      AND survivor_row.monitor_type = bml.monitor_type
+                      AND survivor_row.source_event_id IS NOT DISTINCT FROM bml.source_event_id
+               )
+             RETURNING bml.id
+        """),
+        {"surviving_id": surviving_id, "absorbed_id": absorbed_id},
+    )
+    moved_monitor_log_ids = [row[0] for row in monitor_result.fetchall()]
+
     session.execute(
         text("DELETE FROM buyer_entities WHERE id = :id"),
         {"id": absorbed_id},
@@ -102,6 +142,8 @@ def merge_entities(
         absorbed_snapshot=absorbed_snapshot,
         links_moved=links_moved,
         moved_link_ids=moved_link_ids,
+        moved_ledger_event_ids=moved_ledger_event_ids,
+        moved_monitor_log_ids=moved_monitor_log_ids,
         merged_by=merged_by,
         merge_reason=reason,
     )
@@ -109,8 +151,10 @@ def merge_entities(
     session.flush()
 
     logger.info(
-        "merge_entities: absorbed entity %d into %d (%d links moved) by %s",
-        absorbed_id, surviving_id, links_moved, merged_by,
+        "merge_entities: absorbed entity %d into %d (%d links, %d ledger events, "
+        "%d monitor log rows moved) by %s",
+        absorbed_id, surviving_id, links_moved, len(moved_ledger_event_ids),
+        len(moved_monitor_log_ids), merged_by,
     )
     return log
 
@@ -198,6 +242,41 @@ def unmerge_entity(
             "found still on surviving entity %d -- some may have been re-merged or "
             "reassigned since",
             merge_log_id, len(moved_link_ids), links_returned, log["surviving_id"],
+        )
+
+    # moved_ledger_event_ids / moved_monitor_log_ids are None for merges logged
+    # before these columns existed -- nothing to restore, not an error (the
+    # links restore above is the load-bearing part for those legacy rows).
+    moved_ledger_event_ids = log["moved_ledger_event_ids"]
+    if moved_ledger_event_ids:
+        session.execute(
+            text("""
+                UPDATE borrower_ledger_events
+                   SET buyer_entity_id = :restored_id
+                 WHERE id = ANY(:moved_ledger_event_ids)
+                   AND buyer_entity_id = :surviving_id
+            """),
+            {
+                "restored_id": restored.id,
+                "moved_ledger_event_ids": moved_ledger_event_ids,
+                "surviving_id": log["surviving_id"],
+            },
+        )
+
+    moved_monitor_log_ids = log["moved_monitor_log_ids"]
+    if moved_monitor_log_ids:
+        session.execute(
+            text("""
+                UPDATE borrower_monitor_log
+                   SET buyer_entity_id = :restored_id
+                 WHERE id = ANY(:moved_monitor_log_ids)
+                   AND buyer_entity_id = :surviving_id
+            """),
+            {
+                "restored_id": restored.id,
+                "moved_monitor_log_ids": moved_monitor_log_ids,
+                "surviving_id": log["surviving_id"],
+            },
         )
 
     session.execute(
