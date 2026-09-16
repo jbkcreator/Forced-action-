@@ -9409,7 +9409,10 @@ class BorrowerLedgerEvent(Base):
     property: Mapped[Optional["Property"]] = relationship("Property")
 
     __table_args__ = (
-        UniqueConstraint("source_table", "source_id", name="uq_ble_source"),
+        UniqueConstraint(
+            "source_table", "source_id", "event_type", "buyer_entity_id",
+            name="uq_ble_source_event_entity",
+        ),
         CheckConstraint(
             "event_type IN ("
             "'deed_acquisition','deed_sale',"

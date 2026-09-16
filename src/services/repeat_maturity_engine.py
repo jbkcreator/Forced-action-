@@ -423,10 +423,16 @@ def _record_fired(session: Session, alert: MonitorAlert, slack_ts: Optional[str]
 # Orchestrator
 # --------------------------------------------------------------------------- #
 
-def run_monitors(session: Session, today: Optional[date] = None) -> list[MonitorAlert]:
+def run_monitors(
+    session: Session,
+    today: Optional[date] = None,
+    *,
+    deliver: bool = True,
+) -> list[MonitorAlert]:
     """
-    Run all 4 monitors, post Slack alerts, record fired events.
-    Returns the list of MonitorAlert objects that fired.
+    Run all 4 monitors and return eligible alerts. When ``deliver`` is true,
+    post candidates to Slack and record only confirmed deliveries. Preview
+    mode performs neither side effect.
     Does not commit — caller controls the transaction boundary.
     """
     if today is None:
@@ -449,9 +455,19 @@ def run_monitors(session: Session, today: Optional[date] = None) -> list[Monitor
             continue
 
         for alert in alerts:
-            slack_ts = _post_alert(alert)
-            _record_fired(session, alert, slack_ts)
             all_alerts.append(alert)
+            if not deliver:
+                continue
+
+            slack_ts = _post_alert(alert)
+            if slack_ts is None:
+                logger.warning(
+                    "[repeat_maturity] delivery failed; leaving %s/%d retryable",
+                    alert.monitor_type, alert.buyer_entity_id,
+                )
+                continue
+
+            _record_fired(session, alert, slack_ts)
             logger.info(
                 "[repeat_maturity] fired %s for entity %d (%s)",
                 alert.monitor_type, alert.buyer_entity_id, alert.canonical_name,

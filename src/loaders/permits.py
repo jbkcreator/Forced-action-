@@ -109,14 +109,22 @@ class BuildingPermitLoader(BaseLoader):
             # Check for duplicates; update description if previously NULL
             if skip_duplicates:
                 existing_row = self.session.execute(
-                    text("SELECT id, description FROM building_permits WHERE permit_number = :pnum LIMIT 1"),
+                    text("SELECT id, description, status FROM building_permits WHERE permit_number = :pnum LIMIT 1"),
                     {"pnum": record_number},
                 ).fetchone()
                 if existing_row:
-                    if existing_row.description is None and description_val:
+                    incoming_status = str(row.get('Status') or '').strip() or None
+                    description_changed = existing_row.description is None and description_val
+                    status_changed = incoming_status and incoming_status != existing_row.status
+                    if description_changed or status_changed:
                         self.session.execute(
-                            text("UPDATE building_permits SET description = :desc WHERE id = :id"),
-                            {"desc": description_val, "id": existing_row.id},
+                            text("""
+                                UPDATE building_permits
+                                SET description = COALESCE(description, :desc),
+                                    status = CASE WHEN :status IS NOT NULL THEN :status ELSE status END
+                                WHERE id = :id
+                            """),
+                            {"desc": description_val, "status": incoming_status, "id": existing_row.id},
                         )
                         self.session.flush()
                     skipped += 1
