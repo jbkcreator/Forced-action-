@@ -2879,6 +2879,104 @@ def test_write_and_close_property_association(fresh_db):
     assert row2.valid_to is not None, "Closed association must have valid_to set"
 
 
+@pytest.mark.usefixtures("fresh_db")
+def test_property_association_close_is_a_new_cursor_event(fresh_db):
+    """A close after the open cursor has been read must remain discoverable."""
+    from src.services.state_engine import (
+        close_property_association, get_borrower_timeline, write_property_association,
+    )
+
+    person_id = fresh_db.execute(text("""
+        INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
+        VALUES (gen_random_uuid(), 'identified', 'test') RETURNING person_id::text
+    """)).scalar()
+    prop_id = fresh_db.execute(text("""
+        INSERT INTO properties (parcel_id, source_row_hash, needs_rescore, created_at, updated_at)
+        VALUES ('TIMELINE-CLOSE-PROP', 'timeline-close-hash', false, NOW(), NOW())
+        ON CONFLICT (parcel_id) DO UPDATE SET parcel_id = EXCLUDED.parcel_id
+        RETURNING id
+    """)).scalar()
+    association_id = write_property_association(
+        session=fresh_db, person_id=person_id, property_id=prop_id, source="test",
+    )
+
+    first_page = get_borrower_timeline(session=fresh_db, person_id=person_id, limit=1)
+    assert first_page["events"][0]["event_kind"] == "property_association"
+    creation_cursor = first_page["events"][0]["global_seq"]
+
+    assert close_property_association(session=fresh_db, association_id=association_id)
+    after_close = get_borrower_timeline(
+        session=fresh_db, person_id=person_id, after_seq=creation_cursor,
+    )
+
+    assert [event["event_kind"] for event in after_close["events"]] == ["property_association_closed"]
+    assert after_close["events"][0]["extra"]["association_id"] == association_id
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_wp1_guards_fail_closed_when_guc_is_unset(fresh_db):
+    """A fresh session must reject direct state and audit writes."""
+    person_id = fresh_db.execute(text("""
+        INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
+        VALUES (gen_random_uuid(), 'identified', 'test') RETURNING person_id::text
+    """)).scalar()
+    fresh_db.execute(text("SELECT set_config('fa_max.allow_state_write', 'off', true)"))
+    savepoint = fresh_db.begin_nested()
+    with pytest.raises(Exception, match="fa_max"):
+        fresh_db.execute(
+            text("UPDATE fa_max_persons SET lifecycle_state = 'enriched' "
+                 "WHERE person_id = :person_id ::uuid"),
+            {"person_id": person_id},
+        )
+    savepoint.rollback()
+
+
+@pytest.mark.usefixtures("fresh_db")
+def test_wp1_migration_records_legacy_lifecycle_remap_event(fresh_db):
+    """An old vocabulary row is upgraded with an attributable event, not a
+    silent state rewrite."""
+    import importlib.util
+    from pathlib import Path
+
+    fresh_db.execute(text("SET CONSTRAINTS ALL DEFERRED"))
+    fresh_db.execute(text("""
+        INSERT INTO fa_max_person_lifecycle_stage_config
+            (stage_key, display_name, order_index, allowed_next, is_terminal, is_active)
+        VALUES ('warm', 'Warm', 99, '[]'::jsonb, false, true)
+    """))
+    person_id = fresh_db.execute(text("""
+        INSERT INTO fa_max_persons (person_id, lifecycle_state, source)
+        VALUES (gen_random_uuid(), 'warm', 'legacy-test') RETURNING person_id::text
+    """)).scalar()
+
+    path = Path(__file__).parent.parent / "migrations" / "apply_fa_max_wp1_remaining.py"
+    spec = importlib.util.spec_from_file_location("wp1_remaining_upgrade_test", path)
+    migration = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(migration)
+    for statement in migration.STATEMENTS:
+        fresh_db.execute(text(statement))
+
+    assert fresh_db.execute(
+        text("SELECT lifecycle_state FROM fa_max_persons WHERE person_id = :person_id ::uuid"),
+        {"person_id": person_id},
+    ).scalar() == "engaged"
+    event = fresh_db.execute(text("""
+        SELECT from_state, to_state, actor, source_component
+        FROM fa_max_state_transition_events
+        WHERE person_id = :person_id ::uuid
+          AND idempotency_key = :idempotency_key
+    """), {
+        "person_id": person_id,
+        "idempotency_key": f"wp1-lifecycle-remap:{person_id}:warm:engaged",
+    }).mappings().one()
+    assert dict(event) == {
+        "from_state": "warm", "to_state": "engaged",
+        "actor": "system:migration",
+        "source_component": "migrations.apply_fa_max_wp1_remaining",
+    }
+
+
 # --- Unified timeline -----------------------------------------------------------
 
 @pytest.mark.usefixtures("fresh_db")

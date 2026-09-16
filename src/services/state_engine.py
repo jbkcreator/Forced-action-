@@ -912,15 +912,31 @@ def close_property_association(
 
     Returns True if a row was closed, False if already closed or not found.
     """
-    result = session.execute(
+    row = session.execute(
         text("""
             UPDATE fa_max_property_associations
             SET valid_to = NOW()
             WHERE id = :id AND valid_to IS NULL
+            RETURNING person_id::text, source
         """),
         {"id": association_id},
+    ).fetchone()
+    if row is None:
+        return False
+    # Closing is a distinct fact, not a mutation of the original open event.
+    # It receives a fresh shared cursor so clients that have already paged past
+    # the association creation learn that it is no longer active.
+    session.execute(
+        text("""
+            INSERT INTO fa_max_property_association_events
+                (association_id, person_id, event_type, actor, source, occurred_at)
+            VALUES (:association_id, :person_id ::uuid, 'closed',
+                    'system:property_association', :source, NOW())
+            ON CONFLICT (association_id, event_type) DO NOTHING
+        """),
+        {"association_id": association_id, "person_id": row.person_id, "source": row.source},
     )
-    return result.rowcount > 0
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1013,6 +1029,25 @@ def get_borrower_timeline(
                     )                            AS extra
                 FROM fa_max_property_associations pa
                 WHERE pa.person_id = :person_id ::uuid
+
+                UNION ALL
+
+                -- Association closures are append-only timeline facts.  Do
+                -- not mutate/re-emit the original association-open event.
+                SELECT
+                    'property_association_closed'::text AS event_kind,
+                    pae.event_id::text                AS id,
+                    pae.person_id::text               AS person_id,
+                    pae.actor,
+                    pae.occurred_at,
+                    pae.timeline_seq                  AS global_seq,
+                    jsonb_build_object(
+                        'association_id', pae.association_id,
+                        'event_type', pae.event_type,
+                        'source', pae.source
+                    )                                 AS extra
+                FROM fa_max_property_association_events pae
+                WHERE pae.person_id = :person_id ::uuid
             )
             SELECT *
             FROM unified

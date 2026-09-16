@@ -10830,6 +10830,41 @@ class FaMaxPropertyAssociation(Base):
         )
 
 
+class FaMaxPropertyAssociationEvent(Base):
+    """Append-only facts for association lifecycle changes after creation."""
+
+    __tablename__ = "fa_max_property_association_events"
+
+    event_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=text("generate_uuidv7()")
+    )
+    association_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("fa_max_property_associations.id"), nullable=False
+    )
+    person_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("fa_max_persons.person_id"), nullable=False
+    )
+    event_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    actor: Mapped[str] = mapped_column(String(120), nullable=False)
+    source: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    timeline_seq: Mapped[int] = mapped_column(
+        BigInteger, FA_MAX_TIMELINE_SEQUENCE,
+        server_default=FA_MAX_TIMELINE_SEQUENCE.next_value(), nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("event_type IN ('closed')", name="ck_fa_max_property_association_event_type"),
+        UniqueConstraint("association_id", "event_type", name="uq_fa_max_property_association_event"),
+        Index("ix_fa_max_prop_assoc_event_person_timeline_seq", "person_id", "timeline_seq"),
+    )
+
+
 class FaMaxWorkQueue(Base):
     """Durable leased work queue for FA Max background operations.
 

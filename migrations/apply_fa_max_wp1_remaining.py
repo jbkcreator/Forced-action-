@@ -17,7 +17,8 @@ Adds to the schema laid by apply_fa_max_state_engine.py:
 
   4. Creates fa_max_interactions (write-once).
 
-  5. Creates fa_max_property_associations (temporal, integer FK → properties.id).
+  5. Creates fa_max_property_associations and its append-only event table
+     (temporal, integer FK → properties.id).
 
   6. Installs DB immutability trigger on fa_max_state_transition_events and
      fa_max_interactions — BEFORE UPDATE OR DELETE raises unless session-local
@@ -94,6 +95,50 @@ STATEMENTS = [
 ] + [
     # Preserve live rows created under the original WP-1 vocabulary.
     "SELECT set_config('fa_max.allow_state_write', 'on', true)",
+    """
+    -- Record every legacy vocabulary remap before changing live state.  The
+    -- event's deterministic key makes a re-run a no-op, while the registry
+    -- upsert supplies the canonical entity UUID required by the event spine.
+    WITH remaps AS (
+        SELECT person_id, lifecycle_state AS from_state,
+               CASE lifecycle_state
+                   WHEN 'qualifying' THEN 'qualified'
+                   WHEN 'warm' THEN 'engaged'
+                   WHEN 'cold' THEN 'contacted'
+                   WHEN 'active' THEN 'engaged'
+                   WHEN 'submitted' THEN 'application_submitted'
+                   WHEN 'declined' THEN 'dead'
+               END AS to_state
+        FROM fa_max_persons
+        WHERE lifecycle_state IN ('qualifying','warm','cold','active','submitted','declined')
+    ), registry AS (
+        INSERT INTO fa_max_entity_registry (entity_type, native_id)
+        SELECT 'person', person_id::text FROM remaps
+        ON CONFLICT (entity_type, native_id) DO NOTHING
+        RETURNING entity_uuid, native_id
+    ), entity_rows AS (
+        -- A data-modifying CTE's inserted rows are not visible through a
+        -- second scan of its target table in this same statement.  Combine
+        -- the CTE result with pre-existing registrations explicitly.
+        SELECT entity_uuid, native_id FROM registry
+        UNION ALL
+        SELECT er.entity_uuid, er.native_id
+        FROM fa_max_entity_registry er
+        JOIN remaps r
+          ON er.entity_type = 'person' AND er.native_id = r.person_id::text
+    )
+    INSERT INTO fa_max_state_transition_events
+        (entity_uuid, person_id, entity_type, from_state, to_state, actor,
+         source_component, context, idempotency_key, occurred_at)
+    SELECT er.entity_uuid, r.person_id, 'person', r.from_state, r.to_state,
+           'system:migration', 'migrations.apply_fa_max_wp1_remaining',
+           jsonb_build_object('reason', 'legacy_lifecycle_vocabulary_remap'),
+           'wp1-lifecycle-remap:' || r.person_id::text || ':' || r.from_state || ':' || r.to_state,
+           NOW()
+    FROM remaps r
+    JOIN entity_rows er ON er.native_id = r.person_id::text
+    ON CONFLICT (idempotency_key) DO NOTHING
+    """,
     """
     UPDATE fa_max_persons
     SET lifecycle_state = CASE lifecycle_state
@@ -185,6 +230,23 @@ STATEMENTS = [
             CHECK (role IN ('subject','collateral','current_project','exit_property','owned'))
     )
     """,
+    # Must exist before the association-event default below is parsed on a
+    # fresh database.
+    "CREATE SEQUENCE IF NOT EXISTS fa_max_timeline_seq",
+    """
+    CREATE TABLE IF NOT EXISTS fa_max_property_association_events (
+        event_id        UUID        PRIMARY KEY DEFAULT generate_uuidv7(),
+        association_id  BIGINT      NOT NULL REFERENCES fa_max_property_associations(id),
+        person_id       UUID        NOT NULL REFERENCES fa_max_persons(person_id),
+        event_type      VARCHAR(20) NOT NULL CHECK (event_type IN ('closed')),
+        actor           VARCHAR(120) NOT NULL,
+        source          VARCHAR(60),
+        occurred_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        timeline_seq    BIGINT      NOT NULL DEFAULT nextval('fa_max_timeline_seq'),
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_fa_max_property_association_event UNIQUE (association_id, event_type)
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS ix_fa_max_prop_assoc_person_id ON fa_max_property_associations (person_id)",
     "CREATE INDEX IF NOT EXISTS ix_fa_max_prop_assoc_property_id ON fa_max_property_associations (property_id)",
     """
@@ -203,6 +265,8 @@ STATEMENTS = [
     "ALTER TABLE fa_max_state_transition_events ALTER COLUMN timeline_seq SET DEFAULT nextval('fa_max_timeline_seq')",
     "ALTER TABLE fa_max_interactions ALTER COLUMN timeline_seq SET DEFAULT nextval('fa_max_timeline_seq')",
     "ALTER TABLE fa_max_property_associations ALTER COLUMN timeline_seq SET DEFAULT nextval('fa_max_timeline_seq')",
+    "ALTER TABLE fa_max_property_association_events ADD COLUMN IF NOT EXISTS timeline_seq BIGINT",
+    "ALTER TABLE fa_max_property_association_events ALTER COLUMN timeline_seq SET DEFAULT nextval('fa_max_timeline_seq')",
     # A prior migration run may already have installed immutability triggers.
     # Remove them during the controlled backfill; they are recreated below.
     "DROP TRIGGER IF EXISTS trg_fa_max_ste_immutable ON fa_max_state_transition_events",
@@ -215,9 +279,11 @@ STATEMENTS = [
     "ALTER TABLE fa_max_state_transition_events ALTER COLUMN timeline_seq SET NOT NULL",
     "ALTER TABLE fa_max_interactions ALTER COLUMN timeline_seq SET NOT NULL",
     "ALTER TABLE fa_max_property_associations ALTER COLUMN timeline_seq SET NOT NULL",
+    "ALTER TABLE fa_max_property_association_events ALTER COLUMN timeline_seq SET NOT NULL",
     "CREATE INDEX IF NOT EXISTS ix_fa_max_ste_person_timeline_seq ON fa_max_state_transition_events (person_id, timeline_seq)",
     "CREATE INDEX IF NOT EXISTS ix_fa_max_interaction_person_timeline_seq ON fa_max_interactions (person_id, timeline_seq)",
     "CREATE INDEX IF NOT EXISTS ix_fa_max_prop_assoc_person_timeline_seq ON fa_max_property_associations (person_id, timeline_seq)",
+    "CREATE INDEX IF NOT EXISTS ix_fa_max_prop_assoc_event_person_timeline_seq ON fa_max_property_association_events (person_id, timeline_seq)",
 
     # ------------------------------------------------------------------ #
     # 6. DB-enforced immutability trigger on event spine + interactions   #
@@ -229,7 +295,7 @@ STATEMENTS = [
     CREATE OR REPLACE FUNCTION fa_max_guard_immutable_row()
     RETURNS TRIGGER LANGUAGE plpgsql AS $$
     BEGIN
-        IF current_setting('fa_max.allow_state_write', true) <> 'on' THEN
+        IF COALESCE(current_setting('fa_max.allow_state_write', true), 'off') <> 'on' THEN
             RAISE EXCEPTION
                 'fa_max: direct UPDATE/DELETE on % is forbidden. '
                 'State changes must go through transition(). '
@@ -249,7 +315,7 @@ STATEMENTS = [
     CREATE OR REPLACE FUNCTION fa_max_guard_state_write()
     RETURNS TRIGGER LANGUAGE plpgsql AS $$
     BEGIN
-        IF current_setting('fa_max.allow_state_write', true) <> 'on' THEN
+        IF COALESCE(current_setting('fa_max.allow_state_write', true), 'off') <> 'on' THEN
             RAISE EXCEPTION
                 'fa_max: direct state update on % is forbidden; use transition()',
                 TG_TABLE_NAME;
@@ -354,6 +420,7 @@ def main() -> int:
             "fa_max_partners",
             "fa_max_interactions",
             "fa_max_property_associations",
+            "fa_max_property_association_events",
             "fa_max_work_queue",
         ]
         for table in tables:
