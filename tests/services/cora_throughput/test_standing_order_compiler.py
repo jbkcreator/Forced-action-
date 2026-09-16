@@ -26,6 +26,24 @@ def test_five_clean_approvals_propose_a_standing_order(fresh_db, monkeypatch):
     assert row["active"] is False
 
 
+def test_compile_standing_orders_skips_when_cora_is_killed(fresh_db, monkeypatch):
+    """STOP CORA / STOP CORA FOREVER must stop new standing-order proposals
+    from being posted to the approvals channel too."""
+    monkeypatch.setattr(standing_order_compiler, "cora_halted", lambda: True)
+    posted = []
+    monkeypatch.setattr(
+        standing_order_compiler, "_post_standing_order_proposal", lambda *a, **k: posted.append(1) or None,
+    )
+    for i in range(5):
+        seed_decided_item(fresh_db, f"DRAFT-STREAK-KILLED-{i}", "cell_kill_switch_gate_only")
+
+    result = standing_order_compiler.compile_standing_orders(fresh_db)
+
+    assert result == {"proposed": []}
+    assert posted == []
+    assert _standing_order_row(fresh_db, "cell_kill_switch_gate_only") is None
+
+
 def test_fewer_than_five_approvals_does_not_propose(fresh_db, monkeypatch):
     monkeypatch.setattr(standing_order_compiler, "_post_standing_order_proposal", lambda *a, **k: None)
     for i in range(4):
