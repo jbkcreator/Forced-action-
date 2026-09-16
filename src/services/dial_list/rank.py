@@ -3,11 +3,14 @@
 Entrypoint: rank_dial_list(candidates, as_of, config) -> DialList
 
 No I/O, no DB, no network, no LLM. Deterministic and fully unit-testable.
-Score (Q9): expected_revenue = probability × expected_loan × commission × urgency,
-then × builder_multiplier when the opportunity is a builder (Q10).
+Score (Q9): expected_revenue = probability × commission × urgency, where
+commission = commission_rate × expected_loan — so loan size enters exactly once
+(as commission dollars), not squared. Then × builder_multiplier when the
+opportunity is a builder (Q10).
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
@@ -19,18 +22,14 @@ _ZERO = Decimal("0")
 _ONE = Decimal("1")
 
 
+@dataclass(frozen=True, slots=True)
 class _Score:
-    __slots__ = ("expected_revenue", "probability", "expected_loan",
-                 "commission", "urgency", "loan_confidence")
-
-    def __init__(self, expected_revenue, probability, expected_loan,
-                 commission, urgency, loan_confidence):
-        self.expected_revenue = expected_revenue
-        self.probability = probability
-        self.expected_loan = expected_loan
-        self.commission = commission
-        self.urgency = urgency
-        self.loan_confidence = loan_confidence
+    expected_revenue: Decimal
+    probability: Decimal
+    expected_loan: Decimal
+    commission: Decimal
+    urgency: Decimal
+    loan_confidence: LoanConfidence
 
 
 def _probability(c: DialCandidate, config: DialListConfig) -> Decimal:
@@ -70,7 +69,7 @@ def _score(c: DialCandidate, as_of: date, config: DialListConfig) -> _Score:
     expected_loan, loan_conf = _expected_loan(c, config)
     commission = config.commission_rate * expected_loan
     urgency = _urgency(c, as_of, config)
-    expected_revenue = probability * expected_loan * commission * urgency
+    expected_revenue = probability * commission * urgency
     if c.is_builder:
         expected_revenue = expected_revenue * config.builder_multiplier
     return _Score(expected_revenue, probability, expected_loan,
@@ -94,25 +93,23 @@ def _merge_triggers(existing: List[str], incoming: List[str]) -> List[str]:
     return merged
 
 
+_REASON_BY_TRIGGER: Tuple[Tuple[str, str], ...] = (
+    ("builder", "Builder / new-construction signal — larger loan likely."),
+    ("cash_purchase", "Cash purchase, no financing — may want leverage next deal."),
+    ("auction_probate", "Bought at auction/probate — fresh project likely forming."),
+    ("stalled_flip", "Stalled flip (open permit, no completion) — may need a bridge/takeout."),
+    ("permits_no_financing", "Permits pulled, no recorded financing — funding work out of pocket."),
+    ("out_of_state", "Out-of-state owner — likely needs a local lending relationship."),
+)
+_REASON_INTENT_ONLY = "Financing-intent signals present."
+_REASON_FALLBACK = "Financing-intent opportunity."
+
+
 def _reason(c: DialCandidate, triggers: List[str]) -> Tuple[str, List[str]]:
     tset = set(triggers)
-    parts: List[str] = []
-    if "builder" in tset:
-        parts.append("Builder / new-construction signal — larger loan likely.")
-    if "cash_purchase" in tset:
-        parts.append("Cash purchase, no financing — may want leverage next deal.")
-    if "auction_probate" in tset:
-        parts.append("Bought at auction/probate — fresh project likely forming.")
-    if "stalled_flip" in tset:
-        parts.append("Stalled flip (open permit, no completion) — may need a bridge/takeout.")
-    if "permits_no_financing" in tset:
-        parts.append("Permits pulled, no recorded financing — funding work out of pocket.")
-    if "out_of_state" in tset:
-        parts.append("Out-of-state owner — likely needs a local lending relationship.")
-    if "financing_intent" in tset and not parts:
-        parts.append("Financing-intent signals present.")
+    parts = [text for trigger, text in _REASON_BY_TRIGGER if trigger in tset]
     if not parts:
-        parts.append("Financing-intent opportunity.")
+        parts.append(_REASON_INTENT_ONLY if "financing_intent" in tset else _REASON_FALLBACK)
 
     talking_points: List[str] = []
     if c.properties_owned is not None:
@@ -159,7 +156,9 @@ def rank_dial_list(
     entries: List[DialListEntry] = []
     for i, (c, s, triggers) in enumerate(rows[: cfg.list_size], start=1):
         reason, talking_points = _reason(c, triggers)
-        if s.loan_confidence == "low" and s.expected_loan > _ZERO:
+        if s.expected_loan <= _ZERO:
+            talking_points.append("No loan-size estimate available (insufficient data)")
+        elif s.loan_confidence == "low":
             talking_points.append("Est. loan size low-confidence (fallback basis)")
         entries.append(
             DialListEntry(

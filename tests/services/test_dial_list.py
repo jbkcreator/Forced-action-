@@ -170,6 +170,33 @@ def test_urgency_date_proximity():
     assert result.entries[0].urgency > result.entries[1].urgency
 
 
+# 13 — formula pinned numerically: loan enters once (via commission), not squared
+def test_expected_revenue_formula_no_double_count():
+    c = _cand(property_id=1, buyer_entity_id=1, intent_tier="high",
+              max_ltc=Decimal("0.80"), arv=Decimal("500000"))  # loan 400k
+    entry = rank_dial_list([c], AS_OF).entries[0]
+    assert entry.expected_loan == Decimal("400000")
+    assert entry.commission == Decimal("6000")  # 0.015 × 400k
+    # probability(0.50) × commission(6000) × urgency(1.0) — loan is NOT squared
+    assert entry.expected_revenue == Decimal("3000")
+
+
+# 14 — no loan basis: caveat says the size is unavailable, not merely low-confidence
+def test_no_loan_basis_flags_unavailable():
+    c = _cand(property_id=1, buyer_entity_id=1, intent_tier="high")
+    entry = rank_dial_list([c], AS_OF).entries[0]
+    assert "No loan-size estimate available (insufficient data)" in entry.talking_points
+    assert "low-confidence" not in " ".join(entry.talking_points)
+
+
+# 15 — fallback loan basis is flagged low-confidence (not "unavailable")
+def test_fallback_loan_basis_flags_low_confidence():
+    c = _cand(property_id=1, buyer_entity_id=1, intent_tier="high",
+              assessed_value_mkt=Decimal("300000"))
+    entry = rank_dial_list([c], AS_OF).entries[0]
+    assert "Est. loan size low-confidence (fallback basis)" in entry.talking_points
+
+
 def test_invalid_config_rejected():
     with pytest.raises(Exception):
         DialListConfig(list_size=0)

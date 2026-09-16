@@ -72,4 +72,4 @@ class DialList(BaseModel):
     generated_for: date
     entries: List[DialListEntry] = Field(default_factory=list)
     candidate_count: int = 0
-    config_version: str = "wp9-1.0.0"
+    config_version: str

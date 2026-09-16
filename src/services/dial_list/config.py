@@ -1,8 +1,9 @@
 """WP-9 Dial List — scoring configuration.
 
-All coefficients live here (Q9/Q10/Q11), never in code, so the ranking can be
-tuned without a code change. Defaults are starting points and should be
-validated against real outcomes before the list is trusted unattended.
+Every coefficient (Q9/Q10/Q11) is a config field, so the ranking is tuned by
+constructing a DialListConfig with overrides rather than editing the ranker.
+Defaults are starting points and should be validated against real outcomes
+before the list is trusted unattended.
 """
 from __future__ import annotations
 
@@ -10,20 +11,6 @@ from decimal import Decimal
 from typing import Dict
 
 from pydantic import BaseModel, Field, model_validator
-
-# Trigger kinds that are ACTIVE (have a live data source). Maturities /
-# price-drop / 1031-exchange are omitted deliberately — hard API gaps.
-TriggerType = str  # constrained by _ACTIVE_TRIGGERS below at validation time
-
-_ACTIVE_TRIGGERS = (
-    "cash_purchase",
-    "stalled_flip",
-    "permits_no_financing",
-    "auction_probate",
-    "out_of_state",
-    "financing_intent",
-    "builder",
-)
 
 
 class DialListConfig(BaseModel):
