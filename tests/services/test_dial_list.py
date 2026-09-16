@@ -145,7 +145,7 @@ def test_reason_and_talking_points():
     entry = rank_dial_list([c], AS_OF).entries[0]
     assert "leverage" in entry.reason.lower()
     assert "Owns 4 properties" in entry.talking_points
-    assert "Last deal 8 months ago" in entry.talking_points
+    assert "Last sale 8 months ago" in entry.talking_points
 
 
 # 11 — config overrides change output
@@ -185,16 +185,18 @@ def test_expected_revenue_formula_no_double_count():
 def test_no_loan_basis_flags_unavailable():
     c = _cand(property_id=1, buyer_entity_id=1, intent_tier="high")
     entry = rank_dial_list([c], AS_OF).entries[0]
-    assert "No loan-size estimate available (insufficient data)" in entry.talking_points
+    assert "No size estimate (insufficient data)" in entry.talking_points
     assert "low-confidence" not in " ".join(entry.talking_points)
 
 
-# 15 — fallback loan basis is flagged low-confidence (not "unavailable")
+# 15 — fallback loan basis is flagged via the confidence field, no jargon line
 def test_fallback_loan_basis_flags_low_confidence():
     c = _cand(property_id=1, buyer_entity_id=1, intent_tier="high",
               assessed_value_mkt=Decimal("300000"))
     entry = rank_dial_list([c], AS_OF).entries[0]
-    assert "Est. loan size low-confidence (fallback basis)" in entry.talking_points
+    assert entry.expected_loan_confidence == "low"
+    # confidence is surfaced in the digest header, not tagged in every line
+    assert not any("fallback" in p for p in entry.talking_points)
 
 
 # 16 — implausible loan basis is clipped to the cap and flagged low-confidence
@@ -204,6 +206,16 @@ def test_expected_loan_capped():
     entry = rank_dial_list([huge], AS_OF).entries[0]
     assert entry.expected_loan == Decimal("5000000")  # default max_expected_loan
     assert entry.expected_loan_confidence == "low"
+
+
+# 17 — misleading relationship facts are suppressed (owns 0, stale sale proxy)
+def test_relationship_facts_suppressed_when_empty_or_stale():
+    c = _cand(property_id=1, buyer_entity_id=1, triggers=["cash_purchase"],
+              intent_tier="high", assessed_value_mkt=Decimal("300000"),
+              properties_owned=0, last_deal_months_ago=175)
+    tp = rank_dial_list([c], AS_OF).entries[0].talking_points
+    assert not any("Owns" in p for p in tp)        # owns 0 → hidden
+    assert not any("Last sale" in p for p in tp)   # 175mo → too stale, hidden
 
 
 def test_invalid_config_rejected():

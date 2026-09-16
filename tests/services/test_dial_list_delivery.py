@@ -82,8 +82,7 @@ def test_digest_renders_rank_trigger_size_reason_points():
     text = "\n".join(b["text"]["text"] for b in blocks if b["type"] == "section")
     assert "#1" in text
     assert "cash_purchase" in text
-    assert "$400,000" in text
-    assert "(high)" in text
+    assert "$400K" in text  # compact money format
     assert "leverage" in text.lower()
     assert "Owns 4 properties" in text
     assert "top 1 calls" in header
@@ -115,11 +114,13 @@ def test_digest_no_loan_basis_shows_size_na():
     assert "size n/a" in text
 
 
-def test_digest_low_confidence_surfaced():
+def test_digest_low_confidence_surfaced_in_header():
     dl = _dial_list([_entry(expected_loan_confidence="low")])
-    _, blocks = format_dial_list_digest(dl)
-    text = "\n".join(b["text"]["text"] for b in blocks if b["type"] == "section")
-    assert "(low)" in text
+    header, blocks = format_dial_list_digest(dl)
+    # surfaced once in the header, not tagged on every entry line
+    assert "rough estimates from assessed value" in header
+    line = "\n".join(b["text"]["text"] for b in blocks if b["type"] == "section")
+    assert "(low)" not in line
 
 
 # ---- delivery handoff (faked Slack) ---------------------------------------

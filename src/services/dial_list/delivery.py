@@ -24,22 +24,39 @@ logger = logging.getLogger(__name__)
 _ZERO = Decimal("0")
 
 
-def _borrower_label(entry: DialListEntry) -> str:
-    if entry.borrower_resolved and entry.buyer_entity_id is not None:
-        return f"Borrower #{entry.buyer_entity_id}"
+def _name_label(entry: DialListEntry) -> str:
+    if entry.contact_name:
+        name = entry.contact_name
+        return name if entry.borrower_resolved else f"{name} (unverified)"
     return "Unresolved borrower"
+
+
+def _property_label(entry: DialListEntry) -> str:
+    if entry.property_address:
+        return entry.property_address
+    return f"property `{entry.property_id}`"
+
+
+def _money_short(amount: Decimal) -> str:
+    if amount >= 1_000_000:
+        return f"${amount / Decimal('1000000'):.1f}M"
+    if amount >= 1_000:
+        return f"${amount / Decimal('1000'):.0f}K"
+    return f"${amount:,.0f}"
 
 
 def _size_label(entry: DialListEntry) -> str:
     if entry.expected_loan <= _ZERO:
         return "size n/a"
-    return f"~${entry.expected_loan:,.0f} ({entry.expected_loan_confidence})"
+    return f"~{_money_short(entry.expected_loan)}"
 
 
 def _entry_line(entry: DialListEntry) -> str:
     triggers = ", ".join(entry.triggers) if entry.triggers else "—"
+    phone = f" · :phone: {entry.phone}" if entry.phone else ""
     line = (
-        f"*#{entry.rank}* — {_borrower_label(entry)} · property `{entry.property_id}`\n"
+        f"*#{entry.rank}* — *{_name_label(entry)}*{phone}\n"
+        f"  {_property_label(entry)}\n"
         f"  _{triggers}_ · Est. {_size_label(entry)}\n"
         f"  {entry.reason}"
     )
@@ -53,10 +70,19 @@ def _header_text(dial_list: DialList) -> str:
     n = len(dial_list.entries)
     if n == 0:
         return f"*Dial List — {dial_list.generated_for}* — no opportunities today"
-    return (
+    header = (
         f"*Dial List — {dial_list.generated_for}* — top {n} calls "
         f"({dial_list.candidate_count} candidates · {dial_list.config_version})"
     )
+    if any(
+        e.expected_loan_confidence == "low" and e.expected_loan > _ZERO
+        for e in dial_list.entries
+    ):
+        header += (
+            "\n_Sizes are rough estimates from assessed value "
+            "(ARV comps pending)._"
+        )
+    return header
 
 
 def format_dial_list_digest(dial_list: DialList) -> Tuple[str, List[Dict[str, Any]]]:

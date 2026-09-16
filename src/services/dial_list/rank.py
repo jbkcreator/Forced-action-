@@ -21,6 +21,10 @@ from .models import DialCandidate, DialList, DialListEntry, LoanConfidence
 _ZERO = Decimal("0")
 _ONE = Decimal("1")
 
+# Beyond this the property's last-sale proxy is too stale to read as recent
+# activity — drop it rather than show a misleading "last deal 14 years ago".
+_MAX_LAST_SALE_MONTHS = 36
+
 
 @dataclass(frozen=True, slots=True)
 class _Score:
@@ -121,10 +125,13 @@ def _reason(c: DialCandidate, triggers: List[str]) -> Tuple[str, List[str]]:
         parts.append(_REASON_INTENT_ONLY if "financing_intent" in tset else _REASON_FALLBACK)
 
     talking_points: List[str] = []
-    if c.properties_owned is not None:
+    if c.properties_owned:  # suppress 0 / None — misleading, not "owns nothing"
         talking_points.append(f"Owns {c.properties_owned} properties")
-    if c.last_deal_months_ago is not None:
-        talking_points.append(f"Last deal {c.last_deal_months_ago} months ago")
+    if (
+        c.last_deal_months_ago is not None
+        and c.last_deal_months_ago <= _MAX_LAST_SALE_MONTHS
+    ):
+        talking_points.append(f"Last sale {c.last_deal_months_ago} months ago")
     if "out_of_state" in tset:
         talking_points.append("Out-of-state owner")
 
@@ -165,10 +172,10 @@ def rank_dial_list(
     entries: List[DialListEntry] = []
     for i, (c, s, triggers) in enumerate(rows[: cfg.list_size], start=1):
         reason, talking_points = _reason(c, triggers)
+        # Low-confidence (fallback) sizing is surfaced once in the digest header,
+        # not tagged per line — it's currently the norm until ARV comps land.
         if s.expected_loan <= _ZERO:
-            talking_points.append("No loan-size estimate available (insufficient data)")
-        elif s.loan_confidence == "low":
-            talking_points.append("Est. loan size low-confidence (fallback basis)")
+            talking_points.append("No size estimate (insufficient data)")
         entries.append(
             DialListEntry(
                 property_id=c.property_id,
