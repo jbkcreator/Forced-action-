@@ -192,6 +192,59 @@ def test_three_comps_produce_result(db):
     assert result.point is not None
 
 
+def test_repeated_sales_for_one_property_count_as_one_comp(db):
+    county = "county-distinct-comps"
+    _prop(db, 1100, county, subdivision="ALPHA")
+    _prop(db, 1101, county, subdivision="ALPHA")
+    _sale(
+        db,
+        1101,
+        county,
+        sale_yr=2025,
+        sale_mo=6,
+        sale_price=Decimal("260000"),
+        clerk_no="newer-sale",
+    )
+    _sale(
+        db,
+        1101,
+        county,
+        sale_yr=2024,
+        sale_mo=6,
+        sale_price=Decimal("220000"),
+        clerk_no="older-sale",
+    )
+    _prop(db, 1102, county, subdivision="ALPHA")
+    _sale(db, 1102, county, sale_price=Decimal("250000"))
+    db.flush()
+
+    candidates = fetch_candidate_sales(
+        db,
+        subject_property_id=1100,
+        county_id=county,
+        property_use_code="0100",
+        qualified_qual_codes=["01", "02", "03", "04", "05", "06"],
+        as_of_yr=2025,
+        as_of_mo=9,
+    )
+
+    assert [(c.property_id, c.sale_price) for c in candidates] == [
+        (1101, Decimal("260000.00")),
+        (1102, Decimal("250000.00")),
+    ]
+
+    result = compute_arv_for_property(
+        db,
+        subject_property_id=1100,
+        as_of_yr=2025,
+        as_of_mo=9,
+        after_repair_condition=4,
+    )
+    assert result.comp_count == 2
+    assert result.weak_comp is True
+    assert result.confidence == "low"
+
+
 def test_null_price_comp_excluded(db):
     county = "county-nullprice"
     _prop(db, 2000, county, subdivision="ALPHA")

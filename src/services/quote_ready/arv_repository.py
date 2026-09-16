@@ -56,32 +56,57 @@ _SUBJECT_SQL = text(
 
 _CANDIDATES_SQL = text(
     """
+    WITH ranked_sales AS (
+        SELECT
+            d.property_id            AS property_id,
+            d.sale_price             AS sale_price,
+            d.sale_yr                AS sale_yr,
+            d.sale_mo                AS sale_mo,
+            d.qual_cd                AS qual_cd,
+            p.heated_sq_ft           AS heated_sq_ft,
+            p.sq_ft                  AS sq_ft,
+            p.beds                   AS beds,
+            p.baths                  AS baths,
+            p.property_use_code      AS property_use_code,
+            p.building_condition     AS building_condition,
+            p.subdivision            AS subdivision,
+            p.hcpa_neighborhood_code AS hcpa_neighborhood_code,
+            p.zip                    AS zip,
+            p.county_id              AS county_id,
+            ROW_NUMBER() OVER (
+                PARTITION BY d.property_id
+                ORDER BY d.sale_yr DESC, d.sale_mo DESC, d.id DESC
+            ) AS sale_rank
+        FROM dor_sales d
+        JOIN properties p ON d.property_id = p.id
+        WHERE p.county_id = :county
+          AND d.property_id != :subject_id
+          AND d.sale_price IS NOT NULL
+          AND d.sale_price > 0
+          AND p.property_use_code = :use_code
+          AND d.qual_cd IN :qual_codes
+          AND ((:as_of_yr * 12 + :as_of_mo) - (d.sale_yr * 12 + d.sale_mo))
+              BETWEEN 0 AND :months
+    )
     SELECT
-        d.property_id            AS property_id,
-        d.sale_price             AS sale_price,
-        d.sale_yr                AS sale_yr,
-        d.sale_mo                AS sale_mo,
-        d.qual_cd                AS qual_cd,
-        p.heated_sq_ft           AS heated_sq_ft,
-        p.sq_ft                  AS sq_ft,
-        p.beds                   AS beds,
-        p.baths                  AS baths,
-        p.property_use_code      AS property_use_code,
-        p.building_condition     AS building_condition,
-        p.subdivision            AS subdivision,
-        p.hcpa_neighborhood_code AS hcpa_neighborhood_code,
-        p.zip                    AS zip,
-        p.county_id              AS county_id
-    FROM dor_sales d
-    JOIN properties p ON d.property_id = p.id
-    WHERE p.county_id = :county
-      AND d.property_id != :subject_id
-      AND d.sale_price IS NOT NULL
-      AND d.sale_price > 0
-      AND p.property_use_code = :use_code
-      AND d.qual_cd IN :qual_codes
-      AND ((:as_of_yr * 12 + :as_of_mo) - (d.sale_yr * 12 + d.sale_mo))
-          BETWEEN 0 AND :months
+        property_id,
+        sale_price,
+        sale_yr,
+        sale_mo,
+        qual_cd,
+        heated_sq_ft,
+        sq_ft,
+        beds,
+        baths,
+        property_use_code,
+        building_condition,
+        subdivision,
+        hcpa_neighborhood_code,
+        zip,
+        county_id
+    FROM ranked_sales
+    WHERE sale_rank = 1
+    ORDER BY property_id
     """
 ).bindparams(bindparam("qual_codes", expanding=True))
 
