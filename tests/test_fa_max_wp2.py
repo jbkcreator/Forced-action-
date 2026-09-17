@@ -486,16 +486,22 @@ class TestGuards10DLC:
             verdict = evaluate(item, now=self._window_now())
             assert verdict.outcome == ALLOW
 
-    def test_fa_max_send_blocked_while_relay_send_mode_is_not_live(self):
-        """Code-review finding: channels_email.py/channels_sms.py's fake-mode
-        branch returns normally, and the engine treats any normal return as
-        a real send -- mark_sent() then writes a durable WP-1 interaction and
-        a Slack "sent" receipt. fa_max_relay_send_mode defaults to "fake", so
-        without this gate an approved item reaching a real production sweep
-        would be permanently recorded as sent with no actual send. This must
-        block BEFORE the 10DLC check (email isn't even sms-gated by it) --
-        while mode isn't "live", nothing FA Max dispatches, any channel."""
-        from src.services.relay.guards import evaluate, BLOCK
+    def test_fa_max_send_deferred_while_relay_send_mode_is_not_live(self):
+        """Code-review findings (two rounds): channels_email.py/
+        channels_sms.py's fake-mode branch returns normally, and the engine
+        treats any normal return as a real send -- mark_sent() then writes a
+        durable WP-1 interaction and a Slack "sent" receipt.
+        fa_max_relay_send_mode defaults to "fake", so without this gate an
+        approved item reaching a real production sweep would be permanently
+        recorded as sent with no actual send.
+
+        This MUST be DEFER, not BLOCK: the first version of this fix used
+        BLOCK, which engine.py turns into queue.mark_skipped() -- a terminal
+        transition approved_batch() never revisits, silently discarding
+        every FA Max item approved before the lane goes live. DEFER leaves
+        the row 'approved' so it's retried every sweep tick and dispatches
+        normally once the flag flips, with no work lost."""
+        from src.services.relay.guards import evaluate, DEFER
 
         item = _make_queue_item(
             channel="email", recipient="a@example.com", venture_key="fa_max_lending",
@@ -512,8 +518,8 @@ class TestGuards10DLC:
             gs.return_value = settings
 
             verdict = evaluate(item, now=self._window_now())
-            assert verdict.outcome == BLOCK
-            assert "fa_max_relay_send_mode_not_live" in verdict.reason
+            assert verdict.outcome == DEFER
+            assert verdict.reason == "fa_max_relay_send_mode_not_live"
 
     def test_fa_max_send_not_blocked_by_mode_gate_once_live(self):
         """Sanity check for the guard above: once fa_max_relay_send_mode is

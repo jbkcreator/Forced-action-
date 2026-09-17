@@ -285,6 +285,50 @@ def test_blocked_item_marked_skipped_never_claimed(fake_backend, unlimited_ceili
     assert fake_backend.skipped[1] == "suppressed:email_opt_out"
 
 
+def test_fa_max_approved_item_survives_fake_mode_and_dispatches_once_live(
+    fake_backend, unlimited_ceiling, green_kill_switch, monkeypatch,
+):
+    """Code-review finding (WP-T2-1, second round): a fix that blocked FA
+    Max dispatch while fa_max_relay_send_mode != "live" originally used
+    BLOCK, which is terminal (mark_skipped -- approved_batch() never
+    revisits it), silently discarding every item approved before the lane
+    went live. Uses the real guards.evaluate() (not a stub, unlike the
+    generic DEFER test above) to prove the actual fix: repeated ticks in
+    fake mode leave the row 'approved' and untouched, and it dispatches
+    normally the moment the flag flips to "live" with no re-approval and no
+    lost work."""
+    from src.services.relay import guards as relay_guards
+
+    item = replace(
+        _make_item(1, channel="fake"), venture_key="fa_max_lending",
+        person_id="00000000-0000-0000-0000-000000000001", agent_name="vera",
+        autonomy_tier_at_send="A", lane="MONEY",
+        decided_by="josh", decision_interaction_id="00000000-0000-0000-0000-000000000002",
+    )
+    calls = []
+    monkeypatch.setitem(relay_engine.DISPATCHERS, "fake", lambda item: calls.append(item.id))
+    monkeypatch.setattr(relay_guards, "_suppression_reason", lambda item: None)
+    monkeypatch.setattr(relay_guards, "_fa_max_compliance_reason", lambda item: None)
+
+    settings = type("S", (), {"fa_max_relay_send_mode": "fake", "fa_max_10dlc_registered": True})()
+    monkeypatch.setattr(relay_guards, "get_settings", lambda: settings)
+
+    for _ in range(3):  # repeated fake-mode sweep ticks
+        result = relay_engine.execute_batch([item], batch_id="b1", now=_IN_WINDOW_NOW)
+        assert result.deferred == 1
+        assert result.sent == 0
+        assert calls == []
+        assert fake_backend.claimed == set()
+        assert 1 not in fake_backend.skipped
+        assert 1 not in fake_backend.sent
+
+    settings.fa_max_relay_send_mode = "live"  # domain/DNS/10DLC now confirmed
+    result = relay_engine.execute_batch([item], batch_id="b2", now=_IN_WINDOW_NOW)
+    assert result.sent == 1
+    assert calls == [1]
+    assert fake_backend.sent == [1]
+
+
 def test_fa_max_block_is_surfaced_to_its_slack_lane(fake_backend, unlimited_ceiling, green_kill_switch, monkeypatch):
     """A send-layer refusal is durable first, then visible to the operator."""
     item = replace(_make_item(1), venture_key="fa_max_lending", lane="EXCEPTIONS")

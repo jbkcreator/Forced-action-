@@ -58,3 +58,4 @@ GUARD_BLOCK = "block"
 # reserve/release step (see guards.py).
 REASON_OUTSIDE_SEND_WINDOW = "outside_send_window"
 REASON_SUPPRESSED = "suppressed"  # suffixed with ":{cause}", e.g. "suppressed:email_opt_out"
+REASON_FA_MAX_SEND_MODE_NOT_LIVE = "fa_max_relay_send_mode_not_live"
