@@ -1091,17 +1091,75 @@ def extract_permit_candidates(
     yield from _permit_name_candidates(session, "permit_staging", only_unresolved)
 
 
+_EXCEPTIONS_CARD_ROW_CAP = 15  # Block Kit safety: keep well under the 50-block limit
+
+
+def _severity(conf: int) -> str:
+    """Visual severity by distance below the confidence floor."""
+    return "🔴" if conf < 60 else "🟠"
+
+
 def _build_exceptions_message(low_conf_links: list[tuple[str, int, str, int]]) -> str:
-    """Render the batched EXCEPTIONS alert text (pure — unit-testable)."""
+    """Plain-text fallback (notifications + clients without Block Kit)."""
+    n = len(low_conf_links)
     lines = [
-        f"• {src}#{src_id} '{name}' → entity_id={entity_id} confidence={conf} (UNVERIFIED)"
-        for src, src_id, name, conf, entity_id in low_conf_links
+        f"• {name} — {src} #{src_id} → entity {entity_id} · confidence {conf} (unverified)"
+        for src, src_id, name, conf, entity_id in low_conf_links[:_EXCEPTIONS_CARD_ROW_CAP]
     ]
-    return (
-        f":building_construction: *Builder permit resolution — {len(lines)} low-confidence link(s)*\n"
-        + "\n".join(lines[:20])  # cap to avoid oversized messages
-        + ("\n… (truncated)" if len(lines) > 20 else "")
-    )
+    extra = f"\n…and {n - _EXCEPTIONS_CARD_ROW_CAP} more" if n > _EXCEPTIONS_CARD_ROW_CAP else ""
+    return f"Builder permit resolution — {n} low-confidence link(s) need review\n" + "\n".join(lines) + extra
+
+
+def _build_exceptions_blocks(low_conf_links: list[tuple[str, int, str, int]]) -> list[dict]:
+    """Render a Block Kit card for the EXCEPTIONS alert (pure — unit-testable)."""
+    n = len(low_conf_links)
+    shown = low_conf_links[:_EXCEPTIONS_CARD_ROW_CAP]
+
+    blocks: list[dict] = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": "🏗  Builder Permit Resolution", "emoji": True},
+        },
+        {
+            "type": "context",
+            "elements": [{
+                "type": "mrkdwn",
+                "text": (
+                    f"*{n}* permit link{'s' if n != 1 else ''} resolved *below the confidence floor* "
+                    f"(<{_BUILDER_CONFIDENCE_FLOOR}) — confirm or reject each match before it is trusted."
+                ),
+            }],
+        },
+        {"type": "divider"},
+    ]
+
+    for src, src_id, name, conf, entity_id in shown:
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"{_severity(conf)}  *{name}*\n"
+                    f"`{src}` #{src_id}  →  entity `{entity_id}`"
+                ),
+            },
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Confidence*\n{conf} / 100"},
+                {"type": "mrkdwn", "text": "*Status*\n_unverified_"},
+            ],
+        })
+
+    if n > _EXCEPTIONS_CARD_ROW_CAP:
+        blocks.append({
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": f"…and *{n - _EXCEPTIONS_CARD_ROW_CAP}* more not shown"}],
+        })
+
+    blocks.append({
+        "type": "context",
+        "elements": [{"type": "mrkdwn", "text": "Lane: *EXCEPTIONS*  ·  Source: Builder Engine (WP-T2-8)"}],
+    })
+    return blocks
 
 
 def _emit_exceptions_alerts(
@@ -1128,10 +1186,13 @@ def _emit_exceptions_alerts(
         )
         return
 
-    msg = _build_exceptions_message(low_conf_links)
     try:
         from slack_sdk import WebClient
-        WebClient(token=token.get_secret_value()).chat_postMessage(channel=channel, text=msg)
+        WebClient(token=token.get_secret_value()).chat_postMessage(
+            channel=channel,
+            text=_build_exceptions_message(low_conf_links),   # notification / a11y fallback
+            blocks=_build_exceptions_blocks(low_conf_links),
+        )
         logger.info("_emit_exceptions_alerts: posted %d low-confidence permit link(s) to EXCEPTIONS",
                     len(low_conf_links))
     except Exception as exc:

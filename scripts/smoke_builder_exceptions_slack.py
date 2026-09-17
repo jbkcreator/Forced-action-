@@ -13,7 +13,13 @@ from __future__ import annotations
 
 import sys
 
-from src.services.buyer_entity_resolution import _emit_exceptions_alerts, _build_exceptions_message
+import json
+
+from src.services.buyer_entity_resolution import (
+    _build_exceptions_blocks,
+    _build_exceptions_message,
+    _emit_exceptions_alerts,
+)
 
 
 def _safe_print(text: str) -> None:
@@ -27,8 +33,10 @@ def main() -> None:
         ("permit_staging", 101, "ACME HOMES LLC", 62, 5001),
         ("building_permits", 202, "BUILDPRO INC", 58, 5002),
     ]
-    _safe_print("=== message that will be sent ===")
+    _safe_print("=== plain-text fallback ===")
     _safe_print(_build_exceptions_message(sample))
+    _safe_print("=== Block Kit card (JSON) ===")
+    _safe_print(json.dumps(_build_exceptions_blocks(sample), indent=2))
     _safe_print("=== attempting Slack post ===")
     _emit_exceptions_alerts(sample)
     _safe_print("done - check the EXCEPTIONS channel (or the log line if unconfigured).")

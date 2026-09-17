@@ -8,6 +8,7 @@ from sqlalchemy import text
 from unittest import mock
 
 from src.services.buyer_entity_resolution import (
+    _build_exceptions_blocks,
     _build_exceptions_message,
     _emit_exceptions_alerts,
     _infer_entity_type_from_name,
@@ -15,14 +16,40 @@ from src.services.buyer_entity_resolution import (
 )
 
 
-def test_exceptions_message_renders_links():
+def test_exceptions_message_fallback_renders_links():
     msg = _build_exceptions_message([
         ("permit_staging", 1, "ACME HOMES LLC", 62, 900),
         ("building_permits", 2, "BUILDPRO INC", 55, 901),
     ])
-    assert "2 low-confidence link(s)" in msg
-    assert "permit_staging#1 'ACME HOMES LLC'" in msg
-    assert "confidence=62 (UNVERIFIED)" in msg
+    assert "2 low-confidence link(s) need review" in msg
+    assert "ACME HOMES LLC" in msg
+    assert "confidence 62 (unverified)" in msg
+
+
+def test_exceptions_blocks_structure():
+    blocks = _build_exceptions_blocks([
+        ("permit_staging", 1, "ACME HOMES LLC", 62, 900),   # 🟠
+        ("building_permits", 2, "BUILDPRO INC", 55, 901),   # 🔴
+    ])
+    assert blocks[0]["type"] == "header"
+    assert "Builder Permit Resolution" in blocks[0]["text"]["text"]
+    # one section per link, each with the two-field confidence/status layout
+    sections = [b for b in blocks if b["type"] == "section"]
+    assert len(sections) == 2
+    assert "*ACME HOMES LLC*" in sections[0]["text"]["text"]
+    assert any("Confidence" in f["text"] for f in sections[0]["fields"])
+    assert "🟠" in sections[0]["text"]["text"]   # 62 → below floor, not critical
+    assert "🔴" in sections[1]["text"]["text"]   # 55 → critical
+
+
+def test_exceptions_blocks_cap_and_overflow():
+    links = [("permit_staging", i, f"BUILDER {i} LLC", 60, 1000 + i) for i in range(20)]
+    blocks = _build_exceptions_blocks(links)
+    sections = [b for b in blocks if b["type"] == "section"]
+    assert len(sections) == 15                       # capped
+    assert any("5" in e["text"] and "more" in e["text"]
+               for b in blocks if b["type"] == "context"
+               for e in b["elements"])               # overflow note present
 
 
 def test_exceptions_alert_noops_when_slack_unconfigured():
