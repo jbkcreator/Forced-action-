@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 
 import uuid
 
+from config.settings import settings as global_settings
 from src.core.database import get_db_context
 from src.services.tracked_links import (
     build_tracked_link_reply,
@@ -21,6 +22,7 @@ from src.services.tracked_links import (
 )
 
 _TAG = "ztest-slack-slash"
+_ALLOWED_CHANNEL = "C_TEST_RELATIONSHIPS"
 
 
 def test_usage_message_on_missing_args(fresh_db):
@@ -91,17 +93,36 @@ def test_socket_handler_ignores_other_slash_commands():
     client = MagicMock()
     request = SimpleNamespace(
         envelope_id="env-2", type="slash_commands",
-        payload={"command": "/some-other-command", "text": "", "user_name": "josh"},
+        payload={"command": "/some-other-command", "text": "", "user_name": "josh", "channel_id": _ALLOWED_CHANNEL},
     )
     assert handle_tracked_link_socket_request(client, request) is False
     client.send_socket_mode_response.assert_not_called()
 
 
-def test_socket_handler_handles_tracked_link_command():
+def test_socket_handler_rejects_wrong_channel(monkeypatch):
+    monkeypatch.setattr(global_settings, "fa_max_slack_channel_relationships", _ALLOWED_CHANNEL)
+
+    client = MagicMock()
+    request = SimpleNamespace(
+        envelope_id="env-4", type="slash_commands",
+        payload={"command": "/tracked-link", "text": f"partner {_TAG} wrong channel", "user_name": "josh",
+                  "channel_id": "C_SOME_OTHER_CHANNEL"},
+    )
+
+    assert handle_tracked_link_socket_request(client, request) is True  # handled — we responded, just refused
+    client.send_socket_mode_response.assert_called_once()
+    sent = client.send_socket_mode_response.call_args[0][0]
+    assert "fa-max-relationships" in sent.payload["text"]
+
+
+def test_socket_handler_handles_tracked_link_command(monkeypatch):
+    monkeypatch.setattr(global_settings, "fa_max_slack_channel_relationships", _ALLOWED_CHANNEL)
+
     client = MagicMock()
     request = SimpleNamespace(
         envelope_id="env-3", type="slash_commands",
-        payload={"command": "/tracked-link", "text": f"partner {_TAG} socket test", "user_name": "josh"},
+        payload={"command": "/tracked-link", "text": f"partner {_TAG} socket test", "user_name": "josh",
+                  "channel_id": _ALLOWED_CHANNEL},
     )
 
     assert handle_tracked_link_socket_request(client, request) is True

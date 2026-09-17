@@ -177,7 +177,18 @@ def handle_tracked_link_socket_request(client, request) -> bool:
         return False
 
     from slack_sdk.socket_mode.response import SocketModeResponse
+    from config.settings import settings
     from src.core.database import get_db_context
+
+    allowed_channel = settings.fa_max_slack_channel_relationships
+    if allowed_channel and payload.get("channel_id") != allowed_channel:
+        client.send_socket_mode_response(
+            SocketModeResponse(
+                envelope_id=request.envelope_id,
+                payload=_slack_ephemeral(f"{_SLASH_COMMAND} only works in the fa-max-relationships channel."),
+            )
+        )
+        return True
 
     text_arg = payload.get("text") or ""
     user = payload.get("user_name") or "someone"
