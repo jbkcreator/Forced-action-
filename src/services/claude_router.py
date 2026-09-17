@@ -76,6 +76,10 @@ _TASK_ROUTING: dict[str, str] = {
     "cora_reply_compose":  "sonnet",
     # Concierge Chat
     "chat_response":  "haiku",   # MD-grounded FAQ reply — Haiku is plenty
+    # Command Center — Josh's pipeline chatbot
+    "cora_cc_guard":  "haiku",   # intent classification / injection detection
+    "cora_cc_query":  "sonnet",  # agentic loop + final answer synthesis
+    "cora_cc_compact": "haiku",  # history compaction summary
     # Opus — explicit override, edge cases only
     "edge_case": "opus",
 }
@@ -258,6 +262,244 @@ def call_claude_with_usage(
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cost_usd": cost_usd,
+    }
+
+
+def call_claude_for_tool_loop(
+    task_type: str,
+    messages: list[dict],
+    system: str,
+    tools: list[dict],
+    max_tokens: int = 1024,
+    graph_name: Optional[str] = None,
+    db: Optional[Session] = None,
+    force_tier: Optional[str] = None,
+) -> dict:
+    """
+    Single Claude API call for a multi-turn agentic tool-use loop.
+
+    Unlike call_claude_with_usage(), this returns the full response needed to
+    build the next turn's messages: stop_reason, all tool_calls with their ids,
+    and assistant_content as plain serializable dicts.  The caller maintains
+    the messages list, appends assistant_content after each call, then appends
+    tool_result blocks before the next call.
+
+    Returns:
+        {
+            "stop_reason":        "tool_use" | "end_turn" | "max_tokens",
+            "text":               str,          # the answer text when stop_reason == "end_turn"
+            "tool_calls":         list[dict],   # [{"id", "name", "input"}, ...] when stop_reason == "tool_use"
+            "assistant_content":  list[dict],   # append to messages as {"role": "assistant", "content": this}
+            "input_tokens":       int,
+            "output_tokens":      int,
+            "cost_usd":           float,
+            "model":              str,
+        }
+
+    Raises:
+        anthropic.APIError on API failure — callers must catch and handle.
+    """
+    model_tier = force_tier or _TASK_ROUTING.get(task_type, "sonnet")
+    model_id = _model_id(model_tier)
+    client = _build_client()
+
+    kwargs: dict = {
+        "model": model_id,
+        "max_tokens": max_tokens,
+        "messages": messages,
+        "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+        "tools": tools,
+        "tool_choice": {"type": "auto"},
+    }
+
+    resolved_target = resolve_pause_target(graph_name=graph_name, task_type=task_type)
+    active_pause = get_active_pause(db, "claude", resolved_target) if db and resolved_target else None
+    if active_pause:
+        logger.warning(
+            "claude_router: blocked task=%s pause_target=%s reason=%s",
+            task_type, resolved_target, active_pause.reason,
+        )
+        _log_usage(None, model_tier, task_type, None, db, graph_name=graph_name,
+                   pause_target=resolved_target, blocked_by_pause=True,
+                   block_reason=f"pause: {active_pause.reason}")
+        return {
+            "stop_reason": "end_turn",
+            "text": f"[BLOCKED] Vendor cost pause active for '{resolved_target}'.",
+            "tool_calls": [],
+            "assistant_content": [{"type": "text", "text": f"[BLOCKED] Vendor cost pause active."}],
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cost_usd": 0.0,
+            "model": model_tier,
+        }
+
+    response = client.messages.create(**kwargs)
+
+    usage = getattr(response, "usage", None)
+    input_tokens = getattr(usage, "input_tokens", 0) if usage else 0
+    output_tokens = getattr(usage, "output_tokens", 0) if usage else 0
+    costs = _COST_TABLE.get(model_tier, _COST_TABLE["sonnet"])
+    cost_usd = (input_tokens * costs["input"] + output_tokens * costs["output"]) / 1_000_000
+
+    _log_usage(response, model_tier, task_type, None, db,
+               graph_name=graph_name, pause_target=resolved_target)
+
+    stop_reason = getattr(response, "stop_reason", "end_turn") or "end_turn"
+
+    # Convert SDK content blocks to plain serializable dicts — required
+    # because these go into LangGraph state (msgpack) and back into
+    # messages on the next API call.
+    assistant_content: list[dict] = []
+    text_parts: list[str] = []
+    tool_calls: list[dict] = []
+
+    for block in response.content:
+        if isinstance(block, TextBlock):
+            assistant_content.append({"type": "text", "text": block.text})
+            text_parts.append(block.text)
+        elif isinstance(block, ToolUseBlock):
+            assistant_content.append({
+                "type": "tool_use",
+                "id": block.id,
+                "name": block.name,
+                "input": dict(block.input) if block.input else {},
+            })
+            tool_calls.append({
+                "id": block.id,
+                "name": block.name,
+                "input": dict(block.input) if block.input else {},
+            })
+
+    return {
+        "stop_reason": stop_reason,
+        "text": "".join(text_parts),
+        "tool_calls": tool_calls,
+        "assistant_content": assistant_content,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cost_usd": cost_usd,
+        "model": model_tier,
+    }
+
+
+def call_claude_streaming(
+    task_type: str,
+    messages: list[dict],
+    system: str,
+    tools: list[dict],
+    max_tokens: int = 1024,
+    graph_name: Optional[str] = None,
+    db: Optional[Session] = None,
+    on_text_chunk=None,  # Callable[[str], None] | None
+) -> dict:
+    """
+    Streaming variant of call_claude_for_tool_loop.
+
+    Identical return shape. When `on_text_chunk` is provided it is called with
+    each text delta as Claude streams the response — useful for updating a
+    Slack placeholder message progressively.
+
+    During tool-use iterations Claude emits no text so the callback is silent.
+    On the final answer iteration the callback fires with each token, letting
+    the caller push incremental updates to Slack at their own throttle rate.
+    """
+    model_tier = _TASK_ROUTING.get(task_type, "sonnet")
+    model_id = _model_id(model_tier)
+    client = _build_client()
+
+    resolved_target = resolve_pause_target(graph_name=graph_name, task_type=task_type)
+    active_pause = get_active_pause(db, "claude", resolved_target) if db and resolved_target else None
+    if active_pause:
+        logger.warning("claude_router: blocked task=%s pause=%s", task_type, resolved_target)
+        _log_usage(None, model_tier, task_type, None, db, graph_name=graph_name,
+                   pause_target=resolved_target, blocked_by_pause=True,
+                   block_reason=f"pause: {active_pause.reason}")
+        blocked_text = f"[BLOCKED] Vendor cost pause active for '{resolved_target}'."
+        return {
+            "stop_reason": "end_turn", "text": blocked_text,
+            "tool_calls": [], "assistant_content": [{"type": "text", "text": blocked_text}],
+            "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "model": model_tier,
+        }
+
+    kwargs: dict = {
+        "model": model_id,
+        "max_tokens": max_tokens,
+        "messages": messages,
+        "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+        "tools": tools,
+        "tool_choice": {"type": "auto"},
+    }
+
+    # Run the stream in a background thread so LangGraph's node introspection
+    # never sees the streaming context manager (it mistakes it for a generator node).
+    import threading as _threading
+
+    _result: list = []
+    _exc: list = []
+
+    def _stream_worker():
+        try:
+            with client.messages.stream(**kwargs) as stream:
+                if on_text_chunk is not None:
+                    for text_delta in stream.text_stream:
+                        try:
+                            on_text_chunk(text_delta)
+                        except Exception:
+                            pass
+                _result.append(stream.get_final_message())
+        except Exception as e:
+            _exc.append(e)
+
+    t = _threading.Thread(target=_stream_worker, daemon=True)
+    t.start()
+    t.join()
+
+    if _exc:
+        # Streaming failed — fall back to a regular blocking call.
+        logger.warning("claude_router: streaming failed (%s) — falling back to create()", _exc[0])
+        response = client.messages.create(**kwargs)
+    else:
+        response = _result[0]
+
+    usage = getattr(response, "usage", None)
+    input_tokens = getattr(usage, "input_tokens", 0) if usage else 0
+    output_tokens = getattr(usage, "output_tokens", 0) if usage else 0
+    costs = _COST_TABLE.get(model_tier, _COST_TABLE["sonnet"])
+    cost_usd = (input_tokens * costs["input"] + output_tokens * costs["output"]) / 1_000_000
+
+    _log_usage(response, model_tier, task_type, None, db,
+               graph_name=graph_name, pause_target=resolved_target)
+
+    stop_reason = getattr(response, "stop_reason", "end_turn") or "end_turn"
+
+    assistant_content: list[dict] = []
+    text_parts: list[str] = []
+    tool_calls: list[dict] = []
+
+    for block in response.content:
+        if isinstance(block, TextBlock):
+            assistant_content.append({"type": "text", "text": block.text})
+            text_parts.append(block.text)
+        elif isinstance(block, ToolUseBlock):
+            assistant_content.append({
+                "type": "tool_use", "id": block.id,
+                "name": block.name,
+                "input": dict(block.input) if block.input else {},
+            })
+            tool_calls.append({
+                "id": block.id, "name": block.name,
+                "input": dict(block.input) if block.input else {},
+            })
+
+    return {
+        "stop_reason": stop_reason,
+        "text": "".join(text_parts),
+        "tool_calls": tool_calls,
+        "assistant_content": assistant_content,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cost_usd": cost_usd,
+        "model": model_tier,
     }
 
 
