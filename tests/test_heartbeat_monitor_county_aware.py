@@ -21,11 +21,11 @@ def test_label_and_alert_county_for_county_beat():
     assert "violations/pinellas" in b.alert_subject()
 
 
-def test_pasco_not_monitored_until_scraper_active():
-    # WP-T2-8 Stage F review fix #5: Pasco must NOT be in the monitored permit
-    # counties while its source is inactive (no scraper) — heartbeat ignores
-    # is_active, so it would page every run with no success row.
-    assert "pasco" not in hm.MULTI_COUNTY_SOURCES.get("permits", set())
+def test_pasco_monitored_now_scraper_active():
+    # WP-T2-8 Stage F: Pasco's permit scraper is active on cron with an approved
+    # playwright_code (county_sources is_active=TRUE), so its feed IS now
+    # SLA-monitored — a stale/failed Pasco pull pages ops like any permit county.
+    assert "pasco" in hm.MULTI_COUNTY_SOURCES["permits"]
     assert {"hillsborough", "pinellas"} <= hm.MULTI_COUNTY_SOURCES["permits"]
 
 

@@ -177,9 +177,11 @@ MULTI_COUNTY_SOURCES: Dict[str, set] = {
         "insurance_claims",
     )
 }
-# Pasco is best-effort (WP-T2-8 Stage F). Scraper active but SLA monitoring
-# deferred until feed is confirmed stable. Add "pasco" to
-# MULTI_COUNTY_SOURCES["permits"] when ready to alert on stale Pasco data.
+# Pasco permits (WP-T2-8 Stage F): scraper is active on cron, so its feed is
+# now SLA-monitored — a stale/failed Pasco permit pull pages ops like any other
+# permit county. Its county_sources row is is_active=TRUE with approved
+# playwright_code, so a real success row exists on each run to compare against.
+MULTI_COUNTY_SOURCES["permits"].add("pasco")
 
 _WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
