@@ -490,14 +490,15 @@ SLACK_SIGNING_SECRET=...
 > ever be Slack's actual configured URL at a time, silently breaking the
 > other two.
 
-For Relay card thread replies, enable **Event Subscriptions** separately and
-set its Request URL to `https://<your-host>/api/admin/slack/events`. Subscribe
-to the message event for each conversation type where Relay cards are posted,
-grant the corresponding history scope, invite the bot to those channels, and
-reinstall the app after changing scopes. This route handles exact `approve`
+For Relay card thread replies, enable **Event Subscriptions** and subscribe
+to the message event for each conversation type where Relay cards are posted.
+When Relay uses Socket Mode, Slack delivers those subscribed events to the
+Socket Mode listener; no Events API Request URL is needed. Grant the
+corresponding history scope, invite the bot to those channels, and reinstall
+the app after changing scopes. Exact `approve`
 and `reject` replies in a card thread; it is distinct from Interactivity.
-Verify Slack accepts the URL challenge and delivers a signed test event before
-relying on thread replies as an approval path.
+Send a test thread reply and verify the Socket Mode listener records the
+decision before relying on thread replies as an approval path.
 
 ### Adding a candidate county
 ```sql
@@ -553,9 +554,9 @@ RELAY_DAILY_CEILING=20          # per channel, per calendar day
 ```
 
 ### Slack app setup
-Relay approvals use Slack Socket Mode so they work with the existing shared
-Slack app without a public callback URL. Enable Socket Mode and create an
-app-level `xapp-...` token with `connections:write`; store it as
+Relay approvals and thread actions use Slack Socket Mode with the dedicated
+FA Max Slack app, so no public callback URL is required. Enable Socket Mode
+and create an app-level `xapp-...` token with `connections:write`; store it as
 `RELAY_SLACK_APP_TOKEN`. Install and run the listener:
 
 ```bash
@@ -564,10 +565,9 @@ systemctl daemon-reload
 systemctl enable --now fa-relay-slack-listener
 ```
 
-Run exactly one Socket Mode listener for a shared Slack app's interactive
-actions. Slack can deliver a payload to any active listener connection, so
-separate action-specific listeners must be consolidated into one dispatcher
-before they share the same production app.
+Run exactly one Socket Mode listener for the FA Max Slack app. If another
+workflow must share that app, use one dispatcher that routes every action;
+Slack can deliver a payload to any active listener connection.
 
 Grant `channels:history` (and `groups:history` for a private queue) so the
 FA Max retry worker can reconcile a card accepted by Slack before a local

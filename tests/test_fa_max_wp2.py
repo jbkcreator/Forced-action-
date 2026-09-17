@@ -941,3 +941,27 @@ class TestFaMaxSocketMode:
         assert socket_listener.handle_socket_request(client, request) is False
         client.send_socket_mode_response.assert_called_once()
         decision.assert_not_called()
+
+    def test_socket_listener_routes_thread_action_events_to_durable_handler(self, monkeypatch):
+        from src.services.relay import socket_listener
+
+        client = MagicMock()
+        request = SimpleNamespace(
+            envelope_id="env-3",
+            type="events_api",
+            payload={
+                "type": "event_callback",
+                "event": {
+                    "type": "message",
+                    "thread_ts": "1710000000.000100",
+                    "text": "approve",
+                    "user": "U_APPROVER",
+                },
+            },
+        )
+        thread_action = MagicMock()
+        monkeypatch.setattr("src.api.admin_router._handle_relay_thread_action", thread_action)
+
+        assert socket_listener.handle_socket_request(client, request) is True
+        client.send_socket_mode_response.assert_called_once()
+        thread_action.assert_called_once_with(request.payload)

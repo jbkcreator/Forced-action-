@@ -34,9 +34,19 @@ def handle_socket_request(client: Any, request: Any) -> bool:
     # handler is intentionally called only after it, and remains idempotent.
     client.send_socket_mode_response(SocketModeResponse(envelope_id=request.envelope_id))
 
+    payload = request.payload or {}
+    if request.type == "events_api":
+        # Socket Mode delivers subscribed Events API payloads in an
+        # ``events_api`` envelope. Reuse the HTTP route's thread-command
+        # handler so an exact approve/reject reply has the same durable
+        # authorization, transition, and audit behaviour as a button click.
+        from src.api.admin_router import _handle_relay_thread_action
+
+        _handle_relay_thread_action(payload)
+        return payload.get("type") == "event_callback"
+
     if request.type != "interactive":
         return False
-    payload = request.payload or {}
     if payload.get("type") != "block_actions":
         return False
     actions = payload.get("actions") or []

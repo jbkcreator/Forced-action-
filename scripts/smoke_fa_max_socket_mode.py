@@ -55,7 +55,8 @@ def create() -> int:
             skip_contract_validation=True,
         )
         item_ids.append(item.id)
-        print(f"{lane}: item_id={item.id}; click {{'approved': 'APPROVE', 'rejected': 'REJECT'}[expected]} in Slack")
+        action_label = "APPROVE" if expected == "approved" else "REJECT"
+        print(f"{lane}: item_id={item.id}; click {action_label} in Slack")
 
     print("Do not run a Relay sweep. After both clicks, run:")
     print(f"  python scripts/smoke_fa_max_socket_mode.py verify {' '.join(map(str, item_ids))}")
