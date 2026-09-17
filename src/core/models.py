@@ -913,6 +913,10 @@ class PermitStaging(Base):
     status: Mapped[Optional[str]] = mapped_column(String(50))
     description: Mapped[Optional[str]] = mapped_column(Text)
 
+    # Enforcement flag — mirrors BuildingPermit; computed before the property-match
+    # branch so builder detectors can exclude enforcement permits from staging too.
+    is_enforcement_permit: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+
     # Dates
     issue_date: Mapped[Optional[date]] = mapped_column(Date)
     expire_date: Mapped[Optional[date]] = mapped_column(Date)

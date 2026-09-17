@@ -8,7 +8,11 @@ from src.loaders.permits import BuildingPermitLoader
 
 
 def test_existing_permit_status_is_refreshed_when_source_closes_it():
-    existing = SimpleNamespace(id=12, description="roof", status="Issued")
+    existing = SimpleNamespace(
+        id=12, description="roof", status="Issued",
+        holder_name=None, contractor_name=None,
+        job_value=None, completion_status=None,
+    )
     session = Mock()
     session.execute.return_value.fetchone.return_value = existing
     loader = SimpleNamespace(session=session)

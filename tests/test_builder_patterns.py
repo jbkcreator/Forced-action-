@@ -34,17 +34,17 @@ def _mk_entity(db, name: str) -> int:
 
 def _mk_staging_permit(db, permit_number, *, issue_date=None, permit_type="New Construction",
                        completion_status="issued", matched_property_id=None, job_value=300000,
-                       county_id="hillsborough") -> int:
+                       county_id="hillsborough", is_enforcement=False) -> int:
     row = db.execute(
         text("""
             INSERT INTO permit_staging
                 (permit_number, permit_type, county_id, holder_name, completion_status,
-                 status, job_value, issue_date, matched, matched_property_id)
-            VALUES (:pn, :pt, :cty, 'HOLDER', :cs, :cs, :jv, :issue, FALSE, :mpid)
+                 status, job_value, issue_date, matched, matched_property_id, is_enforcement_permit)
+            VALUES (:pn, :pt, :cty, 'HOLDER', :cs, :cs, :jv, :issue, FALSE, :mpid, :enf)
             RETURNING id
         """),
         {"pn": permit_number, "pt": permit_type, "cty": county_id, "cs": completion_status,
-         "jv": job_value, "issue": issue_date, "mpid": matched_property_id},
+         "jv": job_value, "issue": issue_date, "mpid": matched_property_id, "enf": is_enforcement},
     ).fetchone()
     return row.id
 
@@ -138,6 +138,19 @@ def test_repeat_builder_counts_distinct_projects_not_revisions(fresh_db):
 
     hits = detect_repeat_builders(db)
     assert not _entity_ids_in(hits, e)   # same property twice = 1 project → silent
+
+
+def test_repeat_builder_excludes_enforcement_staging_permits(fresh_db):
+    db = fresh_db
+    e = _mk_entity(db, "STAGING ENFORCEMENT LLC")
+    p1 = _mk_staging_permit(db, "SE-1", issue_date=_TODAY - timedelta(days=30), is_enforcement=True)
+    p2 = _mk_staging_permit(db, "SE-2", issue_date=_TODAY - timedelta(days=90), is_enforcement=True)
+    _link(db, e, "permit_staging", p1)
+    _link(db, e, "permit_staging", p2)
+    db.flush()
+
+    hits = detect_repeat_builders(db)
+    assert not _entity_ids_in(hits, e)   # both enforcement in staging → silent
 
 
 def test_repeat_builder_ignores_permits_outside_window(fresh_db):

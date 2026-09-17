@@ -173,6 +173,7 @@ _REPEAT_BUILDER_SQL = text("""
         FROM permit_staging s
         JOIN buyer_entity_links bel ON bel.source_table = 'permit_staging' AND bel.source_id = s.id
         WHERE s.issue_date >= :since AND s.issue_date <= :as_of
+          AND COALESCE(s.is_enforcement_permit, FALSE) = FALSE
     ),
     entity_summary AS (
         SELECT
@@ -255,6 +256,7 @@ _CONCURRENT_BUILDER_SQL = text("""
         FROM permit_staging s
         JOIN buyer_entity_links bel ON bel.source_table = 'permit_staging' AND bel.source_id = s.id
         WHERE LOWER(COALESCE(s.completion_status, s.status, '')) = ANY(:active_statuses)
+          AND COALESCE(s.is_enforcement_permit, FALSE) = FALSE
     ),
     summary AS (
         -- distinct active PROJECTS: collapse revisions on the same matched property,
@@ -340,6 +342,7 @@ def detect_townhome_infill(
             FROM permit_staging s
             JOIN buyer_entity_links bel ON bel.source_table = 'permit_staging' AND bel.source_id = s.id
             WHERE ({ilike_ps}) {county_filter_ps}
+              AND COALESCE(s.is_enforcement_permit, FALSE) = FALSE
         ),
         summary AS (
             SELECT buyer_entity_id, COUNT(*) AS match_count,
@@ -393,6 +396,7 @@ _LAND_TO_PERMIT_SQL = text("""
         FROM permit_staging s
         JOIN buyer_entity_links bel ON bel.source_table = 'permit_staging' AND bel.source_id = s.id
         WHERE s.issue_date IS NOT NULL
+          AND COALESCE(s.is_enforcement_permit, FALSE) = FALSE
     ),
     deed_entities AS (
         SELECT bel.buyer_entity_id, d.property_id, d.record_date
@@ -476,6 +480,7 @@ _SPEC_CADENCE_SQL = text("""
         FROM permit_staging s
         JOIN buyer_entity_links bel ON bel.source_table = 'permit_staging' AND bel.source_id = s.id
         WHERE s.issue_date IS NOT NULL
+          AND COALESCE(s.is_enforcement_permit, FALSE) = FALSE
     ),
     ordered AS (
         SELECT *,

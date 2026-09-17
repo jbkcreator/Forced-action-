@@ -21,6 +21,14 @@ def test_label_and_alert_county_for_county_beat():
     assert "violations/pinellas" in b.alert_subject()
 
 
+def test_pasco_not_monitored_until_scraper_active():
+    # WP-T2-8 Stage F review fix #5: Pasco must NOT be in the monitored permit
+    # counties while its source is inactive (no scraper) — heartbeat ignores
+    # is_active, so it would page every run with no success row.
+    assert "pasco" not in hm.MULTI_COUNTY_SOURCES.get("permits", set())
+    assert {"hillsborough", "pinellas"} <= hm.MULTI_COUNTY_SOURCES["permits"]
+
+
 def test_label_and_alert_county_for_source_wide_beat():
     b = Heartbeat("sunbiz", 1500, None, None, True)  # county_id defaults None
     assert b.label() == "sunbiz"

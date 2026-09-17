@@ -62,6 +62,16 @@ def _is_enforcement(permit_type: str | None, status: str | None, expire_date) ->
 logger = logging.getLogger(__name__)
 
 
+def _clean_str(value) -> str | None:
+    """Scraped-cell → clean str or None. Guards pandas NaN (read_csv(dtype=str)
+    yields float NaN for blank cells; str(NaN) == 'nan', which would otherwise
+    become a fake holder/contractor identity)."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    s = str(value).strip()
+    return s or None
+
+
 def _normalize_completion_status(raw: str | None) -> str | None:
     if not raw:
         return None
@@ -137,22 +147,36 @@ class BuildingPermitLoader(BaseLoader):
         
         for _, row in df.iterrows():
             record_number = str(row['Record Number']).strip()
-            description_val = str(row.get('Description') or '').strip() or None
+            description_val = _clean_str(row.get('Description'))
+            incoming_holder = _clean_str(row.get('Holder Name'))
+            incoming_contractor = _clean_str(row.get('Contractor Name'))
+            incoming_job_value = _parse_job_value(row.get('Job Value'))
 
-            # Check for duplicates; update description if previously NULL
+            # Check for duplicates; backfill description + enrichment when NULL
             if skip_duplicates:
                 existing_row = self.session.execute(
                     text("""
-                        SELECT id, description, status, holder_name, contractor_name
+                        SELECT id, description, status, holder_name, contractor_name,
+                               job_value, completion_status
                         FROM building_permits WHERE permit_number = :pnum LIMIT 1
                     """),
                     {"pnum": record_number},
                 ).fetchone()
                 if existing_row:
-                    incoming_status = str(row.get('Status') or '').strip() or None
+                    incoming_status = _clean_str(row.get('Status'))
+                    incoming_completion = _normalize_completion_status(incoming_status)
                     description_changed = existing_row.description is None and description_val
-                    status_changed = incoming_status and incoming_status != existing_row.status
-                    if description_changed or status_changed:
+                    status_changed = bool(incoming_status and incoming_status != existing_row.status)
+                    # Backfill fires whenever incoming source data can fill a currently-NULL
+                    # enrichment column — not only on description/status change (a later scrape
+                    # can add holder/contractor/job_value with status unchanged).
+                    enrichment_backfillable = (
+                        (incoming_holder and existing_row.holder_name is None)
+                        or (incoming_contractor and existing_row.contractor_name is None)
+                        or (incoming_job_value is not None and existing_row.job_value is None)
+                        or (incoming_completion and existing_row.completion_status is None)
+                    )
+                    if description_changed or status_changed or enrichment_backfillable:
                         self.session.execute(
                             text("""
                                 UPDATE building_permits
@@ -167,10 +191,10 @@ class BuildingPermitLoader(BaseLoader):
                             {
                                 "desc": description_val,
                                 "status": incoming_status,
-                                "holder_name": str(row.get('Holder Name') or '').strip() or None,
-                                "contractor_name": str(row.get('Contractor Name') or '').strip() or None,
-                                "job_value": _parse_job_value(row.get('Job Value')),
-                                "completion_status": _normalize_completion_status(incoming_status),
+                                "holder_name": incoming_holder,
+                                "contractor_name": incoming_contractor,
+                                "job_value": incoming_job_value,
+                                "completion_status": incoming_completion,
                                 "id": existing_row.id,
                             },
                         )
@@ -196,25 +220,22 @@ class BuildingPermitLoader(BaseLoader):
                     property_record, score = match_result
                     logger.info(f"Matched permit by address (score: {score}%): {record_number}")
             
-            # Enrichment fields shared by both branches
-            permit_type_val = row.get('Record Type')
-            if pd.isna(permit_type_val) if isinstance(permit_type_val, float) else False:
-                permit_type_val = None
-            status_val = row.get('Status')
-            if pd.isna(status_val) if isinstance(status_val, float) else False:
-                status_val = None
-
-            raw_holder = str(row.get('Holder Name') or '').strip() or None
-            raw_contractor = str(row.get('Contractor Name') or '').strip() or None
-            job_value_val = _parse_job_value(row.get('Job Value'))
+            # Enrichment fields shared by both branches (NaN-safe via _clean_str)
+            permit_type_val = _clean_str(row.get('Record Type'))
+            status_val = _clean_str(row.get('Status'))
+            raw_holder = incoming_holder
+            raw_contractor = incoming_contractor
+            job_value_val = incoming_job_value
             completion_status_val = _normalize_completion_status(status_val)
             parsed_issue = self.parse_date(row.get('Date'))
             parsed_expire = self.parse_date(row.get('Expiration Date'))
+            # Enforcement is computed BEFORE the property-match branch so unmatched
+            # permits carry the flag into permit_staging (detectors must be able to
+            # exclude enforcement records from the staging side too).
+            enforcement = _is_enforcement(permit_type_val, status_val, parsed_expire)
 
             if property_record:
                 try:
-                    enforcement = _is_enforcement(permit_type_val, status_val, parsed_expire)
-
                     permit_record = BuildingPermit(
                         property_id=property_record.id,
                         permit_number=record_number,
@@ -244,7 +265,7 @@ class BuildingPermitLoader(BaseLoader):
                 self._persist_to_staging(
                     permit_number=record_number,
                     permit_type=permit_type_val,
-                    address=str(row.get('Address', '')),
+                    address=_clean_str(row.get('Address')) or '',
                     holder_name=raw_holder,
                     contractor_name=raw_contractor,
                     job_value=job_value_val,
@@ -253,6 +274,7 @@ class BuildingPermitLoader(BaseLoader):
                     description=description_val,
                     issue_date=parsed_issue,
                     expire_date=parsed_expire,
+                    is_enforcement_permit=enforcement,
                 )
                 self.quarantine_unmatched(
                     source_type="permits",
@@ -279,6 +301,7 @@ class BuildingPermitLoader(BaseLoader):
         description: str | None,
         issue_date,
         expire_date,
+        is_enforcement_permit: bool = False,
     ) -> None:
         """Upsert an unmatched permit into permit_staging."""
         self.session.execute(
@@ -287,20 +310,21 @@ class BuildingPermitLoader(BaseLoader):
                     permit_number, permit_type, county_id, address,
                     holder_name, contractor_name, job_value,
                     completion_status, status, description,
-                    issue_date, expire_date, date_added, matched
+                    issue_date, expire_date, is_enforcement_permit, date_added, matched
                 ) VALUES (
                     :permit_number, :permit_type, :county_id, :address,
                     :holder_name, :contractor_name, :job_value,
                     :completion_status, :status, :description,
-                    :issue_date, :expire_date, CURRENT_DATE, FALSE
+                    :issue_date, :expire_date, :is_enforcement_permit, CURRENT_DATE, FALSE
                 )
                 ON CONFLICT (permit_number) DO UPDATE SET
-                    status            = EXCLUDED.status,
-                    completion_status = EXCLUDED.completion_status,
-                    holder_name       = COALESCE(EXCLUDED.holder_name, permit_staging.holder_name),
-                    contractor_name   = COALESCE(EXCLUDED.contractor_name, permit_staging.contractor_name),
-                    job_value         = COALESCE(EXCLUDED.job_value, permit_staging.job_value),
-                    description       = COALESCE(EXCLUDED.description, permit_staging.description)
+                    status                = EXCLUDED.status,
+                    completion_status     = EXCLUDED.completion_status,
+                    is_enforcement_permit = EXCLUDED.is_enforcement_permit,
+                    holder_name           = COALESCE(EXCLUDED.holder_name, permit_staging.holder_name),
+                    contractor_name       = COALESCE(EXCLUDED.contractor_name, permit_staging.contractor_name),
+                    job_value             = COALESCE(EXCLUDED.job_value, permit_staging.job_value),
+                    description           = COALESCE(EXCLUDED.description, permit_staging.description)
             """),
             {
                 "permit_number": permit_number,
@@ -315,6 +339,7 @@ class BuildingPermitLoader(BaseLoader):
                 "description": description,
                 "issue_date": issue_date,
                 "expire_date": expire_date,
+                "is_enforcement_permit": is_enforcement_permit,
             },
         )
 

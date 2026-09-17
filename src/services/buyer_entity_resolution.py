@@ -1014,9 +1014,16 @@ def _permit_name_candidates(
     only_unresolved: bool,
 ) -> Iterator[CandidateRecord]:
     """
-    Stream holder_name and contractor_name rows from building_permits or
-    permit_staging as CandidateRecords. Each unique (source_id, name_column)
-    pair becomes one record so the resolver can link it independently.
+    Stream one CandidateRecord per permit row from building_permits or
+    permit_staging. The permit's principal party is holder_name (applicant /
+    owner-of-record) when present, else contractor_name — so contractor-only
+    permits (common in permit data) still resolve into the graph.
+
+    Known limitation: buyer_entity_links has UNIQUE(source_table, source_id), so
+    a permit contributes exactly one link. When holder and contractor are BOTH
+    present and DIFFERENT, only the holder is resolved as principal; tracking the
+    contractor as a separate builder identity on the same permit would need a
+    role-aware link key (deferred — see PR follow-ups).
 
     only_unresolved=True skips source_ids that already have a buyer_entity_link.
     """
@@ -1027,17 +1034,19 @@ def _permit_name_candidates(
         "AND bel.id IS NULL" if only_unresolved else ""
     )
 
-    # holder_name column
-    holder_sql = f"""
-        SELECT p.id, p.holder_name AS raw_name, p.county_id
+    # principal = holder if present, else contractor (contractor-only permits)
+    party_sql = f"""
+        SELECT p.id,
+               COALESCE(NULLIF(p.holder_name, ''), NULLIF(p.contractor_name, '')) AS raw_name,
+               p.county_id
         FROM {source_table} p
         LEFT JOIN buyer_entity_links bel
             ON bel.source_table = :src AND bel.source_id = p.id
-        WHERE p.holder_name IS NOT NULL AND p.holder_name != ''
+        WHERE COALESCE(NULLIF(p.holder_name, ''), NULLIF(p.contractor_name, '')) IS NOT NULL
         {unresolved_guard}
         ORDER BY p.id
     """
-    for row in session.execute(text(holder_sql), {"src": source_table}).yield_per(_STREAM_BATCH):
+    for row in session.execute(text(party_sql), {"src": source_table}).yield_per(_STREAM_BATCH):
         raw = row.raw_name or ""
         yield CandidateRecord(
             source_table=source_table,

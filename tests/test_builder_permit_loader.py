@@ -7,6 +7,7 @@ import pandas as pd
 
 from src.loaders.permits import (
     BuildingPermitLoader,
+    _clean_str,
     _normalize_completion_status,
     _parse_job_value,
 )
@@ -36,6 +37,15 @@ def test_normalize_completion_status_maps_synonyms():
 def test_normalize_completion_status_unknown_is_none():
     assert _normalize_completion_status("banana") is None
     assert _normalize_completion_status(None) is None
+
+
+def test_clean_str_guards_nan():
+    import numpy as np
+    assert _clean_str(np.nan) is None          # blank CSV cell → NaN, not "nan"
+    assert _clean_str(float("nan")) is None
+    assert _clean_str(None) is None
+    assert _clean_str("  ") is None
+    assert _clean_str("  ACME  ") == "ACME"
 
 
 # ── matched permit gets enrichment fields ─────────────────────────────────────
@@ -123,6 +133,7 @@ def test_duplicate_permit_backfills_enrichment_columns():
     existing = SimpleNamespace(
         id=12, description="roof", status="Issued",
         holder_name=None, contractor_name=None,
+        job_value=None, completion_status=None,
     )
     session = Mock()
     session.execute.return_value.fetchone.return_value = existing
@@ -147,3 +158,66 @@ def test_duplicate_permit_backfills_enrichment_columns():
     assert params["contractor_name"] == "FINISH CO"
     assert params["job_value"] == 150000.0
     assert params["completion_status"] == "completed"
+
+
+def test_duplicate_backfills_enrichment_when_status_and_description_unchanged():
+    # existing permit already has description + status; a LATER scrape adds
+    # enrichment fields. Backfill must fire even though desc/status are unchanged.
+    existing = SimpleNamespace(
+        id=77, description="roof", status="Issued",
+        holder_name=None, contractor_name=None,
+        job_value=None, completion_status=None,
+    )
+    session = Mock()
+    session.execute.return_value.fetchone.return_value = existing
+    loader = SimpleNamespace(session=session)
+    frame = pd.DataFrame([{
+        "Record Number": "P-77",
+        "Description": "roof",       # unchanged
+        "Status": "Issued",          # unchanged
+        "Holder Name": "NEWLY SEEN LLC",
+        "Job Value": "$220,000",
+    }])
+
+    matched, unmatched, skipped = BuildingPermitLoader.load_from_dataframe(loader, frame)
+
+    assert (matched, unmatched, skipped) == (0, 0, 1)
+    # an UPDATE was still issued (2nd execute call)
+    assert len(session.execute.call_args_list) == 2
+    params = session.execute.call_args_list[1].args[1]
+    assert params["holder_name"] == "NEWLY SEEN LLC"
+    assert params["job_value"] == 220000.0
+
+
+def test_blank_holder_cell_does_not_create_nan_identity():
+    session = Mock()
+    session.execute.return_value.fetchone.return_value = None
+    prop = SimpleNamespace(id=55)
+    loader = SimpleNamespace(
+        session=session,
+        county_id="hillsborough",
+        _thresholds=SimpleNamespace(address_floor=75),
+        find_property_by_address=Mock(return_value=(prop, 100)),
+        parse_date=Mock(return_value=date(2026, 9, 1)),
+        safe_add=Mock(return_value=True),
+    )
+    # blank Holder/Contractor cells → pandas NaN under read_csv(dtype=str)
+    frame = pd.DataFrame({
+        "Record Number": ["P-blank"],
+        "Record Type": ["New Construction"],
+        "Status": ["Issued"],
+        "Address": ["1 Test Way, Tampa, FL 33602"],
+        "Date": ["2026-09-01"],
+        "Expiration Date": ["2027-09-01"],
+        "Holder Name": [None],
+        "Contractor Name": [None],
+        "Job Value": [None],
+    }).astype(object)
+    frame.loc[0, ["Holder Name", "Contractor Name", "Job Value"]] = float("nan")
+
+    BuildingPermitLoader.load_from_dataframe(loader, frame)
+
+    permit = loader.safe_add.call_args.args[0]
+    assert permit.holder_name is None       # not the string "nan"
+    assert permit.contractor_name is None
+    assert permit.job_value is None
