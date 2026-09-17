@@ -199,9 +199,8 @@ def transition(
             )
             return TransitionResult(outcome=TransitionOutcome.contended, current_state=None)
 
-    _acquire_pg_advisory_lock(session, entity_uuid)
-
     try:
+        _acquire_pg_advisory_lock(session, entity_uuid)
         return _do_transition(
             session=session,
             entity_type=entity_type,

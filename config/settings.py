@@ -556,6 +556,11 @@ class AppSettings(BaseSettings):
 	# admin_jwt_secret when unset so local-dev works without extra env config.
 	landing_token_secret: Optional[SecretStr] = Field(default=None, env="LANDING_TOKEN_SECRET")
 
+	# WP-7 self-serve pre-fill — Backflip handoff adapter selection.
+	# handoff_only (default) | fake | url | api. See src/services/backflip_port.py.
+	backflip_adapter: str = Field(default="handoff_only", env="BACKFLIP_ADAPTER")
+	backflip_prequal_url: Optional[str] = Field(default=None, env="BACKFLIP_PREQUAL_URL")
+
 	# Synthflow outbound voice drops (Phase C)
 	synthflow_api_base: str = Field(default="https://api.synthflow.ai/v2", env="SYNTHFLOW_API_BASE")
 	synthflow_api_key: Optional[SecretStr] = Field(default=None, env="SYNTHFLOW_API_KEY")
@@ -639,10 +644,14 @@ class AppSettings(BaseSettings):
 	county_launch_reminder_days: int = Field(default=7, env="COUNTY_LAUNCH_REMINDER_DAYS")
 	slack_bot_token: Optional[SecretStr] = Field(default=None, env="SLACK_BOT_TOKEN")
 	slack_signing_secret: Optional[SecretStr] = Field(default=None, env="SLACK_SIGNING_SECRET")
+	# Dedicated FA Max Slack app. It must not reuse the shared Slack app
+	# credentials used by County Launch and other Relay ventures.
+	fa_max_slack_bot_token: Optional[SecretStr] = Field(default=None, env="FA_MAX_SLACK_BOT_TOKEN")
+	fa_max_slack_app_token: Optional[SecretStr] = Field(default=None, env="FA_MAX_SLACK_APP_TOKEN")
 	vera_slack_channel: Optional[str] = Field(default=None, env="VERA_SLACK_CHANNEL")
 
-	# Relay approval queue (RELAY-v2.2 sub-task R1). Reuses slack_bot_token /
-	# slack_signing_secret above — no separate Slack app.
+	# Relay approval queue (RELAY-v2.2 sub-task R1). Non-FA-Max Relay ventures
+	# reuse slack_bot_token / slack_signing_secret; FA Max uses its dedicated app.
 	relay_slack_channel: str = Field(default="", env="RELAY_SLACK_CHANNEL")
 	relay_approvers: list = Field(default=[], env="RELAY_APPROVERS")
 
@@ -660,6 +669,29 @@ class AppSettings(BaseSettings):
 	# county-launch approval and posting it there would surface in the wrong
 	# review surface.
 	learning_hygiene_slack_channel: str = Field(default="", env="LEARNING_HYGIENE_SLACK_CHANNEL")
+
+	# WP-9 Dial List daily digest — the "MONEY" queue (FA MAX amendment 1).
+	# Reuses slack_bot_token above; its own channel, not cora_throughput's
+	# (cold-outreach draft approvals) nor relay's (per-item sends) — the dial
+	# list is a read-only ranked calling aid, a distinct review surface.
+	dial_list_slack_channel: str = Field(default="", env="DIAL_LIST_SLACK_CHANNEL")
+	# App-level token (xapp-…, scope connections:write) for the dial-list action
+	# listener's Socket Mode connection — only the interactive button/thread
+	# handler needs it; the read-only digest does not. Unset → listener no-ops.
+	dial_list_slack_app_token: Optional[SecretStr] = Field(
+		default=None, env="DIAL_LIST_SLACK_APP_TOKEN"
+	)
+	# The single operator (Josh) allowed to act on dial-list cards; a tap from
+	# anyone else is ignored. Unset → no gate (dev/local only).
+	dial_list_approver_user_id: str = Field(
+		default="", env="DIAL_LIST_APPROVER_USER_ID"
+	)
+	# A dial-list source (deeds, permits, foreclosures, tax_deed_auction,
+	# probate) whose last successful scraper run is older than this many days is
+	# flagged "stale" in the digest header (failure-behavior visibility).
+	dial_list_source_sla_days: int = Field(
+		default=2, env="DIAL_LIST_SOURCE_SLA_DAYS"
+	)
 
 	# Relay email channel (RELAY-v2.2 sub-task R2). relay_instantly_campaign_id
 	# is set once after running `python -m src.services.relay --setup-email-channel`
@@ -700,6 +732,10 @@ class AppSettings(BaseSettings):
 	# "auto-reject triggers a Slack message to Josh"). Reuses slack_bot_token
 	# above, same convention as relay_slack_channel/lifecycle_incident_slack_channel.
 	quality_contracts_slack_channel: Optional[str] = Field(default=None, env="QUALITY_CONTRACTS_SLACK_CHANNEL")
+
+	# Forced Action MAX — WP-6 Repeat & Maturity Engine. Alert channel for
+	# borrower relationship touchpoints (loan maturity, next project, DSCR, expansion).
+	relationships_slack_channel: Optional[str] = Field(default=None, env="RELATIONSHIPS_SLACK_CHANNEL")
 
 	# Stage 10 — Prometheus metrics exposition (fa055).
 	# When true, GET /metrics returns Prometheus text format with kill-switch

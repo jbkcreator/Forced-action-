@@ -68,6 +68,13 @@ def _resolve_channel(item: QueueItem, settings) -> str:
     return get_venture_config(item.venture_key).relay_slack_channel
 
 
+def _resolve_bot_token(item: QueueItem, settings):
+    # FA Max uses its dedicated Slack app; other ventures use the shared app.
+    if item.venture_key == _FA_MAX_VENTURE:
+        return getattr(settings, 'fa_max_slack_bot_token', None)
+    return settings.slack_bot_token
+
+
 def post_for_approval(item: QueueItem) -> None:
     """Post an interactive Approve/Reject Slack message for a pending item.
 
@@ -81,7 +88,7 @@ def post_for_approval(item: QueueItem) -> None:
     settings = get_settings()
     if item.status != "pending" or item.slack_message_ts:
         return
-    token = settings.slack_bot_token
+    token = _resolve_bot_token(item, settings)
     channel = _resolve_channel(item, settings)
     if not token or not channel:
         logger.info(
@@ -181,7 +188,8 @@ def post_completion_receipt(
     Never raises: a failed receipt must not mark the batch as failed.
     """
     settings = get_settings()
-    token = settings.slack_bot_token
+    token = (settings.fa_max_slack_bot_token if venture_key == _FA_MAX_VENTURE
+             else settings.slack_bot_token)
     channel = get_venture_config(venture_key).relay_slack_channel
     if not token or not channel:
         logger.info(
@@ -226,7 +234,7 @@ def post_blocked_action(item: QueueItem, reason: str) -> None:
     into an executable one.
     """
     settings = get_settings()
-    token = settings.slack_bot_token
+    token = _resolve_bot_token(item, settings)
     channel = _resolve_channel(item, settings)
     if not token or not channel:
         logger.warning("[Relay] blocked item %d (%s); Slack not configured", item.id, reason)
@@ -270,7 +278,7 @@ def post_exceptions_alert(*, venture_key: str, rule: str, message: str) -> bool:
 def post_uncertain_action(item: QueueItem) -> None:
     """Ask an operator to reconcile an ambiguous provider result; never retry it."""
     settings = get_settings()
-    token = settings.slack_bot_token
+    token = _resolve_bot_token(item, settings)
     channel = _resolve_channel(item, settings)
     if not token or not channel:
         logger.error("[Relay] uncertain provider result for item %d; Slack unavailable", item.id)

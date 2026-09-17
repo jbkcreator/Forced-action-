@@ -20,6 +20,7 @@ import re
 import unittest.mock as mock
 from dataclasses import replace
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import MagicMock, patch
 
@@ -250,7 +251,7 @@ class TestFaMaxCardRecovery:
 
         item = _make_queue_item(venture_key="fa_max_lending", lane="MONEY")
         lease = datetime.now(timezone.utc)
-        settings = SimpleNamespace(slack_bot_token=MagicMock(get_secret_value=lambda: "xoxb-test"))
+        settings = SimpleNamespace(slack_bot_token=MagicMock(get_secret_value=lambda: "xoxb-shared"), fa_max_slack_bot_token=MagicMock(get_secret_value=lambda: "xoxb-fa-max"))
         with patch("src.services.relay.slack_post.get_settings", return_value=settings), \
              patch("src.services.relay.slack_post._resolve_channel", return_value="C_TEST"), \
              patch("src.services.relay.slack_post.queue.claim_slack_post", return_value=lease), \
@@ -273,7 +274,7 @@ class TestFaMaxCardRecovery:
 
         item = _make_queue_item(venture_key="fa_max_lending", lane="MONEY")
         lease = datetime.now(timezone.utc)
-        settings = SimpleNamespace(slack_bot_token=MagicMock(get_secret_value=lambda: "xoxb-test"))
+        settings = SimpleNamespace(slack_bot_token=MagicMock(get_secret_value=lambda: "xoxb-shared"), fa_max_slack_bot_token=MagicMock(get_secret_value=lambda: "xoxb-fa-max"))
         with patch("src.services.relay.slack_post.get_settings", return_value=settings), \
              patch("src.services.relay.slack_post._resolve_channel", return_value="C_TEST"), \
              patch("src.services.relay.slack_post.queue.claim_slack_post", return_value=lease), \
@@ -1010,3 +1011,86 @@ class TestWp2ClosureGuards:
                     raise AssertionError(
                         f"fa_max_autonomy.py calls a send function: {node.func.id!r}"
                     )
+
+
+class TestFaMaxSocketMode:
+    def test_socket_listener_acks_and_reuses_durable_relay_handler(self, monkeypatch):
+        """Socket Mode must reach the same decision handler as HTTP, not a
+        parallel approval implementation."""
+        from src.services.relay import socket_listener
+
+        client = MagicMock()
+        request = SimpleNamespace(
+            envelope_id="env-1",
+            type="interactive",
+            payload={
+                "type": "block_actions",
+                "user": {"id": "U_APPROVER"},
+                "actions": [{"action_id": "approve", "value": '{"item_id": 12, "action": "approve"}'}],
+            },
+        )
+        decision = MagicMock(return_value={"ok": True})
+        monkeypatch.setattr("src.api.admin_router._handle_relay_decision", decision)
+
+        assert socket_listener.handle_socket_request(client, request) is True
+        client.send_socket_mode_response.assert_called_once()
+        decision.assert_called_once_with(request.payload)
+
+    def test_socket_listener_acks_but_ignores_other_app_actions(self, monkeypatch):
+        from src.services.relay import socket_listener
+
+        client = MagicMock()
+        request = SimpleNamespace(
+            envelope_id="env-2", type="interactive",
+            payload={"type": "block_actions", "actions": [{"action_id": "approve_win_story"}]},
+        )
+        decision = MagicMock()
+        monkeypatch.setattr("src.api.admin_router._handle_relay_decision", decision)
+
+        assert socket_listener.handle_socket_request(client, request) is False
+        client.send_socket_mode_response.assert_called_once()
+        decision.assert_not_called()
+
+    def test_socket_listener_routes_thread_action_events_to_durable_handler(self, monkeypatch):
+        from src.services.relay import socket_listener
+
+        client = MagicMock()
+        request = SimpleNamespace(
+            envelope_id="env-3",
+            type="events_api",
+            payload={
+                "type": "event_callback",
+                "event": {
+                    "type": "message",
+                    "thread_ts": "1710000000.000100",
+                    "text": "approve",
+                    "user": "U_APPROVER",
+                },
+            },
+        )
+        thread_action = MagicMock()
+        monkeypatch.setattr("src.api.admin_router._handle_relay_thread_action", thread_action)
+
+        assert socket_listener.handle_socket_request(client, request) is True
+        client.send_socket_mode_response.assert_called_once()
+        thread_action.assert_called_once_with(request.payload)
+
+
+def test_fa_max_slack_uses_dedicated_bot_token():
+    from types import SimpleNamespace
+    from src.services.relay.slack_post import _resolve_bot_token
+
+    fa_item = _make_queue_item(venture_key="fa_max_lending", lane="MONEY")
+    other_item = _make_queue_item(venture_key="hillsborough_distress", lane="MONEY")
+    settings = SimpleNamespace(fa_max_slack_bot_token="fa-max", slack_bot_token="shared")
+
+    assert _resolve_bot_token(fa_item, settings) == "fa-max"
+    assert _resolve_bot_token(other_item, settings) == "shared"
+
+
+def test_socket_listener_requires_dedicated_fa_max_tokens():
+    from src.services.relay import socket_listener
+
+    names = socket_listener.run.__code__.co_names
+    assert "fa_max_slack_app_token" in names
+    assert "fa_max_slack_bot_token" in names
