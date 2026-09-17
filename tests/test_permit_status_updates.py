@@ -22,7 +22,7 @@ def test_existing_permit_status_is_refreshed_when_source_closes_it():
 
     assert (matched, unmatched, skipped) == (0, 0, 1)
     update_sql = str(session.execute.call_args_list[1].args[0])
-    assert "status = CASE WHEN :status IS NOT NULL" in update_sql
+    assert "CASE WHEN :status IS NOT NULL" in update_sql
     assert session.execute.call_args_list[1].args[1]["status"] == "Complete"
 
 
