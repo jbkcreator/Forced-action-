@@ -9429,6 +9429,15 @@ class BuyerEntityMergeLog(Base):
     reversed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     reversed_by: Mapped[Optional[str]] = mapped_column(String(100))
     restored_id: Mapped[Optional[int]] = mapped_column(Integer)
+    # Append-only history rows reassigned absorbed→surviving during the merge, so
+    # unmerge can move exactly those back (they carry no linked_at heuristic and
+    # would otherwise be lost to the buyer_entities ON DELETE CASCADE).
+    moved_ledger_event_ids: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb"),
+    )
+    moved_monitor_log_ids: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb"),
+    )
 
     surviving_entity: Mapped["BuyerEntity"] = relationship(
         "BuyerEntity", foreign_keys="[BuyerEntityMergeLog.surviving_id]",
@@ -9535,7 +9544,10 @@ class BorrowerLedgerEvent(Base):
     property: Mapped[Optional["Property"]] = relationship("Property")
 
     __table_args__ = (
-        UniqueConstraint("source_table", "source_id", name="uq_ble_source"),
+        UniqueConstraint(
+            "source_table", "source_id", "event_type", "buyer_entity_id",
+            name="uq_ble_source_event_entity",
+        ),
         CheckConstraint(
             "event_type IN ("
             "'deed_acquisition','deed_sale',"
@@ -11387,3 +11399,56 @@ class SelfserveSession(Base):
 
     def __repr__(self) -> str:
         return f"<SelfserveSession(id={self.id}, token={self.token!r}, status={self.status!r})>"
+
+
+class FaMaxArvResult(Base):
+    """WP-8B canonical ARV result — one row per computed valuation of a property.
+
+    Property-keyed and spine-independent. New computations that change the
+    determinative inputs insert a row and supersede the previous current row;
+    identical recomputes are no-ops. Published figures are stored rounded to
+    the nearest $5,000, while comp details remain internal-only provenance.
+    """
+
+    __tablename__ = "fa_max_arv_results"
+
+    arv_result_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=text("generate_uuidv7()")
+    )
+    property_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    computed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    low: Mapped[Optional[float]] = mapped_column(Numeric(14, 2))
+    high: Mapped[Optional[float]] = mapped_column(Numeric(14, 2))
+    point: Mapped[Optional[float]] = mapped_column(Numeric(14, 2))
+    confidence: Mapped[Optional[str]] = mapped_column(String(10))
+    comp_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    weak_comp: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    locality_tier: Mapped[Optional[str]] = mapped_column(String(20))
+    selected_comps: Mapped[Optional[list]] = mapped_column(JSONB)
+    source: Mapped[str] = mapped_column(String(50), nullable=False)
+    arv_unknown: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+    calculation_version: Mapped[str] = mapped_column(String(20), nullable=False)
+    input_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default=text("'computed'")
+    )
+    supersedes_result_id: Mapped[Optional[str]] = mapped_column(PG_UUID(as_uuid=True))
+
+    __table_args__ = (
+        Index("idx_fa_max_arv_property_computed", "property_id", "computed_at"),
+        Index("idx_fa_max_arv_property_status", "property_id", "status"),
+        Index(
+            "uq_fa_max_arv_one_computed_per_property",
+            "property_id",
+            unique=True,
+            postgresql_where=text("status = 'computed'"),
+            sqlite_where=text("status = 'computed'"),
+        ),
+        CheckConstraint(
+            "status IN ('computed','superseded')", name="ck_fa_max_arv_status"
+        ),
+    )

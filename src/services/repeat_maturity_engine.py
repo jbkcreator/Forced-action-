@@ -41,6 +41,7 @@ _DSCR_SEASONING_DAYS = 120
 _DSCR_WINDOW_DAYS = 7                 # fire within 7-day window around day 120
 _EXPANSION_MILESTONES = {3, 5, 10}
 _EXPANSION_LOOKBACK_DAYS = 7
+_NEXT_PROJECT_RETRY_DAYS = 30
 
 MONITOR_TYPES = ("loan_maturity", "next_project", "dscr_day120", "portfolio_expansion")
 
@@ -132,6 +133,7 @@ def _check_next_project(session: Session, today: date) -> list[MonitorAlert]:
     deed_sale or permit_closed events from yesterday, buyer has prior acquisitions.
     """
     yesterday = today - timedelta(days=1)
+    retry_cutoff = today - timedelta(days=_NEXT_PROJECT_RETRY_DAYS)
 
     rows = session.execute(text("""
         SELECT
@@ -150,7 +152,7 @@ def _check_next_project(session: Session, today: date) -> list[MonitorAlert]:
         JOIN buyer_entities be ON be.id = ble.buyer_entity_id
         LEFT JOIN properties p ON p.id = ble.property_id
         WHERE ble.event_type IN ('deed_sale', 'permit_closed')
-          AND ble.event_date = :yesterday
+          AND ble.event_date BETWEEN :retry_cutoff AND :yesterday
           AND be.total_purchase_count >= 1
           AND NOT EXISTS (
               SELECT 1 FROM borrower_monitor_log bml
@@ -158,7 +160,7 @@ def _check_next_project(session: Session, today: date) -> list[MonitorAlert]:
                 AND bml.monitor_type = 'next_project'
                 AND bml.source_event_id = ble.id
           )
-    """), {"yesterday": yesterday}).mappings().all()
+    """), {"retry_cutoff": retry_cutoff, "yesterday": yesterday}).mappings().all()
 
     alerts = []
     for r in rows:
@@ -242,14 +244,23 @@ def _check_dscr_day120(session: Session, today: date) -> list[MonitorAlert]:
 
 def _check_portfolio_expansion(session: Session, today: date) -> list[MonitorAlert]:
     """
-    Buyers whose total_purchase_count just crossed a milestone (3, 5, 10) via a
-    deed_acquisition in the last 7 days.
+    Buyers who have CROSSED a milestone (3, 5, 10) via a deed_acquisition in the
+    last 7 days.
+
+    total_purchase_count is a batch recompute (refresh_portfolio_aggregates), so
+    a single sweep can jump an active buyer past a milestone (2→4, 4→6) without
+    ever landing exactly on it. Matching on `>=` the highest crossed milestone —
+    and deduping on the highest milestone already alerted (stored monitor_value)
+    — means a skipped milestone still fires, and each milestone fires at most
+    once per entity.
     """
     lookback = today - timedelta(days=_EXPANSION_LOOKBACK_DAYS)
     milestones = list(_EXPANSION_MILESTONES)
+    min_milestone = min(milestones)
 
-    # DISTINCT ON (buyer_entity_id) — take only the latest acquisition per entity
-    # so one entity crossing a milestone emits at most one alert per run.
+    # DISTINCT ON (buyer_entity_id) — one alert per entity per run. `milestone`
+    # is the highest configured milestone the current count has reached; the
+    # NOT EXISTS suppresses it only if an equal-or-higher milestone already fired.
     rows = session.execute(text("""
         SELECT DISTINCT ON (ble.buyer_entity_id)
             ble.id              AS event_id,
@@ -261,21 +272,30 @@ def _check_portfolio_expansion(session: Session, today: date) -> list[MonitorAle
             be.total_purchase_count,
             be.total_cash_volume,
             be.buyer_type,
-            be.financing_signal
+            be.financing_signal,
+            (SELECT max(m) FROM unnest(:milestones) AS m
+                 WHERE m <= be.total_purchase_count) AS milestone
         FROM borrower_ledger_events ble
         JOIN buyer_entities be ON be.id = ble.buyer_entity_id
         LEFT JOIN properties p ON p.id = ble.property_id
         WHERE ble.event_type = 'deed_acquisition'
           AND ble.event_date >= :lookback
-          AND be.total_purchase_count = ANY(:milestones)
+          AND be.total_purchase_count >= :min_milestone
           AND NOT EXISTS (
               SELECT 1 FROM borrower_monitor_log bml
               WHERE bml.buyer_entity_id = ble.buyer_entity_id
                 AND bml.monitor_type = 'portfolio_expansion'
-                AND bml.source_event_id = ble.id
+                AND bml.monitor_value >= (
+                    SELECT max(m) FROM unnest(:milestones) AS m
+                        WHERE m <= be.total_purchase_count
+                )
           )
         ORDER BY ble.buyer_entity_id, ble.id DESC
-    """), {"lookback": lookback, "milestones": milestones}).mappings().all()
+    """), {
+        "lookback": lookback,
+        "milestones": milestones,
+        "min_milestone": min_milestone,
+    }).mappings().all()
 
     alerts = []
     for r in rows:
@@ -291,7 +311,7 @@ def _check_portfolio_expansion(session: Session, today: date) -> list[MonitorAle
             total_cash_volume=float(r["total_cash_volume"] or 0),
             buyer_type=r["buyer_type"],
             financing_signal=r["financing_signal"],
-            extra={"milestone": r["total_purchase_count"]},
+            extra={"milestone": r["milestone"]},
         ))
     return alerts
 
@@ -407,14 +427,15 @@ def _post_alert(alert: MonitorAlert) -> Optional[str]:
 def _record_fired(session: Session, alert: MonitorAlert, slack_ts: Optional[str]) -> None:
     session.execute(text("""
         INSERT INTO borrower_monitor_log
-            (buyer_entity_id, monitor_type, source_event_id, slack_ts)
+            (buyer_entity_id, monitor_type, source_event_id, monitor_value, slack_ts)
         VALUES
-            (:entity_id, :monitor_type, :source_event_id, :slack_ts)
+            (:entity_id, :monitor_type, :source_event_id, :monitor_value, :slack_ts)
         ON CONFLICT (buyer_entity_id, monitor_type, source_event_id) DO NOTHING
     """), {
         "entity_id": alert.buyer_entity_id,
         "monitor_type": alert.monitor_type,
         "source_event_id": alert.source_event_id,
+        "monitor_value": alert.extra.get("milestone"),
         "slack_ts": slack_ts,
     })
 
@@ -427,14 +448,15 @@ def run_monitors(
     session: Session,
     today: Optional[date] = None,
     *,
-    dry_run: bool = False,
+    deliver: bool = True,
 ) -> list[MonitorAlert]:
     """
-    Run all 4 monitors, post Slack alerts, record fired events.
-    Returns the list of MonitorAlert objects that fired.
+    Run all 4 monitors and return eligible alerts. When ``deliver`` is true,
+    post candidates to Slack and record only confirmed deliveries. Preview
+    mode performs neither side effect.
     Does not commit — caller controls the transaction boundary.
 
-    dry_run=True skips _post_alert() and _record_fired() entirely -- rolling
+    deliver=False skips _post_alert() and _record_fired() entirely -- rolling
     back the transaction afterward only undoes the DB writes, it can never
     un-send a Slack message already posted.
     """
@@ -458,18 +480,22 @@ def run_monitors(
             continue
 
         for alert in alerts:
-            if dry_run:
-                logger.info(
-                    "[repeat_maturity] (dry-run, no Slack post) would fire %s for entity %d (%s)",
-                    alert.monitor_type, alert.buyer_entity_id, alert.canonical_name,
-                )
-            else:
-                slack_ts = _post_alert(alert)
-                _record_fired(session, alert, slack_ts)
-                logger.info(
-                    "[repeat_maturity] fired %s for entity %d (%s)",
-                    alert.monitor_type, alert.buyer_entity_id, alert.canonical_name,
-                )
             all_alerts.append(alert)
+            if not deliver:
+                continue
+
+            slack_ts = _post_alert(alert)
+            if slack_ts is None:
+                logger.warning(
+                    "[repeat_maturity] delivery failed; leaving %s/%d retryable",
+                    alert.monitor_type, alert.buyer_entity_id,
+                )
+                continue
+
+            _record_fired(session, alert, slack_ts)
+            logger.info(
+                "[repeat_maturity] fired %s for entity %d (%s)",
+                alert.monitor_type, alert.buyer_entity_id, alert.canonical_name,
+            )
 
     return all_alerts

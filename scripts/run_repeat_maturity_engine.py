@@ -35,8 +35,8 @@ def main(dry_run: bool, as_of: date) -> None:
 
     with Session_() as session:
         if dry_run:
-            # Run queries so we can log counts, but skip Slack posts and DB writes.
-            alerts = run_monitors(session, today=as_of, dry_run=True)
+            # Run queries so we can log counts, but roll back instead of committing.
+            alerts = run_monitors(session, today=as_of, deliver=False)
             session.rollback()
             print(f"\n[DRY RUN] Would have fired {len(alerts)} alert(s):")
             for a in alerts:
