@@ -186,6 +186,22 @@ def test_suppressed_contact_holds_off_instead_of_handing_off(monkeypatch, tracke
         assert row["handoff_ref"] is None
 
         person_id = row["person_id"]
+
+        # Spec's failure-behavior section: a blocked send must be "surfaced
+        # to me" (Josh), not just logged server-side.
+        exceptions_row = db.execute(
+            text(
+                "SELECT lane, status, payload FROM relay_approval_queue "
+                "WHERE idempotency_key = :key"
+            ),
+            {"key": f"selfserve-suppressed-handoff-{token}"},
+        ).mappings().first()
+        assert exceptions_row is not None
+        assert exceptions_row["lane"] == "EXCEPTIONS"
+        assert exceptions_row["payload"]["reason"] == "handoff_held_active_backflip_touch"
+
+        db.execute(text("DELETE FROM relay_approval_queue WHERE idempotency_key = :key"),
+                   {"key": f"selfserve-suppressed-handoff-{token}"})
         db.execute(text("DELETE FROM selfserve_sessions WHERE token = :token"), {"token": token})
         db.execute(text("DELETE FROM fa_max_person_consent WHERE person_id = :pid"), {"pid": person_id})
         db.execute(text("DELETE FROM fa_max_persons WHERE person_id = :pid"), {"pid": person_id})

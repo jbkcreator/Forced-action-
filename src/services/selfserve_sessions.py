@@ -136,13 +136,12 @@ def find_possible_person_match(
     return str(row.person_id) if row else None
 
 
-def flag_possible_identity_match(db: Session, new_person_id: str, existing_person_id: str, session_token: str) -> None:
-    """Surface a possible-duplicate person to the EXCEPTIONS lane for human
-    review (spec L567) — never auto-merged. Writes into the existing WP-2
+def _write_exceptions_row(db: Session, idempotency_key: str, agent_name: str, person_id: str, payload: dict) -> None:
+    """Shared EXCEPTIONS-lane writer. Writes into the existing WP-2
     relay_approval_queue/Slack-delivery pipeline (src/services/relay/), so
     WP-7 does not need its own Slack-posting code: whatever sweep already
     turns pending EXCEPTIONS-lane rows into Slack cards picks this up too.
-    Idempotent on session_token — a re-submit does not duplicate the flag."""
+    Idempotent on idempotency_key — a re-submit does not duplicate the flag."""
     db.execute(
         text(
             """
@@ -151,20 +150,53 @@ def flag_possible_identity_match(db: Session, new_person_id: str, existing_perso
                  status, agent_name, autonomy_tier_at_send, person_id)
             VALUES
                 (:idempotency_key, 'fa_max_lending', 'EXCEPTIONS', 'noop', 'n/a',
-                 CAST(:payload AS JSONB), 'pending', 'selfserve_identity_check', 'A', :person_id)
+                 CAST(:payload AS JSONB), 'pending', :agent_name, 'A', :person_id)
             ON CONFLICT (idempotency_key) DO NOTHING
             """
         ),
         {
-            "idempotency_key": f"selfserve-possible-match-{session_token}",
-            "payload": json.dumps({
-                "reason": "possible_duplicate_person",
-                "new_person_id": new_person_id,
-                "existing_person_id": existing_person_id,
-                "session_token": session_token,
-                "source": "wp7_selfserve",
-            }),
-            "person_id": new_person_id,
+            "idempotency_key": idempotency_key,
+            "agent_name": agent_name,
+            "payload": json.dumps(payload),
+            "person_id": person_id,
+        },
+    )
+
+
+def flag_possible_identity_match(db: Session, new_person_id: str, existing_person_id: str, session_token: str) -> None:
+    """Surface a possible-duplicate person to the EXCEPTIONS lane for human
+    review (spec L567) — never auto-merged."""
+    _write_exceptions_row(
+        db,
+        idempotency_key=f"selfserve-possible-match-{session_token}",
+        agent_name="selfserve_identity_check",
+        person_id=new_person_id,
+        payload={
+            "reason": "possible_duplicate_person",
+            "new_person_id": new_person_id,
+            "existing_person_id": existing_person_id,
+            "session_token": session_token,
+            "source": "wp7_selfserve",
+        },
+    )
+
+
+def flag_suppressed_handoff(db: Session, person_id: str, session_token: str, contact: dict) -> None:
+    """Surface a held-back handoff to the EXCEPTIONS lane. Spec's
+    failure-behavior section: "A send fails suppression. Blocked, logged
+    with reason, surfaced to me. Never silently dropped." A server log line
+    alone does not satisfy "surfaced to me" — Josh needs to see this in
+    Slack, same as any other EXCEPTIONS item."""
+    _write_exceptions_row(
+        db,
+        idempotency_key=f"selfserve-suppressed-handoff-{session_token}",
+        agent_name="selfserve_suppression_check",
+        person_id=person_id,
+        payload={
+            "reason": "handoff_held_active_backflip_touch",
+            "session_token": session_token,
+            "contact": contact,
+            "source": "wp7_selfserve",
         },
     )
 

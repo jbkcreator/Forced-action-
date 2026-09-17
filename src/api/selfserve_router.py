@@ -60,6 +60,7 @@ from src.services.backflip_port import HandoffPayload, get_backflip_port
 from src.services.prefill_assembly import assemble_prefill, find_property_by_address
 from src.services.selfserve_sessions import (
     create_session,
+    flag_suppressed_handoff,
     get_session_by_token,
     is_backflip_suppressed,
     submit_session,
@@ -287,6 +288,11 @@ async def submit_selfserve(token: str, request: Request, db: Session = Depends(g
             "selfserve: session token=%s suppressed — active Backflip touch on this contact, holding off",
             token,
         )
+        if updated.person_id:
+            # Spec's failure-behavior section: "A send fails suppression.
+            # Blocked, logged with reason, surfaced to me." A log line alone
+            # doesn't satisfy "surfaced to me" — Josh needs to see this.
+            flag_suppressed_handoff(db, person_id=updated.person_id, session_token=token, contact=contact)
         db.commit()
         return HTMLResponse(
             "<html><body><p>Thanks — you're already connected with Backflip on this. "
