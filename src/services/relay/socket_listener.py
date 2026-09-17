@@ -32,12 +32,22 @@ logger = logging.getLogger(__name__)
 
 
 def handle_socket_request(client: Any, request: Any) -> bool:
-    """Acknowledge and dispatch one Slack Socket Mode envelope.
+    """Acknowledge and dispatch one Slack Socket Mode envelope this listener owns.
+
+    Only ``events_api`` and ``interactive`` envelopes belong to this listener.
+    Other envelope types (e.g. ``slash_commands``, owned by
+    ``handle_tracked_link_socket_request``) are left un-acked and untouched so
+    the listener that actually owns them can send Slack the real response —
+    Slack Socket Mode resolves an envelope on its *first* acknowledgement, so
+    acking here for an envelope this listener does not own would silently
+    swallow the other listener's reply.
 
     Returns ``True`` only when this listener handled a Relay Approve/Reject
-    action.  Other app actions are acknowledged and left untouched so a
-    shared Socket Mode app does not accidentally mutate another workflow.
+    action.
     """
+    if request.type not in {"events_api", "interactive"}:
+        return False
+
     from slack_sdk.socket_mode.response import SocketModeResponse
 
     # Slack requires this acknowledgement within three seconds.  The durable
@@ -55,8 +65,6 @@ def handle_socket_request(client: Any, request: Any) -> bool:
         _handle_relay_thread_action(payload)
         return payload.get("type") == "event_callback"
 
-    if request.type != "interactive":
-        return False
     if payload.get("type") != "block_actions":
         return False
     actions = payload.get("actions") or []
