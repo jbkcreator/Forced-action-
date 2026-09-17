@@ -997,6 +997,150 @@ def attach_or_create_entities(
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# WP-T2-8 Stage B — Permit principal resolution
+# Extracts holder_name / contractor_name from building_permits + permit_staging,
+# resolves each to a buyer_entity via the existing pipeline.
+# Low-confidence links (<UNVERIFIED_FLOOR) are written as 'unverified' and also
+# emitted to the EXCEPTIONS Slack channel for manual confirmation.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_BUILDER_CONFIDENCE_FLOOR = 70  # mirrors UNVERIFIED_FLOOR in gating.py
+
+
+def _permit_name_candidates(
+    session: Session,
+    source_table: str,
+    only_unresolved: bool,
+) -> Iterator[CandidateRecord]:
+    """
+    Stream holder_name and contractor_name rows from building_permits or
+    permit_staging as CandidateRecords. Each unique (source_id, name_column)
+    pair becomes one record so the resolver can link it independently.
+
+    only_unresolved=True skips source_ids that already have a buyer_entity_link.
+    """
+    if source_table not in ("building_permits", "permit_staging"):
+        raise ValueError(f"Unknown source_table for permit resolution: {source_table!r}")
+
+    unresolved_guard = (
+        "AND bel.id IS NULL" if only_unresolved else ""
+    )
+
+    # holder_name column
+    holder_sql = f"""
+        SELECT p.id, p.holder_name AS raw_name, p.county_id
+        FROM {source_table} p
+        LEFT JOIN buyer_entity_links bel
+            ON bel.source_table = :src AND bel.source_id = p.id
+        WHERE p.holder_name IS NOT NULL AND p.holder_name != ''
+        {unresolved_guard}
+        ORDER BY p.id
+    """
+    for row in session.execute(text(holder_sql), {"src": source_table}).yield_per(_STREAM_BATCH):
+        raw = row.raw_name or ""
+        yield CandidateRecord(
+            source_table=source_table,
+            source_id=row.id,
+            raw_name=raw,
+            normalized_name=BaseLoader.normalize_owner_name(raw),
+            mailing_address=None,
+            entity_type_hint="Individual",
+            managing_members=None,
+            county_id=row.county_id,
+        )
+
+
+def extract_permit_candidates(
+    session: Session, only_unresolved: bool = True,
+) -> Iterator[CandidateRecord]:
+    """Combined stream over building_permits + permit_staging."""
+    yield from _permit_name_candidates(session, "building_permits", only_unresolved)
+    yield from _permit_name_candidates(session, "permit_staging", only_unresolved)
+
+
+def _emit_exceptions_alerts(
+    low_conf_links: list[tuple[str, int, str, int]],
+) -> None:
+    """
+    Post a single batched EXCEPTIONS alert for permit resolutions below the
+    confidence floor. Non-fatal — if Slack post fails, we log and continue.
+    """
+    if not low_conf_links:
+        return
+    try:
+        from src.services.relay.slack_post import post_to_slack
+        lines = [
+            f"• {src}#{src_id} '{name}' → entity_id={entity_id} confidence={conf} (UNVERIFIED)"
+            for src, src_id, name, conf, entity_id in low_conf_links
+        ]
+        msg = (
+            f":building_construction: *Builder permit resolution — {len(lines)} low-confidence link(s)*\n"
+            + "\n".join(lines[:20])  # cap to avoid oversized messages
+            + ("\n… (truncated)" if len(lines) > 20 else "")
+        )
+        post_to_slack("EXCEPTIONS", msg)
+    except Exception as exc:
+        logger.warning("_emit_exceptions_alerts: slack post failed: %s", exc)
+
+
+def run_incremental_permits(
+    session: Session,
+    county_id: Optional[str] = None,
+    only_unresolved: bool = True,
+) -> dict:
+    """
+    Stage B entry point — resolve permit holder/contractor names to buyer_entities.
+
+    Behaviour:
+    - Pulls unresolved (default) permit candidates from building_permits + permit_staging.
+    - Runs through the identical cluster_against_anchors pipeline used by run_incremental.
+    - confidence >= 70: writes BuyerEntityLink as 'verified'; entity persisted.
+    - confidence < 70: writes BuyerEntityLink as 'unverified'; also emits an
+      EXCEPTIONS Slack alert for manual confirmation (never auto-merges).
+    - Commits once at the end.
+    """
+    new_candidates = list(extract_permit_candidates(session, only_unresolved=only_unresolved))
+    if county_id:
+        new_candidates = [c for c in new_candidates if c.county_id == county_id]
+
+    if not new_candidates:
+        return {"new_entities": 0, "new_links": 0, "conflicts": 0, "processed": 0,
+                "changed_entity_ids": [], "low_confidence": 0}
+
+    existing_entities = load_existing_entity_candidates(session, county_id=None)
+    combined = new_candidates + existing_entities
+    relevant_clusters, confidences, evidence_index = cluster_against_anchors(combined)
+    stats = attach_or_create_entities(session, relevant_clusters, confidences, evidence_index)
+
+    # Collect low-confidence links for EXCEPTIONS routing
+    low_conf_links = []
+    for cluster, confidence in zip(relevant_clusters, confidences):
+        if confidence < _BUILDER_CONFIDENCE_FLOOR:
+            new_recs = [r for r in cluster if r.source_table != _ENTITY_ANCHOR_TABLE]
+            for rec in new_recs:
+                low_conf_links.append((rec.source_table, rec.source_id, rec.raw_name, confidence))
+
+    # Enrich with entity_id for the alert message — look up the links we just wrote
+    alert_items = []
+    for src, src_id, name, conf in low_conf_links:
+        row = session.execute(
+            text("SELECT buyer_entity_id FROM buyer_entity_links WHERE source_table=:t AND source_id=:id LIMIT 1"),
+            {"t": src, "id": src_id},
+        ).fetchone()
+        entity_id = row.buyer_entity_id if row else "?"
+        alert_items.append((src, src_id, name, conf, entity_id))
+
+    session.commit()
+    _emit_exceptions_alerts(alert_items)
+
+    return {
+        **stats,
+        "processed": len(new_candidates),
+        "low_confidence": len(low_conf_links),
+    }
+
+
 def run_incremental(session: Session, county_id: Optional[str] = None) -> dict:
     """
     Nightly-safe incremental resolution: match new/changed owners/deeds rows
