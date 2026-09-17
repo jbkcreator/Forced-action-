@@ -856,6 +856,12 @@ class BuildingPermit(Base):
     # Enforcement flag — True for stop work orders, after-the-fact, failed/expired/revoked/suspended
     is_enforcement_permit: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
 
+    # Builder enrichment columns (Stage A — WP-T2-8)
+    contractor_name: Mapped[Optional[str]] = mapped_column(Text)
+    holder_name: Mapped[Optional[str]] = mapped_column(Text)       # permit applicant / owner-of-record
+    job_value: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 2))  # declared construction value
+    completion_status: Mapped[Optional[str]] = mapped_column(String(50))  # issued|active|expired|completed|pending
+
     # Load tracking & multi-county
     date_added: Mapped[Optional[date]] = mapped_column(Date, default=date.today, index=True)
     county_id: Mapped[Optional[str]] = mapped_column(String(50), default='hillsborough', index=True)
@@ -868,10 +874,63 @@ class BuildingPermit(Base):
         Index("idx_permit_type", "permit_type"),
         Index("idx_permit_status", "status"),
         Index("idx_permit_expire_date", "expire_date"),
+        Index("idx_permit_holder_name", "holder_name"),
+        Index("idx_permit_contractor_name", "contractor_name"),
     )
 
     def __repr__(self):
         return f"<BuildingPermit(id={self.id}, permit_number='{self.permit_number}', type='{self.permit_type}')>"
+
+
+class PermitStaging(Base):
+    """
+    Unmatched building permits — permits that could not be linked to an existing
+    properties row (new construction / vacant lots / unplatted parcels).
+
+    Builder Engine reads UNION(building_permits, permit_staging) so builder
+    pattern detection runs on the full permit set, not just property-matched ones.
+    The building_permits.property_id NOT NULL invariant is preserved.
+
+    Stage A′ — WP-T2-8.
+    """
+    __tablename__ = "permit_staging"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+
+    # Core permit identity
+    permit_number: Mapped[str] = mapped_column(String(100), unique=True, nullable=False, index=True)
+    permit_type: Mapped[Optional[str]] = mapped_column(String(100))
+    county_id: Mapped[Optional[str]] = mapped_column(String(50), index=True)
+
+    # Address as raw string — no property FK
+    address: Mapped[Optional[str]] = mapped_column(Text)
+
+    # Builder-relevant enrichment
+    holder_name: Mapped[Optional[str]] = mapped_column(Text)
+    contractor_name: Mapped[Optional[str]] = mapped_column(Text)
+    job_value: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 2))
+    completion_status: Mapped[Optional[str]] = mapped_column(String(50))
+    status: Mapped[Optional[str]] = mapped_column(String(50))
+    description: Mapped[Optional[str]] = mapped_column(Text)
+
+    # Dates
+    issue_date: Mapped[Optional[date]] = mapped_column(Date)
+    expire_date: Mapped[Optional[date]] = mapped_column(Date)
+    date_added: Mapped[Optional[date]] = mapped_column(Date, default=date.today, index=True)
+
+    # Resolution state — True once this staging row is linked to a properties row
+    matched: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    matched_property_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("properties.id"), nullable=True, index=True
+    )
+
+    __table_args__ = (
+        Index("idx_permit_staging_holder", "holder_name"),
+        Index("idx_permit_staging_county_issue", "county_id", "issue_date"),
+    )
+
+    def __repr__(self):
+        return f"<PermitStaging(id={self.id}, permit_number='{self.permit_number}', matched={self.matched})>"
 
 
 class Incident(Base):

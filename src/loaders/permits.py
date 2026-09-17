@@ -10,8 +10,27 @@ from typing import Optional, Tuple
 import pandas as pd
 from sqlalchemy import text
 
+_COMPLETION_STATUS_MAP: dict[str, str] = {
+    "issued": "issued",
+    "active": "active",
+    "open": "active",
+    "in review": "active",
+    "under review": "active",
+    "approved": "issued",
+    "expired": "expired",
+    "revoked": "expired",
+    "cancelled": "expired",
+    "cancel": "expired",
+    "completed": "completed",
+    "finaled": "completed",
+    "closed": "completed",
+    "pending": "pending",
+    "received": "pending",
+    "submitted": "pending",
+}
+
 from src.loaders.base import BaseLoader
-from src.core.models import BuildingPermit, CountySource
+from src.core.models import BuildingPermit, CountySource, PermitStaging
 
 # Hillsborough County permit_type substrings that indicate an enforcement permit
 _ENFORCEMENT_TYPE_KEYWORDS = frozenset({
@@ -38,6 +57,23 @@ def _is_enforcement(permit_type: str | None, status: str | None, expire_date) ->
     return False
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_completion_status(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    return _COMPLETION_STATUS_MAP.get(raw.lower().strip())
+
+
+def _parse_job_value(raw) -> float | None:
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return None
+    try:
+        cleaned = str(raw).replace("$", "").replace(",", "").strip()
+        val = float(cleaned)
+        return val if val > 0 else None
+    except (ValueError, TypeError):
+        return None
 
 
 class BuildingPermitLoader(BaseLoader):
@@ -103,7 +139,10 @@ class BuildingPermitLoader(BaseLoader):
             # Check for duplicates; update description if previously NULL
             if skip_duplicates:
                 existing_row = self.session.execute(
-                    text("SELECT id, description, status FROM building_permits WHERE permit_number = :pnum LIMIT 1"),
+                    text("""
+                        SELECT id, description, status, holder_name, contractor_name
+                        FROM building_permits WHERE permit_number = :pnum LIMIT 1
+                    """),
                     {"pnum": record_number},
                 ).fetchone()
                 if existing_row:
@@ -114,11 +153,23 @@ class BuildingPermitLoader(BaseLoader):
                         self.session.execute(
                             text("""
                                 UPDATE building_permits
-                                SET description = COALESCE(description, :desc),
-                                    status = CASE WHEN :status IS NOT NULL THEN :status ELSE status END
+                                SET description       = COALESCE(description, :desc),
+                                    status            = CASE WHEN :status IS NOT NULL THEN :status ELSE status END,
+                                    holder_name       = COALESCE(holder_name, :holder_name),
+                                    contractor_name   = COALESCE(contractor_name, :contractor_name),
+                                    job_value         = COALESCE(job_value, :job_value),
+                                    completion_status = COALESCE(completion_status, :completion_status)
                                 WHERE id = :id
                             """),
-                            {"desc": description_val, "status": incoming_status, "id": existing_row.id},
+                            {
+                                "desc": description_val,
+                                "status": incoming_status,
+                                "holder_name": str(row.get('Holder Name') or '').strip() or None,
+                                "contractor_name": str(row.get('Contractor Name') or '').strip() or None,
+                                "job_value": _parse_job_value(row.get('Job Value')),
+                                "completion_status": _normalize_completion_status(incoming_status),
+                                "id": existing_row.id,
+                            },
                         )
                         self.session.flush()
                     skipped += 1
@@ -142,18 +193,23 @@ class BuildingPermitLoader(BaseLoader):
                     property_record, score = match_result
                     logger.info(f"Matched permit by address (score: {score}%): {record_number}")
             
+            # Enrichment fields shared by both branches
+            permit_type_val = row.get('Record Type')
+            if pd.isna(permit_type_val) if isinstance(permit_type_val, float) else False:
+                permit_type_val = None
+            status_val = row.get('Status')
+            if pd.isna(status_val) if isinstance(status_val, float) else False:
+                status_val = None
+
+            raw_holder = str(row.get('Holder Name') or '').strip() or None
+            raw_contractor = str(row.get('Contractor Name') or '').strip() or None
+            job_value_val = _parse_job_value(row.get('Job Value'))
+            completion_status_val = _normalize_completion_status(status_val)
+            parsed_issue = self.parse_date(row.get('Date'))
+            parsed_expire = self.parse_date(row.get('Expiration Date'))
+
             if property_record:
                 try:
-                    # Handle NaN values
-                    permit_type_val = row.get('Record Type')
-                    if pd.isna(permit_type_val):
-                        permit_type_val = None
-                    
-                    status_val = row.get('Status')
-                    if pd.isna(status_val):
-                        status_val = None
-                    
-                    parsed_expire = self.parse_date(row.get('Expiration Date'))
                     enforcement = _is_enforcement(permit_type_val, status_val, parsed_expire)
 
                     permit_record = BuildingPermit(
@@ -161,13 +217,17 @@ class BuildingPermitLoader(BaseLoader):
                         permit_number=record_number,
                         permit_type=permit_type_val,
                         status=status_val,
-                        issue_date=self.parse_date(row.get('Date')),
+                        issue_date=parsed_issue,
                         expire_date=parsed_expire,
                         is_enforcement_permit=enforcement,
                         county_id=self.county_id,
                         description=description_val,
+                        holder_name=raw_holder,
+                        contractor_name=raw_contractor,
+                        job_value=job_value_val,
+                        completion_status=completion_status_val,
                     )
-                    
+
                     if self.safe_add(permit_record):
                         matched += 1
                     else:
@@ -177,7 +237,20 @@ class BuildingPermitLoader(BaseLoader):
                     logger.error(f"Error building permit {record_number}: {e}")
                     unmatched += 1
             else:
-                logger.warning(f"No property match for permit: {record_number} at {row.get('Address')}")
+                logger.info(f"Permit {record_number} unmatched — staging for builder engine")
+                self._persist_to_staging(
+                    permit_number=record_number,
+                    permit_type=permit_type_val,
+                    address=str(row.get('Address', '')),
+                    holder_name=raw_holder,
+                    contractor_name=raw_contractor,
+                    job_value=job_value_val,
+                    completion_status=completion_status_val,
+                    status=status_val,
+                    description=description_val,
+                    issue_date=parsed_issue,
+                    expire_date=parsed_expire,
+                )
                 self.quarantine_unmatched(
                     source_type="permits",
                     raw_row=row.to_dict() if hasattr(row, 'to_dict') else dict(row),
@@ -188,6 +261,59 @@ class BuildingPermitLoader(BaseLoader):
         
         logger.info(f"Building Permits: {matched} matched, {unmatched} unmatched, {skipped} skipped")
         return matched, unmatched, skipped
+
+    def _persist_to_staging(
+        self,
+        *,
+        permit_number: str,
+        permit_type: str | None,
+        address: str,
+        holder_name: str | None,
+        contractor_name: str | None,
+        job_value: float | None,
+        completion_status: str | None,
+        status: str | None,
+        description: str | None,
+        issue_date,
+        expire_date,
+    ) -> None:
+        """Upsert an unmatched permit into permit_staging."""
+        self.session.execute(
+            text("""
+                INSERT INTO permit_staging (
+                    permit_number, permit_type, county_id, address,
+                    holder_name, contractor_name, job_value,
+                    completion_status, status, description,
+                    issue_date, expire_date, date_added, matched
+                ) VALUES (
+                    :permit_number, :permit_type, :county_id, :address,
+                    :holder_name, :contractor_name, :job_value,
+                    :completion_status, :status, :description,
+                    :issue_date, :expire_date, CURRENT_DATE, FALSE
+                )
+                ON CONFLICT (permit_number) DO UPDATE SET
+                    status            = EXCLUDED.status,
+                    completion_status = EXCLUDED.completion_status,
+                    holder_name       = COALESCE(EXCLUDED.holder_name, permit_staging.holder_name),
+                    contractor_name   = COALESCE(EXCLUDED.contractor_name, permit_staging.contractor_name),
+                    job_value         = COALESCE(EXCLUDED.job_value, permit_staging.job_value),
+                    description       = COALESCE(EXCLUDED.description, permit_staging.description)
+            """),
+            {
+                "permit_number": permit_number,
+                "permit_type": permit_type,
+                "county_id": self.county_id,
+                "address": address,
+                "holder_name": holder_name,
+                "contractor_name": contractor_name,
+                "job_value": job_value,
+                "completion_status": completion_status,
+                "status": status,
+                "description": description,
+                "issue_date": issue_date,
+                "expire_date": expire_date,
+            },
+        )
 
 
 PermitLoader = BuildingPermitLoader
