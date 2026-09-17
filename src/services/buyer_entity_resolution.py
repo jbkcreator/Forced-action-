@@ -1111,53 +1111,102 @@ def _build_exceptions_message(low_conf_links: list[tuple[str, int, str, int]]) -
 
 
 def _build_exceptions_blocks(low_conf_links: list[tuple[str, int, str, int]]) -> list[dict]:
-    """Render a Block Kit card for the EXCEPTIONS alert (pure — unit-testable)."""
+    """Render a Block Kit card for the EXCEPTIONS alert (pure — unit-testable).
+
+    Design follows Slack UI guide: bold primary text, italic muted secondary,
+    primary/danger button styles, ghost neutral for non-destructive actions,
+    dividers for card separation.
+    """
     n = len(low_conf_links)
     shown = low_conf_links[:_EXCEPTIONS_CARD_ROW_CAP]
 
+    def _conf_label(conf: int) -> str:
+        return "Critical" if conf < 60 else "Low"
+
     blocks: list[dict] = [
+        # Summary header — primary text bold, secondary detail muted
         {
-            "type": "header",
-            "text": {"type": "plain_text", "text": "🏗  Builder Permit Resolution", "emoji": True},
-        },
-        {
-            "type": "context",
-            "elements": [{
+            "type": "section",
+            "text": {
                 "type": "mrkdwn",
                 "text": (
-                    f"*{n}* permit link{'s' if n != 1 else ''} resolved *below the confidence floor* "
-                    f"(<{_BUILDER_CONFIDENCE_FLOOR}) — confirm or reject each match before it is trusted."
+                    f"*{n} match{'es' if n != 1 else ''} need{'s' if n == 1 else ''} your review* "
+                    f"_(confidence < {_BUILDER_CONFIDENCE_FLOOR})_\n"
+                    "_Confirm or reject each before it is trusted._"
                 ),
-            }],
+            },
         },
         {"type": "divider"},
     ]
 
     for src, src_id, name, conf, entity_id in shown:
+        sev = _severity(conf)
+        label = _conf_label(conf)
+        # Row: company name (primary/bold) + source path (secondary/muted)
         blocks.append({
             "type": "section",
             "text": {
                 "type": "mrkdwn",
                 "text": (
-                    f"{_severity(conf)}  *{name}*\n"
-                    f"`{src}` #{src_id}  →  entity `{entity_id}`"
+                    f"*{name}*\n"
+                    f"_`{src}` #{src_id}  →  Entity #{entity_id}_"
                 ),
             },
+        })
+        # Confidence + status fields — numeric tabular, muted labels
+        blocks.append({
+            "type": "section",
             "fields": [
-                {"type": "mrkdwn", "text": f"*Confidence*\n{conf} / 100"},
-                {"type": "mrkdwn", "text": "*Status*\n_unverified_"},
+                {"type": "mrkdwn", "text": f"*Confidence*\n{sev} *{conf}%*  _{label}_"},
+                {"type": "mrkdwn", "text": f"*Status*\n_Needs review_"},
             ],
         })
+        # Actions: primary=Confirm (accent), danger=Reject, neutral ghost=View details
+        blocks.append({
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Confirm", "emoji": False},
+                    "style": "primary",
+                    "action_id": f"confirm_entity_link_{src}_{src_id}",
+                    "value": f"{src}:{src_id}:{entity_id}",
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Reject", "emoji": False},
+                    "style": "danger",
+                    "action_id": f"reject_entity_link_{src}_{src_id}",
+                    "value": f"{src}:{src_id}:{entity_id}",
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "View details", "emoji": False},
+                    "action_id": f"view_entity_link_{src}_{src_id}",
+                    "value": f"{src}:{src_id}:{entity_id}",
+                },
+            ],
+        })
+        blocks.append({"type": "divider"})
 
     if n > _EXCEPTIONS_CARD_ROW_CAP:
         blocks.append({
             "type": "context",
-            "elements": [{"type": "mrkdwn", "text": f"…and *{n - _EXCEPTIONS_CARD_ROW_CAP}* more not shown"}],
+            "elements": [{"type": "mrkdwn", "text": f"_…and *{n - _EXCEPTIONS_CARD_ROW_CAP}* more not shown_"}],
         })
 
+    # Footer: tertiary/muted, pipe-separated, count summary on right
     blocks.append({
         "type": "context",
-        "elements": [{"type": "mrkdwn", "text": "Lane: *EXCEPTIONS*  ·  Source: Builder Engine (WP-T2-8)"}],
+        "elements": [
+            {
+                "type": "mrkdwn",
+                "text": (
+                    f"Lane: *EXCEPTIONS*  |  Source: Builder Engine (WP-T2-8)"
+                    f"  |  _{n} of {n} match{'es' if n != 1 else ''}_"
+                ),
+            },
+        ],
     })
     return blocks
 

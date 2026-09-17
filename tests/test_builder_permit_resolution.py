@@ -31,22 +31,32 @@ def test_exceptions_blocks_structure():
         ("permit_staging", 1, "ACME HOMES LLC", 62, 900),   # 🟠
         ("building_permits", 2, "BUILDPRO INC", 55, 901),   # 🔴
     ])
-    assert blocks[0]["type"] == "header"
-    assert "Builder Permit Resolution" in blocks[0]["text"]["text"]
-    # one section per link, each with the two-field confidence/status layout
-    sections = [b for b in blocks if b["type"] == "section"]
-    assert len(sections) == 2
-    assert "*ACME HOMES LLC*" in sections[0]["text"]["text"]
-    assert any("Confidence" in f["text"] for f in sections[0]["fields"])
-    assert "🟠" in sections[0]["text"]["text"]   # 62 → below floor, not critical
-    assert "🔴" in sections[1]["text"]["text"]   # 55 → critical
+    # header is now a section with count summary
+    assert blocks[0]["type"] == "section"
+    assert "2 matches need your review" in blocks[0]["text"]["text"]
+    # per link: name-section, fields-section, actions-block, divider = 4 blocks
+    name_sections = [b for b in blocks if b["type"] == "section" and "text" in b
+                     and "HOMES LLC" in b["text"].get("text", "")]
+    assert "*ACME HOMES LLC*" in name_sections[0]["text"]["text"]
+    # fields sections carry confidence/status
+    field_sections = [b for b in blocks if b["type"] == "section" and "fields" in b]
+    assert len(field_sections) == 2
+    assert any("Confidence" in f["text"] for f in field_sections[0]["fields"])
+    assert "🟠" in field_sections[0]["fields"][0]["text"]   # 62 → Low
+    assert "🔴" in field_sections[1]["fields"][0]["text"]   # 55 → Critical
+    # action buttons present for each link
+    action_blocks = [b for b in blocks if b["type"] == "actions"]
+    assert len(action_blocks) == 2
+    assert any(e["style"] == "primary" for e in action_blocks[0]["elements"])
+    assert any(e["style"] == "danger" for e in action_blocks[0]["elements"])
 
 
 def test_exceptions_blocks_cap_and_overflow():
     links = [("permit_staging", i, f"BUILDER {i} LLC", 60, 1000 + i) for i in range(20)]
     blocks = _build_exceptions_blocks(links)
-    sections = [b for b in blocks if b["type"] == "section"]
-    assert len(sections) == 15                       # capped
+    # per link: name-section + fields-section = 2 sections; cap = 15 links → 30 sections
+    field_sections = [b for b in blocks if b["type"] == "section" and "fields" in b]
+    assert len(field_sections) == 15                 # capped at 15 links
     assert any("5" in e["text"] and "more" in e["text"]
                for b in blocks if b["type"] == "context"
                for e in b["elements"])               # overflow note present
