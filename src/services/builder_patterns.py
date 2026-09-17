@@ -407,17 +407,17 @@ _LAND_TO_PERMIT_SQL = text("""
         WHERE pu.issue_date - de.record_date BETWEEN 0 AND :deed_window_days
     )
     SELECT
-        buyer_entity_id,
-        MAX(issue_date)                       AS latest_date,
-        SUM(COALESCE(job_value, 0))           AS total_jv,
-        MAX(property_id)                      AS any_property_id,
-        MAX(county_id)                        AS county_id,
+        matches.buyer_entity_id,
+        MAX(matches.issue_date)                       AS latest_date,
+        SUM(COALESCE(matches.job_value, 0))           AS total_jv,
+        MAX(matches.property_id)                      AS any_property_id,
+        MAX(matches.county_id)                        AS county_id,
         be.canonical_name,
-        ARRAY_AGG(permit_row_id) FILTER (WHERE src = 'building_permits') AS bp_ids,
-        ARRAY_AGG(permit_row_id) FILTER (WHERE src = 'permit_staging')   AS ps_ids
+        ARRAY_AGG(matches.permit_row_id) FILTER (WHERE matches.src = 'building_permits') AS bp_ids,
+        ARRAY_AGG(matches.permit_row_id) FILTER (WHERE matches.src = 'permit_staging')   AS ps_ids
     FROM matches
     JOIN buyer_entities be ON be.id = matches.buyer_entity_id
-    GROUP BY buyer_entity_id, be.canonical_name
+    GROUP BY matches.buyer_entity_id, be.canonical_name
 """)
 
 
@@ -556,3 +556,104 @@ def run_builder_detectors(
         len(hits), county_id or "all",
     )
     return hits
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage E adapter — BuilderHit → property-keyed dial-list signal.
+#
+# CONTRACT PINNED against feat/wp-9-dial-list (not yet on dev), 2026-09-17.
+# WP-9's dial-list accumulator is PROPERTY-keyed: every detector feeds
+# {property_id: urgency_date} into a per-property accumulator, and the assembled
+# DialCandidate.property_id is the key. Builder patterns are PRINCIPAL-keyed by
+# nature (you cannot detect "repeat builder" at a single property). This adapter
+# bridges the grain: it fans each BuilderHit out to the property_ids of its
+# evidence permits, so Stage E can fold the builder signal into WP-9's
+# accumulator exactly like every other detector.
+#
+# NO dial_list import here on purpose — this stays a pure library so it does not
+# depend on WP-9 landing. Stage E (once WP-9 is on dev) calls
+# map_hits_to_property_signals(), then for each returned property_id does:
+#     acc[pid].triggers.add("builder"); acc[pid].is_builder = True
+#     acc[pid].urgency_date = max(acc[pid].urgency_date, sig.urgency_date)
+# and REPLACES WP-9's crude _BUILDER_SQL detector (keyword-only, no principal,
+# no permit_staging) — see reconciliation note below. Do not run both.
+#
+# Known grain limitation: staging permits with matched_property_id IS NULL
+# (unmatched new-construction / vacant-lot permits — the land→permit case) carry
+# no property_id and therefore cannot enter WP-9's property-keyed dial list yet.
+# They still exist in the graph via buyer_entities (Stage B) and surface in
+# RELATIONSHIPS; they enter MONEY only once the permit matches a property.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class PropertyBuilderSignal:
+    """Property-keyed builder signal — the shape Stage E folds into WP-9's acc."""
+
+    property_id: int
+    trigger: str = "builder"
+    patterns: list[str] = field(default_factory=list)       # which of the 5 fired
+    urgency_date: Optional[date] = None                      # newest permit date across hits
+    buyer_entity_id: Optional[int] = None
+    principal_name: Optional[str] = None
+
+
+def map_hits_to_property_signals(
+    session: Session,
+    hits: List[BuilderHit],
+) -> dict[int, PropertyBuilderSignal]:
+    """
+    Fan BuilderHits out to property-keyed signals for WP-9's dial-list accumulator.
+
+    Resolves property_id for every evidence permit in ONE batched query over
+    building_permits + permit_staging (never per-hit), then merges patterns and
+    keeps the newest urgency_date per property. Pure adapter: no dial_list import,
+    no writes.
+    """
+    # Collect every referenced permit id, per source table.
+    bp_ids: set[int] = set()
+    ps_ids: set[int] = set()
+    for h in hits:
+        bp_ids.update(h.evidence_permit_ids)
+        ps_ids.update(h.staging_permit_ids)
+
+    bp_prop: dict[int, Optional[int]] = {}
+    ps_prop: dict[int, Optional[int]] = {}
+    if bp_ids:
+        for row in session.execute(
+            text("SELECT id, property_id FROM building_permits WHERE id = ANY(:ids)"),
+            {"ids": list(bp_ids)},
+        ):
+            bp_prop[row.id] = row.property_id
+    if ps_ids:
+        for row in session.execute(
+            text("SELECT id, matched_property_id FROM permit_staging WHERE id = ANY(:ids)"),
+            {"ids": list(ps_ids)},
+        ):
+            ps_prop[row.id] = row.matched_property_id
+
+    signals: dict[int, PropertyBuilderSignal] = {}
+    for h in hits:
+        prop_ids = {
+            bp_prop.get(pid) for pid in h.evidence_permit_ids
+        } | {
+            ps_prop.get(pid) for pid in h.staging_permit_ids
+        }
+        for prop_id in prop_ids:
+            if prop_id is None:
+                continue  # unmatched staging permit — see grain limitation note
+            sig = signals.get(prop_id)
+            if sig is None:
+                sig = PropertyBuilderSignal(
+                    property_id=prop_id,
+                    buyer_entity_id=h.buyer_entity_id,
+                    principal_name=h.principal_name,
+                )
+                signals[prop_id] = sig
+            if h.pattern not in sig.patterns:
+                sig.patterns.append(h.pattern)
+            if h.latest_permit_date is not None:
+                sig.urgency_date = (
+                    h.latest_permit_date if sig.urgency_date is None
+                    else max(sig.urgency_date, h.latest_permit_date)
+                )
+    return signals
