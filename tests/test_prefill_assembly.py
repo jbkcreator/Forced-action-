@@ -60,3 +60,13 @@ def test_property_with_no_deed_or_permit_has_absent_sections(fresh_db):
     assert "open_permits" not in fields
     # Core property facts still present — the page still reads as complete.
     assert fields["address"]["value"] == "123 Test St"
+
+
+def test_borrower_screen_escapes_scraped_values(fresh_db):
+    """Owner/address values come from scraped county portals — they must never
+    be interpolated into the borrower page unescaped."""
+    from src.api.selfserve_router import _render_field_row
+
+    row = _render_field_row("owner_name", '"><script>alert(1)</script>')
+    assert "<script>" not in row
+    assert "&lt;script&gt;" in row

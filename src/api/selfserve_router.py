@@ -31,12 +31,13 @@ from a mistyped/expired URL, not a borrower's own click.
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import logging
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Form, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import text
@@ -113,24 +114,31 @@ def click_tracked_link(slug: str, request: Request, db: Session = Depends(get_db
 # ---------------------------------------------------------------------------
 
 
+def _esc(value) -> str:
+    """Escape before interpolating into HTML. Property/owner values are scraped
+    from county portals — untrusted input on a public page."""
+    return html.escape(str(value), quote=True)
+
+
 def _render_field_row(key: str, value) -> str:
     display = value if not isinstance(value, (dict, list)) else str(value)
     return (
-        f'<div class="field"><label>{key.replace("_", " ").title()}</label>'
-        f'<input type="text" name="correction__{key}" value="{display}"></div>'
+        f'<div class="field"><label>{_esc(key.replace("_", " ").title())}</label>'
+        f'<input type="text" name="correction__{_esc(key)}" value="{_esc(display)}"></div>'
     )
 
 
 def _render_question_row(q: dict) -> str:
+    key, label = _esc(q["key"]), _esc(q["label"])
     if q["type"] == "select":
-        options = "".join(f'<option value="{o}">{o}</option>' for o in q.get("options", []))
-        return f'<div class="field"><label>{q["label"]}</label><select name="q__{q["key"]}">{options}</select></div>'
+        options = "".join(f'<option value="{_esc(o)}">{_esc(o)}</option>' for o in q.get("options", []))
+        return f'<div class="field"><label>{label}</label><select name="q__{key}">{options}</select></div>'
     if q["type"] == "boolean":
         return (
-            f'<div class="field"><label>{q["label"]}</label>'
-            f'<select name="q__{q["key"]}"><option value="true">Yes</option><option value="false">No</option></select></div>'
+            f'<div class="field"><label>{label}</label>'
+            f'<select name="q__{key}"><option value="true">Yes</option><option value="false">No</option></select></div>'
         )
-    return f'<div class="field"><label>{q["label"]}</label><input type="text" name="q__{q["key"]}"></div>'
+    return f'<div class="field"><label>{label}</label><input type="text" name="q__{key}"></div>'
 
 
 @router.get("/selfserve/{token}", response_class=HTMLResponse)
