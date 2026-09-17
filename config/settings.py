@@ -824,9 +824,12 @@ class AppSettings(BaseSettings):
 	# code support exists for this -- deliberately, per WP-T2-1's scope):
 	#   1. List every FA Max row still in 'approved' status (the backlog).
 	#   2. Check each one's content and original approval date for staleness.
-	#   3. Hold back or reject (via the existing Slack flow) anything stale
-	#      before flipping this flag -- once true, the very next sweep tick
-	#      dispatches every row still 'approved', oldest first, up to the
+	#   3. If any approved item is stale, keep this flag false until those
+	#      items are safely removed from the approved queue. The existing
+	#      Slack Approve/Reject buttons only decide pending items; they cannot
+	#      reject an item that is already approved. No approved-item cancellation
+	#      workflow exists here. Once this flag is true, the next sweep can
+	#      dispatch every remaining approved row, oldest first, up to the
 	#      daily ceiling.
 	#   4. Record who ran this review and when, outside this flag (e.g. in
 	#      the go-live runbook/incident channel) -- this flag is a boolean,
