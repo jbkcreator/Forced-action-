@@ -18,7 +18,7 @@ from decimal import Decimal
 from typing import Optional
 from uuid import UUID
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
 
 from src.services.builder_patterns import BuilderHit
@@ -51,34 +51,54 @@ class _PropertyValues:
     last_sale_price: Optional[Decimal] = None     # acquisition-cost basis
 
 
+def _pos(v):
+    return Decimal(str(v)) if v and Decimal(str(v)) > _ZERO else None
+
+
+def _property_values_batch(
+    session: Session, property_ids: list[int],
+) -> dict[int, _PropertyValues]:
+    """Fetch value fields for many properties in ONE query (avoids an N+1
+    financials SELECT per builder hit). Missing property_ids simply absent."""
+    if not property_ids:
+        return {}
+    rows = session.execute(
+        text("""
+            SELECT f.property_id, f.arv, f.assessed_value_mkt, f.last_sale_price
+            FROM financials f
+            WHERE f.property_id IN :pids
+        """).bindparams(bindparam("pids", expanding=True)),
+        {"pids": list(set(property_ids))},
+    )
+    return {
+        r.property_id: _PropertyValues(
+            arv=_pos(r.arv),
+            assessed_value_mkt=_pos(r.assessed_value_mkt),
+            last_sale_price=_pos(r.last_sale_price),
+        )
+        for r in rows
+    }
+
+
 def _property_values(session: Session, property_id: int) -> _PropertyValues:
-    """Fetch the value fields separately — ARV is collateral (LTV cap basis),
+    """Single-property value fetch. ARV is collateral (LTV cap basis),
     assessed/sale are acquisition-cost bases. Conflating them lets the loan
     exceed the LTV cap (ARV must not be reused as the cost basis)."""
-    row = session.execute(
-        text("""
-            SELECT f.arv, f.assessed_value_mkt, f.last_sale_price
-            FROM financials f
-            WHERE f.property_id = :pid
-            LIMIT 1
-        """),
-        {"pid": property_id},
-    ).fetchone()
-    if row is None:
-        return _PropertyValues()
-
-    def _pos(v):
-        return Decimal(str(v)) if v and Decimal(str(v)) > _ZERO else None
-
-    return _PropertyValues(
-        arv=_pos(row.arv),
-        assessed_value_mkt=_pos(row.assessed_value_mkt),
-        last_sale_price=_pos(row.last_sale_price),
+    return _property_values_batch(session, [property_id]).get(
+        property_id, _PropertyValues()
     )
 
 
-def size_builder_hit(session: Session, hit: BuilderHit) -> BuilderSizingResult:
-    """Compute a loan-size estimate for one BuilderHit."""
+def size_builder_hit(
+    session: Session,
+    hit: BuilderHit,
+    values: Optional[_PropertyValues] = None,
+) -> BuilderSizingResult:
+    """Compute a loan-size estimate for one BuilderHit.
+
+    values: pre-fetched property values (from _property_values_batch) — pass
+    it when sizing many hits to avoid a per-hit financials query.
+    """
 
     # Path 1: property-backed value (quote_ready pipeline).
     # Requires BOTH an acquisition-cost basis (assessed/sale) AND a rehab (permit
@@ -87,7 +107,7 @@ def size_builder_hit(session: Session, hit: BuilderHit) -> BuilderSizingResult:
     # exceed the LTV cap. If no cost basis exists we do NOT reuse ARV as cost
     # (that bypassed the cap); we fall through to job-value sizing.
     if hit.property_id:
-        vals = _property_values(session, hit.property_id)
+        vals = values if values is not None else _property_values(session, hit.property_id)
         cost_basis = vals.assessed_value_mkt or vals.last_sale_price
         rehab = hit.total_job_value if (hit.total_job_value and hit.total_job_value > _ZERO) else None
         if cost_basis and rehab:
@@ -137,11 +157,16 @@ def size_builder_hit(session: Session, hit: BuilderHit) -> BuilderSizingResult:
 
 
 def size_builder_hits(session: Session, hits: list[BuilderHit]) -> list[BuilderSizingResult]:
-    """Batch-size a list of BuilderHits."""
+    """Batch-size a list of BuilderHits. Property values for every hit are
+    fetched in ONE query up front, then reused per hit (no N+1)."""
+    values_by_property = _property_values_batch(
+        session, [h.property_id for h in hits if h.property_id],
+    )
     results = []
     for hit in hits:
         try:
-            results.append(size_builder_hit(session, hit))
+            vals = values_by_property.get(hit.property_id) if hit.property_id else None
+            results.append(size_builder_hit(session, hit, values=vals))
         except Exception as exc:
             logger.warning(
                 "size_builder_hit failed for entity_id=%s pattern=%s: %s",

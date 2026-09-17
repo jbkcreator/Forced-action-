@@ -53,8 +53,10 @@ def test_spec_cadence_is_candidate():
     assert is_relationships_candidate(_hit("spec_cadence"))
 
 
-def test_concurrent_builder_not_candidate():
-    assert not is_relationships_candidate(_hit("concurrent_builder"))
+def test_concurrent_builder_is_candidate():
+    # Spec §WP-T2-8: portfolio-expansion / standing-relationship builders
+    # (>=2 currently active permits) surface in RELATIONSHIPS.
+    assert is_relationships_candidate(_hit("concurrent_builder"))
 
 
 def test_townhome_infill_not_candidate():

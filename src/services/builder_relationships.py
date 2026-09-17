@@ -27,9 +27,13 @@ from src.services.builder_sizing import BuilderSizingResult
 
 logger = logging.getLogger(__name__)
 
-# Patterns that qualify for the RELATIONSHIPS queue (high-value repeat/portfolio signals)
+# Patterns that qualify for the RELATIONSHIPS queue: repeat and
+# portfolio-expansion / standing-relationship builders (spec §WP-T2-8 Output).
+# concurrent_builder = "two or more currently active permits" — the standing
+# relationship the spec explicitly names for this lane, not a transaction.
 _RELATIONSHIPS_PATTERNS: frozenset[PatternType] = frozenset({
     "repeat_builder",
+    "concurrent_builder",
     "spec_cadence",
 })
 
@@ -276,9 +280,13 @@ def surface_relationship_hits(session: Session, hits: Iterable[BuilderHit]) -> i
     snoozed builder is skipped until its snooze expires. Each surfaced card
     carries its 85% LTC construction sizing (Stage D).
     """
-    from src.services.builder_sizing import size_builder_hit
+    from src.services.builder_sizing import size_builder_hits
 
+    hits = list(hits)
     dismissed, snoozed = load_builder_queue_state(session)
+    # Size every hit in ONE batched pass (financials prefetched) — avoids a
+    # per-hit query inside the loop. Keyed by object identity within this call.
+    sizing_by_hit = {id(h): s for h, s in zip(hits, size_builder_hits(session, hits))}
     surfaced = 0
     for hit in hits:
         if not is_relationships_candidate(hit):
@@ -306,7 +314,7 @@ def surface_relationship_hits(session: Session, hits: Iterable[BuilderHit]) -> i
             continue
         if claimed is None:
             continue
-        sizing = size_builder_hit(session, hit)
+        sizing = sizing_by_hit.get(id(hit))
         if emit_relationships_alert(hit, sizing):
             surfaced += 1
             continue

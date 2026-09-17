@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import Iterable, Iterator, Optional
 
 from rapidfuzz import fuzz
-from sqlalchemy import insert, text
+from sqlalchemy import bindparam, insert, text
 from sqlalchemy.orm import Session
 
 from config.settings import get_settings
@@ -1499,15 +1499,26 @@ def run_incremental_permits(
             for rec in new_recs:
                 low_conf_links.append((rec.source_table, rec.source_id, rec.raw_name, confidence))
 
-    # Enrich with entity_id for the alert message — look up the links we just wrote
-    alert_items = []
-    for src, src_id, name, conf in low_conf_links:
-        row = session.execute(
-            text("SELECT buyer_entity_id FROM buyer_entity_links WHERE source_table=:t AND source_id=:id LIMIT 1"),
-            {"t": src, "id": src_id},
-        ).fetchone()
-        entity_id = row.buyer_entity_id if row else "?"
-        alert_items.append((src, src_id, name, conf, entity_id))
+    # Enrich with entity_id for the alert message — look up the links we just
+    # wrote in ONE query (a per-link SELECT would be N+1). Key by (table, id).
+    entity_by_source: dict[tuple[str, int], int] = {}
+    if low_conf_links:
+        pairs = {(src, src_id) for src, src_id, _name, _conf in low_conf_links}
+        rows = session.execute(
+            text("""
+                SELECT source_table, source_id, buyer_entity_id
+                FROM buyer_entity_links
+                WHERE (source_table, source_id) IN :pairs
+            """).bindparams(bindparam("pairs", expanding=True)),
+            {"pairs": list(pairs)},
+        )
+        for r in rows:
+            entity_by_source[(r.source_table, r.source_id)] = r.buyer_entity_id
+
+    alert_items = [
+        (src, src_id, name, conf, entity_by_source.get((src, src_id), "?"))
+        for src, src_id, name, conf in low_conf_links
+    ]
 
     session.commit()
     _emit_exceptions_alerts(alert_items)
