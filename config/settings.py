@@ -804,6 +804,20 @@ class AppSettings(BaseSettings):
 	# flag does not itself replace the fa_max_10dlc_registered SMS gate below.
 	fa_max_relay_send_mode: str = Field(default="fake", env="FA_MAX_RELAY_SEND_MODE")
 
+	# Code-review finding (WP-T2-1, third round): flipping fa_max_relay_send_
+	# mode to "live" alone must NOT auto-release the backlog of items
+	# approved during the weeks-long warmup ramp while the lane was still in
+	# fake mode -- their content or the underlying business decision behind
+	# them may be stale by go-live. This flag is a SEPARATE, deliberate
+	# confirmation (mirrors fa_max_10dlc_registered's manual, defaults-closed
+	# pattern): an operator reviews the backlog and explicitly sets this to
+	# true as its own go-live action, distinct from and after the send-mode
+	# flip. relay.guards defers every FA Max item, regardless of channel,
+	# until BOTH this and fa_max_relay_send_mode == "live" are true.
+	fa_max_send_backlog_release_confirmed: bool = Field(
+		default=False, env="FA_MAX_SEND_BACKLOG_RELEASE_CONFIRMED"
+	)
+
 
 @lru_cache
 def get_settings() -> AppSettings:

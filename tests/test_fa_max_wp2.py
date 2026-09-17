@@ -436,6 +436,7 @@ class TestGuards10DLC:
             settings.relay_send_window_end = 18
             settings.relay_send_window_timezone = "America/New_York"
             settings.fa_max_relay_send_mode = "live"
+            settings.fa_max_send_backlog_release_confirmed = True
             settings.fa_max_10dlc_registered = False
             gs.return_value = settings
 
@@ -456,6 +457,7 @@ class TestGuards10DLC:
             settings.relay_send_window_end = 18
             settings.relay_send_window_timezone = "America/New_York"
             settings.fa_max_relay_send_mode = "live"
+            settings.fa_max_send_backlog_release_confirmed = True
             settings.fa_max_10dlc_registered = True
             gs.return_value = settings
 
@@ -521,11 +523,39 @@ class TestGuards10DLC:
             assert verdict.outcome == DEFER
             assert verdict.reason == "fa_max_relay_send_mode_not_live"
 
+    def test_fa_max_send_deferred_when_backlog_release_not_confirmed(self):
+        """Code-review finding (third round): flipping fa_max_relay_send_
+        mode to "live" alone must not auto-release the backlog approved
+        during warmup -- a separate, deliberate operator confirmation is
+        required. Must be DEFER (not BLOCK) for the same work-loss reason
+        as the mode gate itself."""
+        from src.services.relay.guards import evaluate, DEFER
+
+        item = _make_queue_item(
+            channel="email", recipient="a@example.com", venture_key="fa_max_lending",
+        )
+        with (
+            patch("src.services.relay.guards.get_settings") as gs,
+            patch("src.services.relay.guards._suppression_reason", return_value=None),
+        ):
+            settings = MagicMock()
+            settings.relay_send_window_start = 11
+            settings.relay_send_window_end = 18
+            settings.relay_send_window_timezone = "America/New_York"
+            settings.fa_max_relay_send_mode = "live"
+            settings.fa_max_send_backlog_release_confirmed = False
+            gs.return_value = settings
+
+            verdict = evaluate(item, now=self._window_now())
+            assert verdict.outcome == DEFER
+            assert verdict.reason == "fa_max_backlog_release_not_confirmed"
+
     def test_fa_max_send_not_blocked_by_mode_gate_once_live(self):
         """Sanity check for the guard above: once fa_max_relay_send_mode is
-        "live", this specific gate must not be what blocks the item --
-        whatever blocks it next (missing_governance_fields here) must be a
-        real, later check, not this one masking it."""
+        "live" AND the backlog release is confirmed, neither of those gates
+        must be what blocks the item -- whatever blocks it next
+        (missing_governance_fields here) must be a real, later check, not
+        one of these masking it."""
         from src.services.relay.guards import evaluate, BLOCK
 
         item = _make_queue_item(
@@ -540,11 +570,13 @@ class TestGuards10DLC:
             settings.relay_send_window_end = 18
             settings.relay_send_window_timezone = "America/New_York"
             settings.fa_max_relay_send_mode = "live"
+            settings.fa_max_send_backlog_release_confirmed = True
             gs.return_value = settings
 
             verdict = evaluate(item, now=self._window_now())
             assert verdict.outcome == BLOCK
             assert "fa_max_relay_send_mode_not_live" not in verdict.reason
+            assert "fa_max_backlog_release_not_confirmed" not in verdict.reason
 
 
 # ===========================================================================

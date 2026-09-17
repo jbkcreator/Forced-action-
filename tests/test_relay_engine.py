@@ -288,15 +288,25 @@ def test_blocked_item_marked_skipped_never_claimed(fake_backend, unlimited_ceili
 def test_fa_max_approved_item_survives_fake_mode_and_dispatches_once_live(
     fake_backend, unlimited_ceiling, green_kill_switch, monkeypatch,
 ):
-    """Code-review finding (WP-T2-1, second round): a fix that blocked FA
-    Max dispatch while fa_max_relay_send_mode != "live" originally used
-    BLOCK, which is terminal (mark_skipped -- approved_batch() never
-    revisits it), silently discarding every item approved before the lane
-    went live. Uses the real guards.evaluate() (not a stub, unlike the
-    generic DEFER test above) to prove the actual fix: repeated ticks in
-    fake mode leave the row 'approved' and untouched, and it dispatches
-    normally the moment the flag flips to "live" with no re-approval and no
-    lost work."""
+    """Code-review findings across three rounds on this same gate:
+
+    Round 2: a fix that blocked FA Max dispatch while
+    fa_max_relay_send_mode != "live" originally used BLOCK, which is
+    terminal (mark_skipped -- approved_batch() never revisits it), silently
+    discarding every item approved before the lane went live.
+
+    Round 3: flipping send_mode to "live" alone must not auto-release the
+    multi-week backlog of items approved during warmup -- their content or
+    the underlying decision behind them may be stale by go-live, so a
+    SEPARATE fa_max_send_backlog_release_confirmed flag is required too,
+    set only by a deliberate operator action at go-live (mirrors
+    fa_max_10dlc_registered's manual, defaults-closed pattern).
+
+    Uses the real guards.evaluate() (not a stub, unlike the generic DEFER
+    test above) to prove both gates: repeated ticks in fake mode leave the
+    row 'approved' and untouched; flipping send_mode alone still defers it
+    (backlog not yet released); it dispatches only once BOTH are set, with
+    no re-approval and no lost work at any stage."""
     from src.services.relay import guards as relay_guards
 
     item = replace(
@@ -310,11 +320,14 @@ def test_fa_max_approved_item_survives_fake_mode_and_dispatches_once_live(
     monkeypatch.setattr(relay_guards, "_suppression_reason", lambda item: None)
     monkeypatch.setattr(relay_guards, "_fa_max_compliance_reason", lambda item: None)
 
-    settings = type("S", (), {"fa_max_relay_send_mode": "fake", "fa_max_10dlc_registered": True})()
+    settings = type("S", (), {
+        "fa_max_relay_send_mode": "fake",
+        "fa_max_10dlc_registered": True,
+        "fa_max_send_backlog_release_confirmed": False,
+    })()
     monkeypatch.setattr(relay_guards, "get_settings", lambda: settings)
 
-    for _ in range(3):  # repeated fake-mode sweep ticks
-        result = relay_engine.execute_batch([item], batch_id="b1", now=_IN_WINDOW_NOW)
+    def _assert_untouched(result):
         assert result.deferred == 1
         assert result.sent == 0
         assert calls == []
@@ -322,8 +335,15 @@ def test_fa_max_approved_item_survives_fake_mode_and_dispatches_once_live(
         assert 1 not in fake_backend.skipped
         assert 1 not in fake_backend.sent
 
+    for _ in range(3):  # repeated fake-mode sweep ticks
+        _assert_untouched(relay_engine.execute_batch([item], batch_id="b1", now=_IN_WINDOW_NOW))
+
     settings.fa_max_relay_send_mode = "live"  # domain/DNS/10DLC now confirmed
     result = relay_engine.execute_batch([item], batch_id="b2", now=_IN_WINDOW_NOW)
+    _assert_untouched(result)  # mode alone isn't enough -- backlog not yet released
+
+    settings.fa_max_send_backlog_release_confirmed = True  # operator reviewed and released it
+    result = relay_engine.execute_batch([item], batch_id="b3", now=_IN_WINDOW_NOW)
     assert result.sent == 1
     assert calls == [1]
     assert fake_backend.sent == [1]

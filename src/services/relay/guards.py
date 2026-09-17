@@ -40,6 +40,7 @@ from src.services.relay.config import (
     GUARD_ALLOW,
     GUARD_BLOCK,
     GUARD_DEFER,
+    REASON_FA_MAX_BACKLOG_RELEASE_NOT_CONFIRMED,
     REASON_FA_MAX_SEND_MODE_NOT_LIVE,
     REASON_OUTSIDE_SEND_WINDOW,
     REASON_SUPPRESSED,
@@ -131,31 +132,51 @@ def evaluate(item: QueueItem, *, now: datetime, venture=None) -> Verdict:
     if not _within_send_window(now, settings):
         return Verdict(DEFER, REASON_OUTSIDE_SEND_WINDOW)
 
-    if item.venture_key == _FA_MAX_VENTURE and get_settings().fa_max_relay_send_mode != "live":
-        # Code-review finding: channels_email.py/channels_sms.py's fake-mode
-        # branch returns normally after recording into FAKE_MAIL/FAKE_SMS,
-        # and the engine treats any normal return as a real send -- it calls
-        # queue.mark_sent(), which writes dispatched_at, a durable WP-1
-        # outbound interaction, and a Slack "sent" completion receipt Josh
-        # reads as real. fa_max_relay_send_mode defaults to "fake", so an
-        # approved item reaching a real production sweep today would be
-        # permanently recorded as sent with no actual send happening.
-        #
-        # This MUST be DEFER, not BLOCK (second code-review finding, on the
-        # first fix): BLOCK -> queue.mark_skipped() is a terminal status
-        # transition approved_batch() never revisits, which would silently
-        # discard every FA Max item approved before the lane goes live --
-        # exactly the "permanently skips approved messages" bug the first
-        # version of this check introduced. DEFER leaves the row untouched
-        # in 'approved', so it's retried every sweep tick and dispatches
-        # normally once the flag flips to "live", with no work lost.
-        #
-        # The fake dispatch branches themselves exist so a developer can
-        # call send_email()/send_sms() directly in a test with the mode
-        # monkeypatched (see tests/test_fa_max_wp_t2_1_send_infra.py) --
-        # those calls bypass evaluate() entirely and are unaffected by this
-        # gate.
-        return Verdict(DEFER, REASON_FA_MAX_SEND_MODE_NOT_LIVE)
+    if item.venture_key == _FA_MAX_VENTURE:
+        fa_settings = get_settings()
+
+        if fa_settings.fa_max_relay_send_mode != "live":
+            # Code-review finding: channels_email.py/channels_sms.py's
+            # fake-mode branch returns normally after recording into
+            # FAKE_MAIL/FAKE_SMS, and the engine treats any normal return
+            # as a real send -- it calls queue.mark_sent(), which writes
+            # dispatched_at, a durable WP-1 outbound interaction, and a
+            # Slack "sent" completion receipt Josh reads as real.
+            # fa_max_relay_send_mode defaults to "fake", so an approved
+            # item reaching a real production sweep today would be
+            # permanently recorded as sent with no actual send happening.
+            #
+            # This MUST be DEFER, not BLOCK (second code-review finding, on
+            # the first fix): BLOCK -> queue.mark_skipped() is a terminal
+            # status transition approved_batch() never revisits, which
+            # would silently discard every FA Max item approved before the
+            # lane goes live -- exactly the "permanently skips approved
+            # messages" bug the first version of this check introduced.
+            # DEFER leaves the row untouched in 'approved', so it's
+            # retried every sweep tick and dispatches normally once the
+            # flag flips to "live", with no work lost.
+            #
+            # The fake dispatch branches themselves exist so a developer
+            # can call send_email()/send_sms() directly in a test with the
+            # mode monkeypatched (see
+            # tests/test_fa_max_wp_t2_1_send_infra.py) -- those calls
+            # bypass evaluate() entirely and are unaffected by this gate.
+            return Verdict(DEFER, REASON_FA_MAX_SEND_MODE_NOT_LIVE)
+
+        if not fa_settings.fa_max_send_backlog_release_confirmed:
+            # Code-review finding (third round): flipping send_mode to
+            # "live" alone must not auto-release the multi-week backlog of
+            # items approved while the lane was still in fake mode -- their
+            # content or the underlying business decision behind them may
+            # be stale by go-live, and guards.py's own freshness rechecks
+            # (consent, suppression, campaign membership below) don't cover
+            # content staleness. This is a SEPARATE, deliberate operator
+            # confirmation an operator sets only after reviewing the
+            # backlog at go-live -- mirrors fa_max_10dlc_registered's
+            # manual, defaults-closed pattern. DEFER for the same reason as
+            # above: nothing approved is ever lost, only held until a human
+            # explicitly releases it.
+            return Verdict(DEFER, REASON_FA_MAX_BACKLOG_RELEASE_NOT_CONFIRMED)
 
     # FA Max compliance check must run before suppression so 10DLC block
     # appears in the refusal log even when the contact is also suppressed.
