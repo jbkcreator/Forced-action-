@@ -3,17 +3,19 @@ Manual merge and unmerge operations for buyer entities.
 
 merge_entities()   — collapses two buyer_entities rows into one, moving all
                      buyer_entity_links, borrower_ledger_events,
-                     borrower_monitor_log, and closer_calls rows from the
-                     absorbed entity to the surviving entity (the ledger/
-                     monitor FKs are ON DELETE CASCADE and would silently
-                     destroy history; closer_calls.buyer_entity_id has no
-                     ondelete clause at all, so an unmoved row there raises a
-                     raw FK violation on the DELETE below), snapshotting the
-                     absorbed row, then deleting it.
+                     borrower_monitor_log, closer_calls, and selfserve_sessions
+                     rows from the absorbed entity to the surviving entity (the
+                     ledger/monitor FKs are ON DELETE CASCADE and would
+                     silently destroy history; closer_calls.buyer_entity_id and
+                     selfserve_sessions.buyer_entity_id have no ondelete clause
+                     at all, so an unmoved row there raises a raw FK violation
+                     on the DELETE below), snapshotting the absorbed row, then
+                     deleting it.
 
 unmerge_entity()   — reverses a logged merge: restores the absorbed entity from
                      its snapshot, moves its links/ledger events/monitor log/
-                     closer_calls rows back, and marks the log row reversed.
+                     closer_calls/selfserve_sessions rows back, and marks the
+                     log row reversed.
 
 These functions are for manual corrections and admin-driven operations only.
 The nightly resolver (buyer_entity_resolution.run_incremental) never calls them —
@@ -61,17 +63,24 @@ def merge_entities(
     if surviving_id == absorbed_id:
         raise ValueError("surviving_id and absorbed_id must be different")
 
-    surviving = session.execute(
-        text("SELECT * FROM buyer_entities WHERE id = :id FOR UPDATE"),
-        {"id": surviving_id},
-    ).mappings().one_or_none()
+    # Lock in a canonical (ascending-id) order regardless of which side the
+    # caller names surviving/absorbed -- two concurrent merges of the same
+    # pair with swapped roles (merge(A,B) and merge(B,A)) would otherwise lock
+    # in opposite order and deadlock (Postgres 40P01).
+    first_id, second_id = sorted((surviving_id, absorbed_id))
+    locked = {
+        row["id"]: row
+        for row in session.execute(
+            text("SELECT * FROM buyer_entities WHERE id IN (:first_id, :second_id) FOR UPDATE"),
+            {"first_id": first_id, "second_id": second_id},
+        ).mappings().all()
+    }
+
+    surviving = locked.get(surviving_id)
     if surviving is None:
         raise ValueError(f"surviving buyer_entity id={surviving_id} not found")
 
-    absorbed = session.execute(
-        text("SELECT * FROM buyer_entities WHERE id = :id FOR UPDATE"),
-        {"id": absorbed_id},
-    ).mappings().one_or_none()
+    absorbed = locked.get(absorbed_id)
     if absorbed is None:
         raise ValueError(f"absorbed buyer_entity id={absorbed_id} not found")
 
@@ -143,6 +152,20 @@ def merge_entities(
     )
     moved_closer_call_ids = [row[0] for row in closer_call_result.fetchall()]
 
+    # selfserve_sessions.buyer_entity_id also has no ondelete clause (NO
+    # ACTION) -- same failure mode as closer_calls above: an unmoved row
+    # raises a raw FK violation on the DELETE below.
+    selfserve_result = session.execute(
+        text("""
+            UPDATE selfserve_sessions
+               SET buyer_entity_id = :surviving_id
+             WHERE buyer_entity_id = :absorbed_id
+             RETURNING id
+        """),
+        {"surviving_id": surviving_id, "absorbed_id": absorbed_id},
+    )
+    moved_selfserve_session_ids = [row[0] for row in selfserve_result.fetchall()]
+
     session.execute(
         text("DELETE FROM buyer_entities WHERE id = :id"),
         {"id": absorbed_id},
@@ -162,6 +185,7 @@ def merge_entities(
         moved_ledger_event_ids=moved_ledger_event_ids,
         moved_monitor_log_ids=moved_monitor_log_ids,
         moved_closer_call_ids=moved_closer_call_ids,
+        moved_selfserve_session_ids=moved_selfserve_session_ids,
         merged_by=merged_by,
         merge_reason=reason,
     )
@@ -170,9 +194,10 @@ def merge_entities(
 
     logger.info(
         "merge_entities: absorbed entity %d into %d (%d links, %d ledger events, "
-        "%d monitor log rows, %d closer calls moved) by %s",
+        "%d monitor log rows, %d closer calls, %d selfserve sessions moved) by %s",
         absorbed_id, surviving_id, links_moved, len(moved_ledger_event_ids),
-        len(moved_monitor_log_ids), len(moved_closer_call_ids), merged_by,
+        len(moved_monitor_log_ids), len(moved_closer_call_ids),
+        len(moved_selfserve_session_ids), merged_by,
     )
     return log
 
@@ -262,10 +287,10 @@ def unmerge_entity(
             merge_log_id, len(moved_link_ids), links_returned, log["surviving_id"],
         )
 
-    # moved_ledger_event_ids / moved_monitor_log_ids / moved_closer_call_ids
-    # are None for merges logged before these columns existed -- nothing to
-    # restore, not an error (the links restore above is the load-bearing
-    # part for those legacy rows).
+    # moved_ledger_event_ids / moved_monitor_log_ids / moved_closer_call_ids /
+    # moved_selfserve_session_ids are None for merges logged before these
+    # columns existed -- nothing to restore, not an error (the links restore
+    # above is the load-bearing part for those legacy rows).
     moved_ledger_event_ids = log["moved_ledger_event_ids"]
     if moved_ledger_event_ids:
         session.execute(
@@ -310,6 +335,22 @@ def unmerge_entity(
             {
                 "restored_id": restored.id,
                 "moved_closer_call_ids": moved_closer_call_ids,
+                "surviving_id": log["surviving_id"],
+            },
+        )
+
+    moved_selfserve_session_ids = log["moved_selfserve_session_ids"]
+    if moved_selfserve_session_ids:
+        session.execute(
+            text("""
+                UPDATE selfserve_sessions
+                   SET buyer_entity_id = :restored_id
+                 WHERE id = ANY(:moved_selfserve_session_ids)
+                   AND buyer_entity_id = :surviving_id
+            """),
+            {
+                "restored_id": restored.id,
+                "moved_selfserve_session_ids": moved_selfserve_session_ids,
                 "surviving_id": log["surviving_id"],
             },
         )

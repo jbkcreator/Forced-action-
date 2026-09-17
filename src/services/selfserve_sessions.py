@@ -50,12 +50,15 @@ def create_session(
 
 
 def get_session_by_token(db: Session, token: str) -> Optional[SelfserveSession]:
+    """Returns None for an unknown OR expired token -- a forwarded/leaked
+    session link must not stay functional forever just because handoff never
+    happened."""
     row = db.execute(
         text(
             "SELECT id, token, tracked_link_id, property_id, buyer_entity_id, "
             "person_id, prefill_snapshot, corrections, confirmations, contact, "
-            "status, handoff_ref, handed_off_at, started_at, last_activity_at "
-            "FROM selfserve_sessions WHERE token = :token"
+            "status, handoff_ref, handed_off_at, started_at, last_activity_at, expires_at "
+            "FROM selfserve_sessions WHERE token = :token AND expires_at > now()"
         ),
         {"token": token},
     ).mappings().first()

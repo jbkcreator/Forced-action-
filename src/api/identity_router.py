@@ -25,7 +25,13 @@ from sqlalchemy.orm import Session
 
 from src.api.admin_router import get_current_admin
 from src.api.deps import get_db as _get_db
-from src.services.buyer_entity_exceptions import list_open_exceptions, resolve_exception
+from src.services.buyer_entity_exceptions import (
+    ExceptionNotFoundError,
+    ExceptionNotOpenError,
+    get_exception,
+    list_open_exceptions,
+    resolve_exception,
+)
 from src.services.buyer_entity_merge import merge_entities
 
 logger = logging.getLogger(__name__)
@@ -64,8 +70,25 @@ def merge_exception(
     """Resolve an exception by merging surviving_id/absorbed_id. Calls
     merge_entities() then resolve_exception() in one transaction -- the
     exception row is stamped 'merged' with the real merge_log_id, never a
-    guess."""
+    guess.
+
+    Validates the row is still 'open' and, when the row's own entity pair is
+    known (multi_anchor_conflict entity_ids), that the supplied ids are a
+    subset of it -- otherwise an admin could re-resolve an already-merged/
+    rejected exception with unrelated ids and clobber the audit trail."""
     admin_id = admin.get("sub", "admin")
+
+    row = get_exception(db, exception_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Exception not found.")
+    if row["status"] != "open":
+        raise HTTPException(status_code=409, detail=f"Exception is already {row['status']!r}.")
+    if row["entity_ids"] and not {body.surviving_id, body.absorbed_id} <= set(row["entity_ids"]):
+        raise HTTPException(
+            status_code=422,
+            detail="surviving_id/absorbed_id must be among this exception's own entity_ids.",
+        )
+
     try:
         log = merge_entities(
             db, surviving_id=body.surviving_id, absorbed_id=body.absorbed_id,
@@ -76,6 +99,12 @@ def merge_exception(
             merge_log_id=log.id,
         )
         db.commit()
+    except ExceptionNotFoundError as exc:
+        db.rollback()
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ExceptionNotOpenError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc))
     except ValueError as exc:
         db.rollback()
         raise HTTPException(status_code=422, detail=str(exc))
@@ -105,9 +134,15 @@ def reject_exception(
             "[Admin] identity exception %d rejected by admin:%s (reason=%r)",
             exception_id, admin_id, body.reason,
         )
-    except ValueError as exc:
+    except ExceptionNotFoundError as exc:
         db.rollback()
         raise HTTPException(status_code=404, detail=str(exc))
+    except ExceptionNotOpenError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc))
     except Exception:
         db.rollback()
         logger.error("[Admin] identity exception reject failed (id=%s)", exception_id, exc_info=True)

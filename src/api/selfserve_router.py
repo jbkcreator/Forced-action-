@@ -181,6 +181,15 @@ def selfserve_screen(token: str, db: Session = Depends(get_db)):
     if session_row.status in ("handed_off",):
         raise HTTPException(status_code=409, detail="This session has already been submitted.")
 
+    # A borrower still reading the page is still "mid-flow" -- without this,
+    # the abandonment sweep (list_stale_session_tokens) can mislabel them
+    # abandoned purely because submit hasn't happened yet.
+    db.execute(
+        text("UPDATE selfserve_sessions SET last_activity_at = now() WHERE token = :token"),
+        {"token": token},
+    )
+    db.commit()
+
     fields = (session_row.prefill_snapshot or {}).get("fields", {})
     address_prompt = ""
     if session_row.property_id is None:
@@ -285,8 +294,8 @@ async def submit_selfserve(token: str, request: Request, db: Session = Depends(g
     # existing touch.
     if is_backflip_suppressed(db, email=contact.get("email"), phone=contact.get("phone")):
         logger.warning(
-            "selfserve: session token=%s suppressed — active Backflip touch on this contact, holding off",
-            token,
+            "selfserve: session token=...%s suppressed — active Backflip touch on this contact, holding off",
+            token[-8:],
         )
         if updated.person_id:
             # Spec's failure-behavior section: "A send fails suppression.
@@ -299,24 +308,45 @@ async def submit_selfserve(token: str, request: Request, db: Session = Depends(g
             "No further action needed from you; we'll stay out of the way.</p></body></html>"
         )
 
+    # The status transition itself is the concurrency gate: two concurrent
+    # POSTs (double-click, client retry) can both pass the "handed_off" check
+    # above before either writes. Claim the row first (uncommitted); only the
+    # request that actually flips it calls the external handoff. If handoff()
+    # raises, roll back so the claim never lands and the session stays
+    # retryable instead of being stuck "handed_off" with no ref.
+    claim = db.execute(
+        text(
+            "UPDATE selfserve_sessions SET status = 'handed_off' "
+            "WHERE token = :token AND status <> 'handed_off' RETURNING id"
+        ),
+        {"token": token},
+    ).first()
+    if claim is None:
+        db.commit()
+        raise HTTPException(status_code=409, detail="This session has already been submitted.")
+
     port = get_backflip_port()
-    result = port.handoff(HandoffPayload(
-        session_token=token,
-        prefill_fields={k: v.get("value") for k, v in (updated.prefill_snapshot or {}).get("fields", {}).items()},
-        confirmations=confirmations,
-        contact=contact,
-    ))
+    try:
+        result = port.handoff(HandoffPayload(
+            session_token=token,
+            prefill_fields={k: v.get("value") for k, v in (updated.prefill_snapshot or {}).get("fields", {}).items()},
+            confirmations=confirmations,
+            contact=contact,
+        ))
+    except Exception:
+        db.rollback()
+        raise
 
     db.execute(
         text(
-            "UPDATE selfserve_sessions SET status = 'handed_off', handoff_ref = :ref, "
+            "UPDATE selfserve_sessions SET handoff_ref = :ref, "
             "handed_off_at = now() WHERE token = :token"
         ),
         {"ref": result.handoff_ref, "token": token},
     )
     db.commit()
 
-    logger.info("selfserve: session token=%s handed off, ref=%s", token, result.handoff_ref)
+    logger.info("selfserve: session token=...%s handed off, ref=%s", token[-8:], result.handoff_ref)
     return RedirectResponse(url=result.redirect_url, status_code=302)
 
 

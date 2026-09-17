@@ -147,6 +147,27 @@ def list_open_exceptions(session: Session, limit: int = 100) -> list[dict]:
     return [dict(row._mapping) for row in rows]
 
 
+def get_exception(session: Session, exception_id: int) -> Optional[dict]:
+    """Fetch one exception row by id, or None if it doesn't exist."""
+    row = session.execute(
+        text("""
+            SELECT id, kind, left_ref, right_ref, entity_ids, status
+            FROM buyer_entity_match_exception
+            WHERE id = :id
+        """),
+        {"id": exception_id},
+    ).mappings().one_or_none()
+    return dict(row) if row is not None else None
+
+
+class ExceptionNotFoundError(ValueError):
+    pass
+
+
+class ExceptionNotOpenError(ValueError):
+    pass
+
+
 def resolve_exception(
     session: Session,
     exception_id: int,
@@ -161,21 +182,25 @@ def resolve_exception(
     the same transaction, so the exception row and the merge log stay
     consistent.
 
-    Raises ValueError if status is not a valid terminal state or the row
-    does not exist. Does not commit — caller controls the transaction
-    boundary.
+    Raises ExceptionNotFoundError if the row does not exist, or
+    ExceptionNotOpenError if it was already resolved (an admin re-resolving
+    an already-merged/rejected row with unrelated ids would otherwise
+    clobber the audit trail). Does not commit — caller controls the
+    transaction boundary.
     """
     if status not in ("merged", "rejected", "stale"):
         raise ValueError(f"invalid resolution status: {status!r}")
     if status == "merged" and merge_log_id is None:
         raise ValueError("merge_log_id is required when resolving to 'merged'")
 
+    # WHERE status = 'open' is the actual concurrency gate -- the UPDATE
+    # itself only ever flips a currently-open row, race or not.
     result = session.execute(
         text("""
             UPDATE buyer_entity_match_exception
                SET status = :status, resolved_by = :resolved_by,
                    resolved_at = now(), merge_log_id = :merge_log_id
-             WHERE id = :id
+             WHERE id = :id AND status = 'open'
         """),
         {
             "status": status, "resolved_by": resolved_by,
@@ -183,7 +208,12 @@ def resolve_exception(
         },
     )
     if result.rowcount == 0:
-        raise ValueError(f"buyer_entity_match_exception id={exception_id} not found")
+        existing = get_exception(session, exception_id)
+        if existing is None:
+            raise ExceptionNotFoundError(f"buyer_entity_match_exception id={exception_id} not found")
+        raise ExceptionNotOpenError(
+            f"buyer_entity_match_exception id={exception_id} is already {existing['status']!r}",
+        )
 
     logger.info(
         "resolve_exception: id=%d -> %s by %s (merge_log_id=%s)",

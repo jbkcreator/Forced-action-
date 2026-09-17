@@ -3,7 +3,7 @@ Database models for Distressed Property Intelligence Platform.
 Implements the Hub-and-Spoke architecture with properties as the central hub.
 """
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any, List, Optional
@@ -9410,7 +9410,7 @@ class BuyerEntityMergeLog(Base):
     """
     __tablename__ = "buyer_entity_merge_log"
 
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     surviving_id: Mapped[int] = mapped_column(
         ForeignKey("buyer_entities.id"), nullable=False, index=True,
     )
@@ -9421,6 +9421,7 @@ class BuyerEntityMergeLog(Base):
     moved_ledger_event_ids: Mapped[Optional[list]] = mapped_column(JSONB)
     moved_monitor_log_ids: Mapped[Optional[list]] = mapped_column(JSONB)
     moved_closer_call_ids: Mapped[Optional[list]] = mapped_column(JSONB)
+    moved_selfserve_session_ids: Mapped[Optional[list]] = mapped_column(JSONB)
     merged_by: Mapped[str] = mapped_column(String(100), nullable=False)
     merge_reason: Mapped[Optional[str]] = mapped_column(Text)
     merged_at: Mapped[datetime] = mapped_column(
@@ -9429,15 +9430,6 @@ class BuyerEntityMergeLog(Base):
     reversed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     reversed_by: Mapped[Optional[str]] = mapped_column(String(100))
     restored_id: Mapped[Optional[int]] = mapped_column(Integer)
-    # Append-only history rows reassigned absorbed→surviving during the merge, so
-    # unmerge can move exactly those back (they carry no linked_at heuristic and
-    # would otherwise be lost to the buyer_entities ON DELETE CASCADE).
-    moved_ledger_event_ids: Mapped[list] = mapped_column(
-        JSONB, nullable=False, server_default=text("'[]'::jsonb"),
-    )
-    moved_monitor_log_ids: Mapped[list] = mapped_column(
-        JSONB, nullable=False, server_default=text("'[]'::jsonb"),
-    )
 
     surviving_entity: Mapped["BuyerEntity"] = relationship(
         "BuyerEntity", foreign_keys="[BuyerEntityMergeLog.surviving_id]",
@@ -9481,7 +9473,7 @@ class BuyerEntityMatchException(Base):
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="open")  # open|merged|rejected|stale
     resolved_by: Mapped[Optional[str]] = mapped_column(String(100))
     resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
-    merge_log_id: Mapped[Optional[int]] = mapped_column(ForeignKey("buyer_entity_merge_log.id"))
+    merge_log_id: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("buyer_entity_merge_log.id"))
     first_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(),
     )
@@ -10557,6 +10549,8 @@ class FaMaxPerson(Base):
             ["lifecycle_state"],
             ["fa_max_person_lifecycle_stage_config.stage_key"],
             name="fk_fa_max_persons_lifecycle_state",
+            deferrable=True,
+            initially="DEFERRED",
         ),
         CheckConstraint(
             "merged_into_id IS NULL OR merged_into_id <> person_id",
@@ -10674,6 +10668,8 @@ class FaMaxOpportunity(Base):
             ["current_stage"],
             ["fa_max_opportunity_stage_config.stage_key"],
             name="fk_fa_max_opp_stage_config",
+            deferrable=True,
+            initially="DEFERRED",
         ),
         CheckConstraint(
             "opportunity_type IN ('acquisition','rehab','construction','extension',"
@@ -11386,6 +11382,11 @@ class SelfserveSession(Base):
     last_activity_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
         default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc) + timedelta(days=30),
+        server_default=text("now() + interval '30 days'"),
     )
 
     __table_args__ = (
