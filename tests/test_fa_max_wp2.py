@@ -423,8 +423,15 @@ class TestGuards10DLC:
         # 14:00 NY = within window
         return datetime(2026, 9, 15, 14, 0, tzinfo=ZoneInfo("America/New_York")).astimezone(tz.utc)
 
-    def test_fa_max_sms_blocked_when_10dlc_not_registered(self):
-        from src.services.relay.guards import evaluate, BLOCK
+    def test_fa_max_sms_deferred_when_10dlc_not_registered(self):
+        """Code-review finding, PR #281: this must be DEFER, not BLOCK.
+        BLOCK -> queue.mark_skipped() is terminal (never revisited), which
+        would permanently discard every FA Max SMS approved during the
+        weeks 10DLC registration realistically takes with carriers --
+        exactly the bug pattern fa_max_relay_send_mode's own DEFER exists
+        to avoid, for the identical reason (a system-wide, temporary-by-
+        design condition, not a per-item defect)."""
+        from src.services.relay.guards import evaluate, DEFER
 
         item = self._fa_max_sms_item()
         with (
@@ -441,7 +448,7 @@ class TestGuards10DLC:
             gs.return_value = settings
 
             verdict = evaluate(item, now=self._window_now())
-            assert verdict.outcome == BLOCK
+            assert verdict.outcome == DEFER
             assert "fa_max_10dlc_not_registered" in verdict.reason
 
     def test_fa_max_sms_allowed_when_10dlc_registered(self):

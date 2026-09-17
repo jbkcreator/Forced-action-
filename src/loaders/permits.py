@@ -178,9 +178,16 @@ class BuildingPermitLoader(BaseLoader):
                             from src.services.borrower_profile_service import (
                                 schedule_profile_recompute_for_property,
                             )
-                            schedule_profile_recompute_for_property(
-                                self.session, property_record.id, "new_permit"
-                            )
+                            # Savepoint (not a bare try/except) so a failure here
+                            # aborts only this nested write, not the whole loader
+                            # session -- mirrors safe_add()'s own protection.
+                            # Without it, a recompute failure here poisons the
+                            # transaction and every later safe_add() in this file
+                            # fails too (code-review finding, WP-T2-1 PR #281).
+                            with self.session.begin_nested():
+                                schedule_profile_recompute_for_property(
+                                    self.session, property_record.id, "new_permit"
+                                )
                         except Exception:
                             logger.warning(
                                 "Failed to schedule profile recompute for property %s after permit %s",

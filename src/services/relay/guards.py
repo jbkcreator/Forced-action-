@@ -40,6 +40,7 @@ from src.services.relay.config import (
     GUARD_ALLOW,
     GUARD_BLOCK,
     GUARD_DEFER,
+    REASON_FA_MAX_10DLC_NOT_REGISTERED,
     REASON_FA_MAX_BACKLOG_RELEASE_NOT_CONFIRMED,
     REASON_FA_MAX_SEND_MODE_NOT_LIVE,
     REASON_OUTSIDE_SEND_WINDOW,
@@ -89,9 +90,6 @@ def _fa_max_compliance_reason(item: QueueItem) -> str | None:
     """
     if item.venture_key != _FA_MAX_VENTURE:
         return None
-
-    if item.channel == "sms" and not get_settings().fa_max_10dlc_registered:
-        return "fa_max_10dlc_not_registered"
 
     if item.channel not in ("email", "sms"):
         return "unsupported_fa_max_channel"
@@ -184,8 +182,25 @@ def evaluate(item: QueueItem, *, now: datetime, venture=None) -> Verdict:
             # first, on the very next sweep tick.
             return Verdict(DEFER, REASON_FA_MAX_BACKLOG_RELEASE_NOT_CONFIRMED)
 
-    # FA Max compliance check must run before suppression so 10DLC block
-    # appears in the refusal log even when the contact is also suppressed.
+        if item.channel == "sms" and not fa_settings.fa_max_10dlc_registered:
+            # Code-review finding, PR #281: this used to be one of the
+            # per-item reasons _fa_max_compliance_reason() returns, which
+            # evaluate() wraps in BLOCK -> queue.mark_skipped() -- a
+            # terminal status never revisited (see mark_skipped()'s own
+            # docstring). fa_max_10dlc_registered is a system-wide,
+            # temporary-by-design condition exactly like
+            # fa_max_relay_send_mode above (channels_sms.py's own comment
+            # groups them together), not a per-item defect -- 10DLC
+            # registration realistically takes weeks with carriers, and an
+            # SMS item approved during that window must be retried once
+            # registration completes, not permanently discarded. DEFER
+            # leaves it in 'approved' for the next sweep tick, same as the
+            # two checks above.
+            return Verdict(DEFER, REASON_FA_MAX_10DLC_NOT_REGISTERED)
+
+    # FA Max compliance check must run before suppression so a per-item
+    # governance block appears in the refusal log even when the contact is
+    # also suppressed.
     fa_cause = _fa_max_compliance_reason(item)
     if fa_cause is not None:
         return Verdict(BLOCK, f"{REASON_SUPPRESSED}:{fa_cause}")
