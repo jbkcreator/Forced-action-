@@ -539,8 +539,8 @@ RELAY_APPROVERS=["U01ABC123","U02DEF456"]   # Slack user IDs — MUST be JSON-ar
                                              # startup (pydantic-settings parses list
                                              # fields as JSON, not CSV).
 RELAY_SLACK_CHANNEL=#agent-daily
-SLACK_BOT_TOKEN=xoxb-...        # posts and updates approval cards
-RELAY_SLACK_APP_TOKEN=xapp-...  # Socket Mode, requires connections:write
+FA_MAX_SLACK_BOT_TOKEN=xoxb-... # dedicated FA Max app: posts and updates cards
+FA_MAX_SLACK_APP_TOKEN=xapp-... # dedicated FA Max Socket Mode, connections:write
 
 # Email channel (Instantly) — set after running the one-time setup command below
 RELAY_INSTANTLY_CAMPAIGN_ID=
@@ -557,7 +557,9 @@ RELAY_DAILY_CEILING=20          # per channel, per calendar day
 Relay approvals and thread actions use Slack Socket Mode with the dedicated
 FA Max Slack app, so no public callback URL is required. Enable Socket Mode
 and create an app-level `xapp-...` token with `connections:write`; store it as
-`RELAY_SLACK_APP_TOKEN`. Install and run the listener:
+FA_MAX_SLACK_APP_TOKEN. Store its Bot User OAuth Token as
+FA_MAX_SLACK_BOT_TOKEN. The client secret, signing secret, and verification
+token are not used by this Socket Mode listener. Install and run the listener:
 
 ```bash
 cp deploy/systemd/fa-relay-slack-listener.service /etc/systemd/system/

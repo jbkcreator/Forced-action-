@@ -251,7 +251,7 @@ class TestFaMaxCardRecovery:
 
         item = _make_queue_item(venture_key="fa_max_lending", lane="MONEY")
         lease = datetime.now(timezone.utc)
-        settings = SimpleNamespace(slack_bot_token=MagicMock(get_secret_value=lambda: "xoxb-test"))
+        settings = SimpleNamespace(slack_bot_token=MagicMock(get_secret_value=lambda: "xoxb-shared"), fa_max_slack_bot_token=MagicMock(get_secret_value=lambda: "xoxb-fa-max"))
         with patch("src.services.relay.slack_post.get_settings", return_value=settings), \
              patch("src.services.relay.slack_post._resolve_channel", return_value="C_TEST"), \
              patch("src.services.relay.slack_post.queue.claim_slack_post", return_value=lease), \
@@ -274,7 +274,7 @@ class TestFaMaxCardRecovery:
 
         item = _make_queue_item(venture_key="fa_max_lending", lane="MONEY")
         lease = datetime.now(timezone.utc)
-        settings = SimpleNamespace(slack_bot_token=MagicMock(get_secret_value=lambda: "xoxb-test"))
+        settings = SimpleNamespace(slack_bot_token=MagicMock(get_secret_value=lambda: "xoxb-shared"), fa_max_slack_bot_token=MagicMock(get_secret_value=lambda: "xoxb-fa-max"))
         with patch("src.services.relay.slack_post.get_settings", return_value=settings), \
              patch("src.services.relay.slack_post._resolve_channel", return_value="C_TEST"), \
              patch("src.services.relay.slack_post.queue.claim_slack_post", return_value=lease), \
@@ -965,3 +965,23 @@ class TestFaMaxSocketMode:
         assert socket_listener.handle_socket_request(client, request) is True
         client.send_socket_mode_response.assert_called_once()
         thread_action.assert_called_once_with(request.payload)
+
+
+def test_fa_max_slack_uses_dedicated_bot_token():
+    from types import SimpleNamespace
+    from src.services.relay.slack_post import _resolve_bot_token
+
+    fa_item = _make_queue_item(venture_key="fa_max_lending", lane="MONEY")
+    other_item = _make_queue_item(venture_key="hillsborough_distress", lane="MONEY")
+    settings = SimpleNamespace(fa_max_slack_bot_token="fa-max", slack_bot_token="shared")
+
+    assert _resolve_bot_token(fa_item, settings) == "fa-max"
+    assert _resolve_bot_token(other_item, settings) == "shared"
+
+
+def test_socket_listener_requires_dedicated_fa_max_tokens():
+    from src.services.relay import socket_listener
+
+    names = socket_listener.run.__code__.co_names
+    assert "fa_max_slack_app_token" in names
+    assert "fa_max_slack_bot_token" in names

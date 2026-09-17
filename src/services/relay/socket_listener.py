@@ -73,12 +73,12 @@ def handle_socket_request(client: Any, request: Any) -> bool:
 def run() -> None:
     """Connect the Relay listener and keep it alive until the service stops."""
     settings = get_settings()
-    app_token = settings.relay_slack_app_token
-    bot_token = settings.slack_bot_token
+    app_token = settings.fa_max_slack_app_token
+    bot_token = settings.fa_max_slack_bot_token
     if not app_token or not bot_token:
         logger.warning(
-            "[RelaySocket] listener not started: RELAY_SLACK_APP_TOKEN or "
-            "SLACK_BOT_TOKEN is unset"
+            "[RelaySocket] listener not started: FA_MAX_SLACK_APP_TOKEN or "
+            "FA_MAX_SLACK_BOT_TOKEN is unset"
         )
         return
 
