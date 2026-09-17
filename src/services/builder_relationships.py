@@ -13,7 +13,7 @@ No-ops silently when unconfigured — same pattern as EXCEPTIONS lane.
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Iterable, Optional
 
@@ -238,16 +238,52 @@ _RELEASE_RELATIONSHIP_ALERT_SQL = text("""
 """)
 
 
+def load_builder_queue_state(session: Session) -> tuple[set[int], set[int]]:
+    """Return (dismissed_entity_ids, actively_snoozed_entity_ids) from
+    builder_dial_queue — the operator decisions made on RELATIONSHIPS cards.
+
+    Dismissed builders ("Not a fit") are excluded from MONEY and RELATIONSHIPS.
+    Snoozed builders are suppressed from RELATIONSHIPS until snoozed_until passes.
+    A single query; both sets read from one pass.
+    """
+    now = datetime.now(timezone.utc)
+    dismissed: set[int] = set()
+    snoozed: set[int] = set()
+    for row in session.execute(text(
+        "SELECT buyer_entity_id, dismissed, snoozed_until FROM builder_dial_queue"
+    )):
+        if row.dismissed:
+            dismissed.add(row.buyer_entity_id)
+            continue
+        su = row.snoozed_until
+        if su is not None:
+            # Normalize a possibly tz-naive value (SQLite) before comparing.
+            if su.tzinfo is None:
+                su = su.replace(tzinfo=timezone.utc)
+            if su > now:
+                snoozed.add(row.buyer_entity_id)
+    return dismissed, snoozed
+
+
 def surface_relationship_hits(session: Session, hits: Iterable[BuilderHit]) -> int:
     """Post qualifying builder events once, durably, across scheduled runs.
 
     The database claim is committed before Slack I/O so concurrent dial-list
     jobs cannot double-post. A failed or unconfigured delivery releases the
     claim, allowing the next scheduled run to retry.
+
+    Operator decisions are honored: a dismissed builder is never surfaced; a
+    snoozed builder is skipped until its snooze expires. Each surfaced card
+    carries its 85% LTC construction sizing (Stage D).
     """
+    from src.services.builder_sizing import size_builder_hit
+
+    dismissed, snoozed = load_builder_queue_state(session)
     surfaced = 0
     for hit in hits:
         if not is_relationships_candidate(hit):
+            continue
+        if hit.buyer_entity_id in dismissed or hit.buyer_entity_id in snoozed:
             continue
         params = {
             "buyer_entity_id": hit.buyer_entity_id,
@@ -270,7 +306,8 @@ def surface_relationship_hits(session: Session, hits: Iterable[BuilderHit]) -> i
             continue
         if claimed is None:
             continue
-        if emit_relationships_alert(hit):
+        sizing = size_builder_hit(session, hit)
+        if emit_relationships_alert(hit, sizing):
             surfaced += 1
             continue
         savepoint = session.begin_nested()

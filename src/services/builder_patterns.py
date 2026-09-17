@@ -115,7 +115,7 @@ def _union_select(extra_columns: str = "", where: str = "", params: dict | None 
             {extra_columns}
         FROM building_permits p
         JOIN buyer_entity_links bel
-            ON bel.source_table = 'building_permits' AND bel.source_id = p.id
+            ON bel.source_table = 'building_permits' AND bel.source_id = p.id AND bel.match_confidence >= 70
         {where}
 
         UNION ALL
@@ -136,7 +136,7 @@ def _union_select(extra_columns: str = "", where: str = "", params: dict | None 
             {extra_columns}
         FROM permit_staging s
         JOIN buyer_entity_links bel
-            ON bel.source_table = 'permit_staging' AND bel.source_id = s.id
+            ON bel.source_table = 'permit_staging' AND bel.source_id = s.id AND bel.match_confidence >= 70
         {where}
     """
 
@@ -156,7 +156,7 @@ _REPEAT_BUILDER_SQL = text("""
             p.county_id,
             'building_permits' AS src
         FROM building_permits p
-        JOIN buyer_entity_links bel ON bel.source_table = 'building_permits' AND bel.source_id = p.id
+        JOIN buyer_entity_links bel ON bel.source_table = 'building_permits' AND bel.source_id = p.id AND bel.match_confidence >= 70
         WHERE p.issue_date >= :since AND p.issue_date <= :as_of
           AND COALESCE(p.is_enforcement_permit, FALSE) = FALSE
 
@@ -171,7 +171,7 @@ _REPEAT_BUILDER_SQL = text("""
             s.county_id,
             'permit_staging'
         FROM permit_staging s
-        JOIN buyer_entity_links bel ON bel.source_table = 'permit_staging' AND bel.source_id = s.id
+        JOIN buyer_entity_links bel ON bel.source_table = 'permit_staging' AND bel.source_id = s.id AND bel.match_confidence >= 70
         WHERE s.issue_date >= :since AND s.issue_date <= :as_of
           AND COALESCE(s.is_enforcement_permit, FALSE) = FALSE
     ),
@@ -245,7 +245,7 @@ _CONCURRENT_BUILDER_SQL = text("""
         SELECT bel.buyer_entity_id, p.id, p.property_id, p.issue_date, p.job_value, p.county_id,
                'building_permits' AS src
         FROM building_permits p
-        JOIN buyer_entity_links bel ON bel.source_table = 'building_permits' AND bel.source_id = p.id
+        JOIN buyer_entity_links bel ON bel.source_table = 'building_permits' AND bel.source_id = p.id AND bel.match_confidence >= 70
         WHERE LOWER(COALESCE(p.completion_status, p.status, '')) = ANY(:active_statuses)
           AND COALESCE(p.is_enforcement_permit, FALSE) = FALSE
 
@@ -254,7 +254,7 @@ _CONCURRENT_BUILDER_SQL = text("""
         SELECT bel.buyer_entity_id, s.id, s.matched_property_id, s.issue_date, s.job_value, s.county_id,
                'permit_staging'
         FROM permit_staging s
-        JOIN buyer_entity_links bel ON bel.source_table = 'permit_staging' AND bel.source_id = s.id
+        JOIN buyer_entity_links bel ON bel.source_table = 'permit_staging' AND bel.source_id = s.id AND bel.match_confidence >= 70
         WHERE LOWER(COALESCE(s.completion_status, s.status, '')) = ANY(:active_statuses)
           AND COALESCE(s.is_enforcement_permit, FALSE) = FALSE
     ),
@@ -331,7 +331,7 @@ def detect_townhome_infill(
             SELECT bel.buyer_entity_id, p.id AS pid, p.property_id, p.issue_date,
                    p.job_value, p.county_id, 'building_permits' AS src
             FROM building_permits p
-            JOIN buyer_entity_links bel ON bel.source_table = 'building_permits' AND bel.source_id = p.id
+            JOIN buyer_entity_links bel ON bel.source_table = 'building_permits' AND bel.source_id = p.id AND bel.match_confidence >= 70
             WHERE ({ilike_bp}) {county_filter_bp}
               AND COALESCE(p.is_enforcement_permit, FALSE) = FALSE
 
@@ -340,7 +340,7 @@ def detect_townhome_infill(
             SELECT bel.buyer_entity_id, s.id, s.matched_property_id, s.issue_date,
                    s.job_value, s.county_id, 'permit_staging'
             FROM permit_staging s
-            JOIN buyer_entity_links bel ON bel.source_table = 'permit_staging' AND bel.source_id = s.id
+            JOIN buyer_entity_links bel ON bel.source_table = 'permit_staging' AND bel.source_id = s.id AND bel.match_confidence >= 70
             WHERE ({ilike_ps}) {county_filter_ps}
               AND COALESCE(s.is_enforcement_permit, FALSE) = FALSE
         ),
@@ -385,7 +385,7 @@ _LAND_TO_PERMIT_SQL = text("""
         SELECT bel.buyer_entity_id, p.id AS permit_row_id, p.property_id, p.issue_date,
                p.job_value, p.county_id, 'building_permits' AS src
         FROM building_permits p
-        JOIN buyer_entity_links bel ON bel.source_table = 'building_permits' AND bel.source_id = p.id
+        JOIN buyer_entity_links bel ON bel.source_table = 'building_permits' AND bel.source_id = p.id AND bel.match_confidence >= 70
         WHERE p.issue_date IS NOT NULL
           AND COALESCE(p.is_enforcement_permit, FALSE) = FALSE
 
@@ -394,14 +394,14 @@ _LAND_TO_PERMIT_SQL = text("""
         SELECT bel.buyer_entity_id, s.id, s.matched_property_id, s.issue_date,
                s.job_value, s.county_id, 'permit_staging'
         FROM permit_staging s
-        JOIN buyer_entity_links bel ON bel.source_table = 'permit_staging' AND bel.source_id = s.id
+        JOIN buyer_entity_links bel ON bel.source_table = 'permit_staging' AND bel.source_id = s.id AND bel.match_confidence >= 70
         WHERE s.issue_date IS NOT NULL
           AND COALESCE(s.is_enforcement_permit, FALSE) = FALSE
     ),
     deed_entities AS (
         SELECT bel.buyer_entity_id, d.property_id, d.record_date
         FROM deeds d
-        JOIN buyer_entity_links bel ON bel.source_table = 'deeds' AND bel.source_id = d.id
+        JOIN buyer_entity_links bel ON bel.source_table = 'deeds' AND bel.source_id = d.id AND bel.match_confidence >= 70
         WHERE d.record_date IS NOT NULL
     ),
     matches AS (
@@ -469,7 +469,7 @@ _SPEC_CADENCE_SQL = text("""
         SELECT bel.buyer_entity_id, p.id AS permit_row_id, p.issue_date,
                p.property_id, p.job_value, p.county_id, 'building_permits' AS src
         FROM building_permits p
-        JOIN buyer_entity_links bel ON bel.source_table = 'building_permits' AND bel.source_id = p.id
+        JOIN buyer_entity_links bel ON bel.source_table = 'building_permits' AND bel.source_id = p.id AND bel.match_confidence >= 70
         WHERE p.issue_date IS NOT NULL
           AND COALESCE(p.is_enforcement_permit, FALSE) = FALSE
 
@@ -478,7 +478,7 @@ _SPEC_CADENCE_SQL = text("""
         SELECT bel.buyer_entity_id, s.id, s.issue_date,
                s.matched_property_id, s.job_value, s.county_id, 'permit_staging'
         FROM permit_staging s
-        JOIN buyer_entity_links bel ON bel.source_table = 'permit_staging' AND bel.source_id = s.id
+        JOIN buyer_entity_links bel ON bel.source_table = 'permit_staging' AND bel.source_id = s.id AND bel.match_confidence >= 70
         WHERE s.issue_date IS NOT NULL
           AND COALESCE(s.is_enforcement_permit, FALSE) = FALSE
     ),

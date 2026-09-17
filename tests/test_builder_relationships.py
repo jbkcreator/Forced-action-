@@ -148,7 +148,7 @@ def test_emit_posts_when_configured():
 
 def test_surface_relationship_hits_posts_each_event_once(fresh_db, monkeypatch):
     fresh_db.execute(text("""
-        CREATE TABLE builder_relationship_alerts (
+        CREATE TABLE IF NOT EXISTS builder_relationship_alerts (
             buyer_entity_id BIGINT NOT NULL,
             pattern VARCHAR(32) NOT NULL,
             latest_permit_date DATE NOT NULL,
@@ -156,6 +156,12 @@ def test_surface_relationship_hits_posts_each_event_once(fresh_db, monkeypatch):
             PRIMARY KEY (buyer_entity_id, pattern, latest_permit_date)
         )
     """))
+    fresh_db.execute(text("DELETE FROM builder_relationship_alerts"))
+    # builder_relationship_alerts FKs buyer_entities(id) — seed the parent.
+    fresh_db.execute(text(
+        "INSERT INTO buyer_entities (id, canonical_name, entity_type, confidence_score) "
+        "VALUES (42, 'ACME BUILDERS LLC', 'LLC', 90) ON CONFLICT (id) DO NOTHING"
+    ))
     fresh_db.commit()
     posted = []
     monkeypatch.setattr(
@@ -171,7 +177,7 @@ def test_surface_relationship_hits_posts_each_event_once(fresh_db, monkeypatch):
 
 def test_surface_relationship_hits_retries_when_delivery_fails(fresh_db, monkeypatch):
     fresh_db.execute(text("""
-        CREATE TABLE builder_relationship_alerts (
+        CREATE TABLE IF NOT EXISTS builder_relationship_alerts (
             buyer_entity_id BIGINT NOT NULL,
             pattern VARCHAR(32) NOT NULL,
             latest_permit_date DATE NOT NULL,
@@ -179,6 +185,12 @@ def test_surface_relationship_hits_retries_when_delivery_fails(fresh_db, monkeyp
             PRIMARY KEY (buyer_entity_id, pattern, latest_permit_date)
         )
     """))
+    fresh_db.execute(text("DELETE FROM builder_relationship_alerts"))
+    # builder_relationship_alerts FKs buyer_entities(id) — seed the parent.
+    fresh_db.execute(text(
+        "INSERT INTO buyer_entities (id, canonical_name, entity_type, confidence_score) "
+        "VALUES (42, 'ACME BUILDERS LLC', 'LLC', 90) ON CONFLICT (id) DO NOTHING"
+    ))
     fresh_db.commit()
     monkeypatch.setattr(
         "src.services.builder_relationships.emit_relationships_alert",

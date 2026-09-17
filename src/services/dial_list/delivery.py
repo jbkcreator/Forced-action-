@@ -344,8 +344,10 @@ def generate_and_deliver(
     )
 
     try:
+        # Live delivery path — opt in to RELATIONSHIPS Slack posting + ledger.
         dial_list = generate_dial_list(
-            session, as_of=as_of, county_id=county_id, config=config
+            session, as_of=as_of, county_id=county_id, config=config,
+            surface_relationships=True,
         )
     except SQLAlchemyError:
         logger.error(

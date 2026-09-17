@@ -86,6 +86,63 @@ def _staging(db, permit_number, *, holder=None, contractor=None, county="hillsbo
     ).fetchone().id
 
 
+def test_run_incremental_permits_four_value_contract(fresh_db):
+    """#1 regression: cluster_against_anchors returns 4 values post-merge.
+    run_incremental_permits must unpack all four (was crashing with
+    ValueError: too many values to unpack), and a brand-new permit name
+    must resolve without raising."""
+    from src.services.buyer_entity_resolution import run_incremental_permits
+
+    db = fresh_db
+    sid = _staging(db, "NEWNAME-1", holder="BRAND NEW BUILDER LLC")
+    db.flush()
+
+    stats = run_incremental_permits(db, county_id="hillsborough")
+    assert stats["processed"] >= 1
+
+    # #2 regression: an unconfirmed singleton link is persisted at the cluster
+    # confidence (60, below the 70 floor) — NOT 100 — so builder detectors
+    # (which require match_confidence >= 70) never treat it as trusted.
+    row = db.execute(
+        text("SELECT match_confidence FROM buyer_entity_links "
+             "WHERE source_table='permit_staging' AND source_id=:sid"),
+        {"sid": sid},
+    ).fetchone()
+    assert row is not None
+    assert row.match_confidence == 60
+    assert row.match_confidence < 70   # excluded from MONEY/RELATIONSHIPS detectors
+
+
+def test_rejected_permit_link_excluded_from_extraction(fresh_db):
+    """#4 regression: once an operator durably rejects a permit->entity match,
+    the extractor must never re-surface that permit for resolution (otherwise
+    the nightly sweep recreates the identical link and re-alerts)."""
+    db = fresh_db
+    sid = _staging(db, "REJECT-1", holder="REJECTED BUILDER LLC")
+    db.flush()
+
+    # Present before rejection.
+    before = [c for c in extract_permit_candidates(db, only_unresolved=True)
+              if c.source_table == "permit_staging" and c.source_id == sid]
+    assert len(before) == 1
+
+    # Operator rejection writes the durable exception (as _handle_reject does).
+    db.execute(
+        text("""
+            INSERT INTO buyer_entity_match_exception
+                (kind, left_ref, right_ref, explanation, status, resolved_by, resolved_at)
+            VALUES ('rejected_permit_link', :lref, 'buyer_entities#900',
+                    'operator rejected', 'rejected', 'slack:U1', now())
+        """),
+        {"lref": f"permit_staging#{sid}"},
+    )
+    db.flush()
+
+    after = [c for c in extract_permit_candidates(db, only_unresolved=True)
+             if c.source_table == "permit_staging" and c.source_id == sid]
+    assert after == []   # durably rejected — never re-extracted
+
+
 def test_contractor_only_permit_is_extracted(fresh_db):
     db = fresh_db
     sid = _staging(db, "CONLY-1", holder=None, contractor="BUILDPRO INC")

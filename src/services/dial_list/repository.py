@@ -33,7 +33,11 @@ from src.services.builder_patterns import (
     map_hits_to_property_signals,
     run_builder_detectors,
 )
-from src.services.builder_relationships import surface_relationship_hits
+from src.services.builder_relationships import (
+    load_builder_queue_state,
+    surface_relationship_hits,
+)
+from src.services.builder_sizing import size_builder_hits
 from src.services.buyer_entity_resolution import run_incremental_permits
 
 from .config import DEFAULT_CONFIG, DialListConfig
@@ -314,6 +318,7 @@ class _Acc:
     __slots__ = (
         "triggers", "is_builder", "intent_tier", "urgency_date",
         "builder_entity_id", "builder_name",
+        "builder_loan", "builder_loan_confidence",
     )
 
     def __init__(self) -> None:
@@ -323,6 +328,10 @@ class _Acc:
         self.urgency_date: Optional[date] = None
         self.builder_entity_id: Optional[int] = None
         self.builder_name: Optional[str] = None
+        # 85% LTC construction sizing (Stage D) — overrides the generic
+        # assessed-value loan fallback in the ranker for builder candidates.
+        self.builder_loan: Optional[Decimal] = None
+        self.builder_loan_confidence: Optional[str] = None
 
     def add_date(self, d: Optional[object]) -> None:
         d2 = _as_date(d)
@@ -364,11 +373,16 @@ def assemble_dial_candidates(
     as_of: date,
     county_id: Optional[str] = None,
     config: Optional[DialListConfig] = None,
+    surface_relationships: bool = False,
 ) -> List[DialCandidate]:
     """Run the live detectors, union + resolve, return ranking-ready candidates.
 
     Raises `SQLAlchemyError` (after logging) on any DB failure — a daily batch
     should fail loud, not silently emit an empty list that reads as "no calls".
+
+    surface_relationships: when True, also posts RELATIONSHIPS Slack cards and
+    writes their dedup ledger. Defaults False so a --dry-run generation produces
+    NO delivery side effects (only the live delivery path opts in).
     """
     cfg = config or DEFAULT_CONFIG
     try:
@@ -388,14 +402,38 @@ def assemble_dial_candidates(
         builder_hits = run_builder_detectors(
             session, as_of=as_of, county_id=county_id,
         )
-        surface_relationship_hits(session, builder_hits)
+        # RELATIONSHIPS Slack delivery is a side effect — gated to the live path.
+        if surface_relationships:
+            surface_relationship_hits(session, builder_hits)
+
+        # Operator decisions + Stage D sizing only matter when builders fired.
+        dismissed_builders: Set[int] = set()
+        builder_loans: Dict[int, tuple[Decimal, str]] = {}
+        if builder_hits:
+            dismissed_builders, _snoozed = load_builder_queue_state(session)
+            # 85% LTC construction sizing per builder entity (Stage D); keep the
+            # largest loan when a builder spans multiple properties.
+            for sizing in size_builder_hits(session, builder_hits):
+                if sizing.estimated_loan is None:
+                    continue
+                prev = builder_loans.get(sizing.buyer_entity_id)
+                if prev is None or sizing.estimated_loan > prev[0]:
+                    builder_loans[sizing.buyer_entity_id] = (
+                        sizing.estimated_loan, sizing.confidence,
+                    )
+
         for pid, signal in map_hits_to_property_signals(session, builder_hits).items():
+            if signal.buyer_entity_id in dismissed_builders:
+                continue
             a = _bucket(pid)
             a.triggers.add("builder")
             a.is_builder = True
             a.builder_entity_id = signal.buyer_entity_id
             a.builder_name = signal.principal_name
             a.add_date(signal.urgency_date)
+            loan = builder_loans.get(signal.buyer_entity_id)
+            if loan is not None:
+                a.builder_loan, a.builder_loan_confidence = loan
 
         cash_since = as_of - timedelta(days=_CASH_LOOKBACK_DAYS)
         permit_since = as_of - timedelta(days=_PERMIT_LOOKBACK_DAYS)
@@ -577,6 +615,13 @@ def assemble_dial_candidates(
                 # falls back to assessed value / last sale.
                 arv=None,
                 max_ltc=None,
+                # Builder candidates carry Stage D's 85% LTC construction sizing;
+                # the ranker uses this override ahead of the generic 70% assessed
+                # fallback (a builder's loan basis is the build, not the parcel).
+                expected_loan_override=a.builder_loan,
+                expected_loan_override_confidence=(
+                    "high" if a.builder_loan_confidence == "high" else "low"
+                ) if a.builder_loan is not None else None,
                 assessed_value_mkt=_dec(e.get("assessed_value_mkt")),
                 last_sale_price=_dec(e.get("last_sale_price")),
                 is_builder=a.is_builder,
@@ -703,11 +748,17 @@ def generate_dial_list(
     as_of: date,
     county_id: Optional[str] = None,
     config: Optional[DialListConfig] = None,
+    surface_relationships: bool = False,
 ) -> DialList:
-    """Assemble candidates from the DB and rank them with the pure core."""
+    """Assemble candidates from the DB and rank them with the pure core.
+
+    surface_relationships defaults False so a dry-run generation posts nothing
+    and writes no RELATIONSHIPS dedup ledger; the live delivery path passes True.
+    """
     cfg = config or DEFAULT_CONFIG
     candidates = assemble_dial_candidates(
-        session, as_of=as_of, county_id=county_id, config=cfg
+        session, as_of=as_of, county_id=county_id, config=cfg,
+        surface_relationships=surface_relationships,
     )
     dial_list = rank_dial_list(candidates, as_of, cfg)
     dial_list.stale_sources = stale_dial_list_sources(

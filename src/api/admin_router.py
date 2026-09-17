@@ -2669,11 +2669,31 @@ def _handle_reject_entity_link(payload: dict, db: Session) -> dict:
         """),
         {"tbl": src_table, "sid": src_id, "eid": entity_id},
     ).rowcount
-    db.commit()
     if not updated:
+        db.rollback()
         return _slack_ephemeral(f"Link not found ({src_table}#{src_id} -> entity #{entity_id}).")
+    # Durable rejection: without this, the next nightly sweep sees the permit as
+    # unresolved, recreates the identical singleton link, and re-alerts. The
+    # permit extractor anti-joins on this row so the same pair is never proposed
+    # again. Idempotent on (kind, left_ref, right_ref).
+    db.execute(
+        text("""
+            INSERT INTO buyer_entity_match_exception
+                (kind, left_ref, right_ref, explanation, status, resolved_by, resolved_at)
+            VALUES ('rejected_permit_link', :left_ref, :right_ref,
+                    :explanation, 'rejected', :by, now())
+            ON CONFLICT (kind, left_ref, right_ref) DO NOTHING
+        """),
+        {
+            "left_ref": f"{src_table}#{src_id}",
+            "right_ref": f"buyer_entities#{entity_id}",
+            "explanation": f"Operator rejected {src_table}#{src_id} -> entity #{entity_id}",
+            "by": f"slack:{user_id}",
+        },
+    )
+    db.commit()
     logger.info("[EntityLink] rejected src=%s id=%d entity=%d by=%s", src_table, src_id, entity_id, user_id)
-    return _slack_ephemeral(f":no_entry: Link rejected. Record will be re-evaluated on next run.")
+    return _slack_ephemeral(":no_entry: Link rejected. This match will not be proposed again.")
 
 
 def _handle_view_entity_link(payload: dict, db: Session) -> dict:

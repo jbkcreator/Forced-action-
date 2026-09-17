@@ -904,8 +904,9 @@ def compute_cluster_confidences(
     shouldn't inflate a cluster actually held together by a much weaker
     fuzzy/LLM link elsewhere. A cluster held together entirely by structural
     edges gets that structural confidence, since that IS all the evidence.
-    Singleton clusters (no edges at all) get 100 — nothing was inferred, so
-    there's no matching uncertainty to score.
+    Singleton clusters (no edges at all) are brand-new names that matched
+    nothing — they get _NEW_SINGLETON_CONFIDENCE (60, below the EXCEPTIONS
+    floor) so they route for human review instead of being trusted outright.
     """
     index_by_key = _cluster_index_by_key(clusters)
     non_structural_mins: dict[int, int] = {}
@@ -1172,9 +1173,15 @@ def attach_or_create_entities(
             # single-record cluster), not a human decision. 'manual' means
             # exactly what it says and is reserved for an actual human-set
             # link (e.g. an admin merge/reject action) -- see WI-5.
+            # A singleton (no corroborating edge) must NOT be persisted as a
+            # trusted 100-confidence link: it matched nothing, so its link
+            # carries the cluster's own confidence (60 for a brand-new name).
+            # Builder detectors filter on match_confidence >= 70, so an
+            # unverified singleton never feeds MONEY/RELATIONSHIPS until an
+            # operator confirms it via the EXCEPTIONS lane.
             method, explanation, link_confidence, _principal_name = evidence_index.get(
                 _record_key(rec),
-                ("singleton_no_edge", "single-record cluster; no corroborating edge", 100, None),
+                ("singleton_no_edge", "single-record cluster; no corroborating edge", confidence, None),
             )
             session.execute(insert(BuyerEntityLink).values(
                 buyer_entity_id=entity_id,
@@ -1253,7 +1260,10 @@ def _permit_name_candidates(
         "AND bel.id IS NULL" if only_unresolved else ""
     )
 
-    # principal = holder if present, else contractor (contractor-only permits)
+    # principal = holder if present, else contractor (contractor-only permits).
+    # The NOT EXISTS excludes permits an operator durably rejected in EXCEPTIONS:
+    # without it, an unresolved rejected permit would re-resolve to the same
+    # entity and re-alert on every nightly sweep (see _handle_reject_entity_link).
     party_sql = f"""
         SELECT p.id,
                COALESCE(NULLIF(p.holder_name, ''), NULLIF(p.contractor_name, '')) AS raw_name,
@@ -1263,6 +1273,11 @@ def _permit_name_candidates(
             ON bel.source_table = :src AND bel.source_id = p.id
         WHERE COALESCE(NULLIF(p.holder_name, ''), NULLIF(p.contractor_name, '')) IS NOT NULL
         {unresolved_guard}
+        AND NOT EXISTS (
+            SELECT 1 FROM buyer_entity_match_exception e
+            WHERE e.kind = 'rejected_permit_link'
+              AND e.left_ref = :src || '#' || p.id::text
+        )
         ORDER BY p.id
     """
     for row in session.execute(text(party_sql), {"src": source_table}).yield_per(_STREAM_BATCH):
@@ -1470,8 +1485,11 @@ def run_incremental_permits(
 
     existing_entities = load_existing_entity_candidates(session, county_id=None)
     combined = new_candidates + existing_entities
-    relevant_clusters, confidences, evidence_index = cluster_against_anchors(combined)
+    relevant_clusters, confidences, evidence_index, ambiguous_pairs = cluster_against_anchors(combined)
     stats = attach_or_create_entities(session, relevant_clusters, confidences, evidence_index)
+    # Ambiguous permit-name verdicts the resolver declined to link are durably
+    # routed to EXCEPTIONS (buyer_entity_match_exception), same as run_incremental.
+    record_ambiguous_pair_exceptions(session, ambiguous_pairs)
 
     # Collect low-confidence links for EXCEPTIONS routing
     low_conf_links = []

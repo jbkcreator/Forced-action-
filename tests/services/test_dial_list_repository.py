@@ -17,6 +17,7 @@ from sqlalchemy.orm import sessionmaker
 
 from src.core.models import (
     AgentLaneOpportunityOutcome,
+    BuilderDialQueue,
     BuildingPermit,
     BuyerEntity,
     BuyerEntityLink,
@@ -71,6 +72,7 @@ def db():
         TaxDeedAuction.__table__,
         BuyerEntity.__table__,
         BuyerEntityLink.__table__,
+        BuilderDialQueue.__table__,
         AgentLaneOpportunityOutcome.__table__,
         DialListSnapshot.__table__,
         DialListTouch.__table__,
@@ -290,7 +292,8 @@ def test_builder_patterns_feed_resolved_principal_to_dial_list(db, monkeypatch):
         },
     )
 
-    cands = assemble_dial_candidates(db, as_of=AS_OF)
+    # Live path opts into RELATIONSHIPS surfacing.
+    cands = assemble_dial_candidates(db, as_of=AS_OF, surface_relationships=True)
 
     assert resolution_calls == [None]
     assert relationship_batches == [[hit]]
@@ -300,6 +303,72 @@ def test_builder_patterns_feed_resolved_principal_to_dial_list(db, monkeypatch):
     assert cands[0].buyer_entity_id == 777
     assert cands[0].borrower_name == "RESOLVED BUILDER LLC"
     assert cands[0].urgency_date == AS_OF - timedelta(days=7)
+
+
+def test_dry_run_generation_does_not_surface_relationships(db, monkeypatch):
+    """#6 regression: a dry-run (default) must produce NO RELATIONSHIPS side
+    effects — no Slack post, no dedup-ledger write."""
+    from src.services.builder_patterns import BuilderHit, PropertyBuilderSignal
+    from src.services.dial_list import repository
+
+    pid = _prop(db)
+    db.flush()
+    hit = BuilderHit(
+        pattern="repeat_builder", buyer_entity_id=777,
+        principal_name="RESOLVED BUILDER LLC", evidence_permit_ids=[11],
+        county_id="hillsborough", latest_permit_date=AS_OF - timedelta(days=7),
+        property_id=pid,
+    )
+    surfaced = []
+    monkeypatch.setattr(repository, "run_incremental_permits", lambda *a, **k: {})
+    monkeypatch.setattr(repository, "run_builder_detectors", lambda *a, **k: [hit])
+    monkeypatch.setattr(
+        repository, "surface_relationship_hits",
+        lambda session, hits: surfaced.append(list(hits)) or 1,
+    )
+    monkeypatch.setattr(
+        repository, "map_hits_to_property_signals",
+        lambda session, hits: {pid: PropertyBuilderSignal(
+            property_id=pid, patterns=["repeat_builder"],
+            urgency_date=hit.latest_permit_date, buyer_entity_id=777,
+            principal_name="RESOLVED BUILDER LLC")},
+    )
+
+    # Default surface_relationships=False → no delivery, but MONEY still built.
+    cands = assemble_dial_candidates(db, as_of=AS_OF)
+
+    assert surfaced == []                     # no RELATIONSHIPS side effect
+    assert len(cands) == 1 and cands[0].is_builder is True
+
+
+def test_dismissed_builder_excluded_from_money(db, monkeypatch):
+    """#3 regression: a builder marked 'Not a fit' never enters the dial list."""
+    from src.services.builder_patterns import BuilderHit, PropertyBuilderSignal
+    from src.services.dial_list import repository
+
+    pid = _prop(db)
+    db.add(BuilderDialQueue(buyer_entity_id=777, queued_by="slack:U1", dismissed=True))
+    db.flush()
+    hit = BuilderHit(
+        pattern="repeat_builder", buyer_entity_id=777,
+        principal_name="DISMISSED BUILDER LLC", evidence_permit_ids=[11],
+        county_id="hillsborough", latest_permit_date=AS_OF - timedelta(days=7),
+        property_id=pid,
+    )
+    monkeypatch.setattr(repository, "run_incremental_permits", lambda *a, **k: {})
+    monkeypatch.setattr(repository, "run_builder_detectors", lambda *a, **k: [hit])
+    monkeypatch.setattr(repository, "surface_relationship_hits", lambda *a, **k: 0)
+    monkeypatch.setattr(
+        repository, "map_hits_to_property_signals",
+        lambda session, hits: {pid: PropertyBuilderSignal(
+            property_id=pid, patterns=["repeat_builder"],
+            urgency_date=hit.latest_permit_date, buyer_entity_id=777,
+            principal_name="DISMISSED BUILDER LLC")},
+    )
+
+    cands = assemble_dial_candidates(db, as_of=AS_OF)
+
+    assert cands == []   # dismissed builder produced no candidate
 
 
 def test_probate_detected(db):
