@@ -88,6 +88,25 @@ def _fa_max_compliance_reason(item: QueueItem) -> str | None:
     if item.venture_key != _FA_MAX_VENTURE:
         return None
 
+    if get_settings().fa_max_relay_send_mode != "live":
+        # Code-review finding: channels_email.py/channels_sms.py's fake-mode
+        # branch returns normally after recording into FAKE_MAIL/FAKE_SMS,
+        # and the engine treats any normal return as a real send -- it calls
+        # queue.mark_sent(), which writes dispatched_at, a durable WP-1
+        # outbound interaction, and a Slack "sent" completion receipt Josh
+        # reads as real. fa_max_relay_send_mode defaults to "fake", so an
+        # approved item reaching a real production sweep today would be
+        # permanently recorded as sent with no actual send happening. The
+        # fake dispatch branches exist so a developer can call send_email()/
+        # send_sms() directly in a test with the mode monkeypatched (see
+        # tests/test_fa_max_wp_t2_1_send_infra.py) -- those calls bypass
+        # evaluate() entirely and are unaffected by this gate. This check is
+        # what stops a real approved item from ever reaching that branch
+        # through the one real production path (engine.execute_batch ->
+        # this gate -> dispatch): while site-wide sending isn't live, no FA
+        # Max item of any channel gets dispatched, fake or real.
+        return "fa_max_relay_send_mode_not_live"
+
     if item.channel == "sms" and not get_settings().fa_max_10dlc_registered:
         return "fa_max_10dlc_not_registered"
 

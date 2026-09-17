@@ -90,8 +90,26 @@ def sync_unsubscribes(venture_key: str = DEFAULT_VENTURE_KEY) -> SyncResult:
         with get_db_context() as db:
             while True:
                 page = instantly.list_leads(campaign_id, cursor=cursor)
-                if not page:
-                    break
+                if page is None:
+                    # instantly_service.list_leads() returns None for TWO
+                    # different reasons it does not distinguish: the global
+                    # Instantly integration being disabled/unconfigured, or a
+                    # genuine mid-poll request failure (network/API error) --
+                    # see its own docstring. Both look identical here, and
+                    # both mean this run cannot prove what changed since the
+                    # last sync. Treating either as "reached the last page"
+                    # (the pre-review-fix behaviour) silently truncated the
+                    # poll and reported status="synced" even when a failure
+                    # happened on page 2 of 6 -- exactly the stale-suppression
+                    # risk this module exists to prevent. Fail closed instead:
+                    # raise so the caller (sweep.run_sweep) defers the whole
+                    # batch rather than send against a partial suppression
+                    # view.
+                    raise SuppressionSyncFailed(
+                        f"Instantly list_leads returned None for venture {venture_key} "
+                        f"(campaign {campaign_id}, cursor={cursor!r}) -- integration "
+                        f"disabled or request failed; cannot confirm this page synced"
+                    )
                 leads = page.get("leads", [])
                 if not leads:
                     break

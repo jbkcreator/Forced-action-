@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from config.venture_template import DEFAULT_VENTURE_KEY
 from src.services.relay import suppression_sync
 
@@ -98,15 +100,35 @@ def test_stops_on_empty_page(monkeypatch):
     assert result.count == 0
 
 
-def test_stops_when_list_leads_returns_none(monkeypatch):
-    """Matches instantly_service.list_leads()'s own contract: returns None
-    on a request failure rather than raising."""
+def test_raises_when_list_leads_returns_none(monkeypatch):
+    """Code-review finding: instantly_service.list_leads()'s own contract
+    returns None for BOTH a disabled/unconfigured integration and a genuine
+    mid-poll request failure -- it does not distinguish them. Treating None
+    as "reached the last page" (the old behaviour this test used to pin)
+    silently truncated the poll and reported status="synced" even when a
+    real failure happened partway through -- exactly the stale-suppression
+    risk this module exists to prevent. It must fail closed instead."""
     _patch_venture(monkeypatch)
     monkeypatch.setattr(suppression_sync.instantly, "list_leads", lambda *a, **k: None)
 
-    result = suppression_sync.sync_unsubscribes()
-    assert result.status == "synced"
-    assert result.count == 0
+    with pytest.raises(suppression_sync.SuppressionSyncFailed):
+        suppression_sync.sync_unsubscribes()
+
+
+def test_raises_when_list_leads_returns_none_on_a_later_page(monkeypatch):
+    """The bug wasn't limited to the first page -- a failure after several
+    successful pages must still defer the whole sync, not report the leads
+    already suppressed as a complete, trustworthy sync."""
+    _patch_venture(monkeypatch)
+    pages = [
+        {"leads": [{"email": "a@example.com", "interest_status": "unsubscribed"}], "next_starting_after": "cursor-2"},
+        None,
+    ]
+    monkeypatch.setattr(suppression_sync.instantly, "list_leads", lambda *a, **k: pages.pop(0))
+    monkeypatch.setattr(suppression_sync, "suppress_contact", lambda db, email, source: None)
+
+    with pytest.raises(suppression_sync.SuppressionSyncFailed):
+        suppression_sync.sync_unsubscribes()
 
 
 def test_venture_key_defaults_to_venture_one(monkeypatch):
