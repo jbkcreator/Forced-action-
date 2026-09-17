@@ -455,6 +455,10 @@ def run_monitors(
     post candidates to Slack and record only confirmed deliveries. Preview
     mode performs neither side effect.
     Does not commit — caller controls the transaction boundary.
+
+    deliver=False skips _post_alert() and _record_fired() entirely -- rolling
+    back the transaction afterward only undoes the DB writes, it can never
+    un-send a Slack message already posted.
     """
     if today is None:
         today = date.today()

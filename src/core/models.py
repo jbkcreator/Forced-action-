@@ -3,7 +3,7 @@ Database models for Distressed Property Intelligence Platform.
 Implements the Hub-and-Spoke architecture with properties as the central hub.
 """
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any, List, Optional
@@ -9212,6 +9212,21 @@ class BuyerEntity(Base):
     canonical_name: Mapped[str] = mapped_column(Text, nullable=False)
     entity_type: Mapped[str] = mapped_column(String(20), nullable=False)   # Individual | LLC | Trust | Corporate
     primary_mailing_address: Mapped[Optional[str]] = mapped_column(String(255))
+    # Modal (most common) normalized email/phone across the cluster's member
+    # records -- denormalized the same way canonical_name/primary_mailing_address
+    # already are, so run_incremental's existing-entity anchors (see
+    # load_existing_entity_candidates in buyer_entity_resolution.py) can be
+    # contact-matched against a new owners/deeds row without a fresh query.
+    # phone is always via src/services/phone_utils.normalize (E.164).
+    primary_email: Mapped[Optional[str]] = mapped_column(Text)
+    primary_phone: Mapped[Optional[str]] = mapped_column(String(20))
+    # The controlling PERSON's name for an entity resolved via Sunbiz LLC
+    # piercing (e.g. an entity whose canonical_name is an LLC because no
+    # Individual/Trust candidate was in the cluster still has principal_name
+    # set to the pierced managing member). NULL when the entity was never
+    # pierced -- an LLC entity with no known principal. See
+    # buyer_entity_resolution.canonical_name()/find_structural_edges().
+    principal_name: Mapped[Optional[str]] = mapped_column(Text)
     confidence_score: Mapped[int] = mapped_column(Integer, nullable=False)
     verification_status: Mapped[str] = mapped_column(String(20), nullable=False, default="unverified")
     total_purchase_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -9356,7 +9371,7 @@ class BuyerEntityLink(Base):
         ),
         CheckConstraint(
             "match_method IN ('sunbiz_llc_piercing', 'exact_name_address', 'fuzzy_name', 'llm_adjudicated', 'manual', "
-            "'exact_name_only', 'auction_name_only_unverified')",
+            "'exact_name_only', 'auction_name_only_unverified', 'singleton_no_edge')",
             name="check_buyer_entity_link_match_method",
         ),
         CheckConstraint(
@@ -9384,16 +9399,29 @@ class BuyerEntityMergeLog(Base):
     absorbed_id carries no FK because the row it referenced has been deleted.
     restored_id is populated by unmerge_entity() with the new PK assigned to
     the restored entity (old PK cannot be reused safely).
+
+    moved_link_ids is the exact set of buyer_entity_links.id values reassigned
+    to surviving_id at merge time. unmerge_entity() restores precisely these
+    IDs -- never a timestamp heuristic, which cannot distinguish links moved
+    by this merge from the survivor's own pre-existing links (both predate
+    merged_at). A log row with moved_link_ids IS NULL (logged before this
+    column existed) cannot be safely unmerged; unmerge_entity() raises rather
+    than guess.
     """
     __tablename__ = "buyer_entity_merge_log"
 
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     surviving_id: Mapped[int] = mapped_column(
         ForeignKey("buyer_entities.id"), nullable=False, index=True,
     )
     absorbed_id: Mapped[int] = mapped_column(Integer, nullable=False)
     absorbed_snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False)
     links_moved: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    moved_link_ids: Mapped[Optional[list]] = mapped_column(JSONB)
+    moved_ledger_event_ids: Mapped[Optional[list]] = mapped_column(JSONB)
+    moved_monitor_log_ids: Mapped[Optional[list]] = mapped_column(JSONB)
+    moved_closer_call_ids: Mapped[Optional[list]] = mapped_column(JSONB)
+    moved_selfserve_session_ids: Mapped[Optional[list]] = mapped_column(JSONB)
     merged_by: Mapped[str] = mapped_column(String(100), nullable=False)
     merge_reason: Mapped[Optional[str]] = mapped_column(Text)
     merged_at: Mapped[datetime] = mapped_column(
@@ -9402,15 +9430,6 @@ class BuyerEntityMergeLog(Base):
     reversed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     reversed_by: Mapped[Optional[str]] = mapped_column(String(100))
     restored_id: Mapped[Optional[int]] = mapped_column(Integer)
-    # Append-only history rows reassigned absorbed→surviving during the merge, so
-    # unmerge can move exactly those back (they carry no linked_at heuristic and
-    # would otherwise be lost to the buyer_entities ON DELETE CASCADE).
-    moved_ledger_event_ids: Mapped[list] = mapped_column(
-        JSONB, nullable=False, server_default=text("'[]'::jsonb"),
-    )
-    moved_monitor_log_ids: Mapped[list] = mapped_column(
-        JSONB, nullable=False, server_default=text("'[]'::jsonb"),
-    )
 
     surviving_entity: Mapped["BuyerEntity"] = relationship(
         "BuyerEntity", foreign_keys="[BuyerEntityMergeLog.surviving_id]",
@@ -9420,6 +9439,59 @@ class BuyerEntityMergeLog(Base):
         Index("idx_merge_log_surviving", "surviving_id"),
         Index("idx_merge_log_absorbed", "absorbed_id"),
         Index("idx_merge_log_active", "id", postgresql_where=text("reversed_at IS NULL")),
+    )
+
+
+class BuyerEntityMatchException(Base):
+    """
+    Durable record of a resolver decision that correctly refused to
+    auto-merge -- an ambiguous pair, a cluster touching 2+ existing
+    buyer_entities anchors, or an LLM tie-break that came back DIFFERENT on
+    a high-name-score pair. Previously these were logger.warning only and
+    forgotten. Client spec: "Identity resolution is uncertain. Records stay
+    separate and a possible-match flag routes to EXCEPTIONS."
+
+    Also the missing input to merge_entities() (buyer_entity_merge.py),
+    which had no caller before this table existed -- an admin resolving one
+    of these rows to 'merged' is expected to call merge_entities() and stamp
+    merge_log_id here in the same transaction.
+
+    Upserted on (kind, left_ref, right_ref): the nightly sweep re-seeing the
+    same ambiguous pair every run bumps last_seen_at rather than creating a
+    new row per run.
+    """
+    __tablename__ = "buyer_entity_match_exception"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)   # ambiguous_pair | multi_anchor_conflict | llm_different
+    left_ref: Mapped[str] = mapped_column(Text, nullable=False)    # e.g. 'owners#4412'
+    right_ref: Mapped[str] = mapped_column(Text, nullable=False)   # e.g. 'buyer_entities#88'
+    entity_ids: Mapped[Optional[list]] = mapped_column(JSONB)      # anchors, for multi_anchor_conflict
+    name_score: Mapped[Optional[int]] = mapped_column(Integer)
+    address_score: Mapped[Optional[int]] = mapped_column(Integer)
+    explanation: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="open")  # open|merged|rejected|stale
+    resolved_by: Mapped[Optional[str]] = mapped_column(String(100))
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    merge_log_id: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("buyer_entity_merge_log.id"))
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+
+    __table_args__ = (
+        UniqueConstraint("kind", "left_ref", "right_ref", name="uq_match_exception_pair"),
+        Index("idx_match_exception_open", "first_seen_at", postgresql_where=text("status = 'open'")),
+        CheckConstraint(
+            "kind IN ('ambiguous_pair', 'multi_anchor_conflict', 'llm_different')",
+            name="buyer_entity_match_exception_kind_check",
+        ),
+        CheckConstraint(
+            "status IN ('open', 'merged', 'rejected', 'stale')",
+            name="buyer_entity_match_exception_status_check",
+        ),
     )
 
 
@@ -10477,6 +10549,8 @@ class FaMaxPerson(Base):
             ["lifecycle_state"],
             ["fa_max_person_lifecycle_stage_config.stage_key"],
             name="fk_fa_max_persons_lifecycle_state",
+            deferrable=True,
+            initially="DEFERRED",
         ),
         CheckConstraint(
             "merged_into_id IS NULL OR merged_into_id <> person_id",
@@ -10594,6 +10668,8 @@ class FaMaxOpportunity(Base):
             ["current_stage"],
             ["fa_max_opportunity_stage_config.stage_key"],
             name="fk_fa_max_opp_stage_config",
+            deferrable=True,
+            initially="DEFERRED",
         ),
         CheckConstraint(
             "opportunity_type IN ('acquisition','rehab','construction','extension',"
@@ -11190,6 +11266,140 @@ class FaMaxWorkQueue(Base):
             f"<FaMaxWorkQueue(work_item_id={self.work_item_id!r}, "
             f"queue={self.queue_name!r}, status={self.status!r})>"
         )
+
+
+# ============================================================================
+# WP-7 — Self-serve pre-fill path (tracked links)
+# ============================================================================
+
+class TrackedLink(Base):
+    """A partner/campaign/mailer-specific URL into the self-serve pre-fill flow.
+
+    `property_id` is set for per-property mailers (the primary v1 experience —
+    instant recognition on click) and NULL for generic partner/campaign links,
+    which fall back to address entry resolved through BaseLoader's matching
+    waterfall. See tasks/FA_Max_build/dev2_wp7_selfserve_prefill_plan.md WI-1.
+    """
+    __tablename__ = "tracked_links"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    slug: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    label: Mapped[str] = mapped_column(Text, nullable=False)
+    partner_ref: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    campaign_ref: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    property_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("properties.id"), nullable=True
+    )
+    destination: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_by: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "kind IN ('partner', 'campaign', 'source', 'property_mailer')",
+            name="ck_tracked_links_kind",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return f"<TrackedLink(id={self.id}, slug={self.slug!r}, kind={self.kind!r})>"
+
+
+class TrackedLinkClick(Base):
+    """One row per click on a TrackedLink. `ip_hash` is a salted hash, never
+    the raw IP. `session_token` ties this click to the selfserve session the
+    borrower then fills out."""
+    __tablename__ = "tracked_link_clicks"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    tracked_link_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("tracked_links.id"), nullable=False
+    )
+    clicked_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+    ip_hash: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    user_agent: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    referer: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    session_token: Mapped[str] = mapped_column(Text, nullable=False)
+
+    __table_args__ = (
+        Index("idx_link_clicks_link", "tracked_link_id", "clicked_at"),
+        Index("idx_link_clicks_session", "session_token"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<TrackedLinkClick(id={self.id}, link={self.tracked_link_id})>"
+
+
+class SelfserveSession(Base):
+    """One self-serve pre-fill session (WP-7 WI-3).
+
+    Two identity FKs, not one — a real, confirmed gap in this codebase, not
+    speculative design (see plan §1.5): `buyer_entity_id` is the WP-3/WP-4
+    deed-side identity (BuyerEntity), `person_id` is the WP-1 governance-side
+    identity (FaMaxPerson, required by relay_approval_queue's live CHECK
+    constraint for any outbound send this session later triggers). Nothing in
+    this codebase bridges the two yet — both are resolved independently here.
+
+    `prefill_snapshot` is immutable after creation — same discipline as
+    DealRoom.properties_snapshot, and for the same reason: the audit record of
+    what the borrower was actually shown.
+    """
+    __tablename__ = "selfserve_sessions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    token: Mapped[str] = mapped_column(PG_UUID(as_uuid=False), nullable=False, unique=True)
+    tracked_link_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("tracked_links.id"), nullable=True
+    )
+    property_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("properties.id"), nullable=True
+    )
+    buyer_entity_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("buyer_entities.id"), nullable=True
+    )
+    person_id: Mapped[Optional[str]] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("fa_max_persons.person_id"), nullable=True
+    )
+    prefill_snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    corrections: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    confirmations: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    contact: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="started")
+    handoff_ref: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    handed_off_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+    last_activity_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc) + timedelta(days=30),
+        server_default=text("now() + interval '30 days'"),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('started', 'prefilled', 'confirmed', 'handed_off', 'abandoned')",
+            name="ck_selfserve_sessions_status",
+        ),
+        Index("idx_selfserve_status", "status", "started_at"),
+        Index("idx_selfserve_person", "person_id"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<SelfserveSession(id={self.id}, token={self.token!r}, status={self.status!r})>"
 
 
 class FaMaxArvResult(Base):
