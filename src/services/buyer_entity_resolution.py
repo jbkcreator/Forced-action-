@@ -23,6 +23,7 @@ from rapidfuzz import fuzz
 from sqlalchemy import insert, text
 from sqlalchemy.orm import Session
 
+from config.settings import get_settings
 from src.agents.hunter.gating import verification_status
 from src.core.models import BuyerEntity, BuyerEntityLink
 from src.loaders.base import BaseLoader
@@ -1090,29 +1091,51 @@ def extract_permit_candidates(
     yield from _permit_name_candidates(session, "permit_staging", only_unresolved)
 
 
+def _build_exceptions_message(low_conf_links: list[tuple[str, int, str, int]]) -> str:
+    """Render the batched EXCEPTIONS alert text (pure — unit-testable)."""
+    lines = [
+        f"• {src}#{src_id} '{name}' → entity_id={entity_id} confidence={conf} (UNVERIFIED)"
+        for src, src_id, name, conf, entity_id in low_conf_links
+    ]
+    return (
+        f":building_construction: *Builder permit resolution — {len(lines)} low-confidence link(s)*\n"
+        + "\n".join(lines[:20])  # cap to avoid oversized messages
+        + ("\n… (truncated)" if len(lines) > 20 else "")
+    )
+
+
 def _emit_exceptions_alerts(
     low_conf_links: list[tuple[str, int, str, int]],
 ) -> None:
     """
     Post a single batched EXCEPTIONS alert for permit resolutions below the
-    confidence floor. Non-fatal — if Slack post fails, we log and continue.
+    confidence floor, to the FA-Max EXCEPTIONS Slack lane.
+
+    No-ops (logs and returns) when Slack is not configured — mirrors
+    slack_post.post_for_approval, so nightly resolution runs never fail because
+    of a missing token/channel. Non-fatal: a Slack error is logged, never raised.
     """
     if not low_conf_links:
         return
-    try:
-        from src.services.relay.slack_post import post_to_slack
-        lines = [
-            f"• {src}#{src_id} '{name}' → entity_id={entity_id} confidence={conf} (UNVERIFIED)"
-            for src, src_id, name, conf, entity_id in low_conf_links
-        ]
-        msg = (
-            f":building_construction: *Builder permit resolution — {len(lines)} low-confidence link(s)*\n"
-            + "\n".join(lines[:20])  # cap to avoid oversized messages
-            + ("\n… (truncated)" if len(lines) > 20 else "")
+
+    settings = get_settings()
+    token = settings.slack_bot_token
+    channel = getattr(settings, "fa_max_slack_channel_exceptions", "")
+    if not token or not channel:
+        logger.info(
+            "_emit_exceptions_alerts: Slack not configured (no token/EXCEPTIONS channel) — "
+            "%d low-confidence permit link(s) logged only", len(low_conf_links),
         )
-        post_to_slack("EXCEPTIONS", msg)
+        return
+
+    msg = _build_exceptions_message(low_conf_links)
+    try:
+        from slack_sdk import WebClient
+        WebClient(token=token.get_secret_value()).chat_postMessage(channel=channel, text=msg)
+        logger.info("_emit_exceptions_alerts: posted %d low-confidence permit link(s) to EXCEPTIONS",
+                    len(low_conf_links))
     except Exception as exc:
-        logger.warning("_emit_exceptions_alerts: slack post failed: %s", exc)
+        logger.error("_emit_exceptions_alerts: Slack post failed: %s", exc, exc_info=True)
 
 
 def run_incremental_permits(

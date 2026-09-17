@@ -5,10 +5,35 @@ the extractor now resolves COALESCE(holder_name, contractor_name).
 """
 from sqlalchemy import text
 
+from unittest import mock
+
 from src.services.buyer_entity_resolution import (
+    _build_exceptions_message,
+    _emit_exceptions_alerts,
     _infer_entity_type_from_name,
     extract_permit_candidates,
 )
+
+
+def test_exceptions_message_renders_links():
+    msg = _build_exceptions_message([
+        ("permit_staging", 1, "ACME HOMES LLC", 62, 900),
+        ("building_permits", 2, "BUILDPRO INC", 55, 901),
+    ])
+    assert "2 low-confidence link(s)" in msg
+    assert "permit_staging#1 'ACME HOMES LLC'" in msg
+    assert "confidence=62 (UNVERIFIED)" in msg
+
+
+def test_exceptions_alert_noops_when_slack_unconfigured():
+    # No token/channel → must not raise, must not attempt a post.
+    fake = mock.MagicMock()
+    fake.slack_bot_token = None
+    fake.fa_max_slack_channel_exceptions = ""
+    with mock.patch("src.services.buyer_entity_resolution.get_settings", return_value=fake):
+        with mock.patch("slack_sdk.WebClient") as web:
+            _emit_exceptions_alerts([("permit_staging", 1, "X LLC", 60, 1)])
+            web.assert_not_called()
 
 
 def _staging(db, permit_number, *, holder=None, contractor=None, county="hillsborough"):
