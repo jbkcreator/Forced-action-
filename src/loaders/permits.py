@@ -254,6 +254,11 @@ class BuildingPermitLoader(BaseLoader):
 
                     if self.safe_add(permit_record):
                         matched += 1
+                        # Promotion: this permit now has a real building_permits row.
+                        # Remove any earlier permit_staging representation (and its
+                        # buyer_entity_link) so detectors don't count the same permit
+                        # twice — once via the matched property, once via staging.
+                        self._promote_from_staging(record_number)
                     else:
                         unmatched += 1
 
@@ -286,6 +291,31 @@ class BuildingPermitLoader(BaseLoader):
         
         logger.info(f"Building Permits: {matched} matched, {unmatched} unmatched, {skipped} skipped")
         return matched, unmatched, skipped
+
+    def _promote_from_staging(self, permit_number: str) -> None:
+        """Remove a staged permit once it has a real building_permits row.
+
+        Deletes the buyer_entity_link pointing at the staging row first (the
+        principal will re-resolve against the building_permits row on the next
+        resolver pass), then the staging row itself. Idempotent — a no-op when
+        the permit was never staged.
+        """
+        staging = self.session.execute(
+            text("SELECT id FROM permit_staging WHERE permit_number = :pn"),
+            {"pn": permit_number},
+        ).fetchone()
+        if staging is None:
+            return
+        self.session.execute(
+            text("DELETE FROM buyer_entity_links "
+                 "WHERE source_table = 'permit_staging' AND source_id = :sid"),
+            {"sid": staging.id},
+        )
+        self.session.execute(
+            text("DELETE FROM permit_staging WHERE id = :sid"),
+            {"sid": staging.id},
+        )
+        self.session.flush()
 
     def _persist_to_staging(
         self,

@@ -1008,6 +1008,28 @@ def attach_or_create_entities(
 _BUILDER_CONFIDENCE_FLOOR = 70  # mirrors UNVERIFIED_FLOOR in gating.py
 
 
+_LLC_SUFFIXES = (" LLC", " L.L.C", " LC", " PLLC")
+_CORP_SUFFIXES = (" INC", " INCORPORATED", " CORP", " CORPORATION", " CO", " COMPANY", " LP", " LLP", " PA")
+_TRUST_TOKENS = (" TRUST", " TRUSTEE", " TR ", " REVOCABLE", " LIVING TRUST")
+
+
+def _infer_entity_type_from_name(name: str) -> str:
+    """Best-effort legal-type guess from a raw party name so permit companies are
+    not all mislabeled 'Individual' (which suppresses Sunbiz principal resolution
+    and lets a company fragment from its principal). Matches the entity_type CHECK
+    set on buyer_entities: Individual | LLC | Trust | Corporate."""
+    if not name:
+        return "Individual"
+    padded = f" {name.upper().strip()} "
+    if any(s in padded for s in _LLC_SUFFIXES):
+        return "LLC"
+    if any(t in padded for t in _TRUST_TOKENS):
+        return "Trust"
+    if any(s in padded for s in _CORP_SUFFIXES):
+        return "Corporate"
+    return "Individual"
+
+
 def _permit_name_candidates(
     session: Session,
     source_table: str,
@@ -1054,7 +1076,7 @@ def _permit_name_candidates(
             raw_name=raw,
             normalized_name=BaseLoader.normalize_owner_name(raw),
             mailing_address=None,
-            entity_type_hint="Individual",
+            entity_type_hint=_infer_entity_type_from_name(raw),
             managing_members=None,
             county_id=row.county_id,
         )

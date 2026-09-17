@@ -61,6 +61,7 @@ def test_matched_permit_populates_enrichment_fields():
         find_property_by_address=Mock(return_value=(prop, 100)),
         parse_date=Mock(return_value=date(2026, 9, 1)),
         safe_add=Mock(return_value=True),
+        _promote_from_staging=Mock(),
     )
     frame = pd.DataFrame([{
         "Record Number": "P-enrich",
@@ -96,6 +97,7 @@ def test_unmatched_permit_persists_to_staging():
         find_property_by_address=Mock(return_value=None),  # NO property match
         parse_date=Mock(return_value=date(2026, 9, 1)),
         safe_add=Mock(return_value=True),
+        _promote_from_staging=Mock(),
         quarantine_unmatched=Mock(),
     )
     # bind the real _persist_to_staging so it actually runs
@@ -200,6 +202,7 @@ def test_blank_holder_cell_does_not_create_nan_identity():
         find_property_by_address=Mock(return_value=(prop, 100)),
         parse_date=Mock(return_value=date(2026, 9, 1)),
         safe_add=Mock(return_value=True),
+        _promote_from_staging=Mock(),
     )
     # blank Holder/Contractor cells → pandas NaN under read_csv(dtype=str)
     frame = pd.DataFrame({

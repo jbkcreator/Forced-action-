@@ -44,11 +44,17 @@ class BuilderSizingResult:
     property_id: Optional[int] = None
 
 
-def _arv_for_property(session: Session, property_id: int) -> Optional[Decimal]:
-    """
-    Pull the best available value basis for a property from the financials
-    table. Falls back: arv → assessed_value_mkt → last_sale_price.
-    """
+@dataclass
+class _PropertyValues:
+    arv: Optional[Decimal] = None                 # after-repair value → collateral / LTV cap
+    assessed_value_mkt: Optional[Decimal] = None  # acquisition-cost basis
+    last_sale_price: Optional[Decimal] = None     # acquisition-cost basis
+
+
+def _property_values(session: Session, property_id: int) -> _PropertyValues:
+    """Fetch the value fields separately — ARV is collateral (LTV cap basis),
+    assessed/sale are acquisition-cost bases. Conflating them lets the loan
+    exceed the LTV cap (ARV must not be reused as the cost basis)."""
     row = session.execute(
         text("""
             SELECT f.arv, f.assessed_value_mkt, f.last_sale_price
@@ -59,32 +65,41 @@ def _arv_for_property(session: Session, property_id: int) -> Optional[Decimal]:
         {"pid": property_id},
     ).fetchone()
     if row is None:
-        return None
-    for v in (row.arv, row.assessed_value_mkt, row.last_sale_price):
-        if v and Decimal(str(v)) > _ZERO:
-            return Decimal(str(v))
-    return None
+        return _PropertyValues()
+
+    def _pos(v):
+        return Decimal(str(v)) if v and Decimal(str(v)) > _ZERO else None
+
+    return _PropertyValues(
+        arv=_pos(row.arv),
+        assessed_value_mkt=_pos(row.assessed_value_mkt),
+        last_sale_price=_pos(row.last_sale_price),
+    )
 
 
 def size_builder_hit(session: Session, hit: BuilderHit) -> BuilderSizingResult:
     """Compute a loan-size estimate for one BuilderHit."""
 
-    # Path 1: property-backed value (quote_ready pipeline)
+    # Path 1: property-backed value (quote_ready pipeline).
+    # Requires BOTH an acquisition-cost basis (assessed/sale) AND a rehab (permit
+    # job_value) to derive project cost. ARV is passed separately as collateral so
+    # compute_quote_ready enforces min(LTC×cost, LTV×ARV) — the loan can never
+    # exceed the LTV cap. If no cost basis exists we do NOT reuse ARV as cost
+    # (that bypassed the cap); we fall through to job-value sizing.
     if hit.property_id:
-        arv = _arv_for_property(session, hit.property_id)
-        if arv:
-            # Construction project cost = land/ARV basis + build cost. The permit
-            # job_value IS the build cost, so it maps to rehab_estimate; without
-            # it compute_quote_ready cannot derive project_cost (SPEC Q8:
-            # ARV/rehab → 85% LTC of project cost).
-            rehab = hit.total_job_value if (hit.total_job_value and hit.total_job_value > _ZERO) else _ZERO
+        vals = _property_values(session, hit.property_id)
+        cost_basis = vals.assessed_value_mkt or vals.last_sale_price
+        rehab = hit.total_job_value if (hit.total_job_value and hit.total_job_value > _ZERO) else None
+        if cost_basis and rehab:
             inp = QuoteReadyInput(
                 opportunity_id=UUID(int=0),  # sentinel — no real opportunity yet at detection time
                 property_id=hit.property_id,
                 max_ltc=_CONSTRUCTION_LTC,
                 max_ltv=_CONSTRUCTION_LTV,
-                estimated_value=arv,
+                assessed_value_mkt=vals.assessed_value_mkt,
+                last_sale_price=vals.last_sale_price,
                 rehab_estimate=rehab,
+                arv=vals.arv,  # None → LTV cap simply not applied; never exceeded
             )
             result = compute_quote_ready(inp)
             proposed = result.proposed_loan

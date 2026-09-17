@@ -41,6 +41,7 @@ def test_new_completed_permit_is_persisted_for_ledger_closure():
         find_property_by_address=Mock(return_value=(prop, 100)),
         parse_date=Mock(return_value=date(2026, 9, 16)),
         safe_add=Mock(return_value=True),
+        _promote_from_staging=Mock(),
     )
     frame = pd.DataFrame([{
         "Record Number": "P-closed",
