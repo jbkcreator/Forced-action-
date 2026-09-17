@@ -74,17 +74,16 @@ _SUPPRESS_ON_STATUS = {"unsubscribed", "bounced"}
 #     dead end -- and do not infer complaint data from bounce rate, warmup
 #     score, or Relay's own failure rate (those measure different things
 #     and would silently misclassify).
-#   - The SAME webhook catalog DOES expose `email_bounced`, which would let
+#   - The SAME webhook catalog DOES expose `email_bounced`, which lets
 #     hard-bounce suppression become immediate (webhook-driven) instead of
-#     this module's current ~30-min poll -- a real, separate improvement
-#     opportunity from the complaint gap above. NOT implemented here:
-#     Instantly's docs state webhooks require the Hypergrowth plan ($97/mo)
-#     or higher, and this codebase has no way to confirm this account's
-#     actual plan/webhook configuration without live account access. Building
-#     a webhook endpoint (mirroring src/api/main.py's existing Telnyx
-#     message.finalized pattern at line ~5587) is a well-specified follow-up
-#     once that one fact is confirmed -- not blocked on API capability
-#     research anymore, only on an account-level confirmation.
+#     this module's ~30-min poll. IMPLEMENTED (2026-09): see
+#     src/services/relay/bounce_webhook.py + POST /webhooks/instantly
+#     (src/api/main.py) -- registration with Instantly (which needs the
+#     Hypergrowth plan or higher per Instantly's docs) and confirming the
+#     account is actually enrolled is an account-level step outside this
+#     codebase, not an engineering blocker anymore. This module's poll
+#     stays in place unchanged as the backstop for a missed webhook
+#     delivery -- it is not superseded, just no longer the fastest path.
 
 
 @dataclass(frozen=True)

@@ -105,6 +105,13 @@ class AppSettings(BaseSettings):
 	instantly_base_url: str = Field(default="https://api.instantly.ai", env="INSTANTLY_BASE_URL")
 	instantly_enabled: bool = Field(default=True, env="INSTANTLY_ENABLED")
 
+	# Instantly webhook receiver (WP-T2-1 go-live review, 2026-09) — Instantly's
+	# webhook registration UI lets a custom header be attached to every delivery;
+	# set this to whatever value is configured there so /webhooks/instantly can
+	# reject deliveries that don't carry it. Unset = the endpoint fails closed
+	# (rejects everything) rather than accepting unauthenticated bounce claims.
+	instantly_webhook_secret: Optional[SecretStr] = Field(default=None, env="INSTANTLY_WEBHOOK_SECRET")
+
 	# Non-buyer nurture — shared Instantly campaign. Per the 2026-07-22 domain
 	# decision this shares the same warmed mailbox as the DBPR cold campaign
 	# (leads@forcedactionleads.com), not a separate dedicated domain — see

@@ -1594,6 +1594,78 @@ async def stripe_webhook(
 
 
 # ---------------------------------------------------------------------------
+# POST /webhooks/instantly — real-time bounce/unsubscribe suppression
+# (WP-T2-1 go-live review, 2026-09). Replaces the ~30-min
+# suppression_sync.sync_unsubscribes() poll as the primary trigger for hard
+# bounces and unsubscribes; the poll stays in place unchanged as a backstop
+# for a missed delivery. Does NOT cover spam complaints — Instantly's
+# webhook catalog has no complaint event type (see bounce_webhook.py).
+# ---------------------------------------------------------------------------
+
+@app.post("/webhooks/instantly", status_code=200, include_in_schema=False)
+async def instantly_webhook(request: Request, db: Session = Depends(get_db)):
+    """
+    Instantly webhook receiver. Auth is a shared secret in a custom header —
+    Instantly's webhook registration UI lets an arbitrary header be attached
+    to every delivery; set INSTANTLY_WEBHOOK_SECRET to that same value.
+    Fails closed: no configured secret, or a mismatched/missing header,
+    both reject rather than accept an unauthenticated suppression claim.
+
+    Always returns 200 once authenticated, even for an event this module
+    ignores — a 4xx/5xx would make Instantly retry a payload we understood
+    and deliberately chose not to act on, which is not a delivery failure.
+    """
+    from src.services.webhook_log import log_webhook_event, already_logged
+    from src.services.relay.bounce_webhook import handle_event
+
+    s = get_settings()
+    configured_secret = s.instantly_webhook_secret.get_secret_value() if s.instantly_webhook_secret else None
+    provided_secret = request.headers.get("X-Instantly-Webhook-Secret")
+    if not configured_secret or not provided_secret or not hmac.compare_digest(configured_secret, provided_secret):
+        log_webhook_event(
+            source="instantly", event_type="unknown", status="failed",
+            status_detail="secret_verification_failed",
+        )
+        raise HTTPException(status_code=403, detail="Invalid webhook secret")
+
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        logger.warning("Instantly webhook body not JSON-decodable: %s", exc)
+        log_webhook_event(source="instantly", event_type="unknown", status="failed",
+                           status_detail="invalid_json")
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Invalid payload shape")
+
+    event_type = (payload.get("event_type") or payload.get("event") or "unknown")
+    event_id = payload.get("event_id") or payload.get("id")
+
+    if event_id and already_logged("instantly", str(event_id)):
+        log_webhook_event(source="instantly", event_type=event_type, source_event_id=event_id,
+                           status="duplicate", db=db)
+        return {"status": "ok"}
+
+    try:
+        acted = handle_event(db, payload)
+        log_webhook_event(
+            source="instantly", event_type=event_type, source_event_id=event_id,
+            status="processed" if acted else "skipped",
+            payload=payload, payload_kind="instantly", db=db,
+        )
+    except Exception:
+        logger.error("[instantly_webhook] handler error for event_type=%s", event_type, exc_info=True)
+        log_webhook_event(source="instantly", event_type=event_type, source_event_id=event_id,
+                           status="failed", status_detail="handler_error")
+        # Still 200: an unhandled exception here means our own bug, not a
+        # delivery failure Instantly should retry into the same bug.
+        return {"status": "ok"}
+
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
 # POST /webhooks/aircall — Closer Cockpit call capture (Sprint S1b)
 # Events: call.ended, transcription.created, sentiment.created, topics.created.
 # HMAC-verified, returns 200 fast; updates closer_calls and (on transcript)
