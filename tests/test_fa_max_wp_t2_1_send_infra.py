@@ -146,6 +146,107 @@ def test_fa_max_send_governance_only_imported_by_relay():
     )
 
 
+# Item 2 (WP-T2-1 go-live review, 2026-09): the two checks above close two
+# narrower gaps -- a raw vendor call, and a governance-module import -- but
+# neither catches a NEW file that is FA-Max-aware (imports FA Max's own
+# durable-state/governance/model symbols) and ALSO calls the *compliant*
+# wrapper (sms_compliance.send_sms / instantly_service.add_leads) directly,
+# skipping relay.enqueue() -> guards.evaluate() entirely. That wrapper can't
+# be banned outright -- ~15 unrelated Lifecycle/subscriber features call it
+# legitimately for their own, non-FA-Max traffic (verified: none of them
+# import any FA-Max-specific module or model). So the enforceable invariant
+# is narrower and real: a file that is BOTH FA-Max-aware AND calls a raw
+# send function, outside the two sanctioned dispatchers, is forbidden.
+#
+# This is still static analysis, not a runtime capability system -- Python
+# has no way to prove a call chain actually crossed guards.evaluate() without
+# either a forgeable caller-supplied flag (rejected: any caller can set a
+# flag) or restricting who may call the pure governance/gate functions
+# (rejected: this repo's own tests call those functions directly for unit
+# coverage -- see test_fa_max_wp2.py -- restricting their callers would
+# either break that pattern or, if test files are allowlisted, not actually
+# guard anything, since a bypass simply never calls the gate it's skipping
+# in the first place). A determined future engineer who hardcodes a phone
+# number instead of reading it from an FA-Max table would not be caught by
+# this check -- documented here, not silently assumed away.
+_FA_MAX_SIGNAL_MODULES = {
+    "src.services.fa_max_send_governance",
+    "src.services.state_engine",  # WP-1 durable state engine — FA Max only
+}
+_FA_MAX_SANCTIONED_SENDERS = {
+    "src/services/relay/channels_sms.py",
+    "src/services/relay/channels_email.py",
+    "src/services/fa_max_send_governance.py",  # governance module itself
+    "src/services/state_engine.py",
+    "src/services/relay/guards.py",
+    "src/services/relay/queue.py",
+    "src/services/relay/fakes.py",  # test doubles, never touch a real vendor
+    # File-level granularity limitation, verified by hand: admin_router.py is
+    # a large shared router. Its FA-Max-awareness comes from
+    # _handle_relay_decision (imports state_engine for the Slack
+    # approve/reject -> transition() flow) -- a DIFFERENT function from the
+    # one that calls send_sms() (the Lifecycle marketing-message approval
+    # endpoint at "/lifecycle-messages/approve", message_type="marketing",
+    # subscriber_id-scoped -- unrelated to FA Max). This check can't see
+    # function boundaries, only file-level imports+calls; a real per-file
+    # split would remove the need for this entry.
+    "src/api/admin_router.py",
+}
+_RAW_SEND_CALL_NAMES = {"send_message", "send_sms", "add_leads"}
+
+
+def _is_fa_max_aware(tree: ast.AST) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module in _FA_MAX_SIGNAL_MODULES:
+            return True
+        if isinstance(node, ast.Import) and any(
+            alias.name in _FA_MAX_SIGNAL_MODULES for alias in node.names
+        ):
+            return True
+        # src.core.models is imported broadly for unrelated reasons; only
+        # count it as an FA Max signal when a FaMax* symbol is actually
+        # pulled from it.
+        if isinstance(node, ast.ImportFrom) and node.module == "src.core.models":
+            if any(alias.name.startswith("FaMax") for alias in node.names):
+                return True
+    return False
+
+
+def _calls_any_raw_send(tree: ast.AST) -> str | None:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+            if name in _RAW_SEND_CALL_NAMES:
+                return name
+    return None
+
+
+def test_no_fa_max_aware_direct_send_callers():
+    """A file that reads FA Max's own governance/durable-state modules and
+    ALSO calls a raw send function outside the two sanctioned dispatchers is
+    exactly the shape of a future feature built without going through
+    relay.enqueue() -> guards.evaluate() -> channels_sms.py/channels_email.py
+    -- it would skip the 10DLC gate, the backlog-release gate, and FA Max
+    consent entirely. See the module-level comment above for what this check
+    can and cannot prove."""
+    offenders = []
+    for rel, path in _iter_python_files(exclude=_FA_MAX_SANCTIONED_SENDERS):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        if not _is_fa_max_aware(tree):
+            continue
+        hit = _calls_any_raw_send(tree)
+        if hit:
+            offenders.append(f"{rel} is FA-Max-aware and calls {hit}(...)")
+    assert not offenders, (
+        "New FA-Max-aware direct send caller(s) found outside the sanctioned "
+        "relay dispatchers -- route through relay.enqueue() -> "
+        "channels_sms.py/channels_email.py instead, or add to "
+        "_FA_MAX_SANCTIONED_SENDERS with a documented reason:\n"
+        + "\n".join(offenders)
+    )
+
+
 def test_sms_channel_is_registered():
     import src.services.relay.channels_sms  # noqa: F401
     from src.services.relay.channels import DISPATCHERS
@@ -260,7 +361,7 @@ def test_sweep_defers_whole_batch_on_suppression_sync_failure(monkeypatch):
 
     claimed = []
     monkeypatch.setattr(sweep, "sync_unsubscribes", _boom)
-    monkeypatch.setattr(sweep, "post_exceptions_alert", lambda **kw: True)
+    monkeypatch.setattr(sweep.exceptions_alert_queue, "enqueue_and_attempt", lambda **kw: True)
     monkeypatch.setattr(sweep.queue, "approved_batch", lambda **kw: [object(), object()])
 
     def _fail_if_called(*a, **kw):
@@ -283,3 +384,43 @@ def test_fake_receipts_never_claim_delivery():
     receipt = FAKE_SMS.send(to="+15550001111", body="hi")
     assert receipt.accepted is True
     assert receipt.delivered is None
+
+
+def test_fa_max_aware_direct_sender_detector_catches_a_synthetic_bypass():
+    """test_no_fa_max_aware_direct_send_callers proves today's repo is clean;
+    this proves the DETECTOR itself would actually catch the bypass shape it
+    claims to catch, rather than just happening to pass because nothing in
+    the current tree triggers it. Parses synthetic source text directly --
+    no real file needs to exist on disk for this."""
+    bypass_source = (
+        "from src.services.fa_max_send_governance import require_consent\n"
+        "from src.services import sms_compliance\n"
+        "def notify_borrower(phone, body, db):\n"
+        "    sms_compliance.send_sms(phone, body, db, message_type='transactional')\n"
+    )
+    tree = ast.parse(bypass_source, filename="<synthetic-bypass>")
+    assert _is_fa_max_aware(tree) is True
+    assert _calls_any_raw_send(tree) == "send_sms"
+
+    # Sanity check: a file that's FA-Max-aware but never sends is fine --
+    # e.g. a state-machine read/decision function with no send call.
+    aware_but_safe_source = (
+        "from src.services.state_engine import get_person_state\n"
+        "def check(person_id, db):\n"
+        "    return get_person_state(session=db, person_id=person_id)\n"
+    )
+    tree = ast.parse(aware_but_safe_source, filename="<synthetic-safe>")
+    assert _is_fa_max_aware(tree) is True
+    assert _calls_any_raw_send(tree) is None
+
+    # Sanity check: a file that sends but has no FA Max awareness at all
+    # (the ~15 legitimate Lifecycle/subscriber callers' actual shape) is
+    # correctly not flagged.
+    unrelated_sender_source = (
+        "from src.services import sms_compliance\n"
+        "def notify_subscriber(phone, body, db, subscriber_id):\n"
+        "    sms_compliance.send_sms(phone, body, db, message_type='marketing', "
+        "subscriber_id=subscriber_id)\n"
+    )
+    tree = ast.parse(unrelated_sender_source, filename="<synthetic-unrelated>")
+    assert _is_fa_max_aware(tree) is False

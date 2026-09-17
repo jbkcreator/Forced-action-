@@ -43,14 +43,48 @@ logger = logging.getLogger(__name__)
 
 _SUPPRESS_ON_STATUS = {"unsubscribed", "bounced"}
 
-# NOTE (production-execution review, finding 4): Instantly's lead status
-# vocabulary (see instantly_service._LEAD_STATUS_MAP) has "bounced" and
-# "unsubscribed" but no distinct spam-complaint status — this poll cannot
-# ingest complaints today. Do not treat this module as complaint-complete;
-# it is a live-lane blocker (WP-T2-1 Done When: "complaint event ingestion:
-# spam complaints auto-suppress immediately"). The actual provider event/API
-# contract for complaints needs checking before any complaint-ingestion code
-# is written — the wrong assumption here would silently under-suppress.
+# NOTE (production-execution review, finding 4; investigated WP-T2-1
+# go-live review, 2026-09): Instantly's lead status vocabulary (see
+# instantly_service._LEAD_STATUS_MAP) has "bounced" and "unsubscribed" but
+# no distinct spam-complaint status — this poll cannot ingest complaints
+# today. Do not treat this module as complaint-complete; it is a live-lane
+# blocker (WP-T2-1 Done When: "complaint event ingestion: spam complaints
+# auto-suppress immediately").
+#
+# Investigation findings (public API v2 docs, 2026-09 — re-verify against
+# this account's actual plan/webhook config before building anything, since
+# public docs alone can't confirm account-level availability):
+#   - Instantly's documented webhook event catalog
+#     (https://developer.instantly.ai/guides/webhook-events) has
+#     `email_bounced` and `lead_unsubscribed` events but NO distinct
+#     spam-complaint/FBL event type. Confirmed precisely, not overstated
+#     (code-review finding, 2026-09 -- an earlier version of this comment
+#     said "permanent... unless Instantly adds one," which is internally
+#     contradictory and too narrow a claim anyway): this establishes only
+#     that INSTANTLY'S OWN API doesn't expose a complaint signal today, not
+#     that complaint data is unobtainable by any means. Complaint feedback
+#     loops (FBL) commonly exist independent of the ESP entirely -- e.g.
+#     Microsoft's JMRP delivers a per-complaint ARF report directly to a
+#     registered address for Outlook/Hotmail/Live/MSN complaints, and
+#     Gmail's Postmaster Tools API exposes an aggregate daily spam-rate
+#     metric -- neither investigated here, both a genuinely separate path
+#     from anything Instantly does or doesn't add to its API. Until one of
+#     these is investigated and either wired up or ruled out, treat
+#     complaint ingestion as unimplemented and undecided, not as a settled
+#     dead end -- and do not infer complaint data from bounce rate, warmup
+#     score, or Relay's own failure rate (those measure different things
+#     and would silently misclassify).
+#   - The SAME webhook catalog DOES expose `email_bounced`, which would let
+#     hard-bounce suppression become immediate (webhook-driven) instead of
+#     this module's current ~30-min poll -- a real, separate improvement
+#     opportunity from the complaint gap above. NOT implemented here:
+#     Instantly's docs state webhooks require the Hypergrowth plan ($97/mo)
+#     or higher, and this codebase has no way to confirm this account's
+#     actual plan/webhook configuration without live account access. Building
+#     a webhook endpoint (mirroring src/api/main.py's existing Telnyx
+#     message.finalized pattern at line ~5587) is a well-specified follow-up
+#     once that one fact is confirmed -- not blocked on API capability
+#     research anymore, only on an account-level confirmation.
 
 
 @dataclass(frozen=True)

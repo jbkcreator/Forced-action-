@@ -58,7 +58,10 @@ def test_sync_failure_defers_the_batch(monkeypatch):
     monkeypatch.setattr(sweep, "sync_unsubscribes", _raiser)
     monkeypatch.setattr(sweep.queue, "approved_batch", lambda limit=50, venture_key=None: [SimpleNamespace(id=1), SimpleNamespace(id=2)])
     alerts = []
-    monkeypatch.setattr(sweep, "post_exceptions_alert", lambda **kw: alerts.append(kw) or True)
+    monkeypatch.setattr(
+        sweep.exceptions_alert_queue, "enqueue_and_attempt",
+        lambda **kw: alerts.append(kw) or True,
+    )
     executed = []
     monkeypatch.setattr(sweep, "execute_batch", lambda *a, **k: executed.append((a, k)))
 

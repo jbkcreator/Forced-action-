@@ -12,9 +12,9 @@ import logging
 import uuid
 
 from config.venture_template import DEFAULT_VENTURE_KEY
-from src.services.relay import queue
+from src.services.relay import exceptions_alert_queue, queue
 from src.services.relay.engine import BatchResult, execute_batch
-from src.services.relay.slack_post import post_completion_receipt, post_exceptions_alert
+from src.services.relay.slack_post import post_completion_receipt
 from src.services.relay.suppression_sync import SuppressionSyncFailed, sync_unsubscribes
 from src.utils.venture_config import get_venture_config
 
@@ -80,7 +80,12 @@ def run_sweep(*, limit: int = 50, venture_key: str = DEFAULT_VENTURE_KEY) -> Bat
         # one of the two ever executes per run_sweep() call, since this one
         # returns immediately.
         logger.error("[Relay] unsubscribe sync failed — deferring batch for venture %s: %s", venture_key, exc)
-        post_exceptions_alert(
+        # Durable (WP-T2-1 go-live review, 2026-09): a sustained Instantly
+        # outage means this branch fires every ~30-min sweep tick until it
+        # recovers -- exceptions_alert_queue's own dedup (not this call
+        # site) is what stops that from creating a new pending row every
+        # tick; see its module docstring.
+        exceptions_alert_queue.enqueue_and_attempt(
             venture_key=venture_key,
             rule="relay_suppression_sync_failed",
             message=f"Suppression sync failed for venture {venture_key}; batch deferred to avoid sending against a possibly stale suppression list.\n{exc}",

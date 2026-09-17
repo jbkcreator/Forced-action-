@@ -2,28 +2,37 @@
 FA Max send-infrastructure health monitor (WP-T2-1).
 
 WP-T2-1's own Done-When line is "sustained inbox placement above 95% at
-target volume" — genuine inbox-placement measurement requires a seed-list
-provider (e.g. GlockApps, 250ok). No such integration exists in this repo,
-and SOT.md Part 6's integration inventory does not list one. This monitor
-does NOT claim to measure placement; it is a proxy built from what the
-existing stack actually observes:
+target volume" — this monitor does NOT measure that; it is a proxy built
+from what the existing stack already observes:
 
-  - Instantly warmup health score for the FA Max passthrough campaign's
-    connected mailbox(es) (same signal email_deliverability_monitor.py
-    already uses for the rest of the platform).
+  - Instantly warmup health score for the FA Max venture's own sending
+    mailbox specifically (see _warmup_trip -- scoped by
+    venture.relay_instantly_sender_email since 2026-09; previously checked
+    every connected Instantly account fleet-wide, a real bug an unrelated
+    venture's mailbox could have tripped or masked).
   - Relay's own observed bounce/skip rate for 'sent' vs 'failed'/'skipped'
     FA Max items over the trailing window (src.services.relay.queue).
 
-True placement measurement is a live-lane blocker, not a code gap — it
-needs a client/vendor decision on a seed-list provider before it can be
-built at all. Do not wire this monitor's output into a "Done" claim for the
-95% placement criterion.
+Real placement measurement (correction, 2026-09 go-live review: an earlier
+version of this docstring said it needs a separate seed-list vendor and
+cannot be built from this repo at all -- that was wrong) is buildable via
+Instantly's own documented Inbox Placement Analytics API
+(developer.instantly.ai/api-reference/groups/inbox-placement-analytics),
+pending confirmation of (1) account entitlement to Instantly's separate
+"Inbox Placement" plan and (2) whether seed-list-style sampling (this
+feature's actual methodology, same as any third-party alternative) is what
+the client means by "at target volume." See docs/fa-max-go-live.md Step 6
+for both open items. Do not wire this monitor's proxy output into a "Done"
+claim for the 95% placement criterion either way.
 
-Alerts post to the FA Max EXCEPTIONS Slack lane (WP-2's queue), with the
-same durable dedup this repo already uses for scraper ops alerts
-(ScraperAlertLog, ALERT_DEDUP_WINDOW_HOURS) — a page is only recorded as
-delivered if post_exceptions_alert() actually succeeded, so a Slack outage
-leaves the trip eligible for the next run rather than silently dropped.
+Alerts route through src.services.relay.exceptions_alert_queue (WP-T2-1
+go-live review, 2026-09): a row is durably committed BEFORE Slack is ever
+called, so a Slack outage OR a process crash mid-attempt leaves the alert
+recoverable by the drain worker (src/tasks/fa_max_exceptions_alert_drain.py)
+rather than silently dropped. That module also owns the "don't re-page the
+same condition within N hours" dedup — this monitor no longer keeps its own
+separate ScraperAlertLog-based dedup for that purpose (removed here to avoid
+two divergent sources of truth for "was this recently alerted").
 """
 from __future__ import annotations
 
@@ -37,7 +46,7 @@ from sqlalchemy import text
 
 from src.core.database import get_db_context
 from src.services import instantly_service
-from src.services.relay.slack_post import post_exceptions_alert
+from src.services.relay import exceptions_alert_queue
 from src.utils.venture_config import get_venture_config
 
 logger = logging.getLogger(__name__)
@@ -47,7 +56,6 @@ WARMUP_SCORE_FLOOR = 70
 ROLLING_HOURS = 24
 MIN_SENT_FLOOR = 10
 FAILURE_RATE_CONCERN = 0.10
-ALERT_DEDUP_WINDOW_HOURS = 12
 
 
 @dataclass
@@ -56,27 +64,48 @@ class Trip:
     detail: str
 
 
-def _warmup_trip(campaign_id: Optional[str]) -> Optional[Trip]:
-    if not campaign_id:
+def _warmup_trip(campaign_id: Optional[str], sender_email: Optional[str]) -> Optional[Trip]:
+    """WP-T2-1 go-live review (2026-09) fix: instantly_service.list_accounts()
+    is genuinely fleet-wide (GET /api/v2/accounts, no campaign filter) --
+    this function used to call it unconditionally and check warmup health on
+    EVERY connected mailbox in the whole Instantly workspace, only using
+    campaign_id to decide whether to run at all. That meant an unrelated
+    venture's mailbox warming up could trip an FA Max EXCEPTIONS alert, and
+    a genuinely unhealthy FA Max mailbox could be masked by an unrelated
+    healthy one averaging into "not unhealthy" — the result proved nothing
+    about FA Max specifically.
+
+    Scoped instead to venture.relay_instantly_sender_email -- the one
+    sending mailbox this repo's own data model actually tracks per venture
+    (see src/utils/venture_config.py; it's a single str field, not a list,
+    so this repo has no multi-mailbox model to scope against yet regardless
+    of what Instantly's account-campaign-mapping API might otherwise allow).
+    """
+    if not campaign_id or not sender_email:
         return None
     accounts = instantly_service.list_accounts()
-    emails = [a.get("email") for a in accounts if a.get("email")]
-    if not emails:
-        return None
-    warmup_by_email = {
+    all_emails = {a.get("email") for a in accounts if a.get("email")}
+    sender_email_lower = sender_email.strip().lower()
+    matched = next((e for e in all_emails if e.strip().lower() == sender_email_lower), None)
+    if matched is None:
+        return Trip(
+            rule="fa_max_sender_mailbox_not_found",
+            detail=f"Configured sender {sender_email!r} not found among "
+                   f"{len(all_emails)} connected Instantly account(s) -- warmup "
+                   f"cannot be checked for a mailbox Instantly doesn't report.",
+        )
+    warmup = {
         item.get("email"): item
-        for item in instantly_service.get_warmup_analytics(emails)
+        for item in instantly_service.get_warmup_analytics([matched])
         if item.get("email")
     }
-    unhealthy = [
-        email for email in emails
-        if int((warmup_by_email.get(email) or {}).get("health_score") or 0) < WARMUP_SCORE_FLOOR
-    ]
-    if not unhealthy:
+    score = int((warmup.get(matched) or {}).get("health_score") or 0)
+    if score >= WARMUP_SCORE_FLOOR:
         return None
     return Trip(
         rule="fa_max_warmup_score_low",
-        detail=f"Mailbox(es) below warmup floor {WARMUP_SCORE_FLOOR}: {', '.join(unhealthy)} "
+        detail=f"FA Max sending mailbox {matched!r} warmup score {score} is below "
+               f"floor {WARMUP_SCORE_FLOOR} "
                f"(proxy only — not a placement measurement, see module docstring)",
     )
 
@@ -111,27 +140,10 @@ def evaluate(*, now: Optional[datetime] = None) -> list[Trip]:
     now = now or datetime.now(timezone.utc)
     trips: list[Trip] = []
     venture = get_venture_config(FA_MAX_VENTURE)
-    trips.append(_warmup_trip(venture.relay_instantly_campaign_id))
+    trips.append(_warmup_trip(venture.relay_instantly_campaign_id, venture.relay_instantly_sender_email))
     with get_db_context() as session:
         trips.append(_relay_failure_trip(session, now))
     return [t for t in trips if t is not None]
-
-
-def _recently_paged(session, rule: str) -> bool:
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=ALERT_DEDUP_WINDOW_HOURS)
-    existing = session.execute(
-        text(
-            "SELECT id FROM scraper_alert_log "
-            "WHERE alert_type = :rule AND county_id = :venture AND alerted_at >= :cutoff LIMIT 1"
-        ),
-        {"rule": rule, "venture": FA_MAX_VENTURE, "cutoff": cutoff},
-    ).first()
-    return existing is not None
-
-
-def _record_paged(session, rule: str) -> None:
-    from src.core.models import ScraperAlertLog
-    session.add(ScraperAlertLog(source_type=rule, county_id=FA_MAX_VENTURE, alert_type=rule))
 
 
 def run_and_page(*, dry_run: bool = False) -> list[Trip]:
@@ -140,19 +152,19 @@ def run_and_page(*, dry_run: bool = False) -> list[Trip]:
         logger.info("[fa_max_send_health] no trips")
         return []
 
-    with get_db_context() as session:
-        for trip in trips:
-            if _recently_paged(session, trip.rule):
-                logger.info("[fa_max_send_health] %s already paged in last %dh", trip.rule, ALERT_DEDUP_WINDOW_HOURS)
-                continue
-            if dry_run:
-                logger.info("[fa_max_send_health][DRY] would page %s: %s", trip.rule, trip.detail)
-                continue
-            if post_exceptions_alert(venture_key=FA_MAX_VENTURE, rule=trip.rule, message=trip.detail):
-                _record_paged(session, trip.rule)
-            else:
-                logger.error("[fa_max_send_health] alert for %s NOT delivered — left eligible for next run", trip.rule)
-        session.commit()
+    for trip in trips:
+        if dry_run:
+            logger.info("[fa_max_send_health][DRY] would page %s: %s", trip.rule, trip.detail)
+            continue
+        # Dedup (skip if already pending/recently sent) and durability are
+        # both exceptions_alert_queue's responsibility now — see module
+        # docstring. A False return here means either "deduped, nothing new
+        # queued" or "queued but this immediate attempt failed"; either way
+        # the drain worker's next tick is the correct place to look, not a
+        # retry here.
+        exceptions_alert_queue.enqueue_and_attempt(
+            venture_key=FA_MAX_VENTURE, rule=trip.rule, message=trip.detail,
+        )
     return trips
 
 
