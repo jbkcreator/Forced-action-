@@ -876,6 +876,12 @@ COUNTY_ID=hillsborough
 30 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.hunter_nightly_sweep --county-id $COUNTY_ID
 31 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.hunter_nightly_sweep --county-id pinellas
 
+# WP-5B — FA Max borrower buy-box, velocity, and next-need profile sweep.
+# Runs at 08:45 UTC — after hunter_nightly_sweep (08:30-08:31) refreshes
+# BuyerEntity cadence/portfolio data which this sweep reads.
+# Single run covers all counties (profiles are keyed on fa_max_persons, not county).
+45 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.fa_max_profile_sweep
+
 # NBRA opportunity-score population (REVINT I1) — fills opportunity_scores from
 # freshly-refreshed whale flags so get_ranked_queue() has rows to rank. Must run
 # AFTER hunter_nightly_sweep (above) which updates whale flags.

@@ -787,11 +787,56 @@ def _do_transition(
         "State transition: %s %s %s->%s by %s (event=%s)",
         entity_type, entity_uuid, from_state, to_state, actor, event_row.event_id,
     )
+
+    # WP-5B: queue a profile recompute whenever an opportunity reaches a
+    # material state (funded or matured) so the buy-box prediction stays fresh.
+    # Isolated in its own savepoint so a failure here never poisons the
+    # surrounding transaction that already committed the state transition above.
+    _maybe_enqueue_profile_recompute(
+        session=session,
+        entity_type=entity_type,
+        to_state=to_state,
+        person_id=derived_person_id,
+    )
+
     return TransitionResult(
         outcome=TransitionOutcome.succeeded,
         current_state=to_state,
         event_id=event_row.event_id,
     )
+
+
+_OPPORTUNITY_RECOMPUTE_STATES = frozenset({"funded", "matured"})
+
+
+def _maybe_enqueue_profile_recompute(
+    *,
+    session: Session,
+    entity_type: str,
+    to_state: str,
+    person_id: Optional[str],
+) -> None:
+    """Queue a WP-5B profile recompute when a material opportunity event fires.
+
+    Only opportunity entities reaching funded/matured states trigger a recompute —
+    those are the events most likely to shift the cadence or next-need prediction.
+    Fails silently so a queue insert failure never blocks the state transition.
+    """
+    if entity_type != "opportunity" or to_state not in _OPPORTUNITY_RECOMPUTE_STATES:
+        return
+    if not person_id:
+        return
+    sp = session.begin_nested()
+    try:
+        from src.services.borrower_profile_service import schedule_profile_recompute
+        schedule_profile_recompute(session, person_id, reason=f"opportunity_transition:{to_state}")
+        sp.commit()
+    except Exception:
+        sp.rollback()
+        logger.warning(
+            "Failed to enqueue profile recompute for person %s after opportunity->%s",
+            person_id, to_state, exc_info=True,
+        )
 
 
 def make_idempotency_key(
@@ -859,6 +904,21 @@ def write_interaction(
             "body_redacted": body_redacted,
         },
     ).fetchone()
+
+    # WP-5B: new interaction may shift next-need prediction; enqueue recompute.
+    # Savepoint isolates this so a failure never aborts the interaction insert above.
+    sp = session.begin_nested()
+    try:
+        from src.services.borrower_profile_service import schedule_profile_recompute
+        schedule_profile_recompute(session, person_id, reason="new_interaction")
+        sp.commit()
+    except Exception:
+        sp.rollback()
+        logger.warning(
+            "Failed to enqueue profile recompute for person %s after write_interaction",
+            person_id, exc_info=True,
+        )
+
     return row.interaction_id  # type: ignore[union-attr]
 
 
