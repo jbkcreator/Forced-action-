@@ -38,10 +38,11 @@ import uuid
 from config.venture_template import DEFAULT_VENTURE_KEY
 from src.utils.logger import setup_logging
 
-# Import for its registration side effect only — makes the real 'email'
-# channel available in DISPATCHERS before any --sweep/--seed runs (R1's
-# channels.py ships only the 'noop' test channel).
+# Import for their registration side effect only — makes the real 'email'
+# and 'sms' (WP-T2-1) channels available in DISPATCHERS before any
+# --sweep/--seed runs (R1's channels.py ships only the 'noop' test channel).
 import src.services.relay.channels_email  # noqa: F401
+import src.services.relay.channels_sms  # noqa: F401
 
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")

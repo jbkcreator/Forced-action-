@@ -2,8 +2,14 @@
 Tests for src.services.relay.sweep (RELAY-v2.2 sub-tasks R1 + R3).
 
 R3 addition under test: run_sweep() calls sync_unsubscribes() before
-execute_batch(), and a failure in that sync must never stop already-approved
-items from being sent.
+execute_batch().
+
+WP-T2-1 (production-execution review finding 3): a sync FAILURE
+(SuppressionSyncFailed) must now defer the whole batch rather than execute
+it against a possibly stale suppression list -- the opposite of R3's
+original "must never stop already-approved sends" rule, which conflated an
+unconfigured venture (not an error) with a genuine poll failure (a reason
+to hold off). See test_sync_failure_defers_the_batch below.
 
 PR #195 review addition: run_sweep() must refuse to execute a batch for a
 deactivated venture (ventures.is_active = false) rather than dispatch its
@@ -14,10 +20,15 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from src.services.relay import sweep
+from src.services.relay.suppression_sync import SuppressionSyncFailed, SyncResult
+
+
+def _synced(count: int = 0):
+    return lambda venture_key=None: SyncResult(status="synced", count=count)
 
 
 def test_sweep_returns_empty_result_with_no_approved_items(monkeypatch):
-    monkeypatch.setattr(sweep, "sync_unsubscribes", lambda venture_key=None: 0)
+    monkeypatch.setattr(sweep, "sync_unsubscribes", _synced())
     monkeypatch.setattr(sweep.queue, "approved_batch", lambda limit=50, venture_key=None: [])
 
     result = sweep.run_sweep()
@@ -28,7 +39,7 @@ def test_sweep_returns_empty_result_with_no_approved_items(monkeypatch):
 
 def test_sweep_calls_sync_before_execute(monkeypatch):
     order = []
-    monkeypatch.setattr(sweep, "sync_unsubscribes", lambda venture_key=None: order.append("sync") or 0)
+    monkeypatch.setattr(sweep, "sync_unsubscribes", lambda venture_key=None: order.append("sync") or SyncResult(status="synced"))
     monkeypatch.setattr(sweep.queue, "approved_batch", lambda limit=50, venture_key=None: order.append("query") or [])
 
     sweep.run_sweep()
@@ -36,17 +47,28 @@ def test_sweep_calls_sync_before_execute(monkeypatch):
     assert order == ["sync", "query"]
 
 
-def test_sync_failure_does_not_stop_the_batch(monkeypatch):
-    """A dead Instantly API must not block already-approved sends."""
+def test_sync_failure_defers_the_batch(monkeypatch):
+    """A failed Instantly poll means this batch's suppression view may be
+    stale, so run_sweep() must defer (not execute) the whole batch and page
+    EXCEPTIONS -- reversed from R3's original 'never stop already-approved
+    sends' behavior (production-execution review finding 3)."""
     def _raiser(venture_key=None):
-        raise RuntimeError("Instantly API down")
+        raise SuppressionSyncFailed("Instantly API down")
 
     monkeypatch.setattr(sweep, "sync_unsubscribes", _raiser)
-    monkeypatch.setattr(sweep.queue, "approved_batch", lambda limit=50, venture_key=None: [])
+    monkeypatch.setattr(sweep.queue, "approved_batch", lambda limit=50, venture_key=None: [SimpleNamespace(id=1), SimpleNamespace(id=2)])
+    alerts = []
+    monkeypatch.setattr(sweep, "post_exceptions_alert", lambda **kw: alerts.append(kw) or True)
+    executed = []
+    monkeypatch.setattr(sweep, "execute_batch", lambda *a, **k: executed.append((a, k)))
 
     result = sweep.run_sweep()  # must not raise
 
+    assert executed == []  # never reached
     assert result.sent == 0
+    assert result.deferred == 2
+    assert len(alerts) == 1
+    assert alerts[0]["rule"] == "relay_suppression_sync_failed"
 
 
 def test_sweep_syncs_unsubscribes_for_its_own_venture(monkeypatch):
@@ -54,7 +76,7 @@ def test_sweep_syncs_unsubscribes_for_its_own_venture(monkeypatch):
     not a fleet-wide default — otherwise a second venture's unsubscribes
     would never be pulled in."""
     seen: list[str] = []
-    monkeypatch.setattr(sweep, "sync_unsubscribes", lambda venture_key=None: seen.append(venture_key) or 0)
+    monkeypatch.setattr(sweep, "sync_unsubscribes", lambda venture_key=None: seen.append(venture_key) or SyncResult(status="synced"))
     monkeypatch.setattr(sweep.queue, "approved_batch", lambda limit=50, venture_key=None: [])
 
     sweep.run_sweep(venture_key="venture_two")
@@ -67,7 +89,7 @@ def test_sweep_refuses_to_execute_for_a_deactivated_venture(monkeypatch):
     reach execute_batch, regardless of what its resolved config looks like
     -- this is the independent second gate on top of venture_config.py
     resolving a disabled config for it."""
-    monkeypatch.setattr(sweep, "sync_unsubscribes", lambda venture_key=None: 0)
+    monkeypatch.setattr(sweep, "sync_unsubscribes", _synced())
     monkeypatch.setattr(
         sweep.queue, "approved_batch",
         lambda limit=50, venture_key=None: [SimpleNamespace(id=1)],
@@ -89,7 +111,7 @@ def test_sweep_refuses_to_execute_for_a_deactivated_venture(monkeypatch):
 def test_sweep_still_executes_for_an_active_venture(monkeypatch):
     """Sanity check for the guard above: an active venture's batch must
     still reach execute_batch unchanged."""
-    monkeypatch.setattr(sweep, "sync_unsubscribes", lambda venture_key=None: 0)
+    monkeypatch.setattr(sweep, "sync_unsubscribes", _synced())
     monkeypatch.setattr(
         sweep.queue, "approved_batch",
         lambda limit=50, venture_key=None: [SimpleNamespace(id=1)],

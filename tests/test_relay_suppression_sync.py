@@ -30,7 +30,9 @@ def _patch_venture(monkeypatch, *, campaign_id: str | None = "camp-1"):
 def test_returns_zero_when_channel_not_configured(monkeypatch):
     _patch_venture(monkeypatch, campaign_id=None)
 
-    assert suppression_sync.sync_unsubscribes() == 0
+    result = suppression_sync.sync_unsubscribes()
+    assert result.status == "not_configured"
+    assert result.count == 0
 
 
 def test_suppresses_unsubscribed_and_bounced_leads(monkeypatch):
@@ -54,9 +56,10 @@ def test_suppresses_unsubscribed_and_bounced_leads(monkeypatch):
         lambda db, email, source: calls.append((email, source)),
     )
 
-    n = suppression_sync.sync_unsubscribes()
+    result = suppression_sync.sync_unsubscribes()
 
-    assert n == 2
+    assert result.status == "synced"
+    assert result.count == 2
     assert ("opted-out@example.com", "instantly_sync") in calls
     assert ("hard-bounced@example.com", "instantly_sync") in calls
     assert not any(e == "still-active@example.com" for e, _ in calls)
@@ -78,9 +81,10 @@ def test_paginates_until_no_cursor(monkeypatch):
     monkeypatch.setattr(suppression_sync.instantly, "list_leads", _fake_list_leads)
     monkeypatch.setattr(suppression_sync, "suppress_contact", lambda db, email, source: None)
 
-    n = suppression_sync.sync_unsubscribes()
+    result = suppression_sync.sync_unsubscribes()
 
-    assert n == 2
+    assert result.status == "synced"
+    assert result.count == 2
     assert calls_made == [None, "cursor-2"]
 
 
@@ -89,7 +93,9 @@ def test_stops_on_empty_page(monkeypatch):
     monkeypatch.setattr(suppression_sync.instantly, "list_leads", lambda *a, **k: {"leads": [], "next_starting_after": None})
     monkeypatch.setattr(suppression_sync, "suppress_contact", lambda **k: (_ for _ in ()).throw(AssertionError("should not be called")))
 
-    assert suppression_sync.sync_unsubscribes() == 0
+    result = suppression_sync.sync_unsubscribes()
+    assert result.status == "synced"
+    assert result.count == 0
 
 
 def test_stops_when_list_leads_returns_none(monkeypatch):
@@ -98,7 +104,9 @@ def test_stops_when_list_leads_returns_none(monkeypatch):
     _patch_venture(monkeypatch)
     monkeypatch.setattr(suppression_sync.instantly, "list_leads", lambda *a, **k: None)
 
-    assert suppression_sync.sync_unsubscribes() == 0
+    result = suppression_sync.sync_unsubscribes()
+    assert result.status == "synced"
+    assert result.count == 0
 
 
 def test_venture_key_defaults_to_venture_one(monkeypatch):
@@ -135,8 +143,9 @@ def test_scoped_to_the_given_venture(monkeypatch):
     calls = []
     monkeypatch.setattr(suppression_sync, "suppress_contact", lambda db, email, source: calls.append(email))
 
-    n = suppression_sync.sync_unsubscribes(venture_key="venture_two")
+    result = suppression_sync.sync_unsubscribes(venture_key="venture_two")
 
     assert seen == ["venture_two"]
-    assert n == 1
+    assert result.status == "synced"
+    assert result.count == 1
     assert calls == ["b@example.com"]

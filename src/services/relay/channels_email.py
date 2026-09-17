@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from html import escape as _html_escape
 
+from config.settings import get_settings
 from src.services import instantly_service as instantly
 from src.services.email_unsubscribe import unsubscribe_url
 from src.services.relay.channels import register
@@ -34,6 +35,8 @@ from src.services.relay.queue import QueueItem
 from src.utils.venture_config import get_venture_config
 
 PASSTHROUGH_CAMPAIGN_NAME = "Relay Passthrough (RELAY-v2.2 R2)"
+
+_FA_MAX_VENTURE = "fa_max_lending"
 
 
 def build_passthrough_body(body_text: str, recipient: str, venture) -> str:
@@ -68,6 +71,29 @@ def send_email(item: QueueItem) -> None:
     like a repeat of venture A's and fail.
     """
     venture = get_venture_config(item.venture_key)
+
+    subject = (item.payload or {}).get("subject", "")
+    body = (item.payload or {}).get("body", "")
+    if not body:
+        raise RuntimeError(f"item {item.id}: payload missing 'body' for email channel")
+
+    body = build_passthrough_body(body, item.recipient, venture)
+
+    if item.venture_key == _FA_MAX_VENTURE and get_settings().fa_max_relay_send_mode == "fake":
+        # WP-T2-1: the dedicated FA Max outreach domain/DNS/warmup is not
+        # live yet (client to confirm domain — split doc Q7/Q8). Every FA
+        # Max send goes through the same FakeMail recorder every other
+        # developer's tests use until fa_max_relay_send_mode flips to "live".
+        from src.services.relay.fakes import FAKE_MAIL
+
+        receipt = FAKE_MAIL.send(
+            recipient=item.recipient, subject=subject, body=body,
+            campaign_id=venture.relay_instantly_campaign_id or "fa_max_fake_campaign",
+        )
+        if not receipt.accepted:
+            raise RuntimeError(f"item {item.id}: fake email send refused ({receipt.reason})")
+        return
+
     campaign_id = venture.relay_instantly_campaign_id
     if not campaign_id:
         raise RuntimeError(
@@ -77,13 +103,6 @@ def send_email(item: QueueItem) -> None:
             f"the venture's ventures.relay_instantly_campaign_id (or, for "
             f"venture #1, RELAY_INSTANTLY_CAMPAIGN_ID in .env)"
         )
-
-    subject = (item.payload or {}).get("subject", "")
-    body = (item.payload or {}).get("body", "")
-    if not body:
-        raise RuntimeError(f"item {item.id}: payload missing 'body' for email channel")
-
-    body = build_passthrough_body(body, item.recipient, venture)
 
     result = instantly.add_leads(campaign_id, [{
         "email": item.recipient,

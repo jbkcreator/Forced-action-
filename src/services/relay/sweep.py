@@ -14,15 +14,16 @@ import uuid
 from config.venture_template import DEFAULT_VENTURE_KEY
 from src.services.relay import queue
 from src.services.relay.engine import BatchResult, execute_batch
-from src.services.relay.slack_post import post_completion_receipt
-from src.services.relay.suppression_sync import sync_unsubscribes
+from src.services.relay.slack_post import post_completion_receipt, post_exceptions_alert
+from src.services.relay.suppression_sync import SuppressionSyncFailed, sync_unsubscribes
 from src.utils.venture_config import get_venture_config
 
-# Import for its registration side effect only — makes the real 'email'
-# channel (RELAY-v2.2 R2) available in DISPATCHERS whenever this module is
-# imported directly (e.g. by a caller other than __main__.py, which
-# imports it too).
+# Import for their registration side effect only — makes the real 'email'
+# channel (RELAY-v2.2 R2) and the 'sms' channel (WP-T2-1) available in
+# DISPATCHERS whenever this module is imported directly (e.g. by a caller
+# other than __main__.py, which imports both too).
 import src.services.relay.channels_email  # noqa: F401,E402
+import src.services.relay.channels_sms  # noqa: F401,E402
 
 logger = logging.getLogger(__name__)
 
@@ -37,9 +38,18 @@ def run_sweep(*, limit: int = 50, venture_key: str = DEFAULT_VENTURE_KEY) -> Bat
     tick's guards.evaluate() suppression recheck runs. Scoped to this same
     venture_key (CLONE-v2.2 / CL3) since each venture sends through its own
     Instantly campaign — syncing the wrong one would leave a venture's real
-    unsubscribes unsuppressed. A dead Instantly API must not stop
-    already-approved sends, so failures here are logged and swallowed rather
-    than propagated.
+    unsubscribes unsuppressed.
+
+    (production-execution review, finding 3) A failed sync means this
+    batch's suppression view may be stale — the entire reason this sync
+    exists is to catch an opt-out landing in Instantly moments before this
+    sweep runs. Continuing to execute_batch() on a poll that just failed
+    would defeat that purpose silently. So a SuppressionSyncFailed here
+    defers the whole batch (approved rows are left completely untouched —
+    execute_batch() is never called, so nothing is claimed) and pages
+    EXCEPTIONS; the next sweep tick retries the sync and, if it recovers,
+    executes normally. A "not_configured" result (venture's email channel
+    genuinely isn't wired up yet) is not a failure and does not defer.
 
     One sweep run covers exactly one venture (CLONE-v2.2 / CL3): the batch
     is filtered to that venture's rows and executed under that venture's
@@ -55,11 +65,29 @@ def run_sweep(*, limit: int = 50, venture_key: str = DEFAULT_VENTURE_KEY) -> Bat
     to execute_batch for a venture that is supposed to be off.
     """
     try:
-        n = sync_unsubscribes(venture_key=venture_key)
-        if n:
-            logger.info("[Relay] sweep: synced %d new suppression(s) from Instantly", n)
-    except Exception:
-        logger.error("[Relay] unsubscribe sync failed — continuing to execute batch", exc_info=True)
+        result = sync_unsubscribes(venture_key=venture_key)
+        if result.status == "not_configured":
+            logger.info("[Relay] sweep: venture %s email channel not configured — skipping unsubscribe sync", venture_key)
+        elif result.count:
+            logger.info("[Relay] sweep: synced %d new suppression(s) from Instantly", result.count)
+    except SuppressionSyncFailed as exc:
+        # Sync must run and fail (or succeed) BEFORE the queue is even
+        # queried — test_sweep_calls_sync_before_execute pins this order,
+        # and a stale suppression view is the reason to defer before ever
+        # looking at what's approved, not after. The approved_batch() call
+        # below is therefore genuinely a separate one for this branch, not
+        # a redundant duplicate of the one after this try/except: exactly
+        # one of the two ever executes per run_sweep() call, since this one
+        # returns immediately.
+        logger.error("[Relay] unsubscribe sync failed — deferring batch for venture %s: %s", venture_key, exc)
+        post_exceptions_alert(
+            venture_key=venture_key,
+            rule="relay_suppression_sync_failed",
+            message=f"Suppression sync failed for venture {venture_key}; batch deferred to avoid sending against a possibly stale suppression list.\n{exc}",
+        )
+        deferred = BatchResult()
+        deferred.deferred = len(queue.approved_batch(limit=limit, venture_key=venture_key))
+        return deferred
 
     items = queue.approved_batch(limit=limit, venture_key=venture_key)
     if not items:

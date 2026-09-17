@@ -795,6 +795,15 @@ class AppSettings(BaseSettings):
 	fa_max_slack_channel_relationships: str = Field(default="", env="FA_MAX_SLACK_CHANNEL_RELATIONSHIPS")
 	fa_max_backflip_feed_max_age_hours: int = Field(default=24, ge=1, env="FA_MAX_BACKFLIP_FEED_MAX_AGE_HOURS")
 
+	# ── FA Max WP-T2-1 — Own-Lane Send Infrastructure ────────────────────────
+	# "fake" (default) = every FA Max relay send goes through the in-memory
+	# FakeInstantly/FakeTelnyx recorders in src/services/relay/fakes.py — no
+	# network, no credentials, safe for every developer's tests and for local
+	# dev. "live" = real Instantly/Telnyx calls. Flip only once the dedicated
+	# outreach domain, DNS auth, and 10DLC registration are confirmed; this
+	# flag does not itself replace the fa_max_10dlc_registered SMS gate below.
+	fa_max_relay_send_mode: str = Field(default="fake", env="FA_MAX_RELAY_SEND_MODE")
+
 
 @lru_cache
 def get_settings() -> AppSettings:
