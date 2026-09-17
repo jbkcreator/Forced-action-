@@ -11269,6 +11269,70 @@ class FaMaxWorkQueue(Base):
 
 
 # ============================================================================
+# WP-9 — DIAL-LIST FAILURE-BEHAVIOR STATE
+# ============================================================================
+
+
+class DialListSnapshot(Base):
+    """Last successful dial list, retained for safe cached fallback delivery."""
+
+    __tablename__ = "dial_list_snapshot"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
+    county_id: Mapped[Optional[str]] = mapped_column(Text)
+    generated_for: Mapped[date] = mapped_column(Date, nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("idx_dial_list_snapshot_county_date", "county_id", "generated_for"),
+    )
+
+
+class DialListTouch(Base):
+    """Durable audit record for each Called or Skip interaction."""
+
+    __tablename__ = "dial_list_touch"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
+    opportunity_thread_id: Mapped[Optional[str]] = mapped_column(Text)
+    property_id: Mapped[Optional[int]] = mapped_column(BigInteger)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    actor: Mapped[Optional[str]] = mapped_column(Text)
+    generation_date: Mapped[date] = mapped_column(Date, nullable=False)
+    touched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class DialListNeedsEnrichment(Base):
+    """Candidate held from the dial list until it has a verified phone number."""
+
+    __tablename__ = "dial_list_needs_enrichment"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
+    property_id: Mapped[int] = mapped_column(BigInteger, nullable=False, unique=True)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    first_seen: Mapped[date] = mapped_column(Date, nullable=False)
+    last_seen: Mapped[date] = mapped_column(Date, nullable=False)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+# ============================================================================
 # WP-5B — Borrower Buy Box, Velocity & Next-Need Prediction
 # ============================================================================
 

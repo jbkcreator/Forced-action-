@@ -1068,6 +1068,22 @@ COUNTY_ID=hillsborough
 # violation, since the live constraint permits only four status values.
 15 10 * * * $PROJECT/scripts/cron/run.sh src.tasks.learning_hygiene_sweep
 
+# WP-9 Dial List — daily ranked call list (FA MAX amendment 1).
+#
+# Assembles the day's financing-intent opportunities (cash purchases, stalled
+# flips, permits-no-financing, auction/probate, out-of-state, builder signals,
+# plus the financing-intent feed), ranks them by expected revenue, and posts
+# the top-N digest to the MONEY Slack channel so it's waiting before Josh's
+# morning calling block.
+#
+# 10:45 UTC — after the 04:00–08:15 scrape/CDS/skip-trace/enrichment chain, so
+# scores, contacts, and financing-intent are today's; and ahead of the 7 AM
+# Eastern calling block (mirrors new_distress_digest's morning delivery).
+#
+# Runs fleet-wide (no --county-id). Requires DIAL_LIST_SLACK_CHANNEL set;
+# unset = the job logs the list and no-ops the post (never fails).
+45 10 * * * $PROJECT/scripts/cron/run.sh src.tasks.dial_list_daily
+
 # WP-7 self-serve — mark sessions abandoned after 24h of inactivity. Dry-run
 # by default (see the task's own docstring); add --apply once confirmed.
 0 * * * * $PROJECT/scripts/cron/run.sh src.tasks.selfserve_abandonment_sweep

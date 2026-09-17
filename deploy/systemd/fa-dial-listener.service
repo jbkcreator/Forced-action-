@@ -1,0 +1,29 @@
+[Unit]
+Description=Forced Action Dial List action listener (Socket Mode)
+After=network.target fa-api.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/Forced-action-
+Environment="PATH=/root/Forced-action-/.venv/bin"
+EnvironmentFile=/root/Forced-action-/.env
+ExecStart=/root/Forced-action-/.venv/bin/python -m src.services.dial_list.action_listener
+
+# Restart on crash; back off after repeated failures
+Restart=always
+RestartSec=15
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fa-dial-listener
+
+[Install]
+WantedBy=multi-user.target

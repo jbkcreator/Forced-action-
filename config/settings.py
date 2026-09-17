@@ -659,6 +659,29 @@ class AppSettings(BaseSettings):
 	# review surface.
 	learning_hygiene_slack_channel: str = Field(default="", env="LEARNING_HYGIENE_SLACK_CHANNEL")
 
+	# WP-9 Dial List daily digest — the "MONEY" queue (FA MAX amendment 1).
+	# Reuses slack_bot_token above; its own channel, not cora_throughput's
+	# (cold-outreach draft approvals) nor relay's (per-item sends) — the dial
+	# list is a read-only ranked calling aid, a distinct review surface.
+	dial_list_slack_channel: str = Field(default="", env="DIAL_LIST_SLACK_CHANNEL")
+	# App-level token (xapp-…, scope connections:write) for the dial-list action
+	# listener's Socket Mode connection — only the interactive button/thread
+	# handler needs it; the read-only digest does not. Unset → listener no-ops.
+	dial_list_slack_app_token: Optional[SecretStr] = Field(
+		default=None, env="DIAL_LIST_SLACK_APP_TOKEN"
+	)
+	# The single operator (Josh) allowed to act on dial-list cards; a tap from
+	# anyone else is ignored. Unset → no gate (dev/local only).
+	dial_list_approver_user_id: str = Field(
+		default="", env="DIAL_LIST_APPROVER_USER_ID"
+	)
+	# A dial-list source (deeds, permits, foreclosures, tax_deed_auction,
+	# probate) whose last successful scraper run is older than this many days is
+	# flagged "stale" in the digest header (failure-behavior visibility).
+	dial_list_source_sla_days: int = Field(
+		default=2, env="DIAL_LIST_SOURCE_SLA_DAYS"
+	)
+
 	# Relay email channel (RELAY-v2.2 sub-task R2). relay_instantly_campaign_id
 	# is set once after running `python -m src.services.relay --setup-email-channel`
 	# (see src/services/relay/channels_email.py) — unset means the email
