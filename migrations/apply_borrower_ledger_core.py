@@ -34,7 +34,8 @@ def apply(engine=None):
                 amount          numeric(14, 2),
                 meta            jsonb,
                 created_at      timestamptz NOT NULL DEFAULT now(),
-                CONSTRAINT uq_ble_source UNIQUE (source_table, source_id),
+                CONSTRAINT uq_ble_source_event_entity
+                    UNIQUE (source_table, source_id, event_type, buyer_entity_id),
                 CONSTRAINT ck_ble_event_type CHECK (event_type IN (
                     'deed_acquisition','deed_sale',
                     'foreclosure_filed','foreclosure_resolved',

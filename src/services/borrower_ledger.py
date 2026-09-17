@@ -41,8 +41,9 @@ def record_event(
     meta: Optional[dict] = None,
 ) -> bool:
     """
-    Insert one borrower ledger event. Skips silently on (source_table, source_id)
-    conflict so the backfill and nightly sweeps are safe to re-run.
+    Insert one borrower ledger event. Skips silently when the same source,
+    event type, and borrower identity already exists, so ingestion is safe to
+    re-run while one deed can represent both a buyer acquisition and seller sale.
 
     Returns True if a row was inserted, False if it already existed.
     Does not commit — caller controls the transaction boundary.
@@ -55,7 +56,7 @@ def record_event(
             VALUES
                 (:buyer_entity_id, :event_type, :event_date, :property_id,
                  :source_table, :source_id, :summary, :amount, :meta)
-            ON CONFLICT (source_table, source_id) DO NOTHING
+            ON CONFLICT (source_table, source_id, event_type, buyer_entity_id) DO NOTHING
         """),
         {
             "buyer_entity_id": buyer_entity_id,
