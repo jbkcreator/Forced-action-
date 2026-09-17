@@ -170,12 +170,18 @@ def evaluate(item: QueueItem, *, now: datetime, venture=None) -> Verdict:
             # content or the underlying business decision behind them may
             # be stale by go-live, and guards.py's own freshness rechecks
             # (consent, suppression, campaign membership below) don't cover
-            # content staleness. This is a SEPARATE, deliberate operator
-            # confirmation an operator sets only after reviewing the
-            # backlog at go-live -- mirrors fa_max_10dlc_registered's
-            # manual, defaults-closed pattern. DEFER for the same reason as
-            # above: nothing approved is ever lost, only held until a human
-            # explicitly releases it.
+            # content staleness. DEFER for the same reason as above: nothing
+            # approved is ever lost, only held until this flag is set.
+            #
+            # This flag is NOT proof review happened (code-review
+            # clarification, fourth round) -- see the full go-live procedure
+            # documented on config/settings.py's
+            # fa_max_send_backlog_release_confirmed field. An item's earlier
+            # per-item Slack approval (decided_by/decided_at) is a different
+            # review, from before the lane was ready; it does not satisfy
+            # this one. Setting this flag true with no review having
+            # actually happened dispatches the entire backlog, oldest
+            # first, on the very next sweep tick.
             return Verdict(DEFER, REASON_FA_MAX_BACKLOG_RELEASE_NOT_CONFIRMED)
 
     # FA Max compliance check must run before suppression so 10DLC block

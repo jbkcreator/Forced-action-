@@ -810,10 +810,30 @@ class AppSettings(BaseSettings):
 	# fake mode -- their content or the underlying business decision behind
 	# them may be stale by go-live. This flag is a SEPARATE, deliberate
 	# confirmation (mirrors fa_max_10dlc_registered's manual, defaults-closed
-	# pattern): an operator reviews the backlog and explicitly sets this to
-	# true as its own go-live action, distinct from and after the send-mode
-	# flip. relay.guards defers every FA Max item, regardless of channel,
+	# pattern): relay.guards defers every FA Max item, regardless of channel,
 	# until BOTH this and fa_max_relay_send_mode == "live" are true.
+	#
+	# What this flag does NOT do (code-review clarification, fourth round):
+	# an earlier per-item Slack approval (relay_approval_queue.decided_by/
+	# decided_at/decision_interaction_id -- WP-2's existing MONEY-lane
+	# approve/reject flow) is NOT the same review this flag certifies. Josh
+	# may have approved a message weeks before the lane was even ready to
+	# send it. This flag only enforces that SOME go-live review happened; it
+	# does not perform or record one. Before setting it true, the operator
+	# enabling live sending must, as a manual go-live procedure (no UI or
+	# code support exists for this -- deliberately, per WP-T2-1's scope):
+	#   1. List every FA Max row still in 'approved' status (the backlog).
+	#   2. Check each one's content and original approval date for staleness.
+	#   3. Hold back or reject (via the existing Slack flow) anything stale
+	#      before flipping this flag -- once true, the very next sweep tick
+	#      dispatches every row still 'approved', oldest first, up to the
+	#      daily ceiling.
+	#   4. Record who ran this review and when, outside this flag (e.g. in
+	#      the go-live runbook/incident channel) -- this flag is a boolean,
+	#      not an audit trail.
+	# A real per-item release/reject mechanism was explicitly scoped OUT for
+	# WP-T2-1 (2026-09 decision) in favor of this manual procedure plus the
+	# single flag; do not read its existence as proof the review happened.
 	fa_max_send_backlog_release_confirmed: bool = Field(
 		default=False, env="FA_MAX_SEND_BACKLOG_RELEASE_CONFIRMED"
 	)
