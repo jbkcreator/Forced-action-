@@ -1,0 +1,103 @@
+"""WP-9 Dial List — scoring configuration.
+
+Every coefficient (Q9/Q10/Q11) is a config field, so the ranking is tuned by
+constructing a DialListConfig with overrides rather than editing the ranker.
+Defaults are starting points and should be validated against real outcomes
+before the list is trusted unattended.
+"""
+from __future__ import annotations
+
+from decimal import Decimal
+from typing import Dict
+
+from pydantic import BaseModel, Field, model_validator
+
+
+class DialListConfig(BaseModel):
+    """Config-driven coefficients for the expected-revenue ranking."""
+
+    list_size: int = Field(default=30, ge=1)
+
+    # probability ← financing intent tier; detector-only candidates take a floor
+    intent_probability: Dict[str, Decimal] = Field(
+        default_factory=lambda: {
+            "high": Decimal("0.50"),
+            "medium": Decimal("0.30"),
+            "low": Decimal("0.15"),
+        }
+    )
+    detector_only_probability_floor: Decimal = Field(default=Decimal("0.10"), gt=0)
+
+    # expected loan fallback when no ARV/max_ltc available
+    expected_loan_fallback_fraction: Decimal = Field(default=Decimal("0.70"), gt=0)
+    # sanity cap on the estimated loan — hard-money residential deals don't run
+    # to eight figures; without it a commercial-scale assessed value (or bad
+    # data) dominates the dollar-ranking. Estimates above this are clipped and
+    # flagged low-confidence.
+    max_expected_loan: Decimal = Field(default=Decimal("5000000"), gt=0)
+
+    # commission (permitted post client-Q18 — business-purpose hard money)
+    commission_rate: Decimal = Field(default=Decimal("0.015"), gt=0)
+
+    # per-trigger base urgency weight (higher = more time-sensitive)
+    urgency_weights: Dict[str, Decimal] = Field(
+        default_factory=lambda: {
+            "auction_probate": Decimal("1.5"),
+            "maturities": Decimal("1.4"),
+            "builder": Decimal("1.3"),
+            "cash_purchase": Decimal("1.2"),
+            "exchange_1031": Decimal("1.2"),
+            "price_drop": Decimal("1.1"),
+            "stalled_flip": Decimal("1.1"),
+            "permits_no_financing": Decimal("1.0"),
+            "financing_intent": Decimal("1.0"),
+            "expired_listing": Decimal("0.9"),
+            "out_of_state": Decimal("0.8"),
+        }
+    )
+
+    # --- config-gated triggers (client item 13, off by default) --------------
+    # maturities approaching: no true loan-maturity/term field exists. Heuristic
+    # source = legal_and_liens mortgage records (document_type ML) filed ~term
+    # months ago, assuming a typical hard-money term. Enable once real loan
+    # origination/maturity data lands.
+    enable_maturities_trigger: bool = False
+    maturity_assumed_term_months: int = Field(default=12, ge=1)
+    maturity_window_days: int = Field(default=60, ge=1)  # "approaching" band
+    # 1031 exchange: no dedicated field; only a weak deeds.grantee text signal
+    # (~3 rows fleet-wide today). Off until a real exchange signal exists.
+    enable_1031_trigger: bool = False
+    # price drops / expired investor listings: NO MLS/listing table exists at
+    # all. Declared here so they light up when a listing feed lands; there is no
+    # detector query to run until then.
+    enable_price_drop_trigger: bool = False
+    enable_expired_listing_trigger: bool = False
+    # a candidate with no recognised trigger urgency falls back to this
+    urgency_default: Decimal = Field(default=Decimal("1.0"), gt=0)
+    # date-proximity boost: an urgency_date within this window scales urgency up
+    # to (1 + urgency_recent_boost); older/absent dates get no boost.
+    urgency_recent_days: int = Field(default=90, ge=1)
+    urgency_recent_boost: Decimal = Field(default=Decimal("0.5"), ge=0)
+
+    # builder opportunities float above equal-dollar distress (Q10)
+    builder_multiplier: Decimal = Field(default=Decimal("1.5"), gt=0)
+
+    config_version: str = "wp9-1.0.0"
+
+    @model_validator(mode="after")
+    def _validate(self) -> "DialListConfig":
+        if not self.intent_probability:
+            raise ValueError("intent_probability must be non-empty")
+        for tier in ("high", "medium", "low"):
+            if tier not in self.intent_probability:
+                raise ValueError(f"intent_probability missing tier {tier!r}")
+        if any(v <= 0 for v in self.intent_probability.values()):
+            raise ValueError("intent_probability values must be positive")
+        if not self.urgency_weights:
+            raise ValueError("urgency_weights must be non-empty")
+        if any(v <= 0 for v in self.urgency_weights.values()):
+            raise ValueError("urgency_weights values must be positive")
+        return self
+
+
+DEFAULT_CONFIG = DialListConfig()

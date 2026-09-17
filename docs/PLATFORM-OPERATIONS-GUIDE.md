@@ -490,14 +490,15 @@ SLACK_SIGNING_SECRET=...
 > ever be Slack's actual configured URL at a time, silently breaking the
 > other two.
 
-For Relay card thread replies, enable **Event Subscriptions** separately and
-set its Request URL to `https://<your-host>/api/admin/slack/events`. Subscribe
-to the message event for each conversation type where Relay cards are posted,
-grant the corresponding history scope, invite the bot to those channels, and
-reinstall the app after changing scopes. This route handles exact `approve`
+For Relay card thread replies, enable **Event Subscriptions** and subscribe
+to the message event for each conversation type where Relay cards are posted.
+When Relay uses Socket Mode, Slack delivers those subscribed events to the
+Socket Mode listener; no Events API Request URL is needed. Grant the
+corresponding history scope, invite the bot to those channels, and reinstall
+the app after changing scopes. Exact `approve`
 and `reject` replies in a card thread; it is distinct from Interactivity.
-Verify Slack accepts the URL challenge and delivers a signed test event before
-relying on thread replies as an approval path.
+Send a test thread reply and verify the Socket Mode listener records the
+decision before relying on thread replies as an approval path.
 
 ### Adding a candidate county
 ```sql
@@ -538,8 +539,8 @@ RELAY_APPROVERS=["U01ABC123","U02DEF456"]   # Slack user IDs — MUST be JSON-ar
                                              # startup (pydantic-settings parses list
                                              # fields as JSON, not CSV).
 RELAY_SLACK_CHANNEL=#agent-daily
-SLACK_BOT_TOKEN=xoxb-...        # reused from County Launch above — no separate app
-SLACK_SIGNING_SECRET=...        # reused from County Launch above
+FA_MAX_SLACK_BOT_TOKEN=xoxb-... # dedicated FA Max app: posts and updates cards
+FA_MAX_SLACK_APP_TOKEN=xapp-... # dedicated FA Max Socket Mode, connections:write
 
 # Email channel (Instantly) — set after running the one-time setup command below
 RELAY_INSTANTLY_CAMPAIGN_ID=
@@ -553,15 +554,27 @@ RELAY_DAILY_CEILING=20          # per channel, per calendar day
 ```
 
 ### Slack app setup
-Reuses the same Slack app as County Launch (`SLACK_BOT_TOKEN`/`SLACK_SIGNING_SECRET`) —
-no separate app needed.
-1. Interactivity is already covered by the single `/api/admin/slack/interact`
-   Request URL set up under County Launch above — Relay's Approve/Reject
-   buttons dispatch through that same endpoint, nothing further to add here.
-   Grant `channels:history` (and `groups:history` for a private queue) so the
-   FA Max retry worker can reconcile a card accepted by Slack before a local
-   crash. Run `python -m src.services.relay --post-pending-fa-max` every five
-   minutes; the checked-in crontab includes this worker.
+Relay approvals and thread actions use Slack Socket Mode with the dedicated
+FA Max Slack app, so no public callback URL is required. Enable Socket Mode
+and create an app-level `xapp-...` token with `connections:write`; store it as
+FA_MAX_SLACK_APP_TOKEN. Store its Bot User OAuth Token as
+FA_MAX_SLACK_BOT_TOKEN. The client secret, signing secret, and verification
+token are not used by this Socket Mode listener. Install and run the listener:
+
+```bash
+cp deploy/systemd/fa-relay-slack-listener.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now fa-relay-slack-listener
+```
+
+Run exactly one Socket Mode listener for the FA Max Slack app. If another
+workflow must share that app, use one dispatcher that routes every action;
+Slack can deliver a payload to any active listener connection.
+
+Grant `channels:history` (and `groups:history` for a private queue) so the
+FA Max retry worker can reconcile a card accepted by Slack before a local
+crash. Run `python -m src.services.relay --post-pending-fa-max` every five
+minutes; the checked-in crontab includes this worker.
 2. Add a slash command `/relay-kill` with Request URL:
    `https://<your-host>/api/admin/slack/kill`
    (usage: `/relay-kill ALL | RELAY | VERA | HUNTER | CORA [FOREVER]` — sets

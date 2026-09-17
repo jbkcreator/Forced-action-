@@ -230,6 +230,7 @@ from src.api.admin_leads_router import router as admin_leads_router  # noqa: E40
 from src.api.funnel_analytics_router import router as funnel_analytics_router  # noqa: E402
 from src.api.operator_dashboard_router import router as operator_dashboard_router  # noqa: E402
 from src.api.vera_router import router as vera_router  # noqa: E402
+from src.api.identity_router import router as identity_router  # noqa: E402
 app.include_router(metrics_router)
 app.include_router(alert_webhook_router)
 app.include_router(revenue_metrics_router)
@@ -237,6 +238,7 @@ app.include_router(admin_leads_router)
 app.include_router(funnel_analytics_router)
 app.include_router(operator_dashboard_router)
 app.include_router(vera_router)
+app.include_router(identity_router)
 
 from src.api.bankruptcy_alert_router import router as bankruptcy_alert_router  # noqa: E402
 app.include_router(bankruptcy_alert_router)
@@ -293,6 +295,9 @@ from src.api.broker_router import router as broker_router  # noqa: E402
 app.include_router(broker_router)
 from src.api.loan_lane_router import router as loan_lane_router  # noqa: E402
 app.include_router(loan_lane_router)
+
+from src.api.fa_max_router import router as fa_max_router  # noqa: E402
+app.include_router(fa_max_router)
 from src.api.commission_router import router as commission_router  # noqa: E402
 app.include_router(commission_router)
 from src.api.account_router import router as account_router  # noqa: E402
@@ -302,7 +307,9 @@ app.include_router(scarcity_router)
 from src.api.demo_router import router as demo_router  # noqa: E402
 app.include_router(demo_router)
 from src.api.deal_room_router import router as deal_room_router  # noqa: E402
+from src.api.selfserve_router import router as selfserve_router  # noqa: E402
 app.include_router(deal_room_router)
+app.include_router(selfserve_router)
 
 
 # ---------------------------------------------------------------------------
