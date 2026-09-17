@@ -57,6 +57,7 @@ def run_backfill(county_id=None, dry_run: bool = False) -> None:
         cluster_against_anchors,
         extract_candidates,
         load_existing_entity_candidates,
+        record_ambiguous_pair_exceptions,
     )
 
     if hunter_halted():
@@ -84,7 +85,7 @@ def run_backfill(county_id=None, dry_run: bool = False) -> None:
         combined = candidates + existing_entities
 
         logger.info("Finding structural edges, blocking, scoring, clustering...")
-        relevant_clusters, confidences, evidence_index = cluster_against_anchors(combined)
+        relevant_clusters, confidences, evidence_index, ambiguous_pairs = cluster_against_anchors(combined)
 
         would_create = sum(
             1 for c in relevant_clusters
@@ -101,8 +102,15 @@ def run_backfill(county_id=None, dry_run: bool = False) -> None:
         )
 
         if dry_run:
-            logger.info("[DRY RUN] No writes performed.")
+            logger.info(
+                "[DRY RUN] No writes performed. %d ambiguous pairs would route to EXCEPTIONS.",
+                len(ambiguous_pairs),
+            )
             return
+
+        exceptions_recorded = record_ambiguous_pair_exceptions(session, ambiguous_pairs)
+        session.commit()
+        logger.info("Recorded %d ambiguous-pair exceptions for review.", exceptions_recorded)
 
         # Committed in batches of _ENTITY_COMMIT_BATCH clusters, NOT one
         # transaction for the whole run -- this is a one-time job against

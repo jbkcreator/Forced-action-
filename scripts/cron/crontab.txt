@@ -115,6 +115,16 @@ COUNTY_ID=hillsborough
 # Distinct --log-name so the two counties don't share one log/.status file.
 32 6 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.load_validator pinellas --log-name load_validator_pinellas
 
+# WP-5A incremental borrower ledger — materialize new acquisitions, sales, and
+# permit transitions after scraper/load jobs and before the alert monitor.
+44 6 * * * cd $PROJECT && PYTHONPATH=. python scripts/sync_borrower_ledger.py >> /var/log/fa/borrower_ledger.log 2>&1
+
+# WP-6 Repeat & Maturity Engine — 06:45 UTC daily (after scrapers + load validator,
+# before CDS scoring). Reads borrower_ledger_events + buyer_entities for 4 monitors
+# (loan_maturity, next_project, dscr_day120, portfolio_expansion). Posts to
+# RELATIONSHIPS_SLACK_CHANNEL. Idempotent — borrower_monitor_log deduplicates.
+45 6 * * * cd $PROJECT && PYTHONPATH=. python scripts/run_repeat_maturity_engine.py >> /var/log/fa/repeat_maturity.log 2>&1
+
 # Quora S6 organic-answer pipeline — 06:35 AM UTC daily (after load validator).
 # Picks one keyword via DB rotation (quora_topics + cooldown_days), scrapes Quora,
 # publishes to Cora for classification + answer drafting, upserts to quora_questions.
@@ -866,6 +876,12 @@ COUNTY_ID=hillsborough
 30 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.hunter_nightly_sweep --county-id $COUNTY_ID
 31 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.hunter_nightly_sweep --county-id pinellas
 
+# WP-5B — FA Max borrower buy-box, velocity, and next-need profile sweep.
+# Runs at 08:45 UTC — after hunter_nightly_sweep (08:30-08:31) refreshes
+# BuyerEntity cadence/portfolio data which this sweep reads.
+# Single run covers all counties (profiles are keyed on fa_max_persons, not county).
+45 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.fa_max_profile_sweep
+
 # NBRA opportunity-score population (REVINT I1) — fills opportunity_scores from
 # freshly-refreshed whale flags so get_ranked_queue() has rows to rank. Must run
 # AFTER hunter_nightly_sweep (above) which updates whale flags.
@@ -1067,5 +1083,9 @@ COUNTY_ID=hillsborough
 # Runs fleet-wide (no --county-id). Requires DIAL_LIST_SLACK_CHANNEL set;
 # unset = the job logs the list and no-ops the post (never fails).
 45 10 * * * $PROJECT/scripts/cron/run.sh src.tasks.dial_list_daily
+
+# WP-7 self-serve — mark sessions abandoned after 24h of inactivity. Dry-run
+# by default (see the task's own docstring); add --apply once confirmed.
+0 * * * * $PROJECT/scripts/cron/run.sh src.tasks.selfserve_abandonment_sweep
 
 # === END FORCED-ACTION-PLATFORM ===

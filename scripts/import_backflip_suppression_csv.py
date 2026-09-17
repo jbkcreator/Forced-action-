@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
+import sys
 from pathlib import Path
 
 from sqlalchemy import text
