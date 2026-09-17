@@ -549,6 +549,11 @@ class AppSettings(BaseSettings):
 	# admin_jwt_secret when unset so local-dev works without extra env config.
 	landing_token_secret: Optional[SecretStr] = Field(default=None, env="LANDING_TOKEN_SECRET")
 
+	# WP-7 self-serve pre-fill — Backflip handoff adapter selection.
+	# handoff_only (default) | fake | url | api. See src/services/backflip_port.py.
+	backflip_adapter: str = Field(default="handoff_only", env="BACKFLIP_ADAPTER")
+	backflip_prequal_url: Optional[str] = Field(default=None, env="BACKFLIP_PREQUAL_URL")
+
 	# Synthflow outbound voice drops (Phase C)
 	synthflow_api_base: str = Field(default="https://api.synthflow.ai/v2", env="SYNTHFLOW_API_BASE")
 	synthflow_api_key: Optional[SecretStr] = Field(default=None, env="SYNTHFLOW_API_KEY")
@@ -693,6 +698,10 @@ class AppSettings(BaseSettings):
 	# "auto-reject triggers a Slack message to Josh"). Reuses slack_bot_token
 	# above, same convention as relay_slack_channel/lifecycle_incident_slack_channel.
 	quality_contracts_slack_channel: Optional[str] = Field(default=None, env="QUALITY_CONTRACTS_SLACK_CHANNEL")
+
+	# Forced Action MAX — WP-6 Repeat & Maturity Engine. Alert channel for
+	# borrower relationship touchpoints (loan maturity, next project, DSCR, expansion).
+	relationships_slack_channel: Optional[str] = Field(default=None, env="RELATIONSHIPS_SLACK_CHANNEL")
 
 	# Stage 10 — Prometheus metrics exposition (fa055).
 	# When true, GET /metrics returns Prometheus text format with kill-switch

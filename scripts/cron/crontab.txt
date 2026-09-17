@@ -115,6 +115,16 @@ COUNTY_ID=hillsborough
 # Distinct --log-name so the two counties don't share one log/.status file.
 32 6 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.load_validator pinellas --log-name load_validator_pinellas
 
+# WP-5A incremental borrower ledger — materialize new acquisitions, sales, and
+# permit transitions after scraper/load jobs and before the alert monitor.
+44 6 * * * cd $PROJECT && PYTHONPATH=. python scripts/sync_borrower_ledger.py >> /var/log/fa/borrower_ledger.log 2>&1
+
+# WP-6 Repeat & Maturity Engine — 06:45 UTC daily (after scrapers + load validator,
+# before CDS scoring). Reads borrower_ledger_events + buyer_entities for 4 monitors
+# (loan_maturity, next_project, dscr_day120, portfolio_expansion). Posts to
+# RELATIONSHIPS_SLACK_CHANNEL. Idempotent — borrower_monitor_log deduplicates.
+45 6 * * * cd $PROJECT && PYTHONPATH=. python scripts/run_repeat_maturity_engine.py >> /var/log/fa/repeat_maturity.log 2>&1
+
 # Quora S6 organic-answer pipeline — 06:35 AM UTC daily (after load validator).
 # Picks one keyword via DB rotation (quora_topics + cooldown_days), scrapes Quora,
 # publishes to Cora for classification + answer drafting, upserts to quora_questions.
@@ -1057,5 +1067,9 @@ COUNTY_ID=hillsborough
 # without touching anything — mark_contradicted would otherwise raise a CHECK
 # violation, since the live constraint permits only four status values.
 15 10 * * * $PROJECT/scripts/cron/run.sh src.tasks.learning_hygiene_sweep
+
+# WP-7 self-serve — mark sessions abandoned after 24h of inactivity. Dry-run
+# by default (see the task's own docstring); add --apply once confirmed.
+0 * * * * $PROJECT/scripts/cron/run.sh src.tasks.selfserve_abandonment_sweep
 
 # === END FORCED-ACTION-PLATFORM ===

@@ -1097,6 +1097,17 @@ async def run_lien_pipeline(
             run.no_data()
             return True
 
+        if day_errors:
+            # Some days in the range succeeded, but at least one failed —
+            # reporting a clean success here would silently drop that day's
+            # records with no alerting. Fail the run so the missing day is
+            # visible and can be retried, even though partial data is loaded.
+            combined_err = "; ".join(day_errors)
+            logger.error(
+                "[Pipeline] %d day(s) succeeded but %d day(s) failed: %s",
+                len(collected), len(day_errors), combined_err,
+            )
+
         df = pd.concat(collected, ignore_index=True)
         if len(collected) > 1:
             logger.info("[Pipeline] Combined %d records from %d segment(s)", len(df), len(collected))
@@ -1145,13 +1156,23 @@ async def run_lien_pipeline(
         if load_to_db:
             all_ok, load_error = _load_to_database(county_id, _t0)
             if all_ok:
-                # Per-subtype stats are written inside _load_to_database via
-                # scraper_db_helper:_record_load_stats — one row each for
-                # lien_tcl/lien_ccl/lien_hoa/lien_ml/lien_tl/lis_pendens plus
-                # 'no_data' rows for absent subtypes. Suppress the wrapper's
-                # own completion write so it doesn't clobber those via the
-                # (run_date, source_type, county_id) upsert.
-                run.suppress_completion_write()
+                if day_errors:
+                    # Collected days loaded fine, but at least one day in the
+                    # range failed outright — that day's records are missing,
+                    # not just absent, so this must alert rather than read as
+                    # a clean run.
+                    run.fail(
+                        ScraperOutcome.UNKNOWN.value,
+                        error_message=f"partial run — {'; '.join(day_errors)}"[:500],
+                    )
+                else:
+                    # Per-subtype stats are written inside _load_to_database via
+                    # scraper_db_helper:_record_load_stats — one row each for
+                    # lien_tcl/lien_ccl/lien_hoa/lien_ml/lien_tl/lis_pendens plus
+                    # 'no_data' rows for absent subtypes. Suppress the wrapper's
+                    # own completion write so it doesn't clobber those via the
+                    # (run_date, source_type, county_id) upsert.
+                    run.suppress_completion_write()
             else:
                 # At least one DB-load target failed. deeds/judgments each
                 # have a DATA_TYPE_TO_SOURCE entry, so load_scraped_data_to_db
@@ -1168,6 +1189,11 @@ async def run_lien_pipeline(
                     outcome,
                     error_message=str(load_error)[:500] if load_error is not None else "one or more lien/deed/judgment DB loads failed",
                 )
+        elif day_errors:
+            run.fail(
+                ScraperOutcome.UNKNOWN.value,
+                error_message=f"partial run — {'; '.join(day_errors)}"[:500],
+            )
         else:
             run.success(total_scraped=total)
 
