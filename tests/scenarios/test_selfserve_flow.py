@@ -139,3 +139,58 @@ def test_unknown_slug_degrades_to_generic_flow_not_404():
     resp = client.get("/go/definitely-not-a-real-slug")
     assert resp.status_code == 302
     assert "/selfserve/" in resp.headers["location"]
+
+
+def test_suppressed_contact_holds_off_instead_of_handing_off(monkeypatch, tracked_link_slug, property_id):
+    """Client's answered attribution rule (client-response doc Q5): if a
+    prospect already has an active Backflip campaign touch in motion, Forced
+    Action holds off rather than sending a competing outreach. The session's
+    own answers must still be saved — only the handoff redirect is held."""
+    from config.settings import settings as global_settings
+    monkeypatch.setattr(global_settings, "backflip_adapter", "fake")
+
+    suppressed_email = f"suppressed-{uuid.uuid4().hex[:8]}@example.com"
+    with get_db_context() as db:
+        db.execute(
+            text(
+                "INSERT INTO fa_max_backflip_campaign_contacts (identifier_kind, identifier_value, active) "
+                "VALUES ('email', :email, true)"
+            ),
+            {"email": suppressed_email},
+        )
+        db.commit()
+
+    client = TestClient(app, follow_redirects=False)
+    click_resp = client.get(f"/go/{tracked_link_slug}")
+    token = click_resp.headers["location"].split("/selfserve/")[1]
+
+    submit_resp = client.post(
+        f"/api/selfserve/{token}/submit",
+        data={
+            "q__exit_strategy": "flip",
+            "contact_name": "Suppressed Borrower",
+            "contact_email": suppressed_email,
+            "consent": "on",
+        },
+        follow_redirects=False,
+    )
+    assert submit_resp.status_code == 200  # held — not a 302 to Backflip
+    assert "no further action needed" in submit_resp.text.lower()
+
+    with get_db_context() as db:
+        row = db.execute(
+            text("SELECT status, handoff_ref, person_id FROM selfserve_sessions WHERE token = :token"),
+            {"token": token},
+        ).mappings().first()
+        assert row["status"] == "confirmed"  # saved, but never handed_off
+        assert row["handoff_ref"] is None
+
+        person_id = row["person_id"]
+        db.execute(text("DELETE FROM selfserve_sessions WHERE token = :token"), {"token": token})
+        db.execute(text("DELETE FROM fa_max_person_consent WHERE person_id = :pid"), {"pid": person_id})
+        db.execute(text("DELETE FROM fa_max_persons WHERE person_id = :pid"), {"pid": person_id})
+        db.execute(
+            text("DELETE FROM fa_max_backflip_campaign_contacts WHERE identifier_value = :email"),
+            {"email": suppressed_email},
+        )
+        db.commit()

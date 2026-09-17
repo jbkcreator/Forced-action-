@@ -1058,4 +1058,8 @@ COUNTY_ID=hillsborough
 # violation, since the live constraint permits only four status values.
 15 10 * * * $PROJECT/scripts/cron/run.sh src.tasks.learning_hygiene_sweep
 
+# WP-7 self-serve — mark sessions abandoned after 24h of inactivity. Dry-run
+# by default (see the task's own docstring); add --apply once confirmed.
+0 * * * * $PROJECT/scripts/cron/run.sh src.tasks.selfserve_abandonment_sweep
+
 # === END FORCED-ACTION-PLATFORM ===

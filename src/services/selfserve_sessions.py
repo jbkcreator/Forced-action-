@@ -220,3 +220,36 @@ def mark_abandoned(db: Session, token: str) -> None:
         ),
         {"token": token},
     )
+
+
+def list_stale_session_tokens(db: Session, older_than_hours: int) -> list[str]:
+    """Sessions still in-flight (never confirmed or handed off) whose last
+    activity is older than the cutoff — candidates for mark_abandoned. Used
+    by src/tasks/selfserve_abandonment_sweep.py."""
+    rows = db.execute(
+        text(
+            "SELECT token FROM selfserve_sessions "
+            "WHERE status IN ('started', 'prefilled') "
+            "AND last_activity_at < now() - make_interval(hours => :hours)"
+        ),
+        {"hours": older_than_hours},
+    ).fetchall()
+    return [str(r.token) for r in rows]
+
+
+def list_consented_abandoned_contacts(db: Session, channel: str) -> list[dict]:
+    """Abandoned sessions whose contact has recorded consent for `channel` —
+    the pre-filtered interface a future rescue-outreach agent (spec item 21)
+    would read from. Built now, cheap, and exercises has_consent's contract;
+    the outreach agent itself sending anything is out of WP-7 scope."""
+    rows = db.execute(
+        text(
+            "SELECT token, person_id, contact FROM selfserve_sessions "
+            "WHERE status = 'abandoned' AND person_id IS NOT NULL"
+        )
+    ).mappings().all()
+    return [
+        {"token": str(row["token"]), "person_id": str(row["person_id"]), "contact": row["contact"]}
+        for row in rows
+        if has_consent(db, str(row["person_id"]), channel)
+    ]

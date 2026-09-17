@@ -48,11 +48,13 @@ from config.settings import settings
 from src.api.admin_router import get_current_admin
 from src.api.deps import get_db
 from src.core.models import TrackedLink
+from src.core.redis_client import rincr
 from src.services.backflip_port import HandoffPayload, get_backflip_port
 from src.services.prefill_assembly import assemble_prefill, find_property_by_address
 from src.services.selfserve_sessions import (
     create_session,
     get_session_by_token,
+    is_backflip_suppressed,
     submit_session,
 )
 from src.services.tracked_links import mint_link, record_click, resolve_slug
@@ -62,6 +64,13 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["selfserve"])
 
 _VALID_KINDS = ("partner", "campaign", "source", "property_mailer")
+
+# WI-4 — Redis rate limit on session creation and submit per IP. Fails open
+# (never blocks) if Redis is unavailable, same convention as every other
+# rincr() caller in this codebase (src/core/redis_client.py:122).
+_RATE_LIMIT_WINDOW_SECONDS = 60
+_CLICK_LIMIT_PER_MINUTE = 30
+_SUBMIT_LIMIT_PER_MINUTE = 10
 
 
 def _hash_ip(ip: Optional[str]) -> Optional[str]:
@@ -73,6 +82,14 @@ def _hash_ip(ip: Optional[str]) -> Optional[str]:
     return hashlib.sha256(f"{salt}:{ip}".encode()).hexdigest()
 
 
+def _rate_limited(bucket: str, limit: int) -> bool:
+    """True if this bucket has exceeded `limit` hits in the current window.
+    No ip_hash (unknown client, e.g. behind a proxy misconfig) never blocks —
+    an IP-less request can't be rate-limited by IP without false-positiving
+    every anonymized caller onto one shared counter."""
+    return rincr(f"selfserve:rl:{bucket}", ttl_seconds=_RATE_LIMIT_WINDOW_SECONDS) > limit
+
+
 # ---------------------------------------------------------------------------
 # GET /go/{slug} — click, attribute, create the session
 # ---------------------------------------------------------------------------
@@ -80,6 +97,10 @@ def _hash_ip(ip: Optional[str]) -> Optional[str]:
 
 @router.get("/go/{slug}")
 def click_tracked_link(slug: str, request: Request, db: Session = Depends(get_db)):
+    ip_hash = _hash_ip(request.client.host if request.client else None)
+    if ip_hash and _rate_limited(f"click:{ip_hash}", _CLICK_LIMIT_PER_MINUTE):
+        raise HTTPException(status_code=429, detail="Too many requests.")
+
     link = resolve_slug(db, slug)
     token = str(uuid.uuid4())
 
@@ -94,7 +115,7 @@ def click_tracked_link(slug: str, request: Request, db: Session = Depends(get_db
             db,
             tracked_link_id=link.id,
             session_token=token,
-            ip_hash=_hash_ip(request.client.host if request.client else None),
+            ip_hash=ip_hash,
             user_agent=request.headers.get("user-agent"),
             referer=request.headers.get("referer"),
         )
@@ -190,6 +211,10 @@ def selfserve_screen(token: str, db: Session = Depends(get_db)):
 
 @router.post("/api/selfserve/{token}/submit")
 async def submit_selfserve(token: str, request: Request, db: Session = Depends(get_db)):
+    ip_hash = _hash_ip(request.client.host if request.client else None)
+    if ip_hash and _rate_limited(f"submit:{ip_hash}", _SUBMIT_LIMIT_PER_MINUTE):
+        raise HTTPException(status_code=429, detail="Too many requests.")
+
     session_row = get_session_by_token(db, token)
     if session_row is None:
         raise HTTPException(status_code=404, detail="Session not found or expired.")
@@ -211,12 +236,23 @@ async def submit_selfserve(token: str, request: Request, db: Session = Depends(g
             )
             session_row.property_id = prop_id
 
-    corrections = {k[len("correction__"):]: v for k, v in form.items() if k.startswith("correction__")}
-    confirmations = {k[len("q__"):]: v for k, v in form.items() if k.startswith("q__")}
+    def _str_field(name: str) -> Optional[str]:
+        # Form fields are plain text inputs — never file uploads — but a
+        # crafted multipart request could send an UploadFile under this
+        # field name. Reject rather than silently stringifying a file object.
+        val = form.get(name)
+        if val is None:
+            return None
+        if not isinstance(val, str):
+            raise HTTPException(status_code=400, detail=f"{name} must be text.")
+        return val
+
+    corrections = {k[len("correction__"):]: v for k, v in form.items() if k.startswith("correction__") and isinstance(v, str)}
+    confirmations = {k[len("q__"):]: v for k, v in form.items() if k.startswith("q__") and isinstance(v, str)}
     contact = {
-        "name": form.get("contact_name"),
-        "email": form.get("contact_email"),
-        "phone": form.get("contact_phone"),
+        "name": _str_field("contact_name"),
+        "email": _str_field("contact_email"),
+        "phone": _str_field("contact_phone"),
     }
     consent_channels = ["email", "sms"] if form.get("consent") else []
 
@@ -228,6 +264,24 @@ async def submit_selfserve(token: str, request: Request, db: Session = Depends(g
         contact=contact,
         consent_channels=consent_channels,
     )
+
+    # WI-4 / client-answered attribution rule (client-response doc Q5): if a
+    # prospect already has an active Backflip campaign touch in motion,
+    # Forced Action holds off rather than sending a competing outreach. The
+    # session's own attribution redirect to Backflip *is* that outreach, so
+    # it is what gets held — the borrower's answers are still saved, nothing
+    # is lost, we just don't inject our own attribution on top of Backflip's
+    # existing touch.
+    if is_backflip_suppressed(db, email=contact.get("email"), phone=contact.get("phone")):
+        logger.warning(
+            "selfserve: session token=%s suppressed — active Backflip touch on this contact, holding off",
+            token,
+        )
+        db.commit()
+        return HTMLResponse(
+            "<html><body><p>Thanks — you're already connected with Backflip on this. "
+            "No further action needed from you; we'll stay out of the way.</p></body></html>"
+        )
 
     port = get_backflip_port()
     result = port.handoff(HandoffPayload(
