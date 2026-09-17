@@ -49,6 +49,30 @@ def _mk_staging_permit(db, permit_number, *, issue_date=None, permit_type="New C
     return row.id
 
 
+def _mk_property(db, parcel_id) -> int:
+    return db.execute(
+        text("INSERT INTO properties (parcel_id, needs_rescore, created_at, updated_at) "
+             "VALUES (:pid, false, now(), now()) RETURNING id"),
+        {"pid": parcel_id},
+    ).fetchone().id
+
+
+def _mk_building_permit(db, permit_number, *, property_id, issue_date=None,
+                        is_enforcement=False, permit_type="New Construction",
+                        county_id="hillsborough") -> int:
+    return db.execute(
+        text("""
+            INSERT INTO building_permits
+                (property_id, permit_number, permit_type, status, issue_date,
+                 is_enforcement_permit, county_id, completion_status)
+            VALUES (:prop, :pn, :pt, 'issued', :issue, :enf, :cty, 'issued')
+            RETURNING id
+        """),
+        {"prop": property_id, "pn": permit_number, "pt": permit_type,
+         "issue": issue_date, "enf": is_enforcement, "cty": county_id},
+    ).fetchone().id
+
+
 def _link(db, entity_id, source_table, source_id):
     db.execute(
         text("""
@@ -82,6 +106,38 @@ def test_repeat_builder_positive_and_negative(fresh_db):
     hits = detect_repeat_builders(db)
     assert _entity_ids_in(hits, hot)         # 2 permits / 24mo → fires
     assert not _entity_ids_in(hits, cold)    # 1 permit → silent
+
+
+def test_repeat_builder_excludes_enforcement_permits(fresh_db):
+    db = fresh_db
+    e = _mk_entity(db, "ENFORCEMENT ONLY LLC")
+    prop1 = _mk_property(db, "ENF-P1")
+    prop2 = _mk_property(db, "ENF-P2")
+    b1 = _mk_building_permit(db, "ENF-1", property_id=prop1,
+                             issue_date=_TODAY - timedelta(days=30), is_enforcement=True)
+    b2 = _mk_building_permit(db, "ENF-2", property_id=prop2,
+                             issue_date=_TODAY - timedelta(days=60), is_enforcement=True)
+    _link(db, e, "building_permits", b1)
+    _link(db, e, "building_permits", b2)
+    db.flush()
+
+    hits = detect_repeat_builders(db)
+    assert not _entity_ids_in(hits, e)   # 2 permits but both enforcement → silent
+
+
+def test_repeat_builder_counts_distinct_projects_not_revisions(fresh_db):
+    db = fresh_db
+    prop = _mk_property(db, "REVISION-PARCEL")
+    e = _mk_entity(db, "REVISIONS LLC")
+    # two permit rows (revisions) on the SAME property → 1 project → must NOT fire
+    b1 = _mk_building_permit(db, "REV-1", property_id=prop, issue_date=_TODAY - timedelta(days=20))
+    b2 = _mk_building_permit(db, "REV-2", property_id=prop, issue_date=_TODAY - timedelta(days=50))
+    _link(db, e, "building_permits", b1)
+    _link(db, e, "building_permits", b2)
+    db.flush()
+
+    hits = detect_repeat_builders(db)
+    assert not _entity_ids_in(hits, e)   # same property twice = 1 project → silent
 
 
 def test_repeat_builder_ignores_permits_outside_window(fresh_db):
@@ -191,12 +247,16 @@ def test_land_to_permit_deed_then_permit_within_90d(fresh_db):
 
 def test_adapter_fans_matched_permit_to_property_signal(fresh_db):
     db = fresh_db
-    prop = db.execute(
-        text("INSERT INTO properties (parcel_id, needs_rescore, created_at, updated_at) VALUES ('ADAPT-PARCEL', false, now(), now()) RETURNING id")
+    # two DISTINCT properties → a genuine repeat builder (2 projects)
+    prop1 = db.execute(
+        text("INSERT INTO properties (parcel_id, needs_rescore, created_at, updated_at) VALUES ('ADAPT-P1', false, now(), now()) RETURNING id")
+    ).fetchone().id
+    prop2 = db.execute(
+        text("INSERT INTO properties (parcel_id, needs_rescore, created_at, updated_at) VALUES ('ADAPT-P2', false, now(), now()) RETURNING id")
     ).fetchone().id
     hot = _mk_entity(db, "ADAPTER LLC")
-    p1 = _mk_staging_permit(db, "AD-1", issue_date=_TODAY - timedelta(days=10), matched_property_id=prop)
-    p2 = _mk_staging_permit(db, "AD-2", issue_date=_TODAY - timedelta(days=100), matched_property_id=prop)
+    p1 = _mk_staging_permit(db, "AD-1", issue_date=_TODAY - timedelta(days=10), matched_property_id=prop1)
+    p2 = _mk_staging_permit(db, "AD-2", issue_date=_TODAY - timedelta(days=100), matched_property_id=prop2)
     _link(db, hot, "permit_staging", p1)
     _link(db, hot, "permit_staging", p2)
     db.flush()
@@ -205,11 +265,12 @@ def test_adapter_fans_matched_permit_to_property_signal(fresh_db):
     my = [h for h in hits if h.buyer_entity_id == hot]
     assert my
     signals = map_hits_to_property_signals(db, my)
-    assert prop in signals
-    sig = signals[prop]
-    assert sig.trigger == "builder"
-    assert "repeat_builder" in sig.patterns
-    assert sig.urgency_date == _TODAY - timedelta(days=10)  # newest
+    # both properties get a signal; each carries the builder trigger + pattern
+    assert prop1 in signals and prop2 in signals
+    assert signals[prop1].trigger == "builder"
+    assert "repeat_builder" in signals[prop1].patterns
+    # urgency = newest permit date across the hit (fanned to every property)
+    assert signals[prop1].urgency_date == _TODAY - timedelta(days=10)
 
 
 def test_adapter_skips_unmatched_staging_permit(fresh_db):

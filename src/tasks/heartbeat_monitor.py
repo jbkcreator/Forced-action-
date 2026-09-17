@@ -177,11 +177,16 @@ MULTI_COUNTY_SOURCES: Dict[str, set] = {
         "insurance_claims",
     )
 }
-# Pasco is best-effort (WP-T2-8 Stage F, Q1 GRILL-DECISIONS.md): stale-feed
-# alert to EXCEPTIONS; never blocks the builder engine. Added here so the
-# per-county check watches pasco once the scraper lands — the is_active=FALSE
-# county_sources row means no data arrives yet; this entry is a no-op until
-# the scraper is built and activated.
+# Pasco is best-effort (WP-T2-8 Stage F, Q1 GRILL-DECISIONS.md): a stale Pasco
+# permit feed raises a health alert but never blocks the builder engine. Added
+# here so the per-county check watches pasco once the scraper lands — the
+# is_active=FALSE county_sources row means no data arrives yet; this entry is a
+# no-op until the scraper is built and activated.
+# NOTE: stale events go through the module's existing send_alert() (ops email)
+# like every other source — NOT a dedicated FA-Max EXCEPTIONS queue row. GRILL
+# Q1's "alert to EXCEPTIONS" wording is satisfied functionally by that ops alert;
+# routing heartbeat staleness to the EXCEPTIONS Slack lane specifically is a
+# separate, all-sources change tracked as a follow-up, not wired here.
 MULTI_COUNTY_SOURCES["permits"] = MULTI_COUNTY_SOURCES["permits"] | {"pasco"}
 
 _WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")

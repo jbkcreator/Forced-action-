@@ -158,6 +158,7 @@ _REPEAT_BUILDER_SQL = text("""
         FROM building_permits p
         JOIN buyer_entity_links bel ON bel.source_table = 'building_permits' AND bel.source_id = p.id
         WHERE p.issue_date >= :since AND p.issue_date <= :as_of
+          AND COALESCE(p.is_enforcement_permit, FALSE) = FALSE
 
         UNION ALL
 
@@ -176,14 +177,17 @@ _REPEAT_BUILDER_SQL = text("""
     entity_summary AS (
         SELECT
             buyer_entity_id,
-            COUNT(*)                          AS permit_count,
+            -- distinct PROJECTS, not raw permit rows: collapse permit revisions on
+            -- the same matched property; treat each unmatched staging permit
+            -- (property_id NULL) as its own site so land→permit builders still count.
+            COUNT(DISTINCT COALESCE(property_id::text, 'staging:' || permit_row_id::text)) AS permit_count,
             MAX(issue_date)                   AS latest_date,
             SUM(COALESCE(job_value, 0))       AS total_jv,
             MAX(property_id)                  AS any_property_id,
             MAX(county_id)                    AS county_id
         FROM permit_union
         GROUP BY buyer_entity_id
-        HAVING COUNT(*) >= :min_permits
+        HAVING COUNT(DISTINCT COALESCE(property_id::text, 'staging:' || permit_row_id::text)) >= :min_permits
     )
     SELECT
         es.*,
@@ -242,6 +246,7 @@ _CONCURRENT_BUILDER_SQL = text("""
         FROM building_permits p
         JOIN buyer_entity_links bel ON bel.source_table = 'building_permits' AND bel.source_id = p.id
         WHERE LOWER(COALESCE(p.completion_status, p.status, '')) = ANY(:active_statuses)
+          AND COALESCE(p.is_enforcement_permit, FALSE) = FALSE
 
         UNION ALL
 
@@ -252,12 +257,15 @@ _CONCURRENT_BUILDER_SQL = text("""
         WHERE LOWER(COALESCE(s.completion_status, s.status, '')) = ANY(:active_statuses)
     ),
     summary AS (
-        SELECT buyer_entity_id, COUNT(*) AS active_count,
+        -- distinct active PROJECTS: collapse revisions on the same matched property,
+        -- keep each unmatched staging permit as its own site (property_id NULL).
+        SELECT buyer_entity_id,
+               COUNT(DISTINCT COALESCE(property_id::text, 'staging:' || id::text)) AS active_count,
                MAX(issue_date) AS latest_date, SUM(COALESCE(job_value, 0)) AS total_jv,
                MAX(property_id) AS any_property_id, MAX(county_id) AS county_id
         FROM active_union
         GROUP BY buyer_entity_id
-        HAVING COUNT(*) >= :min_active
+        HAVING COUNT(DISTINCT COALESCE(property_id::text, 'staging:' || id::text)) >= :min_active
     )
     SELECT s.*, be.canonical_name,
         ARRAY(SELECT id FROM active_union au WHERE au.buyer_entity_id = s.buyer_entity_id AND au.src = 'building_permits') AS bp_ids,
@@ -323,6 +331,7 @@ def detect_townhome_infill(
             FROM building_permits p
             JOIN buyer_entity_links bel ON bel.source_table = 'building_permits' AND bel.source_id = p.id
             WHERE ({ilike_bp}) {county_filter_bp}
+              AND COALESCE(p.is_enforcement_permit, FALSE) = FALSE
 
             UNION ALL
 
@@ -375,6 +384,7 @@ _LAND_TO_PERMIT_SQL = text("""
         FROM building_permits p
         JOIN buyer_entity_links bel ON bel.source_table = 'building_permits' AND bel.source_id = p.id
         WHERE p.issue_date IS NOT NULL
+          AND COALESCE(p.is_enforcement_permit, FALSE) = FALSE
 
         UNION ALL
 
@@ -457,6 +467,7 @@ _SPEC_CADENCE_SQL = text("""
         FROM building_permits p
         JOIN buyer_entity_links bel ON bel.source_table = 'building_permits' AND bel.source_id = p.id
         WHERE p.issue_date IS NOT NULL
+          AND COALESCE(p.is_enforcement_permit, FALSE) = FALSE
 
         UNION ALL
 
