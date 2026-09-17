@@ -1,11 +1,21 @@
-"""Socket Mode listener for Relay approval cards.
+"""Socket Mode listener for the FA Max Slack app.
 
-This is the long-running inbound half of the Relay Slack integration.  It
-receives Block Kit button envelopes over Slack's authenticated WebSocket and
-delegates them to the same durable approval handler used by the HTTP endpoint.
-The listener is deliberately separate from the send sweep: losing or
-restarting it never changes a pending queue row, and Slack can redeliver an
-unacknowledged envelope.
+This is the long-running inbound half of the FA Max Slack integration — one
+process, one WebSocket connection, one growing list of listener functions.
+Each registered listener gets every incoming envelope and independently
+decides whether it applies, so unrelated workflows sharing this one
+connection never step on each other (see ``_on_request`` vs
+``_on_tracked_link_request`` below).
+
+Relay approval cards (``_on_request``): receives Block Kit button envelopes
+over Slack's authenticated WebSocket and delegates them to the same durable
+approval handler used by the HTTP endpoint. Deliberately separate from the
+send sweep: losing or restarting it never changes a pending queue row, and
+Slack can redeliver an unacknowledged envelope.
+
+``/tracked-link`` (``_on_tracked_link_request``, WP-7 self-serve pre-fill):
+lets Josh mint a tracked link himself, no engineer needed. Owned by
+src/services/tracked_links.py — this file only registers it.
 
 Run with ``python -m src.services.relay.socket_listener``.  It needs both
 ``SLACK_BOT_TOKEN`` (to update cards) and ``RELAY_SLACK_APP_TOKEN`` (xapp,
@@ -98,7 +108,22 @@ def run() -> None:
             # queue row remains pending unless the handler commits its CAS.
             logger.exception("[RelaySocket] failed to process Slack envelope")
 
+    def _on_tracked_link_request(client: Any, request: Any) -> None:
+        # WP-7 (Forced Action MAX) self-serve pre-fill — /tracked-link slash
+        # command. Owned by src/services/tracked_links.py, imported lazily
+        # here (same convention as WebClient/SocketModeClient above) so this
+        # module has no hard dependency on WP-7's package at load time.
+        try:
+            from src.services.tracked_links import handle_tracked_link_socket_request
+
+            handled = handle_tracked_link_socket_request(client, request)
+            if handled:
+                logger.info("[RelaySocket] processed /tracked-link command")
+        except Exception:
+            logger.exception("[RelaySocket] failed to process /tracked-link request")
+
     socket.socket_mode_request_listeners.append(_on_request)
+    socket.socket_mode_request_listeners.append(_on_tracked_link_request)
     logger.info("[RelaySocket] connecting via Socket Mode")
     socket.connect()
 
