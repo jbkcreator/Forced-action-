@@ -103,6 +103,72 @@ def resolve_or_create_person(db: Session, source_reference: str) -> str:
     return str(row.person_id)
 
 
+def find_possible_person_match(
+    db: Session, email: Optional[str], phone: Optional[str], exclude_token: str
+) -> Optional[str]:
+    """Look for a DIFFERENT selfserve session whose recorded contact shares
+    this email or normalized phone. `fa_max_persons` has no contact column
+    (module docstring), so this reads the one place contact info actually
+    lives today — other sessions' `contact` JSONB — as a stopgap.
+
+    Never merges. Per spec (failure-behavior section, L567): "Identity
+    resolution is uncertain. Records stay separate and a possible-match flag
+    routes to EXCEPTIONS. Never auto-merged below a confidence threshold."
+    """
+    phone_norm = normalize_phone(phone) if phone else None
+    if not email and not phone_norm:
+        return None
+    row = db.execute(
+        text(
+            """
+            SELECT person_id FROM selfserve_sessions
+            WHERE token <> :exclude_token AND person_id IS NOT NULL
+              AND (
+                (:email IS NOT NULL AND lower(contact->>'email') = lower(:email))
+                OR (:phone IS NOT NULL AND contact->>'phone' = :phone)
+              )
+            ORDER BY started_at DESC
+            LIMIT 1
+            """
+        ),
+        {"exclude_token": exclude_token, "email": email, "phone": phone_norm},
+    ).first()
+    return str(row.person_id) if row else None
+
+
+def flag_possible_identity_match(db: Session, new_person_id: str, existing_person_id: str, session_token: str) -> None:
+    """Surface a possible-duplicate person to the EXCEPTIONS lane for human
+    review (spec L567) — never auto-merged. Writes into the existing WP-2
+    relay_approval_queue/Slack-delivery pipeline (src/services/relay/), so
+    WP-7 does not need its own Slack-posting code: whatever sweep already
+    turns pending EXCEPTIONS-lane rows into Slack cards picks this up too.
+    Idempotent on session_token — a re-submit does not duplicate the flag."""
+    db.execute(
+        text(
+            """
+            INSERT INTO relay_approval_queue
+                (idempotency_key, venture_key, lane, channel, recipient, payload,
+                 status, agent_name, autonomy_tier_at_send, person_id)
+            VALUES
+                (:idempotency_key, 'fa_max_lending', 'EXCEPTIONS', 'noop', 'n/a',
+                 CAST(:payload AS JSONB), 'pending', 'selfserve_identity_check', 'A', :person_id)
+            ON CONFLICT (idempotency_key) DO NOTHING
+            """
+        ),
+        {
+            "idempotency_key": f"selfserve-possible-match-{session_token}",
+            "payload": json.dumps({
+                "reason": "possible_duplicate_person",
+                "new_person_id": new_person_id,
+                "existing_person_id": existing_person_id,
+                "session_token": session_token,
+                "source": "wp7_selfserve",
+            }),
+            "person_id": new_person_id,
+        },
+    )
+
+
 def record_consent(db: Session, person_id: str, channels: list[str], source: str = "selfserve_flow") -> None:
     """Write one fa_max_person_consent row per channel the borrower checked.
     Idempotent — (person_id, channel) is unique, a re-submit updates in place."""
@@ -175,6 +241,12 @@ def submit_session(
 
     person_id = resolve_or_create_person(db, source_reference=token)
     buyer_entity_id = resolve_buyer_entity_id(db, session_row.property_id)
+
+    possible_match = find_possible_person_match(
+        db, email=contact.get("email"), phone=contact.get("phone"), exclude_token=token
+    )
+    if possible_match:
+        flag_possible_identity_match(db, new_person_id=person_id, existing_person_id=possible_match, session_token=token)
 
     if consent_channels:
         record_consent(db, person_id, consent_channels)
