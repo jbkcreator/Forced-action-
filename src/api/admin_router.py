@@ -1876,9 +1876,9 @@ def _update_relay_slack_message(
     channel cannot be edited in another, so using a single global channel here
     would fail every edit for every venture but the first.
     """
-    from src.services.relay.slack_post import _resolve_channel
+    from src.services.relay.slack_post import _resolve_bot_token, _resolve_channel
 
-    token = settings.slack_bot_token
+    token = _resolve_bot_token(item, settings)
     channel = _resolve_channel(item, settings)
     if not token or not channel or not item.slack_message_ts:
         return

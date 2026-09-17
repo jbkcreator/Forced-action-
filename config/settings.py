@@ -637,10 +637,14 @@ class AppSettings(BaseSettings):
 	county_launch_reminder_days: int = Field(default=7, env="COUNTY_LAUNCH_REMINDER_DAYS")
 	slack_bot_token: Optional[SecretStr] = Field(default=None, env="SLACK_BOT_TOKEN")
 	slack_signing_secret: Optional[SecretStr] = Field(default=None, env="SLACK_SIGNING_SECRET")
+	# Dedicated FA Max Slack app. It must not reuse the shared Slack app
+	# credentials used by County Launch and other Relay ventures.
+	fa_max_slack_bot_token: Optional[SecretStr] = Field(default=None, env="FA_MAX_SLACK_BOT_TOKEN")
+	fa_max_slack_app_token: Optional[SecretStr] = Field(default=None, env="FA_MAX_SLACK_APP_TOKEN")
 	vera_slack_channel: Optional[str] = Field(default=None, env="VERA_SLACK_CHANNEL")
 
-	# Relay approval queue (RELAY-v2.2 sub-task R1). Reuses slack_bot_token /
-	# slack_signing_secret above — no separate Slack app.
+	# Relay approval queue (RELAY-v2.2 sub-task R1). Non-FA-Max Relay ventures
+	# reuse slack_bot_token / slack_signing_secret; FA Max uses its dedicated app.
 	relay_slack_channel: str = Field(default="", env="RELAY_SLACK_CHANNEL")
 	relay_approvers: list = Field(default=[], env="RELAY_APPROVERS")
 
