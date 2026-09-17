@@ -177,7 +177,9 @@ MULTI_COUNTY_SOURCES: Dict[str, set] = {
         "insurance_claims",
     )
 }
-MULTI_COUNTY_SOURCES["permits"].add("pasco")
+# Pasco is best-effort (WP-T2-8 Stage F). Scraper active but SLA monitoring
+# deferred until feed is confirmed stable. Add "pasco" to
+# MULTI_COUNTY_SOURCES["permits"] when ready to alert on stale Pasco data.
 
 _WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
