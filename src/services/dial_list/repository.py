@@ -29,6 +29,12 @@ from sqlalchemy.orm import Session
 from config.settings import get_settings
 
 from src.core.models import DialListSnapshot
+from src.services.builder_patterns import (
+    map_hits_to_property_signals,
+    run_builder_detectors,
+)
+from src.services.builder_relationships import surface_relationship_hits
+from src.services.buyer_entity_resolution import run_incremental_permits
 
 from .config import DEFAULT_CONFIG, DialListConfig
 from .models import DialCandidate, DialList
@@ -49,13 +55,6 @@ _PROBATE_LOOKBACK_DAYS = 365
 # Heuristic: there is no explicit completion field (see GRILL-DECISIONS.md #3).
 _PERMIT_CLOSED_STATUSES = (
     "final", "finaled", "closed", "completed", "co issued", "expired", "cancelled",
-)
-
-_NEW_CONSTRUCTION_PATTERNS = (
-    "%new construction%",
-    "%new single family%",
-    "%new residential%",
-    "%new sfr%",
 )
 
 # DOR major use-code prefixes that are in-scope for hard-money residential
@@ -153,24 +152,6 @@ _STALLED_SQL = text(
     GROUP BY bp.property_id
     """
 ).bindparams(bindparam("closed_statuses", expanding=True))
-
-_BUILDER_SQL = text(
-    """
-    SELECT bp.property_id AS property_id, MAX(bp.issue_date) AS urgency_date
-    FROM building_permits bp
-    WHERE bp.issue_date IS NOT NULL
-      AND bp.issue_date <= :as_of AND bp.issue_date >= :since
-      AND (:county IS NULL OR bp.county_id = :county)
-      AND (
-          LOWER(COALESCE(bp.permit_type, '')) LIKE :p0
-          OR LOWER(COALESCE(bp.permit_type, '')) LIKE :p1
-          OR LOWER(COALESCE(bp.permit_type, '')) LIKE :p2
-          OR LOWER(COALESCE(bp.permit_type, '')) LIKE :p3
-          OR LOWER(COALESCE(bp.description, '')) LIKE :p0
-      )
-    GROUP BY bp.property_id
-    """
-)
 
 _FORECLOSURE_AUCTION_SQL = text(
     """
@@ -330,13 +311,18 @@ _ENRICH_SQL = text(
 class _Acc:
     """Per-property accumulator built during detector fan-out."""
 
-    __slots__ = ("triggers", "is_builder", "intent_tier", "urgency_date")
+    __slots__ = (
+        "triggers", "is_builder", "intent_tier", "urgency_date",
+        "builder_entity_id", "builder_name",
+    )
 
     def __init__(self) -> None:
         self.triggers: Set[str] = set()
         self.is_builder: bool = False
         self.intent_tier: Optional[str] = None
         self.urgency_date: Optional[date] = None
+        self.builder_entity_id: Optional[int] = None
+        self.builder_name: Optional[str] = None
 
     def add_date(self, d: Optional[object]) -> None:
         d2 = _as_date(d)
@@ -395,6 +381,22 @@ def assemble_dial_candidates(
                 acc[pid] = a
             return a
 
+        # Stage E: resolve newly ingested permit principals, run all five
+        # principal-aware builder detectors, then bridge their entity-grained
+        # hits into WP-9's property-keyed accumulator.
+        run_incremental_permits(session, county_id=county_id)
+        builder_hits = run_builder_detectors(
+            session, as_of=as_of, county_id=county_id,
+        )
+        surface_relationship_hits(session, builder_hits)
+        for pid, signal in map_hits_to_property_signals(session, builder_hits).items():
+            a = _bucket(pid)
+            a.triggers.add("builder")
+            a.is_builder = True
+            a.builder_entity_id = signal.buyer_entity_id
+            a.builder_name = signal.principal_name
+            a.add_date(signal.urgency_date)
+
         cash_since = as_of - timedelta(days=_CASH_LOOKBACK_DAYS)
         permit_since = as_of - timedelta(days=_PERMIT_LOOKBACK_DAYS)
         stalled_before = as_of - timedelta(days=_STALLED_MIN_AGE_DAYS)
@@ -441,25 +443,7 @@ def assemble_dial_candidates(
             a.triggers.add("stalled_flip")
             a.add_date(row["urgency_date"])
 
-        # 5) builder / new-construction signal
-        for row in session.execute(
-            _BUILDER_SQL,
-            {
-                "as_of": as_of,
-                "since": permit_since,
-                "county": county_id,
-                "p0": _NEW_CONSTRUCTION_PATTERNS[0],
-                "p1": _NEW_CONSTRUCTION_PATTERNS[1],
-                "p2": _NEW_CONSTRUCTION_PATTERNS[2],
-                "p3": _NEW_CONSTRUCTION_PATTERNS[3],
-            },
-        ).mappings():
-            a = _bucket(row["property_id"])
-            a.triggers.add("builder")
-            a.is_builder = True
-            a.add_date(row["urgency_date"])
-
-        # 6) auction / probate purchases (three sources → one trigger)
+        # 5) auction / probate purchases (three sources → one trigger)
         for row in session.execute(
             _FORECLOSURE_AUCTION_SQL,
             {"as_of_next": as_of_next, "since": auction_since, "county": county_id},
@@ -585,7 +569,7 @@ def assemble_dial_candidates(
             DialCandidate(
                 property_id=pid,
                 opportunity_id=e.get("opportunity_thread_id"),
-                buyer_entity_id=e.get("buyer_entity_id"),
+                buyer_entity_id=a.builder_entity_id or e.get("buyer_entity_id"),
                 triggers=sorted(a.triggers),
                 intent_tier=a.intent_tier,
                 # arv/max_ltc come from the WP-8B published ARV once its
@@ -597,7 +581,7 @@ def assemble_dial_candidates(
                 last_sale_price=_dec(e.get("last_sale_price")),
                 is_builder=a.is_builder,
                 urgency_date=a.urgency_date,
-                borrower_name=e.get("canonical_name"),
+                borrower_name=a.builder_name or e.get("canonical_name"),
                 owner_name=e.get("owner_name"),
                 property_address=address,
                 phone=e.get("phone_1"),

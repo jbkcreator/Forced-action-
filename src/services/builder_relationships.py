@@ -13,8 +13,13 @@ No-ops silently when unconfigured — same pattern as EXCEPTIONS lane.
 from __future__ import annotations
 
 import logging
+from datetime import date
 from decimal import Decimal
-from typing import Optional
+from typing import Iterable, Optional
+
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
 
 from config.settings import get_settings
 from src.services.builder_patterns import BuilderHit, PatternType
@@ -178,7 +183,7 @@ def build_relationships_text(hit: BuilderHit, sizing: Optional[BuilderSizingResu
 def emit_relationships_alert(
     hit: BuilderHit,
     sizing: Optional[BuilderSizingResult] = None,
-) -> None:
+) -> bool:
     """Post one builder opportunity card to the RELATIONSHIPS Slack queue.
 
     No-ops when the channel or token is unconfigured — mirrors the EXCEPTIONS
@@ -194,7 +199,7 @@ def emit_relationships_alert(
             hit.principal_name,
             hit.pattern,
         )
-        return
+        return False
 
     try:
         from slack_sdk import WebClient
@@ -209,7 +214,74 @@ def emit_relationships_alert(
             hit.principal_name,
             hit.pattern,
         )
+        return True
     except Exception:
         logger.exception(
             "Failed to post RELATIONSHIPS alert for builder %s", hit.principal_name
         )
+        return False
+
+
+_CLAIM_RELATIONSHIP_ALERT_SQL = text("""
+    INSERT INTO builder_relationship_alerts
+        (buyer_entity_id, pattern, latest_permit_date, surfaced_at)
+    VALUES (:buyer_entity_id, :pattern, :latest_permit_date, CURRENT_TIMESTAMP)
+    ON CONFLICT (buyer_entity_id, pattern, latest_permit_date) DO NOTHING
+    RETURNING buyer_entity_id
+""")
+
+_RELEASE_RELATIONSHIP_ALERT_SQL = text("""
+    DELETE FROM builder_relationship_alerts
+    WHERE buyer_entity_id = :buyer_entity_id
+      AND pattern = :pattern
+      AND latest_permit_date = :latest_permit_date
+""")
+
+
+def surface_relationship_hits(session: Session, hits: Iterable[BuilderHit]) -> int:
+    """Post qualifying builder events once, durably, across scheduled runs.
+
+    The database claim is committed before Slack I/O so concurrent dial-list
+    jobs cannot double-post. A failed or unconfigured delivery releases the
+    claim, allowing the next scheduled run to retry.
+    """
+    surfaced = 0
+    for hit in hits:
+        if not is_relationships_candidate(hit):
+            continue
+        params = {
+            "buyer_entity_id": hit.buyer_entity_id,
+            "pattern": hit.pattern,
+            "latest_permit_date": hit.latest_permit_date or date.min,
+        }
+        savepoint = session.begin_nested()
+        try:
+            claimed = session.execute(
+                _CLAIM_RELATIONSHIP_ALERT_SQL, params,
+            ).first()
+            savepoint.commit()
+            session.commit()
+        except SQLAlchemyError:
+            savepoint.rollback()
+            logger.exception(
+                "Could not claim RELATIONSHIPS event for builder %s",
+                hit.buyer_entity_id,
+            )
+            continue
+        if claimed is None:
+            continue
+        if emit_relationships_alert(hit):
+            surfaced += 1
+            continue
+        savepoint = session.begin_nested()
+        try:
+            session.execute(_RELEASE_RELATIONSHIP_ALERT_SQL, params)
+            savepoint.commit()
+            session.commit()
+        except SQLAlchemyError:
+            savepoint.rollback()
+            logger.exception(
+                "Could not release failed RELATIONSHIPS event for builder %s",
+                hit.buyer_entity_id,
+            )
+    return surfaced

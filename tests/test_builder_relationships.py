@@ -5,12 +5,15 @@ from datetime import date
 from decimal import Decimal
 from unittest import mock
 
+from sqlalchemy import text
+
 from src.services.builder_patterns import BuilderHit
 from src.services.builder_relationships import (
     build_relationships_blocks,
     build_relationships_text,
     emit_relationships_alert,
     is_relationships_candidate,
+    surface_relationship_hits,
 )
 from src.services.builder_sizing import BuilderSizingResult
 
@@ -141,3 +144,49 @@ def test_emit_posts_when_configured():
             assert call_kwargs["channel"] == "C0C2BRYKU4C"
             assert "blocks" in call_kwargs
             assert "text" in call_kwargs
+
+
+def test_surface_relationship_hits_posts_each_event_once(fresh_db, monkeypatch):
+    fresh_db.execute(text("""
+        CREATE TABLE builder_relationship_alerts (
+            buyer_entity_id BIGINT NOT NULL,
+            pattern VARCHAR(32) NOT NULL,
+            latest_permit_date DATE NOT NULL,
+            surfaced_at TIMESTAMP,
+            PRIMARY KEY (buyer_entity_id, pattern, latest_permit_date)
+        )
+    """))
+    fresh_db.commit()
+    posted = []
+    monkeypatch.setattr(
+        "src.services.builder_relationships.emit_relationships_alert",
+        lambda hit, sizing=None: posted.append(hit) or True,
+    )
+    hit = _hit("repeat_builder")
+
+    assert surface_relationship_hits(fresh_db, [hit]) == 1
+    assert surface_relationship_hits(fresh_db, [hit]) == 0
+    assert posted == [hit]
+
+
+def test_surface_relationship_hits_retries_when_delivery_fails(fresh_db, monkeypatch):
+    fresh_db.execute(text("""
+        CREATE TABLE builder_relationship_alerts (
+            buyer_entity_id BIGINT NOT NULL,
+            pattern VARCHAR(32) NOT NULL,
+            latest_permit_date DATE NOT NULL,
+            surfaced_at TIMESTAMP,
+            PRIMARY KEY (buyer_entity_id, pattern, latest_permit_date)
+        )
+    """))
+    fresh_db.commit()
+    monkeypatch.setattr(
+        "src.services.builder_relationships.emit_relationships_alert",
+        lambda hit, sizing=None: False,
+    )
+    hit = _hit("repeat_builder")
+
+    assert surface_relationship_hits(fresh_db, [hit]) == 0
+    assert surface_relationship_hits(fresh_db, [hit]) == 0
+    count = fresh_db.execute(text("SELECT COUNT(*) FROM builder_relationship_alerts")).scalar_one()
+    assert count == 0

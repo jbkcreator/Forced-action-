@@ -87,6 +87,16 @@ def db():
         engine.dispose()
 
 
+@pytest.fixture(autouse=True)
+def _empty_builder_pipeline(monkeypatch):
+    """Keep generic WP-9 tests focused; Stage-E behavior has a dedicated test."""
+    from src.services.dial_list import repository
+
+    monkeypatch.setattr(repository, "run_incremental_permits", lambda *a, **k: {})
+    monkeypatch.setattr(repository, "run_builder_detectors", lambda *a, **k: [])
+    monkeypatch.setattr(repository, "map_hits_to_property_signals", lambda *a, **k: {})
+
+
 _pid_seq = [0]
 
 
@@ -233,17 +243,63 @@ def test_financing_intent_feed_maps_tier(db):
     assert cands[0].intent_tier == "high"
 
 
-def test_builder_flag(db):
+def test_builder_patterns_feed_resolved_principal_to_dial_list(db, monkeypatch):
+    from src.services.builder_patterns import BuilderHit, PropertyBuilderSignal
+    from src.services.dial_list import repository
+
     pid = _prop(db)
-    db.add(BuildingPermit(property_id=pid, permit_number="P1",
-                          permit_type="New Construction - SFR",
-                          issue_date=AS_OF - timedelta(days=60),
-                          is_enforcement_permit=False, county_id="hillsborough"))
     db.flush()
+
+    resolution_calls = []
+    relationship_batches = []
+    hit = BuilderHit(
+        pattern="repeat_builder",
+        buyer_entity_id=777,
+        principal_name="RESOLVED BUILDER LLC",
+        evidence_permit_ids=[11, 12],
+        county_id="hillsborough",
+        latest_permit_date=AS_OF - timedelta(days=7),
+        property_id=pid,
+    )
+    monkeypatch.setattr(
+        repository,
+        "run_incremental_permits",
+        lambda session, county_id=None: resolution_calls.append(county_id) or {},
+    )
+    monkeypatch.setattr(
+        repository,
+        "run_builder_detectors",
+        lambda session, as_of=None, county_id=None: [hit],
+    )
+    monkeypatch.setattr(
+        repository,
+        "surface_relationship_hits",
+        lambda session, hits: relationship_batches.append(list(hits)) or 1,
+    )
+    monkeypatch.setattr(
+        repository,
+        "map_hits_to_property_signals",
+        lambda session, hits: {
+            pid: PropertyBuilderSignal(
+                property_id=pid,
+                patterns=["repeat_builder"],
+                urgency_date=hit.latest_permit_date,
+                buyer_entity_id=777,
+                principal_name="RESOLVED BUILDER LLC",
+            )
+        },
+    )
+
     cands = assemble_dial_candidates(db, as_of=AS_OF)
+
+    assert resolution_calls == [None]
+    assert relationship_batches == [[hit]]
     assert len(cands) == 1
     assert cands[0].is_builder is True
     assert "builder" in cands[0].triggers
+    assert cands[0].buyer_entity_id == 777
+    assert cands[0].borrower_name == "RESOLVED BUILDER LLC"
+    assert cands[0].urgency_date == AS_OF - timedelta(days=7)
 
 
 def test_probate_detected(db):
