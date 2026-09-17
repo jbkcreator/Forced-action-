@@ -37,7 +37,16 @@ logger = logging.getLogger(__name__)
 # immediate suppression trigger. Matches suppression_sync._SUPPRESS_ON_STATUS's
 # intent (bounced, unsubscribed) but keyed on the webhook's own vocabulary,
 # which is not guaranteed to match the lead-status polling vocabulary.
-_SUPPRESS_ON_EVENT = {"email_bounced", "lead_unsubscribed"}
+#
+# Values are short, fixed labels (not f"instantly_webhook:{event_type}") --
+# email_opt_outs.source is VARCHAR(30), and "instantly_webhook:email_bounced"
+# (32 chars) overflowed it, silently failing the suppression INSERT the
+# first time this was exercised against a real event (caught by manual
+# local verification, 2026-09). Every value here must stay under 30 chars.
+_SUPPRESS_ON_EVENT = {
+    "email_bounced": "instantly_webhook_bounce",
+    "lead_unsubscribed": "instantly_webhook_unsub",
+}
 
 
 def _extract_email(payload: dict[str, Any]) -> Optional[str]:
@@ -65,7 +74,8 @@ def handle_event(db, payload: dict[str, Any]) -> bool:
     and chose to ignore.
     """
     event_type = (payload.get("event_type") or payload.get("event") or "").strip().lower()
-    if event_type not in _SUPPRESS_ON_EVENT:
+    source = _SUPPRESS_ON_EVENT.get(event_type)
+    if source is None:
         logger.info("[Relay][InstantlyWebhook] ignoring event_type=%s", event_type or "<missing>")
         return False
 
@@ -77,6 +87,6 @@ def handle_event(db, payload: dict[str, Any]) -> bool:
         )
         return False
 
-    suppress_contact(db, email=email, source=f"instantly_webhook:{event_type}")
+    suppress_contact(db, email=email, source=source)
     logger.info("[Relay][InstantlyWebhook] suppressed contact via event_type=%s", event_type)
     return True

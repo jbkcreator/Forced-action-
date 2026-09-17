@@ -22,7 +22,8 @@ def test_email_bounced_event_suppresses_contact():
     mock_suppress.assert_called_once()
     _, kwargs = mock_suppress.call_args
     assert kwargs["email"] == "dead@example.com"
-    assert kwargs["source"] == "instantly_webhook:email_bounced"
+    assert kwargs["source"] == "instantly_webhook_bounce"
+    assert len(kwargs["source"]) <= 30  # email_opt_outs.source is VARCHAR(30)
 
 
 def test_lead_unsubscribed_event_suppresses_contact():
