@@ -259,6 +259,18 @@ class BuildingPermitLoader(BaseLoader):
                         # buyer_entity_link) so detectors don't count the same permit
                         # twice — once via the matched property, once via staging.
                         self._promote_from_staging(record_number)
+                        try:
+                            from src.services.borrower_profile_service import (
+                                schedule_profile_recompute_for_property,
+                            )
+                            schedule_profile_recompute_for_property(
+                                self.session, property_record.id, "new_permit"
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Failed to schedule profile recompute for property %s after permit %s",
+                                property_record.id, record_number,
+                            )
                     else:
                         unmatched += 1
 

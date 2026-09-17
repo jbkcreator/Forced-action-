@@ -11,6 +11,10 @@ via property_id for all property-linked tables).
 Idempotent: ON CONFLICT (source_table, source_id) DO NOTHING means re-running
 produces the same result. Run dry-run first, then --apply against prod.
 
+Each source query streams via yield_per(_COMMIT_BATCH) (server-side cursor)
+rather than materializing the full result set -- these source tables can run
+into the hundreds of thousands of rows.
+
 Usage:
     PYTHONPATH=. python scripts/backfill_borrower_ledger.py            # dry-run
     PYTHONPATH=. python scripts/backfill_borrower_ledger.py --apply    # write to DB
@@ -55,13 +59,18 @@ class BackfillStats:
 # Source processors
 # --------------------------------------------------------------------------- #
 
-def _backfill_deed_acquisitions(session: Session, dry_run: bool) -> BackfillStats:
+def _backfill_deed_acquisitions(read_session: Session, write_session: Session, dry_run: bool) -> BackfillStats:
     """
     deed_acquisition — deeds where the grantee (buyer) is a resolved buyer entity.
     buyer_entity_links.source_table='deeds' links deeds directly to buyer_entity_id.
+
+    Reads via a dedicated session so the periodic commits below (issued on
+    write_session) never touch the transaction the server-side yield_per
+    cursor is scoped to -- committing that transaction mid-stream invalidates
+    the cursor and aborts the run past the first batch.
     """
     stats = BackfillStats("deeds/deed_acquisition")
-    rows = session.execute(text("""
+    rows = read_session.execute(text("""
         SELECT
             d.id,
             bel.buyer_entity_id,
@@ -76,7 +85,7 @@ def _backfill_deed_acquisitions(session: Session, dry_run: bool) -> BackfillStat
             ON bel.source_table = 'deeds' AND bel.source_id = d.id
         WHERE d.record_date IS NOT NULL
         ORDER BY d.id
-    """)).mappings().all()
+    """).execution_options(yield_per=_COMMIT_BATCH)).mappings()
 
     for r in rows:
         stats.attempted += 1
@@ -84,7 +93,7 @@ def _backfill_deed_acquisitions(session: Session, dry_run: bool) -> BackfillStat
         if not dry_run:
             try:
                 inserted = record_event(
-                    session,
+                    write_session,
                     buyer_entity_id=r["buyer_entity_id"],
                     event_type="deed_acquisition",
                     event_date=r["event_date"],
@@ -98,21 +107,22 @@ def _backfill_deed_acquisitions(session: Session, dry_run: bool) -> BackfillStat
                 stats.inserted += inserted
                 stats.skipped += not inserted
                 if stats.attempted % _COMMIT_BATCH == 0:
-                    session.commit()
+                    write_session.commit()
             except Exception as exc:
                 logger.error("deed_acquisition id=%d: %s", r["id"], exc)
-                session.rollback()
+                write_session.rollback()
                 stats.errors += 1
         else:
             stats.inserted += 1  # count as would-insert in dry-run
 
     if not dry_run:
-        session.commit()
+        write_session.commit()
     return stats
 
 
 def _backfill_via_owner_link(
-    session: Session,
+    read_session: Session,
+    write_session: Session,
     dry_run: bool,
     *,
     source_table: str,
@@ -127,9 +137,15 @@ def _backfill_via_owner_link(
     `query` must SELECT: id, property_id, event_date, amount (nullable),
     summary, and any extra columns packed into a 'meta_json' text column.
     The query is responsible for joining to the owner-resolution path.
+
+    Reads via a dedicated session -- see _backfill_deed_acquisitions for why
+    the write_session commits must never share the streaming cursor's
+    transaction.
     """
     stats = BackfillStats(f"{source_table}/{event_type}")
-    rows = session.execute(text(query)).mappings().all()
+    rows = read_session.execute(
+        text(query).execution_options(yield_per=_COMMIT_BATCH),
+    ).mappings()
 
     for r in rows:
         stats.attempted += 1
@@ -142,7 +158,7 @@ def _backfill_via_owner_link(
                 import json
                 meta = json.loads(r["meta_json"]) if r.get("meta_json") else None
                 inserted = record_event(
-                    session,
+                    write_session,
                     buyer_entity_id=r["buyer_entity_id"],
                     event_type=event_type,
                     event_date=r["event_date"],
@@ -156,16 +172,16 @@ def _backfill_via_owner_link(
                 stats.inserted += inserted
                 stats.skipped += not inserted
                 if stats.attempted % _COMMIT_BATCH == 0:
-                    session.commit()
+                    write_session.commit()
             except Exception as exc:
                 logger.error("%s id=%d: %s", source_table, r["id"], exc)
-                session.rollback()
+                write_session.rollback()
                 stats.errors += 1
         else:
             stats.inserted += 1
 
     if not dry_run:
-        session.commit()
+        write_session.commit()
     return stats
 
 
@@ -315,7 +331,10 @@ def run(source_filter: Optional[str], dry_run: bool) -> None:
 
     all_stats: list[BackfillStats] = []
 
-    with Session_() as session:
+    # Two sessions: read_session owns the server-side yield_per cursor and is
+    # never committed; write_session issues the periodic commits. Sharing one
+    # session for both invalidates the cursor on the first commit past batch 1.
+    with Session_() as read_session, Session_() as write_session:
         sources = [source_filter] if source_filter else list(_ALL_SOURCES)
 
         for src in sources:
@@ -324,11 +343,11 @@ def run(source_filter: Optional[str], dry_run: bool) -> None:
                 continue
 
             if src == "deeds":
-                stats = _backfill_deed_acquisitions(session, dry_run)
+                stats = _backfill_deed_acquisitions(read_session, write_session, dry_run)
             else:
                 table, event_type, query = _ALL_SOURCES[src]
                 stats = _backfill_via_owner_link(
-                    session, dry_run,
+                    read_session, write_session, dry_run,
                     source_table=table,
                     event_type=event_type,
                     query=query,
