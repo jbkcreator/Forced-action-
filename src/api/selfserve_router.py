@@ -23,6 +23,13 @@
   POST /api/admin/selfserve/tracked-links  — admin JWT. Mint a tracked link.
   GET  /api/admin/selfserve/tracked-links  — admin JWT. List tracked links.
 
+Link generation without an engineer (the client's "own outreach lane"
+requirement) ships as a Slack slash command, not a route in this file — the
+FA Max Slack app is Socket Mode, so slash commands arrive over a WebSocket,
+not an HTTP POST. See src/services/tracked_links.py
+(handle_tracked_link_socket_request) and src/services/relay/socket_listener.py
+(PR #276) for where it actually lives.
+
 An unknown or inactive slug redirects to the generic flow and logs a
 warning — it never 404s a borrower (a dead link in a printed mailer must not
 be a dead end). An unknown *session* token does 404 — that can only happen
@@ -57,13 +64,16 @@ from src.services.selfserve_sessions import (
     is_backflip_suppressed,
     submit_session,
 )
-from src.services.tracked_links import mint_link, record_click, resolve_slug
+from src.services.tracked_links import (
+    VALID_TRACKED_LINK_KINDS,
+    mint_link,
+    record_click,
+    resolve_slug,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["selfserve"])
-
-_VALID_KINDS = ("partner", "campaign", "source", "property_mailer")
 
 # WI-4 — Redis rate limit on session creation and submit per IP. Fails open
 # (never blocks) if Redis is unavailable, same convention as every other
@@ -345,8 +355,8 @@ def create_tracked_link(
     admin: dict = Depends(get_current_admin),
     db: Session = Depends(get_db),
 ):
-    if body.kind not in _VALID_KINDS:
-        raise HTTPException(status_code=422, detail=f"kind must be one of {_VALID_KINDS}")
+    if body.kind not in VALID_TRACKED_LINK_KINDS:
+        raise HTTPException(status_code=422, detail=f"kind must be one of {VALID_TRACKED_LINK_KINDS}")
 
     link = mint_link(
         db,
@@ -375,3 +385,4 @@ def list_tracked_links(
         )
     ).mappings().all()
     return [_to_response(TrackedLink(**dict(row))) for row in rows]
+

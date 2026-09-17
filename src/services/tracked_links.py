@@ -101,3 +101,91 @@ def record_click(
     db.add(click)
     db.flush()
     return click
+
+
+# ---------------------------------------------------------------------------
+# Slack slash command: /tracked-link — link generation without an engineer.
+#
+# Lives here, not in src/services/relay/, deliberately: WP-7 owns this logic,
+# the shared Socket Mode connection (src/services/relay/socket_listener.py,
+# PR #276) just imports and registers it. Contract matches that module's
+# handle_socket_request exactly (client, request) -> bool, so it drops into
+# the same socket_mode_request_listeners list without any changes there
+# beyond one registration line — see the Phase B follow-up.
+# ---------------------------------------------------------------------------
+
+VALID_TRACKED_LINK_KINDS = ("partner", "campaign", "source", "property_mailer")
+
+_SLASH_COMMAND = "/tracked-link"
+_SLASH_USAGE = (
+    "Usage: `/tracked-link <partner|campaign|source|property_mailer> <label or address>`\n"
+    "Examples:\n"
+    "  `/tracked-link partner Acme Title Co`\n"
+    "  `/tracked-link property_mailer 123 Main St, Tampa FL 33602`"
+)
+
+
+def _slack_ephemeral(msg: str) -> dict:
+    return {"response_type": "ephemeral", "text": msg}
+
+
+def build_tracked_link_reply(db: Session, text_arg: str, user: str) -> dict:
+    """Parse the slash command's text, mint the link, return the Slack
+    response payload. Split out from the Socket Mode envelope handling below
+    so it's testable with a plain db session — no fake Slack objects needed."""
+    from src.services.prefill_assembly import find_property_by_address
+
+    parts = (text_arg or "").strip().split(maxsplit=1)
+    if len(parts) < 2:
+        return _slack_ephemeral(_SLASH_USAGE)
+
+    kind, rest = parts[0].lower(), parts[1].strip()
+    if kind not in VALID_TRACKED_LINK_KINDS:
+        return _slack_ephemeral(
+            f"Unknown kind {kind!r}. Use one of: {', '.join(VALID_TRACKED_LINK_KINDS)}\n\n{_SLASH_USAGE}"
+        )
+
+    property_id = None
+    label = rest
+    if kind == "property_mailer":
+        property_id, _confidence = find_property_by_address(db, rest)
+        if property_id is None:
+            return _slack_ephemeral(
+                f"Couldn't confidently match {rest!r} to a property — check the address and try again."
+            )
+        label = f"mailer: {rest}"
+
+    link = mint_link(db, kind=kind, label=label, created_by=f"slack:{user}", property_id=property_id)
+
+    from config.settings import settings
+    base = settings.app_base_url.rstrip("/") if settings.app_base_url else ""
+    return _slack_ephemeral(f"Created: {base}/go/{link.slug}")
+
+
+def handle_tracked_link_socket_request(client, request) -> bool:
+    """Socket Mode envelope handler for the /tracked-link slash command.
+
+    Returns True only when this listener handled the request — every other
+    app action is left untouched so a shared Socket Mode connection does not
+    accidentally mutate another workflow (same contract as
+    src/services/relay/socket_listener.py's handle_socket_request).
+    """
+    if request.type != "slash_commands":
+        return False
+    payload = request.payload or {}
+    if payload.get("command") != _SLASH_COMMAND:
+        return False
+
+    from slack_sdk.socket_mode.response import SocketModeResponse
+    from src.core.database import get_db_context
+
+    text_arg = payload.get("text") or ""
+    user = payload.get("user_name") or "someone"
+
+    with get_db_context() as db:
+        reply = build_tracked_link_reply(db, text_arg, user)
+
+    client.send_socket_mode_response(
+        SocketModeResponse(envelope_id=request.envelope_id, payload=reply)
+    )
+    return True
