@@ -800,6 +800,11 @@ def compute_cluster_confidences(
             current = non_structural_mins.get(idx)
             non_structural_mins[idx] = verdict.confidence if current is None else min(current, verdict.confidence)
 
+    # Singletons (no edges at all) are brand-new names that matched nothing.
+    # They are NOT verified — assign confidence just below the EXCEPTIONS floor
+    # so they are routed for human review instead of silently trusted.
+    _NEW_SINGLETON_CONFIDENCE = 60
+
     confidences = []
     for i in range(len(clusters)):
         if i in non_structural_mins:
@@ -807,7 +812,7 @@ def compute_cluster_confidences(
         elif i in structural_max:
             confidences.append(structural_max[i])
         else:
-            confidences.append(100)
+            confidences.append(_NEW_SINGLETON_CONFIDENCE)
     return confidences
 
 

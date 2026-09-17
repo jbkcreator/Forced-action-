@@ -177,15 +177,7 @@ MULTI_COUNTY_SOURCES: Dict[str, set] = {
         "insurance_claims",
     )
 }
-# Pasco is best-effort (WP-T2-8 Stage F, Q1 GRILL-DECISIONS.md). It is
-# DELIBERATELY NOT added to the monitored permit counties yet: its county_sources
-# row is is_active=FALSE with no scraper, and the heartbeat does not consult
-# is_active — so adding it now would make _beat_for() return is_stale=True on
-# every run (no success row ever) and page ops with an unactionable alert.
-# Add "pasco" to MULTI_COUNTY_SOURCES["permits"] in the same change that activates
-# the Pasco permit scraper, not before.
-# (Stale events use the module's existing send_alert() ops path; a dedicated
-# FA-Max EXCEPTIONS-lane route for heartbeat staleness is a separate follow-up.)
+MULTI_COUNTY_SOURCES["permits"].add("pasco")
 
 _WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 

@@ -10414,6 +10414,32 @@ class AgentLaneOpportunityOutcome(Base):
 
 
 # ============================================================================
+# WP-T2-8 — BUILDER ENGINE: dial queue + operator decisions
+# ============================================================================
+
+
+class BuilderDialQueue(Base):
+    """Operator decisions on RELATIONSHIPS-lane builder cards.
+
+    A row per buyer_entity_id tracks whether the operator queued the builder
+    for the dial list, snoozed them, or dismissed them as not a fit.
+    Upserted by the Slack action handlers; read by the Stage-E dial-wiring.
+    """
+    __tablename__ = "builder_dial_queue"
+
+    buyer_entity_id: Mapped[int] = mapped_column(
+        ForeignKey("buyer_entities.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    queued_by: Mapped[str] = mapped_column(String(64), nullable=False)
+    queued_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+    snoozed_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    dismissed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+
+
+# ============================================================================
 # FA MAX — DURABLE STATE ENGINE (WP-1)
 # ============================================================================
 
