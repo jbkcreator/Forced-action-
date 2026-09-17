@@ -1,4 +1,4 @@
-﻿"""Create and verify two non-sending FA Max Socket Mode approval cards.
+"""Create and verify two non-sending FA Max Socket Mode approval cards.
 
 This is a local acceptance harness. It queues cards only; it never runs a
 Relay sweep, so neither card can send email or SMS. Use ``create`` to produce
@@ -94,4 +94,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
