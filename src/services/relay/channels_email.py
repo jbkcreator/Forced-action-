@@ -43,16 +43,33 @@ def build_passthrough_body(body_text: str, recipient: str, venture) -> str:
     """Wrap plain-text body in the passthrough campaign's required HTML shell.
 
     Escapes the text, converts newlines to <br>, and appends the CAN-SPAM
-    footer (venture brand + postal address + one-click unsubscribe). Shared
-    by the Relay send channel and the Vertical Autopilot probe so both carry
-    an identical, compliant footer through the same passthrough campaign.
+    footer (venture brand + postal address + optional phone + optional
+    compliance disclaimer + one-click unsubscribe). Shared by the Relay send
+    channel and the Vertical Autopilot probe so both carry an identical,
+    compliant footer through the same passthrough campaign.
+
+    outbound_contact_phone / outbound_disclaimer (WP-T2-1 go-live review,
+    2026-09, SOT.md client Q9) are per-venture and optional — a venture with
+    neither set (e.g. venture #1) renders exactly the pre-existing
+    brand+address+unsubscribe footer, unchanged.
     """
     nl_to_br = _html_escape(body_text).replace("\r\n", "\n").replace("\n", "<br>\n")
     unsub = unsubscribe_url(recipient)
+
+    identity_lines = [venture.brand_name, venture.postal_address]
+    phone = getattr(venture, "outbound_contact_phone", None)
+    if phone:
+        identity_lines.append(_html_escape(phone))
+    identity_html = "<br>".join(line for line in identity_lines if line)
+
+    disclaimer = getattr(venture, "outbound_disclaimer", None)
+    disclaimer_html = f'<br><br>{_html_escape(disclaimer)}' if disclaimer else ""
+
     return (
         f'<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.6;max-width:600px">'
         f"{nl_to_br}"
-        f'<br><br>--<br>{venture.brand_name}<br>{venture.postal_address}<br><br>'
+        f'<br><br>--<br>{identity_html}'
+        f'{disclaimer_html}<br><br>'
         f'<a href="{unsub}" style="color:#888;font-size:12px">Unsubscribe</a>'
         f"</div>"
     )

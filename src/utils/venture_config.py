@@ -62,6 +62,11 @@ class VentureConfig:
     display_name: str
     brand_name: str
     postal_address: str
+    # CAN-SPAM footer extras (WP-T2-1 go-live review, 2026-09) — both
+    # optional; None means the footer omits that line rather than rendering
+    # a blank one (see channels_email.py:build_passthrough_body).
+    outbound_contact_phone: Optional[str]
+    outbound_disclaimer: Optional[str]
 
     # Geography — read by the flood/insurance/storm scrapers (`state`) and
     # bankruptcy_engine (`bankruptcy_court_code`, `default_bankruptcy_division`)
@@ -98,6 +103,8 @@ def _from_settings(venture_key: str) -> VentureConfig:
         display_name=venture_key,
         brand_name=_FALLBACK_BRAND_NAME,
         postal_address=settings.company_postal_address,
+        outbound_contact_phone=None,
+        outbound_disclaimer=None,
         state="FL",
         bankruptcy_court_code="flmb",
         default_bankruptcy_division="8:",
@@ -141,6 +148,8 @@ def _from_row(row) -> VentureConfig:
         display_name=row.display_name,
         brand_name=row.brand_name,
         postal_address=row.postal_address or settings.company_postal_address,
+        outbound_contact_phone=row.outbound_contact_phone,
+        outbound_disclaimer=row.outbound_disclaimer,
         state=row.state,
         bankruptcy_court_code=row.bankruptcy_court_code,
         default_bankruptcy_division=row.default_bankruptcy_division,
@@ -183,6 +192,8 @@ def _disabled_config(row) -> VentureConfig:
         display_name=row.display_name,
         brand_name=row.brand_name,
         postal_address=row.postal_address,
+        outbound_contact_phone=row.outbound_contact_phone,
+        outbound_disclaimer=row.outbound_disclaimer,
         state=row.state,
         bankruptcy_court_code=row.bankruptcy_court_code,
         default_bankruptcy_division=row.default_bankruptcy_division,
@@ -201,7 +212,8 @@ def _disabled_config(row) -> VentureConfig:
 
 
 _SELECT_VENTURE = """
-    SELECT venture_key, display_name, brand_name, postal_address, state,
+    SELECT venture_key, display_name, brand_name, postal_address,
+           outbound_contact_phone, outbound_disclaimer, state,
            bankruptcy_court_code, default_bankruptcy_division, template_county_id,
            relay_slack_channel, relay_approvers, relay_instantly_campaign_id,
            relay_instantly_sender_email, relay_send_window_start,

@@ -36,6 +36,7 @@ PYTHONPATH=. python migrations/apply_fa_max_wp1_remaining.py  # FA Max WP-1 comp
 PYTHONPATH=. python migrations/apply_fa_max_wp2_queues.py   # FA Max WP-2 queue columns + consent table + fa_max_lending venture (idempotent, run after WP-1)
 PYTHONPATH=. python migrations/apply_fa_max_wp5b_profile.py  # FA Max WP-5B borrower buy-box/velocity/next-need profile table (idempotent, run after WP-1)
 PYTHONPATH=. python migrations/apply_fa_max_exceptions_alert_queue.py  # FA Max WP-T2-1 durable EXCEPTIONS alert retry queue (idempotent)
+PYTHONPATH=. python migrations/apply_fa_max_venture_footer_fields.py  # FA Max WP-T2-1 venture footer phone/disclaimer + Josh's confirmed fa_max_lending footer text (idempotent)
 
 # Tests
 pytest tests/                                  # default (excludes scenario)

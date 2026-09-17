@@ -5052,6 +5052,13 @@ class Venture(Base):
     # used to live in src/services/relay/channels_email.py.
     brand_name: Mapped[str] = mapped_column(String(120), nullable=False)
     postal_address: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Phone line and compliance disclaimer rendered in the same CAN-SPAM
+    # footer as brand_name/postal_address (WP-T2-1 go-live review, 2026-09,
+    # client Q9 "Email Branding, Signature, and Compliance Footer"). Both
+    # optional -- a venture with neither set gets the pre-existing
+    # brand+address+unsubscribe footer unchanged (channels_email.py).
+    outbound_contact_phone: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    outbound_disclaimer: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # Geography. `state` is read by the flood/insurance/storm scrapers for
     # NWS + FEMA lookups; the court fields by bankruptcy_engine. Both were
