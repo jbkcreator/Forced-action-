@@ -10,8 +10,11 @@ per the client's own Done-When (amendment doc item 20, L262):
 
 WHAT IT DOES
 
-Seeds one property and one property_mailer tracked link, then walks the real
-service functions exactly as the HTTP layer does: resolve_slug -> record_click
+Seeds one property and one tracked link bound to it directly (property_id set
+at mint time — the admin-mint path, not the Slack command, which no longer
+offers a property-bound kind since physical mail campaigns are out of scope),
+then walks the real service functions exactly as the HTTP layer does:
+resolve_slug -> record_click
 -> assemble_prefill -> create_session -> submit_session -> FakeBackflipPort
 .handoff(). Asserts the property was recognized without the borrower typing
 anything, the pre-fill payload carries no banned fields, consent was recorded,
@@ -134,7 +137,7 @@ def run(verbose: bool = False) -> int:
         )
 
         link = mint_link(
-            db, kind="property_mailer", label="acceptance harness mailer",
+            db, kind="source", label="acceptance harness link",
             created_by="wp7_acceptance", property_id=property_id,
         )
         db.flush()

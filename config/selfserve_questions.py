@@ -11,7 +11,7 @@ SELFSERVE_QUESTIONS: list[dict] = [
     {"key": "purchase_price", "label": "Purchase price / under contract?", "type": "text"},
     {"key": "rehab_budget", "label": "Rehab budget", "type": "currency"},
     {"key": "exit_strategy", "label": "Exit strategy", "type": "select", "options": ["flip", "hold"]},
-    {"key": "timeline_to_close", "label": "Timeline to close", "type": "text"},
+    {"key": "timeline_to_close", "label": "Timeline to close", "type": "date"},
     {"key": "prior_flip_count", "label": "Number of prior flips", "type": "integer"},
     {"key": "entity_name", "label": "Entity name the loan closes in", "type": "text"},
     {"key": "already_owned", "label": "Is the property already owned?", "type": "boolean"},

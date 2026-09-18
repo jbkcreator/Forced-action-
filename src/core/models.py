@@ -11650,12 +11650,26 @@ class FaMaxPersonProfile(Base):
 # ============================================================================
 
 class TrackedLink(Base):
-    """A partner/campaign/mailer-specific URL into the self-serve pre-fill flow.
+    """A partner/campaign/source URL into the self-serve pre-fill flow.
 
-    `property_id` is set for per-property mailers (the primary v1 experience —
-    instant recognition on click) and NULL for generic partner/campaign links,
-    which fall back to address entry resolved through BaseLoader's matching
-    waterfall. See tasks/FA_Max_build/dev2_wp7_selfserve_prefill_plan.md WI-1.
+    `property_id` is nullable and unset by the `/tracked-link` Slack command —
+    every link falls back to address entry resolved through BaseLoader's
+    matching waterfall. The column stays available for a future
+    admin-API-minted link bound to one known property, but there is no
+    per-property-mailer path (physical mail campaigns are out of scope; the
+    kind was removed 2026-09-18 — it was never in the client's spec). See
+    tasks/FA_Max_build/dev2_wp7_selfserve_prefill_plan.md WI-1.
+
+    `buyer_entity_id` is a separate, independent axis from `property_id` —
+    added 2026-09-18 so `/tracked-link` can bind a link to a known repeat
+    borrower (exact canonical_name match, disambiguated by
+    primary_mailing_address when the name alone is ambiguous — see
+    src/services/tracked_links.py:find_buyer_entity_by_name) without
+    requiring a target property address, which usually doesn't exist yet for
+    a borrower's *next* deal. A property's current owner-of-record is not
+    assumed to be the borrower buying it next, so this is never derived from
+    `property_id` — it is only ever set from an explicit name match at mint
+    time, or left NULL.
     """
     __tablename__ = "tracked_links"
 
@@ -11668,6 +11682,9 @@ class TrackedLink(Base):
     property_id: Mapped[Optional[int]] = mapped_column(
         Integer, ForeignKey("properties.id"), nullable=True
     )
+    buyer_entity_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("buyer_entities.id"), nullable=True
+    )
     destination: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_by: Mapped[str] = mapped_column(Text, nullable=False)
@@ -11678,7 +11695,7 @@ class TrackedLink(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "kind IN ('partner', 'campaign', 'source', 'property_mailer')",
+            "kind IN ('partner', 'campaign', 'source')",
             name="ck_tracked_links_kind",
         ),
     )

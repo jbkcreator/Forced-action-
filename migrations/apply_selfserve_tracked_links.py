@@ -24,12 +24,13 @@ STATEMENTS: list[tuple[str, str]] = [
             partner_ref   TEXT,
             campaign_ref  TEXT,
             property_id   INTEGER REFERENCES properties(id),
+            buyer_entity_id INTEGER REFERENCES buyer_entities(id),
             destination   TEXT,
             is_active     BOOLEAN NOT NULL DEFAULT true,
             created_by    TEXT NOT NULL,
             created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
             CONSTRAINT ck_tracked_links_kind
-                CHECK (kind IN ('partner', 'campaign', 'source', 'property_mailer'))
+                CHECK (kind IN ('partner', 'campaign', 'source'))
         );
         """,
     ),
