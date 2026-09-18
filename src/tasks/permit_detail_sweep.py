@@ -307,7 +307,39 @@ def run_sweep(
         time.sleep(delay)
 
     logger.info("Sweep done: %s", stats)
+    _post_slack_digest(county_filter or "all", stats, total=len(rows))
     return stats
+
+
+_ERROR_RATE_ALERT_THRESHOLD = 0.5  # alert when >50% of attempted permits errored
+
+
+def _post_slack_digest(county: str, stats: dict[str, int], total: int) -> None:
+    """Post a sweep summary to Slack. No-op when slack_bot_token is unset."""
+    from config.settings import get_settings
+    settings = get_settings()
+    token = getattr(settings, "slack_bot_token", None)
+    channel = getattr(settings, "relay_slack_channel", None)
+    if not token or not channel:
+        logger.debug("[permit_detail_sweep] Slack not configured — digest skipped")
+        return
+
+    attempted = stats["enriched"] + stats["errors"]
+    error_rate = stats["errors"] / attempted if attempted else 0
+    status = ":white_check_mark:" if error_rate <= _ERROR_RATE_ALERT_THRESHOLD else ":rotating_light:"
+
+    text = (
+        f"{status} *Permit detail sweep* — county: `{county}`\n"
+        f"Enriched: {stats['enriched']} | Skipped: {stats['skipped']} | "
+        f"Errors: {stats['errors']} / {total} total\n"
+        f"Error rate: {error_rate:.0%}"
+    )
+
+    try:
+        from slack_sdk import WebClient
+        WebClient(token=token).chat_postMessage(channel=channel, text=text)
+    except Exception as exc:
+        logger.warning("[permit_detail_sweep] Slack digest failed: %s", exc)
 
 
 def main() -> None:
