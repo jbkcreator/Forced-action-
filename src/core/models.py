@@ -11155,6 +11155,18 @@ class FaMaxPartner(Base):
     state_version: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text("0")
     )
+    # WP-T2-9 ranking snapshot fields (apply_partner_ranking_snapshot.py)
+    observed_transaction_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    first_observed_at: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    last_observed_at: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    county_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    buyer_entity_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("buyer_entities.id", name="fk_fa_max_partner_buyer_entity", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -11169,6 +11181,9 @@ class FaMaxPartner(Base):
         ),
         Index("ix_fa_max_partner_person_id", "person_id"),
         Index("ix_fa_max_partner_status", "status"),
+        Index("ix_fa_max_partner_class_txn", "partner_class", "observed_transaction_count"),
+        Index("ix_fa_max_partner_buyer_entity", "buyer_entity_id"),
+        Index("ix_fa_max_partner_county", "county_id"),
     )
 
     def __repr__(self) -> str:

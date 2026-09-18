@@ -107,10 +107,10 @@ def _run_county(county_id: str, *, dry_run: bool, as_of: date) -> int:
         from src.services.partner_mining.resolution import (
             run_counterparty_resolution, resolve_counterparty_names,
         )
-        run_counterparty_resolution(db, county_id=cid)
+        run_counterparty_resolution(db, county_id=county_id)
 
         # Load deed rows for this county within the lookback window.
-        deed_rows = db.execute(
+        result = db.execute(
             text("""
                 SELECT
                     d.id, d.property_id, d.instrument_number,
@@ -126,7 +126,8 @@ def _run_county(county_id: str, *, dry_run: bool, as_of: date) -> int:
                 ORDER BY d.record_date
             """),
             {"county_id": county_id, "since": since, "as_of": as_of},
-        ).fetchall()
+        )
+        deed_rows = list(result.yield_per(1000))
 
         if not deed_rows:
             logger.info("[PartnerMining] %s: no deed rows in window", county_id)
@@ -135,6 +136,7 @@ def _run_county(county_id: str, *, dry_run: bool, as_of: date) -> int:
         # ── Stage A: extract counterparties ──────────────────────────────────
         lender_counts: dict[str, dict] = {}
         wholesaler_names = set(find_wholesaler_candidates(deed_rows))
+        wholesaler_txn_counts: dict[str, int] = {}
 
         for row in deed_rows:
             homestead = bool(getattr(row, "homestead_exempt", False))
@@ -161,6 +163,11 @@ def _run_county(county_id: str, *, dry_run: bool, as_of: date) -> int:
             if not is_investor_transaction(row, homestead_exempt=homestead):
                 continue
 
+            # Track wholesaler transaction volume for observed-count ranking.
+            grantee = (getattr(row, "grantee", None) or "").strip().upper()
+            if grantee in wholesaler_names:
+                wholesaler_txn_counts[grantee] = wholesaler_txn_counts.get(grantee, 0) + 1
+
         # ── Stage B lookup: map raw lender names → buyer_entity_id ──────────
         lender_name_map = resolve_counterparty_names(db, list(lender_counts.keys()))
 
@@ -178,12 +185,11 @@ def _run_county(county_id: str, *, dry_run: bool, as_of: date) -> int:
             ))
 
         for name in wholesaler_names:
-            # Count qualifying investor txns where this name was the wholesaler.
             partner_rows.append(PartnerRow(
                 buyer_entity_id=0,
                 canonical_name=name,
                 partner_class=PartnerClass.WHOLESALER.value,
-                observed_transaction_count=1,
+                observed_transaction_count=wholesaler_txn_counts.get(name, 1),
                 last_observed_at=as_of,
             ))
 
@@ -196,8 +202,8 @@ def _run_county(county_id: str, *, dry_run: bool, as_of: date) -> int:
 
         # ── Stage E: enrich top-25 per class ─────────────────────────────────
         from src.services.partner_mining.enrich import enrich_top_partners
-        enrich_stats = enrich_top_partners(db, ranked, county_id=cid)
-        logger.info("[PartnerMining] %s enrichment: %s", cid, enrich_stats)
+        enrich_stats = enrich_top_partners(db, ranked, county_id=county_id)
+        logger.info("[PartnerMining] %s enrichment: %s", county_id, enrich_stats)
 
         upsert_partner_rows(db, ranked, county_id=county_id)
         return len(ranked)

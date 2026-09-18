@@ -73,8 +73,8 @@ def enrich_top_partners(
             row.needs_enrichment = True
             needs_enrichment_count += 1
             logger.debug(
-                "[PartnerMining] no owner link for entity %d (%s) — needs_enrichment",
-                row.buyer_entity_id, row.canonical_name,
+                "[PartnerMining] no owner link for entity %d — needs_enrichment",
+                row.buyer_entity_id,
             )
             continue
 
@@ -88,7 +88,7 @@ def enrich_top_partners(
             enriched += 1
         except Exception as exc:
             logger.warning(
-                "[PartnerMining] enrichment failed for %s: %s", row.canonical_name, exc
+                "[PartnerMining] enrichment failed for entity %d: %s", row.buyer_entity_id, exc
             )
             row.needs_enrichment = True
             needs_enrichment_count += 1
