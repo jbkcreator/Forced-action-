@@ -1,0 +1,359 @@
+"""
+Post-load permit detail enrichment sweep.
+
+Queries building_permits WHERE contractor_name IS NULL (up to --limit rows),
+fetches Accela CapDetail pages, parses contractor/applicant/owner fields,
+and persists them back to the same row.
+
+Resolution strategy by county:
+  Pasco:            capIDs = permit_number.split('-')  — 3-segment format REC26-00000-01VUT
+  Hillsborough /
+  Pinellas:         single Playwright session; search by record number to get CapDetail href
+
+Usage:
+    PYTHONPATH=. python -m src.tasks.permit_detail_sweep
+    PYTHONPATH=. python -m src.tasks.permit_detail_sweep --county pasco --limit 100 --delay 1.5
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+from sqlalchemy import create_engine, text
+
+# Make sure project root is on path when invoked as __main__
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from config.settings import get_settings
+from src.scrappers.permit.detail_parse import parse_permit_detail, PermitDetail
+from src.scrappers.permit.detail_url import build_detail_url
+
+logger = logging.getLogger(__name__)
+
+# --- agency code lookup -------------------------------------------------------
+
+_AGENCY_CODE: dict[str, str] = {
+    "hillsborough": "HCFL",
+    "pinellas": "PINELLAS",
+    "pasco": "PASCO",
+}
+
+_SEARCH_URL: dict[str, str] = {
+    "hillsborough": "https://aca-prod.accela.com/HCFL/Cap/CapHome.aspx?module=Building&TabName=Building",
+    "pinellas": "https://aca-prod.accela.com/PINELLAS/Cap/CapHome.aspx?module=Building&TabName=Building",
+}
+
+_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+# --- URL resolution -----------------------------------------------------------
+
+def _pasco_detail_url(permit_number: str) -> Optional[str]:
+    """Pasco permit format REC26-00000-01VUT encodes capIDs directly."""
+    parts = permit_number.split("-")
+    if len(parts) != 3:
+        return None
+    return build_detail_url("PASCO", parts[0], parts[1], parts[2])
+
+
+def _fetch_html_http(url: str) -> Optional[str]:
+    """Plain HTTP GET for counties where capIDs are known (Pasco)."""
+    from src.utils.http_helpers import requests_get_with_retry
+    try:
+        resp = requests_get_with_retry(url, headers={"User-Agent": _UA})
+        return resp.text
+    except Exception as exc:
+        logger.warning("HTTP GET failed for %s: %s", url, exc)
+        return None
+
+
+def _playwright_fetch_html(permit_number: str, county_id: str) -> Optional[str]:
+    """
+    Open one Playwright page, search by record number, navigate to CapDetail,
+    return the HTML.  Called once per H/P permit.
+    """
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+    search_url = _SEARCH_URL.get(county_id)
+    if not search_url:
+        logger.error("No search URL for county %s", county_id)
+        return None
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        ctx = browser.new_context(user_agent=_UA, viewport={"width": 1400, "height": 900})
+        page = ctx.new_page()
+        try:
+            page.goto(search_url, timeout=60_000, wait_until="domcontentloaded")
+            page.wait_for_load_state("networkidle", timeout=30_000)
+            page.wait_for_timeout(2000)
+
+            # Fill permit number in the dedicated permit-number field
+            permit_input = page.query_selector(
+                "#ctl00_PlaceHolderMain_generalSearchForm_txtGSPermitNumber"
+            )
+            if not permit_input:
+                logger.warning("[%s] Permit-number input not found for %s", county_id, permit_number)
+                browser.close()
+                return None
+
+            permit_input.evaluate("el => { el.value = ''; el.dispatchEvent(new Event('input')); }")
+            permit_input.fill(permit_number)
+            page.wait_for_timeout(400)
+
+            # Submit via JS click (element may not be visible in headless layout)
+            submitted = False
+            for sel in [
+                "#ctl00_PlaceHolderMain_btnNewSearch",
+                "a[id*='btnNewSearch']",
+                "#SearchForm_Start",
+            ]:
+                el = page.query_selector(sel)
+                if el:
+                    el.evaluate("el => el.click()")
+                    submitted = True
+                    break
+            if not submitted:
+                logger.warning("[%s] Search submit button not found for %s", county_id, permit_number)
+                browser.close()
+                return None
+
+            # Wait for Accela AJAX loading mask: appear then disappear
+            try:
+                page.wait_for_selector("#divGlobalLoadingMask:not(.ACA_Hide)", timeout=8_000)
+            except Exception:
+                pass
+            try:
+                page.wait_for_selector("#divGlobalLoadingMask.ACA_Hide", timeout=30_000)
+            except Exception:
+                page.wait_for_timeout(4000)
+
+            # Accela may redirect to detail (single match) or show a results list.
+            # If results list: find first CapDetail href and navigate.
+            try:
+                hrefs = [
+                    a.get_attribute("href") or ""
+                    for a in page.query_selector_all("a[href*='CapDetail']")
+                ]
+            except Exception:
+                # Execution context destroyed mid-navigation — wait and retry once
+                try:
+                    page.wait_for_load_state("networkidle", timeout=20_000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(2000)
+                hrefs = [
+                    a.get_attribute("href") or ""
+                    for a in page.query_selector_all("a[href*='CapDetail']")
+                ]
+
+            if hrefs:
+                href = hrefs[0]
+                # Handle absolute, root-relative, and relative URLs
+                if href.startswith("http"):
+                    pass
+                elif href.startswith("/"):
+                    href = "https://aca-prod.accela.com" + href
+                else:
+                    # relative like ../Cap/CapDetail.aspx — resolve from portal base
+                    base = f"https://aca-prod.accela.com/{_AGENCY_CODE.get(county_id, county_id.upper())}/"
+                    href = base + href.lstrip("./")
+                page.goto(href, timeout=60_000, wait_until="domcontentloaded")
+                try:
+                    page.wait_for_load_state("networkidle", timeout=30_000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(2500)
+
+            # Verify we landed on a detail page
+            body_text = page.inner_text("body")
+            if "Licensed Professional" not in body_text and "Applicant" not in body_text and "Owner" not in body_text:
+                logger.warning("[%s] Result page doesn't look like detail for %s", county_id, permit_number)
+                browser.close()
+                return None
+
+            html = page.content()
+            browser.close()
+            return html
+
+        except PWTimeout as exc:
+            logger.warning("[%s] Playwright timeout for %s: %s", county_id, permit_number, exc)
+            browser.close()
+            return None
+        except Exception as exc:
+            logger.error("[%s] Playwright error for %s: %s", county_id, permit_number, exc)
+            try:
+                browser.close()
+            except Exception:
+                pass
+            return None
+
+
+# --- DB persistence -----------------------------------------------------------
+
+def _update_permit(conn, permit_id: int, detail: PermitDetail) -> None:
+    from src.services.phone_utils import normalize as normalize_phone
+    conn.execute(
+        text("""
+            UPDATE building_permits SET
+                contractor_name         = COALESCE(contractor_name, :contractor_name),
+                holder_name             = COALESCE(holder_name, :holder_name),
+                completion_status       = COALESCE(completion_status, :completion_status),
+                contractor_license      = COALESCE(contractor_license, :contractor_license),
+                contractor_license_type = COALESCE(contractor_license_type, :contractor_license_type),
+                contractor_phone        = COALESCE(contractor_phone, :contractor_phone),
+                contractor_email        = COALESCE(contractor_email, :contractor_email),
+                applicant_name          = COALESCE(applicant_name, :applicant_name),
+                owner_name              = COALESCE(owner_name, :owner_name)
+            WHERE id = :id
+        """),
+        {
+            "contractor_name": detail.licensed_professional_name,
+            "holder_name": detail.applicant_name,
+            "completion_status": detail.completion_status,
+            "contractor_license": detail.contractor_license,
+            "contractor_license_type": detail.contractor_license_type,
+            "contractor_phone": normalize_phone(detail.contractor_phone) if detail.contractor_phone else None,
+            "contractor_email": detail.contractor_email,
+            "applicant_name": detail.applicant_name,
+            "owner_name": detail.owner_name,
+            "id": permit_id,
+        },
+    )
+
+
+# --- Main sweep ---------------------------------------------------------------
+
+def run_sweep(
+    county_filter: Optional[str] = None,
+    limit: int = 50,
+    delay: float = 2.0,
+) -> dict[str, int]:
+    """
+    Fetch and persist detail data for up to `limit` permits missing contractor_name.
+
+    Returns stats dict: enriched / skipped / errors.
+    """
+    engine = create_engine(get_settings().database_url)
+    stats = {"enriched": 0, "skipped": 0, "errors": 0}
+
+    county_clause = "AND bp.county_id = :county" if county_filter else ""
+
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(f"""
+                SELECT bp.id, bp.permit_number, bp.county_id
+                FROM building_permits bp
+                WHERE bp.contractor_name IS NULL
+                  {county_clause}
+                ORDER BY bp.id
+                LIMIT :limit
+            """),
+            {"limit": limit, **({"county": county_filter} if county_filter else {})},
+        ).fetchall()
+
+    logger.info("Sweep: %d permits to enrich (county=%s, limit=%d)", len(rows), county_filter or "all", limit)
+
+    for row in rows:
+        permit_id, permit_number, county_id = row.id, row.permit_number, row.county_id
+
+        html: Optional[str] = None
+        if county_id == "pasco":
+            url = _pasco_detail_url(permit_number)
+            if url:
+                html = _fetch_html_http(url)
+            else:
+                logger.warning("Pasco: cannot derive URL for permit %s", permit_number)
+                stats["skipped"] += 1
+                continue
+        elif county_id in ("hillsborough", "pinellas"):
+            html = _playwright_fetch_html(permit_number, county_id)
+        else:
+            logger.warning("Unknown county %s for permit %s — skipping", county_id, permit_number)
+            stats["skipped"] += 1
+            continue
+
+        if not html:
+            stats["errors"] += 1
+            time.sleep(delay)
+            continue
+
+        try:
+            detail = parse_permit_detail(html)
+        except Exception as exc:
+            logger.error("Parse failed for %s: %s", permit_number, exc)
+            stats["errors"] += 1
+            time.sleep(delay)
+            continue
+
+        try:
+            with engine.begin() as conn:
+                _update_permit(conn, permit_id, detail)
+            stats["enriched"] += 1
+            logger.info(
+                "Enriched %s (%s): license=%r",
+                permit_number, county_id, detail.contractor_license,
+            )
+        except Exception as exc:
+            logger.error("DB update failed for %s: %s", permit_number, exc)
+            stats["errors"] += 1
+
+        time.sleep(delay)
+
+    logger.info("Sweep done: %s", stats)
+    _post_slack_digest(county_filter or "all", stats, total=len(rows))
+    return stats
+
+
+_ERROR_RATE_ALERT_THRESHOLD = 0.5  # alert when >50% of attempted permits errored
+
+
+def _post_slack_digest(county: str, stats: dict[str, int], total: int) -> None:
+    """Post a sweep summary to Slack. No-op when slack_bot_token is unset."""
+    from config.settings import get_settings
+    settings = get_settings()
+    token = getattr(settings, "slack_bot_token", None)
+    channel = getattr(settings, "relay_slack_channel", None)
+    if not token or not channel:
+        logger.debug("[permit_detail_sweep] Slack not configured — digest skipped")
+        return
+
+    attempted = stats["enriched"] + stats["errors"]
+    error_rate = stats["errors"] / attempted if attempted else 0
+    status = ":white_check_mark:" if error_rate <= _ERROR_RATE_ALERT_THRESHOLD else ":rotating_light:"
+
+    text = (
+        f"{status} *Permit detail sweep* — county: `{county}`\n"
+        f"Enriched: {stats['enriched']} | Skipped: {stats['skipped']} | "
+        f"Errors: {stats['errors']} / {total} total\n"
+        f"Error rate: {error_rate:.0%}"
+    )
+
+    try:
+        from slack_sdk import WebClient
+        WebClient(token=token).chat_postMessage(channel=channel, text=text)
+    except Exception as exc:
+        logger.warning("[permit_detail_sweep] Slack digest failed: %s", exc)
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    parser = argparse.ArgumentParser(description="Permit detail enrichment sweep")
+    parser.add_argument("--county", choices=["hillsborough", "pinellas", "pasco"], default=None)
+    parser.add_argument("--limit", type=int, default=50)
+    parser.add_argument("--delay", type=float, default=2.0, help="Seconds between requests")
+    args = parser.parse_args()
+
+    stats = run_sweep(county_filter=args.county, limit=args.limit, delay=args.delay)
+    print(f"Done: {stats}")
+
+
+if __name__ == "__main__":
+    main()
