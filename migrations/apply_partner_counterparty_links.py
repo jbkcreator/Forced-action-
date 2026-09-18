@@ -46,7 +46,7 @@ _MIGRATIONS = [
 
 def run() -> None:
     settings = get_settings()
-    engine = create_engine(settings.DATABASE_URL)
+    engine = create_engine(settings.database_url)
     with engine.begin() as conn:
         for sql in _MIGRATIONS:
             conn.execute(text(sql.strip()))
