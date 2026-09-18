@@ -11,8 +11,10 @@ routes on a plain dict lookup with the docstring "no LLM"; this loop is the
 same idea applied to a sequence of tool calls instead of a single event
 route. The loop node repeatedly:
 
-    pick next step -> look up tool in FA_MAX_TOOL_REGISTRY -> call it
-        -> log via fa_max_tool_log.log_tool_call() -> append result
+    pick next step -> look up tool in FA_MAX_TOOL_REGISTRY
+        -> fa_max_tool_log.start_tool_call() [audit row BEFORE execution]
+        -> call it -> fa_max_tool_log.finish_tool_call() [audit row updated]
+        -> append result
     until steps are exhausted, a tool call fails/blocks, or
     config.agents.AgentsSettings.fa_max_agent_max_tool_calls is reached.
 
@@ -32,13 +34,13 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import time
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, Callable, Dict, List, Optional, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
 from src.agents.fa_max.tool_registry import FA_MAX_TOOL_REGISTRY, get_fa_max_tool
 from src.services.fa_max_send_governance import GovernanceBlocked
-from src.services.fa_max_tool_log import log_tool_call
+from src.services.fa_max_tool_log import finish_tool_call, start_tool_call
 
 logger = logging.getLogger(__name__)
 
@@ -65,14 +67,98 @@ class FaMaxAgentState(TypedDict, total=False):
 
 
 def _call_tool(tool_name: str, args: Dict[str, Any], *, session) -> Any:
+    import inspect
+
     spec = get_fa_max_tool(tool_name)
     call_args = dict(args)
-    if "session" in spec.func.__code__.co_varnames:
+    # Uses inspect.signature() rather than a raw bytecode-varnames scan,
+    # which would list every local variable a function body assigns, not
+    # just its parameters -- a tool with a local variable happening to
+    # share the `session` name (but not a parameter) would otherwise
+    # silently receive an unexpected `session=` kwarg and raise TypeError
+    # on every invocation.
+    if "session" in inspect.signature(spec.func).parameters:
         call_args["session"] = session
     return spec.func(**call_args)
 
 
-def _call_tool_with_timeout(tool_name: str, args: Dict[str, Any], *, timeout_seconds: float) -> Any:
+def _reconcile_orphaned_call(
+    *, log_id: int, tool_name: str, agent_name: Optional[str], work_item_id: Optional[str],
+) -> "Callable[[concurrent.futures.Future], None]":
+    """Build a Future.add_done_callback() target that reconciles a timed-out
+    tool call's fa_max_tool_call_log row with its TRUE final outcome,
+    whenever the orphaned thread actually finishes.
+
+    Python cannot force-kill a thread, so a call that timed out from the
+    agent loop's point of view may still complete later -- including a
+    `send` tool whose side effect (an outbound message queued via
+    relay.queue.enqueue) genuinely lands after the loop already logged a
+    timeout and moved on. Rather than leaving that send permanently
+    unaudited (or its audit row permanently lying that it errored), this
+    callback fires when the future actually resolves -- possibly seconds or
+    minutes after the loop gave up -- and updates the SAME log_id row
+    (written by start_tool_call() before the call began) to the real
+    status/output. finish_tool_call() may therefore be called twice for one
+    log_id: once synchronously with status='error' when the timeout fires,
+    and once here, later, with the true outcome -- last write wins, and the
+    row is tagged so this is visible to anyone reading it.
+
+    This does not and cannot PREVENT the late side effect (there is no way
+    to abort an in-flight thread in Python) -- it closes the audit gap so
+    the late effect is never silently invisible.
+    """
+
+    def _callback(fut: concurrent.futures.Future) -> None:
+        from src.core.database import get_db_context
+
+        exc = fut.exception()
+        if exc is not None:
+            output: Dict[str, Any] = {"error": str(exc)}
+            status = "error"
+        else:
+            result = fut.result()
+            output = dict(result) if isinstance(result, dict) else {"result": result}
+            status = "success"
+        output["_late_completion_after_timeout"] = True
+
+        logger.warning(
+            "fa_max.agent_graph: tool %r for work_item_id=%s completed AFTER its "
+            "timeout was already logged (the agent loop had already moved on) -- "
+            "reconciling fa_max_tool_call_log id=%s to status=%s",
+            tool_name, work_item_id, log_id, status,
+        )
+        try:
+            with get_db_context() as session:
+                reconciled = finish_tool_call(
+                    session=session, log_id=log_id, output=output,
+                    duration_ms=None, status=status,
+                )
+            if not reconciled:
+                logger.error(
+                    "fa_max.agent_graph: failed to reconcile late completion for "
+                    "tool %r log_id=%s work_item_id=%s -- a real side effect may "
+                    "now be unaudited",
+                    tool_name, log_id, work_item_id,
+                )
+        except Exception:
+            logger.exception(
+                "fa_max.agent_graph: reconciliation callback raised for tool %r "
+                "log_id=%s work_item_id=%s",
+                tool_name, log_id, work_item_id,
+            )
+
+    return _callback
+
+
+def _call_tool_with_timeout(
+    tool_name: str,
+    args: Dict[str, Any],
+    *,
+    timeout_seconds: float,
+    log_id: Optional[int] = None,
+    agent_name: Optional[str] = None,
+    work_item_id: Optional[str] = None,
+) -> Any:
     """Run one tool call on its own DB session, in its own thread, bounded by
     fa_max_agent_tool_timeout_seconds.
 
@@ -87,6 +173,10 @@ def _call_tool_with_timeout(tool_name: str, args: Dict[str, Any], *, timeout_sec
     wait, not the callee's actual execution. The work item's own lease
     (fa_max_work_queue, reclaim_expired_work_items) remains the outer safety
     net for a worker process that is well and truly stuck.
+
+    On an actual timeout, if log_id is given, registers a done-callback
+    (see _reconcile_orphaned_call) so a late-completing call is never
+    silently unaudited -- see that function's docstring.
     """
     from src.core.database import get_db_context
 
@@ -98,6 +188,13 @@ def _call_tool_with_timeout(tool_name: str, args: Dict[str, Any], *, timeout_sec
     try:
         return future.result(timeout=timeout_seconds)
     except concurrent.futures.TimeoutError as exc:
+        if log_id is not None:
+            future.add_done_callback(
+                _reconcile_orphaned_call(
+                    log_id=log_id, tool_name=tool_name,
+                    agent_name=agent_name, work_item_id=work_item_id,
+                )
+            )
         raise ToolCallTimeout(
             f"tool {tool_name!r} exceeded {timeout_seconds}s timeout"
         ) from exc
@@ -128,9 +225,43 @@ def _node_tool_step(state: FaMaxAgentState) -> FaMaxAgentState:
         results.append({"tool": tool_name, "status": "error", "error": "unknown_tool"})
         return {"tool_results": results, "step_index": step_index + 1, "done": True, "error": "unknown_tool"}
 
+    # Audit BEFORE execution, not only after: a durable 'in_progress' row is
+    # written before the tool runs at all, so a record of this call exists
+    # before any side effect (e.g. a `send` tool queuing an outbound
+    # message) can occur -- closing the gap where a post-hoc-only log write
+    # meant a real send could land before, or without, any audit trail. If
+    # even this start-write fails, refuse to run the tool at all: an
+    # unauditable call is worse than a work item that stays claimed for its
+    # lease to expire and retry.
+    with get_db_context() as start_session:
+        log_id = start_tool_call(
+            session=start_session,
+            agent_name=agent_name,
+            tool_name=tool_name,
+            input=args,
+            work_item_id=work_item_id,
+        )
+
+    if log_id is None:
+        logger.error(
+            "fa_max.agent_graph: could not write in_progress audit row for tool %r "
+            "work_item_id=%s — refusing to execute unaudited, stopping loop fail-closed",
+            tool_name, work_item_id,
+        )
+        results.append({"tool": tool_name, "status": "error", "output": None, "error": "audit_log_write_failed"})
+        return {
+            "tool_results": results,
+            "step_index": step_index + 1,
+            "done": True,
+            "error": "audit_log_write_failed",
+        }
+
     start = time.monotonic()
     try:
-        output = _call_tool_with_timeout(tool_name, args, timeout_seconds=tool_timeout_seconds)
+        output = _call_tool_with_timeout(
+            tool_name, args, timeout_seconds=tool_timeout_seconds,
+            log_id=log_id, agent_name=agent_name, work_item_id=work_item_id,
+        )
         status = "success"
         error = None
     except GovernanceBlocked as exc:
@@ -138,6 +269,12 @@ def _node_tool_step(state: FaMaxAgentState) -> FaMaxAgentState:
         status = "blocked"
         error = str(exc)
     except ToolCallTimeout as exc:
+        # The row this timeout is about to mark 'error' may still be
+        # overwritten later by _reconcile_orphaned_call() (registered inside
+        # _call_tool_with_timeout) with the call's TRUE outcome once the
+        # orphaned thread actually finishes -- this is the best-available
+        # value at the moment the loop gives up, not a claim that the call
+        # never had an effect.
         logger.error(
             "fa_max.agent_graph: tool %r timed out after %ss for work_item_id=%s",
             tool_name, tool_timeout_seconds, work_item_id,
@@ -156,29 +293,27 @@ def _node_tool_step(state: FaMaxAgentState) -> FaMaxAgentState:
 
     # Fail-closed on the audit write itself (not just on the tool call):
     # WP-T2-2's Done-When line is "every tool call logged," not "every tool
-    # call logged unless the log write itself fails." log_tool_call() never
-    # raises (a logging failure must not crash mid-call), so its return value
-    # is the only signal this loop has that the durable audit row didn't
-    # land. Continuing past that failure would silently produce an
-    # unauditable send/tool-invocation -- worse than stopping the loop and
-    # letting the work item's lease-driven reclaim retry it from scratch.
+    # call logged unless the log write itself fails." finish_tool_call()
+    # never raises (a logging failure must not crash mid-call), so its
+    # return value is the only signal this loop has that the durable audit
+    # row didn't get its final state. Continuing past that failure would
+    # silently leave the row stuck at 'in_progress' forever -- stopping the
+    # loop lets the work item's lease-driven reclaim retry it from scratch.
     with get_db_context() as log_session:
-        logged = log_tool_call(
+        logged = finish_tool_call(
             session=log_session,
-            agent_name=agent_name,
-            tool_name=tool_name,
-            input=args,
+            log_id=log_id,
             output=output if isinstance(output, dict) else {"result": output},
             duration_ms=duration_ms,
             status=status,
-            work_item_id=work_item_id,
         )
 
     if not logged:
         logger.error(
-            "fa_max.agent_graph: audit log write failed for tool %r work_item_id=%s — "
-            "stopping loop fail-closed rather than continuing unaudited",
-            tool_name, work_item_id,
+            "fa_max.agent_graph: audit log finish-write failed for tool %r log_id=%s "
+            "work_item_id=%s — stopping loop fail-closed rather than leaving the row "
+            "stuck at 'in_progress'",
+            tool_name, log_id, work_item_id,
         )
         results.append({"tool": tool_name, "status": status, "output": output, "error": error})
         return {

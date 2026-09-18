@@ -39,6 +39,7 @@ PYTHONPATH=. python migrations/apply_fa_max_exceptions_alert_queue.py  # FA Max 
 PYTHONPATH=. python migrations/apply_fa_max_venture_footer_fields.py  # FA Max WP-T2-1 venture footer phone/disclaimer + Josh's confirmed fa_max_lending footer text (idempotent)
 PYTHONPATH=. python migrations/apply_fa_max_wp_t2_2_agent_infra.py  # FA Max WP-T2-2: interaction/opportunity attribution, relay Snooze/Revise columns, fa_max_tool_call_log (idempotent)
 PYTHONPATH=. python migrations/apply_fa_max_wp_t2_2_opportunity_origin_immutable.py  # FA Max WP-T2-2 review fix: DB trigger enforcing fa_max_opportunities.origin_interaction_id write-once (idempotent, run after apply_fa_max_wp_t2_2_agent_infra.py)
+PYTHONPATH=. python migrations/apply_fa_max_wp_t2_2_tool_call_log_in_progress_status.py  # FA Max WP-T2-2 review fix: widens fa_max_tool_call_log.status CHECK to allow 'in_progress' (audit row written before a tool executes, not only after) (idempotent, run after apply_fa_max_wp_t2_2_agent_infra.py)
 
 # FA Max agent worker (separate process, WP-T2-2 — see docs/PLATFORM-OPERATIONS-GUIDE.md)
 python -m src.agents.fa_max.worker

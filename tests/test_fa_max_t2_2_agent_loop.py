@@ -208,25 +208,82 @@ class TestLogToolCall:
         assert input_json["credit_score"] == "[redacted]"
         assert input_json["lane"] == "MONEY"
 
-    def test_timed_tool_call_logs_success(self):
-        from src.services.fa_max_tool_log import timed_tool_call
+    def test_start_tool_call_inserts_in_progress_row_and_returns_id(self):
+        from src.services.fa_max_tool_log import start_tool_call
         session = self._make_session()
-        with timed_tool_call(session=session, agent_name="cora", tool_name="read_state", input={}) as result:
-            result["output"] = {"state": "active"}
+        session.execute.return_value.scalar.return_value = 42
+        log_id = start_tool_call(
+            session=session, agent_name="cora", tool_name="send",
+            input={"lane": "MONEY"}, work_item_id="wi-1",
+        )
+        assert log_id == 42
         session.execute.assert_called_once()
-        call_args = session.execute.call_args[0][1]
-        assert call_args["status"] == "success"
+        assert "in_progress" in str(session.execute.call_args[0][0])
+        params = session.execute.call_args[0][1]
+        assert params["agent_name"] == "cora"
+        assert params["tool_name"] == "send"
 
-    def test_timed_tool_call_logs_error_and_reraises(self):
-        from src.services.fa_max_tool_log import timed_tool_call
+    def test_start_tool_call_returns_none_on_db_failure(self):
+        from src.services.fa_max_tool_log import start_tool_call
+        session = MagicMock()
+        session.execute.side_effect = RuntimeError("DB offline")
+        log_id = start_tool_call(
+            session=session, agent_name="cora", tool_name="send", input={},
+        )
+        assert log_id is None
+
+    def test_start_tool_call_redacts_sensitive_input(self):
+        from src.services.fa_max_tool_log import start_tool_call
         session = self._make_session()
-        with pytest.raises(ValueError, match="boom"):
-            with timed_tool_call(session=session, agent_name="cora", tool_name="read_state", input={}) as result:
-                raise ValueError("boom")
-        call_args = session.execute.call_args[0][1]
-        assert call_args["status"] == "error"
-        output_json = json.loads(call_args["output"])
-        assert "boom" in output_json["error"]
+        session.execute.return_value.scalar.return_value = 1
+        start_tool_call(
+            session=session, agent_name="cora", tool_name="send",
+            input={"credit_score": 720, "lane": "MONEY"},
+        )
+        params = session.execute.call_args[0][1]
+        input_json = json.loads(params["input"])
+        assert input_json["credit_score"] == "[redacted]"
+        assert input_json["lane"] == "MONEY"
+
+    def test_finish_tool_call_updates_row(self):
+        from src.services.fa_max_tool_log import finish_tool_call
+        session = self._make_session()
+        ok = finish_tool_call(
+            session=session, log_id=42, output={"state": "active"},
+            duration_ms=15, status="success",
+        )
+        assert ok is True
+        session.execute.assert_called_once()
+        params = session.execute.call_args[0][1]
+        assert params["log_id"] == 42
+        assert params["status"] == "success"
+
+    def test_finish_tool_call_invalid_status_raises(self):
+        from src.services.fa_max_tool_log import finish_tool_call
+        with pytest.raises(ValueError, match="status must be"):
+            finish_tool_call(
+                session=self._make_session(), log_id=1, output={},
+                duration_ms=1, status="unknown",
+            )
+
+    def test_finish_tool_call_returns_false_on_db_failure(self):
+        from src.services.fa_max_tool_log import finish_tool_call
+        session = MagicMock()
+        session.execute.side_effect = RuntimeError("DB offline")
+        ok = finish_tool_call(
+            session=session, log_id=1, output={}, duration_ms=1, status="error",
+        )
+        assert ok is False
+
+    def test_finish_tool_call_can_be_called_twice_for_same_log_id(self):
+        """Reconciliation of a late-completing timed-out call calls this a
+        second time for the same log_id -- must not raise or refuse."""
+        from src.services.fa_max_tool_log import finish_tool_call
+        session = self._make_session()
+        finish_tool_call(session=session, log_id=7, output={"error": "timeout"}, duration_ms=None, status="error")
+        ok = finish_tool_call(session=session, log_id=7, output={"status": "ok"}, duration_ms=1200, status="success")
+        assert ok is True
+        assert session.execute.call_count == 2
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -474,14 +531,15 @@ class TestAgentGraphLoop:
         with patch("src.agents.fa_max.agent_graph.FA_MAX_TOOL_REGISTRY", {"get_fa_max_person_state": MagicMock()}):
             with patch("config.agents.get_agents_settings") as mock_settings:
                 with patch("src.core.database.get_db_context") as mock_db:
-                    with patch("src.agents.fa_max.agent_graph.log_tool_call"):
-                        mock_settings.return_value.fa_max_agent_max_tool_calls = 1
-                        mock_settings.return_value.fa_max_agent_tool_timeout_seconds = 30
-                        mock_session = MagicMock()
-                        mock_db.return_value.__enter__ = MagicMock(return_value=mock_session)
-                        mock_db.return_value.__exit__ = MagicMock(return_value=False)
-                        with patch("src.agents.fa_max.agent_graph._call_tool", return_value={"state": "active"}):
-                            result = _node_tool_step(state)
+                    with patch("src.agents.fa_max.agent_graph.start_tool_call", return_value=1):
+                        with patch("src.agents.fa_max.agent_graph.finish_tool_call", return_value=True):
+                            mock_settings.return_value.fa_max_agent_max_tool_calls = 1
+                            mock_settings.return_value.fa_max_agent_tool_timeout_seconds = 30
+                            mock_session = MagicMock()
+                            mock_db.return_value.__enter__ = MagicMock(return_value=mock_session)
+                            mock_db.return_value.__exit__ = MagicMock(return_value=False)
+                            with patch("src.agents.fa_max.agent_graph._call_tool", return_value={"state": "active"}):
+                                result = _node_tool_step(state)
 
         # step_index goes from 0 to 1 = exhausted with max_calls=1
         assert result["done"] is True
@@ -504,18 +562,20 @@ class TestAgentGraphLoop:
         state = self._make_state(steps=steps)
         logged_status = []
 
-        def capture_log(**kwargs):
+        def capture_finish(**kwargs):
             logged_status.append(kwargs["status"])
+            return True
 
         with patch("config.agents.get_agents_settings") as mock_settings:
             with patch("src.core.database.get_db_context") as mock_db:
-                with patch("src.agents.fa_max.agent_graph.log_tool_call", side_effect=capture_log):
-                    with patch("src.agents.fa_max.agent_graph._call_tool", side_effect=GovernanceBlocked("suppressed")):
-                        mock_settings.return_value.fa_max_agent_max_tool_calls = 8
-                        mock_settings.return_value.fa_max_agent_tool_timeout_seconds = 30
-                        mock_db.return_value.__enter__ = MagicMock(return_value=MagicMock())
-                        mock_db.return_value.__exit__ = MagicMock(return_value=False)
-                        result = _node_tool_step(state)
+                with patch("src.agents.fa_max.agent_graph.start_tool_call", return_value=1):
+                    with patch("src.agents.fa_max.agent_graph.finish_tool_call", side_effect=capture_finish):
+                        with patch("src.agents.fa_max.agent_graph._call_tool", side_effect=GovernanceBlocked("suppressed")):
+                            mock_settings.return_value.fa_max_agent_max_tool_calls = 8
+                            mock_settings.return_value.fa_max_agent_tool_timeout_seconds = 30
+                            mock_db.return_value.__enter__ = MagicMock(return_value=MagicMock())
+                            mock_db.return_value.__exit__ = MagicMock(return_value=False)
+                            result = _node_tool_step(state)
 
         assert logged_status == ["blocked"]
         assert result["done"] is True
@@ -529,43 +589,57 @@ class TestAgentGraphLoop:
         state = self._make_state(steps=steps)
         logged_status = []
 
-        def capture_log(**kwargs):
+        def capture_finish(**kwargs):
             logged_status.append(kwargs["status"])
+            return True
 
         with patch("config.agents.get_agents_settings") as mock_settings:
             with patch("src.core.database.get_db_context") as mock_db:
-                with patch("src.agents.fa_max.agent_graph.log_tool_call", side_effect=capture_log):
-                    with patch("src.agents.fa_max.agent_graph._call_tool", side_effect=RuntimeError("network timeout")):
-                        mock_settings.return_value.fa_max_agent_max_tool_calls = 8
-                        mock_settings.return_value.fa_max_agent_tool_timeout_seconds = 30
-                        mock_db.return_value.__enter__ = MagicMock(return_value=MagicMock())
-                        mock_db.return_value.__exit__ = MagicMock(return_value=False)
-                        result = _node_tool_step(state)
+                with patch("src.agents.fa_max.agent_graph.start_tool_call", return_value=1):
+                    with patch("src.agents.fa_max.agent_graph.finish_tool_call", side_effect=capture_finish):
+                        with patch("src.agents.fa_max.agent_graph._call_tool", side_effect=RuntimeError("network timeout")):
+                            mock_settings.return_value.fa_max_agent_max_tool_calls = 8
+                            mock_settings.return_value.fa_max_agent_tool_timeout_seconds = 30
+                            mock_db.return_value.__enter__ = MagicMock(return_value=MagicMock())
+                            mock_db.return_value.__exit__ = MagicMock(return_value=False)
+                            result = _node_tool_step(state)
 
         assert logged_status == ["error"]
         assert result["done"] is True
 
     def test_log_tool_call_called_for_every_invocation(self):
-        """Category 5: every tool invocation must produce a log row."""
+        """Category 5: every tool invocation must produce a start+finish audit pair."""
         from src.agents.fa_max.agent_graph import _node_tool_step
 
         steps = [{"tool": "get_fa_max_person_state", "args": {"person_id": "p1"}}]
         state = self._make_state(steps=steps)
-        log_calls = []
+        start_calls = []
+        finish_calls = []
+
+        def capture_start(**kw):
+            start_calls.append(kw)
+            return 1
+
+        def capture_finish(**kw):
+            finish_calls.append(kw)
+            return True
 
         with patch("config.agents.get_agents_settings") as mock_settings:
             with patch("src.core.database.get_db_context") as mock_db:
-                with patch("src.agents.fa_max.agent_graph.log_tool_call", side_effect=lambda **kw: log_calls.append(kw)):
-                    with patch("src.agents.fa_max.agent_graph._call_tool", return_value={"state": "active"}):
-                        mock_settings.return_value.fa_max_agent_max_tool_calls = 8
-                        mock_settings.return_value.fa_max_agent_tool_timeout_seconds = 30
-                        mock_db.return_value.__enter__ = MagicMock(return_value=MagicMock())
-                        mock_db.return_value.__exit__ = MagicMock(return_value=False)
-                        _node_tool_step(state)
+                with patch("src.agents.fa_max.agent_graph.start_tool_call", side_effect=capture_start):
+                    with patch("src.agents.fa_max.agent_graph.finish_tool_call", side_effect=capture_finish):
+                        with patch("src.agents.fa_max.agent_graph._call_tool", return_value={"state": "active"}):
+                            mock_settings.return_value.fa_max_agent_max_tool_calls = 8
+                            mock_settings.return_value.fa_max_agent_tool_timeout_seconds = 30
+                            mock_db.return_value.__enter__ = MagicMock(return_value=MagicMock())
+                            mock_db.return_value.__exit__ = MagicMock(return_value=False)
+                            _node_tool_step(state)
 
-        assert len(log_calls) == 1
-        assert log_calls[0]["tool_name"] == "get_fa_max_person_state"
-        assert log_calls[0]["status"] == "success"
+        assert len(start_calls) == 1
+        assert start_calls[0]["tool_name"] == "get_fa_max_person_state"
+        assert len(finish_calls) == 1
+        assert finish_calls[0]["log_id"] == 1
+        assert finish_calls[0]["status"] == "success"
 
     def test_run_fa_max_agent_no_checkpoint_executes_steps(self):
         """run_fa_max_agent_no_checkpoint completes a two-step plan successfully."""
@@ -751,6 +825,26 @@ class TestComplianceStructural:
         actual = {c.key for c in FaMaxToolCallLog.__table__.columns}
         assert expected_cols <= actual
 
+    def test_fa_max_tool_call_log_model_status_check_allows_in_progress(self):
+        """WP-T2-2 review fix: the audit row is written 'in_progress' BEFORE
+        the tool executes -- the model's CHECK constraint must allow it."""
+        from sqlalchemy import CheckConstraint
+        from src.core.models import FaMaxToolCallLog
+        checks = [c for c in FaMaxToolCallLog.__table_args__ if isinstance(c, CheckConstraint)]
+        assert any("in_progress" in str(c.sqltext) for c in checks), \
+            "FaMaxToolCallLog status CHECK constraint must allow 'in_progress'"
+
+    def test_call_tool_uses_inspect_signature_not_co_varnames(self):
+        """WP-T2-2 review fix: co_varnames includes every local variable a
+        function assigns, not just its parameters -- a tool with a local
+        var literally named `session` (not a parameter) would silently
+        receive an unexpected session= kwarg under the old check."""
+        import inspect
+        from src.agents.fa_max import agent_graph
+        source = inspect.getsource(agent_graph._call_tool)
+        assert "__code__.co_varnames" not in source
+        assert "inspect.signature" in source
+
     def test_no_send_path_bypasses_fa_max_tool_registry(self):
         """The send tool is the ONLY enqueue entry point for FA Max.
         Verify tool_registry.send calls relay.queue.enqueue (not a side-channel)."""
@@ -835,6 +929,30 @@ class TestMigrationDDLStructural:
     def test_migration_has_verification_block(self):
         src = self._get_migration_sql()
         assert "information_schema.columns" in src, "Migration should verify columns exist after applying"
+
+    def _get_in_progress_migration_sql(self) -> str:
+        import pathlib
+        return pathlib.Path(
+            "migrations/apply_fa_max_wp_t2_2_tool_call_log_in_progress_status.py"
+        ).read_text(encoding="utf-8")
+
+    def test_in_progress_migration_widens_status_constraint(self):
+        src = self._get_in_progress_migration_sql()
+        assert "in_progress" in src
+        assert "DROP CONSTRAINT" in src.upper() or "drop constraint" in src.lower()
+        assert "ADD CONSTRAINT" in src.upper() or "add constraint" in src.lower()
+
+    def test_in_progress_migration_is_idempotent_looking(self):
+        """Looks up the existing constraint name dynamically rather than
+        assuming one -- the original CREATE TABLE's inline CHECK and
+        Base.metadata.create_all()'s named CheckConstraint could differ."""
+        src = self._get_in_progress_migration_sql()
+        assert "pg_constraint" in src
+        assert "IF EXISTS" not in src or "conname" in src  # dynamic lookup, not a hardcoded guess
+
+    def test_in_progress_migration_has_verification_block(self):
+        src = self._get_in_progress_migration_sql()
+        assert "pg_get_constraintdef" in src
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1014,26 +1132,118 @@ class TestToolCallTimeout:
         state = self._make_state(steps=steps)
         logged_status = []
 
-        def _capture(**kw):
+        def _capture_finish(**kw):
             logged_status.append(kw["status"])
             return True
 
         with patch("config.agents.get_agents_settings") as mock_settings:
             with patch("src.core.database.get_db_context") as mock_db:
-                with patch("src.agents.fa_max.agent_graph.log_tool_call", side_effect=_capture):
-                    with patch(
-                        "src.agents.fa_max.agent_graph._call_tool_with_timeout",
-                        side_effect=ToolCallTimeout("tool 'get_fa_max_person_state' exceeded 0.05s timeout"),
-                    ):
-                        mock_settings.return_value.fa_max_agent_max_tool_calls = 8
-                        mock_settings.return_value.fa_max_agent_tool_timeout_seconds = 0.05
-                        mock_db.return_value.__enter__ = MagicMock(return_value=MagicMock())
-                        mock_db.return_value.__exit__ = MagicMock(return_value=False)
-                        result = _node_tool_step(state)
+                with patch("src.agents.fa_max.agent_graph.start_tool_call", return_value=1):
+                    with patch("src.agents.fa_max.agent_graph.finish_tool_call", side_effect=_capture_finish):
+                        with patch(
+                            "src.agents.fa_max.agent_graph._call_tool_with_timeout",
+                            side_effect=ToolCallTimeout("tool 'get_fa_max_person_state' exceeded 0.05s timeout"),
+                        ):
+                            mock_settings.return_value.fa_max_agent_max_tool_calls = 8
+                            mock_settings.return_value.fa_max_agent_tool_timeout_seconds = 0.05
+                            mock_db.return_value.__enter__ = MagicMock(return_value=MagicMock())
+                            mock_db.return_value.__exit__ = MagicMock(return_value=False)
+                            result = _node_tool_step(state)
 
         assert logged_status == ["error"]
         assert result["done"] is True
         assert "timeout" in (result["error"] or "").lower() or "exceeded" in (result["error"] or "").lower()
+
+    def test_start_tool_call_happens_before_the_tool_executes(self):
+        """WP-T2-2 review fix: the audit row must exist BEFORE the tool runs,
+        not only after — so a send's side effect can never land unaudited."""
+        from src.agents.fa_max.agent_graph import _node_tool_step
+
+        steps = [{"tool": "get_fa_max_person_state", "args": {"person_id": "p1"}}]
+        state = self._make_state(steps=steps)
+        call_order = []
+
+        def _capture_start(**kw):
+            call_order.append("start")
+            return 1
+
+        def _capture_call(tool_name, args, timeout_seconds, **kw):
+            call_order.append("execute")
+            return {"ok": True}
+
+        def _capture_finish(**kw):
+            call_order.append("finish")
+            return True
+
+        with patch("config.agents.get_agents_settings") as mock_settings:
+            with patch("src.core.database.get_db_context") as mock_db:
+                with patch("src.agents.fa_max.agent_graph.start_tool_call", side_effect=_capture_start):
+                    with patch("src.agents.fa_max.agent_graph.finish_tool_call", side_effect=_capture_finish):
+                        with patch("src.agents.fa_max.agent_graph._call_tool_with_timeout", side_effect=_capture_call):
+                            mock_settings.return_value.fa_max_agent_max_tool_calls = 8
+                            mock_settings.return_value.fa_max_agent_tool_timeout_seconds = 30
+                            mock_db.return_value.__enter__ = MagicMock(return_value=MagicMock())
+                            mock_db.return_value.__exit__ = MagicMock(return_value=False)
+                            _node_tool_step(state)
+
+        assert call_order == ["start", "execute", "finish"]
+
+    def test_call_tool_with_timeout_registers_reconciliation_callback_on_timeout(self):
+        """WP-T2-2 review fix: a call that times out from the loop's point of
+        view but later completes on its orphaned thread must reconcile its
+        audit row to the real outcome, not leave it permanently saying
+        'error' when a real send actually went through."""
+        from src.agents.fa_max.agent_graph import _call_tool_with_timeout, ToolCallTimeout
+
+        def _slow_then_succeeds(tool_name, args, *, session):
+            time.sleep(0.2)
+            return {"item_id": 99, "status": "approved"}
+
+        reconciled = []
+
+        def fake_finish_tool_call(**kw):
+            reconciled.append(kw)
+            return True
+
+        with patch("src.agents.fa_max.agent_graph._call_tool", side_effect=_slow_then_succeeds):
+            with patch("src.core.database.get_db_context") as mock_db:
+                mock_db.return_value.__enter__ = MagicMock(return_value=MagicMock())
+                mock_db.return_value.__exit__ = MagicMock(return_value=False)
+                with patch("src.agents.fa_max.agent_graph.finish_tool_call", side_effect=fake_finish_tool_call):
+                    with pytest.raises(ToolCallTimeout):
+                        _call_tool_with_timeout(
+                            "send", {}, timeout_seconds=0.02,
+                            log_id=55, agent_name="cora", work_item_id="wid-late",
+                        )
+                    # The orphaned thread is still running (0.2s sleep); give it
+                    # time to finish and fire its done-callback.
+                    time.sleep(0.4)
+
+        assert len(reconciled) == 1
+        assert reconciled[0]["log_id"] == 55
+        assert reconciled[0]["status"] == "success"
+        assert reconciled[0]["output"]["_late_completion_after_timeout"] is True
+        assert reconciled[0]["output"]["item_id"] == 99
+
+    def test_call_tool_with_timeout_no_reconciliation_when_log_id_is_none(self):
+        """Callers that don't pass log_id (none currently do, but defensive)
+        must not register a reconciliation callback that would crash trying
+        to write with log_id=None."""
+        from src.agents.fa_max.agent_graph import _call_tool_with_timeout, ToolCallTimeout
+
+        def _slow_tool(tool_name, args, *, session):
+            time.sleep(0.1)
+            return {"ok": True}
+
+        with patch("src.agents.fa_max.agent_graph._call_tool", side_effect=_slow_tool):
+            with patch("src.core.database.get_db_context") as mock_db:
+                mock_db.return_value.__enter__ = MagicMock(return_value=MagicMock())
+                mock_db.return_value.__exit__ = MagicMock(return_value=False)
+                with patch("src.agents.fa_max.agent_graph.finish_tool_call") as mock_finish:
+                    with pytest.raises(ToolCallTimeout):
+                        _call_tool_with_timeout("slow_tool", {}, timeout_seconds=0.02)
+                    time.sleep(0.2)
+                mock_finish.assert_not_called()
 
     def test_timeout_setting_defaults_to_positive_int(self):
         from config.agents import AgentsSettings
@@ -1071,9 +1281,10 @@ class TestAuditFailClosed:
         )
         assert ok is False
 
-    def test_node_tool_step_stops_loop_when_audit_write_fails(self):
-        """WP-T2-2 Done-When: 'every tool call logged' — if the audit row
-        can't be written, the loop must not silently continue unaudited."""
+    def test_node_tool_step_refuses_to_execute_when_start_audit_write_fails(self):
+        """WP-T2-2 review fix: the audit row is written BEFORE the tool runs.
+        If even that start-write fails, the tool must never be called at
+        all — an unauditable call is worse than one that never happened."""
         from src.agents.fa_max.agent_graph import _node_tool_step
 
         steps = [
@@ -1084,13 +1295,41 @@ class TestAuditFailClosed:
 
         with patch("config.agents.get_agents_settings") as mock_settings:
             with patch("src.core.database.get_db_context") as mock_db:
-                with patch("src.agents.fa_max.agent_graph.log_tool_call", return_value=False):
-                    with patch("src.agents.fa_max.agent_graph._call_tool_with_timeout", return_value={"state": "active"}):
+                with patch("src.agents.fa_max.agent_graph.start_tool_call", return_value=None):
+                    with patch("src.agents.fa_max.agent_graph._call_tool_with_timeout") as mock_call:
                         mock_settings.return_value.fa_max_agent_max_tool_calls = 8
                         mock_settings.return_value.fa_max_agent_tool_timeout_seconds = 30
                         mock_db.return_value.__enter__ = MagicMock(return_value=MagicMock())
                         mock_db.return_value.__exit__ = MagicMock(return_value=False)
                         result = _node_tool_step(state)
+
+        mock_call.assert_not_called()
+        assert result["done"] is True
+        assert result["error"] == "audit_log_write_failed"
+        assert result["step_index"] == 1
+
+    def test_node_tool_step_stops_loop_when_finish_audit_write_fails(self):
+        """WP-T2-2 Done-When: 'every tool call logged' — if the audit row's
+        final-state UPDATE can't be written, the loop must not silently
+        continue with a row stuck at 'in_progress' forever."""
+        from src.agents.fa_max.agent_graph import _node_tool_step
+
+        steps = [
+            {"tool": "get_fa_max_person_state", "args": {"person_id": "p1"}},
+            {"tool": "get_fa_max_person_history", "args": {"person_id": "p1"}},
+        ]
+        state = self._make_state(steps=steps)
+
+        with patch("config.agents.get_agents_settings") as mock_settings:
+            with patch("src.core.database.get_db_context") as mock_db:
+                with patch("src.agents.fa_max.agent_graph.start_tool_call", return_value=1):
+                    with patch("src.agents.fa_max.agent_graph.finish_tool_call", return_value=False):
+                        with patch("src.agents.fa_max.agent_graph._call_tool_with_timeout", return_value={"state": "active"}):
+                            mock_settings.return_value.fa_max_agent_max_tool_calls = 8
+                            mock_settings.return_value.fa_max_agent_tool_timeout_seconds = 30
+                            mock_db.return_value.__enter__ = MagicMock(return_value=MagicMock())
+                            mock_db.return_value.__exit__ = MagicMock(return_value=False)
+                            result = _node_tool_step(state)
 
         assert result["done"] is True
         assert result["error"] == "audit_log_write_failed"
@@ -1104,13 +1343,14 @@ class TestAuditFailClosed:
 
         with patch("config.agents.get_agents_settings") as mock_settings:
             with patch("src.core.database.get_db_context") as mock_db:
-                with patch("src.agents.fa_max.agent_graph.log_tool_call", return_value=True):
-                    with patch("src.agents.fa_max.agent_graph._call_tool_with_timeout", return_value={"state": "active"}):
-                        mock_settings.return_value.fa_max_agent_max_tool_calls = 8
-                        mock_settings.return_value.fa_max_agent_tool_timeout_seconds = 30
-                        mock_db.return_value.__enter__ = MagicMock(return_value=MagicMock())
-                        mock_db.return_value.__exit__ = MagicMock(return_value=False)
-                        result = _node_tool_step(state)
+                with patch("src.agents.fa_max.agent_graph.start_tool_call", return_value=1):
+                    with patch("src.agents.fa_max.agent_graph.finish_tool_call", return_value=True):
+                        with patch("src.agents.fa_max.agent_graph._call_tool_with_timeout", return_value={"state": "active"}):
+                            mock_settings.return_value.fa_max_agent_max_tool_calls = 8
+                            mock_settings.return_value.fa_max_agent_tool_timeout_seconds = 30
+                            mock_db.return_value.__enter__ = MagicMock(return_value=MagicMock())
+                            mock_db.return_value.__exit__ = MagicMock(return_value=False)
+                            result = _node_tool_step(state)
 
         assert result["error"] != "audit_log_write_failed"
 

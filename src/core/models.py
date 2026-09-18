@@ -11234,7 +11234,7 @@ class FaMaxToolCallLog(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "status IN ('success', 'error', 'blocked')",
+            "status IN ('in_progress', 'success', 'error', 'blocked')",
             name="ck_fa_max_tool_call_log_status",
         ),
         Index("ix_fa_max_tool_call_log_work_item", "work_item_id"),

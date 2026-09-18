@@ -4,9 +4,17 @@ Writes to `fa_max_tool_call_log` — distinct from `agent_decisions`
 (src/agents/tools/write_tools.py::log_decision), which records a graph's
 overall DECISION. This module records every individual TOOL INVOCATION
 inside a work item's bounded tool-call loop, whether or not that call
-produced a decision. Every tool registered in the FA Max tool registry
-(src/agents/fa_max/tool_registry.py) must route through log_tool_call() —
-see that module for the wrapper that calls this on every invocation.
+produced a decision.
+
+Two write paths:
+  - start_tool_call() / finish_tool_call() — the two-phase form used by
+    src.agents.fa_max.agent_graph._node_tool_step: a durable 'in_progress'
+    row is written BEFORE a tool executes, then updated to its true final
+    outcome after. This is what gives "every tool call logged" its actual
+    meaning for a `send` tool with a real side effect — the audit row
+    exists before the side effect can happen, not only after.
+  - log_tool_call() — a single-shot INSERT for a call that has already
+    finished; use only where the pre-execution guarantee isn't needed.
 
 Redaction mirrors src.agents.tools.write_tools._safe_snapshot's intent
 (strip PII/financial-shaped values before persisting) but is stricter:
@@ -19,9 +27,7 @@ from __future__ import annotations
 
 import logging
 import re
-import time
-from contextlib import contextmanager
-from typing import Any, Generator, Optional
+from typing import Any, Optional
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -73,11 +79,21 @@ def log_tool_call(
     status: str,
     work_item_id: Optional[str] = None,
 ) -> bool:
-    """Write one row to fa_max_tool_call_log. Never RAISES — a logging
-    failure must not abort the agent's work item mid-call — but DOES report
-    success/failure via its return value, so a caller for whom "every tool
-    call logged" is a hard requirement (src.agents.fa_max.agent_graph) can
-    fail closed rather than silently continuing unaudited. Callers that
+    """Write one COMPLETE row to fa_max_tool_call_log in a single INSERT.
+
+    This is the single-shot form: it logs a call that has ALREADY finished,
+    in one write. It does NOT give the "audit row exists before any side
+    effect can occur" guarantee — for that, src.agents.fa_max.agent_graph
+    uses start_tool_call() before the tool executes and finish_tool_call()
+    after, so a durable row exists first and is only ever updated, never
+    created after the fact. Kept for callers that log a call's outcome
+    after the fact and don't need the pre-execution guarantee (e.g.
+    timed_tool_call() below, or a future simple read-only tool wrapper).
+
+    Never RAISES — a logging failure must not abort the agent's work item
+    mid-call — but DOES report success/failure via its return value, so a
+    caller for whom "every tool call logged" is a hard requirement can fail
+    closed rather than silently continuing unaudited. Callers that
     genuinely don't need that guarantee may ignore the return value.
 
     status must be one of 'success', 'error', 'blocked' (blocked = a
@@ -115,40 +131,98 @@ def log_tool_call(
         return False
 
 
-@contextmanager
-def timed_tool_call(
+def start_tool_call(
     *,
     session: Session,
     agent_name: str,
     tool_name: str,
     input: Optional[dict],
     work_item_id: Optional[str] = None,
-) -> Generator[dict, None, None]:
-    """Context manager that times a tool call and logs it on exit.
+) -> Optional[int]:
+    """Write a durable 'in_progress' row BEFORE the tool call executes.
 
-    Usage:
-        with timed_tool_call(session=s, agent_name=..., tool_name=..., input=args) as result:
-            result["output"] = the_tool_fn(**args)
+    This is the fix for the audit-ordering gap a WP-T2-2 review found: a
+    single post-execution log write meant a `send` tool's real side effect
+    (an outbound message queued via relay.queue.enqueue) could land before
+    any audit row existed, or with none at all if the post-hoc write
+    failed. Writing this row first means a durable record of "this call is
+    happening" exists before the tool can do anything — not only after.
 
-    On an uncaught exception inside the block, logs status='error' with the
-    exception message as output, then re-raises.
+    Returns the new row's id, or None if the write itself failed (never
+    raises). A caller for whom "every tool call logged" is a hard
+    requirement (src.agents.fa_max.agent_graph._node_tool_step) must refuse
+    to execute the tool at all when this returns None — an unauditable call
+    is worse than a call that never happened.
     """
-    start = time.monotonic()
-    result: dict = {"output": None}
+    import json as _json
+
     try:
-        yield result
-    except Exception as exc:
-        duration_ms = int((time.monotonic() - start) * 1000)
-        log_tool_call(
-            session=session, agent_name=agent_name, tool_name=tool_name,
-            input=input, output={"error": str(exc)}, duration_ms=duration_ms,
-            status="error", work_item_id=work_item_id,
+        row = session.execute(
+            text(
+                "INSERT INTO fa_max_tool_call_log "
+                "(work_item_id, agent_name, tool_name, input, output, duration_ms, status, created_at) "
+                "VALUES (CAST(:work_item_id AS uuid), :agent_name, :tool_name, "
+                ":input ::jsonb, NULL, NULL, 'in_progress', now()) "
+                "RETURNING id"
+            ),
+            {
+                "work_item_id": work_item_id,
+                "agent_name": agent_name,
+                "tool_name": tool_name,
+                "input": _json.dumps(redact_for_tool_log(input)),
+            },
         )
-        raise
-    else:
-        duration_ms = int((time.monotonic() - start) * 1000)
-        log_tool_call(
-            session=session, agent_name=agent_name, tool_name=tool_name,
-            input=input, output=result.get("output"), duration_ms=duration_ms,
-            status="success", work_item_id=work_item_id,
+        log_id = row.scalar()
+        return int(log_id) if log_id is not None else None
+    except Exception:
+        logger.warning(
+            "fa_max_tool_call_log start-write failed for agent=%s tool=%s work_item=%s",
+            agent_name, tool_name, work_item_id, exc_info=True,
         )
+        return None
+
+
+def finish_tool_call(
+    *,
+    session: Session,
+    log_id: int,
+    output: Optional[dict],
+    duration_ms: Optional[int],
+    status: str,
+) -> bool:
+    """Update the row start_tool_call() wrote with the call's true final
+    outcome. Never raises; returns False on failure so a caller with a hard
+    "every call logged" requirement can fail closed.
+
+    Also used to RECONCILE a call that completed AFTER its timeout was
+    already logged: src.agents.fa_max.agent_graph registers a callback on
+    a timed-out call's underlying thread so that whenever it actually
+    finishes — even long after the agent loop gave up waiting and moved on
+    — this is called again for the same log_id with the real outcome.
+    Calling this more than once for the same log_id is safe; the row
+    reflects whatever finish_tool_call() call landed last.
+    """
+    if status not in ("success", "error", "blocked"):
+        raise ValueError(f"status must be 'success', 'error', or 'blocked', got {status!r}")
+    import json as _json
+
+    try:
+        session.execute(
+            text(
+                "UPDATE fa_max_tool_call_log SET "
+                "output = :output ::jsonb, duration_ms = :duration_ms, status = :status "
+                "WHERE id = :log_id"
+            ),
+            {
+                "log_id": log_id,
+                "output": _json.dumps(redact_for_tool_log(output)),
+                "duration_ms": duration_ms,
+                "status": status,
+            },
+        )
+        return True
+    except Exception:
+        logger.warning(
+            "fa_max_tool_call_log finish-write failed for log_id=%s", log_id, exc_info=True,
+        )
+        return False
