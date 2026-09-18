@@ -136,6 +136,78 @@ def _row_to_item(row: dict) -> QueueItem:
     return QueueItem(**{col: row[col] for col in _QUEUE_ITEM_COLUMNS if col in row})
 
 
+def _mask_recipient(recipient: Optional[str]) -> str:
+    """Minimal recipient masking for a Slack alert body — CLAUDE.md: never
+    log raw PII, only IDs/masked representations. Keeps just enough of the
+    tail to let Josh recognize which draft this is without exposing the
+    full email/phone in a channel."""
+    if not recipient:
+        return "<none>"
+    return f"...{recipient[-4:]}" if len(recipient) > 4 else "***"
+
+
+def _alert_pre_enqueue_governance_refusal(
+    *, reason: str, idempotency_key: str, recipient: Optional[str],
+    agent_name: Optional[str], lane: Optional[str], autonomy_tier_at_send: Optional[str],
+) -> None:
+    """Surface a GovernanceBlocked refusal that happened BEFORE any
+    relay_approval_queue row exists (WP-T2-2 review fix).
+
+    SOT.md's "a blocked send is logged with a reason and surfaced to Josh"
+    was previously only true for a block that happens AFTER an item exists
+    (Relay's own dispatch-time block posts a Slack notice on that row —
+    see slack_post.py). A refusal raised HERE, inside enqueue() itself —
+    missing governance fields, an invalid lane, an unsupported channel,
+    withdrawn/absent consent, suppression, an unknown tier, or a send
+    attempt whose claim already expired — creates no row at all, so that
+    path never fires. The agent loop still logs the refusal into
+    fa_max_tool_call_log (status='blocked') either way — that satisfies
+    "logged with a reason" — but nothing was surfacing it to Josh.
+
+    Reuses the SAME durable, crash-safe EXCEPTIONS-lane delivery pattern
+    src.tasks.fa_max_send_health_monitor and
+    src.tasks.fa_max_weekly_edit_rate_report already use
+    (exceptions_alert_queue.enqueue_and_attempt) rather than a second,
+    ad-hoc Slack-posting path — the alert is committed durably before Slack
+    is contacted, so a Slack outage or crash mid-attempt leaves it
+    recoverable by the existing drain worker, not silently lost.
+
+    rule is scoped to the reason's category (text before the first ':',
+    e.g. 'suppressed' from 'suppressed:email_opt_out') rather than the
+    full reason string, so a genuinely new failure MODE always alerts while
+    repeated instances of the SAME misconfiguration within the dedup window
+    don't produce a Slack flood — the full reason and recipient still
+    appear in the message body every time.
+
+    Never raises — an alerting failure must not turn a governance refusal
+    into an unhandled exception that masks the refusal itself; the caller
+    (enqueue()) re-raises the original GovernanceBlocked regardless of
+    whether this alert succeeds.
+    """
+    try:
+        from src.services.relay import exceptions_alert_queue
+
+        reason_category = reason.split(":", 1)[0]
+        message = (
+            "*FA Max send blocked before it reached the approval queue*\n"
+            f"  • reason: `{reason}`\n"
+            f"  • idempotency_key: `{idempotency_key}`\n"
+            f"  • recipient: `{_mask_recipient(recipient)}`\n"
+            f"  • agent: `{agent_name or '<none>'}`  ·  lane: `{lane or '<none>'}`  ·  "
+            f"tier: `{autonomy_tier_at_send or '<none>'}`"
+        )
+        exceptions_alert_queue.enqueue_and_attempt(
+            venture_key="fa_max_lending",
+            rule=f"fa_max_pre_enqueue_governance_refusal:{reason_category}",
+            message=message,
+        )
+    except Exception:
+        logger.warning(
+            "[Relay] failed to alert on pre-enqueue governance refusal "
+            "idempotency_key=%s reason=%s", idempotency_key, reason, exc_info=True,
+        )
+
+
 def enqueue(
     *,
     idempotency_key: str,
@@ -374,6 +446,16 @@ def enqueue(
         existing = get_item_by_idempotency_key(idempotency_key)
         if existing is not None:
             return existing
+        raise
+    except Exception as exc:
+        from src.services.fa_max_send_governance import GovernanceBlocked
+
+        if venture_key == "fa_max_lending" and isinstance(exc, GovernanceBlocked):
+            _alert_pre_enqueue_governance_refusal(
+                reason=exc.reason, idempotency_key=idempotency_key,
+                recipient=recipient, agent_name=agent_name, lane=lane,
+                autonomy_tier_at_send=autonomy_tier_at_send,
+            )
         raise
     item = get_item(item_id)
     assert item is not None  # just inserted in the same call

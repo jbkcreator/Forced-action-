@@ -1382,6 +1382,104 @@ class TestEditRateReadsMaterialEditColumn:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 21. Review-fix: pre-enqueue governance refusals surfaced to Josh
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestPreEnqueueGovernanceRefusalAlert:
+    def test_mask_recipient_keeps_only_tail(self):
+        from src.services.relay.queue import _mask_recipient
+        assert _mask_recipient("josh@example.com") == "....com"
+        assert _mask_recipient(None) == "<none>"
+        assert _mask_recipient("ab") == "***"
+
+    def test_alert_helper_calls_enqueue_and_attempt(self):
+        from src.services.relay import queue
+
+        with patch("src.services.relay.exceptions_alert_queue.enqueue_and_attempt") as mock_alert:
+            queue._alert_pre_enqueue_governance_refusal(
+                reason="suppressed:email_opt_out", idempotency_key="k1",
+                recipient="a@b.com", agent_name="cora", lane="MONEY",
+                autonomy_tier_at_send="A",
+            )
+        mock_alert.assert_called_once()
+        kwargs = mock_alert.call_args.kwargs
+        assert kwargs["venture_key"] == "fa_max_lending"
+        assert kwargs["rule"] == "fa_max_pre_enqueue_governance_refusal:suppressed"
+        assert "k1" in kwargs["message"]
+        assert "email_opt_out" in kwargs["message"]
+        assert "a@b.com" not in kwargs["message"]  # raw recipient never logged
+
+    def test_alert_helper_never_raises_on_delivery_failure(self):
+        from src.services.relay import queue
+        with patch(
+            "src.services.relay.exceptions_alert_queue.enqueue_and_attempt",
+            side_effect=RuntimeError("db offline"),
+        ):
+            queue._alert_pre_enqueue_governance_refusal(
+                reason="suppressed:email_opt_out", idempotency_key="k1",
+                recipient="a@b.com", agent_name="cora", lane="MONEY",
+                autonomy_tier_at_send="A",
+            )  # must not raise
+
+    def test_enqueue_alerts_on_pre_insert_governance_blocked(self):
+        """A GovernanceBlocked raised before any row exists (missing fields,
+        suppression, unknown tier, etc.) must alert AND still re-raise the
+        original exception -- the alert is a side effect, not a
+        replacement for the refusal itself."""
+        from src.services.fa_max_send_governance import GovernanceBlocked
+        from src.services.relay import queue
+
+        with patch("src.services.relay.queue.get_db_context") as mock_db:
+            mock_session = MagicMock()
+            mock_db.return_value.__enter__ = MagicMock(return_value=mock_session)
+            mock_db.return_value.__exit__ = MagicMock(return_value=False)
+            with patch(
+                "src.services.fa_max_send_governance.require_consent",
+                side_effect=GovernanceBlocked("consent_absent"),
+            ):
+                with patch("src.services.relay.queue._alert_pre_enqueue_governance_refusal") as mock_alert:
+                    with pytest.raises(GovernanceBlocked, match="consent_absent"):
+                        queue.enqueue(
+                            idempotency_key="k2", channel="email", recipient="a@b.com",
+                            payload={"body": "hi"}, venture_key="fa_max_lending",
+                            lane="MONEY", agent_name="cora", autonomy_tier_at_send="A",
+                            person_id="p1", skip_contract_validation=True,
+                        )
+        mock_alert.assert_called_once()
+        assert mock_alert.call_args.kwargs["reason"] == "consent_absent"
+
+    def test_enqueue_does_not_alert_for_non_fa_max_ventures(self):
+        """The pre-enqueue alert is FA Max-specific -- a GovernanceBlocked
+        can only be raised inside the fa_max_lending governance block in
+        the first place, but this guards against a future refactor that
+        might raise it elsewhere for a different venture."""
+        import inspect
+        from src.services.relay import queue
+        source = inspect.getsource(queue.enqueue)
+        assert 'venture_key == "fa_max_lending" and isinstance(exc, GovernanceBlocked)' in source
+
+    def test_enqueue_does_not_alert_on_integrity_error(self):
+        """An idempotent retry (IntegrityError -> existing row returned) is
+        normal operation, not a refusal -- must not alert."""
+        from src.services.relay import queue
+
+        fake_existing = MagicMock()
+        with patch("src.services.relay.queue.get_db_context") as mock_db:
+            mock_session = MagicMock()
+            mock_session.flush.side_effect = __import__("sqlalchemy.exc", fromlist=["IntegrityError"]).IntegrityError("x", {}, Exception("dup"))
+            mock_db.return_value.__enter__ = MagicMock(return_value=mock_session)
+            mock_db.return_value.__exit__ = MagicMock(return_value=False)
+            with patch("src.services.relay.queue.get_item_by_idempotency_key", return_value=fake_existing):
+                with patch("src.services.relay.queue._alert_pre_enqueue_governance_refusal") as mock_alert:
+                    result = queue.enqueue(
+                        idempotency_key="k3", channel="email", recipient="a@b.com",
+                        payload={"subject": "s", "body": "hi"}, skip_contract_validation=True,
+                    )
+        assert result is fake_existing
+        mock_alert.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 17. Review-fix: send tool refuses a stale (already-timed-out) attempt
 # ─────────────────────────────────────────────────────────────────────────────
 
