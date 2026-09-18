@@ -644,6 +644,7 @@ class AppSettings(BaseSettings):
 	county_launch_reminder_days: int = Field(default=7, env="COUNTY_LAUNCH_REMINDER_DAYS")
 	slack_bot_token: Optional[SecretStr] = Field(default=None, env="SLACK_BOT_TOKEN")
 	slack_signing_secret: Optional[SecretStr] = Field(default=None, env="SLACK_SIGNING_SECRET")
+	slack_app_token: Optional[SecretStr] = Field(default=None, env="SLACK_APP_TOKEN")
 	# Dedicated FA Max Slack app. It must not reuse the shared Slack app
 	# credentials used by County Launch and other Relay ventures.
 	fa_max_slack_bot_token: Optional[SecretStr] = Field(default=None, env="FA_MAX_SLACK_BOT_TOKEN")
