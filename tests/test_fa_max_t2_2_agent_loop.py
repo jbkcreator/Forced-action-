@@ -302,7 +302,7 @@ class TestAutonomyTierGating:
             if "funded" in sql.lower() or "fa_max_opportunities" in sql.lower():
                 result.scalar.return_value = loan_count
                 return result
-            if "edited_before_approval" in sql:
+            if "material_edit" in sql:
                 row = {"edited": edit_count, "total": send_count}
                 mappings = MagicMock()
                 mappings.first.return_value = row
@@ -1038,6 +1038,195 @@ class TestSnoozeRevise:
         source = inspect.getsource(record_revision)
         assert "revision_count + 1" in source or "revision_count" in source
 
+    def test_record_revision_writes_payload_body(self):
+        """WP-T2-2 review fix: a Revise submission must update payload->>
+        'body' too, not just final_content -- every channel dispatcher
+        (channels_email.send_email, channels_sms.send_sms) reads
+        item.payload['body'], never final_content. Without this, an
+        approved revision silently sent the ORIGINAL draft."""
+        from src.services.relay.queue import record_revision
+        import inspect
+        source = inspect.getsource(record_revision)
+        assert "jsonb_set" in source and "'{body}'" in source, \
+            "record_revision must write the revised text into payload->>'body'"
+
+    def test_record_revision_updates_payload_body_in_practice(self):
+        """Exercises record_revision end-to-end against a fake session and
+        confirms the UPDATE params carry the revised text for the jsonb_set
+        target, not just final_content."""
+        from src.services.relay.queue import record_revision
+        session = MagicMock()
+        row = {
+            "id": 7, "idempotency_key": "k", "channel": "email", "recipient": "a@b.com",
+            "payload": {"subject": "s", "body": "revised text"}, "thread_id": None,
+            "status": "pending", "batch_id": None, "decided_by": None, "error": None,
+            "dispatched_at": None, "created_at": None, "venture_key": "fa_max_lending",
+            "lane": "MONEY", "agent_name": "cora", "autonomy_tier_at_send": "A",
+            "person_id": "p1", "autonomy_gate_reason": None, "decision_interaction_id": None,
+            "send_interaction_id": None, "slack_post_attempted_at": None,
+            "slack_post_lease_until": None, "eligible_at": None, "original_draft": "orig",
+            "final_content": "revised text", "revision_count": 1, "last_revised_by": "slack:U1",
+            "last_revised_at": None, "material_edit": True,
+            "slack_message_ts": None, "decided_at": None,
+        }
+        session.execute.return_value.mappings.return_value.first.return_value = row
+        with patch("src.services.relay.queue.get_db_context") as mock_ctx:
+            mock_ctx.return_value.__enter__ = MagicMock(return_value=session)
+            mock_ctx.return_value.__exit__ = MagicMock(return_value=False)
+            item = record_revision(7, final_content="revised text", revised_by="slack:U1", material_edit=True)
+        params = session.execute.call_args[0][1]
+        assert params["final_content_json"] == '"revised text"'
+        assert item.payload["body"] == "revised text"
+
+    def test_revise_submission_baseline_is_original_draft_not_previous_revision(self):
+        """WP-T2-2 review fix: material_edit must compare against the
+        ORIGINAL draft on every revision, not the previous revision -- else
+        a sequence of small edits can add up to a large rewrite without
+        ever crossing the material threshold."""
+        import inspect
+        from src.api import admin_router
+        source = inspect.getsource(admin_router._handle_relay_revise_submission)
+        assert "existing.original_draft" in source
+        assert "existing.final_content or existing.original_draft" not in source
+
+    def test_revise_material_edit_is_sticky(self):
+        """Once a revision is flagged material, a later smaller edit must
+        not un-flag it (the flag feeds the Tier B edit-rate gate, where
+        under-counting is the unsafe direction)."""
+        import inspect
+        from src.api import admin_router
+        source = inspect.getsource(admin_router._handle_relay_revise_submission)
+        assert "bool(existing.material_edit) or _is_material_edit" in source
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 16. Review-fix: edit-rate reads material_edit, not the unwritten payload flag
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestEditRateReadsMaterialEditColumn:
+    def _session_returning(self, edited: int, total: int):
+        session = MagicMock()
+        row = {"edited": edited, "total": total}
+        session.execute.return_value.mappings.return_value.first.return_value = row
+        return session
+
+    def test_get_edit_rate_queries_material_edit_column(self):
+        import inspect
+        from src.services.fa_max_autonomy import get_edit_rate
+        source = inspect.getsource(get_edit_rate)
+        assert "COUNT(*) FILTER (WHERE material_edit IS TRUE)" in source
+
+    def test_get_weekly_edit_rate_queries_material_edit_column(self):
+        import inspect
+        from src.services.fa_max_autonomy import get_weekly_edit_rate
+        source = inspect.getsource(get_weekly_edit_rate)
+        assert "COUNT(*) FILTER (WHERE material_edit IS TRUE)" in source
+
+    def test_get_edit_rate_computes_from_material_edit_counts(self):
+        from src.services.fa_max_autonomy import get_edit_rate
+        session = self._session_returning(edited=20, total=100)
+        rate = get_edit_rate("cora", "B", session)
+        assert rate == pytest.approx(0.20)
+
+    def test_mark_sent_uses_material_edit_not_payload_flag(self):
+        """mark_sent's write_interaction(approved_bool=...) must be derived
+        from the material_edit column, not the never-written payload
+        'edited_before_approval' flag."""
+        import inspect
+        from src.services.relay.queue import mark_sent
+        source = inspect.getsource(mark_sent)
+        assert "row['material_edit']" in source or 'row["material_edit"]' in source
+        assert "payload'].get('edited_before_approval')" not in source
+        assert '(row["payload"] or {}).get("edited_before_approval")' not in source
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 17. Review-fix: send tool refuses a stale (already-timed-out) attempt
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestSendAttemptExpiry:
+    def test_claim_send_attempt_returns_true_when_in_progress(self):
+        from src.services.fa_max_tool_log import claim_send_attempt
+        session = MagicMock()
+        session.execute.return_value.rowcount = 1
+        assert claim_send_attempt(session=session, log_id=5) is True
+
+    def test_claim_send_attempt_returns_false_when_already_finalized(self):
+        from src.services.fa_max_tool_log import claim_send_attempt
+        session = MagicMock()
+        session.execute.return_value.rowcount = 0
+        assert claim_send_attempt(session=session, log_id=5) is False
+
+    def test_claim_send_attempt_fails_closed_on_db_error(self):
+        from src.services.fa_max_tool_log import claim_send_attempt
+        session = MagicMock()
+        session.execute.side_effect = RuntimeError("db offline")
+        assert claim_send_attempt(session=session, log_id=5) is False
+
+    def test_send_tool_refuses_when_attempt_already_expired(self):
+        from src.agents.fa_max.tool_registry import send, SendAttemptExpired
+        session = MagicMock()
+        with patch("src.services.fa_max_tool_log.claim_send_attempt", return_value=False):
+            with pytest.raises(SendAttemptExpired):
+                send(
+                    idempotency_key="k1", channel="email", recipient="a@b.com",
+                    payload={"body": "hi"}, agent_name="cora", lane="MONEY",
+                    autonomy_tier_at_send="A", person_id="p1", session=session,
+                    log_id=42,
+                )
+
+    def test_send_tool_proceeds_when_attempt_still_live(self):
+        from src.agents.fa_max.tool_registry import send
+        session = MagicMock()
+        fake_item = MagicMock(id=1, status="pending")
+        with patch("src.services.fa_max_tool_log.claim_send_attempt", return_value=True):
+            with patch("src.services.fa_max_autonomy.check_tier_gate") as mock_gate:
+                mock_gate.return_value.allowed = False
+                mock_gate.return_value.outcome.value = "below_send_threshold"
+                with patch("src.services.relay.queue.enqueue", return_value=fake_item):
+                    with patch("src.services.relay.queue.capture_original_draft"):
+                        result = send(
+                            idempotency_key="k2", channel="email", recipient="a@b.com",
+                            payload={"body": "hi"}, agent_name="cora", lane="MONEY",
+                            autonomy_tier_at_send="A", person_id="p1", session=session,
+                            log_id=42,
+                        )
+        assert result["item_id"] == 1
+
+    def test_send_tool_skips_claim_when_log_id_is_none(self):
+        """A caller that doesn't pass log_id (defensive; agent_graph always
+        does) must not attempt a claim at all."""
+        from src.agents.fa_max.tool_registry import send
+        session = MagicMock()
+        fake_item = MagicMock(id=2, status="pending")
+        with patch("src.services.fa_max_tool_log.claim_send_attempt") as mock_claim:
+            with patch("src.services.fa_max_autonomy.check_tier_gate") as mock_gate:
+                mock_gate.return_value.allowed = False
+                mock_gate.return_value.outcome.value = "below_send_threshold"
+                with patch("src.services.relay.queue.enqueue", return_value=fake_item):
+                    with patch("src.services.relay.queue.capture_original_draft"):
+                        send(
+                            idempotency_key="k3", channel="email", recipient="a@b.com",
+                            payload={"body": "hi"}, agent_name="cora", lane="MONEY",
+                            autonomy_tier_at_send="A", person_id="p1", session=session,
+                        )
+        mock_claim.assert_not_called()
+
+    def test_call_tool_passes_log_id_only_to_tools_that_declare_it(self):
+        """get_fa_max_person_state has no log_id parameter -- _call_tool
+        must not pass it, or a TypeError would fire on every read call."""
+        from src.agents.fa_max.agent_graph import _call_tool
+        with patch("src.agents.fa_max.tool_registry.get_fa_max_person_state") as mock_read:
+            mock_read.return_value = {"ok": True}
+            with patch("src.agents.fa_max.agent_graph.get_fa_max_tool") as mock_get:
+                spec = MagicMock()
+                spec.func = mock_read
+                mock_get.return_value = spec
+                result = _call_tool("get_fa_max_person_state", {"person_id": "p1"}, session=MagicMock(), log_id=99)
+        assert result == {"ok": True}
+        call_kwargs = mock_read.call_args.kwargs
+        assert "log_id" not in call_kwargs
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 12. mark_skipped accepts pending rows — regression (category 10)
@@ -1103,7 +1292,7 @@ class TestToolCallTimeout:
     def test_call_tool_with_timeout_raises_on_slow_call(self):
         from src.agents.fa_max.agent_graph import _call_tool_with_timeout, ToolCallTimeout
 
-        def _slow_tool(tool_name, args, *, session):
+        def _slow_tool(tool_name, args, *, session, log_id=None):
             time.sleep(2)
             return {"ok": True}
 
@@ -1195,7 +1384,7 @@ class TestToolCallTimeout:
         'error' when a real send actually went through."""
         from src.agents.fa_max.agent_graph import _call_tool_with_timeout, ToolCallTimeout
 
-        def _slow_then_succeeds(tool_name, args, *, session):
+        def _slow_then_succeeds(tool_name, args, *, session, log_id=None):
             time.sleep(0.2)
             return {"item_id": 99, "status": "approved"}
 
@@ -1231,7 +1420,7 @@ class TestToolCallTimeout:
         to write with log_id=None."""
         from src.agents.fa_max.agent_graph import _call_tool_with_timeout, ToolCallTimeout
 
-        def _slow_tool(tool_name, args, *, session):
+        def _slow_tool(tool_name, args, *, session, log_id=None):
             time.sleep(0.1)
             return {"ok": True}
 

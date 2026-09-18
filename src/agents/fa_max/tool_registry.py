@@ -52,6 +52,17 @@ class FaMaxToolRegistrationError(Exception):
     """Raised when a tool is registered with invalid configuration."""
 
 
+class SendAttemptExpired(Exception):
+    """Raised by `send` (WP-T2-2 review fix) when its own attempt has
+    already been marked timed out by the agent loop before it reached the
+    point of actually enqueuing — see fa_max_tool_log.claim_send_attempt.
+    The loop moved on and logged a timeout while this call was still
+    running; rather than fire a send with no loop left waiting for it,
+    `send` refuses. Caught by src.agents.fa_max.agent_graph's generic tool
+    exception handler like any other tool error — logged status='error',
+    loop already stopped (it stopped when the timeout itself fired)."""
+
+
 @dataclass(frozen=True)
 class FaMaxToolSpec:
     name: str
@@ -161,6 +172,7 @@ def send(
     person_id: str,
     thread_id: Optional[str] = None,
     session,
+    log_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Propose an outbound FA Max send via relay_approval_queue.enqueue().
 
@@ -174,13 +186,33 @@ def send(
     doing so would just be a second, redundant no-op/race against the one
     enqueue() already performs.
 
+    log_id (WP-T2-2 review fix): src.agents.fa_max.agent_graph passes this
+    call's own fa_max_tool_call_log row id through automatically. Before
+    doing anything with a real side effect, this atomically confirms via
+    fa_max_tool_log.claim_send_attempt() that the agent loop has not
+    already timed this exact attempt out — closing (not eliminating; see
+    that function's docstring) the window where a hung call finally wakes
+    up and enqueues a real send well after the loop stopped waiting for it.
+    A refused attempt raises SendAttemptExpired rather than proceeding.
+
     On success for a row that is still 'pending' (i.e. auto_authorize was
     False, or the fresh re-check inside enqueue() declined it), captures
     the drafted content into original_draft via capture_original_draft() —
     once, so a later Slack Revise never overwrites the pre-revision text.
     """
     from src.services.fa_max_autonomy import check_tier_gate
+    from src.services.fa_max_tool_log import claim_send_attempt
     from src.services.relay import queue as relay_queue
+
+    if log_id is not None and not claim_send_attempt(session=session, log_id=log_id):
+        logger.warning(
+            "fa_max.tool_registry.send: attempt log_id=%s already timed out by the "
+            "agent loop — refusing to enqueue idempotency_key=%r",
+            log_id, idempotency_key,
+        )
+        raise SendAttemptExpired(
+            f"send attempt log_id={log_id} already timed out by the agent loop"
+        )
 
     gate = check_tier_gate(agent_name, autonomy_tier_at_send, session)
 

@@ -182,6 +182,56 @@ def start_tool_call(
         return None
 
 
+def claim_send_attempt(*, session: Session, log_id: int) -> bool:
+    """Atomically check whether a tool-call attempt is still live before it
+    is allowed to cause a real outbound side effect (WP-T2-2 review fix for
+    the timeout race — see src.agents.fa_max.tool_registry.send).
+
+    A tool call that has blown past fa_max_agent_tool_timeout_seconds gets
+    its fa_max_tool_call_log row finished with status='error' by
+    src.agents.fa_max.agent_graph._node_tool_step's timeout handler --
+    synchronously, on the agent loop's own thread. The orphaned worker
+    thread, unaware the loop already gave up, may still be about to call
+    relay.queue.enqueue() and cause a real send. This gives that thread one
+    place to durably ask "is my attempt still considered live?" immediately
+    before it does anything with an external effect: a conditional UPDATE
+    that only succeeds while the row is still 'in_progress'. If the timeout
+    handler's finish_tool_call() has already committed status='error', this
+    UPDATE matches zero rows and returns False -- the caller must refuse to
+    proceed.
+
+    This narrows, but cannot fully close, the race: nothing can make two
+    independent threads agree on a single instant without one blocking on
+    the other, and blocking the send tool on the timeout path would defeat
+    the point of having a timeout at all. What this DOES guarantee is that
+    the decision is based on durable, currently-committed database state
+    (not each thread's own local assumption of who "won"), and that
+    whichever side loses the race is provably, auditably the one that saw
+    the row already finalized -- not a coin flip.
+
+    Returns True (claim succeeded, attempt is still live) or False (already
+    finalized -- refuse). Never raises; a DB error here is treated as "not
+    claimed" (fail closed -- refuse to send rather than risk sending on an
+    attempt whose liveness could not be confirmed).
+    """
+    try:
+        result = session.execute(
+            text(
+                "UPDATE fa_max_tool_call_log SET "
+                "output = jsonb_set(COALESCE(output, '{}'::jsonb), '{_send_confirmed}', 'true'::jsonb) "
+                "WHERE id = :log_id AND status = 'in_progress'"
+            ),
+            {"log_id": log_id},
+        )
+        return result.rowcount > 0
+    except Exception:
+        logger.warning(
+            "fa_max_tool_call_log claim_send_attempt failed for log_id=%s -- "
+            "treating as not claimed (fail closed)", log_id, exc_info=True,
+        )
+        return False
+
+
 def finish_tool_call(
     *,
     session: Session,

@@ -637,20 +637,23 @@ def mark_sent(item_id: int, *, batch_id: str) -> None:
                 "dispatched_at = now(), updated_at = now() "
                 "WHERE id = :id AND status = :approved AND batch_id = :batch_id"
                 " RETURNING venture_key, person_id::text, channel, agent_name, "
-                "autonomy_tier_at_send, payload"
+                "autonomy_tier_at_send, payload, material_edit"
             ),
             {"status": STATUS_SENT, "id": item_id, "approved": STATUS_APPROVED, "batch_id": batch_id},
         ).mappings().first()
         if row and row["venture_key"] == "fa_max_lending" and row["person_id"]:
             from src.services.state_engine import write_interaction
 
+            # material_edit (WP-T2-2 review fix), not the unwritten
+            # payload->>'edited_before_approval' flag -- see get_edit_rate()'s
+            # docstring for the same fix on the rate side of this evidence.
             interaction_id = write_interaction(
                 session=session,
                 person_id=row["person_id"],
                 channel=row["channel"],
                 direction="outbound",
                 actor=f"agent:{row['agent_name']}",
-                approved_bool=not bool((row["payload"] or {}).get("edited_before_approval")),
+                approved_bool=not bool(row["material_edit"]),
                 autonomy_tier_at_time=row["autonomy_tier_at_send"],
                 body_redacted="relay outbound send",
                 agent_name=row["agent_name"],
@@ -722,14 +725,36 @@ def record_revision(
     material_edit flag. Only applies to a still-'pending' row -- a decided
     row's content is final.
 
+    ALSO writes the revised text into payload->>'body' (WP-T2-2 review fix):
+    a Revise submission previously updated final_content for display only --
+    every dispatcher (channels_email.send_email, channels_sms.send_sms)
+    reads item.payload["body"], which record_revision() never touched, so
+    an approved revision silently sent the ORIGINAL draft. payload is the
+    single field every channel dispatcher actually reads, so making it the
+    write target (rather than teaching each dispatcher about final_content)
+    keeps there being exactly one place a channel needs to look, matching
+    the rest of this module's "one seam" design. final_content/original_draft
+    remain the audit trail of what was drafted vs. revised; payload->>'body'
+    is what actually goes out.
+
+    material_edit stored here is whatever the caller computed -- see
+    src.api.admin_router._handle_relay_revise_submission, which compares
+    against original_draft (not the previous revision) and OR's it with
+    the row's current material_edit, so a run of individually-small edits
+    that add up to a large overall change is never diluted back to
+    "not material" by comparing each edit only to its immediate predecessor.
+
     Returns the updated row, or None if the row was not pending (stale
     revise submission on an already-decided card).
     """
+    import json as _json
+
     with get_db_context() as session:
         row = session.execute(
             text(
                 "UPDATE relay_approval_queue SET "
                 "final_content = :final_content, "
+                "payload = jsonb_set(COALESCE(payload, '{}'::jsonb), '{body}', :final_content_json ::jsonb, true), "
                 "revision_count = revision_count + 1, "
                 "last_revised_by = :revised_by, "
                 "last_revised_at = now(), "
@@ -740,6 +765,7 @@ def record_revision(
             ),
             {
                 "id": item_id, "final_content": final_content,
+                "final_content_json": _json.dumps(final_content),
                 "revised_by": revised_by, "material_edit": material_edit,
                 "pending": STATUS_PENDING,
             },

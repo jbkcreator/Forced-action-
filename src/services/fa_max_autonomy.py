@@ -178,18 +178,25 @@ def get_edit_rate(agent_name: str, tier: str, session: Session) -> float:
     """Lifetime fraction of approved sends where the draft was materially
     edited before approval, scoped to this (agent_name, tier) pair. Used by
     the graduation gate — see get_weekly_edit_rate() for the Friday report's
-    current-ISO-week-scoped sibling; both read the same material_edit-
-    equivalent evidence, different WHERE window.
+    current-ISO-week-scoped sibling; both read the same evidence column,
+    different WHERE window.
 
-    'Edited' = payload->>'edited_before_approval' IS TRUE, set by the Slack
-    approve handler when it detects the body was changed by Josh before
-    approving. Returns 0.0 when no approved sends exist (avoids division by
-    zero and is the most accurate representation of an unproven agent).
+    'Edited' = relay_approval_queue.material_edit IS TRUE, set by
+    src.api.admin_router._handle_relay_revise_submission on a Slack Revise
+    submission (a normalized-token-diff against the ORIGINAL draft, sticky
+    across further revisions — see that function's docstring). WP-T2-2
+    review fix: this previously read payload->>'edited_before_approval',
+    a flag nothing in production ever wrote, so every agent's edit rate
+    always computed as 0% regardless of how many drafts were actually
+    revised before approval — silently letting Tier B's <10%-edit-rate gate
+    pass on missing evidence rather than real evidence. Returns 0.0 when no
+    approved sends exist (avoids division by zero and is the most accurate
+    representation of an unproven agent).
     """
     row = session.execute(
         text(
             "SELECT "
-            "  COUNT(*) FILTER (WHERE (payload->>'edited_before_approval')::boolean IS TRUE) AS edited, "
+            "  COUNT(*) FILTER (WHERE material_edit IS TRUE) AS edited, "
             "  COUNT(*) AS total "
             "FROM relay_approval_queue "
             "WHERE venture_key = :v AND status = 'sent' "
@@ -205,9 +212,9 @@ def get_edit_rate(agent_name: str, tier: str, session: Session) -> float:
 def get_weekly_edit_rate(agent_name: str, tier: str, session: Session) -> float:
     """Edit rate scoped to the CURRENT ISO week (Monday 00:00 America/New_York
     through now), for the Friday weekly edit-rate operations report. Reads
-    the same 'edited_before_approval' payload flag as get_edit_rate() — the
-    difference is the WHERE window, not the evidence source. Returns 0.0
-    when no approved sends exist this week."""
+    the same material_edit column as get_edit_rate() — the difference is
+    the WHERE window, not the evidence source. Returns 0.0 when no approved
+    sends exist this week."""
     from datetime import datetime, timedelta, timezone as _tz
     from zoneinfo import ZoneInfo
 
@@ -220,7 +227,7 @@ def get_weekly_edit_rate(agent_name: str, tier: str, session: Session) -> float:
     row = session.execute(
         text(
             "SELECT "
-            "  COUNT(*) FILTER (WHERE (payload->>'edited_before_approval')::boolean IS TRUE) AS edited, "
+            "  COUNT(*) FILTER (WHERE material_edit IS TRUE) AS edited, "
             "  COUNT(*) AS total "
             "FROM relay_approval_queue "
             "WHERE venture_key = :v AND status = 'sent' "

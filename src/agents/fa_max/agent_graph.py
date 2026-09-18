@@ -66,7 +66,7 @@ class FaMaxAgentState(TypedDict, total=False):
     error: Optional[str]
 
 
-def _call_tool(tool_name: str, args: Dict[str, Any], *, session) -> Any:
+def _call_tool(tool_name: str, args: Dict[str, Any], *, session, log_id: Optional[int] = None) -> Any:
     import inspect
 
     spec = get_fa_max_tool(tool_name)
@@ -77,8 +77,16 @@ def _call_tool(tool_name: str, args: Dict[str, Any], *, session) -> Any:
     # share the `session` name (but not a parameter) would otherwise
     # silently receive an unexpected `session=` kwarg and raise TypeError
     # on every invocation.
-    if "session" in inspect.signature(spec.func).parameters:
+    params = inspect.signature(spec.func).parameters
+    if "session" in params:
         call_args["session"] = session
+    # log_id (WP-T2-2 review fix): only a tool that declares this parameter
+    # (currently just `send`) gets it -- it is this call's own durable
+    # fa_max_tool_call_log row id, letting a send tool atomically confirm
+    # via fa_max_tool_log.claim_send_attempt() that the agent loop hasn't
+    # already given up on it (timed out) before causing a real side effect.
+    if "log_id" in params:
+        call_args["log_id"] = log_id
     return spec.func(**call_args)
 
 
@@ -106,6 +114,23 @@ def _reconcile_orphaned_call(
     This does not and cannot PREVENT the late side effect (there is no way
     to abort an in-flight thread in Python) -- it closes the audit gap so
     the late effect is never silently invisible.
+
+    KNOWN LIMITATION: this callback lives only in this process's memory. If
+    the worker process itself crashes or restarts before the orphaned
+    thread finishes (not just the tool call timing out -- the whole
+    process going away), the callback never fires and the row is left at
+    whatever finish_tool_call() wrote synchronously when the timeout first
+    fired (status='error'). The actual SEND side effect is not lost in that
+    scenario -- if the orphaned thread's `send` tool got past
+    fa_max_tool_log.claim_send_attempt() before the crash, its
+    relay.queue.enqueue() call already durably inserted the
+    relay_approval_queue row (idempotency-keyed, so a retry of the same
+    attempt cannot duplicate it) -- only this AUDIT row's final status can
+    go stale. A periodic sweep that cross-references a stale/error
+    fa_max_tool_call_log row's stored idempotency_key (in its redacted
+    `input`) against relay_approval_queue would close this remaining gap;
+    not built here -- flagged as a real, scoped-out follow-up rather than
+    silently left unmentioned.
     """
 
     def _callback(fut: concurrent.futures.Future) -> None:
@@ -177,12 +202,19 @@ def _call_tool_with_timeout(
     On an actual timeout, if log_id is given, registers a done-callback
     (see _reconcile_orphaned_call) so a late-completing call is never
     silently unaudited -- see that function's docstring.
+
+    log_id is ALSO passed straight through to _call_tool() (and from there,
+    to any tool that declares a log_id parameter) whether or not a timeout
+    ever happens -- the `send` tool uses it to durably confirm, right
+    before it would cause a real side effect, that the agent loop hasn't
+    already timed this attempt out (see fa_max_tool_log.claim_send_attempt
+    and src.agents.fa_max.tool_registry.send).
     """
     from src.core.database import get_db_context
 
     def _run() -> Any:
         with get_db_context() as tool_session:
-            return _call_tool(tool_name, args, session=tool_session)
+            return _call_tool(tool_name, args, session=tool_session, log_id=log_id)
 
     future = _TOOL_CALL_EXECUTOR.submit(_run)
     try:

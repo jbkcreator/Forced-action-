@@ -2286,8 +2286,17 @@ def _handle_relay_revise_submission(payload: dict) -> dict:
     except Exception:
         return {"response_action": "errors", "errors": {"revised_content_block": "Missing revised content."}}
 
-    baseline = existing.final_content or existing.original_draft or ""
-    material = _is_material_edit(baseline, new_content)
+    # Baseline is ALWAYS the original draft, never the previous revision
+    # (WP-T2-2 review fix): comparing each edit only to its immediate
+    # predecessor lets a sequence of individually-small revisions add up to
+    # a large overall rewrite without ever crossing the material-edit
+    # threshold. material_edit is also sticky (OR'd with its current value)
+    # so a later small, non-material tweak can never un-flag an item a
+    # prior revision already made material -- this flag feeds the Tier B
+    # graduation edit-rate gate, where under-counting edits is the unsafe
+    # direction.
+    baseline = existing.original_draft or ""
+    material = bool(existing.material_edit) or _is_material_edit(baseline, new_content)
 
     item = relay_queue.record_revision(
         item_id, final_content=new_content, revised_by=f"slack:{user_id}", material_edit=material,
