@@ -126,26 +126,56 @@ def _playwright_fetch_html(permit_number: str, county_id: str) -> Optional[str]:
                 browser.close()
                 return None
 
-            page.wait_for_load_state("networkidle", timeout=40_000)
-            page.wait_for_timeout(3000)
+            # Wait for Accela AJAX loading mask: appear then disappear
+            try:
+                page.wait_for_selector("#divGlobalLoadingMask:not(.ACA_Hide)", timeout=8_000)
+            except Exception:
+                pass
+            try:
+                page.wait_for_selector("#divGlobalLoadingMask.ACA_Hide", timeout=30_000)
+            except Exception:
+                page.wait_for_timeout(4000)
 
-            # Accela redirects to detail page on single match — parse content directly.
-            # If multiple results, grab first CapDetail href and navigate to it.
-            hrefs = [
-                a.get_attribute("href") or ""
-                for a in page.query_selector_all("a[href*='CapDetail']")
-            ]
+            # Accela may redirect to detail (single match) or show a results list.
+            # If results list: find first CapDetail href and navigate.
+            try:
+                hrefs = [
+                    a.get_attribute("href") or ""
+                    for a in page.query_selector_all("a[href*='CapDetail']")
+                ]
+            except Exception:
+                # Execution context destroyed mid-navigation — wait and retry once
+                try:
+                    page.wait_for_load_state("networkidle", timeout=20_000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(2000)
+                hrefs = [
+                    a.get_attribute("href") or ""
+                    for a in page.query_selector_all("a[href*='CapDetail']")
+                ]
+
             if hrefs:
                 href = hrefs[0]
-                if href.startswith("/"):
+                # Handle absolute, root-relative, and relative URLs
+                if href.startswith("http"):
+                    pass
+                elif href.startswith("/"):
                     href = "https://aca-prod.accela.com" + href
+                else:
+                    # relative like ../Cap/CapDetail.aspx — resolve from portal base
+                    base = f"https://aca-prod.accela.com/{_AGENCY_CODE.get(county_id, county_id.upper())}/"
+                    href = base + href.lstrip("./")
                 page.goto(href, timeout=60_000, wait_until="domcontentloaded")
-                page.wait_for_load_state("networkidle", timeout=30_000)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=30_000)
+                except Exception:
+                    pass
                 page.wait_for_timeout(2500)
 
-            # Verify this is a detail page (has a known section heading)
+            # Verify we landed on a detail page
             body_text = page.inner_text("body")
-            if permit_number not in body_text and "Licensed Professional" not in body_text and "Applicant" not in body_text:
+            if "Licensed Professional" not in body_text and "Applicant" not in body_text and "Owner" not in body_text:
                 logger.warning("[%s] Result page doesn't look like detail for %s", county_id, permit_number)
                 browser.close()
                 return None
