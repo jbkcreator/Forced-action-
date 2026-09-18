@@ -60,9 +60,9 @@ def _get_client():
     from config.settings import get_settings
     from slack_sdk import WebClient
     s = get_settings()
-    if not s.slack_bot_token:
+    if not s.fa_max_slack_bot_token:
         return None
-    return WebClient(token=s.slack_bot_token.get_secret_value())
+    return WebClient(token=s.fa_max_slack_bot_token.get_secret_value())
 
 
 # ── Watermark ─────────────────────────────────────────────────────────────────
@@ -148,7 +148,7 @@ def poll_once(channel: Optional[str] = None) -> int:
     channel = channel or _listen_channel()
     client = _get_client()
     if client is None:
-        logger.warning("cc.slack_listener: SLACK_BOT_TOKEN not set — skipping poll")
+        logger.warning("cc.slack_listener: FA_MAX_SLACK_BOT_TOKEN not set — skipping poll")
         return 0
 
     from src.agents.cora.command_center.worker import publish_query

@@ -250,8 +250,8 @@ class CommandCenterWorker:
                 from config.settings import get_settings
                 from slack_sdk import WebClient
                 _s = get_settings()
-                if _s.slack_bot_token:
-                    WebClient(token=_s.slack_bot_token.get_secret_value()).chat_postMessage(
+                if _s.fa_max_slack_bot_token:
+                    WebClient(token=_s.fa_max_slack_bot_token.get_secret_value()).chat_postMessage(
                         channel=slack_channel, text=greeting_reply,
                     )
             except Exception as exc:
@@ -273,8 +273,8 @@ class CommandCenterWorker:
                 from config.settings import get_settings
                 from slack_sdk import WebClient
                 _s = get_settings()
-                if _s.slack_bot_token:
-                    _client = WebClient(token=_s.slack_bot_token.get_secret_value())
+                if _s.fa_max_slack_bot_token:
+                    _client = WebClient(token=_s.fa_max_slack_bot_token.get_secret_value())
                     _resp = _client.chat_postMessage(
                         channel=slack_channel,
                         text="⏳ _Looking that up..._",
@@ -366,13 +366,13 @@ def main() -> None:
     stop_event = threading.Event()
 
     # Start Slack inbound thread — Socket Mode (real-time WebSocket) if
-    # SLACK_APP_TOKEN is set, otherwise fall back to the polling listener.
+    # FA_MAX_SLACK_APP_TOKEN is set, otherwise fall back to the polling listener.
     import os
-    _has_app_token = bool(os.environ.get("SLACK_APP_TOKEN", "").strip())
+    _has_app_token = bool(os.environ.get("FA_MAX_SLACK_APP_TOKEN", "").strip())
     if not _has_app_token:
         try:
             from config.settings import get_settings as _gs
-            _has_app_token = bool(getattr(_gs(), "slack_app_token", None))
+            _has_app_token = bool(getattr(_gs(), "fa_max_slack_app_token", None))
         except Exception:
             pass
 
@@ -381,7 +381,7 @@ def main() -> None:
         _mode = "socket-mode (real-time)"
     else:
         from src.agents.cora.command_center.slack_listener import run_periodic as _listen
-        _mode = "polling (fallback — set SLACK_APP_TOKEN for real-time)"
+        _mode = "polling (fallback — set FA_MAX_SLACK_APP_TOKEN for real-time)"
 
     listener_thread = threading.Thread(
         target=_listen,

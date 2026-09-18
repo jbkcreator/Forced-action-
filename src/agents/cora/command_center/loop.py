@@ -201,11 +201,11 @@ def _make_node_loop():
             try:
                 from config.settings import get_settings
                 _s = get_settings()
-                if _s.slack_bot_token:
+                if _s.fa_max_slack_bot_token:
                     from src.agents.cora.command_center.step_tracker import StepTracker
                     tracker = StepTracker(
                         slack_channel, placeholder_ts,
-                        _s.slack_bot_token.get_secret_value(),
+                        _s.fa_max_slack_bot_token.get_secret_value(),
                     )
             except Exception as _exc:
                 logger.debug("loop: StepTracker init failed: %s", _exc)

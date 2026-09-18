@@ -6,12 +6,12 @@ connection to Slack. Events arrive in ~50-150ms instead of up to poll_interval.
 
 Requirements:
   1. Slack App-Level Token (xapp-…) with connections:write scope
-     → set SLACK_APP_TOKEN env var
+     → set FA_MAX_SLACK_APP_TOKEN env var
   2. Socket Mode enabled in the Slack app dashboard
   3. message.channels event subscription enabled
 
 Run via worker.py main() — started as a daemon thread alongside the CC worker.
-Falls back to the polling listener if SLACK_APP_TOKEN is not set.
+Falls back to the polling listener if FA_MAX_SLACK_APP_TOKEN is not set.
 """
 from __future__ import annotations
 
@@ -29,13 +29,13 @@ _LISTEN_CHANNEL = None  # None = all channels the bot is in; set to filter
 def _get_app_token() -> Optional[str]:
     try:
         from config.settings import get_settings
-        t = get_settings().slack_app_token
+        t = get_settings().fa_max_slack_app_token
         if t:
             return t.get_secret_value()
     except Exception:
         pass
     import os
-    return os.environ.get("SLACK_APP_TOKEN", "").strip() or None
+    return os.environ.get("FA_MAX_SLACK_APP_TOKEN", "").strip() or None
 
 
 def _handle_message(event: dict) -> None:
@@ -89,7 +89,7 @@ def run_socket_mode(stop_event: threading.Event) -> None:
     app_token = _get_app_token()
     if not app_token:
         logger.warning(
-            "cc.socket: SLACK_APP_TOKEN not set — Socket Mode unavailable. "
+            "cc.socket: FA_MAX_SLACK_APP_TOKEN not set — Socket Mode unavailable. "
             "Set the env var and enable Socket Mode in the Slack app dashboard."
         )
         return
@@ -105,11 +105,11 @@ def run_socket_mode(stop_event: threading.Event) -> None:
         return
 
     settings = get_settings()
-    if not settings.slack_bot_token:
-        logger.error("cc.socket: SLACK_BOT_TOKEN not set")
+    if not settings.fa_max_slack_bot_token:
+        logger.error("cc.socket: FA_MAX_SLACK_BOT_TOKEN not set")
         return
 
-    web_client = WebClient(token=settings.slack_bot_token.get_secret_value())
+    web_client = WebClient(token=settings.fa_max_slack_bot_token.get_secret_value())
     client = SocketModeClient(app_token=app_token, web_client=web_client)
 
     def _on_event(socket_client: SocketModeClient, req: SocketModeRequest) -> None:

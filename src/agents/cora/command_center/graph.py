@@ -121,7 +121,7 @@ def _node_emit(state: CommandCenterState) -> CommandCenterState:
         from slack_sdk import WebClient
 
         settings = get_settings()
-        token = settings.slack_bot_token
+        token = settings.fa_max_slack_bot_token
         if token:
             client = WebClient(token=token.get_secret_value())
             placeholder_ts = state.get("placeholder_ts")
@@ -139,7 +139,7 @@ def _node_emit(state: CommandCenterState) -> CommandCenterState:
                 client.chat_postMessage(**kwargs)
                 logger.info("command_center.emit: posted to channel=%s", slack_channel)
         else:
-            logger.warning("command_center.emit: SLACK_BOT_TOKEN not set — answer not posted")
+            logger.warning("command_center.emit: FA_MAX_SLACK_BOT_TOKEN not set — answer not posted")
     except Exception as exc:
         logger.warning("command_center.emit: Slack post failed: %s", exc)
 
