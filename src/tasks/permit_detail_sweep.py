@@ -96,60 +96,59 @@ def _playwright_fetch_html(permit_number: str, county_id: str) -> Optional[str]:
             page.wait_for_load_state("networkidle", timeout=30_000)
             page.wait_for_timeout(2000)
 
-            # Fill record number in "General Search" text field
-            filled = False
-            for sel in [
-                "input[id*='txtSearchCondition']",
-                "input[id*='txtGSPermit']",
-                "input[id*='txtGSRecordNumber']",
-                "input[id*='searchCondition']",
-            ]:
-                el = page.query_selector(sel)
-                if el:
-                    el.click(click_count=3)
-                    page.keyboard.type(permit_number, delay=40)
-                    filled = True
-                    break
-
-            if not filled:
-                logger.warning("[%s] Could not find search input for %s", county_id, permit_number)
+            # Fill permit number in the dedicated permit-number field
+            permit_input = page.query_selector(
+                "#ctl00_PlaceHolderMain_generalSearchForm_txtGSPermitNumber"
+            )
+            if not permit_input:
+                logger.warning("[%s] Permit-number input not found for %s", county_id, permit_number)
                 browser.close()
                 return None
 
-            # Submit search
+            permit_input.evaluate("el => { el.value = ''; el.dispatchEvent(new Event('input')); }")
+            permit_input.fill(permit_number)
+            page.wait_for_timeout(400)
+
+            # Submit via JS click (element may not be visible in headless layout)
+            submitted = False
             for sel in [
                 "#ctl00_PlaceHolderMain_btnNewSearch",
                 "a[id*='btnNewSearch']",
-                "input[id*='btnNewSearch']",
-                "input[id*='btnSearch']",
+                "#SearchForm_Start",
             ]:
                 el = page.query_selector(sel)
                 if el:
-                    el.click()
+                    el.evaluate("el => el.click()")
+                    submitted = True
                     break
+            if not submitted:
+                logger.warning("[%s] Search submit button not found for %s", county_id, permit_number)
+                browser.close()
+                return None
 
             page.wait_for_load_state("networkidle", timeout=40_000)
             page.wait_for_timeout(3000)
 
-            # Find first CapDetail link in results
-            href = None
-            for a in page.query_selector_all("a[href*='CapDetail']"):
-                h = a.get_attribute("href") or ""
-                if "CapDetail" in h:
-                    href = h
-                    break
+            # Accela redirects to detail page on single match — parse content directly.
+            # If multiple results, grab first CapDetail href and navigate to it.
+            hrefs = [
+                a.get_attribute("href") or ""
+                for a in page.query_selector_all("a[href*='CapDetail']")
+            ]
+            if hrefs:
+                href = hrefs[0]
+                if href.startswith("/"):
+                    href = "https://aca-prod.accela.com" + href
+                page.goto(href, timeout=60_000, wait_until="domcontentloaded")
+                page.wait_for_load_state("networkidle", timeout=30_000)
+                page.wait_for_timeout(2500)
 
-            if not href:
-                logger.warning("[%s] No CapDetail link found for %s", county_id, permit_number)
+            # Verify this is a detail page (has a known section heading)
+            body_text = page.inner_text("body")
+            if permit_number not in body_text and "Licensed Professional" not in body_text and "Applicant" not in body_text:
+                logger.warning("[%s] Result page doesn't look like detail for %s", county_id, permit_number)
                 browser.close()
                 return None
-
-            if href.startswith("/"):
-                href = "https://aca-prod.accela.com" + href
-
-            page.goto(href, timeout=60_000, wait_until="domcontentloaded")
-            page.wait_for_load_state("networkidle", timeout=30_000)
-            page.wait_for_timeout(2500)
 
             html = page.content()
             browser.close()
@@ -215,14 +214,13 @@ def run_sweep(
     engine = create_engine(get_settings().database_url)
     stats = {"enriched": 0, "skipped": 0, "errors": 0}
 
-    county_clause = "AND c.county_id = :county" if county_filter else ""
+    county_clause = "AND bp.county_id = :county" if county_filter else ""
 
     with engine.connect() as conn:
         rows = conn.execute(
             text(f"""
-                SELECT bp.id, bp.permit_number, c.county_id
+                SELECT bp.id, bp.permit_number, bp.county_id
                 FROM building_permits bp
-                JOIN counties c ON c.id = bp.county_id
                 WHERE bp.contractor_name IS NULL
                   {county_clause}
                 ORDER BY bp.id
