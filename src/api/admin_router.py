@@ -1712,7 +1712,20 @@ async def slack_events(request: Request):
 
 def _handle_relay_thread_action(payload: dict) -> None:
     """Turn an authorized exact command in a Relay card thread into a
-    regular durable Relay decision."""
+    regular durable Relay decision.
+
+    No revision_count_at_post guard applies here (WP-T2-2 review fix note):
+    unlike a button click, a typed thread reply carries no client-side
+    snapshot of what content the approver saw -- there is nothing to
+    compare against structurally. This is safe ONLY because the card
+    itself is now kept in sync with the latest revision (see
+    src.services.relay.slack_post.refresh_card_after_revision, called from
+    the Revise submission handler) -- a typed "approve" always acts on
+    whatever the thread's card currently shows. record_decision()'s own
+    'WHERE status = pending' guard still applies (a decided or reclaimed
+    row cannot be re-decided), which is the one true structural race guard
+    a text-only reply can get.
+    """
     event = payload.get("event") or {}
     if event.get("type") != "message" or event.get("subtype") or event.get("bot_id"):
         return
@@ -1972,6 +1985,7 @@ def _handle_relay_decision(payload: dict) -> dict:
     # current revision_count has moved since, this Approve click is acting
     # on stale (pre-revision) content and must be refused rather than
     # silently sending the old draft.
+    posted_revision_count = None
     if action == "approve":
         posted_revision_count = action_data.get("revision_count_at_post")
         if posted_revision_count is not None and existing.revision_count != posted_revision_count:
@@ -1979,6 +1993,11 @@ def _handle_relay_decision(payload: dict) -> dict:
                 f"Item #{item_id} was revised (now revision #{existing.revision_count}) after this "
                 "card was posted — check the revision note in this thread before approving."
             )
+        # This early check is a fast, friendly error message — the actual
+        # guarantee against a Revise landing between this check and the
+        # decision commit is expected_revision_count on record_decision()
+        # below, which folds the same comparison into the atomic UPDATE
+        # itself (WP-T2-2 review fix — see that function's docstring).
 
     has_fa_transition = (
         action == "approve"
@@ -2069,9 +2088,10 @@ def _handle_relay_decision(payload: dict) -> dict:
                     raise ValueError(f"state transition refused: {result.outcome.value}")
                 item = relay_queue.record_decision(
                     item_id, approved=True, decided_by=user_id, session=_db,
+                    expected_revision_count=posted_revision_count,
                 )
                 if item is None:
-                    raise ValueError("queue item is no longer pending")
+                    raise ValueError("queue item is no longer pending (or was revised after this card was posted)")
         except Exception as exc:
             _log.error(
                 "FA Max state transition failed on relay approval item=%d: %s",
@@ -2083,10 +2103,12 @@ def _handle_relay_decision(payload: dict) -> dict:
     else:
         item = relay_queue.record_decision(
             item_id, approved=(action == "approve"), decided_by=user_id,
+            expected_revision_count=posted_revision_count,
         )
         if item is None:
             return _slack_ephemeral(
-                f"Item #{item_id} was already decided (not still pending)."
+                f"Item #{item_id} was already decided, or was revised after this "
+                "card was posted (not still pending at the expected revision)."
             )
 
     reply_text = (
@@ -2309,6 +2331,16 @@ def _handle_relay_revise_submission(payload: dict) -> dict:
         f":pencil2: Revised by <@{user_id}> (revision #{item.revision_count}"
         f"{', material change' if material else ''}):\n{new_content[:2900]}",
     )
+    # WP-T2-2 review fix: the original card's Approve button was posted with
+    # revision_count_at_post baked in from BEFORE this revision, so without
+    # refreshing it, the stale-card guard in _handle_relay_decision would
+    # refuse that button FOREVER after even one revision -- there would be
+    # no working Approve path left for this item via Slack. Rebuilding the
+    # card in place gives it fresh buttons whose baked-in revision_count
+    # matches the row this revision just produced.
+    from src.services.relay.slack_post import refresh_card_after_revision
+
+    refresh_card_after_revision(item)
     return {"response_action": "clear"}
 
 

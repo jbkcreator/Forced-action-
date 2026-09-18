@@ -226,6 +226,7 @@ def enqueue(
                     require_consent,
                     suppression_reason,
                     validate_safe_payload,
+                    validate_tier_claim,
                 )
 
                 missing = [name for name, value in (
@@ -250,6 +251,15 @@ def enqueue(
                 )
                 if suppressed:
                     raise GovernanceBlocked(f"suppressed:{suppressed}")
+                # WP-T2-2 review fix: check_tier_gate() below trusts
+                # autonomy_tier_at_send as given and checks THAT tier's
+                # send-count/edit-rate evidence -- it has no way to know
+                # whether the claim itself is plausible for this message to
+                # this recipient. validate_tier_claim() closes the "cold
+                # message labeled A" gap by refusing an A/B claim for a
+                # person with zero prior contact history, structurally, at
+                # the single seam every fa_max send passes through.
+                validate_tier_claim(session, person_id=str(person_id), tier=str(autonomy_tier_at_send))
                 gate = check_tier_gate(str(agent_name), str(autonomy_tier_at_send), session)
                 gate_reason = gate.outcome.value
                 # Pending items need a Slack human decision. Graduation gates
@@ -461,6 +471,7 @@ def get_item_for_update(item_id: int, *, session) -> Optional[QueueItem]:
 
 def record_decision(
     item_id: int, *, approved: bool, decided_by: str, session=None,
+    expected_revision_count: Optional[int] = None,
 ) -> Optional[QueueItem]:
     """Flip a 'pending' row to approved/rejected. Called by the Slack
     decision webhook.
@@ -468,23 +479,42 @@ def record_decision(
     Returns None (no-op) if the row was not 'pending' at the moment of
     the update — guards a double button-press or a stale/duplicate Slack
     retry from re-deciding an already-decided row.
+
+    expected_revision_count (WP-T2-2 review fix): when given, folds the
+    stale-card check into this SAME atomic UPDATE (AND revision_count =
+    :expected_revision_count) instead of a separate, earlier, unlocked
+    SELECT the way src.api.admin_router._handle_relay_decision used to do
+    it. That earlier pattern (read revision_count, THEN decide whether to
+    call this function) left a real gap: a Revise could commit in between
+    the read and this write, and the earlier check would have already
+    passed on now-stale data. Folding the comparison into the UPDATE's own
+    WHERE clause makes "is this decision still acting on the revision_count
+    the caller saw" and "is this row still pending" a single indivisible
+    check-and-write — there is no window between them for a concurrent
+    Revise to land in. A mismatch (moved before this UPDATE commits) makes
+    this a no-op, same as any other stale/duplicate decision.
     """
     new_status = STATUS_APPROVED if approved else STATUS_REJECTED
     def apply(decision_session) -> Optional[QueueItem]:
+        where = "id = :id AND status = :pending"
+        params: dict = {
+            "new_status": new_status,
+            "decided_by": decided_by,
+            "id": item_id,
+            "pending": STATUS_PENDING,
+        }
+        if expected_revision_count is not None:
+            where += " AND revision_count = :expected_revision_count"
+            params["expected_revision_count"] = expected_revision_count
         row = decision_session.execute(
             text(
                 "UPDATE relay_approval_queue "
                 "SET status = :new_status, decided_by = :decided_by, "
                 "    decided_at = now(), updated_at = now() "
-                "WHERE id = :id AND status = :pending "
+                f"WHERE {where} "
                 f"RETURNING {_COLUMNS_SQL}"
             ),
-            {
-                "new_status": new_status,
-                "decided_by": decided_by,
-                "id": item_id,
-                "pending": STATUS_PENDING,
-            },
+            params,
         ).mappings().first()
         if row is None:
             return None

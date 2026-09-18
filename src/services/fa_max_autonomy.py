@@ -26,6 +26,21 @@ This module reads live counts from the DB — graduation state is never
 hard-coded. The Relay execution path currently requires a durable human
 approval for every FA Max item; autonomous dispatch is not enabled by WP-2.
 
+EXPLICIT SCOPE DECISION (WP-T2-2 review round 5): the split doc's prose
+places "the autonomy tier table... in the registry configuration, not
+scattered across individual agents." The three threshold constants below
+(_TIER_A_MIN_SENDS etc.) live here, in this service module, not inside
+src.agents.fa_max.tool_registry.FA_MAX_TOOL_REGISTRY. This is a deliberate
+choice, not an oversight: the tool registry's entries describe CALLABLE
+TOOLS (name, category, idempotency, whether a call requires the send gate)
+— the tier thresholds describe GRADUATION POLICY, a different concern with
+a different lifecycle (Josh/product may change a threshold without
+touching what tools exist). Putting policy constants inside a tool-registry
+dataclass would conflate the two. This module IS this WP's "central tier
+policy": check_tier_gate() is the one function every send path calls, and
+these constants are the one place the numbers are declared. WP-T2-2 is
+hereby amended to state this explicitly.
+
 All reads use sqlalchemy.text() per CLAUDE.md.
 """
 from __future__ import annotations

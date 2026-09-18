@@ -1145,23 +1145,165 @@ class TestEditRateReadsMaterialEditColumn:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestSendAttemptExpiry:
+    def _patched_db(self, session):
+        p = patch("src.core.database.get_db_context")
+        mock_db = p.start()
+        mock_db.return_value.__enter__ = MagicMock(return_value=session)
+        mock_db.return_value.__exit__ = MagicMock(return_value=False)
+        return p
+
     def test_claim_send_attempt_returns_true_when_in_progress(self):
         from src.services.fa_max_tool_log import claim_send_attempt
         session = MagicMock()
         session.execute.return_value.rowcount = 1
-        assert claim_send_attempt(session=session, log_id=5) is True
+        p = self._patched_db(session)
+        try:
+            assert claim_send_attempt(log_id=5) is True
+        finally:
+            p.stop()
 
     def test_claim_send_attempt_returns_false_when_already_finalized(self):
         from src.services.fa_max_tool_log import claim_send_attempt
         session = MagicMock()
         session.execute.return_value.rowcount = 0
-        assert claim_send_attempt(session=session, log_id=5) is False
+        p = self._patched_db(session)
+        try:
+            assert claim_send_attempt(log_id=5) is False
+        finally:
+            p.stop()
 
     def test_claim_send_attempt_fails_closed_on_db_error(self):
         from src.services.fa_max_tool_log import claim_send_attempt
         session = MagicMock()
         session.execute.side_effect = RuntimeError("db offline")
-        assert claim_send_attempt(session=session, log_id=5) is False
+        p = self._patched_db(session)
+        try:
+            assert claim_send_attempt(log_id=5) is False
+        finally:
+            p.stop()
+
+    def test_claim_send_attempt_uses_its_own_session_not_the_callers(self):
+        """WP-T2-2 review round 5 fix: claim_send_attempt() must NOT take a
+        session parameter — sharing the send tool's own long-lived session
+        was the root cause of the timeout/lock-contention bug (the claim's
+        row lock stayed held for the whole rest of the tool call instead of
+        releasing immediately)."""
+        import inspect
+        from src.services.fa_max_tool_log import claim_send_attempt
+        params = inspect.signature(claim_send_attempt).parameters
+        assert "session" not in params
+
+    def test_claim_send_attempt_sets_status_claimed(self):
+        from src.services.fa_max_tool_log import claim_send_attempt
+        session = MagicMock()
+        session.execute.return_value.rowcount = 1
+        p = self._patched_db(session)
+        try:
+            claim_send_attempt(log_id=5)
+        finally:
+            p.stop()
+        sql = str(session.execute.call_args[0][0])
+        assert "'claimed'" in sql
+        assert "'in_progress'" in sql
+
+    def test_finish_tool_call_require_status_guards_the_update(self):
+        from src.services.fa_max_tool_log import finish_tool_call
+        session = MagicMock()
+        session.execute.return_value.rowcount = 0
+        ok = finish_tool_call(
+            session=session, log_id=5, output={"error": "timeout"},
+            duration_ms=None, status="error", require_status="in_progress",
+        )
+        assert ok is True  # a guard mismatch is not a write failure
+        sql = str(session.execute.call_args[0][0])
+        assert "require_status" in str(session.execute.call_args[0][1])
+
+    def test_finish_tool_call_without_require_status_is_unconditional(self):
+        from src.services.fa_max_tool_log import finish_tool_call
+        session = MagicMock()
+        finish_tool_call(
+            session=session, log_id=5, output={"ok": True},
+            duration_ms=10, status="success",
+        )
+        params = session.execute.call_args[0][1]
+        assert "require_status" not in params
+
+    def test_node_tool_step_timeout_finish_uses_require_status_in_progress(self):
+        """WP-T2-2 review round 5 fix: the timeout branch's finish_tool_call
+        call must pass require_status='in_progress' so it cannot clobber a
+        row a concurrent claim_send_attempt() already promoted to
+        'claimed'."""
+        from src.agents.fa_max.agent_graph import _node_tool_step, ToolCallTimeout
+
+        steps = [{"tool": "send", "args": {}}]
+        state = {
+            "work_item_id": "wid-x", "agent_name": "cora", "steps": steps,
+            "step_index": 0, "tool_results": [], "done": False, "error": None,
+        }
+        captured = {}
+
+        def _capture_finish(**kw):
+            captured.update(kw)
+            return True
+
+        with patch("config.agents.get_agents_settings") as mock_settings:
+            with patch("src.core.database.get_db_context") as mock_db:
+                with patch("src.agents.fa_max.agent_graph.start_tool_call", return_value=1):
+                    with patch("src.agents.fa_max.agent_graph.finish_tool_call", side_effect=_capture_finish):
+                        with patch(
+                            "src.agents.fa_max.agent_graph._call_tool_with_timeout",
+                            side_effect=ToolCallTimeout("tool 'send' exceeded timeout"),
+                        ):
+                            mock_settings.return_value.fa_max_agent_max_tool_calls = 8
+                            mock_settings.return_value.fa_max_agent_tool_timeout_seconds = 0.05
+                            mock_db.return_value.__enter__ = MagicMock(return_value=MagicMock())
+                            mock_db.return_value.__exit__ = MagicMock(return_value=False)
+                            _node_tool_step(state)
+
+        assert captured.get("require_status") == "in_progress"
+
+    def test_node_tool_step_success_finish_has_no_require_status(self):
+        """A normal (non-timeout) completion's finish_tool_call call must
+        remain unconditional -- require_status is timeout-specific."""
+        from src.agents.fa_max.agent_graph import _node_tool_step
+
+        steps = [{"tool": "get_fa_max_person_state", "args": {"person_id": "p1"}}]
+        state = {
+            "work_item_id": "wid-y", "agent_name": "cora", "steps": steps,
+            "step_index": 0, "tool_results": [], "done": False, "error": None,
+        }
+        captured = {}
+
+        def _capture_finish(**kw):
+            captured.update(kw)
+            return True
+
+        with patch("config.agents.get_agents_settings") as mock_settings:
+            with patch("src.core.database.get_db_context") as mock_db:
+                with patch("src.agents.fa_max.agent_graph.start_tool_call", return_value=1):
+                    with patch("src.agents.fa_max.agent_graph.finish_tool_call", side_effect=_capture_finish):
+                        with patch("src.agents.fa_max.agent_graph._call_tool_with_timeout", return_value={"ok": True}):
+                            mock_settings.return_value.fa_max_agent_max_tool_calls = 8
+                            mock_settings.return_value.fa_max_agent_tool_timeout_seconds = 30
+                            mock_db.return_value.__enter__ = MagicMock(return_value=MagicMock())
+                            mock_db.return_value.__exit__ = MagicMock(return_value=False)
+                            _node_tool_step(state)
+
+        assert captured.get("require_status") is None
+
+    def test_model_status_check_allows_claimed(self):
+        from sqlalchemy import CheckConstraint
+        from src.core.models import FaMaxToolCallLog
+        checks = [c for c in FaMaxToolCallLog.__table_args__ if isinstance(c, CheckConstraint)]
+        assert any("claimed" in str(c.sqltext) for c in checks)
+
+    def test_claimed_status_migration_widens_constraint(self):
+        import pathlib
+        src = pathlib.Path(
+            "migrations/apply_fa_max_wp_t2_2_tool_call_log_claimed_status.py"
+        ).read_text(encoding="utf-8")
+        assert "claimed" in src
+        assert "pg_constraint" in src
 
     def test_send_tool_refuses_when_attempt_already_expired(self):
         from src.agents.fa_max.tool_registry import send, SendAttemptExpired
@@ -1226,6 +1368,113 @@ class TestSendAttemptExpiry:
         assert result == {"ok": True}
         call_kwargs = mock_read.call_args.kwargs
         assert "log_id" not in call_kwargs
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 18. Review-fix: claimed autonomy tier must be trusted, not assumed
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestValidateTierClaim:
+    def test_tier_c_never_blocked(self):
+        from src.services.fa_max_send_governance import validate_tier_claim
+        session = MagicMock()
+        validate_tier_claim(session, person_id="p1", tier="C")
+        session.execute.assert_not_called()
+
+    def test_tier_a_blocked_with_no_prior_contact(self):
+        from src.services.fa_max_send_governance import GovernanceBlocked, validate_tier_claim
+        session = MagicMock()
+        session.execute.return_value.scalar.return_value = 0
+        with pytest.raises(GovernanceBlocked, match="tier_claim_untrusted"):
+            validate_tier_claim(session, person_id="p1", tier="A")
+
+    def test_tier_b_blocked_with_no_prior_contact(self):
+        from src.services.fa_max_send_governance import GovernanceBlocked, validate_tier_claim
+        session = MagicMock()
+        session.execute.return_value.scalar.return_value = 0
+        with pytest.raises(GovernanceBlocked, match="tier_claim_untrusted"):
+            validate_tier_claim(session, person_id="p1", tier="B")
+
+    def test_tier_a_allowed_with_prior_contact(self):
+        from src.services.fa_max_send_governance import validate_tier_claim
+        session = MagicMock()
+        session.execute.return_value.scalar.return_value = 3
+        validate_tier_claim(session, person_id="p1", tier="A")  # must not raise
+
+    def test_enqueue_calls_validate_tier_claim(self):
+        import inspect
+        from src.services.relay import queue
+        source = inspect.getsource(queue.enqueue)
+        assert "validate_tier_claim" in source
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 19. Review-fix: atomic revision-count guard on approval decisions
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestAtomicRevisionCountGuard:
+    def test_record_decision_accepts_expected_revision_count(self):
+        import inspect
+        from src.services.relay.queue import record_decision
+        params = inspect.signature(record_decision).parameters
+        assert "expected_revision_count" in params
+
+    def test_record_decision_folds_check_into_where_clause(self):
+        from src.services.relay.queue import record_decision
+        session = MagicMock()
+        session.execute.return_value.mappings.return_value.first.return_value = None
+        record_decision(
+            7, approved=True, decided_by="U1", session=session,
+            expected_revision_count=2,
+        )
+        sql = str(session.execute.call_args[0][0])
+        params = session.execute.call_args[0][1]
+        assert "revision_count = :expected_revision_count" in sql
+        assert params["expected_revision_count"] == 2
+
+    def test_record_decision_omits_revision_guard_when_not_given(self):
+        from src.services.relay.queue import record_decision
+        session = MagicMock()
+        session.execute.return_value.mappings.return_value.first.return_value = None
+        record_decision(7, approved=True, decided_by="U1", session=session)
+        sql = str(session.execute.call_args[0][0])
+        assert "revision_count = :expected_revision_count" not in sql
+
+    def test_admin_router_passes_expected_revision_count_through(self):
+        import inspect
+        from src.api import admin_router
+        source = inspect.getsource(admin_router._handle_relay_decision)
+        assert "expected_revision_count=posted_revision_count" in source
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 20. Review-fix: Revise refreshes the posted card so Approve keeps working
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestRefreshCardAfterRevision:
+    def test_refresh_card_after_revision_exists(self):
+        from src.services.relay.slack_post import refresh_card_after_revision
+        assert callable(refresh_card_after_revision)
+
+    def test_refresh_card_noop_when_no_slack_message(self):
+        from src.services.relay.slack_post import refresh_card_after_revision
+        item = MagicMock(slack_message_ts=None)
+        assert refresh_card_after_revision(item) is True
+
+    def test_revise_submission_calls_refresh_card(self):
+        import inspect
+        from src.api import admin_router
+        source = inspect.getsource(admin_router._handle_relay_revise_submission)
+        assert "refresh_card_after_revision" in source
+
+    def test_build_approval_blocks_bakes_current_revision_count(self):
+        from src.services.relay.slack_post import _build_approval_blocks
+        item = MagicMock(id=9, revision_count=3, payload={"subject": "s"})
+        blocks = _build_approval_blocks(item)
+        actions = [b for b in blocks if b.get("type") == "actions"][0]
+        approve_btn = [e for e in actions["elements"] if e["action_id"] == "approve"][0]
+        value = json.loads(approve_btn["value"])
+        assert value["revision_count_at_post"] == 3
 
 
 # ─────────────────────────────────────────────────────────────────────────────

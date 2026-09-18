@@ -182,7 +182,7 @@ def start_tool_call(
         return None
 
 
-def claim_send_attempt(*, session: Session, log_id: int) -> bool:
+def claim_send_attempt(*, log_id: int) -> bool:
     """Atomically check whether a tool-call attempt is still live before it
     is allowed to cause a real outbound side effect (WP-T2-2 review fix for
     the timeout race — see src.agents.fa_max.tool_registry.send).
@@ -195,17 +195,38 @@ def claim_send_attempt(*, session: Session, log_id: int) -> bool:
     relay.queue.enqueue() and cause a real send. This gives that thread one
     place to durably ask "is my attempt still considered live?" immediately
     before it does anything with an external effect: a conditional UPDATE
-    that only succeeds while the row is still 'in_progress'. If the timeout
-    handler's finish_tool_call() has already committed status='error', this
-    UPDATE matches zero rows and returns False -- the caller must refuse to
-    proceed.
+    that only succeeds while the row is still 'in_progress', transitioning
+    it to 'claimed'. If the timeout handler's finish_tool_call() has
+    already committed status='error', this UPDATE matches zero rows and
+    returns False -- the caller must refuse to proceed.
 
-    This narrows, but cannot fully close, the race: nothing can make two
-    independent threads agree on a single instant without one blocking on
-    the other, and blocking the send tool on the timeout path would defeat
-    the point of having a timeout at all. What this DOES guarantee is that
-    the decision is based on durable, currently-committed database state
-    (not each thread's own local assumption of who "won"), and that
+    OWN SHORT-LIVED TRANSACTION (WP-T2-2 review round 5 fix): this
+    deliberately does NOT take the caller's session, unlike every other
+    function in this module. An earlier version shared the send tool's own
+    long-lived session here -- since that session doesn't commit until the
+    ENTIRE tool call finishes (including relay.queue.enqueue(), which can
+    itself contact Slack), the row lock this UPDATE takes stayed held for
+    that whole duration. A concurrently-firing timeout's finish_tool_call()
+    UPDATE on the SAME row would then physically BLOCK waiting on that
+    lock -- turning the configured fa_max_agent_tool_timeout_seconds into
+    "wait for the send to finish anyway," which defeats having a timeout at
+    all. Opening and committing a dedicated session here means the lock is
+    held only for the instant of this one UPDATE, not for the rest of the
+    send.
+
+    finish_tool_call()'s timeout-path call now passes
+    require_status='in_progress', so if THIS claim wins the race and
+    promotes the row to 'claimed' first, a timeout write that arrives
+    afterward becomes a no-op instead of clobbering 'claimed' back to
+    'error' -- see that function's docstring.
+
+    This narrows, but cannot fully close, the underlying race: nothing can
+    make two independent threads agree on a single instant without one
+    blocking on the other, and blocking the send tool on the timeout path
+    would defeat the point of having a timeout at all. What this DOES
+    guarantee is that the decision is based on durable, currently-committed
+    database state (not each thread's own local assumption of who "won"),
+    that the lock window is as short as physically possible, and that
     whichever side loses the race is provably, auditably the one that saw
     the row already finalized -- not a coin flip.
 
@@ -214,16 +235,19 @@ def claim_send_attempt(*, session: Session, log_id: int) -> bool:
     claimed" (fail closed -- refuse to send rather than risk sending on an
     attempt whose liveness could not be confirmed).
     """
+    from src.core.database import get_db_context
+
     try:
-        result = session.execute(
-            text(
-                "UPDATE fa_max_tool_call_log SET "
-                "output = jsonb_set(COALESCE(output, '{}'::jsonb), '{_send_confirmed}', 'true'::jsonb) "
-                "WHERE id = :log_id AND status = 'in_progress'"
-            ),
-            {"log_id": log_id},
-        )
-        return result.rowcount > 0
+        with get_db_context() as session:
+            result = session.execute(
+                text(
+                    "UPDATE fa_max_tool_call_log SET status = 'claimed' "
+                    "WHERE id = :log_id AND status = 'in_progress'"
+                ),
+                {"log_id": log_id},
+            )
+            claimed = result.rowcount > 0
+        return claimed
     except Exception:
         logger.warning(
             "fa_max_tool_call_log claim_send_attempt failed for log_id=%s -- "
@@ -239,10 +263,11 @@ def finish_tool_call(
     output: Optional[dict],
     duration_ms: Optional[int],
     status: str,
+    require_status: Optional[str] = None,
 ) -> bool:
     """Update the row start_tool_call() wrote with the call's true final
-    outcome. Never raises; returns False on failure so a caller with a hard
-    "every call logged" requirement can fail closed.
+    outcome. Never raises; returns False on a genuine write failure so a
+    caller with a hard "every call logged" requirement can fail closed.
 
     Also used to RECONCILE a call that completed AFTER its timeout was
     already logged: src.agents.fa_max.agent_graph registers a callback on
@@ -250,26 +275,55 @@ def finish_tool_call(
     finishes — even long after the agent loop gave up waiting and moved on
     — this is called again for the same log_id with the real outcome.
     Calling this more than once for the same log_id is safe; the row
-    reflects whatever finish_tool_call() call landed last.
+    reflects whatever finish_tool_call() call landed last (that later call
+    is always unconditional -- require_status is never passed there, since
+    the reconciliation callback IS the authoritative final outcome).
+
+    require_status (WP-T2-2 review round 5 fix): when given, makes this a
+    CONDITIONAL update -- the WHERE clause also requires the row's CURRENT
+    status to still match. The agent loop's timeout handler passes
+    require_status='in_progress' specifically so that if
+    fa_max_tool_log.claim_send_attempt() has ALREADY promoted this row past
+    'in_progress' (to 'claimed', meaning a send tool durably confirmed its
+    attempt was still live and proceeded), the timeout's own write becomes
+    a no-op instead of clobbering that 'claimed' state back to 'error' --
+    preserving the signal that a real send was let through, rather than
+    silently erasing it. A guard mismatch (0 rows updated) is NOT treated
+    as a write failure -- the row still exists and still carries a valid
+    status, just not the one this particular call wanted to write -- so
+    this still returns True in that case; only an actual exception returns
+    False.
     """
     if status not in ("success", "error", "blocked"):
         raise ValueError(f"status must be 'success', 'error', or 'blocked', got {status!r}")
     import json as _json
 
+    where = "id = :log_id"
+    params: dict = {
+        "log_id": log_id,
+        "output": _json.dumps(redact_for_tool_log(output)),
+        "duration_ms": duration_ms,
+        "status": status,
+    }
+    if require_status is not None:
+        where += " AND status = :require_status"
+        params["require_status"] = require_status
+
     try:
-        session.execute(
+        result = session.execute(
             text(
                 "UPDATE fa_max_tool_call_log SET "
                 "output = :output ::jsonb, duration_ms = :duration_ms, status = :status "
-                "WHERE id = :log_id"
+                f"WHERE {where}"
             ),
-            {
-                "log_id": log_id,
-                "output": _json.dumps(redact_for_tool_log(output)),
-                "duration_ms": duration_ms,
-                "status": status,
-            },
+            params,
         )
+        if require_status is not None and result.rowcount == 0:
+            logger.info(
+                "fa_max_tool_call_log finish_tool_call: log_id=%s no longer status=%r "
+                "(likely claimed by claim_send_attempt() first) -- not overwriting",
+                log_id, require_status,
+            )
         return True
     except Exception:
         logger.warning(

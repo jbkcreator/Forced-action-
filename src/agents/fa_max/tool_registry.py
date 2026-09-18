@@ -204,7 +204,7 @@ def send(
     from src.services.fa_max_tool_log import claim_send_attempt
     from src.services.relay import queue as relay_queue
 
-    if log_id is not None and not claim_send_attempt(session=session, log_id=log_id):
+    if log_id is not None and not claim_send_attempt(log_id=log_id):
         logger.warning(
             "fa_max.tool_registry.send: attempt log_id=%s already timed out by the "
             "agent loop — refusing to enqueue idempotency_key=%r",

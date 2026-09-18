@@ -9,7 +9,26 @@ work item (a graph, a task, an operator script). This mirrors the rest of
 this codebase's own convention for agent routing — src.agents.cora.main_graph
 routes on a plain dict lookup with the docstring "no LLM"; this loop is the
 same idea applied to a sequence of tool calls instead of a single event
-route. The loop node repeatedly:
+route.
+
+EXPLICIT SCOPE DECISION (WP-T2-2 review round 5): the WP-T2-2 split doc's
+prose describes Cora "receiving a task description" and "identifying which
+tool to call from the registry" — read literally, that implies a live
+LLM-driven task-to-tool planner. This module does NOT build that. Doing so
+now would be new architecture invented mid-fix-cycle, not a bug fix, and
+would contradict the one explicit "no LLM" precedent already set by
+src.agents.cora.main_graph for the rest of this codebase's agent routing.
+The caller-supplied ``steps`` plan (built by admin_router.py's
+POST /fa-max/agent-tasks today, or a future automatic producer) IS this
+WP's execution-plan contract — WP-T2-2 is hereby amended to state that
+explicitly rather than leaving it an unstated gap against the split doc's
+prose. A live task-to-tool LLM planner, if ever wanted, is new scope for a
+future work package to design and task-analysis to settle — not something
+to add here without that planning pass and the open questions it would
+raise (which model, what tool-selection failure mode, how autonomy-tier
+gating interacts with a planner's own tool choice).
+
+The loop node repeatedly:
 
     pick next step -> look up tool in FA_MAX_TOOL_REGISTRY
         -> fa_max_tool_log.start_tool_call() [audit row BEFORE execution]
@@ -289,6 +308,7 @@ def _node_tool_step(state: FaMaxAgentState) -> FaMaxAgentState:
         }
 
     start = time.monotonic()
+    was_timeout = False
     try:
         output = _call_tool_with_timeout(
             tool_name, args, timeout_seconds=tool_timeout_seconds,
@@ -306,7 +326,13 @@ def _node_tool_step(state: FaMaxAgentState) -> FaMaxAgentState:
         # _call_tool_with_timeout) with the call's TRUE outcome once the
         # orphaned thread actually finishes -- this is the best-available
         # value at the moment the loop gives up, not a claim that the call
-        # never had an effect.
+        # never had an effect. was_timeout makes the finish_tool_call() call
+        # below CONDITIONAL (require_status='in_progress') -- WP-T2-2 review
+        # round 5 fix: if fa_max_tool_log.claim_send_attempt() already
+        # promoted this row to 'claimed' (the orphaned send tool durably
+        # confirmed it was still live and proceeded), this write must not
+        # clobber that signal back to 'error'.
+        was_timeout = True
         logger.error(
             "fa_max.agent_graph: tool %r timed out after %ss for work_item_id=%s",
             tool_name, tool_timeout_seconds, work_item_id,
@@ -338,6 +364,7 @@ def _node_tool_step(state: FaMaxAgentState) -> FaMaxAgentState:
             output=output if isinstance(output, dict) else {"result": output},
             duration_ms=duration_ms,
             status=status,
+            require_status="in_progress" if was_timeout else None,
         )
 
     if not logged:

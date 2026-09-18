@@ -68,6 +68,55 @@ def require_consent(session: Session, *, person_id: str, channel: str) -> Consen
     return ConsentResult(True, "consent_granted")
 
 
+def validate_tier_claim(session: Session, *, person_id: str, tier: str) -> None:
+    """Structural, conservative check that a claimed autonomy tier is not
+    an easier gate than this recipient's real contact history supports
+    (WP-T2-2 review fix).
+
+    The task that dispatches a `send` tool call supplies agent_name and
+    autonomy_tier_at_send as plain arguments -- src.services.fa_max_
+    autonomy.check_tier_gate() then checks that AGENT's send-count/edit-rate
+    evidence for the CLAIMED tier, but nothing previously checked whether
+    the claimed tier was even a plausible description of THIS message to
+    THIS recipient. A cold first touch mislabeled tier A would use the
+    easier 25-send gate instead of the correct 300-send-plus-5-funded-loans
+    gate for tier C.
+
+    This does not attempt to distinguish "reply in an existing thread" from
+    "partner warm introduction" -- both of Tier A and B's real definitions
+    require a *relationship concept* (which specific thread, which partner
+    record) that is not part of this WP's scope and would be an invented
+    assumption to encode here. What IS checkable from data this WP already
+    owns is the one unambiguous invariant: Tier A and Tier B both presume
+    SOME prior contact already exists with this person -- a reply, a
+    follow-up, or a warm introduction are none of them a FIRST message. A
+    person with ZERO prior fa_max_interactions rows has, by definition,
+    never been contacted -- claiming Tier A or B for them is claiming a
+    relationship that provably does not exist yet, and must be refused
+    regardless of which agent or which task supplied the claim. A genuine
+    cold first touch is Tier C, which does not claim any prior
+    relationship and is unaffected by this check.
+
+    Raises GovernanceBlocked (never silently downgrades the tier -- a
+    silent downgrade would let the wrong gate's evidence still count) when
+    the claim cannot be trusted. No-ops for tier C or any other value; this
+    function only ever narrows A/B, never blocks C.
+    """
+    if tier not in ("A", "B"):
+        return
+    prior_contact_count = session.execute(
+        text(
+            "SELECT COUNT(*) FROM fa_max_interactions "
+            "WHERE person_id = CAST(:person_id AS uuid)"
+        ),
+        {"person_id": person_id},
+    ).scalar()
+    if not prior_contact_count:
+        raise GovernanceBlocked(
+            f"tier_claim_untrusted:{tier}_requires_prior_interaction_history"
+        )
+
+
 def suppression_reason(session: Session, *, recipient: str, channel: str) -> str | None:
     """First suppression gate, using the same stores as Relay's send gate."""
     campaign_reason = backflip_campaign_reason(session, recipient=recipient, channel=channel)

@@ -98,17 +98,6 @@ def post_for_approval(item: QueueItem) -> None:
         )
         return
 
-    # revision_count_at_post lets the approve handler detect a stale card —
-    # a Revise submitted after this card was posted must not be silently
-    # approved as if it were the content shown here (WP-T2-2 item 9).
-    approve_value = json.dumps({
-        "item_id": item.id, "action": "approve", "revision_count_at_post": item.revision_count,
-    })
-    reject_value = json.dumps({"item_id": item.id, "action": "reject"})
-    skip_value = json.dumps({"item_id": item.id, "action": "skip"})
-    snooze_value = json.dumps({"item_id": item.id, "action": "snooze"})
-    revise_value = json.dumps({"item_id": item.id, "action": "revise"})
-
     lease_until = None
     if item.venture_key == _FA_MAX_VENTURE:
         lease_until = queue.claim_slack_post(item.id)
@@ -142,46 +131,7 @@ def post_for_approval(item: QueueItem) -> None:
         response = client.chat_postMessage(
             channel=channel,
             text=_summary_text(item),
-            blocks=[
-                {"type": "section", "text": {"type": "mrkdwn", "text": _summary_text(item)}},
-                {
-                    "type": "actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "Approve"},
-                            "style": "primary",
-                            "action_id": "approve",
-                            "value": approve_value,
-                        },
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "Reject"},
-                            "style": "danger",
-                            "action_id": "reject",
-                            "value": reject_value,
-                        },
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "Skip"},
-                            "action_id": "fa_max_skip",
-                            "value": skip_value,
-                        },
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "Snooze"},
-                            "action_id": "fa_max_snooze",
-                            "value": snooze_value,
-                        },
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "Revise"},
-                            "action_id": "fa_max_revise",
-                            "value": revise_value,
-                        },
-                    ],
-                },
-            ],
+            blocks=_build_approval_blocks(item),
         )
         queue.set_slack_message_ts(item.id, response["ts"], lease_until=lease_until)
     except Exception as exc:
@@ -189,6 +139,112 @@ def post_for_approval(item: QueueItem) -> None:
     finally:
         if lease_until is not None:
             queue.release_slack_post(item.id, lease_until)
+
+
+def _build_approval_blocks(item: QueueItem) -> list:
+    """Shared block layout for the interactive approval card — used both by
+    post_for_approval() (first post) and refresh_card_after_revision()
+    (WP-T2-2 review fix, below). approve_value/reject_value always carry
+    THIS item's CURRENT revision_count, so a card built by this function
+    always matches the stale-card guard in
+    src.api.admin_router._handle_relay_decision as of the moment it's built.
+    """
+    approve_value = json.dumps({
+        "item_id": item.id, "action": "approve", "revision_count_at_post": item.revision_count,
+    })
+    reject_value = json.dumps({"item_id": item.id, "action": "reject"})
+    skip_value = json.dumps({"item_id": item.id, "action": "skip"})
+    snooze_value = json.dumps({"item_id": item.id, "action": "snooze"})
+    revise_value = json.dumps({"item_id": item.id, "action": "revise"})
+    return [
+        {"type": "section", "text": {"type": "mrkdwn", "text": _summary_text(item)}},
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Approve"},
+                    "style": "primary",
+                    "action_id": "approve",
+                    "value": approve_value,
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Reject"},
+                    "style": "danger",
+                    "action_id": "reject",
+                    "value": reject_value,
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Skip"},
+                    "action_id": "fa_max_skip",
+                    "value": skip_value,
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Snooze"},
+                    "action_id": "fa_max_snooze",
+                    "value": snooze_value,
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Revise"},
+                    "action_id": "fa_max_revise",
+                    "value": revise_value,
+                },
+            ],
+        },
+    ]
+
+
+def refresh_card_after_revision(item: QueueItem) -> bool:
+    """Rebuild the posted card's blocks after a Revise submission (WP-T2-2
+    review fix) so the Approve/Reject/Skip/Snooze/Revise buttons carry the
+    item's NEW revision_count and the visible text reflects the revised
+    content -- not the pre-revision card.
+
+    Before this existed, a Revise only posted a thread reply under the
+    original card; the card's OWN Approve button kept the revision_count
+    baked in at first-post time (always 0), so any revision at all made the
+    stale-card guard in admin_router._handle_relay_decision refuse the
+    original button FOREVER -- there was no way to approve a revised item
+    through the card again. Updating the card in place (chat.update on the
+    same message ts) is the fix: it is the SAME mechanism
+    _update_relay_slack_message already uses for terminal-state edits, just
+    reused here for a non-terminal (still-pending) content refresh.
+
+    Returns True if the update was sent (or Slack isn't configured, which
+    is a legitimate no-op, not a failure), False only on an actual Slack
+    API error. Never raises -- called from the Revise submission handler,
+    which must not fail the revision itself over a Slack hiccup; the
+    revision is already durably saved by the time this runs.
+    """
+    if not item.slack_message_ts:
+        return True
+
+    settings = get_settings()
+    token = _resolve_bot_token(item, settings)
+    channel = _resolve_channel(item, settings)
+    if not token or not channel:
+        return True
+
+    try:
+        from slack_sdk import WebClient
+        client = WebClient(token=token.get_secret_value())
+        client.chat_update(
+            channel=channel,
+            ts=item.slack_message_ts,
+            text=_summary_text(item),
+            blocks=_build_approval_blocks(item),
+        )
+        return True
+    except Exception as exc:
+        logger.error(
+            "[Relay] refresh_card_after_revision chat.update failed for item %d: %s",
+            item.id, exc, exc_info=True,
+        )
+        return False
 
 
 def _build_revise_modal(item: QueueItem) -> dict:
