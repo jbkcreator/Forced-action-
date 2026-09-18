@@ -150,6 +150,7 @@ def enqueue(
     person_id: Optional[str] = None,
     skip_contract_validation: bool = False,
     auto_authorize: bool = False,
+    send_attempt_log_id: Optional[int] = None,
 ) -> QueueItem:
     """Write a new 'pending' row. Called by Cora/THROUGH (Phase 2) and by
     R1's --seed CLI today.
@@ -215,8 +216,32 @@ def enqueue(
                 )
             raise rejected from exc
 
+    # Autonomous dispatch must originate from an audited agent-loop send
+    # attempt. Direct Relay callers can still create a human-approval draft.
+    if venture_key == "fa_max_lending" and auto_authorize and send_attempt_log_id is None:
+        auto_authorize = False
+
     try:
         with get_db_context() as session:
+            if send_attempt_log_id is not None:
+                from config.agents import get_agents_settings
+                from src.services.fa_max_send_governance import GovernanceBlocked
+
+                # The send attempt and the queue insert share this transaction.
+                # A thread that wakes after its deadline cannot enqueue merely
+                # because it obtained a claim before the agent loop timed out.
+                live = session.execute(text(
+                    "SELECT 1 FROM fa_max_tool_call_log WHERE id = :log_id "
+                    "AND tool_name = 'send' AND status = 'claimed' "
+                    "AND input->>'idempotency_key' = :idempotency_key "
+                    "AND agent_name = :agent_name "
+                    "AND created_at + (:timeout_seconds * interval '1 second') > clock_timestamp() "
+                    "FOR UPDATE"
+                ), {"log_id": send_attempt_log_id,
+                    "idempotency_key": idempotency_key, "agent_name": agent_name,
+                    "timeout_seconds": get_agents_settings().fa_max_agent_tool_timeout_seconds}).scalar()
+                if not live:
+                    raise GovernanceBlocked("send_attempt_expired")
             gate_reason = None
             if venture_key == "fa_max_lending":
                 from src.services.fa_max_autonomy import check_tier_gate
@@ -226,7 +251,6 @@ def enqueue(
                     require_consent,
                     suppression_reason,
                     validate_safe_payload,
-                    validate_tier_claim,
                 )
 
                 missing = [name for name, value in (
@@ -251,15 +275,9 @@ def enqueue(
                 )
                 if suppressed:
                     raise GovernanceBlocked(f"suppressed:{suppressed}")
-                # WP-T2-2 review fix: check_tier_gate() below trusts
-                # autonomy_tier_at_send as given and checks THAT tier's
-                # send-count/edit-rate evidence -- it has no way to know
-                # whether the claim itself is plausible for this message to
-                # this recipient. validate_tier_claim() closes the "cold
-                # message labeled A" gap by refusing an A/B claim for a
-                # person with zero prior contact history, structurally, at
-                # the single seam every fa_max send passes through.
-                validate_tier_claim(session, person_id=str(person_id), tier=str(autonomy_tier_at_send))
+                # A warm introduction can be a first contact. Recipient
+                # context is checked before autonomous authorization below;
+                # unverified A/B claims remain pending for human approval.
                 gate = check_tier_gate(str(agent_name), str(autonomy_tier_at_send), session)
                 gate_reason = gate.outcome.value
                 # Pending items need a Slack human decision. Graduation gates
@@ -289,6 +307,7 @@ def enqueue(
                 from config.settings import get_settings as _get_fa_max_settings
                 from src.services.fa_max_autonomy import check_tier_gate as _fresh_tier_gate
                 from src.services.fa_max_send_governance import suppression_reason as _fresh_suppression_reason
+                from src.services.fa_max_send_governance import autonomous_tier_context_verified
                 from src.services.state_engine import write_interaction as _write_authorizing_interaction
 
                 # Fail-closed gate (WP-T2-2 item 10): autonomous dispatch is
@@ -311,7 +330,11 @@ def enqueue(
                     fresh_suppressed = _fresh_suppression_reason(
                         session, recipient=recipient, channel=channel,
                     )
-                if fresh_gate is not None and fresh_gate.allowed and not fresh_suppressed:
+                context_verified = autonomous_tier_context_verified(
+                    session, person_id=str(person_id),
+                    tier=str(autonomy_tier_at_send), thread_id=thread_id,
+                )
+                if fresh_gate is not None and fresh_gate.allowed and not fresh_suppressed and context_verified:
                     tier = str(autonomy_tier_at_send)
                     interaction_id = _write_authorizing_interaction(
                         session=session,
@@ -343,8 +366,9 @@ def enqueue(
                 else:
                     logger.info(
                         "[Relay] auto_authorize declined for item %s: "
-                        "tier_gate_allowed=%s suppression_reason=%s -- leaving pending",
+                        "tier_gate_allowed=%s suppression_reason=%s context_verified=%s -- leaving pending",
                         item_id, (fresh_gate.allowed if fresh_gate is not None else None), fresh_suppressed,
+                        context_verified,
                     )
     except IntegrityError:
         existing = get_item_by_idempotency_key(idempotency_key)

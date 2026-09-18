@@ -591,6 +591,21 @@ worker and this endpoint exist so a human-triggered task has somewhere real
 to run; an automatic trigger (which event should hand Cora a task, and when)
 is a separate, not-yet-built work package's decision, not invented here.
 
+The endpoint accepts either ordered `steps` or a `task_description` plus
+structured `context`. The v1 description selector supports one recognized
+action (person state/history, suppression, send, or approval-card repost) and
+rejects ambiguous requests. The worker also reconciles expired claimed send
+attempts against Relay's idempotency-keyed queue during its reclaim sweep.
+
+For causal Tier C evidence, an admin records an opportunity from the exact
+completed send with `POST /api/admin/fa-max/opportunities/from-send`. Normal
+stage progression uses `POST /api/admin/fa-max/opportunities/{id}/advance`;
+the verified `closing` to `funded` step uses
+`POST /api/admin/fa-max/opportunities/{id}/funded`. The latter writes the
+funded outcome in the same transaction as the state transition event. Rerun
+`apply_fa_max_wp_t2_2_opportunity_origin_immutable.py` on upgraded databases
+before using this path so a NULL origin cannot be filled in after creation.
+
 Grant `channels:history` (and `groups:history` for a private queue) so the
 FA Max retry worker can reconcile a card accepted by Slack before a local
 crash. Run `python -m src.services.relay --post-pending-fa-max` every five

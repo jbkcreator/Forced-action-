@@ -11,22 +11,11 @@ routes on a plain dict lookup with the docstring "no LLM"; this loop is the
 same idea applied to a sequence of tool calls instead of a single event
 route.
 
-EXPLICIT SCOPE DECISION (WP-T2-2 review round 5): the WP-T2-2 split doc's
-prose describes Cora "receiving a task description" and "identifying which
-tool to call from the registry" — read literally, that implies a live
-LLM-driven task-to-tool planner. This module does NOT build that. Doing so
-now would be new architecture invented mid-fix-cycle, not a bug fix, and
-would contradict the one explicit "no LLM" precedent already set by
-src.agents.cora.main_graph for the rest of this codebase's agent routing.
-The caller-supplied ``steps`` plan (built by admin_router.py's
-POST /fa-max/agent-tasks today, or a future automatic producer) IS this
-WP's execution-plan contract — WP-T2-2 is hereby amended to state that
-explicitly rather than leaving it an unstated gap against the split doc's
-prose. A live task-to-tool LLM planner, if ever wanted, is new scope for a
-future work package to design and task-analysis to settle — not something
-to add here without that planning pass and the open questions it would
-raise (which model, what tool-selection failure mode, how autonomy-tier
-gating interacts with a planner's own tool choice).
+The admin task endpoint also accepts a task description. The worker uses
+tool_registry.select_task_tools() to select one registered v1 action from
+that description, following Cora's existing deterministic routing pattern.
+Ambiguous or unsupported requests are rejected; explicit ordered ``steps``
+remain available for bounded multi-tool tasks.
 
 The loop node repeatedly:
 
@@ -229,6 +218,9 @@ def _call_tool_with_timeout(
     already timed this attempt out (see fa_max_tool_log.claim_send_attempt
     and src.agents.fa_max.tool_registry.send).
     """
+    if tool_name == "send" and agent_name is not None and args.get("agent_name") != agent_name:
+        raise GovernanceBlocked("send_agent_name_mismatch")
+
     from src.core.database import get_db_context
 
     def _run() -> Any:

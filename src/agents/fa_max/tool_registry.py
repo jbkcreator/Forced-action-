@@ -16,7 +16,7 @@ module is therefore a small, FA-Max-scoped equivalent of the same pattern
 it does not reimplement idempotency/category validation beyond what FA Max
 actually needs.
 
-Exactly four tools are registered here — no more, per the WP-T2-2 spec's
+Five tools are registered here, per the WP-T2-2 spec's
 "not pre-populated for tools that don't yet exist":
 
   - get_fa_max_person_state    (read,  requires_send_gate=False)
@@ -74,6 +74,59 @@ class FaMaxToolSpec:
 
 
 FA_MAX_TOOL_REGISTRY: Dict[str, FaMaxToolSpec] = {}
+
+# Central send policy used by the registry's send tool and Relay's fresh
+# authorization check. No agent owns a private copy of these thresholds.
+FA_MAX_AUTONOMY_POLICY = {
+    "A": {"approved_sends": 25},
+    "B": {"approved_sends": 100, "max_edit_rate_exclusive": 0.10},
+    "C": {"approved_sends": 300, "funded_loans": 5},
+}
+
+
+def select_task_tools(description: str, context: dict) -> list[dict]:
+    """Select registered v1 tools for a bounded operator task.
+
+    The deterministic selector follows Cora's existing no-LLM routing
+    pattern. Ambiguous requests fail closed; outbound content and recipient
+    must be explicit context, then Relay applies its own send gates.
+    """
+    intent = " ".join(description.casefold().split())
+    if " then " in intent or " and " in intent:
+        raise ValueError("unsupported_multi_action_task")
+    if "suppression" in intent:
+        name = "check_suppression"
+        args = {key: context[key] for key in ("recipient", "channel") if key in context}
+    elif "history" in intent:
+        name = "get_fa_max_person_history"
+        args = {key: context[key] for key in ("person_id", "limit", "after_seq") if key in context}
+    elif "state" in intent:
+        name = "get_fa_max_person_state"
+        args = {"person_id": context["person_id"]} if "person_id" in context else {}
+    elif intent.startswith("send ") or intent == "send":
+        name = "send"
+        args = {key: context[key] for key in (
+            "idempotency_key", "channel", "recipient", "payload", "agent_name",
+            "lane", "autonomy_tier_at_send", "person_id", "thread_id",
+        ) if key in context}
+    elif "slack" in intent:
+        name = "post_slack"
+        args = {"item_id": context["item_id"]} if "item_id" in context else {}
+    else:
+        raise ValueError("unsupported_task_description")
+    if name not in FA_MAX_TOOL_REGISTRY:
+        raise ValueError("selected_tool_not_registered")
+    required = {
+        "check_suppression": {"recipient", "channel"},
+        "get_fa_max_person_history": {"person_id"},
+        "get_fa_max_person_state": {"person_id"},
+        "send": {"idempotency_key", "channel", "recipient", "payload", "agent_name",
+                 "lane", "autonomy_tier_at_send", "person_id"},
+        "post_slack": {"item_id"},
+    }[name]
+    if not required.issubset(args):
+        raise ValueError("task_context_missing:" + ",".join(sorted(required - args.keys())))
+    return [{"tool": name, "args": args}]
 
 
 def fa_max_tool(
@@ -228,6 +281,7 @@ def send(
         autonomy_tier_at_send=autonomy_tier_at_send,
         person_id=person_id,
         auto_authorize=gate.allowed,
+        send_attempt_log_id=log_id,
     )
 
     if item.status == "pending":

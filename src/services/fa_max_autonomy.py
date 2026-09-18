@@ -16,30 +16,12 @@ Tiers (per SOT.md Part 2 / Requirement Two):
 status='sent', agent_name=<this agent>. Approved-but-unsent rows don't count
 (counting them would let an agent game the gate without real outreach).
 
-Edit rate = rows where the approved payload.body differs from the original
-pending payload.body (draft materially changed before approval), divided by
-total approved sends for this agent. Tracked via the 'edited_before_approval'
-flag in the payload, set by the Slack approve handler when it detects the body
-was changed.
+Edit rate reads the durable material_edit flag on human-approved queue rows,
+grouped by approval time. Autonomous sends do not dilute the evidence.
 
-This module reads live counts from the DB — graduation state is never
-hard-coded. The Relay execution path currently requires a durable human
-approval for every FA Max item; autonomous dispatch is not enabled by WP-2.
-
-EXPLICIT SCOPE DECISION (WP-T2-2 review round 5): the split doc's prose
-places "the autonomy tier table... in the registry configuration, not
-scattered across individual agents." The three threshold constants below
-(_TIER_A_MIN_SENDS etc.) live here, in this service module, not inside
-src.agents.fa_max.tool_registry.FA_MAX_TOOL_REGISTRY. This is a deliberate
-choice, not an oversight: the tool registry's entries describe CALLABLE
-TOOLS (name, category, idempotency, whether a call requires the send gate)
-— the tier thresholds describe GRADUATION POLICY, a different concern with
-a different lifecycle (Josh/product may change a threshold without
-touching what tools exist). Putting policy constants inside a tool-registry
-dataclass would conflate the two. This module IS this WP's "central tier
-policy": check_tier_gate() is the one function every send path calls, and
-these constants are the one place the numbers are declared. WP-T2-2 is
-hereby amended to state this explicitly.
+Graduation thresholds live in the FA Max tool registry configuration. Relay
+checks them again inside its authorization transaction; autonomous dispatch
+also requires the explicit constitution-confirmation setting.
 
 All reads use sqlalchemy.text() per CLAUDE.md.
 """
@@ -58,11 +40,13 @@ logger = logging.getLogger(__name__)
 FA_MAX_VENTURE = "fa_max_lending"
 
 # Tier thresholds (SOT.md Part 2)
-_TIER_A_MIN_SENDS = 25
-_TIER_B_MIN_SENDS = 100
-_TIER_B_MAX_EDIT_RATE = 0.10  # 10 %
-_TIER_C_MIN_SENDS = 300
-_TIER_C_MIN_FUNDED_LOANS = 5
+from src.agents.fa_max.tool_registry import FA_MAX_AUTONOMY_POLICY
+
+_TIER_A_MIN_SENDS = FA_MAX_AUTONOMY_POLICY["A"]["approved_sends"]
+_TIER_B_MIN_SENDS = FA_MAX_AUTONOMY_POLICY["B"]["approved_sends"]
+_TIER_B_MAX_EDIT_RATE = FA_MAX_AUTONOMY_POLICY["B"]["max_edit_rate_exclusive"]
+_TIER_C_MIN_SENDS = FA_MAX_AUTONOMY_POLICY["C"]["approved_sends"]
+_TIER_C_MIN_FUNDED_LOANS = FA_MAX_AUTONOMY_POLICY["C"]["funded_loans"]
 
 
 class TierGateOutcome(str, Enum):
@@ -214,7 +198,9 @@ def get_edit_rate(agent_name: str, tier: str, session: Session) -> float:
             "  COUNT(*) FILTER (WHERE material_edit IS TRUE) AS edited, "
             "  COUNT(*) AS total "
             "FROM relay_approval_queue "
-            "WHERE venture_key = :v AND status = 'sent' "
+            "WHERE venture_key = :v AND decided_at IS NOT NULL "
+            "AND decided_by IS NOT NULL AND decided_by NOT LIKE 'system:autonomous:%' "
+            "AND status IN ('approved', 'sent', 'failed', 'uncertain', 'skipped') "
             "AND agent_name = :a AND autonomy_tier_at_send = :tier"
         ),
         {"v": FA_MAX_VENTURE, "a": agent_name, "tier": tier},
@@ -245,9 +231,11 @@ def get_weekly_edit_rate(agent_name: str, tier: str, session: Session) -> float:
             "  COUNT(*) FILTER (WHERE material_edit IS TRUE) AS edited, "
             "  COUNT(*) AS total "
             "FROM relay_approval_queue "
-            "WHERE venture_key = :v AND status = 'sent' "
+            "WHERE venture_key = :v AND decided_at IS NOT NULL "
+            "AND decided_by IS NOT NULL AND decided_by NOT LIKE 'system:autonomous:%' "
+            "AND status IN ('approved', 'sent', 'failed', 'uncertain', 'skipped') "
             "AND agent_name = :a AND autonomy_tier_at_send = :tier "
-            "AND dispatched_at >= :week_start"
+            "AND decided_at >= :week_start"
         ),
         {"v": FA_MAX_VENTURE, "a": agent_name, "tier": tier, "week_start": week_start_utc},
     ).mappings().first()
@@ -279,6 +267,7 @@ def get_funded_loan_count(agent_name: str, tier: str, session: Session) -> int:
                 "JOIN fa_max_interactions i ON i.interaction_id = o.origin_interaction_id "
                 "WHERE o.outcome = 'funded' "
                 "AND o.origin_interaction_id IS NOT NULL "
+                "AND i.direction = 'outbound' "
                 "AND i.agent_name = :a AND i.autonomy_tier_at_time = :tier"
             ),
             {"a": agent_name, "tier": tier},

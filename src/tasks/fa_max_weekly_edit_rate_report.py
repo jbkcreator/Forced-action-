@@ -8,11 +8,11 @@ this one is not superseded by or folded into that one, per the WP-T2-2
 scope table).
 
 Discovers which (agent_name, tier) pairs to report on by querying
-relay_approval_queue directly for any pair with at least one 'sent' row in
+relay_approval_queue directly for any pair with at least one human approval in
 the current week, rather than a hardcoded agent list -- there is no
 canonical fixed roster of FA Max agent names anywhere in this codebase
 (agent_name is a free-text column, see src/services/relay/queue.py's own
-comment). A pair with zero sends this week is not reported (nothing to say).
+comment). A pair with zero human approvals this week is not reported.
 
 Delivery reuses src.services.relay.exceptions_alert_queue.enqueue_and_attempt
 -- the same durable-alert pattern src.tasks.fa_max_send_health_monitor
@@ -45,7 +45,7 @@ _RULE = "fa_max_weekly_edit_rate_report"
 
 
 def _agent_tier_pairs_with_sends_this_week(session) -> list[tuple[str, str]]:
-    """(agent_name, autonomy_tier_at_send) pairs with >=1 'sent' row so far
+    """(agent_name, autonomy_tier_at_send) pairs with >=1 human approval so far
     in the current ISO week (America/New_York), matching get_weekly_edit_
     rate()'s own week-start computation so the roster and the rate it reports
     agree on what "this week" means."""
@@ -63,9 +63,11 @@ def _agent_tier_pairs_with_sends_this_week(session) -> list[tuple[str, str]]:
         text(
             "SELECT DISTINCT agent_name, autonomy_tier_at_send "
             "FROM relay_approval_queue "
-            "WHERE venture_key = :v AND status = 'sent' "
+            "WHERE venture_key = :v AND decided_at IS NOT NULL "
+            "AND decided_by IS NOT NULL AND decided_by NOT LIKE 'system:autonomous:%' "
+            "AND status IN ('approved', 'sent', 'failed', 'uncertain', 'skipped') "
             "AND agent_name IS NOT NULL AND autonomy_tier_at_send IS NOT NULL "
-            "AND dispatched_at >= :week_start "
+            "AND decided_at >= :week_start "
             "ORDER BY agent_name, autonomy_tier_at_send"
         ),
         {"v": FA_MAX_VENTURE, "week_start": week_start_utc},
@@ -79,7 +81,7 @@ def build_report(*, dry_run: bool = False) -> str:
     with get_db_context() as session:
         pairs = _agent_tier_pairs_with_sends_this_week(session)
         if not pairs:
-            return "No FA Max approved sends recorded yet this week."
+            return "No FA Max human approvals recorded yet this week."
 
         lines = ["*FA Max weekly edit-rate report*"]
         for agent_name, tier in pairs:

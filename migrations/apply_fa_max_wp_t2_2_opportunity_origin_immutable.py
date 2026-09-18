@@ -7,10 +7,9 @@ by fa_max_autonomy.get_funded_loan_count() for the Tier C graduation gate.
 create_fa_max_opportunity() (src/services/state_engine.py) is documented as
 the single write path and never exposes an UPDATE for this column -- but a
 future caller could still issue a raw UPDATE directly against the table.
-This migration closes that gap with a BEFORE UPDATE trigger: once
-origin_interaction_id is non-NULL, any UPDATE attempting to change it
-(including setting it back to NULL) is rejected. Setting it from NULL to a
-value is still allowed exactly once, matching "write-once, set at creation."
+This migration closes that gap with a BEFORE UPDATE trigger: any change
+to origin_interaction_id is rejected. It must be set at INSERT time; NULL
+remains unattributed and cannot be filled in later.
 
 Idempotent. Safe to re-run (CREATE OR REPLACE FUNCTION / DROP TRIGGER IF
 EXISTS + CREATE TRIGGER).
@@ -28,8 +27,7 @@ STATEMENTS: list[tuple[str, str]] = [
         CREATE OR REPLACE FUNCTION fa_max_opp_origin_interaction_immutable()
         RETURNS trigger AS $$
         BEGIN
-            IF OLD.origin_interaction_id IS NOT NULL
-               AND NEW.origin_interaction_id IS DISTINCT FROM OLD.origin_interaction_id THEN
+            IF NEW.origin_interaction_id IS DISTINCT FROM OLD.origin_interaction_id THEN
                 RAISE EXCEPTION
                     'fa_max_opportunities.origin_interaction_id is write-once: '
                     'opportunity % already has origin_interaction_id % -- cannot change to %',

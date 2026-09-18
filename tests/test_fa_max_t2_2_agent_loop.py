@@ -29,6 +29,155 @@ from unittest.mock import MagicMock, patch, call
 
 import pytest
 
+
+class TestConsolidatedProductionPaths:
+    def test_send_text_is_redacted_before_tool_audit(self):
+        from src.services.fa_max_tool_log import redact_for_tool_log
+
+        snapshot = redact_for_tool_log({
+            "idempotency_key": "send-1", "recipient": "person@example.com",
+            "payload": {"subject": "Private deal", "body": "Income $100,000"},
+        })
+        assert snapshot["idempotency_key"] == "send-1"
+        assert snapshot["recipient"] == "[redacted]"
+        assert snapshot["payload"]["body"] == "[redacted]"
+
+    def test_task_description_selects_registered_tool(self):
+        from src.agents.fa_max.tool_registry import select_task_tools
+
+        assert select_task_tools("Show borrower history", {"person_id": "p1"}) == [
+            {"tool": "get_fa_max_person_history", "args": {"person_id": "p1"}}
+        ]
+        with pytest.raises(ValueError, match="unsupported_task_description"):
+            select_task_tools("decide what to do", {"person_id": "p1"})
+
+    def test_send_cannot_claim_another_agents_evidence(self):
+        from src.agents.fa_max.agent_graph import _call_tool_with_timeout
+        from src.services.fa_max_send_governance import GovernanceBlocked
+
+        with pytest.raises(GovernanceBlocked, match="send_agent_name_mismatch"):
+            _call_tool_with_timeout("send", {"agent_name": "other"},
+                                    timeout_seconds=1, agent_name="cora")
+
+    def test_autonomous_a_requires_real_context_after_prior_contact(self):
+        from src.services.fa_max_send_governance import autonomous_tier_context_verified
+
+        session = MagicMock()
+        session.execute.return_value.scalar.return_value = None
+        assert autonomous_tier_context_verified(
+            session, person_id="person", tier="A", thread_id="thread",
+        ) is False
+        assert session.execute.call_count == 2
+        assert "i.direction = 'inbound'" in str(session.execute.call_args.args[0])
+
+    def test_autonomous_b_requires_active_partner(self):
+        from src.services.fa_max_send_governance import autonomous_tier_context_verified
+
+        session = MagicMock()
+        session.execute.return_value.scalar.return_value = None
+        assert autonomous_tier_context_verified(
+            session, person_id="person", tier="B", thread_id=None,
+        ) is False
+        assert "status = 'active'" in str(session.execute.call_args.args[0])
+
+    def test_opportunity_origin_comes_from_sent_relay_row(self):
+        from src.services.state_engine import create_opportunity_from_relay_send
+
+        session = MagicMock()
+        session.execute.return_value.mappings.return_value.first.return_value = {
+            "person_id": "person", "origin_id": "interaction",
+        }
+        with patch("src.services.state_engine.create_fa_max_opportunity", return_value="opportunity") as create:
+            assert create_opportunity_from_relay_send(
+                session=session, relay_item_id=12, opportunity_type="rehab",
+            ) == "opportunity"
+        sql = str(session.execute.call_args.args[0])
+        assert "status = 'sent'" in sql and "autonomy_tier_at_send = 'C'" in sql
+        assert create.call_args.kwargs["origin_interaction_id"] == "interaction"
+        assert create.call_args.kwargs["person_id"] == "person"
+
+    def test_opportunity_origin_rejects_unsent_relay_row(self):
+        from src.services.state_engine import create_opportunity_from_relay_send
+
+        session = MagicMock()
+        session.execute.return_value.mappings.return_value.first.return_value = None
+        with pytest.raises(ValueError, match="relay_send_not_attributable"):
+            create_opportunity_from_relay_send(
+                session=session, relay_item_id=12, opportunity_type="rehab",
+            )
+
+    def test_funded_outcome_requires_successful_state_transition(self):
+        from src.services.state_engine import mark_opportunity_funded, TransitionOutcome, TransitionResult
+
+        session = MagicMock()
+        current = {"current_stage": "closing", "state_version": 4}
+        with patch("src.services.state_engine.get_opportunity_state", return_value=current), \
+             patch("src.services.state_engine.transition", return_value=TransitionResult(
+                 outcome=TransitionOutcome.invalid_transition, current_state="closing",
+             )):
+            result = mark_opportunity_funded(
+                session=session, opportunity_id="opportunity", actor="admin:test",
+                idempotency_key="funded:opportunity",
+            )
+        assert result.outcome == TransitionOutcome.invalid_transition
+        session.execute.assert_not_called()
+
+    def test_funded_transition_sets_outcome_for_causal_gate(self):
+        from src.services.state_engine import mark_opportunity_funded, TransitionOutcome, TransitionResult
+
+        session = MagicMock()
+        current = {"current_stage": "closing", "state_version": 4}
+        with patch("src.services.state_engine.get_opportunity_state", return_value=current), \
+             patch("src.services.state_engine.transition", return_value=TransitionResult(
+                 outcome=TransitionOutcome.succeeded, current_state="funded",
+             )):
+            result = mark_opportunity_funded(
+                session=session, opportunity_id="opportunity", actor="admin:test",
+                idempotency_key="funded:opportunity",
+            )
+        assert result.outcome == TransitionOutcome.succeeded
+        assert "outcome = 'funded'" in str(session.execute.call_args.args[0])
+
+    def test_expired_claim_reconciles_against_relay_queue(self):
+        from datetime import datetime, timezone
+        from src.services.fa_max_tool_log import reconcile_expired_send_attempts
+
+        session = MagicMock()
+        calls = session.execute.return_value
+        calls.mappings.return_value.all.return_value = [{
+            "id": 7, "input": {"idempotency_key": "send-7"},
+            "created_at": datetime.now(timezone.utc),
+        }]
+        calls.mappings.return_value.first.return_value = {"id": 42, "status": "pending"}
+        with patch("src.services.fa_max_tool_log.finish_tool_call") as finish:
+            assert reconcile_expired_send_attempts(session=session, timeout_seconds=30) == 1
+        assert "FOR UPDATE SKIP LOCKED" in str(session.execute.call_args_list[0].args[0])
+        assert finish.call_args.kwargs["status"] == "success"
+        assert finish.call_args.kwargs["output"]["item_id"] == 42
+
+    def test_expired_send_cannot_enter_relay_queue(self):
+        from src.services.fa_max_send_governance import GovernanceBlocked
+        from src.services.relay.queue import enqueue
+
+        session = MagicMock()
+        session.execute.return_value.scalar.return_value = None
+        with patch("src.services.relay.queue.get_db_context") as db, \
+             patch("config.agents.get_agents_settings") as settings:
+            db.return_value.__enter__ = MagicMock(return_value=session)
+            db.return_value.__exit__ = MagicMock(return_value=False)
+            settings.return_value.fa_max_agent_tool_timeout_seconds = 30
+            with pytest.raises(GovernanceBlocked, match="send_attempt_expired"):
+                enqueue(
+                    idempotency_key="send-1", channel="email", recipient="x@example.com",
+                    payload={"subject": "Hi", "body": "Hello"},
+                    venture_key="fa_max_lending", skip_contract_validation=True,
+                    send_attempt_log_id=7,
+                )
+        assert session.add.call_count == 0
+        params = session.execute.call_args.args[1]
+        assert params["idempotency_key"] == "send-1"
+        assert "input->>'idempotency_key' = :idempotency_key" in str(session.execute.call_args.args[0])
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Tool registry — unit
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1128,6 +1277,20 @@ class TestEditRateReadsMaterialEditColumn:
         rate = get_edit_rate("cora", "B", session)
         assert rate == pytest.approx(0.20)
 
+    def test_edit_rates_use_human_approval_evidence(self):
+        from src.services.fa_max_autonomy import get_edit_rate, get_weekly_edit_rate
+
+        session = self._session_returning(edited=1, total=2)
+        assert get_edit_rate("cora", "B", session) == 0.5
+        lifetime_sql = str(session.execute.call_args.args[0])
+        assert "decided_at IS NOT NULL" in lifetime_sql
+        assert "decided_by NOT LIKE 'system:autonomous:%'" in lifetime_sql
+        assert "status IN ('approved', 'sent'" in lifetime_sql
+        assert get_weekly_edit_rate("cora", "B", session) == 0.5
+        weekly_sql = str(session.execute.call_args.args[0])
+        assert "decided_at >= :week_start" in weekly_sql
+        assert "dispatched_at" not in weekly_sql
+
     def test_mark_sent_uses_material_edit_not_payload_flag(self):
         """mark_sent's write_interaction(approved_bool=...) must be derived
         from the material_edit column, not the never-written payload
@@ -1374,38 +1537,12 @@ class TestSendAttemptExpiry:
 # 18. Review-fix: claimed autonomy tier must be trusted, not assumed
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestValidateTierClaim:
-    def test_tier_c_never_blocked(self):
-        from src.services.fa_max_send_governance import validate_tier_claim
-        session = MagicMock()
-        validate_tier_claim(session, person_id="p1", tier="C")
-        session.execute.assert_not_called()
-
-    def test_tier_a_blocked_with_no_prior_contact(self):
-        from src.services.fa_max_send_governance import GovernanceBlocked, validate_tier_claim
-        session = MagicMock()
-        session.execute.return_value.scalar.return_value = 0
-        with pytest.raises(GovernanceBlocked, match="tier_claim_untrusted"):
-            validate_tier_claim(session, person_id="p1", tier="A")
-
-    def test_tier_b_blocked_with_no_prior_contact(self):
-        from src.services.fa_max_send_governance import GovernanceBlocked, validate_tier_claim
-        session = MagicMock()
-        session.execute.return_value.scalar.return_value = 0
-        with pytest.raises(GovernanceBlocked, match="tier_claim_untrusted"):
-            validate_tier_claim(session, person_id="p1", tier="B")
-
-    def test_tier_a_allowed_with_prior_contact(self):
-        from src.services.fa_max_send_governance import validate_tier_claim
-        session = MagicMock()
-        session.execute.return_value.scalar.return_value = 3
-        validate_tier_claim(session, person_id="p1", tier="A")  # must not raise
-
-    def test_enqueue_calls_validate_tier_claim(self):
+class TestAutonomousTierContext:
+    def test_enqueue_checks_context_before_autonomous_approval(self):
         import inspect
         from src.services.relay import queue
         source = inspect.getsource(queue.enqueue)
-        assert "validate_tier_claim" in source
+        assert "autonomous_tier_context_verified" in source
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1466,6 +1603,34 @@ class TestRefreshCardAfterRevision:
         from src.api import admin_router
         source = inspect.getsource(admin_router._handle_relay_revise_submission)
         assert "refresh_card_after_revision" in source
+
+    def test_revised_typed_approval_requires_versioned_button(self):
+        from src.api import admin_router
+
+        item = MagicMock(venture_key="fa_max_lending", revision_count=2)
+        with patch("src.services.relay.queue.get_item_by_slack_message_ts", return_value=item), \
+             patch.object(admin_router, "_relay_approver_authorized", return_value=True), \
+             patch.object(admin_router, "_post_relay_thread_note") as note, \
+             patch.object(admin_router, "_handle_relay_decision") as decide:
+            admin_router._handle_relay_thread_action({"event": {
+                "type": "message", "text": "approve", "thread_ts": "123", "user": "U1",
+            }})
+        note.assert_called_once()
+        decide.assert_not_called()
+
+    def test_fa_max_approval_card_without_revision_token_is_refused(self):
+        from src.api import admin_router
+
+        item = MagicMock(id=9, venture_key="fa_max_lending", revision_count=0)
+        with patch("src.services.relay.queue.get_item", return_value=item), \
+             patch.object(admin_router, "_relay_approver_authorized", return_value=True), \
+             patch("src.services.relay.queue.record_decision") as decide:
+            result = admin_router._handle_relay_decision({
+                "user": {"id": "U1"},
+                "actions": [{"value": json.dumps({"item_id": 9, "action": "approve"})}],
+            })
+        decide.assert_not_called()
+        assert "revision token" in str(result)
 
     def test_build_approval_blocks_bakes_current_revision_count(self):
         from src.services.relay.slack_post import _build_approval_blocks
@@ -1650,7 +1815,7 @@ class TestToolCallTimeout:
                 with patch("src.agents.fa_max.agent_graph.finish_tool_call", side_effect=fake_finish_tool_call):
                     with pytest.raises(ToolCallTimeout):
                         _call_tool_with_timeout(
-                            "send", {}, timeout_seconds=0.02,
+                            "send", {"agent_name": "cora"}, timeout_seconds=0.02,
                             log_id=55, agent_name="cora", work_item_id="wid-late",
                         )
                     # The orphaned thread is still running (0.2s sleep); give it
@@ -1883,7 +2048,7 @@ class TestOpportunityOriginImmutableMigration:
 
     def test_trigger_rejects_change_of_non_null_value(self):
         src = self._get_sql()
-        assert "OLD.origin_interaction_id IS NOT NULL" in src
+        assert "NEW.origin_interaction_id IS DISTINCT FROM OLD.origin_interaction_id" in src
         assert "RAISE EXCEPTION" in src
 
     def test_trigger_attached_before_update(self):
@@ -1912,7 +2077,7 @@ class TestWeeklyEditRateReport:
                 return_value=[],
             ):
                 report = build_report()
-        assert "No FA Max approved sends" in report
+        assert "No FA Max human approvals" in report
 
     def test_build_report_includes_each_pair(self):
         from src.tasks.fa_max_weekly_edit_rate_report import build_report

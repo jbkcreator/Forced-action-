@@ -959,20 +959,16 @@ def create_fa_max_opportunity(
     provides no update path for the column at all (nor does any other
     function in this module), and the accompanying migration
     (apply_fa_max_wp_t2_2_opportunity_origin_immutable.py) adds a database
-    trigger that rejects any UPDATE changing an already-non-NULL
-    origin_interaction_id, so the write-once rule holds even against a
+    trigger that rejects any UPDATE changing origin_interaction_id, so the
+    write-once rule holds even against a
     future caller that bypasses this function. NULL is valid (an
     opportunity with no attributable originating interaction — e.g. a
     borrower who called in cold) and correctly counts as zero funded-loan
     evidence for every agent/tier.
 
-    What actually triggers FA Max opportunity creation in production — which
-    event, which graph node calls this — is NOT part of WP-T2-2's scope and
-    is not decided here; no such caller exists in this codebase yet (see
-    WP-T2-2's own PR notes). This function exists so that whichever
-    downstream work package builds that trigger logic has the single,
-    correct write path to call, consistent with this module's "single write
-    path" invariant, rather than each future caller inventing its own INSERT.
+    The admin endpoint for an opportunity caused by a completed Tier C send
+    calls create_opportunity_from_relay_send(), which validates the Relay
+    interaction and then uses this single insert path.
     """
     row = session.execute(
         text("""
@@ -1010,6 +1006,58 @@ def create_fa_max_opportunity(
             )
         return existing.opportunity_id  # type: ignore[union-attr]
     return row.opportunity_id  # type: ignore[union-attr]
+
+
+def create_opportunity_from_relay_send(
+    *, session: Session, relay_item_id: int, opportunity_type: str,
+) -> str:
+    """Create an opportunity causally attributed to one completed send.
+
+    The caller supplies a Relay row, never a person or arbitrary interaction
+    id. The sent row supplies both fields, preventing a person-based join or
+    attribution to a draft that was never dispatched.
+    """
+    row = session.execute(text(
+        "SELECT person_id::text AS person_id, send_interaction_id::text AS origin_id "
+        "FROM relay_approval_queue WHERE id = :id AND venture_key = 'fa_max_lending' "
+        "AND status = 'sent' AND autonomy_tier_at_send = 'C' "
+        "AND send_interaction_id IS NOT NULL"
+    ), {"id": relay_item_id}).mappings().first()
+    if row is None:
+        raise ValueError("relay_send_not_attributable")
+    return create_fa_max_opportunity(
+        session=session, person_id=row["person_id"],
+        opportunity_type=opportunity_type, source="relay_outbound",
+        source_reference=str(relay_item_id),
+        idempotency_key=f"relay_outbound:{relay_item_id}:{opportunity_type}",
+        origin_interaction_id=row["origin_id"],
+    )
+
+
+def mark_opportunity_funded(
+    *, session: Session, opportunity_id: str, actor: str, idempotency_key: str,
+) -> TransitionResult:
+    """Record funding through the state engine and update the causal count.
+
+    Only the normal closing -> funded transition is accepted. The outcome
+    and funded timestamp share the transaction with its immutable event.
+    """
+    current = get_opportunity_state(session=session, opportunity_id=opportunity_id)
+    if not current:
+        return TransitionResult(outcome=TransitionOutcome.invalid_transition, current_state=None)
+    result = transition(
+        session=session, entity_type="opportunity", entity_uuid=opportunity_id,
+        from_state=current["current_stage"], to_state="funded", actor=actor,
+        source_component="src.services.state_engine.mark_opportunity_funded",
+        idempotency_key=idempotency_key, state_version=current["state_version"],
+    )
+    if result.outcome == TransitionOutcome.succeeded:
+        session.execute(text(
+            "UPDATE fa_max_opportunities SET outcome = 'funded', "
+            "actual_funded_at = now(), updated_at = now() "
+            "WHERE opportunity_id = CAST(:id AS uuid) AND current_stage = 'funded'"
+        ), {"id": opportunity_id})
+    return result
 
 
 # ---------------------------------------------------------------------------

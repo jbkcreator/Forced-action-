@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import re
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from sqlalchemy import text
@@ -43,7 +44,8 @@ _REDACTED = "[redacted]"
 _SENSITIVE_KEY = re.compile(
     r"(^|_)(ssn|social_security|credit_score|fico|income|bank_statement|"
     r"tax_return|dti|debt_to_income|rate|interest_rate|term|commitment|"
-    r"phone|email|address|dob|date_of_birth|password|token|secret|api_key)(_|$)",
+    r"phone|email|address|dob|date_of_birth|password|token|secret|api_key|"
+    r"body|subject|content|text|recipient)(_|$)",
     re.IGNORECASE,
 )
 
@@ -256,6 +258,36 @@ def claim_send_attempt(*, log_id: int) -> bool:
         return False
 
 
+def reconcile_expired_send_attempts(*, session: Session, timeout_seconds: float) -> int:
+    """Resolve stale claimed sends after a worker crash or lost callback.
+
+    The enqueue transaction locks the same log row and checks its deadline.
+    Once that transaction commits, a queue row proves the handoff happened;
+    without one, an expired attempt can no longer enqueue. SKIP LOCKED keeps
+    the sweep from waiting for an in-flight enqueue transaction.
+    """
+    rows = session.execute(text(
+        "SELECT id, input, created_at FROM fa_max_tool_call_log "
+        "WHERE tool_name = 'send' AND status = 'claimed' "
+        "AND created_at + (:timeout_seconds * interval '1 second') < clock_timestamp() "
+        "ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED"
+    ), {"timeout_seconds": timeout_seconds}).mappings().all()
+    for row in rows:
+        key = (row["input"] or {}).get("idempotency_key")
+        relay = session.execute(text(
+            "SELECT id, status FROM relay_approval_queue WHERE idempotency_key = :key"
+        ), {"key": key}).mappings().first() if key else None
+        outcome = ({"item_id": relay["id"], "relay_status": relay["status"],
+                    "recovered_after_restart": True} if relay else
+                   {"error": "expired_before_relay_enqueue", "recovered_after_restart": True})
+        finish_tool_call(
+            session=session, log_id=row["id"], output=outcome,
+            duration_ms=max(0, int((datetime.now(timezone.utc) - row["created_at"]).total_seconds() * 1000)),
+            status="success" if relay else "error", require_status="claimed",
+        )
+    return len(rows)
+
+
 def finish_tool_call(
     *,
     session: Session,
@@ -274,10 +306,8 @@ def finish_tool_call(
     a timed-out call's underlying thread so that whenever it actually
     finishes — even long after the agent loop gave up waiting and moved on
     — this is called again for the same log_id with the real outcome.
-    Calling this more than once for the same log_id is safe; the row
-    reflects whatever finish_tool_call() call landed last (that later call
-    is always unconditional -- require_status is never passed there, since
-    the reconciliation callback IS the authoritative final outcome).
+    Calling this more than once for the same log_id is safe. A restart sweep
+    also resolves expired claimed sends against Relay's durable queue row.
 
     require_status (WP-T2-2 review round 5 fix): when given, makes this a
     CONDITIONAL update -- the WHERE clause also requires the row's CURRENT

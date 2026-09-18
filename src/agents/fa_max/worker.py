@@ -94,7 +94,14 @@ class FaMaxWorker:
         steps = payload.get("steps") or []
 
         try:
+            if payload.get("task_description"):
+                from src.agents.fa_max.tool_registry import select_task_tools
+                steps = select_task_tools(payload["task_description"], payload.get("context") or {})
             result = run_fa_max_agent(work_item_id=work_item_id, agent_name=agent_name, steps=steps)
+        except ValueError as exc:
+            logger.warning("fa_max.worker: invalid task work_item_id=%s: %s", work_item_id, exc)
+            self._complete(work_item_id, "failed")
+            return
         except Exception:
             logger.exception(
                 "fa_max.worker: run_fa_max_agent raised for work_item_id=%s agent_name=%s — "
@@ -111,8 +118,15 @@ class FaMaxWorker:
         )
 
     def _sweep_expired(self) -> None:
+        from config.agents import get_agents_settings
+        from src.services.fa_max_tool_log import reconcile_expired_send_attempts
+
         with get_db_context() as session:
             reclaim_expired_work_items(session=session, queue_name=FA_MAX_QUEUE_NAME)
+            reconcile_expired_send_attempts(
+                session=session,
+                timeout_seconds=get_agents_settings().fa_max_agent_tool_timeout_seconds,
+            )
 
     def run_forever(self, idle_poll_seconds: int = IDLE_POLL_SECONDS) -> None:
         logger.info("fa_max.worker: starting (worker=%s)", self.worker_id)

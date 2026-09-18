@@ -1714,17 +1714,10 @@ def _handle_relay_thread_action(payload: dict) -> None:
     """Turn an authorized exact command in a Relay card thread into a
     regular durable Relay decision.
 
-    No revision_count_at_post guard applies here (WP-T2-2 review fix note):
-    unlike a button click, a typed thread reply carries no client-side
-    snapshot of what content the approver saw -- there is nothing to
-    compare against structurally. This is safe ONLY because the card
-    itself is now kept in sync with the latest revision (see
-    src.services.relay.slack_post.refresh_card_after_revision, called from
-    the Revise submission handler) -- a typed "approve" always acts on
-    whatever the thread's card currently shows. record_decision()'s own
-    'WHERE status = pending' guard still applies (a decided or reclaimed
-    row cannot be re-decided), which is the one true structural race guard
-    a text-only reply can get.
+    A typed reply has no revision snapshot. After any revision, typed
+    approval is refused; the approver must use the refreshed button, whose
+    revision count is checked atomically with the decision. This remains
+    safe if Slack failed to refresh the card.
     """
     event = payload.get("event") or {}
     if event.get("type") != "message" or event.get("subtype") or event.get("bot_id"):
@@ -1740,11 +1733,17 @@ def _handle_relay_thread_action(payload: dict) -> None:
     item = relay_queue.get_item_by_slack_message_ts(str(thread_ts))
     if item is None or not _relay_approver_authorized(str(user_id), item.venture_key):
         return
+    # A typed reply carries no revision token. For a revised FA Max draft,
+    # require the refreshed button's atomic revision check instead.
+    if command == "approve" and item.venture_key == "fa_max_lending" and item.revision_count:
+        _post_relay_thread_note(item, "Review the revised card and use its Approve button.")
+        return
     # Reuse the normal decision path, including its pending-row CAS, state
     # transition transaction, interaction audit, and Slack-card update.
     _handle_relay_decision({
         "user": {"id": str(user_id)},
-        "actions": [{"value": json.dumps({"item_id": item.id, "action": command})}],
+        "actions": [{"value": json.dumps({"item_id": item.id, "action": command,
+                                           "revision_count_at_post": item.revision_count})}],
     })
 
 
@@ -1988,6 +1987,8 @@ def _handle_relay_decision(payload: dict) -> dict:
     posted_revision_count = None
     if action == "approve":
         posted_revision_count = action_data.get("revision_count_at_post")
+        if existing.venture_key == _FA_MAX_VENTURE and posted_revision_count is None:
+            return _slack_ephemeral("Approval card is missing a revision token; open the current card.")
         if posted_revision_count is not None and existing.revision_count != posted_revision_count:
             return _slack_ephemeral(
                 f"Item #{item_id} was revised (now revision #{existing.revision_count}) after this "
@@ -2340,7 +2341,10 @@ def _handle_relay_revise_submission(payload: dict) -> dict:
     # matches the row this revision just produced.
     from src.services.relay.slack_post import refresh_card_after_revision
 
-    refresh_card_after_revision(item)
+    if not refresh_card_after_revision(item):
+        return {"response_action": "errors", "errors": {
+            "revised_content_block": "Revision saved, but Slack could not refresh the approval card. Reopen Revise and submit again before approval."
+        }}
     return {"response_action": "clear"}
 
 
@@ -2362,10 +2366,92 @@ def _handle_relay_revise_submission(payload: dict) -> dict:
 class FaMaxAgentTaskRequest(BaseModel):
     person_id: str
     agent_name: str
-    steps: List[Dict[str, Any]] = Field(
-        ..., description="Ordered [{tool: <FA_MAX_TOOL_REGISTRY name>, args: {...}}, ...] plan.",
-    )
+    steps: List[Dict[str, Any]] = Field(default_factory=list)
+    task_description: Optional[str] = None
+    context: Dict[str, Any] = Field(default_factory=dict)
     idempotency_key: Optional[str] = None
+
+
+class FaMaxOpportunityFromSendRequest(BaseModel):
+    relay_item_id: int
+    opportunity_type: str
+
+
+class FaMaxOpportunityAdvanceRequest(BaseModel):
+    to_state: str = Field(min_length=1)
+    expected_version: int = Field(ge=0)
+    idempotency_key: str = Field(min_length=1)
+
+
+@router.post("/fa-max/opportunities/from-send")
+def create_fa_max_opportunity_from_send(
+    body: FaMaxOpportunityFromSendRequest,
+    _admin: dict = Depends(get_current_admin),
+):
+    """Record an opportunity from the specific sent Tier C interaction."""
+    from src.services.state_engine import create_opportunity_from_relay_send
+
+    if body.relay_item_id <= 0 or body.opportunity_type not in {
+        "acquisition", "rehab", "construction", "extension", "refinance",
+        "dscr_takeout", "repeat",
+    }:
+        raise HTTPException(status_code=400, detail="Invalid Relay item or opportunity type")
+    with get_db_context() as session:
+        try:
+            opportunity_id = create_opportunity_from_relay_send(
+                session=session, relay_item_id=body.relay_item_id,
+                opportunity_type=body.opportunity_type,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"opportunity_id": opportunity_id}
+
+
+@router.post("/fa-max/opportunities/{opportunity_id}/advance")
+def advance_fa_max_opportunity(
+    opportunity_id: str, body: FaMaxOpportunityAdvanceRequest,
+    _admin: dict = Depends(get_current_admin),
+):
+    """Advance one opportunity through configured stages with CAS and audit."""
+    from src.services.state_engine import (
+        get_opportunity_state, transition, TransitionOutcome,
+    )
+
+    if body.to_state == "funded":
+        raise HTTPException(status_code=400, detail="Use the funded endpoint")
+    with get_db_context() as session:
+        current = get_opportunity_state(session=session, opportunity_id=opportunity_id)
+        if not current:
+            raise HTTPException(status_code=404, detail="Opportunity not found")
+        if current["state_version"] != body.expected_version:
+            raise HTTPException(status_code=409, detail="Opportunity version changed")
+        result = transition(
+            session=session, entity_type="opportunity", entity_uuid=opportunity_id,
+            from_state=current["current_stage"], to_state=body.to_state,
+            actor="admin:fa_max_opportunity", source_component="src.api.admin_router",
+            idempotency_key=body.idempotency_key, state_version=body.expected_version,
+        )
+        if result.outcome not in (TransitionOutcome.succeeded, TransitionOutcome.idempotent_skip):
+            raise HTTPException(status_code=409, detail=f"Transition refused: {result.outcome.value}")
+    return {"opportunity_id": opportunity_id, "stage": result.current_state}
+
+
+@router.post("/fa-max/opportunities/{opportunity_id}/funded")
+def mark_fa_max_opportunity_funded(
+    opportunity_id: str,
+    _admin: dict = Depends(get_current_admin),
+):
+    """Record a verified closing -> funded event in the FA Max ledger."""
+    from src.services.state_engine import mark_opportunity_funded, TransitionOutcome
+
+    with get_db_context() as session:
+        result = mark_opportunity_funded(
+            session=session, opportunity_id=opportunity_id,
+            actor="admin:fa_max_funding", idempotency_key=f"funded:{opportunity_id}",
+        )
+        if result.outcome not in (TransitionOutcome.succeeded, TransitionOutcome.idempotent_skip):
+            raise HTTPException(status_code=409, detail=f"Funding transition refused: {result.outcome.value}")
+    return {"opportunity_id": opportunity_id, "outcome": "funded"}
 
 
 @router.post("/fa-max/agent-tasks")
@@ -2380,12 +2466,19 @@ def create_fa_max_agent_task(
     not surface as an 'unknown_tool' error deep in the worker's audit log
     after the item was already claimed.
     """
-    from src.agents.fa_max.tool_registry import FA_MAX_TOOL_REGISTRY
+    from src.agents.fa_max.tool_registry import FA_MAX_TOOL_REGISTRY, select_task_tools
     from src.agents.fa_max.worker import FA_MAX_QUEUE_NAME
     from src.services.state_engine import enqueue_work_item
 
-    if not body.steps:
-        raise HTTPException(status_code=400, detail="steps must not be empty")
+    if bool(body.steps) == bool(body.task_description):
+        raise HTTPException(status_code=400, detail="Provide either steps or task_description")
+    if body.task_description:
+        try:
+            selected = select_task_tools(body.task_description, body.context)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if selected[0]["tool"] == "send" and body.context.get("agent_name") != body.agent_name:
+            raise HTTPException(status_code=400, detail="send agent_name must match task agent_name")
     unknown_tools = sorted({
         step.get("tool") for step in body.steps if step.get("tool") not in FA_MAX_TOOL_REGISTRY
     })
@@ -2396,7 +2489,8 @@ def create_fa_max_agent_task(
         work_item_id = enqueue_work_item(
             session=session,
             queue_name=FA_MAX_QUEUE_NAME,
-            payload={"agent_name": body.agent_name, "steps": body.steps},
+            payload={"agent_name": body.agent_name, "steps": body.steps,
+                     "task_description": body.task_description, "context": body.context},
             idempotency_key=body.idempotency_key,
             person_id=body.person_id,
         )
