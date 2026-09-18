@@ -409,8 +409,15 @@ def record_decision(
 
     if session is not None:
         return apply(session)
-    with get_db_context() as owned_session:
-        return apply(owned_session)
+    try:
+        with get_db_context() as owned_session:
+            return apply(owned_session)
+    except Exception:
+        import logging as _log
+        _log.getLogger(__name__).exception(
+            "[record_decision] transaction rolled back for item_id=%s", item_id
+        )
+        raise
 
 
 def approved_batch(limit: int = 50, *, venture_key: Optional[str] = None) -> list[QueueItem]:
