@@ -8,7 +8,11 @@ from src.loaders.permits import BuildingPermitLoader
 
 
 def test_existing_permit_status_is_refreshed_when_source_closes_it():
-    existing = SimpleNamespace(id=12, description="roof", status="Issued")
+    existing = SimpleNamespace(
+        id=12, description="roof", status="Issued",
+        holder_name=None, contractor_name=None,
+        job_value=None, completion_status=None,
+    )
     session = Mock()
     session.execute.return_value.fetchone.return_value = existing
     loader = SimpleNamespace(session=session)
@@ -22,7 +26,7 @@ def test_existing_permit_status_is_refreshed_when_source_closes_it():
 
     assert (matched, unmatched, skipped) == (0, 0, 1)
     update_sql = str(session.execute.call_args_list[1].args[0])
-    assert "status = CASE WHEN :status IS NOT NULL" in update_sql
+    assert "CASE WHEN :status IS NOT NULL" in update_sql
     assert session.execute.call_args_list[1].args[1]["status"] == "Complete"
 
 
@@ -37,6 +41,7 @@ def test_new_completed_permit_is_persisted_for_ledger_closure():
         find_property_by_address=Mock(return_value=(prop, 100)),
         parse_date=Mock(return_value=date(2026, 9, 16)),
         safe_add=Mock(return_value=True),
+        _promote_from_staging=Mock(),
     )
     frame = pd.DataFrame([{
         "Record Number": "P-closed",

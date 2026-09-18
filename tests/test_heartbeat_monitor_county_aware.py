@@ -21,6 +21,14 @@ def test_label_and_alert_county_for_county_beat():
     assert "violations/pinellas" in b.alert_subject()
 
 
+def test_pasco_monitored_now_scraper_active():
+    # WP-T2-8 Stage F: Pasco's permit scraper is active on cron with an approved
+    # playwright_code (county_sources is_active=TRUE), so its feed IS now
+    # SLA-monitored — a stale/failed Pasco pull pages ops like any permit county.
+    assert "pasco" in hm.MULTI_COUNTY_SOURCES["permits"]
+    assert {"hillsborough", "pinellas"} <= hm.MULTI_COUNTY_SOURCES["permits"]
+
+
 def test_label_and_alert_county_for_source_wide_beat():
     b = Heartbeat("sunbiz", 1500, None, None, True)  # county_id defaults None
     assert b.label() == "sunbiz"

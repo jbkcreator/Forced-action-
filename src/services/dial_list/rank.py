@@ -52,6 +52,11 @@ def _expected_loan(c: DialCandidate, config: DialListConfig) -> Tuple[Decimal, L
 
 
 def _raw_expected_loan(c: DialCandidate, config: DialListConfig) -> Tuple[Decimal, LoanConfidence]:
+    # Builder candidates carry an explicit 85% LTC construction loan basis
+    # (Stage D). It takes precedence over the generic assessed-value fallback —
+    # a builder's loan is sized on the build, not the parcel's assessed value.
+    if c.expected_loan_override is not None and c.expected_loan_override > _ZERO:
+        return c.expected_loan_override, (c.expected_loan_override_confidence or "low")
     if c.arv is not None and c.arv > _ZERO and c.max_ltc is not None and c.max_ltc > _ZERO:
         return c.max_ltc * c.arv, "high"
     if c.assessed_value_mkt is not None and c.assessed_value_mkt > _ZERO:

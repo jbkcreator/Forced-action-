@@ -65,6 +65,11 @@ COLUMN_ALIASES: dict[str, list[str]] = {
     "Status": ["Status", "Application Status", "Permit Status"],
     "Short Notes": ["Short Notes", "Notes", "Short Note"],
     "Address": ["Address", "Location", "Parcel Address", "Property Address"],
+    # Builder enrichment — WP-T2-8 Stage A
+    "Contractor Name": ["Contractor Name", "Contractor", "Licensed Contractor", "Contractor Firm"],
+    "Holder Name": ["Holder Name", "Permit Holder", "Applicant Name", "Applicant", "Owner Name", "Owner"],
+    "Job Value": ["Job Value", "Valuation", "Declared Value", "Construction Value", "Project Value", "Estimated Value"],
+    "Expiration Date": ["Expiration Date", "Expire Date", "Expiry Date", "Expiry"],
 }
 
 

@@ -42,7 +42,12 @@ class DialCandidate(BaseModel):
     triggers: List[TriggerType] = Field(min_length=1)
     intent_tier: Optional[IntentTier] = None  # None = detector-only candidate
 
-    # expected-loan bases (first available wins: max_ltc×arv → assessed → last sale)
+    # expected-loan bases (first available wins: override → max_ltc×arv →
+    # assessed → last sale). The override carries Stage D's 85% LTC construction
+    # sizing for builder candidates, whose loan basis is the build cost, not the
+    # parcel's assessed value.
+    expected_loan_override: Optional[Decimal] = Field(default=None, ge=0)
+    expected_loan_override_confidence: Optional[LoanConfidence] = None
     arv: Optional[Decimal] = Field(default=None, ge=0)
     max_ltc: Optional[Decimal] = Field(default=None, ge=0)
     assessed_value_mkt: Optional[Decimal] = Field(default=None, ge=0)

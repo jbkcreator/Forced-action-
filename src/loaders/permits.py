@@ -10,8 +10,30 @@ from typing import Optional, Tuple
 import pandas as pd
 from sqlalchemy import text
 
+_COMPLETION_STATUS_MAP: dict[str, str] = {
+    "issued": "issued",
+    "active": "active",
+    "open": "active",
+    "in review": "active",
+    "under review": "active",
+    "approved": "issued",
+    "expired": "expired",
+    "revoked": "expired",
+    "cancelled": "expired",
+    "cancel": "expired",
+    "completed": "completed",
+    "complete": "completed",
+    "finaled": "completed",
+    "final": "completed",
+    "closed": "completed",
+    "co issued": "completed",
+    "pending": "pending",
+    "received": "pending",
+    "submitted": "pending",
+}
+
 from src.loaders.base import BaseLoader
-from src.core.models import BuildingPermit, CountySource
+from src.core.models import BuildingPermit, CountySource, PermitStaging
 
 # Hillsborough County permit_type substrings that indicate an enforcement permit
 _ENFORCEMENT_TYPE_KEYWORDS = frozenset({
@@ -38,6 +60,33 @@ def _is_enforcement(permit_type: str | None, status: str | None, expire_date) ->
     return False
 
 logger = logging.getLogger(__name__)
+
+
+def _clean_str(value) -> str | None:
+    """Scraped-cell → clean str or None. Guards pandas NaN (read_csv(dtype=str)
+    yields float NaN for blank cells; str(NaN) == 'nan', which would otherwise
+    become a fake holder/contractor identity)."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    s = str(value).strip()
+    return s or None
+
+
+def _normalize_completion_status(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    return _COMPLETION_STATUS_MAP.get(raw.lower().strip())
+
+
+def _parse_job_value(raw) -> float | None:
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return None
+    try:
+        cleaned = str(raw).replace("$", "").replace(",", "").strip()
+        val = float(cleaned)
+        return val if val > 0 else None
+    except (ValueError, TypeError):
+        return None
 
 
 class BuildingPermitLoader(BaseLoader):
@@ -98,27 +147,56 @@ class BuildingPermitLoader(BaseLoader):
         
         for _, row in df.iterrows():
             record_number = str(row['Record Number']).strip()
-            description_val = str(row.get('Description') or '').strip() or None
+            description_val = _clean_str(row.get('Description'))
+            incoming_holder = _clean_str(row.get('Holder Name'))
+            incoming_contractor = _clean_str(row.get('Contractor Name'))
+            incoming_job_value = _parse_job_value(row.get('Job Value'))
 
-            # Check for duplicates; update description if previously NULL
+            # Check for duplicates; backfill description + enrichment when NULL
             if skip_duplicates:
                 existing_row = self.session.execute(
-                    text("SELECT id, description, status FROM building_permits WHERE permit_number = :pnum LIMIT 1"),
+                    text("""
+                        SELECT id, description, status, holder_name, contractor_name,
+                               job_value, completion_status
+                        FROM building_permits WHERE permit_number = :pnum LIMIT 1
+                    """),
                     {"pnum": record_number},
                 ).fetchone()
                 if existing_row:
-                    incoming_status = str(row.get('Status') or '').strip() or None
+                    incoming_status = _clean_str(row.get('Status'))
+                    incoming_completion = _normalize_completion_status(incoming_status)
                     description_changed = existing_row.description is None and description_val
-                    status_changed = incoming_status and incoming_status != existing_row.status
-                    if description_changed or status_changed:
+                    status_changed = bool(incoming_status and incoming_status != existing_row.status)
+                    # Backfill fires whenever incoming source data can fill a currently-NULL
+                    # enrichment column — not only on description/status change (a later scrape
+                    # can add holder/contractor/job_value with status unchanged).
+                    enrichment_backfillable = (
+                        (incoming_holder and existing_row.holder_name is None)
+                        or (incoming_contractor and existing_row.contractor_name is None)
+                        or (incoming_job_value is not None and existing_row.job_value is None)
+                        or (incoming_completion and existing_row.completion_status is None)
+                    )
+                    if description_changed or status_changed or enrichment_backfillable:
                         self.session.execute(
                             text("""
                                 UPDATE building_permits
-                                SET description = COALESCE(description, :desc),
-                                    status = CASE WHEN :status IS NOT NULL THEN :status ELSE status END
+                                SET description       = COALESCE(description, :desc),
+                                    status            = CASE WHEN :status IS NOT NULL THEN :status ELSE status END,
+                                    holder_name       = COALESCE(holder_name, :holder_name),
+                                    contractor_name   = COALESCE(contractor_name, :contractor_name),
+                                    job_value         = COALESCE(job_value, :job_value),
+                                    completion_status = COALESCE(completion_status, :completion_status)
                                 WHERE id = :id
                             """),
-                            {"desc": description_val, "status": incoming_status, "id": existing_row.id},
+                            {
+                                "desc": description_val,
+                                "status": incoming_status,
+                                "holder_name": incoming_holder,
+                                "contractor_name": incoming_contractor,
+                                "job_value": incoming_job_value,
+                                "completion_status": incoming_completion,
+                                "id": existing_row.id,
+                            },
                         )
                         self.session.flush()
                     skipped += 1
@@ -142,34 +220,45 @@ class BuildingPermitLoader(BaseLoader):
                     property_record, score = match_result
                     logger.info(f"Matched permit by address (score: {score}%): {record_number}")
             
+            # Enrichment fields shared by both branches (NaN-safe via _clean_str)
+            permit_type_val = _clean_str(row.get('Record Type'))
+            status_val = _clean_str(row.get('Status'))
+            raw_holder = incoming_holder
+            raw_contractor = incoming_contractor
+            job_value_val = incoming_job_value
+            completion_status_val = _normalize_completion_status(status_val)
+            parsed_issue = self.parse_date(row.get('Date'))
+            parsed_expire = self.parse_date(row.get('Expiration Date'))
+            # Enforcement is computed BEFORE the property-match branch so unmatched
+            # permits carry the flag into permit_staging (detectors must be able to
+            # exclude enforcement records from the staging side too).
+            enforcement = _is_enforcement(permit_type_val, status_val, parsed_expire)
+
             if property_record:
                 try:
-                    # Handle NaN values
-                    permit_type_val = row.get('Record Type')
-                    if pd.isna(permit_type_val):
-                        permit_type_val = None
-                    
-                    status_val = row.get('Status')
-                    if pd.isna(status_val):
-                        status_val = None
-                    
-                    parsed_expire = self.parse_date(row.get('Expiration Date'))
-                    enforcement = _is_enforcement(permit_type_val, status_val, parsed_expire)
-
                     permit_record = BuildingPermit(
                         property_id=property_record.id,
                         permit_number=record_number,
                         permit_type=permit_type_val,
                         status=status_val,
-                        issue_date=self.parse_date(row.get('Date')),
+                        issue_date=parsed_issue,
                         expire_date=parsed_expire,
                         is_enforcement_permit=enforcement,
                         county_id=self.county_id,
                         description=description_val,
+                        holder_name=raw_holder,
+                        contractor_name=raw_contractor,
+                        job_value=job_value_val,
+                        completion_status=completion_status_val,
                     )
-                    
+
                     if self.safe_add(permit_record):
                         matched += 1
+                        # Promotion: this permit now has a real building_permits row.
+                        # Remove any earlier permit_staging representation (and its
+                        # buyer_entity_link) so detectors don't count the same permit
+                        # twice — once via the matched property, once via staging.
+                        self._promote_from_staging(record_number)
                         try:
                             from src.services.borrower_profile_service import (
                                 schedule_profile_recompute_for_property,
@@ -189,7 +278,21 @@ class BuildingPermitLoader(BaseLoader):
                     logger.error(f"Error building permit {record_number}: {e}")
                     unmatched += 1
             else:
-                logger.warning(f"No property match for permit: {record_number} at {row.get('Address')}")
+                logger.info(f"Permit {record_number} unmatched — staging for builder engine")
+                self._persist_to_staging(
+                    permit_number=record_number,
+                    permit_type=permit_type_val,
+                    address=_clean_str(row.get('Address')) or '',
+                    holder_name=raw_holder,
+                    contractor_name=raw_contractor,
+                    job_value=job_value_val,
+                    completion_status=completion_status_val,
+                    status=status_val,
+                    description=description_val,
+                    issue_date=parsed_issue,
+                    expire_date=parsed_expire,
+                    is_enforcement_permit=enforcement,
+                )
                 self.quarantine_unmatched(
                     source_type="permits",
                     raw_row=row.to_dict() if hasattr(row, 'to_dict') else dict(row),
@@ -200,6 +303,87 @@ class BuildingPermitLoader(BaseLoader):
         
         logger.info(f"Building Permits: {matched} matched, {unmatched} unmatched, {skipped} skipped")
         return matched, unmatched, skipped
+
+    def _promote_from_staging(self, permit_number: str) -> None:
+        """Remove a staged permit once it has a real building_permits row.
+
+        Deletes the buyer_entity_link pointing at the staging row first (the
+        principal will re-resolve against the building_permits row on the next
+        resolver pass), then the staging row itself. Idempotent — a no-op when
+        the permit was never staged.
+        """
+        staging = self.session.execute(
+            text("SELECT id FROM permit_staging WHERE permit_number = :pn"),
+            {"pn": permit_number},
+        ).fetchone()
+        if staging is None:
+            return
+        self.session.execute(
+            text("DELETE FROM buyer_entity_links "
+                 "WHERE source_table = 'permit_staging' AND source_id = :sid"),
+            {"sid": staging.id},
+        )
+        self.session.execute(
+            text("DELETE FROM permit_staging WHERE id = :sid"),
+            {"sid": staging.id},
+        )
+        self.session.flush()
+
+    def _persist_to_staging(
+        self,
+        *,
+        permit_number: str,
+        permit_type: str | None,
+        address: str,
+        holder_name: str | None,
+        contractor_name: str | None,
+        job_value: float | None,
+        completion_status: str | None,
+        status: str | None,
+        description: str | None,
+        issue_date,
+        expire_date,
+        is_enforcement_permit: bool = False,
+    ) -> None:
+        """Upsert an unmatched permit into permit_staging."""
+        self.session.execute(
+            text("""
+                INSERT INTO permit_staging (
+                    permit_number, permit_type, county_id, address,
+                    holder_name, contractor_name, job_value,
+                    completion_status, status, description,
+                    issue_date, expire_date, is_enforcement_permit, date_added, matched
+                ) VALUES (
+                    :permit_number, :permit_type, :county_id, :address,
+                    :holder_name, :contractor_name, :job_value,
+                    :completion_status, :status, :description,
+                    :issue_date, :expire_date, :is_enforcement_permit, CURRENT_DATE, FALSE
+                )
+                ON CONFLICT (permit_number) DO UPDATE SET
+                    status                = EXCLUDED.status,
+                    completion_status     = EXCLUDED.completion_status,
+                    is_enforcement_permit = EXCLUDED.is_enforcement_permit,
+                    holder_name           = COALESCE(EXCLUDED.holder_name, permit_staging.holder_name),
+                    contractor_name       = COALESCE(EXCLUDED.contractor_name, permit_staging.contractor_name),
+                    job_value             = COALESCE(EXCLUDED.job_value, permit_staging.job_value),
+                    description           = COALESCE(EXCLUDED.description, permit_staging.description)
+            """),
+            {
+                "permit_number": permit_number,
+                "permit_type": permit_type,
+                "county_id": self.county_id,
+                "address": address,
+                "holder_name": holder_name,
+                "contractor_name": contractor_name,
+                "job_value": job_value,
+                "completion_status": completion_status,
+                "status": status,
+                "description": description,
+                "issue_date": issue_date,
+                "expire_date": expire_date,
+                "is_enforcement_permit": is_enforcement_permit,
+            },
+        )
 
 
 PermitLoader = BuildingPermitLoader

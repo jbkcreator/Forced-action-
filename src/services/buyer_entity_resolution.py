@@ -20,9 +20,10 @@ from dataclasses import dataclass
 from typing import Iterable, Iterator, Optional
 
 from rapidfuzz import fuzz
-from sqlalchemy import insert, text
+from sqlalchemy import bindparam, insert, text
 from sqlalchemy.orm import Session
 
+from config.settings import get_settings
 from src.agents.hunter.gating import verification_status
 from src.core.models import BuyerEntity, BuyerEntityLink
 from src.loaders.base import BaseLoader
@@ -903,8 +904,9 @@ def compute_cluster_confidences(
     shouldn't inflate a cluster actually held together by a much weaker
     fuzzy/LLM link elsewhere. A cluster held together entirely by structural
     edges gets that structural confidence, since that IS all the evidence.
-    Singleton clusters (no edges at all) get 100 — nothing was inferred, so
-    there's no matching uncertainty to score.
+    Singleton clusters (no edges at all) are brand-new names that matched
+    nothing — they get _NEW_SINGLETON_CONFIDENCE (60, below the EXCEPTIONS
+    floor) so they route for human review instead of being trusted outright.
     """
     index_by_key = _cluster_index_by_key(clusters)
     non_structural_mins: dict[int, int] = {}
@@ -922,6 +924,11 @@ def compute_cluster_confidences(
             current = non_structural_mins.get(idx)
             non_structural_mins[idx] = verdict.confidence if current is None else min(current, verdict.confidence)
 
+    # Singletons (no edges at all) are brand-new names that matched nothing.
+    # They are NOT verified — assign confidence just below the EXCEPTIONS floor
+    # so they are routed for human review instead of silently trusted.
+    _NEW_SINGLETON_CONFIDENCE = 60
+
     confidences = []
     for i in range(len(clusters)):
         if i in non_structural_mins:
@@ -929,7 +936,7 @@ def compute_cluster_confidences(
         elif i in structural_max:
             confidences.append(structural_max[i])
         else:
-            confidences.append(100)
+            confidences.append(_NEW_SINGLETON_CONFIDENCE)
     return confidences
 
 
@@ -1166,9 +1173,15 @@ def attach_or_create_entities(
             # single-record cluster), not a human decision. 'manual' means
             # exactly what it says and is reserved for an actual human-set
             # link (e.g. an admin merge/reject action) -- see WI-5.
+            # A singleton (no corroborating edge) must NOT be persisted as a
+            # trusted 100-confidence link: it matched nothing, so its link
+            # carries the cluster's own confidence (60 for a brand-new name).
+            # Builder detectors filter on match_confidence >= 70, so an
+            # unverified singleton never feeds MONEY/RELATIONSHIPS until an
+            # operator confirms it via the EXCEPTIONS lane.
             method, explanation, link_confidence, _principal_name = evidence_index.get(
                 _record_key(rec),
-                ("singleton_no_edge", "single-record cluster; no corroborating edge", 100, None),
+                ("singleton_no_edge", "single-record cluster; no corroborating edge", confidence, None),
             )
             session.execute(insert(BuyerEntityLink).values(
                 buyer_entity_id=entity_id,
@@ -1188,6 +1201,333 @@ def attach_or_create_entities(
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# WP-T2-8 Stage B — Permit principal resolution
+# Extracts holder_name / contractor_name from building_permits + permit_staging,
+# resolves each to a buyer_entity via the existing pipeline.
+# Low-confidence links (<UNVERIFIED_FLOOR) are written as 'unverified' and also
+# emitted to the EXCEPTIONS Slack channel for manual confirmation.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_BUILDER_CONFIDENCE_FLOOR = 70  # mirrors UNVERIFIED_FLOOR in gating.py
+
+
+_LLC_SUFFIXES = (" LLC", " L.L.C", " LC", " PLLC")
+_CORP_SUFFIXES = (" INC", " INCORPORATED", " CORP", " CORPORATION", " CO", " COMPANY", " LP", " LLP", " PA")
+_TRUST_TOKENS = (" TRUST", " TRUSTEE", " TR ", " REVOCABLE", " LIVING TRUST")
+
+
+def _infer_entity_type_from_name(name: str) -> str:
+    """Best-effort legal-type guess from a raw party name so permit companies are
+    not all mislabeled 'Individual' (which suppresses Sunbiz principal resolution
+    and lets a company fragment from its principal). Matches the entity_type CHECK
+    set on buyer_entities: Individual | LLC | Trust | Corporate."""
+    if not name:
+        return "Individual"
+    padded = f" {name.upper().strip()} "
+    if any(s in padded for s in _LLC_SUFFIXES):
+        return "LLC"
+    if any(t in padded for t in _TRUST_TOKENS):
+        return "Trust"
+    if any(s in padded for s in _CORP_SUFFIXES):
+        return "Corporate"
+    return "Individual"
+
+
+def _permit_name_candidates(
+    session: Session,
+    source_table: str,
+    only_unresolved: bool,
+) -> Iterator[CandidateRecord]:
+    """
+    Stream one CandidateRecord per permit row from building_permits or
+    permit_staging. The permit's principal party is holder_name (applicant /
+    owner-of-record) when present, else contractor_name — so contractor-only
+    permits (common in permit data) still resolve into the graph.
+
+    Known limitation: buyer_entity_links has UNIQUE(source_table, source_id), so
+    a permit contributes exactly one link. When holder and contractor are BOTH
+    present and DIFFERENT, only the holder is resolved as principal; tracking the
+    contractor as a separate builder identity on the same permit would need a
+    role-aware link key (deferred — see PR follow-ups).
+
+    only_unresolved=True skips source_ids that already have a buyer_entity_link.
+    """
+    if source_table not in ("building_permits", "permit_staging"):
+        raise ValueError(f"Unknown source_table for permit resolution: {source_table!r}")
+
+    unresolved_guard = (
+        "AND bel.id IS NULL" if only_unresolved else ""
+    )
+
+    # principal = holder if present, else contractor (contractor-only permits).
+    # The NOT EXISTS excludes permits an operator durably rejected in EXCEPTIONS:
+    # without it, an unresolved rejected permit would re-resolve to the same
+    # entity and re-alert on every nightly sweep (see _handle_reject_entity_link).
+    party_sql = f"""
+        SELECT p.id,
+               COALESCE(NULLIF(p.holder_name, ''), NULLIF(p.contractor_name, '')) AS raw_name,
+               p.county_id
+        FROM {source_table} p
+        LEFT JOIN buyer_entity_links bel
+            ON bel.source_table = :src AND bel.source_id = p.id
+        WHERE COALESCE(NULLIF(p.holder_name, ''), NULLIF(p.contractor_name, '')) IS NOT NULL
+        {unresolved_guard}
+        AND NOT EXISTS (
+            SELECT 1 FROM buyer_entity_match_exception e
+            WHERE e.kind = 'rejected_permit_link'
+              AND e.left_ref = :src || '#' || p.id::text
+        )
+        ORDER BY p.id
+    """
+    for row in session.execute(text(party_sql), {"src": source_table}).yield_per(_STREAM_BATCH):
+        raw = row.raw_name or ""
+        yield CandidateRecord(
+            source_table=source_table,
+            source_id=row.id,
+            raw_name=raw,
+            normalized_name=BaseLoader.normalize_owner_name(raw),
+            mailing_address=None,
+            entity_type_hint=_infer_entity_type_from_name(raw),
+            managing_members=None,
+            county_id=row.county_id,
+        )
+
+
+def extract_permit_candidates(
+    session: Session, only_unresolved: bool = True,
+) -> Iterator[CandidateRecord]:
+    """Combined stream over building_permits + permit_staging."""
+    yield from _permit_name_candidates(session, "building_permits", only_unresolved)
+    yield from _permit_name_candidates(session, "permit_staging", only_unresolved)
+
+
+_EXCEPTIONS_CARD_ROW_CAP = 15  # Block Kit safety: keep well under the 50-block limit
+
+
+def _severity(conf: int) -> str:
+    """Visual severity by distance below the confidence floor."""
+    return "🔴" if conf < 60 else "🟠"
+
+
+def _build_exceptions_message(low_conf_links: list[tuple[str, int, str, int]]) -> str:
+    """Plain-text fallback (notifications + clients without Block Kit)."""
+    n = len(low_conf_links)
+    lines = [
+        f"• {name} — {src} #{src_id} → entity {entity_id} · confidence {conf} (unverified)"
+        for src, src_id, name, conf, entity_id in low_conf_links[:_EXCEPTIONS_CARD_ROW_CAP]
+    ]
+    extra = f"\n…and {n - _EXCEPTIONS_CARD_ROW_CAP} more" if n > _EXCEPTIONS_CARD_ROW_CAP else ""
+    return f"Builder permit resolution — {n} low-confidence link(s) need review\n" + "\n".join(lines) + extra
+
+
+def _build_exceptions_blocks(low_conf_links: list[tuple[str, int, str, int]]) -> list[dict]:
+    """Render a Block Kit card for the EXCEPTIONS alert (pure — unit-testable).
+
+    Design follows Slack UI guide: bold primary text, italic muted secondary,
+    primary/danger button styles, ghost neutral for non-destructive actions,
+    dividers for card separation.
+    """
+    n = len(low_conf_links)
+    shown = low_conf_links[:_EXCEPTIONS_CARD_ROW_CAP]
+
+    def _conf_label(conf: int) -> str:
+        return "Critical" if conf < 60 else "Low"
+
+    blocks: list[dict] = [
+        # Summary header — primary text bold, secondary detail muted
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"*{n} match{'es' if n != 1 else ''} need{'s' if n == 1 else ''} your review* "
+                    f"_(confidence < {_BUILDER_CONFIDENCE_FLOOR})_\n"
+                    "_Confirm or reject each before it is trusted._"
+                ),
+            },
+        },
+        {"type": "divider"},
+    ]
+
+    for src, src_id, name, conf, entity_id in shown:
+        sev = _severity(conf)
+        label = _conf_label(conf)
+        # Row: company name (primary/bold) + source path (secondary/muted)
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"*{name}*\n"
+                    f"_`{src}` #{src_id}  →  Entity #{entity_id}_"
+                ),
+            },
+        })
+        # Confidence + status fields — numeric tabular, muted labels
+        blocks.append({
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Confidence*\n{sev} *{conf}%*  _{label}_"},
+                {"type": "mrkdwn", "text": f"*Status*\n_Needs review_"},
+            ],
+        })
+        # Actions: primary=Confirm (accent), danger=Reject, neutral ghost=View details
+        blocks.append({
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Confirm", "emoji": False},
+                    "style": "primary",
+                    "action_id": f"confirm_entity_link_{src}_{src_id}",
+                    "value": f"{src}:{src_id}:{entity_id}",
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Reject", "emoji": False},
+                    "style": "danger",
+                    "action_id": f"reject_entity_link_{src}_{src_id}",
+                    "value": f"{src}:{src_id}:{entity_id}",
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "View details", "emoji": False},
+                    "action_id": f"view_entity_link_{src}_{src_id}",
+                    "value": f"{src}:{src_id}:{entity_id}",
+                },
+            ],
+        })
+        blocks.append({"type": "divider"})
+
+    if n > _EXCEPTIONS_CARD_ROW_CAP:
+        blocks.append({
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": f"_…and *{n - _EXCEPTIONS_CARD_ROW_CAP}* more not shown_"}],
+        })
+
+    # Footer: tertiary/muted, pipe-separated, count summary on right
+    blocks.append({
+        "type": "context",
+        "elements": [
+            {
+                "type": "mrkdwn",
+                "text": (
+                    f"Lane: *EXCEPTIONS*  |  Source: Builder Engine (WP-T2-8)"
+                    f"  |  _{n} of {n} match{'es' if n != 1 else ''}_"
+                ),
+            },
+        ],
+    })
+    return blocks
+
+
+def _emit_exceptions_alerts(
+    low_conf_links: list[tuple[str, int, str, int]],
+) -> None:
+    """
+    Post a single batched EXCEPTIONS alert for permit resolutions below the
+    confidence floor, to the FA-Max EXCEPTIONS Slack lane.
+
+    No-ops (logs and returns) when Slack is not configured — mirrors
+    slack_post.post_for_approval, so nightly resolution runs never fail because
+    of a missing token/channel. Non-fatal: a Slack error is logged, never raised.
+    """
+    if not low_conf_links:
+        return
+
+    settings = get_settings()
+    token = settings.slack_bot_token
+    channel = getattr(settings, "fa_max_slack_channel_exceptions", "")
+    if not token or not channel:
+        logger.info(
+            "_emit_exceptions_alerts: Slack not configured (no token/EXCEPTIONS channel) — "
+            "%d low-confidence permit link(s) logged only", len(low_conf_links),
+        )
+        return
+
+    try:
+        from slack_sdk import WebClient
+        WebClient(token=token.get_secret_value()).chat_postMessage(
+            channel=channel,
+            text=_build_exceptions_message(low_conf_links),   # notification / a11y fallback
+            blocks=_build_exceptions_blocks(low_conf_links),
+        )
+        logger.info("_emit_exceptions_alerts: posted %d low-confidence permit link(s) to EXCEPTIONS",
+                    len(low_conf_links))
+    except Exception as exc:
+        logger.error("_emit_exceptions_alerts: Slack post failed: %s", exc, exc_info=True)
+
+
+def run_incremental_permits(
+    session: Session,
+    county_id: Optional[str] = None,
+    only_unresolved: bool = True,
+) -> dict:
+    """
+    Stage B entry point — resolve permit holder/contractor names to buyer_entities.
+
+    Behaviour:
+    - Pulls unresolved (default) permit candidates from building_permits + permit_staging.
+    - Runs through the identical cluster_against_anchors pipeline used by run_incremental.
+    - confidence >= 70: writes BuyerEntityLink as 'verified'; entity persisted.
+    - confidence < 70: writes BuyerEntityLink as 'unverified'; also emits an
+      EXCEPTIONS Slack alert for manual confirmation (never auto-merges).
+    - Commits once at the end.
+    """
+    new_candidates = list(extract_permit_candidates(session, only_unresolved=only_unresolved))
+    if county_id:
+        new_candidates = [c for c in new_candidates if c.county_id == county_id]
+
+    if not new_candidates:
+        return {"new_entities": 0, "new_links": 0, "conflicts": 0, "processed": 0,
+                "changed_entity_ids": [], "low_confidence": 0}
+
+    existing_entities = load_existing_entity_candidates(session, county_id=None)
+    combined = new_candidates + existing_entities
+    relevant_clusters, confidences, evidence_index, ambiguous_pairs = cluster_against_anchors(combined)
+    stats = attach_or_create_entities(session, relevant_clusters, confidences, evidence_index)
+    # Ambiguous permit-name verdicts the resolver declined to link are durably
+    # routed to EXCEPTIONS (buyer_entity_match_exception), same as run_incremental.
+    record_ambiguous_pair_exceptions(session, ambiguous_pairs)
+
+    # Collect low-confidence links for EXCEPTIONS routing
+    low_conf_links = []
+    for cluster, confidence in zip(relevant_clusters, confidences):
+        if confidence < _BUILDER_CONFIDENCE_FLOOR:
+            new_recs = [r for r in cluster if r.source_table != _ENTITY_ANCHOR_TABLE]
+            for rec in new_recs:
+                low_conf_links.append((rec.source_table, rec.source_id, rec.raw_name, confidence))
+
+    # Enrich with entity_id for the alert message — look up the links we just
+    # wrote in ONE query (a per-link SELECT would be N+1). Key by (table, id).
+    entity_by_source: dict[tuple[str, int], int] = {}
+    if low_conf_links:
+        pairs = {(src, src_id) for src, src_id, _name, _conf in low_conf_links}
+        rows = session.execute(
+            text("""
+                SELECT source_table, source_id, buyer_entity_id
+                FROM buyer_entity_links
+                WHERE (source_table, source_id) IN :pairs
+            """).bindparams(bindparam("pairs", expanding=True)),
+            {"pairs": list(pairs)},
+        )
+        for r in rows:
+            entity_by_source[(r.source_table, r.source_id)] = r.buyer_entity_id
+
+    alert_items = [
+        (src, src_id, name, conf, entity_by_source.get((src, src_id), "?"))
+        for src, src_id, name, conf in low_conf_links
+    ]
+
+    session.commit()
+    _emit_exceptions_alerts(alert_items)
+
+    return {
+        **stats,
+        "processed": len(new_candidates),
+        "low_confidence": len(low_conf_links),
+    }
 def record_ambiguous_pair_exceptions(
     session: Session,
     ambiguous_pairs: list[tuple[CandidateRecord, CandidateRecord, MatchVerdict]],

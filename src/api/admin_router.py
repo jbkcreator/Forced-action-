@@ -1655,7 +1655,7 @@ async def slack_interact(request: Request, background_tasks: BackgroundTasks, db
     action_id = actions[0].get("action_id") if actions else None
 
     _CORA_EXACT = frozenset({"approve_all", "reject_batch", "ratify_standing_order", "decline_standing_order"})
-    _CORA_PREFIXES = ("reject_", "view_", "archive_standing_order_", "keep_standing_order_")
+    _CORA_PREFIXES = ("view_", "archive_standing_order_", "keep_standing_order_")
 
     if action_id == "county_launch_decision":
         return _handle_county_launch_interact(payload, db)
@@ -1663,9 +1663,23 @@ async def slack_interact(request: Request, background_tasks: BackgroundTasks, db
         return _handle_relay_decision(payload)
     if action_id in ("approve_win_story", "dismiss_win_story"):
         return _handle_win_story_interact(payload, db)
+    # Builder entity-link actions (EXCEPTIONS lane — WP-T2-8)
+    if action_id and action_id.startswith("confirm_entity_link_"):
+        return _handle_confirm_entity_link(payload, db)
+    if action_id and action_id.startswith("reject_entity_link_"):
+        return _handle_reject_entity_link(payload, db)
+    if action_id and action_id.startswith("view_entity_link_"):
+        return _handle_view_entity_link(payload, db)
+    # Builder opportunity actions (RELATIONSHIPS lane — WP-T2-8)
+    if action_id and action_id.startswith("add_builder_to_diallist_"):
+        return _handle_add_builder_to_diallist(payload, db)
+    if action_id and action_id.startswith("snooze_builder_"):
+        return _handle_snooze_builder(payload, db)
+    if action_id and action_id.startswith("dismiss_builder_"):
+        return _handle_dismiss_builder(payload, db)
     if action_id in _CORA_EXACT or (
         action_id and any(action_id.startswith(p) for p in _CORA_PREFIXES)
-    ):
+    ) or (action_id and action_id.startswith("reject_")):
         return _handle_cora_batch_interact(payload, db, background_tasks)
 
     return _slack_ephemeral(f"Unrecognized action: {action_id}")
@@ -2601,6 +2615,180 @@ def _handle_win_story_interact(payload: dict, db: Session) -> dict:
 
     _update_win_story_slack_message(asset_id, payload, reply)
     return {"ok": True}
+
+
+def _handle_confirm_entity_link(payload: dict, db: Session) -> dict:
+    """EXCEPTIONS lane — operator confirms a low-confidence buyer_entity_link."""
+    actions = payload.get("actions", [])
+    if not actions:
+        return _slack_ephemeral("No action in payload.")
+    value = actions[0].get("value", "")
+    parts = value.split(":")
+    if len(parts) != 3:
+        return _slack_ephemeral("Invalid payload format.")
+    src_table, src_id_str, entity_id_str = parts
+    try:
+        src_id, entity_id = int(src_id_str), int(entity_id_str)
+    except ValueError:
+        return _slack_ephemeral("Invalid IDs in payload.")
+    user_id = payload.get("user", {}).get("id", "unknown")
+    updated = db.execute(
+        text("""
+            UPDATE buyer_entity_links
+               SET match_confidence = 100, match_method = 'manual'
+             WHERE source_table = :tbl AND source_id = :sid AND buyer_entity_id = :eid
+        """),
+        {"tbl": src_table, "sid": src_id, "eid": entity_id},
+    ).rowcount
+    db.commit()
+    if not updated:
+        return _slack_ephemeral(f"Link not found ({src_table}#{src_id} -> entity #{entity_id}).")
+    logger.info("[EntityLink] confirmed src=%s id=%d entity=%d by=%s", src_table, src_id, entity_id, user_id)
+    return _slack_ephemeral(f":white_check_mark: Link confirmed. Entity #{entity_id} now trusted.")
+
+
+def _handle_reject_entity_link(payload: dict, db: Session) -> dict:
+    """EXCEPTIONS lane — operator rejects a low-confidence buyer_entity_link."""
+    actions = payload.get("actions", [])
+    if not actions:
+        return _slack_ephemeral("No action in payload.")
+    value = actions[0].get("value", "")
+    parts = value.split(":")
+    if len(parts) != 3:
+        return _slack_ephemeral("Invalid payload format.")
+    src_table, src_id_str, entity_id_str = parts
+    try:
+        src_id, entity_id = int(src_id_str), int(entity_id_str)
+    except ValueError:
+        return _slack_ephemeral("Invalid IDs in payload.")
+    user_id = payload.get("user", {}).get("id", "unknown")
+    updated = db.execute(
+        text("""
+            DELETE FROM buyer_entity_links
+             WHERE source_table = :tbl AND source_id = :sid AND buyer_entity_id = :eid
+        """),
+        {"tbl": src_table, "sid": src_id, "eid": entity_id},
+    ).rowcount
+    if not updated:
+        db.rollback()
+        return _slack_ephemeral(f"Link not found ({src_table}#{src_id} -> entity #{entity_id}).")
+    # Durable rejection: without this, the next nightly sweep sees the permit as
+    # unresolved, recreates the identical singleton link, and re-alerts. The
+    # permit extractor anti-joins on this row so the same pair is never proposed
+    # again. Idempotent on (kind, left_ref, right_ref).
+    db.execute(
+        text("""
+            INSERT INTO buyer_entity_match_exception
+                (kind, left_ref, right_ref, explanation, status, resolved_by, resolved_at)
+            VALUES ('rejected_permit_link', :left_ref, :right_ref,
+                    :explanation, 'rejected', :by, now())
+            ON CONFLICT (kind, left_ref, right_ref) DO NOTHING
+        """),
+        {
+            "left_ref": f"{src_table}#{src_id}",
+            "right_ref": f"buyer_entities#{entity_id}",
+            "explanation": f"Operator rejected {src_table}#{src_id} -> entity #{entity_id}",
+            "by": f"slack:{user_id}",
+        },
+    )
+    db.commit()
+    logger.info("[EntityLink] rejected src=%s id=%d entity=%d by=%s", src_table, src_id, entity_id, user_id)
+    return _slack_ephemeral(":no_entry: Link rejected. This match will not be proposed again.")
+
+
+def _handle_view_entity_link(payload: dict, db: Session) -> dict:
+    """EXCEPTIONS lane — show current entity details for review."""
+    actions = payload.get("actions", [])
+    if not actions:
+        return _slack_ephemeral("No action in payload.")
+    value = actions[0].get("value", "")
+    parts = value.split(":")
+    if len(parts) != 3:
+        return _slack_ephemeral("Invalid payload format.")
+    _, src_id_str, entity_id_str = parts
+    try:
+        entity_id = int(entity_id_str)
+    except ValueError:
+        return _slack_ephemeral("Invalid entity ID.")
+    row = db.execute(
+        text("SELECT canonical_name, entity_type, confidence_score FROM buyer_entities WHERE id = :id"),
+        {"id": entity_id},
+    ).fetchone()
+    if not row:
+        return _slack_ephemeral(f"Entity #{entity_id} not found.")
+    return _slack_ephemeral(
+        f"*Entity #{entity_id}*\nName: {row.canonical_name}\nType: {row.entity_type}\nConfidence: {row.confidence_score}%"
+    )
+
+
+def _handle_add_builder_to_diallist(payload: dict, db: Session) -> dict:
+    """RELATIONSHIPS lane — queue builder entity for dial list consideration."""
+    actions = payload.get("actions", [])
+    if not actions:
+        return _slack_ephemeral("No action in payload.")
+    try:
+        entity_id = int(actions[0].get("value", ""))
+    except ValueError:
+        return _slack_ephemeral("Invalid entity ID.")
+    user_id = payload.get("user", {}).get("id", "unknown")
+    db.execute(
+        text("""
+            INSERT INTO builder_dial_queue (buyer_entity_id, queued_by, queued_at)
+            VALUES (:eid, :by, NOW())
+            ON CONFLICT (buyer_entity_id) DO UPDATE SET queued_by = EXCLUDED.queued_by, queued_at = NOW()
+        """),
+        {"eid": entity_id, "by": f"slack:{user_id}"},
+    )
+    db.commit()
+    logger.info("[BuilderRelationships] entity=%d added to dial queue by=%s", entity_id, user_id)
+    return _slack_ephemeral(f":phone: Builder #{entity_id} added to dial list queue.")
+
+
+def _handle_snooze_builder(payload: dict, db: Session) -> dict:
+    """RELATIONSHIPS lane — snooze builder alert for 7 days."""
+    actions = payload.get("actions", [])
+    if not actions:
+        return _slack_ephemeral("No action in payload.")
+    try:
+        entity_id = int(actions[0].get("value", ""))
+    except ValueError:
+        return _slack_ephemeral("Invalid entity ID.")
+    user_id = payload.get("user", {}).get("id", "unknown")
+    db.execute(
+        text("""
+            INSERT INTO builder_dial_queue (buyer_entity_id, queued_by, queued_at, snoozed_until)
+            VALUES (:eid, :by, NOW(), NOW() + INTERVAL '7 days')
+            ON CONFLICT (buyer_entity_id) DO UPDATE
+               SET snoozed_until = NOW() + INTERVAL '7 days', queued_by = EXCLUDED.queued_by
+        """),
+        {"eid": entity_id, "by": f"slack:{user_id}"},
+    )
+    db.commit()
+    logger.info("[BuilderRelationships] entity=%d snoozed 7d by=%s", entity_id, user_id)
+    return _slack_ephemeral(f":zzz: Builder #{entity_id} snoozed for 7 days.")
+
+
+def _handle_dismiss_builder(payload: dict, db: Session) -> dict:
+    """RELATIONSHIPS lane — mark builder as not a fit (permanent dismiss)."""
+    actions = payload.get("actions", [])
+    if not actions:
+        return _slack_ephemeral("No action in payload.")
+    try:
+        entity_id = int(actions[0].get("value", ""))
+    except ValueError:
+        return _slack_ephemeral("Invalid entity ID.")
+    user_id = payload.get("user", {}).get("id", "unknown")
+    db.execute(
+        text("""
+            INSERT INTO builder_dial_queue (buyer_entity_id, queued_by, queued_at, dismissed)
+            VALUES (:eid, :by, NOW(), TRUE)
+            ON CONFLICT (buyer_entity_id) DO UPDATE SET dismissed = TRUE, queued_by = EXCLUDED.queued_by
+        """),
+        {"eid": entity_id, "by": f"slack:{user_id}"},
+    )
+    db.commit()
+    logger.info("[BuilderRelationships] entity=%d dismissed by=%s", entity_id, user_id)
+    return _slack_ephemeral(f":no_entry: Builder #{entity_id} marked as not a fit.")
 
 
 def _update_win_story_slack_message(asset_id: int, payload: dict, reply_text: str) -> None:

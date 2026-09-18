@@ -29,6 +29,16 @@ from sqlalchemy.orm import Session
 from config.settings import get_settings
 
 from src.core.models import DialListSnapshot
+from src.services.builder_patterns import (
+    map_hits_to_property_signals,
+    run_builder_detectors,
+)
+from src.services.builder_relationships import (
+    load_builder_queue_state,
+    surface_relationship_hits,
+)
+from src.services.builder_sizing import size_builder_hits
+from src.services.buyer_entity_resolution import run_incremental_permits
 
 from .config import DEFAULT_CONFIG, DialListConfig
 from .models import DialCandidate, DialList
@@ -49,13 +59,6 @@ _PROBATE_LOOKBACK_DAYS = 365
 # Heuristic: there is no explicit completion field (see GRILL-DECISIONS.md #3).
 _PERMIT_CLOSED_STATUSES = (
     "final", "finaled", "closed", "completed", "co issued", "expired", "cancelled",
-)
-
-_NEW_CONSTRUCTION_PATTERNS = (
-    "%new construction%",
-    "%new single family%",
-    "%new residential%",
-    "%new sfr%",
 )
 
 # DOR major use-code prefixes that are in-scope for hard-money residential
@@ -153,24 +156,6 @@ _STALLED_SQL = text(
     GROUP BY bp.property_id
     """
 ).bindparams(bindparam("closed_statuses", expanding=True))
-
-_BUILDER_SQL = text(
-    """
-    SELECT bp.property_id AS property_id, MAX(bp.issue_date) AS urgency_date
-    FROM building_permits bp
-    WHERE bp.issue_date IS NOT NULL
-      AND bp.issue_date <= :as_of AND bp.issue_date >= :since
-      AND (:county IS NULL OR bp.county_id = :county)
-      AND (
-          LOWER(COALESCE(bp.permit_type, '')) LIKE :p0
-          OR LOWER(COALESCE(bp.permit_type, '')) LIKE :p1
-          OR LOWER(COALESCE(bp.permit_type, '')) LIKE :p2
-          OR LOWER(COALESCE(bp.permit_type, '')) LIKE :p3
-          OR LOWER(COALESCE(bp.description, '')) LIKE :p0
-      )
-    GROUP BY bp.property_id
-    """
-)
 
 _FORECLOSURE_AUCTION_SQL = text(
     """
@@ -330,13 +315,23 @@ _ENRICH_SQL = text(
 class _Acc:
     """Per-property accumulator built during detector fan-out."""
 
-    __slots__ = ("triggers", "is_builder", "intent_tier", "urgency_date")
+    __slots__ = (
+        "triggers", "is_builder", "intent_tier", "urgency_date",
+        "builder_entity_id", "builder_name",
+        "builder_loan", "builder_loan_confidence",
+    )
 
     def __init__(self) -> None:
         self.triggers: Set[str] = set()
         self.is_builder: bool = False
         self.intent_tier: Optional[str] = None
         self.urgency_date: Optional[date] = None
+        self.builder_entity_id: Optional[int] = None
+        self.builder_name: Optional[str] = None
+        # 85% LTC construction sizing (Stage D) — overrides the generic
+        # assessed-value loan fallback in the ranker for builder candidates.
+        self.builder_loan: Optional[Decimal] = None
+        self.builder_loan_confidence: Optional[str] = None
 
     def add_date(self, d: Optional[object]) -> None:
         d2 = _as_date(d)
@@ -378,11 +373,16 @@ def assemble_dial_candidates(
     as_of: date,
     county_id: Optional[str] = None,
     config: Optional[DialListConfig] = None,
+    surface_relationships: bool = False,
 ) -> List[DialCandidate]:
     """Run the live detectors, union + resolve, return ranking-ready candidates.
 
     Raises `SQLAlchemyError` (after logging) on any DB failure — a daily batch
     should fail loud, not silently emit an empty list that reads as "no calls".
+
+    surface_relationships: when True, also posts RELATIONSHIPS Slack cards and
+    writes their dedup ledger. Defaults False so a --dry-run generation produces
+    NO delivery side effects (only the live delivery path opts in).
     """
     cfg = config or DEFAULT_CONFIG
     try:
@@ -394,6 +394,46 @@ def assemble_dial_candidates(
                 a = _Acc()
                 acc[pid] = a
             return a
+
+        # Stage E: resolve newly ingested permit principals, run all five
+        # principal-aware builder detectors, then bridge their entity-grained
+        # hits into WP-9's property-keyed accumulator.
+        run_incremental_permits(session, county_id=county_id)
+        builder_hits = run_builder_detectors(
+            session, as_of=as_of, county_id=county_id,
+        )
+        # RELATIONSHIPS Slack delivery is a side effect — gated to the live path.
+        if surface_relationships:
+            surface_relationship_hits(session, builder_hits)
+
+        # Operator decisions + Stage D sizing only matter when builders fired.
+        dismissed_builders: Set[int] = set()
+        builder_loans: Dict[int, tuple[Decimal, str]] = {}
+        if builder_hits:
+            dismissed_builders, _snoozed = load_builder_queue_state(session)
+            # 85% LTC construction sizing per builder entity (Stage D); keep the
+            # largest loan when a builder spans multiple properties.
+            for sizing in size_builder_hits(session, builder_hits):
+                if sizing.estimated_loan is None:
+                    continue
+                prev = builder_loans.get(sizing.buyer_entity_id)
+                if prev is None or sizing.estimated_loan > prev[0]:
+                    builder_loans[sizing.buyer_entity_id] = (
+                        sizing.estimated_loan, sizing.confidence,
+                    )
+
+        for pid, signal in map_hits_to_property_signals(session, builder_hits).items():
+            if signal.buyer_entity_id in dismissed_builders:
+                continue
+            a = _bucket(pid)
+            a.triggers.add("builder")
+            a.is_builder = True
+            a.builder_entity_id = signal.buyer_entity_id
+            a.builder_name = signal.principal_name
+            a.add_date(signal.urgency_date)
+            loan = builder_loans.get(signal.buyer_entity_id)
+            if loan is not None:
+                a.builder_loan, a.builder_loan_confidence = loan
 
         cash_since = as_of - timedelta(days=_CASH_LOOKBACK_DAYS)
         permit_since = as_of - timedelta(days=_PERMIT_LOOKBACK_DAYS)
@@ -441,25 +481,7 @@ def assemble_dial_candidates(
             a.triggers.add("stalled_flip")
             a.add_date(row["urgency_date"])
 
-        # 5) builder / new-construction signal
-        for row in session.execute(
-            _BUILDER_SQL,
-            {
-                "as_of": as_of,
-                "since": permit_since,
-                "county": county_id,
-                "p0": _NEW_CONSTRUCTION_PATTERNS[0],
-                "p1": _NEW_CONSTRUCTION_PATTERNS[1],
-                "p2": _NEW_CONSTRUCTION_PATTERNS[2],
-                "p3": _NEW_CONSTRUCTION_PATTERNS[3],
-            },
-        ).mappings():
-            a = _bucket(row["property_id"])
-            a.triggers.add("builder")
-            a.is_builder = True
-            a.add_date(row["urgency_date"])
-
-        # 6) auction / probate purchases (three sources → one trigger)
+        # 5) auction / probate purchases (three sources → one trigger)
         for row in session.execute(
             _FORECLOSURE_AUCTION_SQL,
             {"as_of_next": as_of_next, "since": auction_since, "county": county_id},
@@ -585,7 +607,7 @@ def assemble_dial_candidates(
             DialCandidate(
                 property_id=pid,
                 opportunity_id=e.get("opportunity_thread_id"),
-                buyer_entity_id=e.get("buyer_entity_id"),
+                buyer_entity_id=a.builder_entity_id or e.get("buyer_entity_id"),
                 triggers=sorted(a.triggers),
                 intent_tier=a.intent_tier,
                 # arv/max_ltc come from the WP-8B published ARV once its
@@ -593,11 +615,18 @@ def assemble_dial_candidates(
                 # falls back to assessed value / last sale.
                 arv=None,
                 max_ltc=None,
+                # Builder candidates carry Stage D's 85% LTC construction sizing;
+                # the ranker uses this override ahead of the generic 70% assessed
+                # fallback (a builder's loan basis is the build, not the parcel).
+                expected_loan_override=a.builder_loan,
+                expected_loan_override_confidence=(
+                    "high" if a.builder_loan_confidence == "high" else "low"
+                ) if a.builder_loan is not None else None,
                 assessed_value_mkt=_dec(e.get("assessed_value_mkt")),
                 last_sale_price=_dec(e.get("last_sale_price")),
                 is_builder=a.is_builder,
                 urgency_date=a.urgency_date,
-                borrower_name=e.get("canonical_name"),
+                borrower_name=a.builder_name or e.get("canonical_name"),
                 owner_name=e.get("owner_name"),
                 property_address=address,
                 phone=e.get("phone_1"),
@@ -719,11 +748,17 @@ def generate_dial_list(
     as_of: date,
     county_id: Optional[str] = None,
     config: Optional[DialListConfig] = None,
+    surface_relationships: bool = False,
 ) -> DialList:
-    """Assemble candidates from the DB and rank them with the pure core."""
+    """Assemble candidates from the DB and rank them with the pure core.
+
+    surface_relationships defaults False so a dry-run generation posts nothing
+    and writes no RELATIONSHIPS dedup ledger; the live delivery path passes True.
+    """
     cfg = config or DEFAULT_CONFIG
     candidates = assemble_dial_candidates(
-        session, as_of=as_of, county_id=county_id, config=cfg
+        session, as_of=as_of, county_id=county_id, config=cfg,
+        surface_relationships=surface_relationships,
     )
     dial_list = rank_dial_list(candidates, as_of, cfg)
     dial_list.stale_sources = stale_dial_list_sources(
