@@ -144,6 +144,13 @@ COUNTY_ID=hillsborough
 # fast relative to how rarely EXCEPTIONS actually trips.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.fa_max_exceptions_alert_drain
 
+# FA Max weekly edit-rate report (WP-T2-2) — Friday 14:00 UTC. Posts each
+# (agent_name, tier) pair's current-ISO-week edit rate to the EXCEPTIONS
+# Slack lane via the same durable alert queue fa_max_send_health_monitor
+# uses. Distinct from WP-T2-12's Command Center Friday scorecard — this is
+# WP-T2-2's own Done-When line, not superseded by that adjacent report.
+0 14 * * 5 $PROJECT/scripts/cron/run.sh src.tasks.fa_max_weekly_edit_rate_report
+
 # Autonomous Inbound Content Loop (Task 5.1) — Weekly Sunday @ 09:00 AM UTC.
 # Scores each Quora Seed Keyword over a 30-day window, deactivates losers
 # (>=5 answers, 0 paid signups) and expands winners (LLM variations, pool cap 30,

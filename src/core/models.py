@@ -9293,6 +9293,17 @@ class RelayApprovalQueueItem(Base):
     send_interaction_id: Mapped[Optional[Any]] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("fa_max_interactions.interaction_id"), nullable=True
     )
+    # WP-T2-2: Snooze / Revise support. eligible_at is distinct from
+    # fa_max_work_queue.available_at (a different table's deferred-execution
+    # column) — this governs whether THIS row is currently postable /
+    # dispatchable. NULL = always eligible.
+    eligible_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    original_draft: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    final_content: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    revision_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    last_revised_by: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    last_revised_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    material_edit: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
         default=lambda: datetime.now(timezone.utc), server_default=func.now(),
@@ -9307,6 +9318,10 @@ class RelayApprovalQueueItem(Base):
         Index("ix_relay_approval_queue_status", "status"),
         Index("ix_relay_approval_queue_batch_status", "batch_id", "status"),
         Index("ix_relay_approval_queue_venture_status", "venture_key", "status"),
+        Index(
+            "ix_relay_approval_queue_eligible_at", "eligible_at",
+            postgresql_where=text("eligible_at IS NOT NULL"),
+        ),
         # CL4: venture_ladder.cell_reply_rates() joins outbound_drafts to this
         # table on (thread_id, venture_key) to count only items that were
         # really dispatched, so the reply rate the auto-double rule scales on
@@ -10840,6 +10855,18 @@ class FaMaxOpportunity(Base):
     maturity_months: Mapped[Optional[int]] = mapped_column(SmallInteger, nullable=True)
     backflip_ref: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     assigned_to: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    # WP-T2-2: write-once attribution to the interaction that triggered this
+    # opportunity's creation. NULL = unattributed = counts as zero for the
+    # Tier C funded-loan causal-join evidence (fa_max_autonomy.get_funded_
+    # loan_count). Set exactly once at creation time by the caller that
+    # inserts the opportunity row; application-layer enforced (no current
+    # production call site creates FaMaxOpportunity rows yet -- see WP-T2-2
+    # deviation notes), never overwritten thereafter.
+    origin_interaction_id: Mapped[Optional[Any]] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_interactions.interaction_id", name="fk_fa_max_opp_origin_interaction"),
+        nullable=True,
+    )
     # CAS optimistic-concurrency guard — same pattern as FaMaxPerson.state_version.
     state_version: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text("0")
@@ -10880,6 +10907,10 @@ class FaMaxOpportunity(Base):
             "ix_fa_max_opp_open",
             "outcome",
             postgresql_where=text("outcome = 'open'"),
+        ),
+        Index(
+            "ix_fa_max_opp_origin_interaction", "origin_interaction_id",
+            postgresql_where=text("origin_interaction_id IS NOT NULL"),
         ),
     )
 
@@ -11212,6 +11243,12 @@ class FaMaxInteraction(Base):
     actor: Mapped[str] = mapped_column(String(120), nullable=False)
     approved_bool: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     autonomy_tier_at_time: Mapped[Optional[str]] = mapped_column(String(5), nullable=True)
+    # WP-T2-2: which agent authored/drove this interaction. Nullable —
+    # populated going forward by write_interaction()/mark_sent() callers.
+    # Traffic direction continues to be carried by autonomy_tier_at_time's
+    # existing (agent_name, autonomy_tier_at_time) pairing semantics; no
+    # separate direction column is added.
+    agent_name: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
     body_redacted: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     occurred_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -11246,6 +11283,10 @@ class FaMaxInteraction(Base):
         Index("ix_fa_max_interaction_person_id", "person_id"),
         Index("ix_fa_max_interaction_person_seq", "person_id", "seq"),
         Index("ix_fa_max_interaction_person_timeline_seq", "person_id", "timeline_seq"),
+        Index(
+            "ix_fa_max_interaction_agent_name", "agent_name",
+            postgresql_where=text("agent_name IS NOT NULL"),
+        ),
     )
 
     def __repr__(self) -> str:
@@ -11253,6 +11294,47 @@ class FaMaxInteraction(Base):
             f"<FaMaxInteraction(interaction_id={self.interaction_id!r}, "
             f"person={self.person_id!r}, channel={self.channel!r}, "
             f"direction={self.direction!r})>"
+        )
+
+
+class FaMaxToolCallLog(Base):
+    """Per-tool-call audit trail for the FA Max agent runtime (WP-T2-2).
+
+    Separate from agent_decisions — agent_decisions records a DECISION
+    (autonomy-tier-gated outcome, logged via write_tools.log_decision());
+    this table records every individual tool INVOCATION inside the agent's
+    bounded tool-call loop, whether or not it produced a decision. input/
+    output are redacted (PII/financial-shaped values stripped) before
+    storage — never raw payload content.
+    """
+
+    __tablename__ = "fa_max_tool_call_log"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    work_item_id: Mapped[Optional[Any]] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    agent_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    tool_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    input: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    output: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    duration_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('in_progress', 'claimed', 'success', 'error', 'blocked')",
+            name="ck_fa_max_tool_call_log_status",
+        ),
+        Index("ix_fa_max_tool_call_log_work_item", "work_item_id"),
+        Index("ix_fa_max_tool_call_log_agent_tool", "agent_name", "tool_name", text("created_at DESC")),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<FaMaxToolCallLog(id={self.id}, agent={self.agent_name!r}, "
+            f"tool={self.tool_name!r}, status={self.status!r})>"
         )
 
 

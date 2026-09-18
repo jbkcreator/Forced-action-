@@ -4,6 +4,10 @@ Admin API router.
 Provides JWT-authenticated endpoints for internal operations:
   POST /api/admin/login                   — issue a 24-hour bearer token
   POST /api/admin/upload/tax-delinquency  — upload a tax delinquency CSV
+  POST /api/admin/fa-max/agent-tasks      — manually dispatch a bounded FA Max
+                                             agent task (WP-T2-2; see that
+                                             section below for why this is a
+                                             manual trigger, not automatic)
 
 Auth pattern:
   - Single credential pair from env (ADMIN_USERNAME / ADMIN_PASSWORD)
@@ -1651,6 +1655,13 @@ async def slack_interact(request: Request, background_tasks: BackgroundTasks, db
         raise HTTPException(status_code=401, detail="Invalid Slack signature")
 
     payload = _parse_slack_interactive_payload(raw)
+
+    # view_submission (WP-T2-2 Revise modal) arrives at this same
+    # Interactivity Request URL, not as a "block_actions" payload with an
+    # `actions` list — it must be checked before indexing into `actions`.
+    if payload.get("type") == "view_submission" and payload.get("view", {}).get("callback_id") == "fa_max_revise_submit":
+        return _handle_relay_revise_submission(payload)
+
     actions = payload.get("actions", [])
     action_id = actions[0].get("action_id") if actions else None
 
@@ -1661,6 +1672,12 @@ async def slack_interact(request: Request, background_tasks: BackgroundTasks, db
         return _handle_county_launch_interact(payload, db)
     if action_id in ("approve", "reject"):
         return _handle_relay_decision(payload)
+    if action_id == "fa_max_skip":
+        return _handle_relay_skip(payload)
+    if action_id == "fa_max_snooze":
+        return _handle_relay_snooze(payload)
+    if action_id == "fa_max_revise":
+        return _handle_relay_revise_open(payload)
     if action_id in ("approve_win_story", "dismiss_win_story"):
         return _handle_win_story_interact(payload, db)
     # Builder entity-link actions (EXCEPTIONS lane — WP-T2-8)
@@ -1709,7 +1726,13 @@ async def slack_events(request: Request):
 
 def _handle_relay_thread_action(payload: dict) -> None:
     """Turn an authorized exact command in a Relay card thread into a
-    regular durable Relay decision."""
+    regular durable Relay decision.
+
+    A typed reply has no revision snapshot. After any revision, typed
+    approval is refused; the approver must use the refreshed button, whose
+    revision count is checked atomically with the decision. This remains
+    safe if Slack failed to refresh the card.
+    """
     event = payload.get("event") or {}
     if event.get("type") != "message" or event.get("subtype") or event.get("bot_id"):
         return
@@ -1724,11 +1747,17 @@ def _handle_relay_thread_action(payload: dict) -> None:
     item = relay_queue.get_item_by_slack_message_ts(str(thread_ts))
     if item is None or not _relay_approver_authorized(str(user_id), item.venture_key):
         return
+    # A typed reply carries no revision token. For a revised FA Max draft,
+    # require the refreshed button's atomic revision check instead.
+    if command == "approve" and item.venture_key == "fa_max_lending" and item.revision_count:
+        _post_relay_thread_note(item, "Review the revised card and use its Approve button.")
+        return
     # Reuse the normal decision path, including its pending-row CAS, state
     # transition transaction, interaction audit, and Slack-card update.
     _handle_relay_decision({
         "user": {"id": str(user_id)},
-        "actions": [{"value": json.dumps({"item_id": item.id, "action": command})}],
+        "actions": [{"value": json.dumps({"item_id": item.id, "action": command,
+                                           "revision_count_at_post": item.revision_count})}],
     })
 
 
@@ -1962,6 +1991,29 @@ def _handle_relay_decision(payload: dict) -> dict:
     if existing is None:
         return _slack_ephemeral(f"Item #{item_id} not found.")
 
+    # Stale-card guard (WP-T2-2 item 9): a Revise submitted after this card
+    # was posted bumps revision_count. approve_value/reject_value carry the
+    # revision_count that was current AT POST TIME
+    # (src.services.relay.slack_post.post_for_approval) — if the row's
+    # current revision_count has moved since, this Approve click is acting
+    # on stale (pre-revision) content and must be refused rather than
+    # silently sending the old draft.
+    posted_revision_count = None
+    if action == "approve":
+        posted_revision_count = action_data.get("revision_count_at_post")
+        if existing.venture_key == _FA_MAX_VENTURE and posted_revision_count is None:
+            return _slack_ephemeral("Approval card is missing a revision token; open the current card.")
+        if posted_revision_count is not None and existing.revision_count != posted_revision_count:
+            return _slack_ephemeral(
+                f"Item #{item_id} was revised (now revision #{existing.revision_count}) after this "
+                "card was posted — check the revision note in this thread before approving."
+            )
+        # This early check is a fast, friendly error message — the actual
+        # guarantee against a Revise landing between this check and the
+        # decision commit is expected_revision_count on record_decision()
+        # below, which folds the same comparison into the atomic UPDATE
+        # itself (WP-T2-2 review fix — see that function's docstring).
+
     has_fa_transition = (
         action == "approve"
         and existing.venture_key == _FA_MAX_VENTURE
@@ -2051,9 +2103,10 @@ def _handle_relay_decision(payload: dict) -> dict:
                     raise ValueError(f"state transition refused: {result.outcome.value}")
                 item = relay_queue.record_decision(
                     item_id, approved=True, decided_by=user_id, session=_db,
+                    expected_revision_count=posted_revision_count,
                 )
                 if item is None:
-                    raise ValueError("queue item is no longer pending")
+                    raise ValueError("queue item is no longer pending (or was revised after this card was posted)")
         except Exception as exc:
             _log.error(
                 "FA Max state transition failed on relay approval item=%d: %s",
@@ -2065,10 +2118,12 @@ def _handle_relay_decision(payload: dict) -> dict:
     else:
         item = relay_queue.record_decision(
             item_id, approved=(action == "approve"), decided_by=user_id,
+            expected_revision_count=posted_revision_count,
         )
         if item is None:
             return _slack_ephemeral(
-                f"Item #{item_id} was already decided (not still pending)."
+                f"Item #{item_id} was already decided, or was revised after this "
+                "card was posted (not still pending at the expected revision)."
             )
 
     reply_text = (
@@ -2082,6 +2137,382 @@ def _handle_relay_decision(payload: dict) -> dict:
         _update_relay_slack_message(item, reply_text)
 
     return {"ok": True}
+
+
+def _relay_action_item_id(payload: dict) -> tuple[Optional[int], dict]:
+    """Shared parse: pull item_id + the raw action_data dict off a
+    block_actions payload's first action value. Same shape as
+    _handle_relay_decision's own parsing, factored out so Skip/Snooze/
+    Revise-open don't each re-derive it slightly differently."""
+    actions = payload.get("actions", [])
+    if not actions:
+        return None, {}
+    try:
+        action_data = json.loads(actions[0].get("value", "{}"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid action value")
+    return action_data.get("item_id"), action_data
+
+
+def _handle_relay_skip(payload: dict) -> dict:
+    """Slack Skip button (WP-T2-2 item 9).
+
+    Calls the existing relay.queue.mark_skipped() exactly as built — it is
+    NOT rebuilt here. mark_skipped() accepts a row in status 'approved' OR
+    'pending' (widened during WP-T2-2 review specifically so this button
+    works — see mark_skipped()'s own docstring for why 'pending' is safe to
+    add there without reopening the RELAY-v2.2 double-send bug its guard
+    exists for). A False return here means the row had already left
+    'pending'/'approved' by the time this click landed (already decided,
+    dispatched, or reclaimed) — a genuine stale-click case, not a routine
+    outcome.
+    """
+    from src.services.relay import queue as relay_queue
+
+    user_id = payload.get("user", {}).get("id", "")
+    item_id, _ = _relay_action_item_id(payload)
+    if not item_id:
+        raise HTTPException(status_code=400, detail="Invalid action data")
+
+    existing = relay_queue.get_item(item_id)
+    venture_key = existing.venture_key if existing is not None else DEFAULT_VENTURE_KEY
+    if not _relay_approver_authorized(user_id, venture_key):
+        return _slack_ephemeral("Not authorized to decide Relay sends.")
+    if existing is None:
+        return _slack_ephemeral(f"Item #{item_id} not found.")
+
+    ok = relay_queue.mark_skipped(item_id, f"slack_skip:{user_id}")
+    if not ok:
+        return _slack_ephemeral(
+            f"Item #{item_id} could not be skipped — it may already be decided, "
+            "dispatched, or reclaimed by a concurrent action."
+        )
+    item = relay_queue.get_item(item_id)
+    if item and item.slack_message_ts:
+        _update_relay_slack_message(item, f":fast_forward: Skipped by <@{user_id}>.")
+    return {"ok": True}
+
+
+def _handle_relay_snooze(payload: dict) -> dict:
+    """Slack Snooze button (WP-T2-2 item 9) — defers a pending card via the
+    existing relay.queue.snooze_item() helper."""
+    from src.services.relay import queue as relay_queue
+
+    user_id = payload.get("user", {}).get("id", "")
+    item_id, _ = _relay_action_item_id(payload)
+    if not item_id:
+        raise HTTPException(status_code=400, detail="Invalid action data")
+
+    existing = relay_queue.get_item(item_id)
+    venture_key = existing.venture_key if existing is not None else DEFAULT_VENTURE_KEY
+    if not _relay_approver_authorized(user_id, venture_key):
+        return _slack_ephemeral("Not authorized to decide Relay sends.")
+    if existing is None:
+        return _slack_ephemeral(f"Item #{item_id} not found.")
+
+    ok = relay_queue.snooze_item(item_id)
+    if not ok:
+        return _slack_ephemeral(f"Item #{item_id} could not be snoozed (not pending).")
+    item = relay_queue.get_item(item_id)
+    if item and item.slack_message_ts:
+        _update_relay_slack_message(item, f":clock3: Snoozed by <@{user_id}> — will re-surface later.")
+    return {"ok": True}
+
+
+def _handle_relay_revise_open(payload: dict) -> dict:
+    """Slack Revise button (WP-T2-2 item 9) — opens the revise modal
+    (src.services.relay.slack_post.open_revise_modal). No existing
+    free-text-capture Slack primitive covered this, so a modal +
+    view_submission is the new mechanism (see that function's docstring)."""
+    from src.services.relay import queue as relay_queue
+    from src.services.relay.slack_post import open_revise_modal
+
+    user_id = payload.get("user", {}).get("id", "")
+    item_id, _ = _relay_action_item_id(payload)
+    if not item_id:
+        raise HTTPException(status_code=400, detail="Invalid action data")
+
+    existing = relay_queue.get_item(item_id)
+    venture_key = existing.venture_key if existing is not None else DEFAULT_VENTURE_KEY
+    if not _relay_approver_authorized(user_id, venture_key):
+        return _slack_ephemeral("Not authorized to decide Relay sends.")
+    if existing is None or existing.status != "pending":
+        return _slack_ephemeral(f"Item #{item_id} is not open for revision.")
+
+    open_revise_modal(payload.get("trigger_id", ""), existing)
+    return {}
+
+
+def _is_material_edit(old_text: str, new_text: str) -> bool:
+    """Normalized-token-diff used to compute material_edit for a Slack
+    revision. record_revision() (src.services.relay.queue) only PERSISTS
+    whatever material_edit value it is given — its body is a plain UPDATE,
+    it does not compute one — so this is the computation, done once here
+    at the single caller rather than inside that shared helper.
+
+    A change is "material" when more than 15% of the union of the two
+    texts' lowercased word tokens differ (symmetric difference / union).
+    Threshold chosen to catch a rewritten sentence or changed number while
+    ignoring whitespace/punctuation-only edits.
+    """
+    import re as _re
+
+    def _tokens(text: str) -> set:
+        return set(_re.findall(r"\w+", (text or "").lower()))
+
+    old_tokens = _tokens(old_text)
+    new_tokens = _tokens(new_text)
+    union = old_tokens | new_tokens
+    if not union:
+        return False
+    diff = old_tokens.symmetric_difference(new_tokens)
+    return (len(diff) / len(union)) > 0.15
+
+
+def _post_relay_thread_note(item, text: str) -> None:
+    """Post a threaded reply under a Relay card without touching its
+    buttons — unlike _update_relay_slack_message (which replaces the whole
+    message and is reserved for a terminal decision), a revision must leave
+    Approve/Reject/Skip/Snooze/Revise live on the original card."""
+    from src.services.relay.slack_post import _resolve_bot_token, _resolve_channel
+
+    token = _resolve_bot_token(item, settings)
+    channel = _resolve_channel(item, settings)
+    if not token or not channel or not item.slack_message_ts:
+        return
+    try:
+        from slack_sdk import WebClient
+        WebClient(token=token.get_secret_value()).chat_postMessage(
+            channel=channel, thread_ts=item.slack_message_ts, text=text,
+        )
+    except Exception as exc:
+        logger.error("[RelayInteract] thread note post failed for item %d: %s", item.id, exc)
+
+
+def _handle_relay_revise_submission(payload: dict) -> dict:
+    """Slack Revise modal submission (WP-T2-2 item 9).
+
+    Computes material_edit (see _is_material_edit) and calls the existing
+    relay.queue.record_revision() helper with it. Posts the new content as
+    a thread reply under the original card rather than replacing the card,
+    since the item is still pending a decision.
+    """
+    from src.services.relay import queue as relay_queue
+
+    user_id = payload.get("user", {}).get("id", "")
+    view = payload.get("view", {})
+    try:
+        metadata = json.loads(view.get("private_metadata", "{}"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid view metadata")
+    item_id = metadata.get("item_id")
+    if not item_id:
+        raise HTTPException(status_code=400, detail="Invalid view metadata")
+
+    existing = relay_queue.get_item(item_id)
+    venture_key = existing.venture_key if existing is not None else DEFAULT_VENTURE_KEY
+    if not _relay_approver_authorized(user_id, venture_key):
+        return {"response_action": "errors", "errors": {"revised_content_block": "Not authorized."}}
+    if existing is None or existing.status != "pending":
+        return {"response_action": "errors", "errors": {"revised_content_block": "Item is no longer pending."}}
+
+    try:
+        new_content = (
+            view["state"]["values"]["revised_content_block"]["revised_content"]["value"] or ""
+        )
+    except Exception:
+        return {"response_action": "errors", "errors": {"revised_content_block": "Missing revised content."}}
+
+    # Baseline is ALWAYS the original draft, never the previous revision
+    # (WP-T2-2 review fix): comparing each edit only to its immediate
+    # predecessor lets a sequence of individually-small revisions add up to
+    # a large overall rewrite without ever crossing the material-edit
+    # threshold. material_edit is also sticky (OR'd with its current value)
+    # so a later small, non-material tweak can never un-flag an item a
+    # prior revision already made material -- this flag feeds the Tier B
+    # graduation edit-rate gate, where under-counting edits is the unsafe
+    # direction.
+    baseline = existing.original_draft or ""
+    material = bool(existing.material_edit) or _is_material_edit(baseline, new_content)
+
+    item = relay_queue.record_revision(
+        item_id, final_content=new_content, revised_by=f"slack:{user_id}", material_edit=material,
+    )
+    if item is None:
+        return {"response_action": "errors", "errors": {"revised_content_block": "Item is no longer pending."}}
+
+    _post_relay_thread_note(
+        item,
+        f":pencil2: Revised by <@{user_id}> (revision #{item.revision_count}"
+        f"{', material change' if material else ''}):\n{new_content[:2900]}",
+    )
+    # WP-T2-2 review fix: the original card's Approve button was posted with
+    # revision_count_at_post baked in from BEFORE this revision, so without
+    # refreshing it, the stale-card guard in _handle_relay_decision would
+    # refuse that button FOREVER after even one revision -- there would be
+    # no working Approve path left for this item via Slack. Rebuilding the
+    # card in place gives it fresh buttons whose baked-in revision_count
+    # matches the row this revision just produced.
+    from src.services.relay.slack_post import refresh_card_after_revision
+
+    if not refresh_card_after_revision(item):
+        return {"response_action": "errors", "errors": {
+            "revised_content_block": "Revision saved, but Slack could not refresh the approval card. Reopen Revise and submit again before approval."
+        }}
+    return {"response_action": "clear"}
+
+
+# ===========================================================================
+# FA MAX AGENT TASK DISPATCH (WP-T2-2 review fix)
+#
+# Manual, admin-JWT-gated producer for fa_max_work_queue(queue_name=
+# 'fa_max_agent') -- src.agents.fa_max.worker.FaMaxWorker has no other
+# production caller as of WP-T2-2 (see that module's docstring and
+# docs/PLATFORM-OPERATIONS-GUIDE.md's FA Max agent worker section). This
+# endpoint does NOT decide *when* Cora should act -- it is Josh (or another
+# admin) explicitly choosing to dispatch a bounded task, mirroring the
+# existing admin-upload precedent (POST /api/admin/upload/tax-delinquency)
+# for "a human action is today's real production trigger." An automatic
+# event-driven producer (which event, which graph node) is a separate,
+# not-yet-built work package's decision.
+# ===========================================================================
+
+class FaMaxAgentTaskRequest(BaseModel):
+    person_id: str
+    agent_name: str
+    steps: List[Dict[str, Any]] = Field(default_factory=list)
+    task_description: Optional[str] = None
+    context: Dict[str, Any] = Field(default_factory=dict)
+    idempotency_key: Optional[str] = None
+
+
+class FaMaxOpportunityFromSendRequest(BaseModel):
+    relay_item_id: int
+    opportunity_type: str
+
+
+class FaMaxOpportunityAdvanceRequest(BaseModel):
+    to_state: str = Field(min_length=1)
+    expected_version: int = Field(ge=0)
+    idempotency_key: str = Field(min_length=1)
+
+
+@router.post("/fa-max/opportunities/from-send")
+def create_fa_max_opportunity_from_send(
+    body: FaMaxOpportunityFromSendRequest,
+    _admin: dict = Depends(get_current_admin),
+):
+    """Record an opportunity from the specific sent Tier C interaction."""
+    from src.services.state_engine import create_opportunity_from_relay_send
+
+    if body.relay_item_id <= 0 or body.opportunity_type not in {
+        "acquisition", "rehab", "construction", "extension", "refinance",
+        "dscr_takeout", "repeat",
+    }:
+        raise HTTPException(status_code=400, detail="Invalid Relay item or opportunity type")
+    with get_db_context() as session:
+        try:
+            opportunity_id = create_opportunity_from_relay_send(
+                session=session, relay_item_id=body.relay_item_id,
+                opportunity_type=body.opportunity_type,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"opportunity_id": opportunity_id}
+
+
+@router.post("/fa-max/opportunities/{opportunity_id}/advance")
+def advance_fa_max_opportunity(
+    opportunity_id: str, body: FaMaxOpportunityAdvanceRequest,
+    _admin: dict = Depends(get_current_admin),
+):
+    """Advance one opportunity through configured stages with CAS and audit."""
+    from src.services.state_engine import (
+        get_opportunity_state, transition, TransitionOutcome,
+    )
+
+    if body.to_state == "funded":
+        raise HTTPException(status_code=400, detail="Use the funded endpoint")
+    with get_db_context() as session:
+        current = get_opportunity_state(session=session, opportunity_id=opportunity_id)
+        if not current:
+            raise HTTPException(status_code=404, detail="Opportunity not found")
+        if current["state_version"] != body.expected_version:
+            raise HTTPException(status_code=409, detail="Opportunity version changed")
+        result = transition(
+            session=session, entity_type="opportunity", entity_uuid=opportunity_id,
+            from_state=current["current_stage"], to_state=body.to_state,
+            actor="admin:fa_max_opportunity", source_component="src.api.admin_router",
+            idempotency_key=body.idempotency_key, state_version=body.expected_version,
+        )
+        if result.outcome not in (TransitionOutcome.succeeded, TransitionOutcome.idempotent_skip):
+            raise HTTPException(status_code=409, detail=f"Transition refused: {result.outcome.value}")
+    return {"opportunity_id": opportunity_id, "stage": result.current_state}
+
+
+@router.post("/fa-max/opportunities/{opportunity_id}/funded")
+def mark_fa_max_opportunity_funded(
+    opportunity_id: str,
+    _admin: dict = Depends(get_current_admin),
+):
+    """Record a verified closing -> funded event in the FA Max ledger."""
+    from src.services.state_engine import mark_opportunity_funded, TransitionOutcome
+
+    with get_db_context() as session:
+        result = mark_opportunity_funded(
+            session=session, opportunity_id=opportunity_id,
+            actor="admin:fa_max_funding", idempotency_key=f"funded:{opportunity_id}",
+        )
+        if result.outcome not in (TransitionOutcome.succeeded, TransitionOutcome.idempotent_skip):
+            raise HTTPException(status_code=409, detail=f"Funding transition refused: {result.outcome.value}")
+    return {"opportunity_id": opportunity_id, "outcome": "funded"}
+
+
+@router.post("/fa-max/agent-tasks")
+def create_fa_max_agent_task(
+    body: FaMaxAgentTaskRequest,
+    _admin: dict = Depends(get_current_admin),
+):
+    """Enqueue one bounded tool-call task for the FA Max agent worker.
+
+    Validates every step's tool name against FA_MAX_TOOL_REGISTRY before
+    enqueueing -- a typo'd tool name should fail this request with a 400,
+    not surface as an 'unknown_tool' error deep in the worker's audit log
+    after the item was already claimed.
+    """
+    from src.agents.fa_max.tool_registry import FA_MAX_TOOL_REGISTRY, select_task_tools
+    from src.agents.fa_max.worker import FA_MAX_QUEUE_NAME
+    from src.services.state_engine import enqueue_work_item
+
+    if bool(body.steps) == bool(body.task_description):
+        raise HTTPException(status_code=400, detail="Provide either steps or task_description")
+    if body.task_description:
+        try:
+            selected = select_task_tools(body.task_description, body.context)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if selected[0]["tool"] == "send" and body.context.get("agent_name") != body.agent_name:
+            raise HTTPException(status_code=400, detail="send agent_name must match task agent_name")
+    unknown_tools = sorted({
+        step.get("tool") for step in body.steps if step.get("tool") not in FA_MAX_TOOL_REGISTRY
+    })
+    if unknown_tools:
+        raise HTTPException(status_code=400, detail=f"Unknown tool name(s): {unknown_tools}")
+
+    with get_db_context() as session:
+        work_item_id = enqueue_work_item(
+            session=session,
+            queue_name=FA_MAX_QUEUE_NAME,
+            payload={"agent_name": body.agent_name, "steps": body.steps,
+                     "task_description": body.task_description, "context": body.context},
+            idempotency_key=body.idempotency_key,
+            person_id=body.person_id,
+        )
+        session.commit()
+
+    if work_item_id is None:
+        return {"ok": True, "work_item_id": None, "note": "idempotency_key already queued — no duplicate created"}
+    return {"ok": True, "work_item_id": work_item_id}
 
 
 # ===========================================================================

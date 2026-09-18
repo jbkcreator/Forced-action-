@@ -68,6 +68,59 @@ def require_consent(session: Session, *, person_id: str, channel: str) -> Consen
     return ConsentResult(True, "consent_granted")
 
 
+def autonomous_tier_context_verified(
+    session: Session, *, person_id: str, tier: str, thread_id: str | None,
+) -> bool:
+    """Verify an A/B auto-send against durable recipient context.
+
+    A prior interaction alone is insufficient: a later cold pitch to the
+    same person remains cold. Unverifiable replies and warm introductions
+    continue through human approval. Tier C is the conservative default.
+
+    thread_id is currently UNUSED for Tier A verification (WP-T2-2 review
+    fix) -- kept in the signature so call sites and a future WP-T2-6 (Reply
+    Agent as Portal Concierge, which owns inbound-reply-to-thread
+    correlation) do not need a signature change to use it once that
+    correlation actually exists. See the Tier A branch below for why.
+    """
+    if tier == "C":
+        return True
+    if tier == "A":
+        funded = session.execute(text(
+            "SELECT 1 FROM fa_max_opportunities WHERE person_id = CAST(:person_id AS uuid) "
+            "AND outcome = 'funded' LIMIT 1"
+        ), {"person_id": person_id}).scalar()
+        if funded:
+            return True
+        # WP-T2-2 review fix: the prior "any later inbound interaction for
+        # this person, after a sent item in this thread" heuristic did NOT
+        # actually tie the inbound interaction to the SAME thread --
+        # fa_max_interactions has no thread_id column at all, so the EXISTS
+        # subquery could only ever check "this person replied to something,
+        # at some point, in some conversation." A reply on an unrelated
+        # thread (or an unrelated later inbound touch from a different
+        # channel) would satisfy it and incorrectly authorize an autonomous
+        # send on THIS thread. There is currently no production path in
+        # this codebase that captures which thread an inbound reply
+        # belongs to -- that correlation is WP-T2-6's (Reply Agent as
+        # Portal Concierge) job, not this WP's. Rather than invent a
+        # thread_id column with no real writer behind it, this falls back
+        # to the review's own explicitly offered safe alternative: when the
+        # link cannot be proved, the send stays unverified for autonomous
+        # dispatch (auto_authorize is declined, and the item is queued for
+        # ordinary human Slack approval instead) -- a funded-borrower
+        # relationship is the only Tier A context this function can
+        # currently prove from durable data.
+        return False
+    if tier == "B":
+        active_partner = session.execute(text(
+            "SELECT 1 FROM fa_max_partners WHERE person_id = CAST(:person_id AS uuid) "
+            "AND status = 'active' LIMIT 1"
+        ), {"person_id": person_id}).scalar()
+        return bool(active_partner)
+    return False
+
+
 def suppression_reason(session: Session, *, recipient: str, channel: str) -> str | None:
     """First suppression gate, using the same stores as Relay's send gate."""
     campaign_reason = backflip_campaign_reason(session, recipient=recipient, channel=channel)

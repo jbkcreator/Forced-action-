@@ -885,6 +885,24 @@ class AppSettings(BaseSettings):
 		default=False, env="FA_MAX_SEND_BACKLOG_RELEASE_CONFIRMED"
 	)
 
+	# ── FA Max WP-T2-2 — Bounded Agent Runtime & Autonomous Dispatch ─────────
+	# Fail-closed gate on relay.queue.enqueue(auto_authorize=True). Mirrors
+	# fa_max_10dlc_registered's manual, defaults-closed pattern: even an agent
+	# that has graduated past its tier's send/edit-rate/funded-loan threshold
+	# (fa_max_autonomy.check_tier_gate) must NOT be dispatched autonomously
+	# until this flag is explicitly true. It exists because autonomous
+	# dispatch (no human Slack approval in the loop) is not yet covered by
+	# docs/constitutions/cora.md's drafts-only constitution -- see the
+	# proposed amendment at
+	# docs/constitutions/cora_autonomy_amendment_proposed.md, awaiting Josh's
+	# direct sign-off per that constitution's own amendment rule. Until this
+	# flag is flipped, the FA Max tool registry's send-gate check always
+	# falls back to the human-approval path (auto_authorize=False),
+	# regardless of tier graduation.
+	fa_max_autonomous_dispatch_confirmed: bool = Field(
+		default=False, env="FA_MAX_AUTONOMOUS_DISPATCH_CONFIRMED"
+	)
+
 
 @lru_cache
 def get_settings() -> AppSettings:

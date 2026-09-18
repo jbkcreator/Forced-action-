@@ -1,0 +1,23 @@
+[Unit]
+Description=Forced Action FA Max agent worker (bounded tool-call loop, WP-T2-2)
+After=network.target fa-api.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/Forced-action-
+Environment="PATH=/root/Forced-action-/.venv/bin"
+EnvironmentFile=/root/Forced-action-/.env
+ExecStart=/root/Forced-action-/.venv/bin/python -m src.agents.fa_max.worker
+Restart=always
+RestartSec=15
+StartLimitIntervalSec=120
+StartLimitBurst=5
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fa-max-agent-worker
+
+[Install]
+WantedBy=multi-user.target
