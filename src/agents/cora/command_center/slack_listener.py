@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 # The bot's own Slack user ID — messages from this user are skipped
 # to prevent the bot from replying to its own answers.
-_BOT_USER_ID = "U0BNFHF5STT"
+_BOT_USER_ID = "U0C2GT5CDGA"
 
 _WATERMARK_KEY_PREFIX = "cc:slack:watermark:"  # + channel_id
 _SEEN_KEY_PREFIX = "cc:slack:seen:"             # + message ts

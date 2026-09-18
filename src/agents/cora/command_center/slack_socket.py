@@ -22,7 +22,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-_BOT_USER_ID = "U0BNFHF5STT"
+_BOT_USER_ID = "U0C2GT5CDGA"
 _LISTEN_CHANNEL = None  # None = all channels the bot is in; set to filter
 
 
