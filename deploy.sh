@@ -20,6 +20,8 @@ CORA_UNIT_SRC="$PROJECT_DIR/deploy/systemd/cora.service"
 CORA_UNIT_DST="/etc/systemd/system/cora.service"
 THROUGHPUT_UNIT_SRC="$PROJECT_DIR/deploy/systemd/cora_throughput.service"
 THROUGHPUT_UNIT_DST="/etc/systemd/system/cora_throughput.service"
+CC_UNIT_SRC="$PROJECT_DIR/deploy/systemd/cora-command-center.service"
+CC_UNIT_DST="/etc/systemd/system/cora-command-center.service"
 
 cd "$PROJECT_DIR"
 
@@ -164,6 +166,16 @@ if ! cmp -s "$THROUGHPUT_UNIT_SRC" "$THROUGHPUT_UNIT_DST" 2>/dev/null; then
 fi
 systemctl enable cora_throughput || fail "systemctl enable cora_throughput"
 
+# Command Center — Slack Q&A worker over the properties DB, own unit file.
+if [ ! -f "$CC_UNIT_SRC" ]; then
+    fail "cora-command-center.service unit file not found at $CC_UNIT_SRC"
+fi
+if ! cmp -s "$CC_UNIT_SRC" "$CC_UNIT_DST" 2>/dev/null; then
+    cp "$CC_UNIT_SRC" "$CC_UNIT_DST" || fail "install cora-command-center.service"
+    systemctl daemon-reload || fail "systemctl daemon-reload (cora-command-center)"
+fi
+systemctl enable cora-command-center || fail "systemctl enable cora-command-center"
+
 systemctl restart fa-api || fail "systemctl restart fa-api"
 systemctl restart lifecycle || fail "systemctl restart lifecycle"
 systemctl restart cora || fail "systemctl restart cora"
@@ -177,6 +189,9 @@ systemctl is-active --quiet cora || fail "cora service not active after restart"
 systemctl restart cora_throughput || fail "systemctl restart cora_throughput"
 sleep 2
 systemctl is-active --quiet cora_throughput || fail "cora_throughput service not active after restart"
+systemctl restart cora-command-center || fail "systemctl restart cora-command-center"
+sleep 2
+systemctl is-active --quiet cora-command-center || fail "cora-command-center service not active after restart"
 
 RESTART_TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
