@@ -38,7 +38,10 @@ def parse_permit_detail(html: str) -> PermitDetail:
     result = PermitDetail()
 
     result.completion_status = _extract_record_status(soup)
-    result.project_description = _extract_section_text(soup, "Project Description:")
+    result.project_description = (
+        _extract_section_text(soup, "Project Description:")
+        or _extract_section_text(soup, "Description")
+    )
     result.work_location = _extract_work_location(soup)
     result.owner_name = _extract_owner_name(soup)
 
@@ -67,7 +70,10 @@ def parse_permit_detail(html: str) -> PermitDetail:
 # ---------------------------------------------------------------------------
 
 def _find_section_container(soup: BeautifulSoup, label: str) -> Optional[Tag]:
+    # Try exact match first, then without trailing colon (Pasco omits it)
     span = soup.find("span", string=label)
+    if not span and label.endswith(":"):
+        span = soup.find("span", string=label.rstrip(":"))
     if not span:
         return None
     return span.find_parent(["div", "td"])
@@ -111,48 +117,104 @@ def _extract_owner_name(soup: BeautifulSoup) -> Optional[str]:
     return _first_name_line(container, skip="Owner:")
 
 
-def _first_name_line(container: Tag, skip: str) -> Optional[str]:
-    """Extract the person/entity name from a section container.
+_STOP_LINE_RE = re.compile(
+    r"^(Phone|Mobile|Business|Home|Email|Fax|License|Certified|Registered"
+    r"|Contractor|Plumbing|Electric|Roofing|HVAC|Mechanical)",
+    re.IGNORECASE,
+)
+_STATE_CODES = {"AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA",
+                "KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ",
+                "NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT",
+                "VA","WA","WV","WI","WY"}
 
-    Strategy: after stripping the label, collect words until we hit a token that
-    looks like an address number, phone digit run, or email — all of which signal
-    the name portion has ended.
+
+def _first_name_line(container: Tag, skip: str) -> Optional[str]:
+    """Extract the person/entity name from an Accela section container.
+
+    Accela emits one word (or phrase) per <br/>-delimited line for name fields.
+    Strategy:
+    1. Replace <br/> → \\n, split into lines.
+    2. Skip the label line.
+    3. Accumulate word-tokens until a stop condition (phone label, address digit,
+       state code, email, license keyword) — max 4 tokens (First [MI] Last [Suffix]).
+    4. Join and return.
     """
-    text = container.get_text(" ", strip=True)
-    text = text.replace(skip, "").strip()
-    # Remove email tokens first (they can appear inline with name on LP section)
-    text = _EMAIL_RE.sub("", text).strip()
-    words = text.split()
-    name_words: list[str] = []
-    for word in words:
-        clean = word.rstrip("*,").strip()
-        if not clean:
+    for br in container.find_all("br"):
+        br.replace_with("\n")
+    raw = container.get_text("\n")
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+
+    # Build label variants to strip (with and without trailing colon)
+    skip_variants = [skip, skip.rstrip(":")]
+
+    name_tokens: list[str] = []
+    past_label = False
+
+    for ln in lines:
+        # Strip label occurrences (with or without colon)
+        cleaned = ln
+        for sv in skip_variants:
+            cleaned = re.sub(re.escape(sv), "", cleaned)
+        cleaned = cleaned.strip()
+        cleaned = _EMAIL_RE.sub("", cleaned).strip()
+        cleaned = cleaned.rstrip("*, ").strip()
+
+        if not cleaned:
             continue
-        # Stop at: standalone digit string (phone), address number (all digits), zip
-        digits_only = re.sub(r"\D", "", clean)
-        if len(digits_only) >= 7:  # phone or long number
+
+        if not past_label:
+            past_label = True
+            if not cleaned:
+                continue
+
+        # Stop conditions
+        if _STOP_LINE_RE.match(cleaned):
             break
-        if clean.isdigit() and len(clean) >= 4:  # address number or zip
+        if re.match(r"^\d{2,}", cleaned):  # address number
             break
-        # Stop at company separator on LP line (name/company)
-        if "/" in clean and name_words:
+        if cleaned.upper() in _STATE_CODES:
             break
-        name_words.append(clean)
-        # After accumulating a few words, stop at FL/state abbreviation (address start)
-        if len(name_words) >= 2 and clean in ("FL", "GA", "TX", "NC", "SC", "CA", "NY"):
-            name_words.pop()
+        digits = re.sub(r"\D", "", cleaned)
+        if digits and len(digits) >= len(cleaned) * 0.6:  # phone digits
             break
-    name = " ".join(name_words).strip().rstrip("*,").strip()
+        # Company separator: Hillsborough uses "COMPANY/PERSON" or "NAME/COMPANY"
+        # If we already have a name, a "/" line is the company — stop.
+        # If this is the first content line with "/", take the longer part as company
+        # and skip (the name was already the previous line or is inline above).
+        if "/" in cleaned:
+            if name_tokens:
+                break  # already have name; "/" line is COMPANY/PERSON — stop
+            # No name yet: Hillsborough format "COMPANY/PERSON" — name not usable here
+            break
+
+        # Multi-word line after first token = company name, not person name
+        if len(cleaned.split()) > 1 and name_tokens:
+            break
+
+        # Multi-word first content line (e.g., "KEVIN WELLS" from Hillsborough) = full name
+        name_tokens.append(cleaned)
+        if len(cleaned.split()) > 1:
+            break  # multi-word = complete name token, don't accumulate further
+
+        # Hard cap: 4 tokens (First MI Last Suffix) — stop accumulating
+        if len(name_tokens) == 4:
+            break
+
+    name = " ".join(name_tokens).strip().rstrip("*,").strip()
     return name if len(name) > 2 else None
 
 
 def _extract_phone(text: str) -> Optional[str]:
-    # Prefer Mobile Phone: number
-    m = re.search(r"Mobile Phone[:\s]+(\d[\d\s\-]{8,12}\d)", text, re.IGNORECASE)
+    # Prefer Mobile Phone: number (handles (XXX)XXX-XXXX and XXXXXXXXXX formats)
+    m = re.search(r"Mobile Phone[:\s]+([\d\(\)\s\-\.]{7,16})", text, re.IGNORECASE)
     if m:
         digits = re.sub(r"\D", "", m.group(1))
         if len(digits) >= 10:
             return digits[:10]
+    # Fallback: any 10-digit run or (XXX)XXX-XXXX pattern
+    m = re.search(r"\((\d{3})\)\s*(\d{3})[-\s]?(\d{4})", text)
+    if m:
+        return m.group(1) + m.group(2) + m.group(3)
     m = re.search(r"\b(\d{10})\b", text)
     if m:
         return m.group(1)
