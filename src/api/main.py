@@ -4,6 +4,7 @@ Forced Action — FastAPI application.
 Endpoints:
     GET  /health                   — Health check (UptimeRobot / load balancer)
     POST /webhooks/stripe          — Stripe event receiver
+    POST /webhooks/portal-stall   — FA Max portal-stall trigger (WP-T2-4)
     GET  /api/founding-spots       — Founding countdown for landing page
     GET  /api/zip-check            — ZIP availability checker for landing page
     POST /api/checkout             — Create Stripe checkout session
@@ -6617,6 +6618,21 @@ def leaderboard_endpoint(
         public_boards.append({**b, "leaderboard": rows})
 
     return {"as_of": snap.get("as_of"), "leaderboards": public_boards}
+
+
+# ── FA Max WP-T2-4: Portal Concierge webhook ─────────────────────────────────
+
+@app.post("/webhooks/portal-stall", status_code=200, include_in_schema=False)
+async def portal_stall_webhook(request: Request, db: Session = Depends(get_db)):
+    """
+    Backflip calls this when a borrower starts the pre-qual flow and does not
+    complete within the stall threshold. Routes to the concierge or publishes
+    a portal.stall event for the Abandonment Agent.
+    """
+    from src.agents.reply_concierge.portal_stall import PortalStallPayload, handle_portal_stall
+    body = await request.json()
+    payload = PortalStallPayload(**body)
+    return handle_portal_stall(payload, db)
 
 
 # ── Phase 2B: NWS weather alert webhook ───────────────────────────────────────
