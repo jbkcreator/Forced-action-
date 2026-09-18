@@ -23,7 +23,6 @@ import time
 from pathlib import Path
 from typing import Optional
 
-import httpx
 from sqlalchemy import create_engine, text
 
 # Make sure project root is on path when invoked as __main__
@@ -63,15 +62,14 @@ def _pasco_detail_url(permit_number: str) -> Optional[str]:
     return build_detail_url("PASCO", parts[0], parts[1], parts[2])
 
 
-def _fetch_html_httpx(url: str, timeout: float = 30.0) -> Optional[str]:
+def _fetch_html_http(url: str) -> Optional[str]:
     """Plain HTTP GET for counties where capIDs are known (Pasco)."""
+    from src.utils.http_helpers import requests_get_with_retry
     try:
-        with httpx.Client(headers={"User-Agent": _UA}, follow_redirects=True, timeout=timeout) as client:
-            r = client.get(url)
-            r.raise_for_status()
-            return r.text
+        resp = requests_get_with_retry(url, headers={"User-Agent": _UA})
+        return resp.text
     except Exception as exc:
-        logger.warning("httpx GET failed for %s: %s", url, exc)
+        logger.warning("HTTP GET failed for %s: %s", url, exc)
         return None
 
 
@@ -200,6 +198,7 @@ def _playwright_fetch_html(permit_number: str, county_id: str) -> Optional[str]:
 # --- DB persistence -----------------------------------------------------------
 
 def _update_permit(conn, permit_id: int, detail: PermitDetail) -> None:
+    from src.services.phone_utils import normalize as normalize_phone
     conn.execute(
         text("""
             UPDATE building_permits SET
@@ -220,7 +219,7 @@ def _update_permit(conn, permit_id: int, detail: PermitDetail) -> None:
             "completion_status": detail.completion_status,
             "contractor_license": detail.contractor_license,
             "contractor_license_type": detail.contractor_license_type,
-            "contractor_phone": detail.contractor_phone,
+            "contractor_phone": normalize_phone(detail.contractor_phone) if detail.contractor_phone else None,
             "contractor_email": detail.contractor_email,
             "applicant_name": detail.applicant_name,
             "owner_name": detail.owner_name,
@@ -268,7 +267,7 @@ def run_sweep(
         if county_id == "pasco":
             url = _pasco_detail_url(permit_number)
             if url:
-                html = _fetch_html_httpx(url)
+                html = _fetch_html_http(url)
             else:
                 logger.warning("Pasco: cannot derive URL for permit %s", permit_number)
                 stats["skipped"] += 1
@@ -298,9 +297,8 @@ def run_sweep(
                 _update_permit(conn, permit_id, detail)
             stats["enriched"] += 1
             logger.info(
-                "Enriched %s (%s): contractor=%r license=%r",
-                permit_number, county_id,
-                detail.licensed_professional_name, detail.contractor_license,
+                "Enriched %s (%s): license=%r",
+                permit_number, county_id, detail.contractor_license,
             )
         except Exception as exc:
             logger.error("DB update failed for %s: %s", permit_number, exc)
