@@ -434,12 +434,14 @@ def call_claude_streaming(
     # never sees the streaming context manager (it mistakes it for a generator node).
     import threading as _threading
 
+    _STREAM_TIMEOUT_S = 90  # hard ceiling per streaming call
+
     _result: list = []
     _exc: list = []
 
     def _stream_worker():
         try:
-            with client.messages.stream(**kwargs) as stream:
+            with client.messages.stream(timeout=_STREAM_TIMEOUT_S, **kwargs) as stream:
                 if on_text_chunk is not None:
                     for text_delta in stream.text_stream:
                         try:
@@ -452,7 +454,10 @@ def call_claude_streaming(
 
     t = _threading.Thread(target=_stream_worker, daemon=True)
     t.start()
-    t.join()
+    t.join(timeout=_STREAM_TIMEOUT_S + 5)
+
+    if t.is_alive():
+        _exc.append(TimeoutError(f"Claude streaming call exceeded {_STREAM_TIMEOUT_S}s timeout"))
 
     if _exc:
         # Streaming failed — fall back to a regular blocking call.

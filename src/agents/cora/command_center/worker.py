@@ -19,6 +19,7 @@ import logging
 import os
 import signal
 import socket
+import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -33,7 +34,7 @@ CC_DLQ_KEY = "cc:dlq"
 CC_LOCK_PREFIX = "cc_lock:"
 CC_LOCK_TTL = 120
 MAX_DELIVERIES = 3
-CLAIM_MIN_IDLE_MS = 90_000
+CLAIM_MIN_IDLE_MS = 150_000   # must exceed CC_LOCK_TTL (120s) to avoid reclaiming still-locked messages
 CLAIM_SWEEP_EVERY_N = 12
 
 
@@ -97,7 +98,6 @@ def _consumer_name() -> str:
 def _read_batch(consumer_name: str, count: int = 1, block_ms: int = 1000) -> List[Dict[str, Any]]:
     if not redis_available():
         return []
-    ensure_group()
     result = get_redis().xreadgroup(
         CC_GROUP_NAME, consumer_name, {CC_STREAM_KEY: ">"}, count=count, block=block_ms
     )
@@ -144,7 +144,13 @@ def _claim_stale(consumer_name: str) -> List[Dict[str, Any]]:
         if entry.get("time_since_delivered", 0) < CLAIM_MIN_IDLE_MS:
             continue
         if entry.get("times_delivered", 1) >= MAX_DELIVERIES:
-            _dead_letter(entry["message_id"], {}, "max_deliveries_exceeded")
+            # Fetch the message payload before dead-lettering so the DLQ entry is useful.
+            try:
+                fetched = get_redis().xrange(CC_STREAM_KEY, entry["message_id"], entry["message_id"], count=1)
+                dl_fields = dict(fetched[0][1]) if fetched else {}
+            except Exception:
+                dl_fields = {}
+            _dead_letter(entry["message_id"], dl_fields, "max_deliveries_exceeded")
             continue
         to_claim.append(entry["message_id"])
 
@@ -224,7 +230,7 @@ class CommandCenterWorker:
 
         if not session_id:
             logger.warning("cc.worker: message_id=%s has no session_id — dead-lettering", message_id)
-            _dead_letter(message_id, {}, "missing_session_id")
+            _dead_letter(message_id, message.get("payload", {}), "missing_session_id")
             return
 
         if not _acquire_session_lock(session_id, owner=self.consumer_name):
@@ -279,6 +285,22 @@ class CommandCenterWorker:
                 logger.warning("cc.worker: placeholder post failed: %s — will post fresh on emit", exc)
         payload["placeholder_ts"] = placeholder_ts
 
+        # Heartbeat thread: refresh the session lock TTL every CC_LOCK_TTL//2 seconds
+        # so a long-running graph cannot lose the lock mid-execution.
+        _hb_stop = threading.Event()
+
+        def _heartbeat() -> None:
+            key = f"{CC_LOCK_PREFIX}{session_id}"
+            while not _hb_stop.wait(CC_LOCK_TTL // 2):
+                try:
+                    if redis_available():
+                        get_redis().expire(key, CC_LOCK_TTL)
+                except Exception:
+                    pass
+
+        _hb_thread = threading.Thread(target=_heartbeat, daemon=True, name=f"cc-lock-hb-{session_id[:8]}")
+        _hb_thread.start()
+
         try:
             from src.agents.cora.command_center.graph import run_command_center
             from src.core.database import get_db_context
@@ -306,8 +328,11 @@ class CommandCenterWorker:
                 "cc.worker: run_command_center raised for session=%s message_id=%s",
                 session_id, message_id,
             )
+            _hb_stop.set()
             _release_session_lock(session_id, self.consumer_name)
             return
+        finally:
+            _hb_stop.set()
 
         _release_session_lock(session_id, self.consumer_name)
         _ack(message_id)

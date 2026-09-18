@@ -21,6 +21,9 @@ import re
 import time
 from typing import Any, Dict, List
 
+import sqlglot
+import sqlglot.expressions as exp
+
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -74,12 +77,24 @@ _DANGEROUS_FUNCS: re.Pattern = re.compile(
     re.IGNORECASE,
 )
 
-_FROM_JOIN_RE: re.Pattern = re.compile(
-    r'\b(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_]*)',
-    re.IGNORECASE,
-)
-
 _LIMIT_RE: re.Pattern = re.compile(r'\bLIMIT\s+\d+', re.IGNORECASE)
+
+
+def _extract_tables(sql: str) -> set[str]:
+    """
+    Parse sql with sqlglot and return the set of referenced table names,
+    lower-cased and unquoted.  Raises ValueError on parse failure or if
+    the query contains a double-quote character (quoted identifiers are
+    rejected before parsing as a belt-and-suspenders guard against
+    allowlist bypass via quoting).
+    """
+    if '"' in sql:
+        raise ValueError("Quoted identifiers are not permitted in queries.")
+    try:
+        tree = sqlglot.parse_one(sql, dialect="postgres")
+    except sqlglot.errors.ParseError as exc:
+        raise ValueError(f"SQL parse error: {exc}") from exc
+    return {node.name.lower() for node in tree.find_all(exp.Table) if node.name}
 
 
 def _strip_comments(sql: str) -> str:
@@ -121,8 +136,9 @@ def validate_sql(sql: str) -> str:
     if _DANGEROUS_FUNCS.search(cleaned):
         raise ValueError("Disallowed server-side function detected.")
 
-    # Table allowlist — all tables referenced in FROM/JOIN must be permitted.
-    referenced = {m.group(1).lower() for m in _FROM_JOIN_RE.finditer(cleaned)}
+    # Table allowlist — parse the AST to extract all referenced table names,
+    # rejecting quoted identifiers and anything outside ALLOWED_TABLES.
+    referenced = _extract_tables(cleaned)
     disallowed = referenced - ALLOWED_TABLES
     if disallowed:
         raise ValueError(

@@ -226,11 +226,11 @@ def _check_program(
                 f"minimum is {min_exp}"
             )
 
-    if uncertain:
-        return EligibilityResult(status="uncertain", uncertain_flags=list(set(uncertain)))
-
     if failures:
         return EligibilityResult(status="out_of_box", fail_reasons=failures)
+
+    if uncertain:
+        return EligibilityResult(status="uncertain", uncertain_flags=list(set(uncertain)))
 
     return EligibilityResult(
         status="in_box",

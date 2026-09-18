@@ -84,17 +84,17 @@ def _save_watermark(channel: str, ts: str) -> None:
 # ── Seen-cache ────────────────────────────────────────────────────────────────
 
 def _already_seen(ts: str) -> bool:
+    """
+    Atomically claim this ts as seen. Returns True if already seen by another
+    caller, False if this call is the first (and has now claimed it).
+    Uses SET NX so concurrent pollers can't both see the same message as new.
+    """
     from src.core.redis_client import get_redis, redis_available
     if not redis_available():
         return False
-    return bool(get_redis().exists(f"{_SEEN_KEY_PREFIX}{ts}"))
-
-
-def _mark_seen(ts: str) -> None:
-    from src.core.redis_client import get_redis, redis_available
-    if not redis_available():
-        return
-    get_redis().set(f"{_SEEN_KEY_PREFIX}{ts}", "1", ex=_SEEN_TTL_SECONDS)
+    # SET NX returns True when the key was newly created (this caller is first).
+    is_new = get_redis().set(f"{_SEEN_KEY_PREFIX}{ts}", "1", nx=True, ex=_SEEN_TTL_SECONDS)
+    return not bool(is_new)
 
 
 # ── Core poll ─────────────────────────────────────────────────────────────────
@@ -162,7 +162,6 @@ def poll_once(channel: Optional[str] = None) -> int:
         )
 
         if mid is not None:
-            _mark_seen(ts)
             published += 1
             logger.info(
                 "cc.slack_listener: published query session=%s user=%s ts=%s text=%r",

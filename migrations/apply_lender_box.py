@@ -89,7 +89,7 @@ CREATE TABLE IF NOT EXISTS lender_box_geographies (
     is_excluded BOOLEAN     NOT NULL DEFAULT false,
 
     CONSTRAINT uq_lender_box_geographies_program_state_county
-        UNIQUE (program_key, state, county)
+        UNIQUE NULLS NOT DISTINCT (program_key, state, county)
 )
 """
 

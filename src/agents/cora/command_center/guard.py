@@ -80,6 +80,13 @@ _INJECTION_PATTERNS: re.Pattern = re.compile(
     re.IGNORECASE,
 )
 
+_PRICING_PATTERNS: re.Pattern = re.compile(
+    r'\b(interest\s+rate|apr|annual\s+percentage\s+rate|origination\s+fee|'
+    r'loan\s+term|rate\s+sheet|points?\s+(on|charged)|lender\s+fee|'
+    r'closing\s+cost|prepayment\s+penalty|draw\s+fee|extension\s+fee)\b',
+    re.IGNORECASE,
+)
+
 # ── Phase 2 ───────────────────────────────────────────────────────────────────
 
 _GUARD_SYSTEM = (
@@ -149,7 +156,7 @@ _BLOCK_MESSAGES: Dict[str, str] = {
 }
 
 
-def run_guard(question: str, db: Optional[Session], history: Optional[list] = None) -> Dict[str, Any]:
+def run_guard(question: str, db: Optional[Session], history: Optional[list] = None, session_id: Optional[str] = None) -> Dict[str, Any]:
     """
     Returns {"blocked": bool, "block_reason": str | None, "intent": str | None}.
 
@@ -195,6 +202,13 @@ def run_guard(question: str, db: Optional[Session], history: Optional[list] = No
             "block_message": _BLOCK_MESSAGES["borrower_financial"],
             "intent": "borrower_financial",
         }
+    if _PRICING_PATTERNS.search(question):
+        return {
+            "blocked": True,
+            "block_reason": "pricing_question",
+            "block_message": _BLOCK_MESSAGES["pricing_question"],
+            "intent": "pricing_question",
+        }
     if _INJECTION_PATTERNS.search(question):
         return {
             "blocked": True,
@@ -208,7 +222,8 @@ def run_guard(question: str, db: Optional[Session], history: Optional[list] = No
     # that slipped past Phase 1) shouldn't pay for a second Haiku call.
     import hashlib as _hashlib
     _norm_q = re.sub(r"\s+", " ", question.strip().lower())
-    _cache_key = f"cc:guard_intent:{_hashlib.md5(_norm_q.encode()).hexdigest()}"
+    _session_scope = session_id or "global"
+    _cache_key = f"cc:guard_intent:{_session_scope}:{_hashlib.md5(_norm_q.encode()).hexdigest()}"
     _cached_intent: Optional[str] = None
     try:
         from src.core.redis_client import get_redis, redis_available
@@ -252,8 +267,14 @@ def run_guard(question: str, db: Optional[Session], history: Optional[list] = No
                 tool_choice={"type": "tool", "name": "classify_intent"},
             )
         except Exception as exc:
-            logger.warning("guard.classify: Claude call failed (%s) — defaulting to pass", exc)
-            return {"blocked": False, "block_reason": None, "intent": "valid_pipeline_query"}
+            logger.error("guard.classify: Claude call failed (%s) — blocking request (fail-closed)", exc)
+            return {
+                "blocked": True,
+                "block_reason": "classifier_unavailable",
+                "block_message": "I'm having trouble processing that right now. Please try again in a moment.",
+                "intent": "unknown",
+                "cost_usd": 0.0,
+            }
 
         tool_input = result.get("tool_input") or {}
         intent = tool_input.get("intent", "valid_pipeline_query")
@@ -300,7 +321,7 @@ def _make_node_guard():
         if len(question) > 2000:
             question = question[:2000]
 
-        outcome = run_guard(question, db, history=state.get("messages", []))
+        outcome = run_guard(question, db, history=state.get("messages", []), session_id=state.get("session_id"))
 
         if outcome["blocked"]:
             return {

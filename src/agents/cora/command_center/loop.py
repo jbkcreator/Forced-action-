@@ -47,28 +47,28 @@ def _normalize(question: str) -> str:
     return re.sub(r"\s+", " ", question.strip().lower())
 
 
-def _cache_key(question: str) -> str:
+def _cache_key(session_id: str, question: str) -> str:
     h = hashlib.md5(_normalize(question).encode()).hexdigest()
-    return f"cc:answer_cache:{h}"
+    return f"cc:answer_cache:{session_id}:{h}"
 
 
-def _get_cached(question: str) -> Optional[str]:
+def _get_cached(session_id: str, question: str) -> Optional[str]:
     try:
         from src.core.redis_client import get_redis, redis_available
         if not redis_available():
             return None
-        val = get_redis().get(_cache_key(question))
+        val = get_redis().get(_cache_key(session_id, question))
         return val if val else None
     except Exception:
         return None
 
 
-def _set_cached(question: str, answer: str) -> None:
+def _set_cached(session_id: str, question: str, answer: str) -> None:
     try:
         from src.core.redis_client import get_redis, redis_available
         if not redis_available():
             return
-        get_redis().set(_cache_key(question), answer, ex=_CACHE_TTL)
+        get_redis().set(_cache_key(session_id, question), answer, ex=_CACHE_TTL)
     except Exception:
         pass
 
@@ -174,11 +174,16 @@ def _make_node_loop():
         messages.append({"role": "user", "content": question})
         turn_number += 1
 
-        # Cache check — question-keyed, 90s TTL. Stateless questions (lender box,
-        # scoreboard snapshots) hit regardless of which turn they appear on.
-        cached = _get_cached(question)
+        # Cache check — scoped per session, 90s TTL.
+        cached = _get_cached(session_id, question)
         if cached:
             logger.info("loop.cache: hit for session=%s question=%r", session_id, question[:60])
+            if db is not None:
+                try:
+                    store.append_message(db, session_id, turn_number=turn_number - 1, role="user", content=question)
+                    store.append_message(db, session_id, turn_number=turn_number, role="assistant", content=cached)
+                except Exception as exc:
+                    logger.warning("loop: failed to persist cache-hit turn: %s", exc)
             return {
                 "messages": messages,
                 "history_length": history_length,
@@ -332,7 +337,7 @@ def _make_node_loop():
 
         # Cache answer so repeated identical questions skip the LLM entirely.
         if answer:
-            _set_cached(question, answer)
+            _set_cached(session_id, question, answer)
 
         # Persist new message turns to DB (only turns added this request).
         if db is not None:
