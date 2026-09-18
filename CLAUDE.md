@@ -37,6 +37,14 @@ PYTHONPATH=. python migrations/apply_fa_max_wp2_queues.py   # FA Max WP-2 queue 
 PYTHONPATH=. python migrations/apply_fa_max_wp5b_profile.py  # FA Max WP-5B borrower buy-box/velocity/next-need profile table (idempotent, run after WP-1)
 PYTHONPATH=. python migrations/apply_fa_max_exceptions_alert_queue.py  # FA Max WP-T2-1 durable EXCEPTIONS alert retry queue (idempotent)
 PYTHONPATH=. python migrations/apply_fa_max_venture_footer_fields.py  # FA Max WP-T2-1 venture footer phone/disclaimer + Josh's confirmed fa_max_lending footer text (idempotent)
+PYTHONPATH=. python migrations/apply_fa_max_wp_t2_2_agent_infra.py  # FA Max WP-T2-2: interaction/opportunity attribution, relay Snooze/Revise columns, fa_max_tool_call_log (idempotent)
+PYTHONPATH=. python migrations/apply_fa_max_wp_t2_2_opportunity_origin_immutable.py  # FA Max WP-T2-2 review fix: DB trigger enforcing fa_max_opportunities.origin_interaction_id write-once (idempotent, run after apply_fa_max_wp_t2_2_agent_infra.py)
+
+# FA Max agent worker (separate process, WP-T2-2 — see docs/PLATFORM-OPERATIONS-GUIDE.md)
+python -m src.agents.fa_max.worker
+
+# FA Max weekly edit-rate report (Friday cron, WP-T2-2)
+python -m src.tasks.fa_max_weekly_edit_rate_report
 
 # Tests
 pytest tests/                                  # default (excludes scenario)

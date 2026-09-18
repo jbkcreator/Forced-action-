@@ -571,6 +571,26 @@ Run exactly one Socket Mode listener for the FA Max Slack app. If another
 workflow must share that app, use one dispatcher that routes every action;
 Slack can deliver a payload to any active listener connection.
 
+### FA Max agent worker (WP-T2-2)
+Consumes `fa_max_work_queue` items with `queue_name='fa_max_agent'` and runs
+Cora's bounded tool-call loop (`src/agents/fa_max/agent_graph.py`). Separate
+process from the API and from the Relay Slack listener above — a crash here
+only stalls claimed work items until their lease expires
+(`reclaim_expired_work_items`), it does not affect approvals or sends.
+
+```bash
+cp deploy/systemd/fa-max-agent-worker.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now fa-max-agent-worker
+```
+
+As of WP-T2-2, no production event source enqueues `fa_max_agent` work items
+yet — an operator dispatches tasks manually via
+`POST /api/admin/fa-max/agent-tasks` (admin JWT; see admin_router.py). The
+worker and this endpoint exist so a human-triggered task has somewhere real
+to run; an automatic trigger (which event should hand Cora a task, and when)
+is a separate, not-yet-built work package's decision, not invented here.
+
 Grant `channels:history` (and `groups:history` for a private queue) so the
 FA Max retry worker can reconcile a card accepted by Slack before a local
 crash. Run `python -m src.services.relay --post-pending-fa-max` every five

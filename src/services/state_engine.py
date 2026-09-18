@@ -874,6 +874,7 @@ def write_interaction(
     approved_bool: Optional[bool] = None,
     autonomy_tier_at_time: Optional[str] = None,
     body_redacted: Optional[str] = None,
+    agent_name: Optional[str] = None,
 ) -> str:
     """Append a single interaction record. Write-once — never use this to
     update or replace an existing interaction.
@@ -883,15 +884,21 @@ def write_interaction(
     Compliance: no body/PII content stored. body_redacted is for content-free
     summaries only (e.g., 'initial outreach email'). No rate/term/commitment
     content may appear in body_redacted.
+
+    agent_name (WP-T2-2): which agent authored/drove this interaction.
+    Nullable — omit for interactions with no single owning agent (e.g.
+    human Slack decisions). autonomy_tier_at_time remains the traffic-
+    direction/evidence value; agent_name pairs with it for the (agent_name,
+    autonomy_tier_at_time) evidence scoping in fa_max_autonomy.py.
     """
     row = session.execute(
         text("""
             INSERT INTO fa_max_interactions
                 (person_id, channel, direction, actor,
-                 approved_bool, autonomy_tier_at_time, body_redacted, occurred_at)
+                 approved_bool, autonomy_tier_at_time, body_redacted, agent_name, occurred_at)
             VALUES
                 (:person_id ::uuid, :channel, :direction, :actor,
-                 :approved_bool, :autonomy_tier_at_time, :body_redacted, NOW())
+                 :approved_bool, :autonomy_tier_at_time, :body_redacted, :agent_name, NOW())
             RETURNING interaction_id::text
         """),
         {
@@ -902,6 +909,7 @@ def write_interaction(
             "approved_bool": approved_bool,
             "autonomy_tier_at_time": autonomy_tier_at_time,
             "body_redacted": body_redacted,
+            "agent_name": agent_name,
         },
     ).fetchone()
 
@@ -920,6 +928,88 @@ def write_interaction(
         )
 
     return row.interaction_id  # type: ignore[union-attr]
+
+
+# ---------------------------------------------------------------------------
+# Opportunity writer (WP-T2-2: single write path for fa_max_opportunities,
+# mirroring write_interaction()'s own "one INSERT function, never touched
+# directly elsewhere" convention).
+# ---------------------------------------------------------------------------
+
+def create_fa_max_opportunity(
+    *,
+    session: Session,
+    person_id: str,
+    opportunity_type: str,
+    source: str,
+    source_reference: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+    origin_interaction_id: Optional[str] = None,
+    assigned_to: Optional[str] = None,
+) -> str:
+    """Create one fa_max_opportunities row. This is the ONLY function that
+    may INSERT into fa_max_opportunities — nothing else in this codebase
+    does today (confirmed by a repo-wide search at WP-T2-2 review time: no
+    caller of this table's origination existed before this function).
+
+    origin_interaction_id (WP-T2-2): write-once causal attribution to the
+    fa_max_interactions row that triggered this opportunity, consumed by
+    fa_max_autonomy.get_funded_loan_count() for the Tier C graduation gate.
+    Passed here, at creation, and NEVER updated afterward — this function
+    provides no update path for the column at all (nor does any other
+    function in this module), and the accompanying migration
+    (apply_fa_max_wp_t2_2_opportunity_origin_immutable.py) adds a database
+    trigger that rejects any UPDATE changing an already-non-NULL
+    origin_interaction_id, so the write-once rule holds even against a
+    future caller that bypasses this function. NULL is valid (an
+    opportunity with no attributable originating interaction — e.g. a
+    borrower who called in cold) and correctly counts as zero funded-loan
+    evidence for every agent/tier.
+
+    What actually triggers FA Max opportunity creation in production — which
+    event, which graph node calls this — is NOT part of WP-T2-2's scope and
+    is not decided here; no such caller exists in this codebase yet (see
+    WP-T2-2's own PR notes). This function exists so that whichever
+    downstream work package builds that trigger logic has the single,
+    correct write path to call, consistent with this module's "single write
+    path" invariant, rather than each future caller inventing its own INSERT.
+    """
+    row = session.execute(
+        text("""
+            INSERT INTO fa_max_opportunities
+                (person_id, opportunity_type, source, source_reference,
+                 idempotency_key, origin_interaction_id, assigned_to)
+            VALUES
+                (:person_id ::uuid, :opportunity_type, :source, :source_reference,
+                 :idempotency_key, :origin_interaction_id ::uuid, :assigned_to)
+            ON CONFLICT (idempotency_key)
+                WHERE idempotency_key IS NOT NULL
+                DO NOTHING
+            RETURNING opportunity_id::text
+        """),
+        {
+            "person_id": person_id,
+            "opportunity_type": opportunity_type,
+            "source": source,
+            "source_reference": source_reference,
+            "idempotency_key": idempotency_key,
+            "origin_interaction_id": origin_interaction_id,
+            "assigned_to": assigned_to,
+        },
+    ).fetchone()
+    if row is None:
+        # Idempotent retry on the same key — return the existing row's id.
+        existing = session.execute(
+            text("SELECT opportunity_id::text FROM fa_max_opportunities WHERE idempotency_key = :key"),
+            {"key": idempotency_key},
+        ).fetchone()
+        if existing is None:
+            raise RuntimeError(
+                f"create_fa_max_opportunity: idempotency_key {idempotency_key!r} conflicted "
+                "but no existing row was found — this should be impossible"
+            )
+        return existing.opportunity_id  # type: ignore[union-attr]
+    return row.opportunity_id  # type: ignore[union-attr]
 
 
 # ---------------------------------------------------------------------------

@@ -98,8 +98,16 @@ def post_for_approval(item: QueueItem) -> None:
         )
         return
 
-    approve_value = json.dumps({"item_id": item.id, "action": "approve"})
+    # revision_count_at_post lets the approve handler detect a stale card —
+    # a Revise submitted after this card was posted must not be silently
+    # approved as if it were the content shown here (WP-T2-2 item 9).
+    approve_value = json.dumps({
+        "item_id": item.id, "action": "approve", "revision_count_at_post": item.revision_count,
+    })
     reject_value = json.dumps({"item_id": item.id, "action": "reject"})
+    skip_value = json.dumps({"item_id": item.id, "action": "skip"})
+    snooze_value = json.dumps({"item_id": item.id, "action": "snooze"})
+    revise_value = json.dumps({"item_id": item.id, "action": "revise"})
 
     lease_until = None
     if item.venture_key == _FA_MAX_VENTURE:
@@ -153,6 +161,24 @@ def post_for_approval(item: QueueItem) -> None:
                             "action_id": "reject",
                             "value": reject_value,
                         },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Skip"},
+                            "action_id": "fa_max_skip",
+                            "value": skip_value,
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Snooze"},
+                            "action_id": "fa_max_snooze",
+                            "value": snooze_value,
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Revise"},
+                            "action_id": "fa_max_revise",
+                            "value": revise_value,
+                        },
                     ],
                 },
             ],
@@ -163,6 +189,59 @@ def post_for_approval(item: QueueItem) -> None:
     finally:
         if lease_until is not None:
             queue.release_slack_post(item.id, lease_until)
+
+
+def _build_revise_modal(item: QueueItem) -> dict:
+    """Modal for the Slack Revise button (WP-T2-2 item 9).
+
+    No existing free-text-capture Slack primitive was found in this repo
+    (batch_slack.open_draft_modal is read-only — it has no input block and
+    no view_submission handler). This is a new, minimal one: a single
+    multiline text input pre-filled with the current content
+    (final_content if this item has already been revised once, else
+    original_draft), submitted back as a view_submission carrying item_id
+    in private_metadata.
+    """
+    prefill = (item.final_content or item.original_draft or "")[:3000]
+    return {
+        "type": "modal",
+        "callback_id": "fa_max_revise_submit",
+        "private_metadata": json.dumps({"item_id": item.id}),
+        "title": {"type": "plain_text", "text": f"Revise #{item.id}"[:24]},
+        "submit": {"type": "plain_text", "text": "Save revision"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "input",
+                "block_id": "revised_content_block",
+                "label": {"type": "plain_text", "text": "Revised content"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "revised_content",
+                    "multiline": True,
+                    "initial_value": prefill,
+                },
+            },
+        ],
+    }
+
+
+def open_revise_modal(trigger_id: str, item: QueueItem) -> bool:
+    """Open the Revise modal for a pending item. Returns True on success."""
+    settings = get_settings()
+    token = _resolve_bot_token(item, settings)
+    if not token or not trigger_id:
+        logger.info("[Relay] cannot open revise modal for item %d — no token or trigger_id", item.id)
+        return False
+    try:
+        from slack_sdk import WebClient
+        WebClient(token=token.get_secret_value()).views_open(
+            trigger_id=trigger_id, view=_build_revise_modal(item),
+        )
+        return True
+    except Exception as exc:
+        logger.error("[Relay] views.open failed for revise item %d: %s", item.id, exc, exc_info=True)
+        return False
 
 
 def post_unposted_fa_max_cards(*, limit: int = 50) -> int:

@@ -1,0 +1,252 @@
+"""
+FA Max agent graph — a bounded tool-call loop over one claimed
+fa_max_work_queue item (WP-T2-2).
+
+Deterministic step consumption, not free-form LLM tool selection: a claimed
+work item's payload carries an ordered ``steps`` list
+(``[{"tool": <name>, "args": {...}}, ...]``), built by whatever enqueued the
+work item (a graph, a task, an operator script). This mirrors the rest of
+this codebase's own convention for agent routing — src.agents.cora.main_graph
+routes on a plain dict lookup with the docstring "no LLM"; this loop is the
+same idea applied to a sequence of tool calls instead of a single event
+route. The loop node repeatedly:
+
+    pick next step -> look up tool in FA_MAX_TOOL_REGISTRY -> call it
+        -> log via fa_max_tool_log.log_tool_call() -> append result
+    until steps are exhausted, a tool call fails/blocks, or
+    config.agents.AgentsSettings.fa_max_agent_max_tool_calls is reached.
+
+Checkpointed with the same generic Postgres checkpoint store Cora uses
+(src.agents.checkpoint.checkpoint_saver — see that module; it is
+graph-agnostic, keyed only by thread_id/checkpoint_ns, so this reuses it
+directly rather than duplicating it). checkpoint_ns="fa_max" keeps this
+graph's checkpoints in their own namespace within the same shared tables,
+same reasoning as src.agents.cora.checkpointer's checkpoint_ns="cora".
+
+On crash mid-loop, the work item's lease in fa_max_work_queue simply expires
+and src.services.state_engine.reclaim_expired_work_items() returns it to
+'available' for a future claim — no separate retry path here (see worker.py).
+"""
+from __future__ import annotations
+
+import concurrent.futures
+import logging
+import time
+from typing import Any, Dict, List, Optional, TypedDict
+
+from langgraph.graph import END, START, StateGraph
+
+from src.agents.fa_max.tool_registry import FA_MAX_TOOL_REGISTRY, get_fa_max_tool
+from src.services.fa_max_send_governance import GovernanceBlocked
+from src.services.fa_max_tool_log import log_tool_call
+
+logger = logging.getLogger(__name__)
+
+# One dedicated worker per tool call, never reused across calls -- see
+# _call_tool_with_timeout()'s docstring for why a fresh session/thread pair
+# is used instead of sharing the node's own session with a background thread.
+_TOOL_CALL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="fa_max_tool_call",
+)
+
+
+class ToolCallTimeout(Exception):
+    """Raised when a single tool call exceeds fa_max_agent_tool_timeout_seconds."""
+
+
+class FaMaxAgentState(TypedDict, total=False):
+    work_item_id: str
+    agent_name: str
+    steps: List[Dict[str, Any]]
+    step_index: int
+    tool_results: List[Dict[str, Any]]
+    done: bool
+    error: Optional[str]
+
+
+def _call_tool(tool_name: str, args: Dict[str, Any], *, session) -> Any:
+    spec = get_fa_max_tool(tool_name)
+    call_args = dict(args)
+    if "session" in spec.func.__code__.co_varnames:
+        call_args["session"] = session
+    return spec.func(**call_args)
+
+
+def _call_tool_with_timeout(tool_name: str, args: Dict[str, Any], *, timeout_seconds: float) -> Any:
+    """Run one tool call on its own DB session, in its own thread, bounded by
+    fa_max_agent_tool_timeout_seconds.
+
+    Deliberately does NOT share the calling node's own session with the
+    worker thread: SQLAlchemy Session objects are not safe for concurrent
+    use, and on a timeout the calling thread must be free to immediately log
+    the failure and stop the loop without waiting on (or racing) whatever
+    the abandoned worker thread is still doing. Python cannot force-kill a
+    thread, so a timed-out call's underlying thread may keep running in the
+    background against its OWN session/connection until it finishes or that
+    connection is torn down independently -- this bounds the AGENT LOOP's
+    wait, not the callee's actual execution. The work item's own lease
+    (fa_max_work_queue, reclaim_expired_work_items) remains the outer safety
+    net for a worker process that is well and truly stuck.
+    """
+    from src.core.database import get_db_context
+
+    def _run() -> Any:
+        with get_db_context() as tool_session:
+            return _call_tool(tool_name, args, session=tool_session)
+
+    future = _TOOL_CALL_EXECUTOR.submit(_run)
+    try:
+        return future.result(timeout=timeout_seconds)
+    except concurrent.futures.TimeoutError as exc:
+        raise ToolCallTimeout(
+            f"tool {tool_name!r} exceeded {timeout_seconds}s timeout"
+        ) from exc
+
+
+def _node_tool_step(state: FaMaxAgentState) -> FaMaxAgentState:
+    from config.agents import get_agents_settings
+    from src.core.database import get_db_context
+
+    settings = get_agents_settings()
+    max_calls = settings.fa_max_agent_max_tool_calls
+    tool_timeout_seconds = settings.fa_max_agent_tool_timeout_seconds
+    step_index = state.get("step_index", 0)
+    steps = state.get("steps", [])
+    agent_name = state["agent_name"]
+    work_item_id = state.get("work_item_id")
+    results = list(state.get("tool_results", []))
+
+    if step_index >= len(steps) or step_index >= max_calls:
+        return {"done": True}
+
+    step = steps[step_index]
+    tool_name = step.get("tool")
+    args = step.get("args", {}) or {}
+
+    if tool_name not in FA_MAX_TOOL_REGISTRY:
+        logger.warning("fa_max.agent_graph: unknown tool %r at step %d — stopping", tool_name, step_index)
+        results.append({"tool": tool_name, "status": "error", "error": "unknown_tool"})
+        return {"tool_results": results, "step_index": step_index + 1, "done": True, "error": "unknown_tool"}
+
+    start = time.monotonic()
+    try:
+        output = _call_tool_with_timeout(tool_name, args, timeout_seconds=tool_timeout_seconds)
+        status = "success"
+        error = None
+    except GovernanceBlocked as exc:
+        output = {"error": str(exc)}
+        status = "blocked"
+        error = str(exc)
+    except ToolCallTimeout as exc:
+        logger.error(
+            "fa_max.agent_graph: tool %r timed out after %ss for work_item_id=%s",
+            tool_name, tool_timeout_seconds, work_item_id,
+        )
+        output = {"error": str(exc)}
+        status = "error"
+        error = str(exc)
+    except Exception as exc:  # noqa: BLE001 - must not crash the loop; logged below
+        logger.exception(
+            "fa_max.agent_graph: tool %r raised for work_item_id=%s", tool_name, work_item_id,
+        )
+        output = {"error": str(exc)}
+        status = "error"
+        error = str(exc)
+    duration_ms = int((time.monotonic() - start) * 1000)
+
+    # Fail-closed on the audit write itself (not just on the tool call):
+    # WP-T2-2's Done-When line is "every tool call logged," not "every tool
+    # call logged unless the log write itself fails." log_tool_call() never
+    # raises (a logging failure must not crash mid-call), so its return value
+    # is the only signal this loop has that the durable audit row didn't
+    # land. Continuing past that failure would silently produce an
+    # unauditable send/tool-invocation -- worse than stopping the loop and
+    # letting the work item's lease-driven reclaim retry it from scratch.
+    with get_db_context() as log_session:
+        logged = log_tool_call(
+            session=log_session,
+            agent_name=agent_name,
+            tool_name=tool_name,
+            input=args,
+            output=output if isinstance(output, dict) else {"result": output},
+            duration_ms=duration_ms,
+            status=status,
+            work_item_id=work_item_id,
+        )
+
+    if not logged:
+        logger.error(
+            "fa_max.agent_graph: audit log write failed for tool %r work_item_id=%s — "
+            "stopping loop fail-closed rather than continuing unaudited",
+            tool_name, work_item_id,
+        )
+        results.append({"tool": tool_name, "status": status, "output": output, "error": error})
+        return {
+            "tool_results": results,
+            "step_index": step_index + 1,
+            "done": True,
+            "error": "audit_log_write_failed",
+        }
+
+    results.append({"tool": tool_name, "status": status, "output": output, "error": error})
+    new_step_index = step_index + 1
+    done = status != "success" or new_step_index >= len(steps) or new_step_index >= max_calls
+
+    return {
+        "tool_results": results,
+        "step_index": new_step_index,
+        "done": done,
+        "error": error if status != "success" else state.get("error"),
+    }
+
+
+def _route_continue(state: FaMaxAgentState) -> str:
+    return END if state.get("done") else "tool_step"
+
+
+def build_fa_max_agent_graph() -> StateGraph:
+    g = StateGraph(FaMaxAgentState)
+    g.add_node("tool_step", _node_tool_step)
+    g.add_edge(START, "tool_step")
+    g.add_conditional_edges("tool_step", _route_continue, {"tool_step": "tool_step", END: END})
+    return g
+
+
+def run_fa_max_agent(
+    *, work_item_id: str, agent_name: str, steps: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Compile and run one work item's bounded tool-call loop, checkpointed
+    by thread_id=work_item_id so a crash mid-loop can resume from the last
+    completed step on the next claim of the same item (before its lease
+    expires and reclaim_expired_work_items() offers it up again)."""
+    from src.agents.checkpoint import checkpoint_saver
+
+    builder = build_fa_max_agent_graph()
+    initial: FaMaxAgentState = {
+        "work_item_id": work_item_id,
+        "agent_name": agent_name,
+        "steps": steps,
+        "step_index": 0,
+        "tool_results": [],
+        "done": False,
+        "error": None,
+    }
+    with checkpoint_saver() as saver:
+        graph = builder.compile(checkpointer=saver)
+        final = graph.invoke(
+            initial,
+            config={"configurable": {"thread_id": f"fa_max_work:{work_item_id}", "checkpoint_ns": "fa_max"}},
+        )
+        return dict(final)
+
+
+def run_fa_max_agent_no_checkpoint(
+    *, work_item_id: str, agent_name: str, steps: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Checkpointer-free variant for tests/CLI use."""
+    graph = build_fa_max_agent_graph().compile()
+    final = graph.invoke({
+        "work_item_id": work_item_id, "agent_name": agent_name, "steps": steps,
+        "step_index": 0, "tool_results": [], "done": False, "error": None,
+    })
+    return dict(final)
