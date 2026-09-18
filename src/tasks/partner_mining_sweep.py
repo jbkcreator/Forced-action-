@@ -103,6 +103,12 @@ def _run_county(county_id: str, *, dry_run: bool, as_of: date) -> int:
     since = as_of - timedelta(days=lookback_days)
 
     with get_db_context() as db:
+        # Stage B: resolve new lender counterparties into buyer_entities graph.
+        from src.services.partner_mining.resolution import (
+            run_counterparty_resolution, resolve_counterparty_names,
+        )
+        run_counterparty_resolution(db, county_id=cid)
+
         # Load deed rows for this county within the lookback window.
         deed_rows = db.execute(
             text("""
@@ -155,12 +161,15 @@ def _run_county(county_id: str, *, dry_run: bool, as_of: date) -> int:
             if not is_investor_transaction(row, homestead_exempt=homestead):
                 continue
 
+        # ── Stage B lookup: map raw lender names → buyer_entity_id ──────────
+        lender_name_map = resolve_counterparty_names(db, list(lender_counts.keys()))
+
         # ── Stage C + D: build PartnerRow list and rank ───────────────────────
         partner_rows: list[PartnerRow] = []
 
         for name, stats in lender_counts.items():
             partner_rows.append(PartnerRow(
-                buyer_entity_id=0,  # resolved below in production; stub for now
+                buyer_entity_id=lender_name_map.get(name) or 0,
                 canonical_name=name,
                 partner_class=PartnerClass.LENDER.value,
                 observed_transaction_count=stats["count"],

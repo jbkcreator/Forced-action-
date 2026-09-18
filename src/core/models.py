@@ -9528,7 +9528,7 @@ class BuyerEntityLink(Base):
         UniqueConstraint("source_table", "source_id", name="uq_buyer_entity_link_source"),
         CheckConstraint(
             "source_table IN ('owners', 'deeds', 'sunbiz_snapshots', 'tax_deed_auctions', "
-            "'building_permits', 'permit_staging')",
+            "'building_permits', 'permit_staging', 'deed_lender', 'deed_wholesaler')",
             name="check_buyer_entity_link_source_table",
         ),
         CheckConstraint(
