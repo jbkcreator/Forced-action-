@@ -30,6 +30,8 @@ class PartnerRow:
     # Populated by rank_partners:
     rank: int = 0
     status: str = "identified"
+    # Populated by enrich_top_partners (Stage E):
+    needs_enrichment: bool = False
 
 
 _TOP_N = 25

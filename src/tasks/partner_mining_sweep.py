@@ -194,6 +194,11 @@ def _run_county(county_id: str, *, dry_run: bool, as_of: date) -> int:
                         county_id, len(ranked))
             return len(ranked)
 
+        # ── Stage E: enrich top-25 per class ─────────────────────────────────
+        from src.services.partner_mining.enrich import enrich_top_partners
+        enrich_stats = enrich_top_partners(db, ranked, county_id=cid)
+        logger.info("[PartnerMining] %s enrichment: %s", cid, enrich_stats)
+
         upsert_partner_rows(db, ranked, county_id=county_id)
         return len(ranked)
 
