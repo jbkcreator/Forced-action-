@@ -23,6 +23,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from typing import List, Optional
 
 logger = logging.getLogger(__name__)
@@ -83,18 +84,58 @@ def _save_watermark(channel: str, ts: str) -> None:
 
 # ── Seen-cache ────────────────────────────────────────────────────────────────
 
-def _already_seen(ts: str) -> bool:
+_CLAIM_TTL_SECONDS = 30  # short TTL while publish is in-flight
+
+
+def _claim_seen(ts: str) -> tuple[bool, str]:
     """
-    Atomically claim this ts as seen. Returns True if already seen by another
-    caller, False if this call is the first (and has now claimed it).
-    Uses SET NX so concurrent pollers can't both see the same message as new.
+    Atomically claim this ts with a short TTL and an owner token.
+    Returns (claimed, token): claimed=True when this caller is first,
+    False when already owned by another caller/poll.
+    When Redis is unavailable, fail-open (treat as new so the message is
+    not permanently silenced).
     """
     from src.core.redis_client import get_redis, redis_available
     if not redis_available():
-        return False
-    # SET NX returns True when the key was newly created (this caller is first).
-    is_new = get_redis().set(f"{_SEEN_KEY_PREFIX}{ts}", "1", nx=True, ex=_SEEN_TTL_SECONDS)
-    return not bool(is_new)
+        return True, ""
+    token = uuid.uuid4().hex
+    is_new = get_redis().set(f"{_SEEN_KEY_PREFIX}{ts}", token, nx=True, ex=_CLAIM_TTL_SECONDS)
+    return bool(is_new), token
+
+
+def _promote_claim(ts: str, token: str) -> None:
+    """
+    After a successful publish: extend the seen key TTL to the full retention
+    window so the message is not re-processed on later polls.
+    Only promotes if the key still holds our token (guards against expiry race).
+    """
+    from src.core.redis_client import get_redis, redis_available
+    if not redis_available() or not token:
+        return
+    r = get_redis()
+    if r.get(f"{_SEEN_KEY_PREFIX}{ts}") == token:
+        r.set(f"{_SEEN_KEY_PREFIX}{ts}", token, ex=_SEEN_TTL_SECONDS)
+
+
+_LUA_RELEASE = """
+if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+else
+    return 0
+end
+"""
+
+
+def _release_claim(ts: str, token: str) -> None:
+    """
+    After a failed publish: atomically delete the seen key so the next poll
+    retries the message.  Lua compare-and-delete prevents releasing a key
+    that was re-claimed by a concurrent poller after our claim expired.
+    """
+    from src.core.redis_client import get_redis, redis_available
+    if not redis_available() or not token:
+        return
+    get_redis().eval(_LUA_RELEASE, 1, f"{_SEEN_KEY_PREFIX}{ts}", token)
 
 
 # ── Core poll ─────────────────────────────────────────────────────────────────
@@ -146,7 +187,8 @@ def poll_once(channel: Optional[str] = None) -> int:
             continue
         if user_id == _BOT_USER_ID:
             continue
-        if _already_seen(ts):
+        claimed, token = _claim_seen(ts)
+        if not claimed:
             newest_ts = ts
             continue
 
@@ -162,14 +204,16 @@ def poll_once(channel: Optional[str] = None) -> int:
         )
 
         if mid is not None:
+            _promote_claim(ts, token)
             published += 1
             logger.info(
                 "cc.slack_listener: published query session=%s user=%s ts=%s text=%r",
                 session_id, user_id, ts, text[:80],
             )
         else:
+            _release_claim(ts, token)
             logger.warning(
-                "cc.slack_listener: publish_query failed for ts=%s — will retry next poll",
+                "cc.slack_listener: publish failed ts=%s — releasing claim for retry next poll",
                 ts,
             )
             # Don't advance watermark past a failed message
