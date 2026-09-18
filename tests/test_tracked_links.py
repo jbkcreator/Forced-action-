@@ -36,15 +36,19 @@ def test_record_click_creates_one_row(fresh_db):
     assert click.session_token == "tok-abc"
 
 
-def test_property_mailer_link_carries_property_id(fresh_db):
+def test_source_link_can_carry_property_id(fresh_db):
+    """property_id is a generic, kind-independent field — the admin mint path
+    can bind any kind to a known property; there is no dedicated
+    property-bound kind (physical mail campaigns are out of scope, and
+    'property_mailer' — removed 2026-09-18 — was never in the client's spec)."""
     link = mint_link(
         fresh_db,
-        kind="property_mailer",
-        label="123 Main St mailer",
+        kind="source",
+        label="123 Main St",
         created_by="tester",
         property_id=None,  # no live property fixture needed for this unit test
     )
     fresh_db.flush()
-    assert link.kind == "property_mailer"
+    assert link.kind == "source"
 
 

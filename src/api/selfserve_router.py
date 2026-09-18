@@ -41,6 +41,7 @@ import hashlib
 import html
 import json
 import logging
+import re
 import uuid
 from typing import Optional
 
@@ -57,6 +58,7 @@ from src.api.deps import get_db
 from src.core.models import TrackedLink
 from src.core.redis_client import rincr
 from src.services.backflip_port import HandoffPayload, get_backflip_port
+from src.services.phone_utils import normalize as normalize_phone
 from src.services.prefill_assembly import assemble_prefill, find_property_by_address
 from src.services.selfserve_sessions import (
     create_session,
@@ -82,6 +84,15 @@ router = APIRouter(tags=["selfserve"])
 _RATE_LIMIT_WINDOW_SECONDS = 60
 _CLICK_LIMIT_PER_MINUTE = 30
 _SUBMIT_LIMIT_PER_MINUTE = 10
+
+# Client-side hint (HTML pattern attribute) and server-side enforcement
+# share this one definition rather than drifting apart. A raw constant
+# keeps the regex escapes literal instead of fighting the outer f-string
+# that renders the page. Digits-only (no parens/dashes) because the field
+# itself strips non-digit keystrokes live (see the oninput handler) --
+# exactly 10 digits, the US number without a leading country code.
+_US_PHONE_PATTERN = r"^\d{10}$"
+_EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 def _hash_ip(ip: Optional[str]) -> Optional[str]:
@@ -117,11 +128,13 @@ def click_tracked_link(slug: str, request: Request, db: Session = Depends(get_db
 
     link_id = None
     property_id = None
+    buyer_entity_id = None
     if link is None:
         logger.warning("selfserve: unknown or inactive slug=%r — degrading to generic flow", slug)
     else:
         link_id = link.id
         property_id = link.property_id
+        buyer_entity_id = link.buyer_entity_id
         record_click(
             db,
             tracked_link_id=link.id,
@@ -132,7 +145,10 @@ def click_tracked_link(slug: str, request: Request, db: Session = Depends(get_db
         )
 
     prefill = assemble_prefill(db, property_id).to_dict() if property_id else {"property_id": None, "fields": {}}
-    session_row = create_session(db, prefill_snapshot=prefill, tracked_link_id=link_id, property_id=property_id)
+    session_row = create_session(
+        db, prefill_snapshot=prefill, tracked_link_id=link_id, property_id=property_id,
+        buyer_entity_id=buyer_entity_id,
+    )
     # The session's own token IS the click's attribution token — one UUID,
     # not two — so a plain 302 (no cookie/JWT round-trip) is sufficient.
     session_row.token = token
@@ -152,25 +168,175 @@ def _esc(value) -> str:
     return html.escape(str(value), quote=True)
 
 
+# ---------------------------------------------------------------------------
+# Page shell — dark-glass styling matching the platform's design language
+# (see Forced-action-ui/src/config/theme.json for the source palette).
+# Inlined rather than linked: this route has no static-asset pipeline of its
+# own, and one page doesn't earn a shared stylesheet. No brand name or logo
+# by design — see WP-7 plan §7 Q11, brand separation still undecided.
+# ---------------------------------------------------------------------------
+
+_PAGE_STYLE = """
+:root{
+  --bg-0:#070b14;--bg-1:#0f172a;--bg-2:#131c33;
+  --card:rgba(255,255,255,.04);--border:rgba(255,255,255,.08);--border-strong:rgba(255,255,255,.14);
+  --text:#f8fafc;--text-2:#94a3b8;--text-3:#64748b;
+  --primary:#fbbf24;--primary-dark:#f59e0b;--accent:#a855f7;
+  --radius-lg:1rem;--radius-md:.75rem;--radius-sm:.5rem;
+}
+*{box-sizing:border-box;}
+html,body{margin:0;padding:0;}
+body{
+  font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;
+  color:var(--text);
+  background:linear-gradient(135deg,var(--bg-0) 0%,var(--bg-1) 30%,var(--bg-2) 50%,var(--bg-1) 70%,var(--bg-0) 100%);
+  background-attachment:fixed;
+  min-height:100vh;
+  padding:2rem 1rem 4rem;
+}
+.wrap{max-width:640px;margin:0 auto;}
+.brand{display:flex;align-items:center;gap:.6rem;margin-bottom:1.75rem;}
+.brand-badge{
+  width:2.25rem;height:2.25rem;border-radius:var(--radius-sm);flex-shrink:0;
+  display:flex;align-items:center;justify-content:center;font-weight:900;font-size:.8rem;
+  color:#0f172a;background:linear-gradient(135deg,#facc15,#f59e0b);
+}
+.brand-name{font-weight:700;color:var(--text);}
+.brand-name .accent{color:var(--primary);}
+.eyebrow{
+  display:inline-flex;align-items:center;gap:.4rem;font-size:.75rem;font-weight:600;letter-spacing:.02em;
+  color:var(--primary);background:rgba(251,191,36,.1);border:1px solid rgba(251,191,36,.25);
+  border-radius:999px;padding:.3rem .75rem;margin-bottom:1rem;
+}
+h1{font-size:1.6rem;font-weight:800;margin:0 0 .4rem;line-height:1.25;}
+.sub{color:var(--text-2);font-size:.95rem;margin:0 0 1.75rem;line-height:1.5;}
+.card{
+  background:var(--card);border:1px solid var(--border);border-radius:var(--radius-lg);
+  padding:1.5rem;margin-bottom:1.25rem;backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
+}
+.card h2{
+  font-size:.8rem;text-transform:uppercase;letter-spacing:.06em;color:var(--text-2);font-weight:700;
+  margin:0 0 1.15rem;display:flex;align-items:center;gap:.6rem;
+}
+.step-num{
+  display:inline-flex;align-items:center;justify-content:center;width:1.5rem;height:1.5rem;border-radius:50%;
+  background:linear-gradient(135deg,rgba(251,191,36,.2),rgba(168,85,247,.15));border:1px solid rgba(251,191,36,.3);
+  color:var(--primary);font-size:.75rem;font-weight:800;flex-shrink:0;
+}
+.field{margin-bottom:1rem;}
+.field:last-child{margin-bottom:0;}
+label{display:block;font-size:.8rem;font-weight:600;color:var(--text-2);margin-bottom:.4rem;}
+input[type=text],input[type=email],input[type=tel],input[type=date],select{
+  width:100%;padding:.7rem .85rem;background:rgba(255,255,255,.03);border:1px solid var(--border-strong);
+  border-radius:var(--radius-sm);color:var(--text);font-size:.95rem;font-family:inherit;
+  transition:border-color .2s ease,background .2s ease,box-shadow .2s ease;
+  color-scheme:dark;
+}
+input::placeholder{color:var(--text-3);}
+input:focus,select:focus{
+  outline:none;border-color:var(--primary);background:rgba(255,255,255,.05);
+  box-shadow:0 0 0 3px rgba(251,191,36,.15);
+}
+select option{background:#1a1d2e;color:#f1f5f9;}
+/* Chrome/Edge force a light autofill background by default — this keeps
+   an autofilled or browser-suggested value on the dark theme instead of a
+   jarring white cell. */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus {
+  -webkit-box-shadow: 0 0 0 1000px rgba(255,255,255,.05) inset !important;
+  -webkit-text-fill-color: #f8fafc !important;
+  caret-color: #f8fafc;
+  transition: background-color 9999s ease-in-out 0s;
+}
+.found-badge{
+  display:inline-flex;align-items:center;gap:.4rem;font-size:.75rem;font-weight:700;color:#4ade80;
+  background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.25);border-radius:999px;
+  padding:.3rem .7rem;margin-bottom:1.1rem;
+}
+.help-text{color:var(--text-3);font-size:.85rem;margin:0 0 1rem;line-height:1.5;}
+.consent{
+  display:flex;gap:.65rem;align-items:flex-start;background:rgba(255,255,255,.02);
+  border:1px solid var(--border);border-radius:var(--radius-sm);padding:.9rem 1rem;
+}
+.consent input{width:auto;margin-top:.2rem;accent-color:var(--primary);}
+.consent label{margin:0;font-weight:400;color:var(--text-2);font-size:.85rem;line-height:1.45;}
+.btn{
+  display:block;width:100%;padding:.95rem 1.5rem;margin-top:.5rem;
+  background:linear-gradient(135deg,var(--primary),var(--primary-dark));color:#1a1200;
+  font-weight:800;font-size:1rem;font-family:inherit;border:none;border-radius:var(--radius-md);cursor:pointer;
+  transition:transform .2s cubic-bezier(.4,0,.2,1),box-shadow .2s ease;
+}
+.btn:hover{transform:translateY(-2px);box-shadow:0 8px 24px rgba(251,191,36,.3);}
+.btn:active{transform:translateY(0) scale(.99);}
+.footnote{text-align:center;color:var(--text-3);font-size:.75rem;margin-top:1.25rem;line-height:1.5;}
+.notice-wrap{max-width:480px;margin:4rem auto 0;text-align:center;}
+.notice-wrap .brand{justify-content:center;margin-bottom:2rem;}
+.notice-card{
+  background:var(--card);border:1px solid var(--border);
+  border-radius:var(--radius-lg);padding:2.25rem 1.75rem;backdrop-filter:blur(16px);
+}
+.notice-card p{color:var(--text-2);font-size:.95rem;line-height:1.6;margin:0;}
+@media (max-width:480px){
+  body{padding:1.25rem .85rem 3rem;}
+  .card{padding:1.15rem;}
+  h1{font-size:1.35rem;}
+}
+"""
+
+_PAGE_HEAD = (
+    '<meta charset="utf-8">'
+    '<meta name="viewport" content="width=device-width, initial-scale=1">'
+    '<meta name="robots" content="noindex, nofollow">'
+    '<link rel="preconnect" href="https://fonts.googleapis.com">'
+    '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
+    '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">'
+    f"<style>{_PAGE_STYLE}</style>"
+)
+
+
+def _render_page(title: str, body: str) -> str:
+    return f"<!doctype html><html lang=\"en\"><head><title>{_esc(title)}</title>{_PAGE_HEAD}</head><body>{body}</body></html>"
+
+
 def _render_field_row(key: str, value) -> str:
     display = value if not isinstance(value, (dict, list)) else str(value)
+    field_id = f"correction__{_esc(key)}"
+    label = _esc(key.replace("_", " ").title())
     return (
-        f'<div class="field"><label>{_esc(key.replace("_", " ").title())}</label>'
-        f'<input type="text" name="correction__{_esc(key)}" value="{_esc(display)}"></div>'
+        f'<div class="field"><label for="{field_id}">{label}</label>'
+        f'<input type="text" id="{field_id}" name="{field_id}" value="{_esc(display)}" required></div>'
     )
 
 
-def _render_question_row(q: dict) -> str:
+def _render_question_row(q: dict, default: Optional[str] = None) -> str:
+    """default pre-fills a known answer (e.g. entity_name/prior_flip_count
+    from a buyer_entity resolved at link-mint time) as an editable value —
+    never hidden, so the borrower still confirms it rather than it being
+    silently assumed (same principle as the property section)."""
     key, label = _esc(q["key"]), _esc(q["label"])
+    field_id = f"q__{key}"
     if q["type"] == "select":
-        options = "".join(f'<option value="{_esc(o)}">{_esc(o)}</option>' for o in q.get("options", []))
-        return f'<div class="field"><label>{label}</label><select name="q__{key}">{options}</select></div>'
-    if q["type"] == "boolean":
-        return (
-            f'<div class="field"><label>{label}</label>'
-            f'<select name="q__{key}"><option value="true">Yes</option><option value="false">No</option></select></div>'
+        options = "".join(
+            f'<option value="{_esc(o)}"{" selected" if default == o else ""}>{_esc(o.title())}</option>'
+            for o in q.get("options", [])
         )
-    return f'<div class="field"><label>{label}</label><input type="text" name="q__{key}"></div>'
+        return f'<div class="field"><label for="{field_id}">{label}</label><select id="{field_id}" name="{field_id}">{options}</select></div>'
+    if q["type"] == "boolean":
+        true_sel = " selected" if default == "true" else ""
+        false_sel = " selected" if default == "false" else ""
+        return (
+            f'<div class="field"><label for="{field_id}">{label}</label>'
+            f'<select id="{field_id}" name="{field_id}"><option value="true"{true_sel}>Yes</option>'
+            f'<option value="false"{false_sel}>No</option></select></div>'
+        )
+    if q["type"] == "date":
+        # Native date picker — full day/month/year, either picked from a
+        # calendar or typed directly; the browser enforces the format.
+        value_attr = f' value="{_esc(default)}"' if default is not None else ""
+        return f'<div class="field"><label for="{field_id}">{label}</label><input type="date" id="{field_id}" name="{field_id}"{value_attr}></div>'
+    value_attr = f' value="{_esc(default)}"' if default is not None else ""
+    return f'<div class="field"><label for="{field_id}">{label}</label><input type="text" id="{field_id}" name="{field_id}"{value_attr}></div>'
 
 
 @router.get("/selfserve/{token}", response_class=HTMLResponse)
@@ -190,38 +356,95 @@ def selfserve_screen(token: str, db: Session = Depends(get_db)):
     )
     db.commit()
 
+    # Borrower-level recognition (WI-1 follow-up, 2026-09-18) — independent
+    # of property recognition: an exact canonical_name match at link-mint
+    # time (tracked_links.find_buyer_entity_by_name), never derived from the
+    # property, since a property's current owner-of-record is not assumed
+    # to be the borrower financing it next. Resolved before the property
+    # section below so its copy can acknowledge a recognized borrower
+    # without a bound property, instead of a generic "we don't know you"
+    # message right next to a "Borrower recognized" badge.
+    known_answers: dict[str, str] = {}
+    borrower_badge = ""
+    borrower_name: Optional[str] = None
+    if session_row.buyer_entity_id is not None:
+        entity = db.execute(
+            text("SELECT canonical_name, total_purchase_count FROM buyer_entities WHERE id = :id"),
+            {"id": session_row.buyer_entity_id},
+        ).mappings().first()
+        if entity:
+            borrower_name = str(entity["canonical_name"])
+            known_answers["entity_name"] = borrower_name
+            known_answers["prior_flip_count"] = str(entity["total_purchase_count"])
+            borrower_badge = '<span class="found-badge">&#10003; Borrower recognized</span>'
+
     fields = (session_row.prefill_snapshot or {}).get("fields", {})
-    address_prompt = ""
     if session_row.property_id is None:
-        address_prompt = (
-            '<div class="field"><label>Property address (we could not recognize it automatically)</label>'
-            '<input type="text" name="manual_address"></div>'
+        no_property_copy = (
+            f"We recognize you, {_esc(borrower_name.title())} — we just need the address of the property "
+            "you're financing this time."
+            if borrower_name else
+            "We could not automatically recognize this property from the link. "
+            "Enter the address below and we'll pull what public records we have."
         )
-        prefill_html = "<p>We could not automatically recognize your property. Please enter the address below.</p>"
+        property_section = (
+            f'<p class="help-text">{no_property_copy}</p>'
+            '<div class="field"><label for="manual_address">Property address</label>'
+            '<input type="text" id="manual_address" name="manual_address" placeholder="123 Main St, Tampa, FL 33602" required></div>'
+        )
     else:
-        prefill_html = "".join(_render_field_row(k, v["value"]) for k, v in fields.items()) or "<p>No public records found for this property.</p>"
+        rows = "".join(_render_field_row(k, v["value"]) for k, v in fields.items())
+        property_section = (
+            '<span class="found-badge">&#10003; Property recognized</span>'
+            + (rows or '<p class="help-text">No public records found for this property — you can still continue.</p>')
+        )
 
-    questions_html = "".join(_render_question_row(q) for q in SELFSERVE_QUESTIONS)
+    questions_html = borrower_badge + "".join(
+        _render_question_row(q, known_answers.get(q["key"])) for q in SELFSERVE_QUESTIONS
+    )
 
-    return HTMLResponse(f"""
-    <html><body>
-    <form method="post" action="/api/selfserve/{token}/submit">
-      <h2>Is this your property?</h2>
-      {prefill_html}
-      {address_prompt}
-      <h2>A few more details</h2>
-      {questions_html}
-      <h2>Your contact info</h2>
-      <div class="field"><label>Name</label><input type="text" name="contact_name" required></div>
-      <div class="field"><label>Email</label><input type="email" name="contact_email" required></div>
-      <div class="field"><label>Phone</label><input type="tel" name="contact_phone"></div>
-      <div class="field">
-        <label><input type="checkbox" name="consent"> {CONSENT_COPY}</label>
+    body = f"""
+    <div class="wrap">
+      <div class="brand">
+        <div class="brand-badge">FA</div>
+        <span class="brand-name">Forced <span class="accent">Action</span></span>
       </div>
-      <button type="submit">Continue to Backflip</button>
-    </form>
-    </body></html>
-    """)
+      <span class="eyebrow">&#9679; Fast-Track Application</span>
+      <h1>Is this your property?</h1>
+      <p class="sub">We pulled public records for this address. Confirm what looks right and correct anything that's off,
+        then answer a few quick questions.</p>
+      <form method="post" action="/api/selfserve/{token}/submit">
+        <div class="card">
+          <h2><span class="step-num">1</span>Property details</h2>
+          {property_section}
+        </div>
+        <div class="card">
+          <h2><span class="step-num">2</span>A few more details</h2>
+          {questions_html}
+        </div>
+        <div class="card">
+          <h2><span class="step-num">3</span>Your contact info</h2>
+          <div class="field"><label for="contact_name">Name</label>
+            <input type="text" id="contact_name" name="contact_name" autocomplete="name" required></div>
+          <div class="field"><label for="contact_email">Email</label>
+            <input type="email" id="contact_email" name="contact_email" autocomplete="email"
+              placeholder="name@example.com" required></div>
+          <div class="field"><label for="contact_phone">Phone</label>
+            <input type="tel" id="contact_phone" name="contact_phone" autocomplete="tel" inputmode="numeric"
+              placeholder="8135551234" pattern="{_US_PHONE_PATTERN}" maxlength="10"
+              oninput="this.value=this.value.replace(/[^0-9]/g,'').slice(0,10)"
+              title="Enter a 10-digit US phone number, digits only, e.g. 8135551234" required></div>
+          <div class="consent">
+            <input type="checkbox" id="consent" name="consent">
+            <label for="consent">{CONSENT_COPY}</label>
+          </div>
+        </div>
+        <button type="submit" class="btn">Continue &rarr;</button>
+        <p class="footnote">Your information is kept private and used only to process this inquiry.</p>
+      </form>
+    </div>
+    """
+    return HTMLResponse(_render_page("Confirm Your Property", body))
 
 
 # ---------------------------------------------------------------------------
@@ -243,19 +466,6 @@ async def submit_selfserve(token: str, request: Request, db: Session = Depends(g
 
     form = await request.form()
 
-    if session_row.property_id is None and form.get("manual_address"):
-        prop_id, _confidence = find_property_by_address(db, str(form["manual_address"]))
-        if prop_id:
-            prefill = assemble_prefill(db, prop_id).to_dict()
-            db.execute(
-                text(
-                    "UPDATE selfserve_sessions SET property_id = :pid, "
-                    "prefill_snapshot = CAST(:snap AS JSONB) WHERE token = :token"
-                ),
-                {"pid": prop_id, "snap": json.dumps(prefill), "token": token},
-            )
-            session_row.property_id = prop_id
-
     def _str_field(name: str) -> Optional[str]:
         # Form fields are plain text inputs — never file uploads — but a
         # crafted multipart request could send an UploadFile under this
@@ -267,12 +477,50 @@ async def submit_selfserve(token: str, request: Request, db: Session = Depends(g
             raise HTTPException(status_code=400, detail=f"{name} must be text.")
         return val
 
+    # Property details are mandatory: a borrower with no recognized property
+    # must at least type an address — it doesn't have to successfully
+    # resolve (plan §7 Q6 — an unmatched address still gets captured as a
+    # lead), but it can't be skipped entirely.
+    manual_address_raw = (_str_field("manual_address") or "").strip()
+    if session_row.property_id is None and not manual_address_raw:
+        raise HTTPException(status_code=400, detail="Property address is required.")
+
+    if session_row.property_id is None and manual_address_raw:
+        prop_id, _confidence = find_property_by_address(db, manual_address_raw)
+        if prop_id:
+            prefill = assemble_prefill(db, prop_id).to_dict()
+            db.execute(
+                text(
+                    "UPDATE selfserve_sessions SET property_id = :pid, "
+                    "prefill_snapshot = CAST(:snap AS JSONB) WHERE token = :token"
+                ),
+                {"pid": prop_id, "snap": json.dumps(prefill), "token": token},
+            )
+            session_row.property_id = prop_id
+
     corrections = {k[len("correction__"):]: v for k, v in form.items() if k.startswith("correction__") and isinstance(v, str)}
     confirmations = {k[len("q__"):]: v for k, v in form.items() if k.startswith("q__") and isinstance(v, str)}
+
+    email = (_str_field("contact_email") or "").strip()
+    if not _EMAIL_PATTERN.match(email):
+        raise HTTPException(status_code=400, detail="Enter a valid email address.")
+
+    # Every phone read/write goes through phone_utils.normalize (codebase-
+    # wide rule) — storing raw human-typed text here would both violate
+    # that and desync from is_backflip_suppressed's own normalized lookup
+    # and any future SMS send, which need strict E.164. Contact info is
+    # mandatory, so phone is required same as name/email.
+    raw_phone = (_str_field("contact_phone") or "").strip()
+    if not raw_phone:
+        raise HTTPException(status_code=400, detail="Phone number is required.")
+    normalized_phone = normalize_phone(raw_phone)
+    if normalized_phone is None:
+        raise HTTPException(status_code=400, detail="Enter a valid US phone number.")
+
     contact = {
         "name": _str_field("contact_name"),
-        "email": _str_field("contact_email"),
-        "phone": _str_field("contact_phone"),
+        "email": email,
+        "phone": normalized_phone,
     }
     consent_channels = ["email", "sms"] if form.get("consent") else []
 
@@ -303,10 +551,15 @@ async def submit_selfserve(token: str, request: Request, db: Session = Depends(g
             # doesn't satisfy "surfaced to me" — Josh needs to see this.
             flag_suppressed_handoff(db, person_id=updated.person_id, session_token=token, contact=contact)
         db.commit()
-        return HTMLResponse(
-            "<html><body><p>Thanks — you're already connected with Backflip on this. "
-            "No further action needed from you; we'll stay out of the way.</p></body></html>"
-        )
+        return HTMLResponse(_render_page(
+            "Thanks",
+            '<div class="notice-wrap">'
+            '<div class="brand"><div class="brand-badge">FA</div>'
+            '<span class="brand-name">Forced <span class="accent">Action</span></span></div>'
+            '<div class="notice-card"><p>Thanks — you\'re already connected with Backflip on this. '
+            "No further action needed from you; we'll stay out of the way.</p></div>"
+            "</div>",
+        ))
 
     # The status transition itself is the concurrency gate: two concurrent
     # POSTs (double-click, client retry) can both pass the "handed_off" check
@@ -356,7 +609,7 @@ async def submit_selfserve(token: str, request: Request, db: Session = Depends(g
 
 
 class _MintTrackedLinkRequest(BaseModel):
-    kind: str = Field(..., description="partner | campaign | source | property_mailer")
+    kind: str = Field(..., description="partner | campaign | source")
     label: str = Field(..., min_length=1)
     partner_ref: Optional[str] = None
     campaign_ref: Optional[str] = None

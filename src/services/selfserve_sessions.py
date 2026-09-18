@@ -36,11 +36,18 @@ def create_session(
     prefill_snapshot: dict,
     tracked_link_id: Optional[int] = None,
     property_id: Optional[int] = None,
+    buyer_entity_id: Optional[int] = None,
 ) -> SelfserveSession:
+    """buyer_entity_id here comes from the tracked link itself (an explicit
+    name match at mint time — see tracked_links.find_buyer_entity_by_name),
+    not from the property. It is a deliberate identification of a known
+    repeat borrower and must survive submit_session's own property-derived
+    resolution, which only ever fills the gap when this is still NULL."""
     session_row = SelfserveSession(
         token=str(uuid.uuid4()),
         tracked_link_id=tracked_link_id,
         property_id=property_id,
+        buyer_entity_id=buyer_entity_id,
         prefill_snapshot=prefill_snapshot,
         status="prefilled" if prefill_snapshot.get("fields") else "started",
     )
@@ -275,7 +282,12 @@ def submit_session(
         raise ValueError(f"selfserve session not found for token={token!r}")
 
     person_id = resolve_or_create_person(db, source_reference=token)
-    buyer_entity_id = resolve_buyer_entity_id(db, session_row.property_id)
+    # A buyer_entity_id already on the session came from an explicit name
+    # match at link-mint time (a deliberate identification of a known
+    # repeat borrower) and takes precedence — the property-derived fallback
+    # below only fills the gap, since a property's current owner-of-record
+    # is not necessarily the borrower financing it next.
+    buyer_entity_id = session_row.buyer_entity_id or resolve_buyer_entity_id(db, session_row.property_id)
 
     possible_match = find_possible_person_match(
         db, email=contact.get("email"), phone=contact.get("phone"), exclude_token=token
