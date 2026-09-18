@@ -392,6 +392,16 @@ def _post_slash_reply(response_url: Optional[str], reply: dict) -> None:
     from src.utils.http_helpers import requests_post_with_retry
 
     try:
-        requests_post_with_retry(response_url, json=reply, timeout=5)
+        resp = requests_post_with_retry(response_url, json=reply, timeout=5)
+        # Diagnostic (2026-09-18): requests_post_with_retry only raises on
+        # HTTP error status codes. Slack's response_url endpoint can return
+        # 200 with a body that indicates it rejected the payload (e.g. an
+        # expired or already-used response_url), which raise_for_status()
+        # would never catch — log the actual body so a silent Slack-side
+        # rejection is visible instead of looking like a successful send.
+        logger.info(
+            "[tracked_links] response_url POST -> status=%s body=%s",
+            resp.status_code, resp.text[:500],
+        )
     except Exception:
         logger.exception("[tracked_links] failed to deliver /tracked-link reply via response_url")
