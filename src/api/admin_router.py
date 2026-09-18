@@ -1600,10 +1600,11 @@ from fastapi import Request
 
 
 def _verify_slack_signature(headers: dict, body: bytes) -> bool:
-    """Verify Slack request signature (HMAC-SHA256). Rejects replays > 5 min old."""
-    secret = settings.slack_signing_secret
-    if not secret:
-        return False
+    """Verify Slack request signature (HMAC-SHA256). Rejects replays > 5 min old.
+
+    Tries the FA Max signing secret first, then falls back to the shared secret,
+    so button clicks from both Slack apps are accepted at this single endpoint.
+    """
     ts = headers.get("x-slack-request-timestamp", "")
     try:
         if abs(time.time() - int(ts)) > 300:
@@ -1611,13 +1612,19 @@ def _verify_slack_signature(headers: dict, body: bytes) -> bool:
     except (TypeError, ValueError):
         return False
     sig_base = f"v0:{ts}:{body.decode('utf-8')}"
-    expected = "v0=" + hmac.new(
-        secret.get_secret_value().encode(),
-        sig_base.encode(),
-        hashlib.sha256,
-    ).hexdigest()
     received = headers.get("x-slack-signature", "")
-    return hmac.compare_digest(expected, received)
+    candidates = [settings.fa_max_slack_signing_secret, settings.slack_signing_secret]
+    for secret in candidates:
+        if not secret:
+            continue
+        expected = "v0=" + hmac.new(
+            secret.get_secret_value().encode(),
+            sig_base.encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        if hmac.compare_digest(expected, received):
+            return True
+    return False
 
 
 def _slack_ephemeral(text: str) -> dict:

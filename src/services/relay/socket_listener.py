@@ -69,11 +69,55 @@ def handle_socket_request(client: Any, request: Any) -> bool:
         return False
     actions = payload.get("actions") or []
     action_id = actions[0].get("action_id") if actions else None
+
+    from src.api.admin_router import (
+        _handle_relay_decision,
+        _handle_confirm_entity_link,
+        _handle_reject_entity_link,
+        _handle_view_entity_link,
+        _handle_add_builder_to_diallist,
+        _handle_snooze_builder,
+        _handle_dismiss_builder,
+    )
+    from src.core.database import get_db_context
+
+    # EXCEPTIONS lane (WP-T2-8)
+    if action_id and action_id.startswith("confirm_entity_link_"):
+        with get_db_context() as db:
+            result = _handle_confirm_entity_link(payload, db)
+        _post_socket_ephemeral(client, payload, result)
+        return True
+    if action_id and action_id.startswith("reject_entity_link_"):
+        with get_db_context() as db:
+            result = _handle_reject_entity_link(payload, db)
+        _post_socket_ephemeral(client, payload, result)
+        return True
+    if action_id and action_id.startswith("view_entity_link_"):
+        with get_db_context() as db:
+            result = _handle_view_entity_link(payload, db)
+        _post_socket_ephemeral(client, payload, result)
+        return True
+
+    # RELATIONSHIPS lane (WP-T2-8)
+    if action_id and action_id.startswith("add_builder_to_diallist_"):
+        with get_db_context() as db:
+            result = _handle_add_builder_to_diallist(payload, db)
+        _post_socket_ephemeral(client, payload, result)
+        return True
+    if action_id and action_id.startswith("snooze_builder_"):
+        with get_db_context() as db:
+            result = _handle_snooze_builder(payload, db)
+        _post_socket_ephemeral(client, payload, result)
+        return True
+    if action_id and action_id.startswith("dismiss_builder_"):
+        with get_db_context() as db:
+            result = _handle_dismiss_builder(payload, db)
+        _post_socket_ephemeral(client, payload, result)
+        return True
+
+    # Relay approve/reject
     if action_id not in {"approve", "reject"}:
         return False
-
-    # Imports stay local so a worker startup does not create an API server.
-    from src.api.admin_router import _handle_relay_decision
 
     result = _handle_relay_decision(payload)
     # HTTP can return an ephemeral refusal directly to Slack. Socket Mode has
@@ -86,6 +130,24 @@ def handle_socket_request(client: Any, request: Any) -> bool:
             (result or {}).get("text", "no result detail"),
         )
     return True
+
+
+def _post_socket_ephemeral(client: Any, payload: dict, result: dict) -> None:
+    """Send an ephemeral reply after a Socket Mode button action.
+
+    Socket Mode already acknowledged the envelope — ephemeral replies must go
+    through chat.postEphemeral, not the envelope response.
+    """
+    text = (result or {}).get("text", "")
+    if not text:
+        return
+    try:
+        channel = payload.get("channel", {}).get("id", "")
+        user_id = payload.get("user", {}).get("id", "")
+        if channel and user_id:
+            client.web_client.chat_postEphemeral(channel=channel, user=user_id, text=text)
+    except Exception:
+        logger.warning("[RelaySocket] could not post ephemeral reply: %s", text)
 
 
 def run() -> None:

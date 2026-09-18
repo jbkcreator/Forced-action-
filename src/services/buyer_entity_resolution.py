@@ -1437,7 +1437,7 @@ def _emit_exceptions_alerts(
         return
 
     settings = get_settings()
-    token = settings.slack_bot_token
+    token = settings.fa_max_slack_bot_token or settings.slack_bot_token
     channel = getattr(settings, "fa_max_slack_channel_exceptions", "")
     if not token or not channel:
         logger.info(

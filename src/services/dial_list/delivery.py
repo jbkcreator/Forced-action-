@@ -259,7 +259,7 @@ def deliver_dial_list(
     the daily job. When ``interactive`` is set, cards carry action buttons.
     """
     settings = get_settings()
-    token = settings.slack_bot_token
+    token = settings.fa_max_slack_bot_token or settings.slack_bot_token
     target = _resolve_channel(channel)
     if not token or not target:
         logger.warning(

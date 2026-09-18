@@ -194,7 +194,7 @@ def emit_relationships_alert(
     lane pattern so nightly runs never fail due to missing Slack config.
     """
     settings = get_settings()
-    token = settings.slack_bot_token
+    token = settings.fa_max_slack_bot_token or settings.slack_bot_token
     channel = settings.fa_max_slack_channel_relationships
 
     if not token or not channel:
