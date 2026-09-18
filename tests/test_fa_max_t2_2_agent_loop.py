@@ -51,6 +51,59 @@ class TestConsolidatedProductionPaths:
         with pytest.raises(ValueError, match="unsupported_task_description"):
             select_task_tools("decide what to do", {"person_id": "p1"})
 
+    def test_task_description_resolves_and_joined_clauses(self):
+        """WP-T2-2 review fix: 'check suppression and show history' must
+        resolve to TWO ordered steps, not raise unsupported_multi_action_task."""
+        from src.agents.fa_max.tool_registry import select_task_tools
+
+        steps = select_task_tools(
+            "check suppression and show history",
+            {"recipient": "a@b.com", "channel": "email", "person_id": "p1"},
+        )
+        assert steps == [
+            {"tool": "check_suppression", "args": {"recipient": "a@b.com", "channel": "email"}},
+            {"tool": "get_fa_max_person_history", "args": {"person_id": "p1"}},
+        ]
+
+    def test_task_description_resolves_then_joined_clauses(self):
+        from src.agents.fa_max.tool_registry import select_task_tools
+
+        steps = select_task_tools(
+            "show state then post to slack",
+            {"person_id": "p1", "item_id": 7},
+        )
+        assert [s["tool"] for s in steps] == ["get_fa_max_person_state", "post_slack"]
+
+    def test_task_description_multi_clause_preserves_order(self):
+        from src.agents.fa_max.tool_registry import select_task_tools
+
+        steps = select_task_tools(
+            "show history and show state and post to slack",
+            {"person_id": "p1", "item_id": 3},
+        )
+        assert [s["tool"] for s in steps] == [
+            "get_fa_max_person_history", "get_fa_max_person_state", "post_slack",
+        ]
+
+    def test_task_description_multi_clause_fails_closed_on_bad_clause(self):
+        """One unresolvable clause rejects the WHOLE task -- no partial
+        execution of only the clauses that matched."""
+        from src.agents.fa_max.tool_registry import select_task_tools
+
+        with pytest.raises(ValueError, match="unsupported_task_description"):
+            select_task_tools("show history and do something vague", {"person_id": "p1"})
+
+    def test_task_description_single_clause_unchanged(self):
+        """A description with no 'and'/'then' still returns a one-item list
+        exactly as before this fix."""
+        from src.agents.fa_max.tool_registry import select_task_tools
+
+        assert select_task_tools("send this", {
+            "idempotency_key": "k", "channel": "email", "recipient": "a@b.com",
+            "payload": {"body": "hi"}, "agent_name": "cora", "lane": "MONEY",
+            "autonomy_tier_at_send": "A", "person_id": "p1",
+        })[0]["tool"] == "send"
+
     def test_send_cannot_claim_another_agents_evidence(self):
         from src.agents.fa_max.agent_graph import _call_tool_with_timeout
         from src.services.fa_max_send_governance import GovernanceBlocked
@@ -60,6 +113,12 @@ class TestConsolidatedProductionPaths:
                                     timeout_seconds=1, agent_name="cora")
 
     def test_autonomous_a_requires_real_context_after_prior_contact(self):
+        """WP-T2-2 review fix: the prior "any later inbound interaction"
+        heuristic did not tie the reply to the SAME thread -- fa_max_
+        interactions has no thread_id column, so it could only ever prove
+        "this person replied to something, at some point." A non-funded
+        Tier A claim must now fall through to human approval unconditionally
+        (a single funded-loan query, no thread-crossing exploit query)."""
         from src.services.fa_max_send_governance import autonomous_tier_context_verified
 
         session = MagicMock()
@@ -67,8 +126,27 @@ class TestConsolidatedProductionPaths:
         assert autonomous_tier_context_verified(
             session, person_id="person", tier="A", thread_id="thread",
         ) is False
-        assert session.execute.call_count == 2
-        assert "i.direction = 'inbound'" in str(session.execute.call_args.args[0])
+        assert session.execute.call_count == 1
+        assert "outcome = 'funded'" in str(session.execute.call_args.args[0])
+
+    def test_autonomous_a_thread_crossing_no_longer_exploitable(self):
+        """A reply on an UNRELATED thread (or any later inbound touch) must
+        never authorize an autonomous send on a different thread -- the
+        function now has no code path that could be tricked into it."""
+        import inspect
+        from src.services.fa_max_send_governance import autonomous_tier_context_verified
+        source = inspect.getsource(autonomous_tier_context_verified)
+        assert "i.direction = 'inbound'" not in source
+        assert "relay_approval_queue" not in source
+
+    def test_autonomous_a_funded_borrower_still_verified(self):
+        from src.services.fa_max_send_governance import autonomous_tier_context_verified
+
+        session = MagicMock()
+        session.execute.return_value.scalar.return_value = 1
+        assert autonomous_tier_context_verified(
+            session, person_id="person", tier="A", thread_id=None,
+        ) is True
 
     def test_autonomous_b_requires_active_partner(self):
         from src.services.fa_max_send_governance import autonomous_tier_context_verified

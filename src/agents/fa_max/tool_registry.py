@@ -40,6 +40,7 @@ fresh, unconditional post_for_approval() call for a still-pending row.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Literal, Optional
 
@@ -84,16 +85,15 @@ FA_MAX_AUTONOMY_POLICY = {
 }
 
 
-def select_task_tools(description: str, context: dict) -> list[dict]:
-    """Select registered v1 tools for a bounded operator task.
+def _select_single_task_tool(intent: str, context: dict) -> dict:
+    """Resolve ONE clause of a task description to one {tool, args} step.
 
-    The deterministic selector follows Cora's existing no-LLM routing
-    pattern. Ambiguous requests fail closed; outbound content and recipient
-    must be explicit context, then Relay applies its own send gates.
+    Split out of select_task_tools() so a multi-clause description (WP-T2-2
+    review fix, below) can call this once per clause and concatenate the
+    results into an ordered steps list -- the same shape agent_graph.py's
+    loop already consumes for an operator-supplied plan, just derived from
+    text instead of typed directly.
     """
-    intent = " ".join(description.casefold().split())
-    if " then " in intent or " and " in intent:
-        raise ValueError("unsupported_multi_action_task")
     if "suppression" in intent:
         name = "check_suppression"
         args = {key: context[key] for key in ("recipient", "channel") if key in context}
@@ -113,7 +113,7 @@ def select_task_tools(description: str, context: dict) -> list[dict]:
         name = "post_slack"
         args = {"item_id": context["item_id"]} if "item_id" in context else {}
     else:
-        raise ValueError("unsupported_task_description")
+        raise ValueError(f"unsupported_task_description:{intent!r}")
     if name not in FA_MAX_TOOL_REGISTRY:
         raise ValueError("selected_tool_not_registered")
     required = {
@@ -126,7 +126,35 @@ def select_task_tools(description: str, context: dict) -> list[dict]:
     }[name]
     if not required.issubset(args):
         raise ValueError("task_context_missing:" + ",".join(sorted(required - args.keys())))
-    return [{"tool": name, "args": args}]
+    return {"tool": name, "args": args}
+
+
+_CLAUSE_SPLIT_RE = re.compile(r"\s+(?:then|and)\s+")
+
+
+def select_task_tools(description: str, context: dict) -> list[dict]:
+    """Select registered v1 tools for a bounded operator task.
+
+    The deterministic selector follows Cora's existing no-LLM routing
+    pattern. Ambiguous requests fail closed; outbound content and recipient
+    must be explicit context, then Relay applies its own send gates.
+
+    WP-T2-2 review fix: a description joined by "and"/"then" ("check
+    suppression and send") is now split into ordered clauses, each resolved
+    independently via _select_single_task_tool() and concatenated into one
+    steps list — the same execution-plan shape a caller could already
+    supply directly. This is still NOT free-form reasoning: each clause is
+    matched against the same fixed keyword table as a single-clause
+    description always was, in the ORDER the words appeared, with the SAME
+    fail-closed behavior — any clause that doesn't resolve raises and the
+    whole task is rejected rather than partially executed. A description
+    with no "and"/"then" behaves exactly as before (a single-item list).
+    """
+    intent = " ".join(description.casefold().split())
+    clauses = [c.strip() for c in _CLAUSE_SPLIT_RE.split(intent) if c.strip()]
+    if not clauses:
+        raise ValueError("unsupported_task_description")
+    return [_select_single_task_tool(clause, context) for clause in clauses]
 
 
 def fa_max_tool(
