@@ -105,6 +105,13 @@ class AppSettings(BaseSettings):
 	instantly_base_url: str = Field(default="https://api.instantly.ai", env="INSTANTLY_BASE_URL")
 	instantly_enabled: bool = Field(default=True, env="INSTANTLY_ENABLED")
 
+	# Instantly webhook receiver (WP-T2-1 go-live review, 2026-09) — Instantly's
+	# webhook registration UI lets a custom header be attached to every delivery;
+	# set this to whatever value is configured there so /webhooks/instantly can
+	# reject deliveries that don't carry it. Unset = the endpoint fails closed
+	# (rejects everything) rather than accepting unauthenticated bounce claims.
+	instantly_webhook_secret: Optional[SecretStr] = Field(default=None, env="INSTANTLY_WEBHOOK_SECRET")
+
 	# Non-buyer nurture — shared Instantly campaign. Per the 2026-07-22 domain
 	# decision this shares the same warmed mailbox as the DBPR cold campaign
 	# (leads@forcedactionleads.com), not a separate dedicated domain — see
@@ -830,6 +837,52 @@ class AppSettings(BaseSettings):
 	fa_max_slack_channel_exceptions: str = Field(default="", env="FA_MAX_SLACK_CHANNEL_EXCEPTIONS")
 	fa_max_slack_channel_relationships: str = Field(default="", env="FA_MAX_SLACK_CHANNEL_RELATIONSHIPS")
 	fa_max_backflip_feed_max_age_hours: int = Field(default=24, ge=1, env="FA_MAX_BACKFLIP_FEED_MAX_AGE_HOURS")
+
+	# ── FA Max WP-T2-1 — Own-Lane Send Infrastructure ────────────────────────
+	# "fake" (default) = every FA Max relay send goes through the in-memory
+	# FakeInstantly/FakeTelnyx recorders in src/services/relay/fakes.py — no
+	# network, no credentials, safe for every developer's tests and for local
+	# dev. "live" = real Instantly/Telnyx calls. Flip only once the dedicated
+	# outreach domain, DNS auth, and 10DLC registration are confirmed; this
+	# flag does not itself replace the fa_max_10dlc_registered SMS gate below.
+	fa_max_relay_send_mode: str = Field(default="fake", env="FA_MAX_RELAY_SEND_MODE")
+
+	# Code-review finding (WP-T2-1, third round): flipping fa_max_relay_send_
+	# mode to "live" alone must NOT auto-release the backlog of items
+	# approved during the weeks-long warmup ramp while the lane was still in
+	# fake mode -- their content or the underlying business decision behind
+	# them may be stale by go-live. This flag is a SEPARATE, deliberate
+	# confirmation (mirrors fa_max_10dlc_registered's manual, defaults-closed
+	# pattern): relay.guards defers every FA Max item, regardless of channel,
+	# until BOTH this and fa_max_relay_send_mode == "live" are true.
+	#
+	# What this flag does NOT do (code-review clarification, fourth round):
+	# an earlier per-item Slack approval (relay_approval_queue.decided_by/
+	# decided_at/decision_interaction_id -- WP-2's existing MONEY-lane
+	# approve/reject flow) is NOT the same review this flag certifies. Josh
+	# may have approved a message weeks before the lane was even ready to
+	# send it. This flag only enforces that SOME go-live review happened; it
+	# does not perform or record one. Before setting it true, the operator
+	# enabling live sending must, as a manual go-live procedure (no UI or
+	# code support exists for this -- deliberately, per WP-T2-1's scope):
+	#   1. List every FA Max row still in 'approved' status (the backlog).
+	#   2. Check each one's content and original approval date for staleness.
+	#   3. If any approved item is stale, keep this flag false until those
+	#      items are safely removed from the approved queue. The existing
+	#      Slack Approve/Reject buttons only decide pending items; they cannot
+	#      reject an item that is already approved. No approved-item cancellation
+	#      workflow exists here. Once this flag is true, the next sweep can
+	#      dispatch every remaining approved row, oldest first, up to the
+	#      daily ceiling.
+	#   4. Record who ran this review and when, outside this flag (e.g. in
+	#      the go-live runbook/incident channel) -- this flag is a boolean,
+	#      not an audit trail.
+	# A real per-item release/reject mechanism was explicitly scoped OUT for
+	# WP-T2-1 (2026-09 decision) in favor of this manual procedure plus the
+	# single flag; do not read its existence as proof the review happened.
+	fa_max_send_backlog_release_confirmed: bool = Field(
+		default=False, env="FA_MAX_SEND_BACKLOG_RELEASE_CONFIRMED"
+	)
 
 
 @lru_cache

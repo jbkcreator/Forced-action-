@@ -2789,6 +2789,97 @@ class LifecycleEventQueue(Base):
         return f"<LifecycleEventQueue(id={self.id}, type={self.event_type}, status={self.status})>"
 
 
+class FaMaxExceptionsAlertQueue(Base):
+    """
+    Durable pending-alert queue for the FA Max EXCEPTIONS Slack lane
+    (WP-T2-1 go-live review, 2026-09).
+
+    Before this table existed, post_exceptions_alert() was called directly
+    and fire-and-forget by both fa_max_send_health_monitor.py and
+    relay/sweep.py's suppression-sync-failure path: a Slack outage OR a
+    process crash between deciding to alert and the Slack call completing
+    meant the alert was silently lost -- there was nothing durable to retry.
+    Mirrors LifecycleEventQueue's pending/committed-first pattern: a row is
+    inserted and committed BEFORE the Slack call is attempted, so a crash at
+    any point after that leaves a recoverable 'pending' row rather than
+    nothing at all.
+
+    Ambiguous-result note (documented, not solved): if the process crashes
+    or times out AFTER Slack has accepted chat_postMessage but BEFORE this
+    row is marked 'sent', the next drain tick re-posts the same content --
+    a duplicate Slack message, not a lost one. Unlike relay's approval-card
+    retry (slack_post.post_for_approval), which reconciles via
+    conversations_history search because a duplicate APPROVAL CARD risks a
+    duplicate SEND, an EXCEPTIONS alert carries no send risk -- worst case
+    is Josh sees the same warning twice. That asymmetry is why this queue
+    does not implement history-based reconciliation: the cost of building
+    it isn't justified by what a duplicate here actually costs.
+
+    Status values: 'pending' (not yet delivered) -> 'sent' (terminal).
+    Retry is intentionally unbounded (a stale-source-style alert must not
+    silently give up — see testing-verification's failure/retry guidance);
+    `attempts` is tracked for observability, not as a cutoff.
+
+    `claimed_until` (code-review finding, 2026-09): enqueue_and_attempt()'s
+    immediate delivery attempt and drain_pending()'s retry sweep both
+    operate on 'pending' rows with a real network call (Slack) in between
+    the row becoming visible and it being finalized. Without an atomic
+    claim, the immediate attempt and an overlapping drain tick — or two
+    overlapping drain ticks, if one run takes longer than the cron cadence
+    — can both select and post the SAME row concurrently: a genuine
+    duplicate-post case beyond the documented crash-after-Slack one above.
+    Mirrors relay_approval_queue.slack_post_lease_until's exact pattern
+    (queue.py's claim_slack_post/release_slack_post) — a short-lived lease,
+    not a hard lock, so a crashed claimant's row naturally becomes
+    claimable again after the lease expires rather than staying stuck.
+    """
+    __tablename__ = "fa_max_exceptions_alert_queue"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    venture_key: Mapped[str] = mapped_column(Text, nullable=False)
+    rule: Mapped[str] = mapped_column(Text, nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    last_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    error: Mapped[Optional[str]] = mapped_column(Text)
+    claimed_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        Index("idx_fa_max_exceptions_alert_queue_status", "status", "created_at"),
+        # Dedup lookup: "is there already a pending-or-recently-sent row for
+        # this (venture, rule)" — sweep.py's suppression-sync-failure path
+        # can otherwise fire once per sweep tick (every 30 min) for a
+        # multi-hour Instantly outage, flooding this table with duplicate
+        # pending rows for the same underlying condition.
+        Index("idx_fa_max_exceptions_alert_queue_dedup", "venture_key", "rule", "created_at"),
+        Index("idx_fa_max_exceptions_alert_queue_claim", "status", "claimed_until"),
+        # Code-review finding (third round, 2026-09): the dedup lookup above
+        # is a plain SELECT, and SELECT-then-INSERT is a check-then-act race
+        # -- two concurrent producers can both see "nothing pending" and
+        # both insert. Reproduced directly. This partial unique index is
+        # the actual fix: the database itself refuses a second 'pending' row
+        # for the same (venture_key, rule), so exceptions_alert_queue.py's
+        # enqueue only needs to catch the resulting IntegrityError, not
+        # prevent the race in application code (which a SELECT can't do
+        # alone).
+        Index(
+            "ux_fa_max_exceptions_alert_queue_pending_dedup", "venture_key", "rule",
+            unique=True, postgresql_where=text("status = 'pending'"),
+        ),
+    )
+
+    def __repr__(self):
+        return (
+            f"<FaMaxExceptionsAlertQueue(id={self.id}, rule={self.rule!r}, "
+            f"status={self.status!r})>"
+        )
+
+
 class UnifiedSubscriberMemory(Base):
     """
     Single audit-spine table aggregating all external-interaction events
@@ -5024,6 +5115,13 @@ class Venture(Base):
     # used to live in src/services/relay/channels_email.py.
     brand_name: Mapped[str] = mapped_column(String(120), nullable=False)
     postal_address: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Phone line and compliance disclaimer rendered in the same CAN-SPAM
+    # footer as brand_name/postal_address (WP-T2-1 go-live review, 2026-09,
+    # client Q9 "Email Branding, Signature, and Compliance Footer"). Both
+    # optional -- a venture with neither set gets the pre-existing
+    # brand+address+unsubscribe footer unchanged (channels_email.py).
+    outbound_contact_phone: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    outbound_disclaimer: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # Geography. `state` is read by the flood/insurance/storm scrapers for
     # NWS + FEMA lookups; the court fields by bankruptcy_engine. Both were

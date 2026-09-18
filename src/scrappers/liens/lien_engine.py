@@ -1189,6 +1189,15 @@ async def run_lien_pipeline(
                     outcome,
                     error_message=str(load_error)[:500] if load_error is not None else "one or more lien/deed/judgment DB loads failed",
                 )
+                # Code-review finding, PR #281: this branch correctly recorded
+                # the failure via run.fail() above but fell through to the
+                # unconditional `return True` below, so the CLI's
+                # sys.exit(0 if success else 1) exited 0 on a genuine DB-load
+                # failure -- exactly the exit-code correctness
+                # pipeline_exit_code() exists to guarantee (see its own
+                # docstring for the mirror-image bug this class of check
+                # already caught once).
+                return False
         elif day_errors:
             run.fail(
                 ScraperOutcome.UNKNOWN.value,

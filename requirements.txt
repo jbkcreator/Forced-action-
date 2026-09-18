@@ -30,6 +30,10 @@ usaddress>=0.5.10
 python-jose[cryptography]>=3.3.0
 bcrypt>=4.0.0
 email-validator>=2.0.0
+dnspython>=2.6.0  # already present transitively via email-validator; pinned
+                  # directly for WP-T2-1's relay --health SPF/DKIM/DMARC
+                  # checks (src/services/relay/__main__.py) so those checks
+                  # don't silently break if email-validator ever drops it
 
 # File format readers
 dbfread>=2.0.7

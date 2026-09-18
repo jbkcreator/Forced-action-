@@ -225,6 +225,16 @@ def _telnyx(payload: Dict[str, Any]) -> dict:
     }
 
 
+def _instantly(payload: Dict[str, Any]) -> dict:
+    """Instantly webhook — keep event/campaign ids, drop the lead email."""
+    lead = payload.get("lead") if isinstance(payload.get("lead"), dict) else {}
+    return {
+        "event_type":  payload.get("event_type") or payload.get("event"),
+        "campaign_id": payload.get("campaign_id") or lead.get("campaign_id"),
+        "has_email":   bool(payload.get("email") or payload.get("lead_email") or lead.get("email")),
+    }
+
+
 def _checkout_started(payload: Dict[str, Any]) -> dict:
     """Our own pre-built checkout-creation metadata (tier/product/etc.) —
     not a raw Stripe Event, so it must not go through _stripe's Event-shaped
@@ -246,6 +256,7 @@ _SANITIZERS = {
     "telnyx":              _telnyx,
     "telnyx_inbound":      _telnyx,
     "telnyx_voice":        _telnyx,
+    "instantly":           _instantly,
 }
 
 

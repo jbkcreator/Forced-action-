@@ -247,6 +247,34 @@ def post_blocked_action(item: QueueItem, reason: str) -> None:
         logger.error("[Relay] blocked-action post failed for item %d: %s", item.id, exc, exc_info=True)
 
 
+def post_exceptions_alert(*, venture_key: str, rule: str, message: str) -> bool:
+    """Post an operational (non-item) alert to the FA Max EXCEPTIONS lane.
+
+    Used for send-infrastructure health (WP-T2-1: "Alert in EXCEPTIONS queue
+    when reputation falls below threshold") and for a failed suppression
+    sync — these are not `RelayApprovalQueueItem` decisions, so they don't
+    go through post_for_approval/post_blocked_action. Returns True if the
+    alert was actually posted (Slack configured and the call succeeded),
+    False otherwise, so a caller with durable dedup (e.g. ScraperAlertLog)
+    can decide whether to record the alert as delivered.
+    """
+    settings = get_settings()
+    token = settings.slack_bot_token
+    channel = getattr(settings, "fa_max_slack_channel_exceptions", "") or get_venture_config(venture_key).relay_slack_channel
+    if not token or not channel:
+        logger.warning("[Relay][EXCEPTIONS] %s (venture=%s): Slack not configured — %s", rule, venture_key, message)
+        return False
+    try:
+        from slack_sdk import WebClient
+        WebClient(token=token.get_secret_value()).chat_postMessage(
+            channel=channel, text=f":rotating_light: *{rule}* (venture={venture_key})\n{message}",
+        )
+        return True
+    except Exception:
+        logger.exception("[Relay][EXCEPTIONS] alert post failed for rule %s (venture=%s)", rule, venture_key)
+        return False
+
+
 def post_uncertain_action(item: QueueItem) -> None:
     """Ask an operator to reconcile an ambiguous provider result; never retry it."""
     settings = get_settings()

@@ -29,6 +29,8 @@ gets slow.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
+from typing import Literal
 
 from config.venture_template import DEFAULT_VENTURE_KEY
 from src.core.database import get_db_context
@@ -41,40 +43,125 @@ logger = logging.getLogger(__name__)
 
 _SUPPRESS_ON_STATUS = {"unsubscribed", "bounced"}
 
+# NOTE (production-execution review, finding 4; investigated WP-T2-1
+# go-live review, 2026-09): Instantly's lead status vocabulary (see
+# instantly_service._LEAD_STATUS_MAP) has "bounced" and "unsubscribed" but
+# no distinct spam-complaint status — this poll cannot ingest complaints
+# today. Do not treat this module as complaint-complete; it is a live-lane
+# blocker (WP-T2-1 Done When: "complaint event ingestion: spam complaints
+# auto-suppress immediately").
+#
+# Investigation findings (public API v2 docs, 2026-09 — re-verify against
+# this account's actual plan/webhook config before building anything, since
+# public docs alone can't confirm account-level availability):
+#   - Instantly's documented webhook event catalog
+#     (https://developer.instantly.ai/guides/webhook-events) has
+#     `email_bounced` and `lead_unsubscribed` events but NO distinct
+#     spam-complaint/FBL event type. Confirmed precisely, not overstated
+#     (code-review finding, 2026-09 -- an earlier version of this comment
+#     said "permanent... unless Instantly adds one," which is internally
+#     contradictory and too narrow a claim anyway): this establishes only
+#     that INSTANTLY'S OWN API doesn't expose a complaint signal today, not
+#     that complaint data is unobtainable by any means. Complaint feedback
+#     loops (FBL) commonly exist independent of the ESP entirely -- e.g.
+#     Microsoft's JMRP delivers a per-complaint ARF report directly to a
+#     registered address for Outlook/Hotmail/Live/MSN complaints, and
+#     Gmail's Postmaster Tools API exposes an aggregate daily spam-rate
+#     metric -- neither investigated here, both a genuinely separate path
+#     from anything Instantly does or doesn't add to its API. Until one of
+#     these is investigated and either wired up or ruled out, treat
+#     complaint ingestion as unimplemented and undecided, not as a settled
+#     dead end -- and do not infer complaint data from bounce rate, warmup
+#     score, or Relay's own failure rate (those measure different things
+#     and would silently misclassify).
+#   - The SAME webhook catalog DOES expose `email_bounced`, which lets
+#     hard-bounce suppression become immediate (webhook-driven) instead of
+#     this module's ~30-min poll. IMPLEMENTED (2026-09): see
+#     src/services/relay/bounce_webhook.py + POST /webhooks/instantly
+#     (src/api/main.py) -- registration with Instantly (which needs the
+#     Hypergrowth plan or higher per Instantly's docs) and confirming the
+#     account is actually enrolled is an account-level step outside this
+#     codebase, not an engineering blocker anymore. This module's poll
+#     stays in place unchanged as the backstop for a missed webhook
+#     delivery -- it is not superseded, just no longer the fastest path.
 
-def sync_unsubscribes(venture_key: str = DEFAULT_VENTURE_KEY) -> int:
+
+@dataclass(frozen=True)
+class SyncResult:
+    status: Literal["synced", "not_configured"]
+    count: int = 0
+
+
+class SuppressionSyncFailed(RuntimeError):
+    """Raised when the Instantly poll itself fails (network/API error) —
+    distinct from `not_configured`, which is an expected state for a venture
+    whose email channel isn't wired up yet, not a fault."""
+
+
+def sync_unsubscribes(venture_key: str = DEFAULT_VENTURE_KEY) -> SyncResult:
     """Pull unsubscribed/bounced leads from `venture_key`'s Relay passthrough
-    campaign into email_opt_outs (cascading to sms_opt_outs). Returns the
-    number of leads suppressed this run. No-op (returns 0) if that venture's
-    email channel isn't configured yet."""
+    campaign into email_opt_outs (cascading to sms_opt_outs).
+
+    Returns SyncResult(status="not_configured") if that venture's email
+    channel isn't set up yet — an expected state, not an error, so the
+    caller must not treat it as a failed sync (production-execution review,
+    finding 3: the old `return 0` for this case was indistinguishable from
+    "polled and found nothing to suppress").
+
+    Raises SuppressionSyncFailed if the Instantly poll itself fails. The
+    caller (sweep.run_sweep) must treat that as reason to defer the whole
+    batch rather than send against a suppression list that may now be
+    stale — the entire point of syncing before the guard recheck.
+    """
     campaign_id = get_venture_config(venture_key).relay_instantly_campaign_id
     if not campaign_id:
-        return 0
+        return SyncResult(status="not_configured")
 
     synced = 0
     cursor = None
-    with get_db_context() as db:
-        while True:
-            page = instantly.list_leads(campaign_id, cursor=cursor)
-            if not page:
-                break
-            leads = page.get("leads", [])
-            if not leads:
-                break
+    try:
+        with get_db_context() as db:
+            while True:
+                page = instantly.list_leads(campaign_id, cursor=cursor)
+                if page is None:
+                    # instantly_service.list_leads() returns None for TWO
+                    # different reasons it does not distinguish: the global
+                    # Instantly integration being disabled/unconfigured, or a
+                    # genuine mid-poll request failure (network/API error) --
+                    # see its own docstring. Both look identical here, and
+                    # both mean this run cannot prove what changed since the
+                    # last sync. Treating either as "reached the last page"
+                    # (the pre-review-fix behaviour) silently truncated the
+                    # poll and reported status="synced" even when a failure
+                    # happened on page 2 of 6 -- exactly the stale-suppression
+                    # risk this module exists to prevent. Fail closed instead:
+                    # raise so the caller (sweep.run_sweep) defers the whole
+                    # batch rather than send against a partial suppression
+                    # view.
+                    raise SuppressionSyncFailed(
+                        f"Instantly list_leads returned None for venture {venture_key} "
+                        f"(campaign {campaign_id}, cursor={cursor!r}) -- integration "
+                        f"disabled or request failed; cannot confirm this page synced"
+                    )
+                leads = page.get("leads", [])
+                if not leads:
+                    break
 
-            for lead in leads:
-                email = (lead.get("email") or "").strip().lower()
-                if not email:
-                    continue
-                raw_status = lead.get("interest_status") or lead.get("status") or "active"
-                if map_lead_status(raw_status) in _SUPPRESS_ON_STATUS:
-                    suppress_contact(db, email=email, source="instantly_sync")
-                    synced += 1
+                for lead in leads:
+                    email = (lead.get("email") or "").strip().lower()
+                    if not email:
+                        continue
+                    raw_status = lead.get("interest_status") or lead.get("status") or "active"
+                    if map_lead_status(raw_status) in _SUPPRESS_ON_STATUS:
+                        suppress_contact(db, email=email, source="instantly_sync")
+                        synced += 1
 
-            cursor = page.get("next_starting_after")
-            if not cursor:
-                break
-        # get_db_context() commits on clean exit from this block (session_scope);
-        # no manual commit needed or safe to add here.
+                cursor = page.get("next_starting_after")
+                if not cursor:
+                    break
+            # get_db_context() commits on clean exit from this block (session_scope);
+            # no manual commit needed or safe to add here.
+    except Exception as exc:
+        raise SuppressionSyncFailed(f"Instantly suppression poll failed for venture {venture_key}: {exc}") from exc
 
-    return synced
+    return SyncResult(status="synced", count=synced)

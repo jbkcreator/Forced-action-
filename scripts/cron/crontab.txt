@@ -130,6 +130,20 @@ COUNTY_ID=hillsborough
 # publishes to Cora for classification + answer drafting, upserts to quora_questions.
 35 6 * * * $PROJECT/scripts/cron/run.sh src.tasks.quora_s6_orchestrator
 
+# FA Max send-infrastructure health monitor (WP-T2-1) — daily 06:40 AM UTC.
+# Proxy warmup/failure-rate checks for the FA Max lending outreach lane;
+# pages the EXCEPTIONS Slack lane. Does NOT measure true inbox placement
+# (no seed-list provider integrated — see module docstring); do not use
+# this alone to certify the 95% placement Done-When criterion.
+40 6 * * * $PROJECT/scripts/cron/run.sh src.tasks.fa_max_send_health_monitor
+
+# FA Max EXCEPTIONS alert drain worker (WP-T2-1 go-live review, 2026-09) —
+# every 5 min. Retries any alert left 'pending' after a Slack outage or a
+# process crash mid-attempt (fa_max_exceptions_alert_queue table). Mirrors
+# --post-pending-fa-max's cadence for the same reason: recovery should be
+# fast relative to how rarely EXCEPTIONS actually trips.
+*/5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.fa_max_exceptions_alert_drain
+
 # Autonomous Inbound Content Loop (Task 5.1) — Weekly Sunday @ 09:00 AM UTC.
 # Scores each Quora Seed Keyword over a 30-day window, deactivates losers
 # (>=5 answers, 0 paid signups) and expands winners (LLM variations, pool cap 30,
