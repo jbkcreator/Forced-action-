@@ -151,6 +151,21 @@ COUNTY_ID=hillsborough
 # WP-T2-2's own Done-When line, not superseded by that adjacent report.
 0 14 * * 5 $PROJECT/scripts/cron/run.sh src.tasks.fa_max_weekly_edit_rate_report
 
+# FA Max GYR Opportunity Router sweep (WP-T2-11) — daily 06:30 UTC.
+# Classifies every open fa_max_opportunity as green/yellow/red, persists GYR
+# fields, logs to fa_max_gyr_routing_log, and posts MONEY/EXCEPTIONS Slack
+# cards. Must complete before Josh's 07:00 ET morning review window.
+# Staggered after the nightly CDS rescore (07:00 UTC) window on the 24h cycle;
+# 06:30 UTC = 02:30 ET — well clear of both scraper close (06:30 UTC load
+# validator) and CDS open (07:00 UTC).
+30 6 * * * $PROJECT/scripts/cron/run.sh src.tasks.fa_max_opportunity_router_daily
+
+# FA Max GYR staleness pass (WP-T2-11) — daily 08:00 UTC.
+# Resurfaces unactioned green opportunities older than one business day
+# (Mon-Fri America/New_York). Runs after Josh's 07:00 ET review window
+# opens so he sees stale alerts alongside fresh morning deal flow.
+0 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.fa_max_opportunity_router_staleness
+
 # Autonomous Inbound Content Loop (Task 5.1) — Weekly Sunday @ 09:00 AM UTC.
 # Scores each Quora Seed Keyword over a 30-day window, deactivates losers
 # (>=5 answers, 0 paid signups) and expands winners (LLM variations, pool cap 30,
