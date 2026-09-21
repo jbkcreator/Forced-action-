@@ -105,3 +105,74 @@ def _post_stall_exception(session: Session, data: dict[str, Any], elapsed_days: 
             "pid": data["person_id"],
         },
     )
+
+
+_STATUS_TOUCH_CANDIDATES_SQL = text("""
+    SELECT fs.opportunity_id::text, fs.person_id::text, fs.backflip_stage,
+           fs.last_borrower_touch_at, fs.contact_email
+    FROM fa_max_file_state fs
+    -- 'funded'/'declined' mirrors config.fa_max_stage_monitoring.TERMINAL_BACKFLIP_STAGES;
+    -- keep this literal in sync if that constant ever changes.
+    WHERE fs.backflip_stage NOT IN ('funded', 'declined')
+    LIMIT 200
+""")
+
+_STATUS_TOUCH_BODY = (
+    "Quick update on your file — it's currently {stage_label}. "
+    "We'll reach out as soon as there's something new. In the meantime, "
+    "reply here anytime with questions."
+)
+
+_STAGE_LABELS = {
+    "submitted": "with Backflip for initial review",
+    "under_review": "under review",
+    "conditional_approval": "conditionally approved",
+    "docs_requested": "waiting on a couple of documents",
+    "cleared_to_close": "cleared to close",
+}
+
+
+def sweep_status_touches(session: Session) -> int:
+    from src.services import fa_max_file_state
+
+    rows = session.execute(_STATUS_TOUCH_CANDIDATES_SQL).fetchall()
+    sent = 0
+    for row in rows:
+        data = dict(row._mapping)
+        if data["last_borrower_touch_at"] is not None:
+            elapsed = business_days_since(data["last_borrower_touch_at"])
+            if elapsed < STATUS_TOUCH_INTERVAL_BUSINESS_DAYS:
+                continue
+        if not data.get("contact_email"):
+            logger.warning(
+                "stage_monitor: opportunity_id=%s has no resolvable contact email "
+                "(fa_max_file_state.contact_email is NULL) — skipping status touch",
+                data["opportunity_id"],
+            )
+            continue
+        try:
+            body = _STATUS_TOUCH_BODY.format(
+                stage_label=_STAGE_LABELS.get(data["backflip_stage"], "moving forward")
+            )
+            was_sent = fa_max_file_state.send_governed_email(
+                session, opportunity_id=data["opportunity_id"], person_id=data["person_id"],
+                contact_email=data["contact_email"], subject="Update on your application",
+                body=body, lane="RELATIONSHIPS", agent_name=_AGENT_NAME,
+                idempotency_key=f"fa_max_status_touch:{data['opportunity_id']}:{_today_key()}",
+            )
+            if was_sent:
+                fa_max_file_state.touch_borrower(session, opportunity_id=data["opportunity_id"])
+                sent += 1
+        except Exception:
+            logger.exception(
+                "stage_monitor: failed to send status touch for opportunity_id=%s",
+                data["opportunity_id"],
+            )
+    if sent:
+        logger.info("stage_monitor: sent %d status touch(es)", sent)
+    return sent
+
+
+def _today_key() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).date().isoformat()
