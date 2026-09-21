@@ -46,6 +46,8 @@ class TestFaMaxFileUpdateCommand:
             "src.agents.reply_concierge.backflip_stage_ingest.resolve_opportunity_by_backflip_ref",
             return_value={"opportunity_id": "opp-1", "person_id": "p-1"},
         ), patch(
+            "src.services.fa_max_file_state.ensure_file_state"
+        ), patch(
             "src.services.fa_max_file_state.update_backflip_stage"
         ) as mock_update:
             response = client.post(
@@ -65,6 +67,8 @@ class TestFaMaxFileUpdateCommand:
         ), patch(
             "src.agents.reply_concierge.backflip_stage_ingest.resolve_opportunity_by_backflip_ref",
             return_value={"opportunity_id": "opp-1", "person_id": "p-1"},
+        ), patch(
+            "src.services.fa_max_file_state.ensure_file_state"
         ), patch(
             "src.services.fa_max_file_state.record_document_request"
         ) as mock_record:
