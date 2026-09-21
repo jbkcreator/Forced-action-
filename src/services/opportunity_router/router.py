@@ -153,6 +153,7 @@ def run_staleness_pass(db: Session) -> int:
         )
         post_staleness_alert(ctx, decision)
 
+        db.execute(text("SET LOCAL fa_max.allow_state_write = 'on'"))
         db.execute(
             text("""
                 UPDATE fa_max_opportunities
@@ -217,6 +218,7 @@ def _minimal_staleness_ctx(opportunity_id: str):
 
 def _persist(opportunity_id: str, decision: RoutingDecision, db: Session) -> None:
     """UPDATE fa_max_opportunities with new GYR fields using CAS on state_version."""
+    db.execute(text("SET LOCAL fa_max.allow_state_write = 'on'"))
     db.execute(
         text("""
             UPDATE fa_max_opportunities
