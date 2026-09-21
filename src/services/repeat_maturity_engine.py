@@ -385,7 +385,7 @@ def _format_alert_blocks(alert: MonitorAlert) -> tuple[str, list]:
 def _post_alert(alert: MonitorAlert) -> Optional[str]:
     """Post one alert to Slack. Returns ts on success, None if unconfigured."""
     settings = get_settings()
-    token = settings.slack_bot_token
+    token = settings.fa_max_slack_bot_token or settings.slack_bot_token
     channel = settings.relationships_slack_channel
 
     summary_text, blocks = _format_alert_blocks(alert)
