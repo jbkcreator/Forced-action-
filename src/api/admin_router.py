@@ -2961,6 +2961,75 @@ async def slack_resume_command(request: Request):
     return _slack_ephemeral(f"✅ RESUME {target} — kill switch override cleared.")
 
 
+@router.post("/slack/fa-max-file-update")
+async def slack_fa_max_file_update_command(request: Request, db: Session = Depends(get_db)):
+    """
+    Slack slash command: '/fa-max-file-update <backflip_ref> <stage>' or
+    '/fa-max-file-update <backflip_ref> doc:<document name>' (WP-T2-6).
+
+    Stage tokens match config.fa_max_stage_monitoring.BACKFLIP_STAGE_KEYS
+    exactly (snake_case: under_review, conditional_approval, docs_requested,
+    cleared_to_close, funded, declined). A doc: prefix records a document
+    request instead of a stage change.
+
+    Same authorization gate as /relay-kill — relay_approvers, since manually
+    moving a file's stage/document state is at least as consequential.
+    """
+    from config.fa_max_stage_monitoring import BACKFLIP_STAGE_KEYS
+    from src.agents.reply_concierge.backflip_stage_ingest import resolve_opportunity_by_backflip_ref
+    from src.services import fa_max_file_state
+
+    raw = await request.body()
+    if not _verify_slack_signature(dict(request.headers), raw):
+        raise HTTPException(status_code=401, detail="Invalid Slack signature")
+
+    form = parse_qs(raw.decode("utf-8"))
+    user_id = form.get("user_id", [""])[0]
+    if not _relay_approver_authorized(user_id, "fa_max_lending"):
+        return _slack_ephemeral("Not authorized to update FA Max file state.")
+
+    tokens = form.get("text", [""])[0].strip().split(maxsplit=1)
+    if len(tokens) != 2:
+        return _slack_ephemeral(
+            "Usage: /fa-max-file-update <backflip_ref> <stage> | "
+            "/fa-max-file-update <backflip_ref> doc:<document name>"
+        )
+    backflip_ref, action = tokens[0], tokens[1].strip()
+
+    resolved = resolve_opportunity_by_backflip_ref(db, backflip_ref)
+    if resolved is None:
+        return _slack_ephemeral(f"No opportunity found for {backflip_ref}.")
+
+    if action.lower().startswith("doc:"):
+        document_name = action[len("doc:"):].strip()
+        if not document_name:
+            return _slack_ephemeral("Usage: /fa-max-file-update <backflip_ref> doc:<document name>")
+        fa_max_file_state.ensure_file_state(
+            db, opportunity_id=resolved["opportunity_id"], person_id=resolved["person_id"],
+        )
+        fa_max_file_state.record_document_request(
+            db, opportunity_id=resolved["opportunity_id"], person_id=resolved["person_id"],
+            document_name=document_name, source="manual",
+            idempotency_key=f"docreq:{resolved['opportunity_id']}:{document_name}",
+        )
+        return _slack_ephemeral(f"Recorded document request '{document_name}' for {backflip_ref}.")
+
+    stage = action.lower()
+    if stage not in BACKFLIP_STAGE_KEYS:
+        return _slack_ephemeral(
+            f"Usage: /fa-max-file-update {backflip_ref} <stage> — one of: "
+            + ", ".join(sorted(BACKFLIP_STAGE_KEYS))
+        )
+    fa_max_file_state.ensure_file_state(
+        db, opportunity_id=resolved["opportunity_id"], person_id=resolved["person_id"],
+    )
+    fa_max_file_state.update_backflip_stage(
+        db, opportunity_id=resolved["opportunity_id"], to_stage=stage,
+        actor=f"manual:{user_id}", source="manual",
+    )
+    return _slack_ephemeral(f"{backflip_ref} updated to stage: {stage}.")
+
+
 # ===========================================================================
 # WIN-STORY APPROVAL
 # ===========================================================================
