@@ -188,7 +188,20 @@ def run() -> None:
     from slack_sdk.socket_mode import SocketModeClient
 
     web = WebClient(token=bot_token.get_secret_value())
-    socket = SocketModeClient(app_token=app_token.get_secret_value(), web_client=web)
+    # concurrency=25 (library default: 10) -- this one connection carries both
+    # Relay approval-card clicks and /tracked-link slash commands. A burst of
+    # real approval activity can occupy all 10 default workers, queuing a
+    # slash command envelope behind them; if that queue wait pushes past
+    # Slack's 3-second ack window the command never even starts, and Slack
+    # shows the user "the app did not respond" with nothing logged on our
+    # side. Confirmed via isolated reproduction (2026-09-21): the same
+    # rapid-fire /tracked-link test dropped replies against the live
+    # production workspace but never dropped a single reply against an
+    # isolated test app/workspace with no concurrent traffic, run both
+    # locally and from this server -- ruling out the server's network path
+    # and the slash-command code itself, and pointing at worker-pool
+    # contention on the shared connection.
+    socket = SocketModeClient(app_token=app_token.get_secret_value(), web_client=web, concurrency=25)
 
     def _on_request(client: Any, request: Any) -> None:
         try:
