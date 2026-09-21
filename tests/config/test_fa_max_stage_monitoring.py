@@ -1,8 +1,6 @@
 """tests/config/test_fa_max_stage_monitoring.py"""
 from __future__ import annotations
 
-import pytest
-
 from config.fa_max_stage_monitoring import (
     BACKFLIP_STAGE_KEYS,
     DOC_CHASE_ESCALATE_BUSINESS_DAYS,
@@ -27,8 +25,8 @@ def test_terminal_stages_are_subset_of_stage_keys():
     assert TERMINAL_BACKFLIP_STAGES == {"funded", "declined"}
 
 
-def test_doc_chase_escalate_after_followup():
-    assert DOC_CHASE_ESCALATE_BUSINESS_DAYS > DOC_CHASE_FOLLOWUP_BUSINESS_DAYS
+def test_doc_chase_total_escalation_window_is_four_business_days():
+    assert DOC_CHASE_FOLLOWUP_BUSINESS_DAYS + DOC_CHASE_ESCALATE_BUSINESS_DAYS == 4.0
 
 
 def test_validate_passes_with_shipped_defaults():

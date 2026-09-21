@@ -27,9 +27,9 @@ STATUS_TOUCH_INTERVAL_BUSINESS_DAYS: float = 5.0
 # first touch if the doc still hasn't arrived.
 DOC_CHASE_FOLLOWUP_BUSINESS_DAYS: float = 2.0
 
-# Escalate to EXCEPTIONS this many business days after the original request
-# (4 total from the original request) if still outstanding.
-DOC_CHASE_ESCALATE_BUSINESS_DAYS: float = 4.0
+# Escalate to EXCEPTIONS this many business days after the follow-up send
+# (2 more days after follow-up at +2 = 4 total business days from original request).
+DOC_CHASE_ESCALATE_BUSINESS_DAYS: float = 2.0
 
 # Backflip-side stage taxonomy this build tracks. NOT the same enum as
 # fa_max_opportunity_stage_config.stage_key (the coarse borrower-journey
