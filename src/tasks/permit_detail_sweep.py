@@ -197,6 +197,18 @@ def _playwright_fetch_html(permit_number: str, county_id: str) -> Optional[str]:
 
 # --- DB persistence -----------------------------------------------------------
 
+def _parse_job_value_decimal(raw: Optional[str]) -> Optional[str]:
+    """Strip Accela currency formatting ($120,000.00 → '120000.00') for Postgres Numeric."""
+    if not raw:
+        return None
+    cleaned = raw.replace("$", "").replace(",", "").strip()
+    try:
+        float(cleaned)  # validate it's numeric before sending to DB
+        return cleaned
+    except ValueError:
+        return None
+
+
 def _update_permit(conn, permit_id: int, detail: PermitDetail) -> None:
     from src.services.phone_utils import normalize as normalize_phone
     conn.execute(
@@ -210,7 +222,8 @@ def _update_permit(conn, permit_id: int, detail: PermitDetail) -> None:
                 contractor_phone        = COALESCE(contractor_phone, :contractor_phone),
                 contractor_email        = COALESCE(contractor_email, :contractor_email),
                 applicant_name          = COALESCE(applicant_name, :applicant_name),
-                owner_name              = COALESCE(owner_name, :owner_name)
+                owner_name              = COALESCE(owner_name, :owner_name),
+                job_value               = COALESCE(job_value, :job_value)
             WHERE id = :id
         """),
         {
@@ -223,6 +236,7 @@ def _update_permit(conn, permit_id: int, detail: PermitDetail) -> None:
             "contractor_email": detail.contractor_email,
             "applicant_name": detail.applicant_name,
             "owner_name": detail.owner_name,
+            "job_value": _parse_job_value_decimal(detail.job_value),
             "id": permit_id,
         },
     )
@@ -236,7 +250,7 @@ def run_sweep(
     delay: float = 2.0,
 ) -> dict[str, int]:
     """
-    Fetch and persist detail data for up to `limit` permits missing contractor_name.
+    Fetch and persist detail data for up to `limit` permits missing contractor_name or job_value.
 
     Returns stats dict: enriched / skipped / errors.
     """
@@ -250,7 +264,7 @@ def run_sweep(
             text(f"""
                 SELECT bp.id, bp.permit_number, bp.county_id
                 FROM building_permits bp
-                WHERE bp.contractor_name IS NULL
+                WHERE (bp.contractor_name IS NULL OR bp.job_value IS NULL)
                   {county_clause}
                 ORDER BY bp.id
                 LIMIT :limit
@@ -318,7 +332,8 @@ def _post_slack_digest(county: str, stats: dict[str, int], total: int) -> None:
     """Post a sweep summary to Slack. No-op when slack_bot_token is unset."""
     from config.settings import get_settings
     settings = get_settings()
-    token = getattr(settings, "slack_bot_token", None)
+    _token = getattr(settings, "slack_bot_token", None)
+    token = _token.get_secret_value() if hasattr(_token, "get_secret_value") else _token
     channel = getattr(settings, "relay_slack_channel", None)
     if not token or not channel:
         logger.debug("[permit_detail_sweep] Slack not configured — digest skipped")

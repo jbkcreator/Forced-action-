@@ -38,6 +38,7 @@ def parse_permit_detail(html: str) -> PermitDetail:
     result = PermitDetail()
 
     result.completion_status = _extract_record_status(soup)
+    result.job_value = _extract_job_value(soup)
     result.project_description = (
         _extract_section_text(soup, "Project Description:")
         or _extract_section_text(soup, "Description")
@@ -86,6 +87,15 @@ def _extract_section_text(soup: BeautifulSoup, label: str) -> Optional[str]:
     text = container.get_text(" ", strip=True)
     text = text.replace(label, "").strip()
     return text or None
+
+
+def _extract_job_value(soup: BeautifulSoup) -> Optional[str]:
+    # Accela "More Details" tab: <span id="...lblJobValue">$120,000.00</span>
+    # Selector consistent across Hillsborough, Pinellas, Pasco portals.
+    tag = soup.find("span", id=re.compile(r"lblJobValue$", re.IGNORECASE))
+    if tag:
+        return tag.get_text(strip=True) or None
+    return None
 
 
 def _extract_record_status(soup: BeautifulSoup) -> Optional[str]:
