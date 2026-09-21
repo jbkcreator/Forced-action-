@@ -107,7 +107,7 @@ def classify(ctx: RouterContext, config: RouterConfig) -> RoutingDecision:
     if not ctx.has_interaction:
         yellow_reasons.append(YellowReason.BORROWER_NOT_CONTACTED.value)
 
-    if ctx.lender_box_status == "uncertain" and yellow_reasons:
+    if ctx.lender_box_status == "uncertain":
         return RoutingDecision(
             color=GyrColor.YELLOW,
             expected_revenue_cents=rev_cents,

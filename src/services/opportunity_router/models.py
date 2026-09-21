@@ -4,11 +4,13 @@ No I/O, no DB, no network. Everything here is a plain dataclass or enum.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
 from typing import List, Literal, Optional
+
+from pydantic import BaseModel
 
 
 class GyrColor(str, Enum):
@@ -37,10 +39,10 @@ class RedReason(str, Enum):
 GyrQueue = Literal["MONEY", "EXCEPTIONS"]
 
 
-@dataclass(frozen=True)
-class RouterConfig:
+class RouterConfig(BaseModel):
+    model_config = {"frozen": True}
+
     green_min_expected_revenue_cents: int
-    config_version: str = "1"
 
 
 @dataclass(frozen=True)
