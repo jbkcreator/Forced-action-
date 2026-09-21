@@ -42,7 +42,7 @@ def ensure_group() -> None:
     if not redis_available():
         return
     try:
-        get_redis().xgroup_create(CC_STREAM_KEY, CC_GROUP_NAME, id="0", mkstream=True)
+        get_redis().xgroup_create(CC_STREAM_KEY, CC_GROUP_NAME, id="$", mkstream=True)
     except Exception as exc:  # noqa: BLE001
         if "BUSYGROUP" not in str(exc):
             raise
