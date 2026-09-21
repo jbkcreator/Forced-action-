@@ -127,6 +127,10 @@ def _run_county(county_id: str, *, dry_run: bool, as_of: date) -> int:
             """),
             {"county_id": county_id, "since": since, "as_of": as_of},
         )
+        # Materialise into a list: find_wholesaler_candidates requires two passes
+        # (group by property_id, then iterate for lender extraction). The lookback
+        # window (36 months) bounds total size; yield_per(1000) keeps the server-side
+        # cursor open rather than fetching all rows at once.
         deed_rows = list(result.yield_per(1000))
 
         if not deed_rows:
@@ -184,9 +188,11 @@ def _run_county(county_id: str, *, dry_run: bool, as_of: date) -> int:
                 total_cash_volume=stats["volume"],
             ))
 
+        wholesaler_name_map = resolve_counterparty_names(db, list(wholesaler_names))
+
         for name in wholesaler_names:
             partner_rows.append(PartnerRow(
-                buyer_entity_id=0,
+                buyer_entity_id=wholesaler_name_map.get(name) or 0,
                 canonical_name=name,
                 partner_class=PartnerClass.WHOLESALER.value,
                 observed_transaction_count=wholesaler_txn_counts.get(name, 1),

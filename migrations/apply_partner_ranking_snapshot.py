@@ -64,6 +64,20 @@ _MIGRATIONS = [
     CREATE INDEX IF NOT EXISTS ix_fa_max_partner_county
         ON fa_max_partners (county_id)
     """,
+    # Unique constraint required for ON CONFLICT (person_id, partner_class) upsert.
+    """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = 'uq_fa_max_partner_person_class'
+        ) THEN
+            ALTER TABLE fa_max_partners
+                ADD CONSTRAINT uq_fa_max_partner_person_class
+                UNIQUE (person_id, partner_class);
+        END IF;
+    END$$
+    """,
 ]
 
 
