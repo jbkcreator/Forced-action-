@@ -856,11 +856,17 @@ class BuildingPermit(Base):
     # Enforcement flag — True for stop work orders, after-the-fact, failed/expired/revoked/suspended
     is_enforcement_permit: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
 
-    # Builder enrichment columns (Stage A — WP-T2-8)
+    # Builder enrichment columns (Stage A — WP-T2-8) + detail-page fields (permit-detail enrichment)
     contractor_name: Mapped[Optional[str]] = mapped_column(Text)
     holder_name: Mapped[Optional[str]] = mapped_column(Text)       # permit applicant / owner-of-record
     job_value: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 2))  # declared construction value
     completion_status: Mapped[Optional[str]] = mapped_column(String(50))  # issued|active|expired|completed|pending
+    contractor_license: Mapped[Optional[str]] = mapped_column(String(50))
+    contractor_license_type: Mapped[Optional[str]] = mapped_column(String(100))
+    contractor_phone: Mapped[Optional[str]] = mapped_column(String(20))
+    contractor_email: Mapped[Optional[str]] = mapped_column(String(200))
+    applicant_name: Mapped[Optional[str]] = mapped_column(String(200))
+    owner_name: Mapped[Optional[str]] = mapped_column(String(200))
 
     # Load tracking & multi-county
     date_added: Mapped[Optional[date]] = mapped_column(Date, default=date.today, index=True)

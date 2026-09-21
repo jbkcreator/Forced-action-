@@ -61,6 +61,28 @@ def _is_enforcement(permit_type: str | None, status: str | None, expire_date) ->
 
 logger = logging.getLogger(__name__)
 
+# Detail-field column names that may appear in an enriched DataFrame
+_DETAIL_COLUMNS: dict[str, str] = {
+    "contractor_name": "contractor_name",
+    "holder_name": "holder_name",
+    "completion_status": "completion_status",
+    "contractor_license": "contractor_license",
+    "contractor_license_type": "contractor_license_type",
+    "contractor_phone": "contractor_phone",
+    "contractor_email": "contractor_email",
+    "applicant_name": "applicant_name",
+    "owner_name": "owner_name",
+}
+
+
+def _extract_detail_fields(row) -> dict:
+    """Return a dict of detail column values from a DataFrame row, None for absent/NaN columns."""
+    out: dict = {}
+    for col, param in _DETAIL_COLUMNS.items():
+        raw = row.get(col)
+        out[param] = str(raw).strip() or None if (raw is not None and not pd.isna(raw)) else None
+    return out
+
 
 def _clean_str(value) -> str | None:
     """Scraped-cell → clean str or None. Guards pandas NaN (read_csv(dtype=str)
@@ -167,34 +189,42 @@ class BuildingPermitLoader(BaseLoader):
                     incoming_completion = _normalize_completion_status(incoming_status)
                     description_changed = existing_row.description is None and description_val
                     status_changed = bool(incoming_status and incoming_status != existing_row.status)
-                    # Backfill fires whenever incoming source data can fill a currently-NULL
-                    # enrichment column — not only on description/status change (a later scrape
-                    # can add holder/contractor/job_value with status unchanged).
+                    detail_fields = _extract_detail_fields(row)
                     enrichment_backfillable = (
                         (incoming_holder and existing_row.holder_name is None)
                         or (incoming_contractor and existing_row.contractor_name is None)
                         or (incoming_job_value is not None and existing_row.job_value is None)
                         or (incoming_completion and existing_row.completion_status is None)
+                        or any(v is not None for v in detail_fields.values())
                     )
                     if description_changed or status_changed or enrichment_backfillable:
                         self.session.execute(
                             text("""
                                 UPDATE building_permits
-                                SET description       = COALESCE(description, :desc),
-                                    status            = CASE WHEN :status IS NOT NULL THEN :status ELSE status END,
-                                    holder_name       = COALESCE(holder_name, :holder_name),
-                                    contractor_name   = COALESCE(contractor_name, :contractor_name),
-                                    job_value         = COALESCE(job_value, :job_value),
-                                    completion_status = COALESCE(completion_status, :completion_status)
+                                SET description             = COALESCE(description, :desc),
+                                    status                  = CASE WHEN :status IS NOT NULL THEN :status ELSE status END,
+                                    holder_name             = COALESCE(holder_name, :holder_name),
+                                    contractor_name         = COALESCE(contractor_name, :contractor_name),
+                                    job_value               = COALESCE(job_value, :job_value),
+                                    completion_status       = COALESCE(completion_status, :completion_status),
+                                    contractor_license      = COALESCE(contractor_license, :contractor_license),
+                                    contractor_license_type = COALESCE(contractor_license_type, :contractor_license_type),
+                                    contractor_phone        = COALESCE(contractor_phone, :contractor_phone),
+                                    contractor_email        = COALESCE(contractor_email, :contractor_email),
+                                    applicant_name          = COALESCE(applicant_name, :applicant_name),
+                                    owner_name              = COALESCE(owner_name, :owner_name)
                                 WHERE id = :id
                             """),
                             {
+                                **detail_fields,
                                 "desc": description_val,
                                 "status": incoming_status,
-                                "holder_name": incoming_holder,
-                                "contractor_name": incoming_contractor,
+                                # Explicit source-row values take precedence over
+                                # scraped detail fields for overlapping columns.
+                                "holder_name": incoming_holder or detail_fields.get("holder_name"),
+                                "contractor_name": incoming_contractor or detail_fields.get("contractor_name"),
                                 "job_value": incoming_job_value,
-                                "completion_status": incoming_completion,
+                                "completion_status": incoming_completion or detail_fields.get("completion_status"),
                                 "id": existing_row.id,
                             },
                         )
@@ -236,6 +266,16 @@ class BuildingPermitLoader(BaseLoader):
 
             if property_record:
                 try:
+                    detail_fields = _extract_detail_fields(row)
+                    # Merge: explicit (source-row) values take precedence over
+                    # scraped detail fields for the three overlapping columns.
+                    merged = {
+                        **detail_fields,
+                        "holder_name": raw_holder or detail_fields.get("holder_name"),
+                        "contractor_name": raw_contractor or detail_fields.get("contractor_name"),
+                        "completion_status": completion_status_val or detail_fields.get("completion_status"),
+                        "job_value": job_value_val,
+                    }
                     permit_record = BuildingPermit(
                         property_id=property_record.id,
                         permit_number=record_number,
@@ -246,10 +286,7 @@ class BuildingPermitLoader(BaseLoader):
                         is_enforcement_permit=enforcement,
                         county_id=self.county_id,
                         description=description_val,
-                        holder_name=raw_holder,
-                        contractor_name=raw_contractor,
-                        job_value=job_value_val,
-                        completion_status=completion_status_val,
+                        **merged,
                     )
 
                     if self.safe_add(permit_record):
