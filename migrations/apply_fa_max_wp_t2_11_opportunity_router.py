@@ -12,7 +12,7 @@ from sqlalchemy import text
 
 sys.path.insert(0, ".")
 
-from src.db import get_db_context
+from src.core.database import get_db_context
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)

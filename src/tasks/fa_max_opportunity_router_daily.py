@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 def _run(dry_run: bool = False) -> None:
-    from src.db import get_db_context
+    from src.core.database import get_db_context
     from src.services.opportunity_router import run_sweep
 
     today = date.today()
