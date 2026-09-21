@@ -125,6 +125,11 @@ COUNTY_ID=hillsborough
 # RELATIONSHIPS_SLACK_CHANNEL. Idempotent — borrower_monitor_log deduplicates.
 45 6 * * * cd $PROJECT && PYTHONPATH=. python scripts/run_repeat_maturity_engine.py >> /var/log/fa/repeat_maturity.log 2>&1
 
+# WP-T2-5 Abandonment Agent — every minute. Polls abandonment_sequences for
+# touches where due_at <= now() and fires them via relay_approval_queue.
+# Idempotent — relay idempotency_key prevents duplicate sends on back-to-back runs.
+* * * * * cd $PROJECT && PYTHONPATH=. python scripts/run_abandonment_worker.py >> /var/log/fa/abandonment_worker.log 2>&1
+
 # Quora S6 organic-answer pipeline — 06:35 AM UTC daily (after load validator).
 # Picks one keyword via DB rotation (quora_topics + cooldown_days), scrapes Quora,
 # publishes to Cora for classification + answer drafting, upserts to quora_questions.

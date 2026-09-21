@@ -84,7 +84,7 @@ def handle_portal_stall(payload: PortalStallPayload, db: Session) -> dict:
             "person_id": person_id,
         }
 
-    # No pending inbound — publish portal.stall event for Abandonment Agent
+    # No pending inbound — publish portal.stall event and enqueue abandonment sequence
     _publish_stall_event(
         person_id=person_id,
         opportunity_id=opportunity_id,
@@ -93,8 +93,19 @@ def handle_portal_stall(payload: PortalStallPayload, db: Session) -> dict:
         portal_started_at=payload.portal_started_at,
         db=db,
     )
+
+    if person_id:
+        from src.agents.reply_concierge.abandonment_agent import enqueue_sequence
+        enqueue_sequence(
+            person_id=person_id,
+            contact_email=payload.contact_email,
+            opportunity_id=opportunity_id,
+            borrower_first_name=payload.borrower_first_name,
+            db=db,
+        )
+
     logger.info(
-        "portal_stall: person_id=%s published portal.stall event for abandonment",
+        "portal_stall: person_id=%s published portal.stall event and enqueued abandonment sequence",
         person_id,
     )
     return {"status": "stall_event_published", "person_id": person_id}
