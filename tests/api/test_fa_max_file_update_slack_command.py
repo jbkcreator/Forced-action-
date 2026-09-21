@@ -84,6 +84,9 @@ class TestFaMaxFileUpdateCommand:
     def test_unknown_stage_returns_usage(self):
         with patch("src.api.admin_router._verify_slack_signature", return_value=True), patch(
             "src.api.admin_router._relay_approver_authorized", return_value=True
+        ), patch(
+            "src.agents.reply_concierge.backflip_stage_ingest.resolve_opportunity_by_backflip_ref",
+            return_value={"opportunity_id": "opp-1", "person_id": "p-1"},
         ):
             response = client.post(
                 "/api/admin/slack/fa-max-file-update",
