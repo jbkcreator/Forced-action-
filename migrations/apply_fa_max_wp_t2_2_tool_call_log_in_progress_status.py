@@ -28,7 +28,10 @@ from sqlalchemy import text
 from src.core.database import get_db_context
 
 NEW_CONSTRAINT_NAME = "ck_fa_max_tool_call_log_status"
-NEW_CONSTRAINT_SQL = "status IN ('in_progress', 'success', 'error', 'blocked')"
+# 'claimed' is included here so this migration is safe regardless of whether
+# apply_fa_max_wp_t2_2_tool_call_log_claimed_status.py runs before or after.
+# Both migrations converge on the same final constraint definition.
+NEW_CONSTRAINT_SQL = "status IN ('in_progress', 'claimed', 'success', 'error', 'blocked')"
 
 
 def main() -> None:
@@ -51,7 +54,7 @@ def main() -> None:
         else:
             print("  -> no existing status CHECK constraint found on fa_max_tool_call_log")
 
-        print(f"  -> adding {NEW_CONSTRAINT_NAME!r} allowing 'in_progress'")
+        print(f"  -> adding {NEW_CONSTRAINT_NAME!r} allowing 'in_progress' and 'claimed'")
         session.execute(
             text(
                 f"ALTER TABLE fa_max_tool_call_log ADD CONSTRAINT {NEW_CONSTRAINT_NAME} "
