@@ -54,9 +54,7 @@ def parse_permit_detail(html: str) -> PermitDetail:
     if lp_container:
         text = lp_container.get_text(" ", strip=True)
         result.licensed_professional_name = _first_name_line(lp_container, skip="Licensed Professional:")
-        result.contractor_email = _extract_email(text) or _extract_email(
-            (app_container.get_text(" ") if app_container else "")
-        )
+        result.contractor_email = _extract_email(text)
         result.contractor_phone = _extract_phone(text)
         license_match = _LICENSE_RE.search(text)
         if license_match:

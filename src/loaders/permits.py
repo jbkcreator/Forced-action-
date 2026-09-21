@@ -216,14 +216,16 @@ class BuildingPermitLoader(BaseLoader):
                                 WHERE id = :id
                             """),
                             {
+                                **detail_fields,
                                 "desc": description_val,
                                 "status": incoming_status,
-                                "holder_name": incoming_holder,
-                                "contractor_name": incoming_contractor,
+                                # Explicit source-row values take precedence over
+                                # scraped detail fields for overlapping columns.
+                                "holder_name": incoming_holder or detail_fields.get("holder_name"),
+                                "contractor_name": incoming_contractor or detail_fields.get("contractor_name"),
                                 "job_value": incoming_job_value,
-                                "completion_status": incoming_completion,
+                                "completion_status": incoming_completion or detail_fields.get("completion_status"),
                                 "id": existing_row.id,
-                                **detail_fields,
                             },
                         )
                         self.session.flush()
@@ -265,6 +267,15 @@ class BuildingPermitLoader(BaseLoader):
             if property_record:
                 try:
                     detail_fields = _extract_detail_fields(row)
+                    # Merge: explicit (source-row) values take precedence over
+                    # scraped detail fields for the three overlapping columns.
+                    merged = {
+                        **detail_fields,
+                        "holder_name": raw_holder or detail_fields.get("holder_name"),
+                        "contractor_name": raw_contractor or detail_fields.get("contractor_name"),
+                        "completion_status": completion_status_val or detail_fields.get("completion_status"),
+                        "job_value": job_value_val,
+                    }
                     permit_record = BuildingPermit(
                         property_id=property_record.id,
                         permit_number=record_number,
@@ -275,11 +286,7 @@ class BuildingPermitLoader(BaseLoader):
                         is_enforcement_permit=enforcement,
                         county_id=self.county_id,
                         description=description_val,
-                        holder_name=raw_holder,
-                        contractor_name=raw_contractor,
-                        job_value=job_value_val,
-                        completion_status=completion_status_val,
-                        **detail_fields,
+                        **merged,
                     )
 
                     if self.safe_add(permit_record):
