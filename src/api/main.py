@@ -4,6 +4,7 @@ Forced Action — FastAPI application.
 Endpoints:
     GET  /health                   — Health check (UptimeRobot / load balancer)
     POST /webhooks/stripe          — Stripe event receiver
+    POST /webhooks/portal-stall   — FA Max portal-stall trigger (WP-T2-4)
     GET  /api/founding-spots       — Founding countdown for landing page
     GET  /api/zip-check            — ZIP availability checker for landing page
     POST /api/checkout             — Create Stripe checkout session
@@ -6696,6 +6697,46 @@ def leaderboard_endpoint(
         public_boards.append({**b, "leaderboard": rows})
 
     return {"as_of": snap.get("as_of"), "leaderboards": public_boards}
+
+
+# ── FA Max WP-T2-4: Portal Concierge webhook ─────────────────────────────────
+
+def _verify_backflip_signature(raw_body: bytes, signature) -> bool:
+    """HMAC-SHA256(raw_body, backflip_webhook_secret) == X-Backflip-Signature."""
+    import hmac
+    import hashlib
+
+    s = get_settings()
+    secret = s.backflip_webhook_secret.get_secret_value() if s.backflip_webhook_secret else None
+    if not secret:
+        logger.error("[portal-stall] backflip_webhook_secret not configured — rejecting event")
+        return False
+    if not signature:
+        return False
+    expected = hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+@app.post("/webhooks/portal-stall", status_code=200, include_in_schema=False)
+async def portal_stall_webhook(
+    request: Request,
+    x_backflip_signature: str = Header(None, alias="X-Backflip-Signature"),
+    db: Session = Depends(get_db),
+):
+    """
+    Backflip calls this when a borrower starts the pre-qual flow and does not
+    complete within the stall threshold. Routes to the concierge or publishes
+    a portal.stall event for the Abandonment Agent.
+    """
+    raw_body = await request.body()
+    if not _verify_backflip_signature(raw_body, x_backflip_signature):
+        raise HTTPException(status_code=401, detail="invalid signature")
+
+    import json as _json
+    from src.agents.reply_concierge.portal_stall import PortalStallPayload, handle_portal_stall
+    body = _json.loads(raw_body or b"{}")
+    payload = PortalStallPayload(**body)
+    return handle_portal_stall(payload, db)
 
 
 # ── Phase 2B: NWS weather alert webhook ───────────────────────────────────────
