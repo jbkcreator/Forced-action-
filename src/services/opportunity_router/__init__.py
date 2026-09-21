@@ -8,6 +8,6 @@ Public API:
     run_sweep(db, as_of)        — nightly full sweep (all open opportunities)
     reevaluate(ids, db)         — event-driven subset re-evaluation
 """
-from .router import reevaluate, run_sweep
+from .router import reevaluate, run_staleness_pass, run_sweep
 
-__all__ = ["run_sweep", "reevaluate"]
+__all__ = ["run_sweep", "reevaluate", "run_staleness_pass"]

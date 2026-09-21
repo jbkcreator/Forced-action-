@@ -216,3 +216,43 @@ def test_suppressed_beats_out_of_box():
     )
     assert decision.color == GyrColor.RED
     assert RedReason.BORROWER_SUPPRESSED.value in decision.reason_codes
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Staleness business-day logic
+# ──────────────────────────────────────────────────────────────────────────────
+
+from datetime import timezone
+from zoneinfo import ZoneInfo
+from src.services.opportunity_router.router import _is_stale
+
+_ET = ZoneInfo("America/New_York")
+
+
+def _et(year, month, day, hour=9) -> datetime:
+    from datetime import datetime
+    return datetime(year, month, day, hour, 0, 0, tzinfo=_ET)
+
+
+def test_stale_after_one_business_day():
+    ranked_at = _et(2026, 9, 21, 8)   # Monday 08:00 ET
+    now_et = _et(2026, 9, 22, 8)      # Tuesday 08:00 ET — one business day later
+    assert _is_stale(ranked_at, now_et)
+
+
+def test_not_stale_same_day():
+    ranked_at = _et(2026, 9, 21, 8)
+    now_et = _et(2026, 9, 21, 18)     # same day, later
+    assert not _is_stale(ranked_at, now_et)
+
+
+def test_stale_skips_weekend():
+    ranked_at = _et(2026, 9, 18, 8)   # Friday 08:00 ET
+    now_et = _et(2026, 9, 21, 8)      # Monday 08:00 ET — Sat/Sun don't count
+    assert _is_stale(ranked_at, now_et)
+
+
+def test_not_stale_over_weekend_if_friday_same_day():
+    ranked_at = _et(2026, 9, 18, 8)   # Friday
+    now_et = _et(2026, 9, 19, 8)      # Saturday — 0 business days elapsed
+    assert not _is_stale(ranked_at, now_et)
