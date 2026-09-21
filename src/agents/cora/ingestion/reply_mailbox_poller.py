@@ -217,6 +217,29 @@ def _process_candidate_message(service: Any, message_id: str, db: Session) -> Op
         subject = _header(headers, "Subject")
         body_text = _decode_body(message.get("payload", {}))
 
+        # WP-T2-6: Backflip notification emails share this mailbox with borrower
+        # replies. Checked before the fa_max_persons lookup below — a Backflip
+        # notification's from_address is Backflip's own domain, never a
+        # borrower's, so this never competes with that branch.
+        from config.settings import get_settings as _get_settings
+        backflip_domain = _get_settings().fa_max_backflip_notification_sender_domain
+        if backflip_domain and from_address.lower().endswith(f"@{backflip_domain.lower()}"):
+            from src.agents.reply_concierge.backflip_email_parser import parse_backflip_notification
+            from src.agents.reply_concierge.backflip_stage_ingest import apply_parsed_event
+
+            event = parse_backflip_notification(subject, body_text)
+            if event is None:
+                logger.info(
+                    "reply_mailbox_poller: Backflip sender=%s subject=%r message_id=%s "
+                    "did not match any known notification pattern — dropped",
+                    from_address, subject[:80], message_id,
+                )
+                _mark_seen(message_id)
+                return False
+            applied = apply_parsed_event(db, event, source="email_parsed", actor="backflip_email_poller")
+            _mark_seen(message_id)
+            return applied
+
         thread_id = find_opportunity_thread_id_by_email(db, from_address)
 
         if thread_id is None:

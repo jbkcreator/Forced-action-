@@ -291,6 +291,12 @@ class AppSettings(BaseSettings):
 	# either one, it silently no-ops every poll rather than raising.
 	cora_gmail_service_account_key_path: Optional[str] = Field(default=None, env="CORA_GMAIL_SERVICE_ACCOUNT_KEY_PATH")
 	cora_reply_mailbox_address: Optional[str] = Field(default=None, env="CORA_REPLY_MAILBOX_ADDRESS")
+	# WP-T2-6: Backflip's own notification-sender domain, shares this same
+	# mailbox with FA Max borrower replies. No default — the branch in
+	# reply_mailbox_poller.py no-ops until the client confirms it (Q7/Q8/Q13).
+	fa_max_backflip_notification_sender_domain: Optional[str] = Field(
+		default=None, env="FA_MAX_BACKFLIP_NOTIFICATION_SENDER_DOMAIN"
+	)
 	# "whale" = Hunter→buyer_entity flow (default). "dbpr_storm" = Aug blitz targeting
 	# storm/restoration contractors from dbpr_contacts. Flip in env, no code deploy.
 	cora_target_mode: str = Field(default="whale", env="CORA_TARGET_MODE")
