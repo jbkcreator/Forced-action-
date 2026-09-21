@@ -334,7 +334,10 @@ def build_tracked_link_reply(db: Session, text_arg: str, user: str) -> dict:
 
     from config.settings import settings
     base = settings.app_base_url.rstrip("/") if settings.app_base_url else ""
-    lines = [f"Created: {base}/go/{link.slug}"] + notes
+    lines = [
+        f"Created: {base}/go/{link.slug}",
+        f"Kind: *{kind}* | Label: {label}",
+    ] + notes
     return _slack_ephemeral("\n".join(lines))
 
 
