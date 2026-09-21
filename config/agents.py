@@ -130,6 +130,36 @@ class AgentsSettings(AppSettings):
 		),
 	)
 
+	# ── FA Max agent runtime (WP-T2-2) ───────────────────────────────────────
+	fa_max_agent_max_tool_calls: int = Field(
+		default=8,
+		ge=1,
+		env="FA_MAX_AGENT_MAX_TOOL_CALLS",
+		description=(
+			"Bounded tool-call loop ceiling for the FA Max agent worker "
+			"(src/agents/fa_max/worker.py) -- caps how many tool calls a single "
+			"claimed work item may make before the loop force-exits, leaving the "
+			"item to reclaim_expired_work_items()'s existing lease mechanism "
+			"rather than looping indefinitely on a stuck task."
+		),
+	)
+
+	fa_max_agent_tool_timeout_seconds: int = Field(
+		default=30,
+		ge=1,
+		env="FA_MAX_AGENT_TOOL_TIMEOUT_SECONDS",
+		description=(
+			"Per-tool-call wall-clock ceiling for the FA Max agent loop "
+			"(src/agents/fa_max/agent_graph.py). fa_max_agent_max_tool_calls bounds "
+			"how MANY calls a work item may make; this bounds how LONG any single "
+			"call may run -- without it, one hung external call (a slow DB query, "
+			"a stalled Slack/enrichment request) could hold the worker indefinitely "
+			"even though the call count never advances. A timed-out call is logged "
+			"status='error' in fa_max_tool_call_log and stops the loop, exactly like "
+			"any other tool exception."
+		),
+	)
+
 	# ── Helpers ───────────────────────────────────────────────────────────────
 	@property
 	def enabled_graphs(self) -> List[str]:
