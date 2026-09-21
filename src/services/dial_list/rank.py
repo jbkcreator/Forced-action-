@@ -94,6 +94,22 @@ def _score(c: DialCandidate, as_of: date, config: DialListConfig) -> _Score:
                   commission, urgency, loan_conf)
 
 
+def score_candidate(
+    candidate: DialCandidate,
+    as_of: date,
+    config: Optional[DialListConfig] = None,
+) -> Decimal:
+    """Public entrypoint for single-candidate scoring (WP-T2-11 router).
+
+    Returns expected_revenue as a Decimal. Reuses _score() so the router and
+    the dial list are guaranteed to agree on every deal's dollar value.
+    Do NOT call rank_dial_list() from the router — that wrapper deduplicates
+    and truncates to a top-N call list, which the router does not want.
+    """
+    cfg = config or DEFAULT_CONFIG
+    return _score(candidate, as_of, cfg).expected_revenue
+
+
 def _dedup_key(c: DialCandidate) -> Tuple[str, object]:
     """Resolved borrowers collapse by buyer_entity_id; unresolved by property."""
     if c.buyer_entity_id is not None:
