@@ -71,7 +71,12 @@ class TestFaMaxFileUpdateCommand:
             "src.services.fa_max_file_state.ensure_file_state"
         ), patch(
             "src.services.fa_max_file_state.record_document_request"
-        ) as mock_record:
+        ) as mock_record, patch(
+            "src.services.fa_max_file_state.get_file_state",
+            return_value={"contact_email": "borrower@example.com"},
+        ), patch(
+            "src.agents.reply_concierge.stage_monitor.send_first_chase_touch"
+        ) as mock_first_touch:
             response = client.post(
                 "/api/admin/slack/fa-max-file-update",
                 data={"user_id": "U123", "text": "BF-1 doc:Bank Statement"},
@@ -80,6 +85,9 @@ class TestFaMaxFileUpdateCommand:
         assert response.status_code == 200
         mock_record.assert_called_once()
         assert mock_record.call_args.kwargs["document_name"] == "Bank Statement"
+        mock_first_touch.assert_called_once()
+        assert mock_first_touch.call_args.kwargs["document_name"] == "Bank Statement"
+        assert mock_first_touch.call_args.kwargs["contact_email"] == "borrower@example.com"
 
     def test_unknown_stage_returns_usage(self):
         with patch("src.api.admin_router._verify_slack_signature", return_value=True), patch(

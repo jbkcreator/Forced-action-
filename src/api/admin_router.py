@@ -3012,6 +3012,14 @@ async def slack_fa_max_file_update_command(request: Request, db: Session = Depen
             document_name=document_name, source="manual",
             idempotency_key=f"docreq:{resolved['opportunity_id']}:{document_name}",
         )
+        from src.agents.reply_concierge import stage_monitor
+
+        file_state = fa_max_file_state.get_file_state(db, opportunity_id=resolved["opportunity_id"])
+        stage_monitor.send_first_chase_touch(
+            db, opportunity_id=resolved["opportunity_id"], person_id=resolved["person_id"],
+            document_name=document_name,
+            contact_email=(file_state or {}).get("contact_email"),
+        )
         return _slack_ephemeral(f"Recorded document request '{document_name}' for {backflip_ref}.")
 
     stage = action.lower()

@@ -129,3 +129,133 @@ class TestSweepStatusTouches:
             count = stage_monitor.sweep_status_touches(db)
         assert count == 0
         mock_touch.assert_not_called()
+
+
+class TestSweepDocumentChases:
+    def test_no_outstanding_requests_returns_zero(self):
+        db = _mock_db()
+        assert stage_monitor.sweep_document_chases(db) == 0
+
+    def test_sends_followup_after_threshold(self):
+        db = _mock_db()
+        row = MagicMock()
+        row._mapping = {
+            "id": 1, "opportunity_id": "opp-1", "person_id": "p-1",
+            "document_name": "Bank Statement", "first_chase_sent_at":
+                datetime.now(timezone.utc) - timedelta(days=4),
+            "followup_chase_sent_at": None, "escalated_at": None,
+            "contact_email": "borrower@example.com",
+        }
+        db.execute.return_value.fetchall.return_value = [row]
+        with patch(
+            "src.services.fa_max_file_state.send_governed_email", return_value=True,
+        ) as mock_send:
+            count = stage_monitor.sweep_document_chases(db)
+        assert count == 1
+        assert mock_send.call_args.kwargs["lane"] == "RELATIONSHIPS"
+        db.execute.assert_any_call(
+            stage_monitor._MARK_FOLLOWUP_SENT_SQL, {"id": 1},
+        )
+
+    def test_followup_skipped_when_no_contact_email(self):
+        db = _mock_db()
+        row = MagicMock()
+        row._mapping = {
+            "id": 4, "opportunity_id": "opp-4", "person_id": "p-4",
+            "document_name": "Bank Statement", "first_chase_sent_at":
+                datetime.now(timezone.utc) - timedelta(days=3),
+            "followup_chase_sent_at": None, "escalated_at": None,
+            "contact_email": None,
+        }
+        db.execute.return_value.fetchall.return_value = [row]
+        with patch("src.services.fa_max_file_state.send_governed_email") as mock_send:
+            count = stage_monitor.sweep_document_chases(db)
+        assert count == 0
+        mock_send.assert_not_called()
+
+    def test_escalates_after_followup_threshold(self):
+        db = _mock_db()
+        row = MagicMock()
+        row._mapping = {
+            "id": 2, "opportunity_id": "opp-2", "person_id": "p-2",
+            "document_name": "Tax Return", "first_chase_sent_at":
+                datetime.now(timezone.utc) - timedelta(days=7),
+            "followup_chase_sent_at": datetime.now(timezone.utc) - timedelta(days=4),
+            "escalated_at": None, "contact_email": "borrower2@example.com",
+        }
+        db.execute.return_value.fetchall.return_value = [row]
+        count = stage_monitor.sweep_document_chases(db)
+        assert count == 1
+        insert_calls = [
+            call for call in db.execute.call_args_list
+            if "INSERT INTO relay_approval_queue" in str(call.args[0])
+        ]
+        assert len(insert_calls) == 1
+        assert insert_calls[0].args[1]["lane"] == "EXCEPTIONS"
+        db.execute.assert_any_call(
+            stage_monitor._MARK_ESCALATED_SQL, {"id": 2},
+        )
+
+    def test_not_yet_due_is_skipped(self):
+        db = _mock_db()
+        row = MagicMock()
+        row._mapping = {
+            "id": 3, "opportunity_id": "opp-3", "person_id": "p-3",
+            "document_name": "ID", "first_chase_sent_at":
+                datetime.now(timezone.utc) - timedelta(hours=1),
+            "followup_chase_sent_at": None, "escalated_at": None,
+            "contact_email": "borrower3@example.com",
+        }
+        db.execute.return_value.fetchall.return_value = [row]
+        with patch("src.services.fa_max_file_state.send_governed_email") as mock_send:
+            count = stage_monitor.sweep_document_chases(db)
+        assert count == 0
+        mock_send.assert_not_called()
+
+
+class TestSendFirstChaseTouch:
+    """The immediate, on-request-detection touch (Part B) -- distinct from
+    sweep_document_chases()'s later follow-up/escalation steps."""
+
+    def test_sends_and_marks_first_chase_sent(self):
+        db = _mock_db()
+        with patch(
+            "src.services.fa_max_file_state.send_governed_email", return_value=True,
+        ) as mock_send:
+            sent = stage_monitor.send_first_chase_touch(
+                db, opportunity_id="opp-1", person_id="p-1",
+                document_name="Bank Statement", contact_email="borrower@example.com",
+            )
+        assert sent is True
+        assert mock_send.call_args.kwargs["contact_email"] == "borrower@example.com"
+        assert mock_send.call_args.kwargs["lane"] == "RELATIONSHIPS"
+        db.execute.assert_any_call(
+            stage_monitor._MARK_FIRST_CHASE_SENT_SQL,
+            {"idempotency_key": "docreq:opp-1:Bank Statement"},
+        )
+
+    def test_skips_when_no_contact_email(self):
+        db = _mock_db()
+        with patch("src.services.fa_max_file_state.send_governed_email") as mock_send:
+            sent = stage_monitor.send_first_chase_touch(
+                db, opportunity_id="opp-2", person_id="p-2",
+                document_name="ID", contact_email=None,
+            )
+        assert sent is False
+        mock_send.assert_not_called()
+
+    def test_governance_block_does_not_mark_sent(self):
+        db = _mock_db()
+        with patch(
+            "src.services.fa_max_file_state.send_governed_email", return_value=False,
+        ):
+            sent = stage_monitor.send_first_chase_touch(
+                db, opportunity_id="opp-3", person_id="p-3",
+                document_name="ID", contact_email="suppressed@example.com",
+            )
+        assert sent is False
+        mark_calls = [
+            call for call in db.execute.call_args_list
+            if call.args and call.args[0] is stage_monitor._MARK_FIRST_CHASE_SENT_SQL
+        ]
+        assert mark_calls == []

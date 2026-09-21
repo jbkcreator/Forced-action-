@@ -61,11 +61,20 @@ class TestApplyParsedEvent:
             "src.services.fa_max_file_state.ensure_file_state"
         ), patch(
             "src.services.fa_max_file_state.record_document_request"
-        ) as mock_record:
+        ) as mock_record, patch(
+            "src.services.fa_max_file_state.get_file_state",
+            return_value={"contact_email": "borrower@example.com"},
+        ), patch(
+            "src.agents.reply_concierge.stage_monitor.send_first_chase_touch"
+        ) as mock_first_touch:
             applied = apply_parsed_event(db, event, source="email_parsed", actor="backflip_email")
         assert applied is True
         mock_record.assert_called_once()
         assert mock_record.call_args.kwargs["document_name"] == "Bank Statement"
+        mock_first_touch.assert_called_once_with(
+            db, opportunity_id="opp-1", person_id="p-1",
+            document_name="Bank Statement", contact_email="borrower@example.com",
+        )
 
     def test_terms_applies_via_file_state(self):
         db = _mock_db()

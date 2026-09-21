@@ -13,6 +13,7 @@ from typing import Any, Dict, Optional
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from src.agents.reply_concierge import stage_monitor
 from src.agents.reply_concierge.backflip_email_parser import ParsedBackflipEvent
 from src.services import fa_max_file_state
 
@@ -68,6 +69,12 @@ def apply_parsed_event(
             session, opportunity_id=opportunity_id, person_id=person_id,
             document_name=event.document_name, source=source,
             idempotency_key=idempotency_key,
+        )
+        file_state = fa_max_file_state.get_file_state(session, opportunity_id=opportunity_id)
+        stage_monitor.send_first_chase_touch(
+            session, opportunity_id=opportunity_id, person_id=person_id,
+            document_name=event.document_name,
+            contact_email=(file_state or {}).get("contact_email"),
         )
     elif event.event_type == "terms":
         fa_max_file_state.record_terms(
