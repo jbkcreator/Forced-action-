@@ -218,6 +218,52 @@ def test_failure_isolation_one_bad_item_does_not_abort_batch(fake_backend, unlim
     assert fake_backend.sent == [2]
 
 
+def test_fa_max_audit_failure_defers_only_that_item_and_batch_continues(
+    fake_backend, unlimited_ceiling, green_kill_switch, monkeypatch,
+):
+    """An unavailable decision-audit store must fail closed per item without
+    escaping guards.evaluate() and stalling every later row in the sweep."""
+    from src.services.relay import guards as relay_guards
+
+    fa_item = replace(
+        _make_item(1, channel="fake"),
+        venture_key="fa_max_lending",
+        person_id="00000000-0000-0000-0000-000000000001",
+        agent_name="vera",
+        autonomy_tier_at_send="A",
+        lane="MONEY",
+        decided_by="josh",
+        decision_interaction_id="00000000-0000-0000-0000-000000000002",
+        opportunity_id="00000000-0000-0000-0000-000000000003",
+        channel_split_source="deed",
+    )
+    later_item = _make_item(2, channel="fake")
+    sent = []
+    monkeypatch.setitem(relay_engine.DISPATCHERS, "fake", lambda item: sent.append(item.id))
+    monkeypatch.setattr(relay_guards, "_fa_max_compliance_reason", lambda item: None)
+    monkeypatch.setattr(relay_guards, "_suppression_reason", lambda item: None)
+    monkeypatch.setattr(
+        "src.services.fa_max_send_governance.record_backflip_suppression_decision",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("audit database unavailable")),
+    )
+    settings = type("S", (), {
+        "fa_max_relay_send_mode": "live",
+        "fa_max_10dlc_registered": True,
+        "fa_max_send_backlog_release_confirmed": True,
+    })()
+    monkeypatch.setattr(relay_guards, "get_settings", lambda: settings)
+
+    result = relay_engine.execute_batch(
+        [fa_item, later_item], batch_id="audit-outage", now=_IN_WINDOW_NOW,
+    )
+
+    assert result.deferred == 1
+    assert result.sent == 1
+    assert sent == [2]
+    assert 1 not in fake_backend.claimed
+    assert fake_backend.sent == [2]
+
+
 def test_failed_dispatch_releases_its_ceiling_reservation(fake_backend, green_kill_switch, monkeypatch):
     """PR #179 finding #2: a reservation for an item whose dispatch raised
     must be refunded -- a transient send failure shouldn't permanently

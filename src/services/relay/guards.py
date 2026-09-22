@@ -79,6 +79,33 @@ def _suppression_reason(item: QueueItem) -> str | None:
     return None   # 'noop' and any future non-contact channel
 
 
+def _record_backflip_decision(*, item: QueueItem, suppressed: bool, reason: str | None) -> bool:
+    """Persist one decision without allowing audit storage to abort a batch.
+
+    A blocked contact remains blocked if the audit store is unavailable. A
+    clear contact is deferred by evaluate() until its allow decision can be
+    durably recorded. Returning False lets the caller apply those different
+    fail-closed outcomes while the Relay loop continues with later items.
+    """
+    try:
+        from src.services.fa_max_send_governance import record_backflip_suppression_decision
+        record_backflip_suppression_decision(
+            gate="send",
+            recipient=item.recipient,
+            suppressed=suppressed,
+            reason=reason,
+            opportunity_id=item.opportunity_id,
+        )
+    except Exception:
+        logger.exception(
+            "[Relay] item %s Backflip suppression audit write failed; "
+            "the item will remain fail-closed",
+            item.id,
+        )
+        return False
+    return True
+
+
 def _fa_max_compliance_reason(item: QueueItem) -> str | None:
     """FA Max-specific pre-send compliance checks (WP-2).
 
@@ -116,42 +143,27 @@ def _fa_max_compliance_reason(item: QueueItem) -> str | None:
         if campaign_reason:
             # WP-T2-3: audit the Backflip suppression decision in its own
             # committed transaction (survives any caller rollback).
-            from src.services.fa_max_send_governance import record_backflip_suppression_decision
-            record_backflip_suppression_decision(
-                gate="send",
-                recipient=item.recipient,
-                suppressed=True,
-                reason=campaign_reason,
-                opportunity_id=item.opportunity_id,
-            )
+            _record_backflip_decision(item=item, suppressed=True, reason=campaign_reason)
             return campaign_reason
         # WP-T2-3: channel-split enforcement at the send gate.
         from src.services.fa_max_send_governance import channel_split_reason, get_channel_split_source
         split_reason = channel_split_reason(db, opportunity_id=item.opportunity_id, person_id=item.person_id)
         if split_reason:
-            from src.services.fa_max_send_governance import record_backflip_suppression_decision
-            record_backflip_suppression_decision(
-                gate="send", recipient=item.recipient, suppressed=True,
-                reason=f"channel_split:{split_reason}", opportunity_id=item.opportunity_id,
+            _record_backflip_decision(
+                item=item, suppressed=True, reason=f"channel_split:{split_reason}",
             )
             return f"channel_split:{split_reason}"
         current_source = get_channel_split_source(
             db, opportunity_id=item.opportunity_id, person_id=item.person_id,
         )
         if current_source != item.channel_split_source:
-            from src.services.fa_max_send_governance import record_backflip_suppression_decision
-            record_backflip_suppression_decision(
-                gate="send", recipient=item.recipient, suppressed=True,
-                reason="channel_split_source_changed", opportunity_id=item.opportunity_id,
+            _record_backflip_decision(
+                item=item, suppressed=True, reason="channel_split_source_changed",
             )
             return "channel_split_source_changed"
         consent = require_consent(db, person_id=item.person_id, channel=item.channel)
         if not consent.allowed:
-            from src.services.fa_max_send_governance import record_backflip_suppression_decision
-            record_backflip_suppression_decision(
-                gate="send", recipient=item.recipient, suppressed=True,
-                reason=consent.reason, opportunity_id=item.opportunity_id,
-            )
+            _record_backflip_decision(item=item, suppressed=True, reason=consent.reason)
             return consent.reason
     return None
 
@@ -245,19 +257,12 @@ def evaluate(item: QueueItem, *, now: datetime, venture=None) -> Verdict:
     cause = _suppression_reason(item)
     if cause is not None:
         if item.venture_key == _FA_MAX_VENTURE:
-            from src.services.fa_max_send_governance import record_backflip_suppression_decision
-            record_backflip_suppression_decision(
-                gate="send", recipient=item.recipient, suppressed=True,
-                reason=cause, opportunity_id=item.opportunity_id,
-            )
+            _record_backflip_decision(item=item, suppressed=True, reason=cause)
         return Verdict(BLOCK, f"{REASON_SUPPRESSED}:{cause}")
 
     if item.venture_key == _FA_MAX_VENTURE:
-        from src.services.fa_max_send_governance import record_backflip_suppression_decision
-        record_backflip_suppression_decision(
-            gate="send", recipient=item.recipient, suppressed=False,
-            reason=None, opportunity_id=item.opportunity_id,
-        )
+        if not _record_backflip_decision(item=item, suppressed=False, reason=None):
+            return Verdict(DEFER, "suppression_audit_unavailable")
 
     return Verdict(ALLOW)
 
