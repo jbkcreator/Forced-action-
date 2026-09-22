@@ -118,8 +118,8 @@ def log_tool_call(
                 "work_item_id": work_item_id,
                 "agent_name": agent_name,
                 "tool_name": tool_name,
-                "input": _json.dumps(redact_for_tool_log(input)),
-                "output": _json.dumps(redact_for_tool_log(output)),
+                "input": _json.dumps(redact_for_tool_log(input), default=str),
+                "output": _json.dumps(redact_for_tool_log(output), default=str),
                 "duration_ms": duration_ms,
                 "status": status,
             },
@@ -171,7 +171,7 @@ def start_tool_call(
                 "work_item_id": work_item_id,
                 "agent_name": agent_name,
                 "tool_name": tool_name,
-                "input": _json.dumps(redact_for_tool_log(input)),
+                "input": _json.dumps(redact_for_tool_log(input), default=str),
             },
         )
         log_id = row.scalar()
@@ -329,17 +329,18 @@ def finish_tool_call(
     import json as _json
 
     where = "id = :log_id"
-    params: dict = {
-        "log_id": log_id,
-        "output": _json.dumps(redact_for_tool_log(output)),
-        "duration_ms": duration_ms,
-        "status": status,
-    }
-    if require_status is not None:
-        where += " AND status = :require_status"
-        params["require_status"] = require_status
 
     try:
+        params: dict = {
+            "log_id": log_id,
+            "output": _json.dumps(redact_for_tool_log(output), default=str),
+            "duration_ms": duration_ms,
+            "status": status,
+        }
+        if require_status is not None:
+            where += " AND status = :require_status"
+            params["require_status"] = require_status
+
         result = session.execute(
             text(
                 "UPDATE fa_max_tool_call_log SET "

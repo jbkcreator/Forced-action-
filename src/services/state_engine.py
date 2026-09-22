@@ -1054,8 +1054,17 @@ def create_fa_max_opportunity(
                 f"create_fa_max_opportunity: idempotency_key {idempotency_key!r} conflicted "
                 "but no existing row was found — this should be impossible"
             )
-        return existing.opportunity_id  # type: ignore[union-attr]
-    return row.opportunity_id  # type: ignore[union-attr]
+        opportunity_id = existing.opportunity_id  # type: ignore[union-attr]
+    else:
+        opportunity_id = row.opportunity_id  # type: ignore[union-attr]
+
+    # Register in the entity registry in the SAME transaction as the insert above, so a crash
+    # between the two can never leave an unregistered opportunity. Without this, transition()
+    # (the only sanctioned write path for opportunity stage changes) fails with
+    # invalid_transition/"not found in registry" for every opportunity this function creates
+    # (confirmed bug, WP-T2-1/T2-2 e2e review).
+    ensure_entity_registry(session=session, entity_type="opportunity", native_id=opportunity_id)
+    return opportunity_id
 
 
 def create_opportunity_from_relay_send(
