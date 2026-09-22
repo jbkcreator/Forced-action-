@@ -148,10 +148,11 @@ def enqueue_sequence(
         except Exception as exc:
             db.rollback()
             logger.error(
-                "abandonment: failed to insert touch %d for person_id=%s: %s",
+                "abandonment: failed to insert touch %d for person_id=%s — rolled back, "
+                "no touches enqueued: %s",
                 touch_number, person_id, exc,
             )
-            return inserted
+            return 0
 
     db.commit()
     logger.info(

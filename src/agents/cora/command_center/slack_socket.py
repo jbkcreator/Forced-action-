@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
+import time
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -113,12 +114,24 @@ def run_socket_mode(stop_event: threading.Event) -> None:
     web_client = WebClient(token=bot_token)
 
     global _BOT_USER_ID
-    try:
-        auth = web_client.auth_test()
-        _BOT_USER_ID = auth["user_id"]
-        logger.info("cc.socket: bot user_id resolved via auth.test: %s", _BOT_USER_ID)
-    except Exception as exc:
-        logger.warning("cc.socket: auth.test failed — bot self-reply filter disabled: %s", exc)
+    for attempt in range(1, 4):
+        try:
+            auth = web_client.auth_test()
+            _BOT_USER_ID = auth["user_id"]
+            logger.info("cc.socket: bot user_id resolved via auth.test: %s", _BOT_USER_ID)
+            break
+        except Exception as exc:
+            logger.warning(
+                "cc.socket: auth.test failed (attempt %d/3): %s", attempt, exc,
+            )
+            if attempt < 3:
+                time.sleep(2 * attempt)
+    else:
+        logger.error(
+            "cc.socket: auth.test failed after 3 attempts — refusing to start Socket "
+            "Mode without a self-reply filter (fail closed)"
+        )
+        return
 
     client = SocketModeClient(app_token=app_token, web_client=web_client)
 
