@@ -23,7 +23,7 @@ from decimal import Decimal
 from typing import Dict, List, Optional, Set
 
 from sqlalchemy import bindparam, text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import ProgrammingError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from config.settings import get_settings
@@ -392,15 +392,21 @@ def _batch_published_arv(
     """
     if not property_ids:
         return {}
-    rows = session.execute(
-        _BATCH_ARV_SQL.bindparams(bindparam("pids", expanding=True)),
-        {"pids": list(set(property_ids))},
-    ).mappings()
-    return {
-        r["property_id"]: r["point"]
-        for r in rows
-        if not r["arv_unknown"] and r["point"] is not None
-    }
+    try:
+        rows = session.execute(
+            _BATCH_ARV_SQL.bindparams(bindparam("pids", expanding=True)),
+            {"pids": list(set(property_ids))},
+        ).mappings()
+        return {
+            r["property_id"]: r["point"]
+            for r in rows
+            if not r["arv_unknown"] and r["point"] is not None
+        }
+    except ProgrammingError as exc:
+        # fa_max_arv_results absent (migration not yet applied) — ARV unavailable
+        logger.warning("fa_max_arv_results query failed, ARV skipped: %s", exc.orig)
+        session.rollback()
+        return {}
 
 
 def assemble_dial_candidates(
