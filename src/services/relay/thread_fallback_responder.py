@@ -120,7 +120,14 @@ def _parse_classify_response(raw: str) -> ClassifyResult:
     caller gets a useful redirect rather than a silent error.
     """
     try:
-        data = json.loads(raw.strip())
+        cleaned = raw.strip()
+        # Strip markdown fences if Haiku wraps the JSON despite instructions.
+        if cleaned.startswith("```"):
+            cleaned = "\n".join(
+                line for line in cleaned.splitlines()
+                if not line.startswith("```")
+            ).strip()
+        data = json.loads(cleaned)
         bucket_str = data.get("bucket", "other")
         bucket = Bucket(bucket_str) if bucket_str in Bucket._value2member_map_ else Bucket.OTHER
         lookup_id: Optional[str] = data.get("lookup_id") or None
