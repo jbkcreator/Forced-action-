@@ -10734,6 +10734,9 @@ class FaMaxPerson(Base):
     )
     source: Mapped[str] = mapped_column(String(60), nullable=False)
     source_reference: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    full_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    phone: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     # CAS optimistic-concurrency guard — incremented on every successful transition().
     # Callers must supply the current value when calling transition(); a mismatched
     # version (stale read) produces already_advanced without a state mutation.
@@ -10764,6 +10767,10 @@ class FaMaxPerson(Base):
             "ix_fa_max_persons_not_merged",
             "person_id",
             postgresql_where=text("merged_into_id IS NULL"),
+        ),
+        Index(
+            "ix_fa_max_persons_full_name_trgm", "full_name",
+            postgresql_using="gin", postgresql_ops={"full_name": "gin_trgm_ops"},
         ),
     )
 
