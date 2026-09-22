@@ -15,6 +15,7 @@ from src.services.calendar.booking import (
 from src.services.calendar.client import (
     CalendarClient,
     CalendarEvent,
+    CalendarUnavailable,
     get_calendar_client,
     get_calendar_id,
     reset_calendar_client,
@@ -26,6 +27,7 @@ __all__ = [
     "BusyBlock",
     "CalendarClient",
     "CalendarEvent",
+    "CalendarUnavailable",
     "FakeCalendar",
     "FakeCalendarError",
     "RescheduleRequest",

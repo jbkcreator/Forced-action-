@@ -126,10 +126,23 @@ class TestWrapperConversion:
         assert result["reason"] == "suppressed"
         assert result["booking_ref"] is None
 
-    def test_live_mode_raises_rather_than_silently_faking(self):
+    def test_live_mode_builds_the_google_client_not_the_fake(self):
+        from src.services.calendar.client import get_calendar_client
+        from src.services.calendar.fakes import FakeCalendar
+
+        with patch("config.settings.get_settings") as settings, patch(
+            "src.services.calendar.google_client.GoogleCalendarClient.from_settings"
+        ) as from_settings:
+            settings.return_value.fa_max_calendar_mode = "live"
+            client = get_calendar_client()
+
+        from_settings.assert_called_once()
+        assert not isinstance(client, FakeCalendar)
+
+    def test_unknown_mode_raises_rather_than_guessing(self):
         from src.services.calendar.client import get_calendar_client
 
         with patch("config.settings.get_settings") as settings:
-            settings.return_value.fa_max_calendar_mode = "live"
-            with pytest.raises(NotImplementedError):
+            settings.return_value.fa_max_calendar_mode = "stage"
+            with pytest.raises(ValueError, match="Unknown FA_MAX_CALENDAR_MODE"):
                 get_calendar_client()

@@ -18,6 +18,16 @@ from typing import Optional, Protocol, runtime_checkable
 from src.services.calendar.availability import BusyBlock
 
 
+class CalendarUnavailable(RuntimeError):
+    """Availability could not be determined.
+
+    Part of the contract, not an implementation detail. An implementation that
+    cannot read a calendar must raise this rather than return no busy spans:
+    "no busy spans" means completely free, so a swallowed error would offer
+    every slot in the window and book over the client's whole week.
+    """
+
+
 @dataclass(frozen=True)
 class CalendarEvent:
     """A booking as the calendar provider reports it back."""
@@ -82,9 +92,9 @@ def get_calendar_client() -> CalendarClient:
 
     mode = get_settings().fa_max_calendar_mode
     if mode == "live":
-        raise NotImplementedError(
-            "FA_MAX_CALENDAR_MODE=live but no live calendar client exists yet"
-        )
+        from src.services.calendar.google_client import GoogleCalendarClient
+
+        return GoogleCalendarClient.from_settings()
     if mode != "fake":
         raise ValueError(f"Unknown FA_MAX_CALENDAR_MODE {mode!r} — expected 'fake' or 'live'")
 

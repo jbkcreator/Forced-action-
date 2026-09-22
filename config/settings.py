@@ -655,6 +655,10 @@ class AppSettings(BaseSettings):
 	# environment cannot put a test meeting on the client's real day.
 	fa_max_calendar_mode: str = Field(default="fake", env="FA_MAX_CALENDAR_MODE")
 	fa_max_calendar_id: Optional[str] = Field(default=None, env="FA_MAX_CALENDAR_ID")
+	# Domain-wide delegation impersonates a named user; this is whose calendar
+	# bookings land on. Must be inside the Workspace the service account is
+	# delegated within.
+	fa_max_calendar_subject: Optional[str] = Field(default=None, env="FA_MAX_CALENDAR_SUBJECT")
 	vera_slack_channel: Optional[str] = Field(default=None, env="VERA_SLACK_CHANNEL")
 
 	# Relay approval queue (RELAY-v2.2 sub-task R1). Non-FA-Max Relay ventures
