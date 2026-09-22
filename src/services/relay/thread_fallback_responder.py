@@ -68,6 +68,7 @@ _SOURCE_STALE_DAYS = 7
 class Bucket(str, Enum):
     SIMPLE_LOOKUP = "simple_lookup"
     CC_QUERY = "cc_query"
+    SOCIAL = "social"
     OTHER = "other"
 
 
@@ -108,8 +109,15 @@ Known lookup catalog (use bucket "simple_lookup" for any of these — match on i
 
 Use bucket "cc_query" when the message asks for: deal evaluation, backward math, scoreboard,
 analytics, pipeline forecasts, or any multi-step intelligence question not in the catalog.
+ALSO use "cc_query" for a vague follow-up you cannot map to a specific catalog lookup with
+concrete params (e.g. "what is it?", "tell me more", "why?", "which one?"). Do NOT guess a
+lookup when the reference is unclear — redirect instead.
 
-Use bucket "other" for: greetings, thanks, off-topic text, or anything with no data intent.
+Use bucket "social" for greetings, thanks, and encouragement directed at the team/assistant
+("good morning team", "nice work", "thanks!", "great job"). These get a brief friendly reply.
+
+Use bucket "other" ONLY for text with no data intent and no social intent: gibberish, random
+numbers, off-topic chatter between people, status noise ("brb", "on a call"). These stay silent.
 """
 
 # Tool schema — forcing tool_use guarantees a structured dict back (no prose, no
@@ -122,7 +130,7 @@ CLASSIFY_TOOL: dict[str, Any] = {
         "properties": {
             "bucket": {
                 "type": "string",
-                "enum": ["simple_lookup", "cc_query", "other"],
+                "enum": ["simple_lookup", "cc_query", "social", "other"],
             },
             "lookup_id": {
                 "type": ["string", "null"],
@@ -411,6 +419,16 @@ def build_other_ack_text() -> str:
     return "Noted — flagged for follow-up."
 
 
+def build_social_reply(raw_text: str) -> str:
+    """A brief, friendly reply to greetings/thanks/encouragement. Doubles as a
+    gentle capability hint so operators know what they can ask. Deterministic —
+    no LLM-generated prose, so it can't drift or hallucinate."""
+    lower = raw_text.lower()
+    if "thank" in lower or "nice" in lower or "great" in lower or "good job" in lower:
+        return "Anytime! Ask me for deal counts, the top uncalled deal, source freshness, or a deal's status."
+    return "👋 Hey! I can pull deal counts, the top uncalled deal, source freshness, or a deal's status — just ask."
+
+
 # ---------------------------------------------------------------------------
 # Audit log
 # ---------------------------------------------------------------------------
@@ -596,6 +614,8 @@ def _classify_and_respond(
                 reply_text = _run_catalog_lookup(classify_result, db)
             elif bucket == Bucket.CC_QUERY:
                 reply_text = build_redirect_text(cc_channel_id=cc_channel)
+            elif bucket == Bucket.SOCIAL:
+                reply_text = build_social_reply(raw_text)
             else:
                 reply_text = build_other_ack_text()
 

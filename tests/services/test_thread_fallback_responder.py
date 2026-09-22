@@ -24,6 +24,7 @@ from src.services.relay.thread_fallback_responder import (
     format_deal_status_result,
     build_redirect_text,
     build_other_ack_text,
+    build_social_reply,
 )
 
 
@@ -204,6 +205,26 @@ class TestRedirectAndAckText:
         assert "follow" in text.lower() or "noted" in text.lower()
 
 
+class TestSocialReply:
+    def test_thanks_variant(self):
+        text = build_social_reply("thanks so much!")
+        assert "anytime" in text.lower()
+
+    def test_praise_variant(self):
+        text = build_social_reply("nice work team")
+        assert "anytime" in text.lower()
+
+    def test_greeting_variant(self):
+        text = build_social_reply("good morning team")
+        assert "hey" in text.lower() or "👋" in text
+
+    def test_social_reply_hints_capabilities(self):
+        """Both variants nudge the operator toward what they can ask."""
+        for msg in ("thanks!", "morning"):
+            text = build_social_reply(msg).lower()
+            assert "deal" in text or "source" in text
+
+
 # ---------------------------------------------------------------------------
 # Bucket validation (catalog membership)
 # ---------------------------------------------------------------------------
@@ -295,10 +316,17 @@ class TestHandleChannelMessage:
         assert "pipeline-intelligence" in post.call_args.kwargs["text"].lower()
 
     def test_other_stays_silent(self):
-        """Greetings/thanks must NOT get a channel reply."""
-        post, audit = self._run("thanks!", _classify_stub("other"))
+        """Gibberish / off-topic noise must NOT get a channel reply."""
+        post, audit = self._run("asdfghjkl", _classify_stub("other"))
         post.assert_not_called()
         # Still audited — silence is logged, not invisible.
+        audit.assert_called_once()
+
+    def test_social_gets_friendly_reply(self):
+        """Greetings/thanks are answered (not silent) so the bot feels present."""
+        post, audit = self._run("good morning team", _classify_stub("social"))
+        post.assert_called_once()
+        assert post.call_args.kwargs["text"]  # non-empty friendly reply
         audit.assert_called_once()
 
     def test_audit_relay_item_id_is_none(self):

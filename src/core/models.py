@@ -11967,7 +11967,7 @@ class FaMaxThreadFallbackLog(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "bucket IN ('simple_lookup','cc_query','other')",
+            "bucket IN ('simple_lookup','cc_query','social','other')",
             name="ck_fa_max_thread_fallback_bucket",
         ),
         Index("ix_fa_max_thread_fallback_relay_item", "relay_item_id"),

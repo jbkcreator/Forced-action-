@@ -35,7 +35,7 @@ STATEMENTS: list[tuple[str, str]] = [
             cost_usd        NUMERIC(12, 6),
             created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
             CONSTRAINT ck_fa_max_thread_fallback_bucket
-                CHECK (bucket IN ('simple_lookup', 'cc_query', 'other'))
+                CHECK (bucket IN ('simple_lookup', 'cc_query', 'social', 'other'))
         );
         """,
     ),
