@@ -184,7 +184,6 @@ def extract_wholesaler_candidates(
         params["county_id"] = county_id
 
     result = session.execute(text(sql), params).yield_per(_STREAM_BATCH)
-    seen: set[str] = set()
     for row in result:
         raw_name = (row.grantee or "").strip()
         if not raw_name:
@@ -199,7 +198,6 @@ def extract_wholesaler_candidates(
             managing_members=None,
             county_id=row.county_id,
         )
-        seen.add(raw_name)
 
 
 def run_wholesaler_resolution(
