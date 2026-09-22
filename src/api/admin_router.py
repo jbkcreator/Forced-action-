@@ -2472,11 +2472,21 @@ def _handle_log_submission_view_submit(payload: dict, db: Session) -> dict:
 
     fa_max_file_state.ensure_file_state(db, opportunity_id=opportunity_id, person_id=person_id)
 
+    # Deliberately NOT fa_max_file_state.record_terms(): that function also
+    # transitions submitted -> term_sheet whenever current_stage is already
+    # 'submitted' (it's designed for a genuine terms-received event). This
+    # block just records a reference Josh already knows at submission time
+    # -- no underwriting has happened yet, so the stage must not move.
     backflip_ref = _field("backflip_ref_block", "backflip_ref") or None
     if backflip_ref:
-        fa_max_file_state.record_terms(
-            db, opportunity_id=opportunity_id, actor="user:josh", backflip_ref=backflip_ref,
+        db.execute(
+            text(
+                "UPDATE fa_max_opportunities SET backflip_ref = :backflip_ref, "
+                "updated_at = NOW() WHERE opportunity_id = :opportunity_id::uuid"
+            ),
+            {"backflip_ref": backflip_ref, "opportunity_id": opportunity_id},
         )
+        db.commit()
 
     return {}
 

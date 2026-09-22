@@ -40,19 +40,28 @@ class TestLogSubmissionViewSubmission:
                 "backflip_ref_block": {"backflip_ref": {"value": "BF-5521"}},
             },
         )
-        with patch("src.api.admin_router._verify_slack_signature", return_value=True), \
-             patch(
-                 "src.services.state_engine.create_fa_max_opportunity", return_value="opp-1",
-             ) as mock_create, \
-             patch("src.services.state_engine.transition") as mock_transition, \
-             patch("src.services.fa_max_file_state.ensure_file_state") as mock_ensure, \
-             patch(
-                 "src.services.fa_max_file_state.record_terms",
-             ) as mock_record_terms:
-            response = client.post(
-                "/api/admin/slack/interact", data=raw,
-                headers={**_signed_headers(), "content-type": "application/x-www-form-urlencoded"},
-            )
+        from src.api.admin_router import get_db
+
+        mock_db = MagicMock()
+
+        def _override():
+            yield mock_db
+
+        app.dependency_overrides[get_db] = _override
+        try:
+            with patch("src.api.admin_router._verify_slack_signature", return_value=True), \
+                 patch(
+                     "src.services.state_engine.create_fa_max_opportunity", return_value="opp-1",
+                 ) as mock_create, \
+                 patch("src.services.state_engine.transition") as mock_transition, \
+                 patch("src.services.fa_max_file_state.ensure_file_state") as mock_ensure, \
+                 patch("src.services.fa_max_file_state.record_terms") as mock_record_terms:
+                response = client.post(
+                    "/api/admin/slack/interact", data=raw,
+                    headers={**_signed_headers(), "content-type": "application/x-www-form-urlencoded"},
+                )
+        finally:
+            app.dependency_overrides.pop(get_db, None)
         assert response.status_code == 200
         mock_create.assert_called_once()
         assert mock_create.call_args.kwargs["person_id"] == "p-existing-1"
@@ -62,8 +71,17 @@ class TestLogSubmissionViewSubmission:
         assert mock_transition.call_args.kwargs["validate_allowed_next"] is False
         assert "reason" in mock_transition.call_args.kwargs["context"]
         mock_ensure.assert_called_once()
-        mock_record_terms.assert_called_once()
-        assert mock_record_terms.call_args.kwargs["backflip_ref"] == "BF-5521"
+        # record_terms() must NOT be called for a bare submission-time
+        # reference — it would side-effect a submitted -> term_sheet
+        # transition before any underwriting has happened.
+        mock_record_terms.assert_not_called()
+        backflip_calls = [
+            call for call in mock_db.execute.call_args_list
+            if call.args and "backflip_ref" in call.args[1]
+        ]
+        assert len(backflip_calls) == 1
+        assert backflip_calls[0].args[1]["backflip_ref"] == "BF-5521"
+        assert backflip_calls[0].args[1]["opportunity_id"] == "opp-1"
 
     def test_new_borrower_creates_person_then_opportunity(self):
         raw = _view_submission_payload(
