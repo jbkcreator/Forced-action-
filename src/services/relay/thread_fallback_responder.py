@@ -547,6 +547,44 @@ def _coalesce_roles(messages: list[dict]) -> list[dict]:
     return out
 
 
+def _classify_message(
+    raw_text: str,
+    history: Optional[list[dict]] = None,
+) -> tuple["ClassifyResult", dict]:
+    """Classify one operator message — the single production classify seam.
+
+    Builds the messages contract, calls Haiku with forced tool_use at
+    temperature=0 (deterministic classification), and parses the structured
+    result. Returns (ClassifyResult, raw_response_dict) so callers can pull
+    token/cost accounting off the response. Never raises for a well-formed
+    call — a text fallback covers the rare no-tool-use response.
+
+    Both the live handler (_classify_and_respond) and the acceptance harness
+    call THIS function, so the harness cannot drift from what prod runs.
+    """
+    messages = list(history or [])
+    messages.append({"role": "user", "content": f"DATA: {raw_text}"})
+    messages = _coalesce_roles(messages)
+
+    resp = call_claude_with_usage(
+        task_type="fa_max_thread_fallback",
+        messages=messages,
+        system=_CLASSIFY_SYSTEM,
+        cache_system=True,
+        tools=[CLASSIFY_TOOL],
+        tool_choice={"type": "tool", "name": CLASSIFY_TOOL["name"]},
+        max_tokens=256,
+        temperature=0,
+    )
+
+    tool_input = resp.get("tool_input")
+    if isinstance(tool_input, dict):
+        result = _validate_classify(tool_input)
+    else:
+        result = _parse_classify_response(resp.get("text") or "")
+    return result, resp
+
+
 def _classify_and_respond(
     *,
     raw_text: str,
@@ -581,29 +619,11 @@ def _classify_and_respond(
     try:
         settings = get_settings()
 
-        messages = list(history or [])
-        messages.append({"role": "user", "content": f"DATA: {raw_text}"})
-        messages = _coalesce_roles(messages)
-
-        classify_resp = call_claude_with_usage(
-            task_type="fa_max_thread_fallback",
-            messages=messages,
-            system=_CLASSIFY_SYSTEM,
-            cache_system=True,
-            tools=[CLASSIFY_TOOL],
-            tool_choice={"type": "tool", "name": CLASSIFY_TOOL["name"]},
-            max_tokens=256,
-        )
+        classify_result, classify_resp = _classify_message(raw_text, history)
         tokens_in = classify_resp.get("input_tokens", 0)
         tokens_out = classify_resp.get("output_tokens", 0)
         cost_usd = classify_resp.get("cost_usd", 0.0)
 
-        tool_input = classify_resp.get("tool_input")
-        if isinstance(tool_input, dict):
-            classify_result = _validate_classify(tool_input)
-        else:
-            # Fallback: model returned text instead of a tool_use block.
-            classify_result = _parse_classify_response(classify_resp.get("text") or "")
         bucket = classify_result.bucket
         lookup_id = classify_result.lookup_id
 

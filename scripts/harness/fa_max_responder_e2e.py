@@ -37,8 +37,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 # ── Acceptance thresholds ─────────────────────────────────────────────────────
-ACCURACY_THRESHOLD_PCT = 95   # bucket correct in ≥ this % of (case × run) pairs
-RUNS_PER_CASE = 3             # majority vote; odd number avoids ties
+ACCURACY_THRESHOLD_PCT = 95   # ≥ this % of CASES must pass (bucket+lookup+query)
+RUNS_PER_CASE = 3             # per-case majority vote; catches residual temp=0 flakiness
 DB_TIMEOUT_MS = 5000          # SET LOCAL statement_timeout per DB touch
 
 
@@ -137,33 +137,14 @@ CASES: list[Case] = [
 ]
 
 
-def _classify(raw_text: str, history: Optional[list]) -> dict:
-    """Run the real production classify call — forced tool_use, temp=0."""
-    from src.services.relay.thread_fallback_responder import (
-        CLASSIFY_TOOL, _CLASSIFY_SYSTEM, _validate_classify,
-        _parse_classify_response, _coalesce_roles,
-    )
-    from src.services.claude_router import call_claude_with_usage
+def _classify(raw_text: str, history: Optional[list]):
+    """Call the EXACT production classify seam — no reimplementation.
 
-    messages = _coalesce_roles(
-        list(history or []) + [{"role": "user", "content": f"DATA: {raw_text}"}]
-    )
-    resp = call_claude_with_usage(
-        task_type="fa_max_thread_fallback",
-        messages=messages,
-        system=_CLASSIFY_SYSTEM,
-        cache_system=True,
-        tools=[CLASSIFY_TOOL],
-        tool_choice={"type": "tool", "name": CLASSIFY_TOOL["name"]},
-        max_tokens=256,
-        temperature=0,  # deterministic classification
-    )
-    ti = resp.get("tool_input")
-    if isinstance(ti, dict):
-        result = _validate_classify(ti)
-    else:
-        result = _parse_classify_response(resp.get("text") or "")
-    return result, resp
+    _classify_message is the same function _classify_and_respond runs in prod,
+    so the harness cannot drift from production's model/prompt/params/temperature.
+    """
+    from src.services.relay.thread_fallback_responder import _classify_message
+    return _classify_message(raw_text, history)
 
 
 def _prompt_hash() -> str:
@@ -485,7 +466,9 @@ def main() -> int:
     # ── Threshold evaluation ──────────────────────────────────────────────────
     print("\n" + "=" * 65)
     threshold_fail = accuracy_pct < ACCURACY_THRESHOLD_PCT
-    print(f"  Bucket accuracy : {accuracy_pct:.1f}%  (threshold ≥ {ACCURACY_THRESHOLD_PCT}%)  {'PASS' if not threshold_fail else 'FAIL'}")
+    # "Case pass rate", not "bucket accuracy": a case fails on wrong bucket OR
+    # wrong lookup_id OR a catalog query that raised. Kept as one gate number.
+    print(f"  Case pass rate  : {accuracy_pct:.1f}%  (threshold ≥ {ACCURACY_THRESHOLD_PCT}%)  {'PASS' if not threshold_fail else 'FAIL'}")
     print(f"  Total failures  : {total_failures}")
 
     if total_failures == 0 and not threshold_fail:
@@ -493,7 +476,7 @@ def main() -> int:
     else:
         print(f"\nRESULT: GATE FAILED — do not ship until resolved")
         if threshold_fail:
-            print(f"  -> Bucket accuracy {accuracy_pct:.1f}% < {ACCURACY_THRESHOLD_PCT}% threshold")
+            print(f"  -> Case pass rate {accuracy_pct:.1f}% < {ACCURACY_THRESHOLD_PCT}% threshold")
     print("=" * 65)
     return 1 if (total_failures or threshold_fail) else 0
 
