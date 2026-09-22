@@ -96,7 +96,7 @@ def assemble_batch(ids: List[str], db: Session) -> List[RouterContext]:
                 a.point,
                 a.confidence
             FROM fa_max_opportunity_properties op
-            JOIN fa_max_arv_results a ON a.property_id = op.property_id
+            LEFT JOIN fa_max_arv_results a ON a.property_id = op.property_id
                 AND a.status = 'computed'
             WHERE op.opportunity_id = ANY(CAST(:ids AS uuid[]))
         """),
