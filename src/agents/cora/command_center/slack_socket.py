@@ -28,8 +28,10 @@ _BOT_USER_ID = "U0C2GT5CDGA"
 def _listen_channel() -> Optional[str]:
     """Command Center is restricted to the one channel Josh uses to manage
     his whole FA Max pipeline (submissions, status updates, questions) —
-    client decision, WP-T2-6 addendum Task 21. Read live (not cached at
-    import time) so a settings change takes effect without a restart."""
+    client decision, WP-T2-6 addendum Task 21. Read per call rather than
+    frozen into a module-level constant at import time; get_settings() is
+    itself lru_cached process-wide, so a settings change still needs a
+    restart to take effect."""
     from config.settings import get_settings
     return get_settings().fa_max_slack_cc_channel
 

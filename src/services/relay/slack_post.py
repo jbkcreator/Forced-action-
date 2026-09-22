@@ -306,6 +306,42 @@ _OPPORTUNITY_TYPES = (
 )
 
 
+def _deal_detail_blocks() -> list:
+    """The three deal-detail fields both log-submission views carry.
+
+    They live on BOTH views because either view can be the one Josh
+    actually submits: the search view submits directly for an existing
+    borrower (no view swap), and the new-entry view submits after the
+    swap. `_handle_log_submission_view_submit` reads opportunity_type
+    (required by fa_max_opportunities' CHECK constraint) and backflip_ref
+    regardless of which view it came from.
+    """
+    return [
+        {
+            "type": "input", "block_id": "opportunity_type_block",
+            "label": {"type": "plain_text", "text": "Loan type"},
+            "element": {
+                "type": "static_select",
+                "action_id": "opportunity_type",
+                "options": [
+                    {"text": {"type": "plain_text", "text": t}, "value": t}
+                    for t in _OPPORTUNITY_TYPES
+                ],
+            },
+        },
+        {
+            "type": "input", "block_id": "loan_amount_block", "optional": True,
+            "label": {"type": "plain_text", "text": "Loan amount ($)"},
+            "element": {"type": "plain_text_input", "action_id": "loan_amount"},
+        },
+        {
+            "type": "input", "block_id": "backflip_ref_block", "optional": True,
+            "label": {"type": "plain_text", "text": "Backflip reference (if you have it)"},
+            "element": {"type": "plain_text_input", "action_id": "backflip_ref"},
+        },
+    ]
+
+
 def _build_log_submission_modal() -> dict:
     """Addendum to WP-T2-6 -- initial view for logging a Backflip
     submission. Live-searches existing FA Max borrowers (Task 16/18)
@@ -343,6 +379,7 @@ def _build_log_submission_modal() -> dict:
                     },
                 ],
             },
+            *_deal_detail_blocks(),
         ],
     }
 
@@ -380,28 +417,7 @@ def _build_log_submission_new_entry_view(prior_metadata: dict) -> dict:
                 "label": {"type": "plain_text", "text": "Property address"},
                 "element": {"type": "plain_text_input", "action_id": "new_property_address"},
             },
-            {
-                "type": "input", "block_id": "opportunity_type_block",
-                "label": {"type": "plain_text", "text": "Loan type"},
-                "element": {
-                    "type": "static_select",
-                    "action_id": "opportunity_type",
-                    "options": [
-                        {"text": {"type": "plain_text", "text": t}, "value": t}
-                        for t in _OPPORTUNITY_TYPES
-                    ],
-                },
-            },
-            {
-                "type": "input", "block_id": "loan_amount_block", "optional": True,
-                "label": {"type": "plain_text", "text": "Loan amount ($)"},
-                "element": {"type": "plain_text_input", "action_id": "loan_amount"},
-            },
-            {
-                "type": "input", "block_id": "backflip_ref_block", "optional": True,
-                "label": {"type": "plain_text", "text": "Backflip reference (if you have it)"},
-                "element": {"type": "plain_text_input", "action_id": "backflip_ref"},
-            },
+            *_deal_detail_blocks(),
         ],
     }
 
@@ -421,6 +437,27 @@ def open_log_submission_modal(trigger_id: str) -> bool:
         return True
     except Exception as exc:
         logger.error("[Relay] views.open failed for log-submission modal: %s", exc, exc_info=True)
+        return False
+
+
+def open_log_submission_new_entry_view(view_id: str, view_hash: str, prior_metadata: dict) -> bool:
+    """Swaps the already-open log-submission modal to the new-borrower view
+    in place (views.update, not a second popup) when Josh clicks "Not on
+    this list — new borrower". Returns True on success."""
+    settings = get_settings()
+    token = settings.fa_max_slack_bot_token
+    if not token or not view_id or not view_hash:
+        logger.info("[Relay] cannot swap log-submission modal to new-entry view — missing token/view_id/hash")
+        return False
+    try:
+        from slack_sdk import WebClient
+        WebClient(token=token.get_secret_value()).views_update(
+            view_id=view_id, hash=view_hash,
+            view=_build_log_submission_new_entry_view(prior_metadata),
+        )
+        return True
+    except Exception as exc:
+        logger.error("[Relay] views.update failed swapping to new-entry view: %s", exc, exc_info=True)
         return False
 
 

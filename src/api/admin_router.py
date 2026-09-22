@@ -1737,6 +1737,8 @@ async def slack_interact(request: Request, background_tasks: BackgroundTasks, db
         return _handle_relay_snooze(payload)
     if action_id == "fa_max_revise":
         return _handle_relay_revise_open(payload)
+    if action_id == "log_submission_new_borrower":
+        return _handle_log_submission_new_borrower_click(payload)
     if action_id in ("approve_win_story", "dismiss_win_story"):
         return _handle_win_story_interact(payload, db)
     # Builder entity-link actions (EXCEPTIONS lane — WP-T2-8)
@@ -2421,6 +2423,21 @@ def _handle_relay_revise_submission(payload: dict) -> dict:
     return {"response_action": "clear"}
 
 
+def _handle_log_submission_new_borrower_click(payload: dict) -> dict:
+    """"Not on this list — new borrower" button inside the log-submission
+    modal — swaps the view in place via views.update, preserving whatever
+    Josh already entered (e.g. a partial search) in private_metadata."""
+    from src.services.relay.slack_post import open_log_submission_new_entry_view
+
+    view = payload.get("view", {})
+    open_log_submission_new_entry_view(
+        view.get("id", ""),
+        view.get("hash", ""),
+        json.loads(view.get("private_metadata") or "{}"),
+    )
+    return {}
+
+
 def _handle_log_submission_view_submit(payload: dict, db: Session) -> dict:
     """Slack `/fa-max-log-submission` modal submission (WP-T2-6 addendum,
     Task 19). This is the moment Josh tells the system he already submitted
@@ -2436,6 +2453,7 @@ def _handle_log_submission_view_submit(payload: dict, db: Session) -> dict:
     other select block in this modal (e.g. opportunity_type_block).
     """
     from src.services import fa_max_file_state, state_engine
+    from src.services.phone_utils import normalize as normalize_phone
 
     view = payload["view"]
     metadata = json.loads(view.get("private_metadata") or "{}")
@@ -2443,7 +2461,10 @@ def _handle_log_submission_view_submit(payload: dict, db: Session) -> dict:
 
     def _field(block_id: str, action_id: str) -> str:
         block = values.get(block_id, {}).get(action_id, {})
-        return (block.get("value") or block.get("selected_option", {}).get("value") or "").strip()
+        # `selected_option` arrives as an explicit JSON null (not a missing
+        # key) for an optional select with nothing chosen, so the default
+        # from .get() is never reached — coalesce the null itself.
+        return (block.get("value") or (block.get("selected_option") or {}).get("value") or "").strip()
 
     if metadata.get("mode") == "new_borrower":
         full_name = _field("new_full_name_block", "new_full_name")
@@ -2453,7 +2474,7 @@ def _handle_log_submission_view_submit(payload: dict, db: Session) -> dict:
                 "errors": {"new_full_name_block": "Borrower name is required."},
             }
         email = _field("new_email_block", "new_email") or None
-        phone = _field("new_phone_block", "new_phone") or None
+        phone = normalize_phone(_field("new_phone_block", "new_phone") or None)
         person_row = db.execute(
             text(
                 "INSERT INTO fa_max_persons (source, full_name, email, phone) "

@@ -10772,6 +10772,10 @@ class FaMaxPerson(Base):
             "ix_fa_max_persons_full_name_trgm", "full_name",
             postgresql_using="gin", postgresql_ops={"full_name": "gin_trgm_ops"},
         ),
+        Index(
+            "ix_fa_max_persons_email", "email",
+            postgresql_where=text("email IS NOT NULL"),
+        ),
     )
 
     def __repr__(self) -> str:

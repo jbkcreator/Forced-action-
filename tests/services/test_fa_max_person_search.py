@@ -43,6 +43,19 @@ class TestSearchFaMaxPersons:
         call_args = db.execute.call_args
         assert call_args.args[1]["query"] == "O'Brien"
 
+    def test_phone_query_is_normalized_to_e164_for_the_phone_comparison(self):
+        db = _mock_db([])
+        search_fa_max_persons(db, "(813) 555-0100")
+        params = db.execute.call_args.args[1]
+        assert params["normalized_query"] == "+18135550100"
+        # the ILIKE name/email clauses keep the raw typed text
+        assert params["query"] == "(813) 555-0100"
+
+    def test_non_phone_query_normalizes_to_none_and_cannot_match(self):
+        db = _mock_db([])
+        search_fa_max_persons(db, "Jane Doe")
+        assert db.execute.call_args.args[1]["normalized_query"] is None
+
     def test_respects_limit(self):
         db = _mock_db([])
         search_fa_max_persons(db, "Jane", limit=3)

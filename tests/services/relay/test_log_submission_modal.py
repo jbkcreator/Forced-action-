@@ -8,6 +8,7 @@ from src.services.relay.slack_post import (
     _build_log_submission_modal,
     _build_log_submission_new_entry_view,
     open_log_submission_modal,
+    open_log_submission_new_entry_view,
 )
 
 
@@ -30,6 +31,21 @@ class TestBuildLogSubmissionModal:
             for el in b.get("elements", [])
         }
         assert "log_submission_new_borrower" in action_ids
+
+    def test_initial_view_has_deal_detail_blocks(self):
+        # The search view's own submit button is live (existing-borrower
+        # path submits directly), so it must carry the same deal fields the
+        # submit handler reads -- opportunity_type is required by
+        # fa_max_opportunities' CHECK constraint.
+        view = _build_log_submission_modal()
+        block_ids = {b["block_id"] for b in view["blocks"] if "block_id" in b}
+        assert block_ids >= {
+            "opportunity_type_block", "loan_amount_block", "backflip_ref_block",
+        }
+        opp = next(b for b in view["blocks"] if b.get("block_id") == "opportunity_type_block")
+        assert opp["element"]["type"] == "static_select"
+        assert opp["element"]["action_id"] == "opportunity_type"
+        assert not opp.get("optional")
 
 
 class TestBuildNewEntryView:
@@ -65,3 +81,26 @@ class TestOpenLogSubmissionModal:
             mock_settings.return_value.fa_max_slack_bot_token = None
             result = open_log_submission_modal("trigger-123")
         assert result is False
+
+
+class TestOpenLogSubmissionNewEntryView:
+    def test_calls_views_update_in_place_preserving_metadata(self):
+        with patch("src.services.relay.slack_post.get_settings") as mock_settings, \
+             patch("slack_sdk.WebClient") as mock_client_cls:
+            mock_settings.return_value.fa_max_slack_bot_token.get_secret_value.return_value = "xoxb-test"
+            result = open_log_submission_new_entry_view("V1", "h1", {"note": "kept"})
+        assert result is True
+        mock_client_cls.return_value.views_open.assert_not_called()
+        kwargs = mock_client_cls.return_value.views_update.call_args.kwargs
+        assert kwargs["view_id"] == "V1"
+        assert kwargs["hash"] == "h1"
+        meta = json.loads(kwargs["view"]["private_metadata"])
+        assert meta == {"note": "kept", "mode": "new_borrower"}
+
+    def test_missing_view_id_or_hash_returns_false(self):
+        with patch("src.services.relay.slack_post.get_settings") as mock_settings, \
+             patch("slack_sdk.WebClient") as mock_client_cls:
+            mock_settings.return_value.fa_max_slack_bot_token.get_secret_value.return_value = "xoxb-test"
+            assert open_log_submission_new_entry_view("", "h1", {}) is False
+            assert open_log_submission_new_entry_view("V1", "", {}) is False
+        mock_client_cls.return_value.views_update.assert_not_called()

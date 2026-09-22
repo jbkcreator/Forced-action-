@@ -23,6 +23,8 @@ from typing import Any, Dict, List
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from src.services.phone_utils import normalize as normalize_phone
+
 _SEARCH_SQL = text("""
     SELECT
         p.person_id::text,
@@ -41,7 +43,7 @@ _SEARCH_SQL = text("""
       AND (
           p.full_name ILIKE '%' || :query || '%'
           OR p.email ILIKE '%' || :query || '%'
-          OR p.phone = :query
+          OR p.phone = :normalized_query
       )
     ORDER BY similarity(COALESCE(p.full_name, ''), :query) DESC
     LIMIT :limit
@@ -63,5 +65,13 @@ def search_fa_max_persons(session: Session, query: str, *, limit: int = 5) -> Li
     if not query:
         return []
 
-    rows = session.execute(_SEARCH_SQL, {"query": query, "limit": limit}).fetchall()
+    # Stored phones are E.164 (phone_utils.normalize on write), so the raw
+    # typed query must be normalized too or `p.phone = ...` never matches.
+    # A non-phone-shaped query normalizes to None, which `=` can't match.
+    params = {
+        "query": query,
+        "normalized_query": normalize_phone(query),
+        "limit": limit,
+    }
+    rows = session.execute(_SEARCH_SQL, params).fetchall()
     return [dict(row._mapping) for row in rows]
