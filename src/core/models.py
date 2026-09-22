@@ -10884,6 +10884,13 @@ class FaMaxOpportunity(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
+    # WP-T2-11: GYR routing columns
+    gyr_color: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    expected_revenue_cents: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    gyr_reason: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    gyr_ranked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    gyr_stale_alerted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
     __table_args__ = (
         ForeignKeyConstraint(
             ["current_stage"],
@@ -10901,6 +10908,10 @@ class FaMaxOpportunity(Base):
             "outcome IN ('open','funded','dead','recycled','referred')",
             name="ck_fa_max_opp_outcome",
         ),
+        CheckConstraint(
+            "gyr_color IN ('green','yellow','red') OR gyr_color IS NULL",
+            name="ck_fa_max_opp_gyr_color",
+        ),
         Index(
             "uq_fa_max_opp_idempotency_key",
             "idempotency_key",
@@ -10917,6 +10928,12 @@ class FaMaxOpportunity(Base):
         Index(
             "ix_fa_max_opp_origin_interaction", "origin_interaction_id",
             postgresql_where=text("origin_interaction_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_fa_max_opp_gyr_money",
+            "gyr_color",
+            "expected_revenue_cents",
+            postgresql_where=text("outcome = 'open'"),
         ),
     )
 
@@ -11950,4 +11967,39 @@ class FaMaxArvResult(Base):
         CheckConstraint(
             "status IN ('computed','superseded')", name="ck_fa_max_arv_status"
         ),
+    )
+
+
+class FaMaxGyrRoutingLog(Base):
+    """Immutable audit log — one row per GYR routing decision (WP-T2-11).
+
+    Never updated. Every classify() call produces one row so routing history is
+    fully reconstructable independent of the mutable gyr_* columns on
+    fa_max_opportunities.
+    """
+
+    __tablename__ = "fa_max_gyr_routing_log"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    opportunity_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_opportunities.opportunity_id", name="fk_fa_max_gyr_log_opp"),
+        nullable=False,
+    )
+    color: Mapped[str] = mapped_column(String(10), nullable=False)
+    expected_revenue_cents: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    reason_codes: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
+    disqualifying_rule: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    queue: Mapped[Optional[str]] = mapped_column(String(12), nullable=True)
+    decided_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("color IN ('green','yellow','red')", name="ck_fa_max_gyr_log_color"),
+        CheckConstraint(
+            "queue IN ('MONEY','EXCEPTIONS') OR queue IS NULL",
+            name="ck_fa_max_gyr_log_queue",
+        ),
+        Index("ix_fa_max_gyr_log_opp_decided", "opportunity_id", "decided_at"),
     )
