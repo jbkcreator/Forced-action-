@@ -838,8 +838,6 @@ class AppSettings(BaseSettings):
 	fa_max_slack_channel_money: str = Field(default="", env="FA_MAX_SLACK_CHANNEL_MONEY")
 	fa_max_slack_channel_exceptions: str = Field(default="", env="FA_MAX_SLACK_CHANNEL_EXCEPTIONS")
 	fa_max_slack_channel_relationships: str = Field(default="", env="FA_MAX_SLACK_CHANNEL_RELATIONSHIPS")
-	# WP-T2-12: Command Center channel — where the thread fallback responder redirects
-	# cc_query messages. CC_SLACK_CHANNEL takes precedence; falls back to RELATIONSHIPS.
 	cc_slack_channel: str = Field(default="", env="CC_SLACK_CHANNEL")
 	fa_max_backflip_feed_max_age_hours: int = Field(default=24, ge=1, env="FA_MAX_BACKFLIP_FEED_MAX_AGE_HOURS")
 	backflip_webhook_secret: Optional[SecretStr] = Field(default=None, env="BACKFLIP_WEBHOOK_SECRET")
