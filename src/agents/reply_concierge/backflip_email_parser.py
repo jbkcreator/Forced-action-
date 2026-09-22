@@ -158,11 +158,10 @@ def _parse_via_llm(subject: str, body_text: str) -> Optional[ParsedBackflipEvent
             if raw_text.startswith("json"):
                 raw_text = raw_text[4:]
         parsed = json.loads(raw_text.strip())
+        return _event_from_llm_response(parsed)
     except Exception as exc:
         logger.error("backflip_email_parser: LLM fallback call failed: %s", exc)
         return None
-
-    return _event_from_llm_response(parsed)
 
 
 def _build_llm_prompt(subject: str, body_text: str) -> str:

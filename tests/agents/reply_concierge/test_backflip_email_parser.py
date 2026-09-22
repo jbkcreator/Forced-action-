@@ -181,3 +181,58 @@ class TestLLMFallback:
             mock_anthropic.return_value.messages.create.return_value = _mock_llm_response(payload)
             result = parse_backflip_notification("Subject", "Body with vague status update.")
         assert result is None
+
+    def test_llm_wrong_typed_stage_list_instead_of_string_degrades_to_none(self):
+        """LLM returns stage as list instead of string -- unhashable type
+        error when checking membership in BACKFLIP_STAGE_KEYS (frozenset).
+        Must degrade to None, not raise."""
+        payload = {
+            "is_backflip_notification": True, "event_type": "stage_change",
+            "backflip_ref": "APP-1", "stage": ["under", "review"],
+            "document_name": None, "loan_amount_cents": None, "maturity_months": None,
+        }
+        with patch("anthropic.Anthropic") as mock_anthropic:
+            mock_anthropic.return_value.messages.create.return_value = _mock_llm_response(payload)
+            result = parse_backflip_notification("Subject", "Body text.")
+        assert result is None
+
+    def test_llm_wrong_typed_event_type_list_instead_of_string_degrades_to_none(self):
+        """LLM returns event_type as list instead of string -- unhashable
+        type error when checking membership in _EVENT_TYPES. Must degrade to None."""
+        payload = {
+            "is_backflip_notification": True, "event_type": ["stage", "change"],
+            "backflip_ref": "APP-1", "stage": "under_review",
+            "document_name": None, "loan_amount_cents": None, "maturity_months": None,
+        }
+        with patch("anthropic.Anthropic") as mock_anthropic:
+            mock_anthropic.return_value.messages.create.return_value = _mock_llm_response(payload)
+            result = parse_backflip_notification("Subject", "Body text.")
+        assert result is None
+
+    def test_llm_loan_amount_as_infinity_degrades_to_none(self):
+        """LLM returns loan_amount_cents as float('inf') -- OverflowError when
+        int() tries to convert. isinstance(float('inf'), (int, float)) is True,
+        so this bypasses the isinstance guard and tries int(). Must degrade to None."""
+        # Create JSON with Infinity which json.loads() accepts
+        block = MagicMock()
+        block.text = '{"is_backflip_notification": true, "event_type": "terms", "backflip_ref": "APP-1", "stage": null, "document_name": null, "loan_amount_cents": Infinity, "maturity_months": null}'
+        response = MagicMock()
+        response.content = [block]
+        with patch("anthropic.Anthropic") as mock_anthropic:
+            mock_anthropic.return_value.messages.create.return_value = response
+            result = parse_backflip_notification("Subject", "Body text.")
+        assert result is None
+
+    def test_llm_maturity_months_as_invalid_float_degrades_to_none(self):
+        """LLM returns maturity_months as float('inf') -- OverflowError when
+        int() tries to convert. Must degrade to None, not raise."""
+        import json
+        block = MagicMock()
+        # Manually create JSON with float('inf') which json.loads() accepts
+        block.text = '{"is_backflip_notification": true, "event_type": "terms", "backflip_ref": "APP-1", "stage": null, "document_name": null, "loan_amount_cents": null, "maturity_months": Infinity}'
+        response = MagicMock()
+        response.content = [block]
+        with patch("anthropic.Anthropic") as mock_anthropic:
+            mock_anthropic.return_value.messages.create.return_value = response
+            result = parse_backflip_notification("Subject", "Body text.")
+        assert result is None
