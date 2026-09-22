@@ -109,9 +109,13 @@ Known lookup catalog (use bucket "simple_lookup" for any of these — match on i
 
 Use bucket "cc_query" when the message asks for: deal evaluation, backward math, scoreboard,
 analytics, pipeline forecasts, or any multi-step intelligence question not in the catalog.
-ALSO use "cc_query" for a vague follow-up you cannot map to a specific catalog lookup with
-concrete params (e.g. "what is it?", "tell me more", "why?", "which one?"). Do NOT guess a
-lookup when the reference is unclear — redirect instead.
+ALSO use "cc_query" for:
+- A vague follow-up you cannot map to a specific catalog lookup with concrete params
+  (e.g. "what is it?", "tell me more", "why?", "which one?"). Do NOT guess — redirect instead.
+- A message that asks for TWO OR MORE distinct things at once (compound / multi-intent questions,
+  e.g. "how many greens AND is tracerfy stale?", "count yellows and show top deal"). Even if each
+  part is individually in the catalog, the combination is a cc_query — pick one catalog item only
+  when the message has exactly one clear intent.
 
 Use bucket "social" for greetings, thanks, and encouragement directed at the team/assistant
 ("good morning team", "nice work", "thanks!", "great job"). These get a brief friendly reply.
