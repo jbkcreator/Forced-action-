@@ -10734,8 +10734,8 @@ class FaMaxPerson(Base):
     )
     source: Mapped[str] = mapped_column(String(60), nullable=False)
     source_reference: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    full_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    full_name: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    email: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     phone: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     # CAS optimistic-concurrency guard — incremented on every successful transition().
     # Callers must supply the current value when calling transition(); a mismatched
