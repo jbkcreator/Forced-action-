@@ -160,8 +160,11 @@ def run_guard(question: str, db: Optional[Session], history: Optional[list] = No
     """
     Returns {"blocked": bool, "block_reason": str | None, "intent": str | None}.
 
-    Never raises — a guard failure defaults to NOT blocking so a transient
-    Claude error doesn't silence Josh permanently.
+    Never raises. A classifier failure blocks (fail-closed): an unclassified
+    question could be an injection attempt or a request for borrower financial
+    data, so an outage must not become a way past the guard. Greetings and the
+    Phase 1 pattern rules answer without the classifier, so they keep working
+    while it is down.
     """
     # Phase 1 — pattern scan
 
