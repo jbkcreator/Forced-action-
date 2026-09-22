@@ -8,7 +8,19 @@ touches stage_monitor.py, fa_max_file_state.py, or the poller wiring.
 """
 from __future__ import annotations
 
+import json
+from unittest.mock import MagicMock, patch
+
 from src.agents.reply_concierge.backflip_email_parser import parse_backflip_notification
+
+
+def _mock_llm_response(payload: dict):
+    """Builds a fake anthropic.Anthropic().messages.create() return value."""
+    block = MagicMock()
+    block.text = json.dumps(payload)
+    response = MagicMock()
+    response.content = [block]
+    return response
 
 
 def test_stage_change_under_review():
@@ -65,3 +77,107 @@ def test_unrecognized_email_returns_none():
 def test_missing_backflip_ref_returns_none():
     result = parse_backflip_notification("Now Under Review", "Your file has moved to Under Review.")
     assert result is None
+
+
+class TestLLMFallback:
+    """The LLM fallback only fires when the regex path returns None."""
+
+    def test_regex_match_never_calls_llm(self):
+        with patch("anthropic.Anthropic") as mock_anthropic:
+            result = parse_backflip_notification(
+                "Application BF-10293 — Now Under Review",
+                "Your application BF-10293 has moved to Under Review.",
+            )
+        assert result.stage == "under_review"
+        mock_anthropic.assert_not_called()
+
+    def test_llm_fallback_extracts_stage_change_in_unrecognized_format(self):
+        payload = {
+            "is_backflip_notification": True, "event_type": "stage_change",
+            "backflip_ref": "APP-99182", "stage": "docs_requested",
+            "document_name": None, "loan_amount_cents": None, "maturity_months": None,
+        }
+        with patch("anthropic.Anthropic") as mock_anthropic:
+            mock_anthropic.return_value.messages.create.return_value = _mock_llm_response(payload)
+            result = parse_backflip_notification(
+                "Your file needs attention", "We're waiting on something from you for APP-99182.",
+            )
+        assert result is not None
+        assert result.event_type == "stage_change"
+        assert result.stage == "docs_requested"
+        assert result.backflip_ref == "APP-99182"
+
+    def test_llm_fallback_extracts_document_request(self):
+        payload = {
+            "is_backflip_notification": True, "event_type": "document_request",
+            "backflip_ref": "APP-1", "stage": None,
+            "document_name": "Voided check", "loan_amount_cents": None, "maturity_months": None,
+        }
+        with patch("anthropic.Anthropic") as mock_anthropic:
+            mock_anthropic.return_value.messages.create.return_value = _mock_llm_response(payload)
+            result = parse_backflip_notification("Re: your file APP-1", "Please send a voided check.")
+        assert result.event_type == "document_request"
+        assert result.document_name == "Voided check"
+
+    def test_llm_fallback_extracts_terms(self):
+        payload = {
+            "is_backflip_notification": True, "event_type": "terms",
+            "backflip_ref": "APP-1", "stage": None, "document_name": None,
+            "loan_amount_cents": 30_000_000, "maturity_months": 18,
+        }
+        with patch("anthropic.Anthropic") as mock_anthropic:
+            mock_anthropic.return_value.messages.create.return_value = _mock_llm_response(payload)
+            result = parse_backflip_notification("APP-1 approved", "Your terms are ready.")
+        assert result.event_type == "terms"
+        assert result.loan_amount_cents == 30_000_000
+        assert result.maturity_months == 18
+
+    def test_llm_says_not_a_backflip_email_returns_none(self):
+        payload = {
+            "is_backflip_notification": False, "event_type": None, "backflip_ref": None,
+            "stage": None, "document_name": None, "loan_amount_cents": None, "maturity_months": None,
+        }
+        with patch("anthropic.Anthropic") as mock_anthropic:
+            mock_anthropic.return_value.messages.create.return_value = _mock_llm_response(payload)
+            result = parse_backflip_notification("Weekly digest", "Nothing about a loan file here.")
+        assert result is None
+
+    def test_llm_returns_stage_outside_known_set_is_rejected(self):
+        """Safety guard: an LLM-invented stage name must never reach the caller,
+        mirroring src/loaders/llm_matcher.py's own candidate-set validation."""
+        payload = {
+            "is_backflip_notification": True, "event_type": "stage_change",
+            "backflip_ref": "APP-1", "stage": "pending_secondary_review",
+            "document_name": None, "loan_amount_cents": None, "maturity_months": None,
+        }
+        with patch("anthropic.Anthropic") as mock_anthropic:
+            mock_anthropic.return_value.messages.create.return_value = _mock_llm_response(payload)
+            result = parse_backflip_notification("Update on APP-1", "Some unusual status text.")
+        assert result is None
+
+    def test_llm_returns_malformed_json_degrades_to_none(self):
+        block = MagicMock()
+        block.text = "not valid json at all"
+        response = MagicMock()
+        response.content = [block]
+        with patch("anthropic.Anthropic") as mock_anthropic:
+            mock_anthropic.return_value.messages.create.return_value = response
+            result = parse_backflip_notification("Subject", "Body text with no ref.")
+        assert result is None
+
+    def test_llm_api_call_raising_degrades_to_none(self):
+        with patch("anthropic.Anthropic") as mock_anthropic:
+            mock_anthropic.return_value.messages.create.side_effect = RuntimeError("API down")
+            result = parse_backflip_notification("Subject", "Body text with no ref.")
+        assert result is None
+
+    def test_llm_missing_backflip_ref_returns_none(self):
+        payload = {
+            "is_backflip_notification": True, "event_type": "stage_change",
+            "backflip_ref": None, "stage": "under_review",
+            "document_name": None, "loan_amount_cents": None, "maturity_months": None,
+        }
+        with patch("anthropic.Anthropic") as mock_anthropic:
+            mock_anthropic.return_value.messages.create.return_value = _mock_llm_response(payload)
+            result = parse_backflip_notification("Subject", "Body with vague status update.")
+        assert result is None
