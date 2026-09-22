@@ -11179,6 +11179,7 @@ class FaMaxPartner(Base):
             "status IN ('identified', 'active', 'inactive')",
             name="ck_fa_max_partner_status",
         ),
+        UniqueConstraint("person_id", "partner_class", name="uq_fa_max_partner_person_class"),
         Index("ix_fa_max_partner_person_id", "person_id"),
         Index("ix_fa_max_partner_status", "status"),
         Index("ix_fa_max_partner_class_txn", "partner_class", "observed_transaction_count"),

@@ -26,6 +26,7 @@ class PartnerRow:
     partner_class: str
     observed_transaction_count: int
     last_observed_at: date
+    first_observed_at: Optional[date] = None
     total_cash_volume: float = 0.0
     # Populated by rank_partners:
     rank: int = 0

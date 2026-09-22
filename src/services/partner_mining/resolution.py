@@ -100,13 +100,15 @@ def extract_counterparty_candidates(
 def resolve_counterparty_names(
     session: "Session",
     names: list[str],
+    *,
+    source_table: str = "deed_lender",
 ) -> dict[str, Optional[int]]:
     """
     Map raw counterparty name strings → buyer_entity_id.
 
-    Looks up existing buyer_entity_links where source_table='deed_lender' and
-    joins to buyer_entities.canonical_name. Returns {name: entity_id or None}.
-    Call after run_counterparty_resolution has committed the links.
+    Looks up existing buyer_entity_links for the given source_table and joins
+    to buyer_entities.canonical_name. Returns {name: entity_id or None}.
+    Call after the relevant counterparty resolution has committed the links.
 
     For names not yet resolved (no link), returns None — the sweep will flag
     those rows as needs-enrichment.
@@ -119,10 +121,10 @@ def resolve_counterparty_names(
             SELECT be.canonical_name, be.id AS buyer_entity_id
             FROM buyer_entities be
             JOIN buyer_entity_links bel ON bel.buyer_entity_id = be.id
-            WHERE bel.source_table = 'deed_lender'
+            WHERE bel.source_table = :source_table
               AND be.canonical_name = ANY(:names)
         """),
-        {"names": names},
+        {"source_table": source_table, "names": names},
     ).fetchall()
 
     mapping: dict[str, Optional[int]] = {n: None for n in names}

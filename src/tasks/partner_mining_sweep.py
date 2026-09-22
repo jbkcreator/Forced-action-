@@ -184,11 +184,14 @@ def _run_county(county_id: str, *, dry_run: bool, as_of: date) -> int:
                 canonical_name=name,
                 partner_class=PartnerClass.LENDER.value,
                 observed_transaction_count=stats["count"],
+                first_observed_at=stats["first"],
                 last_observed_at=stats["last"],
                 total_cash_volume=stats["volume"],
             ))
 
-        wholesaler_name_map = resolve_counterparty_names(db, list(wholesaler_names))
+        wholesaler_name_map = resolve_counterparty_names(
+            db, list(wholesaler_names), source_table="deed_wholesaler"
+        )
 
         for name in wholesaler_names:
             partner_rows.append(PartnerRow(
@@ -197,6 +200,7 @@ def _run_county(county_id: str, *, dry_run: bool, as_of: date) -> int:
                 partner_class=PartnerClass.WHOLESALER.value,
                 observed_transaction_count=wholesaler_txn_counts.get(name, 1),
                 last_observed_at=as_of,
+                first_observed_at=as_of,
             ))
 
         ranked = rank_partners(partner_rows)
