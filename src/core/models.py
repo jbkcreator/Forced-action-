@@ -9559,7 +9559,7 @@ class BuyerEntityLink(Base):
         UniqueConstraint("source_table", "source_id", name="uq_buyer_entity_link_source"),
         CheckConstraint(
             "source_table IN ('owners', 'deeds', 'sunbiz_snapshots', 'tax_deed_auctions', "
-            "'building_permits', 'permit_staging')",
+            "'building_permits', 'permit_staging', 'deed_lender', 'deed_wholesaler')",
             name="check_buyer_entity_link_source_table",
         ),
         CheckConstraint(
@@ -10906,6 +10906,13 @@ class FaMaxOpportunity(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
+    # WP-T2-11: GYR routing columns
+    gyr_color: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    expected_revenue_cents: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    gyr_reason: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    gyr_ranked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    gyr_stale_alerted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
     __table_args__ = (
         ForeignKeyConstraint(
             ["current_stage"],
@@ -10928,6 +10935,10 @@ class FaMaxOpportunity(Base):
             "OR backflip_attribution_owner IN ('forced_action','backflip')",
             name="ck_fa_max_opp_attribution_owner",
         ),
+        CheckConstraint(
+            "gyr_color IN ('green','yellow','red') OR gyr_color IS NULL",
+            name="ck_fa_max_opp_gyr_color",
+        ),
         Index(
             "uq_fa_max_opp_idempotency_key",
             "idempotency_key",
@@ -10944,6 +10955,12 @@ class FaMaxOpportunity(Base):
         Index(
             "ix_fa_max_opp_origin_interaction", "origin_interaction_id",
             postgresql_where=text("origin_interaction_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_fa_max_opp_gyr_money",
+            "gyr_color",
+            "expected_revenue_cents",
+            postgresql_where=text("outcome = 'open'"),
         ),
     )
 
@@ -11270,6 +11287,18 @@ class FaMaxPartner(Base):
     state_version: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text("0")
     )
+    # WP-T2-9 ranking snapshot fields (apply_partner_ranking_snapshot.py)
+    observed_transaction_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    first_observed_at: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    last_observed_at: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    county_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    buyer_entity_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("buyer_entities.id", name="fk_fa_max_partner_buyer_entity", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -11282,8 +11311,12 @@ class FaMaxPartner(Base):
             "status IN ('identified', 'active', 'inactive')",
             name="ck_fa_max_partner_status",
         ),
+        UniqueConstraint("person_id", "partner_class", name="uq_fa_max_partner_person_class"),
         Index("ix_fa_max_partner_person_id", "person_id"),
         Index("ix_fa_max_partner_status", "status"),
+        Index("ix_fa_max_partner_class_txn", "partner_class", "observed_transaction_count"),
+        Index("ix_fa_max_partner_buyer_entity", "buyer_entity_id"),
+        Index("ix_fa_max_partner_county", "county_id"),
     )
 
     def __repr__(self) -> str:
@@ -12012,4 +12045,39 @@ class FaMaxArvResult(Base):
         CheckConstraint(
             "status IN ('computed','superseded')", name="ck_fa_max_arv_status"
         ),
+    )
+
+
+class FaMaxGyrRoutingLog(Base):
+    """Immutable audit log — one row per GYR routing decision (WP-T2-11).
+
+    Never updated. Every classify() call produces one row so routing history is
+    fully reconstructable independent of the mutable gyr_* columns on
+    fa_max_opportunities.
+    """
+
+    __tablename__ = "fa_max_gyr_routing_log"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    opportunity_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_opportunities.opportunity_id", name="fk_fa_max_gyr_log_opp"),
+        nullable=False,
+    )
+    color: Mapped[str] = mapped_column(String(10), nullable=False)
+    expected_revenue_cents: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    reason_codes: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
+    disqualifying_rule: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    queue: Mapped[Optional[str]] = mapped_column(String(12), nullable=True)
+    decided_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("color IN ('green','yellow','red')", name="ck_fa_max_gyr_log_color"),
+        CheckConstraint(
+            "queue IN ('MONEY','EXCEPTIONS') OR queue IS NULL",
+            name="ck_fa_max_gyr_log_queue",
+        ),
+        Index("ix_fa_max_gyr_log_opp_decided", "opportunity_id", "decided_at"),
     )
