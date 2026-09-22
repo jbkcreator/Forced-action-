@@ -226,7 +226,11 @@ def _persist(opportunity_id: str, decision: RoutingDecision, db: Session) -> Non
                 gyr_color = :color,
                 expected_revenue_cents = :rev,
                 gyr_reason = CAST(:reason AS jsonb),
-                gyr_ranked_at = now(),
+                gyr_ranked_at = CASE
+                    WHEN :color = 'green' AND (gyr_color IS DISTINCT FROM 'green' OR gyr_ranked_at IS NULL)
+                    THEN now()
+                    ELSE gyr_ranked_at
+                END,
                 updated_at = now(),
                 state_version = state_version + 1
             WHERE opportunity_id = CAST(:oid AS uuid)
