@@ -75,6 +75,33 @@ def _resolve_bot_token(item: QueueItem, settings):
     return settings.slack_bot_token
 
 
+def post_thread_note(item: QueueItem, text: str) -> None:
+    """Post a plain-text reply inside the item's existing card thread.
+
+    Used by WP-T2-12 (thread fallback responder) to reply inline without
+    creating a new card. Best-effort — logs and returns on any error.
+    """
+    settings = get_settings()
+    token = _resolve_bot_token(item, settings)
+    channel = _resolve_channel(item, settings)
+    if not token or not channel or not item.slack_message_ts:
+        logger.warning(
+            "[slack_post.post_thread_note] missing token/channel/ts for item %s", item.id
+        )
+        return
+    try:
+        from slack_sdk import WebClient
+        WebClient(token=token.get_secret_value()).chat_postMessage(
+            channel=channel,
+            thread_ts=item.slack_message_ts,
+            text=text,
+        )
+    except Exception as exc:
+        logger.error(
+            "[slack_post.post_thread_note] post failed for item %s: %s", item.id, exc
+        )
+
+
 def post_for_approval(item: QueueItem) -> None:
     """Post an interactive Approve/Reject Slack message for a pending item.
 

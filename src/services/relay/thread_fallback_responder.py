@@ -7,8 +7,12 @@ Relay card threads. Classifies intent via a single Haiku call, then either:
   - Posts a pointer to the Command Center channel (cc_query), or
   - Acknowledges and logs (other).
 
-All DB reads use sqlalchemy.text() with named bind parameters — no LLM-authored SQL,
-no free SELECT. Writes one audit row to fa_max_tool_call_log per invocation.
+All DB reads use hardcoded parameterized sqlalchemy.text() queries — no LLM-authored SQL,
+no free SELECT. Execution is wrapped in _execute_catalog_query() following the
+command_center/db_tool.py never-raises, returns-dict pattern.
+
+Writes one audit row to fa_max_thread_fallback_log per invocation.
+In-thread posting goes through slack_post.post_thread_note.
 
 Called from admin_router._handle_relay_thread_action (strict else-branch after the
 existing approve/reject + pending-revision precedence).
@@ -140,7 +144,40 @@ def _parse_classify_response(raw: str) -> ClassifyResult:
 
 
 # ---------------------------------------------------------------------------
-# Catalog queries — parameterized, read-only, text() only
+# Catalog query executor — db_tool.py pattern (never raises, returns dict)
+# ---------------------------------------------------------------------------
+
+def _execute_catalog_query(
+    db: Session,
+    sql: str,
+    params: Optional[dict[str, Any]] = None,
+    *,
+    multi_row: bool = True,
+) -> dict[str, Any]:
+    """Execute a hardcoded parameterized catalog query.
+
+    Follows the command_center/db_tool.execute_query never-raises, returns-dict
+    convention. All SQL here is a compile-time constant — no LLM-authored SQL,
+    no user input interpolated into the statement (only into bind params).
+
+    Returns {"rows": [...], "count": N} for multi_row queries, or
+            {"row": {...}|None} for single-row queries.
+    On error returns {"error": "<message>"}.
+    """
+    try:
+        result = db.execute(text(sql), params or {})
+        if multi_row:
+            rows = [dict(r) for r in result.mappings().all()]
+            return {"rows": rows, "count": len(rows)}
+        row = result.mappings().first()
+        return {"row": dict(row) if row else None}
+    except Exception as exc:
+        logger.warning("[ThreadFallback] catalog query failed: %s | sql=%r", exc, sql[:120])
+        return {"error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# Catalog queries — parameterized, read-only; all SQL is a compile-time constant
 # ---------------------------------------------------------------------------
 
 def _query_count_by_color(
@@ -155,8 +192,8 @@ def _query_count_by_color(
         GROUP BY gyr_color
         ORDER BY gyr_color
     """
-    rows = db.execute(text(sql), {"color": color, "today": today}).mappings().all()
-    return [dict(r) for r in rows]
+    result = _execute_catalog_query(db, sql, {"color": color, "today": today})
+    return result.get("rows", [])
 
 
 def _query_top_uncalled_deal(db: Session) -> Optional[dict[str, Any]]:
@@ -182,34 +219,31 @@ def _query_top_uncalled_deal(db: Session) -> Optional[dict[str, Any]]:
         ORDER BY o.expected_revenue_cents DESC NULLS LAST
         LIMIT 1
     """
-    row = db.execute(text(sql)).mappings().first()
-    return dict(row) if row else None
+    result = _execute_catalog_query(db, sql, multi_row=False)
+    return result.get("row")
 
 
 def _query_source_staleness(
     db: Session, source: Optional[str]
 ) -> list[dict[str, Any]]:
     """Return sources with no new opportunity in the last _SOURCE_STALE_DAYS days."""
-    sql = """
+    # _SOURCE_STALE_DAYS is an integer constant — safe to embed in the literal
+    # INTERVAL string (not user input; cannot expand the query surface).
+    sql = f"""
         SELECT source,
                MAX(created_at) AS last_seen,
                EXTRACT(DAY FROM now() - MAX(created_at))::int AS last_seen_days_ago
         FROM fa_max_opportunities
         WHERE (:source IS NULL OR source ILIKE :source_pattern)
         GROUP BY source
-        HAVING MAX(created_at) < now() - INTERVAL ':stale_days days'
+        HAVING MAX(created_at) < now() - INTERVAL '{_SOURCE_STALE_DAYS} days'
         ORDER BY last_seen ASC
     """
-    # Use literal interval interpolation safely — stale_days is an integer constant.
-    sql_safe = sql.replace(":stale_days", str(_SOURCE_STALE_DAYS))
-    rows = db.execute(
-        text(sql_safe),
-        {
-            "source": source,
-            "source_pattern": f"%{source}%" if source else None,
-        },
-    ).mappings().all()
-    return [dict(r) for r in rows]
+    result = _execute_catalog_query(
+        db, sql,
+        {"source": source, "source_pattern": f"%{source}%" if source else None},
+    )
+    return result.get("rows", [])
 
 
 def _query_deal_status(db: Session, address: str) -> Optional[dict[str, Any]]:
@@ -230,10 +264,8 @@ def _query_deal_status(db: Session, address: str) -> Optional[dict[str, Any]]:
         ORDER BY o.updated_at DESC
         LIMIT 1
     """
-    row = db.execute(
-        text(sql), {"address_pattern": f"%{address}%"}
-    ).mappings().first()
-    return dict(row) if row else None
+    result = _execute_catalog_query(db, sql, {"address_pattern": f"%{address}%"}, multi_row=False)
+    return result.get("row")
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +361,7 @@ def _write_audit_log(
     relay_item_id: int,
     slack_user_id: str,
     thread_ts: str,
+    lane: str,
     raw_text: str,
     bucket: Bucket,
     lookup_id: Optional[str],
@@ -342,16 +375,17 @@ def _write_audit_log(
         db.execute(
             text("""
                 INSERT INTO fa_max_thread_fallback_log
-                    (relay_item_id, slack_user_id, thread_ts, raw_text, bucket,
+                    (relay_item_id, slack_user_id, thread_ts, lane, raw_text, bucket,
                      lookup_id, reply_sent, tokens_in, tokens_out, cost_usd)
                 VALUES
-                    (:relay_item_id, :slack_user_id, :thread_ts, :raw_text, :bucket,
+                    (:relay_item_id, :slack_user_id, :thread_ts, :lane, :raw_text, :bucket,
                      :lookup_id, :reply_sent, :tokens_in, :tokens_out, :cost_usd)
             """),
             {
                 "relay_item_id": relay_item_id,
                 "slack_user_id": slack_user_id,
                 "thread_ts": thread_ts,
+                "lane": lane or None,
                 "raw_text": raw_text[:2000],
                 "bucket": bucket.value,
                 "lookup_id": lookup_id,
@@ -461,13 +495,18 @@ def handle_thread_fallback_reply(item: Any, event: dict) -> None:
         lookup_id = classify_result.lookup_id
 
         # ── 2. Build reply ───────────────────────────────────────────────────
+        # CC channel: CC_SLACK_CHANNEL env var takes precedence over RELATIONSHIPS.
+        cc_channel = (
+            settings.cc_slack_channel
+            or settings.fa_max_slack_channel_relationships
+            or ""
+        )
+        lane: str = getattr(item, "lane", "") or ""
+
         with get_db_context() as db:
             if bucket == Bucket.SIMPLE_LOOKUP:
                 reply_text = _run_catalog_lookup(classify_result, db)
             elif bucket == Bucket.CC_QUERY:
-                cc_channel = (
-                    getattr(settings, "fa_max_slack_channel_relationships", "") or ""
-                )
                 reply_text = build_redirect_text(cc_channel_id=cc_channel)
             else:
                 reply_text = build_other_ack_text()
@@ -477,6 +516,7 @@ def handle_thread_fallback_reply(item: Any, event: dict) -> None:
                 relay_item_id=item.id,
                 slack_user_id=user_id,
                 thread_ts=thread_ts,
+                lane=lane,
                 raw_text=raw_text,
                 bucket=bucket,
                 lookup_id=lookup_id,
@@ -486,8 +526,9 @@ def handle_thread_fallback_reply(item: Any, event: dict) -> None:
                 cost_usd=cost_usd,
             )
 
-        # ── 3. Post reply in-thread ──────────────────────────────────────────
-        _post_thread_reply(item, reply_text, settings)
+        # ── 3. Post reply in-thread via slack_post abstraction ───────────────
+        from src.services.relay.slack_post import post_thread_note
+        post_thread_note(item, reply_text)
 
     except Exception as exc:
         logger.error(
@@ -496,37 +537,3 @@ def handle_thread_fallback_reply(item: Any, event: dict) -> None:
             user_id,
             exc,
         )
-
-
-def _post_thread_reply(item: Any, text: str, settings: Any) -> None:
-    """Post a plain-text reply into the card thread. Best-effort, never raises."""
-    try:
-        from slack_sdk import WebClient
-
-        token_obj = (
-            getattr(settings, "fa_max_slack_bot_token", None)
-            if getattr(item, "venture_key", None) == "fa_max_lending"
-            else getattr(settings, "slack_bot_token", None)
-        )
-        if not token_obj:
-            logger.warning("[ThreadFallback] no Slack token available — reply not sent")
-            return
-
-        from src.services.relay.slack_post import _resolve_channel
-
-        channel = _resolve_channel(item, settings)
-        if not channel or not item.slack_message_ts:
-            logger.warning(
-                "[ThreadFallback] missing channel or thread_ts for item %s", item.id
-            )
-            return
-
-        WebClient(token=token_obj.get_secret_value()).chat_postMessage(
-            channel=channel,
-            thread_ts=item.slack_message_ts,
-            text=text,
-        )
-        logger.info("[ThreadFallback] reply posted for item %s bucket=%s", item.id, item)
-
-    except Exception as exc:
-        logger.error("[ThreadFallback] Slack post failed for item %s: %s", getattr(item, "id", "?"), exc)

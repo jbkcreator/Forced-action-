@@ -25,6 +25,7 @@ STATEMENTS: list[tuple[str, str]] = [
             relay_item_id   BIGINT NOT NULL,
             slack_user_id   VARCHAR(60) NOT NULL,
             thread_ts       VARCHAR(40) NOT NULL,
+            lane            VARCHAR(20),
             raw_text        TEXT,
             bucket          VARCHAR(20) NOT NULL,
             lookup_id       VARCHAR(60),
@@ -36,6 +37,13 @@ STATEMENTS: list[tuple[str, str]] = [
             CONSTRAINT ck_fa_max_thread_fallback_bucket
                 CHECK (bucket IN ('simple_lookup', 'cc_query', 'other'))
         );
+        """,
+    ),
+    (
+        "ADD COLUMN lane (idempotent — safe if table already has it)",
+        """
+        ALTER TABLE fa_max_thread_fallback_log
+            ADD COLUMN IF NOT EXISTS lane VARCHAR(20);
         """,
     ),
     (

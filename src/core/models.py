@@ -11951,6 +11951,7 @@ class FaMaxThreadFallbackLog(Base):
     relay_item_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     slack_user_id: Mapped[str] = mapped_column(String(60), nullable=False)
     thread_ts: Mapped[str] = mapped_column(String(40), nullable=False)
+    lane: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     raw_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     bucket: Mapped[str] = mapped_column(String(20), nullable=False)
     lookup_id: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
