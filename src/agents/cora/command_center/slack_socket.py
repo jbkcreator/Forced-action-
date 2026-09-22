@@ -100,6 +100,8 @@ def run_socket_mode(stop_event: threading.Event) -> None:
         from slack_sdk.socket_mode.request import SocketModeRequest
         from config.settings import get_settings
         from slack_sdk import WebClient
+
+        from src.agents.cora.command_center.bot_identity import resolve_bot_user_id
     except ImportError as exc:
         logger.error("cc.socket: slack_sdk missing socket_mode support: %s", exc)
         return
@@ -113,12 +115,13 @@ def run_socket_mode(stop_event: threading.Event) -> None:
     web_client = WebClient(token=bot_token)
 
     global _BOT_USER_ID
-    try:
-        auth = web_client.auth_test()
-        _BOT_USER_ID = auth["user_id"]
-        logger.info("cc.socket: bot user_id resolved via auth.test: %s", _BOT_USER_ID)
-    except Exception as exc:
-        logger.warning("cc.socket: auth.test failed — bot self-reply filter disabled: %s", exc)
+    _BOT_USER_ID = resolve_bot_user_id(web_client)
+    if not _BOT_USER_ID:
+        logger.error(
+            "cc.socket: refusing to start — an unfiltered listener re-ingests the "
+            "bot's own replies as new questions. Set FA_MAX_SLACK_BOT_USER_ID."
+        )
+        return
 
     client = SocketModeClient(app_token=app_token, web_client=web_client)
 

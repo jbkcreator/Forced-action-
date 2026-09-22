@@ -650,6 +650,9 @@ class AppSettings(BaseSettings):
 	fa_max_slack_bot_token: Optional[SecretStr] = Field(default=None, env="FA_MAX_SLACK_BOT_TOKEN")
 	fa_max_slack_app_token: Optional[SecretStr] = Field(default=None, env="FA_MAX_SLACK_APP_TOKEN")
 	fa_max_slack_signing_secret: Optional[SecretStr] = Field(default=None, env="FA_MAX_SLACK_SIGNING_SECRET")
+	# Fallback for the Command Center's self-message filter when Slack's
+	# auth.test is unreachable at startup. Normally resolved dynamically.
+	fa_max_slack_bot_user_id: Optional[str] = Field(default=None, env="FA_MAX_SLACK_BOT_USER_ID")
 	vera_slack_channel: Optional[str] = Field(default=None, env="VERA_SLACK_CHANNEL")
 
 	# Relay approval queue (RELAY-v2.2 sub-task R1). Non-FA-Max Relay ventures
