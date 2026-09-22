@@ -1618,7 +1618,11 @@ def _verify_slack_signature(headers: dict, body: bytes) -> bool:
         return False
     sig_base = f"v0:{ts}:{body.decode('utf-8')}"
     received = headers.get("x-slack-signature", "")
-    candidates = [settings.fa_max_slack_signing_secret, settings.slack_signing_secret]
+    candidates = [
+        settings.fa_max_slack_signing_secret,
+        settings.slack_signing_secret,
+        settings.fa_max_test_slack_signing_secret,
+    ]
     for secret in candidates:
         if not secret:
             continue

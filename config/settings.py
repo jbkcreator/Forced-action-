@@ -685,6 +685,12 @@ class AppSettings(BaseSettings):
 	# Fallback for the Command Center's self-message filter when Slack's
 	# auth.test is unreachable at startup. Normally resolved dynamically.
 	fa_max_slack_bot_user_id: Optional[str] = Field(default=None, env="FA_MAX_SLACK_BOT_USER_ID")
+	# Sandbox Slack app used only for manual E2E verification of the Relay
+	# approve/reject interactivity path against a real (non-production) Slack
+	# workspace, so a tester can click real buttons without touching prod
+	# channels or the prod FA Max signing secret. Accepted as an additional
+	# fallback by _verify_slack_signature; never used to post/route anything.
+	fa_max_test_slack_signing_secret: Optional[SecretStr] = Field(default=None, env="FA_MAX_TEST_SLACK_SIGNING_SECRET")
 	vera_slack_channel: Optional[str] = Field(default=None, env="VERA_SLACK_CHANNEL")
 
 	# Relay approval queue (RELAY-v2.2 sub-task R1). Non-FA-Max Relay ventures
