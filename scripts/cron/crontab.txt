@@ -1097,6 +1097,15 @@ COUNTY_ID=hillsborough
 # Assembles the day's financing-intent opportunities (cash purchases, stalled
 # flips, permits-no-financing, auction/probate, out-of-state, builder signals,
 # plus the financing-intent feed), ranks them by expected revenue, and posts
+# WP-8A ARV sweep — compute + persist canonical ARV for active dial-list
+# candidates (properties in financing_intent_scores within the 36-month
+# window) that have no computed ARV row or a stale one (>7 days).
+#
+# 10:00 UTC — after CDS (07:00) and financing-intent sweep so scores are
+# settled; before the dial list (10:45) so _batch_published_arv reads fresh
+# rows. Idempotent: same inputs are a no-op; changed inputs insert+supersede.
+0 10 * * * $PROJECT/scripts/cron/run.sh src.tasks.arv_sweep
+
 # the top-N digest to the MONEY Slack channel so it's waiting before Josh's
 # morning calling block.
 #
