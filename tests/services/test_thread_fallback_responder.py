@@ -16,6 +16,8 @@ from src.services.relay.thread_fallback_responder import (
     Bucket,
     ClassifyResult,
     _parse_classify_response,
+    _validate_classify,
+    _coalesce_roles,
     format_count_by_color_result,
     format_top_uncalled_deal_result,
     format_source_staleness_result,
@@ -231,13 +233,14 @@ class TestCatalogMembership:
 # ---------------------------------------------------------------------------
 
 def _classify_stub(bucket_value: str, lookup_id=None, params=None):
-    """Return a fake call_claude_with_usage response classifying to bucket_value."""
+    """Fake call_claude_with_usage response via the forced-tool_use path."""
     return {
-        "text": json.dumps({
+        "text": "",
+        "tool_input": {
             "bucket": bucket_value,
             "lookup_id": lookup_id,
             "params": params or {},
-        }),
+        },
         "input_tokens": 10,
         "output_tokens": 5,
         "cost_usd": 0.0001,
@@ -302,3 +305,268 @@ class TestHandleChannelMessage:
         _, audit = self._run("how many reds?", _classify_stub("simple_lookup", "count_by_color", {"color": "red"}))
         assert audit.call_args.kwargs["relay_item_id"] is None
         assert audit.call_args.kwargs["lane"] == "RELATIONSHIPS"
+
+    def test_tool_use_path_preferred_over_text(self):
+        """When tool_input is present it wins, even if text is garbage."""
+        resp = _classify_stub("simple_lookup", "count_by_color", {"color": "green"})
+        resp["text"] = "```json broken fence```"
+        post, _ = self._run("how many greens?", resp)
+        post.assert_called_once()
+
+    def test_text_fallback_when_no_tool_input(self):
+        """If the model returns text (no tool_use), the JSON fallback still parses."""
+        resp = {
+            "text": json.dumps({"bucket": "cc_query", "lookup_id": None, "params": {}}),
+            "tool_input": None,
+            "input_tokens": 1, "output_tokens": 1, "cost_usd": 0.0,
+        }
+        post, _ = self._run("evaluate this deal", resp)
+        post.assert_called_once()
+        assert "pipeline-intelligence" in post.call_args.kwargs["text"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Follow-up context — _coalesce_roles enforces the Anthropic messages contract
+# ---------------------------------------------------------------------------
+
+class TestCoalesceRoles:
+    def test_alternating_kept_as_is(self):
+        msgs = [
+            {"role": "user", "content": "how many greens?"},
+            {"role": "assistant", "content": "5 green."},
+            {"role": "user", "content": "DATA: what about reds?"},
+        ]
+        assert _coalesce_roles(msgs) == msgs
+
+    def test_consecutive_user_turns_merged(self):
+        msgs = [
+            {"role": "user", "content": "how many greens?"},
+            {"role": "user", "content": "DATA: what about reds?"},
+        ]
+        out = _coalesce_roles(msgs)
+        assert len(out) == 1
+        assert out[0]["role"] == "user"
+        assert "greens" in out[0]["content"] and "reds" in out[0]["content"]
+
+    def test_leading_assistant_dropped(self):
+        msgs = [
+            {"role": "assistant", "content": "stale bot note"},
+            {"role": "user", "content": "DATA: how many greens?"},
+        ]
+        out = _coalesce_roles(msgs)
+        assert out[0]["role"] == "user"
+        assert len(out) == 1
+
+
+class TestChannelHistoryWiring:
+    """A threaded reply pulls prior turns; a top-level message does not."""
+
+    def _run(self, event, history_turns):
+        with patch(
+            "src.services.relay.thread_fallback_responder.call_claude_with_usage",
+            return_value=_classify_stub("simple_lookup", "count_by_color", {"color": "red"}),
+        ) as mock_llm, patch(
+            "src.core.database.get_db_context"
+        ) as mock_db_ctx, patch(
+            "src.services.relay.thread_fallback_responder._write_audit_log"
+        ), patch(
+            "src.services.relay.thread_fallback_responder._run_catalog_lookup",
+            return_value="3 red.",
+        ), patch(
+            "src.services.relay.slack_post.post_note"
+        ), patch(
+            "src.services.relay.slack_post.fetch_thread_history",
+            return_value=history_turns,
+        ) as mock_hist:
+            mock_db_ctx.return_value.__enter__.return_value = MagicMock()
+            from src.services.relay.thread_fallback_responder import handle_channel_message
+            handle_channel_message(
+                event=event, venture_key="fa_max_lending",
+                lane="RELATIONSHIPS", channel="C_REL",
+            )
+            return mock_llm, mock_hist
+
+    def test_threaded_reply_fetches_and_passes_history(self):
+        event = {
+            "type": "message", "user": "U1", "channel": "C_REL",
+            "ts": "1790000000.000200", "thread_ts": "1790000000.000100",
+            "text": "what about reds?",
+        }
+        prior = [
+            {"role": "user", "content": "how many greens?"},
+            {"role": "assistant", "content": "5 green."},
+        ]
+        mock_llm, mock_hist = self._run(event, prior)
+        mock_hist.assert_called_once()
+        # The prior turns are prepended ahead of the current DATA: message.
+        sent = mock_llm.call_args.kwargs["messages"]
+        assert sent[0]["content"] == "how many greens?"
+        assert sent[-1]["content"].startswith("DATA:")
+
+    def test_top_level_message_no_history_fetch(self):
+        event = {
+            "type": "message", "user": "U1", "channel": "C_REL",
+            "ts": "1790000000.000100", "text": "how many reds?",
+        }
+        mock_llm, mock_hist = self._run(event, [])
+        mock_hist.assert_not_called()
+        sent = mock_llm.call_args.kwargs["messages"]
+        assert len(sent) == 1
+        assert sent[0]["content"].startswith("DATA:")
+
+    def test_history_fetch_failure_degrades_to_single_shot(self):
+        """A conversations_replies error must not break the reply — history=[]"""
+        event = {
+            "type": "message", "user": "U1", "channel": "C_REL",
+            "ts": "1790000000.000200", "thread_ts": "1790000000.000100",
+            "text": "what about reds?",
+        }
+        # fetch_thread_history itself swallows errors and returns []; simulate that.
+        mock_llm, _ = self._run(event, [])
+        sent = mock_llm.call_args.kwargs["messages"]
+        assert len(sent) == 1  # no history, still classifies the current message
+
+
+# ---------------------------------------------------------------------------
+# Routing seam — admin_router._handle_relay_thread_action WP-T2-12 branches
+# ---------------------------------------------------------------------------
+
+class TestChannelRouting:
+    """The channel path fires only for an authorized approver posting in a
+    mapped FA Max lane channel. Everything else is dropped."""
+
+    def _dispatch(self, event, *, item=None, lane_map=None, authorized=True):
+        from src.api import admin_router
+        with patch(
+            "src.services.relay.queue.get_item_by_slack_message_ts", return_value=item
+        ), patch.object(
+            admin_router, "_fa_max_channel_lane_map",
+            return_value=(lane_map if lane_map is not None else {"C_REL": "RELATIONSHIPS"}),
+        ), patch.object(
+            admin_router, "_relay_approver_authorized", return_value=authorized
+        ), patch(
+            "src.services.relay.thread_fallback_responder.handle_channel_message"
+        ) as mock_channel, patch(
+            "src.services.relay.thread_fallback_responder.handle_thread_fallback_reply"
+        ) as mock_card:
+            admin_router._handle_relay_thread_action({"event": event})
+            return mock_channel, mock_card
+
+    def test_authorized_in_mapped_channel_answers(self):
+        ch, _ = self._dispatch({
+            "type": "message", "user": "U1", "channel": "C_REL",
+            "ts": "1.1", "text": "how many greens?",
+        })
+        ch.assert_called_once()
+        assert ch.call_args.kwargs["lane"] == "RELATIONSHIPS"
+
+    def test_unauthorized_user_dropped(self):
+        ch, _ = self._dispatch({
+            "type": "message", "user": "U_STRANGER", "channel": "C_REL",
+            "ts": "1.1", "text": "how many greens?",
+        }, authorized=False)
+        ch.assert_not_called()
+
+    def test_unmapped_channel_dropped(self):
+        ch, _ = self._dispatch({
+            "type": "message", "user": "U1", "channel": "C_RANDOM",
+            "ts": "1.1", "text": "how many greens?",
+        })
+        ch.assert_not_called()
+
+    def test_bot_message_ignored(self):
+        ch, card = self._dispatch({
+            "type": "message", "user": "U1", "channel": "C_REL",
+            "ts": "1.1", "text": "0 green.", "bot_id": "B1",
+        })
+        ch.assert_not_called()
+        card.assert_not_called()
+
+    def test_subtype_message_ignored(self):
+        ch, _ = self._dispatch({
+            "type": "message", "user": "U1", "channel": "C_REL",
+            "ts": "1.1", "text": "joined", "subtype": "channel_join",
+        })
+        ch.assert_not_called()
+
+    def test_missing_user_ignored(self):
+        ch, _ = self._dispatch({
+            "type": "message", "channel": "C_REL", "ts": "1.1", "text": "hi",
+        })
+        ch.assert_not_called()
+
+    def test_card_thread_noncommand_uses_card_path_not_channel(self):
+        item = MagicMock(venture_key="fa_max_lending", revision_count=0, id=5)
+        ch, card = self._dispatch({
+            "type": "message", "user": "U1", "channel": "C_REL",
+            "ts": "2.2", "thread_ts": "1.1", "text": "why this one?",
+        }, item=item)
+        card.assert_called_once()
+        ch.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Anti-hallucination — answers come ONLY from the DB, never the LLM
+# ---------------------------------------------------------------------------
+
+class TestNoHallucination:
+    """The LLM classifies; the DB answers. A data reply must equal the actual
+    rows, and no reply may invent a number the DB didn't return."""
+
+    def test_reply_number_equals_db_count(self):
+        from src.services.relay import thread_fallback_responder as tfr
+        db = MagicMock()
+        with patch.object(
+            tfr, "_execute_catalog_query",
+            return_value={"rows": [{"gyr_color": "red", "cnt": 7}], "count": 1},
+        ):
+            reply = tfr._run_catalog_lookup(
+                ClassifyResult(bucket=Bucket.SIMPLE_LOOKUP, lookup_id="count_by_color",
+                               params={"color": "red"}),
+                db,
+            )
+        # The 7 is the DB's, not the model's.
+        assert "7 red" in reply
+
+    def test_db_error_yields_honest_message_not_a_number(self):
+        from src.services.relay import thread_fallback_responder as tfr
+        db = MagicMock()
+        with patch.object(
+            tfr, "_execute_catalog_query", return_value={"error": "connection reset"},
+        ):
+            reply = tfr._run_catalog_lookup(
+                ClassifyResult(bucket=Bucket.SIMPLE_LOOKUP, lookup_id="count_by_color",
+                               params={"color": "green"}),
+                db,
+            )
+        # Empty rows → honest "0 ...", never a fabricated count.
+        assert "0 open opportunities" in reply
+        assert not any(c.isdigit() and c != "0" for c in reply.replace("0 open", ""))
+
+    def test_catalog_query_never_raises(self):
+        """Even a raising DB session returns a safe string, not an exception."""
+        from src.services.relay import thread_fallback_responder as tfr
+        db = MagicMock()
+        db.execute.side_effect = RuntimeError("db down")
+        reply = tfr._run_catalog_lookup(
+            ClassifyResult(bucket=Bucket.SIMPLE_LOOKUP, lookup_id="deal_status",
+                           params={"address": "123 Main"}),
+            db,
+        )
+        assert isinstance(reply, str) and reply
+
+    def test_redirect_and_ack_carry_no_data(self):
+        """The only LLM-adjacent replies are static templates — no numbers."""
+        redirect = build_redirect_text(cc_channel_id="C123")
+        ack = build_other_ack_text()
+        for txt in (redirect, ack):
+            assert not any(ch.isdigit() for ch in txt.replace("C123", ""))
+
+    def test_invalid_bucket_string_becomes_other(self):
+        res = _validate_classify({"bucket": "definitely_not_a_bucket"})
+        assert res.bucket == Bucket.OTHER
+
+    def test_unknown_color_is_honest_zero_not_invented(self):
+        """A nonsense color param returns the DB's empty result honestly."""
+        text = format_count_by_color_result([], color_filter="purple")
+        assert "0" in text and "purple" in text

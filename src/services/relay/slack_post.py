@@ -106,6 +106,49 @@ def post_note(*, venture_key: str, channel: str, thread_ts: str, text: str) -> N
         logger.error("[slack_post.post_note] post failed (channel=%s): %s", channel, exc)
 
 
+def fetch_thread_history(
+    *,
+    venture_key: str,
+    channel: str,
+    thread_ts: str,
+    exclude_ts: str = "",
+    limit: int = 10,
+) -> list[dict]:
+    """Return prior turns of a Slack thread as classify message history.
+
+    Maps our bot's messages to role 'assistant' and human messages to 'user',
+    oldest first, excluding `exclude_ts` (the message being classified now) and
+    Slack join/system subtypes. Capped to the last `limit` turns to bound tokens.
+
+    Best-effort: returns [] on any error or when Slack isn't configured, so a
+    history fetch failure degrades to single-shot classification, never an error.
+    """
+    settings = get_settings()
+    token = _resolve_bot_token_for_venture(venture_key, settings)
+    if not token or not channel or not thread_ts:
+        return []
+    try:
+        from slack_sdk import WebClient
+        resp = WebClient(token=token.get_secret_value()).conversations_replies(
+            channel=channel, ts=thread_ts, limit=limit + 10,
+        )
+        turns: list[dict] = []
+        for msg in resp.get("messages", []):
+            if msg.get("ts") == exclude_ts or msg.get("subtype"):
+                continue
+            content = str(msg.get("text") or "").strip()
+            if not content:
+                continue
+            role = "assistant" if msg.get("bot_id") else "user"
+            turns.append({"role": role, "content": content})
+        return turns[-limit:]
+    except Exception as exc:
+        logger.warning(
+            "[slack_post.fetch_thread_history] failed (channel=%s): %s", channel, exc
+        )
+        return []
+
+
 def post_thread_note(item: QueueItem, text: str) -> None:
     """Post a plain-text reply inside the item's existing card thread.
 

@@ -9,11 +9,15 @@ one shared classify/respond core:
     (MONEY/EXCEPTIONS/RELATIONSHIPS/CC); stays silent on 'other' so ordinary
     channel chatter isn't answered.
 
-Both classify intent via a single Haiku call, then either:
+Both classify intent via a single Haiku call (forced tool_use for a guaranteed
+structured result — no prose/markdown parsing), then either:
 
   - Answer with a parameterized read-only catalog query (simple_lookup), or
   - Post a pointer to the Command Center channel (cc_query), or
   - Acknowledge / stay silent and log (other).
+
+The channel path passes prior thread turns as conversation history so operator
+follow-ups ("what about reds?") resolve against the earlier question.
 
 All DB reads use hardcoded parameterized sqlalchemy.text() queries — no LLM-authored SQL,
 no free SELECT. Execution is wrapped in _execute_catalog_query() following the
@@ -79,9 +83,12 @@ class ClassifyResult:
 # ---------------------------------------------------------------------------
 
 _CLASSIFY_SYSTEM = """\
-You classify a Slack message from an authorized pipeline operator into one of three buckets.
+You classify the operator's LATEST Slack message into one of three buckets, then call the
+classify_operator_message tool with the result. Earlier turns in the conversation are prior
+context — use them to resolve follow-ups (e.g. after "how many green deals?", a later
+"what about reds?" is count_by_color with color=red). Always classify the latest message.
 
-Known lookup catalog (return "simple_lookup" for any of these — match on intent, not exact wording):
+Known lookup catalog (use bucket "simple_lookup" for any of these — match on intent, not exact wording):
 
 1. count_by_color
    Examples: "how many green deals?", "count yellows", "how many reds today?", "total open"
@@ -99,60 +106,97 @@ Known lookup catalog (return "simple_lookup" for any of these — match on inten
    Examples: "what's the status of 4021 Bayshore?", "deal at 123 Main", "where is that Tampa deal?"
    params: { "address": "<partial or full address string>" }  ← REQUIRED
 
-Return "cc_query" when the message asks for: deal evaluation, backward math, scoreboard,
+Use bucket "cc_query" when the message asks for: deal evaluation, backward math, scoreboard,
 analytics, pipeline forecasts, or any multi-step intelligence question not in the catalog.
 
-Return "other" for: greetings, thanks, off-topic text, or anything with no data intent.
-
-Respond with ONLY valid JSON. No explanation, no markdown fences.
-Schema: {"bucket": "simple_lookup|cc_query|other", "lookup_id": string|null, "params": {...}}
+Use bucket "other" for: greetings, thanks, off-topic text, or anything with no data intent.
 """
+
+# Tool schema — forcing tool_use guarantees a structured dict back (no prose, no
+# markdown fences), so classification can never fail on output formatting.
+CLASSIFY_TOOL: dict[str, Any] = {
+    "name": "classify_operator_message",
+    "description": "Route an operator's Slack message to a bucket with optional lookup + params.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "bucket": {
+                "type": "string",
+                "enum": ["simple_lookup", "cc_query", "other"],
+            },
+            "lookup_id": {
+                "type": ["string", "null"],
+                "enum": [
+                    "count_by_color",
+                    "top_uncalled_deal",
+                    "source_staleness",
+                    "deal_status",
+                    None,
+                ],
+                "description": "Required when bucket is simple_lookup; null otherwise.",
+            },
+            "params": {
+                "type": "object",
+                "description": "Lookup parameters (color/today, source, address). Empty when not needed.",
+            },
+        },
+        "required": ["bucket"],
+    },
+}
 
 
 # ---------------------------------------------------------------------------
 # Parse + validate Haiku output
 # ---------------------------------------------------------------------------
 
-def _parse_classify_response(raw: str) -> ClassifyResult:
-    """Parse the Haiku JSON response and enforce catalog safety.
+def _validate_classify(data: dict) -> ClassifyResult:
+    """Enforce catalog safety on a classifier result dict.
 
     Unknown lookup_ids and missing required params downgrade to cc_query so the
-    caller gets a useful redirect rather than a silent error.
+    caller gets a useful redirect rather than a silent error. Shared by the
+    tool_use path (dict straight from Haiku) and the legacy text-JSON fallback.
+    """
+    bucket_str = data.get("bucket", "other")
+    bucket = Bucket(bucket_str) if bucket_str in Bucket._value2member_map_ else Bucket.OTHER
+    lookup_id: Optional[str] = data.get("lookup_id") or None
+    params: dict[str, Any] = data.get("params") or {}
+
+    if bucket == Bucket.SIMPLE_LOOKUP:
+        # Guard 1: lookup_id must be in the catalog.
+        if lookup_id not in _CATALOG_IDS:
+            logger.warning(
+                "[ThreadFallback] unknown lookup_id %r — redirecting to CC", lookup_id
+            )
+            return ClassifyResult(bucket=Bucket.CC_QUERY)
+
+        # Guard 2: required params must be present and non-empty.
+        for required in _REQUIRED_PARAMS.get(lookup_id, []):
+            if not params.get(required):
+                logger.warning(
+                    "[ThreadFallback] lookup_id=%r missing required param %r — redirecting",
+                    lookup_id,
+                    required,
+                )
+                return ClassifyResult(bucket=Bucket.CC_QUERY)
+
+    return ClassifyResult(bucket=bucket, lookup_id=lookup_id, params=params)
+
+
+def _parse_classify_response(raw: str) -> ClassifyResult:
+    """Legacy text fallback: parse a JSON string, then validate.
+
+    Only used when Haiku returns text instead of a tool_use block. Strips
+    markdown fences defensively. The primary path is now forced tool_use, which
+    returns a dict straight to _validate_classify.
     """
     try:
         cleaned = raw.strip()
-        # Strip markdown fences if Haiku wraps the JSON despite instructions.
         if cleaned.startswith("```"):
             cleaned = "\n".join(
                 line for line in cleaned.splitlines()
                 if not line.startswith("```")
             ).strip()
-        data = json.loads(cleaned)
-        bucket_str = data.get("bucket", "other")
-        bucket = Bucket(bucket_str) if bucket_str in Bucket._value2member_map_ else Bucket.OTHER
-        lookup_id: Optional[str] = data.get("lookup_id") or None
-        params: dict[str, Any] = data.get("params") or {}
-
-        if bucket == Bucket.SIMPLE_LOOKUP:
-            # Guard 1: lookup_id must be in the catalog.
-            if lookup_id not in _CATALOG_IDS:
-                logger.warning(
-                    "[ThreadFallback] unknown lookup_id %r — redirecting to CC", lookup_id
-                )
-                return ClassifyResult(bucket=Bucket.CC_QUERY)
-
-            # Guard 2: required params must be present and non-empty.
-            for required in _REQUIRED_PARAMS.get(lookup_id, []):
-                if not params.get(required):
-                    logger.warning(
-                        "[ThreadFallback] lookup_id=%r missing required param %r — redirecting",
-                        lookup_id,
-                        required,
-                    )
-                    return ClassifyResult(bucket=Bucket.CC_QUERY)
-
-        return ClassifyResult(bucket=bucket, lookup_id=lookup_id, params=params)
-
+        return _validate_classify(json.loads(cleaned))
     except (json.JSONDecodeError, ValueError, KeyError) as exc:
         logger.warning("[ThreadFallback] classify parse failed: %s", exc)
         return ClassifyResult(bucket=Bucket.OTHER)
@@ -462,6 +506,25 @@ def _run_catalog_lookup(result: ClassifyResult, db: Session) -> str:
 # Main entry point
 # ---------------------------------------------------------------------------
 
+def _coalesce_roles(messages: list[dict]) -> list[dict]:
+    """Enforce the Anthropic messages contract: first turn is user, roles
+    alternate. Drops leading assistant turns and merges consecutive same-role
+    turns (join with newline) so a thread with two human messages in a row
+    can't produce an invalid request.
+    """
+    out: list[dict] = []
+    for m in messages:
+        role = m["role"]
+        content = m["content"]
+        if not out and role != "user":
+            continue
+        if out and out[-1]["role"] == role:
+            out[-1]["content"] += "\n" + content
+        else:
+            out.append({"role": role, "content": content})
+    return out
+
+
 def _classify_and_respond(
     *,
     raw_text: str,
@@ -470,11 +533,16 @@ def _classify_and_respond(
     audit_thread_ts: str,
     relay_item_id: Optional[int],
     silent_other: bool,
+    history: Optional[list[dict]] = None,
 ) -> Optional[str]:
     """Classify one message, build the reply, and write the audit row.
 
     Returns the reply text to post, or None when nothing should be posted
     (silent_other and the message classified as 'other'). Never raises.
+
+    `history` is prior thread turns ({"role": "user"|"assistant", "content": str})
+    passed ahead of the current message so follow-ups like "what about reds?"
+    resolve against the earlier question. Empty/None = single-shot classify.
 
     Shared by the card-thread path (handle_thread_fallback_reply) and the
     channel path (handle_channel_message); the caller owns where to post.
@@ -491,18 +559,29 @@ def _classify_and_respond(
     try:
         settings = get_settings()
 
+        messages = list(history or [])
+        messages.append({"role": "user", "content": f"DATA: {raw_text}"})
+        messages = _coalesce_roles(messages)
+
         classify_resp = call_claude_with_usage(
             task_type="fa_max_thread_fallback",
-            messages=[{"role": "user", "content": f"DATA: {raw_text}"}],
+            messages=messages,
             system=_CLASSIFY_SYSTEM,
+            cache_system=True,
+            tools=[CLASSIFY_TOOL],
+            tool_choice={"type": "tool", "name": CLASSIFY_TOOL["name"]},
             max_tokens=256,
         )
         tokens_in = classify_resp.get("input_tokens", 0)
         tokens_out = classify_resp.get("output_tokens", 0)
         cost_usd = classify_resp.get("cost_usd", 0.0)
-        raw_classify = classify_resp.get("text") or ""
 
-        classify_result = _parse_classify_response(raw_classify)
+        tool_input = classify_resp.get("tool_input")
+        if isinstance(tool_input, dict):
+            classify_result = _validate_classify(tool_input)
+        else:
+            # Fallback: model returned text instead of a tool_use block.
+            classify_result = _parse_classify_response(classify_resp.get("text") or "")
         bucket = classify_result.bucket
         lookup_id = classify_result.lookup_id
 
@@ -580,6 +659,20 @@ def handle_channel_message(
     # non-card thread, stay in that thread.
     reply_thread_ts = str(event.get("thread_ts") or event.get("ts") or "")
 
+    # Follow-up context: when the operator replies inside an existing thread,
+    # pull the prior turns so questions like "what about reds?" resolve against
+    # the earlier question. A top-level message (no thread_ts) has no history.
+    history: list[dict] = []
+    incoming_thread_ts = str(event.get("thread_ts") or "")
+    if incoming_thread_ts:
+        from src.services.relay.slack_post import fetch_thread_history
+        history = fetch_thread_history(
+            venture_key=venture_key,
+            channel=channel,
+            thread_ts=incoming_thread_ts,
+            exclude_ts=str(event.get("ts") or ""),
+        )
+
     reply = _classify_and_respond(
         raw_text=str(event.get("text") or "").strip(),
         user_id=str(event.get("user") or ""),
@@ -587,6 +680,7 @@ def handle_channel_message(
         audit_thread_ts=reply_thread_ts,
         relay_item_id=None,
         silent_other=True,
+        history=history,
     )
     if reply is None:
         return
