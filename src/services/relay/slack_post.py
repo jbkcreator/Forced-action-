@@ -27,8 +27,13 @@ logger = logging.getLogger(__name__)
 
 
 def _summary_text(item: QueueItem) -> str:
-    subject = item.payload.get("subject") if isinstance(item.payload, dict) else None
-    preview = subject or str(item.payload)[:120]
+    p = item.payload if isinstance(item.payload, dict) else {}
+    preview = (
+        p.get("subject")
+        or p.get("inbound_snippet")
+        or p.get("type")
+        or str(item.payload)[:120]
+    )
     return (
         f"*Relay approval needed* (#{item.id})  Ref: `{_card_ref(item)}`\n"
         f"Channel: `{item.channel}`  ·  To: `{item.recipient}`\n"

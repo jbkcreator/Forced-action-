@@ -63,6 +63,14 @@ def handle_inbound(
     classification = classify_inbound(inbound_text)
     cost = classification.cost_usd
 
+    # Halt any active abandonment sequence — borrower replied, stop all touches.
+    if person_id:
+        try:
+            from src.agents.reply_concierge.abandonment_agent import halt_sequence
+            halt_sequence(person_id, db, reason="reply_received")
+        except Exception as _halt_exc:
+            logger.warning("router: halt_sequence failed for person_id=%s: %s", person_id, _halt_exc)
+
     # ── Opt-out: immediate, irreversible, no reply ─────────────────────────
     if classification.intent == "opt_out":
         handle_opt_out(
