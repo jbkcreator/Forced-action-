@@ -11125,6 +11125,149 @@ class FaMaxPersonConsent(Base):
         )
 
 
+class FaMaxFileState(Base):
+    """WP-T2-6: Backflip-side stage detail for one submitted file.
+
+    backflip_stage is deliberately NOT the same enum as
+    fa_max_opportunities.current_stage — it tracks Backflip's finer-grained
+    internal stage detail the coarse borrower-journey FSM has no room for.
+    Runtime reads/writes go through src/services/fa_max_file_state.py via
+    sqlalchemy.text(); this class exists as the schema source of truth for
+    tests' create_all (CLAUDE.md, ADR 0024).
+
+    Mirrors migrations/apply_fa_max_wp_t2_6_stage_monitoring.py.
+    """
+    __tablename__ = "fa_max_file_state"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    opportunity_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_opportunities.opportunity_id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    person_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_persons.person_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    backflip_stage: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=text("'submitted'")
+    )
+    contact_email: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    last_stage_change_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+    last_borrower_touch_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    expected_next_stage: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    stall_flagged_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "backflip_stage IN ('submitted', 'under_review', 'conditional_approval', "
+            "'docs_requested', 'cleared_to_close', 'funded', 'declined')",
+            name="ck_fa_max_file_state_stage",
+        ),
+        Index(
+            "idx_fa_max_file_state_stall",
+            "last_stage_change_at",
+            postgresql_where=text("backflip_stage NOT IN ('funded', 'declined')"),
+        ),
+        Index(
+            "idx_fa_max_file_state_touch",
+            "last_borrower_touch_at",
+            postgresql_where=text("backflip_stage NOT IN ('funded', 'declined')"),
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<FaMaxFileState(opportunity={self.opportunity_id!r}, "
+            f"stage={self.backflip_stage!r})>"
+        )
+
+
+class FaMaxDocumentRequests(Base):
+    """WP-T2-6: one row per outstanding document ask, with its own chase timers.
+
+    Per-document rather than per-file because one file can have several
+    documents outstanding at once with different request dates and therefore
+    independent follow-up/escalation clocks.
+
+    Mirrors migrations/apply_fa_max_wp_t2_6_stage_monitoring.py.
+    """
+    __tablename__ = "fa_max_document_requests"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    opportunity_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_opportunities.opportunity_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    person_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_persons.person_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    document_name: Mapped[str] = mapped_column(Text, nullable=False)
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+    received_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    first_chase_sent_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    followup_chase_sent_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    escalated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    source: Mapped[str] = mapped_column(Text, nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "source IN ('email_parsed', 'manual')",
+            name="ck_fa_max_doc_request_source",
+        ),
+        UniqueConstraint("idempotency_key", name="uq_fa_max_doc_request_idempotency"),
+        Index(
+            "idx_fa_max_doc_requests_outstanding",
+            "opportunity_id",
+            postgresql_where=text("received_at IS NULL"),
+        ),
+        Index(
+            "idx_fa_max_doc_requests_chase_due",
+            "first_chase_sent_at",
+            postgresql_where=text(
+                "received_at IS NULL AND followup_chase_sent_at IS NULL"
+            ),
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<FaMaxDocumentRequests(opportunity={self.opportunity_id!r}, "
+            f"document={self.document_name!r}, received_at={self.received_at!r})>"
+        )
+
+
 class FaMaxBackflipCampaignContact(Base):
     """Current Backflip campaign membership; separate from permanent opt-outs."""
     __tablename__ = "fa_max_backflip_campaign_contacts"

@@ -114,6 +114,7 @@ _STATUS_TOUCH_CANDIDATES_SQL = text("""
     -- 'funded'/'declined' mirrors config.fa_max_stage_monitoring.TERMINAL_BACKFLIP_STAGES;
     -- keep this literal in sync if that constant ever changes.
     WHERE fs.backflip_stage NOT IN ('funded', 'declined')
+    ORDER BY fs.last_borrower_touch_at NULLS FIRST
     LIMIT 200
 """)
 
@@ -185,8 +186,31 @@ _OUTSTANDING_DOC_REQUESTS_SQL = text("""
     FROM fa_max_document_requests dr
     JOIN fa_max_file_state fs ON fs.opportunity_id = dr.opportunity_id
     WHERE dr.received_at IS NULL AND dr.escalated_at IS NULL
+      -- 'funded'/'declined' mirrors config.fa_max_stage_monitoring.TERMINAL_BACKFLIP_STAGES;
+      -- keep this literal in sync if that constant ever changes.
+      AND fs.backflip_stage NOT IN ('funded', 'declined')
+    ORDER BY dr.requested_at
     LIMIT 200
 """)
+
+# Borrower-facing document-chase copy never names the specific document.
+# relay_approval_queue's CHECK constraint rejects any fa_max_lending payload
+# matching a prohibited-financial-term regex, and the document names that
+# actually occur ("Bank Statement", "Tax Return", "Proof of income",
+# "Commitment letter") all match it. The document name lives in
+# fa_max_document_requests / fa_max_interactions for internal reference; the
+# borrower gets a prompt to reply, which is the action we want anyway.
+_DOC_CHASE_FIRST_SUBJECT = "Action needed: a document is still outstanding"
+_DOC_CHASE_FIRST_BODY = (
+    "We're waiting on one more document to keep your file moving. "
+    "Reply here and we'll confirm exactly what's needed and how to send it."
+)
+_DOC_CHASE_FOLLOWUP_SUBJECT = "Still waiting on a document"
+_DOC_CHASE_FOLLOWUP_BODY = (
+    "Following up — we're still waiting on a document to keep your file "
+    "moving. Reply here and we'll confirm exactly what's needed and how to "
+    "send it."
+)
 
 _MARK_FOLLOWUP_SENT_SQL = text("""
     UPDATE fa_max_document_requests SET followup_chase_sent_at = NOW() WHERE id = :id
@@ -244,12 +268,8 @@ def _send_chase_followup(session: Session, data: dict[str, Any]) -> bool:
 
     return fa_max_file_state.send_governed_email(
         session, opportunity_id=data["opportunity_id"], person_id=data["person_id"],
-        contact_email=data["contact_email"], subject=f"Still need: {data['document_name']}",
-        body=(
-            f"Following up — we're still waiting on {data['document_name']} "
-            "to keep your file moving. Reply here if you have questions "
-            "about how to submit it."
-        ),
+        contact_email=data["contact_email"],
+        subject=_DOC_CHASE_FOLLOWUP_SUBJECT, body=_DOC_CHASE_FOLLOWUP_BODY,
         lane="RELATIONSHIPS", agent_name=_AGENT_NAME,
         idempotency_key=f"fa_max_doc_chase_followup:{data['id']}",
     )
@@ -257,6 +277,29 @@ def _send_chase_followup(session: Session, data: dict[str, Any]) -> bool:
 
 def _escalate_chase(session: Session, data: dict[str, Any]) -> None:
     import json
+
+    from src.services import fa_max_send_governance as governance
+
+    # document_name is redacted even here: relay_approval_queue's CHECK
+    # constraint rejects any fa_max_lending payload matching the prohibited-
+    # financial-term regex regardless of lane, and common document names
+    # ("Bank Statement", "Tax Return", "Proof of income") all match it. The
+    # real name stays in fa_max_document_requests -- document_request_id is
+    # what the client looks it up by.
+    payload = {
+        "type": "document_chase_escalation",
+        "opportunity_id": data["opportunity_id"],
+        "document_request_id": data["id"],
+        "document_name_redacted": True,
+    }
+    try:
+        governance.validate_safe_payload(payload)
+    except governance.GovernanceBlocked as exc:
+        logger.warning(
+            "stage_monitor: escalation blocked for request id=%s reason=%s",
+            data["id"], exc.reason,
+        )
+        return
 
     # Raw insert, not enqueue() -- same reason as _post_stall_exception:
     # no Hunter-style thread_id exists for an FA Max opportunity.
@@ -273,11 +316,7 @@ def _escalate_chase(session: Session, data: dict[str, Any]) -> None:
         {
             "idem": f"fa_max_doc_chase_escalate:{data['id']}", "vk": _VENTURE_KEY,
             "lane": "EXCEPTIONS",
-            "payload": json.dumps({
-                "type": "document_chase_escalation",
-                "opportunity_id": data["opportunity_id"],
-                "document_name": data["document_name"],
-            }),
+            "payload": json.dumps(payload),
             "agent": _AGENT_NAME, "pid": data["person_id"],
         },
     )
@@ -313,11 +352,8 @@ def send_first_chase_touch(
     idempotency_key = f"docreq:{opportunity_id}:{document_name}"
     was_sent = fa_max_file_state.send_governed_email(
         session, opportunity_id=opportunity_id, person_id=person_id,
-        contact_email=contact_email, subject=f"Action needed: {document_name}",
-        body=(
-            f"We need {document_name} to keep your file moving. "
-            "Reply here if you have questions about how to submit it."
-        ),
+        contact_email=contact_email,
+        subject=_DOC_CHASE_FIRST_SUBJECT, body=_DOC_CHASE_FIRST_BODY,
         lane="RELATIONSHIPS", agent_name=_AGENT_NAME,
         idempotency_key=f"fa_max_doc_chase_first:{idempotency_key}",
     )

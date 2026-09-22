@@ -22,7 +22,13 @@ carry. Every send here is a raw INSERT INTO relay_approval_queue, the same
 pattern src/agents/reply_concierge/router.py and abandonment_agent.py
 already use for exactly this reason (see plan doc Assumption 7). Because
 that path skips enqueue()'s automatic checks, every borrower-facing send
-calls fa_max_send_governance.require_consent()/suppression_reason() first.
+calls fa_max_send_governance.validate_safe_payload()/require_consent()/
+suppression_reason() first. The payload check is not merely policy:
+relay_approval_queue carries a CHECK constraint rejecting any
+fa_max_lending payload whose text matches a prohibited-financial-term
+regex, which common document names ("Bank Statement", "Tax Return") all
+match -- hence the generic, document-name-free borrower copy in
+stage_monitor.py.
 """
 from __future__ import annotations
 
@@ -297,14 +303,32 @@ def send_governed_email(
     subject: str, body: str, lane: str, agent_name: str, idempotency_key: str,
 ) -> bool:
     """The one seam every borrower-facing send in Tasks 10-11 goes through.
-    Runs the full canonical governance check (consent + suppression) before
-    a raw insert into relay_approval_queue -- the same two checks enqueue()
-    would have run internally, applied explicitly here since enqueue()
-    itself isn't usable (see module docstring). Returns whether the row was
-    written; False means governance blocked it (logged, not raised -- a
-    blocked send must never crash a sweep processing other files).
+    Runs the full canonical governance check (content safety + consent +
+    suppression) before a raw insert into relay_approval_queue -- the same
+    checks enqueue() would have run internally, applied explicitly here
+    since enqueue() itself isn't usable (see module docstring).
+
+    Returns True only when a row was actually written. False means either
+    governance blocked it (logged, not raised -- a blocked send must never
+    crash a sweep processing other files) or ON CONFLICT DO NOTHING deduped
+    it. Callers use the return value to decide whether to stamp a
+    "we sent this" timestamp, so a deduped no-op must not read as a send.
+
+    The content check matters beyond policy: relay_approval_queue carries a
+    CHECK constraint rejecting any fa_max_lending payload whose text matches
+    a prohibited-financial-term regex, so an unchecked borrower-facing
+    payload raises IntegrityError and the caller retries it forever.
     """
     from src.services import fa_max_send_governance as governance
+
+    try:
+        governance.validate_safe_payload({"subject": subject, "body": body})
+    except governance.GovernanceBlocked as exc:
+        logger.warning(
+            "fa_max_file_state: send blocked opportunity_id=%s reason=%s",
+            opportunity_id, exc.reason,
+        )
+        return False
 
     consent = governance.require_consent(session, person_id=person_id, channel="email")
     if not consent.allowed:
@@ -322,15 +346,16 @@ def send_governed_email(
         )
         return False
 
-    session.execute(
+    inserted = session.execute(
         text("""
             INSERT INTO relay_approval_queue
                 (idempotency_key, venture_key, lane, channel, recipient,
                  payload, status, agent_name, autonomy_tier_at_send, person_id)
             VALUES
                 (:idem, :vk, :lane, 'email', :recipient,
-                 CAST(:payload AS JSONB), 'pending', :agent, 'B', :pid)
+                 CAST(:payload AS JSONB), 'pending', :agent, 'A', :pid)
             ON CONFLICT (idempotency_key) DO NOTHING
+            RETURNING id
         """),
         {
             "idem": idempotency_key, "vk": _VENTURE_KEY, "lane": lane,
@@ -338,8 +363,14 @@ def send_governed_email(
             "payload": json.dumps({"subject": subject, "body": body}),
             "agent": agent_name, "pid": person_id,
         },
-    )
+    ).fetchone()
     session.commit()
+    if inserted is None:
+        logger.info(
+            "fa_max_file_state: send deduped opportunity_id=%s lane=%s agent=%s",
+            opportunity_id, lane, agent_name,
+        )
+        return False
     logger.info(
         "fa_max_file_state: sent opportunity_id=%s lane=%s agent=%s",
         opportunity_id, lane, agent_name,

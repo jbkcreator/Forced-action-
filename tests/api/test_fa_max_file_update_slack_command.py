@@ -89,6 +89,65 @@ class TestFaMaxFileUpdateCommand:
         assert mock_first_touch.call_args.kwargs["document_name"] == "Bank Statement"
         assert mock_first_touch.call_args.kwargs["contact_email"] == "borrower@example.com"
 
+    def test_document_received_happy_path(self):
+        """Finding 4: record_document_received() had no caller, so every
+        request walked first-touch -> follow-up -> escalation even after the
+        borrower complied. This is its one manual closure path.
+        """
+        with patch("src.api.admin_router._verify_slack_signature", return_value=True), patch(
+            "src.api.admin_router._relay_approver_authorized", return_value=True
+        ), patch(
+            "src.agents.reply_concierge.backflip_stage_ingest.resolve_opportunity_by_backflip_ref",
+            return_value={"opportunity_id": "opp-1", "person_id": "p-1"},
+        ), patch(
+            "src.services.fa_max_file_state.record_document_received", return_value=1,
+        ) as mock_received:
+            response = client.post(
+                "/api/admin/slack/fa-max-file-update",
+                data={"user_id": "U123", "text": "BF-1 received:Bank Statement"},
+                headers=_signed_headers(),
+            )
+        assert response.status_code == 200
+        assert "received" in response.json()["text"]
+        mock_received.assert_called_once()
+        assert mock_received.call_args.kwargs["document_name"] == "Bank Statement"
+        assert mock_received.call_args.kwargs["opportunity_id"] == "opp-1"
+
+    def test_document_received_no_matching_request(self):
+        with patch("src.api.admin_router._verify_slack_signature", return_value=True), patch(
+            "src.api.admin_router._relay_approver_authorized", return_value=True
+        ), patch(
+            "src.agents.reply_concierge.backflip_stage_ingest.resolve_opportunity_by_backflip_ref",
+            return_value={"opportunity_id": "opp-1", "person_id": "p-1"},
+        ), patch(
+            "src.services.fa_max_file_state.record_document_received", return_value=0,
+        ):
+            response = client.post(
+                "/api/admin/slack/fa-max-file-update",
+                data={"user_id": "U123", "text": "BF-1 received:Nope"},
+                headers=_signed_headers(),
+            )
+        assert response.status_code == 200
+        assert "No outstanding request" in response.json()["text"]
+
+    def test_document_received_requires_a_name(self):
+        with patch("src.api.admin_router._verify_slack_signature", return_value=True), patch(
+            "src.api.admin_router._relay_approver_authorized", return_value=True
+        ), patch(
+            "src.agents.reply_concierge.backflip_stage_ingest.resolve_opportunity_by_backflip_ref",
+            return_value={"opportunity_id": "opp-1", "person_id": "p-1"},
+        ), patch(
+            "src.services.fa_max_file_state.record_document_received"
+        ) as mock_received:
+            response = client.post(
+                "/api/admin/slack/fa-max-file-update",
+                data={"user_id": "U123", "text": "BF-1 received:   "},
+                headers=_signed_headers(),
+            )
+        assert response.status_code == 200
+        assert "Usage" in response.json()["text"]
+        mock_received.assert_not_called()
+
     def test_unknown_stage_returns_usage(self):
         with patch("src.api.admin_router._verify_slack_signature", return_value=True), patch(
             "src.api.admin_router._relay_approver_authorized", return_value=True

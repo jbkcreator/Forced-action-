@@ -2964,13 +2964,16 @@ async def slack_resume_command(request: Request):
 @router.post("/slack/fa-max-file-update")
 async def slack_fa_max_file_update_command(request: Request, db: Session = Depends(get_db)):
     """
-    Slack slash command: '/fa-max-file-update <backflip_ref> <stage>' or
-    '/fa-max-file-update <backflip_ref> doc:<document name>' (WP-T2-6).
+    Slack slash command (WP-T2-6):
+        /fa-max-file-update <backflip_ref> <stage>
+        /fa-max-file-update <backflip_ref> doc:<document name>
+        /fa-max-file-update <backflip_ref> received:<document name>
 
     Stage tokens match config.fa_max_stage_monitoring.BACKFLIP_STAGE_KEYS
     exactly (snake_case: under_review, conditional_approval, docs_requested,
     cleared_to_close, funded, declined). A doc: prefix records a document
-    request instead of a stage change.
+    request instead of a stage change; a received: prefix closes one out,
+    stopping its chase timers before they escalate.
 
     Same authorization gate as /relay-kill — relay_approvers, since manually
     moving a file's stage/document state is at least as consequential.
@@ -2992,13 +2995,31 @@ async def slack_fa_max_file_update_command(request: Request, db: Session = Depen
     if len(tokens) != 2:
         return _slack_ephemeral(
             "Usage: /fa-max-file-update <backflip_ref> <stage> | "
-            "/fa-max-file-update <backflip_ref> doc:<document name>"
+            "/fa-max-file-update <backflip_ref> doc:<document name> | "
+            "/fa-max-file-update <backflip_ref> received:<document name>"
         )
     backflip_ref, action = tokens[0], tokens[1].strip()
 
     resolved = resolve_opportunity_by_backflip_ref(db, backflip_ref)
     if resolved is None:
         return _slack_ephemeral(f"No opportunity found for {backflip_ref}.")
+
+    if action.lower().startswith("received:"):
+        document_name = action[len("received:"):].strip()
+        if not document_name:
+            return _slack_ephemeral(
+                "Usage: /fa-max-file-update <backflip_ref> received:<document name>"
+            )
+        closed = fa_max_file_state.record_document_received(
+            db, opportunity_id=resolved["opportunity_id"], document_name=document_name,
+        )
+        if not closed:
+            return _slack_ephemeral(
+                f"No outstanding request named '{document_name}' for {backflip_ref}."
+            )
+        return _slack_ephemeral(
+            f"Marked '{document_name}' received for {backflip_ref} — chase stopped."
+        )
 
     if action.lower().startswith("doc:"):
         document_name = action[len("doc:"):].strip()

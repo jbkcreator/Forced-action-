@@ -184,8 +184,14 @@ class TestTouchBorrower:
 
 
 class TestSendGovernedEmail:
+    @staticmethod
+    def _db_with_insert_returning_id():
+        db = MagicMock()
+        db.execute.return_value.fetchone.return_value = (1,)
+        return db
+
     def test_sends_when_consent_and_suppression_both_pass(self):
-        db = _mock_db()
+        db = self._db_with_insert_returning_id()
         with patch(
             "src.services.fa_max_send_governance.require_consent",
             return_value=MagicMock(allowed=True),
@@ -239,5 +245,93 @@ class TestSendGovernedEmail:
                 contact_email="borrower@example.com", subject="Update",
                 body="Still under review.", lane="RELATIONSHIPS",
                 agent_name="stage_monitor", idempotency_key="test-key-3",
+            )
+        assert sent is False
+
+    def test_blocks_prohibited_document_name_in_borrower_copy(self):
+        """Finding 1a: relay_approval_queue's live CHECK constraint rejects any
+        fa_max_lending payload naming a prohibited financial term, so the
+        content check must happen before the INSERT, not as an IntegrityError.
+        """
+        db = self._db_with_insert_returning_id()
+        with patch(
+            "src.services.fa_max_send_governance.require_consent",
+            return_value=MagicMock(allowed=True),
+        ), patch(
+            "src.services.fa_max_send_governance.suppression_reason", return_value=None,
+        ):
+            sent = svc.send_governed_email(
+                db, opportunity_id="opp-1", person_id="p-1",
+                contact_email="borrower@example.com",
+                subject="Action needed: Bank Statement",
+                body="We need your Bank Statement to keep your file moving.",
+                lane="RELATIONSHIPS", agent_name="stage_monitor",
+                idempotency_key="test-key-unsafe",
+            )
+        assert sent is False
+        insert_calls = [
+            call for call in db.execute.call_args_list
+            if "INSERT INTO relay_approval_queue" in str(call.args[0])
+        ]
+        assert insert_calls == []
+
+    def test_safe_copy_still_sends(self):
+        db = self._db_with_insert_returning_id()
+        with patch(
+            "src.services.fa_max_send_governance.require_consent",
+            return_value=MagicMock(allowed=True),
+        ), patch(
+            "src.services.fa_max_send_governance.suppression_reason", return_value=None,
+        ):
+            sent = svc.send_governed_email(
+                db, opportunity_id="opp-1", person_id="p-1",
+                contact_email="borrower@example.com",
+                subject="Action needed: a document is still outstanding",
+                body="We're waiting on one more document to keep your file moving.",
+                lane="RELATIONSHIPS", agent_name="stage_monitor",
+                idempotency_key="test-key-safe",
+            )
+        assert sent is True
+
+    def test_stamps_autonomy_tier_a(self):
+        """Finding 2: every other FA Max insert stamps 'A'; tier scopes
+        fa_max_autonomy's send-count/edit-rate evidence.
+        """
+        db = self._db_with_insert_returning_id()
+        with patch(
+            "src.services.fa_max_send_governance.require_consent",
+            return_value=MagicMock(allowed=True),
+        ), patch(
+            "src.services.fa_max_send_governance.suppression_reason", return_value=None,
+        ):
+            svc.send_governed_email(
+                db, opportunity_id="opp-1", person_id="p-1",
+                contact_email="borrower@example.com", subject="Update",
+                body="Still under review.", lane="RELATIONSHIPS",
+                agent_name="stage_monitor", idempotency_key="test-key-tier",
+            )
+        insert_sql = next(
+            str(call.args[0]) for call in db.execute.call_args_list
+            if "INSERT INTO relay_approval_queue" in str(call.args[0])
+        )
+        assert "'pending', :agent, 'A', :pid" in insert_sql
+
+    def test_deduped_insert_returns_false(self):
+        """Finding 6: ON CONFLICT DO NOTHING no-op must not read as a send, or
+        the caller re-stamps first_chase_sent_at / last_borrower_touch_at.
+        """
+        db = MagicMock()
+        db.execute.return_value.fetchone.return_value = None
+        with patch(
+            "src.services.fa_max_send_governance.require_consent",
+            return_value=MagicMock(allowed=True),
+        ), patch(
+            "src.services.fa_max_send_governance.suppression_reason", return_value=None,
+        ):
+            sent = svc.send_governed_email(
+                db, opportunity_id="opp-1", person_id="p-1",
+                contact_email="borrower@example.com", subject="Update",
+                body="Still under review.", lane="RELATIONSHIPS",
+                agent_name="stage_monitor", idempotency_key="test-key-dup",
             )
         assert sent is False

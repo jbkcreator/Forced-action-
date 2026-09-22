@@ -1,10 +1,13 @@
 """tests/agents/reply_concierge/test_stage_monitor.py"""
 from __future__ import annotations
 
+import json
+import re
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 from src.agents.reply_concierge import stage_monitor
+from src.services.fa_max_send_governance import GovernanceBlocked
 
 
 def _mock_db():
@@ -211,6 +214,125 @@ class TestSweepDocumentChases:
             count = stage_monitor.sweep_document_chases(db)
         assert count == 0
         mock_send.assert_not_called()
+
+
+_DB_PROHIBITED_TERMS = re.compile(
+    r"(ssn|social.security|credit.score|fico|income|bank.statement|tax.return"
+    r"|debt.to.income|interest.rate|loan.rate|loan.term|commitment)",
+    re.IGNORECASE,
+)
+
+
+class TestBorrowerFacingCopyIsGeneric:
+    """Finding 1c: relay_approval_queue carries a live CHECK constraint
+    rejecting any fa_max_lending payload matching _DB_PROHIBITED_TERMS, and
+    real document names ('Bank Statement', 'Tax Return', 'Proof of income',
+    'Commitment letter') all match it. No borrower-facing template may name
+    the document.
+    """
+
+    def test_chase_copy_never_names_a_document_and_clears_both_regexes(self):
+        from src.services import fa_max_send_governance as governance
+
+        copy = [
+            stage_monitor._DOC_CHASE_FIRST_SUBJECT,
+            stage_monitor._DOC_CHASE_FIRST_BODY,
+            stage_monitor._DOC_CHASE_FOLLOWUP_SUBJECT,
+            stage_monitor._DOC_CHASE_FOLLOWUP_BODY,
+        ] + [
+            stage_monitor._STATUS_TOUCH_BODY.format(stage_label=label)
+            for label in list(stage_monitor._STAGE_LABELS.values()) + ["moving forward"]
+        ]
+        for text_value in copy:
+            assert not _DB_PROHIBITED_TERMS.search(text_value), text_value
+            governance.validate_safe_payload({"body": text_value})
+
+    def test_first_chase_subject_and_body_do_not_interpolate_document_name(self):
+        db = _mock_db()
+        with patch(
+            "src.services.fa_max_file_state.send_governed_email", return_value=True,
+        ) as mock_send:
+            stage_monitor.send_first_chase_touch(
+                db, opportunity_id="opp-1", person_id="p-1",
+                document_name="Bank Statement (last 2 months)",
+                contact_email="borrower@example.com",
+            )
+        kwargs = mock_send.call_args.kwargs
+        assert "Bank Statement" not in kwargs["subject"]
+        assert "Bank Statement" not in kwargs["body"]
+
+    def test_followup_subject_and_body_do_not_interpolate_document_name(self):
+        db = _mock_db()
+        with patch(
+            "src.services.fa_max_file_state.send_governed_email", return_value=True,
+        ) as mock_send:
+            stage_monitor._send_chase_followup(db, {
+                "id": 9, "opportunity_id": "opp-9", "person_id": "p-9",
+                "document_name": "Tax Return", "contact_email": "b@example.com",
+            })
+        kwargs = mock_send.call_args.kwargs
+        assert "Tax Return" not in kwargs["subject"]
+        assert "Tax Return" not in kwargs["body"]
+
+
+class TestEscalationPayload:
+    def test_redacts_document_name_and_passes_governance(self):
+        """Finding 1b: _escalate_chase inserts raw (not via
+        send_governed_email), so it needs its own validate_safe_payload call;
+        the document name is redacted because the CHECK constraint applies to
+        every fa_max_lending payload regardless of lane.
+        """
+        from src.services import fa_max_send_governance as governance
+
+        db = _mock_db()
+        stage_monitor._escalate_chase(db, {
+            "id": 11, "opportunity_id": "opp-11", "person_id": "p-11",
+            "document_name": "Bank Statement",
+        })
+        insert_calls = [
+            call for call in db.execute.call_args_list
+            if "INSERT INTO relay_approval_queue" in str(call.args[0])
+        ]
+        assert len(insert_calls) == 1
+        payload = json.loads(insert_calls[0].args[1]["payload"])
+        assert payload["document_name_redacted"] is True
+        assert payload["document_request_id"] == 11
+        assert "Bank Statement" not in insert_calls[0].args[1]["payload"]
+        assert not _DB_PROHIBITED_TERMS.search(insert_calls[0].args[1]["payload"])
+        governance.validate_safe_payload(payload)
+
+    def test_skips_insert_when_payload_is_blocked(self):
+        db = _mock_db()
+        with patch(
+            "src.services.fa_max_send_governance.validate_safe_payload",
+            side_effect=GovernanceBlocked("prohibited_financial_content:payload.x"),
+        ):
+            stage_monitor._escalate_chase(db, {
+                "id": 12, "opportunity_id": "opp-12", "person_id": "p-12",
+                "document_name": "Bank Statement",
+            })
+        insert_calls = [
+            call for call in db.execute.call_args_list
+            if "INSERT INTO relay_approval_queue" in str(call.args[0])
+        ]
+        assert insert_calls == []
+
+
+class TestSweepQueryGuards:
+    def test_doc_request_sweep_excludes_terminal_stages(self):
+        """Finding 3: a declined borrower must not keep getting chased."""
+        sql = str(stage_monitor._OUTSTANDING_DOC_REQUESTS_SQL)
+        assert "fs.backflip_stage NOT IN ('funded', 'declined')" in sql
+
+    def test_limited_sweeps_are_deterministically_ordered(self):
+        """Finding 5: LIMIT 200 without ORDER BY starves rows past the 200th."""
+        status_sql = str(stage_monitor._STATUS_TOUCH_CANDIDATES_SQL)
+        assert "ORDER BY fs.last_borrower_touch_at NULLS FIRST" in status_sql
+        assert status_sql.index("ORDER BY") < status_sql.index("LIMIT")
+
+        doc_sql = str(stage_monitor._OUTSTANDING_DOC_REQUESTS_SQL)
+        assert "ORDER BY dr.requested_at" in doc_sql
+        assert doc_sql.index("ORDER BY") < doc_sql.index("LIMIT")
 
 
 class TestSendFirstChaseTouch:
