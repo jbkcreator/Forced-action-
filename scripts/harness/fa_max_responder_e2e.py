@@ -204,6 +204,7 @@ def run_classification_matrix() -> tuple[int, int]:
     for c in CASES:
         buckets: list[str] = []
         lookups: list[str] = []
+        results_list = []  # store full result objects to recover real params
         run_cost = 0.0
         run_latency = 0.0
 
@@ -219,6 +220,7 @@ def run_classification_matrix() -> tuple[int, int]:
             run_cost += resp.get("cost_usd", 0.0)
             buckets.append(result.bucket.value)
             lookups.append(result.lookup_id or "")
+            results_list.append(result)
 
         if len(buckets) < RUNS_PER_CASE:
             continue  # already counted as failure above
@@ -231,24 +233,25 @@ def run_classification_matrix() -> tuple[int, int]:
         majority_lookup = Counter(lookups).most_common(1)[0][0]
         accuracy = buckets.count(majority_bucket) / RUNS_PER_CASE * 100
 
+        # Pick a representative result object that matches the majority bucket/lookup
+        # so we use the real LLM-extracted params, not a reconstructed empty dict.
+        majority_result = next(
+            (r for r in results_list
+             if r.bucket.value == majority_bucket and (r.lookup_id or "") == majority_lookup),
+            results_list[0],
+        )
+
         bucket_ok = majority_bucket == c.expect_bucket
         lookup_ok = (c.expect_lookup is None) or (majority_lookup == c.expect_lookup)
 
-        # Run catalog query against live schema (once, with timeout)
+        # Run catalog query against live schema using the real extracted params.
         query_ok = True
         query_note = ""
         if majority_bucket == "simple_lookup":
             try:
                 with get_db_context() as db:
                     db.execute(text(f"SET LOCAL statement_timeout = {DB_TIMEOUT_MS}"))
-                    # reconstruct a minimal classify result with majority values
-                    from src.services.relay.thread_fallback_responder import ClassifyResult, Bucket
-                    probe = ClassifyResult(
-                        bucket=Bucket(majority_bucket),
-                        lookup_id=majority_lookup or None,
-                        params={},
-                    )
-                    reply = _run_catalog_lookup(probe, db)
+                    reply = _run_catalog_lookup(majority_result, db)
                 query_note = f" -> {reply[:50]!r}"
             except Exception as exc:
                 query_ok = False
