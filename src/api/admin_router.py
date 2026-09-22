@@ -57,6 +57,7 @@ from src.core.models import (
 )
 from src.loaders.tax import TaxDelinquencyLoader
 from src.loaders.voter_registry import VoterRegistryLoader
+from src.services.relay.slack_post import open_log_submission_modal
 from src.services.zip_territory import claim_zip_territory
 from src.utils.county_config import invalidate_cache
 from src.utils.test_account import is_test_subscriber
@@ -1635,6 +1636,27 @@ def _slack_ephemeral(text: str) -> dict:
     return {"response_type": "ephemeral", "text": text}
 
 
+def _handle_borrower_search_suggestion(payload: dict, db: Session) -> dict:
+    """block_suggestion handler for the log-submission modal's borrower
+    external_select (Task 18). Slack's options[].text.text field has a 75
+    character limit, hence the truncation.
+    """
+    from src.services.fa_max_person_search import search_fa_max_persons
+
+    query = payload.get("value", "")
+    matches = search_fa_max_persons(db, query)
+    options = []
+    for m in matches:
+        detail_parts = [p for p in (m.get("email"), m.get("phone"), m.get("last_stage")) if p]
+        detail = " · ".join(detail_parts) if detail_parts else "no contact on file"
+        label = f"{m['full_name'] or 'Unnamed'} ({detail})"[:75]
+        options.append({
+            "text": {"type": "plain_text", "text": label},
+            "value": m["person_id"],
+        })
+    return {"options": options}
+
+
 def _parse_slack_interactive_payload(raw: bytes) -> dict:
     """Shared by every Block Kit button endpoint below (not /slack/kill,
     which is a slash command with a differently-shaped body)."""
@@ -1668,6 +1690,13 @@ async def slack_interact(request: Request, background_tasks: BackgroundTasks, db
     # `actions` list — it must be checked before indexing into `actions`.
     if payload.get("type") == "view_submission" and payload.get("view", {}).get("callback_id") == "fa_max_revise_submit":
         return _handle_relay_revise_submission(payload)
+
+    # block_suggestion (external_select live search) also arrives at this
+    # same Interactivity Request URL, with neither an "actions" list nor a
+    # "view"/callback_id shape — checked here for the same reason
+    # view_submission is checked before indexing into `actions` above.
+    if payload.get("type") == "block_suggestion" and payload.get("action_id") == "borrower_search":
+        return _handle_borrower_search_suggestion(payload, db)
 
     actions = payload.get("actions", [])
     action_id = actions[0].get("action_id") if actions else None
@@ -3057,6 +3086,31 @@ async def slack_fa_max_file_update_command(request: Request, db: Session = Depen
         actor=f"manual:{user_id}", source="manual",
     )
     return _slack_ephemeral(f"{backflip_ref} updated to stage: {stage}.")
+
+
+@router.post("/slack/fa-max-log-submission")
+async def slack_log_submission_command(request: Request):
+    """
+    Slack slash command: '/fa-max-log-submission' (no arguments — opens a
+    modal). Addendum to WP-T2-6: records the moment Josh submits a deal to
+    Backflip, which nothing else in this codebase does today (backflip_ref
+    was previously only ever created downstream, when terms arrive).
+
+    Same authorization gate as /fa-max-file-update — relay_approvers.
+    """
+    raw = await request.body()
+    if not _verify_slack_signature(dict(request.headers), raw):
+        raise HTTPException(status_code=401, detail="Invalid Slack signature")
+
+    form = parse_qs(raw.decode("utf-8"))
+    user_id = form.get("user_id", [""])[0]
+    if not _relay_approver_authorized(user_id, "fa_max_lending"):
+        return _slack_ephemeral("Not authorized to log a Backflip submission.")
+
+    trigger_id = form.get("trigger_id", [""])[0]
+    if not open_log_submission_modal(trigger_id):
+        return _slack_ephemeral("Couldn't open the form — try again in a moment.")
+    return {"response_type": "ephemeral"}
 
 
 # ===========================================================================
