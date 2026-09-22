@@ -20,6 +20,21 @@ def bookings_db(fresh_db):
     """
     if fresh_db.execute(text("SELECT to_regclass('public.fa_max_bookings')")).scalar() is None:
         pytest.skip("fa_max_bookings absent — run migrations/apply_fa_max_bookings.py")
+
+    # The integrity migration adds the columns and partial indexes that
+    # idempotency and slot-claiming depend on; without them these tests would
+    # pass against a schema that cannot make those guarantees.
+    has_key = fresh_db.execute(
+        text(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name = 'fa_max_bookings' AND column_name = 'idempotency_key'"
+        )
+    ).first()
+    if has_key is None:
+        pytest.skip(
+            "fa_max_bookings lacks idempotency_key — "
+            "run migrations/apply_fa_max_bookings_integrity.py"
+        )
     return fresh_db
 
 

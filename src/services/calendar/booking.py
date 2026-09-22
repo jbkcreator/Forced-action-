@@ -17,6 +17,7 @@ a provider rejection is an error and belongs in the agent loop's handler.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import secrets
 from dataclasses import dataclass
@@ -32,12 +33,17 @@ from config.calendar import (
     DEFAULT_SLOT_DURATION_MINUTES,
     RESCHEDULE_ALERT_RULE,
 )
-from src.services.calendar.availability import Slot, compute_free_slots
+from src.services.calendar.availability import BusyBlock, Slot, compute_free_slots
 from src.services.calendar.client import CalendarClient, CalendarEvent
 
 logger = logging.getLogger(__name__)
 
 RESCHEDULE_ALTERNATIVE_LIMIT = 3
+
+BUSY_CACHE_PREFIX = "calendar:busy:"
+# Short enough that a slot taken elsewhere disappears from the page quickly,
+# long enough to absorb a link being opened repeatedly.
+BUSY_CACHE_TTL_SECONDS = 30
 
 _TZ = ZoneInfo(CALENDAR_TIMEZONE)
 
@@ -77,9 +83,21 @@ def get_slots(
     now: datetime,
     duration_minutes: int = DEFAULT_SLOT_DURATION_MINUTES,
     include_weekends: bool = False,
+    use_cache: bool = False,
 ) -> list[Slot]:
-    """Bookable slots in the window, honouring every availability rule."""
-    busy = client.get_busy(calendar_id=calendar_id, start=window_start, end=window_end)
+    """Bookable slots in the window, honouring every availability rule.
+
+    `use_cache` is for display only. Showing a borrower availability that is
+    a few seconds stale costs nothing — they get "that slot just went" and
+    pick another. Never enable it for a check that decides a write: book()'s
+    re-read must see the calendar as it is now, and a cached answer there
+    would reintroduce the double-booking it exists to prevent.
+    """
+    busy = (
+        _cached_busy(client, calendar_id, window_start, window_end)
+        if use_cache
+        else client.get_busy(calendar_id=calendar_id, start=window_start, end=window_end)
+    )
     return compute_free_slots(
         busy=busy,
         window_start=window_start,
@@ -100,8 +118,15 @@ def book(
     topic: str,
     description: str = "",
     person_id: Optional[Any] = None,
+    tracked_link_id: Optional[int] = None,
 ) -> BookingResult:
-    """Book a slot for an attendee, refusing if suppressed or already taken."""
+    """Book a slot for an attendee, refusing if suppressed or already taken.
+
+    Commits. The row claiming the slot must be durable before the calendar
+    event is created, or a crash in between leaves a meeting in the
+    borrower's inbox that no record points at. A stray row is recoverable;
+    a stray meeting is not.
+    """
     from src.agents.fa_max.tool_registry import check_suppression
 
     suppression = check_suppression(
@@ -116,67 +141,226 @@ def book(
             booked=False, reason="suppressed", detail=suppression["reason"]
         )
 
+    key = _idempotency_key(calendar_id, slot, attendee_email)
+    replay = _existing_booking(session, key)
+    if replay is not None:
+        return replay
+
     if _is_taken(client=client, calendar_id=calendar_id, slot=slot):
         logger.info("calendar.book: refused — slot taken since it was offered")
         return BookingResult(booked=False, reason="slot_taken")
 
-    event = client.create_event(
-        calendar_id=calendar_id,
-        start=slot.start,
-        end=slot.end,
-        summary=topic,
-        attendee_email=attendee_email,
-        description=description,
+    claim = _claim_slot(
+        session=session, calendar_id=calendar_id, slot=slot,
+        attendee_email=attendee_email, topic=topic, person_id=person_id,
+        tracked_link_id=tracked_link_id, idempotency_key=key,
     )
+    if claim is None:
+        # Another booking holds this slot or this key. Whoever committed
+        # first owns it; the database settled the race, not the re-check.
+        logger.info("calendar.book: refused — lost the slot claim")
+        replay = _existing_booking(session, key)
+        return replay or BookingResult(booked=False, reason="slot_taken")
 
-    booking_ref = _record_booking(
-        session=session,
-        calendar_id=calendar_id,
-        event=event,
-        attendee_email=attendee_email,
-        topic=topic,
-        person_id=person_id,
-    )
+    booking_ref = claim
+    try:
+        event = client.create_event(
+            calendar_id=calendar_id,
+            start=slot.start,
+            end=slot.end,
+            summary=topic,
+            attendee_email=attendee_email,
+            description=description,
+        )
+    except Exception:
+        # Release the slot: a pending row holds it against everyone else, and
+        # no meeting was created to justify that.
+        _release_claim(session, booking_ref)
+        logger.exception("calendar.book: provider rejected booking_ref=%s", booking_ref)
+        raise
+
+    _confirm_claim(session, booking_ref, event)
     logger.info(
         "calendar.book: booked booking_ref=%s event_id=%s", booking_ref, event.event_id
     )
     return BookingResult(booked=True, event=event, booking_ref=booking_ref)
 
 
-def _record_booking(
+def _cached_busy(client, calendar_id: str, start: datetime, end: datetime):
+    """Free/busy for display, cached briefly. Falls through on any cache fault.
+
+    Redis being unavailable must not take the booking page down with it, so
+    every failure here degrades to a live read rather than raising.
+    """
+    import json
+
+    key = (
+        f"{BUSY_CACHE_PREFIX}{calendar_id}:"
+        f"{start.isoformat()}:{end.isoformat()}"
+    )
+    try:
+        from src.core.redis_client import get_redis, redis_available
+
+        if redis_available():
+            cached = get_redis().get(key)
+            if cached:
+                return [
+                    BusyBlock(
+                        start=datetime.fromisoformat(span["start"]),
+                        end=datetime.fromisoformat(span["end"]),
+                    )
+                    for span in json.loads(cached)
+                ]
+    except Exception:
+        logger.debug("calendar: busy-cache read failed — reading live", exc_info=True)
+
+    busy = client.get_busy(calendar_id=calendar_id, start=start, end=end)
+
+    try:
+        from src.core.redis_client import get_redis, redis_available
+
+        if redis_available():
+            get_redis().set(
+                key,
+                json.dumps(
+                    [{"start": b.start.isoformat(), "end": b.end.isoformat()} for b in busy]
+                ),
+                ex=BUSY_CACHE_TTL_SECONDS,
+            )
+    except Exception:
+        logger.debug("calendar: busy-cache write failed", exc_info=True)
+
+    return busy
+
+
+def _idempotency_key(calendar_id: str, slot: Slot, attendee_email: str) -> str:
+    """Stable across retries of the same booking, distinct across bookings.
+
+    The agent loop recovers a crashed step by letting its lease expire and
+    re-running it, so this call is replayed whenever a crash lands between
+    creating the event and completing the work item.
+    """
+    material = f"{calendar_id}|{slot.start.isoformat()}|{attendee_email.strip().lower()}"
+    return hashlib.sha256(material.encode()).hexdigest()
+
+
+def _existing_booking(session, idempotency_key: str) -> Optional[BookingResult]:
+    """The outcome of an earlier identical booking, or None if this is new."""
+    row = session.execute(
+        sa_text(
+            "SELECT booking_ref, status FROM fa_max_bookings "
+            "WHERE idempotency_key = :key"
+        ),
+        {"key": idempotency_key},
+    ).mappings().first()
+    if row is None or row["status"] == "cancelled":
+        return None
+
+    if row["status"] == "pending":
+        # Claimed but unconfirmed: either in flight right now, or orphaned by
+        # a crash before the event was created. Reporting it as booked would
+        # promise a meeting that may not exist.
+        return BookingResult(
+            booked=False, booking_ref=row["booking_ref"], reason="in_progress"
+        )
+
+    logger.info("calendar.book: replay of booking_ref=%s", row["booking_ref"])
+    return BookingResult(
+        booked=True, booking_ref=row["booking_ref"], reason="already_booked"
+    )
+
+
+def _claim_slot(
     *,
     session,
     calendar_id: str,
-    event: CalendarEvent,
+    slot: Slot,
     attendee_email: str,
     topic: str,
     person_id: Optional[Any],
-) -> str:
-    """Persist the booking and return its stable reference."""
+    tracked_link_id: Optional[int],
+    idempotency_key: str,
+) -> Optional[str]:
+    """Durably claim the slot. Returns the booking ref, or None if lost.
+
+    Commits so the claim survives a crash during the provider call. The
+    partial unique index on (calendar_id, starts_at) settles concurrent
+    bookings that both passed the availability re-check.
+    """
+    from sqlalchemy.exc import IntegrityError
+
     booking_ref = secrets.token_urlsafe(9)
+    try:
+        session.execute(
+            sa_text(
+                """
+                INSERT INTO fa_max_bookings
+                    (booking_ref, idempotency_key, tracked_link_id, calendar_id,
+                     person_id, attendee_email, topic, starts_at, ends_at, status)
+                VALUES
+                    (:booking_ref, :idempotency_key, :tracked_link_id, :calendar_id,
+                     :person_id, :attendee_email, :topic, :starts_at, :ends_at, 'pending')
+                """
+            ),
+            {
+                "booking_ref": booking_ref,
+                "idempotency_key": idempotency_key,
+                "tracked_link_id": tracked_link_id,
+                "calendar_id": calendar_id,
+                "person_id": person_id,
+                "attendee_email": attendee_email,
+                "topic": topic,
+                "starts_at": slot.start,
+                "ends_at": slot.end,
+            },
+        )
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        return None
+    return booking_ref
+
+
+def _confirm_claim(session, booking_ref: str, event: CalendarEvent) -> None:
     session.execute(
         sa_text(
-            """
-            INSERT INTO fa_max_bookings
-                (booking_ref, calendar_id, provider_event_id, person_id,
-                 attendee_email, topic, starts_at, ends_at, status)
-            VALUES
-                (:booking_ref, :calendar_id, :provider_event_id, :person_id,
-                 :attendee_email, :topic, :starts_at, :ends_at, 'confirmed')
-            """
+            "UPDATE fa_max_bookings "
+            "SET status = 'confirmed', provider_event_id = :event_id, updated_at = NOW() "
+            "WHERE booking_ref = :booking_ref"
         ),
-        {
-            "booking_ref": booking_ref,
-            "calendar_id": calendar_id,
-            "provider_event_id": event.event_id,
-            "person_id": person_id,
-            "attendee_email": attendee_email,
-            "topic": topic,
-            "starts_at": event.start,
-            "ends_at": event.end,
-        },
+        {"booking_ref": booking_ref, "event_id": event.event_id},
     )
-    return booking_ref
+    session.commit()
+
+
+def _release_claim(session, booking_ref: str) -> None:
+    session.rollback()
+    session.execute(
+        sa_text(
+            "UPDATE fa_max_bookings "
+            "SET status = 'cancelled', updated_at = NOW() "
+            "WHERE booking_ref = :booking_ref"
+        ),
+        {"booking_ref": booking_ref},
+    )
+    session.commit()
+
+
+def has_live_booking(session, *, tracked_link_id: int) -> bool:
+    """Whether a booking link has already produced a booking that still stands.
+
+    Cancelled bookings are excluded so a borrower whose meeting fell through
+    can use the same link again rather than having to email in.
+    """
+    return session.execute(
+        sa_text(
+            "SELECT 1 FROM fa_max_bookings "
+            "WHERE tracked_link_id = :link_id "
+            "AND status IN ('pending', 'confirmed', 'reschedule_requested') "
+            "LIMIT 1"
+        ),
+        {"link_id": tracked_link_id},
+    ).first() is not None
 
 
 def reschedule(

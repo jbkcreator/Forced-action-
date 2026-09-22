@@ -10,6 +10,7 @@ from src.services.calendar.booking import (
     RescheduleRequest,
     book,
     get_slots,
+    has_live_booking,
     reschedule,
 )
 from src.services.calendar.client import (
@@ -37,6 +38,7 @@ __all__ = [
     "get_calendar_client",
     "get_calendar_id",
     "get_slots",
+    "has_live_booking",
     "reschedule",
     "reset_calendar_client",
 ]

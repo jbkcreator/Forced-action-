@@ -11147,6 +11147,17 @@ class FaMaxBooking(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     booking_ref: Mapped[str] = mapped_column(String(40), nullable=False, unique=True)
+    # Derived from the calendar, slot and attendee, so a replayed booking
+    # resolves to the row it already created instead of a second meeting.
+    idempotency_key: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True, unique=True,
+    )
+    tracked_link_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger,
+        ForeignKey("tracked_links.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     calendar_id: Mapped[str] = mapped_column(String(320), nullable=False)
     provider_event_id: Mapped[Optional[str]] = mapped_column(
         String(200), nullable=True, index=True,
@@ -11175,10 +11186,13 @@ class FaMaxBooking(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "status IN ('confirmed', 'cancelled', 'reschedule_requested')",
+            "status IN ('pending', 'confirmed', 'cancelled', 'reschedule_requested')",
             name="ck_fa_max_bookings_status",
         ),
         CheckConstraint("ends_at > starts_at", name="ck_fa_max_bookings_span"),
+        # The partial unique index holding one live booking per slot is
+        # created in migrations/apply_fa_max_bookings_integrity.py — a
+        # filtered index cannot be expressed as a table constraint.
     )
 
     def __repr__(self) -> str:

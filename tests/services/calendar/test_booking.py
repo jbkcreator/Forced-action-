@@ -346,6 +346,164 @@ class TestReschedule:
             )
 
 
+class TestAvailabilityCaching:
+    """Cache what is shown; never cache what decides a write."""
+
+    @pytest.fixture
+    def cache_id(self):
+        """A calendar id unique to this test.
+
+        The cache lives in a shared Redis with a 30-second TTL, so a fixed id
+        would let one run's entry satisfy the next run's first read and the
+        call count would silently come out wrong.
+        """
+        import uuid
+
+        return f"cache-test-{uuid.uuid4().hex}@example.invalid"
+
+    def _counting_calendar(self):
+        calls = []
+
+        class _Counting(FakeCalendar):
+            def get_busy(self, **kwargs):
+                calls.append(kwargs)
+                return super().get_busy(**kwargs)
+
+        return _Counting(), calls
+
+    def test_display_reads_are_served_from_cache(self, cache_id):
+        calendar, calls = self._counting_calendar()
+        args = dict(
+            client=calendar, calendar_id=cache_id, window_start=WINDOW_START,
+            window_end=WINDOW_END, now=NOW, use_cache=True,
+        )
+        get_slots(**args)
+        get_slots(**args)
+
+        assert len(calls) == 1, "the second view should not hit the provider again"
+
+    def test_uncached_reads_always_hit_the_provider(self, cache_id):
+        calendar, calls = self._counting_calendar()
+        args = dict(
+            client=calendar, calendar_id=cache_id, window_start=WINDOW_START,
+            window_end=WINDOW_END, now=NOW,
+        )
+        get_slots(**args)
+        get_slots(**args)
+
+        assert len(calls) == 2
+
+    def test_the_booking_recheck_never_enters_the_cache_layer(self, cache_id):
+        """Caching the safety check would reintroduce the race it prevents.
+
+        Asserted by watching the cache helper rather than counting provider
+        calls: on a miss the cache calls through anyway, so a call count
+        cannot tell the two paths apart.
+        """
+        calendar, _ = self._counting_calendar()
+        session = _RecordingSession()
+
+        with patch("src.services.calendar.booking._cached_busy") as cached, _allow_all():
+            book(
+                client=calendar, session=session, calendar_id=cache_id, slot=_slot(11),
+                attendee_email=ATTENDEE, topic="Intro call",
+            )
+
+        cached.assert_not_called()
+
+
+class TestIntegrityAgainstPostgres:
+    """The guarantees the database enforces, not merely the code.
+
+    A re-check in application code narrows a race; only a constraint closes
+    it. These run against the real schema so a missing index fails here
+    rather than in front of two borrowers.
+    """
+
+    def test_the_slot_index_rejects_a_second_live_booking(self, bookings_db):
+        from sqlalchemy.exc import IntegrityError
+
+        slot = _slot(11)
+        calendar = FakeCalendar()
+        with _allow_all():
+            first = _book(calendar, bookings_db, slot=slot)
+        assert first.booked
+
+        # Bypass book() entirely — this is the database's job, not the code's.
+        # A savepoint contains the expected failure: rolling back the session
+        # outright would take the fixture's own transaction with it.
+        with pytest.raises(IntegrityError):
+            with bookings_db.begin_nested():
+                bookings_db.execute(
+                    text(
+                        "INSERT INTO fa_max_bookings "
+                        "(booking_ref, calendar_id, attendee_email, topic, starts_at, ends_at, status) "
+                        "VALUES ('sneak', :cal, 'other@example.invalid', 'x', :s, :e, 'confirmed')"
+                    ),
+                    {"cal": CALENDAR_ID, "s": slot.start, "e": slot.end},
+                )
+
+    def test_a_cancelled_booking_releases_its_slot(self, bookings_db):
+        slot = _slot(11)
+        calendar = FakeCalendar()
+        with _allow_all():
+            first = _book(calendar, bookings_db, slot=slot)
+
+        bookings_db.execute(
+            text("UPDATE fa_max_bookings SET status='cancelled' WHERE booking_ref=:r"),
+            {"r": first.booking_ref},
+        )
+        calendar.cancel_event(
+            calendar_id=CALENDAR_ID, event_id=first.event.event_id
+        )
+
+        with _allow_all():
+            second = _book(
+                calendar, bookings_db, slot=slot, attendee="other@example.invalid"
+            )
+        assert second.booked, "a cancelled booking must not hold its slot forever"
+
+    def test_replaying_the_same_booking_returns_the_original(self, bookings_db):
+        slot = _slot(11)
+        calendar = FakeCalendar()
+        with _allow_all():
+            first = _book(calendar, bookings_db, slot=slot)
+            replay = _book(calendar, bookings_db, slot=slot)
+
+        assert replay.booked
+        assert replay.booking_ref == first.booking_ref
+        assert replay.reason == "already_booked"
+        assert len(calendar.created) == 1, "a replay must not create a second meeting"
+
+    def test_live_booking_lookup_tracks_the_link(self, bookings_db):
+        from src.services.calendar import has_live_booking
+
+        link_id = bookings_db.execute(
+            text("SELECT id FROM tracked_links ORDER BY id LIMIT 1")
+        ).scalar()
+        if link_id is None:
+            pytest.skip("no tracked_links row to attach to")
+
+        assert not has_live_booking(bookings_db, tracked_link_id=link_id)
+
+        with _allow_all():
+            booked = book(
+                client=FakeCalendar(), session=bookings_db, calendar_id=CALENDAR_ID,
+                slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                tracked_link_id=link_id,
+            )
+        assert booked.booked
+        assert has_live_booking(bookings_db, tracked_link_id=link_id)
+
+        bookings_db.execute(
+            text("UPDATE fa_max_bookings SET status='cancelled' WHERE booking_ref=:r"),
+            {"r": booked.booking_ref},
+        )
+        assert not has_live_booking(bookings_db, tracked_link_id=link_id), (
+            "a cancelled booking must let the borrower use the link again"
+        )
+
+
 class _Result:
     def __init__(self, row):
         self._row = row
@@ -358,15 +516,33 @@ class _Result:
 
 
 class _RecordingSession:
-    """Captures the SQL a call would issue, without a database behind it."""
+    """Captures the SQL a call would issue, without a database behind it.
 
-    def __init__(self, select_row=None):
+    `rows` maps a SQL fragment to the row that query should return, so the
+    idempotency lookup and the reschedule lookup can answer differently
+    within one call.
+    """
+
+    def __init__(self, select_row=None, rows=None):
         self.calls: list[tuple[str, dict]] = []
+        self.commits = 0
+        self.rollbacks = 0
         self._select_row = select_row
+        self._rows = rows or {}
 
     def execute(self, statement, params=None):
-        self.calls.append((" ".join(str(statement).split()), params or {}))
+        sql = " ".join(str(statement).split())
+        self.calls.append((sql, params or {}))
+        for fragment, row in self._rows.items():
+            if fragment in sql:
+                return _Result(row)
         return _Result(self._select_row)
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
 
     def statements_containing(self, fragment: str) -> list[tuple[str, dict]]:
         return [call for call in self.calls if fragment in call[0]]
@@ -380,7 +556,7 @@ class TestWrittenSqlWithoutDatabase:
     migrations/apply_fa_max_bookings.py has been run.
     """
 
-    def test_book_inserts_the_booking(self):
+    def test_book_claims_the_slot_then_confirms_it(self):
         session = _RecordingSession()
         slot = _slot(11)
         with _allow_all():
@@ -388,6 +564,7 @@ class TestWrittenSqlWithoutDatabase:
                 client=FakeCalendar(), session=session, calendar_id=CALENDAR_ID,
                 slot=slot, attendee_email=ATTENDEE, topic="Intro call",
                 person_id="11111111-1111-1111-1111-111111111111",
+                tracked_link_id=99,
             )
 
         inserts = session.statements_containing("INSERT INTO fa_max_bookings")
@@ -399,7 +576,127 @@ class TestWrittenSqlWithoutDatabase:
         assert params["starts_at"] == slot.start
         assert params["ends_at"] == slot.end
         assert params["person_id"] == "11111111-1111-1111-1111-111111111111"
-        assert params["provider_event_id"] == result.event.event_id
+        assert params["tracked_link_id"] == 99
+        assert len(params["idempotency_key"]) == 64
+        assert "'pending'" in inserts[0][0], "the slot is claimed before the event exists"
+
+        confirms = session.statements_containing("SET status = 'confirmed'")
+        assert len(confirms) == 1
+        assert confirms[0][1]["event_id"] == result.event.event_id
+
+    def test_the_claim_is_committed_before_the_provider_is_called(self):
+        """A crash between the two must leave a stray row, never a stray meeting."""
+        commits_at_create = []
+
+        class _WatchingCalendar(FakeCalendar):
+            def create_event(self, **kwargs):
+                commits_at_create.append(session.commits)
+                return super().create_event(**kwargs)
+
+        session = _RecordingSession()
+        with _allow_all():
+            book(
+                client=_WatchingCalendar(), session=session, calendar_id=CALENDAR_ID,
+                slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+            )
+
+        assert commits_at_create == [1], "the claim was not durable before the event"
+
+    def test_idempotency_key_is_stable_for_the_same_booking(self):
+        keys = []
+        for _ in range(2):
+            session = _RecordingSession()
+            with _allow_all():
+                book(
+                    client=FakeCalendar(), session=session, calendar_id=CALENDAR_ID,
+                    slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                )
+            keys.append(
+                session.statements_containing("INSERT INTO fa_max_bookings")[0][1][
+                    "idempotency_key"
+                ]
+            )
+        assert keys[0] == keys[1]
+
+    def test_idempotency_key_differs_by_attendee_and_slot(self):
+        def key_for(slot, attendee):
+            session = _RecordingSession()
+            with _allow_all():
+                book(
+                    client=FakeCalendar(), session=session, calendar_id=CALENDAR_ID,
+                    slot=slot, attendee_email=attendee, topic="Intro call",
+                )
+            return session.statements_containing("INSERT INTO fa_max_bookings")[0][1][
+                "idempotency_key"
+            ]
+
+        base = key_for(_slot(11), ATTENDEE)
+        assert key_for(_slot(14), ATTENDEE) != base
+        assert key_for(_slot(11), "other@example.invalid") != base
+
+    def test_replay_of_a_confirmed_booking_returns_the_original(self):
+        session = _RecordingSession(
+            rows={"SELECT booking_ref, status FROM fa_max_bookings":
+                  {"booking_ref": "ORIG123", "status": "confirmed"}}
+        )
+        calendar = FakeCalendar()
+        with _allow_all():
+            result = book(
+                client=calendar, session=session, calendar_id=CALENDAR_ID,
+                slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+            )
+
+        assert result.booked
+        assert result.booking_ref == "ORIG123"
+        assert result.reason == "already_booked"
+        assert calendar.created == [], "a replay must not create a second meeting"
+
+    def test_replay_of_a_pending_booking_does_not_claim_success(self):
+        session = _RecordingSession(
+            rows={"SELECT booking_ref, status FROM fa_max_bookings":
+                  {"booking_ref": "ORIG123", "status": "pending"}}
+        )
+        calendar = FakeCalendar()
+        with _allow_all():
+            result = book(
+                client=calendar, session=session, calendar_id=CALENDAR_ID,
+                slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+            )
+
+        assert not result.booked, "a pending claim may have no meeting behind it"
+        assert result.reason == "in_progress"
+        assert calendar.created == []
+
+    def test_a_cancelled_booking_does_not_block_rebooking(self):
+        session = _RecordingSession(
+            rows={"SELECT booking_ref, status FROM fa_max_bookings":
+                  {"booking_ref": "OLD123", "status": "cancelled"}}
+        )
+        calendar = FakeCalendar()
+        with _allow_all():
+            result = book(
+                client=calendar, session=session, calendar_id=CALENDAR_ID,
+                slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+            )
+
+        assert result.booked
+        assert result.booking_ref != "OLD123"
+        assert len(calendar.created) == 1
+
+    def test_provider_failure_releases_the_claimed_slot(self):
+        session = _RecordingSession()
+        calendar = FakeCalendar(fail_attendees={ATTENDEE})
+        with _allow_all(), pytest.raises(FakeCalendarError):
+            book(
+                client=calendar, session=session, calendar_id=CALENDAR_ID,
+                slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+            )
+
+        released = session.statements_containing("SET status = 'cancelled'")
+        assert len(released) == 1, (
+            "a pending row holds the slot against everyone else; a failed "
+            "booking must give it back"
+        )
 
     def test_suppressed_book_writes_nothing(self):
         session = _RecordingSession()
@@ -419,7 +716,9 @@ class TestWrittenSqlWithoutDatabase:
                 client=calendar, session=session, calendar_id=CALENDAR_ID, slot=slot,
                 attendee_email=ATTENDEE, topic="Intro call",
             )
-        assert session.calls == []
+        # The idempotency lookup still runs; nothing is written.
+        assert session.statements_containing("INSERT INTO fa_max_bookings") == []
+        assert session.commits == 0
 
     def test_reschedule_marks_status_and_pages_exceptions(self):
         session = _RecordingSession(
