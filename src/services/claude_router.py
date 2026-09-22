@@ -177,6 +177,7 @@ def call_claude_with_usage(
     force_tier: Optional[str] = None,
     tools: Optional[list[dict]] = None,
     tool_choice: Optional[dict] = None,
+    temperature: Optional[float] = None,
 ) -> dict:
     """
     Same as call_claude() but returns a dict that includes token counts and
@@ -219,6 +220,9 @@ def call_claude_with_usage(
             ]
         else:
             kwargs["system"] = system
+
+    if temperature is not None:
+        kwargs["temperature"] = temperature
 
     if tools:
         kwargs["tools"] = tools
