@@ -1688,8 +1688,12 @@ async def slack_interact(request: Request, background_tasks: BackgroundTasks, db
     # view_submission (WP-T2-2 Revise modal) arrives at this same
     # Interactivity Request URL, not as a "block_actions" payload with an
     # `actions` list — it must be checked before indexing into `actions`.
-    if payload.get("type") == "view_submission" and payload.get("view", {}).get("callback_id") == "fa_max_revise_submit":
-        return _handle_relay_revise_submission(payload)
+    if payload.get("type") == "view_submission":
+        callback_id = payload.get("view", {}).get("callback_id")
+        if callback_id == "fa_max_revise_submit":
+            return _handle_relay_revise_submission(payload)
+        if callback_id == "fa_max_log_submission_submit":
+            return _handle_log_submission_view_submit(payload, db)
 
     # block_suggestion (external_select live search) also arrives at this
     # same Interactivity Request URL, with neither an "actions" list nor a
@@ -2396,6 +2400,85 @@ def _handle_relay_revise_submission(payload: dict) -> dict:
             "revised_content_block": "Revision saved, but Slack could not refresh the approval card. Reopen Revise and submit again before approval."
         }}
     return {"response_action": "clear"}
+
+
+def _handle_log_submission_view_submit(payload: dict, db: Session) -> dict:
+    """Slack `/fa-max-log-submission` modal submission (WP-T2-6 addendum,
+    Task 19). This is the moment Josh tells the system he already submitted
+    a deal to Backflip -- it creates/links the borrower, creates a new
+    opportunity, jumps it straight to 'submitted' via the admin-override
+    transition path (the deal already happened outside our normal funnel),
+    and records backflip_ref if given.
+
+    person_id for the "existing borrower" path is read from
+    view.state.values, not private_metadata: the modal's borrower_search
+    external_select has no dispatch_action, so Slack only reports the
+    selection at submission time, inside `values` -- exactly like every
+    other select block in this modal (e.g. opportunity_type_block).
+    """
+    from src.services import fa_max_file_state, state_engine
+
+    view = payload["view"]
+    metadata = json.loads(view.get("private_metadata") or "{}")
+    values = view["state"]["values"]
+
+    def _field(block_id: str, action_id: str) -> str:
+        block = values.get(block_id, {}).get(action_id, {})
+        return (block.get("value") or block.get("selected_option", {}).get("value") or "").strip()
+
+    if metadata.get("mode") == "new_borrower":
+        full_name = _field("new_full_name_block", "new_full_name")
+        if not full_name:
+            return {
+                "response_action": "errors",
+                "errors": {"new_full_name_block": "Borrower name is required."},
+            }
+        email = _field("new_email_block", "new_email") or None
+        phone = _field("new_phone_block", "new_phone") or None
+        person_row = db.execute(
+            text(
+                "INSERT INTO fa_max_persons (source, full_name, email, phone) "
+                "VALUES ('manual_submission_modal', :name, :email, :phone) "
+                "RETURNING person_id"
+            ),
+            {"name": full_name, "email": email, "phone": phone},
+        ).fetchone()
+        db.commit()
+        person_id = str(person_row.person_id)
+    else:
+        person_id = _field("borrower_search_block", "borrower_search")
+        if not person_id:
+            return {
+                "response_action": "errors",
+                "errors": {"borrower_search_block": "Select a borrower or choose \"new borrower\"."},
+            }
+
+    opportunity_type = _field("opportunity_type_block", "opportunity_type")
+    opportunity_id = state_engine.create_fa_max_opportunity(
+        session=db, person_id=person_id, opportunity_type=opportunity_type,
+        source="manual_submission_modal",
+    )
+
+    user_id = payload.get("user", {}).get("id", "unknown")
+    state_engine.transition(
+        session=db, entity_type="opportunity", entity_uuid=opportunity_id,
+        from_state="new", to_state="submitted",
+        actor="user:josh", source_component="src.api.admin_router",
+        idempotency_key=f"log_submission:{opportunity_id}:submitted",
+        validate_allowed_next=False,
+        context={"reason": "manual log of an already-completed Backflip submission via Slack modal",
+                 "recorded_by_slack_user": user_id},
+    )
+
+    fa_max_file_state.ensure_file_state(db, opportunity_id=opportunity_id, person_id=person_id)
+
+    backflip_ref = _field("backflip_ref_block", "backflip_ref") or None
+    if backflip_ref:
+        fa_max_file_state.record_terms(
+            db, opportunity_id=opportunity_id, actor="user:josh", backflip_ref=backflip_ref,
+        )
+
+    return {}
 
 
 # ===========================================================================
