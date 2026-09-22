@@ -1,21 +1,29 @@
-"""WP-T2-12 — Card-Thread Fallback Responder.
+"""WP-T2-12 — FA Max Slack LLM Responder.
 
-Handles non-approve/reject replies from the authorized approver inside FA-Max
-Relay card threads. Classifies intent via a single Haiku call, then either:
+Answers plain-English operator questions in FA Max Slack lanes. Two entry points,
+one shared classify/respond core:
 
-  - Answers with a parameterized read-only catalog query (simple_lookup), or
-  - Posts a pointer to the Command Center channel (cc_query), or
-  - Acknowledges and logs (other).
+  - handle_thread_fallback_reply: a non-approve/reject reply inside a relay card
+    thread (acks 'other' so the typed reply is acknowledged).
+  - handle_channel_message: any top-level message in a mapped lane channel
+    (MONEY/EXCEPTIONS/RELATIONSHIPS/CC); stays silent on 'other' so ordinary
+    channel chatter isn't answered.
+
+Both classify intent via a single Haiku call, then either:
+
+  - Answer with a parameterized read-only catalog query (simple_lookup), or
+  - Post a pointer to the Command Center channel (cc_query), or
+  - Acknowledge / stay silent and log (other).
 
 All DB reads use hardcoded parameterized sqlalchemy.text() queries — no LLM-authored SQL,
 no free SELECT. Execution is wrapped in _execute_catalog_query() following the
 command_center/db_tool.py never-raises, returns-dict pattern.
 
-Writes one audit row to fa_max_thread_fallback_log per invocation.
-In-thread posting goes through slack_post.post_thread_note.
+Writes one audit row to fa_max_thread_fallback_log per invocation (relay_item_id
+is NULL for channel messages). Posting goes through slack_post.post_note.
 
-Called from admin_router._handle_relay_thread_action (strict else-branch after the
-existing approve/reject + pending-revision precedence).
+Authorized-approver gating is enforced by the caller
+(admin_router._handle_relay_thread_action).
 """
 from __future__ import annotations
 
@@ -447,22 +455,25 @@ def _run_catalog_lookup(result: ClassifyResult, db: Session) -> str:
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def handle_thread_fallback_reply(item: Any, event: dict) -> None:
-    """Orchestrate classify → answer/redirect/ack for a non-command thread reply.
+def _classify_and_respond(
+    *,
+    raw_text: str,
+    user_id: str,
+    lane: str,
+    audit_thread_ts: str,
+    relay_item_id: Optional[int],
+    silent_other: bool,
+) -> Optional[str]:
+    """Classify one message, build the reply, and write the audit row.
 
-    Called from admin_router._handle_relay_thread_action (strict else-branch,
-    authorized approver only). Never raises — all errors are logged.
+    Returns the reply text to post, or None when nothing should be posted
+    (silent_other and the message classified as 'other'). Never raises.
 
-    Args:
-        item: relay_approval_queue ORM row (has .id, .slack_message_ts, .venture_key).
-        event: Slack event dict from the socket payload.
+    Shared by the card-thread path (handle_thread_fallback_reply) and the
+    channel path (handle_channel_message); the caller owns where to post.
     """
     from src.core.database import get_db_context
     from config.settings import get_settings
-
-    raw_text: str = str(event.get("text") or "").strip()
-    user_id: str = str(event.get("user") or "")
-    thread_ts: str = str(item.slack_message_ts or "")
 
     tokens_in = tokens_out = 0
     cost_usd = 0.0
@@ -473,15 +484,9 @@ def handle_thread_fallback_reply(item: Any, event: dict) -> None:
     try:
         settings = get_settings()
 
-        # ── 1. Classify ──────────────────────────────────────────────────────
         classify_resp = call_claude_with_usage(
             task_type="fa_max_thread_fallback",
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"DATA: {raw_text}",
-                }
-            ],
+            messages=[{"role": "user", "content": f"DATA: {raw_text}"}],
             system=_CLASSIFY_SYSTEM,
             max_tokens=256,
         )
@@ -494,14 +499,11 @@ def handle_thread_fallback_reply(item: Any, event: dict) -> None:
         bucket = classify_result.bucket
         lookup_id = classify_result.lookup_id
 
-        # ── 2. Build reply ───────────────────────────────────────────────────
-        # CC channel: CC_SLACK_CHANNEL env var takes precedence over RELATIONSHIPS.
         cc_channel = (
             settings.cc_slack_channel
             or settings.fa_max_slack_channel_relationships
             or ""
         )
-        lane: str = getattr(item, "lane", "") or ""
 
         with get_db_context() as db:
             if bucket == Bucket.SIMPLE_LOOKUP:
@@ -513,9 +515,9 @@ def handle_thread_fallback_reply(item: Any, event: dict) -> None:
 
             _write_audit_log(
                 db=db,
-                relay_item_id=item.id,
+                relay_item_id=relay_item_id,
                 slack_user_id=user_id,
-                thread_ts=thread_ts,
+                thread_ts=audit_thread_ts,
                 lane=lane,
                 raw_text=raw_text,
                 bucket=bucket,
@@ -526,14 +528,65 @@ def handle_thread_fallback_reply(item: Any, event: dict) -> None:
                 cost_usd=cost_usd,
             )
 
-        # ── 3. Post reply in-thread via slack_post abstraction ───────────────
-        from src.services.relay.slack_post import post_thread_note
-        post_thread_note(item, reply_text)
+        if silent_other and bucket == Bucket.OTHER:
+            return None
+        return reply_text
 
     except Exception as exc:
         logger.error(
-            "[ThreadFallback] unhandled error for item %s user %s: %s",
-            getattr(item, "id", "?"),
-            user_id,
-            exc,
+            "[ThreadFallback] classify/respond error (item=%s user=%s): %s",
+            relay_item_id, user_id, exc,
         )
+        return None
+
+
+def handle_thread_fallback_reply(item: Any, event: dict) -> None:
+    """Card-thread path: a non-approve/reject reply inside a relay card thread.
+
+    Authorized-approver only (enforced by the caller). Acks 'other' replies so
+    the approver knows the typed reply was seen. Never raises.
+    """
+    reply = _classify_and_respond(
+        raw_text=str(event.get("text") or "").strip(),
+        user_id=str(event.get("user") or ""),
+        lane=getattr(item, "lane", "") or "",
+        audit_thread_ts=str(item.slack_message_ts or ""),
+        relay_item_id=item.id,
+        silent_other=False,
+    )
+    if reply is None:
+        return
+    from src.services.relay.slack_post import post_thread_note
+    post_thread_note(item, reply)
+
+
+def handle_channel_message(
+    *, event: dict, venture_key: str, lane: str, channel: str
+) -> None:
+    """Channel path: any top-level message in a mapped FA Max lane channel.
+
+    Authorized-approver only (enforced by the caller). Replies threaded under
+    the operator's own message. Stays silent on 'other' (greetings/thanks) so
+    ordinary channel chatter isn't answered. Never raises.
+    """
+    # Thread the reply under the message itself; if it's already a reply in a
+    # non-card thread, stay in that thread.
+    reply_thread_ts = str(event.get("thread_ts") or event.get("ts") or "")
+
+    reply = _classify_and_respond(
+        raw_text=str(event.get("text") or "").strip(),
+        user_id=str(event.get("user") or ""),
+        lane=lane,
+        audit_thread_ts=reply_thread_ts,
+        relay_item_id=None,
+        silent_other=True,
+    )
+    if reply is None:
+        return
+    from src.services.relay.slack_post import post_note
+    post_note(
+        venture_key=venture_key,
+        channel=channel,
+        thread_ts=reply_thread_ts,
+        text=reply,
+    )

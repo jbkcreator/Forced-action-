@@ -75,31 +75,56 @@ def _resolve_bot_token(item: QueueItem, settings):
     return settings.slack_bot_token
 
 
-def post_thread_note(item: QueueItem, text: str) -> None:
-    """Post a plain-text reply inside the item's existing card thread.
+def _resolve_bot_token_for_venture(venture_key: str, settings):
+    """Bot token for a venture without needing a QueueItem (WP-T2-12 channel path)."""
+    if venture_key == _FA_MAX_VENTURE:
+        return getattr(settings, "fa_max_slack_bot_token", None)
+    return settings.slack_bot_token
 
-    Used by WP-T2-12 (thread fallback responder) to reply inline without
-    creating a new card. Best-effort — logs and returns on any error.
+
+def post_note(*, venture_key: str, channel: str, thread_ts: str, text: str) -> None:
+    """Post a plain-text reply into `channel`, threaded under `thread_ts`.
+
+    The general in-channel poster used by the WP-T2-12 FA Max Slack responder.
+    Works with or without an originating card — the caller supplies the channel
+    and the ts to thread under. Best-effort: logs and returns on any error.
     """
     settings = get_settings()
-    token = _resolve_bot_token(item, settings)
-    channel = _resolve_channel(item, settings)
-    if not token or not channel or not item.slack_message_ts:
+    token = _resolve_bot_token_for_venture(venture_key, settings)
+    if not token or not channel or not thread_ts:
         logger.warning(
-            "[slack_post.post_thread_note] missing token/channel/ts for item %s", item.id
+            "[slack_post.post_note] missing token/channel/ts (venture=%s channel=%s)",
+            venture_key, channel,
         )
         return
     try:
         from slack_sdk import WebClient
         WebClient(token=token.get_secret_value()).chat_postMessage(
-            channel=channel,
-            thread_ts=item.slack_message_ts,
-            text=text,
+            channel=channel, thread_ts=thread_ts, text=text,
         )
     except Exception as exc:
-        logger.error(
-            "[slack_post.post_thread_note] post failed for item %s: %s", item.id, exc
+        logger.error("[slack_post.post_note] post failed (channel=%s): %s", channel, exc)
+
+
+def post_thread_note(item: QueueItem, text: str) -> None:
+    """Post a plain-text reply inside the item's existing card thread.
+
+    Thin wrapper over post_note for the card-thread path — resolves the channel
+    and venture from the QueueItem. Best-effort — logs and returns on any error.
+    """
+    settings = get_settings()
+    channel = _resolve_channel(item, settings)
+    if not channel or not item.slack_message_ts:
+        logger.warning(
+            "[slack_post.post_thread_note] missing channel/ts for item %s", item.id
         )
+        return
+    post_note(
+        venture_key=item.venture_key,
+        channel=channel,
+        thread_ts=item.slack_message_ts,
+        text=text,
+    )
 
 
 def post_for_approval(item: QueueItem) -> None:

@@ -11938,17 +11938,19 @@ class FaMaxArvResult(Base):
 
 
 class FaMaxThreadFallbackLog(Base):
-    """Audit log for WP-T2-12 card-thread fallback responder.
+    """Audit log for WP-T2-12 FA Max Slack LLM responder.
 
-    One row per invocation — every non-approve/reject authorized-approver thread
-    reply that reaches the fallback responder. Feeds catalog tuning and human
+    One row per invocation — every authorized-approver message the responder
+    classifies, whether a card-thread reply (relay_item_id set) or a top-level
+    channel message (relay_item_id NULL). Feeds catalog tuning and human
     follow-up on 'other' bucket rows.
     """
 
     __tablename__ = "fa_max_thread_fallback_log"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    relay_item_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # NULL for top-level channel messages (no originating card).
+    relay_item_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     slack_user_id: Mapped[str] = mapped_column(String(60), nullable=False)
     thread_ts: Mapped[str] = mapped_column(String(40), nullable=False)
     lane: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)

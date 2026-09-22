@@ -224,3 +224,81 @@ class TestCatalogMembership:
             raw = json.dumps({"bucket": "simple_lookup", "lookup_id": bad_id, "params": {}})
             result = _parse_classify_response(raw)
             assert result.bucket == Bucket.CC_QUERY, f"{bad_id!r} should redirect to CC"
+
+
+# ---------------------------------------------------------------------------
+# Channel-level path (WP-T2-12 channel extension) — handle_channel_message
+# ---------------------------------------------------------------------------
+
+def _classify_stub(bucket_value: str, lookup_id=None, params=None):
+    """Return a fake call_claude_with_usage response classifying to bucket_value."""
+    return {
+        "text": json.dumps({
+            "bucket": bucket_value,
+            "lookup_id": lookup_id,
+            "params": params or {},
+        }),
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "cost_usd": 0.0001,
+    }
+
+
+class TestHandleChannelMessage:
+    """The channel path answers real questions, stays silent on 'other',
+    posts via post_note, and audits with relay_item_id=NULL."""
+
+    def _run(self, text, classify_resp):
+        event = {
+            "type": "message", "user": "U_APPROVER", "channel": "C_RELATIONSHIPS",
+            "ts": "1790000000.000100", "text": text,
+        }
+        with patch(
+            "src.services.relay.thread_fallback_responder.call_claude_with_usage",
+            return_value=classify_resp,
+        ), patch(
+            "src.core.database.get_db_context"
+        ) as mock_db_ctx, patch(
+            "src.services.relay.thread_fallback_responder._write_audit_log"
+        ) as mock_audit, patch(
+            "src.services.relay.thread_fallback_responder._run_catalog_lookup",
+            return_value="Open opportunities: 5 green.",
+        ), patch(
+            "src.services.relay.slack_post.post_note"
+        ) as mock_post:
+            mock_db_ctx.return_value.__enter__.return_value = MagicMock()
+            from src.services.relay.thread_fallback_responder import handle_channel_message
+            handle_channel_message(
+                event=event, venture_key="fa_max_lending",
+                lane="RELATIONSHIPS", channel="C_RELATIONSHIPS",
+            )
+            return mock_post, mock_audit
+
+    def test_simple_lookup_posts_answer(self):
+        post, audit = self._run(
+            "how many green deals?", _classify_stub("simple_lookup", "count_by_color", {"color": "green"})
+        )
+        post.assert_called_once()
+        kwargs = post.call_args.kwargs
+        assert kwargs["channel"] == "C_RELATIONSHIPS"
+        assert kwargs["venture_key"] == "fa_max_lending"
+        assert kwargs["thread_ts"] == "1790000000.000100"
+        assert "green" in kwargs["text"].lower()
+
+    def test_cc_query_posts_redirect(self):
+        post, _ = self._run("evaluate this deal", _classify_stub("cc_query"))
+        post.assert_called_once()
+        # Redirect wording is stable regardless of whether a CC channel is set.
+        assert "pipeline-intelligence" in post.call_args.kwargs["text"].lower()
+
+    def test_other_stays_silent(self):
+        """Greetings/thanks must NOT get a channel reply."""
+        post, audit = self._run("thanks!", _classify_stub("other"))
+        post.assert_not_called()
+        # Still audited — silence is logged, not invisible.
+        audit.assert_called_once()
+
+    def test_audit_relay_item_id_is_none(self):
+        _, audit = self._run("how many reds?", _classify_stub("simple_lookup", "count_by_color", {"color": "red"}))
+        assert audit.call_args.kwargs["relay_item_id"] is None
+        assert audit.call_args.kwargs["lane"] == "RELATIONSHIPS"
