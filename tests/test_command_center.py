@@ -83,9 +83,27 @@ class TestValidateSql:
             validate_sql(sql)
 
     def test_select_from_allowed_tables(self):
-        for table in ["buyer_entities", "outbound_drafts", "lender_box_programs", "lender_box_geographies"]:
+        for table in [
+            "buyer_entities", "outbound_drafts", "lender_box_programs",
+            "lender_box_geographies", "fa_max_persons", "fa_max_opportunities",
+        ]:
             sql = f"SELECT id FROM {table} LIMIT 1"
             assert validate_sql(sql) == sql
+
+    def test_fa_max_tables_join_passes(self):
+        sql = (
+            "SELECT o.opportunity_id, o.current_stage, p.full_name FROM fa_max_opportunities o "
+            "JOIN fa_max_persons p ON p.person_id = o.person_id "
+            "WHERE p.merged_into_id IS NULL LIMIT 10"
+        )
+        assert validate_sql(sql) == sql
+
+    def test_fa_max_tables_in_schema_description(self):
+        from src.agents.cora.command_center.db_tool import schema_description
+        description = schema_description()
+        assert "fa_max_persons" in description
+        assert "fa_max_opportunities" in description
+        assert "backflip_ref" in description
 
     def test_update_rejected(self):
         with pytest.raises(ValueError, match="Only SELECT"):
