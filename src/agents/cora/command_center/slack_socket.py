@@ -18,11 +18,12 @@ from __future__ import annotations
 import logging
 import re
 import threading
+import time
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-_BOT_USER_ID = "U0C2GT5CDGA"
+_BOT_USER_ID: Optional[str] = None  # resolved at startup via auth.test
 _LISTEN_CHANNEL = None  # None = all channels the bot is in; set to filter
 
 
@@ -109,7 +110,29 @@ def run_socket_mode(stop_event: threading.Event) -> None:
         logger.error("cc.socket: FA_MAX_SLACK_BOT_TOKEN not set")
         return
 
-    web_client = WebClient(token=settings.fa_max_slack_bot_token.get_secret_value())
+    bot_token = settings.fa_max_slack_bot_token.get_secret_value()
+    web_client = WebClient(token=bot_token)
+
+    global _BOT_USER_ID
+    for attempt in range(1, 4):
+        try:
+            auth = web_client.auth_test()
+            _BOT_USER_ID = auth["user_id"]
+            logger.info("cc.socket: bot user_id resolved via auth.test: %s", _BOT_USER_ID)
+            break
+        except Exception as exc:
+            logger.warning(
+                "cc.socket: auth.test failed (attempt %d/3): %s", attempt, exc,
+            )
+            if attempt < 3:
+                time.sleep(2 * attempt)
+    else:
+        logger.error(
+            "cc.socket: auth.test failed after 3 attempts — refusing to start Socket "
+            "Mode without a self-reply filter (fail closed)"
+        )
+        return
+
     client = SocketModeClient(app_token=app_token, web_client=web_client)
 
     def _on_event(socket_client: SocketModeClient, req: SocketModeRequest) -> None:

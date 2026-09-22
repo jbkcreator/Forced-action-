@@ -847,6 +847,11 @@ class AppSettings(BaseSettings):
 	fa_max_slack_channel_money: str = Field(default="", env="FA_MAX_SLACK_CHANNEL_MONEY")
 	fa_max_slack_channel_exceptions: str = Field(default="", env="FA_MAX_SLACK_CHANNEL_EXCEPTIONS")
 	fa_max_slack_channel_relationships: str = Field(default="", env="FA_MAX_SLACK_CHANNEL_RELATIONSHIPS")
+	# WP-T2-11: minimum expected revenue (cents) for an in-box opportunity to be green.
+	# Confirm launch value with Josh; placeholder = $150 commission dollars (15% × ~$1k).
+	fa_max_gyr_green_min_expected_revenue_cents: int = Field(
+		default=15000, env="FA_MAX_GYR_GREEN_MIN_EXPECTED_REVENUE_CENTS"
+	)
 	fa_max_backflip_feed_max_age_hours: int = Field(default=24, ge=1, env="FA_MAX_BACKFLIP_FEED_MAX_AGE_HOURS")
 	backflip_webhook_secret: Optional[SecretStr] = Field(default=None, env="BACKFLIP_WEBHOOK_SECRET")
 

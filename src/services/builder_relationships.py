@@ -57,7 +57,7 @@ def is_relationships_candidate(hit: BuilderHit) -> bool:
 
 def _format_loan(amount: Optional[Decimal]) -> str:
     if amount is None:
-        return "_Unknown_"
+        return "—"
     m = amount / Decimal("1_000_000")
     if m >= Decimal("1"):
         return f"${m:.2f}M"
@@ -78,8 +78,10 @@ def build_relationships_blocks(
     primary/ghost action buttons, dividers for structure.
     """
     pattern_label = _PATTERN_LABELS.get(hit.pattern, hit.pattern)
-    loan_str = _format_loan(sizing.estimated_loan if sizing else None)
-    confidence_str = sizing.confidence if sizing else "unknown"
+    estimated_loan = sizing.estimated_loan if sizing else None
+    loan_str = _format_loan(estimated_loan)
+    confidence_str = (sizing.confidence if sizing else None) if estimated_loan is not None else None
+    sizing_source = (sizing.sizing_source if sizing else None) or None
     permit_count = _permit_count(hit)
     county_str = hit.county_id.replace("_", " ").title() if hit.county_id else "Unknown county"
     date_str = (
@@ -116,7 +118,11 @@ def build_relationships_blocks(
                 },
                 {
                     "type": "mrkdwn",
-                    "text": f"*Est. Loan Size*\n{loan_str}  _{confidence_str}_",
+                    "text": (
+                        f"*Est. Loan Size*\n{loan_str}  _{confidence_str}_"
+                        if confidence_str
+                        else f"*Est. Loan Size*\n{loan_str}"
+                    ),
                 },
                 {
                     "type": "mrkdwn",
@@ -124,7 +130,7 @@ def build_relationships_blocks(
                 },
                 {
                     "type": "mrkdwn",
-                    "text": f"*Sizing Source*\n_{sizing.sizing_source if sizing else 'none'}_",
+                    "text": f"*Sizing Source*\n_{sizing_source}_" if sizing_source and sizing_source != "none" else "*Sizing Source*\n—",
                 },
             ],
         },
