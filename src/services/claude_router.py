@@ -80,6 +80,8 @@ _TASK_ROUTING: dict[str, str] = {
     "cora_cc_guard":  "haiku",   # intent classification / injection detection
     "cora_cc_query":  "sonnet",  # agentic loop + final answer synthesis
     "cora_cc_compact": "haiku",  # history compaction summary
+    # FA Max thread fallback responder (WP-T2-12) — intent classify, Haiku is sufficient
+    "fa_max_thread_fallback": "haiku",
     # Opus — explicit override, edge cases only
     "edge_case": "opus",
 }

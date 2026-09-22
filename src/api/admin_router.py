@@ -1739,13 +1739,16 @@ def _handle_relay_thread_action(payload: dict) -> None:
     approval is refused; the approver must use the refreshed button, whose
     revision count is checked atomically with the decision. This remains
     safe if Slack failed to refresh the card.
+
+    Non-approve/reject replies from the authorized approver are handled by
+    the WP-T2-12 fallback responder (classify → answer / redirect / ack).
+    Replies from unauthorized users are silently dropped regardless of text.
     """
     event = payload.get("event") or {}
     if event.get("type") != "message" or event.get("subtype") or event.get("bot_id"):
         return
     command = str(event.get("text") or "").strip().casefold()
-    if command not in {"approve", "reject"}:
-        return
+    is_command = command in {"approve", "reject"}
     thread_ts = event.get("thread_ts")
     user_id = event.get("user")
     if not thread_ts or not user_id:
@@ -1753,6 +1756,14 @@ def _handle_relay_thread_action(payload: dict) -> None:
     from src.services.relay import queue as relay_queue
     item = relay_queue.get_item_by_slack_message_ts(str(thread_ts))
     if item is None or not _relay_approver_authorized(str(user_id), item.venture_key):
+        return
+    # WP-T2-12: authorized approver sent a non-command reply — invoke fallback
+    # responder (classify → catalog lookup / CC redirect / ack). This branch is
+    # the strict else after approve/reject; it never reaches the revision guard
+    # or _handle_relay_decision below.
+    if not is_command:
+        from src.services.relay.thread_fallback_responder import handle_thread_fallback_reply
+        handle_thread_fallback_reply(item, event)
         return
     # A typed reply carries no revision token. For a revised FA Max draft,
     # require the refreshed button's atomic revision check instead.

@@ -11935,3 +11935,38 @@ class FaMaxArvResult(Base):
             "status IN ('computed','superseded')", name="ck_fa_max_arv_status"
         ),
     )
+
+
+class FaMaxThreadFallbackLog(Base):
+    """Audit log for WP-T2-12 card-thread fallback responder.
+
+    One row per invocation — every non-approve/reject authorized-approver thread
+    reply that reaches the fallback responder. Feeds catalog tuning and human
+    follow-up on 'other' bucket rows.
+    """
+
+    __tablename__ = "fa_max_thread_fallback_log"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    relay_item_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    slack_user_id: Mapped[str] = mapped_column(String(60), nullable=False)
+    thread_ts: Mapped[str] = mapped_column(String(40), nullable=False)
+    raw_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    bucket: Mapped[str] = mapped_column(String(20), nullable=False)
+    lookup_id: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
+    reply_sent: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    tokens_in: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    tokens_out: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    cost_usd: Mapped[Optional[float]] = mapped_column(Numeric(12, 6), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "bucket IN ('simple_lookup','cc_query','other')",
+            name="ck_fa_max_thread_fallback_bucket",
+        ),
+        Index("ix_fa_max_thread_fallback_relay_item", "relay_item_id"),
+        Index("ix_fa_max_thread_fallback_created", "created_at"),
+    )
