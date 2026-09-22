@@ -84,7 +84,7 @@ def poll_backflip_mailbox(session: Session) -> int:
     sender_domain = settings.fa_max_backflip_notification_sender_domain
 
     if not mailbox_email or not app_password or not sender_domain:
-        logger.info(
+        logger.debug(
             "backflip_mailbox_poller: not configured (mailbox_email/app_password/"
             "sender_domain) -- no-op"
         )
@@ -99,7 +99,7 @@ def poll_backflip_mailbox(session: Session) -> int:
             conn.login(mailbox_email, app_password.get_secret_value())
             conn.select("INBOX")
             _, data = conn.search(None, f'(UNSEEN FROM "{sender_domain}")')
-            uids = data[0].split()
+            uids = (data[0] or b"").split()
             logger.info(
                 "backflip_mailbox_poller: poll start -- %d unread from %s",
                 len(uids), sender_domain,
@@ -116,6 +116,7 @@ def poll_backflip_mailbox(session: Session) -> int:
                         "backflip_mailbox_poller: error processing uid=%s: %s",
                         uid, exc, exc_info=True,
                     )
+                    session.rollback()
     except (imaplib.IMAP4.error, OSError) as exc:
         logger.error("backflip_mailbox_poller: IMAP failure: %s", exc, exc_info=True)
         return processed
