@@ -131,6 +131,11 @@ COUNTY_ID=hillsborough
 # sends on back-to-back runs.
 */15 * * * * cd $PROJECT && PYTHONPATH=. python scripts/run_stage_monitor_worker.py >> /var/log/fa/stage_monitor_worker.log 2>&1
 
+# WP-T2-6 Addendum 2 -- Backflip notification poll (Josh's own mailbox,
+# IMAP + app password). No-ops until FA_MAX_BACKFLIP_MAILBOX_EMAIL/
+# _APP_PASSWORD/_NOTIFICATION_SENDER_DOMAIN are all confirmed and set.
+*/15 * * * * cd $PROJECT && PYTHONPATH=. python scripts/run_backflip_mailbox_poller.py >> /var/log/fa/backflip_mailbox_poller.log 2>&1
+
 # Quora S6 organic-answer pipeline — 06:35 AM UTC daily (after load validator).
 # Picks one keyword via DB rotation (quora_topics + cooldown_days), scrapes Quora,
 # publishes to Cora for classification + answer drafting, upserts to quora_questions.
