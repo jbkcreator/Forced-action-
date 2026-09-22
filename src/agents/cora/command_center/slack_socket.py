@@ -23,7 +23,15 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 _BOT_USER_ID = "U0C2GT5CDGA"
-_LISTEN_CHANNEL = None  # None = all channels the bot is in; set to filter
+
+
+def _listen_channel() -> Optional[str]:
+    """Command Center is restricted to the one channel Josh uses to manage
+    his whole FA Max pipeline (submissions, status updates, questions) —
+    client decision, WP-T2-6 addendum Task 21. Read live (not cached at
+    import time) so a settings change takes effect without a restart."""
+    from config.settings import get_settings
+    return get_settings().fa_max_slack_cc_channel
 
 
 def _get_app_token() -> Optional[str]:
@@ -53,7 +61,8 @@ def _handle_message(event: dict) -> None:
         return
     if user_id == _BOT_USER_ID:
         return
-    if _LISTEN_CHANNEL and channel != _LISTEN_CHANNEL:
+    listen_channel = _listen_channel()
+    if listen_channel and channel != listen_channel:
         return
 
     # Strip @-mention prefix — handled in guard too, but clean here for session key

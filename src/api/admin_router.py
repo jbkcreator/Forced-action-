@@ -35,7 +35,7 @@ from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import and_, case, distinct, func, or_, select, text
 from sqlalchemy.orm import Session
 
-from config.settings import settings
+from config.settings import get_settings, settings
 from config.venture_template import DEFAULT_VENTURE_KEY
 from src.api.deps import get_db, VALID_TIERS, VALID_VERTICALS, ZIP_RE
 from src.core.database import get_db_context
@@ -1636,6 +1636,25 @@ def _slack_ephemeral(text: str) -> dict:
     return {"response_type": "ephemeral", "text": text}
 
 
+def _reject_if_wrong_command_channel(form: dict) -> Optional[dict]:
+    """Shared gate for both FA Max pipeline slash commands, per the
+    client's decision that the Command Center channel is where Josh
+    manages submissions, status updates, and questions — all of it, one
+    place. Unset setting means the channel hasn't been configured yet and
+    fails OPEN (never lock Josh out of his own commands before the
+    channel ID exists) — see plan Task 21's design note.
+    """
+    required_channel = get_settings().fa_max_slack_cc_channel
+    if not required_channel:
+        return None
+    actual_channel = form.get("channel_id", [""])[0]
+    if actual_channel == required_channel:
+        return None
+    return _slack_ephemeral(
+        "Please use this command in the Command Center channel (#fa-max-command-center), not here."
+    )
+
+
 def _handle_borrower_search_suggestion(payload: dict, db: Session) -> dict:
     """block_suggestion handler for the log-submission modal's borrower
     external_select (Task 18). Slack's options[].text.text field has a 75
@@ -3109,6 +3128,9 @@ async def slack_fa_max_file_update_command(request: Request, db: Session = Depen
         raise HTTPException(status_code=401, detail="Invalid Slack signature")
 
     form = parse_qs(raw.decode("utf-8"))
+    channel_rejection = _reject_if_wrong_command_channel(form)
+    if channel_rejection is not None:
+        return channel_rejection
     user_id = form.get("user_id", [""])[0]
     if not _relay_approver_authorized(user_id, "fa_max_lending"):
         return _slack_ephemeral("Not authorized to update FA Max file state.")
@@ -3196,6 +3218,9 @@ async def slack_log_submission_command(request: Request):
         raise HTTPException(status_code=401, detail="Invalid Slack signature")
 
     form = parse_qs(raw.decode("utf-8"))
+    channel_rejection = _reject_if_wrong_command_channel(form)
+    if channel_rejection is not None:
+        return channel_rejection
     user_id = form.get("user_id", [""])[0]
     if not _relay_approver_authorized(user_id, "fa_max_lending"):
         return _slack_ephemeral("Not authorized to log a Backflip submission.")
