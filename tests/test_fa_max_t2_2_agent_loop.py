@@ -263,7 +263,14 @@ class TestConsolidatedProductionPaths:
 class TestFaMaxToolRegistry:
     def test_all_expected_tools_registered(self):
         from src.agents.fa_max.tool_registry import FA_MAX_TOOL_REGISTRY
-        expected = {"get_fa_max_person_state", "get_fa_max_person_history", "check_suppression", "send", "post_slack"}
+        # Exact equality, not a subset check: the point is to catch a tool
+        # registered by accident. Each Tier 2 package that ships a tool adds
+        # it here deliberately — the calendar entries arrived with scheduling.
+        expected = {
+            "get_fa_max_person_state", "get_fa_max_person_history", "check_suppression",
+            "send", "post_slack",
+            "calendar.get_slots", "calendar.book", "calendar.reschedule",
+        }
         assert expected == set(FA_MAX_TOOL_REGISTRY.keys())
 
     def test_send_requires_send_gate(self):

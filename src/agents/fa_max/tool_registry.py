@@ -112,6 +112,21 @@ def _select_single_task_tool(intent: str, context: dict) -> dict:
     elif "slack" in intent:
         name = "post_slack"
         args = {"item_id": context["item_id"]} if "item_id" in context else {}
+    # Checked before "book": "reschedule the booking" matches both, and only
+    # the reschedule reading of it is correct.
+    elif "reschedule" in intent:
+        name = "calendar.reschedule"
+        args = {key: context[key] for key in ("booking_ref", "calendar_id") if key in context}
+    elif "book" in intent:
+        name = "calendar.book"
+        args = {key: context[key] for key in (
+            "starts_at", "ends_at", "attendee_email", "topic", "person_id", "calendar_id",
+        ) if key in context}
+    elif "slot" in intent or "availability" in intent:
+        name = "calendar.get_slots"
+        args = {key: context[key] for key in (
+            "window_start", "window_end", "duration_minutes", "include_weekends", "calendar_id",
+        ) if key in context}
     else:
         raise ValueError(f"unsupported_task_description:{intent!r}")
     if name not in FA_MAX_TOOL_REGISTRY:
@@ -123,6 +138,9 @@ def _select_single_task_tool(intent: str, context: dict) -> dict:
         "send": {"idempotency_key", "channel", "recipient", "payload", "agent_name",
                  "lane", "autonomy_tier_at_send", "person_id"},
         "post_slack": {"item_id"},
+        "calendar.get_slots": {"window_start", "window_end"},
+        "calendar.book": {"starts_at", "ends_at", "attendee_email", "topic"},
+        "calendar.reschedule": {"booking_ref"},
     }[name]
     if not required.issubset(args):
         raise ValueError("task_context_missing:" + ",".join(sorted(required - args.keys())))
@@ -349,4 +367,118 @@ def post_slack(*, item_id: int) -> Dict[str, Any]:
     return {
         "item_id": item_id,
         "posted": bool(refreshed and refreshed.slack_message_ts),
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# calendar.* — scheduling, delegating to src.services.calendar.
+#
+# Names are dotted to match the interface the Tier 2 scope publishes, which
+# is the string another developer will search for.
+#
+# A steps payload is JSON, so these wrappers take ISO-8601 strings rather
+# than datetimes and resolve the calendar client themselves — a client
+# object cannot travel through a work item.
+#
+# `now` is read here rather than passed in: the runtime boundary is where a
+# real clock belongs, and the availability rules underneath stay pure.
+# ──────────────────────────────────────────────────────────────────────────
+
+@fa_max_tool(category="read", idempotent=True, name="calendar.get_slots")
+def calendar_get_slots(
+    *,
+    window_start: str,
+    window_end: str,
+    duration_minutes: int = 30,
+    include_weekends: bool = False,
+    calendar_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Open meeting slots on the client's calendar."""
+    from datetime import datetime, timezone
+
+    from src.services.calendar import get_slots
+    from src.services.calendar.client import get_calendar_client, get_calendar_id
+
+    slots = get_slots(
+        client=get_calendar_client(),
+        calendar_id=calendar_id or get_calendar_id(),
+        window_start=datetime.fromisoformat(window_start),
+        window_end=datetime.fromisoformat(window_end),
+        now=datetime.now(timezone.utc),
+        duration_minutes=duration_minutes,
+        include_weekends=include_weekends,
+    )
+    return {
+        "slots": [
+            {"start": slot.start.isoformat(), "end": slot.end.isoformat()}
+            for slot in slots
+        ]
+    }
+
+
+@fa_max_tool(
+    category="write", idempotent=False, requires_send_gate=True, name="calendar.book"
+)
+def calendar_book(
+    *,
+    starts_at: str,
+    ends_at: str,
+    attendee_email: str,
+    topic: str,
+    person_id: Optional[str] = None,
+    calendar_id: Optional[str] = None,
+    session=None,
+) -> Dict[str, Any]:
+    """Book a slot and invite the attendee, refusing a suppressed recipient."""
+    from datetime import datetime
+
+    from src.services.calendar import Slot, book
+    from src.services.calendar.client import get_calendar_client, get_calendar_id
+
+    result = book(
+        client=get_calendar_client(),
+        session=session,
+        calendar_id=calendar_id or get_calendar_id(),
+        slot=Slot(
+            start=datetime.fromisoformat(starts_at), end=datetime.fromisoformat(ends_at)
+        ),
+        attendee_email=attendee_email,
+        topic=topic,
+        person_id=person_id,
+    )
+    return {
+        "booked": result.booked,
+        "booking_ref": result.booking_ref,
+        "event_id": result.event.event_id if result.event else None,
+        "reason": result.reason,
+        "detail": result.detail,
+    }
+
+
+@fa_max_tool(
+    category="write", idempotent=True, requires_send_gate=False, name="calendar.reschedule"
+)
+def calendar_reschedule(
+    *, booking_ref: str, calendar_id: Optional[str] = None, session=None
+) -> Dict[str, Any]:
+    """Page EXCEPTIONS with a booking and alternatives. Moves nothing."""
+    from datetime import datetime, timezone
+
+    from src.services.calendar import reschedule
+    from src.services.calendar.client import get_calendar_client, get_calendar_id
+
+    request = reschedule(
+        client=get_calendar_client(),
+        session=session,
+        calendar_id=calendar_id or get_calendar_id(),
+        booking_ref=booking_ref,
+        now=datetime.now(timezone.utc),
+    )
+    return {
+        "booking_ref": request.booking_ref,
+        "alerted": request.alerted,
+        "alternatives": [
+            {"start": slot.start.isoformat(), "end": slot.end.isoformat()}
+            for slot in request.alternatives
+        ],
     }

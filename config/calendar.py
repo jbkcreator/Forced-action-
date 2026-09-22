@@ -34,6 +34,11 @@ SLOT_ALIGNMENT_MINUTES = 30
 # datetime.weekday(): Monday is 0, so Saturday and Sunday are 5 and 6.
 WEEKEND_WEEKDAYS = frozenset({5, 6})
 
+# Which venture's EXCEPTIONS lane a reschedule request is surfaced on.
+CALENDAR_VENTURE_KEY = "fa_max_lending"
+
+RESCHEDULE_ALERT_RULE = "calendar_reschedule_requested"
+
 
 def validate_calendar_config() -> None:
     """Raise ValueError if the configured rules cannot produce bookable slots."""

@@ -12,7 +12,13 @@ from src.services.calendar.booking import (
     get_slots,
     reschedule,
 )
-from src.services.calendar.client import CalendarClient, CalendarEvent
+from src.services.calendar.client import (
+    CalendarClient,
+    CalendarEvent,
+    get_calendar_client,
+    get_calendar_id,
+    reset_calendar_client,
+)
 from src.services.calendar.fakes import FakeCalendar, FakeCalendarError
 
 __all__ = [
@@ -26,6 +32,9 @@ __all__ = [
     "Slot",
     "book",
     "compute_free_slots",
+    "get_calendar_client",
+    "get_calendar_id",
     "get_slots",
     "reschedule",
+    "reset_calendar_client",
 ]

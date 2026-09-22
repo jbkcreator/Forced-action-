@@ -11131,6 +11131,63 @@ class FaMaxPersonConsent(Base):
         )
 
 
+class FaMaxBooking(Base):
+    """One meeting the calendar tool scheduled on the client's calendar.
+
+    Keyed by `booking_ref` rather than the provider's event id. A reschedule
+    or cancellation arrives referring to a meeting that may since have been
+    recreated provider-side under a new id, and the opportunity it belongs to
+    needs a handle that survives that. The provider id is recorded alongside
+    so the event can still be found, not as identity.
+
+    No rate, term, or commitment fields — a booking records that a
+    conversation was scheduled, never anything about the deal.
+    """
+    __tablename__ = "fa_max_bookings"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    booking_ref: Mapped[str] = mapped_column(String(40), nullable=False, unique=True)
+    calendar_id: Mapped[str] = mapped_column(String(320), nullable=False)
+    provider_event_id: Mapped[Optional[str]] = mapped_column(
+        String(200), nullable=True, index=True,
+    )
+    person_id: Mapped[Optional[Any]] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_persons.person_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    attendee_email: Mapped[str] = mapped_column(String(320), nullable=False, index=True)
+    topic: Mapped[str] = mapped_column(String(200), nullable=False)
+    starts_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True,
+    )
+    ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(30), nullable=False, server_default=text("'confirmed'"),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('confirmed', 'cancelled', 'reschedule_requested')",
+            name="ck_fa_max_bookings_status",
+        ),
+        CheckConstraint("ends_at > starts_at", name="ck_fa_max_bookings_span"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<FaMaxBooking(ref={self.booking_ref!r}, "
+            f"starts_at={self.starts_at!r}, status={self.status!r})>"
+        )
+
+
 class FaMaxBackflipCampaignContact(Base):
     """Current Backflip campaign membership; separate from permanent opt-outs."""
     __tablename__ = "fa_max_backflip_campaign_contacts"

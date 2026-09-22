@@ -18,17 +18,28 @@ a provider rejection is an error and belongs in the agent loop's handler.
 from __future__ import annotations
 
 import logging
+import secrets
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
-from config.calendar import DEFAULT_SLOT_DURATION_MINUTES
+from sqlalchemy import text as sa_text
+
+from config.calendar import (
+    CALENDAR_TIMEZONE,
+    CALENDAR_VENTURE_KEY,
+    DEFAULT_SLOT_DURATION_MINUTES,
+    RESCHEDULE_ALERT_RULE,
+)
 from src.services.calendar.availability import Slot, compute_free_slots
 from src.services.calendar.client import CalendarClient, CalendarEvent
 
 logger = logging.getLogger(__name__)
 
 RESCHEDULE_ALTERNATIVE_LIMIT = 3
+
+_TZ = ZoneInfo(CALENDAR_TIMEZONE)
 
 
 @dataclass(frozen=True)
@@ -37,6 +48,7 @@ class BookingResult:
 
     booked: bool
     event: Optional[CalendarEvent] = None
+    booking_ref: Optional[str] = None
     reason: Optional[str] = None
     detail: Optional[str] = None
 
@@ -45,14 +57,15 @@ class BookingResult:
 class RescheduleRequest:
     """A reschedule surfaced for a human, not an automated rebooking.
 
-    v1 deliberately stops here: it gathers the current booking and some
-    alternatives for the EXCEPTIONS queue and changes nothing. Autonomous
-    negotiation is out of scope.
+    v1 deliberately stops short of moving anything: it gathers the booking and
+    some alternatives, pages EXCEPTIONS, and marks the row so the booking is
+    visibly in question. Autonomous negotiation is out of scope.
     """
 
-    event_id: str
+    booking_ref: str
     current: Optional[CalendarEvent]
     alternatives: list[Slot]
+    alerted: bool
 
 
 def get_slots(
@@ -86,6 +99,7 @@ def book(
     attendee_email: str,
     topic: str,
     description: str = "",
+    person_id: Optional[Any] = None,
 ) -> BookingResult:
     """Book a slot for an attendee, refusing if suppressed or already taken."""
     from src.agents.fa_max.tool_registry import check_suppression
@@ -114,37 +128,166 @@ def book(
         attendee_email=attendee_email,
         description=description,
     )
-    logger.info("calendar.book: booked event_id=%s", event.event_id)
-    return BookingResult(booked=True, event=event)
+
+    booking_ref = _record_booking(
+        session=session,
+        calendar_id=calendar_id,
+        event=event,
+        attendee_email=attendee_email,
+        topic=topic,
+        person_id=person_id,
+    )
+    logger.info(
+        "calendar.book: booked booking_ref=%s event_id=%s", booking_ref, event.event_id
+    )
+    return BookingResult(booked=True, event=event, booking_ref=booking_ref)
+
+
+def _record_booking(
+    *,
+    session,
+    calendar_id: str,
+    event: CalendarEvent,
+    attendee_email: str,
+    topic: str,
+    person_id: Optional[Any],
+) -> str:
+    """Persist the booking and return its stable reference."""
+    booking_ref = secrets.token_urlsafe(9)
+    session.execute(
+        sa_text(
+            """
+            INSERT INTO fa_max_bookings
+                (booking_ref, calendar_id, provider_event_id, person_id,
+                 attendee_email, topic, starts_at, ends_at, status)
+            VALUES
+                (:booking_ref, :calendar_id, :provider_event_id, :person_id,
+                 :attendee_email, :topic, :starts_at, :ends_at, 'confirmed')
+            """
+        ),
+        {
+            "booking_ref": booking_ref,
+            "calendar_id": calendar_id,
+            "provider_event_id": event.event_id,
+            "person_id": person_id,
+            "attendee_email": attendee_email,
+            "topic": topic,
+            "starts_at": event.start,
+            "ends_at": event.end,
+        },
+    )
+    return booking_ref
 
 
 def reschedule(
     *,
     client: CalendarClient,
+    session,
     calendar_id: str,
-    event_id: str,
+    booking_ref: str,
     now: datetime,
     window_days: int = 7,
     duration_minutes: int = DEFAULT_SLOT_DURATION_MINUTES,
 ) -> RescheduleRequest:
-    """Collect a booking and some alternatives for a human to resolve."""
-    current = client.get_event(calendar_id=calendar_id, event_id=event_id)
+    """Page a human with the booking and some alternatives. Moves nothing."""
+    booking = session.execute(
+        sa_text(
+            """
+            SELECT provider_event_id, attendee_email, topic, starts_at
+            FROM fa_max_bookings
+            WHERE booking_ref = :booking_ref
+            """
+        ),
+        {"booking_ref": booking_ref},
+    ).mappings().first()
+    if booking is None:
+        raise ValueError(f"unknown booking_ref {booking_ref!r}")
 
-    window_start = now
-    window_end = now + timedelta(days=window_days)
+    current = None
+    if booking["provider_event_id"]:
+        current = client.get_event(
+            calendar_id=calendar_id, event_id=booking["provider_event_id"]
+        )
+
     alternatives = get_slots(
         client=client,
         calendar_id=calendar_id,
-        window_start=window_start,
-        window_end=window_end,
+        window_start=now,
+        window_end=now + timedelta(days=window_days),
         now=now,
         duration_minutes=duration_minutes,
+    )[:RESCHEDULE_ALTERNATIVE_LIMIT]
+
+    session.execute(
+        sa_text(
+            """
+            UPDATE fa_max_bookings
+            SET status = 'reschedule_requested', updated_at = NOW()
+            WHERE booking_ref = :booking_ref
+            """
+        ),
+        {"booking_ref": booking_ref},
+    )
+
+    alerted = _alert_exceptions(
+        booking_ref=booking_ref,
+        attendee_email=booking["attendee_email"],
+        topic=booking["topic"],
+        starts_at=booking["starts_at"],
+        alternatives=alternatives,
     )
     return RescheduleRequest(
-        event_id=event_id,
+        booking_ref=booking_ref,
         current=current,
-        alternatives=alternatives[:RESCHEDULE_ALTERNATIVE_LIMIT],
+        alternatives=alternatives,
+        alerted=alerted,
     )
+
+
+def _alert_exceptions(
+    *,
+    booking_ref: str,
+    attendee_email: str,
+    topic: str,
+    starts_at: datetime,
+    alternatives: list[Slot],
+) -> bool:
+    """Surface the request on the EXCEPTIONS lane. Never raises.
+
+    A failed page must not roll back the status change: the booking really is
+    in question either way, and the alert queue retries on its own.
+    """
+    from src.services.relay import exceptions_alert_queue
+
+    offered = (
+        ", ".join(_human_time(slot.start) for slot in alternatives)
+        if alternatives
+        else "none available in the next week"
+    )
+    message = (
+        f"*Reschedule requested* — {topic}\n"
+        f"Booking: `{booking_ref}`\n"
+        f"Attendee: {attendee_email}\n"
+        f"Currently: {_human_time(starts_at)}\n"
+        f"Alternatives: {offered}"
+    )
+    try:
+        return exceptions_alert_queue.enqueue_and_attempt(
+            venture_key=CALENDAR_VENTURE_KEY,
+            rule=RESCHEDULE_ALERT_RULE,
+            message=message,
+        )
+    except Exception:
+        logger.exception(
+            "calendar.reschedule: EXCEPTIONS alert failed for booking_ref=%s", booking_ref
+        )
+        return False
+
+
+def _human_time(moment: datetime) -> str:
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(_TZ).strftime("%a %d %b %H:%M %Z")
 
 
 def _is_taken(*, client: CalendarClient, calendar_id: str, slot: Slot) -> bool:
