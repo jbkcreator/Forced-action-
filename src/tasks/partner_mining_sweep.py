@@ -105,9 +105,11 @@ def _run_county(county_id: str, *, dry_run: bool, as_of: date) -> int:
     with get_db_context() as db:
         # Stage B: resolve new lender counterparties into buyer_entities graph.
         from src.services.partner_mining.resolution import (
-            run_counterparty_resolution, resolve_counterparty_names,
+            run_counterparty_resolution, run_wholesaler_resolution,
+            resolve_counterparty_names,
         )
         run_counterparty_resolution(db, county_id=county_id)
+        run_wholesaler_resolution(db, county_id=county_id)
 
         # Load deed rows for this county within the lookback window.
         result = db.execute(
