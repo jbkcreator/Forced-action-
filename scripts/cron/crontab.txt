@@ -125,6 +125,12 @@ COUNTY_ID=hillsborough
 # RELATIONSHIPS_SLACK_CHANNEL. Idempotent — borrower_monitor_log deduplicates.
 45 6 * * * cd $PROJECT && PYTHONPATH=. python scripts/run_repeat_maturity_engine.py >> /var/log/fa/repeat_maturity.log 2>&1
 
+# WP-T2-6 Stage Monitoring and Document Chase — every 15 minutes. Runs
+# stall detection, proactive status touches, and document chase follow-
+# up/escalation. Idempotent — relay idempotency_key prevents duplicate
+# sends on back-to-back runs.
+*/15 * * * * cd $PROJECT && PYTHONPATH=. python scripts/run_stage_monitor_worker.py >> /var/log/fa/stage_monitor_worker.log 2>&1
+
 # Quora S6 organic-answer pipeline — 06:35 AM UTC daily (after load validator).
 # Picks one keyword via DB rotation (quora_topics + cooldown_days), scrapes Quora,
 # publishes to Cora for classification + answer drafting, upserts to quora_questions.
