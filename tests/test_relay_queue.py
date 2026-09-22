@@ -42,6 +42,9 @@ def test_enqueue_signature_matches_documented_contract():
         "agent_name",
         "autonomy_tier_at_send",
         "person_id",
+        "auto_authorize",
+        "send_attempt_log_id",
+        "opportunity_id",
     }
 
     required = {name for name, p in params.items() if p.default is inspect.Parameter.empty}

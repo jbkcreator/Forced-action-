@@ -314,11 +314,17 @@ def test_fa_max_approved_item_survives_fake_mode_and_dispatches_once_live(
         person_id="00000000-0000-0000-0000-000000000001", agent_name="vera",
         autonomy_tier_at_send="A", lane="MONEY",
         decided_by="josh", decision_interaction_id="00000000-0000-0000-0000-000000000002",
+        opportunity_id="00000000-0000-0000-0000-000000000003",
+        channel_split_source="deed",
     )
     calls = []
     monkeypatch.setitem(relay_engine.DISPATCHERS, "fake", lambda item: calls.append(item.id))
     monkeypatch.setattr(relay_guards, "_suppression_reason", lambda item: None)
     monkeypatch.setattr(relay_guards, "_fa_max_compliance_reason", lambda item: None)
+    monkeypatch.setattr(
+        "src.services.fa_max_send_governance.record_backflip_suppression_decision",
+        lambda **kwargs: None,
+    )
 
     settings = type("S", (), {
         "fa_max_relay_send_mode": "fake",

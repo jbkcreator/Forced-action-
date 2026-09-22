@@ -110,6 +110,43 @@ def _warmup_trip(campaign_id: Optional[str], sender_email: Optional[str]) -> Opt
     )
 
 
+def _backflip_feed_stale_trip(session, now: datetime) -> Optional[Trip]:
+    """WP-T2-3: proactive EXCEPTIONS alert when the Backflip campaign snapshot
+    is missing or stale. backflip_campaign_reason() already blocks sends when
+    the feed is stale (fail-closed), but that is reactive — an operator only
+    learns of the staleness when a send attempt is refused. This check surfaces
+    the condition proactively so the feed can be refreshed before live sends begin.
+
+    Uses the same freshness window as backflip_campaign_reason() itself
+    (fa_max_backflip_feed_max_age_hours), sourced from settings to keep the two
+    in sync. If the singleton row doesn't exist at all (feed never imported),
+    treats it as stale."""
+    from config.settings import get_settings
+    max_age = get_settings().fa_max_backflip_feed_max_age_hours
+    fresh = session.execute(
+        text(
+            "SELECT last_success_at >= now() - make_interval(hours => :max_age) "
+            "FROM fa_max_backflip_campaign_feed WHERE id = 1"
+        ),
+        {"max_age": max_age},
+    ).scalar_one_or_none()
+    if fresh is None:
+        return Trip(
+            rule="fa_max_backflip_feed_never_imported",
+            detail="fa_max_backflip_campaign_feed has no row (id=1 missing) — "
+                   "the Backflip suppression snapshot has never been imported. "
+                   "Run: python scripts/import_backflip_suppression_csv.py --file <path>",
+        )
+    if not fresh:
+        return Trip(
+            rule="fa_max_backflip_feed_stale",
+            detail=f"Backflip campaign snapshot is older than {max_age}h — "
+                   "backflip_campaign_reason() is currently blocking ALL FA Max sends "
+                   "on this basis (fail-closed). Re-import to unblock.",
+        )
+    return None
+
+
 def _relay_failure_trip(session, now: datetime) -> Optional[Trip]:
     since = now - timedelta(hours=ROLLING_HOURS)
     row = session.execute(
@@ -143,6 +180,7 @@ def evaluate(*, now: Optional[datetime] = None) -> list[Trip]:
     trips.append(_warmup_trip(venture.relay_instantly_campaign_id, venture.relay_instantly_sender_email))
     with get_db_context() as session:
         trips.append(_relay_failure_trip(session, now))
+        trips.append(_backflip_feed_stale_trip(session, now))
     return [t for t in trips if t is not None]
 
 
