@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 
 from src.core.models import SelfserveSession
 from src.services.phone_utils import normalize as normalize_phone
+from src.services.state_engine import ensure_entity_registry
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +111,9 @@ def resolve_or_create_person(db: Session, source_reference: str) -> str:
     ).first()
     if row is None:
         raise RuntimeError("fa_max_persons insert did not return a person_id")
-    return str(row.person_id)
+    person_id = str(row.person_id)
+    ensure_entity_registry(session=db, entity_type="person", native_id=person_id)
+    return person_id
 
 
 def find_possible_person_match(
