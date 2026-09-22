@@ -1112,4 +1112,10 @@ COUNTY_ID=hillsborough
 # by default (see the task's own docstring); add --apply once confirmed.
 0 * * * * $PROJECT/scripts/cron/run.sh src.tasks.selfserve_abandonment_sweep
 
+# WP-T2-9 Partner Mining & Producer Ranking — runs after nightly deed load
+# (deeds load 05:00–05:10 UTC; this fires at 06:00 UTC to ensure both
+# Hillsborough and Pinellas deed batches are committed before ranking).
+# Incremental: only new deeds update counts + re-rank; no full rebuild.
+0 6 * * * $PROJECT/scripts/cron/run.sh src.tasks.partner_mining_sweep
+
 # === END FORCED-ACTION-PLATFORM ===

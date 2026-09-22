@@ -85,6 +85,8 @@ HEARTBEAT_SLAS: Dict[str, int] = {
     "appraiser_sale_outcomes": 10_140,   # weekly, after the appraiser bulk refresh
     "outcome_label_layer":     1500,
     "dor_sale_outcomes":       131_040,
+    # WP-T2-9 Partner Mining — runs nightly at 06:00 UTC after deed load
+    "partner_mining":          1500,
 }
 
 # Sources that are intentionally NOT scheduled on certain weekdays. Heartbeat
