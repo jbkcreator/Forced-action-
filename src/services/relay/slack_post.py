@@ -300,6 +300,130 @@ def open_revise_modal(trigger_id: str, item: QueueItem) -> bool:
         return False
 
 
+_OPPORTUNITY_TYPES = (
+    "acquisition", "rehab", "construction", "extension",
+    "refinance", "dscr_takeout", "repeat",
+)
+
+
+def _build_log_submission_modal() -> dict:
+    """Addendum to WP-T2-6 -- initial view for logging a Backflip
+    submission. Live-searches existing FA Max borrowers (Task 16/18)
+    before ever asking Josh to re-enter someone we already know, closing
+    the gap where backflip_ref was never created until terms arrived.
+    """
+    return {
+        "type": "modal",
+        "callback_id": "fa_max_log_submission_submit",
+        "private_metadata": json.dumps({"mode": "search"}),
+        "title": {"type": "plain_text", "text": "Log Backflip Submission"[:24]},
+        "submit": {"type": "plain_text", "text": "Continue"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "input",
+                "block_id": "borrower_search_block",
+                "optional": True,
+                "label": {"type": "plain_text", "text": "Search existing borrowers"},
+                "element": {
+                    "type": "external_select",
+                    "action_id": "borrower_search",
+                    "min_query_length": 2,
+                    "placeholder": {"type": "plain_text", "text": "Type a name, email, or phone"},
+                },
+            },
+            {
+                "type": "actions",
+                "block_id": "new_borrower_action_block",
+                "elements": [
+                    {
+                        "type": "button",
+                        "action_id": "log_submission_new_borrower",
+                        "text": {"type": "plain_text", "text": "Not on this list — new borrower"},
+                    },
+                ],
+            },
+        ],
+    }
+
+
+def _build_log_submission_new_entry_view(prior_metadata: dict) -> dict:
+    """Fallback view -- Josh clicked "new borrower" or the search found no
+    match. Same modal, swapped blocks (views.update, not a second popup)."""
+    metadata = dict(prior_metadata)
+    metadata["mode"] = "new_borrower"
+    return {
+        "type": "modal",
+        "callback_id": "fa_max_log_submission_submit",
+        "private_metadata": json.dumps(metadata),
+        "title": {"type": "plain_text", "text": "New Borrower Submission"[:24]},
+        "submit": {"type": "plain_text", "text": "Log Submission"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "input", "block_id": "new_full_name_block",
+                "label": {"type": "plain_text", "text": "Borrower name"},
+                "element": {"type": "plain_text_input", "action_id": "new_full_name"},
+            },
+            {
+                "type": "input", "block_id": "new_email_block", "optional": True,
+                "label": {"type": "plain_text", "text": "Email"},
+                "element": {"type": "plain_text_input", "action_id": "new_email"},
+            },
+            {
+                "type": "input", "block_id": "new_phone_block", "optional": True,
+                "label": {"type": "plain_text", "text": "Phone"},
+                "element": {"type": "plain_text_input", "action_id": "new_phone"},
+            },
+            {
+                "type": "input", "block_id": "new_property_address_block", "optional": True,
+                "label": {"type": "plain_text", "text": "Property address"},
+                "element": {"type": "plain_text_input", "action_id": "new_property_address"},
+            },
+            {
+                "type": "input", "block_id": "opportunity_type_block",
+                "label": {"type": "plain_text", "text": "Loan type"},
+                "element": {
+                    "type": "static_select",
+                    "action_id": "opportunity_type",
+                    "options": [
+                        {"text": {"type": "plain_text", "text": t}, "value": t}
+                        for t in _OPPORTUNITY_TYPES
+                    ],
+                },
+            },
+            {
+                "type": "input", "block_id": "loan_amount_block", "optional": True,
+                "label": {"type": "plain_text", "text": "Loan amount ($)"},
+                "element": {"type": "plain_text_input", "action_id": "loan_amount"},
+            },
+            {
+                "type": "input", "block_id": "backflip_ref_block", "optional": True,
+                "label": {"type": "plain_text", "text": "Backflip reference (if you have it)"},
+                "element": {"type": "plain_text_input", "action_id": "backflip_ref"},
+            },
+        ],
+    }
+
+
+def open_log_submission_modal(trigger_id: str) -> bool:
+    """Opens the initial search view. Returns True on success."""
+    settings = get_settings()
+    token = settings.fa_max_slack_bot_token
+    if not token or not trigger_id:
+        logger.info("[Relay] cannot open log-submission modal — no token or trigger_id")
+        return False
+    try:
+        from slack_sdk import WebClient
+        WebClient(token=token.get_secret_value()).views_open(
+            trigger_id=trigger_id, view=_build_log_submission_modal(),
+        )
+        return True
+    except Exception as exc:
+        logger.error("[Relay] views.open failed for log-submission modal: %s", exc, exc_info=True)
+        return False
+
+
 def post_unposted_fa_max_cards(*, limit: int = 50) -> int:
     """Retry committed, pending FA Max cards after Slack or process failure."""
     items = queue.unposted_fa_max_items(limit=limit)
