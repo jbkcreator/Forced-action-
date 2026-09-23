@@ -870,6 +870,12 @@ class AppSettings(BaseSettings):
 	# not yet configured, so the restriction fails open (see
 	# _reject_if_wrong_command_channel / _listen_channel).
 	fa_max_slack_cc_channel: Optional[str] = Field(default=None, env="FA_MAX_SLACK_CC_CHANNEL")
+
+	# WP-T2-11: minimum expected revenue (cents) for an in-box opportunity to be green.
+	# Confirm launch value with Josh; placeholder = $150 commission dollars (15% × ~$1k).
+	fa_max_gyr_green_min_expected_revenue_cents: int = Field(
+		default=15000, env="FA_MAX_GYR_GREEN_MIN_EXPECTED_REVENUE_CENTS"
+	)
 	fa_max_backflip_feed_max_age_hours: int = Field(default=24, ge=1, env="FA_MAX_BACKFLIP_FEED_MAX_AGE_HOURS")
 	backflip_webhook_secret: Optional[SecretStr] = Field(default=None, env="BACKFLIP_WEBHOOK_SECRET")
 
