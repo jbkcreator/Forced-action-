@@ -69,6 +69,27 @@ def test_terms_email():
     assert result.backflip_ref == "BF-90011"
 
 
+def test_stage_change_matches_non_bf_ref_format():
+    """The ref pattern must not assume Backflip's real format -- it's
+    unconfirmed (Q7/Q8/Q13). This uses our own test data's actual shape
+    (letters immediately followed by digits, no hyphen)."""
+    subject = "Application b1234 — Now Under Review"
+    body = "Your application b1234 has moved to Under Review."
+    result = parse_backflip_notification(subject, body)
+    assert result is not None
+    assert result.event_type == "stage_change"
+    assert result.backflip_ref == "b1234"
+
+
+def test_stage_change_matches_app_prefixed_ref_format():
+    subject = "APP-1: Conditional Approval Issued"
+    body = "Conditional approval has been issued for APP-1."
+    result = parse_backflip_notification(subject, body)
+    assert result is not None
+    assert result.backflip_ref == "APP-1"
+    assert result.stage == "conditional_approval"
+
+
 def test_unrecognized_email_returns_none():
     result = parse_backflip_notification("Weekly newsletter", "Nothing relevant here.")
     assert result is None

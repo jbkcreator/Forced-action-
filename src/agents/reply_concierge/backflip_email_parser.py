@@ -9,8 +9,15 @@ sense of the email at all.
 
 No real Backflip notification samples exist yet (client clarifications
 Q7/Q8/Q13 all still open -- exact mailbox and real email format
-unconfirmed), so the regex patterns AND the assumed 'BF-####' ref format
-are both guesses. The LLM fallback exists specifically to cover that gap:
+unconfirmed), so the stage/document/terms regex patterns are guesses.
+The ref pattern deliberately does NOT assume a vendor-specific prefix
+like 'BF-####' -- Backflip's real reference format is unknown, and our
+own test data already uses a different shape ('b1234'). _REF_PATTERN
+instead matches the general shape of a reference token (letters followed
+by an optional hyphen and digits) and leaves the actual truth check to
+resolve_opportunity_by_backflip_ref() downstream -- a token that doesn't
+match a real opportunity is dropped there, so a broad pattern costs
+nothing but a log line. The LLM fallback exists to cover the rest of that gap:
 an automated system's notification emails are normally one fixed template
 (regex is the right primary tool for that -- deterministic, free,
 instantly testable), but until the real template is confirmed, a genuine
@@ -40,7 +47,7 @@ logger = logging.getLogger(__name__)
 _LLM_MODEL = "claude-sonnet-4-5-20250929"
 _EVENT_TYPES = frozenset({"stage_change", "document_request", "terms"})
 
-_REF_PATTERN = re.compile(r"\bBF-\d{4,}\b")
+_REF_PATTERN = re.compile(r"\b[A-Za-z]{1,10}-\d+\b|\b[A-Za-z]{1,10}\d{3,}\b")
 
 _STAGE_SIGNALS: tuple[tuple[re.Pattern, str], ...] = (
     (re.compile(r"cleared to close", re.IGNORECASE), "cleared_to_close"),
@@ -76,8 +83,8 @@ def _extract_ref(subject: str, body_text: str) -> Optional[str]:
 def parse_backflip_notification(subject: str, body_text: str) -> Optional[ParsedBackflipEvent]:
     """Regex first (deterministic, free, instantly testable). Falls back to
     an LLM extraction call only when the regex path finds nothing -- either
-    because no 'BF-####'-shaped ref is present, or a ref is present but none
-    of the known event patterns match. Never raises; a fallback failure
+    because no reference-shaped token is present, or a ref is present but
+    none of the known event patterns match. Never raises; a fallback failure
     (API error, malformed response) degrades to None like a genuine
     non-match, so a poller or sweep calling this never needs its own
     try/except around it.
