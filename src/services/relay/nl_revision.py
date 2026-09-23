@@ -74,6 +74,29 @@ def embellishment_guard(revised: str, original: str) -> Optional[str]:
     return None
 
 
+# Formatting references in an instruction are not facts: "under 50 words",
+# "paragraph 2", "the 2nd sentence", "3 bullet points" ("points" is a rate word).
+_STRUCTURAL_RE = re.compile(
+    r"\b\d+(?:st|nd|rd|th)?\s+(?:bullet\s+points?|bullets?|words?|sentences?|paragraphs?"
+    r"|lines?|characters?|chars?)\b"
+    r"|\b(?:paragraph|sentence|line|bullet|point)\s+#?\s*\d+\b"
+    r"|\b\d+(?:st|nd|rd|th)\b"
+    r"|\bbullet\s+points?\b",
+    re.IGNORECASE,
+)
+
+
+def instruction_adds_facts(instruction: str, original: str) -> Optional[str]:
+    """Why the instruction asks for a fact the original lacks, else None.
+
+    Checked before the LLM call: when asked to add a fact the model tends to
+    silently decline and reword something else, which hides the refusal from
+    the approver. The output guard still runs after the call.
+    """
+    reason = embellishment_guard(_STRUCTURAL_RE.sub(" ", instruction), original)
+    return reason.replace("introduced", "asks for", 1) if reason else None
+
+
 def _build_user_prompt(instruction: str, original: str, current: str, history: Sequence[str]) -> str:
     prior = "\n".join(f"- {h}" for h in history) or "(none)"
     return (
@@ -93,6 +116,10 @@ def revise_draft(
     llm: Llm,
     history: Sequence[str] = (),
 ) -> RevisionResult:
+    asked = instruction_adds_facts(instruction, original)
+    if asked:
+        logger.info("[NLRevision] instruction refused before rewrite: %s", asked)
+        return RevisionResult(ok=False, reason="embellishment", detail=asked)
     user = _build_user_prompt(instruction, original, current, history)
     try:
         revised = (llm(_SYSTEM, user) or "").strip()

@@ -564,3 +564,82 @@ class TestRevisionLogDb:
             with get_db_context() as s:
                 s.execute(sql("DELETE FROM fa_max_draft_revisions WHERE relay_item_id = :id"), {"id": item_id})
                 s.execute(sql("DELETE FROM relay_approval_queue WHERE id = :id"), {"id": item_id})
+
+
+# ── instruction pre-check (live test: model silently declined to add facts) ──
+
+_ORIG = "Hi Mike, I saw the cash purchase on 4512 Oak Street closed last month. Want to chat?"
+
+
+class TestInstructionPreCheck:
+    @pytest.mark.parametrize("instruction,needle", [
+        ("add that we can close in 10 days at 80% LTV", "10"),
+        ("mention the $5,000 fee", "$5,000"),
+        ("say he's pre-approved", "pre-approved"),
+        ("tell him our rate is great", "rate"),
+        ("mention we charge 2 points", "2"),
+    ])
+    def test_new_fact_in_instruction_is_refused_before_llm(self, instruction, needle):
+        llm = MagicMock()
+        r = nl_revision.revise_draft(instruction=instruction, original=_ORIG, current=_ORIG, llm=llm)
+        assert r.reason == "embellishment" and needle in r.detail and "asks for" in r.detail
+        llm.assert_not_called()
+
+    @pytest.mark.parametrize("instruction", [
+        "shorter, drop the second sentence",
+        "keep it under 50 words",
+        "make it 2 sentences",
+        "drop paragraph 2",
+        "remove the 2nd sentence",
+        "use 3 bullet points",
+        "mention 4512 Oak Street first",
+        "friendlier tone",
+    ])
+    def test_formatting_numbers_and_existing_facts_pass(self, instruction):
+        llm = MagicMock(return_value="Hi Mike, saw your Oak Street purchase. Want to chat?")
+        r = nl_revision.revise_draft(instruction=instruction, original=_ORIG, current=_ORIG, llm=llm)
+        assert r.ok, r.detail
+        llm.assert_called_once()
+
+
+# ── Edit text modal save over Socket Mode ────────────────────────────────────
+
+def _view_request(callback_id="fa_max_revise_submit"):
+    payload = {"type": "view_submission", "user": {"id": "U1"},
+               "view": {"callback_id": callback_id, "private_metadata": '{"item_id": 7}'}}
+    return MagicMock(type="interactive", envelope_id="env-1", payload=payload)
+
+
+class TestSocketModalSubmission:
+    def _run(self, request, **handler_kw):
+        from src.services.relay import socket_listener as sl
+
+        client = MagicMock()
+        with patch("src.api.admin_router._handle_relay_revise_submission", **handler_kw) as handler:
+            handled = sl.handle_socket_request(client, request)
+        acks = client.send_socket_mode_response.call_args_list
+        return handled, handler, acks
+
+    def test_submission_dispatched_and_result_sent_in_ack(self):
+        handled, handler, acks = self._run(_view_request(), return_value={"response_action": "clear"})
+        assert handled is True
+        handler.assert_called_once()
+        assert len(acks) == 1
+        resp = acks[0].args[0]
+        assert resp.envelope_id == "env-1" and resp.payload == {"response_action": "clear"}
+
+    def test_validation_errors_reach_the_modal(self):
+        errors = {"response_action": "errors", "errors": {"revised_content_block": "Item is no longer pending."}}
+        _, _, acks = self._run(_view_request(), return_value=errors)
+        assert acks[0].args[0].payload == errors
+
+    def test_handler_crash_shows_error_instead_of_silent_close(self):
+        _, _, acks = self._run(_view_request(), side_effect=RuntimeError("db down"))
+        assert len(acks) == 1
+        assert acks[0].args[0].payload["response_action"] == "errors"
+
+    def test_other_modals_are_acked_empty_without_revise_handler(self):
+        handled, handler, acks = self._run(_view_request(callback_id="something_else"))
+        assert handled is True  # dev's view_submission block acks and owns every modal envelope
+        handler.assert_not_called()
+        assert len(acks) == 1 and not acks[0].args[0].payload

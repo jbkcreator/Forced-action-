@@ -181,7 +181,12 @@ def handle_socket_request(client: Any, request: Any) -> bool:
             logger.exception(
                 "[RelaySocket] view_submission handler raised for callback_id=%s", callback_id,
             )
-            response_body = None
+            # WP-T3-1: a failed Edit-text save shows an error in the modal
+            # instead of closing it as if it had saved.
+            response_body = (
+                {"response_action": "errors", "errors": {"revised_content_block": "Couldn't save — try again."}}
+                if callback_id == "fa_max_revise_submit" else None
+            )
         logger.info(
             "[RelaySocket] view_submission callback_id=%r user=%s -> response=%s",
             callback_id, user_id, "errors" if (response_body or {}).get("response_action") == "errors" else "ok",
