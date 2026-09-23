@@ -38,7 +38,7 @@ VOICE_OUTCOMES = frozenset({
 # Word boundaries prevent partial matches (e.g. "pirate" does not match "rate").
 _FINANCIAL_TERMS = re.compile(
     r"\b(credit|score|fico|income|salary|bank\s+statement|tax\s+return|ssn"
-    r"|social\s+security|w-?2|rate|apr)\b",
+    r"|social\s+security|w-?2|rates?|apr)\b",
     re.IGNORECASE,
 )
 
