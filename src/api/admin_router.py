@@ -2573,9 +2573,9 @@ def _handle_log_submission_view_submit(payload: dict, db: Session) -> dict:
     # block just records a reference Josh already knows at submission time
     # -- no underwriting has happened yet, so the stage must not move.
     backflip_ref = _field("backflip_ref_block", "backflip_ref") or None
-    # new_property_address_block only exists on the new-borrower view (see
-    # _build_log_submission_new_entry_view) -- absent from `values` on the
-    # existing-borrower path, so _field() harmlessly returns "" -> None.
+    # new_property_address_block lives in _deal_detail_blocks() -- present
+    # on both views, since a repeat existing borrower's new loan can be
+    # for a different property than any of their prior ones.
     property_address = _field("new_property_address_block", "new_property_address") or None
     # loan_amount_block was read from Slack and then silently discarded --
     # never written anywhere (WP-T2-6 review fix). Dollars-to-cents

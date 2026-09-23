@@ -99,6 +99,52 @@ class TestLogSubmissionViewSubmission:
             "check for a missing space before a :: cast"
         )
 
+    def test_existing_borrower_can_set_property_address_for_this_loan(self):
+        # Product fix: a repeat borrower's new loan can be for a different
+        # property than any of their prior ones (FaMaxOpportunity's own
+        # docstring) -- property_address moved into the shared
+        # _deal_detail_blocks() so the existing-borrower path can capture
+        # it too, not just the new-borrower view.
+        raw = _view_submission_payload(
+            "fa_max_log_submission_submit",
+            {"mode": "search"},
+            {
+                "borrower_search_block": {"borrower_search": {"selected_option": {"value": "p-existing-2"}}},
+                "opportunity_type_block": {"opportunity_type": {"selected_option": {"value": "rehab"}}},
+                "new_property_address_block": {"new_property_address": {"value": "456 Repeat Ave"}},
+            },
+        )
+        from src.api.admin_router import get_db
+
+        mock_db = MagicMock()
+        mock_db.execute.return_value.scalar.return_value = "Existing Repeat Borrower"
+
+        def _override():
+            yield mock_db
+
+        app.dependency_overrides[get_db] = _override
+        try:
+            with patch("src.api.admin_router._verify_slack_signature", return_value=True), \
+                 patch(
+                     "src.services.state_engine.create_fa_max_opportunity", return_value="opp-2b",
+                 ), \
+                 patch("src.services.state_engine.transition"), \
+                 patch("src.services.fa_max_file_state.ensure_file_state"):
+                response = client.post(
+                    "/api/admin/slack/interact", data=raw,
+                    headers={**_signed_headers(), "content-type": "application/x-www-form-urlencoded"},
+                )
+        finally:
+            app.dependency_overrides.pop(get_db, None)
+        assert response.status_code == 200
+        address_calls = [
+            call for call in mock_db.execute.call_args_list
+            if call.args and isinstance(call.args[1], dict) and "property_address" in call.args[1]
+        ]
+        assert len(address_calls) == 1
+        assert address_calls[0].args[1]["property_address"] == "456 Repeat Ave"
+        assert address_calls[0].args[1]["opportunity_id"] == "opp-2b"
+
     def test_new_borrower_creates_person_then_opportunity(self):
         raw = _view_submission_payload(
             "fa_max_log_submission_submit",

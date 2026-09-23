@@ -312,14 +312,23 @@ _OPPORTUNITY_TYPES = (
 
 
 def _deal_detail_blocks() -> list:
-    """The three deal-detail fields both log-submission views carry.
+    """The four deal-detail fields both log-submission views carry.
 
     They live on BOTH views because either view can be the one Josh
     actually submits: the search view submits directly for an existing
     borrower (no view swap), and the new-entry view submits after the
     swap. `_handle_log_submission_view_submit` reads opportunity_type
-    (required by fa_max_opportunities' CHECK constraint) and backflip_ref
-    regardless of which view it came from.
+    (required by fa_max_opportunities' CHECK constraint), backflip_ref,
+    and property_address regardless of which view it came from.
+
+    property_address lives here rather than only on the new-borrower
+    view (where it originally shipped) because a REPEAT borrower's new
+    loan can be for a different property than any of their prior ones
+    (FaMaxOpportunity's own docstring: "the same borrower can have an
+    acquisition opportunity and a later rehab loan on the same
+    property, and a repeat borrower gets a new row per project") --
+    the existing-borrower path had no way to capture it at all before
+    this fix, flagged live during manual E2E testing.
     """
     return [
         {
@@ -343,6 +352,11 @@ def _deal_detail_blocks() -> list:
             "type": "input", "block_id": "backflip_ref_block", "optional": True,
             "label": {"type": "plain_text", "text": "Backflip reference (if you have it)"},
             "element": {"type": "plain_text_input", "action_id": "backflip_ref"},
+        },
+        {
+            "type": "input", "block_id": "new_property_address_block", "optional": True,
+            "label": {"type": "plain_text", "text": "Property address"},
+            "element": {"type": "plain_text_input", "action_id": "new_property_address"},
         },
     ]
 
@@ -423,11 +437,6 @@ def _build_log_submission_new_entry_view(prior_metadata: dict) -> dict:
                 "type": "input", "block_id": "new_phone_block", "optional": True,
                 "label": {"type": "plain_text", "text": "Phone"},
                 "element": {"type": "plain_text_input", "action_id": "new_phone"},
-            },
-            {
-                "type": "input", "block_id": "new_property_address_block", "optional": True,
-                "label": {"type": "plain_text", "text": "Property address"},
-                "element": {"type": "plain_text_input", "action_id": "new_property_address"},
             },
             *_deal_detail_blocks(),
         ],

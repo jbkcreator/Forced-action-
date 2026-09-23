@@ -36,11 +36,14 @@ class TestBuildLogSubmissionModal:
         # The search view's own submit button is live (existing-borrower
         # path submits directly), so it must carry the same deal fields the
         # submit handler reads -- opportunity_type is required by
-        # fa_max_opportunities' CHECK constraint.
+        # fa_max_opportunities' CHECK constraint. property_address is here
+        # too (not just on the new-borrower view) since a repeat existing
+        # borrower's new loan can be for a different property.
         view = _build_log_submission_modal()
         block_ids = {b["block_id"] for b in view["blocks"] if "block_id" in b}
         assert block_ids >= {
             "opportunity_type_block", "loan_amount_block", "backflip_ref_block",
+            "new_property_address_block",
         }
         opp = next(b for b in view["blocks"] if b.get("block_id") == "opportunity_type_block")
         assert opp["element"]["type"] == "static_select"
