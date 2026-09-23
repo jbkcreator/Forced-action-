@@ -140,10 +140,23 @@ def handle_socket_request(client: Any, request: Any) -> bool:
         _handle_add_builder_to_diallist,
         _handle_snooze_builder,
         _handle_dismiss_builder,
+        _handle_log_submission_new_borrower_click,
     )
     from src.core.database import get_db_context
 
     user_id = payload.get("user", {}).get("id", "?")
+
+    # WP-T2-6 addendum: "Not on this list -- new borrower" button inside
+    # the log-submission modal. No DB session and no ephemeral reply --
+    # the handler's only effect is a views.update call swapping the modal
+    # in place, and it always returns {}.
+    if action_id == "log_submission_new_borrower":
+        logger.info("[RelaySocket] log-submission new-borrower click user=%s", user_id)
+        try:
+            _handle_log_submission_new_borrower_click(payload)
+        except Exception:
+            logger.exception("[RelaySocket] failed to open new-borrower view")
+        return True
 
     # EXCEPTIONS lane (WP-T2-8)
     if action_id and action_id.startswith("confirm_entity_link_"):

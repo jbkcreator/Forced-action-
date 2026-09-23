@@ -27,6 +27,51 @@ class TestHandleSocketRequestIgnoresUnownedEnvelopes:
         client.send_socket_mode_response.assert_not_called()
 
 
+class TestNewBorrowerButtonClick:
+    def test_calls_handler_and_acks_blank(self):
+        # Regression: "log_submission_new_borrower" was never dispatched
+        # in this Socket-Mode-only app -- clicking the button silently
+        # did nothing (blank ack, no view.update, no log line), found
+        # live during manual E2E testing.
+        client = mock.MagicMock()
+        payload = {
+            "type": "block_actions",
+            "actions": [{"action_id": "log_submission_new_borrower"}],
+            "user": {"id": "U123"},
+            "view": {"id": "V1", "hash": "h1", "private_metadata": '{"mode": "search"}'},
+        }
+        request = _request("interactive", "env-50", payload)
+
+        with mock.patch(
+            "src.api.admin_router._handle_log_submission_new_borrower_click", return_value={},
+        ) as mock_handle:
+            handled = socket_listener.handle_socket_request(client, request)
+
+        assert handled is True
+        mock_handle.assert_called_once_with(payload)
+        # Blank ack -- the real effect is the handler's own views.update call.
+        sent = client.send_socket_mode_response.call_args.args[0]
+        assert sent.payload is None
+
+    def test_handler_raising_does_not_crash_dispatch(self):
+        client = mock.MagicMock()
+        payload = {
+            "type": "block_actions",
+            "actions": [{"action_id": "log_submission_new_borrower"}],
+            "user": {"id": "U123"},
+            "view": {"id": "V1", "hash": "h1", "private_metadata": "not json"},
+        }
+        request = _request("interactive", "env-51", payload)
+
+        with mock.patch(
+            "src.api.admin_router._handle_log_submission_new_borrower_click",
+            side_effect=RuntimeError("boom"),
+        ):
+            handled = socket_listener.handle_socket_request(client, request)
+
+        assert handled is True
+
+
 class TestViewSubmissionDispatch:
     def test_log_submission_modal_acks_with_handler_result(self):
         client = mock.MagicMock()
