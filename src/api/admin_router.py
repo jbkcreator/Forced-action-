@@ -58,6 +58,7 @@ from src.core.models import (
 from src.loaders.tax import TaxDelinquencyLoader
 from src.loaders.voter_registry import VoterRegistryLoader
 from src.services.relay.slack_post import open_new_file_modal
+from src.services.relay import nl_revision
 from src.services.zip_territory import claim_zip_territory
 from src.utils.county_config import invalidate_cache
 from src.utils.test_account import is_test_subscriber
@@ -1797,6 +1798,8 @@ async def slack_interact(request: Request, background_tasks: BackgroundTasks, db
         return _handle_relay_revise_open(payload)
     if action_id == "new_file_new_borrower":
         return _handle_new_file_new_borrower_click(payload)
+    if action_id == "fa_max_edit_text":
+        return _handle_relay_edit_text_open(payload)
     if action_id in ("approve_win_story", "dismiss_win_story"):
         return _handle_win_story_interact(payload, db)
     # Quote Ready dossier decision (WP-8B — MONEY lane)
@@ -1898,6 +1901,13 @@ def _handle_relay_thread_action(payload: dict) -> None:
         return
 
     if not _relay_approver_authorized(str(user_id), item.venture_key):
+        return
+    # WP-T3-1: an open Revise slot for THIS card's thread outranks commands and
+    # the fallback responder (Banks precedence: halt → pending-revision →
+    # command → ignore; halt is evaluated upstream).
+    if item.venture_key == "fa_max_lending" and _consume_revise_slot(
+        item, str(user_id), str(thread_ts), str(event.get("text") or ""),
+    ):
         return
     # WP-T2-12: authorized approver sent a non-command reply — invoke fallback
     # responder (classify → catalog lookup / CC redirect / ack). This branch is
@@ -2416,13 +2426,10 @@ def _handle_relay_snooze(payload: dict) -> dict:
     return {"ok": True}
 
 
-def _handle_relay_revise_open(payload: dict) -> dict:
-    """Slack Revise button (WP-T2-2 item 9) — opens the revise modal
-    (src.services.relay.slack_post.open_revise_modal). No existing
-    free-text-capture Slack primitive covered this, so a modal +
-    view_submission is the new mechanism (see that function's docstring)."""
+def _revisable_item_or_refusal(payload: dict):
+    """Shared guard for the Revise / Edit text buttons. Returns (item, None)
+    when the clicker may revise a pending item, else (None, slack_response)."""
     from src.services.relay import queue as relay_queue
-    from src.services.relay.slack_post import open_revise_modal
 
     user_id = payload.get("user", {}).get("id", "")
     item_id, _ = _relay_action_item_id(payload)
@@ -2432,12 +2439,150 @@ def _handle_relay_revise_open(payload: dict) -> dict:
     existing = relay_queue.get_item(item_id)
     venture_key = existing.venture_key if existing is not None else DEFAULT_VENTURE_KEY
     if not _relay_approver_authorized(user_id, venture_key):
-        return _slack_ephemeral("Not authorized to decide Relay sends.")
+        return None, _slack_ephemeral("Not authorized to decide Relay sends.")
     if existing is None or existing.status != "pending":
-        return _slack_ephemeral(f"Item #{item_id} is not open for revision.")
+        return None, _slack_ephemeral(f"Item #{item_id} is not open for revision.")
+    return existing, None
 
+
+def _handle_relay_revise_open(payload: dict) -> dict:
+    """Slack Revise button (WP-T3-1) — opens a button-driven NL revision slot
+    (Banks pattern): the approver's next reply in this card's thread, within
+    the slot TTL, is the rewrite instruction. Facts are changed via Edit text."""
+    existing, refusal = _revisable_item_or_refusal(payload)
+    if refusal is not None:
+        return refusal
+    user_id = payload.get("user", {}).get("id", "")
+    _open_pending_slot(
+        slack_user_id=user_id, kind="revise", target_ref=str(existing.id),
+        channel_id=str((payload.get("channel") or {}).get("id") or ""),
+        thread_ts=existing.slack_message_ts,
+    )
+    _post_relay_thread_note(
+        existing,
+        f":writing_hand: <@{user_id}> Revising — reply here with your change "
+        f"(e.g. `shorter`, `drop the second paragraph`). Say `cancel` to stop. "
+        f"Expires in {settings.fa_max_pending_slot_ttl_min} min.",
+    )
+    return {}
+
+
+def _handle_relay_edit_text_open(payload: dict) -> dict:
+    """Slack Edit text button — opens the full-text revise modal (the WP-T2-2
+    mechanism), for when the approver wants to change facts by hand."""
+    from src.services.relay.slack_post import open_revise_modal
+
+    existing, refusal = _revisable_item_or_refusal(payload)
+    if refusal is not None:
+        return refusal
     open_revise_modal(payload.get("trigger_id", ""), existing)
     return {}
+
+
+def _open_pending_slot(**kwargs) -> None:
+    from src.services.fa_max_pending_slot import open_slot
+
+    with get_db_context() as session:
+        open_slot(session, **kwargs)
+
+
+def _get_pending_slot(slack_user_id: str):
+    """A slot-lookup failure degrades to "no slot" so it can never block the
+    approve/reject command path that runs after it."""
+    from sqlalchemy.exc import SQLAlchemyError
+    from src.services.fa_max_pending_slot import get_slot
+
+    try:
+        with get_db_context() as session:
+            return get_slot(session, slack_user_id)
+    except SQLAlchemyError as exc:
+        logger.error("[RelayInteract] pending-slot lookup failed: %s", type(exc).__name__)
+        return None
+
+
+def _clear_pending_slot(slack_user_id: str) -> None:
+    from src.services.fa_max_pending_slot import clear_slot
+
+    with get_db_context() as session:
+        clear_slot(session, slack_user_id)
+
+
+_REVISION_SLOT_PASSTHROUGH = frozenset({"approve", "reject"})
+
+
+def _consume_revise_slot(item, user_id: str, thread_ts: str, raw_text: str) -> bool:
+    """Route a card-thread reply through the approver's open Revise slot.
+
+    Returns True when the reply was handled here. A slot only captures a
+    reply in the thread it was opened on; `cancel` closes it; typed
+    approve/reject close it and fall through to the normal command path.
+    """
+    slot = _get_pending_slot(user_id)
+    if slot is None or slot.kind != "revise" or slot.thread_ts != thread_ts:
+        return False
+    command = raw_text.strip().casefold()
+    if command in _REVISION_SLOT_PASSTHROUGH:
+        _clear_pending_slot(user_id)
+        return False
+    if command == "cancel":
+        _clear_pending_slot(user_id)
+        _post_relay_thread_note(item, ":writing_hand: Revision cancelled.")
+        return True
+    _apply_nl_revision(item, raw_text.strip(), user_id)
+    return True
+
+
+def _apply_nl_revision(item, instruction: str, user_id: str) -> None:
+    """One tap = one revision: the slot is cleared whatever the outcome."""
+    _clear_pending_slot(user_id)
+    if item.status != "pending":
+        _post_relay_thread_note(item, f"Item #{item.id} is no longer pending — nothing revised.")
+        return
+    original = item.original_draft or ""
+    result = nl_revision.revise_draft(
+        instruction=instruction,
+        original=original,
+        current=item.final_content or original,
+        llm=nl_revision.claude_llm,
+    )
+    if not result.ok:
+        _post_relay_thread_note(item, ":warning: Couldn't revise — try again, or use Edit text.")
+        return
+    revised, _, refreshed = _apply_draft_revision(item, result.text, revised_by=f"slack_nl:{user_id}")
+    if revised is None:
+        _post_relay_thread_note(item, f"Item #{item.id} is no longer pending — nothing revised.")
+    elif not refreshed:
+        _post_relay_thread_note(
+            revised, "Revision saved, but the card could not refresh — tap Revise again before approving.",
+        )
+
+
+def _apply_draft_revision(existing, new_text: str, *, revised_by: str):
+    """Persist one revision (modal or NL) and refresh the card in place.
+
+    Returns (item | None, material_edit, card_refreshed). item is None when
+    the row is no longer pending. material_edit is measured against the
+    ORIGINAL draft and is sticky, so a run of small edits cannot dilute a
+    large overall rewrite below the Tier B edit-rate threshold.
+    """
+    from src.services.relay import queue as relay_queue
+    from src.services.relay.slack_post import refresh_card_after_revision
+
+    baseline = existing.original_draft or ""
+    material = bool(existing.material_edit) or _is_material_edit(baseline, new_text)
+    item = relay_queue.record_revision(
+        existing.id, final_content=new_text, revised_by=revised_by, material_edit=material,
+    )
+    if item is None:
+        return None, material, False
+    _post_relay_thread_note(
+        item,
+        f":pencil2: Revised by <@{revised_by.split(':', 1)[-1]}> (revision #{item.revision_count}"
+        f"{', material change' if material else ''}):\n{new_text[:2900]}",
+    )
+    # The card's Approve button carries revision_count_at_post; rebuilding it
+    # keeps a working Approve path after the stale-card guard sees the bump.
+    return item, material, refresh_card_after_revision(item)
 
 
 def _is_material_edit(old_text: str, new_text: str) -> bool:
@@ -2520,41 +2665,12 @@ def _handle_relay_revise_submission(payload: dict) -> dict:
     except Exception:
         return {"response_action": "errors", "errors": {"revised_content_block": "Missing revised content."}}
 
-    # Baseline is ALWAYS the original draft, never the previous revision
-    # (WP-T2-2 review fix): comparing each edit only to its immediate
-    # predecessor lets a sequence of individually-small revisions add up to
-    # a large overall rewrite without ever crossing the material-edit
-    # threshold. material_edit is also sticky (OR'd with its current value)
-    # so a later small, non-material tweak can never un-flag an item a
-    # prior revision already made material -- this flag feeds the Tier B
-    # graduation edit-rate gate, where under-counting edits is the unsafe
-    # direction.
-    baseline = existing.original_draft or ""
-    material = bool(existing.material_edit) or _is_material_edit(baseline, new_content)
-
-    item = relay_queue.record_revision(
-        item_id, final_content=new_content, revised_by=f"slack:{user_id}", material_edit=material,
-    )
+    item, _, refreshed = _apply_draft_revision(existing, new_content, revised_by=f"slack:{user_id}")
     if item is None:
         return {"response_action": "errors", "errors": {"revised_content_block": "Item is no longer pending."}}
-
-    _post_relay_thread_note(
-        item,
-        f":pencil2: Revised by <@{user_id}> (revision #{item.revision_count}"
-        f"{', material change' if material else ''}):\n{new_content[:2900]}",
-    )
-    # WP-T2-2 review fix: the original card's Approve button was posted with
-    # revision_count_at_post baked in from BEFORE this revision, so without
-    # refreshing it, the stale-card guard in _handle_relay_decision would
-    # refuse that button FOREVER after even one revision -- there would be
-    # no working Approve path left for this item via Slack. Rebuilding the
-    # card in place gives it fresh buttons whose baked-in revision_count
-    # matches the row this revision just produced.
-    from src.services.relay.slack_post import refresh_card_after_revision
-
-    if not refresh_card_after_revision(item):
+    if not refreshed:
         return {"response_action": "errors", "errors": {
-            "revised_content_block": "Revision saved, but Slack could not refresh the approval card. Reopen Revise and submit again before approval."
+            "revised_content_block": "Revision saved, but Slack could not refresh the approval card. Reopen Edit text and submit again before approval."
         }}
     return {"response_action": "clear"}
 

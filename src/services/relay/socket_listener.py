@@ -32,6 +32,11 @@ from config.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
+_REVISE_ACTIONS = {
+    "fa_max_revise": "_handle_relay_revise_open",
+    "fa_max_edit_text": "_handle_relay_edit_text_open",
+}
+
 
 def handle_socket_request(client: Any, request: Any) -> bool:
     """Acknowledge and dispatch one Slack Socket Mode envelope this listener owns.
@@ -226,7 +231,6 @@ def handle_socket_request(client: Any, request: Any) -> bool:
         _handle_relay_decision,
         _handle_relay_skip,
         _handle_relay_snooze,
-        _handle_relay_revise_open,
         _handle_confirm_entity_link,
         _handle_reject_entity_link,
         _handle_view_entity_link,
@@ -340,11 +344,11 @@ def handle_socket_request(client: Any, request: Any) -> bool:
     # these three were unreachable in production until this branch existed
     # here — approve/reject worked because they had their own action_id
     # branch below, but these three did not.
-    if action_id in ("fa_max_skip", "fa_max_snooze", "fa_max_revise"):
+    # fa_max_revise / fa_max_edit_text are dispatched below via _REVISE_ACTIONS (WP-T3-1).
+    if action_id in ("fa_max_skip", "fa_max_snooze"):
         _handler = {
             "fa_max_skip": _handle_relay_skip,
             "fa_max_snooze": _handle_relay_snooze,
-            "fa_max_revise": _handle_relay_revise_open,
         }[action_id]
         logger.info("[RelaySocket] relay %s: user=%s", action_id, user_id)
         try:
@@ -357,6 +361,19 @@ def handle_socket_request(client: Any, request: Any) -> bool:
             logger.exception("[RelaySocket] %s raised", action_id)
             return True
         _post_socket_ephemeral(client, payload, result or {})
+        return True
+
+    # FA Max Revise (NL slot) / Edit text (modal) — WP-T3-1
+    if action_id in _REVISE_ACTIONS:
+        import src.api.admin_router as _admin_router
+
+        logger.info("[RelaySocket] %s: user=%s", action_id, user_id)
+        try:
+            result = getattr(_admin_router, _REVISE_ACTIONS[action_id])(payload)
+        except Exception:
+            logger.exception("[RelaySocket] %s failed", action_id)
+            return True
+        _post_socket_ephemeral(client, payload, result)
         return True
 
     # Relay approve/reject

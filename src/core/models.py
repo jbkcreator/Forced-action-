@@ -12325,6 +12325,30 @@ class FaMaxThreadFallbackLog(Base):
     )
 
 
+class FaMaxPendingSlot(Base):
+    """WP-T3-1 — one short-lived "next message is for this card" slot per approver.
+
+    Opened by the Revise button (kind='revise', target_ref = relay item id,
+    thread_ts = the card's ts) or the dial-list Log call button (kind='voice',
+    target_ref = opportunity id). Last tap wins; expiry enforced on read.
+    """
+
+    __tablename__ = "fa_max_pending_slots"
+
+    slack_user_id: Mapped[str] = mapped_column(String(60), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(10), nullable=False)
+    target_ref: Mapped[str] = mapped_column(String(64), nullable=False)
+    channel_id: Mapped[str] = mapped_column(String(40), nullable=False)
+    thread_ts: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    set_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("kind IN ('revise','voice')", name="ck_fa_max_pending_slot_kind"),
+    )
+
+
 class FaMaxGyrRoutingLog(Base):
     """Immutable audit log — one row per GYR routing decision (WP-T2-11).
 

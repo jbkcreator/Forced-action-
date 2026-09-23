@@ -1,0 +1,324 @@
+"""WP-T3-1 ticket 01 — button-driven NL revision (pending slot → rewrite in place)."""
+from __future__ import annotations
+
+import json
+from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from src.services import fa_max_pending_slot as slots
+from src.services.fa_max_pending_slot import PendingSlot
+from src.services.relay import nl_revision
+
+NOW = datetime(2026, 9, 23, 12, 0, tzinfo=timezone.utc)
+
+
+def _slot(**over) -> PendingSlot:
+    base = dict(
+        slack_user_id="U1", kind="revise", target_ref="7", channel_id="C1",
+        thread_ts="111.1", set_at=NOW,
+    )
+    base.update(over)
+    return PendingSlot(**base)
+
+
+def _item(**over):
+    base = dict(
+        id=7, venture_key="fa_max_lending", status="pending", revision_count=0,
+        slack_message_ts="111.1", original_draft="Hi Mike, saw your permit on 12 Oak St. We fund flips fast. Want to chat?",
+        final_content=None, material_edit=False,
+    )
+    base.update(over)
+    return MagicMock(**base)
+
+
+# ── pending slot ─────────────────────────────────────────────────────────────
+
+class TestPendingSlot:
+    def test_open_slot_is_an_upsert_so_last_tap_wins(self):
+        session = MagicMock()
+        slots.open_slot(session, slack_user_id="U1", kind="revise", target_ref="7",
+                        channel_id="C1", thread_ts="111.1")
+        sql = str(session.execute.call_args.args[0])
+        assert "ON CONFLICT (slack_user_id) DO UPDATE" in sql
+
+    def test_open_slot_rejects_unknown_kind(self):
+        with pytest.raises(ValueError):
+            slots.open_slot(MagicMock(), slack_user_id="U1", kind="bogus", target_ref="7", channel_id="C1")
+
+    def test_get_slot_returns_live_slot(self):
+        session = MagicMock()
+        session.execute.return_value.mappings.return_value.first.return_value = {
+            "slack_user_id": "U1", "kind": "revise", "target_ref": "7", "channel_id": "C1",
+            "thread_ts": "111.1", "set_at": NOW - timedelta(minutes=5),
+        }
+        slot = slots.get_slot(session, "U1", now=NOW, ttl_min=15)
+        assert slot is not None and slot.target_ref == "7"
+
+    def test_get_slot_expired_is_deleted_and_returns_none(self):
+        session = MagicMock()
+        session.execute.return_value.mappings.return_value.first.return_value = {
+            "slack_user_id": "U1", "kind": "revise", "target_ref": "7", "channel_id": "C1",
+            "thread_ts": "111.1", "set_at": NOW - timedelta(minutes=16),
+        }
+        assert slots.get_slot(session, "U1", now=NOW, ttl_min=15) is None
+        assert "DELETE FROM fa_max_pending_slots" in str(session.execute.call_args.args[0])
+
+    def test_slot_lookup_db_failure_degrades_to_no_slot(self):
+        from sqlalchemy.exc import OperationalError
+        from src.api import admin_router
+
+        with patch.object(admin_router, "get_db_context", side_effect=OperationalError("x", {}, None)):
+            assert admin_router._get_pending_slot("U1") is None
+
+    def test_get_slot_missing_returns_none(self):
+        session = MagicMock()
+        session.execute.return_value.mappings.return_value.first.return_value = None
+        assert slots.get_slot(session, "U1", now=NOW) is None
+
+
+# ── rewrite core ─────────────────────────────────────────────────────────────
+
+class TestReviseDraft:
+    def test_returns_llm_text_on_success(self):
+        llm = MagicMock(return_value="  Hi Mike, saw your permit on 12 Oak St. Want to chat?  ")
+        res = nl_revision.revise_draft(
+            instruction="shorter", original="orig", current="orig", llm=llm,
+        )
+        assert res.ok and res.text == "Hi Mike, saw your permit on 12 Oak St. Want to chat?"
+
+    def test_prompt_carries_instruction_original_and_current_as_data(self):
+        llm = MagicMock(return_value="x")
+        nl_revision.revise_draft(instruction="shorter", original="ORIG", current="CURR", llm=llm)
+        system, user = llm.call_args.args
+        assert "ORIGINAL" in system.upper()
+        assert "shorter" in user and "ORIG" in user and "CURR" in user
+
+    def test_llm_exception_is_llm_error(self):
+        llm = MagicMock(side_effect=RuntimeError("boom"))
+        res = nl_revision.revise_draft(instruction="shorter", original="o", current="o", llm=llm)
+        assert not res.ok and res.reason == "llm_error"
+
+    @pytest.mark.parametrize("out", ["", "   ", "[BLOCKED] Vendor cost pause active"])
+    def test_empty_or_blocked_output_is_llm_error(self, out):
+        res = nl_revision.revise_draft(
+            instruction="shorter", original="o", current="o", llm=MagicMock(return_value=out),
+        )
+        assert not res.ok and res.reason == "llm_error"
+
+
+# ── thread routing (precedence) ──────────────────────────────────────────────
+
+def _thread_event(text: str, thread_ts: str = "111.1") -> dict:
+    return {"event": {"type": "message", "text": text, "thread_ts": thread_ts, "user": "U1", "channel": "C1"}}
+
+
+class TestThreadRouting:
+    def _run(self, text, *, slot, thread_ts="111.1", item=None):
+        from src.api import admin_router
+
+        item = item or _item()
+        with patch("src.services.relay.queue.get_item_by_slack_message_ts", return_value=item), \
+             patch.object(admin_router, "_relay_approver_authorized", return_value=True), \
+             patch.object(admin_router, "_get_pending_slot", return_value=slot), \
+             patch.object(admin_router, "_clear_pending_slot") as clear, \
+             patch.object(admin_router, "_apply_nl_revision") as apply_nl, \
+             patch.object(admin_router, "_post_relay_thread_note") as note, \
+             patch.object(admin_router, "_handle_relay_decision") as decide, \
+             patch("src.services.relay.thread_fallback_responder.handle_thread_fallback_reply") as fallback:
+            admin_router._handle_relay_thread_action(_thread_event(text, thread_ts))
+        return dict(clear=clear, apply_nl=apply_nl, note=note, decide=decide, fallback=fallback)
+
+    def test_slot_same_thread_routes_to_revision(self):
+        m = self._run("shorter", slot=_slot())
+        m["apply_nl"].assert_called_once()
+        m["fallback"].assert_not_called()
+
+    def test_no_slot_still_reaches_fallback(self):
+        m = self._run("shorter", slot=None)
+        m["apply_nl"].assert_not_called()
+        m["fallback"].assert_called_once()
+
+    def test_slot_for_other_thread_is_not_consumed(self):
+        m = self._run("shorter", slot=_slot(thread_ts="999.9"))
+        m["apply_nl"].assert_not_called()
+        m["clear"].assert_not_called()
+        m["fallback"].assert_called_once()
+
+    def test_voice_slot_does_not_capture_text_reply(self):
+        m = self._run("shorter", slot=_slot(kind="voice"))
+        m["apply_nl"].assert_not_called()
+
+    def test_cancel_clears_slot_without_revising(self):
+        m = self._run("cancel", slot=_slot())
+        m["clear"].assert_called_once()
+        m["apply_nl"].assert_not_called()
+        m["fallback"].assert_not_called()
+        m["note"].assert_called_once()
+
+    def test_approve_with_slot_open_clears_and_goes_to_command_path(self):
+        m = self._run("approve", slot=_slot())
+        m["clear"].assert_called_once()
+        m["apply_nl"].assert_not_called()
+        m["decide"].assert_called_once()
+
+    def test_non_fa_max_card_ignores_slot(self):
+        m = self._run("shorter", slot=_slot(), item=_item(venture_key="hillsborough_distress"))
+        m["apply_nl"].assert_not_called()
+
+
+# ── apply NL revision ────────────────────────────────────────────────────────
+
+class TestApplyNlRevision:
+    def test_success_goes_through_shared_revision_helper(self):
+        from src.api import admin_router
+
+        item = _item()
+        with patch.object(admin_router, "_clear_pending_slot") as clear, \
+             patch.object(admin_router.nl_revision, "revise_draft",
+                          return_value=nl_revision.RevisionResult(ok=True, text="Hi Mike. Want to chat?")), \
+             patch.object(admin_router, "_apply_draft_revision", return_value=(item, True, True)) as apply, \
+             patch.object(admin_router, "_post_relay_thread_note"):
+            admin_router._apply_nl_revision(item, "shorter", "U1")
+        clear.assert_called_once_with("U1")
+        assert apply.call_args.args[1] == "Hi Mike. Want to chat?"
+        assert apply.call_args.kwargs["revised_by"] == "slack_nl:U1"
+
+    def test_failure_writes_nothing_and_posts_note(self):
+        from src.api import admin_router
+
+        item = _item()
+        with patch.object(admin_router, "_clear_pending_slot") as clear, \
+             patch.object(admin_router.nl_revision, "revise_draft",
+                          return_value=nl_revision.RevisionResult(ok=False, reason="llm_error")), \
+             patch.object(admin_router, "_apply_draft_revision") as apply, \
+             patch.object(admin_router, "_post_relay_thread_note") as note:
+            admin_router._apply_nl_revision(item, "shorter", "U1")
+        clear.assert_called_once()
+        apply.assert_not_called()
+        note.assert_called_once()
+
+    def test_not_pending_item_is_refused(self):
+        from src.api import admin_router
+
+        item = _item(status="approved")
+        with patch.object(admin_router, "_clear_pending_slot"), \
+             patch.object(admin_router.nl_revision, "revise_draft") as revise, \
+             patch.object(admin_router, "_post_relay_thread_note") as note:
+            admin_router._apply_nl_revision(item, "shorter", "U1")
+        revise.assert_not_called()
+        note.assert_called_once()
+
+    def test_uses_current_text_and_original_draft(self):
+        from src.api import admin_router
+
+        item = _item(final_content="CURRENT", original_draft="ORIGINAL")
+        with patch.object(admin_router, "_clear_pending_slot"), \
+             patch.object(admin_router.nl_revision, "revise_draft",
+                          return_value=nl_revision.RevisionResult(ok=False, reason="llm_error")) as revise, \
+             patch.object(admin_router, "_post_relay_thread_note"):
+            admin_router._apply_nl_revision(item, "shorter", "U1")
+        assert revise.call_args.kwargs["original"] == "ORIGINAL"
+        assert revise.call_args.kwargs["current"] == "CURRENT"
+
+
+# ── shared revision helper (modal + NL) ──────────────────────────────────────
+
+class TestApplyDraftRevision:
+    def _run(self, existing, new_text):
+        from src.api import admin_router
+
+        saved = _item(revision_count=1)
+        with patch("src.services.relay.queue.record_revision", return_value=saved) as rec, \
+             patch.object(admin_router, "_post_relay_thread_note"), \
+             patch("src.services.relay.slack_post.refresh_card_after_revision", return_value=True):
+            out = admin_router._apply_draft_revision(existing, new_text, revised_by="slack_nl:U1")
+        return out, rec
+
+    def test_material_edit_baseline_is_original_draft(self):
+        existing = _item(original_draft="a b c d e f g h i j", final_content="totally different words here")
+        (_, material, _), rec = self._run(existing, "a b c d e f g h i j")
+        assert material is False
+        assert rec.call_args.kwargs["material_edit"] is False
+
+    def test_material_edit_is_sticky(self):
+        existing = _item(original_draft="a b c d e f g h i j", material_edit=True)
+        (_, material, _), _ = self._run(existing, "a b c d e f g h i j")
+        assert material is True
+
+    def test_not_pending_returns_none(self):
+        from src.api import admin_router
+
+        with patch("src.services.relay.queue.record_revision", return_value=None), \
+             patch.object(admin_router, "_post_relay_thread_note") as note:
+            item, _, _ = admin_router._apply_draft_revision(_item(), "x", revised_by="slack:U1")
+        assert item is None
+        note.assert_not_called()
+
+
+# ── buttons ──────────────────────────────────────────────────────────────────
+
+def _action_payload(action_id: str) -> dict:
+    return {
+        "type": "block_actions", "user": {"id": "U1"}, "trigger_id": "T1",
+        "channel": {"id": "C1"},
+        "actions": [{"action_id": action_id, "value": json.dumps({"item_id": 7, "action": "revise"})}],
+    }
+
+
+class TestButtons:
+    def test_revise_button_opens_slot_not_modal(self):
+        from src.api import admin_router
+
+        with patch("src.services.relay.queue.get_item", return_value=_item()), \
+             patch.object(admin_router, "_relay_approver_authorized", return_value=True), \
+             patch.object(admin_router, "_open_pending_slot") as open_slot, \
+             patch.object(admin_router, "_post_relay_thread_note") as note, \
+             patch("src.services.relay.slack_post.open_revise_modal") as modal:
+            admin_router._handle_relay_revise_open(_action_payload("fa_max_revise"))
+        open_slot.assert_called_once()
+        assert open_slot.call_args.kwargs["kind"] == "revise"
+        assert open_slot.call_args.kwargs["thread_ts"] == "111.1"
+        note.assert_called_once()
+        modal.assert_not_called()
+
+    def test_revise_button_unauthorized_opens_nothing(self):
+        from src.api import admin_router
+
+        with patch("src.services.relay.queue.get_item", return_value=_item()), \
+             patch.object(admin_router, "_relay_approver_authorized", return_value=False), \
+             patch.object(admin_router, "_open_pending_slot") as open_slot:
+            admin_router._handle_relay_revise_open(_action_payload("fa_max_revise"))
+        open_slot.assert_not_called()
+
+    def test_edit_text_button_opens_modal(self):
+        from src.api import admin_router
+
+        with patch("src.services.relay.queue.get_item", return_value=_item()), \
+             patch.object(admin_router, "_relay_approver_authorized", return_value=True), \
+             patch("src.services.relay.slack_post.open_revise_modal") as modal:
+            admin_router._handle_relay_edit_text_open(_action_payload("fa_max_edit_text"))
+        modal.assert_called_once()
+
+    def test_card_has_revise_and_edit_text_buttons(self):
+        from src.services.relay.slack_post import _build_approval_blocks
+
+        item = _item(recipient="x@example.com", channel="email", payload={"body": "b"})
+        with patch("src.services.relay.slack_post._summary_text", return_value="s"):
+            blocks = _build_approval_blocks(item)
+        ids = {e["action_id"] for e in blocks[1]["elements"]}
+        assert {"fa_max_revise", "fa_max_edit_text"} <= ids
+
+    @pytest.mark.parametrize("action_id,handler", [
+        ("fa_max_revise", "_handle_relay_revise_open"),
+        ("fa_max_edit_text", "_handle_relay_edit_text_open"),
+    ])
+    def test_socket_mode_dispatches_revise_buttons(self, action_id, handler):
+        from src.api import admin_router
+        from src.services.relay import socket_listener
+
+        request = MagicMock(type="interactive", envelope_id="E1", payload=_action_payload(action_id))
+        with patch.object(admin_router, handler, return_value={}) as h:
+            assert socket_listener.handle_socket_request(MagicMock(), request) is True
+        h.assert_called_once()

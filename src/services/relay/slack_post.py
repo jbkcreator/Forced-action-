@@ -293,6 +293,12 @@ def _build_approval_blocks(item: QueueItem) -> list:
                     "action_id": "fa_max_revise",
                     "value": revise_value,
                 },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Edit text"},
+                    "action_id": "fa_max_edit_text",
+                    "value": revise_value,
+                },
             ],
         },
     ]
