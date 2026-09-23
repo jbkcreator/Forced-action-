@@ -16,7 +16,7 @@ Tests:
 from __future__ import annotations
 
 import uuid
-from datetime import date
+from datetime import date, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -29,6 +29,11 @@ from src.services.fa_max_voice_intake import (
     handle_voice_intake,
     strip_financial,
 )
+
+
+# Due dates must be within [today, today+366d] or extraction drops them.
+_DUE = date.today() + timedelta(days=6)
+_DUE_ISO = _DUE.isoformat()
 
 
 # ── Transcriber ───────────────────────────────────────────────────────────────
@@ -109,11 +114,11 @@ class TestExtractDisposition:
             "outcome": "callback_requested",
             "summary": "Wants callback.",
             "next_action": "Call back Tuesday",
-            "next_action_due": "2026-09-30",
+            "next_action_due": _DUE_ISO,
         })
         assert d.outcome == "callback_requested"
         assert d.next_action == "Call back Tuesday"
-        assert d.next_action_due == date(2026, 9, 30)
+        assert d.next_action_due == _DUE
 
     def test_invalid_outcome_defaults_to_unclear(self):
         d = self._call({"outcome": "bogus_outcome", "summary": "Some text."})
@@ -435,7 +440,7 @@ class TestHandleVoiceIntakeHappyPath:
                       "outcome": "connected_interested",
                       "summary": "Good lead, interested.",
                       "next_action": "Call Thursday",
-                      "next_action_due": "2026-09-24",
+                      "next_action_due": _DUE_ISO,
                   }, "text": ""}),
             patch("src.services.fa_max_voice_intake.requests.get",
                   return_value=_fake_download()),
@@ -467,7 +472,7 @@ class TestHandleVoiceIntakeHappyPath:
         assert p["outcome"] == "connected_interested"
         assert p["summary"] == "Good lead, interested."
         assert p["next_action"] == "Call Thursday"
-        assert p["next_action_due"] == date(2026, 9, 24)
+        assert p["next_action_due"] == _DUE
         assert p["slack_user_id"] == _USER_ID
         assert p["interaction_id"] == fake_interaction_id
 
@@ -480,7 +485,7 @@ class TestHandleVoiceIntakeHappyPath:
 _TRANSCRIPT = "Talked to Mike Rivera, interested, call back Tuesday."
 _AUDIO = b"SECRET_AUDIO_BYTES"
 _DISP = {"outcome": "callback_requested", "summary": "Mike wants a callback.",
-         "next_action": "Call Mike", "next_action_due": "2026-09-29"}
+         "next_action": "Call Mike", "next_action_due": _DUE_ISO}
 
 
 def _patched_pipeline(session, *, client, file_info=None, llm=None, person=_PERSON_ID, extra=()):
@@ -755,7 +760,7 @@ class TestVoiceIntakeDb:
             assert len(inter) == 1 and len(disp) == 1
             assert tuple(inter[0][1:]) == ("voice", "outbound", "call disposition: callback_requested")
             assert disp[0][0] == inter[0][0] and disp[0][1] == opp
-            assert disp[0][2] == "callback_requested" and disp[0][5] == date(2026, 9, 29)
+            assert disp[0][2] == "callback_requested" and disp[0][5] == _DUE
             stored = " ".join(str(v) for row in inter + disp for v in row)
             assert "Mike Rivera" not in stored and "SECRET_AUDIO" not in stored
             rdd.assert_not_called()
@@ -912,3 +917,28 @@ class TestDialListTapsOnFaMaxSocket:
         handle.assert_called_once()
         assert handle.call_args.kwargs["client"] is client.web_client
         relay_decision.assert_not_called()
+
+
+class TestDueDateResolution:
+    def _extract(self, due, today=date(2026, 9, 23)):
+        with patch("src.services.claude_router.call_claude_with_usage",
+                   return_value={"tool_input": {"outcome": "callback_requested", "summary": "x",
+                                                "next_action": "Call", "next_action_due": due},
+                                 "text": ""}) as llm:
+            return extract_disposition("call back next Tuesday", today=today), llm
+
+    def test_prompt_carries_today(self):
+        _, llm = self._extract("2026-09-29")
+        assert "Today is Wednesday, 2026-09-23" in llm.call_args.kwargs["system"]
+
+    def test_next_tuesday_kept(self):
+        d, _ = self._extract("2026-09-29")
+        assert d.next_action_due == date(2026, 9, 29)
+
+    def test_past_date_dropped(self):
+        d, _ = self._extract("2025-07-22")
+        assert d.next_action_due is None and d.next_action == "Call"
+
+    def test_more_than_a_year_out_dropped(self):
+        d, _ = self._extract("2027-12-01")
+        assert d.next_action_due is None

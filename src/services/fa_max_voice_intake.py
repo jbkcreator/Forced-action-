@@ -12,7 +12,8 @@ import logging
 import re
 import threading
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Optional, Protocol, runtime_checkable
 
 import requests
@@ -152,9 +153,19 @@ class Disposition:
     next_action_due: Optional[date]
 
 
-def extract_disposition(transcript: str, db: Optional[Session] = None) -> Disposition:
+_LOCAL_TZ = ZoneInfo("America/Detroit")
+_MAX_DUE_AHEAD = timedelta(days=366)
+
+
+def extract_disposition(
+    transcript: str, db: Optional[Session] = None, *, today: Optional[date] = None,
+) -> Disposition:
     """Extract a structured call disposition from a transcript via Claude tool_use."""
     from src.services.claude_router import call_claude_with_usage
+
+    # The model has no clock: without today's date it resolves "next Tuesday"
+    # against its training data (a live test produced a date a year in the past).
+    today = today or datetime.now(_LOCAL_TZ).date()
 
     tool = {
         "name": "record_disposition",
@@ -177,7 +188,10 @@ def extract_disposition(transcript: str, db: Optional[Session] = None) -> Dispos
                 },
                 "next_action_due": {
                     "type": "string",
-                    "description": "ISO date for next action due date. Omit if none.",
+                    "description": (
+                        "ISO date (YYYY-MM-DD) the next action is due, resolved against "
+                        "today's date. Omit if the caller gave no day or date."
+                    ),
                 },
             },
             "required": ["outcome", "summary"],
@@ -189,7 +203,9 @@ def extract_disposition(transcript: str, db: Optional[Session] = None) -> Dispos
         system=(
             "You extract call dispositions from sales call transcripts. "
             "Never infer borrower financial data (rates, income, credit). "
-            "Use only what the caller said about the conversation outcome."
+            "Use only what the caller said about the conversation outcome. "
+            f"Today is {today:%A, %Y-%m-%d}; resolve relative days like 'next Tuesday' "
+            "against today."
         ),
         tools=[tool],
         db=db,
@@ -212,6 +228,10 @@ def extract_disposition(transcript: str, db: Optional[Session] = None) -> Dispos
             next_action_due = date.fromisoformat(str(due_raw))
         except ValueError:
             pass
+    if next_action_due and not (today <= next_action_due <= today + _MAX_DUE_AHEAD):
+        logger.warning("[VoiceIntake] dropped implausible next_action_due (%s days from today)",
+                       (next_action_due - today).days)
+        next_action_due = None
     return Disposition(
         outcome=outcome,
         summary=summary,
