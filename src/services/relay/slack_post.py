@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import hashlib
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from config.settings import get_settings
 from config.venture_template import DEFAULT_VENTURE_KEY
@@ -347,16 +347,22 @@ def _deal_detail_blocks() -> list:
     ]
 
 
-def _build_log_submission_modal() -> dict:
+def _build_log_submission_modal(channel_id: str = "") -> dict:
     """Addendum to WP-T2-6 -- initial view for logging a Backflip
     submission. Live-searches existing FA Max borrowers (Task 16/18)
     before ever asking Josh to re-enter someone we already know, closing
     the gap where backflip_ref was never created until terms arrived.
+
+    channel_id: the slash command's invoking channel, carried through
+    private_metadata (and forward through the new-borrower view swap via
+    _build_log_submission_new_entry_view's dict(prior_metadata)) so
+    _handle_log_submission_view_submit knows where to post the success
+    confirmation after a submission completes.
     """
     return {
         "type": "modal",
         "callback_id": "fa_max_log_submission_submit",
-        "private_metadata": json.dumps({"mode": "search"}),
+        "private_metadata": json.dumps({"mode": "search", "channel_id": channel_id}),
         "title": {"type": "plain_text", "text": "Log Backflip Submission"[:24]},
         "submit": {"type": "plain_text", "text": "Continue"},
         "close": {"type": "plain_text", "text": "Cancel"},
@@ -428,7 +434,7 @@ def _build_log_submission_new_entry_view(prior_metadata: dict) -> dict:
     }
 
 
-def open_log_submission_modal(trigger_id: str) -> bool:
+def open_log_submission_modal(trigger_id: str, channel_id: str = "") -> bool:
     """Opens the initial search view. Returns True on success."""
     settings = get_settings()
     token = settings.fa_max_slack_bot_token
@@ -438,12 +444,35 @@ def open_log_submission_modal(trigger_id: str) -> bool:
     try:
         from slack_sdk import WebClient
         WebClient(token=token.get_secret_value()).views_open(
-            trigger_id=trigger_id, view=_build_log_submission_modal(),
+            trigger_id=trigger_id, view=_build_log_submission_modal(channel_id),
         )
         return True
     except Exception as exc:
         logger.error("[Relay] views.open failed for log-submission modal: %s", exc, exc_info=True)
         return False
+
+
+def post_log_submission_confirmation(channel_id: str, full_name: str, backflip_ref: Optional[str]) -> None:
+    """Posts the success confirmation after a log-submission modal
+    completes -- mirrors post_completion_receipt's shape (icon + short
+    text, never raises, logs and returns on failure). No-ops if the
+    channel_id wasn't captured (e.g. an older-format private_metadata
+    from a modal opened before this field existed)."""
+    settings = get_settings()
+    token = settings.fa_max_slack_bot_token
+    if not token or not channel_id:
+        logger.info(
+            "[Relay] cannot post log-submission confirmation — no token or channel_id"
+        )
+        return
+    text = f"✅ Logged submission for {full_name}"
+    if backflip_ref:
+        text += f" ({backflip_ref})"
+    try:
+        from slack_sdk import WebClient
+        WebClient(token=token.get_secret_value()).chat_postMessage(channel=channel_id, text=text)
+    except Exception as exc:
+        logger.error("[Relay] log-submission confirmation post failed: %s", exc, exc_info=True)
 
 
 def open_log_submission_new_entry_view(view_id: str, view_hash: str, prior_metadata: dict) -> bool:

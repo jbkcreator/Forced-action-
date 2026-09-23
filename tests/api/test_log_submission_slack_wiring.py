@@ -25,7 +25,7 @@ class TestLogSubmissionSlashCommand:
                 headers=_signed_headers(),
             )
         assert response.status_code == 200
-        mock_open.assert_called_once_with("trig-1")
+        mock_open.assert_called_once_with("trig-1", "")
 
     def test_unauthorized_user_does_not_open_modal(self):
         with patch("src.api.admin_router._verify_slack_signature", return_value=True), \

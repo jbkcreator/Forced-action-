@@ -183,6 +183,133 @@ class TestLogSubmissionViewSubmission:
         assert address_calls[0].args[1]["property_address"] == "123 Main St"
         assert address_calls[0].args[1]["opportunity_id"] == "opp-4"
 
+    def test_new_borrower_loan_amount_is_persisted_as_cents(self):
+        # Regression: loan_amount_block was read from Slack and then
+        # silently discarded -- never written anywhere.
+        raw = _view_submission_payload(
+            "fa_max_log_submission_submit",
+            {"mode": "new_borrower", "channel_id": "C123"},
+            {
+                "new_full_name_block": {"new_full_name": {"value": "John Smith"}},
+                "loan_amount_block": {"loan_amount": {"value": "250,000.50"}},
+                "opportunity_type_block": {"opportunity_type": {"selected_option": {"value": "acquisition"}}},
+            },
+        )
+        fake_person_row = MagicMock()
+        fake_person_row.person_id = "p-new-5"
+        from src.api.admin_router import get_db
+
+        mock_db = MagicMock()
+        mock_db.execute.return_value.fetchone.return_value = fake_person_row
+
+        def _override():
+            yield mock_db
+
+        app.dependency_overrides[get_db] = _override
+        try:
+            with patch("src.api.admin_router._verify_slack_signature", return_value=True), \
+                 patch(
+                     "src.services.state_engine.create_fa_max_opportunity", return_value="opp-5",
+                 ), \
+                 patch("src.services.state_engine.transition"), \
+                 patch("src.services.fa_max_file_state.ensure_file_state"), \
+                 patch(
+                     "src.services.relay.slack_post.post_log_submission_confirmation",
+                 ) as mock_confirm:
+                response = client.post(
+                    "/api/admin/slack/interact", data=raw,
+                    headers={**_signed_headers(), "content-type": "application/x-www-form-urlencoded"},
+                )
+        finally:
+            app.dependency_overrides.pop(get_db, None)
+        assert response.status_code == 200
+        loan_calls = [
+            call for call in mock_db.execute.call_args_list
+            if call.args and isinstance(call.args[1], dict) and "loan_amount_cents" in call.args[1]
+        ]
+        assert len(loan_calls) == 1
+        assert loan_calls[0].args[1]["loan_amount_cents"] == 25000050
+        mock_confirm.assert_called_once_with("C123", "John Smith", None)
+
+    def test_new_borrower_unparseable_loan_amount_dropped_not_crashed(self):
+        raw = _view_submission_payload(
+            "fa_max_log_submission_submit",
+            {"mode": "new_borrower"},
+            {
+                "new_full_name_block": {"new_full_name": {"value": "John Smith"}},
+                "loan_amount_block": {"loan_amount": {"value": "not a number"}},
+                "opportunity_type_block": {"opportunity_type": {"selected_option": {"value": "acquisition"}}},
+            },
+        )
+        fake_person_row = MagicMock()
+        fake_person_row.person_id = "p-new-6"
+        from src.api.admin_router import get_db
+
+        mock_db = MagicMock()
+        mock_db.execute.return_value.fetchone.return_value = fake_person_row
+
+        def _override():
+            yield mock_db
+
+        app.dependency_overrides[get_db] = _override
+        try:
+            with patch("src.api.admin_router._verify_slack_signature", return_value=True), \
+                 patch(
+                     "src.services.state_engine.create_fa_max_opportunity", return_value="opp-6",
+                 ), \
+                 patch("src.services.state_engine.transition"), \
+                 patch("src.services.fa_max_file_state.ensure_file_state"):
+                response = client.post(
+                    "/api/admin/slack/interact", data=raw,
+                    headers={**_signed_headers(), "content-type": "application/x-www-form-urlencoded"},
+                )
+        finally:
+            app.dependency_overrides.pop(get_db, None)
+        assert response.status_code == 200
+        loan_calls = [
+            call for call in mock_db.execute.call_args_list
+            if call.args and isinstance(call.args[1], dict) and "loan_amount_cents" in call.args[1]
+        ]
+        assert len(loan_calls) == 0
+
+    def test_confirmation_posted_with_backflip_ref_for_existing_borrower(self):
+        raw = _view_submission_payload(
+            "fa_max_log_submission_submit",
+            {"mode": "search", "channel_id": "C999"},
+            {
+                "borrower_search_block": {"borrower_search": {"selected_option": {"value": "p-existing-9"}}},
+                "opportunity_type_block": {"opportunity_type": {"selected_option": {"value": "rehab"}}},
+                "backflip_ref_block": {"backflip_ref": {"value": "BF-9001"}},
+            },
+        )
+        from src.api.admin_router import get_db
+
+        mock_db = MagicMock()
+        mock_db.execute.return_value.scalar.return_value = "Jane Existing"
+
+        def _override():
+            yield mock_db
+
+        app.dependency_overrides[get_db] = _override
+        try:
+            with patch("src.api.admin_router._verify_slack_signature", return_value=True), \
+                 patch(
+                     "src.services.state_engine.create_fa_max_opportunity", return_value="opp-9",
+                 ), \
+                 patch("src.services.state_engine.transition"), \
+                 patch("src.services.fa_max_file_state.ensure_file_state"), \
+                 patch(
+                     "src.services.relay.slack_post.post_log_submission_confirmation",
+                 ) as mock_confirm:
+                response = client.post(
+                    "/api/admin/slack/interact", data=raw,
+                    headers={**_signed_headers(), "content-type": "application/x-www-form-urlencoded"},
+                )
+        finally:
+            app.dependency_overrides.pop(get_db, None)
+        assert response.status_code == 200
+        mock_confirm.assert_called_once_with("C999", "Jane Existing", "BF-9001")
+
     def test_new_borrower_phone_is_normalized_before_insert(self):
         raw = _view_submission_payload(
             "fa_max_log_submission_submit",

@@ -2526,6 +2526,10 @@ def _handle_log_submission_view_submit(payload: dict, db: Session) -> dict:
         person_id = str(person_row.person_id)
     else:
         person_id = _field("borrower_search_block", "borrower_search")
+        full_name = db.execute(
+            text("SELECT full_name FROM fa_max_persons WHERE person_id = :pid ::uuid"),
+            {"pid": person_id},
+        ).scalar() or "borrower"
 
     opportunity_type = _field("opportunity_type_block", "opportunity_type")
     opportunity_id = state_engine.create_fa_max_opportunity(
@@ -2556,21 +2560,41 @@ def _handle_log_submission_view_submit(payload: dict, db: Session) -> dict:
     # _build_log_submission_new_entry_view) -- absent from `values` on the
     # existing-borrower path, so _field() harmlessly returns "" -> None.
     property_address = _field("new_property_address_block", "new_property_address") or None
-    if backflip_ref or property_address:
+    # loan_amount_block was read from Slack and then silently discarded --
+    # never written anywhere (WP-T2-6 review fix). Dollars-to-cents
+    # conversion matches record_terms()'s own established convention.
+    # Josh may type digits with commas/a "$" prefix; anything else
+    # unparseable is dropped rather than guessed at or crashing the
+    # submission over a formatting slip.
+    loan_amount_cents = None
+    loan_amount_raw = _field("loan_amount_block", "loan_amount")
+    if loan_amount_raw:
+        try:
+            loan_amount_cents = round(float(loan_amount_raw.replace(",", "").replace("$", "")) * 100)
+        except ValueError:
+            logger.warning(
+                "log-submission: unparseable loan_amount %r for opportunity_id=%s -- dropped",
+                loan_amount_raw, opportunity_id,
+            )
+    if backflip_ref or property_address or loan_amount_cents is not None:
         db.execute(
             text(
                 "UPDATE fa_max_opportunities SET "
                 "backflip_ref = COALESCE(:backflip_ref, backflip_ref), "
                 "property_address = COALESCE(:property_address, property_address), "
+                "loan_amount_cents = COALESCE(:loan_amount_cents, loan_amount_cents), "
                 "updated_at = NOW() WHERE opportunity_id = :opportunity_id ::uuid"
             ),
             {
                 "backflip_ref": backflip_ref, "property_address": property_address,
-                "opportunity_id": opportunity_id,
+                "loan_amount_cents": loan_amount_cents, "opportunity_id": opportunity_id,
             },
         )
         db.commit()
 
+    from src.services.relay.slack_post import post_log_submission_confirmation
+
+    post_log_submission_confirmation(metadata.get("channel_id", ""), full_name, backflip_ref)
     return {}
 
 
@@ -3289,7 +3313,7 @@ def _fa_max_log_submission_command(form: dict) -> dict:
         return _slack_ephemeral("Not authorized to log a Backflip submission.")
 
     trigger_id = form.get("trigger_id", "")
-    if not open_log_submission_modal(trigger_id):
+    if not open_log_submission_modal(trigger_id, form.get("channel_id", "")):
         return _slack_ephemeral("Couldn't open the form — try again in a moment.")
     return {"response_type": "ephemeral"}
 
