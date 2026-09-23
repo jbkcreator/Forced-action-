@@ -497,7 +497,49 @@ def _handle_sufficient(
         # transaction after the lock releases.
         _cancel_all_gap_alerts_for_opportunity(session=session, opportunity_id=opportunity_id)
 
+        # Compute + persist the Scenario Builder result for EVERY sufficient
+        # evaluation, not only the first (code-review finding, ninth round,
+        # 2026-09): the state_engine.transition() hook only fires on the
+        # qualifying→scoping STAGE CHANGE — a later correction that keeps
+        # the opportunity in 'scoping' (or beyond) produces no new stage
+        # transition, so the dossier Josh reviews never reflected it. This
+        # is the primary, reliable trigger for BOTH first sufficiency and
+        # every later correction; enqueue_quote_ready_work above remains
+        # for whichever future consumer eventually reads that queue.
+        #
+        # Persist here, under the SAME lock validated above (so this result
+        # is provably computed from the exact facts just validated); Slack
+        # delivery happens AFTER commit below, never inside this
+        # transaction, so a later failure in this same transaction can
+        # never leave a posted card with no committed row behind it.
+        #
+        # Isolated in its own savepoint (matching state_engine.py's
+        # existing _maybe_trigger_quote_ready_review pattern): a Scenario
+        # Builder compute/persist failure must never poison the stage
+        # transition, EXCEPTIONS cancellation, and builder-queue enqueue
+        # already done above in this same transaction.
+        pending_dossier_result_id = None
+        sp = session.begin_nested()
+        try:
+            from src.services.quote_ready.dossier import compute_and_persist_quote_ready
+            pending_dossier_result_id = compute_and_persist_quote_ready(
+                session, opportunity_id=opportunity_id
+            )
+            sp.commit()
+        except Exception:
+            sp.rollback()
+            logger.warning(
+                "fa_max.qual_worker: Scenario Builder compute/persist failed for"
+                " opportunity=%s — stage transition/cancellation above are unaffected",
+                opportunity_id, exc_info=True,
+            )
+
         session.commit()
+
+    if pending_dossier_result_id:
+        from src.services.quote_ready.dossier import post_quote_ready_dossier
+        with get_db_context() as delivery_session:
+            post_quote_ready_dossier(delivery_session, pending_dossier_result_id)
 
     if work_item_id:
         logger.info(

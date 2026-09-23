@@ -246,3 +246,261 @@ class TestResolveQuoteReadyFactsUnit:
         )
         assert resolved["rehab_estimate"] == 20000
         assert resolved["facts_revision"] == 0
+
+
+class TestCorrectionAfterScopingRebuildsScenario:
+    """code-review finding, ninth round, 2026-09: the state_engine transition
+    hook only fires on the qualifying->scoping STAGE CHANGE. A later
+    correction that keeps the opportunity in 'scoping' produced no new
+    trigger at all -- _handle_sufficient must now rebuild the scenario on
+    EVERY sufficient evaluation, not just the first."""
+
+    def test_second_sufficient_evaluation_from_scoping_produces_new_result(self, fresh_db):
+        from src.services.fa_max_qualification import set_facts, SufficiencyResult
+        from src.services.state_engine import get_opportunity_state
+        from src.agents.fa_max.qualification_worker import _handle_sufficient
+
+        property_id = _make_property(fresh_db)
+        _make_financials(fresh_db, property_id, est_repair_cost=20000, assessed_value_mkt=300000)
+        opp_id = _make_opportunity_with_property(fresh_db, property_id)
+
+        set_facts(
+            session=fresh_db, opportunity_id=opp_id,
+            updates={"purchase_price": 200000, "rehab_estimate": 50000, "arv": 320000},
+            source="client", set_by="admin:test",
+        )
+        fresh_db.commit()
+
+        opp = get_opportunity_state(session=fresh_db, opportunity_id=opp_id)
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                "src.agents.fa_max.qualification_worker.get_db_context",
+                lambda: _SessionCtx(fresh_db),
+            )
+            _handle_sufficient(
+                opportunity_id=opp_id, person_id=opp["person_id"],
+                current_stage=opp["current_stage"], state_version=opp["state_version"],
+                facts_revision=1,
+                result=SufficiencyResult(verdict="sufficient", gaps=[], opportunity_id=opp_id, facts_revision=1),
+            )
+        fresh_db.expire_all()
+
+        # Now already in 'scoping' -- a correction must still rebuild.
+        set_facts(
+            session=fresh_db, opportunity_id=opp_id,
+            updates={"rehab_estimate": 75000},
+            source="client", set_by="admin:test",
+        )
+        fresh_db.commit()
+        opp2 = get_opportunity_state(session=fresh_db, opportunity_id=opp_id)
+        assert opp2["current_stage"] == "scoping"  # confirms this is the correction case, not first-sufficiency
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                "src.agents.fa_max.qualification_worker.get_db_context",
+                lambda: _SessionCtx(fresh_db),
+            )
+            _handle_sufficient(
+                opportunity_id=opp_id, person_id=opp2["person_id"],
+                current_stage=opp2["current_stage"], state_version=opp2["state_version"],
+                facts_revision=2,
+                result=SufficiencyResult(verdict="sufficient", gaps=[], opportunity_id=opp_id, facts_revision=2),
+            )
+        fresh_db.expire_all()
+
+        rows = fresh_db.execute(
+            text(
+                "SELECT inputs FROM fa_max_quote_ready_results"
+                " WHERE opportunity_id = :oid ::uuid ORDER BY computed_at ASC"
+            ),
+            {"oid": opp_id},
+        ).mappings().all()
+        assert len(rows) == 2
+        assert float(rows[0]["inputs"]["rehab_estimate"]) == 50000
+        assert float(rows[1]["inputs"]["rehab_estimate"]) == 75000
+
+
+class _SessionCtx:
+    """Minimal context-manager wrapper so a test can substitute get_db_context()
+    with an already-open fresh_db session (matching the pattern used
+    elsewhere in this test suite's TestQualificationWorkerTransition test)."""
+    def __init__(self, session):
+        self._session = session
+
+    def __enter__(self):
+        return self._session
+
+    def __exit__(self, *exc):
+        return False
+
+
+class TestDeliveryNeverHappensBeforeCommit:
+    """code-review finding, ninth round, 2026-09: Slack delivery previously
+    happened INSIDE the same transaction/savepoint as the persist -- a
+    later failure in that same transaction could leave a posted card with
+    no committed row behind it. Prove delivery is now strictly post-commit:
+    if something in the SAME transaction fails after persist, Slack must
+    NEVER have been called at all (not "called then the card lacks a row" --
+    zero calls)."""
+
+    def test_downstream_failure_after_persist_results_in_zero_slack_calls(self):
+        from unittest.mock import patch
+        from src.services.quote_ready.dossier import compute_and_persist_quote_ready
+        from src.core.database import get_db_context
+        from src.services.fa_max_qualification import set_facts
+
+        with get_db_context() as setup_session:
+            property_id = _make_property(setup_session)
+            _make_financials(setup_session, property_id, est_repair_cost=20000, assessed_value_mkt=300000)
+            opp_id = _make_opportunity_with_property(setup_session, property_id)
+            setup_session.commit()
+        try:
+            with get_db_context() as session:
+                set_facts(
+                    session=session, opportunity_id=opp_id,
+                    updates={"purchase_price": 200000, "rehab_estimate": 50000, "arv": 320000},
+                    source="client", set_by="admin:test",
+                )
+                session.commit()
+
+            with patch(
+                "src.services.relay.slack_post.post_exceptions_alert"
+            ), patch(
+                "slack_sdk.WebClient.chat_postMessage"
+            ) as mock_slack_post:
+                with pytest.raises(RuntimeError):
+                    with get_db_context() as session:
+                        result_id = compute_and_persist_quote_ready(session, opportunity_id=opp_id)
+                        assert result_id is not None
+                        # Simulate a downstream failure in the SAME
+                        # transaction, after persist but before commit.
+                        raise RuntimeError("simulated downstream failure")
+
+            mock_slack_post.assert_not_called()
+
+            with get_db_context() as session:
+                # The persisted row must also be gone -- the whole
+                # transaction rolled back, exactly as intended.
+                count = session.execute(
+                    text(
+                        "SELECT COUNT(*) FROM fa_max_quote_ready_results"
+                        " WHERE opportunity_id = :oid ::uuid"
+                    ),
+                    {"oid": opp_id},
+                ).scalar()
+                assert count == 0
+        finally:
+            with get_db_context() as cleanup:
+                cleanup.execute(
+                    text("DELETE FROM fa_max_opportunity_facts WHERE opportunity_id = :oid ::uuid"),
+                    {"oid": opp_id},
+                )
+                cleanup.execute(
+                    text("DELETE FROM fa_max_opportunity_properties WHERE opportunity_id = :oid ::uuid"),
+                    {"oid": opp_id},
+                )
+                cleanup.execute(
+                    text("DELETE FROM fa_max_opportunities WHERE opportunity_id = :oid ::uuid"),
+                    {"oid": opp_id},
+                )
+                cleanup.commit()
+
+
+class TestMissingFinancialsRowStillProducesScenario:
+    def test_complete_t37_facts_with_no_financials_row_computes(self, fresh_db):
+        """code-review finding, ninth round, 2026-09: the financials-row
+        early return fired BEFORE T3-7 facts were ever read -- a rehab
+        opportunity with a complete client-confirmed purchase price, rehab
+        estimate, and ARV produced NO scenario if its property simply had
+        no financials row yet (a newly discovered property, by
+        construction, not an error state)."""
+        from src.services.fa_max_qualification import set_facts
+        from src.services.quote_ready.dossier import compute_and_persist_quote_ready
+
+        property_id = _make_property(fresh_db)
+        # Deliberately NO _make_financials() call -- no row at all.
+        opp_id = _make_opportunity_with_property(fresh_db, property_id)
+
+        set_facts(
+            session=fresh_db, opportunity_id=opp_id,
+            updates={"purchase_price": 200000, "rehab_estimate": 50000, "arv": 320000},
+            source="client", set_by="admin:test",
+        )
+        fresh_db.flush()
+
+        result_id = compute_and_persist_quote_ready(fresh_db, opportunity_id=opp_id)
+        assert result_id is not None
+
+        row = fresh_db.execute(
+            text(
+                "SELECT status, inputs FROM fa_max_quote_ready_results"
+                " WHERE result_id = :rid ::uuid"
+            ),
+            {"rid": result_id},
+        ).mappings().first()
+        assert row["status"] == "computed"
+        assert float(row["inputs"]["purchase_price"]) == 200000
+        assert float(row["inputs"]["rehab_estimate"]) == 50000
+        assert float(row["inputs"]["arv"]) == 320000
+
+
+class TestRevertedValueBecomesCurrentAgain:
+    def test_50k_to_60k_to_50k_ends_with_50k_current(self, fresh_db):
+        """code-review finding, ninth round, 2026-09: reverting rehab_estimate
+        from $50k to $60k and back to $50k must leave the $50k result
+        'computed' (current, reviewable) and the $60k result 'superseded' --
+        not the reverse, which was the bug (the exact-match lookup returned
+        the historical $50k row's id without reviving its status, while the
+        genuinely stale $60k row stayed marked 'computed')."""
+        from src.services.fa_max_qualification import set_facts
+        from src.services.quote_ready.dossier import compute_and_persist_quote_ready
+
+        property_id = _make_property(fresh_db)
+        _make_financials(fresh_db, property_id, est_repair_cost=20000, assessed_value_mkt=300000)
+        opp_id = _make_opportunity_with_property(fresh_db, property_id)
+
+        set_facts(
+            session=fresh_db, opportunity_id=opp_id,
+            updates={"purchase_price": 200000, "rehab_estimate": 50000, "arv": 320000},
+            source="client", set_by="admin:test",
+        )
+        fresh_db.flush()
+        result_50k_first = compute_and_persist_quote_ready(fresh_db, opportunity_id=opp_id)
+
+        set_facts(
+            session=fresh_db, opportunity_id=opp_id,
+            updates={"rehab_estimate": 60000}, source="client", set_by="admin:test",
+        )
+        fresh_db.flush()
+        result_60k = compute_and_persist_quote_ready(fresh_db, opportunity_id=opp_id)
+        assert result_60k != result_50k_first
+
+        set_facts(
+            session=fresh_db, opportunity_id=opp_id,
+            updates={"rehab_estimate": 50000}, source="client", set_by="admin:test",
+        )
+        fresh_db.flush()
+        result_50k_again = compute_and_persist_quote_ready(fresh_db, opportunity_id=opp_id)
+        assert result_50k_again == result_50k_first  # revived, not a fresh row
+
+        rows = {
+            r["result_id"]: r["status"]
+            for r in fresh_db.execute(
+                text(
+                    "SELECT result_id::text AS result_id, status"
+                    " FROM fa_max_quote_ready_results WHERE opportunity_id = :oid ::uuid"
+                ),
+                {"oid": opp_id},
+            ).mappings().all()
+        }
+        assert rows[result_50k_first] == "computed"
+        assert rows[result_60k] == "superseded"
+
+        current = fresh_db.execute(
+            text(
+                "SELECT inputs FROM fa_max_quote_ready_results"
+                " WHERE opportunity_id = :oid ::uuid AND status = 'computed'"
+            ),
+            {"oid": opp_id},
+        ).mappings().first()
+        assert float(current["inputs"]["rehab_estimate"]) == 50000

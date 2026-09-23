@@ -774,13 +774,25 @@ _DEFAULT_MAX_LTC = Decimal("0.85")
 _DEFAULT_MAX_LTV = Decimal("0.75")
 
 
-def maybe_trigger_quote_ready_review(session: Session, *, opportunity_id: str) -> None:
-    """Auto-compute and post a Quote Ready dossier when an opportunity has
-    enough real deal facts to be worth Josh's 3-minute review. Silent no-op
-    (not an error) when the opportunity has no linked subject property, or
-    no financials row, or the resulting scenario is identical to the last
-    one already posted (re-entering 'scoping' from 'ready_to_submit' with
-    unchanged facts must not re-spam a duplicate card).
+def compute_and_persist_quote_ready(session: Session, *, opportunity_id: str) -> Optional[str]:
+    """Compute a Quote Ready scenario from an opportunity's current facts
+    and durably persist it — NO Slack delivery here. Returns the result_id
+    of a genuinely NEW or changed scenario, or None when there is nothing
+    new to deliver (no linked subject property, or the resulting scenario
+    is identical to the last one already computed).
+
+    Split out from maybe_trigger_quote_ready_review (code-review finding,
+    ninth round, 2026-09) so a caller can commit this persist and THEN
+    attempt Slack delivery in a separate step/transaction — posting to
+    Slack from inside a savepoint of a larger, still-open transaction risks
+    a "phantom card": if something LATER in that same outer transaction
+    fails and rolls back, the Slack message was already sent (an
+    irreversible external side effect) but the DB row backing its
+    Approve/Modify/Reject buttons never committed. See
+    maybe_trigger_quote_ready_review's docstring for the still-inline
+    caller (the state_engine.transition() hook) and its accepted residual
+    risk, and qualification_worker.py's own caller for the fully-split
+    persist-then-deliver-after-commit pattern.
 
     Facts precedence (code-review finding, eighth round, 2026-09 — the T3-7
     Qualification Agent's client-confirmed facts and this financials-derived
@@ -792,7 +804,11 @@ def maybe_trigger_quote_ready_review(session: Session, *, opportunity_id: str) -
     client-always-wins-when-set precedence set_facts() already enforces on
     the write side. financials/published-ARV remain the fallback for any
     field the client hasn't confirmed (most commonly on an opportunity T3-7
-    never touched at all, or a pure enrichment-sourced field).
+    never touched at all, or a pure enrichment-sourced field, or a property
+    that simply has no financials row yet — code-review finding, ninth
+    round, 2026-09: financials is a fallback SOURCE, not a REQUIREMENT; a
+    property that hasn't been through enrichment yet must not block a
+    scenario T3-7's own facts are otherwise complete enough to compute).
     """
     from src.services.fa_max_qualification import resolve_quote_ready_facts
     from src.services.quote_ready.compute import compute_quote_ready
@@ -802,13 +818,28 @@ def maybe_trigger_quote_ready_review(session: Session, *, opportunity_id: str) -
     property_id = session.execute(_SUBJECT_PROPERTY_SQL, {"opportunity_id": opportunity_id}).scalar()
     if property_id is None:
         logger.info("[QuoteReady] auto-trigger skipped for opportunity_id=%s — no linked subject property", opportunity_id)
-        return
+        return None
 
+    # financials is a FALLBACK source, not a requirement — T3-7's own
+    # confirmed facts (resolved below) are the primary source and can be
+    # completely sufficient on their own (code-review finding, ninth round,
+    # 2026-09: this early return fired before T3-7's facts were ever read,
+    # so a rehab opportunity with a client-confirmed purchase price, rehab
+    # estimate, and ARV still produced NO scenario at all if its property
+    # simply hadn't been through the enrichment pipeline yet — a newly
+    # discovered or manually entered property has no financials row by
+    # construction, not by error). A missing row degrades gracefully to an
+    # all-None fallback; resolve_quote_ready_facts() below still lets T3-7's
+    # confirmed values through per field.
     fin = session.execute(_FINANCIALS_SQL, {"property_id": property_id}).mappings().first()
     if fin is None:
-        logger.info("[QuoteReady] auto-trigger skipped for opportunity_id=%s property_id=%s — no financials row",
-                    opportunity_id, property_id)
-        return
+        logger.info(
+            "[QuoteReady] opportunity_id=%s property_id=%s has no financials row —"
+            " proceeding on T3-7 facts alone where present",
+            opportunity_id, property_id,
+        )
+        fin = {"assessed_value_mkt": None, "last_sale_price": None,
+               "est_repair_cost": None, "legacy_arv": None}
 
     published_arv = get_published_arv(session, property_id)
     if published_arv is not None:
@@ -860,11 +891,33 @@ def maybe_trigger_quote_ready_review(session: Session, *, opportunity_id: str) -
     )
 
     if new_result_id == previous_id:
-        logger.info("[QuoteReady] auto-trigger for opportunity_id=%s: scenario unchanged, no new card posted",
+        logger.info("[QuoteReady] opportunity_id=%s: scenario unchanged, nothing new to deliver",
                      opportunity_id)
-        return
+        return None
 
-    logger.info("[QuoteReady] auto-trigger posted dossier for opportunity_id=%s result_id=%s"
-                " facts_revision=%d (missing=%s)",
+    logger.info("[QuoteReady] opportunity_id=%s computed+persisted result_id=%s"
+                " facts_revision=%d (missing=%s) — pending delivery",
                 opportunity_id, new_result_id, facts_revision, result.missing)
-    post_quote_ready_dossier(session, new_result_id)
+    return new_result_id
+
+
+def maybe_trigger_quote_ready_review(session: Session, *, opportunity_id: str) -> None:
+    """Compute, persist, AND post the dossier inline, in one call — kept for
+    the state_engine.transition() 'scoping' hook, whose savepoint-isolated
+    call site cannot straightforwardly defer delivery to after the OUTER
+    transaction commits (transition() is generic and used by many callers
+    beyond T3-7; restructuring its return contract to carry a pending
+    delivery id is out of scope here).
+
+    Accepted residual risk (unchanged from before the ninth-round split):
+    if the outer transaction this runs inside later fails and rolls back
+    AFTER this call's Slack post succeeds, the card stays posted with no
+    committed row behind its buttons. qualification_worker.py's own caller
+    (T3-7's real, primary path — both first sufficiency and every later
+    correction) does NOT use this function; it calls
+    compute_and_persist_quote_ready() directly and delivers strictly after
+    its own commit, closing this risk for the path T3-7 controls.
+    """
+    new_result_id = compute_and_persist_quote_ready(session, opportunity_id=opportunity_id)
+    if new_result_id is not None:
+        post_quote_ready_dossier(session, new_result_id)
