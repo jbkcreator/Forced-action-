@@ -1059,8 +1059,13 @@ def mark_opportunity_funded(
     current = get_opportunity_state(session=session, opportunity_id=opportunity_id)
     if not current:
         return TransitionResult(outcome=TransitionOutcome.invalid_transition, current_state=None)
+    # transition() requires a real fa_max_entity_registry entity_uuid, not
+    # the opportunity's own native ID (WP-T2-6 review fix).
+    entity_uuid = ensure_entity_registry(
+        session=session, entity_type="opportunity", native_id=opportunity_id,
+    )
     result = transition(
-        session=session, entity_type="opportunity", entity_uuid=opportunity_id,
+        session=session, entity_type="opportunity", entity_uuid=entity_uuid,
         from_state=current["current_stage"], to_state="funded", actor=actor,
         source_component="src.services.state_engine.mark_opportunity_funded",
         idempotency_key=idempotency_key, state_version=current["state_version"],

@@ -193,6 +193,7 @@ class TestConsolidatedProductionPaths:
         session = MagicMock()
         current = {"current_stage": "closing", "state_version": 4}
         with patch("src.services.state_engine.get_opportunity_state", return_value=current), \
+             patch("src.services.state_engine.ensure_entity_registry", return_value="registry-uuid-3"), \
              patch("src.services.state_engine.transition", return_value=TransitionResult(
                  outcome=TransitionOutcome.invalid_transition, current_state="closing",
              )):
@@ -201,6 +202,11 @@ class TestConsolidatedProductionPaths:
                 idempotency_key="funded:opportunity",
             )
         assert result.outcome == TransitionOutcome.invalid_transition
+        # No post-transition writes (the funded-outcome UPDATE) happen when
+        # the transition itself is refused -- ensure_entity_registry (which
+        # does its own session.execute calls, resolving the entity_uuid
+        # transition() requires) is mocked above so this assertion still
+        # tests exactly that, not the registry lookup's own DB calls.
         session.execute.assert_not_called()
 
     def test_funded_transition_sets_outcome_for_causal_gate(self):

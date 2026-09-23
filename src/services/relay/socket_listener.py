@@ -24,7 +24,7 @@ with ``connections:write`` scope).
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Optional
 
 from config.settings import get_settings
 
@@ -35,8 +35,9 @@ def handle_socket_request(client: Any, request: Any) -> bool:
     """Acknowledge and dispatch one Slack Socket Mode envelope this listener owns.
 
     Only ``events_api`` and ``interactive`` envelopes belong to this listener.
-    Other envelope types (e.g. ``slash_commands``, owned by
-    ``handle_tracked_link_socket_request``) are left un-acked and untouched so
+    Other envelope types (``slash_commands``, owned by
+    ``handle_tracked_link_socket_request`` or
+    ``handle_fa_max_slash_command_request``) are left un-acked and untouched so
     the listener that actually owns them can send Slack the real response —
     Slack Socket Mode resolves an envelope on its *first* acknowledgement, so
     acking here for an envelope this listener does not own would silently
@@ -50,11 +51,106 @@ def handle_socket_request(client: Any, request: Any) -> bool:
 
     from slack_sdk.socket_mode.response import SocketModeResponse
 
+    payload = request.payload or {}
+
+    # view_submission (WP-T2-6 new-file modal, and the pre-existing
+    # Revise modal) and block_suggestion (borrower-search autocomplete)
+    # must carry their real response -- response_action / options -- IN
+    # the envelope's own acknowledgement. Unlike a slash command, there is
+    # no response_url-style side channel for a modal's validation display,
+    # so the handler has to run (fast: a handful of inserts/selects) before
+    # the single ack this envelope gets. This is why these two are checked
+    # before the blank ack below, which every other interactive/events_api
+    # envelope gets instead.
+    if request.type == "interactive" and payload.get("type") == "view_submission":
+        callback_id = payload.get("view", {}).get("callback_id")
+
+        if callback_id == "fa_max_new_file_submit":
+            # This handler's DB work (profiled live: ~10s against this
+            # dev DB's network latency, well past Slack's ~3s Socket Mode
+            # ack window) cannot ride the ack the way fa_max_revise_submit
+            # below does -- found live during manual E2E testing (Slack
+            # reported dispatch_failed even though the DB write eventually
+            # succeeded). _new_file_pre_validate covers BOTH of the
+            # handler's error-returning checks and needs no DB access, so
+            # it runs before the ack; once it passes, ack immediately
+            # (closing the modal) and do the real DB work after -- same
+            # "ack fast, defer the work" pattern already used for the FA
+            # Max slash commands. There is no response_action channel
+            # left post-ack, so a DB-layer failure here can only be
+            # logged, not shown inline in the modal.
+            from src.api.admin_router import (
+                _handle_new_file_view_submit,
+                _new_file_pre_validate,
+            )
+            from src.core.database import get_db_context
+
+            try:
+                pre_validation_error = _new_file_pre_validate(payload)
+            except Exception:
+                logger.exception("[RelaySocket] new-file pre-validation raised")
+                pre_validation_error = None
+
+            if pre_validation_error is not None:
+                client.send_socket_mode_response(
+                    SocketModeResponse(envelope_id=request.envelope_id, payload=pre_validation_error)
+                )
+                return True
+
+            client.send_socket_mode_response(SocketModeResponse(envelope_id=request.envelope_id))
+            try:
+                with get_db_context() as db:
+                    _handle_new_file_view_submit(payload, db)
+            except Exception:
+                logger.exception("[RelaySocket] new-file DB work raised after ack")
+            return True
+
+        from src.api.admin_router import _handle_relay_revise_submission
+
+        try:
+            if callback_id == "fa_max_revise_submit":
+                # _handle_relay_revise_submission raises HTTPException on
+                # malformed view metadata -- that's caught by FastAPI's own
+                # exception middleware on the HTTP path, but there is no
+                # such middleware here. Left uncaught, this envelope would
+                # simply never get acked at all: Slack sees a silent
+                # 3-second timeout rather than a clean error.
+                result = _handle_relay_revise_submission(payload)
+            else:
+                result = {}
+        except Exception:
+            logger.exception(
+                "[RelaySocket] view_submission handler raised for callback_id=%s", callback_id,
+            )
+            result = {}
+        client.send_socket_mode_response(
+            SocketModeResponse(envelope_id=request.envelope_id, payload=result)
+        )
+        return True
+
+    if (
+        request.type == "interactive"
+        and payload.get("type") == "block_suggestion"
+        and payload.get("action_id") == "borrower_search"
+    ):
+        from src.api.admin_router import _handle_borrower_search_suggestion
+        from src.core.database import get_db_context
+
+        try:
+            with get_db_context() as db:
+                result = _handle_borrower_search_suggestion(payload, db)
+        except Exception:
+            logger.exception("[RelaySocket] block_suggestion handler raised for borrower_search")
+            result = {"options": []}
+        client.send_socket_mode_response(
+            SocketModeResponse(envelope_id=request.envelope_id, payload=result)
+        )
+        return True
+
     # Slack requires this acknowledgement within three seconds.  The durable
     # handler is intentionally called only after it, and remains idempotent.
     client.send_socket_mode_response(SocketModeResponse(envelope_id=request.envelope_id))
 
-    payload = request.payload or {}
     if request.type == "events_api":
         # Socket Mode delivers subscribed Events API payloads in an
         # ``events_api`` envelope. Reuse the HTTP route's thread-command
@@ -78,10 +174,23 @@ def handle_socket_request(client: Any, request: Any) -> bool:
         _handle_add_builder_to_diallist,
         _handle_snooze_builder,
         _handle_dismiss_builder,
+        _handle_new_file_new_borrower_click,
     )
     from src.core.database import get_db_context
 
     user_id = payload.get("user", {}).get("id", "?")
+
+    # WP-T2-6 addendum: "Not on this list -- new borrower" button inside
+    # the new-file modal. No DB session and no ephemeral reply --
+    # the handler's only effect is a views.update call swapping the modal
+    # in place, and it always returns {}.
+    if action_id == "new_file_new_borrower":
+        logger.info("[RelaySocket] new-file new-borrower click user=%s", user_id)
+        try:
+            _handle_new_file_new_borrower_click(payload)
+        except Exception:
+            logger.exception("[RelaySocket] failed to open new-borrower view")
+        return True
 
     # EXCEPTIONS lane (WP-T2-8)
     if action_id and action_id.startswith("confirm_entity_link_"):
@@ -172,6 +281,90 @@ def _post_socket_ephemeral(client: Any, payload: dict, result: dict) -> None:
         logger.warning("[RelaySocket] could not post ephemeral reply: %s", text)
 
 
+_FA_MAX_SLASH_COMMANDS = frozenset({
+    "/fa-max-new-file", "/fa-max-update-file", "/fa-max-open-files",
+})
+
+
+def _post_slash_reply(response_url: Optional[str], reply: dict) -> None:
+    """Deliver a slash command's reply after the 3-second ack window has
+    already been used. Best-effort: Slack has nothing to retry against if
+    this fails, so log and move on rather than raising into the listener.
+
+    Local copy of src/services/tracked_links.py's helper of the same
+    name and shape -- small enough that duplicating it keeps each
+    listener's Slack reply plumbing independent, matching this module's
+    own contract of unrelated workflows never stepping on each other.
+    """
+    if not response_url:
+        logger.warning("[FaMaxSlash] no response_url on envelope, reply dropped")
+        return
+    from src.utils.http_helpers import requests_post_with_retry
+
+    try:
+        resp = requests_post_with_retry(response_url, json=reply, timeout=5)
+        logger.info("[FaMaxSlash] response_url POST -> status=%s", resp.status_code)
+    except Exception:
+        logger.exception("[FaMaxSlash] failed to deliver reply via response_url")
+
+
+def handle_fa_max_slash_command_request(client: Any, request: Any) -> bool:
+    """Socket Mode envelope handler for '/fa-max-new-file',
+    '/fa-max-update-file', and '/fa-max-open-files' (WP-T2-6). This
+    Slack app has no Interactivity/slash-command Request URL option once
+    Socket Mode is enabled, so these commands -- and view_submission/
+    block_suggestion, handled in handle_socket_request above -- are
+    unreachable via the HTTP routes in src/api/admin_router.py in this
+    deployment. The same pure functions those routes call are reused here
+    rather than duplicated.
+
+    Returns True only when this listener handled one of these commands --
+    every other envelope is left untouched, same contract as
+    handle_tracked_link_socket_request.
+    """
+    if request.type != "slash_commands":
+        return False
+    payload = request.payload or {}
+    command = payload.get("command")
+    if command not in _FA_MAX_SLASH_COMMANDS:
+        return False
+
+    from slack_sdk.socket_mode.response import SocketModeResponse
+
+    # Ack bare immediately, same discipline as _on_request /
+    # handle_tracked_link_socket_request -- the real reply goes out via
+    # response_url once the (fast) DB work below is done.
+    client.send_socket_mode_response(SocketModeResponse(envelope_id=request.envelope_id))
+
+    response_url = payload.get("response_url")
+    if command == "/fa-max-new-file":
+        from src.api.admin_router import _fa_max_new_file_command
+
+        reply = _fa_max_new_file_command(payload)
+    elif command == "/fa-max-update-file":
+        from src.api.admin_router import _fa_max_update_file_command
+        from src.core.database import get_db_context
+
+        with get_db_context() as db:
+            reply = _fa_max_update_file_command(payload, db)
+    else:
+        from src.api.admin_router import _fa_max_open_files_command
+        from src.core.database import get_db_context
+
+        with get_db_context() as db:
+            reply = _fa_max_open_files_command(payload, db)
+
+    if reply.get("text"):
+        # A reply with no text (e.g. _fa_max_new_file_command's
+        # success case -- the modal already opened via views.open, there
+        # is nothing left to say) was harmless as a direct HTTP ack, but
+        # POSTing it to response_url is a real Slack API call, and Slack
+        # rejects a contentless ephemeral message with a 500. Simplest
+        # correct behavior: nothing to say means nothing to post.
+        _post_slash_reply(response_url, reply)
+    return True
+
+
 def run() -> None:
     """Connect the Relay listener and keep it alive until the service stops."""
     settings = get_settings()
@@ -225,8 +418,15 @@ def run() -> None:
         except Exception:
             logger.exception("[RelaySocket] failed to process /tracked-link request")
 
+    def _on_fa_max_slash_request(client: Any, request: Any) -> None:
+        try:
+            handle_fa_max_slash_command_request(client, request)
+        except Exception:
+            logger.exception("[RelaySocket] failed to process FA Max slash command request")
+
     socket.socket_mode_request_listeners.append(_on_request)
     socket.socket_mode_request_listeners.append(_on_tracked_link_request)
+    socket.socket_mode_request_listeners.append(_on_fa_max_slash_request)
     logger.info("[RelaySocket] connecting via Socket Mode")
     socket.connect()
 
