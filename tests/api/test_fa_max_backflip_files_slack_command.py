@@ -68,8 +68,12 @@ class TestFaMaxBackflipFilesCommand:
             app.dependency_overrides.pop(get_db, None)
         assert response.status_code == 200
         text = response.json()["text"]
-        assert "Jane Doe — bl1234 — under_review" in text
-        assert "John Smith — BF-2001 — submitted" in text
+        assert "*Open Backflip Files* (2)" in text
+        assert "```" in text
+        assert "Borrower" in text and "Ref" in text and "Stage" in text
+        assert "Jane Doe" in text and "bl1234" in text and "under_review" in text
+        assert "John Smith" in text and "BF-2001" in text and "submitted" in text
+        assert "/fa-max-file-update <ref> ...`" in text
 
     def test_empty_result_returns_friendly_message(self):
         from src.api.admin_router import get_db

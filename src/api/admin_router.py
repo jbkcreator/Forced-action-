@@ -3376,8 +3376,21 @@ def _fa_max_backflip_files_command(form: dict, db: Session) -> dict:
     if not rows:
         return _slack_ephemeral("No open files with a Backflip reference on record.")
 
-    lines = [f"{r.full_name or 'Unnamed'} — {r.backflip_ref} — {r.current_stage}" for r in rows]
-    return _slack_ephemeral("\n".join(lines))
+    names = [r.full_name or "Unnamed" for r in rows]
+    name_width = max(len("Borrower"), *(len(n) for n in names))
+    ref_width = max(len("Ref"), *(len(r.backflip_ref) for r in rows))
+
+    table_lines = [f"{'Borrower':<{name_width}}  {'Ref':<{ref_width}}  Stage"]
+    for name, r in zip(names, rows):
+        table_lines.append(f"{name:<{name_width}}  {r.backflip_ref:<{ref_width}}  {r.current_stage}")
+    table_body = "\n".join(table_lines)
+
+    message = (
+        f"*Open Backflip Files* ({len(rows)})\n"
+        f"```{table_body}```\n"
+        f"Copy a ref above into `/fa-max-file-update <ref> ...`"
+    )
+    return _slack_ephemeral(message)
 
 
 def _parse_slack_form(raw: bytes) -> dict:
