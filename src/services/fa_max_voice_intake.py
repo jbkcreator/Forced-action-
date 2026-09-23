@@ -6,8 +6,11 @@ Audio bytes and transcripts are never stored; only their lengths are logged.
 """
 from __future__ import annotations
 
+import importlib.util
+import io
 import logging
 import re
+import threading
 from dataclasses import dataclass
 from datetime import date
 from typing import Optional, Protocol, runtime_checkable
@@ -80,9 +83,61 @@ class WhisperTranscriber:
         return resp.json().get("text", "")
 
 
+# Biases decoding toward lending vocabulary (small.en heard "rehab" as "Rahab").
+_LOCAL_HINT_PROMPT = (
+    "Call notes from a private lender: rehab, flip, fix and flip, DSCR, bridge loan, "
+    "Backflip, cash purchase, permit, contractor, draw, closing, callback."
+)
+
+
+class FasterWhisperTranscriber:
+    """Self-hosted Whisper via faster-whisper (CPU, int8). Audio is decoded in
+    memory and never written to disk.
+
+    One model per process, loaded on first use. Calls are serialized: the
+    Socket Mode listener runs up to 25 worker threads, and parallel decodes on
+    a 4-vCPU prod box would each run slower and multiply RAM.
+    """
+
+    _model = None
+    _lock = threading.Lock()
+
+    def __init__(self, model_name: str, cpu_threads: int) -> None:
+        self._model_name = model_name
+        self._cpu_threads = cpu_threads
+
+    def _get_model(self):
+        cls = type(self)
+        if cls._model is None:
+            from faster_whisper import WhisperModel
+
+            logger.info("[VoiceIntake] loading local whisper model %s", self._model_name)
+            cls._model = WhisperModel(
+                self._model_name, device="cpu", compute_type="int8",
+                cpu_threads=self._cpu_threads,
+            )
+        return cls._model
+
+    def transcribe(self, audio: bytes, filename: str, mimetype: str) -> str:
+        with type(self)._lock:
+            model = self._get_model()
+            segments, _info = model.transcribe(
+                io.BytesIO(audio), beam_size=1, initial_prompt=_LOCAL_HINT_PROMPT,
+            )
+            return " ".join(s.text.strip() for s in segments).strip()
+
+
 def get_transcriber() -> Optional[Transcriber]:
-    """Return WhisperTranscriber when configured, else None."""
-    if get_settings().openai_api_key is None:
+    """Return the configured transcriber, or None when it can't run here."""
+    settings = get_settings()
+    if settings.fa_max_transcriber == "local":
+        if importlib.util.find_spec("faster_whisper") is None:
+            logger.warning("[VoiceIntake] fa_max_transcriber=local but faster-whisper not installed")
+            return None
+        return FasterWhisperTranscriber(
+            settings.fa_max_local_whisper_model, settings.fa_max_local_whisper_threads,
+        )
+    if settings.openai_api_key is None:
         return None
     return WhisperTranscriber()
 

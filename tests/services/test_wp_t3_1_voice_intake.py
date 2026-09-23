@@ -45,20 +45,45 @@ class TestFakeTranscriber:
 
 
 class TestGetTranscriber:
-    def test_returns_none_when_no_openai_key(self):
+    def test_openai_mode_returns_none_when_no_openai_key(self):
         with patch("src.services.fa_max_voice_intake.get_settings") as mock_gs:
+            mock_gs.return_value.fa_max_transcriber = "openai"
             mock_gs.return_value.openai_api_key = None
             result = get_transcriber()
         assert result is None
 
-    def test_returns_whisper_when_key_set(self):
+    def test_openai_mode_returns_whisper_when_key_set(self):
         from src.services.fa_max_voice_intake import WhisperTranscriber
 
-        mock_key = MagicMock()
         with patch("src.services.fa_max_voice_intake.get_settings") as mock_gs:
-            mock_gs.return_value.openai_api_key = mock_key
+            mock_gs.return_value.fa_max_transcriber = "openai"
+            mock_gs.return_value.openai_api_key = MagicMock()
             result = get_transcriber()
         assert isinstance(result, WhisperTranscriber)
+
+    def test_local_mode_needs_no_api_key(self):
+        from src.services.fa_max_voice_intake import FasterWhisperTranscriber
+
+        with patch("src.services.fa_max_voice_intake.get_settings") as mock_gs,              patch("src.services.fa_max_voice_intake.importlib.util.find_spec", return_value=object()):
+            mock_gs.return_value.fa_max_transcriber = "local"
+            mock_gs.return_value.openai_api_key = None
+            mock_gs.return_value.fa_max_local_whisper_model = "small.en"
+            mock_gs.return_value.fa_max_local_whisper_threads = 2
+            result = get_transcriber()
+        assert isinstance(result, FasterWhisperTranscriber)
+
+    def test_local_mode_without_package_is_not_configured(self):
+        with patch("src.services.fa_max_voice_intake.get_settings") as mock_gs,              patch("src.services.fa_max_voice_intake.importlib.util.find_spec", return_value=None):
+            mock_gs.return_value.fa_max_transcriber = "local"
+            assert get_transcriber() is None
+
+    def test_default_setting_is_local_small_en(self):
+        from config.settings import AppSettings
+
+        fields = AppSettings.model_fields
+        assert fields["fa_max_transcriber"].default == "local"
+        assert fields["fa_max_local_whisper_model"].default == "small.en"
+        assert fields["fa_max_local_whisper_threads"].default == 2
 
 
 # ── extract_disposition ───────────────────────────────────────────────────────
@@ -766,3 +791,98 @@ class TestVoiceIntakeDb:
             s.close()
             outer.rollback()
             conn.close()
+
+
+# ── self-hosted faster-whisper transcriber ───────────────────────────────────
+
+class _FakeSegment:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+class _FakeWhisperModel:
+    instances = 0
+    calls: list = []
+
+    def __init__(self, name, device, compute_type, cpu_threads):
+        type(self).instances += 1
+        self.args = (name, device, compute_type, cpu_threads)
+
+    def transcribe(self, audio, **kwargs):
+        type(self).calls.append((audio, kwargs))
+        return iter([_FakeSegment(" Talked to Mike. "), _FakeSegment(" Call back Tuesday. ")]), None
+
+
+@pytest.fixture
+def fake_faster_whisper(monkeypatch):
+    import sys
+    import types
+    from src.services.fa_max_voice_intake import FasterWhisperTranscriber
+
+    _FakeWhisperModel.instances = 0
+    _FakeWhisperModel.calls = []
+    monkeypatch.setitem(sys.modules, "faster_whisper",
+                        types.SimpleNamespace(WhisperModel=_FakeWhisperModel))
+    monkeypatch.setattr(FasterWhisperTranscriber, "_model", None)
+    yield _FakeWhisperModel
+
+
+class TestFasterWhisperTranscriber:
+    def test_decodes_bytes_in_memory_with_domain_hint(self, fake_faster_whisper):
+        import io
+        from src.services.fa_max_voice_intake import FasterWhisperTranscriber
+
+        text = FasterWhisperTranscriber("small.en", 2).transcribe(b"AUDIO", "v.m4a", "audio/mp4")
+        assert text == "Talked to Mike. Call back Tuesday."
+        audio, kwargs = fake_faster_whisper.calls[0]
+        assert isinstance(audio, io.BytesIO) and audio.getvalue() == b"AUDIO"
+        assert kwargs["beam_size"] == 1
+        assert "rehab" in kwargs["initial_prompt"]
+
+    def test_model_loaded_once_on_cpu_int8(self, fake_faster_whisper):
+        from src.services.fa_max_voice_intake import FasterWhisperTranscriber
+
+        FasterWhisperTranscriber("small.en", 2).transcribe(b"a", "a.m4a", "audio/mp4")
+        FasterWhisperTranscriber("small.en", 2).transcribe(b"b", "b.m4a", "audio/mp4")
+        assert fake_faster_whisper.instances == 1
+        assert FasterWhisperTranscriber._model.args == ("small.en", "cpu", "int8", 2)
+
+    def test_concurrent_calls_are_serialized(self, fake_faster_whisper, monkeypatch):
+        import threading
+        import time
+        from src.services.fa_max_voice_intake import FasterWhisperTranscriber
+
+        active, peak = [0], [0]
+        guard = threading.Lock()
+
+        def slow_transcribe(self, audio, **kwargs):
+            with guard:
+                active[0] += 1
+                peak[0] = max(peak[0], active[0])
+            time.sleep(0.05)
+            with guard:
+                active[0] -= 1
+            return iter([_FakeSegment("ok")]), None
+
+        monkeypatch.setattr(_FakeWhisperModel, "transcribe", slow_transcribe)
+        t = FasterWhisperTranscriber("small.en", 2)
+        threads = [threading.Thread(target=t.transcribe, args=(b"x", "x.m4a", "audio/mp4"))
+                   for _ in range(4)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+        assert peak[0] == 1
+
+    def test_real_model_opt_in(self):
+        """Loads the real model. Opt in: FA_MAX_REAL_WHISPER_SAMPLE=<path to audio>."""
+        import importlib.util
+        import os
+        from src.services.fa_max_voice_intake import FasterWhisperTranscriber
+
+        sample = os.environ.get("FA_MAX_REAL_WHISPER_SAMPLE")
+        if not sample or importlib.util.find_spec("faster_whisper") is None:
+            pytest.skip("set FA_MAX_REAL_WHISPER_SAMPLE and install faster-whisper")
+        with open(sample, "rb") as fh:
+            text = FasterWhisperTranscriber("small.en", 2).transcribe(fh.read(), sample, "audio/mpeg")
+        assert len(text.split()) > 5
