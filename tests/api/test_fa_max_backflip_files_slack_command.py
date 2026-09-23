@@ -73,7 +73,9 @@ class TestFaMaxBackflipFilesCommand:
         assert "Borrower" in text and "Ref" in text and "Stage" in text
         assert "Jane Doe" in text and "bl1234" in text and "under_review" in text
         assert "John Smith" in text and "BF-2001" in text and "submitted" in text
-        assert "/fa-max-file-update <ref> ...`" in text
+        assert "/fa-max-file-update <ref> <stage>" in text
+        assert "/fa-max-file-update <ref> doc:<document name>" in text
+        assert "/fa-max-file-update <ref> received:<document name>" in text
 
     def test_empty_result_returns_friendly_message(self):
         from src.api.admin_router import get_db

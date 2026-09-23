@@ -3250,9 +3250,11 @@ def _fa_max_file_update_command(form: dict, db: Session) -> dict:
     tokens = (form.get("text") or "").strip().split(maxsplit=1)
     if len(tokens) != 2:
         return _slack_ephemeral(
-            "Usage: /fa-max-file-update <backflip_ref> <stage> | "
-            "/fa-max-file-update <backflip_ref> doc:<document name> | "
+            "Usage:\n```"
+            "/fa-max-file-update <backflip_ref> <stage>\n"
+            "/fa-max-file-update <backflip_ref> doc:<document name>\n"
             "/fa-max-file-update <backflip_ref> received:<document name>"
+            "```"
         )
     backflip_ref, action = tokens[0], tokens[1].strip()
 
@@ -3264,7 +3266,7 @@ def _fa_max_file_update_command(form: dict, db: Session) -> dict:
         document_name = action[len("received:"):].strip()
         if not document_name:
             return _slack_ephemeral(
-                "Usage: /fa-max-file-update <backflip_ref> received:<document name>"
+                f"Usage:\n```/fa-max-file-update {backflip_ref} received:<document name>```"
             )
         closed = fa_max_file_state.record_document_received(
             db, opportunity_id=resolved["opportunity_id"], document_name=document_name,
@@ -3280,7 +3282,9 @@ def _fa_max_file_update_command(form: dict, db: Session) -> dict:
     if action.lower().startswith("doc:"):
         document_name = action[len("doc:"):].strip()
         if not document_name:
-            return _slack_ephemeral("Usage: /fa-max-file-update <backflip_ref> doc:<document name>")
+            return _slack_ephemeral(
+                f"Usage:\n```/fa-max-file-update {backflip_ref} doc:<document name>```"
+            )
         fa_max_file_state.ensure_file_state(
             db, opportunity_id=resolved["opportunity_id"], person_id=resolved["person_id"],
         )
@@ -3301,10 +3305,10 @@ def _fa_max_file_update_command(form: dict, db: Session) -> dict:
 
     stage = action.lower()
     if stage not in BACKFLIP_STAGE_KEYS:
-        return _slack_ephemeral(
-            f"Usage: /fa-max-file-update {backflip_ref} <stage> — one of: "
-            + ", ".join(sorted(BACKFLIP_STAGE_KEYS))
+        stage_lines = "\n".join(
+            f"/fa-max-file-update {backflip_ref} {s}" for s in sorted(BACKFLIP_STAGE_KEYS)
         )
+        return _slack_ephemeral(f"Usage — one of:\n```{stage_lines}```")
     fa_max_file_state.ensure_file_state(
         db, opportunity_id=resolved["opportunity_id"], person_id=resolved["person_id"],
     )
@@ -3388,7 +3392,10 @@ def _fa_max_backflip_files_command(form: dict, db: Session) -> dict:
     message = (
         f"*Open Backflip Files* ({len(rows)})\n"
         f"```{table_body}```\n"
-        f"Copy a ref above into `/fa-max-file-update <ref> ...`"
+        f"Copy a ref above, then use:\n"
+        f"```/fa-max-file-update <ref> <stage>\n"
+        f"/fa-max-file-update <ref> doc:<document name>\n"
+        f"/fa-max-file-update <ref> received:<document name>```"
     )
     return _slack_ephemeral(message)
 
