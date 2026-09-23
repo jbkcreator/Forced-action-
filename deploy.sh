@@ -22,6 +22,14 @@ THROUGHPUT_UNIT_SRC="$PROJECT_DIR/deploy/systemd/cora_throughput.service"
 THROUGHPUT_UNIT_DST="/etc/systemd/system/cora_throughput.service"
 CC_UNIT_SRC="$PROJECT_DIR/deploy/systemd/cora-command-center.service"
 CC_UNIT_DST="/etc/systemd/system/cora-command-center.service"
+# FA Max Slack Socket Mode listener (Relay approval buttons + /tracked-link
+# slash command). Unit file existed in the repo but this script never
+# installed/enabled/restarted it, so every deploy left it running whatever
+# code was loaded at its last manual restart — found 2026-09-18 when a
+# merged, on-disk fix to /tracked-link never took effect in prod because
+# this service was never bounced.
+RELAY_UNIT_SRC="$PROJECT_DIR/deploy/systemd/fa-relay-slack-listener.service"
+RELAY_UNIT_DST="/etc/systemd/system/fa-relay-slack-listener.service"
 
 cd "$PROJECT_DIR"
 
@@ -91,6 +99,9 @@ rollback() {
     # rollback failure.
     if systemctl list-unit-files cora.service &>/dev/null; then
         systemctl restart cora || echo "ROLLBACK WARNING: cora restart failed" >&2
+    fi
+    if systemctl list-unit-files fa-relay-slack-listener.service &>/dev/null; then
+        systemctl restart fa-relay-slack-listener || echo "ROLLBACK WARNING: fa-relay-slack-listener restart failed" >&2
     fi
     echo "== ROLLBACK COMPLETE — prod running $good_sha ==" >&2
     echo "NOTE: if $good_sha predates the cora->lifecycle DB rename, schema and code are now mismatched — this deploy cannot undo a completed DB rename. Manual DB recovery required." >&2
@@ -176,9 +187,20 @@ if ! cmp -s "$CC_UNIT_SRC" "$CC_UNIT_DST" 2>/dev/null; then
 fi
 systemctl enable cora-command-center || fail "systemctl enable cora-command-center"
 
+# FA Max Slack Socket Mode listener — see RELAY_UNIT_SRC comment above.
+if [ ! -f "$RELAY_UNIT_SRC" ]; then
+    fail "fa-relay-slack-listener.service unit file not found at $RELAY_UNIT_SRC"
+fi
+if ! cmp -s "$RELAY_UNIT_SRC" "$RELAY_UNIT_DST" 2>/dev/null; then
+    cp "$RELAY_UNIT_SRC" "$RELAY_UNIT_DST" || fail "install fa-relay-slack-listener.service"
+    systemctl daemon-reload || fail "systemctl daemon-reload (fa-relay-slack-listener)"
+fi
+systemctl enable fa-relay-slack-listener || fail "systemctl enable fa-relay-slack-listener"
+
 systemctl restart fa-api || fail "systemctl restart fa-api"
 systemctl restart lifecycle || fail "systemctl restart lifecycle"
 systemctl restart cora || fail "systemctl restart cora"
+systemctl restart fa-relay-slack-listener || fail "systemctl restart fa-relay-slack-listener"
 
 RESTART_TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
@@ -186,6 +208,7 @@ echo "== 6/7 verify service health =="
 sleep 2
 systemctl is-active --quiet lifecycle || fail "lifecycle service not active after restart"
 systemctl is-active --quiet cora || fail "cora service not active after restart"
+systemctl is-active --quiet fa-relay-slack-listener || fail "fa-relay-slack-listener service not active after restart"
 systemctl restart cora_throughput || fail "systemctl restart cora_throughput"
 sleep 2
 systemctl is-active --quiet cora_throughput || fail "cora_throughput service not active after restart"

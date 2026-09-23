@@ -125,6 +125,11 @@ COUNTY_ID=hillsborough
 # RELATIONSHIPS_SLACK_CHANNEL. Idempotent — borrower_monitor_log deduplicates.
 45 6 * * * cd $PROJECT && PYTHONPATH=. python scripts/run_repeat_maturity_engine.py >> /var/log/fa/repeat_maturity.log 2>&1
 
+# WP-T2-5 Abandonment Agent — every minute. Polls abandonment_sequences for
+# touches where due_at <= now() and fires them via relay_approval_queue.
+# Idempotent — relay idempotency_key prevents duplicate sends on back-to-back runs.
+* * * * * cd $PROJECT && PYTHONPATH=. python scripts/run_abandonment_worker.py >> /var/log/fa/abandonment_worker.log 2>&1
+
 # Quora S6 organic-answer pipeline — 06:35 AM UTC daily (after load validator).
 # Picks one keyword via DB rotation (quora_topics + cooldown_days), scrapes Quora,
 # publishes to Cora for classification + answer drafting, upserts to quora_questions.
@@ -143,6 +148,28 @@ COUNTY_ID=hillsborough
 # --post-pending-fa-max's cadence for the same reason: recovery should be
 # fast relative to how rarely EXCEPTIONS actually trips.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.fa_max_exceptions_alert_drain
+
+# FA Max weekly edit-rate report (WP-T2-2) — Friday 14:00 UTC. Posts each
+# (agent_name, tier) pair's current-ISO-week edit rate to the EXCEPTIONS
+# Slack lane via the same durable alert queue fa_max_send_health_monitor
+# uses. Distinct from WP-T2-12's Command Center Friday scorecard — this is
+# WP-T2-2's own Done-When line, not superseded by that adjacent report.
+0 14 * * 5 $PROJECT/scripts/cron/run.sh src.tasks.fa_max_weekly_edit_rate_report
+
+# FA Max GYR Opportunity Router sweep (WP-T2-11) — daily 06:30 UTC.
+# Classifies every open fa_max_opportunity as green/yellow/red, persists GYR
+# fields, logs to fa_max_gyr_routing_log, and posts MONEY/EXCEPTIONS Slack
+# cards. Must complete before Josh's 07:00 ET morning review window.
+# Staggered after the nightly CDS rescore (07:00 UTC) window on the 24h cycle;
+# 06:30 UTC = 02:30 ET — well clear of both scraper close (06:30 UTC load
+# validator) and CDS open (07:00 UTC).
+30 6 * * * $PROJECT/scripts/cron/run.sh src.tasks.fa_max_opportunity_router_daily
+
+# FA Max GYR staleness pass (WP-T2-11) — daily 08:00 UTC.
+# Resurfaces unactioned green opportunities older than one business day
+# (Mon-Fri America/New_York). Runs after Josh's 07:00 ET review window
+# opens so he sees stale alerts alongside fresh morning deal flow.
+0 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.fa_max_opportunity_router_staleness
 
 # Autonomous Inbound Content Loop (Task 5.1) — Weekly Sunday @ 09:00 AM UTC.
 # Scores each Quora Seed Keyword over a 30-day window, deactivates losers
@@ -1090,6 +1117,15 @@ COUNTY_ID=hillsborough
 # Assembles the day's financing-intent opportunities (cash purchases, stalled
 # flips, permits-no-financing, auction/probate, out-of-state, builder signals,
 # plus the financing-intent feed), ranks them by expected revenue, and posts
+# WP-8A ARV sweep — compute + persist canonical ARV for active dial-list
+# candidates (properties in financing_intent_scores within the 36-month
+# window) that have no computed ARV row or a stale one (>7 days).
+#
+# 10:00 UTC — after CDS (07:00) and financing-intent sweep so scores are
+# settled; before the dial list (10:45) so _batch_published_arv reads fresh
+# rows. Idempotent: same inputs are a no-op; changed inputs insert+supersede.
+0 10 * * * $PROJECT/scripts/cron/run.sh src.tasks.arv_sweep
+
 # the top-N digest to the MONEY Slack channel so it's waiting before Josh's
 # morning calling block.
 #
@@ -1104,5 +1140,11 @@ COUNTY_ID=hillsborough
 # WP-7 self-serve — mark sessions abandoned after 24h of inactivity. Dry-run
 # by default (see the task's own docstring); add --apply once confirmed.
 0 * * * * $PROJECT/scripts/cron/run.sh src.tasks.selfserve_abandonment_sweep
+
+# WP-T2-9 Partner Mining & Producer Ranking — runs after nightly deed load
+# (deeds load 05:00–05:10 UTC; this fires at 06:00 UTC to ensure both
+# Hillsborough and Pinellas deed batches are committed before ranking).
+# Incremental: only new deeds update counts + re-rank; no full rebuild.
+0 6 * * * $PROJECT/scripts/cron/run.sh src.tasks.partner_mining_sweep
 
 # === END FORCED-ACTION-PLATFORM ===

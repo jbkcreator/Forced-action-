@@ -874,6 +874,7 @@ def write_interaction(
     approved_bool: Optional[bool] = None,
     autonomy_tier_at_time: Optional[str] = None,
     body_redacted: Optional[str] = None,
+    agent_name: Optional[str] = None,
 ) -> str:
     """Append a single interaction record. Write-once — never use this to
     update or replace an existing interaction.
@@ -883,15 +884,21 @@ def write_interaction(
     Compliance: no body/PII content stored. body_redacted is for content-free
     summaries only (e.g., 'initial outreach email'). No rate/term/commitment
     content may appear in body_redacted.
+
+    agent_name (WP-T2-2): which agent authored/drove this interaction.
+    Nullable — omit for interactions with no single owning agent (e.g.
+    human Slack decisions). autonomy_tier_at_time remains the traffic-
+    direction/evidence value; agent_name pairs with it for the (agent_name,
+    autonomy_tier_at_time) evidence scoping in fa_max_autonomy.py.
     """
     row = session.execute(
         text("""
             INSERT INTO fa_max_interactions
                 (person_id, channel, direction, actor,
-                 approved_bool, autonomy_tier_at_time, body_redacted, occurred_at)
+                 approved_bool, autonomy_tier_at_time, body_redacted, agent_name, occurred_at)
             VALUES
                 (:person_id ::uuid, :channel, :direction, :actor,
-                 :approved_bool, :autonomy_tier_at_time, :body_redacted, NOW())
+                 :approved_bool, :autonomy_tier_at_time, :body_redacted, :agent_name, NOW())
             RETURNING interaction_id::text
         """),
         {
@@ -902,6 +909,7 @@ def write_interaction(
             "approved_bool": approved_bool,
             "autonomy_tier_at_time": autonomy_tier_at_time,
             "body_redacted": body_redacted,
+            "agent_name": agent_name,
         },
     ).fetchone()
 
@@ -920,6 +928,150 @@ def write_interaction(
         )
 
     return row.interaction_id  # type: ignore[union-attr]
+
+
+# ---------------------------------------------------------------------------
+# Opportunity writer (WP-T2-2: single write path for fa_max_opportunities,
+# mirroring write_interaction()'s own "one INSERT function, never touched
+# directly elsewhere" convention).
+# ---------------------------------------------------------------------------
+
+def create_fa_max_opportunity(
+    *,
+    session: Session,
+    person_id: str,
+    opportunity_type: str,
+    source: str,
+    source_reference: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+    origin_interaction_id: Optional[str] = None,
+    assigned_to: Optional[str] = None,
+) -> str:
+    """Create one fa_max_opportunities row. This is the ONLY function that
+    may INSERT into fa_max_opportunities — nothing else in this codebase
+    does today (confirmed by a repo-wide search at WP-T2-2 review time: no
+    caller of this table's origination existed before this function).
+
+    origin_interaction_id (WP-T2-2): write-once causal attribution to the
+    fa_max_interactions row that triggered this opportunity, consumed by
+    fa_max_autonomy.get_funded_loan_count() for the Tier C graduation gate.
+    Passed here, at creation, and NEVER updated afterward — this function
+    provides no update path for the column at all (nor does any other
+    function in this module), and the accompanying migration
+    (apply_fa_max_wp_t2_2_opportunity_origin_immutable.py) adds a database
+    trigger that rejects any UPDATE changing origin_interaction_id, so the
+    write-once rule holds even against a
+    future caller that bypasses this function. NULL is valid (an
+    opportunity with no attributable originating interaction — e.g. a
+    borrower who called in cold) and correctly counts as zero funded-loan
+    evidence for every agent/tier.
+
+    The admin endpoint for an opportunity caused by a completed Tier C send
+    calls create_opportunity_from_relay_send(), which validates the Relay
+    interaction and then uses this single insert path.
+    """
+    row = session.execute(
+        text("""
+            INSERT INTO fa_max_opportunities
+                (person_id, opportunity_type, source, source_reference,
+                 idempotency_key, origin_interaction_id, assigned_to)
+            VALUES
+                (:person_id ::uuid, :opportunity_type, :source, :source_reference,
+                 :idempotency_key, :origin_interaction_id ::uuid, :assigned_to)
+            ON CONFLICT (idempotency_key)
+                WHERE idempotency_key IS NOT NULL
+                DO NOTHING
+            RETURNING opportunity_id::text
+        """),
+        {
+            "person_id": person_id,
+            "opportunity_type": opportunity_type,
+            "source": source,
+            "source_reference": source_reference,
+            "idempotency_key": idempotency_key,
+            "origin_interaction_id": origin_interaction_id,
+            "assigned_to": assigned_to,
+        },
+    ).fetchone()
+    if row is None:
+        # Idempotent retry on the same key — return the existing row's id.
+        existing = session.execute(
+            text("SELECT opportunity_id::text FROM fa_max_opportunities WHERE idempotency_key = :key"),
+            {"key": idempotency_key},
+        ).fetchone()
+        if existing is None:
+            raise RuntimeError(
+                f"create_fa_max_opportunity: idempotency_key {idempotency_key!r} conflicted "
+                "but no existing row was found — this should be impossible"
+            )
+        return existing.opportunity_id  # type: ignore[union-attr]
+    return row.opportunity_id  # type: ignore[union-attr]
+
+
+def create_opportunity_from_relay_send(
+    *, session: Session, relay_item_id: int, opportunity_type: str,
+) -> str:
+    """Create an opportunity causally attributed to one completed send.
+
+    The caller supplies a Relay row, never a person or arbitrary interaction
+    id. The sent row supplies both fields, preventing a person-based join or
+    attribution to a draft that was never dispatched.
+    """
+    row = session.execute(text(
+        "SELECT person_id::text AS person_id, send_interaction_id::text AS origin_id, "
+        "channel_split_source "
+        "FROM relay_approval_queue WHERE id = :id AND venture_key = 'fa_max_lending' "
+        "AND status = 'sent' AND autonomy_tier_at_send = 'C' "
+        "AND send_interaction_id IS NOT NULL"
+    ), {"id": relay_item_id}).mappings().first()
+    if row is None:
+        raise ValueError("relay_send_not_attributable")
+    from src.services.fa_max_send_governance import FA_MAX_ALLOWED_SOURCE_TYPES
+    if row["channel_split_source"] not in FA_MAX_ALLOWED_SOURCE_TYPES:
+        raise ValueError("relay_send_source_not_verified")
+    opportunity_id = create_fa_max_opportunity(
+        session=session, person_id=row["person_id"],
+        opportunity_type=opportunity_type, source=row["channel_split_source"],
+        source_reference=str(relay_item_id),
+        idempotency_key=f"relay_outbound:{relay_item_id}:{opportunity_type}",
+        origin_interaction_id=row["origin_id"],
+    )
+    session.execute(text(
+        "UPDATE fa_max_opportunities AS o "
+        "SET backflip_attribution_owner = 'forced_action', "
+        "backflip_attribution_set_at = first_touch.claimed_at "
+        "FROM fa_max_person_first_touch AS first_touch "
+        "WHERE o.opportunity_id = CAST(:opportunity_id AS uuid) "
+        "AND o.person_id = first_touch.person_id "
+        "AND o.backflip_attribution_owner IS NULL"
+    ), {"opportunity_id": opportunity_id})
+    return opportunity_id
+
+
+def mark_opportunity_funded(
+    *, session: Session, opportunity_id: str, actor: str, idempotency_key: str,
+) -> TransitionResult:
+    """Record funding through the state engine and update the causal count.
+
+    Only the normal closing -> funded transition is accepted. The outcome
+    and funded timestamp share the transaction with its immutable event.
+    """
+    current = get_opportunity_state(session=session, opportunity_id=opportunity_id)
+    if not current:
+        return TransitionResult(outcome=TransitionOutcome.invalid_transition, current_state=None)
+    result = transition(
+        session=session, entity_type="opportunity", entity_uuid=opportunity_id,
+        from_state=current["current_stage"], to_state="funded", actor=actor,
+        source_component="src.services.state_engine.mark_opportunity_funded",
+        idempotency_key=idempotency_key, state_version=current["state_version"],
+    )
+    if result.outcome == TransitionOutcome.succeeded:
+        session.execute(text(
+            "UPDATE fa_max_opportunities SET outcome = 'funded', "
+            "actual_funded_at = now(), updated_at = now() "
+            "WHERE opportunity_id = CAST(:id AS uuid) AND current_stage = 'funded'"
+        ), {"id": opportunity_id})
+    return result
 
 
 # ---------------------------------------------------------------------------

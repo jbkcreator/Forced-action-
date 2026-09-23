@@ -27,8 +27,13 @@ logger = logging.getLogger(__name__)
 
 
 def _summary_text(item: QueueItem) -> str:
-    subject = item.payload.get("subject") if isinstance(item.payload, dict) else None
-    preview = subject or str(item.payload)[:120]
+    p = item.payload if isinstance(item.payload, dict) else {}
+    preview = (
+        p.get("subject")
+        or p.get("inbound_snippet")
+        or p.get("type")
+        or str(item.payload)[:120]
+    )
     return (
         f"*Relay approval needed* (#{item.id})  Ref: `{_card_ref(item)}`\n"
         f"Channel: `{item.channel}`  ·  To: `{item.recipient}`\n"
@@ -98,9 +103,6 @@ def post_for_approval(item: QueueItem) -> None:
         )
         return
 
-    approve_value = json.dumps({"item_id": item.id, "action": "approve"})
-    reject_value = json.dumps({"item_id": item.id, "action": "reject"})
-
     lease_until = None
     if item.venture_key == _FA_MAX_VENTURE:
         lease_until = queue.claim_slack_post(item.id)
@@ -134,28 +136,7 @@ def post_for_approval(item: QueueItem) -> None:
         response = client.chat_postMessage(
             channel=channel,
             text=_summary_text(item),
-            blocks=[
-                {"type": "section", "text": {"type": "mrkdwn", "text": _summary_text(item)}},
-                {
-                    "type": "actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "Approve"},
-                            "style": "primary",
-                            "action_id": "approve",
-                            "value": approve_value,
-                        },
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "Reject"},
-                            "style": "danger",
-                            "action_id": "reject",
-                            "value": reject_value,
-                        },
-                    ],
-                },
-            ],
+            blocks=_build_approval_blocks(item),
         )
         queue.set_slack_message_ts(item.id, response["ts"], lease_until=lease_until)
     except Exception as exc:
@@ -163,6 +144,165 @@ def post_for_approval(item: QueueItem) -> None:
     finally:
         if lease_until is not None:
             queue.release_slack_post(item.id, lease_until)
+
+
+def _build_approval_blocks(item: QueueItem) -> list:
+    """Shared block layout for the interactive approval card — used both by
+    post_for_approval() (first post) and refresh_card_after_revision()
+    (WP-T2-2 review fix, below). approve_value/reject_value always carry
+    THIS item's CURRENT revision_count, so a card built by this function
+    always matches the stale-card guard in
+    src.api.admin_router._handle_relay_decision as of the moment it's built.
+    """
+    approve_value = json.dumps({
+        "item_id": item.id, "action": "approve", "revision_count_at_post": item.revision_count,
+    })
+    reject_value = json.dumps({"item_id": item.id, "action": "reject"})
+    skip_value = json.dumps({"item_id": item.id, "action": "skip"})
+    snooze_value = json.dumps({"item_id": item.id, "action": "snooze"})
+    revise_value = json.dumps({"item_id": item.id, "action": "revise"})
+    return [
+        {"type": "section", "text": {"type": "mrkdwn", "text": _summary_text(item)}},
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Approve"},
+                    "style": "primary",
+                    "action_id": "approve",
+                    "value": approve_value,
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Reject"},
+                    "style": "danger",
+                    "action_id": "reject",
+                    "value": reject_value,
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Skip"},
+                    "action_id": "fa_max_skip",
+                    "value": skip_value,
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Snooze"},
+                    "action_id": "fa_max_snooze",
+                    "value": snooze_value,
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Revise"},
+                    "action_id": "fa_max_revise",
+                    "value": revise_value,
+                },
+            ],
+        },
+    ]
+
+
+def refresh_card_after_revision(item: QueueItem) -> bool:
+    """Rebuild the posted card's blocks after a Revise submission (WP-T2-2
+    review fix) so the Approve/Reject/Skip/Snooze/Revise buttons carry the
+    item's NEW revision_count and the visible text reflects the revised
+    content -- not the pre-revision card.
+
+    Before this existed, a Revise only posted a thread reply under the
+    original card; the card's OWN Approve button kept the revision_count
+    baked in at first-post time (always 0), so any revision at all made the
+    stale-card guard in admin_router._handle_relay_decision refuse the
+    original button FOREVER -- there was no way to approve a revised item
+    through the card again. Updating the card in place (chat.update on the
+    same message ts) is the fix: it is the SAME mechanism
+    _update_relay_slack_message already uses for terminal-state edits, just
+    reused here for a non-terminal (still-pending) content refresh.
+
+    Returns True if the update was sent (or Slack isn't configured, which
+    is a legitimate no-op, not a failure), False only on an actual Slack
+    API error. Never raises -- called from the Revise submission handler,
+    which must not fail the revision itself over a Slack hiccup; the
+    revision is already durably saved by the time this runs.
+    """
+    if not item.slack_message_ts:
+        return True
+
+    settings = get_settings()
+    token = _resolve_bot_token(item, settings)
+    channel = _resolve_channel(item, settings)
+    if not token or not channel:
+        return True
+
+    try:
+        from slack_sdk import WebClient
+        client = WebClient(token=token.get_secret_value())
+        client.chat_update(
+            channel=channel,
+            ts=item.slack_message_ts,
+            text=_summary_text(item),
+            blocks=_build_approval_blocks(item),
+        )
+        return True
+    except Exception as exc:
+        logger.error(
+            "[Relay] refresh_card_after_revision chat.update failed for item %d: %s",
+            item.id, exc, exc_info=True,
+        )
+        return False
+
+
+def _build_revise_modal(item: QueueItem) -> dict:
+    """Modal for the Slack Revise button (WP-T2-2 item 9).
+
+    No existing free-text-capture Slack primitive was found in this repo
+    (batch_slack.open_draft_modal is read-only — it has no input block and
+    no view_submission handler). This is a new, minimal one: a single
+    multiline text input pre-filled with the current content
+    (final_content if this item has already been revised once, else
+    original_draft), submitted back as a view_submission carrying item_id
+    in private_metadata.
+    """
+    prefill = (item.final_content or item.original_draft or "")[:3000]
+    return {
+        "type": "modal",
+        "callback_id": "fa_max_revise_submit",
+        "private_metadata": json.dumps({"item_id": item.id}),
+        "title": {"type": "plain_text", "text": f"Revise #{item.id}"[:24]},
+        "submit": {"type": "plain_text", "text": "Save revision"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "input",
+                "block_id": "revised_content_block",
+                "label": {"type": "plain_text", "text": "Revised content"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "revised_content",
+                    "multiline": True,
+                    "initial_value": prefill,
+                },
+            },
+        ],
+    }
+
+
+def open_revise_modal(trigger_id: str, item: QueueItem) -> bool:
+    """Open the Revise modal for a pending item. Returns True on success."""
+    settings = get_settings()
+    token = _resolve_bot_token(item, settings)
+    if not token or not trigger_id:
+        logger.info("[Relay] cannot open revise modal for item %d — no token or trigger_id", item.id)
+        return False
+    try:
+        from slack_sdk import WebClient
+        WebClient(token=token.get_secret_value()).views_open(
+            trigger_id=trigger_id, view=_build_revise_modal(item),
+        )
+        return True
+    except Exception as exc:
+        logger.error("[Relay] views.open failed for revise item %d: %s", item.id, exc, exc_info=True)
+        return False
 
 
 def post_unposted_fa_max_cards(*, limit: int = 50) -> int:

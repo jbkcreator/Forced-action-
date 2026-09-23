@@ -258,7 +258,7 @@ def test_socket_handler_rejects_wrong_channel(monkeypatch):
     posted = {}
     monkeypatch.setattr(
         "src.utils.http_helpers.requests_post_with_retry",
-        lambda url, **kw: posted.update(url=url, json=kw.get("json")),
+        lambda url, **kw: posted.update(url=url, json=kw.get("json")) or SimpleNamespace(status_code=200, text="ok"),
     )
 
     client = MagicMock()
@@ -284,7 +284,7 @@ def test_socket_handler_handles_tracked_link_command(monkeypatch):
     posted = {}
     monkeypatch.setattr(
         "src.utils.http_helpers.requests_post_with_retry",
-        lambda url, **kw: posted.update(url=url, json=kw.get("json")),
+        lambda url, **kw: posted.update(url=url, json=kw.get("json")) or SimpleNamespace(status_code=200, text="ok"),
     )
 
     client = MagicMock()

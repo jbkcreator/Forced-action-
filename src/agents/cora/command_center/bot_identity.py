@@ -10,6 +10,7 @@ to configuration.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -26,20 +27,25 @@ def _configured_bot_user_id() -> Optional[str]:
 
 def resolve_bot_user_id(web_client) -> Optional[str]:
     """
-    Ask Slack which user this bot token belongs to, falling back to config.
+    Ask Slack which user this bot token belongs to, retrying transient
+    failures before falling back to config.
 
     Returns None when neither source yields an ID. Callers must treat that as
     fatal rather than listening unfiltered.
     """
-    try:
-        user_id = web_client.auth_test()["user_id"]
-        logger.info("cc.bot_identity: resolved bot user_id from auth.test: %s", user_id)
-        return user_id
-    except Exception as exc:
-        logger.warning(
-            "cc.bot_identity: auth.test failed (%s) — falling back to configured ID", exc
-        )
+    for attempt in range(1, 4):
+        try:
+            user_id = web_client.auth_test()["user_id"]
+            logger.info("cc.bot_identity: resolved bot user_id from auth.test: %s", user_id)
+            return user_id
+        except Exception as exc:
+            logger.warning(
+                "cc.bot_identity: auth.test failed (attempt %d/3): %s", attempt, exc
+            )
+            if attempt < 3:
+                time.sleep(2 * attempt)
 
+    logger.warning("cc.bot_identity: auth.test failed after 3 attempts — falling back to configured ID")
     configured = _configured_bot_user_id()
     if configured:
         logger.info("cc.bot_identity: using configured bot user_id: %s", configured)

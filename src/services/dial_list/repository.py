@@ -367,6 +367,51 @@ def _dec(value: Optional[object]) -> Optional[Decimal]:
     return d if d >= 0 else None
 
 
+_BATCH_ARV_SQL = text(
+    """
+    SELECT DISTINCT ON (property_id)
+        property_id, point, arv_unknown
+    FROM fa_max_arv_results
+    WHERE property_id IN :pids
+      AND status = 'computed'
+    ORDER BY property_id, computed_at DESC
+    """
+)
+
+_DIAL_LIST_MAX_LTC = Decimal("0.70")
+
+
+def _batch_published_arv(
+    session: Session, property_ids: list[int],
+) -> dict[int, Decimal]:
+    """Return {property_id: arv_point} for properties with a computed, non-unknown ARV.
+
+    One query for the whole candidate set — no per-property round trips.
+    Builder candidates don't use arv/max_ltc (they have expected_loan_override),
+    but we fetch for all pids and let the caller skip builders.
+    """
+    if not property_ids:
+        return {}
+    sp = session.begin_nested()
+    try:
+        rows = session.execute(
+            _BATCH_ARV_SQL.bindparams(bindparam("pids", expanding=True)),
+            {"pids": list(set(property_ids))},
+        ).mappings()
+        result = {
+            r["property_id"]: r["point"]
+            for r in rows
+            if not r["arv_unknown"] and r["point"] is not None
+        }
+        sp.commit()
+        return result
+    except SQLAlchemyError as exc:
+        # fa_max_arv_results absent or transient DB error — degrade gracefully.
+        sp.rollback()
+        logger.warning("fa_max_arv_results query failed, ARV skipped: %s", exc)
+        return {}
+
+
 def assemble_dial_candidates(
     session: Session,
     *,
@@ -555,6 +600,11 @@ def assemble_dial_candidates(
             # a property with >1 owner link could appear twice; first wins
             enrich.setdefault(row["property_id"], dict(row))
 
+        # Batch-fetch canonical ARV (WP-8B) for all candidates — one query.
+        published_arv: Dict[int, Decimal] = _batch_published_arv(
+            session, list(acc.keys())
+        )
+
         # Exclude opportunities already coded won/lost — they should not
         # resurface on the next day's list. Scope the lookup to this run's
         # candidate threads so the query never scans the full outcomes table.
@@ -610,11 +660,8 @@ def assemble_dial_candidates(
                 buyer_entity_id=a.builder_entity_id or e.get("buyer_entity_id"),
                 triggers=sorted(a.triggers),
                 intent_tier=a.intent_tier,
-                # arv/max_ltc come from the WP-8B published ARV once its
-                # persistence lands (blocked on WP-1); until then the core
-                # falls back to assessed value / last sale.
-                arv=None,
-                max_ltc=None,
+                arv=published_arv.get(pid),
+                max_ltc=_DIAL_LIST_MAX_LTC if published_arv.get(pid) is not None else None,
                 # Builder candidates carry Stage D's 85% LTC construction sizing;
                 # the ranker uses this override ahead of the generic 70% assessed
                 # fallback (a builder's loan basis is the build, not the parcel).

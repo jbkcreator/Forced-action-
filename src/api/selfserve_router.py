@@ -269,6 +269,11 @@ input:-webkit-autofill:focus {
 }
 .btn:hover{transform:translateY(-2px);box-shadow:0 8px 24px rgba(251,191,36,.3);}
 .btn:active{transform:translateY(0) scale(.99);}
+.btn:disabled{opacity:.6;cursor:not-allowed;transform:none;box-shadow:none;}
+.form-error{
+  color:#fca5a5;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);
+  border-radius:var(--radius-sm);padding:.8rem 1rem;font-size:.85rem;line-height:1.5;margin:0 0 1rem;
+}
 .footnote{text-align:center;color:var(--text-3);font-size:.75rem;margin-top:1.25rem;line-height:1.5;}
 .notice-wrap{max-width:480px;margin:4rem auto 0;text-align:center;}
 .notice-wrap .brand{justify-content:center;margin-bottom:2rem;}
@@ -439,10 +444,55 @@ def selfserve_screen(token: str, db: Session = Depends(get_db)):
             <label for="consent">{CONSENT_COPY}</label>
           </div>
         </div>
+        <div id="form-error" class="form-error" role="alert" hidden></div>
         <button type="submit" class="btn">Continue &rarr;</button>
         <p class="footnote">Your information is kept private and used only to process this inquiry.</p>
       </form>
     </div>
+    <script>
+    (function () {{
+      var form = document.querySelector("form");
+      var errorBox = document.getElementById("form-error");
+      var btn = form.querySelector("button[type=submit]");
+      var btnDefaultText = btn.textContent;
+
+      function showError(msg) {{
+        errorBox.textContent = msg;
+        errorBox.hidden = false;
+        errorBox.scrollIntoView({{behavior: "smooth", block: "center"}});
+      }}
+
+      form.addEventListener("submit", function (event) {{
+        event.preventDefault();
+        errorBox.hidden = true;
+        btn.disabled = true;
+        btn.textContent = "Submitting…";
+
+        fetch(form.action, {{method: "POST", body: new FormData(form)}})
+          .then(function (resp) {{
+            if (resp.ok) {{
+              if (resp.redirected) {{
+                window.location.href = resp.url;
+                return;
+              }}
+              return resp.text().then(function (html) {{
+                document.open();
+                document.write(html);
+                document.close();
+              }});
+            }}
+            return resp.json().catch(function () {{ return {{}}; }}).then(function (data) {{
+              throw new Error(data.detail || "Something went wrong. Please try again.");
+            }});
+          }})
+          .catch(function (err) {{
+            showError(err.message || "Something went wrong. Please try again.");
+            btn.disabled = false;
+            btn.textContent = btnDefaultText;
+          }});
+      }});
+    }})();
+    </script>
     """
     return HTMLResponse(_render_page("Confirm Your Property", body))
 

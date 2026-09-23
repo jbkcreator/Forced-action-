@@ -81,18 +81,23 @@ def handle_socket_request(client: Any, request: Any) -> bool:
     )
     from src.core.database import get_db_context
 
+    user_id = payload.get("user", {}).get("id", "?")
+
     # EXCEPTIONS lane (WP-T2-8)
     if action_id and action_id.startswith("confirm_entity_link_"):
+        logger.info("[RelaySocket] entity-link confirm: action_id=%s user=%s", action_id, user_id)
         with get_db_context() as db:
             result = _handle_confirm_entity_link(payload, db)
         _post_socket_ephemeral(client, payload, result)
         return True
     if action_id and action_id.startswith("reject_entity_link_"):
+        logger.info("[RelaySocket] entity-link reject: action_id=%s user=%s", action_id, user_id)
         with get_db_context() as db:
             result = _handle_reject_entity_link(payload, db)
         _post_socket_ephemeral(client, payload, result)
         return True
     if action_id and action_id.startswith("view_entity_link_"):
+        logger.info("[RelaySocket] entity-link view: action_id=%s user=%s", action_id, user_id)
         with get_db_context() as db:
             result = _handle_view_entity_link(payload, db)
         _post_socket_ephemeral(client, payload, result)
@@ -100,16 +105,19 @@ def handle_socket_request(client: Any, request: Any) -> bool:
 
     # RELATIONSHIPS lane (WP-T2-8)
     if action_id and action_id.startswith("add_builder_to_diallist_"):
+        logger.info("[RelaySocket] builder dial-list add: action_id=%s user=%s", action_id, user_id)
         with get_db_context() as db:
             result = _handle_add_builder_to_diallist(payload, db)
         _post_socket_ephemeral(client, payload, result)
         return True
     if action_id and action_id.startswith("snooze_builder_"):
+        logger.info("[RelaySocket] builder snooze: action_id=%s user=%s", action_id, user_id)
         with get_db_context() as db:
             result = _handle_snooze_builder(payload, db)
         _post_socket_ephemeral(client, payload, result)
         return True
     if action_id and action_id.startswith("dismiss_builder_"):
+        logger.info("[RelaySocket] builder dismiss: action_id=%s user=%s", action_id, user_id)
         with get_db_context() as db:
             result = _handle_dismiss_builder(payload, db)
         _post_socket_ephemeral(client, payload, result)
@@ -119,16 +127,30 @@ def handle_socket_request(client: Any, request: Any) -> bool:
     if action_id not in {"approve", "reject"}:
         return False
 
-    result = _handle_relay_decision(payload)
-    # HTTP can return an ephemeral refusal directly to Slack. Socket Mode has
-    # already acknowledged the envelope, so retain the same result in logs for
-    # an operator to diagnose an authorization or state-transition refusal.
+    import json as _json
+    try:
+        _action_data = _json.loads((payload.get("actions") or [{}])[0].get("value", "{}"))
+    except Exception:
+        _action_data = {}
+    _item_id = _action_data.get("item_id")
+    logger.info("[RelaySocket] relay decision: item_id=%s action=%s user=%s",
+                _item_id, action_id, payload.get("user", {}).get("id", "?"))
+
+    try:
+        result = _handle_relay_decision(payload)
+    except Exception:
+        logger.exception("[RelaySocket] _handle_relay_decision raised for item_id=%s", _item_id)
+        return True
+
     if (result or {}).get("ok") is not True:
         logger.warning(
-            "[RelaySocket] approval left pending for Slack user %s: %s",
+            "[RelaySocket] approval left pending: item_id=%s user=%s reason=%s",
+            _item_id,
             payload.get("user", {}).get("id", "unknown"),
-            (result or {}).get("text", "no result detail"),
+            (result or {}).get("text", "no detail"),
         )
+    else:
+        logger.info("[RelaySocket] decision committed: item_id=%s result=%s", _item_id, result)
     return True
 
 
@@ -166,13 +188,24 @@ def run() -> None:
     from slack_sdk.socket_mode import SocketModeClient
 
     web = WebClient(token=bot_token.get_secret_value())
-    socket = SocketModeClient(app_token=app_token.get_secret_value(), web_client=web)
+    # concurrency=25 (library default: 10) -- this one connection carries both
+    # Relay approval-card clicks and /tracked-link slash commands. A burst of
+    # real approval activity can occupy all 10 default workers, queuing a
+    # slash command envelope behind them; if that queue wait pushes past
+    # Slack's 3-second ack window the command never even starts, and Slack
+    # shows the user "the app did not respond" with nothing logged on our
+    # side. Confirmed via isolated reproduction (2026-09-21): the same
+    # rapid-fire /tracked-link test dropped replies against the live
+    # production workspace but never dropped a single reply against an
+    # isolated test app/workspace with no concurrent traffic, run both
+    # locally and from this server -- ruling out the server's network path
+    # and the slash-command code itself, and pointing at worker-pool
+    # contention on the shared connection.
+    socket = SocketModeClient(app_token=app_token.get_secret_value(), web_client=web, concurrency=25)
 
     def _on_request(client: Any, request: Any) -> None:
         try:
-            handled = handle_socket_request(client, request)
-            if handled:
-                logger.info("[RelaySocket] processed Relay approval action")
+            handle_socket_request(client, request)
         except Exception:
             # An action failure is logged after acknowledgement.  The durable
             # queue row remains pending unless the handler commits its CAS.

@@ -220,6 +220,29 @@ def _process_candidate_message(service: Any, message_id: str, db: Session) -> Op
         thread_id = find_opportunity_thread_id_by_email(db, from_address)
 
         if thread_id is None:
+            # Check if this is an FA Max contact before dropping.
+            from sqlalchemy import text as _text
+            fa_max_row = db.execute(
+                _text("""
+                    SELECT person_id FROM fa_max_persons
+                    WHERE source_reference ILIKE :email
+                    LIMIT 1
+                """),
+                {"email": from_address.strip().lower()},
+            ).fetchone()
+            if fa_max_row:
+                from src.agents.reply_concierge.router import handle_inbound
+                handle_inbound(
+                    inbound_text=body_text,
+                    channel="email",
+                    person_id=str(fa_max_row[0]),
+                    contact_email=from_address,
+                    opportunity_id=None,
+                    borrower_first_name=None,
+                    db=db,
+                )
+                _mark_seen(message_id)
+                return True
             logger.warning(
                 "reply_mailbox_poller: unmatched sender=%s subject=%r message_id=%s — not queued, no draft was ever sent to this address",
                 from_address, subject[:80], message_id,

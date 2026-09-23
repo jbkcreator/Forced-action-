@@ -856,11 +856,17 @@ class BuildingPermit(Base):
     # Enforcement flag — True for stop work orders, after-the-fact, failed/expired/revoked/suspended
     is_enforcement_permit: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
 
-    # Builder enrichment columns (Stage A — WP-T2-8)
+    # Builder enrichment columns (Stage A — WP-T2-8) + detail-page fields (permit-detail enrichment)
     contractor_name: Mapped[Optional[str]] = mapped_column(Text)
     holder_name: Mapped[Optional[str]] = mapped_column(Text)       # permit applicant / owner-of-record
     job_value: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 2))  # declared construction value
     completion_status: Mapped[Optional[str]] = mapped_column(String(50))  # issued|active|expired|completed|pending
+    contractor_license: Mapped[Optional[str]] = mapped_column(String(50))
+    contractor_license_type: Mapped[Optional[str]] = mapped_column(String(100))
+    contractor_phone: Mapped[Optional[str]] = mapped_column(String(20))
+    contractor_email: Mapped[Optional[str]] = mapped_column(String(200))
+    applicant_name: Mapped[Optional[str]] = mapped_column(String(200))
+    owner_name: Mapped[Optional[str]] = mapped_column(String(200))
 
     # Load tracking & multi-county
     date_added: Mapped[Optional[date]] = mapped_column(Date, default=date.today, index=True)
@@ -9293,6 +9299,27 @@ class RelayApprovalQueueItem(Base):
     send_interaction_id: Mapped[Optional[Any]] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("fa_max_interactions.interaction_id"), nullable=True
     )
+    # WP-T2-2: Snooze / Revise support. eligible_at is distinct from
+    # fa_max_work_queue.available_at (a different table's deferred-execution
+    # column) — this governs whether THIS row is currently postable /
+    # dispatchable. NULL = always eligible.
+    eligible_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    original_draft: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    final_content: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    revision_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    last_revised_by: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    last_revised_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    material_edit: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    # WP-T2-3: which fa_max_opportunity this queue item targets. Nullable —
+    # non-opportunity-linked items (bulk partner touches, EXCEPTIONS lane) skip
+    # attribution. When set, mark_sent() writes backflip_attribution_owner on
+    # that opportunity row under a WHERE IS NULL guard so concurrent sends are safe.
+    opportunity_id: Mapped[Optional[Any]] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_opportunities.opportunity_id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    channel_split_source: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
         default=lambda: datetime.now(timezone.utc), server_default=func.now(),
@@ -9307,6 +9334,10 @@ class RelayApprovalQueueItem(Base):
         Index("ix_relay_approval_queue_status", "status"),
         Index("ix_relay_approval_queue_batch_status", "batch_id", "status"),
         Index("ix_relay_approval_queue_venture_status", "venture_key", "status"),
+        Index(
+            "ix_relay_approval_queue_eligible_at", "eligible_at",
+            postgresql_where=text("eligible_at IS NOT NULL"),
+        ),
         # CL4: venture_ladder.cell_reply_rates() joins outbound_drafts to this
         # table on (thread_id, venture_key) to count only items that were
         # really dispatched, so the reply rate the auto-double rule scales on
@@ -9528,7 +9559,7 @@ class BuyerEntityLink(Base):
         UniqueConstraint("source_table", "source_id", name="uq_buyer_entity_link_source"),
         CheckConstraint(
             "source_table IN ('owners', 'deeds', 'sunbiz_snapshots', 'tax_deed_auctions', "
-            "'building_permits', 'permit_staging')",
+            "'building_permits', 'permit_staging', 'deed_lender', 'deed_wholesaler')",
             name="check_buyer_entity_link_source_table",
         ),
         CheckConstraint(
@@ -10840,9 +10871,33 @@ class FaMaxOpportunity(Base):
     maturity_months: Mapped[Optional[int]] = mapped_column(SmallInteger, nullable=True)
     backflip_ref: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     assigned_to: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    # WP-T2-2: write-once attribution to the interaction that triggered this
+    # opportunity's creation. NULL = unattributed = counts as zero for the
+    # Tier C funded-loan causal-join evidence (fa_max_autonomy.get_funded_
+    # loan_count). Set exactly once at creation time by the caller that
+    # inserts the opportunity row; application-layer enforced (no current
+    # production call site creates FaMaxOpportunity rows yet -- see WP-T2-2
+    # deviation notes), never overwritten thereafter.
+    origin_interaction_id: Mapped[Optional[Any]] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_interactions.interaction_id", name="fk_fa_max_opp_origin_interaction"),
+        nullable=True,
+    )
     # CAS optimistic-concurrency guard — same pattern as FaMaxPerson.state_version.
     state_version: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text("0")
+    )
+    # WP-T2-3: write-once channel attribution. NULL = no real send has landed yet.
+    # 'forced_action' = FA Max originated the relationship (off-market trigger,
+    # partner layer). 'backflip' = this contact was already in an active Backflip
+    # campaign at the time of first send (should not occur — suppression blocks
+    # those; present as a guard for unexpected state). Written by mark_sent()
+    # under WHERE backflip_attribution_owner IS NULL — concurrent workers are safe.
+    backflip_attribution_owner: Mapped[Optional[str]] = mapped_column(
+        String(30), nullable=True
+    )
+    backflip_attribution_set_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -10850,6 +10905,13 @@ class FaMaxOpportunity(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+    # WP-T2-11: GYR routing columns
+    gyr_color: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    expected_revenue_cents: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    gyr_reason: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    gyr_ranked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    gyr_stale_alerted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         ForeignKeyConstraint(
@@ -10868,6 +10930,15 @@ class FaMaxOpportunity(Base):
             "outcome IN ('open','funded','dead','recycled','referred')",
             name="ck_fa_max_opp_outcome",
         ),
+        CheckConstraint(
+            "backflip_attribution_owner IS NULL "
+            "OR backflip_attribution_owner IN ('forced_action','backflip')",
+            name="ck_fa_max_opp_attribution_owner",
+        ),
+        CheckConstraint(
+            "gyr_color IN ('green','yellow','red') OR gyr_color IS NULL",
+            name="ck_fa_max_opp_gyr_color",
+        ),
         Index(
             "uq_fa_max_opp_idempotency_key",
             "idempotency_key",
@@ -10879,6 +10950,16 @@ class FaMaxOpportunity(Base):
         Index(
             "ix_fa_max_opp_open",
             "outcome",
+            postgresql_where=text("outcome = 'open'"),
+        ),
+        Index(
+            "ix_fa_max_opp_origin_interaction", "origin_interaction_id",
+            postgresql_where=text("origin_interaction_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_fa_max_opp_gyr_money",
+            "gyr_color",
+            "expected_revenue_cents",
             postgresql_where=text("outcome = 'open'"),
         ),
     )
@@ -11094,6 +11175,57 @@ class FaMaxPersonConsent(Base):
         )
 
 
+class FaMaxPersonFirstTouch(Base):
+    """Permanent first clean FA reach, before an opportunity may exist."""
+    __tablename__ = "fa_max_person_first_touch"
+
+    person_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("fa_max_persons.person_id"), primary_key=True,
+    )
+    relay_item_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("relay_approval_queue.id"), nullable=False,
+    )
+    channel_split_source: Mapped[str] = mapped_column(String(60), nullable=False)
+    claimed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class FaMaxPersonContactIdentifier(Base):
+    """Operator-verified identifiers used for person-wide suppression."""
+    __tablename__ = "fa_max_person_contact_identifiers"
+
+    identifier_kind: Mapped[str] = mapped_column(String(10), primary_key=True)
+    identifier_value: Mapped[str] = mapped_column(Text, primary_key=True)
+    person_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("fa_max_persons.person_id"), nullable=False,
+    )
+    source: Mapped[str] = mapped_column(String(60), nullable=False)
+    verified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    __table_args__ = (
+        CheckConstraint("identifier_kind IN ('email','phone')", name="ck_fa_max_person_identifier_kind"),
+        Index("ix_fa_max_person_contact_identifiers_person", "person_id"),
+    )
+
+
+class FaMaxBackflipSuppressionDecision(Base):
+    """Durable draft/send boundary decision; recipient digest avoids raw PII."""
+    __tablename__ = "fa_max_backflip_suppression_decisions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    gate: Mapped[str] = mapped_column(String(10), nullable=False)
+    recipient_masked: Mapped[str] = mapped_column(String(20), nullable=False)
+    recipient_sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    opportunity_id: Mapped[Optional[Any]] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    suppressed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint("gate IN ('draft','send')", name="ck_fa_max_bsd_gate"),
+        Index("ix_fa_max_bsd_opportunity_id", "opportunity_id", postgresql_where=text("opportunity_id IS NOT NULL")),
+        Index("ix_fa_max_bsd_created_at", created_at.desc()),
+    )
+
+
 class FaMaxBackflipCampaignContact(Base):
     """Current Backflip campaign membership; separate from permanent opt-outs."""
     __tablename__ = "fa_max_backflip_campaign_contacts"
@@ -11155,6 +11287,18 @@ class FaMaxPartner(Base):
     state_version: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text("0")
     )
+    # WP-T2-9 ranking snapshot fields (apply_partner_ranking_snapshot.py)
+    observed_transaction_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    first_observed_at: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    last_observed_at: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    county_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    buyer_entity_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("buyer_entities.id", name="fk_fa_max_partner_buyer_entity", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -11167,8 +11311,12 @@ class FaMaxPartner(Base):
             "status IN ('identified', 'active', 'inactive')",
             name="ck_fa_max_partner_status",
         ),
+        UniqueConstraint("person_id", "partner_class", name="uq_fa_max_partner_person_class"),
         Index("ix_fa_max_partner_person_id", "person_id"),
         Index("ix_fa_max_partner_status", "status"),
+        Index("ix_fa_max_partner_class_txn", "partner_class", "observed_transaction_count"),
+        Index("ix_fa_max_partner_buyer_entity", "buyer_entity_id"),
+        Index("ix_fa_max_partner_county", "county_id"),
     )
 
     def __repr__(self) -> str:
@@ -11212,6 +11360,12 @@ class FaMaxInteraction(Base):
     actor: Mapped[str] = mapped_column(String(120), nullable=False)
     approved_bool: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     autonomy_tier_at_time: Mapped[Optional[str]] = mapped_column(String(5), nullable=True)
+    # WP-T2-2: which agent authored/drove this interaction. Nullable —
+    # populated going forward by write_interaction()/mark_sent() callers.
+    # Traffic direction continues to be carried by autonomy_tier_at_time's
+    # existing (agent_name, autonomy_tier_at_time) pairing semantics; no
+    # separate direction column is added.
+    agent_name: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
     body_redacted: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     occurred_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -11246,6 +11400,10 @@ class FaMaxInteraction(Base):
         Index("ix_fa_max_interaction_person_id", "person_id"),
         Index("ix_fa_max_interaction_person_seq", "person_id", "seq"),
         Index("ix_fa_max_interaction_person_timeline_seq", "person_id", "timeline_seq"),
+        Index(
+            "ix_fa_max_interaction_agent_name", "agent_name",
+            postgresql_where=text("agent_name IS NOT NULL"),
+        ),
     )
 
     def __repr__(self) -> str:
@@ -11253,6 +11411,47 @@ class FaMaxInteraction(Base):
             f"<FaMaxInteraction(interaction_id={self.interaction_id!r}, "
             f"person={self.person_id!r}, channel={self.channel!r}, "
             f"direction={self.direction!r})>"
+        )
+
+
+class FaMaxToolCallLog(Base):
+    """Per-tool-call audit trail for the FA Max agent runtime (WP-T2-2).
+
+    Separate from agent_decisions — agent_decisions records a DECISION
+    (autonomy-tier-gated outcome, logged via write_tools.log_decision());
+    this table records every individual tool INVOCATION inside the agent's
+    bounded tool-call loop, whether or not it produced a decision. input/
+    output are redacted (PII/financial-shaped values stripped) before
+    storage — never raw payload content.
+    """
+
+    __tablename__ = "fa_max_tool_call_log"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    work_item_id: Mapped[Optional[Any]] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    agent_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    tool_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    input: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    output: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    duration_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('in_progress', 'claimed', 'success', 'error', 'blocked')",
+            name="ck_fa_max_tool_call_log_status",
+        ),
+        Index("ix_fa_max_tool_call_log_work_item", "work_item_id"),
+        Index("ix_fa_max_tool_call_log_agent_tool", "agent_name", "tool_name", text("created_at DESC")),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<FaMaxToolCallLog(id={self.id}, agent={self.agent_name!r}, "
+            f"tool={self.tool_name!r}, status={self.status!r})>"
         )
 
 
@@ -11846,4 +12045,39 @@ class FaMaxArvResult(Base):
         CheckConstraint(
             "status IN ('computed','superseded')", name="ck_fa_max_arv_status"
         ),
+    )
+
+
+class FaMaxGyrRoutingLog(Base):
+    """Immutable audit log — one row per GYR routing decision (WP-T2-11).
+
+    Never updated. Every classify() call produces one row so routing history is
+    fully reconstructable independent of the mutable gyr_* columns on
+    fa_max_opportunities.
+    """
+
+    __tablename__ = "fa_max_gyr_routing_log"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    opportunity_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_opportunities.opportunity_id", name="fk_fa_max_gyr_log_opp"),
+        nullable=False,
+    )
+    color: Mapped[str] = mapped_column(String(10), nullable=False)
+    expected_revenue_cents: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    reason_codes: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
+    disqualifying_rule: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    queue: Mapped[Optional[str]] = mapped_column(String(12), nullable=True)
+    decided_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("color IN ('green','yellow','red')", name="ck_fa_max_gyr_log_color"),
+        CheckConstraint(
+            "queue IN ('MONEY','EXCEPTIONS') OR queue IS NULL",
+            name="ck_fa_max_gyr_log_queue",
+        ),
+        Index("ix_fa_max_gyr_log_opp_decided", "opportunity_id", "decided_at"),
     )
