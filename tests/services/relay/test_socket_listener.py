@@ -69,6 +69,31 @@ class TestViewSubmissionDispatch:
         sent = client.send_socket_mode_response.call_args.args[0]
         assert sent.payload == result
 
+    def test_revise_modal_handler_raising_http_exception_still_acks(self):
+        # Regression: _handle_relay_revise_submission raises HTTPException
+        # on malformed view metadata -- caught by FastAPI's middleware on
+        # the HTTP path, but there is no such middleware here. Before this
+        # fix, that exception would propagate past the ack entirely, and
+        # Slack would see a silent 3-second timeout instead of any
+        # response for the envelope.
+        from fastapi import HTTPException
+
+        client = mock.MagicMock()
+        payload = {"type": "view_submission", "view": {"callback_id": "fa_max_revise_submit"}}
+        request = _request("interactive", "env-99", payload)
+
+        with mock.patch(
+            "src.api.admin_router._handle_relay_revise_submission",
+            side_effect=HTTPException(status_code=400, detail="Invalid view metadata"),
+        ):
+            handled = socket_listener.handle_socket_request(client, request)
+
+        assert handled is True
+        client.send_socket_mode_response.assert_called_once()
+        sent = client.send_socket_mode_response.call_args.args[0]
+        assert sent.envelope_id == "env-99"
+        assert sent.payload == {}
+
     def test_unknown_callback_id_acks_blank_and_returns_true(self):
         client = mock.MagicMock()
         payload = {"type": "view_submission", "view": {"callback_id": "something_else"}}
@@ -98,6 +123,21 @@ class TestBlockSuggestionDispatch:
         assert mock_handle.call_args.args[0] == payload
         sent = client.send_socket_mode_response.call_args.args[0]
         assert sent.payload == result
+
+    def test_handler_raising_still_acks_with_empty_options(self):
+        client = mock.MagicMock()
+        payload = {"type": "block_suggestion", "action_id": "borrower_search", "value": "Jane"}
+        request = _request("interactive", "env-97", payload)
+
+        with mock.patch(
+            "src.api.admin_router._handle_borrower_search_suggestion",
+            side_effect=RuntimeError("db exploded"),
+        ):
+            handled = socket_listener.handle_socket_request(client, request)
+
+        assert handled is True
+        sent = client.send_socket_mode_response.call_args.args[0]
+        assert sent.payload == {"options": []}
 
     def test_other_block_suggestion_action_id_falls_through_to_block_actions_path(self):
         # Not borrower_search, and no "actions" list either -- must not

@@ -70,12 +70,24 @@ def handle_socket_request(client: Any, request: Any) -> bool:
         from src.core.database import get_db_context
 
         callback_id = payload.get("view", {}).get("callback_id")
-        if callback_id == "fa_max_revise_submit":
-            result = _handle_relay_revise_submission(payload)
-        elif callback_id == "fa_max_log_submission_submit":
-            with get_db_context() as db:
-                result = _handle_log_submission_view_submit(payload, db)
-        else:
+        try:
+            if callback_id == "fa_max_revise_submit":
+                # _handle_relay_revise_submission raises HTTPException on
+                # malformed view metadata -- that's caught by FastAPI's own
+                # exception middleware on the HTTP path, but there is no
+                # such middleware here. Left uncaught, this envelope would
+                # simply never get acked at all: Slack sees a silent
+                # 3-second timeout rather than a clean error.
+                result = _handle_relay_revise_submission(payload)
+            elif callback_id == "fa_max_log_submission_submit":
+                with get_db_context() as db:
+                    result = _handle_log_submission_view_submit(payload, db)
+            else:
+                result = {}
+        except Exception:
+            logger.exception(
+                "[RelaySocket] view_submission handler raised for callback_id=%s", callback_id,
+            )
             result = {}
         client.send_socket_mode_response(
             SocketModeResponse(envelope_id=request.envelope_id, payload=result)
@@ -90,8 +102,12 @@ def handle_socket_request(client: Any, request: Any) -> bool:
         from src.api.admin_router import _handle_borrower_search_suggestion
         from src.core.database import get_db_context
 
-        with get_db_context() as db:
-            result = _handle_borrower_search_suggestion(payload, db)
+        try:
+            with get_db_context() as db:
+                result = _handle_borrower_search_suggestion(payload, db)
+        except Exception:
+            logger.exception("[RelaySocket] block_suggestion handler raised for borrower_search")
+            result = {"options": []}
         client.send_socket_mode_response(
             SocketModeResponse(envelope_id=request.envelope_id, payload=result)
         )
