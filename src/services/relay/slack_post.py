@@ -380,7 +380,8 @@ def _build_log_submission_modal() -> dict:
                     {
                         "type": "button",
                         "action_id": "log_submission_new_borrower",
-                        "text": {"type": "plain_text", "text": "Not on this list — new borrower"},
+                        "text": {"type": "plain_text", "text": "+ Add new borrower"},
+                        "style": "primary",
                     },
                 ],
             },
