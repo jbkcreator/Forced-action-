@@ -682,6 +682,9 @@ class AppSettings(BaseSettings):
 	fa_max_slack_bot_token: Optional[SecretStr] = Field(default=None, env="FA_MAX_SLACK_BOT_TOKEN")
 	fa_max_slack_app_token: Optional[SecretStr] = Field(default=None, env="FA_MAX_SLACK_APP_TOKEN")
 	fa_max_slack_signing_secret: Optional[SecretStr] = Field(default=None, env="FA_MAX_SLACK_SIGNING_SECRET")
+	# Fallback for the Command Center's self-message filter when Slack's
+	# auth.test is unreachable at startup. Normally resolved dynamically.
+	fa_max_slack_bot_user_id: Optional[str] = Field(default=None, env="FA_MAX_SLACK_BOT_USER_ID")
 	vera_slack_channel: Optional[str] = Field(default=None, env="VERA_SLACK_CHANNEL")
 
 	# Relay approval queue (RELAY-v2.2 sub-task R1). Non-FA-Max Relay ventures
@@ -881,6 +884,7 @@ class AppSettings(BaseSettings):
 		default=15000, env="FA_MAX_GYR_GREEN_MIN_EXPECTED_REVENUE_CENTS"
 	)
 	fa_max_backflip_feed_max_age_hours: int = Field(default=24, ge=1, env="FA_MAX_BACKFLIP_FEED_MAX_AGE_HOURS")
+	fa_max_backflip_feed_adapter: str = Field(default="csv", env="FA_MAX_BACKFLIP_FEED_ADAPTER")
 	backflip_webhook_secret: Optional[SecretStr] = Field(default=None, env="BACKFLIP_WEBHOOK_SECRET")
 
 	# ── FA Max WP-T2-1 — Own-Lane Send Infrastructure ────────────────────────

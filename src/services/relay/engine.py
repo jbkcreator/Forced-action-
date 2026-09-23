@@ -132,6 +132,14 @@ def execute_batch(
 
         verdict = guards.evaluate(item, now=now, venture=venture)
         if verdict.outcome == guards.DEFER:
+            if (item.venture_key == "fa_max_lending" and
+                    verdict.reason == "fa_max_opportunity_link_requires_review"):
+                from src.services.relay import exceptions_alert_queue
+                exceptions_alert_queue.enqueue_and_attempt(
+                    venture_key="fa_max_lending",
+                    rule="fa_max_opportunity_link_requires_review",
+                    message=f"Relay item {item.id} is held for an operator-verified opportunity link.",
+                )
             logger.info("[Relay] item %d deferred: %s", item.id, verdict.reason)
             result.deferred += 1
             continue

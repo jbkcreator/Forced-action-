@@ -18,7 +18,6 @@ from __future__ import annotations
 import logging
 import re
 import threading
-import time
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -112,6 +111,8 @@ def run_socket_mode(stop_event: threading.Event) -> None:
         from slack_sdk.socket_mode.request import SocketModeRequest
         from config.settings import get_settings
         from slack_sdk import WebClient
+
+        from src.agents.cora.command_center.bot_identity import resolve_bot_user_id
     except ImportError as exc:
         logger.error("cc.socket: slack_sdk missing socket_mode support: %s", exc)
         return
@@ -125,22 +126,11 @@ def run_socket_mode(stop_event: threading.Event) -> None:
     web_client = WebClient(token=bot_token)
 
     global _BOT_USER_ID
-    for attempt in range(1, 4):
-        try:
-            auth = web_client.auth_test()
-            _BOT_USER_ID = auth["user_id"]
-            logger.info("cc.socket: bot user_id resolved via auth.test: %s", _BOT_USER_ID)
-            break
-        except Exception as exc:
-            logger.warning(
-                "cc.socket: auth.test failed (attempt %d/3): %s", attempt, exc,
-            )
-            if attempt < 3:
-                time.sleep(2 * attempt)
-    else:
+    _BOT_USER_ID = resolve_bot_user_id(web_client)
+    if not _BOT_USER_ID:
         logger.error(
-            "cc.socket: auth.test failed after 3 attempts — refusing to start Socket "
-            "Mode without a self-reply filter (fail closed)"
+            "cc.socket: refusing to start — an unfiltered listener re-ingests the "
+            "bot's own replies as new questions. Set FA_MAX_SLACK_BOT_USER_ID."
         )
         return
 
