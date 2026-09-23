@@ -124,6 +124,49 @@ class TestLogSubmissionViewSubmission:
         assert response.status_code == 200
         assert mock_create.call_args.kwargs["person_id"] == "p-new-1"
 
+    def test_new_borrower_property_address_is_persisted(self):
+        raw = _view_submission_payload(
+            "fa_max_log_submission_submit",
+            {"mode": "new_borrower"},
+            {
+                "new_full_name_block": {"new_full_name": {"value": "John Smith"}},
+                "new_property_address_block": {"new_property_address": {"value": "123 Main St"}},
+                "opportunity_type_block": {"opportunity_type": {"selected_option": {"value": "acquisition"}}},
+            },
+        )
+        fake_person_row = MagicMock()
+        fake_person_row.person_id = "p-new-4"
+        from src.api.admin_router import get_db
+
+        mock_db = MagicMock()
+        mock_db.execute.return_value.fetchone.return_value = fake_person_row
+
+        def _override():
+            yield mock_db
+
+        app.dependency_overrides[get_db] = _override
+        try:
+            with patch("src.api.admin_router._verify_slack_signature", return_value=True), \
+                 patch(
+                     "src.services.state_engine.create_fa_max_opportunity", return_value="opp-4",
+                 ), \
+                 patch("src.services.state_engine.transition"), \
+                 patch("src.services.fa_max_file_state.ensure_file_state"):
+                response = client.post(
+                    "/api/admin/slack/interact", data=raw,
+                    headers={**_signed_headers(), "content-type": "application/x-www-form-urlencoded"},
+                )
+        finally:
+            app.dependency_overrides.pop(get_db, None)
+        assert response.status_code == 200
+        address_calls = [
+            call for call in mock_db.execute.call_args_list
+            if call.args and isinstance(call.args[1], dict) and "property_address" in call.args[1]
+        ]
+        assert len(address_calls) == 1
+        assert address_calls[0].args[1]["property_address"] == "123 Main St"
+        assert address_calls[0].args[1]["opportunity_id"] == "opp-4"
+
     def test_new_borrower_phone_is_normalized_before_insert(self):
         raw = _view_submission_payload(
             "fa_max_log_submission_submit",

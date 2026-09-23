@@ -2518,13 +2518,22 @@ def _handle_log_submission_view_submit(payload: dict, db: Session) -> dict:
     # block just records a reference Josh already knows at submission time
     # -- no underwriting has happened yet, so the stage must not move.
     backflip_ref = _field("backflip_ref_block", "backflip_ref") or None
-    if backflip_ref:
+    # new_property_address_block only exists on the new-borrower view (see
+    # _build_log_submission_new_entry_view) -- absent from `values` on the
+    # existing-borrower path, so _field() harmlessly returns "" -> None.
+    property_address = _field("new_property_address_block", "new_property_address") or None
+    if backflip_ref or property_address:
         db.execute(
             text(
-                "UPDATE fa_max_opportunities SET backflip_ref = :backflip_ref, "
+                "UPDATE fa_max_opportunities SET "
+                "backflip_ref = COALESCE(:backflip_ref, backflip_ref), "
+                "property_address = COALESCE(:property_address, property_address), "
                 "updated_at = NOW() WHERE opportunity_id = :opportunity_id::uuid"
             ),
-            {"backflip_ref": backflip_ref, "opportunity_id": opportunity_id},
+            {
+                "backflip_ref": backflip_ref, "property_address": property_address,
+                "opportunity_id": opportunity_id,
+            },
         )
         db.commit()
 

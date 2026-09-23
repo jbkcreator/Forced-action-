@@ -10865,6 +10865,11 @@ class FaMaxOpportunity(Base):
     loan_amount_cents: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     maturity_months: Mapped[Optional[int]] = mapped_column(SmallInteger, nullable=True)
     backflip_ref: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # Free-text address as typed by Josh in the log-submission modal for a
+    # new borrower -- NOT a FK into properties(id) (see FaMaxOpportunityProperty
+    # for the matched-property link table). This just preserves what he
+    # entered at submission time; it is never fuzzy-matched or validated.
+    property_address: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     assigned_to: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
     # WP-T2-2: write-once attribution to the interaction that triggered this
     # opportunity's creation. NULL = unattributed = counts as zero for the

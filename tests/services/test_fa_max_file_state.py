@@ -152,6 +152,19 @@ class TestRecordDocumentReceived:
         )
         assert count == 1
 
+    def test_matches_regardless_of_case_and_whitespace(self):
+        # doc:Bank Statement requested, received:BANK STATEMENT closed --
+        # must not silently match zero rows.
+        db = _mock_db()
+        db.execute.return_value.rowcount = 1
+        count = svc.record_document_received(
+            db, opportunity_id="opp-1", document_name="  BANK STATEMENT  ",
+        )
+        assert count == 1
+        sql = str(db.execute.call_args.args[0])
+        assert "lower(trim(document_name))" in sql
+        assert "lower(trim(:document_name))" in sql
+
 
 class TestRecordTerms:
     def test_writes_terms_and_notifies_money_via_raw_insert(self):

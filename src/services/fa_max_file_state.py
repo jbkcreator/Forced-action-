@@ -204,12 +204,15 @@ def record_document_request(
 
 
 def record_document_received(session: Session, *, opportunity_id: str, document_name: str) -> int:
+    # document_name is free text typed twice by a human (once on request,
+    # once on receipt) -- case-fold and trim both sides so a casing/
+    # whitespace difference doesn't leave the request stuck open forever.
     result = session.execute(
         text("""
             UPDATE fa_max_document_requests
             SET received_at = NOW()
             WHERE opportunity_id = :opportunity_id ::uuid
-              AND document_name = :document_name
+              AND lower(trim(document_name)) = lower(trim(:document_name))
               AND received_at IS NULL
         """),
         {"opportunity_id": opportunity_id, "document_name": document_name},
