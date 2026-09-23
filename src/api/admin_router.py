@@ -3245,7 +3245,7 @@ def _fa_max_file_update_command(form: dict, db: Session) -> dict:
         return channel_rejection
     user_id = form.get("user_id", "")
     if not _relay_approver_authorized(user_id, "fa_max_lending"):
-        return _slack_ephemeral("Not authorized to update FA Max file state.")
+        return _slack_ephemeral("🚫 Not authorized to update FA Max file state.")
 
     tokens = (form.get("text") or "").strip().split(maxsplit=1)
     if len(tokens) != 2:
@@ -3258,7 +3258,7 @@ def _fa_max_file_update_command(form: dict, db: Session) -> dict:
 
     resolved = resolve_opportunity_by_backflip_ref(db, backflip_ref)
     if resolved is None:
-        return _slack_ephemeral(f"No opportunity found for {backflip_ref}.")
+        return _slack_ephemeral(f"🔍 No opportunity found for `{backflip_ref}`.")
 
     if action.lower().startswith("received:"):
         document_name = action[len("received:"):].strip()
@@ -3271,10 +3271,10 @@ def _fa_max_file_update_command(form: dict, db: Session) -> dict:
         )
         if not closed:
             return _slack_ephemeral(
-                f"No outstanding request named '{document_name}' for {backflip_ref}."
+                f"⚠️ No outstanding request named *{document_name}* for `{backflip_ref}`."
             )
         return _slack_ephemeral(
-            f"Marked '{document_name}' received for {backflip_ref} — chase stopped."
+            f"✅ Marked *{document_name}* received for `{backflip_ref}` — chase stopped."
         )
 
     if action.lower().startswith("doc:"):
@@ -3297,7 +3297,7 @@ def _fa_max_file_update_command(form: dict, db: Session) -> dict:
             document_name=document_name,
             contact_email=(file_state or {}).get("contact_email"),
         )
-        return _slack_ephemeral(f"Recorded document request '{document_name}' for {backflip_ref}.")
+        return _slack_ephemeral(f"📄 Recorded document request *{document_name}* for `{backflip_ref}`.")
 
     stage = action.lower()
     if stage not in BACKFLIP_STAGE_KEYS:
@@ -3312,7 +3312,7 @@ def _fa_max_file_update_command(form: dict, db: Session) -> dict:
         db, opportunity_id=resolved["opportunity_id"], to_stage=stage,
         actor=f"manual:{user_id}", source="manual",
     )
-    return _slack_ephemeral(f"{backflip_ref} updated to stage: {stage}.")
+    return _slack_ephemeral(f"✅ `{backflip_ref}` updated to stage: *{stage}*.")
 
 
 def _fa_max_log_submission_command(form: dict) -> dict:
