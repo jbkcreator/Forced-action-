@@ -161,8 +161,14 @@ def update_backflip_stage(
     if to_stage == "declined":
         current = state_engine.get_opportunity_state(session=session, opportunity_id=opportunity_id)
         if current is not None and current["current_stage"] not in ("declined", "dead"):
+            # transition() requires a real fa_max_entity_registry
+            # entity_uuid, not the opportunity's own native ID
+            # (WP-T2-6 review fix).
+            entity_uuid = state_engine.ensure_entity_registry(
+                session=session, entity_type="opportunity", native_id=opportunity_id,
+            )
             state_engine.transition(
-                session=session, entity_type="opportunity", entity_uuid=opportunity_id,
+                session=session, entity_type="opportunity", entity_uuid=entity_uuid,
                 from_state=current["current_stage"], to_state="declined",
                 actor=actor, source_component="src.services.fa_max_file_state",
                 idempotency_key=f"fa_max_file_state:declined:{opportunity_id}",
@@ -255,8 +261,13 @@ def record_terms(
 
     current = state_engine.get_opportunity_state(session=session, opportunity_id=opportunity_id)
     if current is not None and current["current_stage"] == "submitted":
+        # transition() requires a real fa_max_entity_registry entity_uuid,
+        # not the opportunity's own native ID (WP-T2-6 review fix).
+        entity_uuid = state_engine.ensure_entity_registry(
+            session=session, entity_type="opportunity", native_id=opportunity_id,
+        )
         state_engine.transition(
-            session=session, entity_type="opportunity", entity_uuid=opportunity_id,
+            session=session, entity_type="opportunity", entity_uuid=entity_uuid,
             from_state="submitted", to_state="term_sheet",
             actor=actor, source_component="src.services.fa_max_file_state",
             idempotency_key=f"fa_max_file_state:term_sheet:{opportunity_id}",

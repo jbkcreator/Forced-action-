@@ -121,6 +121,8 @@ class TestUpdateBackflipStage:
             "src.services.state_engine.get_opportunity_state",
             return_value={"current_stage": "submitted", "state_version": 3},
         ), patch("src.services.state_engine.transition") as mock_transition, patch(
+            "src.services.state_engine.ensure_entity_registry", return_value="registry-uuid-1",
+        ), patch(
             "src.services.state_engine.write_interaction"
         ):
             svc.update_backflip_stage(
@@ -129,6 +131,7 @@ class TestUpdateBackflipStage:
             )
         mock_transition.assert_called_once()
         assert mock_transition.call_args.kwargs["to_state"] == "declined"
+        assert mock_transition.call_args.kwargs["entity_uuid"] == "registry-uuid-1"
 
 
 class TestRecordDocumentRequest:
@@ -172,7 +175,9 @@ class TestRecordTerms:
         with patch(
             "src.services.state_engine.get_opportunity_state",
             return_value={"current_stage": "submitted", "state_version": 1},
-        ), patch("src.services.state_engine.transition") as mock_transition:
+        ), patch("src.services.state_engine.transition") as mock_transition, patch(
+            "src.services.state_engine.ensure_entity_registry", return_value="registry-uuid-2",
+        ):
             svc.record_terms(
                 db, opportunity_id="opp-1", actor="email_parser",
                 loan_amount_cents=25_000_000, maturity_months=12,
@@ -180,6 +185,7 @@ class TestRecordTerms:
             )
         mock_transition.assert_called_once()
         assert mock_transition.call_args.kwargs["to_state"] == "term_sheet"
+        assert mock_transition.call_args.kwargs["entity_uuid"] == "registry-uuid-2"
         insert_calls = [
             call for call in db.execute.call_args_list
             if "INSERT INTO relay_approval_queue" in str(call.args[0])

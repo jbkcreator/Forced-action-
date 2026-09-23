@@ -2092,6 +2092,7 @@ def _handle_relay_decision(payload: dict) -> dict:
         spec = existing.payload["fa_max_transition"]
         try:
             from src.services.state_engine import (
+                ensure_entity_registry,
                 get_opportunity_state,
                 get_person_state,
                 transition,
@@ -2100,6 +2101,11 @@ def _handle_relay_decision(payload: dict) -> dict:
             from src.core.database import get_db_context as _get_db
 
             entity_type = spec.get("entity_type", "person")
+            # spec["entity_uuid"] is the entity's own native ID
+            # (opportunity_id/person_id) -- get_opportunity_state/
+            # get_person_state below need exactly that. transition()
+            # needs a real fa_max_entity_registry entity_uuid instead
+            # (resolved just before that call, WP-T2-6 review fix).
             entity_uuid = spec["entity_uuid"]
 
             with _get_db() as _db:
@@ -2149,9 +2155,12 @@ def _handle_relay_decision(payload: dict) -> dict:
                 # the borrower's history — no error, just a missing row.
                 person_id_for_event = current.get("person_id")
 
+                registry_entity_uuid = ensure_entity_registry(
+                    session=_db, entity_type=entity_type, native_id=entity_uuid,
+                )
                 result = transition(
                     entity_type=entity_type,
-                    entity_uuid=entity_uuid,
+                    entity_uuid=registry_entity_uuid,
                     from_state=current_from_state,
                     to_state=spec["to_state"],
                     actor=f"slack_approver:{user_id}",
@@ -2538,8 +2547,16 @@ def _handle_log_submission_view_submit(payload: dict, db: Session) -> dict:
     )
 
     user_id = payload.get("user", {}).get("id", "unknown")
+    # transition() requires a real fa_max_entity_registry entity_uuid, not
+    # the opportunity's own native ID (WP-T2-6 review fix -- confirmed
+    # live: every existing call site in this codebase passed the native ID
+    # directly, which transition()'s registry lookup never matched since
+    # nothing had registered it, so the transition silently no-op'd).
+    entity_uuid = state_engine.ensure_entity_registry(
+        session=db, entity_type="opportunity", native_id=opportunity_id,
+    )
     state_engine.transition(
-        session=db, entity_type="opportunity", entity_uuid=opportunity_id,
+        session=db, entity_type="opportunity", entity_uuid=entity_uuid,
         from_state="new", to_state="submitted",
         actor="user:josh", source_component="src.api.admin_router",
         idempotency_key=f"log_submission:{opportunity_id}:submitted",
@@ -2664,7 +2681,7 @@ def advance_fa_max_opportunity(
 ):
     """Advance one opportunity through configured stages with CAS and audit."""
     from src.services.state_engine import (
-        get_opportunity_state, transition, TransitionOutcome,
+        ensure_entity_registry, get_opportunity_state, transition, TransitionOutcome,
     )
 
     if body.to_state == "funded":
@@ -2675,8 +2692,13 @@ def advance_fa_max_opportunity(
             raise HTTPException(status_code=404, detail="Opportunity not found")
         if current["state_version"] != body.expected_version:
             raise HTTPException(status_code=409, detail="Opportunity version changed")
+        # transition() requires a real fa_max_entity_registry entity_uuid,
+        # not the opportunity's own native ID (WP-T2-6 review fix).
+        entity_uuid = ensure_entity_registry(
+            session=session, entity_type="opportunity", native_id=opportunity_id,
+        )
         result = transition(
-            session=session, entity_type="opportunity", entity_uuid=opportunity_id,
+            session=session, entity_type="opportunity", entity_uuid=entity_uuid,
             from_state=current["current_stage"], to_state=body.to_state,
             actor="admin:fa_max_opportunity", source_component="src.api.admin_router",
             idempotency_key=body.idempotency_key, state_version=body.expected_version,
