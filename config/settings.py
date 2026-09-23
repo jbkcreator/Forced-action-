@@ -903,6 +903,10 @@ class AppSettings(BaseSettings):
 	fa_max_backflip_feed_adapter: str = Field(default="csv", env="FA_MAX_BACKFLIP_FEED_ADAPTER")
 	# WP-T3-1: how long a Revise / Log-call tap waits for the approver's next message.
 	fa_max_pending_slot_ttl_min: int = Field(default=15, ge=1, env="FA_MAX_PENDING_SLOT_TTL_MIN")
+	# WP-T3-1: voice-note transcription via OpenAI Whisper.
+	openai_api_key: Optional[SecretStr] = Field(default=None, env="OPENAI_API_KEY")
+	fa_max_whisper_model: str = Field(default="whisper-1", env="FA_MAX_WHISPER_MODEL")
+	fa_max_voice_max_bytes: int = Field(default=25_000_000, ge=1, env="FA_MAX_VOICE_MAX_BYTES")
 	backflip_webhook_secret: Optional[SecretStr] = Field(default=None, env="BACKFLIP_WEBHOOK_SECRET")
 
 	# ── FA Max WP-T2-1 — Own-Lane Send Infrastructure ────────────────────────

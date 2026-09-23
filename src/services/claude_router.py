@@ -84,6 +84,8 @@ _TASK_ROUTING: dict[str, str] = {
     "fa_max_thread_fallback": "haiku",
     # FA Max NL draft revision (WP-T3-1) — copy goes out under Josh's name
     "fa_max_nl_revision": "sonnet",
+    # FA Max voice-note disposition extraction (WP-T3-1)
+    "fa_max_voice_disposition": "sonnet",
     # Opus — explicit override, edge cases only
     "edge_case": "opus",
 }

@@ -14,7 +14,7 @@ from sqlalchemy import text
 
 from src.core.database import get_db_context
 
-TABLES = ("fa_max_pending_slots", "fa_max_draft_revisions")
+TABLES = ("fa_max_pending_slots", "fa_max_draft_revisions", "fa_max_call_dispositions")
 
 STATEMENTS: list[tuple[str, str]] = [
     (
@@ -55,6 +55,34 @@ STATEMENTS: list[tuple[str, str]] = [
         """
         CREATE INDEX IF NOT EXISTS ix_fa_max_draft_revisions_item
             ON fa_max_draft_revisions (relay_item_id);
+        """,
+    ),
+    (
+        "CREATE fa_max_call_dispositions",
+        """
+        CREATE TABLE IF NOT EXISTS fa_max_call_dispositions (
+            id              BIGSERIAL PRIMARY KEY,
+            interaction_id  UUID NOT NULL REFERENCES fa_max_interactions (interaction_id),
+            person_id       UUID NOT NULL REFERENCES fa_max_persons (person_id),
+            opportunity_id  UUID NOT NULL REFERENCES fa_max_opportunities (opportunity_id),
+            outcome         VARCHAR(40) NOT NULL,
+            summary         VARCHAR(280) NOT NULL,
+            next_action     VARCHAR(140),
+            next_action_due DATE,
+            slack_user_id   VARCHAR(60) NOT NULL,
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+            CONSTRAINT ck_fa_max_call_disposition_outcome CHECK (outcome IN (
+                'connected_interested','connected_not_interested',
+                'callback_requested','voicemail','no_answer','wrong_number','unclear'
+            ))
+        );
+        """,
+    ),
+    (
+        "INDEX ix_fa_max_call_dispositions_person_created",
+        """
+        CREATE INDEX IF NOT EXISTS ix_fa_max_call_dispositions_person_created
+            ON fa_max_call_dispositions (person_id, created_at);
         """,
     ),
 ]

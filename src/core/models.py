@@ -12381,6 +12381,50 @@ class FaMaxDraftRevision(Base):
     )
 
 
+class FaMaxCallDisposition(Base):
+    """WP-T3-1 — one row per voice-note call disposition.
+
+    Written in the same transaction as the fa_max_interactions row.
+    Never updates won/lost outcomes (record_dial_disposition is not called).
+    """
+
+    __tablename__ = "fa_max_call_dispositions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    interaction_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_interactions.interaction_id", name="fk_fa_max_call_disp_interaction"),
+        nullable=False,
+    )
+    person_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_persons.person_id", name="fk_fa_max_call_disp_person"),
+        nullable=False,
+    )
+    opportunity_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_opportunities.opportunity_id", name="fk_fa_max_call_disp_opp"),
+        nullable=False,
+    )
+    outcome: Mapped[str] = mapped_column(String(40), nullable=False)
+    summary: Mapped[str] = mapped_column(String(280), nullable=False)
+    next_action: Mapped[Optional[str]] = mapped_column(String(140), nullable=True)
+    next_action_due: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    slack_user_id: Mapped[str] = mapped_column(String(60), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "outcome IN ('connected_interested','connected_not_interested',"
+            "'callback_requested','voicemail','no_answer','wrong_number','unclear')",
+            name="ck_fa_max_call_disposition_outcome",
+        ),
+        Index("ix_fa_max_call_dispositions_person_created", "person_id", "created_at"),
+    )
+
+
 class FaMaxGyrRoutingLog(Base):
     """Immutable audit log — one row per GYR routing decision (WP-T2-11).
 

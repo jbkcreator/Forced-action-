@@ -213,6 +213,13 @@ def handle_socket_request(client: Any, request: Any) -> bool:
     client.send_socket_mode_response(SocketModeResponse(envelope_id=request.envelope_id))
 
     if request.type == "events_api":
+        # WP-T3-1 §4.2: audio file_share events arrive as message/file_share —
+        # intercept before _handle_relay_thread_action, which filters subtype != None.
+        _ev = payload.get("event") or {}
+        if _ev.get("type") == "message" and _ev.get("subtype") == "file_share":
+            _handle_voice_file_share(client, payload)
+            return True
+
         # Socket Mode delivers subscribed Events API payloads in an
         # ``events_api`` envelope. Reuse the HTTP route's thread-command
         # handler so an exact approve/reject reply has the same durable
@@ -507,6 +514,74 @@ def handle_fa_max_slash_command_request(client: Any, request: Any) -> bool:
         # correct behavior: nothing to say means nothing to post.
         _post_slash_reply(response_url, reply)
     return True
+
+
+def _handle_voice_file_share(client: Any, payload: dict) -> None:
+    """Route an audio file_share event to the voice intake pipeline (WP-T3-1 §4.2).
+
+    Fires only when the sender has a live voice slot. Without one, posts a hint
+    and writes nothing.
+    """
+    from src.services.fa_max_pending_slot import get_slot
+    from src.services.fa_max_voice_intake import handle_voice_intake
+    from src.core.database import get_db_context
+
+    settings = get_settings()
+    event = payload.get("event") or {}
+    user_id = event.get("user", "")
+    channel_id = event.get("channel", "")
+    thread_ts = event.get("thread_ts")
+
+    if not _relay_approver_authorized_for_voice(user_id):
+        return
+
+    files = event.get("files") or []
+    if not files:
+        return
+    file_info = files[0]
+    mimetype = file_info.get("mimetype", "")
+    if not (mimetype.startswith("audio/") or mimetype == "video/mp4"):
+        return
+
+    bot_token_obj = settings.fa_max_slack_bot_token or settings.slack_bot_token
+    if not bot_token_obj:
+        return
+    bot_token = bot_token_obj.get_secret_value()
+
+    with get_db_context() as session:
+        slot = get_slot(session, user_id)
+        if slot is None or slot.kind != "voice":
+            try:
+                kwargs: dict = {
+                    "channel": channel_id,
+                    "text": "Tap :microphone: Log call on the person's card, then send the note again.",
+                }
+                if thread_ts:
+                    kwargs["thread_ts"] = thread_ts
+                client.web_client.chat_postMessage(**kwargs)
+            except Exception:
+                logger.warning("[VoiceIntake] no-slot hint post failed")
+            return
+
+        opportunity_id = slot.target_ref
+        handle_voice_intake(
+            session=session,
+            slack_user_id=user_id,
+            opportunity_id=opportunity_id,
+            file_info=file_info,
+            bot_token=bot_token,
+            slack_client=client.web_client,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+        )
+
+
+def _relay_approver_authorized_for_voice(user_id: str) -> bool:
+    from src.api.admin_router import _relay_approver_authorized
+    try:
+        return _relay_approver_authorized(user_id)
+    except Exception:
+        return False
 
 
 def run() -> None:
