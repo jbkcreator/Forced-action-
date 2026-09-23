@@ -42,9 +42,13 @@ PYTHONPATH=. python migrations/apply_fa_max_wp_t2_2_opportunity_origin_immutable
 PYTHONPATH=. python migrations/apply_fa_max_wp_t2_2_tool_call_log_in_progress_status.py  # FA Max WP-T2-2 review fix: widens fa_max_tool_call_log.status CHECK to allow 'in_progress' (audit row written before a tool executes, not only after) (idempotent, run after apply_fa_max_wp_t2_2_agent_infra.py)
 PYTHONPATH=. python migrations/apply_fa_max_wp_t2_2_tool_call_log_claimed_status.py  # FA Max WP-T2-2 review fix: widens fa_max_tool_call_log.status CHECK to allow 'claimed' (claim_send_attempt()'s short-lived commit so a timeout write can't clobber a legitimately-claimed send) (idempotent, run after apply_fa_max_wp_t2_2_tool_call_log_in_progress_status.py)
 PYTHONPATH=. python migrations/apply_fa_max_wp_t2_3.py  # FA Max WP-T2-3: opportunity_id on relay_approval_queue, backflip_attribution_owner/set_at on fa_max_opportunities, fa_max_backflip_suppression_decisions audit table (idempotent, run after WP-T2-2)
+PYTHONPATH=. python migrations/apply_fa_max_opportunity_facts.py  # FA Max WP-T3-7: fa_max_opportunity_facts + fa_max_qualification_decisions, widens exceptions_alert_queue.status to add 'cancelled' (idempotent, run after WP-1)
 
 # FA Max agent worker (separate process, WP-T2-2 — see docs/PLATFORM-OPERATIONS-GUIDE.md)
 python -m src.agents.fa_max.worker
+
+# FA Max qualification agent worker (separate process, WP-T3-7 — see docs/PLATFORM-OPERATIONS-GUIDE.md)
+python -m src.agents.fa_max.qualification_worker
 
 # FA Max weekly edit-rate report (Friday cron, WP-T2-2)
 python -m src.tasks.fa_max_weekly_edit_rate_report
@@ -121,6 +125,7 @@ Seven-rung state machine over `ventures.ladder_stage`: `radar → probe → pilo
 - `learning_hygiene.py`: lesson-hygiene verdicts, evidence vocabularies (default-deny over the `agent_decisions` CHECK sets), `validate_hygiene_config()`, `config_snapshot()` frozen into every audit row.
 - `venture_template.py`: `DEFAULT_VENTURE_KEY`, the copy-and-fill `VENTURE_TEMPLATE`, and `validate_venture_config()`.
 - `venture_ladder.py`: `LADDER_STAGES`, per-stage `STAGE_GATES` (each with `direction` + `no_metric_behavior`), presell + auto-double constants, `validate_ladder_config()`.
+- `fa_max_qualification.py`: WP-T3-7 Qualification Agent's per-`opportunity_type` `CHECKLIST` (`FactSpec` list), `CHECKLIST_VERSION` (bump triggers the qualification worker's startup backstop sweep), `NUMERIC_FACT_KEYS` (facts checked for validity, not just presence).
 
 ### Deployment
 Single `Dockerfile` at project root. `docker-compose.yml` runs `api` and `lifecycle` as two services from the same image with `network_mode: host` (Postgres + Redis run on the host). Nginx serves React SPA static files and proxies `/api/` + `/webhooks/` to FastAPI on port 8000.

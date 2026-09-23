@@ -12358,3 +12358,129 @@ class FaMaxGyrRoutingLog(Base):
         ),
         Index("ix_fa_max_gyr_log_opp_decided", "opportunity_id", "decided_at"),
     )
+
+
+class FaMaxOpportunityFacts(Base):
+    """WP-T3-7 — property/project facts intake for the Qualification Agent.
+
+    One row per opportunity (1:1). The single write path is
+    src.services.fa_max_qualification.set_facts() via
+    POST /api/admin/fa-max/opportunities/{id}/facts — nothing else may
+    INSERT/UPDATE this table. Schema mirrors
+    migrations/apply_fa_max_opportunity_facts.py exactly; this model exists
+    so Base.metadata.create_all() (this repo's test-fixture source of
+    truth per CLAUDE.md) creates the table in a fresh/test environment
+    without requiring the migration to have run first (code-review finding,
+    2026-09: these tables previously existed only in the migration script).
+
+    COMPLIANCE BOUNDARY (SOT.md Part 1): no borrower financial data column
+    may ever be added here — credit_score, income, bank_statement,
+    tax_return, ssn are permanently forbidden regardless of source.
+    """
+
+    __tablename__ = "fa_max_opportunity_facts"
+
+    opportunity_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_opportunities.opportunity_id", name="fk_fa_max_opp_facts_opp"),
+        primary_key=True,
+    )
+    facts_revision: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    property_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("properties.id", name="fk_fa_max_opp_facts_property")
+    )
+    purchase_price: Mapped[Optional[float]] = mapped_column(Numeric(14, 2))
+    estimated_value: Mapped[Optional[float]] = mapped_column(Numeric(14, 2))
+    assessed_value_mkt: Mapped[Optional[float]] = mapped_column(Numeric(14, 2))
+    last_sale_price: Mapped[Optional[float]] = mapped_column(Numeric(14, 2))
+    rehab_estimate: Mapped[Optional[float]] = mapped_column(Numeric(14, 2))
+    rehab_source: Mapped[Optional[str]] = mapped_column(String(30))
+    rehab_confidence: Mapped[Optional[str]] = mapped_column(String(10))
+    arv: Mapped[Optional[float]] = mapped_column(Numeric(14, 2))
+    arv_source: Mapped[Optional[str]] = mapped_column(String(80))
+    arv_confidence: Mapped[Optional[str]] = mapped_column(String(10))
+    expected_exit_strategy: Mapped[Optional[str]] = mapped_column(String(30))
+    current_use: Mapped[Optional[str]] = mapped_column(String(60))
+    existing_sqft: Mapped[Optional[int]] = mapped_column(Integer)
+    facts_provenance: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "rehab_source IS NULL OR rehab_source IN ('job_estimator', 'override')",
+            name="ck_fa_max_opp_facts_rehab_source",
+        ),
+        CheckConstraint(
+            "rehab_confidence IS NULL OR rehab_confidence IN ('high', 'medium', 'low')",
+            name="ck_fa_max_opp_facts_rehab_confidence",
+        ),
+        CheckConstraint(
+            "arv_source IS NULL OR (arv_source ~ '^[a-z0-9_.:-]+$'"
+            " AND arv_source !~* '(credit_score|income|bank_statement|tax_return|ssn|fico|dti|debt_to_income)')",
+            name="fa_max_opportunity_facts_arv_source_check",
+        ),
+        CheckConstraint(
+            "arv_confidence IS NULL OR arv_confidence IN ('high', 'medium', 'low')",
+            name="ck_fa_max_opp_facts_arv_confidence",
+        ),
+        CheckConstraint(
+            "expected_exit_strategy IS NULL OR expected_exit_strategy IN"
+            " ('sale','rent','dscr','refinance','unknown')",
+            name="ck_fa_max_opp_facts_exit_strategy",
+        ),
+        CheckConstraint(
+            "current_use IS NULL OR current_use IN"
+            " ('single_family','multi_family_2_4','multi_family_5plus',"
+            " 'condo','townhouse','vacant_land','commercial','mixed_use','other')",
+            name="fa_max_opportunity_facts_current_use_check",
+        ),
+        CheckConstraint(
+            "existing_sqft IS NULL OR existing_sqft >= 0",
+            name="ck_fa_max_opp_facts_sqft",
+        ),
+        Index("ix_fa_max_opp_facts_rev", "opportunity_id", "facts_revision"),
+    )
+
+
+class FaMaxQualificationDecision(Base):
+    """WP-T3-7 — append-only audit row per sufficiency evaluation.
+
+    Written by src.services.fa_max_qualification.evaluate_sufficiency(). See
+    FaMaxOpportunityFacts's docstring for why this model exists alongside
+    the migration.
+    """
+
+    __tablename__ = "fa_max_qualification_decisions"
+
+    decision_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    opportunity_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_opportunities.opportunity_id", name="fk_fa_max_qual_dec_opp"),
+        nullable=False,
+    )
+    facts_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    checklist_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    verdict: Mapped[str] = mapped_column(String(30), nullable=False)
+    gaps: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    gap_content_hash: Mapped[Optional[str]] = mapped_column(String(64))
+    decided_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    decided_by: Mapped[str] = mapped_column(String(80), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "verdict IN ('sufficient', 'insufficient', 'pending_enrichment',"
+            " 'sufficient_pending_contract')",
+            name="ck_fa_max_qual_dec_verdict",
+        ),
+        Index("ix_fa_max_qd_opp_decided", "opportunity_id", "decided_at"),
+        Index("ix_fa_max_qd_opp_rev", "opportunity_id", "facts_revision", "checklist_version"),
+    )

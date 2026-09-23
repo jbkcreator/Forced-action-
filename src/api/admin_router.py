@@ -31,7 +31,7 @@ import stripe
 from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Query, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import and_, case, distinct, func, or_, select, text
 from sqlalchemy.orm import Session
 
@@ -6749,3 +6749,193 @@ async def quora_auth_ws(websocket: WebSocket, token: str = Query(...)):
             )
         except Exception:
             pass
+
+
+# ===========================================================================
+# FA Max Opportunity Facts intake — WP-T3-7 Qualification Agent
+#
+# This is the single write path for property/project facts. It:
+#   1. Validates no borrower-financial-data fields are present (SOT.md Part 1).
+#   2. Calls fa_max_qualification.set_facts() which enforces client-override
+#      precedence and only bumps facts_revision on effective changes.
+#   3. Enqueues a qualification recheck for the new revision.
+#
+# Callers: admin operators and (via background enrichment) the T3-8
+# Fundability Agent. The endpoint is the only production write path into
+# fa_max_opportunity_facts — nothing else may INSERT/UPDATE that table.
+# ===========================================================================
+
+class FaMaxOpportunityFactsRequest(BaseModel):
+    # extra="forbid": reject unknown fields outright rather than silently
+    # dropping them. Pydantic's default (ignore) meant an unknown key like
+    # "income" never reached no_financial_fields() below (it only inspects
+    # model_fields_set, which by construction never contains an undeclared
+    # field) — the validator's "belt-and-suspenders" claim was weaker than
+    # documented, even though no forbidden data could reach the DB either
+    # way (only _ALLOWED_UPDATES columns are ever written). Rejecting
+    # outright makes a caller's mistake visible as a 400 instead of a
+    # silent no-op (code-review finding, 2026-09).
+    model_config = ConfigDict(extra="forbid")
+
+    # Property link (nullable for portfolio scenarios)
+    property_id: Optional[int] = None
+
+    # Purchase basis (QuoteReadyInput fallback chain)
+    purchase_price: Optional[float] = Field(default=None, ge=0)
+    estimated_value: Optional[float] = Field(default=None, ge=0)
+    assessed_value_mkt: Optional[float] = Field(default=None, ge=0)
+    last_sale_price: Optional[float] = Field(default=None, ge=0)
+
+    # Rehab
+    rehab_estimate: Optional[float] = Field(default=None, ge=0)
+    rehab_source: Optional[Literal["job_estimator", "override"]] = None
+    rehab_confidence: Optional[Literal["high", "medium", "low"]] = None
+
+    # ARV
+    arv: Optional[float] = Field(default=None, ge=0)
+    # Structured identifier, not free prose — mirrors QuoteReadyInput's own
+    # arv_source values ("legacy_financial.arv", a WP-8B comp-range/
+    # manual-override tag): lowercase identifier characters only. A plain
+    # free-text field here was another unrestricted-text path around the
+    # "property/project facts only" schema boundary alongside current_use
+    # (code-review finding, third round, 2026-09) — a Literal enum isn't
+    # used because this field's real vocabulary is WP-8B's, not T3-7's, to
+    # define; the pattern constrains the SHAPE of the value without
+    # guessing at Dev 4's exact taxonomy.
+    arv_source: Optional[str] = Field(
+        default=None, max_length=80, pattern=r"^[a-z0-9_.:-]+$"
+    )
+    arv_confidence: Optional[Literal["high", "medium", "low"]] = None
+
+    # Scenario-type-specific
+    expected_exit_strategy: Optional[Literal[
+        "sale", "rent", "dscr", "refinance", "unknown"
+    ]] = None
+    # Fixed vocabulary, not free text — see config.fa_max_qualification.CurrentUse
+    # and the matching DB CHECK constraint. A free-text field here was an
+    # unrestricted-text path around the "property/project facts only" schema
+    # boundary: extra="forbid" blocks unknown field NAMES but not what a
+    # caller puts inside an allowed field's VALUE (code-review finding,
+    # second round, 2026-09).
+    current_use: Optional[Literal[
+        "single_family", "multi_family_2_4", "multi_family_5plus",
+        "condo", "townhouse", "vacant_land", "commercial", "mixed_use", "other",
+    ]] = None
+    existing_sqft: Optional[int] = Field(default=None, ge=0)
+
+    # Source annotation — what kind of writer this is. WHO (set_by) is
+    # derived server-side from the authenticated admin's JWT subject, not
+    # caller-supplied — a client-controlled audit identity let any admin
+    # caller attribute a fact write to an arbitrary label (code-review
+    # finding, 2026-09). See set_fa_max_opportunity_facts() below.
+    source: Literal["client", "enrichment", "auto"] = "client"
+
+    @model_validator(mode="after")
+    def no_financial_fields(self) -> "FaMaxOpportunityFactsRequest":
+        """SOT.md Part 1: no borrower financial data, ever.
+        This validator is a belt-and-suspenders check that no future caller
+        accidentally sneaks a forbidden field through the Pydantic schema.
+        The schema itself already omits these fields, so this is defense-in-depth.
+
+        Also checks arv_source's VALUE, not just field names (code-review
+        finding, fourth round, 2026-09: a character-shape pattern alone
+        accepts an identifier-shaped string like "borrower_income:123" —
+        syntactically valid, but the substring itself is exactly the kind
+        of content this field must never carry). arv_source is provenance
+        metadata (WHERE an ARV number came from), never the number itself,
+        so this is a targeted substring block for the demonstrated case,
+        not a claim that arv_source's full vocabulary is closed — that
+        vocabulary is WP-8B's to define (see the field's own comment).
+        """
+        from config.fa_max_qualification import FORBIDDEN_FINANCIAL_TERMS as forbidden_keys
+        provided = {k for k in self.model_fields_set if k.lower() in forbidden_keys}
+        if provided:
+            raise ValueError(
+                f"Borrower financial data is forbidden in FA Max: {sorted(provided)}"
+            )
+        if self.arv_source and any(
+            term in self.arv_source.lower() for term in forbidden_keys
+        ):
+            raise ValueError(
+                f"arv_source must not reference borrower financial data: {self.arv_source!r}"
+            )
+        return self
+
+
+@router.post("/fa-max/opportunities/{opportunity_id}/facts")
+def set_fa_max_opportunity_facts(
+    opportunity_id: str,
+    body: FaMaxOpportunityFactsRequest,
+    _admin: dict = Depends(get_current_admin),
+):
+    """Write property/project facts for an opportunity and trigger qualification.
+
+    Compliance: no borrower financial data (credit score, income, bank
+    statement, tax return, SSN). SOT.md Part 1 — enforced at schema level.
+
+    Returns the updated facts_revision and the work_item_id of the enqueued
+    qualification recheck (None when the write was a no-op and no revision
+    was bumped).
+    """
+    from src.services.fa_max_qualification import set_facts, enqueue_qualification_recheck
+    from src.services.state_engine import get_opportunity_state
+    from src.core.database import get_db_context
+
+    # exclude_unset (not exclude_none): a field the caller never sent is
+    # correctly omitted, but a field the caller explicitly sent as null is
+    # an intentional clear-to-None instruction and must reach set_facts() as
+    # such — exclude_none stripped both cases identically, so a client had
+    # no way to retract a previously-set fact (code-review finding, 2026-09).
+    # set_facts()'s existing None-vs-value handling in _values_equal already
+    # treats None as a distinct, comparable value.
+    raw_updates = body.model_dump(exclude={"source"}, exclude_unset=True)
+
+    # Audit identity is the authenticated admin's JWT subject, never
+    # caller-supplied (code-review finding, 2026-09) — matches this
+    # router's existing _admin.get("sub") pattern used elsewhere.
+    set_by = f"admin:{_admin.get('sub', 'unknown')}"
+
+    with get_db_context() as session:
+        opp = get_opportunity_state(session=session, opportunity_id=opportunity_id)
+        if opp is None:
+            raise HTTPException(status_code=404, detail="Opportunity not found")
+
+        if opp["outcome"] not in ("open",):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot write facts to a terminal opportunity (outcome={opp['outcome']!r})",
+            )
+
+        try:
+            new_revision = set_facts(
+                session=session,
+                opportunity_id=opportunity_id,
+                updates=raw_updates,
+                source=body.source,
+                set_by=set_by,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        # Enqueue qualification recheck. Even if the revision didn't change
+        # (no effective update), the recheck idempotency_key prevents a
+        # duplicate item — the caller can safely POST again with the same
+        # facts to request a fresh evaluation.
+        work_item_id = enqueue_qualification_recheck(
+            session=session,
+            opportunity_id=opportunity_id,
+            facts_revision=new_revision,
+            person_id=opp.get("person_id"),
+        )
+        session.commit()
+
+    logger.info(
+        "admin.set_fa_max_facts: opportunity=%s new_revision=%d"
+        " work_item=%s source=%s set_by=%s",
+        opportunity_id, new_revision, work_item_id, body.source, set_by,
+    )
+    return {
+        "opportunity_id": opportunity_id,
+        "facts_revision": new_revision,
+        "qualification_work_item_id": work_item_id,
+    }
