@@ -193,7 +193,7 @@ def execute_query(db: Session, sql: str) -> Dict[str, Any]:
         result_rows = [dict(r) for r in rows]
         logger.info(
             "db_tool.execute_query: rows=%d duration_ms=%d sql=%r",
-            len(result_rows), duration_ms, limited[:120],
+            len(result_rows), duration_ms, limited[:1000],
         )
         return {"rows": result_rows, "count": len(result_rows)}
     except Exception as exc:
