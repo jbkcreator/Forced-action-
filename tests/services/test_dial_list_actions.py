@@ -82,9 +82,9 @@ def _value(**kwargs: Any) -> str:
 # ---------------------------------------------------------------------------
 
 class TestActionsBlock:
-    def test_has_four_elements(self):
+    def test_has_five_elements(self):
         block = _actions_block(_entry(), _AS_OF)
-        assert len(block["elements"]) == 4
+        assert len(block["elements"]) == 5
 
     def test_action_ids(self):
         block = _actions_block(_entry(), _AS_OF)

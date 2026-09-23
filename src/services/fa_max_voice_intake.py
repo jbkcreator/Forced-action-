@@ -33,10 +33,18 @@ VOICE_OUTCOMES = frozenset({
 # Sentences matching these terms are stripped from summary/next_action.
 # Word boundaries prevent partial matches (e.g. "pirate" does not match "rate").
 _FINANCIAL_TERMS = re.compile(
-    r"\b(credit\s+score|fico|income|salary|bank\s+statement|tax\s+return|ssn"
+    r"\b(credit|score|fico|income|salary|bank\s+statement|tax\s+return|ssn"
     r"|social\s+security|w-?2|rate|apr)\b",
     re.IGNORECASE,
 )
+
+
+def is_voice_file(file_info: dict) -> bool:
+    """Slack voice clips carry subtype 'slack_audio' and may report video/mp4."""
+    return (
+        str(file_info.get("mimetype") or "").startswith("audio/")
+        or file_info.get("subtype") == "slack_audio"
+    )
 
 
 # ── Transcriber protocol ──────────────────────────────────────────────────────
@@ -131,7 +139,11 @@ def extract_disposition(transcript: str, db: Optional[Session] = None) -> Dispos
         tools=[tool],
         db=db,
     )
-    inp = result.get("tool_input") or {}
+    inp = result.get("tool_input")
+    if not inp:
+        # Forced tool_choice always yields tool_input; None means the call was
+        # blocked (vendor-cost pause) — never record that as an 'unclear' call.
+        raise RuntimeError("disposition extraction returned no tool_input")
     outcome = inp.get("outcome", "unclear")
     if outcome not in VOICE_OUTCOMES:
         outcome = "unclear"
@@ -191,19 +203,32 @@ def handle_voice_intake(
     def _note(msg: str) -> None:
         _post_note(slack_client, channel_id=channel_id, thread_ts=thread_ts, text=msg)
 
-    # 1. Download
-    mimetype = file_info.get("mimetype", "")
-    if not mimetype.startswith("audio/"):
-        _note("Voice clips only — please send an audio file.")
+    def _refuse(msg: str) -> None:
+        _note(msg)
         clear_slot(session, slack_user_id)
         session.commit()
+
+    # 1. Download (files.info for the authoritative url/size/mimetype)
+    try:
+        file_info = {**file_info, **slack_client.files_info(file=file_info["id"])["file"]}  # type: ignore[attr-defined]
+    except Exception as exc:
+        logger.warning("[VoiceIntake] files.info failed: %s", type(exc).__name__)
+        _refuse("Couldn't retrieve the audio file — try again.")
+        return
+
+    mimetype = str(file_info.get("mimetype") or "")
+    if not is_voice_file(file_info):
+        _refuse("Voice clips only — please send an audio file.")
+        return
+
+    max_mb = settings.fa_max_voice_max_bytes // 1_000_000
+    if int(file_info.get("size") or 0) > settings.fa_max_voice_max_bytes:
+        _refuse(f"Audio file is too large (max {max_mb} MB).")
         return
 
     url = file_info.get("url_private_download") or file_info.get("url_private", "")
     if not url:
-        _note("Couldn't retrieve the audio file.")
-        clear_slot(session, slack_user_id)
-        session.commit()
+        _refuse("Couldn't retrieve the audio file.")
         return
 
     try:
@@ -215,18 +240,12 @@ def handle_voice_intake(
         resp.raise_for_status()
         audio = resp.content
     except Exception as exc:
-        logger.warning("[VoiceIntake] download failed: %s", exc)
-        _note("Couldn't download the audio — try again.")
-        clear_slot(session, slack_user_id)
-        session.commit()
+        logger.warning("[VoiceIntake] download failed: %s", type(exc).__name__)
+        _refuse("Couldn't download the audio — try again.")
         return
 
     if len(audio) > settings.fa_max_voice_max_bytes:
-        _note(
-            f"Audio file is too large (max {settings.fa_max_voice_max_bytes // 1_000_000} MB)."
-        )
-        clear_slot(session, slack_user_id)
-        session.commit()
+        _refuse(f"Audio file is too large (max {max_mb} MB).")
         return
 
     logger.info("[VoiceIntake] downloaded %d bytes, mimetype=%s", len(audio), mimetype)
@@ -234,19 +253,16 @@ def handle_voice_intake(
     # 2. Transcribe
     transcriber = get_transcriber()
     if transcriber is None:
-        _note("Voice intake not configured.")
-        clear_slot(session, slack_user_id)
-        session.commit()
+        _refuse("Voice intake not configured.")
         return
 
     filename = file_info.get("name") or "audio.m4a"
     try:
         transcript = transcriber.transcribe(audio, filename, mimetype)
     except Exception as exc:
-        logger.warning("[VoiceIntake] transcription failed: %s", exc)
+        logger.warning("[VoiceIntake] transcription failed: %s", type(exc).__name__)
+        # Slot kept (SPEC §4.3) so Josh can resend within the TTL.
         _note("Couldn't transcribe — try again.")
-        # Spec §4.3: slot is NOT cleared on transcription error.
-        session.commit()
         return
 
     logger.info("[VoiceIntake] transcript length=%d", len(transcript))
@@ -255,10 +271,8 @@ def handle_voice_intake(
     try:
         disposition = extract_disposition(transcript, db=session)
     except Exception as exc:
-        logger.warning("[VoiceIntake] extract_disposition failed: %s", exc)
-        _note("Couldn't process the call — try again.")
-        clear_slot(session, slack_user_id)
-        session.commit()
+        logger.warning("[VoiceIntake] extract_disposition failed: %s", type(exc).__name__)
+        _refuse("Couldn't process the call — try again.")
         return
 
     # 4. Guard — strip any sentences with financial data terms
@@ -268,9 +282,7 @@ def handle_voice_intake(
     # 5. Persist
     person_id = _resolve_person_id(session, opportunity_id)
     if person_id is None:
-        _note("No person linked to this opportunity — can't record the call.")
-        clear_slot(session, slack_user_id)
-        session.commit()
+        _refuse("No person linked to this opportunity — can't record the call.")
         return
 
     try:
@@ -306,7 +318,7 @@ def handle_voice_intake(
         clear_slot(session, slack_user_id)
         session.commit()
     except Exception as exc:
-        logger.error("[VoiceIntake] persist failed: %s", exc, exc_info=True)
+        logger.error("[VoiceIntake] persist failed: %s", type(exc).__name__)
         session.rollback()
         _note("Couldn't save the call record — try again.")
         return

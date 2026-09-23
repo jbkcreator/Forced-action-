@@ -523,7 +523,7 @@ def _handle_voice_file_share(client: Any, payload: dict) -> None:
     and writes nothing.
     """
     from src.services.fa_max_pending_slot import get_slot
-    from src.services.fa_max_voice_intake import handle_voice_intake
+    from src.services.fa_max_voice_intake import handle_voice_intake, is_voice_file
     from src.core.database import get_db_context
 
     settings = get_settings()
@@ -532,16 +532,15 @@ def _handle_voice_file_share(client: Any, payload: dict) -> None:
     channel_id = event.get("channel", "")
     thread_ts = event.get("thread_ts")
 
+    if not user_id or event.get("bot_id") or not _is_fa_max_voice_channel(channel_id):
+        return
     if not _relay_approver_authorized_for_voice(user_id):
         return
 
     files = event.get("files") or []
-    if not files:
+    if not files or not is_voice_file(files[0]):
         return
     file_info = files[0]
-    mimetype = file_info.get("mimetype", "")
-    if not (mimetype.startswith("audio/") or mimetype == "video/mp4"):
-        return
 
     bot_token_obj = settings.fa_max_slack_bot_token or settings.slack_bot_token
     if not bot_token_obj:
@@ -574,6 +573,15 @@ def _handle_voice_file_share(client: Any, payload: dict) -> None:
             channel_id=channel_id,
             thread_ts=thread_ts,
         )
+
+
+def _is_fa_max_voice_channel(channel_id: str) -> bool:
+    """FA Max lane channels plus the dial-list channel, where Log call lives."""
+    from src.api.admin_router import _fa_max_channel_lane_map
+
+    if not channel_id:
+        return False
+    return channel_id in _fa_max_channel_lane_map() or channel_id == get_settings().dial_list_slack_channel
 
 
 def _relay_approver_authorized_for_voice(user_id: str) -> bool:

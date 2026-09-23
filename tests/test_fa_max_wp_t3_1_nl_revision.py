@@ -209,6 +209,12 @@ class TestThreadRouting:
         m["apply_nl"].assert_not_called()
         m["decide"].assert_called_once()
 
+    def test_revision_runs_while_relay_kill_switch_halted(self):
+        red = {"color": "red", "feature": "relay_global"}
+        with patch("src.services.kill_switch_service.get_kill_switch_status", return_value=red):
+            m = self._run("shorter", slot=_slot())
+        m["apply_nl"].assert_called_once()
+
     def test_non_fa_max_card_ignores_slot(self):
         m = self._run("shorter", slot=_slot(), item=_item(venture_key="hillsborough_distress"))
         m["apply_nl"].assert_not_called()
