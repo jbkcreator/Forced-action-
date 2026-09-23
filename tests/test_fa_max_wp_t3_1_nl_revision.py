@@ -643,3 +643,25 @@ class TestSocketModalSubmission:
         assert handled is True  # dev's view_submission block acks and owns every modal envelope
         handler.assert_not_called()
         assert len(acks) == 1 and not acks[0].args[0].payload
+
+
+class TestDateWordsAreFacts:
+    SARAH = "Hi Sarah, congrats on the permit for 88 Elm Street. Open to a call on Thursday?"
+
+    def test_new_weekday_in_output_is_refused(self):
+        flag = nl_revision.embellishment_guard("Hi Sarah, open to a call on Friday?", self.SARAH)
+        assert flag and "friday" in flag
+
+    def test_existing_weekday_is_allowed(self):
+        assert nl_revision.embellishment_guard("Sarah, call Thursday?", self.SARAH) is None
+
+    def test_instruction_to_change_day_refused_before_llm(self):
+        llm = MagicMock()
+        r = nl_revision.revise_draft(instruction="move the call to Friday", original=self.SARAH,
+                                     current=self.SARAH, llm=llm)
+        assert r.reason == "embellishment" and "friday" in r.detail
+        llm.assert_not_called()
+
+    @pytest.mark.parametrize("revised", ["You may want to chat, Sarah.", "Sarah, marching ahead on 88 Elm Street?"])
+    def test_may_and_substrings_are_not_dates(self, revised):
+        assert nl_revision.embellishment_guard(revised, self.SARAH) is None

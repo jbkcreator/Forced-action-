@@ -32,8 +32,23 @@ RATE_TERM_WORDS: tuple[str, ...] = (
     "commitment", "commit", "rate", "apr", "points", "terms",
 )
 
+# Days and dates are facts too ("move the call to Friday" slipped past the
+# number guard in the eval run). "may" is left out: it is usually the verb.
+DATE_WORDS: tuple[str, ...] = (
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "january", "february", "march", "april", "june", "july", "august",
+    "september", "october", "november", "december", "tomorrow", "tonight",
+)
+
 _NUMBER_RE = re.compile(r"(\$)?(\d[\d,]*(?:\.\d+)?)(%)?")
-_TERM_RES = {w: re.compile(rf"(?<![\w-]){re.escape(w)}(?![\w-])", re.IGNORECASE) for w in RATE_TERM_WORDS}
+
+
+def _word_re(word: str) -> re.Pattern:
+    return re.compile(rf"(?<![\w-]){re.escape(word)}(?![\w-])", re.IGNORECASE)
+
+
+_TERM_RES = {w: _word_re(w) for w in RATE_TERM_WORDS}
+_DATE_RES = {w: _word_re(w) for w in DATE_WORDS}
 
 
 @dataclass(frozen=True)
@@ -71,6 +86,9 @@ def embellishment_guard(revised: str, original: str) -> Optional[str]:
     for word, pattern in _TERM_RES.items():
         if pattern.search(revised) and not pattern.search(original):
             return f"introduced rate/term language not in the draft: {word}"
+    for word, pattern in _DATE_RES.items():
+        if pattern.search(revised) and not pattern.search(original):
+            return f"introduced a day or date not in the draft: {word}"
     return None
 
 
