@@ -126,6 +126,62 @@ class TestPollBackflipMailbox:
         mock_apply.assert_not_called()
         mock_conn.store.assert_not_called()
 
+    def test_sender_filter_as_full_address_matches_only_that_sender(self):
+        # sender_domain containing "@" narrows matching to that one exact
+        # address -- needed when the poll mailbox and the sender share a
+        # domain (e.g. Gmail-to-Gmail in dev/test), where a bare-domain
+        # filter would also catch unrelated mail in the same inbox.
+        db = MagicMock()
+        raw = _raw_message(
+            "Application BF-10293 -- Now Under Review",
+            "Your application BF-10293 has moved to Under Review.",
+            "sender@gmail.com",
+        )
+        mock_conn = MagicMock()
+        mock_conn.search.return_value = ("OK", [b"1"])
+        mock_conn.fetch.return_value = ("OK", [(b"1 (BODY[])", raw)])
+        mock_conn.__enter__.return_value = mock_conn
+
+        with patch(
+            "config.settings.get_settings",
+            return_value=_settings(sender_domain="sender@gmail.com"),
+        ), \
+             patch("imaplib.IMAP4_SSL", return_value=mock_conn), \
+             patch(
+                 "src.agents.reply_concierge.backflip_stage_ingest.apply_parsed_event",
+                 return_value=True,
+             ) as mock_apply:
+            result = poll_backflip_mailbox(db)
+
+        assert result == 1
+        mock_apply.assert_called_once()
+
+    def test_sender_filter_as_full_address_rejects_other_sender_same_domain(self):
+        db = MagicMock()
+        raw = _raw_message(
+            "Application BF-10293 -- Now Under Review",
+            "moved to Under Review.",
+            "someone-else@gmail.com",
+        )
+        mock_conn = MagicMock()
+        mock_conn.search.return_value = ("OK", [b"1"])
+        mock_conn.fetch.return_value = ("OK", [(b"1 (BODY[])", raw)])
+        mock_conn.__enter__.return_value = mock_conn
+
+        with patch(
+            "config.settings.get_settings",
+            return_value=_settings(sender_domain="sender@gmail.com"),
+        ), \
+             patch("imaplib.IMAP4_SSL", return_value=mock_conn), \
+             patch(
+                 "src.agents.reply_concierge.backflip_stage_ingest.apply_parsed_event",
+             ) as mock_apply:
+            result = poll_backflip_mailbox(db)
+
+        assert result == 0
+        mock_apply.assert_not_called()
+        mock_conn.store.assert_not_called()
+
     def test_imap_login_failure_returns_zero_not_raises(self):
         db = MagicMock()
         with patch("config.settings.get_settings", return_value=_settings()), \

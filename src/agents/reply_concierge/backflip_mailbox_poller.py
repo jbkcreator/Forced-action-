@@ -21,11 +21,16 @@ problem (banks/emailport.py): a Gmail App Password + stdlib imaplib,
 self-serve, no GCP project needed.
 
 Safety design (same spirit as Banks' emailport.py/inbox.py):
-- IMAP SEARCH is scoped to Backflip's own sender domain BEFORE any
-  message is fetched -- nothing outside that domain is ever read, let
-  alone touched. A defensive re-check of the actual From header after
-  fetch guards against IMAP SEARCH FROM being a loose substring match
-  on some servers.
+- IMAP SEARCH is scoped to Backflip's own sender BEFORE any message is
+  fetched -- nothing outside that sender is ever read, let alone
+  touched. FA_MAX_BACKFLIP_NOTIFICATION_SENDER_DOMAIN accepts either a
+  bare domain ("backflip.com", matches any sender on it) or a full
+  address ("notify@backflip.com", matches only that one sender) -- the
+  latter matters when the poll mailbox and the sender share a domain
+  (e.g. Gmail-to-Gmail in dev/test), where a domain-level filter would
+  also catch unrelated mail in the same inbox. A defensive re-check of
+  the actual From header after fetch guards against IMAP SEARCH FROM
+  being a loose substring match on some servers.
 - A message is marked \\Seen only AFTER apply_parsed_event() succeeds,
   so a crash or DB failure mid-run leaves it unread and it is retried
   on the next poll -- at-least-once, never silently dropped.
@@ -52,6 +57,17 @@ from sqlalchemy.orm import Session
 logger = logging.getLogger(__name__)
 
 IMAP_HOST = "imap.gmail.com"
+
+
+def _matches_sender_filter(from_address: str, sender_filter: str) -> bool:
+    """sender_filter is FA_MAX_BACKFLIP_NOTIFICATION_SENDER_DOMAIN -- a
+    bare domain ("backflip.com") matches any sender on it; a full address
+    ("notify@backflip.com") matches only that one exact sender."""
+    from_address = from_address.lower()
+    sender_filter = sender_filter.lower()
+    if "@" in sender_filter:
+        return from_address == sender_filter
+    return from_address.endswith(f"@{sender_filter}")
 
 
 def _extract_body(msg: email.message.Message) -> str:
@@ -133,9 +149,9 @@ def _process_one(conn, uid, sender_domain, parse_fn, apply_fn, session) -> int:
 
     msg = email.message_from_bytes(msg_data[0][1])
     _, from_address = parseaddr(msg.get("From", ""))
-    if not from_address.lower().endswith(f"@{sender_domain.lower()}"):
+    if not _matches_sender_filter(from_address, sender_domain):
         # Defensive re-check -- IMAP SEARCH FROM is a loose match on some
-        # servers; never let a message outside the confirmed domain reach
+        # servers; never let a message outside the confirmed sender reach
         # the parser just because the server's search returned it.
         return 0
 

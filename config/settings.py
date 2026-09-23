@@ -312,10 +312,14 @@ class AppSettings(BaseSettings):
 	fa_max_backflip_mailbox_app_password: Optional[SecretStr] = Field(
 		default=None, env="FA_MAX_BACKFLIP_MAILBOX_APP_PASSWORD"
 	)
-	# Backflip's own notification-sender domain -- now consumed by
+	# Backflip's own notification sender -- now consumed by
 	# backflip_mailbox_poller.py, not reply_mailbox_poller.py (that branch
-	# was removed in Addendum 2; see its git history for why). No default
-	# -- the poller no-ops until this and the two fields above are all set.
+	# was removed in Addendum 2; see its git history for why). Accepts
+	# either a bare domain ("backflip.com", matches any sender on it) or a
+	# full address ("notify@backflip.com", matches only that one exact
+	# sender -- narrower, useful when the poll mailbox and the sender
+	# share a domain, e.g. Gmail-to-Gmail in dev/test). No default -- the
+	# poller no-ops until this and the two fields above are all set.
 	fa_max_backflip_notification_sender_domain: Optional[str] = Field(
 		default=None, env="FA_MAX_BACKFLIP_NOTIFICATION_SENDER_DOMAIN"
 	)
