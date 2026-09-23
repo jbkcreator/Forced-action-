@@ -211,7 +211,7 @@ def is_backflip_suppressed(session: Session, *, recipient: str, channel: str, pe
         )
         if reason:
             return (True, reason)
-    return (reason is not None, reason)
+    return (False, None)
 
 
 def record_backflip_suppression_decision(

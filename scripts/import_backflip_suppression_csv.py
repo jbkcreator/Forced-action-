@@ -8,39 +8,21 @@ writes permanent opt-out tables.
 from __future__ import annotations
 
 import argparse
-import csv
 import logging
 import sys
 from pathlib import Path
 
-from src.services.fa_max_backflip_feed import CsvBackflipFeedPort, replace_backflip_snapshot
-from src.services.phone_utils import normalize
+from src.services.fa_max_backflip_feed import (
+    CsvBackflipFeedPort,
+    parse_backflip_csv,
+    replace_backflip_snapshot,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-def _identifiers(csv_path: Path) -> set[tuple[str, str]]:
-    identifiers: set[tuple[str, str]] = set()
-    with csv_path.open(newline="", encoding="utf-8-sig") as fh:
-        reader = csv.DictReader(fh)
-        headers = {name.strip().lower() for name in (reader.fieldnames or [])}
-        if not headers.intersection({"email", "phone"}):
-            raise ValueError("CSV needs an email or phone column")
-        for line_no, raw in enumerate(reader, start=2):
-            row = {(key or "").strip().lower(): (value or "").strip()
-                   for key, value in raw.items()}
-            if row.get("email"):
-                identifiers.add(("email", row["email"].lower()))
-            if row.get("phone"):
-                phone = normalize(row["phone"])
-                if not phone:
-                    raise ValueError(f"invalid phone on CSV line {line_no}")
-                identifiers.add(("phone", phone))
-    return identifiers
-
-
 def run(csv_path: Path, *, dry_run: bool = False, allow_empty: bool = False) -> int:
-    identifiers = _identifiers(csv_path)
+    identifiers = parse_backflip_csv(csv_path)
     if not identifiers and not allow_empty:
         raise ValueError("empty campaign snapshot; pass --allow-empty after verifying the export")
     if dry_run:

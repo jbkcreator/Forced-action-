@@ -20,6 +20,7 @@ import ast
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
+from uuid import uuid4
 
 import pytest
 
@@ -56,6 +57,26 @@ class TestIsBackflipSuppressed:
             assert is_backflip_suppressed(
                 session, recipient="+18135550100", channel="sms", person_id="person-1",
             ) == (True, "backflip_active_campaign")
+
+    def test_verified_identifiers_with_no_campaign_match_are_clear(self):
+        from src.services.fa_max_send_governance import is_backflip_suppressed
+
+        session = MagicMock()
+        session.execute.return_value.fetchall.return_value = [
+            ("email", "clear@example.com"), ("phone", "+18135550100"),
+        ]
+        with patch(
+            "src.services.fa_max_send_governance.backflip_campaign_reason",
+            return_value=None,
+        ) as campaign_check:
+            assert is_backflip_suppressed(
+                session,
+                recipient="clear@example.com",
+                channel="email",
+                person_id="person-1",
+            ) == (False, None)
+
+        assert campaign_check.call_count == 3
 
     def test_suppressed_when_campaign_reason_present(self):
         from src.services.fa_max_send_governance import is_backflip_suppressed
@@ -588,19 +609,32 @@ class TestFeedAdapters:
 
         assert isinstance(port, FakeBackflipFeedPort)
 
-    def test_csv_port_delegates_to_import_script(self):
+    def test_csv_port_imports_without_cli_module_dependency(self):
         from src.services.fa_max_backflip_feed import CsvBackflipFeedPort
 
-        dummy_csv = Path("contacts.csv")
+        csv_path = Path.cwd() / f".backflip-port-test-{uuid4().hex}.csv"
+        csv_path.write_text(
+            "email,phone\n Clear@Example.com ,(813) 555-0100\n",
+            encoding="utf-8",
+        )
+        session = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = session
+        context.__exit__.return_value = False
 
-        port = CsvBackflipFeedPort(dummy_csv)
+        try:
+            with patch("src.services.fa_max_backflip_feed.get_db_context", return_value=context):
+                result = CsvBackflipFeedPort(csv_path).import_snapshot()
+        finally:
+            csv_path.unlink(missing_ok=True)
 
-        # `run` is imported locally inside import_snapshot — patch at source module.
-        with patch("scripts.import_backflip_suppression_csv.run", return_value=1) as mock_run:
-            result = port.import_snapshot()
-
-        assert result == 1
-        mock_run.assert_called_once_with(dummy_csv, dry_run=False, allow_empty=False)
+        assert result == 2
+        values = {
+            call.args[1]["value"]
+            for call in session.execute.call_args_list
+            if len(call.args) > 1 and "value" in call.args[1]
+        }
+        assert values == {"clear@example.com", "+18135550100"}
 
     def test_get_backflip_feed_port_no_csv_returns_not_implemented(self):
         from src.services.fa_max_backflip_feed import NotImplementedBackflipFeedPort, get_backflip_feed_port

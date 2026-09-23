@@ -28,6 +28,7 @@ real version/timestamp; any such field added today would be invented data.
 """
 from __future__ import annotations
 
+import csv
 import logging
 from pathlib import Path
 from typing import Protocol
@@ -36,6 +37,31 @@ from sqlalchemy import text
 from src.core.database import get_db_context
 
 logger = logging.getLogger(__name__)
+
+
+def parse_backflip_csv(csv_path: Path) -> set[tuple[str, str]]:
+    """Parse and normalize the identifiers in one Backflip CSV snapshot."""
+    from src.services.phone_utils import normalize
+
+    identifiers: set[tuple[str, str]] = set()
+    with csv_path.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        headers = {name.strip().lower() for name in (reader.fieldnames or [])}
+        if not headers.intersection({"email", "phone"}):
+            raise ValueError("CSV needs an email or phone column")
+        for line_no, raw in enumerate(reader, start=2):
+            row = {
+                (key or "").strip().lower(): (value or "").strip()
+                for key, value in raw.items()
+            }
+            if row.get("email"):
+                identifiers.add(("email", row["email"].lower()))
+            if row.get("phone"):
+                phone = normalize(row["phone"])
+                if not phone:
+                    raise ValueError(f"invalid phone on CSV line {line_no}")
+                identifiers.add(("phone", phone))
+    return identifiers
 
 
 def replace_backflip_snapshot(
@@ -100,11 +126,10 @@ class FakeBackflipFeedPort:
 class CsvBackflipFeedPort:
     """Production v1: imports from an operator-supplied CSV export.
 
-    Wraps scripts/import_backflip_suppression_csv.py's run() function so
-    the adapter contract is satisfied without duplicating the import logic.
     The CSV path is supplied at construction time (from a settings key or a
     cron job argument); allow_empty controls the safety gate against an
-    accidentally empty export clearing the protection.
+    accidentally empty export clearing the protection. Parsing and storage
+    live in this module so the CLI remains a one-way wrapper around the port.
     """
 
     def __init__(self, csv_path: Path, *, allow_empty: bool = False) -> None:
@@ -112,8 +137,8 @@ class CsvBackflipFeedPort:
         self.allow_empty = allow_empty
 
     def import_snapshot(self) -> int:
-        from scripts.import_backflip_suppression_csv import run
-        count = run(self.csv_path, dry_run=False, allow_empty=self.allow_empty)
+        identifiers = parse_backflip_csv(self.csv_path)
+        count = replace_backflip_snapshot(identifiers, allow_empty=self.allow_empty)
         logger.info("[BackflipFeed] CsvBackflipFeedPort: imported %d identifiers from %s", count, self.csv_path)
         return count
 
