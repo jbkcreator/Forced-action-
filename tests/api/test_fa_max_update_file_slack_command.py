@@ -1,4 +1,4 @@
-"""tests/api/test_fa_max_file_update_slack_command.py"""
+"""tests/api/test_fa_max_update_file_slack_command.py"""
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
@@ -17,11 +17,11 @@ def _signed_headers():
     return {"x-slack-request-timestamp": "9999999999", "x-slack-signature": "v0=test"}
 
 
-class TestFaMaxFileUpdateCommand:
+class TestFaMaxUpdateFileCommand:
     def test_rejects_bad_signature(self):
         with patch("src.api.admin_router._verify_slack_signature", return_value=False):
             response = client.post(
-                "/api/admin/slack/fa-max-file-update",
+                "/api/admin/slack/fa-max-update-file",
                 data={"user_id": "U123", "text": "BF-1 under_review"},
                 headers=_signed_headers(),
             )
@@ -32,7 +32,7 @@ class TestFaMaxFileUpdateCommand:
             "src.api.admin_router._relay_approver_authorized", return_value=False
         ):
             response = client.post(
-                "/api/admin/slack/fa-max-file-update",
+                "/api/admin/slack/fa-max-update-file",
                 data={"user_id": "U999", "text": "BF-1 under_review"},
                 headers=_signed_headers(),
             )
@@ -51,7 +51,7 @@ class TestFaMaxFileUpdateCommand:
             "src.services.fa_max_file_state.update_backflip_stage"
         ) as mock_update:
             response = client.post(
-                "/api/admin/slack/fa-max-file-update",
+                "/api/admin/slack/fa-max-update-file",
                 data={"user_id": "U123", "text": "BF-1 under_review"},
                 headers=_signed_headers(),
             )
@@ -78,7 +78,7 @@ class TestFaMaxFileUpdateCommand:
             "src.agents.reply_concierge.stage_monitor.send_first_chase_touch"
         ) as mock_first_touch:
             response = client.post(
-                "/api/admin/slack/fa-max-file-update",
+                "/api/admin/slack/fa-max-update-file",
                 data={"user_id": "U123", "text": "BF-1 doc:Bank Statement"},
                 headers=_signed_headers(),
             )
@@ -103,7 +103,7 @@ class TestFaMaxFileUpdateCommand:
             "src.services.fa_max_file_state.record_document_received", return_value=1,
         ) as mock_received:
             response = client.post(
-                "/api/admin/slack/fa-max-file-update",
+                "/api/admin/slack/fa-max-update-file",
                 data={"user_id": "U123", "text": "BF-1 received:Bank Statement"},
                 headers=_signed_headers(),
             )
@@ -123,7 +123,7 @@ class TestFaMaxFileUpdateCommand:
             "src.services.fa_max_file_state.record_document_received", return_value=0,
         ):
             response = client.post(
-                "/api/admin/slack/fa-max-file-update",
+                "/api/admin/slack/fa-max-update-file",
                 data={"user_id": "U123", "text": "BF-1 received:Nope"},
                 headers=_signed_headers(),
             )
@@ -140,7 +140,7 @@ class TestFaMaxFileUpdateCommand:
             "src.services.fa_max_file_state.record_document_received"
         ) as mock_received:
             response = client.post(
-                "/api/admin/slack/fa-max-file-update",
+                "/api/admin/slack/fa-max-update-file",
                 data={"user_id": "U123", "text": "BF-1 received:   "},
                 headers=_signed_headers(),
             )
@@ -156,7 +156,7 @@ class TestFaMaxFileUpdateCommand:
             return_value={"opportunity_id": "opp-1", "person_id": "p-1"},
         ):
             response = client.post(
-                "/api/admin/slack/fa-max-file-update",
+                "/api/admin/slack/fa-max-update-file",
                 data={"user_id": "U123", "text": "BF-1 not_a_stage"},
                 headers=_signed_headers(),
             )
@@ -171,7 +171,7 @@ class TestFaMaxFileUpdateCommand:
             return_value=None,
         ):
             response = client.post(
-                "/api/admin/slack/fa-max-file-update",
+                "/api/admin/slack/fa-max-update-file",
                 data={"user_id": "U123", "text": "BF-999 under_review"},
                 headers=_signed_headers(),
             )

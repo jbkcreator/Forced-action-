@@ -36,13 +36,13 @@ class TestRejectIfWrongCommandChannel:
         assert "command center" in result["text"].lower()
 
 
-class TestFileUpdateCommandRespectsChannelRestriction:
+class TestUpdateFileCommandRespectsChannelRestriction:
     def test_rejected_outside_command_center_channel(self):
         with patch("src.api.admin_router._verify_slack_signature", return_value=True), \
              patch("src.api.admin_router.get_settings") as mock_settings:
             mock_settings.return_value.fa_max_slack_cc_channel = "C_COMMAND_CENTER"
             response = client.post(
-                "/api/admin/slack/fa-max-file-update",
+                "/api/admin/slack/fa-max-update-file",
                 data={"user_id": "U123", "text": "BF-1 under_review", "channel_id": "C_WRONG"},
                 headers=_signed_headers(),
             )
@@ -50,14 +50,14 @@ class TestFileUpdateCommandRespectsChannelRestriction:
         assert "command center" in response.json()["text"].lower()
 
 
-class TestLogSubmissionCommandRespectsChannelRestriction:
+class TestNewFileCommandRespectsChannelRestriction:
     def test_rejected_outside_command_center_channel(self):
         with patch("src.api.admin_router._verify_slack_signature", return_value=True), \
              patch("src.api.admin_router.get_settings") as mock_settings, \
-             patch("src.api.admin_router.open_log_submission_modal") as mock_open:
+             patch("src.api.admin_router.open_new_file_modal") as mock_open:
             mock_settings.return_value.fa_max_slack_cc_channel = "C_COMMAND_CENTER"
             response = client.post(
-                "/api/admin/slack/fa-max-log-submission",
+                "/api/admin/slack/fa-max-new-file",
                 data={"user_id": "U123", "trigger_id": "trig-1", "channel_id": "C_WRONG"},
                 headers=_signed_headers(),
             )

@@ -1,8 +1,8 @@
 """WP-7 Phase B — /tracked-link registered on the shared FA Max Socket Mode
 connection (src/services/relay/socket_listener.py), alongside the existing
 Relay approval listener from PR #276 (wp2-socket-mode-approvals) and the
-WP-T2-6 FA Max slash-command listener (/fa-max-log-submission,
-/fa-max-file-update).
+WP-T2-6 FA Max slash-command listener (/fa-max-new-file,
+/fa-max-update-file).
 
 Only tests the *wiring* — that run() registers all three listeners on one
 connection and never blocks the test on socket.connect(), and that a
@@ -10,8 +10,8 @@ slash_commands envelope dispatched through every registered listener (as
 run() wires them) is acked exactly once, by the listener that owns it. Each
 command's own parsing/logic is tested in its own PR
 (tests/test_tracked_link_slack_command.py for /tracked-link;
-tests/api/test_fa_max_file_update_slack_command.py and
-tests/api/test_log_submission_slack_wiring.py for the FA Max commands),
+tests/api/test_fa_max_update_file_slack_command.py and
+tests/api/test_new_file_slack_wiring.py for the FA Max commands),
 since that logic lives in src/services/tracked_links.py and
 src/api/admin_router.py, not here.
 """
@@ -115,7 +115,7 @@ def test_slash_command_envelope_is_acked_once_by_the_owning_listener(monkeypatch
 
 def test_fa_max_slash_command_envelope_is_acked_once_by_the_owning_listener(monkeypatch):
     """Same regression coverage as the /tracked-link test above, for the
-    WP-T2-6 /fa-max-file-update command -- must not be double-acked by
+    WP-T2-6 /fa-max-update-file command -- must not be double-acked by
     the Relay listener's unconditional ack, since all three listeners on
     this shared connection see every envelope."""
     settings = get_settings()
@@ -141,14 +141,14 @@ def test_fa_max_slash_command_envelope_is_acked_once_by_the_owning_listener(monk
         type="slash_commands",
         envelope_id="env-2",
         payload={
-            "command": "/fa-max-file-update", "text": "BF-1 under_review",
+            "command": "/fa-max-update-file", "text": "BF-1 under_review",
             "user_id": "U123", "channel_id": "C123", "response_url": "https://hooks.slack.test/x",
         },
     )
     client = mock.MagicMock()
 
     with mock.patch(
-        "src.api.admin_router._fa_max_file_update_command",
+        "src.api.admin_router._fa_max_update_file_command",
         return_value={"response_type": "ephemeral", "text": "BF-1 updated to stage: under_review."},
     ), mock.patch("src.utils.http_helpers.requests_post_with_retry") as mock_post:
         mock_post.return_value = mock.Mock(status_code=200, text="ok")

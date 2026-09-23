@@ -29,21 +29,21 @@ class TestHandleSocketRequestIgnoresUnownedEnvelopes:
 
 class TestNewBorrowerButtonClick:
     def test_calls_handler_and_acks_blank(self):
-        # Regression: "log_submission_new_borrower" was never dispatched
+        # Regression: "new_file_new_borrower" was never dispatched
         # in this Socket-Mode-only app -- clicking the button silently
         # did nothing (blank ack, no view.update, no log line), found
         # live during manual E2E testing.
         client = mock.MagicMock()
         payload = {
             "type": "block_actions",
-            "actions": [{"action_id": "log_submission_new_borrower"}],
+            "actions": [{"action_id": "new_file_new_borrower"}],
             "user": {"id": "U123"},
             "view": {"id": "V1", "hash": "h1", "private_metadata": '{"mode": "search"}'},
         }
         request = _request("interactive", "env-50", payload)
 
         with mock.patch(
-            "src.api.admin_router._handle_log_submission_new_borrower_click", return_value={},
+            "src.api.admin_router._handle_new_file_new_borrower_click", return_value={},
         ) as mock_handle:
             handled = socket_listener.handle_socket_request(client, request)
 
@@ -57,14 +57,14 @@ class TestNewBorrowerButtonClick:
         client = mock.MagicMock()
         payload = {
             "type": "block_actions",
-            "actions": [{"action_id": "log_submission_new_borrower"}],
+            "actions": [{"action_id": "new_file_new_borrower"}],
             "user": {"id": "U123"},
             "view": {"id": "V1", "hash": "h1", "private_metadata": "not json"},
         }
         request = _request("interactive", "env-51", payload)
 
         with mock.patch(
-            "src.api.admin_router._handle_log_submission_new_borrower_click",
+            "src.api.admin_router._handle_new_file_new_borrower_click",
             side_effect=RuntimeError("boom"),
         ):
             handled = socket_listener.handle_socket_request(client, request)
@@ -72,12 +72,12 @@ class TestNewBorrowerButtonClick:
         assert handled is True
 
 
-class TestLogSubmissionAckFastDeferWork:
-    """fa_max_log_submission_submit's DB work (profiled live: ~10s
+class TestNewFileAckFastDeferWork:
+    """fa_max_new_file_submit's DB work (profiled live: ~10s
     against this dev DB's network latency) blows past Slack's ~3s
     Socket Mode ack window -- found live during manual E2E testing
     (Slack reported dispatch_failed even though the DB write eventually
-    succeeded). It now runs _log_submission_pre_validate (DB-free)
+    succeeded). It now runs _new_file_pre_validate (DB-free)
     BEFORE acking, and defers the real DB work to after the ack.
     """
 
@@ -85,15 +85,15 @@ class TestLogSubmissionAckFastDeferWork:
         client = mock.MagicMock()
         payload = {
             "type": "view_submission",
-            "view": {"callback_id": "fa_max_log_submission_submit"},
+            "view": {"callback_id": "fa_max_new_file_submit"},
         }
         request = _request("interactive", "env-2", payload)
         error = {"response_action": "errors", "errors": {"new_full_name_block": "Borrower name is required."}}
 
         with mock.patch(
-            "src.api.admin_router._log_submission_pre_validate", return_value=error,
+            "src.api.admin_router._new_file_pre_validate", return_value=error,
         ) as mock_prevalidate, mock.patch(
-            "src.api.admin_router._handle_log_submission_view_submit",
+            "src.api.admin_router._handle_new_file_view_submit",
         ) as mock_handle:
             handled = socket_listener.handle_socket_request(client, request)
 
@@ -109,14 +109,14 @@ class TestLogSubmissionAckFastDeferWork:
         client = mock.MagicMock()
         payload = {
             "type": "view_submission",
-            "view": {"callback_id": "fa_max_log_submission_submit"},
+            "view": {"callback_id": "fa_max_new_file_submit"},
         }
         request = _request("interactive", "env-2b", payload)
 
         with mock.patch(
-            "src.api.admin_router._log_submission_pre_validate", return_value=None,
+            "src.api.admin_router._new_file_pre_validate", return_value=None,
         ), mock.patch(
-            "src.api.admin_router._handle_log_submission_view_submit", return_value={},
+            "src.api.admin_router._handle_new_file_view_submit", return_value={},
         ) as mock_handle, mock.patch("src.core.database.get_db_context") as mock_ctx:
             mock_ctx.return_value.__enter__.return_value = mock.MagicMock()
             handled = socket_listener.handle_socket_request(client, request)
@@ -134,14 +134,14 @@ class TestLogSubmissionAckFastDeferWork:
         client = mock.MagicMock()
         payload = {
             "type": "view_submission",
-            "view": {"callback_id": "fa_max_log_submission_submit"},
+            "view": {"callback_id": "fa_max_new_file_submit"},
         }
         request = _request("interactive", "env-2c", payload)
 
         with mock.patch(
-            "src.api.admin_router._log_submission_pre_validate", return_value=None,
+            "src.api.admin_router._new_file_pre_validate", return_value=None,
         ), mock.patch(
-            "src.api.admin_router._handle_log_submission_view_submit",
+            "src.api.admin_router._handle_new_file_view_submit",
             side_effect=RuntimeError("db exploded"),
         ), mock.patch("src.core.database.get_db_context") as mock_ctx:
             mock_ctx.return_value.__enter__.return_value = mock.MagicMock()
@@ -264,14 +264,14 @@ class TestFaMaxSlashCommandRequest:
 
     def test_ignores_non_slash_command_envelopes(self):
         client = mock.MagicMock()
-        request = _request("interactive", "env-8", {"command": "/fa-max-file-update"})
+        request = _request("interactive", "env-8", {"command": "/fa-max-update-file"})
         assert socket_listener.handle_fa_max_slash_command_request(client, request) is False
         client.send_socket_mode_response.assert_not_called()
 
     def test_backflip_files_acks_blank_then_replies_via_response_url(self):
         client = mock.MagicMock()
         payload = {
-            "command": "/fa-max-backflip-files",
+            "command": "/fa-max-open-files",
             "user_id": "U123", "channel_id": "C123",
             "response_url": "https://hooks.slack.test/z",
         }
@@ -279,7 +279,7 @@ class TestFaMaxSlashCommandRequest:
         reply = {"response_type": "ephemeral", "text": "Jane Doe — bl1234 — under_review"}
 
         with mock.patch(
-            "src.api.admin_router._fa_max_backflip_files_command", return_value=reply,
+            "src.api.admin_router._fa_max_open_files_command", return_value=reply,
         ) as mock_handle, mock.patch(
             "src.core.database.get_db_context",
         ) as mock_ctx, mock.patch(
@@ -299,7 +299,7 @@ class TestFaMaxSlashCommandRequest:
     def test_file_update_acks_blank_then_replies_via_response_url(self):
         client = mock.MagicMock()
         payload = {
-            "command": "/fa-max-file-update", "text": "BF-1 under_review",
+            "command": "/fa-max-update-file", "text": "BF-1 under_review",
             "user_id": "U123", "channel_id": "C123",
             "response_url": "https://hooks.slack.test/x",
         }
@@ -307,7 +307,7 @@ class TestFaMaxSlashCommandRequest:
         reply = {"response_type": "ephemeral", "text": "BF-1 updated to stage: under_review."}
 
         with mock.patch(
-            "src.api.admin_router._fa_max_file_update_command", return_value=reply,
+            "src.api.admin_router._fa_max_update_file_command", return_value=reply,
         ) as mock_handle, mock.patch(
             "src.utils.http_helpers.requests_post_with_retry",
         ) as mock_post:
@@ -322,8 +322,8 @@ class TestFaMaxSlashCommandRequest:
         assert sent.payload is None
         mock_post.assert_called_once_with("https://hooks.slack.test/x", json=reply, timeout=5)
 
-    def test_log_submission_success_has_nothing_to_say_and_does_not_post(self):
-        # Regression: _fa_max_log_submission_command's success case
+    def test_new_file_success_has_nothing_to_say_and_does_not_post(self):
+        # Regression: _fa_max_new_file_command's success case
         # returns {"response_type": "ephemeral"} with no "text" -- the
         # modal already opened via views.open, there's nothing left to
         # say. That's harmless as a direct HTTP ack, but POSTing it to
@@ -332,7 +332,7 @@ class TestFaMaxSlashCommandRequest:
         # test app during manual E2E testing).
         client = mock.MagicMock()
         payload = {
-            "command": "/fa-max-log-submission", "trigger_id": "trig-1",
+            "command": "/fa-max-new-file", "trigger_id": "trig-1",
             "user_id": "U123", "channel_id": "C123",
             "response_url": "https://hooks.slack.test/y",
         }
@@ -340,7 +340,7 @@ class TestFaMaxSlashCommandRequest:
         reply = {"response_type": "ephemeral"}
 
         with mock.patch(
-            "src.api.admin_router._fa_max_log_submission_command", return_value=reply,
+            "src.api.admin_router._fa_max_new_file_command", return_value=reply,
         ) as mock_handle, mock.patch(
             "src.utils.http_helpers.requests_post_with_retry",
         ) as mock_post:
@@ -350,10 +350,10 @@ class TestFaMaxSlashCommandRequest:
         mock_handle.assert_called_once_with(payload)
         mock_post.assert_not_called()
 
-    def test_log_submission_failure_reply_has_text_and_does_post(self):
+    def test_new_file_failure_reply_has_text_and_does_post(self):
         client = mock.MagicMock()
         payload = {
-            "command": "/fa-max-log-submission", "trigger_id": "trig-1",
+            "command": "/fa-max-new-file", "trigger_id": "trig-1",
             "user_id": "U123", "channel_id": "C123",
             "response_url": "https://hooks.slack.test/y",
         }
@@ -361,7 +361,7 @@ class TestFaMaxSlashCommandRequest:
         reply = {"response_type": "ephemeral", "text": "Couldn't open the form — try again in a moment."}
 
         with mock.patch(
-            "src.api.admin_router._fa_max_log_submission_command", return_value=reply,
+            "src.api.admin_router._fa_max_new_file_command", return_value=reply,
         ), mock.patch(
             "src.utils.http_helpers.requests_post_with_retry",
         ) as mock_post:
@@ -373,11 +373,11 @@ class TestFaMaxSlashCommandRequest:
 
     def test_missing_response_url_drops_reply_without_raising(self):
         client = mock.MagicMock()
-        payload = {"command": "/fa-max-file-update", "text": "BF-1 under_review"}
+        payload = {"command": "/fa-max-update-file", "text": "BF-1 under_review"}
         request = _request("slash_commands", "env-11", payload)
 
         with mock.patch(
-            "src.api.admin_router._fa_max_file_update_command",
+            "src.api.admin_router._fa_max_update_file_command",
             return_value={"response_type": "ephemeral", "text": "done"},
         ):
             handled = socket_listener.handle_fa_max_slash_command_request(client, request)

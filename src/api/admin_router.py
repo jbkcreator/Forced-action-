@@ -57,7 +57,7 @@ from src.core.models import (
 )
 from src.loaders.tax import TaxDelinquencyLoader
 from src.loaders.voter_registry import VoterRegistryLoader
-from src.services.relay.slack_post import open_log_submission_modal
+from src.services.relay.slack_post import open_new_file_modal
 from src.services.zip_territory import claim_zip_territory
 from src.utils.county_config import invalidate_cache
 from src.utils.test_account import is_test_subscriber
@@ -1660,7 +1660,7 @@ def _reject_if_wrong_command_channel(channel_id: str) -> Optional[dict]:
 
 
 def _handle_borrower_search_suggestion(payload: dict, db: Session) -> dict:
-    """block_suggestion handler for the log-submission modal's borrower
+    """block_suggestion handler for the new-file modal's borrower
     external_select (Task 18). Slack's options[].text.text field has a 75
     character limit, hence the truncation.
     """
@@ -1715,8 +1715,8 @@ async def slack_interact(request: Request, background_tasks: BackgroundTasks, db
         callback_id = payload.get("view", {}).get("callback_id")
         if callback_id == "fa_max_revise_submit":
             return _handle_relay_revise_submission(payload)
-        if callback_id == "fa_max_log_submission_submit":
-            return _handle_log_submission_view_submit(payload, db)
+        if callback_id == "fa_max_new_file_submit":
+            return _handle_new_file_view_submit(payload, db)
 
     # block_suggestion (external_select live search) also arrives at this
     # same Interactivity Request URL, with neither an "actions" list nor a
@@ -1741,8 +1741,8 @@ async def slack_interact(request: Request, background_tasks: BackgroundTasks, db
         return _handle_relay_snooze(payload)
     if action_id == "fa_max_revise":
         return _handle_relay_revise_open(payload)
-    if action_id == "log_submission_new_borrower":
-        return _handle_log_submission_new_borrower_click(payload)
+    if action_id == "new_file_new_borrower":
+        return _handle_new_file_new_borrower_click(payload)
     if action_id in ("approve_win_story", "dismiss_win_story"):
         return _handle_win_story_interact(payload, db)
     # Builder entity-link actions (EXCEPTIONS lane — WP-T2-8)
@@ -2436,14 +2436,14 @@ def _handle_relay_revise_submission(payload: dict) -> dict:
     return {"response_action": "clear"}
 
 
-def _handle_log_submission_new_borrower_click(payload: dict) -> dict:
-    """"Not on this list — new borrower" button inside the log-submission
+def _handle_new_file_new_borrower_click(payload: dict) -> dict:
+    """"Not on this list — new borrower" button inside the new-file
     modal — swaps the view in place via views.update, preserving whatever
     Josh already entered (e.g. a partial search) in private_metadata."""
-    from src.services.relay.slack_post import open_log_submission_new_entry_view
+    from src.services.relay.slack_post import open_new_file_new_entry_view
 
     view = payload.get("view", {})
-    open_log_submission_new_entry_view(
+    open_new_file_new_entry_view(
         view.get("id", ""),
         view.get("hash", ""),
         json.loads(view.get("private_metadata") or "{}"),
@@ -2451,7 +2451,7 @@ def _handle_log_submission_new_borrower_click(payload: dict) -> dict:
     return {}
 
 
-def _log_submission_field(values: dict, block_id: str, action_id: str) -> str:
+def _new_file_field(values: dict, block_id: str, action_id: str) -> str:
     block = values.get(block_id, {}).get(action_id, {})
     # `selected_option` arrives as an explicit JSON null (not a missing
     # key) for an optional select with nothing chosen, so the default
@@ -2459,12 +2459,12 @@ def _log_submission_field(values: dict, block_id: str, action_id: str) -> str:
     return (block.get("value") or (block.get("selected_option") or {}).get("value") or "").strip()
 
 
-def _log_submission_pre_validate(payload: dict) -> Optional[dict]:
-    """Fast, DB-free validation for the log-submission modal submit --
-    both of _handle_log_submission_view_submit's only two error-returning
+def _new_file_pre_validate(payload: dict) -> Optional[dict]:
+    """Fast, DB-free validation for the new-file modal submit --
+    both of _handle_new_file_view_submit's only two error-returning
     checks, factored out so the Socket Mode listener
     (src/services/relay/socket_listener.py) can run them BEFORE acking.
-    The DB work in _handle_log_submission_view_submit below can take
+    The DB work in _handle_new_file_view_submit below can take
     several seconds against this dev DB's network latency -- past
     Slack's ~3s Socket Mode ack window -- so that listener acks
     immediately once these two (in-memory only) checks pass, then does
@@ -2477,13 +2477,13 @@ def _log_submission_pre_validate(payload: dict) -> Optional[dict]:
     values = view["state"]["values"]
 
     if metadata.get("mode") == "new_borrower":
-        if not _log_submission_field(values, "new_full_name_block", "new_full_name"):
+        if not _new_file_field(values, "new_full_name_block", "new_full_name"):
             return {
                 "response_action": "errors",
                 "errors": {"new_full_name_block": "Borrower name is required."},
             }
     else:
-        if not _log_submission_field(values, "borrower_search_block", "borrower_search"):
+        if not _new_file_field(values, "borrower_search_block", "borrower_search"):
             return {
                 "response_action": "errors",
                 "errors": {"borrower_search_block": "Select a borrower or choose \"new borrower\"."},
@@ -2491,8 +2491,8 @@ def _log_submission_pre_validate(payload: dict) -> Optional[dict]:
     return None
 
 
-def _handle_log_submission_view_submit(payload: dict, db: Session) -> dict:
-    """Slack `/fa-max-log-submission` modal submission (WP-T2-6 addendum,
+def _handle_new_file_view_submit(payload: dict, db: Session) -> dict:
+    """Slack `/fa-max-new-file` modal submission (WP-T2-6 addendum,
     Task 19). This is the moment Josh tells the system he already submitted
     a deal to Backflip -- it creates/links the borrower, creates a new
     opportunity, jumps it straight to 'submitted' via the admin-override
@@ -2508,7 +2508,7 @@ def _handle_log_submission_view_submit(payload: dict, db: Session) -> dict:
     from src.services import fa_max_file_state, state_engine
     from src.services.phone_utils import normalize as normalize_phone
 
-    pre_validation_error = _log_submission_pre_validate(payload)
+    pre_validation_error = _new_file_pre_validate(payload)
     if pre_validation_error is not None:
         return pre_validation_error
 
@@ -2517,7 +2517,7 @@ def _handle_log_submission_view_submit(payload: dict, db: Session) -> dict:
     values = view["state"]["values"]
 
     def _field(block_id: str, action_id: str) -> str:
-        return _log_submission_field(values, block_id, action_id)
+        return _new_file_field(values, block_id, action_id)
 
     if metadata.get("mode") == "new_borrower":
         full_name = _field("new_full_name_block", "new_full_name")
@@ -2559,7 +2559,7 @@ def _handle_log_submission_view_submit(payload: dict, db: Session) -> dict:
         session=db, entity_type="opportunity", entity_uuid=entity_uuid,
         from_state="new", to_state="submitted",
         actor="user:josh", source_component="src.api.admin_router",
-        idempotency_key=f"log_submission:{opportunity_id}:submitted",
+        idempotency_key=f"new_file:{opportunity_id}:submitted",
         validate_allowed_next=False,
         context={"reason": "manual log of an already-completed Backflip submission via Slack modal",
                  "recorded_by_slack_user": user_id},
@@ -2590,7 +2590,7 @@ def _handle_log_submission_view_submit(payload: dict, db: Session) -> dict:
             loan_amount_cents = round(float(loan_amount_raw.replace(",", "").replace("$", "")) * 100)
         except ValueError:
             logger.warning(
-                "log-submission: unparseable loan_amount %r for opportunity_id=%s -- dropped",
+                "new-file: unparseable loan_amount %r for opportunity_id=%s -- dropped",
                 loan_amount_raw, opportunity_id,
             )
     if backflip_ref or property_address or loan_amount_cents is not None:
@@ -2609,9 +2609,9 @@ def _handle_log_submission_view_submit(payload: dict, db: Session) -> dict:
         )
         db.commit()
 
-    from src.services.relay.slack_post import post_log_submission_confirmation
+    from src.services.relay.slack_post import post_new_file_confirmation
 
-    post_log_submission_confirmation(metadata.get("channel_id", ""), full_name, backflip_ref)
+    post_new_file_confirmation(metadata.get("channel_id", ""), full_name, backflip_ref)
     return {}
 
 
@@ -3212,12 +3212,12 @@ async def slack_resume_command(request: Request):
     return _slack_ephemeral(f"✅ RESUME {target} — kill switch override cleared.")
 
 
-def _fa_max_file_update_command(form: dict, db: Session) -> dict:
+def _fa_max_update_file_command(form: dict, db: Session) -> dict:
     """
     Pure logic for the Slack slash command (WP-T2-6):
-        /fa-max-file-update <backflip_ref> <stage>
-        /fa-max-file-update <backflip_ref> doc:<document name>
-        /fa-max-file-update <backflip_ref> received:<document name>
+        /fa-max-update-file <backflip_ref> <stage>
+        /fa-max-update-file <backflip_ref> doc:<document name>
+        /fa-max-update-file <backflip_ref> received:<document name>
 
     Stage tokens match config.fa_max_stage_monitoring.BACKFLIP_STAGE_KEYS
     exactly (snake_case: under_review, conditional_approval, docs_requested,
@@ -3251,9 +3251,9 @@ def _fa_max_file_update_command(form: dict, db: Session) -> dict:
     if len(tokens) != 2:
         return _slack_ephemeral(
             "Usage:\n```"
-            "/fa-max-file-update <backflip_ref> <stage>\n"
-            "/fa-max-file-update <backflip_ref> doc:<document name>\n"
-            "/fa-max-file-update <backflip_ref> received:<document name>"
+            "/fa-max-update-file <backflip_ref> <stage>\n"
+            "/fa-max-update-file <backflip_ref> doc:<document name>\n"
+            "/fa-max-update-file <backflip_ref> received:<document name>"
             "```"
         )
     backflip_ref, action = tokens[0], tokens[1].strip()
@@ -3266,7 +3266,7 @@ def _fa_max_file_update_command(form: dict, db: Session) -> dict:
         document_name = action[len("received:"):].strip()
         if not document_name:
             return _slack_ephemeral(
-                f"Usage:\n```/fa-max-file-update {backflip_ref} received:<document name>```"
+                f"Usage:\n```/fa-max-update-file {backflip_ref} received:<document name>```"
             )
         closed = fa_max_file_state.record_document_received(
             db, opportunity_id=resolved["opportunity_id"], document_name=document_name,
@@ -3283,7 +3283,7 @@ def _fa_max_file_update_command(form: dict, db: Session) -> dict:
         document_name = action[len("doc:"):].strip()
         if not document_name:
             return _slack_ephemeral(
-                f"Usage:\n```/fa-max-file-update {backflip_ref} doc:<document name>```"
+                f"Usage:\n```/fa-max-update-file {backflip_ref} doc:<document name>```"
             )
         fa_max_file_state.ensure_file_state(
             db, opportunity_id=resolved["opportunity_id"], person_id=resolved["person_id"],
@@ -3306,7 +3306,7 @@ def _fa_max_file_update_command(form: dict, db: Session) -> dict:
     stage = action.lower()
     if stage not in BACKFLIP_STAGE_KEYS:
         stage_lines = "\n".join(
-            f"/fa-max-file-update {backflip_ref} {s}" for s in sorted(BACKFLIP_STAGE_KEYS)
+            f"/fa-max-update-file {backflip_ref} {s}" for s in sorted(BACKFLIP_STAGE_KEYS)
         )
         return _slack_ephemeral(f"Usage — one of:\n```{stage_lines}```")
     fa_max_file_state.ensure_file_state(
@@ -3319,16 +3319,16 @@ def _fa_max_file_update_command(form: dict, db: Session) -> dict:
     return _slack_ephemeral(f"✅ `{backflip_ref}` updated to stage: *{stage}*.")
 
 
-def _fa_max_log_submission_command(form: dict) -> dict:
+def _fa_max_new_file_command(form: dict) -> dict:
     """
-    Pure logic for the Slack slash command '/fa-max-log-submission' (no
+    Pure logic for the Slack slash command '/fa-max-new-file' (no
     arguments — opens a modal). Addendum to WP-T2-6: records the moment
     Josh submits a deal to Backflip, which nothing else in this codebase
     does today (backflip_ref was previously only ever created downstream,
     when terms arrive).
 
-    Same authorization gate as /fa-max-file-update — relay_approvers. See
-    _fa_max_file_update_command's docstring for why this takes an
+    Same authorization gate as /fa-max-update-file — relay_approvers. See
+    _fa_max_update_file_command's docstring for why this takes an
     already-scalar form dict and is shared with the Socket Mode listener.
     """
     channel_rejection = _reject_if_wrong_command_channel(form.get("channel_id", ""))
@@ -3339,20 +3339,20 @@ def _fa_max_log_submission_command(form: dict) -> dict:
         return _slack_ephemeral("Not authorized to log a Backflip submission.")
 
     trigger_id = form.get("trigger_id", "")
-    if not open_log_submission_modal(trigger_id, form.get("channel_id", "")):
+    if not open_new_file_modal(trigger_id, form.get("channel_id", "")):
         return _slack_ephemeral("Couldn't open the form — try again in a moment.")
     return {"response_type": "ephemeral"}
 
 
-def _fa_max_backflip_files_command(form: dict, db: Session) -> dict:
+def _fa_max_open_files_command(form: dict, db: Session) -> dict:
     """
-    Pure logic for the Slack slash command '/fa-max-backflip-files' (no
+    Pure logic for the Slack slash command '/fa-max-open-files' (no
     arguments — lists open files with a Backflip reference on record).
 
-    Exists because /fa-max-file-update requires Josh to already know the
+    Exists because /fa-max-update-file requires Josh to already know the
     exact backflip_ref string, which he won't always remember -- this
     lets him look it up instead of guessing. Deliberately a plain list
-    rather than a name-based fallback lookup on /fa-max-file-update
+    rather than a name-based fallback lookup on /fa-max-update-file
     itself: the same borrower name can have multiple opportunities in
     different stages, so resolving by name alone is ambiguous in exactly
     the case this command exists to help with. Listing every ref sidesteps
@@ -3393,9 +3393,9 @@ def _fa_max_backflip_files_command(form: dict, db: Session) -> dict:
         f"*Open Backflip Files* ({len(rows)})\n"
         f"```{table_body}```\n"
         f"Copy a ref above, then use:\n"
-        f"```/fa-max-file-update <ref> <stage>\n"
-        f"/fa-max-file-update <ref> doc:<document name>\n"
-        f"/fa-max-file-update <ref> received:<document name>```"
+        f"```/fa-max-update-file <ref> <stage>\n"
+        f"/fa-max-update-file <ref> doc:<document name>\n"
+        f"/fa-max-update-file <ref> received:<document name>```"
     )
     return _slack_ephemeral(message)
 
@@ -3408,39 +3408,39 @@ def _parse_slack_form(raw: bytes) -> dict:
     return {k: v[0] for k, v in parse_qs(raw.decode("utf-8")).items()}
 
 
-@router.post("/slack/fa-max-file-update")
-async def slack_fa_max_file_update_command(request: Request, db: Session = Depends(get_db)):
+@router.post("/slack/fa-max-update-file")
+async def slack_fa_max_update_file_command(request: Request, db: Session = Depends(get_db)):
     """
     Slack slash command (WP-T2-6):
-        /fa-max-file-update <backflip_ref> <stage>
-        /fa-max-file-update <backflip_ref> doc:<document name>
-        /fa-max-file-update <backflip_ref> received:<document name>
+        /fa-max-update-file <backflip_ref> <stage>
+        /fa-max-update-file <backflip_ref> doc:<document name>
+        /fa-max-update-file <backflip_ref> received:<document name>
     """
     raw = await request.body()
     if not _verify_slack_signature(dict(request.headers), raw):
         raise HTTPException(status_code=401, detail="Invalid Slack signature")
 
-    return _fa_max_file_update_command(_parse_slack_form(raw), db)
+    return _fa_max_update_file_command(_parse_slack_form(raw), db)
 
 
-@router.post("/slack/fa-max-log-submission")
-async def slack_log_submission_command(request: Request):
-    """Slack slash command: '/fa-max-log-submission' (no arguments — opens a modal)."""
+@router.post("/slack/fa-max-new-file")
+async def slack_new_file_command(request: Request):
+    """Slack slash command: '/fa-max-new-file' (no arguments — opens a modal)."""
     raw = await request.body()
     if not _verify_slack_signature(dict(request.headers), raw):
         raise HTTPException(status_code=401, detail="Invalid Slack signature")
 
-    return _fa_max_log_submission_command(_parse_slack_form(raw))
+    return _fa_max_new_file_command(_parse_slack_form(raw))
 
 
-@router.post("/slack/fa-max-backflip-files")
-async def slack_fa_max_backflip_files_command(request: Request, db: Session = Depends(get_db)):
-    """Slack slash command: '/fa-max-backflip-files' (no arguments — lists open files with a Backflip reference)."""
+@router.post("/slack/fa-max-open-files")
+async def slack_fa_max_open_files_command(request: Request, db: Session = Depends(get_db)):
+    """Slack slash command: '/fa-max-open-files' (no arguments — lists open files with a Backflip reference)."""
     raw = await request.body()
     if not _verify_slack_signature(dict(request.headers), raw):
         raise HTTPException(status_code=401, detail="Invalid Slack signature")
 
-    return _fa_max_backflip_files_command(_parse_slack_form(raw), db)
+    return _fa_max_open_files_command(_parse_slack_form(raw), db)
 
 
 # ===========================================================================

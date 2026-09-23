@@ -1,4 +1,4 @@
-"""tests/api/test_fa_max_backflip_files_slack_command.py"""
+"""tests/api/test_fa_max_open_files_slack_command.py"""
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
@@ -22,11 +22,11 @@ def _fake_row(full_name, backflip_ref, current_stage):
     return row
 
 
-class TestFaMaxBackflipFilesCommand:
+class TestFaMaxOpenFilesCommand:
     def test_rejects_bad_signature(self):
         with patch("src.api.admin_router._verify_slack_signature", return_value=False):
             response = client.post(
-                "/api/admin/slack/fa-max-backflip-files",
+                "/api/admin/slack/fa-max-open-files",
                 data={"user_id": "U123"},
                 headers=_signed_headers(),
             )
@@ -36,7 +36,7 @@ class TestFaMaxBackflipFilesCommand:
         with patch("src.api.admin_router._verify_slack_signature", return_value=True), \
              patch("src.api.admin_router._relay_approver_authorized", return_value=False):
             response = client.post(
-                "/api/admin/slack/fa-max-backflip-files",
+                "/api/admin/slack/fa-max-open-files",
                 data={"user_id": "U999"},
                 headers=_signed_headers(),
             )
@@ -60,7 +60,7 @@ class TestFaMaxBackflipFilesCommand:
             with patch("src.api.admin_router._verify_slack_signature", return_value=True), \
                  patch("src.api.admin_router._relay_approver_authorized", return_value=True):
                 response = client.post(
-                    "/api/admin/slack/fa-max-backflip-files",
+                    "/api/admin/slack/fa-max-open-files",
                     data={"user_id": "U123"},
                     headers=_signed_headers(),
                 )
@@ -73,9 +73,9 @@ class TestFaMaxBackflipFilesCommand:
         assert "Borrower" in text and "Ref" in text and "Stage" in text
         assert "Jane Doe" in text and "bl1234" in text and "under_review" in text
         assert "John Smith" in text and "BF-2001" in text and "submitted" in text
-        assert "/fa-max-file-update <ref> <stage>" in text
-        assert "/fa-max-file-update <ref> doc:<document name>" in text
-        assert "/fa-max-file-update <ref> received:<document name>" in text
+        assert "/fa-max-update-file <ref> <stage>" in text
+        assert "/fa-max-update-file <ref> doc:<document name>" in text
+        assert "/fa-max-update-file <ref> received:<document name>" in text
 
     def test_empty_result_returns_friendly_message(self):
         from src.api.admin_router import get_db
@@ -91,7 +91,7 @@ class TestFaMaxBackflipFilesCommand:
             with patch("src.api.admin_router._verify_slack_signature", return_value=True), \
                  patch("src.api.admin_router._relay_approver_authorized", return_value=True):
                 response = client.post(
-                    "/api/admin/slack/fa-max-backflip-files",
+                    "/api/admin/slack/fa-max-open-files",
                     data={"user_id": "U123"},
                     headers=_signed_headers(),
                 )
@@ -114,7 +114,7 @@ class TestFaMaxBackflipFilesCommand:
             with patch("src.api.admin_router._verify_slack_signature", return_value=True), \
                  patch("src.api.admin_router._relay_approver_authorized", return_value=True):
                 client.post(
-                    "/api/admin/slack/fa-max-backflip-files",
+                    "/api/admin/slack/fa-max-open-files",
                     data={"user_id": "U123"},
                     headers=_signed_headers(),
                 )

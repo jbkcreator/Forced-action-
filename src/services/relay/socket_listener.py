@@ -53,7 +53,7 @@ def handle_socket_request(client: Any, request: Any) -> bool:
 
     payload = request.payload or {}
 
-    # view_submission (WP-T2-6 log-submission modal, and the pre-existing
+    # view_submission (WP-T2-6 new-file modal, and the pre-existing
     # Revise modal) and block_suggestion (borrower-search autocomplete)
     # must carry their real response -- response_action / options -- IN
     # the envelope's own acknowledgement. Unlike a slash command, there is
@@ -65,13 +65,13 @@ def handle_socket_request(client: Any, request: Any) -> bool:
     if request.type == "interactive" and payload.get("type") == "view_submission":
         callback_id = payload.get("view", {}).get("callback_id")
 
-        if callback_id == "fa_max_log_submission_submit":
+        if callback_id == "fa_max_new_file_submit":
             # This handler's DB work (profiled live: ~10s against this
             # dev DB's network latency, well past Slack's ~3s Socket Mode
             # ack window) cannot ride the ack the way fa_max_revise_submit
             # below does -- found live during manual E2E testing (Slack
             # reported dispatch_failed even though the DB write eventually
-            # succeeded). _log_submission_pre_validate covers BOTH of the
+            # succeeded). _new_file_pre_validate covers BOTH of the
             # handler's error-returning checks and needs no DB access, so
             # it runs before the ack; once it passes, ack immediately
             # (closing the modal) and do the real DB work after -- same
@@ -80,15 +80,15 @@ def handle_socket_request(client: Any, request: Any) -> bool:
             # left post-ack, so a DB-layer failure here can only be
             # logged, not shown inline in the modal.
             from src.api.admin_router import (
-                _handle_log_submission_view_submit,
-                _log_submission_pre_validate,
+                _handle_new_file_view_submit,
+                _new_file_pre_validate,
             )
             from src.core.database import get_db_context
 
             try:
-                pre_validation_error = _log_submission_pre_validate(payload)
+                pre_validation_error = _new_file_pre_validate(payload)
             except Exception:
-                logger.exception("[RelaySocket] log-submission pre-validation raised")
+                logger.exception("[RelaySocket] new-file pre-validation raised")
                 pre_validation_error = None
 
             if pre_validation_error is not None:
@@ -100,9 +100,9 @@ def handle_socket_request(client: Any, request: Any) -> bool:
             client.send_socket_mode_response(SocketModeResponse(envelope_id=request.envelope_id))
             try:
                 with get_db_context() as db:
-                    _handle_log_submission_view_submit(payload, db)
+                    _handle_new_file_view_submit(payload, db)
             except Exception:
-                logger.exception("[RelaySocket] log-submission DB work raised after ack")
+                logger.exception("[RelaySocket] new-file DB work raised after ack")
             return True
 
         from src.api.admin_router import _handle_relay_revise_submission
@@ -174,20 +174,20 @@ def handle_socket_request(client: Any, request: Any) -> bool:
         _handle_add_builder_to_diallist,
         _handle_snooze_builder,
         _handle_dismiss_builder,
-        _handle_log_submission_new_borrower_click,
+        _handle_new_file_new_borrower_click,
     )
     from src.core.database import get_db_context
 
     user_id = payload.get("user", {}).get("id", "?")
 
     # WP-T2-6 addendum: "Not on this list -- new borrower" button inside
-    # the log-submission modal. No DB session and no ephemeral reply --
+    # the new-file modal. No DB session and no ephemeral reply --
     # the handler's only effect is a views.update call swapping the modal
     # in place, and it always returns {}.
-    if action_id == "log_submission_new_borrower":
-        logger.info("[RelaySocket] log-submission new-borrower click user=%s", user_id)
+    if action_id == "new_file_new_borrower":
+        logger.info("[RelaySocket] new-file new-borrower click user=%s", user_id)
         try:
-            _handle_log_submission_new_borrower_click(payload)
+            _handle_new_file_new_borrower_click(payload)
         except Exception:
             logger.exception("[RelaySocket] failed to open new-borrower view")
         return True
@@ -282,7 +282,7 @@ def _post_socket_ephemeral(client: Any, payload: dict, result: dict) -> None:
 
 
 _FA_MAX_SLASH_COMMANDS = frozenset({
-    "/fa-max-log-submission", "/fa-max-file-update", "/fa-max-backflip-files",
+    "/fa-max-new-file", "/fa-max-update-file", "/fa-max-open-files",
 })
 
 
@@ -309,8 +309,8 @@ def _post_slash_reply(response_url: Optional[str], reply: dict) -> None:
 
 
 def handle_fa_max_slash_command_request(client: Any, request: Any) -> bool:
-    """Socket Mode envelope handler for '/fa-max-log-submission',
-    '/fa-max-file-update', and '/fa-max-backflip-files' (WP-T2-6). This
+    """Socket Mode envelope handler for '/fa-max-new-file',
+    '/fa-max-update-file', and '/fa-max-open-files' (WP-T2-6). This
     Slack app has no Interactivity/slash-command Request URL option once
     Socket Mode is enabled, so these commands -- and view_submission/
     block_suggestion, handled in handle_socket_request above -- are
@@ -337,25 +337,25 @@ def handle_fa_max_slash_command_request(client: Any, request: Any) -> bool:
     client.send_socket_mode_response(SocketModeResponse(envelope_id=request.envelope_id))
 
     response_url = payload.get("response_url")
-    if command == "/fa-max-log-submission":
-        from src.api.admin_router import _fa_max_log_submission_command
+    if command == "/fa-max-new-file":
+        from src.api.admin_router import _fa_max_new_file_command
 
-        reply = _fa_max_log_submission_command(payload)
-    elif command == "/fa-max-file-update":
-        from src.api.admin_router import _fa_max_file_update_command
+        reply = _fa_max_new_file_command(payload)
+    elif command == "/fa-max-update-file":
+        from src.api.admin_router import _fa_max_update_file_command
         from src.core.database import get_db_context
 
         with get_db_context() as db:
-            reply = _fa_max_file_update_command(payload, db)
+            reply = _fa_max_update_file_command(payload, db)
     else:
-        from src.api.admin_router import _fa_max_backflip_files_command
+        from src.api.admin_router import _fa_max_open_files_command
         from src.core.database import get_db_context
 
         with get_db_context() as db:
-            reply = _fa_max_backflip_files_command(payload, db)
+            reply = _fa_max_open_files_command(payload, db)
 
     if reply.get("text"):
-        # A reply with no text (e.g. _fa_max_log_submission_command's
+        # A reply with no text (e.g. _fa_max_new_file_command's
         # success case -- the modal already opened via views.open, there
         # is nothing left to say) was harmless as a direct HTTP ack, but
         # POSTing it to response_url is a real Slack API call, and Slack

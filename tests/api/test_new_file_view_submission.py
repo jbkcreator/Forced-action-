@@ -1,4 +1,4 @@
-"""tests/api/test_log_submission_view_submission.py"""
+"""tests/api/test_new_file_view_submission.py"""
 from __future__ import annotations
 
 import json
@@ -28,10 +28,10 @@ def _view_submission_payload(callback_id: str, private_metadata: dict, values: d
     return "payload=" + json.dumps(payload)
 
 
-class TestLogSubmissionViewSubmission:
+class TestNewFileViewSubmission:
     def test_existing_borrower_creates_opportunity_and_sets_backflip_ref(self):
         raw = _view_submission_payload(
-            "fa_max_log_submission_submit",
+            "fa_max_new_file_submit",
             {"mode": "search"},
             {
                 "borrower_search_block": {"borrower_search": {"selected_option": {"value": "p-existing-1"}}},
@@ -106,7 +106,7 @@ class TestLogSubmissionViewSubmission:
         # _deal_detail_blocks() so the existing-borrower path can capture
         # it too, not just the new-borrower view.
         raw = _view_submission_payload(
-            "fa_max_log_submission_submit",
+            "fa_max_new_file_submit",
             {"mode": "search"},
             {
                 "borrower_search_block": {"borrower_search": {"selected_option": {"value": "p-existing-2"}}},
@@ -147,7 +147,7 @@ class TestLogSubmissionViewSubmission:
 
     def test_new_borrower_creates_person_then_opportunity(self):
         raw = _view_submission_payload(
-            "fa_max_log_submission_submit",
+            "fa_max_new_file_submit",
             {"mode": "new_borrower"},
             {
                 "new_full_name_block": {"new_full_name": {"value": "John Smith"}},
@@ -188,7 +188,7 @@ class TestLogSubmissionViewSubmission:
 
     def test_new_borrower_property_address_is_persisted(self):
         raw = _view_submission_payload(
-            "fa_max_log_submission_submit",
+            "fa_max_new_file_submit",
             {"mode": "new_borrower"},
             {
                 "new_full_name_block": {"new_full_name": {"value": "John Smith"}},
@@ -233,7 +233,7 @@ class TestLogSubmissionViewSubmission:
         # Regression: loan_amount_block was read from Slack and then
         # silently discarded -- never written anywhere.
         raw = _view_submission_payload(
-            "fa_max_log_submission_submit",
+            "fa_max_new_file_submit",
             {"mode": "new_borrower", "channel_id": "C123"},
             {
                 "new_full_name_block": {"new_full_name": {"value": "John Smith"}},
@@ -260,7 +260,7 @@ class TestLogSubmissionViewSubmission:
                  patch("src.services.state_engine.transition"), \
                  patch("src.services.fa_max_file_state.ensure_file_state"), \
                  patch(
-                     "src.services.relay.slack_post.post_log_submission_confirmation",
+                     "src.services.relay.slack_post.post_new_file_confirmation",
                  ) as mock_confirm:
                 response = client.post(
                     "/api/admin/slack/interact", data=raw,
@@ -279,7 +279,7 @@ class TestLogSubmissionViewSubmission:
 
     def test_new_borrower_unparseable_loan_amount_dropped_not_crashed(self):
         raw = _view_submission_payload(
-            "fa_max_log_submission_submit",
+            "fa_max_new_file_submit",
             {"mode": "new_borrower"},
             {
                 "new_full_name_block": {"new_full_name": {"value": "John Smith"}},
@@ -320,7 +320,7 @@ class TestLogSubmissionViewSubmission:
 
     def test_confirmation_posted_with_backflip_ref_for_existing_borrower(self):
         raw = _view_submission_payload(
-            "fa_max_log_submission_submit",
+            "fa_max_new_file_submit",
             {"mode": "search", "channel_id": "C999"},
             {
                 "borrower_search_block": {"borrower_search": {"selected_option": {"value": "p-existing-9"}}},
@@ -345,7 +345,7 @@ class TestLogSubmissionViewSubmission:
                  patch("src.services.state_engine.transition"), \
                  patch("src.services.fa_max_file_state.ensure_file_state"), \
                  patch(
-                     "src.services.relay.slack_post.post_log_submission_confirmation",
+                     "src.services.relay.slack_post.post_new_file_confirmation",
                  ) as mock_confirm:
                 response = client.post(
                     "/api/admin/slack/interact", data=raw,
@@ -358,7 +358,7 @@ class TestLogSubmissionViewSubmission:
 
     def test_new_borrower_phone_is_normalized_before_insert(self):
         raw = _view_submission_payload(
-            "fa_max_log_submission_submit",
+            "fa_max_new_file_submit",
             {"mode": "new_borrower"},
             {
                 "new_full_name_block": {"new_full_name": {"value": "John Smith"}},
@@ -399,7 +399,7 @@ class TestLogSubmissionViewSubmission:
         # Slack sends "selected_option": null (not a missing key) for an
         # optional select with nothing chosen -- must not raise.
         raw = _view_submission_payload(
-            "fa_max_log_submission_submit",
+            "fa_max_new_file_submit",
             {"mode": "search"},
             {
                 "borrower_search_block": {"borrower_search": {"selected_option": None}},
@@ -419,7 +419,7 @@ class TestLogSubmissionViewSubmission:
         payload = {
             "type": "block_actions",
             "user": {"id": "U123"},
-            "actions": [{"action_id": "log_submission_new_borrower"}],
+            "actions": [{"action_id": "new_file_new_borrower"}],
             "view": {
                 "id": "V777", "hash": "h777",
                 "private_metadata": json.dumps({"mode": "search"}),
@@ -427,7 +427,7 @@ class TestLogSubmissionViewSubmission:
         }
         with patch("src.api.admin_router._verify_slack_signature", return_value=True), \
              patch(
-                 "src.services.relay.slack_post.open_log_submission_new_entry_view",
+                 "src.services.relay.slack_post.open_new_file_new_entry_view",
              ) as mock_swap:
             response = client.post(
                 "/api/admin/slack/interact", data="payload=" + json.dumps(payload),
@@ -438,7 +438,7 @@ class TestLogSubmissionViewSubmission:
 
     def test_missing_required_full_name_returns_validation_error(self):
         raw = _view_submission_payload(
-            "fa_max_log_submission_submit",
+            "fa_max_new_file_submit",
             {"mode": "new_borrower"},
             {
                 "new_full_name_block": {"new_full_name": {"value": ""}},

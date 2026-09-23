@@ -1,4 +1,4 @@
-"""tests/api/test_log_submission_slack_wiring.py"""
+"""tests/api/test_new_file_slack_wiring.py"""
 from __future__ import annotations
 
 from unittest.mock import patch
@@ -14,13 +14,13 @@ def _signed_headers():
     return {"x-slack-request-timestamp": "9999999999", "x-slack-signature": "v0=test"}
 
 
-class TestLogSubmissionSlashCommand:
+class TestNewFileSlashCommand:
     def test_opens_modal_when_authorized(self):
         with patch("src.api.admin_router._verify_slack_signature", return_value=True), \
              patch("src.api.admin_router._relay_approver_authorized", return_value=True), \
-             patch("src.api.admin_router.open_log_submission_modal", return_value=True) as mock_open:
+             patch("src.api.admin_router.open_new_file_modal", return_value=True) as mock_open:
             response = client.post(
-                "/api/admin/slack/fa-max-log-submission",
+                "/api/admin/slack/fa-max-new-file",
                 data={"user_id": "U123", "trigger_id": "trig-1", "text": ""},
                 headers=_signed_headers(),
             )
@@ -30,9 +30,9 @@ class TestLogSubmissionSlashCommand:
     def test_unauthorized_user_does_not_open_modal(self):
         with patch("src.api.admin_router._verify_slack_signature", return_value=True), \
              patch("src.api.admin_router._relay_approver_authorized", return_value=False), \
-             patch("src.api.admin_router.open_log_submission_modal") as mock_open:
+             patch("src.api.admin_router.open_new_file_modal") as mock_open:
             response = client.post(
-                "/api/admin/slack/fa-max-log-submission",
+                "/api/admin/slack/fa-max-new-file",
                 data={"user_id": "U999", "trigger_id": "trig-1"},
                 headers=_signed_headers(),
             )
