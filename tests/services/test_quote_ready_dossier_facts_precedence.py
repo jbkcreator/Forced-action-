@@ -12,12 +12,36 @@ run against the real schema, not a mocked one.
 from __future__ import annotations
 
 import uuid
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import text
 
 
 pytestmark = pytest.mark.usefixtures("fresh_db")
+
+
+@pytest.fixture(autouse=True)
+def _block_real_slack():
+    """INCIDENT (2026-09, ninth round): this file's tests exercise
+    maybe_trigger_quote_ready_review()/compute_and_persist_quote_ready(),
+    which on a successful compute posts a real dossier card via
+    slack_sdk.WebClient.chat_postMessage(). Real FA_MAX_SLACK_BOT_TOKEN/
+    FA_MAX_SLACK_CHANNEL_MONEY credentials are configured in this repo's
+    .env, and only ONE test class in this file's original version
+    (TestDeliveryNeverHappensBeforeCommit) mocked that call — every other
+    test posted a REAL card to the REAL MONEY Slack channel on every run.
+    fresh_db's transaction rollback does NOT undo this: the Slack API call
+    is not part of the DB transaction at all, so rolling back the DB
+    change has zero effect on a message already sent.
+
+    Autouse, applies to EVERY test in this file regardless of whether it
+    also patches this itself — redundant patching is harmless, missing it
+    once is not.
+    """
+    with patch("slack_sdk.WebClient.chat_postMessage") as mock_post, \
+         patch("src.services.relay.exceptions_alert_queue.post_exceptions_alert"):
+        yield mock_post
 
 
 def _make_property(session) -> int:
