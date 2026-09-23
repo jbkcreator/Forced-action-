@@ -399,7 +399,8 @@ def post_exceptions_alert(*, venture_key: str, rule: str, message: str) -> bool:
     can decide whether to record the alert as delivered.
     """
     settings = get_settings()
-    token = settings.slack_bot_token
+    token = (settings.fa_max_slack_bot_token if venture_key == _FA_MAX_VENTURE
+             else settings.slack_bot_token)
     channel = getattr(settings, "fa_max_slack_channel_exceptions", "") or get_venture_config(venture_key).relay_slack_channel
     if not token or not channel:
         logger.warning("[Relay][EXCEPTIONS] %s (venture=%s): Slack not configured — %s", rule, venture_key, message)

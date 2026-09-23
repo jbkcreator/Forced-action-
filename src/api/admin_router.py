@@ -1687,6 +1687,11 @@ async def slack_interact(request: Request, background_tasks: BackgroundTasks, db
         return _handle_relay_revise_open(payload)
     if action_id in ("approve_win_story", "dismiss_win_story"):
         return _handle_win_story_interact(payload, db)
+    # Quote Ready dossier decision (WP-8B — MONEY lane)
+    if action_id in ("quote_ready_approve", "quote_ready_reject"):
+        return _handle_quote_ready_decision(payload, db)
+    if action_id == "quote_ready_modify":
+        return _handle_quote_ready_modify_open(payload, db)
     # Builder entity-link actions (EXCEPTIONS lane — WP-T2-8)
     if action_id and action_id.startswith("confirm_entity_link_"):
         return _handle_confirm_entity_link(payload, db)
@@ -3053,6 +3058,169 @@ def _handle_win_story_interact(payload: dict, db: Session) -> dict:
 
     _update_win_story_slack_message(asset_id, payload, reply)
     return {"ok": True}
+
+
+_QUOTE_READY_ACTION_TO_DECISION = {
+    "quote_ready_approve": "approved",
+    "quote_ready_reject": "rejected",
+}
+
+
+def _handle_quote_ready_decision(payload: dict, db: Session) -> dict:
+    """WP-8B — Approve / Reject on a Quote Ready dossier card.
+
+    Reuses the real relay approver authorization check (relay_approvers is
+    the fleet-wide review authority list, same as every other Slack decision
+    in this app — Quote Ready review has no separate approver list of its
+    own) and writes into fa_max_quote_ready_results.review_status/
+    reviewed_by/reviewed_at, the columns the schema already carried but had
+    no writer until this handler.
+
+    Modify is NOT handled here — see _handle_quote_ready_modify_open() /
+    _handle_quote_ready_modify_submission(), a real edit-and-recompute
+    modal flow rather than a terminal decision.
+    """
+    from src.services.quote_ready.dossier import decide_quote_ready
+
+    actions = payload.get("actions", [])
+    if not actions:
+        return _slack_ephemeral("No action found in payload.")
+    action_id = actions[0].get("action_id")
+    try:
+        action_data = json.loads(actions[0].get("value", "{}"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid action value")
+
+    result_id = action_data.get("result_id")
+    if not result_id:
+        return _slack_ephemeral("Invalid Quote Ready action data.")
+
+    user_id = payload.get("user", {}).get("id", "")
+    if not _relay_approver_authorized(user_id, "fa_max_lending"):
+        return _slack_ephemeral("Not authorized to review Quote Ready scenarios.")
+
+    decision = _QUOTE_READY_ACTION_TO_DECISION[action_id]
+    applied = decide_quote_ready(db, result_id=result_id, decision=decision, decided_by=user_id)
+    db.commit()
+
+    if not applied:
+        return _slack_ephemeral(f"Scenario #{result_id} was already decided.")
+
+    reply = {
+        "approved": f":white_check_mark: Approved by <@{user_id}>",
+        "rejected": f":no_entry: Rejected by <@{user_id}>",
+    }[decision]
+    logger.info("[QuoteReady] result_id=%s decision=%s by=%s", result_id, decision, user_id)
+    # The card update below already shows this same text to everyone in the
+    # channel — returning it again as an ephemeral (as this handler
+    # previously did) just duplicated the same message as a second,
+    # only-visible-to-you popup. _handle_relay_decision (the pattern this
+    # handler is based on) only updates the card and returns {"ok": True};
+    # matching that here.
+    _update_quote_ready_slack_message(result_id, payload, reply)
+    return {"ok": True}
+
+
+def _handle_quote_ready_modify_open(payload: dict, db: Session) -> dict:
+    """WP-8B — Modify button: opens the real edit modal
+    (src.services.quote_ready.dossier.open_modify_modal), same mechanism as
+    Relay's own Revise button (_handle_relay_revise_open)."""
+    from src.services.quote_ready.dossier import open_modify_modal
+
+    actions = payload.get("actions", [])
+    if not actions:
+        return _slack_ephemeral("No action found in payload.")
+    try:
+        action_data = json.loads(actions[0].get("value", "{}"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid action value")
+    result_id = action_data.get("result_id")
+    if not result_id:
+        return _slack_ephemeral("Invalid Quote Ready action data.")
+
+    user_id = payload.get("user", {}).get("id", "")
+    if not _relay_approver_authorized(user_id, "fa_max_lending"):
+        return _slack_ephemeral("Not authorized to review Quote Ready scenarios.")
+
+    # The card being modified — carried into the modal's private_metadata so
+    # handle_modify_submission() can neutralize this exact card afterward
+    # (see that function's docstring for why: a live card with working
+    # buttons on now-superseded figures is a real approve-the-stale-version
+    # risk).
+    origin_channel = (payload.get("channel") or {}).get("id", "")
+    origin_message_ts = (payload.get("message") or {}).get("ts", "")
+    open_modify_modal(
+        db, trigger_id=payload.get("trigger_id", ""), result_id=result_id,
+        origin_channel=origin_channel, origin_message_ts=origin_message_ts,
+    )
+    return {}
+
+
+def _handle_quote_ready_modify_submission(payload: dict) -> Optional[dict]:
+    """WP-8B — Modify modal submission (Socket Mode view_submission).
+
+    No `db: Session` param, matching _handle_relay_revise_submission's
+    signature — this is invoked directly from socket_listener.py, which has
+    no FastAPI Depends(get_db) to hand it; opens its own session instead.
+
+    Returns Slack's view_submission response shape: {} closes the modal,
+    {"response_action": "errors", "errors": {...}} re-opens it with
+    inline field errors. Returning None (e.g. unauthorized) also closes
+    the modal — Slack treats a missing response_action as a plain close.
+    """
+    from src.services.quote_ready.dossier import handle_modify_submission
+
+    user_id = payload.get("user", {}).get("id", "")
+    view = payload.get("view", {})
+    try:
+        metadata = json.loads(view.get("private_metadata", "{}"))
+    except Exception:
+        return {"response_action": "errors", "errors": {"purchase_price_block": "Invalid view metadata."}}
+    result_id = metadata.get("result_id")
+    if not result_id:
+        return {"response_action": "errors", "errors": {"purchase_price_block": "Invalid view metadata."}}
+    origin_channel = metadata.get("origin_channel", "")
+    origin_message_ts = metadata.get("origin_message_ts", "")
+
+    if not _relay_approver_authorized(user_id, "fa_max_lending"):
+        return {"response_action": "errors", "errors": {"purchase_price_block": "Not authorized."}}
+
+    values = (view.get("state") or {}).get("values") or {}
+    with get_db_context() as db:
+        outcome = handle_modify_submission(
+            db, result_id=result_id, values=values, submitted_by=user_id,
+            origin_channel=origin_channel, origin_message_ts=origin_message_ts,
+        )
+
+    if not outcome.get("ok"):
+        return {"response_action": "errors", "errors": outcome.get("error", {})}
+    logger.info("[QuoteReady] result_id=%s modify submitted by=%s -> new_result_id=%s",
+                result_id, user_id, outcome.get("new_result_id"))
+    return {}
+
+
+def _update_quote_ready_slack_message(result_id: str, payload: dict, reply_text: str) -> None:
+    """Replace the Approve/Modify/Reject buttons with the decision outcome,
+    in place — mirrors _update_win_story_slack_message's pattern (channel +
+    message ts come straight off the interactive payload, no DB lookup
+    needed)."""
+    from config.settings import get_settings
+    s = get_settings()
+    token = s.fa_max_slack_bot_token
+    channel = (payload.get("channel") or {}).get("id")
+    message_ts = (payload.get("message") or {}).get("ts")
+    if not token or not channel or not message_ts:
+        return
+    try:
+        from slack_sdk import WebClient
+        WebClient(token=token.get_secret_value()).chat_update(
+            channel=channel,
+            ts=message_ts,
+            text=reply_text,
+            blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": reply_text}}],
+        )
+    except Exception as exc:
+        logger.error("[QuoteReady] chat.update failed for result_id=%s: %s", result_id, exc)
 
 
 def _handle_confirm_entity_link(payload: dict, db: Session) -> dict:

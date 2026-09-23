@@ -12031,6 +12031,15 @@ class FaMaxArvResult(Base):
         String(20), nullable=False, server_default=text("'computed'")
     )
     supersedes_result_id: Mapped[Optional[str]] = mapped_column(PG_UUID(as_uuid=True))
+    # Manual override with audit trail (WP-8B scope item, migrations/apply_wp8b_arv_override.py).
+    # low/high/point above are the ORIGINAL computed figures and are never modified by an
+    # override — see override_arv_result()'s docstring in arv_persistence.py.
+    override_low: Mapped[Optional[float]] = mapped_column(Numeric(14, 2))
+    override_point: Mapped[Optional[float]] = mapped_column(Numeric(14, 2))
+    override_high: Mapped[Optional[float]] = mapped_column(Numeric(14, 2))
+    override_reason: Mapped[Optional[str]] = mapped_column(Text)
+    overridden_by: Mapped[Optional[str]] = mapped_column(Text)
+    overridden_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (
         Index("idx_fa_max_arv_property_computed", "property_id", "computed_at"),
@@ -12043,7 +12052,7 @@ class FaMaxArvResult(Base):
             sqlite_where=text("status = 'computed'"),
         ),
         CheckConstraint(
-            "status IN ('computed','superseded')", name="ck_fa_max_arv_status"
+            "status IN ('computed','superseded','overridden')", name="ck_fa_max_arv_status"
         ),
     )
 

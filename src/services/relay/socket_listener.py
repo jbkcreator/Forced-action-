@@ -50,11 +50,49 @@ def handle_socket_request(client: Any, request: Any) -> bool:
 
     from slack_sdk.socket_mode.response import SocketModeResponse
 
+    payload = request.payload or {}
+
+    # view_submission (modal Save/Submit) is NOT a fire-and-forget ack like
+    # block_actions below -- Slack requires the SAME acknowledgement to
+    # CARRY the response body (empty {} closes the modal; a
+    # {"response_action": "errors", ...} dict re-opens it with inline field
+    # errors). Sending an empty ack first (as this listener previously did
+    # unconditionally for every interactive envelope) always silently
+    # closed the modal and threw away any validation errors -- confirmed
+    # gap: this listener had ZERO view_submission handling at all, so
+    # neither the pre-existing Relay Revise modal nor Quote Ready's Modify
+    # modal ever actually processed a submission over Socket Mode (the
+    # production fa-relay-slack-listener.service transport). The response
+    # must therefore be computed BEFORE acking, not after.
+    if payload.get("type") == "view_submission":
+        callback_id = (payload.get("view") or {}).get("callback_id")
+        user_id = payload.get("user", {}).get("id", "?")
+        response_body: Optional[dict] = None
+        if callback_id == "fa_max_revise_submit":
+            from src.api.admin_router import _handle_relay_revise_submission
+            response_body = _handle_relay_revise_submission(payload)
+        elif callback_id == "quote_ready_modify_submit":
+            from src.api.admin_router import _handle_quote_ready_modify_submission
+            response_body = _handle_quote_ready_modify_submission(payload)
+        else:
+            logger.info(
+                "[RelaySocket] view_submission with unrecognized callback_id=%r user=%s — "
+                "no handler registered, modal will silently close",
+                callback_id, user_id,
+            )
+        logger.info(
+            "[RelaySocket] view_submission callback_id=%r user=%s -> response=%s",
+            callback_id, user_id, "errors" if (response_body or {}).get("response_action") == "errors" else "ok",
+        )
+        client.send_socket_mode_response(
+            SocketModeResponse(envelope_id=request.envelope_id, payload=response_body)
+        )
+        return callback_id is not None
+
     # Slack requires this acknowledgement within three seconds.  The durable
     # handler is intentionally called only after it, and remains idempotent.
     client.send_socket_mode_response(SocketModeResponse(envelope_id=request.envelope_id))
 
-    payload = request.payload or {}
     if request.type == "events_api":
         # Socket Mode delivers subscribed Events API payloads in an
         # ``events_api`` envelope. Reuse the HTTP route's thread-command
@@ -78,6 +116,8 @@ def handle_socket_request(client: Any, request: Any) -> bool:
         _handle_add_builder_to_diallist,
         _handle_snooze_builder,
         _handle_dismiss_builder,
+        _handle_quote_ready_decision,
+        _handle_quote_ready_modify_open,
     )
     from src.core.database import get_db_context
 
@@ -120,6 +160,20 @@ def handle_socket_request(client: Any, request: Any) -> bool:
         logger.info("[RelaySocket] builder dismiss: action_id=%s user=%s", action_id, user_id)
         with get_db_context() as db:
             result = _handle_dismiss_builder(payload, db)
+        _post_socket_ephemeral(client, payload, result)
+        return True
+
+    # Quote Ready dossier decision (WP-8B — MONEY lane)
+    if action_id in ("quote_ready_approve", "quote_ready_reject"):
+        logger.info("[RelaySocket] quote-ready decision: action_id=%s user=%s", action_id, user_id)
+        with get_db_context() as db:
+            result = _handle_quote_ready_decision(payload, db)
+        _post_socket_ephemeral(client, payload, result)
+        return True
+    if action_id == "quote_ready_modify":
+        logger.info("[RelaySocket] quote-ready modify (opening modal): user=%s", user_id)
+        with get_db_context() as db:
+            result = _handle_quote_ready_modify_open(payload, db)
         _post_socket_ephemeral(client, payload, result)
         return True
 

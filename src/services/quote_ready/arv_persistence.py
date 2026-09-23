@@ -119,6 +119,15 @@ class PublishedARV(BaseModel):
     weak_comp: bool = True
     computed_at: datetime
     source: str
+    # Manual-override audit trail (WP-8B: "allow reviewed manual override
+    # with audit trail"). low/high/point above are already the override
+    # values when overridden=True — a consumer that only reads low/high/point
+    # always gets the figure that should govern, without needing to know
+    # override happened. These extra fields exist so a reviewer-facing
+    # surface can still show "this was overridden, by whom, why."
+    overridden: bool = False
+    overridden_by: Optional[str] = None
+    override_reason: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -192,11 +201,28 @@ _MARK_SUPERSEDED_SQL = text(
 _PUBLISHED_SQL = text(
     """
     SELECT arv_result_id, low, high, point, confidence, comp_count,
-           weak_comp, computed_at, source, arv_unknown
+           weak_comp, computed_at, source, arv_unknown, status,
+           override_low, override_point, override_high,
+           overridden_by, override_reason
     FROM fa_max_arv_results
-    WHERE property_id = :pid AND status = 'computed'
+    WHERE property_id = :pid AND status IN ('computed', 'overridden')
     ORDER BY computed_at DESC
     LIMIT 1
+    """
+)
+
+_OVERRIDE_SQL = text(
+    """
+    UPDATE fa_max_arv_results
+    SET status = 'overridden',
+        override_low = :override_low,
+        override_point = :override_point,
+        override_high = :override_high,
+        override_reason = :override_reason,
+        overridden_by = :overridden_by,
+        overridden_at = now()
+    WHERE arv_result_id = :arv_result_id AND status = 'computed'
+    RETURNING arv_result_id
     """
 )
 
@@ -291,14 +317,92 @@ def get_published_arv(session: Session, property_id: int) -> Optional[PublishedA
     row = session.execute(_PUBLISHED_SQL, {"pid": property_id}).mappings().first()
     if row is None or row["arv_unknown"]:
         return None
+    overridden = row["status"] == "overridden"
     return PublishedARV(
         arv_result_id=str(row["arv_result_id"]),
-        low=row["low"],
-        high=row["high"],
-        point=row["point"],
+        # An override REPLACES the governing figure for every downstream
+        # consumer of this projection — they read low/high/point only and
+        # should never need to know an override happened to get the right
+        # number. The original computed values stay untouched on the row
+        # itself (queryable directly for audit/reversal — see
+        # override_arv_result()'s docstring).
+        low=row["override_low"] if overridden else row["low"],
+        high=row["override_high"] if overridden else row["high"],
+        point=row["override_point"] if overridden else row["point"],
         confidence=row["confidence"],
         comp_count=row["comp_count"],
         weak_comp=row["weak_comp"],
         computed_at=row["computed_at"],
         source=row["source"],
+        overridden=overridden,
+        overridden_by=row["overridden_by"] if overridden else None,
+        override_reason=row["override_reason"] if overridden else None,
     )
+
+
+def override_arv_result(
+    session: Session,
+    *,
+    arv_result_id: str,
+    override_low: Decimal,
+    override_point: Decimal,
+    override_high: Decimal,
+    reason: str,
+    overridden_by: str,
+) -> bool:
+    """Manually override a computed ARV, with a mandatory audit trail
+    (WP-8B: "allow reviewed manual override with audit trail").
+
+    Reviewed override only — targets a row currently in 'computed' status
+    (the WHERE clause in _OVERRIDE_SQL enforces this: an already-overridden
+    or already-superseded row cannot be re-overridden through this path,
+    preventing a stale/duplicate review from silently winning). The
+    ORIGINAL computed low/high/point/confidence/selected_comps are never
+    modified — this only adds override_* columns and flips status, so the
+    computation this override is correcting stays fully inspectable
+    (a bad override is reversible: re-run compute_arv_for_property() +
+    persist_arv_result() to insert a fresh 'computed' row, exactly the
+    same "never destroy history" pattern used everywhere else in this
+    codebase for merges/state transitions).
+
+    Raises ValueError if reason is blank, or if low/point/high are not in
+    non-decreasing order (same ordering invariant the compute engine itself
+    guarantees — an override must not silently produce an inverted range).
+
+    Returns True if the override was applied, False if no row in
+    'computed' status matched arv_result_id (already overridden/superseded,
+    or the id doesn't exist) — never raises for that case, since a
+    double-click on a review button is a normal UI race, not an error.
+    """
+    if not reason or not reason.strip():
+        raise ValueError("override_arv_result: reason is required")
+    if not (override_low <= override_point <= override_high):
+        raise ValueError(
+            f"override_arv_result: range must be non-decreasing, got "
+            f"low={override_low} point={override_point} high={override_high}"
+        )
+
+    result = session.execute(
+        _OVERRIDE_SQL,
+        {
+            "arv_result_id": arv_result_id,
+            "override_low": round_to_5k(override_low),
+            "override_point": round_to_5k(override_point),
+            "override_high": round_to_5k(override_high),
+            "override_reason": reason.strip(),
+            "overridden_by": overridden_by,
+        },
+    ).fetchone()
+    applied = result is not None
+    if applied:
+        logger.info(
+            "arv_persistence: ARV %s overridden by %s (reason=%r)",
+            arv_result_id, overridden_by, reason,
+        )
+    else:
+        logger.warning(
+            "arv_persistence: override_arv_result no-op — %s is not in 'computed' status "
+            "(already overridden/superseded, or does not exist)",
+            arv_result_id,
+        )
+    return applied

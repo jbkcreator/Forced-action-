@@ -71,6 +71,19 @@ _ALLOWED_GOVERNANCE_IMPORTERS = {
     "src/services/relay/guards.py",
     "src/services/relay/queue.py",
     "src/services/relay/channels_sms.py",
+    # WP-T2-2: check_suppression() is a read-only pre-check tool
+    # (requires_send_gate=False) that lets an agent inspect suppression
+    # state before deciding what to do -- it does not send anything. The
+    # actual send() tool in this same file routes exclusively through
+    # relay_queue.enqueue(), never touches fa_max_send_governance directly.
+    "src/agents/fa_max/tool_registry.py",
+    # Only imports the GovernanceBlocked exception type to catch it after
+    # relay.enqueue() raises it -- not a second send path.
+    "src/agents/fa_max/agent_graph.py",
+    # WP-T2-3: mark_sent_attribution() imports FA_MAX_ALLOWED_SOURCE_TYPES,
+    # a constant, to validate an already-sent item's attribution -- not a
+    # send path at all.
+    "src/services/state_engine.py",
 }
 
 

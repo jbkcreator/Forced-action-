@@ -799,6 +799,20 @@ def _do_transition(
         person_id=derived_person_id,
     )
 
+    # WP-8A/8B: auto-post a Quote Ready dossier when an opportunity enters
+    # 'scoping' — the stage name IS "deal being structured", the trigger
+    # point confirmed for SOT.md §17's "when an opportunity looks real,
+    # assemble the whole deal picture before Josh reviews it." Isolated in
+    # its own savepoint for the same reason as the WP-5B hook above: a
+    # dossier-posting failure (bad property data, Slack outage) must never
+    # poison the state transition that already committed.
+    _maybe_trigger_quote_ready_review(
+        session=session,
+        entity_type=entity_type,
+        to_state=to_state,
+        opportunity_id=native_id,
+    )
+
     return TransitionResult(
         outcome=TransitionOutcome.succeeded,
         current_state=to_state,
@@ -836,6 +850,42 @@ def _maybe_enqueue_profile_recompute(
         logger.warning(
             "Failed to enqueue profile recompute for person %s after opportunity->%s",
             person_id, to_state, exc_info=True,
+        )
+
+
+_QUOTE_READY_TRIGGER_STATES = frozenset({"scoping"})
+
+
+def _maybe_trigger_quote_ready_review(
+    *,
+    session: Session,
+    entity_type: str,
+    to_state: str,
+    opportunity_id: Optional[str],
+) -> None:
+    """Auto-post a WP-8A/8B Quote Ready dossier when an opportunity enters
+    'scoping'. See src.services.quote_ready.dossier.maybe_trigger_quote_ready_review
+    for the actual compute/persist/post logic and its own silent-no-op
+    conditions (no linked property, no financials row, unchanged scenario).
+
+    Fails silently so a dossier-posting failure (bad property data, Slack
+    outage) never blocks the state transition — same isolation contract as
+    _maybe_enqueue_profile_recompute above.
+    """
+    if entity_type != "opportunity" or to_state not in _QUOTE_READY_TRIGGER_STATES:
+        return
+    if not opportunity_id:
+        return
+    sp = session.begin_nested()
+    try:
+        from src.services.quote_ready.dossier import maybe_trigger_quote_ready_review
+        maybe_trigger_quote_ready_review(session, opportunity_id=opportunity_id)
+        sp.commit()
+    except Exception:
+        sp.rollback()
+        logger.warning(
+            "Failed to auto-trigger Quote Ready review for opportunity_id=%s -> %s",
+            opportunity_id, to_state, exc_info=True,
         )
 
 

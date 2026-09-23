@@ -255,7 +255,7 @@ def cmd_health(venture_key: str) -> int:
     _line(f"  {icon} monitor + drain worker cron registration [{cron['state']}] {cron['detail']}")
 
     exceptions_channel_configured = bool(
-        settings.slack_bot_token and getattr(settings, "fa_max_slack_channel_exceptions", "")
+        settings.fa_max_slack_bot_token and getattr(settings, "fa_max_slack_channel_exceptions", "")
     )
     icon = _OK if exceptions_channel_configured else _WARN
     _line(
@@ -398,7 +398,7 @@ def cmd_go_live_readiness(venture_key: str) -> int:
     ])["state"]
 
     exceptions_channel_configured = bool(
-        settings.slack_bot_token and getattr(settings, "fa_max_slack_channel_exceptions", "")
+        settings.fa_max_slack_bot_token and getattr(settings, "fa_max_slack_channel_exceptions", "")
     )
 
     readiness = check_go_live_readiness(
