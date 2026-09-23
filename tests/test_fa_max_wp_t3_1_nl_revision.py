@@ -83,9 +83,8 @@ class TestPendingSlot:
 class TestReviseDraft:
     def test_returns_llm_text_on_success(self):
         llm = MagicMock(return_value="  Hi Mike, saw your permit on 12 Oak St. Want to chat?  ")
-        res = nl_revision.revise_draft(
-            instruction="shorter", original="orig", current="orig", llm=llm,
-        )
+        orig = "Hi Mike, saw your permit on 12 Oak St. We fund flips fast. Want to chat?"
+        res = nl_revision.revise_draft(instruction="shorter", original=orig, current=orig, llm=llm)
         assert res.ok and res.text == "Hi Mike, saw your permit on 12 Oak St. Want to chat?"
 
     def test_prompt_carries_instruction_original_and_current_as_data(self):
@@ -106,6 +105,53 @@ class TestReviseDraft:
             instruction="shorter", original="o", current="o", llm=MagicMock(return_value=out),
         )
         assert not res.ok and res.reason == "llm_error"
+
+
+ORIGINAL = "Hi Mike, saw your permit on 12 Oak St. Your $250,000 flip looks strong. Want to chat?"
+
+
+class TestEmbellishmentGuard:
+    @pytest.mark.parametrize("revised", [
+        "Hi Mike, saw your permit on 12 Oak St. Want to chat?",
+        "Mike — your $250,000 flip at 12 Oak St looks strong. Chat?",
+        "Hi Mike, saw your 12 Oak St permit. Your 250,000 flip looks strong.",
+    ])
+    def test_clean_rewrites_pass(self, revised):
+        assert nl_revision.embellishment_guard(revised, ORIGINAL) is None
+
+    @pytest.mark.parametrize("revised,needle", [
+        ("Hi Mike, we close in 10 days. Want to chat?", "10"),
+        ("Hi Mike, we can lend $300,000 on 12 Oak St.", "$300,000"),
+        ("Hi Mike, 12 Oak St could return 20%.", "20%"),
+        ("Hi Mike, your 250,000 flip is worth $250,000 plus $1.", "$1"),
+        ("Hi Mike, 12 Oak St. Rates from 9.5%!", "9.5%"),
+    ])
+    def test_new_number_money_or_percent_is_refused(self, revised, needle):
+        flag = nl_revision.embellishment_guard(revised, ORIGINAL)
+        assert flag is not None and needle in flag
+
+    def test_bare_number_does_not_become_new_money_or_percent(self):
+        assert nl_revision.embellishment_guard("12% off at Oak St", ORIGINAL) is not None
+
+    @pytest.mark.parametrize("word", [
+        "rate", "APR", "points", "terms", "approved", "pre-approved",
+        "guarantee", "guaranteed", "commit", "commitment",
+    ])
+    def test_new_rate_or_term_word_is_refused(self, word):
+        flag = nl_revision.embellishment_guard(f"Hi Mike, {word} for 12 Oak St. Want to chat?", ORIGINAL)
+        assert flag is not None and word.lower() in flag.lower()
+
+    def test_rate_word_already_in_original_is_allowed(self):
+        original = "Hi Mike, our rate sheet is attached. Want to chat?"
+        assert nl_revision.embellishment_guard("Mike — rate sheet attached. Chat?", original) is None
+
+    def test_word_boundary_not_substring(self):
+        assert nl_revision.embellishment_guard("Hi Mike, a pirate ship at 12 Oak St?", ORIGINAL) is None
+
+    def test_revise_draft_refuses_embellished_output(self):
+        llm = MagicMock(return_value="Hi Mike, we guarantee funding in 5 days.")
+        res = nl_revision.revise_draft(instruction="stronger hook", original=ORIGINAL, current=ORIGINAL, llm=llm)
+        assert not res.ok and res.reason == "embellishment" and res.detail
 
 
 # ── thread routing (precedence) ──────────────────────────────────────────────
@@ -199,6 +245,21 @@ class TestApplyNlRevision:
         apply.assert_not_called()
         note.assert_called_once()
 
+    def test_embellishment_refusal_leaves_row_unchanged_and_explains(self):
+        from src.api import admin_router
+
+        item = _item()
+        with patch.object(admin_router, "_clear_pending_slot"), \
+             patch.object(admin_router.nl_revision, "revise_draft",
+                          return_value=nl_revision.RevisionResult(
+                              ok=False, reason="embellishment", detail="introduced 10")), \
+             patch("src.services.relay.queue.record_revision") as rec, \
+             patch.object(admin_router, "_post_relay_thread_note") as note:
+            admin_router._apply_nl_revision(item, "stronger hook", "U1")
+        rec.assert_not_called()
+        text = note.call_args.args[1]
+        assert "Skipped" in text and "Edit text" in text
+
     def test_not_pending_item_is_refused(self):
         from src.api import admin_router
 
@@ -255,6 +316,20 @@ class TestApplyDraftRevision:
             item, _, _ = admin_router._apply_draft_revision(_item(), "x", revised_by="slack:U1")
         assert item is None
         note.assert_not_called()
+
+
+# ── fallback responder hint ──────────────────────────────────────────────────
+
+class TestFallbackReviseHint:
+    def test_card_thread_other_ack_hints_revise(self):
+        from src.services.relay.thread_fallback_responder import build_other_ack_text
+
+        assert "tap Revise" in build_other_ack_text(on_card=True)
+
+    def test_channel_other_ack_has_no_revise_hint(self):
+        from src.services.relay.thread_fallback_responder import build_other_ack_text
+
+        assert "Revise" not in build_other_ack_text()
 
 
 # ── buttons ──────────────────────────────────────────────────────────────────

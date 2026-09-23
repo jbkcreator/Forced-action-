@@ -2545,6 +2545,13 @@ def _apply_nl_revision(item, instruction: str, user_id: str) -> None:
         current=item.final_content or original,
         llm=nl_revision.claude_llm,
     )
+    if result.reason == "embellishment":
+        _post_relay_thread_note(
+            item,
+            f":no_entry: Skipped — that adds a fact or term not in the draft ({result.detail}). "
+            "Use Edit text to change facts.",
+        )
+        return
     if not result.ok:
         _post_relay_thread_note(item, ":warning: Couldn't revise — try again, or use Edit text.")
         return
