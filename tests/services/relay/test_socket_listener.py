@@ -72,18 +72,51 @@ class TestNewBorrowerButtonClick:
         assert handled is True
 
 
-class TestViewSubmissionDispatch:
-    def test_log_submission_modal_acks_with_handler_result(self):
+class TestLogSubmissionAckFastDeferWork:
+    """fa_max_log_submission_submit's DB work (profiled live: ~10s
+    against this dev DB's network latency) blows past Slack's ~3s
+    Socket Mode ack window -- found live during manual E2E testing
+    (Slack reported dispatch_failed even though the DB write eventually
+    succeeded). It now runs _log_submission_pre_validate (DB-free)
+    BEFORE acking, and defers the real DB work to after the ack.
+    """
+
+    def test_pre_validation_failure_acks_with_errors_without_touching_db(self):
         client = mock.MagicMock()
         payload = {
             "type": "view_submission",
             "view": {"callback_id": "fa_max_log_submission_submit"},
         }
         request = _request("interactive", "env-2", payload)
-        result = {"response_action": "errors", "errors": {"new_full_name_block": "required"}}
+        error = {"response_action": "errors", "errors": {"new_full_name_block": "Borrower name is required."}}
 
         with mock.patch(
-            "src.api.admin_router._handle_log_submission_view_submit", return_value=result,
+            "src.api.admin_router._log_submission_pre_validate", return_value=error,
+        ) as mock_prevalidate, mock.patch(
+            "src.api.admin_router._handle_log_submission_view_submit",
+        ) as mock_handle:
+            handled = socket_listener.handle_socket_request(client, request)
+
+        assert handled is True
+        mock_prevalidate.assert_called_once_with(payload)
+        mock_handle.assert_not_called()
+        client.send_socket_mode_response.assert_called_once()
+        sent = client.send_socket_mode_response.call_args.args[0]
+        assert sent.envelope_id == "env-2"
+        assert sent.payload == error
+
+    def test_pre_validation_pass_acks_blank_then_runs_db_work_after(self):
+        client = mock.MagicMock()
+        payload = {
+            "type": "view_submission",
+            "view": {"callback_id": "fa_max_log_submission_submit"},
+        }
+        request = _request("interactive", "env-2b", payload)
+
+        with mock.patch(
+            "src.api.admin_router._log_submission_pre_validate", return_value=None,
+        ), mock.patch(
+            "src.api.admin_router._handle_log_submission_view_submit", return_value={},
         ) as mock_handle, mock.patch("src.core.database.get_db_context") as mock_ctx:
             mock_ctx.return_value.__enter__.return_value = mock.MagicMock()
             handled = socket_listener.handle_socket_request(client, request)
@@ -91,11 +124,34 @@ class TestViewSubmissionDispatch:
         assert handled is True
         mock_handle.assert_called_once()
         assert mock_handle.call_args.args[0] == payload
+        # Exactly one ack, sent before the (slow) DB work, carrying no
+        # payload -- there is no response_action channel left afterward.
         client.send_socket_mode_response.assert_called_once()
         sent = client.send_socket_mode_response.call_args.args[0]
-        assert sent.envelope_id == "env-2"
-        assert sent.payload == result
+        assert sent.payload is None
 
+    def test_db_work_raising_after_ack_is_logged_not_raised(self):
+        client = mock.MagicMock()
+        payload = {
+            "type": "view_submission",
+            "view": {"callback_id": "fa_max_log_submission_submit"},
+        }
+        request = _request("interactive", "env-2c", payload)
+
+        with mock.patch(
+            "src.api.admin_router._log_submission_pre_validate", return_value=None,
+        ), mock.patch(
+            "src.api.admin_router._handle_log_submission_view_submit",
+            side_effect=RuntimeError("db exploded"),
+        ), mock.patch("src.core.database.get_db_context") as mock_ctx:
+            mock_ctx.return_value.__enter__.return_value = mock.MagicMock()
+            handled = socket_listener.handle_socket_request(client, request)
+
+        assert handled is True
+        client.send_socket_mode_response.assert_called_once()
+
+
+class TestViewSubmissionDispatch:
     def test_revise_modal_acks_with_handler_result(self):
         # Pre-existing Revise modal -- same Socket-Mode-only gap, fixed by
         # the same branch that fixes the new log-submission modal.

@@ -2442,6 +2442,46 @@ def _handle_log_submission_new_borrower_click(payload: dict) -> dict:
     return {}
 
 
+def _log_submission_field(values: dict, block_id: str, action_id: str) -> str:
+    block = values.get(block_id, {}).get(action_id, {})
+    # `selected_option` arrives as an explicit JSON null (not a missing
+    # key) for an optional select with nothing chosen, so the default
+    # from .get() is never reached — coalesce the null itself.
+    return (block.get("value") or (block.get("selected_option") or {}).get("value") or "").strip()
+
+
+def _log_submission_pre_validate(payload: dict) -> Optional[dict]:
+    """Fast, DB-free validation for the log-submission modal submit --
+    both of _handle_log_submission_view_submit's only two error-returning
+    checks, factored out so the Socket Mode listener
+    (src/services/relay/socket_listener.py) can run them BEFORE acking.
+    The DB work in _handle_log_submission_view_submit below can take
+    several seconds against this dev DB's network latency -- past
+    Slack's ~3s Socket Mode ack window -- so that listener acks
+    immediately once these two (in-memory only) checks pass, then does
+    the actual DB work afterward. There is no response_action channel
+    left post-ack, so these are the only validation this modal can ever
+    show inline once Socket Mode is the delivery mechanism.
+    """
+    view = payload["view"]
+    metadata = json.loads(view.get("private_metadata") or "{}")
+    values = view["state"]["values"]
+
+    if metadata.get("mode") == "new_borrower":
+        if not _log_submission_field(values, "new_full_name_block", "new_full_name"):
+            return {
+                "response_action": "errors",
+                "errors": {"new_full_name_block": "Borrower name is required."},
+            }
+    else:
+        if not _log_submission_field(values, "borrower_search_block", "borrower_search"):
+            return {
+                "response_action": "errors",
+                "errors": {"borrower_search_block": "Select a borrower or choose \"new borrower\"."},
+            }
+    return None
+
+
 def _handle_log_submission_view_submit(payload: dict, db: Session) -> dict:
     """Slack `/fa-max-log-submission` modal submission (WP-T2-6 addendum,
     Task 19). This is the moment Josh tells the system he already submitted
@@ -2459,24 +2499,19 @@ def _handle_log_submission_view_submit(payload: dict, db: Session) -> dict:
     from src.services import fa_max_file_state, state_engine
     from src.services.phone_utils import normalize as normalize_phone
 
+    pre_validation_error = _log_submission_pre_validate(payload)
+    if pre_validation_error is not None:
+        return pre_validation_error
+
     view = payload["view"]
     metadata = json.loads(view.get("private_metadata") or "{}")
     values = view["state"]["values"]
 
     def _field(block_id: str, action_id: str) -> str:
-        block = values.get(block_id, {}).get(action_id, {})
-        # `selected_option` arrives as an explicit JSON null (not a missing
-        # key) for an optional select with nothing chosen, so the default
-        # from .get() is never reached — coalesce the null itself.
-        return (block.get("value") or (block.get("selected_option") or {}).get("value") or "").strip()
+        return _log_submission_field(values, block_id, action_id)
 
     if metadata.get("mode") == "new_borrower":
         full_name = _field("new_full_name_block", "new_full_name")
-        if not full_name:
-            return {
-                "response_action": "errors",
-                "errors": {"new_full_name_block": "Borrower name is required."},
-            }
         email = _field("new_email_block", "new_email") or None
         phone = normalize_phone(_field("new_phone_block", "new_phone") or None)
         person_row = db.execute(
@@ -2491,11 +2526,6 @@ def _handle_log_submission_view_submit(payload: dict, db: Session) -> dict:
         person_id = str(person_row.person_id)
     else:
         person_id = _field("borrower_search_block", "borrower_search")
-        if not person_id:
-            return {
-                "response_action": "errors",
-                "errors": {"borrower_search_block": "Select a borrower or choose \"new borrower\"."},
-            }
 
     opportunity_type = _field("opportunity_type_block", "opportunity_type")
     opportunity_id = state_engine.create_fa_max_opportunity(

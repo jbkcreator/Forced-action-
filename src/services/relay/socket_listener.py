@@ -63,13 +63,50 @@ def handle_socket_request(client: Any, request: Any) -> bool:
     # before the blank ack below, which every other interactive/events_api
     # envelope gets instead.
     if request.type == "interactive" and payload.get("type") == "view_submission":
-        from src.api.admin_router import (
-            _handle_log_submission_view_submit,
-            _handle_relay_revise_submission,
-        )
-        from src.core.database import get_db_context
-
         callback_id = payload.get("view", {}).get("callback_id")
+
+        if callback_id == "fa_max_log_submission_submit":
+            # This handler's DB work (profiled live: ~10s against this
+            # dev DB's network latency, well past Slack's ~3s Socket Mode
+            # ack window) cannot ride the ack the way fa_max_revise_submit
+            # below does -- found live during manual E2E testing (Slack
+            # reported dispatch_failed even though the DB write eventually
+            # succeeded). _log_submission_pre_validate covers BOTH of the
+            # handler's error-returning checks and needs no DB access, so
+            # it runs before the ack; once it passes, ack immediately
+            # (closing the modal) and do the real DB work after -- same
+            # "ack fast, defer the work" pattern already used for the FA
+            # Max slash commands. There is no response_action channel
+            # left post-ack, so a DB-layer failure here can only be
+            # logged, not shown inline in the modal.
+            from src.api.admin_router import (
+                _handle_log_submission_view_submit,
+                _log_submission_pre_validate,
+            )
+            from src.core.database import get_db_context
+
+            try:
+                pre_validation_error = _log_submission_pre_validate(payload)
+            except Exception:
+                logger.exception("[RelaySocket] log-submission pre-validation raised")
+                pre_validation_error = None
+
+            if pre_validation_error is not None:
+                client.send_socket_mode_response(
+                    SocketModeResponse(envelope_id=request.envelope_id, payload=pre_validation_error)
+                )
+                return True
+
+            client.send_socket_mode_response(SocketModeResponse(envelope_id=request.envelope_id))
+            try:
+                with get_db_context() as db:
+                    _handle_log_submission_view_submit(payload, db)
+            except Exception:
+                logger.exception("[RelaySocket] log-submission DB work raised after ack")
+            return True
+
+        from src.api.admin_router import _handle_relay_revise_submission
+
         try:
             if callback_id == "fa_max_revise_submit":
                 # _handle_relay_revise_submission raises HTTPException on
@@ -79,9 +116,6 @@ def handle_socket_request(client: Any, request: Any) -> bool:
                 # simply never get acked at all: Slack sees a silent
                 # 3-second timeout rather than a clean error.
                 result = _handle_relay_revise_submission(payload)
-            elif callback_id == "fa_max_log_submission_submit":
-                with get_db_context() as db:
-                    result = _handle_log_submission_view_submit(payload, db)
             else:
                 result = {}
         except Exception:
