@@ -281,7 +281,9 @@ def _post_socket_ephemeral(client: Any, payload: dict, result: dict) -> None:
         logger.warning("[RelaySocket] could not post ephemeral reply: %s", text)
 
 
-_FA_MAX_SLASH_COMMANDS = frozenset({"/fa-max-log-submission", "/fa-max-file-update"})
+_FA_MAX_SLASH_COMMANDS = frozenset({
+    "/fa-max-log-submission", "/fa-max-file-update", "/fa-max-backflip-files",
+})
 
 
 def _post_slash_reply(response_url: Optional[str], reply: dict) -> None:
@@ -307,16 +309,17 @@ def _post_slash_reply(response_url: Optional[str], reply: dict) -> None:
 
 
 def handle_fa_max_slash_command_request(client: Any, request: Any) -> bool:
-    """Socket Mode envelope handler for '/fa-max-log-submission' and
-    '/fa-max-file-update' (WP-T2-6). This Slack app has no Interactivity/
-    slash-command Request URL option once Socket Mode is enabled, so
-    these two commands -- and view_submission/block_suggestion, handled
-    in handle_socket_request above -- are unreachable via the HTTP routes
-    in src/api/admin_router.py in this deployment. The same pure functions
-    those routes call are reused here rather than duplicated.
+    """Socket Mode envelope handler for '/fa-max-log-submission',
+    '/fa-max-file-update', and '/fa-max-backflip-files' (WP-T2-6). This
+    Slack app has no Interactivity/slash-command Request URL option once
+    Socket Mode is enabled, so these commands -- and view_submission/
+    block_suggestion, handled in handle_socket_request above -- are
+    unreachable via the HTTP routes in src/api/admin_router.py in this
+    deployment. The same pure functions those routes call are reused here
+    rather than duplicated.
 
-    Returns True only when this listener handled one of these two
-    commands -- every other envelope is left untouched, same contract as
+    Returns True only when this listener handled one of these commands --
+    every other envelope is left untouched, same contract as
     handle_tracked_link_socket_request.
     """
     if request.type != "slash_commands":
@@ -338,12 +341,18 @@ def handle_fa_max_slash_command_request(client: Any, request: Any) -> bool:
         from src.api.admin_router import _fa_max_log_submission_command
 
         reply = _fa_max_log_submission_command(payload)
-    else:
+    elif command == "/fa-max-file-update":
         from src.api.admin_router import _fa_max_file_update_command
         from src.core.database import get_db_context
 
         with get_db_context() as db:
             reply = _fa_max_file_update_command(payload, db)
+    else:
+        from src.api.admin_router import _fa_max_backflip_files_command
+        from src.core.database import get_db_context
+
+        with get_db_context() as db:
+            reply = _fa_max_backflip_files_command(payload, db)
 
     if reply.get("text"):
         # A reply with no text (e.g. _fa_max_log_submission_command's

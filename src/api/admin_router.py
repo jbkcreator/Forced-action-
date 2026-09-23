@@ -3340,6 +3340,46 @@ def _fa_max_log_submission_command(form: dict) -> dict:
     return {"response_type": "ephemeral"}
 
 
+def _fa_max_backflip_files_command(form: dict, db: Session) -> dict:
+    """
+    Pure logic for the Slack slash command '/fa-max-backflip-files' (no
+    arguments — lists open files with a Backflip reference on record).
+
+    Exists because /fa-max-file-update requires Josh to already know the
+    exact backflip_ref string, which he won't always remember -- this
+    lets him look it up instead of guessing. Deliberately a plain list
+    rather than a name-based fallback lookup on /fa-max-file-update
+    itself: the same borrower name can have multiple opportunities in
+    different stages, so resolving by name alone is ambiguous in exactly
+    the case this command exists to help with. Listing every ref sidesteps
+    that -- Josh picks the exact one himself, no disambiguation needed.
+
+    Same authorization gate as the other two FA Max commands.
+    """
+    channel_rejection = _reject_if_wrong_command_channel(form.get("channel_id", ""))
+    if channel_rejection is not None:
+        return channel_rejection
+    user_id = form.get("user_id", "")
+    if not _relay_approver_authorized(user_id, "fa_max_lending"):
+        return _slack_ephemeral("Not authorized to list FA Max files.")
+
+    rows = db.execute(
+        text("""
+            SELECT p.full_name, o.backflip_ref, o.current_stage
+            FROM fa_max_opportunities o
+            JOIN fa_max_persons p ON p.person_id = o.person_id
+            WHERE o.backflip_ref IS NOT NULL AND o.outcome = 'open'
+            ORDER BY o.updated_at DESC
+            LIMIT 25
+        """)
+    ).fetchall()
+    if not rows:
+        return _slack_ephemeral("No open files with a Backflip reference on record.")
+
+    lines = [f"{r.full_name or 'Unnamed'} — {r.backflip_ref} — {r.current_stage}" for r in rows]
+    return _slack_ephemeral("\n".join(lines))
+
+
 def _parse_slack_form(raw: bytes) -> dict:
     """Slack's slash-command HTTP body is form-encoded and parse_qs
     list-wraps every value; both slash-command routes just want the
@@ -3371,6 +3411,16 @@ async def slack_log_submission_command(request: Request):
         raise HTTPException(status_code=401, detail="Invalid Slack signature")
 
     return _fa_max_log_submission_command(_parse_slack_form(raw))
+
+
+@router.post("/slack/fa-max-backflip-files")
+async def slack_fa_max_backflip_files_command(request: Request, db: Session = Depends(get_db)):
+    """Slack slash command: '/fa-max-backflip-files' (no arguments — lists open files with a Backflip reference)."""
+    raw = await request.body()
+    if not _verify_slack_signature(dict(request.headers), raw):
+        raise HTTPException(status_code=401, detail="Invalid Slack signature")
+
+    return _fa_max_backflip_files_command(_parse_slack_form(raw), db)
 
 
 # ===========================================================================

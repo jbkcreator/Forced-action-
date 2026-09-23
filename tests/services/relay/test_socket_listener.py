@@ -268,6 +268,34 @@ class TestFaMaxSlashCommandRequest:
         assert socket_listener.handle_fa_max_slash_command_request(client, request) is False
         client.send_socket_mode_response.assert_not_called()
 
+    def test_backflip_files_acks_blank_then_replies_via_response_url(self):
+        client = mock.MagicMock()
+        payload = {
+            "command": "/fa-max-backflip-files",
+            "user_id": "U123", "channel_id": "C123",
+            "response_url": "https://hooks.slack.test/z",
+        }
+        request = _request("slash_commands", "env-9b", payload)
+        reply = {"response_type": "ephemeral", "text": "Jane Doe — bl1234 — under_review"}
+
+        with mock.patch(
+            "src.api.admin_router._fa_max_backflip_files_command", return_value=reply,
+        ) as mock_handle, mock.patch(
+            "src.core.database.get_db_context",
+        ) as mock_ctx, mock.patch(
+            "src.utils.http_helpers.requests_post_with_retry",
+        ) as mock_post:
+            mock_ctx.return_value.__enter__.return_value = mock.MagicMock()
+            mock_post.return_value = mock.Mock(status_code=200, text="ok")
+            handled = socket_listener.handle_fa_max_slash_command_request(client, request)
+
+        assert handled is True
+        mock_handle.assert_called_once()
+        assert mock_handle.call_args.args[0] == payload
+        sent = client.send_socket_mode_response.call_args.args[0]
+        assert sent.payload is None
+        mock_post.assert_called_once_with("https://hooks.slack.test/z", json=reply, timeout=5)
+
     def test_file_update_acks_blank_then_replies_via_response_url(self):
         client = mock.MagicMock()
         payload = {
