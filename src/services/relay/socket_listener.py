@@ -298,7 +298,14 @@ def handle_fa_max_slash_command_request(client: Any, request: Any) -> bool:
         with get_db_context() as db:
             reply = _fa_max_file_update_command(payload, db)
 
-    _post_slash_reply(response_url, reply)
+    if reply.get("text"):
+        # A reply with no text (e.g. _fa_max_log_submission_command's
+        # success case -- the modal already opened via views.open, there
+        # is nothing left to say) was harmless as a direct HTTP ack, but
+        # POSTing it to response_url is a real Slack API call, and Slack
+        # rejects a contentless ephemeral message with a 500. Simplest
+        # correct behavior: nothing to say means nothing to post.
+        _post_slash_reply(response_url, reply)
     return True
 
 

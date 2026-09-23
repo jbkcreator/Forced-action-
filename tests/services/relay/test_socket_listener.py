@@ -193,7 +193,14 @@ class TestFaMaxSlashCommandRequest:
         assert sent.payload is None
         mock_post.assert_called_once_with("https://hooks.slack.test/x", json=reply, timeout=5)
 
-    def test_log_submission_acks_blank_then_replies_via_response_url(self):
+    def test_log_submission_success_has_nothing_to_say_and_does_not_post(self):
+        # Regression: _fa_max_log_submission_command's success case
+        # returns {"response_type": "ephemeral"} with no "text" -- the
+        # modal already opened via views.open, there's nothing left to
+        # say. That's harmless as a direct HTTP ack, but POSTing it to
+        # response_url is a real Slack API call, and Slack rejects a
+        # contentless ephemeral with a 500 (confirmed against the live
+        # test app during manual E2E testing).
         client = mock.MagicMock()
         payload = {
             "command": "/fa-max-log-submission", "trigger_id": "trig-1",
@@ -208,11 +215,31 @@ class TestFaMaxSlashCommandRequest:
         ) as mock_handle, mock.patch(
             "src.utils.http_helpers.requests_post_with_retry",
         ) as mock_post:
-            mock_post.return_value = mock.Mock(status_code=200, text="ok")
             handled = socket_listener.handle_fa_max_slash_command_request(client, request)
 
         assert handled is True
         mock_handle.assert_called_once_with(payload)
+        mock_post.assert_not_called()
+
+    def test_log_submission_failure_reply_has_text_and_does_post(self):
+        client = mock.MagicMock()
+        payload = {
+            "command": "/fa-max-log-submission", "trigger_id": "trig-1",
+            "user_id": "U123", "channel_id": "C123",
+            "response_url": "https://hooks.slack.test/y",
+        }
+        request = _request("slash_commands", "env-10b", payload)
+        reply = {"response_type": "ephemeral", "text": "Couldn't open the form — try again in a moment."}
+
+        with mock.patch(
+            "src.api.admin_router._fa_max_log_submission_command", return_value=reply,
+        ), mock.patch(
+            "src.utils.http_helpers.requests_post_with_retry",
+        ) as mock_post:
+            mock_post.return_value = mock.Mock(status_code=200, text="ok")
+            handled = socket_listener.handle_fa_max_slash_command_request(client, request)
+
+        assert handled is True
         mock_post.assert_called_once_with("https://hooks.slack.test/y", json=reply, timeout=5)
 
     def test_missing_response_url_drops_reply_without_raising(self):
