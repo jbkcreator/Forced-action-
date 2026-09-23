@@ -781,7 +781,20 @@ def maybe_trigger_quote_ready_review(session: Session, *, opportunity_id: str) -
     no financials row, or the resulting scenario is identical to the last
     one already posted (re-entering 'scoping' from 'ready_to_submit' with
     unchanged facts must not re-spam a duplicate card).
+
+    Facts precedence (code-review finding, eighth round, 2026-09 — the T3-7
+    Qualification Agent's client-confirmed facts and this financials-derived
+    read were two disconnected sources of "current" deal facts, so a client
+    correction gathered by T3-7 was never reflected in the dossier Josh
+    actually reviews): T3-7's fa_max_opportunity_facts values, where present,
+    now override the raw financials read below via
+    fa_max_qualification.resolve_quote_ready_facts() — the SAME
+    client-always-wins-when-set precedence set_facts() already enforces on
+    the write side. financials/published-ARV remain the fallback for any
+    field the client hasn't confirmed (most commonly on an opportunity T3-7
+    never touched at all, or a pure enrichment-sourced field).
     """
+    from src.services.fa_max_qualification import resolve_quote_ready_facts
     from src.services.quote_ready.compute import compute_quote_ready
     from src.services.quote_ready.models import QuoteReadyInput
     from src.services.quote_ready.persistence import persist_quote_ready_result
@@ -808,23 +821,50 @@ def maybe_trigger_quote_ready_review(session: Session, *, opportunity_id: str) -
     else:
         arv, arv_source, arv_confidence = None, "legacy_financial.arv", "low"
 
+    # Resolve T3-7 facts over this financials/ARV fallback — FOR UPDATE
+    # locks the facts row for the rest of this function, so a concurrent
+    # set_facts() can't land between this read and persist_quote_ready_result()
+    # committing below without either being reflected in the OTHER's outcome.
+    resolved = resolve_quote_ready_facts(
+        session=session,
+        opportunity_id=opportunity_id,
+        fallback={
+            "estimated_value": fin["assessed_value_mkt"],
+            "last_sale_price": fin["last_sale_price"],
+            "rehab_estimate": fin["est_repair_cost"],
+            "rehab_source": "job_estimator",
+            "arv": arv,
+            "arv_source": arv_source,
+            "arv_confidence": arv_confidence,
+        },
+    )
+    facts_revision = resolved.pop("facts_revision")
+
     inp = QuoteReadyInput(
         opportunity_id=opportunity_id, property_id=property_id,
         max_ltc=_DEFAULT_MAX_LTC, max_ltv=_DEFAULT_MAX_LTV,
-        estimated_value=fin["assessed_value_mkt"], last_sale_price=fin["last_sale_price"],
-        rehab_estimate=fin["est_repair_cost"], rehab_source="job_estimator",
-        arv=arv, arv_source=arv_source, arv_confidence=arv_confidence,
+        purchase_price=resolved.get("purchase_price"),
+        estimated_value=resolved["estimated_value"],
+        assessed_value_mkt=resolved.get("assessed_value_mkt"),
+        last_sale_price=resolved["last_sale_price"],
+        rehab_estimate=resolved["rehab_estimate"], rehab_source=resolved["rehab_source"],
+        rehab_confidence=resolved.get("rehab_confidence"),
+        arv=resolved["arv"], arv_source=resolved["arv_source"], arv_confidence=resolved["arv_confidence"],
     )
     result = compute_quote_ready(inp)
 
     previous_id = session.execute(_LATEST_COMPUTED_FOR_TRIGGER_SQL, {"opportunity_id": opportunity_id}).scalar()
-    new_result_id = persist_quote_ready_result(session, inp=inp, result=result, computed_by="auto_trigger:scoping")
+    new_result_id = persist_quote_ready_result(
+        session, inp=inp, result=result,
+        computed_by=f"auto_trigger:scoping:facts_rev={facts_revision}",
+    )
 
     if new_result_id == previous_id:
         logger.info("[QuoteReady] auto-trigger for opportunity_id=%s: scenario unchanged, no new card posted",
                      opportunity_id)
         return
 
-    logger.info("[QuoteReady] auto-trigger posted dossier for opportunity_id=%s result_id=%s (missing=%s)",
-                opportunity_id, new_result_id, result.missing)
+    logger.info("[QuoteReady] auto-trigger posted dossier for opportunity_id=%s result_id=%s"
+                " facts_revision=%d (missing=%s)",
+                opportunity_id, new_result_id, facts_revision, result.missing)
     post_quote_ready_dossier(session, new_result_id)

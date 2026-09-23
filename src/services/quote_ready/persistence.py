@@ -220,6 +220,28 @@ _LATEST_COMPUTED_SQL = _text(
     """
 )
 
+# Matches uq_quote_ready_opp_hash_version's actual scope: (opportunity_id,
+# input_hash, calculation_version) with NO status filter (code-review
+# finding, eighth round, 2026-09). _LATEST_COMPUTED_SQL above only looks at
+# 'computed' rows for the supersede DECISION — correct for that purpose
+# (never clobber a reviewer's 'needs_review'/'approved'/'rejected' row) —
+# but persist_quote_ready_result() used ONLY that lookup to also decide
+# insert-vs-noop, so a recompute producing the exact same (hash, version)
+# as an existing NON-'computed' row (most commonly 'incomplete' — an
+# opportunity missing ARV, retried unchanged) found no 'latest', tried to
+# insert, and crashed on the unique constraint instead of returning the
+# existing row. Caught by the $20k/$50k precedence integration test's own
+# repeat-trigger-no-duplicate case.
+_EXACT_MATCH_ANY_STATUS_SQL = _text(
+    """
+    SELECT result_id::text AS result_id
+    FROM fa_max_quote_ready_results
+    WHERE opportunity_id = :opportunity_id ::uuid
+      AND input_hash = :input_hash AND calculation_version = :calculation_version
+    LIMIT 1
+    """
+)
+
 _MARK_SUPERSEDED_SQL = _text(
     "UPDATE fa_max_quote_ready_results SET status = 'superseded' WHERE result_id = :rid ::uuid"
 )
@@ -278,6 +300,22 @@ def persist_quote_ready_result(
     decision = decide_persistence(latest, new_hash, QUOTE_READY_CALC_VERSION)
     if decision.action == "noop":
         return decision.existing_result_id  # type: ignore[return-value]
+
+    # decide_persistence() only saw 'computed' rows — an exact (hash,
+    # version) match against a NON-'computed' row (e.g. 'incomplete') is
+    # invisible to it, but still collides with uq_quote_ready_opp_hash_version.
+    # Check the constraint's actual scope directly before attempting the
+    # insert, rather than letting Postgres reject it.
+    exact_match_id = session.execute(
+        _EXACT_MATCH_ANY_STATUS_SQL,
+        {
+            "opportunity_id": str(inp.opportunity_id),
+            "input_hash": new_hash,
+            "calculation_version": QUOTE_READY_CALC_VERSION,
+        },
+    ).scalar_one_or_none()
+    if exact_match_id is not None:
+        return exact_match_id
 
     row_dict = build_result_row(
         inp, result, computed_by=computed_by, supersedes_result_id=decision.supersedes_result_id,
