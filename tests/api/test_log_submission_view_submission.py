@@ -83,6 +83,22 @@ class TestLogSubmissionViewSubmission:
         assert backflip_calls[0].args[1]["backflip_ref"] == "BF-5521"
         assert backflip_calls[0].args[1]["opportunity_id"] == "opp-1"
 
+        # Regression: a bind param immediately followed by a Postgres cast
+        # with no space -- ":opportunity_id::uuid" -- is silently NOT
+        # recognized as a bind parameter by SQLAlchemy's text() at all
+        # (confirmed by direct .compile() reproduction; the convention
+        # elsewhere in this codebase is always ":name ::uuid", with a
+        # space). Every other test here mocks db.execute entirely, so
+        # this never gets caught unless something actually compiles the
+        # real TextClause -- do that here.
+        from sqlalchemy.dialects import postgresql
+
+        compiled = backflip_calls[0].args[0].compile(dialect=postgresql.dialect())
+        assert "opportunity_id" in compiled.params, (
+            "opportunity_id bind param not recognized by the SQL compiler -- "
+            "check for a missing space before a :: cast"
+        )
+
     def test_new_borrower_creates_person_then_opportunity(self):
         raw = _view_submission_payload(
             "fa_max_log_submission_submit",

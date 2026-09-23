@@ -2532,7 +2532,7 @@ def _handle_log_submission_view_submit(payload: dict, db: Session) -> dict:
                 "UPDATE fa_max_opportunities SET "
                 "backflip_ref = COALESCE(:backflip_ref, backflip_ref), "
                 "property_address = COALESCE(:property_address, property_address), "
-                "updated_at = NOW() WHERE opportunity_id = :opportunity_id::uuid"
+                "updated_at = NOW() WHERE opportunity_id = :opportunity_id ::uuid"
             ),
             {
                 "backflip_ref": backflip_ref, "property_address": property_address,
