@@ -19,19 +19,19 @@ class TestRejectIfWrongCommandChannel:
     def test_allows_when_setting_unset(self):
         with patch("src.api.admin_router.get_settings") as mock_settings:
             mock_settings.return_value.fa_max_slack_cc_channel = None
-            result = _reject_if_wrong_command_channel({"channel_id": ["C_ANYWHERE"]})
+            result = _reject_if_wrong_command_channel("C_ANYWHERE")
         assert result is None
 
     def test_allows_when_channel_matches(self):
         with patch("src.api.admin_router.get_settings") as mock_settings:
             mock_settings.return_value.fa_max_slack_cc_channel = "C_COMMAND_CENTER"
-            result = _reject_if_wrong_command_channel({"channel_id": ["C_COMMAND_CENTER"]})
+            result = _reject_if_wrong_command_channel("C_COMMAND_CENTER")
         assert result is None
 
     def test_rejects_when_channel_does_not_match(self):
         with patch("src.api.admin_router.get_settings") as mock_settings:
             mock_settings.return_value.fa_max_slack_cc_channel = "C_COMMAND_CENTER"
-            result = _reject_if_wrong_command_channel({"channel_id": ["C_SOME_OTHER_CHANNEL"]})
+            result = _reject_if_wrong_command_channel("C_SOME_OTHER_CHANNEL")
         assert result is not None
         assert "command center" in result["text"].lower()
 

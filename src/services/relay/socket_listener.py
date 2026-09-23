@@ -24,7 +24,7 @@ with ``connections:write`` scope).
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Optional
 
 from config.settings import get_settings
 
@@ -35,8 +35,9 @@ def handle_socket_request(client: Any, request: Any) -> bool:
     """Acknowledge and dispatch one Slack Socket Mode envelope this listener owns.
 
     Only ``events_api`` and ``interactive`` envelopes belong to this listener.
-    Other envelope types (e.g. ``slash_commands``, owned by
-    ``handle_tracked_link_socket_request``) are left un-acked and untouched so
+    Other envelope types (``slash_commands``, owned by
+    ``handle_tracked_link_socket_request`` or
+    ``handle_fa_max_slash_command_request``) are left un-acked and untouched so
     the listener that actually owns them can send Slack the real response —
     Slack Socket Mode resolves an envelope on its *first* acknowledgement, so
     acking here for an envelope this listener does not own would silently
@@ -50,11 +51,56 @@ def handle_socket_request(client: Any, request: Any) -> bool:
 
     from slack_sdk.socket_mode.response import SocketModeResponse
 
+    payload = request.payload or {}
+
+    # view_submission (WP-T2-6 log-submission modal, and the pre-existing
+    # Revise modal) and block_suggestion (borrower-search autocomplete)
+    # must carry their real response -- response_action / options -- IN
+    # the envelope's own acknowledgement. Unlike a slash command, there is
+    # no response_url-style side channel for a modal's validation display,
+    # so the handler has to run (fast: a handful of inserts/selects) before
+    # the single ack this envelope gets. This is why these two are checked
+    # before the blank ack below, which every other interactive/events_api
+    # envelope gets instead.
+    if request.type == "interactive" and payload.get("type") == "view_submission":
+        from src.api.admin_router import (
+            _handle_log_submission_view_submit,
+            _handle_relay_revise_submission,
+        )
+        from src.core.database import get_db_context
+
+        callback_id = payload.get("view", {}).get("callback_id")
+        if callback_id == "fa_max_revise_submit":
+            result = _handle_relay_revise_submission(payload)
+        elif callback_id == "fa_max_log_submission_submit":
+            with get_db_context() as db:
+                result = _handle_log_submission_view_submit(payload, db)
+        else:
+            result = {}
+        client.send_socket_mode_response(
+            SocketModeResponse(envelope_id=request.envelope_id, payload=result)
+        )
+        return True
+
+    if (
+        request.type == "interactive"
+        and payload.get("type") == "block_suggestion"
+        and payload.get("action_id") == "borrower_search"
+    ):
+        from src.api.admin_router import _handle_borrower_search_suggestion
+        from src.core.database import get_db_context
+
+        with get_db_context() as db:
+            result = _handle_borrower_search_suggestion(payload, db)
+        client.send_socket_mode_response(
+            SocketModeResponse(envelope_id=request.envelope_id, payload=result)
+        )
+        return True
+
     # Slack requires this acknowledgement within three seconds.  The durable
     # handler is intentionally called only after it, and remains idempotent.
     client.send_socket_mode_response(SocketModeResponse(envelope_id=request.envelope_id))
 
-    payload = request.payload or {}
     if request.type == "events_api":
         # Socket Mode delivers subscribed Events API payloads in an
         # ``events_api`` envelope. Reuse the HTTP route's thread-command
@@ -172,6 +218,74 @@ def _post_socket_ephemeral(client: Any, payload: dict, result: dict) -> None:
         logger.warning("[RelaySocket] could not post ephemeral reply: %s", text)
 
 
+_FA_MAX_SLASH_COMMANDS = frozenset({"/fa-max-log-submission", "/fa-max-file-update"})
+
+
+def _post_slash_reply(response_url: Optional[str], reply: dict) -> None:
+    """Deliver a slash command's reply after the 3-second ack window has
+    already been used. Best-effort: Slack has nothing to retry against if
+    this fails, so log and move on rather than raising into the listener.
+
+    Local copy of src/services/tracked_links.py's helper of the same
+    name and shape -- small enough that duplicating it keeps each
+    listener's Slack reply plumbing independent, matching this module's
+    own contract of unrelated workflows never stepping on each other.
+    """
+    if not response_url:
+        logger.warning("[FaMaxSlash] no response_url on envelope, reply dropped")
+        return
+    from src.utils.http_helpers import requests_post_with_retry
+
+    try:
+        resp = requests_post_with_retry(response_url, json=reply, timeout=5)
+        logger.info("[FaMaxSlash] response_url POST -> status=%s", resp.status_code)
+    except Exception:
+        logger.exception("[FaMaxSlash] failed to deliver reply via response_url")
+
+
+def handle_fa_max_slash_command_request(client: Any, request: Any) -> bool:
+    """Socket Mode envelope handler for '/fa-max-log-submission' and
+    '/fa-max-file-update' (WP-T2-6). This Slack app has no Interactivity/
+    slash-command Request URL option once Socket Mode is enabled, so
+    these two commands -- and view_submission/block_suggestion, handled
+    in handle_socket_request above -- are unreachable via the HTTP routes
+    in src/api/admin_router.py in this deployment. The same pure functions
+    those routes call are reused here rather than duplicated.
+
+    Returns True only when this listener handled one of these two
+    commands -- every other envelope is left untouched, same contract as
+    handle_tracked_link_socket_request.
+    """
+    if request.type != "slash_commands":
+        return False
+    payload = request.payload or {}
+    command = payload.get("command")
+    if command not in _FA_MAX_SLASH_COMMANDS:
+        return False
+
+    from slack_sdk.socket_mode.response import SocketModeResponse
+
+    # Ack bare immediately, same discipline as _on_request /
+    # handle_tracked_link_socket_request -- the real reply goes out via
+    # response_url once the (fast) DB work below is done.
+    client.send_socket_mode_response(SocketModeResponse(envelope_id=request.envelope_id))
+
+    response_url = payload.get("response_url")
+    if command == "/fa-max-log-submission":
+        from src.api.admin_router import _fa_max_log_submission_command
+
+        reply = _fa_max_log_submission_command(payload)
+    else:
+        from src.api.admin_router import _fa_max_file_update_command
+        from src.core.database import get_db_context
+
+        with get_db_context() as db:
+            reply = _fa_max_file_update_command(payload, db)
+
+    _post_slash_reply(response_url, reply)
+    return True
+
+
 def run() -> None:
     """Connect the Relay listener and keep it alive until the service stops."""
     settings = get_settings()
@@ -225,8 +339,15 @@ def run() -> None:
         except Exception:
             logger.exception("[RelaySocket] failed to process /tracked-link request")
 
+    def _on_fa_max_slash_request(client: Any, request: Any) -> None:
+        try:
+            handle_fa_max_slash_command_request(client, request)
+        except Exception:
+            logger.exception("[RelaySocket] failed to process FA Max slash command request")
+
     socket.socket_mode_request_listeners.append(_on_request)
     socket.socket_mode_request_listeners.append(_on_tracked_link_request)
+    socket.socket_mode_request_listeners.append(_on_fa_max_slash_request)
     logger.info("[RelaySocket] connecting via Socket Mode")
     socket.connect()
 

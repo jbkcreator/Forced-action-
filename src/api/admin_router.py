@@ -1636,19 +1636,23 @@ def _slack_ephemeral(text: str) -> dict:
     return {"response_type": "ephemeral", "text": text}
 
 
-def _reject_if_wrong_command_channel(form: dict) -> Optional[dict]:
+def _reject_if_wrong_command_channel(channel_id: str) -> Optional[dict]:
     """Shared gate for both FA Max pipeline slash commands, per the
     client's decision that the Command Center channel is where Josh
     manages submissions, status updates, and questions — all of it, one
     place. Unset setting means the channel hasn't been configured yet and
     fails OPEN (never lock Josh out of his own commands before the
     channel ID exists) — see plan Task 21's design note.
+
+    Takes a plain channel_id string rather than a raw Slack form dict so
+    both the HTTP Request-URL route (parse_qs, list-wrapped values) and
+    the Socket Mode slash-command listener (already-scalar payload dict)
+    can call it after normalizing to the same shape.
     """
     required_channel = get_settings().fa_max_slack_cc_channel
     if not required_channel:
         return None
-    actual_channel = form.get("channel_id", [""])[0]
-    if actual_channel == required_channel:
+    if channel_id == required_channel:
         return None
     return _slack_ephemeral(
         "Please use this command in the Command Center channel (#fa-max-command-center), not here."
@@ -3132,10 +3136,9 @@ async def slack_resume_command(request: Request):
     return _slack_ephemeral(f"✅ RESUME {target} — kill switch override cleared.")
 
 
-@router.post("/slack/fa-max-file-update")
-async def slack_fa_max_file_update_command(request: Request, db: Session = Depends(get_db)):
+def _fa_max_file_update_command(form: dict, db: Session) -> dict:
     """
-    Slack slash command (WP-T2-6):
+    Pure logic for the Slack slash command (WP-T2-6):
         /fa-max-file-update <backflip_ref> <stage>
         /fa-max-file-update <backflip_ref> doc:<document name>
         /fa-max-file-update <backflip_ref> received:<document name>
@@ -3148,24 +3151,27 @@ async def slack_fa_max_file_update_command(request: Request, db: Session = Depen
 
     Same authorization gate as /relay-kill — relay_approvers, since manually
     moving a file's stage/document state is at least as consequential.
+
+    Takes an already-scalar form dict (not Slack's raw list-wrapped
+    parse_qs shape) so both the HTTP Request-URL route below and the
+    Socket Mode slash-command listener (src/services/relay/socket_listener.py)
+    can share it. This app has no Interactivity/slash-command Request URL
+    option once Socket Mode is enabled, so the HTTP route is reachable
+    only on a dev/test app running with Socket Mode off — the Socket Mode
+    listener is what actually serves this command in production.
     """
     from config.fa_max_stage_monitoring import BACKFLIP_STAGE_KEYS
     from src.agents.reply_concierge.backflip_stage_ingest import resolve_opportunity_by_backflip_ref
     from src.services import fa_max_file_state
 
-    raw = await request.body()
-    if not _verify_slack_signature(dict(request.headers), raw):
-        raise HTTPException(status_code=401, detail="Invalid Slack signature")
-
-    form = parse_qs(raw.decode("utf-8"))
-    channel_rejection = _reject_if_wrong_command_channel(form)
+    channel_rejection = _reject_if_wrong_command_channel(form.get("channel_id", ""))
     if channel_rejection is not None:
         return channel_rejection
-    user_id = form.get("user_id", [""])[0]
+    user_id = form.get("user_id", "")
     if not _relay_approver_authorized(user_id, "fa_max_lending"):
         return _slack_ephemeral("Not authorized to update FA Max file state.")
 
-    tokens = form.get("text", [""])[0].strip().split(maxsplit=1)
+    tokens = (form.get("text") or "").strip().split(maxsplit=1)
     if len(tokens) != 2:
         return _slack_ephemeral(
             "Usage: /fa-max-file-update <backflip_ref> <stage> | "
@@ -3233,32 +3239,62 @@ async def slack_fa_max_file_update_command(request: Request, db: Session = Depen
     return _slack_ephemeral(f"{backflip_ref} updated to stage: {stage}.")
 
 
-@router.post("/slack/fa-max-log-submission")
-async def slack_log_submission_command(request: Request):
+def _fa_max_log_submission_command(form: dict) -> dict:
     """
-    Slack slash command: '/fa-max-log-submission' (no arguments — opens a
-    modal). Addendum to WP-T2-6: records the moment Josh submits a deal to
-    Backflip, which nothing else in this codebase does today (backflip_ref
-    was previously only ever created downstream, when terms arrive).
+    Pure logic for the Slack slash command '/fa-max-log-submission' (no
+    arguments — opens a modal). Addendum to WP-T2-6: records the moment
+    Josh submits a deal to Backflip, which nothing else in this codebase
+    does today (backflip_ref was previously only ever created downstream,
+    when terms arrive).
 
-    Same authorization gate as /fa-max-file-update — relay_approvers.
+    Same authorization gate as /fa-max-file-update — relay_approvers. See
+    _fa_max_file_update_command's docstring for why this takes an
+    already-scalar form dict and is shared with the Socket Mode listener.
+    """
+    channel_rejection = _reject_if_wrong_command_channel(form.get("channel_id", ""))
+    if channel_rejection is not None:
+        return channel_rejection
+    user_id = form.get("user_id", "")
+    if not _relay_approver_authorized(user_id, "fa_max_lending"):
+        return _slack_ephemeral("Not authorized to log a Backflip submission.")
+
+    trigger_id = form.get("trigger_id", "")
+    if not open_log_submission_modal(trigger_id):
+        return _slack_ephemeral("Couldn't open the form — try again in a moment.")
+    return {"response_type": "ephemeral"}
+
+
+def _parse_slack_form(raw: bytes) -> dict:
+    """Slack's slash-command HTTP body is form-encoded and parse_qs
+    list-wraps every value; both slash-command routes just want the
+    first (only) value per key, matching the already-scalar shape Socket
+    Mode delivers the same payload in."""
+    return {k: v[0] for k, v in parse_qs(raw.decode("utf-8")).items()}
+
+
+@router.post("/slack/fa-max-file-update")
+async def slack_fa_max_file_update_command(request: Request, db: Session = Depends(get_db)):
+    """
+    Slack slash command (WP-T2-6):
+        /fa-max-file-update <backflip_ref> <stage>
+        /fa-max-file-update <backflip_ref> doc:<document name>
+        /fa-max-file-update <backflip_ref> received:<document name>
     """
     raw = await request.body()
     if not _verify_slack_signature(dict(request.headers), raw):
         raise HTTPException(status_code=401, detail="Invalid Slack signature")
 
-    form = parse_qs(raw.decode("utf-8"))
-    channel_rejection = _reject_if_wrong_command_channel(form)
-    if channel_rejection is not None:
-        return channel_rejection
-    user_id = form.get("user_id", [""])[0]
-    if not _relay_approver_authorized(user_id, "fa_max_lending"):
-        return _slack_ephemeral("Not authorized to log a Backflip submission.")
+    return _fa_max_file_update_command(_parse_slack_form(raw), db)
 
-    trigger_id = form.get("trigger_id", [""])[0]
-    if not open_log_submission_modal(trigger_id):
-        return _slack_ephemeral("Couldn't open the form — try again in a moment.")
-    return {"response_type": "ephemeral"}
+
+@router.post("/slack/fa-max-log-submission")
+async def slack_log_submission_command(request: Request):
+    """Slack slash command: '/fa-max-log-submission' (no arguments — opens a modal)."""
+    raw = await request.body()
+    if not _verify_slack_signature(dict(request.headers), raw):
+        raise HTTPException(status_code=401, detail="Invalid Slack signature")
+
+    return _fa_max_log_submission_command(_parse_slack_form(raw))
 
 
 # ===========================================================================
