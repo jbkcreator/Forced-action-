@@ -886,3 +886,29 @@ class TestFasterWhisperTranscriber:
         with open(sample, "rb") as fh:
             text = FasterWhisperTranscriber("small.en", 2).transcribe(fh.read(), sample, "audio/mpeg")
         assert len(text.split()) > 5
+
+
+class TestDialListTapsOnFaMaxSocket:
+    """deliver_dial_list posts cards with the FA Max bot, so Slack sends their
+    button taps to the FA Max socket, which must dispatch them."""
+
+    @pytest.mark.parametrize("action_id", ["dial_log_call", "dial_called", "dial_won", "dial_lost", "dial_skip"])
+    def test_dial_actions_reach_dial_list_handler(self, action_id):
+        from contextlib import contextmanager
+        from src.services.relay import socket_listener as sl
+
+        @contextmanager
+        def _ctx():
+            yield MagicMock()
+
+        payload = {"type": "block_actions", "user": {"id": "U_JOSH"},
+                   "actions": [{"action_id": action_id, "value": "{}"}]}
+        req = MagicMock(type="interactive", envelope_id="e1", payload=payload)
+        client = MagicMock()
+        with patch("src.core.database.get_db_context", _ctx), \
+             patch("src.services.dial_list.actions.handle_action") as handle, \
+             patch("src.api.admin_router._handle_relay_decision") as relay_decision:
+            assert sl.handle_socket_request(client, req) is True
+        handle.assert_called_once()
+        assert handle.call_args.kwargs["client"] is client.web_client
+        relay_decision.assert_not_called()
