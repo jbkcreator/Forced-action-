@@ -567,9 +567,35 @@ class TestNoHallucination:
                                params={"color": "green"}),
                 db,
             )
-        # Empty rows → honest "0 ...", never a fabricated count.
-        assert "0 open opportunities" in reply
-        assert not any(c.isdigit() and c != "0" for c in reply.replace("0 open", ""))
+        # A DB error must NOT read as a confirmed zero — it must surface as an
+        # honest "couldn't retrieve" reply, distinct from a real empty result.
+        assert "0 open opportunities" not in reply
+        assert "Couldn't retrieve" in reply
+        assert not any(ch.isdigit() for ch in reply)
+
+    def test_db_error_reply_differs_from_confirmed_zero(self):
+        """The error reply and a genuine empty result must be distinguishable."""
+        from src.services.relay import thread_fallback_responder as tfr
+        db = MagicMock()
+
+        with patch.object(
+            tfr, "_execute_catalog_query", return_value={"error": "timeout"},
+        ):
+            error_reply = tfr._run_catalog_lookup(
+                ClassifyResult(bucket=Bucket.SIMPLE_LOOKUP, lookup_id="count_by_color",
+                               params={"color": "green"}),
+                db,
+            )
+        with patch.object(
+            tfr, "_execute_catalog_query", return_value={"rows": [], "count": 0},
+        ):
+            zero_reply = tfr._run_catalog_lookup(
+                ClassifyResult(bucket=Bucket.SIMPLE_LOOKUP, lookup_id="count_by_color",
+                               params={"color": "green"}),
+                db,
+            )
+        assert error_reply != zero_reply
+        assert "0 open opportunities" in zero_reply
 
     def test_catalog_query_never_raises(self):
         """Even a raising DB session returns a safe string, not an exception."""

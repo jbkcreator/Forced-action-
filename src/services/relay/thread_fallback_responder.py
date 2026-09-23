@@ -251,6 +251,24 @@ def _execute_catalog_query(
 # Catalog queries — parameterized, read-only; all SQL is a compile-time constant
 # ---------------------------------------------------------------------------
 
+class _CatalogQueryError(Exception):
+    """A catalog query failed at the DB layer. Raised by the _query_* helpers
+    so the dispatcher short-circuits to the honest "couldn't retrieve" reply
+    instead of a formatter turning an error into a confident zero."""
+
+
+def _rows_or_raise(result: dict[str, Any]) -> list[dict[str, Any]]:
+    if result.get("error") is not None:
+        raise _CatalogQueryError(result["error"])
+    return result.get("rows", [])
+
+
+def _row_or_raise(result: dict[str, Any]) -> Optional[dict[str, Any]]:
+    if result.get("error") is not None:
+        raise _CatalogQueryError(result["error"])
+    return result.get("row")
+
+
 def _query_count_by_color(
     db: Session, color: Optional[str], today: bool
 ) -> list[dict[str, Any]]:
@@ -264,7 +282,7 @@ def _query_count_by_color(
         ORDER BY gyr_color
     """
     result = _execute_catalog_query(db, sql, {"color": color, "today": today})
-    return result.get("rows", [])
+    return _rows_or_raise(result)
 
 
 def _query_top_uncalled_deal(db: Session) -> Optional[dict[str, Any]]:
@@ -291,7 +309,7 @@ def _query_top_uncalled_deal(db: Session) -> Optional[dict[str, Any]]:
         LIMIT 1
     """
     result = _execute_catalog_query(db, sql, multi_row=False)
-    return result.get("row")
+    return _row_or_raise(result)
 
 
 def _query_source_staleness(
@@ -314,7 +332,7 @@ def _query_source_staleness(
         db, sql,
         {"source": source, "source_pattern": f"%{source}%" if source else None},
     )
-    return result.get("rows", [])
+    return _rows_or_raise(result)
 
 
 def _query_deal_status(db: Session, address: str) -> Optional[dict[str, Any]]:
@@ -336,7 +354,7 @@ def _query_deal_status(db: Session, address: str) -> Optional[dict[str, Any]]:
         LIMIT 1
     """
     result = _execute_catalog_query(db, sql, {"address_pattern": f"%{address}%"}, multi_row=False)
-    return result.get("row")
+    return _row_or_raise(result)
 
 
 # ---------------------------------------------------------------------------
