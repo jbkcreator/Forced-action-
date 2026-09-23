@@ -397,3 +397,164 @@ class TestButtons:
         with patch.object(admin_router, handler, return_value={}) as h:
             assert socket_listener.handle_socket_request(MagicMock(), request) is True
         h.assert_called_once()
+
+
+# ── ticket 03: revision log (working memory) ─────────────────────────────────
+
+def _queue_row(**over) -> dict:
+    row = {
+        "id": 7, "idempotency_key": "k", "channel": "email", "recipient": "a@b.com",
+        "payload": {"body": "new"}, "thread_id": None, "status": "pending", "batch_id": None,
+        "decided_by": None, "error": None, "dispatched_at": None, "created_at": None,
+        "venture_key": "fa_max_lending", "lane": "MONEY", "agent_name": "cora",
+        "autonomy_tier_at_send": "A", "person_id": "p1", "autonomy_gate_reason": None,
+        "decision_interaction_id": None, "send_interaction_id": None,
+        "slack_post_attempted_at": None, "slack_post_lease_until": None, "eligible_at": None,
+        "original_draft": "orig", "final_content": "new", "revision_count": 3,
+        "last_revised_by": "slack_nl:U1", "last_revised_at": None, "material_edit": True,
+        "slack_message_ts": None, "decided_at": None,
+    }
+    row.update(over)
+    return row
+
+
+def _fake_ctx(session):
+    ctx = MagicMock()
+    ctx.return_value.__enter__ = MagicMock(return_value=session)
+    ctx.return_value.__exit__ = MagicMock(return_value=False)
+    return ctx
+
+
+class TestRecordRevisionLog:
+    def test_log_row_written_in_same_session_with_revision_no(self):
+        from src.services.relay import queue as rq
+
+        session = MagicMock()
+        session.execute.return_value.mappings.return_value.first.return_value = _queue_row()
+        with patch("src.services.relay.queue.get_db_context", _fake_ctx(session)):
+            rq.record_revision(
+                7, final_content="new", revised_by="slack_nl:U1", material_edit=True,
+                log=rq.RevisionLogEntry(source="nl", before_text="old", instruction="shorter"),
+            )
+        assert session.execute.call_count == 2
+        sql, params = session.execute.call_args.args
+        assert "INSERT INTO fa_max_draft_revisions" in str(sql)
+        assert params["revision_no"] == 3 and params["source"] == "nl"
+        assert params["before_text"] == "old" and params["after_text"] == "new"
+        assert params["instruction"] == "shorter" and params["material_edit"] is True
+
+    def test_not_pending_writes_no_log(self):
+        from src.services.relay import queue as rq
+
+        session = MagicMock()
+        session.execute.return_value.mappings.return_value.first.return_value = None
+        with patch("src.services.relay.queue.get_db_context", _fake_ctx(session)):
+            out = rq.record_revision(
+                7, final_content="new", revised_by="slack:U1", material_edit=False,
+                log=rq.RevisionLogEntry(source="modal", before_text="old"),
+            )
+        assert out is None and session.execute.call_count == 1
+
+    def test_rejects_unknown_source(self):
+        from src.services.relay import queue as rq
+
+        with pytest.raises(ValueError):
+            rq.RevisionLogEntry(source="bogus", before_text="x")
+
+
+class TestRevisionHistory:
+    def test_history_labels_nl_and_modal_in_order(self):
+        from src.services.relay import queue as rq
+
+        session = MagicMock()
+        session.execute.return_value.mappings.return_value.all.return_value = [
+            {"source": "nl", "instruction": "drop the address"},
+            {"source": "modal", "instruction": None},
+        ]
+        with patch("src.services.relay.queue.get_db_context", _fake_ctx(session)):
+            assert rq.get_revision_history(7) == ["drop the address", "(manual text edit)"]
+        assert "ORDER BY revision_no" in str(session.execute.call_args.args[0])
+
+    def test_prompt_includes_history(self):
+        llm = MagicMock(return_value="x")
+        nl_revision.revise_draft(
+            instruction="put the address back", original="ORIG", current="CURR",
+            history=["drop the address"], llm=llm,
+        )
+        assert "drop the address" in llm.call_args.args[1]
+
+
+class TestApplyPassesLogAndHistory:
+    def _apply(self, existing, **kwargs):
+        from src.api import admin_router
+
+        with patch("src.services.relay.queue.record_revision", return_value=_item(revision_count=1)) as rec, \
+             patch.object(admin_router, "_post_relay_thread_note"), \
+             patch("src.services.relay.slack_post.refresh_card_after_revision", return_value=True):
+            admin_router._apply_draft_revision(existing, "NEW", **kwargs)
+        return rec.call_args.kwargs["log"]
+
+    def test_nl_revision_logs_instruction_and_before_text(self):
+        log = self._apply(_item(final_content="CURRENT", original_draft="ORIGINAL"),
+                          revised_by="slack_nl:U1", source="nl", instruction="shorter")
+        assert (log.source, log.before_text, log.instruction) == ("nl", "CURRENT", "shorter")
+
+    def test_modal_revision_logs_modal_source(self):
+        log = self._apply(_item(final_content=None, original_draft="ORIGINAL"), revised_by="slack:U1")
+        assert (log.source, log.before_text, log.instruction) == ("modal", "ORIGINAL", None)
+
+    def _nl_history_seen(self, history_patch):
+        from src.api import admin_router
+
+        with patch.object(admin_router, "_clear_pending_slot"), \
+             patch("src.services.relay.queue.get_revision_history", **history_patch), \
+             patch.object(admin_router.nl_revision, "revise_draft",
+                          return_value=nl_revision.RevisionResult(ok=False, reason="llm_error")) as revise, \
+             patch.object(admin_router, "_post_relay_thread_note"):
+            admin_router._apply_nl_revision(_item(), "put it back", "U1")
+        return revise.call_args.kwargs["history"]
+
+    def test_nl_revision_feeds_history_into_rewrite(self):
+        assert self._nl_history_seen({"return_value": ["drop the address"]}) == ["drop the address"]
+
+    def test_history_lookup_failure_degrades_to_empty(self):
+        from sqlalchemy.exc import OperationalError
+
+        assert self._nl_history_seen({"side_effect": OperationalError("x", {}, None)}) == []
+
+
+# ── ticket 03: DB-backed (shared DB, self-cleaning) ──────────────────────────
+
+class TestRevisionLogDb:
+    def test_modal_then_nl_writes_two_ordered_log_rows(self):
+        from sqlalchemy import text as sql
+        from src.core.database import get_db_context
+        from src.services.relay import queue as rq
+
+        key = f"wp-t3-1-test-{datetime.now(timezone.utc).timestamp()}"
+        with get_db_context() as s:
+            item_id = s.execute(sql(
+                "INSERT INTO relay_approval_queue "
+                "(idempotency_key, channel, recipient, payload, original_draft) "
+                "VALUES (:k, 'email', 'test@example.com', CAST(:p AS jsonb), 'orig') RETURNING id"
+            ), {"k": key, "p": json.dumps({"body": "orig"})}).scalar_one()
+        try:
+            rq.record_revision(item_id, final_content="edited by hand", revised_by="slack:U1",
+                               material_edit=True, log=rq.RevisionLogEntry(source="modal", before_text="orig"))
+            rq.record_revision(item_id, final_content="shorter", revised_by="slack_nl:U1", material_edit=True,
+                               log=rq.RevisionLogEntry(source="nl", before_text="edited by hand",
+                                                       instruction="shorter"))
+            with get_db_context() as s:
+                rows = s.execute(sql(
+                    "SELECT revision_no, source, instruction, before_text, after_text "
+                    "FROM fa_max_draft_revisions WHERE relay_item_id = :id ORDER BY revision_no"
+                ), {"id": item_id}).all()
+            assert [tuple(r) for r in rows] == [
+                (1, "modal", None, "orig", "edited by hand"),
+                (2, "nl", "shorter", "edited by hand", "shorter"),
+            ]
+            assert rq.get_revision_history(item_id) == ["(manual text edit)", "shorter"]
+        finally:
+            with get_db_context() as s:
+                s.execute(sql("DELETE FROM fa_max_draft_revisions WHERE relay_item_id = :id"), {"id": item_id})
+                s.execute(sql("DELETE FROM relay_approval_queue WHERE id = :id"), {"id": item_id})

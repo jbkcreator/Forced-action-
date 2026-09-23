@@ -12349,6 +12349,38 @@ class FaMaxPendingSlot(Base):
     )
 
 
+class FaMaxDraftRevision(Base):
+    """WP-T3-1 — append-only history of every revision to a relay draft.
+
+    Written in the same transaction as relay.queue.record_revision (modal
+    Edit text and NL Revise alike). Read back as the NL rewrite's working
+    memory. Never updated or deleted.
+    """
+
+    __tablename__ = "fa_max_draft_revisions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    relay_item_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("relay_approval_queue.id"), nullable=False
+    )
+    revision_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    source: Mapped[str] = mapped_column(String(10), nullable=False)
+    instruction: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    before_text: Mapped[str] = mapped_column(Text, nullable=False)
+    after_text: Mapped[str] = mapped_column(Text, nullable=False)
+    material_edit: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    revised_by: Mapped[str] = mapped_column(String(80), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("source IN ('modal','nl')", name="ck_fa_max_draft_revision_source"),
+        UniqueConstraint("relay_item_id", "revision_no", name="uq_fa_max_draft_revision_item_no"),
+        Index("ix_fa_max_draft_revisions_item", "relay_item_id"),
+    )
+
+
 class FaMaxGyrRoutingLog(Base):
     """Immutable audit log — one row per GYR routing decision (WP-T2-11).
 

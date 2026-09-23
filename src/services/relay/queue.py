@@ -957,8 +957,39 @@ def capture_original_draft(item_id: int, *, draft: str) -> None:
         )
 
 
+REVISION_SOURCES = frozenset({"modal", "nl"})
+MANUAL_EDIT_LABEL = "(manual text edit)"
+
+
+@dataclass(frozen=True)
+class RevisionLogEntry:
+    """One fa_max_draft_revisions row (WP-T3-1): the draft's working memory."""
+    source: str
+    before_text: str
+    instruction: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.source not in REVISION_SOURCES:
+            raise ValueError(f"unknown revision source: {self.source!r}")
+
+
+def get_revision_history(item_id: int) -> list[str]:
+    """Earlier revision steps for a draft, oldest first — NL instructions
+    verbatim, full-text edits as a fixed label."""
+    with get_db_context() as session:
+        rows = session.execute(
+            text(
+                "SELECT source, instruction FROM fa_max_draft_revisions "
+                "WHERE relay_item_id = :id ORDER BY revision_no"
+            ),
+            {"id": item_id},
+        ).mappings().all()
+    return [r["instruction"] if r["source"] == "nl" and r["instruction"] else MANUAL_EDIT_LABEL for r in rows]
+
+
 def record_revision(
     item_id: int, *, final_content: str, revised_by: str, material_edit: bool,
+    log: Optional[RevisionLogEntry] = None,
 ) -> Optional[QueueItem]:
     """Apply a Slack Revise submission (WP-T2-2): set final_content,
     increment revision_count, stamp last_revised_by/at, store the computed
@@ -983,6 +1014,10 @@ def record_revision(
     the row's current material_edit, so a run of individually-small edits
     that add up to a large overall change is never diluted back to
     "not material" by comparing each edit only to its immediate predecessor.
+
+    When `log` is given, the matching fa_max_draft_revisions row is written
+    in the SAME transaction, numbered by the row's new revision_count — a
+    revision and its history entry commit together or not at all.
 
     Returns the updated row, or None if the row was not pending (stale
     revise submission on an already-decided card).
@@ -1010,7 +1045,25 @@ def record_revision(
                 "pending": STATUS_PENDING,
             },
         ).mappings().first()
-        return _row_to_item(dict(row)) if row else None
+        if row is None:
+            return None
+        if log is not None:
+            session.execute(
+                text(
+                    "INSERT INTO fa_max_draft_revisions "
+                    "(relay_item_id, revision_no, source, instruction, before_text, "
+                    " after_text, material_edit, revised_by) "
+                    "VALUES (:item_id, :revision_no, :source, :instruction, :before_text, "
+                    " :after_text, :material_edit, :revised_by)"
+                ),
+                {
+                    "item_id": item_id, "revision_no": row["revision_count"],
+                    "source": log.source, "instruction": log.instruction,
+                    "before_text": log.before_text, "after_text": final_content,
+                    "material_edit": material_edit, "revised_by": revised_by,
+                },
+            )
+        return _row_to_item(dict(row))
 
 
 def mark_skipped(item_id: int, reason: str) -> bool:

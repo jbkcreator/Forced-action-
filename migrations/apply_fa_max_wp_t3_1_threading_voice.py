@@ -1,8 +1,9 @@
 """WP-T3-1 — Slack threading & voice-note intake tables.
 
 fa_max_pending_slots: one short-lived Revise / Log-call slot per approver.
+fa_max_draft_revisions: append-only revision history per relay draft (working memory).
 
-Safe to re-run — all DDL is IF NOT EXISTS. Independent of other FA Max tables.
+Safe to re-run — all DDL is IF NOT EXISTS. Requires relay_approval_queue (FK).
 
 Usage:
     PYTHONPATH=. python migrations/apply_fa_max_wp_t3_1_threading_voice.py
@@ -13,7 +14,7 @@ from sqlalchemy import text
 
 from src.core.database import get_db_context
 
-TABLES = ("fa_max_pending_slots",)
+TABLES = ("fa_max_pending_slots", "fa_max_draft_revisions")
 
 STATEMENTS: list[tuple[str, str]] = [
     (
@@ -28,6 +29,32 @@ STATEMENTS: list[tuple[str, str]] = [
             set_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
             CONSTRAINT ck_fa_max_pending_slot_kind CHECK (kind IN ('revise', 'voice'))
         );
+        """,
+    ),
+    (
+        "CREATE fa_max_draft_revisions",
+        """
+        CREATE TABLE IF NOT EXISTS fa_max_draft_revisions (
+            id              BIGSERIAL PRIMARY KEY,
+            relay_item_id   BIGINT NOT NULL REFERENCES relay_approval_queue (id),
+            revision_no     INTEGER NOT NULL,
+            source          VARCHAR(10) NOT NULL,
+            instruction     TEXT,
+            before_text     TEXT NOT NULL,
+            after_text      TEXT NOT NULL,
+            material_edit   BOOLEAN NOT NULL,
+            revised_by      VARCHAR(80) NOT NULL,
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+            CONSTRAINT ck_fa_max_draft_revision_source CHECK (source IN ('modal', 'nl')),
+            CONSTRAINT uq_fa_max_draft_revision_item_no UNIQUE (relay_item_id, revision_no)
+        );
+        """,
+    ),
+    (
+        "INDEX ix_fa_max_draft_revisions_item",
+        """
+        CREATE INDEX IF NOT EXISTS ix_fa_max_draft_revisions_item
+            ON fa_max_draft_revisions (relay_item_id);
         """,
     ),
 ]

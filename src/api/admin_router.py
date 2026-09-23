@@ -2543,6 +2543,7 @@ def _apply_nl_revision(item, instruction: str, user_id: str) -> None:
         instruction=instruction,
         original=original,
         current=item.final_content or original,
+        history=_revision_history(item.id),
         llm=nl_revision.claude_llm,
     )
     if result.reason == "embellishment":
@@ -2555,7 +2556,9 @@ def _apply_nl_revision(item, instruction: str, user_id: str) -> None:
     if not result.ok:
         _post_relay_thread_note(item, ":warning: Couldn't revise — try again, or use Edit text.")
         return
-    revised, _, refreshed = _apply_draft_revision(item, result.text, revised_by=f"slack_nl:{user_id}")
+    revised, _, refreshed = _apply_draft_revision(
+        item, result.text, revised_by=f"slack_nl:{user_id}", source="nl", instruction=instruction,
+    )
     if revised is None:
         _post_relay_thread_note(item, f"Item #{item.id} is no longer pending — nothing revised.")
     elif not refreshed:
@@ -2564,7 +2567,23 @@ def _apply_nl_revision(item, instruction: str, user_id: str) -> None:
         )
 
 
-def _apply_draft_revision(existing, new_text: str, *, revised_by: str):
+def _revision_history(item_id: int) -> list[str]:
+    """Working memory for the rewrite prompt; a lookup failure only loses
+    context, it never blocks the revision."""
+    from sqlalchemy.exc import SQLAlchemyError
+    from src.services.relay import queue as relay_queue
+
+    try:
+        return relay_queue.get_revision_history(item_id)
+    except SQLAlchemyError as exc:
+        logger.error("[RelayInteract] revision history lookup failed: %s", type(exc).__name__)
+        return []
+
+
+def _apply_draft_revision(
+    existing, new_text: str, *, revised_by: str,
+    source: str = "modal", instruction: Optional[str] = None,
+):
     """Persist one revision (modal or NL) and refresh the card in place.
 
     Returns (item | None, material_edit, card_refreshed). item is None when
@@ -2579,6 +2598,9 @@ def _apply_draft_revision(existing, new_text: str, *, revised_by: str):
     material = bool(existing.material_edit) or _is_material_edit(baseline, new_text)
     item = relay_queue.record_revision(
         existing.id, final_content=new_text, revised_by=revised_by, material_edit=material,
+        log=relay_queue.RevisionLogEntry(
+            source=source, before_text=existing.final_content or baseline, instruction=instruction,
+        ),
     )
     if item is None:
         return None, material, False
