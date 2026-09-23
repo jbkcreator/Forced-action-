@@ -462,7 +462,10 @@ def post_log_submission_confirmation(channel_id: str, full_name: str, backflip_r
     token = settings.fa_max_slack_bot_token
     if not token or not channel_id:
         logger.info(
-            "[Relay] cannot post log-submission confirmation — no token or channel_id"
+            "[Relay] cannot post log-submission confirmation — missing %s "
+            "(likely private_metadata from a modal opened before channel_id "
+            "capture existed, or FA_MAX_SLACK_BOT_TOKEN unset)",
+            "token" if not token else "channel_id",
         )
         return
     text = f"✅ Logged submission for {full_name}"
