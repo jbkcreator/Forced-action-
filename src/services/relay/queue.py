@@ -124,6 +124,10 @@ class QueueItem:
     last_revised_by: Optional[str] = None
     last_revised_at: Optional[datetime] = None
     material_edit: Optional[bool] = None
+    # A first touch may precede opportunity creation. Its verified person
+    # source is stamped below and checked again at dispatch.
+    opportunity_id: Optional[str] = None
+    channel_split_source: Optional[str] = None
 
 
 _QUEUE_ITEM_COLUMNS = tuple(f.name for f in fields(QueueItem))
@@ -223,6 +227,7 @@ def enqueue(
     skip_contract_validation: bool = False,
     auto_authorize: bool = False,
     send_attempt_log_id: Optional[int] = None,
+    opportunity_id: Optional[str] = None,
 ) -> QueueItem:
     """Write a new 'pending' row. Called by Cora/THROUGH (Phase 2) and by
     R1's --seed CLI today.
@@ -343,10 +348,24 @@ def enqueue(
                 if not consent.allowed:
                     raise GovernanceBlocked(consent.reason)
                 suppressed = suppression_reason(
-                    session, recipient=recipient, channel=channel,
+                    session, recipient=recipient, channel=channel, person_id=person_id,
                 )
                 if suppressed:
                     raise GovernanceBlocked(f"suppressed:{suppressed}")
+                # Verify the opportunity source, or the person source for a
+                # first touch, before any approval card can be created.
+                from src.services.fa_max_send_governance import channel_split_reason, get_channel_split_source
+                split_reason = channel_split_reason(session, opportunity_id=opportunity_id, person_id=person_id)
+                if split_reason:
+                    raise GovernanceBlocked(f"channel_split:{split_reason}")
+                channel_source = get_channel_split_source(
+                    session, opportunity_id=opportunity_id, person_id=str(person_id),
+                )
+                from src.services.fa_max_send_governance import record_backflip_suppression_decision
+                record_backflip_suppression_decision(
+                    gate="draft", recipient=recipient, suppressed=False,
+                    reason=None, opportunity_id=opportunity_id,
+                )
                 # A warm introduction can be a first contact. Recipient
                 # context is checked before autonomous authorization below;
                 # unverified A/B claims remain pending for human approval.
@@ -370,6 +389,8 @@ def enqueue(
                 autonomy_tier_at_send=autonomy_tier_at_send,
                 person_id=person_id,
                 autonomy_gate_reason=gate_reason,
+                opportunity_id=opportunity_id,
+                channel_split_source=channel_source if venture_key == "fa_max_lending" else None,
             )
             session.add(item)
             session.flush()
@@ -400,7 +421,13 @@ def enqueue(
                 else:
                     fresh_gate = _fresh_tier_gate(str(agent_name), str(autonomy_tier_at_send), session)
                     fresh_suppressed = _fresh_suppression_reason(
-                        session, recipient=recipient, channel=channel,
+                        session, recipient=recipient, channel=channel, person_id=person_id,
+                    )
+                    from src.services.fa_max_send_governance import record_backflip_suppression_decision
+                    record_backflip_suppression_decision(
+                        gate="draft", recipient=recipient,
+                        suppressed=bool(fresh_suppressed), reason=fresh_suppressed,
+                        opportunity_id=opportunity_id,
                     )
                 context_verified = autonomous_tier_context_verified(
                     session, person_id=str(person_id),
@@ -456,6 +483,23 @@ def enqueue(
                 recipient=recipient, agent_name=agent_name, lane=lane,
                 autonomy_tier_at_send=autonomy_tier_at_send,
             )
+            # WP-T2-3: write the Backflip-suppression audit row in its own
+            # committed transaction so it survives this GovernanceBlocked raise,
+            # which is about to roll back the enclosing get_db_context() session
+            # (and any queue row that may have been partially written). Only
+            # record the decision when the block reason is suppression-related —
+            # other governance failures (missing fields, invalid lane, consent
+            # absent) are not Backflip decisions.
+            if (exc.reason.startswith("suppressed:") or exc.reason.startswith("channel_split:")
+                    or exc.reason in {"consent_absent", "consent_withdrawn"}):
+                from src.services.fa_max_send_governance import record_backflip_suppression_decision
+                record_backflip_suppression_decision(
+                    gate="draft",
+                    recipient=recipient or "",
+                    suppressed=True,
+                    reason=exc.reason,
+                    opportunity_id=opportunity_id,
+                )
         raise
     item = get_item(item_id)
     assert item is not None  # just inserted in the same call
@@ -773,6 +817,7 @@ def mark_sent(item_id: int, *, batch_id: str) -> None:
     whichever worker currently owns the row can finalize it -- the other
     worker's call simply no-ops (0 rows match) instead of silently
     overwriting a completed receipt."""
+    attribution_issue = False
     with get_db_context() as session:
         row = session.execute(
             text(
@@ -780,7 +825,7 @@ def mark_sent(item_id: int, *, batch_id: str) -> None:
                 "dispatched_at = now(), updated_at = now() "
                 "WHERE id = :id AND status = :approved AND batch_id = :batch_id"
                 " RETURNING venture_key, person_id::text, channel, agent_name, "
-                "autonomy_tier_at_send, payload, material_edit"
+                "autonomy_tier_at_send, payload, material_edit, opportunity_id::text, channel_split_source"
             ),
             {"status": STATUS_SENT, "id": item_id, "approved": STATUS_APPROVED, "batch_id": batch_id},
         ).mappings().first()
@@ -805,6 +850,53 @@ def mark_sent(item_id: int, *, batch_id: str) -> None:
                 text("UPDATE relay_approval_queue SET send_interaction_id = CAST(:iid AS uuid) WHERE id = :id"),
                 {"iid": interaction_id, "id": item_id},
             )
+            session.execute(text(
+                "INSERT INTO fa_max_person_first_touch "
+                "(person_id, relay_item_id, channel_split_source) "
+                "VALUES (CAST(:person_id AS uuid), :item_id, :source) "
+                "ON CONFLICT (person_id) DO NOTHING"
+            ), {"person_id": row["person_id"], "item_id": item_id,
+                "source": row["channel_split_source"]})
+            # WP-T2-3: write backflip attribution on the linked opportunity.
+            # WHERE IS NULL guard: concurrent mark_sent() calls are safe —
+            # only the first write wins; subsequent calls are no-ops.
+            # Skipped when no opportunity_id was supplied at enqueue time.
+            opp_id = row.get("opportunity_id")
+            if opp_id:
+                updated = session.execute(
+                    text(
+                        "UPDATE fa_max_opportunities "
+                        "SET backflip_attribution_owner = 'forced_action', "
+                        "    backflip_attribution_set_at = now(), "
+                        "    updated_at = now() "
+                        "WHERE opportunity_id = CAST(:opp_id AS uuid) "
+                        "AND person_id = CAST(:person_id AS uuid) "
+                        "AND backflip_attribution_owner IS NULL"
+                    ),
+                    {"opp_id": opp_id, "person_id": row["person_id"]},
+                )
+                if updated.rowcount == 0:
+                    owner = session.execute(text(
+                        "SELECT backflip_attribution_owner FROM fa_max_opportunities "
+                        "WHERE opportunity_id = CAST(:opp_id AS uuid) "
+                        "AND person_id = CAST(:person_id AS uuid)"
+                    ), {"opp_id": opp_id, "person_id": row["person_id"]}).scalar_one_or_none()
+                    if owner != "forced_action":
+                        attribution_issue = True
+                        session.execute(text(
+                            "UPDATE relay_approval_queue SET error = 'attribution_unresolved' "
+                            "WHERE id = :id"
+                        ), {"id": item_id})
+            else:
+                # First-touch opportunity is created from this sent row by
+                # create_opportunity_from_relay_send(), which claims ownership.
+                logger.info("[Relay] sent first touch %s; opportunity awaits creation", item_id)
+    if attribution_issue:
+        from src.services.relay import exceptions_alert_queue
+        exceptions_alert_queue.enqueue_and_attempt(
+            venture_key="fa_max_lending", rule="fa_max_attribution_unresolved",
+            message=f"Sent Relay item {item_id} could not claim its linked opportunity; reconcile attribution.",
+        )
 
 
 def mark_failed(item_id: int, error: str, *, batch_id: str) -> None:

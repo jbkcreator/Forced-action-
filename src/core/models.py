@@ -9310,6 +9310,16 @@ class RelayApprovalQueueItem(Base):
     last_revised_by: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
     last_revised_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     material_edit: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    # WP-T2-3: which fa_max_opportunity this queue item targets. Nullable —
+    # non-opportunity-linked items (bulk partner touches, EXCEPTIONS lane) skip
+    # attribution. When set, mark_sent() writes backflip_attribution_owner on
+    # that opportunity row under a WHERE IS NULL guard so concurrent sends are safe.
+    opportunity_id: Mapped[Optional[Any]] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_opportunities.opportunity_id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    channel_split_source: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
         default=lambda: datetime.now(timezone.utc), server_default=func.now(),
@@ -10877,6 +10887,18 @@ class FaMaxOpportunity(Base):
     state_version: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text("0")
     )
+    # WP-T2-3: write-once channel attribution. NULL = no real send has landed yet.
+    # 'forced_action' = FA Max originated the relationship (off-market trigger,
+    # partner layer). 'backflip' = this contact was already in an active Backflip
+    # campaign at the time of first send (should not occur — suppression blocks
+    # those; present as a guard for unexpected state). Written by mark_sent()
+    # under WHERE backflip_attribution_owner IS NULL — concurrent workers are safe.
+    backflip_attribution_owner: Mapped[Optional[str]] = mapped_column(
+        String(30), nullable=True
+    )
+    backflip_attribution_set_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -10907,6 +10929,11 @@ class FaMaxOpportunity(Base):
         CheckConstraint(
             "outcome IN ('open','funded','dead','recycled','referred')",
             name="ck_fa_max_opp_outcome",
+        ),
+        CheckConstraint(
+            "backflip_attribution_owner IS NULL "
+            "OR backflip_attribution_owner IN ('forced_action','backflip')",
+            name="ck_fa_max_opp_attribution_owner",
         ),
         CheckConstraint(
             "gyr_color IN ('green','yellow','red') OR gyr_color IS NULL",
@@ -11146,6 +11173,57 @@ class FaMaxPersonConsent(Base):
             f"<FaMaxPersonConsent(person={self.person_id!r}, "
             f"channel={self.channel!r}, consented={self.consented!r})>"
         )
+
+
+class FaMaxPersonFirstTouch(Base):
+    """Permanent first clean FA reach, before an opportunity may exist."""
+    __tablename__ = "fa_max_person_first_touch"
+
+    person_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("fa_max_persons.person_id"), primary_key=True,
+    )
+    relay_item_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("relay_approval_queue.id"), nullable=False,
+    )
+    channel_split_source: Mapped[str] = mapped_column(String(60), nullable=False)
+    claimed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class FaMaxPersonContactIdentifier(Base):
+    """Operator-verified identifiers used for person-wide suppression."""
+    __tablename__ = "fa_max_person_contact_identifiers"
+
+    identifier_kind: Mapped[str] = mapped_column(String(10), primary_key=True)
+    identifier_value: Mapped[str] = mapped_column(Text, primary_key=True)
+    person_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("fa_max_persons.person_id"), nullable=False,
+    )
+    source: Mapped[str] = mapped_column(String(60), nullable=False)
+    verified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    __table_args__ = (
+        CheckConstraint("identifier_kind IN ('email','phone')", name="ck_fa_max_person_identifier_kind"),
+        Index("ix_fa_max_person_contact_identifiers_person", "person_id"),
+    )
+
+
+class FaMaxBackflipSuppressionDecision(Base):
+    """Durable draft/send boundary decision; recipient digest avoids raw PII."""
+    __tablename__ = "fa_max_backflip_suppression_decisions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    gate: Mapped[str] = mapped_column(String(10), nullable=False)
+    recipient_masked: Mapped[str] = mapped_column(String(20), nullable=False)
+    recipient_sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    opportunity_id: Mapped[Optional[Any]] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    suppressed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint("gate IN ('draft','send')", name="ck_fa_max_bsd_gate"),
+        Index("ix_fa_max_bsd_opportunity_id", "opportunity_id", postgresql_where=text("opportunity_id IS NOT NULL")),
+        Index("ix_fa_max_bsd_created_at", created_at.desc()),
+    )
 
 
 class FaMaxBackflipCampaignContact(Base):

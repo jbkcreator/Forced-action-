@@ -103,6 +103,40 @@ which it checks, since neither is automatable.
 
 ## Step 5 — Review the approved backlog, THEN flip send mode
 
+WP-T2-3 precondition: run `PYTHONPATH=. python migrations/apply_fa_max_wp_t2_3.py`
+after the WP-T2-2 migrations. Import the latest verified active-campaign CSV
+with `PYTHONPATH=. python scripts/import_backflip_suppression_csv.py --file
+<export.csv>`. Check the import count and run the health monitor; an absent or
+stale feed blocks sends and raises an EXCEPTIONS alert.
+
+Import the operator-verified person-to-contact map before sending:
+`PYTHONPATH=. python scripts/import_fa_max_contact_identifiers_csv.py --file
+<contacts.csv>`. The CSV needs `person_id` plus `email` and/or `phone`. A
+recipient not linked to that person is blocked at both gates. Importing a
+contact identifier already assigned to another person fails for identity
+review; do not reassign it automatically.
+
+Review any older `approved` FA Max rows with `channel_split_source IS NULL`
+before release. The send gate defers them with
+`fa_max_opportunity_link_requires_review`; it does not silently dispatch or
+terminally skip them. Verify the person's source and contact identifiers,
+then reject and redraft under the new gate, or explicitly reconcile the row.
+For a first touch, the canonical `fa_max_persons.source` must be one of
+`deed`, `permit`, `distress`, `maturity`, or `partner`; the verified source is
+stamped on the Relay row. The existing Tier C admin flow creates its
+opportunity from the completed send and claims Forced Action attribution at
+that point. Opportunities created before this migration with
+`source='relay_outbound'` need source review before they can be used for
+another outbound; do not relabel them without confirming the original lane.
+
+The live feed format, Backflip employee roster, and conduit definition are
+pending Backflip. Employee and conduit suppression cannot be asserted until
+those sources exist.
+The contact check considers every operator-verified email and phone linked to
+the FA Max person. Before live sends, confirm the Backflip export covers the
+identifiers used for active campaign contacts; an identifier missing from
+both the export and the verified person map cannot be matched deterministically.
+
 **Do this in order — flipping `fa_max_relay_send_mode` before reviewing
 the backlog releases nothing by itself (see `guards.py`'s
 `fa_max_send_backlog_release_confirmed` gate), but flipping BOTH flags

@@ -844,6 +844,7 @@ class AppSettings(BaseSettings):
 		default=15000, env="FA_MAX_GYR_GREEN_MIN_EXPECTED_REVENUE_CENTS"
 	)
 	fa_max_backflip_feed_max_age_hours: int = Field(default=24, ge=1, env="FA_MAX_BACKFLIP_FEED_MAX_AGE_HOURS")
+	fa_max_backflip_feed_adapter: str = Field(default="csv", env="FA_MAX_BACKFLIP_FEED_ADAPTER")
 	backflip_webhook_secret: Optional[SecretStr] = Field(default=None, env="BACKFLIP_WEBHOOK_SECRET")
 
 	# ── FA Max WP-T2-1 — Own-Lane Send Infrastructure ────────────────────────
