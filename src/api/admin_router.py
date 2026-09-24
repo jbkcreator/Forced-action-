@@ -1619,8 +1619,10 @@ from fastapi import Request
 _QUOTE_READY_SANDBOX_SCOPED_IDS = {
     "quote_ready_approve",
     "quote_ready_reject",
-    "quote_ready_modify_open",
+    "quote_ready_modify",
     "quote_ready_modify_submit",
+    "quote_ready_override_arv",
+    "quote_ready_override_arv_submit",
 }
 
 
@@ -1802,6 +1804,8 @@ async def slack_interact(request: Request, background_tasks: BackgroundTasks, db
         return _handle_quote_ready_decision(payload, db)
     if action_id == "quote_ready_modify":
         return _handle_quote_ready_modify_open(payload, db)
+    if action_id == "quote_ready_override_arv":
+        return _handle_quote_ready_override_arv_open(payload, db)
     # Builder entity-link actions (EXCEPTIONS lane — WP-T2-8)
     if action_id and action_id.startswith("confirm_entity_link_"):
         return _handle_confirm_entity_link(payload, db)
@@ -3687,6 +3691,69 @@ def _handle_quote_ready_modify_open(payload: dict, db: Session) -> dict:
         db, trigger_id=payload.get("trigger_id", ""), result_id=result_id,
         origin_channel=origin_channel, origin_message_ts=origin_message_ts,
     )
+    return {}
+
+
+def _handle_quote_ready_override_arv_open(payload: dict, db: Session) -> dict:
+    """WP-8B — Override ARV button: opens the real override modal
+    (src.services.quote_ready.dossier.open_override_arv_modal). Wires the
+    previously-orphaned override_arv_result() (models/migration/validation/
+    audit fields all existed with no caller) into a real Slack surface,
+    same mechanism as the Modify button above."""
+    from src.services.quote_ready.dossier import open_override_arv_modal
+
+    actions = payload.get("actions", [])
+    if not actions:
+        return _slack_ephemeral("No action found in payload.")
+    try:
+        action_data = json.loads(actions[0].get("value", "{}"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid action value")
+    result_id = action_data.get("result_id")
+    if not result_id:
+        return _slack_ephemeral("Invalid Quote Ready action data.")
+
+    user_id = payload.get("user", {}).get("id", "")
+    if not _relay_approver_authorized(user_id, "fa_max_lending"):
+        return _slack_ephemeral("Not authorized to review Quote Ready scenarios.")
+
+    open_override_arv_modal(db, trigger_id=payload.get("trigger_id", ""), result_id=result_id)
+    return {}
+
+
+def _handle_quote_ready_override_arv_submission(payload: dict) -> Optional[dict]:
+    """WP-8B — Override ARV modal submission (Socket Mode view_submission).
+
+    No `db: Session` param, same reasoning as
+    _handle_quote_ready_modify_submission — invoked directly from
+    socket_listener.py, which has no FastAPI Depends(get_db) to hand it.
+
+    Unlike Modify, this triggers no further Slack API calls on success (no
+    new card to post, no old card to neutralize — it corrects the ARV
+    figure in place), so it needs no ack-first split: the whole thing is a
+    single DB write and can safely complete before the ack.
+    """
+    from src.services.quote_ready.dossier import handle_override_arv_submission
+
+    user_id = payload.get("user", {}).get("id", "")
+    view = payload.get("view", {})
+    try:
+        metadata = json.loads(view.get("private_metadata", "{}"))
+    except Exception:
+        return {"response_action": "errors", "errors": {"override_low_block": "Invalid view metadata."}}
+    if not metadata.get("arv_result_id"):
+        return {"response_action": "errors", "errors": {"override_low_block": "Invalid view metadata."}}
+
+    if not _relay_approver_authorized(user_id, "fa_max_lending"):
+        return {"response_action": "errors", "errors": {"override_low_block": "Not authorized."}}
+
+    values = (view.get("state") or {}).get("values") or {}
+    with get_db_context() as db:
+        outcome = handle_override_arv_submission(db, values=values, metadata=metadata, submitted_by=user_id)
+
+    if not outcome.get("ok"):
+        return {"response_action": "errors", "errors": outcome.get("error", {})}
+    logger.info("[QuoteReady] arv_result_id=%s override submitted by=%s", metadata.get("arv_result_id"), user_id)
     return {}
 
 

@@ -155,6 +155,13 @@ def handle_socket_request(client: Any, request: Any) -> bool:
                 # 3-second timeout rather than a clean error.
                 from src.api.admin_router import _handle_relay_revise_submission
                 response_body = _handle_relay_revise_submission(payload)
+            elif callback_id == "quote_ready_override_arv_submit":
+                # A single DB write with no follow-on Slack API calls (see
+                # _handle_quote_ready_override_arv_submission's docstring),
+                # so unlike quote_ready_modify_submit above it needs no
+                # ack-first split -- safe to run fully before the ack.
+                from src.api.admin_router import _handle_quote_ready_override_arv_submission
+                response_body = _handle_quote_ready_override_arv_submission(payload)
             else:
                 logger.info(
                     "[RelaySocket] view_submission with unrecognized callback_id=%r user=%s — "

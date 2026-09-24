@@ -139,33 +139,45 @@ def build_dossier_text(row: dict[str, Any]) -> str:
 
 def _build_dossier_blocks(row: dict[str, Any], text_body: str) -> list:
     result_id = str(row["result_id"])
+    elements = [
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Approve"},
+            "style": "primary",
+            "action_id": "quote_ready_approve",
+            "value": json.dumps({"result_id": result_id}),
+        },
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Modify"},
+            "action_id": "quote_ready_modify",
+            "value": json.dumps({"result_id": result_id}),
+        },
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Reject"},
+            "style": "danger",
+            "action_id": "quote_ready_reject",
+            "value": json.dumps({"result_id": result_id}),
+        },
+    ]
+    # Override ARV (WP-8B "allow reviewed manual override with audit trail")
+    # only makes sense when there's a published ARV row to override — an
+    # opportunity whose property has no comps yet has nothing for
+    # override_arv_result() to target. Wires the previously-orphaned
+    # override_arv_result() into a real Slack surface: see
+    # _handle_quote_ready_override_arv_open()/_submission() in admin_router.py.
+    arv = row.get("arv")
+    if arv is not None:
+        elements.append({
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Override ARV"},
+            "action_id": "quote_ready_override_arv",
+            "value": json.dumps({"result_id": result_id, "arv_result_id": arv.arv_result_id}),
+        })
     return [
         {"type": "section", "text": {"type": "mrkdwn", "text": text_body}},
-        {
-            "type": "actions",
-            "elements": [
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "Approve"},
-                    "style": "primary",
-                    "action_id": "quote_ready_approve",
-                    "value": json.dumps({"result_id": result_id}),
-                },
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "Modify"},
-                    "action_id": "quote_ready_modify",
-                    "value": json.dumps({"result_id": result_id}),
-                },
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "Reject"},
-                    "style": "danger",
-                    "action_id": "quote_ready_reject",
-                    "value": json.dumps({"result_id": result_id}),
-                },
-            ],
-        },
+        {"type": "actions", "elements": elements},
     ]
 
 
@@ -377,6 +389,153 @@ def open_modify_modal(
     except Exception:
         logger.error("[QuoteReady] views.open failed for result_id=%s", result_id, exc_info=True)
         return False
+
+
+OVERRIDE_ARV_CALLBACK_ID = "quote_ready_override_arv_submit"
+
+
+def _build_override_arv_modal(arv, *, result_id: str) -> dict:
+    """Modal pre-filled with the current published ARV range. Submitting
+    calls override_arv_result() directly — unlike Modify, this does NOT
+    recompute a new Quote Ready scenario; it only corrects the ARV figure
+    itself, with the mandatory reason/audit trail WP-8B requires."""
+    return {
+        "type": "modal",
+        "callback_id": OVERRIDE_ARV_CALLBACK_ID,
+        "private_metadata": json.dumps({
+            "result_id": result_id,
+            "arv_result_id": arv.arv_result_id,
+        }),
+        "title": {"type": "plain_text", "text": "Override ARV"[:24]},
+        "submit": {"type": "plain_text", "text": "Override"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"Current: {arv.low:,.0f} – {arv.high:,.0f} (point {arv.point:,.0f}, "
+                        f"{arv.comp_count} comps, {'WEAK' if arv.weak_comp else 'strong'} evidence)"
+                    ),
+                },
+            },
+            {
+                "type": "input", "block_id": "override_low_block",
+                "label": {"type": "plain_text", "text": "Override low"},
+                "element": {"type": "plain_text_input", "action_id": "override_low",
+                            "initial_value": str(arv.low)},
+            },
+            {
+                "type": "input", "block_id": "override_point_block",
+                "label": {"type": "plain_text", "text": "Override point"},
+                "element": {"type": "plain_text_input", "action_id": "override_point",
+                            "initial_value": str(arv.point)},
+            },
+            {
+                "type": "input", "block_id": "override_high_block",
+                "label": {"type": "plain_text", "text": "Override high"},
+                "element": {"type": "plain_text_input", "action_id": "override_high",
+                            "initial_value": str(arv.high)},
+            },
+            {
+                "type": "input", "block_id": "reason_block",
+                "label": {"type": "plain_text", "text": "Reason (required)"},
+                "element": {"type": "plain_text_input", "action_id": "reason", "multiline": True},
+            },
+        ],
+    }
+
+
+def open_override_arv_modal(session: Session, *, trigger_id: str, result_id: str) -> bool:
+    """Open the Override ARV modal for a scenario's published ARV. Returns
+    True on success, False if Slack isn't configured, the scenario/ARV
+    doesn't exist, or the open call fails (never raises — same contract as
+    open_modify_modal above)."""
+    row = session.execute(_SELECT_RESULT_SQL, {"result_id": result_id}).mappings().first()
+    if row is None or not row.get("property_id"):
+        logger.warning("open_override_arv_modal: no row/property for result_id=%s", result_id)
+        return False
+    arv = get_published_arv(session, row["property_id"])
+    if arv is None:
+        logger.warning("open_override_arv_modal: no published ARV for result_id=%s", result_id)
+        return False
+
+    settings = get_settings()
+    token = _resolve_bot_token(settings)
+    if not token or not trigger_id:
+        logger.info("[QuoteReady] cannot open override-ARV modal for result_id=%s — no token or trigger_id", result_id)
+        return False
+    try:
+        from slack_sdk import WebClient
+        WebClient(token=token.get_secret_value()).views_open(
+            trigger_id=trigger_id,
+            view=_build_override_arv_modal(arv, result_id=result_id),
+        )
+        return True
+    except Exception:
+        logger.error("[QuoteReady] views.open (override ARV) failed for result_id=%s", result_id, exc_info=True)
+        return False
+
+
+def handle_override_arv_submission(session: Session, *, values: dict, metadata: dict, submitted_by: str) -> dict[str, Any]:
+    """Apply a reviewer's ARV override via override_arv_result(). Returns
+    {"ok": True} on success, or {"ok": False, "error": <field-level Slack
+    modal error dict>} on bad input or a failed apply (e.g. the ARV row was
+    already overridden/superseded by the time this submission lands —
+    override_arv_result()'s own WHERE guard is the data-layer backstop,
+    same "first decision wins" pattern as decide_quote_ready())."""
+    from src.services.quote_ready.arv_persistence import override_arv_result
+
+    def _field(block_id: str, action_id: str) -> str:
+        return values.get(block_id, {}).get(action_id, {}).get("value") or ""
+
+    try:
+        override_low = _parse_decimal(_field("override_low_block", "override_low"))
+        override_point = _parse_decimal(_field("override_point_block", "override_point"))
+        override_high = _parse_decimal(_field("override_high_block", "override_high"))
+    except Exception as exc:
+        return {"ok": False, "error": {"override_low_block": f"Could not parse a number: {exc}"}}
+
+    if override_low is None or override_point is None or override_high is None:
+        return {"ok": False, "error": {"override_low_block": "Low, point, and high are all required."}}
+
+    reason = _field("reason_block", "reason").strip()
+    if not reason:
+        return {"ok": False, "error": {"reason_block": "A reason is required."}}
+
+    if not (override_low <= override_point <= override_high):
+        return {
+            "ok": False,
+            "error": {"override_low_block": "Range must be non-decreasing: low <= point <= high."},
+        }
+
+    arv_result_id = metadata.get("arv_result_id")
+    if not arv_result_id:
+        return {"ok": False, "error": {"override_low_block": "Invalid view metadata — no ARV result to override."}}
+
+    try:
+        applied = override_arv_result(
+            session,
+            arv_result_id=arv_result_id,
+            override_low=override_low,
+            override_point=override_point,
+            override_high=override_high,
+            reason=reason,
+            overridden_by=submitted_by,
+        )
+        session.commit()
+    except ValueError as exc:
+        session.rollback()
+        return {"ok": False, "error": {"override_low_block": str(exc)}}
+
+    if not applied:
+        return {
+            "ok": False,
+            "error": {"override_low_block": "This ARV was already overridden or superseded — refresh and retry."},
+        }
+    logger.info("[QuoteReady] arv_result_id=%s overridden by=%s", arv_result_id, submitted_by)
+    return {"ok": True}
 
 
 def _parse_decimal(raw: str) -> Optional[Decimal]:
