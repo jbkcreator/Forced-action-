@@ -80,6 +80,101 @@ def _resolve_bot_token(item: QueueItem, settings):
     return settings.slack_bot_token
 
 
+def _resolve_bot_token_for_venture(venture_key: str, settings):
+    """Bot token for a venture without needing a QueueItem (WP-T2-12 channel path)."""
+    if venture_key == _FA_MAX_VENTURE:
+        return getattr(settings, "fa_max_slack_bot_token", None)
+    return settings.slack_bot_token
+
+
+def post_note(*, venture_key: str, channel: str, thread_ts: str, text: str) -> None:
+    """Post a plain-text reply into `channel`, threaded under `thread_ts`.
+
+    The general in-channel poster used by the WP-T2-12 FA Max Slack responder.
+    Works with or without an originating card — the caller supplies the channel
+    and the ts to thread under. Best-effort: logs and returns on any error.
+    """
+    settings = get_settings()
+    token = _resolve_bot_token_for_venture(venture_key, settings)
+    if not token or not channel or not thread_ts:
+        logger.warning(
+            "[slack_post.post_note] missing token/channel/ts (venture=%s channel=%s)",
+            venture_key, channel,
+        )
+        return
+    try:
+        from slack_sdk import WebClient
+        WebClient(token=token.get_secret_value()).chat_postMessage(
+            channel=channel, thread_ts=thread_ts, text=text,
+        )
+    except Exception as exc:
+        logger.error("[slack_post.post_note] post failed (channel=%s): %s", channel, exc)
+
+
+def fetch_thread_history(
+    *,
+    venture_key: str,
+    channel: str,
+    thread_ts: str,
+    exclude_ts: str = "",
+    limit: int = 10,
+) -> list[dict]:
+    """Return prior turns of a Slack thread as classify message history.
+
+    Maps our bot's messages to role 'assistant' and human messages to 'user',
+    oldest first, excluding `exclude_ts` (the message being classified now) and
+    Slack join/system subtypes. Capped to the last `limit` turns to bound tokens.
+
+    Best-effort: returns [] on any error or when Slack isn't configured, so a
+    history fetch failure degrades to single-shot classification, never an error.
+    """
+    settings = get_settings()
+    token = _resolve_bot_token_for_venture(venture_key, settings)
+    if not token or not channel or not thread_ts:
+        return []
+    try:
+        from slack_sdk import WebClient
+        resp = WebClient(token=token.get_secret_value()).conversations_replies(
+            channel=channel, ts=thread_ts, limit=limit + 10,
+        )
+        turns: list[dict] = []
+        for msg in resp.get("messages", []):
+            if msg.get("ts") == exclude_ts or msg.get("subtype"):
+                continue
+            content = str(msg.get("text") or "").strip()
+            if not content:
+                continue
+            role = "assistant" if msg.get("bot_id") else "user"
+            turns.append({"role": role, "content": content})
+        return turns[-limit:]
+    except Exception as exc:
+        logger.warning(
+            "[slack_post.fetch_thread_history] failed (channel=%s): %s", channel, exc
+        )
+        return []
+
+
+def post_thread_note(item: QueueItem, text: str) -> None:
+    """Post a plain-text reply inside the item's existing card thread.
+
+    Thin wrapper over post_note for the card-thread path — resolves the channel
+    and venture from the QueueItem. Best-effort — logs and returns on any error.
+    """
+    settings = get_settings()
+    channel = _resolve_channel(item, settings)
+    if not channel or not item.slack_message_ts:
+        logger.warning(
+            "[slack_post.post_thread_note] missing channel/ts for item %s", item.id
+        )
+        return
+    post_note(
+        venture_key=item.venture_key,
+        channel=channel,
+        thread_ts=item.slack_message_ts,
+        text=text,
+    )
+
+
 def post_for_approval(item: QueueItem) -> None:
     """Post an interactive Approve/Reject Slack message for a pending item.
 

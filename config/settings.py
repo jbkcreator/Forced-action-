@@ -881,7 +881,8 @@ class AppSettings(BaseSettings):
 	fa_max_slack_channel_relationships: str = Field(default="", env="FA_MAX_SLACK_CHANNEL_RELATIONSHIPS")
 	# Command Center channel restriction (WP-T2-6 addendum Task 21). Unset =
 	# not yet configured, so the restriction fails open (see
-	# _reject_if_wrong_command_channel / _listen_channel).
+	# _reject_if_wrong_command_channel / _listen_channel). Also the channel
+	# the WP-T2-12 LLM responder points CC_QUERY messages to.
 	fa_max_slack_cc_channel: Optional[str] = Field(default=None, env="FA_MAX_SLACK_CC_CHANNEL")
 
 	# WP-T2-11: minimum expected revenue (cents) for an in-box opportunity to be green.
