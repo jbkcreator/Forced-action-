@@ -71,6 +71,10 @@ _ALLOWED_GOVERNANCE_IMPORTERS = {
     "src/services/relay/guards.py",
     "src/services/relay/queue.py",
     "src/services/relay/channels_sms.py",
+    # Read-only governance checks added by WP-T2-2+; no send path involved:
+    "src/services/state_engine.py",        # reads FA_MAX_ALLOWED_SOURCE_TYPES constant for validation
+    "src/agents/fa_max/tool_registry.py",  # reads suppression_reason before dispatch decision
+    "src/agents/fa_max/agent_graph.py",    # imports GovernanceBlocked exception for error handling
 }
 
 
