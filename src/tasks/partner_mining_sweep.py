@@ -108,8 +108,10 @@ def _run_county(county_id: str, *, dry_run: bool, as_of: date) -> int:
             run_counterparty_resolution, run_wholesaler_resolution,
             resolve_counterparty_names,
         )
-        run_counterparty_resolution(db, county_id=county_id)
-        run_wholesaler_resolution(db, county_id=county_id)
+        # Both resolution steps commit internally, so dry-run must skip them.
+        if not dry_run:
+            run_counterparty_resolution(db, county_id=county_id)
+            run_wholesaler_resolution(db, county_id=county_id)
 
         # Load deed rows for this county within the lookback window.
         result = db.execute(
@@ -119,9 +121,9 @@ def _run_county(county_id: str, *, dry_run: bool, as_of: date) -> int:
                     d.grantor, d.grantee, d.deed_type, d.doc_type,
                     d.sale_price, d.sale_qualified, d.mortgage_amount,
                     d.record_date, d.county_id,
-                    p.homestead_exempt
+                    f.homestead_exempt
                 FROM deeds d
-                LEFT JOIN properties p ON p.id = d.property_id
+                LEFT JOIN financials f ON f.property_id = d.property_id
                 WHERE d.county_id = :county_id
                   AND d.record_date >= :since
                   AND d.record_date <= :as_of
@@ -222,7 +224,11 @@ def _run_county(county_id: str, *, dry_run: bool, as_of: date) -> int:
 
 
 def main(argv: Optional[list[str]] = None) -> None:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    # run.sh keeps only lines matching " - WARNING|ERROR|CRITICAL - ".
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
     parser = argparse.ArgumentParser(description="WP-T2-9 partner mining sweep")
     parser.add_argument("--county-id", default=None)
     parser.add_argument("--dry-run", action="store_true")
