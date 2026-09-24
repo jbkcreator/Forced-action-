@@ -33,7 +33,7 @@ def run(
     Execute the partner mining sweep for one or all counties.
 
     Returns a summary dict with keys: counties_processed, partners_ranked,
-    enrichment_queued, errors.
+    errors, success.
     """
     from src.core.database import get_db_context
     from src.utils.scraper_db_helper import record_scraper_stats
@@ -42,6 +42,7 @@ def run(
     counties = [county_id] if county_id else ["hillsborough", "pinellas", "pasco"]
     total_ranked = 0
     errors: list[str] = []
+    failed_counties: set[str] = set()
 
     start = time.monotonic()
 
@@ -54,12 +55,13 @@ def run(
             # Pasco is best-effort — log and continue (GRILL Q1).
             msg = f"{cid}: {exc}"
             errors.append(msg)
+            failed_counties.add(cid)
             logger.warning("[PartnerMining] %s — skipping county: %s", cid, exc)
 
     duration = time.monotonic() - start
-    success = len(errors) == 0 or (
+    success = not failed_counties or (
         # Pasco-only failure is still a partial success.
-        all("pasco" in e for e in errors) and total_ranked > 0
+        failed_counties == {"pasco"} and total_ranked > 0
     )
 
     if not dry_run:
@@ -82,6 +84,7 @@ def run(
         "counties_processed": len(counties) - len(errors),
         "partners_ranked": total_ranked,
         "errors": errors,
+        "success": success,
     }
 
 
@@ -238,7 +241,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     as_of = date.fromisoformat(args.as_of) if args.as_of else None
     result = run(county_id=args.county_id, dry_run=args.dry_run, as_of=as_of)
     logger.info("[PartnerMining] done: %s", result)
-    sys.exit(0 if not result["errors"] else 1)
+    sys.exit(0 if result["success"] else 1)
 
 
 if __name__ == "__main__":
