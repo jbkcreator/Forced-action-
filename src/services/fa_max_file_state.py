@@ -144,7 +144,6 @@ def update_backflip_stage(
     if row is None:
         raise ValueError(f"update_backflip_stage: no file_state row for {opportunity_id}")
     person_id = row[0]
-    session.commit()
 
     # channel reflects how this observation actually arrived -- 'slack' for
     # a manually-typed update, 'email' for a parsed Backflip notification.
@@ -174,6 +173,18 @@ def update_backflip_stage(
                 idempotency_key=f"fa_max_file_state:declined:{opportunity_id}",
                 state_version=current["state_version"],
             )
+
+    # One commit for the whole operation (file_state UPDATE + interaction
+    # log + optional declined-cascade transition) -- this function must not
+    # depend on the caller's session-lifecycle convention. Found live: the
+    # previous mid-function commit here committed the file_state UPDATE but
+    # left write_interaction()'s INSERT (and transition(), which explicitly
+    # documents "caller owns commit/rollback") pending in an uncommitted
+    # transaction. Every other call site uses get_db_context(), which
+    # auto-commits on clean exit and masked this; the Backflip email poller
+    # manages a bare Session with no trailing commit, so that second write
+    # was silently rolled back on session close.
+    session.commit()
 
     logger.info(
         "fa_max_file_state: opportunity_id=%s stage=%s source=%s actor=%s",
