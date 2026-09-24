@@ -307,6 +307,7 @@ class TestCorrectionAfterScopingRebuildsScenario:
                 facts_revision=1,
                 result=SufficiencyResult(verdict="sufficient", gaps=[], opportunity_id=opp_id, facts_revision=1),
             )
+        _drain_workflow(fresh_db)
         fresh_db.expire_all()
 
         # Now already in 'scoping' -- a correction must still rebuild.
@@ -330,6 +331,7 @@ class TestCorrectionAfterScopingRebuildsScenario:
                 facts_revision=2,
                 result=SufficiencyResult(verdict="sufficient", gaps=[], opportunity_id=opp_id, facts_revision=2),
             )
+        _drain_workflow(fresh_db)
         fresh_db.expire_all()
 
         rows = fresh_db.execute(
@@ -528,3 +530,17 @@ class TestRevertedValueBecomesCurrentAgain:
             {"oid": opp_id},
         ).mappings().first()
         assert float(current["inputs"]["rehab_estimate"]) == 50000
+
+
+def _drain_workflow(session):
+    """Exercise the durable consumers after the qualification transaction."""
+    from src.services.quote_ready import workflow
+    from src.services.state_engine import claim_next_work_item
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(workflow, "get_db_context", lambda: _SessionCtx(session))
+        for queue in workflow.WORKFLOW_QUEUES:
+            for _ in range(20):
+                item = claim_next_work_item(session=session, queue_name=queue, worker_id="integration-drain")
+                if item is None:
+                    break
+                workflow.process_work_item(item, worker_id="integration-drain")

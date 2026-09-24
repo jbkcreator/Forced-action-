@@ -8,14 +8,10 @@ appropriate downstream work.
 
 Autonomy: internal agent — no outbound contact, no tier gate required.
 
-Cross-owner dependencies explicitly tracked here (not silently assumed):
-  • Dev 4 (WP-8A/8B): owns and must wire the "fa_max_quote_ready" queue
-    consumer. T3-7 enqueues into that queue on every sufficient decision;
-    Dev 4's consumer must re-check facts_revision and checklist_version at
-    result-publication time, not only at claim time (stale-handoff window).
-  • T3-8 (Fundability Agent, same developer): owns the enrichment-exhaustion
-    promotion trigger. Until T3-8 defines a terminal enrichment-failed state,
-    pending_enrichment gaps remain indefinitely pending from T3-7's side.
+Cross-owner dependencies:
+  Quote Ready build and delivery are consumed by the qualification worker
+  through src.services.quote_ready.workflow, with revision checks and retries.
+  T3-8 owns the enrichment-exhaustion policy for pending enrichment gaps.
 
 Compliance boundary (SOT.md Part 1):
     No borrower financial data (credit score, income, bank statement, tax
@@ -569,14 +565,8 @@ def enqueue_quote_ready_work(
 ) -> Optional[str]:
     """Enqueue Scenario Builder work for a sufficient opportunity.
 
-    DEPENDENCY: The 'fa_max_quote_ready' queue consumer is owned by Dev 4
-    (WP-8A/8B) and is NOT YET BUILT. This enqueue is durable; the work item
-    will sit pending until Dev 4's consumer comes online.
-
-    The consumer MUST re-verify (opportunity_id, facts_revision, checklist_version)
-    at result-publication time, not only at claim time, to detect a correction
-    that landed mid-calculation and map the in-flight result to 'superseded'
-    rather than the current scenario.
+    Consumed by the qualification worker's durable build/delivery workflow.
+    Both stages re-check the revision, checklist version, and open outcome.
     """
     from src.services.state_engine import enqueue_work_item
 

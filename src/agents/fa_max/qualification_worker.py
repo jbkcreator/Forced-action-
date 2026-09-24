@@ -101,6 +101,7 @@ class FaMaxQualificationWorker:
         self.worker_id = worker_id or _worker_id()
         self._stop = False
         self._loop_count = 0
+        self._queue_cursor = 0
 
     def request_stop(self, *_args: Any) -> None:
         logger.info(
@@ -113,13 +114,20 @@ class FaMaxQualificationWorker:
         signal.signal(signal.SIGTERM, self.request_stop)
 
     def _claim(self) -> Optional[Dict[str, Any]]:
-        with get_db_context() as session:
-            return claim_next_work_item(
-                session=session,
-                queue_name=FA_MAX_QUAL_QUEUE_NAME,
-                worker_id=self.worker_id,
-                lease_seconds=DEFAULT_LEASE_SECONDS,
-            )
+        # Rotate queues so intake cannot starve builds or Slack delivery.
+        from src.services.quote_ready.workflow import WORKFLOW_QUEUES
+        queues = (FA_MAX_QUAL_QUEUE_NAME, *WORKFLOW_QUEUES)
+        for _ in queues:
+            queue = queues[self._queue_cursor % len(queues)]
+            self._queue_cursor += 1
+            with get_db_context() as session:
+                item = claim_next_work_item(
+                    session=session, queue_name=queue, worker_id=self.worker_id,
+                    lease_seconds=DEFAULT_LEASE_SECONDS,
+                )
+            if item is not None:
+                return item
+        return None
 
     def _complete(self, work_item_id: str, status: str) -> None:
         with get_db_context() as session:
@@ -137,6 +145,10 @@ class FaMaxQualificationWorker:
             )
 
     def _process_one(self, item: Dict[str, Any]) -> None:
+        from src.services.quote_ready.workflow import WORKFLOW_QUEUES, process_work_item
+        if item.get("queue_name") in WORKFLOW_QUEUES:
+            process_work_item(item, worker_id=self.worker_id)
+            return
         work_item_id: str = item["work_item_id"]
         payload: Dict[str, Any] = item.get("payload") or {}
 
@@ -191,12 +203,13 @@ class FaMaxQualificationWorker:
 
     def _sweep_expired(self) -> None:
         with get_db_context() as session:
-            reclaim_expired_work_items(
-                session=session, queue_name=FA_MAX_QUAL_QUEUE_NAME
-            )
+            from src.services.quote_ready.workflow import WORKFLOW_QUEUES
+            for queue in (FA_MAX_QUAL_QUEUE_NAME, *WORKFLOW_QUEUES):
+                reclaim_expired_work_items(session=session, queue_name=queue)
 
     def run_forever(self, idle_poll_seconds: int = IDLE_POLL_SECONDS) -> None:
         logger.info("fa_max.qual_worker: starting (worker=%s)", self.worker_id)
+        self._sweep_expired()
         reactivate_failed_qualification_items()
         run_checklist_version_backstop_sweep()
         while not self._stop:
@@ -497,55 +510,13 @@ def _handle_sufficient(
         # transaction after the lock releases.
         _cancel_all_gap_alerts_for_opportunity(session=session, opportunity_id=opportunity_id)
 
-        # Compute + persist the Scenario Builder result for EVERY sufficient
-        # evaluation, not only the first (code-review finding, ninth round,
-        # 2026-09): the state_engine.transition() hook only fires on the
-        # qualifying→scoping STAGE CHANGE — a later correction that keeps
-        # the opportunity in 'scoping' (or beyond) produces no new stage
-        # transition, so the dossier Josh reviews never reflected it. This
-        # is the primary, reliable trigger for BOTH first sufficiency and
-        # every later correction; enqueue_quote_ready_work above remains
-        # for whichever future consumer eventually reads that queue.
-        #
-        # Persist here, under the SAME lock validated above (so this result
-        # is provably computed from the exact facts just validated); Slack
-        # delivery happens AFTER commit below, never inside this
-        # transaction, so a later failure in this same transaction can
-        # never leave a posted card with no committed row behind it.
-        #
-        # Isolated in its own savepoint (matching state_engine.py's
-        # existing _maybe_trigger_quote_ready_review pattern): a Scenario
-        # Builder compute/persist failure must never poison the stage
-        # transition, EXCEPTIONS cancellation, and builder-queue enqueue
-        # already done above in this same transaction.
-        pending_dossier_result_id = None
-        sp = session.begin_nested()
-        try:
-            from src.services.quote_ready.dossier import compute_and_persist_quote_ready
-            pending_dossier_result_id = compute_and_persist_quote_ready(
-                session, opportunity_id=opportunity_id
-            )
-            sp.commit()
-        except Exception:
-            sp.rollback()
-            logger.warning(
-                "fa_max.qual_worker: Scenario Builder compute/persist failed for"
-                " opportunity=%s — stage transition/cancellation above are unaffected",
-                opportunity_id, exc_info=True,
-            )
-
         session.commit()
-
-    if pending_dossier_result_id:
-        from src.services.quote_ready.dossier import post_quote_ready_dossier
-        with get_db_context() as delivery_session:
-            post_quote_ready_dossier(delivery_session, pending_dossier_result_id)
 
     if work_item_id:
         logger.info(
             "fa_max.qual_worker: opportunity=%s sufficient at revision=%d"
             " → enqueued fa_max_quote_ready work_item=%s"
-            " (DEPENDENCY: Dev 4 WP-8A/8B consumer not yet built)",
+            " (durable builder task)",
             opportunity_id, facts_revision, work_item_id,
         )
     else:

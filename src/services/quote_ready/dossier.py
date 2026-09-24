@@ -212,7 +212,7 @@ def assemble_dossier_row(session: Session, result_id: str) -> Optional[dict[str,
     return row
 
 
-def post_quote_ready_dossier(session: Session, result_id: str) -> Optional[str]:
+def post_quote_ready_dossier(session: Session, result_id: str, *, delivery_id: Optional[str] = None) -> Optional[str]:
     """Post the dossier for one fa_max_quote_ready_results row to the
     internal MONEY Slack lane. Returns the Slack message ts, or None if
     Slack isn't configured or the row doesn't exist (never raises — a
@@ -236,8 +236,9 @@ def post_quote_ready_dossier(session: Session, result_id: str) -> Optional[str]:
     text_body = build_dossier_text(row)
     try:
         from slack_sdk import WebClient
-        client = WebClient(token=token.get_secret_value())
-        response = client.chat_postMessage(channel=channel, text=text_body, blocks=_build_dossier_blocks(row, text_body))
+        client = WebClient(token=token.get_secret_value(), timeout=15, retry_handlers=[])
+        kwargs = {"client_msg_id": delivery_id} if delivery_id else {}
+        response = client.chat_postMessage(channel=channel, text=text_body, blocks=_build_dossier_blocks(row, text_body), **kwargs)
         return response["ts"]
     except Exception:
         logger.error("[QuoteReady] Slack post failed for result_id=%s", result_id, exc_info=True)
@@ -774,7 +775,7 @@ _DEFAULT_MAX_LTC = Decimal("0.85")
 _DEFAULT_MAX_LTV = Decimal("0.75")
 
 
-def compute_and_persist_quote_ready(session: Session, *, opportunity_id: str) -> Optional[str]:
+def compute_and_persist_quote_ready(session: Session, *, opportunity_id: str, return_existing: bool = False) -> Optional[str]:
     """Compute a Quote Ready scenario from an opportunity's current facts
     and durably persist it — NO Slack delivery here. Returns the result_id
     of a genuinely NEW or changed scenario, or None when there is nothing
@@ -893,7 +894,7 @@ def compute_and_persist_quote_ready(session: Session, *, opportunity_id: str) ->
     if new_result_id == previous_id:
         logger.info("[QuoteReady] opportunity_id=%s: scenario unchanged, nothing new to deliver",
                      opportunity_id)
-        return None
+        return new_result_id if return_existing else None
 
     logger.info("[QuoteReady] opportunity_id=%s computed+persisted result_id=%s"
                 " facts_revision=%d (missing=%s) — pending delivery",
@@ -902,21 +903,10 @@ def compute_and_persist_quote_ready(session: Session, *, opportunity_id: str) ->
 
 
 def maybe_trigger_quote_ready_review(session: Session, *, opportunity_id: str) -> None:
-    """Compute, persist, AND post the dossier inline, in one call — kept for
-    the state_engine.transition() 'scoping' hook, whose savepoint-isolated
-    call site cannot straightforwardly defer delivery to after the OUTER
-    transaction commits (transition() is generic and used by many callers
-    beyond T3-7; restructuring its return contract to carry a pending
-    delivery id is out of scope here).
+    """Legacy synchronous helper for explicit/manual callers only.
 
-    Accepted residual risk (unchanged from before the ninth-round split):
-    if the outer transaction this runs inside later fails and rolls back
-    AFTER this call's Slack post succeeds, the card stays posted with no
-    committed row behind its buttons. qualification_worker.py's own caller
-    (T3-7's real, primary path — both first sufficiency and every later
-    correction) does NOT use this function; it calls
-    compute_and_persist_quote_ready() directly and delivers strictly after
-    its own commit, closing this risk for the path T3-7 controls.
+    Production transitions and qualification enqueue through quote_ready.workflow.
+    This helper does not own a transaction and is not an automatic hook.
     """
     new_result_id = compute_and_persist_quote_ready(session, opportunity_id=opportunity_id)
     if new_result_id is not None:
