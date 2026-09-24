@@ -2155,7 +2155,8 @@ class ScraperRunStats(Base):
             "'tax_deed_auction', 'vacant_land',"
             "'tax_deed_outcomes', 'appraiser_sale_outcomes', 'foreclosure_outcomes',"
             "'outcome_label_layer', 'dor_sales', 'dor_sale_outcomes',"
-            "'deed_flip_outcomes', 'probate_lien_outcomes', 'lis_pendens_outcomes'"
+            "'deed_flip_outcomes', 'probate_lien_outcomes', 'lis_pendens_outcomes',"
+            "'partner_mining'"
             ")",
             name="check_run_stats_source_type",
         ),
