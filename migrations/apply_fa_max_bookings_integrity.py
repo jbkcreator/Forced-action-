@@ -13,6 +13,9 @@ Three guarantees the first cut of fa_max_bookings could not make:
                      calendar. Partial, so a cancelled booking frees its slot
                      for re-booking rather than blocking it forever.
 
+  live-overlap     — two live bookings on one calendar cannot overlap, even
+    exclusion        with different starts or durations (needs btree_gist).
+
   tracked_link_id  — lets the booking page refuse a second live booking from
                      one link, which is otherwise unbounded.
 
@@ -73,6 +76,27 @@ _DDL = [
     CREATE UNIQUE INDEX IF NOT EXISTS ux_fa_max_bookings_live_slot
         ON fa_max_bookings (calendar_id, starts_at)
         WHERE status IN ('pending', 'confirmed', 'reschedule_requested');
+    """,
+    # The unique index above only catches identical starts. Slots come in 30
+    # and 60 minutes on a 30-minute grid, so 14:00-15:00 and 14:30-15:00 have
+    # different starts yet overlap; only a range exclusion closes that race.
+    """
+    CREATE EXTENSION IF NOT EXISTS btree_gist;
+    """,
+    """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint WHERE conname = 'ex_fa_max_bookings_live_overlap'
+        ) THEN
+            ALTER TABLE fa_max_bookings
+                ADD CONSTRAINT ex_fa_max_bookings_live_overlap
+                EXCLUDE USING gist (
+                    calendar_id WITH =,
+                    tstzrange(starts_at, ends_at) WITH &&
+                ) WHERE (status IN ('pending', 'confirmed', 'reschedule_requested'));
+        END IF;
+    END $$;
     """,
     """
     CREATE INDEX IF NOT EXISTS idx_fa_max_bookings_tracked_link

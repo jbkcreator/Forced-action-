@@ -38,8 +38,9 @@ from src.core.database import get_db_context
 
 logger = logging.getLogger(__name__)
 
-# A claim older than this cannot still be in flight: book() holds one only
-# across a single provider call.
+# A claim older than this should not still be in flight: book() holds one
+# only across a single provider call. If a call does outlive it, book()'s
+# confirm finds the row released and cancels the event it just created.
 STALE_CLAIM_MINUTES = 15
 
 # Past meetings are left alone. A cancellation after the fact changes

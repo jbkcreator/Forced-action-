@@ -23,7 +23,8 @@ CALENDAR_ID = "client@example.invalid"
 def _window() -> tuple[str, str]:
     """A window far enough out to clear the minimum-notice rule."""
     start = datetime.now(timezone.utc) + timedelta(days=2)
-    return start.isoformat(), (start + timedelta(days=2)).isoformat()
+    # Four days always spans a weekday, whatever day the suite runs on.
+    return start.isoformat(), (start + timedelta(days=4)).isoformat()
 
 
 class TestRegistration:

@@ -505,6 +505,8 @@ class TestIntegrityAgainstPostgres:
 
 
 class _Result:
+    rowcount = 1
+
     def __init__(self, row):
         self._row = row
 
@@ -751,3 +753,62 @@ class TestWrittenSqlWithoutDatabase:
             )
         assert session.statements_containing("UPDATE fa_max_bookings") == []
         alert.assert_not_called()
+
+
+class TestPr296ReviewFixes:
+    """Regressions for the PR #296 review: overlap, naive times, expired claims."""
+
+    def test_overlapping_slot_with_a_different_start_is_refused(self, bookings_db):
+        with _allow_all():
+            first = _book(FakeCalendar(), bookings_db, slot=_slot(14, minutes=60))
+            # A fresh fake sees no busy time, as when both requests pass the
+            # live re-check before either event exists — only the DB can refuse.
+            second = _book(
+                FakeCalendar(), bookings_db, slot=_slot(14, 30),
+                attendee="other@example.invalid",
+            )
+        assert first.booked
+        assert not second.booked
+        assert second.reason == "slot_taken"
+
+    def test_back_to_back_slots_do_not_conflict(self, bookings_db):
+        with _allow_all():
+            first = _book(FakeCalendar(), bookings_db, slot=_slot(14))
+            second = _book(
+                FakeCalendar(), bookings_db, slot=_slot(14, 30),
+                attendee="other@example.invalid",
+            )
+        assert first.booked and second.booked
+
+    def test_naive_timestamps_are_rejected_before_anything_is_written(self):
+        session = _RecordingSession()
+        naive = datetime(2026, 6, 15, 14)
+        with _allow_all(), pytest.raises(ValueError, match="timezone-aware"):
+            book(
+                client=FakeCalendar(), session=session, calendar_id=CALENDAR_ID,
+                slot=Slot(start=naive, end=naive + timedelta(minutes=30)),
+                attendee_email=ATTENDEE, topic="Intro call",
+            )
+        assert session.calls == []
+
+    def test_a_claim_released_mid_call_cancels_the_new_event(self):
+        class _SweptSession(_RecordingSession):
+            def execute(self, statement, params=None):
+                result = super().execute(statement, params)
+                if "SET status = 'confirmed'" in " ".join(str(statement).split()):
+                    result.rowcount = 0
+                return result
+
+        calendar = FakeCalendar()
+        session = _SweptSession()
+        with _allow_all():
+            result = book(
+                client=calendar, session=session, calendar_id=CALENDAR_ID,
+                slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+            )
+
+        assert not result.booked
+        assert result.reason == "claim_expired"
+        assert calendar.get_busy(
+            calendar_id=CALENDAR_ID, start=_slot(11).start, end=_slot(11).end
+        ) == [], "the orphaned meeting must be taken back"

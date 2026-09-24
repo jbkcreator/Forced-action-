@@ -11207,9 +11207,9 @@ class FaMaxBooking(Base):
             name="ck_fa_max_bookings_status",
         ),
         CheckConstraint("ends_at > starts_at", name="ck_fa_max_bookings_span"),
-        # The partial unique index holding one live booking per slot is
-        # created in migrations/apply_fa_max_bookings_integrity.py — a
-        # filtered index cannot be expressed as a table constraint.
+        # The partial unique index and the live-overlap exclusion constraint
+        # are created in migrations/apply_fa_max_bookings_integrity.py — both
+        # are filtered, and the exclusion needs the btree_gist extension.
     )
 
     def __repr__(self) -> str:

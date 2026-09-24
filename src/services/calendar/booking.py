@@ -33,7 +33,12 @@ from config.calendar import (
     DEFAULT_SLOT_DURATION_MINUTES,
     RESCHEDULE_ALERT_RULE,
 )
-from src.services.calendar.availability import BusyBlock, Slot, compute_free_slots
+from src.services.calendar.availability import (
+    BusyBlock,
+    Slot,
+    _require_aware,
+    compute_free_slots,
+)
 from src.services.calendar.client import CalendarClient, CalendarEvent
 
 logger = logging.getLogger(__name__)
@@ -129,6 +134,11 @@ def book(
     """
     from src.agents.fa_max.tool_registry import check_suppression
 
+    # A naive time would crash the tz-aware busy comparison, or be stored in
+    # TIMESTAMPTZ at whatever offset the DB session happens to use.
+    _require_aware(slot.start, "slot.start")
+    _require_aware(slot.end, "slot.end")
+
     suppression = check_suppression(
         recipient=attendee_email, channel="email", session=session
     )
@@ -179,7 +189,22 @@ def book(
         logger.exception("calendar.book: provider rejected booking_ref=%s", booking_ref)
         raise
 
-    _confirm_claim(session, booking_ref, event)
+    if not _confirm_claim(session, booking_ref, event):
+        # The stale-claim sweep released this row while the provider call was
+        # in flight, so the slot may already be someone else's. Take back the
+        # meeting rather than leave one no record points at.
+        logger.error(
+            "calendar.book: claim expired mid-call booking_ref=%s — cancelling event_id=%s",
+            booking_ref, event.event_id,
+        )
+        try:
+            client.cancel_event(calendar_id=calendar_id, event_id=event.event_id)
+        except Exception:
+            logger.exception(
+                "calendar.book: could not cancel orphaned event_id=%s", event.event_id
+            )
+        return BookingResult(booked=False, booking_ref=booking_ref, reason="claim_expired")
+
     logger.info(
         "calendar.book: booked booking_ref=%s event_id=%s", booking_ref, event.event_id
     )
@@ -284,8 +309,8 @@ def _claim_slot(
     """Durably claim the slot. Returns the booking ref, or None if lost.
 
     Commits so the claim survives a crash during the provider call. The
-    partial unique index on (calendar_id, starts_at) settles concurrent
-    bookings that both passed the availability re-check.
+    live-overlap exclusion constraint settles concurrent bookings that both
+    passed the availability re-check, whatever their starts or durations.
     """
     from sqlalchemy.exc import IntegrityError
 
@@ -321,16 +346,18 @@ def _claim_slot(
     return booking_ref
 
 
-def _confirm_claim(session, booking_ref: str, event: CalendarEvent) -> None:
-    session.execute(
+def _confirm_claim(session, booking_ref: str, event: CalendarEvent) -> bool:
+    """Confirm our own pending claim. False if the sweep already released it."""
+    result = session.execute(
         sa_text(
             "UPDATE fa_max_bookings "
             "SET status = 'confirmed', provider_event_id = :event_id, updated_at = NOW() "
-            "WHERE booking_ref = :booking_ref"
+            "WHERE booking_ref = :booking_ref AND status = 'pending'"
         ),
         {"booking_ref": booking_ref, "event_id": event.event_id},
     )
     session.commit()
+    return result.rowcount == 1
 
 
 def _release_claim(session, booking_ref: str) -> None:
