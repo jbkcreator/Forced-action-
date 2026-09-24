@@ -1137,6 +1137,15 @@ COUNTY_ID=hillsborough
 # rows. Idempotent: same inputs are a no-op; changed inputs insert+supersede.
 0 10 * * * $PROJECT/scripts/cron/run.sh src.tasks.arv_sweep
 
+# 10:30 UTC — WP-T3-8 Fundability Agent backstop sweep. Runs after arv_sweep
+# (10:00) so WP-8B's published ARV rows are fresh. Finds open opportunities
+# whose latest qualification decision is pending_enrichment (ARV absent),
+# writes the published ARV via set_facts() (T3-7's authoritative write path),
+# and escalates to EXCEPTIONS after ENRICHMENT_EXHAUSTION_DAYS. Pre-flight
+# check exits cleanly if T3-7 tables (fa_max_opportunity_facts,
+# fa_max_qualification_decisions) haven't been applied yet.
+30 10 * * * $PROJECT/scripts/cron/run.sh src.tasks.fa_max_fundability_sweep
+
 # the top-N digest to the MONEY Slack channel so it's waiting before Josh's
 # morning calling block.
 #

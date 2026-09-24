@@ -151,6 +151,27 @@ def run(
                 )
                 persisted += 1
 
+                # WP-T3-8 event-driven hook: notify fundability agent that a
+                # new ARV is available for this property so any waiting
+                # opportunity can resolve its pending_enrichment gap the same
+                # day rather than waiting for the next fundability sweep.
+                # Guard: if T3-7 tables (fa_max_opportunity_facts) aren't
+                # applied yet, the import fails silently so arv_sweep itself
+                # is never broken by the T3-8 dependency.
+                try:
+                    from src.services.fa_max_fundability_agent import (
+                        populate_arv_for_property,
+                    )
+                    populate_arv_for_property(session=db, property_id=pid)
+                except ImportError:
+                    pass
+                except Exception:
+                    logger.warning(
+                        "[ARVSweep] fundability hook failed for property_id=%d"
+                        " — sweep result unaffected",
+                        pid,
+                    )
+
             except Exception as exc:
                 errors += 1
                 logger.warning("[ARVSweep] property_id=%d failed: %s", pid, exc)
