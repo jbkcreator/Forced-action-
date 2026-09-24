@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime, timedelta, timezone
-from typing import List, Optional
+from collections import defaultdict
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
@@ -22,8 +23,8 @@ from sqlalchemy.orm import Session
 from config.settings import get_settings
 from .assemble import assemble_batch
 from .classify import classify
-from .delivery import post_staleness_alert, post_to_slack
-from .models import GyrColor, RouterConfig, RoutingDecision
+from .delivery import post_queue_header, post_reengagement, post_staleness_alert, post_to_slack
+from .models import GyrColor, RedReason, RouterConfig, RoutingDecision
 
 _ET = ZoneInfo("America/New_York")
 
@@ -39,8 +40,52 @@ def _router_config() -> RouterConfig:
     )
 
 
+_COLOR_ORDER = {GyrColor.GREEN: 0, GyrColor.YELLOW: 1, GyrColor.RED: 2}
+
+
+def is_reengagement(
+    prior_color: Optional[str], prior_reasons: Optional[Sequence[str]], decision: RoutingDecision,
+) -> bool:
+    """A deal previously declined by the Lender Box that now routes green or
+    yellow -- a possible re-engagement (spec item 21: "previously declined
+    borrowers who have since become fundable")."""
+    return (
+        prior_color == GyrColor.RED.value
+        and RedReason.OUT_OF_BOX.value in (prior_reasons or [])
+        and decision.color in (GyrColor.GREEN, GyrColor.YELLOW)
+    )
+
+
+def _prior_states(ids: Sequence[str], db: Session) -> Dict[str, Tuple[Optional[str], list]]:
+    rows = db.execute(
+        text("""
+            SELECT opportunity_id::text, gyr_color, gyr_reason
+            FROM fa_max_opportunities
+            WHERE opportunity_id = ANY(CAST(:ids AS uuid[]))
+        """),
+        {"ids": list(ids)},
+    ).mappings().all()
+    return {r["opportunity_id"]: (r["gyr_color"], r["gyr_reason"] or []) for r in rows}
+
+
+def rank_for_delivery(
+    pairs: Sequence[Tuple[Any, RoutingDecision]],
+) -> Dict[str, List[Tuple[Any, RoutingDecision]]]:
+    """Group routed opportunities by Slack queue, each ranked by color then
+    expected dollars descending. Terminal decisions (no queue) are dropped."""
+    by_queue: Dict[str, List[Tuple[Any, RoutingDecision]]] = defaultdict(list)
+    for ctx, decision in pairs:
+        if decision.queue:
+            by_queue[decision.queue].append((ctx, decision))
+    for items in by_queue.values():
+        items.sort(key=lambda p: (_COLOR_ORDER[p[1].color], -p[1].expected_revenue_cents))
+    return dict(by_queue)
+
+
 def run_sweep(db: Session, as_of: Optional[date] = None) -> int:
-    """Nightly full sweep. Returns number of opportunities processed."""
+    """Nightly full sweep. Classifies and persists every open opportunity,
+    then delivers each Slack queue as a header plus cards in rank order.
+    Returns number of opportunities processed."""
     as_of = as_of or date.today()
     config = _router_config()
     processed = 0
@@ -52,18 +97,31 @@ def run_sweep(db: Session, as_of: Optional[date] = None) -> int:
     all_ids = list(ids_result)
     logger.info("GYR sweep starting: %d open opportunities", len(all_ids))
 
+    routed = []
+    reengaged = []
     for batch_start in range(0, len(all_ids), _BATCH_SIZE):
         batch = all_ids[batch_start: batch_start + _BATCH_SIZE]
+        prior = _prior_states(batch, db)
         contexts = assemble_batch(batch, db)
 
         for ctx in contexts:
             decision = classify(ctx, config)
             _persist(ctx.opportunity_id, decision, db)
             _log_decision(ctx.opportunity_id, decision, db)
-            post_to_slack(ctx, decision)
+            routed.append((ctx, decision))
+            if is_reengagement(*prior.get(ctx.opportunity_id, (None, [])), decision):
+                reengaged.append((ctx, decision))
             processed += 1
 
         db.commit()
+
+    for queue, items in rank_for_delivery(routed).items():
+        total_cents = sum(d.expected_revenue_cents for _, d in items)
+        post_queue_header(queue, count=len(items), total_revenue_cents=total_cents)
+        for rank, (ctx, decision) in enumerate(items, start=1):
+            post_to_slack(ctx, decision, rank=rank, total=len(items))
+    for ctx, decision in reengaged:
+        post_reengagement(ctx, decision)
 
     logger.info("GYR sweep complete: %d opportunities routed", processed)
     return processed
@@ -81,16 +139,7 @@ def reevaluate(ids: List[str], db: Session) -> int:
     config = _router_config()
     changed = 0
 
-    # Fetch current colors for change detection
-    current_rows = db.execute(
-        text("""
-            SELECT opportunity_id::text, gyr_color
-            FROM fa_max_opportunities
-            WHERE opportunity_id = ANY(CAST(:ids AS uuid[]))
-        """),
-        {"ids": ids},
-    ).mappings().all()
-    current_color = {r["opportunity_id"]: r["gyr_color"] for r in current_rows}
+    prior = _prior_states(ids, db)
 
     for batch_start in range(0, len(ids), _BATCH_SIZE):
         batch = ids[batch_start: batch_start + _BATCH_SIZE]
@@ -98,12 +147,14 @@ def reevaluate(ids: List[str], db: Session) -> int:
 
         for ctx in contexts:
             decision = classify(ctx, config)
-            old_color = current_color.get(ctx.opportunity_id)
+            old_color, old_reasons = prior.get(ctx.opportunity_id, (None, []))
             _persist(ctx.opportunity_id, decision, db)
             _log_decision(ctx.opportunity_id, decision, db)
             if old_color != decision.color.value:
                 post_to_slack(ctx, decision)
                 changed += 1
+            if is_reengagement(old_color, old_reasons, decision):
+                post_reengagement(ctx, decision)
 
         db.commit()
 

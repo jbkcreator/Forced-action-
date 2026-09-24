@@ -9,7 +9,8 @@ A cron worker (scripts/run_abandonment_worker.py) runs every minute,
 calls fire_due_touches(), and sends any rows where due_at <= now() and
 the row is not yet sent or cancelled.
 
-halt_sequence() is called by router.py when an inbound reply arrives —
+halt_sequence() is called by router.py when an inbound reply arrives, and
+halt_for_portal_completion() when the borrower finishes the application —
 it cancels all pending touches for that person so the sequence stops
 immediately.
 
@@ -34,6 +35,10 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+
+from src.services import fa_max_outbound_links
+from src.services.fa_max_outbound_links import BOOKING_LINE, OutboundLinks
+from src.services.fa_max_portal_completion import halt_for_portal_completion, is_portal_completed
 
 logger = logging.getLogger(__name__)
 
@@ -61,8 +66,8 @@ _TOUCH_TEMPLATES = {
         "to help if you hit a snag or have questions. Just reply here or finish up: {portal_link}"
     ),
     3: (
-        "Wanted to follow up one more time. Rates are moving and getting pre-qualified "
-        "now locks in your position before anything shifts. Takes just a few minutes: {portal_link}"
+        "Wanted to follow up one more time. If you've got a deal lined up, finishing the "
+        "pre-qual now means we can move quickly when you need us. Takes just a few minutes: {portal_link}"
     ),
     4: (
         "Would it help to jump on a quick call? I can walk you through the application "
@@ -201,7 +206,7 @@ def fire_due_touches(db: Session) -> int:
     rows = db.execute(
         text("""
             SELECT id, person_id, contact_email, opportunity_id,
-                   borrower_first_name, touch_number, idempotency_key
+                   borrower_first_name, touch_number, idempotency_key, created_at
             FROM abandonment_sequences
             WHERE due_at      <= NOW()
               AND sent_at      IS NULL
@@ -224,6 +229,7 @@ def fire_due_touches(db: Session) -> int:
             borrower_first_name=row[4],
             touch_number=row[5],
             idempotency_key=row[6],
+            sequence_started_at=row[7],
             db=db,
         )
         if success:
@@ -242,6 +248,7 @@ def _fire_touch(
     borrower_first_name: Optional[str],
     touch_number: int,
     idempotency_key: str,
+    sequence_started_at: datetime,
     db: Session,
 ) -> bool:
     if not contact_email:
@@ -260,7 +267,22 @@ def _fire_touch(
         halt_sequence(person_id, db, reason="suppressed")
         return False
 
-    body = _render_template(touch_number, borrower_first_name)
+    if is_portal_completed(db, person_id, opportunity_id, sequence_started_at):
+        logger.info(
+            "abandonment: person_id=%s completed the portal — halting before touch %d",
+            person_id, touch_number,
+        )
+        halt_sequence(person_id, db, reason="portal_completed")
+        return False
+
+    links = fa_max_outbound_links.resolve_or_alert(
+        db, agent_name=_AGENT_NAME, person_id=person_id, opportunity_id=opportunity_id,
+    )
+    if links is None:
+        _cancel_touch(seq_id, "link_unresolved", db)
+        return False
+
+    body = _render_template(touch_number, borrower_first_name, links)
     subject = _touch_subject(touch_number)
 
     relay_idem = f"abandonment:touch:{idempotency_key}"
@@ -346,12 +368,16 @@ def _is_suppressed(person_id: str, db: Session) -> bool:
     return row[0] in ("suppressed", "do_not_contact", "dead")
 
 
-def _render_template(touch_number: int, borrower_first_name: Optional[str]) -> str:
+def _render_template(
+    touch_number: int, borrower_first_name: Optional[str], links: OutboundLinks,
+) -> str:
     template = _TOUCH_TEMPLATES.get(touch_number, "")
+    if "{calendar_link}" not in template:
+        template += "\n\n" + BOOKING_LINE
     name = borrower_first_name or "there"
     body = f"Hey {name},\n\n" + template.format(
-        portal_link="[portal link]",
-        calendar_link="[calendar link]",
+        portal_link=links.portal_url,
+        calendar_link=links.calendar_url,
     )
     return body + _COMPLIANCE_FOOTER
 

@@ -1156,10 +1156,17 @@ COUNTY_ID=hillsborough
 # cancelled in Google otherwise leaves our record saying confirmed, and a
 # claim orphaned by a crash holds its slot forever. Every 15 minutes because
 # a borrower turning up to a cancelled call is the failure being prevented.
-# Dry-run by default; add --apply once the live calendar is configured, and
-# note the task refuses to run at all while FA_MAX_CALENDAR_MODE=fake.
+# Live calendar is configured (dev Google calendar until the client's creds
+# swap in — env-only). The task refuses to run at all while
+# FA_MAX_CALENDAR_MODE=fake or FA_MAX_CALENDAR_ID is unset, so --apply
+# cannot wipe bookings on a misconfigured host.
+*/15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.calendar_booking_sweep --apply
 
-*/15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.calendar_booking_sweep
+# WP-T2-8 permit detail enrichment — fills contractor/applicant/owner on new
+# building_permits rows (Accela CapDetail) so the builder engine can resolve
+# principals and size loans. 40-50 min after each of the 3x/day permit loads
+# (05:45–05:55, 13:45–13:55, 21:45–21:55 UTC, Mon-Sat), all counties.
+40 6,14,22 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.permit_detail_sweep --limit 200
 # WP-T2-9 Partner Mining & Producer Ranking — runs after nightly deed load
 # (deeds load 05:00–05:10 UTC; this fires at 06:00 UTC to ensure both
 # Hillsborough and Pinellas deed batches are committed before ranking).
