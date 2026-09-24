@@ -16,6 +16,7 @@ from src.agents.cora.command_center import slack_socket
 def test_run_socket_mode_refuses_to_start_when_auth_test_always_fails():
     settings = MagicMock()
     settings.fa_max_slack_bot_token.get_secret_value.return_value = "xoxb-fake"
+    settings.fa_max_slack_bot_user_id = None
 
     with patch.object(slack_socket, "_get_app_token", return_value="xapp-fake"), \
          patch("slack_sdk.WebClient") as MockWebClient, \

@@ -4,7 +4,7 @@ publishes each one to the cc:events Redis stream for the CC worker to process.
 
 Pattern mirrors src/agents/cora/ingestion/reply_mailbox_poller.py:
   - Watermark (latest ts) stored in Redis — only new messages each poll
-  - Bot's own messages filtered out (U0BNFHF5STT) to prevent reply loops
+  - Bot's own messages filtered out to prevent reply loops
   - publish_query() → cc:events → CommandCenterWorker picks up and answers
   - Session ID: cc:{user_id}:{channel_id} — one conversation per user per channel
 
@@ -28,9 +28,9 @@ from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
-# The bot's own Slack user ID — messages from this user are skipped
-# to prevent the bot from replying to its own answers.
-_BOT_USER_ID = "U0C2GT5CDGA"
+# The bot's own Slack user ID, resolved at startup by run_periodic so that
+# messages the bot posted are skipped instead of answered again.
+_BOT_USER_ID: Optional[str] = None
 
 _WATERMARK_KEY_PREFIX = "cc:slack:watermark:"  # + channel_id
 _SEEN_KEY_PREFIX = "cc:slack:seen:"             # + message ts
@@ -237,6 +237,23 @@ def run_periodic(
         "cc.slack_listener: starting — channel=%s poll_interval=%ds",
         channel, interval_seconds,
     )
+
+    client = _get_client()
+    if client is None:
+        logger.error("cc.slack_listener: FA_MAX_SLACK_BOT_TOKEN not set — not starting")
+        return
+
+    from src.agents.cora.command_center.bot_identity import resolve_bot_user_id
+
+    global _BOT_USER_ID
+    _BOT_USER_ID = resolve_bot_user_id(client)
+    if not _BOT_USER_ID:
+        logger.error(
+            "cc.slack_listener: refusing to start — an unfiltered listener re-ingests "
+            "the bot's own replies as new questions. Set FA_MAX_SLACK_BOT_USER_ID."
+        )
+        return
+
     # Wait until Redis is reachable before first poll (tunnel may take a moment).
     from src.core.redis_client import redis_available
     while not stop_event.is_set() and not redis_available():

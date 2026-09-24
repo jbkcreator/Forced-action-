@@ -91,6 +91,16 @@ TOOL USE RULES:
 - After gathering data, give a concise, specific answer (under 150 words). Use exact numbers.
 - If a tool returns an error, say so clearly and suggest what the user should check manually.
 
+OUTPUT FORMATTING — this is Slack, not GitHub. Slack's "mrkdwn" is NOT the same \
+as GitHub Markdown, and rendering the wrong syntax shows literal punctuation to the user:
+- Bold is *single asterisks* (*text*), never **double asterisks** — double asterisks \
+render as literal text in Slack, not bold.
+- NEVER use a Markdown table (lines with | and |---|---|) — Slack does not render \
+tables at all; they show as literal pipe characters. For any list of records \
+(e.g. multiple open files), use either a fenced code block with aligned columns \
+(```Borrower   Ref   Stage\n...```) or a bulleted list with *bold* labels — never a table.
+- Italics is _single underscores_ (_text_), never *single asterisks* (that is bold).
+
 {schema}
 """
 

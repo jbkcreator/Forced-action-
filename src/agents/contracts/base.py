@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 from dataclasses import dataclass, field
 from typing import Any, Optional, Type
 
@@ -98,9 +99,23 @@ def notify_slack_rejection(exc: HandoffRejected) -> None:
     """Per decision D2: auto-reject triggers a Slack message to Josh.
 
     No-ops (logs and returns) if Slack isn't configured -- same convention
-    as src/services/relay/slack_post.py:post_for_approval -- so this stays
-    usable in local/dev/test environments without a live Slack app.
+    as src/services/relay/slack_post.py:post_for_approval.
+
+    Also no-ops under pytest. Checking configuration alone is not enough to
+    keep a test run quiet: this checkout's .env carries real Slack
+    credentials, so a full-suite run posts a burst of rejections built from
+    fixture data. The 24h dedup in reject_and_notify() cannot absorb them
+    either, because fixtures that mint a fresh reference_id each run never
+    match a previous row.
     """
+    if "pytest" in sys.modules:
+        logger.info(
+            "[QUALITY-Q3] pytest detected — rejection at boundary=%s reference_id=%s "
+            "logged only, Slack post suppressed",
+            exc.boundary, exc.reference_id,
+        )
+        return
+
     settings = get_settings()
     token = settings.slack_bot_token
     channel = settings.quality_contracts_slack_channel

@@ -646,7 +646,7 @@ def _classify_and_respond(
         lookup_id = classify_result.lookup_id
 
         cc_channel = (
-            settings.cc_slack_channel
+            settings.fa_max_slack_cc_channel
             or settings.fa_max_slack_channel_relationships
             or ""
         )

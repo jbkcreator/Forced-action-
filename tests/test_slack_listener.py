@@ -14,6 +14,9 @@ import pytest
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
+_BOT_SELF = "U_BOT_SELF"
+
+
 def _make_message(ts: str, text: str, user: str = "U_HUMAN") -> dict:
     return {"ts": ts, "text": text, "user": user}
 
@@ -217,12 +220,13 @@ class TestPollOnceTransientFailure:
         assert publish_count[0] == 1, "message must not be published twice"
 
     def test_bot_messages_skipped(self, patch_settings):
-        """Messages from the bot's own user ID are never published."""
+        """A message the bot posted is never re-published as a new question."""
         mock_client, _ = patch_settings
-        messages = [_make_message("333.000", "bot reply", user="U0BNFHF5STT")]
+        messages = [_make_message("333.000", "bot reply", user=_BOT_SELF)]
         mock_client.conversations_history.return_value = _conversations_history_response(messages)
 
-        with patch("src.agents.cora.command_center.worker.publish_query") as mock_pub, \
+        with patch("src.agents.cora.command_center.slack_listener._BOT_USER_ID", _BOT_SELF), \
+             patch("src.agents.cora.command_center.worker.publish_query") as mock_pub, \
              patch("src.agents.cora.command_center.slack_listener._get_watermark", return_value=None), \
              patch("src.agents.cora.command_center.slack_listener._save_watermark"), \
              patch("src.core.redis_client.redis_available", return_value=False):
@@ -232,3 +236,25 @@ class TestPollOnceTransientFailure:
 
         assert n == 0
         mock_pub.assert_not_called()
+
+    def test_human_messages_survive_the_bot_filter(self, patch_settings):
+        """Control for test_bot_messages_skipped.
+
+        Without it that test also passes when poll_once publishes nothing at
+        all, so a bot ID that matches no one reads as a working filter.
+        """
+        mock_client, _ = patch_settings
+        messages = [_make_message("334.000", "how many deals?", user="U_HUMAN")]
+        mock_client.conversations_history.return_value = _conversations_history_response(messages)
+
+        with patch("src.agents.cora.command_center.slack_listener._BOT_USER_ID", _BOT_SELF), \
+             patch("src.agents.cora.command_center.worker.publish_query", return_value="1-0") as mock_pub, \
+             patch("src.agents.cora.command_center.slack_listener._get_watermark", return_value=None), \
+             patch("src.agents.cora.command_center.slack_listener._save_watermark"), \
+             patch("src.core.redis_client.redis_available", return_value=False):
+
+            from src.agents.cora.command_center.slack_listener import poll_once
+            n = poll_once("C_TEST")
+
+        assert n == 1
+        mock_pub.assert_called_once()
