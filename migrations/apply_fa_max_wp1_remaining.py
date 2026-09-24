@@ -406,6 +406,11 @@ STATEMENTS = [
     """,
 ]
 
+# DML-only slice (stage upserts + legacy remap CTE + state UPDATE + stage DELETE).
+# Used by tests that run inside a fixture transaction — DDL cannot execute inside
+# a transaction that has pending trigger events (Postgres constraint).
+LEGACY_REMAP_STATEMENTS = [s for s in STATEMENTS if "ALTER TABLE" not in s and "CREATE " not in s and "DROP " not in s]
+
 
 def main() -> int:
     with get_db_context() as db:

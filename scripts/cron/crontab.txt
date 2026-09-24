@@ -125,6 +125,17 @@ COUNTY_ID=hillsborough
 # RELATIONSHIPS_SLACK_CHANNEL. Idempotent — borrower_monitor_log deduplicates.
 45 6 * * * cd $PROJECT && PYTHONPATH=. python scripts/run_repeat_maturity_engine.py >> /var/log/fa/repeat_maturity.log 2>&1
 
+# WP-T2-6 Stage Monitoring and Document Chase — every 15 minutes. Runs
+# stall detection, proactive status touches, and document chase follow-
+# up/escalation. Idempotent — relay idempotency_key prevents duplicate
+# sends on back-to-back runs.
+*/15 * * * * cd $PROJECT && PYTHONPATH=. python scripts/run_stage_monitor_worker.py >> /var/log/fa/stage_monitor_worker.log 2>&1
+
+# WP-T2-6 Addendum 2 -- Backflip notification poll (Josh's own mailbox,
+# IMAP + app password). No-ops until FA_MAX_BACKFLIP_MAILBOX_EMAIL/
+# _APP_PASSWORD/_NOTIFICATION_SENDER_DOMAIN are all confirmed and set.
+*/15 * * * * cd $PROJECT && PYTHONPATH=. python scripts/run_backflip_mailbox_poller.py >> /var/log/fa/backflip_mailbox_poller.log 2>&1
+
 # WP-T2-5 Abandonment Agent — every minute. Polls abandonment_sequences for
 # touches where due_at <= now() and fires them via relay_approval_queue.
 # Idempotent — relay idempotency_key prevents duplicate sends on back-to-back runs.
@@ -206,7 +217,7 @@ COUNTY_ID=hillsborough
 52 4 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.divorce.divorce_engine --load-to-db --county-id pinellas --no-proxy
 
 # P5. Liens + Deeds + Judgments — 05:05 AM UTC / 01:05 AM EDT / 10:35 AM IST
-5 5 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.liens.lien_engine --start-date $(date -d "1 day ago" +\%Y-\%m-\%d) --end-date $(date +\%Y-\%m-\%d) --load-to-db --county-id pinellas
+5 5 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.liens.lien_engine --start-date $(date -d "1 day ago" +\%Y-\%m-\%d) --end-date $(date +\%Y-\%m-\%d) --load-to-db --county-id pinellas --log-name lien_engine_pinellas
 
 # P6. Building Permits       — 3x/day at 05:50, 13:50, 21:50 UTC (every 8h, Mon-Sat)
 50 5,13,21 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.permit.permit_engine --start-date $(date -d "1 day ago" +\%Y-\%m-\%d) --end-date $(date +\%Y-\%m-\%d) --load-to-db --county-id pinellas

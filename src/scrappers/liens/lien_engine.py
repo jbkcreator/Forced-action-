@@ -24,10 +24,11 @@ Usage:
 
 import asyncio
 import json
+import logging
 import time
 import traceback
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -577,7 +578,7 @@ async def _scrape_with_nodriver(
 
     debug_dir = download_dir / "debug"
 
-    async def _dump_debug(page, label: str) -> None:
+    async def _dump_debug(page, label: str, level: int = logging.ERROR) -> None:
         try:
             debug_dir.mkdir(parents=True, exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -586,7 +587,7 @@ async def _scrape_with_nodriver(
             await page.save_screenshot(filename=str(shot), full_page=True)
             content = await page.get_content()
             html.write_text(content or "", encoding="utf-8")
-            logger.error("[CF/ND] Debug capture: %s | %s", shot, html)
+            logger.log(level, "[CF/ND] Debug capture: %s | %s", shot, html)
         except Exception as exc:
             logger.warning("[CF/ND] Debug capture failed: %s", exc)
 
@@ -631,6 +632,9 @@ async def _scrape_with_nodriver(
                     return None, ScraperOutcome.SOURCE_ERROR.value, f"portal_5000_limit: {_portal_msg[:300]}"
             except Exception as _chk_exc:
                 logger.debug("[CF/ND] Could not check for 5000-cap error: %s", _chk_exc)
+            # Evidence for the caller's empty-vs-failed decision: the portal
+            # shows nothing on an empty search, so keep what it did show.
+            await _dump_debug(page, "empty_result", level=logging.INFO)
 
         return df, None, None
     except PlaywrightCodeError as exc:
@@ -881,6 +885,60 @@ def process_lien_data(file_path: Path) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Court-day calendar (used to decide whether an empty result is plausible)
+# ---------------------------------------------------------------------------
+
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
+    """n-th `weekday` (Mon=0) of the month; n=-1 means the last one."""
+    if n > 0:
+        first = date(year, month, 1)
+        return first + timedelta(days=(weekday - first.weekday()) % 7 + 7 * (n - 1))
+    nxt = date(year + (month == 12), month % 12 + 1, 1)
+    last = nxt - timedelta(days=1)
+    return last - timedelta(days=(last.weekday() - weekday) % 7)
+
+
+def _observed(d: date) -> date:
+    if d.weekday() == 5:
+        return d - timedelta(days=1)
+    if d.weekday() == 6:
+        return d + timedelta(days=1)
+    return d
+
+
+def _clerk_holidays(year: int) -> set[date]:
+    """US federal holidays plus the day after Thanksgiving. A clerk closure
+    missing from this list only costs a false alert, never silent data loss."""
+    thanksgiving = _nth_weekday(year, 11, 3, 4)
+    return {
+        _observed(date(year, 1, 1)),
+        _nth_weekday(year, 1, 0, 3),
+        _nth_weekday(year, 2, 0, 3),
+        _nth_weekday(year, 5, 0, -1),
+        _observed(date(year, 6, 19)),
+        _observed(date(year, 7, 4)),
+        _nth_weekday(year, 9, 0, 1),
+        _observed(date(year, 11, 11)),
+        thanksgiving,
+        thanksgiving + timedelta(days=1),
+        _observed(date(year, 12, 25)),
+    }
+
+
+def _past_court_days(start: date, end: date, today: Optional[date] = None) -> list[date]:
+    """Weekday, non-holiday dates in [start, end] strictly before today —
+    days whose filings should already be indexed by the portal."""
+    today = today or date.today()
+    days: list[date] = []
+    cur = start
+    while cur <= end and cur < today:
+        if cur.weekday() < 5 and cur not in _clerk_holidays(cur.year):
+            days.append(cur)
+        cur += timedelta(days=1)
+    return days
+
+
+# ---------------------------------------------------------------------------
 # Single-span scrape dispatcher (called once per day in the split loop)
 # ---------------------------------------------------------------------------
 
@@ -893,6 +951,7 @@ async def _dispatch_scrape(
     cf_profile: Optional[dict],
     headful: bool,
     no_proxy: bool,
+    download_dir: Path = RAW_LIEN_DIR,
 ) -> tuple:
     """Run one scrape for a single date span. Returns (df, outcome, error_msg).
 
@@ -905,12 +964,12 @@ async def _dispatch_scrape(
 
     if scrape_mode in ("nodriver_only", "nodriver_then_ai") and playwright_code:
         df, nd_outcome, nd_error = await _scrape_with_nodriver(
-            playwright_code, source, start_str, end_str, RAW_LIEN_DIR, cf_profile=cf_profile,
+            playwright_code, source, start_str, end_str, download_dir, cf_profile=cf_profile,
         )
         used_selector_mode = True
     elif scrape_mode in ("playwright_only", "playwright_then_ai") and playwright_code:
         df, nd_outcome, nd_error = await _scrape_with_playwright(
-            playwright_code, source, start_str, end_str, RAW_LIEN_DIR,
+            playwright_code, source, start_str, end_str, download_dir,
             headful=headful, cf_profile=cf_profile, no_proxy=no_proxy,
         )
         used_selector_mode = True
@@ -935,7 +994,7 @@ async def _dispatch_scrape(
     if not used_selector_mode or use_ai_fallback:
         task = build_agent_task(source, start_str, end_str)
         history, start_time, agent_exc = await run_browser_agent(
-            task, RAW_LIEN_DIR, headful=headful, cf_profile=cf_profile, no_proxy=no_proxy,
+            task, download_dir, headful=headful, cf_profile=cf_profile, no_proxy=no_proxy,
         )
         if history is None:
             outcome = classify_exception(agent_exc) if agent_exc is not None else ScraperOutcome.UNKNOWN.value
@@ -943,7 +1002,7 @@ async def _dispatch_scrape(
             return None, outcome, err
 
         await asyncio.sleep(5)
-        downloaded_file = _locate_download(RAW_LIEN_DIR, start_time)
+        downloaded_file = _locate_download(download_dir, start_time)
         if not downloaded_file:
             return None, ScraperOutcome.UNKNOWN.value, "agent completed but no downloaded file was located"
 
@@ -1049,6 +1108,12 @@ async def run_lien_pipeline(
         # Expands into per-day items only when the portal's 5000-row cap is
         # actually hit on a multi-day span; a single-day cap hit cannot be
         # split further and is recorded as a plain error.
+        # Per-county download dir: Hillsborough (05:00) and Pinellas (05:05)
+        # overlap, and a shared folder lets one county's export be picked up
+        # as the other's.
+        _download_dir = RAW_LIEN_DIR / county_id
+        _download_dir.mkdir(parents=True, exist_ok=True)
+
         _work_queue: deque = deque([(_start_dt, _end_dt)])
         collected: list = []
         day_errors: list = []
@@ -1060,6 +1125,7 @@ async def run_lien_pipeline(
 
             _df, _day_outcome, _day_err = await _dispatch_scrape(
                 source, _ws_str, _we_str, scrape_mode, playwright_code, cf_profile, headful, no_proxy,
+                download_dir=_download_dir,
             )
 
             _is_cap_error = _day_outcome is not None and "portal_5000_limit" in (_day_err or "")
@@ -1082,8 +1148,21 @@ async def run_lien_pipeline(
             elif _day_outcome is not None:
                 day_errors.append(f"{_ws_str}: {_day_outcome} — {_day_err}")
                 logger.error("[Pipeline] Scrape failed for %s: %s — %s", _ws_str, _day_outcome, _day_err)
+            elif _past_court_days(_ws.date(), _we.date()):
+                # The portal renders an empty search identically to a search
+                # that never ran (no grid, no message, no CSV button), so an
+                # empty span covering a completed court day is not trusted as
+                # "no filings" — fail loudly so run.sh retries and alerts.
+                _court_days = ", ".join(d.strftime("%m/%d") for d in _past_court_days(_ws.date(), _we.date()))
+                day_errors.append(
+                    f"{_ws_str}: {ScraperOutcome.UNKNOWN.value} — empty result for court day(s) {_court_days}"
+                )
+                logger.error(
+                    "[Pipeline] Empty result for %s → %s covers court day(s) %s — treating as scrape failure",
+                    _ws_str, _we_str, _court_days,
+                )
             else:
-                logger.info("[Pipeline] No records for %s", _ws_str)
+                logger.info("[Pipeline] No records for %s (no completed court days in span)", _ws_str)
 
         if not collected:
             if day_errors:

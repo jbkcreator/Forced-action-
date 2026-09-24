@@ -1004,8 +1004,17 @@ def create_fa_max_opportunity(
                 f"create_fa_max_opportunity: idempotency_key {idempotency_key!r} conflicted "
                 "but no existing row was found — this should be impossible"
             )
-        return existing.opportunity_id  # type: ignore[union-attr]
-    return row.opportunity_id  # type: ignore[union-attr]
+        opportunity_id = existing.opportunity_id  # type: ignore[union-attr]
+    else:
+        opportunity_id = row.opportunity_id  # type: ignore[union-attr]
+
+    # Register in the entity registry in the SAME transaction as the insert above, so a crash
+    # between the two can never leave an unregistered opportunity. Without this, transition()
+    # (the only sanctioned write path for opportunity stage changes) fails with
+    # invalid_transition/"not found in registry" for every opportunity this function creates
+    # (confirmed bug, WP-T2-1/T2-2 e2e review).
+    ensure_entity_registry(session=session, entity_type="opportunity", native_id=opportunity_id)
+    return opportunity_id
 
 
 def create_opportunity_from_relay_send(
@@ -1018,20 +1027,34 @@ def create_opportunity_from_relay_send(
     attribution to a draft that was never dispatched.
     """
     row = session.execute(text(
-        "SELECT person_id::text AS person_id, send_interaction_id::text AS origin_id "
+        "SELECT person_id::text AS person_id, send_interaction_id::text AS origin_id, "
+        "channel_split_source "
         "FROM relay_approval_queue WHERE id = :id AND venture_key = 'fa_max_lending' "
         "AND status = 'sent' AND autonomy_tier_at_send = 'C' "
         "AND send_interaction_id IS NOT NULL"
     ), {"id": relay_item_id}).mappings().first()
     if row is None:
         raise ValueError("relay_send_not_attributable")
-    return create_fa_max_opportunity(
+    from src.services.fa_max_send_governance import FA_MAX_ALLOWED_SOURCE_TYPES
+    if row["channel_split_source"] not in FA_MAX_ALLOWED_SOURCE_TYPES:
+        raise ValueError("relay_send_source_not_verified")
+    opportunity_id = create_fa_max_opportunity(
         session=session, person_id=row["person_id"],
-        opportunity_type=opportunity_type, source="relay_outbound",
+        opportunity_type=opportunity_type, source=row["channel_split_source"],
         source_reference=str(relay_item_id),
         idempotency_key=f"relay_outbound:{relay_item_id}:{opportunity_type}",
         origin_interaction_id=row["origin_id"],
     )
+    session.execute(text(
+        "UPDATE fa_max_opportunities AS o "
+        "SET backflip_attribution_owner = 'forced_action', "
+        "backflip_attribution_set_at = first_touch.claimed_at "
+        "FROM fa_max_person_first_touch AS first_touch "
+        "WHERE o.opportunity_id = CAST(:opportunity_id AS uuid) "
+        "AND o.person_id = first_touch.person_id "
+        "AND o.backflip_attribution_owner IS NULL"
+    ), {"opportunity_id": opportunity_id})
+    return opportunity_id
 
 
 def mark_opportunity_funded(
@@ -1045,8 +1068,13 @@ def mark_opportunity_funded(
     current = get_opportunity_state(session=session, opportunity_id=opportunity_id)
     if not current:
         return TransitionResult(outcome=TransitionOutcome.invalid_transition, current_state=None)
+    # transition() requires a real fa_max_entity_registry entity_uuid, not
+    # the opportunity's own native ID (WP-T2-6 review fix).
+    entity_uuid = ensure_entity_registry(
+        session=session, entity_type="opportunity", native_id=opportunity_id,
+    )
     result = transition(
-        session=session, entity_type="opportunity", entity_uuid=opportunity_id,
+        session=session, entity_type="opportunity", entity_uuid=entity_uuid,
         from_state=current["current_stage"], to_state="funded", actor=actor,
         source_component="src.services.state_engine.mark_opportunity_funded",
         idempotency_key=idempotency_key, state_version=current["state_version"],

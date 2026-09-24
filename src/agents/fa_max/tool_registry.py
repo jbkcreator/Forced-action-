@@ -269,6 +269,7 @@ def send(
     lane: str,
     autonomy_tier_at_send: str,
     person_id: str,
+    opportunity_id: Optional[str] = None,
     thread_id: Optional[str] = None,
     session,
     log_id: Optional[int] = None,
@@ -326,6 +327,7 @@ def send(
         agent_name=agent_name,
         autonomy_tier_at_send=autonomy_tier_at_send,
         person_id=person_id,
+        opportunity_id=opportunity_id,
         auto_authorize=gate.allowed,
         send_attempt_log_id=log_id,
     )

@@ -69,6 +69,7 @@ _IDENTITY_REPLY = (
     "• 🏠 *Deal eligibility* — check if a deal fits Backflip's lending box\n"
     "• 🔢 *Backward math* — how many outreaches to hit a deal target\n"
     "• 🐋 *Whale targets* — look up buyer entities and their activity\n"
+    "• 📁 *Backflip files* — which files are open, a borrower's stage, or their Backflip reference\n"
     "• 📈 *Scoreboard* — recent outreach volume and reply rate\n\n"
     "What do you need?"
 )
@@ -94,7 +95,9 @@ _GUARD_SYSTEM = (
     "hard-money lending Account Executive. Classify the user's question into exactly "
     "one intent. The chatbot can only answer questions about: pipeline health, "
     "outreach counts, reply rates, whale targets, deal eligibility evaluation, "
-    "backward math (how many outreaches to hit a deal target), and program rules. "
+    "backward math (how many outreaches to hit a deal target), program rules, and "
+    "FA Max Backflip file status (which files are currently open, a borrower's "
+    "submission or stage status, or a file's Backflip reference). "
     "It cannot discuss interest rates, APR, fees, loan terms, or borrower financial "
     "data (credit, income, bank statements, tax returns, SSNs)."
 )
@@ -150,8 +153,8 @@ _BLOCK_MESSAGES: Dict[str, str] = {
     ),
     "out_of_scope": (
         "I can only answer questions about the Forced Action pipeline: outreach "
-        "counts, reply rates, whale targets, deal eligibility, and backward math. "
-        "What would you like to know?"
+        "counts, reply rates, whale targets, deal eligibility, backward math, and "
+        "Backflip file status. What would you like to know?"
     ),
 }
 
@@ -160,8 +163,11 @@ def run_guard(question: str, db: Optional[Session], history: Optional[list] = No
     """
     Returns {"blocked": bool, "block_reason": str | None, "intent": str | None}.
 
-    Never raises — a guard failure defaults to NOT blocking so a transient
-    Claude error doesn't silence Josh permanently.
+    Never raises. A classifier failure blocks (fail-closed): an unclassified
+    question could be an injection attempt or a request for borrower financial
+    data, so an outage must not become a way past the guard. Greetings and the
+    Phase 1 pattern rules answer without the classifier, so they keep working
+    while it is down.
     """
     # Phase 1 — pattern scan
 
