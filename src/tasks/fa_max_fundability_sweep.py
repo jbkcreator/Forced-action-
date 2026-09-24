@@ -59,21 +59,28 @@ def run_sweep(*, dry_run: bool = False) -> int:
 
         if dry_run:
             logger.info("fa_max.fundability_sweep: dry-run mode — no writes")
-            from sqlalchemy import text
 
-            count = session.execute(
-                text(
-                    "SELECT COUNT(DISTINCT qd.opportunity_id)"
-                    " FROM fa_max_qualification_decisions qd"
-                    " JOIN fa_max_opportunities opp"
-                    "   ON opp.opportunity_id = qd.opportunity_id"
-                    " WHERE opp.outcome = 'open'"
-                    "   AND qd.gaps @> '[{\"gap_type\": \"pending_enrichment\"}]'"
-                )
-            ).scalar()
+            # Reuse the sweep's own candidate query (not a hand-rolled COUNT)
+            # so the dry-run count can never drift from what a real run would
+            # evaluate — it applies the same stage/outcome eligibility filter.
+            from src.services.fa_max_fundability_agent import (
+                _PENDING_ARV_OPPS_SQL,
+            )
+            from config.fa_max_fundability import (
+                FUNDABILITY_ELIGIBLE_OUTCOMES,
+                FUNDABILITY_ELIGIBLE_STAGES,
+            )
+
+            rows = session.execute(
+                _PENDING_ARV_OPPS_SQL,
+                {
+                    "outcomes": tuple(FUNDABILITY_ELIGIBLE_OUTCOMES),
+                    "stages": tuple(FUNDABILITY_ELIGIBLE_STAGES),
+                },
+            ).mappings().all()
             logger.info(
                 "fa_max.fundability_sweep: dry-run — %d opportunities would be evaluated",
-                count,
+                len(rows),
             )
             return 0
 

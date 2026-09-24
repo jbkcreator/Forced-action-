@@ -104,22 +104,35 @@ _SUBJECT_PROPERTY_SQL = text(
 
 _PENDING_ARV_OPPS_SQL = text(
     """
-    SELECT DISTINCT ON (qd.opportunity_id)
-        qd.opportunity_id ::text,
+    WITH latest_decision AS (
+        SELECT DISTINCT ON (qd.opportunity_id)
+            qd.opportunity_id,
+            qd.gaps
+        FROM fa_max_qualification_decisions qd
+        ORDER BY qd.opportunity_id, qd.decided_at DESC
+    ),
+    first_pending AS (
+        SELECT opportunity_id, MIN(decided_at) AS first_pending_at
+        FROM fa_max_qualification_decisions
+        WHERE gaps @> '[{"gap_type": "pending_enrichment"}]'
+        GROUP BY opportunity_id
+    )
+    SELECT
+        ld.opportunity_id ::text,
         opp.current_stage,
         opp.outcome,
         opp.person_id ::text,
         (SELECT op.property_id
            FROM fa_max_opportunity_properties op
-          WHERE op.opportunity_id = qd.opportunity_id AND op.role = 'subject'
+          WHERE op.opportunity_id = ld.opportunity_id AND op.role = 'subject'
           LIMIT 1) AS property_id,
-        MIN(qd.decided_at) OVER (PARTITION BY qd.opportunity_id) AS first_pending_at
-    FROM fa_max_qualification_decisions qd
-    JOIN fa_max_opportunities opp ON opp.opportunity_id = qd.opportunity_id
+        fp.first_pending_at
+    FROM latest_decision ld
+    JOIN fa_max_opportunities opp ON opp.opportunity_id = ld.opportunity_id
+    JOIN first_pending fp ON fp.opportunity_id = ld.opportunity_id
     WHERE opp.outcome IN :outcomes
       AND opp.current_stage IN :stages
-      AND qd.gaps @> '[{"gap_type": "pending_enrichment"}]'
-    ORDER BY qd.opportunity_id, qd.decided_at DESC
+      AND ld.gaps @> '[{"gap_type": "pending_enrichment"}]'
     """
 )
 
@@ -257,6 +270,18 @@ def populate_arv_for_opportunity(
         )
         return result
 
+    # Capture the pre-write revision so we can tell an effective change
+    # (set_facts bumps it) from a no-op write (set_facts returns it unchanged,
+    # e.g. the client already locked in the same ARV via override precedence).
+    prior_revision_row = session.execute(
+        text(
+            "SELECT facts_revision FROM fa_max_opportunity_facts"
+            " WHERE opportunity_id = :oid ::uuid"
+        ),
+        {"oid": opportunity_id},
+    ).first()
+    prior_revision = prior_revision_row[0] if prior_revision_row else 0
+
     # Write facts via T3-7's single authoritative path. Client-override
     # precedence is enforced inside set_facts() — we don't need to check it
     # here. If the ARV was already client-overridden, set_facts() returns the
@@ -270,10 +295,12 @@ def populate_arv_for_opportunity(
     )
     session.commit()
 
+    revision_changed = new_revision != prior_revision
+
     # Only re-queue if the revision actually changed (set_facts returns the
     # CURRENT revision when no effective change was made — avoid a spurious
     # recheck if the client already had the same ARV locked in).
-    if "arv" in updates:
+    if "arv" in updates and revision_changed:
         result.arv_written = True
         result.facts_revision = new_revision
         enqueue_qualification_recheck(
@@ -287,6 +314,16 @@ def populate_arv_for_opportunity(
             "fa_max.fundability: opportunity=%s property=%s ARV=%.0f written"
             " (revision=%s), qualification recheck enqueued",
             opportunity_id, property_id, updates["arv"], new_revision,
+        )
+    elif "arv" in updates:
+        # ARV was available but the write was a no-op (revision unchanged) —
+        # already recorded (e.g. a prior sweep wrote it, or a client override
+        # already locked in the same value). Not a fresh write; don't re-queue.
+        result.facts_revision = new_revision
+        logger.debug(
+            "fa_max.fundability: opportunity=%s property=%s — ARV already"
+            " current (revision=%s unchanged), no recheck needed",
+            opportunity_id, property_id, new_revision,
         )
     else:
         # Financial fallbacks written but no ARV — still incomplete for

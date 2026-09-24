@@ -141,6 +141,7 @@ class TestPopulateArvAvailable:
             MagicMock(**{"mappings.return_value.first.return_value": {
                 "assessed_value_mkt": 200000.0, "last_sale_price": None,
             }}),  # financials
+            MagicMock(**{"first.return_value": (0,)}),  # prior facts_revision
         ])
         session.execute.side_effect = lambda *a, **kw: next(calls)
 
@@ -173,6 +174,43 @@ class TestPopulateArvAvailable:
         assert re.match(r'^[a-z0-9_.:-]+$', FUNDABILITY_ARV_SOURCE), (
             "FUNDABILITY_ARV_SOURCE must match the facts API pattern ^[a-z0-9_.:-]+$"
         )
+
+    def test_noop_write_does_not_report_arv_written_or_reenqueue(self):
+        """set_facts() returns the CURRENT revision unchanged when the ARV was
+        already recorded (e.g. a prior sweep run, or a client override already
+        locked in the same value). arv_written must reflect an actual write,
+        not merely that ARV was present in the update payload — a no-op must
+        not trigger a spurious qualification recheck.
+        """
+        from src.services.fa_max_fundability_agent import populate_arv_for_opportunity
+
+        session = MagicMock()
+        calls = iter([
+            MagicMock(**{"first.return_value": (42,)}),  # subject property
+            MagicMock(**{"mappings.return_value.first.return_value": {
+                "assessed_value_mkt": None, "last_sale_price": None,
+            }}),  # financials
+            MagicMock(**{"first.return_value": (3,)}),  # prior facts_revision = 3
+        ])
+        session.execute.side_effect = lambda *a, **kw: next(calls)
+
+        arv = _make_published_arv(point=Decimal("250000"))
+
+        with (
+            patch("src.services.fa_max_fundability_agent.get_published_arv", return_value=arv),
+            # set_facts returns the SAME revision (3) — no effective change
+            patch("src.services.fa_max_fundability_agent.set_facts", return_value=3),
+            patch("src.services.fa_max_fundability_agent.enqueue_qualification_recheck") as mock_eq,
+        ):
+            result = populate_arv_for_opportunity(
+                session=session,
+                opportunity_id="test-opp-id",
+            )
+
+        assert result.arv_written is False
+        assert result.arv_unavailable is False
+        assert result.facts_revision == 3
+        mock_eq.assert_not_called()
 
 
 # ===========================================================================
@@ -260,7 +298,9 @@ class TestClientOverridePrecedence:
         fin_exec.mappings.return_value.first.return_value = {
             "assessed_value_mkt": None, "last_sale_price": None,
         }
-        session.execute.side_effect = [prop_exec, fin_exec]
+        rev_exec = MagicMock()
+        rev_exec.first.return_value = (0,)
+        session.execute.side_effect = [prop_exec, fin_exec, rev_exec]
 
         arv = _make_published_arv()
 
@@ -293,7 +333,9 @@ class TestFinancialFallbacks:
             "assessed_value_mkt": 180000.0,
             "last_sale_price": 195000.0,
         }
-        session.execute.side_effect = [prop_exec, fin_exec]
+        rev_exec = MagicMock()
+        rev_exec.first.return_value = (0,)
+        session.execute.side_effect = [prop_exec, fin_exec, rev_exec]
 
         arv = _make_published_arv(point=Decimal("250000"))
 
@@ -495,6 +537,106 @@ class TestRetryIdempotency:
         assert r1.arv_written is False
         assert r2.arv_written is False
         mock_set.assert_not_called()
+
+
+# ===========================================================================
+# Category 9b — sweep query excludes opportunities already resolved by a
+# later decision, even though an older decision was pending_enrichment
+# (code-review finding: DISTINCT ON must pick the LATEST decision first,
+# then filter for pending_enrichment — not filter-then-pick-latest-match)
+# ===========================================================================
+
+class TestPendingArvQueryLatestDecisionOnly:
+    def test_excludes_opportunity_resolved_by_newer_decision(self, fresh_db):
+        from src.services.fa_max_fundability_agent import _PENDING_ARV_OPPS_SQL
+        from config.fa_max_fundability import (
+            FUNDABILITY_ELIGIBLE_OUTCOMES,
+            FUNDABILITY_ELIGIBLE_STAGES,
+        )
+
+        session = fresh_db
+        pid = session.execute(
+            text(
+                "INSERT INTO properties"
+                " (parcel_id, source_row_hash, needs_rescore, created_at, updated_at)"
+                " VALUES (:par, 'testhash', false, now(), now())"
+                " RETURNING id"
+            ),
+            {"par": f"TEST-{uuid.uuid4().hex[:8]}"},
+        ).scalar_one()
+        session.flush()
+
+        _, opp_id = _make_person_and_opportunity(session, stage="qualifying")
+        _link_subject_property(session, opp_id, pid)
+        session.flush()
+
+        # Older decision: pending_enrichment.
+        old_ts = datetime.now(timezone.utc) - timedelta(days=3)
+        _insert_pending_decision(session, opp_id, decided_at=old_ts)
+
+        # Newer decision: gap resolved (empty gaps array).
+        session.execute(
+            text(
+                "INSERT INTO fa_max_qualification_decisions"
+                " (opportunity_id, facts_revision, checklist_version, verdict,"
+                "  gaps, decided_by, decided_at)"
+                " VALUES (:oid ::uuid, 1, '1.0.0', 'sufficient',"
+                "  '[]' ::jsonb, 'test', now())"
+            ),
+            {"oid": opp_id},
+        )
+        session.commit()
+
+        rows = session.execute(
+            _PENDING_ARV_OPPS_SQL,
+            {
+                "outcomes": tuple(FUNDABILITY_ELIGIBLE_OUTCOMES),
+                "stages": tuple(FUNDABILITY_ELIGIBLE_STAGES),
+            },
+        ).mappings().all()
+
+        matched_ids = {r["opportunity_id"] for r in rows}
+        assert opp_id not in matched_ids, (
+            "Opportunity's latest decision is resolved (no pending_enrichment gap) —"
+            " it must not be swept just because an OLDER decision was pending."
+        )
+
+    def test_includes_opportunity_whose_latest_decision_is_still_pending(self, fresh_db):
+        from src.services.fa_max_fundability_agent import _PENDING_ARV_OPPS_SQL
+        from config.fa_max_fundability import (
+            FUNDABILITY_ELIGIBLE_OUTCOMES,
+            FUNDABILITY_ELIGIBLE_STAGES,
+        )
+
+        session = fresh_db
+        pid = session.execute(
+            text(
+                "INSERT INTO properties"
+                " (parcel_id, source_row_hash, needs_rescore, created_at, updated_at)"
+                " VALUES (:par, 'testhash', false, now(), now())"
+                " RETURNING id"
+            ),
+            {"par": f"TEST-{uuid.uuid4().hex[:8]}"},
+        ).scalar_one()
+        session.flush()
+
+        _, opp_id = _make_person_and_opportunity(session, stage="qualifying")
+        _link_subject_property(session, opp_id, pid)
+        session.flush()
+
+        old_ts = datetime.now(timezone.utc) - timedelta(days=3)
+        _insert_pending_decision(session, opp_id, decided_at=old_ts)
+
+        rows = session.execute(
+            _PENDING_ARV_OPPS_SQL,
+            {
+                "outcomes": tuple(FUNDABILITY_ELIGIBLE_OUTCOMES),
+                "stages": tuple(FUNDABILITY_ELIGIBLE_STAGES),
+            },
+        ).mappings().all()
+
+        matched_ids = {r["opportunity_id"] for r in rows}
+        assert opp_id in matched_ids
 
 
 # ===========================================================================
