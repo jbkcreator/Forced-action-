@@ -404,21 +404,23 @@ class TestEscalation:
 # ===========================================================================
 
 class TestPopulateArvForPropertyIntegration:
+    def _insert_property(self, session) -> int:
+        return session.execute(
+            text(
+                "INSERT INTO properties"
+                " (parcel_id, source_row_hash, needs_rescore, created_at, updated_at)"
+                " VALUES (:par, 'testhash', false, now(), now())"
+                " RETURNING id"
+            ),
+            {"par": f"TEST-{uuid.uuid4().hex[:8]}"},
+        ).scalar_one()
+
     def test_finds_open_qualifying_opportunity(self, fresh_db):
         """populate_arv_for_property returns a result for each matching opportunity."""
         from src.services.fa_max_fundability_agent import populate_arv_for_property
 
         session = fresh_db
-
-        # Need a real property row for the FK
-        pid = session.execute(
-            text(
-                "INSERT INTO properties (parcel_id, county_id, address)"
-                " VALUES (:par, 'hillsborough', '1 Test St')"
-                " RETURNING id"
-            ),
-            {"par": f"TEST-{uuid.uuid4().hex[:8]}"},
-        ).scalar_one()
+        pid = self._insert_property(session)
         session.flush()
 
         _, opp_id = _make_person_and_opportunity(session, stage="qualifying")
@@ -443,19 +445,10 @@ class TestPopulateArvForPropertyIntegration:
         from src.services.fa_max_fundability_agent import populate_arv_for_property
 
         session = fresh_db
-
-        pid = session.execute(
-            text(
-                "INSERT INTO properties (parcel_id, county_id, address)"
-                " VALUES (:par, 'hillsborough', '2 Dead St')"
-                " RETURNING id"
-            ),
-            {"par": f"TEST-{uuid.uuid4().hex[:8]}"},
-        ).scalar_one()
+        pid = self._insert_property(session)
         session.flush()
 
         _, opp_id = _make_person_and_opportunity(session, stage="qualifying")
-        # Mark opportunity dead
         session.execute(
             text("UPDATE fa_max_opportunities SET outcome='dead' WHERE opportunity_id=:oid ::uuid"),
             {"oid": opp_id},
