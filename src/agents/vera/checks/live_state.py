@@ -126,6 +126,7 @@ _MODULE_TO_SOURCE_TYPES: dict[str, set[str]] = {
     "src.connectors.appraiser_sale_outcomes": {"appraiser_sale_outcomes"},
     "src.connectors.label_layer": {"outcome_label_layer"},
     "src.connectors.dor_sale_outcomes": {"dor_sale_outcomes"},
+    "src.tasks.partner_mining_sweep": {"partner_mining"},
 }
 
 

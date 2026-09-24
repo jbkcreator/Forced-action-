@@ -2155,7 +2155,8 @@ class ScraperRunStats(Base):
             "'tax_deed_auction', 'vacant_land',"
             "'tax_deed_outcomes', 'appraiser_sale_outcomes', 'foreclosure_outcomes',"
             "'outcome_label_layer', 'dor_sales', 'dor_sale_outcomes',"
-            "'deed_flip_outcomes', 'probate_lien_outcomes', 'lis_pendens_outcomes'"
+            "'deed_flip_outcomes', 'probate_lien_outcomes', 'lis_pendens_outcomes',"
+            "'partner_mining'"
             ")",
             name="check_run_stats_source_type",
         ),
@@ -11191,6 +11192,77 @@ class FaMaxPersonConsent(Base):
         )
 
 
+class FaMaxBooking(Base):
+    """One meeting the calendar tool scheduled on the client's calendar.
+
+    Keyed by `booking_ref` rather than the provider's event id. A reschedule
+    or cancellation arrives referring to a meeting that may since have been
+    recreated provider-side under a new id, and the opportunity it belongs to
+    needs a handle that survives that. The provider id is recorded alongside
+    so the event can still be found, not as identity.
+
+    No rate, term, or commitment fields — a booking records that a
+    conversation was scheduled, never anything about the deal.
+    """
+    __tablename__ = "fa_max_bookings"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    booking_ref: Mapped[str] = mapped_column(String(40), nullable=False, unique=True)
+    # Derived from the calendar, slot and attendee, so a replayed booking
+    # resolves to the row it already created instead of a second meeting.
+    idempotency_key: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True, unique=True,
+    )
+    tracked_link_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger,
+        ForeignKey("tracked_links.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    calendar_id: Mapped[str] = mapped_column(String(320), nullable=False)
+    provider_event_id: Mapped[Optional[str]] = mapped_column(
+        String(200), nullable=True, index=True,
+    )
+    person_id: Mapped[Optional[Any]] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_persons.person_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    attendee_email: Mapped[str] = mapped_column(String(320), nullable=False, index=True)
+    topic: Mapped[str] = mapped_column(String(200), nullable=False)
+    starts_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True,
+    )
+    ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(30), nullable=False, server_default=text("'confirmed'"),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'confirmed', 'cancelled', 'reschedule_requested')",
+            name="ck_fa_max_bookings_status",
+        ),
+        CheckConstraint("ends_at > starts_at", name="ck_fa_max_bookings_span"),
+        # The partial unique index and the live-overlap exclusion constraint
+        # are created in migrations/apply_fa_max_bookings_integrity.py — both
+        # are filtered, and the exclusion needs the btree_gist extension.
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<FaMaxBooking(ref={self.booking_ref!r}, "
+            f"starts_at={self.starts_at!r}, status={self.status!r})>"
+        )
+
+
 class FaMaxFileState(Base):
     """WP-T2-6: Backflip-side stage detail for one submitted file.
 
@@ -12212,6 +12284,44 @@ class FaMaxArvResult(Base):
         CheckConstraint(
             "status IN ('computed','superseded','overridden')", name="ck_fa_max_arv_status"
         ),
+    )
+
+
+class FaMaxThreadFallbackLog(Base):
+    """Audit log for WP-T2-12 FA Max Slack LLM responder.
+
+    One row per invocation — every authorized-approver message the responder
+    classifies, whether a card-thread reply (relay_item_id set) or a top-level
+    channel message (relay_item_id NULL). Feeds catalog tuning and human
+    follow-up on 'other' bucket rows.
+    """
+
+    __tablename__ = "fa_max_thread_fallback_log"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    # NULL for top-level channel messages (no originating card).
+    relay_item_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    slack_user_id: Mapped[str] = mapped_column(String(60), nullable=False)
+    thread_ts: Mapped[str] = mapped_column(String(40), nullable=False)
+    lane: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    raw_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    bucket: Mapped[str] = mapped_column(String(20), nullable=False)
+    lookup_id: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
+    reply_sent: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    tokens_in: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    tokens_out: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    cost_usd: Mapped[Optional[float]] = mapped_column(Numeric(12, 6), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "bucket IN ('simple_lookup','cc_query','social','other')",
+            name="ck_fa_max_thread_fallback_bucket",
+        ),
+        Index("ix_fa_max_thread_fallback_relay_item", "relay_item_id"),
+        Index("ix_fa_max_thread_fallback_created", "created_at"),
     )
 
 

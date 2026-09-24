@@ -1858,20 +1858,54 @@ def _handle_relay_thread_action(payload: dict) -> None:
     approval is refused; the approver must use the refreshed button, whose
     revision count is checked atomically with the decision. This remains
     safe if Slack failed to refresh the card.
+
+    Non-approve/reject replies from the authorized approver are handled by
+    the WP-T2-12 fallback responder (classify → answer / redirect / ack).
+    Replies from unauthorized users are silently dropped regardless of text.
     """
     event = payload.get("event") or {}
     if event.get("type") != "message" or event.get("subtype") or event.get("bot_id"):
         return
     command = str(event.get("text") or "").strip().casefold()
-    if command not in {"approve", "reject"}:
-        return
+    is_command = command in {"approve", "reject"}
     thread_ts = event.get("thread_ts")
     user_id = event.get("user")
-    if not thread_ts or not user_id:
+    if not user_id:
         return
     from src.services.relay import queue as relay_queue
-    item = relay_queue.get_item_by_slack_message_ts(str(thread_ts))
-    if item is None or not _relay_approver_authorized(str(user_id), item.venture_key):
+
+    # Card-thread path: a reply under a known relay approval card.
+    item = (
+        relay_queue.get_item_by_slack_message_ts(str(thread_ts)) if thread_ts else None
+    )
+    if item is None:
+        # WP-T2-12 (channel-level): any top-level message (or a reply in a
+        # non-card thread) in a mapped FA Max lane channel is answered by the
+        # LLM responder. Authorized-approver only; the responder stays silent
+        # on non-questions so ordinary channel chatter isn't answered.
+        lane = _fa_max_channel_lane_map().get(str(event.get("channel") or ""))
+        if lane is None:
+            return
+        if not _relay_approver_authorized(str(user_id), "fa_max_lending"):
+            return
+        from src.services.relay.thread_fallback_responder import handle_channel_message
+        handle_channel_message(
+            event=event,
+            venture_key="fa_max_lending",
+            lane=lane,
+            channel=str(event.get("channel") or ""),
+        )
+        return
+
+    if not _relay_approver_authorized(str(user_id), item.venture_key):
+        return
+    # WP-T2-12: authorized approver sent a non-command reply — invoke fallback
+    # responder (classify → catalog lookup / CC redirect / ack). This branch is
+    # the strict else after approve/reject; it never reaches the revision guard
+    # or _handle_relay_decision below.
+    if not is_command:
+        from src.services.relay.thread_fallback_responder import handle_thread_fallback_reply
+        handle_thread_fallback_reply(item, event)
         return
     # A typed reply carries no revision token. For a revised FA Max draft,
     # require the refreshed button's atomic revision check instead.
@@ -1993,6 +2027,27 @@ def _update_slack_message(candidate: "ExpansionCandidate", reply_text: str) -> N
 # ===========================================================================
 # RELAY — APPROVAL QUEUE DECISION + KILL COMMAND (RELAY-v2.2 sub-task R1)
 # ===========================================================================
+
+def _fa_max_channel_lane_map() -> dict[str, str]:
+    """Map each configured FA Max Slack channel ID to its lane (WP-T2-12).
+
+    Used to route a top-level channel message to the LLM responder and to stamp
+    the lane on its audit row. All these channels belong to fa_max_lending.
+    Unconfigured (empty) channel IDs are skipped so an unset env var can never
+    map the empty string to a lane.
+    """
+    mapping: dict[str, str] = {}
+    for attr, lane in (
+        ("fa_max_slack_channel_money", "MONEY"),
+        ("fa_max_slack_channel_exceptions", "EXCEPTIONS"),
+        ("fa_max_slack_channel_relationships", "RELATIONSHIPS"),
+        ("fa_max_slack_cc_channel", "CC"),
+    ):
+        channel_id = getattr(settings, attr, "") or ""
+        if channel_id:
+            mapping[channel_id] = lane
+    return mapping
+
 
 def _relay_approver_authorized(user_id: str, venture_key: Optional[str] = None) -> bool:
     """Fail CLOSED: an empty/unset RELAY_APPROVERS means NOBODY is

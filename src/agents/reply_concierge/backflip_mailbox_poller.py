@@ -48,6 +48,8 @@ Safety design (same spirit as Banks' emailport.py/inbox.py):
 from __future__ import annotations
 
 import email
+import email.message
+import email.policy
 import imaplib
 import logging
 from email.utils import parseaddr
@@ -147,7 +149,12 @@ def _process_one(conn, uid, sender_domain, parse_fn, apply_fn, session) -> int:
     if not msg_data or not isinstance(msg_data[0], tuple):
         return 0
 
-    msg = email.message_from_bytes(msg_data[0][1])
+    # policy.default decodes RFC 2047 encoded-word headers (e.g. a subject
+    # with a non-ASCII character arrives as "=?UTF-8?Q?...?="). Without it,
+    # msg.get("Subject") returns that raw encoded string, and "UTF-8" itself
+    # is a false-positive match for a letters+digits reference token --
+    # found via a real Gmail test send whose em dash triggered exactly this.
+    msg = email.message_from_bytes(msg_data[0][1], policy=email.policy.default)
     _, from_address = parseaddr(msg.get("From", ""))
     if not _matches_sender_filter(from_address, sender_domain):
         # Defensive re-check -- IMAP SEARCH FROM is a loose match on some

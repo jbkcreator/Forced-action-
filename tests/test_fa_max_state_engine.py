@@ -2954,7 +2954,9 @@ def test_wp1_migration_records_legacy_lifecycle_remap_event(fresh_db):
     migration = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(migration)
-    for statement in migration.STATEMENTS:
+    # Use DML-only slice — DDL cannot run inside a transaction with pending
+    # trigger events (the fixture wraps everything in one outer transaction).
+    for statement in migration.LEGACY_REMAP_STATEMENTS:
         fresh_db.execute(text(statement))
 
     assert fresh_db.execute(

@@ -272,7 +272,14 @@ class TestConsolidatedProductionPaths:
 class TestFaMaxToolRegistry:
     def test_all_expected_tools_registered(self):
         from src.agents.fa_max.tool_registry import FA_MAX_TOOL_REGISTRY
-        expected = {"get_fa_max_person_state", "get_fa_max_person_history", "check_suppression", "send", "post_slack"}
+        # Exact equality, not a subset check: the point is to catch a tool
+        # registered by accident. Each Tier 2 package that ships a tool adds
+        # it here deliberately — the calendar entries arrived with scheduling.
+        expected = {
+            "get_fa_max_person_state", "get_fa_max_person_history", "check_suppression",
+            "send", "post_slack",
+            "calendar.get_slots", "calendar.book", "calendar.reschedule",
+        }
         assert expected == set(FA_MAX_TOOL_REGISTRY.keys())
 
     def test_send_requires_send_gate(self):
@@ -2154,7 +2161,13 @@ class TestCreateFaMaxOpportunity:
         session = MagicMock()
         row = MagicMock()
         row.opportunity_id = "opp-123"
-        session.execute.return_value.fetchone.return_value = row
+        # call 0 = INSERT opportunity; calls 1-2 = ensure_entity_registry (INSERT + SELECT)
+        insert_result = MagicMock()
+        insert_result.fetchone.return_value = row
+        reg_insert = MagicMock()
+        reg_select = MagicMock()
+        reg_select.scalar.return_value = "some-uuid"
+        session.execute.side_effect = [insert_result, reg_insert, reg_select]
 
         result = create_fa_max_opportunity(
             session=session, person_id="person-1", opportunity_type="acquisition",
@@ -2172,7 +2185,12 @@ class TestCreateFaMaxOpportunity:
         session = MagicMock()
         row = MagicMock()
         row.opportunity_id = "opp-456"
-        session.execute.return_value.fetchone.return_value = row
+        insert_result = MagicMock()
+        insert_result.fetchone.return_value = row
+        reg_insert = MagicMock()
+        reg_select = MagicMock()
+        reg_select.scalar.return_value = "some-uuid"
+        session.execute.side_effect = [insert_result, reg_insert, reg_select]
 
         result = create_fa_max_opportunity(
             session=session, person_id="person-1", opportunity_type="acquisition", source="inbound_call",

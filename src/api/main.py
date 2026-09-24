@@ -309,8 +309,10 @@ from src.api.demo_router import router as demo_router  # noqa: E402
 app.include_router(demo_router)
 from src.api.deal_room_router import router as deal_room_router  # noqa: E402
 from src.api.selfserve_router import router as selfserve_router  # noqa: E402
+from src.api.booking_router import router as booking_router  # noqa: E402
 app.include_router(deal_room_router)
 app.include_router(selfserve_router)
+app.include_router(booking_router)
 
 
 # ---------------------------------------------------------------------------
