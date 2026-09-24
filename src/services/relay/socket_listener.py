@@ -109,6 +109,41 @@ def handle_socket_request(client: Any, request: Any) -> bool:
                 logger.exception("[RelaySocket] new-file DB work raised after ack")
             return True
 
+        if callback_id == "quote_ready_modify_submit":
+            # Split the same way as fa_max_new_file_submit above: everything
+            # that can produce an inline {"response_action": "errors", ...}
+            # (validation, recompute, persist, commit) runs before the ack,
+            # since Slack requires that SAME ack to carry field errors. The
+            # two Slack API calls this submission triggers on success --
+            # posting the new dossier card and neutralizing the old one --
+            # are real network round trips and do NOT need to complete
+            # before the modal closes, so they run after via
+            # finalize_modify_submission(). Confirmed real gap: this used to
+            # run both calls before the ack, on the same ~3s Socket Mode
+            # budget that caused a live dispatch_failed for
+            # fa_max_new_file_submit's DB work alone.
+            from src.api.admin_router import _handle_quote_ready_modify_submission
+
+            try:
+                ack_body, finalize_kwargs = _handle_quote_ready_modify_submission(payload)
+            except Exception:
+                logger.exception("[RelaySocket] quote_ready_modify_submit handler raised")
+                ack_body, finalize_kwargs = None, None
+
+            client.send_socket_mode_response(
+                SocketModeResponse(envelope_id=request.envelope_id, payload=ack_body)
+            )
+            if finalize_kwargs is not None:
+                from src.services.quote_ready.dossier import finalize_modify_submission
+                try:
+                    finalize_modify_submission(**finalize_kwargs)
+                except Exception:
+                    logger.exception(
+                        "[RelaySocket] finalize_modify_submission raised after ack for new_result_id=%s",
+                        finalize_kwargs.get("new_result_id"),
+                    )
+            return True
+
         response_body: Optional[dict] = None
         try:
             if callback_id == "fa_max_revise_submit":
@@ -120,9 +155,6 @@ def handle_socket_request(client: Any, request: Any) -> bool:
                 # 3-second timeout rather than a clean error.
                 from src.api.admin_router import _handle_relay_revise_submission
                 response_body = _handle_relay_revise_submission(payload)
-            elif callback_id == "quote_ready_modify_submit":
-                from src.api.admin_router import _handle_quote_ready_modify_submission
-                response_body = _handle_quote_ready_modify_submission(payload)
             else:
                 logger.info(
                     "[RelaySocket] view_submission with unrecognized callback_id=%r user=%s — "

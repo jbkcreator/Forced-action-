@@ -1604,11 +1604,56 @@ from urllib.parse import parse_qs
 from fastapi import Request
 
 
+# Sandbox Slack signing secret (settings.fa_max_test_slack_signing_secret) is
+# a fallback trust root for the ENTIRE shared _verify_slack_signature check
+# below, which authenticates all 12 Slack interactivity/command/event
+# endpoints in this router, not just Quote Ready. It's inert in production
+# today only because the env var happens to be unset there; a misconfigured
+# prod .env or a leaked sandbox-app secret would otherwise grant
+# signature-forgeable write access to every admin Slack action in this app
+# (win-story approve/reject, entity links, Relay decisions, etc.), not just
+# the Quote Ready sandbox testing it was added for. Scoped here to only the
+# action_id/callback_id values Quote Ready's sandbox E2E testing actually
+# needs, so a forged/leaked sandbox secret can at most forge a Quote Ready
+# decision, never anything else this endpoint handles.
+_QUOTE_READY_SANDBOX_SCOPED_IDS = {
+    "quote_ready_approve",
+    "quote_ready_reject",
+    "quote_ready_modify_open",
+    "quote_ready_modify_submit",
+}
+
+
+def _extract_slack_action_identifier(body: bytes) -> Optional[str]:
+    """Best-effort action_id/callback_id extraction from a raw Slack request
+    body, used only to scope the sandbox signing secret in
+    _verify_slack_signature below. Never raises: a slash command or
+    events_api body won't parse as an interactive payload at all, and that
+    correctly excludes it from the sandbox secret's reach rather than
+    erroring the request (the real signing secrets are checked regardless
+    of whether this helper can identify anything)."""
+    try:
+        payload_str = parse_qs(body.decode("utf-8")).get("payload", ["{}"])[0]
+        payload = json.loads(payload_str)
+    except Exception:
+        return None
+    callback_id = (payload.get("view") or {}).get("callback_id")
+    if callback_id:
+        return callback_id
+    actions = payload.get("actions") or []
+    if actions:
+        return actions[0].get("action_id")
+    return None
+
+
 def _verify_slack_signature(headers: dict, body: bytes) -> bool:
     """Verify Slack request signature (HMAC-SHA256). Rejects replays > 5 min old.
 
     Tries the FA Max signing secret first, then falls back to the shared secret,
     so button clicks from both Slack apps are accepted at this single endpoint.
+    The sandbox secret is a third fallback, but scoped to Quote Ready's own
+    action IDs only (see _QUOTE_READY_SANDBOX_SCOPED_IDS above) — it cannot
+    authenticate a request for anything else this shared endpoint handles.
     """
     ts = headers.get("x-slack-request-timestamp", "")
     try:
@@ -1626,6 +1671,9 @@ def _verify_slack_signature(headers: dict, body: bytes) -> bool:
     for secret in candidates:
         if not secret:
             continue
+        if secret is settings.fa_max_test_slack_signing_secret:
+            if _extract_slack_action_identifier(body) not in _QUOTE_READY_SANDBOX_SCOPED_IDS:
+                continue
         expected = "v0=" + hmac.new(
             secret.get_secret_value().encode(),
             sig_base.encode(),
@@ -3642,17 +3690,26 @@ def _handle_quote_ready_modify_open(payload: dict, db: Session) -> dict:
     return {}
 
 
-def _handle_quote_ready_modify_submission(payload: dict) -> Optional[dict]:
+def _handle_quote_ready_modify_submission(payload: dict) -> tuple[Optional[dict], Optional[dict]]:
     """WP-8B — Modify modal submission (Socket Mode view_submission).
 
     No `db: Session` param, matching _handle_relay_revise_submission's
     signature — this is invoked directly from socket_listener.py, which has
     no FastAPI Depends(get_db) to hand it; opens its own session instead.
 
-    Returns Slack's view_submission response shape: {} closes the modal,
-    {"response_action": "errors", "errors": {...}} re-opens it with
-    inline field errors. Returning None (e.g. unauthorized) also closes
-    the modal — Slack treats a missing response_action as a plain close.
+    Returns (ack_body, finalize_kwargs):
+      - ack_body is Slack's view_submission response shape: {} closes the
+        modal, {"response_action": "errors", "errors": {...}} re-opens it
+        with inline field errors. None (e.g. unauthorized) also closes the
+        modal — Slack treats a missing response_action as a plain close.
+      - finalize_kwargs is None on any error path, or the kwargs for
+        dossier.finalize_modify_submission(**finalize_kwargs) on success.
+        The caller (socket_listener.py) MUST send ack_body as the Socket
+        Mode response FIRST, then call finalize_modify_submission after —
+        it posts the new dossier card and neutralizes the old one, both
+        real Slack API calls that must not run before the ack (see
+        handle_modify_submission()'s tail comment for the dispatch_failed
+        risk this avoids).
     """
     from src.services.quote_ready.dossier import handle_modify_submission
 
@@ -3661,15 +3718,15 @@ def _handle_quote_ready_modify_submission(payload: dict) -> Optional[dict]:
     try:
         metadata = json.loads(view.get("private_metadata", "{}"))
     except Exception:
-        return {"response_action": "errors", "errors": {"purchase_price_block": "Invalid view metadata."}}
+        return {"response_action": "errors", "errors": {"purchase_price_block": "Invalid view metadata."}}, None
     result_id = metadata.get("result_id")
     if not result_id:
-        return {"response_action": "errors", "errors": {"purchase_price_block": "Invalid view metadata."}}
+        return {"response_action": "errors", "errors": {"purchase_price_block": "Invalid view metadata."}}, None
     origin_channel = metadata.get("origin_channel", "")
     origin_message_ts = metadata.get("origin_message_ts", "")
 
     if not _relay_approver_authorized(user_id, "fa_max_lending"):
-        return {"response_action": "errors", "errors": {"purchase_price_block": "Not authorized."}}
+        return {"response_action": "errors", "errors": {"purchase_price_block": "Not authorized."}}, None
 
     values = (view.get("state") or {}).get("values") or {}
     with get_db_context() as db:
@@ -3679,10 +3736,16 @@ def _handle_quote_ready_modify_submission(payload: dict) -> Optional[dict]:
         )
 
     if not outcome.get("ok"):
-        return {"response_action": "errors", "errors": outcome.get("error", {})}
+        return {"response_action": "errors", "errors": outcome.get("error", {})}, None
     logger.info("[QuoteReady] result_id=%s modify submitted by=%s -> new_result_id=%s",
                 result_id, user_id, outcome.get("new_result_id"))
-    return {}
+    finalize_kwargs = {
+        "new_result_id": outcome["new_result_id"],
+        "submitted_by": outcome["submitted_by"],
+        "origin_channel": outcome["origin_channel"],
+        "origin_message_ts": outcome["origin_message_ts"],
+    }
+    return {}, finalize_kwargs
 
 
 def _update_quote_ready_slack_message(result_id: str, payload: dict, reply_text: str) -> None:

@@ -62,7 +62,7 @@ _DECIDE_SQL = text(
     UPDATE fa_max_quote_ready_results
     SET review_status = :review_status, reviewed_by = :reviewed_by, reviewed_at = now()
     WHERE result_id = :result_id ::uuid AND status = 'computed'
-      AND review_status IS DISTINCT FROM :review_status
+      AND review_status IS NULL
     RETURNING result_id
     """
 )
@@ -242,9 +242,18 @@ def decide_quote_ready(session: Session, *, result_id: str, decision: str, decid
     "3-minute Approve, Modify, or Reject review" (SOT.md §17) actually
     produces a revised scenario to re-review, not a dead-end status flip.
 
-    Idempotent: a repeat click with the SAME decision is a no-op (returns
-    False, matches the "already decided" pattern used by every other
-    reviewer button in this codebase — see admin_router._handle_relay_decision).
+    Terminal at the data layer: the WHERE guard requires review_status IS
+    NULL, so only the FIRST decision on a given result_id ever succeeds.
+    A repeat click — whether the SAME decision (double-click/retry) or a
+    CONFLICTING one (Approve then Reject on the same result_id) — is a
+    no-op that returns False. This was previously guarded by
+    `review_status IS DISTINCT FROM :review_status`, which let a second,
+    conflicting decision silently overwrite the first (Approve then Reject
+    both matched, since each new value was "distinct" from the prior one).
+    That made the decision reversible with no error, contradicting the
+    "never allowed at the data layer" claim below. Fixed by requiring
+    review_status IS NULL: once ANY decision is recorded, every later
+    decision attempt on that result_id fails the WHERE clause.
 
     DB-level safety net (belt-and-suspenders alongside the old card's
     buttons being removed by handle_modify_submission()'s neutralization
@@ -488,12 +497,57 @@ def handle_modify_submission(
     session.commit()
 
     logger.info("[QuoteReady] result_id=%s modified by=%s -> new_result_id=%s", result_id, submitted_by, new_result_id)
-    post_quote_ready_dossier(session, new_result_id)
-    _neutralize_dossier_card(
-        origin_channel, origin_message_ts,
-        f":pencil2: Modified by <@{submitted_by}> — see the new scenario posted below.",
-    )
-    return {"ok": True, "new_result_id": new_result_id}
+    # Posting the new dossier card and neutralizing the old one are each a
+    # synchronous Slack API call (chat.postMessage / chat.update). They used
+    # to run here, inline, before the Socket Mode ack this function's result
+    # feeds into — the exact dispatch_failed risk fa_max_new_file_submit was
+    # already reworked to avoid elsewhere in this same PR (see
+    # socket_listener.py's callback_id == "fa_max_new_file_submit" branch):
+    # under real Slack-API/network latency this handler's DB work plus two
+    # sequential external calls can blow the ~3s ack window, so the reviewer
+    # sees an error/stuck modal even though the new scenario is already
+    # persisted server-side. Everything up to and including session.commit()
+    # above must stay before the ack (Slack requires the SAME ack to carry
+    # {"response_action": "errors", ...} for inline validation failures) --
+    # only the two Slack calls below are deferred. See
+    # finalize_modify_submission(), called from admin_router AFTER the ack.
+    return {
+        "ok": True,
+        "new_result_id": new_result_id,
+        "submitted_by": submitted_by,
+        "origin_channel": origin_channel,
+        "origin_message_ts": origin_message_ts,
+    }
+
+
+def finalize_modify_submission(
+    *, new_result_id: str, submitted_by: str, origin_channel: str = "", origin_message_ts: str = "",
+) -> None:
+    """Post the new dossier card and neutralize the old one — the two Slack
+    API calls deliberately deferred out of handle_modify_submission() (see
+    that function's tail comment) so they run AFTER the Socket Mode ack
+    instead of blocking it. Opens its own DB session since this runs after
+    the caller's request-scoped session has already returned control to
+    Slack, matching the deferred-work pattern already used for
+    fa_max_new_file_submit in socket_listener.py. Best-effort: a failure
+    here is logged, not raised -- the modal has already closed and the new
+    scenario is already durably persisted regardless of whether the Slack
+    post succeeds.
+    """
+    from src.core.database import get_db_context
+
+    try:
+        with get_db_context() as session:
+            post_quote_ready_dossier(session, new_result_id)
+            _neutralize_dossier_card(
+                origin_channel, origin_message_ts,
+                f":pencil2: Modified by <@{submitted_by}> — see the new scenario posted below.",
+            )
+    except Exception:
+        logger.exception(
+            "[QuoteReady] finalize_modify_submission failed for new_result_id=%s (scenario already persisted)",
+            new_result_id,
+        )
 
 
 def _neutralize_dossier_card(channel: str, message_ts: str, reply_text: str) -> None:
