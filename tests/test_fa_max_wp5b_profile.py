@@ -1050,13 +1050,17 @@ class TestWorkQueueScheduling:
         from src.services.borrower_profile_service import schedule_profile_recompute_for_property
         prop_id = _insert_property(fresh_db)
         fresh_db.commit()
+        # Snapshot queue depth before — other tests may have committed rows
+        before = fresh_db.execute(
+            text("SELECT COUNT(*) FROM fa_max_work_queue WHERE queue_name = 'profile_recompute'"),
+        ).scalar()
         # No buyer_entity_links → no persons → no queue rows added
         schedule_profile_recompute_for_property(fresh_db, prop_id, "new_deed")
         fresh_db.commit()
-        count = fresh_db.execute(
+        after = fresh_db.execute(
             text("SELECT COUNT(*) FROM fa_max_work_queue WHERE queue_name = 'profile_recompute'"),
         ).scalar()
-        assert count == 0
+        assert after == before
 
     def test_second_event_after_drain_reactivates_item(self, fresh_db):
         """A second material event after the first has been drained must
@@ -1356,6 +1360,18 @@ def test_schedule_recompute_claimed_to_done_race(pg_engine):
         complete_work_item,
         enqueue_work_item,
     )
+
+    # ── Pre-cleanup: remove stale available items left by previous test runs ─
+    # Tests that call fresh_db.commit() inside the fixture session commit to the
+    # real DB; claim_next_work_item picks the oldest available row, so leaked
+    # rows from earlier runs cause the wrong item to be claimed.
+    pre_conn = pg_engine.connect()
+    pre_trans = pre_conn.begin()
+    pre_conn.execute(text(
+        "DELETE FROM fa_max_work_queue WHERE queue_name = 'profile_recompute' AND status = 'available'"
+    ))
+    pre_trans.commit()
+    pre_conn.close()
 
     # ── Setup: create a person and an available profile recompute job ────────
     setup_conn = pg_engine.connect()
