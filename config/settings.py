@@ -682,6 +682,15 @@ class AppSettings(BaseSettings):
 	fa_max_slack_bot_token: Optional[SecretStr] = Field(default=None, env="FA_MAX_SLACK_BOT_TOKEN")
 	fa_max_slack_app_token: Optional[SecretStr] = Field(default=None, env="FA_MAX_SLACK_APP_TOKEN")
 	fa_max_slack_signing_secret: Optional[SecretStr] = Field(default=None, env="FA_MAX_SLACK_SIGNING_SECRET")
+	# Calendar scheduling. "fake" keeps every booking in memory; only "live"
+	# reaches a real calendar, and it stays the non-default so a misconfigured
+	# environment cannot put a test meeting on the client's real day.
+	fa_max_calendar_mode: str = Field(default="fake", env="FA_MAX_CALENDAR_MODE")
+	fa_max_calendar_id: Optional[str] = Field(default=None, env="FA_MAX_CALENDAR_ID")
+	# Domain-wide delegation impersonates a named user; this is whose calendar
+	# bookings land on. Must be inside the Workspace the service account is
+	# delegated within.
+	fa_max_calendar_subject: Optional[str] = Field(default=None, env="FA_MAX_CALENDAR_SUBJECT")
 	# Fallback for the Command Center's self-message filter when Slack's
 	# auth.test is unreachable at startup. Normally resolved dynamically.
 	fa_max_slack_bot_user_id: Optional[str] = Field(default=None, env="FA_MAX_SLACK_BOT_USER_ID")

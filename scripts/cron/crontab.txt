@@ -1152,6 +1152,14 @@ COUNTY_ID=hillsborough
 # by default (see the task's own docstring); add --apply once confirmed.
 0 * * * * $PROJECT/scripts/cron/run.sh src.tasks.selfserve_abandonment_sweep
 
+# Calendar bookings — reconcile against the calendar they live on: a meeting
+# cancelled in Google otherwise leaves our record saying confirmed, and a
+# claim orphaned by a crash holds its slot forever. Every 15 minutes because
+# a borrower turning up to a cancelled call is the failure being prevented.
+# Dry-run by default; add --apply once the live calendar is configured, and
+# note the task refuses to run at all while FA_MAX_CALENDAR_MODE=fake.
+
+*/15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.calendar_booking_sweep
 # WP-T2-9 Partner Mining & Producer Ranking — runs after nightly deed load
 # (deeds load 05:00–05:10 UTC; this fires at 06:00 UTC to ensure both
 # Hillsborough and Pinellas deed batches are committed before ranking).
