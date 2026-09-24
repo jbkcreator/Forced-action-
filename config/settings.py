@@ -291,6 +291,38 @@ class AppSettings(BaseSettings):
 	# either one, it silently no-ops every poll rather than raising.
 	cora_gmail_service_account_key_path: Optional[str] = Field(default=None, env="CORA_GMAIL_SERVICE_ACCOUNT_KEY_PATH")
 	cora_reply_mailbox_address: Optional[str] = Field(default=None, env="CORA_REPLY_MAILBOX_ADDRESS")
+	# WP-T2-6 Addendum 2 (2026-09-22): Backflip's notifications go to Josh's
+	# own mailbox, NOT Cora's shared leads@forcedactionleads.com (that
+	# assumption -- see the original comment here through 2026-09-22's git
+	# history -- was never confirmed and does not hold up: Cora's mailbox
+	# catches replies to Forced Action's OWN outbound marketing emails;
+	# Backflip is a third-party platform Josh personally registered with,
+	# so its notifications go wherever HIS Backflip account is registered
+	# to. Read via a Gmail App Password + IMAP (src/agents/reply_concierge/
+	# backflip_mailbox_poller.py), the same mechanism the separate Banks
+	# project uses for the identical problem (reading one person's own
+	# real inbox -- domain-wide delegation cannot reach a personal mailbox
+	# at all, there is no Workspace admin to grant it against).
+	# Placeholder pending final address confirmation (may end up being a
+	# company address rather than personal) -- the mechanism is correct
+	# either way, only the configured address would change.
+	fa_max_backflip_mailbox_email: Optional[str] = Field(
+		default=None, env="FA_MAX_BACKFLIP_MAILBOX_EMAIL"
+	)
+	fa_max_backflip_mailbox_app_password: Optional[SecretStr] = Field(
+		default=None, env="FA_MAX_BACKFLIP_MAILBOX_APP_PASSWORD"
+	)
+	# Backflip's own notification sender -- now consumed by
+	# backflip_mailbox_poller.py, not reply_mailbox_poller.py (that branch
+	# was removed in Addendum 2; see its git history for why). Accepts
+	# either a bare domain ("backflip.com", matches any sender on it) or a
+	# full address ("notify@backflip.com", matches only that one exact
+	# sender -- narrower, useful when the poll mailbox and the sender
+	# share a domain, e.g. Gmail-to-Gmail in dev/test). No default -- the
+	# poller no-ops until this and the two fields above are all set.
+	fa_max_backflip_notification_sender_domain: Optional[str] = Field(
+		default=None, env="FA_MAX_BACKFLIP_NOTIFICATION_SENDER_DOMAIN"
+	)
 	# "whale" = Hunter→buyer_entity flow (default). "dbpr_storm" = Aug blitz targeting
 	# storm/restoration contractors from dbpr_contacts. Flip in env, no code deploy.
 	cora_target_mode: str = Field(default="whale", env="CORA_TARGET_MODE")
@@ -847,6 +879,11 @@ class AppSettings(BaseSettings):
 	fa_max_slack_channel_money: str = Field(default="", env="FA_MAX_SLACK_CHANNEL_MONEY")
 	fa_max_slack_channel_exceptions: str = Field(default="", env="FA_MAX_SLACK_CHANNEL_EXCEPTIONS")
 	fa_max_slack_channel_relationships: str = Field(default="", env="FA_MAX_SLACK_CHANNEL_RELATIONSHIPS")
+	# Command Center channel restriction (WP-T2-6 addendum Task 21). Unset =
+	# not yet configured, so the restriction fails open (see
+	# _reject_if_wrong_command_channel / _listen_channel).
+	fa_max_slack_cc_channel: Optional[str] = Field(default=None, env="FA_MAX_SLACK_CC_CHANNEL")
+
 	# WP-T2-11: minimum expected revenue (cents) for an in-box opportunity to be green.
 	# Confirm launch value with Josh; placeholder = $150 commission dollars (15% × ~$1k).
 	fa_max_gyr_green_min_expected_revenue_cents: int = Field(

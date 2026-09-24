@@ -36,6 +36,8 @@ ALLOWED_TABLES: frozenset[str] = frozenset([
     "outbound_drafts",
     "lender_box_programs",
     "lender_box_geographies",
+    "fa_max_persons",
+    "fa_max_opportunities",
 ])
 
 # Human-readable schema shown in the system prompt so Claude knows what to query.
@@ -58,6 +60,20 @@ TABLE_SCHEMAS: Dict[str, str] = {
     ),
     "lender_box_geographies": (
         "id, program_key, state, county (NULL = state-wide), is_excluded"
+    ),
+    "fa_max_persons": (
+        "person_id, lifecycle_state, full_name, email, phone, source, "
+        "merged_into_id, created_at. "
+        "IMPORTANT: always filter WHERE merged_into_id IS NULL (excludes rows "
+        "merged into another person's canonical record)."
+    ),
+    "fa_max_opportunities": (
+        "opportunity_id, person_id, opportunity_type, current_stage, outcome, "
+        "source, loan_amount_cents, maturity_months, backflip_ref, "
+        "expected_need_date, actual_funded_at, created_at, updated_at. "
+        "opportunity_type is one of: acquisition, rehab, construction, "
+        "extension, refinance, dscr_takeout, repeat. Join to fa_max_persons "
+        "on person_id for the borrower's name/email/phone."
     ),
 }
 
@@ -177,7 +193,7 @@ def execute_query(db: Session, sql: str) -> Dict[str, Any]:
         result_rows = [dict(r) for r in rows]
         logger.info(
             "db_tool.execute_query: rows=%d duration_ms=%d sql=%r",
-            len(result_rows), duration_ms, limited[:120],
+            len(result_rows), duration_ms, limited[:1000],
         )
         return {"rows": result_rows, "count": len(result_rows)}
     except Exception as exc:

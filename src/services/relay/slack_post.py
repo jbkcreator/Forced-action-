@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import hashlib
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from config.settings import get_settings
 from config.venture_template import DEFAULT_VENTURE_KEY
@@ -302,6 +302,209 @@ def open_revise_modal(trigger_id: str, item: QueueItem) -> bool:
         return True
     except Exception as exc:
         logger.error("[Relay] views.open failed for revise item %d: %s", item.id, exc, exc_info=True)
+        return False
+
+
+_OPPORTUNITY_TYPES = (
+    "acquisition", "rehab", "construction", "extension",
+    "refinance", "dscr_takeout", "repeat",
+)
+
+
+def _deal_detail_blocks() -> list:
+    """The four deal-detail fields both new-file views carry.
+
+    They live on BOTH views because either view can be the one Josh
+    actually submits: the search view submits directly for an existing
+    borrower (no view swap), and the new-entry view submits after the
+    swap. `_handle_new_file_view_submit` reads opportunity_type
+    (required by fa_max_opportunities' CHECK constraint), backflip_ref,
+    and property_address regardless of which view it came from.
+
+    property_address lives here rather than only on the new-borrower
+    view (where it originally shipped) because a REPEAT borrower's new
+    loan can be for a different property than any of their prior ones
+    (FaMaxOpportunity's own docstring: "the same borrower can have an
+    acquisition opportunity and a later rehab loan on the same
+    property, and a repeat borrower gets a new row per project") --
+    the existing-borrower path had no way to capture it at all before
+    this fix, flagged live during manual E2E testing.
+    """
+    return [
+        {
+            "type": "input", "block_id": "opportunity_type_block",
+            "label": {"type": "plain_text", "text": "Loan type"},
+            "element": {
+                "type": "static_select",
+                "action_id": "opportunity_type",
+                "options": [
+                    {"text": {"type": "plain_text", "text": t}, "value": t}
+                    for t in _OPPORTUNITY_TYPES
+                ],
+            },
+        },
+        {
+            "type": "input", "block_id": "loan_amount_block", "optional": True,
+            "label": {"type": "plain_text", "text": "Loan amount ($)"},
+            "element": {"type": "plain_text_input", "action_id": "loan_amount"},
+        },
+        {
+            "type": "input", "block_id": "backflip_ref_block", "optional": True,
+            "label": {"type": "plain_text", "text": "Backflip reference (if you have it)"},
+            "element": {"type": "plain_text_input", "action_id": "backflip_ref"},
+        },
+        {
+            "type": "input", "block_id": "new_property_address_block", "optional": True,
+            "label": {"type": "plain_text", "text": "Property address"},
+            "element": {"type": "plain_text_input", "action_id": "new_property_address"},
+        },
+    ]
+
+
+def _build_new_file_modal(channel_id: str = "") -> dict:
+    """Addendum to WP-T2-6 -- initial view for logging a Backflip
+    submission. Live-searches existing FA Max borrowers (Task 16/18)
+    before ever asking Josh to re-enter someone we already know, closing
+    the gap where backflip_ref was never created until terms arrived.
+
+    channel_id: the slash command's invoking channel, carried through
+    private_metadata (and forward through the new-borrower view swap via
+    _build_new_file_new_entry_view's dict(prior_metadata)) so
+    _handle_new_file_view_submit knows where to post the success
+    confirmation after a submission completes.
+    """
+    return {
+        "type": "modal",
+        "callback_id": "fa_max_new_file_submit",
+        "private_metadata": json.dumps({"mode": "search", "channel_id": channel_id}),
+        "title": {"type": "plain_text", "text": "Log Backflip Submission"[:24]},
+        "submit": {"type": "plain_text", "text": "Continue"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "input",
+                "block_id": "borrower_search_block",
+                "optional": True,
+                "label": {"type": "plain_text", "text": "Search existing borrowers"},
+                "element": {
+                    "type": "external_select",
+                    "action_id": "borrower_search",
+                    "min_query_length": 2,
+                    "placeholder": {"type": "plain_text", "text": "Type a name, email, or phone"},
+                },
+            },
+            {
+                "type": "actions",
+                "block_id": "new_borrower_action_block",
+                "elements": [
+                    {
+                        "type": "button",
+                        "action_id": "new_file_new_borrower",
+                        "text": {"type": "plain_text", "text": "+ Add new borrower"},
+                        "style": "primary",
+                    },
+                ],
+            },
+            *_deal_detail_blocks(),
+        ],
+    }
+
+
+def _build_new_file_new_entry_view(prior_metadata: dict) -> dict:
+    """Fallback view -- Josh clicked "new borrower" or the search found no
+    match. Same modal, swapped blocks (views.update, not a second popup)."""
+    metadata = dict(prior_metadata)
+    metadata["mode"] = "new_borrower"
+    return {
+        "type": "modal",
+        "callback_id": "fa_max_new_file_submit",
+        "private_metadata": json.dumps(metadata),
+        "title": {"type": "plain_text", "text": "New Borrower Submission"[:24]},
+        "submit": {"type": "plain_text", "text": "Log Submission"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "input", "block_id": "new_full_name_block",
+                "label": {"type": "plain_text", "text": "Borrower name"},
+                "element": {"type": "plain_text_input", "action_id": "new_full_name"},
+            },
+            {
+                "type": "input", "block_id": "new_email_block", "optional": True,
+                "label": {"type": "plain_text", "text": "Email"},
+                "element": {"type": "plain_text_input", "action_id": "new_email"},
+            },
+            {
+                "type": "input", "block_id": "new_phone_block", "optional": True,
+                "label": {"type": "plain_text", "text": "Phone"},
+                "element": {"type": "plain_text_input", "action_id": "new_phone"},
+            },
+            *_deal_detail_blocks(),
+        ],
+    }
+
+
+def open_new_file_modal(trigger_id: str, channel_id: str = "") -> bool:
+    """Opens the initial search view. Returns True on success."""
+    settings = get_settings()
+    token = settings.fa_max_slack_bot_token
+    if not token or not trigger_id:
+        logger.info("[Relay] cannot open new-file modal — no token or trigger_id")
+        return False
+    try:
+        from slack_sdk import WebClient
+        WebClient(token=token.get_secret_value()).views_open(
+            trigger_id=trigger_id, view=_build_new_file_modal(channel_id),
+        )
+        return True
+    except Exception as exc:
+        logger.error("[Relay] views.open failed for new-file modal: %s", exc, exc_info=True)
+        return False
+
+
+def post_new_file_confirmation(channel_id: str, full_name: str, backflip_ref: Optional[str]) -> None:
+    """Posts the success confirmation after a new-file modal
+    completes -- mirrors post_completion_receipt's shape (icon + short
+    text, never raises, logs and returns on failure). No-ops if the
+    channel_id wasn't captured (e.g. an older-format private_metadata
+    from a modal opened before this field existed)."""
+    settings = get_settings()
+    token = settings.fa_max_slack_bot_token
+    if not token or not channel_id:
+        logger.info(
+            "[Relay] cannot post new-file confirmation — missing %s "
+            "(likely private_metadata from a modal opened before channel_id "
+            "capture existed, or FA_MAX_SLACK_BOT_TOKEN unset)",
+            "token" if not token else "channel_id",
+        )
+        return
+    text = f"✅ Logged submission for {full_name}"
+    if backflip_ref:
+        text += f" ({backflip_ref})"
+    try:
+        from slack_sdk import WebClient
+        WebClient(token=token.get_secret_value()).chat_postMessage(channel=channel_id, text=text)
+    except Exception as exc:
+        logger.error("[Relay] new-file confirmation post failed: %s", exc, exc_info=True)
+
+
+def open_new_file_new_entry_view(view_id: str, view_hash: str, prior_metadata: dict) -> bool:
+    """Swaps the already-open new-file modal to the new-borrower view
+    in place (views.update, not a second popup) when Josh clicks "Not on
+    this list — new borrower". Returns True on success."""
+    settings = get_settings()
+    token = settings.fa_max_slack_bot_token
+    if not token or not view_id or not view_hash:
+        logger.info("[Relay] cannot swap new-file modal to new-entry view — missing token/view_id/hash")
+        return False
+    try:
+        from slack_sdk import WebClient
+        WebClient(token=token.get_secret_value()).views_update(
+            view_id=view_id, hash=view_hash,
+            view=_build_new_file_new_entry_view(prior_metadata),
+        )
+        return True
+    except Exception as exc:
+        logger.error("[Relay] views.update failed swapping to new-entry view: %s", exc, exc_info=True)
         return False
 
 

@@ -35,7 +35,7 @@ from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import and_, case, distinct, func, or_, select, text
 from sqlalchemy.orm import Session
 
-from config.settings import settings
+from config.settings import get_settings, settings
 from config.venture_template import DEFAULT_VENTURE_KEY
 from src.api.deps import get_db, VALID_TIERS, VALID_VERTICALS, ZIP_RE
 from src.core.database import get_db_context
@@ -57,6 +57,7 @@ from src.core.models import (
 )
 from src.loaders.tax import TaxDelinquencyLoader
 from src.loaders.voter_registry import VoterRegistryLoader
+from src.services.relay.slack_post import open_new_file_modal
 from src.services.zip_territory import claim_zip_territory
 from src.utils.county_config import invalidate_cache
 from src.utils.test_account import is_test_subscriber
@@ -1639,6 +1640,50 @@ def _slack_ephemeral(text: str) -> dict:
     return {"response_type": "ephemeral", "text": text}
 
 
+def _reject_if_wrong_command_channel(channel_id: str) -> Optional[dict]:
+    """Shared gate for both FA Max pipeline slash commands, per the
+    client's decision that the Command Center channel is where Josh
+    manages submissions, status updates, and questions — all of it, one
+    place. Unset setting means the channel hasn't been configured yet and
+    fails OPEN (never lock Josh out of his own commands before the
+    channel ID exists) — see plan Task 21's design note.
+
+    Takes a plain channel_id string rather than a raw Slack form dict so
+    both the HTTP Request-URL route (parse_qs, list-wrapped values) and
+    the Socket Mode slash-command listener (already-scalar payload dict)
+    can call it after normalizing to the same shape.
+    """
+    required_channel = get_settings().fa_max_slack_cc_channel
+    if not required_channel:
+        return None
+    if channel_id == required_channel:
+        return None
+    return _slack_ephemeral(
+        "Please use this command in the Command Center channel (#fa-max-command-center), not here."
+    )
+
+
+def _handle_borrower_search_suggestion(payload: dict, db: Session) -> dict:
+    """block_suggestion handler for the new-file modal's borrower
+    external_select (Task 18). Slack's options[].text.text field has a 75
+    character limit, hence the truncation.
+    """
+    from src.services.fa_max_person_search import search_fa_max_persons
+
+    query = payload.get("value", "")
+    matches = search_fa_max_persons(db, query)
+    options = []
+    for m in matches:
+        detail_parts = [p for p in (m.get("email"), m.get("phone"), m.get("last_stage")) if p]
+        detail = " · ".join(detail_parts) if detail_parts else "no contact on file"
+        label = f"{m['full_name'] or 'Unnamed'} ({detail})"[:75]
+        options.append({
+            "text": {"type": "plain_text", "text": label},
+            "value": m["person_id"],
+        })
+    return {"options": options}
+
+
 def _parse_slack_interactive_payload(raw: bytes) -> dict:
     """Shared by every Block Kit button endpoint below (not /slack/kill,
     which is a slash command with a differently-shaped body)."""
@@ -1670,8 +1715,19 @@ async def slack_interact(request: Request, background_tasks: BackgroundTasks, db
     # view_submission (WP-T2-2 Revise modal) arrives at this same
     # Interactivity Request URL, not as a "block_actions" payload with an
     # `actions` list — it must be checked before indexing into `actions`.
-    if payload.get("type") == "view_submission" and payload.get("view", {}).get("callback_id") == "fa_max_revise_submit":
-        return _handle_relay_revise_submission(payload)
+    if payload.get("type") == "view_submission":
+        callback_id = payload.get("view", {}).get("callback_id")
+        if callback_id == "fa_max_revise_submit":
+            return _handle_relay_revise_submission(payload)
+        if callback_id == "fa_max_new_file_submit":
+            return _handle_new_file_view_submit(payload, db)
+
+    # block_suggestion (external_select live search) also arrives at this
+    # same Interactivity Request URL, with neither an "actions" list nor a
+    # "view"/callback_id shape — checked here for the same reason
+    # view_submission is checked before indexing into `actions` above.
+    if payload.get("type") == "block_suggestion" and payload.get("action_id") == "borrower_search":
+        return _handle_borrower_search_suggestion(payload, db)
 
     actions = payload.get("actions", [])
     action_id = actions[0].get("action_id") if actions else None
@@ -1689,6 +1745,8 @@ async def slack_interact(request: Request, background_tasks: BackgroundTasks, db
         return _handle_relay_snooze(payload)
     if action_id == "fa_max_revise":
         return _handle_relay_revise_open(payload)
+    if action_id == "new_file_new_borrower":
+        return _handle_new_file_new_borrower_click(payload)
     if action_id in ("approve_win_story", "dismiss_win_story"):
         return _handle_win_story_interact(payload, db)
     # Quote Ready dossier decision (WP-8B — MONEY lane)
@@ -2043,6 +2101,7 @@ def _handle_relay_decision(payload: dict) -> dict:
         spec = existing.payload["fa_max_transition"]
         try:
             from src.services.state_engine import (
+                ensure_entity_registry,
                 get_opportunity_state,
                 get_person_state,
                 transition,
@@ -2051,6 +2110,11 @@ def _handle_relay_decision(payload: dict) -> dict:
             from src.core.database import get_db_context as _get_db
 
             entity_type = spec.get("entity_type", "person")
+            # spec["entity_uuid"] is the entity's own native ID
+            # (opportunity_id/person_id) -- get_opportunity_state/
+            # get_person_state below need exactly that. transition()
+            # needs a real fa_max_entity_registry entity_uuid instead
+            # (resolved just before that call, WP-T2-6 review fix).
             entity_uuid = spec["entity_uuid"]
 
             with _get_db() as _db:
@@ -2100,9 +2164,12 @@ def _handle_relay_decision(payload: dict) -> dict:
                 # the borrower's history — no error, just a missing row.
                 person_id_for_event = current.get("person_id")
 
+                registry_entity_uuid = ensure_entity_registry(
+                    session=_db, entity_type=entity_type, native_id=entity_uuid,
+                )
                 result = transition(
                     entity_type=entity_type,
-                    entity_uuid=entity_uuid,
+                    entity_uuid=registry_entity_uuid,
                     from_state=current_from_state,
                     to_state=spec["to_state"],
                     actor=f"slack_approver:{user_id}",
@@ -2378,6 +2445,185 @@ def _handle_relay_revise_submission(payload: dict) -> dict:
     return {"response_action": "clear"}
 
 
+def _handle_new_file_new_borrower_click(payload: dict) -> dict:
+    """"Not on this list — new borrower" button inside the new-file
+    modal — swaps the view in place via views.update, preserving whatever
+    Josh already entered (e.g. a partial search) in private_metadata."""
+    from src.services.relay.slack_post import open_new_file_new_entry_view
+
+    view = payload.get("view", {})
+    open_new_file_new_entry_view(
+        view.get("id", ""),
+        view.get("hash", ""),
+        json.loads(view.get("private_metadata") or "{}"),
+    )
+    return {}
+
+
+def _new_file_field(values: dict, block_id: str, action_id: str) -> str:
+    block = values.get(block_id, {}).get(action_id, {})
+    # `selected_option` arrives as an explicit JSON null (not a missing
+    # key) for an optional select with nothing chosen, so the default
+    # from .get() is never reached — coalesce the null itself.
+    return (block.get("value") or (block.get("selected_option") or {}).get("value") or "").strip()
+
+
+def _new_file_pre_validate(payload: dict) -> Optional[dict]:
+    """Fast, DB-free validation for the new-file modal submit --
+    both of _handle_new_file_view_submit's only two error-returning
+    checks, factored out so the Socket Mode listener
+    (src/services/relay/socket_listener.py) can run them BEFORE acking.
+    The DB work in _handle_new_file_view_submit below can take
+    several seconds against this dev DB's network latency -- past
+    Slack's ~3s Socket Mode ack window -- so that listener acks
+    immediately once these two (in-memory only) checks pass, then does
+    the actual DB work afterward. There is no response_action channel
+    left post-ack, so these are the only validation this modal can ever
+    show inline once Socket Mode is the delivery mechanism.
+    """
+    view = payload["view"]
+    metadata = json.loads(view.get("private_metadata") or "{}")
+    values = view["state"]["values"]
+
+    if metadata.get("mode") == "new_borrower":
+        if not _new_file_field(values, "new_full_name_block", "new_full_name"):
+            return {
+                "response_action": "errors",
+                "errors": {"new_full_name_block": "Borrower name is required."},
+            }
+    else:
+        if not _new_file_field(values, "borrower_search_block", "borrower_search"):
+            return {
+                "response_action": "errors",
+                "errors": {"borrower_search_block": "Select a borrower or choose \"new borrower\"."},
+            }
+    return None
+
+
+def _handle_new_file_view_submit(payload: dict, db: Session) -> dict:
+    """Slack `/fa-max-new-file` modal submission (WP-T2-6 addendum,
+    Task 19). This is the moment Josh tells the system he already submitted
+    a deal to Backflip -- it creates/links the borrower, creates a new
+    opportunity, jumps it straight to 'submitted' via the admin-override
+    transition path (the deal already happened outside our normal funnel),
+    and records backflip_ref if given.
+
+    person_id for the "existing borrower" path is read from
+    view.state.values, not private_metadata: the modal's borrower_search
+    external_select has no dispatch_action, so Slack only reports the
+    selection at submission time, inside `values` -- exactly like every
+    other select block in this modal (e.g. opportunity_type_block).
+    """
+    from src.services import fa_max_file_state, state_engine
+    from src.services.phone_utils import normalize as normalize_phone
+
+    pre_validation_error = _new_file_pre_validate(payload)
+    if pre_validation_error is not None:
+        return pre_validation_error
+
+    view = payload["view"]
+    metadata = json.loads(view.get("private_metadata") or "{}")
+    values = view["state"]["values"]
+
+    def _field(block_id: str, action_id: str) -> str:
+        return _new_file_field(values, block_id, action_id)
+
+    if metadata.get("mode") == "new_borrower":
+        full_name = _field("new_full_name_block", "new_full_name")
+        email = _field("new_email_block", "new_email") or None
+        phone = normalize_phone(_field("new_phone_block", "new_phone") or None)
+        person_row = db.execute(
+            text(
+                "INSERT INTO fa_max_persons (source, full_name, email, phone) "
+                "VALUES ('manual_submission_modal', :name, :email, :phone) "
+                "RETURNING person_id"
+            ),
+            {"name": full_name, "email": email, "phone": phone},
+        ).fetchone()
+        db.commit()
+        person_id = str(person_row.person_id)
+    else:
+        person_id = _field("borrower_search_block", "borrower_search")
+        full_name = db.execute(
+            text("SELECT full_name FROM fa_max_persons WHERE person_id = :pid ::uuid"),
+            {"pid": person_id},
+        ).scalar() or "borrower"
+
+    opportunity_type = _field("opportunity_type_block", "opportunity_type")
+    opportunity_id = state_engine.create_fa_max_opportunity(
+        session=db, person_id=person_id, opportunity_type=opportunity_type,
+        source="manual_submission_modal",
+    )
+
+    user_id = payload.get("user", {}).get("id", "unknown")
+    # transition() requires a real fa_max_entity_registry entity_uuid, not
+    # the opportunity's own native ID (WP-T2-6 review fix -- confirmed
+    # live: every existing call site in this codebase passed the native ID
+    # directly, which transition()'s registry lookup never matched since
+    # nothing had registered it, so the transition silently no-op'd).
+    entity_uuid = state_engine.ensure_entity_registry(
+        session=db, entity_type="opportunity", native_id=opportunity_id,
+    )
+    state_engine.transition(
+        session=db, entity_type="opportunity", entity_uuid=entity_uuid,
+        from_state="new", to_state="submitted",
+        actor="user:josh", source_component="src.api.admin_router",
+        idempotency_key=f"new_file:{opportunity_id}:submitted",
+        validate_allowed_next=False,
+        context={"reason": "manual log of an already-completed Backflip submission via Slack modal",
+                 "recorded_by_slack_user": user_id},
+    )
+
+    fa_max_file_state.ensure_file_state(db, opportunity_id=opportunity_id, person_id=person_id)
+
+    # Deliberately NOT fa_max_file_state.record_terms(): that function also
+    # transitions submitted -> term_sheet whenever current_stage is already
+    # 'submitted' (it's designed for a genuine terms-received event). This
+    # block just records a reference Josh already knows at submission time
+    # -- no underwriting has happened yet, so the stage must not move.
+    backflip_ref = _field("backflip_ref_block", "backflip_ref") or None
+    # new_property_address_block lives in _deal_detail_blocks() -- present
+    # on both views, since a repeat existing borrower's new loan can be
+    # for a different property than any of their prior ones.
+    property_address = _field("new_property_address_block", "new_property_address") or None
+    # loan_amount_block was read from Slack and then silently discarded --
+    # never written anywhere (WP-T2-6 review fix). Dollars-to-cents
+    # conversion matches record_terms()'s own established convention.
+    # Josh may type digits with commas/a "$" prefix; anything else
+    # unparseable is dropped rather than guessed at or crashing the
+    # submission over a formatting slip.
+    loan_amount_cents = None
+    loan_amount_raw = _field("loan_amount_block", "loan_amount")
+    if loan_amount_raw:
+        try:
+            loan_amount_cents = round(float(loan_amount_raw.replace(",", "").replace("$", "")) * 100)
+        except ValueError:
+            logger.warning(
+                "new-file: unparseable loan_amount %r for opportunity_id=%s -- dropped",
+                loan_amount_raw, opportunity_id,
+            )
+    if backflip_ref or property_address or loan_amount_cents is not None:
+        db.execute(
+            text(
+                "UPDATE fa_max_opportunities SET "
+                "backflip_ref = COALESCE(:backflip_ref, backflip_ref), "
+                "property_address = COALESCE(:property_address, property_address), "
+                "loan_amount_cents = COALESCE(:loan_amount_cents, loan_amount_cents), "
+                "updated_at = NOW() WHERE opportunity_id = :opportunity_id ::uuid"
+            ),
+            {
+                "backflip_ref": backflip_ref, "property_address": property_address,
+                "loan_amount_cents": loan_amount_cents, "opportunity_id": opportunity_id,
+            },
+        )
+        db.commit()
+
+    from src.services.relay.slack_post import post_new_file_confirmation
+
+    post_new_file_confirmation(metadata.get("channel_id", ""), full_name, backflip_ref)
+    return {}
+
+
 # ===========================================================================
 # FA MAX AGENT TASK DISPATCH (WP-T2-2 review fix)
 #
@@ -2444,7 +2690,7 @@ def advance_fa_max_opportunity(
 ):
     """Advance one opportunity through configured stages with CAS and audit."""
     from src.services.state_engine import (
-        get_opportunity_state, transition, TransitionOutcome,
+        ensure_entity_registry, get_opportunity_state, transition, TransitionOutcome,
     )
 
     if body.to_state == "funded":
@@ -2455,8 +2701,13 @@ def advance_fa_max_opportunity(
             raise HTTPException(status_code=404, detail="Opportunity not found")
         if current["state_version"] != body.expected_version:
             raise HTTPException(status_code=409, detail="Opportunity version changed")
+        # transition() requires a real fa_max_entity_registry entity_uuid,
+        # not the opportunity's own native ID (WP-T2-6 review fix).
+        entity_uuid = ensure_entity_registry(
+            session=session, entity_type="opportunity", native_id=opportunity_id,
+        )
         result = transition(
-            session=session, entity_type="opportunity", entity_uuid=opportunity_id,
+            session=session, entity_type="opportunity", entity_uuid=entity_uuid,
             from_state=current["current_stage"], to_state=body.to_state,
             actor="admin:fa_max_opportunity", source_component="src.api.admin_router",
             idempotency_key=body.idempotency_key, state_version=body.expected_version,
@@ -2968,6 +3219,237 @@ async def slack_resume_command(request: Request):
             "Override may still be active. Try again or clear it directly."
         )
     return _slack_ephemeral(f"✅ RESUME {target} — kill switch override cleared.")
+
+
+def _fa_max_update_file_command(form: dict, db: Session) -> dict:
+    """
+    Pure logic for the Slack slash command (WP-T2-6):
+        /fa-max-update-file <backflip_ref> <stage>
+        /fa-max-update-file <backflip_ref> doc:<document name>
+        /fa-max-update-file <backflip_ref> received:<document name>
+
+    Stage tokens match config.fa_max_stage_monitoring.BACKFLIP_STAGE_KEYS
+    exactly (snake_case: under_review, conditional_approval, docs_requested,
+    cleared_to_close, funded, declined). A doc: prefix records a document
+    request instead of a stage change; a received: prefix closes one out,
+    stopping its chase timers before they escalate.
+
+    Same authorization gate as /relay-kill — relay_approvers, since manually
+    moving a file's stage/document state is at least as consequential.
+
+    Takes an already-scalar form dict (not Slack's raw list-wrapped
+    parse_qs shape) so both the HTTP Request-URL route below and the
+    Socket Mode slash-command listener (src/services/relay/socket_listener.py)
+    can share it. This app has no Interactivity/slash-command Request URL
+    option once Socket Mode is enabled, so the HTTP route is reachable
+    only on a dev/test app running with Socket Mode off — the Socket Mode
+    listener is what actually serves this command in production.
+    """
+    from config.fa_max_stage_monitoring import BACKFLIP_STAGE_KEYS
+    from src.agents.reply_concierge.backflip_stage_ingest import resolve_opportunity_by_backflip_ref
+    from src.services import fa_max_file_state
+
+    channel_rejection = _reject_if_wrong_command_channel(form.get("channel_id", ""))
+    if channel_rejection is not None:
+        return channel_rejection
+    user_id = form.get("user_id", "")
+    if not _relay_approver_authorized(user_id, "fa_max_lending"):
+        return _slack_ephemeral("🚫 Not authorized to update FA Max file state.")
+
+    tokens = (form.get("text") or "").strip().split(maxsplit=1)
+    if len(tokens) != 2:
+        return _slack_ephemeral(
+            "Usage:\n```"
+            "/fa-max-update-file <backflip_ref> <stage>\n"
+            "/fa-max-update-file <backflip_ref> doc:<document name>\n"
+            "/fa-max-update-file <backflip_ref> received:<document name>"
+            "```"
+        )
+    backflip_ref, action = tokens[0], tokens[1].strip()
+
+    resolved = resolve_opportunity_by_backflip_ref(db, backflip_ref)
+    if resolved is None:
+        return _slack_ephemeral(f"🔍 No opportunity found for `{backflip_ref}`.")
+
+    if action.lower().startswith("received:"):
+        document_name = action[len("received:"):].strip()
+        if not document_name:
+            return _slack_ephemeral(
+                f"Usage:\n```/fa-max-update-file {backflip_ref} received:<document name>```"
+            )
+        closed = fa_max_file_state.record_document_received(
+            db, opportunity_id=resolved["opportunity_id"], document_name=document_name,
+        )
+        if not closed:
+            return _slack_ephemeral(
+                f"⚠️ No outstanding request named *{document_name}* for `{backflip_ref}`."
+            )
+        return _slack_ephemeral(
+            f"✅ Marked *{document_name}* received for `{backflip_ref}` — chase stopped."
+        )
+
+    if action.lower().startswith("doc:"):
+        document_name = action[len("doc:"):].strip()
+        if not document_name:
+            return _slack_ephemeral(
+                f"Usage:\n```/fa-max-update-file {backflip_ref} doc:<document name>```"
+            )
+        fa_max_file_state.ensure_file_state(
+            db, opportunity_id=resolved["opportunity_id"], person_id=resolved["person_id"],
+        )
+        fa_max_file_state.record_document_request(
+            db, opportunity_id=resolved["opportunity_id"], person_id=resolved["person_id"],
+            document_name=document_name, source="manual",
+            idempotency_key=f"docreq:{resolved['opportunity_id']}:{document_name}",
+        )
+        from src.agents.reply_concierge import stage_monitor
+
+        file_state = fa_max_file_state.get_file_state(db, opportunity_id=resolved["opportunity_id"])
+        stage_monitor.send_first_chase_touch(
+            db, opportunity_id=resolved["opportunity_id"], person_id=resolved["person_id"],
+            document_name=document_name,
+            contact_email=(file_state or {}).get("contact_email"),
+        )
+        return _slack_ephemeral(f"📄 Recorded document request *{document_name}* for `{backflip_ref}`.")
+
+    stage = action.lower()
+    if stage not in BACKFLIP_STAGE_KEYS:
+        stage_lines = "\n".join(
+            f"/fa-max-update-file {backflip_ref} {s}" for s in sorted(BACKFLIP_STAGE_KEYS)
+        )
+        return _slack_ephemeral(f"Usage — one of:\n```{stage_lines}```")
+    fa_max_file_state.ensure_file_state(
+        db, opportunity_id=resolved["opportunity_id"], person_id=resolved["person_id"],
+    )
+    fa_max_file_state.update_backflip_stage(
+        db, opportunity_id=resolved["opportunity_id"], to_stage=stage,
+        actor=f"manual:{user_id}", source="manual",
+    )
+    return _slack_ephemeral(f"✅ `{backflip_ref}` updated to stage: *{stage}*.")
+
+
+def _fa_max_new_file_command(form: dict) -> dict:
+    """
+    Pure logic for the Slack slash command '/fa-max-new-file' (no
+    arguments — opens a modal). Addendum to WP-T2-6: records the moment
+    Josh submits a deal to Backflip, which nothing else in this codebase
+    does today (backflip_ref was previously only ever created downstream,
+    when terms arrive).
+
+    Same authorization gate as /fa-max-update-file — relay_approvers. See
+    _fa_max_update_file_command's docstring for why this takes an
+    already-scalar form dict and is shared with the Socket Mode listener.
+    """
+    channel_rejection = _reject_if_wrong_command_channel(form.get("channel_id", ""))
+    if channel_rejection is not None:
+        return channel_rejection
+    user_id = form.get("user_id", "")
+    if not _relay_approver_authorized(user_id, "fa_max_lending"):
+        return _slack_ephemeral("Not authorized to log a Backflip submission.")
+
+    trigger_id = form.get("trigger_id", "")
+    if not open_new_file_modal(trigger_id, form.get("channel_id", "")):
+        return _slack_ephemeral("Couldn't open the form — try again in a moment.")
+    return {"response_type": "ephemeral"}
+
+
+def _fa_max_open_files_command(form: dict, db: Session) -> dict:
+    """
+    Pure logic for the Slack slash command '/fa-max-open-files' (no
+    arguments — lists open files with a Backflip reference on record).
+
+    Exists because /fa-max-update-file requires Josh to already know the
+    exact backflip_ref string, which he won't always remember -- this
+    lets him look it up instead of guessing. Deliberately a plain list
+    rather than a name-based fallback lookup on /fa-max-update-file
+    itself: the same borrower name can have multiple opportunities in
+    different stages, so resolving by name alone is ambiguous in exactly
+    the case this command exists to help with. Listing every ref sidesteps
+    that -- Josh picks the exact one himself, no disambiguation needed.
+
+    Same authorization gate as the other two FA Max commands.
+    """
+    channel_rejection = _reject_if_wrong_command_channel(form.get("channel_id", ""))
+    if channel_rejection is not None:
+        return channel_rejection
+    user_id = form.get("user_id", "")
+    if not _relay_approver_authorized(user_id, "fa_max_lending"):
+        return _slack_ephemeral("Not authorized to list FA Max files.")
+
+    rows = db.execute(
+        text("""
+            SELECT p.full_name, o.backflip_ref, o.current_stage
+            FROM fa_max_opportunities o
+            JOIN fa_max_persons p ON p.person_id = o.person_id
+            WHERE o.backflip_ref IS NOT NULL AND o.outcome = 'open'
+            ORDER BY o.updated_at DESC
+            LIMIT 25
+        """)
+    ).fetchall()
+    if not rows:
+        return _slack_ephemeral("No open files with a Backflip reference on record.")
+
+    names = [r.full_name or "Unnamed" for r in rows]
+    name_width = max(len("Borrower"), *(len(n) for n in names))
+    ref_width = max(len("Ref"), *(len(r.backflip_ref) for r in rows))
+
+    table_lines = [f"{'Borrower':<{name_width}}  {'Ref':<{ref_width}}  Stage"]
+    for name, r in zip(names, rows):
+        table_lines.append(f"{name:<{name_width}}  {r.backflip_ref:<{ref_width}}  {r.current_stage}")
+    table_body = "\n".join(table_lines)
+
+    message = (
+        f"*Open Backflip Files* ({len(rows)})\n"
+        f"```{table_body}```\n"
+        f"Copy a ref above, then use:\n"
+        f"```/fa-max-update-file <ref> <stage>\n"
+        f"/fa-max-update-file <ref> doc:<document name>\n"
+        f"/fa-max-update-file <ref> received:<document name>```"
+    )
+    return _slack_ephemeral(message)
+
+
+def _parse_slack_form(raw: bytes) -> dict:
+    """Slack's slash-command HTTP body is form-encoded and parse_qs
+    list-wraps every value; both slash-command routes just want the
+    first (only) value per key, matching the already-scalar shape Socket
+    Mode delivers the same payload in."""
+    return {k: v[0] for k, v in parse_qs(raw.decode("utf-8")).items()}
+
+
+@router.post("/slack/fa-max-update-file")
+async def slack_fa_max_update_file_command(request: Request, db: Session = Depends(get_db)):
+    """
+    Slack slash command (WP-T2-6):
+        /fa-max-update-file <backflip_ref> <stage>
+        /fa-max-update-file <backflip_ref> doc:<document name>
+        /fa-max-update-file <backflip_ref> received:<document name>
+    """
+    raw = await request.body()
+    if not _verify_slack_signature(dict(request.headers), raw):
+        raise HTTPException(status_code=401, detail="Invalid Slack signature")
+
+    return _fa_max_update_file_command(_parse_slack_form(raw), db)
+
+
+@router.post("/slack/fa-max-new-file")
+async def slack_new_file_command(request: Request):
+    """Slack slash command: '/fa-max-new-file' (no arguments — opens a modal)."""
+    raw = await request.body()
+    if not _verify_slack_signature(dict(request.headers), raw):
+        raise HTTPException(status_code=401, detail="Invalid Slack signature")
+
+    return _fa_max_new_file_command(_parse_slack_form(raw))
+
+
+@router.post("/slack/fa-max-open-files")
+async def slack_fa_max_open_files_command(request: Request, db: Session = Depends(get_db)):
+    """Slack slash command: '/fa-max-open-files' (no arguments — lists open files with a Backflip reference)."""
+    raw = await request.body()
+    if not _verify_slack_signature(dict(request.headers), raw):
+        raise HTTPException(status_code=401, detail="Invalid Slack signature")
+
+    return _fa_max_open_files_command(_parse_slack_form(raw), db)
 
 
 # ===========================================================================
