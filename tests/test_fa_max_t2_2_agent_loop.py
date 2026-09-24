@@ -2154,14 +2154,21 @@ class TestCreateFaMaxOpportunity:
         session = MagicMock()
         row = MagicMock()
         row.opportunity_id = "opp-123"
-        session.execute.return_value.fetchone.return_value = row
+        # call 0 = INSERT opportunity; calls 1-2 = ensure_entity_registry (INSERT + SELECT)
+        insert_result = MagicMock()
+        insert_result.fetchone.return_value = row
+        reg_insert = MagicMock()
+        reg_select = MagicMock()
+        reg_select.scalar.return_value = "some-uuid"
+        session.execute.side_effect = [insert_result, reg_insert, reg_select]
 
         result = create_fa_max_opportunity(
             session=session, person_id="person-1", opportunity_type="acquisition",
             source="cora_outreach", origin_interaction_id="interaction-1",
         )
         assert result == "opp-123"
-        params = session.execute.call_args[0][1]
+        # call_args_list[0] is the INSERT call
+        params = session.execute.call_args_list[0][0][1]
         assert params["origin_interaction_id"] == "interaction-1"
 
     def test_inserts_with_null_origin_interaction_id(self):
@@ -2170,13 +2177,18 @@ class TestCreateFaMaxOpportunity:
         session = MagicMock()
         row = MagicMock()
         row.opportunity_id = "opp-456"
-        session.execute.return_value.fetchone.return_value = row
+        insert_result = MagicMock()
+        insert_result.fetchone.return_value = row
+        reg_insert = MagicMock()
+        reg_select = MagicMock()
+        reg_select.scalar.return_value = "some-uuid"
+        session.execute.side_effect = [insert_result, reg_insert, reg_select]
 
         result = create_fa_max_opportunity(
             session=session, person_id="person-1", opportunity_type="acquisition", source="inbound_call",
         )
         assert result == "opp-456"
-        params = session.execute.call_args[0][1]
+        params = session.execute.call_args_list[0][0][1]
         assert params["origin_interaction_id"] is None
 
     def test_idempotent_retry_returns_existing_row(self):
@@ -2191,7 +2203,11 @@ class TestCreateFaMaxOpportunity:
         existing_row.opportunity_id = "opp-existing"
         select_result = MagicMock()
         select_result.fetchone.return_value = existing_row
-        session.execute.side_effect = [insert_result, select_result]
+        reg_insert = MagicMock()
+        reg_select = MagicMock()
+        reg_select.scalar.return_value = "some-uuid"
+        # INSERT (conflict) → SELECT existing → ensure_entity_registry INSERT + SELECT
+        session.execute.side_effect = [insert_result, select_result, reg_insert, reg_select]
 
         result = create_fa_max_opportunity(
             session=session, person_id="person-1", opportunity_type="acquisition",
