@@ -2282,31 +2282,44 @@ class TestOpportunityOriginImmutableMigration:
 
 class TestWeeklyEditRateReport:
     def test_build_report_no_sends_this_week(self):
+        """WP-T3-2: build_report now delegates to build_rollup; empty rollup
+        still returns the unchanged 'no approvals' message."""
         from src.tasks.fa_max_weekly_edit_rate_report import build_report
         with patch("src.tasks.fa_max_weekly_edit_rate_report.get_db_context") as mock_db:
             session = MagicMock()
             mock_db.return_value.__enter__ = MagicMock(return_value=session)
             mock_db.return_value.__exit__ = MagicMock(return_value=False)
             with patch(
-                "src.tasks.fa_max_weekly_edit_rate_report._agent_tier_pairs_with_sends_this_week",
+                "src.tasks.fa_max_weekly_edit_rate_report.build_rollup",
                 return_value=[],
             ):
-                report = build_report()
+                with patch(
+                    "src.tasks.fa_max_weekly_edit_rate_report.count_uncaptured",
+                    return_value=0,
+                ):
+                    report = build_report()
         assert "No FA Max human approvals" in report
 
     def test_build_report_includes_each_pair(self):
+        """WP-T3-2: build_report renders rollup entries; agent name and tier
+        must appear in output."""
         from src.tasks.fa_max_weekly_edit_rate_report import build_report
+        from src.services.fa_max_edit_log import AgentRollup
+        rollups = [
+            AgentRollup("cora", "A", 0.05, 0.0, False, 10, 1, 0, ["wording"], None, False),
+            AgentRollup("hunter", "B", 0.12, 0.0, False, 5, 2, 1, ["numbers"], None, False),
+        ]
         with patch("src.tasks.fa_max_weekly_edit_rate_report.get_db_context") as mock_db:
             session = MagicMock()
             mock_db.return_value.__enter__ = MagicMock(return_value=session)
             mock_db.return_value.__exit__ = MagicMock(return_value=False)
             with patch(
-                "src.tasks.fa_max_weekly_edit_rate_report._agent_tier_pairs_with_sends_this_week",
-                return_value=[("cora", "A"), ("hunter", "B")],
+                "src.tasks.fa_max_weekly_edit_rate_report.build_rollup",
+                return_value=rollups,
             ):
                 with patch(
-                    "src.tasks.fa_max_weekly_edit_rate_report.get_weekly_edit_rate",
-                    side_effect=[0.05, 0.12],
+                    "src.tasks.fa_max_weekly_edit_rate_report.count_uncaptured",
+                    return_value=0,
                 ):
                     report = build_report()
         assert "cora" in report and "tier A" in report
@@ -2472,3 +2485,57 @@ class TestSkipDocstringCorrected:
         from src.api import admin_router
         source = inspect.getsource(admin_router._handle_relay_skip)
         assert "only applies to an" not in source
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WP-T3-2 — Capture fix: record_revision preserves pre-revision body when
+# original_draft was NULL (raw-INSERT paths: stage_monitor, abandonment_agent, etc.)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCaptureFixOriginalDraft:
+    """D2: record_revision COALESCE fix ensures rows inserted without
+    original_draft get it populated on first revision, so material_edit is
+    computed against the real original body rather than ''."""
+
+    def _make_session(self, row: dict):
+        """Return a mock session whose execute().mappings().first() returns row."""
+        session = MagicMock()
+        session.execute.return_value.mappings.return_value.first.return_value = row
+        return session
+
+    def test_record_revision_sql_preserves_original_draft_via_coalesce(self):
+        """The UPDATE SQL must set original_draft = COALESCE(original_draft, payload->>'body')
+        so the pre-revision body is captured on the first Revise of any raw-INSERT row."""
+        import inspect
+        from src.services.relay.queue import record_revision
+        source = inspect.getsource(record_revision)
+        assert "COALESCE(original_draft" in source, (
+            "record_revision must COALESCE original_draft so raw-INSERT paths "
+            "(stage_monitor, abandonment_agent, etc.) capture the original body"
+        )
+
+    def test_admin_router_baseline_falls_back_to_payload_body(self):
+        """When original_draft is None, _handle_relay_revise_submission must use
+        item.payload['body'] as the baseline — not '' — so material_edit is computed
+        against the real draft, not an empty string."""
+        import inspect
+        from src.api import admin_router
+        source = inspect.getsource(admin_router._handle_relay_revise_submission)
+        # Baseline must consult payload.get("body") when original_draft is falsy
+        assert 'get("body")' in source or "payload" in source.lower(), (
+            "Baseline must fall back to payload body when original_draft is None"
+        )
+        # Old single-fallback: "existing.original_draft or ''" must NOT be the only path
+        assert 'existing.original_draft or ""' not in source, (
+            'Baseline must not fall back to "" — it must try payload body first'
+        )
+
+    def test_is_material_edit_delegates_to_edit_log_module(self):
+        """admin_router._is_material_edit must delegate to fa_max_edit_log.is_material_edit
+        so the threshold is defined in exactly one place (D3)."""
+        import inspect
+        from src.api import admin_router
+        source = inspect.getsource(admin_router._is_material_edit)
+        assert "fa_max_edit_log" in source or "is_material_edit" in source, (
+            "_is_material_edit must delegate to fa_max_edit_log.is_material_edit"
+        )

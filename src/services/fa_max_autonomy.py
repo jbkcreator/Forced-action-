@@ -39,6 +39,35 @@ logger = logging.getLogger(__name__)
 
 FA_MAX_VENTURE = "fa_max_lending"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared SQL fragments (WP-T3-2: extracted so edit_log uses the same filter)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Human-approved population: venture, human-decided, status set.
+# Callers add AND agent_name = :a AND autonomy_tier_at_send = :tier.
+# fa_max_edit_log._POPULATION_WHERE mirrors this — keep in sync.
+_EDIT_RATE_POPULATION_WHERE = (
+    "venture_key = :v AND decided_at IS NOT NULL "
+    "AND decided_by IS NOT NULL AND decided_by NOT LIKE 'system:autonomous:%' "
+    "AND status IN ('approved', 'sent', 'failed', 'uncertain', 'skipped') "
+    "AND agent_name = :a AND autonomy_tier_at_send = :tier"
+)
+
+
+def _iso_week_start(now=None) -> "datetime":
+    """Monday 00:00 America/New_York as UTC datetime for the given instant."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from zoneinfo import ZoneInfo
+    eastern = ZoneInfo("America/New_York")
+    if now is None:
+        now = _dt.now(eastern)
+    else:
+        now = now.astimezone(eastern)
+    week_start_eastern = (now - _td(days=now.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    return week_start_eastern.astimezone(_tz.utc)
+
 # Tier thresholds (SOT.md Part 2)
 from src.agents.fa_max.tool_registry import FA_MAX_AUTONOMY_POLICY
 
@@ -198,10 +227,7 @@ def get_edit_rate(agent_name: str, tier: str, session: Session) -> float:
             "  COUNT(*) FILTER (WHERE material_edit IS TRUE) AS edited, "
             "  COUNT(*) AS total "
             "FROM relay_approval_queue "
-            "WHERE venture_key = :v AND decided_at IS NOT NULL "
-            "AND decided_by IS NOT NULL AND decided_by NOT LIKE 'system:autonomous:%' "
-            "AND status IN ('approved', 'sent', 'failed', 'uncertain', 'skipped') "
-            "AND agent_name = :a AND autonomy_tier_at_send = :tier"
+            f"WHERE {_EDIT_RATE_POPULATION_WHERE}"
         ),
         {"v": FA_MAX_VENTURE, "a": agent_name, "tier": tier},
     ).mappings().first()
@@ -210,34 +236,42 @@ def get_edit_rate(agent_name: str, tier: str, session: Session) -> float:
     return row["edited"] / row["total"]
 
 
-def get_weekly_edit_rate(agent_name: str, tier: str, session: Session) -> float:
+def get_weekly_edit_rate(
+    agent_name: str,
+    tier: str,
+    session: Session,
+    *,
+    week_start: Optional["datetime"] = None,
+    week_end: Optional["datetime"] = None,
+) -> float:
     """Edit rate scoped to the CURRENT ISO week (Monday 00:00 America/New_York
     through now), for the Friday weekly edit-rate operations report. Reads
     the same material_edit column as get_edit_rate() — the difference is
     the WHERE window, not the evidence source. Returns 0.0 when no approved
-    sends exist this week."""
-    from datetime import datetime, timedelta, timezone as _tz
-    from zoneinfo import ZoneInfo
+    sends exist this week.
 
-    eastern = ZoneInfo("America/New_York")
-    now_eastern = datetime.now(eastern)
-    week_start_eastern = (now_eastern - timedelta(days=now_eastern.weekday())).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    week_start_utc = week_start_eastern.astimezone(_tz.utc)
+    WP-T3-2: accepts optional week_start / week_end (UTC datetimes) so
+    build_rollup can query prior weeks without duplicating the SQL. When
+    omitted, defaults to the current ISO week — identical behavior to before.
+    """
+    if week_start is None:
+        week_start = _iso_week_start()
+    extra_clause = "AND decided_at >= :week_start"
+    params: dict = {"v": FA_MAX_VENTURE, "a": agent_name, "tier": tier,
+                    "week_start": week_start}
+    if week_end is not None:
+        extra_clause += " AND decided_at < :week_end"
+        params["week_end"] = week_end
     row = session.execute(
         text(
             "SELECT "
             "  COUNT(*) FILTER (WHERE material_edit IS TRUE) AS edited, "
             "  COUNT(*) AS total "
             "FROM relay_approval_queue "
-            "WHERE venture_key = :v AND decided_at IS NOT NULL "
-            "AND decided_by IS NOT NULL AND decided_by NOT LIKE 'system:autonomous:%' "
-            "AND status IN ('approved', 'sent', 'failed', 'uncertain', 'skipped') "
-            "AND agent_name = :a AND autonomy_tier_at_send = :tier "
-            "AND decided_at >= :week_start"
+            f"WHERE {_EDIT_RATE_POPULATION_WHERE} "
+            f"{extra_clause}"
         ),
-        {"v": FA_MAX_VENTURE, "a": agent_name, "tier": tier, "week_start": week_start_utc},
+        params,
     ).mappings().first()
     if not row or not row["total"]:
         return 0.0

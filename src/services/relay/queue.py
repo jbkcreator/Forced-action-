@@ -994,6 +994,7 @@ def record_revision(
             text(
                 "UPDATE relay_approval_queue SET "
                 "final_content = :final_content, "
+                "original_draft = COALESCE(original_draft, payload->>'body'), "
                 "payload = jsonb_set(COALESCE(payload, '{}'::jsonb), '{body}', :final_content_json ::jsonb, true), "
                 "revision_count = revision_count + 1, "
                 "last_revised_by = :revised_by, "

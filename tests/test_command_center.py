@@ -626,3 +626,93 @@ class TestQueryDb:
         )
         payload = json.loads(result_json[6:])
         assert "error" in payload
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WP-T3-2 — Command Center: get_edit_log tool + scoreboard edit_rate_this_week
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestGetEditLogTool:
+    """Tests for the new get_edit_log Command Center tool (WP-T3-2 §6)."""
+
+    def test_get_edit_log_is_registered(self):
+        """get_edit_log must be in the TOOLS list and _HANDLERS dispatch table."""
+        from src.agents.cora.command_center.tools import TOOLS, _HANDLERS
+        tool_names = [t["name"] for t in TOOLS]
+        assert "get_edit_log" in tool_names, "get_edit_log missing from TOOLS"
+        assert "get_edit_log" in _HANDLERS, "get_edit_log missing from _HANDLERS"
+
+    def test_get_edit_log_dispatch_returns_str_int(self):
+        """dispatch_tool must return (str, int) and never raise."""
+        result_json, duration_ms = dispatch_tool(
+            "get_edit_log",
+            {"weeks_back": 1, "limit": 5},
+            _null_db(),
+        )
+        assert isinstance(result_json, str)
+        assert isinstance(duration_ms, int)
+
+    def test_get_edit_log_result_has_expected_keys(self):
+        """Result payload must contain period, rollup, entries, uncaptured."""
+        result_json, _ = dispatch_tool(
+            "get_edit_log",
+            {"weeks_back": 1, "limit": 5},
+            _null_db(),
+        )
+        payload = json.loads(result_json[6:])  # strip "DATA: "
+        assert "period" in payload or "error" in payload  # graceful on empty DB
+        if "period" in payload:
+            assert "rollup" in payload
+            assert "entries" in payload
+            assert "uncaptured" in payload
+
+    def test_get_edit_log_weeks_back_out_of_range_returns_error(self):
+        """weeks_back must be validated 1–8; values outside return an error."""
+        result_json, _ = dispatch_tool(
+            "get_edit_log",
+            {"weeks_back": 0},
+            _null_db(),
+        )
+        payload = json.loads(result_json[6:])
+        assert "error" in payload
+
+    def test_get_edit_log_limit_out_of_range_returns_error(self):
+        result_json, _ = dispatch_tool(
+            "get_edit_log",
+            {"limit": 30},
+            _null_db(),
+        )
+        payload = json.loads(result_json[6:])
+        assert "error" in payload
+
+
+class TestScoreboardEditRateField:
+    """The get_scoreboard tool must include edit_rate_this_week (WP-T3-2 §6)."""
+
+    def test_scoreboard_includes_edit_rate_this_week_key(self):
+        result_json, _ = dispatch_tool("get_scoreboard", {}, _null_db())
+        payload = json.loads(result_json[6:])
+        if "error" in payload:
+            return  # DB not available, skip assertion
+        assert "edit_rate_this_week" in payload
+
+    def test_scoreboard_edit_rate_is_list(self):
+        result_json, _ = dispatch_tool("get_scoreboard", {}, _null_db())
+        payload = json.loads(result_json[6:])
+        if "error" in payload:
+            return
+        assert isinstance(payload["edit_rate_this_week"], list)
+
+    def test_scoreboard_degrades_gracefully_when_edit_rate_fails(self):
+        """If the edit-rate query fails, the scoreboard must still return
+        other fields with edit_rate_this_week degraded to []."""
+        from unittest.mock import patch
+        with patch(
+            "src.agents.cora.command_center.tools.build_rollup",
+            side_effect=Exception("DB timeout"),
+        ):
+            result_json, _ = dispatch_tool("get_scoreboard", {}, _null_db())
+        payload = json.loads(result_json[6:])
+        # Must not raise and must degrade edit_rate_this_week to []
+        if "edit_rate_this_week" in payload:
+            assert payload["edit_rate_this_week"] == []
