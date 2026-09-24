@@ -53,32 +53,36 @@ def handle_socket_request(client: Any, request: Any) -> bool:
 
     payload = request.payload or {}
 
-    # view_submission (WP-T2-6 new-file modal, and the pre-existing
-    # Revise modal) and block_suggestion (borrower-search autocomplete)
-    # must carry their real response -- response_action / options -- IN
-    # the envelope's own acknowledgement. Unlike a slash command, there is
-    # no response_url-style side channel for a modal's validation display,
-    # so the handler has to run (fast: a handful of inserts/selects) before
-    # the single ack this envelope gets. This is why these two are checked
-    # before the blank ack below, which every other interactive/events_api
-    # envelope gets instead.
+    # view_submission (modal Save/Submit) and block_suggestion (borrower-
+    # search autocomplete) are NOT a fire-and-forget ack like block_actions
+    # below -- Slack requires the SAME acknowledgement to CARRY the real
+    # response (empty {} closes a modal; {"response_action": "errors", ...}
+    # re-opens it with inline field errors; block_suggestion needs its
+    # {"options": [...]} body). Unlike a slash command there is no
+    # response_url-style side channel, so each handler must run BEFORE the
+    # single ack this envelope gets. Confirmed gap: this listener previously
+    # had ZERO view_submission handling, so neither the Relay Revise modal
+    # nor Quote Ready's Modify modal ever actually processed a submission
+    # over Socket Mode (the production fa-relay-slack-listener.service
+    # transport).
     if request.type == "interactive" and payload.get("type") == "view_submission":
-        callback_id = payload.get("view", {}).get("callback_id")
+        callback_id = (payload.get("view") or {}).get("callback_id")
+        user_id = payload.get("user", {}).get("id", "?")
 
         if callback_id == "fa_max_new_file_submit":
             # This handler's DB work (profiled live: ~10s against this
             # dev DB's network latency, well past Slack's ~3s Socket Mode
-            # ack window) cannot ride the ack the way fa_max_revise_submit
-            # below does -- found live during manual E2E testing (Slack
-            # reported dispatch_failed even though the DB write eventually
-            # succeeded). _new_file_pre_validate covers BOTH of the
-            # handler's error-returning checks and needs no DB access, so
-            # it runs before the ack; once it passes, ack immediately
-            # (closing the modal) and do the real DB work after -- same
-            # "ack fast, defer the work" pattern already used for the FA
-            # Max slash commands. There is no response_action channel
-            # left post-ack, so a DB-layer failure here can only be
-            # logged, not shown inline in the modal.
+            # ack window) cannot ride the ack the way fa_max_revise_submit /
+            # quote_ready_modify_submit below do -- found live during manual
+            # E2E testing (Slack reported dispatch_failed even though the DB
+            # write eventually succeeded). _new_file_pre_validate covers
+            # both of the handler's error-returning checks and needs no DB
+            # access, so it runs before the ack; once it passes, ack
+            # immediately (closing the modal) and do the real DB work after
+            # -- same "ack fast, defer the work" pattern already used for
+            # the FA Max slash commands. There is no response_action channel
+            # left post-ack, so a DB-layer failure here can only be logged,
+            # not shown inline in the modal.
             from src.api.admin_router import (
                 _handle_new_file_view_submit,
                 _new_file_pre_validate,
@@ -105,8 +109,42 @@ def handle_socket_request(client: Any, request: Any) -> bool:
                 logger.exception("[RelaySocket] new-file DB work raised after ack")
             return True
 
-        from src.api.admin_router import _handle_relay_revise_submission
+        if callback_id == "quote_ready_modify_submit":
+            # Split the same way as fa_max_new_file_submit above: everything
+            # that can produce an inline {"response_action": "errors", ...}
+            # (validation, recompute, persist, commit) runs before the ack,
+            # since Slack requires that SAME ack to carry field errors. The
+            # two Slack API calls this submission triggers on success --
+            # posting the new dossier card and neutralizing the old one --
+            # are real network round trips and do NOT need to complete
+            # before the modal closes, so they run after via
+            # finalize_modify_submission(). Confirmed real gap: this used to
+            # run both calls before the ack, on the same ~3s Socket Mode
+            # budget that caused a live dispatch_failed for
+            # fa_max_new_file_submit's DB work alone.
+            from src.api.admin_router import _handle_quote_ready_modify_submission
 
+            try:
+                ack_body, finalize_kwargs = _handle_quote_ready_modify_submission(payload)
+            except Exception:
+                logger.exception("[RelaySocket] quote_ready_modify_submit handler raised")
+                ack_body, finalize_kwargs = None, None
+
+            client.send_socket_mode_response(
+                SocketModeResponse(envelope_id=request.envelope_id, payload=ack_body)
+            )
+            if finalize_kwargs is not None:
+                from src.services.quote_ready.dossier import finalize_modify_submission
+                try:
+                    finalize_modify_submission(**finalize_kwargs)
+                except Exception:
+                    logger.exception(
+                        "[RelaySocket] finalize_modify_submission raised after ack for new_result_id=%s",
+                        finalize_kwargs.get("new_result_id"),
+                    )
+            return True
+
+        response_body: Optional[dict] = None
         try:
             if callback_id == "fa_max_revise_submit":
                 # _handle_relay_revise_submission raises HTTPException on
@@ -115,16 +153,32 @@ def handle_socket_request(client: Any, request: Any) -> bool:
                 # such middleware here. Left uncaught, this envelope would
                 # simply never get acked at all: Slack sees a silent
                 # 3-second timeout rather than a clean error.
-                result = _handle_relay_revise_submission(payload)
+                from src.api.admin_router import _handle_relay_revise_submission
+                response_body = _handle_relay_revise_submission(payload)
+            elif callback_id == "quote_ready_override_arv_submit":
+                # A single DB write with no follow-on Slack API calls (see
+                # _handle_quote_ready_override_arv_submission's docstring),
+                # so unlike quote_ready_modify_submit above it needs no
+                # ack-first split -- safe to run fully before the ack.
+                from src.api.admin_router import _handle_quote_ready_override_arv_submission
+                response_body = _handle_quote_ready_override_arv_submission(payload)
             else:
-                result = {}
+                logger.info(
+                    "[RelaySocket] view_submission with unrecognized callback_id=%r user=%s — "
+                    "no handler registered, modal will silently close",
+                    callback_id, user_id,
+                )
         except Exception:
             logger.exception(
                 "[RelaySocket] view_submission handler raised for callback_id=%s", callback_id,
             )
-            result = {}
+            response_body = None
+        logger.info(
+            "[RelaySocket] view_submission callback_id=%r user=%s -> response=%s",
+            callback_id, user_id, "errors" if (response_body or {}).get("response_action") == "errors" else "ok",
+        )
         client.send_socket_mode_response(
-            SocketModeResponse(envelope_id=request.envelope_id, payload=result)
+            SocketModeResponse(envelope_id=request.envelope_id, payload=response_body)
         )
         return True
 
@@ -174,6 +228,8 @@ def handle_socket_request(client: Any, request: Any) -> bool:
         _handle_add_builder_to_diallist,
         _handle_snooze_builder,
         _handle_dismiss_builder,
+        _handle_quote_ready_decision,
+        _handle_quote_ready_modify_open,
         _handle_new_file_new_borrower_click,
     )
     from src.core.database import get_db_context
@@ -229,6 +285,20 @@ def handle_socket_request(client: Any, request: Any) -> bool:
         logger.info("[RelaySocket] builder dismiss: action_id=%s user=%s", action_id, user_id)
         with get_db_context() as db:
             result = _handle_dismiss_builder(payload, db)
+        _post_socket_ephemeral(client, payload, result)
+        return True
+
+    # Quote Ready dossier decision (WP-8B — MONEY lane)
+    if action_id in ("quote_ready_approve", "quote_ready_reject"):
+        logger.info("[RelaySocket] quote-ready decision: action_id=%s user=%s", action_id, user_id)
+        with get_db_context() as db:
+            result = _handle_quote_ready_decision(payload, db)
+        _post_socket_ephemeral(client, payload, result)
+        return True
+    if action_id == "quote_ready_modify":
+        logger.info("[RelaySocket] quote-ready modify (opening modal): user=%s", user_id)
+        with get_db_context() as db:
+            result = _handle_quote_ready_modify_open(payload, db)
         _post_socket_ephemeral(client, payload, result)
         return True
 

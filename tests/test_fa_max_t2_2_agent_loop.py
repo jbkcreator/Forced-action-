@@ -2174,7 +2174,8 @@ class TestCreateFaMaxOpportunity:
             source="cora_outreach", origin_interaction_id="interaction-1",
         )
         assert result == "opp-123"
-        # call_args_list[0] is the INSERT call
+        # First call is the INSERT into fa_max_opportunities -- later calls
+        # are ensure_entity_registry()'s own INSERT/SELECT into the registry.
         params = session.execute.call_args_list[0][0][1]
         assert params["origin_interaction_id"] == "interaction-1"
 
@@ -2210,11 +2211,16 @@ class TestCreateFaMaxOpportunity:
         existing_row.opportunity_id = "opp-existing"
         select_result = MagicMock()
         select_result.fetchone.return_value = existing_row
-        reg_insert = MagicMock()
-        reg_select = MagicMock()
-        reg_select.scalar.return_value = "some-uuid"
-        # INSERT (conflict) → SELECT existing → ensure_entity_registry INSERT + SELECT
-        session.execute.side_effect = [insert_result, select_result, reg_insert, reg_select]
+        # ensure_entity_registry() issues its own INSERT + SELECT after the
+        # idempotent-retry branch resolves the opportunity_id.
+        registry_insert_result = MagicMock()
+        registry_row = MagicMock()
+        registry_row.entity_uuid = "registry-uuid-1"
+        registry_select_result = MagicMock()
+        registry_select_result.fetchone.return_value = registry_row
+        session.execute.side_effect = [
+            insert_result, select_result, registry_insert_result, registry_select_result,
+        ]
 
         result = create_fa_max_opportunity(
             session=session, person_id="person-1", opportunity_type="acquisition",
