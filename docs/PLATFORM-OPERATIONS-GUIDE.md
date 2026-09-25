@@ -597,6 +597,51 @@ action (person state/history, suppression, send, or approval-card repost) and
 rejects ambiguous requests. The worker also reconciles expired claimed send
 attempts against Relay's idempotency-keyed queue during its reclaim sweep.
 
+### FA Max Campaign Selection Agent (WP-T3-4)
+Two scheduled jobs, both idempotent and safe to re-run — see
+`config/fa_max_campaigns.py` for the campaign list, priority order, and
+per-rule enable switches:
+
+```bash
+# Daily 06:30 UTC — after partner mining (06:00 UTC). Enrolls new contacts,
+# re-checks pause/resume/cancel on every existing enrollment, posts one
+# summary to the RELATIONSHIPS Slack channel. `--dry-run` computes the same
+# decisions with no writes.
+python -m src.tasks.fa_max_campaign_enrollment_sweep [--dry-run]
+
+# Every 15 minutes. Hands due, unblocked touches to the Outreach Agent
+# (`fa_max_outreach` queue, WP-T3-5) or Partner Nurture Agent
+# (`fa_max_partner_nurture` queue, WP-T3-6). Contains no send code.
+python -m src.tasks.fa_max_campaign_due_steps
+```
+
+Both jobs are pure `fa_max_work_queue`/`fa_max_campaign_*` table writers —
+neither ever calls Relay's `enqueue()` directly, so a bug here can misroute
+or stall a touch but cannot itself send a message. `exit_desk` starts
+disabled (`config.fa_max_campaigns.CAMPAIGN_ENABLED`) until the bought
+lending-data feed lands (plan D-1); enabling it means agreeing the
+`lending_mortgage_records` table/view shape with whoever builds that loader
+first.
+
+**Sequence content**: the content writer's CSV loads per campaign, versioned
+(a load never affects people already mid-sequence):
+
+```bash
+python -m src.services.fa_max_campaigns.content load <file.csv> <campaign_key> [--dry-run]
+python -m src.services.fa_max_campaigns.content print-doc  # regenerate docs/fa_max_campaign_merge_fields.md
+```
+
+**Campaign 3 (Rescue Circuit) partner list**: Josh's own contact list
+(title reps, closing attorneys, brokers, loan officers) imports via:
+
+```bash
+python -m src.services.fa_max_campaigns.import_partners <file.csv> [--dry-run]
+```
+
+Imported partners are written with `status='identified'` (never `active`) so
+an import can never itself grant Tier B autonomous-send context, and with
+`fa_max_persons.source='partner'` so they pass the FA/Backflip channel split.
+
 For causal Tier C evidence, an admin records an opportunity from the exact
 completed send with `POST /api/admin/fa-max/opportunities/from-send`. Normal
 stage progression uses `POST /api/admin/fa-max/opportunities/{id}/advance`;

@@ -122,6 +122,31 @@ def handle_inbound(from_number: str, body: str, db: Session) -> Optional[str]:
     return None
 
 
+def _cascade_fa_max_opt_out(phone: str, db: Session) -> None:
+    """WP-T3-4 (plan Section 6.6): if this phone belongs to a resolved FA Max
+    person, run the same handle_opt_out() the concierge's reply-opt-out path
+    uses — moves the person to do_not_contact and cancels any active
+    campaign enrollment (opt-out on any channel stops every channel).
+    Best-effort: never blocks the underlying TCPA suppression write."""
+    try:
+        from sqlalchemy import text as _text
+
+        row = db.execute(
+            _text("SELECT person_id::text FROM fa_max_persons WHERE phone = :phone AND merged_into_id IS NULL LIMIT 1"),
+            {"phone": phone},
+        ).fetchone()
+        if not row:
+            return
+        from src.agents.reply_concierge.opt_out import handle_opt_out
+
+        handle_opt_out(
+            person_id=row[0], contact_email=None,
+            inbound_text="SMS STOP", channel="sms", db=db,
+        )
+    except Exception:
+        logger.warning("record_opt_out: fa_max cascade failed for phone=%s", phone, exc_info=True)
+
+
 def record_opt_out(
     phone: str,
     keyword: str,
@@ -158,6 +183,7 @@ def record_opt_out(
                 "record_opt_out: email cascade failed for already-suppressed phone=%s",
                 phone, exc_info=True,
             )
+        _cascade_fa_max_opt_out(phone, db)
         return
     db.add(SmsOptOut(
         phone=phone,
@@ -166,6 +192,7 @@ def record_opt_out(
         opted_out_at=datetime.now(timezone.utc),
     ))
     db.flush()
+    _cascade_fa_max_opt_out(phone, db)
 
     # fa037 — Revenue Signal Score hook. Resolve the subscriber via the
     # existing SmsOptIn → Subscriber lookup pattern (mirrors

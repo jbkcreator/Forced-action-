@@ -42,12 +42,24 @@ PYTHONPATH=. python migrations/apply_fa_max_wp_t2_2_opportunity_origin_immutable
 PYTHONPATH=. python migrations/apply_fa_max_wp_t2_2_tool_call_log_in_progress_status.py  # FA Max WP-T2-2 review fix: widens fa_max_tool_call_log.status CHECK to allow 'in_progress' (audit row written before a tool executes, not only after) (idempotent, run after apply_fa_max_wp_t2_2_agent_infra.py)
 PYTHONPATH=. python migrations/apply_fa_max_wp_t2_2_tool_call_log_claimed_status.py  # FA Max WP-T2-2 review fix: widens fa_max_tool_call_log.status CHECK to allow 'claimed' (claim_send_attempt()'s short-lived commit so a timeout write can't clobber a legitimately-claimed send) (idempotent, run after apply_fa_max_wp_t2_2_tool_call_log_in_progress_status.py)
 PYTHONPATH=. python migrations/apply_fa_max_wp_t2_3.py  # FA Max WP-T2-3: opportunity_id on relay_approval_queue, backflip_attribution_owner/set_at on fa_max_opportunities, fa_max_backflip_suppression_decisions audit table (idempotent, run after WP-T2-2)
+PYTHONPATH=. python migrations/apply_fa_max_wp_t3_4_campaign_selection.py  # FA Max WP-T3-4: fa_max_campaign_sequence_steps/enrollments/enrollment_events/touches (idempotent, run after WP-1/WP-2)
 
 # FA Max agent worker (separate process, WP-T2-2 — see docs/PLATFORM-OPERATIONS-GUIDE.md)
 python -m src.agents.fa_max.worker
 
 # FA Max weekly edit-rate report (Friday cron, WP-T2-2)
 python -m src.tasks.fa_max_weekly_edit_rate_report
+
+# FA Max Campaign Selection Agent (WP-T3-4) — enrollment sweep (daily 06:30 UTC) + due-step sweep (every 15 min)
+python -m src.tasks.fa_max_campaign_enrollment_sweep [--dry-run]
+python -m src.tasks.fa_max_campaign_due_steps
+
+# FA Max campaign sequence content: load the writer's CSV, or print the merge-field reference doc
+python -m src.services.fa_max_campaigns.content load <file.csv> <capital_desk_loop|exit_desk|rescue_circuit> [--dry-run]
+python -m src.services.fa_max_campaigns.content print-doc
+
+# FA Max Campaign 3 (Rescue Circuit) partner list import
+python -m src.services.fa_max_campaigns.import_partners <file.csv> [--dry-run]
 
 # Tests
 pytest tests/                                  # default (excludes scenario)
@@ -83,6 +95,9 @@ Central `properties` table (~522k parcels). 1:Many → foreclosures, tax_delinqu
 - **Agents** (`src/agents/`): LangGraph (Lifecycle) runtime. **Runs as a separate process/container from FastAPI.** Entry point: `python -m src.agents --serve`. API and Lifecycle communicate **exclusively** through Redis Queue (`lifecycle:queue` key, LPUSH/BRPOP) and Postgres NOTIFY (`lifecycle_events` channel). **Never call `dispatch_event()` directly from API/services/tasks** — use `publish_lifecycle_event()` from `src.agents.events.ingestion`. If Redis is unavailable, events fall back to `lifecycle_event_queue` Postgres table with 60s sweep. Supervisor routes events via dict lookup (`src/agents/router.py`). 10 graphs. Kill switch colors: green=send, yellow=fallback template, red=block. All decisions logged to `agent_decisions`. Guardrails in `config/lifecycle_guardrails.py`. `kill_switch_metric_ingest.get_cached_metric` re-exports from `kill_switch_service` — import from service layer, not tasks.
 
 - **Tasks** (`src/tasks/`): Scheduled jobs. `daily_report.py` — CSV ops report (runs 08:10 UTC for both Hillsborough and Pinellas). `daily_dashboard.py` — 10-section PDF (23:30 UTC Mon-Sat), separate from daily_report. `dnc_refresh` — monthly Tracerfy DNC re-scrub. `learning_hygiene_sweep.py` — daily 10:15 UTC lesson-hygiene sweep (LEARN Layer 4), **dry-run unless `--apply`**.
+
+### Campaign Selection Agent (FA Max WP-T3-4)
+`src/services/fa_max_campaigns/` assigns each FA Max person to exactly one of three v1 campaigns — `capital_desk_loop`, `exit_desk` (config-disabled until the bought lending-data feed lands), `rescue_circuit` — tracks their step/next-touch state (`fa_max_campaign_enrollments`/`_touches`/`_enrollment_events`), and hands due, unblocked touches to the Outreach Agent's (`fa_max_outreach`) or Partner Nurture Agent's (`fa_max_partner_nurture`) work queue. **Contains no send code and never writes `fa_max_person_consent`** — a step with no consent row for its channel holds (email) or is skipped (sms), never bypassed. `eligibility.py` = campaign rules; `blocks.py` = the shared enrollment/advancement gate (wraps `fa_max_send_governance`, never reimplements it); `selection.py` = the enrollment/due-step engine (`run_enrollment_sweep`, `process_due_touches`, `cancel_enrollments`); `content.py` = the writer's CSV loader + merge-field registry (`docs/fa_max_campaign_merge_fields.md`); `import_partners.py` = Josh's Campaign 3 (Rescue Circuit) partner list import. Priority and thresholds in `config/fa_max_campaigns.py`. An opt-out on any channel (email unsubscribe, SMS STOP, or a reply) cancels the person's enrollment via a single choke point in `src.agents.reply_concierge.opt_out.handle_opt_out()` — see the hooks in `sms_compliance.record_opt_out()` and `email_unsubscribe_router.py`.
 
 ### Lesson Hygiene (LEARN-v2.2 Layer 4)
 Garbage collection for `lifecycle_playbook`. `src/services/learning_hygiene.py` = pure `decide(LessonStats) -> Verdict` + `sweep(db, *, now, dry_run, limit)`; thresholds in `config/learning_hygiene.py`; cron driver `src/tasks/learning_hygiene_sweep.py`. Calls the existing `supersede_recommendation` / `mark_contradicted` from `playbook_writer.py` — it decides *when*, never what a lesson means.

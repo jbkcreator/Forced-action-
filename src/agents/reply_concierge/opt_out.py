@@ -94,6 +94,24 @@ def handle_opt_out(
             db.rollback()
             logger.error("opt_out: failed to transition fa_max_persons for person_id=%s: %s", person_id, exc)
 
+    # 1b. WP-T3-4: cancel any active/paused campaign enrollment and its
+    # future touches. Single choke point — every opt-out path (reply,
+    # email-unsubscribe hook, SMS-STOP hook) routes through handle_opt_out,
+    # so this line is the one place "opt-out on any channel stops every
+    # channel" (plan Section 6.6) is enforced for campaign sends. Guarded so
+    # a campaign-selection failure can never block the underlying
+    # suppression write above.
+    if person_id and suppressed:
+        try:
+            from src.services.fa_max_campaigns.selection import cancel_enrollments
+
+            cancel_enrollments(db, person_id=person_id, reason=f"opt_out_{channel}")
+        except Exception as exc:
+            logger.warning(
+                "opt_out: cancel_enrollments failed for person_id=%s channel=%s: %s",
+                person_id, channel, exc,
+            )
+
     # 2. Suppress in the email suppression store (covers Cora's outbound path)
     if contact_email:
         try:
