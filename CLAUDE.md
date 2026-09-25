@@ -53,6 +53,10 @@ python -m src.agents.fa_max.qualification_worker
 # FA Max weekly edit-rate report (Friday cron, WP-T2-2)
 python -m src.tasks.fa_max_weekly_edit_rate_report
 
+# FA Max Fundability Agent backstop sweep (daily 10:30 UTC cron, WP-T3-8 — after arv_sweep at 10:00)
+python -m src.tasks.fa_max_fundability_sweep
+python -m src.tasks.fa_max_fundability_sweep --dry-run
+
 # Tests
 pytest tests/                                  # default (excludes scenario)
 pytest -m scenario                             # opt-in sandbox e2e
