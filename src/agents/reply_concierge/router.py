@@ -21,6 +21,7 @@ from sqlalchemy import text
 from src.agents.reply_concierge.classifier import classify_inbound, CONFIDENCE_THRESHOLD
 from src.agents.reply_concierge.opt_out import handle_opt_out
 from src.agents.reply_concierge.responder import build_reply
+from src.services import fa_max_outbound_links
 
 logger = logging.getLogger(__name__)
 
@@ -300,6 +301,13 @@ def _queue_reply(
     db: Session,
 ) -> Optional[int]:
     idempotency_key = _idem_key("reply", person_id, reply_text)
+    if contact_email:
+        links = fa_max_outbound_links.resolve_or_alert(
+            db, agent_name=_AGENT_NAME, person_id=person_id, opportunity_id=opportunity_id,
+        )
+        if links is None:
+            return None
+        reply_text = fa_max_outbound_links.add_booking_line(reply_text, links)
     payload = {
         "type": "concierge_reply",
         "kb_topic_key": kb_topic_key,
