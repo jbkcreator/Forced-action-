@@ -773,6 +773,56 @@ class TestArvSweepHookGuard:
             else:
                 sys.modules["src.services.fa_max_fundability_agent"] = original
 
+    def test_db_error_in_hook_does_not_poison_outer_session(self):
+        """A DB-level failure inside populate_arv_for_property must not abort
+        the shared arv_sweep session — the savepoint (begin_nested) must
+        isolate the hook's transaction state so subsequent properties still
+        persist their ARV results.
+        """
+        from unittest.mock import MagicMock, patch
+        import sqlalchemy.exc
+
+        from src.tasks.arv_sweep import run
+
+        # Two properties: the first triggers a DB error in the hook, the
+        # second must still succeed and be persisted.
+        mock_db = MagicMock()
+        # begin_nested() returns a context manager; simulate it absorbing the error
+        nested_ctx = MagicMock()
+        mock_db.begin_nested.return_value.__enter__ = MagicMock(return_value=nested_ctx)
+        mock_db.begin_nested.return_value.__exit__ = MagicMock(return_value=False)
+
+        property_ids = [101, 102]
+
+        def fake_populate(session, property_id):
+            if property_id == 101:
+                raise sqlalchemy.exc.OperationalError(
+                    "relation does not exist", {}, None
+                )
+
+        arv_result = MagicMock()
+        arv_result.arv_unknown = False
+
+        with (
+            patch("src.tasks.arv_sweep._candidate_property_ids", return_value=property_ids),
+            patch("src.tasks.arv_sweep.compute_arv_for_property", return_value=arv_result),
+            patch("src.tasks.arv_sweep.persist_arv_result") as mock_persist,
+            patch("src.tasks.arv_sweep.get_db_context") as mock_ctx,
+            patch(
+                "src.services.fa_max_fundability_agent.populate_arv_for_property",
+                side_effect=fake_populate,
+            ),
+        ):
+            mock_ctx.return_value.__enter__ = MagicMock(return_value=mock_db)
+            mock_ctx.return_value.__exit__ = MagicMock(return_value=False)
+
+            result = run(dry_run=False)
+
+        # Both properties should have been persisted despite the hook error on #101
+        assert mock_persist.call_count == 2
+        assert result["errors"] == 0
+        assert result["persisted"] == 2
+
 
 # ===========================================================================
 # Category 14 — sweep pre-flight check

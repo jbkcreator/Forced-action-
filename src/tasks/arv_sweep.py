@@ -162,7 +162,8 @@ def run(
                     from src.services.fa_max_fundability_agent import (
                         populate_arv_for_property,
                     )
-                    populate_arv_for_property(session=db, property_id=pid)
+                    with db.begin_nested():
+                        populate_arv_for_property(session=db, property_id=pid)
                 except ImportError:
                     pass
                 except Exception:
