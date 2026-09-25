@@ -2504,10 +2504,10 @@ def _handle_relay_revise_submission(payload: dict) -> dict:
     # prior revision already made material -- this flag feeds the Tier B
     # graduation edit-rate gate, where under-counting edits is the unsafe
     # direction.
-    # WP-T3-2 D2: fall back to payload body when original_draft is None
-    # (raw-INSERT paths never set original_draft; COALESCE in record_revision
-    # will capture it on this revision, but we compute material_edit first).
-    baseline = existing.original_draft or (existing.payload or {}).get("body") or ""
+    # WP-T3-2: raw-INSERT writers never set original_draft, so fall back to
+    # the row's draft text -- the same value record_revision() captures as
+    # original_draft on this revision.
+    baseline = existing.original_draft or relay_queue.draft_text(existing.payload)
     material = bool(existing.material_edit) or _is_material_edit(baseline, new_content)
 
     item = relay_queue.record_revision(

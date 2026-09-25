@@ -355,10 +355,11 @@ def _build_revise_modal(item: QueueItem) -> dict:
     no view_submission handler). This is a new, minimal one: a single
     multiline text input pre-filled with the current content
     (final_content if this item has already been revised once, else
-    original_draft), submitted back as a view_submission carrying item_id
-    in private_metadata.
+    original_draft, else the draft text in its payload for rows whose writer
+    never set original_draft), submitted back as a view_submission carrying
+    item_id in private_metadata.
     """
-    prefill = (item.final_content or item.original_draft or "")[:3000]
+    prefill = (item.final_content or item.original_draft or queue.draft_text(item.payload))[:3000]
     return {
         "type": "modal",
         "callback_id": "fa_max_revise_submit",

@@ -297,7 +297,7 @@ def person_id(queue_db):
 
 
 def _seed(db, person, *, agent, tier="A", status="sent", decided_at=None, original=None, final=None,
-          body=None, revisions=0, material=None, decided_by="slack:U_JOSH") -> int:
+          body=None, payload=None, revisions=0, material=None, decided_by="slack:U_JOSH") -> int:
     return db.execute(
         text(
             "INSERT INTO relay_approval_queue "
@@ -311,7 +311,8 @@ def _seed(db, person, *, agent, tier="A", status="sent", decided_at=None, origin
         ),
         {
             "k": f"wp-t3-2-test-{uuid.uuid4()}",
-            "payload": json.dumps({"subject": "s", "body": body if body is not None else (final or original or "")}),
+            "payload": json.dumps(payload if payload is not None else
+                                  {"subject": "s", "body": body if body is not None else (final or original or "")}),
             "status": status, "agent": agent, "tier": tier,
             "decided_by": decided_by if decided_at else None, "decided_at": decided_at,
             "original": original, "final": final, "revisions": revisions, "material": material,
@@ -479,3 +480,43 @@ class TestCaptureFixThroughReviseHandler:
         assert row["original_draft"] == body
         assert row["revision_count"] == 2
         assert row["material_edit"] is True
+
+    def test_reply_concierge_row_captures_reply_text(self, queue_db, person_id):
+        """Reply Concierge queues its draft under payload.reply_text, not body."""
+        reply = "Hi Mike,\nThanks for reaching out about the duplex on Oak Street last week.\nBest, Josh"
+        revised = "Hi Mike,\nThanks for reaching out about the duplex on Oak Street last week!\nBest, Josh"
+        item_id = _seed(queue_db, person_id, agent="reply_concierge", status="pending", payload={
+            "type": "concierge_reply", "kb_topic_key": None, "opportunity_id": None,
+            "reply_text": reply, "auto_send": False,
+        })
+
+        self._submit_revision(queue_db, item_id, revised)
+
+        row = self._row(queue_db, item_id)
+        assert row["original_draft"] == reply
+        assert row["material_edit"] is False
+        entries = get_edit_log(queue_db, window_start=datetime(2000, 1, 1, tzinfo=timezone.utc),
+                               window_end=datetime(2100, 1, 1, tzinfo=timezone.utc), agent_name="reply_concierge")
+        assert all(e.item_id != item_id for e in entries)  # still pending — logged once decided
+
+
+class TestDraftText:
+    @pytest.mark.parametrize("payload, expected", [
+        ({"subject": "s", "body": "email body"}, "email body"),
+        ({"type": "concierge_reply", "reply_text": "concierge reply"}, "concierge reply"),
+        ({"type": "concierge_exceptions", "suggested_reply": "suggested"}, "suggested"),
+        ({"body": "", "reply_text": "fallback past empty body"}, "fallback past empty body"),
+        ({"type": "file_stalled", "opportunity_id": "o1"}, ""),
+        (None, ""),
+    ])
+    def test_draft_text_reads_every_writer_shape(self, payload, expected):
+        from src.services.relay.queue import draft_text
+        assert draft_text(payload) == expected
+
+    def test_revise_modal_prefills_concierge_draft(self):
+        from types import SimpleNamespace
+        from src.services.relay.slack_post import _build_revise_modal
+        item = SimpleNamespace(id=7, final_content=None, original_draft=None,
+                               payload={"type": "concierge_reply", "reply_text": "Hi Mike, thanks!"})
+        element = _build_revise_modal(item)["blocks"][0]["element"]
+        assert element["initial_value"] == "Hi Mike, thanks!"
