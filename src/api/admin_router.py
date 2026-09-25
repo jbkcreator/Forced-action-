@@ -57,6 +57,7 @@ from src.core.models import (
 )
 from src.loaders.tax import TaxDelinquencyLoader
 from src.loaders.voter_registry import VoterRegistryLoader
+from src.services.fa_max_edit_log import is_material_edit as _is_material_edit
 from src.services.relay.slack_post import open_new_file_modal
 from src.services.zip_territory import claim_zip_territory
 from src.utils.county_config import invalidate_cache
@@ -2378,7 +2379,7 @@ def _handle_relay_skip(payload: dict) -> dict:
     if existing is None:
         return _slack_ephemeral(f"Item #{item_id} not found.")
 
-    ok = relay_queue.mark_skipped(item_id, f"slack_skip:{user_id}")
+    ok = relay_queue.mark_skipped(item_id, f"slack_skip:{user_id}", decided_by=user_id)
     if not ok:
         return _slack_ephemeral(
             f"Item #{item_id} could not be skipped — it may already be decided, "
@@ -2438,32 +2439,6 @@ def _handle_relay_revise_open(payload: dict) -> dict:
 
     open_revise_modal(payload.get("trigger_id", ""), existing)
     return {}
-
-
-def _is_material_edit(old_text: str, new_text: str) -> bool:
-    """Normalized-token-diff used to compute material_edit for a Slack
-    revision. record_revision() (src.services.relay.queue) only PERSISTS
-    whatever material_edit value it is given — its body is a plain UPDATE,
-    it does not compute one — so this is the computation, done once here
-    at the single caller rather than inside that shared helper.
-
-    A change is "material" when more than 15% of the union of the two
-    texts' lowercased word tokens differ (symmetric difference / union).
-    Threshold chosen to catch a rewritten sentence or changed number while
-    ignoring whitespace/punctuation-only edits.
-    """
-    import re as _re
-
-    def _tokens(text: str) -> set:
-        return set(_re.findall(r"\w+", (text or "").lower()))
-
-    old_tokens = _tokens(old_text)
-    new_tokens = _tokens(new_text)
-    union = old_tokens | new_tokens
-    if not union:
-        return False
-    diff = old_tokens.symmetric_difference(new_tokens)
-    return (len(diff) / len(union)) > 0.15
 
 
 def _post_relay_thread_note(item, text: str) -> None:
@@ -2529,7 +2504,10 @@ def _handle_relay_revise_submission(payload: dict) -> dict:
     # prior revision already made material -- this flag feeds the Tier B
     # graduation edit-rate gate, where under-counting edits is the unsafe
     # direction.
-    baseline = existing.original_draft or ""
+    # WP-T3-2: raw-INSERT writers never set original_draft, so fall back to
+    # the row's draft text -- the same value record_revision() captures as
+    # original_draft on this revision.
+    baseline = existing.original_draft or relay_queue.draft_text(existing.payload)
     material = bool(existing.material_edit) or _is_material_edit(baseline, new_content)
 
     item = relay_queue.record_revision(
