@@ -217,7 +217,7 @@ COUNTY_ID=hillsborough
 52 4 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.divorce.divorce_engine --load-to-db --county-id pinellas --no-proxy
 
 # P5. Liens + Deeds + Judgments — 05:05 AM UTC / 01:05 AM EDT / 10:35 AM IST
-5 5 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.liens.lien_engine --start-date $(date -d "1 day ago" +\%Y-\%m-\%d) --end-date $(date +\%Y-\%m-\%d) --load-to-db --county-id pinellas
+5 5 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.liens.lien_engine --start-date $(date -d "1 day ago" +\%Y-\%m-\%d) --end-date $(date +\%Y-\%m-\%d) --load-to-db --county-id pinellas --log-name lien_engine_pinellas
 
 # P6. Building Permits       — 3x/day at 05:50, 13:50, 21:50 UTC (every 8h, Mon-Sat)
 50 5,13,21 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.permit.permit_engine --start-date $(date -d "1 day ago" +\%Y-\%m-\%d) --end-date $(date +\%Y-\%m-\%d) --load-to-db --county-id pinellas
@@ -1152,6 +1152,14 @@ COUNTY_ID=hillsborough
 # by default (see the task's own docstring); add --apply once confirmed.
 0 * * * * $PROJECT/scripts/cron/run.sh src.tasks.selfserve_abandonment_sweep
 
+# Calendar bookings — reconcile against the calendar they live on: a meeting
+# cancelled in Google otherwise leaves our record saying confirmed, and a
+# claim orphaned by a crash holds its slot forever. Every 15 minutes because
+# a borrower turning up to a cancelled call is the failure being prevented.
+# Dry-run by default; add --apply once the live calendar is configured, and
+# note the task refuses to run at all while FA_MAX_CALENDAR_MODE=fake.
+
+*/15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.calendar_booking_sweep
 # WP-T2-9 Partner Mining & Producer Ranking — runs after nightly deed load
 # (deeds load 05:00–05:10 UTC; this fires at 06:00 UTC to ensure both
 # Hillsborough and Pinellas deed batches are committed before ranking).

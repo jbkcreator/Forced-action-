@@ -1,0 +1,81 @@
+{
+  "_about": "Ground-truth facts for the 4 ElevenLabs ASR test clips. 'must_contain_any' = groups where at least one variant must appear (covers how Whisper spells/says things). 'must_strip' = terms that must NOT survive strip_financial().",
+  "clips": [
+    {
+      "id": "s01_mike_rivera",
+      "clip_hint": "sp111_s35",
+      "label": "Mike Rivera / Oak Street / next Tuesday (normal pace)",
+      "must_contain": [
+        "mike",
+        "rivera",
+        "4512",
+        "oak street",
+        "seminole heights",
+        "bayshore",
+        "tuesday"
+      ],
+      "must_contain_any": [
+        ["thirty days", "30 days"]
+      ],
+      "must_strip": ["credit score", "720", "rate"],
+      "expected_outcomes": ["callback_requested", "connected_interested"],
+      "_notes": "s01: 'thirty days' → Whisper may write '30 days'; 'tuesday' confirmed"
+    },
+    {
+      "id": "s02_tony_castellano",
+      "clip_hint": "sp120_s4",
+      "label": "Tony Castellano / Swann Ave / $250k / Monday (fast 1.2x)",
+      "must_contain": [
+        "tony",
+        "castellano",
+        "1830",
+        "hyde park",
+        "250",
+        "monday"
+      ],
+      "must_contain_any": [
+        ["swann", "swan"]
+      ],
+      "must_strip": [],
+      "expected_outcomes": ["callback_requested", "connected_interested"],
+      "_notes": "s02: 'Swann' → Whisper writes 'Swan'; both accepted"
+    },
+    {
+      "id": "s03_hernandez",
+      "clip_hint": "sp108_s17",
+      "label": "Hernandez family / Ridge Road / $80k / two weeks",
+      "must_contain": [
+        "hernandez",
+        "diego",
+        "ridge road",
+        "nebraska",
+        "two weeks"
+      ],
+      "must_contain_any": [
+        ["eighty thousand", "80,000", "eighty"]
+      ],
+      "must_strip": ["rate", "income"],
+      "expected_outcomes": ["callback_requested", "connected_interested"],
+      "_notes": "s03: 'eighty' → Whisper may write '80,000' or drop; accept any form"
+    },
+    {
+      "id": "s04_chidi_okafor",
+      "clip_hint": "sp96_s6",
+      "label": "Chidi Okafor / Dale Mabry / $1.2M / October 12",
+      "must_contain": [
+        "chidi",
+        "palm harbor",
+        "dale mabry",
+        "1.2",
+        "grace",
+        "october"
+      ],
+      "must_contain_any": [
+        ["okafor", "okafur", "okafour"]
+      ],
+      "must_strip": ["credit"],
+      "expected_outcomes": ["connected_interested", "callback_requested"],
+      "_notes": "s04: 'Okafor' → Whisper transcribes 'Okafur'; all variants accepted"
+    }
+  ]
+}

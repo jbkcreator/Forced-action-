@@ -3,7 +3,7 @@
 from functools import lru_cache
 from datetime import date
 
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import AliasChoices, AnyUrl, Field, SecretStr, PostgresDsn, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -682,9 +682,24 @@ class AppSettings(BaseSettings):
 	fa_max_slack_bot_token: Optional[SecretStr] = Field(default=None, env="FA_MAX_SLACK_BOT_TOKEN")
 	fa_max_slack_app_token: Optional[SecretStr] = Field(default=None, env="FA_MAX_SLACK_APP_TOKEN")
 	fa_max_slack_signing_secret: Optional[SecretStr] = Field(default=None, env="FA_MAX_SLACK_SIGNING_SECRET")
+	# Calendar scheduling. "fake" keeps every booking in memory; only "live"
+	# reaches a real calendar, and it stays the non-default so a misconfigured
+	# environment cannot put a test meeting on the client's real day.
+	fa_max_calendar_mode: str = Field(default="fake", env="FA_MAX_CALENDAR_MODE")
+	fa_max_calendar_id: Optional[str] = Field(default=None, env="FA_MAX_CALENDAR_ID")
+	# Domain-wide delegation impersonates a named user; this is whose calendar
+	# bookings land on. Must be inside the Workspace the service account is
+	# delegated within.
+	fa_max_calendar_subject: Optional[str] = Field(default=None, env="FA_MAX_CALENDAR_SUBJECT")
 	# Fallback for the Command Center's self-message filter when Slack's
 	# auth.test is unreachable at startup. Normally resolved dynamically.
 	fa_max_slack_bot_user_id: Optional[str] = Field(default=None, env="FA_MAX_SLACK_BOT_USER_ID")
+	# Sandbox Slack app used only for manual E2E verification of the Relay
+	# approve/reject interactivity path against a real (non-production) Slack
+	# workspace, so a tester can click real buttons without touching prod
+	# channels or the prod FA Max signing secret. Accepted as an additional
+	# fallback by _verify_slack_signature; never used to post/route anything.
+	fa_max_test_slack_signing_secret: Optional[SecretStr] = Field(default=None, env="FA_MAX_TEST_SLACK_SIGNING_SECRET")
 	vera_slack_channel: Optional[str] = Field(default=None, env="VERA_SLACK_CHANNEL")
 
 	# Relay approval queue (RELAY-v2.2 sub-task R1). Non-FA-Max Relay ventures
@@ -712,12 +727,6 @@ class AppSettings(BaseSettings):
 	# (cold-outreach draft approvals) nor relay's (per-item sends) — the dial
 	# list is a read-only ranked calling aid, a distinct review surface.
 	dial_list_slack_channel: str = Field(default="", env="DIAL_LIST_SLACK_CHANNEL")
-	# App-level token (xapp-…, scope connections:write) for the dial-list action
-	# listener's Socket Mode connection — only the interactive button/thread
-	# handler needs it; the read-only digest does not. Unset → listener no-ops.
-	dial_list_slack_app_token: Optional[SecretStr] = Field(
-		default=None, env="DIAL_LIST_SLACK_APP_TOKEN"
-	)
 	# The single operator (Josh) allowed to act on dial-list cards; a tap from
 	# anyone else is ignored. Unset → no gate (dev/local only).
 	dial_list_approver_user_id: str = Field(
@@ -878,6 +887,12 @@ class AppSettings(BaseSettings):
 	# _reject_if_wrong_command_channel / _listen_channel). Also the channel
 	# the WP-T2-12 LLM responder points CC_QUERY messages to.
 	fa_max_slack_cc_channel: Optional[str] = Field(default=None, env="FA_MAX_SLACK_CC_CHANNEL")
+	# When True: Relay listener owns the sole Socket Mode connection; it forwards
+	# CC channel messages to cc:events and Cora's worker opens no socket.
+	# Default False so the flag must be explicitly enabled post-deploy (see rollout
+	# guide in FA Max Slack Single-Socket Fix v2.md). Set to True only after
+	# confirming no developer machine holds an extra prod-token connection.
+	fa_max_slack_single_socket: bool = Field(default=False, env="FA_MAX_SLACK_SINGLE_SOCKET")
 
 	# WP-T2-11: minimum expected revenue (cents) for an in-box opportunity to be green.
 	# Confirm launch value with Josh; placeholder = $150 commission dollars (15% × ~$1k).
@@ -886,6 +901,17 @@ class AppSettings(BaseSettings):
 	)
 	fa_max_backflip_feed_max_age_hours: int = Field(default=24, ge=1, env="FA_MAX_BACKFLIP_FEED_MAX_AGE_HOURS")
 	fa_max_backflip_feed_adapter: str = Field(default="csv", env="FA_MAX_BACKFLIP_FEED_ADAPTER")
+	# WP-T3-1: how long a Revise / Log-call tap waits for the approver's next message.
+	fa_max_pending_slot_ttl_min: int = Field(default=15, ge=1, env="FA_MAX_PENDING_SLOT_TTL_MIN")
+	# WP-T3-1: voice-note transcription via OpenAI Whisper.
+	openai_api_key: Optional[SecretStr] = Field(default=None, env="OPENAI_API_KEY")
+	fa_max_whisper_model: str = Field(default="whisper-1", env="FA_MAX_WHISPER_MODEL")
+	fa_max_voice_max_bytes: int = Field(default=25_000_000, ge=1, env="FA_MAX_VOICE_MAX_BYTES")
+	# "local" = self-hosted faster-whisper (audio never leaves the box); "openai" = Whisper API.
+	fa_max_transcriber: Literal["local", "openai"] = Field(default="local", env="FA_MAX_TRANSCRIBER")
+	# small.en benchmarked on prod (4 vCPU, load ~12): 12.5s per 80s note, names/addresses clean.
+	fa_max_local_whisper_model: str = Field(default="small.en", env="FA_MAX_LOCAL_WHISPER_MODEL")
+	fa_max_local_whisper_threads: int = Field(default=2, ge=1, env="FA_MAX_LOCAL_WHISPER_THREADS")
 	backflip_webhook_secret: Optional[SecretStr] = Field(default=None, env="BACKFLIP_WEBHOOK_SECRET")
 
 	# ── FA Max WP-T2-1 — Own-Lane Send Infrastructure ────────────────────────

@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 def run() -> None:
     settings = get_settings()
-    app_token = settings.dial_list_slack_app_token
+    app_token = getattr(settings, "dial_list_slack_app_token", None)
     bot_token = settings.slack_bot_token
     approver = settings.dial_list_approver_user_id
 

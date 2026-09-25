@@ -376,21 +376,41 @@ def main() -> None:
         except Exception:
             pass
 
-    if _has_app_token:
+    # FA_MAX_SLACK_SINGLE_SOCKET: Relay listener owns the sole socket connection
+    # and forwards CC messages into cc:events. This worker must NOT open a second
+    # connection — doing so would steal envelopes from Relay, causing the same
+    # intermittent-drop bug this flag was introduced to fix.
+    try:
+        from config.settings import get_settings as _gs
+        _single_socket = _gs().fa_max_slack_single_socket
+    except Exception:
+        _single_socket = False
+
+    listener_thread = None
+    if _single_socket:
+        logger.info("cc.worker: Slack inbound handled by Relay listener (single socket)")
+    elif _has_app_token:
         from src.agents.cora.command_center.slack_socket import run_socket_mode as _listen
         _mode = "socket-mode (real-time)"
+        listener_thread = threading.Thread(
+            target=_listen,
+            args=(stop_event,),
+            daemon=True,
+            name="cc-slack-listener",
+        )
+        listener_thread.start()
+        logger.info("cc.worker: slack listener started mode=%s", _mode)
     else:
         from src.agents.cora.command_center.slack_listener import run_periodic as _listen
         _mode = "polling (fallback — set FA_MAX_SLACK_APP_TOKEN for real-time)"
-
-    listener_thread = threading.Thread(
-        target=_listen,
-        args=(stop_event,),
-        daemon=True,
-        name="cc-slack-listener",
-    )
-    listener_thread.start()
-    logger.info("cc.worker: slack listener started mode=%s", _mode)
+        listener_thread = threading.Thread(
+            target=_listen,
+            args=(stop_event,),
+            daemon=True,
+            name="cc-slack-listener",
+        )
+        listener_thread.start()
+        logger.info("cc.worker: slack listener started mode=%s", _mode)
 
     worker = CommandCenterWorker()
 
@@ -405,7 +425,8 @@ def main() -> None:
         worker.run_forever()
     finally:
         stop_event.set()
-        listener_thread.join(timeout=5)
+        if listener_thread is not None:
+            listener_thread.join(timeout=5)
 
 
 if __name__ == "__main__":

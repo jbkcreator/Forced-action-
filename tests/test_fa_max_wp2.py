@@ -383,7 +383,21 @@ class TestSettings:
         s = AppSettings()
         assert s.fa_max_10dlc_registered is False
 
-    def test_fa_max_slack_channels_default_empty(self):
+    def test_fa_max_slack_channels_default_empty(self, monkeypatch):
+        # AppSettings() alone reads the repo's real .env (model_config
+        # env_file=".env"), which legitimately sets these for production --
+        # disabling the whole file breaks unrelated required fields with no
+        # env-var fallback, so instead force just these three unset via
+        # monkeypatch (which os.environ-overrides both .env and any
+        # inherited shell value) to see the true class default.
+        for var in (
+            "FA_MAX_SLACK_CHANNEL_MONEY",
+            "FA_MAX_SLACK_CHANNEL_EXCEPTIONS",
+            "FA_MAX_SLACK_CHANNEL_RELATIONSHIPS",
+        ):
+            monkeypatch.delenv(var, raising=False)
+            monkeypatch.setenv(var, "")
+
         from config.settings import AppSettings
 
         s = AppSettings()

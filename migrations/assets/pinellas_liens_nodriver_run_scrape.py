@@ -54,17 +54,31 @@ async def run_scrape(page, download_dir, start_date, end_date, url, county_id):
 
     csv_btn = await page.select("#btnCsvButton", timeout=30)
     if csv_btn is None:
+        # An empty search and a search that never ran look identical on this
+        # portal, so retry the click once before reporting empty.
+        search_btn = await page.select("#btnSearch", timeout=10)
+        if search_btn is not None:
+            await search_btn.click()
+            await page.sleep(5)
+            csv_btn = await page.select("#btnCsvButton", timeout=30)
+    if csv_btn is None:
         return pd.DataFrame()
 
-    existing = set(download_dir.glob("*.csv"))
+    before = {f: f.stat().st_mtime for f in download_dir.glob("*.csv")}
     await csv_btn.click()
-    await page.sleep(8)
 
-    candidates = [f for f in download_dir.glob("*.csv") if f not in existing]
+    candidates = []
+    for _ in range(15):
+        await page.sleep(2)
+        candidates = [
+            f for f in download_dir.glob("*.csv")
+            if before.get(f) != f.stat().st_mtime and f.stat().st_size > 0
+        ]
+        if candidates:
+            break
     if not candidates:
-        candidates = list(download_dir.glob("*.csv"))
-    if not candidates:
-        raise RuntimeError("DOWNLOAD_FAILED - no CSV file appeared after export click")
+        raise RuntimeError("DOWNLOAD_FAILED - no CSV file written after export click")
+    await page.sleep(2)
 
     dest = max(candidates, key=lambda p: p.stat().st_mtime)
     for enc in ("utf-8", "latin1", "cp1252"):
@@ -74,4 +88,4 @@ async def run_scrape(page, download_dir, start_date, end_date, url, county_id):
             return df
         except Exception:
             continue
-    return pd.DataFrame()
+    raise RuntimeError(f"DOWNLOAD_UNREADABLE - could not parse {dest.name}")

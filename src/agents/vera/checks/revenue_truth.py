@@ -387,12 +387,17 @@ def _db_mrr(session) -> tuple:
     """(db_total_cents, active_null_plan_price_count). Matches
     daily_dashboard.py's exact formula: SUM(plan_price) WHERE status='active'
     AND plan_price IS NOT NULL — so V3's number matches what's already on the
-    operator dashboard, not a competing definition."""
+    operator dashboard, not a competing definition. The NULL count skips the
+    free tier, which has no price by design — only a paid-tier row with no
+    price is a billing gap worth flagging."""
     total = session.execute(
         text("SELECT SUM(plan_price) FROM subscribers WHERE status='active' AND plan_price IS NOT NULL AND is_test IS NOT TRUE")
     ).scalar()
     null_count = session.execute(
-        text("SELECT COUNT(*) FROM subscribers WHERE status='active' AND plan_price IS NULL AND is_test IS NOT TRUE")
+        text(
+            "SELECT COUNT(*) FROM subscribers WHERE status='active' AND plan_price IS NULL "
+            "AND is_test IS NOT TRUE AND tier IS DISTINCT FROM 'free'"
+        )
     ).scalar()
     total_cents = int(round((total or Decimal("0")) * 100))
     return total_cents, int(null_count or 0)
@@ -510,7 +515,7 @@ def _write_mrr_facts(mrr: MrrResult, new_yesterday_cents: Optional[int]) -> None
     write_fact(
         "revenue.mrr.active_null_plan_price_count", str(mrr.active_null_plan_price_count),
         value_numeric=Decimal(mrr.active_null_plan_price_count), source="subscribers",
-        method="COUNT(*) WHERE status='active' AND plan_price IS NULL",
+        method="COUNT(*) WHERE status='active' AND plan_price IS NULL AND tier IS DISTINCT FROM 'free'",
         freshness_class=FRESHNESS_REVENUE_24H,
     )
 

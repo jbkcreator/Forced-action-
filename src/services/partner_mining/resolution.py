@@ -143,14 +143,16 @@ def resolve_counterparty_names(
 _WHOLESALER_QUERY = """
     SELECT buy.id AS deed_id, buy.grantee, buy.county_id
     FROM deeds buy
-    JOIN deeds sell
-        ON sell.property_id = buy.property_id
-       AND sell.grantor ILIKE buy.grantee
-       AND sell.record_date > buy.record_date
-       AND sell.record_date <= buy.record_date + INTERVAL '{window_days} days'
     LEFT JOIN buyer_entity_links bel
         ON bel.source_table = 'deed_wholesaler' AND bel.source_id = buy.id
     WHERE buy.grantee IS NOT NULL AND buy.grantee != ''
+      AND EXISTS (
+          SELECT 1 FROM deeds sell
+          WHERE sell.property_id = buy.property_id
+            AND sell.grantor ILIKE buy.grantee
+            AND sell.record_date > buy.record_date
+            AND sell.record_date <= buy.record_date + INTERVAL '{window_days} days'
+      )
       {county_filter}
       {unresolved_filter}
     ORDER BY buy.id

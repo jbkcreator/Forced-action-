@@ -30,6 +30,7 @@ ACTION_CALLED = "dial_called"
 ACTION_WON = "dial_won"
 ACTION_LOST = "dial_lost"
 ACTION_SKIP = "dial_skip"
+ACTION_LOG_CALL = "dial_log_call"
 # Prefix for the per-entry actions block_id, so the handler can locate and
 # replace exactly the tapped card's action row inside the digest message.
 ACTIONS_BLOCK_PREFIX = "dial_act:"
@@ -162,6 +163,11 @@ def _actions_block(entry: DialListEntry, as_of: object) -> Dict[str, Any]:
             {
                 "type": "button", "action_id": ACTION_SKIP, "style": "danger",
                 "text": {"type": "plain_text", "text": "⏭ Skip"},
+                "value": base,
+            },
+            {
+                "type": "button", "action_id": ACTION_LOG_CALL,
+                "text": {"type": "plain_text", "text": ":microphone: Log call"},
                 "value": base,
             },
         ],

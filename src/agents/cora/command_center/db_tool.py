@@ -72,8 +72,11 @@ TABLE_SCHEMAS: Dict[str, str] = {
         "source, loan_amount_cents, maturity_months, backflip_ref, "
         "expected_need_date, actual_funded_at, created_at, updated_at. "
         "opportunity_type is one of: acquisition, rehab, construction, "
-        "extension, refinance, dscr_takeout, repeat. Join to fa_max_persons "
-        "on person_id for the borrower's name/email/phone."
+        "extension, refinance, dscr_takeout, repeat. "
+        "outcome is never NULL — it is one of: open, funded, dead, recycled, "
+        "referred. An 'open' file/opportunity means outcome = 'open', NOT "
+        "outcome IS NULL. Join to fa_max_persons on person_id for the "
+        "borrower's name/email/phone."
     ),
 }
 

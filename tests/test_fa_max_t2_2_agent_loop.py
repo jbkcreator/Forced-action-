@@ -272,7 +272,14 @@ class TestConsolidatedProductionPaths:
 class TestFaMaxToolRegistry:
     def test_all_expected_tools_registered(self):
         from src.agents.fa_max.tool_registry import FA_MAX_TOOL_REGISTRY
-        expected = {"get_fa_max_person_state", "get_fa_max_person_history", "check_suppression", "send", "post_slack"}
+        # Exact equality, not a subset check: the point is to catch a tool
+        # registered by accident. Each Tier 2 package that ships a tool adds
+        # it here deliberately — the calendar entries arrived with scheduling.
+        expected = {
+            "get_fa_max_person_state", "get_fa_max_person_history", "check_suppression",
+            "send", "post_slack",
+            "calendar.get_slots", "calendar.book", "calendar.reschedule",
+        }
         assert expected == set(FA_MAX_TOOL_REGISTRY.keys())
 
     def test_send_requires_send_gate(self):
@@ -1321,7 +1328,7 @@ class TestSnoozeRevise:
         ever crossing the material threshold."""
         import inspect
         from src.api import admin_router
-        source = inspect.getsource(admin_router._handle_relay_revise_submission)
+        source = inspect.getsource(admin_router._apply_draft_revision)
         assert "existing.original_draft" in source
         assert "existing.final_content or existing.original_draft" not in source
 
@@ -1331,7 +1338,7 @@ class TestSnoozeRevise:
         under-counting is the unsafe direction)."""
         import inspect
         from src.api import admin_router
-        source = inspect.getsource(admin_router._handle_relay_revise_submission)
+        source = inspect.getsource(admin_router._apply_draft_revision)
         assert "bool(existing.material_edit) or _is_material_edit" in source
 
 
@@ -1787,8 +1794,9 @@ class TestRefreshCardAfterRevision:
     def test_revise_submission_calls_refresh_card(self):
         import inspect
         from src.api import admin_router
-        source = inspect.getsource(admin_router._handle_relay_revise_submission)
+        source = inspect.getsource(admin_router._apply_draft_revision)
         assert "refresh_card_after_revision" in source
+        assert "_apply_draft_revision" in inspect.getsource(admin_router._handle_relay_revise_submission)
 
     def test_revised_typed_approval_requires_versioned_button(self):
         from src.api import admin_router
@@ -2154,14 +2162,22 @@ class TestCreateFaMaxOpportunity:
         session = MagicMock()
         row = MagicMock()
         row.opportunity_id = "opp-123"
-        session.execute.return_value.fetchone.return_value = row
+        # call 0 = INSERT opportunity; calls 1-2 = ensure_entity_registry (INSERT + SELECT)
+        insert_result = MagicMock()
+        insert_result.fetchone.return_value = row
+        reg_insert = MagicMock()
+        reg_select = MagicMock()
+        reg_select.scalar.return_value = "some-uuid"
+        session.execute.side_effect = [insert_result, reg_insert, reg_select]
 
         result = create_fa_max_opportunity(
             session=session, person_id="person-1", opportunity_type="acquisition",
             source="cora_outreach", origin_interaction_id="interaction-1",
         )
         assert result == "opp-123"
-        params = session.execute.call_args[0][1]
+        # First call is the INSERT into fa_max_opportunities -- later calls
+        # are ensure_entity_registry()'s own INSERT/SELECT into the registry.
+        params = session.execute.call_args_list[0][0][1]
         assert params["origin_interaction_id"] == "interaction-1"
 
     def test_inserts_with_null_origin_interaction_id(self):
@@ -2170,13 +2186,18 @@ class TestCreateFaMaxOpportunity:
         session = MagicMock()
         row = MagicMock()
         row.opportunity_id = "opp-456"
-        session.execute.return_value.fetchone.return_value = row
+        insert_result = MagicMock()
+        insert_result.fetchone.return_value = row
+        reg_insert = MagicMock()
+        reg_select = MagicMock()
+        reg_select.scalar.return_value = "some-uuid"
+        session.execute.side_effect = [insert_result, reg_insert, reg_select]
 
         result = create_fa_max_opportunity(
             session=session, person_id="person-1", opportunity_type="acquisition", source="inbound_call",
         )
         assert result == "opp-456"
-        params = session.execute.call_args[0][1]
+        params = session.execute.call_args_list[0][0][1]
         assert params["origin_interaction_id"] is None
 
     def test_idempotent_retry_returns_existing_row(self):
@@ -2191,7 +2212,16 @@ class TestCreateFaMaxOpportunity:
         existing_row.opportunity_id = "opp-existing"
         select_result = MagicMock()
         select_result.fetchone.return_value = existing_row
-        session.execute.side_effect = [insert_result, select_result]
+        # ensure_entity_registry() issues its own INSERT + SELECT after the
+        # idempotent-retry branch resolves the opportunity_id.
+        registry_insert_result = MagicMock()
+        registry_row = MagicMock()
+        registry_row.entity_uuid = "registry-uuid-1"
+        registry_select_result = MagicMock()
+        registry_select_result.fetchone.return_value = registry_row
+        session.execute.side_effect = [
+            insert_result, select_result, registry_insert_result, registry_select_result,
+        ]
 
         result = create_fa_max_opportunity(
             session=session, person_id="person-1", opportunity_type="acquisition",

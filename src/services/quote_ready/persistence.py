@@ -195,3 +195,105 @@ class NoOpEventSink:
     """Local/default sink until WP-1's domain-event publisher lands."""
     def emit(self, *, event_type: str, opportunity_id: str, idempotency_key: str, payload: dict) -> None:
         return None
+
+
+# ---------------------------------------------------------------------------
+# DB write path — the actual INSERT this module's own docstring flagged as
+# spine-bound and "NOT yet wired": build_result_row() only ever built the
+# row dict; nothing in this codebase called INSERT with it (confirmed by a
+# real e2e test run finding fa_max_quote_ready_results empty in production
+# despite compute_quote_ready() being called from builder_sizing.py). This
+# closes that gap using the exact idempotent-or-supersede pattern
+# arv_persistence.persist_arv_result() already uses for WP-8B.
+# ---------------------------------------------------------------------------
+
+from sqlalchemy import text as _text
+from sqlalchemy.orm import Session as _Session
+
+_LATEST_COMPUTED_SQL = _text(
+    """
+    SELECT result_id::text AS result_id, input_hash, calculation_version
+    FROM fa_max_quote_ready_results
+    WHERE opportunity_id = :opportunity_id ::uuid AND status = 'computed'
+    ORDER BY computed_at DESC
+    LIMIT 1
+    """
+)
+
+_MARK_SUPERSEDED_SQL = _text(
+    "UPDATE fa_max_quote_ready_results SET status = 'superseded' WHERE result_id = :rid ::uuid"
+)
+
+_INSERT_SQL = _text(
+    """
+    INSERT INTO fa_max_quote_ready_results (
+        opportunity_id, property_id, calculation_version, input_hash, status,
+        inputs, outputs, provenance, confidence, missing_inputs, computed_by,
+        supersedes_result_id
+    ) VALUES (
+        :opportunity_id ::uuid, :property_id, :calculation_version, :input_hash, :status,
+        CAST(:inputs AS JSONB), CAST(:outputs AS JSONB), CAST(:provenance AS JSONB),
+        CAST(:confidence AS JSONB), CAST(:missing_inputs AS JSONB), :computed_by,
+        :supersedes_result_id ::uuid
+    )
+    RETURNING result_id::text
+    """
+)
+
+
+def persist_quote_ready_result(
+    session: _Session,
+    *,
+    inp: QuoteReadyInput,
+    result: QuoteReadyResult,
+    computed_by: str,
+) -> str:
+    """Persist a computed Quote Ready result, idempotent-or-supersede on
+    (opportunity_id, effective inputs, calculation_version) — same shape as
+    arv_persistence.persist_arv_result(). Returns the result_id that now
+    represents this opportunity's current scenario (an existing row on a
+    no-op, else the freshly inserted one).
+
+    Only ever supersedes a row still in 'computed' status — a row already
+    'needs_review'/'approved'/'rejected' by a human reviewer is left alone;
+    persist_quote_ready_result() finding no 'computed' row for the
+    opportunity simply inserts a fresh one, which is exactly what
+    dossier._handle_quote_ready_modify_submission wants: Modify always
+    produces a new row to re-review, never silently overwrites the one a
+    reviewer already looked at.
+    """
+    new_hash = compute_input_hash(inp)
+    row = session.execute(
+        _LATEST_COMPUTED_SQL, {"opportunity_id": str(inp.opportunity_id)}
+    ).mappings().first()
+    latest = (
+        ExistingResult(
+            result_id=row["result_id"],
+            input_hash=row["input_hash"],
+            calculation_version=row["calculation_version"],
+        )
+        if row is not None
+        else None
+    )
+    decision = decide_persistence(latest, new_hash, QUOTE_READY_CALC_VERSION)
+    if decision.action == "noop":
+        return decision.existing_result_id  # type: ignore[return-value]
+
+    row_dict = build_result_row(
+        inp, result, computed_by=computed_by, supersedes_result_id=decision.supersedes_result_id,
+    )
+    if decision.action == "insert_supersede":
+        session.execute(_MARK_SUPERSEDED_SQL, {"rid": decision.supersedes_result_id})
+
+    new_id = session.execute(
+        _INSERT_SQL,
+        {
+            **row_dict,
+            "inputs": json.dumps(row_dict["inputs"]),
+            "outputs": json.dumps(row_dict["outputs"]),
+            "provenance": json.dumps(row_dict["provenance"]),
+            "confidence": json.dumps(row_dict["confidence"]),
+            "missing_inputs": json.dumps(row_dict["missing_inputs"]),
+        },
+    ).scalar_one()
+    return new_id

@@ -58,6 +58,7 @@ from src.core.models import (
 from src.loaders.tax import TaxDelinquencyLoader
 from src.loaders.voter_registry import VoterRegistryLoader
 from src.services.relay.slack_post import open_new_file_modal
+from src.services.relay import nl_revision
 from src.services.zip_territory import claim_zip_territory
 from src.utils.county_config import invalidate_cache
 from src.utils.test_account import is_test_subscriber
@@ -1604,11 +1605,58 @@ from urllib.parse import parse_qs
 from fastapi import Request
 
 
+# Sandbox Slack signing secret (settings.fa_max_test_slack_signing_secret) is
+# a fallback trust root for the ENTIRE shared _verify_slack_signature check
+# below, which authenticates all 12 Slack interactivity/command/event
+# endpoints in this router, not just Quote Ready. It's inert in production
+# today only because the env var happens to be unset there; a misconfigured
+# prod .env or a leaked sandbox-app secret would otherwise grant
+# signature-forgeable write access to every admin Slack action in this app
+# (win-story approve/reject, entity links, Relay decisions, etc.), not just
+# the Quote Ready sandbox testing it was added for. Scoped here to only the
+# action_id/callback_id values Quote Ready's sandbox E2E testing actually
+# needs, so a forged/leaked sandbox secret can at most forge a Quote Ready
+# decision, never anything else this endpoint handles.
+_QUOTE_READY_SANDBOX_SCOPED_IDS = {
+    "quote_ready_approve",
+    "quote_ready_reject",
+    "quote_ready_modify",
+    "quote_ready_modify_submit",
+    "quote_ready_override_arv",
+    "quote_ready_override_arv_submit",
+}
+
+
+def _extract_slack_action_identifier(body: bytes) -> Optional[str]:
+    """Best-effort action_id/callback_id extraction from a raw Slack request
+    body, used only to scope the sandbox signing secret in
+    _verify_slack_signature below. Never raises: a slash command or
+    events_api body won't parse as an interactive payload at all, and that
+    correctly excludes it from the sandbox secret's reach rather than
+    erroring the request (the real signing secrets are checked regardless
+    of whether this helper can identify anything)."""
+    try:
+        payload_str = parse_qs(body.decode("utf-8")).get("payload", ["{}"])[0]
+        payload = json.loads(payload_str)
+    except Exception:
+        return None
+    callback_id = (payload.get("view") or {}).get("callback_id")
+    if callback_id:
+        return callback_id
+    actions = payload.get("actions") or []
+    if actions:
+        return actions[0].get("action_id")
+    return None
+
+
 def _verify_slack_signature(headers: dict, body: bytes) -> bool:
     """Verify Slack request signature (HMAC-SHA256). Rejects replays > 5 min old.
 
     Tries the FA Max signing secret first, then falls back to the shared secret,
     so button clicks from both Slack apps are accepted at this single endpoint.
+    The sandbox secret is a third fallback, but scoped to Quote Ready's own
+    action IDs only (see _QUOTE_READY_SANDBOX_SCOPED_IDS above) — it cannot
+    authenticate a request for anything else this shared endpoint handles.
     """
     ts = headers.get("x-slack-request-timestamp", "")
     try:
@@ -1618,10 +1666,17 @@ def _verify_slack_signature(headers: dict, body: bytes) -> bool:
         return False
     sig_base = f"v0:{ts}:{body.decode('utf-8')}"
     received = headers.get("x-slack-signature", "")
-    candidates = [settings.fa_max_slack_signing_secret, settings.slack_signing_secret]
+    candidates = [
+        settings.fa_max_slack_signing_secret,
+        settings.slack_signing_secret,
+        settings.fa_max_test_slack_signing_secret,
+    ]
     for secret in candidates:
         if not secret:
             continue
+        if secret is settings.fa_max_test_slack_signing_secret:
+            if _extract_slack_action_identifier(body) not in _QUOTE_READY_SANDBOX_SCOPED_IDS:
+                continue
         expected = "v0=" + hmac.new(
             secret.get_secret_value().encode(),
             sig_base.encode(),
@@ -1743,8 +1798,17 @@ async def slack_interact(request: Request, background_tasks: BackgroundTasks, db
         return _handle_relay_revise_open(payload)
     if action_id == "new_file_new_borrower":
         return _handle_new_file_new_borrower_click(payload)
+    if action_id == "fa_max_edit_text":
+        return _handle_relay_edit_text_open(payload)
     if action_id in ("approve_win_story", "dismiss_win_story"):
         return _handle_win_story_interact(payload, db)
+    # Quote Ready dossier decision (WP-8B — MONEY lane)
+    if action_id in ("quote_ready_approve", "quote_ready_reject"):
+        return _handle_quote_ready_decision(payload, db)
+    if action_id == "quote_ready_modify":
+        return _handle_quote_ready_modify_open(payload, db)
+    if action_id == "quote_ready_override_arv":
+        return _handle_quote_ready_override_arv_open(payload, db)
     # Builder entity-link actions (EXCEPTIONS lane — WP-T2-8)
     if action_id and action_id.startswith("confirm_entity_link_"):
         return _handle_confirm_entity_link(payload, db)
@@ -1837,6 +1901,13 @@ def _handle_relay_thread_action(payload: dict) -> None:
         return
 
     if not _relay_approver_authorized(str(user_id), item.venture_key):
+        return
+    # WP-T3-1: an open Revise slot for THIS card's thread outranks commands and
+    # the fallback responder (Banks precedence: halt → pending-revision →
+    # command → ignore; halt is evaluated upstream).
+    if item.venture_key == "fa_max_lending" and _consume_revise_slot(
+        item, str(user_id), str(thread_ts), str(event.get("text") or ""),
+    ):
         return
     # WP-T2-12: authorized approver sent a non-command reply — invoke fallback
     # responder (classify → catalog lookup / CC redirect / ack). This branch is
@@ -1976,12 +2047,19 @@ def _fa_max_channel_lane_map() -> dict[str, str]:
     map the empty string to a lane.
     """
     mapping: dict[str, str] = {}
-    for attr, lane in (
+    lanes = [
         ("fa_max_slack_channel_money", "MONEY"),
         ("fa_max_slack_channel_exceptions", "EXCEPTIONS"),
         ("fa_max_slack_channel_relationships", "RELATIONSHIPS"),
-        ("fa_max_slack_cc_channel", "CC"),
-    ):
+    ]
+    # With FA_MAX_SLACK_SINGLE_SOCKET=True, Cora owns #fa-max-command-center
+    # exclusively: messages are forwarded by the Relay listener into cc:events,
+    # and this responder must not answer them (each question would get two replies).
+    # With the flag off (default / rollback), CC stays in the lane map and Relay's
+    # WP-T2-12 responder answers CC questions as it does today.
+    if not settings.fa_max_slack_single_socket:
+        lanes.append(("fa_max_slack_cc_channel", "CC"))
+    for attr, lane in lanes:
         channel_id = getattr(settings, attr, "") or ""
         if channel_id:
             mapping[channel_id] = lane
@@ -2348,13 +2426,10 @@ def _handle_relay_snooze(payload: dict) -> dict:
     return {"ok": True}
 
 
-def _handle_relay_revise_open(payload: dict) -> dict:
-    """Slack Revise button (WP-T2-2 item 9) — opens the revise modal
-    (src.services.relay.slack_post.open_revise_modal). No existing
-    free-text-capture Slack primitive covered this, so a modal +
-    view_submission is the new mechanism (see that function's docstring)."""
+def _revisable_item_or_refusal(payload: dict):
+    """Shared guard for the Revise / Edit text buttons. Returns (item, None)
+    when the clicker may revise a pending item, else (None, slack_response)."""
     from src.services.relay import queue as relay_queue
-    from src.services.relay.slack_post import open_revise_modal
 
     user_id = payload.get("user", {}).get("id", "")
     item_id, _ = _relay_action_item_id(payload)
@@ -2364,12 +2439,179 @@ def _handle_relay_revise_open(payload: dict) -> dict:
     existing = relay_queue.get_item(item_id)
     venture_key = existing.venture_key if existing is not None else DEFAULT_VENTURE_KEY
     if not _relay_approver_authorized(user_id, venture_key):
-        return _slack_ephemeral("Not authorized to decide Relay sends.")
+        return None, _slack_ephemeral("Not authorized to decide Relay sends.")
     if existing is None or existing.status != "pending":
-        return _slack_ephemeral(f"Item #{item_id} is not open for revision.")
+        return None, _slack_ephemeral(f"Item #{item_id} is not open for revision.")
+    return existing, None
 
+
+def _handle_relay_revise_open(payload: dict) -> dict:
+    """Slack Revise button (WP-T3-1) — opens a button-driven NL revision slot
+    (Banks pattern): the approver's next reply in this card's thread, within
+    the slot TTL, is the rewrite instruction. Facts are changed via Edit text."""
+    existing, refusal = _revisable_item_or_refusal(payload)
+    if refusal is not None:
+        return refusal
+    user_id = payload.get("user", {}).get("id", "")
+    _open_pending_slot(
+        slack_user_id=user_id, kind="revise", target_ref=str(existing.id),
+        channel_id=str((payload.get("channel") or {}).get("id") or ""),
+        thread_ts=existing.slack_message_ts,
+    )
+    _post_relay_thread_note(
+        existing,
+        f":writing_hand: <@{user_id}> Revising — reply here with your change "
+        f"(e.g. `shorter`, `drop the second paragraph`). Say `cancel` to stop. "
+        f"Expires in {settings.fa_max_pending_slot_ttl_min} min.",
+    )
+    return {}
+
+
+def _handle_relay_edit_text_open(payload: dict) -> dict:
+    """Slack Edit text button — opens the full-text revise modal (the WP-T2-2
+    mechanism), for when the approver wants to change facts by hand."""
+    from src.services.relay.slack_post import open_revise_modal
+
+    existing, refusal = _revisable_item_or_refusal(payload)
+    if refusal is not None:
+        return refusal
     open_revise_modal(payload.get("trigger_id", ""), existing)
     return {}
+
+
+def _open_pending_slot(**kwargs) -> None:
+    from src.services.fa_max_pending_slot import open_slot
+
+    with get_db_context() as session:
+        open_slot(session, **kwargs)
+
+
+def _get_pending_slot(slack_user_id: str):
+    """A slot-lookup failure degrades to "no slot" so it can never block the
+    approve/reject command path that runs after it."""
+    from sqlalchemy.exc import SQLAlchemyError
+    from src.services.fa_max_pending_slot import get_slot
+
+    try:
+        with get_db_context() as session:
+            return get_slot(session, slack_user_id)
+    except SQLAlchemyError as exc:
+        logger.error("[RelayInteract] pending-slot lookup failed: %s", type(exc).__name__)
+        return None
+
+
+def _clear_pending_slot(slack_user_id: str) -> None:
+    from src.services.fa_max_pending_slot import clear_slot
+
+    with get_db_context() as session:
+        clear_slot(session, slack_user_id)
+
+
+_REVISION_SLOT_PASSTHROUGH = frozenset({"approve", "reject"})
+
+
+def _consume_revise_slot(item, user_id: str, thread_ts: str, raw_text: str) -> bool:
+    """Route a card-thread reply through the approver's open Revise slot.
+
+    Returns True when the reply was handled here. A slot only captures a
+    reply in the thread it was opened on; `cancel` closes it; typed
+    approve/reject close it and fall through to the normal command path.
+    """
+    slot = _get_pending_slot(user_id)
+    if slot is None or slot.kind != "revise" or slot.thread_ts != thread_ts:
+        return False
+    command = raw_text.strip().casefold()
+    if command in _REVISION_SLOT_PASSTHROUGH:
+        _clear_pending_slot(user_id)
+        return False
+    if command == "cancel":
+        _clear_pending_slot(user_id)
+        _post_relay_thread_note(item, ":writing_hand: Revision cancelled.")
+        return True
+    _apply_nl_revision(item, raw_text.strip(), user_id)
+    return True
+
+
+def _apply_nl_revision(item, instruction: str, user_id: str) -> None:
+    """One tap = one revision: the slot is cleared whatever the outcome."""
+    _clear_pending_slot(user_id)
+    if item.status != "pending":
+        _post_relay_thread_note(item, f"Item #{item.id} is no longer pending — nothing revised.")
+        return
+    original = item.original_draft or ""
+    result = nl_revision.revise_draft(
+        instruction=instruction,
+        original=original,
+        current=item.final_content or original,
+        history=_revision_history(item.id),
+        llm=nl_revision.claude_llm,
+    )
+    if result.reason == "embellishment":
+        _post_relay_thread_note(
+            item,
+            f":no_entry: Skipped — that adds a fact or term not in the draft ({result.detail}). "
+            "Use Edit text to change facts.",
+        )
+        return
+    if not result.ok:
+        _post_relay_thread_note(item, ":warning: Couldn't revise — try again, or use Edit text.")
+        return
+    revised, _, refreshed = _apply_draft_revision(
+        item, result.text, revised_by=f"slack_nl:{user_id}", source="nl", instruction=instruction,
+    )
+    if revised is None:
+        _post_relay_thread_note(item, f"Item #{item.id} is no longer pending — nothing revised.")
+    elif not refreshed:
+        _post_relay_thread_note(
+            revised, "Revision saved, but the card could not refresh — tap Revise again before approving.",
+        )
+
+
+def _revision_history(item_id: int) -> list[str]:
+    """Working memory for the rewrite prompt; a lookup failure only loses
+    context, it never blocks the revision."""
+    from sqlalchemy.exc import SQLAlchemyError
+    from src.services.relay import queue as relay_queue
+
+    try:
+        return relay_queue.get_revision_history(item_id)
+    except SQLAlchemyError as exc:
+        logger.error("[RelayInteract] revision history lookup failed: %s", type(exc).__name__)
+        return []
+
+
+def _apply_draft_revision(
+    existing, new_text: str, *, revised_by: str,
+    source: str = "modal", instruction: Optional[str] = None,
+):
+    """Persist one revision (modal or NL) and refresh the card in place.
+
+    Returns (item | None, material_edit, card_refreshed). item is None when
+    the row is no longer pending. material_edit is measured against the
+    ORIGINAL draft and is sticky, so a run of small edits cannot dilute a
+    large overall rewrite below the Tier B edit-rate threshold.
+    """
+    from src.services.relay import queue as relay_queue
+    from src.services.relay.slack_post import refresh_card_after_revision
+
+    baseline = existing.original_draft or ""
+    material = bool(existing.material_edit) or _is_material_edit(baseline, new_text)
+    item = relay_queue.record_revision(
+        existing.id, final_content=new_text, revised_by=revised_by, material_edit=material,
+        log=relay_queue.RevisionLogEntry(
+            source=source, before_text=existing.final_content or baseline, instruction=instruction,
+        ),
+    )
+    if item is None:
+        return None, material, False
+    _post_relay_thread_note(
+        item,
+        f":pencil2: Revised by <@{revised_by.split(':', 1)[-1]}> (revision #{item.revision_count}"
+        f"{', material change' if material else ''}):\n{new_text[:2900]}",
+    )
+    # The card's Approve button carries revision_count_at_post; rebuilding it
+    # keeps a working Approve path after the stale-card guard sees the bump.
+    return item, material, refresh_card_after_revision(item)
 
 
 def _is_material_edit(old_text: str, new_text: str) -> bool:
@@ -2452,41 +2694,12 @@ def _handle_relay_revise_submission(payload: dict) -> dict:
     except Exception:
         return {"response_action": "errors", "errors": {"revised_content_block": "Missing revised content."}}
 
-    # Baseline is ALWAYS the original draft, never the previous revision
-    # (WP-T2-2 review fix): comparing each edit only to its immediate
-    # predecessor lets a sequence of individually-small revisions add up to
-    # a large overall rewrite without ever crossing the material-edit
-    # threshold. material_edit is also sticky (OR'd with its current value)
-    # so a later small, non-material tweak can never un-flag an item a
-    # prior revision already made material -- this flag feeds the Tier B
-    # graduation edit-rate gate, where under-counting edits is the unsafe
-    # direction.
-    baseline = existing.original_draft or ""
-    material = bool(existing.material_edit) or _is_material_edit(baseline, new_content)
-
-    item = relay_queue.record_revision(
-        item_id, final_content=new_content, revised_by=f"slack:{user_id}", material_edit=material,
-    )
+    item, _, refreshed = _apply_draft_revision(existing, new_content, revised_by=f"slack:{user_id}")
     if item is None:
         return {"response_action": "errors", "errors": {"revised_content_block": "Item is no longer pending."}}
-
-    _post_relay_thread_note(
-        item,
-        f":pencil2: Revised by <@{user_id}> (revision #{item.revision_count}"
-        f"{', material change' if material else ''}):\n{new_content[:2900]}",
-    )
-    # WP-T2-2 review fix: the original card's Approve button was posted with
-    # revision_count_at_post baked in from BEFORE this revision, so without
-    # refreshing it, the stale-card guard in _handle_relay_decision would
-    # refuse that button FOREVER after even one revision -- there would be
-    # no working Approve path left for this item via Slack. Rebuilding the
-    # card in place gives it fresh buttons whose baked-in revision_count
-    # matches the row this revision just produced.
-    from src.services.relay.slack_post import refresh_card_after_revision
-
-    if not refresh_card_after_revision(item):
+    if not refreshed:
         return {"response_action": "errors", "errors": {
-            "revised_content_block": "Revision saved, but Slack could not refresh the approval card. Reopen Revise and submit again before approval."
+            "revised_content_block": "Revision saved, but Slack could not refresh the approval card. Reopen Edit text and submit again before approval."
         }}
     return {"response_action": "clear"}
 
@@ -3424,9 +3637,11 @@ def _fa_max_open_files_command(form: dict, db: Session) -> dict:
 
     rows = db.execute(
         text("""
-            SELECT p.full_name, o.backflip_ref, o.current_stage
+            SELECT p.full_name, o.backflip_ref,
+                   COALESCE(fs.backflip_stage, o.current_stage) AS stage
             FROM fa_max_opportunities o
             JOIN fa_max_persons p ON p.person_id = o.person_id
+            LEFT JOIN fa_max_file_state fs ON fs.opportunity_id = o.opportunity_id
             WHERE o.backflip_ref IS NOT NULL AND o.outcome = 'open'
             ORDER BY o.updated_at DESC
             LIMIT 25
@@ -3441,7 +3656,7 @@ def _fa_max_open_files_command(form: dict, db: Session) -> dict:
 
     table_lines = [f"{'Borrower':<{name_width}}  {'Ref':<{ref_width}}  Stage"]
     for name, r in zip(names, rows):
-        table_lines.append(f"{name:<{name_width}}  {r.backflip_ref:<{ref_width}}  {r.current_stage}")
+        table_lines.append(f"{name:<{name_width}}  {r.backflip_ref:<{ref_width}}  {r.stage}")
     table_body = "\n".join(table_lines)
 
     message = (
@@ -3590,6 +3805,247 @@ def _handle_win_story_interact(payload: dict, db: Session) -> dict:
 
     _update_win_story_slack_message(asset_id, payload, reply)
     return {"ok": True}
+
+
+_QUOTE_READY_ACTION_TO_DECISION = {
+    "quote_ready_approve": "approved",
+    "quote_ready_reject": "rejected",
+}
+
+
+def _handle_quote_ready_decision(payload: dict, db: Session) -> dict:
+    """WP-8B — Approve / Reject on a Quote Ready dossier card.
+
+    Reuses the real relay approver authorization check (relay_approvers is
+    the fleet-wide review authority list, same as every other Slack decision
+    in this app — Quote Ready review has no separate approver list of its
+    own) and writes into fa_max_quote_ready_results.review_status/
+    reviewed_by/reviewed_at, the columns the schema already carried but had
+    no writer until this handler.
+
+    Modify is NOT handled here — see _handle_quote_ready_modify_open() /
+    _handle_quote_ready_modify_submission(), a real edit-and-recompute
+    modal flow rather than a terminal decision.
+    """
+    from src.services.quote_ready.dossier import decide_quote_ready
+
+    actions = payload.get("actions", [])
+    if not actions:
+        return _slack_ephemeral("No action found in payload.")
+    action_id = actions[0].get("action_id")
+    try:
+        action_data = json.loads(actions[0].get("value", "{}"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid action value")
+
+    result_id = action_data.get("result_id")
+    if not result_id:
+        return _slack_ephemeral("Invalid Quote Ready action data.")
+
+    user_id = payload.get("user", {}).get("id", "")
+    if not _relay_approver_authorized(user_id, "fa_max_lending"):
+        return _slack_ephemeral("Not authorized to review Quote Ready scenarios.")
+
+    decision = _QUOTE_READY_ACTION_TO_DECISION[action_id]
+    applied = decide_quote_ready(db, result_id=result_id, decision=decision, decided_by=user_id)
+    db.commit()
+
+    if not applied:
+        return _slack_ephemeral(f"Scenario #{result_id} was already decided.")
+
+    reply = {
+        "approved": f":white_check_mark: Approved by <@{user_id}>",
+        "rejected": f":no_entry: Rejected by <@{user_id}>",
+    }[decision]
+    logger.info("[QuoteReady] result_id=%s decision=%s by=%s", result_id, decision, user_id)
+    # The card update below already shows this same text to everyone in the
+    # channel — returning it again as an ephemeral (as this handler
+    # previously did) just duplicated the same message as a second,
+    # only-visible-to-you popup. _handle_relay_decision (the pattern this
+    # handler is based on) only updates the card and returns {"ok": True};
+    # matching that here.
+    _update_quote_ready_slack_message(result_id, payload, reply)
+    return {"ok": True}
+
+
+def _handle_quote_ready_modify_open(payload: dict, db: Session) -> dict:
+    """WP-8B — Modify button: opens the real edit modal
+    (src.services.quote_ready.dossier.open_modify_modal), same mechanism as
+    Relay's own Revise button (_handle_relay_revise_open)."""
+    from src.services.quote_ready.dossier import open_modify_modal
+
+    actions = payload.get("actions", [])
+    if not actions:
+        return _slack_ephemeral("No action found in payload.")
+    try:
+        action_data = json.loads(actions[0].get("value", "{}"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid action value")
+    result_id = action_data.get("result_id")
+    if not result_id:
+        return _slack_ephemeral("Invalid Quote Ready action data.")
+
+    user_id = payload.get("user", {}).get("id", "")
+    if not _relay_approver_authorized(user_id, "fa_max_lending"):
+        return _slack_ephemeral("Not authorized to review Quote Ready scenarios.")
+
+    # The card being modified — carried into the modal's private_metadata so
+    # handle_modify_submission() can neutralize this exact card afterward
+    # (see that function's docstring for why: a live card with working
+    # buttons on now-superseded figures is a real approve-the-stale-version
+    # risk).
+    origin_channel = (payload.get("channel") or {}).get("id", "")
+    origin_message_ts = (payload.get("message") or {}).get("ts", "")
+    open_modify_modal(
+        db, trigger_id=payload.get("trigger_id", ""), result_id=result_id,
+        origin_channel=origin_channel, origin_message_ts=origin_message_ts,
+    )
+    return {}
+
+
+def _handle_quote_ready_override_arv_open(payload: dict, db: Session) -> dict:
+    """WP-8B — Override ARV button: opens the real override modal
+    (src.services.quote_ready.dossier.open_override_arv_modal). Wires the
+    previously-orphaned override_arv_result() (models/migration/validation/
+    audit fields all existed with no caller) into a real Slack surface,
+    same mechanism as the Modify button above."""
+    from src.services.quote_ready.dossier import open_override_arv_modal
+
+    actions = payload.get("actions", [])
+    if not actions:
+        return _slack_ephemeral("No action found in payload.")
+    try:
+        action_data = json.loads(actions[0].get("value", "{}"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid action value")
+    result_id = action_data.get("result_id")
+    if not result_id:
+        return _slack_ephemeral("Invalid Quote Ready action data.")
+
+    user_id = payload.get("user", {}).get("id", "")
+    if not _relay_approver_authorized(user_id, "fa_max_lending"):
+        return _slack_ephemeral("Not authorized to review Quote Ready scenarios.")
+
+    open_override_arv_modal(db, trigger_id=payload.get("trigger_id", ""), result_id=result_id)
+    return {}
+
+
+def _handle_quote_ready_override_arv_submission(payload: dict) -> Optional[dict]:
+    """WP-8B — Override ARV modal submission (Socket Mode view_submission).
+
+    No `db: Session` param, same reasoning as
+    _handle_quote_ready_modify_submission — invoked directly from
+    socket_listener.py, which has no FastAPI Depends(get_db) to hand it.
+
+    Unlike Modify, this triggers no further Slack API calls on success (no
+    new card to post, no old card to neutralize — it corrects the ARV
+    figure in place), so it needs no ack-first split: the whole thing is a
+    single DB write and can safely complete before the ack.
+    """
+    from src.services.quote_ready.dossier import handle_override_arv_submission
+
+    user_id = payload.get("user", {}).get("id", "")
+    view = payload.get("view", {})
+    try:
+        metadata = json.loads(view.get("private_metadata", "{}"))
+    except Exception:
+        return {"response_action": "errors", "errors": {"override_low_block": "Invalid view metadata."}}
+    if not metadata.get("arv_result_id"):
+        return {"response_action": "errors", "errors": {"override_low_block": "Invalid view metadata."}}
+
+    if not _relay_approver_authorized(user_id, "fa_max_lending"):
+        return {"response_action": "errors", "errors": {"override_low_block": "Not authorized."}}
+
+    values = (view.get("state") or {}).get("values") or {}
+    with get_db_context() as db:
+        outcome = handle_override_arv_submission(db, values=values, metadata=metadata, submitted_by=user_id)
+
+    if not outcome.get("ok"):
+        return {"response_action": "errors", "errors": outcome.get("error", {})}
+    logger.info("[QuoteReady] arv_result_id=%s override submitted by=%s", metadata.get("arv_result_id"), user_id)
+    return {}
+
+
+def _handle_quote_ready_modify_submission(payload: dict) -> tuple[Optional[dict], Optional[dict]]:
+    """WP-8B — Modify modal submission (Socket Mode view_submission).
+
+    No `db: Session` param, matching _handle_relay_revise_submission's
+    signature — this is invoked directly from socket_listener.py, which has
+    no FastAPI Depends(get_db) to hand it; opens its own session instead.
+
+    Returns (ack_body, finalize_kwargs):
+      - ack_body is Slack's view_submission response shape: {} closes the
+        modal, {"response_action": "errors", "errors": {...}} re-opens it
+        with inline field errors. None (e.g. unauthorized) also closes the
+        modal — Slack treats a missing response_action as a plain close.
+      - finalize_kwargs is None on any error path, or the kwargs for
+        dossier.finalize_modify_submission(**finalize_kwargs) on success.
+        The caller (socket_listener.py) MUST send ack_body as the Socket
+        Mode response FIRST, then call finalize_modify_submission after —
+        it posts the new dossier card and neutralizes the old one, both
+        real Slack API calls that must not run before the ack (see
+        handle_modify_submission()'s tail comment for the dispatch_failed
+        risk this avoids).
+    """
+    from src.services.quote_ready.dossier import handle_modify_submission
+
+    user_id = payload.get("user", {}).get("id", "")
+    view = payload.get("view", {})
+    try:
+        metadata = json.loads(view.get("private_metadata", "{}"))
+    except Exception:
+        return {"response_action": "errors", "errors": {"purchase_price_block": "Invalid view metadata."}}, None
+    result_id = metadata.get("result_id")
+    if not result_id:
+        return {"response_action": "errors", "errors": {"purchase_price_block": "Invalid view metadata."}}, None
+    origin_channel = metadata.get("origin_channel", "")
+    origin_message_ts = metadata.get("origin_message_ts", "")
+
+    if not _relay_approver_authorized(user_id, "fa_max_lending"):
+        return {"response_action": "errors", "errors": {"purchase_price_block": "Not authorized."}}, None
+
+    values = (view.get("state") or {}).get("values") or {}
+    with get_db_context() as db:
+        outcome = handle_modify_submission(
+            db, result_id=result_id, values=values, submitted_by=user_id,
+            origin_channel=origin_channel, origin_message_ts=origin_message_ts,
+        )
+
+    if not outcome.get("ok"):
+        return {"response_action": "errors", "errors": outcome.get("error", {})}, None
+    logger.info("[QuoteReady] result_id=%s modify submitted by=%s -> new_result_id=%s",
+                result_id, user_id, outcome.get("new_result_id"))
+    finalize_kwargs = {
+        "new_result_id": outcome["new_result_id"],
+        "submitted_by": outcome["submitted_by"],
+        "origin_channel": outcome["origin_channel"],
+        "origin_message_ts": outcome["origin_message_ts"],
+    }
+    return {}, finalize_kwargs
+
+
+def _update_quote_ready_slack_message(result_id: str, payload: dict, reply_text: str) -> None:
+    """Replace the Approve/Modify/Reject buttons with the decision outcome,
+    in place — mirrors _update_win_story_slack_message's pattern (channel +
+    message ts come straight off the interactive payload, no DB lookup
+    needed)."""
+    from config.settings import get_settings
+    s = get_settings()
+    token = s.fa_max_slack_bot_token
+    channel = (payload.get("channel") or {}).get("id")
+    message_ts = (payload.get("message") or {}).get("ts")
+    if not token or not channel or not message_ts:
+        return
+    try:
+        from slack_sdk import WebClient
+        WebClient(token=token.get_secret_value()).chat_update(
+            channel=channel,
+            ts=message_ts,
+            text=reply_text,
+            blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": reply_text}}],
+        )
+    except Exception as exc:
+        logger.error("[QuoteReady] chat.update failed for result_id=%s: %s", result_id, exc)
 
 
 def _handle_confirm_entity_link(payload: dict, db: Session) -> dict:
