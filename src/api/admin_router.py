@@ -2037,12 +2037,19 @@ def _fa_max_channel_lane_map() -> dict[str, str]:
     map the empty string to a lane.
     """
     mapping: dict[str, str] = {}
-    for attr, lane in (
+    lanes = [
         ("fa_max_slack_channel_money", "MONEY"),
         ("fa_max_slack_channel_exceptions", "EXCEPTIONS"),
         ("fa_max_slack_channel_relationships", "RELATIONSHIPS"),
-        ("fa_max_slack_cc_channel", "CC"),
-    ):
+    ]
+    # With FA_MAX_SLACK_SINGLE_SOCKET=True, Cora owns #fa-max-command-center
+    # exclusively: messages are forwarded by the Relay listener into cc:events,
+    # and this responder must not answer them (each question would get two replies).
+    # With the flag off (default / rollback), CC stays in the lane map and Relay's
+    # WP-T2-12 responder answers CC questions as it does today.
+    if not settings.fa_max_slack_single_socket:
+        lanes.append(("fa_max_slack_cc_channel", "CC"))
+    for attr, lane in lanes:
         channel_id = getattr(settings, attr, "") or ""
         if channel_id:
             mapping[channel_id] = lane
@@ -3485,9 +3492,11 @@ def _fa_max_open_files_command(form: dict, db: Session) -> dict:
 
     rows = db.execute(
         text("""
-            SELECT p.full_name, o.backflip_ref, o.current_stage
+            SELECT p.full_name, o.backflip_ref,
+                   COALESCE(fs.backflip_stage, o.current_stage) AS stage
             FROM fa_max_opportunities o
             JOIN fa_max_persons p ON p.person_id = o.person_id
+            LEFT JOIN fa_max_file_state fs ON fs.opportunity_id = o.opportunity_id
             WHERE o.backflip_ref IS NOT NULL AND o.outcome = 'open'
             ORDER BY o.updated_at DESC
             LIMIT 25
@@ -3502,7 +3511,7 @@ def _fa_max_open_files_command(form: dict, db: Session) -> dict:
 
     table_lines = [f"{'Borrower':<{name_width}}  {'Ref':<{ref_width}}  Stage"]
     for name, r in zip(names, rows):
-        table_lines.append(f"{name:<{name_width}}  {r.backflip_ref:<{ref_width}}  {r.current_stage}")
+        table_lines.append(f"{name:<{name_width}}  {r.backflip_ref:<{ref_width}}  {r.stage}")
     table_body = "\n".join(table_lines)
 
     message = (

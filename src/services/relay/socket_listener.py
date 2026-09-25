@@ -26,6 +26,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
+from fastapi import HTTPException
+
 from config.settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -222,6 +224,9 @@ def handle_socket_request(client: Any, request: Any) -> bool:
 
     from src.api.admin_router import (
         _handle_relay_decision,
+        _handle_relay_skip,
+        _handle_relay_snooze,
+        _handle_relay_revise_open,
         _handle_confirm_entity_link,
         _handle_reject_entity_link,
         _handle_view_entity_link,
@@ -300,6 +305,58 @@ def handle_socket_request(client: Any, request: Any) -> bool:
         with get_db_context() as db:
             result = _handle_quote_ready_modify_open(payload, db)
         _post_socket_ephemeral(client, payload, result)
+        return True
+
+    # Dial List card buttons — cards are posted by the FA Max bot (delivery.py)
+    # so their block_actions envelopes arrive here. No separate listener handled
+    # them before; without this branch every dial_* click was silently dropped.
+    # Runs regardless of FA_MAX_SLACK_SINGLE_SOCKET (always was the right home).
+    if action_id and action_id.startswith("dial_"):
+        from src.services.dial_list.actions import handle_action as _dial_handle_action
+
+        logger.info("[RelaySocket] dial-list action: action_id=%s user=%s", action_id, user_id)
+        with get_db_context() as db:
+            dial_result = _dial_handle_action(
+                payload, db,
+                approver_id=get_settings().dial_list_approver_user_id,
+                client=client.web_client,
+            )
+        if dial_result.status in ("error", "ignored"):
+            logger.warning(
+                "[RelaySocket] dial-list action %s not applied: status=%s message=%s",
+                action_id, dial_result.status, dial_result.message,
+            )
+            _post_socket_ephemeral(
+                client, payload,
+                {"text": dial_result.message or "Could not apply that action."},
+            )
+        return True
+
+    # Relay Skip / Snooze / Revise buttons — the same card built by
+    # _build_approval_blocks() as Approve/Reject, but on their own action_ids
+    # (fa_max_skip/fa_max_snooze/fa_max_revise). Socket Mode is this app's
+    # only interactivity transport (a Socket-Mode-configured Slack app never
+    # also calls an HTTP Request URL), so admin_router.py's handlers for
+    # these three were unreachable in production until this branch existed
+    # here — approve/reject worked because they had their own action_id
+    # branch below, but these three did not.
+    if action_id in ("fa_max_skip", "fa_max_snooze", "fa_max_revise"):
+        _handler = {
+            "fa_max_skip": _handle_relay_skip,
+            "fa_max_snooze": _handle_relay_snooze,
+            "fa_max_revise": _handle_relay_revise_open,
+        }[action_id]
+        logger.info("[RelaySocket] relay %s: user=%s", action_id, user_id)
+        try:
+            result = _handler(payload)
+        except HTTPException as exc:
+            logger.warning("[RelaySocket] %s rejected: %s", action_id, exc.detail)
+            _post_socket_ephemeral(client, payload, {"text": str(exc.detail)})
+            return True
+        except Exception:
+            logger.exception("[RelaySocket] %s raised", action_id)
+            return True
+        _post_socket_ephemeral(client, payload, result or {})
         return True
 
     # Relay approve/reject
@@ -497,6 +554,28 @@ def run() -> None:
     socket.socket_mode_request_listeners.append(_on_request)
     socket.socket_mode_request_listeners.append(_on_tracked_link_request)
     socket.socket_mode_request_listeners.append(_on_fa_max_slash_request)
+
+    # FA_MAX_SLACK_SINGLE_SOCKET: Relay is the sole socket owner. Forward CC
+    # channel messages to Cora's cc:events stream so Cora's worker handles them.
+    # Registered LAST so it runs after _on_request has already acked the envelope
+    # — a slow Redis call here cannot delay the ack or cause Slack to redeliver.
+    if get_settings().fa_max_slack_single_socket:
+        from src.agents.cora.command_center import slack_socket as cc_socket
+
+        if cc_socket.init_forwarder(web):
+            def _on_cc_message(client: Any, request: Any) -> None:
+                if request.type != "events_api":
+                    return
+                payload = request.payload or {}
+                event = payload.get("event") or {}
+                if event.get("type") == "message":
+                    cc_socket.forward_message(event, payload.get("event_id"))
+
+            socket.socket_mode_request_listeners.append(_on_cc_message)
+            logger.info("[RelaySocket] CC forwarding enabled")
+        else:
+            logger.error("[RelaySocket] CC forwarding disabled: see cc.socket error above")
+
     logger.info("[RelaySocket] connecting via Socket Mode")
     socket.connect()
 

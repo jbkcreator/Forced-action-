@@ -25,6 +25,7 @@ def test_run_registers_all_three_listeners(monkeypatch):
     settings = get_settings()
     monkeypatch.setattr(settings, "fa_max_slack_app_token", mock.Mock(get_secret_value=lambda: "xapp-test"))
     monkeypatch.setattr(settings, "fa_max_slack_bot_token", mock.Mock(get_secret_value=lambda: "xoxb-test"))
+    monkeypatch.setattr(settings, "fa_max_slack_single_socket", False)
     monkeypatch.setattr(socket_listener, "get_settings", lambda: settings)
 
     fake_socket = mock.MagicMock()
@@ -68,6 +69,7 @@ def test_slash_command_envelope_is_acked_once_by_the_owning_listener(monkeypatch
     settings = get_settings()
     monkeypatch.setattr(settings, "fa_max_slack_app_token", mock.Mock(get_secret_value=lambda: "xapp-test"))
     monkeypatch.setattr(settings, "fa_max_slack_bot_token", mock.Mock(get_secret_value=lambda: "xoxb-test"))
+    monkeypatch.setattr(settings, "fa_max_slack_single_socket", False)
     monkeypatch.setattr(socket_listener, "get_settings", lambda: settings)
 
     fake_socket = mock.MagicMock()
@@ -121,6 +123,7 @@ def test_fa_max_slash_command_envelope_is_acked_once_by_the_owning_listener(monk
     settings = get_settings()
     monkeypatch.setattr(settings, "fa_max_slack_app_token", mock.Mock(get_secret_value=lambda: "xapp-test"))
     monkeypatch.setattr(settings, "fa_max_slack_bot_token", mock.Mock(get_secret_value=lambda: "xoxb-test"))
+    monkeypatch.setattr(settings, "fa_max_slack_single_socket", False)
     monkeypatch.setattr(socket_listener, "get_settings", lambda: settings)
 
     fake_socket = mock.MagicMock()

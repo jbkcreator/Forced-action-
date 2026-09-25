@@ -1,6 +1,7 @@
 .env
 .env.*
 *.env
+.env.test
 secrets/
 # WP-T2-12 local E2E helpers (never commit — test.env holds secrets)
 run_test_listener.py
