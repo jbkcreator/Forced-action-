@@ -130,7 +130,11 @@ def resolve_links(db: Session, *, person_id: str, opportunity_id: Optional[str])
 
 def add_booking_line(body: str, links: OutboundLinks) -> str:
     """Insert the booking line above the compliance footer when the body
-    already carries one, else append it."""
+    already carries one, else append it. Idempotent: a body that already
+    contains this booking URL (e.g. an agent draft quoting an earlier
+    message) is returned unchanged."""
+    if links.calendar_url in body:
+        return body
     line = BOOKING_LINE.format(calendar_link=links.calendar_url)
     head, marker, footer = body.rpartition(_FOOTER_MARKER)
     if not marker:

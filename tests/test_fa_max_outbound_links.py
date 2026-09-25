@@ -225,3 +225,15 @@ def test_agent_tool_send_carries_booking_link(fresh_db, monkeypatch):
     )
 
     assert "https://app.example.test/book/" in captured["payload"]["body"]
+
+
+def test_booking_line_is_added_only_once():
+    from src.services.fa_max_outbound_links import OutboundLinks, add_booking_line
+
+    links = OutboundLinks(calendar_url="https://x/book/s", portal_url="https://x/go/s")
+    once = add_booking_line("Following up.\n\n---\nReply STOP to opt out.", links)
+
+    twice = add_booking_line(once, links)
+
+    assert twice == once
+    assert twice.count("https://x/book/s") == 1
