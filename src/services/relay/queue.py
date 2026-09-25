@@ -927,7 +927,12 @@ def snooze_item(item_id: int, *, hours: float = 4.0) -> bool:
         result = session.execute(
             text(
                 "UPDATE relay_approval_queue "
-                "SET eligible_at = now() + make_interval(hours => :hours), updated_at = now() "
+                # make_interval(hours => ...) requires an integer arg and
+                # raises UndefinedFunction against a float/numeric bind
+                # (psycopg2 sends this Python float as numeric) -- multiplying
+                # a numeric by an interval literal works for any float value,
+                # fractional hours included, with no function-signature issue.
+                "SET eligible_at = now() + (:hours * interval '1 hour'), updated_at = now() "
                 "WHERE id = :id AND status = :pending"
             ),
             {"id": item_id, "hours": hours, "pending": STATUS_PENDING},

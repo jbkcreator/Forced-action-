@@ -14,11 +14,11 @@ def _signed_headers():
     return {"x-slack-request-timestamp": "9999999999", "x-slack-signature": "v0=test"}
 
 
-def _fake_row(full_name, backflip_ref, current_stage):
+def _fake_row(full_name, backflip_ref, stage):
     row = MagicMock()
     row.full_name = full_name
     row.backflip_ref = backflip_ref
-    row.current_stage = current_stage
+    row.stage = stage
     return row
 
 

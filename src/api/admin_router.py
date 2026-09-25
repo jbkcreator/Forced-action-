@@ -3492,9 +3492,11 @@ def _fa_max_open_files_command(form: dict, db: Session) -> dict:
 
     rows = db.execute(
         text("""
-            SELECT p.full_name, o.backflip_ref, o.current_stage
+            SELECT p.full_name, o.backflip_ref,
+                   COALESCE(fs.backflip_stage, o.current_stage) AS stage
             FROM fa_max_opportunities o
             JOIN fa_max_persons p ON p.person_id = o.person_id
+            LEFT JOIN fa_max_file_state fs ON fs.opportunity_id = o.opportunity_id
             WHERE o.backflip_ref IS NOT NULL AND o.outcome = 'open'
             ORDER BY o.updated_at DESC
             LIMIT 25
@@ -3509,7 +3511,7 @@ def _fa_max_open_files_command(form: dict, db: Session) -> dict:
 
     table_lines = [f"{'Borrower':<{name_width}}  {'Ref':<{ref_width}}  Stage"]
     for name, r in zip(names, rows):
-        table_lines.append(f"{name:<{name_width}}  {r.backflip_ref:<{ref_width}}  {r.current_stage}")
+        table_lines.append(f"{name:<{name_width}}  {r.backflip_ref:<{ref_width}}  {r.stage}")
     table_body = "\n".join(table_lines)
 
     message = (
