@@ -29,8 +29,10 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -40,33 +42,79 @@ logger = logging.getLogger(__name__)
 FA_MAX_VENTURE = "fa_max_lending"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Shared SQL fragments (WP-T3-2: extracted so edit_log uses the same filter)
+# Edit-rate population (WP-T3-2): the one definition of which queue rows count
+# toward an edit rate. The Tier B gate, the Friday report and the weekly edit
+# log all read through it, so they can never disagree about the population.
+# Bind :v = FA_MAX_VENTURE.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Human-approved population: venture, human-decided, status set.
-# Callers add AND agent_name = :a AND autonomy_tier_at_send = :tier.
-# fa_max_edit_log._POPULATION_WHERE mirrors this — keep in sync.
-_EDIT_RATE_POPULATION_WHERE = (
+EDIT_RATE_POPULATION_SQL = (
     "venture_key = :v AND decided_at IS NOT NULL "
     "AND decided_by IS NOT NULL AND decided_by NOT LIKE 'system:autonomous:%' "
     "AND status IN ('approved', 'sent', 'failed', 'uncertain', 'skipped') "
-    "AND agent_name = :a AND autonomy_tier_at_send = :tier"
+    "AND agent_name IS NOT NULL AND autonomy_tier_at_send IS NOT NULL"
 )
 
+_PAIR_SQL = "AND agent_name = :a AND autonomy_tier_at_send = :tier"
 
-def _iso_week_start(now=None) -> "datetime":
-    """Monday 00:00 America/New_York as UTC datetime for the given instant."""
-    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
-    from zoneinfo import ZoneInfo
-    eastern = ZoneInfo("America/New_York")
-    if now is None:
-        now = _dt.now(eastern)
-    else:
-        now = now.astimezone(eastern)
-    week_start_eastern = (now - _td(days=now.weekday())).replace(
+_EDIT_COUNTS_SELECT = (
+    "COUNT(*) FILTER (WHERE material_edit IS TRUE) AS material, "
+    "COUNT(*) FILTER (WHERE revision_count > 0) AS revised, "
+    "COUNT(*) AS decided"
+)
+
+_EASTERN = ZoneInfo("America/New_York")
+
+
+def iso_week_bounds(now: Optional[datetime] = None, *, weeks_back: int = 0) -> tuple[datetime, datetime]:
+    """(start, end) in UTC of the ISO week (Monday 00:00 America/New_York)
+    containing `now`, shifted `weeks_back` weeks earlier. Arithmetic runs on
+    Eastern wall-clock time so a week spanning a DST change is still exactly
+    Monday-to-Monday."""
+    now_et = (now or datetime.now(timezone.utc)).astimezone(_EASTERN)
+    start_et = (now_et - timedelta(days=now_et.weekday(), weeks=weeks_back)).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
-    return week_start_eastern.astimezone(_tz.utc)
+    end_et = start_et + timedelta(days=7)
+    return start_et.astimezone(timezone.utc), end_et.astimezone(timezone.utc)
+
+
+@dataclass(frozen=True)
+class EditCounts:
+    """Edit-rate evidence for one (agent_name, tier) pair over one window."""
+    material: int
+    revised: int
+    decided: int
+
+    @property
+    def rate(self) -> float:
+        return self.material / self.decided if self.decided else 0.0
+
+
+def get_edit_counts_by_pair(
+    session: Session, *, window_start: datetime, window_end: datetime,
+) -> dict[tuple[str, str], EditCounts]:
+    """EditCounts for every (agent_name, tier) pair decided in
+    [window_start, window_end), in one grouped query. EditCounts.rate is the
+    same number get_weekly_edit_rate returns for that pair and window."""
+    rows = session.execute(
+        text(
+            f"SELECT agent_name, autonomy_tier_at_send, {_EDIT_COUNTS_SELECT} "
+            "FROM relay_approval_queue "
+            f"WHERE {EDIT_RATE_POPULATION_SQL} "
+            "AND decided_at >= :start AND decided_at < :end "
+            "GROUP BY agent_name, autonomy_tier_at_send "
+            "ORDER BY agent_name, autonomy_tier_at_send"
+        ),
+        {"v": FA_MAX_VENTURE, "start": window_start, "end": window_end},
+    ).mappings().all()
+    return {
+        (r["agent_name"], r["autonomy_tier_at_send"]): EditCounts(
+            material=int(r["material"]), revised=int(r["revised"]), decided=int(r["decided"]),
+        )
+        for r in rows
+    }
+
 
 # Tier thresholds (SOT.md Part 2)
 from src.agents.fa_max.tool_registry import FA_MAX_AUTONOMY_POLICY
@@ -227,7 +275,7 @@ def get_edit_rate(agent_name: str, tier: str, session: Session) -> float:
             "  COUNT(*) FILTER (WHERE material_edit IS TRUE) AS edited, "
             "  COUNT(*) AS total "
             "FROM relay_approval_queue "
-            f"WHERE {_EDIT_RATE_POPULATION_WHERE}"
+            f"WHERE {EDIT_RATE_POPULATION_SQL} {_PAIR_SQL}"
         ),
         {"v": FA_MAX_VENTURE, "a": agent_name, "tier": tier},
     ).mappings().first()
@@ -241,8 +289,8 @@ def get_weekly_edit_rate(
     tier: str,
     session: Session,
     *,
-    week_start: Optional["datetime"] = None,
-    week_end: Optional["datetime"] = None,
+    week_start: Optional[datetime] = None,
+    week_end: Optional[datetime] = None,
 ) -> float:
     """Edit rate scoped to the CURRENT ISO week (Monday 00:00 America/New_York
     through now), for the Friday weekly edit-rate operations report. Reads
@@ -250,17 +298,15 @@ def get_weekly_edit_rate(
     the WHERE window, not the evidence source. Returns 0.0 when no approved
     sends exist this week.
 
-    WP-T3-2: accepts optional week_start / week_end (UTC datetimes) so
-    build_rollup can query prior weeks without duplicating the SQL. When
-    omitted, defaults to the current ISO week — identical behavior to before.
+    WP-T3-2: week_start / week_end (UTC) select another window; omitted, the
+    window is the current ISO week through now, as before.
     """
     if week_start is None:
-        week_start = _iso_week_start()
-    extra_clause = "AND decided_at >= :week_start"
-    params: dict = {"v": FA_MAX_VENTURE, "a": agent_name, "tier": tier,
-                    "week_start": week_start}
+        week_start, _ = iso_week_bounds()
+    window_sql = "AND decided_at >= :week_start"
+    params: dict = {"v": FA_MAX_VENTURE, "a": agent_name, "tier": tier, "week_start": week_start}
     if week_end is not None:
-        extra_clause += " AND decided_at < :week_end"
+        window_sql += " AND decided_at < :week_end"
         params["week_end"] = week_end
     row = session.execute(
         text(
@@ -268,8 +314,7 @@ def get_weekly_edit_rate(
             "  COUNT(*) FILTER (WHERE material_edit IS TRUE) AS edited, "
             "  COUNT(*) AS total "
             "FROM relay_approval_queue "
-            f"WHERE {_EDIT_RATE_POPULATION_WHERE} "
-            f"{extra_clause}"
+            f"WHERE {EDIT_RATE_POPULATION_SQL} {_PAIR_SQL} {window_sql}"
         ),
         params,
     ).mappings().first()

@@ -57,6 +57,7 @@ from src.core.models import (
 )
 from src.loaders.tax import TaxDelinquencyLoader
 from src.loaders.voter_registry import VoterRegistryLoader
+from src.services.fa_max_edit_log import is_material_edit as _is_material_edit
 from src.services.relay.slack_post import open_new_file_modal
 from src.services.zip_territory import claim_zip_territory
 from src.utils.county_config import invalidate_cache
@@ -2438,14 +2439,6 @@ def _handle_relay_revise_open(payload: dict) -> dict:
 
     open_revise_modal(payload.get("trigger_id", ""), existing)
     return {}
-
-
-def _is_material_edit(old_text: str, new_text: str) -> bool:
-    """Thin delegate to fa_max_edit_log.is_material_edit — single source of
-    truth for the material-edit threshold (WP-T3-2 D3). Kept here so all
-    existing callers continue to work without change."""
-    from src.services.fa_max_edit_log import is_material_edit as _ime
-    return _ime(old_text, new_text)
 
 
 def _post_relay_thread_note(item, text: str) -> None:

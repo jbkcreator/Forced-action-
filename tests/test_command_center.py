@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import timedelta
 from decimal import Decimal
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -632,87 +633,66 @@ class TestQueryDb:
 # WP-T3-2 — Command Center: get_edit_log tool + scoreboard edit_rate_this_week
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _cc_payload(result_json: str) -> dict:
+    assert result_json.startswith("DATA: ")
+    return json.loads(result_json[len("DATA: "):])
+
+
 class TestGetEditLogTool:
-    """Tests for the new get_edit_log Command Center tool (WP-T3-2 §6)."""
-
-    def test_get_edit_log_is_registered(self):
-        """get_edit_log must be in the TOOLS list and _HANDLERS dispatch table."""
+    def test_registered_in_tools_and_handlers(self):
         from src.agents.cora.command_center.tools import TOOLS, _HANDLERS
-        tool_names = [t["name"] for t in TOOLS]
-        assert "get_edit_log" in tool_names, "get_edit_log missing from TOOLS"
-        assert "get_edit_log" in _HANDLERS, "get_edit_log missing from _HANDLERS"
+        assert "get_edit_log" in [t["name"] for t in TOOLS]
+        assert "get_edit_log" in _HANDLERS
 
-    def test_get_edit_log_dispatch_returns_str_int(self):
-        """dispatch_tool must return (str, int) and never raise."""
-        result_json, duration_ms = dispatch_tool(
-            "get_edit_log",
-            {"weeks_back": 1, "limit": 5},
-            _null_db(),
-        )
-        assert isinstance(result_json, str)
-        assert isinstance(duration_ms, int)
+    def test_returns_rollup_entries_and_uncaptured(self):
+        from src.services.fa_max_autonomy import EditCounts
+        from src.services.fa_max_edit_log import AgentRollup
+        rollup = AgentRollup(agent_name="stage_monitor", tier="A",
+                             this_week=EditCounts(material=1, revised=2, decided=10),
+                             prior_4w=None, top_categories=[("numbers", 1)], biggest_edit=None)
+        with patch("src.agents.cora.command_center.tools.build_rollup", return_value=[rollup]),                 patch("src.agents.cora.command_center.tools.get_edit_log", return_value=[]) as log,                 patch("src.agents.cora.command_center.tools.count_uncaptured", return_value=3):
+            payload = _cc_payload(dispatch_tool("get_edit_log", {"weeks_back": 2, "limit": 5}, _null_db())[0])
+        assert payload["rollup"][0]["agent_name"] == "stage_monitor"
+        assert payload["rollup"][0]["rate_this_week"] == 0.1
+        assert payload["rollup"][0]["top_categories"] == [{"category": "numbers", "count": 1}]
+        assert payload["entries"] == [] and payload["uncaptured"] == 3
+        kwargs = log.call_args.kwargs
+        assert kwargs["limit"] == 5
+        assert kwargs["window_end"] - kwargs["window_start"] >= timedelta(days=13)  # weeks_back=2 spans 2 weeks
 
-    def test_get_edit_log_result_has_expected_keys(self):
-        """Result payload must contain period, rollup, entries, uncaptured."""
-        result_json, _ = dispatch_tool(
-            "get_edit_log",
-            {"weeks_back": 1, "limit": 5},
-            _null_db(),
-        )
-        payload = json.loads(result_json[6:])  # strip "DATA: "
-        assert "period" in payload or "error" in payload  # graceful on empty DB
-        if "period" in payload:
-            assert "rollup" in payload
-            assert "entries" in payload
-            assert "uncaptured" in payload
+    def test_agent_filter_applies_to_rollup_and_entries(self):
+        from src.services.fa_max_autonomy import EditCounts
+        from src.services.fa_max_edit_log import AgentRollup
+        rollups = [AgentRollup(agent_name=n, tier="A", this_week=EditCounts(0, 0, 1), prior_4w=None,
+                               top_categories=[], biggest_edit=None) for n in ("a", "b")]
+        with patch("src.agents.cora.command_center.tools.build_rollup", return_value=rollups),                 patch("src.agents.cora.command_center.tools.get_edit_log", return_value=[]) as log,                 patch("src.agents.cora.command_center.tools.count_uncaptured", return_value=0):
+            payload = _cc_payload(dispatch_tool("get_edit_log", {"agent_name": "b"}, _null_db())[0])
+        assert [r["agent_name"] for r in payload["rollup"]] == ["b"]
+        assert log.call_args.kwargs["agent_name"] == "b"
 
-    def test_get_edit_log_weeks_back_out_of_range_returns_error(self):
-        """weeks_back must be validated 1–8; values outside return an error."""
-        result_json, _ = dispatch_tool(
-            "get_edit_log",
-            {"weeks_back": 0},
-            _null_db(),
-        )
-        payload = json.loads(result_json[6:])
-        assert "error" in payload
+    @pytest.mark.parametrize("tool_input", [{"weeks_back": 0}, {"weeks_back": 9}, {"limit": 0},
+                                            {"limit": 26}, {"limit": "many"}])
+    def test_rejects_out_of_range_input(self, tool_input):
+        assert "error" in _cc_payload(dispatch_tool("get_edit_log", tool_input, _null_db())[0])
 
-    def test_get_edit_log_limit_out_of_range_returns_error(self):
-        result_json, _ = dispatch_tool(
-            "get_edit_log",
-            {"limit": 30},
-            _null_db(),
-        )
-        payload = json.loads(result_json[6:])
-        assert "error" in payload
+    def test_db_failure_returns_generic_error(self):
+        with patch("src.agents.cora.command_center.tools.build_rollup",
+                   side_effect=RuntimeError("password=hunter2 host=10.0.0.5")):
+            payload = _cc_payload(dispatch_tool("get_edit_log", {}, _null_db())[0])
+        assert payload == {"error": "edit log unavailable"}
 
 
 class TestScoreboardEditRateField:
-    """The get_scoreboard tool must include edit_rate_this_week (WP-T3-2 §6)."""
+    def test_scoreboard_lists_gate_rate_per_agent(self):
+        from src.services.fa_max_autonomy import EditCounts
+        counts = {("stage_monitor", "A"): EditCounts(material=1, revised=2, decided=8)}
+        with patch("src.agents.cora.command_center.tools.get_edit_counts_by_pair", return_value=counts):
+            payload = _cc_payload(dispatch_tool("get_scoreboard", {}, _null_db())[0])
+        assert payload["edit_rate_this_week"] == [{"agent": "stage_monitor", "tier": "A", "rate": 0.125, "n": 8}]
 
-    def test_scoreboard_includes_edit_rate_this_week_key(self):
-        result_json, _ = dispatch_tool("get_scoreboard", {}, _null_db())
-        payload = json.loads(result_json[6:])
-        if "error" in payload:
-            return  # DB not available, skip assertion
-        assert "edit_rate_this_week" in payload
-
-    def test_scoreboard_edit_rate_is_list(self):
-        result_json, _ = dispatch_tool("get_scoreboard", {}, _null_db())
-        payload = json.loads(result_json[6:])
-        if "error" in payload:
-            return
-        assert isinstance(payload["edit_rate_this_week"], list)
-
-    def test_scoreboard_degrades_gracefully_when_edit_rate_fails(self):
-        """If the edit-rate query fails, the scoreboard must still return
-        other fields with edit_rate_this_week degraded to []."""
-        from unittest.mock import patch
-        with patch(
-            "src.agents.cora.command_center.tools.build_rollup",
-            side_effect=Exception("DB timeout"),
-        ):
-            result_json, _ = dispatch_tool("get_scoreboard", {}, _null_db())
-        payload = json.loads(result_json[6:])
-        # Must not raise and must degrade edit_rate_this_week to []
-        if "edit_rate_this_week" in payload:
-            assert payload["edit_rate_this_week"] == []
+    def test_scoreboard_survives_edit_rate_failure(self):
+        with patch("src.agents.cora.command_center.tools.get_edit_counts_by_pair",
+                   side_effect=RuntimeError("db down")):
+            payload = _cc_payload(dispatch_tool("get_scoreboard", {}, _null_db())[0])
+        assert payload["edit_rate_this_week"] == []
+        assert "outreaches_sent" in payload

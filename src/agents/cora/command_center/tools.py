@@ -22,7 +22,8 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from src.agents.cora.command_center.db_tool import execute_query
-from src.services.fa_max_edit_log import build_rollup, count_uncaptured, get_edit_log, _iso_week_start_utc
+from src.services.fa_max_autonomy import get_edit_counts_by_pair, iso_week_bounds
+from src.services.fa_max_edit_log import build_rollup, count_uncaptured, get_edit_log
 
 logger = logging.getLogger(__name__)
 
@@ -158,7 +159,7 @@ GET_EDIT_LOG_SCHEMA: Dict[str, Any] = {
             },
             "weeks_back": {
                 "type": "integer",
-                "description": "How many past ISO weeks to include (1–8). Default 1.",
+                "description": "How many ISO weeks of edit entries to return, counting back from this week (1–8). Default 1.",
             },
             "limit": {
                 "type": "integer",
@@ -327,14 +328,15 @@ def _handle_get_scoreboard(tool_input: Dict[str, Any], db: Session) -> Any:
 
     reply_rate = round(replies / outreaches, 4) if outreaches > 0 else None
 
-    # WP-T3-2: edit-rate-this-week — degrades to [] on any error
+    # WP-T3-2: same per-agent number as the Tier B gate; the scoreboard stays
+    # usable if this part fails.
     edit_rate_this_week: list = []
     try:
-        rollups = build_rollup(db, weeks_back=1)
+        week_start, week_end = iso_week_bounds()
+        counts = get_edit_counts_by_pair(db, window_start=week_start, window_end=week_end)
         edit_rate_this_week = [
-            {"agent": r.agent_name, "tier": r.tier,
-             "rate": round(r.rate_this_week, 4), "n": r.n_decided}
-            for r in rollups
+            {"agent": agent, "tier": tier, "rate": round(c.rate, 4), "n": c.decided}
+            for (agent, tier), c in counts.items()
         ]
     except Exception as exc:
         logger.warning("tools.scoreboard: edit_rate_this_week failed: %s", exc)
@@ -382,56 +384,40 @@ def _handle_search_opportunity(tool_input: Dict[str, Any], db: Session) -> Any:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _handle_get_edit_log(tool_input: Dict[str, Any], db: Session) -> Any:
-    """WP-T3-2: per-agent edit log (rollup + entries with diffs)."""
-    import dataclasses
-    from datetime import timezone, timedelta
-
-    weeks_back = int(tool_input.get("weeks_back", 1))
-    limit = int(tool_input.get("limit", 10))
-    agent_name: Optional[str] = tool_input.get("agent_name")
-
-    if not (1 <= weeks_back <= 8):
+    """WP-T3-2 weekly edit log. rollup = the current ISO week against the prior
+    4 weeks; entries and uncaptured span the last `weeks_back` ISO weeks."""
+    try:
+        weeks_back = int(tool_input.get("weeks_back", 1))
+        limit = int(tool_input.get("limit", 10))
+    except (TypeError, ValueError):
+        return {"error": "weeks_back and limit must be integers"}
+    if not 1 <= weeks_back <= 8:
         return {"error": "weeks_back must be between 1 and 8"}
-    if not (1 <= limit <= 25):
+    if not 1 <= limit <= 25:
         return {"error": "limit must be between 1 and 25"}
+    agent_name: Optional[str] = tool_input.get("agent_name") or None
 
     try:
-        week_start = _iso_week_start_utc()
-        week_end = week_start + timedelta(days=7)
-
-        rollups = build_rollup(db, weeks_back=weeks_back)
-        entries = get_edit_log(db, week_start=week_start, week_end=week_end,
-                               agent_name=agent_name, limit=limit)
-        uncaptured = count_uncaptured(db, week_start=week_start, week_end=week_end)
-
-        def _entry_dict(e):
-            d = dataclasses.asdict(e)
-            # Truncate drafts to 1000 chars per spec
-            for k in ("original_draft", "final_text"):
-                if d.get(k) and len(d[k]) > 1000:
-                    d[k] = d[k][:997] + "…"
-            # Convert datetimes to ISO strings
-            for k in ("last_revised_at", "decided_at"):
-                if d.get(k):
-                    d[k] = d[k].isoformat()
-            return d
-
-        def _rollup_dict(r):
-            d = dataclasses.asdict(r)
-            if d.get("biggest_edit"):
-                d["biggest_edit"] = _entry_dict(r.biggest_edit)
-            return d
-
-        period = f"{week_start.date().isoformat()} / {week_end.date().isoformat()}"
-        return {
-            "period": period,
-            "rollup": [_rollup_dict(r) for r in rollups],
-            "entries": [_entry_dict(e) for e in entries],
-            "uncaptured": uncaptured,
-        }
+        window_start, _ = iso_week_bounds(weeks_back=weeks_back - 1)
+        _, window_end = iso_week_bounds()
+        rollups = build_rollup(db)
+        if agent_name:
+            rollups = [r for r in rollups if r.agent_name == agent_name]
+        entries = get_edit_log(
+            db, window_start=window_start, window_end=window_end,
+            agent_name=agent_name, limit=limit,
+        )
+        uncaptured = count_uncaptured(db, window_start=window_start, window_end=window_end)
     except Exception as exc:
         logger.warning("tools.get_edit_log failed: %s", exc)
-        return {"error": str(exc)}
+        return {"error": "edit log unavailable"}
+
+    return {
+        "period": f"{window_start.date().isoformat()} / {window_end.date().isoformat()}",
+        "rollup": [r.to_dict() for r in rollups],
+        "entries": [e.to_dict() for e in entries],
+        "uncaptured": uncaptured,
+    }
 
 
 _HANDLERS = {
