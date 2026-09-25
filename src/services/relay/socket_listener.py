@@ -32,7 +32,6 @@ from config.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
-_DIAL_LIST_ACTION_PREFIX = "dial_"
 
 _REVISE_ACTIONS = {
     "fa_max_revise": "_handle_relay_revise_open",
@@ -388,17 +387,6 @@ def handle_socket_request(client: Any, request: Any) -> bool:
             logger.exception("[RelaySocket] %s failed", action_id)
             return True
         _post_socket_ephemeral(client, payload, result)
-        return True
-
-    # Dial-list cards are posted by the FA Max bot (deliver_dial_list), so Slack
-    # delivers their taps to this app's socket, not the dial-list listener's app.
-    if action_id and action_id.startswith(_DIAL_LIST_ACTION_PREFIX):
-        from src.services.dial_list.actions import handle_action
-
-        logger.info("[RelaySocket] dial-list action: action_id=%s user=%s", action_id, user_id)
-        with get_db_context() as db:
-            handle_action(payload, db, approver_id=get_settings().dial_list_approver_user_id,
-                          client=client.web_client)
         return True
 
     # Relay approve/reject
