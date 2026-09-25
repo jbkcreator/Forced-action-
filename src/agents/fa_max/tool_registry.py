@@ -232,6 +232,39 @@ def get_fa_max_person_state(*, person_id: str, session=None) -> Dict[str, Any]:
 
 
 @fa_max_tool(category="read", idempotent=True)
+def get_campaign_enrollment(*, person_id: str, session) -> Dict[str, Any]:
+    """WP-T3-4: current + past campaign enrollment(s) for one person, so
+    Cora/the command center can answer "why is this person in Exit Desk?"
+    without opening another tool. Read-only — no send/write capability."""
+    from sqlalchemy import text as _text
+
+    rows = session.execute(
+        _text(
+            "SELECT enrollment_id::text, campaign_key, audience, status, trigger_type, "
+            "trigger_reason, also_matched, enrolled_at, ended_at, end_reason, last_touch_sent_at "
+            "FROM fa_max_campaign_enrollments WHERE person_id = CAST(:pid AS uuid) "
+            "ORDER BY enrolled_at DESC"
+        ),
+        {"pid": person_id},
+    ).mappings().all()
+    enrollments = [dict(row) for row in rows]
+
+    next_touch = None
+    if enrollments and enrollments[0]["status"] in ("active", "paused"):
+        touch = session.execute(
+            _text(
+                "SELECT step, channel, due_at, status FROM fa_max_campaign_touches "
+                "WHERE enrollment_id = CAST(:eid AS uuid) AND status IN ('scheduled', 'held') "
+                "ORDER BY due_at LIMIT 1"
+            ),
+            {"eid": enrollments[0]["enrollment_id"]},
+        ).mappings().fetchone()
+        next_touch = dict(touch) if touch else None
+
+    return {"person_id": person_id, "enrollments": enrollments, "next_due_touch": next_touch}
+
+
+@fa_max_tool(category="read", idempotent=True)
 def get_fa_max_person_history(
     *, person_id: str, limit: int = 100, after_seq: Optional[int] = None, session=None,
 ) -> Dict[str, Any]:

@@ -22,6 +22,12 @@ class PartnerClass(str, Enum):
     BROKER = "broker"
     PROPERTY_MANAGER = "property_manager"
     INSURANCE_AGENT = "insurance_agent"
+    # WP-T3-4 (Rescue Circuit) — import-only, from Josh's own partner list
+    # (src.services.fa_max_campaigns.import_partners). Deliberately NOT in
+    # _ROLE_MAP below: the automatic classifier must never assign these two
+    # any more than it may assign TITLE_REP/BROKER — see assign_partner_class.
+    CLOSING_ATTORNEY = "closing_attorney"
+    LOAN_OFFICER = "loan_officer"
 
 
 _ROLE_MAP: dict[str, PartnerClass] = {

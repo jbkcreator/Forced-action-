@@ -12358,3 +12358,206 @@ class FaMaxGyrRoutingLog(Base):
         ),
         Index("ix_fa_max_gyr_log_opp_decided", "opportunity_id", "decided_at"),
     )
+
+
+# ============================================================================
+# WP-T3-4 — Campaign Selection Agent
+# ============================================================================
+
+class FaMaxCampaignSequenceStep(Base):
+    """One loaded message step for one campaign/version, from the content
+    writer's spreadsheet (see src.services.fa_max_campaigns.content). A new
+    load creates a new sequence_version; people already enrolled finish on
+    the version they started (plan Section 6.8)."""
+
+    __tablename__ = "fa_max_campaign_sequence_steps"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    campaign_key: Mapped[str] = mapped_column(String(30), nullable=False)
+    sequence_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    step: Mapped[int] = mapped_column(Integer, nullable=False)
+    days_after_previous: Mapped[int] = mapped_column(Integer, nullable=False)
+    channel: Mapped[str] = mapped_column(String(10), nullable=False)
+    subject: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    body_template: Mapped[str] = mapped_column(Text, nullable=False)
+    loaded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    loaded_by: Mapped[str] = mapped_column(String(120), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "campaign_key IN ('capital_desk_loop', 'exit_desk', 'rescue_circuit')",
+            name="ck_fa_max_campaign_step_campaign",
+        ),
+        CheckConstraint("channel IN ('email', 'sms')", name="ck_fa_max_campaign_step_channel"),
+        CheckConstraint("step >= 1", name="ck_fa_max_campaign_step_positive"),
+        CheckConstraint("days_after_previous >= 0", name="ck_fa_max_campaign_step_gap_nonneg"),
+        UniqueConstraint(
+            "campaign_key", "sequence_version", "step", name="uq_fa_max_campaign_step",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<FaMaxCampaignSequenceStep(campaign={self.campaign_key!r}, "
+            f"version={self.sequence_version}, step={self.step})>"
+        )
+
+
+class FaMaxCampaignEnrollment(Base):
+    """One person's current or past membership in one campaign.
+
+    A partial unique index enforces exactly one active-or-paused enrollment
+    per person at the database layer — no code path can create a second one
+    even under a race (plan Section 6.1, "one campaign per person, ever").
+    """
+
+    __tablename__ = "fa_max_campaign_enrollments"
+
+    enrollment_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=text("generate_uuidv7()")
+    )
+    person_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_persons.person_id", name="fk_fa_max_campaign_enrollment_person", ondelete="CASCADE"),
+        nullable=False,
+    )
+    campaign_key: Mapped[str] = mapped_column(String(30), nullable=False)
+    audience: Mapped[str] = mapped_column(String(20), nullable=False)
+    sequence_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    trigger_type: Mapped[str] = mapped_column(String(60), nullable=False)
+    trigger_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    source: Mapped[str] = mapped_column(String(60), nullable=False)
+    property_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("properties.id", name="fk_fa_max_campaign_enrollment_property"), nullable=True,
+    )
+    county_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    state: Mapped[Optional[str]] = mapped_column(String(2), nullable=True)
+    trigger_context: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    also_matched: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    enrolled_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    end_reason: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
+    last_touch_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "campaign_key IN ('capital_desk_loop', 'exit_desk', 'rescue_circuit')",
+            name="ck_fa_max_campaign_enrollment_campaign",
+        ),
+        CheckConstraint(
+            "audience IN ('investor', 'partner')", name="ck_fa_max_campaign_enrollment_audience",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'paused', 'completed', 'cancelled', 'preempted')",
+            name="ck_fa_max_campaign_enrollment_status",
+        ),
+        Index("ix_fa_max_campaign_enrollments_campaign_status", "campaign_key", "status"),
+        Index("ix_fa_max_campaign_enrollments_person", "person_id"),
+        Index(
+            "uq_fa_max_campaign_enrollment_active_person", "person_id",
+            unique=True,
+            postgresql_where=text("status IN ('active', 'paused')"),
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<FaMaxCampaignEnrollment(enrollment_id={self.enrollment_id!r}, "
+            f"campaign={self.campaign_key!r}, status={self.status!r})>"
+        )
+
+
+class FaMaxCampaignEnrollmentEvent(Base):
+    """Append-only history of every enrollment state change (client Part A
+    Q2: every record keeps "a full timestamped and attributed history")."""
+
+    __tablename__ = "fa_max_campaign_enrollment_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    enrollment_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey(
+            "fa_max_campaign_enrollments.enrollment_id",
+            name="fk_fa_max_campaign_event_enrollment", ondelete="CASCADE",
+        ),
+        nullable=False,
+    )
+    event: Mapped[str] = mapped_column(String(30), nullable=False)
+    reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    actor: Mapped[str] = mapped_column(String(60), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "event IN ('enrolled', 'paused', 'resumed', 'preempted', 'cancelled', "
+            "'completed', 'touch_held', 'touch_released')",
+            name="ck_fa_max_campaign_event_type",
+        ),
+        Index("ix_fa_max_campaign_enrollment_events_enrollment", "enrollment_id", "created_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<FaMaxCampaignEnrollmentEvent(enrollment={self.enrollment_id!r}, event={self.event!r})>"
+
+
+class FaMaxCampaignTouch(Base):
+    """One scheduled step for one enrolled person. Shape copied from
+    abandonment_sequences (migrations/apply_abandonment_sequences.py)."""
+
+    __tablename__ = "fa_max_campaign_touches"
+
+    touch_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    enrollment_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey(
+            "fa_max_campaign_enrollments.enrollment_id",
+            name="fk_fa_max_campaign_touch_enrollment", ondelete="CASCADE",
+        ),
+        nullable=False,
+    )
+    step: Mapped[int] = mapped_column(Integer, nullable=False)
+    channel: Mapped[str] = mapped_column(String(10), nullable=False)
+    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, server_default=text("'scheduled'"))
+    status_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    work_item_id: Mapped[Optional[Any]] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    relay_item_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    idempotency_key: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("step >= 1", name="ck_fa_max_campaign_touch_step_positive"),
+        CheckConstraint("channel IN ('email', 'sms')", name="ck_fa_max_campaign_touch_channel"),
+        CheckConstraint(
+            "status IN ('scheduled', 'held', 'handed_off', 'sent', 'skipped', 'cancelled')",
+            name="ck_fa_max_campaign_touch_status",
+        ),
+        UniqueConstraint("idempotency_key", name="uq_fa_max_campaign_touch_idempotency"),
+        Index(
+            "ix_fa_max_campaign_touches_due", "due_at",
+            postgresql_where=text("status IN ('scheduled', 'held')"),
+        ),
+        Index("ix_fa_max_campaign_touches_enrollment", "enrollment_id"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<FaMaxCampaignTouch(touch_id={self.touch_id}, "
+            f"step={self.step}, status={self.status!r})>"
+        )

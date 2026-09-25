@@ -182,6 +182,18 @@ COUNTY_ID=hillsborough
 # opens so he sees stale alerts alongside fresh morning deal flow.
 0 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.fa_max_opportunity_router_staleness
 
+# FA Max Campaign Selection Agent (WP-T3-4) — daily enrollment sweep, 06:30
+# UTC, after partner mining (06:00 UTC). Assigns new contacts to a v1
+# campaign (capital_desk_loop/exit_desk/rescue_circuit), re-checks
+# pause/resume/cancel on every existing enrollment, posts one summary to
+# RELATIONSHIPS. Contains no send code.
+30 6 * * * $PROJECT/scripts/cron/run.sh src.tasks.fa_max_campaign_enrollment_sweep
+
+# FA Max Campaign due-step sweep (WP-T3-4) — every 15 minutes. Hands due,
+# unblocked touches to the Outreach Agent (WP-T3-5) or Partner Nurture
+# Agent (WP-T3-6) work queues. Never bypasses consent/suppression.
+*/15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.fa_max_campaign_due_steps
+
 # Autonomous Inbound Content Loop (Task 5.1) — Weekly Sunday @ 09:00 AM UTC.
 # Scores each Quora Seed Keyword over a 30-day window, deactivates losers
 # (>=5 answers, 0 paid signups) and expands winners (LLM variations, pool cap 30,

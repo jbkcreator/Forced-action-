@@ -27,12 +27,44 @@ _CONFIRMED_HTML = "<html><body><p>You have been unsubscribed and will not receiv
 _INVALID_HTML = "<html><body><p>This unsubscribe link is invalid or has expired.</p></body></html>"
 
 
+def _cascade_fa_max_opt_out(email: str, db: Session) -> None:
+    """WP-T3-4 (plan Section 6.6): if this email belongs to a resolved FA Max
+    person, run the same handle_opt_out() the concierge's reply-opt-out path
+    uses — moves the person to do_not_contact and cancels any active
+    campaign enrollment. Best-effort: never blocks the unsubscribe response."""
+    try:
+        from sqlalchemy import text as _text
+
+        row = db.execute(
+            _text(
+                "SELECT person_id::text FROM fa_max_persons "
+                "WHERE lower(email) = lower(:email) AND merged_into_id IS NULL LIMIT 1"
+            ),
+            {"email": email},
+        ).fetchone()
+        if not row:
+            return
+        from src.agents.reply_concierge.opt_out import handle_opt_out
+
+        handle_opt_out(
+            person_id=row[0], contact_email=email,
+            inbound_text="unsubscribe_link", channel="email", db=db,
+        )
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "email_unsubscribe: fa_max cascade failed for email=%s", email, exc_info=True,
+        )
+
+
 def _do_unsubscribe(token: str, db: Session) -> HTMLResponse:
     email = verify_unsubscribe_token(token)
     if not email:
         return HTMLResponse(_INVALID_HTML, status_code=400)
 
     suppress_contact(db, email=email, source="unsubscribe_link")
+    _cascade_fa_max_opt_out(email, db)
     return HTMLResponse(_CONFIRMED_HTML, status_code=200)
 
 
