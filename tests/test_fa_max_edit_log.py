@@ -520,3 +520,63 @@ class TestDraftText:
                                payload={"type": "concierge_reply", "reply_text": "Hi Mike, thanks!"})
         element = _build_revise_modal(item)["blocks"][0]["element"]
         assert element["initial_value"] == "Hi Mike, thanks!"
+
+
+class TestHumanSkipCountsAsDecision:
+    """A draft Josh revises and then Skips in Slack is a human decision: it must
+    carry decided_by / decided_at so it enters the edit-rate population (the
+    gate and the weekly log). The engine's send-time skip must not overwrite
+    the approval that preceded it."""
+
+    def _skip_via_slack(self, db, item_id: int, user_id: str = "U_JOSH") -> dict:
+        from src.api import admin_router
+
+        @contextmanager
+        def _same_session():
+            yield db
+
+        payload = {"user": {"id": user_id},
+                   "actions": [{"action_id": "fa_max_skip", "value": json.dumps({"item_id": item_id, "action": "skip"})}]}
+        with patch("src.services.relay.queue.get_db_context", _same_session), \
+                patch.object(admin_router, "_relay_approver_authorized", return_value=True), \
+                patch.object(admin_router, "_update_relay_slack_message"):
+            return admin_router._handle_relay_skip(payload)
+
+    def _decision(self, db, item_id: int):
+        return db.execute(text("SELECT status, decided_by, decided_at FROM relay_approval_queue WHERE id = :id"),
+                          {"id": item_id}).mappings().one()
+
+    def test_slack_skip_of_revised_draft_is_logged_and_counted(self, queue_db, person_id):
+        agent = f"t32_skip_{uuid.uuid4().hex[:8]}"
+        item_id = _seed(queue_db, person_id, agent=agent, status="pending", revisions=1, material=True,
+                        original="Hi Mike,\nThe flip closes at $300,000.\nBest, Josh",
+                        final="Hi Mike,\nThe flip closes at $250,000.\nBest, Josh")
+
+        assert self._skip_via_slack(queue_db, item_id) == {"ok": True}
+
+        row = self._decision(queue_db, item_id)
+        assert row["status"] == "skipped"
+        assert row["decided_by"] == "U_JOSH"
+        assert row["decided_at"] is not None
+        start, end = iso_week_bounds(row["decided_at"])
+        assert [e.item_id for e in get_edit_log(queue_db, window_start=start, window_end=end, agent_name=agent)] == [item_id]
+        assert get_weekly_edit_rate(agent, "A", queue_db, week_start=start, week_end=end) == 1.0
+
+    def test_engine_skip_keeps_the_approval_decision(self, queue_db, person_id):
+        from src.services.relay import queue as relay_queue
+
+        approved_at = datetime(2026, 9, 21, 15, 0, tzinfo=timezone.utc)
+        item_id = _seed(queue_db, person_id, agent="t32_engine_skip", status="approved",
+                        decided_at=approved_at, decided_by="U_APPROVER", original="draft")
+
+        @contextmanager
+        def _same_session():
+            yield queue_db
+
+        with patch("src.services.relay.queue.get_db_context", _same_session):
+            assert relay_queue.mark_skipped(item_id, "guard_block:suppressed") is True
+
+        row = self._decision(queue_db, item_id)
+        assert row["status"] == "skipped"
+        assert row["decided_by"] == "U_APPROVER"
+        assert row["decided_at"] == approved_at

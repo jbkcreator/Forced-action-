@@ -2379,7 +2379,7 @@ def _handle_relay_skip(payload: dict) -> dict:
     if existing is None:
         return _slack_ephemeral(f"Item #{item_id} not found.")
 
-    ok = relay_queue.mark_skipped(item_id, f"slack_skip:{user_id}")
+    ok = relay_queue.mark_skipped(item_id, f"slack_skip:{user_id}", decided_by=user_id)
     if not ok:
         return _slack_ephemeral(
             f"Item #{item_id} could not be skipped — it may already be decided, "

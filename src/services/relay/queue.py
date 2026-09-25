@@ -1035,7 +1035,7 @@ def record_revision(
         return _row_to_item(dict(row)) if row else None
 
 
-def mark_skipped(item_id: int, reason: str) -> bool:
+def mark_skipped(item_id: int, reason: str, *, decided_by: Optional[str] = None) -> bool:
     """Transitions a 'pending' or 'approved' row to 'skipped' -- guarded so a
     row that has already reached a terminal state (sent/failed/skipped) can
     never be downgraded. Without this guard, calling mark_skipped() on a row
@@ -1052,18 +1052,27 @@ def mark_skipped(item_id: int, reason: str) -> bool:
     can Skip a card still awaiting approval (the Slack Skip button), not
     only the execution engine's own skip-at-send-time path on already
     'approved' rows -- 'pending' is not a terminal state, so allowing it
-    here does not reopen the RELAY-v2.2 bug this guard exists for."""
+    here does not reopen the RELAY-v2.2 bug this guard exists for.
+
+    `decided_by` (WP-T3-2) marks a human Skip as a decision: decided_by /
+    decided_at are stamped only where still NULL, so a skip of a pending card
+    enters the edit-rate population while an engine skip of an already-
+    approved row keeps the approval that preceded it."""
     with get_db_context() as session:
         result = session.execute(
             text(
                 "UPDATE relay_approval_queue SET status = :status, "
-                "error = :error, updated_at = now() "
+                "error = :error, updated_at = now(), "
+                "decided_by = COALESCE(decided_by, :decided_by), "
+                "decided_at = CASE WHEN CAST(:decided_by AS text) IS NOT NULL "
+                "THEN COALESCE(decided_at, now()) ELSE decided_at END "
                 "WHERE id = :id AND status IN (:approved, :pending) "
                 "AND (venture_key <> 'fa_max_lending' OR batch_id IS NULL)"
             ),
             {
                 "status": STATUS_SKIPPED,
                 "error": reason,
+                "decided_by": decided_by,
                 "id": item_id,
                 "approved": STATUS_APPROVED,
                 "pending": STATUS_PENDING,
