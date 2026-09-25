@@ -727,12 +727,6 @@ class AppSettings(BaseSettings):
 	# (cold-outreach draft approvals) nor relay's (per-item sends) — the dial
 	# list is a read-only ranked calling aid, a distinct review surface.
 	dial_list_slack_channel: str = Field(default="", env="DIAL_LIST_SLACK_CHANNEL")
-	# App-level token (xapp-…, scope connections:write) for the dial-list action
-	# listener's Socket Mode connection — only the interactive button/thread
-	# handler needs it; the read-only digest does not. Unset → listener no-ops.
-	dial_list_slack_app_token: Optional[SecretStr] = Field(
-		default=None, env="DIAL_LIST_SLACK_APP_TOKEN"
-	)
 	# The single operator (Josh) allowed to act on dial-list cards; a tap from
 	# anyone else is ignored. Unset → no gate (dev/local only).
 	dial_list_approver_user_id: str = Field(
@@ -893,6 +887,12 @@ class AppSettings(BaseSettings):
 	# _reject_if_wrong_command_channel / _listen_channel). Also the channel
 	# the WP-T2-12 LLM responder points CC_QUERY messages to.
 	fa_max_slack_cc_channel: Optional[str] = Field(default=None, env="FA_MAX_SLACK_CC_CHANNEL")
+	# When True: Relay listener owns the sole Socket Mode connection; it forwards
+	# CC channel messages to cc:events and Cora's worker opens no socket.
+	# Default False so the flag must be explicitly enabled post-deploy (see rollout
+	# guide in FA Max Slack Single-Socket Fix v2.md). Set to True only after
+	# confirming no developer machine holds an extra prod-token connection.
+	fa_max_slack_single_socket: bool = Field(default=False, env="FA_MAX_SLACK_SINGLE_SOCKET")
 
 	# WP-T2-11: minimum expected revenue (cents) for an in-box opportunity to be green.
 	# Confirm launch value with Josh; placeholder = $150 commission dollars (15% × ~$1k).

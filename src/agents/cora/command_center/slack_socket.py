@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +90,87 @@ def _handle_message(event: dict) -> None:
         )
     else:
         logger.warning("cc.socket: publish_query failed for ts=%s", ts)
+
+
+_DEDUP_TTL_S = 600
+
+
+def init_forwarder(web_client: Any) -> bool:
+    """Prepare this module for an external socket owner (Relay listener).
+
+    Called once from Relay's run() when FA_MAX_SLACK_SINGLE_SOCKET is True.
+    Resolves the bot user ID so forward_message can filter the bot's own
+    replies. Returns False (and logs an ERROR) when the channel is unset or
+    the bot ID cannot be resolved — in both cases nothing is forwarded and
+    Relay's existing handlers are unaffected.
+    """
+    global _BOT_USER_ID
+    if not _listen_channel():
+        logger.error(
+            "cc.socket: FA_MAX_SLACK_CC_CHANNEL unset, refusing to forward — "
+            "without a channel filter _handle_message passes every channel, "
+            "so Cora would answer in MONEY/EXCEPTIONS/RELATIONSHIPS too"
+        )
+        return False
+    _BOT_USER_ID = resolve_bot_user_id(web_client)
+    if not _BOT_USER_ID:
+        logger.error(
+            "cc.socket: cannot resolve bot user ID — CC forwarding disabled "
+            "(an unfiltered listener re-ingests the bot's own replies as questions)"
+        )
+        return False
+    return True
+
+
+def forward_message(event: dict, event_id: Optional[str]) -> None:
+    """Filter, dedupe and publish one message event to cc:events. Never raises.
+
+    Called by Relay's _on_cc_message after the envelope has already been
+    acked, so a slow Redis call here cannot make Slack time out or redeliver.
+    Channel and bot_id checks run before any Redis call.
+    """
+    try:
+        if event.get("channel") != _listen_channel() or event.get("bot_id"):
+            return
+        if _BOT_USER_ID and event.get("user") == _BOT_USER_ID:
+            return
+        if not _first_delivery(event_id):
+            return
+        _handle_message(event)
+    except Exception:
+        logger.exception("cc.socket: forward_message raised ts=%s", event.get("ts"))
+
+
+def _first_delivery(event_id: Optional[str]) -> bool:
+    """Return True and mark seen on first delivery; False on a duplicate.
+
+    Falls through to True (allow) when event_id is absent or Redis is down
+    so a Redis outage never silently drops questions. Clicks are already
+    idempotent at the queue-row CAS level and do not call this path.
+    """
+    if not event_id:
+        return True
+    from src.core.redis_client import get_redis
+
+    r = get_redis()
+    if r is None:
+        return True
+    try:
+        return bool(r.set(f"cc:seen:{event_id}", 1, nx=True, ex=_DEDUP_TTL_S))
+    except Exception:
+        logger.warning("cc.socket: dedup check failed event_id=%s", event_id)
+        return True
+
+
+def resolve_bot_user_id(web_client: Any) -> Optional[str]:
+    """Resolve the bot's own Slack user ID, needed to filter its own replies.
+
+    Thin public re-export so Relay's run() can call init_forwarder() without
+    importing bot_identity directly (keeping relay independent of Cora internals).
+    Delegates to the canonical implementation in bot_identity.py.
+    """
+    from src.agents.cora.command_center.bot_identity import resolve_bot_user_id as _resolve
+    return _resolve(web_client)
 
 
 def run_socket_mode(stop_event: threading.Event) -> None:

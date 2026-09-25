@@ -2037,12 +2037,19 @@ def _fa_max_channel_lane_map() -> dict[str, str]:
     map the empty string to a lane.
     """
     mapping: dict[str, str] = {}
-    for attr, lane in (
+    lanes = [
         ("fa_max_slack_channel_money", "MONEY"),
         ("fa_max_slack_channel_exceptions", "EXCEPTIONS"),
         ("fa_max_slack_channel_relationships", "RELATIONSHIPS"),
-        ("fa_max_slack_cc_channel", "CC"),
-    ):
+    ]
+    # With FA_MAX_SLACK_SINGLE_SOCKET=True, Cora owns #fa-max-command-center
+    # exclusively: messages are forwarded by the Relay listener into cc:events,
+    # and this responder must not answer them (each question would get two replies).
+    # With the flag off (default / rollback), CC stays in the lane map and Relay's
+    # WP-T2-12 responder answers CC questions as it does today.
+    if not settings.fa_max_slack_single_socket:
+        lanes.append(("fa_max_slack_cc_channel", "CC"))
+    for attr, lane in lanes:
         channel_id = getattr(settings, attr, "") or ""
         if channel_id:
             mapping[channel_id] = lane

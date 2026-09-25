@@ -302,6 +302,22 @@ def handle_socket_request(client: Any, request: Any) -> bool:
         _post_socket_ephemeral(client, payload, result)
         return True
 
+    # Dial List card buttons — cards are posted by the FA Max bot (delivery.py)
+    # so their block_actions envelopes arrive here. No separate listener handled
+    # them before; without this branch every dial_* click was silently dropped.
+    # Runs regardless of FA_MAX_SLACK_SINGLE_SOCKET (always was the right home).
+    if action_id and action_id.startswith("dial_"):
+        from src.services.dial_list.actions import handle_action as _dial_handle_action
+
+        logger.info("[RelaySocket] dial-list action: action_id=%s user=%s", action_id, user_id)
+        with get_db_context() as db:
+            _dial_handle_action(
+                payload, db,
+                approver_id=get_settings().dial_list_approver_user_id,
+                client=client.web_client,
+            )
+        return True
+
     # Relay approve/reject
     if action_id not in {"approve", "reject"}:
         return False
@@ -497,6 +513,28 @@ def run() -> None:
     socket.socket_mode_request_listeners.append(_on_request)
     socket.socket_mode_request_listeners.append(_on_tracked_link_request)
     socket.socket_mode_request_listeners.append(_on_fa_max_slash_request)
+
+    # FA_MAX_SLACK_SINGLE_SOCKET: Relay is the sole socket owner. Forward CC
+    # channel messages to Cora's cc:events stream so Cora's worker handles them.
+    # Registered LAST so it runs after _on_request has already acked the envelope
+    # — a slow Redis call here cannot delay the ack or cause Slack to redeliver.
+    if get_settings().fa_max_slack_single_socket:
+        from src.agents.cora.command_center import slack_socket as cc_socket
+
+        if cc_socket.init_forwarder(web):
+            def _on_cc_message(client: Any, request: Any) -> None:
+                if request.type != "events_api":
+                    return
+                payload = request.payload or {}
+                event = payload.get("event") or {}
+                if event.get("type") == "message":
+                    cc_socket.forward_message(event, payload.get("event_id"))
+
+            socket.socket_mode_request_listeners.append(_on_cc_message)
+            logger.info("[RelaySocket] CC forwarding enabled")
+        else:
+            logger.error("[RelaySocket] CC forwarding disabled: see cc.socket error above")
+
     logger.info("[RelaySocket] connecting via Socket Mode")
     socket.connect()
 
