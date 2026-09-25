@@ -12,8 +12,13 @@ FA Max Slack Single-Socket Fix — automated tests covering:
   8. Same event_id twice → publish_query once.
   9. Redis unavailable → click commits; CC message logs warning without raise.
   10. Flag on → worker.main() starts no listener thread, shuts down cleanly.
-  11. Flag off → Relay registers no CC forwarder.
-  12. dial_won envelope → handle_action called.
+  11. Flag off/on → run()'s actual registered listener list (obtained by
+      calling run() itself, not a manual reconstruction) has the right
+      members in the right order; the real _on_cc_message/_on_request
+      callbacks it built are dispatched with full envelopes to prove the
+      wiring itself (not just the underlying helpers) is correct.
+  12. dial_won envelope → handle_action called; error/ignored dial results
+      post ephemeral feedback instead of being silently discarded post-ack.
 """
 from __future__ import annotations
 
@@ -395,9 +400,15 @@ class TestWorkerMainNoListenerWhenFlagOn:
 # ---------------------------------------------------------------------------
 
 class TestRelayDoesNotRegisterForwarderWhenFlagOff:
-    def test_no_cc_forwarder_when_flag_off(self):
+    def _run_with_flag(self, flag: bool):
+        """Actually invoke socket_listener.run() and capture the listener
+        list it builds, patching the module's own already-imported
+        get_settings binding (not config.settings.get_settings, which run()
+        never calls — `from config.settings import get_settings` binds the
+        name into this module's namespace at import time)."""
         class FakeSocket:
-            socket_mode_request_listeners: list = []
+            def __init__(self):
+                self.socket_mode_request_listeners: list = []
 
             def connect(self):
                 pass
@@ -405,7 +416,7 @@ class TestRelayDoesNotRegisterForwarderWhenFlagOff:
         fake_socket = FakeSocket()
 
         with (
-            mock.patch("config.settings.get_settings") as mock_settings,
+            mock.patch("src.services.relay.socket_listener.get_settings") as mock_settings,
             mock.patch("slack_sdk.WebClient"),
             mock.patch("slack_sdk.socket_mode.SocketModeClient", return_value=fake_socket),
             mock.patch("threading.Event"),
@@ -413,17 +424,104 @@ class TestRelayDoesNotRegisterForwarderWhenFlagOff:
             s = mock_settings.return_value
             s.fa_max_slack_app_token.get_secret_value.return_value = "xapp-test"
             s.fa_max_slack_bot_token.get_secret_value.return_value = "xoxb-test"
-            s.fa_max_slack_single_socket = False
+            s.fa_max_slack_single_socket = flag
 
             from src.services.relay import socket_listener
-            try:
-                socket_listener.run()
-            except Exception:
-                pass
+            socket_listener.run()  # must not raise; no swallowing here
 
-        # Should only have the 3 standard listeners, no CC forwarder
-        names = [getattr(l, "__name__", "") for l in fake_socket.socket_mode_request_listeners]
-        assert not any("cc_message" in n for n in names)
+        return fake_socket.socket_mode_request_listeners
+
+    def test_no_cc_forwarder_when_flag_off(self):
+        listeners = self._run_with_flag(False)
+
+        # Exactly the 3 standard listeners registered, in the fixed order
+        # run() appends them, no CC forwarder appended at all.
+        names = [getattr(l, "__name__", "") for l in listeners]
+        assert names == ["_on_request", "_on_tracked_link_request", "_on_fa_max_slash_request"]
+
+    def test_cc_forwarder_registered_last_when_flag_on(self):
+        with mock.patch(
+            "src.agents.cora.command_center.slack_socket.init_forwarder",
+            return_value=True,
+        ):
+            listeners = self._run_with_flag(True)
+
+        names = [getattr(l, "__name__", "") for l in listeners]
+        assert names == [
+            "_on_request", "_on_tracked_link_request",
+            "_on_fa_max_slash_request", "_on_cc_message",
+        ]
+
+    def test_registered_cc_callback_dispatches_full_envelope(self):
+        """Obtain the real _on_cc_message callback run() registered (not a
+        direct call to forward_message) and dispatch a full events_api
+        request through it, proving the actual wiring — not just the
+        underlying helper — reaches publish_query."""
+        with (
+            mock.patch(
+                "src.agents.cora.command_center.slack_socket.init_forwarder",
+                return_value=True,
+            ),
+            mock.patch(
+                "src.agents.cora.command_center.slack_socket._listen_channel",
+                return_value="C_CC",
+            ),
+            mock.patch(
+                "src.agents.cora.command_center.slack_socket._BOT_USER_ID", "U_BOT",
+            ),
+            mock.patch("src.core.redis_client.get_redis", return_value=fakeredis.FakeRedis()),
+            mock.patch(
+                "src.agents.cora.command_center.worker.publish_query", return_value="m1",
+            ) as mock_pub,
+        ):
+            listeners = self._run_with_flag(True)
+            cc_callback = listeners[-1]
+            assert cc_callback.__name__ == "_on_cc_message"
+
+            event = {"type": "message", "channel": "C_CC", "user": "U_JOSH", "text": "q?", "ts": "9.0"}
+            req = _request("events_api", "env-real-wire-1", {"event": event, "event_id": "EvRealWire1"})
+            cc_callback(mock.MagicMock(), req)
+
+        mock_pub.assert_called_once()
+
+    def test_registered_request_callback_acks_before_cc_forward(self):
+        """Full-chain ordering: dispatch through the two real callbacks
+        run() built (_on_request then _on_cc_message), not manual calls to
+        handle_socket_request/forward_message in isolation."""
+        order = []
+
+        with (
+            mock.patch(
+                "src.agents.cora.command_center.slack_socket.init_forwarder",
+                return_value=True,
+            ),
+            mock.patch(
+                "src.agents.cora.command_center.slack_socket._listen_channel",
+                return_value="C_CC",
+            ),
+            mock.patch(
+                "src.agents.cora.command_center.slack_socket._BOT_USER_ID", "U_BOT",
+            ),
+            mock.patch("src.core.redis_client.get_redis", return_value=fakeredis.FakeRedis()),
+            mock.patch(
+                "src.agents.cora.command_center.worker.publish_query",
+                side_effect=lambda **_kw: order.append("forward") or "m1",
+            ),
+            mock.patch("src.api.admin_router._handle_relay_thread_action"),
+        ):
+            listeners = self._run_with_flag(True)
+            on_request, on_cc_message = listeners[0], listeners[-1]
+
+            client = mock.MagicMock()
+            client.send_socket_mode_response.side_effect = lambda resp: order.append("ack")
+
+            event = {"type": "message", "channel": "C_CC", "user": "U_JOSH", "text": "q?", "ts": "9.1"}
+            req = _request("events_api", "env-real-wire-2", {"event": event, "event_id": "EvRealWire2"})
+
+            on_request(client, req)
+            on_cc_message(client, req)
+
+        assert order == ["ack", "forward"]
 
 
 # ---------------------------------------------------------------------------
@@ -431,17 +529,15 @@ class TestRelayDoesNotRegisterForwarderWhenFlagOff:
 # ---------------------------------------------------------------------------
 
 class TestDialListRoutedToHandler:
-    def test_dial_won_reaches_handle_action(self):
+    def _dispatch(self, action_id: str, mock_result):
         client = mock.MagicMock()
         payload = {
             "type": "block_actions",
-            "actions": [{"action_id": "dial_won", "value": "{}"}],
+            "actions": [{"action_id": action_id, "value": "{}"}],
             "user": {"id": "U_JOSH"},
             "channel": {"id": "C_MONEY"},
         }
         req = _request("interactive", "env-dial-1", payload)
-
-        mock_result = mock.Mock(status="completed", kind="won", message="")
 
         with (
             mock.patch(
@@ -449,7 +545,12 @@ class TestDialListRoutedToHandler:
                 return_value=mock_result,
             ) as mock_handle,
             mock.patch("src.core.database.get_db_context") as mock_db,
-            mock.patch("config.settings.get_settings") as mock_gs,
+            # socket_listener.py does `from config.settings import get_settings`,
+            # so the patch target must be the module's own bound name, exactly
+            # like the run()-registration binding bug fixed above — patching
+            # config.settings.get_settings here would silently use the real
+            # settings object and make the approver_id assertion below vacuous.
+            mock.patch("src.services.relay.socket_listener.get_settings") as mock_gs,
         ):
             mock_gs.return_value.dial_list_approver_user_id = "U_JOSH"
             mock_db.return_value.__enter__ = mock.Mock(return_value=mock.MagicMock())
@@ -458,5 +559,45 @@ class TestDialListRoutedToHandler:
             from src.services.relay import socket_listener
             result = socket_listener.handle_socket_request(client, req)
 
+        return result, client, mock_handle
+
+    def test_dial_won_reaches_handle_action(self):
+        mock_result = mock.Mock(status="recorded", kind="won", message="")
+        result, client, mock_handle = self._dispatch("dial_won", mock_result)
+
         assert result is True
         mock_handle.assert_called_once()
+        assert mock_handle.call_args.kwargs["approver_id"] == "U_JOSH"
+        # Success: no error/ignored feedback posted to the user.
+        client.web_client.chat_postEphemeral.assert_not_called()
+
+    def test_dial_action_error_result_posts_ephemeral_feedback(self):
+        """Regression for review finding: a Dial action's error/ignored result
+        was previously discarded silently after the envelope was already
+        acked, leaving the operator with no feedback at all."""
+        mock_result = mock.Mock(status="error", kind="won", message="touch persistence failed")
+        result, client, _ = self._dispatch("dial_won", mock_result)
+
+        assert result is True
+        client.web_client.chat_postEphemeral.assert_called_once()
+        kwargs = client.web_client.chat_postEphemeral.call_args.kwargs
+        assert kwargs["channel"] == "C_MONEY"
+        assert kwargs["user"] == "U_JOSH"
+        assert "touch persistence failed" in kwargs["text"]
+
+    def test_dial_action_ignored_result_posts_ephemeral_feedback(self):
+        mock_result = mock.Mock(status="ignored", kind=None, message="no approver configured")
+        result, client, _ = self._dispatch("dial_won", mock_result)
+
+        assert result is True
+        client.web_client.chat_postEphemeral.assert_called_once()
+        assert "no approver configured" in client.web_client.chat_postEphemeral.call_args.kwargs["text"]
+
+    def test_dial_touched_result_posts_no_ephemeral(self):
+        """A non-terminal touch (called/skip) is a success path — must not
+        also spam an ephemeral message."""
+        mock_result = mock.Mock(status="touched", kind="called", message=None)
+        result, client, _ = self._dispatch("dial_called", mock_result)
+
+        assert result is True
+        client.web_client.chat_postEphemeral.assert_not_called()

@@ -311,10 +311,19 @@ def handle_socket_request(client: Any, request: Any) -> bool:
 
         logger.info("[RelaySocket] dial-list action: action_id=%s user=%s", action_id, user_id)
         with get_db_context() as db:
-            _dial_handle_action(
+            dial_result = _dial_handle_action(
                 payload, db,
                 approver_id=get_settings().dial_list_approver_user_id,
                 client=client.web_client,
+            )
+        if dial_result.status in ("error", "ignored"):
+            logger.warning(
+                "[RelaySocket] dial-list action %s not applied: status=%s message=%s",
+                action_id, dial_result.status, dial_result.message,
+            )
+            _post_socket_ephemeral(
+                client, payload,
+                {"text": dial_result.message or "Could not apply that action."},
             )
         return True
 
