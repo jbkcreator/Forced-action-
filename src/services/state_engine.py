@@ -1475,6 +1475,54 @@ def complete_work_item(
     return result.rowcount > 0
 
 
+def reactivate_failed_work_items(
+    *, session: Session, queue_name: str, limit: int = 500,
+) -> int:
+    """Return terminally-'failed' work items in this queue to 'available'
+    for reclaiming, by resetting the SAME row — not by re-inserting.
+
+    idempotency_key is UNIQUE with no status scoping (see
+    apply_fa_max_wp1_remaining.py) — that's deliberate for its normal job
+    (a retried/re-delivered trigger producing a duplicate enqueue attempt
+    must be a no-op), but it also means a caller that hits
+    MAX_TRANSIENT_ATTEMPTS and lets an item terminally fail has NO way to
+    recover it by enqueuing again: the conflicting idempotency_key makes
+    every subsequent enqueue attempt for that exact (entity, revision)
+    combination silently do nothing (code-review finding, fourth round,
+    2026-09 — found via src.agents.fa_max.qualification_worker's backstop
+    sweep, which had no way to recover a permanently-failed qualification
+    item even when it correctly identified the opportunity as needing
+    reevaluation). Reactivating the existing row sidesteps the unique
+    constraint entirely — there is no new INSERT.
+
+    Returns the count reactivated. Bounded by `limit` — callers doing a
+    startup sweep should call this in a loop the same way they paginate
+    other backstop queries, not assume every failed item is caught by one
+    call on a queue that could have accumulated more than `limit`.
+    """
+    result = session.execute(
+        text("""
+            UPDATE fa_max_work_queue
+            SET status           = 'available',
+                worker_id        = NULL,
+                claimed_at       = NULL,
+                lease_expires_at = NULL,
+                done_at          = NULL,
+                attempt_count    = 0,
+                updated_at       = NOW()
+            WHERE work_item_id IN (
+                SELECT work_item_id FROM fa_max_work_queue
+                WHERE queue_name = :queue_name AND status = 'failed'
+                ORDER BY updated_at ASC
+                LIMIT :limit
+                FOR UPDATE SKIP LOCKED
+            )
+        """),
+        {"queue_name": queue_name, "limit": limit},
+    )
+    return result.rowcount
+
+
 def reclaim_expired_work_items(
     *,
     session: Session,

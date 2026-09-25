@@ -234,6 +234,129 @@ def enqueue_and_attempt(*, venture_key: str, rule: str, message: str) -> bool:
         return False
 
 
+def enqueue_pending(*, session, venture_key: str, rule: str, message: str) -> Optional[int]:
+    """Durably record a 'pending' alert row WITHOUT attempting delivery, as
+    part of the CALLER's own transaction — the caller controls commit, and
+    is responsible for delivering it afterward (see attempt_delivery()).
+
+    Added for the T3-7 qualification worker (code-review finding, sixth
+    round, 2026-09): that caller needs this INSERT to be atomic with a
+    FOR UPDATE lock it already holds on a DIFFERENT row (the opportunity's
+    facts_revision, to guard against an out-of-order stale evaluation) —
+    enqueue_and_attempt() always commits (releasing any caller-held lock)
+    before it returns, so it can't be used for that. This function commits
+    nothing; a caller that wants the earlier "insert + immediately attempt"
+    behavior should keep using enqueue_and_attempt() instead — this pair
+    only exists for a caller that needs the insert coupled to its own
+    lock/transaction and the delivery attempt to happen strictly after.
+
+    Same dedup semantics as enqueue_and_attempt() (via the same
+    _recently_queued() check and the same partial unique index as the
+    backstop). Returns the new row's id, or None if a pending/recently-sent
+    row for this (venture_key, rule) already exists — including via a
+    concurrent INSERT racing this one.
+
+    Uses INSERT ... ON CONFLICT ... DO NOTHING against the exact partial
+    unique index (ux_fa_max_exceptions_alert_queue_pending_dedup), not a
+    try/except IntegrityError (code-review finding, seventh round,
+    2026-09): catching the exception in Python does NOT clear Postgres's
+    aborted-transaction state — every statement after it in the SAME
+    transaction, including the caller's own commit, would fail with
+    InFailedSqlTransaction, discarding whatever durable work (e.g. the
+    cancellation this function is meant to be atomic WITH) the caller had
+    already done in that same transaction. ON CONFLICT DO NOTHING never
+    raises for the collision it's declared against, so this needs no
+    rollback or savepoint at all — the caller's transaction stays healthy
+    regardless of which branch this takes.
+    """
+    if _recently_queued(session, venture_key=venture_key, rule=rule):
+        logger.info(
+            "[Relay][EXCEPTIONS] %s (venture=%s) already queued/sent within %dh — skipping",
+            rule, venture_key, DEDUP_WINDOW_HOURS,
+        )
+        return None
+    row_id = session.execute(
+        text(
+            "INSERT INTO fa_max_exceptions_alert_queue "
+            "(venture_key, rule, message, status) "
+            "VALUES (:venture, :rule, :message, 'pending') "
+            "ON CONFLICT (venture_key, rule) WHERE status = 'pending' DO NOTHING "
+            "RETURNING id"
+        ),
+        {"venture": venture_key, "rule": rule, "message": message},
+    ).scalar_one_or_none()
+    if row_id is None:
+        logger.info(
+            "[Relay][EXCEPTIONS] %s (venture=%s) already queued by a concurrent "
+            "caller (unique constraint) — skipping",
+            rule, venture_key,
+        )
+        return None
+    return row_id
+
+
+def attempt_delivery(row_id: int, *, venture_key: str, rule: str, message: str) -> bool:
+    """Claim and deliver an already-durably-recorded pending row (see
+    enqueue_pending()). Never raises — same guarantee as
+    enqueue_and_attempt(). Returns True if this call delivered it."""
+    try:
+        if not _claim_row(row_id):
+            logger.info(
+                "[Relay][EXCEPTIONS] alert id=%d rule=%s claimed by a concurrent "
+                "worker before this attempt — leaving it to them",
+                row_id, rule,
+            )
+            return False
+        return _attempt(row_id, venture_key=venture_key, rule=rule, message=message, attempts_so_far=0)
+    except Exception:
+        logger.exception(
+            "[Relay][EXCEPTIONS] attempt_delivery failed for id=%d rule=%s (venture=%s)",
+            row_id, rule, venture_key,
+        )
+        return False
+
+
+def cancel_pending_alert(*, venture_key: str, rule: str) -> bool:
+    """Cancel a still-pending, unclaimed EXCEPTIONS alert by (venture_key, rule).
+
+    Called by the qualification worker when the gap set for an opportunity changes,
+    so a superseded "A+B gaps" alert can't outlive the narrower "B only" one that
+    replaces it (WP-T3-7 gap-hash supersession — see qualification_worker.py).
+
+    Guarantee: cancellation prevents FUTURE delivery attempts on unclaimed rows.
+    A row already claimed and mid-_attempt() may still complete — this is the
+    accepted duplicate-delivery trade-off documented on this module's class docstring.
+
+    Returns True if a row was cancelled, False if no unclaimed pending row was found
+    (already sent, already cancelled, claimed by another worker, or never existed).
+
+    NOTE: requires apply_fa_max_opportunity_facts.py migration to have been applied
+    first — that migration adds 'cancelled' to the status CHECK constraint.
+    """
+    with get_db_context() as session:
+        row_id = session.execute(
+            text(
+                "UPDATE fa_max_exceptions_alert_queue"
+                " SET status = 'cancelled'"
+                " WHERE venture_key = :venture AND rule = :rule"
+                " AND status = 'pending'"
+                " AND (claimed_until IS NULL OR claimed_until < now())"
+                " RETURNING id"
+            ),
+            {"venture": venture_key, "rule": rule},
+        ).scalar_one_or_none()
+        session.commit()
+
+    if row_id is not None:
+        logger.info(
+            "[Relay][EXCEPTIONS] cancel_pending_alert: cancelled id=%d rule=%s"
+            " venture=%s",
+            row_id, rule, venture_key,
+        )
+        return True
+    return False
+
+
 def drain_pending(*, limit: int = 50) -> int:
     """Retry every still-'pending', unclaimed alert, oldest first. Called by
     the standalone drain task on a short cron cycle. Returns the number of
