@@ -1463,6 +1463,69 @@ class TestReactivateFailedWorkItems:
         assert second is None  # confirms the recovery gap this fix addresses
 
 
+class TestReclaimDoesNotDoubleCountAttempts:
+    def test_real_claim_fail_reclaim_cycle_reaches_permanent_failure_after_max_attempts_not_before(
+        self, fresh_db,
+    ):
+        """code-review finding, 2026-09: reclaim_expired_work_items() used to
+        increment attempt_count on top of claim_next_work_item()'s own
+        increment, so a transiently-failing item hit
+        qualification_worker.MAX_TRANSIENT_ATTEMPTS (5) after only 3 real
+        processing attempts (claim=1, reclaim=2, claim=3, reclaim=4,
+        claim=5 -> 5 < 5 is False). Drives a real claim -> simulated
+        exception -> lease expiry -> reclaim -> claim cycle through
+        MAX_TRANSIENT_ATTEMPTS genuine attempts and asserts attempt_count
+        lands exactly on the real attempt number at each claim, not double."""
+        from src.services.state_engine import (
+            enqueue_work_item, claim_next_work_item, reclaim_expired_work_items,
+        )
+        from src.agents.fa_max.qualification_worker import MAX_TRANSIENT_ATTEMPTS
+
+        work_item_id = enqueue_work_item(
+            session=fresh_db, queue_name="fa_max_qualification",
+            payload={"opportunity_id": "opp-reclaim-double-count-test", "facts_revision": 1},
+        )
+        fresh_db.flush()
+
+        for real_attempt in range(1, MAX_TRANSIENT_ATTEMPTS + 1):
+            claimed = claim_next_work_item(
+                session=fresh_db, queue_name="fa_max_qualification", worker_id="test-worker",
+            )
+            assert claimed["work_item_id"] == work_item_id
+            assert claimed["attempt_count"] == real_attempt, (
+                f"real attempt #{real_attempt} landed on attempt_count="
+                f"{claimed['attempt_count']} -- reclaim is double-counting again"
+            )
+
+            if real_attempt == MAX_TRANSIENT_ATTEMPTS:
+                break  # worker's own logic would permanently-fail here, not reclaim
+
+            # Simulate the worker hitting a transient exception and leaving
+            # the item claimed for its lease to expire, then simulate the
+            # lease actually expiring (no real 120s sleep in a test).
+            fresh_db.execute(
+                text(
+                    "UPDATE fa_max_work_queue SET lease_expires_at = NOW() - INTERVAL '1 second'"
+                    " WHERE work_item_id = :id ::uuid"
+                ),
+                {"id": work_item_id},
+            )
+            fresh_db.flush()
+            n = reclaim_expired_work_items(session=fresh_db, queue_name="fa_max_qualification")
+            assert n == 1
+            fresh_db.flush()
+
+        # After exactly MAX_TRANSIENT_ATTEMPTS real claims, attempt_count must
+        # equal MAX_TRANSIENT_ATTEMPTS -- not 2x-1 as it would with the bug.
+        row = fresh_db.execute(
+            text(
+                "SELECT attempt_count FROM fa_max_work_queue WHERE work_item_id = :id ::uuid"
+            ),
+            {"id": work_item_id},
+        ).mappings().first()
+        assert row["attempt_count"] == MAX_TRANSIENT_ATTEMPTS
+
+
 class TestSufficientPendingContractDispatch:
     def test_no_transition_no_enqueue_no_alert(self):
         """code-review finding, fourth round, 2026-09: a 'sufficient_pending_

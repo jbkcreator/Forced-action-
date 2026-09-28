@@ -1531,8 +1531,14 @@ def reclaim_expired_work_items(
     """Return expired claimed items back to 'available'. Returns count reclaimed.
 
     Called by a recovery monitor (or the worker on startup) to re-offer items
-    whose workers died or timed out. Reclaim also increments attempt_count so
-    repeated lease failures remain visible to permanent-failure routing.
+    whose workers died or timed out. Does NOT touch attempt_count -- that
+    column already counts real processing attempts via claim_next_work_item's
+    own increment on every claim, including a reclaimed item's next claim.
+    Incrementing it here too double-counts each retry cycle (claim + reclaim
+    both bump it for one real attempt), silently halving a caller's intended
+    retry budget -- e.g. src.agents.fa_max.qualification_worker's
+    MAX_TRANSIENT_ATTEMPTS=5 permanently failed an item after only 3 genuine
+    attempts before this fix (code-review finding, 2026-09).
     """
     result = session.execute(
         text("""
@@ -1541,7 +1547,6 @@ def reclaim_expired_work_items(
                 claimed_at       = NULL,
                 lease_expires_at = NULL,
                 worker_id        = NULL,
-                attempt_count    = attempt_count + 1,
                 updated_at       = NOW()
             WHERE status           = 'claimed'
               AND lease_expires_at < NOW()
