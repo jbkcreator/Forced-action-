@@ -529,10 +529,12 @@ class TestMainRespectsEnabledFlag:
         with patch("src.tasks.property_radar_maturity_pull.settings") as mock_settings, \
              patch("src.tasks.property_radar_maturity_pull.get_db_context") as mock_db, \
              patch("src.tasks.property_radar_maturity_pull._run_pull") as mock_run_pull, \
+             patch("src.tasks.property_radar_maturity_pull.property_radar_lead_handoff") as mock_handoff, \
              patch("src.tasks.property_radar_maturity_pull.ENABLED_STATES", frozenset({"FL"})):
             mock_settings.property_radar_enabled = True
             mock_settings.property_radar_mode = "fake"
             mock_run_pull.return_value = {"run_id": 1}
+            mock_handoff.run.return_value.summary.return_value = "ok"
             self._run_main(["--mode", "daily", "--state", "FL"])
             mock_db.assert_called_once()
 
@@ -548,6 +550,81 @@ class TestMainRespectsEnabledFlag:
             self._run_main(["--dry-run", "--state", "FL"])
             mock_report.assert_called_once()
             mock_db.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Pull -> stage -> handoff chaining (Dev 3 integration): main() must call
+# property_radar_lead_handoff.run() after a successful pull, matching the
+# repo's dry-run-unless-apply sweep convention, without letting a handoff
+# failure retroactively affect the pull's own already-committed success.
+# ---------------------------------------------------------------------------
+
+class TestMainChainsHandoff:
+    def _run_main(self, argv):
+        import sys
+        from src.tasks.property_radar_maturity_pull import main
+        old_argv = sys.argv
+        sys.argv = ["property_radar_maturity_pull.py"] + argv
+        try:
+            main()
+        finally:
+            sys.argv = old_argv
+
+    def _enabled_settings(self, mock_settings):
+        mock_settings.property_radar_enabled = True
+        mock_settings.property_radar_mode = "fake"
+
+    def test_handoff_runs_after_a_successful_pull_dry_run_by_default(self):
+        with patch("src.tasks.property_radar_maturity_pull.settings") as mock_settings, \
+             patch("src.tasks.property_radar_maturity_pull.get_db_context"), \
+             patch("src.tasks.property_radar_maturity_pull._run_pull") as mock_run_pull, \
+             patch("src.tasks.property_radar_maturity_pull.property_radar_lead_handoff") as mock_handoff, \
+             patch("src.tasks.property_radar_maturity_pull.ENABLED_STATES", frozenset({"FL"})):
+            self._enabled_settings(mock_settings)
+            mock_run_pull.return_value = {"run_id": 1}
+            mock_handoff.run.return_value.summary.return_value = "ok"
+            self._run_main(["--mode", "daily", "--state", "FL", "--campaign", "maturity_target_lender"])
+            mock_handoff.run.assert_called_once_with(campaign="maturity_target_lender", apply=False)
+
+    def test_apply_handoff_flag_passes_through(self):
+        with patch("src.tasks.property_radar_maturity_pull.settings") as mock_settings, \
+             patch("src.tasks.property_radar_maturity_pull.get_db_context"), \
+             patch("src.tasks.property_radar_maturity_pull._run_pull") as mock_run_pull, \
+             patch("src.tasks.property_radar_maturity_pull.property_radar_lead_handoff") as mock_handoff, \
+             patch("src.tasks.property_radar_maturity_pull.ENABLED_STATES", frozenset({"FL"})):
+            self._enabled_settings(mock_settings)
+            mock_run_pull.return_value = {"run_id": 1}
+            mock_handoff.run.return_value.summary.return_value = "ok"
+            self._run_main([
+                "--mode", "daily", "--state", "FL",
+                "--campaign", "maturity_target_lender", "--apply-handoff",
+            ])
+            mock_handoff.run.assert_called_once_with(campaign="maturity_target_lender", apply=True)
+
+    def test_skip_handoff_flag_prevents_the_call(self):
+        with patch("src.tasks.property_radar_maturity_pull.settings") as mock_settings, \
+             patch("src.tasks.property_radar_maturity_pull.get_db_context"), \
+             patch("src.tasks.property_radar_maturity_pull._run_pull") as mock_run_pull, \
+             patch("src.tasks.property_radar_maturity_pull.property_radar_lead_handoff") as mock_handoff, \
+             patch("src.tasks.property_radar_maturity_pull.ENABLED_STATES", frozenset({"FL"})):
+            self._enabled_settings(mock_settings)
+            mock_run_pull.return_value = {"run_id": 1}
+            self._run_main(["--mode", "daily", "--state", "FL", "--skip-handoff"])
+            mock_handoff.run.assert_not_called()
+
+    def test_handoff_failure_does_not_propagate(self):
+        """A handoff-layer exception must not crash main() or be raised to the
+        cron wrapper -- the pull_run row is already committed as 'done' by the
+        time this runs, and that success must stand regardless."""
+        with patch("src.tasks.property_radar_maturity_pull.settings") as mock_settings, \
+             patch("src.tasks.property_radar_maturity_pull.get_db_context"), \
+             patch("src.tasks.property_radar_maturity_pull._run_pull") as mock_run_pull, \
+             patch("src.tasks.property_radar_maturity_pull.property_radar_lead_handoff") as mock_handoff, \
+             patch("src.tasks.property_radar_maturity_pull.ENABLED_STATES", frozenset({"FL"})):
+            self._enabled_settings(mock_settings)
+            mock_run_pull.return_value = {"run_id": 1}
+            mock_handoff.run.side_effect = RuntimeError("handoff DB blew up")
+            self._run_main(["--mode", "daily", "--state", "FL"])  # must not raise
 
 
 # ---------------------------------------------------------------------------
