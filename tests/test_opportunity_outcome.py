@@ -9,12 +9,13 @@ import pytest
 from src.services.opportunity_outcome import LOSS_REASON_CODES, record_loss
 
 
-def test_loss_reason_codes_is_the_spec_eight():
+def test_loss_reason_codes_is_the_closed_set():
     assert set(LOSS_REASON_CODES) == {
         "timing", "price", "trust", "fit",
         "no_urgency", "wrong_contact", "competitor", "no_response",
+        "loan_paid_off",
     }
-    assert len(LOSS_REASON_CODES) == 8
+    assert len(LOSS_REASON_CODES) == 9
 
 
 def test_record_loss_rejects_unknown_code_before_touching_db():

@@ -10609,7 +10609,7 @@ class AgentLaneOpportunityOutcome(Base):
         CheckConstraint(
             "(outcome = 'won' AND reason_code IS NULL) OR "
             "(outcome = 'lost' AND reason_code IN "
-            "('timing','price','trust','fit','no_urgency','wrong_contact','competitor','no_response'))",
+            "('timing','price','trust','fit','no_urgency','wrong_contact','competitor','no_response','loan_paid_off'))",
             name="ck_alo_reason_code",
         ),
     )
@@ -12406,7 +12406,9 @@ class PropertyRadarHandoffDecision(Base):
     )
 
 
-# ============================================================================
+# =====================================================================
+
+
 # PropertyRadar ingestion — Developer 1 checkpoint tables
 # ============================================================================
 
@@ -12538,4 +12540,45 @@ class PropertyRadarRecord(Base):
         Index("ix_pr_campaign", "campaign"),
         Index("ix_pr_county_fips", "county_fips"),
         Index("ix_pr_property_id", "property_id"),
+    )
+
+
+class LeadCampaignAssignment(Base):
+    """Which campaign owns a person — at most one active owner per person.
+
+    A person can qualify for several campaigns; the highest-priority one in
+    config/lead_ownership.py owns them. Losers are kept as `blocked`, a former
+    owner displaced by a higher-priority campaign as `preempted` (ownership only
+    moves upward). An active FA Max engine enrollment (fa_max_campaign_enrollments)
+    counts as a competing owner but is never written from here.
+
+    Also carries the lead tag: source (e.g. property_radar) and radar_id, so no
+    campaign/source columns are needed on fa_max_persons or fa_max_opportunities.
+    """
+
+    __tablename__ = "lead_campaign_assignments"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    person_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_persons.person_id", name="fk_lca_person"),
+        nullable=False,
+    )
+    opportunity_id: Mapped[Optional[Any]] = mapped_column(PG_UUID(as_uuid=True))
+    campaign: Mapped[str] = mapped_column(String(60), nullable=False)
+    source: Mapped[str] = mapped_column(String(40), nullable=False)
+    radar_id: Mapped[Optional[str]] = mapped_column(String(50))
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    displaced_by: Mapped[Optional[str]] = mapped_column(String(60))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint("status IN ('active','preempted','blocked')", name="ck_lca_status"),
+        Index("uq_lca_one_active_owner", "person_id", unique=True,
+              postgresql_where=text("status = 'active'")),
+        Index("uq_lca_claim", "person_id", "campaign", text("COALESCE(radar_id, '')"), unique=True),
+        Index("ix_lca_campaign", "campaign"),
     )
