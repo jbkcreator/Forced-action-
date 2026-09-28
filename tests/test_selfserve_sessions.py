@@ -93,6 +93,22 @@ def test_mark_abandoned_never_touches_confirmed_session(fresh_db):
     assert row.status == "confirmed"  # unchanged — a completed form is not abandoned
 
 
+def test_resolve_or_create_person_is_idempotent_on_resubmit(fresh_db):
+    """A double-submit (double click, retry after a timeout, back+resubmit)
+    reuses the same person row instead of raising IntegrityError against
+    fa_max_persons' unique (source, source_reference) index."""
+    first = resolve_or_create_person(fresh_db, source_reference="resubmit-token")
+    second = resolve_or_create_person(fresh_db, source_reference="resubmit-token")
+    assert first == second
+    count = fresh_db.execute(
+        text(
+            "SELECT count(*) FROM fa_max_persons "
+            "WHERE source = 'selfserve_flow' AND source_reference = 'resubmit-token'"
+        )
+    ).scalar_one()
+    assert count == 1
+
+
 def test_list_consented_abandoned_contacts_filters_by_channel(fresh_db):
     person_id = resolve_or_create_person(fresh_db, source_reference="test-consented")
     record_consent(fresh_db, person_id, ["email"])

@@ -10793,6 +10793,10 @@ class FaMaxPerson(Base):
             "ix_fa_max_persons_email", "email",
             postgresql_where=text("email IS NOT NULL"),
         ),
+        Index(
+            "uq_fa_max_persons_source_reference", "source", "source_reference",
+            unique=True, postgresql_where=text("source_reference IS NOT NULL"),
+        ),
     )
 
     def __repr__(self) -> str:
@@ -12483,4 +12487,181 @@ class FaMaxQualificationDecision(Base):
         ),
         Index("ix_fa_max_qd_opp_decided", "opportunity_id", "decided_at"),
         Index("ix_fa_max_qd_opp_rev", "opportunity_id", "facts_revision", "checklist_version"),
+    )
+
+
+class PropertyRadarHandoffDecision(Base):
+    """One handoff decision for a staged PropertyRadar record.
+
+    Append-only. The partial unique index on radar_id (outcome='handed_off')
+    is the durable guarantee that a record reaches FA Max at most once;
+    suppressed and skipped records are re-evaluated on later runs.
+    """
+
+    __tablename__ = "property_radar_handoff_decisions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    radar_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    campaign: Mapped[str] = mapped_column(String(100), nullable=False)
+    county_fips: Mapped[str] = mapped_column(String(5), nullable=False)
+    outcome: Mapped[str] = mapped_column(String(20), nullable=False)
+    reason: Mapped[str] = mapped_column(String(60), nullable=False)
+    person_id: Mapped[Optional[str]] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_persons.person_id", ondelete="SET NULL", name="fk_pr_handoff_person"),
+        nullable=True,
+    )
+    opportunity_id: Mapped[Optional[str]] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_opportunities.opportunity_id", ondelete="SET NULL", name="fk_pr_handoff_opp"),
+        nullable=True,
+    )
+    decided_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "outcome IN ('handed_off', 'suppressed', 'skipped')", name="ck_pr_handoff_outcome"
+        ),
+        Index(
+            "uq_pr_handoff_once", "radar_id", unique=True,
+            postgresql_where=text("outcome = 'handed_off'"),
+        ),
+        Index("ix_pr_handoff_radar_decided", "radar_id", "decided_at"),
+    )
+
+
+# ============================================================================
+# PropertyRadar ingestion — Developer 1 checkpoint tables
+# ============================================================================
+
+class PropertyRadarPullRun(Base):
+    """One row per completed (or in-progress) PropertyRadar pull run.
+
+    Dev 1 owns idempotency: the seen-ids table (property_radar_seen_ids, raw
+    DDL only — no ORM model needed) dedupes radar_ids across runs. If the
+    cross-developer contract meeting (open question #2) resolves that Dev 2's
+    staging table owns seen radar_ids instead, drop property_radar_seen_ids and
+    update the daily-pull query in property_radar_maturity_pull.py — no other
+    callers exist.
+    """
+
+    __tablename__ = "property_radar_pull_runs"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    run_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    state: Mapped[str] = mapped_column(String(2), nullable=False)
+    campaign: Mapped[str] = mapped_column(String(80), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    records_fetched: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    exports_consumed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="running")
+
+    __table_args__ = (
+        CheckConstraint(
+            "run_type IN ('backlog', 'daily')", name="ck_pr_pull_run_type"
+        ),
+        CheckConstraint(
+            "status IN ('running', 'done', 'failed')", name="ck_pr_pull_run_status"
+        ),
+        Index("ix_pr_pull_runs_state_campaign", "state", "campaign"),
+    )
+
+
+# ============================================================================
+# PropertyRadar staging — Developer 2 (property_radar_records)
+# ============================================================================
+
+class PropertyRadarRecord(Base):
+    """Staging table for PropertyRadar records.
+
+    PropertyRadar records are NOT written into `properties` because parcel_id
+    is globally unique across the whole DB while two counties in different
+    states can share the same APN. Deduplication key is (state_fips,
+    county_fips, apn). A nullable property_id links the record to an FA
+    property when the county is loaded (Hillsborough, Pasco, Pinellas); for
+    all other counties the record is stored as-is.
+
+    Change detection tracks ownership and loan transitions so that records
+    already in outreach can be suppressed when the underlying situation
+    changes (sold → new owner, refinanced → old loan gone).
+
+    Future migration path: when per-county uniqueness is added to `properties`
+    and the 522k-row table is migrated, a backfill script can copy these
+    records into `properties` and drop the staging table.
+    """
+
+    __tablename__ = "property_radar_records"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    # --- Deduplication key -------------------------------------------------
+    radar_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    state_fips: Mapped[str] = mapped_column(String(5), nullable=False)
+    county_fips: Mapped[str] = mapped_column(String(5), nullable=False)
+    apn: Mapped[str] = mapped_column(String(100), nullable=False)
+
+    # --- Geography / display -----------------------------------------------
+    state: Mapped[str] = mapped_column(String(2), nullable=False)
+    county_name: Mapped[str] = mapped_column(String(100), nullable=False)
+
+    # --- Property ----------------------------------------------------------
+    property_address: Mapped[Optional[str]] = mapped_column(String(255))
+    city: Mapped[Optional[str]] = mapped_column(String(100))
+    zip: Mapped[Optional[str]] = mapped_column(String(10))
+    property_type: Mapped[Optional[str]] = mapped_column(String(20))
+
+    # --- Ownership ----------------------------------------------------------
+    owner_name: Mapped[Optional[str]] = mapped_column(String(255))
+    ownership_type: Mapped[Optional[str]] = mapped_column(String(50))
+    mailing_address: Mapped[Optional[str]] = mapped_column(String(255))
+    mailing_city: Mapped[Optional[str]] = mapped_column(String(100))
+    mailing_state: Mapped[Optional[str]] = mapped_column(String(2))
+    mailing_zip: Mapped[Optional[str]] = mapped_column(String(10))
+    principal_name: Mapped[Optional[str]] = mapped_column(String(255))
+
+    # --- Loan ---------------------------------------------------------------
+    lender_name: Mapped[Optional[str]] = mapped_column(String(255))
+    loan_amount: Mapped[Optional[int]] = mapped_column(BigInteger)
+    loan_recorded_date: Mapped[Optional[str]] = mapped_column(String(20))
+    loan_term_years: Mapped[Optional[str]] = mapped_column(String(20))
+    est_maturity_date: Mapped[Optional[str]] = mapped_column(String(20))
+    loan_doc_number: Mapped[Optional[str]] = mapped_column(String(100))
+
+    # --- Campaign -----------------------------------------------------------
+    campaign: Mapped[Optional[str]] = mapped_column(String(100))
+
+    # --- FA property link --------------------------------------------------
+    property_id: Mapped[Optional[int]] = mapped_column(BigInteger)
+    match_method: Mapped[Optional[str]] = mapped_column(String(50))
+    match_confidence: Mapped[Optional[int]] = mapped_column(Integer)
+
+    # --- Change detection --------------------------------------------------
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default=text("'active'")
+    )
+    change_flags: Mapped[Optional[list]] = mapped_column(ARRAY(String))
+    changed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    prior: Mapped[Optional[dict]] = mapped_column(JSONB)
+
+    # --- Audit -------------------------------------------------------------
+    raw: Mapped[Optional[dict]] = mapped_column(JSONB)
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint("state_fips", "county_fips", "apn", name="uq_pr_state_county_apn"),
+        UniqueConstraint("radar_id", name="uq_pr_radar_id"),
+        CheckConstraint("status IN ('active','sold','refinanced')", name="ck_pr_status"),
+        Index("ix_pr_campaign", "campaign"),
+        Index("ix_pr_county_fips", "county_fips"),
+        Index("ix_pr_property_id", "property_id"),
     )

@@ -100,18 +100,37 @@ def resolve_buyer_entity_id(db: Session, property_id: Optional[int]) -> Optional
 
 
 def resolve_or_create_person(db: Session, source_reference: str) -> str:
-    """Create a fa_max_persons row for this session (see module docstring —
-    contact-based matching against an existing person is not possible yet)."""
+    """Create or reuse the fa_max_persons row for this session (see module
+    docstring — contact-based matching against an existing person is not
+    possible yet).
+
+    Idempotent on (source, source_reference): a resubmitted form (double
+    click, retry after a timeout, back+resubmit — submit_session calls this
+    unconditionally on every submit, with no prior confirmed-status check)
+    reuses the same person row instead of racing the unique index on
+    fa_max_persons(source, source_reference)."""
     row = db.execute(
         text(
             "INSERT INTO fa_max_persons (source, source_reference) "
-            "VALUES ('selfserve_flow', :ref) RETURNING person_id"
+            "VALUES ('selfserve_flow', :ref) "
+            "ON CONFLICT (source, source_reference) WHERE source_reference IS NOT NULL DO NOTHING "
+            "RETURNING person_id"
         ),
         {"ref": source_reference},
     ).first()
     if row is None:
-        raise RuntimeError("fa_max_persons insert did not return a person_id")
-    person_id = str(row.person_id)
+        existing = db.execute(
+            text(
+                "SELECT person_id FROM fa_max_persons "
+                "WHERE source = 'selfserve_flow' AND source_reference = :ref"
+            ),
+            {"ref": source_reference},
+        ).scalar_one_or_none()
+        if existing is None:
+            raise RuntimeError("fa_max_persons insert conflicted but no existing row was found")
+        person_id = str(existing)
+    else:
+        person_id = str(row.person_id)
     ensure_entity_registry(session=db, entity_type="person", native_id=person_id)
     return person_id
 

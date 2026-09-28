@@ -327,6 +327,18 @@ class AppSettings(BaseSettings):
 	# storm/restoration contractors from dbpr_contacts. Flip in env, no code deploy.
 	cora_target_mode: str = Field(default="whale", env="CORA_TARGET_MODE")
 
+	# PropertyRadar ingestion adapter (Developer 1)
+	# Solo plan: 10,000 export credits/month. Purchase=0 counts are free and
+	# never billed. Set property_radar_mode="fake" (default) in tests/local;
+	# "live" in production with a real key.
+	property_radar_api_key: Optional[SecretStr] = Field(default=None, env="PROPERTY_RADAR_API_KEY")
+	property_radar_enabled: bool = Field(default=False, env="PROPERTY_RADAR_ENABLED")
+	property_radar_mode: str = Field(default="fake", env="PROPERTY_RADAR_MODE")
+	# Hard cap per pull run — refuses to purchase more than this many records
+	# in a single invocation regardless of remaining monthly allowance. Prevents
+	# a runaway backlog from draining the monthly budget in one shot.
+	property_radar_per_run_cap: int = Field(default=5000, env="PROPERTY_RADAR_PER_RUN_CAP")
+
 
 	# ── Mode-aware helpers ────────────────────────────────────────────────────
 	# Use these everywhere instead of accessing live/test fields directly.
@@ -902,6 +914,12 @@ class AppSettings(BaseSettings):
 	fa_max_backflip_feed_max_age_hours: int = Field(default=24, ge=1, env="FA_MAX_BACKFLIP_FEED_MAX_AGE_HOURS")
 	fa_max_backflip_feed_adapter: str = Field(default="csv", env="FA_MAX_BACKFLIP_FEED_ADAPTER")
 	backflip_webhook_secret: Optional[SecretStr] = Field(default=None, env="BACKFLIP_WEBHOOK_SECRET")
+
+	# PropertyRadar lead handoff into FA Max. Both default off: contact rules
+	# stay off until the consent policy for these leads is decided, and the
+	# thin path limits handoff to the counties in config/property_radar_handoff.py.
+	property_radar_contact_rules_enabled: bool = Field(default=False, env="PROPERTY_RADAR_CONTACT_RULES_ENABLED")
+	property_radar_thin_path_only: bool = Field(default=False, env="PROPERTY_RADAR_THIN_PATH_ONLY")
 
 	# ── FA Max WP-T2-1 — Own-Lane Send Infrastructure ────────────────────────
 	# "fake" (default) = every FA Max relay send goes through the in-memory
