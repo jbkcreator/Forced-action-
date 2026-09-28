@@ -19,7 +19,10 @@ run_handoff() already catches that and records the record as
 skipped/handoff_error — so this constraint is the only change needed; no
 application code changes.
 
-Idempotent: safe to re-run (CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS).
+Idempotent: safe to re-run (CREATE UNIQUE INDEX IF NOT EXISTS). Not
+CONCURRENTLY — fa_max_persons is ~126 rows today, so the brief ACCESS
+EXCLUSIVE lock this takes is effectively instant. Revisit if this table
+grows large enough for that lock to matter.
 
 Run:
   PYTHONPATH=. python migrations/apply_fa_max_persons_source_reference_unique.py
