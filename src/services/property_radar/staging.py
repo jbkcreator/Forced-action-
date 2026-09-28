@@ -39,17 +39,18 @@ STATUS_REFINANCED = "refinanced"
 FLAG_OWNER_CHANGED = "owner_changed"
 FLAG_LOAN_CHANGED = "loan_changed"
 
-_COLUMNS: tuple[str, ...] = (
-    "radar_id", "state_fips", "county_fips", "apn",
-    "state", "county_name",
-    "property_address", "city", "zip", "property_type",
-    "owner_name", "ownership_type",
-    "mailing_address", "mailing_city", "mailing_state", "mailing_zip",
-    "principal_name",
-    "lender_name", "loan_amount", "loan_recorded_date",
-    "loan_term_years", "est_maturity_date", "loan_doc_number",
-    "campaign", "raw",
-)
+_COLUMN_TYPES: dict[str, str] = {
+    "radar_id": "text", "state_fips": "text", "county_fips": "text", "apn": "text",
+    "state": "text", "county_name": "text",
+    "property_address": "text", "city": "text", "zip": "text", "property_type": "text",
+    "owner_name": "text", "ownership_type": "text",
+    "mailing_address": "text", "mailing_city": "text", "mailing_state": "text", "mailing_zip": "text",
+    "principal_name": "text",
+    "lender_name": "text", "loan_amount": "bigint", "loan_recorded_date": "text",
+    "loan_term_years": "text", "est_maturity_date": "text", "loan_doc_number": "text",
+    "campaign": "text", "raw": "jsonb",
+}
+_COLUMNS: tuple[str, ...] = tuple(_COLUMN_TYPES)
 _KEY_COLUMNS = ("state_fips", "county_fips", "apn")
 _REQUIRED_COLUMNS = ("radar_id", "state_fips", "county_fips", "apn", "state", "county_name")
 # A blank value here in the feed means "not reported", not "cleared": keep the
@@ -127,27 +128,36 @@ _FETCH_RADAR_IDS_SQL = """
     WHERE radar_id = ANY(:ids)
 """
 
+# Whole batch travels as one JSON array and is unpacked server-side, so each
+# write is a single statement (a text() executemany is one round trip per row).
+_RECORDSET_COLS = ", ".join(f"{c} {t}" for c, t in _COLUMN_TYPES.items())
+
 _INSERT_SQL = f"""
     INSERT INTO property_radar_records ({", ".join(_COLUMNS)}, status, first_seen_at, last_seen_at)
-    VALUES ({", ".join(":" + c for c in _COLUMNS)}, '{STATUS_ACTIVE}', now(), now())
+    SELECT {", ".join(_COLUMNS)}, '{STATUS_ACTIVE}', now(), now()
+    FROM jsonb_to_recordset(CAST(:rows AS jsonb)) AS x({_RECORDSET_COLS})
 """
 
 _UPDATE_SQL = f"""
-    UPDATE property_radar_records SET
-        {", ".join(f"{c} = :{c}" for c in _COLUMNS if c not in _KEY_COLUMNS)},
-        status       = :status,
-        change_flags = CASE WHEN :has_change THEN CAST(:change_flags AS text[]) ELSE change_flags END,
-        prior        = CASE WHEN :has_change THEN CAST(:prior AS jsonb) ELSE prior END,
-        changed_at   = CASE WHEN :has_change THEN now() ELSE changed_at END,
+    UPDATE property_radar_records r SET
+        {", ".join(f"{c} = x.{c}" for c in _COLUMNS if c not in _KEY_COLUMNS)},
+        status       = x.status,
+        change_flags = CASE WHEN x.has_change THEN x.change_flags ELSE r.change_flags END,
+        prior        = CASE WHEN x.has_change THEN x.prior ELSE r.prior END,
+        changed_at   = CASE WHEN x.has_change THEN now() ELSE r.changed_at END,
         last_seen_at = now()
-    WHERE state_fips = :state_fips AND county_fips = :county_fips AND apn = :apn
+    FROM jsonb_to_recordset(CAST(:rows AS jsonb))
+         AS x({_RECORDSET_COLS}, status text, has_change boolean, change_flags text[], prior jsonb)
+    WHERE r.state_fips = x.state_fips AND r.county_fips = x.county_fips AND r.apn = x.apn
 """
 
 
 def _base_params(r: dict[str, Any]) -> dict[str, Any]:
-    params = {c: r.get(c) for c in _COLUMNS}
-    params["raw"] = json.dumps(r["raw"]) if r.get("raw") is not None else None
-    return params
+    return {c: r.get(c) for c in _COLUMNS}
+
+
+def _rows_param(rows: list[dict[str, Any]]) -> dict[str, str]:
+    return {"rows": json.dumps(rows, default=str)}
 
 
 def _dedupe_batch(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
@@ -222,14 +232,14 @@ def _upsert_batch(session: Session, batch: list[dict[str, Any]], skipped: int) -
             status=status,
             has_change=bool(flags),
             change_flags=flags or None,
-            prior=json.dumps(prior) if prior else None,
+            prior=prior or None,
         )
         updates.append(params)
 
     if inserts:
-        session.execute(text(_INSERT_SQL), inserts)
+        session.execute(text(_INSERT_SQL), _rows_param(inserts))
     if updates:
-        session.execute(text(_UPDATE_SQL), updates)
+        session.execute(text(_UPDATE_SQL), _rows_param(updates))
     session.flush()
 
     logger.info(

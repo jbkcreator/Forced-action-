@@ -11,6 +11,7 @@ lead to the wrong property.
 """
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -19,6 +20,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from config.matching import for_county
 from config.property_radar import COUNTY_FIPS_TO_SLUG
 from src.loaders.base import BaseLoader
 
@@ -47,9 +49,11 @@ _FETCH_UNLINKED_SQL = """
 """
 
 _SET_LINK_SQL = """
-    UPDATE property_radar_records
-    SET property_id = :property_id, match_method = :match_method, match_confidence = :match_confidence
-    WHERE id = :id
+    UPDATE property_radar_records r
+    SET property_id = x.property_id, match_method = x.match_method, match_confidence = x.match_confidence
+    FROM jsonb_to_recordset(CAST(:rows AS jsonb))
+         AS x(id bigint, property_id bigint, match_method text, match_confidence integer)
+    WHERE r.id = x.id
 """
 
 
@@ -93,7 +97,7 @@ def _link_pages(session: Session, fips_to_slug: dict[str, str], batch_size: int,
             if link:
                 links.append(link)
         if links:
-            session.execute(text(_SET_LINK_SQL), links)
+            session.execute(text(_SET_LINK_SQL), {"rows": json.dumps(links)})
 
         if len(rows) < batch_size:
             break
@@ -102,15 +106,19 @@ def _link_pages(session: Session, fips_to_slug: dict[str, str], batch_size: int,
 
 
 def _match(loader: BaseLoader, slug: str, row: Any) -> tuple[str, dict[str, Any] | None]:
+    # Address hits below auto_match are "pending_review" everywhere else in FA;
+    # a staging link has no review step, so only accept auto-match quality.
     prop, method, confidence = loader.find_property_cascade(
         parcel_id=row["apn"],
         address=row["property_address"],
         zip_code=row["zip"],
         city=row["city"],
+        addr_threshold=round(for_county(slug).auto_match * 100),
     )
     if prop is None:
         return NO_MATCH, None
     if (prop.county_id or "").lower() != slug.lower():
         logger.warning("County mismatch for record id=%s: expected %s got %s", row["id"], slug, prop.county_id)
         return COUNTY_MISMATCH, None
-    return LINKED, {"id": row["id"], "property_id": prop.id, "match_method": method, "match_confidence": confidence}
+    return LINKED, {"id": row["id"], "property_id": prop.id, "match_method": method,
+                    "match_confidence": round(confidence) if confidence is not None else None}
