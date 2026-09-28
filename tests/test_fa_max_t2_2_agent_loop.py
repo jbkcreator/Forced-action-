@@ -2281,38 +2281,27 @@ class TestOpportunityOriginImmutableMigration:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestWeeklyEditRateReport:
+    def _render(self, rollups):
+        from src.tasks import fa_max_weekly_edit_rate_report as report
+        with patch.object(report, "get_db_context") as mock_db,                 patch.object(report, "build_rollup", return_value=rollups),                 patch.object(report, "count_uncaptured", return_value=0):
+            mock_db.return_value.__enter__.return_value = MagicMock()
+            return report.build_report()
+
     def test_build_report_no_sends_this_week(self):
-        from src.tasks.fa_max_weekly_edit_rate_report import build_report
-        with patch("src.tasks.fa_max_weekly_edit_rate_report.get_db_context") as mock_db:
-            session = MagicMock()
-            mock_db.return_value.__enter__ = MagicMock(return_value=session)
-            mock_db.return_value.__exit__ = MagicMock(return_value=False)
-            with patch(
-                "src.tasks.fa_max_weekly_edit_rate_report._agent_tier_pairs_with_sends_this_week",
-                return_value=[],
-            ):
-                report = build_report()
-        assert "No FA Max human approvals" in report
+        assert "No FA Max human approvals" in self._render([])
 
     def test_build_report_includes_each_pair(self):
-        from src.tasks.fa_max_weekly_edit_rate_report import build_report
-        with patch("src.tasks.fa_max_weekly_edit_rate_report.get_db_context") as mock_db:
-            session = MagicMock()
-            mock_db.return_value.__enter__ = MagicMock(return_value=session)
-            mock_db.return_value.__exit__ = MagicMock(return_value=False)
-            with patch(
-                "src.tasks.fa_max_weekly_edit_rate_report._agent_tier_pairs_with_sends_this_week",
-                return_value=[("cora", "A"), ("hunter", "B")],
-            ):
-                with patch(
-                    "src.tasks.fa_max_weekly_edit_rate_report.get_weekly_edit_rate",
-                    side_effect=[0.05, 0.12],
-                ):
-                    report = build_report()
-        assert "cora" in report and "tier A" in report
-        assert "hunter" in report and "tier B" in report
-        assert "5.0%" in report
-        assert "12.0%" in report
+        from src.services.fa_max_autonomy import EditCounts
+        from src.services.fa_max_edit_log import AgentRollup
+        rollups = [
+            AgentRollup(agent_name="cora", tier="A", this_week=EditCounts(material=1, revised=1, decided=20),
+                        prior_4w=None, top_categories=[], biggest_edit=None),
+            AgentRollup(agent_name="hunter", tier="B", this_week=EditCounts(material=3, revised=4, decided=25),
+                        prior_4w=None, top_categories=[], biggest_edit=None),
+        ]
+        report = self._render(rollups)
+        assert "`cora` (tier A) — 5.0%" in report
+        assert "`hunter` (tier B) — 12.0% ⚠" in report
 
     def test_run_dry_run_does_not_call_alert_queue(self):
         from src.tasks.fa_max_weekly_edit_rate_report import run

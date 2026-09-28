@@ -940,6 +940,27 @@ def snooze_item(item_id: int, *, hours: float = 4.0) -> bool:
         return result.rowcount > 0
 
 
+# Payload keys that hold a row's human-editable draft text, in priority order.
+# Most writers use 'body'; Reply Concierge rows carry 'reply_text' (replies)
+# or 'suggested_reply' (EXCEPTIONS cards). draft_text() and _DRAFT_TEXT_SQL
+# must stay in the same order.
+DRAFT_TEXT_KEYS = ("body", "reply_text", "suggested_reply")
+_DRAFT_TEXT_SQL = "COALESCE(" + ", ".join(
+    f"NULLIF(payload->>'{key}', '')" for key in DRAFT_TEXT_KEYS
+) + ")"
+
+
+def draft_text(payload: Optional[dict]) -> str:
+    """The draft text a queue row proposes to send, whichever payload key
+    its writer used. '' when the row carries no draft (informational cards)."""
+    payload = payload or {}
+    for key in DRAFT_TEXT_KEYS:
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
 def capture_original_draft(item_id: int, *, draft: str) -> None:
     """Record the drafted content at first human-approval enqueue (WP-T2-2).
 
@@ -994,6 +1015,7 @@ def record_revision(
             text(
                 "UPDATE relay_approval_queue SET "
                 "final_content = :final_content, "
+                f"original_draft = COALESCE(original_draft, {_DRAFT_TEXT_SQL}), "
                 "payload = jsonb_set(COALESCE(payload, '{}'::jsonb), '{body}', :final_content_json ::jsonb, true), "
                 "revision_count = revision_count + 1, "
                 "last_revised_by = :revised_by, "
@@ -1013,7 +1035,7 @@ def record_revision(
         return _row_to_item(dict(row)) if row else None
 
 
-def mark_skipped(item_id: int, reason: str) -> bool:
+def mark_skipped(item_id: int, reason: str, *, decided_by: Optional[str] = None) -> bool:
     """Transitions a 'pending' or 'approved' row to 'skipped' -- guarded so a
     row that has already reached a terminal state (sent/failed/skipped) can
     never be downgraded. Without this guard, calling mark_skipped() on a row
@@ -1030,18 +1052,27 @@ def mark_skipped(item_id: int, reason: str) -> bool:
     can Skip a card still awaiting approval (the Slack Skip button), not
     only the execution engine's own skip-at-send-time path on already
     'approved' rows -- 'pending' is not a terminal state, so allowing it
-    here does not reopen the RELAY-v2.2 bug this guard exists for."""
+    here does not reopen the RELAY-v2.2 bug this guard exists for.
+
+    `decided_by` (WP-T3-2) marks a human Skip as a decision: decided_by /
+    decided_at are stamped only where still NULL, so a skip of a pending card
+    enters the edit-rate population while an engine skip of an already-
+    approved row keeps the approval that preceded it."""
     with get_db_context() as session:
         result = session.execute(
             text(
                 "UPDATE relay_approval_queue SET status = :status, "
-                "error = :error, updated_at = now() "
+                "error = :error, updated_at = now(), "
+                "decided_by = COALESCE(decided_by, :decided_by), "
+                "decided_at = CASE WHEN CAST(:decided_by AS text) IS NOT NULL "
+                "THEN COALESCE(decided_at, now()) ELSE decided_at END "
                 "WHERE id = :id AND status IN (:approved, :pending) "
                 "AND (venture_key <> 'fa_max_lending' OR batch_id IS NULL)"
             ),
             {
                 "status": STATUS_SKIPPED,
                 "error": reason,
+                "decided_by": decided_by,
                 "id": item_id,
                 "approved": STATUS_APPROVED,
                 "pending": STATUS_PENDING,
