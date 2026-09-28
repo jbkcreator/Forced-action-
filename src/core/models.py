@@ -12358,3 +12358,45 @@ class FaMaxGyrRoutingLog(Base):
         ),
         Index("ix_fa_max_gyr_log_opp_decided", "opportunity_id", "decided_at"),
     )
+
+
+class PropertyRadarHandoffDecision(Base):
+    """One handoff decision for a staged PropertyRadar record.
+
+    Append-only. The partial unique index on radar_id (outcome='handed_off')
+    is the durable guarantee that a record reaches FA Max at most once;
+    suppressed and skipped records are re-evaluated on later runs.
+    """
+
+    __tablename__ = "property_radar_handoff_decisions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    radar_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    campaign: Mapped[str] = mapped_column(String(100), nullable=False)
+    county_fips: Mapped[str] = mapped_column(String(5), nullable=False)
+    outcome: Mapped[str] = mapped_column(String(20), nullable=False)
+    reason: Mapped[str] = mapped_column(String(60), nullable=False)
+    person_id: Mapped[Optional[str]] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_persons.person_id", ondelete="SET NULL", name="fk_pr_handoff_person"),
+        nullable=True,
+    )
+    opportunity_id: Mapped[Optional[str]] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_opportunities.opportunity_id", ondelete="SET NULL", name="fk_pr_handoff_opp"),
+        nullable=True,
+    )
+    decided_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "outcome IN ('handed_off', 'suppressed', 'skipped')", name="ck_pr_handoff_outcome"
+        ),
+        Index(
+            "uq_pr_handoff_once", "radar_id", unique=True,
+            postgresql_where=text("outcome = 'handed_off'"),
+        ),
+        Index("ix_pr_handoff_radar_decided", "radar_id", "decided_at"),
+    )

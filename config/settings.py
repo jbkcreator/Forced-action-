@@ -903,6 +903,12 @@ class AppSettings(BaseSettings):
 	fa_max_backflip_feed_adapter: str = Field(default="csv", env="FA_MAX_BACKFLIP_FEED_ADAPTER")
 	backflip_webhook_secret: Optional[SecretStr] = Field(default=None, env="BACKFLIP_WEBHOOK_SECRET")
 
+	# PropertyRadar lead handoff into FA Max. Both default off: contact rules
+	# stay off until the consent policy for these leads is decided, and the
+	# thin path limits handoff to the counties in config/property_radar_handoff.py.
+	property_radar_contact_rules_enabled: bool = Field(default=False, env="PROPERTY_RADAR_CONTACT_RULES_ENABLED")
+	property_radar_thin_path_only: bool = Field(default=False, env="PROPERTY_RADAR_THIN_PATH_ONLY")
+
 	# ── FA Max WP-T2-1 — Own-Lane Send Infrastructure ────────────────────────
 	# "fake" (default) = every FA Max relay send goes through the in-memory
 	# FakeInstantly/FakeTelnyx recorders in src/services/relay/fakes.py — no
