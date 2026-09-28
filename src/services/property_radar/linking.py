@@ -1,142 +1,107 @@
-"""PropertyRadar → FA property linker.
+"""PropertyRadar -> FA property linker.
 
-Walks unlinked property_radar_records for loaded counties and sets property_id
-via the existing parcel/address cascade (stages 1–2 only — no owner-name
-fuzzy match to avoid false positives with LLCs that own many properties).
+Sets property_id on unlinked property_radar_records in loaded counties, via
+BaseLoader.find_property_cascade stages 1-2 only (parcel -> address). Owner
+fuzzy matching is deliberately excluded: an LLC owning many properties would
+link to the wrong one.
 
-Guard: the matched FA property's county_id must equal the county slug for the
-record's county_fips. A cross-county parcel collision is discarded.
-
-Run after upsert_records(), either inline or as a separate scheduled pass.
+The cascade is already county-scoped; the county check after a match is a
+guard against that ever changing, since a cross-county link would attach a
+lead to the wrong property.
 """
 from __future__ import annotations
 
 import logging
 from typing import Any
 
+import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from config.property_radar import COUNTY_FIPS_TO_SLUG
+from src.loaders.base import BaseLoader
 
 logger = logging.getLogger(__name__)
 
-# ── minimal concrete loader ──────────────────────────────────────────────────
-# BaseLoader is abstract (load_from_dataframe). We need a thin subclass to
-# access find_property_cascade without duplicating the matching waterfall.
-
-def _make_loader(session: Session, county_id: str):
-    from src.loaders.base import BaseLoader
-    import pandas as pd
-
-    class _RadarLinker(BaseLoader):
-        def load_from_dataframe(self, df: "pd.DataFrame", skip_duplicates: bool = True):  # type: ignore[override]
-            raise NotImplementedError
-
-    return _RadarLinker(session, county_id=county_id)
+LINKED = "linked"
+NO_MATCH = "no_match"
+COUNTY_MISMATCH = "skipped_county_mismatch"
 
 
-# ── SQL ─────────────────────────────────────────────────────────────────────
+class _MatchOnlyLoader(BaseLoader):
+    """BaseLoader used only for its matching cascade; never loads data."""
+
+    def load_from_dataframe(self, df: pd.DataFrame, skip_duplicates: bool = True):
+        raise NotImplementedError
+
 
 _FETCH_UNLINKED_SQL = """
-    SELECT id, state_fips, county_fips, apn, property_address, city, zip
+    SELECT id, county_fips, apn, property_address, city, zip
     FROM property_radar_records
     WHERE property_id IS NULL
       AND county_fips = ANY(:fips_list)
+      AND id > :last_id
     ORDER BY id
     LIMIT :batch_size
-    OFFSET :offset
 """
 
 _SET_LINK_SQL = """
     UPDATE property_radar_records
-    SET property_id      = :property_id,
-        match_method     = :match_method,
-        match_confidence = :match_confidence
+    SET property_id = :property_id, match_method = :match_method, match_confidence = :match_confidence
     WHERE id = :id
 """
 
 
-# ── public API ───────────────────────────────────────────────────────────────
-
 def link_unlinked(session: Session, *, batch_size: int = 500) -> dict[str, int]:
-    """Link unlinked staging records to FA properties for loaded counties.
+    """Link unlinked records in loaded counties. Returns counts per outcome."""
+    counts = {LINKED: 0, NO_MATCH: 0, COUNTY_MISMATCH: 0}
+    fips_to_slug = dict(COUNTY_FIPS_TO_SLUG)
+    if not fips_to_slug:
+        return counts
 
-    Processes in pages of `batch_size`. Returns a summary dict with keys
-    linked, skipped_county_mismatch, no_match.
-    """
-    loaded_fips = list(COUNTY_FIPS_TO_SLUG.keys())
-    if not loaded_fips:
-        return {"linked": 0, "skipped_county_mismatch": 0, "no_match": 0}
-
-    linked = no_match = mismatch = 0
-    offset = 0
+    loaders = {slug: _MatchOnlyLoader(session, county_id=slug) for slug in set(fips_to_slug.values())}
+    last_id = 0
 
     while True:
         rows = session.execute(
             text(_FETCH_UNLINKED_SQL),
-            {"fips_list": loaded_fips, "batch_size": batch_size, "offset": offset},
+            {"fips_list": list(fips_to_slug), "last_id": last_id, "batch_size": batch_size},
         ).mappings().all()
-
         if not rows:
             break
+        last_id = rows[-1]["id"]
 
+        links: list[dict[str, Any]] = []
         for row in rows:
-            result = _try_link(session, dict(row))
-            if result == "linked":
-                linked += 1
-            elif result == "mismatch":
-                mismatch += 1
-            else:
-                no_match += 1
+            slug = fips_to_slug[row["county_fips"]]
+            outcome, link = _match(loaders[slug], slug, row)
+            counts[outcome] += 1
+            if link:
+                links.append(link)
+        if links:
+            session.execute(text(_SET_LINK_SQL), links)
 
-        offset += batch_size
         if len(rows) < batch_size:
             break
 
     session.flush()
     logger.info(
         "PropertyRadar link_unlinked: linked=%d no_match=%d county_mismatch=%d",
-        linked, no_match, mismatch,
+        counts[LINKED], counts[NO_MATCH], counts[COUNTY_MISMATCH],
     )
-    return {"linked": linked, "skipped_county_mismatch": mismatch, "no_match": no_match}
+    return counts
 
 
-def _try_link(session: Session, row: dict[str, Any]) -> str:
-    """Attempt one record. Returns 'linked', 'mismatch', or 'no_match'."""
-    county_fips: str = row["county_fips"]
-    expected_slug = COUNTY_FIPS_TO_SLUG.get(county_fips)
-    if not expected_slug:
-        return "no_match"
-
-    loader = _make_loader(session, county_id=expected_slug)
-
+def _match(loader: BaseLoader, slug: str, row: Any) -> tuple[str, dict[str, Any] | None]:
     prop, method, confidence = loader.find_property_cascade(
-        parcel_id=row.get("apn"),
-        address=row.get("property_address"),
-        zip_code=row.get("zip"),
-        city=row.get("city"),
-        # No owner_name — avoids LLC cross-property false positives (Q2)
+        parcel_id=row["apn"],
+        address=row["property_address"],
+        zip_code=row["zip"],
+        city=row["city"],
     )
-
     if prop is None:
-        return "no_match"
-
-    # County guard: discard cross-county parcel collision (Q3)
-    if (prop.county_id or "").lower() != expected_slug.lower():
-        logger.debug(
-            "County mismatch for record id=%s: expected %s got %s",
-            row["id"], expected_slug, prop.county_id,
-        )
-        return "mismatch"
-
-    session.execute(
-        text(_SET_LINK_SQL),
-        {
-            "id": row["id"],
-            "property_id": prop.id,
-            "match_method": method,
-            "match_confidence": confidence,
-        },
-    )
-    return "linked"
+        return NO_MATCH, None
+    if (prop.county_id or "").lower() != slug.lower():
+        logger.warning("County mismatch for record id=%s: expected %s got %s", row["id"], slug, prop.county_id)
+        return COUNTY_MISMATCH, None
+    return LINKED, {"id": row["id"], "property_id": prop.id, "match_method": method, "match_confidence": confidence}

@@ -12388,7 +12388,7 @@ class PropertyRadarRecord(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
 
     # --- Deduplication key -------------------------------------------------
-    radar_id: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
+    radar_id: Mapped[str] = mapped_column(String(50), nullable=False)
     state_fips: Mapped[str] = mapped_column(String(5), nullable=False)
     county_fips: Mapped[str] = mapped_column(String(5), nullable=False)
     apn: Mapped[str] = mapped_column(String(100), nullable=False)
@@ -12421,10 +12421,10 @@ class PropertyRadarRecord(Base):
     loan_doc_number: Mapped[Optional[str]] = mapped_column(String(100))
 
     # --- Campaign -----------------------------------------------------------
-    campaign: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+    campaign: Mapped[Optional[str]] = mapped_column(String(100))
 
     # --- FA property link --------------------------------------------------
-    property_id: Mapped[Optional[int]] = mapped_column(BigInteger, index=True)
+    property_id: Mapped[Optional[int]] = mapped_column(BigInteger)
     match_method: Mapped[Optional[str]] = mapped_column(String(50))
     match_confidence: Mapped[Optional[int]] = mapped_column(Integer)
 
@@ -12447,6 +12447,9 @@ class PropertyRadarRecord(Base):
 
     __table_args__ = (
         UniqueConstraint("state_fips", "county_fips", "apn", name="uq_pr_state_county_apn"),
+        UniqueConstraint("radar_id", name="uq_pr_radar_id"),
         CheckConstraint("status IN ('active','sold','refinanced')", name="ck_pr_status"),
+        Index("ix_pr_campaign", "campaign"),
         Index("ix_pr_county_fips", "county_fips"),
+        Index("ix_pr_property_id", "property_id"),
     )

@@ -1,13 +1,19 @@
 """PropertyRadar staging writer.
 
 Upserts normalized PropertyRadar records (§3 contract) into
-property_radar_records. Change detection flags ownership and loan transitions
-so downstream suppression can remove in-flight outreach when the underlying
-situation changes.
+property_radar_records. Records never go into `properties`: parcel_id is
+globally unique there, but an APN is only unique within a county, so a
+statewide/multi-state feed would collide or merge the wrong property. The
+future path is a per-county uniqueness migration on `properties`, then a
+backfill from this table (see PropertyRadarRecord docstring).
 
-Design: records are deduplicated by (state_fips, county_fips, apn).
-radar_id is also unique; a collision on a different row is a data error —
-we log and skip rather than overwrite.
+Dedupe key is (state_fips, county_fips, apn); radar_id is also unique. A
+radar_id already held by a different key is a data error — logged and
+skipped, never overwritten.
+
+Change detection: an owner change marks the row `sold`, a loan change marks
+it `refinanced`. Flags, prior values and changed_at persist until the next
+real change, so a later unchanged re-stage never erases the signal.
 """
 from __future__ import annotations
 
@@ -24,7 +30,26 @@ from config.property_radar import OWNER_ABBREVIATIONS
 
 logger = logging.getLogger(__name__)
 
-# ── owner normalization ──────────────────────────────────────────────────────
+Key = tuple[str, str, str]
+
+STATUS_ACTIVE = "active"
+STATUS_SOLD = "sold"
+STATUS_REFINANCED = "refinanced"
+FLAG_OWNER_CHANGED = "owner_changed"
+FLAG_LOAN_CHANGED = "loan_changed"
+
+_COLUMNS: tuple[str, ...] = (
+    "radar_id", "state_fips", "county_fips", "apn",
+    "state", "county_name",
+    "property_address", "city", "zip", "property_type",
+    "owner_name", "ownership_type",
+    "mailing_address", "mailing_city", "mailing_state", "mailing_zip",
+    "principal_name",
+    "lender_name", "loan_amount", "loan_recorded_date",
+    "loan_term_years", "est_maturity_date", "loan_doc_number",
+    "campaign", "raw",
+)
+_KEY_COLUMNS = ("state_fips", "county_fips", "apn")
 
 _PUNCT_RE = re.compile(r"[^\w\s]")
 _SPACE_RE = re.compile(r"\s+")
@@ -34,34 +59,61 @@ def normalize_owner(name: str | None) -> str:
     """Upper-case, remove punctuation, collapse spaces, expand PR abbreviations."""
     if not name:
         return ""
-    s = _PUNCT_RE.sub("", name.upper())   # remove punct (not replace — avoids "Smith's" → "SMITH S")
+    s = _PUNCT_RE.sub("", name.upper())  # remove, not replace: "Smith's" -> "SMITHS"
     s = _SPACE_RE.sub(" ", s).strip()
     return " ".join(OWNER_ABBREVIATIONS.get(w, w) for w in s.split())
 
 
-# ── change detection ─────────────────────────────────────────────────────────
+def _key(r: dict[str, Any]) -> Key:
+    return (r["state_fips"], r["county_fips"], r["apn"])
+
+
+def _owner_changed(incoming: dict[str, Any], existing: dict[str, Any]) -> bool:
+    new = normalize_owner(incoming.get("owner_name"))
+    if not new:  # missing owner in the feed is not evidence of a sale
+        return False
+    return new != normalize_owner(existing.get("owner_name"))
+
 
 def _loan_changed(incoming: dict[str, Any], existing: dict[str, Any]) -> bool:
-    """True when the loan appears to have changed since last staging."""
     new_doc = incoming.get("loan_doc_number") or ""
     old_doc = existing.get("loan_doc_number") or ""
     if new_doc and old_doc:
         return new_doc != old_doc
-    # Fallback: lender name + recorded date together
-    new_pair = (incoming.get("lender_name") or "", incoming.get("loan_recorded_date") or "")
-    old_pair = (existing.get("lender_name") or "", existing.get("loan_recorded_date") or "")
-    if any(new_pair) and any(old_pair):
+    new_pair = (normalize_owner(incoming.get("lender_name")), incoming.get("loan_recorded_date") or "")
+    old_pair = (normalize_owner(existing.get("lender_name")), existing.get("loan_recorded_date") or "")
+    if all(new_pair) and all(old_pair):
         return new_pair != old_pair
     return False
 
 
-# ── SQL ─────────────────────────────────────────────────────────────────────
+def _detect_change(
+    incoming: dict[str, Any], existing: dict[str, Any]
+) -> tuple[list[str], dict[str, Any], str]:
+    flags: list[str] = []
+    prior: dict[str, Any] = {}
+    status: str = existing["status"]
+    if _owner_changed(incoming, existing):
+        flags.append(FLAG_OWNER_CHANGED)
+        prior["owner_name"] = existing.get("owner_name")
+        status = STATUS_SOLD
+    if _loan_changed(incoming, existing):
+        flags.append(FLAG_LOAN_CHANGED)
+        prior["lender_name"] = existing.get("lender_name")
+        prior["loan_recorded_date"] = existing.get("loan_recorded_date")
+        prior["loan_doc_number"] = existing.get("loan_doc_number")
+        if status != STATUS_SOLD:
+            status = STATUS_REFINANCED
+    return flags, prior, status
+
 
 _FETCH_EXISTING_SQL = """
-    SELECT id, radar_id, owner_name, lender_name, loan_recorded_date,
-           loan_doc_number, status, state_fips, county_fips, apn
-    FROM property_radar_records
-    WHERE (state_fips || '|' || county_fips || '|' || apn) = ANY(:keys)
+    SELECT r.radar_id, r.state_fips, r.county_fips, r.apn, r.owner_name,
+           r.lender_name, r.loan_recorded_date, r.loan_doc_number, r.status
+    FROM property_radar_records r
+    JOIN unnest(CAST(:sf AS text[]), CAST(:cf AS text[]), CAST(:apn AS text[]))
+         AS k(state_fips, county_fips, apn)
+      ON r.state_fips = k.state_fips AND r.county_fips = k.county_fips AND r.apn = k.apn
 """
 
 _FETCH_RADAR_IDS_SQL = """
@@ -70,191 +122,98 @@ _FETCH_RADAR_IDS_SQL = """
     WHERE radar_id = ANY(:ids)
 """
 
-_INSERT_SQL = """
-    INSERT INTO property_radar_records (
-        radar_id, state_fips, county_fips, apn,
-        state, county_name,
-        property_address, city, zip, property_type,
-        owner_name, ownership_type,
-        mailing_address, mailing_city, mailing_state, mailing_zip,
-        principal_name,
-        lender_name, loan_amount, loan_recorded_date,
-        loan_term_years, est_maturity_date, loan_doc_number,
-        campaign, status, raw,
-        first_seen_at, last_seen_at
-    ) VALUES (
-        :radar_id, :state_fips, :county_fips, :apn,
-        :state, :county_name,
-        :property_address, :city, :zip, :property_type,
-        :owner_name, :ownership_type,
-        :mailing_address, :mailing_city, :mailing_state, :mailing_zip,
-        :principal_name,
-        :lender_name, :loan_amount, :loan_recorded_date,
-        :loan_term_years, :est_maturity_date, :loan_doc_number,
-        :campaign, 'active', :raw,
-        now(), now()
-    )
+_INSERT_SQL = f"""
+    INSERT INTO property_radar_records ({", ".join(_COLUMNS)}, status, first_seen_at, last_seen_at)
+    VALUES ({", ".join(":" + c for c in _COLUMNS)}, '{STATUS_ACTIVE}', now(), now())
 """
 
-_UPDATE_SQL = """
+_UPDATE_SQL = f"""
     UPDATE property_radar_records SET
-        radar_id           = :radar_id,
-        state              = :state,
-        county_name        = :county_name,
-        property_address   = :property_address,
-        city               = :city,
-        zip                = :zip,
-        property_type      = :property_type,
-        owner_name         = :owner_name,
-        ownership_type     = :ownership_type,
-        mailing_address    = :mailing_address,
-        mailing_city       = :mailing_city,
-        mailing_state      = :mailing_state,
-        mailing_zip        = :mailing_zip,
-        principal_name     = :principal_name,
-        lender_name        = :lender_name,
-        loan_amount        = :loan_amount,
-        loan_recorded_date = :loan_recorded_date,
-        loan_term_years    = :loan_term_years,
-        est_maturity_date  = :est_maturity_date,
-        loan_doc_number    = :loan_doc_number,
-        campaign           = :campaign,
-        status             = :status,
-        change_flags       = :change_flags,
-        changed_at         = :changed_at,
-        prior              = :prior,
-        raw                = :raw,
-        last_seen_at       = now()
-    WHERE state_fips = :state_fips
-      AND county_fips = :county_fips
-      AND apn = :apn
+        {", ".join(f"{c} = :{c}" for c in _COLUMNS if c not in _KEY_COLUMNS)},
+        status       = :status,
+        change_flags = CASE WHEN :has_change THEN CAST(:change_flags AS text[]) ELSE change_flags END,
+        prior        = CASE WHEN :has_change THEN CAST(:prior AS jsonb) ELSE prior END,
+        changed_at   = CASE WHEN :has_change THEN now() ELSE changed_at END,
+        last_seen_at = now()
+    WHERE state_fips = :state_fips AND county_fips = :county_fips AND apn = :apn
 """
-
-
-# ── public API ───────────────────────────────────────────────────────────────
-
-def upsert_records(
-    session: Session,
-    records: list[dict[str, Any]],
-) -> tuple[int, int, int]:
-    """Upsert a batch of §3-contract PropertyRadar records.
-
-    Returns (inserted, updated, skipped). Skipped means radar_id collision on
-    a different (state_fips, county_fips, apn) row — logged, not raised.
-    """
-    if not records:
-        return 0, 0, 0
-
-    inserted = updated = skipped = 0
-    now = datetime.now(tz=timezone.utc)
-
-    # Batch-fetch existing rows by dedup key
-    key_strs = list({
-        f"{r['state_fips']}|{r['county_fips']}|{r['apn']}"
-        for r in records
-    })
-    rows = session.execute(text(_FETCH_EXISTING_SQL), {"keys": key_strs}).mappings().all()
-    existing_by_key: dict[tuple[str, str, str], dict[str, Any]] = {
-        (row["state_fips"], row["county_fips"], row["apn"]): dict(row)
-        for row in rows
-    }
-
-    # Batch-fetch radar_id → row key for collision detection
-    all_radar_ids = list({r["radar_id"] for r in records})
-    rid_rows = session.execute(
-        text(_FETCH_RADAR_IDS_SQL), {"ids": all_radar_ids}
-    ).mappings().all()
-    radar_id_to_key: dict[str, tuple[str, str, str]] = {
-        row["radar_id"]: (row["state_fips"], row["county_fips"], row["apn"])
-        for row in rid_rows
-    }
-
-    for record in records:
-        key = (record["state_fips"], record["county_fips"], record["apn"])
-        existing = existing_by_key.get(key)
-        incoming_rid = record["radar_id"]
-
-        if existing is None:
-            if incoming_rid in radar_id_to_key and radar_id_to_key[incoming_rid] != key:
-                logger.warning(
-                    "radar_id %s already on row %s, skipping insert for %s",
-                    incoming_rid, radar_id_to_key[incoming_rid], key,
-                )
-                skipped += 1
-                continue
-            session.execute(text(_INSERT_SQL), _base_params(record))
-            inserted += 1
-
-        else:
-            existing_rid = existing["radar_id"]
-            if incoming_rid != existing_rid:
-                collision_key = radar_id_to_key.get(incoming_rid)
-                if collision_key and collision_key != key:
-                    logger.warning(
-                        "radar_id %s collision: exists on %s, cannot reassign to %s",
-                        incoming_rid, collision_key, key,
-                    )
-                    skipped += 1
-                    continue
-
-            change_flags: list[str] = []
-            prior: dict[str, Any] = {}
-            status: str = existing["status"]
-
-            if normalize_owner(record.get("owner_name")) != normalize_owner(existing.get("owner_name")):
-                change_flags.append("owner_changed")
-                prior["owner_name"] = existing["owner_name"]
-                status = "sold"
-
-            if _loan_changed(record, existing):
-                change_flags.append("loan_changed")
-                prior["lender_name"] = existing.get("lender_name")
-                prior["loan_recorded_date"] = existing.get("loan_recorded_date")
-                prior["loan_doc_number"] = existing.get("loan_doc_number")
-                if "owner_changed" not in change_flags:
-                    status = "refinanced"
-
-            params = _base_params(record)
-            params["status"] = status
-            params["change_flags"] = change_flags or None
-            params["prior"] = json.dumps(prior) if prior else None
-            params["changed_at"] = now if change_flags else None
-            session.execute(text(_UPDATE_SQL), params)
-            updated += 1
-
-    session.flush()
-    logger.info(
-        "PropertyRadar upsert: inserted=%d updated=%d skipped=%d",
-        inserted, updated, skipped,
-    )
-    return inserted, updated, skipped
 
 
 def _base_params(r: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "radar_id": r["radar_id"],
-        "state_fips": r["state_fips"],
-        "county_fips": r["county_fips"],
-        "apn": r["apn"],
-        "state": r.get("state"),
-        "county_name": r.get("county_name"),
-        "property_address": r.get("property_address"),
-        "city": r.get("city"),
-        "zip": r.get("zip"),
-        "property_type": r.get("property_type"),
-        "owner_name": r.get("owner_name"),
-        "ownership_type": r.get("ownership_type"),
-        "mailing_address": r.get("mailing_address"),
-        "mailing_city": r.get("mailing_city"),
-        "mailing_state": r.get("mailing_state"),
-        "mailing_zip": r.get("mailing_zip"),
-        "principal_name": r.get("principal_name"),
-        "lender_name": r.get("lender_name"),
-        "loan_amount": r.get("loan_amount"),
-        "loan_recorded_date": r.get("loan_recorded_date"),
-        "loan_term_years": r.get("loan_term_years"),
-        "est_maturity_date": r.get("est_maturity_date"),
-        "loan_doc_number": r.get("loan_doc_number"),
-        "campaign": r.get("campaign"),
-        "raw": json.dumps(r["raw"]) if r.get("raw") is not None else None,
-    }
+    params = {c: r.get(c) for c in _COLUMNS}
+    params["raw"] = json.dumps(r["raw"]) if r.get("raw") is not None else None
+    return params
+
+
+def _dedupe_batch(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    """Last record wins per key; a radar_id reused by a second key is dropped."""
+    by_key: dict[Key, dict[str, Any]] = {}
+    for r in records:
+        by_key[_key(r)] = r
+    kept: list[dict[str, Any]] = []
+    rid_owner: dict[str, Key] = {}
+    for k, r in by_key.items():
+        rid = r["radar_id"]
+        if rid in rid_owner:
+            logger.warning("radar_id %s repeated in batch for %s and %s, skipping latter", rid, rid_owner[rid], k)
+            continue
+        rid_owner[rid] = k
+        kept.append(r)
+    return kept, len(records) - len(kept)
+
+
+def upsert_records(session: Session, records: list[dict[str, Any]]) -> tuple[int, int, int]:
+    """Upsert a batch of §3-contract records. Returns (inserted, updated, skipped)."""
+    if not records:
+        return 0, 0, 0
+
+    batch, skipped = _dedupe_batch(records)
+    keys = [_key(r) for r in batch]
+
+    existing_rows = session.execute(
+        text(_FETCH_EXISTING_SQL),
+        {"sf": [k[0] for k in keys], "cf": [k[1] for k in keys], "apn": [k[2] for k in keys]},
+    ).mappings().all()
+    existing_by_key: dict[Key, dict[str, Any]] = {_key(row): dict(row) for row in existing_rows}
+
+    rid_rows = session.execute(
+        text(_FETCH_RADAR_IDS_SQL), {"ids": [r["radar_id"] for r in batch]}
+    ).mappings().all()
+    radar_id_to_key: dict[str, Key] = {row["radar_id"]: _key(row) for row in rid_rows}
+
+    inserts: list[dict[str, Any]] = []
+    updates: list[dict[str, Any]] = []
+    for record in batch:
+        key = _key(record)
+        holder = radar_id_to_key.get(record["radar_id"])
+        if holder is not None and holder != key:
+            logger.warning("radar_id %s already on %s, skipping %s", record["radar_id"], holder, key)
+            skipped += 1
+            continue
+
+        existing = existing_by_key.get(key)
+        if existing is None:
+            inserts.append(_base_params(record))
+            continue
+
+        flags, prior, status = _detect_change(record, existing)
+        params = _base_params(record)
+        params.update(
+            status=status,
+            has_change=bool(flags),
+            change_flags=flags or None,
+            prior=json.dumps(prior) if prior else None,
+        )
+        updates.append(params)
+
+    if inserts:
+        session.execute(text(_INSERT_SQL), inserts)
+    if updates:
+        session.execute(text(_UPDATE_SQL), updates)
+    session.flush()
+
+    logger.info(
+        "PropertyRadar upsert: inserted=%d updated=%d skipped=%d",
+        len(inserts), len(updates), skipped,
+    )
+    return len(inserts), len(updates), skipped

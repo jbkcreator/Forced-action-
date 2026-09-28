@@ -24,7 +24,6 @@ OWNER_ABBREVIATIONS: dict[str, str] = {
     "FNDG": "FUNDING",
     "CAP": "CAPITAL",
     "MGMT": "MANAGEMENT",
-    "PROP": "PROPERTIES",
     "ASSOC": "ASSOCIATES",
     "GRP": "GROUP",
     "INTL": "INTERNATIONAL",
