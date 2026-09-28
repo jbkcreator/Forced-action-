@@ -11,6 +11,7 @@ we log and skip rather than overwrite.
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 from datetime import datetime, timezone
@@ -30,10 +31,10 @@ _SPACE_RE = re.compile(r"\s+")
 
 
 def normalize_owner(name: str | None) -> str:
-    """Upper-case, strip punctuation, collapse spaces, expand PR abbreviations."""
+    """Upper-case, remove punctuation, collapse spaces, expand PR abbreviations."""
     if not name:
         return ""
-    s = _PUNCT_RE.sub(" ", name.upper())
+    s = _PUNCT_RE.sub("", name.upper())   # remove punct (not replace — avoids "Smith's" → "SMITH S")
     s = _SPACE_RE.sub(" ", s).strip()
     return " ".join(OWNER_ABBREVIATIONS.get(w, w) for w in s.split())
 
@@ -216,7 +217,7 @@ def upsert_records(
             params = _base_params(record)
             params["status"] = status
             params["change_flags"] = change_flags or None
-            params["prior"] = prior or None
+            params["prior"] = json.dumps(prior) if prior else None
             params["changed_at"] = now if change_flags else None
             session.execute(text(_UPDATE_SQL), params)
             updated += 1
@@ -255,5 +256,5 @@ def _base_params(r: dict[str, Any]) -> dict[str, Any]:
         "est_maturity_date": r.get("est_maturity_date"),
         "loan_doc_number": r.get("loan_doc_number"),
         "campaign": r.get("campaign"),
-        "raw": r.get("raw"),
+        "raw": json.dumps(r["raw"]) if r.get("raw") is not None else None,
     }

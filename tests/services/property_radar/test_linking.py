@@ -91,19 +91,22 @@ def test_no_link_for_unloaded_county(fresh_db):
     assert row["property_id"] is None
 
 
-def test_county_mismatch_not_linked(fresh_db):
-    """Parcel found in wrong county is discarded (county guard Q3)."""
-    # Seed property under a DIFFERENT county slug
+def test_no_link_when_property_in_different_county(fresh_db):
+    """Parcel exists but under a different county slug — cascade is county-scoped
+    so it returns no match; property_id stays null."""
     _insert_fake_property(
         fresh_db,
         parcel_id=_FAKE_APN,
-        county_id="pasco",  # wrong county
+        county_id="pasco",  # different county than the staging record (hillsborough)
         address="456 LINK TEST ST",
     )
     upsert_records(fresh_db, [_pr_record()])
 
     result = link_unlinked(fresh_db)
-    assert result["skipped_county_mismatch"] >= 1
+    # Cascade is county-scoped: parcel+address search only within hillsborough,
+    # so the pasco property is invisible → no_match, not mismatch.
+    assert result["linked"] == 0
+    assert result["no_match"] >= 1
 
     row = fresh_db.execute(
         text("SELECT property_id FROM property_radar_records WHERE radar_id = :rid"),
