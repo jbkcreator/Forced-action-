@@ -32,13 +32,15 @@ Wiring / production entry point:
   For the one-time backlog run, invoke manually:
     PYTHONPATH=. python -m src.tasks.property_radar_maturity_pull --mode backlog [--dry-run]
 
-Dev 2 integration note (open question #2, deferred to Monday meeting):
-  This task writes normalised records to stdout (JSON lines) and inserts
-  dedup checkpoints into property_radar_seen_ids. If the contract meeting
-  resolves that Dev 2's staging table owns seen radar_ids instead, remove
-  the seen_ids INSERT/query here and replace with a NOT IN against Dev 2's
-  staging table. The normalised-record output contract (PropertyRadarNormalized)
-  does not change.
+Dev 2 integration:
+  Every normalized record is written into Dev 2's staging table
+  (property_radar_records) via src.services.property_radar.staging.upsert_records(),
+  once per ~100-record batch, followed by a single link_unlinked() call after
+  the whole pull completes — this is the real interchange point with Dev 2's
+  storage layer. The stdout JSON emission is retained only for manual
+  inspection/debugging; nothing downstream should rely on parsing it.
+  property_radar_seen_ids remains Dev 1's own dedup checkpoint (separate
+  from, and does not replace, Dev 2's own dedupe-by-key in upsert_records).
 """
 from __future__ import annotations
 
@@ -60,6 +62,8 @@ from config.settings import settings
 from src.core.database import get_db_context
 from src.services.property_radar_normalizer import normalize
 from src.services.property_radar_port import get_property_radar_port
+from src.services.property_radar.linking import link_unlinked
+from src.services.property_radar.staging import upsert_records
 from src.utils.logger import setup_logging
 
 setup_logging()
@@ -159,6 +163,44 @@ def _last_successful_run_date(session, state: str, campaign: str) -> Optional[da
     return row[0].date()
 
 
+def _to_staging_dict(normalized) -> dict:
+    """PropertyRadarNormalized -> the exact dict shape upsert_records() expects
+    (src.services.property_radar.staging._COLUMNS). Field names must match
+    that module's _COLUMN_TYPES map exactly — a renamed field here lands as
+    a silent NULL in property_radar_records, not an error."""
+    return {
+        "radar_id": normalized.radar_id,
+        "state_fips": normalized.state_fips,
+        "county_fips": normalized.county_fips,
+        "apn": normalized.apn,
+        "state": normalized.state,
+        "county_name": normalized.county_name,
+        "property_address": normalized.property_address,
+        "city": normalized.city,
+        "zip": normalized.zip,
+        "property_type": normalized.property_type,
+        "owner_name": normalized.owner_name,
+        "ownership_type": normalized.ownership_type,
+        "mailing_address": normalized.mailing_address,
+        "mailing_city": normalized.mailing_city,
+        "mailing_state": normalized.mailing_state,
+        "mailing_zip": normalized.mailing_zip,
+        "principal_name": normalized.principal_name,
+        "lender_name": normalized.lender_name,
+        "loan_amount": normalized.loan_amount,
+        "loan_recorded_date": (
+            normalized.loan_recorded_date.isoformat() if normalized.loan_recorded_date else None
+        ),
+        "loan_term_years": normalized.loan_term_years,
+        "est_maturity_date": (
+            normalized.est_maturity_date.isoformat() if normalized.est_maturity_date else None
+        ),
+        "loan_doc_number": normalized.loan_doc_number,
+        "campaign": normalized.campaign,
+        "raw": normalized.raw,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Pull logic
 # ---------------------------------------------------------------------------
@@ -220,6 +262,18 @@ def _run_pull(
     exports_consumed = 0
     excluded = 0
     batch_ids: list[str] = []
+    staging_batch: list[dict] = []
+    inserted_total = updated_total = skipped_total = 0
+
+    def _flush_staging_batch() -> None:
+        nonlocal inserted_total, updated_total, skipped_total, staging_batch
+        if not staging_batch:
+            return
+        ins, upd, skp = upsert_records(session, staging_batch)
+        inserted_total += ins
+        updated_total += upd
+        skipped_total += skp
+        staging_batch = []
 
     try:
         for record in port.purchase(criteria):
@@ -234,46 +288,36 @@ def _run_pull(
 
             records_fetched += 1
             batch_ids.append(record.radar_id)
+            staging_batch.append(_to_staging_dict(normalized))
 
-            # Emit normalised record to stdout (JSON line) for Dev 2 to consume
-            # — field names match the §3 shared contract exactly.
-            print(json.dumps({
-                "radar_id": normalized.radar_id,
-                "state_fips": normalized.state_fips,
-                "county_fips": normalized.county_fips,
-                "apn": normalized.apn,
-                "state": normalized.state,
-                "county_name": normalized.county_name,
-                "address": normalized.address,
-                "city": normalized.city,
-                "zip_code": normalized.zip_code,
-                "property_type": normalized.property_type,
-                "owner_name": normalized.owner_name,
-                "ownership_type": normalized.ownership_type,
-                "lender_original": normalized.lender_original,
-                "loan_date": normalized.loan_date.isoformat() if normalized.loan_date else None,
-                "loan_amount": normalized.loan_amount,
-                "loan_term_years": normalized.loan_term_years,
-                "est_maturity_date": (
-                    normalized.est_maturity_date.isoformat()
-                    if normalized.est_maturity_date else None
-                ),
-                "loan_doc_number": None,
-                "principal_name": normalized.principal_name,
-                "campaign": normalized.campaign,
-                "raw": normalized.raw,
-            }), flush=True)
+            # Emit normalised record to stdout (JSON line) — useful for manual
+            # inspection/debugging; the real interchange point with Dev 2's
+            # storage is the upsert_records() call below, not this print.
+            print(json.dumps(_to_staging_dict(normalized)), flush=True)
 
-            # Flush seen-id batch every 100 records to survive mid-run crashes
+            # Flush every 100 records: write to Dev 2's staging table, mark
+            # seen, commit. Both survive a mid-run crash at this boundary.
             if len(batch_ids) >= 100:
+                _flush_staging_batch()
                 _mark_seen(session, state, campaign, batch_ids)
                 session.commit()
                 batch_ids = []
 
-        # Final batch
+        # Final partial batch
+        _flush_staging_batch()
         if batch_ids:
             _mark_seen(session, state, campaign, batch_ids)
             session.commit()
+
+        # Link newly-staged records to FA properties where the county is
+        # loaded (Dev 2's contract: call once after all pages are upserted,
+        # not per page).
+        link_counts = link_unlinked(session)
+        session.commit()
+        logger.info(
+            "PropertyRadar staging: %d inserted, %d updated, %d skipped; link: %s",
+            inserted_total, updated_total, skipped_total, link_counts,
+        )
 
         # Mark run done
         session.execute(
