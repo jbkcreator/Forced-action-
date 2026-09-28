@@ -12398,3 +12398,98 @@ class PropertyRadarPullRun(Base):
         ),
         Index("ix_pr_pull_runs_state_campaign", "state", "campaign"),
     )
+
+
+# ============================================================================
+# PropertyRadar staging — Developer 2 (property_radar_records)
+# ============================================================================
+
+class PropertyRadarRecord(Base):
+    """Staging table for PropertyRadar records.
+
+    PropertyRadar records are NOT written into `properties` because parcel_id
+    is globally unique across the whole DB while two counties in different
+    states can share the same APN. Deduplication key is (state_fips,
+    county_fips, apn). A nullable property_id links the record to an FA
+    property when the county is loaded (Hillsborough, Pasco, Pinellas); for
+    all other counties the record is stored as-is.
+
+    Change detection tracks ownership and loan transitions so that records
+    already in outreach can be suppressed when the underlying situation
+    changes (sold → new owner, refinanced → old loan gone).
+
+    Future migration path: when per-county uniqueness is added to `properties`
+    and the 522k-row table is migrated, a backfill script can copy these
+    records into `properties` and drop the staging table.
+    """
+
+    __tablename__ = "property_radar_records"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    # --- Deduplication key -------------------------------------------------
+    radar_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    state_fips: Mapped[str] = mapped_column(String(5), nullable=False)
+    county_fips: Mapped[str] = mapped_column(String(5), nullable=False)
+    apn: Mapped[str] = mapped_column(String(100), nullable=False)
+
+    # --- Geography / display -----------------------------------------------
+    state: Mapped[str] = mapped_column(String(2), nullable=False)
+    county_name: Mapped[str] = mapped_column(String(100), nullable=False)
+
+    # --- Property ----------------------------------------------------------
+    property_address: Mapped[Optional[str]] = mapped_column(String(255))
+    city: Mapped[Optional[str]] = mapped_column(String(100))
+    zip: Mapped[Optional[str]] = mapped_column(String(10))
+    property_type: Mapped[Optional[str]] = mapped_column(String(20))
+
+    # --- Ownership ----------------------------------------------------------
+    owner_name: Mapped[Optional[str]] = mapped_column(String(255))
+    ownership_type: Mapped[Optional[str]] = mapped_column(String(50))
+    mailing_address: Mapped[Optional[str]] = mapped_column(String(255))
+    mailing_city: Mapped[Optional[str]] = mapped_column(String(100))
+    mailing_state: Mapped[Optional[str]] = mapped_column(String(2))
+    mailing_zip: Mapped[Optional[str]] = mapped_column(String(10))
+    principal_name: Mapped[Optional[str]] = mapped_column(String(255))
+
+    # --- Loan ---------------------------------------------------------------
+    lender_name: Mapped[Optional[str]] = mapped_column(String(255))
+    loan_amount: Mapped[Optional[int]] = mapped_column(BigInteger)
+    loan_recorded_date: Mapped[Optional[str]] = mapped_column(String(20))
+    loan_term_years: Mapped[Optional[str]] = mapped_column(String(20))
+    est_maturity_date: Mapped[Optional[str]] = mapped_column(String(20))
+    loan_doc_number: Mapped[Optional[str]] = mapped_column(String(100))
+
+    # --- Campaign -----------------------------------------------------------
+    campaign: Mapped[Optional[str]] = mapped_column(String(100))
+
+    # --- FA property link --------------------------------------------------
+    property_id: Mapped[Optional[int]] = mapped_column(BigInteger)
+    match_method: Mapped[Optional[str]] = mapped_column(String(50))
+    match_confidence: Mapped[Optional[int]] = mapped_column(Integer)
+
+    # --- Change detection --------------------------------------------------
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default=text("'active'")
+    )
+    change_flags: Mapped[Optional[list]] = mapped_column(ARRAY(String))
+    changed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    prior: Mapped[Optional[dict]] = mapped_column(JSONB)
+
+    # --- Audit -------------------------------------------------------------
+    raw: Mapped[Optional[dict]] = mapped_column(JSONB)
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint("state_fips", "county_fips", "apn", name="uq_pr_state_county_apn"),
+        UniqueConstraint("radar_id", name="uq_pr_radar_id"),
+        CheckConstraint("status IN ('active','sold','refinanced')", name="ck_pr_status"),
+        Index("ix_pr_campaign", "campaign"),
+        Index("ix_pr_county_fips", "county_fips"),
+        Index("ix_pr_property_id", "property_id"),
+    )
