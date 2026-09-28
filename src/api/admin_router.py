@@ -1904,8 +1904,9 @@ def _handle_relay_thread_action(payload: dict) -> None:
         return
     # WP-T3-1: an open Revise slot for THIS card's thread outranks commands and
     # the fallback responder (Banks precedence: halt → pending-revision →
-    # command → ignore; halt is evaluated upstream).
-    if item.venture_key == "fa_max_lending" and _consume_revise_slot(
+    # command → ignore; halt is evaluated upstream). Every venture's card
+    # renders Revise, so every venture's reply is consumed here.
+    if _consume_revise_slot(
         item, str(user_id), str(thread_ts), str(event.get("text") or ""),
     ):
         return
