@@ -455,3 +455,68 @@ class TestLastSuccessfulRunDate:
         session.execute.return_value.first.return_value = (ts,)
         result = _last_successful_run_date(session, "FL", "maturity_target_lender")
         assert result == ts.date()
+
+
+# ---------------------------------------------------------------------------
+# main() PROPERTY_RADAR_ENABLED gate (PR #313 review finding: the cron job
+# was documented as "disabled by default" but nothing actually checked the
+# flag, so it silently wrote real rows to production tables every night even
+# in mode="fake". main() must short-circuit on property_radar_enabled=False
+# regardless of property_radar_mode.)
+# ---------------------------------------------------------------------------
+
+class TestMainRespectsEnabledFlag:
+    def _run_main(self, argv):
+        import sys
+        from src.tasks.property_radar_maturity_pull import main
+        old_argv = sys.argv
+        sys.argv = ["property_radar_maturity_pull.py"] + argv
+        try:
+            main()
+        finally:
+            sys.argv = old_argv
+
+    def test_disabled_short_circuits_before_any_db_session(self):
+        """Regardless of property_radar_mode, PROPERTY_RADAR_ENABLED=false
+        must no-op main() before get_db_context()/_run_pull() ever run —
+        this is what the cron job's "disabled by default" promise depends on."""
+        with patch("src.tasks.property_radar_maturity_pull.settings") as mock_settings, \
+             patch("src.tasks.property_radar_maturity_pull.get_db_context") as mock_db, \
+             patch("src.tasks.property_radar_maturity_pull.ENABLED_STATES", frozenset({"FL"})):
+            mock_settings.property_radar_enabled = False
+            mock_settings.property_radar_mode = "fake"  # the default — must still be gated
+            self._run_main(["--mode", "daily", "--state", "FL"])
+            mock_db.assert_not_called()
+
+    def test_disabled_short_circuits_even_in_live_mode(self):
+        with patch("src.tasks.property_radar_maturity_pull.settings") as mock_settings, \
+             patch("src.tasks.property_radar_maturity_pull.get_db_context") as mock_db, \
+             patch("src.tasks.property_radar_maturity_pull.ENABLED_STATES", frozenset({"FL"})):
+            mock_settings.property_radar_enabled = False
+            mock_settings.property_radar_mode = "live"
+            self._run_main(["--mode", "backlog", "--state", "FL"])
+            mock_db.assert_not_called()
+
+    def test_enabled_proceeds_to_db_session(self):
+        with patch("src.tasks.property_radar_maturity_pull.settings") as mock_settings, \
+             patch("src.tasks.property_radar_maturity_pull.get_db_context") as mock_db, \
+             patch("src.tasks.property_radar_maturity_pull._run_pull") as mock_run_pull, \
+             patch("src.tasks.property_radar_maturity_pull.ENABLED_STATES", frozenset({"FL"})):
+            mock_settings.property_radar_enabled = True
+            mock_settings.property_radar_mode = "fake"
+            mock_run_pull.return_value = {"run_id": 1}
+            self._run_main(["--mode", "daily", "--state", "FL"])
+            mock_db.assert_called_once()
+
+    def test_dry_run_is_exempt_from_the_enabled_gate(self):
+        """--dry-run only makes free count() calls and writes nothing, so it
+        must stay usable for verification even when the job is disabled."""
+        with patch("src.tasks.property_radar_maturity_pull.settings") as mock_settings, \
+             patch("src.tasks.property_radar_maturity_pull.get_db_context") as mock_db, \
+             patch("src.tasks.property_radar_maturity_pull._dry_run_county_report") as mock_report, \
+             patch("src.tasks.property_radar_maturity_pull.ENABLED_STATES", frozenset({"FL"})):
+            mock_settings.property_radar_enabled = False
+            mock_settings.property_radar_mode = "fake"
+            self._run_main(["--dry-run", "--state", "FL"])
+            mock_report.assert_called_once()
+            mock_db.assert_not_called()

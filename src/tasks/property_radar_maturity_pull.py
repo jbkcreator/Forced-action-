@@ -398,6 +398,22 @@ def main() -> None:
         if args.dry_run:
             return
 
+    # Fail-closed: CLAUDE.md and the cron entry both document this job as
+    # "disabled until PROPERTY_RADAR_ENABLED=true". Nothing else in the code
+    # path actually enforced that — get_property_radar_port() only reads this
+    # flag on the mode=="live" branch, so with the default mode=="fake" the
+    # job would otherwise run daily against the real DB (inserting real rows
+    # into property_radar_pull_runs/property_radar_seen_ids) even while
+    # "disabled". --dry-run/--county-report are exempt: they only make free
+    # count() calls and write nothing, so they stay usable for verification
+    # regardless of this flag.
+    if not settings.property_radar_enabled:
+        logger.info(
+            "PropertyRadar pull is disabled (PROPERTY_RADAR_ENABLED=false) — "
+            "no-op. Set PROPERTY_RADAR_ENABLED=true to enable real runs."
+        )
+        return
+
     logger.info(
         "Starting PropertyRadar pull: mode=%s state=%s campaign=%s",
         args.mode, state, args.campaign,
