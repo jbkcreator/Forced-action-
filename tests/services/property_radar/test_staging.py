@@ -127,6 +127,27 @@ def test_missing_owner_is_not_a_sale(fresh_db):
     assert row["status"] == "active" and not row["change_flags"]
 
 
+def test_owner_gap_then_same_owner_is_not_a_sale(fresh_db):
+    upsert_records(fresh_db, [_rec(owner_name="ACME INVESTMENTS LLC")])
+    upsert_records(fresh_db, [_rec(owner_name=None)])
+    upsert_records(fresh_db, [_rec(owner_name="ACME INVESTMENTS LLC")])
+    row = _row(fresh_db)
+    assert row["status"] == "active" and not row["change_flags"]
+    assert row["owner_name"] == "ACME INVESTMENTS LLC"
+
+
+def test_loan_doc_gap_then_same_doc_is_not_a_refinance(fresh_db):
+    upsert_records(fresh_db, [_rec(loan_doc_number="DOC-001", lender_name=None, loan_recorded_date=None)])
+    upsert_records(fresh_db, [_rec(loan_doc_number=None, lender_name=None, loan_recorded_date=None)])
+    upsert_records(fresh_db, [_rec(loan_doc_number="DOC-001", lender_name=None, loan_recorded_date=None)])
+    assert _row(fresh_db)["status"] == "active"
+
+
+def test_record_without_county_is_skipped(fresh_db):
+    assert upsert_records(fresh_db, [_rec(county_name=None)]) == (0, 0, 1)
+    assert _count(fresh_db) == 0
+
+
 def test_loan_change_flags_refinanced(fresh_db):
     upsert_records(fresh_db, [_rec(loan_doc_number="DOC-OLD")])
     upsert_records(fresh_db, [_rec(loan_doc_number="DOC-NEW")])

@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from config.property_radar import OWNER_ABBREVIATIONS
@@ -50,6 +51,10 @@ _COLUMNS: tuple[str, ...] = (
     "campaign", "raw",
 )
 _KEY_COLUMNS = ("state_fips", "county_fips", "apn")
+_REQUIRED_COLUMNS = ("radar_id", "state_fips", "county_fips", "apn", "state", "county_name")
+# A blank value here in the feed means "not reported", not "cleared": keep the
+# stored value so a gap can't read as a change when the real value reappears.
+_STICKY_COLUMNS = ("owner_name", "lender_name", "loan_recorded_date", "loan_doc_number")
 
 _PUNCT_RE = re.compile(r"[^\w\s]")
 _SPACE_RE = re.compile(r"\s+")
@@ -149,6 +154,10 @@ def _dedupe_batch(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], 
     """Last record wins per key; a radar_id reused by a second key is dropped."""
     by_key: dict[Key, dict[str, Any]] = {}
     for r in records:
+        missing = [c for c in _REQUIRED_COLUMNS if not r.get(c)]
+        if missing:
+            logger.warning("PropertyRadar record radar_id=%s missing %s, skipping", r.get("radar_id"), missing)
+            continue
         by_key[_key(r)] = r
     kept: list[dict[str, Any]] = []
     rid_owner: dict[str, Key] = {}
@@ -168,6 +177,16 @@ def upsert_records(session: Session, records: list[dict[str, Any]]) -> tuple[int
         return 0, 0, 0
 
     batch, skipped = _dedupe_batch(records)
+    if not batch:
+        return 0, 0, skipped
+    try:
+        return _upsert_batch(session, batch, skipped)
+    except SQLAlchemyError:
+        logger.exception("PropertyRadar upsert failed for batch of %d records", len(batch))
+        raise
+
+
+def _upsert_batch(session: Session, batch: list[dict[str, Any]], skipped: int) -> tuple[int, int, int]:
     keys = [_key(r) for r in batch]
 
     existing_rows = session.execute(
@@ -196,6 +215,7 @@ def upsert_records(session: Session, records: list[dict[str, Any]]) -> tuple[int
             inserts.append(_base_params(record))
             continue
 
+        record = {**record, **{c: existing.get(c) for c in _STICKY_COLUMNS if not record.get(c)}}
         flags, prior, status = _detect_change(record, existing)
         params = _base_params(record)
         params.update(

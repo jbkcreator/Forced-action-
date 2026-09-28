@@ -30,8 +30,8 @@ DDL = [
         county_fips VARCHAR(5)   NOT NULL,
         apn         VARCHAR(100) NOT NULL,
 
-        state        VARCHAR(2),
-        county_name  VARCHAR(100),
+        state        VARCHAR(2)   NOT NULL,
+        county_name  VARCHAR(100) NOT NULL,
 
         property_address VARCHAR(255),
         city             VARCHAR(100),
@@ -73,7 +73,10 @@ DDL = [
         CONSTRAINT ck_pr_status           CHECK  (status IN ('active','sold','refinanced'))
     );
     """,
-    "CREATE INDEX IF NOT EXISTS ix_pr_campaign    ON property_radar_records (campaign);",
+    # Tables created before county became mandatory; SET NOT NULL is a no-op when already set.
+    "ALTER TABLE property_radar_records ALTER COLUMN state SET NOT NULL;",
+    "ALTER TABLE property_radar_records ALTER COLUMN county_name SET NOT NULL;",
+    "CREATE INDEX IF NOT EXISTS ix_pr_campaign   ON property_radar_records (campaign);",
     "CREATE INDEX IF NOT EXISTS ix_pr_county_fips ON property_radar_records (county_fips);",
     "CREATE INDEX IF NOT EXISTS ix_pr_property_id ON property_radar_records (property_id);",
 ]

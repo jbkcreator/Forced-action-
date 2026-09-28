@@ -12394,8 +12394,8 @@ class PropertyRadarRecord(Base):
     apn: Mapped[str] = mapped_column(String(100), nullable=False)
 
     # --- Geography / display -----------------------------------------------
-    state: Mapped[Optional[str]] = mapped_column(String(2))
-    county_name: Mapped[Optional[str]] = mapped_column(String(100))
+    state: Mapped[str] = mapped_column(String(2), nullable=False)
+    county_name: Mapped[str] = mapped_column(String(100), nullable=False)
 
     # --- Property ----------------------------------------------------------
     property_address: Mapped[Optional[str]] = mapped_column(String(255))

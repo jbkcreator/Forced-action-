@@ -39,6 +39,8 @@ def _rec(n: int = 1, **overrides) -> dict:
         "state_fips": "12",
         "county_fips": FAKE_FIPS,
         "apn": f"TEST-PR-LINK-APN-{n:03d}",
+        "state": "FL",
+        "county_name": "TEST COUNTY",
         "property_address": None,
         "city": "TAMPA",
         "zip": None,

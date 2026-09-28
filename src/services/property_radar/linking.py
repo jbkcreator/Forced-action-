@@ -16,6 +16,7 @@ from typing import Any
 
 import pandas as pd
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from config.property_radar import COUNTY_FIPS_TO_SLUG
@@ -59,6 +60,19 @@ def link_unlinked(session: Session, *, batch_size: int = 500) -> dict[str, int]:
     if not fips_to_slug:
         return counts
 
+    try:
+        _link_pages(session, fips_to_slug, batch_size, counts)
+    except SQLAlchemyError:
+        logger.exception("PropertyRadar link_unlinked failed after %s", counts)
+        raise
+    logger.info(
+        "PropertyRadar link_unlinked: linked=%d no_match=%d county_mismatch=%d",
+        counts[LINKED], counts[NO_MATCH], counts[COUNTY_MISMATCH],
+    )
+    return counts
+
+
+def _link_pages(session: Session, fips_to_slug: dict[str, str], batch_size: int, counts: dict[str, int]) -> None:
     loaders = {slug: _MatchOnlyLoader(session, county_id=slug) for slug in set(fips_to_slug.values())}
     last_id = 0
 
@@ -85,11 +99,6 @@ def link_unlinked(session: Session, *, batch_size: int = 500) -> dict[str, int]:
             break
 
     session.flush()
-    logger.info(
-        "PropertyRadar link_unlinked: linked=%d no_match=%d county_mismatch=%d",
-        counts[LINKED], counts[NO_MATCH], counts[COUNTY_MISMATCH],
-    )
-    return counts
 
 
 def _match(loader: BaseLoader, slug: str, row: Any) -> tuple[str, dict[str, Any] | None]:
