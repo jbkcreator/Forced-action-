@@ -10793,6 +10793,10 @@ class FaMaxPerson(Base):
             "ix_fa_max_persons_email", "email",
             postgresql_where=text("email IS NOT NULL"),
         ),
+        Index(
+            "uq_fa_max_persons_source_reference", "source", "source_reference",
+            unique=True, postgresql_where=text("source_reference IS NOT NULL"),
+        ),
     )
 
     def __repr__(self) -> str:
