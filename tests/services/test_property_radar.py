@@ -64,6 +64,10 @@ def _raw_record(
         "PType": "SFR",
         "Owner": "TEST LLC",
         "OwnershipType": ownership_type,
+        "OwnerAddress": "500 MAILING AVE",
+        "OwnerCity": "MIAMI",
+        "OwnerState": "FL",
+        "OwnerZipFive": "33101",
         "FirstLenderOriginal": lender,
         "FirstDate": loan_date,
         "FirstAmount": 300000,
@@ -89,10 +93,13 @@ class TestNormalizer:
         assert result.county_name == "HILLSBOROUGH"
         assert result.county_fips == "12057"
         assert result.state_fips == "12"
-        assert result.loan_date == date(2025, 12, 9)
+        assert result.loan_recorded_date == date(2025, 12, 9)
         assert result.loan_term_years == 2
         assert result.loan_doc_number is None
         assert result.raw["RadarID"] == "PDA00001"
+        assert result.property_address == "100 MAIN ST"
+        assert result.zip == "33601"
+        assert result.lender_name == "KIAVI FNDG INC"
 
     def test_long_term_exclusion_filters_record(self):
         result = normalize(_record(term="30"), state="FL", campaign="maturity_target_lender")
@@ -119,8 +126,29 @@ class TestNormalizer:
         rec = _record(term="2")
         rec.raw["FirstDate"] = None
         result = normalize(rec, state="FL", campaign="x")
-        assert result.loan_date is None
+        assert result.loan_recorded_date is None
         assert result.est_maturity_date is None
+
+    def test_mailing_address_extracted_from_owner_fields(self):
+        """Dev 2's staging schema (property_radar_records) has dedicated
+        mailing_address/city/state/zip columns sourced from PropertyRadar's
+        OwnerAddress/OwnerCity/OwnerState/OwnerZipFive — this is the owner's
+        mailing address, not the property's own address."""
+        result = normalize(_record(), state="FL", campaign="x")
+        assert result.mailing_address == "500 MAILING AVE"
+        assert result.mailing_city == "MIAMI"
+        assert result.mailing_state == "FL"
+        assert result.mailing_zip == "33101"
+
+    def test_missing_mailing_fields_are_none(self):
+        rec = _record()
+        for key in ("OwnerAddress", "OwnerCity", "OwnerState", "OwnerZipFive"):
+            rec.raw[key] = None
+        result = normalize(rec, state="FL", campaign="x")
+        assert result.mailing_address is None
+        assert result.mailing_city is None
+        assert result.mailing_state is None
+        assert result.mailing_zip is None
 
     def test_principal_name_extracted_from_persons(self):
         persons = [
@@ -520,3 +548,107 @@ class TestMainRespectsEnabledFlag:
             self._run_main(["--dry-run", "--state", "FL"])
             mock_report.assert_called_once()
             mock_db.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# End-to-end integration: the pull must actually write into Dev 2's staging
+# table, not just print to stdout. This is what earlier silently regressed —
+# _run_pull() only emitted JSON to stdout and never called upsert_records(),
+# so nothing landed in property_radar_records regardless of how correct the
+# normalizer's output looked. Real Postgres, both migrations applied.
+# ---------------------------------------------------------------------------
+
+class TestPullWritesToStagingTable:
+    # Must be a real registered campaign key (build_campaign_criteria raises
+    # otherwise) — isolate test data by radar_id prefix instead of a fake
+    # campaign name.
+    CAMPAIGN = "maturity_target_lender"
+    RADAR_ID_PREFIX = "INTTEST"
+
+    def _cleanup(self, session):
+        from sqlalchemy import text
+        session.execute(text("DELETE FROM property_radar_records WHERE radar_id LIKE :p"), {"p": f"{self.RADAR_ID_PREFIX}%"})
+        session.execute(text("DELETE FROM property_radar_seen_ids WHERE radar_id LIKE :p"), {"p": f"{self.RADAR_ID_PREFIX}%"})
+        session.commit()
+
+    def test_backlog_pull_actually_inserts_into_property_radar_records(self):
+        from sqlalchemy import text
+        from unittest.mock import patch
+        from src.core.database import get_db_context
+        from src.tasks.property_radar_maturity_pull import _run_pull
+
+        raw_records = [
+            _raw_record("INTTEST0001", county="HILLSBOROUGH"),
+            _raw_record("INTTEST0002", county="PINELLAS"),
+        ]
+        fake_port = FakePropertyRadarPort(canned_records=raw_records)
+
+        with get_db_context() as session:
+            self._cleanup(session)
+            run_id = None
+            try:
+                with patch(
+                    "src.tasks.property_radar_maturity_pull.get_property_radar_port",
+                    return_value=fake_port,
+                ):
+                    result = _run_pull(
+                        mode="backlog", state="FL", campaign=self.CAMPAIGN,
+                        dry_run=False, session=session,
+                    )
+                run_id = result["run_id"]
+                assert result["records_fetched"] == 2
+
+                rows = session.execute(
+                    text(
+                        "SELECT radar_id, property_address, zip, lender_name, "
+                        "loan_recorded_date, mailing_address, county_name "
+                        "FROM property_radar_records WHERE radar_id LIKE :p ORDER BY radar_id"
+                    ),
+                    {"p": f"{self.RADAR_ID_PREFIX}%"},
+                ).mappings().all()
+                assert len(rows) == 2
+                # The exact bug this test guards against: a field-name mismatch
+                # between the normalizer and staging._COLUMNS silently lands as
+                # NULL here even though the normalizer's own output looked correct.
+                for row in rows:
+                    assert row["property_address"] == "100 MAIN ST"
+                    assert row["zip"] == "33601"
+                    assert row["lender_name"] == "KIAVI FNDG INC"
+                    assert row["loan_recorded_date"] is not None
+                    assert row["mailing_address"] == "500 MAILING AVE"
+                    assert row["county_name"] in ("HILLSBOROUGH", "PINELLAS")
+            finally:
+                self._cleanup(session)
+                if run_id is not None:
+                    session.execute(text("DELETE FROM property_radar_pull_runs WHERE id = :id"), {"id": run_id})
+                    session.commit()
+
+    def test_rerun_is_idempotent_no_duplicate_rows(self):
+        """upsert_records() dedupes by (state_fips, county_fips, apn); running
+        the same batch twice must not create duplicate property_radar_records rows."""
+        from sqlalchemy import text
+        from unittest.mock import patch
+        from src.core.database import get_db_context
+        from src.services.property_radar.staging import upsert_records
+        from src.tasks.property_radar_maturity_pull import _to_staging_dict
+        from src.services.property_radar_normalizer import normalize
+        from src.services.property_radar_port import PropertyRadarRecord
+
+        raw = _raw_record("INTTEST0003", county="HILLSBOROUGH")
+        record = PropertyRadarRecord(radar_id="INTTEST0003", raw=raw)
+        normalized = normalize(record, state="FL", campaign=self.CAMPAIGN)
+        staging_dict = _to_staging_dict(normalized)
+
+        with get_db_context() as session:
+            self._cleanup(session)
+            try:
+                upsert_records(session, [staging_dict])
+                upsert_records(session, [staging_dict])
+                session.commit()
+                count = session.execute(
+                    text("SELECT COUNT(*) FROM property_radar_records WHERE radar_id LIKE :p"),
+                    {"p": f"{self.RADAR_ID_PREFIX}%"},
+                ).scalar()
+                assert count == 1
+            finally:
+                self._cleanup(session)

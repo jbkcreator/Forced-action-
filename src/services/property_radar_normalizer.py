@@ -29,6 +29,18 @@ Key decisions encoded here (all from task-analysis plan, not invented here):
   5. county: taken from the raw County field (already uppercased by PR API).
      FIPS is looked up from config/property_radar_fips.py.
 
+  6. mailing_address/city/state/zip: taken from PropertyRadar's OwnerAddress/
+     OwnerCity/OwnerState/OwnerZipFive — this is the owner's mailing address,
+     not necessarily the property's own address (isSameMailing distinguishes
+     the two upstream but is not itself carried through here).
+
+Field names below match src/services/property_radar/staging.py's _COLUMNS
+exactly (property_address, zip, lender_name, loan_recorded_date, etc.) —
+this was previously misaligned (address/zip_code/lender_original/loan_date)
+and every renamed field silently landed as NULL in property_radar_records
+once Dev 2's upsert path was actually wired up. Do not rename without
+checking that module's _COLUMN_TYPES map first.
+
 COMPLIANCE BOUNDARY: no borrower financial data (credit score, income, bank
 statement, tax return, SSN) is stored or passed through this normalizer.
 """
@@ -62,24 +74,31 @@ class PropertyRadarNormalized:
     answer changes, only this dataclass and its consumers need updating.
     """
 
+    # Field names below match src/services/property_radar/staging.py's
+    # _COLUMNS exactly (Dev 2's §3 contract) — do not rename without
+    # checking that module's _COLUMN_TYPES map.
     radar_id: str
     state_fips: str
     county_fips: str
     apn: str
     state: str
     county_name: str
-    address: Optional[str]
+    property_address: Optional[str]
     city: Optional[str]
-    zip_code: Optional[str]
+    zip: Optional[str]
     property_type: Optional[str]
     owner_name: Optional[str]
     ownership_type: Optional[str]
-    lender_original: Optional[str]
-    loan_date: Optional[date]
+    lender_name: Optional[str]
+    loan_recorded_date: Optional[date]
     loan_amount: Optional[int]
     loan_term_years: Optional[int]       # None when "Unknown" or absent
     est_maturity_date: Optional[date]    # None when term or date is absent/unknown
     raw: dict                            # original PropertyRadar record, verbatim
+    mailing_address: Optional[str] = None
+    mailing_city: Optional[str] = None
+    mailing_state: Optional[str] = None
+    mailing_zip: Optional[str] = None
     loan_doc_number: None = None         # Always None — out of Dev 1 scope
     principal_name: Optional[str] = None
     campaign: str = ""
@@ -134,14 +153,18 @@ def normalize(
         apn=apn,
         state=state_upper,
         county_name=county_raw,
-        address=raw.get("Address") or None,
+        property_address=raw.get("Address") or None,
         city=raw.get("City") or None,
-        zip_code=raw.get("ZipFive") or None,
+        zip=raw.get("ZipFive") or None,
         property_type=raw.get("PType") or None,
         owner_name=raw.get("Owner") or None,
         ownership_type=raw.get("OwnershipType") or None,
-        lender_original=raw.get("FirstLenderOriginal") or None,
-        loan_date=loan_date,
+        mailing_address=raw.get("OwnerAddress") or None,
+        mailing_city=raw.get("OwnerCity") or None,
+        mailing_state=raw.get("OwnerState") or None,
+        mailing_zip=raw.get("OwnerZipFive") or None,
+        lender_name=raw.get("FirstLenderOriginal") or None,
+        loan_recorded_date=loan_date,
         loan_amount=_parse_int(raw.get("FirstAmount")),
         loan_term_years=term_years,
         est_maturity_date=est_maturity,
