@@ -17,13 +17,17 @@ def _record(n: int) -> dict:
 
 
 def _stages(calls: list[str], pulled: list[list[dict]] | None = None) -> Stages:
-    def pull(session, mode, state, campaign):
+    def pull(session, mode, state, campaign, stats):
         calls.append("pull")
-        yield from (pulled or [])
+        for batch in pulled or []:
+            stats.exports += len(batch)
+            yield batch
 
     return Stages(
         count=lambda s, mode, state, campaign: calls.append("count") or 42,
+        open_run=lambda s, mode, state, campaign: calls.append("open_run") or 7,
         pull=pull,
+        close_run=lambda s, run_id, status, fetched, exports: calls.append(f"close:{run_id}:{status}:{fetched}:{exports}"),
         mark_seen=lambda s, state, campaign, ids: calls.append(f"seen:{len(ids)}"),
         stage=lambda s, batch: calls.append(f"stage:{len(batch)}") or (len(batch), 0, 0),
         link=lambda s: calls.append("link") or {"linked": 1},
@@ -48,7 +52,8 @@ def test_apply_stages_links_hands_off_and_commits():
     batches = [[_record(1), _record(2)], [_record(3)]]
     summary = run(session, _stages(calls, batches), mode="daily", state="FL",
                   campaign="maturity_target_lender", apply=True)
-    assert calls == ["count", "pull", "stage:2", "seen:2", "stage:1", "seen:1", "link", "handoff:True:True"]
+    assert calls == ["count", "open_run", "pull", "stage:2", "seen:2", "stage:1", "seen:1",
+                     "close:7:done:3:3", "link", "handoff:True:True"]
     assert summary.staged == {"inserted": 3, "updated": 0, "skipped": 0}
     session.rollback.assert_not_called()
     assert session.commit.call_count >= 5
@@ -62,19 +67,52 @@ def test_records_marked_seen_only_after_their_batch_commits():
     assert order.index("seen:1") > order.index("stage:1") + 1  # a commit sits between them
 
 
-def test_failed_stage_leaves_batch_unseen():
-    session, calls = MagicMock(), []
-    stages = _stages(calls, [[_record(1)]])
+def _run_raising(stages):
+    session = MagicMock()
+    with pytest.raises(RuntimeError):
+        run(session, stages, mode="daily", state="FL", campaign="maturity_target_lender", apply=True)
+    return session
+
+
+def test_failed_stage_leaves_batch_unseen_and_marks_run_failed():
+    calls: list[str] = []
+    stages = _stages(calls, [[_record(1), _record(2)]])
 
     def boom(s, batch):
         raise RuntimeError("stage failed")
 
     stages.stage = boom
-    try:
-        run(session, stages, mode="daily", state="FL", campaign="maturity_target_lender", apply=True)
-    except RuntimeError:
-        pass
+    session = _run_raising(stages)
     assert not any(c.startswith("seen") for c in calls)
+    assert calls[-1] == "close:7:failed:0:2"
+    session.rollback.assert_called()
+
+
+def test_failed_mark_seen_marks_run_failed():
+    calls: list[str] = []
+    stages = _stages(calls, [[_record(1)], [_record(2)]])
+
+    def boom(s, state, campaign, ids):
+        raise RuntimeError("mark_seen failed")
+
+    stages.mark_seen = boom
+    _run_raising(stages)
+    assert calls[-1].startswith("close:7:failed:")
+    assert not any(c.startswith("close:7:done") for c in calls)
+
+
+def test_failed_purchase_marks_run_failed():
+    calls: list[str] = []
+    stages = _stages(calls)
+
+    def boom(session, mode, state, campaign, stats):
+        stats.exports += 1
+        raise RuntimeError("api down")
+        yield  # pragma: no cover
+
+    stages.pull = boom
+    _run_raising(stages)
+    assert calls[-1] == "close:7:failed:0:1"
 
 
 @dataclass
@@ -165,42 +203,22 @@ def _patched_stages(monkeypatch, radar_ids, seen=frozenset()):
     return runner.default_stages()
 
 
-def _executed_sql(session) -> list[str]:
-    return [str(c.args[0]) for c in session.execute.call_args_list]
-
-
-def test_pull_records_a_done_run_as_the_daily_watermark(monkeypatch):
+def test_real_pull_stage_skips_seen_and_counts_exports(monkeypatch):
+    from src.tasks.property_radar_runner import PullStats
     stages = _patched_stages(monkeypatch, ["A", "B", "C"], seen=frozenset({"B"}))
-    session = MagicMock()
-    session.execute.return_value.scalar.return_value = 7
-    batches = list(stages.pull(session, "daily", "FL", "maturity_target_lender"))
+    stats = PullStats()
+    batches = list(stages.pull(MagicMock(), "daily", "FL", "maturity_target_lender", stats))
     assert [r["radar_id"] for b in batches for r in b] == ["A", "C"]
-    sql = _executed_sql(session)
-    assert any("INSERT INTO property_radar_pull_runs" in s for s in sql)
-    done = [c for c in session.execute.call_args_list if "status = 'done'" in str(c.args[0])]
-    assert done and done[0].args[1] == {"id": 7, "fetched": 2, "exports": 3}
+    assert stats.exports == 3
 
 
-def test_failed_purchase_marks_the_run_failed(monkeypatch):
-    stages = _patched_stages(monkeypatch, ["A"])
-
-    class _Boom(_FakePort):
-        def purchase(self, criteria):
-            raise RuntimeError("api down")
-            yield  # pragma: no cover
-
-    import src.services.property_radar_port as port_mod
-    monkeypatch.setattr(port_mod, "get_property_radar_port", lambda: _Boom([]))
-    from src.tasks import property_radar_runner as runner
-    stages = runner.default_stages()
+def test_real_run_bookkeeping_writes_done_and_failed(monkeypatch):
+    stages = _patched_stages(monkeypatch, [])
     session = MagicMock()
-    try:
-        list(stages.pull(session, "daily", "FL", "maturity_target_lender"))
-    except RuntimeError:
-        pass
-    sql = _executed_sql(session)
-    assert any("status = 'failed'" in s for s in sql)
-    assert not any("status = 'done'" in s for s in sql)
+    stages.close_run(session, 7, "failed", 0, 2)
+    sql, params = session.execute.call_args.args
+    assert "UPDATE property_radar_pull_runs" in str(sql)
+    assert params == {"id": 7, "status": "failed", "fetched": 0, "exports": 2}
 
 
 @dataclass

@@ -46,10 +46,18 @@ STAGE_BATCH_SIZE = 500
 
 
 @dataclass
+class PullStats:
+    """Filled in by the pull stage while it iterates: every purchased record costs an export."""
+    exports: int = 0
+
+
+@dataclass
 class Stages:
-    """Pipeline steps (count, pull, mark seen, stage, link, handoff), injectable for tests."""
+    """Pipeline steps, injectable for tests. open_run/close_run keep the pull-run audit row."""
     count: Callable[[Session, str, str, str], int]
-    pull: Callable[[Session, str, str, str], Iterator[list[dict[str, Any]]]]
+    open_run: Callable[[Session, str, str, str], Any]
+    pull: Callable[[Session, str, str, str, PullStats], Iterator[list[dict[str, Any]]]]
+    close_run: Callable[[Session, Any, str, int, int], None]
     mark_seen: Callable[[Session, str, str, list[str]], None]
     stage: Callable[[Session, list[dict[str, Any]]], tuple[int, int, int]]
     link: Callable[[Session], dict[str, int]]
@@ -115,14 +123,7 @@ def run(session: Session, stages: Stages, *, mode: str, state: str, campaign: st
     summary.would_fetch = stages.count(session, mode, state, campaign)
 
     if apply:
-        for batch in stages.pull(session, mode, state, campaign):
-            ins, upd, skip = stages.stage(session, batch)
-            session.commit()
-            # Seen only after the batch is committed: a failed stage must be re-fetched.
-            stages.mark_seen(session, state, campaign, [r["radar_id"] for r in batch])
-            session.commit()
-            for key, val in zip(("inserted", "updated", "skipped"), (ins, upd, skip)):
-                summary.staged[key] += val
+        _pull_and_stage(session, stages, summary, mode=mode, state=state, campaign=campaign)
 
     try:
         summary.linked = stages.link(session)
@@ -135,16 +136,47 @@ def run(session: Session, stages: Stages, *, mode: str, state: str, campaign: st
     return summary
 
 
+def _pull_and_stage(session: Session, stages: Stages, summary: RunSummary, *,
+                    mode: str, state: str, campaign: str) -> None:
+    """Buy + stage batch by batch. The run row ends 'done' or 'failed', whichever step raises."""
+    run_id = stages.open_run(session, mode, state, campaign)
+    session.commit()
+    stats, fetched, committed = PullStats(), 0, 0
+    try:
+        for batch in stages.pull(session, mode, state, campaign, stats):
+            ins, upd, skip = stages.stage(session, batch)
+            session.commit()
+            # Seen only after the batch is committed: a failed stage must be re-fetched.
+            stages.mark_seen(session, state, campaign, [r["radar_id"] for r in batch])
+            session.commit()
+            committed += 1
+            fetched += len(batch)
+            for key, val in zip(("inserted", "updated", "skipped"), (ins, upd, skip)):
+                summary.staged[key] += val
+    except Exception:
+        session.rollback()
+        stages.close_run(session, run_id, "failed", fetched, stats.exports)
+        session.commit()
+        logger.exception(
+            "PropertyRadar pull/stage failed for %s/%s after %d committed batches; "
+            "unstaged records stay unseen and are re-fetched next run", state, campaign, committed,
+        )
+        raise
+    stages.close_run(session, run_id, "done", fetched, stats.exports)
+    session.commit()
+
+
 _RUN_START_SQL = """
     INSERT INTO property_radar_pull_runs (run_type, state, campaign, started_at, status)
     VALUES (:mode, :state, :campaign, now(), 'running') RETURNING id
 """
-_RUN_DONE_SQL = """
+# The pull-run row is the daily watermark: a 'done' run narrows the next daily
+# criteria to newly matured loans instead of re-buying the backlog.
+_RUN_CLOSE_SQL = """
     UPDATE property_radar_pull_runs
-    SET finished_at = now(), records_fetched = :fetched, exports_consumed = :exports, status = 'done'
+    SET finished_at = now(), records_fetched = :fetched, exports_consumed = :exports, status = :status
     WHERE id = :id
 """
-_RUN_FAILED_SQL = "UPDATE property_radar_pull_runs SET finished_at = now(), status = 'failed' WHERE id = :id"
 
 
 def default_stages(trace_results: Optional[Path] = None) -> Stages:
@@ -170,7 +202,14 @@ def default_stages(trace_results: Optional[Path] = None) -> Stages:
             logger.exception("PropertyRadar free count failed for %s/%s (%s)", state, campaign, mode)
             raise
 
-    def pull(session: Session, mode: str, state: str, campaign: str) -> Iterator[list[dict[str, Any]]]:
+    def open_run(session: Session, mode: str, state: str, campaign: str) -> int:
+        return session.execute(text(_RUN_START_SQL), {"mode": mode, "state": state, "campaign": campaign}).scalar()
+
+    def close_run(session: Session, run_id: int, status: str, fetched: int, exports: int) -> None:
+        session.execute(text(_RUN_CLOSE_SQL), {"id": run_id, "status": status, "fetched": fetched, "exports": exports})
+
+    def pull(session: Session, mode: str, state: str, campaign: str,
+             stats: PullStats) -> Iterator[list[dict[str, Any]]]:
         crit = criteria(session, mode, state, campaign)
         try:
             pull_task._check_budget(port, crit, state, campaign)
@@ -178,38 +217,16 @@ def default_stages(trace_results: Optional[Path] = None) -> Stages:
             logger.exception("PropertyRadar budget check refused or failed for %s/%s", state, campaign)
             raise
         seen = pull_task._load_seen_ids(session, state, campaign)
-        # The pull-run row is the daily watermark: a 'done' run narrows the next
-        # daily criteria to newly matured loans instead of re-buying the backlog.
-        run_id = session.execute(text(_RUN_START_SQL), {"mode": mode, "state": state, "campaign": campaign}).scalar()
-        session.commit()
-        exports = 0
 
         def purchased():
-            nonlocal exports
             for r in port.purchase(crit):
-                exports += 1
+                stats.exports += 1
                 if r.radar_id not in seen:
                     yield r
 
         records = (to_contract(n) for n in (normalize(r, state=state, campaign=campaign) for r in purchased())
                    if n is not None)
-        staged_batches = fetched = 0
-        try:
-            for batch in _batches(records, STAGE_BATCH_SIZE):
-                yield batch
-                staged_batches += 1
-                fetched += len(batch)
-        except Exception:
-            session.rollback()
-            session.execute(text(_RUN_FAILED_SQL), {"id": run_id})
-            session.commit()
-            logger.exception(
-                "PropertyRadar pull failed for %s/%s after %d committed batches; "
-                "unstaged records stay unseen and are re-fetched next run", state, campaign, staged_batches,
-            )
-            raise
-        session.execute(text(_RUN_DONE_SQL), {"id": run_id, "fetched": fetched, "exports": exports})
-        session.commit()
+        yield from _batches(records, STAGE_BATCH_SIZE)
 
     def handoff(session: Session, campaign: str, apply: bool, commit: Optional[Callable[[], None]]) -> dict[str, int]:
         from config.settings import get_settings
@@ -229,7 +246,7 @@ def default_stages(trace_results: Optional[Path] = None) -> Stages:
         return dict(Counter(d.outcome.value for d in report.decisions))
 
     return Stages(
-        count=count, pull=pull, mark_seen=pull_task._mark_seen,
+        count=count, open_run=open_run, pull=pull, close_run=close_run, mark_seen=pull_task._mark_seen,
         stage=staging.upsert_records, link=linking.link_unlinked, handoff=handoff,
     )
 
