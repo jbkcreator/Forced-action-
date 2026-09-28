@@ -109,21 +109,26 @@ def resolve_links(db: Session, *, person_id: str, opportunity_id: Optional[str])
         raise LinkUnresolved("app_base_url_unset")
 
     label = _outbound_link_label(person_id, opportunity_id)
-    slug = _existing_slug(db, label)
-    if slug is None:
-        try:
-            link = mint_link(
-                db,
-                kind="source",
-                label=label,
-                created_by=_CREATED_BY,
-                property_id=_subject_property_id(db, opportunity_id) if opportunity_id else None,
-                buyer_entity_id=_buyer_entity_id(db, person_id),
-            )
-        except Exception as exc:
-            logger.warning("fa_max_outbound_links: mint failed opportunity_id=%s: %s", opportunity_id, type(exc).__name__)
-            raise LinkUnresolved("mint_failed") from exc
-        slug = link.slug
+    # Lookup and mint share one savepoint: any DB failure here must degrade to
+    # the fail-closed LinkUnresolved path, and must not leave the caller's
+    # transaction aborted (callers loop over many touches on one session).
+    stage = "lookup_failed"
+    try:
+        with db.begin_nested():
+            slug = _existing_slug(db, label)
+            if slug is None:
+                stage = "mint_failed"
+                slug = mint_link(
+                    db,
+                    kind="source",
+                    label=label,
+                    created_by=_CREATED_BY,
+                    property_id=_subject_property_id(db, opportunity_id) if opportunity_id else None,
+                    buyer_entity_id=_buyer_entity_id(db, person_id),
+                ).slug
+    except Exception as exc:
+        logger.warning("fa_max_outbound_links: %s opportunity_id=%s: %s", stage, opportunity_id, type(exc).__name__)
+        raise LinkUnresolved(stage) from exc
 
     return OutboundLinks(calendar_url=f"{base}/book/{slug}", portal_url=f"{base}/go/{slug}")
 

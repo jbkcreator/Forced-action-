@@ -237,3 +237,35 @@ def test_booking_line_is_added_only_once():
 
     assert twice == once
     assert twice.count("https://x/book/s") == 1
+
+
+def test_lookup_db_error_fails_closed_and_keeps_session_usable(fresh_db, monkeypatch):
+    """A DB error on the existing-link lookup must become LinkUnresolved (withhold +
+    alert), not escape to the caller's loop — and must not abort its transaction."""
+    from src.services import fa_max_outbound_links as links_mod
+
+    monkeypatch.setattr(links_mod, "_public_base_url", lambda: "https://app.example.test")
+    monkeypatch.setattr(links_mod, "_existing_slug",
+                        lambda db, label: db.execute(text("SELECT slug FROM no_such_table_for_test")).scalar())
+    person_id, opportunity_id = _seed_person_opportunity(fresh_db)
+
+    with pytest.raises(links_mod.LinkUnresolved) as exc:
+        links_mod.resolve_links(fresh_db, person_id=person_id, opportunity_id=opportunity_id)
+    assert str(exc.value) == "lookup_failed"
+    assert fresh_db.execute(text("SELECT 1")).scalar() == 1
+
+
+def test_resolve_or_alert_turns_lookup_error_into_withheld_touch(fresh_db, monkeypatch):
+    from src.services import fa_max_outbound_links as links_mod
+
+    alerts: list[dict] = []
+    monkeypatch.setattr(links_mod, "_public_base_url", lambda: "https://app.example.test")
+    monkeypatch.setattr(links_mod, "alert_link_unresolved", lambda **kw: alerts.append(kw))
+    monkeypatch.setattr(links_mod, "_existing_slug",
+                        lambda db, label: db.execute(text("SELECT slug FROM no_such_table_for_test")).scalar())
+    person_id, opportunity_id = _seed_person_opportunity(fresh_db)
+
+    assert links_mod.resolve_or_alert(
+        fresh_db, person_id=person_id, opportunity_id=opportunity_id, agent_name="test",
+    ) is None
+    assert alerts and alerts[0]["reason"] == "lookup_failed"
