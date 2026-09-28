@@ -26,6 +26,7 @@ from enum import Enum
 from typing import Optional
 
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from config.lead_ownership import FA_MAX_ENGINE_CAMPAIGNS, priority_rank
@@ -80,10 +81,14 @@ def decide(claim: str, ours: Optional[str], engine: Optional[str]) -> _Decision:
 
 _LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtext(:lock_key))"
 
-_EXISTING_CLAIM_SQL = """
-    SELECT status FROM lead_campaign_assignments
-    WHERE person_id = CAST(:person_id AS uuid) AND campaign = :campaign
-      AND COALESCE(radar_id, '') = COALESCE(:radar_id, '')
+# One read for both: the person's active owner and this exact claim, if already made.
+_CLAIM_STATE_SQL = """
+    SELECT id, campaign, status,
+           (campaign = :campaign AND COALESCE(radar_id, '') = COALESCE(:radar_id, '')) AS is_this_claim
+    FROM lead_campaign_assignments
+    WHERE person_id = CAST(:person_id AS uuid)
+      AND (status = :active
+           OR (campaign = :campaign AND COALESCE(radar_id, '') = COALESCE(:radar_id, '')))
 """
 
 _ACTIVE_ASSIGNMENT_SQL = """
@@ -132,8 +137,12 @@ def _active_assignment(session: Session, person_id: str) -> Optional[dict]:
 
 def owning_campaign(session: Session, person_id: str) -> Optional[str]:
     """The campaign allowed to run a sequence for this person right now, or None."""
-    ours = _active_assignment(session, person_id)
-    return _best(ours and ours["campaign"], _engine_owner(session, person_id))
+    try:
+        ours = _active_assignment(session, person_id)
+        return _best(ours and ours["campaign"], _engine_owner(session, person_id))
+    except SQLAlchemyError:
+        logger.exception("Lead ownership lookup failed for person %s", person_id)
+        raise
 
 
 def claim_ownership(
@@ -149,16 +158,32 @@ def claim_ownership(
     if campaign in FA_MAX_ENGINE_CAMPAIGNS:
         raise ValueError(f"{campaign!r} is owned through fa_max_campaign_enrollments, not claimed here")
     priority_rank(campaign)  # rejects unknown campaigns before touching the DB
+    try:
+        return _claim(session, person_id=person_id, campaign=campaign, source=source,
+                      opportunity_id=opportunity_id, radar_id=radar_id)
+    except SQLAlchemyError:
+        logger.exception("Lead ownership claim failed: campaign=%s person=%s radar_id=%s",
+                         campaign, person_id, radar_id)
+        raise
+
+
+def _claim(
+    session: Session, *, person_id: str, campaign: str, source: str,
+    opportunity_id: Optional[str], radar_id: Optional[str],
+) -> OwnershipResult:
     # Serialize claims per person: the partial unique index alone would turn a
     # concurrent second claim into an IntegrityError instead of a preempt/block.
     session.execute(text(_LOCK_SQL), {"lock_key": f"lead_ownership:{person_id}"})
 
-    ours = _active_assignment(session, person_id)
+    claim_params = {"person_id": person_id, "campaign": campaign, "radar_id": radar_id}
+    rows = session.execute(
+        text(_CLAIM_STATE_SQL), {**claim_params, "active": AssignmentStatus.ACTIVE.value}
+    ).mappings().all()
+    ours = next((dict(r) for r in rows if r["status"] == AssignmentStatus.ACTIVE.value), None)
+    existing = next((r["status"] for r in rows if r["is_this_claim"]), None)
     ours_campaign = ours and ours["campaign"]
     engine = _engine_owner(session, person_id)
 
-    claim_params = {"person_id": person_id, "campaign": campaign, "radar_id": radar_id}
-    existing = session.execute(text(_EXISTING_CLAIM_SQL), claim_params).scalar()
     if existing is not None:
         return OwnershipResult(AssignmentStatus(existing), _best(ours_campaign, engine) or campaign)
 

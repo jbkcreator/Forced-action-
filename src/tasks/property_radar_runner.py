@@ -9,7 +9,8 @@ committing each stage. --apply refuses a state that is not in ENABLED_STATES.
 
 Usage:
     PYTHONPATH=. python -m src.tasks.property_radar_runner                 # dry run
-    PYTHONPATH=. python -m src.tasks.property_radar_runner --apply --mode daily --state FL
+    PYTHONPATH=. python -m src.tasks.property_radar_runner --apply --mode daily --state FL \
+        --trace-results path/to/trace_results.csv
 
 Adding a state (config only, no code change):
   1. config/property_radar_fips.py      add the state's FIPS code and every county FIPS
@@ -32,8 +33,10 @@ import argparse
 import logging
 from collections import Counter
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Optional
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
@@ -124,11 +127,24 @@ def run(session: Session, stages: Stages, *, mode: str, state: str, campaign: st
     return summary
 
 
-def default_stages() -> Stages:
+_RUN_START_SQL = """
+    INSERT INTO property_radar_pull_runs (run_type, state, campaign, started_at, status)
+    VALUES (:mode, :state, :campaign, now(), 'running') RETURNING id
+"""
+_RUN_DONE_SQL = """
+    UPDATE property_radar_pull_runs
+    SET finished_at = now(), records_fetched = :fetched, exports_consumed = :exports, status = 'done'
+    WHERE id = :id
+"""
+_RUN_FAILED_SQL = "UPDATE property_radar_pull_runs SET finished_at = now(), status = 'failed' WHERE id = :id"
+
+
+def default_stages(trace_results: Optional[Path] = None) -> Stages:
     """Real stages. Imported lazily: each belongs to another developer's module."""
     from config.property_radar_campaigns import build_campaign_criteria
     from src.services.property_radar import linking, staging
     from src.services.property_radar.lead_handoff import SqlHandoffStore, iter_staged_leads, run_handoff
+    from src.services.property_radar.trace_contacts import load_trace_contacts
     from src.services.property_radar_normalizer import normalize
     from src.services.property_radar_port import get_property_radar_port
     from src.tasks import property_radar_maturity_pull as pull_task
@@ -154,31 +170,49 @@ def default_stages() -> Stages:
             logger.exception("PropertyRadar budget check refused or failed for %s/%s", state, campaign)
             raise
         seen = pull_task._load_seen_ids(session, state, campaign)
-        records = (
-            to_contract(n)
-            for n in (normalize(r, state=state, campaign=campaign) for r in port.purchase(crit)
-                      if r.radar_id not in seen)
-            if n is not None
-        )
-        staged_batches = 0
+        # The pull-run row is the daily watermark: a 'done' run narrows the next
+        # daily criteria to newly matured loans instead of re-buying the backlog.
+        run_id = session.execute(text(_RUN_START_SQL), {"mode": mode, "state": state, "campaign": campaign}).scalar()
+        session.commit()
+        exports = 0
+
+        def purchased():
+            nonlocal exports
+            for r in port.purchase(crit):
+                exports += 1
+                if r.radar_id not in seen:
+                    yield r
+
+        records = (to_contract(n) for n in (normalize(r, state=state, campaign=campaign) for r in purchased())
+                   if n is not None)
+        staged_batches = fetched = 0
         try:
             for batch in _batches(records, STAGE_BATCH_SIZE):
                 yield batch
                 staged_batches += 1
+                fetched += len(batch)
         except Exception:
+            session.rollback()
+            session.execute(text(_RUN_FAILED_SQL), {"id": run_id})
+            session.commit()
             logger.exception(
-                "PropertyRadar purchase failed for %s/%s after %d committed batches; "
+                "PropertyRadar pull failed for %s/%s after %d committed batches; "
                 "unstaged records stay unseen and are re-fetched next run", state, campaign, staged_batches,
             )
             raise
+        session.execute(text(_RUN_DONE_SQL), {"id": run_id, "fetched": fetched, "exports": exports})
+        session.commit()
 
     def handoff(session: Session, campaign: str, apply: bool, commit: Optional[Callable[[], None]]) -> dict[str, int]:
         from config.settings import get_settings
         settings = get_settings()
+        contacts = load_trace_contacts(trace_results) if trace_results else {}
+        if not contacts:
+            logger.warning("No trace contacts supplied: the handoff skips every record as no_contact_data.")
         report = run_handoff(
             store=SqlHandoffStore(session),
             pages=iter_staged_leads(session, campaign=campaign),
-            contacts_by_radar={},
+            contacts_by_radar=contacts,
             thin_path_only=settings.property_radar_thin_path_only,
             contact_rules_enabled=settings.property_radar_contact_rules_enabled,
             apply=apply,
@@ -202,6 +236,8 @@ def main() -> None:
     parser.add_argument("--mode", choices=("daily", "backlog"), default="daily")
     parser.add_argument("--state", default="FL")
     parser.add_argument("--campaign", default=DEFAULT_CAMPAIGN)
+    parser.add_argument("--trace-results", type=Path,
+                        help="Tracerfy results CSV; the handoff needs contacts or it skips every record")
     parser.add_argument("--apply", action="store_true", help="Buy, stage, link and hand off (default: dry run)")
     args = parser.parse_args()
 
@@ -216,7 +252,7 @@ def main() -> None:
 
     from src.core.database import get_db_context
     with get_db_context() as session:
-        summary = run(session, default_stages(), mode=args.mode, state=args.state,
+        summary = run(session, default_stages(args.trace_results), mode=args.mode, state=args.state,
                       campaign=args.campaign, apply=args.apply)
     logger.info("\n%s", summary.render())
 

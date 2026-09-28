@@ -135,3 +135,69 @@ def test_dry_run_leaves_nothing_in_the_database(pg_engine):
     with pg_engine.connect() as conn:
         left = conn.execute(text("SELECT COUNT(*) FROM fa_max_persons WHERE source_reference = :r"), {"r": ref}).scalar()
     assert left == 0
+
+
+class _FakePort:
+    def __init__(self, radar_ids):
+        self.radar_ids = radar_ids
+
+    def count(self, criteria):
+        return len(self.radar_ids)
+
+    def purchase(self, criteria):
+        for rid in self.radar_ids:
+            yield _Normalized(radar_id=rid)
+
+
+def _patched_stages(monkeypatch, radar_ids, seen=frozenset()):
+    import config.property_radar_campaigns as campaigns
+    import src.services.property_radar_normalizer as normalizer
+    import src.services.property_radar_port as port_mod
+    import src.tasks.property_radar_maturity_pull as pull_task
+    from src.tasks import property_radar_runner as runner
+
+    monkeypatch.setattr(port_mod, "get_property_radar_port", lambda: _FakePort(radar_ids))
+    monkeypatch.setattr(campaigns, "build_campaign_criteria", lambda *a, **k: [])
+    monkeypatch.setattr(normalizer, "normalize", lambda r, **k: r)
+    monkeypatch.setattr(pull_task, "_check_budget", lambda *a: 0)
+    monkeypatch.setattr(pull_task, "_load_seen_ids", lambda *a: seen)
+    monkeypatch.setattr(pull_task, "_last_successful_run_date", lambda *a: None)
+    return runner.default_stages()
+
+
+def _executed_sql(session) -> list[str]:
+    return [str(c.args[0]) for c in session.execute.call_args_list]
+
+
+def test_pull_records_a_done_run_as_the_daily_watermark(monkeypatch):
+    stages = _patched_stages(monkeypatch, ["A", "B", "C"], seen=frozenset({"B"}))
+    session = MagicMock()
+    session.execute.return_value.scalar.return_value = 7
+    batches = list(stages.pull(session, "daily", "FL", "maturity_target_lender"))
+    assert [r["radar_id"] for b in batches for r in b] == ["A", "C"]
+    sql = _executed_sql(session)
+    assert any("INSERT INTO property_radar_pull_runs" in s for s in sql)
+    done = [c for c in session.execute.call_args_list if "status = 'done'" in str(c.args[0])]
+    assert done and done[0].args[1] == {"id": 7, "fetched": 2, "exports": 3}
+
+
+def test_failed_purchase_marks_the_run_failed(monkeypatch):
+    stages = _patched_stages(monkeypatch, ["A"])
+
+    class _Boom(_FakePort):
+        def purchase(self, criteria):
+            raise RuntimeError("api down")
+            yield  # pragma: no cover
+
+    import src.services.property_radar_port as port_mod
+    monkeypatch.setattr(port_mod, "get_property_radar_port", lambda: _Boom([]))
+    from src.tasks import property_radar_runner as runner
+    stages = runner.default_stages()
+    session = MagicMock()
+    try:
+        list(stages.pull(session, "daily", "FL", "maturity_target_lender"))
+    except RuntimeError:
+        pass
+    sql = _executed_sql(session)
+    assert any("status = 'failed'" in s for s in sql)
+    assert not any("status = 'done'" in s for s in sql)

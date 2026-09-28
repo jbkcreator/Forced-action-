@@ -18,10 +18,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import logging
+
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from config.lead_ownership import CAMPAIGN_PRIORITY, FA_MAX_ENGINE_CAMPAIGNS
+
+logger = logging.getLogger(__name__)
 
 MEASURES = ("reach", "reply", "booked", "wrong_person", "paid_off")
 
@@ -102,7 +107,11 @@ def lead_campaigns() -> tuple[str, ...]:
 def pilot_rollup(session: Session) -> list[CampaignRollup]:
     """One row per lead campaign, in priority order; zeros before any sends."""
     campaigns = lead_campaigns()
-    rows = session.execute(text(_ROLLUP_SQL), {"campaigns": list(campaigns)}).mappings().all()
+    try:
+        rows = session.execute(text(_ROLLUP_SQL), {"campaigns": list(campaigns)}).mappings().all()
+    except SQLAlchemyError:
+        logger.exception("Pilot rollup query failed for campaigns %s", campaigns)
+        raise
     by_campaign = {r["campaign"]: CampaignRollup(**dict(r)) for r in rows}
     return [by_campaign.get(c, CampaignRollup(c)) for c in campaigns]
 
