@@ -42,6 +42,10 @@ PYTHONPATH=. python migrations/apply_fa_max_wp_t2_2_opportunity_origin_immutable
 PYTHONPATH=. python migrations/apply_fa_max_wp_t2_2_tool_call_log_in_progress_status.py  # FA Max WP-T2-2 review fix: widens fa_max_tool_call_log.status CHECK to allow 'in_progress' (audit row written before a tool executes, not only after) (idempotent, run after apply_fa_max_wp_t2_2_agent_infra.py)
 PYTHONPATH=. python migrations/apply_fa_max_wp_t2_2_tool_call_log_claimed_status.py  # FA Max WP-T2-2 review fix: widens fa_max_tool_call_log.status CHECK to allow 'claimed' (claim_send_attempt()'s short-lived commit so a timeout write can't clobber a legitimately-claimed send) (idempotent, run after apply_fa_max_wp_t2_2_tool_call_log_in_progress_status.py)
 PYTHONPATH=. python migrations/apply_fa_max_wp_t2_3.py  # FA Max WP-T2-3: opportunity_id on relay_approval_queue, backflip_attribution_owner/set_at on fa_max_opportunities, fa_max_backflip_suppression_decisions audit table (idempotent, run after WP-T2-2)
+PYTHONPATH=. python migrations/apply_property_radar_pull_runs.py  # PropertyRadar ingestion adapter (Dev 1): property_radar_pull_runs (run checkpoint) + property_radar_seen_ids (dedup) (idempotent)
+
+# PropertyRadar daily target-lender maturity pull (separate cron, disabled until PROPERTY_RADAR_ENABLED=true — see scripts/cron/crontab.txt)
+python -m src.tasks.property_radar_maturity_pull --mode daily --state FL
 
 # FA Max agent worker (separate process, WP-T2-2 — see docs/PLATFORM-OPERATIONS-GUIDE.md)
 python -m src.agents.fa_max.worker
