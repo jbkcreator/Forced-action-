@@ -327,6 +327,18 @@ class AppSettings(BaseSettings):
 	# storm/restoration contractors from dbpr_contacts. Flip in env, no code deploy.
 	cora_target_mode: str = Field(default="whale", env="CORA_TARGET_MODE")
 
+	# PropertyRadar ingestion adapter (Developer 1)
+	# Solo plan: 10,000 export credits/month. Purchase=0 counts are free and
+	# never billed. Set property_radar_mode="fake" (default) in tests/local;
+	# "live" in production with a real key.
+	property_radar_api_key: Optional[SecretStr] = Field(default=None, env="PROPERTY_RADAR_API_KEY")
+	property_radar_enabled: bool = Field(default=False, env="PROPERTY_RADAR_ENABLED")
+	property_radar_mode: str = Field(default="fake", env="PROPERTY_RADAR_MODE")
+	# Hard cap per pull run — refuses to purchase more than this many records
+	# in a single invocation regardless of remaining monthly allowance. Prevents
+	# a runaway backlog from draining the monthly budget in one shot.
+	property_radar_per_run_cap: int = Field(default=5000, env="PROPERTY_RADAR_PER_RUN_CAP")
+
 
 	# ── Mode-aware helpers ────────────────────────────────────────────────────
 	# Use these everywhere instead of accessing live/test fields directly.

@@ -1,0 +1,457 @@
+"""Tests for PropertyRadar ingestion adapter — Developer 1 scope.
+
+All tests use FakePropertyRadarPort; no network calls are made.
+
+Covers:
+  - Normalizer: field extraction, long-term exclusion, est_maturity_date,
+    principal_name extraction, Unknown term handling.
+  - Port: FakePropertyRadarPort records calls, count() returns len(canned).
+  - Budget guard: allowance check and per-run cap raise RuntimeError.
+  - Campaign criteria: build_campaign_criteria raises on unknown campaign;
+    FL and GA criteria include expected keys.
+  - FIPS: Miami-Dade → 12025, Hillsborough → 12057, unknown → None.
+  - county_fips: case-insensitive lookup.
+"""
+from __future__ import annotations
+
+import json
+from dataclasses import replace
+from datetime import date
+from typing import Iterator
+from unittest.mock import patch
+
+import pytest
+
+from config.property_radar_campaigns import build_campaign_criteria, DEFAULT_CAMPAIGN
+from config.property_radar_fips import county_fips, FIPS_BY_STATE
+from src.services.property_radar_normalizer import (
+    PropertyRadarNormalized,
+    _compute_maturity,
+    _extract_principal,
+    _parse_term,
+    normalize,
+)
+from src.services.property_radar_port import (
+    AllowanceInfo,
+    FakePropertyRadarPort,
+    PropertyRadarRecord,
+)
+
+
+# ---------------------------------------------------------------------------
+# Fixtures — raw record builders
+# ---------------------------------------------------------------------------
+
+def _raw_record(
+    radar_id: str = "PDA00001",
+    *,
+    state: str = "FL",
+    county: str = "HILLSBOROUGH",
+    lender: str = "KIAVI FNDG INC",
+    loan_date: str = "2025-12-09",
+    term: object = "2",
+    persons: list | None = None,
+    ownership_type: str = "Corporate",
+) -> dict:
+    return {
+        "RadarID": radar_id,
+        "APN": "APN_001",
+        "State": state,
+        "County": county,
+        "Address": "100 MAIN ST",
+        "City": "TAMPA",
+        "ZipFive": "33601",
+        "PType": "SFR",
+        "Owner": "TEST LLC",
+        "OwnershipType": ownership_type,
+        "FirstLenderOriginal": lender,
+        "FirstDate": loan_date,
+        "FirstAmount": 300000,
+        "FirstTermInYears": term,
+        "Persons": persons or [],
+    }
+
+
+def _record(radar_id: str = "PDA00001", **kwargs) -> PropertyRadarRecord:
+    return PropertyRadarRecord(radar_id=radar_id, raw=_raw_record(radar_id=radar_id, **kwargs))
+
+
+# ---------------------------------------------------------------------------
+# Normalizer tests
+# ---------------------------------------------------------------------------
+
+class TestNormalizer:
+    def test_basic_normalization(self):
+        result = normalize(_record(), state="FL", campaign="maturity_target_lender")
+        assert result is not None
+        assert result.radar_id == "PDA00001"
+        assert result.state == "FL"
+        assert result.county_name == "HILLSBOROUGH"
+        assert result.county_fips == "12057"
+        assert result.state_fips == "12"
+        assert result.loan_date == date(2025, 12, 9)
+        assert result.loan_term_years == 2
+        assert result.loan_doc_number is None
+        assert result.raw["RadarID"] == "PDA00001"
+
+    def test_long_term_exclusion_filters_record(self):
+        result = normalize(_record(term="30"), state="FL", campaign="maturity_target_lender")
+        assert result is None
+
+    def test_long_term_exclusion_threshold_is_20(self):
+        assert normalize(_record(term="19"), state="FL", campaign="x") is not None
+        assert normalize(_record(term="20"), state="FL", campaign="x") is None
+
+    def test_unknown_term_is_kept(self):
+        result = normalize(_record(term="Unknown"), state="FL", campaign="x")
+        assert result is not None
+        assert result.loan_term_years is None
+
+    def test_unknown_term_has_no_maturity_date(self):
+        result = normalize(_record(term="Unknown"), state="FL", campaign="x")
+        assert result.est_maturity_date is None
+
+    def test_numeric_term_computes_maturity(self):
+        result = normalize(_record(term="2", loan_date="2025-01-01"), state="FL", campaign="x")
+        assert result.est_maturity_date == date(2027, 1, 1)
+
+    def test_missing_loan_date_yields_no_maturity(self):
+        rec = _record(term="2")
+        rec.raw["FirstDate"] = None
+        result = normalize(rec, state="FL", campaign="x")
+        assert result.loan_date is None
+        assert result.est_maturity_date is None
+
+    def test_principal_name_extracted_from_persons(self):
+        persons = [
+            {
+                "RadarID": "X",
+                "OwnershipRole": "Principal",
+                "PersonType": "Person",
+                "FirstName": "Jane",
+                "LastName": "Doe",
+            }
+        ]
+        result = normalize(_record(persons=persons), state="FL", campaign="x")
+        assert result.principal_name == "Jane Doe"
+
+    def test_company_principal_yields_no_name(self):
+        persons = [
+            {
+                "RadarID": "X",
+                "OwnershipRole": "Principal",
+                "PersonType": "Company",
+                "EntityName": "ACME LLC",
+            }
+        ]
+        result = normalize(_record(persons=persons), state="FL", campaign="x")
+        assert result.principal_name is None
+
+    def test_no_persons_yields_no_principal(self):
+        result = normalize(_record(persons=[]), state="FL", campaign="x")
+        assert result.principal_name is None
+
+    def test_county_normalized_uppercase(self):
+        rec = _record()
+        rec.raw["County"] = "hillsborough"
+        result = normalize(rec, state="FL", campaign="x")
+        assert result.county_name == "HILLSBOROUGH"
+
+    def test_miami_dade_fips_is_12025(self):
+        rec = _record(county="MIAMI-DADE")
+        result = normalize(rec, state="FL", campaign="x")
+        assert result.county_fips == "12025"
+
+    def test_unknown_county_is_skipped_missing_required_fips(self):
+        """Dev 2's contract: records missing county_fips (unresolvable county
+        name) are skipped, not passed through with county_fips=None."""
+        rec = _record(county="MADE-UP-COUNTY")
+        result = normalize(rec, state="FL", campaign="x")
+        assert result is None
+
+    def test_missing_apn_is_skipped(self):
+        rec = _record()
+        rec.raw["APN"] = None
+        result = normalize(rec, state="FL", campaign="x")
+        assert result is None
+
+    def test_unresolvable_state_is_skipped(self):
+        rec = _record(state="ZZ")
+        result = normalize(rec, state="ZZ", campaign="x")
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# FIPS mapping tests
+# ---------------------------------------------------------------------------
+
+class TestFIPSMapping:
+    def test_hillsborough_fips(self):
+        assert county_fips("FL", "HILLSBOROUGH") == "12057"
+
+    def test_pinellas_fips(self):
+        assert county_fips("FL", "PINELLAS") == "12103"
+
+    def test_miami_dade_legacy_fips(self):
+        assert county_fips("FL", "MIAMI-DADE") == "12025"
+
+    def test_case_insensitive(self):
+        assert county_fips("fl", "hillsborough") == "12057"
+
+    def test_unknown_county_returns_none(self):
+        assert county_fips("FL", "ATLANTIS") is None
+
+    def test_unknown_state_returns_none(self):
+        assert county_fips("ZZ", "ANYWHERE") is None
+
+    def test_fl_has_67_counties(self):
+        assert len(FIPS_BY_STATE["FL"]) == 67
+
+    def test_ga_cobb_fips(self):
+        assert county_fips("GA", "COBB") == "13067"
+
+
+# ---------------------------------------------------------------------------
+# FakePropertyRadarPort tests
+# ---------------------------------------------------------------------------
+
+class TestFakePort:
+    def test_count_returns_len_of_canned(self):
+        port = FakePropertyRadarPort(
+            canned_records=[_raw_record("A"), _raw_record("B")]
+        )
+        assert port.count([]) == 2
+
+    def test_count_records_call(self):
+        port = FakePropertyRadarPort()
+        criteria = [{"name": "State", "value": ["FL"]}]
+        port.count(criteria)
+        assert port.count_calls == [criteria]
+
+    def test_purchase_yields_all_canned(self):
+        port = FakePropertyRadarPort(
+            canned_records=[_raw_record("R1"), _raw_record("R2")]
+        )
+        results = list(port.purchase([]))
+        assert [r.radar_id for r in results] == ["R1", "R2"]
+
+    def test_purchase_records_call(self):
+        port = FakePropertyRadarPort(canned_records=[_raw_record()])
+        criteria = [{"name": "State", "value": ["FL"]}]
+        list(port.purchase(criteria))
+        assert port.purchase_calls == [criteria]
+
+    def test_allowance_returns_canned(self):
+        port = FakePropertyRadarPort(
+            canned_allowance=AllowanceInfo(
+                quantity_free_remaining=500,
+                quantity_purchased_remaining=9500,
+            )
+        )
+        a = port.allowance()
+        assert a.total_remaining == 10000
+
+
+# ---------------------------------------------------------------------------
+# Budget guard tests
+# ---------------------------------------------------------------------------
+
+class TestBudgetGuard:
+    """Test the budget guard by calling _check_budget directly."""
+
+    def _port_with(self, count: int, remaining: int) -> FakePropertyRadarPort:
+        return FakePropertyRadarPort(
+            canned_records=[_raw_record(str(i)) for i in range(count)],
+            canned_allowance=AllowanceInfo(
+                quantity_free_remaining=remaining,
+                quantity_purchased_remaining=0,
+            ),
+        )
+
+    def test_within_budget_returns_count(self):
+        from src.tasks.property_radar_maturity_pull import _check_budget
+        from unittest.mock import patch
+        port = self._port_with(count=100, remaining=5000)
+        with patch("src.tasks.property_radar_maturity_pull.settings") as mock_settings:
+            mock_settings.property_radar_per_run_cap = 5000
+            result = _check_budget(port, [], "FL", "maturity_target_lender")
+        assert result == 100
+
+    def test_over_allowance_raises(self):
+        from src.tasks.property_radar_maturity_pull import _check_budget
+        from unittest.mock import patch
+        port = self._port_with(count=200, remaining=50)
+        with patch("src.tasks.property_radar_maturity_pull.settings") as mock_settings:
+            mock_settings.property_radar_per_run_cap = 5000
+            with pytest.raises(RuntimeError, match="budget guard"):
+                _check_budget(port, [], "FL", "maturity_target_lender")
+
+    def test_over_per_run_cap_raises(self):
+        from src.tasks.property_radar_maturity_pull import _check_budget
+        from unittest.mock import patch
+        port = self._port_with(count=2000, remaining=10000)
+        with patch("src.tasks.property_radar_maturity_pull.settings") as mock_settings:
+            mock_settings.property_radar_per_run_cap = 500
+            with pytest.raises(RuntimeError, match="per-run cap"):
+                _check_budget(port, [], "FL", "maturity_target_lender")
+
+    def test_zero_count_skips_allowance_check(self):
+        from src.tasks.property_radar_maturity_pull import _check_budget
+        from unittest.mock import patch
+        port = FakePropertyRadarPort(
+            canned_records=[],
+            canned_allowance=AllowanceInfo(
+                quantity_free_remaining=0, quantity_purchased_remaining=0
+            ),
+        )
+        with patch("src.tasks.property_radar_maturity_pull.settings") as mock_settings:
+            mock_settings.property_radar_per_run_cap = 500
+            result = _check_budget(port, [], "FL", "maturity_target_lender")
+        assert result == 0
+
+    def test_unverified_allowance_skips_over_allowance_check_but_enforces_cap(self):
+        """LivePropertyRadarPort.allowance() has no free quota endpoint to call —
+        it returns verified=False. _check_budget must not treat that as a real
+        remaining-balance of 0 (which would wrongly block every live run); it
+        must still enforce per_run_cap, the only real pre-flight guard left."""
+        from src.tasks.property_radar_maturity_pull import _check_budget
+        from unittest.mock import patch
+        port = FakePropertyRadarPort(
+            canned_records=[_raw_record(str(i)) for i in range(100)],
+            canned_allowance=AllowanceInfo(
+                quantity_free_remaining=0, quantity_purchased_remaining=0, verified=False
+            ),
+        )
+        with patch("src.tasks.property_radar_maturity_pull.settings") as mock_settings:
+            mock_settings.property_radar_per_run_cap = 5000
+            result = _check_budget(port, [], "FL", "maturity_target_lender")
+        assert result == 100
+
+    def test_unverified_allowance_still_enforces_per_run_cap(self):
+        from src.tasks.property_radar_maturity_pull import _check_budget
+        from unittest.mock import patch
+        port = FakePropertyRadarPort(
+            canned_records=[_raw_record(str(i)) for i in range(2000)],
+            canned_allowance=AllowanceInfo(
+                quantity_free_remaining=0, quantity_purchased_remaining=0, verified=False
+            ),
+        )
+        with patch("src.tasks.property_radar_maturity_pull.settings") as mock_settings:
+            mock_settings.property_radar_per_run_cap = 500
+            with pytest.raises(RuntimeError, match="per-run cap"):
+                _check_budget(port, [], "FL", "maturity_target_lender")
+
+
+# ---------------------------------------------------------------------------
+# Campaign criteria tests
+# ---------------------------------------------------------------------------
+
+class TestCampaignCriteria:
+    def test_fl_maturity_target_lender_has_required_keys(self):
+        criteria = build_campaign_criteria("FL", "maturity_target_lender")
+        names = {c["name"] for c in criteria}
+        assert "OwnershipType" in names
+        assert "isListedForSale" in names
+        assert "FirstDate" in names
+        assert "FirstLenderOriginal" in names
+
+    def test_fl_criteria_ownership_is_corporate(self):
+        criteria = build_campaign_criteria("FL", "maturity_target_lender")
+        ownership = next(c for c in criteria if c["name"] == "OwnershipType")
+        assert ownership["value"] == ["Corporate"]
+
+    def test_fl_criteria_no_firsttermsinyears(self):
+        # TermInYears is export-only — must not appear as a criterion
+        criteria = build_campaign_criteria("FL", "maturity_target_lender")
+        names = [c["name"] for c in criteria]
+        assert "FirstTermInYears" not in names
+
+    def test_ga_criteria_state_value_is_ga(self):
+        criteria = build_campaign_criteria("GA", "maturity_target_lender")
+        state_c = next(c for c in criteria if c["name"] == "State")
+        assert state_c["value"] == ["GA"]
+
+    def test_fl_lender_includes_kiavi(self):
+        criteria = build_campaign_criteria("FL", "maturity_target_lender")
+        lender_c = next(c for c in criteria if c["name"] == "FirstLenderOriginal")
+        assert "Kiavi" in lender_c["value"]
+
+    def test_unknown_campaign_raises(self):
+        with pytest.raises(ValueError, match="Unknown campaign"):
+            build_campaign_criteria("FL", "nonexistent_campaign_xyz")
+
+
+# ---------------------------------------------------------------------------
+# Daily incremental-window tests (§2.3: daily pull must not re-query the
+# full backlog window — otherwise every daily run re-bills ~700+ records)
+# ---------------------------------------------------------------------------
+
+class TestDailyIncrementalWindow:
+    def test_no_daily_since_uses_full_backlog_window(self):
+        """Backlog mode (daily_since=None) must keep querying the full
+        8-15 month window — this is the existing, unchanged behavior."""
+        from datetime import date, timedelta
+        full = build_campaign_criteria("FL", "maturity_target_lender")
+        narrowed = build_campaign_criteria(
+            "FL", "maturity_target_lender", daily_since=date.today() - timedelta(days=1)
+        )
+        full_date = next(c for c in full if c["name"] == "FirstDate")["value"][0]
+        narrowed_date = next(c for c in narrowed if c["name"] == "FirstDate")["value"][0]
+        assert full_date != narrowed_date
+
+    def test_daily_since_narrows_to_since_last_run(self):
+        """A daily_since of N days ago must produce a FirstDate window whose
+        start is N days before today's window edge, not the full 15-month
+        backlog start — this is what keeps a daily run cheap."""
+        from datetime import date, timedelta
+        since = date.today() - timedelta(days=3)
+        criteria = build_campaign_criteria("FL", "maturity_target_lender", daily_since=since)
+        first_date = next(c for c in criteria if c["name"] == "FirstDate")["value"][0]
+        # window spans only a few days, not ~7 months (15m - 8m)
+        start_str, end_str = first_date.replace("from: ", "").split(" to: ")
+        from datetime import datetime as dt
+        start_d = dt.strptime(start_str, "%m/%d/%Y").date()
+        end_d = dt.strptime(end_str, "%m/%d/%Y").date()
+        assert (end_d - start_d).days <= 4
+
+    def test_daily_since_today_or_future_degenerates_to_empty_not_wider(self):
+        """If daily_since is today (two runs same day) the window must not
+        widen back out to the full backlog range."""
+        from datetime import date
+        criteria = build_campaign_criteria(
+            "FL", "maturity_target_lender", daily_since=date.today()
+        )
+        first_date = next(c for c in criteria if c["name"] == "FirstDate")["value"][0]
+        start_str, end_str = first_date.replace("from: ", "").split(" to: ")
+        assert start_str == end_str
+
+    def test_ga_supports_daily_since_too(self):
+        from datetime import date, timedelta
+        since = date.today() - timedelta(days=2)
+        criteria = build_campaign_criteria("GA", "maturity_target_lender", daily_since=since)
+        first_date = next(c for c in criteria if c["name"] == "FirstDate")["value"][0]
+        start_str, end_str = first_date.replace("from: ", "").split(" to: ")
+        from datetime import datetime as dt
+        start_d = dt.strptime(start_str, "%m/%d/%Y").date()
+        end_d = dt.strptime(end_str, "%m/%d/%Y").date()
+        assert (end_d - start_d).days <= 4
+
+
+class TestLastSuccessfulRunDate:
+    def test_no_prior_run_returns_none(self):
+        from unittest.mock import MagicMock
+        from src.tasks.property_radar_maturity_pull import _last_successful_run_date
+        session = MagicMock()
+        session.execute.return_value.first.return_value = None
+        result = _last_successful_run_date(session, "FL", "maturity_target_lender")
+        assert result is None
+
+    def test_prior_run_returns_its_date(self):
+        from unittest.mock import MagicMock
+        from datetime import datetime, timezone
+        from src.tasks.property_radar_maturity_pull import _last_successful_run_date
+        session = MagicMock()
+        ts = datetime(2026, 9, 20, tzinfo=timezone.utc)
+        session.execute.return_value.first.return_value = (ts,)
+        result = _last_successful_run_date(session, "FL", "maturity_target_lender")
+        assert result == ts.date()

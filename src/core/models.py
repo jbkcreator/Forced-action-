@@ -12358,3 +12358,43 @@ class FaMaxGyrRoutingLog(Base):
         ),
         Index("ix_fa_max_gyr_log_opp_decided", "opportunity_id", "decided_at"),
     )
+
+
+# ============================================================================
+# PropertyRadar ingestion — Developer 1 checkpoint tables
+# ============================================================================
+
+class PropertyRadarPullRun(Base):
+    """One row per completed (or in-progress) PropertyRadar pull run.
+
+    Dev 1 owns idempotency: the seen-ids table (property_radar_seen_ids, raw
+    DDL only — no ORM model needed) dedupes radar_ids across runs. If the
+    cross-developer contract meeting (open question #2) resolves that Dev 2's
+    staging table owns seen radar_ids instead, drop property_radar_seen_ids and
+    update the daily-pull query in property_radar_maturity_pull.py — no other
+    callers exist.
+    """
+
+    __tablename__ = "property_radar_pull_runs"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    run_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    state: Mapped[str] = mapped_column(String(2), nullable=False)
+    campaign: Mapped[str] = mapped_column(String(80), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    records_fetched: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    exports_consumed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="running")
+
+    __table_args__ = (
+        CheckConstraint(
+            "run_type IN ('backlog', 'daily')", name="ck_pr_pull_run_type"
+        ),
+        CheckConstraint(
+            "status IN ('running', 'done', 'failed')", name="ck_pr_pull_run_status"
+        ),
+        Index("ix_pr_pull_runs_state_campaign", "state", "campaign"),
+    )

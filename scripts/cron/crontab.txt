@@ -1166,4 +1166,12 @@ COUNTY_ID=hillsborough
 # Incremental: only new deeds update counts + re-rank; no full rebuild.
 0 6 * * * $PROJECT/scripts/cron/run.sh src.tasks.partner_mining_sweep
 
+# PropertyRadar target-lender maturity pull — Developer 1 ingestion adapter
+# Daily at 02:00 UTC; fires after scrapers (04:00-06:30) is intentional:
+# this job runs BEFORE the main scraper window so it does not compete for DB
+# write capacity. Adjust if ordering with a Dev 2 staging sweep is required.
+# Backlog run (one-time): invoke manually with --mode backlog.
+# Guard: job no-ops when PROPERTY_RADAR_ENABLED=false (default).
+0 2 * * * $PROJECT/scripts/cron/run.sh src.tasks.property_radar_maturity_pull --mode daily --state FL
+
 # === END FORCED-ACTION-PLATFORM ===
