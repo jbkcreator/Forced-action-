@@ -831,3 +831,52 @@ class TestExitDeskLoanAgeMonths:
             f"expected ~14 total months, got {matches[0].extra['loan_age_months']} "
             "(EXTRACT(MONTH FROM AGE(...)) alone would wrap to ~2)"
         )
+
+
+class TestExitDeskOwnerResolution:
+    def test_resolves_owner_via_deed_id_not_property_id(self, fresh_db):
+        """Review fix: buyer_entity_links.source_id is deeds.id. A decoy deed
+        whose id equals the mortgage's property_id must not resolve its
+        (unrelated) entity as the borrower."""
+        from src.services.fa_max_campaigns import eligibility
+
+        n = fresh_db.execute(
+            text("SELECT GREATEST((SELECT COALESCE(MAX(id), 0) FROM properties), "
+                 "(SELECT COALESCE(MAX(id), 0) FROM deeds)) + 1000")
+        ).scalar()
+        fresh_db.execute(
+            text(
+                "INSERT INTO properties (id, parcel_id, source_row_hash, needs_rescore, county_id, "
+                "address, city, created_at, updated_at) "
+                "VALUES (:id, :parcel, :hash, false, 'hillsborough', '1 Owner St', 'Tampa', NOW(), NOW())"
+            ),
+            {"id": n, "parcel": f"TEST-{uuid.uuid4().hex[:8]}", "hash": uuid.uuid4().hex},
+        )
+        owner_pid, owner_eid = _fresh_person(fresh_db, email="owner@example.com"), _fresh_buyer_entity(fresh_db, name="Owner LLC")
+        _link_person_to_entity(fresh_db, owner_pid, owner_eid)
+        _link_deed_to_entity(fresh_db, owner_eid, _insert_deed(
+            fresh_db, property_id=n, grantee="Owner LLC", sale_price=400000, mortgage_amount=350000,
+        ))
+
+        decoy_pid, decoy_eid = _fresh_person(fresh_db, email="decoy@example.com"), _fresh_buyer_entity(fresh_db, name="Decoy LLC")
+        _link_person_to_entity(fresh_db, decoy_pid, decoy_eid)
+        fresh_db.execute(
+            text(
+                "INSERT INTO deeds (id, property_id, instrument_number, grantee, record_date, "
+                "sale_price, deed_type, sale_qualified) "
+                "VALUES (:id, :pid, :instr, 'Decoy LLC', CURRENT_DATE, 100000, 'Warranty Deed', true)"
+            ),
+            {"id": n, "pid": _insert_property(fresh_db), "instr": f"INST-{uuid.uuid4().hex[:8]}"},
+        )
+        _link_deed_to_entity(fresh_db, decoy_eid, n)
+
+        _seed_exit_desk_bought_row(fresh_db, property_id=n, entity_name="Owner LLC", months_old=10)
+
+        cfg.CAMPAIGN_ENABLED[cfg.CAMPAIGN_EXIT_DESK] = True
+        try:
+            result = eligibility.exit_desk_candidates(fresh_db)
+        finally:
+            cfg.CAMPAIGN_ENABLED[cfg.CAMPAIGN_EXIT_DESK] = False
+
+        resolved = {c.person_id for c in result.candidates if c.property_id == n}
+        assert resolved == {owner_pid}

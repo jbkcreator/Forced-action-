@@ -604,7 +604,10 @@ def _process_one_touch(session: Session, touch: dict, summary: dict) -> None:
     )
     session.execute(
         text(
-            "UPDATE fa_max_campaign_touches SET status = 'handed_off', work_item_id = CAST(:wid AS uuid) "
+            "UPDATE fa_max_campaign_touches SET status = 'handed_off', "
+            # enqueue returns None when a racing sweep already enqueued this
+            # touch (idempotency key); keep the winner's pointer.
+            "work_item_id = COALESCE(CAST(:wid AS uuid), work_item_id) "
             "WHERE touch_id = :tid"
         ),
         {"wid": work_item_id, "tid": touch["touch_id"]},

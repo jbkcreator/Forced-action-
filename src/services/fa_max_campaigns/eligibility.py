@@ -202,7 +202,13 @@ def exit_desk_candidates(session: Session) -> EligibilityResult:
             (EXTRACT(YEAR FROM AGE(NOW(), m.recording_date)) * 12
                 + EXTRACT(MONTH FROM AGE(NOW(), m.recording_date)))::int AS loan_age_months
         FROM {cfg.LENDING_MORTGAGE_RECORDS_TABLE} m
-        JOIN buyer_entity_links bel ON bel.source_table = 'deeds' AND bel.source_id = m.property_id
+        -- buyer_entity_links.source_id is deeds.id (not properties.id): resolve
+        -- the property's current owner via its most recent deed.
+        JOIN LATERAL (
+            SELECT d.id FROM deeds d WHERE d.property_id = m.property_id
+            ORDER BY d.record_date DESC NULLS LAST, d.id DESC LIMIT 1
+        ) d ON TRUE
+        JOIN buyer_entity_links bel ON bel.source_table = 'deeds' AND bel.source_id = d.id
         JOIN fa_max_person_profiles fpp ON fpp.buyer_entity_id = bel.buyer_entity_id
         WHERE m.lender_type IN :lender_types
           AND m.satisfied_bool IS NOT TRUE

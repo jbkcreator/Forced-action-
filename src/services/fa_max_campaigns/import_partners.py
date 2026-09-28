@@ -165,13 +165,14 @@ def import_partners_csv(session: Session, file_path: str, *, dry_run: bool = Fal
             summary.matched_existing += 1
 
         _upsert_partner(session, person_id=person_id, partner_class=partner_type, county_id=county)
-        session.commit()
 
         if _is_suppressed(session, person_id):
             summary.skipped_suppressed += 1
 
     if dry_run:
         session.rollback()
+    else:
+        session.commit()
     return summary
 
 
