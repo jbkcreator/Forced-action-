@@ -574,10 +574,10 @@ class TestMainChainsHandoff:
         mock_settings.property_radar_enabled = True
         mock_settings.property_radar_mode = "fake"
 
-    def test_handoff_runs_live_by_default(self):
-        """Explicit decision (2026-09-28): the handoff is LIVE by default,
-        overriding this repo's usual dry-run-unless---apply sweep convention
-        -- real leads are written to FA Max unless --dry-run-handoff is passed."""
+    def test_handoff_runs_dry_run_by_default(self):
+        """Matches the build-split spec's own stated runner default
+        ("one CLI (--dry-run by default, --apply)") -- no real FA Max writes
+        unless --apply-handoff is passed explicitly."""
         with patch("src.tasks.property_radar_maturity_pull.settings") as mock_settings, \
              patch("src.tasks.property_radar_maturity_pull.get_db_context"), \
              patch("src.tasks.property_radar_maturity_pull._run_pull") as mock_run_pull, \
@@ -587,9 +587,9 @@ class TestMainChainsHandoff:
             mock_run_pull.return_value = {"run_id": 1}
             mock_handoff.run.return_value.summary.return_value = "ok"
             self._run_main(["--mode", "daily", "--state", "FL", "--campaign", "maturity_target_lender"])
-            mock_handoff.run.assert_called_once_with(campaign="maturity_target_lender", trace_results=None, apply=True)
+            mock_handoff.run.assert_called_once_with(campaign="maturity_target_lender", trace_results=None, apply=False)
 
-    def test_dry_run_handoff_flag_disables_apply(self):
+    def test_apply_handoff_flag_enables_live_writes(self):
         with patch("src.tasks.property_radar_maturity_pull.settings") as mock_settings, \
              patch("src.tasks.property_radar_maturity_pull.get_db_context"), \
              patch("src.tasks.property_radar_maturity_pull._run_pull") as mock_run_pull, \
@@ -600,9 +600,9 @@ class TestMainChainsHandoff:
             mock_handoff.run.return_value.summary.return_value = "ok"
             self._run_main([
                 "--mode", "daily", "--state", "FL",
-                "--campaign", "maturity_target_lender", "--dry-run-handoff",
+                "--campaign", "maturity_target_lender", "--apply-handoff",
             ])
-            mock_handoff.run.assert_called_once_with(campaign="maturity_target_lender", trace_results=None, apply=False)
+            mock_handoff.run.assert_called_once_with(campaign="maturity_target_lender", trace_results=None, apply=True)
 
     def test_skip_handoff_flag_prevents_the_call(self):
         with patch("src.tasks.property_radar_maturity_pull.settings") as mock_settings, \

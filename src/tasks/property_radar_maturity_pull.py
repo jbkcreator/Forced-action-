@@ -45,12 +45,10 @@ Dev 2 integration:
 Dev 3 integration (pull -> stage -> handoff):
   After the pull's own session commits (staging + linking done), main() calls
   src.tasks.property_radar_lead_handoff.run() once, in its OWN session, to
-  walk every staged record and decide handoff/suppress/skip.
-
-  ** LIVE BY DEFAULT ** (explicit decision, 2026-09-28 — overrides this
-  repo's usual dry-run-unless---apply sweep convention): every pull run
-  applies the handoff for real, writing actual leads/opportunities into FA
-  Max, unless --dry-run-handoff is passed. --skip-handoff opts out of the
+  walk every staged record and decide handoff/suppress/skip. This follows
+  the build-split spec's own stated default (PROPERTYRADAR_BUILD_SPLIT.md:
+  "one CLI (--dry-run by default, --apply)"): dry run by default, real
+  writes to FA Max only with --apply-handoff. --skip-handoff opts out of the
   handoff step entirely. A handoff failure is logged but never flips an
   already-successful pull_run row to 'failed' -- staging and handoff are
   separate concerns with separate outcomes.
@@ -453,13 +451,14 @@ def main() -> None:
         help="Tracerfy results CSV to attach contacts from during handoff "
              "(no new trace spend — reads the existing file only). Without "
              "this, every staged record has no contact data and the handoff "
-             "always skips it regardless of --dry-run-handoff.",
+             "always skips it regardless of --apply-handoff.",
     )
     parser.add_argument(
-        "--dry-run-handoff",
+        "--apply-handoff",
         action="store_true",
-        help="Print the handoff decision summary but write nothing to FA Max "
-             "(default: LIVE — real leads/suppressions are written to FA Max)",
+        help="Actually write handed-off leads to FA Max (default: dry run, matching "
+             "the build-split spec's own stated runner default — prints the decision "
+             "summary, writes nothing)",
     )
     args = parser.parse_args()
 
@@ -522,7 +521,7 @@ def main() -> None:
         report = property_radar_lead_handoff.run(
             campaign=args.campaign,
             trace_results=args.trace_results,
-            apply=not args.dry_run_handoff,
+            apply=args.apply_handoff,
         )
         logger.info("PropertyRadar handoff: %s", report.summary().replace("\n", " | "))
     except Exception:
