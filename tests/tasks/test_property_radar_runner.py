@@ -201,3 +201,27 @@ def test_failed_purchase_marks_the_run_failed(monkeypatch):
     sql = _executed_sql(session)
     assert any("status = 'failed'" in s for s in sql)
     assert not any("status = 'done'" in s for s in sql)
+
+
+@dataclass
+class _ContractNamed:
+    radar_id: str = "P2"
+    state_fips: str = "12"
+    county_fips: str = "12103"
+    apn: str = "0001"
+    state: str = "FL"
+    county_name: str = "PINELLAS"
+    property_address: str = "1 MAIN ST"
+    zip: str = "33701"
+    lender_name: str = "LIMA ONE"
+    loan_recorded_date: date = date(2025, 3, 1)
+    mailing_city: str = "BOSTON"
+    raw: dict = None
+
+
+def test_to_contract_accepts_contract_named_records():
+    c = to_contract(_ContractNamed())
+    assert (c["property_address"], c["zip"], c["lender_name"], c["loan_recorded_date"], c["mailing_city"]) == (
+        "1 MAIN ST", "33701", "LIMA ONE", "2025-03-01", "BOSTON",
+    )
+    assert c["city"] is None

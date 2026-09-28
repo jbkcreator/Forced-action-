@@ -75,20 +75,28 @@ class RunSummary:
         ])
 
 
+# The normalizer's pre-contract field names (renamed to the contract in PR #315).
+_LEGACY_FIELD_NAMES = {
+    "address": "property_address", "zip_code": "zip",
+    "lender_original": "lender_name", "loan_date": "loan_recorded_date",
+}
+_CONTRACT_FIELDS = (
+    "radar_id", "state_fips", "county_fips", "apn", "state", "county_name",
+    "property_address", "city", "zip", "property_type", "owner_name", "ownership_type",
+    "mailing_address", "mailing_city", "mailing_state", "mailing_zip", "principal_name",
+    "lender_name", "loan_amount", "loan_recorded_date", "loan_term_years", "est_maturity_date",
+    "loan_doc_number", "campaign", "raw",
+)
+
+
 def to_contract(record: Any) -> dict[str, Any]:
-    """Dev 1's normalized record -> the §3 staging contract field names."""
-    return {
-        "radar_id": record.radar_id, "state_fips": record.state_fips, "county_fips": record.county_fips,
-        "apn": record.apn, "state": record.state, "county_name": record.county_name,
-        "property_address": record.address, "city": record.city, "zip": record.zip_code,
-        "property_type": record.property_type, "owner_name": record.owner_name,
-        "ownership_type": record.ownership_type, "principal_name": record.principal_name,
-        "lender_name": record.lender_original, "loan_amount": record.loan_amount,
-        "loan_recorded_date": record.loan_date.isoformat() if record.loan_date else None,
-        "loan_term_years": str(record.loan_term_years) if record.loan_term_years is not None else None,
-        "est_maturity_date": record.est_maturity_date.isoformat() if record.est_maturity_date else None,
-        "loan_doc_number": record.loan_doc_number, "campaign": record.campaign, "raw": record.raw,
-    }
+    """Dev 1's normalized record -> the §3 staging contract (dates/term as strings)."""
+    fields = {_LEGACY_FIELD_NAMES.get(k, k): v for k, v in vars(record).items()}
+    out = {f: fields.get(f) for f in _CONTRACT_FIELDS}
+    for f in ("loan_recorded_date", "est_maturity_date"):
+        out[f] = out[f].isoformat() if out[f] else None
+    out["loan_term_years"] = str(out["loan_term_years"]) if out["loan_term_years"] is not None else None
+    return out
 
 
 def _batches(records: Iterable[dict[str, Any]], size: int) -> Iterator[list[dict[str, Any]]]:
