@@ -1,10 +1,11 @@
 """PropertyRadar runner: pull -> stage -> link -> handoff, end to end.
 
-Dry run by default: a free PropertyRadar count (Purchase=0, no exports), then
-link + handoff decisions over what is already staged, all inside a transaction
-that is rolled back. Prints counts per stage; buys nothing, writes nothing.
+Dry run by default: a free PropertyRadar count (Purchase=0, no exports) of
+what the pull would buy, then link + handoff decisions over records ALREADY
+staged, inside a transaction that is rolled back. New records are not staged
+in a dry run — staging them would mean buying them. Buys nothing, writes nothing.
 --apply buys the new records, stages them, links them and hands them off,
-committing each stage.
+committing each stage. --apply refuses a state that is not in ENABLED_STATES.
 
 Usage:
     PYTHONPATH=. python -m src.tasks.property_radar_runner                 # dry run
@@ -13,10 +14,12 @@ Usage:
 Adding a state (config only, no code change):
   1. config/property_radar_fips.py      add the state's FIPS code and every county FIPS
                                         (keep PropertyRadar quirks, e.g. Miami-Dade = 12025).
-  2. config/property_radar_campaigns.py add or enable the state's campaign criteria block.
+  2. config/property_radar_campaigns.py add the state's criteria to the campaign's builder
+                                        (_CAMPAIGN_BUILDERS entry for (state, campaign)),
+                                        then add the state to ENABLED_STATES to switch it on.
   3. config/property_radar.py           only if FA loads the state's counties: add each
                                         FIPS -> FA county slug so records link to properties.
-  4. Dry run with --state <XX> and check the free count per county.
+  4. Dry run with --state <XX> (allowed before it is enabled) and check the free count.
   5. --apply --mode backlog once, then daily runs (cron line below, when enabled).
   A new campaign also needs a CAMPAIGN_PRIORITY entry (config/lead_ownership.py) and
   handoff entries (config/property_radar_handoff.py).
@@ -27,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Iterator, Optional
 
@@ -40,7 +44,7 @@ STAGE_BATCH_SIZE = 500
 
 @dataclass
 class Stages:
-    """The four pipeline steps, injectable so the runner is testable without the API."""
+    """Pipeline steps (count, pull, mark seen, stage, link, handoff), injectable for tests."""
     count: Callable[[Session, str, str, str], int]
     pull: Callable[[Session, str, str, str], Iterator[list[dict[str, Any]]]]
     mark_seen: Callable[[Session, str, str, list[str]], None]
@@ -68,19 +72,19 @@ class RunSummary:
         ])
 
 
-def to_contract(n: Any) -> dict[str, Any]:
+def to_contract(record: Any) -> dict[str, Any]:
     """Dev 1's normalized record -> the §3 staging contract field names."""
     return {
-        "radar_id": n.radar_id, "state_fips": n.state_fips, "county_fips": n.county_fips,
-        "apn": n.apn, "state": n.state, "county_name": n.county_name,
-        "property_address": n.address, "city": n.city, "zip": n.zip_code,
-        "property_type": n.property_type, "owner_name": n.owner_name,
-        "ownership_type": n.ownership_type, "principal_name": n.principal_name,
-        "lender_name": n.lender_original, "loan_amount": n.loan_amount,
-        "loan_recorded_date": n.loan_date.isoformat() if n.loan_date else None,
-        "loan_term_years": str(n.loan_term_years) if n.loan_term_years is not None else None,
-        "est_maturity_date": n.est_maturity_date.isoformat() if n.est_maturity_date else None,
-        "loan_doc_number": n.loan_doc_number, "campaign": n.campaign, "raw": n.raw,
+        "radar_id": record.radar_id, "state_fips": record.state_fips, "county_fips": record.county_fips,
+        "apn": record.apn, "state": record.state, "county_name": record.county_name,
+        "property_address": record.address, "city": record.city, "zip": record.zip_code,
+        "property_type": record.property_type, "owner_name": record.owner_name,
+        "ownership_type": record.ownership_type, "principal_name": record.principal_name,
+        "lender_name": record.lender_original, "loan_amount": record.loan_amount,
+        "loan_recorded_date": record.loan_date.isoformat() if record.loan_date else None,
+        "loan_term_years": str(record.loan_term_years) if record.loan_term_years is not None else None,
+        "est_maturity_date": record.est_maturity_date.isoformat() if record.est_maturity_date else None,
+        "loan_doc_number": record.loan_doc_number, "campaign": record.campaign, "raw": record.raw,
     }
 
 
@@ -136,11 +140,19 @@ def default_stages() -> Stages:
         return build_campaign_criteria(state, campaign, daily_since=since)
 
     def count(session: Session, mode: str, state: str, campaign: str) -> int:
-        return port.count(criteria(session, mode, state, campaign))
+        try:
+            return port.count(criteria(session, mode, state, campaign))
+        except Exception:
+            logger.exception("PropertyRadar free count failed for %s/%s (%s)", state, campaign, mode)
+            raise
 
     def pull(session: Session, mode: str, state: str, campaign: str) -> Iterator[list[dict[str, Any]]]:
         crit = criteria(session, mode, state, campaign)
-        pull_task._check_budget(port, crit, state, campaign)
+        try:
+            pull_task._check_budget(port, crit, state, campaign)
+        except Exception:
+            logger.exception("PropertyRadar budget check refused or failed for %s/%s", state, campaign)
+            raise
         seen = pull_task._load_seen_ids(session, state, campaign)
         records = (
             to_contract(n)
@@ -148,7 +160,17 @@ def default_stages() -> Stages:
                       if r.radar_id not in seen)
             if n is not None
         )
-        yield from _batches(records, STAGE_BATCH_SIZE)
+        staged_batches = 0
+        try:
+            for batch in _batches(records, STAGE_BATCH_SIZE):
+                yield batch
+                staged_batches += 1
+        except Exception:
+            logger.exception(
+                "PropertyRadar purchase failed for %s/%s after %d committed batches; "
+                "unstaged records stay unseen and are re-fetched next run", state, campaign, staged_batches,
+            )
+            raise
 
     def handoff(session: Session, campaign: str, apply: bool, commit: Optional[Callable[[], None]]) -> dict[str, int]:
         from config.settings import get_settings
@@ -162,7 +184,7 @@ def default_stages() -> Stages:
             apply=apply,
             commit=commit,
         )
-        return {str(k.value if hasattr(k, "value") else k): v for k, v in report.counts().items()}
+        return dict(Counter(d.outcome.value for d in report.decisions))
 
     return Stages(
         count=count, pull=pull, mark_seen=pull_task._mark_seen,
@@ -183,9 +205,13 @@ def main() -> None:
     parser.add_argument("--apply", action="store_true", help="Buy, stage, link and hand off (default: dry run)")
     args = parser.parse_args()
 
+    from config.property_radar_campaigns import ENABLED_STATES
     from config.settings import get_settings
     if args.apply and not get_settings().property_radar_enabled:
-        logger.warning("PROPERTY_RADAR_ENABLED is false — refusing --apply.")
+        logger.warning("PROPERTY_RADAR_ENABLED is false - refusing --apply.")
+        return
+    if args.apply and args.state not in ENABLED_STATES:
+        logger.warning("State %s is not in ENABLED_STATES - refusing --apply (dry run is allowed).", args.state)
         return
 
     from src.core.database import get_db_context

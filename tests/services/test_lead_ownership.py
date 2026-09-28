@@ -5,7 +5,7 @@ import pytest
 from sqlalchemy import text
 
 import config.lead_ownership as cfg
-from src.services.lead_ownership import claim_ownership, owning_campaign
+from src.services.lead_ownership import AssignmentStatus as S, claim_ownership, decide, owning_campaign
 
 HIGH, LOW = "test_high_campaign", "test_low_campaign"
 SRC = "property_radar"
@@ -33,6 +33,7 @@ def _engine_enrollment(session, person_id: str, campaign: str, status: str = "ac
     session.execute(text(
         "CREATE TABLE IF NOT EXISTS fa_max_campaign_enrollments "
         "(person_id uuid, campaign_key text, status text)"))
+    session.info.pop("lead_ownership_engine_table", None)  # table appeared mid-session
     session.execute(text(
         "INSERT INTO fa_max_campaign_enrollments VALUES (CAST(:p AS uuid), :c, :s)"),
         {"p": person_id, "c": campaign, "s": status})
@@ -127,3 +128,19 @@ def test_engine_campaign_cannot_be_claimed_here(fresh_db):
 def test_unknown_campaign_is_rejected(fresh_db):
     with pytest.raises(ValueError):
         claim_ownership(fresh_db, person_id=_person(fresh_db), campaign="not_configured", source=SRC)
+
+
+# ── pure rule (no DB) ─────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("claim, ours, engine, expected", [
+    (LOW, None, None, (S.ACTIVE, LOW, None, None)),
+    (LOW, HIGH, None, (S.BLOCKED, HIGH, HIGH, None)),
+    (HIGH, LOW, None, (S.ACTIVE, HIGH, None, HIGH)),
+    (LOW, None, "capital_desk_loop", (S.BLOCKED, "capital_desk_loop", "capital_desk_loop", None)),
+    (HIGH, None, "capital_desk_loop", (S.BLOCKED, "capital_desk_loop", "capital_desk_loop", None)),
+    (LOW, LOW, "capital_desk_loop", (S.BLOCKED, "capital_desk_loop", "capital_desk_loop", "capital_desk_loop")),
+    (HIGH, LOW, "exit_desk", (S.BLOCKED, "exit_desk", "exit_desk", "exit_desk")),
+])
+def test_decide(claim, ours, engine, expected):
+    d = decide(claim, ours, engine)
+    assert (d.status, d.owner, d.displaced_by, d.preempt_ours_by) == expected

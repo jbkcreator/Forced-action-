@@ -37,11 +37,11 @@ props AS (
     FROM fa_max_property_associations a JOIN owners o ON o.person_id = a.person_id
 ),
 threads AS (
-    SELECT DISTINCT q.person_id, q.thread_id
+    SELECT q.person_id, q.thread_id
     FROM relay_approval_queue q JOIN owners o ON o.person_id = q.person_id
     WHERE q.thread_id IS NOT NULL
     UNION
-    SELECT DISTINCT p.person_id, t.opportunity_thread_id
+    SELECT p.person_id, t.opportunity_thread_id
     FROM dial_list_touch t JOIN props p ON p.property_id = t.property_id
     WHERE t.opportunity_thread_id IS NOT NULL
 ),

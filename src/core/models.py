@@ -11935,6 +11935,8 @@ class DialListTouch(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
+    __table_args__ = (Index("ix_dial_list_touch_property_id", "property_id"),)
+
 
 class DialListNeedsEnrichment(Base):
     """Candidate held from the dial list until it has a verified phone number."""

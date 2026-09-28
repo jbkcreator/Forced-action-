@@ -5,6 +5,10 @@ from dataclasses import dataclass
 from datetime import date
 from unittest.mock import MagicMock
 
+import pytest
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
 from src.tasks.property_radar_runner import Stages, run, to_contract
 
 
@@ -108,3 +112,26 @@ def test_to_contract_maps_dev1_fields_to_staging_names():
     assert c["loan_term_years"] == "1"
     assert c["principal_name"] == "JANE DOE"
     assert not {"address", "zip_code", "lender_original", "loan_date"} & c.keys()
+
+
+def test_dry_run_leaves_nothing_in_the_database(pg_engine):
+    """A stage that writes during a dry run must be rolled back, not committed."""
+    if pg_engine is None:
+        pytest.skip("DATABASE_URL not configured")
+    ref = "test-runner-dry-run-marker"
+    calls: list[str] = []
+    stages = _stages(calls)
+
+    def writing_link(s):
+        s.execute(text("INSERT INTO fa_max_persons (source, source_reference) VALUES ('maturity', :r)"), {"r": ref})
+        return {"linked": 1}
+
+    stages.link = writing_link
+    session = Session(bind=pg_engine)
+    try:
+        run(session, stages, mode="daily", state="FL", campaign="maturity_target_lender", apply=False)
+    finally:
+        session.close()
+    with pg_engine.connect() as conn:
+        left = conn.execute(text("SELECT COUNT(*) FROM fa_max_persons WHERE source_reference = :r"), {"r": ref}).scalar()
+    assert left == 0
