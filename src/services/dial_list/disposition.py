@@ -66,7 +66,7 @@ def record_dial_disposition(
     Validation runs before any DB access (business-rule boundary):
       - ``outcome`` must be 'won' or 'lost';
       - a 'won' outcome must not carry a ``loss_code``;
-      - a 'lost' outcome requires one of the eight ``LOSS_REASON_CODES``.
+      - a 'lost' outcome requires one of the ``LOSS_REASON_CODES``.
 
     Raises:
         ValueError: on an invalid outcome / loss_code combination.

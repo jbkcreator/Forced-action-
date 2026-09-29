@@ -30,6 +30,8 @@ from config.property_radar_handoff import (
     STAGED_RECORD_PAGE_SIZE,
     THIN_PATH_COUNTY_FIPS,
 )
+from config.lead_ownership import LEAD_SOURCE_PROPERTY_RADAR
+from src.services.lead_ownership import claim_ownership
 from src.services.property_radar.trace_contacts import LeadContacts
 
 logger = logging.getLogger(__name__)
@@ -321,6 +323,12 @@ class SqlHandoffStore:
                 source=source_type,
                 source_reference=source_reference,
                 idempotency_key=f"{SOURCE_REFERENCE_PREFIX}:{lead.radar_id}:{lead.campaign}",
+            )
+            # Always ACTIVE here: the person was created a line ago, so nobody else can own
+            # them. Send-path enforcement is owning_campaign()'s job (see lead_ownership.py).
+            claim_ownership(
+                self._session, person_id=person_id, opportunity_id=opportunity_id,
+                campaign=lead.campaign, source=LEAD_SOURCE_PROPERTY_RADAR, radar_id=lead.radar_id,
             )
             self._session.execute(
                 text(

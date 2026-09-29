@@ -35,6 +35,7 @@ LOSS_REASON_CODES = (
     "wrong_contact",
     "competitor",
     "no_response",
+    "loan_paid_off",
 )
 
 # Single source of INSERT SQL, shared by the single-row and bulk paths. Passing
