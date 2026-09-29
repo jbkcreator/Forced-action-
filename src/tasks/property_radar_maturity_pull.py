@@ -41,6 +41,17 @@ Dev 2 integration:
   inspection/debugging; nothing downstream should rely on parsing it.
   property_radar_seen_ids remains Dev 1's own dedup checkpoint (separate
   from, and does not replace, Dev 2's own dedupe-by-key in upsert_records).
+
+Dev 3 integration (pull -> stage -> handoff):
+  After the pull's own session commits (staging + linking done), main() calls
+  src.tasks.property_radar_lead_handoff.run() once, in its OWN session, to
+  walk every staged record and decide handoff/suppress/skip. This follows
+  the build-split spec's own stated default (PROPERTYRADAR_BUILD_SPLIT.md:
+  "one CLI (--dry-run by default, --apply)"): dry run by default, real
+  writes to FA Max only with --apply-handoff. --skip-handoff opts out of the
+  handoff step entirely. A handoff failure is logged but never flips an
+  already-successful pull_run row to 'failed' -- staging and handoff are
+  separate concerns with separate outcomes.
 """
 from __future__ import annotations
 
@@ -49,6 +60,7 @@ import json
 import logging
 import sys
 from datetime import date, datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from sqlalchemy import text
@@ -64,6 +76,7 @@ from src.services.property_radar_normalizer import normalize
 from src.services.property_radar_port import get_property_radar_port
 from src.services.property_radar.linking import link_unlinked
 from src.services.property_radar.staging import upsert_records
+from src.tasks import property_radar_lead_handoff
 from src.utils.logger import setup_logging
 
 setup_logging()
@@ -426,6 +439,27 @@ def main() -> None:
         action="store_true",
         help="Print per-county breakdown (uses Purchase=0, always free)",
     )
+    parser.add_argument(
+        "--skip-handoff",
+        action="store_true",
+        help="Do not run the FA Max lead handoff step after staging completes",
+    )
+    parser.add_argument(
+        "--trace-results",
+        type=Path,
+        default=None,
+        help="Tracerfy results CSV to attach contacts from during handoff "
+             "(no new trace spend — reads the existing file only). Without "
+             "this, every staged record has no contact data and the handoff "
+             "always skips it regardless of --apply-handoff.",
+    )
+    parser.add_argument(
+        "--apply-handoff",
+        action="store_true",
+        help="Actually write handed-off leads to FA Max (default: dry run, matching "
+             "the build-split spec's own stated runner default — prints the decision "
+             "summary, writes nothing)",
+    )
     args = parser.parse_args()
 
     state = args.state.upper()
@@ -473,6 +507,33 @@ def main() -> None:
         )
 
     print(json.dumps(result), file=sys.stderr)
+
+    if args.skip_handoff:
+        return
+
+    # Staging (upsert_records + link_unlinked) already committed inside
+    # _run_pull() above. The handoff walks property_radar_records itself
+    # (independent read, its own session) to decide handoff/suppress/skip
+    # for every staged record — not just the ones this run touched, so a
+    # record staged by an earlier run that was previously skipped (e.g. for
+    # a missing contact) is reconsidered too.
+    try:
+        report = property_radar_lead_handoff.run(
+            campaign=args.campaign,
+            trace_results=args.trace_results,
+            apply=args.apply_handoff,
+        )
+        logger.info("PropertyRadar handoff: %s", report.summary().replace("\n", " | "))
+    except Exception:
+        # A handoff failure must never retroactively mark the pull_run
+        # above as failed -- staging succeeded and is durable regardless
+        # of what the handoff step does with it.
+        logger.exception(
+            "PropertyRadar handoff step failed after a successful pull "
+            "(run_id=%s) -- staged records are safe, handoff can be "
+            "retried independently via property_radar_lead_handoff",
+            result.get("run_id"),
+        )
 
 
 if __name__ == "__main__":
