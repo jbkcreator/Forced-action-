@@ -49,7 +49,7 @@ class NoScrub:
 
 
 def _run(db, records, scrubber=NoScrub(), **kw):
-    from src.services.lending_compliance import filter_loadable
+    from src.lending.compliance import filter_loadable
     return {r.phone: r for r in filter_loadable(records, db, now=NOW, scrubber=scrubber, **kw)}
 
 
@@ -157,7 +157,7 @@ def test_pool_export_field_name_normalized_phone_is_accepted(db):
 
 
 def test_one_result_per_record_in_input_order(db):
-    from src.services.lending_compliance import filter_loadable
+    from src.lending.compliance import filter_loadable
 
     _dnc(db, P_CLEAN, age_days=1)
     records = [{"phone": ""}, {"phone": P_CLEAN}, {"phone": ""}, {"phone": P_CLEAN}]
@@ -179,7 +179,7 @@ def test_line_type_from_tracerfy_is_recorded(db):
 
 
 def test_run_id_writes_every_exclusion(db):
-    from src.services.lending_compliance import phone_hash
+    from src.lending.compliance import phone_hash
 
     _dnc(db, P_CLEAN, age_days=1)
     _run(db, [{"phone": P_CLEAN}, {"phone": "123"}, {"phone": P_STALE}], FakeScrub([]), run_id="run-t1")

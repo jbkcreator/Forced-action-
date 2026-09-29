@@ -1,7 +1,7 @@
 """Create the ``lending`` schema and Wave 0 compliance-floor tables.
 
 Tables: suppression_list, contacts, opt_out_events, load_exclusions
-(src/core/lending_models.py). Then backfills lending.suppression_list from FA
+(src/lending/models.py). Then backfills lending.suppression_list from FA
 opt-outs + Tracerfy litigators via reconcile_suppression. Idempotent.
 
 Usage:
@@ -16,7 +16,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 from config.settings import get_settings
-from src.core.lending_models import LENDING_SCHEMA, LendingBase
+from src.lending.models import LENDING_SCHEMA, LendingBase
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -33,7 +33,7 @@ _ALTERS = [
 
 def apply(engine: Engine | None = None, schema: str = LENDING_SCHEMA, source_schema: str = "public") -> None:
     """``schema`` / ``source_schema`` are overridable so tests never touch the shared schema."""
-    from src.services.lending_compliance import reconcile_suppression
+    from src.lending.compliance import reconcile_suppression
 
     engine = engine or create_engine(get_settings().database_url, pool_pre_ping=True)
     with engine.begin() as conn:

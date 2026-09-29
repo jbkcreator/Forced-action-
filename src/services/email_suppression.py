@@ -138,7 +138,7 @@ def suppress_contact(
     # Best-effort in a savepoint - a lending failure must never undo the FA opt-out.
     try:
         with db.begin_nested():
-            from src.services.lending_compliance import mirror_fa_opt_out
+            from src.lending.compliance import mirror_fa_opt_out
             mirror_fa_opt_out(db, phone=phone, email=email, source=source)
     except Exception:
         logger.error("[Suppression] lending mirror failed source=%s", source, exc_info=True)

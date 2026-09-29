@@ -38,7 +38,7 @@ def db():
 
 
 def _check(db, now):
-    from src.services.lending_compliance import can_dial_now
+    from src.lending.compliance import can_dial_now
     return can_dial_now(PHONE, db, now=now)
 
 
@@ -81,7 +81,7 @@ def test_block_ends_once_oldest_attempt_is_older_than_24h(db):
 
 
 def test_recipient_timezone_is_lending_owned_and_conservative_for_850():
-    from src.services.lending_compliance import recipient_timezone
+    from src.lending.compliance import recipient_timezone
     assert recipient_timezone("+18505551234").key == "America/Chicago"
     assert recipient_timezone("+14045551234").key == "America/New_York"  # Georgia
     assert recipient_timezone("+18135551234", zip_code="33602").key == "America/New_York"
@@ -96,7 +96,7 @@ class FakeDialer:
 
 
 def test_on_attempt_recorded_pulls_contact_at_the_cap_only(db):
-    from src.services.lending_compliance import on_attempt_recorded
+    from src.lending.compliance import on_attempt_recorded
 
     dialer = FakeDialer()
     _attempt(db, NOON_LOCAL - timedelta(hours=2))
@@ -111,6 +111,6 @@ def test_on_attempt_recorded_pulls_contact_at_the_cap_only(db):
 
 
 def test_on_attempt_recorded_ignores_missing_phone(db):
-    from src.services.lending_compliance import on_attempt_recorded
+    from src.lending.compliance import on_attempt_recorded
 
     assert on_attempt_recorded(db, None, now=NOON_LOCAL, dialer_remover=FakeDialer()) is None

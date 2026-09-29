@@ -1,4 +1,4 @@
-"""tests/migrations/test_apply_lending_compliance.py
+"""tests/lending/test_apply_lending_compliance.py
 
 Wave 0 Dev 2 (WP-W0-2/3/8) lending compliance schema. Runs against a throwaway
 schema pair (never the shared `lending` schema) and drops it afterwards.

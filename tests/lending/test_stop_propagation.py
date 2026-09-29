@@ -45,7 +45,7 @@ def _scalar(db, sql, **p):
 
 
 def _event(db, phone):
-    from src.services.lending_compliance import phone_hash
+    from src.lending.compliance import phone_hash
     return db.execute(
         text("SELECT channel, source_ref, actor, status, received_at, suppression_at, sms_at, "
              "email_at, dialer_removed_at FROM lending.opt_out_events WHERE phone_hash = :h"),
@@ -54,7 +54,7 @@ def _event(db, phone):
 
 
 def test_verbal_decline_blocks_every_store_within_sla(db):
-    from src.services.lending_compliance import filter_loadable, propagate_opt_out
+    from src.lending.compliance import filter_loadable, propagate_opt_out
 
     dialer = FakeDialer()
     propagate_opt_out(db, phone=PHONE, source_ref="call_42", actor="seat_a",
@@ -78,7 +78,7 @@ def test_verbal_decline_blocks_every_store_within_sla(db):
 
 
 def test_dialer_outage_never_blocks_the_suppression_writes(db):
-    from src.services.lending_compliance import propagate_opt_out
+    from src.lending.compliance import propagate_opt_out
 
     propagate_opt_out(db, phone=PHONE, source_ref="call_43", dialer_remover=FakeDialer(boom=True))
 
@@ -100,7 +100,8 @@ def test_email_unsubscribe_reaches_lending_suppression(db):
 
 
 def test_inbound_sms_stop_reaches_lending_suppression_and_dialer(db, monkeypatch):
-    from src.services import lending_compliance, sms_compliance
+    from src.lending import compliance as lending_compliance
+    from src.services import sms_compliance
 
     dialer = FakeDialer()
     monkeypatch.setattr(lending_compliance, "_default_dialer_remover", lambda: dialer)
@@ -122,8 +123,9 @@ def test_bounce_is_not_recorded_as_a_lending_opt_out(db):
 
 
 def test_repeat_fa_opt_out_creates_one_event(db, monkeypatch):
-    from src.services import lending_compliance, sms_compliance
-    from src.services.lending_compliance import phone_hash
+    from src.lending import compliance as lending_compliance
+    from src.services import sms_compliance
+    from src.lending.compliance import phone_hash
 
     monkeypatch.setattr(lending_compliance, "_default_dialer_remover", lambda: FakeDialer())
     sms_compliance.handle_inbound(PHONE, "STOP", db)
@@ -133,7 +135,7 @@ def test_repeat_fa_opt_out_creates_one_event(db, monkeypatch):
 
 
 def test_reconcile_recovers_an_opt_out_whose_mirror_failed(db, monkeypatch):
-    from src.services import lending_compliance
+    from src.lending import compliance as lending_compliance
     from src.services.email_suppression import suppress_contact
 
     def broken(*a, **k):
@@ -148,7 +150,7 @@ def test_reconcile_recovers_an_opt_out_whose_mirror_failed(db, monkeypatch):
 
 
 def test_redelivered_dnc_request_does_nothing_extra(db):
-    from src.services.lending_compliance import phone_hash, propagate_opt_out
+    from src.lending.compliance import phone_hash, propagate_opt_out
 
     dialer = FakeDialer()
     first = propagate_opt_out(db, phone=PHONE, source_ref="call_77", actor="seat_a", dialer_remover=dialer)
