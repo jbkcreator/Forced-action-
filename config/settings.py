@@ -327,6 +327,15 @@ class AppSettings(BaseSettings):
 	# storm/restoration contractors from dbpr_contacts. Flip in env, no code deploy.
 	cora_target_mode: str = Field(default="whale", env="CORA_TARGET_MODE")
 
+	# OFR mortgage-broker ingestion (WP-W0-1 Pool 3)
+	# Fully automated monthly pull: download the OFR "Ch 494 Businesses -
+	# NMLS (MBR-MBRB)" zip, unzip, load into ofr_mortgage_brokers. Disabled by
+	# default; set OFR_BROKER_ENABLED=true in production once the prod box can
+	# reach flofr.gov. URL is the direct zip download (copied from the OFR
+	# Registration Data Download page).
+	ofr_broker_enabled: bool = Field(default=False, env="OFR_BROKER_ENABLED")
+	ofr_broker_download_url: Optional[str] = Field(default=None, env="OFR_BROKER_DOWNLOAD_URL")
+
 	# PropertyRadar ingestion adapter (Developer 1)
 	# Solo plan: 10,000 export credits/month. Purchase=0 counts are free and
 	# never billed. Set property_radar_mode="fake" (default) in tests/local;

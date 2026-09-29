@@ -1179,4 +1179,13 @@ COUNTY_ID=hillsborough
 # the runner also refuses --apply while PROPERTY_RADAR_ENABLED=false.
 # 30 2 * * * $PROJECT/scripts/cron/run.sh src.tasks.property_radar_runner --apply --mode daily --state FL
 
+# OFR mortgage-broker refresh (WP-W0-1 Pool 3) — MONTHLY.
+# OFR publishes the MBR-MBRB file monthly; this downloads + unzips + loads it
+# into ofr_mortgage_brokers (Pool 3's source). Runs 1st of month 05:00 UTC,
+# inside the scraper window and before CDS (07:00). Fully automated — no CSV
+# hand-load. Guard: no-ops (raises, logged) when OFR_BROKER_ENABLED=false
+# (default) or OFR_BROKER_DOWNLOAD_URL unset; enable in prod once the box can
+# reach flofr.gov.
+0 5 1 * * $PROJECT/scripts/cron/run.sh src.tasks.ofr_broker_load
+
 # === END FORCED-ACTION-PLATFORM ===
