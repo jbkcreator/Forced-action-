@@ -11470,7 +11470,10 @@ class FaMaxBackflipCampaignContact(Base):
     imported_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     __table_args__ = (
-        CheckConstraint("identifier_kind IN ('email', 'phone')", name="ck_fa_max_backflip_identifier_kind"),
+        CheckConstraint(
+            "identifier_kind IN ('email', 'phone', 'entity_name', 'parcel_id')",
+            name="ck_fa_max_backflip_identifier_kind",
+        ),
         Index("ix_fa_max_backflip_active_contact", "identifier_kind", "identifier_value", postgresql_where=text("active")),
     )
 
