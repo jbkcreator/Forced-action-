@@ -1328,7 +1328,7 @@ class TestSnoozeRevise:
         ever crossing the material threshold."""
         import inspect
         from src.api import admin_router
-        source = inspect.getsource(admin_router._handle_relay_revise_submission)
+        source = inspect.getsource(admin_router._apply_draft_revision)
         assert "existing.original_draft" in source
         assert "existing.final_content or existing.original_draft" not in source
 
@@ -1338,7 +1338,7 @@ class TestSnoozeRevise:
         under-counting is the unsafe direction)."""
         import inspect
         from src.api import admin_router
-        source = inspect.getsource(admin_router._handle_relay_revise_submission)
+        source = inspect.getsource(admin_router._apply_draft_revision)
         assert "bool(existing.material_edit) or _is_material_edit" in source
 
 
@@ -1794,8 +1794,9 @@ class TestRefreshCardAfterRevision:
     def test_revise_submission_calls_refresh_card(self):
         import inspect
         from src.api import admin_router
-        source = inspect.getsource(admin_router._handle_relay_revise_submission)
+        source = inspect.getsource(admin_router._apply_draft_revision)
         assert "refresh_card_after_revision" in source
+        assert "_apply_draft_revision" in inspect.getsource(admin_router._handle_relay_revise_submission)
 
     def test_revised_typed_approval_requires_versioned_button(self):
         from src.api import admin_router

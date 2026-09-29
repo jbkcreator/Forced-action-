@@ -437,8 +437,11 @@ def build_redirect_text(cc_channel_id: str) -> str:
     )
 
 
-def build_other_ack_text() -> str:
-    return "Noted — flagged for follow-up."
+def build_other_ack_text(on_card: bool = False) -> str:
+    """on_card: the reply was under a draft card, where a revision needs the
+    Revise button (WP-T3-1 — a bare thread reply never edits a draft)."""
+    ack = "Noted — flagged for follow-up."
+    return f"{ack} To change this draft, tap Revise." if on_card else ack
 
 
 def build_social_reply(raw_text: str) -> str:
@@ -659,7 +662,7 @@ def _classify_and_respond(
             elif bucket == Bucket.SOCIAL:
                 reply_text = build_social_reply(raw_text)
             else:
-                reply_text = build_other_ack_text()
+                reply_text = build_other_ack_text(on_card=relay_item_id is not None)
 
             _write_audit_log(
                 db=db,

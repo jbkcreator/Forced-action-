@@ -33,6 +33,12 @@ from config.settings import get_settings
 logger = logging.getLogger(__name__)
 
 
+_REVISE_ACTIONS = {
+    "fa_max_revise": "_handle_relay_revise_open",
+    "fa_max_edit_text": "_handle_relay_edit_text_open",
+}
+
+
 def handle_socket_request(client: Any, request: Any) -> bool:
     """Acknowledge and dispatch one Slack Socket Mode envelope this listener owns.
 
@@ -174,7 +180,12 @@ def handle_socket_request(client: Any, request: Any) -> bool:
             logger.exception(
                 "[RelaySocket] view_submission handler raised for callback_id=%s", callback_id,
             )
-            response_body = None
+            # WP-T3-1: a failed Edit-text save shows an error in the modal
+            # instead of closing it as if it had saved.
+            response_body = (
+                {"response_action": "errors", "errors": {"revised_content_block": "Couldn't save — try again."}}
+                if callback_id == "fa_max_revise_submit" else None
+            )
         logger.info(
             "[RelaySocket] view_submission callback_id=%r user=%s -> response=%s",
             callback_id, user_id, "errors" if (response_body or {}).get("response_action") == "errors" else "ok",
@@ -208,6 +219,13 @@ def handle_socket_request(client: Any, request: Any) -> bool:
     client.send_socket_mode_response(SocketModeResponse(envelope_id=request.envelope_id))
 
     if request.type == "events_api":
+        # WP-T3-1 §4.2: audio file_share events arrive as message/file_share —
+        # intercept before _handle_relay_thread_action, which filters subtype != None.
+        _ev = payload.get("event") or {}
+        if _ev.get("type") == "message" and _ev.get("subtype") == "file_share":
+            _handle_voice_file_share(client, payload)
+            return True
+
         # Socket Mode delivers subscribed Events API payloads in an
         # ``events_api`` envelope. Reuse the HTTP route's thread-command
         # handler so an exact approve/reject reply has the same durable
@@ -226,7 +244,6 @@ def handle_socket_request(client: Any, request: Any) -> bool:
         _handle_relay_decision,
         _handle_relay_skip,
         _handle_relay_snooze,
-        _handle_relay_revise_open,
         _handle_confirm_entity_link,
         _handle_reject_entity_link,
         _handle_view_entity_link,
@@ -340,11 +357,11 @@ def handle_socket_request(client: Any, request: Any) -> bool:
     # these three were unreachable in production until this branch existed
     # here — approve/reject worked because they had their own action_id
     # branch below, but these three did not.
-    if action_id in ("fa_max_skip", "fa_max_snooze", "fa_max_revise"):
+    # fa_max_revise / fa_max_edit_text are dispatched below via _REVISE_ACTIONS (WP-T3-1).
+    if action_id in ("fa_max_skip", "fa_max_snooze"):
         _handler = {
             "fa_max_skip": _handle_relay_skip,
             "fa_max_snooze": _handle_relay_snooze,
-            "fa_max_revise": _handle_relay_revise_open,
         }[action_id]
         logger.info("[RelaySocket] relay %s: user=%s", action_id, user_id)
         try:
@@ -357,6 +374,19 @@ def handle_socket_request(client: Any, request: Any) -> bool:
             logger.exception("[RelaySocket] %s raised", action_id)
             return True
         _post_socket_ephemeral(client, payload, result or {})
+        return True
+
+    # FA Max Revise (NL slot) / Edit text (modal) — WP-T3-1
+    if action_id in _REVISE_ACTIONS:
+        import src.api.admin_router as _admin_router
+
+        logger.info("[RelaySocket] %s: user=%s", action_id, user_id)
+        try:
+            result = getattr(_admin_router, _REVISE_ACTIONS[action_id])(payload)
+        except Exception:
+            logger.exception("[RelaySocket] %s failed", action_id)
+            return True
+        _post_socket_ephemeral(client, payload, result)
         return True
 
     # Relay approve/reject
@@ -490,6 +520,82 @@ def handle_fa_max_slash_command_request(client: Any, request: Any) -> bool:
         # correct behavior: nothing to say means nothing to post.
         _post_slash_reply(response_url, reply)
     return True
+
+
+def _handle_voice_file_share(client: Any, payload: dict) -> None:
+    """Route an audio file_share event to the voice intake pipeline (WP-T3-1 §4.2).
+
+    Fires only when the sender has a live voice slot. Without one, posts a hint
+    and writes nothing.
+    """
+    from src.services.fa_max_pending_slot import get_slot
+    from src.services.fa_max_voice_intake import handle_voice_intake, is_voice_file
+    from src.core.database import get_db_context
+
+    settings = get_settings()
+    event = payload.get("event") or {}
+    user_id = event.get("user", "")
+    channel_id = event.get("channel", "")
+    thread_ts = event.get("thread_ts")
+
+    if not user_id or event.get("bot_id") or not _is_fa_max_voice_channel(channel_id):
+        return
+    if not _relay_approver_authorized_for_voice(user_id):
+        return
+
+    files = event.get("files") or []
+    if not files or not is_voice_file(files[0]):
+        return
+    file_info = files[0]
+
+    bot_token_obj = settings.fa_max_slack_bot_token or settings.slack_bot_token
+    if not bot_token_obj:
+        return
+    bot_token = bot_token_obj.get_secret_value()
+
+    with get_db_context() as session:
+        slot = get_slot(session, user_id)
+        if slot is None or slot.kind != "voice":
+            try:
+                kwargs: dict = {
+                    "channel": channel_id,
+                    "text": "Tap :microphone: Log call on the person's card, then send the note again.",
+                }
+                if thread_ts:
+                    kwargs["thread_ts"] = thread_ts
+                client.web_client.chat_postMessage(**kwargs)
+            except Exception:
+                logger.warning("[VoiceIntake] no-slot hint post failed")
+            return
+
+        opportunity_id = slot.target_ref
+        handle_voice_intake(
+            session=session,
+            slack_user_id=user_id,
+            opportunity_id=opportunity_id,
+            file_info=file_info,
+            bot_token=bot_token,
+            slack_client=client.web_client,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+        )
+
+
+def _is_fa_max_voice_channel(channel_id: str) -> bool:
+    """FA Max lane channels plus the dial-list channel, where Log call lives."""
+    from src.api.admin_router import _fa_max_channel_lane_map
+
+    if not channel_id:
+        return False
+    return channel_id in _fa_max_channel_lane_map() or channel_id == get_settings().dial_list_slack_channel
+
+
+def _relay_approver_authorized_for_voice(user_id: str) -> bool:
+    from src.api.admin_router import _relay_approver_authorized
+    try:
+        return _relay_approver_authorized(user_id)
+    except Exception:
+        return False
 
 
 def run() -> None:

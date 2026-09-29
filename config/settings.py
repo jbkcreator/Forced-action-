@@ -3,7 +3,7 @@
 from functools import lru_cache
 from datetime import date
 
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import AliasChoices, AnyUrl, Field, SecretStr, PostgresDsn, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -913,6 +913,17 @@ class AppSettings(BaseSettings):
 	)
 	fa_max_backflip_feed_max_age_hours: int = Field(default=24, ge=1, env="FA_MAX_BACKFLIP_FEED_MAX_AGE_HOURS")
 	fa_max_backflip_feed_adapter: str = Field(default="csv", env="FA_MAX_BACKFLIP_FEED_ADAPTER")
+	# WP-T3-1: how long a Revise / Log-call tap waits for the approver's next message.
+	fa_max_pending_slot_ttl_min: int = Field(default=15, ge=1, env="FA_MAX_PENDING_SLOT_TTL_MIN")
+	# WP-T3-1: voice-note transcription via OpenAI Whisper.
+	openai_api_key: Optional[SecretStr] = Field(default=None, env="OPENAI_API_KEY")
+	fa_max_whisper_model: str = Field(default="whisper-1", env="FA_MAX_WHISPER_MODEL")
+	fa_max_voice_max_bytes: int = Field(default=25_000_000, ge=1, env="FA_MAX_VOICE_MAX_BYTES")
+	# "local" = self-hosted faster-whisper (audio never leaves the box); "openai" = Whisper API.
+	fa_max_transcriber: Literal["local", "openai"] = Field(default="local", env="FA_MAX_TRANSCRIBER")
+	# small.en benchmarked on prod (4 vCPU, load ~12): 12.5s per 80s note, names/addresses clean.
+	fa_max_local_whisper_model: str = Field(default="small.en", env="FA_MAX_LOCAL_WHISPER_MODEL")
+	fa_max_local_whisper_threads: int = Field(default=2, ge=1, env="FA_MAX_LOCAL_WHISPER_THREADS")
 	backflip_webhook_secret: Optional[SecretStr] = Field(default=None, env="BACKFLIP_WEBHOOK_SECRET")
 
 	# PropertyRadar lead handoff into FA Max. Both default off: contact rules

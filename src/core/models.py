@@ -12329,6 +12329,106 @@ class FaMaxThreadFallbackLog(Base):
     )
 
 
+class FaMaxPendingSlot(Base):
+    """WP-T3-1 — one short-lived "next message is for this card" slot per approver.
+
+    Opened by the Revise button (kind='revise', target_ref = relay item id,
+    thread_ts = the card's ts) or the dial-list Log call button (kind='voice',
+    target_ref = opportunity id). Last tap wins; expiry enforced on read.
+    """
+
+    __tablename__ = "fa_max_pending_slots"
+
+    slack_user_id: Mapped[str] = mapped_column(String(60), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(10), nullable=False)
+    target_ref: Mapped[str] = mapped_column(String(64), nullable=False)
+    channel_id: Mapped[str] = mapped_column(String(40), nullable=False)
+    thread_ts: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    set_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("kind IN ('revise','voice')", name="ck_fa_max_pending_slot_kind"),
+    )
+
+
+class FaMaxDraftRevision(Base):
+    """WP-T3-1 — append-only history of every revision to a relay draft.
+
+    Written in the same transaction as relay.queue.record_revision (modal
+    Edit text and NL Revise alike). Read back as the NL rewrite's working
+    memory. Never updated or deleted.
+    """
+
+    __tablename__ = "fa_max_draft_revisions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    relay_item_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("relay_approval_queue.id"), nullable=False
+    )
+    revision_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    source: Mapped[str] = mapped_column(String(10), nullable=False)
+    instruction: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    before_text: Mapped[str] = mapped_column(Text, nullable=False)
+    after_text: Mapped[str] = mapped_column(Text, nullable=False)
+    material_edit: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    revised_by: Mapped[str] = mapped_column(String(80), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("source IN ('modal','nl')", name="ck_fa_max_draft_revision_source"),
+        UniqueConstraint("relay_item_id", "revision_no", name="uq_fa_max_draft_revision_item_no"),
+        Index("ix_fa_max_draft_revisions_item", "relay_item_id"),
+    )
+
+
+class FaMaxCallDisposition(Base):
+    """WP-T3-1 — one row per voice-note call disposition.
+
+    Written in the same transaction as the fa_max_interactions row.
+    Never updates won/lost outcomes (record_dial_disposition is not called).
+    """
+
+    __tablename__ = "fa_max_call_dispositions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    interaction_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_interactions.interaction_id", name="fk_fa_max_call_disp_interaction"),
+        nullable=False,
+    )
+    person_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_persons.person_id", name="fk_fa_max_call_disp_person"),
+        nullable=False,
+    )
+    opportunity_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("fa_max_opportunities.opportunity_id", name="fk_fa_max_call_disp_opp"),
+        nullable=False,
+    )
+    outcome: Mapped[str] = mapped_column(String(40), nullable=False)
+    summary: Mapped[str] = mapped_column(String(280), nullable=False)
+    next_action: Mapped[Optional[str]] = mapped_column(String(140), nullable=True)
+    next_action_due: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    slack_user_id: Mapped[str] = mapped_column(String(60), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "outcome IN ('connected_interested','connected_not_interested',"
+            "'callback_requested','voicemail','no_answer','wrong_number','unclear')",
+            name="ck_fa_max_call_disposition_outcome",
+        ),
+        Index("ix_fa_max_call_dispositions_person_created", "person_id", "created_at"),
+    )
+
+
 class FaMaxGyrRoutingLog(Base):
     """Immutable audit log — one row per GYR routing decision (WP-T2-11).
 

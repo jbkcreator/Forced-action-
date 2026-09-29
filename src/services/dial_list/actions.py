@@ -31,6 +31,7 @@ from src.services.opportunity_outcome import LOSS_REASON_CODES
 
 from .delivery import (
     ACTION_CALLED,
+    ACTION_LOG_CALL,
     ACTION_LOST,
     ACTION_SKIP,
     ACTION_WON,
@@ -191,6 +192,36 @@ def handle_action(
         except Exception:  # a failed cosmetic update must not lose the write
             logger.warning("[DialList] chat_update failed for %s", thread, exc_info=True)
         return new_blocks
+
+    # WP-T3-1: Log call — opens a voice slot so the next audio file is attributed.
+    if action_id == ACTION_LOG_CALL:
+        from src.services.fa_max_pending_slot import open_slot
+        from config.settings import get_settings as _get_settings
+        if approver_id and user_id != approver_id:
+            return ActionResult(status="ignored", message="unauthorized")
+        try:
+            open_slot(
+                session,
+                slack_user_id=user_id or "",
+                kind="voice",
+                target_ref=thread or "",
+                channel_id=channel or "",
+            )
+            session.commit()
+        except Exception:
+            logger.warning("[DialList] voice slot open failed for %s", thread, exc_info=True)
+            return ActionResult(status="error", kind="voice", opportunity_thread_id=thread,
+                                message="slot open failed")
+        if client and channel and user_id:
+            try:
+                ttl = _get_settings().fa_max_pending_slot_ttl_min
+                client.chat_postEphemeral(
+                    channel=channel, user=user_id,
+                    text=f":microphone: Send your voice note in the next {ttl} min.",
+                )
+            except Exception:
+                logger.warning("[DialList] ephemeral reply failed for voice slot", exc_info=True)
+        return ActionResult(status="touched", kind="voice", opportunity_thread_id=thread)
 
     # non-terminal: called / skip — no outcome row, but a durable touch record
     if action_id in _NON_TERMINAL:
