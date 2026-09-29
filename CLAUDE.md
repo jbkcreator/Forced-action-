@@ -44,6 +44,10 @@ PYTHONPATH=. python migrations/apply_fa_max_wp_t2_2_tool_call_log_claimed_status
 PYTHONPATH=. python migrations/apply_fa_max_wp_t2_3.py  # FA Max WP-T2-3: opportunity_id on relay_approval_queue, backflip_attribution_owner/set_at on fa_max_opportunities, fa_max_backflip_suppression_decisions audit table (idempotent, run after WP-T2-2)
 PYTHONPATH=. python migrations/apply_backflip_conflict_identifiers.py  # Backflip borrower conflict check: entity_name/parcel_id identifier kinds on fa_max_backflip_campaign_contacts (idempotent)
 PYTHONPATH=. python migrations/apply_backflip_dialer_audit_removal.py  # Removes the dialer gate + subject_ref/matched_criteria from fa_max_backflip_suppression_decisions; conflict decisions go to lending.load_exclusions (idempotent, refuses while dialer rows exist)
+PYTHONPATH=. python migrations/apply_lending_dialer_load_records.py  # lending.dialer_load_records: records loaded into the Aircall dialer, one active row per phone (idempotent, run after apply_lending_compliance.py)
+
+# Lending dialer load: pool export -> compliance filter -> Backflip conflict check -> Aircall. Dry run unless --live
+python -m src.tasks.lending_dialer_load --input pools.json
 PYTHONPATH=. python migrations/apply_property_radar_pull_runs.py  # PropertyRadar ingestion adapter (Dev 1): property_radar_pull_runs (run checkpoint) + property_radar_seen_ids (dedup) (idempotent)
 
 # PropertyRadar daily target-lender maturity pull (separate cron, disabled until PROPERTY_RADAR_ENABLED=true — see scripts/cron/crontab.txt)

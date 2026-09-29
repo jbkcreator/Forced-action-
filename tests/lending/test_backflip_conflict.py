@@ -14,7 +14,7 @@ import json
 
 import pytest
 
-from src.services.backflip_conflict_check import (
+from src.lending.backflip_conflict import (
     CRITERION_EMAIL_DOMAIN,
     CRITERION_ENTITY_NAME,
     CRITERION_PARCEL_ID,
@@ -188,7 +188,7 @@ class TestFailClosed:
 class TestLoadIndex:
     def _load(self, session):
         settings = MagicMock(fa_max_backflip_feed_max_age_hours=24)
-        with patch("src.services.backflip_conflict_check.get_settings", return_value=settings):
+        with patch("src.lending.backflip_conflict.get_settings", return_value=settings):
             return load_backflip_identifier_index(session)
 
     def test_missing_feed_row_is_unavailable(self):
