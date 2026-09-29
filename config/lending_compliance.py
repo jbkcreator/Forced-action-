@@ -15,6 +15,7 @@ MAX_ATTEMPTS_PER_PERIOD = 3
 ATTEMPT_PERIOD_HOURS = 24        # rolling
 DNC_SCRUB_MAX_AGE_DAYS = 31
 STOP_PROPAGATION_SLA_SECONDS = 60
+OPT_OUT_POLL_SECONDS = 15        # FA opt-out poller interval; worst case well inside the SLA
 GEORGIA_ALLOWED_ENTITY_TYPES = frozenset({"LLC", "LP", "CORPORATION"})
 
 # Recipient timezone by area code (lending-owned copy; FA SMS keeps its own).
@@ -34,6 +35,9 @@ AREA_CODE_TZ: dict[str, str] = {
 # FA sms_opt_outs rows written by the Tracerfy DNC refresh are national-DNC hits,
 # re-verified every 31 days — never a permanent opt-out.
 TRACERFY_DNC_SOURCE = "tracerfy_dnc_refresh"
+
+# suppress_contact() source used by the dialer path; the poller skips it (already propagated).
+DIALER_OPT_OUT_SOURCE = "lending_dialer"
 
 # suppress_contact() sources that are deliverability failures, not a person saying
 # "stop" (spec §3.2 covers STOP / UNSUBSCRIBE / verbal decline only). FA still blocks
@@ -86,5 +90,7 @@ def validate_lending_compliance_config() -> None:
         raise ValueError("CALL_WINDOW_START must be before CALL_WINDOW_END")
     if MAX_ATTEMPTS_PER_PERIOD < 1:
         raise ValueError("MAX_ATTEMPTS_PER_PERIOD must be >= 1")
+    if OPT_OUT_POLL_SECONDS * 2 >= STOP_PROPAGATION_SLA_SECONDS:
+        raise ValueError("OPT_OUT_POLL_SECONDS must leave room inside the stop-propagation SLA")
     if ATTEMPT_PERIOD_HOURS < 1 or DNC_SCRUB_MAX_AGE_DAYS < 1 or STOP_PROPAGATION_SLA_SECONDS < 1:
         raise ValueError("periods and SLAs must be positive")

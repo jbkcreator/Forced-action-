@@ -98,3 +98,20 @@ class LendingLoadExclusion(LendingBase):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 
     __table_args__ = (Index("idx_lending_load_exclusions_run", "run_id"),)
+
+
+class LendingDncScrub(LendingBase):
+    """Tracerfy results fetched by lending (spec §4.2). FA's dnc_phone_checks is
+    read-only for lending (least privilege); both are consulted, freshest wins."""
+
+    __tablename__ = "dnc_scrubs"
+
+    phone: Mapped[str] = mapped_column(String(20), primary_key=True)  # phone_utils.normalize
+    national_dnc: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    litigator: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    state_dnc: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    line_type: Mapped[Optional[str]] = mapped_column(String(20))
+    checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    raw_result: Mapped[Optional[dict]] = mapped_column(JSONB)
+
+    __table_args__ = (Index("idx_lending_dnc_scrubs_checked_at", "checked_at"),)

@@ -4,9 +4,8 @@
   Order (spec §3 pipeline): phone valid → Georgia entity stop → internal
   suppression → fresh Tracerfy scrub (national DNC, state DNC, litigator).
 - ``can_dial_now`` — call-time gate: calling window + rolling attempt cap.
-- ``propagate_opt_out`` / ``mirror_fa_opt_out`` — global stop-propagation.
-- ``reconcile_suppression`` — idempotent catch-up of FA opt-outs into the
-  lending suppression list (backfill + retry path for a failed mirror).
+- ``propagate_opt_out`` / ``poll_fa_opt_outs`` — global stop-propagation.
+- ``reconcile_suppression`` — schema-parameterised backfill used by the migration.
 
 Batch only: one query per gate for the whole list. Never commits — the caller
 owns the transaction.
@@ -15,7 +14,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
@@ -29,6 +27,7 @@ from config.lending_compliance import (
     CALL_WINDOW_END,
     CALL_WINDOW_START,
     DEFAULT_TZ,
+    DIALER_OPT_OUT_SOURCE,
     DNC_SCRUB_MAX_AGE_DAYS,
     GEORGIA_ALLOWED_ENTITY_TYPES,
     MAX_ATTEMPTS_PER_PERIOD,
@@ -100,15 +99,21 @@ def _suppressed_phones(db, phones: list[str]) -> set[str]:
 
 
 def _stored_scrubs(db, phones: list[str]) -> dict[str, ScrubResult]:
+    """Freshest scrub per phone across FA's cache (read-only) and lending's own."""
     rows = db.execute(
         text(
-            "SELECT phone, national_dnc, litigator, checked_at, "
-            "raw_result->>'state_dnc', raw_result->>'phone_type' "
-            "FROM dnc_phone_checks WHERE phone = ANY(:phones)"
+            "SELECT DISTINCT ON (phone) phone, national_dnc, litigator, state_dnc, checked_at, line_type FROM ("
+            "  SELECT phone, national_dnc, litigator, raw_result->>'state_dnc' AS state_dnc, checked_at, "
+            "         raw_result->>'phone_type' AS line_type "
+            "  FROM dnc_phone_checks WHERE phone = ANY(:phones) "
+            "  UNION ALL "
+            "  SELECT phone, national_dnc, litigator, CASE WHEN state_dnc THEN 'Y' ELSE 'N' END, checked_at, line_type "
+            "  FROM lending.dnc_scrubs WHERE phone = ANY(:phones)"
+            ") s ORDER BY phone, checked_at DESC"
         ),
         {"phones": phones},
     ).fetchall()
-    return {r[0]: ScrubResult(r[1], r[2], _is_yes(r[4]), r[3], r[5]) for r in rows}
+    return {r[0]: ScrubResult(r[1], r[2], _is_yes(r[3]), r[4], r[5]) for r in rows}
 
 
 def _verdict(phone: str, scrub: ScrubResult) -> GateResult:
@@ -197,19 +202,22 @@ def _scrub(db, phones: list[str], scrubber: Scrubber) -> dict[str, ScrubResult]:
 
     db.execute(
         text(
-            "INSERT INTO dnc_phone_checks (phone, national_dnc, litigator, checked_at, source, raw_result) "
-            "VALUES (:phone, :national_dnc, :litigator, :checked_at, :source, CAST(:raw_result AS jsonb)) "
+            "INSERT INTO lending.dnc_scrubs "
+            "(phone, national_dnc, litigator, state_dnc, line_type, checked_at, raw_result) "
+            "VALUES (:phone, :national_dnc, :litigator, :state_dnc, :line_type, :checked_at, "
+            "CAST(:raw_result AS jsonb)) "
             "ON CONFLICT (phone) DO UPDATE SET national_dnc = EXCLUDED.national_dnc, "
-            "litigator = EXCLUDED.litigator, checked_at = EXCLUDED.checked_at, "
-            "source = EXCLUDED.source, raw_result = EXCLUDED.raw_result"
+            "litigator = EXCLUDED.litigator, state_dnc = EXCLUDED.state_dnc, line_type = EXCLUDED.line_type, "
+            "checked_at = EXCLUDED.checked_at, raw_result = EXCLUDED.raw_result"
         ),
         [
             {
                 "phone": p,
                 "national_dnc": s.national_dnc,
                 "litigator": s.litigator,
+                "state_dnc": s.state_dnc,
+                "line_type": s.line_type,
                 "checked_at": s.checked_at,
-                "source": TRACERFY_DNC_SOURCE,
                 "raw_result": json.dumps(raw_by_phone[p]),
             }
             for p, s in scrubbed.items()
@@ -356,22 +364,28 @@ def on_attempt_recorded(
 
 
 # ── Global stop-propagation (WP-W0-8, spec §3.2) ─────────────────────────────
-# Every FA opt-out path (SMS STOP, email unsubscribe, Cora/concierge replies, IVR)
-# ends in email_suppression.suppress_contact, which calls mirror_fa_opt_out once the
-# FA stores are written. The dialer's verbal decline enters via propagate_opt_out,
-# which passes its call context down through _DIALER_CTX (suppress_contact's
-# signature is shared FA code and stays unchanged).
+# FA code is not touched (least privilege, Option B):
+#   - Dialer DNC_REQUEST → propagate_opt_out: writes FA's SMS/email stores through
+#     suppress_contact (the spec requires the dialer opt-out to block SMS + email),
+#     then the lending stores and the Aircall pool.
+#   - SMS STOP / email UNSUBSCRIBE → FA's own handlers write FA's stores;
+#     poll_fa_opt_outs picks them up every OPT_OUT_POLL_SECONDS.
 
 
-@dataclass
-class _DialerContext:
+@dataclass(frozen=True)
+class _OptOut:
+    channel: OptOutChannel
+    phone: Optional[str]
+    email: Optional[str]
     source_ref: Optional[str]
     actor: Optional[str]
-    dialer_remover: Optional[DialerRemover]
-    event_id: Optional[int] = None
+    received_at: datetime
 
 
-_DIALER_CTX: ContextVar[Optional[_DialerContext]] = ContextVar("lending_dialer_ctx", default=None)
+@dataclass(frozen=True)
+class PollResult:
+    new_opt_outs: int
+    dialer_retried: int
 
 
 def _default_dialer_remover() -> Optional[DialerRemover]:
@@ -411,119 +425,166 @@ def propagate_opt_out(
         if existing:
             return existing
 
-    ctx = _DialerContext(source_ref=source_ref, actor=actor, dialer_remover=dialer_remover)
-    token = _DIALER_CTX.set(ctx)
-    try:
-        suppress_contact(db, email=email, phone=phone, source="lending_dialer")
-    finally:
-        _DIALER_CTX.reset(token)
-    return ctx.event_id
-
-
-def _already_suppressed(db, phone: Optional[str], email: Optional[str]) -> bool:
-    return db.execute(
-        text(
-            "SELECT count(*) FROM lending.suppression_list "
-            "WHERE (CAST(:phone AS varchar) IS NULL OR phone = :phone) "
-            "AND (CAST(:email AS varchar) IS NULL OR email = :email) "
-            "AND (phone IS NOT NULL OR email IS NOT NULL)"
-        ),
-        {"phone": phone, "email": email},
-    ).scalar() > 0
-
-
-def mirror_fa_opt_out(db, *, phone: Optional[str], email: Optional[str], source: str) -> Optional[int]:
-    """Called by suppress_contact after the FA SMS/email stores are written."""
-    if source in NON_OPT_OUT_SOURCES:
-        return None
     phone = normalize_phone(phone) if phone else None
     email = email.strip().lower() if email else None
     if not phone and not email:
         return None
+    suppress_contact(db, email=email, phone=phone, source=DIALER_OPT_OUT_SOURCE)
+    opt_out = _OptOut(OptOutChannel.DIALER, phone, email, source_ref, actor, datetime.now(timezone.utc))
+    return _propagate(db, [opt_out], dialer_remover)[0]
 
-    ctx = _DIALER_CTX.get()
-    if ctx is None and _already_suppressed(db, phone, email):
-        return None  # repeat FA opt-out (e.g. second STOP): already propagated
 
-    channel = OptOutChannel.DIALER if ctx else _channel_for(source)
-    source_ref = ctx.source_ref if ctx else source
-    received_at = datetime.now(timezone.utc)
-
-    event_id = db.execute(
+def poll_fa_opt_outs(db, *, dialer_remover: Optional[DialerRemover] = None) -> PollResult:
+    """Mirror FA opt-outs not yet in lending.suppression_list, and retry pending
+    Aircall removals. Idempotent — safe every few seconds. Does not commit."""
+    excluded = sorted(NON_OPT_OUT_SOURCES | {TRACERFY_DNC_SOURCE, DIALER_OPT_OUT_SOURCE})
+    rows = db.execute(
         text(
-            "INSERT INTO lending.opt_out_events (channel, source_ref, phone_hash, actor, received_at) "
-            "VALUES (:channel, :source_ref, :phash, :actor, :received_at) RETURNING id"
+            "SELECT 'phone' AS kind, o.phone AS value, o.source, o.opted_out_at AT TIME ZONE 'UTC' "
+            "FROM sms_opt_outs o "
+            "WHERE o.source <> ALL(:excluded) "
+            "AND NOT EXISTS (SELECT 1 FROM lending.suppression_list s WHERE s.phone = o.phone) "
+            "UNION ALL "
+            "SELECT 'email', lower(o.email), o.source, o.opted_out_at AT TIME ZONE 'UTC' "
+            "FROM email_opt_outs o "
+            "WHERE o.source <> ALL(:excluded) "
+            "AND NOT EXISTS (SELECT 1 FROM lending.suppression_list s WHERE s.email = lower(o.email))"
         ),
-        {
-            "channel": channel.value,
-            "source_ref": source_ref,
-            "phash": phone_hash(phone) if phone else None,
-            "actor": ctx.actor if ctx else None,
-            "received_at": received_at,
-        },
-    ).scalar()
-    if ctx:
-        ctx.event_id = event_id
+        {"excluded": excluded},
+    ).fetchall()
+
+    opt_outs: list[_OptOut] = []
+    for kind, value, source, opted_out_at in rows:
+        phone = normalize_phone(value) if kind == "phone" else None
+        email = value if kind == "email" else None
+        if phone or email:
+            opt_outs.append(_OptOut(_channel_for(source), phone, email, source, None, opted_out_at))
+    if opt_outs:
+        _propagate(db, opt_outs, dialer_remover)
+
+    retried = _retry_pending_dialer_removals(db, dialer_remover)
+    if opt_outs or retried:
+        logger.info("[lending-compliance] poll new_opt_outs=%d dialer_retried=%d", len(opt_outs), retried)
+    return PollResult(new_opt_outs=len(opt_outs), dialer_retried=retried)
+
+
+def _propagate(db, opt_outs: list[_OptOut], dialer_remover: Optional[DialerRemover]) -> list[int]:
+    """Batch: one statement per lending table, then one Aircall call per phone."""
+    event_ids = [
+        r[0]
+        for r in db.execute(
+            text(
+                "INSERT INTO lending.opt_out_events (channel, source_ref, phone_hash, actor, received_at) "
+                "SELECT channel, source_ref, phone_hash, actor, received_at FROM unnest("
+                "CAST(:channels AS varchar[]), CAST(:refs AS varchar[]), CAST(:hashes AS varchar[]), "
+                "CAST(:actors AS varchar[]), CAST(:received AS timestamptz[])) WITH ORDINALITY "
+                "AS t(channel, source_ref, phone_hash, actor, received_at, ord) ORDER BY ord "
+                "RETURNING id"
+            ),
+            {
+                "channels": [o.channel.value for o in opt_outs],
+                "refs": [o.source_ref for o in opt_outs],
+                "hashes": [phone_hash(o.phone) if o.phone else None for o in opt_outs],
+                "actors": [o.actor for o in opt_outs],
+                "received": [o.received_at for o in opt_outs],
+            },
+        ).fetchall()
+    ]
 
     db.execute(
         text(
             "INSERT INTO lending.suppression_list (phone, email, reason, source_channel, source_ref) "
-            "SELECT p, e, :reason, :channel, :source_ref FROM (VALUES "
-            "(CAST(:phone AS varchar), CAST(NULL AS varchar)), (NULL, CAST(:email AS varchar))) v(p, e) "
-            "WHERE p IS NOT NULL OR e IS NOT NULL "
-            "ON CONFLICT DO NOTHING"
+            "VALUES (:phone, :email, :reason, :channel, :source_ref) ON CONFLICT DO NOTHING"
         ),
-        {
-            "reason": SuppressionReason.OPT_OUT.value,
-            "channel": channel.value,
-            "source_ref": source_ref,
-            "phone": phone,
-            "email": email,
-        },
+        [
+            {
+                "phone": value if kind == "phone" else None,
+                "email": value if kind == "email" else None,
+                "reason": SuppressionReason.OPT_OUT.value,
+                "channel": o.channel.value,
+                "source_ref": o.source_ref,
+            }
+            for o in opt_outs
+            for kind, value in (("phone", o.phone), ("email", o.email))
+            if value
+        ],
     )
-    if phone:
+    phones = sorted({o.phone for o in opt_outs if o.phone})
+    if phones:
         db.execute(
             text(
-                "INSERT INTO lending.contacts (phone, do_not_contact) VALUES (:phone, true) "
+                "INSERT INTO lending.contacts (phone, do_not_contact) "
+                "SELECT unnest(CAST(:phones AS varchar[])), true "
                 "ON CONFLICT (phone) DO UPDATE SET do_not_contact = true"
             ),
-            {"phone": phone},
+            {"phones": phones},
         )
-    stores_written_at = datetime.now(timezone.utc)
+    stores_at = datetime.now(timezone.utc)
 
-    dialer_removed_at = _remove_from_dialer(phone, ctx, event_id) if phone else None
-    status = OptOutStatus.COMPLETE if (phone is None or dialer_removed_at) else OptOutStatus.DIALER_PENDING
-
+    removed_at = _remove_from_dialer(phones, dialer_remover)
+    updates = []
+    for event_id, o in zip(event_ids, opt_outs):
+        dialer_at = removed_at.get(o.phone) if o.phone else None
+        status = OptOutStatus.COMPLETE if (o.phone is None or dialer_at) else OptOutStatus.DIALER_PENDING
+        updates.append({
+            "id": event_id,
+            "stores_at": stores_at,
+            # FA's store already holds this identifier: FA wrote it before the poll,
+            # or suppress_contact wrote it inside propagate_opt_out.
+            "sms_at": stores_at if o.phone else None,
+            "email_at": stores_at if o.email else None,
+            "dialer_at": dialer_at,
+            "status": status.value,
+        })
+        _log_propagation(event_id, o.channel, o.received_at, dialer_at or stores_at, status)
     db.execute(
         text(
             "UPDATE lending.opt_out_events SET suppression_at = :stores_at, sms_at = :sms_at, "
             "email_at = :email_at, dialer_removed_at = :dialer_at, status = :status WHERE id = :id"
         ),
-        {
-            "stores_at": stores_written_at,
-            # suppress_contact writes sms_opt_outs whenever it holds a phone and
-            # email_opt_outs whenever it holds an email, before calling us.
-            "sms_at": stores_written_at if phone else None,
-            "email_at": stores_written_at if email else None,
-            "dialer_at": dialer_removed_at,
-            "status": status.value,
-            "id": event_id,
-        },
+        updates,
     )
-    _log_propagation(event_id, channel, received_at, dialer_removed_at or stores_written_at, status)
-    return event_id
+    return event_ids
 
 
-def _remove_from_dialer(phone: str, ctx: Optional[_DialerContext], event_id: int) -> Optional[datetime]:
-    remover = (ctx.dialer_remover if ctx else None) or _default_dialer_remover()
-    if remover is None:
-        return None
-    try:
-        remover(phone)
-    except Exception as exc:
-        logger.error("[lending-compliance] dialer removal failed event=%s: %s", event_id, exc)
-        return None
-    return datetime.now(timezone.utc)
+def _remove_from_dialer(phones: list[str], dialer_remover: Optional[DialerRemover]) -> dict[str, datetime]:
+    """Removal time per phone Aircall confirmed. Failures stay pending for the next poll."""
+    remover = dialer_remover or _default_dialer_remover()
+    if remover is None or not phones:
+        return {}
+    done: dict[str, datetime] = {}
+    for phone in phones:
+        try:
+            remover(phone)
+            done[phone] = datetime.now(timezone.utc)
+        except Exception as exc:
+            logger.error("[lending-compliance] dialer removal failed phone_hash=%s: %s", phone_hash(phone)[:12], exc)
+    return done
+
+
+def _retry_pending_dialer_removals(db, dialer_remover: Optional[DialerRemover]) -> int:
+    pending = db.execute(
+        text(
+            "SELECT e.id, c.phone FROM lending.opt_out_events e "
+            "JOIN lending.contacts c ON e.phone_hash = encode(sha256(convert_to(c.phone, 'UTF8')), 'hex') "
+            "WHERE e.status = :pending"
+        ),
+        {"pending": OptOutStatus.DIALER_PENDING.value},
+    ).fetchall()
+    if not pending:
+        return 0
+    removed_at = _remove_from_dialer(sorted({phone for _, phone in pending}), dialer_remover)
+    updates = [
+        {"id": event_id, "at": removed_at[phone], "status": OptOutStatus.COMPLETE.value}
+        for event_id, phone in pending
+        if phone in removed_at
+    ]
+    if updates:
+        db.execute(
+            text("UPDATE lending.opt_out_events SET dialer_removed_at = :at, status = :status WHERE id = :id"),
+            updates,
+        )
+    return len(updates)
 
 
 def _log_propagation(event_id, channel, received_at, finished_at, status) -> None:
@@ -538,12 +599,12 @@ def _log_propagation(event_id, channel, received_at, finished_at, status) -> Non
 def reconcile_suppression(db, source_schema: str = "public", target_schema: str = "lending") -> int:
     """Copy FA opt-outs (and Tracerfy litigators) missing from lending.suppression_list.
 
-    Idempotent. Used by the migration backfill and as the retry path when
-    mirror_fa_opt_out fails inside suppress_contact's savepoint. Phones are
+    Idempotent. Used by the migration backfill (no events, no dialer calls —
+    live opt-outs go through poll_fa_opt_outs). Phones are
     normalized in Python (phone_utils rule) before insert. Returns rows added.
     """
     s, t = source_schema, target_schema
-    excluded = sorted(NON_OPT_OUT_SOURCES | {TRACERFY_DNC_SOURCE})
+    excluded = sorted(NON_OPT_OUT_SOURCES | {TRACERFY_DNC_SOURCE, DIALER_OPT_OUT_SOURCE})
     sms = db.execute(
         text(f'SELECT phone FROM "{s}".sms_opt_outs WHERE source <> ALL(:excluded)'),
         {"excluded": excluded},

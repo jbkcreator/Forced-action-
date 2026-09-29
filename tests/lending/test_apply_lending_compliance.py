@@ -16,7 +16,7 @@ pytestmark = pytest.mark.skipif(
     reason="requires a live Postgres DATABASE_URL",
 )
 
-TABLES = {"suppression_list", "contacts", "opt_out_events", "load_exclusions"}
+TABLES = {"suppression_list", "contacts", "opt_out_events", "load_exclusions", "dnc_scrubs"}
 
 
 @pytest.fixture

@@ -102,7 +102,7 @@ def test_stale_phone_is_rescrubbed_then_loadable_and_stamped(db):
 
     assert scrub.calls == [[P_STALE]]
     assert out[P_STALE].allowed
-    checked = db.execute(text("SELECT checked_at FROM dnc_phone_checks WHERE phone = :p"), {"p": P_STALE}).scalar()
+    checked = db.execute(text("SELECT checked_at FROM lending.dnc_scrubs WHERE phone = :p"), {"p": P_STALE}).scalar()
     assert checked > NOW - timedelta(days=1) or checked.year >= 2026  # refreshed by upsert
     stamp = db.execute(text("SELECT last_dnc_scrub FROM lending.contacts WHERE phone = :p"), {"p": P_STALE}).scalar()
     assert stamp is not None
@@ -186,3 +186,21 @@ def test_run_id_writes_every_exclusion(db):
     rows = db.execute(text("SELECT phone_hash, reason FROM lending.load_exclusions WHERE run_id = 'run-t1'")).fetchall()
     assert sorted(r.reason for r in rows) == ["INVALID_PHONE", "SCRUB_FAILED"]
     assert phone_hash(P_STALE) in {r.phone_hash for r in rows}
+
+
+def test_new_scrub_is_cached_in_lending_not_in_fa(db):
+    _dnc(db, P_STALE, age_days=45)
+    _run(db, [{"phone": P_STALE}], FakeScrub([_row(P_STALE)]))
+    fa_age = db.execute(text("SELECT checked_at FROM dnc_phone_checks WHERE phone = :p"), {"p": P_STALE}).scalar()
+    assert fa_age == NOW - timedelta(days=45)  # FA row untouched
+    assert db.execute(text("SELECT count(*) FROM lending.dnc_scrubs WHERE phone = :p"), {"p": P_STALE}).scalar() == 1
+
+
+def test_fresh_lending_scrub_is_reused_without_tracerfy(db):
+    db.execute(
+        text("INSERT INTO lending.dnc_scrubs (phone, national_dnc, litigator, state_dnc, checked_at) "
+             "VALUES (:p, false, false, false, :at)"),
+        {"p": P_CLEAN, "at": NOW - timedelta(days=2)},
+    )
+    out = _run(db, [{"phone": P_CLEAN}])
+    assert out[P_CLEAN].allowed

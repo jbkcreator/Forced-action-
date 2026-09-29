@@ -133,12 +133,3 @@ def suppress_contact(
         "[Suppression] opt-out written email=%s phone=%s source=%s",
         bool(email), bool(phone), source,
     )
-
-    # Lending Wave 0 (WP-W0-8): mirror into lending.suppression_list + dialer pool.
-    # Best-effort in a savepoint - a lending failure must never undo the FA opt-out.
-    try:
-        with db.begin_nested():
-            from src.lending.compliance import mirror_fa_opt_out
-            mirror_fa_opt_out(db, phone=phone, email=email, source=source)
-    except Exception:
-        logger.error("[Suppression] lending mirror failed source=%s", source, exc_info=True)
