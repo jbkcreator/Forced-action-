@@ -33,8 +33,9 @@ def main(argv: list[str] | None = None) -> None:
     while True:
         try:
             run_once()
-        except Exception:
-            logger.error("[lending-opt-out-poller] cycle failed; retrying next interval", exc_info=True)
+        except Exception as exc:
+            # Class only: SQL errors embed bound params (phones/emails).
+            logger.error("[lending-opt-out-poller] cycle failed (%s); retrying next interval", type(exc).__name__)
             if args.once:
                 raise
         if args.once:

@@ -49,6 +49,12 @@ NON_OPT_OUT_SOURCES = frozenset({
     "instantly_webhook_bounce",
 })
 
+# FA opt-out rows the lending poller/backfill must never treat as a person's opt-out.
+OPT_OUT_EXCLUDED_SOURCES = frozenset(NON_OPT_OUT_SOURCES | {TRACERFY_DNC_SOURCE, DIALER_OPT_OUT_SOURCE})
+
+# Postgres advisory-lock key: one poller cycle at a time across all processes.
+OPT_OUT_POLL_LOCK_KEY = 7_302_020_801
+
 # FA suppress_contact() source → opt-out channel. Anything unlisted is email-origin.
 SMS_OPT_OUT_SOURCES = frozenset({"inbound_sms", "twilio_inbound", "cascaded_from_sms"})
 
@@ -60,6 +66,7 @@ class OptOutChannel(str, Enum):
 
 
 class OptOutStatus(str, Enum):
+    PENDING = "pending"
     COMPLETE = "complete"
     DIALER_PENDING = "dialer_pending"
 

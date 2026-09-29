@@ -28,7 +28,7 @@ def db():
     # Dev 4 owns call_dispositions; contract = one row per attempt with phone + call_ended_at.
     session.execute(text(
         "CREATE TABLE IF NOT EXISTS lending.call_dispositions "
-        "(phone varchar(20) NOT NULL, call_ended_at timestamptz NOT NULL, disposition varchar(30))"
+        "(phone varchar(20), direction varchar(10), call_ended_at timestamptz NOT NULL, disposition varchar(30))"
     ))
     yield session
     session.close()
@@ -42,10 +42,11 @@ def _check(db, now):
     return can_dial_now(PHONE, db, now=now)
 
 
-def _attempt(db, ended_at, disposition=None):
+def _attempt(db, ended_at, disposition=None, direction="outbound"):
     db.execute(
-        text("INSERT INTO lending.call_dispositions (phone, call_ended_at, disposition) VALUES (:p, :t, :d)"),
-        {"p": PHONE, "t": ended_at, "d": disposition},
+        text("INSERT INTO lending.call_dispositions (phone, direction, call_ended_at, disposition) "
+             "VALUES (:p, :dir, :t, :d)"),
+        {"p": PHONE, "dir": direction, "t": ended_at, "d": disposition},
     )
 
 
@@ -114,3 +115,15 @@ def test_on_attempt_recorded_ignores_missing_phone(db):
     from src.lending.compliance import on_attempt_recorded
 
     assert on_attempt_recorded(db, None, now=NOON_LOCAL, dialer_remover=FakeDialer()) is None
+
+
+def test_inbound_calls_do_not_count_toward_the_cap(db):
+    for h in (3, 2, 1):
+        _attempt(db, NOON_LOCAL - timedelta(hours=h), direction="inbound")
+    assert _check(db, NOON_LOCAL).allowed
+
+
+def test_missing_direction_counts_toward_the_cap(db):
+    for h in (3, 2, 1):
+        _attempt(db, NOON_LOCAL - timedelta(hours=h), direction=None)
+    assert _check(db, NOON_LOCAL).reason == ReasonCode.ATTEMPT_CAP_REACHED

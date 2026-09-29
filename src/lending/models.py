@@ -15,6 +15,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     Index,
+    Integer,
     MetaData,
     String,
     text,
@@ -41,7 +42,7 @@ class LendingSuppression(LendingBase):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     phone: Mapped[Optional[str]] = mapped_column(String(20), unique=True)  # phone_utils.normalize
     email: Mapped[Optional[str]] = mapped_column(String(255), unique=True)  # lower-cased
-    reason: Mapped[str] = mapped_column(String(30), nullable=False)  # OPT_OUT / LITIGATOR / MANUAL
+    reason: Mapped[str] = mapped_column(String(30), nullable=False)  # SuppressionReason: OPT_OUT / LITIGATOR
     source_channel: Mapped[str] = mapped_column(String(30), nullable=False)  # sms / email / dialer / backfill:*
     source_ref: Mapped[Optional[str]] = mapped_column(String(100))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
@@ -58,6 +59,7 @@ class LendingContact(LendingBase):
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     phone: Mapped[str] = mapped_column(String(20), nullable=False, unique=True)
+    phone_hash: Mapped[Optional[str]] = mapped_column(String(64), index=True)  # joins opt_out_events.phone_hash
     email: Mapped[Optional[str]] = mapped_column(String(255))
     last_dnc_scrub: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     line_type: Mapped[Optional[str]] = mapped_column(String(20))  # Tracerfy phone_type (mobile/landline)
@@ -80,9 +82,16 @@ class LendingOptOutEvent(LendingBase):
     sms_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     email_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     dialer_removed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
-    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending", server_default="pending")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending", server_default="pending")  # OptOutStatus
+    fa_table: Mapped[Optional[str]] = mapped_column(String(20))  # sms_opt_outs / email_opt_outs (poller origin)
+    fa_row_id: Mapped[Optional[int]] = mapped_column(Integer)
 
-    __table_args__ = (Index("idx_lending_opt_out_events_received", "received_at"),)
+    __table_args__ = (
+        Index("idx_lending_opt_out_events_received", "received_at"),
+        Index("idx_lending_opt_out_events_status", "status"),
+        Index("uq_lending_opt_out_events_fa_row", "fa_table", "fa_row_id", unique=True,
+              postgresql_where=text("fa_row_id IS NOT NULL")),
+    )
 
 
 class LendingLoadExclusion(LendingBase):

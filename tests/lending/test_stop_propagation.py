@@ -36,13 +36,17 @@ def db():
 
 
 class FakeDialer:
+    """Records removals of the test phone only: the shared DB holds real FA
+    opt-outs that a poll in the rolled-back test transaction also sees."""
+
     def __init__(self, boom=False):
         self.removed, self.boom = [], boom
 
     def __call__(self, phone):
         if self.boom:
             raise RuntimeError("aircall 500")
-        self.removed.append(phone)
+        if phone == PHONE:
+            self.removed.append(phone)
 
 
 def _scalar(db, sql, **p):
@@ -189,7 +193,7 @@ def test_poll_retries_a_pending_dialer_removal(db):
     dialer = FakeDialer()
     result = poll_fa_opt_outs(db, dialer_remover=dialer)
 
-    assert result.dialer_retried == 1
+    assert result.dialer_retried >= 1
     assert dialer.removed == [PHONE]
     [ev] = _events(db, PHONE)
     assert ev.status == "complete" and ev.dialer_removed_at is not None
@@ -204,3 +208,81 @@ def test_poll_receive_time_is_the_fa_opt_out_time(db):
     poll_fa_opt_outs(db, dialer_remover=FakeDialer())
     [ev] = _events(db, PHONE)
     assert (ev.suppression_at - ev.received_at).total_seconds() >= 19
+
+
+# ── Review v2 fixes ───────────────────────────────────────────────────────────
+
+
+def test_unnormalized_fa_phone_is_processed_once(db):
+    from src.lending.compliance import poll_fa_opt_outs
+
+    db.execute(text("INSERT INTO sms_opt_outs (phone, keyword_used, source, opted_out_at) "
+                    "VALUES ('(813) 555-9001', 'STOP', 'inbound_sms', now())"))
+    dialer = FakeDialer()
+    poll_fa_opt_outs(db, dialer_remover=dialer)
+    poll_fa_opt_outs(db, dialer_remover=dialer)
+
+    assert len(_events(db, PHONE)) == 1
+    assert dialer.removed == [PHONE]
+    assert _scalar(db, "SELECT 1 FROM lending.suppression_list WHERE phone = :p", p=PHONE) == 1
+
+
+def test_padded_fa_email_is_processed_once(db):
+    from src.lending.compliance import poll_fa_opt_outs
+
+    db.execute(text("INSERT INTO email_opt_outs (email, source, opted_out_at) "
+                    "VALUES ('  Stop.Test@Example.com ', 'unsubscribe_link', now())"))
+    first = poll_fa_opt_outs(db, dialer_remover=FakeDialer())
+    second = poll_fa_opt_outs(db, dialer_remover=FakeDialer())
+
+    assert first.new_opt_outs >= 1 and second.new_opt_outs == 0
+    assert _scalar(db, "SELECT 1 FROM lending.suppression_list WHERE email = :e", e=EMAIL) == 1
+
+
+def test_stop_from_an_already_suppressed_phone_still_logs_and_pulls(db):
+    from src.lending.compliance import poll_fa_opt_outs
+    from src.services import sms_compliance
+
+    db.execute(text("INSERT INTO lending.suppression_list (phone, reason, source_channel) "
+                    "VALUES (:p, 'LITIGATOR', 'tracerfy_scrub')"), {"p": PHONE})
+    sms_compliance.handle_inbound(PHONE, "STOP", db)
+    dialer = FakeDialer()
+    poll_fa_opt_outs(db, dialer_remover=dialer)
+
+    assert [e.channel for e in _events(db, PHONE)] == ["sms"]
+    assert dialer.removed == [PHONE]
+    assert _scalar(db, "SELECT reason FROM lending.suppression_list WHERE phone = :p", p=PHONE) == "LITIGATOR"
+
+
+def test_second_poller_skips_while_the_first_holds_the_lock(db):
+    from src.lending.compliance import POLL_LOCK_KEY, poll_fa_opt_outs
+
+    other = create_engine(os.environ["DATABASE_URL"]).connect()
+    try:
+        other.execute(text("SELECT pg_advisory_lock(:k)"), {"k": POLL_LOCK_KEY})
+        result = poll_fa_opt_outs(db, dialer_remover=FakeDialer())
+        assert result.skipped_locked is True
+    finally:
+        other.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": POLL_LOCK_KEY})
+        other.close()
+
+
+def test_pending_dialer_removal_is_reported_as_not_within_sla(db, caplog):
+    from src.lending.compliance import propagate_opt_out
+
+    with caplog.at_level("INFO"):
+        propagate_opt_out(db, phone=PHONE, source_ref="call_90", dialer_remover=FakeDialer(boom=True))
+    msgs = [r.getMessage() for r in caplog.records if "opt-out event=" in r.getMessage()]
+    assert msgs and all("dialer_pending" in m and "sla_met=no" in m for m in msgs)
+
+
+def test_errors_never_log_the_phone(db, caplog):
+    from src.lending.compliance import propagate_opt_out
+
+    class LeakyDialer:
+        def __call__(self, phone):
+            raise RuntimeError(f"aircall rejected {phone}")
+
+    with caplog.at_level("INFO"):
+        propagate_opt_out(db, phone=PHONE, source_ref="call_91", dialer_remover=LeakyDialer())
+    assert PHONE not in caplog.text and PHONE[2:] not in caplog.text
