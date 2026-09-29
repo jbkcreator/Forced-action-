@@ -48,9 +48,9 @@ class NoScrub:
         raise AssertionError(f"scrubber must not be called, got {phones}")
 
 
-def _run(db, records, scrubber=NoScrub()):
+def _run(db, records, scrubber=NoScrub(), **kw):
     from src.services.lending_compliance import filter_loadable
-    return {r.phone: r for r in filter_loadable(records, db, now=NOW, scrubber=scrubber)}
+    return {r.phone: r for r in filter_loadable(records, db, now=NOW, scrubber=scrubber, **kw)}
 
 
 def test_fresh_clean_phone_is_loadable_without_a_new_scrub(db):
@@ -154,3 +154,35 @@ def test_pool_export_field_name_normalized_phone_is_accepted(db):
     _dnc(db, P_CLEAN, age_days=1)
     out = _run(db, [{"normalized_phone": P_CLEAN, "state": "FL"}])
     assert out[P_CLEAN].allowed
+
+
+def test_one_result_per_record_in_input_order(db):
+    from src.services.lending_compliance import filter_loadable
+
+    _dnc(db, P_CLEAN, age_days=1)
+    records = [{"phone": ""}, {"phone": P_CLEAN}, {"phone": ""}, {"phone": P_CLEAN}]
+    out = filter_loadable(records, db, now=NOW, scrubber=NoScrub())
+    assert [r.reason for r in out] == [ReasonCode.INVALID_PHONE, None, ReasonCode.INVALID_PHONE, None]
+
+
+def test_fresh_cached_scrub_stamps_contact_with_its_scrub_time(db):
+    _dnc(db, P_CLEAN, age_days=5)
+    _run(db, [{"phone": P_CLEAN}])
+    stamp = db.execute(text("SELECT last_dnc_scrub FROM lending.contacts WHERE phone = :p"), {"p": P_CLEAN}).scalar()
+    assert stamp == NOW - timedelta(days=5)
+
+
+def test_line_type_from_tracerfy_is_recorded(db):
+    _run(db, [{"phone": P_STALE}], FakeScrub([{**_row(P_STALE), "phone_type": "Mobile"}]))
+    lt = db.execute(text("SELECT line_type FROM lending.contacts WHERE phone = :p"), {"p": P_STALE}).scalar()
+    assert lt == "Mobile"
+
+
+def test_run_id_writes_every_exclusion(db):
+    from src.services.lending_compliance import phone_hash
+
+    _dnc(db, P_CLEAN, age_days=1)
+    _run(db, [{"phone": P_CLEAN}, {"phone": "123"}, {"phone": P_STALE}], FakeScrub([]), run_id="run-t1")
+    rows = db.execute(text("SELECT phone_hash, reason FROM lending.load_exclusions WHERE run_id = 'run-t1'")).fetchall()
+    assert sorted(r.reason for r in rows) == ["INVALID_PHONE", "SCRUB_FAILED"]
+    assert phone_hash(P_STALE) in {r.phone_hash for r in rows}

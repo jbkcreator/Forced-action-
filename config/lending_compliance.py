@@ -17,6 +17,53 @@ DNC_SCRUB_MAX_AGE_DAYS = 31
 STOP_PROPAGATION_SLA_SECONDS = 60
 GEORGIA_ALLOWED_ENTITY_TYPES = frozenset({"LLC", "LP", "CORPORATION"})
 
+# Recipient timezone by area code (lending-owned copy; FA SMS keeps its own).
+# 850 spans ET/CT → Central, the over-suppressing direction.
+DEFAULT_TZ = "America/New_York"
+AREA_CODE_TZ: dict[str, str] = {
+    "850": "America/Chicago",
+    **{ac: "America/New_York" for ac in (
+        # Florida
+        "239", "305", "321", "352", "386", "407", "561", "727", "754", "772",
+        "786", "813", "863", "904", "941", "954",
+        # Georgia
+        "229", "404", "470", "478", "678", "706", "762", "770", "912",
+    )},
+}
+
+# FA sms_opt_outs rows written by the Tracerfy DNC refresh are national-DNC hits,
+# re-verified every 31 days — never a permanent opt-out.
+TRACERFY_DNC_SOURCE = "tracerfy_dnc_refresh"
+
+# suppress_contact() sources that are deliverability failures, not a person saying
+# "stop" (spec §3.2 covers STOP / UNSUBSCRIBE / verbal decline only). FA still blocks
+# them on its own stores (ADR 0028); lending does not record them as opt-outs.
+NON_OPT_OUT_SOURCES = frozenset({
+    "mandrill_hard_bounce",
+    "mandrill_reject",
+    "mandrill_soft_bounce_threshold",
+    "instantly_webhook_bounce",
+})
+
+# FA suppress_contact() source → opt-out channel. Anything unlisted is email-origin.
+SMS_OPT_OUT_SOURCES = frozenset({"inbound_sms", "twilio_inbound", "cascaded_from_sms"})
+
+
+class OptOutChannel(str, Enum):
+    SMS = "sms"
+    EMAIL = "email"
+    DIALER = "dialer"
+
+
+class OptOutStatus(str, Enum):
+    COMPLETE = "complete"
+    DIALER_PENDING = "dialer_pending"
+
+
+class SuppressionReason(str, Enum):
+    OPT_OUT = "OPT_OUT"
+    LITIGATOR = "LITIGATOR"
+
 
 class ReasonCode(str, Enum):
     """Shared exclusion reasons returned by every gate and stored in load_exclusions."""

@@ -135,7 +135,7 @@ def suppress_contact(
     )
 
     # Lending Wave 0 (WP-W0-8): mirror into lending.suppression_list + dialer pool.
-    # Best-effort in a savepoint — a lending failure must never undo the FA opt-out.
+    # Best-effort in a savepoint - a lending failure must never undo the FA opt-out.
     try:
         with db.begin_nested():
             from src.services.lending_compliance import mirror_fa_opt_out

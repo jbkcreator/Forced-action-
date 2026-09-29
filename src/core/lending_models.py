@@ -60,6 +60,7 @@ class LendingContact(LendingBase):
     phone: Mapped[str] = mapped_column(String(20), nullable=False, unique=True)
     email: Mapped[Optional[str]] = mapped_column(String(255))
     last_dnc_scrub: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    line_type: Mapped[Optional[str]] = mapped_column(String(20))  # Tracerfy phone_type (mobile/landline)
     do_not_contact: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 

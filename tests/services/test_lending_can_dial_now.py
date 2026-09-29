@@ -78,3 +78,10 @@ def test_block_ends_once_oldest_attempt_is_older_than_24h(db):
     _attempt(db, NOON_LOCAL - timedelta(hours=2), None)
     _attempt(db, NOON_LOCAL - timedelta(hours=1), None)
     assert _check(db, NOON_LOCAL).allowed
+
+
+def test_recipient_timezone_is_lending_owned_and_conservative_for_850():
+    from src.services.lending_compliance import recipient_timezone
+    assert recipient_timezone("+18505551234").key == "America/Chicago"
+    assert recipient_timezone("+14045551234").key == "America/New_York"  # Georgia
+    assert recipient_timezone("+18135551234", zip_code="33602").key == "America/New_York"

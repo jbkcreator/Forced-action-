@@ -62,11 +62,13 @@ def _seed_sources(engine, source):
             INSERT INTO "{source}".sms_opt_outs (phone, keyword_used, source, opted_out_at) VALUES
               ('+18135550101', 'STOP', 'manual', now()),
               ('+18135550102', 'DNC', 'tracerfy_dnc_refresh', now()),
-              ('+18135550103', 'DNC', 'tracerfy_dnc_refresh', now())
+              ('+18135550103', 'DNC', 'tracerfy_dnc_refresh', now()),
+              ('(813) 555-0106', 'STOP', 'inbound_sms', now())
         """))
         c.execute(text(f"""
             INSERT INTO "{source}".email_opt_outs (email, source, opted_out_at)
-            VALUES ('Optout@Example.com', 'unsubscribe_link', now())
+            VALUES ('Optout@Example.com', 'unsubscribe_link', now()),
+                   ('bounced@example.com', 'mandrill_hard_bounce', now())
         """))
         c.execute(text(f"""
             INSERT INTO "{source}".dnc_phone_checks (phone, national_dnc, litigator, checked_at, source) VALUES
@@ -93,6 +95,8 @@ def test_backfill_takes_real_opt_outs_and_litigators_only(env):
         "+18135550101": "OPT_OUT",      # manual STOP
         "optout@example.com": "OPT_OUT",  # email, lower-cased
         "+18135550103": "LITIGATOR",    # Tracerfy-flagged litigator
+        "+18135550106": "OPT_OUT",      # legacy raw format, normalized on backfill
+        # bounced@example.com excluded: a bounce is not an opt-out
         # 0102 (DNC-only sms row), 0104 (national DNC only), 0105 (clean) excluded:
         # national DNC is re-checked every 31 days, never permanent.
     }

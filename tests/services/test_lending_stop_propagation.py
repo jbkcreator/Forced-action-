@@ -57,7 +57,7 @@ def test_verbal_decline_blocks_every_store_within_sla(db):
     from src.services.lending_compliance import filter_loadable, propagate_opt_out
 
     dialer = FakeDialer()
-    propagate_opt_out(db, channel="dialer", phone=PHONE, source_ref="call_42", actor="seat_a",
+    propagate_opt_out(db, phone=PHONE, source_ref="call_42", actor="seat_a",
                       dialer_remover=dialer)
 
     assert _scalar(db, "SELECT reason FROM lending.suppression_list WHERE phone = :p", p=PHONE) == "OPT_OUT"
@@ -80,7 +80,7 @@ def test_verbal_decline_blocks_every_store_within_sla(db):
 def test_dialer_outage_never_blocks_the_suppression_writes(db):
     from src.services.lending_compliance import propagate_opt_out
 
-    propagate_opt_out(db, channel="dialer", phone=PHONE, source_ref="call_43", dialer_remover=FakeDialer(boom=True))
+    propagate_opt_out(db, phone=PHONE, source_ref="call_43", dialer_remover=FakeDialer(boom=True))
 
     assert _scalar(db, "SELECT 1 FROM lending.suppression_list WHERE phone = :p", p=PHONE) == 1
     assert _scalar(db, "SELECT 1 FROM sms_opt_outs WHERE phone = :p", p=PHONE) == 1
@@ -110,3 +110,38 @@ def test_inbound_sms_stop_reaches_lending_suppression_and_dialer(db, monkeypatch
     assert _scalar(db, "SELECT 1 FROM lending.suppression_list WHERE phone = :p", p=PHONE) == 1
     assert _event(db, PHONE).channel == "sms"
     assert dialer.removed == [PHONE]
+
+
+def test_bounce_is_not_recorded_as_a_lending_opt_out(db):
+    from src.services.email_suppression import suppress_contact
+
+    suppress_contact(db, email=EMAIL, source="mandrill_hard_bounce")
+
+    assert _scalar(db, "SELECT count(*) FROM lending.suppression_list WHERE email = :e", e=EMAIL) == 0
+    assert _scalar(db, "SELECT count(*) FROM email_opt_outs WHERE email = :e", e=EMAIL) == 1  # FA still blocks
+
+
+def test_repeat_fa_opt_out_creates_one_event(db, monkeypatch):
+    from src.services import lending_compliance, sms_compliance
+    from src.services.lending_compliance import phone_hash
+
+    monkeypatch.setattr(lending_compliance, "_default_dialer_remover", lambda: FakeDialer())
+    sms_compliance.handle_inbound(PHONE, "STOP", db)
+    sms_compliance.handle_inbound(PHONE, "STOP", db)
+
+    assert _scalar(db, "SELECT count(*) FROM lending.opt_out_events WHERE phone_hash = :h", h=phone_hash(PHONE)) == 1
+
+
+def test_reconcile_recovers_an_opt_out_whose_mirror_failed(db, monkeypatch):
+    from src.services import lending_compliance
+    from src.services.email_suppression import suppress_contact
+
+    def broken(*a, **k):
+        raise RuntimeError("lending schema unavailable")
+    monkeypatch.setattr(lending_compliance, "mirror_fa_opt_out", broken)
+    suppress_contact(db, email=EMAIL, source="unsubscribe_link")
+    assert _scalar(db, "SELECT count(*) FROM lending.suppression_list WHERE email = :e", e=EMAIL) == 0
+
+    monkeypatch.undo()
+    lending_compliance.reconcile_suppression(db)
+    assert _scalar(db, "SELECT reason FROM lending.suppression_list WHERE email = :e", e=EMAIL) == "OPT_OUT"
