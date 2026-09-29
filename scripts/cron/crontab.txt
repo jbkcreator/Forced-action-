@@ -1179,4 +1179,8 @@ COUNTY_ID=hillsborough
 # the runner also refuses --apply while PROPERTY_RADAR_ENABLED=false.
 # 30 2 * * * $PROJECT/scripts/cron/run.sh src.tasks.property_radar_runner --apply --mode daily --state FL
 
+# Lending call dispositions — retry Google Sheet / Slack #dial-tasks delivery for
+# calls whose first delivery failed or whose result was changed by the caller.
+*/5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_disposition_delivery_retry
+
 # === END FORCED-ACTION-PLATFORM ===

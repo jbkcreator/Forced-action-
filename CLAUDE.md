@@ -44,6 +44,7 @@ PYTHONPATH=. python migrations/apply_fa_max_wp_t2_2_tool_call_log_claimed_status
 PYTHONPATH=. python migrations/apply_fa_max_wp_t2_3.py  # FA Max WP-T2-3: opportunity_id on relay_approval_queue, backflip_attribution_owner/set_at on fa_max_opportunities, fa_max_backflip_suppression_decisions audit table (idempotent, run after WP-T2-2)
 PYTHONPATH=. python migrations/apply_property_radar_pull_runs.py  # PropertyRadar ingestion adapter (Dev 1): property_radar_pull_runs (run checkpoint) + property_radar_seen_ids (dedup) (idempotent)
 
+PYTHONPATH=. python migrations/apply_lending_call_dispositions.py  # lending.call_dispositions (idempotent); runbook docs/lending/aircall-disposition-runbook.md
 # PropertyRadar daily target-lender maturity pull (separate cron, disabled until PROPERTY_RADAR_ENABLED=true — see scripts/cron/crontab.txt)
 python -m src.tasks.property_radar_maturity_pull --mode daily --state FL
 
@@ -99,6 +100,9 @@ Garbage collection for `lifecycle_playbook`. `src/services/learning_hygiene.py` 
 - **`anti_playbook` excluded, not inverted** — counter-evidence against a documented failure means the failure stopped, which is a different terminal state.
 - Rails: schema precondition (verifies `apply_lifecycle_playbook_lessons_versioning.py` ran; **never applies it**), global feed health, blast radius `max(3, 20%)` of the *measurable* population. Audit rows go to `agent_decisions` — no new migration. See ADR 0034 + `config/learning_hygiene.py:validate_hygiene_config()`.
 - **Tasks** (`src/tasks/`): Scheduled jobs. `daily_report.py` — CSV ops report (runs 08:10 UTC for both Hillsborough and Pinellas). `daily_dashboard.py` — 10-section PDF (23:30 UTC Mon-Sat), separate from daily_report. `dnc_refresh` — monthly Tracerfy DNC re-scrub. `venture_ladder_evaluator.py` — daily 09:30 UTC venture-ladder walk (CL4).
+
+### Lending (`src/lending/`)
+Own process (`lending-api`, `127.0.0.1:8010`, Nginx → `/webhooks/aircall/disposition`) and own DB role (`LENDING_DATABASE_URL`, schema `lending` only). One `call_dispositions` row per Aircall call; result = one of 5 Aircall tag names (`config/lending_dispositions.py`). Sheet + Slack delivery runs after the reply; `src.tasks.lending_disposition_delivery_retry` (cron */5) catches failures.
 
 ### County Config
 County config is **DB-backed** via `counties` + `county_sources` tables — **not** `config/counties.json`. Read via `src/utils/county_config.py:get_county(county_id)` (5-min cache). `County.nws_zone` supports comma-separated values for multi-zone counties. Hillsborough: `FLZ151,FLZ251`. Pinellas: `FLZ050`.

@@ -25,3 +25,6 @@ venv/
 ext_tasks/
 tasks/New-agent-lane/csv/
 .worktrees/
+
+# Service-account key files (uploaded to the server by hand, never committed)
+config/Gcp_cred/

@@ -859,6 +859,19 @@ class AppSettings(BaseSettings):
 	aircall_api_id: Optional[SecretStr] = Field(default=None, env="AIRCALL_API_ID")
 	aircall_api_token: Optional[SecretStr] = Field(default=None, env="AIRCALL_API_TOKEN")
 	aircall_webhook_token: Optional[SecretStr] = Field(default=None, env="AIRCALL_WEBHOOK_TOKEN")
+
+	# ── Lending engine: call disposition logging ──
+	# Own DB role, Aircall webhook token, Slack bot and Sheet, separate from the
+	# FA settings above. All optional so the app boots without lending configured.
+	lending_database_url: str = Field(default="", env="LENDING_DATABASE_URL")
+	lending_db_password: Optional[SecretStr] = Field(default=None, env="LENDING_DB_PASSWORD")
+	lending_aircall_webhook_token: Optional[SecretStr] = Field(default=None, env="LENDING_AIRCALL_WEBHOOK_TOKEN")
+	lending_aircall_line_ids: str = Field(default="", env="LENDING_AIRCALL_LINE_IDS")  # comma-separated Aircall number IDs
+	lending_slack_bot_token: Optional[SecretStr] = Field(default=None, env="LENDING_SLACK_BOT_TOKEN")
+	lending_dial_tasks_channel: str = Field(default="", env="LENDING_DIAL_TASKS_CHANNEL")
+	lending_sheets_service_account_key_path: str = Field(default="", env="LENDING_SHEETS_SERVICE_ACCOUNT_KEY_PATH")
+	lending_disposition_sheet_id: str = Field(default="", env="LENDING_DISPOSITION_SHEET_ID")
+	lending_disposition_sheet_tab: str = Field(default="Dispositions", env="LENDING_DISPOSITION_SHEET_TAB")
 	# ── Meta Conversions API (CAPI) — S2 ────────────────────────────────────
 	# Server-side Purchase reporting for closed-loop Meta ad attribution.
 	# Feature-gated and OFF by default — when disabled, or when pixel_id /
