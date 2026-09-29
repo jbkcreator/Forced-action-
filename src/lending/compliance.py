@@ -286,6 +286,71 @@ def tracerfy_scrub(phones: list[str]) -> list[dict]:
     return _poll_queue(_submit_scrub_batch(phones, api_key), api_key)
 
 
+# ── A2 coverage check (spec §12) ──────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class CoverageGap:
+    phone: str
+    reason: ReasonCode
+
+
+@dataclass(frozen=True)
+class A2Report:
+    checked: int
+    gaps: list[CoverageGap]
+    gap_counts: dict[str, int]
+
+    @property
+    def passed(self) -> bool:
+        return not self.gaps
+
+
+def coverage_gaps(db, phones: list[str], *, now: Optional[datetime] = None) -> list[CoverageGap]:
+    """Every number in ``phones`` that would violate A2: no scrub within 31 days
+    (FA or lending cache), on any suppression store, or a positive DNC/litigator
+    result. Read-only and never calls Tracerfy — it re-checks stored evidence with
+    the same lookups filter_loadable uses. An empty list means A2 passes."""
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=DNC_SCRUB_MAX_AGE_DAYS)
+
+    gaps: list[CoverageGap] = []
+    normalized: dict[str, str] = {}
+    for raw in dict.fromkeys(phones):
+        phone = normalize_phone(raw)
+        if phone:
+            normalized.setdefault(phone, raw)
+        else:
+            gaps.append(CoverageGap(phone=raw, reason=ReasonCode.INVALID_PHONE))
+
+    candidates = sorted(normalized)
+    if not candidates:
+        return gaps
+    suppressed = _suppressed_phones(db, candidates)
+    scrubs = _stored_scrubs(db, candidates)
+    for phone in candidates:
+        scrub = scrubs.get(phone)
+        if phone in suppressed:
+            gaps.append(CoverageGap(phone, ReasonCode.SUPPRESSED))
+        elif scrub is None or scrub.checked_at < cutoff:
+            gaps.append(CoverageGap(phone, ReasonCode.NO_FRESH_SCRUB))
+        elif not (verdict := _verdict(phone, scrub)).allowed:
+            gaps.append(CoverageGap(phone, verdict.reason))
+    return gaps
+
+
+def a2_coverage_report(db, phones: list[str], *, now: Optional[datetime] = None) -> A2Report:
+    """Summary for the A2 evidence file: distinct numbers checked + gaps by reason."""
+    gaps = coverage_gaps(db, phones, now=now)
+    counts: dict[str, int] = {}
+    for gap in gaps:
+        counts[gap.reason.value] = counts.get(gap.reason.value, 0) + 1
+    report = A2Report(checked=len(dict.fromkeys(phones)), gaps=gaps, gap_counts=counts)
+    logger.info("[lending-compliance] A2 coverage checked=%d gaps=%s passed=%s",
+                report.checked, counts, report.passed)
+    return report
+
+
 # ── Call-time gate (WP-W0-3) ─────────────────────────────────────────────────
 
 
