@@ -10,10 +10,11 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import json
+
 import pytest
 
 from src.services.backflip_conflict_check import (
-    AUDIT_GATE,
     CRITERION_EMAIL_DOMAIN,
     CRITERION_ENTITY_NAME,
     CRITERION_PARCEL_ID,
@@ -28,7 +29,7 @@ from src.services.backflip_conflict_check import (
     find_borrower_conflicts,
     hash_phone,
     load_backflip_identifier_index,
-    record_dialer_conflict_decisions,
+    record_conflict_exclusions,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -226,55 +227,70 @@ class TestLoadIndex:
 # Audit write
 # ---------------------------------------------------------------------------
 
-class TestAuditWrite:
-    def _write(self, decisions):
+class TestLendingExclusionWrite:
+    def _write(self, decisions, run_id="run-1"):
         session = MagicMock()
-        cm = MagicMock()
-        cm.__enter__.return_value = session
-        with patch("src.services.backflip_conflict_check.get_db_context", return_value=cm):
-            record_dialer_conflict_decisions(decisions)
-        return session
+        written = record_conflict_exclusions(session, run_id, decisions)
+        return session, written
 
-    def test_all_decisions_written_in_one_batch(self):
+    def test_blocked_records_written_in_one_batch_to_lending_schema(self):
         decisions = find_borrower_conflicts(
-            [BorrowerRecord("hit", phone=BACKFLIP_PHONE), BorrowerRecord("clear", email="amy@other.com")],
+            [BorrowerRecord("hit", phone=BACKFLIP_PHONE, parcel_id=BACKFLIP_PARCEL),
+             BorrowerRecord("clear", phone="(813) 555-0199")],
             _index(),
         )
-        session = self._write(decisions)
+        session, written = self._write(decisions)
+        assert written == 1
         assert session.execute.call_count == 1
+        sql = str(session.execute.call_args.args[0])
+        assert "lending.load_exclusions" in sql
+        assert "fa_max" not in sql
         params = session.execute.call_args.args[1]
-        assert [p["subject_ref"] for p in params] == ["hit", "clear"]
-        assert all(p["gate"] == AUDIT_GATE for p in params)
-        assert params[0]["suppressed"] is True
-        assert params[0]["criteria"] == [CRITERION_PHONE_HASH]
-        assert params[1]["suppressed"] is False
-        assert params[1]["criteria"] is None
+        assert len(params) == 1
+        assert params[0]["run_id"] == "run-1"
+        assert params[0]["reason"] == "BACKFLIP_CONFLICT"
+        assert params[0]["phone_hash"] == hash_phone(BACKFLIP_PHONE)
+        assert json.loads(params[0]["detail"]) == {"matched_criteria": [CRITERION_PHONE_HASH, CRITERION_PARCEL_ID]}
 
-    def test_audit_rows_hold_no_raw_identifiers(self):
+    @pytest.mark.parametrize("reason", [REASON_FEED_STALE, REASON_FEED_UNAVAILABLE])
+    def test_feed_block_reasons_use_lending_reason_codes(self, reason):
+        decisions = find_borrower_conflicts(
+            [BorrowerRecord("r1", phone=BACKFLIP_PHONE)], BackflipIdentifierIndex(block_reason=reason),
+        )
+        session, _ = self._write(decisions)
+        params = session.execute.call_args.args[1][0]
+        assert params["reason"] == reason
+        assert reason in {"BACKFLIP_FEED_STALE", "BACKFLIP_FEED_UNAVAILABLE"}
+        assert json.loads(params["detail"]) == {"matched_criteria": []}
+
+    def test_rows_hold_no_raw_identifiers(self):
         decisions = find_borrower_conflicts(
             [BorrowerRecord("hit", phone=BACKFLIP_PHONE, email=BACKFLIP_EMAIL)], _index(),
         )
-        params = self._write(decisions).execute.call_args.args[1][0]
-        flattened = " ".join(str(value) for value in params.values())
+        session, _ = self._write(decisions)
+        flattened = " ".join(str(value) for value in session.execute.call_args.args[1][0].values())
         assert BACKFLIP_PHONE not in flattened
         assert BACKFLIP_EMAIL not in flattened
-        assert params["masked"] == "...0100"
-        assert params["digest"] == hash_phone(BACKFLIP_PHONE)
 
-    def test_empty_decisions_skip_the_database(self):
-        with patch("src.services.backflip_conflict_check.get_db_context") as ctx:
-            record_dialer_conflict_decisions([])
-        ctx.assert_not_called()
+    def test_no_blocked_records_skips_the_database(self):
+        decisions = find_borrower_conflicts([BorrowerRecord("clear", phone="(813) 555-0199")], _index())
+        session, written = self._write(decisions)
+        assert written == 0
+        session.execute.assert_not_called()
+
+    def test_blocked_record_without_phone_raises(self):
+        decisions = find_borrower_conflicts([BorrowerRecord("r1", email=BACKFLIP_EMAIL)], _index())
+        session = MagicMock()
+        with pytest.raises(ValueError, match="no phone hash"):
+            record_conflict_exclusions(session, "run-1", decisions)
+        session.execute.assert_not_called()
 
     def test_database_failure_propagates(self):
         session = MagicMock()
         session.execute.side_effect = RuntimeError("db down")
-        cm = MagicMock()
-        cm.__enter__.return_value = session
-        decisions = find_borrower_conflicts([BorrowerRecord("r1", email=BACKFLIP_EMAIL)], _index())
-        with patch("src.services.backflip_conflict_check.get_db_context", return_value=cm):
-            with pytest.raises(RuntimeError):
-                record_dialer_conflict_decisions(decisions)
+        decisions = find_borrower_conflicts([BorrowerRecord("r1", phone=BACKFLIP_PHONE)], _index())
+        with pytest.raises(RuntimeError):
+            record_conflict_exclusions(session, "run-1", decisions)
 
 
 # ---------------------------------------------------------------------------
@@ -337,11 +353,38 @@ class TestFeedIdentifierKinds:
                 replace_backflip_snapshot({identifier})
         ctx.assert_not_called()
 
-    def test_migration_is_idempotent_and_widens_both_constraints(self):
+    def test_identifier_migration_widens_kinds_only(self):
         source = (REPO_ROOT / "migrations" / "apply_backflip_conflict_identifiers.py").read_text(encoding="utf-8")
         assert "DROP CONSTRAINT IF EXISTS ck_fa_max_backflip_identifier_kind" in source
         assert "'entity_name', 'parcel_id'" in source
+        assert "ALTER TABLE fa_max_backflip_suppression_decisions" not in source
+
+    def test_audit_removal_migration_restores_fa_max_table(self):
+        source = (REPO_ROOT / "migrations" / "apply_backflip_dialer_audit_removal.py").read_text(encoding="utf-8")
+        assert "CHECK (gate IN ('draft', 'send'))" in source
+        assert "DROP COLUMN IF EXISTS subject_ref" in source
+        assert "DROP COLUMN IF EXISTS matched_criteria" in source
         assert "DROP CONSTRAINT IF EXISTS ck_fa_max_bsd_gate" in source
-        assert "'dialer'" in source
-        assert "ADD COLUMN IF NOT EXISTS subject_ref" in source
-        assert "ADD COLUMN IF NOT EXISTS matched_criteria" in source
+
+    def test_audit_removal_refuses_when_dialer_rows_exist(self):
+        from migrations import apply_backflip_dialer_audit_removal as migration
+
+        session = MagicMock()
+        session.execute.return_value.scalar_one.return_value = 2
+        cm = MagicMock()
+        cm.__enter__.return_value = session
+        with patch.object(migration, "get_db_context", return_value=cm):
+            with pytest.raises(RuntimeError, match="refusing"):
+                migration.run()
+        assert session.execute.call_count == 1
+
+    def test_audit_removal_runs_when_no_dialer_rows(self):
+        from migrations import apply_backflip_dialer_audit_removal as migration
+
+        session = MagicMock()
+        session.execute.return_value.scalar_one.return_value = 0
+        cm = MagicMock()
+        cm.__enter__.return_value = session
+        with patch.object(migration, "get_db_context", return_value=cm):
+            migration.run()
+        assert session.execute.call_count == 1 + len(migration.STATEMENTS)

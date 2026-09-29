@@ -12,11 +12,14 @@ because no record can be proven clear without a current view of Backflip's
 book; a record with no usable identifier is blocked for the same reason.
 
 The snapshot is loaded once per run and matched in memory, so a pool of any
-size costs two queries, and every decision is written in one batch insert.
+size costs two queries. Blocked records are written to the lending schema's
+load_exclusions table in one batch insert; lending decisions never go to the
+FA Max audit tables.
 """
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from dataclasses import dataclass
 from typing import Iterable, Sequence
@@ -26,7 +29,6 @@ from sqlalchemy.orm import Session
 
 from config.backflip_conflict import MATCH_EMAIL_DOMAIN
 from config.settings import get_settings
-from src.core.database import get_db_context
 from src.services.fa_max_backflip_feed import (
     normalize_email,
     normalize_entity_name,
@@ -36,18 +38,18 @@ from src.services.phone_utils import normalize as normalize_phone
 
 logger = logging.getLogger(__name__)
 
-REASON_CONFLICT = "backflip_conflict"
-REASON_FEED_UNAVAILABLE = "backflip_feed_unavailable"
-REASON_FEED_STALE = "backflip_feed_stale"
-REASON_NO_IDENTIFIERS = "no_matchable_identifiers"
+# Values match the lending exclusion ReasonCode vocabulary stored in
+# lending.load_exclusions.reason.
+REASON_CONFLICT = "BACKFLIP_CONFLICT"
+REASON_FEED_UNAVAILABLE = "BACKFLIP_FEED_UNAVAILABLE"
+REASON_FEED_STALE = "BACKFLIP_FEED_STALE"
+REASON_NO_IDENTIFIERS = "NO_MATCHABLE_IDENTIFIERS"
 
 CRITERION_PHONE_HASH = "phone_hash"
 CRITERION_PRIMARY_EMAIL = "primary_email"
 CRITERION_EMAIL_DOMAIN = "email_domain"
 CRITERION_ENTITY_NAME = "entity_name"
 CRITERION_PARCEL_ID = "parcel_id"
-
-AUDIT_GATE = "dialer"
 
 
 @dataclass(frozen=True)
@@ -83,12 +85,11 @@ class ConflictDecision:
     blocked: bool
     reason: str | None
     matched_criteria: tuple[str, ...]
-    recipient_masked: str
-    recipient_sha256: str | None
+    phone_hash: str | None
 
 
 def hash_phone(normalized_phone: str) -> str:
-    """SHA-256 of an already-normalized phone, the same digest the audit table stores."""
+    """SHA-256 of an already-normalized phone, the digest lending.load_exclusions stores."""
     return hashlib.sha256(normalized_phone.encode()).hexdigest()
 
 
@@ -137,10 +138,6 @@ def load_backflip_identifier_index(session: Session) -> BackflipIdentifierIndex:
     )
 
 
-def _mask(value: str) -> str:
-    return f"...{value[-4:]}" if len(value) > 4 else "***"
-
-
 def _decide(
     record: BorrowerRecord, index: BackflipIdentifierIndex, *, match_email_domain: bool,
 ) -> ConflictDecision:
@@ -150,12 +147,8 @@ def _decide(
     parcel_id = normalize_parcel_id(record.parcel_id)
     phone_digest = hash_phone(phone) if phone else None
 
-    audit_identifier = phone or email
-    masked = _mask(audit_identifier) if audit_identifier else "***"
-    digest = phone_digest or (hashlib.sha256(email.encode()).hexdigest() if email else None)
-
     def decision(blocked: bool, reason: str | None, criteria: tuple[str, ...] = ()) -> ConflictDecision:
-        return ConflictDecision(record.record_ref, blocked, reason, criteria, masked, digest)
+        return ConflictDecision(record.record_ref, blocked, reason, criteria, phone_digest)
 
     if index.block_reason:
         return decision(True, index.block_reason)
@@ -195,35 +188,35 @@ def find_borrower_conflicts(
     return decisions
 
 
-def record_dialer_conflict_decisions(decisions: Sequence[ConflictDecision]) -> None:
-    """Write every decision to fa_max_backflip_suppression_decisions in one batch.
+def record_conflict_exclusions(
+    session: Session, run_id: str, decisions: Sequence[ConflictDecision],
+) -> int:
+    """Write every blocked decision to lending.load_exclusions in one batch.
 
-    Commits in its own transaction so the audit trail survives a rollback in
-    the caller's load. A failure raises: a load must not proceed without a
-    durable record of what was blocked and why.
+    Uses the caller's session so exclusions commit with the load run they
+    belong to. Every record reaching this gate has already passed the phone
+    check, so a blocked record without a phone hash is a pipeline fault and
+    raises rather than writing an unattributable row. Returns rows written.
     """
-    if not decisions:
-        return
-    params = [
-        {
-            "gate": AUDIT_GATE,
-            "masked": item.recipient_masked,
-            "digest": item.recipient_sha256,
-            "suppressed": item.blocked,
-            "reason": item.reason,
-            "subject_ref": item.record_ref,
-            "criteria": list(item.matched_criteria) or None,
-        }
-        for item in decisions
-    ]
-    with get_db_context() as session:
-        session.execute(
-            text(
-                "INSERT INTO fa_max_backflip_suppression_decisions "
-                "(gate, recipient_masked, recipient_sha256, suppressed, reason, "
-                "subject_ref, matched_criteria) "
-                "VALUES (:gate, :masked, :digest, :suppressed, :reason, "
-                ":subject_ref, :criteria)"
-            ),
-            params,
-        )
+    blocked = [item for item in decisions if item.blocked]
+    if not blocked:
+        return 0
+    missing = [item.record_ref for item in blocked if not item.phone_hash]
+    if missing:
+        raise ValueError(f"{len(missing)} blocked record(s) have no phone hash; first: {missing[0]}")
+    session.execute(
+        text(
+            "INSERT INTO lending.load_exclusions (run_id, phone_hash, reason, detail) "
+            "VALUES (:run_id, :phone_hash, :reason, CAST(:detail AS jsonb))"
+        ),
+        [
+            {
+                "run_id": run_id,
+                "phone_hash": item.phone_hash,
+                "reason": item.reason,
+                "detail": json.dumps({"matched_criteria": list(item.matched_criteria)}),
+            }
+            for item in blocked
+        ],
+    )
+    return len(blocked)
