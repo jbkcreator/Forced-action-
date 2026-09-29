@@ -175,3 +175,22 @@ class LendingCallDisposition(LendingBase):
             ),
         ),
     )
+
+
+class LendingDialerHold(LendingBase):
+    """A contact lending pulled from the Aircall pool *temporarily* (calling window
+    or attempt cap). The sweep restores only open holds, and never a suppressed
+    number. Opt-out removals are permanent and never create a hold."""
+
+    __tablename__ = "dialer_holds"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    phone: Mapped[str] = mapped_column(String(20), nullable=False)  # phone_utils.normalize
+    reason: Mapped[str] = mapped_column(String(20), nullable=False)  # RemovalReason: call_window / attempt_cap
+    held_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    released_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    release_reason: Mapped[Optional[str]] = mapped_column(String(20))  # restored / suppressed
+
+    __table_args__ = (
+        Index("uq_lending_dialer_holds_open", "phone", unique=True, postgresql_where=text("released_at IS NULL")),
+    )

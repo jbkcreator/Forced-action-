@@ -40,13 +40,14 @@ class FakeDialer:
     opt-outs that a poll in the rolled-back test transaction also sees."""
 
     def __init__(self, boom=False):
-        self.removed, self.boom = [], boom
+        self.removed, self.reasons, self.boom = [], [], boom
 
-    def __call__(self, phone):
+    def __call__(self, phone, *, reason):
         if self.boom:
             raise RuntimeError("aircall 500")
         if phone == PHONE:
             self.removed.append(phone)
+            self.reasons.append(reason)
 
 
 def _scalar(db, sql, **p):
@@ -280,9 +281,47 @@ def test_errors_never_log_the_phone(db, caplog):
     from src.lending.compliance import propagate_opt_out
 
     class LeakyDialer:
-        def __call__(self, phone):
+        def __call__(self, phone, *, reason):
             raise RuntimeError(f"aircall rejected {phone}")
 
     with caplog.at_level("INFO"):
         propagate_opt_out(db, phone=PHONE, source_ref="call_91", dialer_remover=LeakyDialer())
     assert PHONE not in caplog.text and PHONE[2:] not in caplog.text
+
+
+def test_opt_out_removals_pass_reason_opt_out(db):
+    from src.lending.compliance import propagate_opt_out
+
+    dialer = FakeDialer()
+    propagate_opt_out(db, phone=PHONE, source_ref="call_95", dialer_remover=dialer)
+    assert dialer.reasons == ["opt_out"]
+
+
+class DialerRemovalUndecided(Exception):
+    """Same class name Dev 3's client raises until O31 is decided."""
+
+
+def test_undecided_removal_warns_once_not_every_poll(db, caplog):
+    from src.lending.compliance import poll_fa_opt_outs, propagate_opt_out
+
+    class Undecided:
+        def __call__(self, phone, *, reason):
+            raise DialerRemovalUndecided()
+
+    from src.lending.compliance import phone_hash
+
+    def mine(records):  # the shared DB holds real FA opt-outs that get their own first attempt
+        tag = phone_hash(PHONE)[:12]
+        return [r for r in records if "DialerRemovalUndecided" in r.getMessage() and tag in r.getMessage()]
+
+    with caplog.at_level("DEBUG"):
+        propagate_opt_out(db, phone=PHONE, source_ref="call_96", dialer_remover=Undecided())
+        first = mine(caplog.records)
+        caplog.clear()
+        poll_fa_opt_outs(db, dialer_remover=Undecided())
+        poll_fa_opt_outs(db, dialer_remover=Undecided())
+        retries = mine(caplog.records)
+
+    assert [r.levelname for r in first] == ["WARNING"]
+    assert retries and all(r.levelname == "DEBUG" for r in retries)
+    assert [e.status for e in _events(db, PHONE)] == ["dialer_pending"]

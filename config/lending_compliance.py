@@ -16,6 +16,7 @@ ATTEMPT_PERIOD_HOURS = 24        # rolling
 DNC_SCRUB_MAX_AGE_DAYS = 31
 STOP_PROPAGATION_SLA_SECONDS = 60
 OPT_OUT_POLL_SECONDS = 15        # FA opt-out poller interval; worst case well inside the SLA
+DIALER_SWEEP_SECONDS = 60        # window/cap pull-and-restore sweep interval
 GEORGIA_ALLOWED_ENTITY_TYPES = frozenset({"LLC", "LP", "CORPORATION"})
 
 # Recipient timezone by area code (lending-owned copy; FA SMS keeps its own).
@@ -54,6 +55,7 @@ OPT_OUT_EXCLUDED_SOURCES = frozenset(NON_OPT_OUT_SOURCES | {TRACERFY_DNC_SOURCE,
 
 # Postgres advisory-lock key: one poller cycle at a time across all processes.
 OPT_OUT_POLL_LOCK_KEY = 7_302_020_801
+DIALER_SWEEP_LOCK_KEY = 7_302_020_802
 
 # FA suppress_contact() source → opt-out channel. Anything unlisted is email-origin.
 SMS_OPT_OUT_SOURCES = frozenset({"inbound_sms", "twilio_inbound", "cascaded_from_sms"})
@@ -89,7 +91,19 @@ class ReasonCode(str, Enum):
     GA_NATURAL_PERSON = "GA_NATURAL_PERSON"
     OUTSIDE_CALL_WINDOW = "OUTSIDE_CALL_WINDOW"
     ATTEMPT_CAP_REACHED = "ATTEMPT_CAP_REACHED"
-    BACKFLIP_CONFLICT = "BACKFLIP_CONFLICT"  # owned by WP-W0-4; tag name pending O6
+    # Owned by WP-W0-4 (Developer 3); tag name is O6.
+    BACKFLIP_CONFLICT = "BACKFLIP_CONFLICT"
+    BACKFLIP_FEED_STALE = "BACKFLIP_FEED_STALE"
+    BACKFLIP_FEED_UNAVAILABLE = "BACKFLIP_FEED_UNAVAILABLE"
+
+
+class RemovalReason(str, Enum):
+    """Why lending pulled a contact from the Aircall pool. Developer 3's restore
+    only reinstates CALL_WINDOW / ATTEMPT_CAP removals, never OPT_OUT."""
+
+    OPT_OUT = "opt_out"
+    CALL_WINDOW = "call_window"
+    ATTEMPT_CAP = "attempt_cap"
 
 
 def validate_lending_compliance_config() -> None:

@@ -25,7 +25,7 @@ def db():
     conn = engine.connect()
     tx = conn.begin()
     session = Session(bind=conn)
-    # Dev 4 owns call_dispositions; contract = one row per attempt with phone + call_ended_at.
+    # Contract: one row per attempt with phone + call_ended_at (aircall_call_id is required by the real table).
     session.execute(text(
         "CREATE TABLE IF NOT EXISTS lending.call_dispositions "
         "(phone varchar(20), direction varchar(10), call_ended_at timestamptz NOT NULL, disposition varchar(30))"
@@ -44,8 +44,8 @@ def _check(db, now):
 
 def _attempt(db, ended_at, disposition=None, direction="outbound"):
     db.execute(
-        text("INSERT INTO lending.call_dispositions (phone, direction, call_ended_at, disposition) "
-             "VALUES (:p, :dir, :t, :d)"),
+        text("INSERT INTO lending.call_dispositions (aircall_call_id, phone, direction, call_ended_at, disposition, raw_event) "
+             "VALUES (gen_random_uuid()::text, :p, :dir, :t, :d, '{}')"),
         {"p": PHONE, "dir": direction, "t": ended_at, "d": disposition},
     )
 
@@ -90,10 +90,11 @@ def test_recipient_timezone_is_lending_owned_and_conservative_for_850():
 
 class FakeDialer:
     def __init__(self):
-        self.removed = []
+        self.removed, self.reasons = [], []
 
-    def __call__(self, phone):
+    def __call__(self, phone, *, reason):
         self.removed.append(phone)
+        self.reasons.append(reason)
 
 
 def test_on_attempt_recorded_pulls_contact_at_the_cap_only(db):
@@ -109,6 +110,7 @@ def test_on_attempt_recorded_pulls_contact_at_the_cap_only(db):
     result = on_attempt_recorded(db, PHONE, now=NOON_LOCAL, dialer_remover=dialer)
     assert result.reason == ReasonCode.ATTEMPT_CAP_REACHED
     assert dialer.removed == [PHONE]
+    assert dialer.reasons == ["attempt_cap"]
 
 
 def test_on_attempt_recorded_ignores_missing_phone(db):

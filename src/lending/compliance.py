@@ -27,6 +27,7 @@ from config.lending_compliance import (
     CALL_WINDOW_END,
     CALL_WINDOW_START,
     DEFAULT_TZ,
+    DIALER_SWEEP_LOCK_KEY,
     DIALER_OPT_OUT_SOURCE,
     DNC_SCRUB_MAX_AGE_DAYS,
     GEORGIA_ALLOWED_ENTITY_TYPES,
@@ -38,6 +39,7 @@ from config.lending_compliance import (
     TRACERFY_DNC_SOURCE,
     OptOutChannel,
     OptOutStatus,
+    RemovalReason,
     ReasonCode,
     SuppressionReason,
 )
@@ -47,7 +49,9 @@ from src.utils.logger import get_logger
 logger = get_logger(__name__)
 
 Scrubber = Callable[[list[str]], list[dict]]
-DialerRemover = Callable[[str], None]
+DialerRemover = Callable[..., None]  # remover(phone, *, reason: str) — Developer 3's aircall_client
+DialerRestorer = Callable[[str], None]  # restore_contact_to_pool(phone) — Developer 3's aircall_client
+LoadedPhones = Callable[[object], list[str]]
 
 
 @dataclass(frozen=True)
@@ -285,6 +289,71 @@ def tracerfy_scrub(phones: list[str]) -> list[dict]:
     return _poll_queue(_submit_scrub_batch(phones, api_key), api_key)
 
 
+# ── A2 coverage check (spec §12) ──────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class CoverageGap:
+    phone: str
+    reason: ReasonCode
+
+
+@dataclass(frozen=True)
+class A2Report:
+    checked: int
+    gaps: list[CoverageGap]
+    gap_counts: dict[str, int]
+
+    @property
+    def passed(self) -> bool:
+        return not self.gaps
+
+
+def coverage_gaps(db, phones: list[str], *, now: Optional[datetime] = None) -> list[CoverageGap]:
+    """Every number in ``phones`` that would violate A2: no scrub within 31 days
+    (FA or lending cache), on any suppression store, or a positive DNC/litigator
+    result. Read-only and never calls Tracerfy — it re-checks stored evidence with
+    the same lookups filter_loadable uses. An empty list means A2 passes."""
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=DNC_SCRUB_MAX_AGE_DAYS)
+
+    gaps: list[CoverageGap] = []
+    normalized: dict[str, str] = {}
+    for raw in dict.fromkeys(phones):
+        phone = normalize_phone(raw)
+        if phone:
+            normalized.setdefault(phone, raw)
+        else:
+            gaps.append(CoverageGap(phone=raw, reason=ReasonCode.INVALID_PHONE))
+
+    candidates = sorted(normalized)
+    if not candidates:
+        return gaps
+    suppressed = _suppressed_phones(db, candidates)
+    scrubs = _stored_scrubs(db, candidates)
+    for phone in candidates:
+        scrub = scrubs.get(phone)
+        if phone in suppressed:
+            gaps.append(CoverageGap(phone, ReasonCode.SUPPRESSED))
+        elif scrub is None or scrub.checked_at < cutoff:
+            gaps.append(CoverageGap(phone, ReasonCode.NO_FRESH_SCRUB))
+        elif not (verdict := _verdict(phone, scrub)).allowed:
+            gaps.append(CoverageGap(phone, verdict.reason))
+    return gaps
+
+
+def a2_coverage_report(db, phones: list[str], *, now: Optional[datetime] = None) -> A2Report:
+    """Summary for the A2 evidence file: distinct numbers checked + gaps by reason."""
+    gaps = coverage_gaps(db, phones, now=now)
+    counts: dict[str, int] = {}
+    for gap in gaps:
+        counts[gap.reason.value] = counts.get(gap.reason.value, 0) + 1
+    report = A2Report(checked=len(dict.fromkeys(phones)), gaps=gaps, gap_counts=counts)
+    logger.info("[lending-compliance] A2 coverage checked=%d gaps=%s passed=%s",
+                report.checked, counts, report.passed)
+    return report
+
+
 # ── Call-time gate (WP-W0-3) ─────────────────────────────────────────────────
 
 
@@ -320,11 +389,15 @@ def can_dial_now(
     if not normalized:
         return _blocked(phone, ReasonCode.INVALID_PHONE)
 
-    local = now.astimezone(recipient_timezone(normalized, zip_code)).time()
-    if not (CALL_WINDOW_START <= local < CALL_WINDOW_END):
+    if _outside_call_window(normalized, now, zip_code):
         return _blocked(normalized, ReasonCode.OUTSIDE_CALL_WINDOW)
 
     return _attempt_cap(db, normalized, now)
+
+
+def _outside_call_window(phone: str, now: datetime, zip_code: Optional[str] = None) -> bool:
+    local = now.astimezone(recipient_timezone(phone, zip_code)).time()
+    return not (CALL_WINDOW_START <= local < CALL_WINDOW_END)
 
 
 def _attempt_cap(db, phone: str, now: datetime) -> GateResult:
@@ -357,15 +430,137 @@ def on_attempt_recorded(
         return None
     result = _attempt_cap(db, normalized, now or datetime.now(timezone.utc))
     if not result.allowed:
-        remover = dialer_remover or _default_dialer_remover()
-        if remover is None:
-            logger.warning("[lending-compliance] attempt cap reached but no dialer remover configured")
-        else:
-            try:
-                remover(normalized)
-            except Exception as exc:
-                logger.error("[lending-compliance] attempt-cap dialer removal failed: %s", _error_kind(exc))
+        if _remove_from_dialer([normalized], dialer_remover, RemovalReason.ATTEMPT_CAP):
+            _open_holds(db, {normalized: RemovalReason.ATTEMPT_CAP})
     return result
+
+
+# ── Dialer enforcement sweep (WP-W0-3) ────────────────────────────────────────
+# Callers dial from the Aircall queue, so the rules must change what is dialable:
+# a contact leaves the queue outside its calling window or at the attempt cap,
+# and returns when the rule allows it again. Holds record every temporary pull.
+
+
+@dataclass(frozen=True)
+class SweepResult:
+    pulled: int
+    restored: int
+    skipped_locked: bool = False
+
+
+SWEEP_LOCK_KEY = DIALER_SWEEP_LOCK_KEY
+
+
+def _default_dialer_restorer() -> Optional[DialerRestorer]:
+    from src.services import aircall_client
+
+    return getattr(aircall_client, "restore_contact_to_pool", None)
+
+
+def _default_loaded_phones(db) -> list[str]:
+    """Active contacts in the Aircall pool, from Developer 3's load records."""
+    if db.execute(text("SELECT to_regclass('lending.dialer_load_records')")).scalar() is None:
+        return []
+    return [r[0] for r in db.execute(
+        text("SELECT DISTINCT phone FROM lending.dialer_load_records WHERE active AND phone IS NOT NULL")
+    ).fetchall()]
+
+
+def _attempt_counts(db, phones: list[str], now: datetime) -> dict[str, int]:
+    rows = db.execute(
+        text(
+            "SELECT phone, count(*) FROM lending.call_dispositions "
+            "WHERE phone = ANY(:phones) AND (direction = 'outbound' OR direction IS NULL) "
+            "AND call_ended_at > :since AND call_ended_at <= :now GROUP BY phone"
+        ),
+        {"phones": phones, "since": now - timedelta(hours=ATTEMPT_PERIOD_HOURS), "now": now},
+    ).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
+def _hold_reason(phone: str, attempts: int, now: datetime) -> Optional[RemovalReason]:
+    if attempts >= MAX_ATTEMPTS_PER_PERIOD:
+        return RemovalReason.ATTEMPT_CAP
+    if _outside_call_window(phone, now):
+        return RemovalReason.CALL_WINDOW
+    return None
+
+
+def _open_holds(db, reasons: dict[str, RemovalReason]) -> None:
+    db.execute(
+        text(
+            "INSERT INTO lending.dialer_holds (phone, reason) VALUES (:phone, :reason) "
+            "ON CONFLICT (phone) WHERE released_at IS NULL DO NOTHING"
+        ),
+        [{"phone": p, "reason": r.value} for p, r in reasons.items()],
+    )
+
+
+def sweep_dialer_pool(
+    db,
+    *,
+    now: Optional[datetime] = None,
+    dialer_remover: Optional[DialerRemover] = None,
+    dialer_restorer: Optional[DialerRestorer] = None,
+    loaded_phones: Optional[LoadedPhones] = None,
+) -> SweepResult:
+    """One enforcement cycle. Idempotent; one cycle at a time (advisory lock). Does not commit."""
+    if not db.execute(text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": SWEEP_LOCK_KEY}).scalar():
+        return SweepResult(pulled=0, restored=0, skipped_locked=True)
+    now = now or datetime.now(timezone.utc)
+
+    held = {r[0] for r in db.execute(text("SELECT phone FROM lending.dialer_holds WHERE released_at IS NULL"))}
+    loaded = sorted({p for p in (normalize_phone(x) for x in (loaded_phones or _default_loaded_phones)(db)) if p})
+    active = [p for p in loaded if p not in held]
+    counts = _attempt_counts(db, active, now) if active else {}
+    to_pull = {p: r for p in active if (r := _hold_reason(p, counts.get(p, 0), now))}
+
+    pulled = 0
+    for reason in (RemovalReason.ATTEMPT_CAP, RemovalReason.CALL_WINDOW):
+        phones = [p for p, r in to_pull.items() if r is reason]
+        done = _remove_from_dialer(phones, dialer_remover, reason)
+        if done:
+            _open_holds(db, {p: reason for p in done})
+            pulled += len(done)
+
+    restored = _release_holds(db, sorted(held), now, dialer_restorer)
+    if pulled or restored:
+        logger.info("[lending-compliance] dialer sweep pulled=%d restored=%d", pulled, restored)
+    return SweepResult(pulled=pulled, restored=restored)
+
+
+def _release_holds(db, held: list[str], now: datetime, dialer_restorer: Optional[DialerRestorer]) -> int:
+    """Restore holds whose rule now allows dialling; close suppressed ones without restoring."""
+    if not held:
+        return 0
+    suppressed = _suppressed_phones(db, held)
+    counts = _attempt_counts(db, held, now)
+    closing: list[dict] = [{"phone": p, "why": "suppressed"} for p in held if p in suppressed]
+    ready = [p for p in held if p not in suppressed and _hold_reason(p, counts.get(p, 0), now) is None]
+
+    restorer = dialer_restorer or _default_dialer_restorer()
+    restored = 0
+    if ready and restorer is None:
+        logger.warning("[lending-compliance] %d hold(s) ready but no dialer restorer configured", len(ready))
+    for phone in ready if restorer else []:
+        try:
+            restorer(phone)
+        except Exception as exc:
+            logger.error("[lending-compliance] dialer restore failed phone_hash=%s: %s",
+                         phone_hash(phone)[:12], _error_kind(exc))
+            continue
+        closing.append({"phone": phone, "why": "restored"})
+        restored += 1
+
+    if closing:
+        db.execute(
+            text(
+                "UPDATE lending.dialer_holds SET released_at = :now, release_reason = :why "
+                "WHERE phone = :phone AND released_at IS NULL"
+            ),
+            [{**c, "now": now} for c in closing],
+        )
+    return restored
 
 
 # ── Global stop-propagation (WP-W0-8, spec §3.2) ─────────────────────────────
@@ -555,7 +750,7 @@ def _propagate(db, opt_outs: list[_OptOut], dialer_remover: Optional[DialerRemov
         )
     stores_at = datetime.now(timezone.utc)
 
-    removed_at = _remove_from_dialer(phones, dialer_remover)
+    removed_at = _remove_from_dialer(phones, dialer_remover, RemovalReason.OPT_OUT)
     updates = []
     for event_id, o in zip(event_ids, opt_outs):
         dialer_at = removed_at.get(o.phone) if o.phone else None
@@ -581,19 +776,38 @@ def _propagate(db, opt_outs: list[_OptOut], dialer_remover: Optional[DialerRemov
     return event_ids
 
 
-def _remove_from_dialer(phones: list[str], dialer_remover: Optional[DialerRemover]) -> dict[str, datetime]:
+# Developer 3's client raises this until the Aircall removal method (O31) is decided.
+# Expected state, not a fault: warn on the first attempt, stay quiet on 15 s retries.
+_UNDECIDED_REMOVAL = "DialerRemovalUndecided"
+
+
+def _remove_from_dialer(
+    phones: list[str],
+    dialer_remover: Optional[DialerRemover],
+    reason: RemovalReason,
+    *,
+    retry: bool = False,
+) -> dict[str, datetime]:
     """Removal time per phone Aircall confirmed. Failures stay pending for the next poll."""
     remover = dialer_remover or _default_dialer_remover()
-    if remover is None or not phones:
+    if remover is None:
+        if phones and not retry:
+            logger.warning("[lending-compliance] no dialer remover configured; %d removal(s) pending", len(phones))
         return {}
     done: dict[str, datetime] = {}
     for phone in phones:
         try:
-            remover(phone)
+            remover(phone, reason=reason.value)
             done[phone] = datetime.now(timezone.utc)
         except Exception as exc:
-            logger.error(
-                "[lending-compliance] dialer removal failed phone_hash=%s: %s", phone_hash(phone)[:12], _error_kind(exc),
+            kind = _error_kind(exc)
+            if kind == _UNDECIDED_REMOVAL:
+                level = logger.debug if retry else logger.warning
+            else:
+                level = logger.error
+            level(
+                "[lending-compliance] dialer removal failed reason=%s phone_hash=%s: %s",
+                reason.value, phone_hash(phone)[:12], kind,
             )
     return done
 
@@ -609,7 +823,9 @@ def _retry_pending_dialer_removals(db, dialer_remover: Optional[DialerRemover]) 
     ).fetchall()
     if not pending:
         return 0
-    removed_at = _remove_from_dialer(sorted({row[1] for row in pending}), dialer_remover)
+    removed_at = _remove_from_dialer(
+        sorted({row[1] for row in pending}), dialer_remover, RemovalReason.OPT_OUT, retry=True,
+    )
     updates = []
     for event_id, phone, channel, received_at in pending:
         if phone in removed_at:
