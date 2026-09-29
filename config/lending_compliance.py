@@ -89,7 +89,19 @@ class ReasonCode(str, Enum):
     GA_NATURAL_PERSON = "GA_NATURAL_PERSON"
     OUTSIDE_CALL_WINDOW = "OUTSIDE_CALL_WINDOW"
     ATTEMPT_CAP_REACHED = "ATTEMPT_CAP_REACHED"
-    BACKFLIP_CONFLICT = "BACKFLIP_CONFLICT"  # owned by WP-W0-4; tag name pending O6
+    # Owned by WP-W0-4 (Developer 3); tag name is O6.
+    BACKFLIP_CONFLICT = "BACKFLIP_CONFLICT"
+    BACKFLIP_FEED_STALE = "BACKFLIP_FEED_STALE"
+    BACKFLIP_FEED_UNAVAILABLE = "BACKFLIP_FEED_UNAVAILABLE"
+
+
+class RemovalReason(str, Enum):
+    """Why lending pulled a contact from the Aircall pool. Developer 3's restore
+    only reinstates CALL_WINDOW / ATTEMPT_CAP removals, never OPT_OUT."""
+
+    OPT_OUT = "opt_out"
+    CALL_WINDOW = "call_window"
+    ATTEMPT_CAP = "attempt_cap"
 
 
 def validate_lending_compliance_config() -> None:

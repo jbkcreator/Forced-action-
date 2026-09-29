@@ -90,10 +90,11 @@ def test_recipient_timezone_is_lending_owned_and_conservative_for_850():
 
 class FakeDialer:
     def __init__(self):
-        self.removed = []
+        self.removed, self.reasons = [], []
 
-    def __call__(self, phone):
+    def __call__(self, phone, *, reason):
         self.removed.append(phone)
+        self.reasons.append(reason)
 
 
 def test_on_attempt_recorded_pulls_contact_at_the_cap_only(db):
@@ -109,6 +110,7 @@ def test_on_attempt_recorded_pulls_contact_at_the_cap_only(db):
     result = on_attempt_recorded(db, PHONE, now=NOON_LOCAL, dialer_remover=dialer)
     assert result.reason == ReasonCode.ATTEMPT_CAP_REACHED
     assert dialer.removed == [PHONE]
+    assert dialer.reasons == ["attempt_cap"]
 
 
 def test_on_attempt_recorded_ignores_missing_phone(db):

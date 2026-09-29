@@ -21,7 +21,7 @@ def test_reason_codes_are_stable_strings():
     assert {c.value for c in cfg.ReasonCode} == {
         "INVALID_PHONE", "NO_FRESH_SCRUB", "SCRUB_FAILED", "NATIONAL_DNC", "STATE_DNC", "LITIGATOR",
         "SUPPRESSED", "GA_NATURAL_PERSON", "OUTSIDE_CALL_WINDOW", "ATTEMPT_CAP_REACHED",
-        "BACKFLIP_CONFLICT",
+        "BACKFLIP_CONFLICT", "BACKFLIP_FEED_STALE", "BACKFLIP_FEED_UNAVAILABLE",
     }
 
 

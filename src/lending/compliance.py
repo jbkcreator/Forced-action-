@@ -38,6 +38,7 @@ from config.lending_compliance import (
     TRACERFY_DNC_SOURCE,
     OptOutChannel,
     OptOutStatus,
+    RemovalReason,
     ReasonCode,
     SuppressionReason,
 )
@@ -47,7 +48,7 @@ from src.utils.logger import get_logger
 logger = get_logger(__name__)
 
 Scrubber = Callable[[list[str]], list[dict]]
-DialerRemover = Callable[[str], None]
+DialerRemover = Callable[..., None]  # remover(phone, *, reason: str) — Developer 3's aircall_client
 
 
 @dataclass(frozen=True)
@@ -357,14 +358,7 @@ def on_attempt_recorded(
         return None
     result = _attempt_cap(db, normalized, now or datetime.now(timezone.utc))
     if not result.allowed:
-        remover = dialer_remover or _default_dialer_remover()
-        if remover is None:
-            logger.warning("[lending-compliance] attempt cap reached but no dialer remover configured")
-        else:
-            try:
-                remover(normalized)
-            except Exception as exc:
-                logger.error("[lending-compliance] attempt-cap dialer removal failed: %s", _error_kind(exc))
+        _remove_from_dialer([normalized], dialer_remover, RemovalReason.ATTEMPT_CAP)
     return result
 
 
@@ -555,7 +549,7 @@ def _propagate(db, opt_outs: list[_OptOut], dialer_remover: Optional[DialerRemov
         )
     stores_at = datetime.now(timezone.utc)
 
-    removed_at = _remove_from_dialer(phones, dialer_remover)
+    removed_at = _remove_from_dialer(phones, dialer_remover, RemovalReason.OPT_OUT)
     updates = []
     for event_id, o in zip(event_ids, opt_outs):
         dialer_at = removed_at.get(o.phone) if o.phone else None
@@ -581,19 +575,38 @@ def _propagate(db, opt_outs: list[_OptOut], dialer_remover: Optional[DialerRemov
     return event_ids
 
 
-def _remove_from_dialer(phones: list[str], dialer_remover: Optional[DialerRemover]) -> dict[str, datetime]:
+# Developer 3's client raises this until the Aircall removal method (O31) is decided.
+# Expected state, not a fault: warn on the first attempt, stay quiet on 15 s retries.
+_UNDECIDED_REMOVAL = "DialerRemovalUndecided"
+
+
+def _remove_from_dialer(
+    phones: list[str],
+    dialer_remover: Optional[DialerRemover],
+    reason: RemovalReason,
+    *,
+    retry: bool = False,
+) -> dict[str, datetime]:
     """Removal time per phone Aircall confirmed. Failures stay pending for the next poll."""
     remover = dialer_remover or _default_dialer_remover()
-    if remover is None or not phones:
+    if remover is None:
+        if phones and not retry:
+            logger.warning("[lending-compliance] no dialer remover configured; %d removal(s) pending", len(phones))
         return {}
     done: dict[str, datetime] = {}
     for phone in phones:
         try:
-            remover(phone)
+            remover(phone, reason=reason.value)
             done[phone] = datetime.now(timezone.utc)
         except Exception as exc:
-            logger.error(
-                "[lending-compliance] dialer removal failed phone_hash=%s: %s", phone_hash(phone)[:12], _error_kind(exc),
+            kind = _error_kind(exc)
+            if kind == _UNDECIDED_REMOVAL:
+                level = logger.debug if retry else logger.warning
+            else:
+                level = logger.error
+            level(
+                "[lending-compliance] dialer removal failed reason=%s phone_hash=%s: %s",
+                reason.value, phone_hash(phone)[:12], kind,
             )
     return done
 
@@ -609,7 +622,9 @@ def _retry_pending_dialer_removals(db, dialer_remover: Optional[DialerRemover]) 
     ).fetchall()
     if not pending:
         return 0
-    removed_at = _remove_from_dialer(sorted({row[1] for row in pending}), dialer_remover)
+    removed_at = _remove_from_dialer(
+        sorted({row[1] for row in pending}), dialer_remover, RemovalReason.OPT_OUT, retry=True,
+    )
     updates = []
     for event_id, phone, channel, received_at in pending:
         if phone in removed_at:
