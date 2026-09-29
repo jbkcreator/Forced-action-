@@ -11441,7 +11441,7 @@ class FaMaxPersonContactIdentifier(Base):
 
 
 class FaMaxBackflipSuppressionDecision(Base):
-    """Durable draft/send boundary decision; recipient digest avoids raw PII."""
+    """Durable Backflip boundary decision (draft, send or dialer load); recipient digest avoids raw PII."""
     __tablename__ = "fa_max_backflip_suppression_decisions"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
@@ -11451,10 +11451,14 @@ class FaMaxBackflipSuppressionDecision(Base):
     opportunity_id: Mapped[Optional[Any]] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
     suppressed: Mapped[bool] = mapped_column(Boolean, nullable=False)
     reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Dialer-load decisions only: the pool record checked and every Backflip
+    # identifier kind it matched on (NULL for draft/send decisions).
+    subject_ref: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    matched_criteria: Mapped[Optional[list]] = mapped_column(ARRAY(Text), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     __table_args__ = (
-        CheckConstraint("gate IN ('draft','send')", name="ck_fa_max_bsd_gate"),
+        CheckConstraint("gate IN ('draft','send','dialer')", name="ck_fa_max_bsd_gate"),
         Index("ix_fa_max_bsd_opportunity_id", "opportunity_id", postgresql_where=text("opportunity_id IS NOT NULL")),
         Index("ix_fa_max_bsd_created_at", created_at.desc()),
     )
@@ -11470,7 +11474,10 @@ class FaMaxBackflipCampaignContact(Base):
     imported_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     __table_args__ = (
-        CheckConstraint("identifier_kind IN ('email', 'phone')", name="ck_fa_max_backflip_identifier_kind"),
+        CheckConstraint(
+            "identifier_kind IN ('email', 'phone', 'entity_name', 'parcel_id')",
+            name="ck_fa_max_backflip_identifier_kind",
+        ),
         Index("ix_fa_max_backflip_active_contact", "identifier_kind", "identifier_value", postgresql_where=text("active")),
     )
 
