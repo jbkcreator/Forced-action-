@@ -148,3 +148,9 @@ def test_state_dnc_hit_from_fresh_scrub_is_blocked(db):
 def test_state_dnc_hit_on_new_scrub_is_blocked(db):
     out = _run(db, [{"phone": P_DNC}], FakeScrub([_row(P_DNC, state="Y")]))
     assert out[P_DNC].reason == ReasonCode.STATE_DNC
+
+
+def test_pool_export_field_name_normalized_phone_is_accepted(db):
+    _dnc(db, P_CLEAN, age_days=1)
+    out = _run(db, [{"normalized_phone": P_CLEAN, "state": "FL"}])
+    assert out[P_CLEAN].allowed

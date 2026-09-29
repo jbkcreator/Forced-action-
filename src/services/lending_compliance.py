@@ -93,7 +93,7 @@ def filter_loadable(
     results: dict[str, GateResult] = {}
     candidates: list[str] = []
     for record in records:
-        raw = record.get("phone") or ""
+        raw = record.get("normalized_phone") or record.get("phone") or ""
         phone = normalize_phone(raw)
         if not phone:
             results[raw] = _blocked(raw, ReasonCode.INVALID_PHONE)
