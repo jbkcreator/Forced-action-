@@ -85,3 +85,32 @@ def test_recipient_timezone_is_lending_owned_and_conservative_for_850():
     assert recipient_timezone("+18505551234").key == "America/Chicago"
     assert recipient_timezone("+14045551234").key == "America/New_York"  # Georgia
     assert recipient_timezone("+18135551234", zip_code="33602").key == "America/New_York"
+
+
+class FakeDialer:
+    def __init__(self):
+        self.removed = []
+
+    def __call__(self, phone):
+        self.removed.append(phone)
+
+
+def test_on_attempt_recorded_pulls_contact_at_the_cap_only(db):
+    from src.services.lending_compliance import on_attempt_recorded
+
+    dialer = FakeDialer()
+    _attempt(db, NOON_LOCAL - timedelta(hours=2))
+    _attempt(db, NOON_LOCAL - timedelta(hours=1))
+    assert on_attempt_recorded(db, PHONE, now=NOON_LOCAL, dialer_remover=dialer).allowed
+    assert dialer.removed == []
+
+    _attempt(db, NOON_LOCAL - timedelta(minutes=5))
+    result = on_attempt_recorded(db, PHONE, now=NOON_LOCAL, dialer_remover=dialer)
+    assert result.reason == ReasonCode.ATTEMPT_CAP_REACHED
+    assert dialer.removed == [PHONE]
+
+
+def test_on_attempt_recorded_ignores_missing_phone(db):
+    from src.services.lending_compliance import on_attempt_recorded
+
+    assert on_attempt_recorded(db, None, now=NOON_LOCAL, dialer_remover=FakeDialer()) is None

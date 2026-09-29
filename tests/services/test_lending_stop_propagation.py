@@ -145,3 +145,15 @@ def test_reconcile_recovers_an_opt_out_whose_mirror_failed(db, monkeypatch):
     monkeypatch.undo()
     lending_compliance.reconcile_suppression(db)
     assert _scalar(db, "SELECT reason FROM lending.suppression_list WHERE email = :e", e=EMAIL) == "OPT_OUT"
+
+
+def test_redelivered_dnc_request_does_nothing_extra(db):
+    from src.services.lending_compliance import phone_hash, propagate_opt_out
+
+    dialer = FakeDialer()
+    first = propagate_opt_out(db, phone=PHONE, source_ref="call_77", actor="seat_a", dialer_remover=dialer)
+    again = propagate_opt_out(db, phone=PHONE, source_ref="call_77", actor="seat_a", dialer_remover=dialer)
+
+    assert again == first
+    assert dialer.removed == [PHONE]
+    assert _scalar(db, "SELECT count(*) FROM lending.opt_out_events WHERE phone_hash = :h", h=phone_hash(PHONE)) == 1

@@ -312,16 +312,47 @@ def can_dial_now(
     if not (CALL_WINDOW_START <= local < CALL_WINDOW_END):
         return _blocked(normalized, ReasonCode.OUTSIDE_CALL_WINDOW)
 
+    return _attempt_cap(db, normalized, now)
+
+
+def _attempt_cap(db, phone: str, now: datetime) -> GateResult:
     attempts = db.execute(
         text(
             "SELECT count(*) FROM lending.call_dispositions "
             "WHERE phone = :phone AND call_ended_at > :since AND call_ended_at <= :now"
         ),
-        {"phone": normalized, "since": now - timedelta(hours=ATTEMPT_PERIOD_HOURS), "now": now},
+        {"phone": phone, "since": now - timedelta(hours=ATTEMPT_PERIOD_HOURS), "now": now},
     ).scalar()
     if attempts >= MAX_ATTEMPTS_PER_PERIOD:
-        return _blocked(normalized, ReasonCode.ATTEMPT_CAP_REACHED)
-    return GateResult(phone=normalized, allowed=True)
+        return _blocked(phone, ReasonCode.ATTEMPT_CAP_REACHED)
+    return GateResult(phone=phone, allowed=True)
+
+
+def on_attempt_recorded(
+    db,
+    phone: Optional[str],
+    *,
+    now: Optional[datetime] = None,
+    dialer_remover: Optional[DialerRemover] = None,
+) -> Optional[GateResult]:
+    """WP-W0-6 hook, called after every call.ended row commits. At the cap, pull the
+    contact from the dialer pool. Idempotent: a replay re-counts the same rows and
+    re-issues the same removal (a no-op for a contact already out of the pool).
+    Restoring after 24 h is the step-5 sweep's job. Does not commit."""
+    normalized = normalize_phone(phone) if phone else None
+    if not normalized:
+        return None
+    result = _attempt_cap(db, normalized, now or datetime.now(timezone.utc))
+    if not result.allowed:
+        remover = dialer_remover or _default_dialer_remover()
+        if remover is None:
+            logger.warning("[lending-compliance] attempt cap reached but no dialer remover configured")
+        else:
+            try:
+                remover(normalized)
+            except Exception as exc:
+                logger.error("[lending-compliance] attempt-cap dialer removal failed: %s", exc)
+    return result
 
 
 # ── Global stop-propagation (WP-W0-8, spec §3.2) ─────────────────────────────
@@ -363,8 +394,22 @@ def propagate_opt_out(
     actor: Optional[str] = None,
     dialer_remover: Optional[DialerRemover] = None,
 ) -> Optional[int]:
-    """Verbal decline (DNC_REQUEST) entry point. Returns the opt_out_events id. Does not commit."""
+    """Verbal decline (DNC_REQUEST) entry point. Returns the opt_out_events id. Does not commit.
+
+    Idempotent per ``source_ref`` (Aircall call id): a redelivered event returns the
+    existing event id and writes nothing."""
     from src.services.email_suppression import suppress_contact
+
+    if source_ref:
+        existing = db.execute(
+            text(
+                "SELECT id FROM lending.opt_out_events "
+                "WHERE channel = :channel AND source_ref = :ref ORDER BY id LIMIT 1"
+            ),
+            {"channel": OptOutChannel.DIALER.value, "ref": source_ref},
+        ).scalar()
+        if existing:
+            return existing
 
     ctx = _DialerContext(source_ref=source_ref, actor=actor, dialer_remover=dialer_remover)
     token = _DIALER_CTX.set(ctx)
