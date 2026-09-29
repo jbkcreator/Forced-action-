@@ -324,6 +324,8 @@ class SqlHandoffStore:
                 source_reference=source_reference,
                 idempotency_key=f"{SOURCE_REFERENCE_PREFIX}:{lead.radar_id}:{lead.campaign}",
             )
+            # Always ACTIVE here: the person was created a line ago, so nobody else can own
+            # them. Send-path enforcement is owning_campaign()'s job (see lead_ownership.py).
             claim_ownership(
                 self._session, person_id=person_id, opportunity_id=opportunity_id,
                 campaign=lead.campaign, source=LEAD_SOURCE_PROPERTY_RADAR, radar_id=lead.radar_id,

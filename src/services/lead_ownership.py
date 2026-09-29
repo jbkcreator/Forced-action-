@@ -17,6 +17,13 @@ engine table may not exist yet (its PR is unmerged); it then has no owners.
 
 owning_campaign() is the read-side check any send path for these leads must
 call before a touch.
+
+Enforcement status: the PropertyRadar handoff only records the claim, and it
+always wins there (the person row is created in the same savepoint, so there is
+no competing owner yet). Nothing in src/ sends to these leads today, so
+owning_campaign() has no caller by design. The FA Max campaign-selection engine
+(WP-T3-4, unmerged) must call it before enrolling or touching a person; until
+that lands the "one owner per person" rule is recorded, not enforced.
 """
 from __future__ import annotations
 
