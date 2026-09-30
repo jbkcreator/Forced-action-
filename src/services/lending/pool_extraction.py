@@ -67,8 +67,8 @@ AIRCALL_TAG: dict[str, str] = {
 
 # Go Live Brief 2.5 source lists. A flipper is List 9 only while its flip is stalled:
 # the latest purchase is at least this old and the property has not been resold.
-STALLED_FLIP_MIN_DAYS: int = 180
-_BUILDER_PERMIT_SOURCES = frozenset({"building_permits", "permit_staging"})
+# 90 days: the median flipper hold is 8 days, and deeds only reach back to 2026-01-01.
+STALLED_FLIP_MIN_DAYS: int = 90
 
 
 def is_stalled_flip(bought: Optional[date], *, resold: bool, today: Optional[date] = None) -> bool:
@@ -79,8 +79,10 @@ def is_stalled_flip(bought: Optional[date], *, resold: bool, today: Optional[dat
 
 def source_tag_for(pool_name: str, source_table: str, *, stalled: bool = False) -> Optional[str]:
     """Brief source list for a staged record; None when it belongs to no launch list."""
+    # Pool 2 rows are contractors (List 3). List 7 (owners pulling NOCs/permits) is
+    # property-level and has no extractor yet.
     if pool_name == "active_builder":
-        return "list_7" if source_table in _BUILDER_PERMIT_SOURCES else "list_3"
+        return "list_3"
     if pool_name == "mortgage_broker":
         return "list_4"
     if pool_name == "auction_winner":

@@ -12,8 +12,8 @@ TODAY = date(2026, 9, 30)
 
 
 @pytest.mark.parametrize("pool,source_table,stalled,tag", [
-    ("active_builder", "building_permits", False, "list_7"),
-    ("active_builder", "permit_staging", False, "list_7"),
+    # Pool 2 is one row per contractor (builder), whatever table supplied it.
+    ("active_builder", "building_permits", False, "list_3"),
     ("active_builder", "dbpr_contacts", False, "list_3"),
     ("mortgage_broker", "ofr_mortgage_brokers", False, "list_4"),
     ("wholesaler_flipper", "buyer_entities", True, "list_9"),
@@ -26,8 +26,8 @@ def test_source_tag_by_pool_and_source(pool, source_table, stalled, tag):
 
 @pytest.mark.parametrize("bought,resold,stalled", [
     (date(2026, 1, 1), False, True),     # 272 days, still held
-    (date(2026, 4, 3), False, True),     # exactly 180 days
-    (date(2026, 4, 4), False, False),    # 179 days
+    (date(2026, 7, 2), False, True),     # exactly 90 days
+    (date(2026, 7, 3), False, False),    # 89 days
     (date(2025, 1, 1), True, False),     # resold: flip completed
     (None, False, False),                # no purchase date: not provable
 ])
