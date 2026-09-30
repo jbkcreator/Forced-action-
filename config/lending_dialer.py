@@ -36,4 +36,7 @@ BATCHDIALER_ENDPOINTS: dict[str, "tuple[str, str] | None"] = {
 }
 # Path discovery (read-only, 2026-09-30): GET-405 (exists, other method) on /contact,
 # /dnclist, /campaigns/search; GET-200 on /cdrs (call records, paged) and /lists.
-# The API lists no remove-from-campaign action: holds use DNC add/delete (Option A).
+# DNC safety: temporary holds (window/cap) only leave and rejoin the campaign; they never
+# use the DNC list, and there is deliberately no DNC-delete endpoint, so a restore can
+# never remove a real DNC entry. The API lists no remove-from-campaign action, so holds
+# stay pending until campaign_remove / campaign_restore are confirmed with a write test.

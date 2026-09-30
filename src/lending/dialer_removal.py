@@ -4,11 +4,11 @@ Matches the compliance floor's ``DialerRemover`` contract: called with a phone,
 returns nothing, raises on failure so the caller keeps the removal pending
 and retries it.
 
-The load row is deactivated only after the Aircall side succeeds, so
+The load row is deactivated only after the dialer side succeeds, so
 ``active`` never claims a number is out of the dialer while callers can still
-dial it. How a contact is made non-dialable in Aircall (remove it from the
+dial it. How a contact is made non-dialable in the dialer (remove it from the
 dialer campaign, delete it, or another control) is an open client decision;
-until it is made the Aircall step raises and nothing changes.
+until it is made the dialer step raises and nothing changes.
 """
 from __future__ import annotations
 
@@ -30,12 +30,12 @@ DialerRemoval = Callable[[Any], None]
 
 
 class DialerRemovalUndecided(RuntimeError):
-    """The Aircall control that makes a contact non-dialable is not decided yet."""
+    """The dialer control that makes a contact non-dialable is not confirmed yet."""
 
 
 def undecided_removal(contact_id: str) -> None:
     raise DialerRemovalUndecided(
-        "how a contact is made non-dialable in Aircall is not decided; removal stays pending"
+        "how a contact is made non-dialable in the dialer is not confirmed; removal stays pending"
     )
 
 

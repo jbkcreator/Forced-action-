@@ -129,7 +129,8 @@ class BatchDialerAdapter:
         return self._campaign_ids[name]
 
     def remove(self, phone: str, *, reason: str) -> None:
-        # Opt-outs are permanent (DNC list); window/cap holds only leave the campaign.
+        # Opt-outs are permanent (DNC list); window/cap holds only leave the campaign and
+        # never touch the DNC list, so restore() can never undo a real DNC entry.
         action = "dnc_add" if reason == RemovalReason.OPT_OUT.value else "campaign_remove"
         self._call(action, {"phone": phone})
 

@@ -169,3 +169,33 @@ def test_transport_get_goes_through_the_get_retry_helper(monkeypatch):
 
     monkeypatch.setattr(dialer_port, "requests_get_with_retry", lambda url, **kw: _Resp(200, b"[]"))
     assert dialer_port._requests_http("k")("GET", "/campaigns") == {"id": 9}
+
+
+# ── DNC safety: holds never use the DNC list, restores never delete a DNC entry ──
+
+@pytest.mark.parametrize("reason", [RemovalReason.CALL_WINDOW.value, RemovalReason.ATTEMPT_CAP.value])
+def test_a_temporary_hold_never_touches_the_dnc_list(reason):
+    http = FakeHttp()
+    BatchDialerAdapter(http=http, endpoints=ENDPOINTS).remove(PHONE, reason=reason)
+    assert [c[1] for c in http.calls] == ["/campaign/remove"]
+
+
+def test_restore_never_deletes_a_dnc_entry():
+    http = FakeHttp()
+    endpoints = {**ENDPOINTS, "dnc_delete": ("DELETE", "/dnc")}
+    BatchDialerAdapter(http=http, endpoints=endpoints).restore(PHONE)
+    assert [c[1] for c in http.calls] == ["/campaign/add"]
+
+
+def test_the_adapter_has_no_dnc_delete_capability_at_all():
+    from config.lending_dialer import BATCHDIALER_ENDPOINTS
+    assert "dnc_delete" not in BATCHDIALER_ENDPOINTS
+    assert not any("dnc" in name and name != "dnc_add" for name in BATCHDIALER_ENDPOINTS)
+
+
+def test_an_unconfirmed_campaign_removal_keeps_the_hold_pending_not_a_dnc_fallback():
+    http = FakeHttp()
+    with pytest.raises(UnconfirmedCapability):
+        BatchDialerAdapter(http=http, endpoints={**ENDPOINTS, "campaign_remove": None}).remove(
+            PHONE, reason=RemovalReason.CALL_WINDOW.value)
+    assert http.calls == []
