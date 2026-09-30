@@ -11,13 +11,16 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
     Index,
     Integer,
     MetaData,
+    Numeric,
     String,
+    Text,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -142,4 +145,43 @@ class LendingDialerHold(LendingBase):
 
     __table_args__ = (
         Index("uq_lending_dialer_holds_open", "phone", unique=True, postgresql_where=text("released_at IS NULL")),
+    )
+
+
+class LendingDialerLoadRecord(LendingBase):
+    """One pool record loaded into the dialer, and what the caller sees for it.
+
+    At most one active row per phone, so a call-time lookup by phone resolves
+    to a single record. Earlier loads stay as inactive history; call events
+    resolve by aircall_contact_id, or by the latest row loaded before the call.
+    """
+
+    __tablename__ = "dialer_load_records"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    pool: Mapped[str] = mapped_column(String(30), nullable=False)
+    source_record_ref: Mapped[str] = mapped_column(String(100), nullable=False)
+    phone: Mapped[str] = mapped_column(String(20), nullable=False)  # phone_utils.normalize (E.164)
+    phone_hash: Mapped[str] = mapped_column(String(64), nullable=False)  # joins load_exclusions / opt_out_events
+    campaign_tag: Mapped[Optional[str]] = mapped_column(String(40))
+    borrower_name: Mapped[Optional[str]] = mapped_column(Text)
+    entity_name: Mapped[Optional[str]] = mapped_column(Text)
+    property_address: Mapped[Optional[str]] = mapped_column(Text)
+    estimated_loan_value: Mapped[Optional[float]] = mapped_column(Numeric(14, 2))
+    recent_permit_details: Mapped[Optional[str]] = mapped_column(Text)
+    aircall_contact_id: Mapped[Optional[int]] = mapped_column(BigInteger)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=text("true"))
+    loaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    deactivated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    deactivation_reason: Mapped[Optional[str]] = mapped_column(String(40))
+
+    __table_args__ = (
+        Index("uq_lending_dialer_load_records_active_phone", "phone", unique=True,
+              postgresql_where=text("active")),
+        Index("idx_lending_dialer_load_records_phone_loaded", "phone", "loaded_at"),
+        Index("idx_lending_dialer_load_records_run", "run_id"),
+        Index("idx_lending_dialer_load_records_contact", "aircall_contact_id",
+              postgresql_where=text("aircall_contact_id IS NOT NULL")),
+        CheckConstraint("active OR deactivated_at IS NOT NULL", name="ck_lending_dialer_load_deactivated_at"),
     )

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -44,9 +45,9 @@ def _check(db, now):
 
 def _attempt(db, ended_at, disposition=None, direction="outbound"):
     db.execute(
-        text("INSERT INTO lending.call_dispositions (phone, direction, call_ended_at, disposition) "
-             "VALUES (:p, :dir, :t, :d)"),
-        {"p": PHONE, "dir": direction, "t": ended_at, "d": disposition},
+        text("INSERT INTO lending.call_dispositions (aircall_call_id, phone, direction, call_ended_at, disposition, raw_event) "
+             "VALUES (:cid, :p, :dir, :t, :d, '{}')"),
+        {"cid": f"test-{uuid.uuid4().hex}", "p": PHONE, "dir": direction, "t": ended_at, "d": disposition},
     )
 
 

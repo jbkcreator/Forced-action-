@@ -7,6 +7,7 @@ Aircall calls are fakes (Developer 3's final signatures). No Tracerfy.
 from __future__ import annotations
 
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -67,8 +68,9 @@ def _sweep(db, now, aircall, loaded=(PHONE,)):
 
 
 def _attempt(db, ended_at):
-    db.execute(text("INSERT INTO lending.call_dispositions (phone, direction, call_ended_at) "
-                    "VALUES (:p, 'outbound', :t)"), {"p": PHONE, "t": ended_at})
+    db.execute(text("INSERT INTO lending.call_dispositions (aircall_call_id, phone, direction, call_ended_at, raw_event) "
+                    "VALUES (:cid, :p, 'outbound', :t, '{}')"),
+               {"cid": f"test-{uuid.uuid4().hex}", "p": PHONE, "t": ended_at})
 
 
 def _hold(db, phone=PHONE):
