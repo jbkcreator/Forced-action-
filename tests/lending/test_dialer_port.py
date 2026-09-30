@@ -22,7 +22,7 @@ class FakeHttp:
 ENDPOINTS = {
     "contact_upsert": ("POST", "/contact"),
     "contact_update": ("PUT", "/contact/{id}"),
-    "campaign_add_contact": ("POST", "/campaign/{campaign_id}/contact"),
+    "contacts_add_to_campaign": ("POST", "/contacts"),
     "campaign_remove": ("POST", "/campaign/remove"),
     "campaign_restore": ("POST", "/campaign/add"),
     "dnc_add": ("POST", "/dnc"),
@@ -96,22 +96,30 @@ class CampaignHttp(FakeHttp):
         return super().__call__(method, path, json=json)
 
 
-def test_loader_upsert_creates_the_contact_in_batchdialer_shape_then_adds_it_to_the_campaign():
-    http = CampaignHttp([{"id": 7, "name": "Builders"}], body={"id": 55})
-    result = BatchDialerAdapter(http=http, endpoints=ENDPOINTS).upsert_contact(PHONE, FIELDS, campaign="Builders")
+def test_loader_upsert_adds_the_contact_into_the_campaign_then_sets_the_card_fields():
+    http = CampaignHttp([{"id": 7, "name": "Builders"}], body={"ids": [55], "success": True})
+    result = BatchDialerAdapter(http=http, endpoints=ENDPOINTS).upsert_contact(
+        PHONE, FIELDS, campaign="Builders", vendor_contact_id="staging:9")
     assert result.contact_id == 55 and result.created is True
-    create, add = http.calls[-2], http.calls[-1]
-    assert create[:2] == ("POST", "/contact")
-    body = create[2]
-    assert (body["firstname"], body["lastname"]) == ("Jane", "Roe")
-    assert body["phonenumbers"] == [{"phonenumber": PHONE}]
-    assert body["customfields"]["entity_name"] == "Roe LLC" and body["customfields"]["details"] == "Property: 1 St"
-    assert add[:2] == ("POST", "/campaign/7/contact") and add[2] == {"contactId": 55}
+    add, card = http.calls[-2], http.calls[-1]
+    assert add[:2] == ("POST", "/contacts")
+    assert add[2]["campaignids"] == [7]
+    contact = add[2]["contacts"][0]
+    assert (contact["firstname"], contact["lastname"], contact["phonenumber1"]) == ("Jane", "Roe", PHONE)
+    assert contact["vendorcontactid"] == "staging:9" and contact["email"] == "j@example.com"
+    assert card[:2] == ("PUT", "/contact/55")
+    assert card[2]["customfields"]["entity_name"] == "Roe LLC" and card[2]["phonenumbers"] == [{"phonenumber": PHONE}]
+
+
+def test_a_failed_campaign_import_is_a_request_error():
+    http = CampaignHttp([{"id": 7, "name": "Builders"}], body={"success": False, "msg": "bad phone"})
+    with pytest.raises(DialerRequestError):
+        BatchDialerAdapter(http=http, endpoints=ENDPOINTS).upsert_contact(PHONE, FIELDS, campaign="Builders")
 
 
 def test_an_unconfirmed_campaign_step_refuses_before_any_contact_is_created():
-    http = CampaignHttp([{"id": 7, "name": "Builders"}], body={"id": 55})
-    adapter = BatchDialerAdapter(http=http, endpoints={**ENDPOINTS, "campaign_add_contact": None})
+    http = CampaignHttp([{"id": 7, "name": "Builders"}], body={"ids": [55], "success": True})
+    adapter = BatchDialerAdapter(http=http, endpoints={**ENDPOINTS, "contacts_add_to_campaign": None})
     with pytest.raises(UnconfirmedCapability):
         adapter.upsert_contact(PHONE, FIELDS, campaign="Builders")
     assert not [c for c in http.calls if c[0] != "GET"]
@@ -125,8 +133,8 @@ def test_update_is_a_full_put_that_keeps_the_phone():
 
 
 def test_missing_for_load_names_every_unconfirmed_load_endpoint():
-    adapter = BatchDialerAdapter(http=FakeHttp(), endpoints={**ENDPOINTS, "campaign_add_contact": None})
-    assert adapter.missing_for_load() == ["campaign_add_contact"]
+    adapter = BatchDialerAdapter(http=FakeHttp(), endpoints={**ENDPOINTS, "contacts_add_to_campaign": None})
+    assert adapter.missing_for_load() == ["contacts_add_to_campaign"]
     assert BatchDialerAdapter(http=FakeHttp(), endpoints=ENDPOINTS).missing_for_load() == []
 
 
@@ -134,11 +142,11 @@ def test_confirmed_contact_endpoints_are_set_in_config():
     from config.lending_dialer import BATCHDIALER_ENDPOINTS
     assert BATCHDIALER_ENDPOINTS["contact_upsert"] == ("POST", "/contact")
     assert BATCHDIALER_ENDPOINTS["contact_update"] == ("PUT", "/contact/{id}")
-    assert BATCHDIALER_ENDPOINTS["campaign_add_contact"] is None   # untested until a campaign exists
+    assert BATCHDIALER_ENDPOINTS["contacts_add_to_campaign"] == ("POST", "/contacts")   # docs: "Add contacts"
 
 
 def test_campaign_ids_are_looked_up_once():
-    http = CampaignHttp([{"id": 7, "name": "Builders"}], body={"id": 1})
+    http = CampaignHttp([{"id": 7, "name": "Builders"}], body={"ids": [1], "success": True})
     adapter = BatchDialerAdapter(http=http, endpoints=ENDPOINTS)
     adapter.upsert_contact(PHONE, FIELDS, campaign="Builders")
     adapter.upsert_contact("+18135558202", FIELDS, campaign="Builders")

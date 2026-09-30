@@ -39,7 +39,7 @@ class FakeAircall:
         self._fail = set(fail_phones)
         self._missing = set(missing_ids)
 
-    def upsert_contact(self, phone, fields, *, campaign=None):
+    def upsert_contact(self, phone, fields, *, campaign=None, vendor_contact_id=None):
         self.campaigns.append(campaign)
         if phone in self._fail:
             raise DialerRequestError("POST /contacts", status=500)

@@ -31,8 +31,9 @@ BATCHDIALER_ENDPOINTS: dict[str, "tuple[str, str] | None"] = {
     # Confirmed live 2026-09-30: create/read/update/delete on a test contact.
     "contact_upsert": ("POST", "/contact"),
     "contact_update": ("PUT", "/contact/{id}"),
-    # Untested until the first campaign exists.
-    "campaign_add_contact": None,
+    # Public API docs, "Add contacts": imports straight into the given campaign ids.
+    # Exercised live with the first campaign.
+    "contacts_add_to_campaign": ("POST", "/contacts"),
     "campaign_remove": None,
     "campaign_restore": None,
     "dnc_add": None,

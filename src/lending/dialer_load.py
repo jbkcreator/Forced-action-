@@ -47,8 +47,8 @@ REASON_NEEDS_SCRUB = "NEEDS_SCRUB"
 
 
 class DialerContacts(Protocol):
-    def upsert_contact(self, phone: str, fields: DialerContactFields, *,
-                       campaign: Optional[str] = None) -> ContactUpsertResult: ...
+    def upsert_contact(self, phone: str, fields: DialerContactFields, *, campaign: Optional[str] = None,
+                       vendor_contact_id: Optional[str] = None) -> ContactUpsertResult: ...
     def update_contact(self, contact_id: Any, fields: DialerContactFields, *,
                        phone: Optional[str] = None) -> dict: ...
 
@@ -195,7 +195,8 @@ def _push_contact(dialer: DialerContacts, item: _Loadable, known_contact_id: Opt
         except DialerRequestError as exc:
             if exc.status != 404:
                 raise
-    return dialer.upsert_contact(item.phone, fields, campaign=item.display.campaign_tag)
+    return dialer.upsert_contact(item.phone, fields, campaign=item.display.campaign_tag,
+                                 vendor_contact_id=item.record_ref or None)
 
 
 def _store_chunk(db, run_id: str, loaded: list[tuple[_Loadable, int]],

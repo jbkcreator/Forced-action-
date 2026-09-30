@@ -27,7 +27,7 @@ from src.lending.dialer_removal import DialerRemovalUndecided
 logger = logging.getLogger(__name__)
 
 Endpoint = Optional[tuple[str, str]]
-LOAD_ENDPOINTS = ("contact_upsert", "contact_update", "campaign_add_contact")
+LOAD_ENDPOINTS = ("contacts_add_to_campaign", "contact_update")
 Http = Callable[..., Mapping[str, Any]]
 
 
@@ -106,26 +106,36 @@ class BatchDialerAdapter:
         fields: Optional[DialerContactFields] = None,
         *,
         campaign: Optional[str] = None,
+        vendor_contact_id: Optional[str] = None,
     ) -> Union[Optional[str], ContactUpsertResult]:
         """Two call shapes: ``upsert_contact(record)`` (rules code) returns the contact id;
-        ``upsert_contact(phone, fields, campaign=)`` (dialer load) creates the contact, then
-        adds it to the campaign. The campaign step is checked first, so an unconfirmed
-        endpoint never leaves a contact created outside any campaign."""
+        ``upsert_contact(phone, fields, campaign=)`` (dialer load) adds the contact straight
+        into the campaign (``POST /contacts`` with ``campaignids``), then sets the context-card
+        custom fields with a full update, which the bulk import does not carry."""
         if isinstance(record_or_phone, Mapping):
             body = self._call("contact_upsert", dict(record_or_phone))
             contact_id = _contact_id(body)
             return str(contact_id) if contact_id is not None else None
-        campaign_id = None
-        if campaign is not None:
-            if self._endpoints.get("campaign_add_contact") is None:
-                raise UnconfirmedCapability("BatchDialer endpoint 'campaign_add_contact' is not confirmed")
+        phone, fields = record_or_phone, fields or DialerContactFields()
+        if campaign is None:
+            body = self._call("contact_upsert", _contact_body(phone, fields))
+            contact_id = _contact_id(body)
+        else:
+            if self._endpoints.get("contacts_add_to_campaign") is None:
+                raise UnconfirmedCapability("BatchDialer endpoint 'contacts_add_to_campaign' is not confirmed")
             campaign_id = self._campaign_id(campaign)
-        body = self._call("contact_upsert", _contact_body(record_or_phone, fields or DialerContactFields()))
-        contact_id = _contact_id(body)
+            body = self._call("contacts_add_to_campaign", {
+                "campaignids": [campaign_id],
+                "contacts": [_import_contact(phone, fields, vendor_contact_id)],
+            })
+            if body.get("success") is False:
+                raise DialerRequestError("BatchDialer contact import failed")
+            ids = body.get("ids") or []
+            contact_id = ids[0] if ids else None
         if contact_id is None:
             raise DialerRequestError("dialer returned no contact id")
-        if campaign_id is not None:
-            self._call("campaign_add_contact", {"contactId": contact_id}, campaign_id=campaign_id)
+        if campaign is not None:
+            self.update_contact(contact_id, fields, phone=phone)
         return ContactUpsertResult(contact_id=contact_id, created=True)
 
     def update_contact(self, contact_id: Any, fields: DialerContactFields, *, phone: Optional[str] = None) -> dict:
@@ -153,6 +163,15 @@ class BatchDialerAdapter:
 
 def _contact_id(body: Mapping[str, Any]) -> Any:
     return body.get("id") if body.get("id") is not None else body.get("contactId")
+
+
+def _import_contact(phone: str, fields: DialerContactFields, vendor_contact_id: Optional[str]) -> dict:
+    """One contact in the ``POST /contacts`` import shape (public API docs, "Add contacts")."""
+    contact = {"firstname": fields.first_name or "", "lastname": fields.last_name or "",
+               "email": fields.email or "", "phonenumber1": phone}
+    if vendor_contact_id:
+        contact["vendorcontactid"] = vendor_contact_id
+    return contact
 
 
 def _contact_body(phone: Optional[str], fields: DialerContactFields) -> dict:
