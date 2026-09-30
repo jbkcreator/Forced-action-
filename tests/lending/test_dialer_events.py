@@ -54,6 +54,12 @@ def test_disposition_before_the_call_end_converges_and_the_real_end_wins(lending
     assert row["call_ended_at"] == NOW - timedelta(minutes=4) and row["disposition"] == "NOT_DECISION_MAKER"
 
 
+def test_telephony_status_does_not_wipe_a_stored_caller_code(lending_db):
+    d.record_dialer_event(lending_db, _ev(disposition_raw="CALLBACK_REQUESTED"))
+    d.record_dialer_event(lending_db, _ev(disposition_raw="ANSWER"))
+    assert _row(lending_db)["disposition"] == "CALLBACK_REQUESTED"
+
+
 def test_changed_code_replaces_the_old_one(lending_db):
     d.record_dialer_event(lending_db, _ev(disposition_raw="CALLBACK_REQUESTED"))
     d.record_dialer_event(lending_db, _ev(disposition_raw="DNC_REQUEST"))

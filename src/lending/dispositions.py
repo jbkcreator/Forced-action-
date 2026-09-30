@@ -309,7 +309,7 @@ def record_dialer_event(db, ev: DialerCallEvent) -> RecordedCall:
                 text("UPDATE lending.call_dispositions SET disposition_raw = :raw, disposition_at = now() WHERE id = :id"),
                 {"raw": ev.disposition_raw, "id": row["id"]},
             )
-        elif code != disposition:
+        elif code is not None and code != disposition:
             cause = DEFAULT_CAUSE.get(code or "") if not row["unfunded_cause"] else None
             db.execute(
                 text("UPDATE lending.call_dispositions SET disposition = :d, disposition_raw = :raw, "
