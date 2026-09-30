@@ -169,3 +169,19 @@ def test_parse_event_reads_nested_and_epoch_fields_and_needs_a_call_id():
 def test_inbound_unanswered_call_raises_no_missed_call_signal(lending_db):
     d.record_dialer_event(lending_db, _ev(direction="inbound", duration=0, disposition_raw="NO_ANSWER"))
     assert lending_db.execute(text("SELECT count(*) FROM lending.missed_call_events")).scalar() == 0
+
+
+def test_every_listed_code_is_stored_with_its_cause_default_and_only_unanswered_codes_queue_a_text(lending_db):
+    """All 13 codes (including the client-approval proposals) work end to end."""
+    from config import lending_dispositions as cfg
+
+    for i, code in enumerate(cfg.DISPOSITIONS):
+        d.record_dialer_event(lending_db, _ev(f"code-{i}", phone=f"81355501{i:02d}", disposition_raw=code, duration=0 if code in cfg.UNANSWERED_CODES else 60))
+    rows = {r[0]: r[1:] for r in lending_db.execute(text(
+        "SELECT disposition, unfunded_cause, unfunded_cause_provisional, disposition_list_version FROM lending.call_dispositions"))}
+    assert set(rows) == set(cfg.DISPOSITIONS)
+    for code, (cause, provisional, version) in rows.items():
+        assert cause == cfg.DEFAULT_CAUSE.get(code) and provisional is (code in cfg.DEFAULT_CAUSE)
+        assert version == cfg.DISPOSITION_LIST_VERSION
+    queued = lending_db.execute(text("SELECT count(*) FROM lending.missed_call_events WHERE status = 'pending'")).scalar()
+    assert queued == len(cfg.UNANSWERED_CODES)
