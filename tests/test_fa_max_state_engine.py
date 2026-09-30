@@ -3271,8 +3271,10 @@ def test_connection_loss_work_queue_recovered(pg_engine):
     )
     assert item_b is not None, "Worker B must claim the reclaimed item"
     assert item_b["work_item_id"] == work_item_id
-    assert item_b["attempt_count"] == 3, (
-        "attempt_count reflects claim A, expired-lease reclaim, and claim B"
+    assert item_b["attempt_count"] == 2, (
+        "attempt_count reflects the two real claims (A, B) only -- reclaim"
+        " itself must not also increment it (code-review finding, 2026-09:"
+        " double-counting halved a caller's real retry budget)"
     )
 
     done = complete_work_item(

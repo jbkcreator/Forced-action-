@@ -591,6 +591,31 @@ worker and this endpoint exist so a human-triggered task has somewhere real
 to run; an automatic trigger (which event should hand Cora a task, and when)
 is a separate, not-yet-built work package's decision, not invented here.
 
+**FA Max qualification worker (WP-T3-7)**
+
+Consumes `fa_max_work_queue` items with `queue_name='fa_max_qualification'`
+and runs the Qualification Agent's sufficiency evaluation
+(`src/agents/fa_max/qualification_worker.py`). Separate process from the API
+and from the other FA Max worker above — a crash here only stalls claimed
+work items until their lease expires (`reclaim_expired_work_items`).
+
+```bash
+cp deploy/systemd/fa-max-qualification-worker.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now fa-max-qualification-worker
+```
+
+Enqueued by `POST /api/admin/fa-max/opportunities/{id}/facts` on every
+effective fact write. On a sufficient verdict it transitions
+`qualifying`→`scoping` (first sufficiency only) and enqueues
+`fa_max_quote_ready` work for the WP-8A/8B Scenario Builder consumer. On an
+insufficient verdict (client-actionable gaps only — never a pure
+`pending_enrichment` gap) it routes to the EXCEPTIONS Slack lane via
+`enqueue_and_attempt()`. Runs a checklist-version backstop sweep at startup:
+any non-terminal opportunity whose latest decision was evaluated against a
+stale `config.fa_max_qualification.CHECKLIST_VERSION` is automatically
+re-enqueued for reevaluation.
+
 The endpoint accepts either ordered `steps` or a `task_description` plus
 structured `context`. The v1 description selector supports one recognized
 action (person state/history, suppression, send, or approval-card repost) and
