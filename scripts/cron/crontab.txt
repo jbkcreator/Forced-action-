@@ -1179,4 +1179,11 @@ COUNTY_ID=hillsborough
 # the runner also refuses --apply while PROPERTY_RADAR_ENABLED=false.
 # 30 2 * * * $PROJECT/scripts/cron/run.sh src.tasks.property_radar_runner --apply --mode daily --state FL
 
+# Lending weekly DNC / litigator re-scrub of numbers loaded in the dialer (Go Live G10).
+# Mondays 06:00 UTC (02:00 ET), before the 09:00 ET calling window. Spends Tracerfy
+# credits (1 per number) up to a hard --max-credits cap; exit 4 = cap reached.
+# DISABLED until the weekly scrub budget is agreed: set --max-credits, then uncomment.
+# Dry check first: PYTHONPATH=. python -m src.lending.weekly_scrub --dry-run
+# 0 6 * * 1 $PROJECT/scripts/cron/run.sh src.lending.weekly_scrub --max-credits <BUDGET>
+
 # === END FORCED-ACTION-PLATFORM ===

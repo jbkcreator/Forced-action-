@@ -478,11 +478,7 @@ def _default_dialer_restorer() -> Optional[DialerRestorer]:
     from src.lending import dialer_port
 
     dialer = dialer_port.get_dialer()
-    if dialer is not None:
-        return dialer.restore
-    from src.services import aircall_client
-
-    return getattr(aircall_client, "restore_contact_to_pool", None)
+    return dialer.restore if dialer is not None else None
 
 
 def _default_loaded_phones(db) -> list[str]:
@@ -628,15 +624,11 @@ def _error_kind(exc: Exception) -> str:
 
 
 def _default_dialer_remover() -> Optional[DialerRemover]:
-    """Aircall pool removal is provided by the WP-W0-5 client once it exists."""
+    """The configured dialer (BatchDialer), or None: removals then stay pending."""
     from src.lending import dialer_port
 
     dialer = dialer_port.get_dialer()
-    if dialer is not None:
-        return dialer.remove
-    from src.services import aircall_client
-
-    return getattr(aircall_client, "remove_contact_from_pool", None)
+    return dialer.remove if dialer is not None else None
 
 
 def _channel_for(source: str, fa_table: str) -> OptOutChannel:

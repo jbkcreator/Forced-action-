@@ -105,3 +105,12 @@ def test_filter_loadable_flags_nurture_for_dnc_blocked_numbers(db):
     from src.lending.compliance import filter_loadable
     filter_loadable([{"phone": PHONES[2]}], db, now=NOW, scrubber=Scrubber(dnc={PHONES[2]}))
     assert db.execute(text("SELECT nurture FROM lending.contacts WHERE phone = :p"), {"p": PHONES[2]}).scalar() is True
+
+
+def test_dry_run_reports_the_count_and_spends_nothing(monkeypatch, caplog):
+    from src.lending import weekly_scrub as ws
+    monkeypatch.setattr(ws, "stale_loaded_phones", lambda db, now=None: PHONES[:3])
+    monkeypatch.setattr(ws, "tracerfy_scrub", lambda phones: pytest.fail("dry run must not scrub"))
+    caplog.set_level("INFO")
+    assert ws.main(["--dry-run"]) == 0
+    assert "3 number(s) would be scrubbed" in caplog.text

@@ -7,6 +7,7 @@ good (reason ``opt_out`` = the vendor's permanent DNC list) and its load row clo
 
 Usage:
     python -m src.lending.weekly_scrub --max-credits 5000
+    python -m src.lending.weekly_scrub --dry-run          # count only, no credits
 """
 from __future__ import annotations
 
@@ -109,9 +110,17 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description="Weekly re-scrub of loaded dialer numbers.")
-    parser.add_argument("--max-credits", type=int, required=True, help="hard Tracerfy credit cap for this run")
+    parser.add_argument("--max-credits", type=int, help="hard Tracerfy credit cap for this run")
+    parser.add_argument("--dry-run", action="store_true", help="count numbers due, spend nothing")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     args = parser.parse_args(argv)
+    if args.dry_run:
+        with get_db_context() as session:
+            due = len(stale_loaded_phones(session))
+        logger.info("[weekly-scrub] dry run: %d number(s) would be scrubbed (%d credits)", due, due)
+        return 0
+    if args.max_credits is None:
+        parser.error("--max-credits is required unless --dry-run")
     with get_db_context() as session:
         result = weekly_scrub(session, scrubber=tracerfy_scrub, max_credits=args.max_credits,
                               batch_size=args.batch_size)
