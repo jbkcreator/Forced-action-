@@ -14,6 +14,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     Index,
     Integer,
@@ -228,4 +229,22 @@ class LendingCallDisposition(LendingBase):
     __table_args__ = (
         Index("idx_lending_call_dispositions_phone_ended", "phone", "call_ended_at"),
         Index("idx_lending_call_dispositions_seat_ended", "caller_seat", "call_ended_at"),
+    )
+
+
+class LendingMissedCallText(LendingBase):
+    """One decision per unanswered call for the missed-call text (WP-GL-9): sent or why not."""
+
+    __tablename__ = "missed_call_texts"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    dialer_call_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
+    phone: Mapped[str] = mapped_column(String(20), nullable=False)  # phone_utils.normalize
+    event_date_et: Mapped[datetime] = mapped_column(Date, nullable=False)
+    outcome: Mapped[str] = mapped_column(String(30), nullable=False)  # sent / dry_run / skipped_*
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        Index("uq_lending_missed_call_texts_sent_day", "phone", "event_date_et", unique=True,
+              postgresql_where=text("outcome = 'sent'")),
     )

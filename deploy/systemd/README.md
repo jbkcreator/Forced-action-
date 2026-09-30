@@ -24,6 +24,7 @@ sudo systemctl start   fa-api lifecycle cora
 Two lending loops, installed by hand so a merge to `dev` never starts them unannounced:
 
 - `fa-lending-opt-out-poller` — every 15 s mirrors FA opt-outs (SMS/email) into `lending.suppression_list` and removes the number from the dialer (60 s stop SLA).
+- `fa-lending-missed-call-poller` — every 15 s reads BatchDialer call records and decides the missed-call text for each new no-answer. Sends only when `MISSED_CALL_TEXT_ENABLED=true`, through the consent-gated SMS path; otherwise logs `dry_run`.
 - `fa-lending-dialer-sweep` — every 60 s pulls dialer contacts outside 09:00–19:15 ET / 8–20 local or at 3 attempts per 24 h, and restores them when allowed.
 
 Both hold a Postgres advisory lock, so a second copy only skips cycles. Until `BATCHDIALER_API_KEY` and the endpoints in `config/lending_dialer.py` are set, dialer removals are recorded as pending and complete on a later cycle.
@@ -33,7 +34,7 @@ Both hold a Postgres advisory lock, so a second copy only skips cycles. Until `B
 PYTHONPATH=. .venv/bin/python -m src.lending.opt_out_poller --once
 PYTHONPATH=. .venv/bin/python -m src.lending.dialer_sweep --once
 
-sudo cp deploy/systemd/fa-lending-opt-out-poller.service deploy/systemd/fa-lending-dialer-sweep.service /etc/systemd/system/
+sudo cp deploy/systemd/fa-lending-opt-out-poller.service deploy/systemd/fa-lending-dialer-sweep.service deploy/systemd/fa-lending-missed-call-poller.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now fa-lending-opt-out-poller fa-lending-dialer-sweep
 sudo journalctl -u fa-lending-opt-out-poller -u fa-lending-dialer-sweep -f
