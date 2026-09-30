@@ -1176,7 +1176,8 @@ COUNTY_ID=hillsborough
 
 # PropertyRadar runner — pull -> stage -> link -> handoff (Developer 4).
 # DISABLED: PropertyRadar monitoring is off until Josh turns it on. Uncomment to enable;
-# the runner also refuses --apply while PROPERTY_RADAR_ENABLED=false.
+# the runner also refuses --apply while PROPERTY_RADAR_ENABLED=false. An --apply run traces staged
+# records live through Tracerfy (ledger-gated, SKIP_TRACE_MAX_RUN_COST_CENTS cap); no CSV step.
 # 30 2 * * * $PROJECT/scripts/cron/run.sh src.tasks.property_radar_runner --apply --mode daily --state FL
 
 # Lending weekly DNC / litigator re-scrub of numbers loaded in the dialer (Go Live G10).
