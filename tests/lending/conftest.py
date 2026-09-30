@@ -5,10 +5,13 @@ nothing persists in the shared database.
 """
 from __future__ import annotations
 
+import logging
+
 import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
+from migrations.apply_lending_call_dispositions_dialer import apply_to
 from src.lending.models import LENDING_SCHEMA, LendingCallDisposition
 
 
@@ -29,9 +32,22 @@ def lending_db():
     tx = conn.begin()
     conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{LENDING_SCHEMA}"'))
     LendingCallDisposition.__table__.create(bind=conn, checkfirst=True)
+    apply_to(conn)  # DDL is transactional: the vendor-neutral migration is rolled back with the test
     session = Session(bind=conn, join_transaction_mode="create_savepoint")
     yield session
     session.close()
     tx.rollback()
     conn.close()
     engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+def _src_logs_reach_caplog():
+    """config/logging.yaml sets the ``src`` logger to propagate=False, and any test that
+    imports a module loading it would hide every later ``src.*`` record from caplog.
+    Re-enable propagation (and DEBUG) for each test, then restore."""
+    src = logging.getLogger("src")
+    saved = (src.propagate, src.level)
+    src.propagate, src.level = True, logging.NOTSET
+    yield
+    src.propagate, src.level = saved

@@ -327,6 +327,15 @@ class AppSettings(BaseSettings):
 	# storm/restoration contractors from dbpr_contacts. Flip in env, no code deploy.
 	cora_target_mode: str = Field(default="whale", env="CORA_TARGET_MODE")
 
+	# OFR mortgage-broker ingestion (WP-W0-1 Pool 3)
+	# Fully automated monthly pull: download the OFR "Ch 494 Businesses -
+	# NMLS (MBR-MBRB)" zip, unzip, load into ofr_mortgage_brokers. Disabled by
+	# default; set OFR_BROKER_ENABLED=true in production once the prod box can
+	# reach flofr.gov. URL is the direct zip download (copied from the OFR
+	# Registration Data Download page).
+	ofr_broker_enabled: bool = Field(default=False, env="OFR_BROKER_ENABLED")
+	ofr_broker_download_url: Optional[str] = Field(default=None, env="OFR_BROKER_DOWNLOAD_URL")
+
 	# PropertyRadar ingestion adapter (Developer 1)
 	# Solo plan: 10,000 export credits/month. Purchase=0 counts are free and
 	# never billed. Set property_radar_mode="fake" (default) in tests/local;
@@ -858,15 +867,18 @@ class AppSettings(BaseSettings):
 	# app boots without Aircall configured (feature-gated).
 	aircall_api_id: Optional[SecretStr] = Field(default=None, env="AIRCALL_API_ID")
 	aircall_api_token: Optional[SecretStr] = Field(default=None, env="AIRCALL_API_TOKEN")
+	batchdialer_api_key: Optional[SecretStr] = Field(default=None, env="BATCHDIALER_API_KEY")
 	aircall_webhook_token: Optional[SecretStr] = Field(default=None, env="AIRCALL_WEBHOOK_TOKEN")
 
 	# ── Lending engine: call disposition logging ──
-	# Own DB role, Aircall webhook token, Slack bot and Sheet, separate from the
+	# Own DB role, dialer webhook secret, Slack bot and Sheet, separate from the
 	# FA settings above. All optional so the app boots without lending configured.
 	lending_database_url: str = Field(default="", env="LENDING_DATABASE_URL")
 	lending_db_password: Optional[SecretStr] = Field(default=None, env="LENDING_DB_PASSWORD")
-	lending_aircall_webhook_token: Optional[SecretStr] = Field(default=None, env="LENDING_AIRCALL_WEBHOOK_TOKEN")
-	lending_aircall_line_ids: str = Field(default="", env="LENDING_AIRCALL_LINE_IDS")  # comma-separated Aircall number IDs
+	lending_dialer_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_DIALER_WEBHOOK_SECRET")
+	lending_dialer_campaign_ids: str = Field(default="", env="LENDING_DIALER_CAMPAIGN_IDS")  # comma-separated; empty ignores every event
+	lending_seat_groups: str = Field(default="", env="LENDING_SEAT_GROUPS")  # "userid:A,userid:B" -> shift group per seat
+	lending_disposition_missing_alert_minutes: int = Field(default=10, env="LENDING_DISPOSITION_MISSING_ALERT_MINUTES")
 	lending_slack_bot_token: Optional[SecretStr] = Field(default=None, env="LENDING_SLACK_BOT_TOKEN")
 	lending_dial_tasks_channel: str = Field(default="", env="LENDING_DIAL_TASKS_CHANNEL")
 	lending_sheets_service_account_key_path: str = Field(default="", env="LENDING_SHEETS_SERVICE_ACCOUNT_KEY_PATH")

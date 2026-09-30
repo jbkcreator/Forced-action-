@@ -1,5 +1,5 @@
 [Unit]
-Description=Lending API (lending-api) — Aircall disposition webhook
+Description=Lending API (lending-api) — dialer disposition webhook
 After=network.target
 
 [Service]

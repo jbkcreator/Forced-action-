@@ -51,7 +51,7 @@ def _gaps(db, phones):
 
 
 def test_clean_fresh_numbers_have_no_gaps(db):
-    _fa_scrub(db, P_OK, age_days=30)
+    _fa_scrub(db, P_OK, age_days=6)
     db.execute(text("INSERT INTO lending.dnc_scrubs (phone, national_dnc, litigator, state_dnc, checked_at) "
                     "VALUES (:p, false, false, false, :at)"), {"p": P_LENDING_OK, "at": NOW - timedelta(days=1)})
     assert _gaps(db, [P_OK, P_LENDING_OK]) == {}

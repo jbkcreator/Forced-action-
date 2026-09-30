@@ -17,13 +17,12 @@ NOW = datetime(2026, 9, 29, 16, 30, tzinfo=timezone.utc)  # 12:30 ET
 
 def _row(**over):
     row = {
-        "id": 1, "aircall_call_id": "c1", "disposition": "CONNECTED", "phone": "+18135550142",
-        "caller_seat": "7", "caller_name": "Sam Caller", "campaign_tag": "DESK_CONSTRUCTION",
-        "aircall_contact_id": None, "talk_duration_sec": 45,
+        "id": 1, "dialer_call_id": "c1", "disposition": "CONNECTED_NOT_INTERESTED", "phone": "+18135550142",
+        "caller_seat": "7", "caller_name": "Sam Caller", "campaign_tag": "Builders", "queue": "builders", "dialer_contact_id": None,
+        "unfunded_cause": "fit", "disposition_list_version": "2026-10-01", "booking_blocked": False, "recording_ref": "https://dialer.example/rec/c1", "talk_duration_sec": 45,
         "call_started_at": datetime(2026, 9, 29, 16, 0, tzinfo=timezone.utc), "call_ended_at": NOW,
-        "disposition_at": NOW, "multiple_dispositions": False, "slack_ts": None,
+        "disposition_at": NOW, "disposition_raw": None, "slack_ts": None,
         "sheet_synced_disposition": None, "slack_posted_disposition": None,
-        "raw_event": {"data": {"direct_link": "https://aircall.example/calls/c1"}},
     }
     row.update(over)
     return row
@@ -44,14 +43,17 @@ def test_sheet_row_matches_the_column_order():
     assert len(line) == len(SHEET_COLUMNS)
     assert line[0] == "c1"
     assert line[1] == "2026-09-29 12:00:00"
-    assert line[6] == "CONNECTED"
+    assert line[4] == "builders"
+    assert line[6] == "CONNECTED_NOT_INTERESTED"
     assert line[7] == "45"
-    assert line[8:11] == ["N", "N", "N"]
-    assert line[11] == "2026-09-29 12:30:00"
+    assert line[8:10] == ["N", "N"]
+    assert line[10:12] == ["fit", "2026-10-01"]
+    assert line[12] == "2026-09-29 12:30:00"
 
 
-def test_sheet_flags_qualified_and_dnc():
-    assert dd.build_sheet_row(_row(disposition="QUALIFIED_APPOINTMENT"), NOW)[8] == "Y"
+def test_sheet_flags_booked_and_dnc():
+    assert dd.build_sheet_row(_row(disposition="BOOKED"), NOW)[8] == "Y"
+    assert dd.build_sheet_row(_row(disposition="BOOKED", booking_blocked=True), NOW)[8] == "N"
     assert dd.build_sheet_row(_row(disposition="DNC_REQUEST"), NOW)[9] == "Y"
 
 
@@ -76,7 +78,7 @@ def test_changed_result_updates_the_same_row_in_place():
     service, values = _sheets([["Call ID"], ["other"], ["c1"]])
     dd.sync_sheet(_row(disposition="DNC_REQUEST"), service, NOW)
     values.append.assert_not_called()
-    assert values.update.call_args.kwargs["range"] == "Dispositions!A3:L3"
+    assert values.update.call_args.kwargs["range"] == "Dispositions!A3:M3"
 
 
 def test_empty_sheet_gets_a_header_first():
@@ -99,25 +101,25 @@ def _text(blocks):
 def test_standard_message_shows_full_phone_and_details():
     fallback, blocks = dd.build_slack_message(_row(), RECORD)
     body = _text(blocks)
-    assert "Call result: CONNECTED" in fallback
+    assert "Call result: CONNECTED_NOT_INTERESTED" in fallback
     assert "+18135550142" in body
-    assert "Pat Builder" in body and "12 Oak St" in body and "DESK_CONSTRUCTION" in body
-    assert "https://aircall.example/calls/c1" in body
+    assert "Pat Builder" in body and "12 Oak St" in body and "builders" in body
+    assert "https://dialer.example/rec/c1" in body
 
 
-def test_qualified_appointment_gets_the_highlighted_card():
-    fallback, blocks = dd.build_slack_message(_row(disposition="QUALIFIED_APPOINTMENT"), RECORD)
-    assert "Qualified appointment" in blocks[0]["text"]["text"]
+def test_booked_gets_the_highlighted_card():
+    fallback, blocks = dd.build_slack_message(_row(disposition="BOOKED"), RECORD)
+    assert "Booked" in blocks[0]["text"]["text"]
+
+
+def test_booked_on_a_nurture_list_is_flagged_not_celebrated():
+    _, blocks = dd.build_slack_message(_row(disposition="BOOKED", booking_blocked=True), RECORD)
+    assert "not counted" in blocks[0]["text"]["text"]
 
 
 def test_dnc_request_gets_a_clear_marker():
     _, blocks = dd.build_slack_message(_row(disposition="DNC_REQUEST"), RECORD)
     assert "DNC request" in blocks[0]["text"]["text"]
-
-
-def test_multiple_result_tags_add_a_supervisor_warning():
-    _, blocks = dd.build_slack_message(_row(multiple_dispositions=True), None)
-    assert "more than one result tag" in str(blocks[-1])
 
 
 def test_missing_load_record_shows_dashes_not_errors():
@@ -166,7 +168,7 @@ def test_sheet_failure_does_not_block_slack(monkeypatch):
 def test_already_delivered_disposition_is_not_resent(monkeypatch):
     slack = MagicMock()
     sheets, values = _sheets([])
-    factory, _ = _factory(_row(sheet_synced_disposition="CONNECTED", slack_posted_disposition="CONNECTED"))
+    factory, _ = _factory(_row(sheet_synced_disposition="CONNECTED_NOT_INTERESTED", slack_posted_disposition="CONNECTED_NOT_INTERESTED"))
     dd.deliver_disposition(1, session_factory=factory, slack_client=slack, sheets_service=sheets)
     slack.chat_postMessage.assert_not_called()
     values.append.assert_not_called()
@@ -186,8 +188,8 @@ def test_removed_result_blanks_the_sheet_row_and_updates_the_slack_message():
     slack = MagicMock()
     sheets, values = _sheets([["Call ID"], ["c1"]])
     factory, _ = _factory(_row(
-        disposition=None, sheet_synced_disposition="CONNECTED",
-        slack_posted_disposition="CONNECTED", slack_ts="5.5"))
+        disposition=None, sheet_synced_disposition="CONNECTED_NOT_INTERESTED",
+        slack_posted_disposition="CONNECTED_NOT_INTERESTED", slack_ts="5.5"))
     dd.deliver_disposition(1, session_factory=factory, slack_client=slack, sheets_service=sheets)
     assert values.update.call_args.kwargs["body"]["values"][0][6] == ""
     assert "Result removed" in slack.chat_update.call_args.kwargs["text"]
@@ -195,7 +197,7 @@ def test_removed_result_blanks_the_sheet_row_and_updates_the_slack_message():
 
 def test_removed_result_without_an_earlier_slack_post_posts_nothing():
     slack = MagicMock()
-    factory, _ = _factory(_row(disposition=None, sheet_synced_disposition=None, slack_posted_disposition="CONNECTED"))
+    factory, _ = _factory(_row(disposition=None, sheet_synced_disposition=None, slack_posted_disposition="CONNECTED_NOT_INTERESTED"))
     dd.deliver_disposition(1, session_factory=factory, slack_client=slack, sheets_service=MagicMock())
     slack.chat_postMessage.assert_not_called()
 
@@ -219,3 +221,19 @@ def test_delivery_never_raises():
         raise RuntimeError("db down")
 
     dd.deliver_disposition(1, session_factory=boom)
+
+
+def test_unknown_code_alert_names_the_code_and_never_raises():
+    slack = MagicMock()
+    dd.alert_unknown_code("c9", "Hot Lead", "7", client=slack)
+    assert "Hot Lead" in slack.chat_postMessage.call_args.kwargs["text"]
+    slack.chat_postMessage.side_effect = RuntimeError("slack down")
+    dd.alert_unknown_code("c9", "Hot Lead", None, client=slack)
+
+
+def test_dnc_removal_pending_alert_says_to_remove_manually_and_never_raises():
+    slack = MagicMock()
+    dd.alert_dnc_removal_pending("c9", "7", client=slack)
+    assert "NOT yet removed" in slack.chat_postMessage.call_args.kwargs["text"]
+    slack.chat_postMessage.side_effect = RuntimeError("slack down")
+    dd.alert_dnc_removal_pending("c9", None, client=slack)

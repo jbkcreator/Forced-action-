@@ -28,6 +28,7 @@ _ALTERS = [
     "ALTER TABLE \"{t}\".opt_out_events ALTER COLUMN received_at SET DEFAULT now()",
     "ALTER TABLE \"{t}\".load_exclusions ALTER COLUMN created_at SET DEFAULT now()",
     "ALTER TABLE \"{t}\".contacts ADD COLUMN IF NOT EXISTS line_type varchar(20)",
+    "ALTER TABLE \"{t}\".contacts ADD COLUMN IF NOT EXISTS nurture boolean NOT NULL DEFAULT false",
     "ALTER TABLE \"{t}\".contacts ADD COLUMN IF NOT EXISTS phone_hash varchar(64)",
     "CREATE INDEX IF NOT EXISTS ix_contacts_phone_hash ON \"{t}\".contacts (phone_hash)",
     "UPDATE \"{t}\".contacts SET phone_hash = encode(sha256(convert_to(phone, 'UTF8')), 'hex') "

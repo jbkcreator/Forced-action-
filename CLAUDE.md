@@ -42,9 +42,16 @@ PYTHONPATH=. python migrations/apply_fa_max_wp_t2_2_opportunity_origin_immutable
 PYTHONPATH=. python migrations/apply_fa_max_wp_t2_2_tool_call_log_in_progress_status.py  # FA Max WP-T2-2 review fix: widens fa_max_tool_call_log.status CHECK to allow 'in_progress' (audit row written before a tool executes, not only after) (idempotent, run after apply_fa_max_wp_t2_2_agent_infra.py)
 PYTHONPATH=. python migrations/apply_fa_max_wp_t2_2_tool_call_log_claimed_status.py  # FA Max WP-T2-2 review fix: widens fa_max_tool_call_log.status CHECK to allow 'claimed' (claim_send_attempt()'s short-lived commit so a timeout write can't clobber a legitimately-claimed send) (idempotent, run after apply_fa_max_wp_t2_2_tool_call_log_in_progress_status.py)
 PYTHONPATH=. python migrations/apply_fa_max_wp_t2_3.py  # FA Max WP-T2-3: opportunity_id on relay_approval_queue, backflip_attribution_owner/set_at on fa_max_opportunities, fa_max_backflip_suppression_decisions audit table (idempotent, run after WP-T2-2)
+PYTHONPATH=. python migrations/apply_backflip_conflict_identifiers.py  # Backflip borrower conflict check: entity_name/parcel_id identifier kinds on fa_max_backflip_campaign_contacts (idempotent)
+PYTHONPATH=. python migrations/apply_backflip_dialer_audit_removal.py  # Removes the dialer gate + subject_ref/matched_criteria from fa_max_backflip_suppression_decisions; conflict decisions go to lending.load_exclusions (idempotent, refuses while dialer rows exist)
+PYTHONPATH=. python migrations/apply_lending_dialer_load_records.py  # lending.dialer_load_records: records loaded into the Aircall dialer, one active row per phone (idempotent, run after apply_lending_compliance.py)
+
+# Lending dialer load: pool export -> compliance filter -> Backflip conflict check -> Aircall. Dry run unless --live
+python -m src.tasks.lending_dialer_load --input pools.json
 PYTHONPATH=. python migrations/apply_property_radar_pull_runs.py  # PropertyRadar ingestion adapter (Dev 1): property_radar_pull_runs (run checkpoint) + property_radar_seen_ids (dedup) (idempotent)
 
-PYTHONPATH=. python migrations/apply_lending_call_dispositions.py  # lending.call_dispositions (idempotent); runbook docs/lending/aircall-disposition-runbook.md
+PYTHONPATH=. python migrations/apply_lending_call_dispositions.py  # lending.call_dispositions (idempotent); runbook docs/lending/dialer-disposition-runbook.md
+PYTHONPATH=. python migrations/apply_lending_call_dispositions_dialer.py  # vendor-neutral rename + dialer-logging columns + lending.missed_call_events (idempotent, run after apply_lending_call_dispositions.py)
 # PropertyRadar daily target-lender maturity pull (separate cron, disabled until PROPERTY_RADAR_ENABLED=true — see scripts/cron/crontab.txt)
 python -m src.tasks.property_radar_maturity_pull --mode daily --state FL
 
@@ -102,7 +109,7 @@ Garbage collection for `lifecycle_playbook`. `src/services/learning_hygiene.py` 
 - **Tasks** (`src/tasks/`): Scheduled jobs. `daily_report.py` — CSV ops report (runs 08:10 UTC for both Hillsborough and Pinellas). `daily_dashboard.py` — 10-section PDF (23:30 UTC Mon-Sat), separate from daily_report. `dnc_refresh` — monthly Tracerfy DNC re-scrub. `venture_ladder_evaluator.py` — daily 09:30 UTC venture-ladder walk (CL4).
 
 ### Lending (`src/lending/`)
-Own process (`lending-api`, `127.0.0.1:8010`, Nginx → `/webhooks/aircall/disposition`) and own DB role (`LENDING_DATABASE_URL`, schema `lending` only). One `call_dispositions` row per Aircall call; result = one of 5 Aircall tag names (`config/lending_dispositions.py`). Sheet + Slack delivery runs after the reply; `src.tasks.lending_disposition_delivery_retry` (cron */5) catches failures.
+Own process (`lending-api`, `127.0.0.1:8010`, Nginx → `/webhooks/lending/dialer`) and own DB role (`LENDING_DATABASE_URL`, schema `lending` only). One `call_dispositions` row per dialer call (columns are vendor-neutral: `dialer_call_id`, `dialer_contact_id`, `caller_id_number`); result = one code from `config/lending_dispositions.py` (`DISPOSITIONS`, versioned by `DISPOSITION_LIST_VERSION`; an unknown code is stored raw in `disposition_raw`, never dropped). `parse_event()` is the only place that knows the dialer's payload shape. An unanswered call also writes `lending.missed_call_events` (one sendable row per phone per ET day; the sender is a separate task). Sheet + Slack delivery runs after the reply; `src.tasks.lending_disposition_delivery_retry` (cron */5) catches failures; `src.tasks.lending_missing_disposition_alert` (cron */5) warns once per connected call with no disposition.
 
 ### County Config
 County config is **DB-backed** via `counties` + `county_sources` tables — **not** `config/counties.json`. Read via `src/utils/county_config.py:get_county(county_id)` (5-min cache). `County.nws_zone` supports comma-separated values for multi-zone counties. Hillsborough: `FLZ151,FLZ251`. Pinellas: `FLZ050`.

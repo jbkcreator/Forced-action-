@@ -54,7 +54,7 @@ def _run(db, records, scrubber=NoScrub(), **kw):
 
 
 def test_fresh_clean_phone_is_loadable_without_a_new_scrub(db):
-    _dnc(db, P_CLEAN, age_days=30)
+    _dnc(db, P_CLEAN, age_days=6)
     out = _run(db, [{"phone": P_CLEAN}])
     assert out[P_CLEAN].allowed and out[P_CLEAN].reason is None
 

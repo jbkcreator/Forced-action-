@@ -15,7 +15,9 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import text
 
 from config.lending_dispositions import (
+    BOOKED_CODE,
     DELIVERY_LATENCY_TARGET_SECONDS,
+    DNC_CODE,
     SHEET_COLUMNS,
     SHEET_TIMEZONE,
 )
@@ -39,18 +41,21 @@ def _yn(flag: bool) -> str:
 def build_sheet_row(row: dict, now: datetime) -> list[str]:
     """One Sheet row, in SHEET_COLUMNS order."""
     disposition = row["disposition"]
+    booked = disposition == BOOKED_CODE and not row.get("booking_blocked")
+    cause = row.get("unfunded_cause") or ""
     return [
-        row["aircall_call_id"],
+        row["dialer_call_id"],
         _et(row["call_started_at"] or row["call_ended_at"]),
         row["caller_name"] or "",
         row["caller_seat"] or "",
-        row["campaign_tag"] or "",
+        row["queue"] or row["campaign_tag"] or "",
         row["phone"] or "",
-        disposition or "",
+        disposition or row.get("disposition_raw") or "",
         str(row["talk_duration_sec"] if row["talk_duration_sec"] is not None else ""),
-        _yn(disposition == "QUALIFIED_APPOINTMENT"),
-        _yn(disposition == "DNC_REQUEST"),
-        _yn(row["multiple_dispositions"]),
+        _yn(booked),
+        _yn(disposition == DNC_CODE),
+        cause,
+        row.get("disposition_list_version") or "",
         _et(now),
     ]
 
@@ -65,19 +70,20 @@ def build_slack_message(row: dict, record: Optional[dict]) -> tuple[str, list[di
         f"*Entity:* {record.get('entity_name') or '—'}",
         f"*Property:* {record.get('property_address') or '—'}",
         f"*Phone:* {row['phone'] or '—'}",
-        f"*Campaign:* {row['campaign_tag'] or '—'}",
+        f"*Queue:* {row['queue'] or row['campaign_tag'] or '—'}",
         f"*Caller:* {row['caller_name'] or row['caller_seat'] or '—'}",
         f"*Talk time:* {row['talk_duration_sec'] if row['talk_duration_sec'] is not None else '—'} s",
     ]
-    link = ((row.get("raw_event") or {}).get("data") or {}).get("direct_link")
-    if link:
-        lines.append(f"<{link}|Open call in Aircall>")
+    if row.get("recording_ref"):
+        lines.append(f"<{row['recording_ref']}|Open call recording>")
 
     if disposition is None:
-        title = ":arrows_counterclockwise: Result removed — waiting for a new result tag"
-    elif disposition == "QUALIFIED_APPOINTMENT":
-        title = ":star2: Qualified appointment"
-    elif disposition == "DNC_REQUEST":
+        title = ":arrows_counterclockwise: Result removed — waiting for a new result"
+    elif disposition == BOOKED_CODE and row.get("booking_blocked"):
+        title = ":warning: BOOKED on a nurture-only list — not counted as a booking"
+    elif disposition == BOOKED_CODE:
+        title = ":star2: Booked (caller-reported)"
+    elif disposition == DNC_CODE:
         title = ":no_entry: DNC request — contact blocked on all channels"
     else:
         title = f"Call result: {disposition}"
@@ -86,10 +92,6 @@ def build_slack_message(row: dict, record: Optional[dict]) -> tuple[str, list[di
         {"type": "header", "text": {"type": "plain_text", "text": title, "emoji": True}},
         {"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines)}},
     ]
-    if row["multiple_dispositions"]:
-        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": (
-            f":warning: This call had more than one result tag; the latest ({disposition}) was counted. "
-            "Supervisor, please check.")}]})
     return f"{title} — {who}", blocks
 
 
@@ -123,7 +125,7 @@ def sync_sheet(row: dict, service: Any, now: datetime) -> None:
         ).execute()
         existing = [["Call ID"]]
     line = build_sheet_row(row, now)
-    position = next((i + 1 for i, cell in enumerate(existing) if cell and cell[0] == row["aircall_call_id"]), None)
+    position = next((i + 1 for i, cell in enumerate(existing) if cell and cell[0] == row["dialer_call_id"]), None)
     if position:
         values.update(
             spreadsheetId=sheet_id, range=f"{tab}!A{position}:{width}{position}",
@@ -162,7 +164,7 @@ def _latency(row: dict, done_at: datetime, sink: str) -> None:
     seconds = (done_at - row["disposition_at"]).total_seconds()
     level = logging.WARNING if seconds > DELIVERY_LATENCY_TARGET_SECONDS else logging.INFO
     logger.log(level, "[lending] call %s %s delivered %.1fs after disposition (target %ds)",
-               row["aircall_call_id"], sink, seconds, DELIVERY_LATENCY_TARGET_SECONDS)
+               row["dialer_call_id"], sink, seconds, DELIVERY_LATENCY_TARGET_SECONDS)
 
 
 def deliver_disposition(
@@ -205,13 +207,13 @@ def _deliver_sheet(db, row: dict, service: Any) -> None:
         _latency(row, now, "sheet")
     except Exception as exc:
         db.rollback()
-        logger.warning("[lending] call %s sheet sync failed: %s", row["aircall_call_id"], type(exc).__name__)
+        logger.warning("[lending] call %s sheet sync failed: %s", row["dialer_call_id"], type(exc).__name__)
 
 
 def _deliver_slack(db, row: dict, client: Any) -> None:
     try:
         now = datetime.now(timezone.utc)
-        record = lookup_load_record(db, row["aircall_contact_id"], row["phone"], row["call_started_at"])
+        record = lookup_load_record(db, row["dialer_contact_id"], row["phone"], row["call_started_at"])
         ts = post_slack(row, record, client or _slack_client())
         db.execute(
             text("UPDATE lending.call_dispositions SET slack_posted_at = :at, "
@@ -223,7 +225,7 @@ def _deliver_slack(db, row: dict, client: Any) -> None:
     except Exception as exc:
         db.rollback()
         logger.warning("[lending] call %s (%s) slack post failed: %s",
-                       row["aircall_call_id"], last4(row["phone"]), type(exc).__name__)
+                       row["dialer_call_id"], last4(row["phone"]), type(exc).__name__)
 
 
 def alert_unpropagated_dnc(call_id: str, caller_seat: Optional[str], client: Any = None) -> None:
@@ -239,3 +241,35 @@ def alert_unpropagated_dnc(call_id: str, caller_seat: Optional[str], client: Any
         )
     except Exception as exc:
         logger.error("[lending] call %s: DNC alert failed: %s", call_id, type(exc).__name__)
+
+
+def alert_unknown_code(call_id: str, raw_code: str, caller_seat: Optional[str], client: Any = None) -> None:
+    """Tell #dial-tasks the dialer sent a disposition our list does not know. Never raises."""
+    if not (client or _configured_slack()):
+        logger.error("[lending] call %s: unknown disposition %r and Slack is not configured", call_id, raw_code)
+        return
+    try:
+        (client or _slack_client()).chat_postMessage(
+            channel=get_settings().lending_dial_tasks_channel,
+            text=(f":warning: Unknown disposition `{raw_code}` on call {call_id} (seat {caller_seat or 'unknown'}). "
+                  "The dialer's Call Results do not match the lending list — check the setup."),
+        )
+    except Exception as exc:
+        logger.error("[lending] call %s: unknown-code alert failed: %s", call_id, type(exc).__name__)
+
+
+def alert_dnc_removal_pending(call_id: str, caller_seat: Optional[str], client: Any = None) -> None:
+    """Tell #dial-tasks a DNC request is recorded everywhere except the dialer, where the
+    removal is not confirmed: the person may still be dialable. Never raises."""
+    if not (client or _configured_slack()):
+        logger.error("[lending] call %s: DNC removal from the dialer is pending and Slack is not configured", call_id)
+        return
+    try:
+        (client or _slack_client()).chat_postMessage(
+            channel=get_settings().lending_dial_tasks_channel,
+            text=(f":rotating_light: DNC request recorded but NOT yet removed from the dialer — call {call_id} "
+                  f"(caller seat {caller_seat or 'unknown'}). Remove the contact in the dialer manually until the "
+                  "automatic removal is confirmed."),
+        )
+    except Exception as exc:
+        logger.error("[lending] call %s: DNC removal-pending alert failed: %s", call_id, type(exc).__name__)
