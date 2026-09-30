@@ -181,3 +181,11 @@ def get_dialer() -> Optional[Dialer]:
     if key is None or not BATCHDIALER_BASE_URL:
         return None
     return BatchDialerAdapter(http=_requests_http(key.get_secret_value()))
+
+
+def get_http() -> Optional[Http]:
+    """The authenticated BatchDialer transport, or None when no key / base URL is set."""
+    key = get_settings().batchdialer_api_key
+    if key is None or not BATCHDIALER_BASE_URL:
+        return None
+    return _requests_http(key.get_secret_value())
