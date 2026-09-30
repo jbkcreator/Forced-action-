@@ -17,6 +17,7 @@ POOL_CAMPAIGN_TAGS: dict[str, str] = {
     "verified_maturity": "Verified maturity",
     "transaction_ready": "Transaction ready",
     "builders": "Builders",
+    "nurture": "Nurture",  # Lists 2/4: dialed for data, never bookable
 }
 
 

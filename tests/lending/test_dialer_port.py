@@ -125,4 +125,5 @@ def test_pool_campaign_tags_name_the_three_launch_queues():
     from config import lending_queues as q
     from config.lending_dialer import POOL_CAMPAIGN_TAGS
     assert POOL_CAMPAIGN_TAGS == {q.VERIFIED_MATURITY: "Verified maturity",
-                                  q.TRANSACTION_READY: "Transaction ready", q.BUILDERS: "Builders"}
+                                  q.TRANSACTION_READY: "Transaction ready", q.BUILDERS: "Builders",
+                                  q.NURTURE: "Nurture"}

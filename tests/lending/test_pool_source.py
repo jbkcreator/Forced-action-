@@ -62,4 +62,4 @@ def test_dialer_load_input_keeps_only_launch_queue_records(db):
     records = [{"source_tag": "list_3", "phone": "+1"}, {"source_tag": "list_4", "phone": "+2"},
                {"source_tag": None, "phone": "+3"}, {"source_tag": "list_9", "phone": "+4"}]
     out = launch_queue_records(records)
-    assert [(r["phone"], r["pool"]) for r in out] == [("+1", "builders"), ("+4", "transaction_ready")]
+    assert [(r["phone"], r["pool"]) for r in out] == [("+1", "builders"), ("+2", "nurture"), ("+4", "transaction_ready")]

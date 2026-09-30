@@ -23,9 +23,21 @@ def test_source_tags_map_to_the_three_launch_queues(tag, queue):
     assert out["queue"] == queue and out["pool"] == queue and out["source_tag"] == tag
 
 
-@pytest.mark.parametrize("tag", ["list_2", "list_4", "list_99", None])
-def test_nurture_only_and_unknown_tags_get_no_queue(tag):
-    assert assign_queue({"source_tag": tag, "phone": "+18135550001"})["queue"] is None
+@pytest.mark.parametrize("tag", ["list_2", "list_4"])
+def test_nurture_lists_are_dialed_but_never_bookable(tag):
+    out = assign_queue({"source_tag": tag, "phone": "+18135550001"})
+    assert out["queue"] == q.NURTURE and out["pool"] == q.NURTURE and out["bookable"] is False
+
+
+@pytest.mark.parametrize("tag", ["list_1", "list_9", "list_3"])
+def test_launch_queue_records_are_bookable(tag):
+    assert assign_queue({"source_tag": tag, "phone": "+18135550001"})["bookable"] is True
+
+
+@pytest.mark.parametrize("tag", ["list_99", None])
+def test_unknown_tags_get_no_queue(tag):
+    out = assign_queue({"source_tag": tag, "phone": "+18135550001"})
+    assert out["queue"] is None and out["bookable"] is False
 
 
 def test_config_is_valid_and_shares_sum_to_one():
@@ -76,5 +88,5 @@ def test_count_report_walks_raw_to_eligible_per_queue(db, monkeypatch):
     assert (b["raw"], b["traced"], b["eligible"]) == (2, 2, 1)   # de-duplicated by phone
     t = report["queues"][q.TRANSACTION_READY]
     assert (t["raw"], t["traced"], t["eligible"]) == (1, 0, 0)   # invalid phone -> not traced
-    assert report["nurture_only"] == 1
+    assert report["queues"][q.NURTURE]["raw"] == 1
     assert report["tracerfy_balance"] == 7313
