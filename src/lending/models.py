@@ -154,7 +154,7 @@ class LendingDialerLoadRecord(LendingBase):
 
     At most one active row per phone, so a call-time lookup by phone resolves
     to a single record. Earlier loads stay as inactive history; call events
-    resolve by aircall_contact_id, or by the latest row loaded before the call.
+    resolve by dialer_contact_id, or by the latest row loaded before the call.
     """
 
     __tablename__ = "dialer_load_records"
@@ -171,7 +171,7 @@ class LendingDialerLoadRecord(LendingBase):
     property_address: Mapped[Optional[str]] = mapped_column(Text)
     estimated_loan_value: Mapped[Optional[float]] = mapped_column(Numeric(14, 2))
     recent_permit_details: Mapped[Optional[str]] = mapped_column(Text)
-    aircall_contact_id: Mapped[Optional[int]] = mapped_column(BigInteger)
+    dialer_contact_id: Mapped[Optional[str]] = mapped_column(String(64))
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=text("true"))
     loaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
     deactivated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
@@ -182,27 +182,27 @@ class LendingDialerLoadRecord(LendingBase):
               postgresql_where=text("active")),
         Index("idx_lending_dialer_load_records_phone_loaded", "phone", "loaded_at"),
         Index("idx_lending_dialer_load_records_run", "run_id"),
-        Index("idx_lending_dialer_load_records_contact", "aircall_contact_id",
-              postgresql_where=text("aircall_contact_id IS NOT NULL")),
+        Index("idx_lending_dialer_load_records_contact", "dialer_contact_id",
+              postgresql_where=text("dialer_contact_id IS NOT NULL")),
         CheckConstraint("active OR deactivated_at IS NOT NULL", name="ck_lending_dialer_load_deactivated_at"),
     )
 
 
 class LendingCallDisposition(LendingBase):
-    """One dialer call-ended event. ``aircall_call_id`` holds the dialer's call id
-    whichever vendor placed the call (renaming it would break the webhook writer)."""
+    """One dialer call-ended event. ``dialer_call_id`` / ``dialer_contact_id`` are whatever
+    the dialer calls them (vendor-neutral, same names as PR #319)."""
 
     __tablename__ = "call_dispositions"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    aircall_call_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
+    dialer_call_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
     direction: Mapped[Optional[str]] = mapped_column(String(20))
     phone: Mapped[Optional[str]] = mapped_column(String(20))
     caller_seat: Mapped[Optional[str]] = mapped_column(String(100))
     caller_name: Mapped[Optional[str]] = mapped_column(String(200))
-    caller_line: Mapped[Optional[str]] = mapped_column(String(50))
+    caller_id_number: Mapped[Optional[str]] = mapped_column(String(50))  # outbound DID shown to the borrower
     campaign_tag: Mapped[Optional[str]] = mapped_column(String(50))
-    aircall_contact_id: Mapped[Optional[str]] = mapped_column(String(50))
+    dialer_contact_id: Mapped[Optional[str]] = mapped_column(String(64))
     disposition: Mapped[Optional[str]] = mapped_column(String(50))
     disposition_tag_raw: Mapped[Optional[str]] = mapped_column(String(100))
     multiple_dispositions: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))

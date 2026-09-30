@@ -49,7 +49,7 @@ REASON_NEEDS_SCRUB = "NEEDS_SCRUB"
 class DialerContacts(Protocol):
     def upsert_contact(self, phone: str, fields: DialerContactFields, *,
                        campaign: Optional[str] = None) -> ContactUpsertResult: ...
-    def update_contact(self, contact_id: int, fields: DialerContactFields) -> dict: ...
+    def update_contact(self, contact_id: Any, fields: DialerContactFields) -> dict: ...
 
 
 class LoadRefused(RuntimeError):
@@ -166,12 +166,12 @@ def _active_rows(db, phones: list[str]) -> dict[str, tuple[int, Optional[int]]]:
         return {}
     rows = db.execute(
         text(
-            "SELECT phone, id, aircall_contact_id FROM lending.dialer_load_records "
+            "SELECT phone, id, dialer_contact_id FROM lending.dialer_load_records "
             "WHERE active AND phone = ANY(CAST(:phones AS varchar[]))"
         ),
         {"phones": phones},
     ).fetchall()
-    return {row.phone: (row.id, row.aircall_contact_id) for row in rows}
+    return {row.phone: (row.id, row.dialer_contact_id) for row in rows}
 
 
 def _count_active_not_in(db, phones: list[str]) -> int:
@@ -184,7 +184,7 @@ def _count_active_not_in(db, phones: list[str]) -> int:
     ).scalar_one()
 
 
-def _push_contact(dialer: DialerContacts, item: _Loadable, known_contact_id: Optional[int],
+def _push_contact(dialer: DialerContacts, item: _Loadable, known_contact_id: Optional[str],
                   fields: DialerContactFields) -> ContactUpsertResult:
     """Update by the stored contact id when known (search can lag); else upsert by phone."""
     if known_contact_id is not None:
@@ -213,7 +213,7 @@ def _store_chunk(db, run_id: str, loaded: list[tuple[_Loadable, int]],
             "INSERT INTO lending.dialer_load_records "
             "(run_id, pool, source_record_ref, phone, phone_hash, campaign_tag, borrower_name, "
             " entity_name, property_address, estimated_loan_value, recent_permit_details, "
-            " aircall_contact_id) "
+            " dialer_contact_id) "
             "VALUES (:run_id, :pool, :ref, :phone, :phone_hash, :campaign_tag, :borrower_name, "
             " :entity_name, :property_address, :estimated_loan_value, :recent_permit_details, "
             " :contact_id)"
@@ -231,7 +231,7 @@ def _store_chunk(db, run_id: str, loaded: list[tuple[_Loadable, int]],
                 "property_address": item.display.property_address,
                 "estimated_loan_value": item.display.estimated_loan_value,
                 "recent_permit_details": item.display.recent_permit_details,
-                "contact_id": contact_id,
+                "contact_id": str(contact_id) if contact_id is not None else None,
             }
             for item, contact_id in loaded
         ],

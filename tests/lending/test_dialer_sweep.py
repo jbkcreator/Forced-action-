@@ -68,7 +68,7 @@ def _sweep(db, now, aircall, loaded=(PHONE,)):
 
 
 def _attempt(db, ended_at):
-    db.execute(text("INSERT INTO lending.call_dispositions (aircall_call_id, phone, direction, call_ended_at, raw_event) "
+    db.execute(text("INSERT INTO lending.call_dispositions (dialer_call_id, phone, direction, call_ended_at, raw_event) "
                     "VALUES (:cid, :p, 'outbound', :t, '{}')"),
                {"cid": f"test-{uuid.uuid4().hex}", "p": PHONE, "t": ended_at})
 

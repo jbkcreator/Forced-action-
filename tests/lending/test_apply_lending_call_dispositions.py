@@ -38,7 +38,7 @@ def test_apply_creates_call_log_with_go_live_columns(env):
     apply(engine=engine, schema=schema)
     cols = _columns(engine, schema)
     assert GO_LIVE_COLUMNS <= cols
-    assert {"aircall_call_id", "phone", "direction", "disposition", "call_ended_at",
+    assert {"dialer_call_id", "phone", "direction", "disposition", "call_ended_at",
             "recording_disclosure_logged", "raw_event"} <= cols
 
 
@@ -49,7 +49,7 @@ def test_apply_adds_missing_columns_to_an_existing_call_log(env):
     with engine.begin() as c:
         c.execute(text(f'CREATE SCHEMA "{schema}"'))
         c.execute(text(f'CREATE TABLE "{schema}".call_dispositions ('
-                       "id serial PRIMARY KEY, aircall_call_id varchar NOT NULL UNIQUE, phone varchar, "
+                       "id serial PRIMARY KEY, dialer_call_id varchar NOT NULL UNIQUE, phone varchar, "
                        "direction varchar, disposition varchar, call_ended_at timestamptz, "
                        "recording_disclosure_logged boolean NOT NULL DEFAULT false, "
                        "raw_event jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now(), "

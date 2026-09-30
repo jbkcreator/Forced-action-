@@ -99,7 +99,7 @@ def _run(db, records, *, index=EMPTY_INDEX, dry_run=False, aircall=None, tags=TA
 
 
 def _load_rows(db, run_id=None):
-    sql = "SELECT phone, run_id, pool, campaign_tag, active, aircall_contact_id, deactivation_reason " \
+    sql = "SELECT phone, run_id, pool, campaign_tag, active, dialer_contact_id, deactivation_reason " \
           "FROM lending.dialer_load_records"
     params = {}
     if run_id:
@@ -147,7 +147,7 @@ class TestLiveLoad:
         rows = _load_rows(db)
         assert [(r.phone, r.campaign_tag, r.active) for r in rows] == [
             (P1, "DESK_CONSTRUCTION", True), (P2, "DESK_CAPITAL_LOOP", True)]
-        assert all(r.aircall_contact_id for r in rows)
+        assert all(r.dialer_contact_id for r in rows)
 
     def test_backflip_conflict_is_excluded_with_matched_criteria(self, db):
         _fresh_scrub(db, P1, P2)
@@ -220,12 +220,12 @@ class TestReload:
         rows = _load_rows(db)
         assert [(r.run_id, r.active, r.deactivation_reason) for r in rows] == [
             ("run-1", False, "superseded"), ("run-2", True, None)]
-        assert rows[0].aircall_contact_id == rows[1].aircall_contact_id
+        assert rows[0].dialer_contact_id == rows[1].dialer_contact_id
 
     def test_contact_deleted_in_aircall_falls_back_to_upsert(self, db):
         _fresh_scrub(db, P1)
         _run(db, [_record("a", P1)], run_id="run-1")
-        stored_id = _load_rows(db)[0].aircall_contact_id
+        stored_id = _load_rows(db)[0].dialer_contact_id
         report, second = _run(db, [_record("a", P1)], run_id="run-2",
                               aircall=FakeAircall(missing_ids={stored_id}))
         assert second.upserts == [P1]
@@ -262,7 +262,7 @@ def test_live_task_refuses_without_a_configured_dialer(tmp_path, monkeypatch):
 def _attempts(db, phone, n, ended_at):
     for i in range(n):
         db.execute(text(
-            "INSERT INTO lending.call_dispositions (aircall_call_id, phone, direction, call_ended_at, raw_event) "
+            "INSERT INTO lending.call_dispositions (dialer_call_id, phone, direction, call_ended_at, raw_event) "
             "VALUES (:c, :p, 'outbound', :t, '{}')"), {"c": f"t-{phone}-{i}-{os.getpid()}", "p": phone, "t": ended_at})
 
 

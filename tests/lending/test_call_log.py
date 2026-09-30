@@ -31,7 +31,7 @@ def db():
 
 def _call(db, ended_at, logged=False):
     cid = f"test-{uuid.uuid4().hex}"
-    db.execute(text("INSERT INTO lending.call_dispositions (aircall_call_id, phone, direction, call_ended_at, "
+    db.execute(text("INSERT INTO lending.call_dispositions (dialer_call_id, phone, direction, call_ended_at, "
                     "recording_disclosure_logged, raw_event) VALUES (:c, '+18135558501', 'outbound', :t, :l, '{}')"),
                {"c": cid, "t": ended_at, "l": logged})
     return cid
@@ -42,7 +42,7 @@ def test_marking_a_call_sets_its_disclosure_flag(db):
     cid = _call(db, NOW)
     assert mark_disclosure_logged(db, cid) is True
     flag = db.execute(text("SELECT recording_disclosure_logged FROM lending.call_dispositions "
-                           "WHERE aircall_call_id = :c"), {"c": cid}).scalar()
+                           "WHERE dialer_call_id = :c"), {"c": cid}).scalar()
     assert flag is True
 
 

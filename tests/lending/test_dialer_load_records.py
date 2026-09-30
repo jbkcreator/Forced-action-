@@ -60,7 +60,7 @@ def _insert(conn, schema, *, run_id="run-1", active=True, loaded_at=None, contac
         text(
             f'INSERT INTO "{schema}".dialer_load_records '
             "(run_id, pool, source_record_ref, phone, phone_hash, active, loaded_at, "
-            " deactivated_at, aircall_contact_id) "
+            " deactivated_at, dialer_contact_id) "
             "VALUES (:run_id, 'builders', 'property:1', :phone, :hash, :active, "
             " COALESCE(:loaded_at, now()), CASE WHEN :active THEN NULL ELSE now() END, :contact_id)"
         ),

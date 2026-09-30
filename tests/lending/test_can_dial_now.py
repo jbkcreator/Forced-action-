@@ -45,7 +45,7 @@ def _check(db, now):
 
 def _attempt(db, ended_at, disposition=None, direction="outbound"):
     db.execute(
-        text("INSERT INTO lending.call_dispositions (aircall_call_id, phone, direction, call_ended_at, disposition, raw_event) "
+        text("INSERT INTO lending.call_dispositions (dialer_call_id, phone, direction, call_ended_at, disposition, raw_event) "
              "VALUES (:cid, :p, :dir, :t, :d, '{}')"),
         {"cid": f"test-{uuid.uuid4().hex}", "p": PHONE, "dir": direction, "t": ended_at, "d": disposition},
     )

@@ -68,7 +68,7 @@ def _context(session):
 def _load(db, contact_id=77):
     db.execute(text(
         "INSERT INTO lending.dialer_load_records "
-        "(run_id, pool, source_record_ref, phone, phone_hash, aircall_contact_id) "
+        "(run_id, pool, source_record_ref, phone, phone_hash, dialer_contact_id) "
         "VALUES ('run-1', 'builders', 'a', :p, :h, :c)"
     ), {"p": PHONE, "h": "a" * 64, "c": contact_id})
 
@@ -81,14 +81,14 @@ def _state(db):
 
 @needs_db
 class TestRemoval:
-    def test_removes_from_aircall_then_deactivates(self, db):
+    def test_removes_from_the_dialer_then_deactivates(self, db):
         _load(db)
         removed = []
         remove_contact_from_pool("(813) 555-8201", removal=removed.append, db_context=_context(db))
-        assert removed == [77]
+        assert removed == ["77"]  # dialer_contact_id is a string
         assert tuple(_state(db)) == (False, REMOVED_FROM_DIALER)
 
-    def test_undecided_aircall_control_raises_and_changes_nothing(self, db):
+    def test_undecided_dialer_control_raises_and_changes_nothing(self, db):
         _load(db)
         with pytest.raises(DialerRemovalUndecided):
             remove_contact_from_pool(PHONE, db_context=_context(db))
