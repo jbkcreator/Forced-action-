@@ -12697,7 +12697,7 @@ class LendingCallingPoolStaging(Base):
     (Aircall load). Wave 0 placeholder location (O1); the final isolated lending
     schema is Dev 2's — only the table name changes when that lands.
     """
-    __tablename__ = "lending_calling_pool_staging"
+    __tablename__ = "calling_pool_staging"  # lending schema (ADR 0001); public view keeps the old name
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     run_id: Mapped[str] = mapped_column(PG_UUID(as_uuid=False), nullable=False, index=True)
@@ -12756,6 +12756,7 @@ class LendingCallingPoolStaging(Base):
         Index("idx_lcps_county", "county_id"),
         Index("idx_lcps_state", "state"),
         Index("idx_lcps_source_tag", "source_tag"),
+        {"schema": "lending"},
     )
 
 

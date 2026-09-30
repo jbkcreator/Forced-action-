@@ -29,7 +29,7 @@ def db():
 
 def _stage(db, run_id, at, phone, tag="list_3", pool="active_builder"):
     db.execute(text(
-        "INSERT INTO lending_calling_pool_staging (run_id, pool_name, aircall_campaign_tag, source_table, source_tag, "
+        "INSERT INTO lending.calling_pool_staging (run_id, pool_name, aircall_campaign_tag, source_table, source_tag, "
         "normalized_phone, phone_available, borrower_name, entity_name, target_property_address, estimated_loan_value, "
         "state, entity_status, parcel_id, created_at) VALUES (:r, :pool, 'X', 'building_permits', :tag, :p, :pa, "
         "'Jane Roe', 'Roe LLC', '1 Main St, TAMPA FL 33602', 250000, 'FL', 'LLC', 'P1', :at)"),

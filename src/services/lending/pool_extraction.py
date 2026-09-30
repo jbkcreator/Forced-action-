@@ -7,7 +7,7 @@ calling pools for the Lending Engine (Cora):
     Pool 2  active_builder      — structural permits (12 mo), no permanent financing recorded
     Pool 3  mortgage_broker     — STUB; blocked on O4 (OFR registry source unconfirmed)
 
-Output lands in ``lending_calling_pool_staging`` in the FA database.  This is
+Output lands in ``lending.calling_pool_staging`` in the FA database.  This is
 a Wave 0 placeholder location.  The final isolated lending schema (O1) is
 owned by Developer 2 — once that schema ships, this writer swaps in the real
 target table without logic changes.
@@ -191,7 +191,7 @@ def _names_match(a: Optional[str], b: Optional[str]) -> bool:
 
 @dataclass
 class CallingPoolRecord:
-    """One row destined for lending_calling_pool_staging.
+    """One row destined for lending.calling_pool_staging.
 
     The five spec §4.3 dialer-display attributes are:
         borrower_name          → Borrower Name
@@ -252,7 +252,7 @@ def extract_calling_pools(
     dry_run: bool = False,
     county_names: tuple[str, ...] = WAVE0_COUNTY_NAMES,
 ) -> dict[str, Any]:
-    """Extract all three calling pools and write to lending_calling_pool_staging.
+    """Extract all three calling pools and write to lending.calling_pool_staging.
 
     Returns a summary dict with per-pool counts, phone-available counts, and
     the run_id so callers can audit the exact rows written.
@@ -313,7 +313,7 @@ def extract_calling_pools(
     if not dry_run:
         written = _write_to_staging(session, all_records)
         summary["rows_written"] = written
-        logger.info("run_id=%s wrote %d rows to lending_calling_pool_staging", run_id, written)
+        logger.info("run_id=%s wrote %d rows to lending.calling_pool_staging", run_id, written)
     else:
         logger.info("run_id=%s dry_run=True skipping DB write (%d records)", run_id, len(all_records))
 
@@ -957,7 +957,7 @@ def _resolve_county_ids(session: Session, county_names: tuple[str, ...]) -> list
 
 
 def _write_to_staging(session: Session, records: list[CallingPoolRecord]) -> int:
-    """Bulk-insert records into lending_calling_pool_staging.
+    """Bulk-insert records into lending.calling_pool_staging.
 
     NOTE: Table location is a Wave 0 placeholder in the FA database.
     Final location (O1) will be set by Dev 2 when the isolated lending schema

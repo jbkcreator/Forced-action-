@@ -62,7 +62,7 @@ def test_migration_adds_source_tag_and_allows_auction_winners():
         apply(session)
         apply(session)  # idempotent
         session.execute(text(
-            "INSERT INTO lending_calling_pool_staging (run_id, pool_name, aircall_campaign_tag, source_table, source_tag) "
+            "INSERT INTO lending.calling_pool_staging (run_id, pool_name, aircall_campaign_tag, source_table, source_tag) "
             "VALUES (:r, 'auction_winner', 'DESK_CAPITAL_LOOP', 'tax_deed_auctions', 'list_6')"), {"r": str(uuid.uuid4())})
     finally:
         tx.rollback()
@@ -101,7 +101,7 @@ def test_staging_write_persists_every_column_including_source_tag():
         rec.run_id = run_id
         assert pe._write_to_staging(session, [rec]) == 1
         got = session.execute(text("SELECT pool_name, source_tag, entity_name, phone_available "
-                                   "FROM lending_calling_pool_staging WHERE run_id = CAST(:r AS uuid)"),
+                                   "FROM lending.calling_pool_staging WHERE run_id = CAST(:r AS uuid)"),
                               {"r": run_id}).fetchall()
         assert got == [("auction_winner", "list_6", "ACME HOLDINGS LLC", False)]
     finally:

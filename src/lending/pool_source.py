@@ -19,7 +19,7 @@ _COLUMNS = (
 
 def latest_run_id(db) -> Optional[str]:
     run_id = db.execute(text(
-        "SELECT run_id FROM lending_calling_pool_staging GROUP BY run_id ORDER BY max(created_at) DESC LIMIT 1"
+        "SELECT run_id FROM lending.calling_pool_staging GROUP BY run_id ORDER BY max(created_at) DESC LIMIT 1"
     )).scalar()
     return str(run_id) if run_id is not None else None
 
@@ -29,7 +29,7 @@ def staged_pool_records(db, *, run_id: Optional[str] = None) -> list[dict[str, A
     if run_id is None:
         return []
     rows = db.execute(
-        text(f"SELECT {_COLUMNS} FROM lending_calling_pool_staging WHERE run_id = CAST(:r AS uuid) ORDER BY id"),
+        text(f"SELECT {_COLUMNS} FROM lending.calling_pool_staging WHERE run_id = CAST(:r AS uuid) ORDER BY id"),
         {"r": run_id},
     ).mappings().all()
     return [

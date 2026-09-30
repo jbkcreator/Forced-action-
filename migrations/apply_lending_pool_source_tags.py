@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 POOLS = ("wholesaler_flipper", "active_builder", "mortgage_broker", "auction_winner")
 
 
-def apply(session, table: str = "lending_calling_pool_staging") -> None:
+def apply(session, table: str = "lending.calling_pool_staging") -> None:
     allowed = ", ".join(f"'{p}'" for p in POOLS)
     session.execute(text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS source_tag TEXT"))
     session.execute(text(f"CREATE INDEX IF NOT EXISTS idx_lcps_source_tag ON {table} (source_tag)"))
