@@ -63,12 +63,16 @@ AIRCALL_TAG: dict[str, str] = {
     "active_builder": "DESK_CONSTRUCTION",
     "mortgage_broker": "DESK_RESCUE",
     "auction_winner": "DESK_CAPITAL_LOOP",
+    "permit_owner": "DESK_CONSTRUCTION",
 }
 
 # Go Live Brief 2.5 source lists. A flipper is List 9 only while its flip is stalled:
 # the latest purchase is at least this old and the property has not been resold.
 # 90 days: the median flipper hold is 8 days, and deeds only reach back to 2026-01-01.
 STALLED_FLIP_MIN_DAYS: int = 90
+# List 7 = owners behind a new-construction permit (brief: "new construction is the repeat
+# business and the biggest checks").
+LIST7_PERMIT_PATTERN: str = "%new construction%"
 
 
 def is_stalled_flip(bought: Optional[date], *, resold: bool, today: Optional[date] = None) -> bool:
@@ -87,6 +91,8 @@ def source_tag_for(pool_name: str, source_table: str, *, stalled: bool = False) 
         return "list_4"
     if pool_name == "auction_winner":
         return "list_6"
+    if pool_name == "permit_owner":
+        return "list_7"
     if pool_name == "wholesaler_flipper" and stalled:
         return "list_9"
     return None
@@ -275,6 +281,8 @@ def extract_calling_pools(
     pool3 = _extract_pool3_mortgage_broker(session, county_ids)
 
     all_records = _dedup_across_pools(pool1, pool2, pool3)
+    claimed = {r.normalized_phone for r in all_records if r.normalized_phone}
+    all_records.extend(drop_claimed_phones(_extract_list7_permit_owners(session, county_ids), claimed))
     all_records.extend(_extract_auction_winners(session, county_ids))  # phoneless: nothing to dedup
     _attach_intent_scores(session, all_records)
     _finalize_run_metadata(all_records, run_id)
@@ -884,6 +892,81 @@ def _as_date(value: Any) -> Optional[date]:
     if value is None:
         return None
     return value.date() if isinstance(value, datetime) else value
+
+
+# ---------------------------------------------------------------------------
+# List 7 — Owners pulling construction permits (NOCs / permits, Go Live Brief 2.5)
+# ---------------------------------------------------------------------------
+
+def permit_owner_record(row: Any) -> CallingPoolRecord:
+    """The property OWNER behind a recent structural permit: they are the one who needs
+    construction financing. Phone is the owner's own traced phone (never the contractor's)."""
+    norm = normalize_phone(row.owner_phone) if row.owner_phone else None
+    elv = (Decimal(str(row.job_value)) * Decimal(str(CONSTRUCTION_LTC))).quantize(Decimal("0.01"))         if row.job_value else Decimal(str(CONSTRUCTION_AVG_LOAN))
+    return CallingPoolRecord(
+        run_id="", pool_name="permit_owner",
+        county_id=str(row.county_id), county_name=row.county_name,
+        borrower_name=None, entity_name=row.owner_name,
+        target_property_address=_compose_address(row.prop_address, row.prop_city, row.prop_state, row.prop_zip),
+        estimated_loan_value=elv,
+        recent_permit_details=_compose_permit_details(row.permit_type, row.issue_date, row.job_value),
+        entity_status=_entity_status_from_firm_name(row.owner_name),
+        parcel_id=row.parcel_id, zip=row.prop_zip, state=row.prop_state or WAVE0_STATE,
+        normalized_phone=norm, phone_available=norm is not None,
+        email=(row.owner_email or "").strip().lower() or None,
+        financing_intent_score=None, intent_tier=None, recommended_product=None,
+        aircall_campaign_tag=AIRCALL_TAG["permit_owner"],
+        buyer_entity_id=None, permit_number=row.permit_number, dbpr_license_number=None,
+        source_property_id=row.source_property_id, source_table="building_permits",
+        source_tag="list_7",
+    )
+
+
+def drop_claimed_phones(records: list[CallingPoolRecord], claimed: set[str]) -> list[CallingPoolRecord]:
+    """Keep records whose phone no higher-priority pool (or earlier record) already holds.
+    Phoneless records are always kept (they are traced individually)."""
+    kept: list[CallingPoolRecord] = []
+    for record in records:
+        if record.normalized_phone:
+            if record.normalized_phone in claimed:
+                continue
+            claimed.add(record.normalized_phone)
+        kept.append(record)
+    return kept
+
+
+def _extract_list7_permit_owners(session: Session, county_ids: list[str]) -> list[CallingPoolRecord]:
+    """One row per property with a NEW-CONSTRUCTION permit issued in the last 12 months in a
+    target county and no permanent financing recorded since (Pool 2's financing rule).
+
+    New construction only: the broader structural set is dominated by express and trade
+    permits (roofs, windows, repairs), which are not construction-financing leads."""
+    rows = session.execute(
+        text("""
+            SELECT DISTINCT ON (bp.property_id)
+                bp.property_id AS source_property_id, bp.permit_number, bp.permit_type, bp.issue_date,
+                bp.job_value, bp.county_id, c.display_name AS county_name,
+                p.parcel_id, p.address AS prop_address, p.city AS prop_city, p.state AS prop_state,
+                p.zip AS prop_zip, o.owner_name, COALESCE(o.phone_1, o.phone_2, o.phone_3) AS owner_phone,
+                o.email_1 AS owner_email
+            FROM building_permits bp
+            JOIN counties c ON c.county_id = bp.county_id
+            JOIN properties p ON p.id = bp.property_id
+            LEFT JOIN owners o ON o.property_id = bp.property_id
+            WHERE bp.is_enforcement_permit = FALSE
+              AND bp.county_id = ANY(:county_ids)
+              AND bp.issue_date >= CURRENT_DATE - INTERVAL '12 months'
+              AND o.owner_name IS NOT NULL
+              AND (bp.permit_type ILIKE :new_construction OR bp.description ILIKE :new_construction)
+              AND NOT EXISTS (SELECT 1 FROM deeds d WHERE d.property_id = bp.property_id
+                              AND d.mortgage_amount > 0 AND d.record_date >= bp.issue_date)
+            ORDER BY bp.property_id, bp.issue_date DESC
+        """),
+        {"county_ids": county_ids, "new_construction": LIST7_PERMIT_PATTERN},
+    ).fetchall()
+    records = [permit_owner_record(row) for row in rows]
+    logger.info("List 7 permit_owner: %d properties", len(records))
+    return records
 
 
 # ---------------------------------------------------------------------------

@@ -12748,7 +12748,7 @@ class LendingCallingPoolStaging(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "pool_name IN ('wholesaler_flipper', 'active_builder', 'mortgage_broker', 'auction_winner')",
+            "pool_name IN ('wholesaler_flipper', 'active_builder', 'mortgage_broker', 'auction_winner', 'permit_owner')",
             name="lending_calling_pool_staging_pool_name_check",
         ),
         Index("idx_lcps_run_id", "run_id"),
