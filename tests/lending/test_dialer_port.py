@@ -127,3 +127,45 @@ def test_pool_campaign_tags_name_the_three_launch_queues():
     assert POOL_CAMPAIGN_TAGS == {q.VERIFIED_MATURITY: "Verified maturity",
                                   q.TRANSACTION_READY: "Transaction ready", q.BUILDERS: "Builders",
                                   q.NURTURE: "Nurture"}
+
+
+# ── HTTP transport ──
+
+class _Resp:
+    def __init__(self, status, body=b"{}"):
+        self.status_code, self.content = status, body
+        self.ok = status < 400
+
+    def json(self):
+        return {"id": 9}
+
+    def raise_for_status(self):
+        if not self.ok:
+            import requests
+            raise requests.HTTPError(response=self)
+
+
+def test_transport_uses_the_retry_helpers_and_logs_safe_failure_context(monkeypatch, caplog):
+    import requests
+    from src.lending import dialer_port
+
+    calls = []
+
+    def fake_post(url, **kwargs):
+        calls.append(("POST", url, kwargs["headers"]["X-ApiKey"]))
+        raise requests.HTTPError(response=_Resp(422))
+
+    monkeypatch.setattr(dialer_port, "requests_post_with_retry", fake_post)
+    http = dialer_port._requests_http("secret-key")
+    with caplog.at_level("WARNING"), pytest.raises(DialerRequestError) as err:
+        http("POST", "/dnclist", json={"phone": PHONE})
+    assert err.value.status == 422 and calls[0][0] == "POST" and calls[0][1].endswith("/dnclist")
+    assert "/dnclist" in caplog.text and "422" in caplog.text
+    assert PHONE not in caplog.text and "secret-key" not in caplog.text
+
+
+def test_transport_get_goes_through_the_get_retry_helper(monkeypatch):
+    from src.lending import dialer_port
+
+    monkeypatch.setattr(dialer_port, "requests_get_with_retry", lambda url, **kw: _Resp(200, b"[]"))
+    assert dialer_port._requests_http("k")("GET", "/campaigns") == {"id": 9}

@@ -21,6 +21,7 @@ from config.lending_dialer import (
     BATCHDIALER_TIMEOUT_SECONDS,
 )
 from config.settings import get_settings
+from src.utils.http_helpers import requests_get_with_retry, requests_post_with_retry
 from src.lending.dialer_removal import DialerRemovalUndecided
 
 logger = logging.getLogger(__name__)
@@ -147,17 +148,27 @@ def _contact_body(phone: Optional[str], fields: DialerContactFields) -> dict:
 
 
 def _requests_http(api_key: str) -> Http:
+    """GET/POST go through the repo retry helpers (network errors, 429, 5xx); a 4xx is
+    final. Failures log method, path and status only: bodies carry phone numbers."""
+
     def call(method: str, path: str, *, json: Optional[dict] = None) -> Any:
+        url = f"{BATCHDIALER_BASE_URL}{path}"
+        kwargs = {"headers": {"X-ApiKey": api_key}, "timeout": BATCHDIALER_TIMEOUT_SECONDS}
         try:
-            response = requests.request(
-                method, f"{BATCHDIALER_BASE_URL}{path}", json=json,
-                headers={"X-ApiKey": api_key}, timeout=BATCHDIALER_TIMEOUT_SECONDS,
-            )
+            if method == "GET":
+                response = requests_get_with_retry(url, max_retries=3, retry_delay=2, **kwargs)
+            elif method == "POST":
+                response = requests_post_with_retry(url, json=json, **kwargs)
+            else:
+                response = requests.request(method, url, json=json, **kwargs)
+                response.raise_for_status()
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            logger.warning("[dialer] BatchDialer %s %s failed: HTTP %s", method, path, status)
+            raise DialerRequestError(f"BatchDialer {method} {path} HTTP {status}", status=status) from exc
         except requests.RequestException as exc:
+            logger.warning("[dialer] BatchDialer %s %s failed: %s", method, path, type(exc).__name__)
             raise DialerRequestError(f"BatchDialer {method} {path}: {type(exc).__name__}") from exc
-        if not response.ok:
-            raise DialerRequestError(f"BatchDialer {method} {path} HTTP {response.status_code}",
-                                     status=response.status_code)
         return response.json() if response.content else {}
 
     return call
