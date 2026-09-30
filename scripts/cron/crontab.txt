@@ -1182,9 +1182,9 @@ COUNTY_ID=hillsborough
 # Lending weekly DNC / litigator re-scrub of numbers loaded in the dialer (Go Live G10).
 # Mondays 06:00 UTC (02:00 ET), before the 09:00 ET calling window. Spends Tracerfy
 # credits (1 per number) up to a hard --max-credits cap; exit 4 = cap reached.
-# DISABLED until approved. Proposed cap 1000 credits/week (lender-engine/go-live-dev1/LISTS-AND-SCRUB-CAP.md).
+# Cap 1000 credits/week, approved 2026-09-30. Scrubs only numbers loaded in the dialer.
 # Dry check first: PYTHONPATH=. python -m src.lending.weekly_scrub --dry-run
-# 0 6 * * 1 $PROJECT/scripts/cron/run.sh src.lending.weekly_scrub --max-credits 1000
+0 6 * * 1 $PROJECT/scripts/cron/run.sh src.lending.weekly_scrub --max-credits 1000
 
 # OFR mortgage-broker refresh (WP-W0-1 Pool 3) — MONTHLY.
 # OFR publishes the MBR-MBRB file monthly; this downloads + unzips + loads it
