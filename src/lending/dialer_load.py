@@ -85,6 +85,7 @@ class LoadReport:
     excluded_by_reason: Counter = field(default_factory=Counter)
     loadable_by_pool: Counter = field(default_factory=Counter)
     duplicate_phones: int = 0
+    distinct_phones: int = 0
     unmapped_pools: list[str] = field(default_factory=list)
     failed: list[dict] = field(default_factory=list)
     active_not_in_run: int = 0
@@ -101,6 +102,7 @@ class LoadReport:
             "excluded_by_reason": dict(self.excluded_by_reason),
             "loadable_by_pool": dict(self.loadable_by_pool),
             "duplicate_phones": self.duplicate_phones,
+            "distinct_phones": self.distinct_phones,
             "unmapped_pools": self.unmapped_pools,
             "failed": self.failed,
             "active_not_in_run": self.active_not_in_run,
@@ -306,6 +308,7 @@ def run_dialer_load(
     report.loadable_by_pool.update(item.pool for item in loadable)
     records_per_phone = Counter(item.phone for item in loadable)
     report.duplicate_phones = sum(1 for n in records_per_phone.values() if n > 1)
+    report.distinct_phones = len(records_per_phone)
     report.unmapped_pools = sorted({item.pool for item in loadable if item.display.campaign_tag is None})
     loadable_phones = sorted(records_per_phone)
     report.active_not_in_run = _count_active_not_in(db, loadable_phones)
