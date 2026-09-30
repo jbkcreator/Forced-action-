@@ -175,6 +175,7 @@ def filter_loadable(
         by_phone[phone] = _verdict(phone, scrub) if scrub else _blocked(phone, ReasonCode.SCRUB_FAILED)
 
     _stamp_contacts(db, fresh)
+    _flag_nurture(db, [p for p, g in by_phone.items() if g.reason in NURTURE_REASONS])
     results = [early.get(i) or by_phone[phones[i]] for i in range(len(records))]
     if run_id:
         _record_exclusions(db, run_id, results)
@@ -265,6 +266,16 @@ def _stamp_contacts(db, scrubs: dict[str, ScrubResult]) -> None:
             "line_types": [scrubs[p].line_type for p in phones],
         },
     )
+
+
+NURTURE_REASONS = frozenset({ReasonCode.NATIONAL_DNC, ReasonCode.STATE_DNC})
+
+
+def _flag_nurture(db, phones: list[str]) -> None:
+    """A DNC block is a phone rule only: the contact stays eligible for the shared
+    (email) nurture destination. Litigators and opt-outs are never flagged."""
+    if phones:
+        db.execute(text("UPDATE lending.contacts SET nurture = true WHERE phone = ANY(:phones)"), {"phones": phones})
 
 
 def _record_exclusions(db, run_id: str, results: list[GateResult]) -> None:
