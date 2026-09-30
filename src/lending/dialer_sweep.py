@@ -1,6 +1,6 @@
 """Lending dialer enforcement sweep (WP-W0-3).
 
-Pulls Aircall contacts outside 8 AM–8 PM recipient local time or at 3 attempts /
+Pulls dialer contacts outside 09:00–19:15 ET / 8–20 recipient local time or at 3 attempts /
 rolling 24 h, and restores them when allowed. One transaction per cycle.
 
 Usage:

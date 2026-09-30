@@ -1,7 +1,7 @@
 """Lending stop-propagation poller (WP-W0-8).
 
 Mirrors FA opt-outs (SMS STOP, email UNSUBSCRIBE) into the lending stores and the
-Aircall pool, and retries pending Aircall removals. One transaction per cycle.
+dialer, and retries pending dialer removals. One transaction per cycle.
 
 Usage:
     python -m src.lending.opt_out_poller            # loop every OPT_OUT_POLL_SECONDS

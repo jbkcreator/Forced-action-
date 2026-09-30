@@ -1,8 +1,7 @@
-"""Map a lending pool record to the Aircall contact a caller sees.
+"""Map a lending pool record to the dialer contact a caller sees.
 
-Aircall contacts have fixed fields (first/last name, company, a free-text
-information field) and no custom attributes, so the five dialer display
-fields are placed as:
+The contact carries fixed fields (first/last name, company, a free-text
+information field), so the five dialer display fields are placed as:
 
 - Borrower Name          -> first_name / last_name
 - Entity Name            -> company_name
@@ -18,7 +17,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Optional
 
-from src.services.aircall_client import AircallContactFields
+from src.lending.dialer_port import DialerContactFields
 from src.services.fa_max_backflip_feed import normalize_email
 
 NOT_AVAILABLE = "Not available"
@@ -83,9 +82,9 @@ def _information(display: DialerDisplay) -> str:
     return text if len(text) <= INFORMATION_MAX_CHARS else text[: INFORMATION_MAX_CHARS - 1] + "…"
 
 
-def aircall_fields(display: DialerDisplay, email: Optional[str] = None) -> AircallContactFields:
+def dialer_fields(display: DialerDisplay, email: Optional[str] = None) -> DialerContactFields:
     first_name, last_name = _split_name(display.borrower_name)
-    return AircallContactFields(
+    return DialerContactFields(
         first_name=first_name,
         last_name=last_name,
         company_name=display.entity_name,

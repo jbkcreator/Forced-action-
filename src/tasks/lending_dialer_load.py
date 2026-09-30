@@ -72,7 +72,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             if args.live:
                 report = run_dialer_load(records, session, run_id=run_id, dry_run=False,
-                                         scrubber=tracerfy_scrub, aircall=dialer,
+                                         scrubber=tracerfy_scrub, dialer=dialer,
                                          commit=session.commit)
             else:
                 report = run_dialer_load(records, session, run_id=run_id, dry_run=True)

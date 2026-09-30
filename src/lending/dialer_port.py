@@ -9,6 +9,7 @@ opt-out path already treats as "removal stays pending".
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional, Protocol, Union
 
 import requests
@@ -21,12 +22,28 @@ from config.lending_dialer import (
 )
 from config.settings import get_settings
 from src.lending.dialer_removal import DialerRemovalUndecided
-from src.services.aircall_client import AircallContactFields, ContactUpsertResult
 
 logger = logging.getLogger(__name__)
 
 Endpoint = Optional[tuple[str, str]]
 Http = Callable[..., Mapping[str, Any]]
+
+
+@dataclass(frozen=True)
+class DialerContactFields:
+    """What the caller sees for a contact; None fields are sent as empty."""
+
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    company_name: Optional[str] = None
+    information: Optional[str] = None
+    email: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ContactUpsertResult:
+    contact_id: Any
+    created: bool
 
 
 class UnconfirmedCapability(DialerRemovalUndecided):
@@ -80,7 +97,7 @@ class BatchDialerAdapter:
     def upsert_contact(
         self,
         record_or_phone: Union[Mapping[str, Any], str],
-        fields: Optional[AircallContactFields] = None,
+        fields: Optional[DialerContactFields] = None,
         *,
         campaign: Optional[str] = None,
     ) -> Union[Optional[str], ContactUpsertResult]:
@@ -90,7 +107,7 @@ class BatchDialerAdapter:
             body = self._call("contact_upsert", dict(record_or_phone))
             contact_id = body.get("id")
             return str(contact_id) if contact_id is not None else None
-        payload = _contact_body(record_or_phone, fields or AircallContactFields())
+        payload = _contact_body(record_or_phone, fields or DialerContactFields())
         if campaign is not None:
             payload["campaignId"] = self._campaign_id(campaign)
         body = self._call("contact_upsert", payload)
@@ -98,7 +115,7 @@ class BatchDialerAdapter:
             raise DialerRequestError("dialer returned no contact id")
         return ContactUpsertResult(contact_id=body["id"], created=True)
 
-    def update_contact(self, contact_id: Any, fields: AircallContactFields) -> dict:
+    def update_contact(self, contact_id: Any, fields: DialerContactFields) -> dict:
         return dict(self._call("contact_update", {"id": contact_id, **_contact_body(None, fields)}))
 
     def _campaign_id(self, name: str) -> Any:
@@ -119,7 +136,7 @@ class BatchDialerAdapter:
         self._call("campaign_restore", {"phone": phone})
 
 
-def _contact_body(phone: Optional[str], fields: AircallContactFields) -> dict:
+def _contact_body(phone: Optional[str], fields: DialerContactFields) -> dict:
     """Field names follow BatchDialer's contact shape; confirmed by the first write test."""
     body = {"firstName": fields.first_name or "", "lastName": fields.last_name or "",
             "company": fields.company_name or "", "notes": fields.information or "",

@@ -1,8 +1,8 @@
-"""Load gated pool records into the Aircall dialer.
+"""Load gated pool records into the dialer dialer.
 
 Pipeline (spec §3): list-build compliance filter (phone, Georgia stop,
 suppression, Tracerfy DNC) -> per-borrower Backflip conflict check ->
-Aircall contact upsert -> lending.dialer_load_records.
+dialer contact upsert -> lending.dialer_load_records.
 
 Blocks apply per phone, not per record: every record sharing a phone with a
 blocked record is blocked too, because the same person would be dialled.
@@ -11,8 +11,8 @@ Open client decisions are never defaulted. A live load refuses to run while a
 loadable pool has no campaign tag, or while a phone would load for more than
 one record; the dry run reports both.
 
-Dry run: nothing is sent to Aircall or Tracerfy, and the caller rolls back.
-Live: records reach Aircall one at a time (paced by the client) and their
+Dry run: nothing is sent to dialer or Tracerfy, and the caller rolls back.
+Live: records reach dialer one at a time (paced by the client) and their
 load rows are committed in chunks, so a stop part-way leaves every loaded
 contact tracked; a re-run updates contacts instead of duplicating them.
 """
@@ -33,14 +33,8 @@ from src.lending.backflip_conflict import (
     load_backflip_identifier_index,
 )
 from src.lending.compliance import GateResult, Scrubber, filter_loadable, phone_hash
-from src.lending.dialer_port import DialerRequestError
-from src.lending.dialer_contact import DialerDisplay, aircall_fields, display_from_record
-from src.services.aircall_client import (
-    AircallAmbiguousContact,
-    AircallContactFields,
-    AircallRequestError,
-    ContactUpsertResult,
-)
+from src.lending.dialer_contact import DialerDisplay, dialer_fields, display_from_record
+from src.lending.dialer_port import ContactUpsertResult, DialerContactFields, DialerRequestError
 from src.services.phone_utils import normalize as normalize_phone
 
 logger = logging.getLogger(__name__)
@@ -52,9 +46,9 @@ REASON_NEEDS_SCRUB = "NEEDS_SCRUB"
 
 
 class DialerContacts(Protocol):
-    def upsert_contact(self, phone: str, fields: AircallContactFields, *,
+    def upsert_contact(self, phone: str, fields: DialerContactFields, *,
                        campaign: Optional[str] = None) -> ContactUpsertResult: ...
-    def update_contact(self, contact_id: int, fields: AircallContactFields) -> dict: ...
+    def update_contact(self, contact_id: int, fields: DialerContactFields) -> dict: ...
 
 
 class LoadRefused(RuntimeError):
@@ -189,17 +183,17 @@ def _count_active_not_in(db, phones: list[str]) -> int:
     ).scalar_one()
 
 
-def _push_contact(aircall: DialerContacts, item: _Loadable, known_contact_id: Optional[int],
-                  fields: AircallContactFields) -> ContactUpsertResult:
+def _push_contact(dialer: DialerContacts, item: _Loadable, known_contact_id: Optional[int],
+                  fields: DialerContactFields) -> ContactUpsertResult:
     """Update by the stored contact id when known (search can lag); else upsert by phone."""
     if known_contact_id is not None:
         try:
-            aircall.update_contact(known_contact_id, fields)
+            dialer.update_contact(known_contact_id, fields)
             return ContactUpsertResult(contact_id=known_contact_id, created=False)
-        except (AircallRequestError, DialerRequestError) as exc:
+        except DialerRequestError as exc:
             if exc.status != 404:
                 raise
-    return aircall.upsert_contact(item.phone, fields, campaign=item.display.campaign_tag)
+    return dialer.upsert_contact(item.phone, fields, campaign=item.display.campaign_tag)
 
 
 def _store_chunk(db, run_id: str, loaded: list[tuple[_Loadable, int]],
@@ -250,19 +244,19 @@ def run_dialer_load(
     run_id: str,
     dry_run: bool,
     scrubber: Optional[Scrubber] = None,
-    aircall: Optional[DialerContacts] = None,
+    dialer: Optional[DialerContacts] = None,
     campaign_tags: Mapping[str, str] = POOL_CAMPAIGN_TAGS,
     commit: Optional[Callable[[], None]] = None,
 ) -> LoadReport:
-    """Gate every record, then (live only) load the survivors into Aircall.
+    """Gate every record, then (live only) load the survivors into dialer.
 
-    Dry run never calls Aircall or Tracerfy and never commits; roll ``db``
-    back afterwards. Live requires ``scrubber`` and ``aircall`` and commits
+    Dry run never calls dialer or Tracerfy and never commits; roll ``db``
+    back afterwards. Live requires ``scrubber`` and ``dialer`` and commits
     through ``commit`` (default ``db.commit``) after each chunk of loads.
     """
     report = LoadReport(run_id=run_id, dry_run=dry_run, total=len(records))
-    if not dry_run and (scrubber is None or aircall is None):
-        raise ValueError("a live load needs a scrubber and an Aircall client")
+    if not dry_run and (scrubber is None or dialer is None):
+        raise ValueError("a live load needs a scrubber and a dialer")
     phones = [normalize_phone(r.get("normalized_phone") or r.get("phone") or "") for r in records]
 
     gate_results = filter_loadable(
@@ -330,10 +324,10 @@ def run_dialer_load(
     active = _active_rows(db, loadable_phones)
     chunk: list[tuple[_Loadable, int]] = []
     for item in loadable:
-        fields = aircall_fields(item.display, email=item.record.get("email"))
+        fields = dialer_fields(item.display, email=item.record.get("email"))
         try:
-            result = _push_contact(aircall, item, active.get(item.phone, (None, None))[1], fields)
-        except (AircallRequestError, AircallAmbiguousContact, DialerRequestError) as exc:
+            result = _push_contact(dialer, item, active.get(item.phone, (None, None))[1], fields)
+        except DialerRequestError as exc:
             report.failed.append({"record_ref": item.record_ref, "error": type(exc).__name__,
                                   "status": getattr(exc, "status", None)})
             continue

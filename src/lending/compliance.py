@@ -52,8 +52,8 @@ from src.utils.logger import get_logger
 logger = get_logger(__name__)
 
 Scrubber = Callable[[list[str]], list[dict]]
-DialerRemover = Callable[..., None]  # remover(phone, *, reason: str) — Developer 3's aircall_client
-DialerRestorer = Callable[[str], None]  # restore_contact_to_pool(phone) — Developer 3's aircall_client
+DialerRemover = Callable[..., None]  # remover(phone, *, reason: str) — dialer_port.Dialer.remove
+DialerRestorer = Callable[[str], None]  # restorer(phone) — dialer_port.Dialer.restore
 LoadedPhones = Callable[[object], list[str]]
 
 
@@ -396,7 +396,7 @@ def can_dial_now(
     """Calling window (09:00-19:15 ET and 8-20 recipient local, narrowed by the
     seat's shift group), then the rolling attempt cap.
 
-    Attempts are outbound rows in lending.call_dispositions (one per Aircall
+    Attempts are outbound rows in lending.call_dispositions (one per dialer
     call.ended, with or without a disposition) — owned by WP-W0-6. A NULL
     direction counts: a missing value must not let a 4th call through.
     """
@@ -459,7 +459,7 @@ def on_attempt_recorded(
 
 
 # ── Dialer enforcement sweep (WP-W0-3) ────────────────────────────────────────
-# Callers dial from the Aircall queue, so the rules must change what is dialable:
+# Callers dial from the dialer queue, so the rules must change what is dialable:
 # a contact leaves the queue outside its calling window or at the attempt cap,
 # and returns when the rule allows it again. Holds record every temporary pull.
 
@@ -482,7 +482,7 @@ def _default_dialer_restorer() -> Optional[DialerRestorer]:
 
 
 def _default_loaded_phones(db) -> list[str]:
-    """Active contacts in the Aircall pool, from Developer 3's load records."""
+    """Active contacts in the dialer, from the load records."""
     if db.execute(text("SELECT to_regclass('lending.dialer_load_records')")).scalar() is None:
         return []
     return [r[0] for r in db.execute(
@@ -591,7 +591,7 @@ def _release_holds(db, held: list[str], now: datetime, dialer_restorer: Optional
 # FA code is not touched (least privilege, Option B):
 #   - Dialer DNC_REQUEST → propagate_opt_out: writes FA's SMS/email stores through
 #     suppress_contact (the spec requires the dialer opt-out to block SMS + email),
-#     then the lending stores and the Aircall pool.
+#     then the lending stores and the dialer pool.
 #   - SMS STOP / email UNSUBSCRIBE → FA's own handlers write FA's stores;
 #     poll_fa_opt_outs picks them up every OPT_OUT_POLL_SECONDS.
 
@@ -619,7 +619,7 @@ POLL_LOCK_KEY = OPT_OUT_POLL_LOCK_KEY
 
 
 def _error_kind(exc: Exception) -> str:
-    """Exception class only: messages from SQL/Tracerfy/Aircall can echo phones."""
+    """Exception class only: messages from SQL/Tracerfy/dialer can echo phones."""
     return type(exc).__name__
 
 
@@ -651,7 +651,7 @@ def propagate_opt_out(
 ) -> Optional[int]:
     """Verbal decline (DNC_REQUEST) entry point. Returns the opt_out_events id. Does not commit.
 
-    Idempotent per ``source_ref`` (Aircall call id): a redelivered event returns the
+    Idempotent per ``source_ref`` (dialer call id): a redelivered event returns the
     existing event id and writes nothing."""
     from src.services.email_suppression import suppress_contact
 
@@ -677,7 +677,7 @@ def propagate_opt_out(
 
 def poll_fa_opt_outs(db, *, dialer_remover: Optional[DialerRemover] = None) -> PollResult:
     """Mirror each FA opt-out row exactly once (keyed on its FA row id, so a raw or
-    padded FA value can never loop), and retry pending Aircall removals.
+    padded FA value can never loop), and retry pending dialer removals.
 
     One cycle at a time across processes (transaction-scoped advisory lock).
     Does not commit."""
@@ -718,7 +718,7 @@ def poll_fa_opt_outs(db, *, dialer_remover: Optional[DialerRemover] = None) -> P
 
 
 def _propagate(db, opt_outs: list[_OptOut], dialer_remover: Optional[DialerRemover]) -> list[int]:
-    """Batch: one statement per lending table, then one Aircall call per phone."""
+    """Batch: one statement per lending table, then one dialer call per phone."""
     event_ids = [
         r[0]
         for r in db.execute(
@@ -801,7 +801,7 @@ def _propagate(db, opt_outs: list[_OptOut], dialer_remover: Optional[DialerRemov
     return event_ids
 
 
-# Developer 3's client raises this until the Aircall removal method (O31) is decided.
+# The dialer adapter raises this while an endpoint is unconfirmed (UnconfirmedCapability).
 # Expected state, not a fault: warn on the first attempt, stay quiet on 15 s retries.
 _UNDECIDED_REMOVAL = "DialerRemovalUndecided"
 
@@ -813,7 +813,7 @@ def _remove_from_dialer(
     *,
     retry: bool = False,
 ) -> dict[str, datetime]:
-    """Removal time per phone Aircall confirmed. Failures stay pending for the next poll."""
+    """Removal time per phone dialer confirmed. Failures stay pending for the next poll."""
     remover = dialer_remover or _default_dialer_remover()
     if remover is None:
         if phones and not retry:
@@ -865,7 +865,7 @@ def _retry_pending_dialer_removals(db, dialer_remover: Optional[DialerRemover]) 
 
 
 def _log_propagation(event_id, channel, received_at, finished_at: Optional[datetime], status) -> None:
-    """``finished_at`` = when the last store (incl. the Aircall pool) was cleared;
+    """``finished_at`` = when the last store (incl. the dialer pool) was cleared;
     None while the dialer removal is still pending, so the SLA is not yet met."""
     if finished_at is None:
         logger.warning(

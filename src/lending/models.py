@@ -131,7 +131,7 @@ class LendingDncScrub(LendingBase):
 
 
 class LendingDialerHold(LendingBase):
-    """A contact lending pulled from the Aircall pool *temporarily* (calling window
+    """A contact lending pulled from the dialer *temporarily* (calling window
     or attempt cap). The sweep restores only open holds, and never a suppressed
     number. Opt-out removals are permanent and never create a hold."""
 

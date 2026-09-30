@@ -76,9 +76,9 @@ def test_rules_code_defaults_use_the_configured_dialer(monkeypatch):
 # ── Loader surface (the dialer load pushes contacts through the same adapter) ──
 
 from src.lending.dialer_port import DialerRequestError
-from src.services.aircall_client import AircallContactFields
+from src.lending.dialer_port import DialerContactFields
 
-FIELDS = AircallContactFields(first_name="Jane", last_name="Roe", company_name="Roe LLC",
+FIELDS = DialerContactFields(first_name="Jane", last_name="Roe", company_name="Roe LLC",
                               information="Property: 1 St", email="j@example.com")
 
 

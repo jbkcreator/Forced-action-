@@ -19,7 +19,7 @@ from src.lending import dialer_load
 from src.lending.backflip_conflict import BackflipIdentifierIndex, hash_phone
 from src.lending.dialer_load import LoadRefused, run_dialer_load
 from src.lending.models import LendingDialerLoadRecord
-from src.services.aircall_client import AircallRequestError, ContactUpsertResult
+from src.lending.dialer_port import ContactUpsertResult, DialerRequestError
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("DATABASE_URL"), reason="requires a live Postgres DATABASE_URL"
@@ -42,14 +42,14 @@ class FakeAircall:
     def upsert_contact(self, phone, fields, *, campaign=None):
         self.campaigns.append(campaign)
         if phone in self._fail:
-            raise AircallRequestError("POST", "/contacts", 500)
+            raise DialerRequestError("POST /contacts", status=500)
         self.upserts.append(phone)
         self._next_id += 1
         return ContactUpsertResult(contact_id=self._next_id, created=True)
 
     def update_contact(self, contact_id, fields):
         if contact_id in self._missing:
-            raise AircallRequestError("POST", f"/contacts/{contact_id}", 404)
+            raise DialerRequestError("POST /contacts/id", status=404)
         self.updates.append(contact_id)
         return {"id": contact_id}
 
@@ -88,7 +88,7 @@ def _run(db, records, *, index=EMPTY_INDEX, dry_run=False, aircall=None, tags=TA
         report = run_dialer_load(
             records, db, run_id=run_id, dry_run=dry_run,
             scrubber=None if dry_run else (lambda phones: []),
-            aircall=None if dry_run else aircall,
+            dialer=None if dry_run else aircall,
             campaign_tags=tags, commit=db.flush,
         )
     return report, aircall
@@ -192,7 +192,7 @@ class TestLiveLoad:
         _fresh_scrub(db, P1, P2)
         report, _ = _run(db, [_record("a", P1), _record("b", P2)], aircall=FakeAircall(fail_phones={P1}))
         assert report.loaded == 1
-        assert report.failed == [{"record_ref": "a", "error": "AircallRequestError", "status": 500}]
+        assert report.failed == [{"record_ref": "a", "error": "DialerRequestError", "status": 500}]
         assert [r.phone for r in _load_rows(db)] == [P2]
 
     def test_live_load_needs_scrubber_and_aircall(self, db):
@@ -240,7 +240,7 @@ def test_live_load_sends_each_contact_to_its_pool_campaign(db):
     dialer = FakeAircall()
     with patch.object(dialer_load, "load_backflip_identifier_index", return_value=EMPTY_INDEX):
         run_dialer_load([_record("c1", P1, pool="builders")], db, run_id="t-campaign", dry_run=False,
-                        scrubber=lambda phones: [], aircall=dialer, campaign_tags=TAGS, commit=db.flush)
+                        scrubber=lambda phones: [], dialer=dialer, campaign_tags=TAGS, commit=db.flush)
     assert dialer.campaigns == ["DESK_CONSTRUCTION"]
 
 

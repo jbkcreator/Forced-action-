@@ -6,7 +6,7 @@ from decimal import Decimal
 from src.lending.dialer_contact import (
     INFORMATION_MAX_CHARS,
     NOT_AVAILABLE,
-    aircall_fields,
+    dialer_fields,
     display_from_record,
 )
 
@@ -20,7 +20,7 @@ RECORD = {
 
 
 def test_full_record_maps_to_every_display_field():
-    fields = aircall_fields(display_from_record(RECORD, "DESK_CONSTRUCTION"), email="John@Smith.com")
+    fields = dialer_fields(display_from_record(RECORD, "DESK_CONSTRUCTION"), email="John@Smith.com")
     assert fields.first_name == "John"
     assert fields.last_name == "Smith"
     assert fields.company_name == "SMITH HOLDINGS LLC"
@@ -34,18 +34,18 @@ def test_full_record_maps_to_every_display_field():
 
 
 def test_missing_values_are_shown_as_not_available():
-    fields = aircall_fields(display_from_record({}, None))
+    fields = dialer_fields(display_from_record({}, None))
     assert fields.first_name is None and fields.last_name is None and fields.company_name is None
     assert all(line.endswith(NOT_AVAILABLE) for line in fields.information.splitlines())
 
 
 def test_single_word_name_is_kept_as_first_name():
-    fields = aircall_fields(display_from_record({"borrower_name": "Madonna"}, None))
+    fields = dialer_fields(display_from_record({"borrower_name": "Madonna"}, None))
     assert (fields.first_name, fields.last_name) == ("Madonna", None)
 
 
 def test_multi_word_first_name_keeps_last_word_as_last_name():
-    fields = aircall_fields(display_from_record({"borrower_name": "Mary Ann van Dyke"}, None))
+    fields = dialer_fields(display_from_record({"borrower_name": "Mary Ann van Dyke"}, None))
     assert (fields.first_name, fields.last_name) == ("Mary Ann van", "Dyke")
 
 
@@ -57,10 +57,10 @@ def test_loan_value_parsing():
 
 
 def test_invalid_email_is_dropped():
-    assert aircall_fields(display_from_record(RECORD, None), email="not-an-email").email is None
+    assert dialer_fields(display_from_record(RECORD, None), email="not-an-email").email is None
 
 
 def test_information_is_bounded():
     long_record = {**RECORD, "recent_permit_details": "x" * 5000}
-    information = aircall_fields(display_from_record(long_record, None)).information
+    information = dialer_fields(display_from_record(long_record, None)).information
     assert len(information) == INFORMATION_MAX_CHARS
