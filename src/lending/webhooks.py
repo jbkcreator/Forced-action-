@@ -6,6 +6,9 @@ run after the reply, so the compliance hooks never wait on Google or Slack.
 
 A real failure returns 5xx so the dialer redelivers the event; every step is
 idempotent, so redelivery is safe. Ignored events always return 200.
+
+Unlike the CDR poller (src/lending/cdr_poll.py), which ignores inbound calls except DNC
+requests, this route applies no inbound filter. It is not the live ingestion path.
 """
 from __future__ import annotations
 

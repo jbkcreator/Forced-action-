@@ -877,7 +877,7 @@ class AppSettings(BaseSettings):
 	lending_db_password: Optional[SecretStr] = Field(default=None, env="LENDING_DB_PASSWORD")
 	lending_dialer_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_DIALER_WEBHOOK_SECRET")
 	lending_dialer_campaign_ids: str = Field(default="", env="LENDING_DIALER_CAMPAIGN_IDS")  # comma-separated; empty ignores every event
-	lending_seat_groups: str = Field(default="", env="LENDING_SEAT_GROUPS")  # "userid:A,userid:B" -> shift group per seat
+	lending_seat_groups: str = Field(default="", env="LENDING_SEAT_GROUPS")  # "agentid:A,agentid:B" (BatchDialer agent id) -> shift group per seat
 	lending_disposition_missing_alert_minutes: int = Field(default=10, env="LENDING_DISPOSITION_MISSING_ALERT_MINUTES")
 	lending_slack_bot_token: Optional[SecretStr] = Field(default=None, env="LENDING_SLACK_BOT_TOKEN")
 	lending_dial_tasks_channel: str = Field(default="", env="LENDING_DIAL_TASKS_CHANNEL")

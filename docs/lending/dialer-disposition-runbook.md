@@ -29,6 +29,15 @@ CDR, and how a contact is held. Confirm them before go-live.
 3. Start `fa-lending-cdr-poller` (`deploy/systemd/fa-lending-cdr-poller.service`). Run **exactly one
    instance**: the `/v2/cdrs/last` watermark is per API key, so a second poller (or anything else using
    that endpoint with the same key) steals records. `lending-api` and its Nginx block are not needed for ingestion.
+   Poller behavior to know:
+   - Inbound calls are ignored, except calls disposed `DNC_REQUEST` (those are opted out; no attempt is counted).
+   - The day rescan re-reads today and yesterday (UTC) every few minutes. After an outage longer than that,
+     run `python -m src.lending.cdr_poller --backfill-days N` (rescans N days, then continues; with `--once` it
+     rescans and exits). DNC rows whose opt-out failed are retried every cycle regardless of the window.
+   - `--once` also advances the `/v2/cdrs/last` watermark for the API key, so it can consume calls that only
+     the running poller's rescan will then recover. Prefer stopping the service first.
+   - UNVERIFIED (Task 0, needs a live account check): the pagination parameter name `next_page` and the CDR
+     status strings (`ANSWER` etc. in `CDR_ANSWERED_STATUSES`).
 4. Install the crontab (delivery retry and missing-disposition alert, both every 5 minutes).
 
 ## 2. What the dialer admin configures in the app (BatchDialer: Akrash)
