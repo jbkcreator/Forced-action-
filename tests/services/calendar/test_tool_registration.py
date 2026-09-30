@@ -111,15 +111,23 @@ class TestWrapperConversion:
         start = datetime.fromisoformat(window_start).replace(
             hour=14, minute=0, second=0, microsecond=0
         )
-        with patch(
-            "src.agents.fa_max.tool_registry.check_suppression",
-            return_value={"suppressed": True, "reason": "opted_out"},
+        with (
+            patch(
+                "src.agents.fa_max.tool_registry.check_suppression",
+                return_value={"suppressed": True, "reason": "opted_out"},
+            ),
+            patch(
+                "src.services.calendar.gate.get_passed_gate_by_id",
+                return_value={"gate_id": "test_gate", "list_key": None, "result": "pass"},
+            ),
+            patch("src.services.calendar.gate.enforce_daily_cap", return_value=True),
         ):
             result = get_fa_max_tool("calendar.book").func(
                 starts_at=start.isoformat(),
                 ends_at=(start + timedelta(minutes=30)).isoformat(),
                 attendee_email="borrower@example.invalid",
                 topic="Intro call",
+                gate_id="test_gate",
                 calendar_id=CALENDAR_ID,
                 session=None,
             )

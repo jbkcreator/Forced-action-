@@ -1,0 +1,277 @@
+"""
+WP-GL-5: Booking gate evaluation and enforcement.
+
+The gate is filled by a caller (internal form), not the borrower. A booking
+can only proceed once the most-recent gate row for the tracked_link has
+result='pass' and the list_key is not currently blocked.
+
+Financial terms must never appear in gate answers — all fields are stored as
+short enum codes (e.g. "cash", "loc"), not free text. This keeps gate data
+clear of both the relay payload CHECK constraint and the voice-intake
+_FINANCIAL_TERMS regex. See config/booking_gate.py for vocabularies.
+
+OPEN DEPENDENCY: BLOCKED_LIST_KEYS in config/booking_gate.py is empty until
+the brief's List 2 / List 4 numbering is mapped to actual pool names.
+"""
+from __future__ import annotations
+
+import logging
+import secrets
+from dataclasses import dataclass
+from datetime import date, timedelta, timezone
+from typing import Any, Optional
+
+from sqlalchemy import text as sa_text
+
+from config.booking_gate import (
+    BLOCKED_LIST_KEYS,
+    CALENDAR_DAILY_CAP,
+    COMPLETED_PROJECTS,
+    DAILY_CAP_ADVISORY_KEY,
+    DECISION_MAKER_KILL_VALUES,
+    DECISION_MAKER_VALUES,
+    EXIT_STRATEGIES,
+    GATE_LIST_UNBLOCK_DATE,
+    GATE_RULES_VERSION,
+    LIQUIDITY_KILL_VALUES,
+    LIQUIDITY_SOURCES,
+    OCCUPANCY_KILL_VALUES,
+    OCCUPANCY_TYPES,
+)
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class GateAnswers:
+    """Typed, code-only representation of a caller's gate form answers."""
+
+    liquidity_source: str
+    completed_projects: str
+    exit_strategy: str
+    occupancy: str
+    decision_maker: str
+    property_address: str
+
+
+@dataclass(frozen=True)
+class GateResult:
+    passed: bool
+    failed_field: Optional[str]
+    reason: Optional[str]
+
+
+def evaluate_gate(answers: GateAnswers) -> GateResult:
+    """Pure evaluation — no DB. Returns pass/fail + first failing field.
+
+    Kill conditions (from brief):
+      - liquidity_source in LIQUIDITY_KILL_VALUES ("none")
+      - occupancy in OCCUPANCY_KILL_VALUES ("homestead")
+      - decision_maker in DECISION_MAKER_KILL_VALUES ("no")
+      - property_address blank
+    Unknown codes fail validation with field='<fieldname>_invalid_code'.
+    """
+    if answers.liquidity_source not in LIQUIDITY_SOURCES:
+        return GateResult(passed=False, failed_field="liquidity_source", reason="invalid_code")
+    if answers.liquidity_source in LIQUIDITY_KILL_VALUES:
+        return GateResult(passed=False, failed_field="liquidity_source", reason="no_liquidity")
+
+    if answers.completed_projects not in COMPLETED_PROJECTS:
+        return GateResult(passed=False, failed_field="completed_projects", reason="invalid_code")
+
+    if answers.exit_strategy not in EXIT_STRATEGIES:
+        return GateResult(passed=False, failed_field="exit_strategy", reason="invalid_code")
+
+    if answers.occupancy not in OCCUPANCY_TYPES:
+        return GateResult(passed=False, failed_field="occupancy", reason="invalid_code")
+    if answers.occupancy in OCCUPANCY_KILL_VALUES:
+        return GateResult(passed=False, failed_field="occupancy", reason="homestead")
+
+    if answers.decision_maker not in DECISION_MAKER_VALUES:
+        return GateResult(passed=False, failed_field="decision_maker", reason="invalid_code")
+    if answers.decision_maker in DECISION_MAKER_KILL_VALUES:
+        return GateResult(passed=False, failed_field="decision_maker", reason="not_decision_maker")
+
+    if not answers.property_address or not answers.property_address.strip():
+        return GateResult(passed=False, failed_field="property_address", reason="missing_address")
+
+    return GateResult(passed=True, failed_field=None, reason=None)
+
+
+def store_gate(
+    session,
+    *,
+    answers: GateAnswers,
+    tracked_link_id: Optional[int] = None,
+    person_id: Optional[int] = None,
+    list_key: Optional[str] = None,
+    captured_by: Optional[str] = None,
+) -> tuple[str, "GateResult"]:
+    """Evaluate and durably store a gate attempt. Returns (gate_id, result).
+
+    Always writes a row regardless of pass/fail so the caller-bonus
+    calculation has a complete audit trail.
+    """
+    result = evaluate_gate(answers)
+    gate_id = secrets.token_urlsafe(16)
+
+    # Store codes only — property_address is the one free-text field but it
+    # is stored in answers JSONB on the gate table only, never in relay payload.
+    answers_dict = {
+        "liquidity_source": answers.liquidity_source,
+        "completed_projects": answers.completed_projects,
+        "exit_strategy": answers.exit_strategy,
+        "occupancy": answers.occupancy,
+        "decision_maker": answers.decision_maker,
+        "property_address": answers.property_address,
+    }
+
+    import json
+
+    session.execute(
+        sa_text(
+            """
+            INSERT INTO fa_max_booking_gates
+                (gate_id, tracked_link_id, person_id, answers, result,
+                 failed_field, list_key, rules_version, captured_by, evaluated_at)
+            VALUES
+                (:gate_id, :tracked_link_id, :person_id, :answers::jsonb, :result,
+                 :failed_field, :list_key, :rules_version, :captured_by, NOW())
+            """
+        ),
+        {
+            "gate_id": gate_id,
+            "tracked_link_id": tracked_link_id,
+            "person_id": person_id,
+            "answers": json.dumps(answers_dict),
+            "result": "pass" if result.passed else "fail",
+            "failed_field": result.failed_field,
+            "list_key": list_key,
+            "rules_version": GATE_RULES_VERSION,
+            "captured_by": captured_by,
+        },
+    )
+    session.commit()
+
+    logger.info(
+        "gate.store: gate_id=%s tracked_link_id=%s result=%s failed_field=%s",
+        gate_id, tracked_link_id, "pass" if result.passed else "fail", result.failed_field,
+    )
+
+    if not result.passed:
+        from src.services.calendar.nurture import enqueue_nurture
+
+        enqueue_nurture(
+            session,
+            gate_id=gate_id,
+            tracked_link_id=tracked_link_id,
+            person_id=person_id,
+            failed_field=result.failed_field,
+            fail_reason=result.reason,
+            list_key=list_key,
+        )
+
+    return gate_id, result
+
+
+def get_passed_gate_for_link(session, tracked_link_id: int) -> Optional[str]:
+    """Return the gate_id of the most-recent passing gate for a tracked link.
+
+    Also enforces the list-block: a passed gate whose list_key is currently
+    blocked (BLOCKED_LIST_KEYS, not yet unblocked by GATE_LIST_UNBLOCK_DATE)
+    is treated as no valid gate.
+
+    Returns gate_id or None.
+    """
+    row = session.execute(
+        sa_text(
+            """
+            SELECT gate_id, list_key
+            FROM fa_max_booking_gates
+            WHERE tracked_link_id = :link_id
+              AND result = 'pass'
+            ORDER BY evaluated_at DESC
+            LIMIT 1
+            """
+        ),
+        {"link_id": tracked_link_id},
+    ).mappings().first()
+
+    if row is None:
+        return None
+
+    if _is_list_blocked(row["list_key"]):
+        logger.info(
+            "gate: tracked_link_id=%s blocked — list_key=%s blocked until %s",
+            tracked_link_id, row["list_key"], GATE_LIST_UNBLOCK_DATE,
+        )
+        return None
+
+    return row["gate_id"]
+
+
+def get_passed_gate_by_id(session, gate_id: str) -> Optional[Any]:
+    """Return the gate row if gate_id exists and passed. None otherwise."""
+    row = session.execute(
+        sa_text(
+            "SELECT gate_id, list_key, result "
+            "FROM fa_max_booking_gates WHERE gate_id = :gate_id"
+        ),
+        {"gate_id": gate_id},
+    ).mappings().first()
+
+    if row is None or row["result"] != "pass":
+        return None
+
+    if _is_list_blocked(row["list_key"]):
+        return None
+
+    return row
+
+
+def _is_list_blocked(list_key: Optional[str]) -> bool:
+    """True if this list_key is blocked and the unblock date has not passed."""
+    if not list_key or list_key not in BLOCKED_LIST_KEYS:
+        return False
+    return date.today() < GATE_LIST_UNBLOCK_DATE
+
+
+def enforce_daily_cap(session) -> bool:
+    """Returns True if there is still capacity for another booking today.
+
+    Uses pg_advisory_xact_lock so concurrent requests serialize rather than
+    racing. Counts 'pending' and 'confirmed' bookings only — cancelled slots
+    free their slot for the day.
+
+    Must be called inside a transaction that is committed before book() is
+    called, or the lock is held across the provider round-trip.
+    """
+    session.execute(
+        sa_text("SELECT pg_advisory_xact_lock(:key)"),
+        {"key": DAILY_CAP_ADVISORY_KEY},
+    )
+
+    today_start = _today_utc_start()
+    tomorrow_start = today_start + timedelta(days=1)
+    count_row = session.execute(
+        sa_text(
+            """
+            SELECT COUNT(*) AS n
+            FROM fa_max_bookings
+            WHERE starts_at >= :today
+              AND starts_at < :tomorrow
+              AND status IN ('pending', 'confirmed')
+            """
+        ),
+        {"today": today_start, "tomorrow": tomorrow_start},
+    ).mappings().first()
+
+    held = count_row["n"] if count_row else 0
+    return held < CALENDAR_DAILY_CAP
+
+
+def _today_utc_start():
+    from datetime import datetime
+
+    today = date.today()
+    return datetime(today.year, today.month, today.day, tzinfo=timezone.utc)

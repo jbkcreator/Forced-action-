@@ -32,6 +32,7 @@ from src.api.public_page import BRAND_MARKUP, escape_html, render_page
 from src.core.redis_client import rincr
 from src.services.calendar import book, get_slots, has_live_booking
 from src.services.calendar.client import get_calendar_client, get_calendar_id
+from src.services.calendar.gate import get_passed_gate_for_link
 from src.services.tracked_links import record_click, resolve_slug
 
 logger = logging.getLogger(__name__)
@@ -107,6 +108,15 @@ def booking_page(slug: str, request: Request, db: Session = Depends(get_db)):
         return _notice(
             "You already have a call booked with us. Check your inbox for the "
             "invitation, or reply to the email if you need to move it."
+        )
+
+    # WP-GL-5: booking page requires a caller-completed gate. If none exists
+    # for this link, the caller has not yet screened this borrower — refuse.
+    if get_passed_gate_for_link(db, link.id) is None:
+        logger.info("booking: gate not passed for slug=%r link_id=%s", slug, link.id)
+        return _notice(
+            "This booking link isn't ready yet. If you just scheduled a call, "
+            "please reply to the email and we'll get it sorted."
         )
 
     try:
@@ -295,6 +305,13 @@ def submit_booking(
         logger.info("booking: refused second booking for slug=%r", slug)
         return {"booked": False, "reason": "already_booked"}
 
+    # WP-GL-5: re-check gate at write time (caller could submit the form,
+    # then the gate row could be invalidated before the borrower clicks).
+    gate_id = get_passed_gate_for_link(db, link.id)
+    if gate_id is None:
+        logger.info("booking: gate not passed at write time for slug=%r link_id=%s", slug, link.id)
+        return {"booked": False, "reason": "gate_not_passed"}
+
     try:
         slot = _requested_slot(payload)
     except ValueError:
@@ -309,6 +326,7 @@ def submit_booking(
         topic=MEETING_TOPIC,
         description=f"Booked by {payload.name} via the Forced Action booking page.",
         tracked_link_id=link.id,
+        gate_id=gate_id,
     )
 
     if not result.booked:
