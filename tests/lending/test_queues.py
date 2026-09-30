@@ -90,3 +90,23 @@ def test_count_report_walks_raw_to_eligible_per_queue(db, monkeypatch):
     assert (t["raw"], t["traced"], t["eligible"]) == (1, 0, 0)   # invalid phone -> not traced
     assert report["queues"][q.NURTURE]["raw"] == 1
     assert report["tracerfy_balance"] == 7313
+    assert (b["scrubbed"], b["after_backflip"]) == (2, 2)   # both builder numbers pass DNC and Backflip
+    assert (t["scrubbed"], t["after_backflip"]) == (0, 0)
+
+
+def test_stage_counts_split_scrub_blocks_from_backflip_blocks():
+    from src.lending.queues import stage_counts
+    counts = stage_counts(traced=10, excluded_by_reason={
+        "NATIONAL_DNC": 3, "LITIGATOR": 1, "INVALID_PHONE": 2, "BACKFLIP_CONFLICT": 2, "BACKFLIP_FEED_STALE": 1})
+    assert counts == {"scrubbed": 6, "after_backflip": 3}
+
+
+@pytestmark_db
+def test_tracerfy_hit_rate_comes_from_the_usage_ledger(db):
+    from src.lending.queues import tracerfy_hit_rate
+    for ok in (True, True, False, True):
+        db.execute(text("INSERT INTO enrichment_usage_logs (vendor, purpose, success, cost_cents, target_address, "
+                        "created_at, quality_discounted) VALUES ('tracerfy', 'skip_trace', :s, 0, 'hit-rate-test', "
+                        "now() + interval '100 years', false)"), {"s": ok})
+    rate = tracerfy_hit_rate(db, since=__import__("datetime").datetime(2126, 1, 1, tzinfo=__import__("datetime").timezone.utc))
+    assert rate == 0.75

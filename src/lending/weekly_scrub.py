@@ -19,6 +19,8 @@ from typing import Optional
 
 from sqlalchemy import text
 
+from src.services.phone_utils import normalize as normalize_phone
+
 from config.lending_compliance import DNC_SCRUB_MAX_AGE_DAYS, RemovalReason
 from src.lending.compliance import (
     DialerRemover,
@@ -36,6 +38,7 @@ from src.lending.compliance import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_BATCH_SIZE = 500
+EXIT_CAP_REACHED = 4
 
 
 @dataclass
@@ -48,9 +51,10 @@ class WeeklyScrubResult:
 
 def stale_loaded_phones(db, *, now: Optional[datetime] = None) -> list[str]:
     now = now or datetime.now(timezone.utc)
-    loaded = [r[0] for r in db.execute(text(
-        "SELECT DISTINCT phone FROM lending.dialer_load_records WHERE active AND phone IS NOT NULL ORDER BY phone"
-    )).fetchall()]
+    raw = db.execute(text(
+        "SELECT DISTINCT phone FROM lending.dialer_load_records WHERE active AND phone IS NOT NULL"
+    )).scalars().all()
+    loaded = sorted({p for p in (normalize_phone(r) for r in raw) if p})
     if not loaded:
         return []
     cutoff = now - timedelta(days=DNC_SCRUB_MAX_AGE_DAYS)
@@ -59,6 +63,9 @@ def stale_loaded_phones(db, *, now: Optional[datetime] = None) -> list[str]:
 
 
 def _close_load_rows(db, phones: list[str]) -> None:
+    phones = sorted({p for p in (normalize_phone(x) for x in phones) if p})
+    if not phones:
+        return
     db.execute(
         text(
             "UPDATE lending.dialer_load_records SET active = false, deactivated_at = now(), "
@@ -125,7 +132,7 @@ def main(argv: list[str] | None = None) -> int:
         result = weekly_scrub(session, scrubber=tracerfy_scrub, max_credits=args.max_credits,
                               batch_size=args.batch_size)
         session.commit()
-    return 4 if result.aborted else 0
+    return EXIT_CAP_REACHED if result.aborted else 0
 
 
 if __name__ == "__main__":

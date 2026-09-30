@@ -16,7 +16,7 @@ from pathlib import Path
 
 from src.core.database import get_db_context
 from src.lending.pool_source import staged_pool_records
-from src.lending.queues import queue_count_report
+from src.lending.queues import queue_count_report, tracerfy_hit_rate
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +42,8 @@ def main(argv: list[str] | None = None) -> int:
 
         balance = get_tracerfy_balance().get("balance")
     with get_db_context() as session:
-        report = queue_count_report(records, session, tracerfy_balance=balance)
+        report = queue_count_report(records, session, tracerfy_balance=balance,
+                                    tracerfy_hit_rate=tracerfy_hit_rate(session))
         session.rollback()
     logger.info("[queue-report] %s", json.dumps(report, indent=2))
     return 0

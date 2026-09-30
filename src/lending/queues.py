@@ -1,13 +1,41 @@
 """Assign pool records to launch queues and report the funnel per queue (Go Live G14/G16)."""
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Optional, Sequence
+
+from sqlalchemy import text
 
 from config.lending_queues import NURTURE, NURTURE_ONLY_TAGS, SOURCE_TAG_QUEUES
 from src.lending.dialer_load import run_dialer_load
 from src.services.phone_utils import normalize as normalize_phone
 
 REPORT_RUN_ID = "queue-count-report"
+HIT_RATE_WINDOW_DAYS = 30
+
+# Exclusions made at the scrub stage vs at the Backflip conflict check.
+_SCRUB_REASONS = frozenset({
+    "NATIONAL_DNC", "STATE_DNC", "LITIGATOR", "SUPPRESSED", "NO_FRESH_SCRUB",
+    "SCRUB_FAILED", "NEEDS_SCRUB", "GA_NATURAL_PERSON",
+})
+
+
+def stage_counts(*, traced: int, excluded_by_reason: Mapping[str, int]) -> dict[str, int]:
+    """Numbers left after the scrub stage and after the Backflip check."""
+    scrubbed = traced - sum(n for r, n in excluded_by_reason.items() if r in _SCRUB_REASONS)
+    backflip = sum(n for r, n in excluded_by_reason.items() if r.startswith("BACKFLIP_"))
+    return {"scrubbed": scrubbed, "after_backflip": scrubbed - backflip}
+
+
+def tracerfy_hit_rate(db, *, since: Optional[datetime] = None) -> Optional[float]:
+    """Share of Tracerfy lookups that found a contact, from enrichment_usage_logs."""
+    since = since or datetime.now(timezone.utc) - timedelta(days=HIT_RATE_WINDOW_DAYS)
+    total, hits = db.execute(
+        text("SELECT count(*), count(*) FILTER (WHERE success) FROM enrichment_usage_logs "
+             "WHERE vendor = 'tracerfy' AND created_at >= :since"),
+        {"since": since},
+    ).one()
+    return round(hits / total, 4) if total else None
 
 
 def assign_queue(record: Mapping[str, Any]) -> dict[str, Any]:
@@ -43,9 +71,11 @@ def queue_count_report(
     queues: dict[str, dict[str, Any]] = {}
     for queue, rows in by_queue.items():
         report = run_dialer_load(rows, db, run_id=REPORT_RUN_ID, dry_run=True)
+        traced = sum(1 for r in rows if normalize_phone(r.get("normalized_phone") or r.get("phone") or ""))
         queues[queue] = {
             "raw": len(rows),
-            "traced": sum(1 for r in rows if normalize_phone(r.get("normalized_phone") or r.get("phone") or "")),
+            "traced": traced,
+            **stage_counts(traced=traced, excluded_by_reason=report.excluded_by_reason),
             "needs_scrub": report.excluded_by_reason.get("NEEDS_SCRUB", 0),
             "excluded_by_reason": dict(report.excluded_by_reason),
             "eligible": report.distinct_phones,

@@ -114,3 +114,12 @@ def test_dry_run_reports_the_count_and_spends_nothing(monkeypatch, caplog):
     caplog.set_level("INFO")
     assert ws.main(["--dry-run"]) == 0
     assert "3 number(s) would be scrubbed" in caplog.text
+
+
+def test_loaded_phones_are_normalized_on_read_and_write(db):
+    from src.lending.weekly_scrub import _close_load_rows, stale_loaded_phones
+    _load(db, "(813) 555-8406")
+    assert "+18135558406" in stale_loaded_phones(db, now=NOW)
+    _load(db, "+18135558407")
+    _close_load_rows(db, ["813-555-8407"])
+    assert db.execute(text("SELECT active FROM lending.dialer_load_records WHERE phone = '+18135558407'")).scalar() is False
