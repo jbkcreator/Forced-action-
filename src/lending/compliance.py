@@ -502,6 +502,22 @@ def _attempt_counts(db, phones: list[str], now: datetime) -> dict[str, int]:
     return {r[0]: r[1] for r in rows}
 
 
+def dial_blocks(db, phones: list[str], *, now: Optional[datetime] = None) -> dict[str, ReasonCode]:
+    """``can_dial_now`` for many phones in one query: phone -> reason for each one that
+    cannot be dialed now (attempt cap first, then the calling window)."""
+    if not phones:
+        return {}
+    now = now or datetime.now(timezone.utc)
+    counts = _attempt_counts(db, phones, now)
+    blocks: dict[str, ReasonCode] = {}
+    for phone in phones:
+        if counts.get(phone, 0) >= MAX_ATTEMPTS_PER_PERIOD:
+            blocks[phone] = ReasonCode.ATTEMPT_CAP_REACHED
+        elif _outside_call_window(phone, now):
+            blocks[phone] = ReasonCode.OUTSIDE_CALL_WINDOW
+    return blocks
+
+
 def _hold_reason(phone: str, attempts: int, now: datetime) -> Optional[RemovalReason]:
     if attempts >= MAX_ATTEMPTS_PER_PERIOD:
         return RemovalReason.ATTEMPT_CAP

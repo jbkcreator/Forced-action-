@@ -82,14 +82,18 @@ def _record(ref, phone, pool="builders", **extra):
             "parcel_id": f"PARCEL-{ref}", "estimated_loan_value": "100000", **extra}
 
 
-def _run(db, records, *, index=EMPTY_INDEX, dry_run=False, aircall=None, tags=TAGS, run_id="run-1"):
+# 12:00 ET: inside the calling window, so the call-time rail never interferes by accident.
+NOON_ET = __import__("datetime").datetime(2026, 9, 29, 16, 0, tzinfo=__import__("datetime").timezone.utc)
+
+
+def _run(db, records, *, index=EMPTY_INDEX, dry_run=False, aircall=None, tags=TAGS, run_id="run-1", now=NOON_ET):
     aircall = aircall if aircall is not None else FakeAircall()
     with patch.object(dialer_load, "load_backflip_identifier_index", return_value=index):
         report = run_dialer_load(
             records, db, run_id=run_id, dry_run=dry_run,
             scrubber=None if dry_run else (lambda phones: []),
             dialer=None if dry_run else aircall,
-            campaign_tags=tags, commit=db.flush,
+            campaign_tags=tags, commit=db.flush, now=now,
         )
     return report, aircall
 
@@ -240,7 +244,8 @@ def test_live_load_sends_each_contact_to_its_pool_campaign(db):
     dialer = FakeAircall()
     with patch.object(dialer_load, "load_backflip_identifier_index", return_value=EMPTY_INDEX):
         run_dialer_load([_record("c1", P1, pool="builders")], db, run_id="t-campaign", dry_run=False,
-                        scrubber=lambda phones: [], dialer=dialer, campaign_tags=TAGS, commit=db.flush)
+                        scrubber=lambda phones: [], dialer=dialer, campaign_tags=TAGS, commit=db.flush,
+                        now=NOON_ET)
     assert dialer.campaigns == ["DESK_CONSTRUCTION"]
 
 
@@ -251,3 +256,27 @@ def test_live_task_refuses_without_a_configured_dialer(tmp_path, monkeypatch):
     pools = tmp_path / "pools.json"
     pools.write_text("[]", encoding="utf-8")
     assert task.main(["--input", str(pools), "--live"]) == 3
+
+
+
+def _attempts(db, phone, n, ended_at):
+    for i in range(n):
+        db.execute(text(
+            "INSERT INTO lending.call_dispositions (aircall_call_id, phone, direction, call_ended_at, raw_event) "
+            "VALUES (:c, :p, 'outbound', :t, '{}')"), {"c": f"t-{phone}-{i}-{os.getpid()}", "p": phone, "t": ended_at})
+
+
+class TestCallTimeRail:
+    def test_a_number_at_the_attempt_cap_is_not_loaded(self, db):
+        _fresh_scrub(db, P1, P2)
+        _attempts(db, P1, 3, NOON_ET - __import__("datetime").timedelta(hours=1))
+        report, dialer = _run(db, [_record("a", P1), _record("b", P2)])
+        assert dialer.upserts == [P2]
+        assert report.excluded_by_reason["ATTEMPT_CAP_REACHED"] == 1
+
+    def test_nothing_loads_after_the_7_15pm_eastern_stop(self, db):
+        _fresh_scrub(db, P1)
+        late = __import__("datetime").datetime(2026, 9, 29, 23, 20, tzinfo=__import__("datetime").timezone.utc)
+        report, dialer = _run(db, [_record("a", P1)], now=late)   # 19:20 ET
+        assert dialer.upserts == []
+        assert report.excluded_by_reason["OUTSIDE_CALL_WINDOW"] == 1

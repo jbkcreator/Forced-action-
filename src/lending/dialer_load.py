@@ -22,6 +22,7 @@ import json
 import logging
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
 from sqlalchemy import text
@@ -32,7 +33,7 @@ from src.lending.backflip_conflict import (
     find_borrower_conflicts,
     load_backflip_identifier_index,
 )
-from src.lending.compliance import GateResult, Scrubber, filter_loadable, phone_hash
+from src.lending.compliance import GateResult, Scrubber, dial_blocks, filter_loadable, phone_hash
 from src.lending.dialer_contact import DialerDisplay, dialer_fields, display_from_record
 from src.lending.dialer_port import ContactUpsertResult, DialerContactFields, DialerRequestError
 from src.services.phone_utils import normalize as normalize_phone
@@ -247,6 +248,7 @@ def run_dialer_load(
     dialer: Optional[DialerContacts] = None,
     campaign_tags: Mapping[str, str] = POOL_CAMPAIGN_TAGS,
     commit: Optional[Callable[[], None]] = None,
+    now: Optional[datetime] = None,
 ) -> LoadReport:
     """Gate every record, then (live only) load the survivors into dialer.
 
@@ -272,6 +274,13 @@ def run_dialer_load(
     candidates = [i for i in range(len(records)) if i not in blocks]
     conflict_blocks, criteria = _conflict_blocks(db, records, candidates, phones)
     blocks.update(conflict_blocks)
+    # Call-time rail in the dial path: a live load never loads a number that cannot be
+    # dialed right now (attempt cap, 09:00-19:15 ET / 8-20 local). Dry runs report
+    # eligibility, not dial time, so they skip it.
+    if not dry_run:
+        rail_candidates = [i for i in range(len(records)) if i not in blocks and phones[i]]
+        rail = dial_blocks(db, sorted({phones[i] for i in rail_candidates}), now=now)
+        blocks.update({i: rail[phones[i]].value for i in rail_candidates if phones[i] in rail})
     blocks.update({i: REASON_NEEDS_SCRUB for i in pending_scrub if i not in conflict_blocks})
     propagated = _propagate_by_phone(phones, blocks)
 
