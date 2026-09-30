@@ -7,6 +7,10 @@ scrubs stale numbers with Tracerfy, loads the dialer and commits.
 Usage:
     python -m src.tasks.lending_dialer_load --input pools.json
     python -m src.tasks.lending_dialer_load --input pools.json --live
+    python -m src.tasks.lending_dialer_load --from-staging [--staging-run-id ID]
+
+``--from-staging`` reads one calling-pool staging run (default: newest) and keeps
+only records in a launch queue; nurture-only and untagged records are never loaded.
 
 The input is a JSON list of pool records (source_record_ref, pool, phone,
 email, borrower_name, entity_name, property_address, estimated_loan_value,
@@ -24,22 +28,36 @@ from src.core.database import get_db_context
 from src.lending.compliance import tracerfy_scrub
 from src.lending.dialer_load import LoadRefused, run_dialer_load
 from src.lending import dialer_port
+from src.lending.pool_source import staged_pool_records
+from src.lending.queues import assign_queue
 
 logger = logging.getLogger(__name__)
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Load a lending pool export into the dialer.")
-    parser.add_argument("--input", required=True, type=Path, help="JSON list of pool records")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--input", type=Path, help="JSON list of pool records")
+    source.add_argument("--from-staging", action="store_true", help="read the calling-pool staging table")
+    parser.add_argument("--staging-run-id", help="staging run to read (default: newest)")
     parser.add_argument("--live", action="store_true", help="load the dialer and commit (default: dry run)")
     parser.add_argument("--run-id", help="identifier for this run (default: timestamped)")
     return parser.parse_args(argv)
 
 
+def launch_queue_records(records: list[dict]) -> list[dict]:
+    """Records assigned to a launch queue, with ``pool`` set to that queue."""
+    return [r for r in (assign_queue(rec) for rec in records) if r["queue"]]
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     args = _parse_args(argv)
-    records = json.loads(args.input.read_text(encoding="utf-8"))
+    if args.from_staging:
+        with get_db_context() as session:
+            records = launch_queue_records(staged_pool_records(session, run_id=args.staging_run_id))
+    else:
+        records = json.loads(args.input.read_text(encoding="utf-8"))
     if not isinstance(records, list):
         logger.error("[dialer-load] input must be a JSON list of records")
         return 2
