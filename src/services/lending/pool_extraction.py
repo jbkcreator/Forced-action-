@@ -37,7 +37,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any, Optional
 
@@ -62,7 +62,32 @@ AIRCALL_TAG: dict[str, str] = {
     "wholesaler_flipper": "DESK_CAPITAL_LOOP",
     "active_builder": "DESK_CONSTRUCTION",
     "mortgage_broker": "DESK_RESCUE",
+    "auction_winner": "DESK_CAPITAL_LOOP",
 }
+
+# Go Live Brief 2.5 source lists. A flipper is List 9 only while its flip is stalled:
+# the latest purchase is at least this old and the property has not been resold.
+STALLED_FLIP_MIN_DAYS: int = 180
+_BUILDER_PERMIT_SOURCES = frozenset({"building_permits", "permit_staging"})
+
+
+def is_stalled_flip(bought: Optional[date], *, resold: bool, today: Optional[date] = None) -> bool:
+    if bought is None or resold:
+        return False
+    return ((today or date.today()) - bought).days >= STALLED_FLIP_MIN_DAYS
+
+
+def source_tag_for(pool_name: str, source_table: str, *, stalled: bool = False) -> Optional[str]:
+    """Brief source list for a staged record; None when it belongs to no launch list."""
+    if pool_name == "active_builder":
+        return "list_7" if source_table in _BUILDER_PERMIT_SOURCES else "list_3"
+    if pool_name == "mortgage_broker":
+        return "list_4"
+    if pool_name == "auction_winner":
+        return "list_6"
+    if pool_name == "wholesaler_flipper" and stalled:
+        return "list_9"
+    return None
 
 # Permit lookback window — spec §4.1 "12-month active permits"
 BUILDER_PERMIT_LOOKBACK_MONTHS: int = 12
@@ -210,6 +235,9 @@ class CallingPoolRecord:
     source_property_id: Optional[int]
     source_table: str
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # Go Live: brief source list (list_1..list_9); set by _finalize_run_metadata.
+    source_tag: Optional[str] = None
+    stalled_flip: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +273,7 @@ def extract_calling_pools(
     pool3 = _extract_pool3_mortgage_broker(session, county_ids)
 
     all_records = _dedup_across_pools(pool1, pool2, pool3)
+    all_records.extend(_extract_auction_winners(session, county_ids))  # phoneless: nothing to dedup
     _attach_intent_scores(session, all_records)
     _finalize_run_metadata(all_records, run_id)
 
@@ -327,7 +356,11 @@ def _extract_pool1_wholesaler_flipper(
                 p.city                          AS prop_city,
                 p.state                         AS prop_state,
                 p.zip                           AS prop_zip,
-                d.sale_price                    AS last_sale_price
+                d.sale_price                    AS last_sale_price,
+                d.record_date                   AS last_purchase_date,
+                EXISTS (SELECT 1 FROM deeds later
+                        WHERE later.property_id = d.property_id
+                          AND later.record_date > d.record_date) AS resold
             FROM buyer_entities be
             JOIN buyer_entity_links bel ON bel.buyer_entity_id = be.id
                                        AND bel.source_table IN ('deeds', 'deed_wholesaler')
@@ -402,6 +435,7 @@ def _extract_pool1_wholesaler_flipper(
             dbpr_license_number=None,
             source_property_id=row.source_property_id,
             source_table="buyer_entities",
+            stalled_flip=is_stalled_flip(_as_date(row.last_purchase_date), resold=bool(row.resold)),
         ))
 
     logger.info("Pool 1 wholesaler_flipper: %d raw rows", len(records))
@@ -840,6 +874,58 @@ def _compose_permit_details(
 def _finalize_run_metadata(records: list[CallingPoolRecord], run_id: str) -> None:
     for r in records:
         r.run_id = run_id
+        if r.source_tag is None:
+            r.source_tag = source_tag_for(r.pool_name, r.source_table, stalled=r.stalled_flip)
+
+
+def _as_date(value: Any) -> Optional[date]:
+    if value is None:
+        return None
+    return value.date() if isinstance(value, datetime) else value
+
+
+# ---------------------------------------------------------------------------
+# List 6 — Tax-deed auction winners (Go Live Brief 2.5)
+# ---------------------------------------------------------------------------
+
+def auction_winner_record(row: Any) -> CallingPoolRecord:
+    """A winner has no phone in FA; the record is staged for tracing, never dialed as-is."""
+    return CallingPoolRecord(
+        run_id="", pool_name="auction_winner",
+        county_id=str(row.county_id), county_name=row.county_name,
+        borrower_name=None, entity_name=row.sold_to,
+        target_property_address=_compose_address(row.prop_address, row.prop_city, row.prop_state, row.prop_zip),
+        estimated_loan_value=Decimal(str(row.sold_amount)) if row.sold_amount else None,
+        recent_permit_details=None,
+        entity_status=_entity_status_from_firm_name(row.sold_to),
+        parcel_id=row.parcel_id, zip=row.prop_zip, state=row.prop_state or WAVE0_STATE,
+        normalized_phone=None, phone_available=False, email=None,
+        financing_intent_score=None, intent_tier=None, recommended_product=None,
+        aircall_campaign_tag=AIRCALL_TAG["auction_winner"],
+        buyer_entity_id=None, permit_number=None, dbpr_license_number=None,
+        source_property_id=row.property_id, source_table="tax_deed_auctions",
+        source_tag="list_6",
+    )
+
+
+def _extract_auction_winners(session: Session, county_ids: list[str]) -> list[CallingPoolRecord]:
+    rows = session.execute(
+        text("""
+            SELECT tda.id AS auction_id, tda.sold_to, tda.sold_amount, tda.property_id,
+                   COALESCE(tda.parcel_id, p.parcel_id) AS parcel_id,
+                   tda.county_id, c.display_name AS county_name,
+                   p.address AS prop_address, p.city AS prop_city, p.state AS prop_state, p.zip AS prop_zip
+            FROM tax_deed_auctions tda
+            LEFT JOIN properties p ON p.id = tda.property_id
+            LEFT JOIN counties c ON c.county_id = tda.county_id
+            WHERE tda.sold_to IS NOT NULL AND btrim(tda.sold_to) <> ''
+              AND tda.county_id = ANY(:county_ids)
+        """),
+        {"county_ids": county_ids},
+    ).fetchall()
+    records = [auction_winner_record(row) for row in rows]
+    logger.info("List 6 auction_winner: %d rows", len(records))
+    return records
 
 
 def _resolve_county_ids(session: Session, county_names: tuple[str, ...]) -> list[str]:
@@ -889,7 +975,7 @@ def _write_to_staging(session: Session, records: list[CallingPoolRecord]) -> int
         "financing_intent_score", "intent_tier", "recommended_product",
         "aircall_campaign_tag",
         "buyer_entity_id", "permit_number", "dbpr_license_number",
-        "source_property_id", "source_table", "created_at",
+        "source_property_id", "source_table", "created_at", "source_tag",
     ]
     insert_sql = f"INSERT INTO lending_calling_pool_staging ({', '.join(cols)}) VALUES %s"
 
@@ -903,7 +989,7 @@ def _write_to_staging(session: Session, records: list[CallingPoolRecord]) -> int
             r.financing_intent_score, r.intent_tier, r.recommended_product,
             r.aircall_campaign_tag,
             r.buyer_entity_id, r.permit_number, r.dbpr_license_number,
-            r.source_property_id, r.source_table, r.created_at,
+            r.source_property_id, r.source_table, r.created_at, r.source_tag,
         )
 
     # Bulk insert via psycopg2 execute_values — ONE network round-trip per batch.
