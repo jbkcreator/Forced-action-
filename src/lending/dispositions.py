@@ -126,8 +126,13 @@ def _to_bool(value: Any) -> Optional[bool]:
 
 
 def _direction(value: Any) -> Optional[str]:
-    text = _str(value)
-    return DIRECTION_ALIASES.get(text.lower(), text.lower()) if text else None
+    s = _str(value)
+    if not s:
+        return None
+    direction = DIRECTION_ALIASES.get(s.lower())
+    if direction is None:
+        logger.warning("[lending] unknown call direction %r", s)
+    return direction
 
 
 def _seat_name(data: dict) -> Optional[str]:

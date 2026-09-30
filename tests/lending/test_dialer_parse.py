@@ -44,3 +44,23 @@ def test_a_cdr_with_no_id_is_rejected():
     bad = dict(DOC_CDR)
     del bad["id"]
     assert d.parse_event(bad) is None
+
+
+def test_unknown_direction_is_stored_as_null_not_as_is():
+    assert d.parse_event({**DOC_CDR, "direction": "outgoing"}).direction is None
+    assert d.parse_event({**DOC_CDR, "direction": "2"}).direction is None
+
+
+def test_direction_is_case_insensitive_and_blank_is_none():
+    assert d.parse_event({**DOC_CDR, "direction": "OUT"}).direction == "outbound"
+    assert d.parse_event({**DOC_CDR, "direction": None}).direction is None
+    assert d.parse_event({**DOC_CDR, "direction": ""}).direction is None
+
+
+def test_seat_name_with_only_a_first_name():
+    cdr = {**DOC_CDR, "agent": {"id": 42, "firstname": "John"}}
+    assert d.parse_event(cdr).seat_name == "John"
+
+
+def test_absolute_recording_url_is_unchanged():
+    assert d.parse_event({**DOC_CDR, "callRecordUrl": "https://x/rec"}).recording_ref == "https://x/rec"
