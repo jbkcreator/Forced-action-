@@ -17,10 +17,11 @@ AIRCALL_REQUEST_TIMEOUT_SECONDS: float = 20.0
 POOL_CAMPAIGN_TAGS: dict[str, str] = {}
 
 
-# BatchDialer (client decision, Go Live Brief 2.4). Auth header X-ApiKey. The base URL
-# and each endpoint stay unset until confirmed against the client's account (E1);
+# BatchDialer (client decision, Go Live Brief 2.4). Auth header X-ApiKey. Each endpoint
+# stays unset until confirmed with a write test on a test campaign (E1);
 # an unset endpoint raises UnconfirmedCapability and removals stay pending.
-BATCHDIALER_BASE_URL: str = ""
+# Confirmed 2026-09-30 with the client key (GET /campaigns, /contacts, /cdrs, /lists -> 200).
+BATCHDIALER_BASE_URL: str = "https://app.batchdialer.com/api"
 BATCHDIALER_TIMEOUT_SECONDS: float = 20.0
 BATCHDIALER_ENDPOINTS: dict[str, "tuple[str, str] | None"] = {
     "contact_upsert": None,
@@ -28,3 +29,6 @@ BATCHDIALER_ENDPOINTS: dict[str, "tuple[str, str] | None"] = {
     "campaign_restore": None,
     "dnc_add": None,
 }
+# Path discovery (read-only, 2026-09-30): GET-405 (exists, other method) on /contact,
+# /dnclist, /campaigns/search; GET-200 on /cdrs (call records, paged) and /lists.
+# The API lists no remove-from-campaign action: holds use DNC add/delete (Option A).
