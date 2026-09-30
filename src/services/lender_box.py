@@ -93,7 +93,7 @@ class EligibilityResult:
 # Core evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate(deal: DealInput, db: Session) -> EligibilityResult:
+def evaluate(deal: DealInput, db: Session, programs: Optional[list] = None) -> EligibilityResult:
     """
     Evaluate a deal against all active Backflip programs.
 
@@ -101,7 +101,8 @@ def evaluate(deal: DealInput, db: Session) -> EligibilityResult:
     across all programs.  Uncertain is returned when a required numeric field
     is missing and the check cannot be completed.
     """
-    programs = _load_active_programs(db)
+    if programs is None:
+        programs = load_active_programs(db)
 
     if not programs:
         logger.warning("lender_box.evaluate: no active programs in lender_box_programs")
@@ -318,7 +319,7 @@ def _derive_financials(
 # DB helpers
 # ---------------------------------------------------------------------------
 
-def _load_active_programs(db: Session) -> list[dict]:
+def load_active_programs(db: Session) -> list[dict]:
     rows = db.execute(
         text("""
             SELECT
@@ -358,4 +359,5 @@ def evaluate_batch(
     still hit the DB per deal because they are filtered by state; add a
     geography cache here if the batch is large and all deals share a state.
     """
-    return [(ref, evaluate(deal, db)) for ref, deal in deals]
+    programs = load_active_programs(db)
+    return [(ref, evaluate(deal, db, programs=programs)) for ref, deal in deals]

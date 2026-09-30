@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 from decimal import Decimal
-from typing import Any
+from typing import Any, Optional
 
 from config.settings import get_settings
 from .models import GyrColor, RouterContext, RoutingDecision
@@ -145,8 +145,41 @@ def _post(token, channel: str, fallback_text: str, blocks: list) -> None:
     client.chat_postMessage(channel=channel, text=fallback_text, blocks=blocks)
 
 
-def post_to_slack(ctx: RouterContext, decision: RoutingDecision) -> None:
-    """Post one GYR card to the appropriate Slack channel."""
+def _slack_token():
+    settings = get_settings()
+    return settings.fa_max_slack_bot_token or settings.slack_bot_token
+
+
+def _queue_channel(queue: str) -> Optional[str]:
+    settings = get_settings()
+    if queue == "MONEY":
+        return settings.fa_max_slack_channel_money
+    if queue == "EXCEPTIONS":
+        return settings.fa_max_slack_channel_exceptions
+    return None
+
+
+def post_queue_header(queue: str, *, count: int, total_revenue_cents: int) -> None:
+    """Post the ranked-list header that precedes a sweep's cards, so Josh
+    reads the queue top-down from here (Slack shows newest last)."""
+    token = _slack_token()
+    channel = _queue_channel(queue)
+    if not token or not channel:
+        logger.debug("GYR delivery: header skipped for queue=%s (token/channel not configured)", queue)
+        return
+    title = f"{queue} — {count} opportunities, ranked by expected revenue (total {_revenue_label(total_revenue_cents)})"
+    try:
+        _post(token, channel, title, [_header(title)])
+    except Exception:
+        logger.exception("GYR delivery: header post failed for queue=%s", queue)
+
+
+def post_to_slack(
+    ctx: RouterContext, decision: RoutingDecision,
+    rank: Optional[int] = None, total: Optional[int] = None,
+) -> None:
+    """Post one GYR card to the appropriate Slack channel. `rank`/`total`
+    label the card's position in the sweep's ranked list."""
     settings = get_settings()
     token = settings.fa_max_slack_bot_token or settings.slack_bot_token
 
@@ -169,10 +202,39 @@ def post_to_slack(ctx: RouterContext, decision: RoutingDecision) -> None:
         logger.debug("GYR delivery: channel not configured for queue=%s — skipping", decision.queue)
         return
 
+    if rank is not None:
+        label = f"#{rank} of {total}"
+        blocks = [blocks[0], _context(label), *blocks[1:]]
+        fallback = f"{label} · {fallback}"
+
     try:
         _post(token, channel, fallback, blocks)
     except Exception:
         logger.exception("GYR delivery: Slack post failed for opportunity %s (queue=%s)", ctx.opportunity_id, decision.queue)
+
+
+def post_reengagement(ctx: RouterContext, decision: RoutingDecision) -> None:
+    """EXCEPTIONS card: a deal the Lender Box previously declined now fits."""
+    token = _slack_token()
+    channel = _queue_channel("EXCEPTIONS")
+    if not token or not channel:
+        logger.debug("GYR delivery: re-engagement skipped for %s (token/channel not configured)", ctx.opportunity_id)
+        return
+    rev = _revenue_label(decision.expected_revenue_cents)
+    blocks = [
+        _header("🔁  Possible Re-engagement — Now Fits the Lender Box"),
+        _divider(),
+        _fields(
+            ("Now", decision.color.value.upper()),
+            ("Est. Revenue", f"`{rev}`"),
+            ("Opportunity", f"`{ctx.opportunity_id[:8]}`"),
+        ),
+        _context("Previously out of the box. A program change means this deal may now be fundable."),
+    ]
+    try:
+        _post(token, channel, f"🔁 Re-engagement | {rev} | opp {ctx.opportunity_id[:8]}", blocks)
+    except Exception:
+        logger.exception("GYR delivery: re-engagement post failed for opportunity %s", ctx.opportunity_id)
 
 
 def post_staleness_alert(ctx: RouterContext, decision: RoutingDecision) -> None:

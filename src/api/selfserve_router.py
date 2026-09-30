@@ -512,6 +512,10 @@ async def submit_selfserve(token: str, request: Request, db: Session = Depends(g
         ),
         {"ref": result.handoff_ref, "token": token},
     )
+    if updated.person_id:
+        from src.services.fa_max_portal_completion import halt_for_portal_completion
+
+        halt_for_portal_completion(db, str(updated.person_id))
     db.commit()
 
     logger.info("selfserve: session token=...%s handed off, ref=%s", token[-8:], result.handoff_ref)

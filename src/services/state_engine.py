@@ -813,6 +813,16 @@ def _do_transition(
         opportunity_id=native_id,
     )
 
+    # WP-T2-6: a borrower who has submitted the application must not keep
+    # receiving portal-abandonment touches.
+    if entity_type == "person" and derived_person_id:
+        from src.services.fa_max_portal_completion import (
+            PORTAL_COMPLETED_LIFECYCLE_STATES, halt_for_portal_completion,
+        )
+
+        if to_state in PORTAL_COMPLETED_LIFECYCLE_STATES:
+            halt_for_portal_completion(session, derived_person_id)
+
     return TransitionResult(
         outcome=TransitionOutcome.succeeded,
         current_state=to_state,
