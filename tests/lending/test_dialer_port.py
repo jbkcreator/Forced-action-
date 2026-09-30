@@ -104,7 +104,7 @@ def test_loader_upsert_creates_the_contact_in_batchdialer_shape_then_adds_it_to_
     assert create[:2] == ("POST", "/contact")
     body = create[2]
     assert (body["firstname"], body["lastname"]) == ("Jane", "Roe")
-    assert body["phoneNumbers"] == [{"phoneNumber": PHONE}]
+    assert body["phonenumbers"] == [{"phonenumber": PHONE}]
     assert body["customfields"]["entity_name"] == "Roe LLC" and body["customfields"]["details"] == "Property: 1 St"
     assert add[:2] == ("POST", "/campaign/7/contact") and add[2] == {"contactId": 55}
 
@@ -121,7 +121,7 @@ def test_update_is_a_full_put_that_keeps_the_phone():
     http = FakeHttp(body={})
     BatchDialerAdapter(http=http, endpoints=ENDPOINTS).update_contact("55", FIELDS, phone=PHONE)
     method, path, body = http.calls[-1]
-    assert (method, path) == ("PUT", "/contact/55") and body["phoneNumbers"] == [{"phoneNumber": PHONE}]
+    assert (method, path) == ("PUT", "/contact/55") and body["phonenumbers"] == [{"phonenumber": PHONE}]
 
 
 def test_missing_for_load_names_every_unconfirmed_load_endpoint():

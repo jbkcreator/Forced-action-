@@ -1,10 +1,11 @@
 """WP-GL-9 missed-call text: rule values and BatchDialer call-record field names.
 
-Call-record field names are provisional until the first real call on the client
-account shows the /api/cdrs shape; they live here so confirming them is a config edit.
+Call-record shape from the BatchDialer public API docs (GET /api/v2/cdrs/last,
+"Get Latest CDRs Since Last Poll"); confirmed against a real call once one exists.
 """
 from __future__ import annotations
 
+CDR_POLL_PATH = "/v2/cdrs/last"   # up to 100 CDRs newer than this integration's last-seen id
 POLL_SECONDS = 15                 # /api/cdrs poll interval; well inside the 60 s target
 POLL_LOCK_KEY = 7_302_020_803     # one poller cycle at a time (next to the lending compliance lock keys)
 MAX_LATE_SECONDS = 60             # brief rule: text within 60 s; an older missed call is logged late, never texted
@@ -13,15 +14,15 @@ TIMEZONE = "America/New_York"     # "one text per person per day" is an Eastern 
 SMS_CAMPAIGN = "lending_missed_call"
 MAX_TEXT_CHARS = 320
 
-# /api/cdrs field names (provisional).
-CDR_ID_FIELDS = ("id", "callId", "uuid")
-CDR_PHONE_FIELDS = ("phoneNumber", "phone", "to", "destination")
-CDR_STATUS_FIELDS = ("status", "result", "disposition")
-CDR_DIRECTION_FIELDS = ("direction", "type")
-CDR_CALLER_ID_FIELDS = ("callerId", "callerIdNumber", "from")
-CDR_ENDED_AT_FIELDS = ("endedAt", "endTime", "ended_at", "end")
-NO_ANSWER_STATUSES = frozenset({"no-answer", "no_answer", "noanswer", "no answer", "missed", "unanswered", "busy"})
-OUTBOUND_DIRECTIONS = frozenset({"outbound", "out", "outgoing"})
+# Documented CDR fields (first match wins).
+CDR_ID_FIELDS = ("id",)
+CDR_PHONE_FIELDS = ("customerNumber",)
+CDR_STATUS_FIELDS = ("status", "disposition")      # status "NOANSWER" / disposition "No Answer"
+CDR_DIRECTION_FIELDS = ("direction",)               # "out" / "in"
+CDR_CALLER_ID_FIELDS = ("did",)                     # the caller-ID number the call went out on
+CDR_ENDED_AT_FIELDS = ("callEndTime",)
+NO_ANSWER_STATUSES = frozenset({"noanswer", "no answer", "no-answer", "no_answer", "busy"})
+OUTBOUND_DIRECTIONS = frozenset({"out", "outbound"})
 
 TEMPLATE_WITH_PROPERTY = (
     "Hi, this is Forced Action Capital calling about {property}. Sorry we missed you - "

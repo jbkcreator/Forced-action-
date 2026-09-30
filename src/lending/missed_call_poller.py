@@ -18,7 +18,7 @@ from typing import Any, Optional
 
 from sqlalchemy import text
 
-from config.lending_missed_call import POLL_LOCK_KEY, POLL_SECONDS
+from config.lending_missed_call import CDR_POLL_PATH, POLL_LOCK_KEY, POLL_SECONDS
 from config.settings import get_settings
 from src.lending.call_log import record_call_attempts
 from src.lending.compliance import on_attempt_recorded
@@ -35,7 +35,7 @@ def run_cycle(db, *, http, enabled: bool, now: Optional[datetime] = None) -> Opt
     """None when another poller holds the lock. Does not commit."""
     if not db.execute(text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": POLL_LOCK_KEY}).scalar():
         return None
-    records = _records(http("GET", "/cdrs"))
+    records = _records(http("GET", CDR_POLL_PATH))
     # Every finished call is an attempt: write it to the call log and run the cap hook,
     # so the 3-attempt rail works even if the dialer never pushes a call event.
     for phone in dict.fromkeys(record_call_attempts(db, records)):

@@ -68,6 +68,12 @@ def _parse_time(value: Any) -> Optional[datetime]:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+def _no_answer_status(row: Mapping[str, Any]) -> str:
+    """Status and disposition both describe the outcome; a no-answer in either counts."""
+    values = [str(row.get(f) or "").strip().lower() for f in CDR_STATUS_FIELDS]
+    return next((v for v in values if v in NO_ANSWER_STATUSES), next((v for v in values if v), ""))
+
+
 def call_record_fields(row: Mapping[str, Any]) -> Optional[dict[str, Any]]:
     """The fields every consumer needs from one call record, or None when the record has
     no id, usable phone or end time. Direction defaults to outbound (the dialer places calls)."""
@@ -81,7 +87,7 @@ def call_record_fields(row: Mapping[str, Any]) -> Optional[dict[str, Any]]:
     return {
         "call_id": str(call_id), "phone": phone, "ended_at": ended_at,
         "direction": "outbound" if direction in OUTBOUND_DIRECTIONS else direction,
-        "status": str(_first(row, CDR_STATUS_FIELDS) or "").strip().lower(),
+        "status": _no_answer_status(row),
         "caller_id_number": normalize_phone(str(caller_id)) if caller_id else None,
     }
 

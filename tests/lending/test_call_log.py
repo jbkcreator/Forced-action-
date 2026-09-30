@@ -62,8 +62,8 @@ def test_calls_missing_the_flag_are_listed_within_the_window(db):
 
 # ── Attempt rows from BatchDialer call records (so the cap works without pushed events) ──
 
-def _record(call_id, phone="(813) 555-8502", direction="outbound", status="no-answer", ended="2026-10-01T14:00:00Z"):
-    return {"id": call_id, "phoneNumber": phone, "direction": direction, "status": status, "endedAt": ended}
+def _record(call_id, phone="8135558502", direction="out", status="NOANSWER", ended="2026-10-01T14:00:00Z"):
+    return {"id": call_id, "customerNumber": phone, "direction": direction, "status": status, "callEndTime": ended}
 
 
 def test_call_records_become_attempt_rows_once(db):

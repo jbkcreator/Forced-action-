@@ -156,8 +156,8 @@ def _contact_id(body: Mapping[str, Any]) -> Any:
 
 
 def _contact_body(phone: Optional[str], fields: DialerContactFields) -> dict:
-    """BatchDialer contact shape, confirmed live 2026-09-30 (create/read/update/delete).
-    Custom fields are free-form and hold what the caller sees beyond the name."""
+    """BatchDialer contact shape (public API docs, "Add single contact"; create/update/delete
+    confirmed live 2026-09-30). Custom fields are free-form and hold what the caller sees."""
     body: dict[str, Any] = {
         "firstname": fields.first_name or "",
         "lastname": fields.last_name or "",
@@ -168,7 +168,7 @@ def _contact_body(phone: Optional[str], fields: DialerContactFields) -> dict:
         },
     }
     if phone is not None:
-        body["phoneNumbers"] = [{"phoneNumber": phone}]
+        body["phonenumbers"] = [{"phonenumber": phone}]
     return body
 
 
