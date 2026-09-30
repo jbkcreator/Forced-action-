@@ -52,17 +52,36 @@ def _attempt(db, ended_at, disposition=None, direction="outbound"):
 
 
 @pytest.mark.parametrize("utc_hour,utc_min,allowed", [
-    (11, 59, False),   # 07:59 local
-    (12, 0, True),     # 08:00 local
-    (23, 59, True),    # 19:59 local
-    (0, 0, False),     # 20:00 local (next UTC day handled below)
+    (12, 59, False),   # 08:59 ET, before the 09:00 ET start
+    (13, 0, True),     # 09:00 ET
+    (23, 14, True),    # 19:14 ET
+    (23, 15, False),   # 19:15 ET client hard stop
 ])
-def test_calling_window_edges(db, utc_hour, utc_min, allowed):
-    day = 30 if (utc_hour, utc_min) == (0, 0) else 29
-    result = _check(db, datetime(2026, 9, day, utc_hour, utc_min, tzinfo=timezone.utc))
+def test_calling_window_edges_are_the_eastern_hard_stop(db, utc_hour, utc_min, allowed):
+    result = _check(db, datetime(2026, 9, 29, utc_hour, utc_min, tzinfo=timezone.utc))
     assert result.allowed is allowed
     if not allowed:
         assert result.reason == ReasonCode.OUTSIDE_CALL_WINDOW
+
+
+def test_central_number_is_also_held_to_its_local_8_to_8(db):
+    from src.lending.compliance import can_dial_now
+    central = "+18505551234"  # 850 -> Central
+    ok = can_dial_now(central, db, now=datetime(2026, 9, 29, 22, 30, tzinfo=timezone.utc))   # 17:30 CT / 18:30 ET
+    assert ok.allowed
+    late = can_dial_now(central, db, now=datetime(2026, 9, 29, 23, 20, tzinfo=timezone.utc))  # 18:20 CT / 19:20 ET
+    assert late.reason == ReasonCode.OUTSIDE_CALL_WINDOW
+
+
+def test_shift_groups_split_the_eastern_day(db):
+    from src.lending.compliance import can_dial_now
+    at_1500 = datetime(2026, 9, 29, 19, 0, tzinfo=timezone.utc)   # 15:00 ET
+    at_1230 = datetime(2026, 9, 29, 16, 30, tzinfo=timezone.utc)  # 12:30 ET
+    assert can_dial_now(PHONE, db, now=at_1230, seat_group="A").allowed
+    assert can_dial_now(PHONE, db, now=at_1230, seat_group="B").reason == ReasonCode.OUTSIDE_CALL_WINDOW
+    assert can_dial_now(PHONE, db, now=at_1500, seat_group="A").reason == ReasonCode.OUTSIDE_CALL_WINDOW
+    assert can_dial_now(PHONE, db, now=at_1500, seat_group="B").allowed
+    assert can_dial_now(PHONE, db, now=at_1500).allowed   # no group -> widest window
 
 
 def test_third_attempt_allowed_fourth_blocked_even_without_disposition(db):

@@ -26,6 +26,9 @@ from config.lending_compliance import (
     ATTEMPT_PERIOD_HOURS,
     CALL_WINDOW_END,
     CALL_WINDOW_START,
+    ET_WINDOW_END,
+    ET_WINDOW_START,
+    SHIFT_GROUPS,
     DEFAULT_TZ,
     DIALER_SWEEP_LOCK_KEY,
     DIALER_OPT_OUT_SOURCE,
@@ -377,8 +380,10 @@ def can_dial_now(
     *,
     now: Optional[datetime] = None,
     zip_code: Optional[str] = None,
+    seat_group: Optional[str] = None,
 ) -> GateResult:
-    """Recipient-local calling window, then the rolling attempt cap.
+    """Calling window (09:00-19:15 ET and 8-20 recipient local, narrowed by the
+    seat's shift group), then the rolling attempt cap.
 
     Attempts are outbound rows in lending.call_dispositions (one per Aircall
     call.ended, with or without a disposition) — owned by WP-W0-6. A NULL
@@ -389,15 +394,22 @@ def can_dial_now(
     if not normalized:
         return _blocked(phone, ReasonCode.INVALID_PHONE)
 
-    if _outside_call_window(normalized, now, zip_code):
+    if _outside_call_window(normalized, now, zip_code, seat_group):
         return _blocked(normalized, ReasonCode.OUTSIDE_CALL_WINDOW)
 
     return _attempt_cap(db, normalized, now)
 
 
-def _outside_call_window(phone: str, now: datetime, zip_code: Optional[str] = None) -> bool:
+def _outside_call_window(
+    phone: str, now: datetime, zip_code: Optional[str] = None, seat_group: Optional[str] = None
+) -> bool:
     local = now.astimezone(recipient_timezone(phone, zip_code)).time()
-    return not (CALL_WINDOW_START <= local < CALL_WINDOW_END)
+    if not (CALL_WINDOW_START <= local < CALL_WINDOW_END):
+        return True
+    start, end = SHIFT_GROUPS.get(seat_group, (ET_WINDOW_START, ET_WINDOW_END)) if seat_group else (
+        ET_WINDOW_START, ET_WINDOW_END)
+    eastern = now.astimezone(ZoneInfo(DEFAULT_TZ)).time()
+    return not (start <= eastern < end)
 
 
 def _attempt_cap(db, phone: str, now: datetime) -> GateResult:

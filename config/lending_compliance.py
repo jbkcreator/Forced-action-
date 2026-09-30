@@ -9,11 +9,19 @@ from __future__ import annotations
 from datetime import time
 from enum import Enum
 
-CALL_WINDOW_START = time(8, 0)   # inclusive, recipient local time
+CALL_WINDOW_START = time(8, 0)   # inclusive, recipient local time (FTSA floor)
 CALL_WINDOW_END = time(20, 0)    # exclusive
+# Client hard stop (Go Live Brief): every call also sits inside 09:00-19:15 Eastern.
+ET_WINDOW_START = time(9, 0)     # inclusive
+ET_WINDOW_END = time(19, 15)     # exclusive
+# Seat shift groups, Eastern. No group -> the widest ET window applies.
+SHIFT_GROUPS: dict[str, tuple[time, time]] = {
+    "A": (time(9, 0), time(15, 0)),
+    "B": (time(13, 0), time(19, 15)),
+}
 MAX_ATTEMPTS_PER_PERIOD = 3
 ATTEMPT_PERIOD_HOURS = 24        # rolling
-DNC_SCRUB_MAX_AGE_DAYS = 31
+DNC_SCRUB_MAX_AGE_DAYS = 7
 STOP_PROPAGATION_SLA_SECONDS = 60
 OPT_OUT_POLL_SECONDS = 15        # FA opt-out poller interval; worst case well inside the SLA
 DIALER_SWEEP_SECONDS = 60        # window/cap pull-and-restore sweep interval
@@ -34,7 +42,7 @@ AREA_CODE_TZ: dict[str, str] = {
 }
 
 # FA sms_opt_outs rows written by the Tracerfy DNC refresh are national-DNC hits,
-# re-verified every 31 days — never a permanent opt-out.
+# re-verified inside the scrub freshness window — never a permanent opt-out.
 TRACERFY_DNC_SOURCE = "tracerfy_dnc_refresh"
 
 # suppress_contact() source used by the dialer path; the poller skips it (already propagated).
@@ -109,6 +117,11 @@ class RemovalReason(str, Enum):
 def validate_lending_compliance_config() -> None:
     if CALL_WINDOW_START >= CALL_WINDOW_END:
         raise ValueError("CALL_WINDOW_START must be before CALL_WINDOW_END")
+    if ET_WINDOW_START >= ET_WINDOW_END:
+        raise ValueError("ET_WINDOW_START must be before ET_WINDOW_END")
+    for group, (start, end) in SHIFT_GROUPS.items():
+        if not (ET_WINDOW_START <= start < end <= ET_WINDOW_END):
+            raise ValueError(f"shift group {group} must sit inside the ET window")
     if MAX_ATTEMPTS_PER_PERIOD < 1:
         raise ValueError("MAX_ATTEMPTS_PER_PERIOD must be >= 1")
     if OPT_OUT_POLL_SECONDS * 2 >= STOP_PROPAGATION_SLA_SECONDS:
