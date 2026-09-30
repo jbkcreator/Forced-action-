@@ -967,7 +967,10 @@ def _write_to_staging(session: Session, records: list[CallingPoolRecord]) -> int
     if not records:
         return 0
 
-    # Column order shared by the INSERT and the per-row tuple builder.
+    from sqlalchemy import insert
+
+    from src.core.models import LendingCallingPoolStaging
+
     cols = [
         "run_id", "pool_name", "county_id", "county_name",
         "borrower_name", "entity_name", "target_property_address",
@@ -979,38 +982,14 @@ def _write_to_staging(session: Session, records: list[CallingPoolRecord]) -> int
         "buyer_entity_id", "permit_number", "dbpr_license_number",
         "source_property_id", "source_table", "created_at", "source_tag",
     ]
-    insert_sql = f"INSERT INTO lending_calling_pool_staging ({', '.join(cols)}) VALUES %s"
 
-    def _tuple(r: CallingPoolRecord) -> tuple:
-        return (
-            r.run_id, r.pool_name, r.county_id, r.county_name,
-            r.borrower_name, r.entity_name, r.target_property_address,
-            r.estimated_loan_value, r.recent_permit_details,
-            r.entity_status, r.parcel_id, r.zip, r.state,
-            r.normalized_phone, r.phone_available, r.email,
-            r.financing_intent_score, r.intent_tier, r.recommended_product,
-            r.aircall_campaign_tag,
-            r.buyer_entity_id, r.permit_number, r.dbpr_license_number,
-            r.source_property_id, r.source_table, r.created_at, r.source_tag,
-        )
-
-    # Bulk insert via psycopg2 execute_values — ONE network round-trip per batch.
-    # Plain executemany sends one INSERT per row, which crawls over a remote
-    # connection (a ~19k-row run took minutes). Dedicated raw connection so
-    # raw-cursor commits don't collide with the passed session.
-    import psycopg2.extras
-
+    # One multi-row INSERT per batch: a single round trip, unlike per-row executemany
+    # (a ~19k-row run took minutes over the remote connection). Commit per batch.
     batch_size = 1000
     written = 0
-    raw = session.get_bind().raw_connection()
-    try:
-        for i in range(0, len(records), batch_size):
-            values = [_tuple(r) for r in records[i:i + batch_size]]
-            with raw.cursor() as cur:
-                psycopg2.extras.execute_values(cur, insert_sql, values, page_size=batch_size)
-            raw.commit()
-            written += len(values)
-    finally:
-        raw.close()
-
+    for i in range(0, len(records), batch_size):
+        batch = [{c: getattr(r, c) for c in cols} for r in records[i:i + batch_size]]
+        session.execute(insert(LendingCallingPoolStaging).values(batch))
+        session.commit()
+        written += len(batch)
     return written

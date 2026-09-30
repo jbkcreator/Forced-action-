@@ -68,3 +68,43 @@ def test_migration_adds_source_tag_and_allows_auction_winners():
         tx.rollback()
         conn.close()
         engine.dispose()
+
+
+def test_orm_model_matches_the_source_tag_migration():
+    from migrations.apply_lending_pool_source_tags import POOLS
+    from src.core.models import LendingCallingPoolStaging as M
+
+    table = M.__table__
+    assert "source_tag" in table.c
+    assert "idx_lcps_source_tag" in {i.name for i in table.indexes}
+    checks = [str(c.sqltext) for c in table.constraints if c.name == "lending_calling_pool_staging_pool_name_check"]
+    assert checks and all(p in checks[0] for p in POOLS)
+
+
+@pytest.mark.skipif(not __import__("os").environ.get("DATABASE_URL"), reason="requires a live Postgres DATABASE_URL")
+def test_staging_write_persists_every_column_including_source_tag():
+    import os
+    import uuid
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.orm import Session
+
+    engine = create_engine(os.environ["DATABASE_URL"])
+    conn = engine.connect()
+    tx = conn.begin()
+    try:
+        session = Session(bind=conn, join_transaction_mode="create_savepoint")
+        run_id = str(uuid.uuid4())
+        row = SimpleNamespace(sold_to="ACME HOLDINGS LLC", sold_amount=150000, property_id=None, parcel_id="P-9",
+                              county_id="hillsborough", county_name="Hillsborough", prop_address="1 Main St",
+                              prop_city="Tampa", prop_state="FL", prop_zip="33602", auction_id=77)
+        rec = pe.auction_winner_record(row)
+        rec.run_id = run_id
+        assert pe._write_to_staging(session, [rec]) == 1
+        got = session.execute(text("SELECT pool_name, source_tag, entity_name, phone_available "
+                                   "FROM lending_calling_pool_staging WHERE run_id = CAST(:r AS uuid)"),
+                              {"r": run_id}).fetchall()
+        assert got == [("auction_winner", "list_6", "ACME HOLDINGS LLC", False)]
+    finally:
+        tx.rollback()
+        conn.close()
+        engine.dispose()

@@ -12739,16 +12739,23 @@ class LendingCallingPoolStaging(Base):
     dbpr_license_number: Mapped[Optional[str]] = mapped_column(String)
     source_property_id: Mapped[Optional[int]] = mapped_column(BigInteger)
     source_table: Mapped[str] = mapped_column(String, nullable=False)
+    # Go Live Brief 2.5 source list (list_1..list_9); apply_lending_pool_source_tags.py
+    source_tag: Mapped[Optional[str]] = mapped_column(String)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
     __table_args__ = (
+        CheckConstraint(
+            "pool_name IN ('wholesaler_flipper', 'active_builder', 'mortgage_broker', 'auction_winner')",
+            name="lending_calling_pool_staging_pool_name_check",
+        ),
         Index("idx_lcps_run_id", "run_id"),
         Index("idx_lcps_pool_phone", "pool_name", "phone_available"),
         Index("idx_lcps_county", "county_id"),
         Index("idx_lcps_state", "state"),
+        Index("idx_lcps_source_tag", "source_tag"),
     )
 
 
