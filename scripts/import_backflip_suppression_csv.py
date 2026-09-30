@@ -1,7 +1,8 @@
 """Replace the active Backflip campaign-contact snapshot from a CSV export.
 
-Expected columns: email and/or phone (case insensitive). An empty snapshot
-requires --allow-empty so a malformed export cannot silently clear protection.
+Expected columns: any of email, phone, entity_name, parcel_id (case
+insensitive). An empty snapshot requires --allow-empty so a malformed export
+cannot silently clear protection.
 The exact feed mapping remains pending Bailey's response. This importer never
 writes permanent opt-out tables.
 """
