@@ -27,12 +27,15 @@ needs_db = pytest.mark.skipif(
 PHONE = "+18135558201"
 
 
-def test_matches_the_compliance_floor_dialer_remover_contract():
+def test_matches_the_compliance_floor_dialer_remover_contract(monkeypatch):
+    from src.lending import dialer_port
     from src.lending.compliance import _default_dialer_remover
 
+    monkeypatch.setattr(dialer_port, "get_dialer",
+                        lambda: dialer_port.BatchDialerAdapter(http=lambda *a, **k: {}))
     remover = _default_dialer_remover()
     assert remover is not None
-    assert list(inspect.signature(remover).parameters) == ["phone"]
+    assert list(inspect.signature(remover).parameters) == ["phone", "reason"]
 
 
 def test_invalid_phone_raises():
