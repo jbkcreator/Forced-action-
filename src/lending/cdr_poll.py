@@ -15,6 +15,7 @@ from urllib.parse import urlencode
 
 from sqlalchemy import text
 
+from config.lending_dispositions import DNC_CODE
 from src.lending.call_pipeline import follow_up, lending_campaign_ids, process_event
 from src.lending.dispositions import DialerCallEvent, parse_event
 
@@ -25,6 +26,8 @@ Http = Callable[..., Any]
 
 @dataclass
 class IngestStats:
+    """`seen` counts every fetched item, filtered ones included; the rest count lending outbound calls only."""
+
     seen: int = 0
     processed: int = 0
     skipped: int = 0
@@ -47,14 +50,20 @@ def fetch_last(http: Http) -> list[dict]:
 
 def iter_day(http: Http, day: date, *, max_pages: int = 200) -> Iterator[dict]:
     cursor: Optional[str] = None
+    seen_cursors: set[str] = set()
     for _ in range(max_pages):
         body = http("GET", _path("/v2/cdrs", callDate=f"{day.isoformat()}T00:00:00Z", pagelength=100, next_page=cursor))
         if not isinstance(body, dict):
+            logger.warning("[lending] CDR day scan for %s ended early: non-dict response", day)
             return
         yield from body.get("items") or []
         cursor = body.get("nextPage")
         if not cursor:
             return
+        if cursor in seen_cursors:
+            logger.warning("[lending] CDR day scan for %s stopped: repeated cursor", day)
+            return
+        seen_cursors.add(cursor)
     logger.warning("[lending] CDR day scan stopped at %d pages for %s", max_pages, day)
 
 
@@ -62,12 +71,16 @@ def _changed(db, events: list[DialerCallEvent]) -> list[DialerCallEvent]:
     if not events:
         return events
     rows = db.execute(
-        text("SELECT dialer_call_id, raw_event->>'disposition', raw_event->>'callEndTime' "
+        text("SELECT dialer_call_id, raw_event->>'disposition', raw_event->>'callEndTime', "
+             "disposition, opt_out_propagated_at "
              "FROM lending.call_dispositions WHERE dialer_call_id = ANY(:ids)"),
         {"ids": [e.call_id for e in events]},
     ).all()
     stored = {r[0]: (r[1], r[2]) for r in rows}
-    return [e for e in events if stored.get(e.call_id) != (e.raw.get("disposition"), e.raw.get("callEndTime"))]
+    unpropagated_dnc = {r[0] for r in rows if r[3] == DNC_CODE and r[4] is None}  # committed before the opt-out hook failed
+    return [e for e in events
+            if e.call_id in unpropagated_dnc
+            or stored.get(e.call_id) != (e.raw.get("disposition"), e.raw.get("callEndTime"))]
 
 
 def ingest(db, items: list[dict], *, only_changed: bool) -> IngestStats:
@@ -88,7 +101,10 @@ def ingest(db, items: list[dict], *, only_changed: bool) -> IngestStats:
             logger.error("[lending] CDR %s failed: %s", ev.call_id, type(exc).__name__)
             continue
         stats.processed += 1
-        follow_up(recorded, lambda fn, *args: fn(*args))
+        try:
+            follow_up(recorded, lambda fn, *args: fn(*args))
+        except Exception as exc:
+            logger.error("[lending] CDR %s follow-up failed: %s", ev.call_id, type(exc).__name__)
     return stats
 
 

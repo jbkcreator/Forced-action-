@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from sqlalchemy import text
@@ -66,13 +67,13 @@ def test_one_bad_cdr_does_not_stop_the_batch(lending_db, monkeypatch):
     real = cdr_poll.process_event
 
     def flaky(db, ev):
-        if ev.call_id == "1":
+        if ev.call_id == "2":
             raise RuntimeError("boom")
         return real(db, ev)
 
     monkeypatch.setattr(cdr_poll, "process_event", flaky)
-    stats = cdr_poll.poll_new(lending_db, FakeHttp(last=[_cdr(1), _cdr(2)]))
-    assert [r[0] for r in _rows(lending_db)] == ["2"] and stats.failed == 1
+    stats = cdr_poll.poll_new(lending_db, FakeHttp(last=[_cdr(1), _cdr(2), _cdr(3)]))
+    assert [r[0] for r in _rows(lending_db)] == ["1", "3"] and stats.failed == 1
 
 
 def test_rescan_pages_through_the_day_and_picks_up_a_later_disposition(lending_db):
@@ -100,3 +101,29 @@ def test_calls_lost_to_the_watermark_are_recovered_by_the_rescan(lending_db):
     http = FakeHttp(days={"2026-09-29": [[_cdr(5)]]})
     cdr_poll.rescan_today(lending_db, http, now=datetime(2026, 9, 29, 17, 0, tzinfo=timezone.utc))
     assert [r[0] for r in _rows(lending_db)] == ["5"]
+
+
+def test_follow_up_failure_does_not_stop_the_batch(lending_db, monkeypatch):
+    def boom(recorded, add_task):
+        if recorded.call_id == "1":
+            raise RuntimeError("slack down")
+
+    monkeypatch.setattr(cdr_poll, "follow_up", boom)
+    cdr_poll.poll_new(lending_db, FakeHttp(last=[_cdr(1), _cdr(2)]))
+    assert [r[0] for r in _rows(lending_db)] == ["1", "2"]
+
+
+def test_dnc_whose_opt_out_failed_is_retried_by_the_rescan(lending_db, monkeypatch):
+    monkeypatch.setattr(call_pipeline, "on_attempt_recorded", MagicMock())
+    monkeypatch.setattr(call_pipeline, "propagate_opt_out", MagicMock(side_effect=RuntimeError("down")))
+    dnc = _cdr(1, disposition="DNC_REQUEST")
+    stats = cdr_poll.poll_new(lending_db, FakeHttp(last=[dnc]))
+    stamp = "SELECT opt_out_propagated_at FROM lending.call_dispositions WHERE dialer_call_id = '1'"
+    assert stats.failed == 1 and lending_db.execute(text(stamp)).scalar() is None
+    assert [r[0] for r in _rows(lending_db)] == ["1"]
+
+    fake = MagicMock(return_value=1)
+    monkeypatch.setattr(call_pipeline, "propagate_opt_out", fake)
+    cdr_poll.rescan_today(lending_db, FakeHttp(days={"2026-09-29": [[dnc]]}),
+                          now=datetime(2026, 9, 29, 17, 0, tzinfo=timezone.utc))
+    assert fake.called and lending_db.execute(text(stamp)).scalar() is not None
