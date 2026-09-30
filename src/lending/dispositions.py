@@ -21,9 +21,12 @@ from sqlalchemy import text
 
 from config.lending_compliance import DEFAULT_TZ
 from config.lending_dispositions import (
+    CDR_ANSWERED_STATUSES,
     BOOKED_CODE,
     DEFAULT_CAUSE,
     DISPOSITION_LIST_VERSION,
+    DIALER_ORIGIN,
+    DIRECTION_ALIASES,
     DISPOSITIONS,
     DNC_CODE,
     EVENT_FIELD_CANDIDATES,
@@ -122,6 +125,24 @@ def _to_bool(value: Any) -> Optional[bool]:
     return str(value).strip().lower() in ("1", "true", "yes", "y")
 
 
+def _direction(value: Any) -> Optional[str]:
+    text = _str(value)
+    return DIRECTION_ALIASES.get(text.lower(), text.lower()) if text else None
+
+
+def _seat_name(data: dict) -> Optional[str]:
+    explicit = _str(_pick(data, "seat_name"))
+    if explicit:
+        return explicit
+    parts = (_str(_dig(data, "agent.firstname")), _str(_dig(data, "agent.lastname")))
+    return " ".join(p for p in parts if p) or None
+
+
+def _recording(value: Any) -> Optional[str]:
+    ref = _str(value)
+    return DIALER_ORIGIN + ref if ref and ref.startswith("/") else ref
+
+
 def parse_event(raw: Any) -> Optional[DialerCallEvent]:
     """Normalize one webhook / poll record. None when it carries no call id."""
     if not isinstance(raw, dict):
@@ -133,17 +154,17 @@ def parse_event(raw: Any) -> Optional[DialerCallEvent]:
     return DialerCallEvent(
         call_id=call_id,
         contact_id=_str(_pick(data, "contact_id")),
-        direction=_str(_pick(data, "direction")),
+        direction=_direction(_pick(data, "direction")),
         phone=_str(_pick(data, "phone")),
         seat_id=_str(_pick(data, "seat_id")),
-        seat_name=_str(_pick(data, "seat_name")),
+        seat_name=_seat_name(data),
         caller_id_number=_str(_pick(data, "caller_id_number")),
         campaign_id=_str(_pick(data, "campaign_id")),
         started_at=_to_dt(_pick(data, "started_at")),
         ended_at=_to_dt(_pick(data, "ended_at")),
         duration=_to_int(_pick(data, "duration")),
         disposition_raw=_str(_pick(data, "disposition")),
-        recording_ref=_str(_pick(data, "recording")),
+        recording_ref=_recording(_pick(data, "recording")),
         disclosure_logged=_to_bool(_pick(data, "disclosure")),
         raw=raw,
     )
@@ -155,6 +176,8 @@ def normalize_code(raw: Optional[str]) -> tuple[Optional[str], bool]:
     if not raw:
         return None, True
     key = re.sub(r"[^A-Z0-9]+", "_", raw.upper()).strip("_")
+    if key in CDR_ANSWERED_STATUSES:
+        return None, True
     if key in DISPOSITIONS:
         return key, True
     if key in SYSTEM_DISPOSITION_ALIASES:
@@ -311,7 +334,8 @@ def record_dialer_event(db, ev: DialerCallEvent) -> RecordedCall:
     if booking_blocked:
         db.execute(text("UPDATE lending.call_dispositions SET booking_blocked = true WHERE id = :id"), {"id": row["id"]})
 
-    unanswered = row["call_ended_at"] is not None and _is_unanswered(ev, code, True) and (row["phone"] is not None)
+    unanswered = (row["call_ended_at"] is not None and ev.direction != "inbound"
+                  and _is_unanswered(ev, code, True) and row["phone"] is not None)
     if unanswered:
         queue_missed_call(db, ev.call_id, row["phone"], ev.caller_id_number, record, row["call_ended_at"])
 

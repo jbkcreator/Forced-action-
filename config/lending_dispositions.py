@@ -38,6 +38,8 @@ SYSTEM_DISPOSITION_ALIASES: dict[str, str] = {
     "DO_NOT_CALL": "DNC_REQUEST",
     "NOT_INTERESTED": "CONNECTED_NOT_INTERESTED",
     "CALL_BACK": "CALLBACK_REQUESTED",
+    "FAILED": "CALL_FAILED",
+    "CONGESTION": "CALL_FAILED",
 }
 
 # Unfunded-cause tags (brief §2.7). Required values for every unfunded outcome.
@@ -77,21 +79,33 @@ RETRY_BATCH_LIMIT = 200
 # (dotted paths reach into nested objects). Replace with the real names from the
 # BatchDialer docs / a captured payload; parse_event() fails loudly without a call id.
 EVENT_FIELD_CANDIDATES: dict[str, tuple[str, ...]] = {
-    "call_id": ("call_id", "callId", "id", "uuid"),
-    "contact_id": ("contact_id", "contactId", "contact.id"),
+    "call_id": ("id", "call_id", "callId", "uuid"),
+    "contact_id": ("contact.id", "contact_id", "contactId"),
     "direction": ("direction", "call_direction"),
-    "phone": ("phone", "phone_number", "to", "dialed_number", "contact.phone"),
-    "seat_id": ("user_id", "userId", "agent_id", "agentId", "user.id"),
+    "phone": ("customerNumber", "phone", "phone_number", "to", "dialed_number", "contact.phone"),
+    "seat_id": ("agent.id", "user_id", "userId", "agent_id", "agentId", "user.id"),
     "seat_name": ("user_name", "userName", "agent_name", "agentName", "user.name"),
-    "caller_id_number": ("caller_id", "callerId", "from", "caller_id_number", "did"),
-    "campaign_id": ("campaign_id", "campaignId", "campaign.id"),
-    "started_at": ("started_at", "startTime", "start_time", "start"),
-    "ended_at": ("ended_at", "endTime", "end_time", "end"),
-    "duration": ("talk_duration", "talkTime", "duration", "billsec"),
+    "caller_id_number": ("did", "caller_id", "callerId", "from", "caller_id_number"),
+    "campaign_id": ("campaign.id", "campaign_id", "campaignId"),
+    "started_at": ("callStartTime", "started_at", "startTime", "start_time", "start"),
+    "ended_at": ("callEndTime", "ended_at", "endTime", "end_time", "end"),
+    "duration": ("duration", "talk_duration", "talkTime", "billsec"),
     "disposition": ("disposition", "call_result", "callResult", "result", "disposition_name"),
-    "recording": ("recording_url", "recordingUrl", "recording"),
+    "recording": ("callRecordUrl", "recording_url", "recordingUrl", "recording"),
     "disclosure": ("recording_disclosure", "disclosure_played"),
 }
+
+DIALER_ORIGIN = "https://app.batchdialer.com"  # callRecordUrl is relative to this
+
+DIRECTION_ALIASES: dict[str, str] = {"out": "outbound", "outbound": "outbound", "in": "inbound", "inbound": "inbound"}
+
+# Telephony statuses on a CDR. UNVERIFIED strings (Task 0 confirms): "ANSWER" means the call
+# connected and the caller has not chosen a result yet.
+CDR_ANSWERED_STATUSES = frozenset({"ANSWER", "ANSWERED"})
+
+CDR_POLL_SECONDS = 15      # GET /v2/cdrs/last: keeps the 60-second text reachable
+CDR_RESCAN_SECONDS = 120   # GET /v2/cdrs for today + yesterday (UTC)
+CDR_POLL_LOCK_KEY = 7_302_020_803  # one poller at a time: the /last watermark is shared per integration
 
 
 def validate_dispositions_config() -> None:

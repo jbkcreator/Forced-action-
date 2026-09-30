@@ -158,3 +158,8 @@ def test_parse_event_reads_nested_and_epoch_fields_and_needs_a_call_id():
     assert (ev.call_id, ev.contact_id, ev.seat_id, ev.disposition_raw) == ("9", "3", "7", "No Answer")
     assert ev.started_at.tzinfo is not None
     assert d.parse_event({"data": {}}) is None and d.parse_event("nope") is None
+
+
+def test_inbound_unanswered_call_raises_no_missed_call_signal(lending_db):
+    d.record_dialer_event(lending_db, _ev(direction="inbound", duration=0, disposition_raw="NO_ANSWER"))
+    assert lending_db.execute(text("SELECT count(*) FROM lending.missed_call_events")).scalar() == 0
