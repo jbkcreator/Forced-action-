@@ -101,6 +101,7 @@ class FaMaxQualificationWorker:
         self.worker_id = worker_id or _worker_id()
         self._stop = False
         self._loop_count = 0
+        self._queue_cursor = 0
 
     def request_stop(self, *_args: Any) -> None:
         logger.info(
@@ -113,13 +114,20 @@ class FaMaxQualificationWorker:
         signal.signal(signal.SIGTERM, self.request_stop)
 
     def _claim(self) -> Optional[Dict[str, Any]]:
-        with get_db_context() as session:
-            return claim_next_work_item(
-                session=session,
-                queue_name=FA_MAX_QUAL_QUEUE_NAME,
-                worker_id=self.worker_id,
-                lease_seconds=DEFAULT_LEASE_SECONDS,
-            )
+        # Rotate queues so intake cannot starve builds or Slack delivery.
+        from src.services.quote_ready.workflow import WORKFLOW_QUEUES
+        queues = (FA_MAX_QUAL_QUEUE_NAME, *WORKFLOW_QUEUES)
+        for _ in queues:
+            queue = queues[self._queue_cursor % len(queues)]
+            self._queue_cursor += 1
+            with get_db_context() as session:
+                item = claim_next_work_item(
+                    session=session, queue_name=queue, worker_id=self.worker_id,
+                    lease_seconds=DEFAULT_LEASE_SECONDS,
+                )
+            if item is not None:
+                return item
+        return None
 
     def _complete(self, work_item_id: str, status: str) -> None:
         with get_db_context() as session:
@@ -137,6 +145,10 @@ class FaMaxQualificationWorker:
             )
 
     def _process_one(self, item: Dict[str, Any]) -> None:
+        from src.services.quote_ready.workflow import WORKFLOW_QUEUES, process_work_item
+        if item.get("queue_name") in WORKFLOW_QUEUES:
+            process_work_item(item, worker_id=self.worker_id)
+            return
         work_item_id: str = item["work_item_id"]
         payload: Dict[str, Any] = item.get("payload") or {}
 
@@ -191,12 +203,13 @@ class FaMaxQualificationWorker:
 
     def _sweep_expired(self) -> None:
         with get_db_context() as session:
-            reclaim_expired_work_items(
-                session=session, queue_name=FA_MAX_QUAL_QUEUE_NAME
-            )
+            from src.services.quote_ready.workflow import WORKFLOW_QUEUES
+            for queue in (FA_MAX_QUAL_QUEUE_NAME, *WORKFLOW_QUEUES):
+                reclaim_expired_work_items(session=session, queue_name=queue)
 
     def run_forever(self, idle_poll_seconds: int = IDLE_POLL_SECONDS) -> None:
         logger.info("fa_max.qual_worker: starting (worker=%s)", self.worker_id)
+        self._sweep_expired()
         reactivate_failed_qualification_items()
         run_checklist_version_backstop_sweep()
         while not self._stop:
@@ -503,7 +516,7 @@ def _handle_sufficient(
         logger.info(
             "fa_max.qual_worker: opportunity=%s sufficient at revision=%d"
             " → enqueued fa_max_quote_ready work_item=%s"
-            " (DEPENDENCY: Dev 4 WP-8A/8B consumer not yet built)",
+            " (durable builder task)",
             opportunity_id, facts_revision, work_item_id,
         )
     else:

@@ -8,14 +8,10 @@ appropriate downstream work.
 
 Autonomy: internal agent — no outbound contact, no tier gate required.
 
-Cross-owner dependencies explicitly tracked here (not silently assumed):
-  • Dev 4 (WP-8A/8B): owns and must wire the "fa_max_quote_ready" queue
-    consumer. T3-7 enqueues into that queue on every sufficient decision;
-    Dev 4's consumer must re-check facts_revision and checklist_version at
-    result-publication time, not only at claim time (stale-handoff window).
-  • T3-8 (Fundability Agent, same developer): owns the enrichment-exhaustion
-    promotion trigger. Until T3-8 defines a terminal enrichment-failed state,
-    pending_enrichment gaps remain indefinitely pending from T3-7's side.
+Cross-owner dependencies:
+  Quote Ready build and delivery are consumed by the qualification worker
+  through src.services.quote_ready.workflow, with revision checks and retries.
+  T3-8 owns the enrichment-exhaustion policy for pending enrichment gaps.
 
 Compliance boundary (SOT.md Part 1):
     No borrower financial data (credit score, income, bank statement, tax
@@ -569,14 +565,8 @@ def enqueue_quote_ready_work(
 ) -> Optional[str]:
     """Enqueue Scenario Builder work for a sufficient opportunity.
 
-    DEPENDENCY: The 'fa_max_quote_ready' queue consumer is owned by Dev 4
-    (WP-8A/8B) and is NOT YET BUILT. This enqueue is durable; the work item
-    will sit pending until Dev 4's consumer comes online.
-
-    The consumer MUST re-verify (opportunity_id, facts_revision, checklist_version)
-    at result-publication time, not only at claim time, to detect a correction
-    that landed mid-calculation and map the in-flight result to 'superseded'
-    rather than the current scenario.
+    Consumed by the qualification worker's durable build/delivery workflow.
+    Both stages re-check the revision, checklist version, and open outcome.
     """
     from src.services.state_engine import enqueue_work_item
 
@@ -594,3 +584,76 @@ def enqueue_quote_ready_work(
         idempotency_key=idempotency_key,
         person_id=person_id,
     )
+
+
+# ---------------------------------------------------------------------------
+# Fact resolution for the Scenario Builder (WP-8A/8B integration)
+# ---------------------------------------------------------------------------
+
+# QuoteReadyInput fields T3-7 can supply, in the order the fallback chain
+# in src/services/quote_ready/compute.py._purchase_basis() itself checks
+# them. This is the agreed precedence contract for the WP-8A/8B connection
+# (code-review finding, eighth round, 2026-09): T3-7's client-confirmed
+# fa_max_opportunity_facts value wins whenever it is non-NULL; a NULL value
+# (never set, or explicitly cleared via the admin endpoint) falls through
+# to the caller's own fallback source (financials / published ARV). This
+# is the SAME precedence rule set_facts() already enforces for writes
+# (client always wins over enrichment) — this function is the read-side of
+# that same contract, so a consumer building a QuoteReadyInput never has to
+# duplicate the precedence logic itself.
+RESOLVABLE_QUOTE_READY_FACT_KEYS: frozenset[str] = frozenset({
+    "purchase_price", "estimated_value", "assessed_value_mkt", "last_sale_price",
+    "rehab_estimate", "rehab_source", "rehab_confidence",
+    "arv", "arv_source", "arv_confidence",
+})
+
+
+def resolve_quote_ready_facts(
+    *, session: Session, opportunity_id: str, fallback: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Resolve QuoteReadyInput fields for one opportunity, giving T3-7's
+    client-confirmed facts precedence over the caller's own fallback source
+    (e.g. dossier.py's financials/published-ARV read) — see
+    RESOLVABLE_QUOTE_READY_FACT_KEYS's docstring for the exact contract.
+
+    LOCKS the facts row (FOR UPDATE) for the remainder of the CALLER's
+    transaction — the caller is expected to persist its computed result
+    (and commit, releasing this lock) before returning, so a concurrent
+    set_facts() call cannot land between this resolution and that persist
+    and go unnoticed (code-review finding, eighth round, 2026-09: "protect
+    against publishing superseded facts"). This mirrors
+    _lock_and_check_eligibility's pattern in the qualification worker.
+
+    Returns a dict with every key in `fallback` present: T3-7's value where
+    the fact row has one, the caller's own fallback value otherwise (never
+    None-over-a-real-value, and never invents a value neither side has).
+    Also includes 'facts_revision' — the caller may record this in its own
+    persisted provenance for auditability, though the lock already
+    guarantees no revision skew within a single resolve+persist call.
+
+    No facts row (opportunity never received a T3-7 intake write) is a
+    normal case, not an error — every resolved field falls back to the
+    caller's own value, and facts_revision is 0.
+    """
+    row = session.execute(
+        text(
+            "SELECT " + ", ".join(sorted(RESOLVABLE_QUOTE_READY_FACT_KEYS)) +
+            ", facts_revision"
+            " FROM fa_max_opportunity_facts"
+            " WHERE opportunity_id = :oid ::uuid"
+            " FOR UPDATE"
+        ),
+        {"oid": opportunity_id},
+    ).mappings().first()
+
+    resolved = dict(fallback)
+    facts_revision = 0
+    if row is not None:
+        facts_revision = row["facts_revision"] or 0
+        for key in RESOLVABLE_QUOTE_READY_FACT_KEYS:
+            value = row[key]
+            if value is not None:
+                resolved[key] = value
+
+    resolved["facts_revision"] = facts_revision
+    return resolved

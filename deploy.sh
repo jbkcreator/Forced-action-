@@ -197,6 +197,17 @@ if ! cmp -s "$RELAY_UNIT_SRC" "$RELAY_UNIT_DST" 2>/dev/null; then
 fi
 systemctl enable fa-relay-slack-listener || fail "systemctl enable fa-relay-slack-listener"
 
+# Qualification also consumes Quote Ready build and delivery queues.
+QUAL_UNIT_SRC="$PROJECT_DIR/deploy/systemd/fa-max-qualification-worker.service"
+QUAL_UNIT_DST="/etc/systemd/system/fa-max-qualification-worker.service"
+if ! cmp -s "$QUAL_UNIT_SRC" "$QUAL_UNIT_DST" 2>/dev/null; then
+    cp "$QUAL_UNIT_SRC" "$QUAL_UNIT_DST" || fail "install fa-max-qualification-worker"
+    systemctl daemon-reload || fail "daemon-reload qualification worker"
+fi
+systemctl enable fa-max-qualification-worker || fail "enable qualification worker"
+systemctl restart fa-max-qualification-worker || fail "restart qualification worker"
+systemctl is-active --quiet fa-max-qualification-worker || fail "qualification worker not active"
+
 systemctl restart fa-api || fail "systemctl restart fa-api"
 systemctl restart lifecycle || fail "systemctl restart lifecycle"
 systemctl restart cora || fail "systemctl restart cora"

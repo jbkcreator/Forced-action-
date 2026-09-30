@@ -212,7 +212,7 @@ def assemble_dossier_row(session: Session, result_id: str) -> Optional[dict[str,
     return row
 
 
-def post_quote_ready_dossier(session: Session, result_id: str) -> Optional[str]:
+def post_quote_ready_dossier(session: Session, result_id: str, *, delivery_id: Optional[str] = None) -> Optional[str]:
     """Post the dossier for one fa_max_quote_ready_results row to the
     internal MONEY Slack lane. Returns the Slack message ts, or None if
     Slack isn't configured or the row doesn't exist (never raises — a
@@ -236,8 +236,9 @@ def post_quote_ready_dossier(session: Session, result_id: str) -> Optional[str]:
     text_body = build_dossier_text(row)
     try:
         from slack_sdk import WebClient
-        client = WebClient(token=token.get_secret_value())
-        response = client.chat_postMessage(channel=channel, text=text_body, blocks=_build_dossier_blocks(row, text_body))
+        client = WebClient(token=token.get_secret_value(), timeout=15, retry_handlers=[])
+        kwargs = {"client_msg_id": delivery_id} if delivery_id else {}
+        response = client.chat_postMessage(channel=channel, text=text_body, blocks=_build_dossier_blocks(row, text_body), **kwargs)
         return response["ts"]
     except Exception:
         logger.error("[QuoteReady] Slack post failed for result_id=%s", result_id, exc_info=True)
@@ -774,14 +775,43 @@ _DEFAULT_MAX_LTC = Decimal("0.85")
 _DEFAULT_MAX_LTV = Decimal("0.75")
 
 
-def maybe_trigger_quote_ready_review(session: Session, *, opportunity_id: str) -> None:
-    """Auto-compute and post a Quote Ready dossier when an opportunity has
-    enough real deal facts to be worth Josh's 3-minute review. Silent no-op
-    (not an error) when the opportunity has no linked subject property, or
-    no financials row, or the resulting scenario is identical to the last
-    one already posted (re-entering 'scoping' from 'ready_to_submit' with
-    unchanged facts must not re-spam a duplicate card).
+def compute_and_persist_quote_ready(session: Session, *, opportunity_id: str, return_existing: bool = False) -> Optional[str]:
+    """Compute a Quote Ready scenario from an opportunity's current facts
+    and durably persist it — NO Slack delivery here. Returns the result_id
+    of a genuinely NEW or changed scenario, or None when there is nothing
+    new to deliver (no linked subject property, or the resulting scenario
+    is identical to the last one already computed).
+
+    Split out from maybe_trigger_quote_ready_review (code-review finding,
+    ninth round, 2026-09) so a caller can commit this persist and THEN
+    attempt Slack delivery in a separate step/transaction — posting to
+    Slack from inside a savepoint of a larger, still-open transaction risks
+    a "phantom card": if something LATER in that same outer transaction
+    fails and rolls back, the Slack message was already sent (an
+    irreversible external side effect) but the DB row backing its
+    Approve/Modify/Reject buttons never committed. See
+    maybe_trigger_quote_ready_review's docstring for the still-inline
+    caller (the state_engine.transition() hook) and its accepted residual
+    risk, and qualification_worker.py's own caller for the fully-split
+    persist-then-deliver-after-commit pattern.
+
+    Facts precedence (code-review finding, eighth round, 2026-09 — the T3-7
+    Qualification Agent's client-confirmed facts and this financials-derived
+    read were two disconnected sources of "current" deal facts, so a client
+    correction gathered by T3-7 was never reflected in the dossier Josh
+    actually reviews): T3-7's fa_max_opportunity_facts values, where present,
+    now override the raw financials read below via
+    fa_max_qualification.resolve_quote_ready_facts() — the SAME
+    client-always-wins-when-set precedence set_facts() already enforces on
+    the write side. financials/published-ARV remain the fallback for any
+    field the client hasn't confirmed (most commonly on an opportunity T3-7
+    never touched at all, or a pure enrichment-sourced field, or a property
+    that simply has no financials row yet — code-review finding, ninth
+    round, 2026-09: financials is a fallback SOURCE, not a REQUIREMENT; a
+    property that hasn't been through enrichment yet must not block a
+    scenario T3-7's own facts are otherwise complete enough to compute).
     """
+    from src.services.fa_max_qualification import resolve_quote_ready_facts
     from src.services.quote_ready.compute import compute_quote_ready
     from src.services.quote_ready.models import QuoteReadyInput
     from src.services.quote_ready.persistence import persist_quote_ready_result
@@ -789,13 +819,28 @@ def maybe_trigger_quote_ready_review(session: Session, *, opportunity_id: str) -
     property_id = session.execute(_SUBJECT_PROPERTY_SQL, {"opportunity_id": opportunity_id}).scalar()
     if property_id is None:
         logger.info("[QuoteReady] auto-trigger skipped for opportunity_id=%s — no linked subject property", opportunity_id)
-        return
+        return None
 
+    # financials is a FALLBACK source, not a requirement — T3-7's own
+    # confirmed facts (resolved below) are the primary source and can be
+    # completely sufficient on their own (code-review finding, ninth round,
+    # 2026-09: this early return fired before T3-7's facts were ever read,
+    # so a rehab opportunity with a client-confirmed purchase price, rehab
+    # estimate, and ARV still produced NO scenario at all if its property
+    # simply hadn't been through the enrichment pipeline yet — a newly
+    # discovered or manually entered property has no financials row by
+    # construction, not by error). A missing row degrades gracefully to an
+    # all-None fallback; resolve_quote_ready_facts() below still lets T3-7's
+    # confirmed values through per field.
     fin = session.execute(_FINANCIALS_SQL, {"property_id": property_id}).mappings().first()
     if fin is None:
-        logger.info("[QuoteReady] auto-trigger skipped for opportunity_id=%s property_id=%s — no financials row",
-                    opportunity_id, property_id)
-        return
+        logger.info(
+            "[QuoteReady] opportunity_id=%s property_id=%s has no financials row —"
+            " proceeding on T3-7 facts alone where present",
+            opportunity_id, property_id,
+        )
+        fin = {"assessed_value_mkt": None, "last_sale_price": None,
+               "est_repair_cost": None, "legacy_arv": None}
 
     published_arv = get_published_arv(session, property_id)
     if published_arv is not None:
@@ -808,23 +853,61 @@ def maybe_trigger_quote_ready_review(session: Session, *, opportunity_id: str) -
     else:
         arv, arv_source, arv_confidence = None, "legacy_financial.arv", "low"
 
+    # Resolve T3-7 facts over this financials/ARV fallback — FOR UPDATE
+    # locks the facts row for the rest of this function, so a concurrent
+    # set_facts() can't land between this read and persist_quote_ready_result()
+    # committing below without either being reflected in the OTHER's outcome.
+    resolved = resolve_quote_ready_facts(
+        session=session,
+        opportunity_id=opportunity_id,
+        fallback={
+            "estimated_value": fin["assessed_value_mkt"],
+            "last_sale_price": fin["last_sale_price"],
+            "rehab_estimate": fin["est_repair_cost"],
+            "rehab_source": "job_estimator",
+            "arv": arv,
+            "arv_source": arv_source,
+            "arv_confidence": arv_confidence,
+        },
+    )
+    facts_revision = resolved.pop("facts_revision")
+
     inp = QuoteReadyInput(
         opportunity_id=opportunity_id, property_id=property_id,
         max_ltc=_DEFAULT_MAX_LTC, max_ltv=_DEFAULT_MAX_LTV,
-        estimated_value=fin["assessed_value_mkt"], last_sale_price=fin["last_sale_price"],
-        rehab_estimate=fin["est_repair_cost"], rehab_source="job_estimator",
-        arv=arv, arv_source=arv_source, arv_confidence=arv_confidence,
+        purchase_price=resolved.get("purchase_price"),
+        estimated_value=resolved["estimated_value"],
+        assessed_value_mkt=resolved.get("assessed_value_mkt"),
+        last_sale_price=resolved["last_sale_price"],
+        rehab_estimate=resolved["rehab_estimate"], rehab_source=resolved["rehab_source"],
+        rehab_confidence=resolved.get("rehab_confidence"),
+        arv=resolved["arv"], arv_source=resolved["arv_source"], arv_confidence=resolved["arv_confidence"],
     )
     result = compute_quote_ready(inp)
 
     previous_id = session.execute(_LATEST_COMPUTED_FOR_TRIGGER_SQL, {"opportunity_id": opportunity_id}).scalar()
-    new_result_id = persist_quote_ready_result(session, inp=inp, result=result, computed_by="auto_trigger:scoping")
+    new_result_id = persist_quote_ready_result(
+        session, inp=inp, result=result,
+        computed_by=f"auto_trigger:scoping:facts_rev={facts_revision}",
+    )
 
     if new_result_id == previous_id:
-        logger.info("[QuoteReady] auto-trigger for opportunity_id=%s: scenario unchanged, no new card posted",
+        logger.info("[QuoteReady] opportunity_id=%s: scenario unchanged, nothing new to deliver",
                      opportunity_id)
-        return
+        return new_result_id if return_existing else None
 
-    logger.info("[QuoteReady] auto-trigger posted dossier for opportunity_id=%s result_id=%s (missing=%s)",
-                opportunity_id, new_result_id, result.missing)
-    post_quote_ready_dossier(session, new_result_id)
+    logger.info("[QuoteReady] opportunity_id=%s computed+persisted result_id=%s"
+                " facts_revision=%d (missing=%s) — pending delivery",
+                opportunity_id, new_result_id, facts_revision, result.missing)
+    return new_result_id
+
+
+def maybe_trigger_quote_ready_review(session: Session, *, opportunity_id: str) -> None:
+    """Legacy synchronous helper for explicit/manual callers only.
+
+    Production transitions and qualification enqueue through quote_ready.workflow.
+    This helper does not own a transaction and is not an automatic hook.
+    """
+    new_result_id = compute_and_persist_quote_ready(session, opportunity_id=opportunity_id)
+    if new_result_id is not None:
+        post_quote_ready_dossier(session, new_result_id)

@@ -220,6 +220,46 @@ _LATEST_COMPUTED_SQL = _text(
     """
 )
 
+# Matches uq_quote_ready_opp_hash_version's actual scope: (opportunity_id,
+# input_hash, calculation_version) with NO status filter (code-review
+# finding, eighth round, 2026-09). _LATEST_COMPUTED_SQL above only looks at
+# 'computed' rows for the supersede DECISION — correct for that purpose
+# (never clobber a reviewer's 'needs_review'/'approved'/'rejected' row) —
+# but persist_quote_ready_result() used ONLY that lookup to also decide
+# insert-vs-noop, so a recompute producing the exact same (hash, version)
+# as an existing NON-'computed' row (most commonly 'incomplete' — an
+# opportunity missing ARV, retried unchanged) found no 'latest', tried to
+# insert, and crashed on the unique constraint instead of returning the
+# existing row. Caught by the $20k/$50k precedence integration test's own
+# repeat-trigger-no-duplicate case.
+_EXACT_MATCH_ANY_STATUS_SQL = _text(
+    """
+    SELECT result_id::text AS result_id, status
+    FROM fa_max_quote_ready_results
+    WHERE opportunity_id = :opportunity_id ::uuid
+      AND input_hash = :input_hash AND calculation_version = :calculation_version
+    LIMIT 1
+    """
+)
+
+# Revives a historical row back to 'computed' — used when a value reverts
+# to something it was BEFORE (e.g. rehab $50k -> $60k -> $50k): the $50k
+# row still exists with status='superseded' from the earlier transition,
+# and uq_quote_ready_opp_hash_version forbids inserting a second row with
+# the same (opportunity_id, input_hash, calculation_version), so reviving
+# the existing row is the ONLY way to make it current again (code-review
+# finding, ninth round, 2026-09). review_status/reviewed_by/reviewed_at are
+# cleared: a resurfaced identical scenario is not the same review context
+# it was reviewed in before (time has passed, other facts may have changed
+# since) — never let a stale approval silently reapply to "now."
+_REVIVE_TO_COMPUTED_SQL = _text(
+    """
+    UPDATE fa_max_quote_ready_results
+    SET status = 'computed', review_status = NULL, reviewed_by = NULL, reviewed_at = NULL
+    WHERE result_id = :rid ::uuid
+    """
+)
+
 _MARK_SUPERSEDED_SQL = _text(
     "UPDATE fa_max_quote_ready_results SET status = 'superseded' WHERE result_id = :rid ::uuid"
 )
@@ -278,6 +318,38 @@ def persist_quote_ready_result(
     decision = decide_persistence(latest, new_hash, QUOTE_READY_CALC_VERSION)
     if decision.action == "noop":
         return decision.existing_result_id  # type: ignore[return-value]
+
+    # decide_persistence() only saw 'computed' rows — an exact (hash,
+    # version) match against a NON-'computed' row is invisible to it, but
+    # still collides with uq_quote_ready_opp_hash_version (INSERT would
+    # crash) if we tried to insert a fresh row for it. Check the
+    # constraint's actual scope directly before attempting the insert.
+    exact_match = session.execute(
+        _EXACT_MATCH_ANY_STATUS_SQL,
+        {
+            "opportunity_id": str(inp.opportunity_id),
+            "input_hash": new_hash,
+            "calculation_version": QUOTE_READY_CALC_VERSION,
+        },
+    ).mappings().first()
+    if exact_match is not None:
+        if exact_match["status"] == "incomplete":
+            # An incomplete result was never a reviewable "current" scenario
+            # to begin with (the computation itself couldn't finish, e.g.
+            # missing ARV) — reuse it as-is, no supersede bookkeeping needed.
+            return exact_match["result_id"]
+        # Any other non-'computed' status (most commonly 'superseded', but
+        # also 'needs_review'/'approved'/'rejected' if a value reverts to
+        # something a reviewer already looked at once) means a value has
+        # reverted to a PRIOR state (code-review finding, ninth round,
+        # 2026-09: previously this branch returned the historical id as-is,
+        # leaving it marked non-'computed' while a genuinely stale row
+        # stayed marked 'computed' — the scenario Josh sees would be the
+        # WRONG one). Revive it and supersede whatever is current now.
+        if decision.action == "insert_supersede":
+            session.execute(_MARK_SUPERSEDED_SQL, {"rid": decision.supersedes_result_id})
+        session.execute(_REVIVE_TO_COMPUTED_SQL, {"rid": exact_match["result_id"]})
+        return exact_match["result_id"]
 
     row_dict = build_result_row(
         inp, result, computed_by=computed_by, supersedes_result_id=decision.supersedes_result_id,
