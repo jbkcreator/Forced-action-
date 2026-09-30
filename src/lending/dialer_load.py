@@ -33,6 +33,7 @@ from src.lending.backflip_conflict import (
     load_backflip_identifier_index,
 )
 from src.lending.compliance import GateResult, Scrubber, filter_loadable, phone_hash
+from src.lending.dialer_port import DialerRequestError
 from src.lending.dialer_contact import DialerDisplay, aircall_fields, display_from_record
 from src.services.aircall_client import (
     AircallAmbiguousContact,
@@ -51,7 +52,8 @@ REASON_NEEDS_SCRUB = "NEEDS_SCRUB"
 
 
 class DialerContacts(Protocol):
-    def upsert_contact(self, phone: str, fields: AircallContactFields) -> ContactUpsertResult: ...
+    def upsert_contact(self, phone: str, fields: AircallContactFields, *,
+                       campaign: Optional[str] = None) -> ContactUpsertResult: ...
     def update_contact(self, contact_id: int, fields: AircallContactFields) -> dict: ...
 
 
@@ -194,10 +196,10 @@ def _push_contact(aircall: DialerContacts, item: _Loadable, known_contact_id: Op
         try:
             aircall.update_contact(known_contact_id, fields)
             return ContactUpsertResult(contact_id=known_contact_id, created=False)
-        except AircallRequestError as exc:
+        except (AircallRequestError, DialerRequestError) as exc:
             if exc.status != 404:
                 raise
-    return aircall.upsert_contact(item.phone, fields)
+    return aircall.upsert_contact(item.phone, fields, campaign=item.display.campaign_tag)
 
 
 def _store_chunk(db, run_id: str, loaded: list[tuple[_Loadable, int]],
@@ -331,7 +333,7 @@ def run_dialer_load(
         fields = aircall_fields(item.display, email=item.record.get("email"))
         try:
             result = _push_contact(aircall, item, active.get(item.phone, (None, None))[1], fields)
-        except (AircallRequestError, AircallAmbiguousContact) as exc:
+        except (AircallRequestError, AircallAmbiguousContact, DialerRequestError) as exc:
             report.failed.append({"record_ref": item.record_ref, "error": type(exc).__name__,
                                   "status": getattr(exc, "status", None)})
             continue

@@ -11,10 +11,13 @@ AIRCALL_RETRY_BASE_SECONDS: float = 2.0
 AIRCALL_MAX_RETRY_WAIT_SECONDS: float = 60.0
 AIRCALL_REQUEST_TIMEOUT_SECONDS: float = 20.0
 
-# Pool -> Aircall campaign tag. Empty until the client decides which pool gets
-# DESK_CAPITAL_LOOP / DESK_CONSTRUCTION / DESK_RESCUE; a live load refuses to
-# run for any pool without an entry here.
-POOL_CAMPAIGN_TAGS: dict[str, str] = {}
+# Pool (launch queue) -> dialer campaign name (Go Live Brief 2.5). The campaigns must
+# exist in BatchDialer with these exact names; a live load refuses any unmapped pool.
+POOL_CAMPAIGN_TAGS: dict[str, str] = {
+    "verified_maturity": "Verified maturity",
+    "transaction_ready": "Transaction ready",
+    "builders": "Builders",
+}
 
 
 # BatchDialer (client decision, Go Live Brief 2.4). Auth header X-ApiKey. Each endpoint
@@ -25,6 +28,7 @@ BATCHDIALER_BASE_URL: str = "https://app.batchdialer.com/api"
 BATCHDIALER_TIMEOUT_SECONDS: float = 20.0
 BATCHDIALER_ENDPOINTS: dict[str, "tuple[str, str] | None"] = {
     "contact_upsert": None,
+    "contact_update": None,
     "campaign_remove": None,
     "campaign_restore": None,
     "dnc_add": None,

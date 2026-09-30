@@ -71,3 +71,58 @@ def test_rules_code_defaults_use_the_configured_dialer(monkeypatch):
     compliance._default_dialer_remover()(PHONE, reason="attempt_cap")
     compliance._default_dialer_restorer()(PHONE)
     assert dialer.events == [("remove", PHONE, "attempt_cap"), ("restore", PHONE, None)]
+
+
+# ── Loader surface (the dialer load pushes contacts through the same adapter) ──
+
+from src.lending.dialer_port import DialerRequestError
+from src.services.aircall_client import AircallContactFields
+
+FIELDS = AircallContactFields(first_name="Jane", last_name="Roe", company_name="Roe LLC",
+                              information="Property: 1 St", email="j@example.com")
+
+
+class CampaignHttp(FakeHttp):
+    def __init__(self, campaigns, body=None):
+        super().__init__(body=body)
+        self.campaigns = campaigns
+
+    def __call__(self, method, path, *, json=None):
+        if (method, path) == ("GET", "/campaigns"):
+            self.calls.append((method, path, None))
+            return self.campaigns
+        return super().__call__(method, path, json=json)
+
+
+def test_loader_upsert_adds_the_contact_to_the_named_campaign():
+    http = CampaignHttp([{"id": 7, "name": "Builders"}], body={"id": 55})
+    result = BatchDialerAdapter(http=http, endpoints=ENDPOINTS).upsert_contact(PHONE, FIELDS, campaign="Builders")
+    assert result.contact_id == 55 and result.created is True
+    method, path, body = http.calls[-1]
+    assert (method, path) == ("POST", "/contacts") and body["campaignId"] == 7 and body["phone"] == PHONE
+
+
+def test_campaign_ids_are_looked_up_once():
+    http = CampaignHttp([{"id": 7, "name": "Builders"}], body={"id": 1})
+    adapter = BatchDialerAdapter(http=http, endpoints=ENDPOINTS)
+    adapter.upsert_contact(PHONE, FIELDS, campaign="Builders")
+    adapter.upsert_contact("+18135558202", FIELDS, campaign="Builders")
+    assert [c for c in http.calls if c[1] == "/campaigns"] == [("GET", "/campaigns", None)]
+
+
+def test_an_unknown_campaign_is_a_request_error_not_a_silent_load():
+    http = CampaignHttp([{"id": 7, "name": "Builders"}])
+    with pytest.raises(DialerRequestError):
+        BatchDialerAdapter(http=http, endpoints=ENDPOINTS).upsert_contact(PHONE, FIELDS, campaign="Nope")
+
+
+def test_record_style_upsert_still_works_for_the_rules_code():
+    http = FakeHttp(body={"id": 42})
+    assert BatchDialerAdapter(http=http, endpoints=ENDPOINTS).upsert_contact({"phone": PHONE}) == "42"
+
+
+def test_pool_campaign_tags_name_the_three_launch_queues():
+    from config import lending_queues as q
+    from config.lending_dialer import POOL_CAMPAIGN_TAGS
+    assert POOL_CAMPAIGN_TAGS == {q.VERIFIED_MATURITY: "Verified maturity",
+                                  q.TRANSACTION_READY: "Transaction ready", q.BUILDERS: "Builders"}

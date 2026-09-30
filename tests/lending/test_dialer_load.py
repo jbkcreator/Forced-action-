@@ -33,12 +33,14 @@ EMPTY_INDEX = BackflipIdentifierIndex(block_reason=None)
 class FakeAircall:
     def __init__(self, fail_phones=(), missing_ids=()):
         self.upserts: list[str] = []
+        self.campaigns: list = []
         self.updates: list[int] = []
         self._next_id = 1000
         self._fail = set(fail_phones)
         self._missing = set(missing_ids)
 
-    def upsert_contact(self, phone, fields):
+    def upsert_contact(self, phone, fields, *, campaign=None):
+        self.campaigns.append(campaign)
         if phone in self._fail:
             raise AircallRequestError("POST", "/contacts", 500)
         self.upserts.append(phone)
@@ -231,3 +233,21 @@ class TestReload:
         report, _ = _run(db, [_record("a", P1)], run_id="run-2")
         assert report.active_not_in_run == 1
         assert [r.phone for r in _load_rows(db, "run-1") if r.active] == [P2]
+
+
+def test_live_load_sends_each_contact_to_its_pool_campaign(db):
+    _fresh_scrub(db, P1)
+    dialer = FakeAircall()
+    with patch.object(dialer_load, "load_backflip_identifier_index", return_value=EMPTY_INDEX):
+        run_dialer_load([_record("c1", P1, pool="builders")], db, run_id="t-campaign", dry_run=False,
+                        scrubber=lambda phones: [], aircall=dialer, campaign_tags=TAGS, commit=db.flush)
+    assert dialer.campaigns == ["DESK_CONSTRUCTION"]
+
+
+def test_live_task_refuses_without_a_configured_dialer(tmp_path, monkeypatch):
+    from src.lending import dialer_port
+    from src.tasks import lending_dialer_load as task
+    monkeypatch.setattr(dialer_port, "get_dialer", lambda: None)
+    pools = tmp_path / "pools.json"
+    pools.write_text("[]", encoding="utf-8")
+    assert task.main(["--input", str(pools), "--live"]) == 3
