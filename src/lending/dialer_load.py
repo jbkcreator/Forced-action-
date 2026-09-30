@@ -84,6 +84,8 @@ class LoadReport:
     loadable_by_pool: Counter = field(default_factory=Counter)
     duplicate_phones: int = 0
     distinct_phones: int = 0
+    needs_scrub: int = 0  # dry run: numbers with no fresh scrub, whatever blocked them afterwards
+    needs_scrub_backflip_blocked: int = 0  # of those, how many the Backflip check also blocked
     unmapped_pools: list[str] = field(default_factory=list)
     failed: list[dict] = field(default_factory=list)
     active_not_in_run: int = 0
@@ -101,6 +103,7 @@ class LoadReport:
             "loadable_by_pool": dict(self.loadable_by_pool),
             "duplicate_phones": self.duplicate_phones,
             "distinct_phones": self.distinct_phones,
+            "needs_scrub": self.needs_scrub,
             "unmapped_pools": self.unmapped_pools,
             "failed": self.failed,
             "active_not_in_run": self.active_not_in_run,
@@ -271,6 +274,7 @@ def run_dialer_load(
     # A dry run scrubs nothing, so unscrubbed numbers still go through the
     # Backflip check; those that pass are reported as needing a scrub.
     pending_scrub = {i for i, reason in blocks.items() if dry_run and reason == REASON_SCRUB_FAILED}
+    report.needs_scrub = len(pending_scrub)
     for i in pending_scrub:
         del blocks[i]
     candidates = [i for i in range(len(records)) if i not in blocks]
@@ -284,6 +288,7 @@ def run_dialer_load(
         rail = dial_blocks(db, sorted({phones[i] for i in rail_candidates}), now=now)
         blocks.update({i: rail[phones[i]].value for i in rail_candidates if phones[i] in rail})
     blocks.update({i: REASON_NEEDS_SCRUB for i in pending_scrub if i not in conflict_blocks})
+    report.needs_scrub_backflip_blocked = sum(1 for i in pending_scrub if i in conflict_blocks)
     propagated = _propagate_by_phone(phones, blocks)
 
     exclusion_rows = [

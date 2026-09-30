@@ -20,11 +20,17 @@ _SCRUB_REASONS = frozenset({
 })
 
 
-def stage_counts(*, traced: int, excluded_by_reason: Mapping[str, int]) -> dict[str, int]:
-    """Numbers left after the scrub stage and after the Backflip check."""
-    scrubbed = traced - sum(n for r, n in excluded_by_reason.items() if r in _SCRUB_REASONS)
+def stage_counts(*, traced: int, excluded_by_reason: Mapping[str, int], needs_scrub: int = 0,
+                 needs_scrub_backflip_blocked: int = 0) -> dict[str, int]:
+    """Numbers left after the scrub stage and after the Backflip check.
+
+    A number with no fresh scrub never counts as scrubbed, even when the Backflip check
+    is the reason recorded for it (a dry run records the first block that sticks)."""
+    scrub_blocked = sum(n for r, n in excluded_by_reason.items() if r in _SCRUB_REASONS and r != "NEEDS_SCRUB")
+    scrubbed = max(traced - scrub_blocked - needs_scrub, 0)
     backflip = sum(n for r, n in excluded_by_reason.items() if r.startswith("BACKFLIP_"))
-    return {"scrubbed": scrubbed, "after_backflip": scrubbed - backflip}
+    backflip_on_scrubbed = backflip - needs_scrub_backflip_blocked
+    return {"scrubbed": scrubbed, "after_backflip": max(scrubbed - backflip_on_scrubbed, 0)}
 
 
 def tracerfy_hit_rate(db, *, since: Optional[datetime] = None) -> Optional[float]:
@@ -75,8 +81,10 @@ def queue_count_report(
         queues[queue] = {
             "raw": len(rows),
             "traced": traced,
-            **stage_counts(traced=traced, excluded_by_reason=report.excluded_by_reason),
-            "needs_scrub": report.excluded_by_reason.get("NEEDS_SCRUB", 0),
+            **stage_counts(traced=traced, excluded_by_reason=report.excluded_by_reason,
+                           needs_scrub=report.needs_scrub,
+                           needs_scrub_backflip_blocked=report.needs_scrub_backflip_blocked),
+            "needs_scrub": report.needs_scrub,
             "excluded_by_reason": dict(report.excluded_by_reason),
             "eligible": report.distinct_phones,
         }
