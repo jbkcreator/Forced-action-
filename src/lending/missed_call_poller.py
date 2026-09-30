@@ -1,4 +1,5 @@
-"""WP-GL-9 missed-call poller: read BatchDialer call records, decide each new no-answer.
+"""Call-record poller: every finished call becomes an attempt row (3-attempt rail), and each
+new no-answer gets its missed-call text decision (WP-GL-9).
 
 Sends only when MISSED_CALL_TEXT_ENABLED=true; otherwise every no-answer is logged as
 ``dry_run``. One cycle at a time (advisory lock), one transaction per cycle.
@@ -19,6 +20,8 @@ from sqlalchemy import text
 
 from config.lending_missed_call import POLL_LOCK_KEY, POLL_SECONDS
 from config.settings import get_settings
+from src.lending.call_log import record_call_attempts
+from src.lending.compliance import on_attempt_recorded
 from src.lending.missed_call_text import consent_gated_sender, parse_cdr, process_missed_calls
 
 logger = logging.getLogger(__name__)
@@ -32,7 +35,12 @@ def run_cycle(db, *, http, enabled: bool, now: Optional[datetime] = None) -> Opt
     """None when another poller holds the lock. Does not commit."""
     if not db.execute(text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": POLL_LOCK_KEY}).scalar():
         return None
-    calls = [c for c in (parse_cdr(r) for r in _records(http("GET", "/cdrs"))) if c is not None]
+    records = _records(http("GET", "/cdrs"))
+    # Every finished call is an attempt: write it to the call log and run the cap hook,
+    # so the 3-attempt rail works even if the dialer never pushes a call event.
+    for phone in dict.fromkeys(record_call_attempts(db, records)):
+        on_attempt_recorded(db, phone, now=now)
+    calls = [c for c in (parse_cdr(r) for r in records) if c is not None]
     return process_missed_calls(db, calls, sender=consent_gated_sender(db), enabled=enabled, now=now)
 
 

@@ -58,3 +58,34 @@ def test_calls_missing_the_flag_are_listed_within_the_window(db):
     _call(db, NOW - timedelta(hours=1), logged=True)
     found = calls_missing_disclosure(db, since=NOW - timedelta(days=1))
     assert missing in found and old not in found
+
+
+# ── Attempt rows from BatchDialer call records (so the cap works without pushed events) ──
+
+def _record(call_id, phone="(813) 555-8502", direction="outbound", status="no-answer", ended="2026-10-01T14:00:00Z"):
+    return {"id": call_id, "phoneNumber": phone, "direction": direction, "status": status, "endedAt": ended}
+
+
+def test_call_records_become_attempt_rows_once(db):
+    from src.lending.call_log import record_call_attempts
+    rows = [_record(f"cdr-{uuid.uuid4().hex[:6]}"), _record(f"cdr-{uuid.uuid4().hex[:6]}", status="answered")]
+    assert record_call_attempts(db, rows) == ["+18135558502", "+18135558502"]
+    assert record_call_attempts(db, rows) == []           # replay inserts nothing
+    n = db.execute(text("SELECT count(*) FROM lending.call_dispositions WHERE phone = '+18135558502' "
+                        "AND direction = 'outbound' AND call_ended_at IS NOT NULL")).scalar()
+    assert n == 2
+
+
+def test_records_without_an_id_phone_or_end_time_are_ignored(db):
+    from src.lending.call_log import record_call_attempts
+    assert record_call_attempts(db, [_record(None), _record("x-1", phone=""), _record("x-2", ended=None)]) == []
+
+
+def test_an_existing_row_written_by_the_webhook_is_left_as_is(db):
+    from src.lending.call_log import record_call_attempts
+    cid = f"cdr-{uuid.uuid4().hex[:6]}"
+    db.execute(text("INSERT INTO lending.call_dispositions (dialer_call_id, phone, direction, caller_seat, raw_event) "
+                    "VALUES (:c, '+18135558502', 'outbound', 'seat-a1', '{}')"), {"c": cid})
+    assert record_call_attempts(db, [_record(cid)]) == []
+    assert db.execute(text("SELECT caller_seat FROM lending.call_dispositions WHERE dialer_call_id = :c"),
+                      {"c": cid}).scalar() == "seat-a1"

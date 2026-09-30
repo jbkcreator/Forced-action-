@@ -64,20 +64,31 @@ def _parse_time(value: Any) -> Optional[datetime]:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def parse_cdr(row: Mapping[str, Any]) -> Optional[MissedCall]:
-    """A MissedCall for an unanswered outbound call record, else None."""
+def call_record_fields(row: Mapping[str, Any]) -> Optional[dict[str, Any]]:
+    """The fields every consumer needs from one call record, or None when the record has
+    no id, usable phone or end time. Direction defaults to outbound (the dialer places calls)."""
     call_id = _first(row, CDR_ID_FIELDS)
-    status = str(_first(row, CDR_STATUS_FIELDS) or "").strip().lower()
-    direction = str(_first(row, CDR_DIRECTION_FIELDS) or "outbound").strip().lower()
     phone = normalize_phone(str(_first(row, CDR_PHONE_FIELDS) or ""))
     ended_at = _parse_time(_first(row, CDR_ENDED_AT_FIELDS))
     if not call_id or not phone or ended_at is None:
         return None
-    if status not in NO_ANSWER_STATUSES or direction not in OUTBOUND_DIRECTIONS:
-        return None
+    direction = str(_first(row, CDR_DIRECTION_FIELDS) or "outbound").strip().lower()
     caller_id = _first(row, CDR_CALLER_ID_FIELDS)
-    return MissedCall(call_id=str(call_id), phone=phone,
-                      caller_id_number=normalize_phone(str(caller_id)) if caller_id else None, ended_at=ended_at)
+    return {
+        "call_id": str(call_id), "phone": phone, "ended_at": ended_at,
+        "direction": "outbound" if direction in OUTBOUND_DIRECTIONS else direction,
+        "status": str(_first(row, CDR_STATUS_FIELDS) or "").strip().lower(),
+        "caller_id_number": normalize_phone(str(caller_id)) if caller_id else None,
+    }
+
+
+def parse_cdr(row: Mapping[str, Any]) -> Optional[MissedCall]:
+    """A MissedCall for an unanswered outbound call record, else None."""
+    fields = call_record_fields(row)
+    if fields is None or fields["direction"] != "outbound" or fields["status"] not in NO_ANSWER_STATUSES:
+        return None
+    return MissedCall(call_id=fields["call_id"], phone=fields["phone"],
+                      caller_id_number=fields["caller_id_number"], ended_at=fields["ended_at"])
 
 
 def render_text(property_address: Optional[str]) -> str:

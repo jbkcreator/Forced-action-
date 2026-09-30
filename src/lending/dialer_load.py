@@ -49,7 +49,8 @@ REASON_NEEDS_SCRUB = "NEEDS_SCRUB"
 class DialerContacts(Protocol):
     def upsert_contact(self, phone: str, fields: DialerContactFields, *,
                        campaign: Optional[str] = None) -> ContactUpsertResult: ...
-    def update_contact(self, contact_id: Any, fields: DialerContactFields) -> dict: ...
+    def update_contact(self, contact_id: Any, fields: DialerContactFields, *,
+                       phone: Optional[str] = None) -> dict: ...
 
 
 class LoadRefused(RuntimeError):
@@ -189,7 +190,7 @@ def _push_contact(dialer: DialerContacts, item: _Loadable, known_contact_id: Opt
     """Update by the stored contact id when known (search can lag); else upsert by phone."""
     if known_contact_id is not None:
         try:
-            dialer.update_contact(known_contact_id, fields)
+            dialer.update_contact(known_contact_id, fields, phone=item.phone)
             return ContactUpsertResult(contact_id=known_contact_id, created=False)
         except DialerRequestError as exc:
             if exc.status != 404:

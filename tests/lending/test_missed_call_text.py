@@ -163,3 +163,15 @@ def test_a_second_poller_skips_while_the_first_holds_the_lock(db):
     finally:
         other.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": POLL_LOCK_KEY})
         other.close()
+
+
+@needs_db
+def test_a_poll_cycle_writes_attempt_rows_and_runs_the_cap_hook(db, monkeypatch):
+    from src.lending import missed_call_poller
+    hooked = []
+    monkeypatch.setattr(missed_call_poller, "on_attempt_recorded", lambda db, phone, now=None: hooked.append(phone))
+    fresh = (NOW - timedelta(seconds=20)).isoformat()
+    records = {"items": [_cdr(id=f"a-{uuid.uuid4().hex[:6]}", status="answered", endedAt=fresh)]}
+    missed_call_poller.run_cycle(db, http=lambda *a, **k: records, enabled=False, now=NOW)
+    assert hooked == [PHONE]
+    assert db.execute(text("SELECT count(*) FROM lending.call_dispositions WHERE phone = :p"), {"p": PHONE}).scalar() == 1

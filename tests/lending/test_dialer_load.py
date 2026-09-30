@@ -47,7 +47,7 @@ class FakeAircall:
         self._next_id += 1
         return ContactUpsertResult(contact_id=self._next_id, created=True)
 
-    def update_contact(self, contact_id, fields):
+    def update_contact(self, contact_id, fields, *, phone=None):
         if contact_id in self._missing:
             raise DialerRequestError("POST /contacts/id", status=404)
         self.updates.append(contact_id)
@@ -280,3 +280,14 @@ class TestCallTimeRail:
         report, dialer = _run(db, [_record("a", P1)], now=late)   # 19:20 ET
         assert dialer.upserts == []
         assert report.excluded_by_reason["OUTSIDE_CALL_WINDOW"] == 1
+
+
+def test_live_task_refuses_while_a_load_endpoint_is_unconfirmed(tmp_path, monkeypatch):
+    from src.lending import dialer_port
+    from src.tasks import lending_dialer_load as task
+    adapter = dialer_port.BatchDialerAdapter(http=lambda *a, **k: {},
+                                             endpoints={"contact_upsert": ("POST", "/contact")})
+    monkeypatch.setattr(dialer_port, "get_dialer", lambda: adapter)
+    pools = tmp_path / "pools.json"
+    pools.write_text("[]", encoding="utf-8")
+    assert task.main(["--input", str(pools), "--live"]) == 3

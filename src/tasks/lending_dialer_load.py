@@ -67,6 +67,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.live and dialer is None:
         logger.error("[dialer-load] refused: no dialer configured (BATCHDIALER_API_KEY)")
         return 3
+    missing = dialer.missing_for_load() if args.live and hasattr(dialer, "missing_for_load") else []
+    if missing:
+        logger.error("[dialer-load] refused: unconfirmed dialer endpoint(s): %s", ", ".join(missing))
+        return 3
 
     with get_db_context() as session:
         try:

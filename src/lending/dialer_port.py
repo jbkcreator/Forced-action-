@@ -27,6 +27,7 @@ from src.lending.dialer_removal import DialerRemovalUndecided
 logger = logging.getLogger(__name__)
 
 Endpoint = Optional[tuple[str, str]]
+LOAD_ENDPOINTS = ("contact_upsert", "contact_update", "campaign_add_contact")
 Http = Callable[..., Mapping[str, Any]]
 
 
@@ -88,12 +89,16 @@ class BatchDialerAdapter:
         self._endpoints = endpoints
         self._campaign_ids: Optional[dict[str, Any]] = None
 
-    def _call(self, action: str, payload: dict) -> Mapping[str, Any]:
+    def _call(self, action: str, payload: dict, **path_params: Any) -> Mapping[str, Any]:
         endpoint = self._endpoints.get(action)
         if endpoint is None:
             raise UnconfirmedCapability(f"BatchDialer endpoint '{action}' is not confirmed")
         method, path = endpoint
-        return self._http(method, path, json=payload)
+        return self._http(method, path.format(**path_params), json=payload)
+
+    def missing_for_load(self) -> list[str]:
+        """Load endpoints still unconfirmed; a live load refuses while any is missing."""
+        return [name for name in LOAD_ENDPOINTS if self._endpoints.get(name) is None]
 
     def upsert_contact(
         self,
@@ -103,21 +108,29 @@ class BatchDialerAdapter:
         campaign: Optional[str] = None,
     ) -> Union[Optional[str], ContactUpsertResult]:
         """Two call shapes: ``upsert_contact(record)`` (rules code) returns the contact id;
-        ``upsert_contact(phone, fields, campaign=)`` (dialer load) returns a ContactUpsertResult."""
+        ``upsert_contact(phone, fields, campaign=)`` (dialer load) creates the contact, then
+        adds it to the campaign. The campaign step is checked first, so an unconfirmed
+        endpoint never leaves a contact created outside any campaign."""
         if isinstance(record_or_phone, Mapping):
             body = self._call("contact_upsert", dict(record_or_phone))
-            contact_id = body.get("id")
+            contact_id = _contact_id(body)
             return str(contact_id) if contact_id is not None else None
-        payload = _contact_body(record_or_phone, fields or DialerContactFields())
+        campaign_id = None
         if campaign is not None:
-            payload["campaignId"] = self._campaign_id(campaign)
-        body = self._call("contact_upsert", payload)
-        if body.get("id") is None:
+            if self._endpoints.get("campaign_add_contact") is None:
+                raise UnconfirmedCapability("BatchDialer endpoint 'campaign_add_contact' is not confirmed")
+            campaign_id = self._campaign_id(campaign)
+        body = self._call("contact_upsert", _contact_body(record_or_phone, fields or DialerContactFields()))
+        contact_id = _contact_id(body)
+        if contact_id is None:
             raise DialerRequestError("dialer returned no contact id")
-        return ContactUpsertResult(contact_id=body["id"], created=True)
+        if campaign_id is not None:
+            self._call("campaign_add_contact", {"contactId": contact_id}, campaign_id=campaign_id)
+        return ContactUpsertResult(contact_id=contact_id, created=True)
 
-    def update_contact(self, contact_id: Any, fields: DialerContactFields) -> dict:
-        return dict(self._call("contact_update", {"id": contact_id, **_contact_body(None, fields)}))
+    def update_contact(self, contact_id: Any, fields: DialerContactFields, *, phone: Optional[str] = None) -> dict:
+        """Full update (PUT): BatchDialer replaces every field, so the phone is sent again."""
+        return dict(self._call("contact_update", _contact_body(phone, fields), id=contact_id))
 
     def _campaign_id(self, name: str) -> Any:
         if self._campaign_ids is None:
@@ -138,13 +151,24 @@ class BatchDialerAdapter:
         self._call("campaign_restore", {"phone": phone})
 
 
+def _contact_id(body: Mapping[str, Any]) -> Any:
+    return body.get("id") if body.get("id") is not None else body.get("contactId")
+
+
 def _contact_body(phone: Optional[str], fields: DialerContactFields) -> dict:
-    """Field names follow BatchDialer's contact shape; confirmed by the first write test."""
-    body = {"firstName": fields.first_name or "", "lastName": fields.last_name or "",
-            "company": fields.company_name or "", "notes": fields.information or "",
-            "email": fields.email or ""}
+    """BatchDialer contact shape, confirmed live 2026-09-30 (create/read/update/delete).
+    Custom fields are free-form and hold what the caller sees beyond the name."""
+    body: dict[str, Any] = {
+        "firstname": fields.first_name or "",
+        "lastname": fields.last_name or "",
+        "customfields": {
+            "entity_name": fields.company_name or "",
+            "details": fields.information or "",
+            "email": fields.email or "",
+        },
+    }
     if phone is not None:
-        body["phone"] = phone
+        body["phoneNumbers"] = [{"phoneNumber": phone}]
     return body
 
 
