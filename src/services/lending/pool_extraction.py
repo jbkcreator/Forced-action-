@@ -96,18 +96,25 @@ CONSTRUCTION_AVG_LOAN = 525_000  # spec p1 (fallback when no job_value)
 FLIP_MIN_LOAN = 100_000          # spec p8
 FLIP_LOAN_FACTOR = 0.75          # bridge estimate off last sale_price
 
-# O12 — a real "Active Builder" is a contractor with N+ permits (spec §5.9 / p18
-# "project history 3+ projects"). The mechanism is spec-correct (count-based
-# qualification per normalized contractor); the threshold is configurable.
-#
-# Spec target is 3. But Wave 0 permit data barely captures contractor names
-# (verified on prod: only 2 contractors DB-wide have 3+ permits), because the
-# lifetime-permit-history aggregation is §5.9's Builder Permit Enrichment Engine
-# — a WAVE 1 component that normalizes names, maps DBPR/GA-SOS licenses and
-# aggregates FL+GA feeds. Until that runs, 3 yields an empty pool. So Wave 0
-# uses 1 (any identifiable builder with recent activity); flip to 3 once §5.9
-# populates builder history.
-BUILDER_MIN_PROJECTS = 1  # spec target: 3 (see note above; raise once §5.9 lands)
+# O12 — Builder identification. The spec (§5.9 / p18) defines a builder via DBPR
+# licensing + permit history. Prod permit data barely captures the contractor
+# (only 61 of 52k permits have a name), so the permit-only path finds ~32.
+# The real builder population is the DBPR construction registry. Pool 2 sources
+# from DBPR (matching §5.9's "maps active state license numbers from DBPR") —
+# phones come via skip-trace (WP-W0-3), same as the other pools.
+BUILDER_MIN_PROJECTS = 1  # retained for the permit-history refinement (§5.9 Wave 1)
+
+# DBPR license types scoped to spec §4.1's "single-family and infill" builder,
+# per FL Statute 489 license classes (verified, not keyword-guessed):
+#   Cert Residential (CRC) — single/duplex/triplex/fourplex only, <=2 stories:
+#       the exact "single-family" match.
+#   Cert Building (CBC) — up to 3 stories, residential + light commercial:
+#       covers infill/small multi-family.
+#   Cert General (CGC) — EXCLUDED: unlimited scope (high-rise, commercial,
+#       industrial) — too broad, does not match "single-family and infill."
+# ('Residental' is a real misspelling in the source data — matched verbatim,
+# not by pattern, so this list is an exact license_type_desc match, not ILIKE.)
+BUILDER_DBPR_LICENSE_TYPES: list[str] = ["Cert Building", "Cert Residental"]
 
 # SQL ILIKE patterns built once from STRUCTURAL_KEYWORDS
 _STRUCTURAL_PATTERNS: list[str] = [f"%{kw}%" for kw in STRUCTURAL_KEYWORDS]
@@ -317,8 +324,8 @@ def _extract_pool1_wholesaler_flipper(
                 -- the entity's OWN linked owner records (the same person, clustered
                 -- by the resolver). NOT enriched_contacts by the transacted
                 -- property (that's the seller/owner of that deal, a different person).
-                COALESCE(be.primary_phone, oc.owner_phone) AS raw_phone,
-                COALESCE(be.primary_email, oc.owner_email) AS email,
+                COALESCE(be.primary_phone, oc.owner_phone, ecc.ec_phone) AS raw_phone,
+                COALESCE(be.primary_email, oc.owner_email, ecc.ec_email) AS email,
                 d.property_id                   AS source_property_id,
                 p.county_id                     AS county_id,
                 c.display_name                  AS county_name,
@@ -348,6 +355,22 @@ def _extract_pool1_wholesaler_flipper(
                   AND COALESCE(o.phone_1, o.phone_2, o.phone_3) IS NOT NULL
                 LIMIT 1
             ) oc ON TRUE
+            -- Enriched (skip-traced) phone on the entity's OWN properties, via its
+            -- clustered owner records — the same person, not the transacted deed's owner.
+            LEFT JOIN LATERAL (
+                SELECT COALESCE(ec.mobile_phone, ec.landline) AS ec_phone,
+                       ec.email                                AS ec_email
+                FROM buyer_entity_links bl
+                JOIN owners o ON o.id = bl.source_id
+                JOIN enriched_contacts ec ON ec.property_id = o.property_id
+                                         AND ec.superseded_at IS NULL
+                                         AND ec.match_success
+                WHERE bl.buyer_entity_id = be.id
+                  AND bl.source_table = 'owners'
+                  AND COALESCE(ec.mobile_phone, ec.landline) IS NOT NULL
+                ORDER BY ec.confidence DESC NULLS LAST, ec.enriched_at DESC
+                LIMIT 1
+            ) ecc ON TRUE
             WHERE be.buyer_type IN ('wholesaler', 'flipper')
               AND p.county_id = ANY(:county_ids)
             ORDER BY be.id, d.record_date DESC NULLS LAST
@@ -416,118 +439,55 @@ def _extract_pool2_active_builder(
     session: Session,
     county_ids: list[str],
 ) -> list[CallingPoolRecord]:
-    """Active builders = contractors with 3+ permits (spec §5.9 / p18).
+    """Builders = DBPR-licensed construction contractors (spec §5.9 / p18).
 
-    O12 (spec-backed): a real "Active Builder" is not any permit — it is a
-    contractor whose permit history meets the 3-project threshold (§5.9 Builder
-    Permit Enrichment Engine; p18 credit box "project history 3+ projects").
-    This is one row PER BUILDER, keyed by normalized contractor/holder name, with:
-      - 3+ non-enforcement structural permits (their qualifying history),
-      - at least one recent (12-month) permit in a target county (active now),
-      - no permanent financing recorded on the recent project.
+    O12: prod permit data barely captures the contractor (only 61 of 52k permits
+    carry a name), so the permit-only path finds ~32. The real builder population
+    is the DBPR construction registry, scoped to Cert Building + Cert Residential
+    (single-family/infill per spec §4.1 — Cert General excluded as out-of-scope,
+    see BUILDER_DBPR_LICENSE_TYPES). Pool 2 sources from DBPR (this is §5.9's
+    "maps active state license numbers from DBPR"), one row per licensed contractor.
 
-    Phone is the CONTRACTOR's: permit column → DBPR registry by license →
-    name-matched owner-builder fallback. Never the property owner's blindly.
-    (permit_staging is excluded here — it carries no contractor identity, so it
-    cannot meet the 3-project builder test.)
+    Phone: DBPR's own phone fields first (mobile/phone/landline). DBPR phones are
+    populated by the separate DBPR enrichment; anything still phone-less flows to
+    the shared skip-trace queue (WP-W0-3) with every other phone-less pool row.
     """
-    structural_patterns = _STRUCTURAL_PATTERNS
-
     rows = session.execute(
         text("""
-            WITH builder_permits AS (
-                -- Every qualifying permit with an identifiable builder.
-                SELECT
-                    bp.id,
-                    lower(trim(COALESCE(NULLIF(TRIM(bp.contractor_name), ''),
-                                        NULLIF(TRIM(bp.holder_name), '')))) AS builder_key,
-                    bp.contractor_name, bp.holder_name, bp.contractor_license,
-                    bp.contractor_phone, bp.contractor_email,
-                    bp.county_id, bp.permit_number, bp.permit_type, bp.issue_date,
-                    bp.job_value, bp.property_id
-                FROM building_permits bp
-                WHERE bp.is_enforcement_permit = FALSE
-                  AND COALESCE(NULLIF(TRIM(bp.contractor_name), ''),
-                               NULLIF(TRIM(bp.holder_name), '')) IS NOT NULL
-                  AND EXISTS (
-                      SELECT 1 FROM unnest(CAST(:structural_patterns AS text[])) kw
-                      WHERE bp.permit_type ILIKE kw OR bp.description ILIKE kw
-                  )
-            ),
-            counts AS (
-                SELECT builder_key, count(*) AS project_count
-                FROM builder_permits
-                GROUP BY builder_key
-                HAVING count(*) >= :min_projects       -- 3+ projects = real builder
-            )
-            -- Most recent qualifying permit per builder that is active (12mo) in a
-            -- target county and has no permanent financing recorded on it.
-            SELECT DISTINCT ON (bpr.builder_key)
-                bpr.builder_key,
-                cnt.project_count,
-                bpr.contractor_name         AS borrower_name,
-                bpr.holder_name             AS entity_name,
-                COALESCE(bpr.contractor_phone, dc.mobile_phone, dc.phone, dc.landline_phone) AS raw_phone,
-                COALESCE(bpr.contractor_email, dc.email)                                     AS email,
-                bpr.job_value,
-                bpr.permit_type,
-                bpr.issue_date,
-                bpr.permit_number,
-                bpr.county_id,
+            SELECT
+                dc.license_number,
+                dc.full_name                AS borrower_name,
+                dc.company_name             AS entity_name,
+                dc.license_type_desc,
+                dc.license_expiry,
+                dc.address                  AS prop_address,
+                dc.city                     AS prop_city,
+                dc.state                    AS prop_state,
+                dc.zip_code                 AS prop_zip,
+                dc.county_id,
                 c.display_name              AS county_name,
-                bpr.property_id             AS source_property_id,
-                p.parcel_id                 AS parcel_id,
-                p.address                   AS prop_address,
-                p.city                      AS prop_city,
-                p.state                     AS prop_state,
-                p.zip                       AS prop_zip,
-                o.owner_name                AS owner_name,
-                COALESCE(o.phone_1, o.phone_2, o.phone_3) AS owner_phone,
-                o.email_1                   AS owner_email
-            FROM builder_permits bpr
-            JOIN counts cnt ON cnt.builder_key = bpr.builder_key
-            JOIN counties c ON c.county_id = bpr.county_id
-            LEFT JOIN properties p ON p.id = bpr.property_id
-            LEFT JOIN dbpr_contacts dc ON dc.license_number = bpr.contractor_license
-            LEFT JOIN owners o ON o.property_id = bpr.property_id
-            WHERE bpr.county_id = ANY(:county_ids)
-              AND bpr.issue_date >= CURRENT_DATE - INTERVAL '12 months'
-              AND NOT EXISTS (
-                  SELECT 1 FROM deeds d
-                  WHERE d.property_id = bpr.property_id
-                    AND d.mortgage_amount > 0
-                    AND d.record_date >= bpr.issue_date
-              )
-            ORDER BY bpr.builder_key, bpr.issue_date DESC
+                COALESCE(dc.mobile_phone, dc.phone, dc.landline_phone) AS raw_phone,
+                dc.email
+            FROM dbpr_contacts dc
+            JOIN counties c ON c.county_id = dc.county_id
+            WHERE dc.county_id = ANY(:county_ids)
+              AND dc.license_type_desc = ANY(:lic_types)
         """),
         {
             "county_ids": county_ids,
-            "structural_patterns": structural_patterns,
-            "min_projects": BUILDER_MIN_PROJECTS,
+            "lic_types": BUILDER_DBPR_LICENSE_TYPES,
         },
     ).fetchall()
 
     records: list[CallingPoolRecord] = []
     for row in rows:
         norm = normalize_phone(row.raw_phone)
-        email = row.email
-        # Owner-builder fallback: borrow the property owner's phone ONLY when the
-        # owner's name matches the builder's (owner-builder on their own lot).
-        if norm is None and row.owner_phone:
-            builder_name = row.borrower_name or row.entity_name
-            if _names_match(builder_name, row.owner_name):
-                norm = normalize_phone(row.owner_phone)
-                email = email or row.owner_email
-
-        # O28 New Construction: 85% LTC of the permit job value; fall back to the
-        # $525K construction average when job_value is missing. Internal estimate.
-        if row.job_value:
-            elv = Decimal(str(row.job_value)) * Decimal(str(CONSTRUCTION_LTC))
-        else:
-            elv = Decimal(str(CONSTRUCTION_AVG_LOAN))
-
-        permit_details = _compose_permit_details(row.permit_type, row.issue_date, row.job_value)
-        detail = f"{row.project_count} permits" + (f" · {permit_details}" if permit_details else "")
+        # O28 New Construction: no per-deal job value from DBPR → the spec's
+        # $525K construction average as the internal estimate.
+        elv = Decimal(str(CONSTRUCTION_AVG_LOAN))
+        detail = row.license_type_desc + (
+            f" · lic {row.license_number}" if row.license_number else ""
+        ) + (f" · exp {row.license_expiry}" if row.license_expiry else "")
 
         records.append(CallingPoolRecord(
             run_id="",
@@ -541,25 +501,28 @@ def _extract_pool2_active_builder(
             ),
             estimated_loan_value=elv,
             recent_permit_details=detail,
-            entity_status=None,   # builders have no structured legal type (Dev 2: NULL → fail-closed in GA)
-            parcel_id=row.parcel_id,
+            entity_status=_entity_status_from_firm_name(row.entity_name),
+            parcel_id=None,                       # DBPR is contractor-level, no property anchor
             zip=row.prop_zip,
             state=row.prop_state or WAVE0_STATE,
             normalized_phone=norm,
             phone_available=norm is not None,
-            email=email,
+            email=row.email,
             financing_intent_score=None,
             intent_tier=None,
             recommended_product=None,
             aircall_campaign_tag=AIRCALL_TAG["active_builder"],
             buyer_entity_id=None,
-            permit_number=row.permit_number,
-            dbpr_license_number=None,
-            source_property_id=row.source_property_id,
-            source_table="building_permits",
+            permit_number=None,
+            dbpr_license_number=row.license_number,
+            source_property_id=None,
+            source_table="dbpr_contacts",
         ))
 
-    logger.info("Pool 2 active_builder: %d builders (min %d projects)", len(records), BUILDER_MIN_PROJECTS)
+    logger.info(
+        "Pool 2 active_builder: %d DBPR contractors (%d with phone)",
+        len(records), sum(1 for r in records if r.phone_available),
+    )
     return records
 
 
