@@ -1,8 +1,8 @@
-"""Load a lending pool export into the Aircall dialer.
+"""Load a lending pool export into the dialer.
 
 Dry run by default: every gate runs and the report is logged, but nothing is
-sent to Aircall or Tracerfy and the transaction is rolled back. ``--live``
-scrubs stale numbers with Tracerfy, loads Aircall and commits.
+sent to the dialer or Tracerfy and the transaction is rolled back. ``--live``
+scrubs stale numbers with Tracerfy, loads the dialer and commits.
 
 Usage:
     python -m src.tasks.lending_dialer_load --input pools.json
@@ -22,16 +22,16 @@ from pathlib import Path
 
 from src.core.database import get_db_context
 from src.lending.compliance import tracerfy_scrub
+from src.lending.aircall_dialer import AircallDialer
 from src.lending.dialer_load import LoadRefused, run_dialer_load
-from src.services import aircall_client
 
 logger = logging.getLogger(__name__)
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Load a lending pool export into the Aircall dialer.")
+    parser = argparse.ArgumentParser(description="Load a lending pool export into the dialer.")
     parser.add_argument("--input", required=True, type=Path, help="JSON list of pool records")
-    parser.add_argument("--live", action="store_true", help="load Aircall and commit (default: dry run)")
+    parser.add_argument("--live", action="store_true", help="load the dialer and commit (default: dry run)")
     parser.add_argument("--run-id", help="identifier for this run (default: timestamped)")
     return parser.parse_args(argv)
 
@@ -49,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             if args.live:
                 report = run_dialer_load(records, session, run_id=run_id, dry_run=False,
-                                         scrubber=tracerfy_scrub, aircall=aircall_client,
+                                         scrubber=tracerfy_scrub, dialer=AircallDialer(),
                                          commit=session.commit)
             else:
                 report = run_dialer_load(records, session, run_id=run_id, dry_run=True)

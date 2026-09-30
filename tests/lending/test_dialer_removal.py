@@ -78,24 +78,24 @@ def _state(db):
 
 @needs_db
 class TestRemoval:
-    def test_removes_from_aircall_then_deactivates(self, db):
+    def test_removes_from_the_dialer_then_deactivates(self, db):
         _load(db)
         removed = []
         remove_contact_from_pool("(813) 555-8201", removal=removed.append, db_context=_context(db))
         assert removed == [77]
         assert tuple(_state(db)) == (False, REMOVED_FROM_DIALER)
 
-    def test_undecided_aircall_control_raises_and_changes_nothing(self, db):
+    def test_undecided_dialer_control_raises_and_changes_nothing(self, db):
         _load(db)
         with pytest.raises(DialerRemovalUndecided):
             remove_contact_from_pool(PHONE, db_context=_context(db))
         assert tuple(_state(db)) == (True, None)
 
-    def test_aircall_failure_keeps_the_row_active(self, db):
+    def test_dialer_failure_keeps_the_row_active(self, db):
         _load(db)
 
         def failing(contact_id):
-            raise RuntimeError("aircall down")
+            raise RuntimeError("dialer down")
 
         with pytest.raises(RuntimeError):
             remove_contact_from_pool(PHONE, removal=failing, db_context=_context(db))
@@ -106,7 +106,7 @@ class TestRemoval:
         remove_contact_from_pool(PHONE, removal=removed.append, db_context=_context(db))
         assert removed == []
 
-    def test_row_without_aircall_contact_is_deactivated_without_calling_aircall(self, db):
+    def test_row_without_dialer_contact_is_deactivated_without_calling_the_dialer(self, db):
         _load(db, contact_id=None)
         removed = []
         remove_contact_from_pool(PHONE, removal=removed.append, db_context=_context(db))

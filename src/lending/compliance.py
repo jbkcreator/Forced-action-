@@ -405,10 +405,10 @@ def _error_kind(exc: Exception) -> str:
 
 
 def _default_dialer_remover() -> Optional[DialerRemover]:
-    """Aircall pool removal is provided by the WP-W0-5 client once it exists."""
-    from src.services import aircall_client
+    """Dialer pool removal; raises while the removal control is undecided, so opt-outs stay pending."""
+    from src.lending.dialer_removal import remove_phone_from_dialer
 
-    return getattr(aircall_client, "remove_contact_from_pool", None)
+    return remove_phone_from_dialer
 
 
 def _channel_for(source: str, fa_table: str) -> OptOutChannel:

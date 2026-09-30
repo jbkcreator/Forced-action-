@@ -297,10 +297,3 @@ def upsert_contact(phone: str, fields: AircallContactFields) -> ContactUpsertRes
     contact_id = int(contact["id"])
     logger.info("[aircall] created contact id=%s phone=%s", contact_id, _mask_phone(phone))
     return ContactUpsertResult(contact_id=contact_id, created=True)
-
-
-def remove_contact_from_pool(phone: str) -> None:
-    """Dialer remover used by lending stop-propagation; see src/lending/dialer_removal.py."""
-    from src.lending.dialer_removal import remove_contact_from_pool as remove
-
-    remove(phone)

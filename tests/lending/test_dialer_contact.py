@@ -1,14 +1,10 @@
-"""Pool record -> Aircall contact display mapping."""
+"""Pool record -> dialer display, and the Aircall adapter's contact field mapping."""
 from __future__ import annotations
 
 from decimal import Decimal
 
-from src.lending.dialer_contact import (
-    INFORMATION_MAX_CHARS,
-    NOT_AVAILABLE,
-    aircall_fields,
-    display_from_record,
-)
+from src.lending.aircall_dialer import INFORMATION_MAX_CHARS, aircall_fields
+from src.lending.dialer_contact import NOT_AVAILABLE, display_from_record, display_lines, split_name
 
 RECORD = {
     "borrower_name": "  John   Smith ",
@@ -39,14 +35,18 @@ def test_missing_values_are_shown_as_not_available():
     assert all(line.endswith(NOT_AVAILABLE) for line in fields.information.splitlines())
 
 
+def test_display_lines_are_provider_neutral():
+    lines = display_lines(display_from_record({}, None))
+    assert len(lines) == 4
+    assert all(line.endswith(NOT_AVAILABLE) for line in lines)
+
+
 def test_single_word_name_is_kept_as_first_name():
-    fields = aircall_fields(display_from_record({"borrower_name": "Madonna"}, None))
-    assert (fields.first_name, fields.last_name) == ("Madonna", None)
+    assert split_name("Madonna") == ("Madonna", None)
 
 
 def test_multi_word_first_name_keeps_last_word_as_last_name():
-    fields = aircall_fields(display_from_record({"borrower_name": "Mary Ann van Dyke"}, None))
-    assert (fields.first_name, fields.last_name) == ("Mary Ann van", "Dyke")
+    assert split_name("Mary Ann van Dyke") == ("Mary Ann van", "Dyke")
 
 
 def test_loan_value_parsing():

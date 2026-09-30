@@ -1,8 +1,8 @@
-"""Dialer load: compliance filter -> Backflip check -> Aircall -> load records.
+"""Dialer load: compliance filter -> Backflip check -> dialer -> load records.
 
 Runs on the real DB inside a transaction that is always rolled back; the load
-table is created inside that transaction, so nothing persists. Aircall is a
-fake that records calls; the Backflip snapshot is a controlled index.
+table is created inside that transaction, so nothing persists. The dialer is
+a fake that records calls; the Backflip snapshot is a controlled index.
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from src.lending import dialer_load
 from src.lending.backflip_conflict import BackflipIdentifierIndex, hash_phone
 from src.lending.dialer_load import LoadRefused, run_dialer_load
 from src.lending.models import LendingDialerLoadRecord
-from src.services.aircall_client import AircallRequestError, ContactUpsertResult
+from src.lending.dialer_client import ContactUpsertResult, DialerRequestError
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("DATABASE_URL"), reason="requires a live Postgres DATABASE_URL"
@@ -30,7 +30,7 @@ TAGS = {"builders": "DESK_CONSTRUCTION", "wholesalers": "DESK_CAPITAL_LOOP"}
 EMPTY_INDEX = BackflipIdentifierIndex(block_reason=None)
 
 
-class FakeAircall:
+class FakeDialer:
     def __init__(self, fail_phones=(), missing_ids=()):
         self.upserts: list[str] = []
         self.updates: list[int] = []
@@ -38,18 +38,17 @@ class FakeAircall:
         self._fail = set(fail_phones)
         self._missing = set(missing_ids)
 
-    def upsert_contact(self, phone, fields):
+    def upsert_contact(self, phone, display, email):
         if phone in self._fail:
-            raise AircallRequestError("POST", "/contacts", 500)
+            raise DialerRequestError(500)
         self.upserts.append(phone)
         self._next_id += 1
         return ContactUpsertResult(contact_id=self._next_id, created=True)
 
-    def update_contact(self, contact_id, fields):
+    def update_contact(self, contact_id, display, email):
         if contact_id in self._missing:
-            raise AircallRequestError("POST", f"/contacts/{contact_id}", 404)
+            raise DialerRequestError(404)
         self.updates.append(contact_id)
-        return {"id": contact_id}
 
 
 @pytest.fixture
@@ -80,16 +79,16 @@ def _record(ref, phone, pool="builders", **extra):
             "parcel_id": f"PARCEL-{ref}", "estimated_loan_value": "100000", **extra}
 
 
-def _run(db, records, *, index=EMPTY_INDEX, dry_run=False, aircall=None, tags=TAGS, run_id="run-1"):
-    aircall = aircall if aircall is not None else FakeAircall()
+def _run(db, records, *, index=EMPTY_INDEX, dry_run=False, dialer=None, tags=TAGS, run_id="run-1"):
+    dialer = dialer if dialer is not None else FakeDialer()
     with patch.object(dialer_load, "load_backflip_identifier_index", return_value=index):
         report = run_dialer_load(
             records, db, run_id=run_id, dry_run=dry_run,
             scrubber=None if dry_run else (lambda phones: []),
-            aircall=None if dry_run else aircall,
+            dialer=None if dry_run else dialer,
             campaign_tags=tags, commit=db.flush,
         )
-    return report, aircall
+    return report, dialer
 
 
 def _load_rows(db, run_id=None):
@@ -109,7 +108,7 @@ def _exclusions(db, run_id="run-1"):
 
 
 class TestDryRun:
-    def test_reports_without_calling_aircall_or_writing(self, db):
+    def test_reports_without_calling_the_dialer_or_writing(self, db):
         _fresh_scrub(db, P1)
         records = [_record("a", P1), _record("b", P2)]
         report, _ = _run(db, records, dry_run=True)
@@ -135,9 +134,9 @@ class TestDryRun:
 class TestLiveLoad:
     def test_loads_clean_records_and_stores_them(self, db):
         _fresh_scrub(db, P1, P2)
-        report, aircall = _run(db, [_record("a", P1), _record("b", P2, pool="wholesalers")])
+        report, dialer = _run(db, [_record("a", P1), _record("b", P2, pool="wholesalers")])
         assert report.loaded == 2 and report.created == 2
-        assert aircall.upserts == [P1, P2]
+        assert dialer.upserts == [P1, P2]
         rows = _load_rows(db)
         assert [(r.phone, r.campaign_tag, r.active) for r in rows] == [
             (P1, "DESK_CONSTRUCTION", True), (P2, "DESK_CAPITAL_LOOP", True)]
@@ -146,8 +145,8 @@ class TestLiveLoad:
     def test_backflip_conflict_is_excluded_with_matched_criteria(self, db):
         _fresh_scrub(db, P1, P2)
         index = replace(EMPTY_INDEX, parcel_ids=frozenset({"PARCELA"}))
-        report, aircall = _run(db, [_record("a", P1), _record("b", P2)], index=index)
-        assert aircall.upserts == [P2]
+        report, dialer = _run(db, [_record("a", P1), _record("b", P2)], index=index)
+        assert dialer.upserts == [P2]
         assert report.excluded_by_reason == {"BACKFLIP_CONFLICT": 1}
         (row,) = _exclusions(db)
         assert row.phone_hash == hash_phone(P1)
@@ -157,8 +156,8 @@ class TestLiveLoad:
     def test_block_on_one_record_blocks_every_record_with_that_phone(self, db):
         _fresh_scrub(db, P1)
         index = replace(EMPTY_INDEX, parcel_ids=frozenset({"PARCELA"}))
-        report, aircall = _run(db, [_record("a", P1), _record("a2", P1)], index=index)
-        assert aircall.upserts == []
+        report, dialer = _run(db, [_record("a", P1), _record("a2", P1)], index=index)
+        assert dialer.upserts == []
         assert report.excluded_by_reason == {"BACKFLIP_CONFLICT": 2}
         details = [r.detail for r in _exclusions(db)]
         assert {"matched_criteria": ["parcel_id"]} in details
@@ -168,8 +167,8 @@ class TestLiveLoad:
         _fresh_scrub(db, P1)
         db.execute(text("INSERT INTO lending.suppression_list (phone, reason, source_channel) "
                         "VALUES (:p, 'OPT_OUT', 'test')"), {"p": P2})
-        report, aircall = _run(db, [_record("a", P1), _record("b", P2)])
-        assert aircall.upserts == [P1]
+        report, dialer = _run(db, [_record("a", P1), _record("b", P2)])
+        assert dialer.upserts == [P1]
         assert report.excluded_by_reason == {"SUPPRESSED": 1}
         assert [r.reason for r in _exclusions(db)] == ["SUPPRESSED"]
 
@@ -181,19 +180,19 @@ class TestLiveLoad:
 
     def test_refuses_when_a_phone_would_load_twice(self, db):
         _fresh_scrub(db, P1)
-        aircall = FakeAircall()
+        dialer = FakeDialer()
         with pytest.raises(LoadRefused, match="more than one record"):
-            _run(db, [_record("a", P1), _record("a2", P1)], aircall=aircall)
-        assert aircall.upserts == []
+            _run(db, [_record("a", P1), _record("a2", P1)], dialer=dialer)
+        assert dialer.upserts == []
 
-    def test_one_aircall_failure_does_not_stop_the_rest(self, db):
+    def test_one_dialer_failure_does_not_stop_the_rest(self, db):
         _fresh_scrub(db, P1, P2)
-        report, _ = _run(db, [_record("a", P1), _record("b", P2)], aircall=FakeAircall(fail_phones={P1}))
+        report, _ = _run(db, [_record("a", P1), _record("b", P2)], dialer=FakeDialer(fail_phones={P1}))
         assert report.loaded == 1
-        assert report.failed == [{"record_ref": "a", "error": "AircallRequestError", "status": 500}]
+        assert report.failed == [{"record_ref": "a", "error": "DialerRequestError", "status": 500}]
         assert [r.phone for r in _load_rows(db)] == [P2]
 
-    def test_live_load_needs_scrubber_and_aircall(self, db):
+    def test_live_load_needs_scrubber_and_dialer(self, db):
         with pytest.raises(ValueError):
             run_dialer_load([], db, run_id="r", dry_run=False)
 
@@ -216,12 +215,12 @@ class TestReload:
             ("run-1", False, "superseded"), ("run-2", True, None)]
         assert rows[0].aircall_contact_id == rows[1].aircall_contact_id
 
-    def test_contact_deleted_in_aircall_falls_back_to_upsert(self, db):
+    def test_contact_deleted_in_the_dialer_falls_back_to_upsert(self, db):
         _fresh_scrub(db, P1)
         _run(db, [_record("a", P1)], run_id="run-1")
         stored_id = _load_rows(db)[0].aircall_contact_id
         report, second = _run(db, [_record("a", P1)], run_id="run-2",
-                              aircall=FakeAircall(missing_ids={stored_id}))
+                              dialer=FakeDialer(missing_ids={stored_id}))
         assert second.upserts == [P1]
         assert report.loaded == 1
 

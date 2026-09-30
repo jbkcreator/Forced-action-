@@ -1,4 +1,4 @@
-"""Lending dialer load: Aircall write limits and retry policy.
+"""Lending dialer load: pool-to-campaign mapping and provider request limits.
 
 Aircall allows 120 Public API requests per minute per company and returns
 HTTP 429 beyond that. The account sends no rate-limit headers, so the client
@@ -11,7 +11,6 @@ AIRCALL_RETRY_BASE_SECONDS: float = 2.0
 AIRCALL_MAX_RETRY_WAIT_SECONDS: float = 60.0
 AIRCALL_REQUEST_TIMEOUT_SECONDS: float = 20.0
 
-# Pool -> Aircall campaign tag. Empty until the client decides which pool gets
-# DESK_CAPITAL_LOOP / DESK_CONSTRUCTION / DESK_RESCUE; a live load refuses to
-# run for any pool without an entry here.
+# Pool -> dialer campaign. Empty until the client decides which pool goes to
+# which campaign; a live load refuses to run for any pool without an entry here.
 POOL_CAMPAIGN_TAGS: dict[str, str] = {}

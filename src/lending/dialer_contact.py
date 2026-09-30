@@ -1,13 +1,9 @@
-"""Map a lending pool record to the Aircall contact a caller sees.
+"""What a caller sees for a lending pool record, independent of the dialer.
 
-Aircall contacts have fixed fields (first/last name, company, a free-text
-information field) and no custom attributes, so the five dialer display
-fields are placed as:
-
-- Borrower Name          -> first_name / last_name
-- Entity Name            -> company_name
-- Target Property Address, Estimated Loan Value, Recent Permit Details,
-  campaign               -> labelled lines in ``information``
+``DialerDisplay`` holds the five spec display fields plus the campaign.
+Provider adapters decide where each field goes on their contact record;
+``display_lines`` is the shared labelled-line rendering for providers that
+only offer a free-text field.
 
 Blank values are shown as "Not available" so a caller can tell a missing
 value from a field that was never mapped.
@@ -18,11 +14,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Optional
 
-from src.services.aircall_client import AircallContactFields
-from src.services.fa_max_backflip_feed import normalize_email
-
 NOT_AVAILABLE = "Not available"
-INFORMATION_MAX_CHARS = 1000
 
 
 @dataclass(frozen=True)
@@ -63,7 +55,7 @@ def display_from_record(record: Mapping[str, Any], campaign_tag: Optional[str]) 
     )
 
 
-def _split_name(name: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+def split_name(name: Optional[str]) -> tuple[Optional[str], Optional[str]]:
     """Last word is the last name; a single word is kept whole as the first name."""
     if not name:
         return None, None
@@ -71,24 +63,12 @@ def _split_name(name: Optional[str]) -> tuple[Optional[str], Optional[str]]:
     return (first, last) if first else (last, None)
 
 
-def _information(display: DialerDisplay) -> str:
+def display_lines(display: DialerDisplay) -> list[str]:
+    """Labelled lines for the fields that have no dedicated contact field."""
     loan = f"${display.estimated_loan_value:,.0f}" if display.estimated_loan_value is not None else None
-    lines = [
+    return [
         f"Property: {display.property_address or NOT_AVAILABLE}",
         f"Est. loan value: {loan or NOT_AVAILABLE}",
         f"Recent permit: {display.recent_permit_details or NOT_AVAILABLE}",
         f"Campaign: {display.campaign_tag or NOT_AVAILABLE}",
     ]
-    text = "\n".join(lines)
-    return text if len(text) <= INFORMATION_MAX_CHARS else text[: INFORMATION_MAX_CHARS - 1] + "…"
-
-
-def aircall_fields(display: DialerDisplay, email: Optional[str] = None) -> AircallContactFields:
-    first_name, last_name = _split_name(display.borrower_name)
-    return AircallContactFields(
-        first_name=first_name,
-        last_name=last_name,
-        company_name=display.entity_name,
-        information=_information(display),
-        email=normalize_email(email),
-    )
