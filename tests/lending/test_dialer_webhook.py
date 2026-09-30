@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from sqlalchemy.exc import OperationalError
 
-from src.lending import webhooks
+from src.lending import call_pipeline, webhooks
 from src.lending.api import app
 from src.lending.db import get_lending_db
 from src.lending.dispositions import RecordedCall
@@ -29,8 +29,8 @@ def db():
 
 @pytest.fixture
 def client(monkeypatch, db):
-    monkeypatch.setattr(webhooks, "get_settings", lambda: SimpleNamespace(
-        lending_dialer_webhook_secret=SecretStr(SECRET), lending_dialer_campaign_ids="55, 56"))
+    monkeypatch.setattr(webhooks, "get_settings", lambda: SimpleNamespace(lending_dialer_webhook_secret=SecretStr(SECRET)))
+    monkeypatch.setattr(call_pipeline, "get_settings", lambda: SimpleNamespace(lending_dialer_campaign_ids="55, 56"))
     app.dependency_overrides[get_lending_db] = lambda: db
     yield TestClient(app)
     app.dependency_overrides.clear()
@@ -59,13 +59,13 @@ def hooks(monkeypatch):
     calls = SimpleNamespace(
         record=MagicMock(return_value=_recorded()), attempt=MagicMock(), opt_out=MagicMock(),
         deliver=MagicMock(), unknown=MagicMock(), dnc_alert=MagicMock(), pending=MagicMock())
-    monkeypatch.setattr(webhooks, "record_dialer_event", calls.record)
-    monkeypatch.setattr(webhooks, "on_attempt_recorded", calls.attempt)
-    monkeypatch.setattr(webhooks, "propagate_opt_out", calls.opt_out)
-    monkeypatch.setattr(webhooks, "deliver_disposition", calls.deliver)
-    monkeypatch.setattr(webhooks, "alert_unknown_code", calls.unknown)
-    monkeypatch.setattr(webhooks, "alert_unpropagated_dnc", calls.dnc_alert)
-    monkeypatch.setattr(webhooks, "alert_dnc_removal_pending", calls.pending)
+    monkeypatch.setattr(call_pipeline, "record_dialer_event", calls.record)
+    monkeypatch.setattr(call_pipeline, "on_attempt_recorded", calls.attempt)
+    monkeypatch.setattr(call_pipeline, "propagate_opt_out", calls.opt_out)
+    monkeypatch.setattr(call_pipeline, "deliver_disposition", calls.deliver)
+    monkeypatch.setattr(call_pipeline, "alert_unknown_code", calls.unknown)
+    monkeypatch.setattr(call_pipeline, "alert_unpropagated_dnc", calls.dnc_alert)
+    monkeypatch.setattr(call_pipeline, "alert_dnc_removal_pending", calls.pending)
     return calls
 
 
@@ -76,8 +76,7 @@ def test_wrong_or_missing_secret_is_401_and_nothing_is_recorded(client, hooks):
 
 
 def test_unset_server_secret_rejects_everything(monkeypatch, client, hooks):
-    monkeypatch.setattr(webhooks, "get_settings", lambda: SimpleNamespace(
-        lending_dialer_webhook_secret=None, lending_dialer_campaign_ids="55"))
+    monkeypatch.setattr(webhooks, "get_settings", lambda: SimpleNamespace(lending_dialer_webhook_secret=None))
     assert _post(client, _event(), secret="anything").status_code == 401
 
 
@@ -156,3 +155,13 @@ def test_dnc_removed_from_the_dialer_sends_no_pending_alert(client, hooks, db):
     db.execute.return_value.scalar.return_value = "complete"
     _post(client, _event())
     hooks.pending.assert_not_called()
+
+
+def test_follow_up_schedules_delivery_and_alerts_through_the_given_runner():
+    from src.lending import call_pipeline as cp
+
+    scheduled = []
+    rec = _recorded(unknown_code="Hot Lead", dnc_requested=True, phone=None, dnc_removal_pending=True)
+    cp.follow_up(rec, lambda fn, *args: scheduled.append((fn.__name__, args)))
+    names = [n for n, _ in scheduled]
+    assert names == ["deliver_disposition", "alert_unknown_code", "alert_unpropagated_dnc", "alert_dnc_removal_pending"]
