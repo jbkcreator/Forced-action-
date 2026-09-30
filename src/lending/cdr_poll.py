@@ -2,11 +2,12 @@
 
 /v2/cdrs/last returns CDRs newer than a server-side watermark for this API key, so it is
 the fast path but can lose calls if we die after reading. /v2/cdrs (stateless, by day) is
-the safety net: the rescan re-reads today and yesterday and only processes rows that are
+the safety net: the rescan re-reads today and the previous day(s) and only processes rows that are
 new or whose disposition / end time changed.
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -17,7 +18,7 @@ from sqlalchemy import text
 
 from config.lending_dispositions import DNC_CODE
 from src.lending.call_pipeline import follow_up, lending_campaign_ids, process_event
-from src.lending.dispositions import DialerCallEvent, parse_event
+from src.lending.dispositions import DialerCallEvent, normalize_code, parse_event
 
 logger = logging.getLogger(__name__)
 
@@ -71,30 +72,43 @@ def _changed(db, events: list[DialerCallEvent]) -> list[DialerCallEvent]:
     if not events:
         return events
     rows = db.execute(
-        text("SELECT dialer_call_id, raw_event->>'disposition', raw_event->>'callEndTime', "
-             "disposition, opt_out_propagated_at "
+        text("SELECT dialer_call_id, raw_event->>'disposition', raw_event->>'callEndTime', raw_event->>'duration', "
+             "disposition, opt_out_propagated_at, phone "
              "FROM lending.call_dispositions WHERE dialer_call_id = ANY(:ids)"),
         {"ids": [e.call_id for e in events]},
     ).all()
-    stored = {r[0]: (r[1], r[2]) for r in rows}
-    unpropagated_dnc = {r[0] for r in rows if r[3] == DNC_CODE and r[4] is None}  # committed before the opt-out hook failed
-    return [e for e in events
-            if e.call_id in unpropagated_dnc
-            or stored.get(e.call_id) != (e.raw.get("disposition"), e.raw.get("callEndTime"))]
+    stored = {r[0]: (r[1], r[2], r[3]) for r in rows}
+    # committed before the opt-out hook failed; a phoneless row cannot be retried, so do not reselect it
+    unpropagated_dnc = {r[0] for r in rows if r[4] == DNC_CODE and r[5] is None and r[6] is not None}
+
+    def key(e: DialerCallEvent):
+        duration = e.raw.get("duration")
+        return (e.raw.get("disposition"), e.raw.get("callEndTime"), None if duration is None else str(duration))
+
+    return [e for e in events if e.call_id in unpropagated_dnc or stored.get(e.call_id) != key(e)]
+
+
+def _finished(ev: DialerCallEvent) -> DialerCallEvent:
+    """Every CDR is a finished dial: make sure it carries an end time so the attempt counts."""
+    if ev.ended_at is not None:
+        return ev
+    end = ev.started_at + timedelta(seconds=ev.duration or 0) if ev.started_at else datetime.now(timezone.utc)
+    return dataclasses.replace(ev, ended_at=end)
 
 
 def ingest(db, items: list[dict], *, only_changed: bool) -> IngestStats:
     stats = IngestStats(seen=len(items))
     campaigns = lending_campaign_ids()
     events = [ev for ev in (parse_event(i) for i in items)
-              if ev and ev.direction != "inbound" and ev.campaign_id in campaigns]
+              if ev and ev.campaign_id in campaigns
+              and (ev.direction != "inbound" or normalize_code(ev.disposition_raw)[0] == DNC_CODE)]
     if only_changed:
         pending = _changed(db, events)
         stats.skipped = len(events) - len(pending)
         events = pending
     for ev in events:
         try:
-            recorded = process_event(db, ev)
+            recorded = process_event(db, _finished(ev))
         except Exception as exc:  # class only: SQL errors embed bound params (phones)
             db.rollback()
             stats.failed += 1
@@ -112,9 +126,10 @@ def poll_new(db, http: Http) -> IngestStats:
     return ingest(db, fetch_last(http), only_changed=False)
 
 
-def rescan_today(db, http: Http, *, now: Optional[datetime] = None) -> IngestStats:
+def rescan_today(db, http: Http, *, now: Optional[datetime] = None, days: int = 2) -> IngestStats:
     today = (now or datetime.now(timezone.utc)).date()
     total = IngestStats()
-    for day in (today, today - timedelta(days=1)):
+    for back in range(days):
+        day = today - timedelta(days=back)
         total = total + ingest(db, list(iter_day(http, day)), only_changed=True)
     return total

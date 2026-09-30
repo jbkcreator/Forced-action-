@@ -11,6 +11,7 @@ from typing import Callable
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from config.lending_dispositions import DNC_CODE
 from config.settings import get_settings
 from src.lending.compliance import on_attempt_recorded, propagate_opt_out
 from src.lending.disposition_delivery import (
@@ -29,27 +30,52 @@ def lending_campaign_ids() -> frozenset[str]:
     return frozenset(part.strip() for part in raw.split(",") if part.strip())
 
 
+def _propagate_dnc(db: Session, *, row_id, phone: str, call_id: str, seat) -> bool:
+    """Opt the number out and stamp the row. Returns True when the dialer removal is still pending."""
+    event_id = propagate_opt_out(db, phone=phone, source_ref=call_id, actor=seat)
+    db.execute(
+        text("UPDATE lending.call_dispositions SET opt_out_propagated_at = now() WHERE id = :id"),
+        {"id": row_id},
+    )
+    return bool(event_id and db.execute(
+        text("SELECT status FROM lending.opt_out_events WHERE id = :id"), {"id": event_id}
+    ).scalar() == "dialer_pending")
+
+
 def process_event(db: Session, ev: DialerCallEvent) -> RecordedCall:
     recorded = record_dialer_event(db, ev)
     db.commit()
 
-    if recorded.call_ended and recorded.phone:
+    if recorded.call_ended and recorded.phone and ev.direction != "inbound":
         on_attempt_recorded(db, recorded.phone)
     if recorded.dnc_requested and not recorded.opt_out_propagated:
         if recorded.phone:
-            event_id = propagate_opt_out(db, phone=recorded.phone, source_ref=recorded.call_id, actor=recorded.caller_seat)
-            db.execute(
-                text("UPDATE lending.call_dispositions SET opt_out_propagated_at = now() WHERE id = :id"),
-                {"id": recorded.row_id},
-            )
-            if event_id and db.execute(
-                text("SELECT status FROM lending.opt_out_events WHERE id = :id"), {"id": event_id}
-            ).scalar() == "dialer_pending":
+            if _propagate_dnc(db, row_id=recorded.row_id, phone=recorded.phone,
+                              call_id=recorded.call_id, seat=recorded.caller_seat):
                 recorded = dataclasses.replace(recorded, dnc_removal_pending=True)
         else:
             logger.error("[lending] call %s: DNC_REQUEST without a usable phone number", recorded.call_id)
     db.commit()
     return recorded
+
+
+def retry_unpropagated_dnc(db: Session) -> int:
+    """DB-only sweep: re-run the opt-out for DNC rows whose propagation failed, whatever the CDR window."""
+    rows = db.execute(
+        text("SELECT id, phone, dialer_call_id, caller_seat FROM lending.call_dispositions "
+             "WHERE disposition = :dnc AND opt_out_propagated_at IS NULL AND phone IS NOT NULL"),
+        {"dnc": DNC_CODE},
+    ).all()
+    done = 0
+    for row_id, phone, call_id, seat in rows:
+        try:
+            _propagate_dnc(db, row_id=row_id, phone=phone, call_id=call_id, seat=seat)
+            db.commit()
+            done += 1
+        except Exception as exc:  # class only: SQL errors embed bound params (phones)
+            db.rollback()
+            logger.error("[lending] DNC retry for call %s failed: %s", call_id, type(exc).__name__)
+    return done
 
 
 def follow_up(recorded: RecordedCall, add_task: Callable[..., None]) -> None:
