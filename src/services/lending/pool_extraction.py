@@ -773,8 +773,8 @@ def _dedup_across_pools(
         if record.phone_available and record.normalized_phone:
             if record.normalized_phone in seen_phones:
                 logger.debug(
-                    "Dedup: dropping borrower=%s pool=%s (already claimed by higher-priority pool)",
-                    record.borrower_name, record.pool_name,
+                    "Dedup: dropping a %s record (phone already claimed by a higher-priority pool)",
+                    record.pool_name,
                 )
                 continue
             seen_phones.add(record.normalized_phone)

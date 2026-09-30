@@ -897,6 +897,16 @@ def _log_propagation(event_id, channel, received_at, finished_at: Optional[datet
     )
 
 
+_RECONCILE_BATCH = 1000
+
+
+def _stream(db, sql: str, params: dict):
+    """First column of every row, read with a server-side cursor in pages of _RECONCILE_BATCH."""
+    result = db.execute(text(sql).execution_options(yield_per=_RECONCILE_BATCH), params)
+    for row in result:
+        yield row[0]
+
+
 def reconcile_suppression(db, source_schema: str = "public", target_schema: str = "lending") -> int:
     """Copy FA opt-outs (and Tracerfy litigators) missing from lending.suppression_list.
 
@@ -906,41 +916,46 @@ def reconcile_suppression(db, source_schema: str = "public", target_schema: str 
     """
     s, t = source_schema, target_schema
     excluded = sorted(OPT_OUT_EXCLUDED_SOURCES)
-    sms = db.execute(
-        text(f'SELECT phone FROM "{s}".sms_opt_outs WHERE source <> ALL(:excluded)'),
-        {"excluded": excluded},
-    ).fetchall()
-    emails = db.execute(
-        text(f'SELECT email FROM "{s}".email_opt_outs WHERE source <> ALL(:excluded)'),
-        {"excluded": excluded},
-    ).fetchall()
-    litigators = db.execute(text(f'SELECT phone FROM "{s}".dnc_phone_checks WHERE litigator')).fetchall()
+    insert = text(
+        f'INSERT INTO "{t}".suppression_list (phone, email, reason, source_channel) '
+        "VALUES (:phone, :email, :reason, :channel) ON CONFLICT DO NOTHING"
+    )
+    before = db.execute(text(f'SELECT count(*) FROM "{t}".suppression_list')).scalar()
+    batch: list[dict] = []
 
-    rows: list[dict] = []
+    def flush() -> None:
+        if batch:
+            db.execute(insert, batch)
+            batch.clear()
+
+    def add(row: dict) -> None:
+        batch.append(row)
+        if len(batch) >= _RECONCILE_BATCH:
+            flush()
+
     seen_phones: set[str] = set()
-    for phones, reason, channel in (
-        (sms, SuppressionReason.OPT_OUT, "backfill:sms_opt_outs"),
-        (litigators, SuppressionReason.LITIGATOR, "backfill:dnc_phone_checks"),
+    for sql, params, reason, channel in (
+        (f'SELECT phone FROM "{s}".sms_opt_outs WHERE source <> ALL(:excluded)', {"excluded": excluded},
+         SuppressionReason.OPT_OUT, "backfill:sms_opt_outs"),
+        (f'SELECT phone FROM "{s}".dnc_phone_checks WHERE litigator', {},
+         SuppressionReason.LITIGATOR, "backfill:dnc_phone_checks"),
     ):
-        for (raw,) in phones:
+        for raw in _stream(db, sql, params):
             phone = normalize_phone(raw)
             if phone and phone not in seen_phones:
                 seen_phones.add(phone)
-                rows.append({"phone": phone, "email": None, "reason": reason.value, "channel": channel})
-    for email in {(e or "").strip().lower() for (e,) in emails} - {""}:
-        rows.append({"phone": None, "email": email, "reason": SuppressionReason.OPT_OUT.value,
-                     "channel": "backfill:email_opt_outs"})
-    if not rows:
-        return 0
+                add({"phone": phone, "email": None, "reason": reason.value, "channel": channel})
 
-    before = db.execute(text(f'SELECT count(*) FROM "{t}".suppression_list')).scalar()
-    db.execute(
-        text(
-            f'INSERT INTO "{t}".suppression_list (phone, email, reason, source_channel) '
-            "VALUES (:phone, :email, :reason, :channel) ON CONFLICT DO NOTHING"
-        ),
-        rows,
-    )
+    seen_emails: set[str] = set()
+    for raw in _stream(db, f'SELECT email FROM "{s}".email_opt_outs WHERE source <> ALL(:excluded)',
+                       {"excluded": excluded}):
+        email = (raw or "").strip().lower()
+        if email and email not in seen_emails:
+            seen_emails.add(email)
+            add({"phone": None, "email": email, "reason": SuppressionReason.OPT_OUT.value,
+                 "channel": "backfill:email_opt_outs"})
+    flush()
+
     added = db.execute(text(f'SELECT count(*) FROM "{t}".suppression_list')).scalar() - before
     logger.info("[lending-compliance] reconcile_suppression added=%d", added)
     return added

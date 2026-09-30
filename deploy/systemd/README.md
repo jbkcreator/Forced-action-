@@ -36,8 +36,8 @@ PYTHONPATH=. .venv/bin/python -m src.lending.dialer_sweep --once
 
 sudo cp deploy/systemd/fa-lending-opt-out-poller.service deploy/systemd/fa-lending-dialer-sweep.service deploy/systemd/fa-lending-missed-call-poller.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now fa-lending-opt-out-poller fa-lending-dialer-sweep
-sudo journalctl -u fa-lending-opt-out-poller -u fa-lending-dialer-sweep -f
+sudo systemctl enable --now fa-lending-opt-out-poller fa-lending-dialer-sweep fa-lending-missed-call-poller
+sudo journalctl -u fa-lending-opt-out-poller -u fa-lending-dialer-sweep -u fa-lending-missed-call-poller -f
 ```
 
 ## Prerequisites the units assume

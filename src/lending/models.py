@@ -241,7 +241,7 @@ class LendingMissedCallText(LendingBase):
     dialer_call_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
     phone: Mapped[str] = mapped_column(String(20), nullable=False)  # phone_utils.normalize
     event_date_et: Mapped[datetime] = mapped_column(Date, nullable=False)
-    outcome: Mapped[str] = mapped_column(String(30), nullable=False)  # sent / dry_run / skipped_*
+    outcome: Mapped[str] = mapped_column(String(30), nullable=False)  # sent / dry_run / skipped_* (incl. skipped_sms_gate)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 
     __table_args__ = (

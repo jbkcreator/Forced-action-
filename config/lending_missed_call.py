@@ -7,7 +7,8 @@ from __future__ import annotations
 
 POLL_SECONDS = 15                 # /api/cdrs poll interval; well inside the 60 s target
 POLL_LOCK_KEY = 7_302_020_803     # one poller cycle at a time (next to the lending compliance lock keys)
-MAX_LATE_SECONDS = 300            # a missed call older than this is logged as late, never texted
+MAX_LATE_SECONDS = 60             # brief rule: text within 60 s; an older missed call is logged late, never texted
+MAX_CALLS_PER_CYCLE = 500         # bound on call records decided per poll cycle
 TIMEZONE = "America/New_York"     # "one text per person per day" is an Eastern calendar day
 SMS_CAMPAIGN = "lending_missed_call"
 MAX_TEXT_CHARS = 320

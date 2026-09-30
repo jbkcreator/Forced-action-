@@ -3,8 +3,11 @@
 Unanswered outbound calls are read from BatchDialer call records (``/api/cdrs``).
 Each gets exactly one decision, stored in ``lending.missed_call_texts``:
 sent, dry_run (feature off), or a skip reason. A text is sent only through FA's
-consent-gated SMS path (``send_sms`` as marketing), so a number without an SMS
-opt-in is skipped, never forced through. Logs carry phone hashes, never phones.
+consent-gated SMS path (``send_sms`` as marketing). That path requires an SMS opt-in
+and an FA subscriber, and sends from FA's single Telnyx number, so today every send is
+blocked and logged ``skipped_sms_gate``: texting cold numbers from the dialed number
+needs the consent decision and a sender that accepts a from-number. Logs carry phone
+hashes, never phones.
 """
 from __future__ import annotations
 
@@ -23,6 +26,7 @@ from config.lending_missed_call import (
     CDR_ID_FIELDS,
     CDR_PHONE_FIELDS,
     CDR_STATUS_FIELDS,
+    MAX_CALLS_PER_CYCLE,
     MAX_LATE_SECONDS,
     MAX_TEXT_CHARS,
     NO_ANSWER_STATUSES,
@@ -37,7 +41,7 @@ from src.services.phone_utils import normalize as normalize_phone
 
 logger = logging.getLogger(__name__)
 
-Sender = Callable[[str, str], bool]  # (to, body) -> sent?
+Sender = Callable[..., bool]  # sender(to, body, from_number) -> sent?
 
 
 @dataclass(frozen=True)
@@ -122,11 +126,17 @@ def _properties(db, phones: list[str]) -> dict[str, str]:
     return {r[0]: r[1] for r in rows if r[1]}
 
 
-def _record(db, call: MissedCall, day: date, outcome: str) -> None:
-    db.execute(text("INSERT INTO lending.missed_call_texts (dialer_call_id, phone, event_date_et, outcome) "
-                    "VALUES (:c, :p, :d, :o) ON CONFLICT (dialer_call_id) DO NOTHING"),
-               {"c": call.call_id, "p": call.phone, "d": day, "o": outcome})
-    logger.info("[missed-call-text] call=%s phone_hash=%s outcome=%s", call.call_id, phone_hash(call.phone)[:12], outcome)
+def _record_all(db, decisions: list[tuple[MissedCall, date, str]]) -> None:
+    if not decisions:
+        return
+    db.execute(
+        text("INSERT INTO lending.missed_call_texts (dialer_call_id, phone, event_date_et, outcome) "
+             "VALUES (:c, :p, :d, :o) ON CONFLICT (dialer_call_id) DO NOTHING"),
+        [{"c": c.call_id, "p": c.phone, "d": d, "o": o} for c, d, o in decisions],
+    )
+    for call, _, outcome in decisions:
+        logger.info("[missed-call-text] call=%s phone_hash=%s outcome=%s",
+                    call.call_id, phone_hash(call.phone)[:12], outcome)
 
 
 def process_missed_calls(
@@ -137,9 +147,10 @@ def process_missed_calls(
     enabled: bool,
     now: Optional[datetime] = None,
 ) -> dict[str, int]:
-    """Decide each call once, in order. Does not commit. Returns outcome counts."""
+    """Decide each call once, in order; at most MAX_CALLS_PER_CYCLE per call. All decisions
+    are written in one batch. Does not commit. Returns outcome counts."""
     now = now or datetime.now(timezone.utc)
-    calls = list(calls)
+    calls = list(calls)[:MAX_CALLS_PER_CYCLE]
     if not calls:
         return {}
     done = _already_decided(db, [c.call_id for c in calls])
@@ -148,9 +159,13 @@ def process_missed_calls(
     suppressed = _suppressed_phones(db, phones) if phones else set()
     properties = _properties(db, phones) if phones else {}
     sent_by_day: dict[date, set[str]] = {}
-    counts: dict[str, int] = {}
+    decisions: list[tuple[MissedCall, date, str]] = []
+    seen: set[str] = set()
 
     for call in fresh:
+        if call.call_id in seen:
+            continue
+        seen.add(call.call_id)
         day = _et_day(call.ended_at)
         sent = sent_by_day.setdefault(day, _sent_today(db, phones, day))
         if call.phone in suppressed:
@@ -161,12 +176,15 @@ def process_missed_calls(
             outcome = "skipped_late"
         elif not enabled:
             outcome = "dry_run"
-        elif sender(call.phone, render_text(properties.get(call.phone))):
+        elif sender(call.phone, render_text(properties.get(call.phone)), call.caller_id_number):
             outcome = "sent"
             sent.add(call.phone)
         else:
-            outcome = "skipped_no_consent"
-        _record(db, call, day, outcome)
+            outcome = "skipped_sms_gate"
+        decisions.append((call, day, outcome))
+    _record_all(db, decisions)
+    counts: dict[str, int] = {}
+    for _, _, outcome in decisions:
         counts[outcome] = counts.get(outcome, 0) + 1
     return counts
 
@@ -175,7 +193,9 @@ def consent_gated_sender(db) -> Sender:
     """FA's central SMS dispatcher as marketing: opt-out, opt-in consent and quiet hours all apply."""
     from src.services.sms_compliance import send_sms
 
-    def send(to: str, body: str) -> bool:
+    def send(to: str, body: str, from_number: Optional[str] = None) -> bool:
+        # send_sms has no from-number yet: it always uses FA's Telnyx number, and it blocks
+        # marketing to non-subscribers. Both change only with the consent decision.
         return send_sms(to, body, db, message_type="marketing", campaign=SMS_CAMPAIGN)
 
     return send

@@ -65,13 +65,13 @@ class Sender:
     def __init__(self, allow=True):
         self.sent, self.allow = [], allow
 
-    def __call__(self, to, body):
-        self.sent.append((to, body))
+    def __call__(self, to, body, from_number=None):
+        self.sent.append((to, body, from_number))
         return self.allow
 
 
-def _call(call_id=None, phone=PHONE, minutes_ago=0.5):
-    return MissedCall(call_id=call_id or f"c-{uuid.uuid4().hex[:8]}", phone=phone, caller_id_number=None,
+def _call(call_id=None, phone=PHONE, minutes_ago=0.5, caller_id=None):
+    return MissedCall(call_id=call_id or f"c-{uuid.uuid4().hex[:8]}", phone=phone, caller_id_number=caller_id,
                       ended_at=NOW - timedelta(minutes=minutes_ago))
 
 
@@ -119,10 +119,35 @@ def test_a_suppressed_number_is_never_texted(db):
 
 
 @needs_db
-def test_a_consent_block_from_the_sms_gate_is_logged_as_no_consent(db):
+def test_a_block_from_the_sms_gate_is_logged_as_such(db):
     from src.lending.missed_call_text import process_missed_calls
     process_missed_calls(db, [_call()], sender=Sender(allow=False), enabled=True, now=NOW)
-    assert _outcomes(db) == ["skipped_no_consent"]
+    assert _outcomes(db) == ["skipped_sms_gate"]
+
+
+@needs_db
+def test_the_text_is_offered_the_dialed_caller_id_number(db):
+    from src.lending.missed_call_text import process_missed_calls
+    sender = Sender()
+    process_missed_calls(db, [_call(caller_id="+18135550999")], sender=sender, enabled=True, now=NOW)
+    assert sender.sent[0][2] == "+18135550999"
+
+
+@needs_db
+def test_a_call_older_than_60_seconds_is_never_texted(db):
+    from src.lending.missed_call_text import process_missed_calls
+    sender = Sender()
+    process_missed_calls(db, [_call(minutes_ago=61 / 60)], sender=sender, enabled=True, now=NOW)
+    assert sender.sent == [] and _outcomes(db) == ["skipped_late"]
+
+
+@needs_db
+def test_decisions_are_written_in_one_batch_and_input_is_bounded(db, monkeypatch):
+    from src.lending import missed_call_text as mct
+    monkeypatch.setattr(mct, "MAX_CALLS_PER_CYCLE", 2)
+    calls = [_call(phone=f"+1813555{8610 + i}") for i in range(3)]
+    counts = mct.process_missed_calls(db, calls, sender=Sender(), enabled=False, now=NOW)
+    assert counts == {"dry_run": 2}
 
 
 @needs_db
