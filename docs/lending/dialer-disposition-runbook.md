@@ -4,10 +4,13 @@ Every dialer call becomes one row in `lending.call_dispositions`; unanswered cal
 `lending.missed_call_events` row. The result reaches the Google Sheet and Slack `#dial-tasks`
 within 30 seconds. This runbook is vendor-neutral; the BatchDialer-specific steps are marked.
 
-**Unconfirmed until BatchDialer's API documentation and a real payload are in hand:** the webhook
-field names (`EVENT_FIELD_CANDIDATES` in `config/lending_dispositions.py`), the webhook security,
-whether an unanswered call produces an event with no caller action, and how a contact is held.
-Capture one payload per event type, mask it, and fix the field map before go-live.
+Call results are ingested by **polling BatchDialer call records (CDRs)** with the service
+`python -m src.lending.cdr_poller` (`deploy/systemd/fa-lending-cdr-poller.service`). The webhook route
+`/webhooks/lending/dialer` still exists but is **not used** unless BatchDialer's payload carries the CDR id.
+
+**Unverified until the live check in `docs/lending/batchdialer-api-findings.md` (Task 0, not yet done)
+is filled in:** the CDR field strings (for example `"ANSWER"`), whether an unanswered call appears as a
+CDR, and how a contact is held. Confirm them before go-live.
 
 ## 1. Order of setup
 
@@ -17,23 +20,22 @@ Capture one payload per event type, mask it, and fix the field map before go-liv
    `LENDING_DB_PASSWORD`).
 2. `.env`:
    - `LENDING_DATABASE_URL`
-   - `LENDING_DIALER_WEBHOOK_SECRET` (long random string)
-   - `LENDING_DIALER_CAMPAIGN_IDS` (comma-separated; **empty ignores every event**)
-   - `LENDING_SEAT_GROUPS` (`userid:A,userid:B`; a seat missing here gets no shift group)
+   - `LENDING_DIALER_CAMPAIGN_IDS` (comma-separated BatchDialer **campaign ids**, from `GET /api/campaigns`; **empty ignores every call**)
+   - `LENDING_SEAT_GROUPS` (`agentid:A,agentid:B`, keyed by BatchDialer **agent id**; a seat missing here gets no shift group)
    - `LENDING_DISPOSITION_MISSING_ALERT_MINUTES` (default 10)
    - `LENDING_SLACK_BOT_TOKEN`, `LENDING_DIAL_TASKS_CHANNEL`,
      `LENDING_SHEETS_SERVICE_ACCOUNT_KEY_PATH`, `LENDING_DISPOSITION_SHEET_ID` (+ `_TAB`)
-   - `BATCHDIALER_API_KEY` (shared with the dialer load; `.env` only, never in chat or PRs)
-3. Start `lending-api` (`deploy/systemd/lending-api.service`) and add the Nginx block:
-   `location /webhooks/lending/dialer { proxy_pass http://127.0.0.1:8010; }`
+   - `BATCHDIALER_API_KEY` (the API token: **User icon → Settings → Integrations → Custom Integration**; shared with the dialer load; `.env` only, never in chat or PRs)
+3. Start `fa-lending-cdr-poller` (`deploy/systemd/fa-lending-cdr-poller.service`). Run **exactly one
+   instance**: the `/v2/cdrs/last` watermark is per API key, so a second poller (or anything else using
+   that endpoint with the same key) steals records. `lending-api` and its Nginx block are not needed for ingestion.
 4. Install the crontab (delivery retry and missing-disposition alert, both every 5 minutes).
 
 ## 2. What the dialer admin configures in the app (BatchDialer: Akrash)
 
 - The disposition list, **exact spelling**, from `config/lending_dispositions.py` (version
   `2026-10-01`; the client approves it first). The codes marked *proposed* in that file need approval.
-- The webhook on each disposition, pointing at `https://<host>/webhooks/lending/dialer` with the
-  secret (header `X-Webhook-Secret`, or `?token=` if the dialer cannot set a header).
+- No webhook is configured; the webhook is not used. We read call results by polling.
 - `DNC_REQUEST` set to add the number to the dialer's DNC list and not redial (backup to our own removal).
 - Campaigns named as in `config/lending_dialer.py` (`POOL_CAMPAIGN_TAGS`).
 - **One line per seat**, max 3 attempts, campaign hours ending 7:15pm ET (backstop; the database rules
@@ -66,5 +68,5 @@ Capture one payload per event type, mask it, and fix the field map before go-liv
 4. An unanswered call creates a `missed_call_events` row; a second the same day is `duplicate_day`.
 5. `DNC_REQUEST` blocks the contact everywhere; a replay does not duplicate.
 6. A connected call with no disposition after N minutes raises one Slack warning.
-7. A wrong secret returns 401; a non-lending campaign returns 200 and is ignored.
+7. The poller logs `processed=N` within 20 s of a test call, and the call row appears; a non-lending campaign is ignored.
 8. `pytest tests/lending/`.
