@@ -15,3 +15,16 @@ AIRCALL_REQUEST_TIMEOUT_SECONDS: float = 20.0
 # DESK_CAPITAL_LOOP / DESK_CONSTRUCTION / DESK_RESCUE; a live load refuses to
 # run for any pool without an entry here.
 POOL_CAMPAIGN_TAGS: dict[str, str] = {}
+
+
+# BatchDialer (client decision, Go Live Brief 2.4). Auth header X-ApiKey. The base URL
+# and each endpoint stay unset until confirmed against the client's account (E1);
+# an unset endpoint raises UnconfirmedCapability and removals stay pending.
+BATCHDIALER_BASE_URL: str = ""
+BATCHDIALER_TIMEOUT_SECONDS: float = 20.0
+BATCHDIALER_ENDPOINTS: dict[str, "tuple[str, str] | None"] = {
+    "contact_upsert": None,
+    "campaign_remove": None,
+    "campaign_restore": None,
+    "dnc_add": None,
+}

@@ -858,6 +858,7 @@ class AppSettings(BaseSettings):
 	# app boots without Aircall configured (feature-gated).
 	aircall_api_id: Optional[SecretStr] = Field(default=None, env="AIRCALL_API_ID")
 	aircall_api_token: Optional[SecretStr] = Field(default=None, env="AIRCALL_API_TOKEN")
+	batchdialer_api_key: Optional[SecretStr] = Field(default=None, env="BATCHDIALER_API_KEY")
 	aircall_webhook_token: Optional[SecretStr] = Field(default=None, env="AIRCALL_WEBHOOK_TOKEN")
 	# ── Meta Conversions API (CAPI) — S2 ────────────────────────────────────
 	# Server-side Purchase reporting for closed-loop Meta ad attribution.
