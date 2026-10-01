@@ -48,6 +48,9 @@ PYTHONPATH=. python migrations/apply_lending_dialer_load_records.py  # lending.d
 
 # Lending dialer load: pool export -> compliance filter -> Backflip conflict check -> Aircall. Dry run unless --live
 python -m src.tasks.lending_dialer_load --input pools.json
+PYTHONPATH=. python migrations/apply_lending_call_extractions.py  # lending.call_extractions: the twelve fields extracted from each call transcript, one row per dialer call (idempotent)
+PYTHONPATH=. python migrations/apply_lending_lead_call_confirmations.py  # lending.lead_call_confirmations: borrower-confirmed maturity and decision maker per property, read by lead scoring as known inputs (idempotent)
+PYTHONPATH=. python migrations/apply_lending_first_contact_snapshots.py  # lending.first_contact_snapshots: write-once scoring inputs, rank, caller and script version per phone at first contact (idempotent)
 PYTHONPATH=. python migrations/apply_property_radar_pull_runs.py  # PropertyRadar ingestion adapter (Dev 1): property_radar_pull_runs (run checkpoint) + property_radar_seen_ids (dedup) (idempotent)
 
 # PropertyRadar daily target-lender maturity pull (separate cron, disabled until PROPERTY_RADAR_ENABLED=true — see scripts/cron/crontab.txt)

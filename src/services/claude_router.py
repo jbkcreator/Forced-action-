@@ -86,6 +86,8 @@ _TASK_ROUTING: dict[str, str] = {
     "fa_max_nl_revision": "sonnet",
     # FA Max voice-note disposition extraction (WP-T3-1)
     "fa_max_voice_disposition": "sonnet",
+    # Lending caller-call field extraction from the transcript
+    "lending_call_extraction": "sonnet",
     # Opus — explicit override, edge cases only
     "edge_case": "opus",
 }
