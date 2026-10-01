@@ -38,7 +38,7 @@ CDR, and how a contact is held. Confirm them before go-live.
    - UNVERIFIED (Task 0, needs a live account check): the pagination parameter name `next_page` and the CDR
      status strings (`ANSWER` etc. in `CDR_ANSWERED_STATUSES`).
 4. Install the crontab: delivery retry and missing-disposition alert (every 5 minutes), plus the two new lines
-   `src.tasks.lending_recording_check` (every 10 minutes) and `src.tasks.lending_daily_scoreboard` (7:00pm ET).
+   `src.tasks.lending_recording_check` (every 10 minutes) and `src.tasks.lending_daily_scoreboard` (7:20pm ET).
 
 ## 2. What the dialer admin configures in the app (BatchDialer: Akrash)
 
@@ -126,7 +126,7 @@ All 13 results exist in BatchDialer (group "Lending", created). Only the three b
 
 ### Daily scoreboard
 
-- `src.tasks.lending_daily_scoreboard` posts to `LENDING_DAILY_CHANNEL` (channel ID) at 7:00pm ET (two UTC cron lines; only the one at 19:xx ET acts).
+- `src.tasks.lending_daily_scoreboard` posts to `LENDING_DAILY_CHANNEL` (channel ID) at 7:20pm ET, after the dialer stops at 7:15pm (UTC cron lines 23:20 and 00:20; only the one at 19:xx ET acts).
   Tables: by caller, by BatchDialer campaign (`dialer_campaign_id`, names from `GET /campaigns`), and by hook (`campaign_tag`).
 - Definitions live in `config/lending_dispositions.py` (`LIVE_CONVERSATION_CODES`, `GATED_CODES`, `NURTURE_SENT_CODES`).
   Booked excludes `booking_blocked`; Showed comes from GHL stage events (see "GHL showed feed" below), not the log.
