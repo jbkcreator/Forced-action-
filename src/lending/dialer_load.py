@@ -21,8 +21,9 @@ from __future__ import annotations
 import json
 import logging
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
 from sqlalchemy import text
@@ -37,6 +38,9 @@ from src.lending.backflip_conflict import (
 from src.lending.compliance import GateResult, Scrubber, dial_blocks, filter_loadable, phone_hash
 from src.lending.dialer_contact import DialerDisplay, dialer_fields, display_from_record
 from src.lending.dialer_port import ContactUpsertResult, DialerContactFields, DialerRequestError
+from src.lending.context_card import build_context_card
+from src.lending.lead_facts import LeadFacts, load_lead_facts
+from src.lending.lead_scoring import LeadSignals, score_lead
 from src.services.phone_utils import normalize as normalize_phone
 
 logger = logging.getLogger(__name__)
@@ -196,7 +200,8 @@ def _push_contact(dialer: DialerContacts, item: _Loadable, known_contact_id: Opt
     """Update by the stored contact id when known (search can lag); else upsert by phone."""
     if known_contact_id is not None:
         try:
-            dialer.update_contact(known_contact_id, fields, phone=item.phone)
+            dialer.update_contact(known_contact_id, fields, phone=item.phone,
+                                  vendor_contact_id=item.record_ref or None)
             return ContactUpsertResult(contact_id=known_contact_id, created=False)
         except DialerRequestError as exc:
             if exc.status != 404:
@@ -244,6 +249,48 @@ def _store_chunk(db, run_id: str, loaded: list[tuple[_Loadable, int]],
             for item, contact_id in loaded
         ],
     )
+
+
+CARD_TIMEZONE = ZoneInfo("America/New_York")
+
+
+def _first_name(borrower_name: Optional[str]) -> Optional[str]:
+    parts = (borrower_name or "").split()
+    return parts[0] if parts else None
+
+
+def _cards(db, loadable: Sequence["_Loadable"]) -> dict[str, dict[str, str]]:
+    """Context-card custom fields per record ref, from one batched facts query.
+
+    The card is extra context for the caller, never a reason to skip a load: if
+    the facts query fails, every record loads without a card (inside a savepoint,
+    so the load's transaction stays usable).
+    """
+    today = datetime.now(CARD_TIMEZONE).date()
+    property_ids = sorted({int(item.record["property_id"]) for item in loadable
+                           if item.record.get("property_id") is not None})
+    facts: dict[int, LeadFacts] = {}
+    if property_ids:
+        try:
+            with db.begin_nested():
+                facts = load_lead_facts(db, property_ids, today=today)
+        except Exception as exc:
+            logger.warning("[dialer-load] card facts unavailable (%s); loading without cards", type(exc).__name__)
+            return {}
+    cards: dict[str, dict[str, str]] = {}
+    for item in loadable:
+        property_id = item.record.get("property_id")
+        lead = facts.get(int(property_id)) if property_id is not None else None
+        lead = lead or LeadFacts(property_id=int(property_id or 0), property_address=item.display.property_address,
+                                 lender_name=None, latest_permit=item.display.recent_permit_details,
+                                 signals=LeadSignals())
+        card = build_context_card(
+            lead, score_lead(lead.signals, today=today),
+            first_name=_first_name(item.display.borrower_name), county=item.display.county,
+            campaign=item.display.campaign_tag, hook=item.display.hook,
+        )
+        cards[item.record_ref] = card.custom_fields
+    return cards
 
 
 def run_dialer_load(
@@ -347,8 +394,10 @@ def run_dialer_load(
     commit()
     active = _active_rows(db, loadable_phones)
     chunk: list[tuple[_Loadable, int]] = []
+    cards = _cards(db, loadable)
     for item in loadable:
-        fields = dialer_fields(item.display, email=item.record.get("email"))
+        fields = replace(dialer_fields(item.display, email=item.record.get("email")),
+                         card=cards.get(item.record_ref, {}))
         try:
             result = _push_contact(dialer, item, active.get(item.phone, (None, None))[1], fields)
         except DialerRequestError as exc:
