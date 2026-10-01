@@ -66,3 +66,13 @@ def test_slack_text_names_every_column(lending_db):
     for word in ("Dials", "Live", "Gated", "Booked", "Showed", "Nurture", "Connect", "Book rate"):
         assert word in out
     assert "n/a (GHL)" in out
+
+
+def test_only_a_blocked_booking_gives_zero_booked_and_no_division_error(lending_db):
+    _call(lending_db, "1", disp="BOOKED", blocked=True)
+    _call(lending_db, "2", camp="12", disp="NO_ANSWER")
+    data = build_scoreboard(lending_db, DAY, NAMES)
+    assert data.total.booked == 0 and data.total.book_rate == 0.0
+    empty = next(r for r in data.by_campaign if r.name == "Builders")
+    assert (empty.live, empty.connect_rate, empty.book_rate) == (0, 0.0, 0.0)
+    format_slack(data, DAY)

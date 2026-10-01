@@ -30,10 +30,11 @@ def test_campaign_id_backfills_from_the_raw_event_and_rerun_is_stable(lending_db
     conn.execute(text(
         "INSERT INTO lending.call_dispositions (dialer_call_id, raw_event) VALUES "
         "('cb1', '{\"campaign\": {\"id\": 11}}'::jsonb), ('cb2', '{\"campaign_id\": \"12\"}'::jsonb), "
-        "('cb3', '{}'::jsonb)"))
+        "('cb3', '{}'::jsonb), ('cb4', '{\"data\": {\"campaign\": {\"id\": 13}}}'::jsonb), "
+        "('cb5', '{\"data\": {\"campaign_id\": \"14\"}}'::jsonb)"))
     apply_to(conn)
     apply_to(conn)
     got = dict(conn.execute(text(
         "SELECT dialer_call_id, dialer_campaign_id FROM lending.call_dispositions "
-        "WHERE dialer_call_id IN ('cb1','cb2','cb3')")).all())
-    assert got == {"cb1": "11", "cb2": "12", "cb3": None}
+        "WHERE dialer_call_id IN ('cb1','cb2','cb3','cb4','cb5')")).all())
+    assert got == {"cb1": "11", "cb2": "12", "cb3": None, "cb4": "13", "cb5": "14"}

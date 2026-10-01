@@ -17,10 +17,10 @@ logger = logging.getLogger(__name__)
 
 
 def campaign_names() -> Mapping[str, str]:
-    http = get_http()
-    if http is None:
-        return {}
     try:
+        http = get_http()
+        if http is None:
+            return {}
         rows = http("GET", "/campaigns", json=None)
         items = rows.get("items", []) if isinstance(rows, Mapping) else rows
         return {str(r["id"]): str(r["name"]) for r in items if "id" in r and "name" in r}
@@ -41,11 +41,16 @@ def main(argv=None, *, now: Optional[datetime] = None) -> int:
     if not (channel and s.lending_slack_bot_token):
         logger.error("[lending] scoreboard not posted: Slack channel or token is not configured")
         return 1
-    with lending_session() as db:
-        message = format_slack(build_scoreboard(db, now_et.date(), campaign_names()), now_et.date())
-    from slack_sdk import WebClient
-    WebClient(token=s.lending_slack_bot_token.get_secret_value()).chat_postMessage(channel=channel, text=message)
-    logger.info("[lending] scoreboard posted for %s", now_et.date())
+    day = now_et.date()
+    try:
+        with lending_session() as db:
+            message = format_slack(build_scoreboard(db, day, campaign_names()), day)
+        from slack_sdk import WebClient
+        WebClient(token=s.lending_slack_bot_token.get_secret_value()).chat_postMessage(channel=channel, text=message)
+    except Exception:
+        logger.exception("[lending] scoreboard post failed for %s", day)
+        return 1
+    logger.info("[lending] scoreboard posted for %s", day)
     return 0
 
 

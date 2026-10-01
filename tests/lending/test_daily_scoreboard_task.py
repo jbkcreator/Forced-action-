@@ -60,3 +60,38 @@ def test_unconfigured_channel_returns_1_and_posts_nothing(wired, monkeypatch):
     monkeypatch.setattr(task, "get_settings", lambda: SimpleNamespace(
         lending_dial_tasks_channel="", lending_slack_bot_token=SecretStr("xoxb-t")))
     assert task.main(["--force"], now=NOON_ET) == 1 and posted == []
+
+
+def test_slack_failure_returns_1_and_logs(wired, monkeypatch, caplog):
+    class Boom:
+        def __init__(self, token):
+            pass
+
+        def chat_postMessage(self, **kw):
+            raise RuntimeError("slack down")
+
+    monkeypatch.setattr("slack_sdk.WebClient", Boom)
+    assert task.main(["--force"], now=NOON_ET) == 1
+    assert "scoreboard post failed for 2026-10-06" in caplog.text and "xoxb" not in caplog.text
+
+
+def test_build_failure_returns_1(wired, monkeypatch):
+    def boom(*a):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(task, "build_scoreboard", boom)
+    assert task.main(["--force"], now=NOON_ET) == 1
+
+
+@pytest.mark.parametrize("http", [lambda *a, **k: 1 / 0, lambda *a, **k: [{"nope": 1}, "x"], lambda *a, **k: {"items": 5}])
+def test_campaign_names_falls_back_to_empty(monkeypatch, http):
+    monkeypatch.setattr(task, "get_http", lambda: http)
+    assert task.campaign_names() == {}
+
+
+def test_campaign_names_when_get_http_itself_raises(monkeypatch):
+    def boom():
+        raise RuntimeError("x")
+
+    monkeypatch.setattr(task, "get_http", boom)
+    assert task.campaign_names() == {}

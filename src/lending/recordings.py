@@ -46,14 +46,14 @@ def check_pending(db, head_status: Callable[[str], int], *, now: Optional[dateti
     for row in rows:
         try:
             outcome = _outcome(head_status(row["recording_ref"]))
-        except Exception:
-            logger.warning("[lending] recording check error call=%s", row["dialer_call_id"], exc_info=True)
+        except Exception as exc:
+            logger.warning("[lending] recording check error call=%s: %s", row["dialer_call_id"], type(exc).__name__)
             outcome = "skipped"
-        if outcome == "forbidden" and row["recording_status"] != "forbidden":
-            logger.warning("[lending] recording permission missing for this key, call=%s", row["dialer_call_id"])
         new_status = outcome if outcome != "skipped" else row["recording_status"]
         db.execute(text("UPDATE lending.call_dispositions SET recording_status = :s, recording_checked_at = :now WHERE id = :id"),
                    {"s": new_status, "now": now, "id": row["id"]})
         setattr(stats, outcome, getattr(stats, outcome) + 1)
     db.commit()
+    if stats.forbidden:
+        logger.warning("[lending] recording permission missing for this key: %d call(s) forbidden this run", stats.forbidden)
     return stats

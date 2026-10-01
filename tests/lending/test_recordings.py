@@ -69,3 +69,10 @@ def test_calls_without_a_recording_are_ignored(lending_db):
     calls = []
     check_pending(lending_db, lambda url: calls.append(url) or 200, now=NOW)
     assert calls == []
+
+
+def test_missing_is_never_rechecked(lending_db):
+    _row(lending_db, status="missing")
+    calls = []
+    check_pending(lending_db, lambda url: calls.append(url) or 200, now=NOW + timedelta(days=1))
+    assert calls == [] and _status(lending_db) == "missing"
