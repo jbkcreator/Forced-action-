@@ -44,7 +44,7 @@ CDR, and how a contact is held. Confirm them before go-live.
 ## 2. What the dialer admin configures in the app (BatchDialer: Akrash)
 
 - The disposition list, **exact spelling**, from `config/lending_dispositions.py` (version
-  `2026-10-01`; the client approves it first). The codes marked *proposed* in that file need approval.
+  `2026-10-01`; the list is approved, 2026-09-30).
 - No webhook is configured; the webhook is not used. We read call results by polling.
 - `DNC_REQUEST` set to add the number to the dialer's DNC list and not redial (backup to our own removal).
 - Campaigns named as in `config/lending_dialer.py` (`POOL_CAMPAIGN_TAGS`).
@@ -86,6 +86,9 @@ CDR, and how a contact is held. Confirm them before go-live.
 - Its `consent_gated_sender` uses FA `send_sms` (Telnyx) and currently blocks every send (`skipped_sms_gate`). The client wants GHL on a
   Next Deal Lending number, consented numbers only, and no text if 10DLC does not clear. That developer should replace the gate with
   `src.lending.consent.has_text_consent(db, phone)` and the sender with GHL. Nothing else from #319 is promised to the sender.
+- `record_consent` re-grants a revoked consent because the BatchDialer field `text_consent=yes` stays on the contact, so whoever calls
+  `revoke_consent()` must also clear that dialer field. Today STOP/DNC are enforced through suppression/`do_not_contact` inside
+  `has_text_consent`, so nothing calls revoke yet.
 - #319's `lending.missed_call_events` / `queue_missed_call()` is not read by that pipeline. Follow-up cleanup: remove it once #320 is merged and
   the text-back task is live (not deleted here; existing tests and the migration cover it).
 

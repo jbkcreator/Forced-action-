@@ -6,7 +6,11 @@ from __future__ import annotations
 
 import logging
 
+from urllib.parse import urlsplit
+
 import requests
+
+from config.lending_dialer import BATCHDIALER_BASE_URL
 
 from config.settings import get_settings
 from src.lending.db import lending_session
@@ -20,7 +24,12 @@ TIMEOUT_SECONDS = 20
 def make_status_getter(api_key: str):
     headers = {"X-ApiKey": api_key}
 
+    dialer_host = urlsplit(BATCHDIALER_BASE_URL).hostname
+
     def status_of(url: str) -> int:
+        if urlsplit(url).hostname != dialer_host:
+            logger.warning("[lending] recording check skipped a link on a non-dialer host; API key not sent")
+            return 0
         # GET without reading the body (HEAD may be unsupported). Redirects are never followed: the key header
         # must not leave the dialer, and a login page behind a redirect would read as 200.
         with requests.get(url, headers=headers, stream=True, timeout=TIMEOUT_SECONDS, allow_redirects=False) as resp:

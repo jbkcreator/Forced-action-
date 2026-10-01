@@ -39,9 +39,10 @@ def check_pending(db, head_status: Callable[[str], int], *, now: Optional[dateti
         text("SELECT id, dialer_call_id, recording_ref, recording_status FROM lending.call_dispositions "
              "WHERE recording_ref IS NOT NULL AND recording_status IN ('pending', 'forbidden') "
              "AND (recording_checked_at IS NULL OR recording_checked_at <= :cutoff) "
-             "ORDER BY call_ended_at LIMIT :n FOR UPDATE SKIP LOCKED"),
+             "ORDER BY call_ended_at LIMIT :n"),
         {"cutoff": cutoff, "n": limit},
     ).mappings().all()
+    db.commit()  # no transaction or row lock may span an HTTP call: ingestion upserts these rows
     stats = CheckStats()
     for row in rows:
         try:
@@ -50,10 +51,11 @@ def check_pending(db, head_status: Callable[[str], int], *, now: Optional[dateti
             logger.warning("[lending] recording check error call=%s: %s", row["dialer_call_id"], type(exc).__name__)
             outcome = "skipped"
         new_status = outcome if outcome != "skipped" else row["recording_status"]
-        db.execute(text("UPDATE lending.call_dispositions SET recording_status = :s, recording_checked_at = :now WHERE id = :id"),
+        db.execute(text("UPDATE lending.call_dispositions SET recording_status = :s, recording_checked_at = :now "
+                        "WHERE id = :id AND recording_status IN ('pending', 'forbidden')"),
                    {"s": new_status, "now": now, "id": row["id"]})
+        db.commit()
         setattr(stats, outcome, getattr(stats, outcome) + 1)
-    db.commit()
     if stats.forbidden:
         logger.warning("[lending] recording permission missing for this key: %d call(s) forbidden this run", stats.forbidden)
     return stats
