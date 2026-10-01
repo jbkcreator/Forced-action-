@@ -82,6 +82,8 @@ def test_credit_cap_aborts_before_a_batch_that_would_exceed_it(db):
                           dialer_remover=Remover())
     assert scrubber.calls == [PHONES[:2]]      # 2nd batch would reach 4 > 3
     assert result.aborted and result.credits_used == 2 and result.scrubbed == 2
+    # The 3 not reached stay blocked at dial time (scrub too old) and are reported, not hidden.
+    assert result.left_unscrubbed == 3
 
 
 def test_new_dnc_hits_leave_the_dialer_and_flag_nurture(db):

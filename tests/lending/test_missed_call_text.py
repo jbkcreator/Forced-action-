@@ -271,3 +271,32 @@ def test_the_poller_pages_the_call_list_until_it_reaches_calls_it_already_has(db
     assert all(p.startswith("/v2/cdrs?") and "/last" not in p for p in requested)
     assert len(requested) == 2          # stopped on the page holding a call it already had
     assert counts == {"dry_run": 1}
+
+
+# ── Shift groups: allow and warn (decision 2026-10-01) ──
+
+@needs_db
+def test_a_call_by_an_agent_with_no_shift_group_is_counted_and_warned(db, caplog, monkeypatch):
+    from src.lending import missed_call_poller
+    monkeypatch.setattr(missed_call_poller, "AGENT_SHIFT_GROUPS", {})
+    fresh = (NOW - timedelta(seconds=20)).isoformat()
+    records = [_cdr(id=f"g-{uuid.uuid4().hex[:6]}", status="COMPLETED", disposition="ANSWER", callEndTime=fresh)]
+    with caplog.at_level("WARNING"):
+        missed_call_poller.run_cycle(db, http=lambda *a, **k: records, enabled=False, now=NOW)
+    assert db.execute(text("SELECT count(*) FROM lending.call_dispositions WHERE phone = :p"), {"p": PHONE}).scalar() == 1
+    assert any("no shift group" in r.getMessage() and "42" in r.getMessage() for r in caplog.records)
+
+
+@needs_db
+def test_a_call_outside_the_agents_shift_is_warned_and_its_group_recorded(db, caplog, monkeypatch):
+    from src.lending import missed_call_poller
+    monkeypatch.setattr(missed_call_poller, "AGENT_SHIFT_GROUPS", {"42": "B"})
+    early = datetime(2026, 10, 5, 14, 0, tzinfo=timezone.utc)   # 10:00 ET: before Group B starts at 13:00
+    call_id = f"g-{uuid.uuid4().hex[:6]}"
+    records = [_cdr(id=call_id, status="COMPLETED", disposition="ANSWER",
+                    callStartTime=early.isoformat(), callEndTime=(early + timedelta(minutes=2)).isoformat())]
+    with caplog.at_level("WARNING"):
+        missed_call_poller.run_cycle(db, http=lambda *a, **k: records, enabled=False, now=early + timedelta(minutes=3))
+    assert any("outside shift group B" in r.getMessage() for r in caplog.records)
+    assert db.execute(text("SELECT seat_group FROM lending.call_dispositions WHERE dialer_call_id = :c"),
+                      {"c": call_id}).scalar() == "B"

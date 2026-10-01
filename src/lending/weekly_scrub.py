@@ -47,6 +47,7 @@ class WeeklyScrubResult:
     blocked: int = 0
     credits_used: int = 0
     aborted: bool = False
+    left_unscrubbed: int = 0  # not reached under the cap: blocked at dial time until rescrubbed
 
 
 def stale_loaded_phones(db, *, now: Optional[datetime] = None) -> list[str]:
@@ -92,8 +93,10 @@ def weekly_scrub(
         batch = targets[start:start + batch_size]
         if result.credits_used + len(batch) > max_credits:
             result.aborted = True
-            logger.warning("[weekly-scrub] credit cap %d reached after %d credits; stopping",
-                           max_credits, result.credits_used)
+            result.left_unscrubbed = len(targets) - start
+            logger.warning("[weekly-scrub] credit cap %d reached after %d credits; %d number(s) left "
+                           "unscrubbed and blocked from dialing until rescrubbed",
+                           max_credits, result.credits_used, result.left_unscrubbed)
             break
         scrubs = _scrub(db, batch, scrubber)
         result.credits_used += len(batch)
@@ -107,8 +110,8 @@ def weekly_scrub(
         _flag_nurture(db, [p for p in blocked if verdicts[p].reason in NURTURE_REASONS])
         removed = _remove_from_dialer(blocked, dialer_remover, RemovalReason.OPT_OUT)
         _close_load_rows(db, list(removed))
-    logger.info("[weekly-scrub] scrubbed=%d blocked=%d credits=%d aborted=%s",
-                result.scrubbed, result.blocked, result.credits_used, result.aborted)
+    logger.info("[weekly-scrub] scrubbed=%d blocked=%d credits=%d aborted=%s left_unscrubbed=%d",
+                result.scrubbed, result.blocked, result.credits_used, result.aborted, result.left_unscrubbed)
     return result
 
 

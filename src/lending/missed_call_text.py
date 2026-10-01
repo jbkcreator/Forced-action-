@@ -56,7 +56,7 @@ def _first(row: Mapping[str, Any], fields: tuple[str, ...]) -> Any:
     return next((row[f] for f in fields if row.get(f) not in (None, "")), None)
 
 
-def _parse_time(value: Any) -> Optional[datetime]:
+def parse_time(value: Any) -> Optional[datetime]:
     if isinstance(value, datetime):
         return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
     if not value:
@@ -79,7 +79,7 @@ def call_record_fields(row: Mapping[str, Any]) -> Optional[dict[str, Any]]:
     no id, usable phone or end time. Direction defaults to outbound (the dialer places calls)."""
     call_id = _first(row, CDR_ID_FIELDS)
     phone = normalize_phone(str(_first(row, CDR_PHONE_FIELDS) or ""))
-    ended_at = _parse_time(_first(row, CDR_ENDED_AT_FIELDS))
+    ended_at = parse_time(_first(row, CDR_ENDED_AT_FIELDS))
     if not call_id or not phone or ended_at is None:
         return None
     direction = str(_first(row, CDR_DIRECTION_FIELDS) or "outbound").strip().lower()
