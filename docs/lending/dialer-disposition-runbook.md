@@ -63,6 +63,27 @@ CDR, and how a contact is held. Confirm them before go-live.
 - **Unknown code:** stored in `disposition_raw`, `disposition` stays empty, one Slack warning.
 - **Built-in dialer results** (No Answer, Busy, Answering Machine, Disconnected Number, Do Not Call, …)
   map to our codes without an alert (`SYSTEM_DISPOSITION_ALIASES`).
+
+#### BatchDialer result names (as created)
+
+| # | Our code | Result name in BatchDialer | Type / how it maps | Attached to campaigns |
+|---|---|---|---|---|
+| 1 | `NO_ANSWER` | **No Answer** | Built-in; the name normalises to `NO_ANSWER` (direct match) | TO DO |
+| 2 | `LEFT_VOICEMAIL` | `LEFT_VOICEMAIL` | Custom; exact | Done |
+| 3 | `BAD_NUMBER` | `BAD_NUMBER` | Custom; exact | Done |
+| 4 | `CALL_FAILED` | `CALL_FAILED` | Custom; exact | Done |
+| 5 | `WRONG_PERSON` | `WRONG_PERSON` | Custom; exact | Done |
+| 6 | `NOT_DECISION_MAKER` | `NOT_DECISION_MAKER` | Custom; exact | TO DO |
+| 7 | `REFERRED` | `REFERRED` | Custom; exact | TO DO |
+| 8 | `DNC_REQUEST` | **Do Not Call** | Built-in; alias `DO_NOT_CALL` -> `DNC_REQUEST` | TO DO |
+| 9 | `CONNECTED_NOT_INTERESTED` | `CONNECTED_NOT_INTERESTED` | Custom; exact | TO DO |
+| 10 | `CALLBACK_REQUESTED` | **Call Back** | Built-in; alias `CALL_BACK` -> `CALLBACK_REQUESTED` | TO DO |
+| 11 | `DATA_NURTURE_ONLY` | `DATA_NURTURE_ONLY` | Custom; exact | TO DO |
+| 12 | `GATE_FAILED_NURTURE` | `GATE_FAILED_NURTURE` | Custom; exact | TO DO |
+| 13 | `BOOKED` | `BOOKED` | Custom; exact | TO DO |
+
+All 13 results exist in BatchDialer (group "Lending", created). Only the three built-ins keep their own names (No Answer, Do Not Call, Call Back); the code maps them, so they need no renaming. A test (`test_every_result_created_in_batchdialer_maps_to_its_code`) pins this table. Akrash still has to attach the nine "TO DO" results to the four campaigns before the test calls.
+
 - **Missed-call signal:** unanswered (no answer, voicemail, failed, or a ring-out with no disposition).
   Status `pending`; a second one the same Eastern day is `duplicate_day`; a suppressed number is `blocked`.
   The text itself is sent by the separate text-back task (see the handoff section); this row is not read by it.

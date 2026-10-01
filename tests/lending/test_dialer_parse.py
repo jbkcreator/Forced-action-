@@ -64,3 +64,29 @@ def test_seat_name_with_only_a_first_name():
 
 def test_absolute_recording_url_is_unchanged():
     assert d.parse_event({**DOC_CDR, "callRecordUrl": "https://x/rec"}).recording_ref == "https://x/rec"
+
+
+# The 13 results created in BatchDialer (group "Lending"): 3 built-ins keep their own names.
+BATCHDIALER_RESULT_NAMES = {
+    "No Answer": "NO_ANSWER",
+    "LEFT_VOICEMAIL": "LEFT_VOICEMAIL",
+    "BAD_NUMBER": "BAD_NUMBER",
+    "CALL_FAILED": "CALL_FAILED",
+    "WRONG_PERSON": "WRONG_PERSON",
+    "NOT_DECISION_MAKER": "NOT_DECISION_MAKER",
+    "REFERRED": "REFERRED",
+    "Do Not Call": "DNC_REQUEST",
+    "CONNECTED_NOT_INTERESTED": "CONNECTED_NOT_INTERESTED",
+    "Call Back": "CALLBACK_REQUESTED",
+    "DATA_NURTURE_ONLY": "DATA_NURTURE_ONLY",
+    "GATE_FAILED_NURTURE": "GATE_FAILED_NURTURE",
+    "BOOKED": "BOOKED",
+}
+
+
+def test_every_result_created_in_batchdialer_maps_to_its_code():
+    from config.lending_dispositions import DISPOSITIONS
+
+    assert set(BATCHDIALER_RESULT_NAMES.values()) == set(DISPOSITIONS)
+    for name, code in BATCHDIALER_RESULT_NAMES.items():
+        assert d.normalize_code(name) == (code, True), name

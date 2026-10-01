@@ -20,6 +20,9 @@ Stacked on #320; merge #320 first, then this PR.
 4. `apply_lending_pr319_client_feedback`
 5. `apply_lending_app_role`
 
+## BatchDialer results
+The 13 results exist in BatchDialer (group "Lending"). Three are the built-ins and keep their own names: **No Answer** -> `NO_ANSWER` (direct), **Do Not Call** -> `DNC_REQUEST` (alias `DO_NOT_CALL`), **Call Back** -> `CALLBACK_REQUESTED` (alias `CALL_BACK`). The other 10 are custom and exact. A test pins all 13 names. Remaining admin work: attach the nine results not yet on the four campaigns (everything except LEFT_VOICEMAIL, BAD_NUMBER, CALL_FAILED, WRONG_PERSON).
+
 ## Admin steps
 
 - Create the BatchDialer contact field `text_consent`.
