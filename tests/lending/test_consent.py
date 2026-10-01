@@ -38,3 +38,11 @@ def test_do_not_contact_flag_blocks_consent(lending_db):
     record_consent(lending_db, PHONE, "on_call_yes")
     lending_db.execute(text("INSERT INTO lending.contacts (phone, do_not_contact) VALUES (:p, true)"), {"p": PHONE})
     assert has_text_consent(lending_db, PHONE) is False
+
+
+def test_handoff_contract_unknown_then_yes_then_suppressed(lending_db):
+    assert has_text_consent(lending_db, PHONE) is False
+    record_consent(lending_db, PHONE, "on_call_yes")
+    assert has_text_consent(lending_db, PHONE) is True
+    lending_db.execute(text("INSERT INTO lending.suppression_list (phone, reason, source_channel) VALUES (:p, 'OPT_OUT', 'sms')"), {"p": PHONE})
+    assert has_text_consent(lending_db, PHONE) is False

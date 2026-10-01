@@ -1,7 +1,7 @@
 # Dialer call disposition logging: setup runbook
 
 Every dialer call becomes one row in `lending.call_dispositions`; unanswered calls also queue a
-`lending.missed_call_events` row. The result reaches the Google Sheet and Slack `#dial-tasks`
+`lending.missed_call_events` row (no consumer; see the handoff section). The result reaches the Google Sheet and Slack `#dial-tasks`
 within 30 seconds. This runbook is vendor-neutral; the BatchDialer-specific steps are marked.
 
 Call results are ingested by **polling BatchDialer call records (CDRs)** with the service
@@ -16,8 +16,8 @@ CDR, and how a contact is held. Confirm them before go-live.
 
 1. Migrations, in order (all idempotent):
    `apply_lending_compliance.py` → `apply_lending_call_dispositions.py` →
-   `apply_lending_call_dispositions_dialer.py` → `apply_lending_app_role.py` (needs a superuser,
-   `LENDING_DB_PASSWORD`).
+   `apply_lending_call_dispositions_dialer.py` → `apply_lending_pr319_client_feedback.py` →
+   `apply_lending_app_role.py` (needs a superuser, `LENDING_DB_PASSWORD`).
 2. `.env`:
    - `LENDING_DATABASE_URL`
    - `LENDING_DIALER_CAMPAIGN_IDS` (comma-separated BatchDialer **campaign ids**, from `GET /api/campaigns`; **empty ignores every call**)
@@ -38,7 +38,8 @@ CDR, and how a contact is held. Confirm them before go-live.
      the running poller's rescan will then recover. Prefer stopping the service first.
    - UNVERIFIED (Task 0, needs a live account check): the pagination parameter name `next_page` and the CDR
      status strings (`ANSWER` etc. in `CDR_ANSWERED_STATUSES`).
-4. Install the crontab (delivery retry and missing-disposition alert, both every 5 minutes).
+4. Install the crontab: delivery retry and missing-disposition alert (every 5 minutes), plus the two new lines
+   `src.tasks.lending_recording_check` (every 10 minutes) and `src.tasks.lending_daily_scoreboard` (7:00pm ET).
 
 ## 2. What the dialer admin configures in the app (BatchDialer: Akrash)
 
@@ -51,6 +52,9 @@ CDR, and how a contact is held. Confirm them before go-live.
   are the enforcement), caller ID numbers, recording disclosure on every connect, and a saved
   screenshot of the disclosure setting (our database records the disclosure only if the dialer reports it).
 - Disposition mandatory after each call, if the dialer supports it.
+- A contact custom field named exactly `text_consent` (create it in BatchDialer; the code writes to it, it does not create it).
+- The recording permission for the API key (see Recordings below).
+- The caller-script line for consent capture (see Consent capture below).
 
 ## 3. Behaviour to know
 
@@ -61,12 +65,29 @@ CDR, and how a contact is held. Confirm them before go-live.
   map to our codes without an alert (`SYSTEM_DISPOSITION_ALIASES`).
 - **Missed-call signal:** unanswered (no answer, voicemail, failed, or a ring-out with no disposition).
   Status `pending`; a second one the same Eastern day is `duplicate_day`; a suppressed number is `blocked`.
-  The text itself is sent by a separate task.
+  The text itself is sent by the separate text-back task (see the handoff section); this row is not read by it.
 - **BOOKED is caller-reported.** On a nurture-only list (Lists 2 and 4) it is flagged `booking_blocked`
   and not counted. Gate passed / held are added when the booking work writes them.
 - **Unfunded cause** is a provisional default from the call result; the file owner sets the final value.
 - **DNC:** opt-out is propagated once on all channels. If the dialer removal is not confirmed the
   opt-out stays `dialer_pending` (see the compliance floor) and must be watched.
+
+### Consent capture
+
+- Script line for the caller, when the borrower is on the phone: ask whether Next Deal Lending may text them, and record a yes.
+- A yes is stored in `lending.text_consents` (`source` `on_call_yes` or `inbound_call`, plus `call_id`, `captured_by`, `captured_at`)
+  and mirrored to the BatchDialer contact field `text_consent`. A failed consent write never blocks call ingestion or loses the call.
+- Revoking or a suppression / do-not-contact entry makes `has_text_consent` false again.
+
+### Handoff to the text-back task
+
+- The sender is PR #320's WP-GL-9 pipeline: `src/lending/missed_call_text.py`, `missed_call_poller.py`, table `lending.missed_call_texts`,
+  setting `missed_call_text_enabled`. It reads BatchDialer CDRs itself.
+- Its `consent_gated_sender` uses FA `send_sms` (Telnyx) and currently blocks every send (`skipped_sms_gate`). The client wants GHL on a
+  Next Deal Lending number, consented numbers only, and no text if 10DLC does not clear. That developer should replace the gate with
+  `src.lending.consent.has_text_consent(db, phone)` and the sender with GHL. Nothing else from #319 is promised to the sender.
+- #319's `lending.missed_call_events` / `queue_missed_call()` is not read by that pipeline. Follow-up cleanup: remove it once #320 is merged and
+  the text-back task is live (not deleted here; existing tests and the migration cover it).
 
 ### Recordings
 
