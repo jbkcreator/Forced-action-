@@ -5,11 +5,16 @@ detail behind it, extracted from the transcript with a forced Claude tool call
 through the router (cost tracking and the vendor-cost pause apply) and
 validated with Pydantic before anything is stored.
 
-The brief freezes twelve fields and names seven; the other five are pending
-client confirmation, so the model holds the seven and new fields are added
-here. Two guards keep the model from inventing facts: a deadline must be a
-plausible future date, and the verbatim kill reason must appear word for word
-in the transcript, otherwise it is dropped.
+The twelve frozen fields: the seven named in the brief (objection, missing
+file items, next action, deadline, referral names, decision maker, verbatim
+kill reason) and the five the client named for the booking qualification
+(completed projects, credit above or below 640, liquidity, deal status,
+property address or target market). Credit is only ever a band; an exact
+score is never recorded.
+
+Guards keep the model from inventing facts: a deadline must be a plausible
+future date, the verbatim kill reason must appear word for word in the
+transcript, and a value outside an allowed set is dropped rather than stored.
 """
 from __future__ import annotations
 
@@ -26,10 +31,14 @@ EXTRACTION_TASK_TYPE = "lending_call_extraction"
 TOOL_NAME = "record_call_fields"
 MAX_DEADLINE_AHEAD = timedelta(days=366)
 MAX_LIST_ITEMS = 10
+MAX_COMPLETED_PROJECTS = 500
+
+CREDIT_BANDS = ("at_or_above_640", "below_640")
+DEAL_STATUSES = ("under_contract", "actively_looking", "no_deal")
 
 
 class CallExtraction(BaseModel):
-    """The frozen extraction fields for one call."""
+    """The twelve frozen extraction fields for one call."""
 
     objection: Optional[str] = Field(default=None, max_length=280)
     missing_file_items: list[str] = Field(default_factory=list)
@@ -38,6 +47,34 @@ class CallExtraction(BaseModel):
     referral_names: list[str] = Field(default_factory=list)
     decision_maker: Optional[str] = Field(default=None, max_length=120)
     kill_reason_verbatim: Optional[str] = Field(default=None, max_length=500)
+    completed_projects_3y: Optional[int] = None
+    credit_band: Optional[str] = None
+    has_liquidity: Optional[bool] = None
+    deal_status: Optional[str] = None
+    property_address: Optional[str] = Field(default=None, max_length=200)
+    target_market: Optional[str] = Field(default=None, max_length=120)
+
+    @field_validator("completed_projects_3y", mode="before")
+    @classmethod
+    def _implausible_count_to_none(cls, value):
+        """A negative, absurd or non-numeric count is dropped, not stored."""
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            return None
+        return count if 0 <= count <= MAX_COMPLETED_PROJECTS else None
+
+    @field_validator("credit_band", mode="before")
+    @classmethod
+    def _unknown_credit_band_to_none(cls, value):
+        return value if value in CREDIT_BANDS else None
+
+    @field_validator("deal_status", mode="before")
+    @classmethod
+    def _unknown_deal_status_to_none(cls, value):
+        return value if value in DEAL_STATUSES else None
 
     @field_validator("missing_file_items", "referral_names")
     @classmethod
@@ -56,7 +93,8 @@ class CallExtraction(BaseModel):
         except ValueError:
             return None
 
-    @field_validator("objection", "next_action", "decision_maker", "kill_reason_verbatim")
+    @field_validator("objection", "next_action", "decision_maker", "kill_reason_verbatim",
+                     "property_address", "target_market")
     @classmethod
     def _blank_to_none(cls, value: Optional[str]) -> Optional[str]:
         return value.strip() or None if value else None
@@ -88,6 +126,31 @@ _TOOL = {
                 "type": "string",
                 "description": "If the borrower ended the opportunity, their exact words copied from the transcript. "
                                "Omit otherwise.",
+            },
+            "completed_projects_3y": {
+                "type": "integer",
+                "description": "How many fix-and-flip or new-construction projects the borrower says they completed "
+                               "in the last 3 years. Omit if not stated.",
+            },
+            "credit_band": {
+                "type": "string", "enum": list(CREDIT_BANDS),
+                "description": "Only whether the borrower said their credit is at or above 640, or below 640. "
+                               "Never an exact score. Omit if not stated.",
+            },
+            "has_liquidity": {
+                "type": "boolean",
+                "description": "Whether the borrower says they have reserves to carry a project and handle a surprise. "
+                               "Omit if not discussed.",
+            },
+            "deal_status": {
+                "type": "string", "enum": list(DEAL_STATUSES),
+                "description": "under_contract: has a live deal now; actively_looking: actively in the market; "
+                               "no_deal: no deal and not looking. Omit if not discussed.",
+            },
+            "property_address": {"type": "string", "description": "The property address discussed, if any."},
+            "target_market": {
+                "type": "string",
+                "description": "The area or market the borrower is buying in, when they are looking without an address.",
             },
         },
     },
@@ -129,7 +192,8 @@ def extract_call_fields(transcript: str, *, today: date, db=None) -> CallExtract
         system=(
             "You extract structured fields from lending phone call transcripts. "
             "Use only what was said on the call; leave a field out rather than guess. "
-            "Never infer rates, income or credit figures. "
+            "Never infer rates, income or an exact credit score; record credit only as at or above 640 "
+            "or below 640, and only if the borrower said it. "
             f"Today is {today:%A, %Y-%m-%d}; resolve relative days against today."
         ),
         tools=[_TOOL],

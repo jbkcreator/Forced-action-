@@ -74,6 +74,37 @@ def test_blocked_model_call_raises_instead_of_storing_empty():
         _extract(None)
 
 
+def test_qualification_fields_are_extracted():
+    result, call = _extract({
+        "completed_projects_3y": 2, "credit_band": "at_or_above_640", "has_liquidity": True,
+        "deal_status": "actively_looking", "property_address": "", "target_market": " Tampa Bay ",
+    })
+    assert (result.completed_projects_3y, result.credit_band, result.has_liquidity) == (2, "at_or_above_640", True)
+    assert (result.deal_status, result.property_address, result.target_market) == ("actively_looking", None, "Tampa Bay")
+    schema = call.call_args.kwargs["tools"][0]["input_schema"]["properties"]
+    assert schema["credit_band"]["enum"] == ["at_or_above_640", "below_640"]
+
+
+@pytest.mark.parametrize("field_name,value", [
+    ("credit_band", "720"),
+    ("credit_band", "good"),
+    ("deal_status", "maybe"),
+    ("completed_projects_3y", -1),
+    ("completed_projects_3y", "several"),
+    ("completed_projects_3y", 5000),
+])
+def test_values_outside_the_allowed_set_are_dropped(field_name, value):
+    result, _ = _extract({field_name: value, "objection": "Timing"})
+    assert getattr(result, field_name) is None
+    assert result.objection == "Timing"
+
+
+def test_exact_credit_score_is_never_requested():
+    _, call = _extract({"objection": "Timing"})
+    system = call.call_args.kwargs["system"]
+    assert "exact credit score" in system and "640" in system
+
+
 def test_overlong_field_fails_validation():
     with pytest.raises(ValidationError):
         _extract({"objection": "x" * 400})

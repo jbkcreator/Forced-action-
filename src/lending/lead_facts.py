@@ -3,16 +3,18 @@
 One query per batch of properties. Sources and their labels:
 
 - Loan amount and lender: PropertyRadar recorded loan (known).
-- Maturity: PropertyRadar ``est_maturity_date`` is computed from the loan
-  date and term, so it is labelled estimated; nothing here marks a maturity
-  known until a verified source exists.
+- Maturity: known when the borrower confirmed it on a call
+  (``lending.lead_call_confirmations``); otherwise PropertyRadar's
+  ``est_maturity_date``, computed from the loan date and term, labelled
+  estimated.
 - Entity standing: Sunbiz status on the owner record, known only when the
   owner was matched on Sunbiz.
 - Equity: ``financials.equity_pct`` is itself an estimate.
 - Repeat operator: properties and recent permits held by the same Sunbiz
   entity (by document number, never by name), known only when the owner has
   a document number.
-- Decision maker: unknown until a caller confirms it, so always missing here.
+- Decision maker: known once a call confirms whether the decision maker was
+  on the call; missing before that.
 """
 from __future__ import annotations
 
@@ -105,25 +107,39 @@ SELECT s.property_id, s.property_address, s.entity_status, s.sunbiz_status,
        s.sunbiz_doc_number, s.equity_pct,
        r.lender_name, r.loan_amount, r.est_maturity_date,
        h.property_count, h.recent_permit_count,
-       lp.summary AS latest_permit
+       lp.summary AS latest_permit,
+       c.maturity_date AS confirmed_maturity_date,
+       c.decision_maker_on_call
 FROM subject s
+LEFT JOIN lending.lead_call_confirmations c ON c.property_id = s.property_id
 LEFT JOIN radar r ON r.property_id = s.property_id
 LEFT JOIN entity_holdings h ON h.sunbiz_doc_number = s.sunbiz_doc_number
 LEFT JOIN latest_permit lp ON lp.property_id = s.property_id
 """
 
 
+def _maturity_signal(row: Any) -> Signal:
+    """A borrower-confirmed maturity is known; the PropertyRadar date is only an estimate."""
+    confirmed = row.get("confirmed_maturity_date")
+    if confirmed is not None:
+        return Signal.known(confirmed)
+    estimated = parse_maturity(row["est_maturity_date"])
+    return Signal.estimated(estimated) if estimated else Signal.missing()
+
+
 def _signals_from_row(row: Any) -> LeadSignals:
-    maturity = parse_maturity(row["est_maturity_date"])
     loan = _decimal(row["loan_amount"])
     equity = _decimal(row["equity_pct"])
     sunbiz_matched = row["sunbiz_status"] == "matched" and row["entity_status"]
     has_entity = row["sunbiz_doc_number"] is not None and row["property_count"] is not None
+    decision_maker = row.get("decision_maker_on_call")
     return LeadSignals(
-        maturity_date=Signal.estimated(maturity) if maturity else Signal.missing(),
+        maturity_date=_maturity_signal(row),
         entity_status=Signal.known(row["entity_status"]) if sunbiz_matched else Signal.missing(),
         equity_pct=Signal.estimated(equity) if equity is not None else Signal.missing(),
-        decision_maker_confirmed=Signal.missing(),
+        decision_maker_confirmed=(
+            Signal.known(bool(decision_maker)) if decision_maker is not None else Signal.missing()
+        ),
         loan_amount=Signal.known(loan) if loan is not None else Signal.missing(),
         entity_property_count=Signal.known(int(row["property_count"])) if has_entity else Signal.missing(),
         entity_recent_permit_count=(
