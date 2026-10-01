@@ -235,6 +235,8 @@ class LendingCallDisposition(LendingBase):
     source_tag: Mapped[Optional[str]] = mapped_column(String(40))
     seat_group: Mapped[Optional[str]] = mapped_column(String(10))
     consent_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # last on-call "yes" read
+    recording_status: Mapped[Optional[str]] = mapped_column(String(12))  # pending | readable | forbidden | missing
+    recording_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (
         Index("idx_lending_call_dispositions_phone_ended", "phone", "call_ended_at"),

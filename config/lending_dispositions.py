@@ -71,6 +71,9 @@ SHEET_COLUMNS = (
 )
 SHEET_TIMEZONE = "America/New_York"
 
+RECORDING_RETRY_MINUTES = 30  # a forbidden/pending recording is rechecked this often, never given up on
+RECORDING_BATCH_LIMIT = 50
+
 DELIVERY_LATENCY_TARGET_SECONDS = 30  # spec §12: disposition -> Sheet + Slack
 RETRY_MIN_AGE_SECONDS = 60            # let the request's own background task finish first
 RETRY_BATCH_LIMIT = 200

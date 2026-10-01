@@ -68,6 +68,18 @@ CDR, and how a contact is held. Confirm them before go-live.
 - **DNC:** opt-out is propagated once on all channels. If the dialer removal is not confirmed the
   opt-out stays `dialer_pending` (see the compliance floor) and must be watched.
 
+### Recordings
+
+- The disclosure plays at the start of every call (Florida requires everyone's consent). `recording_disclosure_logged`
+  is the evidence; Akrash saves a screenshot of the in-app disclosure setting.
+- BatchDialer holds the audio; the call row holds the link (`recording_ref`), shown in the Sheet-adjacent Slack post
+  with the borrower and property.
+- `recording_status`: `pending` (not checked yet or a 5xx), `readable`, `forbidden` (key lacks permission, rechecked every
+  30 min, never given up), `missing` (404). Cron: `src.tasks.lending_recording_check` every 10 min.
+- The permission fix is an account setting in BatchDialer (name it only after reading it off the Integrations screen).
+  Once enabled, `forbidden` rows flip to `readable` within about 40 minutes with no code change.
+- Audio download and S3 storage are not built here. For the week-two call-analysis owner, `readable` is the go signal.
+
 ## 4. Acceptance check
 
 1. A test call creates one row with phone, seat, `seat_group`, caller-ID number, start/end and disposition;

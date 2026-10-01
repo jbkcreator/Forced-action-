@@ -237,3 +237,17 @@ def test_dnc_removal_pending_alert_says_to_remove_manually_and_never_raises():
     assert "NOT yet removed" in slack.chat_postMessage.call_args.kwargs["text"]
     slack.chat_postMessage.side_effect = RuntimeError("slack down")
     dd.alert_dnc_removal_pending("c9", None, client=slack)
+
+
+def test_recording_line_carries_contact_and_status():
+    record = {"borrower_name": "Pat Doe", "property_address": "1 Main St"}
+    texts = {}
+    for status in ("readable", "pending", "forbidden", "missing"):
+        _, blocks = dd.build_slack_message(_row(recording_status=status), record)
+        texts[status] = blocks[1]["text"]["text"]
+    assert "Open call recording>" in texts["readable"] and "(Pat Doe | 1 Main St)" in texts["readable"]
+    assert "recording ready" in texts["readable"]
+    assert "recording pending (permission)" in texts["forbidden"]
+    assert "recording not found" in texts["missing"]
+    _, blocks = dd.build_slack_message(_row(recording_ref=None), record)
+    assert "recording" not in blocks[1]["text"]["text"]

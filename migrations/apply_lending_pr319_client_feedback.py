@@ -19,6 +19,12 @@ logger = logging.getLogger(__name__)
 # Tasks 2, 4 and 5 append their ALTER/UPDATE/INDEX statements here; each is idempotent.
 STATEMENTS: tuple[str, ...] = (
     "ALTER TABLE lending.call_dispositions ADD COLUMN IF NOT EXISTS consent_checked_at timestamptz",
+    "ALTER TABLE lending.call_dispositions ADD COLUMN IF NOT EXISTS recording_status varchar(12)",
+    "ALTER TABLE lending.call_dispositions ADD COLUMN IF NOT EXISTS recording_checked_at timestamptz",
+    "UPDATE lending.call_dispositions SET recording_status = 'pending' "
+    "WHERE recording_ref IS NOT NULL AND recording_status IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_lending_call_dispositions_recording_todo "
+    "ON lending.call_dispositions (recording_checked_at) WHERE recording_status IN ('pending', 'forbidden')",
 )
 
 

@@ -158,6 +158,16 @@ def test_recording_reference_and_disclosure_are_stored_only_when_sent(lending_db
     assert _row(lending_db, "c2")["recording_disclosure_logged"] is False
 
 
+def test_new_recording_enters_the_check_and_no_recording_stays_null(lending_db):
+    d.record_dialer_event(lending_db, _ev(recording_ref="https://x/rec"))
+    d.record_dialer_event(lending_db, _ev("c2"))
+    assert _row(lending_db)["recording_status"] == "pending"
+    assert _row(lending_db, "c2")["recording_status"] is None
+    lending_db.execute(text("UPDATE lending.call_dispositions SET recording_status = 'readable' WHERE dialer_call_id = 'c1'"))
+    d.record_dialer_event(lending_db, _ev(recording_ref="https://x/rec"))
+    assert _row(lending_db)["recording_status"] == "readable"
+
+
 def test_parse_event_reads_nested_and_epoch_fields_and_needs_a_call_id():
     ev = d.parse_event({"event": "x", "data": {"id": 9, "contact": {"id": 3, "phone": "813"}, "user": {"id": 7, "name": "Sam"},
                                                   "startTime": 1790000000, "callResult": "No Answer"}})

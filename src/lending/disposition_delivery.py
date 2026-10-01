@@ -27,6 +27,13 @@ from src.lending.dispositions import last4, lookup_load_record
 
 logger = logging.getLogger(__name__)
 
+RECORDING_STATUS_TEXT = {
+    "readable": "recording ready",
+    "pending": "recording pending",
+    "forbidden": "recording pending (permission)",
+    "missing": "recording not found",
+}
+
 SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 
 
@@ -75,7 +82,10 @@ def build_slack_message(row: dict, record: Optional[dict]) -> tuple[str, list[di
         f"*Talk time:* {row['talk_duration_sec'] if row['talk_duration_sec'] is not None else '—'} s",
     ]
     if row.get("recording_ref"):
-        lines.append(f"<{row['recording_ref']}|Open call recording>")
+        status = RECORDING_STATUS_TEXT.get(row.get("recording_status"), "recording pending")
+        about = " | ".join(p for p in (record.get("borrower_name") or record.get("entity_name"),
+                                       record.get("property_address")) if p)
+        lines.append(f"<{row['recording_ref']}|Open call recording>" + (f" ({about})" if about else "") + f" — {status}")
 
     if disposition is None:
         title = ":arrows_counterclockwise: Result removed — waiting for a new result"

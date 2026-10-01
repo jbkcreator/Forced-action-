@@ -1187,6 +1187,9 @@ COUNTY_ID=hillsborough
 # Lending: warn once per call when a connected call has no disposition after N minutes.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_missing_disposition_alert
 
+# Lending: is each call recording readable with our key? forbidden (permission off) ones are rechecked every 30 min.
+*/10 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_recording_check
+
 # Lending weekly DNC / litigator re-scrub of numbers loaded in the dialer (Go Live G10).
 # Mondays 06:00 UTC (02:00 ET), before the 09:00 ET calling window. Spends Tracerfy
 # credits (1 per number) up to a hard --max-credits cap; exit 4 = cap reached.
