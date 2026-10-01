@@ -37,7 +37,7 @@ def main(argv=None, *, now: Optional[datetime] = None) -> int:
     if now_et.hour != 19 and not args.force:
         return 0
     s = get_settings()
-    channel = s.lending_dial_tasks_channel
+    channel = s.lending_daily_channel
     if not (channel and s.lending_slack_bot_token):
         logger.error("[lending] scoreboard not posted: Slack channel or token is not configured")
         return 1

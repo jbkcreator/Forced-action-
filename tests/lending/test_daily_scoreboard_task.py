@@ -29,7 +29,7 @@ def wired(monkeypatch):
         yield object()
 
     monkeypatch.setattr(task, "get_settings", lambda: SimpleNamespace(
-        lending_dial_tasks_channel="C1", lending_slack_bot_token=SecretStr("xoxb-t")))
+        lending_daily_channel="C1", lending_dial_tasks_channel="CALLS", lending_slack_bot_token=SecretStr("xoxb-t")))
     monkeypatch.setattr(task, "lending_session", fake_session)
     monkeypatch.setattr(task, "campaign_names", lambda: {})
     monkeypatch.setattr(task, "build_scoreboard", lambda db, day, names: days.append(day) or "data")
@@ -58,7 +58,7 @@ def test_force_uses_the_eastern_date_not_the_utc_date(wired):
 def test_unconfigured_channel_returns_1_and_posts_nothing(wired, monkeypatch):
     posted, _ = wired
     monkeypatch.setattr(task, "get_settings", lambda: SimpleNamespace(
-        lending_dial_tasks_channel="", lending_slack_bot_token=SecretStr("xoxb-t")))
+        lending_daily_channel="", lending_dial_tasks_channel="CALLS", lending_slack_bot_token=SecretStr("xoxb-t")))
     assert task.main(["--force"], now=NOON_ET) == 1 and posted == []
 
 
