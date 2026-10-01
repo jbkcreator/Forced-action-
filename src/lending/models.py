@@ -237,10 +237,12 @@ class LendingCallDisposition(LendingBase):
     consent_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # last on-call "yes" read
     recording_status: Mapped[Optional[str]] = mapped_column(String(12))  # pending | readable | forbidden | missing
     recording_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    dialer_campaign_id: Mapped[Optional[str]] = mapped_column(String(64))  # BatchDialer campaign (scoreboard)
 
     __table_args__ = (
         Index("idx_lending_call_dispositions_phone_ended", "phone", "call_ended_at"),
         Index("idx_lending_call_dispositions_seat_ended", "caller_seat", "call_ended_at"),
+        Index("idx_lending_call_dispositions_dialer_campaign_ended", "dialer_campaign_id", "call_ended_at"),
         Index(
             "idx_lending_call_dispositions_undelivered",
             "disposition_at",

@@ -1190,6 +1190,10 @@ COUNTY_ID=hillsborough
 # Lending: is each call recording readable with our key? forbidden (permission off) ones are rechecked every 30 min.
 */10 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_recording_check
 
+# Lending 7pm ET scoreboard to Slack (Part 5.6). Two lines because ET is UTC-4 until Nov 1 and UTC-5 after; the task posts only when it is 19:xx ET.
+0 23 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_daily_scoreboard
+0 0 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_daily_scoreboard
+
 # Lending weekly DNC / litigator re-scrub of numbers loaded in the dialer (Go Live G10).
 # Mondays 06:00 UTC (02:00 ET), before the 09:00 ET calling window. Spends Tracerfy
 # credits (1 per number) up to a hard --max-credits cap; exit 4 = cap reached.

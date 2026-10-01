@@ -63,6 +63,14 @@ DEFAULT_CAUSE: dict[str, str] = {
 BOOKED_CODE = "BOOKED"
 DNC_CODE = "DNC_REQUEST"
 
+# Scoreboard definitions (client Part 5.6). Defaults: a client answer is a one-line change here.
+LIVE_CONVERSATION_CODES = frozenset({
+    "CONNECTED_NOT_INTERESTED", "CALLBACK_REQUESTED", "DNC_REQUEST",
+    "DATA_NURTURE_ONLY", "GATE_FAILED_NURTURE", "BOOKED",
+})
+GATED_CODES = frozenset({"BOOKED", "GATE_FAILED_NURTURE"})  # proxy for "all four captures"
+NURTURE_SENT_CODES = frozenset({"GATE_FAILED_NURTURE"})
+
 # Sheet columns. Held / Gate Passed / Packet are added when WP-GL-5/6 write them.
 SHEET_COLUMNS = (
     "Call ID", "Date/Time (ET)", "Caller", "Caller Seat", "Queue", "Borrower Phone",
@@ -116,7 +124,9 @@ def validate_dispositions_config() -> None:
     if len(codes) != len(DISPOSITIONS):
         raise ValueError("DISPOSITIONS must not repeat a code")
     for name, group in (("UNANSWERED_CODES", UNANSWERED_CODES), ("DEFAULT_CAUSE", set(DEFAULT_CAUSE)),
-                        ("SYSTEM_DISPOSITION_ALIASES", set(SYSTEM_DISPOSITION_ALIASES.values()))):
+                        ("SYSTEM_DISPOSITION_ALIASES", set(SYSTEM_DISPOSITION_ALIASES.values())),
+                        ("LIVE_CONVERSATION_CODES", LIVE_CONVERSATION_CODES), ("GATED_CODES", GATED_CODES),
+                        ("NURTURE_SENT_CODES", NURTURE_SENT_CODES)):
         if not group <= codes:
             raise ValueError(f"{name} names a code missing from DISPOSITIONS: {sorted(group - codes)}")
     if not set(DEFAULT_CAUSE.values()) <= CAUSE_TAGS:

@@ -168,6 +168,12 @@ def test_new_recording_enters_the_check_and_no_recording_stays_null(lending_db):
     assert _row(lending_db)["recording_status"] == "readable"
 
 
+def test_campaign_id_is_stored_and_a_later_event_without_one_keeps_it(lending_db):
+    d.record_dialer_event(lending_db, _ev(campaign_id="55"))
+    d.record_dialer_event(lending_db, _ev(campaign_id=None))
+    assert _row(lending_db)["dialer_campaign_id"] == "55"
+
+
 def test_parse_event_reads_nested_and_epoch_fields_and_needs_a_call_id():
     ev = d.parse_event({"event": "x", "data": {"id": 9, "contact": {"id": 3, "phone": "813"}, "user": {"id": 7, "name": "Sam"},
                                                   "startTime": 1790000000, "callResult": "No Answer"}})

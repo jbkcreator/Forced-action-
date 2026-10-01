@@ -266,10 +266,10 @@ def record_dialer_event(db, ev: DialerCallEvent) -> RecordedCall:
         text(
             "INSERT INTO lending.call_dispositions (dialer_call_id, direction, phone, caller_seat, caller_name, "
             "caller_id_number, dialer_contact_id, seat_group, talk_duration_sec, call_started_at, call_ended_at, "
-            "recording_ref, recording_status, raw_event) "
+            "recording_ref, recording_status, dialer_campaign_id, raw_event) "
             "VALUES (:call_id, :direction, :phone, :seat, :name, :did, :contact_id, :group, :duration, :started, "
             ":ended, :recording, CASE WHEN CAST(:recording AS text) IS NOT NULL THEN 'pending' END, "
-            "CAST(:raw AS jsonb)) "
+            ":campaign_id, CAST(:raw AS jsonb)) "
             "ON CONFLICT (dialer_call_id) DO UPDATE SET "
             "direction = COALESCE(EXCLUDED.direction, lending.call_dispositions.direction), "
             "phone = COALESCE(EXCLUDED.phone, lending.call_dispositions.phone), "
@@ -286,6 +286,7 @@ def record_dialer_event(db, ev: DialerCallEvent) -> RecordedCall:
             "recording_status = CASE WHEN EXCLUDED.recording_ref IS NOT NULL "
             "AND lending.call_dispositions.recording_status IS NULL THEN 'pending' "
             "ELSE lending.call_dispositions.recording_status END, "
+            "dialer_campaign_id = COALESCE(EXCLUDED.dialer_campaign_id, lending.call_dispositions.dialer_campaign_id), "
             "raw_event = EXCLUDED.raw_event, updated_at = now() "
             "RETURNING id, phone, caller_seat, disposition, campaign_tag, queue, dialer_contact_id, "
             "call_started_at, call_ended_at, unfunded_cause, opt_out_propagated_at"
@@ -295,7 +296,7 @@ def record_dialer_event(db, ev: DialerCallEvent) -> RecordedCall:
             "seat": ev.seat_id, "name": ev.seat_name, "did": ev.caller_id_number,
             "contact_id": ev.contact_id, "group": seat_group_for(ev.seat_id),
             "duration": ev.duration, "started": ev.started_at, "ended": ended_at, "real_end": ev.ended_at is not None,
-            "recording": ev.recording_ref, "raw": json.dumps(ev.raw, default=str),
+            "recording": ev.recording_ref, "campaign_id": ev.campaign_id, "raw": json.dumps(ev.raw, default=str),
         },
     ).mappings().one()
 

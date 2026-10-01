@@ -80,6 +80,16 @@ CDR, and how a contact is held. Confirm them before go-live.
   Once enabled, `forbidden` rows flip to `readable` within about 40 minutes with no code change.
 - Audio download and S3 storage are not built here. For the week-two call-analysis owner, `readable` is the go signal.
 
+### Daily scoreboard
+
+- `src.tasks.lending_daily_scoreboard` posts to `LENDING_DIAL_TASKS_CHANNEL` at 7:00pm ET (two UTC cron lines; only the one at 19:xx ET acts).
+  Tables: by caller, by BatchDialer campaign (`dialer_campaign_id`, names from `GET /campaigns`), and by hook (`campaign_tag`).
+- Definitions live in `config/lending_dispositions.py` (`LIVE_CONVERSATION_CODES`, `GATED_CODES`, `NURTURE_SENT_CODES`).
+  Booked excludes `booking_blocked`; Showed is not in the log (client marks Held in GHL), so it prints `n/a (GHL)`.
+- The dialer stops at 7:15pm ET, so calls between 7:00 and 7:15pm are not in the post. Open question for the client: post at 7:20pm instead
+  (change the cron hours and the hour guard together).
+- Test calls count like real ones. Run with `--force` only after the Friday test, or filter by a test campaign.
+
 ## 4. Acceptance check
 
 1. A test call creates one row with phone, seat, `seat_group`, caller-ID number, start/end and disposition;

@@ -25,6 +25,11 @@ STATEMENTS: tuple[str, ...] = (
     "WHERE recording_ref IS NOT NULL AND recording_status IS NULL",
     "CREATE INDEX IF NOT EXISTS idx_lending_call_dispositions_recording_todo "
     "ON lending.call_dispositions (recording_checked_at) WHERE recording_status IN ('pending', 'forbidden')",
+    "ALTER TABLE lending.call_dispositions ADD COLUMN IF NOT EXISTS dialer_campaign_id varchar(64)",
+    "UPDATE lending.call_dispositions SET dialer_campaign_id = COALESCE(raw_event->'campaign'->>'id', raw_event->>'campaign_id') "
+    "WHERE dialer_campaign_id IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_lending_call_dispositions_dialer_campaign_ended "
+    "ON lending.call_dispositions (dialer_campaign_id, call_ended_at)",
 )
 
 
