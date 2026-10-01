@@ -16,10 +16,9 @@ CDR, and how a contact is held. Confirm them before go-live.
 
 1. Migrations, in order (all idempotent):
    `apply_lending_compliance.py` → `apply_lending_call_dispositions.py` →
-   `apply_lending_call_dispositions_dialer.py` → `apply_lending_pr319_client_feedback.py` →
-   `apply_lending_app_role.py` (needs a superuser, `LENDING_DB_PASSWORD`).
+   `apply_lending_call_dispositions_dialer.py` → `apply_lending_pr319_client_feedback.py`.
 2. `.env`:
-   - `LENDING_DATABASE_URL`
+   - `DATABASE_URL` (the shared database; lending has no separate DB URL)
    - `LENDING_DIALER_CAMPAIGN_IDS` (comma-separated BatchDialer **campaign ids**, from `GET /api/campaigns`; **empty ignores every call**)
    - `LENDING_SEAT_GROUPS` (`agentid:A,agentid:B`, keyed by BatchDialer **agent id**; a seat missing here gets no shift group)
    - `LENDING_DISPOSITION_MISSING_ALERT_MINUTES` (default 10)

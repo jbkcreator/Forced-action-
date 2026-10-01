@@ -1,9 +1,4 @@
-"""Lending's own database connection.
-
-Binds to LENDING_DATABASE_URL (the lending_app Postgres role, see
-migrations/apply_lending_app_role.py), never to the FA app's DATABASE_URL, so
-the lending service can only write the ``lending`` schema.
-"""
+"""Lending's database connection: the shared DATABASE_URL, tables in the ``lending`` schema."""
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -22,13 +17,7 @@ _factory: Optional[sessionmaker] = None
 def _session_factory() -> sessionmaker:
     global _engine, _factory
     if _factory is None:
-        url = get_settings().lending_database_url
-        if not url:
-            raise RuntimeError(
-                "LENDING_DATABASE_URL is not set. Provision the role with "
-                "migrations/apply_lending_app_role.py and set it in .env."
-            )
-        _engine = create_engine(url, pool_pre_ping=True, pool_recycle=3600)
+        _engine = create_engine(str(get_settings().database_url), pool_pre_ping=True, pool_recycle=3600)
         _factory = sessionmaker(bind=_engine, autoflush=False, expire_on_commit=False)
     return _factory
 

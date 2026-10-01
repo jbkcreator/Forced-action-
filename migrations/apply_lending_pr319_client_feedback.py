@@ -43,7 +43,7 @@ def apply_to(conn: Connection) -> None:
 
 
 def apply(engine: Engine | None = None) -> None:
-    engine = engine or create_engine(get_settings().lending_database_url or get_settings().database_url, pool_pre_ping=True)
+    engine = engine or create_engine(get_settings().database_url, pool_pre_ping=True)
     with engine.begin() as conn:
         apply_to(conn)
     logger.info("apply_lending_pr319_client_feedback complete.")
