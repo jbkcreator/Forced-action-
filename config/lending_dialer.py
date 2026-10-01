@@ -28,8 +28,12 @@ POOL_CAMPAIGN_TAGS: dict[str, str] = {
 BATCHDIALER_BASE_URL: str = "https://app.batchdialer.com/api"
 BATCHDIALER_TIMEOUT_SECONDS: float = 20.0
 BATCHDIALER_ENDPOINTS: dict[str, "tuple[str, str] | None"] = {
-    "contact_upsert": None,
-    "contact_update": None,
+    # Confirmed live 2026-09-30: create/read/update/delete on a test contact.
+    "contact_upsert": ("POST", "/contact"),
+    "contact_update": ("PUT", "/contact/{id}"),
+    # Public API docs, "Add contacts": imports straight into the given campaign ids.
+    # Exercised live with the first campaign.
+    "contacts_add_to_campaign": ("POST", "/contacts"),
     "campaign_remove": None,
     "campaign_restore": None,
     "dnc_add": None,

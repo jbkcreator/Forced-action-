@@ -61,7 +61,7 @@ def _export_run_to_csv(session, run_id: str, out_dir: Path) -> dict[str, dict[st
     rows = session.execute(
         text(f"""
             SELECT {", ".join(_EXPORT_COLUMNS)}
-            FROM lending_calling_pool_staging
+            FROM lending.calling_pool_staging
             WHERE run_id = :run_id
             ORDER BY pool_name, county_id
         """),

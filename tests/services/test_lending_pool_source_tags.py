@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import date
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -62,7 +63,7 @@ def test_migration_adds_source_tag_and_allows_auction_winners():
         apply(session)
         apply(session)  # idempotent
         session.execute(text(
-            "INSERT INTO lending_calling_pool_staging (run_id, pool_name, aircall_campaign_tag, source_table, source_tag) "
+            "INSERT INTO lending.calling_pool_staging (run_id, pool_name, aircall_campaign_tag, source_table, source_tag) "
             "VALUES (:r, 'auction_winner', 'DESK_CAPITAL_LOOP', 'tax_deed_auctions', 'list_6')"), {"r": str(uuid.uuid4())})
     finally:
         tx.rollback()
@@ -101,10 +102,58 @@ def test_staging_write_persists_every_column_including_source_tag():
         rec.run_id = run_id
         assert pe._write_to_staging(session, [rec]) == 1
         got = session.execute(text("SELECT pool_name, source_tag, entity_name, phone_available "
-                                   "FROM lending_calling_pool_staging WHERE run_id = CAST(:r AS uuid)"),
+                                   "FROM lending.calling_pool_staging WHERE run_id = CAST(:r AS uuid)"),
                               {"r": run_id}).fetchall()
         assert got == [("auction_winner", "list_6", "ACME HOLDINGS LLC", False)]
     finally:
         tx.rollback()
         conn.close()
         engine.dispose()
+
+
+# ── List 7: owners pulling construction permits (NOCs / permits) ──
+
+def _permit_row(**over):
+    row = dict(owner_name="SUNSHINE HOMES LLC", owner_phone="(813) 555-7701", owner_email="Owner@Example.com",
+               job_value=400000, permit_type="Residential New Construction and Additions",
+               issue_date=date(2026, 8, 1), permit_number="BP-77", county_id="hillsborough",
+               county_name="Hillsborough", source_property_id=5, parcel_id="P-77",
+               prop_address="77 Oak St", prop_city="Tampa", prop_state="FL", prop_zip="33602")
+    row.update(over)
+    return SimpleNamespace(**row)
+
+
+def test_a_permit_owner_becomes_a_list_7_builders_record():
+    rec = pe.permit_owner_record(_permit_row())
+    assert (rec.pool_name, rec.source_tag, rec.source_table) == ("permit_owner", "list_7", "building_permits")
+    assert rec.normalized_phone == "+18135557701" and rec.phone_available is True
+    assert rec.entity_name == "SUNSHINE HOMES LLC" and rec.entity_status == "LLC"
+    assert rec.estimated_loan_value == Decimal("340000.00")          # 85% LTC of the permit value
+    assert "New Construction" in rec.recent_permit_details and rec.permit_number == "BP-77"
+
+
+def test_a_permit_owner_without_a_phone_is_staged_for_tracing():
+    rec = pe.permit_owner_record(_permit_row(owner_phone=None))
+    assert rec.normalized_phone is None and rec.phone_available is False
+
+
+def test_permit_owner_pool_maps_to_list_7_and_the_builders_queue():
+    from config import lending_queues as q
+    from src.lending.queues import assign_queue
+    assert pe.source_tag_for("permit_owner", "building_permits") == "list_7"
+    assert assign_queue({"source_tag": "list_7"})["queue"] == q.BUILDERS
+
+
+def test_a_phone_already_claimed_by_a_higher_pool_is_not_repeated():
+    kept = pe.drop_claimed_phones([pe.permit_owner_record(_permit_row()),
+                                   pe.permit_owner_record(_permit_row(owner_phone="8135557702"))],
+                                  claimed={"+18135557701"})
+    assert [r.normalized_phone for r in kept] == ["+18135557702"]
+
+
+def test_the_pool_check_allows_permit_owners():
+    from migrations.apply_lending_pool_source_tags import POOLS
+    from src.core.models import LendingCallingPoolStaging as M
+    assert "permit_owner" in POOLS
+    check = [str(c.sqltext) for c in M.__table__.constraints if c.name == "lending_calling_pool_staging_pool_name_check"][0]
+    assert "permit_owner" in check

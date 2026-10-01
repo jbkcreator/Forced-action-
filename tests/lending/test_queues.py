@@ -110,3 +110,14 @@ def test_tracerfy_hit_rate_comes_from_the_usage_ledger(db):
                         "now() + interval '100 years', false)"), {"s": ok})
     rate = tracerfy_hit_rate(db, since=__import__("datetime").datetime(2126, 1, 1, tzinfo=__import__("datetime").timezone.utc))
     assert rate == 0.75
+
+
+@pytestmark_db
+def test_an_unscrubbed_number_is_never_counted_as_scrubbed_even_when_backflip_blocks_it(db, monkeypatch):
+    from src.lending import dialer_load
+    monkeypatch.setattr(dialer_load, "load_backflip_identifier_index",
+                        lambda _db: BackflipIdentifierIndex(block_reason="BACKFLIP_FEED_STALE"))
+    record = {"source_record_ref": "u1", "phone": "+18135558399", "source_tag": "list_9", "parcel_id": "P-u1",
+              "entity_name": "U LLC", "borrower_name": "B", "property_address": "1 St"}
+    t = queue_count_report([record], db)["queues"][q.TRANSACTION_READY]
+    assert (t["traced"], t["needs_scrub"], t["scrubbed"]) == (1, 1, 0)

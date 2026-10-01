@@ -231,9 +231,17 @@ def default_stages(trace_results: Optional[Path] = None) -> Stages:
     def handoff(session: Session, campaign: str, apply: bool, commit: Optional[Callable[[], None]]) -> dict[str, int]:
         from config.settings import get_settings
         settings = get_settings()
-        contacts = load_trace_contacts(trace_results) if trace_results else {}
+        if trace_results:
+            contacts = load_trace_contacts(trace_results)
+        elif apply:
+            # Go Live: the scheduled run traces staged records live through Tracerfy
+            # (ledger-gated, spend-capped; refuses unless PROPERTY_RADAR_ENABLED=true).
+            from src.tasks.property_radar_lead_handoff import _live_trace
+            contacts = _live_trace(session, campaign)
+        else:
+            contacts = {}
         if not contacts:
-            logger.warning("No trace contacts supplied: the handoff skips every record as no_contact_data.")
+            logger.warning("No trace contacts: the handoff skips every record as no_contact_data.")
         report = run_handoff(
             store=SqlHandoffStore(session),
             pages=iter_staged_leads(session, campaign=campaign),
@@ -262,7 +270,7 @@ def main() -> None:
     parser.add_argument("--state", default="FL")
     parser.add_argument("--campaign", default=DEFAULT_CAMPAIGN)
     parser.add_argument("--trace-results", type=Path,
-                        help="Tracerfy results CSV; the handoff needs contacts or it skips every record")
+                        help="Tracerfy results CSV. Without it, an --apply run traces staged records live")
     parser.add_argument("--apply", action="store_true", help="Buy, stage, link and hand off (default: dry run)")
     args = parser.parse_args()
 
