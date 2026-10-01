@@ -1,15 +1,4 @@
-"""Lending dialer load: Aircall write limits and retry policy.
-
-Aircall allows 120 Public API requests per minute per company and returns
-HTTP 429 beyond that. The account sends no rate-limit headers, so the client
-paces itself to the documented limit rather than reacting to headers.
-"""
-
-AIRCALL_REQUESTS_PER_MINUTE: int = 120
-AIRCALL_MAX_ATTEMPTS: int = 5
-AIRCALL_RETRY_BASE_SECONDS: float = 2.0
-AIRCALL_MAX_RETRY_WAIT_SECONDS: float = 60.0
-AIRCALL_REQUEST_TIMEOUT_SECONDS: float = 20.0
+"""Lending dialer load: queue -> BatchDialer campaign names, hook lines and endpoints."""
 
 # Pool (launch queue) -> dialer campaign name (Go Live Brief 2.5). The campaigns must
 # exist in BatchDialer with these exact names; a live load refuses any unmapped pool.
@@ -18,6 +7,14 @@ POOL_CAMPAIGN_TAGS: dict[str, str] = {
     "transaction_ready": "Transaction ready",
     "builders": "Builders",
     "nurture": "Nurture",  # Lists 2/4: dialed for data, never bookable
+}
+
+# Hook line per campaign, shown on the caller's card. Seeded from the client's voicemail
+# scripts (2026-10-01) until the playbook's per-campaign hooks arrive.
+CAMPAIGN_HOOKS: dict[str, str] = {
+    "Verified maturity": "It looks like the loan on it is coming up; we help investors get ahead of that.",
+    "Transaction ready": "Saw you picked up the property; we can help fund your next deal.",
+    "Builders": "Saw your project; we fund builders and investors in your county.",
 }
 
 
@@ -40,6 +37,8 @@ BATCHDIALER_ENDPOINTS: dict[str, "tuple[str, str] | None"] = {
     "campaign_remove": None,
     "campaign_restore": None,
     "dnc_add": None,
+    # Opt-outs delete the contact (no DNC endpoint in the public API). Confirmed live 2026-09-30.
+    "contact_delete": ("DELETE", "/contact/{id}"),
 }
 # Path discovery (read-only, 2026-09-30): GET-405 (exists, other method) on /contact,
 # /dnclist, /campaigns/search; GET-200 on /cdrs (call records, paged) and /lists.

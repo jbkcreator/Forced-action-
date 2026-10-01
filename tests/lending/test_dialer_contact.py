@@ -16,6 +16,7 @@ RECORD = {
     "property_address": "123 Main St, Tampa, FL 33602",
     "estimated_loan_value": "$350,000",
     "recent_permit_details": "New single-family residence, issued 2026-08-14",
+    "county": "Hillsborough",
 }
 
 
@@ -30,7 +31,15 @@ def test_full_record_maps_to_every_display_field():
         "Est. loan value: $350,000",
         "Recent permit: New single-family residence, issued 2026-08-14",
         "Campaign: DESK_CONSTRUCTION",
+        "County: Hillsborough",
+        "Hook: Not available",
     ]
+
+
+def test_the_hook_line_comes_from_the_campaign():
+    fields = dialer_fields(display_from_record(RECORD, "Verified maturity"))
+    hook = [line for line in fields.information.splitlines() if line.startswith("Hook: ")][0]
+    assert "loan" in hook and "coming up" in hook
 
 
 def test_missing_values_are_shown_as_not_available():
@@ -64,3 +73,14 @@ def test_information_is_bounded():
     long_record = {**RECORD, "recent_permit_details": "x" * 5000}
     information = dialer_fields(display_from_record(long_record, None)).information
     assert len(information) == INFORMATION_MAX_CHARS
+
+
+def test_the_property_address_is_split_into_the_dialer_address_fields():
+    record = {**RECORD, "state": "FL", "zip": "33602"}
+    fields = dialer_fields(display_from_record(record, "Builders"))
+    assert (fields.address, fields.city, fields.state, fields.postal_code) == ("123 Main St", "Tampa", "FL", "33602")
+
+
+def test_a_bare_street_address_still_fills_the_address_field():
+    fields = dialer_fields(display_from_record({"property_address": "9 Oak Ave"}, "Builders"))
+    assert fields.address == "9 Oak Ave" and fields.city is None

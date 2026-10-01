@@ -325,3 +325,44 @@ def test_undecided_removal_warns_once_not_every_poll(db, caplog):
     assert [r.levelname for r in first] == ["WARNING"]
     assert retries and all(r.levelname == "DEBUG" for r in retries)
     assert [e.status for e in _events(db, PHONE)] == ["dialer_pending"]
+
+
+# ── GoHighLevel: every opt-out also becomes do-not-disturb on the GHL contact ────────
+
+
+class FakeGhl:
+    """Sets DND for the test phone only (the shared DB holds real opt-outs)."""
+
+    def __init__(self, ok=True):
+        self.calls, self.ok = [], ok
+
+    def __call__(self, phone):
+        if phone == PHONE:
+            self.calls.append(phone)
+            return self.ok
+        return True
+
+
+def _ghl_column(db):
+    db.execute(text("ALTER TABLE lending.opt_out_events ADD COLUMN IF NOT EXISTS ghl_dnd_at timestamptz"))
+
+
+def test_a_dialer_opt_out_reaches_ghl_on_the_next_poll(db):
+    from src.lending.compliance import poll_fa_opt_outs, propagate_opt_out
+    _ghl_column(db)
+    propagate_opt_out(db, phone=PHONE, source_ref="call-ghl-1", dialer_remover=FakeDialer())
+    ghl = FakeGhl()
+    poll_fa_opt_outs(db, dialer_remover=FakeDialer(), ghl_dnd=ghl)
+    assert ghl.calls == [PHONE]
+    poll_fa_opt_outs(db, dialer_remover=FakeDialer(), ghl_dnd=ghl)
+    assert ghl.calls == [PHONE]          # done once, never again
+
+
+def test_a_failed_ghl_update_is_retried_on_the_next_poll(db):
+    from src.lending.compliance import poll_fa_opt_outs, propagate_opt_out
+    _ghl_column(db)
+    propagate_opt_out(db, phone=PHONE, source_ref="call-ghl-2", dialer_remover=FakeDialer())
+    poll_fa_opt_outs(db, dialer_remover=FakeDialer(), ghl_dnd=FakeGhl(ok=False))
+    ghl = FakeGhl()
+    poll_fa_opt_outs(db, dialer_remover=FakeDialer(), ghl_dnd=ghl)
+    assert ghl.calls == [PHONE]

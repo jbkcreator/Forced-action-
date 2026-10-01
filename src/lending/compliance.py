@@ -13,6 +13,7 @@ owns the transaction.
 from __future__ import annotations
 
 import hashlib
+from collections import defaultdict
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -33,6 +34,7 @@ from config.lending_compliance import (
     DIALER_SWEEP_LOCK_KEY,
     DIALER_OPT_OUT_SOURCE,
     DNC_SCRUB_MAX_AGE_DAYS,
+    GHL_DND_BATCH,
     GEORGIA_ALLOWED_ENTITY_TYPES,
     MAX_ATTEMPTS_PER_PERIOD,
     OPT_OUT_EXCLUDED_SOURCES,
@@ -664,11 +666,13 @@ def propagate_opt_out(
     source_ref: Optional[str] = None,
     actor: Optional[str] = None,
     dialer_remover: Optional[DialerRemover] = None,
+    channel: OptOutChannel = OptOutChannel.DIALER,
 ) -> Optional[int]:
-    """Verbal decline (DNC_REQUEST) entry point. Returns the opt_out_events id. Does not commit.
+    """Verbal decline (DNC_REQUEST) or GHL STOP/DND entry point. Returns the opt_out_events
+    id. Does not commit.
 
-    Idempotent per ``source_ref`` (dialer call id): a redelivered event returns the
-    existing event id and writes nothing."""
+    Idempotent per ``channel`` + ``source_ref`` (dialer call id / GHL contact): a redelivered
+    event returns the existing event id and writes nothing."""
     from src.services.email_suppression import suppress_contact
 
     if source_ref:
@@ -677,7 +681,7 @@ def propagate_opt_out(
                 "SELECT id FROM lending.opt_out_events "
                 "WHERE channel = :channel AND source_ref = :ref ORDER BY id LIMIT 1"
             ),
-            {"channel": OptOutChannel.DIALER.value, "ref": source_ref},
+            {"channel": channel.value, "ref": source_ref},
         ).scalar()
         if existing:
             return existing
@@ -687,11 +691,15 @@ def propagate_opt_out(
     if not phone and not email:
         return None
     suppress_contact(db, email=email, phone=phone, source=DIALER_OPT_OUT_SOURCE)
-    opt_out = _OptOut(OptOutChannel.DIALER, phone, email, source_ref, actor, datetime.now(timezone.utc))
-    return _propagate(db, [opt_out], dialer_remover)[0]
+    opt_out = _OptOut(channel, phone, email, source_ref, actor, datetime.now(timezone.utc))
+    event_id = _propagate(db, [opt_out], dialer_remover)[0]
+    if channel is OptOutChannel.GHL:  # GHL already holds the DND: never echo it back
+        db.execute(text("UPDATE lending.opt_out_events SET ghl_dnd_at = now() WHERE id = :id"), {"id": event_id})
+    return event_id
 
 
-def poll_fa_opt_outs(db, *, dialer_remover: Optional[DialerRemover] = None) -> PollResult:
+def poll_fa_opt_outs(db, *, dialer_remover: Optional[DialerRemover] = None,
+                     ghl_dnd: Optional[Callable[[str], bool]] = None) -> PollResult:
     """Mirror each FA opt-out row exactly once (keyed on its FA row id, so a raw or
     padded FA value can never loop), and retry pending dialer removals.
 
@@ -728,9 +736,40 @@ def poll_fa_opt_outs(db, *, dialer_remover: Optional[DialerRemover] = None) -> P
         _propagate(db, opt_outs, dialer_remover)
 
     retried = _retry_pending_dialer_removals(db, dialer_remover)
+    _sync_ghl_dnd(db, ghl_dnd)
     if opt_outs or retried:
         logger.info("[lending-compliance] poll new_opt_outs=%d dialer_retried=%d", len(opt_outs), retried)
     return PollResult(new_opt_outs=len(opt_outs), dialer_retried=retried)
+
+
+def _sync_ghl_dnd(db, ghl_dnd: Optional[Callable[[str], bool]]) -> int:
+    """Write every opt-out not yet in GHL as do-not-disturb (new ones and retries alike),
+    a bounded batch per poll. Returns how many GHL accepted."""
+    if ghl_dnd is None:
+        from src.lending.ghl_dnd import get_ghl_dnd
+        ghl_dnd = get_ghl_dnd()
+        if ghl_dnd is None:
+            return 0
+    pending = db.execute(
+        text(
+            "SELECT e.id, c.phone FROM lending.opt_out_events e "
+            "JOIN lending.contacts c ON c.phone_hash = e.phone_hash "
+            "WHERE e.ghl_dnd_at IS NULL AND e.phone_hash IS NOT NULL ORDER BY e.id LIMIT :n"
+        ),
+        {"n": GHL_DND_BATCH},
+    ).fetchall()
+    ids_by_phone: dict[str, list[int]] = defaultdict(list)
+    for event_id, phone in pending:
+        ids_by_phone[phone].append(event_id)
+    done: list[int] = []
+    for phone, event_ids in ids_by_phone.items():
+        if ghl_dnd(phone):
+            done.extend(event_ids)
+        else:
+            logger.warning("[lending-compliance] GHL DND pending phone_hash=%s", phone_hash(phone)[:12])
+    if done:
+        db.execute(text("UPDATE lending.opt_out_events SET ghl_dnd_at = now() WHERE id = ANY(:ids)"), {"ids": done})
+    return len(done)
 
 
 def _propagate(db, opt_outs: list[_OptOut], dialer_remover: Optional[DialerRemover]) -> list[int]:

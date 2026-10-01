@@ -213,6 +213,90 @@ def test_the_no_answer_disposition_alone_is_enough():
     assert parse_cdr(_cdr(status="", disposition="No Answer")) is not None
 
 
-def test_the_poller_reads_the_since_last_poll_endpoint():
+def test_the_poller_never_uses_the_shared_since_last_poll_marker():
     from config.lending_missed_call import CDR_POLL_PATH
-    assert CDR_POLL_PATH == "/v2/cdrs/last"
+    assert not CDR_POLL_PATH.endswith("/last")
+
+
+@needs_db
+def test_a_call_dispositioned_do_not_call_suppresses_the_number(db):
+    from src.lending.missed_call_poller import run_cycle
+    fresh = (NOW - timedelta(seconds=20)).isoformat()
+    records = {"items": [_cdr(id=f"d-{uuid.uuid4().hex[:6]}", status="COMPLETED", disposition="DNC_REQUEST",
+                              callEndTime=fresh)]}
+    run_cycle(db, http=lambda *a, **k: records, enabled=False, now=NOW)
+    assert db.execute(text("SELECT count(*) FROM lending.suppression_list WHERE phone = :p"),
+                      {"p": PHONE}).scalar() == 1
+
+
+# ── Multi-line dialing ──
+
+@pytest.mark.parametrize("over", [{"status": "ABANDONED", "disposition": "Abandoned"},
+                                  {"status": "ABANDON", "disposition": ""}])
+def test_an_abandoned_multi_line_call_is_never_a_missed_call(over):
+    # The person picked up and the dialer dropped them: "sorry we missed you" would be wrong.
+    assert parse_cdr(_cdr(**over)) is None
+
+
+@needs_db
+def test_a_dropped_call_with_no_agent_still_counts_as_an_attempt(db):
+    from src.lending import missed_call_poller
+    fresh = (NOW - timedelta(seconds=20)).isoformat()
+    records = [_cdr(id=f"n-{uuid.uuid4().hex[:6]}", status="ABANDONED", disposition="Abandoned",
+                    agent=None, callEndTime=fresh)]
+    missed_call_poller.run_cycle(db, http=lambda *a, **k: records, enabled=False, now=NOW)
+    assert db.execute(text("SELECT count(*) FROM lending.call_dispositions WHERE phone = :p"),
+                      {"p": PHONE}).scalar() == 1
+
+
+# ── Own bookmark: never share BatchDialer's per-integration "since last poll" marker ──
+
+@needs_db
+def test_the_poller_pages_the_call_list_until_it_reaches_calls_it_already_has(db):
+    from src.lending import missed_call_poller
+    fresh = (NOW - timedelta(seconds=20)).isoformat()
+    seen = _cdr(id=f"s-{uuid.uuid4().hex[:6]}", status="COMPLETED", disposition="ANSWER", callEndTime=fresh)
+    missed_call_poller.run_cycle(db, http=lambda *a, **k: [seen], enabled=False, now=NOW)
+
+    new = _cdr(id=f"n-{uuid.uuid4().hex[:6]}", callEndTime=fresh)
+    pages = {None: {"items": [new], "nextPage": "p2"}, "p2": {"items": [seen], "nextPage": "p3"},
+             "p3": {"items": [], "nextPage": None}}
+    requested = []
+
+    def http(method, path, json=None):
+        requested.append(path)
+        cursor = path.split("next_page=")[1].split("&")[0] if "next_page=" in path else None
+        return pages[cursor]
+    counts = missed_call_poller.run_cycle(db, http=http, enabled=False, now=NOW)
+    assert all(p.startswith("/v2/cdrs?") and "/last" not in p for p in requested)
+    assert len(requested) == 2          # stopped on the page holding a call it already had
+    assert counts == {"dry_run": 1}
+
+
+# ── Shift groups: allow and warn (decision 2026-10-01) ──
+
+@needs_db
+def test_a_call_by_an_agent_with_no_shift_group_is_counted_and_warned(db, caplog, monkeypatch):
+    from src.lending import missed_call_poller
+    monkeypatch.setattr(missed_call_poller, "AGENT_SHIFT_GROUPS", {})
+    fresh = (NOW - timedelta(seconds=20)).isoformat()
+    records = [_cdr(id=f"g-{uuid.uuid4().hex[:6]}", status="COMPLETED", disposition="ANSWER", callEndTime=fresh)]
+    with caplog.at_level("WARNING"):
+        missed_call_poller.run_cycle(db, http=lambda *a, **k: records, enabled=False, now=NOW)
+    assert db.execute(text("SELECT count(*) FROM lending.call_dispositions WHERE phone = :p"), {"p": PHONE}).scalar() == 1
+    assert any("no shift group" in r.getMessage() and "42" in r.getMessage() for r in caplog.records)
+
+
+@needs_db
+def test_a_call_outside_the_agents_shift_is_warned_and_its_group_recorded(db, caplog, monkeypatch):
+    from src.lending import missed_call_poller
+    monkeypatch.setattr(missed_call_poller, "AGENT_SHIFT_GROUPS", {"42": "B"})
+    early = datetime(2026, 10, 5, 14, 0, tzinfo=timezone.utc)   # 10:00 ET: before Group B starts at 13:00
+    call_id = f"g-{uuid.uuid4().hex[:6]}"
+    records = [_cdr(id=call_id, status="COMPLETED", disposition="ANSWER",
+                    callStartTime=early.isoformat(), callEndTime=(early + timedelta(minutes=2)).isoformat())]
+    with caplog.at_level("WARNING"):
+        missed_call_poller.run_cycle(db, http=lambda *a, **k: records, enabled=False, now=early + timedelta(minutes=3))
+    assert any("outside shift group B" in r.getMessage() for r in caplog.records)
+    assert db.execute(text("SELECT seat_group FROM lending.call_dispositions WHERE dialer_call_id = :c"),
+                      {"c": call_id}).scalar() == "B"

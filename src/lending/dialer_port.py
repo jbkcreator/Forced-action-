@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional, Protocol, Union
 
 import requests
+from sqlalchemy import text
 
 from config.lending_compliance import RemovalReason
 from config.lending_dialer import (
@@ -24,6 +25,7 @@ from config.lending_dialer import (
 from config.settings import get_settings
 from src.utils.http_helpers import requests_get_with_retry, requests_post_with_retry
 from src.lending.dialer_removal import DialerRemovalUndecided
+from src.services.phone_utils import normalize as normalize_phone
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +43,10 @@ class DialerContactFields:
     company_name: Optional[str] = None
     information: Optional[str] = None
     email: Optional[str] = None
+    address: Optional[str] = None       # property street: BatchDialer's standard Address field,
+    city: Optional[str] = None          # which (unlike custom fields) the agent script can show
+    state: Optional[str] = None
+    postal_code: Optional[str] = None
     customfields: Optional[Mapping[str, str]] = None  # merged over what the dialer already holds
 
 
@@ -90,9 +96,11 @@ class InMemoryDialer:
 
 
 class BatchDialerAdapter:
-    def __init__(self, *, http: Http, endpoints: Mapping[str, Endpoint] = BATCHDIALER_ENDPOINTS) -> None:
+    def __init__(self, *, http: Http, endpoints: Mapping[str, Endpoint] = BATCHDIALER_ENDPOINTS,
+                 contact_ids: Optional[Callable[[str], list[str]]] = None) -> None:
         self._http = http
         self._endpoints = endpoints
+        self._contact_ids = contact_ids
         self._campaign_ids: Optional[dict[str, Any]] = None
 
     def _call(self, action: str, payload: dict, **path_params: Any) -> Mapping[str, Any]:
@@ -141,17 +149,20 @@ class BatchDialerAdapter:
         if contact_id is None:
             raise DialerRequestError("dialer returned no contact id")
         if campaign is not None:
-            self.update_contact(contact_id, fields, phone=phone)
+            self.update_contact(contact_id, fields, phone=phone, vendor_contact_id=vendor_contact_id)
         return ContactUpsertResult(contact_id=contact_id, created=True)
 
-    def update_contact(self, contact_id: Any, fields: DialerContactFields, *, phone: Optional[str] = None) -> dict:
-        """Full update (PUT): BatchDialer replaces every field it is not sent, so the phone is sent
-        again and the stored custom fields (text_consent, anything a caller set) are read first and
-        merged. If that read fails nothing is sent."""
+    def update_contact(self, contact_id: Any, fields: DialerContactFields, *, phone: Optional[str] = None,
+                       vendor_contact_id: Optional[str] = None) -> dict:
+        """Full update (PUT): BatchDialer replaces every field it is not sent, so the phone and our
+        vendor contact id are sent again, and the stored custom fields (text_consent, anything a
+        caller set) are read first and merged. If that read fails nothing is sent."""
         if self._endpoints.get("contact_update") is None:
             raise UnconfirmedCapability("BatchDialer endpoint 'contact_update' is not confirmed")
         existing = self.get_contact_customfields(contact_id)
         body = _contact_body(phone, fields)
+        if vendor_contact_id:
+            body["vendorcontactid"] = vendor_contact_id
         body["customfields"] = {**existing, **body.get("customfields", {}), **(fields.customfields or {})}
         return dict(self._call("contact_update", body, id=contact_id))
 
@@ -174,10 +185,20 @@ class BatchDialerAdapter:
         return self._campaign_ids[name]
 
     def remove(self, phone: str, *, reason: str) -> None:
-        # Opt-outs are permanent (DNC list); window/cap holds only leave the campaign and
-        # never touch the DNC list, so restore() can never undo a real DNC entry.
-        action = "dnc_add" if reason == RemovalReason.OPT_OUT.value else "campaign_remove"
-        self._call(action, {"phone": phone})
+        # The public API has no DNC endpoint, so a permanent opt-out deletes every contact we
+        # loaded for the number (our suppression list blocks any reload). Window/cap holds only
+        # leave the campaign and never delete, so restore() can never undo an opt-out.
+        if reason != RemovalReason.OPT_OUT.value:
+            self._call("campaign_remove", {"phone": phone})
+            return
+        if self._contact_ids is None:
+            raise UnconfirmedCapability("no dialer contact lookup configured for opt-out deletes")
+        for contact_id in self._contact_ids(phone):
+            try:
+                self._call("contact_delete", {}, id=contact_id)
+            except DialerRequestError as exc:
+                if exc.status != 404:  # already gone: the opt-out is done for this contact
+                    raise
 
     def restore(self, phone: str) -> None:
         self._call("campaign_restore", {"phone": phone})
@@ -187,10 +208,18 @@ def _contact_id(body: Mapping[str, Any]) -> Any:
     return body.get("id") if body.get("id") is not None else body.get("contactId")
 
 
+def _ten_digit(phone: str) -> str:
+    """BatchDialer stores US numbers as 10 digits; contact update rejects E.164 ("+1...")."""
+    digits = "".join(ch for ch in phone if ch.isdigit())
+    return digits[1:] if len(digits) == 11 and digits.startswith("1") else digits
+
+
 def _import_contact(phone: str, fields: DialerContactFields, vendor_contact_id: Optional[str]) -> dict:
     """One contact in the ``POST /contacts`` import shape (public API docs, "Add contacts")."""
     contact = {"firstname": fields.first_name or "", "lastname": fields.last_name or "",
-               "email": fields.email or "", "phonenumber1": phone}
+               "email": fields.email or "", "phonenumber1": _ten_digit(phone),
+               "addressline1": fields.address or "", "city": fields.city or "",
+               "state": fields.state or "", "postalcode": fields.postal_code or ""}
     if vendor_contact_id:
         contact["vendorcontactid"] = vendor_contact_id
     return contact
@@ -202,6 +231,10 @@ def _contact_body(phone: Optional[str], fields: DialerContactFields) -> dict:
     body: dict[str, Any] = {
         "firstname": fields.first_name or "",
         "lastname": fields.last_name or "",
+        "address": fields.address or "",
+        "city": fields.city or "",
+        "state": fields.state or "",
+        "postalcode": fields.postal_code or "",
         "customfields": {
             "entity_name": fields.company_name or "",
             "details": fields.information or "",
@@ -209,7 +242,7 @@ def _contact_body(phone: Optional[str], fields: DialerContactFields) -> dict:
         },
     }
     if phone is not None:
-        body["phonenumbers"] = [{"phonenumber": phone}]
+        body["phonenumbers"] = [{"phonenumber": _ten_digit(phone)}]
     return body
 
 
@@ -248,7 +281,19 @@ def get_dialer() -> Optional[Dialer]:
     key = get_settings().batchdialer_api_key
     if key is None or not BATCHDIALER_BASE_URL:
         return None
-    return BatchDialerAdapter(http=_requests_http(key.get_secret_value()))
+    return BatchDialerAdapter(http=_requests_http(key.get_secret_value()), contact_ids=_loaded_contact_ids)
+
+
+def _loaded_contact_ids(phone: str) -> list[str]:
+    """Every dialer contact id ever loaded for the phone (active or not)."""
+    from src.core.database import get_db_context
+
+    with get_db_context() as db:
+        return [str(r[0]) for r in db.execute(
+            text("SELECT DISTINCT dialer_contact_id FROM lending.dialer_load_records "
+                 "WHERE phone = :p AND dialer_contact_id IS NOT NULL"),
+            {"p": normalize_phone(phone)},
+        )]
 
 
 def get_http() -> Optional[Http]:
