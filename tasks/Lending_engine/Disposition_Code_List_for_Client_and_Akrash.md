@@ -29,21 +29,21 @@ BatchDialer's built-in results are also understood and mapped: No Answer, Busy โ
 
 | # | Our code | Result name in BatchDialer | Type / how it maps | Attached to campaigns |
 |---|---|---|---|---|
-| 1 | `NO_ANSWER` | **No Answer** | Built-in; the name normalises to `NO_ANSWER` (direct match) | TO DO |
+| 1 | `NO_ANSWER` | **No Answer** | Built-in; the name normalises to `NO_ANSWER` (direct match) | Done |
 | 2 | `LEFT_VOICEMAIL` | `LEFT_VOICEMAIL` | Custom; exact | Done |
 | 3 | `BAD_NUMBER` | `BAD_NUMBER` | Custom; exact | Done |
 | 4 | `CALL_FAILED` | `CALL_FAILED` | Custom; exact | Done |
 | 5 | `WRONG_PERSON` | `WRONG_PERSON` | Custom; exact | Done |
-| 6 | `NOT_DECISION_MAKER` | `NOT_DECISION_MAKER` | Custom; exact | TO DO |
-| 7 | `REFERRED` | `REFERRED` | Custom; exact | TO DO |
-| 8 | `DNC_REQUEST` | **Do Not Call** | Built-in; alias `DO_NOT_CALL` -> `DNC_REQUEST` | TO DO |
-| 9 | `CONNECTED_NOT_INTERESTED` | `CONNECTED_NOT_INTERESTED` | Custom; exact | TO DO |
-| 10 | `CALLBACK_REQUESTED` | **Call Back** | Built-in; alias `CALL_BACK` -> `CALLBACK_REQUESTED` | TO DO |
-| 11 | `DATA_NURTURE_ONLY` | `DATA_NURTURE_ONLY` | Custom; exact | TO DO |
-| 12 | `GATE_FAILED_NURTURE` | `GATE_FAILED_NURTURE` | Custom; exact | TO DO |
-| 13 | `BOOKED` | `BOOKED` | Custom; exact | TO DO |
+| 6 | `NOT_DECISION_MAKER` | `NOT_DECISION_MAKER` | Custom; exact | Done |
+| 7 | `REFERRED` | `REFERRED` | Custom; exact | Done |
+| 8 | `DNC_REQUEST` | **Do Not Call** | Built-in; alias `DO_NOT_CALL` -> `DNC_REQUEST` | Done |
+| 9 | `CONNECTED_NOT_INTERESTED` | `CONNECTED_NOT_INTERESTED` | Custom; exact | Done |
+| 10 | `CALLBACK_REQUESTED` | **Call Back** | Built-in; alias `CALL_BACK` -> `CALLBACK_REQUESTED` | Done |
+| 11 | `DATA_NURTURE_ONLY` | `DATA_NURTURE_ONLY` | Custom; exact | Done |
+| 12 | `GATE_FAILED_NURTURE` | `GATE_FAILED_NURTURE` | Custom; exact | Done |
+| 13 | `BOOKED` | `BOOKED` | Custom; exact | Done |
 
-All 13 results exist in BatchDialer (group "Lending", created). Only the three built-ins keep their own names (No Answer, Do Not Call, Call Back); the code maps them, so they need no renaming. A test (`test_every_result_created_in_batchdialer_maps_to_its_code`) pins this table. Akrash still has to attach the nine "TO DO" results to the four campaigns before the test calls.
+All 13 results exist in BatchDialer (group "Lending", created). Only the three built-ins keep their own names (No Answer, Do Not Call, Call Back); the code maps them, so they need no renaming. A test (`test_every_result_created_in_batchdialer_maps_to_its_code`) pins this table. The "Lending" call-results group is attached to every campaign (checked by the client).
 
 
 ## B. Unfunded cause (Brief ยง2.7)
