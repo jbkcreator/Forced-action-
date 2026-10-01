@@ -171,7 +171,32 @@ class TestGetSlots:
         assert taken.start not in starts
 
 
-def _book(calendar, session, *, slot=None, attendee=ATTENDEE):
+def _bypass_gate():
+    """Patch out WP-GL-5 gate + cap checks for tests that don't test gate logic.
+
+    Tests that existed before WP-GL-5 call book() without a gate_id. The
+    gate is now a hard requirement, but these tests are verifying other
+    invariants (slot-conflict resolution, idempotency, suppression, etc.)
+    against the real DB schema. Bypassing here keeps them green and focused.
+    """
+    _fake_gate_row = {"gate_id": "test_gate", "list_key": None, "result": "pass"}
+    from contextlib import ExitStack
+    from unittest.mock import patch as _patch
+
+    stack = ExitStack()
+    stack.enter_context(
+        _patch(
+            "src.services.calendar.gate.get_passed_gate_by_id",
+            return_value=_fake_gate_row,
+        )
+    )
+    stack.enter_context(
+        _patch("src.services.calendar.gate.enforce_daily_cap", return_value=True)
+    )
+    return stack
+
+
+def _book(calendar, session, *, slot=None, attendee=ATTENDEE, gate_id="test_gate"):
     return book(
         client=calendar,
         session=session,
@@ -179,10 +204,16 @@ def _book(calendar, session, *, slot=None, attendee=ATTENDEE):
         slot=slot or _slot(11),
         attendee_email=attendee,
         topic="Intro call",
+        gate_id=gate_id,
     )
 
 
 class TestBook:
+    @pytest.fixture(autouse=True)
+    def _gate_bypassed(self):
+        with _bypass_gate():
+            yield
+
     def test_books_an_open_slot(self, bookings_db):
         calendar = FakeCalendar()
         with _allow_all():
@@ -261,6 +292,11 @@ class TestBook:
 
 
 class TestReschedule:
+    @pytest.fixture(autouse=True)
+    def _gate_bypassed(self):
+        with _bypass_gate():
+            yield
+
     def _booked(self, calendar, session):
         with _allow_all():
             return _book(calendar, session, slot=_slot(11))
@@ -403,10 +439,11 @@ class TestAvailabilityCaching:
         calendar, _ = self._counting_calendar()
         session = _RecordingSession()
 
-        with patch("src.services.calendar.booking._cached_busy") as cached, _allow_all():
+        with patch("src.services.calendar.booking._cached_busy") as cached, _allow_all(), _bypass_gate():
             book(
                 client=calendar, session=session, calendar_id=cache_id, slot=_slot(11),
                 attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate",
             )
 
         cached.assert_not_called()
@@ -419,6 +456,11 @@ class TestIntegrityAgainstPostgres:
     it. These run against the real schema so a missing index fails here
     rather than in front of two borrowers.
     """
+
+    @pytest.fixture(autouse=True)
+    def _gate_bypassed(self):
+        with _bypass_gate():
+            yield
 
     def test_the_slot_index_rejects_a_second_live_booking(self, bookings_db):
         from sqlalchemy.exc import IntegrityError
@@ -491,6 +533,7 @@ class TestIntegrityAgainstPostgres:
                 client=FakeCalendar(), session=bookings_db, calendar_id=CALENDAR_ID,
                 slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
                 tracked_link_id=link_id,
+                gate_id="test_gate",
             )
         assert booked.booked
         assert has_live_booking(bookings_db, tracked_link_id=link_id)
@@ -558,6 +601,11 @@ class TestWrittenSqlWithoutDatabase:
     migrations/apply_fa_max_bookings.py has been run.
     """
 
+    @pytest.fixture(autouse=True)
+    def _gate_bypassed(self):
+        with _bypass_gate():
+            yield
+
     def test_book_claims_the_slot_then_confirms_it(self):
         session = _RecordingSession()
         slot = _slot(11)
@@ -567,6 +615,7 @@ class TestWrittenSqlWithoutDatabase:
                 slot=slot, attendee_email=ATTENDEE, topic="Intro call",
                 person_id="11111111-1111-1111-1111-111111111111",
                 tracked_link_id=99,
+                gate_id="test_gate",
             )
 
         inserts = session.statements_containing("INSERT INTO fa_max_bookings")
@@ -600,6 +649,7 @@ class TestWrittenSqlWithoutDatabase:
             book(
                 client=_WatchingCalendar(), session=session, calendar_id=CALENDAR_ID,
                 slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate",
             )
 
         assert commits_at_create == [1], "the claim was not durable before the event"
@@ -612,6 +662,7 @@ class TestWrittenSqlWithoutDatabase:
                 book(
                     client=FakeCalendar(), session=session, calendar_id=CALENDAR_ID,
                     slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                    gate_id="test_gate",
                 )
             keys.append(
                 session.statements_containing("INSERT INTO fa_max_bookings")[0][1][
@@ -627,6 +678,7 @@ class TestWrittenSqlWithoutDatabase:
                 book(
                     client=FakeCalendar(), session=session, calendar_id=CALENDAR_ID,
                     slot=slot, attendee_email=attendee, topic="Intro call",
+                    gate_id="test_gate",
                 )
             return session.statements_containing("INSERT INTO fa_max_bookings")[0][1][
                 "idempotency_key"
@@ -646,6 +698,7 @@ class TestWrittenSqlWithoutDatabase:
             result = book(
                 client=calendar, session=session, calendar_id=CALENDAR_ID,
                 slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate",
             )
 
         assert result.booked
@@ -663,6 +716,7 @@ class TestWrittenSqlWithoutDatabase:
             result = book(
                 client=calendar, session=session, calendar_id=CALENDAR_ID,
                 slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate",
             )
 
         assert not result.booked, "a pending claim may have no meeting behind it"
@@ -679,6 +733,7 @@ class TestWrittenSqlWithoutDatabase:
             result = book(
                 client=calendar, session=session, calendar_id=CALENDAR_ID,
                 slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate",
             )
 
         assert result.booked
@@ -692,6 +747,7 @@ class TestWrittenSqlWithoutDatabase:
             book(
                 client=calendar, session=session, calendar_id=CALENDAR_ID,
                 slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate",
             )
 
         released = session.statements_containing("SET status = 'cancelled'")
@@ -706,6 +762,7 @@ class TestWrittenSqlWithoutDatabase:
             book(
                 client=FakeCalendar(), session=session, calendar_id=CALENDAR_ID,
                 slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate",
             )
         assert session.calls == []
 
@@ -717,6 +774,7 @@ class TestWrittenSqlWithoutDatabase:
             book(
                 client=calendar, session=session, calendar_id=CALENDAR_ID, slot=slot,
                 attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate",
             )
         # The idempotency lookup still runs; nothing is written.
         assert session.statements_containing("INSERT INTO fa_max_bookings") == []
@@ -757,6 +815,11 @@ class TestWrittenSqlWithoutDatabase:
 
 class TestPr296ReviewFixes:
     """Regressions for the PR #296 review: overlap, naive times, expired claims."""
+
+    @pytest.fixture(autouse=True)
+    def _gate_bypassed(self):
+        with _bypass_gate():
+            yield
 
     def test_overlapping_slot_with_a_different_start_is_refused(self, bookings_db):
         with _allow_all():
@@ -805,6 +868,7 @@ class TestPr296ReviewFixes:
             result = book(
                 client=calendar, session=session, calendar_id=CALENDAR_ID,
                 slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate",
             )
 
         assert not result.booked

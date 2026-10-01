@@ -124,8 +124,16 @@ def book(
     description: str = "",
     person_id: Optional[Any] = None,
     tracked_link_id: Optional[int] = None,
+    gate_id: Optional[str] = None,
 ) -> BookingResult:
     """Book a slot for an attendee, refusing if suppressed or already taken.
+
+    gate_id must reference a passed fa_max_booking_gates row. If omitted or
+    invalid, the booking is refused — fail closed. This enforces WP-GL-5's
+    requirement that no booking reaches Josh's calendar without a caller
+    completing the six-field gate. The daily cap (config/booking_gate.py
+    CALENDAR_DAILY_CAP) is checked with a Postgres advisory lock to prevent
+    concurrent bypass.
 
     Commits. The row claiming the slot must be durable before the calendar
     event is created, or a crash in between leaves a meeting in the
@@ -133,11 +141,28 @@ def book(
     a stray meeting is not.
     """
     from src.agents.fa_max.tool_registry import check_suppression
+    from src.services.calendar.gate import enforce_daily_cap, get_passed_gate_by_id
 
     # A naive time would crash the tz-aware busy comparison, or be stored in
     # TIMESTAMPTZ at whatever offset the DB session happens to use.
     _require_aware(slot.start, "slot.start")
     _require_aware(slot.end, "slot.end")
+
+    # Gate re-validation: confirm the gate_id still passes at booking time.
+    # Stored as code-only JSONB — never inspect free-text financial fields here.
+    if not gate_id:
+        logger.info("calendar.book: refused — no gate_id provided")
+        return BookingResult(booked=False, reason="gate_required")
+
+    gate_row = get_passed_gate_by_id(session, gate_id)
+    if gate_row is None:
+        logger.info("calendar.book: refused — gate_id=%s not passed or list blocked", gate_id)
+        return BookingResult(booked=False, reason="gate_not_passed")
+
+    # Daily cap — advisory lock serialises concurrent requests.
+    if not enforce_daily_cap(session):
+        logger.info("calendar.book: refused — daily cap reached")
+        return BookingResult(booked=False, reason="daily_cap_reached")
 
     suppression = check_suppression(
         recipient=attendee_email, channel="email", session=session
@@ -163,7 +188,7 @@ def book(
     claim = _claim_slot(
         session=session, calendar_id=calendar_id, slot=slot,
         attendee_email=attendee_email, topic=topic, person_id=person_id,
-        tracked_link_id=tracked_link_id, idempotency_key=key,
+        tracked_link_id=tracked_link_id, idempotency_key=key, gate_id=gate_id,
     )
     if claim is None:
         # Another booking holds this slot or this key. Whoever committed
@@ -305,6 +330,7 @@ def _claim_slot(
     person_id: Optional[Any],
     tracked_link_id: Optional[int],
     idempotency_key: str,
+    gate_id: Optional[str] = None,
 ) -> Optional[str]:
     """Durably claim the slot. Returns the booking ref, or None if lost.
 
@@ -321,10 +347,10 @@ def _claim_slot(
                 """
                 INSERT INTO fa_max_bookings
                     (booking_ref, idempotency_key, tracked_link_id, calendar_id,
-                     person_id, attendee_email, topic, starts_at, ends_at, status)
+                     person_id, attendee_email, topic, starts_at, ends_at, status, gate_id)
                 VALUES
                     (:booking_ref, :idempotency_key, :tracked_link_id, :calendar_id,
-                     :person_id, :attendee_email, :topic, :starts_at, :ends_at, 'pending')
+                     :person_id, :attendee_email, :topic, :starts_at, :ends_at, 'pending', :gate_id)
                 """
             ),
             {
@@ -337,6 +363,7 @@ def _claim_slot(
                 "topic": topic,
                 "starts_at": slot.start,
                 "ends_at": slot.end,
+                "gate_id": gate_id,
             },
         )
         session.commit()
