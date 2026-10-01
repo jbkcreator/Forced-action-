@@ -227,6 +227,7 @@ app.include_router(competitor_benchmark_router)
 from src.api.metrics_router import router as metrics_router  # noqa: E402
 from src.api.alert_webhook_router import router as alert_webhook_router  # noqa: E402
 from src.api.lending_ghl_router import router as lending_ghl_router  # noqa: E402
+from src.lending.webhooks import router as lending_dialer_router  # noqa: E402
 from src.api.revenue_metrics_router import router as revenue_metrics_router  # noqa: E402
 from src.api.admin_leads_router import router as admin_leads_router  # noqa: E402
 from src.api.funnel_analytics_router import router as funnel_analytics_router  # noqa: E402
@@ -236,6 +237,7 @@ from src.api.identity_router import router as identity_router  # noqa: E402
 app.include_router(metrics_router)
 app.include_router(alert_webhook_router)
 app.include_router(lending_ghl_router)
+app.include_router(lending_dialer_router)
 app.include_router(revenue_metrics_router)
 app.include_router(admin_leads_router)
 app.include_router(funnel_analytics_router)

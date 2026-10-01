@@ -27,7 +27,7 @@ CDR, and how a contact is held. Confirm them before go-live.
    - `BATCHDIALER_API_KEY` (the API token: **User icon → Settings → Integrations → Custom Integration**; shared with the dialer load; `.env` only, never in chat or PRs)
 3. Start `fa-lending-cdr-poller` (`deploy/systemd/fa-lending-cdr-poller.service`). Run **exactly one
    instance**: the `/v2/cdrs/last` watermark is per API key, so a second poller (or anything else using
-   that endpoint with the same key) steals records. `lending-api` and its Nginx block are not needed for ingestion.
+   that endpoint with the same key) steals records. The dialer webhook and the GHL webhooks are served by `fa-api` (no separate lending server); the webhook is not needed for ingestion.
    Poller behavior to know:
    - Inbound calls are ignored, except calls disposed `DNC_REQUEST` (those are opted out; no attempt is counted).
    - The day rescan re-reads today and yesterday (UTC) every few minutes. After an outage longer than that,
@@ -126,10 +126,10 @@ All 13 results exist in BatchDialer (group "Lending", created). Only the three b
 
 ### Daily scoreboard
 
-- `src.tasks.lending_daily_scoreboard` posts to `LENDING_DIAL_TASKS_CHANNEL` at 7:00pm ET (two UTC cron lines; only the one at 19:xx ET acts).
+- `src.tasks.lending_daily_scoreboard` posts to `LENDING_DAILY_CHANNEL` (channel ID) at 7:00pm ET (two UTC cron lines; only the one at 19:xx ET acts).
   Tables: by caller, by BatchDialer campaign (`dialer_campaign_id`, names from `GET /campaigns`), and by hook (`campaign_tag`).
 - Definitions live in `config/lending_dispositions.py` (`LIVE_CONVERSATION_CODES`, `GATED_CODES`, `NURTURE_SENT_CODES`).
-  Booked excludes `booking_blocked`; Showed is not in the log (client marks Held in GHL), so it prints `n/a (GHL)`.
+  Booked excludes `booking_blocked`; Showed comes from GHL stage events (see "GHL showed feed" below), not the log.
 - The dialer stops at 7:15pm ET, so calls between 7:00 and 7:15pm are not in the post. Open question for the client: post at 7:20pm instead
   (change the cron hours and the hour guard together).
 - Test calls count like real ones. Run with `--force` only after the Friday test, or filter by a test campaign.

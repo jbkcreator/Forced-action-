@@ -9,14 +9,17 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from sqlalchemy.exc import OperationalError
 
 from src.lending import call_pipeline, webhooks
-from src.lending.api import app
 from src.lending.db import get_lending_db
 from src.lending.dispositions import RecordedCall
+
+app = FastAPI()
+app.include_router(webhooks.router)
 
 SECRET = "test-secret"
 PATH = "/webhooks/lending/dialer"
