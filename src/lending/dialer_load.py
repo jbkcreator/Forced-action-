@@ -28,6 +28,7 @@ from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 from sqlalchemy import text
 
 from config.lending_dialer import POOL_CAMPAIGN_TAGS
+from config.settings import get_settings
 from src.lending.backflip_conflict import (
     BorrowerRecord,
     find_borrower_conflicts,
@@ -89,6 +90,7 @@ class LoadReport:
     unmapped_pools: list[str] = field(default_factory=list)
     failed: list[dict] = field(default_factory=list)
     active_not_in_run: int = 0
+    backflip_check: bool = True
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -107,6 +109,7 @@ class LoadReport:
             "unmapped_pools": self.unmapped_pools,
             "failed": self.failed,
             "active_not_in_run": self.active_not_in_run,
+            "backflip_check": self.backflip_check,
         }
 
 
@@ -254,14 +257,18 @@ def run_dialer_load(
     campaign_tags: Mapping[str, str] = POOL_CAMPAIGN_TAGS,
     commit: Optional[Callable[[], None]] = None,
     now: Optional[datetime] = None,
+    backflip_check: Optional[bool] = None,
 ) -> LoadReport:
     """Gate every record, then (live only) load the survivors into dialer.
 
     Dry run never calls dialer or Tracerfy and never commits; roll ``db``
     back afterwards. Live requires ``scrubber`` and ``dialer`` and commits
     through ``commit`` (default ``db.commit``) after each chunk of loads.
+    ``backflip_check`` defaults to the ``LENDING_BACKFLIP_CHECK_ENABLED`` setting.
     """
-    report = LoadReport(run_id=run_id, dry_run=dry_run, total=len(records))
+    if backflip_check is None:
+        backflip_check = get_settings().lending_backflip_check_enabled
+    report = LoadReport(run_id=run_id, dry_run=dry_run, total=len(records), backflip_check=backflip_check)
     if not dry_run and (scrubber is None or dialer is None):
         raise ValueError("a live load needs a scrubber and a dialer")
     phones = [normalize_phone(r.get("normalized_phone") or r.get("phone") or "") for r in records]
@@ -278,7 +285,8 @@ def run_dialer_load(
     for i in pending_scrub:
         del blocks[i]
     candidates = [i for i in range(len(records)) if i not in blocks]
-    conflict_blocks, criteria = _conflict_blocks(db, records, candidates, phones)
+    conflict_blocks, criteria = (_conflict_blocks(db, records, candidates, phones)
+                                 if backflip_check else ({}, {}))
     blocks.update(conflict_blocks)
     # Call-time rail in the dial path: a live load never loads a number that cannot be
     # dialed right now (attempt cap, 09:00-19:15 ET / 8-20 local). Dry runs report

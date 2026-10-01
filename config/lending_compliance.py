@@ -24,6 +24,12 @@ ATTEMPT_PERIOD_HOURS = 24        # rolling
 DNC_SCRUB_MAX_AGE_DAYS = 7
 STOP_PROPAGATION_SLA_SECONDS = 60
 OPT_OUT_POLL_SECONDS = 15        # FA opt-out poller interval; worst case well inside the SLA
+# GoHighLevel opt-out sync: every lending opt-out becomes DND on the GHL contact.
+GHL_DND_CHANNELS = ("SMS", "Email", "GMB", "FB", "WhatsApp", "Call")
+GHL_OPT_OUT_TAG = "lending-opt-out"
+GHL_DND_BATCH = 50               # GHL updates per poll cycle (GHL client throttles ~2 req/s)
+GHL_BACKSTOP_PAGE_SIZE = 100     # GHL contact search page size (DND backstop)
+GHL_BACKSTOP_MAX_PAGES = 50      # bound per backstop run (~5,000 DND contacts)
 DIALER_SWEEP_SECONDS = 60        # window/cap pull-and-restore sweep interval
 GEORGIA_ALLOWED_ENTITY_TYPES = frozenset({"LLC", "LP", "CORPORATION"})
 
@@ -73,6 +79,7 @@ class OptOutChannel(str, Enum):
     SMS = "sms"
     EMAIL = "email"
     DIALER = "dialer"
+    GHL = "ghl"
 
 
 class OptOutStatus(str, Enum):

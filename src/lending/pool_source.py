@@ -13,7 +13,7 @@ from sqlalchemy import text
 _COLUMNS = (
     "id, run_id, pool_name, source_tag, normalized_phone, email, borrower_name, entity_name, "
     "target_property_address, estimated_loan_value, recent_permit_details, parcel_id, state, "
-    "entity_status, zip"
+    "entity_status, zip, county_name"
 )
 
 
@@ -49,6 +49,7 @@ def staged_pool_records(db, *, run_id: Optional[str] = None) -> list[dict[str, A
             "state": row["state"],
             "entity_status": row["entity_status"],
             "zip": row["zip"],
+            "county": row["county_name"],
         }
         for row in rows
     ]

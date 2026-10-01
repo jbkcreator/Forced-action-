@@ -25,14 +25,23 @@ ENDPOINTS = {
     "contacts_add_to_campaign": ("POST", "/contacts"),
     "campaign_remove": ("POST", "/campaign/remove"),
     "campaign_restore": ("POST", "/campaign/add"),
-    "dnc_add": ("POST", "/dnc"),
+    "dnc_add": None,
+    "contact_delete": ("DELETE", "/contact/{id}"),
 }
 
 
-def test_opt_out_goes_to_the_permanent_dnc_list():
+def test_an_opt_out_deletes_every_dialer_contact_loaded_for_that_phone():
     http = FakeHttp()
-    BatchDialerAdapter(http=http, endpoints=ENDPOINTS).remove(PHONE, reason=RemovalReason.OPT_OUT.value)
-    assert http.calls == [("POST", "/dnc", {"phone": PHONE})]
+    adapter = BatchDialerAdapter(http=http, endpoints=ENDPOINTS, contact_ids=lambda phone: ["77", "78"])
+    adapter.remove(PHONE, reason=RemovalReason.OPT_OUT.value)
+    assert [(c[0], c[1]) for c in http.calls] == [("DELETE", "/contact/77"), ("DELETE", "/contact/78")]
+
+
+def test_an_opt_out_for_a_number_never_loaded_calls_nothing():
+    http = FakeHttp()
+    BatchDialerAdapter(http=http, endpoints=ENDPOINTS, contact_ids=lambda phone: []).remove(
+        PHONE, reason=RemovalReason.OPT_OUT.value)
+    assert http.calls == []
 
 
 @pytest.mark.parametrize("reason", [RemovalReason.CALL_WINDOW.value, RemovalReason.ATTEMPT_CAP.value])
@@ -242,3 +251,12 @@ def test_an_unconfirmed_campaign_removal_keeps_the_hold_pending_not_a_dnc_fallba
         BatchDialerAdapter(http=http, endpoints={**ENDPOINTS, "campaign_remove": None}).remove(
             PHONE, reason=RemovalReason.CALL_WINDOW.value)
     assert http.calls == []
+
+
+def test_an_opt_out_for_a_contact_already_deleted_still_completes():
+    from src.lending.dialer_port import DialerRequestError
+
+    def http(method, path, *, json=None):
+        raise DialerRequestError("gone", status=404)
+    BatchDialerAdapter(http=http, endpoints=ENDPOINTS, contact_ids=lambda p: ["77"]).remove(
+        PHONE, reason=RemovalReason.OPT_OUT.value)

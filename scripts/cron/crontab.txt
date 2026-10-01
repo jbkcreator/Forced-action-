@@ -1187,6 +1187,10 @@ COUNTY_ID=hillsborough
 # Dry check first: PYTHONPATH=. python -m src.lending.weekly_scrub --dry-run
 0 6 * * 1 $PROJECT/scripts/cron/run.sh src.lending.weekly_scrub --max-credits 1000
 
+# Lending GHL opt-out backstop: every GHL contact with do-not-disturb on is suppressed in
+# lending, in case the GHL "DND changed" workflow webhook is missing or down. Idempotent.
+*/15 * * * * $PROJECT/scripts/cron/run.sh src.lending.ghl_dnd_backstop
+
 # OFR mortgage-broker refresh (WP-W0-1 Pool 3) — MONTHLY.
 # OFR publishes the MBR-MBRB file monthly; this downloads + unzips + loads it
 # into ofr_mortgage_brokers (Pool 3's source). Runs 1st of month 05:00 UTC,

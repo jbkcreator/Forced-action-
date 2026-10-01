@@ -20,6 +20,14 @@ POOL_CAMPAIGN_TAGS: dict[str, str] = {
     "nurture": "Nurture",  # Lists 2/4: dialed for data, never bookable
 }
 
+# Hook line per campaign, shown on the caller's card. Seeded from the client's voicemail
+# scripts (2026-10-01) until the playbook's per-campaign hooks arrive.
+CAMPAIGN_HOOKS: dict[str, str] = {
+    "Verified maturity": "It looks like the loan on it is coming up; we help investors get ahead of that.",
+    "Transaction ready": "Saw you picked up the property; we can help fund your next deal.",
+    "Builders": "Saw your project; we fund builders and investors in your county.",
+}
+
 
 # BatchDialer (client decision, Go Live Brief 2.4). Auth header X-ApiKey. Each endpoint
 # stays unset until confirmed with a write test on a test campaign (E1);
@@ -37,6 +45,8 @@ BATCHDIALER_ENDPOINTS: dict[str, "tuple[str, str] | None"] = {
     "campaign_remove": None,
     "campaign_restore": None,
     "dnc_add": None,
+    # Opt-outs delete the contact (no DNC endpoint in the public API). Confirmed live 2026-09-30.
+    "contact_delete": ("DELETE", "/contact/{id}"),
 }
 # Path discovery (read-only, 2026-09-30): GET-405 (exists, other method) on /contact,
 # /dnclist, /campaigns/search; GET-200 on /cdrs (call records, paged) and /lists.

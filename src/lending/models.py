@@ -87,6 +87,7 @@ class LendingOptOutEvent(LendingBase):
     sms_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     email_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     dialer_removed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    ghl_dnd_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # GHL do-not-disturb set
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending", server_default="pending")  # OptOutStatus
     fa_table: Mapped[Optional[str]] = mapped_column(String(20))  # sms_opt_outs / email_opt_outs (poller origin)
     fa_row_id: Mapped[Optional[int]] = mapped_column(Integer)

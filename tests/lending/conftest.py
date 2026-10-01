@@ -16,3 +16,10 @@ def _src_logs_reach_caplog():
     src.propagate, src.level = True, logging.NOTSET
     yield
     src.propagate, src.level = saved
+
+
+@pytest.fixture(autouse=True)
+def _no_live_ghl(monkeypatch):
+    """The shared DB holds real opt-outs: a test poll must never write them to the real GHL
+    account. Tests that cover the GHL sync pass their own ``ghl_dnd``."""
+    monkeypatch.setattr("src.lending.ghl_dnd.get_ghl_dnd", lambda: None)

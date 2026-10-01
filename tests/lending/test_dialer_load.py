@@ -86,14 +86,15 @@ def _record(ref, phone, pool="builders", **extra):
 NOON_ET = __import__("datetime").datetime(2026, 9, 29, 16, 0, tzinfo=__import__("datetime").timezone.utc)
 
 
-def _run(db, records, *, index=EMPTY_INDEX, dry_run=False, aircall=None, tags=TAGS, run_id="run-1", now=NOON_ET):
+def _run(db, records, *, index=EMPTY_INDEX, dry_run=False, aircall=None, tags=TAGS, run_id="run-1", now=NOON_ET,
+         backflip_check=True):
     aircall = aircall if aircall is not None else FakeAircall()
     with patch.object(dialer_load, "load_backflip_identifier_index", return_value=index):
         report = run_dialer_load(
             records, db, run_id=run_id, dry_run=dry_run,
             scrubber=None if dry_run else (lambda phones: []),
             dialer=None if dry_run else aircall,
-            campaign_tags=tags, commit=db.flush, now=now,
+            campaign_tags=tags, commit=db.flush, now=now, backflip_check=backflip_check,
         )
     return report, aircall
 
@@ -136,6 +137,16 @@ class TestDryRun:
         report, _ = _run(db, records, dry_run=True)
         assert report.unmapped_pools == ["brokers"]
         assert report.duplicate_phones == 1
+
+
+class TestBackflipCheckOff:
+    def test_stale_backflip_feed_does_not_block_the_load_when_the_check_is_off(self, db):
+        _fresh_scrub(db, P1, P2)
+        stale = BackflipIdentifierIndex(block_reason="BACKFLIP_FEED_STALE")
+        report, aircall = _run(db, [_record("a", P1), _record("b", P2)], index=stale, backflip_check=False)
+        assert aircall.upserts == [P1, P2]
+        assert "BACKFLIP_FEED_STALE" not in report.excluded_by_reason
+        assert report.as_dict()["backflip_check"] is False
 
 
 class TestLiveLoad:
