@@ -16,11 +16,16 @@ from dataclasses import fields
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import text as sa_text
 
-from src.lending.lead_scoring import LeadScore, LeadSignals
+from src.lending.lead_facts import load_lead_facts
+from src.lending.lead_scoring import LeadScore, LeadSignals, score_lead
 from src.services.phone_utils import normalize as normalize_phone
+
+# Scoring dates (the 90-day maturity window) follow the callers' Eastern calendar day.
+LENDING_TIMEZONE = ZoneInfo("America/New_York")
 
 
 def _jsonable(value: Any) -> Any:
@@ -87,3 +92,54 @@ def record_first_contact(
         },
     )
     return result.rowcount == 1
+
+
+def has_first_contact(session, phone: str) -> bool:
+    """Whether a snapshot already exists for this phone."""
+    normalized = normalize_phone(phone)
+    if not normalized:
+        return False
+    return session.execute(
+        sa_text("SELECT 1 FROM lending.first_contact_snapshots WHERE phone = :phone"),
+        {"phone": normalized},
+    ).first() is not None
+
+
+def snapshot_first_contact(
+    session,
+    *,
+    phone: str,
+    property_id: Optional[int],
+    contacted_at: datetime,
+    caller_seat: Optional[str],
+    script_version: Optional[str],
+    source_tag: Optional[str],
+    queue: Optional[str],
+    warm: bool,
+) -> bool:
+    """Score the lead as it stands now and snapshot it, once per phone.
+
+    The single call the call-record intake makes for every call: later calls to
+    the same phone return False after one indexed lookup, without loading facts.
+    A call with no resolvable property is still snapshotted with every input
+    missing, so the first contact is never lost. Does not commit.
+    """
+    if has_first_contact(session, phone):
+        return False
+    if contacted_at.tzinfo is None:
+        raise ValueError("contacted_at must be timezone-aware")
+    today = contacted_at.astimezone(LENDING_TIMEZONE).date()
+    facts = load_lead_facts(session, [property_id], today=today).get(property_id) if property_id else None
+    signals = facts.signals if facts else LeadSignals()
+    return record_first_contact(
+        session,
+        phone=phone,
+        contacted_at=contacted_at,
+        caller_seat=caller_seat,
+        script_version=script_version,
+        source_tag=source_tag,
+        queue=queue,
+        warm=warm,
+        signals=signals,
+        score=score_lead(signals, today=today),
+    )
