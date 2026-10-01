@@ -234,6 +234,7 @@ class LendingCallDisposition(LendingBase):
     queue: Mapped[Optional[str]] = mapped_column(String(30))
     source_tag: Mapped[Optional[str]] = mapped_column(String(40))
     seat_group: Mapped[Optional[str]] = mapped_column(String(10))
+    consent_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # last on-call "yes" read
 
     __table_args__ = (
         Index("idx_lending_call_dispositions_phone_ended", "phone", "call_ended_at"),
@@ -271,6 +272,22 @@ class LendingMissedCallEvent(LendingBase):
         Index("uq_lending_missed_call_phone_day", "phone", "event_date_et", unique=True, postgresql_where=text("status <> 'duplicate_day'")),
         Index("idx_lending_missed_call_events_pending", "created_at", postgresql_where=text("status = 'pending'")),
     )
+
+
+class LendingTextConsent(LendingBase):
+    """Evidence that a number agreed to automated texts (client Q27). Revoked rows never gate-pass."""
+
+    __tablename__ = "text_consents"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    phone: Mapped[str] = mapped_column(String(20), nullable=False)  # phone_utils.normalize
+    source: Mapped[str] = mapped_column(String(20), nullable=False)  # inbound_call / inbound_text / web_form / on_call_yes
+    call_id: Mapped[Optional[str]] = mapped_column(String(100))
+    captured_by: Mapped[Optional[str]] = mapped_column(String(200))  # caller name for on_call_yes
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (Index("uq_lending_text_consents_phone_source", "phone", "source", unique=True),)
 
 
 class LendingMissedCallText(LendingBase):

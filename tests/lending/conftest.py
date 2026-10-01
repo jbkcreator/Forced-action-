@@ -12,6 +12,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
 from migrations.apply_lending_call_dispositions_dialer import apply_to
+from migrations.apply_lending_pr319_client_feedback import apply_to as apply_to_feedback
 from src.lending.models import LENDING_SCHEMA, LendingCallDisposition
 
 
@@ -33,6 +34,7 @@ def lending_db():
     conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{LENDING_SCHEMA}"'))
     LendingCallDisposition.__table__.create(bind=conn, checkfirst=True)
     apply_to(conn)  # DDL is transactional: the vendor-neutral migration is rolled back with the test
+    apply_to_feedback(conn)
     session = Session(bind=conn, join_transaction_mode="create_savepoint")
     yield session
     session.close()

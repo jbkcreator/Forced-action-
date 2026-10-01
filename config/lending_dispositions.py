@@ -120,3 +120,8 @@ def validate_dispositions_config() -> None:
         raise ValueError("DEFAULT_CAUSE uses a value outside CAUSE_TAGS")
     if not {BOOKED_CODE, DNC_CODE} <= codes:
         raise ValueError("BOOKED and DNC_REQUEST must be in DISPOSITIONS")
+
+
+# BatchDialer contact custom field the caller sets during the call ("OK if I text you?" -> yes).
+TEXT_CONSENT_FIELD = "text_consent"
+TEXT_CONSENT_YES = "yes"

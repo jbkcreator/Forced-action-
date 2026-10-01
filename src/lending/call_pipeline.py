@@ -6,12 +6,12 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from typing import Callable
+from typing import Callable, Optional
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from config.lending_dispositions import DNC_CODE
+from config.lending_dispositions import DNC_CODE, TEXT_CONSENT_FIELD, TEXT_CONSENT_YES
 from config.settings import get_settings
 from src.lending.compliance import on_attempt_recorded, propagate_opt_out
 from src.lending.disposition_delivery import (
@@ -20,9 +20,13 @@ from src.lending.disposition_delivery import (
     alert_unpropagated_dnc,
     deliver_disposition,
 )
+from src.lending.consent import record_consent
+from src.lending.dialer_port import get_dialer
 from src.lending.dispositions import DialerCallEvent, RecordedCall, record_dialer_event
 
 logger = logging.getLogger(__name__)
+
+CONSENT_CHECK_WINDOW_SECONDS = 2 * 60 * 60
 
 
 def lending_campaign_ids() -> frozenset[str]:
@@ -42,9 +46,45 @@ def _propagate_dnc(db: Session, *, row_id, phone: str, call_id: str, seat) -> bo
     ).scalar() == "dialer_pending")
 
 
-def process_event(db: Session, ev: DialerCallEvent) -> RecordedCall:
+def capture_consent(db: Session, ev: DialerCallEvent, row_phone: Optional[str], caller_name: Optional[str], dialer) -> None:
+    """Answered inbound call = consent; outbound = the caller-set ``text_consent`` contact field."""
+    if not row_phone:
+        return
+    if ev.direction == "inbound" and (ev.duration or 0) > 0:
+        record_consent(db, row_phone, "inbound_call", call_id=ev.call_id)
+        return
+    if ev.direction == "outbound" and ev.contact_id and dialer is not None:
+        try:
+            fields = dialer.get_contact_customfields(ev.contact_id)
+        except Exception as exc:  # class only: the message may carry request detail
+            logger.warning("[lending] call %s: could not read contact custom fields: %s", ev.call_id, type(exc).__name__)
+            return
+        if str(fields.get(TEXT_CONSENT_FIELD, "")).strip().lower() == TEXT_CONSENT_YES:
+            record_consent(db, row_phone, "on_call_yes", call_id=ev.call_id, captured_by=caller_name)
+
+
+def _check_consent(db: Session, ev: DialerCallEvent, row_id: int, dialer) -> None:
+    """Once per connected, recently ended call, and again when a disposition lands after the last check
+    (callers often set the field during wrap-up, after the hang-up)."""
+    row = db.execute(
+        text("SELECT phone, caller_name, direction, dialer_contact_id, talk_duration_sec "
+             "FROM lending.call_dispositions WHERE id = :id AND talk_duration_sec > 0 "
+             "AND call_ended_at > now() - make_interval(secs => :window) "
+             "AND (consent_checked_at IS NULL OR consent_checked_at < disposition_at)"),
+        {"id": row_id, "window": CONSENT_CHECK_WINDOW_SECONDS},
+    ).first()
+    if row is None:
+        return
+    phone, caller_name, direction, contact_id, duration = row
+    capture_consent(db, dataclasses.replace(ev, direction=direction, contact_id=contact_id, duration=duration),
+                    phone, caller_name, dialer)
+    db.execute(text("UPDATE lending.call_dispositions SET consent_checked_at = now() WHERE id = :id"), {"id": row_id})
+
+
+def process_event(db: Session, ev: DialerCallEvent, dialer=None) -> RecordedCall:
     recorded = record_dialer_event(db, ev)
     db.commit()
+    _check_consent(db, ev, recorded.row_id, dialer if dialer is not None else get_dialer())
 
     if recorded.call_ended and recorded.phone and ev.direction != "inbound":
         on_attempt_recorded(db, recorded.phone)

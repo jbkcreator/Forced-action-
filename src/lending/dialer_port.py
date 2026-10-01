@@ -40,6 +40,7 @@ class DialerContactFields:
     company_name: Optional[str] = None
     information: Optional[str] = None
     email: Optional[str] = None
+    customfields: Optional[Mapping[str, str]] = None  # merged over what the dialer already holds
 
 
 @dataclass(frozen=True)
@@ -64,6 +65,7 @@ class Dialer(Protocol):
     def upsert_contact(self, record: Mapping[str, Any]) -> Optional[str]: ...
     def remove(self, phone: str, *, reason: str) -> None: ...
     def restore(self, phone: str) -> None: ...
+    def get_contact_customfields(self, contact_id: Any) -> dict: ...
 
 
 class InMemoryDialer:
@@ -82,6 +84,9 @@ class InMemoryDialer:
     def restore(self, phone: str) -> None:
         self.events.append(("restore", phone, None))
 
+    def get_contact_customfields(self, contact_id: Any) -> dict:
+        return {}
+
 
 class BatchDialerAdapter:
     def __init__(self, *, http: Http, endpoints: Mapping[str, Endpoint] = BATCHDIALER_ENDPOINTS) -> None:
@@ -94,7 +99,7 @@ class BatchDialerAdapter:
         if endpoint is None:
             raise UnconfirmedCapability(f"BatchDialer endpoint '{action}' is not confirmed")
         method, path = endpoint
-        return self._http(method, path.format(**path_params), json=payload)
+        return self._http(method, path.format(**path_params), json=None if method == "GET" else payload)
 
     def missing_for_load(self) -> list[str]:
         """Load endpoints still unconfirmed; a live load refuses while any is missing."""
@@ -139,8 +144,17 @@ class BatchDialerAdapter:
         return ContactUpsertResult(contact_id=contact_id, created=True)
 
     def update_contact(self, contact_id: Any, fields: DialerContactFields, *, phone: Optional[str] = None) -> dict:
-        """Full update (PUT): BatchDialer replaces every field, so the phone is sent again."""
-        return dict(self._call("contact_update", _contact_body(phone, fields), id=contact_id))
+        """Full update (PUT): BatchDialer replaces every field it is not sent, so the phone is sent
+        again and the stored custom fields (text_consent, anything a caller set) are read first and
+        merged. If that read fails nothing is sent."""
+        existing = self.get_contact_customfields(contact_id)
+        body = _contact_body(phone, fields)
+        body["customfields"] = {**existing, **body["customfields"], **(fields.customfields or {})}
+        return dict(self._call("contact_update", body, id=contact_id))
+
+    def get_contact_customfields(self, contact_id: Any) -> dict:
+        body = self._call("contact_get", {}, id=contact_id)
+        return dict((body or {}).get("customfields") or {})
 
     def _campaign_id(self, name: str) -> Any:
         if self._campaign_ids is None:

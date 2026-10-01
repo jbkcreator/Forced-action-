@@ -185,3 +185,81 @@ def test_every_listed_code_is_stored_with_its_cause_default_and_only_unanswered_
         assert version == cfg.DISPOSITION_LIST_VERSION
     queued = lending_db.execute(text("SELECT count(*) FROM lending.missed_call_events WHERE status = 'pending'")).scalar()
     assert queued == len(cfg.UNANSWERED_CODES)
+
+
+# ── Text-consent capture (client Q27) ──
+
+from src.lending.call_pipeline import process_event
+from src.lending.consent import has_text_consent
+from src.lending.dialer_port import DialerRequestError
+
+
+class ConsentDialer:
+    def __init__(self, fields=None, error=None):
+        self.fields, self.error, self.reads = fields or {}, error, []
+
+    def get_contact_customfields(self, contact_id):
+        self.reads.append(contact_id)
+        if self.error:
+            raise self.error
+        return self.fields
+
+
+def _live(call_id="k1", **over):
+    """An event that ended a minute ago (consent is only checked for recent calls)."""
+    now = datetime.now(timezone.utc)
+    return _ev(call_id=call_id, contact_id="9", started_at=now - timedelta(minutes=3),
+               ended_at=now - timedelta(minutes=1), **over)
+
+
+def _consent_sources(db):
+    return db.execute(text("SELECT source, captured_by FROM lending.text_consents")).all()
+
+
+def test_answered_inbound_call_counts_as_text_consent(lending_db):
+    process_event(lending_db, _live(direction="inbound"), dialer=ConsentDialer())
+    assert has_text_consent(lending_db, PHONE) is True
+    assert _consent_sources(lending_db) == [("inbound_call", None)]
+
+
+def test_on_call_yes_is_stored_with_the_caller_name(lending_db):
+    dialer = ConsentDialer({"text_consent": " Yes "})
+    process_event(lending_db, _live(), dialer=dialer)
+    assert _consent_sources(lending_db) == [("on_call_yes", "Sam")]
+    assert dialer.reads == ["9"]
+
+
+@pytest.mark.parametrize("fields", [{"text_consent": "no"}, {}])
+def test_no_or_missing_field_stores_nothing(lending_db, fields):
+    process_event(lending_db, _live(), dialer=ConsentDialer(fields))
+    assert _consent_sources(lending_db) == []
+
+
+def test_dialer_error_stores_nothing_and_does_not_raise(lending_db):
+    process_event(lending_db, _live(), dialer=ConsentDialer(error=DialerRequestError("down")))
+    assert _consent_sources(lending_db) == []
+
+
+def test_unanswered_call_never_reads_the_dialer(lending_db):
+    dialer = ConsentDialer({"text_consent": "yes"})
+    process_event(lending_db, _live(duration=0), dialer=dialer)
+    assert dialer.reads == [] and _consent_sources(lending_db) == []
+
+
+def test_rescan_does_not_reread_but_a_later_disposition_does(lending_db):
+    dialer = ConsentDialer({"text_consent": "no"})
+    process_event(lending_db, _live(), dialer=dialer)
+    process_event(lending_db, _live(), dialer=dialer)
+    assert len(dialer.reads) == 1
+    lending_db.execute(text("UPDATE lending.call_dispositions SET consent_checked_at = now() - interval '1 minute'"))
+    process_event(lending_db, _live(disposition_raw="CALLBACK_REQUESTED"), dialer=dialer)
+    assert len(dialer.reads) == 2
+    process_event(lending_db, _live(disposition_raw="CALLBACK_REQUESTED"), dialer=dialer)
+    assert len(dialer.reads) == 2
+
+
+def test_calls_that_ended_over_two_hours_ago_are_not_checked(lending_db):
+    dialer = ConsentDialer({"text_consent": "yes"})
+    old = datetime.now(timezone.utc) - timedelta(hours=3)
+    process_event(lending_db, _ev(call_id="old", contact_id="9", started_at=old - timedelta(minutes=2), ended_at=old), dialer=dialer)
+    assert dialer.reads == []
