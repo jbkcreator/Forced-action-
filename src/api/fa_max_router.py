@@ -28,6 +28,10 @@ router = APIRouter(prefix="/api/fa-max", tags=["fa-max"])
 class GateSubmission(BaseModel):
     tracked_link_id: int
     liquidity_source: str = Field(description="cash | loc | partner | none")
+    liquidity_amount: Optional[str] = Field(
+        default=None,
+        description="Caller-reported rough amount (brief p.1) — free text, not validated, never gates the booking on its own.",
+    )
     completed_projects: str = Field(description="0 | 1_to_2 | 3_plus")
     exit_strategy: str = Field(description="sale | refinance | other")
     occupancy: str = Field(description="investment | homestead")
@@ -56,6 +60,7 @@ def submit_gate(
 
     answers = GateAnswers(
         liquidity_source=payload.liquidity_source,
+        liquidity_amount=payload.liquidity_amount,
         completed_projects=payload.completed_projects,
         exit_strategy=payload.exit_strategy,
         occupancy=payload.occupancy,

@@ -44,7 +44,14 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class GateAnswers:
-    """Typed, code-only representation of a caller's gate form answers."""
+    """Typed, code-only representation of a caller's gate form answers.
+
+    liquidity_amount is the brief's "rough amount" (p.1) — a caller-reported
+    ballpark, not a verified figure. No format is specified, so it is stored
+    as free-form text and is not validated or gated on; it never fails the
+    gate on its own. Optional so existing callers of this dataclass are
+    unaffected.
+    """
 
     liquidity_source: str
     completed_projects: str
@@ -52,6 +59,7 @@ class GateAnswers:
     occupancy: str
     decision_maker: str
     property_address: str
+    liquidity_amount: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -115,10 +123,12 @@ def store_gate(
     result = evaluate_gate(answers)
     gate_id = secrets.token_urlsafe(16)
 
-    # Store codes only — property_address is the one free-text field but it
-    # is stored in answers JSONB on the gate table only, never in relay payload.
+    # Store codes only — property_address and liquidity_amount are the two
+    # free-text fields, and both live in answers JSONB on the gate table
+    # only, never in relay payload.
     answers_dict = {
         "liquidity_source": answers.liquidity_source,
+        "liquidity_amount": answers.liquidity_amount,
         "completed_projects": answers.completed_projects,
         "exit_strategy": answers.exit_strategy,
         "occupancy": answers.occupancy,

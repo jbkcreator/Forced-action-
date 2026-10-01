@@ -100,6 +100,13 @@ class TestEvaluateGatePass:
         result = evaluate_gate(_passing_answers(occupancy="investment"))
         assert result.passed is True
 
+    def test_liquidity_amount_is_optional_and_never_gates(self):
+        """Brief p.1 asks for "rough amount" alongside type — it is captured
+        but has no kill condition and is unvalidated free text."""
+        assert evaluate_gate(_passing_answers()).passed is True
+        assert evaluate_gate(_passing_answers(liquidity_amount="150k")).passed is True
+        assert evaluate_gate(_passing_answers(liquidity_amount="")).passed is True
+
 
 class TestEvaluateGateKillConditions:
     def test_no_liquidity_is_killed(self):
