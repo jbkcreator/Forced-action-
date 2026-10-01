@@ -155,3 +155,34 @@ class TestWrapperConversion:
             settings.return_value.fa_max_calendar_mode = "stage"
             with pytest.raises(ValueError, match="Unknown FA_MAX_CALENDAR_MODE"):
                 get_calendar_client()
+
+    def test_ghl_mode_builds_the_ghl_client_not_the_fake(self):
+        from src.services.calendar.client import get_calendar_client
+        from src.services.calendar.fakes import FakeCalendar
+
+        with patch("config.settings.get_settings") as settings, patch(
+            "src.services.calendar.ghl_client.GHLCalendarClient.from_settings"
+        ) as from_settings:
+            settings.return_value.fa_max_calendar_mode = "ghl"
+            client = get_calendar_client()
+
+        from_settings.assert_called_once()
+        assert not isinstance(client, FakeCalendar)
+
+    def test_ghl_mode_reads_the_ghl_calendar_id_not_the_google_one(self):
+        from src.services.calendar.client import get_calendar_id
+
+        with patch("config.settings.get_settings") as settings:
+            settings.return_value.fa_max_calendar_mode = "ghl"
+            settings.return_value.fa_max_ghl_calendar_id = "ghl_cal_1"
+            settings.return_value.fa_max_calendar_id = "google_cal_1"
+            assert get_calendar_id() == "ghl_cal_1"
+
+    def test_ghl_mode_without_ghl_calendar_id_raises(self):
+        from src.services.calendar.client import get_calendar_id
+
+        with patch("config.settings.get_settings") as settings:
+            settings.return_value.fa_max_calendar_mode = "ghl"
+            settings.return_value.fa_max_ghl_calendar_id = None
+            with pytest.raises(ValueError, match="FA_MAX_GHL_CALENDAR_ID"):
+                get_calendar_id()

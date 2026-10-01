@@ -95,8 +95,14 @@ def get_calendar_client() -> CalendarClient:
         from src.services.calendar.google_client import GoogleCalendarClient
 
         return GoogleCalendarClient.from_settings()
+    if mode == "ghl":
+        from src.services.calendar.ghl_client import GHLCalendarClient
+
+        return GHLCalendarClient.from_settings()
     if mode != "fake":
-        raise ValueError(f"Unknown FA_MAX_CALENDAR_MODE {mode!r} — expected 'fake' or 'live'")
+        raise ValueError(
+            f"Unknown FA_MAX_CALENDAR_MODE {mode!r} — expected 'fake', 'live' or 'ghl'"
+        )
 
     from src.services.calendar.fakes import FakeCalendar
 
@@ -113,10 +119,23 @@ def reset_calendar_client() -> None:
 
 
 def get_calendar_id() -> str:
-    """The calendar bookings are written to."""
+    """The calendar bookings are written to.
+
+    "ghl" mode reads a separate id — FA_MAX_CALENDAR_ID and
+    FA_MAX_GHL_CALENDAR_ID name calendars in two different systems, and a
+    stale Google id left over from "live" mode must never silently get
+    passed to the GHL client.
+    """
     from config.settings import get_settings
 
-    calendar_id = get_settings().fa_max_calendar_id
+    settings = get_settings()
+    if settings.fa_max_calendar_mode == "ghl":
+        calendar_id = settings.fa_max_ghl_calendar_id
+        if not calendar_id:
+            raise ValueError("FA_MAX_GHL_CALENDAR_ID is not set")
+        return calendar_id
+
+    calendar_id = settings.fa_max_calendar_id
     if not calendar_id:
         raise ValueError("FA_MAX_CALENDAR_ID is not set")
     return calendar_id
