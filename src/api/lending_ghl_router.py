@@ -30,8 +30,7 @@ def _verify_secret(received: Optional[str]) -> None:
     secret = get_settings().lending_ghl_webhook_secret
     if secret is None:
         raise HTTPException(status_code=503, detail="GHL opt-out webhook is not configured")
-    expected = secret.get_secret_value() if hasattr(secret, "get_secret_value") else str(secret)
-    if not received or not hmac.compare_digest(received, expected):
+    if not received or not hmac.compare_digest(received, secret.get_secret_value()):
         raise HTTPException(status_code=401, detail="Invalid webhook secret")
 
 
