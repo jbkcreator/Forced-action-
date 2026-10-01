@@ -70,6 +70,8 @@ LIVE_CONVERSATION_CODES = frozenset({
 })
 GATED_CODES = frozenset({"BOOKED", "GATE_FAILED_NURTURE"})  # proxy for "all four captures"
 NURTURE_SENT_CODES = frozenset({"GATE_FAILED_NURTURE"})
+# GHL pipeline stage names (lower-cased) that count as "showed": the client moves a lead there once the held call happens.
+SHOWED_STAGE_KEYS = frozenset({"held", "showed"})
 
 # Sheet columns. Held / Gate Passed / Packet are added when WP-GL-5/6 write them.
 SHEET_COLUMNS = (
