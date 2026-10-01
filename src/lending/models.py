@@ -295,6 +295,28 @@ class LendingTextConsent(LendingBase):
     __table_args__ = (Index("uq_lending_text_consents_phone_source", "phone", "source", unique=True),)
 
 
+class LendingGhlStageEvent(LendingBase):
+    """A GHL opportunity entering a pipeline stage (workflow webhook). One row per opportunity + stage:
+    a redelivered webhook is a no-op, so the scoreboard counts each stage entry once."""
+
+    __tablename__ = "ghl_stage_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    ghl_opportunity_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    pipeline_id: Mapped[Optional[str]] = mapped_column(String(100))
+    stage_name: Mapped[str] = mapped_column(String(100), nullable=False)  # as GHL sent it
+    stage_key: Mapped[str] = mapped_column(String(100), nullable=False)  # lower-cased, for matching config
+    phone: Mapped[Optional[str]] = mapped_column(String(20))  # phone_utils.normalize
+    booked_by: Mapped[Optional[str]] = mapped_column(String(200))  # fallback when no BOOKED call matches the phone
+    event_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    raw_event: Mapped[dict] = mapped_column(JSONB, nullable=False)
+
+    __table_args__ = (
+        Index("uq_lending_ghl_stage_events_opp_stage", "ghl_opportunity_id", "stage_key", unique=True),
+        Index("idx_lending_ghl_stage_events_stage_at", "stage_key", "event_at"),
+    )
+
+
 class LendingMissedCallText(LendingBase):
     """One decision per unanswered call for the missed-call text (WP-GL-9): sent or why not."""
 

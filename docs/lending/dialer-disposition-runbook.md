@@ -145,3 +145,10 @@ All 13 results exist in BatchDialer (group "Lending", created). Only the three b
 6. A connected call with no disposition after N minutes raises one Slack warning.
 7. The poller logs `processed=N` within 20 s of a test call, and the call row appears; a non-lending campaign is ignored.
 8. `pytest tests/lending/`.
+
+## GHL "showed" feed for the 7pm scoreboard
+
+1. Run `PYTHONPATH=. python migrations/apply_lending_ghl_stage_events.py` (idempotent), and set `LENDING_GHL_WEBHOOK_SECRET` and `LENDING_DAILY_CHANNEL` in `.env`.
+2. In GHL (sub-account): Automation -> Workflows -> new workflow, trigger **Pipeline Stage Changed** on the booked pipeline (stage = the held / showed stage; names matched case-insensitively against `SHOWED_STAGE_KEYS` in `config/lending_dispositions.py`).
+3. Action **Webhook** (POST) to `https://<api host>/webhooks/lending/ghl-stage` with header `X-Webhook-Secret: <the secret>` and JSON body: `opportunity_id` (`{{opportunity.id}}`), `stage_name` (`{{opportunity.pipleline_stage_name}}`), `pipeline_id`, `phone` (`{{contact.phone}}`), optional `booked_by` (the "Booked by" custom field). Use the GHL merge-field picker for the exact variable names.
+4. Showed is credited to the caller / campaign of the latest BOOKED call to that phone; `booked_by` is only the fallback. A repeat delivery of the same opportunity + stage counts once.
