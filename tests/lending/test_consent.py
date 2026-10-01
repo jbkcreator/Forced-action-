@@ -32,3 +32,9 @@ def test_suppressed_or_do_not_contact_number_never_has_consent(lending_db):
 def test_unknown_source_is_rejected(lending_db):
     with pytest.raises(ValueError):
         record_consent(lending_db, PHONE, "cold_list")
+
+
+def test_do_not_contact_flag_blocks_consent(lending_db):
+    record_consent(lending_db, PHONE, "on_call_yes")
+    lending_db.execute(text("INSERT INTO lending.contacts (phone, do_not_contact) VALUES (:p, true)"), {"p": PHONE})
+    assert has_text_consent(lending_db, PHONE) is False

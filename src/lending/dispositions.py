@@ -306,14 +306,14 @@ def record_dialer_event(db, ev: DialerCallEvent) -> RecordedCall:
                 unknown_code = ev.disposition_raw
                 logger.warning("[lending] call %s: unknown disposition code %r", ev.call_id, ev.disposition_raw)
             db.execute(
-                text("UPDATE lending.call_dispositions SET disposition_raw = :raw, disposition_at = now() WHERE id = :id"),
+                text("UPDATE lending.call_dispositions SET disposition_raw = :raw, disposition_at = clock_timestamp() WHERE id = :id"),
                 {"raw": ev.disposition_raw, "id": row["id"]},
             )
         elif code is not None and code != disposition:
             cause = DEFAULT_CAUSE.get(code or "") if not row["unfunded_cause"] else None
             db.execute(
                 text("UPDATE lending.call_dispositions SET disposition = :d, disposition_raw = :raw, "
-                     "disposition_at = now(), disposition_list_version = :v, "
+                     "disposition_at = clock_timestamp(), disposition_list_version = :v, "
                      "unfunded_cause = COALESCE(unfunded_cause, :cause), "
                      "unfunded_cause_provisional = CASE WHEN :cause IS NOT NULL THEN true ELSE unfunded_cause_provisional END "
                      "WHERE id = :id"),

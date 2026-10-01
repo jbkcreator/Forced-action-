@@ -27,6 +27,7 @@ POOL_CAMPAIGN_TAGS: dict[str, str] = {
 # Confirmed 2026-09-30 with the client key (GET /campaigns, /contacts, /cdrs, /lists -> 200).
 BATCHDIALER_BASE_URL: str = "https://app.batchdialer.com/api"
 BATCHDIALER_TIMEOUT_SECONDS: float = 20.0
+BATCHDIALER_QUICK_TIMEOUT_SECONDS: float = 5.0  # single attempt, no retry: the on-call consent read
 BATCHDIALER_ENDPOINTS: dict[str, "tuple[str, str] | None"] = {
     # Confirmed live 2026-09-30: create/read/update/delete on a test contact.
     "contact_upsert": ("POST", "/contact"),

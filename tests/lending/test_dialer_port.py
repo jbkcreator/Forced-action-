@@ -255,7 +255,7 @@ class ContactHttp:
     def __init__(self, customfields=None, get_error=None):
         self.calls, self.customfields, self.get_error = [], customfields or {}, get_error
 
-    def __call__(self, method, path, *, json=None):
+    def __call__(self, method, path, *, json=None, quick=False):
         self.calls.append((method, path, json))
         if method == "GET":
             if self.get_error:
@@ -297,3 +297,11 @@ def test_update_raises_instead_of_wiping_when_the_read_fails():
 
 def test_in_memory_dialer_returns_empty_customfields():
     assert InMemoryDialer().get_contact_customfields(7) == {}
+
+
+def test_update_with_unconfigured_endpoint_raises_without_reading():
+    http = ContactHttp()
+    adapter = BatchDialerAdapter(http=http, endpoints={**ENDPOINTS, "contact_update": None})
+    with pytest.raises(UnconfirmedCapability):
+        adapter.update_contact(7, DialerContactFields())
+    assert http.calls == []

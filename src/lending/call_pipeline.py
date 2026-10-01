@@ -46,26 +46,28 @@ def _propagate_dnc(db: Session, *, row_id, phone: str, call_id: str, seat) -> bo
     ).scalar() == "dialer_pending")
 
 
-def capture_consent(db: Session, ev: DialerCallEvent, row_phone: Optional[str], caller_name: Optional[str], dialer) -> None:
-    """Answered inbound call = consent; outbound = the caller-set ``text_consent`` contact field."""
+def capture_consent(db: Session, ev: DialerCallEvent, row_phone: Optional[str], caller_name: Optional[str], dialer) -> bool:
+    """Answered inbound call = consent; outbound = the caller-set ``text_consent`` contact field.
+    Returns False only when the dialer read failed, so the caller can retry instead of marking it checked."""
     if not row_phone:
-        return
+        return True
     if ev.direction == "inbound" and (ev.duration or 0) > 0:
         record_consent(db, row_phone, "inbound_call", call_id=ev.call_id)
-        return
+        return True
     if ev.direction == "outbound" and ev.contact_id and dialer is not None:
         try:
-            fields = dialer.get_contact_customfields(ev.contact_id)
+            fields = dialer.get_contact_customfields(ev.contact_id, quick=True)
         except Exception as exc:  # class only: the message may carry request detail
             logger.warning("[lending] call %s: could not read contact custom fields: %s", ev.call_id, type(exc).__name__)
-            return
+            return False
         if str(fields.get(TEXT_CONSENT_FIELD, "")).strip().lower() == TEXT_CONSENT_YES:
             record_consent(db, row_phone, "on_call_yes", call_id=ev.call_id, captured_by=caller_name)
+    return True
 
 
 def _check_consent(db: Session, ev: DialerCallEvent, row_id: int, dialer) -> None:
     """Once per connected, recently ended call, and again when a disposition lands after the last check
-    (callers often set the field during wrap-up, after the hang-up)."""
+    (callers often set the field during wrap-up, after the hang-up). A failed dialer read is not stamped."""
     row = db.execute(
         text("SELECT phone, caller_name, direction, dialer_contact_id, talk_duration_sec "
              "FROM lending.call_dispositions WHERE id = :id AND talk_duration_sec > 0 "
@@ -76,15 +78,23 @@ def _check_consent(db: Session, ev: DialerCallEvent, row_id: int, dialer) -> Non
     if row is None:
         return
     phone, caller_name, direction, contact_id, duration = row
-    capture_consent(db, dataclasses.replace(ev, direction=direction, contact_id=contact_id, duration=duration),
-                    phone, caller_name, dialer)
-    db.execute(text("UPDATE lending.call_dispositions SET consent_checked_at = now() WHERE id = :id"), {"id": row_id})
+    if dialer is None:
+        dialer = get_dialer()
+    checked = capture_consent(db, dataclasses.replace(ev, direction=direction, contact_id=contact_id, duration=duration),
+                              phone, caller_name, dialer)
+    if checked:
+        db.execute(text("UPDATE lending.call_dispositions SET consent_checked_at = clock_timestamp() WHERE id = :id"), {"id": row_id})
 
 
 def process_event(db: Session, ev: DialerCallEvent, dialer=None) -> RecordedCall:
     recorded = record_dialer_event(db, ev)
     db.commit()
-    _check_consent(db, ev, recorded.row_id, dialer if dialer is not None else get_dialer())
+    try:
+        with db.begin_nested():
+            _check_consent(db, ev, recorded.row_id, dialer)
+        db.commit()
+    except Exception as exc:  # consent capture must never block attempt counting or opt-out propagation
+        logger.error("[lending] call %s: consent capture failed: %s", ev.call_id, type(exc).__name__)
 
     if recorded.call_ended and recorded.phone and ev.direction != "inbound":
         on_attempt_recorded(db, recorded.phone)

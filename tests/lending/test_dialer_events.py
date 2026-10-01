@@ -198,7 +198,7 @@ class ConsentDialer:
     def __init__(self, fields=None, error=None):
         self.fields, self.error, self.reads = fields or {}, error, []
 
-    def get_contact_customfields(self, contact_id):
+    def get_contact_customfields(self, contact_id, quick=False):
         self.reads.append(contact_id)
         if self.error:
             raise self.error
@@ -238,6 +238,7 @@ def test_no_or_missing_field_stores_nothing(lending_db, fields):
 def test_dialer_error_stores_nothing_and_does_not_raise(lending_db):
     process_event(lending_db, _live(), dialer=ConsentDialer(error=DialerRequestError("down")))
     assert _consent_sources(lending_db) == []
+    assert _row(lending_db, "k1")["consent_checked_at"] is None  # a failed read is retried, not marked checked
 
 
 def test_unanswered_call_never_reads_the_dialer(lending_db):
@@ -251,7 +252,6 @@ def test_rescan_does_not_reread_but_a_later_disposition_does(lending_db):
     process_event(lending_db, _live(), dialer=dialer)
     process_event(lending_db, _live(), dialer=dialer)
     assert len(dialer.reads) == 1
-    lending_db.execute(text("UPDATE lending.call_dispositions SET consent_checked_at = now() - interval '1 minute'"))
     process_event(lending_db, _live(disposition_raw="CALLBACK_REQUESTED"), dialer=dialer)
     assert len(dialer.reads) == 2
     process_event(lending_db, _live(disposition_raw="CALLBACK_REQUESTED"), dialer=dialer)
@@ -263,3 +263,33 @@ def test_calls_that_ended_over_two_hours_ago_are_not_checked(lending_db):
     old = datetime.now(timezone.utc) - timedelta(hours=3)
     process_event(lending_db, _ev(call_id="old", contact_id="9", started_at=old - timedelta(minutes=2), ended_at=old), dialer=dialer)
     assert dialer.reads == []
+
+
+def test_a_failing_consent_step_never_blocks_attempts_or_opt_out(lending_db, monkeypatch):
+    from src.lending import call_pipeline
+
+    attempts = []
+    monkeypatch.setattr(call_pipeline, "on_attempt_recorded", lambda db, phone: attempts.append(phone))
+    monkeypatch.setattr(call_pipeline, "capture_consent",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    recorded = process_event(lending_db, _live(disposition_raw="DNC_REQUEST"), dialer=ConsentDialer())
+    row = _row(lending_db, "k1")
+    assert recorded.row_id == row["id"] and attempts == [row["phone"]]
+    assert row["opt_out_propagated_at"] is not None and row["consent_checked_at"] is None
+
+
+def test_consent_read_is_a_single_quick_attempt(monkeypatch):
+    import requests
+    from src.lending import dialer_port
+
+    calls = []
+
+    def boom(url, **kw):
+        calls.append(kw["timeout"])
+        raise requests.ConnectionError("down")
+
+    monkeypatch.setattr(requests, "get", boom)
+    adapter = dialer_port.BatchDialerAdapter(http=dialer_port._requests_http("k"))
+    with pytest.raises(DialerRequestError):
+        adapter.get_contact_customfields(9, quick=True)
+    assert len(calls) == 1 and calls[0] <= 5
