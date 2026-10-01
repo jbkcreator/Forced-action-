@@ -37,6 +37,8 @@ class DialerDisplay:
     campaign_tag: Optional[str]
     county: Optional[str] = None
     hook: Optional[str] = None
+    state: Optional[str] = None
+    postal_code: Optional[str] = None
 
 
 def _clean(value: Any) -> Optional[str]:
@@ -64,6 +66,8 @@ def display_from_record(record: Mapping[str, Any], campaign_tag: Optional[str]) 
         campaign_tag=_clean(campaign_tag),
         county=_clean(record.get("county")),
         hook=CAMPAIGN_HOOKS.get(campaign_tag or ""),
+        state=_clean(record.get("state")),
+        postal_code=_clean(record.get("zip")),
     )
 
 
@@ -89,12 +93,25 @@ def _information(display: DialerDisplay) -> str:
     return text if len(text) <= INFORMATION_MAX_CHARS else text[: INFORMATION_MAX_CHARS - 1] + "…"
 
 
+def _street_and_city(address: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """"123 Main St, Tampa, FL 33602" -> ("123 Main St", "Tampa"); a bare street keeps no city."""
+    if not address:
+        return None, None
+    parts = [p.strip() for p in address.split(",")]
+    return parts[0] or None, (parts[1] or None) if len(parts) > 2 else None
+
+
 def dialer_fields(display: DialerDisplay, email: Optional[str] = None) -> DialerContactFields:
     first_name, last_name = _split_name(display.borrower_name)
+    street, city = _street_and_city(display.property_address)
     return DialerContactFields(
         first_name=first_name,
         last_name=last_name,
         company_name=display.entity_name,
         information=_information(display),
         email=normalize_email(email),
+        address=street,
+        city=city,
+        state=display.state,
+        postal_code=display.postal_code,
     )

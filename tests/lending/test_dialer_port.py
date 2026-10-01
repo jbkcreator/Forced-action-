@@ -8,6 +8,7 @@ from src.lending.dialer_port import BatchDialerAdapter, InMemoryDialer, Unconfir
 from src.lending.dialer_removal import DialerRemovalUndecided
 
 PHONE = "+18135558201"
+PHONE_10 = "8135558201"  # what BatchDialer accepts on the wire
 
 
 class FakeHttp:
@@ -114,10 +115,10 @@ def test_loader_upsert_adds_the_contact_into_the_campaign_then_sets_the_card_fie
     assert add[:2] == ("POST", "/contacts")
     assert add[2]["campaignids"] == [7]
     contact = add[2]["contacts"][0]
-    assert (contact["firstname"], contact["lastname"], contact["phonenumber1"]) == ("Jane", "Roe", PHONE)
+    assert (contact["firstname"], contact["lastname"], contact["phonenumber1"]) == ("Jane", "Roe", PHONE_10)
     assert contact["vendorcontactid"] == "staging:9" and contact["email"] == "j@example.com"
     assert card[:2] == ("PUT", "/contact/55")
-    assert card[2]["customfields"]["entity_name"] == "Roe LLC" and card[2]["phonenumbers"] == [{"phonenumber": PHONE}]
+    assert card[2]["customfields"]["entity_name"] == "Roe LLC" and card[2]["phonenumbers"] == [{"phonenumber": PHONE_10}]
 
 
 def test_a_failed_campaign_import_is_a_request_error():
@@ -138,7 +139,7 @@ def test_update_is_a_full_put_that_keeps_the_phone():
     http = FakeHttp(body={})
     BatchDialerAdapter(http=http, endpoints=ENDPOINTS).update_contact("55", FIELDS, phone=PHONE)
     method, path, body = http.calls[-1]
-    assert (method, path) == ("PUT", "/contact/55") and body["phonenumbers"] == [{"phonenumber": PHONE}]
+    assert (method, path) == ("PUT", "/contact/55") and body["phonenumbers"] == [{"phonenumber": PHONE_10}]
 
 
 def test_missing_for_load_names_every_unconfirmed_load_endpoint():
@@ -260,3 +261,32 @@ def test_an_opt_out_for_a_contact_already_deleted_still_completes():
         raise DialerRequestError("gone", status=404)
     BatchDialerAdapter(http=http, endpoints=ENDPOINTS, contact_ids=lambda p: ["77"]).remove(
         PHONE, reason=RemovalReason.OPT_OUT.value)
+
+
+def test_the_property_address_fills_the_standard_fields_the_agent_script_can_show():
+    from dataclasses import replace
+    fields = replace(FIELDS, address="123 Main St", city="Tampa", state="FL", postal_code="33602")
+    http = CampaignHttp([{"id": 7, "name": "Builders"}], body={"ids": [55], "success": True})
+    BatchDialerAdapter(http=http, endpoints=ENDPOINTS).upsert_contact(PHONE, fields, campaign="Builders")
+    add, card = http.calls[-2], http.calls[-1]
+    imported = add[2]["contacts"][0]
+    assert (imported["addressline1"], imported["city"], imported["state"], imported["postalcode"]) == (
+        "123 Main St", "Tampa", "FL", "33602")
+    assert (card[2]["address"], card[2]["city"], card[2]["state"], card[2]["postalcode"]) == (
+        "123 Main St", "Tampa", "FL", "33602")
+
+
+def test_phones_are_sent_as_ten_digits_because_batchdialer_rejects_e164_on_update():
+    http = CampaignHttp([{"id": 7, "name": "Builders"}], body={"ids": [55], "success": True})
+    BatchDialerAdapter(http=http, endpoints=ENDPOINTS).upsert_contact("+18135558201", FIELDS, campaign="Builders")
+    add, card = http.calls[-2], http.calls[-1]
+    assert add[2]["contacts"][0]["phonenumber1"] == "8135558201"
+    assert card[2]["phonenumbers"] == [{"phonenumber": "8135558201"}]
+
+
+def test_the_card_update_keeps_our_vendor_contact_id():
+    # BatchDialer's PUT is a full replace: without it, the link back to our record is wiped.
+    http = CampaignHttp([{"id": 7, "name": "Builders"}], body={"ids": [55], "success": True})
+    BatchDialerAdapter(http=http, endpoints=ENDPOINTS).upsert_contact(
+        PHONE, FIELDS, campaign="Builders", vendor_contact_id="staging:9")
+    assert http.calls[-1][2]["vendorcontactid"] == "staging:9"

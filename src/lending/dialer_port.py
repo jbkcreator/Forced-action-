@@ -42,6 +42,10 @@ class DialerContactFields:
     company_name: Optional[str] = None
     information: Optional[str] = None
     email: Optional[str] = None
+    address: Optional[str] = None       # property street: BatchDialer's standard Address field,
+    city: Optional[str] = None          # which (unlike custom fields) the agent script can show
+    state: Optional[str] = None
+    postal_code: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -139,12 +143,17 @@ class BatchDialerAdapter:
         if contact_id is None:
             raise DialerRequestError("dialer returned no contact id")
         if campaign is not None:
-            self.update_contact(contact_id, fields, phone=phone)
+            self.update_contact(contact_id, fields, phone=phone, vendor_contact_id=vendor_contact_id)
         return ContactUpsertResult(contact_id=contact_id, created=True)
 
-    def update_contact(self, contact_id: Any, fields: DialerContactFields, *, phone: Optional[str] = None) -> dict:
-        """Full update (PUT): BatchDialer replaces every field, so the phone is sent again."""
-        return dict(self._call("contact_update", _contact_body(phone, fields), id=contact_id))
+    def update_contact(self, contact_id: Any, fields: DialerContactFields, *, phone: Optional[str] = None,
+                       vendor_contact_id: Optional[str] = None) -> dict:
+        """Full update (PUT): BatchDialer replaces every field, so the phone and our vendor
+        contact id are sent again."""
+        body = _contact_body(phone, fields)
+        if vendor_contact_id:
+            body["vendorcontactid"] = vendor_contact_id
+        return dict(self._call("contact_update", body, id=contact_id))
 
     def _campaign_id(self, name: str) -> Any:
         if self._campaign_ids is None:
@@ -179,10 +188,18 @@ def _contact_id(body: Mapping[str, Any]) -> Any:
     return body.get("id") if body.get("id") is not None else body.get("contactId")
 
 
+def _ten_digit(phone: str) -> str:
+    """BatchDialer stores US numbers as 10 digits; contact update rejects E.164 ("+1...")."""
+    digits = "".join(ch for ch in phone if ch.isdigit())
+    return digits[1:] if len(digits) == 11 and digits.startswith("1") else digits
+
+
 def _import_contact(phone: str, fields: DialerContactFields, vendor_contact_id: Optional[str]) -> dict:
     """One contact in the ``POST /contacts`` import shape (public API docs, "Add contacts")."""
     contact = {"firstname": fields.first_name or "", "lastname": fields.last_name or "",
-               "email": fields.email or "", "phonenumber1": phone}
+               "email": fields.email or "", "phonenumber1": _ten_digit(phone),
+               "addressline1": fields.address or "", "city": fields.city or "",
+               "state": fields.state or "", "postalcode": fields.postal_code or ""}
     if vendor_contact_id:
         contact["vendorcontactid"] = vendor_contact_id
     return contact
@@ -194,6 +211,10 @@ def _contact_body(phone: Optional[str], fields: DialerContactFields) -> dict:
     body: dict[str, Any] = {
         "firstname": fields.first_name or "",
         "lastname": fields.last_name or "",
+        "address": fields.address or "",
+        "city": fields.city or "",
+        "state": fields.state or "",
+        "postalcode": fields.postal_code or "",
         "customfields": {
             "entity_name": fields.company_name or "",
             "details": fields.information or "",
@@ -201,7 +222,7 @@ def _contact_body(phone: Optional[str], fields: DialerContactFields) -> dict:
         },
     }
     if phone is not None:
-        body["phonenumbers"] = [{"phonenumber": phone}]
+        body["phonenumbers"] = [{"phonenumber": _ten_digit(phone)}]
     return body
 
 
