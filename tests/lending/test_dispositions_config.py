@@ -68,3 +68,14 @@ def test_connected_call_without_a_disposition_alerts_once(alert_env, lending_db)
     assert "Sam" in slack.chat_postMessage.call_args.kwargs["text"] and "late" in slack.chat_postMessage.call_args.kwargs["text"]
     assert alert_env.run(slack_client=slack) == 0  # already alerted
     assert slack.chat_postMessage.call_count == 1
+
+
+def test_approved_thirteen_codes_are_pinned_and_three_stay_separate():
+    from config.lending_dispositions import DISPOSITIONS
+
+    assert DISPOSITIONS == (
+        "NO_ANSWER", "LEFT_VOICEMAIL", "BAD_NUMBER", "CALL_FAILED", "WRONG_PERSON",
+        "NOT_DECISION_MAKER", "REFERRED", "DNC_REQUEST", "CONNECTED_NOT_INTERESTED",
+        "CALLBACK_REQUESTED", "DATA_NURTURE_ONLY", "GATE_FAILED_NURTURE", "BOOKED",
+    )
+    assert len({"WRONG_PERSON", "NOT_DECISION_MAKER", "REFERRED"} & set(DISPOSITIONS)) == 3

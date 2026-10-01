@@ -7,19 +7,19 @@ from __future__ import annotations
 
 DISPOSITION_LIST_VERSION = "2026-10-01"
 
-# Codes marked (proposed) are not worded in the brief and need client approval.
+# Final list, approved by the client 2026-09-30. WRONG_PERSON, NOT_DECISION_MAKER and REFERRED stay separate.
 DISPOSITIONS = (
     "NO_ANSWER",
     "LEFT_VOICEMAIL",
     "BAD_NUMBER",
-    "CALL_FAILED",              # proposed
-    "WRONG_PERSON",             # proposed
-    "NOT_DECISION_MAKER",       # proposed
-    "REFERRED",                 # proposed
+    "CALL_FAILED",
+    "WRONG_PERSON",
+    "NOT_DECISION_MAKER",
+    "REFERRED",
     "DNC_REQUEST",
-    "CONNECTED_NOT_INTERESTED",  # proposed
-    "CALLBACK_REQUESTED",       # proposed
-    "DATA_NURTURE_ONLY",        # proposed
+    "CONNECTED_NOT_INTERESTED",
+    "CALLBACK_REQUESTED",
+    "DATA_NURTURE_ONLY",
     "GATE_FAILED_NURTURE",
     "BOOKED",
 )
