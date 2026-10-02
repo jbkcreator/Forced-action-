@@ -104,3 +104,11 @@ def test_only_showed_stages_on_the_day_count_and_booked_by_is_the_fallback(lendi
     assert data.total.showed == 1
     assert next(r for r in data.by_caller if r.name == "Sam").showed == 1
     assert next(r for r in data.by_campaign if r.name == UNATTRIBUTED).showed == 1
+
+
+def test_missing_stage_table_degrades_showed_to_zero_and_keeps_other_columns(lending_db):
+    _call(lending_db, "1", disp="BOOKED")
+    lending_db.execute(text("DROP TABLE lending.ghl_stage_events"))
+    data = build_scoreboard(lending_db, DAY, NAMES)
+    assert (data.total.dials, data.total.booked, data.total.showed) == (1, 1, 0)
+    assert "Showed 0" in format_slack(data, DAY)

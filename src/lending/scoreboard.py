@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from datetime import date, datetime, time, timedelta
 from typing import Mapping, Optional
 from zoneinfo import ZoneInfo
@@ -10,6 +11,8 @@ from sqlalchemy import text
 
 from config.lending_compliance import DEFAULT_TZ
 from config.lending_dispositions import BOOKED_CODE, GATED_CODES, LIVE_CONVERSATION_CODES, NURTURE_SENT_CODES, SHOWED_STAGE_KEYS
+
+logger = logging.getLogger(__name__)
 
 UNATTRIBUTED = "(unattributed)"
 _KEYS = {  # SQL literals, never user input
@@ -70,18 +73,26 @@ def _query(db, key: str, day: date) -> list[tuple[str, int, int, int, int, int]]
 
 def _showed(db, key: str, day: date) -> dict[str, int]:
     """Opportunities that entered a "showed" GHL stage on ``day``, credited to the caller / campaign of the
-    latest BOOKED call to that phone (the event's own booked_by when no such call is logged)."""
+    latest BOOKED call to that phone (the event's own booked_by when no such call is logged).
+
+    Showed is additive: if its table is missing or the query fails, the report still posts with Showed 0
+    rather than losing every other column. The savepoint keeps the outer transaction usable."""
     start, end = _bounds(day)
-    rows = db.execute(
-        text(f"SELECT {_KEYS[key]} AS k, count(*) FROM ("
-             "SELECT COALESCE(NULLIF(b.caller_name, ''), e.booked_by) AS caller_name, b.caller_seat, "
-             "b.dialer_campaign_id, b.campaign_tag FROM lending.ghl_stage_events e "
-             "LEFT JOIN LATERAL (SELECT caller_name, caller_seat, dialer_campaign_id, campaign_tag "
-             "FROM lending.call_dispositions d WHERE d.phone = e.phone AND d.disposition = :booked "
-             "ORDER BY d.call_ended_at DESC NULLS LAST LIMIT 1) b ON true "
-             "WHERE e.stage_key = ANY(:showed) AND e.event_at >= :start AND e.event_at < :end) s GROUP BY 1"),
-        {"booked": BOOKED_CODE, "showed": sorted(SHOWED_STAGE_KEYS), "start": start, "end": end},
-    ).all()
+    try:
+        with db.begin_nested():
+            rows = db.execute(
+                text(f"SELECT {_KEYS[key]} AS k, count(*) FROM ("
+                     "SELECT COALESCE(NULLIF(b.caller_name, ''), e.booked_by) AS caller_name, b.caller_seat, "
+                     "b.dialer_campaign_id, b.campaign_tag FROM lending.ghl_stage_events e "
+                     "LEFT JOIN LATERAL (SELECT caller_name, caller_seat, dialer_campaign_id, campaign_tag "
+                     "FROM lending.call_dispositions d WHERE d.phone = e.phone AND d.disposition = :booked "
+                     "ORDER BY d.call_ended_at DESC NULLS LAST LIMIT 1) b ON true "
+                     "WHERE e.stage_key = ANY(:showed) AND e.event_at >= :start AND e.event_at < :end) s GROUP BY 1"),
+                {"booked": BOOKED_CODE, "showed": sorted(SHOWED_STAGE_KEYS), "start": start, "end": end},
+            ).all()
+    except Exception as exc:
+        logger.warning("[lending-scoreboard] showed query failed, reporting Showed 0: %s", type(exc).__name__)
+        return {}
     return {k: n for k, n in rows}
 
 
