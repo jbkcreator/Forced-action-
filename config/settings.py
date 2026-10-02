@@ -1029,6 +1029,35 @@ class AppSettings(BaseSettings):
 		default=False, env="FA_MAX_AUTONOMOUS_DISPATCH_CONFIRMED"
 	)
 
+	# ── WP-GL-10 — Booking confirmations and reminders ───────────────────────
+	# Fail-closed until 10DLC campaign registration is approved by carriers.
+	# When false, texts are logged as fake sends (FakeGHLMessenger). Email
+	# fallback (LENDING_EMAIL_ENABLED) is independent of this flag.
+	lending_text_enabled: bool = Field(default=False, env="LENDING_TEXT_ENABLED")
+
+	# "fake" = FakeGHLMessenger (no network); "live" = LiveGHLMessenger.
+	# Both lending_text_enabled AND lending_ghl_messenger_mode=="live" must
+	# be true to produce real GHL sends.
+	lending_ghl_messenger_mode: str = Field(default="fake", env="LENDING_GHL_MESSENGER_MODE")
+
+	# Email fallback (B4): fail-closed until hello@nextdeallending.com is live.
+	# When false, email sends are logged as fake (C1/C2 not yet provisioned).
+	lending_email_enabled: bool = Field(default=False, env="LENDING_EMAIL_ENABLED")
+
+	# Shared secret for the GHL "appointment status changed" webhook.
+	# Unset → endpoint closed (same pattern as LENDING_GHL_WEBHOOK_SECRET
+	# for the existing DND webhook in lending_ghl_router).
+	lending_booking_webhook_secret: Optional[SecretStr] = Field(
+		default=None, env="LENDING_BOOKING_WEBHOOK_SECRET"
+	)
+
+	# GHL calendar ID for the "Next Deal Lending – Borrower Calls" calendar.
+	# E1 confirmed: Josh connects his Google Calendar to this GHL calendar.
+	# Set once the calendar is created in the NDL sub-account.
+	lending_ghl_calendar_id: Optional[str] = Field(
+		default=None, env="LENDING_GHL_CALENDAR_ID"
+	)
+
 
 @lru_cache
 def get_settings() -> AppSettings:

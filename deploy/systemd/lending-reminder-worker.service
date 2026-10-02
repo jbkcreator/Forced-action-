@@ -1,0 +1,26 @@
+[Unit]
+Description=Next Deal Lending — Booking Reminder Worker (WP-GL-10)
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/Forced-action-
+Environment="PATH=/root/Forced-action-/.venv/bin"
+EnvironmentFile=/root/Forced-action-/.env
+
+ExecStart=/root/Forced-action-/.venv/bin/python -m src.lending.reminder_worker
+
+Restart=always
+RestartSec=10
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lending-reminder-worker
+
+[Install]
+WantedBy=multi-user.target
