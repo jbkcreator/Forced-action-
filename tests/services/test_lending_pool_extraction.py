@@ -94,7 +94,7 @@ class TestDedup:
             normalized_phone=phone, phone_available=phone is not None,
             line_type="unknown", email=None,
             financing_intent_score=None, intent_tier=None, recommended_product=None,
-            aircall_campaign_tag="TAG", campaign_list=None,
+            aircall_campaign_tag="TAG",
             buyer_entity_id=None, permit_number=None,
             dbpr_license_number=None, source_property_id=None, source_table="t",
         )

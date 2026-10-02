@@ -1176,8 +1176,20 @@ COUNTY_ID=hillsborough
 
 # PropertyRadar runner — pull -> stage -> link -> handoff (Developer 4).
 # DISABLED: PropertyRadar monitoring is off until Josh turns it on. Uncomment to enable;
-# the runner also refuses --apply while PROPERTY_RADAR_ENABLED=false.
+# the runner also refuses --apply while PROPERTY_RADAR_ENABLED=false. An --apply run traces staged
+# records live through Tracerfy (ledger-gated, SKIP_TRACE_MAX_RUN_COST_CENTS cap); no CSV step.
 # 30 2 * * * $PROJECT/scripts/cron/run.sh src.tasks.property_radar_runner --apply --mode daily --state FL
+
+# Lending weekly DNC / litigator re-scrub of numbers loaded in the dialer (Go Live G10).
+# Mondays 06:00 UTC (02:00 ET), before the 09:00 ET calling window. Spends Tracerfy
+# credits (1 per number) up to a hard --max-credits cap; exit 4 = cap reached.
+# Cap 1000 credits/week, approved 2026-09-30. Scrubs only numbers loaded in the dialer.
+# Dry check first: PYTHONPATH=. python -m src.lending.weekly_scrub --dry-run
+0 6 * * 1 $PROJECT/scripts/cron/run.sh src.lending.weekly_scrub --max-credits 1000
+
+# Lending GHL opt-out backstop: every GHL contact with do-not-disturb on is suppressed in
+# lending, in case the GHL "DND changed" workflow webhook is missing or down. Idempotent.
+*/15 * * * * $PROJECT/scripts/cron/run.sh src.lending.ghl_dnd_backstop
 
 # OFR mortgage-broker refresh (WP-W0-1 Pool 3) — MONTHLY.
 # OFR publishes the MBR-MBRB file monthly; this downloads + unzips + loads it

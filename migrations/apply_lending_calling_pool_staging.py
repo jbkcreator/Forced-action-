@@ -29,7 +29,11 @@ logger = logging.getLogger(__name__)
 
 
 DDL = """
-CREATE TABLE IF NOT EXISTS lending_calling_pool_staging (
+CREATE SCHEMA IF NOT EXISTS lending;
+
+-- Lives in the lending schema (ADR 0001); apply_lending_pool_staging_schema.py moved the
+-- original public table and left a public.lending_calling_pool_staging view.
+CREATE TABLE IF NOT EXISTS lending.calling_pool_staging (
     id                      BIGSERIAL PRIMARY KEY,
     run_id                  UUID        NOT NULL,
     pool_name               TEXT        NOT NULL
@@ -80,19 +84,19 @@ CREATE TABLE IF NOT EXISTS lending_calling_pool_staging (
 
 -- Index run_id for per-run audits and Aircall export queries
 CREATE INDEX IF NOT EXISTS idx_lcps_run_id
-    ON lending_calling_pool_staging (run_id);
+    ON lending.calling_pool_staging (run_id);
 
 -- Index pool_name + phone_available for Aircall export filter
 CREATE INDEX IF NOT EXISTS idx_lcps_pool_phone
-    ON lending_calling_pool_staging (pool_name, phone_available);
+    ON lending.calling_pool_staging (pool_name, phone_available);
 
 -- Index county for per-county reporting
 CREATE INDEX IF NOT EXISTS idx_lcps_county
-    ON lending_calling_pool_staging (county_id);
+    ON lending.calling_pool_staging (county_id);
 
 -- Index state for Dev 2's per-state (Georgia) compliance rule
 CREATE INDEX IF NOT EXISTS idx_lcps_state
-    ON lending_calling_pool_staging (state);
+    ON lending.calling_pool_staging (state);
 """
 
 

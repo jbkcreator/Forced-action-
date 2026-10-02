@@ -1,7 +1,8 @@
 """Wave 0 calling-pool extraction task — WP-W0-1.
 
-Extracts three Aircall calling pools from the FA database for Hillsborough and
-Pinellas counties and writes results to ``lending_calling_pool_staging``.
+Extracts the Aircall calling pools (wholesaler_flipper, active_builder,
+mortgage_broker, permit_owner, auction_winner) from the FA database for the
+target FL counties and writes results to ``lending.calling_pool_staging``.
 
 Trigger: manual CLI run for Wave 0.  A nightly scheduler is Wave 1 (O21).
 
@@ -46,19 +47,19 @@ _EXPORT_COLUMNS = [
     "estimated_loan_value", "recent_permit_details",
     "normalized_phone", "phone_available", "line_type", "email",
     "financing_intent_score", "intent_tier", "recommended_product",
-    "aircall_campaign_tag", "campaign_list",
+    "aircall_campaign_tag", "source_tag",
     "buyer_entity_id", "permit_number", "source_property_id", "source_table",
 ]
 
 
 def _export_run_to_csv(session, run_id: str, out_dir: Path) -> dict[str, dict[str, int]]:
-    """Write one CSV per campaign (Josh's List 1-9 taxonomy) for a run.
+    """Write one CSV per campaign (Josh's List 1-9 taxonomy, source_tag) for a run.
 
-    Split by (pool_name, campaign_list) rather than pool_name alone: Builders
-    spans two lists (List 3 DBPR, List 7 NOC/permits) under one pool_name, and
+    Split by (pool_name, source_tag) rather than pool_name alone: wholesaler_flipper
+    spans two lists (List 2 cash buyers, List 9 stalled flips) under one pool_name, and
     Josh's requested reporting table (client_commnets_answers.md Section 2) is
     organized per campaign/list, not per internal pool. A record with no
-    campaign_list (e.g. a not-yet-confirmed mapping) groups under "unassigned"
+    source_tag (not yet mapped to a launch list) groups under "unassigned"
     rather than being silently dropped from the export.
 
     Returns {file_key: {"total": N, "phone_available": M}}.  Exports the FULL
@@ -68,9 +69,9 @@ def _export_run_to_csv(session, run_id: str, out_dir: Path) -> dict[str, dict[st
     rows = session.execute(
         text(f"""
             SELECT {", ".join(_EXPORT_COLUMNS)}
-            FROM lending_calling_pool_staging
+            FROM lending.calling_pool_staging
             WHERE run_id = :run_id
-            ORDER BY pool_name, campaign_list, county_id
+            ORDER BY pool_name, source_tag, county_id
         """),
         {"run_id": run_id},
     ).mappings().all()
@@ -78,7 +79,7 @@ def _export_run_to_csv(session, run_id: str, out_dir: Path) -> dict[str, dict[st
     out_dir.mkdir(parents=True, exist_ok=True)
     by_campaign: dict[str, list[dict]] = {}
     for row in rows:
-        list_slug = (row["campaign_list"] or "unassigned").lower().replace(" ", "_")
+        list_slug = row["source_tag"] or "unassigned"
         key = f"{row['pool_name']}__{list_slug}"
         by_campaign.setdefault(key, []).append(dict(row))
 
@@ -149,13 +150,13 @@ def _print_campaign_table(summary: dict) -> None:
     NOTE: these are raw/phone-available counts only — NOT "dialable after DNC and
     suppression" (that needs WP-W0-2's compliance pass, a separate step/owner).
     """
-    campaign_lists = summary.get("campaign_lists")
-    if not campaign_lists:
+    source_tags = summary.get("source_tags")
+    if not source_tags:
         return
     print("\n=== Per-campaign counts (raw / with phone) — NOT post-compliance 'dialable' ===")
     print(f"{'Campaign':<14} {'Pools':<30} {'Total':>8} {'With Phone':>12} {'Hit %':>7}")
-    for list_name in sorted(campaign_lists.keys()):
-        bucket = campaign_lists[list_name]
+    for list_name in sorted(source_tags.keys()):
+        bucket = source_tags[list_name]
         total = bucket["total"]
         with_phone = bucket["phone_available"]
         pct = f"{(with_phone / total * 100):.1f}%" if total else "0.0%"

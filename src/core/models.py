@@ -11470,7 +11470,10 @@ class FaMaxBackflipCampaignContact(Base):
     imported_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     __table_args__ = (
-        CheckConstraint("identifier_kind IN ('email', 'phone')", name="ck_fa_max_backflip_identifier_kind"),
+        CheckConstraint(
+            "identifier_kind IN ('email', 'phone', 'entity_name', 'parcel_id')",
+            name="ck_fa_max_backflip_identifier_kind",
+        ),
         Index("ix_fa_max_backflip_active_contact", "identifier_kind", "identifier_value", postgresql_where=text("active")),
     )
 
@@ -12694,7 +12697,7 @@ class LendingCallingPoolStaging(Base):
     (Aircall load). Wave 0 placeholder location (O1); the final isolated lending
     schema is Dev 2's — only the table name changes when that lands.
     """
-    __tablename__ = "lending_calling_pool_staging"
+    __tablename__ = "calling_pool_staging"  # lending schema (ADR 0001); public view keeps the old name
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     run_id: Mapped[str] = mapped_column(PG_UUID(as_uuid=False), nullable=False, index=True)
@@ -12730,7 +12733,6 @@ class LendingCallingPoolStaging(Base):
     estimated_loan_value: Mapped[Optional[float]] = mapped_column(Numeric(14, 2))
 
     aircall_campaign_tag: Mapped[str] = mapped_column(String, nullable=False)
-    campaign_list: Mapped[Optional[str]] = mapped_column(String)  # Josh's List 1-9 taxonomy
 
     # Provenance (one per pool type, others NULL)
     buyer_entity_id: Mapped[Optional[int]] = mapped_column(BigInteger)
@@ -12738,16 +12740,24 @@ class LendingCallingPoolStaging(Base):
     dbpr_license_number: Mapped[Optional[str]] = mapped_column(String)
     source_property_id: Mapped[Optional[int]] = mapped_column(BigInteger)
     source_table: Mapped[str] = mapped_column(String, nullable=False)
+    # Go Live Brief 2.5 source list (list_1..list_9); apply_lending_pool_source_tags.py
+    source_tag: Mapped[Optional[str]] = mapped_column(String)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
     __table_args__ = (
+        CheckConstraint(
+            "pool_name IN ('wholesaler_flipper', 'active_builder', 'mortgage_broker', 'auction_winner', 'permit_owner')",
+            name="lending_calling_pool_staging_pool_name_check",
+        ),
         Index("idx_lcps_run_id", "run_id"),
         Index("idx_lcps_pool_phone", "pool_name", "phone_available"),
         Index("idx_lcps_county", "county_id"),
         Index("idx_lcps_state", "state"),
+        Index("idx_lcps_source_tag", "source_tag"),
+        {"schema": "lending"},
     )
 
 
