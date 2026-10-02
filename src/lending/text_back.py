@@ -129,7 +129,8 @@ def render_body(item: PendingText, template_key: str, *, number: str) -> str:
     )
 
 
-TextSender = Callable[[str, str, Optional[str]], str]
+# (phone, body, first_name, *, deadline) -> provider message id; the real sender is GhlSmsSender.
+TextSender = Callable[..., str]
 
 _ET = ZoneInfo(TIMEZONE)
 
@@ -257,7 +258,8 @@ def _decide_and_send(db, item: PendingText, *, sender: Optional[TextSender], ena
             else:
                 started[0] = True
                 try:
-                    message_id = sender(item.phone, body, first_name_of(item.borrower_name))
+                    message_id = sender(item.phone, body, first_name_of(item.borrower_name),
+                                        deadline=item.ended_at + timedelta(seconds=MAX_LATE_SECONDS))
                 except GhlSmsError as exc:
                     outcome = "send_unknown" if exc.ambiguous else "failed"
                 else:

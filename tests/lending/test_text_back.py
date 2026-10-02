@@ -22,9 +22,10 @@ NUMBER = "+18135550100"
 
 class Sender:
     def __init__(self, fail=False):
-        self.sent, self.fail = [], fail
+        self.sent, self.fail, self.deadlines = [], fail, []
 
-    def __call__(self, phone, body, first_name=None):
+    def __call__(self, phone, body, first_name=None, *, deadline=None):
+        self.deadlines.append(deadline)
         if self.fail:
             raise GhlSmsError("GHL message send failed: HTTP 500")
         self.sent.append((phone, body, first_name))
@@ -211,8 +212,8 @@ class SlowSender(Sender):
         super().__init__()
         self.clock, self.seconds = clock, seconds
 
-    def __call__(self, phone, body, first_name=None):
-        result = super().__call__(phone, body, first_name)
+    def __call__(self, phone, body, first_name=None, *, deadline=None):
+        result = super().__call__(phone, body, first_name, deadline=deadline)
         self.clock[0] += timedelta(seconds=self.seconds)
         return result
 
@@ -268,7 +269,7 @@ def test_an_ambiguous_send_error_keeps_the_slot_and_a_second_call_is_a_duplicate
     record_consent(db, PHONE, "on_call_yes")
     seed(db, "c1")
 
-    def timed_out(phone, body, first_name=None):
+    def timed_out(phone, body, first_name=None, *, deadline=None):
         raise GhlSmsError("GHL message send request error (ReadTimeout)", ambiguous=True)
 
     assert run(db, timed_out) == {"send_unknown": 1} and status(db) == "send_unknown"
@@ -326,8 +327,9 @@ def test_a_sent_text_whose_record_write_fails_becomes_send_unknown_and_is_never_
     monkeypatch.setattr(text_back, "_record", failing_on_sent)
     assert run(db, sender) == {} and len(sender.sent) == 1 and status(db) == "sending"
     monkeypatch.setattr(text_back, "_record", real_record)
-    later = NOW + timedelta(minutes=6)
-    assert run(db, sender, now=later) == {} and status(db) == "send_unknown" and len(sender.sent) == 1
+    # decided_at came from the real DB clock; pin it so the stale sweep does not depend on today's date
+    db.execute(text("UPDATE lending.missed_call_events SET decided_at = :t"), {"t": NOW - timedelta(minutes=6)})
+    assert run(db, sender) == {} and status(db) == "send_unknown" and len(sender.sent) == 1
 
 
 def test_the_outcome_update_only_touches_a_row_that_is_still_sending(db):
@@ -351,16 +353,34 @@ def _run_once_main(monkeypatch, order):
     monkeypatch.setattr(cdr_poller, "get_http", lambda: object())
     monkeypatch.setattr(cdr_poller, "lending_session", session)
     monkeypatch.setattr(cdr_poller, "lending_campaign_ids", lambda: frozenset({"55"}))
-    monkeypatch.setattr(cdr_poller, "run_cycle", lambda *a, **k: order.append("cycle") or IngestStats())
+    def cycle(*a, after_poll=None, **k):
+        order.append("poll")
+        if after_poll is not None:
+            after_poll()
+        order.append("rescan")
+        return IngestStats()
+
+    monkeypatch.setattr(cdr_poller, "run_cycle", cycle)
     return cdr_poller.main(["--once"])
 
 
-def test_poller_once_runs_the_text_back_step_exactly_once_after_the_cycle(monkeypatch):
+def test_poller_main_runs_the_text_step_after_the_poll_and_again_after_the_rescan(monkeypatch):
     order = []
     step = MagicMock(side_effect=lambda: order.append("text_back"))
     monkeypatch.setattr(cdr_poller, "text_back_step", step)
     assert _run_once_main(monkeypatch, order) == 0
-    assert step.call_count == 1 and order == ["cycle", "text_back"]
+    # both calls are required: dropping after_poll or the trailing call changes this exact sequence
+    assert order == ["poll", "text_back", "rescan", "text_back"] and step.call_count == 2
+
+
+def test_run_cycle_texts_between_the_fast_poll_and_the_rescan(monkeypatch):
+    order = []
+    monkeypatch.setattr(cdr_poller, "retry_unpropagated_dnc", lambda db: order.append("dnc"))
+    monkeypatch.setattr(cdr_poller, "poll_new", lambda db, http: order.append("poll_new") or IngestStats())
+    monkeypatch.setattr(cdr_poller, "rescan_today", lambda db, http: order.append("rescan_today") or IngestStats())
+    db = MagicMock()
+    cdr_poller.run_cycle(db, "http", rescan=True, after_poll=lambda: order.append("text"))
+    assert order == ["dnc", "poll_new", "text", "rescan_today"] and db.commit.called
 
 
 def test_a_text_back_import_failure_never_crashes_the_poller(monkeypatch, caplog):
@@ -377,3 +397,22 @@ def test_a_text_back_import_failure_never_crashes_the_poller(monkeypatch, caplog
     with caplog.at_level("ERROR"):
         cdr_poller.text_back_step()
     assert "text-back cycle failed (ImportError)" in caplog.text
+
+
+def test_the_sender_is_given_a_send_deadline_sixty_seconds_after_the_call_ended(db):
+    record_consent(db, PHONE, "on_call_yes")
+    seed(db, age=10)
+    sender = Sender()
+    assert run(db, sender) == {"sent": 1}
+    assert sender.deadlines == [NOW - timedelta(seconds=10) + timedelta(seconds=60)]
+
+
+def test_a_deadline_error_from_the_sender_is_failed_and_frees_the_slot(db):
+    record_consent(db, PHONE, "on_call_yes")
+    seed(db, "c1")
+
+    def too_slow(phone, body, first_name=None, *, deadline=None):
+        raise GhlSmsError("deadline passed before send")
+
+    assert run(db, too_slow) == {"failed": 1} and status(db) == "failed"
+    assert seed(db, "c2") == "pending"

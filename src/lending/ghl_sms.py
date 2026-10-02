@@ -7,9 +7,11 @@ decision until the client provides the Next Deal Lending sub-account; switching 
 Exactly one of the two LENDING_GHL_* set is a misconfiguration and fails closed (no account), so a
 half-finished switch can never text or opt out through the wrong sub-account.
 
-The contact upsert goes through the retrying shared helper (safe to repeat). The message send makes
-exactly ONE attempt: after a read timeout GHL may already have accepted the text, and a retry would
-double-text a borrower. A failed send is reported to the caller and never retried here.
+Both the contact upsert and the message send make exactly ONE attempt. The send must never repeat: after
+a read timeout GHL may already have accepted the text, and a retry would double-text a borrower. The
+upsert is single too because the text has to leave within 60 s of the call, so a retrying helper (which
+can run for minutes during a GHL outage) would stall the whole batch; a failed upsert means nothing was
+sent and the caller records it failed. A failed send is reported to the caller and never retried here.
 
 Request shapes follow the public GHL v2 API reference (contacts/upsert, conversations/messages)
 and are NOT yet confirmed against a live round trip. Run ``--send-test`` once with real
@@ -24,6 +26,7 @@ from __future__ import annotations
 import argparse
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 import requests
@@ -113,13 +116,10 @@ def _single_attempt(method: str, url: str, **kwargs: Any) -> requests.Response:
 
 class GhlSmsSender:
     def __init__(self, account: GhlAccount, from_number: str, request: Optional[Request] = None) -> None:
-        """``request`` (tests) replaces both calls; unset, the upsert retries and the send does not."""
+        """``request`` (tests) replaces both calls; unset, both are single attempts."""
         self._account, self._from, self._request = account, from_number, request
 
-    def _upsert_request(self) -> Request:
-        return self._request or ghl_webhook._ghl_request
-
-    def _send_request(self) -> Request:
+    def _http(self) -> Request:
         return self._request or _single_attempt
 
     def _post(self, request: Request, path: str, body: dict, what: str, version: str = "2021-07-28",
@@ -139,14 +139,19 @@ class GhlSmsSender:
         except ValueError:
             return {}
 
-    def __call__(self, phone: str, body: str, first_name: Optional[str] = None) -> str:
+    def __call__(self, phone: str, body: str, first_name: Optional[str] = None, *,
+                 deadline: Optional[datetime] = None) -> str:
+        """Upsert the contact, then send. ``deadline`` (UTC) is the latest moment a send may still start;
+        past it nothing is sent and a non-ambiguous GhlSmsError is raised."""
         contact = {"locationId": self._account.location_id, "phone": phone}
         if first_name:
             contact["firstName"] = first_name
-        contact_id = (self._post(self._upsert_request(), "/contacts/upsert", contact, "contact upsert").get("contact") or {}).get("id")
+        contact_id = (self._post(self._http(), "/contacts/upsert", contact, "contact upsert").get("contact") or {}).get("id")
         if not contact_id:
             raise GhlSmsError("GHL contact upsert returned no contact id")
-        sent = self._post(self._send_request(), "/conversations/messages",
+        if deadline is not None and datetime.now(timezone.utc) > deadline:
+            raise GhlSmsError("deadline passed before send")
+        sent = self._post(self._http(), "/conversations/messages",
                           {"type": "SMS", "contactId": contact_id, "message": body, "fromNumber": self._from},
                           "message send", version="2021-04-15", is_send=True)  # conversations endpoints use this version
         message_id = sent.get("messageId") or sent.get("id")

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta, timezone
 
 import pytest
 import requests
@@ -196,34 +197,72 @@ class Boom:
 
 @pytest.mark.parametrize("exc", [ConnectionError("reset"), requests.Timeout("slow")])
 def test_the_message_send_is_attempted_exactly_once(monkeypatch, exc):
-    upsert = Recorder(Resp(200, {"contact": {"id": "ct1"}}))
-    monkeypatch.setattr("src.services.ghl_webhook._ghl_request", upsert)
-    send = Boom(exc)
-    monkeypatch.setattr("requests.request", send)
+    def http(method, url, **kw):
+        calls.append(url)
+        if url.endswith("/contacts/upsert"):
+            return Resp(200, {"contact": {"id": "ct1"}})
+        raise exc
+
+    calls = []
+    monkeypatch.setattr("requests.request", http)
     with pytest.raises(GhlSmsError) as err:
         GhlSmsSender(ACCOUNT, "+18135550100")(PHONE, "hello", None)
-    assert send.calls == 1 and len(upsert.calls) == 1 and PHONE not in str(err.value)
+    assert [u.rsplit("/", 1)[-1] for u in calls] == ["upsert", "messages"] and PHONE not in str(err.value)
+    assert err.value.ambiguous is True
 
 
 def test_default_send_uses_a_timeout_and_a_429_is_an_error_not_a_retry(monkeypatch):
-    monkeypatch.setattr("src.services.ghl_webhook._ghl_request", Recorder(Resp(200, {"contact": {"id": "ct1"}})))
     seen = []
 
     def fake(method, url, **kw):
-        seen.append(kw)
-        return Resp(429, {})
+        seen.append((url, kw))
+        return Resp(200, {"contact": {"id": "ct1"}}) if url.endswith("/contacts/upsert") else Resp(429, {})
     monkeypatch.setattr("requests.request", fake)
     with pytest.raises(GhlSmsError, match="HTTP 429"):
         GhlSmsSender(ACCOUNT, "+18135550100")(PHONE, "hello", None)
-    assert len(seen) == 1 and seen[0]["timeout"] == 15
+    assert len(seen) == 2 and all(kw["timeout"] == 15 for _, kw in seen)
 
 
-def test_the_upsert_goes_through_the_retrying_helper(monkeypatch):
-    upsert = Recorder(Resp(200, {"contact": {"id": "ct1"}}))
-    monkeypatch.setattr("src.services.ghl_webhook._ghl_request", upsert)
-    monkeypatch.setattr("requests.request", lambda *a, **k: Resp(201, {"messageId": "m1"}))
+def test_the_upsert_is_a_single_attempt_and_never_the_retrying_helper(monkeypatch):
+    def retrying_helper(*a, **k):
+        raise AssertionError("the retrying helper must not be used for texts")
+
+    monkeypatch.setattr("src.services.ghl_webhook._ghl_request", retrying_helper)
+    calls = []
+
+    def http(method, url, **kw):
+        calls.append(url)
+        return Resp(200, {"contact": {"id": "ct1"}}) if url.endswith("/contacts/upsert") else Resp(201, {"messageId": "m1"})
+    monkeypatch.setattr("requests.request", http)
     assert GhlSmsSender(ACCOUNT, "+18135550100")(PHONE, "hello", None) == "m1"
-    assert len(upsert.calls) == 1 and upsert.calls[0][1].endswith("/contacts/upsert")
+    assert [u.rsplit("/", 1)[-1] for u in calls] == ["upsert", "messages"]
+
+
+def test_an_upsert_timeout_is_one_call_and_not_ambiguous(monkeypatch):
+    calls = []
+
+    def http(method, url, **kw):
+        calls.append(url)
+        raise requests.Timeout("slow")
+    monkeypatch.setattr("requests.request", http)
+    with pytest.raises(GhlSmsError) as err:
+        GhlSmsSender(ACCOUNT, "+18135550100")(PHONE, "hello", None)
+    assert len(calls) == 1 and err.value.ambiguous is False
+
+
+def test_a_send_past_its_deadline_is_refused_after_the_upsert_and_never_requested():
+    request = Recorder(Resp(200, {"contact": {"id": "ct1"}}), Resp(201, {"messageId": "m1"}))
+    late = datetime.now(timezone.utc) - timedelta(seconds=1)
+    with pytest.raises(GhlSmsError, match="deadline passed before send") as err:
+        GhlSmsSender(ACCOUNT, "+18135550100", request=request)(PHONE, "hello", None, deadline=late)
+    assert err.value.ambiguous is False and len(request.calls) == 1
+    assert request.calls[0][1].endswith("/contacts/upsert")  # the message request was never made
+
+
+def test_a_send_inside_its_deadline_goes_out():
+    request = Recorder(Resp(200, {"contact": {"id": "ct1"}}), Resp(201, {"messageId": "m1"}))
+    soon = datetime.now(timezone.utc) + timedelta(seconds=30)
+    assert GhlSmsSender(ACCOUNT, "+18135550100", request=request)(PHONE, "hello", None, deadline=soon) == "m1"
 
 
 def test_api_versions_per_endpoint():
