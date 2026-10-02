@@ -189,7 +189,8 @@ def _counties(db, phones: list[str]) -> dict[str, str]:
 def _record(db, event_id: int, status: str, template_key: Optional[str] = None, message_id: Optional[str] = None) -> None:
     db.execute(
         text("UPDATE lending.missed_call_events SET status = :s, decided_at = now(), "
-             "template_key = COALESCE(:t, template_key), provider_message_id = COALESCE(:m, provider_message_id) WHERE id = :id"),
+             "template_key = COALESCE(:t, template_key), provider_message_id = COALESCE(:m, provider_message_id) "
+             "WHERE id = :id AND status = 'sending'"),
         {"s": status, "t": template_key, "m": message_id, "id": event_id},
     )
 
@@ -221,40 +222,76 @@ def _render(item: PendingText, number: str) -> tuple[Optional[str], Optional[str
         return None, None
 
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _mark_unsent_failed(db, item: PendingText) -> Optional[str]:
+    """After an unexpected error BEFORE the sender was called nothing went out: record 'failed' in a
+    fresh transaction so the event does not wait for the stale sweep (which would hold the day's slot).
+    Returns 'failed' when recorded, None when even that write failed (the sweep then takes it)."""
+    try:
+        _record(db, item.event_id, "failed")
+        db.commit()
+        return "failed"
+    except Exception as exc:  # class only
+        logger.error("[text-back] event %s could not be marked failed (%s); left for the stale-claim sweep",
+                     item.event_id, type(exc).__name__)
+        db.rollback()
+        return None
+
+
+def _decide_and_send(db, item: PendingText, *, sender: Optional[TextSender], enabled: bool, number: Optional[str],
+                     now: datetime, started: list[bool]) -> str:
+    """Run the gates and, if all pass, the send; record and return the outcome (the caller commits).
+    ``started`` is set the moment the sender is about to be called: from then on a failure is unknown."""
+    outcome = _decide(db, item, sender=sender, enabled=enabled, now=now)
+    template_key: Optional[str] = None
+    if outcome == "send":
+        if not number:
+            outcome = "skipped_not_configured"
+        else:
+            template_key, body = _render(item, number)
+            if body is None:
+                outcome = "failed"
+            else:
+                started[0] = True
+                try:
+                    message_id = sender(item.phone, body, first_name_of(item.borrower_name))
+                except GhlSmsError as exc:
+                    outcome = "send_unknown" if exc.ambiguous else "failed"
+                else:
+                    _record(db, item.event_id, "sent", template_key, message_id)
+                    return "sent"
+    _record(db, item.event_id, outcome, template_key)
+    return outcome
+
+
 def process_pending(db, *, sender: Optional[TextSender], enabled: bool, number: Optional[str],
-                    now: Optional[datetime] = None, limit: int = 50) -> dict[str, int]:
+                    now: Optional[datetime] = None, limit: int = 50,
+                    clock: Optional[Callable[[], datetime]] = None) -> dict[str, int]:
     """Decide every pending missed-call event once. Commits: the claim first (so a crash cannot make
-    a second worker send the same text), then each event's outcome on its own."""
-    now = now or datetime.now(timezone.utc)
-    _release_stale_claims(db, now)
+    a second worker send the same text), then each event's outcome on its own.
+
+    The 60 s and 8am-8pm gates are checked against the time the event is reached, not when the batch
+    started (each send can take a while): ``clock`` is read per event unless ``now`` is injected."""
+    clock = clock or _utcnow
+    _release_stale_claims(db, now or clock())
     items = _claim(db, limit)
     db.commit()
     counts: dict[str, int] = {}
     for item in items:
-        outcome, template_key = "failed", None
+        started = [False]
         try:
-            outcome = _decide(db, item, sender=sender, enabled=enabled, now=now)
-            if outcome == "send":
-                if not number:
-                    outcome = "skipped_not_configured"
-                else:
-                    template_key, body = _render(item, number)
-                    if body is None:
-                        outcome = "failed"
-                    else:
-                        message_id = sender(item.phone, body, first_name_of(item.borrower_name))
-                        _record(db, item.event_id, "sent", template_key, message_id)
-                        outcome = "sent"
-            if outcome != "sent":
-                _record(db, item.event_id, outcome, template_key)
-        except GhlSmsError:
-            outcome = "failed"
-            _record(db, item.event_id, "failed", template_key)
+            outcome = _decide_and_send(db, item, sender=sender, enabled=enabled, number=number,
+                                       now=now or clock(), started=started)
+            db.commit()
         except Exception as exc:  # class only: SQL / HTTP errors can embed phones
-            logger.error("[text-back] event %s crashed (%s); left for the stale-claim sweep", item.event_id, type(exc).__name__)
+            logger.error("[text-back] event %s crashed (%s)", item.event_id, type(exc).__name__)
             db.rollback()
-            continue
-        db.commit()
+            outcome = None if started[0] else _mark_unsent_failed(db, item)
+            if outcome is None:
+                continue
         counts[outcome] = counts.get(outcome, 0) + 1
         logger.info("[text-back] call=%s phone_hash=%s outcome=%s", item.call_id, phone_hash(item.phone)[:12], outcome)
     return counts

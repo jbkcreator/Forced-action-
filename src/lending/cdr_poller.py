@@ -35,9 +35,9 @@ def run_cycle(db, http, *, rescan: bool) -> IngestStats:
 
 def text_back_step() -> None:
     """WP-GL-9: send the missed-call texts queued by the cycle that just ran. Never blocks ingestion."""
-    from src.lending.text_back import run_text_back_cycle
-
     try:
+        from src.lending.text_back import run_text_back_cycle
+
         counts = run_text_back_cycle()
         if counts:
             logger.info("[lending-cdr-poller] text-back %s", counts)

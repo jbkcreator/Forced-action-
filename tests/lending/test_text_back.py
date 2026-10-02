@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock
 
 import pytest
 from sqlalchemy import text
@@ -10,6 +11,8 @@ from migrations.apply_lending_gl9_text_back import apply_to
 from src.lending.consent import record_consent
 from src.lending.dispositions import queue_missed_call
 from src.lending.ghl_sms import GhlSmsError
+from src.lending import cdr_poller, text_back
+from src.lending.cdr_poll import IngestStats
 from src.lending.text_back import process_pending
 
 NOW = datetime(2026, 10, 5, 15, 0, tzinfo=timezone.utc)  # 11:00 ET
@@ -34,8 +37,8 @@ def db(lending_db):
     return lending_db
 
 
-def seed(db, call_id="c1", *, phone=PHONE, age=10, queue="verified_maturity", caller="Alex", address="123 Main St, Tampa FL"):
-    ended = NOW - timedelta(seconds=age)
+def seed(db, call_id="c1", *, phone=PHONE, age=10, queue="verified_maturity", caller="Alex", address="123 Main St, Tampa FL", at=NOW):
+    ended = at - timedelta(seconds=age)
     db.execute(text("INSERT INTO lending.call_dispositions (dialer_call_id, phone, direction, call_ended_at, queue, caller_name, raw_event) "
                     "VALUES (:c, :p, 'outbound', :e, :q, :n, '{}'::jsonb)"), {"c": call_id, "p": phone, "e": ended, "q": queue, "n": caller})
     record = {"property_address": address} if address else None
@@ -199,3 +202,178 @@ def test_the_old_second_poller_refuses_to_start(caplog):
     from src.lending import missed_call_poller
     missed_call_poller.main(["--once"])
     assert "superseded" in caplog.text
+
+
+class SlowSender(Sender):
+    """Each send 'takes' ``seconds`` on the fake clock."""
+
+    def __init__(self, clock, seconds):
+        super().__init__()
+        self.clock, self.seconds = clock, seconds
+
+    def __call__(self, phone, body, first_name=None):
+        result = super().__call__(phone, body, first_name)
+        self.clock[0] += timedelta(seconds=self.seconds)
+        return result
+
+
+def _two_consented_events(db, at=NOW):
+    for i, call in enumerate(("c1", "c2")):
+        phone = f"+1813555880{i}"
+        record_consent(db, phone, "on_call_yes")
+        seed(db, call, phone=phone, at=at)
+
+
+def test_a_later_event_in_the_same_batch_is_late_once_the_first_send_took_61_seconds(db):
+    _two_consented_events(db)
+    clock = [NOW]
+    sender = SlowSender(clock, 61)
+    counts = process_pending(db, sender=sender, enabled=True, number=NUMBER, clock=lambda: clock[0])
+    assert counts == {"sent": 1, "skipped_late": 1} and len(sender.sent) == 1
+
+
+def test_a_later_event_in_the_same_batch_is_not_texted_after_the_evening_cutoff(db):
+    at = datetime(2026, 10, 5, 23, 59, 30, tzinfo=timezone.utc)  # 7:59:30 pm ET
+    _two_consented_events(db, at=at)
+    clock = [at]
+    sender = SlowSender(clock, 45)  # second event reached at 8:00:15 pm ET, still inside 60 s
+    counts = process_pending(db, sender=sender, enabled=True, number=NUMBER, clock=lambda: clock[0])
+    assert counts == {"sent": 1, "skipped_quiet_hours": 1} and len(sender.sent) == 1
+
+
+def test_an_injected_now_is_used_for_every_event(db):
+    _two_consented_events(db)
+    sender = Sender()
+    assert run(db, sender) == {"sent": 2}
+
+
+@pytest.mark.parametrize("when,expected", [
+    (datetime(2026, 10, 5, 11, 59, 59, tzinfo=timezone.utc), "skipped_quiet_hours"),  # 7:59:59 am EDT
+    (datetime(2026, 10, 5, 12, 0, 0, tzinfo=timezone.utc), "sent"),                   # 8:00:00 am EDT, inclusive
+    (datetime(2026, 10, 5, 23, 59, 59, tzinfo=timezone.utc), "sent"),                 # 7:59:59 pm EDT
+    (datetime(2026, 10, 6, 0, 0, 0, tzinfo=timezone.utc), "skipped_quiet_hours"),     # 8:00:00 pm EDT, exclusive
+    (datetime(2026, 11, 2, 12, 59, 59, tzinfo=timezone.utc), "skipped_quiet_hours"),  # 7:59:59 am EST (after DST ends)
+    (datetime(2026, 11, 2, 13, 0, 0, tzinfo=timezone.utc), "sent"),                   # 8:00:00 am EST
+    (datetime(2026, 11, 3, 0, 59, 59, tzinfo=timezone.utc), "sent"),                  # 7:59:59 pm EST
+    (datetime(2026, 11, 3, 1, 0, 0, tzinfo=timezone.utc), "skipped_quiet_hours"),     # 8:00:00 pm EST
+])
+def test_the_eight_to_eight_window_is_inclusive_at_eight_and_exclusive_at_twenty_et(db, when, expected):
+    record_consent(db, PHONE, "on_call_yes")
+    seed(db, at=when)
+    sender = Sender()
+    assert run(db, sender, now=when) == {expected: 1} and len(sender.sent) == (expected == "sent")
+
+
+def test_an_ambiguous_send_error_keeps_the_slot_and_a_second_call_is_a_duplicate_day(db):
+    record_consent(db, PHONE, "on_call_yes")
+    seed(db, "c1")
+
+    def timed_out(phone, body, first_name=None):
+        raise GhlSmsError("GHL message send request error (ReadTimeout)", ambiguous=True)
+
+    assert run(db, timed_out) == {"send_unknown": 1} and status(db) == "send_unknown"
+    assert seed(db, "c2") == "duplicate_day"
+    sender = Sender()
+    assert run(db, sender) == {} and sender.sent == []
+
+
+def test_a_definite_send_error_is_failed_and_frees_the_slot(db):
+    record_consent(db, PHONE, "on_call_yes")
+    seed(db, "c1")
+    assert run(db, Sender(fail=True)) == {"failed": 1}
+    assert seed(db, "c2") == "pending"
+
+
+def test_an_unexpected_error_before_the_send_is_recorded_failed_not_left_sending(db, monkeypatch):
+    record_consent(db, PHONE, "on_call_yes")
+    seed(db)
+
+    def broken(db_, phone):
+        raise RuntimeError("consent lookup exploded")
+
+    monkeypatch.setattr(text_back, "has_text_consent", broken)
+    sender = Sender()
+    assert run(db, sender) == {"failed": 1} and sender.sent == [] and status(db) == "failed"
+
+
+def test_a_db_error_recording_one_failure_does_not_abort_the_batch(db, monkeypatch):
+    _two_consented_events(db)
+    real_record, calls = text_back._record, []
+
+    def flaky(db_, event_id, status_, *a, **k):
+        calls.append(status_)
+        if len(calls) == 1:
+            raise RuntimeError("write failed")
+        return real_record(db_, event_id, status_, *a, **k)
+
+    monkeypatch.setattr(text_back, "_record", flaky)
+    assert run(db, Sender(fail=True)) == {"failed": 1}
+    states = sorted(db.execute(text("SELECT status FROM lending.missed_call_events")).scalars().all())
+    assert states == ["failed", "sending"]  # the unrecorded one waits for the stale sweep
+
+
+def test_a_sent_text_whose_record_write_fails_becomes_send_unknown_and_is_never_resent(db, monkeypatch):
+    record_consent(db, PHONE, "on_call_yes")
+    seed(db)
+    real_record = text_back._record
+
+    def failing_on_sent(db_, event_id, status_, *a, **k):
+        if status_ == "sent":
+            raise RuntimeError("write failed after the send")
+        return real_record(db_, event_id, status_, *a, **k)
+
+    sender = Sender()
+    monkeypatch.setattr(text_back, "_record", failing_on_sent)
+    assert run(db, sender) == {} and len(sender.sent) == 1 and status(db) == "sending"
+    monkeypatch.setattr(text_back, "_record", real_record)
+    later = NOW + timedelta(minutes=6)
+    assert run(db, sender, now=later) == {} and status(db) == "send_unknown" and len(sender.sent) == 1
+
+
+def test_the_outcome_update_only_touches_a_row_that_is_still_sending(db):
+    record_consent(db, PHONE, "on_call_yes")
+    seed(db)
+    event_id = db.execute(text("SELECT id FROM lending.missed_call_events")).scalar()
+    text_back._record(db, event_id, "failed")  # row is 'pending', not 'sending': no-op
+    assert status(db) == "pending"
+
+
+def _run_once_main(monkeypatch, order):
+    from contextlib import contextmanager
+
+    db = MagicMock()
+    db.execute.return_value.scalar.return_value = True
+
+    @contextmanager
+    def session():
+        yield db
+
+    monkeypatch.setattr(cdr_poller, "get_http", lambda: object())
+    monkeypatch.setattr(cdr_poller, "lending_session", session)
+    monkeypatch.setattr(cdr_poller, "lending_campaign_ids", lambda: frozenset({"55"}))
+    monkeypatch.setattr(cdr_poller, "run_cycle", lambda *a, **k: order.append("cycle") or IngestStats())
+    return cdr_poller.main(["--once"])
+
+
+def test_poller_once_runs_the_text_back_step_exactly_once_after_the_cycle(monkeypatch):
+    order = []
+    step = MagicMock(side_effect=lambda: order.append("text_back"))
+    monkeypatch.setattr(cdr_poller, "text_back_step", step)
+    assert _run_once_main(monkeypatch, order) == 0
+    assert step.call_count == 1 and order == ["cycle", "text_back"]
+
+
+def test_a_text_back_import_failure_never_crashes_the_poller(monkeypatch, caplog):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def broken(name, *a, **k):
+        if name == "src.lending.text_back":
+            raise ImportError("boom")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", broken)
+    with caplog.at_level("ERROR"):
+        cdr_poller.text_back_step()
+    assert "text-back cycle failed (ImportError)" in caplog.text

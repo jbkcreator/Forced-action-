@@ -252,3 +252,54 @@ def test_send_test_cli_reports_a_failed_send_without_a_traceback(monkeypatch):
     monkeypatch.setattr(s, "lending_ghl_sms_from_number", "(813) 555-0100", raising=False)
     monkeypatch.setattr("src.services.ghl_webhook._ghl_request", Boom(ConnectionError("x")))
     assert ghl_sms.main(["--send-test", "(813) 555-8601"]) == 1
+
+
+def _timeout(*a, **k):
+    raise requests.Timeout("slow")
+
+
+class UpsertThenSend:
+    """First call (the contact upsert) succeeds; the second (the send) does ``send``."""
+
+    def __init__(self, send):
+        self.send, self.calls = send, 0
+
+    def __call__(self, *a, **k):
+        self.calls += 1
+        if self.calls == 1:
+            return Resp(200, {"contact": {"id": "ct1"}})
+        return self.send() if callable(self.send) else self.send
+
+
+@pytest.mark.parametrize("request_,ambiguous", [
+    (UpsertThenSend(_timeout), True),                                   # send timeout / connection error
+    (UpsertThenSend(lambda: (_ for _ in ()).throw(ConnectionError("reset"))), True),
+    (UpsertThenSend(Resp(500, {})), True),                              # send 5xx
+    (UpsertThenSend(Resp(503, {})), True),
+    (UpsertThenSend(Resp(201, {})), True),                              # 2xx without a message id
+    (UpsertThenSend(Resp(200, None)), True),                            # 2xx with an unreadable body
+    (UpsertThenSend(Resp(422, {"message": "bad"})), False),             # 4xx: GHL rejected it
+    (UpsertThenSend(Resp(429, {})), False),                             # rate limited: not accepted
+    (UpsertThenSend(Resp(400, {})), False),
+])
+def test_only_a_send_that_may_have_been_accepted_is_ambiguous(request_, ambiguous):
+    with pytest.raises(GhlSmsError) as err:
+        GhlSmsSender(ACCOUNT, "+18135550100", request=request_)(PHONE, "hello", None)
+    assert err.value.ambiguous is ambiguous and request_.calls == 2
+
+
+@pytest.mark.parametrize("first", [_timeout, Resp(500, {}), Resp(422, {}), Resp(200, {"contact": {}})])
+def test_a_contact_upsert_failure_is_never_ambiguous(first):
+    calls = []
+
+    def request(*a, **k):
+        calls.append(1)
+        return first(*a, **k) if callable(first) else first
+
+    with pytest.raises(GhlSmsError) as err:
+        GhlSmsSender(ACCOUNT, "+18135550100", request=request)(PHONE, "hello", None)
+    assert err.value.ambiguous is False and len(calls) == 1  # the send was never attempted
+
+
+def test_ghl_sms_error_is_not_ambiguous_by_default():
+    assert GhlSmsError("x").ambiguous is False and GhlSmsError("x", ambiguous=True).ambiguous is True

@@ -40,7 +40,16 @@ _SEND_TIMEOUT = 15  # seconds, same as the shared GHL helper
 
 
 class GhlSmsError(RuntimeError):
-    """A text could not be handed to GHL. The message never contains a phone or response body."""
+    """A text could not be handed to GHL. The message never contains a phone or response body.
+
+    ``ambiguous`` is True when GHL may nonetheless have accepted the text (send timeout or connection
+    error, HTTP 5xx, or a 2xx with no message id): the caller must treat the outcome as unknown and
+    never resend. False means nothing was sent (upsert failures, 4xx rejections).
+    """
+
+    def __init__(self, message: str, *, ambiguous: bool = False) -> None:
+        super().__init__(message)
+        self.ambiguous = ambiguous
 
 
 @dataclass(frozen=True)
@@ -113,16 +122,18 @@ class GhlSmsSender:
     def _send_request(self) -> Request:
         return self._request or _single_attempt
 
-    def _post(self, request: Request, path: str, body: dict, what: str, version: str = "2021-07-28") -> dict:
+    def _post(self, request: Request, path: str, body: dict, what: str, version: str = "2021-07-28",
+              is_send: bool = False) -> dict:
         try:
             response = request("POST", f"{ghl_webhook._GHL_BASE}{path}",
                                      headers=ghl_headers(self._account.api_key, version), json=body)
         except Exception as exc:  # class only: the message can carry request detail
             logger.warning("[lending-ghl-sms] %s request error: %s", what, type(exc).__name__)
-            raise GhlSmsError(f"GHL {what} request error ({type(exc).__name__})") from None
+            raise GhlSmsError(f"GHL {what} request error ({type(exc).__name__})", ambiguous=is_send) from None
         if response.status_code >= 400:
             logger.warning("[lending-ghl-sms] %s failed: HTTP %s", what, response.status_code)
-            raise GhlSmsError(f"GHL {what} failed: HTTP {response.status_code}")
+            raise GhlSmsError(f"GHL {what} failed: HTTP {response.status_code}",
+                              ambiguous=is_send and response.status_code >= 500)
         try:
             return response.json() or {}
         except ValueError:
@@ -137,10 +148,10 @@ class GhlSmsSender:
             raise GhlSmsError("GHL contact upsert returned no contact id")
         sent = self._post(self._send_request(), "/conversations/messages",
                           {"type": "SMS", "contactId": contact_id, "message": body, "fromNumber": self._from},
-                          "message send", version="2021-04-15")  # conversations endpoints use this version
+                          "message send", version="2021-04-15", is_send=True)  # conversations endpoints use this version
         message_id = sent.get("messageId") or sent.get("id")
         if not message_id:
-            raise GhlSmsError("GHL message send returned no message id")
+            raise GhlSmsError("GHL message send returned no message id", ambiguous=True)
         return str(message_id)
 
 
