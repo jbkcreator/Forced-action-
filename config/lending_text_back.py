@@ -66,3 +66,10 @@ STOP_KEYWORDS = frozenset({"stop", "stopall", "unsubscribe", "cancel", "end", "q
 
 # Opt-out words that revoke consent anywhere in a reply (counsel to confirm scope); "opt out" as two words is handled in the router.
 STOP_TOKENS = frozenset({"stop", "stopall", "unsubscribe", "optout", "revoke"})
+
+# Softer declines (counsel to confirm the phrase list): matched as whole-word phrases in the normalized reply
+# (lower-case, punctuation to spaces, so "don't" becomes "don t"). They revoke consent but do not suppress.
+SOFT_DECLINE_PHRASES = (
+    "wrong number", "remove me", "take me off", "no more", "dont text", "don t text", "do not text",
+    "do not contact", "leave me alone", "not interested",
+)
