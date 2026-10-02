@@ -262,9 +262,11 @@ def _seed_permit(db, *, permit_number, issue_offset_days=30, enforcement=False,
         "d": date.today() - timedelta(days=issue_offset_days), "enf": enforcement,
     })
     # Seed the property owner so Pool 2b LEFT JOIN owners can find a phone.
+    # sunbiz_status has a Python-side ORM default ("pending"), not a server
+    # default, so a raw-SQL insert must set it explicitly.
     db.execute(text("""
-        INSERT INTO owners (property_id, owner_name, phone_1)
-        VALUES (:p, :nm, :ph)
+        INSERT INTO owners (property_id, owner_name, phone_1, sunbiz_status)
+        VALUES (:p, :nm, :ph, 'pending')
         ON CONFLICT DO NOTHING
     """), {"p": prop_id, "nm": owner_name, "ph": owner_phone})
     return prop_id
@@ -300,8 +302,10 @@ class TestPool2NOCBuilders:
             pytest.skip("no hillsborough property")
         fresh_db.execute(text("""
             INSERT INTO building_permits
-                (property_id, permit_number, county_id, permit_type, description, job_value, issue_date)
-            VALUES (:p, 'BP-NOPH', 'hillsborough', 'NEW CONSTRUCTION', 'NEW CONSTRUCTION', 250000, NOW())
+                (property_id, permit_number, county_id, permit_type, description,
+                 job_value, issue_date, is_enforcement_permit)
+            VALUES (:p, 'BP-NOPH', 'hillsborough', 'NEW CONSTRUCTION', 'NEW CONSTRUCTION',
+                    250000, NOW(), false)
         """), {"p": prop_id})
         recs = pe._extract_pool2b_noc_permits(fresh_db, ["hillsborough", "pinellas"])
         r = next((r for r in recs if r.permit_number == "BP-NOPH"), None)
