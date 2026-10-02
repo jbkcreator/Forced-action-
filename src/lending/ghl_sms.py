@@ -4,6 +4,12 @@ Credentials: LENDING_GHL_API_KEY + LENDING_GHL_LOCATION_ID (the Next Deal Lendin
 client answer B1) when both are set, else the shared GHL_API_KEY / GHL_LOCATION_ID, which today
 point at the Bay Street Capital sub-account. The fallback is an interim, team-lead-approved
 decision until the client provides the Next Deal Lending sub-account; switching is two env vars.
+Exactly one of the two LENDING_GHL_* set is a misconfiguration and fails closed (no account), so a
+half-finished switch can never text or opt out through the wrong sub-account.
+
+The contact upsert goes through the retrying shared helper (safe to repeat). The message send makes
+exactly ONE attempt: after a read timeout GHL may already have accepted the text, and a retry would
+double-text a borrower. A failed send is reported to the caller and never retried here.
 
 Request shapes follow the public GHL v2 API reference (contacts/upsert, conversations/messages)
 and are NOT yet confirmed against a live round trip. Run ``--send-test`` once with real
@@ -20,6 +26,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+import requests
+
 from config.settings import get_settings
 from src.services import ghl_webhook
 from src.services.phone_utils import normalize
@@ -27,6 +35,8 @@ from src.services.phone_utils import normalize
 logger = logging.getLogger(__name__)
 
 Request = Callable[..., Any]
+
+_SEND_TIMEOUT = 15  # seconds, same as the shared GHL helper
 
 
 class GhlSmsError(RuntimeError):
@@ -40,20 +50,35 @@ class GhlAccount:
 
 
 _warned_fallback = False
+_warned_partial = False
+
+
+def _secret(value: Any) -> str:
+    return value.get_secret_value() if value is not None else ""
 
 
 def lending_ghl_account() -> Optional[GhlAccount]:
-    """Next Deal Lending credentials when both are set, else the shared (Bay Street) ones, else None."""
-    global _warned_fallback
+    """Next Deal Lending credentials when both are set, the shared (Bay Street) ones when neither is,
+    None when nothing is configured or the Next Deal Lending pair is only half set."""
+    global _warned_fallback, _warned_partial
     s = get_settings()
-    if s.lending_ghl_api_key is not None and s.lending_ghl_location_id:
-        return GhlAccount(s.lending_ghl_api_key.get_secret_value(), s.lending_ghl_location_id)
-    if s.ghl_api_key is None or not s.ghl_location_id:
+    lending_key, lending_location = _secret(s.lending_ghl_api_key), s.lending_ghl_location_id or ""
+    if lending_key and lending_location:
+        return GhlAccount(lending_key, lending_location)
+    if lending_key or lending_location:
+        if not _warned_partial:
+            missing = "LENDING_GHL_LOCATION_ID" if lending_key else "LENDING_GHL_API_KEY"
+            logger.error("[lending-ghl] LENDING_GHL_* is only partially set (%s is missing): "
+                         "no GHL account will be used until both are set or both are removed", missing)
+            _warned_partial = True
+        return None
+    shared_key = _secret(s.ghl_api_key)
+    if not shared_key or not s.ghl_location_id:
         return None
     if not _warned_fallback:
         logger.warning("[lending-ghl] LENDING_GHL_* not set: using the shared GHL_* account (interim, Bay Street Capital)")
         _warned_fallback = True
-    return GhlAccount(s.ghl_api_key.get_secret_value(), s.ghl_location_id)
+    return GhlAccount(shared_key, s.ghl_location_id)
 
 
 def ghl_headers(api_key: str, version: str = "2021-07-28") -> dict[str, str]:
@@ -64,16 +89,33 @@ def ghl_headers(api_key: str, version: str = "2021-07-28") -> dict[str, str]:
 def texting_number() -> Optional[str]:
     """The one number used for calling and texting (E.164), or None when not configured."""
     raw = get_settings().lending_ghl_sms_from_number
-    return (normalize(raw) or raw) if raw else None
+    if not raw:
+        return None
+    number = normalize(raw)
+    if number is None:
+        logger.warning("[lending-ghl-sms] LENDING_GHL_SMS_FROM_NUMBER is not a valid US number; texting disabled")
+    return number
+
+
+def _single_attempt(method: str, url: str, **kwargs: Any) -> requests.Response:
+    """One HTTP attempt, no retry: a repeated send can double-text a borrower."""
+    return requests.request(method, url, timeout=_SEND_TIMEOUT, **kwargs)
 
 
 class GhlSmsSender:
-    def __init__(self, account: GhlAccount, from_number: str, request: Request = ghl_webhook._ghl_request) -> None:
+    def __init__(self, account: GhlAccount, from_number: str, request: Optional[Request] = None) -> None:
+        """``request`` (tests) replaces both calls; unset, the upsert retries and the send does not."""
         self._account, self._from, self._request = account, from_number, request
 
-    def _post(self, path: str, body: dict, what: str, version: str = "2021-07-28") -> dict:
+    def _upsert_request(self) -> Request:
+        return self._request or ghl_webhook._ghl_request
+
+    def _send_request(self) -> Request:
+        return self._request or _single_attempt
+
+    def _post(self, request: Request, path: str, body: dict, what: str, version: str = "2021-07-28") -> dict:
         try:
-            response = self._request("POST", f"{ghl_webhook._GHL_BASE}{path}",
+            response = request("POST", f"{ghl_webhook._GHL_BASE}{path}",
                                      headers=ghl_headers(self._account.api_key, version), json=body)
         except Exception as exc:  # class only: the message can carry request detail
             logger.warning("[lending-ghl-sms] %s request error: %s", what, type(exc).__name__)
@@ -90,10 +132,10 @@ class GhlSmsSender:
         contact = {"locationId": self._account.location_id, "phone": phone}
         if first_name:
             contact["firstName"] = first_name
-        contact_id = (self._post("/contacts/upsert", contact, "contact upsert").get("contact") or {}).get("id")
+        contact_id = (self._post(self._upsert_request(), "/contacts/upsert", contact, "contact upsert").get("contact") or {}).get("id")
         if not contact_id:
             raise GhlSmsError("GHL contact upsert returned no contact id")
-        sent = self._post("/conversations/messages",
+        sent = self._post(self._send_request(), "/conversations/messages",
                           {"type": "SMS", "contactId": contact_id, "message": body, "fromNumber": self._from},
                           "message send", version="2021-04-15")  # conversations endpoints use this version
         message_id = sent.get("messageId") or sent.get("id")
@@ -111,6 +153,7 @@ def get_sender() -> Optional[GhlSmsSender]:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    logging.basicConfig(level=logging.INFO)
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--send-test", metavar="PHONE", required=True, help="send ONE real text to this (your own) phone")
     phone = normalize(parser.parse_args(argv).send_test)
@@ -118,7 +161,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     if sender is None or not phone:
         logger.error("[lending-ghl-sms] GHL account / LENDING_GHL_SMS_FROM_NUMBER not configured or phone invalid; nothing sent")
         return 2
-    message_id = sender(phone, "Next Deal Lending test message. Reply STOP to opt out.", None)
+    try:
+        message_id = sender(phone, "Next Deal Lending test message. Reply STOP to opt out.", None)
+    except GhlSmsError as exc:
+        logger.error("[lending-ghl-sms] test text failed: %s", exc)
+        return 1
     logger.info("[lending-ghl-sms] test text accepted by GHL (message id %s)", message_id)
     return 0
 
