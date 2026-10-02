@@ -1,11 +1,14 @@
 """Wave 0 Calling Pool Extraction — WP-W0-1.
 
-Reads the existing FA database (Hillsborough + Pinellas) and produces three
-calling pools for the Lending Engine (Cora):
+Reads the existing FA database (Hillsborough, Pinellas, Pasco) and produces
+three calling pools for the Lending Engine (Cora):
 
     Pool 1  wholesaler_flipper  — buyer_entities with buyer_type IN ('wholesaler','flipper')
-    Pool 2  active_builder      — structural permits (12 mo), no permanent financing recorded
-    Pool 3  mortgage_broker     — STUB; blocked on O4 (OFR registry source unconfirmed)
+    Pool 2  active_builder      — two tagged sub-lists:
+                                    List 3 = DBPR-licensed Cert Building/Residential contractors
+                                    List 7 = property owners with active structural permits (NOC)
+    Pool 3  mortgage_broker     — OFR "Ch 494 MBR-MBRB" registry, loaded via ofr_broker_load;
+                                   fail-closed (0 records) until the table exists and holds rows
 
 Output lands in ``lending_calling_pool_staging`` in the FA database.  This is
 a Wave 0 placeholder location.  The final isolated lending schema (O1) is
@@ -14,18 +17,28 @@ target table without logic changes.
 
 Open items this file is waiting on:
   O1   — Lending-schema location (Dev 2). Staging table used as placeholder.
-  O4   — FL mortgage broker registry source (OFR, not DBPR). Pool 3 is empty stub.
   O11  — Wholesaler definition (buyer_type vs raw deed-velocity). Using buyer_type.
   O12  — Builder permit_type definitions. Using STRUCTURAL_KEYWORDS from config.
-  O13  — Broker contact sourcing. Pool 3 returns [].
   O14  — Intent filter applicability to non-property pools. Applied where property
           anchor exists; non-anchored records pass through at tier='unscored'.
-  O15  — No-phone handling. Rows without a normalised phone are staged with
-          phone_available=False for Dev 2's skip-trace enrichment (WP-W0-3).
+  O15  — No-phone handling: RESOLVED by lead — Tracerfy only (both skip-trace AND
+          DNC check), per client. BatchData is explicitly NOT used (no credits
+          available). Rows without a normalised phone are staged with
+          phone_available=False for WP-W0-3's Tracerfy-only enrichment pass.
   O16  — Multi-pool dedup precedence. Pool 2 > Pool 1 (same entity in both pools
           keeps the Pool 2 row; pools never share a unique phone).
   O28  — Estimated Loan Value formula. Interim formulas in POOL_ELV_FACTORS below.
   O29  — Recent Permit Details for non-builder pools. Omitted; field is NULL.
+
+Pasco/Builders (RESOLVED by lead): include Pasco in Pool 2 scope IF DBPR data
+exists for it — no separate code gate needed, since the DBPR query already
+filters by county_id and returns zero Pasco rows naturally if none exist
+(never fabricates builders). Actual Pasco DBPR row-count verification is
+still blocked on live-DB access (connection to the production host timed out
+from this environment both in this pass and the prior session) — run the
+query below once connected to confirm real coverage:
+    SELECT license_type_desc, COUNT(*) FROM dbpr_contacts
+    WHERE county_id = 'pasco' GROUP BY license_type_desc;
 
 IMPORTANT: estimated_loan_value is an INTERNAL CALLER REFERENCE only.  It is
 derived from public-record job_value / sale_price.  It is never a quote, term,
