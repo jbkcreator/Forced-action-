@@ -1,7 +1,7 @@
 # Dialer call disposition logging: setup runbook
 
 Every dialer call becomes one row in `lending.call_dispositions`; unanswered calls also queue a
-`lending.missed_call_events` row (no consumer; see the handoff section). The result reaches the Google Sheet and Slack `#dial-tasks`
+`lending.missed_call_events` row (consumed by the WP-GL-9 text-back; see the handoff section). The result reaches the Google Sheet and Slack `#dial-tasks`
 within 30 seconds. This runbook is vendor-neutral; the BatchDialer-specific steps are marked.
 
 Call results are ingested by **polling BatchDialer call records (CDRs)** with the service
@@ -102,16 +102,12 @@ All 13 results exist in BatchDialer (group "Lending", created). Only the three b
 
 ### Handoff to the text-back task
 
-- The sender is PR #320's WP-GL-9 pipeline: `src/lending/missed_call_text.py`, `missed_call_poller.py`, table `lending.missed_call_texts`,
-  setting `missed_call_text_enabled`. It reads BatchDialer CDRs itself.
-- Its `consent_gated_sender` uses FA `send_sms` (Telnyx) and currently blocks every send (`skipped_sms_gate`). The client wants GHL on a
-  Next Deal Lending number, consented numbers only, and no text if 10DLC does not clear. That developer should replace the gate with
-  `src.lending.consent.has_text_consent(db, phone)` and the sender with GHL. Nothing else from #319 is promised to the sender.
+- The text-back is built (WP-GL-9): `src/lending/text_back.py`, run from `fa-lending-cdr-poller`. It consumes
+  `lending.missed_call_events`, gates on `src.lending.consent.has_text_consent`, and sends through GoHighLevel. PR #320's
+  `missed_call_poller` / `missed_call_texts` are superseded. Setup, rules and go-live: `docs/lending/text-back-runbook.md`.
 - `record_consent` re-grants a revoked consent because the BatchDialer field `text_consent=yes` stays on the contact, so whoever calls
-  `revoke_consent()` must also clear that dialer field. Today STOP/DNC are enforced through suppression/`do_not_contact` inside
-  `has_text_consent`, so nothing calls revoke yet.
-- #319's `lending.missed_call_events` / `queue_missed_call()` is not read by that pipeline. Follow-up cleanup: remove it once #320 is merged and
-  the text-back task is live (not deleted here; existing tests and the migration cover it).
+  `revoke_consent()` must also clear that dialer field. A STOP is enforced through suppression/`do_not_contact` inside
+  `has_text_consent` (the dialer field is still `yes`), not by clearing the field.
 
 ### Recordings
 
