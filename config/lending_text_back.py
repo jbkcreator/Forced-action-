@@ -49,4 +49,7 @@ FALLBACK_CALLER = "our team"
 ENTITY_TOKENS = frozenset({
     "llc", "inc", "corp", "corporation", "co", "company", "ltd", "lp", "llp", "pllc", "trust",
     "holdings", "properties", "investments", "capital", "group", "partners", "enterprises", "realty",
+    "homes", "home", "construction", "builders", "building", "development", "developers", "ventures",
+    "management", "estate", "bank", "mortgage", "fund", "association", "ministries", "church",
+    "services", "solutions", "associates", "investors", "family", "revocable", "living", "the", "of", "and",
 })

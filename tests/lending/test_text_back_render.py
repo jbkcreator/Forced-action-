@@ -47,6 +47,9 @@ def test_template_follows_the_queue_and_falls_back_to_general_without_an_address
 @pytest.mark.parametrize("name,expected", [
     ("Samuel Jones", "Samuel"), ("SAM JONES", "Sam"), ("mary-ann lee", "Mary-Ann"), ("McDonald Lee", "McDonald"),
     ("Acme Holdings LLC", None), ("Smith Family Trust", None), ("J. Smith", None), ("  ", None), (None, None), ("X", None),
+    ("Bayshore Homes", None), ("Smith Construction", None), ("Tampa Bay Builders", None),
+    ("Smith & Sons Roofing", None), ("Acme L.L.C.", None), ("Estate of John Smith", None),
+    ("Smith, John", None), ("José Garcia", None),
 ])
 def test_first_name_is_a_real_first_name_or_nothing(name, expected):
     assert first_name_of(name) == expected
@@ -73,3 +76,49 @@ def test_worst_case_fields_keep_the_text_short_and_the_stop_language_whole(key):
     long = "x" * 300
     body = render_body(_item(property_address=long, county=long, caller_name=long, borrower_name=long + " Jones"), key, number=NUMBER)
     assert len(body) <= MAX_TEXT_CHARS and body.endswith("Reply STOP to opt out.")
+
+
+def test_street_address_with_only_comma_and_city_falls_back_to_general():
+    assert choose_template(_item(queue="verified_maturity", property_address=", Tampa FL")) == "general"
+
+
+def test_render_body_raises_when_number_is_blank():
+    with pytest.raises(ValueError, match="a texting number is required"):
+        render_body(_item(), "general", number="")
+    with pytest.raises(ValueError, match="a texting number is required"):
+        render_body(_item(), "general", number=None)
+
+
+def test_whitespace_is_collapsed_in_substituted_values():
+    body = render_body(
+        _item(property_address="123  Main\tSt, Tampa FL", caller_name="Alex\n  Kim", county="Hills\tborough"),
+        "deal_drop",
+        number=NUMBER
+    )
+    assert "123 Main St" in body
+    assert "Alex Kim" in body
+    assert "Hills borough" in body
+
+
+def test_braces_in_data_render_literally_without_exception():
+    body = render_body(
+        _item(property_address="{0} {x} Street, Tampa FL", caller_name="Alex {caller}", county="Hill {county}"),
+        "deal_drop",
+        number=NUMBER
+    )
+    assert "{0} {x}" in body
+    assert "Alex {caller}" in body
+    assert "Hill {county}" in body
+
+
+def test_deal_drop_text_renders_exactly():
+    assert render_body(_item(queue="transaction_ready"), "deal_drop", number=NUMBER) == (
+        "Hi Sam, Alex from Next Deal Lending here. Just tried you about 123 Main St. "
+        "We help investors in Hillsborough fund their next deal. Text back if you'd like to chat. "
+        "Reply STOP to opt out.")
+
+
+def test_general_text_renders_exactly():
+    assert render_body(_item(queue="nurture"), "general", number=NUMBER) == (
+        "Hi Sam, this is Alex with Next Deal Lending. Sorry we missed each other. "
+        "Reply here or call (813) 555-0100 whenever works. Reply STOP to opt out.")
