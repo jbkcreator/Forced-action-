@@ -33,6 +33,18 @@ def run_cycle(db, http, *, rescan: bool) -> IngestStats:
     return stats
 
 
+def text_back_step() -> None:
+    """WP-GL-9: send the missed-call texts queued by the cycle that just ran. Never blocks ingestion."""
+    from src.lending.text_back import run_text_back_cycle
+
+    try:
+        counts = run_text_back_cycle()
+        if counts:
+            logger.info("[lending-cdr-poller] text-back %s", counts)
+    except Exception as exc:  # class only: bodies carry phone numbers
+        logger.error("[lending-cdr-poller] text-back cycle failed (%s); retrying next interval", type(exc).__name__)
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--once", action="store_true", help="run a single cycle (with a rescan) and exit")
@@ -75,6 +87,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 logger.error("[lending-cdr-poller] cycle failed (%s); retrying next interval", type(exc).__name__)
                 if args.once:
                     raise
+            text_back_step()
             if args.once:
                 return 0
             time.sleep(CDR_POLL_SECONDS)

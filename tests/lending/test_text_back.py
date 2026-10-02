@@ -186,3 +186,16 @@ def test_a_render_failure_is_recorded_failed_and_never_left_in_sending(db):
     sender = Sender()
     assert run(db, sender, number="   ") == {"failed": 1} and sender.sent == []
     assert status(db) == "failed"
+
+
+def test_a_text_back_error_never_stops_the_poller_cycle(monkeypatch, caplog):
+    from src.lending import cdr_poller
+    monkeypatch.setattr("src.lending.text_back.run_text_back_cycle", lambda **k: (_ for _ in ()).throw(RuntimeError(PHONE)))
+    cdr_poller.text_back_step()  # must not raise
+    assert PHONE not in caplog.text and "text-back cycle failed" in caplog.text
+
+
+def test_the_old_second_poller_refuses_to_start(caplog):
+    from src.lending import missed_call_poller
+    missed_call_poller.main(["--once"])
+    assert "superseded" in caplog.text
