@@ -194,6 +194,72 @@ class TestPool3Brokers:
         assert r.phone_available is False and r.normalized_phone is None
 
 
+def _insert_lo(db, *, license_number, last="SMITH", first="JOHN", county="HILLSBOROUGH",
+               status="Approved", phone="", state="FL"):
+    db.execute(text("""
+        INSERT INTO ofr_loan_originators
+            (license_number, nmls_id, last_name, first_name, prim_address_1,
+             prim_city, county, prim_state, prim_zip, phone_raw, normalized_phone, status)
+        VALUES (:ln, '1', :last, :first, '1 MAIN ST',
+                :city, :county, :state, '33601', :phone, :norm, :status)
+    """), {
+        "ln": license_number, "last": last, "first": first, "city": "TAMPA",
+        "county": county, "state": state, "phone": phone,
+        "norm": pe.normalize_phone(phone) if phone else None, "status": status,
+    })
+
+
+class TestPool3LoanOriginators:
+    """List 4 'brokers and LOs' — the LO half, wired into the same Pool 3 function."""
+
+    def test_includes_approved_target_county(self, fresh_db):
+        _insert_lo(fresh_db, license_number="LO-INC-1", last="SMITH", first="JANE", county="HILLSBOROUGH")
+        recs = pe._extract_pool3_mortgage_broker(fresh_db, [])
+        r = next((r for r in recs if r.dbpr_license_number == "LO-INC-1"), None)
+        assert r is not None
+        assert r.pool_name == "mortgage_broker"
+        assert r.borrower_name == "JANE SMITH"          # individual — unlike firm-level broker rows
+        assert r.entity_status == "NATURAL_PERSON"
+        assert r.campaign_list == "List 4"
+        assert r.aircall_campaign_tag == "DESK_RESCUE"
+        assert r.source_table == "ofr_loan_originators"
+
+    def test_excludes_non_approved(self, fresh_db):
+        _insert_lo(fresh_db, license_number="LO-EXP", status="Expired")
+        recs = pe._extract_pool3_mortgage_broker(fresh_db, [])
+        assert not any(r.dbpr_license_number == "LO-EXP" for r in recs)
+
+    def test_excludes_other_county(self, fresh_db):
+        # Out-of-state LOs (confirmed common in the real OFR file) must not leak in.
+        _insert_lo(fresh_db, license_number="LO-MI", county="ALLEGAN", state="MI")
+        recs = pe._extract_pool3_mortgage_broker(fresh_db, [])
+        assert not any(r.dbpr_license_number == "LO-MI" for r in recs)
+
+    def test_no_phone_flagged(self, fresh_db):
+        # Real OFR data: ~0% of LOs have a phone even after narrowing to local county.
+        _insert_lo(fresh_db, license_number="LO-NOPH", phone="")
+        recs = pe._extract_pool3_mortgage_broker(fresh_db, [])
+        r = next(r for r in recs if r.dbpr_license_number == "LO-NOPH")
+        assert r.phone_available is False and r.normalized_phone is None
+
+    def test_los_returned_when_brokers_table_empty(self, fresh_db):
+        """Regression test: brokers and LOs are independent OFR datasets. An empty/absent
+        brokers table must never silently suppress LOs (the bug this test guards against —
+        an early `return []` on the brokers fail-closed check used to skip the LO call too)."""
+        _insert_lo(fresh_db, license_number="LO-ALONE", county="HILLSBOROUGH")
+        # Deliberately no broker rows inserted — ofr_mortgage_brokers is empty,
+        # so _ofr_registry_available(session) is False for brokers.
+        recs = pe._extract_pool3_mortgage_broker(fresh_db, [])
+        assert any(r.dbpr_license_number == "LO-ALONE" for r in recs)
+
+    def test_brokers_and_los_both_present(self, fresh_db):
+        _insert_broker(fresh_db, license_number="MBR-BOTH", county="HILLSBOROUGH")
+        _insert_lo(fresh_db, license_number="LO-BOTH", county="HILLSBOROUGH")
+        recs = pe._extract_pool3_mortgage_broker(fresh_db, [])
+        assert any(r.dbpr_license_number == "MBR-BOTH" for r in recs)
+        assert any(r.dbpr_license_number == "LO-BOTH" for r in recs)
+
+
 # ---------------------------------------------------------------------------
 # Pool 1 — Wholesalers / Flippers (DB-backed)
 # ---------------------------------------------------------------------------
