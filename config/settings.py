@@ -336,15 +336,6 @@ class AppSettings(BaseSettings):
 	ofr_broker_enabled: bool = Field(default=False, env="OFR_BROKER_ENABLED")
 	ofr_broker_download_url: Optional[str] = Field(default=None, env="OFR_BROKER_DOWNLOAD_URL")
 
-	# OFR individual Loan Originator (LO) ingestion — List 4 "brokers and LOs" (flagged gap,
-	# WP-W0-1). Split across 3 monthly zips by surname range (A-I, J-R, S-Z) at
-	# real.flofr.com/Public/LO/. Disabled by default — NOT yet wired into Pool 3's
-	# extraction; loader-only until the client confirms LOs are in scope for launch.
-	ofr_lo_enabled: bool = Field(default=False, env="OFR_LO_ENABLED")
-	ofr_lo_download_url_ai: Optional[str] = Field(default=None, env="OFR_LO_DOWNLOAD_URL_AI")
-	ofr_lo_download_url_jr: Optional[str] = Field(default=None, env="OFR_LO_DOWNLOAD_URL_JR")
-	ofr_lo_download_url_sz: Optional[str] = Field(default=None, env="OFR_LO_DOWNLOAD_URL_SZ")
-
 	# PropertyRadar ingestion adapter (Developer 1)
 	# Solo plan: 10,000 export credits/month. Purchase=0 counts are free and
 	# never billed. Set property_radar_mode="fake" (default) in tests/local;
