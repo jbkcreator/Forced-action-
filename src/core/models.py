@@ -11470,7 +11470,10 @@ class FaMaxBackflipCampaignContact(Base):
     imported_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     __table_args__ = (
-        CheckConstraint("identifier_kind IN ('email', 'phone')", name="ck_fa_max_backflip_identifier_kind"),
+        CheckConstraint(
+            "identifier_kind IN ('email', 'phone', 'entity_name', 'parcel_id')",
+            name="ck_fa_max_backflip_identifier_kind",
+        ),
         Index("ix_fa_max_backflip_active_contact", "identifier_kind", "identifier_value", postgresql_where=text("active")),
     )
 
@@ -12683,4 +12686,161 @@ class LeadCampaignAssignment(Base):
               postgresql_where=text("status = 'active'")),
         Index("uq_lca_claim", "person_id", "campaign", text("COALESCE(radar_id, '')"), unique=True),
         Index("ix_lca_campaign", "campaign"),
+    )
+
+
+class LendingCallingPoolStaging(Base):
+    """WP-W0-1 output: the three Wave 0 calling pools (one row per contact).
+
+    Populated by src/services/lending/pool_extraction.py. All three pools land
+    here, distinguished by pool_name. Read by WP-W0-2 (compliance) and WP-W0-4
+    (Aircall load). Wave 0 placeholder location (O1); the final isolated lending
+    schema is Dev 2's — only the table name changes when that lands.
+    """
+    __tablename__ = "calling_pool_staging"  # lending schema (ADR 0001); public view keeps the old name
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(PG_UUID(as_uuid=False), nullable=False, index=True)
+    pool_name: Mapped[str] = mapped_column(String, nullable=False)  # wholesaler_flipper | active_builder | mortgage_broker
+
+    county_id: Mapped[Optional[str]] = mapped_column(String)
+    county_name: Mapped[Optional[str]] = mapped_column(String)
+
+    # Spec §4.3 dialer display attributes
+    borrower_name: Mapped[Optional[str]] = mapped_column(String)
+    entity_name: Mapped[Optional[str]] = mapped_column(String)
+    target_property_address: Mapped[Optional[str]] = mapped_column(String)
+    recent_permit_details: Mapped[Optional[str]] = mapped_column(String)
+
+    # Compliance / geo (Dev 2's DNC + Georgia rules)
+    entity_status: Mapped[Optional[str]] = mapped_column(String)  # LLC|CORPORATION|NATURAL_PERSON|TRUST|NULL
+    parcel_id: Mapped[Optional[str]] = mapped_column(String)
+    zip: Mapped[Optional[str]] = mapped_column(String)
+    state: Mapped[Optional[str]] = mapped_column(String)
+
+    # Contact
+    normalized_phone: Mapped[Optional[str]] = mapped_column(String)  # E.164 or NULL
+    phone_available: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    line_type: Mapped[Optional[str]] = mapped_column(String)  # 'mobile'|'landline'|'unknown'
+    email: Mapped[Optional[str]] = mapped_column(String)
+
+    # Intent (O14)
+    financing_intent_score: Mapped[Optional[float]] = mapped_column(Numeric(5, 2))
+    intent_tier: Mapped[Optional[str]] = mapped_column(String)  # high|medium|low|unscored
+    recommended_product: Mapped[Optional[str]] = mapped_column(String)
+
+    # INTERNAL ESTIMATE — never quoted to borrower (O28)
+    estimated_loan_value: Mapped[Optional[float]] = mapped_column(Numeric(14, 2))
+
+    aircall_campaign_tag: Mapped[str] = mapped_column(String, nullable=False)
+
+    # Provenance (one per pool type, others NULL)
+    buyer_entity_id: Mapped[Optional[int]] = mapped_column(BigInteger)
+    permit_number: Mapped[Optional[str]] = mapped_column(String)
+    dbpr_license_number: Mapped[Optional[str]] = mapped_column(String)
+    source_property_id: Mapped[Optional[int]] = mapped_column(BigInteger)
+    source_table: Mapped[str] = mapped_column(String, nullable=False)
+    # Go Live Brief 2.5 source list (list_1..list_9); apply_lending_pool_source_tags.py
+    source_tag: Mapped[Optional[str]] = mapped_column(String)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "pool_name IN ('wholesaler_flipper', 'active_builder', 'mortgage_broker', 'auction_winner', 'permit_owner')",
+            name="lending_calling_pool_staging_pool_name_check",
+        ),
+        Index("idx_lcps_run_id", "run_id"),
+        Index("idx_lcps_pool_phone", "pool_name", "phone_available"),
+        Index("idx_lcps_county", "county_id"),
+        Index("idx_lcps_state", "state"),
+        Index("idx_lcps_source_tag", "source_tag"),
+        {"schema": "lending"},
+    )
+
+
+class OfrMortgageBroker(Base):
+    """WP-W0-1 Pool 3 source: Florida OFR Ch 494 mortgage-broker business licenses.
+
+    Loaded from the OFR "Ch 494 Businesses - NMLS (MBR-MBRB)" bulk download by
+    src/tasks/ofr_broker_load.py. The authoritative FL mortgage-broker registry
+    (spec §4.1). Pool 3 reads Approved rows in the target counties.
+    """
+    __tablename__ = "ofr_mortgage_brokers"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    license_number: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    license_type: Mapped[Optional[str]] = mapped_column(String)  # MBR | MBRB
+    nmls_id: Mapped[Optional[str]] = mapped_column(String, index=True)
+    firm_name: Mapped[Optional[str]] = mapped_column(String)
+
+    prim_address_1: Mapped[Optional[str]] = mapped_column(String)
+    prim_address_2: Mapped[Optional[str]] = mapped_column(String)
+    prim_city: Mapped[Optional[str]] = mapped_column(String)
+    county: Mapped[Optional[str]] = mapped_column(String)
+    prim_state: Mapped[Optional[str]] = mapped_column(String)
+    prim_zip: Mapped[Optional[str]] = mapped_column(String)
+
+    phone_raw: Mapped[Optional[str]] = mapped_column(String)
+    normalized_phone: Mapped[Optional[str]] = mapped_column(String)  # E.164 or NULL
+
+    status: Mapped[Optional[str]] = mapped_column(String)  # Approved | Expired | ...
+    status_effective_date: Mapped[Optional[date]] = mapped_column(Date)
+    initial_approval: Mapped[Optional[date]] = mapped_column(Date)
+
+    loaded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("idx_ofr_brokers_status_county", "status", "county"),
+        Index("idx_ofr_brokers_nmls", "nmls_id"),
+    )
+
+
+class OfrLoanOriginator(Base):
+    """List 4 "brokers and LOs" gap: individual OFR Loan Originator licenses.
+
+    Loaded from the OFR "LO" bulk download (3 monthly zips split by surname
+    range: AI, JR, SZ) by src/tasks/ofr_lo_load.py. NATIONWIDE NMLS registry —
+    most records are out-of-state individuals holding a remote FL LO license
+    (confirmed from real sample data: Michigan/Oregon addresses), NOT a
+    Florida-residents file. Phone is blank on virtually every record (confirmed
+    from real sample data) — every row needs skip-trace before it is callable.
+
+    NOT YET WIRED into Pool 3's extraction — loader-only until the client
+    confirms LOs are in scope for launch (flagged gap, WP-W0-1).
+    """
+    __tablename__ = "ofr_loan_originators"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    license_number: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    nmls_id: Mapped[Optional[str]] = mapped_column(String, index=True)
+    last_name: Mapped[Optional[str]] = mapped_column(String)
+    first_name: Mapped[Optional[str]] = mapped_column(String)
+    middle_name: Mapped[Optional[str]] = mapped_column(String)
+
+    prim_address_1: Mapped[Optional[str]] = mapped_column(String)
+    prim_address_2: Mapped[Optional[str]] = mapped_column(String)
+    prim_city: Mapped[Optional[str]] = mapped_column(String)
+    county: Mapped[Optional[str]] = mapped_column(String)
+    prim_state: Mapped[Optional[str]] = mapped_column(String)
+    prim_zip: Mapped[Optional[str]] = mapped_column(String)
+
+    phone_raw: Mapped[Optional[str]] = mapped_column(String)       # blank on nearly every row
+    normalized_phone: Mapped[Optional[str]] = mapped_column(String)  # E.164 or NULL
+
+    status: Mapped[Optional[str]] = mapped_column(String)  # Approved | Expired | ...
+    status_effective_date: Mapped[Optional[date]] = mapped_column(Date)
+    initial_approval: Mapped[Optional[date]] = mapped_column(Date)
+
+    loaded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("idx_ofr_los_status_state", "status", "prim_state"),
+        Index("idx_ofr_los_nmls", "nmls_id"),
     )
