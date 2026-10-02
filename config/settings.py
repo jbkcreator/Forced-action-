@@ -327,6 +327,15 @@ class AppSettings(BaseSettings):
 	# storm/restoration contractors from dbpr_contacts. Flip in env, no code deploy.
 	cora_target_mode: str = Field(default="whale", env="CORA_TARGET_MODE")
 
+	# OFR mortgage-broker ingestion (WP-W0-1 Pool 3)
+	# Fully automated monthly pull: download the OFR "Ch 494 Businesses -
+	# NMLS (MBR-MBRB)" zip, unzip, load into ofr_mortgage_brokers. Disabled by
+	# default; set OFR_BROKER_ENABLED=true in production once the prod box can
+	# reach flofr.gov. URL is the direct zip download (copied from the OFR
+	# Registration Data Download page).
+	ofr_broker_enabled: bool = Field(default=False, env="OFR_BROKER_ENABLED")
+	ofr_broker_download_url: Optional[str] = Field(default=None, env="OFR_BROKER_DOWNLOAD_URL")
+
 	# PropertyRadar ingestion adapter (Developer 1)
 	# Solo plan: 10,000 export credits/month. Purchase=0 counts are free and
 	# never billed. Set property_radar_mode="fake" (default) in tests/local;
@@ -858,6 +867,13 @@ class AppSettings(BaseSettings):
 	# app boots without Aircall configured (feature-gated).
 	aircall_api_id: Optional[SecretStr] = Field(default=None, env="AIRCALL_API_ID")
 	aircall_api_token: Optional[SecretStr] = Field(default=None, env="AIRCALL_API_TOKEN")
+	batchdialer_api_key: Optional[SecretStr] = Field(default=None, env="BATCHDIALER_API_KEY")
+	missed_call_text_enabled: bool = Field(default=False, env="MISSED_CALL_TEXT_ENABLED")  # WP-GL-9; off until consent + sender confirmed
+	# Backflip borrower conflict check on the lending load. Off for launch: there is no
+	# Backflip export, and a missing or stale feed blocks every record when it is on.
+	lending_backflip_check_enabled: bool = Field(default=False, env="LENDING_BACKFLIP_CHECK_ENABLED")
+	# Shared secret the GHL "DND changed" workflow sends in X-Webhook-Secret. Unset = endpoint closed.
+	lending_ghl_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_GHL_WEBHOOK_SECRET")
 	aircall_webhook_token: Optional[SecretStr] = Field(default=None, env="AIRCALL_WEBHOOK_TOKEN")
 	# ── Meta Conversions API (CAPI) — S2 ────────────────────────────────────
 	# Server-side Purchase reporting for closed-loop Meta ad attribution.

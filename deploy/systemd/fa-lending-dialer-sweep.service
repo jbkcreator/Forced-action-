@@ -1,0 +1,24 @@
+[Unit]
+Description=Forced Action — Lending dialer sweep (60 s, calling-window and attempt-cap pull and restore)
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/Forced-action-
+Environment="PATH=/root/Forced-action-/.venv/bin"
+Environment="PYTHONPATH=/root/Forced-action-"
+EnvironmentFile=/root/Forced-action-/.env
+ExecStart=/root/Forced-action-/.venv/bin/python -m src.lending.dialer_sweep
+Restart=always
+RestartSec=15
+StartLimitIntervalSec=120
+StartLimitBurst=5
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fa-lending-dialer-sweep
+
+[Install]
+WantedBy=multi-user.target

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import csv
 import logging
+import re
 from pathlib import Path
 from typing import Protocol
 from sqlalchemy import text
@@ -37,6 +38,40 @@ from sqlalchemy import text
 from src.core.database import get_db_context
 
 logger = logging.getLogger(__name__)
+
+IDENTIFIER_KINDS: frozenset[str] = frozenset({"email", "phone", "entity_name", "parcel_id"})
+
+_ENTITY_PUNCTUATION_RE = re.compile(r"[^\w\s]")
+_WHITESPACE_RE = re.compile(r"\s+")
+_PARCEL_SEPARATOR_RE = re.compile(r"[^0-9A-Z]")
+
+
+def normalize_email(raw: str | None) -> str | None:
+    """Lower-cased address, or None when it is not a plausible email."""
+    canonical = (raw or "").strip().lower()
+    if canonical.count("@") != 1:
+        return None
+    local, domain = canonical.split("@", 1)
+    if not local or "." not in domain:
+        return None
+    return canonical
+
+
+def normalize_entity_name(raw: str | None) -> str | None:
+    """Upper-case, punctuation removed, whitespace collapsed.
+
+    Legal suffixes (LLC, INC, CORP) are deliberately kept: stripping them
+    makes unrelated companies that share a stem ("FYLOS LLC" / "FYLOS INC")
+    compare equal, and a false conflict silently drops a good lead.
+    """
+    canonical = _WHITESPACE_RE.sub(" ", _ENTITY_PUNCTUATION_RE.sub("", (raw or "").upper())).strip()
+    return canonical or None
+
+
+def normalize_parcel_id(raw: str | None) -> str | None:
+    """Upper-case with separators removed; leading zeros are significant and kept."""
+    canonical = _PARCEL_SEPARATOR_RE.sub("", (raw or "").upper())
+    return canonical or None
 
 
 def parse_backflip_csv(csv_path: Path) -> set[tuple[str, str]]:
@@ -47,8 +82,8 @@ def parse_backflip_csv(csv_path: Path) -> set[tuple[str, str]]:
     with csv_path.open(newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
         headers = {name.strip().lower() for name in (reader.fieldnames or [])}
-        if not headers.intersection({"email", "phone"}):
-            raise ValueError("CSV needs an email or phone column")
+        if not headers.intersection(IDENTIFIER_KINDS):
+            raise ValueError("CSV needs an email, phone, entity_name or parcel_id column")
         for line_no, raw in enumerate(reader, start=2):
             row = {
                 (key or "").strip().lower(): (value or "").strip()
@@ -61,6 +96,12 @@ def parse_backflip_csv(csv_path: Path) -> set[tuple[str, str]]:
                 if not phone:
                     raise ValueError(f"invalid phone on CSV line {line_no}")
                 identifiers.add(("phone", phone))
+            entity_name = normalize_entity_name(row.get("entity_name"))
+            if entity_name:
+                identifiers.add(("entity_name", entity_name))
+            parcel_id = normalize_parcel_id(row.get("parcel_id"))
+            if parcel_id:
+                identifiers.add(("parcel_id", parcel_id))
     return identifiers
 
 
@@ -70,17 +111,19 @@ def replace_backflip_snapshot(
     """Validate and atomically replace the active snapshot for every adapter."""
     from src.services.phone_utils import normalize
     normalized: set[tuple[str, str]] = set()
+    normalizers = {
+        "email": normalize_email,
+        "phone": normalize,
+        "entity_name": normalize_entity_name,
+        "parcel_id": normalize_parcel_id,
+    }
     for kind, value in identifiers:
-        if kind == "email":
-            canonical = value.strip().lower()
-            if canonical.count("@") != 1 or not canonical.split("@", 1)[0] or "." not in canonical.split("@", 1)[1]:
-                raise ValueError("invalid campaign email")
-        elif kind == "phone":
-            canonical = normalize(value)
-            if canonical is None:
-                raise ValueError("invalid campaign phone")
-        else:
+        normalizer = normalizers.get(kind)
+        if normalizer is None:
             raise ValueError("invalid campaign identifier kind")
+        canonical = normalizer(value)
+        if canonical is None:
+            raise ValueError(f"invalid campaign {kind}")
         normalized.add((kind, canonical))
     if not normalized and not allow_empty:
         raise ValueError("empty campaign snapshot; pass --allow-empty after verifying the export")
