@@ -888,6 +888,7 @@ class AppSettings(BaseSettings):
 	lending_disposition_missing_alert_minutes: int = Field(default=10, env="LENDING_DISPOSITION_MISSING_ALERT_MINUTES")
 	lending_slack_bot_token: Optional[SecretStr] = Field(default=None, env="LENDING_SLACK_BOT_TOKEN")
 	lending_dial_tasks_channel: str = Field(default="", env="LENDING_DIAL_TASKS_CHANNEL")
+	lending_replies_channel: str = Field(default="", env="LENDING_REPLIES_CHANNEL")  # WP-GL-10 rate/terms handoffs; channel ID, the Cora Lending bot must be a member
 	lending_daily_channel: str = Field(default="", env="LENDING_DAILY_CHANNEL")  # 7pm scoreboard; channel ID
 	lending_sheets_service_account_key_path: str = Field(default="", env="LENDING_SHEETS_SERVICE_ACCOUNT_KEY_PATH")
 	lending_disposition_sheet_id: str = Field(default="", env="LENDING_DISPOSITION_SHEET_ID")
@@ -1028,6 +1029,16 @@ class AppSettings(BaseSettings):
 	fa_max_autonomous_dispatch_confirmed: bool = Field(
 		default=False, env="FA_MAX_AUTONOMOUS_DISPATCH_CONFIRMED"
 	)
+
+	# ── WP-GL-10 — Booking confirmations and reminders ───────────────────────
+	# Texts go through GoHighLevel only (src/lending/ghl_sms.py, same account and number as
+	# WP-GL-9). Off until the 10DLC registration clears; the worker then records every due text
+	# as skipped_text_not_enabled instead of sending. Separate from MISSED_CALL_TEXT_ENABLED so
+	# each message family has its own off switch (open question: one switch or two).
+	booking_reminder_text_enabled: bool = Field(default=False, env="BOOKING_REMINDER_TEXT_ENABLED")
+	# Email fallback (B4) stays off until hello@nextdeallending.com has a sender behind it
+	# (Porkbun DNS + Google Workspace are not provisioned). Off = recorded as skipped, never "sent".
+	booking_reminder_email_enabled: bool = Field(default=False, env="BOOKING_REMINDER_EMAIL_ENABLED")
 
 
 @lru_cache

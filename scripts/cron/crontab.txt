@@ -1194,6 +1194,10 @@ COUNTY_ID=hillsborough
 20 23 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_daily_scoreboard
 20 0 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_daily_scoreboard
 
+# Lending 9am ET list of confirmation calls due (WP-GL-10, lending.confirmation_tasks). Two lines because ET is UTC-4 until Nov 1 and UTC-5 after; the task posts only when it is 9:xx ET.
+0 13 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_confirmation_tasks
+0 14 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_confirmation_tasks
+
 # Lending weekly DNC / litigator re-scrub of numbers loaded in the dialer (Go Live G10).
 # Mondays 06:00 UTC (02:00 ET), before the 09:00 ET calling window. Spends Tracerfy
 # credits (1 per number) up to a hard --max-credits cap; exit 4 = cap reached.
