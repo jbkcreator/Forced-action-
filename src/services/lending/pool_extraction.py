@@ -55,13 +55,28 @@ logger = logging.getLogger(__name__)
 # and Pinellas counties only."
 # ---------------------------------------------------------------------------
 
-WAVE0_COUNTY_NAMES: tuple[str, ...] = ("Hillsborough", "Pinellas")
+WAVE0_COUNTY_NAMES: tuple[str, ...] = ("Hillsborough", "Pinellas", "Pasco")
 
 # Aircall campaign tags — spec §4.3
 AIRCALL_TAG: dict[str, str] = {
     "wholesaler_flipper": "DESK_CAPITAL_LOOP",
     "active_builder": "DESK_CONSTRUCTION",
     "mortgage_broker": "DESK_RESCUE",
+}
+
+# Josh's List 1-9 campaign taxonomy (client comments answers doc + questionnaire v2).
+# Builders map to two lists depending on source:
+#   List 3 = DBPR-licensed contractors (license registry — active builders by credential)
+#   List 7 = NOC/permit property owners (building_permits — active construction projects)
+# Brokers: List 4.
+# Wholesaler/Flipper: PROVISIONAL — the client taxonomy names Lists 3, 4, 7 explicitly
+# but has no explicit number for the wholesaler/flipper pool; left None until Josh
+# confirms in the next launch prep session.
+CAMPAIGN_LIST: dict[str, str | None] = {
+    "wholesaler_flipper": None,          # provisional — needs Josh confirmation
+    "active_builder_dbpr": "List 3",     # DBPR-licensed contractors
+    "active_builder_noc": "List 7",      # NOC/permit property owners
+    "mortgage_broker": "List 4",
 }
 
 # Permit lookback window — spec §4.1 "12-month active permits"
@@ -202,6 +217,7 @@ class CallingPoolRecord:
     # ── Contact ─────────────────────────────────────────────────────────
     normalized_phone: Optional[str]       # E.164 or None (see O15)
     phone_available: bool
+    line_type: Optional[str]              # 'mobile' | 'landline' | 'unknown' | None
     email: Optional[str]
 
     # ── Intent filter (spec §4.1 "Filter: Intent Scoring") ──────────────
@@ -209,8 +225,9 @@ class CallingPoolRecord:
     intent_tier: Optional[str]            # high | medium | low | unscored
     recommended_product: Optional[str]
 
-    # ── Routing + provenance ────────────────────────────────────────────
+    # ── Routing + campaign taxonomy ─────────────────────────────────────
     aircall_campaign_tag: str
+    campaign_list: Optional[str]          # Josh's List 1-9; see CAMPAIGN_LIST
     buyer_entity_id: Optional[int]        # set for Pool 1
     permit_number: Optional[str]          # set for Pool 2
     dbpr_license_number: Optional[str]    # reserved for Pool 3
@@ -415,11 +432,13 @@ def _extract_pool1_wholesaler_flipper(
             state=row.prop_state or WAVE0_STATE,
             normalized_phone=norm,
             phone_available=norm is not None,
+            line_type="unknown",           # buyer_entity phone source doesn't distinguish mobile/landline
             email=row.email,
             financing_intent_score=None,   # attached by _attach_intent_scores
             intent_tier=None,
             recommended_product=None,
             aircall_campaign_tag=AIRCALL_TAG["wholesaler_flipper"],
+            campaign_list=CAMPAIGN_LIST["wholesaler_flipper"],  # None — provisional, needs Josh confirmation
             buyer_entity_id=row.buyer_entity_id,
             permit_number=None,
             dbpr_license_number=None,
@@ -467,6 +486,14 @@ def _extract_pool2_active_builder(
                 dc.county_id,
                 c.display_name              AS county_name,
                 COALESCE(dc.mobile_phone, dc.phone, dc.landline_phone) AS raw_phone,
+                -- Capture which DBPR phone field was used so line_type is deterministic.
+                -- DBPR stores mobile and landline in separate columns; 'phone' is untyped.
+                CASE
+                    WHEN dc.mobile_phone IS NOT NULL THEN 'mobile'
+                    WHEN dc.phone IS NOT NULL THEN 'unknown'
+                    WHEN dc.landline_phone IS NOT NULL THEN 'landline'
+                    ELSE NULL
+                END AS phone_line_type,
                 dc.email
             FROM dbpr_contacts dc
             JOIN counties c ON c.county_id = dc.county_id
@@ -507,11 +534,13 @@ def _extract_pool2_active_builder(
             state=row.prop_state or WAVE0_STATE,
             normalized_phone=norm,
             phone_available=norm is not None,
+            line_type=row.phone_line_type,        # 'mobile'|'landline'|'unknown' from DBPR columns
             email=row.email,
             financing_intent_score=None,
             intent_tier=None,
             recommended_product=None,
             aircall_campaign_tag=AIRCALL_TAG["active_builder"],
+            campaign_list=CAMPAIGN_LIST["active_builder_dbpr"],  # List 3
             buyer_entity_id=None,
             permit_number=None,
             dbpr_license_number=row.license_number,
@@ -519,8 +548,125 @@ def _extract_pool2_active_builder(
             source_table="dbpr_contacts",
         ))
 
+    noc_records = _extract_pool2b_noc_permits(session, county_ids)
+    records.extend(noc_records)
+
     logger.info(
-        "Pool 2 active_builder: %d DBPR contractors (%d with phone)",
+        "Pool 2 active_builder: %d DBPR (List 3) + %d NOC/permits (List 7), %d with phone",
+        len(records) - len(noc_records),
+        len(noc_records),
+        sum(1 for r in records if r.phone_available),
+    )
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Pool 2b — NOC / Permits (List 7)
+# ---------------------------------------------------------------------------
+
+def _extract_pool2b_noc_permits(
+    session: Session,
+    county_ids: list[str],
+) -> list[CallingPoolRecord]:
+    """List 7: property owners with active structural/new-construction permits.
+
+    Targets the PROPERTY OWNER side of a construction project — investors or
+    owner-builders who have filed a structural permit in the last 12 months.
+    Distinct from List 3 (DBPR contractors): these are the project owners who
+    may need construction or bridge financing, not the licensed builders per se.
+
+    Phone sourced from the owners table (skip-traced). Records without a phone
+    flow to the shared skip-trace queue (WP-W0-3) same as every other pool.
+
+    Only structural permit types are included; enforcement/violation permits
+    (code_violation, stop-work) are explicitly excluded to avoid conflating
+    a distressed property with an active development project.
+    """
+    rows = session.execute(
+        text("""
+            SELECT DISTINCT ON (p.id)
+                p.id                        AS source_property_id,
+                p.parcel_id,
+                p.address                   AS prop_address,
+                p.city                      AS prop_city,
+                p.state                     AS prop_state,
+                p.zip                       AS prop_zip,
+                p.county_id,
+                c.display_name              AS county_name,
+                o.owner_name                AS borrower_name,
+                COALESCE(o.phone_1, o.phone_2, o.phone_3) AS raw_phone,
+                o.email_1                   AS email,
+                bp.permit_number,
+                bp.permit_type,
+                bp.issue_date,
+                bp.job_value
+            FROM building_permits bp
+            JOIN properties p ON p.id = bp.property_id
+            JOIN counties c   ON c.county_id = p.county_id
+            LEFT JOIN owners o ON o.property_id = p.id
+            WHERE p.county_id = ANY(:county_ids)
+              AND bp.issue_date > NOW() - INTERVAL '12 months'
+              AND (
+                    bp.permit_type ILIKE '%new construction%'
+                 OR bp.permit_type ILIKE '%ground up%'
+                 OR bp.permit_type ILIKE '%foundation%'
+                 OR bp.permit_type ILIKE '%structural%'
+                 OR bp.permit_type ILIKE '%addition%'
+                 OR bp.permit_type ILIKE '%residential new%'
+              )
+              AND bp.permit_type NOT ILIKE '%code violation%'
+              AND bp.permit_type NOT ILIKE '%enforcement%'
+              AND bp.permit_type NOT ILIKE '%stop work%'
+            ORDER BY p.id, bp.issue_date DESC NULLS LAST
+        """),
+        {"county_ids": county_ids},
+    ).fetchall()
+
+    records: list[CallingPoolRecord] = []
+    for row in rows:
+        norm = normalize_phone(row.raw_phone)
+        # O28 New Construction: use actual job_value if present; fall back to avg.
+        if row.job_value:
+            raw_elv = Decimal(str(row.job_value)) * Decimal(str(CONSTRUCTION_LTC))
+            elv = max(Decimal(str(CONSTRUCTION_MIN_LOAN)), raw_elv)
+        else:
+            elv = Decimal(str(CONSTRUCTION_AVG_LOAN))
+        detail = _compose_permit_details(row.permit_type, row.issue_date, row.job_value)
+
+        records.append(CallingPoolRecord(
+            run_id="",
+            pool_name="active_builder",
+            county_id=str(row.county_id),
+            county_name=row.county_name,
+            borrower_name=row.borrower_name,
+            entity_name=None,                     # property-owner sourced — entity resolution deferred
+            target_property_address=_compose_address(
+                row.prop_address, row.prop_city, row.prop_state, row.prop_zip
+            ),
+            estimated_loan_value=elv,
+            recent_permit_details=detail,
+            entity_status=None,                   # no entity_type for permit-owner records
+            parcel_id=row.parcel_id,
+            zip=row.prop_zip,
+            state=row.prop_state or WAVE0_STATE,
+            normalized_phone=norm,
+            phone_available=norm is not None,
+            line_type="unknown",                  # owners table phone_1/2/3 has no line type
+            email=row.email,
+            financing_intent_score=None,          # attached by _attach_intent_scores
+            intent_tier=None,
+            recommended_product=None,
+            aircall_campaign_tag=AIRCALL_TAG["active_builder"],
+            campaign_list=CAMPAIGN_LIST["active_builder_noc"],  # List 7
+            buyer_entity_id=None,
+            permit_number=row.permit_number,
+            dbpr_license_number=None,
+            source_property_id=row.source_property_id,
+            source_table="building_permits",
+        ))
+
+    logger.info(
+        "Pool 2b NOC/permits (List 7): %d structural-permit owners (%d with phone)",
         len(records), sum(1 for r in records if r.phone_available),
     )
     return records
@@ -621,11 +767,13 @@ def _extract_pool3_mortgage_broker(session: Session, county_ids: list[str]) -> l
             state=row.prim_state or WAVE0_STATE,
             normalized_phone=row.normalized_phone,
             phone_available=row.normalized_phone is not None,
+            line_type="unknown",                      # OFR does not distinguish mobile/landline
             email=None,                               # not in OFR — skip-trace optional
             financing_intent_score=None,
             intent_tier=None,
             recommended_product=None,
             aircall_campaign_tag=AIRCALL_TAG["mortgage_broker"],
+            campaign_list=CAMPAIGN_LIST["mortgage_broker"],  # List 4
             buyer_entity_id=None,
             permit_number=None,
             dbpr_license_number=row.license_number,    # OFR license # (repurposed provenance field)
@@ -848,9 +996,9 @@ def _write_to_staging(session: Session, records: list[CallingPoolRecord]) -> int
         "borrower_name", "entity_name", "target_property_address",
         "estimated_loan_value", "recent_permit_details",
         "entity_status", "parcel_id", "zip", "state",
-        "normalized_phone", "phone_available", "email",
+        "normalized_phone", "phone_available", "line_type", "email",
         "financing_intent_score", "intent_tier", "recommended_product",
-        "aircall_campaign_tag",
+        "aircall_campaign_tag", "campaign_list",
         "buyer_entity_id", "permit_number", "dbpr_license_number",
         "source_property_id", "source_table", "created_at",
     ]
@@ -862,9 +1010,9 @@ def _write_to_staging(session: Session, records: list[CallingPoolRecord]) -> int
             r.borrower_name, r.entity_name, r.target_property_address,
             r.estimated_loan_value, r.recent_permit_details,
             r.entity_status, r.parcel_id, r.zip, r.state,
-            r.normalized_phone, r.phone_available, r.email,
+            r.normalized_phone, r.phone_available, r.line_type, r.email,
             r.financing_intent_score, r.intent_tier, r.recommended_product,
-            r.aircall_campaign_tag,
+            r.aircall_campaign_tag, r.campaign_list,
             r.buyer_entity_id, r.permit_number, r.dbpr_license_number,
             r.source_property_id, r.source_table, r.created_at,
         )

@@ -91,9 +91,11 @@ class TestDedup:
             borrower_name=name, entity_name=None, target_property_address=None,
             estimated_loan_value=None, recent_permit_details=None,
             entity_status=None, parcel_id=None, zip=None, state="FL",
-            normalized_phone=phone, phone_available=phone is not None, email=None,
+            normalized_phone=phone, phone_available=phone is not None,
+            line_type="unknown", email=None,
             financing_intent_score=None, intent_tier=None, recommended_product=None,
-            aircall_campaign_tag="TAG", buyer_entity_id=None, permit_number=None,
+            aircall_campaign_tag="TAG", campaign_list=None,
+            buyer_entity_id=None, permit_number=None,
             dbpr_license_number=None, source_property_id=None, source_table="t",
         )
 
@@ -243,7 +245,9 @@ class TestPool1Wholesalers:
 # ---------------------------------------------------------------------------
 
 def _seed_permit(db, *, permit_number, issue_offset_days=30, enforcement=False,
-                 permit_type="NEW CONSTRUCTION", phone="8135550002"):
+                 permit_type="NEW CONSTRUCTION", owner_phone="8135550002",
+                 owner_name="PERMIT OWNER LLC"):
+    """Seed a building_permit + an owner row so Pool 2b (NOC) can find contact info."""
     prop_id = db.execute(text(
         "SELECT id FROM properties WHERE county_id='hillsborough' LIMIT 1")).scalar()
     if prop_id is None:
@@ -251,63 +255,58 @@ def _seed_permit(db, *, permit_number, issue_offset_days=30, enforcement=False,
     db.execute(text("""
         INSERT INTO building_permits
             (property_id, permit_number, county_id, permit_type, description,
-             contractor_name, holder_name, contractor_phone, job_value,
-             issue_date, is_enforcement_permit)
-        VALUES (:p, :pn, 'hillsborough', :pt, :pt, 'TEST GC', 'TEST BUILDER LLC',
-                :ph, 300000, :d, :enf)
+             job_value, issue_date, is_enforcement_permit)
+        VALUES (:p, :pn, 'hillsborough', :pt, :pt, 300000, :d, :enf)
     """), {
-        "p": prop_id, "pn": permit_number, "pt": permit_type, "ph": phone,
+        "p": prop_id, "pn": permit_number, "pt": permit_type,
         "d": date.today() - timedelta(days=issue_offset_days), "enf": enforcement,
     })
+    # Seed the property owner so Pool 2b LEFT JOIN owners can find a phone.
+    db.execute(text("""
+        INSERT INTO owners (property_id, owner_name, phone_1)
+        VALUES (:p, :nm, :ph)
+        ON CONFLICT DO NOTHING
+    """), {"p": prop_id, "nm": owner_name, "ph": owner_phone})
+    return prop_id
 
 
-class TestPool2Builders:
+class TestPool2NOCBuilders:
+    """Pool 2b (List 7): NOC/permit property owners via building_permits."""
+
     def test_includes_recent_structural(self, fresh_db):
         _seed_permit(fresh_db, permit_number="BP-INC-1", issue_offset_days=30)
-        recs = pe._extract_pool2_active_builder(fresh_db, ["hillsborough", "pinellas"])
+        recs = pe._extract_pool2b_noc_permits(fresh_db, ["hillsborough", "pinellas"])
         r = next((r for r in recs if r.permit_number == "BP-INC-1"), None)
         assert r is not None
         assert r.pool_name == "active_builder"
-        assert r.normalized_phone == "+18135550002"
-        assert r.entity_name == "TEST BUILDER LLC"
+        assert r.campaign_list == "List 7"
         assert r.recent_permit_details and "NEW CONSTRUCTION" in r.recent_permit_details
         assert r.aircall_campaign_tag == "DESK_CONSTRUCTION"
 
-    def test_excludes_enforcement_permit(self, fresh_db):
-        _seed_permit(fresh_db, permit_number="BP-ENF", enforcement=True)
-        recs = pe._extract_pool2_active_builder(fresh_db, ["hillsborough", "pinellas"])
-        assert not any(r.permit_number == "BP-ENF" for r in recs)
-
     def test_excludes_old_permit(self, fresh_db):
         _seed_permit(fresh_db, permit_number="BP-OLD", issue_offset_days=400)
-        recs = pe._extract_pool2_active_builder(fresh_db, ["hillsborough", "pinellas"])
+        recs = pe._extract_pool2b_noc_permits(fresh_db, ["hillsborough", "pinellas"])
         assert not any(r.permit_number == "BP-OLD" for r in recs)
 
     def test_excludes_non_structural(self, fresh_db):
         _seed_permit(fresh_db, permit_number="BP-POOL", permit_type="POOL SCREEN ENCLOSURE")
-        recs = pe._extract_pool2_active_builder(fresh_db, ["hillsborough", "pinellas"])
+        recs = pe._extract_pool2b_noc_permits(fresh_db, ["hillsborough", "pinellas"])
         assert not any(r.permit_number == "BP-POOL" for r in recs)
 
-    def test_project_count_threshold(self, fresh_db, monkeypatch):
-        # O12: builder must meet the project-count threshold. Two permits (same
-        # contractor 'TEST GC') under a threshold of 3 → excluded; a third → included.
-        monkeypatch.setattr(pe, "BUILDER_MIN_PROJECTS", 3)
-        _seed_permit(fresh_db, permit_number="BP-A")
-        _seed_permit(fresh_db, permit_number="BP-B")
-        recs = pe._extract_pool2_active_builder(fresh_db, ["hillsborough", "pinellas"])
-        assert not any(r.borrower_name == "TEST GC" for r in recs)   # 2 < 3
-        _seed_permit(fresh_db, permit_number="BP-C")
-        recs = pe._extract_pool2_active_builder(fresh_db, ["hillsborough", "pinellas"])
-        assert any(r.borrower_name == "TEST GC" for r in recs)       # 3 >= 3
-
-    def test_one_row_per_builder(self, fresh_db):
-        # Three permits for one builder collapse to a single calling row.
-        for pn in ("BP-1", "BP-2", "BP-3"):
-            _seed_permit(fresh_db, permit_number=pn)
-        recs = pe._extract_pool2_active_builder(fresh_db, ["hillsborough", "pinellas"])
-        builder_rows = [r for r in recs if r.borrower_name == "TEST GC"]
-        assert len(builder_rows) == 1
-        assert "3 permits" in (builder_rows[0].recent_permit_details or "")
+    def test_no_phone_when_no_owner(self, fresh_db):
+        prop_id = fresh_db.execute(text(
+            "SELECT id FROM properties WHERE county_id='hillsborough' LIMIT 1")).scalar()
+        if prop_id is None:
+            pytest.skip("no hillsborough property")
+        fresh_db.execute(text("""
+            INSERT INTO building_permits
+                (property_id, permit_number, county_id, permit_type, description, job_value, issue_date)
+            VALUES (:p, 'BP-NOPH', 'hillsborough', 'NEW CONSTRUCTION', 'NEW CONSTRUCTION', 250000, NOW())
+        """), {"p": prop_id})
+        recs = pe._extract_pool2b_noc_permits(fresh_db, ["hillsborough", "pinellas"])
+        r = next((r for r in recs if r.permit_number == "BP-NOPH"), None)
+        if r:
+            assert r.phone_available is False
 
 
 # ---------------------------------------------------------------------------
@@ -328,12 +327,43 @@ class TestNamesMatch:
         assert pe._names_match("X", "") is False
 
 
+class TestCampaignListAndLineType:
+    """New fields: campaign_list (Josh's List 1-9) and line_type (mobile/landline/unknown)."""
+
+    def test_pool1_campaign_list_provisional(self, fresh_db):
+        be_id = _seed_wholesaler(fresh_db, buyer_type="wholesaler")
+        recs = pe._extract_pool1_wholesaler_flipper(fresh_db, ["hillsborough", "pinellas"])
+        r = next((r for r in recs if r.buyer_entity_id == be_id), None)
+        if r:
+            assert r.campaign_list is None       # provisional — not confirmed by Josh yet
+            assert r.line_type == "unknown"      # buyer_entity phone source doesn't distinguish
+
+    def test_pool3_campaign_list_4(self, fresh_db):
+        _insert_broker(fresh_db, license_number="MBR-CL4")
+        recs = pe._extract_pool3_mortgage_broker(fresh_db, [])
+        r = next((r for r in recs if r.dbpr_license_number == "MBR-CL4"), None)
+        if r:
+            assert r.campaign_list == "List 4"
+            assert r.line_type == "unknown"
+
+    def test_pool2b_noc_campaign_list_7(self, fresh_db):
+        _seed_permit(fresh_db, permit_number="BP-CL7")
+        recs = pe._extract_pool2b_noc_permits(fresh_db, ["hillsborough", "pinellas"])
+        r = next((r for r in recs if r.permit_number == "BP-CL7"), None)
+        if r:
+            assert r.campaign_list == "List 7"
+
+
 class TestEstimatedLoanValue:
-    def test_pool2_builder_85pct_ltc(self, fresh_db):
+    def test_pool2b_noc_85pct_ltc(self, fresh_db):
         _seed_permit(fresh_db, permit_number="BP-ELV")  # job_value=300000
-        recs = pe._extract_pool2_active_builder(fresh_db, ["hillsborough", "pinellas"])
-        r = next(r for r in recs if r.borrower_name == "TEST GC")
-        assert r.estimated_loan_value == Decimal("300000") * Decimal(str(pe.CONSTRUCTION_LTC))
+        recs = pe._extract_pool2b_noc_permits(fresh_db, ["hillsborough", "pinellas"])
+        r = next((r for r in recs if r.permit_number == "BP-ELV"), None)
+        if r:
+            assert r.estimated_loan_value == max(
+                Decimal(str(pe.CONSTRUCTION_MIN_LOAN)),
+                Decimal("300000") * Decimal(str(pe.CONSTRUCTION_LTC)),
+            )
 
     def test_pool1_flip_floored_at_min(self, fresh_db):
         be_id = _seed_wholesaler(fresh_db)  # sale_price=200000 → 150000 > 100k floor

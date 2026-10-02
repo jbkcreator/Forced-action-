@@ -12718,6 +12718,7 @@ class LendingCallingPoolStaging(Base):
     # Contact
     normalized_phone: Mapped[Optional[str]] = mapped_column(String)  # E.164 or NULL
     phone_available: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    line_type: Mapped[Optional[str]] = mapped_column(String)  # 'mobile'|'landline'|'unknown'
     email: Mapped[Optional[str]] = mapped_column(String)
 
     # Intent (O14)
@@ -12729,6 +12730,7 @@ class LendingCallingPoolStaging(Base):
     estimated_loan_value: Mapped[Optional[float]] = mapped_column(Numeric(14, 2))
 
     aircall_campaign_tag: Mapped[str] = mapped_column(String, nullable=False)
+    campaign_list: Mapped[Optional[str]] = mapped_column(String)  # Josh's List 1-9 taxonomy
 
     # Provenance (one per pool type, others NULL)
     buyer_entity_id: Mapped[Optional[int]] = mapped_column(BigInteger)
