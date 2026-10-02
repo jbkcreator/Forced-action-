@@ -30,15 +30,23 @@ Open items this file is waiting on:
   O28  — Estimated Loan Value formula. Interim formulas in POOL_ELV_FACTORS below.
   O29  — Recent Permit Details for non-builder pools. Omitted; field is NULL.
 
-Pasco/Builders (RESOLVED by lead): include Pasco in Pool 2 scope IF DBPR data
-exists for it — no separate code gate needed, since the DBPR query already
-filters by county_id and returns zero Pasco rows naturally if none exist
-(never fabricates builders). Actual Pasco DBPR row-count verification is
-still blocked on live-DB access (connection to the production host timed out
-from this environment both in this pass and the prior session) — run the
-query below once connected to confirm real coverage:
-    SELECT license_type_desc, COUNT(*) FROM dbpr_contacts
-    WHERE county_id = 'pasco' GROUP BY license_type_desc;
+Pasco/Builders (RESOLVED by lead + verified 2026-10-02 on prod): Pasco has ZERO
+DBPR builder records today (Cert Building + Cert Residental both empty, query
+run directly on the production server). Pool 2 (List 3) correctly returns 0
+Pasco rows as a result — no fabrication, no code change needed. Pool 2b
+(List 7, NOC/permits) does not depend on DBPR and has NOT yet been checked
+for Pasco building_permits coverage — worth a follow-up query:
+    SELECT COUNT(*) FROM building_permits WHERE county_id = 'pasco';
+
+Campaign taxonomy (Josh's List 1-9, client_commnets_answers.md Section 2):
+  - List 2 (wholesaler_flipper, "cash buyers"): INFERRED, not confirmed by
+    Josh by name. Matters because Josh's own instruction ("Lists 2 and 4 are
+    blocked from booking") depends on this mapping being right.
+  - List 4 (mortgage_broker, "brokers and LOs"): Pool 3 only loads the OFR
+    business (MBR/MBRB) file. Josh's own list name includes "LOs" (individual
+    Loan Originators) — NOT ingested. Flagged 2026-10-02, pending a decision
+    on whether the LO file is in scope before launch; deliberately not built
+    blind against an unverified file format this close to production.
 
 IMPORTANT: estimated_loan_value is an INTERNAL CALLER REFERENCE only.  It is
 derived from public-record job_value / sale_price.  It is never a quote, term,
@@ -77,19 +85,26 @@ AIRCALL_TAG: dict[str, str] = {
     "mortgage_broker": "DESK_RESCUE",
 }
 
-# Josh's List 1-9 campaign taxonomy (client comments answers doc + questionnaire v2).
+# Josh's List 1-9 campaign taxonomy (client_commnets_answers.md Section 2 table).
 # Builders map to two lists depending on source:
 #   List 3 = DBPR-licensed contractors (license registry — active builders by credential)
 #   List 7 = NOC/permit property owners (building_permits — active construction projects)
-# Brokers: List 4.
-# Wholesaler/Flipper: PROVISIONAL — the client taxonomy names Lists 3, 4, 7 explicitly
-# but has no explicit number for the wholesaler/flipper pool; left None until Josh
-# confirms in the next launch prep session.
+# Brokers: List 4 "brokers and LOs" — NOTE: our Pool 3 currently loads the OFR
+# business (MBR/MBRB) file only, NOT the individual Loan Originator file, so
+# this list is under-covered relative to Josh's own naming. Flagged to the team
+# (2026-10-02) pending a decision on whether to ingest the LO file before launch —
+# NOT silently built here (the file's phone-field availability is unverified).
+# Wholesaler/Flipper -> List 2 "cash buyers": inferred from the spec's own Pool 1
+# data source (buyer_entities.total_cash_volume) matching Josh's "cash buyers"
+# label — no other list in his taxonomy fits. This is an inference, not a
+# confirmed mapping; it gates Josh's "Lists 2 and 4 blocked from booking" rule
+# (client_commnets_answers.md, "Two booking gates" item), so confirm with Josh
+# if there's any doubt before relying on it operationally.
 CAMPAIGN_LIST: dict[str, str | None] = {
-    "wholesaler_flipper": None,          # provisional — needs Josh confirmation
+    "wholesaler_flipper": "List 2",      # cash buyers — inferred, see note above
     "active_builder_dbpr": "List 3",     # DBPR-licensed contractors
     "active_builder_noc": "List 7",      # NOC/permit property owners
-    "mortgage_broker": "List 4",
+    "mortgage_broker": "List 4",         # brokers only — LOs not yet ingested, see note above
 }
 
 # Permit lookback window — spec §4.1 "12-month active permits"
@@ -451,7 +466,7 @@ def _extract_pool1_wholesaler_flipper(
             intent_tier=None,
             recommended_product=None,
             aircall_campaign_tag=AIRCALL_TAG["wholesaler_flipper"],
-            campaign_list=CAMPAIGN_LIST["wholesaler_flipper"],  # None — provisional, needs Josh confirmation
+            campaign_list=CAMPAIGN_LIST["wholesaler_flipper"],  # List 2 — inferred, see CAMPAIGN_LIST note
             buyer_entity_id=row.buyer_entity_id,
             permit_number=None,
             dbpr_license_number=None,

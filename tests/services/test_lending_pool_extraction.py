@@ -334,12 +334,12 @@ class TestNamesMatch:
 class TestCampaignListAndLineType:
     """New fields: campaign_list (Josh's List 1-9) and line_type (mobile/landline/unknown)."""
 
-    def test_pool1_campaign_list_provisional(self, fresh_db):
+    def test_pool1_campaign_list_2(self, fresh_db):
         be_id = _seed_wholesaler(fresh_db, buyer_type="wholesaler")
         recs = pe._extract_pool1_wholesaler_flipper(fresh_db, ["hillsborough", "pinellas"])
         r = next((r for r in recs if r.buyer_entity_id == be_id), None)
         if r:
-            assert r.campaign_list is None       # provisional — not confirmed by Josh yet
+            assert r.campaign_list == "List 2"   # cash buyers — inferred, see CAMPAIGN_LIST note
             assert r.line_type == "unknown"      # buyer_entity phone source doesn't distinguish
 
     def test_pool3_campaign_list_4(self, fresh_db):

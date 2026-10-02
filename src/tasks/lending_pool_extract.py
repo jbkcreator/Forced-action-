@@ -44,17 +44,24 @@ _EXPORT_COLUMNS = [
     "borrower_name", "entity_name", "entity_status",
     "parcel_id", "target_property_address", "zip", "state",
     "estimated_loan_value", "recent_permit_details",
-    "normalized_phone", "phone_available", "email",
+    "normalized_phone", "phone_available", "line_type", "email",
     "financing_intent_score", "intent_tier", "recommended_product",
-    "aircall_campaign_tag",
+    "aircall_campaign_tag", "campaign_list",
     "buyer_entity_id", "permit_number", "source_property_id", "source_table",
 ]
 
 
 def _export_run_to_csv(session, run_id: str, out_dir: Path) -> dict[str, dict[str, int]]:
-    """Write one CSV per pool for a run, reading back from the staging table.
+    """Write one CSV per campaign (Josh's List 1-9 taxonomy) for a run.
 
-    Returns {pool_name: {"total": N, "phone_available": M}}.  Exports the FULL
+    Split by (pool_name, campaign_list) rather than pool_name alone: Builders
+    spans two lists (List 3 DBPR, List 7 NOC/permits) under one pool_name, and
+    Josh's requested reporting table (client_commnets_answers.md Section 2) is
+    organized per campaign/list, not per internal pool. A record with no
+    campaign_list (e.g. a not-yet-confirmed mapping) groups under "unassigned"
+    rather than being silently dropped from the export.
+
+    Returns {file_key: {"total": N, "phone_available": M}}.  Exports the FULL
     set (both phone_available true and false) so Dev 2 has the A2 coverage
     denominator; phone_available=false rows are their O15 call (INVALID_PHONE).
     """
@@ -63,29 +70,31 @@ def _export_run_to_csv(session, run_id: str, out_dir: Path) -> dict[str, dict[st
             SELECT {", ".join(_EXPORT_COLUMNS)}
             FROM lending_calling_pool_staging
             WHERE run_id = :run_id
-            ORDER BY pool_name, county_id
+            ORDER BY pool_name, campaign_list, county_id
         """),
         {"run_id": run_id},
     ).mappings().all()
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    by_pool: dict[str, list[dict]] = {}
+    by_campaign: dict[str, list[dict]] = {}
     for row in rows:
-        by_pool.setdefault(row["pool_name"], []).append(dict(row))
+        list_slug = (row["campaign_list"] or "unassigned").lower().replace(" ", "_")
+        key = f"{row['pool_name']}__{list_slug}"
+        by_campaign.setdefault(key, []).append(dict(row))
 
     counts: dict[str, dict[str, int]] = {}
-    for pool_name, pool_rows in by_pool.items():
-        path = out_dir / f"wave0_{pool_name}_{run_id[:8]}.csv"
+    for file_key, campaign_rows in by_campaign.items():
+        path = out_dir / f"wave0_{file_key}_{run_id[:8]}.csv"
         with path.open("w", newline="", encoding="utf-8") as fh:
             writer = csv.DictWriter(fh, fieldnames=_EXPORT_COLUMNS, extrasaction="ignore")
             writer.writeheader()
-            writer.writerows(pool_rows)
-        counts[pool_name] = {
-            "total": len(pool_rows),
-            "phone_available": sum(1 for r in pool_rows if r["phone_available"]),
+            writer.writerows(campaign_rows)
+        counts[file_key] = {
+            "total": len(campaign_rows),
+            "phone_available": sum(1 for r in campaign_rows if r["phone_available"]),
         }
         logger.info("Exported %d rows (%d phone-available) to %s",
-                    counts[pool_name]["total"], counts[pool_name]["phone_available"], path)
+                    counts[file_key]["total"], counts[file_key]["phone_available"], path)
     return counts
 
 
