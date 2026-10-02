@@ -98,6 +98,7 @@ Merge-field names below are the intended shape and must be **confirmed in the GH
     "no more", "don't text", "do not contact", "leave me alone", "not interested". Consent is revoked and nothing is recorded, but the
     number is **not** suppressed and **not** removed from the dialer; a later answered call can re-grant consent.
   - any other non-empty reply records `inbound_text` consent.
+  - A hard opt-out is permanent and matches words anywhere, so a false positive (e.g. "bus stop", "please don't stop calling") suppresses the number and deletes it from the dialer, and it must be undone by hand: delete its row from `lending.suppression_list`, set `do_not_contact = false` on its `lending.contacts` row, delete its `sms_opt_outs` row (source `lending_dialer`, which is FA-wide and also blocks every other FA text), and, if the poller has already synced it (`ghl_dnd_at` set on its `lending.opt_out_events` row), clear the DND in GHL, since no code path ever clears it; the dialer removal deletes the BatchDialer contact and nothing restores it (`restore` only undoes calling-window holds), so the number comes back only on the next list build and that needs a manual check.
 - **Form submitted** (website lead form, WP-GL-11) -> Webhook `POST .../webhooks/lending/ghl-text-consent`, body
   `{"source": "web_form", "contact_id": "{{contact.id}}", "phone": "{{contact.phone}}", "consent": "{{<consent checkbox custom field>}}"}`
   (confirm the custom-field merge name). The checkbox must be unchecked by default; only a checked value records consent.
@@ -133,7 +134,7 @@ f. Run the verification in section 6.
    ```sql
    UPDATE lending.opt_out_events SET ghl_dnd_at = NULL WHERE phone_hash IS NOT NULL;
    ```
-   and let the poller drain it (`SELECT count(*) FROM lending.opt_out_events WHERE ghl_dnd_at IS NULL` must reach 0). This does **not**
+   and let the poller drain it (`SELECT count(*) FROM lending.opt_out_events WHERE ghl_dnd_at IS NULL AND phone_hash IS NOT NULL` must reach 0; email-only opt-outs have no phone hash and are never synced, so leave them out of the count). This does **not**
    cover `lending.suppression_list` rows that have no `lending.opt_out_events` row (litigator and other backfilled entries, or numbers
    suppressed before the sync existed). Those are manual: list them with
    ```sql
