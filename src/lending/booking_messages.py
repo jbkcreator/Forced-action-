@@ -10,10 +10,20 @@ GL-5 owner's answer; the transport, outbox event or otherwise, is theirs to choo
 
     booking_ref        str       fa_max_bookings.booking_ref
     provider_event_id  str|None  fa_max_bookings.provider_event_id (the GHL appointment id)
-    person_id          str|None  fa_max_bookings.person_id -> fa_max_persons
+    person_id          str|None  fa_max_bookings.person_id -> fa_max_persons (optional, see below)
+    phone              str|None  the lending contact's phone (E.164); wins over the person's phone
+    first_name         str|None  the contact's first name; wins over the person's name
+    email              str|None  the contact's email, for the no-text-consent fallback
+    text_consent       bool      the caller asked "Is it okay if we text you the confirmation?" and the
+                                 contact said yes (G6); recorded as ``on_call_yes`` consent. Only an
+                                 explicit True counts; AI bookings never carry it (they texted us first).
     slot_start_utc     datetime  timezone-aware
     property_address   str|None  from the gate answers; None drops the address phrase
     booked_by          str|None  the caller's login (gate.captured_by), or "ai"
+
+Lending contacts are identified by phone only and have no ``fa_max_persons`` row (confirmed by the
+WP-GL-9 owner), so a lending booking supplies ``phone`` / ``first_name`` itself; ``person_id`` is the
+fallback source for contact details.
 """
 from __future__ import annotations
 
@@ -55,6 +65,7 @@ from config.lending_reminders import (
     TIMEZONE,
 )
 from src.lending.compliance import phone_hash
+from src.lending.consent import record_consent
 from src.lending.text_back import first_name_of
 from src.services.phone_utils import normalize as normalize_phone
 
@@ -105,7 +116,7 @@ def handle_booking_confirmed(db, payload: Mapping[str, Any], *, now: Optional[da
     A booking with no resolvable person or no phone/email still gets its rows, recorded as skipped
     with the reason, so the gap is visible instead of silent.
     """
-    from src.lending.confirmation_tasks import assign_confirmation_task
+    from src.lending.confirmation_tasks import AI_BOOKER, assign_confirmation_task
 
     now = now or datetime.now(timezone.utc)
     booking_ref = str(payload["booking_ref"])
@@ -115,21 +126,19 @@ def handle_booking_confirmed(db, payload: Mapping[str, Any], *, now: Optional[da
 
     person_id = str(payload["person_id"]) if payload.get("person_id") else None
     person = _person(db, person_id) if person_id else None
-    phone = normalize_phone(person["phone"]) if person and person["phone"] else None
-    email = (person["email"] or "").strip().lower() or None if person else None
+    phone = normalize_phone(payload.get("phone") or "") or (normalize_phone(person["phone"]) if person and person["phone"] else None)
+    email = ((payload.get("email") or (person["email"] if person else None) or "").strip().lower()) or None
+    name = (payload.get("first_name") or "").strip() or (first_name_of(person["full_name"]) if person else None)
     skip_reason = None
-    if person_id is None:
-        skip_reason = "no_person"
-    elif person is None:
-        skip_reason = "person_not_found"
-    elif not phone and not email:
-        skip_reason = "no_contact_method"
+    if not phone and not email:
+        skip_reason = ("no_person" if person_id is None else "person_not_found" if person is None
+                       else "no_contact_method")
 
     common = {
         "booking_ref": booking_ref,
         "provider_event_id": payload.get("provider_event_id"),
         "person_id": person_id,
-        "first_name": first_name_of(person["full_name"]) if person else None,
+        "first_name": name,
         "contact_phone": phone,
         "contact_email": email,
         "property_address": (payload.get("property_address") or None),
@@ -147,8 +156,10 @@ def handle_booking_confirmed(db, payload: Mapping[str, Any], *, now: Optional[da
     else:
         logger.info("[booking-messages] booking_ref=%s scheduled %d rows phone_hash=%s",
                     booking_ref, inserted, phone_hash(phone)[:12] if phone else "-")
+    if payload.get("text_consent") is True and phone and payload.get("booked_by") not in (None, AI_BOOKER):
+        record_consent(db, phone, "on_call_yes", captured_by=payload["booked_by"])
     assignee = assign_confirmation_task(db, booking_ref=booking_ref, person_id=person_id,
-                                        booked_by=payload.get("booked_by"), slot_start_utc=slot_start)
+                                        booked_by=payload.get("booked_by"), slot_start_utc=slot_start, booked_at=now)
     return ScheduleResult(inserted=inserted, skip_reason=skip_reason, assignee=assignee)
 
 

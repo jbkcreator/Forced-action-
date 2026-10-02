@@ -193,3 +193,45 @@ def test_cancel_by_appointment_id_cancels_only_pending_rows(db):
 def test_cancel_by_booking_ref(db):
     handle_booking_confirmed(db, payload(add_person(db)), now=NOW)
     assert cancel_by_booking_ref(db, "ref-1", "booking_rescheduled") == 3
+
+
+# ── lending contacts: phone-keyed, no fa_max_persons row ──────────────────────
+
+def test_a_lending_booking_uses_the_phone_and_name_it_carries_without_a_person(db):
+    result = handle_booking_confirmed(db, payload(None, phone="(813) 555-0147", first_name="Marcus"), now=NOW)
+    assert result.skip_reason is None and result.inserted == 3
+    assert {(r["contact_phone"], r["first_name"], r["status"]) for r in rows(db)} == {("+18135550147", "Marcus", "pending")}
+
+
+def test_the_payload_phone_wins_over_the_person_record(db):
+    person = add_person(db, phone="+18135550999", name="Old Name")
+    handle_booking_confirmed(db, payload(person, phone="+18135550147", first_name="Marcus"), now=NOW)
+    assert {(r["contact_phone"], r["first_name"]) for r in rows(db)} == {("+18135550147", "Marcus")}
+
+
+def test_a_callers_yes_to_texting_is_recorded_as_on_call_consent(db):
+    from src.lending.consent import has_text_consent
+    handle_booking_confirmed(db, payload(None, phone="+18135550147", text_consent=True), now=NOW)
+    assert has_text_consent(db, "+18135550147") is True
+    source, by = db.execute(text("SELECT source, captured_by FROM lending.text_consents")).one()
+    assert (source, by) == ("on_call_yes", "dana@heu.ai")
+
+
+@pytest.mark.parametrize("extra", [{}, {"text_consent": False}, {"text_consent": "yes"}, {"booked_by": "ai", "text_consent": True}])
+def test_only_an_explicit_caller_yes_creates_consent(db, extra):
+    from src.lending.consent import has_text_consent
+    handle_booking_confirmed(db, payload(None, phone="+18135550147", **extra), now=NOW)
+    assert has_text_consent(db, "+18135550147") is False
+
+
+def test_confirmation_call_due_dates_follow_the_client_rules(db):
+    from src.lending.confirmation_tasks import due_date_for
+    wed_call = datetime(2026, 10, 7, 14, 0, tzinfo=timezone.utc)
+    mon_call = datetime(2026, 10, 12, 14, 0, tzinfo=timezone.utc)
+    booked_mon = datetime(2026, 10, 5, 15, 0, tzinfo=timezone.utc)
+    assert str(due_date_for("dana@heu.ai", wed_call, booked_mon)) == "2026-10-06"      # day before
+    assert str(due_date_for("dana@heu.ai", mon_call, booked_mon)) == "2026-10-09"      # Sunday -> Friday
+    assert str(due_date_for("ai", wed_call, booked_mon)) == "2026-10-06"               # next business day
+    fri_night = datetime(2026, 10, 10, 2, 0, tzinfo=timezone.utc)                      # Fri 10 pm ET
+    assert str(due_date_for("ai", mon_call, fri_night)) == "2026-10-12"                # Mon, the call day: never later
+    assert str(due_date_for("ai", wed_call, datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc))) == "2026-10-07"  # same-day booking

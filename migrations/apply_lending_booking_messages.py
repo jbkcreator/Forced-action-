@@ -6,6 +6,7 @@ idempotent. A row moves pending -> sending -> sent | send_unknown | failed, or p
 cancelled; a text is never re-sent from sending / send_unknown.
 
 ``lending.confirmation_tasks`` holds the human confirmation call (one per booking).
+``lending.reply_handoffs`` records each reply-agent Slack post once per GHL message id.
 
 Idempotent; safe to re-run. Usage:
     PYTHONPATH=. python migrations/apply_lending_booking_messages.py
@@ -33,6 +34,7 @@ def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
     conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
     messages = f'"{schema}".booking_messages'
     tasks = f'"{schema}".confirmation_tasks'
+    handoffs = f'"{schema}".reply_handoffs'
     for ddl in (
         f"""CREATE TABLE IF NOT EXISTS {messages} (
             id                  bigserial PRIMARY KEY,
@@ -74,6 +76,15 @@ def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
         )""",
         f"CREATE INDEX IF NOT EXISTS ix_lending_confirmation_tasks_open ON {tasks} (due_date, assignee) "
         f"WHERE completed_at IS NULL",
+        f"""CREATE TABLE IF NOT EXISTS {handoffs} (
+            id          bigserial PRIMARY KEY,
+            message_id  text        NOT NULL UNIQUE,
+            kind        varchar(30) NOT NULL,
+            contact_id  text,
+            phone_hash  varchar(12),
+            created_at  timestamptz NOT NULL DEFAULT now(),
+            posted_at   timestamptz
+        )""",
     ):
         conn.execute(text(ddl))
 
