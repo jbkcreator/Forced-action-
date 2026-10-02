@@ -19,15 +19,15 @@ run them. Everything below the first section is the checklist that remains once 
   `sms_compliance.send_sms`.
 - Safety window 8 am-8 pm ET (`skipped_quiet_hours` outside it). Calls already stop at 7:15 pm ET.
 - **Off until the sending number is A2P Verified.** Until then the flag stays `false`, the line runs calls-only with live voicemail.
-- The send is a **single attempt, never retried**. A timeout is recorded `failed`: a possible duplicate text is worse than a missed one.
+- The send is a **single attempt, never retried**: a possible duplicate text is worse than a missed one. An ambiguous outcome (timeout, 5xx, no message id) is recorded `send_unknown`, not `failed`.
 
 | Status | Meaning |
 |---|---|
-| `pending` / `sending` | Queued / claimed by the processor (a claim stuck over 5 min is released by the stale sweep) |
+| `pending` / `sending` | Queued / claimed by the processor. A claim stuck in `sending` over 5 min (crash) is marked `send_unknown` by the stale sweep: never retried or resent, and it keeps the day's slot |
 | `sent` | GHL accepted the text; `provider_message_id` stored |
 | `dry_run` | Every gate passed but `MISSED_CALL_TEXT_ENABLED=false`; nothing sent |
-| `failed` | Render error or GHL send error (single attempt) |
-| `send_unknown` | Crash after the claim; cannot prove nothing went out, so it holds the day's slot |
+| `failed` | Nothing went out: render error, contact-upsert failure, or a 4xx on the send. Frees the day's slot |
+| `send_unknown` | Cannot prove nothing went out, so it keeps the day's slot and is never resent: crash after the claim (stale sweep), or an ambiguous GHL send (request timed out/errored, a 5xx, or a 2xx with no message id). Check GHL for a duplicate or missing text |
 | `skipped_late` | More than 60 s after the call ended |
 | `skipped_no_consent` | No text consent on file for the phone |
 | `skipped_quiet_hours` | Outside 8 am-8 pm ET |
@@ -85,18 +85,29 @@ Merge-field names below are the intended shape and must be **confirmed in the GH
   the wiring behind the client's request "GHL wired into the #320 opt-out sync" (confirm with the client).
 - **Customer replied (SMS)** -> Webhook `POST .../webhooks/lending/ghl-text-consent`, body
   `{"source": "inbound_text", "contact_id": "{{contact.id}}", "phone": "{{contact.phone}}", "message": "{{message.body}}"}`
-  (confirm the message merge field). GHL's built-in STOP handling still sets DND; this call also revokes consent in FA.
+  (confirm the message merge field). GHL's built-in STOP handling still sets DND. Consent rules (fail closed; counsel should confirm the scope):
+  an empty or non-string message records nothing; a message that is a single stop keyword, or contains stop / stopall / unsubscribe /
+  optout / revoke or "opt out", is an opt-out and revokes consent; "cancel", "end" and "quit" count only as the whole message; any
+  other non-empty reply records `inbound_text` consent.
 - **Form submitted** (website lead form, WP-GL-11) -> Webhook `POST .../webhooks/lending/ghl-text-consent`, body
   `{"source": "web_form", "contact_id": "{{contact.id}}", "phone": "{{contact.phone}}", "consent": "{{<consent checkbox custom field>}}"}`
   (confirm the custom-field merge name). The checkbox must be unchecked by default; only a checked value records consent.
+
+**The STOP revoke in the consent webhook is not durable.** `revoke_consent` only flips `lending.text_consents`; a later answered
+call or CDR re-grants `inbound_call` / `on_call_yes` consent while the BatchDialer `text_consent` field is still `yes`. The durable STOP
+is GoHighLevel's own DND plus the **Contact DND changed** workflow above, which posts to `/webhooks/lending/ghl-opt-out` and writes
+`lending.suppression_list` (`has_text_consent` checks it). That workflow is a hard go-live prerequisite (section 5).
+
 - **Pipeline stage changed** -> `.../webhooks/lending/ghl-stage` (scoreboard "Showed", PR #326; lives on that branch, not this one,
   until merged).
 
 ## 5. Go-live sequence
 
 a. `PYTHONPATH=. python migrations/apply_lending_gl9_text_back.py` (idempotent; run after `apply_lending_call_dispositions_dialer.py`).
-b. Set the env vars from section 2.
-c. `python -m src.lending.ghl_sms --send-test <your own phone>`. Confirm it arrives from the calling/texting number. The request field
+b. Set the env vars from section 2. **Hard prerequisite:** create the **Contact DND changed** workflow (section 4) and test it with a
+   real STOP reply (contact goes DND in GHL, the phone appears in `lending.suppression_list`, `has_text_consent` is false). Texting must
+   not be switched on until this passes.
+c. `python -m src.lending.ghl_sms --send-test <your own phone>` (sends one REAL SMS to the phone you pass). Confirm it arrives from the calling/texting number. The request field
    names follow the public GHL v2 reference and are not yet confirmed live: fix `src/lending/ghl_sms.py` if GHL disagrees.
 d. Restart `fa-lending-cdr-poller` (and `fa-api` if the webhook secret or LENDING_GHL_* changed). With the flag still off, make a test
    unanswered outbound call to a consented test contact and confirm the event ends `dry_run`.
@@ -119,7 +130,7 @@ Against a consented test contact:
 - Unanswered outbound call -> exactly one text within 60 s from the calling/texting number.
 - A second unanswered call the same day -> no text (`duplicate_day`).
 - A non-consented number -> no text (`skipped_no_consent`).
-- Reply STOP -> no further text, the contact is DND in GHL and suppressed in FA.
+- Reply STOP -> no further text, the contact is DND in GHL and in `lending.suppression_list` (the durable block). Place another answered call to the contact afterwards: still no text.
 
 ```sql
 SELECT dialer_call_id, status, template_key, decided_at - created_at
