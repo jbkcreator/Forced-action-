@@ -1,108 +1,89 @@
-"""WP-GL-10: lending.booking_messages — durable confirmation and reminder schedule.
+"""WP-GL-10: booking confirmation / reminder schedule and confirmation-call tasks.
 
-One row per (booking_ref, kind). Unique on (booking_ref, kind) so a retried
-event from WP-GL-5's booking trigger never inserts a duplicate. Status moves
-from 'pending' → 'sent' | 'skipped' | 'cancelled'. Cancellation reason is
-stored so the reminder worker can distinguish a skip (too late / already
-past) from a cancellation (booking rescheduled or cancelled by the contact).
+``lending.booking_messages`` holds one row per (booking, message kind): the confirmation, the
+night-before reminder and the 90-minute reminder. ``UNIQUE (booking_ref, kind)`` makes scheduling
+idempotent. A row moves pending -> sending -> sent | send_unknown | failed, or pending -> skipped |
+cancelled; a text is never re-sent from sending / send_unknown.
 
-Indexes:
-  - (status, send_at) — the reminder worker's due-row poll (FOR UPDATE SKIP LOCKED)
-  - booking_ref — cancel/reschedule by booking
+``lending.confirmation_tasks`` holds the human confirmation call (one per booking).
 
-This table is the ONLY path for scheduling and cancelling GL-10 messages.
-The reminder worker reads from it. Nothing writes to it except
-src/lending/booking_messages.py::schedule_booking_messages() and
-::cancel_booking_messages().
-
-Safe to re-run (idempotent DDL).
+Idempotent; safe to re-run. Usage:
+    PYTHONPATH=. python migrations/apply_lending_booking_messages.py
 """
+from __future__ import annotations
+
 import logging
-import sys
 
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Connection, Engine
 
+from config.lending_reminders import ALL_KINDS, ALL_STATUSES, CHANNEL_EMAIL, CHANNEL_TEXT
+from config.settings import get_settings
+from src.lending.models import LENDING_SCHEMA
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 
-DDL = """
-CREATE TABLE IF NOT EXISTS lending.booking_messages (
-    id                 BIGSERIAL PRIMARY KEY,
-
-    -- Foreign key to the booking. References the booking_ref written by
-    -- WP-GL-5's book() call. booking_ref is NOT a FK column here because
-    -- GL-5's bookings table lives in the public (FA Max) schema and this
-    -- table lives in the lending schema; cross-schema FKs need the table
-    -- to exist first. The constraint is enforced at the application layer.
-    booking_ref        TEXT        NOT NULL,
-
-    -- 'confirmation' | 'night_before' | 'ninety_min' (see config/lending_reminders.py)
-    kind               TEXT        NOT NULL CHECK (kind IN ('confirmation','night_before','ninety_min')),
-
-    -- Channel: 'text' for GHL SMS, 'email' for hello@ fallback (B4 / 10DLC gap)
-    channel            TEXT        NOT NULL CHECK (channel IN ('text','email')),
-
-    -- When to send, always UTC. Computed at schedule time from the slot start.
-    send_at            TIMESTAMPTZ NOT NULL,
-
-    -- Lifecycle: pending → sent | skipped | cancelled
-    status             TEXT        NOT NULL DEFAULT 'pending'
-                                   CHECK (status IN ('pending','sent','skipped','cancelled')),
-    skip_reason        TEXT,       -- e.g. 'too_late', 'already_past', 'suppressed', 'no_consent'
-    cancel_reason      TEXT,       -- e.g. 'booking_cancelled', 'booking_rescheduled'
-
-    -- Contact info at schedule time (denormalised so the worker does not need
-    -- to join back to GL-5's booking row while processing).
-    first_name         TEXT        NOT NULL DEFAULT '',
-    contact_phone      TEXT,       -- normalized E.164; NULL if email-only
-    contact_email      TEXT,       -- NULL if text-only and consent given
-    property_address   TEXT,       -- NULL → templates drop the address phrase (B3)
-    slot_start_utc     TIMESTAMPTZ NOT NULL,
-
-    -- Attribution
-    booked_by          TEXT,       -- caller seat id, or 'ai' for GHL Conversation AI
-    text_consent        BOOLEAN     NOT NULL DEFAULT FALSE,
-                                   -- caller logged "Is it okay if we text you?" yes (G6)
-
-    -- Audit
-    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    sent_at            TIMESTAMPTZ,
-    worker_id          TEXT        -- which reminder_worker instance processed this row
-
-    -- Idempotency: one row per (booking_ref, kind). A retried booking event
-    -- calling schedule_booking_messages() is a no-op.
-);
-
-DO $$ BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conname = 'uq_booking_messages_ref_kind'
-    ) THEN
-        ALTER TABLE lending.booking_messages
-            ADD CONSTRAINT uq_booking_messages_ref_kind
-            UNIQUE (booking_ref, kind);
-    END IF;
-END $$;
-
-CREATE INDEX IF NOT EXISTS idx_booking_messages_due
-    ON lending.booking_messages (status, send_at)
-    WHERE status = 'pending';
-
-CREATE INDEX IF NOT EXISTS idx_booking_messages_booking_ref
-    ON lending.booking_messages (booking_ref);
-"""
+def _in(values: tuple[str, ...]) -> str:
+    return ", ".join(f"'{v}'" for v in values)
 
 
-def run(connection_string: str | None = None) -> None:
-    import os
-    url = connection_string or os.environ["DATABASE_URL"]
-    engine = create_engine(url)
+def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
+    conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+    messages = f'"{schema}".booking_messages'
+    tasks = f'"{schema}".confirmation_tasks'
+    for ddl in (
+        f"""CREATE TABLE IF NOT EXISTS {messages} (
+            id                  bigserial PRIMARY KEY,
+            booking_ref         text         NOT NULL,
+            provider_event_id   text,
+            person_id           text,
+            kind                varchar(20)  NOT NULL CHECK (kind IN ({_in(ALL_KINDS)})),
+            send_at             timestamptz  NOT NULL,
+            status              varchar(24)  NOT NULL DEFAULT 'pending'
+                                CHECK (status IN ({_in(ALL_STATUSES)})),
+            skip_reason         varchar(60),
+            cancel_reason       varchar(60),
+            channel             varchar(10)  CHECK (channel IN ('{CHANNEL_TEXT}', '{CHANNEL_EMAIL}')),
+            attempts            integer      NOT NULL DEFAULT 0,
+            first_name          varchar(60),
+            contact_phone       varchar(20),
+            contact_email       varchar(255),
+            property_address    text,
+            slot_start_utc      timestamptz  NOT NULL,
+            booked_by           varchar(120),
+            provider_message_id varchar(100),
+            created_at          timestamptz  NOT NULL DEFAULT now(),
+            decided_at          timestamptz,
+            sent_at             timestamptz,
+            CONSTRAINT uq_lending_booking_messages_ref_kind UNIQUE (booking_ref, kind)
+        )""",
+        f"CREATE INDEX IF NOT EXISTS ix_lending_booking_messages_due ON {messages} (send_at) WHERE status = 'pending'",
+        f"CREATE INDEX IF NOT EXISTS ix_lending_booking_messages_stale ON {messages} (decided_at) WHERE status = 'sending'",
+        f"CREATE INDEX IF NOT EXISTS ix_lending_booking_messages_event ON {messages} (provider_event_id) "
+        f"WHERE provider_event_id IS NOT NULL",
+        f"""CREATE TABLE IF NOT EXISTS {tasks} (
+            id           bigserial PRIMARY KEY,
+            booking_ref  text         NOT NULL UNIQUE,
+            person_id    text,
+            assignee     varchar(255) NOT NULL,
+            due_date     date         NOT NULL,
+            created_at   timestamptz  NOT NULL DEFAULT now(),
+            completed_at timestamptz
+        )""",
+        f"CREATE INDEX IF NOT EXISTS ix_lending_confirmation_tasks_open ON {tasks} (due_date, assignee) "
+        f"WHERE completed_at IS NULL",
+    ):
+        conn.execute(text(ddl))
+
+
+def apply(engine: Engine | None = None, schema: str = LENDING_SCHEMA) -> None:
+    engine = engine or create_engine(get_settings().database_url, pool_pre_ping=True)
     with engine.begin() as conn:
-        conn.execute(text(DDL))
-    logger.info("apply_lending_booking_messages: done")
+        apply_to(conn, schema)
+    logger.info("apply_lending_booking_messages complete (schema=%s).", schema)
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    run()
-    sys.exit(0)
+    apply()

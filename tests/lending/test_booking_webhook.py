@@ -1,106 +1,77 @@
-"""Tests for WP-GL-10 booking_webhook: cancel/reschedule and secret auth."""
+"""WP-GL-10: a GHL appointment cancelled / rescheduled cancels the booking's pending messages."""
 from __future__ import annotations
 
-import hashlib
-from unittest.mock import MagicMock, patch
+from datetime import datetime, timezone
 
 import pytest
-from fastapi.testclient import TestClient
-
-from src.lending.booking_webhook import router
-
-# Build a minimal app just for this router
 from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from pydantic import SecretStr
+from sqlalchemy import text
 
-app = FastAPI()
-app.include_router(router)
-client = TestClient(app, raise_server_exceptions=False)
+from migrations.apply_lending_booking_messages import apply_to
+from src.lending.booking_messages import handle_booking_confirmed
 
-_SECRET = "test-booking-secret"
-
-
-def _headers(secret: str = _SECRET) -> dict:
-    return {"X-Webhook-Secret": secret}
-
-
-def _patch_secret(secret: str = _SECRET):
-    return patch("src.lending.booking_webhook._secret", return_value=secret)
+SECRET = "test-ghl-secret"
+SLOT = datetime(2026, 10, 7, 14, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 10, 5, 15, 0, tzinfo=timezone.utc)
 
 
-class TestBookingWebhook:
-    def test_closed_when_secret_not_configured(self):
-        with patch("src.lending.booking_webhook._secret", return_value=None):
-            resp = client.post("/webhooks/lending/booking", json={})
-        assert resp.status_code == 405
+@pytest.fixture
+def db(lending_db):
+    apply_to(lending_db.connection())
+    person = lending_db.execute(text("INSERT INTO fa_max_persons (source, full_name, phone) VALUES ('test', 'Jane Doe', "
+                                     "'+18135550111') RETURNING person_id::text")).scalar()
+    handle_booking_confirmed(lending_db, {"booking_ref": "ref-1", "provider_event_id": "appt-1", "person_id": person,
+                                          "slot_start_utc": SLOT, "booked_by": "dana@heu.ai"}, now=NOW)
+    return lending_db
 
-    def test_unauthorized_when_wrong_secret(self):
-        with _patch_secret():
-            resp = client.post(
-                "/webhooks/lending/booking",
-                json={"appointmentId": "appt-1", "status": "cancelled"},
-                headers={"X-Webhook-Secret": "wrong"},
-            )
-        assert resp.status_code == 401
 
-    def test_cancels_rows_on_cancelled_status(self):
-        db = MagicMock()
-        db.execute.return_value.rowcount = 2
-        with (
-            _patch_secret(),
-            patch("src.lending.booking_webhook.get_db", return_value=iter([db])),
-            patch("src.lending.booking_messages.cancel_booking_messages",
-                  return_value=2) as mock_cancel,
-        ):
-            resp = client.post(
-                "/webhooks/lending/booking",
-                json={"appointmentId": "appt-99", "appointmentStatus": "cancelled"},
-                headers=_headers(),
-            )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["status"] == "cancelled"
-        assert data["rows_cancelled"] == 2
+@pytest.fixture
+def client(db, monkeypatch):
+    from config.settings import get_settings
+    from src.api.deps import get_db
+    from src.lending.booking_webhook import router
+    monkeypatch.setattr(get_settings(), "lending_ghl_webhook_secret", SecretStr(SECRET), raising=False)
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_db] = lambda: db
+    return TestClient(app)
 
-    def test_cancels_rows_on_rescheduled_status(self):
-        db = MagicMock()
-        with (
-            _patch_secret(),
-            patch("src.lending.booking_webhook.get_db", return_value=iter([db])),
-            patch("src.lending.booking_messages.cancel_booking_messages",
-                  return_value=1) as mock_cancel,
-        ):
-            resp = client.post(
-                "/webhooks/lending/booking",
-                json={"appointmentId": "appt-99", "status": "rescheduled"},
-                headers=_headers(),
-            )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["status"] == "rescheduled"
-        # db arg is the real SQLAlchemy session injected by get_db; just check booking_ref and reason
-        assert mock_cancel.call_args[0][1] == "appt-99"
-        assert mock_cancel.call_args[0][2] == "booking_rescheduled"
 
-    def test_noop_for_no_appointment_id(self):
-        with _patch_secret():
-            resp = client.post(
-                "/webhooks/lending/booking",
-                json={"type": "ping"},
-                headers=_headers(),
-            )
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "noop"
+def statuses(db):
+    return {r[0]: r[1] for r in db.execute(text("SELECT kind, status FROM lending.booking_messages"))}
 
-    def test_noop_for_unhandled_status(self):
-        db = MagicMock()
-        with (
-            _patch_secret(),
-            patch("src.lending.booking_webhook.get_db", return_value=iter([db])),
-        ):
-            resp = client.post(
-                "/webhooks/lending/booking",
-                json={"appointmentId": "appt-1", "status": "showed"},
-                headers=_headers(),
-            )
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "noop"
+
+def post(client, body, secret=SECRET):
+    headers = {"X-Webhook-Secret": secret} if secret else {}
+    return client.post("/webhooks/lending/ghl-appointment", headers=headers, json=body)
+
+
+def test_a_cancelled_appointment_cancels_all_pending_messages(client, db):
+    response = post(client, {"appointmentId": "appt-1", "appointmentStatus": "cancelled"})
+    assert response.status_code == 200 and response.json() == {"status": "cancelled", "cancelled": 3}
+    assert set(statuses(db).values()) == {"cancelled"}
+
+
+def test_a_rescheduled_appointment_cancels_the_old_messages(client, db):
+    response = post(client, {"appointment": {"id": "appt-1", "appointmentStatus": "rescheduled"}})
+    assert response.json()["cancelled"] == 3
+    assert db.execute(text("SELECT DISTINCT cancel_reason FROM lending.booking_messages")).scalar() == "booking_rescheduled"
+
+
+def test_an_unrelated_status_or_unknown_appointment_changes_nothing(client, db):
+    assert post(client, {"appointmentId": "appt-1", "appointmentStatus": "showed"}).json()["status"] == "noop"
+    assert post(client, {"appointmentId": "other", "appointmentStatus": "cancelled"}).json()["cancelled"] == 0
+    assert post(client, {"type": "ping"}).json()["reason"] == "no_appointment_id"
+    assert set(statuses(db).values()) == {"pending"}
+
+
+def test_the_booking_ref_is_not_an_appointment_id(client, db):
+    assert post(client, {"appointmentId": "ref-1", "appointmentStatus": "cancelled"}).json()["cancelled"] == 0
+
+
+def test_a_wrong_or_missing_secret_is_rejected(client, db):
+    assert post(client, {"appointmentId": "appt-1", "appointmentStatus": "cancelled"}, secret="nope").status_code == 401
+    assert post(client, {"appointmentId": "appt-1", "appointmentStatus": "cancelled"}, secret=None).status_code == 401
+    assert set(statuses(db).values()) == {"pending"}

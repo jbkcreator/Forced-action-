@@ -1,50 +1,35 @@
-"""WP-GL-10: schedule, cancel and render booking confirmation and reminders.
+"""WP-GL-10: schedule, cancel and render the booking confirmation and reminders.
 
-Public API:
-  schedule_booking_messages(db, booking) → int  rows inserted
-  cancel_booking_messages(db, booking_ref, reason) → int  rows cancelled
-  render_text(kind, **fields) → str
-  render_email(kind, **fields) → tuple[subject, body]
+Entry point for a confirmed booking: ``handle_booking_confirmed(db, payload)``. It resolves the
+contact from ``fa_max_persons`` (via ``person_id``), writes the three ``lending.booking_messages``
+rows (idempotent on ``(booking_ref, kind)``) and opens the confirmation-call task. Nothing in this
+module sends: ``reminder_worker`` does, behind the consent / suppression / window gates.
 
-All state is in lending.booking_messages. schedule_booking_messages()
-uses ON CONFLICT DO NOTHING so retried events from WP-GL-5's booking
-trigger are idempotent.
+The payload is the contract the GL-5 booking event must carry (not yet emitted by #323 — see the
+GL-5 owner's answer; the transport, outbox event or otherwise, is theirs to choose)::
 
-A booking passed to schedule_booking_messages must carry:
-  booking_ref       str         stable booking identifier from WP-GL-5
-  first_name        str         contact first name (may be blank)
-  contact_phone     str|None    normalized E.164; None → email-only
-  contact_email     str|None    used for fallback (B4)
-  property_address  str|None    None → templates drop the address phrase
-  slot_start_utc    datetime    timezone-aware UTC
-  booked_by         str|None    caller seat id, or 'ai'
-  text_consent      bool        caller asked and logged the yes (G6)
-  status            str         'confirmed' or 'pending' (AI bookings start pending)
-  ghl_contact_id    str|None    GHL contact id for Live messenger
-
-GL-5 provides this contract via its booking event. Until GL-5 is merged,
-schedule_booking_messages() accepts a plain dict with these keys.
+    booking_ref        str       fa_max_bookings.booking_ref
+    provider_event_id  str|None  fa_max_bookings.provider_event_id (the GHL appointment id)
+    person_id          str|None  fa_max_bookings.person_id -> fa_max_persons
+    slot_start_utc     datetime  timezone-aware
+    property_address   str|None  from the gate answers; None drops the address phrase
+    booked_by          str|None  the caller's login (gate.captured_by), or "ai"
 """
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta, timezone
+from typing import Any, Mapping, Optional
 
 from sqlalchemy import text
 
 from config.lending_reminders import (
-    ALL_KINDS,
     CALLBACK_NUMBER_PLACEHOLDER,
     CONFIRMATION_NO_ADDRESS,
     CONFIRMATION_WITH_ADDRESS,
-    NIGHT_BEFORE_NO_ADDRESS,
-    NIGHT_BEFORE_WITH_ADDRESS,
-    NINETY_MIN_NO_ADDRESS,
-    NINETY_MIN_WITH_ADDRESS,
     EMAIL_CONFIRMATION_NO_ADDRESS,
     EMAIL_CONFIRMATION_WITH_ADDRESS,
-    EMAIL_FROM,
     EMAIL_NIGHT_BEFORE_NO_ADDRESS,
     EMAIL_NIGHT_BEFORE_WITH_ADDRESS,
     EMAIL_NINETY_MIN_NO_ADDRESS,
@@ -56,294 +41,213 @@ from config.lending_reminders import (
     KIND_NIGHT_BEFORE,
     KIND_NINETY_MIN,
     MAX_TEXT_CHARS,
-    MIN_LEAD_SECONDS_90MIN,
     NIGHT_BEFORE_HOUR_ET,
     NIGHT_BEFORE_MINUTE_ET,
+    NIGHT_BEFORE_NO_ADDRESS,
+    NIGHT_BEFORE_WITH_ADDRESS,
+    NINETY_MIN_NO_ADDRESS,
     NINETY_MIN_SECONDS,
+    NINETY_MIN_WITH_ADDRESS,
+    STATUS_CANCELLED,
+    STATUS_PENDING,
+    STATUS_SKIPPED,
+    TEXT_WINDOW_END_HOUR,
+    TEXT_WINDOW_START_HOUR,
     TIMEZONE,
 )
+from src.lending.compliance import phone_hash
+from src.lending.text_back import first_name_of
+from src.services.phone_utils import normalize as normalize_phone
 
 logger = logging.getLogger(__name__)
 
 _INSERT = text("""
     INSERT INTO lending.booking_messages
-        (booking_ref, kind, channel, send_at, first_name, contact_phone,
-         contact_email, property_address, slot_start_utc, booked_by,
-         text_consent)
+        (booking_ref, provider_event_id, person_id, kind, send_at, status, skip_reason, first_name,
+         contact_phone, contact_email, property_address, slot_start_utc, booked_by)
     VALUES
-        (:booking_ref, :kind, :channel, :send_at, :first_name, :contact_phone,
-         :contact_email, :property_address, :slot_start_utc, :booked_by,
-         :text_consent)
+        (:booking_ref, :provider_event_id, :person_id, :kind, :send_at, :status, :skip_reason, :first_name,
+         :contact_phone, :contact_email, :property_address, :slot_start_utc, :booked_by)
     ON CONFLICT (booking_ref, kind) DO NOTHING
 """)
 
-_CANCEL = text("""
-    UPDATE lending.booking_messages
-       SET status = 'cancelled', cancel_reason = :reason
-     WHERE booking_ref = :booking_ref
-       AND status = 'pending'
+_PERSON = text("""
+    SELECT COALESCE(m.full_name, p.full_name) AS full_name,
+           COALESCE(m.phone, p.phone)         AS phone,
+           COALESCE(m.email, p.email)         AS email
+      FROM fa_max_persons p
+      LEFT JOIN fa_max_persons m ON m.person_id = p.merged_into_id
+     WHERE p.person_id::text = :person_id
+""")
+
+_CANCEL_BY_REF = text("""
+    UPDATE lending.booking_messages SET status = 'cancelled', cancel_reason = :reason, decided_at = now()
+     WHERE booking_ref = :ref AND status = 'pending'
+""")
+_CANCEL_BY_EVENT = text("""
+    UPDATE lending.booking_messages SET status = 'cancelled', cancel_reason = :reason, decided_at = now()
+     WHERE provider_event_id = :event_id AND status = 'pending'
 """)
 
 
-def schedule_booking_messages(db, booking: dict[str, Any]) -> int:
-    """Write confirmation and reminder rows for one booking.
+@dataclass(frozen=True)
+class ScheduleResult:
+    inserted: int
+    skip_reason: Optional[str]  # set when every row was recorded as skipped (no person / no contact method)
+    assignee: Optional[str]     # who owns the confirmation call
 
-    Returns the number of rows inserted (0 if all already existed).
-    Does not commit; caller commits.
+
+# ── scheduling ────────────────────────────────────────────────────────────────
+
+def handle_booking_confirmed(db, payload: Mapping[str, Any], *, now: Optional[datetime] = None) -> ScheduleResult:
+    """Schedule the three messages and the confirmation-call task for one confirmed booking.
+
+    Idempotent: a redelivered event inserts nothing and changes nothing. Does not commit.
+    A booking with no resolvable person or no phone/email still gets its rows, recorded as skipped
+    with the reason, so the gap is visible instead of silent.
     """
-    booking_ref: str = booking["booking_ref"]
-    first_name: str = booking.get("first_name") or ""
-    contact_phone: Optional[str] = booking.get("contact_phone")
-    contact_email: Optional[str] = booking.get("contact_email")
-    property_address: Optional[str] = booking.get("property_address")
-    slot_start_utc: datetime = booking["slot_start_utc"]
-    booked_by: Optional[str] = booking.get("booked_by")
-    text_consent: bool = bool(booking.get("text_consent", False))
+    from src.lending.confirmation_tasks import assign_confirmation_task
 
-    # Determine the outbound channel for this contact.
-    # Text is primary when: 10DLC has been approved (LENDING_TEXT_ENABLED)
-    # AND the caller logged the consent yes (G6). Email is the fallback (B4).
-    channel = _channel(text_consent=text_consent)
+    now = now or datetime.now(timezone.utc)
+    booking_ref = str(payload["booking_ref"])
+    slot_start = payload["slot_start_utc"]
+    if slot_start.tzinfo is None:
+        raise ValueError("slot_start_utc must be timezone-aware")
 
-    rows: list[dict] = []
+    person_id = str(payload["person_id"]) if payload.get("person_id") else None
+    person = _person(db, person_id) if person_id else None
+    phone = normalize_phone(person["phone"]) if person and person["phone"] else None
+    email = (person["email"] or "").strip().lower() or None if person else None
+    skip_reason = None
+    if person_id is None:
+        skip_reason = "no_person"
+    elif person is None:
+        skip_reason = "person_not_found"
+    elif not phone and not email:
+        skip_reason = "no_contact_method"
 
-    # Confirmation — always scheduled; send_at is at booking time (NOW at the
-    # caller side, but we record a one-second future so the worker picks it up).
-    rows.append(_row(
-        booking_ref=booking_ref,
-        kind=KIND_CONFIRMATION,
-        channel=channel,
-        send_at=_confirmation_send_at(),
-        first_name=first_name,
-        contact_phone=contact_phone,
-        contact_email=contact_email,
-        property_address=property_address,
-        slot_start_utc=slot_start_utc,
-        booked_by=booked_by,
-        text_consent=text_consent,
-    ))
-
-    # Night-before reminder — skip if booking is made after the send window on
-    # the calendar day before the slot (e.g. booked at 7pm for 10am tomorrow;
-    # the 6pm window has passed).
-    night_before_at = _night_before_send_at(slot_start_utc)
-    if night_before_at is not None:
-        rows.append(_row(
-            booking_ref=booking_ref,
-            kind=KIND_NIGHT_BEFORE,
-            channel=channel,
-            send_at=night_before_at,
-            first_name=first_name,
-            contact_phone=contact_phone,
-            contact_email=contact_email,
-            property_address=property_address,
-            slot_start_utc=slot_start_utc,
-            booked_by=booked_by,
-            text_consent=text_consent,
-        ))
-    else:
-        logger.info(
-            "[booking-messages] night_before skipped (window passed) booking_ref=%s", booking_ref
-        )
-
-    # 90-minute reminder — skip if the slot is fewer than MIN_LEAD_SECONDS_90MIN away.
-    ninety_min_at = slot_start_utc - timedelta(seconds=NINETY_MIN_SECONDS)
-    now_utc = datetime.now(timezone.utc)
-    if (ninety_min_at - now_utc).total_seconds() >= MIN_LEAD_SECONDS_90MIN:
-        rows.append(_row(
-            booking_ref=booking_ref,
-            kind=KIND_NINETY_MIN,
-            channel=channel,
-            send_at=ninety_min_at,
-            first_name=first_name,
-            contact_phone=contact_phone,
-            contact_email=contact_email,
-            property_address=property_address,
-            slot_start_utc=slot_start_utc,
-            booked_by=booked_by,
-            text_consent=text_consent,
-        ))
-    else:
-        logger.info(
-            "[booking-messages] ninety_min skipped (too soon) booking_ref=%s", booking_ref
-        )
-
-    if not rows:
-        return 0
-
-    result = db.execute(_INSERT, rows)
-    inserted = result.rowcount
-    logger.info(
-        "[booking-messages] scheduled %d/%d rows booking_ref=%s channel=%s",
-        inserted, len(rows), booking_ref, channel,
-    )
-    return inserted
-
-
-def cancel_booking_messages(db, booking_ref: str, reason: str) -> int:
-    """Cancel all pending messages for a booking_ref.
-
-    Called when a booking is cancelled or rescheduled (from the GHL webhook
-    in lending_ghl_router). Does not commit; caller commits.
-    """
-    result = db.execute(_CANCEL, {"booking_ref": booking_ref, "reason": reason})
-    logger.info(
-        "[booking-messages] cancelled %d pending rows booking_ref=%s reason=%s",
-        result.rowcount, booking_ref, reason,
-    )
-    return result.rowcount
-
-
-# ── Template rendering ────────────────────────────────────────────────────────
-
-def render_text(
-    kind: str,
-    *,
-    first_name: str,
-    slot_start_utc: datetime,
-    property_address: Optional[str] = None,
-    number: str = CALLBACK_NUMBER_PLACEHOLDER,
-) -> str:
-    """Render the approved text template for a given kind.
-
-    Truncates to MAX_TEXT_CHARS to stay within carrier limits.
-    """
-    fmt = _text_template(kind, has_address=bool(property_address))
-    dt_et = slot_start_utc.astimezone(TIMEZONE)
-    hour = dt_et.hour % 12 or 12
-    ampm = "am" if dt_et.hour < 12 else "pm"
-    time_str = f"{hour}:{dt_et.strftime('%M')} {ampm} ET"
-    body = fmt.format(
-        first_name=first_name or "there",
-        date=dt_et.strftime("%A, %B") + f" {dt_et.day}",
-        time=time_str,
-        property_address=property_address or "",
-        number=number,
-    )
-    return body[:MAX_TEXT_CHARS]
-
-
-def render_email(
-    kind: str,
-    *,
-    first_name: str,
-    slot_start_utc: datetime,
-    property_address: Optional[str] = None,
-    number: str = CALLBACK_NUMBER_PLACEHOLDER,
-) -> tuple[str, str]:
-    """Render the email subject and body for a given kind."""
-    subject = _email_subject(kind)
-    fmt = _email_template(kind, has_address=bool(property_address))
-    dt_et = slot_start_utc.astimezone(TIMEZONE)
-    hour = dt_et.hour % 12 or 12
-    ampm = "am" if dt_et.hour < 12 else "pm"
-    time_str = f"{hour}:{dt_et.strftime('%M')} {ampm} ET"
-    body = fmt.format(
-        first_name=first_name or "there",
-        date=dt_et.strftime("%A, %B") + f" {dt_et.day}",
-        time=time_str,
-        property_address=property_address or "",
-        number=number,
-    )
-    return subject, body
-
-
-# ── Internals ─────────────────────────────────────────────────────────────────
-
-def _channel(*, text_consent: bool) -> str:
-    """Determine the outbound channel for this contact.
-
-    Text is used only when LENDING_TEXT_ENABLED is true AND the caller logged
-    the consent yes. Email is the fallback in all other cases (B4).
-    """
-    from config.settings import get_settings
-    text_enabled = getattr(get_settings(), "lending_text_enabled", False)
-    if text_enabled and text_consent:
-        return "text"
-    return "email"
-
-
-def _confirmation_send_at() -> datetime:
-    """Confirmation goes out immediately — one second from now."""
-    return datetime.now(timezone.utc) + timedelta(seconds=1)
-
-
-def _night_before_send_at(slot_start_utc: datetime) -> Optional[datetime]:
-    """The ET evening send time on the calendar day before the slot.
-
-    Returns None if that moment is in the past (booking made too late).
-    """
-    from datetime import date as date_cls
-
-    slot_et = slot_start_utc.astimezone(TIMEZONE)
-    day_before = slot_et.date() - timedelta(days=1)
-    if day_before < date_cls.today():
-        return None
-
-    # Build an aware datetime at NIGHT_BEFORE_HOUR_ET on the day before.
-    send_et = datetime(
-        day_before.year, day_before.month, day_before.day,
-        NIGHT_BEFORE_HOUR_ET, NIGHT_BEFORE_MINUTE_ET,
-        tzinfo=TIMEZONE,
-    )
-    send_utc = send_et.astimezone(timezone.utc)
-    if send_utc <= datetime.now(timezone.utc):
-        return None
-    return send_utc
-
-
-def _row(
-    *,
-    booking_ref: str,
-    kind: str,
-    channel: str,
-    send_at: datetime,
-    first_name: str,
-    contact_phone: Optional[str],
-    contact_email: Optional[str],
-    property_address: Optional[str],
-    slot_start_utc: datetime,
-    booked_by: Optional[str],
-    text_consent: bool,
-) -> dict:
-    return {
+    common = {
         "booking_ref": booking_ref,
-        "kind": kind,
-        "channel": channel,
-        "send_at": send_at,
-        "first_name": first_name,
-        "contact_phone": contact_phone,
-        "contact_email": contact_email,
-        "property_address": property_address,
-        "slot_start_utc": slot_start_utc,
-        "booked_by": booked_by,
-        "text_consent": text_consent,
+        "provider_event_id": payload.get("provider_event_id"),
+        "person_id": person_id,
+        "first_name": first_name_of(person["full_name"]) if person else None,
+        "contact_phone": phone,
+        "contact_email": email,
+        "property_address": (payload.get("property_address") or None),
+        "slot_start_utc": slot_start,
+        "booked_by": payload.get("booked_by"),
+    }
+    rows = [
+        _row(common, KIND_CONFIRMATION, now, skip_reason),
+        _row(common, KIND_NIGHT_BEFORE, night_before_send_at(slot_start), skip_reason, now=now),
+        _row(common, KIND_NINETY_MIN, slot_start - timedelta(seconds=NINETY_MIN_SECONDS), skip_reason, now=now),
+    ]
+    inserted = sum(db.execute(_INSERT, row).rowcount for row in rows)  # 3 rows; per-statement rowcount is exact
+    if skip_reason:
+        logger.warning("[booking-messages] booking_ref=%s recorded as skipped (%s)", booking_ref, skip_reason)
+    else:
+        logger.info("[booking-messages] booking_ref=%s scheduled %d rows phone_hash=%s",
+                    booking_ref, inserted, phone_hash(phone)[:12] if phone else "-")
+    assignee = assign_confirmation_task(db, booking_ref=booking_ref, person_id=person_id,
+                                        booked_by=payload.get("booked_by"), slot_start_utc=slot_start)
+    return ScheduleResult(inserted=inserted, skip_reason=skip_reason, assignee=assignee)
+
+
+def _person(db, person_id: str) -> Optional[Mapping[str, Any]]:
+    return db.execute(_PERSON, {"person_id": person_id}).mappings().first()
+
+
+def _row(common: dict, kind: str, send_at: Optional[datetime], skip_reason: Optional[str], *,
+         now: Optional[datetime] = None) -> dict:
+    """One insert row. A reminder whose time has already passed is recorded as skipped (visible)."""
+    status, reason = STATUS_PENDING, skip_reason
+    if send_at is None or (now is not None and send_at <= now and kind != KIND_CONFIRMATION):
+        status, reason = STATUS_SKIPPED, reason or "too_late"
+    elif skip_reason:
+        status = STATUS_SKIPPED
+    return {**common, "kind": kind, "send_at": send_at or common["slot_start_utc"],
+            "status": status, "skip_reason": reason}
+
+
+def night_before_send_at(slot_start_utc: datetime) -> datetime:
+    """NIGHT_BEFORE_HOUR_ET on the Eastern calendar day before the slot (may be in the past)."""
+    day_before: date = slot_start_utc.astimezone(TIMEZONE).date() - timedelta(days=1)
+    return datetime.combine(day_before, time(NIGHT_BEFORE_HOUR_ET, NIGHT_BEFORE_MINUTE_ET), tzinfo=TIMEZONE)
+
+
+# ── cancellation ──────────────────────────────────────────────────────────────
+
+def cancel_by_provider_event(db, provider_event_id: str, reason: str) -> int:
+    """Cancel pending messages for the booking whose GHL appointment id this is. Does not commit.
+    A message already claimed for sending cannot be recalled."""
+    n = db.execute(_CANCEL_BY_EVENT, {"event_id": provider_event_id, "reason": reason}).rowcount
+    logger.info("[booking-messages] cancelled %d pending rows (event) reason=%s", n, reason)
+    return n
+
+
+def cancel_by_booking_ref(db, booking_ref: str, reason: str) -> int:
+    n = db.execute(_CANCEL_BY_REF, {"ref": booking_ref, "reason": reason}).rowcount
+    logger.info("[booking-messages] cancelled %d pending rows booking_ref=%s reason=%s", n, booking_ref, reason)
+    return n
+
+
+# ── the text window ───────────────────────────────────────────────────────────
+
+def text_window_open(moment: datetime) -> bool:
+    return TEXT_WINDOW_START_HOUR <= moment.astimezone(TIMEZONE).hour < TEXT_WINDOW_END_HOUR
+
+
+def next_text_window(moment: datetime) -> datetime:
+    """The first moment at or after ``moment`` at which a text may go out."""
+    local = moment.astimezone(TIMEZONE)
+    if text_window_open(moment):
+        return moment
+    day = local.date() if local.hour < TEXT_WINDOW_START_HOUR else local.date() + timedelta(days=1)
+    return datetime.combine(day, time(TEXT_WINDOW_START_HOUR), tzinfo=TIMEZONE)
+
+
+# ── rendering ─────────────────────────────────────────────────────────────────
+
+def _fields(first_name: Optional[str], slot_start_utc: datetime, property_address: Optional[str], number: str) -> dict:
+    local = slot_start_utc.astimezone(TIMEZONE)
+    hour = local.hour % 12 or 12
+    return {
+        "first_name": first_name or "there",
+        "date": local.strftime("%A, %B") + f" {local.day}",
+        "time": f"{hour}:{local.strftime('%M')} {'am' if local.hour < 12 else 'pm'} ET",
+        "property_address": (property_address or "").split(",")[0].strip(),
+        "number": number,
     }
 
 
-def _text_template(kind: str, *, has_address: bool) -> str:
-    if kind == KIND_CONFIRMATION:
-        return CONFIRMATION_WITH_ADDRESS if has_address else CONFIRMATION_NO_ADDRESS
-    if kind == KIND_NIGHT_BEFORE:
-        return NIGHT_BEFORE_WITH_ADDRESS if has_address else NIGHT_BEFORE_NO_ADDRESS
-    if kind == KIND_NINETY_MIN:
-        return NINETY_MIN_WITH_ADDRESS if has_address else NINETY_MIN_NO_ADDRESS
-    raise ValueError(f"unknown reminder kind: {kind!r}")
+def render_text(kind: str, *, first_name: Optional[str], slot_start_utc: datetime,
+                property_address: Optional[str] = None, number: str = CALLBACK_NUMBER_PLACEHOLDER) -> str:
+    """The client-approved text for ``kind``; never longer than MAX_TEXT_CHARS."""
+    fields = _fields(first_name, slot_start_utc, property_address, number)
+    template = _TEXT[kind][bool(fields["property_address"])]
+    return template.format(**fields)[:MAX_TEXT_CHARS]
 
 
-def _email_template(kind: str, *, has_address: bool) -> str:
-    if kind == KIND_CONFIRMATION:
-        return EMAIL_CONFIRMATION_WITH_ADDRESS if has_address else EMAIL_CONFIRMATION_NO_ADDRESS
-    if kind == KIND_NIGHT_BEFORE:
-        return EMAIL_NIGHT_BEFORE_WITH_ADDRESS if has_address else EMAIL_NIGHT_BEFORE_NO_ADDRESS
-    if kind == KIND_NINETY_MIN:
-        return EMAIL_NINETY_MIN_WITH_ADDRESS if has_address else EMAIL_NINETY_MIN_NO_ADDRESS
-    raise ValueError(f"unknown reminder kind: {kind!r}")
+def render_email(kind: str, *, first_name: Optional[str], slot_start_utc: datetime,
+                 property_address: Optional[str] = None, number: str = CALLBACK_NUMBER_PLACEHOLDER) -> tuple[str, str]:
+    fields = _fields(first_name, slot_start_utc, property_address, number)
+    body = _EMAIL[kind][bool(fields["property_address"])].format(**fields)
+    return _EMAIL_SUBJECT[kind], body
 
 
-def _email_subject(kind: str) -> str:
-    return {
-        KIND_CONFIRMATION: EMAIL_SUBJECT_CONFIRMATION,
-        KIND_NIGHT_BEFORE: EMAIL_SUBJECT_NIGHT_BEFORE,
-        KIND_NINETY_MIN: EMAIL_SUBJECT_NINETY_MIN,
-    }[kind]
+# kind -> (without address, with address)
+_TEXT = {
+    KIND_CONFIRMATION: (CONFIRMATION_NO_ADDRESS, CONFIRMATION_WITH_ADDRESS),
+    KIND_NIGHT_BEFORE: (NIGHT_BEFORE_NO_ADDRESS, NIGHT_BEFORE_WITH_ADDRESS),
+    KIND_NINETY_MIN: (NINETY_MIN_NO_ADDRESS, NINETY_MIN_WITH_ADDRESS),
+}
+_EMAIL = {
+    KIND_CONFIRMATION: (EMAIL_CONFIRMATION_NO_ADDRESS, EMAIL_CONFIRMATION_WITH_ADDRESS),
+    KIND_NIGHT_BEFORE: (EMAIL_NIGHT_BEFORE_NO_ADDRESS, EMAIL_NIGHT_BEFORE_WITH_ADDRESS),
+    KIND_NINETY_MIN: (EMAIL_NINETY_MIN_NO_ADDRESS, EMAIL_NINETY_MIN_WITH_ADDRESS),
+}
+_EMAIL_SUBJECT = {
+    KIND_CONFIRMATION: EMAIL_SUBJECT_CONFIRMATION,
+    KIND_NIGHT_BEFORE: EMAIL_SUBJECT_NIGHT_BEFORE,
+    KIND_NINETY_MIN: EMAIL_SUBJECT_NINETY_MIN,
+}

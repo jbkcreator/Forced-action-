@@ -1,168 +1,291 @@
-"""Tests for WP-GL-10 reminder_worker: gate order, suppression, crash-recovery.
-
-All tests use the Fake messenger (no network). DB is mocked.
-"""
+"""WP-GL-10 worker: consent / suppression / window gates, no blind re-sends, crash safety."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Optional
-from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
+from sqlalchemy import text
 
-from config.lending_reminders import KIND_CONFIRMATION, KIND_NIGHT_BEFORE, KIND_NINETY_MIN
-from src.lending.ghl_messenger import FakeGHLMessenger, MessageResult
-from src.lending.reminder_worker import process_due_rows
+from config.lending_reminders import MAX_SEND_ATTEMPTS, RETRY_DELAY_SECONDS, STALE_SEND_SECONDS
+from migrations.apply_lending_booking_messages import apply_to
+from src.lending import reminder_worker
+from src.lending.booking_messages import handle_booking_confirmed
+from src.lending.consent import record_consent, revoke_consent
+from src.lending.ghl_sms import GhlSmsError
+from src.lending.reminder_worker import process_due
 
-
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _slot(hours: float = 24.0) -> datetime:
-    return _now() + timedelta(hours=hours)
-
-
-def _row(
-    *,
-    row_id: int = 1,
-    kind: str = KIND_CONFIRMATION,
-    channel: str = "text",
-    phone: Optional[str] = "+18135550001",
-    email: Optional[str] = "borrower@example.com",
-    first_name: str = "Jane",
-    address: Optional[str] = "412 Oak Ave",
-    slot: Optional[datetime] = None,
-    text_consent: bool = True,
-) -> dict:
-    return {
-        "id": row_id,
-        "booking_ref": f"ref-{row_id}",
-        "kind": kind,
-        "channel": channel,
-        "send_at": _now() - timedelta(seconds=5),
-        "first_name": first_name,
-        "contact_phone": phone,
-        "contact_email": email,
-        "property_address": address,
-        "slot_start_utc": slot or _slot(),
-        "booked_by": "caller@heu.ai",
-        "text_consent": text_consent,
-    }
+ET = ZoneInfo("America/New_York")
+PHONE = "+18135550111"
+SLOT = datetime(2026, 10, 7, 14, 0, tzinfo=timezone.utc)  # Wed 10:00 ET
+NOON = datetime(2026, 10, 5, 16, 0, tzinfo=timezone.utc)  # Mon 12:00 ET: window open
 
 
-def _make_db(rows: list[dict]) -> MagicMock:
-    db = MagicMock()
+class TextSender:
+    def __init__(self, error: Exception | None = None):
+        self.calls, self.error = [], error
 
-    def execute_side(stmt, params=None):
-        result = MagicMock()
-        sql = str(stmt)
-        if "WHERE status = 'pending'" in sql:
-            result.mappings.return_value.all.return_value = rows
-        else:
-            result.rowcount = 1
-        return result
-
-    db.execute.side_effect = execute_side
-    return db
+    def __call__(self, phone, body, first_name=None, *, deadline=None):
+        self.calls.append({"phone": phone, "body": body, "first_name": first_name, "deadline": deadline})
+        if self.error:
+            raise self.error
+        return f"msg-{len(self.calls)}"
 
 
-class TestProcessDueRows:
-    def _run(self, rows, *, suppressed=None, text_enabled=True, dry_run=False):
-        db = _make_db(rows)
-        messenger = FakeGHLMessenger()
-        suppressed_set = suppressed or set()
+class EmailSender:
+    def __init__(self):
+        self.calls = []
 
-        def fake_suppression(db_, phones):
-            return suppressed_set
+    def __call__(self, to, subject, body):
+        self.calls.append((to, subject, body))
+        return f"mail-{len(self.calls)}"
 
-        with (
-            patch("src.lending.reminder_worker.get_messenger", return_value=messenger),
-            patch("src.lending.reminder_worker.get_settings") as mock_s,
-        ):
-            mock_s.return_value.lending_text_enabled = text_enabled
-            mock_s.return_value.lending_email_enabled = False  # email fake mode
-            counts = process_due_rows(
-                db, dry_run=dry_run, suppression_lookup=fake_suppression
-            )
-        return counts, messenger, db
 
-    def test_sends_text_for_due_row(self):
-        counts, messenger, _ = self._run([_row(channel="text")])
-        assert counts.get("sent_text") == 1
-        assert len(messenger.sent) == 1
+@pytest.fixture
+def db(lending_db):
+    apply_to(lending_db.connection())
+    return lending_db
 
-    def test_suppressed_contact_is_skipped(self):
-        row = _row(phone="+18135550001", channel="text")
-        counts, messenger, _ = self._run([row], suppressed={"+18135550001"})
-        assert counts.get("suppressed") == 1
-        assert len(messenger.sent) == 0
 
-    def test_text_not_enabled_skips(self):
-        counts, messenger, _ = self._run([_row(channel="text")], text_enabled=False)
-        assert counts.get("text_not_enabled") == 1
-        assert len(messenger.sent) == 0
+def book(db, *, phone=PHONE, email="jane@example.com", ref="ref-1", slot=SLOT, now=NOON - timedelta(hours=1)):
+    person = db.execute(
+        text("INSERT INTO fa_max_persons (source, full_name, phone, email) VALUES ('test', 'Jane Doe', :p, :e) "
+             "RETURNING person_id::text"), {"p": phone, "e": email}).scalar()
+    handle_booking_confirmed(db, {"booking_ref": ref, "provider_event_id": f"appt-{ref}", "person_id": person,
+                                  "slot_start_utc": slot, "property_address": "412 Oak Ave", "booked_by": "dana@heu.ai"},
+                             now=now)
 
-    def test_no_phone_skips_text_channel(self):
-        counts, messenger, _ = self._run([_row(channel="text", phone=None)])
-        assert counts.get("no_phone") == 1
-        assert len(messenger.sent) == 0
 
-    def test_email_channel_without_email_address_skips(self):
-        counts, _, _ = self._run([_row(channel="email", email=None)])
-        assert counts.get("no_email") == 1
+def cycle(db, *, text_sender=None, email_sender=None, text_enabled=True, email_enabled=False, now=NOON):
+    return process_due(db, text_sender=text_sender, email_sender=email_sender, text_enabled=text_enabled,
+                       email_enabled=email_enabled, now=now, clock=lambda: now)
 
-    def test_email_channel_fake_sends(self):
-        """Email fake always returns sent=True."""
-        counts, messenger, _ = self._run([_row(channel="email", email="x@y.com")])
-        assert counts.get("sent_email") == 1
-        assert len(messenger.sent) == 0  # email path does not use GHL messenger
 
-    def test_dry_run_does_not_send(self):
-        counts, messenger, _ = self._run([_row()], dry_run=True)
-        assert counts.get("dry_run") == 1
-        assert len(messenger.sent) == 0
+def row(db, kind="confirmation"):
+    return db.execute(text("SELECT status, skip_reason, channel, attempts, send_at, provider_message_id, sent_at "
+                           "FROM lending.booking_messages WHERE kind = :k"), {"k": kind}).mappings().one()
 
-    def test_ghl_error_leaves_row_for_retry(self):
-        """A GHLMessengerError is caught and counted as 'retry' (row stays pending)."""
-        from src.lending.ghl_messenger import GHLMessengerError
 
-        class FailingMessenger:
-            def send_text(self, **kwargs):
-                raise GHLMessengerError("network error")
+def test_a_consented_contact_gets_the_confirmation_text_once(db):
+    book(db)
+    record_consent(db, PHONE, "on_call_yes", captured_by="dana@heu.ai")
+    sender = TextSender()
+    assert cycle(db, text_sender=sender) == {"sent": 1}
+    assert len(sender.calls) == 1
+    call = sender.calls[0]
+    assert call["phone"] == PHONE and call["first_name"] == "Jane" and call["deadline"] == SLOT
+    assert "confirming your call with Josh" in call["body"] and call["body"].endswith("Reply STOP to opt out.")
+    done = row(db)
+    assert (done["status"], done["channel"], done["provider_message_id"]) == ("sent", "text", "msg-1")
+    assert done["sent_at"] is not None
+    assert cycle(db, text_sender=sender) == {}  # nothing left that is due
+    assert len(sender.calls) == 1
 
-        db = _make_db([_row(channel="text")])
-        with (
-            patch("src.lending.reminder_worker.get_messenger", return_value=FailingMessenger()),
-            patch("src.lending.reminder_worker.get_settings") as mock_s,
-        ):
-            mock_s.return_value.lending_text_enabled = True
-            mock_s.return_value.lending_email_enabled = False
-            counts = process_due_rows(
-                db, suppression_lookup=lambda db_, p: set()
-            )
-        assert counts.get("retry") == 1
 
-    def test_no_double_send_on_concurrent_workers(self):
-        """FOR UPDATE SKIP LOCKED is handled at the DB level; worker only sees
-        rows the DB handed it. Two workers processing disjoint row-sets cannot
-        both send the same row."""
-        # Simulate: worker A gets row 1, worker B gets row 2.
-        counts_a, messenger_a, _ = self._run([_row(row_id=1)])
-        counts_b, messenger_b, _ = self._run([_row(row_id=2)])
-        assert counts_a.get("sent_text") == 1
-        assert counts_b.get("sent_text") == 1
-        assert len(messenger_a.sent) == 1
-        assert len(messenger_b.sent) == 1
+def test_reminders_are_scheduled_not_sent_with_the_confirmation(db):
+    book(db)
+    record_consent(db, PHONE, "on_call_yes")
+    cycle(db, text_sender=TextSender())
+    assert row(db, "night_before")["status"] == "pending" and row(db, "ninety_min")["status"] == "pending"
 
-    def test_empty_cycle_returns_empty_counts(self):
-        counts, _, _ = self._run([])
-        assert counts == {}
 
-    def test_stop_propagation_blocks_text(self):
-        """A phone that is in the suppression list after scheduling is blocked."""
-        phone = "+18135550002"
-        row = _row(phone=phone, channel="text")
-        counts, messenger, _ = self._run([row], suppressed={phone})
-        assert counts.get("suppressed") == 1
-        assert len(messenger.sent) == 0
+def test_each_reminder_goes_out_when_it_comes_due(db):
+    book(db)
+    record_consent(db, PHONE, "on_call_yes")
+    sender = TextSender()
+    cycle(db, text_sender=sender)
+    assert cycle(db, text_sender=sender, now=datetime(2026, 10, 6, 22, 5, tzinfo=timezone.utc)) == {"sent": 1}  # 6:05 pm ET
+    assert "tomorrow at 10:00 am ET" in sender.calls[-1]["body"]
+    assert cycle(db, text_sender=sender, now=SLOT - timedelta(minutes=89)) == {"sent": 1}
+    assert "in about 90 minutes" in sender.calls[-1]["body"]
+    assert [row(db, k)["status"] for k in ("confirmation", "night_before", "ninety_min")] == ["sent"] * 3
+
+
+def test_no_consent_and_no_email_is_skipped_visibly(db):
+    book(db, email=None)
+    sender = TextSender()
+    assert cycle(db, text_sender=sender) == {"skipped_no_consent": 1}
+    assert sender.calls == [] and row(db)["skip_reason"] == "no_consent"
+
+
+def test_no_text_consent_falls_back_to_email_once_email_is_live(db):
+    book(db)
+    texts, mails = TextSender(), EmailSender()
+    assert cycle(db, text_sender=texts, email_sender=mails, email_enabled=True) == {"sent": 1}
+    assert texts.calls == [] and mails.calls[0][0] == "jane@example.com"
+    assert row(db)["channel"] == "email"
+
+
+def test_email_that_is_not_live_is_skipped_not_reported_sent(db):
+    book(db)
+    assert cycle(db, text_sender=TextSender(), email_enabled=False) == {"skipped_email_not_enabled": 1}
+    assert row(db)["status"] == "skipped"
+
+
+def test_texting_switched_off_sends_nothing_and_says_why(db):
+    book(db)
+    record_consent(db, PHONE, "on_call_yes")
+    sender = TextSender()
+    assert cycle(db, text_sender=sender, text_enabled=False) == {"skipped_text_not_enabled": 1}
+    assert sender.calls == []
+
+
+def test_texting_not_configured_sends_nothing(db):
+    book(db)
+    record_consent(db, PHONE, "on_call_yes")
+    assert cycle(db, text_sender=None) == {"skipped_not_configured": 1}
+
+
+def test_a_stop_after_scheduling_blocks_the_text(db):
+    book(db)
+    record_consent(db, PHONE, "on_call_yes")
+    db.execute(text("INSERT INTO lending.suppression_list (phone, reason, source_channel) VALUES (:p, 'OPT_OUT', 'sms')"),
+               {"p": PHONE})
+    sender = TextSender()
+    assert cycle(db, text_sender=sender) == {"skipped_suppressed": 1}
+    assert sender.calls == []
+
+
+def test_suppression_blocks_the_email_fallback_too(db):
+    book(db)
+    db.execute(text("INSERT INTO lending.suppression_list (phone, reason, source_channel) VALUES (:p, 'OPT_OUT', 'sms')"),
+               {"p": PHONE})
+    mails = EmailSender()
+    assert cycle(db, email_sender=mails, email_enabled=True) == {"skipped_suppressed": 1}
+    assert mails.calls == []
+
+
+def test_revoked_consent_blocks_the_text(db):
+    book(db, email=None)
+    record_consent(db, PHONE, "on_call_yes")
+    revoke_consent(db, PHONE)
+    sender = TextSender()
+    assert cycle(db, text_sender=sender) == {"skipped_no_consent": 1}
+
+
+def test_a_cancelled_booking_is_never_texted(db):
+    book(db)
+    record_consent(db, PHONE, "on_call_yes")
+    db.execute(text("UPDATE lending.booking_messages SET status = 'cancelled'"))
+    sender = TextSender()
+    assert cycle(db, text_sender=sender, now=SLOT - timedelta(minutes=89)) == {}
+    assert sender.calls == []
+
+
+def test_after_hours_confirmation_waits_for_the_window(db):
+    book(db, now=datetime(2026, 10, 6, 1, 0, tzinfo=timezone.utc))  # Mon 9 pm ET
+    record_consent(db, PHONE, "on_call_yes")
+    sender = TextSender()
+    night = datetime(2026, 10, 6, 1, 5, tzinfo=timezone.utc)
+    assert cycle(db, text_sender=sender, now=night) == {"deferred_quiet_hours": 1}
+    deferred = row(db)
+    assert sender.calls == [] and deferred["status"] == "pending" and deferred["attempts"] == 0
+    assert deferred["send_at"] == datetime(2026, 10, 6, 8, 0, tzinfo=ET)
+    assert cycle(db, text_sender=sender, now=datetime(2026, 10, 6, 12, 1, tzinfo=timezone.utc)) == {"sent": 1}
+
+
+def test_the_ninety_minute_text_is_skipped_not_delayed_when_the_window_is_closed(db):
+    early = datetime(2026, 10, 7, 13, 0, tzinfo=timezone.utc)  # Wed 9:00 ET call -> 7:30 am text
+    book(db, slot=early)
+    record_consent(db, PHONE, "on_call_yes")
+    sender = TextSender()
+    cycle(db, text_sender=sender)  # confirmation
+    cycle(db, text_sender=sender, now=datetime(2026, 10, 6, 22, 5, tzinfo=timezone.utc))  # night before, on time
+    at = early - timedelta(minutes=90)
+    assert cycle(db, text_sender=sender, now=at) == {"skipped_quiet_hours": 1}
+    assert (row(db, "ninety_min")["status"], row(db, "ninety_min")["skip_reason"]) == ("skipped", "quiet_hours")
+    assert len(sender.calls) == 2  # confirmation + night-before only
+
+
+def test_a_deferral_that_would_pass_the_call_is_skipped(db):
+    soon = datetime(2026, 10, 6, 11, 0, tzinfo=timezone.utc)  # Tue 7:00 ET call
+    book(db, slot=soon, now=datetime(2026, 10, 6, 1, 0, tzinfo=timezone.utc))
+    record_consent(db, PHONE, "on_call_yes")
+    assert cycle(db, text_sender=TextSender(), now=datetime(2026, 10, 6, 1, 5, tzinfo=timezone.utc)) == {"skipped_quiet_hours": 1}
+
+
+def test_a_call_that_already_started_is_not_texted_about(db):
+    book(db)
+    record_consent(db, PHONE, "on_call_yes")
+    assert cycle(db, text_sender=TextSender(), now=SLOT + timedelta(minutes=1)) == {"skipped_call_started": 3}
+
+
+def test_an_ambiguous_ghl_error_is_never_resent(db):
+    book(db)
+    record_consent(db, PHONE, "on_call_yes")
+    sender = TextSender(GhlSmsError("timeout", ambiguous=True))
+    assert cycle(db, text_sender=sender) == {"send_unknown": 1}
+    assert row(db)["status"] == "send_unknown"
+    assert cycle(db, text_sender=sender, now=NOON + timedelta(hours=1)) == {}
+    assert len(sender.calls) == 1
+
+
+def test_a_definite_failure_is_retried_then_given_up(db):
+    book(db)
+    record_consent(db, PHONE, "on_call_yes")
+    sender = TextSender(GhlSmsError("HTTP 400", ambiguous=False))
+    now = NOON
+    for attempt in range(1, MAX_SEND_ATTEMPTS):
+        assert cycle(db, text_sender=sender, now=now) == {"retry": 1}
+        assert row(db)["status"] == "pending"
+        now += timedelta(seconds=RETRY_DELAY_SECONDS + 1)
+    assert cycle(db, text_sender=sender, now=now) == {"failed": 1}
+    assert row(db)["status"] == "failed" and len(sender.calls) == MAX_SEND_ATTEMPTS
+
+
+def test_a_crash_mid_send_is_closed_as_unknown_never_resent(db):
+    book(db)
+    record_consent(db, PHONE, "on_call_yes")
+    sender = TextSender(RuntimeError("process died"))
+    assert cycle(db, text_sender=sender) == {}
+    assert row(db)["status"] == "sending"
+    later = NOON + timedelta(seconds=STALE_SEND_SECONDS + 5)
+    assert cycle(db, text_sender=TextSender(), now=later) == {}
+    assert (row(db)["status"], row(db)["skip_reason"]) == ("send_unknown", "stale_claim")
+
+
+def test_an_error_before_any_send_is_recorded_failed(db, monkeypatch):
+    book(db)
+    record_consent(db, PHONE, "on_call_yes")
+    monkeypatch.setattr(reminder_worker, "_is_suppressed", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db hiccup")))
+    sender = TextSender()
+    assert cycle(db, text_sender=sender) == {"failed": 1}
+    assert sender.calls == [] and row(db)["skip_reason"] == "internal_error"
+
+
+def test_two_workers_never_claim_the_same_row(db):
+    book(db)
+    record_consent(db, PHONE, "on_call_yes")
+    first = db.execute(reminder_worker._CLAIM, {"now": NOON, "limit": 50}).mappings().all()
+    second = db.execute(reminder_worker._CLAIM, {"now": NOON, "limit": 50}).mappings().all()
+    assert len(first) == 1 and second == []
+
+
+def test_a_night_before_text_that_could_not_go_out_the_evening_before_is_skipped(db):
+    book(db)
+    record_consent(db, PHONE, "on_call_yes")
+    sender = TextSender()
+    cycle(db, text_sender=sender)  # confirmation
+    morning_of = datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc)  # Wed 8:00 ET: "tomorrow" would be wrong
+    cycle(db, text_sender=sender, now=morning_of)
+    assert (row(db, "night_before")["status"], row(db, "night_before")["skip_reason"]) == ("skipped", "too_late")
+    assert len(sender.calls) == 1
+
+
+def test_a_night_before_text_is_not_deferred_into_the_day_of_the_call(db):
+    book(db)
+    record_consent(db, PHONE, "on_call_yes")
+    cycle(db, text_sender=TextSender())
+    late_evening = datetime(2026, 10, 7, 1, 0, tzinfo=timezone.utc)  # Tue 9 pm ET, window closed
+    assert cycle(db, text_sender=TextSender(), now=late_evening) == {"skipped_quiet_hours": 1}
+
+
+def test_a_ninety_minute_text_that_is_very_late_is_skipped(db):
+    book(db)
+    record_consent(db, PHONE, "on_call_yes")
+    sender = TextSender()
+    cycle(db, text_sender=sender)
+    cycle(db, text_sender=sender, now=datetime(2026, 10, 6, 22, 5, tzinfo=timezone.utc))
+    worker_was_down = SLOT - timedelta(minutes=30)  # 60 minutes after it came due
+    assert cycle(db, text_sender=sender, now=worker_was_down) == {"skipped_too_late": 1}
+    assert len(sender.calls) == 2

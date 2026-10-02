@@ -1,51 +1,61 @@
-"""WP-GL-10 booking confirmation and reminder configuration.
+"""WP-GL-10 booking confirmation and reminder configuration (values only, no logic).
 
-Templates, offsets and scheduling rules for:
-  - Confirmation text (right after booking)
-  - Night-before reminder (default 18:00 ET)
-  - 90-minute reminder
+Wording is verbatim from Josh's Oct 2 answers to B3. Any change needs his re-approval and a
+matching update of the 10DLC campaign sample messages.
 
-Wording is verbatim from Josh's Oct 2 answers to Section B3. Any change to
-wording must be re-approved by Josh before the 10DLC campaign registration
-is updated with carriers.
+Open items (not yet answered by the client; defaults are developer choices, not decisions):
+  - NIGHT_BEFORE_HOUR_ET: "the evening before" has no clock time.
+  - CALLBACK_NUMBER: which number goes in the 90-minute text.
 
-Night-before send time (18:00 ET) is the development default. Josh has not
-yet confirmed the clock time; 18:00 ET was chosen as a reasonable evening
-hour and will be changed if Josh specifies otherwise.
-
-Texts are sent through GoHighLevel under the Next Deal Lending texting
-number (G4 confirmed). FA's Telnyx/send_sms path is NOT used here.
-
-10DLC gate: all texts default off (LENDING_TEXT_ENABLED=false). Flip only
-after the 10DLC campaign is approved by carriers. Email fallback runs
-regardless of the 10DLC state for contacts without text consent (B4).
+Texts go through GoHighLevel only (src/lending/ghl_sms.py); consent is src/lending/consent.py.
 """
 from __future__ import annotations
 
 from zoneinfo import ZoneInfo
 
+from config.lending_text_back import MAX_TEXT_CHARS, QUIET_END_HOUR, QUIET_START_HOUR, STALE_SENDING_SECONDS
+
 # ── Scheduling ──────────────────────────────────────────────────────────────
 
-TIMEZONE = ZoneInfo("America/New_York")
+TIMEZONE = ZoneInfo("America/New_York")  # same convention as WP-GL-9: one Eastern clock
 
-# Night-before reminder: send at this hour ET on the calendar day before.
-# OPEN QUESTION (unanswered): Josh was asked the time but did not specify.
-# 18:00 ET is the developer default. Change this constant once confirmed.
-NIGHT_BEFORE_HOUR_ET = 18  # 6:00 PM ET
+NIGHT_BEFORE_HOUR_ET = 18  # OPEN QUESTION (A1): developer default, 6:00 PM ET the evening before
 NIGHT_BEFORE_MINUTE_ET = 0
-
-# 90-minute reminder offset in seconds (from the held-call start).
 NINETY_MIN_SECONDS = 90 * 60
 
-# Maximum text body length (carrier limit, same as WP-GL-9).
-MAX_TEXT_CHARS = 320
+# A reminder's wording is a statement about time ("tomorrow", "in about 90 minutes"), so a reminder the
+# worker could not send promptly (outage, backlog) is skipped as too_late rather than sent with wrong
+# wording: the night-before text is only valid on the Eastern day before the call; the 90-minute text
+# only within this many seconds after it came due.
+NINETY_MIN_MAX_LATE_SECONDS = 15 * 60
 
-# Minimum booking lead time for a reminder to be sent.
-# A booking created fewer than NINETY_MIN_SECONDS before the slot start
-# skips the 90-minute reminder (it would fire in the past or immediately).
-# A booking created after 18:00 ET the day before skips the night-before
-# reminder for the same reason.
-MIN_LEAD_SECONDS_90MIN = NINETY_MIN_SECONDS
+# Texts are only sent inside this ET window (WP-GL-9's safety window, same constants). A confirmation
+# or night-before text that comes due outside it waits for the window to open; the 90-minute text is
+# never deferred (its wording is a promise about timing) and is recorded as skipped_quiet_hours.
+TEXT_WINDOW_START_HOUR = QUIET_START_HOUR
+TEXT_WINDOW_END_HOUR = QUIET_END_HOUR
+
+# ── Sending robustness (mirrors WP-GL-9: a text is never blindly re-sent) ─────
+
+MAX_SEND_ATTEMPTS = 3          # only for failures that provably sent nothing
+RETRY_DELAY_SECONDS = 60
+# A row stuck in 'sending' longer than this is closed as send_unknown and NEVER resent.
+STALE_SEND_SECONDS = STALE_SENDING_SECONDS
+BATCH_SIZE = 50
+POLL_SECONDS = 10
+
+# Final-state vocabulary for lending.booking_messages.status.
+STATUS_PENDING, STATUS_SENDING, STATUS_SENT = "pending", "sending", "sent"
+STATUS_SEND_UNKNOWN, STATUS_FAILED = "send_unknown", "failed"
+STATUS_SKIPPED, STATUS_CANCELLED = "skipped", "cancelled"
+ALL_STATUSES = (STATUS_PENDING, STATUS_SENDING, STATUS_SENT, STATUS_SEND_UNKNOWN, STATUS_FAILED,
+                STATUS_SKIPPED, STATUS_CANCELLED)
+
+CHANNEL_TEXT, CHANNEL_EMAIL = "text", "email"
+
+# G5: an AI-booked call with no caller on shift is assigned to Josh. Taken from his questionnaire
+# answers (E1/G5); change here, not in code.
+FALLBACK_ASSIGNEE = "jbkantor@gmail.com"
 
 # ── Text message kinds ───────────────────────────────────────────────────────
 
@@ -82,17 +92,13 @@ NIGHT_BEFORE_NO_ADDRESS = (
     "Your call with Josh is tomorrow at {time}. Talk soon."
 )
 
-NINETY_MIN_WITH_ADDRESS = (
-    "Hi {first_name}, your Next Deal Lending call with Josh is in about 90 minutes, "
-    "at {time} about {property_address}. "
-    "Call us at {number} if anything's come up."
-)
-
+# The approved 90-minute wording carries no property address, so there is one variant.
 NINETY_MIN_NO_ADDRESS = (
     "Hi {first_name}, your Next Deal Lending call with Josh is in about 90 minutes, "
     "at {time}. "
     "Call us at {number} if anything's come up."
 )
+NINETY_MIN_WITH_ADDRESS = NINETY_MIN_NO_ADDRESS
 
 # ── Email fallback (B4) ──────────────────────────────────────────────────────
 
@@ -154,4 +160,4 @@ EMAIL_NINETY_MIN_NO_ADDRESS = (
 
 # OPEN QUESTION (unanswered): Josh was not asked which number goes here.
 # Using the batch-dialer main number as a placeholder. Change once confirmed.
-CALLBACK_NUMBER_PLACEHOLDER = "(727) 436-9951"
+CALLBACK_NUMBER_PLACEHOLDER = "(727) 436-9951"  # OPEN QUESTION (A2): the only dialer number that exists today

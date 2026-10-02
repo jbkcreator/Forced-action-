@@ -1030,33 +1030,14 @@ class AppSettings(BaseSettings):
 	)
 
 	# ── WP-GL-10 — Booking confirmations and reminders ───────────────────────
-	# Fail-closed until 10DLC campaign registration is approved by carriers.
-	# When false, texts are logged as fake sends (FakeGHLMessenger). Email
-	# fallback (LENDING_EMAIL_ENABLED) is independent of this flag.
-	lending_text_enabled: bool = Field(default=False, env="LENDING_TEXT_ENABLED")
-
-	# "fake" = FakeGHLMessenger (no network); "live" = LiveGHLMessenger.
-	# Both lending_text_enabled AND lending_ghl_messenger_mode=="live" must
-	# be true to produce real GHL sends.
-	lending_ghl_messenger_mode: str = Field(default="fake", env="LENDING_GHL_MESSENGER_MODE")
-
-	# Email fallback (B4): fail-closed until hello@nextdeallending.com is live.
-	# When false, email sends are logged as fake (C1/C2 not yet provisioned).
-	lending_email_enabled: bool = Field(default=False, env="LENDING_EMAIL_ENABLED")
-
-	# Shared secret for the GHL "appointment status changed" webhook.
-	# Unset → endpoint closed (same pattern as LENDING_GHL_WEBHOOK_SECRET
-	# for the existing DND webhook in lending_ghl_router).
-	lending_booking_webhook_secret: Optional[SecretStr] = Field(
-		default=None, env="LENDING_BOOKING_WEBHOOK_SECRET"
-	)
-
-	# GHL calendar ID for the "Next Deal Lending – Borrower Calls" calendar.
-	# E1 confirmed: Josh connects his Google Calendar to this GHL calendar.
-	# Set once the calendar is created in the NDL sub-account.
-	lending_ghl_calendar_id: Optional[str] = Field(
-		default=None, env="LENDING_GHL_CALENDAR_ID"
-	)
+	# Texts go through GoHighLevel only (src/lending/ghl_sms.py, same account and number as
+	# WP-GL-9). Off until the 10DLC registration clears; the worker then records every due text
+	# as skipped_text_not_enabled instead of sending. Separate from MISSED_CALL_TEXT_ENABLED so
+	# each message family has its own off switch (open question: one switch or two).
+	booking_reminder_text_enabled: bool = Field(default=False, env="BOOKING_REMINDER_TEXT_ENABLED")
+	# Email fallback (B4) stays off until hello@nextdeallending.com has a sender behind it
+	# (Porkbun DNS + Google Workspace are not provisioned). Off = recorded as skipped, never "sent".
+	booking_reminder_email_enabled: bool = Field(default=False, env="BOOKING_REMINDER_EMAIL_ENABLED")
 
 
 @lru_cache

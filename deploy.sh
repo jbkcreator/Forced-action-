@@ -30,8 +30,6 @@ CC_UNIT_DST="/etc/systemd/system/cora-command-center.service"
 # this service was never bounced.
 RELAY_UNIT_SRC="$PROJECT_DIR/deploy/systemd/fa-relay-slack-listener.service"
 RELAY_UNIT_DST="/etc/systemd/system/fa-relay-slack-listener.service"
-REMINDER_WORKER_UNIT_SRC="$PROJECT_DIR/deploy/systemd/lending-reminder-worker.service"
-REMINDER_WORKER_UNIT_DST="/etc/systemd/system/lending-reminder-worker.service"
 
 cd "$PROJECT_DIR"
 
@@ -199,23 +197,10 @@ if ! cmp -s "$RELAY_UNIT_SRC" "$RELAY_UNIT_DST" 2>/dev/null; then
 fi
 systemctl enable fa-relay-slack-listener || fail "systemctl enable fa-relay-slack-listener"
 
-# WP-GL-10: lending booking reminder worker. Fail-closed: LENDING_TEXT_ENABLED
-# defaults false, so no live sends go out until 10DLC is confirmed and the flag
-# is flipped in .env.
-if [ ! -f "$REMINDER_WORKER_UNIT_SRC" ]; then
-    fail "lending-reminder-worker.service unit file not found at $REMINDER_WORKER_UNIT_SRC"
-fi
-if ! cmp -s "$REMINDER_WORKER_UNIT_SRC" "$REMINDER_WORKER_UNIT_DST" 2>/dev/null; then
-    cp "$REMINDER_WORKER_UNIT_SRC" "$REMINDER_WORKER_UNIT_DST" || fail "install lending-reminder-worker.service"
-    systemctl daemon-reload || fail "systemctl daemon-reload (lending-reminder-worker)"
-fi
-systemctl enable lending-reminder-worker || fail "systemctl enable lending-reminder-worker"
-
 systemctl restart fa-api || fail "systemctl restart fa-api"
 systemctl restart lifecycle || fail "systemctl restart lifecycle"
 systemctl restart cora || fail "systemctl restart cora"
 systemctl restart fa-relay-slack-listener || fail "systemctl restart fa-relay-slack-listener"
-systemctl restart lending-reminder-worker || fail "systemctl restart lending-reminder-worker"
 
 RESTART_TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
@@ -224,7 +209,6 @@ sleep 2
 systemctl is-active --quiet lifecycle || fail "lifecycle service not active after restart"
 systemctl is-active --quiet cora || fail "cora service not active after restart"
 systemctl is-active --quiet fa-relay-slack-listener || fail "fa-relay-slack-listener service not active after restart"
-systemctl is-active --quiet lending-reminder-worker || fail "lending-reminder-worker service not active after restart"
 systemctl restart cora_throughput || fail "systemctl restart cora_throughput"
 sleep 2
 systemctl is-active --quiet cora_throughput || fail "cora_throughput service not active after restart"

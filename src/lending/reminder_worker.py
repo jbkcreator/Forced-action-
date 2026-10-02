@@ -1,293 +1,274 @@
-"""WP-GL-10: booking reminder worker — polls due rows and sends or emails them.
+"""WP-GL-10: send the due booking confirmations and reminders.
 
-Production entry point:
-  python -m src.lending.reminder_worker [--once] [--dry-run]
+    python -m src.lending.reminder_worker            # loop
+    python -m src.lending.reminder_worker --once     # one cycle and exit
 
-Add to deploy.sh alongside the opt_out_poller and dialer_sweep services:
-  python -m src.lending.reminder_worker &
+Each cycle claims due ``lending.booking_messages`` rows (``FOR UPDATE SKIP LOCKED``, claim committed
+before any send) and decides each row once. Gates, in order: the call has not started -> the contact
+is not suppressed -> a channel exists (text needs the live consent evidence of WP-GL-9's
+``has_text_consent``; otherwise email) -> the channel is switched on and configured -> the text window
+(8am-8pm ET). Texts go out only through GoHighLevel (``ghl_sms.GhlSmsSender``, single attempt).
 
-The worker runs in a tight poll loop (POLL_SECONDS interval). On each cycle:
-
-  1. Lock up to BATCH_SIZE due rows (status='pending', send_at<=now) with
-     FOR UPDATE SKIP LOCKED so two workers never process the same row.
-  2. For each row, apply gate order:
-       a. booking still active? (status='confirmed' or 'pending' — pending
-          AI bookings still send; gate-failed bookings are 'cancelled')
-       b. contact suppressed in lending.suppression_list?
-       c. text channel → text_consent and LENDING_TEXT_ENABLED?
-       d. email channel → contact_email present?
-       e. send via messenger or email sender
-  3. Write sent_at, status, worker_id in the same transaction as the send
-     decision. A crash before commit leaves the row 'pending' — the next
-     cycle picks it up and the idempotent message_id check at the GHL layer
-     prevents double-sends (Fake always re-records; Live may resend once on
-     crash, which is acceptable for reminders).
-
-Suppression: _suppressed_phones (from lending.compliance) covers the
-lending suppression list. FA-side opt-outs are excluded via
-lending.suppression_list reconcile (already run by the opt_out_poller).
-
-Phone hashes, never raw phones, go into log messages (matching WP-GL-9's
-pattern).
+A text is never re-sent when its outcome is unknown: a row left in ``sending`` (crash mid-send) or an
+ambiguous GHL error ends as ``send_unknown``. Only a failure that provably sent nothing is retried.
+Logs carry ids and phone hashes, never phone numbers or message bodies.
 """
 from __future__ import annotations
 
-import hashlib
+import argparse
 import logging
-import os
 import signal
-import socket
-import sys
 import time
-import uuid
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Mapping, Optional
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
+from config.lending_reminders import (
+    BATCH_SIZE,
+    CHANNEL_EMAIL,
+    CHANNEL_TEXT,
+    KIND_NIGHT_BEFORE,
+    KIND_NINETY_MIN,
+    MAX_SEND_ATTEMPTS,
+    NINETY_MIN_MAX_LATE_SECONDS,
+    POLL_SECONDS,
+    RETRY_DELAY_SECONDS,
+    STALE_SEND_SECONDS,
+    TIMEZONE,
+)
 from config.settings import get_settings
-from src.lending.ghl_messenger import GHLMessengerError, get_messenger
+from src.lending.booking_messages import next_text_window, render_email, render_text, text_window_open
+from src.lending.compliance import phone_hash
+from src.lending.consent import has_text_consent
+from src.lending.db import lending_session
+from src.lending.ghl_sms import GhlSmsError, get_sender
 
 logger = logging.getLogger(__name__)
 
-POLL_SECONDS = 10
-BATCH_SIZE = 50
-WORKER_ID = f"{socket.gethostname()}-{os.getpid()}"
+TextSender = Callable[..., str]
+EmailSender = Callable[[str, str, str], str]  # (to, subject, body) -> provider message id; none exists yet
 
-_FETCH = text("""
-    SELECT id, booking_ref, kind, channel, send_at,
-           first_name, contact_phone, contact_email,
-           property_address, slot_start_utc, booked_by, text_consent
-      FROM lending.booking_messages
-     WHERE status = 'pending'
-       AND send_at <= :now
-     ORDER BY send_at
-     LIMIT :limit
-       FOR UPDATE SKIP LOCKED
+_COLUMNS = ("id, booking_ref, kind, send_at, first_name, contact_phone, contact_email, "
+            "property_address, slot_start_utc, attempts")
+
+_CLAIM = text(f"""
+    WITH picked AS (
+        SELECT id FROM lending.booking_messages
+         WHERE status = 'pending' AND send_at <= :now
+         ORDER BY send_at LIMIT :limit FOR UPDATE SKIP LOCKED)
+    UPDATE lending.booking_messages m
+       SET status = 'sending', decided_at = now(), attempts = m.attempts + 1
+      FROM picked WHERE m.id = picked.id
+    RETURNING m.id, m.booking_ref, m.kind, m.send_at, m.first_name, m.contact_phone, m.contact_email,
+              m.property_address, m.slot_start_utc, m.attempts
 """)
 
-_MARK_SENT = text("""
+_STALE = text("""
+    UPDATE lending.booking_messages SET status = 'send_unknown', skip_reason = 'stale_claim', decided_at = now()
+     WHERE status = 'sending' AND decided_at < :cutoff
+""")
+
+_RECORD = text("""
     UPDATE lending.booking_messages
-       SET status = 'sent', sent_at = :sent_at, worker_id = :worker_id
-     WHERE id = :id
+       SET status = :status, skip_reason = :reason, channel = COALESCE(:channel, channel),
+           provider_message_id = COALESCE(:message_id, provider_message_id), decided_at = now(),
+           sent_at = CASE WHEN :status = 'sent' THEN now() ELSE sent_at END
+     WHERE id = :id AND status = 'sending'
 """)
 
-_MARK_SKIPPED = text("""
+_REQUEUE = text("""
     UPDATE lending.booking_messages
-       SET status = 'skipped', skip_reason = :reason, worker_id = :worker_id
-     WHERE id = :id
+       SET status = 'pending', send_at = :send_at, attempts = :attempts, skip_reason = :reason
+     WHERE id = :id AND status = 'sending'
+""")
+
+_SUPPRESSED = text("""
+    SELECT EXISTS (SELECT 1 FROM lending.suppression_list WHERE (phone = :p AND :p IS NOT NULL)
+                                                              OR (email = :e AND :e IS NOT NULL))
+        OR EXISTS (SELECT 1 FROM lending.contacts WHERE phone = :p AND :p IS NOT NULL AND do_not_contact)
 """)
 
 
-def _phone_hash(phone: Optional[str]) -> str:
-    if not phone:
-        return ""
-    return hashlib.sha256(phone.encode()).hexdigest()[:12]
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-SuppressionLookup = object  # Callable[[db, list[str]], set[str]]
+def _is_suppressed(db, phone: Optional[str], email: Optional[str]) -> bool:
+    return bool(db.execute(_SUPPRESSED, {"p": phone, "e": (email or "").lower() or None}).scalar())
 
 
-def _default_suppression_lookup(db, phones: list[str]) -> set[str]:
-    """Load suppressed phones from lending.suppression_list.
+def _record(db, row_id: int, status: str, reason: Optional[str] = None, channel: Optional[str] = None,
+            message_id: Optional[str] = None) -> None:
+    db.execute(_RECORD, {"id": row_id, "status": status, "reason": reason, "channel": channel,
+                         "message_id": message_id})
 
-    lending.compliance is merged in a sibling branch (WP-GL-9/GL-1). Until
-    that branch is merged, this function queries the table directly so this
-    worker has no cross-branch import dependency.
-    """
-    if not phones:
-        return set()
+
+def _requeue(db, row: Mapping[str, Any], send_at: datetime, reason: str, *, count_attempt: bool) -> None:
+    attempts = row["attempts"] if count_attempt else row["attempts"] - 1
+    db.execute(_REQUEUE, {"id": row["id"], "send_at": send_at, "attempts": attempts, "reason": reason})
+
+
+def _decide(db, row: Mapping[str, Any], *, now: datetime, text_sender: Optional[TextSender],
+            email_sender: Optional[EmailSender], text_enabled: bool, email_enabled: bool,
+            started: list[bool]) -> str:
+    """Run the gates and, when they pass, the send. Records the outcome; returns its label."""
+    rid, phone, email, kind = row["id"], row["contact_phone"], row["contact_email"], row["kind"]
+    slot = row["slot_start_utc"]
+    if slot <= now:
+        _record(db, rid, "skipped", "call_started")
+        return "skipped_call_started"
+    if _too_late(row, now):
+        _record(db, rid, "skipped", "too_late")
+        return "skipped_too_late"
+    if _is_suppressed(db, phone, email):
+        _record(db, rid, "skipped", "suppressed")
+        return "skipped_suppressed"
+
+    if phone and has_text_consent(db, phone):
+        return _send_text(db, row, now=now, sender=text_sender, enabled=text_enabled, started=started)
+    if email:
+        return _send_email(db, row, sender=email_sender, enabled=email_enabled, started=started)
+    _record(db, rid, "skipped", "no_consent")
+    return "skipped_no_consent"
+
+
+def _too_late(row: Mapping[str, Any], now: datetime) -> bool:
+    """True when sending now would make the reminder's wording false (see config.lending_reminders)."""
+    if row["kind"] == KIND_NIGHT_BEFORE:
+        return now.astimezone(TIMEZONE).date() >= row["slot_start_utc"].astimezone(TIMEZONE).date()
+    if row["kind"] == KIND_NINETY_MIN:
+        return (now - row["send_at"]).total_seconds() > NINETY_MIN_MAX_LATE_SECONDS
+    return False
+
+
+def _send_text(db, row: Mapping[str, Any], *, now: datetime, sender: Optional[TextSender], enabled: bool,
+               started: list[bool]) -> str:
+    rid, kind, slot = row["id"], row["kind"], row["slot_start_utc"]
+    if not enabled:
+        _record(db, rid, "skipped", "text_not_enabled", CHANNEL_TEXT)
+        return "skipped_text_not_enabled"
+    if sender is None:
+        _record(db, rid, "skipped", "not_configured", CHANNEL_TEXT)
+        return "skipped_not_configured"
+    if not text_window_open(now):
+        # The 90-minute text promises a timing, so it is never delayed; the others wait for the window.
+        opens = next_text_window(now)
+        same_day_as_call = opens.astimezone(TIMEZONE).date() >= slot.astimezone(TIMEZONE).date()
+        if kind == KIND_NINETY_MIN or opens >= slot or (kind == KIND_NIGHT_BEFORE and same_day_as_call):
+            _record(db, rid, "skipped", "quiet_hours", CHANNEL_TEXT)
+            return "skipped_quiet_hours"
+        _requeue(db, row, opens, "deferred_quiet_hours", count_attempt=False)
+        return "deferred_quiet_hours"
+    body = render_text(kind, first_name=row["first_name"], slot_start_utc=slot, property_address=row["property_address"])
+    started[0] = True
     try:
-        rows = db.execute(
-            text("""
-                SELECT phone FROM lending.suppression_list
-                WHERE phone = ANY(:phones)
-            """),
-            {"phones": phones},
-        ).scalars()
-        return set(rows)
-    except Exception:
-        logger.warning("[reminder-worker] suppression lookup failed — treating all unsuppressed")
-        return set()
+        message_id = sender(row["contact_phone"], body, row["first_name"], deadline=slot)
+    except GhlSmsError as exc:
+        if exc.ambiguous:
+            _record(db, rid, "send_unknown", "ambiguous_send_error", CHANNEL_TEXT)
+            return "send_unknown"
+        if row["attempts"] >= MAX_SEND_ATTEMPTS:
+            _record(db, rid, "failed", "send_failed", CHANNEL_TEXT)
+            return "failed"
+        _requeue(db, row, now + timedelta(seconds=RETRY_DELAY_SECONDS), "send_failed_retry", count_attempt=True)
+        return "retry"
+    _record(db, rid, "sent", None, CHANNEL_TEXT, message_id)
+    return "sent"
 
 
-def process_due_rows(
-    db,
-    *,
-    now: Optional[datetime] = None,
-    dry_run: bool = False,
-    worker_id: str = WORKER_ID,
-    suppression_lookup=None,
-) -> dict[str, int]:
-    """Process one batch of due rows inside an already-open transaction.
+def _send_email(db, row: Mapping[str, Any], *, sender: Optional[EmailSender], enabled: bool, started: list[bool]) -> str:
+    rid = row["id"]
+    if not enabled:
+        _record(db, rid, "skipped", "email_not_enabled", CHANNEL_EMAIL)
+        return "skipped_email_not_enabled"
+    if sender is None:
+        _record(db, rid, "skipped", "not_configured", CHANNEL_EMAIL)
+        return "skipped_not_configured"
+    subject, body = render_email(row["kind"], first_name=row["first_name"], slot_start_utc=row["slot_start_utc"],
+                                 property_address=row["property_address"])
+    started[0] = True
+    message_id = sender(row["contact_email"], subject, body)
+    _record(db, rid, "sent", None, CHANNEL_EMAIL, message_id)
+    return "sent"
 
-    Returns outcome counts. Does not commit.
-    suppression_lookup is injectable for testing; defaults to the real DB query.
-    """
-    from src.lending.booking_messages import render_email, render_text
 
-    _suppressed = suppression_lookup or _default_suppression_lookup
-
-    now = now or datetime.now(timezone.utc)
-    rows = db.execute(_FETCH, {"now": now, "limit": BATCH_SIZE}).mappings().all()
-    if not rows:
-        return {}
-
-    phones = [r["contact_phone"] for r in rows if r["contact_phone"]]
-    suppressed = _suppressed(db, phones) if phones else set()
-    messenger = get_messenger()
-
+def process_due(db, *, text_sender: Optional[TextSender], email_sender: Optional[EmailSender] = None,
+                text_enabled: bool, email_enabled: bool, now: Optional[datetime] = None,
+                limit: int = BATCH_SIZE, clock: Callable[[], datetime] = _utcnow) -> dict[str, int]:
+    """One cycle. Commits: the claim first (so a crash cannot make another worker send the same row),
+    then each row's outcome on its own."""
+    db.execute(_STALE, {"cutoff": (now or clock()) - timedelta(seconds=STALE_SEND_SECONDS)})
+    rows = db.execute(_CLAIM, {"now": now or clock(), "limit": limit}).mappings().all()
+    db.commit()
     counts: dict[str, int] = {}
-
     for row in rows:
-        rid = row["id"]
-        kind = row["kind"]
-        channel = row["channel"]
-        phone = row["contact_phone"]
-        email = row["contact_email"]
-        slot_start = row["slot_start_utc"]
-        first_name = row["first_name"] or ""
-        address = row["property_address"]
-
-        # Gate: suppression
-        if phone and phone in suppressed:
-            _skip(db, rid, "suppressed", worker_id)
-            counts["suppressed"] = counts.get("suppressed", 0) + 1
-            continue
-
-        # Re-check LENDING_TEXT_ENABLED at send time in case the flag was
-        # toggled after scheduling (channel was already encoded at schedule time).
-        if channel == "text":
-            if not getattr(get_settings(), "lending_text_enabled", False):
-                _skip(db, rid, "text_not_enabled", worker_id)
-                counts["text_not_enabled"] = counts.get("text_not_enabled", 0) + 1
-                continue
-            if not phone:
-                _skip(db, rid, "no_phone", worker_id)
-                counts["no_phone"] = counts.get("no_phone", 0) + 1
-                continue
-
-        # Gate: email channel requires contact_email
-        if channel == "email" and not email:
-            _skip(db, rid, "no_email", worker_id)
-            counts["no_email"] = counts.get("no_email", 0) + 1
-            continue
-
-        if dry_run:
-            logger.info(
-                "[reminder-worker.dry-run] would-send id=%d kind=%s channel=%s phone_hash=%s",
-                rid, kind, channel, _phone_hash(phone),
-            )
-            counts["dry_run"] = counts.get("dry_run", 0) + 1
-            continue
-
-        # Send
+        started = [False]
         try:
-            if channel == "text":
-                body = render_text(kind, first_name=first_name,
-                                   slot_start_utc=slot_start, property_address=address)
-                result = messenger.send_text(contact_phone=phone, body=body)
-                if result.sent:
-                    _mark_sent(db, rid, worker_id)
-                    counts["sent_text"] = counts.get("sent_text", 0) + 1
-                else:
-                    _skip(db, rid, result.skip_reason or "messenger_skip", worker_id)
-                    counts["skipped"] = counts.get("skipped", 0) + 1
-
-            else:  # email
-                subject, body = render_email(kind, first_name=first_name,
-                                             slot_start_utc=slot_start, property_address=address)
-                ok = _send_email(to=email, subject=subject, body=body)
-                if ok:
-                    _mark_sent(db, rid, worker_id)
-                    counts["sent_email"] = counts.get("sent_email", 0) + 1
-                else:
-                    _skip(db, rid, "email_send_failed", worker_id)
-                    counts["skipped"] = counts.get("skipped", 0) + 1
-
-        except GHLMessengerError as exc:
-            # Network error → leave the row pending; it retries next cycle.
-            logger.error(
-                "[reminder-worker] GHL send failed id=%d kind=%s — will retry: %s",
-                rid, kind, exc,
-            )
-            counts["retry"] = counts.get("retry", 0) + 1
-        except Exception:
-            logger.exception("[reminder-worker] unexpected error on row id=%d", rid)
-            counts["error"] = counts.get("error", 0) + 1
-
+            outcome = _decide(db, row, now=now or clock(), text_sender=text_sender, email_sender=email_sender,
+                              text_enabled=text_enabled, email_enabled=email_enabled, started=started)
+            db.commit()
+        except Exception as exc:  # class only: SQL / HTTP errors can embed phone numbers
+            logger.error("[reminder-worker] row %s crashed (%s)", row["id"], type(exc).__name__)
+            db.rollback()
+            if started[0]:
+                continue  # outcome unknown: the stale sweep closes it as send_unknown, never resent
+            _fail_unsent(db, row["id"])
+            outcome = "failed"
+        counts[outcome] = counts.get(outcome, 0) + 1
+        logger.info("[reminder-worker] row=%s kind=%s phone_hash=%s outcome=%s", row["id"], row["kind"],
+                    phone_hash(row["contact_phone"])[:12] if row["contact_phone"] else "-", outcome)
     return counts
 
 
-def _mark_sent(db, row_id: int, worker_id: str) -> None:
-    db.execute(_MARK_SENT, {
-        "id": row_id,
-        "sent_at": datetime.now(timezone.utc),
-        "worker_id": worker_id,
-    })
+def _fail_unsent(db, row_id: int) -> None:
+    """After an unexpected error BEFORE any send was attempted nothing went out: record 'failed'."""
+    try:
+        _record(db, row_id, "failed", "internal_error")
+        db.commit()
+    except Exception as exc:
+        logger.error("[reminder-worker] row %s could not be marked failed (%s)", row_id, type(exc).__name__)
+        db.rollback()
 
 
-def _skip(db, row_id: int, reason: str, worker_id: str) -> None:
-    db.execute(_MARK_SKIPPED, {"id": row_id, "reason": reason, "worker_id": worker_id})
+def run_cycle(*, now: Optional[datetime] = None) -> dict[str, int]:
+    """One pass with real settings and its own session."""
+    settings = get_settings()
+    with lending_session() as db:
+        return process_due(db, text_sender=get_sender(), email_sender=None,
+                           text_enabled=settings.booking_reminder_text_enabled,
+                           email_enabled=settings.booking_reminder_email_enabled, now=now)
 
-
-def _send_email(*, to: str, subject: str, body: str) -> bool:
-    """Email sender port — Fake until hello@nextdeallending.com DNS is live.
-
-    OPEN DEPENDENCY: C1 (Porkbun API key) and C2 (Google Workspace) are not
-    yet provisioned. Until they are, all emails are logged as dry-run.
-    Flip LENDING_EMAIL_ENABLED=true once the mailbox is confirmed live.
-    """
-    email_enabled = getattr(get_settings(), "lending_email_enabled", False)
-    if not email_enabled:
-        logger.info("[reminder-worker.email.fake] would-send to=%s subject=%r", to, subject)
-        return True  # Fake: report sent so the row progresses
-    # TODO: wire real email sender (Google Workspace SMTP or SendGrid)
-    # once C1 and C2 are complete. For now this path is unreachable.
-    raise NotImplementedError("lending email sender not yet configured")
-
-
-# ── CLI entry point ────────────────────────────────────────────────────────────
 
 _running = True
 
 
-def _handle_term(signum, frame):  # noqa: ARG001
+def _stop(signum, _frame) -> None:
     global _running
-    logger.info("[reminder-worker] received signal %d — stopping", signum)
+    logger.info("[reminder-worker] signal %s received, stopping after this cycle", signum)
     _running = False
 
 
-def main(argv: list[str] | None = None) -> None:
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    args = sys.argv[1:] if argv is None else argv
-    once = "--once" in args
-    dry_run = "--dry-run" in args
-
-    import os
-    engine = create_engine(os.environ["DATABASE_URL"])
-
-    signal.signal(signal.SIGTERM, _handle_term)
-    signal.signal(signal.SIGINT, _handle_term)
-
-    logger.info("[reminder-worker] starting worker_id=%s dry_run=%s", WORKER_ID, dry_run)
-
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--once", action="store_true", help="run a single cycle and exit")
+    args = parser.parse_args(argv)
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+    logger.info("[reminder-worker] starting (text=%s email=%s)", get_settings().booking_reminder_text_enabled,
+                get_settings().booking_reminder_email_enabled)
     while _running:
         try:
-            with engine.begin() as conn:
-                counts = process_due_rows(conn, dry_run=dry_run)
+            counts = run_cycle()
             if counts:
-                logger.info("[reminder-worker] cycle counts=%s", counts)
-        except Exception:
-            logger.exception("[reminder-worker] cycle error — sleeping before retry")
-
-        if once:
+                logger.info("[reminder-worker] cycle %s", counts)
+        except Exception as exc:  # class only
+            logger.error("[reminder-worker] cycle failed (%s); retrying next interval", type(exc).__name__)
+        if args.once:
             break
         time.sleep(POLL_SECONDS)
-
-    logger.info("[reminder-worker] stopped")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
