@@ -11,6 +11,13 @@ SLOT_HOLDING_SQL = "status IN (" + ", ".join(f"'{s}'" for s in SLOT_HOLDING_STAT
 
 MAX_TEXT_CHARS = 320
 
+# Safety net only: calls already stop at 7:15 pm ET and start at 9 am, and a text must go out within
+# 60 s of the call, so a legitimate text is always inside this window. It guards a misconfigured
+# dialer schedule. (Florida's texting law is a counsel question; this does not advise on it.)
+QUIET_START_HOUR = 8
+QUIET_END_HOUR = 20
+STALE_SENDING_SECONDS = 300
+
 # Client-approved wording (questionnaire F2: "Option 1 for Verified maturity, Option 2 for Transaction
 # ready and Builders, Option 3 for Nurture and anything without an address"). Verbatim except the
 # greeting, which is "Hi <first name>" or just "Hi" when the borrower has no usable first name.
