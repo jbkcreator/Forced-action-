@@ -130,8 +130,9 @@ All 13 results exist in BatchDialer (group "Lending", created). Only the three b
   Tables: by caller, by BatchDialer campaign (`dialer_campaign_id`, names from `GET /campaigns`), and by hook (`campaign_tag`).
 - Definitions live in `config/lending_dispositions.py` (`LIVE_CONVERSATION_CODES`, `GATED_CODES`, `NURTURE_SENT_CODES`).
   Booked excludes `booking_blocked`; Showed comes from GHL stage events (see "GHL showed feed" below), not the log.
-- The dialer stops at 7:15pm ET, so calls between 7:00 and 7:15pm are not in the post. Open question for the client: post at 7:20pm instead
-  (change the cron hours and the hour guard together).
+- The post goes out at 7:20pm ET, after the dialer stops at 7:15pm, so every call of the day is counted.
+- A fourth table, by caller-ID number, shows dials, answered (`ANSWERED_CODES`: a person picked up) and answer rate, to spot numbers that drop or get spam-flagged.
+- Not built: abandon rate per campaign. The dialer feed carries no abandoned-call signal and multi-line power dial is not live; add it when BatchDialer reports abandons.
 - Test calls count like real ones. Run with `--force` only after the Friday test, or filter by a test campaign.
 
 ## 4. Acceptance check

@@ -112,3 +112,16 @@ def test_missing_stage_table_degrades_showed_to_zero_and_keeps_other_columns(len
     data = build_scoreboard(lending_db, DAY, NAMES)
     assert (data.total.dials, data.total.booked, data.total.showed) == (1, 1, 0)
     assert "Showed 0" in format_slack(data, DAY)
+
+
+def test_answer_rate_per_caller_id_number(lending_db):
+    for cid, disp, num in (("n1", "NO_ANSWER", "+18135550001"), ("n2", "CONNECTED_NOT_INTERESTED", "+18135550001"),
+                           ("n3", "WRONG_PERSON", "+18135550002"), ("n4", "LEFT_VOICEMAIL", "+18135550002"),
+                           ("n5", "BAD_NUMBER", "+18135550002")):
+        _call(lending_db, cid, disp=disp)
+        lending_db.execute(text("UPDATE lending.call_dispositions SET caller_id_number = :n WHERE dialer_call_id = :c"), {"n": num, "c": cid})
+    data = build_scoreboard(lending_db, DAY, NAMES)
+    by = {r.number: r for r in data.by_number}
+    assert (by["+18135550001"].dials, by["+18135550001"].answered) == (2, 1)
+    assert (by["+18135550002"].dials, by["+18135550002"].answered) == (3, 1)
+    assert "Answer rate 50%" in format_slack(data, DAY)

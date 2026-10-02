@@ -1,7 +1,7 @@
 """7:20pm scoreboard from the disposition log (client Part 5.6): per caller and per campaign."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 from datetime import date, datetime, time, timedelta
 from typing import Mapping, Optional
@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import text
 
 from config.lending_compliance import DEFAULT_TZ
-from config.lending_dispositions import BOOKED_CODE, GATED_CODES, LIVE_CONVERSATION_CODES, NURTURE_SENT_CODES, SHOWED_STAGE_KEYS
+from config.lending_dispositions import ANSWERED_CODES, BOOKED_CODE, GATED_CODES, LIVE_CONVERSATION_CODES, NURTURE_SENT_CODES, SHOWED_STAGE_KEYS
 
 logger = logging.getLogger(__name__)
 
@@ -42,11 +42,23 @@ class Row:
 
 
 @dataclass(frozen=True)
+class NumberRow:
+    number: str
+    dials: int
+    answered: int
+
+    @property
+    def answer_rate(self) -> float:
+        return self.answered / self.dials if self.dials else 0.0
+
+
+@dataclass(frozen=True)
 class ScoreboardData:
     by_caller: list[Row]
     by_campaign: list[Row]
     by_hook: list[Row]
     total: Row
+    by_number: list[NumberRow] = field(default_factory=list)
 
 
 def _bounds(day: date) -> tuple[datetime, datetime]:
@@ -69,6 +81,20 @@ def _query(db, key: str, day: date) -> list[tuple[str, int, int, int, int, int]]
          "booked": BOOKED_CODE, "start": start, "end": end},
     ).all()
     return [tuple(r) for r in rows]
+
+
+def _by_number(db, day: date) -> list[NumberRow]:
+    """Answer rate per outbound caller-ID number, so a number that drops or gets spam-flagged is visible."""
+    start, end = _bounds(day)
+    rows = db.execute(
+        text("SELECT COALESCE(NULLIF(caller_id_number, ''), '(unknown)') AS n, count(*) AS dials, "
+             "count(*) FILTER (WHERE disposition = ANY(:answered)) AS answered "
+             "FROM lending.call_dispositions "
+             "WHERE direction = 'outbound' AND call_ended_at >= :start AND call_ended_at < :end "
+             "GROUP BY 1 ORDER BY dials DESC, n"),
+        {"answered": sorted(ANSWERED_CODES), "start": start, "end": end},
+    ).all()
+    return [NumberRow(*r) for r in rows]
 
 
 def _showed(db, key: str, day: date) -> dict[str, int]:
@@ -110,7 +136,7 @@ def build_scoreboard(db, day: date, campaign_names: Optional[Mapping[str, str]] 
                       lambda k: names.get(k, f"Campaign {k}") if k else UNATTRIBUTED)
     hooks = _rows(_query(db, "hook", day), _showed(db, "hook", day), lambda k: k or UNATTRIBUTED)
     total = Row("TOTAL", *(sum(getattr(r, f) for r in callers) for f in ("dials", "live", "gated", "booked", "nurture", "showed")))
-    return ScoreboardData(callers, campaigns, hooks, total)
+    return ScoreboardData(callers, campaigns, hooks, total, _by_number(db, day))
 
 
 def _line(r: Row) -> str:
@@ -118,9 +144,14 @@ def _line(r: Row) -> str:
             f"Showed {r.showed} | Nurture {r.nurture} | Connect {r.connect_rate:.0%} | Book rate {r.book_rate:.0%}")
 
 
+def _number_line(r: NumberRow) -> str:
+    return f"{r.number}: Dials {r.dials} | Answered {r.answered} | Answer rate {r.answer_rate:.0%}"
+
+
 def format_slack(data: ScoreboardData, day: date) -> str:
     out = [f"*Lending scoreboard {day.isoformat()} (through 7:15pm ET)*", _line(data.total), "", "*By caller*"]
     out += [_line(r) for r in data.by_caller] or ["no dials"]
     out += ["", "*By campaign*"] + ([_line(r) for r in data.by_campaign] or ["no dials"])
     out += ["", "*By hook (campaign tag): which hook works*"] + ([_line(r) for r in data.by_hook] or ["no dials"])
+    out += ["", "*By caller-ID number: answer rate*"] + ([_number_line(r) for r in data.by_number] or ["no dials"])
     return "\n".join(out)

@@ -70,6 +70,8 @@ LIVE_CONVERSATION_CODES = frozenset({
 })
 GATED_CODES = frozenset({"BOOKED", "GATE_FAILED_NURTURE"})  # proxy for "all four captures"
 NURTURE_SENT_CODES = frozenset({"GATE_FAILED_NURTURE"})
+# A person picked up: everything except no-answer, voicemail, failed and bad-number results (answer rate per caller-ID number).
+ANSWERED_CODES = frozenset(DISPOSITIONS) - UNANSWERED_CODES - {"BAD_NUMBER"}
 # GHL pipeline stage names (lower-cased) that count as "showed": the client moves a lead there once the held call happens.
 SHOWED_STAGE_KEYS = frozenset({"held", "showed"})
 
@@ -128,7 +130,7 @@ def validate_dispositions_config() -> None:
     for name, group in (("UNANSWERED_CODES", UNANSWERED_CODES), ("DEFAULT_CAUSE", set(DEFAULT_CAUSE)),
                         ("SYSTEM_DISPOSITION_ALIASES", set(SYSTEM_DISPOSITION_ALIASES.values())),
                         ("LIVE_CONVERSATION_CODES", LIVE_CONVERSATION_CODES), ("GATED_CODES", GATED_CODES),
-                        ("NURTURE_SENT_CODES", NURTURE_SENT_CODES)):
+                        ("NURTURE_SENT_CODES", NURTURE_SENT_CODES), ("ANSWERED_CODES", ANSWERED_CODES)):
         if not group <= codes:
             raise ValueError(f"{name} names a code missing from DISPOSITIONS: {sorted(group - codes)}")
     if not set(DEFAULT_CAUSE.values()) <= CAUSE_TAGS:
