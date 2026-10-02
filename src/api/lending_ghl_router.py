@@ -11,13 +11,14 @@ from __future__ import annotations
 
 import hmac
 import logging
+import re
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy.orm import Session
 
 from config.lending_compliance import OptOutChannel
-from config.lending_text_back import STOP_KEYWORDS
+from config.lending_text_back import STOP_KEYWORDS, STOP_TOKENS
 from config.settings import get_settings
 from src.api.deps import get_db
 from src.lending.compliance import propagate_opt_out
@@ -71,8 +72,18 @@ _TRUTHY = frozenset({"true", "yes", "y", "1", "on", "checked"})
 _CONSENT_SOURCES = frozenset({"web_form", "inbound_text"})
 
 
-def _is_stop(message: str) -> bool:
-    return message.strip().strip(".!").strip().lower() in STOP_KEYWORDS
+def _message_tokens(body: dict[str, Any]) -> list[str]:
+    """Lower-cased alphanumeric tokens of the reply; empty when it is missing or not a string."""
+    contact = body.get("contact") if isinstance(body.get("contact"), dict) else {}
+    raw = body.get("message") or contact.get("message")
+    return re.sub(r"[^a-z0-9]+", " ", raw.lower()).split() if isinstance(raw, str) else []
+
+
+def _is_opt_out(tokens: list[str]) -> bool:
+    # Fails closed (counsel to confirm scope): any stop-word in a reply revokes, a missed opt-out is the costly error.
+    if len(tokens) == 1 and tokens[0] in STOP_KEYWORDS:
+        return True
+    return any(t in STOP_TOKENS for t in tokens) or any(a == "opt" and b == "out" for a, b in zip(tokens, tokens[1:]))
 
 
 @router.post("/ghl-text-consent")
@@ -83,7 +94,7 @@ def ghl_text_consent(
 ) -> dict[str, Any]:
     """A GHL workflow reports text consent. ``web_form``: the lead form's consent box (only a checked
     box counts). ``inbound_text``: the contact texted the Next Deal Lending number; a bare STOP
-    keyword revokes instead. Body: source, phone, consent (web_form), message (inbound_text), contact_id."""
+    phrase revokes instead; an empty or non-text reply records nothing. Body: source, phone, consent (web_form), message (inbound_text), contact_id."""
     _verify_secret(x_webhook_secret)
     source = _field(body, "source")
     phone = normalize(_field(body, "phone"))
@@ -91,10 +102,14 @@ def ghl_text_consent(
         raise HTTPException(status_code=422, detail="source (web_form or inbound_text) and a valid phone are required")
     contact_id = _field(body, "contact_id") or _field(body, "id")
     try:
-        if source == "inbound_text" and _is_stop(_field(body, "message") or ""):
-            revoke_consent(db, phone)
-            db.commit()
-            return {"recorded": False, "revoked": True}
+        if source == "inbound_text":
+            tokens = _message_tokens(body)
+            if not tokens:
+                return {"recorded": False, "revoked": False}
+            if _is_opt_out(tokens):
+                revoke_consent(db, phone)
+                db.commit()
+                return {"recorded": False, "revoked": True}
         if source == "web_form" and str(_field(body, "consent") or "").strip().lower() not in _TRUTHY:
             return {"recorded": False, "revoked": False}
         record_consent(db, phone, source, captured_by=f"ghl:{contact_id}" if contact_id else None)

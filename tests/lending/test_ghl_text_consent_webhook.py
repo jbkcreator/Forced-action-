@@ -58,9 +58,29 @@ def test_a_stop_text_is_never_consent_and_revokes_what_exists(client, lending_db
     assert _sources(lending_db) == [] and not has_text_consent(lending_db, PHONE)
 
 
-def test_a_sentence_containing_stop_is_still_a_normal_message(client, lending_db):
-    r = client.post(URL, headers=HEADERS, json={"source": "inbound_text", "phone": PHONE, "message": "please don't stop calling"})
-    assert r.json()["recorded"] is True
+@pytest.mark.parametrize("message", [
+    "stop?", "stop,", '"STOP"', "STOP!!", "Stop it", "stop texting me", "please stop", "opt out",
+    "Opt-out please", "revoke", "unsubscribe me", "please don't stop calling",
+])
+def test_an_opt_out_phrasing_revokes_even_inside_a_sentence(client, lending_db, message):
+    record_consent(lending_db, PHONE, "web_form")
+    r = client.post(URL, headers=HEADERS, json={"source": "inbound_text", "phone": PHONE, "message": message})
+    assert r.json() == {"recorded": False, "revoked": True}
+    assert _sources(lending_db) == []
+
+
+@pytest.mark.parametrize("message", ["cancel my appointment", "end of month works"])
+def test_single_word_keywords_inside_a_sentence_are_normal_messages(client, lending_db, message):
+    r = client.post(URL, headers=HEADERS, json={"source": "inbound_text", "phone": PHONE, "message": message})
+    assert r.json() == {"recorded": True, "revoked": False} and _sources(lending_db) == ["inbound_text"]
+
+
+@pytest.mark.parametrize("extra", [{"message": ""}, {}, {"message": {"text": "stop"}}, {"message": ["yes"]}, {"message": "  ?! "}])
+def test_an_empty_or_non_text_reply_records_nothing_and_revokes_nothing(client, lending_db, extra):
+    record_consent(lending_db, PHONE, "web_form")
+    r = client.post(URL, headers=HEADERS, json={"source": "inbound_text", "phone": PHONE, **extra})
+    assert r.json() == {"recorded": False, "revoked": False}
+    assert _sources(lending_db) == ["web_form"]
 
 
 @pytest.mark.parametrize("body,code", [

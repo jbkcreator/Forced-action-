@@ -61,5 +61,8 @@ ENTITY_TOKENS = frozenset({
     "services", "solutions", "associates", "investors", "family", "revocable", "living", "the", "of", "and",
 })
 
-# Carrier standard opt-out keywords (a text that is only one of these is a STOP, never consent).
+# Carrier standard opt-out keywords (a text that is only one of these is a STOP, never consent; inside a longer sentence they are normal words).
 STOP_KEYWORDS = frozenset({"stop", "stopall", "unsubscribe", "cancel", "end", "quit"})
+
+# Opt-out words that revoke consent anywhere in a reply (counsel to confirm scope); "opt out" as two words is handled in the router.
+STOP_TOKENS = frozenset({"stop", "stopall", "unsubscribe", "optout", "revoke"})
