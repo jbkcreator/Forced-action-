@@ -5,7 +5,6 @@ matching update of the 10DLC campaign sample messages.
 
 Open items (not yet answered by the client; defaults are developer choices, not decisions):
   - NIGHT_BEFORE_HOUR_ET: "the evening before" has no clock time.
-  - CALLBACK_NUMBER: which number goes in the 90-minute text.
 
 Texts go through GoHighLevel only (src/lending/ghl_sms.py); consent is src/lending/consent.py.
 """
@@ -155,9 +154,3 @@ EMAIL_NINETY_MIN_NO_ADDRESS = (
     "Call us at {number} if anything's come up.\n\n"
     "Next Deal Lending"
 )
-
-# ── Callback number placeholder ──────────────────────────────────────────────
-
-# OPEN QUESTION (unanswered): Josh was not asked which number goes here.
-# Using the batch-dialer main number as a placeholder. Change once confirmed.
-CALLBACK_NUMBER_PLACEHOLDER = "(727) 436-9951"  # OPEN QUESTION (A2): the only dialer number that exists today

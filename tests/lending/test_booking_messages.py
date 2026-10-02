@@ -44,14 +44,20 @@ def test_night_before_and_ninety_minute_wording():
     assert nb == ("Hi Jane, reminder from Next Deal Lending. Your call with Josh is tomorrow at 10:00 am ET "
                   "about 412 Oak Ave. Talk soon.")
     ninety = render_text("ninety_min", first_name="Jane", slot_start_utc=SLOT, property_address="412 Oak Ave",
-                         number="(813) 555-0100")
+                         number="+18135550100")
     assert ninety == ("Hi Jane, your Next Deal Lending call with Josh is in about 90 minutes, at 10:00 am ET. "
                       "Call us at (813) 555-0100 if anything's come up.")
 
 
+def test_the_ninety_minute_text_needs_the_number_and_formats_it():
+    with pytest.raises(ValueError):
+        render_text("ninety_min", first_name="Jane", slot_start_utc=SLOT)
+    assert "(813) 555-0100" in render_text("ninety_min", first_name="Jane", slot_start_utc=SLOT, number="+18135550100")
+
+
 def test_only_the_confirmation_carries_stop_language():
     for kind in ("night_before", "ninety_min"):
-        assert "STOP" not in render_text(kind, first_name="J", slot_start_utc=SLOT)
+        assert "STOP" not in render_text(kind, first_name="J", slot_start_utc=SLOT, number="+18135550100")
 
 
 def test_blank_first_name_falls_back_and_length_is_capped():

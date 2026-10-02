@@ -17,6 +17,7 @@ from src.lending.reminder_worker import process_due
 
 ET = ZoneInfo("America/New_York")
 PHONE = "+18135550111"
+TEXT_NUMBER = "+18135550100"  # the text-back number (LENDING_GHL_SMS_FROM_NUMBER)
 SLOT = datetime(2026, 10, 7, 14, 0, tzinfo=timezone.utc)  # Wed 10:00 ET
 NOON = datetime(2026, 10, 5, 16, 0, tzinfo=timezone.utc)  # Mon 12:00 ET: window open
 
@@ -56,9 +57,10 @@ def book(db, *, phone=PHONE, email="jane@example.com", ref="ref-1", slot=SLOT, n
                              now=now)
 
 
-def cycle(db, *, text_sender=None, email_sender=None, text_enabled=True, email_enabled=False, now=NOON):
+def cycle(db, *, text_sender=None, email_sender=None, text_enabled=True, email_enabled=False, now=NOON,
+          number=TEXT_NUMBER):
     return process_due(db, text_sender=text_sender, email_sender=email_sender, text_enabled=text_enabled,
-                       email_enabled=email_enabled, now=now, clock=lambda: now)
+                       email_enabled=email_enabled, number=number, now=now, clock=lambda: now)
 
 
 def row(db, kind="confirmation"):
@@ -97,7 +99,7 @@ def test_each_reminder_goes_out_when_it_comes_due(db):
     assert cycle(db, text_sender=sender, now=datetime(2026, 10, 6, 22, 5, tzinfo=timezone.utc)) == {"sent": 1}  # 6:05 pm ET
     assert "tomorrow at 10:00 am ET" in sender.calls[-1]["body"]
     assert cycle(db, text_sender=sender, now=SLOT - timedelta(minutes=89)) == {"sent": 1}
-    assert "in about 90 minutes" in sender.calls[-1]["body"]
+    assert "in about 90 minutes" in sender.calls[-1]["body"] and "(813) 555-0100" in sender.calls[-1]["body"]
     assert [row(db, k)["status"] for k in ("confirmation", "night_before", "ninety_min")] == ["sent"] * 3
 
 
@@ -127,6 +129,14 @@ def test_texting_switched_off_sends_nothing_and_says_why(db):
     record_consent(db, PHONE, "on_call_yes")
     sender = TextSender()
     assert cycle(db, text_sender=sender, text_enabled=False) == {"skipped_text_not_enabled": 1}
+    assert sender.calls == []
+
+
+def test_no_text_back_number_means_the_text_is_not_sent(db):
+    book(db)
+    record_consent(db, PHONE, "on_call_yes")
+    sender = TextSender()
+    assert cycle(db, text_sender=sender, number=None) == {"skipped_not_configured": 1}
     assert sender.calls == []
 
 

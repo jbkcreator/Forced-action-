@@ -25,7 +25,6 @@ from typing import Any, Mapping, Optional
 from sqlalchemy import text
 
 from config.lending_reminders import (
-    CALLBACK_NUMBER_PLACEHOLDER,
     CONFIRMATION_NO_ADDRESS,
     CONFIRMATION_WITH_ADDRESS,
     EMAIL_CONFIRMATION_NO_ADDRESS,
@@ -208,7 +207,16 @@ def next_text_window(moment: datetime) -> datetime:
 
 # ── rendering ─────────────────────────────────────────────────────────────────
 
-def _fields(first_name: Optional[str], slot_start_utc: datetime, property_address: Optional[str], number: str) -> dict:
+def display_number(e164: str) -> str:
+    """(813) 555-0100 for a +1XXXXXXXXXX number; anything else is shown unchanged."""
+    digits = e164[2:] if e164.startswith("+1") and len(e164) == 12 else ""
+    return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}" if digits.isdigit() else e164
+
+
+def _fields(first_name: Optional[str], slot_start_utc: datetime, property_address: Optional[str],
+            number: Optional[str], kind: str) -> dict:
+    if kind == KIND_NINETY_MIN and not number:
+        raise ValueError("the 90-minute message needs the number to call")
     local = slot_start_utc.astimezone(TIMEZONE)
     hour = local.hour % 12 or 12
     return {
@@ -216,21 +224,22 @@ def _fields(first_name: Optional[str], slot_start_utc: datetime, property_addres
         "date": local.strftime("%A, %B") + f" {local.day}",
         "time": f"{hour}:{local.strftime('%M')} {'am' if local.hour < 12 else 'pm'} ET",
         "property_address": (property_address or "").split(",")[0].strip(),
-        "number": number,
+        "number": display_number(number) if number else "",
     }
 
 
 def render_text(kind: str, *, first_name: Optional[str], slot_start_utc: datetime,
-                property_address: Optional[str] = None, number: str = CALLBACK_NUMBER_PLACEHOLDER) -> str:
-    """The client-approved text for ``kind``; never longer than MAX_TEXT_CHARS."""
-    fields = _fields(first_name, slot_start_utc, property_address, number)
+                property_address: Optional[str] = None, number: Optional[str] = None) -> str:
+    """The client-approved text for ``kind``; never longer than MAX_TEXT_CHARS. ``number`` (E.164) is the
+    text-back number the 90-minute wording asks the borrower to call; required for that kind."""
+    fields = _fields(first_name, slot_start_utc, property_address, number, kind)
     template = _TEXT[kind][bool(fields["property_address"])]
     return template.format(**fields)[:MAX_TEXT_CHARS]
 
 
 def render_email(kind: str, *, first_name: Optional[str], slot_start_utc: datetime,
-                 property_address: Optional[str] = None, number: str = CALLBACK_NUMBER_PLACEHOLDER) -> tuple[str, str]:
-    fields = _fields(first_name, slot_start_utc, property_address, number)
+                 property_address: Optional[str] = None, number: Optional[str] = None) -> tuple[str, str]:
+    fields = _fields(first_name, slot_start_utc, property_address, number, kind)
     body = _EMAIL[kind][bool(fields["property_address"])].format(**fields)
     return _EMAIL_SUBJECT[kind], body
 
