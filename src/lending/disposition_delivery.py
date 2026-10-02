@@ -34,6 +34,8 @@ RECORDING_STATUS_TEXT = {
     "missing": "recording not found",
 }
 
+DELIVERY_LOCK_NAMESPACE = 3190  # first key of the per-row advisory lock; the second is the row id
+
 SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 
 
@@ -184,24 +186,42 @@ def deliver_disposition(
     slack_client: Any = None,
     sheets_service: Any = None,
 ) -> None:
-    """Bring the Sheet and Slack up to date with the row's disposition. Never raises."""
+    """Bring the Sheet and Slack up to date with the row's disposition. Never raises.
+
+    One delivery per row at a time: the webhook task, the retry cron and other workers
+    would otherwise each see "no Slack message yet" and each create one. The lock lives
+    on its own session because the delivery session commits (which would end a
+    transaction-level lock) and returns its connection to the pool.
+    """
     try:
-        with session_factory() as db:
-            row = db.execute(
-                text("SELECT * FROM lending.call_dispositions WHERE id = :id"), {"id": row_id}
-            ).mappings().first()
-            if not row:
+        with session_factory() as lock_db:
+            key = {"ns": DELIVERY_LOCK_NAMESPACE, "id": row_id}
+            if not lock_db.execute(text("SELECT pg_try_advisory_lock(:ns, :id)"), key).scalar():
+                logger.info("[lending] delivery for row %s already running; skipping", row_id)
                 return
-            row = dict(row)
-            if row["sheet_synced_disposition"] != row["disposition"] and (sheets_service or _configured_sheet()):
-                _deliver_sheet(db, row, sheets_service)
-            # A removed result only needs Slack when an earlier post exists to update.
-            slack_behind = row["slack_posted_disposition"] != row["disposition"]
-            slack_needed = slack_behind and (row["disposition"] or row["slack_ts"])
-            if slack_needed and (slack_client or _configured_slack()):
-                _deliver_slack(db, row, slack_client)
+            try:
+                _deliver_locked(row_id, session_factory, slack_client, sheets_service)
+            finally:
+                lock_db.execute(text("SELECT pg_advisory_unlock(:ns, :id)"), key)
     except Exception as exc:
         logger.error("[lending] delivery for row %s failed: %s", row_id, type(exc).__name__)
+
+
+def _deliver_locked(row_id: int, session_factory: Callable, slack_client: Any, sheets_service: Any) -> None:
+    with session_factory() as db:
+        row = db.execute(
+            text("SELECT * FROM lending.call_dispositions WHERE id = :id"), {"id": row_id}
+        ).mappings().first()
+        if not row:
+            return
+        row = dict(row)
+        if row["sheet_synced_disposition"] != row["disposition"] and (sheets_service or _configured_sheet()):
+            _deliver_sheet(db, row, sheets_service)
+        # A removed result only needs Slack when an earlier post exists to update.
+        slack_behind = row["slack_posted_disposition"] != row["disposition"]
+        slack_needed = slack_behind and (row["disposition"] or row["slack_ts"])
+        if slack_needed and (slack_client or _configured_slack()):
+            _deliver_slack(db, row, slack_client)
 
 
 def _deliver_sheet(db, row: dict, service: Any) -> None:
@@ -210,8 +230,8 @@ def _deliver_sheet(db, row: dict, service: Any) -> None:
         sync_sheet(row, service or _sheets_service(), now)
         db.execute(
             text("UPDATE lending.call_dispositions SET sheet_synced_at = :at, "
-                 "sheet_synced_disposition = disposition WHERE id = :id"),
-            {"at": now, "id": row["id"]},
+                 "sheet_synced_disposition = :d WHERE id = :id"),
+            {"at": now, "d": row["disposition"], "id": row["id"]},
         )
         db.commit()
         _latency(row, now, "sheet")
@@ -227,8 +247,8 @@ def _deliver_slack(db, row: dict, client: Any) -> None:
         ts = post_slack(row, record, client or _slack_client())
         db.execute(
             text("UPDATE lending.call_dispositions SET slack_posted_at = :at, "
-                 "slack_posted_disposition = disposition, slack_ts = :ts WHERE id = :id"),
-            {"at": now, "ts": ts, "id": row["id"]},
+                 "slack_posted_disposition = :d, slack_ts = :ts WHERE id = :id"),
+            {"at": now, "d": row["disposition"], "ts": ts, "id": row["id"]},
         )
         db.commit()
         _latency(row, now, "slack")

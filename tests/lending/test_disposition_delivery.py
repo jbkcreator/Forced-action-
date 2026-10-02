@@ -165,6 +165,44 @@ def test_sheet_failure_does_not_block_slack(monkeypatch):
     assert len(updates) == 1 and "slack_posted_at" in updates[0]
 
 
+def test_sync_stamps_the_delivered_disposition_not_the_rows_current_one(monkeypatch):
+    monkeypatch.setattr(dd, "lookup_load_record", lambda *a, **k: None)
+    sheets, _ = _sheets([])
+    slack = MagicMock()
+    slack.chat_postMessage.return_value = {"ts": "1.1"}
+    factory, db = _factory(_row(disposition="NO_ANSWER"))
+
+    dd.deliver_disposition(1, session_factory=factory, slack_client=slack, sheets_service=sheets)
+
+    updates = [c for c in db.execute.call_args_list if "UPDATE" in str(c.args[0])]
+    assert len(updates) == 2
+    for call in updates:
+        assert "= :d" in str(call.args[0]) and call.args[1]["d"] == "NO_ANSWER"
+
+
+def test_delivery_is_skipped_while_another_run_holds_the_row():
+    slack = MagicMock()
+    sheets, values = _sheets([])
+    factory, db = _factory(_row())
+    db.execute.return_value.scalar.return_value = False  # advisory lock not granted
+
+    dd.deliver_disposition(1, session_factory=factory, slack_client=slack, sheets_service=sheets)
+
+    slack.chat_postMessage.assert_not_called()
+    values.append.assert_not_called()
+    assert not any("pg_advisory_unlock" in str(c.args[0]) for c in db.execute.call_args_list)
+
+
+def test_lock_is_released_even_when_delivery_fails(monkeypatch):
+    factory, db = _factory(_row())
+    db.execute.return_value.scalar.return_value = True
+    monkeypatch.setattr(dd, "_deliver_locked", MagicMock(side_effect=RuntimeError("boom")))
+
+    dd.deliver_disposition(1, session_factory=factory)
+
+    assert any("pg_advisory_unlock" in str(c.args[0]) for c in db.execute.call_args_list)
+
+
 def test_already_delivered_disposition_is_not_resent(monkeypatch):
     slack = MagicMock()
     sheets, values = _sheets([])

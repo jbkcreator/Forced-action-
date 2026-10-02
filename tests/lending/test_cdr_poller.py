@@ -44,7 +44,8 @@ def test_backfill_days_rescans_that_many_days_first(monkeypatch):
     assert code == 0 and rescan.call_args.kwargs["days"] == 5 and not cycle.called
 
 
-def test_empty_campaign_list_warns_at_startup(monkeypatch, caplog):
-    with caplog.at_level("WARNING"):
-        _run_main(monkeypatch, ["--once"], frozenset())
+def test_empty_campaign_list_refuses_to_start(monkeypatch, caplog):
+    with caplog.at_level("ERROR"):
+        code, _, cycle = _run_main(monkeypatch, ["--once"], frozenset())
+    assert code == 2 and not cycle.called
     assert "LENDING_DIALER_CAMPAIGN_IDS is empty" in caplog.text

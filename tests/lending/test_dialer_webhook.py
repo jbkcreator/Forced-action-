@@ -96,6 +96,21 @@ def test_non_lending_campaign_is_ignored_with_200(client, hooks):
     hooks.record.assert_not_called()
 
 
+def test_unset_campaign_list_is_503_so_the_dialer_redelivers(monkeypatch, client, hooks, caplog):
+    monkeypatch.setattr(call_pipeline, "get_settings", lambda: SimpleNamespace(lending_dialer_campaign_ids=""))
+    with caplog.at_level("ERROR"):
+        r = _post(client, _event(disposition="DNC_REQUEST"))
+    assert r.status_code == 503 and "LENDING_DIALER_CAMPAIGN_IDS" in caplog.text
+    hooks.record.assert_not_called()
+
+
+def test_dnc_on_a_non_lending_campaign_is_ignored_but_warned(client, hooks, caplog):
+    with caplog.at_level("WARNING"):
+        r = _post(client, _event(campaign="999", disposition="DNC_REQUEST"))
+    assert r.status_code == 200 and "DNC request on call c1 ignored" in caplog.text
+    hooks.record.assert_not_called()
+
+
 def test_event_without_a_campaign_is_ignored(client, hooks):
     body = _event()
     del body["campaign_id"]

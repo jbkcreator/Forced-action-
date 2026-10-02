@@ -36,6 +36,15 @@ def seats(monkeypatch):
     monkeypatch.setattr(d, "get_settings", lambda: SimpleNamespace(lending_seat_groups="7:A, 8:b"))
 
 
+def test_dnc_is_not_overwritten_until_its_opt_out_is_propagated(lending_db):
+    d.record_dialer_event(lending_db, _ev(disposition_raw="DNC_REQUEST"))
+    d.record_dialer_event(lending_db, _ev(disposition_raw="CALLBACK_REQUESTED"))
+    assert _row(lending_db)["disposition"] == "DNC_REQUEST"
+    lending_db.execute(text("UPDATE lending.call_dispositions SET opt_out_propagated_at = now()"))
+    d.record_dialer_event(lending_db, _ev(disposition_raw="CALLBACK_REQUESTED"))
+    assert _row(lending_db)["disposition"] == "CALLBACK_REQUESTED"
+
+
 def test_replay_gives_one_row_and_the_code_sticks(lending_db):
     d.record_dialer_event(lending_db, _ev(disposition_raw="CALLBACK_REQUESTED"))
     d.record_dialer_event(lending_db, _ev(disposition_raw="CALLBACK_REQUESTED"))

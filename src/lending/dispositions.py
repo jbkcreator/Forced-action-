@@ -314,6 +314,9 @@ def record_dialer_event(db, ev: DialerCallEvent) -> RecordedCall:
                 text("UPDATE lending.call_dispositions SET disposition_raw = :raw, disposition_at = clock_timestamp() WHERE id = :id"),
                 {"raw": ev.disposition_raw, "id": row["id"]},
             )
+        elif code is not None and code != disposition and disposition == DNC_CODE and row["opt_out_propagated_at"] is None:
+            logger.warning("[lending] call %s: kept DNC_REQUEST over a later %s until the opt-out is propagated",
+                           ev.call_id, code)
         elif code is not None and code != disposition:
             cause = DEFAULT_CAUSE.get(code or "") if not row["unfunded_cause"] else None
             db.execute(

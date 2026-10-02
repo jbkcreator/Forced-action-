@@ -22,10 +22,11 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
+from config.lending_dispositions import DNC_CODE
 from config.settings import get_settings
 from src.lending.db import get_lending_db
 from src.lending.call_pipeline import follow_up, lending_campaign_ids, process_event
-from src.lending.dispositions import last4, parse_event
+from src.lending.dispositions import last4, normalize_code, parse_event
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -63,8 +64,15 @@ async def dialer_call_webhook(
     if ev is None:
         raise HTTPException(status_code=400, detail="invalid payload")
 
-    if ev.campaign_id not in lending_campaign_ids():
-        logger.debug("[lending] ignoring event for a non-lending campaign")
+    campaigns = lending_campaign_ids()
+    if not campaigns:
+        logger.error("[lending] LENDING_DIALER_CAMPAIGN_IDS is not set: refusing call %s so the dialer redelivers", ev.call_id)
+        raise HTTPException(status_code=503, detail="lending campaigns not configured")
+    if ev.campaign_id not in campaigns:
+        if normalize_code(ev.disposition_raw)[0] == DNC_CODE:
+            logger.warning("[lending] DNC request on call %s ignored: campaign %s is not a lending campaign", ev.call_id, ev.campaign_id)
+        else:
+            logger.debug("[lending] ignoring event for a non-lending campaign")
         return {"ok": True}
 
     try:

@@ -99,8 +99,13 @@ def _finished(ev: DialerCallEvent) -> DialerCallEvent:
 def ingest(db, items: list[dict], *, only_changed: bool) -> IngestStats:
     stats = IngestStats(seen=len(items))
     campaigns = lending_campaign_ids()
-    events = [ev for ev in (parse_event(i) for i in items)
-              if ev and ev.campaign_id in campaigns
+    parsed = [ev for ev in (parse_event(i) for i in items) if ev]
+    for ev in parsed:
+        if ev.campaign_id not in campaigns and normalize_code(ev.disposition_raw)[0] == DNC_CODE:
+            logger.warning("[lending] DNC request on CDR %s ignored: campaign %s is not a lending campaign",
+                           ev.call_id, ev.campaign_id)
+    events = [ev for ev in parsed
+              if ev.campaign_id in campaigns
               and (ev.direction != "inbound" or normalize_code(ev.disposition_raw)[0] == DNC_CODE)]
     if only_changed:
         pending = _changed(db, events)
