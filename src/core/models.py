@@ -12798,3 +12798,49 @@ class OfrMortgageBroker(Base):
         Index("idx_ofr_brokers_status_county", "status", "county"),
         Index("idx_ofr_brokers_nmls", "nmls_id"),
     )
+
+
+class OfrLoanOriginator(Base):
+    """List 4 "brokers and LOs" gap: individual OFR Loan Originator licenses.
+
+    Loaded from the OFR "LO" bulk download (3 monthly zips split by surname
+    range: AI, JR, SZ) by src/tasks/ofr_lo_load.py. NATIONWIDE NMLS registry —
+    most records are out-of-state individuals holding a remote FL LO license
+    (confirmed from real sample data: Michigan/Oregon addresses), NOT a
+    Florida-residents file. Phone is blank on virtually every record (confirmed
+    from real sample data) — every row needs skip-trace before it is callable.
+
+    NOT YET WIRED into Pool 3's extraction — loader-only until the client
+    confirms LOs are in scope for launch (flagged gap, WP-W0-1).
+    """
+    __tablename__ = "ofr_loan_originators"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    license_number: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    nmls_id: Mapped[Optional[str]] = mapped_column(String, index=True)
+    last_name: Mapped[Optional[str]] = mapped_column(String)
+    first_name: Mapped[Optional[str]] = mapped_column(String)
+    middle_name: Mapped[Optional[str]] = mapped_column(String)
+
+    prim_address_1: Mapped[Optional[str]] = mapped_column(String)
+    prim_address_2: Mapped[Optional[str]] = mapped_column(String)
+    prim_city: Mapped[Optional[str]] = mapped_column(String)
+    county: Mapped[Optional[str]] = mapped_column(String)
+    prim_state: Mapped[Optional[str]] = mapped_column(String)
+    prim_zip: Mapped[Optional[str]] = mapped_column(String)
+
+    phone_raw: Mapped[Optional[str]] = mapped_column(String)       # blank on nearly every row
+    normalized_phone: Mapped[Optional[str]] = mapped_column(String)  # E.164 or NULL
+
+    status: Mapped[Optional[str]] = mapped_column(String)  # Approved | Expired | ...
+    status_effective_date: Mapped[Optional[date]] = mapped_column(Date)
+    initial_approval: Mapped[Optional[date]] = mapped_column(Date)
+
+    loaded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("idx_ofr_los_status_state", "status", "prim_state"),
+        Index("idx_ofr_los_nmls", "nmls_id"),
+    )

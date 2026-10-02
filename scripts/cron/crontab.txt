@@ -1200,4 +1200,21 @@ COUNTY_ID=hillsborough
 # reach flofr.gov.
 0 5 1 * * $PROJECT/scripts/cron/run.sh src.tasks.ofr_broker_load
 
+# OFR individual Loan Originator (LO) refresh — List 4 "brokers and LOs" gap
+# (WP-W0-1 Pool 3). OFR publishes 3 surname-range files (AI/JR/SZ) monthly;
+# one run of this task downloads + unzips + loads all 3 into
+# ofr_loan_originators. Runs 1st of month 05:05 UTC, right after the broker
+# refresh above (same cadence, same host dependency). Fully automated — no
+# manual download/unzip needed once this runs on the server; it only needed
+# a manual path this session because dev work happened from a sandboxed
+# environment that cannot reach flofr.com (confirmed: DNS resolves, TCP times
+# out — a network boundary of that environment, not of production). Guard:
+# no-ops (raises, logged) when OFR_LO_ENABLED=false (default) or any of the
+# 3 OFR_LO_DOWNLOAD_URL_* vars are unset.
+#
+# NOT auto-wired to affect dialing until the client confirms LOs are in scope
+# (flagged gap) — this cron only keeps ofr_loan_originators fresh; Pool 3
+# reads it whenever the table holds rows, same fail-closed pattern as brokers.
+5 5 1 * * $PROJECT/scripts/cron/run.sh src.tasks.ofr_lo_load
+
 # === END FORCED-ACTION-PLATFORM ===

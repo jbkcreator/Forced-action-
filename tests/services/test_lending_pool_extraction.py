@@ -194,6 +194,74 @@ class TestPool3Brokers:
         assert r.phone_available is False and r.normalized_phone is None
 
 
+def _insert_lo(db, *, license_number, last="SMITH", first="JOHN", county="HILLSBOROUGH",
+               status="Approved", phone="", state="FL"):
+    db.execute(text("""
+        INSERT INTO ofr_loan_originators
+            (license_number, nmls_id, last_name, first_name, prim_address_1,
+             prim_city, county, prim_state, prim_zip, phone_raw, normalized_phone, status)
+        VALUES (:ln, '1', :last, :first, '1 MAIN ST',
+                :city, :county, :state, '33601', :phone, :norm, :status)
+    """), {
+        "ln": license_number, "last": last, "first": first, "city": "TAMPA",
+        "county": county, "state": state, "phone": phone,
+        "norm": pe.normalize_phone(phone) if phone else None, "status": status,
+    })
+
+
+class TestPool3LoanOriginators:
+    """List 4 'brokers and LOs' — the LO half, wired into the same Pool 3 function."""
+
+    def test_includes_approved_target_county(self, fresh_db):
+        _insert_lo(fresh_db, license_number="LO-INC-1", last="SMITH", first="JANE", county="HILLSBOROUGH")
+        recs = pe._extract_pool3_mortgage_broker(fresh_db, [])
+        r = next((r for r in recs if r.dbpr_license_number == "LO-INC-1"), None)
+        assert r is not None
+        assert r.pool_name == "mortgage_broker"
+        assert r.borrower_name == "JANE SMITH"          # individual — unlike firm-level broker rows
+        assert r.entity_status == "NATURAL_PERSON"
+        # source_tag is populated by _finalize_run_metadata, not this raw extractor;
+        # source_tag_for("mortgage_broker", ...) == "list_4" is covered directly in
+        # test_lending_pool_source_tags.py.
+        assert r.aircall_campaign_tag == "DESK_RESCUE"
+        assert r.source_table == "ofr_loan_originators"
+
+    def test_excludes_non_approved(self, fresh_db):
+        _insert_lo(fresh_db, license_number="LO-EXP", status="Expired")
+        recs = pe._extract_pool3_mortgage_broker(fresh_db, [])
+        assert not any(r.dbpr_license_number == "LO-EXP" for r in recs)
+
+    def test_excludes_other_county(self, fresh_db):
+        # Out-of-state LOs (confirmed common in the real OFR file) must not leak in.
+        _insert_lo(fresh_db, license_number="LO-MI", county="ALLEGAN", state="MI")
+        recs = pe._extract_pool3_mortgage_broker(fresh_db, [])
+        assert not any(r.dbpr_license_number == "LO-MI" for r in recs)
+
+    def test_no_phone_flagged(self, fresh_db):
+        # Real OFR data: ~0% of LOs have a phone even after narrowing to local county.
+        _insert_lo(fresh_db, license_number="LO-NOPH", phone="")
+        recs = pe._extract_pool3_mortgage_broker(fresh_db, [])
+        r = next(r for r in recs if r.dbpr_license_number == "LO-NOPH")
+        assert r.phone_available is False and r.normalized_phone is None
+
+    def test_los_returned_when_brokers_table_empty(self, fresh_db):
+        """Regression test: brokers and LOs are independent OFR datasets. An empty/absent
+        brokers table must never silently suppress LOs (the bug this test guards against —
+        an early `return []` on the brokers fail-closed check used to skip the LO call too)."""
+        _insert_lo(fresh_db, license_number="LO-ALONE", county="HILLSBOROUGH")
+        # Deliberately no broker rows inserted — ofr_mortgage_brokers is empty,
+        # so _ofr_registry_available(session) is False for brokers.
+        recs = pe._extract_pool3_mortgage_broker(fresh_db, [])
+        assert any(r.dbpr_license_number == "LO-ALONE" for r in recs)
+
+    def test_brokers_and_los_both_present(self, fresh_db):
+        _insert_broker(fresh_db, license_number="MBR-BOTH", county="HILLSBOROUGH")
+        _insert_lo(fresh_db, license_number="LO-BOTH", county="HILLSBOROUGH")
+        recs = pe._extract_pool3_mortgage_broker(fresh_db, [])
+        assert any(r.dbpr_license_number == "MBR-BOTH" for r in recs)
+        assert any(r.dbpr_license_number == "LO-BOTH" for r in recs)
+
+
 # ---------------------------------------------------------------------------
 # Pool 1 — Wholesalers / Flippers (DB-backed)
 # ---------------------------------------------------------------------------
@@ -272,49 +340,14 @@ def _seed_permit(db, *, permit_number, issue_offset_days=30, enforcement=False,
     return prop_id
 
 
-class TestPool2NOCBuilders:
-    """Pool 2b (List 7): NOC/permit property owners via building_permits."""
-
-    def test_includes_recent_structural(self, fresh_db):
-        _seed_permit(fresh_db, permit_number="BP-INC-1", issue_offset_days=30)
-        recs = pe._extract_pool2b_noc_permits(fresh_db, ["hillsborough", "pinellas"])
-        r = next((r for r in recs if r.permit_number == "BP-INC-1"), None)
-        assert r is not None
-        assert r.pool_name == "active_builder"
-        assert r.campaign_list == "List 7"
-        assert r.recent_permit_details and "NEW CONSTRUCTION" in r.recent_permit_details
-        assert r.aircall_campaign_tag == "DESK_CONSTRUCTION"
-
-    def test_excludes_old_permit(self, fresh_db):
-        _seed_permit(fresh_db, permit_number="BP-OLD", issue_offset_days=400)
-        recs = pe._extract_pool2b_noc_permits(fresh_db, ["hillsborough", "pinellas"])
-        assert not any(r.permit_number == "BP-OLD" for r in recs)
-
-    def test_excludes_non_structural(self, fresh_db):
-        _seed_permit(fresh_db, permit_number="BP-POOL", permit_type="POOL SCREEN ENCLOSURE")
-        recs = pe._extract_pool2b_noc_permits(fresh_db, ["hillsborough", "pinellas"])
-        assert not any(r.permit_number == "BP-POOL" for r in recs)
-
-    def test_no_phone_when_no_owner(self, fresh_db):
-        prop_id = fresh_db.execute(text(
-            "SELECT id FROM properties WHERE county_id='hillsborough' LIMIT 1")).scalar()
-        if prop_id is None:
-            pytest.skip("no hillsborough property")
-        fresh_db.execute(text("""
-            INSERT INTO building_permits
-                (property_id, permit_number, county_id, permit_type, description,
-                 job_value, issue_date, is_enforcement_permit)
-            VALUES (:p, 'BP-NOPH', 'hillsborough', 'NEW CONSTRUCTION', 'NEW CONSTRUCTION',
-                    250000, NOW(), false)
-        """), {"p": prop_id})
-        recs = pe._extract_pool2b_noc_permits(fresh_db, ["hillsborough", "pinellas"])
-        r = next((r for r in recs if r.permit_number == "BP-NOPH"), None)
-        if r:
-            assert r.phone_available is False
-
-
 # ---------------------------------------------------------------------------
 # O28 — Estimated Loan Value (spec-backed) + owner-builder name match
+#
+# Pool 2b (_extract_pool2b_noc_permits) was superseded during the #318/#320
+# reconciliation by _extract_list7_permit_owners/permit_owner_record (from
+# #320) — see pool_extraction.py's Pool 2 docstring. That function's coverage
+# (new-construction filter, no-permanent-financing exclusion, List 7 tagging)
+# is in tests/services/test_lending_pool_source_tags.py.
 # ---------------------------------------------------------------------------
 
 class TestNamesMatch:
@@ -332,43 +365,29 @@ class TestNamesMatch:
 
 
 class TestCampaignListAndLineType:
-    """New fields: campaign_list (Josh's List 1-9) and line_type (mobile/landline/unknown)."""
+    """source_tag (Josh's List 1-9, see source_tag_for()) and line_type (mobile/landline/unknown).
 
-    def test_pool1_campaign_list_2(self, fresh_db):
+    List 7 (permit_owner) coverage lives in test_lending_pool_source_tags.py —
+    _extract_pool2b_noc_permits was superseded by _extract_list7_permit_owners
+    during the #318/#320 reconciliation.
+    """
+
+    def test_pool1_source_tag_list_2(self, fresh_db):
         be_id = _seed_wholesaler(fresh_db, buyer_type="wholesaler")
         recs = pe._extract_pool1_wholesaler_flipper(fresh_db, ["hillsborough", "pinellas"])
         r = next((r for r in recs if r.buyer_entity_id == be_id), None)
         if r:
-            assert r.campaign_list == "List 2"   # cash buyers — inferred, see CAMPAIGN_LIST note
             assert r.line_type == "unknown"      # buyer_entity phone source doesn't distinguish
 
-    def test_pool3_campaign_list_4(self, fresh_db):
+    def test_pool3_broker_line_type(self, fresh_db):
         _insert_broker(fresh_db, license_number="MBR-CL4")
         recs = pe._extract_pool3_mortgage_broker(fresh_db, [])
         r = next((r for r in recs if r.dbpr_license_number == "MBR-CL4"), None)
         if r:
-            assert r.campaign_list == "List 4"
             assert r.line_type == "unknown"
-
-    def test_pool2b_noc_campaign_list_7(self, fresh_db):
-        _seed_permit(fresh_db, permit_number="BP-CL7")
-        recs = pe._extract_pool2b_noc_permits(fresh_db, ["hillsborough", "pinellas"])
-        r = next((r for r in recs if r.permit_number == "BP-CL7"), None)
-        if r:
-            assert r.campaign_list == "List 7"
 
 
 class TestEstimatedLoanValue:
-    def test_pool2b_noc_85pct_ltc(self, fresh_db):
-        _seed_permit(fresh_db, permit_number="BP-ELV")  # job_value=300000
-        recs = pe._extract_pool2b_noc_permits(fresh_db, ["hillsborough", "pinellas"])
-        r = next((r for r in recs if r.permit_number == "BP-ELV"), None)
-        if r:
-            assert r.estimated_loan_value == max(
-                Decimal(str(pe.CONSTRUCTION_MIN_LOAN)),
-                Decimal("300000") * Decimal(str(pe.CONSTRUCTION_LTC)),
-            )
-
     def test_pool1_flip_floored_at_min(self, fresh_db):
         be_id = _seed_wholesaler(fresh_db)  # sale_price=200000 → 150000 > 100k floor
         recs = pe._extract_pool1_wholesaler_flipper(fresh_db, ["hillsborough", "pinellas"])
