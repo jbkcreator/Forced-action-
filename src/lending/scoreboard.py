@@ -1,4 +1,4 @@
-"""7pm scoreboard from the disposition log (client Part 5.6): per caller and per campaign."""
+"""7:20pm scoreboard from the disposition log (client Part 5.6): per caller and per campaign."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -86,7 +86,7 @@ def _line(r: Row) -> str:
 
 
 def format_slack(data: ScoreboardData, day: date) -> str:
-    out = [f"*Lending scoreboard {day.isoformat()} (through 7:00pm ET)*", _line(data.total), "", "*By caller*"]
+    out = [f"*Lending scoreboard {day.isoformat()} (through 7:15pm ET)*", _line(data.total), "", "*By caller*"]
     out += [_line(r) for r in data.by_caller] or ["no dials"]
     out += ["", "*By campaign*"] + ([_line(r) for r in data.by_campaign] or ["no dials"])
     out += ["", "*By hook (campaign tag): which hook works*"] + ([_line(r) for r in data.by_hook] or ["no dials"])

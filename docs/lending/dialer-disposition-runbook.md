@@ -22,14 +22,14 @@ CDR, and how a contact is held. Confirm them before go-live.
    - `LENDING_DIALER_CAMPAIGN_IDS` (comma-separated BatchDialer **campaign ids**, from `GET /api/campaigns`; **empty ignores every call**)
    - `LENDING_SEAT_GROUPS` (`agentid:A,agentid:B`, keyed by BatchDialer **agent id**; a seat missing here gets no shift group)
    - `LENDING_DISPOSITION_MISSING_ALERT_MINUTES` (default 10)
-   - `LENDING_SLACK_BOT_TOKEN`, `LENDING_DIAL_TASKS_CHANNEL`,
+   - `LENDING_SLACK_BOT_TOKEN`, `LENDING_DIAL_TASKS_CHANNEL`, `LENDING_DAILY_CHANNEL` (scoreboard),
      `LENDING_SHEETS_SERVICE_ACCOUNT_KEY_PATH`, `LENDING_DISPOSITION_SHEET_ID` (+ `_TAB`)
    - `BATCHDIALER_API_KEY` (the API token: **User icon → Settings → Integrations → Custom Integration**; shared with the dialer load; `.env` only, never in chat or PRs)
 3. Start `fa-lending-cdr-poller` (`deploy/systemd/fa-lending-cdr-poller.service`). Run **exactly one
    instance**: the `/v2/cdrs/last` watermark is per API key, so a second poller (or anything else using
    that endpoint with the same key) steals records. `lending-api` and its Nginx block are not needed for ingestion.
    Poller behavior to know:
-   - Inbound calls are ignored, except calls disposed `DNC_REQUEST` (those are opted out; no attempt is counted).
+   - Inbound calls get no call row, except calls disposed `DNC_REQUEST` (those are opted out; no attempt is counted). An answered inbound call (duration > 0) records `inbound_call` text consent, so the inbound/callback queue's campaign id must be in `LENDING_DIALER_CAMPAIGN_IDS`.
    - The day rescan re-reads today and yesterday (UTC) every few minutes. After an outage longer than that,
      run `python -m src.lending.cdr_poller --backfill-days N` (rescans N days, then continues; with `--once` it
      rescans and exits). DNC rows whose opt-out failed are retried every cycle regardless of the window.
@@ -38,7 +38,7 @@ CDR, and how a contact is held. Confirm them before go-live.
    - UNVERIFIED (Task 0, needs a live account check): the pagination parameter name `next_page` and the CDR
      status strings (`ANSWER` etc. in `CDR_ANSWERED_STATUSES`).
 4. Install the crontab: delivery retry and missing-disposition alert (every 5 minutes), plus the two new lines
-   `src.tasks.lending_recording_check` (every 10 minutes) and `src.tasks.lending_daily_scoreboard` (7:00pm ET).
+   `src.tasks.lending_recording_check` (every 10 minutes) and `src.tasks.lending_daily_scoreboard` (7:20pm ET).
 
 ## 2. What the dialer admin configures in the app (BatchDialer: Akrash)
 
@@ -126,12 +126,11 @@ All 13 results exist in BatchDialer (group "Lending", created). Only the three b
 
 ### Daily scoreboard
 
-- `src.tasks.lending_daily_scoreboard` posts to `LENDING_DIAL_TASKS_CHANNEL` at 7:00pm ET (two UTC cron lines; only the one at 19:xx ET acts).
+- `src.tasks.lending_daily_scoreboard` posts to `LENDING_DAILY_CHANNEL` at 7:20pm ET, retrying Slack 3 times (two UTC cron lines; only the one at 19:xx ET acts).
   Tables: by caller, by BatchDialer campaign (`dialer_campaign_id`, names from `GET /campaigns`), and by hook (`campaign_tag`).
 - Definitions live in `config/lending_dispositions.py` (`LIVE_CONVERSATION_CODES`, `GATED_CODES`, `NURTURE_SENT_CODES`).
   Booked excludes `booking_blocked`; Showed is not in the log (client marks Held in GHL), so it prints `n/a (GHL)`.
-- The dialer stops at 7:15pm ET, so calls between 7:00 and 7:15pm are not in the post. Open question for the client: post at 7:20pm instead
-  (change the cron hours and the hour guard together).
+- The dialer stops at 7:15pm ET, so the post runs at 7:20pm (cron 23:20 and 00:20 UTC; the 19:xx ET guard picks the right one).
 - Test calls count like real ones. Run with `--force` only after the Friday test, or filter by a test campaign.
 
 ## 4. Acceptance check
