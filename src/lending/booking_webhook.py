@@ -18,14 +18,15 @@ point for the GL-5 owner).
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, Header
+from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy.orm import Session
 
 from src.api.deps import get_db
 from src.api.lending_ghl_router import _verify_secret
-from src.lending.booking_messages import cancel_by_provider_event
+from src.lending.booking_messages import cancel_by_provider_event, handle_booking_confirmed
 
 logger = logging.getLogger(__name__)
 
@@ -63,3 +64,42 @@ def ghl_appointment(
     db.commit()
     logger.info("[booking-webhook] appointment status=%s cancelled=%d", status, cancelled)
     return {"status": status, "cancelled": cancelled}
+
+
+def _parse_booking(body: dict[str, Any]) -> dict[str, Any]:
+    """The booking payload with ``slot_start_utc`` parsed; 422 when a required field is missing or invalid."""
+    booking_ref = str(body.get("booking_ref") or "").strip()
+    raw_slot = body.get("slot_start_utc")
+    if not booking_ref or not isinstance(raw_slot, str):
+        raise HTTPException(status_code=422, detail="booking_ref and slot_start_utc are required")
+    try:
+        slot = datetime.fromisoformat(raw_slot)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="slot_start_utc must be an ISO 8601 timestamp") from None
+    if slot.tzinfo is None:
+        raise HTTPException(status_code=422, detail="slot_start_utc must include a timezone")
+    return {**body, "booking_ref": booking_ref, "slot_start_utc": slot}
+
+
+@router.post("/booking-confirmed")
+def booking_confirmed(
+    body: dict[str, Any],
+    x_webhook_secret: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """The production entry point for ``handle_booking_confirmed``: whatever confirms a booking (the GL-5
+    booking flow, or a GHL workflow on appointment created) POSTs the payload documented in
+    ``booking_messages``. Idempotent per ``booking_ref``, so a redelivery changes nothing. This endpoint is
+    the transport the GL-5 owner can call; it does not read GL-5's gate table, which holds enum codes only
+    (no phone, address or consent) and so cannot supply this payload."""
+    _verify_secret(x_webhook_secret)
+    payload = _parse_booking(body)
+    try:
+        result = handle_booking_confirmed(db, payload)
+        db.commit()
+    except Exception as exc:  # class only: the payload carries a phone number
+        logger.error("[booking-webhook] booking_ref=%s scheduling failed (%s)", payload["booking_ref"], type(exc).__name__)
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Could not schedule the booking messages") from None
+    outcome = "skipped" if result.skip_reason else "scheduled" if result.inserted else "duplicate"
+    return {"status": outcome, "inserted": result.inserted, "skip_reason": result.skip_reason}

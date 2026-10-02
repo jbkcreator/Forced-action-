@@ -58,6 +58,10 @@ suppression and consent checks: confirmation right after booking, reminder the e
 pending Josh's confirmation), reminder 90 minutes before. Wording is the client-approved text in
 `config/lending_reminders.py`. Switch on with `BOOKING_REMINDER_TEXT_ENABLED=true` only after 10DLC clears.
 
+## Entry point and task list
+
+A confirmed booking reaches the scheduler through `POST /webhooks/lending/booking-confirmed` (header `X-Webhook-Secret`, payload documented in `src/lending/booking_messages.py`; idempotent per `booking_ref`). Open: the GL-5 owner must call it when a booking is confirmed. Confirmation calls due are posted at 9am ET to `LENDING_DIAL_TASKS_CHANNEL` by `src.tasks.lending_confirmation_tasks`.
+
 ## Done-when checks (use a consented test contact)
 
 1. Reply "Thursday works" -> the agent answers within seconds and offers a slot.
