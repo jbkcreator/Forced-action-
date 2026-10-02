@@ -137,8 +137,32 @@ def main() -> None:
         elif args.export_csv and args.dry_run:
             logger.warning("--export-csv ignored under --dry-run (nothing written to staging).")
 
+    _print_campaign_table(summary)
     print(json.dumps(summary, indent=2, default=str))
     logger.info("lending_pool_extract complete run_id=%s", summary.get("run_id"))
+
+
+def _print_campaign_table(summary: dict) -> None:
+    """Human-readable version of the per-campaign counts (client_commnets_answers.md
+    Section 2's requested shape: campaign, raw records, records with a phone).
+
+    NOTE: these are raw/phone-available counts only — NOT "dialable after DNC and
+    suppression" (that needs WP-W0-2's compliance pass, a separate step/owner).
+    """
+    campaign_lists = summary.get("campaign_lists")
+    if not campaign_lists:
+        return
+    print("\n=== Per-campaign counts (raw / with phone) — NOT post-compliance 'dialable' ===")
+    print(f"{'Campaign':<14} {'Pools':<30} {'Total':>8} {'With Phone':>12} {'Hit %':>7}")
+    for list_name in sorted(campaign_lists.keys()):
+        bucket = campaign_lists[list_name]
+        total = bucket["total"]
+        with_phone = bucket["phone_available"]
+        pct = f"{(with_phone / total * 100):.1f}%" if total else "0.0%"
+        pools = ",".join(bucket["pool_names"])
+        print(f"{list_name:<14} {pools:<30} {total:>8} {with_phone:>12} {pct:>7}")
+    print(f"{'TOTAL':<14} {'':<30} {summary['total_records']:>8} {summary['total_phone_available']:>12}")
+    print()
 
 
 if __name__ == "__main__":

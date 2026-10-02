@@ -304,29 +304,8 @@ def extract_calling_pools(
         "run_id": run_id,
         "dry_run": dry_run,
         "county_ids": county_ids,
-        "pools": {
-            "wholesaler_flipper": {
-                "total": sum(1 for r in all_records if r.pool_name == "wholesaler_flipper"),
-                "phone_available": sum(
-                    1 for r in all_records
-                    if r.pool_name == "wholesaler_flipper" and r.phone_available
-                ),
-            },
-            "active_builder": {
-                "total": sum(1 for r in all_records if r.pool_name == "active_builder"),
-                "phone_available": sum(
-                    1 for r in all_records
-                    if r.pool_name == "active_builder" and r.phone_available
-                ),
-            },
-            "mortgage_broker": {
-                "total": sum(1 for r in all_records if r.pool_name == "mortgage_broker"),
-                "note": (
-                    "Spec §4.1 source (OFR/NMLS professional licensing registry) not ingested "
-                    "in FA — fail-closed, 0 records. Blocked on O4/O13."
-                ),
-            },
-        },
+        "pools": _summarize_by_pool(all_records),
+        "campaign_lists": _summarize_by_campaign_list(all_records),
         "total_records": len(all_records),
         "total_phone_available": sum(1 for r in all_records if r.phone_available),
     }
@@ -339,6 +318,44 @@ def extract_calling_pools(
         logger.info("run_id=%s dry_run=True skipping DB write (%d records)", run_id, len(all_records))
 
     return summary
+
+
+def _summarize_by_pool(records: list[CallingPoolRecord]) -> dict[str, dict[str, int]]:
+    """Total / phone_available per internal pool_name (wholesaler_flipper, active_builder, mortgage_broker).
+
+    Coarser than _summarize_by_campaign_list — active_builder mixes List 3 + List 7 here.
+    Kept for backward-compat callers that key off pool_name rather than campaign_list.
+    """
+    out: dict[str, dict[str, int]] = {}
+    for r in records:
+        bucket = out.setdefault(r.pool_name, {"total": 0, "phone_available": 0})
+        bucket["total"] += 1
+        if r.phone_available:
+            bucket["phone_available"] += 1
+    return out
+
+
+def _summarize_by_campaign_list(records: list[CallingPoolRecord]) -> dict[str, dict[str, Any]]:
+    """Total / phone_available per Josh's List 1-9 taxonomy — the shape of the table he
+    asked for (client_commnets_answers.md Section 2): "each campaign... raw records,
+    records with a phone". A record with campaign_list=None (not yet mapped) groups
+    under 'unassigned' rather than silently vanishing from the report.
+
+    NOTE: this is "raw records" / "records with a phone" only — NOT "dialable after DNC
+    and suppression", which needs WP-W0-2's compliance pass output, not this extraction step.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for r in records:
+        key = r.campaign_list or "unassigned"
+        bucket = out.setdefault(key, {"total": 0, "phone_available": 0, "pool_names": set()})
+        bucket["total"] += 1
+        bucket["pool_names"].add(r.pool_name)
+        if r.phone_available:
+            bucket["phone_available"] += 1
+    # Sets aren't JSON-serializable — convert to a sorted list for the summary dict.
+    for bucket in out.values():
+        bucket["pool_names"] = sorted(bucket["pool_names"])
+    return out
 
 
 # ---------------------------------------------------------------------------
