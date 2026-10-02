@@ -44,6 +44,10 @@ PYTHONPATH=. python migrations/apply_fa_max_wp_t2_2_tool_call_log_claimed_status
 PYTHONPATH=. python migrations/apply_fa_max_wp_t2_3.py  # FA Max WP-T2-3: opportunity_id on relay_approval_queue, backflip_attribution_owner/set_at on fa_max_opportunities, fa_max_backflip_suppression_decisions audit table (idempotent, run after WP-T2-2)
 PYTHONPATH=. python migrations/apply_property_radar_pull_runs.py  # PropertyRadar ingestion adapter (Dev 1): property_radar_pull_runs (run checkpoint) + property_radar_seen_ids (dedup) (idempotent)
 
+PYTHONPATH=. python migrations/apply_lending_call_dispositions.py  # lending.call_dispositions (idempotent); runbook docs/lending/dialer-disposition-runbook.md
+PYTHONPATH=. python migrations/apply_lending_call_dispositions_dialer.py  # vendor-neutral rename + dialer-logging columns + lending.missed_call_events (idempotent, run after apply_lending_call_dispositions.py)
+PYTHONPATH=. python migrations/apply_lending_pr319_client_feedback.py  # lending.text_consents + recording_status and dialer_campaign_id columns (idempotent, run after apply_lending_call_dispositions_dialer.py)
+PYTHONPATH=. python migrations/apply_lending_gl9_text_back.py  # WP-GL-9 text-back decision columns + day-slot index on lending.missed_call_events (idempotent, run after apply_lending_call_dispositions_dialer.py)
 # PropertyRadar daily target-lender maturity pull (separate cron, disabled until PROPERTY_RADAR_ENABLED=true — see scripts/cron/crontab.txt)
 python -m src.tasks.property_radar_maturity_pull --mode daily --state FL
 
@@ -100,6 +104,9 @@ Garbage collection for `lifecycle_playbook`. `src/services/learning_hygiene.py` 
 - Rails: schema precondition (verifies `apply_lifecycle_playbook_lessons_versioning.py` ran; **never applies it**), global feed health, blast radius `max(3, 20%)` of the *measurable* population. Audit rows go to `agent_decisions` — no new migration. See ADR 0034 + `config/learning_hygiene.py:validate_hygiene_config()`.
 - **Tasks** (`src/tasks/`): Scheduled jobs. `daily_report.py` — CSV ops report (runs 08:10 UTC for both Hillsborough and Pinellas). `daily_dashboard.py` — 10-section PDF (23:30 UTC Mon-Sat), separate from daily_report. `dnc_refresh` — monthly Tracerfy DNC re-scrub. `venture_ladder_evaluator.py` — daily 09:30 UTC venture-ladder walk (CL4).
 
+### Lending (`src/lending/`)
+Shared `DATABASE_URL`, tables in schema `lending`. One `call_dispositions` row per dialer call (columns are vendor-neutral: `dialer_call_id`, `dialer_contact_id`, `caller_id_number`); result = one code from `config/lending_dispositions.py` (`DISPOSITIONS`, versioned by `DISPOSITION_LIST_VERSION`; an unknown code is stored raw in `disposition_raw`, never dropped). Ingestion is by polling BatchDialer call records (CDRs): `python -m src.lending.cdr_poller` (systemd `fa-lending-cdr-poller`, code in `cdr_poll.py`; needs exactly one running instance because the `/v2/cdrs/last` watermark is per API key; settings `BATCHDIALER_API_KEY`, `LENDING_DIALER_CAMPAIGN_IDS`, `LENDING_SEAT_GROUPS`), not the webhook. `lending-api` (`127.0.0.1:8010`, `/webhooks/lending/dialer`) still exists but is unused unless the payload carries the CDR id. `parse_event()` is the only place that knows the dialer's payload shape. Unanswered calls write `lending.missed_call_events`, consumed by `src/lending/text_back.py` (WP-GL-9; runs inside the CDR poller, sends through GoHighLevel; #320's `missed_call_poller` is superseded). `lending.text_consents` (written from calls and mirrored to the BatchDialer contact field `text_consent`; read via `src.lending.consent.has_text_consent`) is the text-back gate. `recording_status` (`pending/readable/forbidden/missing`) is kept by `src.tasks.lending_recording_check` (cron */10). `src.tasks.lending_daily_scoreboard` posts the per-caller/campaign scoreboard to `LENDING_DIAL_TASKS_CHANNEL` at 7pm ET. Delivery retry and missing-disposition alert are crons */5 (`lending_disposition_delivery_retry`, `lending_missing_disposition_alert`). WP-GL-9 text-back: `text_back.py` sends consented, once-per-ET-day texts within 60 s through GoHighLevel (account = `LENDING_GHL_API_KEY` / `LENDING_GHL_LOCATION_ID`, falling back to `GHL_API_KEY` / `GHL_LOCATION_ID` until the Next Deal Lending sub-account exists; number = `LENDING_GHL_SMS_FROM_NUMBER`), gated by `MISSED_CALL_TEXT_ENABLED`; consent feed `POST /webhooks/lending/ghl-text-consent`. Lending-engine SMS go through GoHighLevel only; every other FA SMS (subscribers, alerts) stays on Telnyx via `sms_compliance.send_sms`. Runbook: `docs/lending/text-back-runbook.md`.
+
 ### County Config
 County config is **DB-backed** via `counties` + `county_sources` tables — **not** `config/counties.json`. Read via `src/utils/county_config.py:get_county(county_id)` (5-min cache). `County.nws_zone` supports comma-separated values for multi-zone counties. Hillsborough: `FLZ151,FLZ251`. Pinellas: `FLZ050`.
 
@@ -140,7 +147,7 @@ Single `Dockerfile` at project root. `docker-compose.yml` runs `api` and `lifecy
 - **Fuzzy matching**: rapidfuzz. No fuzzywuzzy.
 - **Agents**: LangGraph 1.x with Postgres checkpointer. LangSmith for tracing. No raw Anthropic SDK loops for agent flows.
 - **Lifecycle event dispatch**: `publish_lifecycle_event(event_dict)` from `src.agents.events.ingestion` — never `dispatch_event()` from API/services/tasks.
-- **SMS**: Telnyx. All sends via `src/services/sms_compliance.send_sms` with explicit `message_type`. **Voice/AI calls**: Synthflow.
+- **SMS**: Lending-engine SMS: GoHighLevel via `src/lending/ghl_sms.py`; all other SMS: Telnyx via `src/services/sms_compliance.send_sms` with explicit `message_type`. **Voice/AI calls**: Synthflow.
 - **Phone numbers**: every read/write of a phone column MUST go through `src/services/phone_utils.normalize`.
 - **Payments**: Stripe SDK ≥11. All webhook handlers in `src/services/stripe_webhooks.py`.
 - **Cache/rate-limit**: Redis (server). Use `fakeredis` in tests/sandbox.
