@@ -19,7 +19,7 @@ from src.lending import dialer_load
 from src.lending.backflip_conflict import BackflipIdentifierIndex, hash_phone
 from src.lending.dialer_load import LoadRefused, run_dialer_load
 from src.lending.models import LendingDialerLoadRecord
-from src.lending.dialer_port import ContactUpsertResult, DialerRequestError
+from src.lending.dialer_port import ContactFieldsNotSet, ContactUpsertResult, DialerRequestError
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("DATABASE_URL"), reason="requires a live Postgres DATABASE_URL"
@@ -31,13 +31,14 @@ EMPTY_INDEX = BackflipIdentifierIndex(block_reason=None)
 
 
 class FakeAircall:
-    def __init__(self, fail_phones=(), missing_ids=()):
+    def __init__(self, fail_phones=(), missing_ids=(), fields_fail_phones=()):
         self.upserts: list[str] = []
         self.campaigns: list = []
         self.updates: list[int] = []
         self._next_id = 1000
         self._fail = set(fail_phones)
         self._missing = set(missing_ids)
+        self._fields_fail = set(fields_fail_phones)
 
     def upsert_contact(self, phone, fields, *, campaign=None, vendor_contact_id=None):
         self.campaigns.append(campaign)
@@ -45,6 +46,8 @@ class FakeAircall:
             raise DialerRequestError("POST /contacts", status=500)
         self.upserts.append(phone)
         self._next_id += 1
+        if phone in self._fields_fail:
+            raise ContactFieldsNotSet(self._next_id, DialerRequestError("PUT", status=500))
         return ContactUpsertResult(contact_id=self._next_id, created=True)
 
     def update_contact(self, contact_id, fields, *, phone=None):
@@ -218,6 +221,21 @@ class TestLiveLoad:
         _fresh_scrub(db, P1)
         report, _ = _run(db, [_record("a", P1), _record("b", "bad-phone")])
         assert P1 not in json.dumps(report.as_dict())
+
+
+class TestPartialLoad:
+    def test_a_contact_left_without_its_fields_is_still_tracked_so_an_opt_out_can_delete_it(self, db):
+        _fresh_scrub(db, P1)
+        report, _ = _run(db, [_record("a", P1)], aircall=FakeAircall(fields_fail_phones={P1}))
+        assert report.loaded == 0 and report.failed[0]["error"] == "ContactFieldsNotSet"
+        rows = _load_rows(db)
+        assert [(r.phone, r.active, r.dialer_contact_id) for r in rows] == [(P1, True, "1001")]
+
+    def test_the_next_run_finishes_that_contact_instead_of_creating_another(self, db):
+        _fresh_scrub(db, P1)
+        _run(db, [_record("a", P1)], aircall=FakeAircall(fields_fail_phones={P1}), run_id="run-1")
+        report, second = _run(db, [_record("a", P1)], run_id="run-2")
+        assert second.upserts == [] and second.updates == ["1001"] and report.updated == 1
 
 
 class TestReload:

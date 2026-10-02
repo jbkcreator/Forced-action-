@@ -4,7 +4,13 @@ from __future__ import annotations
 import pytest
 
 from config.lending_compliance import RemovalReason
-from src.lending.dialer_port import BatchDialerAdapter, InMemoryDialer, UnconfirmedCapability
+from src.lending.dialer_port import (
+    BatchDialerAdapter,
+    ContactFieldsNotSet,
+    DialerRequestError,
+    InMemoryDialer,
+    UnconfirmedCapability,
+)
 from src.lending.dialer_removal import DialerRemovalUndecided
 
 PHONE = "+18135558201"
@@ -119,6 +125,24 @@ def test_loader_upsert_adds_the_contact_into_the_campaign_then_sets_the_card_fie
     assert contact["vendorcontactid"] == "staging:9" and contact["email"] == "j@example.com"
     assert card[:2] == ("PUT", "/contact/55")
     assert card[2]["customfields"]["entity_name"] == "Roe LLC" and card[2]["phonenumbers"] == [{"phonenumber": PHONE_10}]
+
+
+class PutFails(CampaignHttp):
+    def __call__(self, method, path, *, json=None):
+        if method == "PUT":
+            self.calls.append((method, path, json))
+            raise DialerRequestError("PUT /contact/55", status=500)
+        return super().__call__(method, path, json=json)
+
+
+def test_a_failed_field_update_still_hands_back_the_live_contact_id():
+    http = PutFails([{"id": 7, "name": "Builders"}], body={"ids": [55], "success": True})
+    adapter = BatchDialerAdapter(http=http, endpoints=ENDPOINTS, contact_ids=lambda phone: ["55"])
+    with pytest.raises(ContactFieldsNotSet) as caught:
+        adapter.upsert_contact(PHONE, FIELDS, campaign="Builders")
+    assert caught.value.contact_id == 55 and caught.value.status == 500
+    adapter.remove(PHONE, reason=RemovalReason.OPT_OUT.value)   # an opt-out can still delete it
+    assert http.calls[-1][:2] == ("DELETE", "/contact/55")
 
 
 def test_a_failed_campaign_import_is_a_request_error():

@@ -12648,6 +12648,24 @@ class PropertyRadarRecord(Base):
     )
 
 
+class PropertyRadarTracedContact(Base):
+    """Contacts bought by the live Tracerfy trace, one row per staged record.
+
+    Written in the same transaction as the enrichment_usage_logs ledger rows that
+    pay for them, so a later crash cannot leave an address ledgered (and therefore
+    never re-traced) with its paid contacts lost. The handoff reads these back.
+    """
+
+    __tablename__ = "property_radar_traced_contacts"
+
+    radar_id: Mapped[str] = mapped_column(String(50), primary_key=True)
+    phones: Mapped[list] = mapped_column(ARRAY(String), nullable=False, server_default=text("'{}'"))
+    emails: Mapped[list] = mapped_column(ARRAY(String), nullable=False, server_default=text("'{}'"))
+    traced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class LeadCampaignAssignment(Base):
     """Which campaign owns a person — at most one active owner per person.
 

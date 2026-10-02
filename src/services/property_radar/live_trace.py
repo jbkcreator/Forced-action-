@@ -5,6 +5,10 @@ hard ``RunSpendCap`` stops the run before a batch that would exceed it, and each
 paid attempt is written back to ``enrichment_usage_logs`` (the shared ledger).
 Vendor I/O is injected: nothing here spends credits unless the caller passes the
 real submit function.
+
+Each batch's contacts are handed to ``write_contacts`` before its ledger rows go to
+``write_ledger``; the caller commits both together so a paid hit is never ledgered
+(and so never re-traced) without its contacts being stored.
 """
 from __future__ import annotations
 
@@ -13,6 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Optional, Sequence
 
+from src.services.property_radar.staging import normalize_owner
 from src.services.property_radar.trace_contacts import LeadContacts, parse_contacts
 from src.services.skip_trace_ledger import BillingModel, NORMAL, RunSpendCap, should_submit, trace_key
 
@@ -23,6 +28,7 @@ DEFAULT_BATCH_SIZE = 250
 
 Submit = Callable[[list[dict]], list[dict]]
 WriteLedger = Callable[[list[dict]], None]
+WriteContacts = Callable[[dict[str, LeadContacts]], None]
 
 
 @dataclass
@@ -32,10 +38,15 @@ class TraceOutcome:
     skipped_already_traced: int = 0
     skipped_unkeyable: int = 0
     skipped_cap: int = 0
+    skipped_no_result: int = 0
 
 
 def _core(key: str) -> str:
     return key.rsplit("|", 1)[0]
+
+
+def _owner(lead: Any) -> str:
+    return normalize_owner(lead.principal_name or lead.owner_name)
 
 
 def _split_name(name: Optional[str]) -> tuple[str, str]:
@@ -58,6 +69,7 @@ def trace_staged_leads(
     submit: Submit,
     write_ledger: WriteLedger,
     cap: RunSpendCap,
+    write_contacts: WriteContacts = lambda contacts: None,
     batch_size: int = DEFAULT_BATCH_SIZE,
 ) -> TraceOutcome:
     outcome = TraceOutcome()
@@ -82,16 +94,28 @@ def trace_staged_leads(
         rows = [_submit_row(by_key[k][0]) for k in batch_keys]
         results = submit(rows)
         outcome.submitted += len(batch_keys)
+        if not results:
+            # An empty queue is a timeout or an all-miss batch; either way we cannot tell, so
+            # nothing is ledgered (a miss is free to retry) and the run stops.
+            outcome.skipped_no_result += sum(len(by_key[k]) for k in keys[start:])
+            logger.error("[pr-live-trace] Tracerfy returned no rows for %d address(es); not ledgered, "
+                         "run stopped", len(batch_keys))
+            break
         hits = {_core(trace_key(r.get("address"), "")): r for r in results if r.get("address")}
-        entries = []
+        entries, traced = [], {}
         for key in batch_keys:
             row = hits.get(_core(key))
             contacts = _contacts_from_row(row) if row else LeadContacts()
+            # The ledger key is building-level and the row sent names the first lead's owner,
+            # so only leads with that owner get the contacts (other units' owners stay untraced).
+            owner = _owner(by_key[key][0])
             for lead in by_key[key]:
-                if not contacts.is_empty:
-                    outcome.contacts[lead.radar_id] = contacts
+                if not contacts.is_empty and _owner(lead) == owner:
+                    traced[lead.radar_id] = contacts
             entries.append(_ledger_entry(key, not contacts.is_empty))
+        write_contacts(traced)
         write_ledger(entries)
+        outcome.contacts.update(traced)
     return outcome
 
 

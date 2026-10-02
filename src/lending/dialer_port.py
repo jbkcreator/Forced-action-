@@ -66,6 +66,18 @@ class DialerRequestError(RuntimeError):
         self.status = status
 
 
+class ContactFieldsNotSet(DialerRequestError):
+    """The contact was created in the campaign but the follow-up field update failed.
+
+    ``contact_id`` is live in the dialer, so the caller must record it: an opt-out can only
+    delete contacts we have an id for, and a re-run should update it, not create another."""
+
+    def __init__(self, contact_id: Any, cause: Exception) -> None:
+        super().__init__(f"dialer contact {contact_id} created but its fields were not set",
+                         status=getattr(cause, "status", None))
+        self.contact_id = contact_id
+
+
 class Dialer(Protocol):
     def upsert_contact(self, record: Mapping[str, Any]) -> Optional[str]: ...
     def remove(self, phone: str, *, reason: str) -> None: ...
@@ -143,7 +155,10 @@ class BatchDialerAdapter:
         if contact_id is None:
             raise DialerRequestError("dialer returned no contact id")
         if campaign is not None:
-            self.update_contact(contact_id, fields, phone=phone, vendor_contact_id=vendor_contact_id)
+            try:
+                self.update_contact(contact_id, fields, phone=phone, vendor_contact_id=vendor_contact_id)
+            except Exception as exc:
+                raise ContactFieldsNotSet(contact_id, exc) from exc
         return ContactUpsertResult(contact_id=contact_id, created=True)
 
     def update_contact(self, contact_id: Any, fields: DialerContactFields, *, phone: Optional[str] = None,
