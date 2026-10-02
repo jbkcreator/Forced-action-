@@ -60,3 +60,6 @@ ENTITY_TOKENS = frozenset({
     "management", "estate", "bank", "mortgage", "fund", "association", "ministries", "church",
     "services", "solutions", "associates", "investors", "family", "revocable", "living", "the", "of", "and",
 })
+
+# Carrier standard opt-out keywords (a text that is only one of these is a STOP, never consent).
+STOP_KEYWORDS = frozenset({"stop", "stopall", "unsubscribe", "cancel", "end", "quit"})

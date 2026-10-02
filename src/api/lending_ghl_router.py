@@ -5,7 +5,7 @@ suppressed in every lending store and removed from the dialer, the same as a dia
 "do not call". Auth: ``X-Webhook-Secret`` must equal LENDING_GHL_WEBHOOK_SECRET; the
 endpoint is closed while the secret is unset.
 
-Endpoint: POST /webhooks/lending/ghl-opt-out
+Endpoints: POST /webhooks/lending/ghl-opt-out, POST /webhooks/lending/ghl-text-consent
 """
 from __future__ import annotations
 
@@ -17,9 +17,12 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy.orm import Session
 
 from config.lending_compliance import OptOutChannel
+from config.lending_text_back import STOP_KEYWORDS
 from config.settings import get_settings
 from src.api.deps import get_db
 from src.lending.compliance import propagate_opt_out
+from src.lending.consent import record_consent, revoke_consent
+from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
 
@@ -62,3 +65,42 @@ def ghl_opt_out(
         logger.error("[lending-ghl] opt-out webhook failed: %s", type(exc).__name__)
         raise HTTPException(status_code=500, detail="Opt-out could not be recorded") from exc
     return {"recorded": event_id is not None}
+
+
+_TRUTHY = frozenset({"true", "yes", "y", "1", "on", "checked"})
+_CONSENT_SOURCES = frozenset({"web_form", "inbound_text"})
+
+
+def _is_stop(message: str) -> bool:
+    return message.strip().strip(".!").strip().lower() in STOP_KEYWORDS
+
+
+@router.post("/ghl-text-consent")
+def ghl_text_consent(
+    body: dict[str, Any],
+    x_webhook_secret: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """A GHL workflow reports text consent. ``web_form``: the lead form's consent box (only a checked
+    box counts). ``inbound_text``: the contact texted the Next Deal Lending number; a bare STOP
+    keyword revokes instead. Body: source, phone, consent (web_form), message (inbound_text), contact_id."""
+    _verify_secret(x_webhook_secret)
+    source = _field(body, "source")
+    phone = normalize(_field(body, "phone"))
+    if source not in _CONSENT_SOURCES or not phone:
+        raise HTTPException(status_code=422, detail="source (web_form or inbound_text) and a valid phone are required")
+    contact_id = _field(body, "contact_id") or _field(body, "id")
+    try:
+        if source == "inbound_text" and _is_stop(_field(body, "message") or ""):
+            revoke_consent(db, phone)
+            db.commit()
+            return {"recorded": False, "revoked": True}
+        if source == "web_form" and str(_field(body, "consent") or "").strip().lower() not in _TRUTHY:
+            return {"recorded": False, "revoked": False}
+        record_consent(db, phone, source, captured_by=f"ghl:{contact_id}" if contact_id else None)
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.error("[lending-ghl] consent webhook failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=500, detail="Consent could not be recorded") from exc
+    return {"recorded": True, "revoked": False}
