@@ -318,3 +318,11 @@ def test_consent_read_is_a_single_quick_attempt(monkeypatch):
     with pytest.raises(DialerRequestError):
         adapter.get_contact_customfields(9, quick=True)
     assert len(calls) == 1 and calls[0] <= 5
+
+
+def test_abandoned_call_is_logged_as_no_answer_but_never_queued_for_the_missed_call_text(lending_db):
+    d.record_dialer_event(lending_db, _ev("ab1", disposition_raw="Abandoned"))
+    d.record_dialer_event(lending_db, _ev("na1", phone="8135550143", disposition_raw="No Answer"))
+    assert _row(lending_db, "ab1")["disposition"] == "NO_ANSWER"
+    queued = lending_db.execute(text("SELECT dialer_call_id FROM lending.missed_call_events")).scalars().all()
+    assert queued == ["na1"]

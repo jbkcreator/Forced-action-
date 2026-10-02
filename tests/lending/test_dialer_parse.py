@@ -90,3 +90,18 @@ def test_every_result_created_in_batchdialer_maps_to_its_code():
     assert set(BATCHDIALER_RESULT_NAMES.values()) == set(DISPOSITIONS)
     for name, code in BATCHDIALER_RESULT_NAMES.items():
         assert d.normalize_code(name) == (code, True), name
+
+
+def test_abandoned_and_voicemail_map_to_our_codes_without_an_unknown_alert():
+    assert d.normalize_code("Abandoned") == ("NO_ANSWER", True)
+    assert d.normalize_code("Voicemail") == ("LEFT_VOICEMAIL", True)
+
+
+def test_successful_sale_and_unknown_stay_unmapped_so_they_alert():
+    assert d.normalize_code("Successful Sale") == (None, False)
+    assert d.normalize_code("Unknown") == (None, False)
+
+
+def test_only_abandoned_is_flagged_abandoned():
+    assert d.is_abandoned("Abandoned") and d.is_abandoned("ABANDONED")
+    assert not d.is_abandoned("No Answer") and not d.is_abandoned(None)

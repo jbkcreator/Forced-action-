@@ -62,6 +62,7 @@ CDR, and how a contact is held. Confirm them before go-live.
 - **Unknown code:** stored in `disposition_raw`, `disposition` stays empty, one Slack warning.
 - **Built-in dialer results** (No Answer, Busy, Answering Machine, Disconnected Number, Do Not Call, …)
   map to our codes without an alert (`SYSTEM_DISPOSITION_ALIASES`).
+  Client-approved 2026-10-02: Abandoned -> `NO_ANSWER` (an attempt, but never queued in `missed_call_events`: the person picked up and was dropped, so "sorry we missed you" would be wrong) and Voicemail -> `LEFT_VOICEMAIL`. Successful Sale and Unknown stay unmapped on purpose, so they alert.
 
 #### BatchDialer result names (as created)
 
