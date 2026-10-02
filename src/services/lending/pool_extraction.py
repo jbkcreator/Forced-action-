@@ -759,34 +759,24 @@ def _extract_pool3_mortgage_broker(session: Session, county_ids: list[str]) -> l
     - NMLS (MBR-MBRB)" bulk download, loaded into ofr_mortgage_brokers by
     src/tasks/ofr_broker_load.py.  We use the BUSINESS (MBR/MBRB) file — the
     broker firms, which in FL includes solo brokers licensed as their own LLC.
+    The individual Loan Originator (LO) file is intentionally NOT used: those
+    are employees (not brokers), carry no employer link, and have no phone.
 
-    List 4 is "brokers AND LOs" per Josh's own taxonomy — individual Loan
-    Originators are now included too, via _extract_pool3b_loan_originators()
-    (OFR's separate "LO" bulk file, ofr_loan_originators table). Confirmed from
-    real sample data: the LO file is a NATIONWIDE NMLS registry (most records
-    are out-of-state individuals holding a remote FL license), and phone
-    coverage is ~0% even after narrowing to our target counties — virtually
-    every LO record needs skip-trace. Same county-match filter as brokers
-    narrows the out-of-state noise down to locally-based LOs, consistent with
-    the referral-relationship use case (Caller Playbook's broker/LO hook).
-
-    This pool stays fail-closed until each table exists AND holds rows, so an
-    empty/absent load never fabricates brokers or LOs.
+    This pool stays fail-closed until the table exists AND holds rows, so an
+    empty/absent load never fabricates brokers.
 
     Aircall tag: DESK_RESCUE.
     """
-    # Wave 0 target counties, upper-cased to match OFR's COUNTY text column.
-    target_counties = [c.upper() for c in WAVE0_COUNTY_NAMES]
-
-    # Brokers and LOs are independent OFR datasets with independent load status —
-    # one being missing/empty must never silently suppress the other.
     if not _ofr_registry_available(session):
         logger.warning(
             "Pool 3 mortgage_broker: ofr_mortgage_brokers table not present — "
-            "0 broker records (fail-closed). Run migrations/apply_ofr_mortgage_brokers.py "
+            "returning 0 records (fail-closed). Run migrations/apply_ofr_mortgage_brokers.py "
             "+ src.tasks.ofr_broker_load."
         )
-        return _extract_pool3b_loan_originators(session, target_counties)
+        return []
+
+    # Wave 0 target counties, upper-cased to match OFR's COUNTY text column.
+    target_counties = [c.upper() for c in WAVE0_COUNTY_NAMES]
 
     rows = session.execute(
         text("""
@@ -836,114 +826,12 @@ def _extract_pool3_mortgage_broker(session: Session, county_ids: list[str]) -> l
             source_table="ofr_mortgage_brokers",
         ))
 
-    lo_records = _extract_pool3b_loan_originators(session, target_counties)
-    records.extend(lo_records)
-
     logger.info(
-        "Pool 3 mortgage_broker: %d broker businesses + %d LOs in %s, %d with phone",
-        len(records) - len(lo_records), len(lo_records), target_counties,
-        sum(1 for r in records if r.phone_available),
-    )
-    return records
-
-
-def _extract_pool3b_loan_originators(session: Session, target_counties: list[str]) -> list[CallingPoolRecord]:
-    """List 4 (part 2): individual Loan Originators — Josh's 'brokers and LOs' naming.
-
-    Same county-match filter as the broker query (not prim_state): the OFR LO
-    file is a nationwide NMLS registry where 'county' is the individual's own
-    home county, frequently out-of-state (confirmed from real sample data —
-    Michigan, Oregon addresses). Matching on county naturally narrows this down
-    to LOs actually based in our target counties — the population that makes
-    sense for an in-person/local referral relationship, not a nationwide cold-
-    call list.
-
-    Fail-closed until ofr_loan_originators exists AND holds rows, same as
-    the broker table — never fabricates LOs from an absent/empty load.
-    """
-    if not _ofr_lo_registry_available(session):
-        logger.warning(
-            "Pool 3b loan_originator: ofr_loan_originators table not present — "
-            "returning 0 records (fail-closed). Run migrations/apply_ofr_loan_originators.py "
-            "+ src.tasks.ofr_lo_load."
-        )
-        return []
-
-    rows = session.execute(
-        text("""
-            SELECT
-                license_number, nmls_id, last_name, first_name, middle_name,
-                prim_address_1, prim_address_2, prim_city, county, prim_state, prim_zip,
-                normalized_phone
-            FROM ofr_loan_originators
-            WHERE status = 'Approved'
-              AND UPPER(COALESCE(county, '')) = ANY(:counties)
-        """),
-        {"counties": target_counties},
-    ).fetchall()
-
-    records: list[CallingPoolRecord] = []
-    for row in rows:
-        addr_line = " ".join(p for p in [row.prim_address_1, row.prim_address_2] if p)
-        full_name = " ".join(p for p in [row.first_name, row.middle_name, row.last_name] if p)
-        records.append(CallingPoolRecord(
-            run_id="",
-            pool_name="mortgage_broker",
-            county_id=(row.county or "").lower(),
-            county_name=(row.county or "").title(),
-            borrower_name=full_name or None,          # individual — unlike the firm-level broker rows
-            entity_name=None,                         # no firm/employer link in the LO file
-            target_property_address=_compose_address(
-                addr_line, row.prim_city, row.prim_state, row.prim_zip
-            ),
-            estimated_loan_value=None,                # O28 — no basis for LOs
-            recent_permit_details=None,               # O29 — n/a
-            entity_status="NATURAL_PERSON",
-            parcel_id=None,                           # LOs have no property anchor
-            zip=row.prim_zip,
-            state=row.prim_state or WAVE0_STATE,
-            normalized_phone=row.normalized_phone,
-            phone_available=row.normalized_phone is not None,
-            line_type="unknown",                      # OFR does not distinguish mobile/landline
-            email=None,                               # not in OFR — skip-trace optional
-            financing_intent_score=None,
-            intent_tier=None,
-            recommended_product=None,
-            aircall_campaign_tag=AIRCALL_TAG["mortgage_broker"],
-            campaign_list=CAMPAIGN_LIST["mortgage_broker"],  # List 4
-            buyer_entity_id=None,
-            permit_number=None,
-            dbpr_license_number=row.license_number,    # OFR license # (repurposed provenance field)
-            source_property_id=None,
-            source_table="ofr_loan_originators",
-        ))
-
-    logger.info(
-        "Pool 3b loan_originator: %d Approved LOs in %s (%d with phone)",
+        "Pool 3 mortgage_broker: %d Approved brokers in %s (%d with phone)",
         len(records), target_counties,
         sum(1 for r in records if r.phone_available),
     )
     return records
-
-
-def _ofr_lo_registry_available(session: Session) -> bool:
-    """True if ofr_loan_originators exists AND holds at least one row.
-
-    Fail-closed on both a missing table and an empty table, so the LO half of
-    Pool 3 never activates before the OFR LO files have actually been loaded.
-    """
-    exists = session.execute(
-        text("""
-            SELECT 1
-            FROM information_schema.tables
-            WHERE table_schema = 'public'
-              AND table_name = 'ofr_loan_originators'
-            LIMIT 1
-        """)
-    ).first()
-    if not exists:
-        return False
-    return session.execute(text("SELECT 1 FROM ofr_loan_originators LIMIT 1")).first() is not None
 
 
 def _entity_status_from_firm_name(firm_name: Optional[str]) -> Optional[str]:
