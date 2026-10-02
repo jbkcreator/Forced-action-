@@ -147,7 +147,7 @@ Single `Dockerfile` at project root. `docker-compose.yml` runs `api` and `lifecy
 - **Fuzzy matching**: rapidfuzz. No fuzzywuzzy.
 - **Agents**: LangGraph 1.x with Postgres checkpointer. LangSmith for tracing. No raw Anthropic SDK loops for agent flows.
 - **Lifecycle event dispatch**: `publish_lifecycle_event(event_dict)` from `src.agents.events.ingestion` — never `dispatch_event()` from API/services/tasks.
-- **SMS**: Telnyx (lending engine: GoHighLevel). All sends via `src/services/sms_compliance.send_sms` with explicit `message_type`. **Voice/AI calls**: Synthflow.
+- **SMS**: Lending-engine SMS: GoHighLevel via `src/lending/ghl_sms.py`; all other SMS: Telnyx via `src/services/sms_compliance.send_sms` with explicit `message_type`. **Voice/AI calls**: Synthflow.
 - **Phone numbers**: every read/write of a phone column MUST go through `src/services/phone_utils.normalize`.
 - **Payments**: Stripe SDK ≥11. All webhook handlers in `src/services/stripe_webhooks.py`.
 - **Cache/rate-limit**: Redis (server). Use `fakeredis` in tests/sandbox.

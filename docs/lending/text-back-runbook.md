@@ -26,7 +26,7 @@ run them. Everything below the first section is the checklist that remains once 
 | `pending` / `sending` | Queued / claimed by the processor. A claim stuck in `sending` over 5 min (crash) is marked `send_unknown` by the stale sweep: never retried or resent, and it keeps the day's slot |
 | `sent` | GHL accepted the text; `provider_message_id` stored |
 | `dry_run` | Every gate passed but `MISSED_CALL_TEXT_ENABLED=false`; nothing sent |
-| `failed` | Nothing went out: render error, contact-upsert failure, or a 4xx on the send. Frees the day's slot |
+| `failed` | Nothing went out: render error, contact-upsert failure (single attempt), a 4xx on the send, or the 60 s send deadline passing before the send started. Frees the day's slot |
 | `send_unknown` | Cannot prove nothing went out, so it keeps the day's slot and is never resent: crash after the claim (stale sweep), or an ambiguous GHL send (request timed out/errored, a 5xx, or a 2xx with no message id). Check GHL for a duplicate or missing text |
 | `skipped_late` | More than 60 s after the call ended |
 | `skipped_no_consent` | No text consent on file for the phone |
@@ -46,7 +46,9 @@ Interim (the existing Bay Street Capital sub-account, used automatically):
 - `MISSED_CALL_TEXT_ENABLED=false` until section 5(e).
 
 When the client provides the Next Deal Lending sub-account: set **both** `LENDING_GHL_API_KEY` (Private Integration token of that
-sub-account) and `LENDING_GHL_LOCATION_ID`, then restart `fa-api` and `fa-lending-cdr-poller`. Nothing else changes: texts and the
+sub-account) and `LENDING_GHL_LOCATION_ID`, then restart `fa-api`, `fa-lending-cdr-poller` **and** `fa-lending-opt-out-poller`
+(settings are cached per process: the texts are sent by the CDR poller and the DND sync runs in the opt-out poller, so a process left on
+the old account would keep texting or writing DND on it). Nothing else changes: texts and the
 opt-out (DND) leg both follow. Setting only **one** of the two is a misconfiguration: texts and DND fail closed (no account is used)
 with an ERROR log; it does not fall back to the Bay Street account.
 
@@ -85,18 +87,26 @@ Merge-field names below are the intended shape and must be **confirmed in the GH
   the wiring behind the client's request "GHL wired into the #320 opt-out sync" (confirm with the client).
 - **Customer replied (SMS)** -> Webhook `POST .../webhooks/lending/ghl-text-consent`, body
   `{"source": "inbound_text", "contact_id": "{{contact.id}}", "phone": "{{contact.phone}}", "message": "{{message.body}}"}`
-  (confirm the message merge field). GHL's built-in STOP handling still sets DND. Consent rules (fail closed; counsel should confirm the scope):
-  an empty or non-string message records nothing; a message that is a single stop keyword, or contains stop / stopall / unsubscribe /
-  optout / revoke or "opt out", is an opt-out and revokes consent; "cancel", "end" and "quit" count only as the whole message; any
-  other non-empty reply records `inbound_text` consent.
+  (confirm the message merge field). GHL's built-in STOP handling still sets DND for bare keywords (the **Contact DND changed** workflow covers that path).
+  Consent rules (fail closed; **counsel should confirm both phrase lists** in `config/lending_text_back.py` before go-live):
+  - empty or non-string message: nothing recorded.
+  - **Hard opt-out**: the whole message is one of stop / stopall / unsubscribe / cancel / end / quit, or it contains stop, stopall,
+    unsubscribe, optout, revoke or "opt out". The router revokes consent **and makes the opt-out durable itself**: the number goes into
+    `lending.suppression_list`, is removed from the dialer, and the opt-out poller's DND sync writes it to GHL (channel `sms`, so
+    `ghl_dnd_at` stays unset until that write succeeds). A later answered call cannot re-grant consent.
+  - **Soft decline**: cancel / end / quit inside a longer message, or a phrase such as "wrong number", "remove me", "take me off",
+    "no more", "don't text", "do not contact", "leave me alone", "not interested". Consent is revoked and nothing is recorded, but the
+    number is **not** suppressed and **not** removed from the dialer; a later answered call can re-grant consent.
+  - any other non-empty reply records `inbound_text` consent.
 - **Form submitted** (website lead form, WP-GL-11) -> Webhook `POST .../webhooks/lending/ghl-text-consent`, body
   `{"source": "web_form", "contact_id": "{{contact.id}}", "phone": "{{contact.phone}}", "consent": "{{<consent checkbox custom field>}}"}`
   (confirm the custom-field merge name). The checkbox must be unchecked by default; only a checked value records consent.
 
-**The STOP revoke in the consent webhook is not durable.** `revoke_consent` only flips `lending.text_consents`; a later answered
-call or CDR re-grants `inbound_call` / `on_call_yes` consent while the BatchDialer `text_consent` field is still `yes`. The durable STOP
-is GoHighLevel's own DND plus the **Contact DND changed** workflow above, which posts to `/webhooks/lending/ghl-opt-out` and writes
-`lending.suppression_list` (`has_text_consent` checks it). That workflow is a hard go-live prerequisite (section 5).
+**Which opt-outs are durable.** A hard opt-out caught by the consent webhook is made durable by the webhook itself (above). A soft
+decline only flips `lending.text_consents`; a later answered call or CDR can re-grant `inbound_call` / `on_call_yes` while the BatchDialer
+`text_consent` field is still `yes`. Bare keywords that GHL handles itself (its DND) reach us through the **Contact DND changed** workflow,
+which posts to `/webhooks/lending/ghl-opt-out` and writes `lending.suppression_list` (`has_text_consent` checks it). That workflow stays a
+hard go-live prerequisite (section 5). The DND sync only runs while `fa-lending-opt-out-poller` is running.
 
 - **Pipeline stage changed** -> `.../webhooks/lending/ghl-stage` (scoreboard "Showed", PR #326; lives on that branch, not this one,
   until merged).
@@ -109,7 +119,7 @@ b. Set the env vars from section 2. **Hard prerequisite:** create the **Contact 
    not be switched on until this passes.
 c. `python -m src.lending.ghl_sms --send-test <your own phone>` (sends one REAL SMS to the phone you pass). Confirm it arrives from the calling/texting number. The request field
    names follow the public GHL v2 reference and are not yet confirmed live: fix `src/lending/ghl_sms.py` if GHL disagrees.
-d. Restart `fa-lending-cdr-poller` (and `fa-api` if the webhook secret or LENDING_GHL_* changed). With the flag still off, make a test
+d. Restart `fa-lending-cdr-poller` (and `fa-api` and `fa-lending-opt-out-poller` if the webhook secret or LENDING_GHL_* changed). With the flag still off, make a test
    unanswered outbound call to a consented test contact and confirm the event ends `dry_run`.
 e. When the number is A2P Verified, set `MISSED_CALL_TEXT_ENABLED=true` and restart `fa-lending-cdr-poller`.
 f. Run the verification in section 6.
@@ -118,8 +128,22 @@ f. Run the verification in section 6.
 
 **Cutover from the Bay Street account to Next Deal Lending:**
 1. Opt-outs previously mirrored to the Bay Street account's DND are **not replayed** to the new account. Before turning texting on
-   there, run a one-off backfill of every phone in `lending.suppression_list` into the new sub-account's DND.
-2. Set both `LENDING_GHL_API_KEY` and `LENDING_GHL_LOCATION_ID`; restart `fa-api` and `fa-lending-cdr-poller`.
+   there, backfill them. `poll_fa_opt_outs` (inside `fa-lending-opt-out-poller`) writes DND for every `lending.opt_out_events` row with
+   `ghl_dnd_at IS NULL` and a phone hash (50 per 15 s cycle). After step 2 below, run once:
+   ```sql
+   UPDATE lending.opt_out_events SET ghl_dnd_at = NULL WHERE phone_hash IS NOT NULL;
+   ```
+   and let the poller drain it (`SELECT count(*) FROM lending.opt_out_events WHERE ghl_dnd_at IS NULL` must reach 0). This does **not**
+   cover `lending.suppression_list` rows that have no `lending.opt_out_events` row (litigator and other backfilled entries, or numbers
+   suppressed before the sync existed). Those are manual: list them with
+   ```sql
+   SELECT s.phone FROM lending.suppression_list s
+   WHERE s.phone IS NOT NULL AND NOT EXISTS (
+     SELECT 1 FROM lending.opt_out_events e JOIN lending.contacts c ON c.phone_hash = e.phone_hash WHERE c.phone = s.phone);
+   ```
+   and push each through `src.lending.ghl_dnd.set_ghl_dnd(phone)` from a one-off script run by a developer with the new credentials
+   loaded (it returns True when GHL accepted the update).
+2. Set both `LENDING_GHL_API_KEY` and `LENDING_GHL_LOCATION_ID`; restart `fa-api`, `fa-lending-cdr-poller` and `fa-lending-opt-out-poller`.
 3. Re-run `--send-test`.
 4. Re-point the three GHL workflows (opt-out, inbound reply, form submitted) to the new sub-account.
 
@@ -130,7 +154,9 @@ Against a consented test contact:
 - Unanswered outbound call -> exactly one text within 60 s from the calling/texting number.
 - A second unanswered call the same day -> no text (`duplicate_day`).
 - A non-consented number -> no text (`skipped_no_consent`).
-- Reply STOP -> no further text, the contact is DND in GHL and in `lending.suppression_list` (the durable block). Place another answered call to the contact afterwards: still no text.
+- Reply STOP -> no further text, the contact is DND in GHL and in `lending.suppression_list` (the durable block). Then place an
+  answered call to the contact (an answered call never texts, but it would normally re-grant `on_call_yes` consent), followed by an
+  unanswered call: that event must end `blocked` or `skipped_no_consent`, never `sent`, and `has_text_consent` stays false.
 
 ```sql
 SELECT dialer_call_id, status, template_key, decided_at - created_at

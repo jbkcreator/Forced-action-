@@ -21,13 +21,13 @@ sudo systemctl start   fa-api lifecycle cora
 
 ## Lending compliance workers (manual install — not in deploy.sh)
 
-Two lending loops, installed by hand so a merge to `dev` never starts them unannounced:
+Lending loops, installed by hand so a merge to `dev` never starts them unannounced:
 
 - `fa-lending-opt-out-poller` — every 15 s mirrors FA opt-outs (SMS/email) into `lending.suppression_list` and removes the number from the dialer (60 s stop SLA).
-- `fa-lending-missed-call-poller` — SUPERSEDED by WP-GL-9: the text-back runs inside `fa-lending-cdr-poller`. Do not install.
+- `fa-lending-missed-call-poller` — SUPERSEDED by WP-GL-9: the text-back runs inside `fa-lending-cdr-poller`. Do not install; if it was installed, remove it: `sudo systemctl disable --now fa-lending-missed-call-poller`.
 - `fa-lending-dialer-sweep` — every 60 s pulls dialer contacts outside 09:00–19:15 ET / 8–20 local or at 3 attempts per 24 h, and restores them when allowed.
 
-Both hold a Postgres advisory lock, so a second copy only skips cycles. Until `BATCHDIALER_API_KEY` and the endpoints in `config/lending_dialer.py` are set, dialer removals are recorded as pending and complete on a later cycle.
+The opt-out poller (per cycle) and the CDR poller (for its lifetime) hold a Postgres advisory lock, so a second copy only skips cycles or exits; the dialer sweep takes no lock, so run exactly one copy. The opt-out poller also writes the GHL do-not-disturb, so restart it whenever `LENDING_GHL_*` changes. Until `BATCHDIALER_API_KEY` and the endpoints in `config/lending_dialer.py` are set, dialer removals are recorded as pending and complete on a later cycle.
 
 ```bash
 # smoke test one cycle each first
