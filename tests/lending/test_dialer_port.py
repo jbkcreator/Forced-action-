@@ -28,6 +28,7 @@ ENDPOINTS = {
     "campaign_restore": ("POST", "/campaign/add"),
     "dnc_add": None,
     "contact_delete": ("DELETE", "/contact/{id}"),
+    "contact_get": ("GET", "/contact/{id}"),
 }
 
 
@@ -111,7 +112,8 @@ def test_loader_upsert_adds_the_contact_into_the_campaign_then_sets_the_card_fie
     result = BatchDialerAdapter(http=http, endpoints=ENDPOINTS).upsert_contact(
         PHONE, FIELDS, campaign="Builders", vendor_contact_id="staging:9")
     assert result.contact_id == 55 and result.created is True
-    add, card = http.calls[-2], http.calls[-1]
+    add, read, card = http.calls[-3], http.calls[-2], http.calls[-1]
+    assert read[:2] == ("GET", "/contact/55")
     assert add[:2] == ("POST", "/contacts")
     assert add[2]["campaignids"] == [7]
     contact = add[2]["contacts"][0]
@@ -254,6 +256,67 @@ def test_an_unconfirmed_campaign_removal_keeps_the_hold_pending_not_a_dnc_fallba
     assert http.calls == []
 
 
+# ── Contact read + custom-field protection (client Q27: text_consent) ──
+
+
+class ContactHttp:
+    """GET /contact/7 returns stored custom fields; everything else is recorded."""
+
+    def __init__(self, customfields=None, get_error=None):
+        self.calls, self.customfields, self.get_error = [], customfields or {}, get_error
+
+    def __call__(self, method, path, *, json=None, quick=False):
+        self.calls.append((method, path, json))
+        if method == "GET":
+            if self.get_error:
+                raise self.get_error
+            return {"customfields": self.customfields}
+        return {}
+
+
+READ_ENDPOINTS = ENDPOINTS
+
+
+def test_get_contact_customfields_reads_without_a_body():
+    http = ContactHttp({"text_consent": "yes"})
+    assert BatchDialerAdapter(http=http, endpoints=READ_ENDPOINTS).get_contact_customfields(7) == {"text_consent": "yes"}
+    assert http.calls == [("GET", "/contact/7", None)]
+
+
+def test_contact_get_is_a_confirmed_read_endpoint():
+    from config.lending_dialer import BATCHDIALER_ENDPOINTS
+    assert BATCHDIALER_ENDPOINTS["contact_get"] == ("GET", "/contact/{id}")
+
+
+def test_update_keeps_text_consent_and_caller_values_win():
+    http = ContactHttp({"text_consent": "yes", "queue": "Builders"})
+    adapter = BatchDialerAdapter(http=http, endpoints=READ_ENDPOINTS)
+    adapter.update_contact(7, DialerContactFields(information="x"))
+    assert http.calls[-1][2]["customfields"]["text_consent"] == "yes"
+    adapter.update_contact(7, DialerContactFields(information="x", customfields={"queue": "Nurture"}))
+    sent = http.calls[-1][2]["customfields"]
+    assert sent["queue"] == "Nurture" and sent["text_consent"] == "yes"
+
+
+def test_update_raises_instead_of_wiping_when_the_read_fails():
+    http = ContactHttp(get_error=DialerRequestError("down"))
+    with pytest.raises(DialerRequestError):
+        BatchDialerAdapter(http=http, endpoints=READ_ENDPOINTS).update_contact(7, DialerContactFields())
+    assert all(c[0] == "GET" for c in http.calls)
+
+
+def test_in_memory_dialer_returns_empty_customfields():
+    assert InMemoryDialer().get_contact_customfields(7) == {}
+
+
+def test_update_with_unconfigured_endpoint_raises_without_reading():
+    http = ContactHttp()
+    adapter = BatchDialerAdapter(http=http, endpoints={**ENDPOINTS, "contact_update": None})
+    with pytest.raises(UnconfirmedCapability):
+        adapter.update_contact(7, DialerContactFields())
+    assert http.calls == []
+
+
 def test_an_opt_out_for_a_contact_already_deleted_still_completes():
     from src.lending.dialer_port import DialerRequestError
 
@@ -268,7 +331,7 @@ def test_the_property_address_fills_the_standard_fields_the_agent_script_can_sho
     fields = replace(FIELDS, address="123 Main St", city="Tampa", state="FL", postal_code="33602")
     http = CampaignHttp([{"id": 7, "name": "Builders"}], body={"ids": [55], "success": True})
     BatchDialerAdapter(http=http, endpoints=ENDPOINTS).upsert_contact(PHONE, fields, campaign="Builders")
-    add, card = http.calls[-2], http.calls[-1]
+    add, _read, card = http.calls[-3], http.calls[-2], http.calls[-1]  # the card update reads the contact first (keeps text_consent)
     imported = add[2]["contacts"][0]
     assert (imported["addressline1"], imported["city"], imported["state"], imported["postalcode"]) == (
         "123 Main St", "Tampa", "FL", "33602")
@@ -279,7 +342,7 @@ def test_the_property_address_fills_the_standard_fields_the_agent_script_can_sho
 def test_phones_are_sent_as_ten_digits_because_batchdialer_rejects_e164_on_update():
     http = CampaignHttp([{"id": 7, "name": "Builders"}], body={"ids": [55], "success": True})
     BatchDialerAdapter(http=http, endpoints=ENDPOINTS).upsert_contact("+18135558201", FIELDS, campaign="Builders")
-    add, card = http.calls[-2], http.calls[-1]
+    add, _read, card = http.calls[-3], http.calls[-2], http.calls[-1]  # the card update reads the contact first (keeps text_consent)
     assert add[2]["contacts"][0]["phonenumber1"] == "8135558201"
     assert card[2]["phonenumbers"] == [{"phonenumber": "8135558201"}]
 
