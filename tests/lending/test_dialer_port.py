@@ -391,3 +391,50 @@ def test_the_card_update_keeps_our_vendor_contact_id():
     BatchDialerAdapter(http=http, endpoints=ENDPOINTS).upsert_contact(
         PHONE, FIELDS, campaign="Builders", vendor_contact_id="staging:9")
     assert http.calls[-1][2]["vendorcontactid"] == "staging:9"
+
+
+def test_an_opt_out_stays_pending_while_an_earlier_create_for_the_phone_is_unconfirmed():
+    from src.lending.dialer_port import UnreconciledContact
+
+    http = FakeHttp()
+    adapter = BatchDialerAdapter(http=http, endpoints=ENDPOINTS, contact_ids=lambda phone: ["77"],
+                                 has_unconfirmed_create=lambda phone: True)
+    with pytest.raises(UnreconciledContact):
+        adapter.remove(PHONE, reason=RemovalReason.OPT_OUT.value)
+    assert [(c[0], c[1]) for c in http.calls] == [("DELETE", "/contact/77")]  # known contacts still deleted
+
+
+def test_an_opt_out_completes_when_no_create_is_unconfirmed():
+    BatchDialerAdapter(http=FakeHttp(), endpoints=ENDPOINTS, contact_ids=lambda phone: [],
+                       has_unconfirmed_create=lambda phone: False).remove(
+        PHONE, reason=RemovalReason.OPT_OUT.value)
+
+
+class FailingAdd(CampaignHttp):
+    def __init__(self, *args, error, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._error = error
+
+    def __call__(self, method, path, *, json=None):
+        if (method, path) == ("POST", "/contacts"):
+            raise self._error
+        return super().__call__(method, path, json=json)
+
+
+@pytest.mark.parametrize("error,maybe_created", [
+    (DialerRequestError("POST /contacts", status=500), True),
+    (DialerRequestError("POST /contacts"), True),                 # timeout / network error
+    (DialerRequestError("POST /contacts", status=422), False),    # rejected: nothing was created
+])
+def test_only_an_ambiguous_create_failure_is_marked_maybe_created(error, maybe_created):
+    http = FailingAdd([{"id": 7, "name": "Builders"}], error=error)
+    with pytest.raises(DialerRequestError) as caught:
+        BatchDialerAdapter(http=http, endpoints=ENDPOINTS).upsert_contact(PHONE, FIELDS, campaign="Builders")
+    assert caught.value.maybe_created is maybe_created
+
+
+def test_a_failure_before_the_create_is_never_marked_maybe_created():
+    with pytest.raises(DialerRequestError) as caught:  # campaign missing: nothing was sent
+        BatchDialerAdapter(http=CampaignHttp([]), endpoints=ENDPOINTS).upsert_contact(
+            PHONE, FIELDS, campaign="Builders")
+    assert caught.value.maybe_created is False
