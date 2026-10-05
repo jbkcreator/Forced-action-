@@ -89,7 +89,21 @@ class TestBuildPoolRow:
         assert row["entity_name"] == "ACME LLC"
         assert row["estimated_loan_value"] == Decimal(300000)
         assert row["source_property_id"] == 42
-        assert row["source_tag"] == "private_maturity"
+        assert row["source_tag"] == "list_8"  # private_maturity -> list_8 (Verified maturity queue)
+
+    def test_campaign_maps_to_brief_source_list(self):
+        for campaign, tag in [("private_maturity", "list_8"),
+                              ("stalled_flip", "list_9"), ("auction_winner", "list_6")]:
+            row = build_pool_row(self._record(campaign=campaign), run_id="r", phone="+14045550100", email=None)
+            assert row["source_tag"] == tag
+
+    def test_maturity_target_lender_splits_by_state(self):
+        ga = build_pool_row(self._record(campaign="maturity_target_lender", state="GA"),
+                            run_id="r", phone="+14045550100", email=None)
+        fl = build_pool_row(self._record(campaign="maturity_target_lender", state="FL"),
+                            run_id="r", phone="+18135550100", email=None)
+        assert ga["source_tag"] == "list_5"  # GA maturity
+        assert fl["source_tag"] == "list_1"  # FL maturity
 
     def test_ga_natural_person_status_is_set_so_gate_can_block(self):
         row = build_pool_row(

@@ -39,6 +39,26 @@ SOURCE_TABLE = "property_radar_records"
 # PropertyRadar maturity leads are the "Verified maturity" dialer queue (Go Live Brief 2.5).
 CAMPAIGN_TAG = POOL_CAMPAIGN_TAGS["verified_maturity"]
 
+# PropertyRadar campaign -> Go Live Brief source list (list_1..list_9). The dialer's
+# queue assignment (src/lending/queues.py:assign_queue) keys off these list tags, not
+# the raw campaign name, so an unmapped campaign would be dropped before load.
+#   list_1 = FL maturity, list_5 = GA maturity, list_8 = private-money maturity
+#     -> Verified maturity (rank 1)
+#   list_9 = stalled flips, list_6 = auction winners -> Transaction ready (rank 2)
+# maturity_target_lender carries both FL and GA records, so it splits by state
+# (list_1 FL / list_5 GA); List 5 is the Georgia maturity list, not a catch-all.
+CAMPAIGN_SOURCE_TAG = {
+    "private_maturity": "list_8",
+    "stalled_flip": "list_9",
+    "auction_winner": "list_6",
+}
+
+
+def _source_tag(campaign: Optional[str], state: Optional[str]) -> Optional[str]:
+    if campaign == "maturity_target_lender":
+        return "list_5" if (state or "").strip().upper() == "GA" else "list_1"
+    return CAMPAIGN_SOURCE_TAG.get(campaign, campaign)
+
 # entity_status values the staging CHECK accepts. GA-allowed business types are
 # LLC / CORPORATION (config.lending_compliance.GEORGIA_ALLOWED_ENTITY_TYPES minus
 # LP, which the staging CHECK does not permit); TRUST and NATURAL_PERSON are kept
@@ -139,7 +159,7 @@ def build_pool_row(
         "dbpr_license_number": None,
         "source_property_id": record.get("property_id"),
         "source_table": SOURCE_TABLE,
-        "source_tag": record.get("campaign"),
+        "source_tag": _source_tag(record.get("campaign"), record.get("state")),
         "homestead_exempt": None,
     }
 
