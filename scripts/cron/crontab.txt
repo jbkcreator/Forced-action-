@@ -1180,6 +1180,14 @@ COUNTY_ID=hillsborough
 # records live through Tracerfy (ledger-gated, SKIP_TRACE_MAX_RUN_COST_CENTS cap); no CSV step.
 # 30 2 * * * $PROJECT/scripts/cron/run.sh src.tasks.property_radar_runner --apply --mode daily --state FL
 
+# PropertyRadar -> calling pool bridge: stage property_radar_records (+ traced phones joined
+# by address+zip) as the pr_maturity pool the dialer reads. Runs after the 02:00 pull and any
+# trace, before the Monday dialer scrub/load. No credit spend (reads existing traces only);
+# phone-less rows are staged too so a later trace joins without a re-extract.
+# DISABLED until Josh turns PropertyRadar on — enable alongside the pull/runner above.
+# Dry check first: PYTHONPATH=. python -m src.tasks.lending_pr_maturity_bridge
+# 0 3 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_pr_maturity_bridge --apply
+
 # Lending weekly DNC / litigator re-scrub of numbers loaded in the dialer (Go Live G10).
 # Mondays 06:00 UTC (02:00 ET), before the 09:00 ET calling window. Spends Tracerfy
 # credits (1 per number) up to a hard --max-credits cap; exit 4 = cap reached.
