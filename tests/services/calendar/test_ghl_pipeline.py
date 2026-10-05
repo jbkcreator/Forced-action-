@@ -110,6 +110,26 @@ class TestPushToStage:
         assert last_call.args[0] == "PUT"
         assert "existing_opp" in last_call.args[1]
 
+    def test_opportunity_search_is_scoped_to_our_pipeline(self):
+        """A contact with an opportunity in some OTHER GHL pipeline must
+        never have that opportunity's stage silently repointed into Booked
+        Calls — the search has to filter by pipeline_id, not just contact_id."""
+        contact_resp = _response(json_body={"contact": {"id": "contact_1"}})
+        search_resp = _response(json_body={"opportunities": []})
+        create_opp_resp = _response(status_code=201, json_body={"opportunity": {"id": "opp_1"}})
+
+        with (
+            patch("config.settings.get_settings", return_value=_configured_settings()),
+            patch("requests.request", side_effect=[contact_resp, search_resp, create_opp_resp]) as mock_req,
+        ):
+            ghl_pipeline.push_to_stage(
+                phone="+18135551234", email=None, first_name="Maria",
+                stage_id=BOOKED_STAGE, opportunity_name="test",
+            )
+
+        search_call = mock_req.call_args_list[1]
+        assert search_call.kwargs["params"]["pipeline_id"] == PIPELINE_ID
+
     def test_contact_upsert_failure_does_not_raise(self):
         with (
             patch("config.settings.get_settings", return_value=_configured_settings()),

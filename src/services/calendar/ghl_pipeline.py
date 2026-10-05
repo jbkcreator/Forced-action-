@@ -127,10 +127,20 @@ def _upsert_contact(*, phone: Optional[str], email: Optional[str], first_name: O
 
 
 def _find_opportunity_for_contact(contact_id: str) -> Optional[str]:
+    """The contact's existing opportunity in OUR pipeline, or None.
+
+    Scoped to lending_ghl_pipeline_id — without this filter a contact who
+    also has an opportunity in some other GHL pipeline would have that
+    unrelated opportunity's stage silently repointed into Booked Calls.
+    """
     try:
         resp = _request(
             "GET", "/opportunities/search",
-            params={"location_id": _settings().lending_ghl_location_id, "contact_id": contact_id},
+            params={
+                "location_id": _settings().lending_ghl_location_id,
+                "contact_id": contact_id,
+                "pipeline_id": _settings().lending_ghl_pipeline_id,
+            },
         )
         if not resp.ok:
             return None
