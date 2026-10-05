@@ -903,11 +903,13 @@ def propagate_opt_out(
 
 
 def poll_fa_opt_outs(db, *, dialer_remover: Optional[DialerRemover] = None,
-                     ghl_dnd: Optional[Callable[[str], bool]] = None) -> PollResult:
+                     ghl_dnd: Optional[Callable[[str], bool]] = None, sync_ghl: bool = True) -> PollResult:
     """Mirror each FA opt-out row exactly once (keyed on its FA row id, so a raw or
     padded FA value can never loop), and retry pending dialer removals.
 
-    One cycle at a time across processes (transaction-scoped advisory lock).
+    One cycle at a time across processes (transaction-scoped advisory lock). The GHL
+    do-not-disturb sync runs here by default; the poller passes ``sync_ghl=False`` and
+    runs ``sync_ghl_dnd`` in its own transaction so slow GHL calls never hold this one.
     Does not commit."""
     if not db.execute(text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": POLL_LOCK_KEY}).scalar():
         return PollResult(new_opt_outs=0, dialer_retried=0, skipped_locked=True)
@@ -940,13 +942,14 @@ def poll_fa_opt_outs(db, *, dialer_remover: Optional[DialerRemover] = None,
         _propagate(db, opt_outs, dialer_remover)
 
     retried = _retry_pending_dialer_removals(db, dialer_remover)
-    _sync_ghl_dnd(db, ghl_dnd)
+    if sync_ghl:
+        sync_ghl_dnd(db, ghl_dnd)
     if opt_outs or retried:
         logger.info("[lending-compliance] poll new_opt_outs=%d dialer_retried=%d", len(opt_outs), retried)
     return PollResult(new_opt_outs=len(opt_outs), dialer_retried=retried)
 
 
-def _sync_ghl_dnd(db, ghl_dnd: Optional[Callable[[str], bool]]) -> int:
+def sync_ghl_dnd(db, ghl_dnd: Optional[Callable[[str], bool]]) -> int:
     """Write every opt-out not yet in GHL as do-not-disturb (new ones and retries alike),
     a bounded batch per poll. Returns how many GHL accepted."""
     if ghl_dnd is None:

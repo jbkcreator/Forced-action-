@@ -14,7 +14,7 @@ import time
 
 from config.lending_compliance import OPT_OUT_POLL_SECONDS
 from src.core.database import get_db_context
-from src.lending.compliance import PollResult, poll_fa_opt_outs
+from src.lending.compliance import PollResult, poll_fa_opt_outs, sync_ghl_dnd
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -22,7 +22,17 @@ logger = get_logger(__name__)
 
 def run_once() -> PollResult:
     with get_db_context() as db:  # session_scope commits on exit
-        return poll_fa_opt_outs(db)
+        result = poll_fa_opt_outs(db, sync_ghl=False)
+    if not result.skipped_locked:
+        # Own transaction: up to a batch of sequential GHL calls must not hold the poll's
+        # advisory lock, or delay (or, on error, roll back) the opt-outs mirrored above.
+        try:
+            with get_db_context() as db:
+                sync_ghl_dnd(db)
+        except Exception as exc:
+            logger.error("[lending-opt-out-poller] GHL DND sync failed (%s); retrying next interval",
+                         type(exc).__name__)
+    return result
 
 
 def main(argv: list[str] | None = None) -> None:
