@@ -1184,6 +1184,9 @@ COUNTY_ID=hillsborough
 # calls whose first delivery failed or whose result was changed by the caller.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_disposition_delivery_retry
 
+# Lending website lead form (WP-GL-11) — retry delivery of leads not yet in GoHighLevel.
+*/5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_web_lead_sweep
+
 # Lending: warn once per call when a connected call has no disposition after N minutes.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_missing_disposition_alert
 

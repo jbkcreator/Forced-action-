@@ -878,6 +878,13 @@ class AppSettings(BaseSettings):
 	# there is no fallback to GHL_API_KEY / GHL_LOCATION_ID (a different account).
 	lending_ghl_api_key: Optional[SecretStr] = Field(default=None, env="LENDING_GHL_API_KEY")
 	lending_ghl_location_id: Optional[str] = Field(default=None, env="LENDING_GHL_LOCATION_ID")
+	# WP-GL-11 website lead form. The "Booked Calls" pipeline id and a stage for new web inquiries. With
+	# either unset the lead is saved to the contact only (no pipeline card): the pipeline has no
+	# new-lead stage until Josh decides one. Optional GHL custom field ids for the ticked consent values.
+	lending_ghl_pipeline_id: Optional[str] = Field(default=None, env="LENDING_GHL_PIPELINE_ID")
+	lending_ghl_stage_new_lead: Optional[str] = Field(default=None, env="LENDING_GHL_STAGE_NEW_LEAD")
+	lending_ghl_cf_sms_consent: Optional[str] = Field(default=None, env="LENDING_GHL_CF_SMS_CONSENT")
+	lending_ghl_cf_deal_drop_optin: Optional[str] = Field(default=None, env="LENDING_GHL_CF_DEAL_DROP_OPTIN")
 	aircall_webhook_token: Optional[SecretStr] = Field(default=None, env="AIRCALL_WEBHOOK_TOKEN")
 
 	# ── Lending engine: call disposition logging ──
