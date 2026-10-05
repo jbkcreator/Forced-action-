@@ -60,11 +60,6 @@ def _write_usage_ledger(session, entries: list[dict]) -> None:
              ":property_id, :target_address, :request_ref, :created_at)"),
         entries,
     )
-    # A real Tracerfy charge already happened for this batch (it is billed on submit,
-    # not on this write) — committing per batch, not at the end of the whole run,
-    # means a later batch's failure can never lose an earlier batch's paid-for ledger
-    # row or its persisted contacts (finding #8).
-    session.commit()
 
 
 def _read_trace_contacts(session, keys: list[str]) -> dict[str, LeadContacts]:
@@ -91,13 +86,15 @@ def _write_trace_contacts(session, contacts_by_key: dict[str, LeadContacts]) -> 
             for key, c in contacts_by_key.items()
         ],
     )
-    session.commit()
 
 
 def _live_trace(session, campaign: str, *, thin_path_only: bool) -> dict[str, LeadContacts]:
     settings = get_settings()
     if not settings.property_radar_enabled:
         raise RuntimeError("--live-trace needs PROPERTY_RADAR_ENABLED=true")
+    if session.execute(text("SELECT to_regclass('property_radar_trace_contacts')")).scalar() is None:
+        raise RuntimeError("property_radar_trace_contacts is missing: run "
+                           "migrations/apply_property_radar_trace_contacts.py before --live-trace")
     all_leads = [lead for page in iter_staged_leads(session, campaign=campaign) for lead in page]
     facts = SqlHandoffStore(session).screening_facts(all_leads, {})
     if not facts.backflip_feed_fresh:
@@ -120,6 +117,8 @@ def _live_trace(session, campaign: str, *, thin_path_only: bool) -> dict[str, Le
         cap=RunSpendCap(settings.skip_trace_max_run_cost_cents),
         read_contacts=lambda ks: _read_trace_contacts(session, ks),
         write_contacts=lambda cs: _write_trace_contacts(session, cs),
+        commit=session.commit,
+        rollback=session.rollback,
     )
     logger.info("PropertyRadar live trace: submitted=%d already_traced=%d unkeyable=%d capped=%d aborted=%s",
                 outcome.submitted, outcome.skipped_already_traced, outcome.skipped_unkeyable, outcome.skipped_cap,

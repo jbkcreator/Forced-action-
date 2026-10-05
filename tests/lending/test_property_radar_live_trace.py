@@ -148,3 +148,61 @@ def test_an_already_traced_key_reads_its_persisted_contact_back():
     )
     assert vendor.submitted == []                       # still never re-billed
     assert outcome.contacts["R1"].emails == ("jane@example.com",)
+
+
+class Tx:
+    """Records the order of ledger/contact writes and commits/rollbacks."""
+
+    def __init__(self, fail_contacts=False, fail_ledger_times=0):
+        self.events, self.fail_contacts, self.fail_ledger_times = [], fail_contacts, fail_ledger_times
+
+    def write_ledger(self, entries):
+        if self.fail_ledger_times:
+            self.fail_ledger_times -= 1
+            raise RuntimeError("db down")
+        self.events.append(("ledger", len(entries)))
+
+    def write_contacts(self, contacts):
+        if self.fail_contacts:
+            raise RuntimeError("deadlock detected")
+        self.events.append(("contacts", len(contacts)))
+
+    def commit(self):
+        self.events.append(("commit",))
+
+    def rollback(self):
+        self.events.append(("rollback",))
+
+
+def _persisting_run(tx):
+    return trace_staged_leads(
+        [lead("R1", "100 Main St")], ledger={}, submit=Vendor([HIT]), write_ledger=tx.write_ledger,
+        write_contacts=tx.write_contacts, commit=tx.commit, rollback=tx.rollback, cap=RunSpendCap(None),
+    )
+
+
+def test_a_billed_batchs_ledger_and_contacts_commit_together_once():
+    tx = Tx()
+    _persisting_run(tx)
+    assert tx.events == [("ledger", 1), ("contacts", 1), ("commit",)]
+
+
+def test_a_contacts_write_failure_keeps_the_paid_contacts_and_still_ledgers_the_batch():
+    """Finding 5: the contacts write fails after the ledger write. The paid hits must still
+    be returned, and the ledger rows must still be saved so the batch is never re-billed."""
+    tx = Tx(fail_contacts=True)
+    outcome = _persisting_run(tx)
+    assert outcome.contacts["R1"].phones == ("+18135550111",)
+    assert outcome.aborted is False
+    assert tx.events == [("ledger", 1), ("rollback",), ("ledger", 1), ("commit",)]
+
+
+def test_the_run_stops_spending_when_even_the_ledger_cannot_be_saved():
+    tx = Tx(fail_contacts=True, fail_ledger_times=2)
+    leads = [lead("R1", "100 Main St"), lead("R2", "200 Oak St", name="Other")]
+    vendor = Vendor([HIT])
+    outcome = trace_staged_leads(leads, ledger={}, submit=vendor, write_ledger=tx.write_ledger,
+                                 write_contacts=tx.write_contacts, commit=tx.commit, rollback=tx.rollback,
+                                 cap=RunSpendCap(None), batch_size=1)
+    assert outcome.aborted is True and vendor.submitted == [["100 Main St"]]    # second batch never billed
+    assert outcome.contacts["R1"].emails == ("jane@example.com",)               # first batch's hit kept
