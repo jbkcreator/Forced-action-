@@ -28,7 +28,7 @@ from sqlalchemy.orm import Session
 
 from src.api.deps import get_db
 from src.api.lending_ghl_router import _verify_secret
-from src.lending.booking_messages import cancel_by_provider_event, handle_booking_confirmed, handle_booking_gate_failed
+from src.lending.booking_messages import cancel_by_provider_event, handle_booking_confirmed, handle_booking_gate_failed, handle_nurture_entry
 from src.lending.confirmation_tasks import complete_confirmation_task
 
 logger = logging.getLogger(__name__)
@@ -172,6 +172,34 @@ def confirmation_task_complete(
     completed = complete_confirmation_task(db, booking_ref)
     db.commit()
     return {"status": "completed" if completed else "no_open_task"}
+
+
+@router.post("/ghl-nurture")
+def ghl_nurture(
+    body: dict[str, Any],
+    x_webhook_secret: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """A GHL workflow ("Pipeline Stage Changed" -> Webhook) reports a contact entering a stage. Entering Nurture
+    before an AI-booked call means the caller's check did not pass: cancel the reminders and send the contact the
+    approved message. This is the trigger for the failed check, so it needs no state from WP-GL-5. Any other stage
+    is ignored. Add it as a second webhook action on the same workflow that feeds ``/ghl-stage``.
+    UNVERIFIED: the field names follow the ``/ghl-stage`` body (stage_name, phone) and GHL's public reference."""
+    _verify_secret(x_webhook_secret)
+    stage = (_first(body, ("stage_name",), ("stageName",), ("pipelineStageName",)) or "").strip().lower()
+    if stage != "nurture":
+        return {"status": "noop", "reason": "stage_not_handled"}
+    phone = _first(body, ("phone",), ("contact", "phone"))
+    if not phone:
+        return {"status": "noop", "reason": "no_phone"}
+    try:
+        outcome = handle_nurture_entry(db, phone)
+        db.commit()
+    except Exception as exc:  # class only: the payload carries a phone number
+        logger.error("[booking-webhook] nurture handling failed (%s)", type(exc).__name__)
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Could not process the stage change") from None
+    return {"status": outcome}
 
 
 @router.post("/booking-gate-failed")

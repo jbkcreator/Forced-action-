@@ -261,6 +261,29 @@ def handle_booking_gate_failed(db, booking_ref: str, *, now: Optional[datetime] 
     return "queued" if queued else "duplicate"
 
 
+_AI_BOOKING_BY_PHONE = text("""
+    SELECT booking_ref FROM lending.booking_messages
+     WHERE contact_phone = :phone AND kind = 'confirmation' AND (booked_by IS NULL OR booked_by = 'ai')
+       AND slot_start_utc > :now
+     ORDER BY slot_start_utc LIMIT 1
+""")
+
+
+def handle_nurture_entry(db, phone: str, *, now: Optional[datetime] = None) -> str:
+    """A contact entered the GHL Nurture stage. If an AI-booked call for them is still ahead, the caller's check
+    did not pass (Josh: a failed check moves the contact to nurture), so run the failed-check handling for that
+    booking. Returns the handling outcome, or "no_ai_booking" when there is nothing to do. A call that already
+    happened, or one a caller booked, is never touched. Does not commit."""
+    now = now or datetime.now(timezone.utc)
+    norm = normalize_phone(phone or "")
+    if not norm:
+        return "no_ai_booking"
+    ref = db.execute(_AI_BOOKING_BY_PHONE, {"phone": norm, "now": now}).scalar()
+    if ref is None:
+        return "no_ai_booking"
+    return handle_booking_gate_failed(db, ref, now=now)
+
+
 def cancel_by_booking_ref(db, booking_ref: str, reason: str) -> int:
     n = db.execute(_CANCEL_BY_REF, {"ref": booking_ref, "reason": reason}).rowcount
     db.execute(_CANCEL_TASK_BY_REF, {"ref": booking_ref})

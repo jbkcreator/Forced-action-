@@ -39,6 +39,11 @@ QUOTED_NUMBER_PATTERNS = (
 )
 
 SNIPPET_CHARS = 300
+
+# Josh answers rate / terms questions and reschedules Monday to Friday, 9:00 AM to 7:15 PM ET (Oct 4 email).
+REPLY_HOURS_START = (9, 0)
+REPLY_HOURS_END = (19, 15)
+REPLY_WEEKDAYS = (0, 1, 2, 3, 4)
 KIND_RATE_TERMS = "rate_terms_handoff"
 KIND_RESCHEDULE = "reschedule_request"
 KIND_AI_HANDOFF = "ai_handoff"

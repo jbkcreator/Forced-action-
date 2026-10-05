@@ -17,7 +17,9 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Optional
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
 
@@ -29,6 +31,9 @@ from config.lending_reply_agent import (
     QUOTED_NUMBER_PATTERNS,
     RATE_TERMS_PHRASES,
     RATE_TERMS_WORDS,
+    REPLY_HOURS_END,
+    REPLY_HOURS_START,
+    REPLY_WEEKDAYS,
     RESCHEDULE_PHRASES,
     SNIPPET_CHARS,
 )
@@ -37,6 +42,8 @@ from src.lending.compliance import phone_hash
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
+
+TIMEZONE_NAME = "America/New_York"
 
 SlackPoster = Callable[[str], None]
 
@@ -121,12 +128,18 @@ def classify(event: ReplyEvent) -> Optional[str]:
     return KIND_AI_HANDOFF if event.handoff else None
 
 
+def in_reply_hours(moment: datetime) -> bool:
+    """True inside Josh's answering hours (Mon-Fri 9:00 AM - 7:15 PM ET)."""
+    local = moment.astimezone(ZoneInfo(TIMEZONE_NAME))
+    return local.weekday() in REPLY_WEEKDAYS and REPLY_HOURS_START <= (local.hour, local.minute) < REPLY_HOURS_END
+
+
 def _slack_safe(value: str) -> str:
     """Slack treats <!channel>, <!here> and <url|label> as live markup unless & < > are escaped."""
     return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def format_slack(kind: str, event: ReplyEvent) -> str:
+def format_slack(kind: str, event: ReplyEvent, *, now: Optional[datetime] = None) -> str:
     who = _slack_safe(event.first_name or "Unknown contact")
     tail = f" (…{event.phone[-4:]})" if event.phone else ""
     snippet = _slack_safe(event.body[:SNIPPET_CHARS]) + ("…" if len(event.body) > SNIPPET_CHARS else "")
@@ -139,7 +152,10 @@ def format_slack(kind: str, event: ReplyEvent) -> str:
         head = "*The reply agent handed this conversation to Josh*"
     else:
         head = "*ALERT: the reply agent's message contains a number it must not quote*"
-    return f"{head}\nFrom: {who}{tail}\n> {snippet}{ref}"
+    after_hours = ""
+    if kind in (KIND_RATE_TERMS, KIND_RESCHEDULE) and not in_reply_hours(now or datetime.now(timezone.utc)):
+        after_hours = "\n_Received outside 9:00 AM - 7:15 PM ET, Mon-Fri: answer first thing next business morning._"
+    return f"{head}\nFrom: {who}{tail}\n> {snippet}{ref}{after_hours}"
 
 
 _CLAIM = text("""
