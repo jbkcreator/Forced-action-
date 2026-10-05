@@ -12765,6 +12765,23 @@ class LendingCallingPoolStaging(Base):
     )
 
 
+class LendingListCatalog(Base):
+    """Human-readable reference for Josh's List 1-9 taxonomy — see
+    config/lending_list_catalog.py (single source of truth) and
+    migrations/apply_lending_list_catalog.py. Documentation only: nothing
+    reads this table to decide a gate; pool_extraction.py's source_tag_for()
+    is still the only place a list_key is assigned.
+    """
+    __tablename__ = "list_catalog"
+
+    list_key: Mapped[str] = mapped_column(String(10), primary_key=True)
+    display_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    pool_name: Mapped[Optional[str]] = mapped_column(String(50))  # NULL: no extractor yet (F1 gap)
+    queue: Mapped[str] = mapped_column(String(50), nullable=False)
+
+    __table_args__ = ({"schema": "lending"},)
+
+
 class OfrMortgageBroker(Base):
     """WP-W0-1 Pool 3 source: Florida OFR Ch 494 mortgage-broker business licenses.
 
