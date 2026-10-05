@@ -1,0 +1,24 @@
+[Unit]
+Description=Forced Action — Lending FA opt-out poller (15 s, mirrors FA opt-outs into lending, 60 s SLA)
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/Forced-action-
+Environment="PATH=/root/Forced-action-/.venv/bin"
+Environment="PYTHONPATH=/root/Forced-action-"
+EnvironmentFile=/root/Forced-action-/.env
+ExecStart=/root/Forced-action-/.venv/bin/python -m src.lending.opt_out_poller
+Restart=always
+RestartSec=15
+StartLimitIntervalSec=120
+StartLimitBurst=5
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fa-lending-opt-out-poller
+
+[Install]
+WantedBy=multi-user.target
