@@ -1188,6 +1188,20 @@ COUNTY_ID=hillsborough
 # Dry check first: PYTHONPATH=. python -m src.tasks.lending_pr_maturity_bridge
 # 0 3 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_pr_maturity_bridge --apply
 
+# Lending call dispositions — retry Google Sheet / Slack #dial-tasks delivery for
+# calls whose first delivery failed or whose result was changed by the caller.
+*/5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_disposition_delivery_retry
+
+# Lending: warn once per call when a connected call has no disposition after N minutes.
+*/5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_missing_disposition_alert
+
+# Lending: is each call recording readable with our key? forbidden (permission off) ones are rechecked every 30 min.
+*/10 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_recording_check
+
+# Lending 7:20pm ET scoreboard to Slack (Part 5.6; dialer stops 7:15pm). Two lines because ET is UTC-4 until Nov 1 and UTC-5 after; the task posts only when it is 19:xx ET.
+20 23 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_daily_scoreboard
+20 0 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_daily_scoreboard
+
 # Lending weekly DNC / litigator re-scrub of numbers loaded in the dialer (Go Live G10).
 # Mondays 06:00 UTC (02:00 ET), before the 09:00 ET calling window. Spends Tracerfy
 # credits (1 per number) up to a hard --max-credits cap; exit 4 = cap reached.

@@ -883,7 +883,24 @@ class AppSettings(BaseSettings):
 	lending_backflip_check_enabled: bool = Field(default=False, env="LENDING_BACKFLIP_CHECK_ENABLED")
 	# Shared secret the GHL "DND changed" workflow sends in X-Webhook-Secret. Unset = endpoint closed.
 	lending_ghl_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_GHL_WEBHOOK_SECRET")
+	# Next Deal Lending GHL sub-account, the only GHL account lending code uses. Both must be set;
+	# there is no fallback to GHL_API_KEY / GHL_LOCATION_ID (a different account).
+	lending_ghl_api_key: Optional[SecretStr] = Field(default=None, env="LENDING_GHL_API_KEY")
+	lending_ghl_location_id: Optional[str] = Field(default=None, env="LENDING_GHL_LOCATION_ID")
 	aircall_webhook_token: Optional[SecretStr] = Field(default=None, env="AIRCALL_WEBHOOK_TOKEN")
+
+	# ── Lending engine: call disposition logging ──
+	# Slack bot and Sheet, separate from the FA settings above.
+	# All optional so the app boots without lending configured. Uses DATABASE_URL.
+	lending_dialer_campaign_ids: str = Field(default="", env="LENDING_DIALER_CAMPAIGN_IDS")  # comma-separated; empty ignores every event
+	lending_seat_groups: str = Field(default="", env="LENDING_SEAT_GROUPS")  # "agentid:A,agentid:B" (BatchDialer agent id) -> shift group per seat
+	lending_disposition_missing_alert_minutes: int = Field(default=10, env="LENDING_DISPOSITION_MISSING_ALERT_MINUTES")
+	lending_slack_bot_token: Optional[SecretStr] = Field(default=None, env="LENDING_SLACK_BOT_TOKEN")
+	lending_dial_tasks_channel: str = Field(default="", env="LENDING_DIAL_TASKS_CHANNEL")
+	lending_daily_channel: str = Field(default="", env="LENDING_DAILY_CHANNEL")  # 7pm scoreboard; channel ID
+	lending_sheets_service_account_key_path: str = Field(default="", env="LENDING_SHEETS_SERVICE_ACCOUNT_KEY_PATH")
+	lending_disposition_sheet_id: str = Field(default="", env="LENDING_DISPOSITION_SHEET_ID")
+	lending_disposition_sheet_tab: str = Field(default="Dispositions", env="LENDING_DISPOSITION_SHEET_TAB")
 	# ── Meta Conversions API (CAPI) — S2 ────────────────────────────────────
 	# Server-side Purchase reporting for closed-loop Meta ad attribution.
 	# Feature-gated and OFF by default — when disabled, or when pixel_id /

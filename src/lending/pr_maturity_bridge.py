@@ -1,8 +1,8 @@
 """Bridge PropertyRadar maturity records into the dialer's calling pool.
 
 The PropertyRadar pull lands records in ``property_radar_records`` and the live
-trace writes any phones/emails into ``property_radar_trace_contacts`` (keyed by
-``trace_key`` = normalized address + zip). Neither table is read by the dialer,
+trace writes any phones/emails into ``property_radar_traced_contacts`` (keyed by
+``radar_id``). Neither table is read by the dialer,
 which loads only from ``lending.calling_pool_staging``. This bridge is the
 missing link: it reads the staged PropertyRadar records, joins their traced
 contacts, and writes them as a sixth pool (``pr_maturity``) into the same
@@ -31,7 +31,6 @@ from sqlalchemy.orm import Session
 from config.lending_dialer import POOL_CAMPAIGN_TAGS
 from src.lending.pool_source import latest_run_id
 from src.services.phone_utils import normalize as normalize_phone
-from src.services.skip_trace_ledger import trace_key
 
 logger = logging.getLogger(__name__)
 
@@ -199,18 +198,18 @@ def _iter_record_pages(
         yield [dict(r) for r in rows]
 
 
-def _load_trace_contacts(session: Session, keys: list[str]) -> dict[str, dict[str, list]]:
-    """Map trace_key -> {'phones': [...], 'emails': [...]} for the given keys."""
-    if not keys:
+def _load_trace_contacts(session: Session, radar_ids: list[str]) -> dict[str, dict[str, list]]:
+    """Map radar_id -> {'phones': [...], 'emails': [...]} for the given records."""
+    if not radar_ids:
         return {}
     rows = session.execute(
         text(
-            "SELECT trace_key, phones, emails FROM property_radar_trace_contacts "
-            "WHERE trace_key = ANY(:keys)"
+            "SELECT radar_id, phones, emails FROM property_radar_traced_contacts "
+            "WHERE radar_id = ANY(:ids)"
         ),
-        {"keys": keys},
+        {"ids": radar_ids},
     ).mappings().all()
-    return {r["trace_key"]: {"phones": r["phones"] or [], "emails": r["emails"] or []} for r in rows}
+    return {r["radar_id"]: {"phones": r["phones"] or [], "emails": r["emails"] or []} for r in rows}
 
 
 def _first_phone(phones: list) -> Optional[str]:
@@ -265,11 +264,10 @@ def extract_pr_maturity_pool(
     total = with_phone = ga = ga_dialable = written = 0
 
     for records in _iter_record_pages(session, state=state):
-        keys = list({trace_key(r.get("property_address"), r.get("zip")) for r in records})
-        contacts = _load_trace_contacts(session, keys)
+        contacts = _load_trace_contacts(session, [r["radar_id"] for r in records])
         rows: list[dict[str, Any]] = []
         for r in records:
-            c = contacts.get(trace_key(r.get("property_address"), r.get("zip")), {"phones": [], "emails": []})
+            c = contacts.get(r["radar_id"], {"phones": [], "emails": []})
             email = c["emails"][0].lower() if c["emails"] else None
             rows.append(build_pool_row(r, run_id=run_id, phone=_first_phone(c["phones"]), email=email))
 

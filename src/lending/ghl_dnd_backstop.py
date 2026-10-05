@@ -12,8 +12,8 @@ from typing import Any, Callable
 from sqlalchemy import text
 
 from config.lending_compliance import GHL_BACKSTOP_MAX_PAGES, GHL_BACKSTOP_PAGE_SIZE, OptOutChannel
-from config.settings import get_settings
 from src.lending.compliance import propagate_opt_out
+from src.lending.ghl_account import ghl_headers, lending_ghl_account
 
 logger = logging.getLogger(__name__)
 
@@ -41,13 +41,16 @@ def run_backstop(db, *, fetch_dnd_page: FetchPage) -> int:
 
 
 def _ghl_fetch_dnd_page(page: int) -> list[dict[str, Any]]:
-    """One page of GHL contacts with DND on. Filter shape per the GHL v2 contact search;
-    confirmed against the live sub-account on first run."""
+    """One page of GHL contacts with DND on, from the Next Deal Lending sub-account. Filter shape
+    per the GHL v2 contact search; confirmed against the live sub-account on first run."""
     from src.services import ghl_webhook
 
+    account = lending_ghl_account()
+    if account is None:
+        raise RuntimeError("LENDING_GHL_API_KEY / LENDING_GHL_LOCATION_ID not set")
     response = ghl_webhook._ghl_request(
-        "POST", f"{ghl_webhook._GHL_BASE}/contacts/search", headers=ghl_webhook._headers(),
-        json={"locationId": get_settings().ghl_location_id, "page": page, "pageLimit": GHL_BACKSTOP_PAGE_SIZE,
+        "POST", f"{ghl_webhook._GHL_BASE}/contacts/search", headers=ghl_headers(account.api_key),
+        json={"locationId": account.location_id, "page": page, "pageLimit": GHL_BACKSTOP_PAGE_SIZE,
               "filters": [{"field": "dnd", "operator": "eq", "value": True}]},
     )
     response.raise_for_status()
@@ -57,9 +60,8 @@ def _ghl_fetch_dnd_page(page: int) -> list[dict[str, Any]]:
 def main() -> None:
     from src.core.database import get_db_context
 
-    settings = get_settings()
-    if settings.ghl_api_key is None or not settings.ghl_location_id:
-        logger.error("[lending-ghl-backstop] GHL_API_KEY / GHL_LOCATION_ID not set")
+    if lending_ghl_account() is None:
+        logger.error("[lending-ghl-backstop] LENDING_GHL_API_KEY / LENDING_GHL_LOCATION_ID not set")
         return
     try:
         with get_db_context() as db:

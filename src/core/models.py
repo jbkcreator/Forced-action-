@@ -12553,23 +12553,6 @@ class PropertyRadarPullRun(Base):
     )
 
 
-class PropertyRadarTraceContact(Base):
-    """Contacts Tracerfy returned for a traced address (trace_key = normalized address + zip).
-
-    The skip-trace ledger only records that an address was billed; this keeps the paid-for
-    emails/phones so a later run can read them back instead of paying again.
-    """
-
-    __tablename__ = "property_radar_trace_contacts"
-
-    trace_key: Mapped[str] = mapped_column(String(255), primary_key=True)
-    emails: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
-    phones: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
-    traced_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
-
-
 class PropertyRadarExcludedRecord(Base):
     """A bought PropertyRadar record the normalizer dropped (e.g. a 20+ year
     loan). Every export is billed, so the raw payload is kept here instead of
@@ -12689,6 +12672,24 @@ class PropertyRadarRecord(Base):
         Index("ix_pr_campaign", "campaign"),
         Index("ix_pr_county_fips", "county_fips"),
         Index("ix_pr_property_id", "property_id"),
+    )
+
+
+class PropertyRadarTracedContact(Base):
+    """Contacts bought by the live Tracerfy trace, one row per staged record.
+
+    Written in the same transaction as the enrichment_usage_logs ledger rows that
+    pay for them, so a later crash cannot leave an address ledgered (and therefore
+    never re-traced) with its paid contacts lost. The handoff reads these back.
+    """
+
+    __tablename__ = "property_radar_traced_contacts"
+
+    radar_id: Mapped[str] = mapped_column(String(50), primary_key=True)
+    phones: Mapped[list] = mapped_column(ARRAY(String), nullable=False, server_default=text("'{}'"))
+    emails: Mapped[list] = mapped_column(ARRAY(String), nullable=False, server_default=text("'{}'"))
+    traced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
 

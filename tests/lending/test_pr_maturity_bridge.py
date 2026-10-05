@@ -173,3 +173,22 @@ class TestRunSelection:
         bridge, calls = self._patch(monkeypatch, latest="extract-run-1")
         bridge.extract_pr_maturity_pool(session=None, dry_run=True)
         assert calls["cleared"] == [] and calls["written"] == []
+
+
+def test_traced_contacts_are_read_from_the_table_the_live_trace_writes_by_radar_id():
+    """The live trace writes property_radar_traced_contacts keyed by radar_id; the bridge must
+    read that table, not an address-keyed copy nobody writes."""
+    from unittest.mock import MagicMock
+
+    from src.lending import pr_maturity_bridge as bridge
+
+    session = MagicMock()
+    session.execute.return_value.mappings.return_value.all.return_value = [
+        {"radar_id": "R1", "phones": ["8135550111"], "emails": ["a@b.co"]},
+        {"radar_id": "R2", "phones": None, "emails": None},
+    ]
+    got = bridge._load_trace_contacts(session, ["R1", "R2"])
+    sql = str(session.execute.call_args.args[0])
+    assert "property_radar_traced_contacts" in sql and "radar_id" in sql and "trace_key" not in sql
+    assert got == {"R1": {"phones": ["8135550111"], "emails": ["a@b.co"]}, "R2": {"phones": [], "emails": []}}
+    assert bridge._load_trace_contacts(session, []) == {}
