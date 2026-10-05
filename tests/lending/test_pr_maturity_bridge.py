@@ -118,3 +118,58 @@ class TestBuildPoolRow:
         row = build_pool_row(self._record(), run_id="run-1", phone=None, email=None)
         assert row["phone_available"] is False
         assert row["normalized_phone"] is None
+
+
+class TestDialerCompatibility:
+    """Review #329 finding 1: bridged rows must survive the dialer's queue assignment."""
+
+    def test_bridged_rows_are_not_dropped_by_launch_queue_records(self):
+        from src.tasks.lending_dialer_load import launch_queue_records
+
+        records = []
+        for campaign, state in [("private_maturity", "FL"), ("private_maturity", "GA"),
+                                ("maturity_target_lender", "FL"), ("maturity_target_lender", "GA"),
+                                ("stalled_flip", "FL"), ("auction_winner", "GA")]:
+            row = build_pool_row(
+                TestBuildPoolRow()._record(campaign=campaign, state=state),
+                run_id="r", phone="+14045550100", email=None,
+            )
+            records.append({"source_tag": row["source_tag"], "phone": row["normalized_phone"]})
+        queued = launch_queue_records(records)
+        assert len(queued) == len(records)
+        assert {r["queue"] for r in queued} == {"verified_maturity", "transaction_ready"}
+
+
+class TestRunSelection:
+    """Review #329 finding 2: the bridge must not start a run that crowds out other pools."""
+
+    def _patch(self, monkeypatch, latest):
+        import src.lending.pr_maturity_bridge as bridge
+
+        calls = {"cleared": [], "written": []}
+        record = TestBuildPoolRow()._record()
+        monkeypatch.setattr(bridge, "latest_run_id", lambda session: latest)
+        monkeypatch.setattr(bridge, "_iter_record_pages", lambda session, state: iter([[record]]))
+        monkeypatch.setattr(bridge, "_load_trace_contacts", lambda session, keys: {})
+        monkeypatch.setattr(bridge, "_clear_previous_rows",
+                            lambda session, run_id, state: calls["cleared"].append(run_id))
+        monkeypatch.setattr(bridge, "_write_rows",
+                            lambda session, rows: calls["written"].extend(rows) or len(rows))
+        return bridge, calls
+
+    def test_rows_join_the_newest_existing_run(self, monkeypatch):
+        bridge, calls = self._patch(monkeypatch, latest="extract-run-1")
+        summary = bridge.extract_pr_maturity_pool(session=None, dry_run=False)
+        assert summary["run_id"] == "extract-run-1"
+        assert calls["cleared"] == ["extract-run-1"]  # previous pr_maturity rows replaced
+        assert {r["run_id"] for r in calls["written"]} == {"extract-run-1"}
+
+    def test_new_run_only_when_none_exists(self, monkeypatch):
+        bridge, calls = self._patch(monkeypatch, latest=None)
+        summary = bridge.extract_pr_maturity_pool(session=None, dry_run=False)
+        assert summary["run_id"] and summary["run_id"] != "extract-run-1"
+
+    def test_dry_run_clears_nothing(self, monkeypatch):
+        bridge, calls = self._patch(monkeypatch, latest="extract-run-1")
+        bridge.extract_pr_maturity_pool(session=None, dry_run=True)
+        assert calls["cleared"] == [] and calls["written"] == []

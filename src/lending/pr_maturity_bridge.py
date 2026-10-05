@@ -29,6 +29,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from config.lending_dialer import POOL_CAMPAIGN_TAGS
+from src.lending.pool_source import latest_run_id
 from src.services.phone_utils import normalize as normalize_phone
 from src.services.skip_trace_ledger import trace_key
 
@@ -220,6 +221,21 @@ def _first_phone(phones: list) -> Optional[str]:
     return None
 
 
+def _clear_previous_rows(session: Session, run_id: str, *, state: Optional[str]) -> None:
+    """Drop this pool's earlier rows in the run so a re-run replaces them."""
+    clause = " AND state = :state" if state else ""
+    params: dict[str, Any] = {"run_id": run_id, "pool": POOL_NAME}
+    if state:
+        params["state"] = state.upper()
+    session.execute(
+        text(
+            "DELETE FROM lending.calling_pool_staging "
+            "WHERE run_id = CAST(:run_id AS uuid) AND pool_name = :pool" + clause
+        ),
+        params,
+    )
+
+
 def _is_ga(row: Mapping[str, Any]) -> bool:
     return (row["state"] or "").upper() == "GA"
 
@@ -234,13 +250,18 @@ def extract_pr_maturity_pool(
 ) -> dict[str, Any]:
     """Build the pr_maturity pool from PropertyRadar records + traced contacts.
 
-    One staging run (``run_id``) per call. Records are read and written in
+    Rows join the NEWEST existing staging run rather than starting their own:
+    the dialer load reads only the newest run, so a pr_maturity-only run would
+    crowd every other pool out of the load. Our previous rows in that run are
+    replaced, so re-running is idempotent. Records are read and written in
     bounded pages, so a statewide maturity table is never fully materialized.
     With ``dry_run`` the rows are built and counted but nothing is written.
     Records with no traced phone are still written (phone_available=False) so a
     later trace can be joined without a re-extract (WP-W0-1 O15 convention).
     """
-    run_id = str(uuid.uuid4())
+    run_id = latest_run_id(session) or str(uuid.uuid4())
+    if not dry_run:
+        _clear_previous_rows(session, run_id, state=state)
     total = with_phone = ga = ga_dialable = written = 0
 
     for records in _iter_record_pages(session, state=state):
