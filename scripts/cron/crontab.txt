@@ -1198,6 +1198,9 @@ COUNTY_ID=hillsborough
 0 13 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_confirmation_tasks
 0 14 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_confirmation_tasks
 
+# Lending: alert in #lending-replies when a rate/terms or reschedule handoff is still unanswered after one business hour (Josh's hours Mon-Fri 9:00-7:15 ET, WP-GL-10).
+*/10 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_reply_sla
+
 # Lending weekly DNC / litigator re-scrub of numbers loaded in the dialer (Go Live G10).
 # Mondays 06:00 UTC (02:00 ET), before the 09:00 ET calling window. Spends Tracerfy
 # credits (1 per number) up to a hard --max-credits cap; exit 4 = cap reached.

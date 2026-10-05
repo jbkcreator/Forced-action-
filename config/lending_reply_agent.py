@@ -44,6 +44,7 @@ SNIPPET_CHARS = 300
 REPLY_HOURS_START = (9, 0)
 REPLY_HOURS_END = (19, 15)
 REPLY_WEEKDAYS = (0, 1, 2, 3, 4)
+REPLY_SLA_BUSINESS_MINUTES = 60   # Josh responds within one business hour (Oct 1 / Oct 4)
 KIND_RATE_TERMS = "rate_terms_handoff"
 KIND_RESCHEDULE = "reschedule_request"
 KIND_AI_HANDOFF = "ai_handoff"

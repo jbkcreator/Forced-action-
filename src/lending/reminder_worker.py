@@ -20,7 +20,7 @@ import logging
 import signal
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional, Protocol
 
 from sqlalchemy import text
 
@@ -46,7 +46,28 @@ from src.lending.ghl_sms import GhlSmsError, get_sender, texting_number
 
 logger = logging.getLogger(__name__)
 
-TextSender = Callable[..., str]
+
+
+class TextSender(Protocol):
+    """The text-sending port: ``GhlSmsSender`` in production, ``FakeTextSender`` in tests and sandboxes."""
+
+    def __call__(self, phone: str, body: str, first_name: Optional[str], *, deadline: datetime) -> str: ...
+
+
+class FakeTextSender:
+    """Records what would have been sent; raises ``error`` instead when given one. Never touches the network."""
+
+    def __init__(self, error: Optional[Exception] = None) -> None:
+        self.sent: list[tuple[str, str]] = []
+        self.error = error
+
+    def __call__(self, phone: str, body: str, first_name: Optional[str], *, deadline: datetime) -> str:
+        if self.error is not None:
+            raise self.error
+        self.sent.append((phone, body))
+        return f"fake-{len(self.sent)}"
+
+
 EmailSender = Callable[[str, str, str], str]  # (to, subject, body) -> provider message id; none exists yet
 
 _COLUMNS = ("id, booking_ref, kind, send_at, first_name, contact_phone, contact_email, "
@@ -217,8 +238,9 @@ def process_due(db, *, text_sender: Optional[TextSender], email_sender: Optional
             _fail_unsent(db, row["id"])
             outcome = "failed"
         counts[outcome] = counts.get(outcome, 0) + 1
-        logger.info("[reminder-worker] row=%s kind=%s phone_hash=%s outcome=%s", row["id"], row["kind"],
-                    phone_hash(row["contact_phone"])[:12] if row["contact_phone"] else "-", outcome)
+        level = logging.WARNING if outcome == "skipped_suppressed" else logging.INFO
+        logger.log(level, "[reminder-worker] row=%s kind=%s phone_hash=%s outcome=%s", row["id"], row["kind"],
+                   phone_hash(row["contact_phone"])[:12] if row["contact_phone"] else "-", outcome)
     return counts
 
 

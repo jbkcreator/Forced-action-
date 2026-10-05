@@ -88,8 +88,14 @@ def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
             contact_id  text,
             phone_hash  varchar(12),
             created_at  timestamptz NOT NULL DEFAULT now(),
-            posted_at   timestamptz
+            posted_at   timestamptz,
+            responded_at timestamptz,
+            overdue_alerted_at timestamptz
         )""",
+        f"ALTER TABLE {handoffs} ADD COLUMN IF NOT EXISTS responded_at timestamptz",
+        f"ALTER TABLE {handoffs} ADD COLUMN IF NOT EXISTS overdue_alerted_at timestamptz",
+        f"CREATE INDEX IF NOT EXISTS ix_lending_reply_handoffs_open ON {handoffs} (posted_at) "
+        f"WHERE posted_at IS NOT NULL AND responded_at IS NULL AND overdue_alerted_at IS NULL",
     ):
         conn.execute(text(ddl))
 

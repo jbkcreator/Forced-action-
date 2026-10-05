@@ -85,6 +85,7 @@ class ReplyEvent:
     first_name: Optional[str]
     phone: Optional[str]
     handoff: bool             # GHL says the AI handed this conversation to a human
+    from_user: bool = False   # an outbound message typed by a person in GHL (Josh), not the AI or a workflow
 
 
 def _pick(body: Mapping[str, Any], *paths: tuple[str, ...]) -> Any:
@@ -114,12 +115,15 @@ def parse_event(body: Mapping[str, Any]) -> Optional[ReplyEvent]:
         first_name=str(_pick(body, ("firstName",), ("contact", "firstName")) or "") or None,
         phone=normalize(str(phone)) if phone else None,
         handoff=bool(_pick(body, ("handoff",), ("aiHandoff",), ("humanHandoff",))),
+        from_user=bool(_pick(body, ("userId",), ("user", "id"), ("message", "userId"))),
     )
 
 
 def classify(event: ReplyEvent) -> Optional[str]:
     """The kind of Slack post this event needs, or None."""
     if event.direction == "outbound":
+        if event.from_user:
+            return None  # Josh may quote numbers; only the AI is held to the no-numbers rule
         return KIND_AI_QUOTED_NUMBERS if quotes_numbers(event.body) else None
     if asks_rate_or_terms(event.body):
         return KIND_RATE_TERMS
@@ -163,6 +167,10 @@ _CLAIM = text("""
     VALUES (:message_id, :kind, :contact_id, :phone_hash)
     ON CONFLICT (message_id) DO NOTHING
 """)
+_RESPONDED = text("""
+    UPDATE lending.reply_handoffs SET responded_at = now()
+     WHERE contact_id = :contact_id AND posted_at IS NOT NULL AND responded_at IS NULL
+""")
 _STATE = text("SELECT posted_at IS NOT NULL FROM lending.reply_handoffs WHERE message_id = :message_id")
 _POSTED = text("UPDATE lending.reply_handoffs SET posted_at = now() WHERE message_id = :message_id")
 
@@ -170,6 +178,11 @@ _POSTED = text("UPDATE lending.reply_handoffs SET posted_at = now() WHERE messag
 def handle_reply_event(db, event: ReplyEvent, *, poster: Optional[SlackPoster]) -> str:
     """Returns "ignored", "duplicate", "posted" or "not_configured". Commits the claim before posting (so
     a failed post is retried on redelivery) and the post result after. Raises if the post itself fails."""
+    if event.direction == "outbound" and event.from_user and event.contact_id:
+        answered = db.execute(_RESPONDED, {"contact_id": event.contact_id}).rowcount
+        db.commit()
+        if answered:
+            logger.info("[reply-guard] %d handoff(s) answered by a person contact=%s", answered, event.contact_id)
     kind = classify(event)
     if kind is None:
         return "ignored"

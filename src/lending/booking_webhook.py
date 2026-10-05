@@ -42,7 +42,8 @@ CANCELLING_STATUSES = {"cancelled": "booking_cancelled", "showed_cancelled": "bo
 SCHEDULING_STATUSES = frozenset({"new", "confirmed", "booked"})
 
 _KNOWN_APPOINTMENT = text("""
-    SELECT booking_ref, person_id, property_address, booked_by FROM lending.booking_messages
+    SELECT booking_ref, person_id, property_address, booked_by, first_name, contact_phone, contact_email
+      FROM lending.booking_messages
      WHERE provider_event_id = :event_id ORDER BY id LIMIT 1
 """)
 
@@ -68,7 +69,7 @@ def ghl_appointment(
     status = (_first(body, ("appointmentStatus",), ("status",), ("appointment", "appointmentStatus")) or "").lower()
     if not appointment_id:
         return {"status": "noop", "reason": "no_appointment_id"}
-    if status in SCHEDULING_STATUSES:
+    if status in SCHEDULING_STATUSES or (status == "rescheduled" and _start_time(body) is not None):
         return _schedule_from_appointment(db, body, appointment_id)
     reason = CANCELLING_STATUSES.get(status)
     if reason is None:
@@ -79,6 +80,16 @@ def ghl_appointment(
     return {"status": status, "cancelled": cancelled}
 
 
+def _start_time(body: dict[str, Any]) -> Optional[datetime]:
+    """The appointment start as a timezone-aware datetime, or None when it is missing, unparseable or naive."""
+    raw_start = _first(body, ("startTime",), ("appointment", "startTime"), ("calendar", "startTime"))
+    try:
+        slot = datetime.fromisoformat(raw_start.replace("Z", "+00:00")) if raw_start else None
+    except ValueError:
+        return None
+    return slot if slot is not None and slot.tzinfo is not None else None
+
+
 def _schedule_from_appointment(db: Session, body: dict[str, Any], appointment_id: str) -> dict[str, Any]:
     """The fallback path when the booking flow does not post ``/booking-confirmed``: a caller creates the GHL
     appointment by hand and this event schedules the confirmation and reminders from what GHL sends (the
@@ -86,12 +97,8 @@ def _schedule_from_appointment(db: Session, body: dict[str, Any], appointment_id
     flag in a GHL event, so the address phrase is dropped, the confirmation call goes to Josh, and a text goes
     out only if consent was already recorded elsewhere (``has_text_consent``). An appointment the booking flow
     already scheduled keeps its ``booking_ref``, address and booker, so the two paths never double-schedule."""
-    raw_start = _first(body, ("startTime",), ("appointment", "startTime"), ("calendar", "startTime"))
-    try:
-        slot = datetime.fromisoformat(raw_start.replace("Z", "+00:00")) if raw_start else None
-    except ValueError:
-        slot = None
-    if slot is None or slot.tzinfo is None:
+    slot = _start_time(body)
+    if slot is None:
         logger.warning("[booking-webhook] appointment %s has no usable timezone-aware start time; nothing scheduled",
                        appointment_id)
         return {"status": "noop", "reason": "no_start_time"}
@@ -100,9 +107,9 @@ def _schedule_from_appointment(db: Session, body: dict[str, Any], appointment_id
         "booking_ref": known["booking_ref"] if known else f"ghl-{appointment_id}",
         "provider_event_id": appointment_id,
         "person_id": known["person_id"] if known else None,
-        "phone": _first(body, ("phone",), ("contact", "phone")),
-        "first_name": _first(body, ("firstName",), ("contact", "firstName")),
-        "email": _first(body, ("email",), ("contact", "email")),
+        "phone": _first(body, ("phone",), ("contact", "phone")) or (known["contact_phone"] if known else None),
+        "first_name": _first(body, ("firstName",), ("contact", "firstName")) or (known["first_name"] if known else None),
+        "email": _first(body, ("email",), ("contact", "email")) or (known["contact_email"] if known else None),
         "property_address": known["property_address"] if known else None,
         "booked_by": known["booked_by"] if known else None,
         "slot_start_utc": slot,
