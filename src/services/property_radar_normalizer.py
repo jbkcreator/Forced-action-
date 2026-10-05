@@ -119,29 +119,18 @@ def normalize(
     skipped." Callers should log/count exclusions but never treat None as an
     error — it is a normal outcome for a share of records based on sample data.
     """
+    reason = exclusion_reason(record, state=state)
+    if reason is not None:
+        logger.debug("PropertyRadar %s excluded: %s", record.radar_id, reason)
+        return None
+
     raw = record.raw
     state_upper = state.upper()
     county_raw = (raw.get("County") or "").strip().upper()
     fips = county_fips(state_upper, county_raw)
     st_fips = _state_fips_lookup(state_upper)
     apn = raw.get("APN") or None
-
-    if not record.radar_id or not st_fips or not fips or not apn or not state_upper or not county_raw:
-        logger.debug(
-            "PropertyRadar %s excluded: missing a required field "
-            "(radar_id/state_fips/county_fips/apn/state/county_name)",
-            record.radar_id,
-        )
-        return None
-
     term_years = _parse_term(raw.get("FirstTermInYears"))
-    if term_years is not None and term_years >= _LONG_TERM_EXCLUSION_YEARS:
-        logger.debug(
-            "PropertyRadar %s excluded: FirstTermInYears=%s >= %d (long-term exclusion)",
-            record.radar_id, term_years, _LONG_TERM_EXCLUSION_YEARS,
-        )
-        return None
-
     loan_date = _parse_date(raw.get("FirstDate"))
     est_maturity = _compute_maturity(loan_date, term_years)
     principal_name = _extract_principal(raw.get("Persons") or [])
@@ -172,6 +161,35 @@ def normalize(
         campaign=campaign,
         raw=raw,
     )
+
+
+EXCLUDED_MISSING_RADAR_ID = "missing_radar_id"
+EXCLUDED_UNKNOWN_STATE = "unknown_state"
+EXCLUDED_MISSING_COUNTY = "missing_county"
+EXCLUDED_UNMAPPED_COUNTY = "unmapped_county"
+EXCLUDED_MISSING_APN = "missing_apn"
+EXCLUDED_LONG_TERM = "long_term_loan"
+
+
+def exclusion_reason(record: PropertyRadarRecord, *, state: str) -> Optional[str]:
+    """Why normalize() would drop this record, or None when it is kept."""
+    raw = record.raw
+    state_upper = state.upper()
+    county_raw = (raw.get("County") or "").strip().upper()
+    if not record.radar_id:
+        return EXCLUDED_MISSING_RADAR_ID
+    if not state_upper or not _state_fips_lookup(state_upper):
+        return EXCLUDED_UNKNOWN_STATE
+    if not county_raw:
+        return EXCLUDED_MISSING_COUNTY
+    if not county_fips(state_upper, county_raw):
+        return EXCLUDED_UNMAPPED_COUNTY
+    if not raw.get("APN"):
+        return EXCLUDED_MISSING_APN
+    term_years = _parse_term(raw.get("FirstTermInYears"))
+    if term_years is not None and term_years >= _LONG_TERM_EXCLUSION_YEARS:
+        return EXCLUDED_LONG_TERM
+    return None
 
 
 # ---------------------------------------------------------------------------

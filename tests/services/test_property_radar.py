@@ -883,3 +883,49 @@ class TestRunPullLinkingAndCap:
     def test_max_records_caps_exports(self):
         result, _ = self._run(link=False, max_records=2)
         assert result["exports_consumed"] == 2
+
+
+class TestExclusionReasons:
+    def test_kept_record_has_no_reason(self):
+        from src.services.property_radar_normalizer import exclusion_reason
+        assert exclusion_reason(_record(), state="FL") is None
+
+    @pytest.mark.parametrize("kwargs, expected", [
+        ({"term": "30"}, "long_term_loan"),
+        ({"county": "NOT A COUNTY"}, "unmapped_county"),
+        ({"county": ""}, "missing_county"),
+    ])
+    def test_reason_matches_why_normalize_drops_it(self, kwargs, expected):
+        from src.services.property_radar_normalizer import exclusion_reason
+        rec = _record(**kwargs)
+        assert normalize(rec, state="FL", campaign="x") is None
+        assert exclusion_reason(rec, state="FL") == expected
+
+    def test_missing_apn_and_unknown_state(self):
+        from src.services.property_radar_normalizer import exclusion_reason
+        rec = _record()
+        rec.raw["APN"] = None
+        assert exclusion_reason(rec, state="FL") == "missing_apn"
+        assert exclusion_reason(_record(), state="ZZ") == "unknown_state"
+
+    def test_run_pull_reports_exclusions_by_reason(self):
+        from unittest.mock import MagicMock
+        from src.tasks.property_radar_maturity_pull import _run_pull
+
+        port = FakePropertyRadarPort(canned_records=[
+            _raw_record("K1"),
+            _raw_record("L1", term="30"),
+            _raw_record("L2", term="25"),
+            _raw_record("U1", county="NOT A COUNTY"),
+        ])
+        with patch("src.tasks.property_radar_maturity_pull.get_property_radar_port", return_value=port), \
+             patch("src.tasks.property_radar_maturity_pull.upsert_records", return_value=(1, 0, 0)), \
+             patch("src.tasks.property_radar_maturity_pull._mark_seen"), \
+             patch("src.tasks.property_radar_maturity_pull._load_seen_ids", return_value=frozenset()):
+            result = _run_pull(
+                mode="backlog", state="FL", campaign="private_maturity",
+                dry_run=False, session=MagicMock(), link=False,
+            )
+        assert result["records_fetched"] == 1
+        assert result["excluded"] == 3
+        assert result["excluded_by_reason"] == {"long_term_loan": 2, "unmapped_county": 1}

@@ -59,6 +59,7 @@ import argparse
 import json
 import logging
 import sys
+from collections import Counter
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -72,7 +73,7 @@ from config.property_radar_campaigns import (
 )
 from config.settings import settings
 from src.core.database import get_db_context
-from src.services.property_radar_normalizer import normalize
+from src.services.property_radar_normalizer import exclusion_reason, normalize
 from src.services.property_radar_port import get_property_radar_port
 from src.services.property_radar.staging import upsert_records
 from src.tasks import property_radar_lead_handoff
@@ -281,7 +282,7 @@ def _run_pull(
 
     records_fetched = 0
     exports_consumed = 0
-    excluded = 0
+    excluded: Counter[str] = Counter()
     batch_ids: list[str] = []
     staging_batch: list[dict] = []
     inserted_total = updated_total = skipped_total = 0
@@ -304,7 +305,7 @@ def _run_pull(
 
             normalized = normalize(record, state=state, campaign=campaign)
             if normalized is None:
-                excluded += 1
+                excluded[exclusion_reason(record, state=state) or "unknown"] += 1
                 continue
 
             records_fetched += 1
@@ -386,8 +387,14 @@ def _run_pull(
         "campaign": campaign,
         "records_fetched": records_fetched,
         "exports_consumed": exports_consumed,
-        "excluded_long_term": excluded,
+        "excluded": sum(excluded.values()),
+        "excluded_by_reason": dict(excluded),
     }
+    if excluded:
+        logger.info(
+            "PropertyRadar pull [%s/%s] excluded %d of %d bought records: %s",
+            state, campaign, sum(excluded.values()), exports_consumed, dict(excluded),
+        )
     logger.info("PropertyRadar pull complete: %s", result)
     return result
 
