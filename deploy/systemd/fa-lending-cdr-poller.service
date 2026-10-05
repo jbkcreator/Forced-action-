@@ -1,0 +1,24 @@
+[Unit]
+Description=Forced Action — Lending BatchDialer CDR poller (15 s fast poll, 2 min rescan)
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/Forced-action-
+Environment="PATH=/root/Forced-action-/.venv/bin"
+Environment="PYTHONPATH=/root/Forced-action-"
+EnvironmentFile=/root/Forced-action-/.env
+ExecStart=/root/Forced-action-/.venv/bin/python -m src.lending.cdr_poller
+Restart=always
+RestartSec=15
+StartLimitIntervalSec=120
+StartLimitBurst=5
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fa-lending-cdr-poller
+
+[Install]
+WantedBy=multi-user.target

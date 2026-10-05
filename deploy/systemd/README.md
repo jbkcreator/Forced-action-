@@ -45,6 +45,8 @@ sudo systemctl enable --now fa-lending-missed-call-poller
 sudo journalctl -u fa-lending-opt-out-poller -u fa-lending-dialer-sweep -u fa-lending-missed-call-poller -f
 ```
 
+`fa-lending-cdr-poller` (BatchDialer call log: 15 s fast poll of `/v2/cdrs/last`, 2 min rescan of today and yesterday) is installed the same way: `sudo cp deploy/systemd/fa-lending-cdr-poller.service /etc/systemd/system/`, then `sudo systemctl daemon-reload && sudo systemctl enable --now fa-lending-cdr-poller`. It needs `BATCHDIALER_API_KEY`, `DATABASE_URL` and `LENDING_DIALER_CAMPAIGN_IDS`. Run exactly one copy (a Postgres advisory lock enforces it): the `/last` watermark is server-side per API key, and `--once` advances it too.
+
 ## Prerequisites the units assume
 
 - `/root/Forced-action-/` — the checked-out repo
