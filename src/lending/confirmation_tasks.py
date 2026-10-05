@@ -30,7 +30,7 @@ _INSERT = text("""
     VALUES (:booking_ref, :person_id, :assignee, :due_date)
     ON CONFLICT (booking_ref) DO UPDATE SET
         assignee = EXCLUDED.assignee, due_date = EXCLUDED.due_date, cancelled_at = NULL, completed_at = NULL
-     WHERE lending.confirmation_tasks.cancelled_at IS NOT NULL
+     WHERE lending.confirmation_tasks.cancelled_at IS NOT NULL AND :revive
 """)
 _COMPLETE = text("""
     UPDATE lending.confirmation_tasks SET completed_at = now()
@@ -87,12 +87,13 @@ def complete_confirmation_task(db, booking_ref: str) -> bool:
 
 
 def assign_confirmation_task(db, *, booking_ref: str, person_id: Optional[str], booked_by: Optional[str],
-                             slot_start_utc: datetime, booked_at: Optional[datetime] = None) -> str:
-    """Record the confirmation call and return its assignee. Idempotent on booking_ref (a cancelled task is revived by a rescheduled booking); does not commit."""
+                             slot_start_utc: datetime, booked_at: Optional[datetime] = None, revive: bool = False) -> str:
+    """Record the confirmation call and return its assignee. Idempotent on booking_ref; a cancelled task is revived
+    only when ``revive`` is set (the booking's messages were re-planned). Does not commit."""
     due_date = due_date_for(booked_by, slot_start_utc, booked_at or datetime.now(timezone.utc))
     assignee = resolve_assignee(booked_by, due_date)
     db.execute(_INSERT, {"booking_ref": booking_ref, "person_id": person_id, "assignee": assignee,
-                         "due_date": due_date})
+                         "due_date": due_date, "revive": revive})
     logger.info("[confirmation-tasks] booking_ref=%s due=%s ai_booked=%s", booking_ref, due_date,
                 booked_by in (None, AI_BOOKER))
     return assignee

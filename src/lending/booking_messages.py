@@ -89,12 +89,19 @@ _INSERT = text("""
         cancel_reason = NULL, channel = NULL, attempts = 0, first_name = EXCLUDED.first_name,
         contact_phone = EXCLUDED.contact_phone, contact_email = EXCLUDED.contact_email,
         property_address = EXCLUDED.property_address, slot_start_utc = EXCLUDED.slot_start_utc,
-        booked_by = EXCLUDED.booked_by, provider_message_id = NULL, decided_at = NULL, sent_at = NULL
-     WHERE lending.booking_messages.slot_start_utc IS DISTINCT FROM EXCLUDED.slot_start_utc
-       AND lending.booking_messages.status <> 'sending'
+        booked_by = EXCLUDED.booked_by, provider_message_id = NULL, decided_at = NULL, sent_at = NULL,
+        replanned_at = now()
+     WHERE lending.booking_messages.status <> 'sending'
+       AND (lending.booking_messages.slot_start_utc IS DISTINCT FROM EXCLUDED.slot_start_utc
+            OR (lending.booking_messages.contact_phone IS NULL AND lending.booking_messages.contact_email IS NULL
+                AND (EXCLUDED.contact_phone IS NOT NULL OR EXCLUDED.contact_email IS NOT NULL)))
 """)
 
-_KNOWN_BOOKING = text("SELECT EXISTS (SELECT 1 FROM lending.booking_messages WHERE booking_ref = :ref)")
+_KNOWN_BOOKING = text("""
+    SELECT count(*) AS n,
+           count(*) FILTER (WHERE contact_phone IS NULL AND contact_email IS NULL) AS without_contact
+      FROM lending.booking_messages WHERE booking_ref = :ref
+""")
 
 _PERSON = text("""
     SELECT COALESCE(m.full_name, p.full_name) AS full_name,
@@ -136,7 +143,8 @@ class ScheduleResult:
 def handle_booking_confirmed(db, payload: Mapping[str, Any], *, now: Optional[datetime] = None) -> ScheduleResult:
     """Schedule the three messages and the confirmation-call task for one confirmed booking.
 
-    Idempotent: a redelivered event (same slot) writes nothing and changes nothing. The same ``booking_ref``
+    Idempotent: a redelivered event (same slot) writes nothing and changes nothing (the exception: a booking whose
+    earlier delivery had no phone or email is completed by a delivery that has one). The same ``booking_ref``
     with a different ``slot_start_utc`` is a reschedule: its rows are re-planned for the new time (a row being
     sent right now is left alone). Consent is recorded on the first delivery only, so a redelivery or a
     reschedule never re-grants consent the contact has since revoked. Does not commit.
@@ -177,17 +185,20 @@ def handle_booking_confirmed(db, payload: Mapping[str, Any], *, now: Optional[da
         _row(common, KIND_NIGHT_BEFORE, night_before_send_at(slot_start), skip_reason, now=now),
         _row(common, KIND_NINETY_MIN, slot_start - timedelta(seconds=NINETY_MIN_SECONDS), skip_reason, now=now),
     ]
-    first_delivery = not db.execute(_KNOWN_BOOKING, {"ref": booking_ref}).scalar()
+    known = db.execute(_KNOWN_BOOKING, {"ref": booking_ref}).mappings().one()
+    first_delivery = known["n"] == 0
+    repairing = known["n"] > 0 and known["n"] == known["without_contact"]   # earlier delivery had no phone or email
     inserted = sum(db.execute(_INSERT, row).rowcount for row in rows)  # 3 rows; per-statement rowcount is exact
     if skip_reason:
         logger.warning("[booking-messages] booking_ref=%s recorded as skipped (%s)", booking_ref, skip_reason)
     else:
         logger.info("[booking-messages] booking_ref=%s scheduled %d rows phone_hash=%s",
                     booking_ref, inserted, phone_hash(phone)[:12] if phone else "-")
-    if first_delivery and payload.get("text_consent") is True and phone and payload.get("booked_by") not in (None, AI_BOOKER):
+    if (first_delivery or repairing) and payload.get("text_consent") is True and phone and payload.get("booked_by") not in (None, AI_BOOKER):
         record_consent(db, phone, "on_call_yes", captured_by=payload["booked_by"])
     assignee = assign_confirmation_task(db, booking_ref=booking_ref, person_id=person_id,
-                                        booked_by=payload.get("booked_by"), slot_start_utc=slot_start, booked_at=now)
+                                        booked_by=payload.get("booked_by"), slot_start_utc=slot_start, booked_at=now,
+                                        revive=not first_delivery and inserted > 0)
     return ScheduleResult(inserted=inserted, skip_reason=skip_reason, assignee=assignee)
 
 
@@ -215,9 +226,24 @@ def night_before_send_at(slot_start_utc: datetime) -> datetime:
 
 # ── cancellation ──────────────────────────────────────────────────────────────
 
-def cancel_by_provider_event(db, provider_event_id: str, reason: str) -> int:
+_RECENTLY_REPLANNED = text("""
+    SELECT EXISTS (SELECT 1 FROM lending.booking_messages
+                    WHERE provider_event_id = :event_id AND replanned_at > now() - (:seconds * interval '1 second'))
+""")
+
+
+def cancel_by_provider_event(db, provider_event_id: str, reason: str, *, spare_replanned_seconds: int = 0) -> int:
     """Cancel pending messages for the booking whose GHL appointment id this is. Does not commit.
-    A message already claimed for sending cannot be recalled."""
+    A message already claimed for sending cannot be recalled.
+
+    ``spare_replanned_seconds``: GHL's "rescheduled" event and the booking flow's new-slot event come from two
+    systems in no guaranteed order. When the new slot was planned first, a late cancel would wipe it, so a cancel
+    with a grace window does nothing if the booking was re-planned within that many seconds."""
+    if spare_replanned_seconds and db.execute(
+            _RECENTLY_REPLANNED, {"event_id": provider_event_id, "seconds": spare_replanned_seconds}).scalar():
+        logger.info("[booking-messages] cancel ignored: booking was re-planned within %ds (reason=%s)",
+                    spare_replanned_seconds, reason)
+        return 0
     n = db.execute(_CANCEL_BY_EVENT, {"event_id": provider_event_id, "reason": reason}).rowcount
     db.execute(_CANCEL_TASK_BY_EVENT, {"event_id": provider_event_id})
     logger.info("[booking-messages] cancelled %d pending rows (event) reason=%s", n, reason)

@@ -40,6 +40,7 @@ CANCELLING_STATUSES = {"cancelled": "booking_cancelled", "showed_cancelled": "bo
 
 
 SCHEDULING_STATUSES = frozenset({"new", "confirmed", "booked"})
+RESCHEDULE_GRACE_SECONDS = 120   # a "rescheduled" cancel spares rows the booking flow re-planned this recently
 
 _KNOWN_APPOINTMENT = text("""
     SELECT booking_ref, person_id, property_address, booked_by, first_name, contact_phone, contact_email
@@ -74,7 +75,8 @@ def ghl_appointment(
     reason = CANCELLING_STATUSES.get(status)
     if reason is None:
         return {"status": "noop", "reason": "status_not_handled"}
-    cancelled = cancel_by_provider_event(db, appointment_id, reason)
+    cancelled = cancel_by_provider_event(db, appointment_id, reason,
+                                         spare_replanned_seconds=RESCHEDULE_GRACE_SECONDS if status == "rescheduled" else 0)
     db.commit()
     logger.info("[booking-webhook] appointment status=%s cancelled=%d", status, cancelled)
     return {"status": status, "cancelled": cancelled}

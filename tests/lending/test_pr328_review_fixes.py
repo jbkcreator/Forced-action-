@@ -102,6 +102,7 @@ def test_a_redelivery_of_the_same_slot_after_a_cancel_stays_cancelled(db):
     cancel_by_provider_event(db, "appt-1", "booking_cancelled")
     assert book(db).inserted == 0
     assert {v[0] for v in rows(db).values()} == {"cancelled"}
+    assert listed(db) == []
 
 
 def test_a_reschedule_leaves_a_row_that_is_being_sent_right_now(db):

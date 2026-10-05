@@ -59,8 +59,10 @@ def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
             created_at          timestamptz  NOT NULL DEFAULT now(),
             decided_at          timestamptz,
             sent_at             timestamptz,
+            replanned_at        timestamptz,
             CONSTRAINT uq_lending_booking_messages_ref_kind UNIQUE (booking_ref, kind)
         )""",
+        f"ALTER TABLE {messages} ADD COLUMN IF NOT EXISTS replanned_at timestamptz",
         # an already-migrated table has the old kind CHECK: widen it to include gate_fail
         f"ALTER TABLE {messages} DROP CONSTRAINT IF EXISTS booking_messages_kind_check",
         f"ALTER TABLE {messages} ADD CONSTRAINT booking_messages_kind_check CHECK (kind IN ({_in(ALL_KINDS)}))",
