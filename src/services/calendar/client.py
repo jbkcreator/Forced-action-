@@ -90,7 +90,7 @@ def get_calendar_client() -> CalendarClient:
     """
     from config.settings import get_settings
 
-    mode = get_settings().fa_max_calendar_mode
+    mode = get_settings().lending_calendar_mode
     if mode == "live":
         from src.services.calendar.google_client import GoogleCalendarClient
 
@@ -101,7 +101,7 @@ def get_calendar_client() -> CalendarClient:
         return GHLCalendarClient.from_settings()
     if mode != "fake":
         raise ValueError(
-            f"Unknown FA_MAX_CALENDAR_MODE {mode!r} — expected 'fake', 'live' or 'ghl'"
+            f"Unknown LENDING_CALENDAR_MODE {mode!r} — expected 'fake', 'live' or 'ghl'"
         )
 
     from src.services.calendar.fakes import FakeCalendar
@@ -129,7 +129,7 @@ def get_calendar_id() -> str:
     from config.settings import get_settings
 
     settings = get_settings()
-    if settings.fa_max_calendar_mode == "ghl":
+    if settings.lending_calendar_mode == "ghl":
         calendar_id = settings.lending_ghl_calendar_id
         if not calendar_id:
             raise ValueError("LENDING_GHL_CALENDAR_ID is not set")

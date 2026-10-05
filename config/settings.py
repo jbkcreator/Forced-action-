@@ -701,18 +701,21 @@ class AppSettings(BaseSettings):
 	# mode here reads Google directly once "ghl" is in use. None is the
 	# default so a misconfigured environment cannot put a test meeting on the
 	# client's real day.
-	fa_max_calendar_mode: str = Field(default="fake", env="FA_MAX_CALENDAR_MODE")
+	# Named LENDING_* (not FA_MAX_*): this toggle exists for the Next Deal
+	# Lending booking flow specifically, same naming family as the
+	# LENDING_GHL_* credentials it switches between.
+	lending_calendar_mode: str = Field(default="fake", env="LENDING_CALENDAR_MODE")
 	fa_max_calendar_id: Optional[str] = Field(default=None, env="FA_MAX_CALENDAR_ID")
 	# Domain-wide delegation impersonates a named user; this is whose calendar
 	# bookings land on. Must be inside the Workspace the service account is
-	# delegated within. Only read when fa_max_calendar_mode == "live".
+	# delegated within. Only read when lending_calendar_mode == "live".
 	fa_max_calendar_subject: Optional[str] = Field(default=None, env="FA_MAX_CALENDAR_SUBJECT")
-	# GHL calendar id bookings are written to when fa_max_calendar_mode ==
+	# GHL calendar id bookings are written to when lending_calendar_mode ==
 	# "ghl". Distinct from GHL_AP_PRO_CALENDAR_ID — that's an unrelated
 	# calendar for a different venture. Named LENDING_GHL_* to match the
-	# sub-account's other credentials below, not FA_MAX_* — it lives in
-	# Next Deal Lending's GHL account, same naming family as the api
-	# key/location id it's read alongside.
+	# sub-account's other credentials below — it lives in Next Deal
+	# Lending's GHL account, same naming family as the api key/location id
+	# it's read alongside.
 	lending_ghl_calendar_id: Optional[str] = Field(default=None, env="LENDING_GHL_CALENDAR_ID")
 	# Next Deal Lending's own GHL sub-account — NOT GHL_API_KEY/
 	# GHL_LOCATION_ID, which are Bay Street Capital's and already depended
@@ -722,6 +725,12 @@ class AppSettings(BaseSettings):
 	# minting its own.
 	lending_ghl_api_key: Optional[SecretStr] = Field(default=None, env="LENDING_GHL_API_KEY")
 	lending_ghl_location_id: Optional[str] = Field(default=None, env="LENDING_GHL_LOCATION_ID")
+	# "Booked Calls" pipeline (WP-GL-5 scope: push bookings to Booked, gate
+	# fails to Nurture — both stages live in this one pipeline, confirmed
+	# directly against the real GHL account on 2026-10-05).
+	lending_ghl_pipeline_id: Optional[str] = Field(default=None, env="LENDING_GHL_PIPELINE_ID")
+	lending_ghl_stage_booked: Optional[str] = Field(default=None, env="LENDING_GHL_STAGE_BOOKED")
+	lending_ghl_stage_nurture: Optional[str] = Field(default=None, env="LENDING_GHL_STAGE_NURTURE")
 	# Fallback for the Command Center's self-message filter when Slack's
 	# auth.test is unreachable at startup. Normally resolved dynamically.
 	fa_max_slack_bot_user_id: Optional[str] = Field(default=None, env="FA_MAX_SLACK_BOT_USER_ID")

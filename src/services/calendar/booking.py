@@ -263,8 +263,37 @@ def book(
         gate_row=gate_row,
         captured_by=gate_row.get("captured_by") if gate_row else None,
     )
+    _push_booking_to_ghl(
+        phone=phone, email=attendee_email, first_name=first_name,
+        topic=topic, booking_ref=booking_ref,
+    )
 
     return BookingResult(booked=True, event=event, booking_ref=booking_ref)
+
+
+def _push_booking_to_ghl(
+    *, phone: Optional[str], email: str, first_name: Optional[str], topic: str, booking_ref: str,
+) -> None:
+    """Push the booking into the Booked stage of the Next Deal Lending GHL
+    pipeline (WP-GL-5 scope). Never raises — a push failure must not undo an
+    already-committed, already-calendared booking.
+    """
+    try:
+        from src.services.calendar.ghl_pipeline import push_booking_to_booked_stage
+
+        pushed = push_booking_to_booked_stage(
+            phone=phone, email=email, first_name=first_name,
+            opportunity_name=f"{topic} ({booking_ref})",
+        )
+        if not pushed:
+            logger.warning(
+                "calendar.book: booking_ref=%s — GHL Booked-stage push did not "
+                "happen (see prior log line for why)", booking_ref,
+            )
+    except Exception:
+        logger.exception(
+            "calendar.book: booking_ref=%s — GHL Booked-stage push raised", booking_ref,
+        )
 
 
 def _notify_booking_confirmed(

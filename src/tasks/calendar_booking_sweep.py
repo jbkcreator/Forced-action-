@@ -94,7 +94,7 @@ def _live_client(factory):
     if isinstance(client, FakeCalendar):
         raise RuntimeError(
             "calendar_booking_sweep refuses to run against FakeCalendar — "
-            "every booking would read as cancelled. Set FA_MAX_CALENDAR_MODE=live."
+            "every booking would read as cancelled. Set LENDING_CALENDAR_MODE=live."
         )
     return client
 

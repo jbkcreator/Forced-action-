@@ -993,6 +993,73 @@ class TestBookingConfirmedNotification:
         assert result.booked is True, "a notification failure must not undo the booking"
 
 
+class TestGhlPipelinePush:
+    """WP-GL-5: a successful booking also pushes the contact into the
+    Booked stage of Next Deal Lending's GHL pipeline (_push_booking_to_ghl).
+    Never undoes an already-committed, already-calendared booking."""
+
+    @pytest.fixture(autouse=True)
+    def _gate_bypassed(self):
+        with _bypass_gate():
+            yield
+
+    def test_successful_push_is_made_with_booking_details(self):
+        session = _NestableRecordingSession()
+        with (
+            _allow_all(),
+            patch(
+                "src.services.calendar.ghl_pipeline.push_booking_to_booked_stage",
+                return_value=True,
+            ) as mock_push,
+        ):
+            result = book(
+                client=FakeCalendar(), session=session, calendar_id=CALENDAR_ID,
+                slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate", phone="+18135551234", first_name="Maria",
+            )
+
+        assert result.booked is True
+        mock_push.assert_called_once()
+        assert mock_push.call_args.kwargs["phone"] == "+18135551234"
+        assert mock_push.call_args.kwargs["email"] == ATTENDEE
+        assert mock_push.call_args.kwargs["first_name"] == "Maria"
+        assert result.booking_ref in mock_push.call_args.kwargs["opportunity_name"]
+
+    def test_push_returning_false_does_not_fail_the_booking(self):
+        session = _NestableRecordingSession()
+        with (
+            _allow_all(),
+            patch(
+                "src.services.calendar.ghl_pipeline.push_booking_to_booked_stage",
+                return_value=False,
+            ),
+        ):
+            result = book(
+                client=FakeCalendar(), session=session, calendar_id=CALENDAR_ID,
+                slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate",
+            )
+
+        assert result.booked is True
+
+    def test_push_raising_does_not_fail_the_booking(self):
+        session = _NestableRecordingSession()
+        with (
+            _allow_all(),
+            patch(
+                "src.services.calendar.ghl_pipeline.push_booking_to_booked_stage",
+                side_effect=RuntimeError("GHL unreachable"),
+            ),
+        ):
+            result = book(
+                client=FakeCalendar(), session=session, calendar_id=CALENDAR_ID,
+                slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate",
+            )
+
+        assert result.booked is True, "a GHL push failure must not undo the booking"
+
+
 class TestBookingConfirmedAgainstRealLendingModule:
     """Runs the real handle_booking_confirmed, not the stub, once #328 has
     merged and src.lending.booking_messages actually exists on this branch.
