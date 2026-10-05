@@ -373,9 +373,10 @@ def a2_coverage_report(db, phones: list[str], *, now: Optional[datetime] = None)
 # ── Call-time gate (WP-W0-3) ─────────────────────────────────────────────────
 
 
-def recipient_timezone(phone: str, zip_code: Optional[str] = None) -> ZoneInfo:
+def recipient_timezone(phone: str, zip_code: Optional[str] = None) -> Optional[ZoneInfo]:
     """Wave 0 pools are Hillsborough/Pinellas: a ZIP in either is Eastern.
-    Otherwise area code, defaulting to Eastern."""
+    Otherwise area code; None for an area code outside the table, so the caller blocks
+    the call rather than assume Eastern (a Central/Pacific recipient would be called early)."""
     if zip_code:
         from src.utils.zip_centroids import get_zip_centroid
 
@@ -384,7 +385,8 @@ def recipient_timezone(phone: str, zip_code: Optional[str] = None) -> ZoneInfo:
     digits = "".join(c for c in phone if c.isdigit())
     if digits.startswith("1"):
         digits = digits[1:]
-    return ZoneInfo(AREA_CODE_TZ.get(digits[:3], DEFAULT_TZ))
+    zone = AREA_CODE_TZ.get(digits[:3])
+    return ZoneInfo(zone) if zone else None
 
 
 def can_dial_now(
@@ -416,7 +418,10 @@ def can_dial_now(
 def _outside_call_window(
     phone: str, now: datetime, zip_code: Optional[str] = None, seat_group: Optional[str] = None
 ) -> bool:
-    local = now.astimezone(recipient_timezone(phone, zip_code)).time()
+    zone = recipient_timezone(phone, zip_code)
+    if zone is None:
+        return True
+    local = now.astimezone(zone).time()
     if not (CALL_WINDOW_START <= local < CALL_WINDOW_END):
         return True
     start, end = SHIFT_GROUPS.get(seat_group, (ET_WINDOW_START, ET_WINDOW_END)) if seat_group else (

@@ -210,8 +210,31 @@ def _push_contact(dialer: DialerContacts, item: _Loadable, known_contact_id: Opt
         except DialerRequestError as exc:
             if exc.status != 404:
                 raise
-    return dialer.upsert_contact(item.phone, fields, campaign=item.display.campaign_tag,
-                                 vendor_contact_id=item.record_ref or None)
+    try:
+        return dialer.upsert_contact(item.phone, fields, campaign=item.display.campaign_tag,
+                                     vendor_contact_id=item.record_ref or None)
+    except DialerRequestError as exc:
+        exc.during_create = True
+        raise
+
+
+def _create_outcome_unknown(exc: DialerRequestError) -> bool:
+    """A create that timed out or hit a 5xx may still have made the contact."""
+    status = exc.status
+    return (getattr(exc, "during_create", False) and not isinstance(exc, ContactFieldsNotSet)
+            and (status is None or status >= 500 or status == 408))
+
+
+def _record_unconfirmed_create(db, run_id: str, item: _Loadable, status: Optional[int]) -> None:
+    db.execute(
+        text(
+            "INSERT INTO lending.dialer_unconfirmed_creates "
+            "(run_id, phone, phone_hash, source_record_ref, error_status) "
+            "VALUES (:run_id, :phone, :phone_hash, :ref, :status)"
+        ),
+        {"run_id": run_id, "phone": item.phone, "phone_hash": phone_hash(item.phone),
+         "ref": item.record_ref, "status": status},
+    )
 
 
 def _store_chunk(db, run_id: str, loaded: list[tuple[_Loadable, int]],
@@ -255,6 +278,31 @@ def _store_chunk(db, run_id: str, loaded: list[tuple[_Loadable, int]],
     )
 
 
+def _raise_if_refused(unmapped_pools: Sequence[str], duplicate_phones: int) -> None:
+    if unmapped_pools:
+        raise LoadRefused(f"no campaign tag for pool(s): {', '.join(unmapped_pools)}")
+    if duplicate_phones:
+        raise LoadRefused(f"{duplicate_phones} phone(s) would load for more than one record")
+
+
+def _refuse_before_scrub(records: Sequence[Mapping[str, Any]], phones: Sequence[Optional[str]], db,
+                         campaign_tags: Mapping[str, str], backflip_check: bool) -> None:
+    """Refusal checks that must run before the paid Tracerfy scrub, which a refused run would
+    otherwise pay for and then roll back. A number the scrub could still clear counts as
+    loadable, so this can only over-refuse, never under-refuse."""
+    results = filter_loadable(list(records), db, scrubber=no_scrub)
+    blocks = {i: r for i, r in _gate_blocks(records, results).items() if r != REASON_SCRUB_FAILED}
+    if backflip_check:
+        candidates = [i for i in range(len(records)) if i not in blocks]
+        blocks.update(_conflict_blocks(db, records, candidates, phones)[0])
+    blocked = set(blocks) | set(_propagate_by_phone(phones, blocks))
+    possible = [i for i in range(len(records)) if i not in blocked]
+    pools = sorted({str(records[i].get("pool") or "") for i in possible
+                    if not campaign_tags.get(str(records[i].get("pool") or ""))})
+    per_phone = Counter(phones[i] for i in possible if phones[i])
+    _raise_if_refused(pools, sum(1 for n in per_phone.values() if n > 1))
+
+
 def run_dialer_load(
     records: Sequence[Mapping[str, Any]],
     db,
@@ -281,6 +329,8 @@ def run_dialer_load(
     if not dry_run and (scrubber is None or dialer is None):
         raise ValueError("a live load needs a scrubber and a dialer")
     phones = [normalize_phone(r.get("normalized_phone") or r.get("phone") or "") for r in records]
+    if not dry_run:
+        _refuse_before_scrub(records, phones, db, campaign_tags, backflip_check)
 
     gate_results = filter_loadable(
         list(records), db, scrubber=no_scrub if dry_run else scrubber,
@@ -346,10 +396,7 @@ def run_dialer_load(
         logger.info("[dialer-load] dry run %s: %s", run_id, json.dumps(report.as_dict()))
         return report
 
-    if report.unmapped_pools:
-        raise LoadRefused(f"no campaign tag for pool(s): {', '.join(report.unmapped_pools)}")
-    if report.duplicate_phones:
-        raise LoadRefused(f"{report.duplicate_phones} phone(s) would load for more than one record")
+    _raise_if_refused(report.unmapped_pools, report.duplicate_phones)
 
     _write_exclusions(db, run_id, exclusion_rows)
     commit = commit or db.commit
@@ -363,6 +410,9 @@ def run_dialer_load(
         except DialerRequestError as exc:
             report.failed.append({"record_ref": item.record_ref, "error": type(exc).__name__,
                                   "status": getattr(exc, "status", None)})
+            if _create_outcome_unknown(exc):
+                _record_unconfirmed_create(db, run_id, item, exc.status)
+                commit()
             if not isinstance(exc, ContactFieldsNotSet):
                 continue
             contact_id = exc.contact_id  # live in the dialer: track it so opt-out can delete it

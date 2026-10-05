@@ -108,6 +108,20 @@ def test_recipient_timezone_is_lending_owned_and_conservative_for_850():
     assert recipient_timezone("+18135551234", zip_code="33602").key == "America/New_York"
 
 
+def test_florida_overlay_area_codes_are_known_eastern():
+    from src.lending.compliance import recipient_timezone
+    for phone in ("+16565551234", "+16895551234", "+19435551234"):  # Tampa, Orlando, Atlanta overlays
+        assert recipient_timezone(phone).key == "America/New_York"
+
+
+def test_unknown_area_code_is_blocked_not_assumed_eastern(db):
+    from src.lending.compliance import can_dial_now, recipient_timezone
+    assert recipient_timezone("+13125551234") is None  # 312 Central, not in the table
+    for phone in ("+13125551234", "+13105551234"):
+        result = can_dial_now(phone, db, now=datetime(2026, 9, 29, 14, 30, tzinfo=timezone.utc))  # 10:30 ET
+        assert result.reason == ReasonCode.OUTSIDE_CALL_WINDOW
+
+
 class FakeDialer:
     def __init__(self):
         self.removed, self.reasons = [], []

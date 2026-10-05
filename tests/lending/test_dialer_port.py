@@ -377,3 +377,20 @@ def test_the_card_update_keeps_our_vendor_contact_id():
     BatchDialerAdapter(http=http, endpoints=ENDPOINTS).upsert_contact(
         PHONE, FIELDS, campaign="Builders", vendor_contact_id="staging:9")
     assert http.calls[-1][2]["vendorcontactid"] == "staging:9"
+
+
+def test_an_opt_out_stays_pending_while_an_earlier_create_for_the_phone_is_unconfirmed():
+    from src.lending.dialer_port import UnreconciledContact
+
+    http = FakeHttp()
+    adapter = BatchDialerAdapter(http=http, endpoints=ENDPOINTS, contact_ids=lambda phone: ["77"],
+                                 has_unconfirmed_create=lambda phone: True)
+    with pytest.raises(UnreconciledContact):
+        adapter.remove(PHONE, reason=RemovalReason.OPT_OUT.value)
+    assert [(c[0], c[1]) for c in http.calls] == [("DELETE", "/contact/77")]  # known contacts still deleted
+
+
+def test_an_opt_out_completes_when_no_create_is_unconfirmed():
+    BatchDialerAdapter(http=FakeHttp(), endpoints=ENDPOINTS, contact_ids=lambda phone: [],
+                       has_unconfirmed_create=lambda phone: False).remove(
+        PHONE, reason=RemovalReason.OPT_OUT.value)

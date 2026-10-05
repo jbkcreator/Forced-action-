@@ -68,6 +68,11 @@ class DialerRequestError(RuntimeError):
         self.status = status
 
 
+class UnreconciledContact(RuntimeError):
+    """An earlier create for this phone failed ambiguously, so a dialer contact may exist that we
+    hold no id for. Raised on opt-out so it stays pending (and alarms) instead of completing."""
+
+
 class ContactFieldsNotSet(DialerRequestError):
     """The contact was created in the campaign but the follow-up field update failed.
 
@@ -109,8 +114,10 @@ class InMemoryDialer:
 
 class BatchDialerAdapter:
     def __init__(self, *, http: Http, endpoints: Mapping[str, Endpoint] = BATCHDIALER_ENDPOINTS,
-                 contact_ids: Optional[Callable[[str], list[str]]] = None) -> None:
+                 contact_ids: Optional[Callable[[str], list[str]]] = None,
+                 has_unconfirmed_create: Optional[Callable[[str], bool]] = None) -> None:
         self._http = http
+        self._has_unconfirmed_create = has_unconfirmed_create
         self._endpoints = endpoints
         self._contact_ids = contact_ids
         self._campaign_ids: Optional[dict[str, Any]] = None
@@ -214,6 +221,8 @@ class BatchDialerAdapter:
             except DialerRequestError as exc:
                 if exc.status != 404:  # already gone: the opt-out is done for this contact
                     raise
+        if self._has_unconfirmed_create is not None and self._has_unconfirmed_create(phone):
+            raise UnreconciledContact("an earlier dialer create for this phone is unconfirmed")
 
     def restore(self, phone: str) -> None:
         self._call("campaign_restore", {"phone": phone})
@@ -296,7 +305,8 @@ def get_dialer() -> Optional[Dialer]:
     key = get_settings().batchdialer_api_key
     if key is None or not BATCHDIALER_BASE_URL:
         return None
-    return BatchDialerAdapter(http=_requests_http(key.get_secret_value()), contact_ids=_loaded_contact_ids)
+    return BatchDialerAdapter(http=_requests_http(key.get_secret_value()), contact_ids=_loaded_contact_ids,
+                              has_unconfirmed_create=_has_unconfirmed_create)
 
 
 def _loaded_contact_ids(phone: str) -> list[str]:
@@ -309,6 +319,17 @@ def _loaded_contact_ids(phone: str) -> list[str]:
                  "WHERE phone = :p AND dialer_contact_id IS NOT NULL"),
             {"p": normalize_phone(phone)},
         )]
+
+
+def _has_unconfirmed_create(phone: str) -> bool:
+    from src.core.database import get_db_context
+
+    with get_db_context() as db:
+        return db.execute(
+            text("SELECT EXISTS (SELECT 1 FROM lending.dialer_unconfirmed_creates "
+                 "WHERE phone = :p AND resolved_at IS NULL)"),
+            {"p": normalize_phone(phone)},
+        ).scalar_one()
 
 
 def get_http() -> Optional[Http]:

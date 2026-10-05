@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from src.lending import dialer_load
 from src.lending.backflip_conflict import BackflipIdentifierIndex, hash_phone
 from src.lending.dialer_load import LoadRefused, run_dialer_load
-from src.lending.models import LendingDialerLoadRecord
+from src.lending.models import LendingDialerLoadRecord, LendingDialerUnconfirmedCreate
 from src.lending.dialer_port import ContactFieldsNotSet, ContactUpsertResult, DialerRequestError
 
 pytestmark = pytest.mark.skipif(
@@ -64,6 +64,7 @@ def db():
     conn = engine.connect()
     tx = conn.begin()
     LendingDialerLoadRecord.__table__.create(conn, checkfirst=True)
+    LendingDialerUnconfirmedCreate.__table__.create(conn, checkfirst=True)
     session = Session(bind=conn)
     yield session
     session.close()
@@ -206,6 +207,31 @@ class TestLiveLoad:
         with pytest.raises(LoadRefused, match="more than one record"):
             _run(db, [_record("a", P1), _record("a2", P1)], aircall=aircall)
         assert aircall.upserts == []
+
+    def test_a_refused_run_never_pays_for_a_scrub(self, db):
+        scrub_calls = []
+        records = [_record("a", P1, pool="brokers"), _record("b", P2)]  # P1, P2 have no fresh scrub
+        with patch.object(dialer_load, "load_backflip_identifier_index", return_value=EMPTY_INDEX):
+            with pytest.raises(LoadRefused, match="brokers"):
+                run_dialer_load(records, db, run_id="run-1", dry_run=False,
+                                scrubber=lambda phones: scrub_calls.append(phones) or [],
+                                dialer=FakeAircall(), campaign_tags=TAGS, commit=db.flush, now=NOON_ET)
+        assert scrub_calls == []
+
+    def test_a_create_that_fails_with_a_5xx_is_recorded_as_unconfirmed(self, db):
+        _fresh_scrub(db, P1, P2)
+        report, _ = _run(db, [_record("a", P1), _record("b", P2)], aircall=FakeAircall(fail_phones=[P1]))
+        assert report.loaded == 1
+        rows = db.execute(text(
+            "SELECT phone, error_status, resolved_at FROM lending.dialer_unconfirmed_creates")).fetchall()
+        assert [(r.phone, r.error_status, r.resolved_at) for r in rows] == [(P1, 500, None)]
+
+    def test_a_create_rejected_with_a_4xx_is_not_unconfirmed(self, db):
+        _fresh_scrub(db, P1)
+        aircall = FakeAircall()
+        aircall.upsert_contact = lambda *a, **k: (_ for _ in ()).throw(DialerRequestError("POST", status=422))
+        _run(db, [_record("a", P1)], aircall=aircall)
+        assert db.execute(text("SELECT count(*) FROM lending.dialer_unconfirmed_creates")).scalar_one() == 0
 
     def test_one_aircall_failure_does_not_stop_the_rest(self, db):
         _fresh_scrub(db, P1, P2)

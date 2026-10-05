@@ -43,6 +43,7 @@ PYTHONPATH=. python migrations/apply_fa_max_wp_t2_2_tool_call_log_in_progress_st
 PYTHONPATH=. python migrations/apply_fa_max_wp_t2_2_tool_call_log_claimed_status.py  # FA Max WP-T2-2 review fix: widens fa_max_tool_call_log.status CHECK to allow 'claimed' (claim_send_attempt()'s short-lived commit so a timeout write can't clobber a legitimately-claimed send) (idempotent, run after apply_fa_max_wp_t2_2_tool_call_log_in_progress_status.py)
 PYTHONPATH=. python migrations/apply_fa_max_wp_t2_3.py  # FA Max WP-T2-3: opportunity_id on relay_approval_queue, backflip_attribution_owner/set_at on fa_max_opportunities, fa_max_backflip_suppression_decisions audit table (idempotent, run after WP-T2-2)
 PYTHONPATH=. python migrations/apply_property_radar_pull_runs.py  # PropertyRadar ingestion adapter (Dev 1): property_radar_pull_runs (run checkpoint) + property_radar_seen_ids (dedup) (idempotent)
+PYTHONPATH=. python migrations/apply_lending_dialer_unconfirmed_creates.py  # Lending dialer load: lending.dialer_unconfirmed_creates (ambiguous creates; keeps an opt-out pending until resolved) (idempotent)
 PYTHONPATH=. python migrations/apply_property_radar_traced_contacts.py  # PropertyRadar live Tracerfy trace: property_radar_traced_contacts (paid contacts stored with the ledger rows; run before the first --live-trace) (idempotent)
 
 PYTHONPATH=. python migrations/apply_lending_call_dispositions.py  # lending.call_dispositions (idempotent); runbook docs/lending/dialer-disposition-runbook.md
