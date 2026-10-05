@@ -17,6 +17,7 @@ Run:
 from __future__ import annotations
 
 import json
+import secrets
 import threading
 from datetime import datetime, timedelta
 from typing import Optional
@@ -406,20 +407,57 @@ class TestStoreGateIntegration:
         ).mappings().first()
         assert nrow is None
 
+    def _make_tracked_link(self, gate_db) -> int:
+        """fa_max_booking_gates.tracked_link_id FKs to tracked_links.id."""
+        row = gate_db.execute(
+            text(
+                """
+                INSERT INTO tracked_links (slug, kind, label, created_by, is_active)
+                VALUES (:slug, 'source', 'test link', 'test_caller', true)
+                RETURNING id
+                """
+            ),
+            {"slug": f"test-{secrets.token_urlsafe(8)}"},
+        ).mappings().first()
+        gate_db.commit()
+        return row["id"]
+
+    def _backdate(self, gate_db, gate_id: str, seconds_ago: int) -> None:
+        """Force a deterministic evaluated_at ordering.
+
+        fresh_db binds the whole test to one outer Postgres transaction, and
+        NOW() is constant for the life of a transaction — two store_gate()
+        calls in the same test land on the identical evaluated_at value, so
+        ORDER BY evaluated_at DESC ties and the result is whichever row
+        Postgres happens to return first, not necessarily the later call.
+        Real traffic never hits this (each request is its own transaction);
+        only this rollback-based test fixture can, so the test backdates
+        explicitly rather than trusting wall-clock order within one txn.
+        """
+        gate_db.execute(
+            text(
+                "UPDATE fa_max_booking_gates SET evaluated_at = NOW() - make_interval(secs => :s) "
+                "WHERE gate_id = :gid"
+            ),
+            {"s": seconds_ago, "gid": gate_id},
+        )
+
     def test_a_later_fail_invalidates_an_earlier_pass_on_the_same_link(self, gate_db):
         """Review finding: get_passed_gate_for_link must not let a stale pass
         outrank a fresh re-screening that failed on the same tracked_link."""
         from src.services.calendar.gate import get_passed_gate_for_link, store_gate
 
-        link_id = 919191  # arbitrary — no FK on tracked_link_id in this table
+        link_id = self._make_tracked_link(gate_db)
 
         with _no_real_alert():
-            store_gate(
+            earlier_pass_id, _ = store_gate(
                 gate_db,
                 answers=_passing_answers(),
                 tracked_link_id=link_id,
                 captured_by="test_caller",
             )
+            self._backdate(gate_db, earlier_pass_id, seconds_ago=60)
+
             store_gate(
                 gate_db,
                 answers=_passing_answers(occupancy="homestead"),
@@ -432,15 +470,17 @@ class TestStoreGateIntegration:
     def test_a_later_pass_is_found_after_an_earlier_fail(self, gate_db):
         from src.services.calendar.gate import get_passed_gate_for_link, store_gate
 
-        link_id = 919192
+        link_id = self._make_tracked_link(gate_db)
 
         with _no_real_alert():
-            store_gate(
+            earlier_fail_id, _ = store_gate(
                 gate_db,
                 answers=_passing_answers(occupancy="homestead"),
                 tracked_link_id=link_id,
                 captured_by="test_caller",
             )
+            self._backdate(gate_db, earlier_fail_id, seconds_ago=60)
+
             gate_id, _ = store_gate(
                 gate_db,
                 answers=_passing_answers(),
