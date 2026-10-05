@@ -259,7 +259,15 @@ def _requests_http(api_key: str) -> Http:
         except requests.RequestException as exc:
             logger.warning("[dialer] BatchDialer %s %s failed: %s", method, path, type(exc).__name__)
             raise DialerRequestError(f"BatchDialer {method} {path}: {type(exc).__name__}") from exc
-        return response.json() if response.content else {}
+        if not response.content:
+            return {}
+        try:
+            return response.json()
+        except ValueError as exc:
+            # A 2xx that is not JSON (proxy error page, truncated body) is a failed call,
+            # not a crash: callers only handle DialerRequestError.
+            logger.warning("[dialer] BatchDialer %s %s returned a non-JSON body", method, path)
+            raise DialerRequestError(f"BatchDialer {method} {path}: non-JSON response") from exc
 
     return call
 

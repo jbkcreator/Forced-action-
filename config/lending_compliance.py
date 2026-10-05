@@ -28,6 +28,16 @@ ATTEMPT_PERIOD_HOURS = 24        # rolling
 MAX_ATTEMPTS_TOTAL = 6
 ATTEMPT_HISTORY_BUSINESS_DAYS = 10
 DNC_SCRUB_MAX_AGE_DAYS = 7
+# The weekly job (cron: Mondays) must rescrub every phone whose scrub would turn stale for the
+# sweep before the next run: age > DNC_SCRUB_MAX_AGE_DAYS - period. With period == max age that
+# is every loaded phone. A threshold equal to the max age (the old behaviour) skips a phone that
+# is 6d23h old, which then sits stale for the sweep until the following Monday (~half the pool).
+WEEKLY_SCRUB_PERIOD_DAYS = 7
+WEEKLY_RESCRUB_AFTER_DAYS = max(0, DNC_SCRUB_MAX_AGE_DAYS - WEEKLY_SCRUB_PERIOD_DAYS)
+# If more than this share of the loaded pool looks stale the weekly job (or Tracerfy) is down,
+# not 20% of the numbers: the sweep alerts instead of mass-pulling the pool from the dialer.
+SCRUB_STALE_BREAKER_PCT = 25
+SCRUB_STALE_BREAKER_MIN_POOL = 20
 STOP_PROPAGATION_SLA_SECONDS = 60
 OPT_OUT_POLL_SECONDS = 15        # FA opt-out poller interval; worst case well inside the SLA
 # GoHighLevel opt-out sync: every lending opt-out becomes DND on the GHL contact.
@@ -155,3 +165,7 @@ def validate_lending_compliance_config() -> None:
         raise ValueError("OPT_OUT_POLL_SECONDS must leave room inside the stop-propagation SLA")
     if ATTEMPT_PERIOD_HOURS < 1 or DNC_SCRUB_MAX_AGE_DAYS < 1 or STOP_PROPAGATION_SLA_SECONDS < 1:
         raise ValueError("periods and SLAs must be positive")
+    if not 1 <= WEEKLY_SCRUB_PERIOD_DAYS <= DNC_SCRUB_MAX_AGE_DAYS:
+        raise ValueError("WEEKLY_SCRUB_PERIOD_DAYS must not exceed DNC_SCRUB_MAX_AGE_DAYS")
+    if not 0 < SCRUB_STALE_BREAKER_PCT <= 100 or SCRUB_STALE_BREAKER_MIN_POOL < 1:
+        raise ValueError("scrub-stale breaker thresholds must be positive (pct <= 100)")

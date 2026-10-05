@@ -226,6 +226,19 @@ def _push_contact(dialer: DialerContacts, item: _Loadable, known_contact_id: Opt
                                  vendor_contact_id=item.record_ref or None)
 
 
+def _record_pushed_before_abort(db, run_id: str, chunk: list[tuple[_Loadable, int]],
+                                active: dict[str, tuple[int, Optional[int]]],
+                                commit: Callable[[], None]) -> None:
+    if not chunk:
+        return
+    try:
+        _store_chunk(db, run_id, chunk, active)
+        commit()
+    except Exception as exc:
+        logger.error("[dialer-load] run %s aborted with %d pushed contact(s) not recorded (%s); "
+                     "reconcile them against the dialer", run_id, len(chunk), type(exc).__name__)
+
+
 def _store_chunk(db, run_id: str, loaded: list[tuple[_Loadable, int]],
                  active: dict[str, tuple[int, Optional[int]]]) -> None:
     superseded = [active[item.phone][0] for item, _ in loaded if item.phone in active]
@@ -368,23 +381,30 @@ def run_dialer_load(
     commit()
     active = _active_rows(db, loadable_phones)
     chunk: list[tuple[_Loadable, int]] = []
-    for item in loadable:
-        fields = dialer_fields(item.display, email=item.record.get("email"))
-        try:
-            _, known_contact_id, known_campaign_tag = active.get(item.phone, (None, None, None))
-            result = _push_contact(dialer, item, known_contact_id, known_campaign_tag, fields)
-        except DialerRequestError as exc:
-            report.failed.append({"record_ref": item.record_ref, "error": type(exc).__name__,
-                                  "status": getattr(exc, "status", None)})
-            continue
-        report.loaded += 1
-        report.created += int(result.created)
-        report.updated += int(not result.created)
-        chunk.append((item, result.contact_id))
-        if len(chunk) >= COMMIT_CHUNK_SIZE:
-            _store_chunk(db, run_id, chunk, active)
-            commit()
-            chunk = []
+    try:
+        for item in loadable:
+            fields = dialer_fields(item.display, email=item.record.get("email"))
+            try:
+                _, known_contact_id, known_campaign_tag = active.get(item.phone, (None, None, None))
+                result = _push_contact(dialer, item, known_contact_id, known_campaign_tag, fields)
+            except DialerRequestError as exc:
+                report.failed.append({"record_ref": item.record_ref, "error": type(exc).__name__,
+                                      "status": getattr(exc, "status", None)})
+                continue
+            report.loaded += 1
+            report.created += int(result.created)
+            report.updated += int(not result.created)
+            chunk.append((item, result.contact_id))
+            if len(chunk) >= COMMIT_CHUNK_SIZE:
+                _store_chunk(db, run_id, chunk, active)
+                commit()
+                chunk = []
+    except BaseException:
+        # SIGTERM, a crash or an unexpected error mid-run: contacts already pushed to the
+        # dialer but not yet recorded would be live with no load row, invisible to a later
+        # opt-out removal. Record them before the error propagates.
+        _record_pushed_before_abort(db, run_id, chunk, active, commit)
+        raise
     if chunk:
         _store_chunk(db, run_id, chunk, active)
         commit()

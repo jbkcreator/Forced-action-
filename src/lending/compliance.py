@@ -36,6 +36,8 @@ from config.lending_compliance import (
     DIALER_SWEEP_LOCK_KEY,
     DIALER_OPT_OUT_SOURCE,
     DNC_SCRUB_MAX_AGE_DAYS,
+    SCRUB_STALE_BREAKER_MIN_POOL,
+    SCRUB_STALE_BREAKER_PCT,
     GHL_DND_BATCH,
     GEORGIA_ALLOWED_ENTITY_TYPES,
     HOMESTEAD_GATE_EXCLUDED_SOURCE_TAGS,
@@ -108,7 +110,7 @@ def _homestead_blocked(record: dict) -> bool:
 
     Blocks only a *confirmed* homestead-exempt property (``homestead_exempt is
     True``). Josh's rule describes two allowed categories and says nothing about
-    an unverified status, and properties.homestead_exempt has no backfill pipeline
+    an unverified status, and financials.homestead_exempt has few confirmed values
     yet — nearly every current record is NULL. Treating NULL as blocked would gate
     out virtually the entire pool, directly against his #1 stated priority (lead
     volume). Unknown passes through like every other unscored field here; this
@@ -563,11 +565,11 @@ def _attempt_history_exhausted_phones(db, phones: list[str], now: datetime) -> s
 
 
 def _close_exhausted_load_row(db, phone: str) -> None:
-    """Permanently closes the load row once total attempt history crosses the cap.
-    Unlike a CALL_WINDOW/ATTEMPT_CAP/SCRUB_STALE hold, this can never un-do itself
-    (the count only grows), so the contact must leave the active pool for good and
-    move to nurture — the same disposition as a DNC/litigator verdict, not a
-    temporary sweep hold."""
+    """Closes the load row once total attempt history crosses the cap, and the contact
+    moves to nurture — the same disposition as a DNC/litigator verdict, not a temporary
+    sweep hold. The count is a rolling ATTEMPT_HISTORY_BUSINESS_DAYS window, so it can
+    fall again as attempts age out, but nothing reopens this row: the contact only
+    returns if a later load run re-pushes it."""
     db.execute(
         text(
             "UPDATE lending.dialer_load_records SET active = false, deactivated_at = now(), "
@@ -586,8 +588,9 @@ def on_attempt_recorded(
 ) -> Optional[GateResult]:
     """WP-W0-6 hook, called after every call.ended row commits. At the 24h cap, pull
     the contact from the dialer pool (restoring after 24h is the step-5 sweep's job).
-    At the total-history cap, the move is permanent: flag nurture, remove from the
-    dialer and close the load row, rather than a temporary hold. Idempotent: a replay
+    At the total-history cap, flag nurture, remove from the dialer and close the load
+    row, rather than a temporary hold; that outranks the 24h cap when both apply, so the
+    nurture flag is never skipped. Idempotent: a replay
     re-counts the same rows and re-issues the same removal (a no-op for a contact
     already out of the pool). Does not commit."""
     normalized = normalize_phone(phone) if phone else None
@@ -595,15 +598,17 @@ def on_attempt_recorded(
         return None
     now = now or datetime.now(timezone.utc)
     result = _attempt_cap(db, normalized, now)
+    if _attempt_history_exhausted_phones(db, [normalized], now):
+        _flag_nurture(db, [normalized])
+        # Close the row only once the dialer confirmed the removal: the sweep and weekly
+        # job read active rows only, so closing it after a failed removal would leave the
+        # contact dialable with nothing left to retry the removal.
+        if _remove_from_dialer([normalized], dialer_remover, RemovalReason.ATTEMPT_HISTORY):
+            _close_exhausted_load_row(db, normalized)
+        return _blocked(normalized, ReasonCode.ATTEMPT_HISTORY_EXCEEDED)
     if not result.allowed:
         if _remove_from_dialer([normalized], dialer_remover, RemovalReason.ATTEMPT_CAP):
             _open_holds(db, {normalized: RemovalReason.ATTEMPT_CAP})
-        return result
-    if _attempt_history_exhausted_phones(db, [normalized], now):
-        _flag_nurture(db, [normalized])
-        _remove_from_dialer([normalized], dialer_remover, RemovalReason.ATTEMPT_HISTORY)
-        _close_exhausted_load_row(db, normalized)
-        return _blocked(normalized, ReasonCode.ATTEMPT_HISTORY_EXCEEDED)
     return result
 
 
@@ -663,6 +668,13 @@ def _stale_scrub_phones(db, phones: list[str], now: datetime) -> set[str]:
     return {p for p in phones if p not in scrubs or scrubs[p].checked_at < cutoff}
 
 
+def _scrub_stale_breaker_tripped(*, stale: int, pool: int) -> bool:
+    """True when so much of the loaded pool looks stale that the weekly rescrub (or Tracerfy)
+    is down. Pulling it all would empty the dialer; the per-dial gate still blocks each
+    stale number at dial time, so the sweep alerts instead."""
+    return pool >= SCRUB_STALE_BREAKER_MIN_POOL and stale * 100 > pool * SCRUB_STALE_BREAKER_PCT
+
+
 def dial_blocks(db, phones: list[str], *, now: Optional[datetime] = None) -> dict[str, ReasonCode]:
     """``can_dial_now`` for many phones in one query: phone -> reason for each one that
     cannot be dialed now (attempt cap, total attempt history, the calling window, then
@@ -695,8 +707,8 @@ def _hold_reason(
         # Defense in depth: on_attempt_recorded already closes the load row and
         # removes the contact the moment the total-history cap is crossed, so the
         # sweep should never actually find one of these still active. If it does
-        # (a missed disposition event, say), this never releases — the count can
-        # only grow — matching on_attempt_recorded's permanent-move-to-nurture intent.
+        # (a missed disposition event, say), it stays held while the rolling window
+        # still counts the attempts, matching on_attempt_recorded's move to nurture.
         return RemovalReason.ATTEMPT_HISTORY
     if _outside_call_window(phone, now):
         return RemovalReason.CALL_WINDOW
@@ -733,6 +745,11 @@ def sweep_dialer_pool(
     active = [p for p in loaded if p not in held]
     counts = _attempt_counts(db, active, now) if active else {}
     stale = _stale_scrub_phones(db, active, now) if active else set()
+    if _scrub_stale_breaker_tripped(stale=len(stale), pool=len(active)):
+        logger.error("[lending-compliance] %d of %d loaded phone(s) have a stale scrub (> %d%%): the weekly "
+                     "rescrub looks down; not mass-pulling them this cycle", len(stale), len(active),
+                     SCRUB_STALE_BREAKER_PCT)
+        stale = set()
     exhausted = _attempt_history_exhausted_phones(db, active, now) if active else set()
     to_pull = {
         p: r for p in active
@@ -886,11 +903,13 @@ def propagate_opt_out(
 
 
 def poll_fa_opt_outs(db, *, dialer_remover: Optional[DialerRemover] = None,
-                     ghl_dnd: Optional[Callable[[str], bool]] = None) -> PollResult:
+                     ghl_dnd: Optional[Callable[[str], bool]] = None, sync_ghl: bool = True) -> PollResult:
     """Mirror each FA opt-out row exactly once (keyed on its FA row id, so a raw or
     padded FA value can never loop), and retry pending dialer removals.
 
-    One cycle at a time across processes (transaction-scoped advisory lock).
+    One cycle at a time across processes (transaction-scoped advisory lock). The GHL
+    do-not-disturb sync runs here by default; the poller passes ``sync_ghl=False`` and
+    runs ``sync_ghl_dnd`` in its own transaction so slow GHL calls never hold this one.
     Does not commit."""
     if not db.execute(text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": POLL_LOCK_KEY}).scalar():
         return PollResult(new_opt_outs=0, dialer_retried=0, skipped_locked=True)
@@ -923,13 +942,14 @@ def poll_fa_opt_outs(db, *, dialer_remover: Optional[DialerRemover] = None,
         _propagate(db, opt_outs, dialer_remover)
 
     retried = _retry_pending_dialer_removals(db, dialer_remover)
-    _sync_ghl_dnd(db, ghl_dnd)
+    if sync_ghl:
+        sync_ghl_dnd(db, ghl_dnd)
     if opt_outs or retried:
         logger.info("[lending-compliance] poll new_opt_outs=%d dialer_retried=%d", len(opt_outs), retried)
     return PollResult(new_opt_outs=len(opt_outs), dialer_retried=retried)
 
 
-def _sync_ghl_dnd(db, ghl_dnd: Optional[Callable[[str], bool]]) -> int:
+def sync_ghl_dnd(db, ghl_dnd: Optional[Callable[[str], bool]]) -> int:
     """Write every opt-out not yet in GHL as do-not-disturb (new ones and retries alike),
     a bounded batch per poll. Returns how many GHL accepted."""
     if ghl_dnd is None:

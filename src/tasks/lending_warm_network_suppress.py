@@ -24,13 +24,20 @@ from pathlib import Path
 
 from src.core.database import get_db_context
 from src.lending.compliance import suppress_warm_network_phones
+from src.services.phone_utils import normalize as normalize_phone
 
 logger = logging.getLogger(__name__)
 
 
 def _read_phones(path: Path) -> list[str]:
-    with path.open(newline="", encoding="utf-8") as handle:
-        return [row["phone"] for row in csv.DictReader(handle) if (row.get("phone") or "").strip()]
+    """``utf-8-sig`` drops the BOM Excel's "CSV UTF-8" export puts on the first header;
+    the header is matched case-insensitively (``Phone``, ``PHONE``)."""
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        column = next((name for name in reader.fieldnames or [] if (name or "").strip().lower() == "phone"), None)
+        if column is None:
+            return []
+        return [row[column] for row in reader if (row.get(column) or "").strip()]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -41,6 +48,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     phones = _read_phones(args.input)
+    if not any(normalize_phone(p) for p in phones):
+        logger.error("[warm-network] no valid phone numbers found in %s (needs a 'phone' column); nothing suppressed",
+                     args.input)
+        return 1
     with get_db_context() as session:
         count = suppress_warm_network_phones(session, phones, source_ref=args.input.name)
         if args.apply:

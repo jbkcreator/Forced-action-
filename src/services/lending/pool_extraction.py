@@ -297,7 +297,7 @@ class CallingPoolRecord:
     source_tag: Optional[str] = None
     stalled_flip: bool = False
     # F8 (Josh, Oct 4 §2): owner-occupied status of the target property, from
-    # properties.homestead_exempt. None for pools with no single subject property
+    # financials.homestead_exempt. None for pools with no single subject property
     # (mortgage_broker: the record is a professional, not a property owner).
     homestead_exempt: Optional[bool] = None
 
@@ -438,7 +438,7 @@ def _extract_pool1_wholesaler_flipper(
                 p.city                          AS prop_city,
                 p.state                         AS prop_state,
                 p.zip                           AS prop_zip,
-                p.homestead_exempt              AS homestead_exempt,
+                f.homestead_exempt              AS homestead_exempt,
                 d.sale_price                    AS last_sale_price,
                 d.record_date                   AS last_purchase_date,
                 EXISTS (SELECT 1 FROM deeds later
@@ -449,6 +449,7 @@ def _extract_pool1_wholesaler_flipper(
                                        AND bel.source_table IN ('deeds', 'deed_wholesaler')
             JOIN deeds d    ON d.id = bel.source_id
             JOIN properties p ON p.id = d.property_id
+            LEFT JOIN financials f ON f.property_id = p.id
             JOIN counties c   ON c.county_id = p.county_id
             -- The entity's OWN contact, via its clustered owner records
             -- (buyer_entity_links source_table='owners' → owners). These records
@@ -536,7 +537,7 @@ def _extract_pool1_wholesaler_flipper(
             source_property_id=row.source_property_id,
             source_table="buyer_entities",
             stalled_flip=is_stalled_flip(_as_date(row.last_purchase_date), resold=bool(row.resold)),
-            homestead_exempt=row.homestead_exempt,
+            homestead_exempt=_buyer_homestead(row.homestead_exempt, bool(row.resold)),
         ))
 
     logger.info("Pool 1 wholesaler_flipper: %d raw rows", len(records))
@@ -1090,6 +1091,12 @@ def permit_owner_record(row: Any) -> CallingPoolRecord:
     )
 
 
+def _buyer_homestead(homestead_exempt: Optional[bool], resold: bool) -> Optional[bool]:
+    """A resold deed property's appraiser flag describes its new (often owner-occupant)
+    owner, not the flipper, so it must not screen the flipper out."""
+    return None if resold else homestead_exempt
+
+
 def drop_claimed_phones(records: list[CallingPoolRecord], claimed: set[str]) -> list[CallingPoolRecord]:
     """Keep records whose phone no higher-priority pool (or earlier record) already holds.
     Phoneless records are always kept (they are traced individually)."""
@@ -1115,12 +1122,13 @@ def _extract_list7_permit_owners(session: Session, county_ids: list[str]) -> lis
                 bp.property_id AS source_property_id, bp.permit_number, bp.permit_type, bp.issue_date,
                 bp.job_value, bp.county_id, c.display_name AS county_name,
                 p.parcel_id, p.address AS prop_address, p.city AS prop_city, p.state AS prop_state,
-                p.zip AS prop_zip, p.homestead_exempt, o.owner_name,
+                p.zip AS prop_zip, f.homestead_exempt, o.owner_name,
                 COALESCE(o.phone_1, o.phone_2, o.phone_3) AS owner_phone,
                 o.email_1 AS owner_email
             FROM building_permits bp
             JOIN counties c ON c.county_id = bp.county_id
             JOIN properties p ON p.id = bp.property_id
+            LEFT JOIN financials f ON f.property_id = bp.property_id
             LEFT JOIN owners o ON o.property_id = bp.property_id
             WHERE bp.is_enforcement_permit = FALSE
               AND bp.county_id = ANY(:county_ids)
@@ -1159,7 +1167,9 @@ def auction_winner_record(row: Any) -> CallingPoolRecord:
         buyer_entity_id=None, permit_number=None, dbpr_license_number=None,
         source_property_id=row.property_id, source_table="tax_deed_auctions",
         source_tag="list_6",
-        homestead_exempt=row.homestead_exempt,
+        # The appraiser flag on this parcel describes the former owner the winner just
+        # bought it from, not the winner, so it is never used to screen them.
+        homestead_exempt=None,
     )
 
 
@@ -1169,8 +1179,7 @@ def _extract_auction_winners(session: Session, county_ids: list[str]) -> list[Ca
             SELECT tda.id AS auction_id, tda.sold_to, tda.sold_amount, tda.property_id,
                    COALESCE(tda.parcel_id, p.parcel_id) AS parcel_id,
                    tda.county_id, c.display_name AS county_name,
-                   p.address AS prop_address, p.city AS prop_city, p.state AS prop_state, p.zip AS prop_zip,
-                   p.homestead_exempt
+                   p.address AS prop_address, p.city AS prop_city, p.state AS prop_state, p.zip AS prop_zip
             FROM tax_deed_auctions tda
             LEFT JOIN properties p ON p.id = tda.property_id
             LEFT JOIN counties c ON c.county_id = tda.county_id

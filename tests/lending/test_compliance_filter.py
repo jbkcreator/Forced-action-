@@ -126,7 +126,7 @@ def test_llc_owner_passes_even_if_homestead_is_unknown(db):
 
 def test_unknown_homestead_status_passes_no_backfill_pipeline_yet(db):
     """Josh's rule names two allowed categories and never addresses unverified
-    status; properties.homestead_exempt has no backfill yet, so blocking on NULL
+    status; financials.homestead_exempt has few confirmed values, so blocking on NULL
     would gate out virtually the entire pool against his #1 stated priority
     (lead volume). Unknown must pass, same as every other unscored field."""
     _dnc(db, P_CLEAN, age_days=1)

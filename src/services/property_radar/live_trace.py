@@ -25,11 +25,22 @@ Submit = Callable[[list[dict]], list[dict]]
 WriteLedger = Callable[[list[dict]], None]
 ReadContacts = Callable[[list[str]], dict[str, LeadContacts]]
 WriteContacts = Callable[[dict[str, LeadContacts]], None]
+Transaction = Callable[[], None]
+
+
+class TraceBilledError(Exception):
+    """The batch was accepted (and billed) by Tracerfy but its results could not be fetched.
+    Any other exception from ``submit`` means the batch was never billed."""
+
+    def __init__(self, queue_id: str):
+        super().__init__(f"queue_id={queue_id}")
+        self.queue_id = queue_id
 
 
 @dataclass
 class TraceOutcome:
     contacts: dict[str, LeadContacts] = field(default_factory=dict)
+    aborted: bool = False
     submitted: int = 0
     skipped_already_traced: int = 0
     skipped_unkeyable: int = 0
@@ -63,11 +74,18 @@ def trace_staged_leads(
     batch_size: int = DEFAULT_BATCH_SIZE,
     read_contacts: Optional[ReadContacts] = None,
     write_contacts: Optional[WriteContacts] = None,
+    commit: Transaction = lambda: None,
+    rollback: Transaction = lambda: None,
 ) -> TraceOutcome:
     """``read_contacts``/``write_contacts`` persist hits keyed by address, so a lead
     already billed for (``ledger`` says so) but not used by *this* run's handoff still
     has its paid-for contacts available on a later run, instead of being re-reported as
-    ``no_contact_data`` forever."""
+    ``no_contact_data`` forever.
+
+    ``write_ledger`` / ``write_contacts`` must not commit: each batch's ledger rows and
+    contacts are committed together through ``commit`` so neither can land without the
+    other. A batch is billed before it is persisted, so ``outcome.contacts`` always holds
+    the paid hits even when persisting fails."""
     outcome = TraceOutcome()
     by_key: dict[str, list[Any]] = {}
     already_traced_leads: list[Any] = []
@@ -95,23 +113,31 @@ def trace_staged_leads(
             outcome.skipped_cap += sum(len(by_key[k]) for k in keys[start:])
             logger.warning("[pr-live-trace] spend cap reached; %d address(es) left untraced", len(keys) - start)
             break
-        cap.add(len(batch_keys) * CENTS_PER_HIT)
         rows = [_submit_row(by_key[k][0]) for k in batch_keys]
         try:
             results = submit(rows)
-        except Exception as exc:
-            # submit() covers both the billing POST and the result poll; a poll failure
-            # happens only after Tracerfy already billed the batch, and we can't tell
-            # that apart from a submit-time failure here. Either way, a retry risks a
-            # double charge, so this batch's keys are written to the ledger as consumed
-            # (a zero-cost miss) rather than left to be re-submitted next run, and
-            # earlier batches' already-returned contacts are kept, not thrown away by
-            # letting this exception propagate out of the whole function.
-            logger.error("[pr-live-trace] batch submit/poll failed for %d address(es); treating as "
-                        "billed and consumed, not retrying: %s", len(batch_keys), type(exc).__name__)
-            write_ledger([_ledger_entry(key, False) for key in batch_keys])
+        except TraceBilledError as exc:
+            # Tracerfy billed the batch but the result poll failed: ledger the keys as
+            # consumed (a zero-cost miss, queue_id kept for manual recovery) so a retry
+            # can't double-charge. Earlier batches' contacts are kept.
+            logger.error("[pr-live-trace] results poll failed after billing for %d address(es), "
+                         "queue_id=%s; ledgered as consumed", len(batch_keys), exc.queue_id)
+            cap.add(len(batch_keys) * CENTS_PER_HIT)
             outcome.submitted += len(batch_keys)
+            entries = [_ledger_entry(key, False, request_ref=exc.queue_id) for key in batch_keys]
+            if not _persist_batch(entries, {}, write_ledger, write_contacts, commit, rollback):
+                outcome.aborted = True
+                break
             continue
+        except Exception as exc:
+            # The submit step failed before billing (bad key, no credits, 429, 5xx,
+            # timeout): nothing was spent, so ledger nothing and stop rather than keep
+            # hitting a broken vendor. These addresses are retried on the next run.
+            logger.error("[pr-live-trace] batch submit failed before billing for %d address(es); "
+                         "stopping the run, nothing ledgered: %s", len(batch_keys), type(exc).__name__)
+            outcome.aborted = True
+            break
+        cap.add(len(batch_keys) * CENTS_PER_HIT)
         outcome.submitted += len(batch_keys)
         hits = {_core(trace_key(r.get("address"), "")): r for r in results if r.get("address")}
         entries = []
@@ -125,10 +151,43 @@ def trace_staged_leads(
             if not contacts.is_empty:
                 new_contacts[key] = contacts
             entries.append(_ledger_entry(key, not contacts.is_empty))
+        if not _persist_batch(entries, new_contacts, write_ledger, write_contacts, commit, rollback):
+            outcome.aborted = True
+            break
+    return outcome
+
+
+def _persist_batch(
+    entries: list[dict],
+    new_contacts: dict[str, LeadContacts],
+    write_ledger: WriteLedger,
+    write_contacts: Optional[WriteContacts],
+    commit: Transaction,
+    rollback: Transaction,
+) -> bool:
+    """Commit a billed batch's ledger rows and contacts together. If that fails, fall back
+    to the ledger rows alone (they are what stops a re-bill). False means even the ledger
+    could not be saved, so the caller must stop spending."""
+    try:
         write_ledger(entries)
         if new_contacts and write_contacts:
             write_contacts(new_contacts)
-    return outcome
+        commit()
+        return True
+    except Exception as exc:
+        logger.error("[pr-live-trace] saving a billed batch failed (%s); retrying the ledger rows alone",
+                     type(exc).__name__)
+        rollback()
+    try:
+        write_ledger(entries)
+        commit()
+        return True
+    except Exception as exc:
+        rollback()
+        logger.critical("[pr-live-trace] could not ledger a billed batch of %d address(es) (%s); stopping "
+                        "the run, these addresses may be billed again next run",
+                        len(entries), type(exc).__name__)
+        return False
 
 
 def _submit_row(lead: Any) -> dict:
@@ -137,7 +196,7 @@ def _submit_row(lead: Any) -> dict:
             "first_name": first, "last_name": last, "label": lead.radar_id}
 
 
-def _ledger_entry(key: str, success: bool) -> dict:
+def _ledger_entry(key: str, success: bool, *, request_ref: Optional[str] = None) -> dict:
     return {"vendor": "tracerfy", "purpose": "skip_trace", "success": success,
             "cost_cents": CENTS_PER_HIT if success else 0, "property_id": None,
-            "target_address": key, "request_ref": None, "created_at": datetime.now(timezone.utc)}
+            "target_address": key, "request_ref": request_ref, "created_at": datetime.now(timezone.utc)}

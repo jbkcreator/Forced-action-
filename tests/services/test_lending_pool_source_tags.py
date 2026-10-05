@@ -174,3 +174,40 @@ def test_the_pool_check_allows_permit_owners():
     assert "permit_owner" in POOLS
     check = [str(c.sqltext) for c in M.__table__.constraints if c.name == "lending_calling_pool_staging_pool_name_check"][0]
     assert "permit_owner" in check
+
+
+# ── F8 homestead: the flag lives on financials, not properties (PR 318 re-review #3) ──
+
+def _captured_sql(extractor):
+    from unittest.mock import MagicMock
+    session = MagicMock()
+    session.execute.return_value.fetchall.return_value = []
+    extractor(session, ["hillsborough"])
+    return " ".join(str(session.execute.call_args_list[0].args[0]).split())
+
+
+@pytest.mark.parametrize("extractor", [pe._extract_pool1_wholesaler_flipper, pe._extract_list7_permit_owners])
+def test_homestead_is_read_from_financials_not_properties(extractor):
+    sql = _captured_sql(extractor)
+    assert "f.homestead_exempt" in sql and "LEFT JOIN financials f ON f.property_id" in sql
+    assert "p.homestead_exempt" not in sql
+
+
+def test_auction_winner_query_never_reads_the_former_owners_homestead_flag():
+    assert "homestead_exempt" not in _captured_sql(pe._extract_auction_winners)
+
+
+def test_an_auction_winner_is_never_screened_on_the_parcels_homestead_flag():
+    row = SimpleNamespace(sold_to="JANE ROE", sold_amount=90000, property_id=1, parcel_id="P-1",
+                          county_id="hillsborough", county_name="Hillsborough", prop_address="1 Main St",
+                          prop_city="Tampa", prop_state="FL", prop_zip="33602", auction_id=1,
+                          homestead_exempt=True)
+    assert pe.auction_winner_record(row).homestead_exempt is None
+
+
+@pytest.mark.parametrize("flag,resold,expected", [
+    (True, False, True), (False, False, False), (None, False, None),
+    (True, True, None),    # resold: the flag now describes the new owner-occupant, not the flipper
+])
+def test_a_flippers_homestead_flag_is_dropped_once_the_property_is_resold(flag, resold, expected):
+    assert pe._buyer_homestead(flag, resold) is expected

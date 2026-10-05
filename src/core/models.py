@@ -12553,6 +12553,23 @@ class PropertyRadarPullRun(Base):
     )
 
 
+class PropertyRadarTraceContact(Base):
+    """Contacts Tracerfy returned for a traced address (trace_key = normalized address + zip).
+
+    The skip-trace ledger only records that an address was billed; this keeps the paid-for
+    emails/phones so a later run can read them back instead of paying again.
+    """
+
+    __tablename__ = "property_radar_trace_contacts"
+
+    trace_key: Mapped[str] = mapped_column(String(255), primary_key=True)
+    emails: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    phones: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    traced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 # ============================================================================
 # PropertyRadar staging — Developer 2 (property_radar_records)
 # ============================================================================
@@ -12743,7 +12760,7 @@ class LendingCallingPoolStaging(Base):
     # Go Live Brief 2.5 source list (list_1..list_9); apply_lending_pool_source_tags.py
     source_tag: Mapped[Optional[str]] = mapped_column(String)
     # F8 (Josh, Oct 4 §2): owner-occupied status of the target property, from
-    # properties.homestead_exempt. NULL for pools with no single subject property
+    # financials.homestead_exempt. NULL for pools with no single subject property
     # (mortgage_broker: the record is a professional, not a property owner).
     homestead_exempt: Mapped[Optional[bool]] = mapped_column(Boolean)
 

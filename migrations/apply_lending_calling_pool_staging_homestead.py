@@ -3,7 +3,7 @@ F8 (Josh, Oct 4 answers §2): "Owner is an LLC, LP or corporation, or a non owne
 occupied investor. Homestead is out."
 
 Adds lending.calling_pool_staging.homestead_exempt, sourced from the existing
-properties.homestead_exempt column by the investor-owner pools (wholesaler/
+financials.homestead_exempt column by the investor-owner pools (wholesaler/
 flipper, active builder, permit owner, auction winner). Not populated for the
 mortgage_broker pool (List 4, brokers and LOs) — that pool is a professional
 referral list, never screened as a property owner.
