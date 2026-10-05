@@ -1006,3 +1006,17 @@ class TestExcludedRecordsTable:
                 for run_id in run_ids:
                     session.execute(text("DELETE FROM property_radar_pull_runs WHERE id = :id"), {"id": run_id})
                 session.commit()
+
+
+class TestCountyAliases:
+    @pytest.mark.parametrize("alias, fips", [
+        ("DADE", "12025"),
+        ("SAINT JOHNS", "12109"),
+        ("SAINT LUCIE", "12111"),
+        ("DE SOTO", "12027"),
+    ])
+    def test_propertyradar_export_spellings_resolve(self, alias, fips):
+        assert county_fips("FL", alias) == fips
+
+    def test_dade_record_is_kept_not_excluded(self):
+        assert normalize(_record(county="DADE"), state="FL", campaign="x").county_fips == "12025"
