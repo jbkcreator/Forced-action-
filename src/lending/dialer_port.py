@@ -18,6 +18,7 @@ from sqlalchemy import text
 from config.lending_compliance import RemovalReason
 from config.lending_dialer import (
     BATCHDIALER_BASE_URL,
+    BATCHDIALER_QUICK_TIMEOUT_SECONDS,
     BATCHDIALER_ENDPOINTS,
     BATCHDIALER_TIMEOUT_SECONDS,
 )
@@ -46,6 +47,7 @@ class DialerContactFields:
     city: Optional[str] = None          # which (unlike custom fields) the agent script can show
     state: Optional[str] = None
     postal_code: Optional[str] = None
+    customfields: Optional[Mapping[str, str]] = None  # merged over what the dialer already holds
 
 
 @dataclass(frozen=True)
@@ -66,10 +68,23 @@ class DialerRequestError(RuntimeError):
         self.status = status
 
 
+class ContactFieldsNotSet(DialerRequestError):
+    """The contact was created in the campaign but the follow-up field update failed.
+
+    ``contact_id`` is live in the dialer, so the caller must record it: an opt-out can only
+    delete contacts we have an id for, and a re-run should update it, not create another."""
+
+    def __init__(self, contact_id: Any, cause: Exception) -> None:
+        super().__init__(f"dialer contact {contact_id} created but its fields were not set",
+                         status=getattr(cause, "status", None))
+        self.contact_id = contact_id
+
+
 class Dialer(Protocol):
     def upsert_contact(self, record: Mapping[str, Any]) -> Optional[str]: ...
     def remove(self, phone: str, *, reason: str) -> None: ...
     def restore(self, phone: str) -> None: ...
+    def get_contact_customfields(self, contact_id: Any, *, quick: bool = False) -> dict: ...
 
 
 class InMemoryDialer:
@@ -88,6 +103,9 @@ class InMemoryDialer:
     def restore(self, phone: str) -> None:
         self.events.append(("restore", phone, None))
 
+    def get_contact_customfields(self, contact_id: Any, *, quick: bool = False) -> dict:
+        return {}
+
 
 class BatchDialerAdapter:
     def __init__(self, *, http: Http, endpoints: Mapping[str, Endpoint] = BATCHDIALER_ENDPOINTS,
@@ -102,7 +120,7 @@ class BatchDialerAdapter:
         if endpoint is None:
             raise UnconfirmedCapability(f"BatchDialer endpoint '{action}' is not confirmed")
         method, path = endpoint
-        return self._http(method, path.format(**path_params), json=payload)
+        return self._http(method, path.format(**path_params), json=None if method == "GET" else payload)
 
     def missing_for_load(self) -> list[str]:
         """Load endpoints still unconfirmed; a live load refuses while any is missing."""
@@ -145,26 +163,32 @@ class BatchDialerAdapter:
         if campaign is not None:
             try:
                 self.update_contact(contact_id, fields, phone=phone, vendor_contact_id=vendor_contact_id)
-            except DialerRequestError as exc:
-                # The contact already exists in the campaign and will be dialed regardless
-                # of whether the card-field PUT lands, so this must not be treated like a
-                # failed upsert (losing the contact id would leave a live contact with no
-                # load record). Let the caller store it with this id: the next load run's
-                # known-contact-id path (_push_contact) retries the PUT.
-                logger.warning(
-                    "[dialer] BatchDialer contact %s created but field update failed: %s",
-                    contact_id, type(exc).__name__,
-                )
+            except Exception as exc:
+                raise ContactFieldsNotSet(contact_id, exc) from exc
         return ContactUpsertResult(contact_id=contact_id, created=True)
 
     def update_contact(self, contact_id: Any, fields: DialerContactFields, *, phone: Optional[str] = None,
                        vendor_contact_id: Optional[str] = None) -> dict:
-        """Full update (PUT): BatchDialer replaces every field, so the phone and our vendor
-        contact id are sent again."""
+        """Full update (PUT): BatchDialer replaces every field it is not sent, so the phone and our
+        vendor contact id are sent again, and the stored custom fields (text_consent, anything a
+        caller set) are read first and merged. If that read fails nothing is sent."""
+        if self._endpoints.get("contact_update") is None:
+            raise UnconfirmedCapability("BatchDialer endpoint 'contact_update' is not confirmed")
+        existing = self.get_contact_customfields(contact_id)
         body = _contact_body(phone, fields)
         if vendor_contact_id:
             body["vendorcontactid"] = vendor_contact_id
+        body["customfields"] = {**existing, **body.get("customfields", {}), **(fields.customfields or {})}
         return dict(self._call("contact_update", body, id=contact_id))
+
+    def get_contact_customfields(self, contact_id: Any, *, quick: bool = False) -> dict:
+        """``quick``: one short attempt, no retries (the on-call consent read must not stall ingestion)."""
+        endpoint = self._endpoints.get("contact_get")
+        if endpoint is None:
+            raise UnconfirmedCapability("BatchDialer endpoint 'contact_get' is not confirmed")
+        path = endpoint[1].format(id=contact_id)
+        body = self._http("GET", path, json=None, quick=True) if quick else self._http("GET", path, json=None)
+        return dict((body or {}).get("customfields") or {})
 
     def _campaign_id(self, name: str) -> Any:
         if self._campaign_ids is None:
@@ -241,11 +265,14 @@ def _requests_http(api_key: str) -> Http:
     """GET/POST go through the repo retry helpers (network errors, 429, 5xx); a 4xx is
     final. Failures log method, path and status only: bodies carry phone numbers."""
 
-    def call(method: str, path: str, *, json: Optional[dict] = None) -> Any:
+    def call(method: str, path: str, *, json: Optional[dict] = None, quick: bool = False) -> Any:
         url = f"{BATCHDIALER_BASE_URL}{path}"
         kwargs = {"headers": {"X-ApiKey": api_key}, "timeout": BATCHDIALER_TIMEOUT_SECONDS}
         try:
-            if method == "GET":
+            if quick:
+                response = requests.get(url, headers=kwargs["headers"], timeout=BATCHDIALER_QUICK_TIMEOUT_SECONDS)
+                response.raise_for_status()
+            elif method == "GET":
                 response = requests_get_with_retry(url, max_retries=3, retry_delay=2, **kwargs)
             elif method == "POST":
                 response = requests_post_with_retry(url, json=json, **kwargs)
@@ -290,3 +317,11 @@ def _loaded_contact_ids(phone: str) -> list[str]:
                  "WHERE phone = :p AND dialer_contact_id IS NOT NULL"),
             {"p": normalize_phone(phone)},
         )]
+
+
+def get_http() -> Optional[Http]:
+    """The authenticated BatchDialer transport, or None when no key / base URL is set."""
+    key = get_settings().batchdialer_api_key
+    if key is None or not BATCHDIALER_BASE_URL:
+        return None
+    return _requests_http(key.get_secret_value())

@@ -12,7 +12,7 @@ def test_live_trace_without_apply_is_rejected_before_touching_the_db(monkeypatch
                     "must be rejected before any DB session (or Tracerfy charge) happens")
 
     monkeypatch.setattr(mod, "get_db_context", _must_not_be_called)
-    with pytest.raises(RuntimeError, match="--live-trace requires --apply"):
+    with pytest.raises(ValueError, match="needs --apply"):
         mod.run(live_trace=True, apply=False)
 
 

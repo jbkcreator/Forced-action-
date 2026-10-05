@@ -11,7 +11,10 @@ Usage:
         --trace-results path/to/trace_results.csv --apply
     PYTHONPATH=. python -m src.tasks.property_radar_lead_handoff --live-trace --apply  # paid Tracerfy trace
 
---live-trace spends Tracerfy credits (1 per hit) and needs PROPERTY_RADAR_ENABLED=true.
+--live-trace spends Tracerfy credits (1 per hit), needs PROPERTY_RADAR_ENABLED=true and
+requires --apply: a dry run discards everything, so a rehearsal would pay for contacts and
+lose them. Paid contacts are stored (property_radar_traced_contacts, migrations/
+apply_property_radar_traced_contacts.py) with the ledger rows, and a later run reuses them.
 
 Contact rules (consent rows) follow PROPERTY_RADAR_CONTACT_RULES_ENABLED and
 cannot be switched on from the command line.
@@ -33,7 +36,7 @@ from src.services.property_radar.lead_handoff import (
     pretrace_eligible,
     run_handoff,
 )
-from src.services.property_radar.live_trace import TraceBilledError, trace_staged_leads
+from src.services.property_radar.live_trace import trace_staged_leads
 from src.services.property_radar.trace_contacts import LeadContacts, load_trace_contacts
 from src.services.skip_trace_ledger import RunSpendCap, already_traced, trace_key
 
@@ -47,10 +50,7 @@ def _tracerfy_submit(rows: list[dict]) -> list[dict]:
 
     api_key = get_settings().tracerfy_api_key.get_secret_value()
     queue_id, wait = _submit_trace_batch(rows, api_key)
-    try:
-        return _poll_trace_queue(queue_id, api_key, wait)
-    except Exception as exc:
-        raise TraceBilledError(str(queue_id)) from exc
+    return _poll_trace_queue(queue_id, api_key, wait)
 
 
 def _write_usage_ledger(session, entries: list[dict]) -> None:
@@ -60,41 +60,36 @@ def _write_usage_ledger(session, entries: list[dict]) -> None:
              ":property_id, :target_address, :request_ref, :created_at)"),
         entries,
     )
+    session.commit()
 
 
-def _read_trace_contacts(session, keys: list[str]) -> dict[str, LeadContacts]:
-    if not keys:
-        return {}
-    rows = session.execute(
-        text("SELECT trace_key, emails, phones FROM property_radar_trace_contacts "
-             "WHERE trace_key = ANY(:keys)"),
-        {"keys": keys},
-    ).fetchall()
-    return {r.trace_key: LeadContacts(emails=tuple(r.emails), phones=tuple(r.phones)) for r in rows}
-
-
-def _write_trace_contacts(session, contacts_by_key: dict[str, LeadContacts]) -> None:
-    import json
-
+def _write_traced_contacts(session, contacts: dict[str, LeadContacts]) -> None:
+    """Not committed here: the ledger write that follows commits both together."""
+    if not contacts:
+        return
     session.execute(
-        text("INSERT INTO property_radar_trace_contacts (trace_key, emails, phones, traced_at) "
-             "VALUES (:trace_key, CAST(:emails AS jsonb), CAST(:phones AS jsonb), now()) "
-             "ON CONFLICT (trace_key) DO UPDATE SET emails = EXCLUDED.emails, "
-             "phones = EXCLUDED.phones, traced_at = EXCLUDED.traced_at"),
-        [
-            {"trace_key": key, "emails": json.dumps(list(c.emails)), "phones": json.dumps(list(c.phones))}
-            for key, c in contacts_by_key.items()
-        ],
+        text("INSERT INTO property_radar_traced_contacts (radar_id, phones, emails) "
+             "VALUES (:radar_id, :phones, :emails) ON CONFLICT (radar_id) DO UPDATE "
+             "SET phones = EXCLUDED.phones, emails = EXCLUDED.emails, traced_at = now()"),
+        [{"radar_id": rid, "phones": list(c.phones), "emails": list(c.emails)} for rid, c in contacts.items()],
     )
+
+
+def _stored_contacts(session, radar_ids: list[str]) -> dict[str, LeadContacts]:
+    rows = session.execute(
+        text("SELECT radar_id, phones, emails FROM property_radar_traced_contacts WHERE radar_id = ANY(:ids)"),
+        {"ids": radar_ids},
+    ).all()
+    return {r.radar_id: LeadContacts(emails=tuple(r.emails), phones=tuple(r.phones)) for r in rows}
 
 
 def _live_trace(session, campaign: str, *, thin_path_only: bool) -> dict[str, LeadContacts]:
     settings = get_settings()
     if not settings.property_radar_enabled:
         raise RuntimeError("--live-trace needs PROPERTY_RADAR_ENABLED=true")
-    if session.execute(text("SELECT to_regclass('property_radar_trace_contacts')")).scalar() is None:
-        raise RuntimeError("property_radar_trace_contacts is missing: run "
-                           "migrations/apply_property_radar_trace_contacts.py before --live-trace")
+    if session.execute(text("SELECT to_regclass('property_radar_traced_contacts')")).scalar() is None:
+        raise RuntimeError("property_radar_traced_contacts is missing: run "
+                           "migrations/apply_property_radar_traced_contacts.py before --live-trace")
     all_leads = [lead for page in iter_staged_leads(session, campaign=campaign) for lead in page]
     facts = SqlHandoffStore(session).screening_facts(all_leads, {})
     if not facts.backflip_feed_fresh:
@@ -114,16 +109,13 @@ def _live_trace(session, campaign: str, *, thin_path_only: bool) -> dict[str, Le
         ledger=already_traced(session, "tracerfy", keys),
         submit=_tracerfy_submit,
         write_ledger=lambda entries: _write_usage_ledger(session, entries),
+        write_contacts=lambda contacts: _write_traced_contacts(session, contacts),
         cap=RunSpendCap(settings.skip_trace_max_run_cost_cents),
-        read_contacts=lambda ks: _read_trace_contacts(session, ks),
-        write_contacts=lambda cs: _write_trace_contacts(session, cs),
-        commit=session.commit,
-        rollback=session.rollback,
     )
-    logger.info("PropertyRadar live trace: submitted=%d already_traced=%d unkeyable=%d capped=%d aborted=%s",
-                outcome.submitted, outcome.skipped_already_traced, outcome.skipped_unkeyable, outcome.skipped_cap,
-                outcome.aborted)
-    return outcome.contacts
+    logger.info("PropertyRadar live trace: submitted=%d already_traced=%d unkeyable=%d capped=%d no_result=%d",
+                outcome.submitted, outcome.skipped_already_traced, outcome.skipped_unkeyable,
+                outcome.skipped_cap, outcome.skipped_no_result)
+    return {**_stored_contacts(session, [lead.radar_id for lead in leads]), **outcome.contacts}
 
 
 def run(
@@ -135,10 +127,7 @@ def run(
     live_trace: bool = False,
 ) -> HandoffReport:
     if live_trace and not apply:
-        # Tracerfy bills on submit; a dry run can roll back its own DB writes but
-        # cannot un-charge a real trace, so --live-trace without --apply would spend
-        # real money and discard the result on every run.
-        raise RuntimeError("--live-trace requires --apply: it is billed immediately and cannot be a dry run")
+        raise ValueError("--live-trace spends Tracerfy credits and needs --apply; a dry run would discard the contacts")
     settings = get_settings()
     thin_path = settings.property_radar_thin_path_only if thin_path_only is None else thin_path_only
     contacts = load_trace_contacts(trace_results) if trace_results else {}
@@ -170,6 +159,8 @@ def main() -> None:
                         help="Trace staged addresses with Tracerfy now (spends credits; ledger-gated)")
     parser.add_argument("--apply", action="store_true", help="Write to FA Max (default: dry run)")
     args = parser.parse_args()
+    if args.live_trace and not args.apply:
+        parser.error("--live-trace spends Tracerfy credits and requires --apply")
     report = run(
         campaign=args.campaign, trace_results=args.trace_results,
         thin_path_only=args.thin_path, apply=args.apply, live_trace=args.live_trace,
