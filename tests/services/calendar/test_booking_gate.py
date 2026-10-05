@@ -30,6 +30,10 @@ from sqlalchemy import text
 from config.booking_gate import (
     CALENDAR_DAILY_CAP,
     COMPLETED_PROJECTS,
+    CREDIT_BAND_QUALIFYING_VALUES,
+    CREDIT_BANDS,
+    DEAL_STATUS_QUALIFYING_VALUES,
+    DEAL_STATUS_VALUES,
     EXIT_STRATEGIES,
     LIQUIDITY_SOURCES,
     OCCUPANCY_TYPES,
@@ -51,10 +55,17 @@ NOW = datetime(2026, 10, 1, 9, tzinfo=ET)
 
 
 def _passing_answers(**overrides) -> GateAnswers:
-    """Minimal passing gate answers. Override any field to test fail paths."""
+    """Minimal passing (BOOK, not just valid) gate answers.
+
+    Satisfies the D2 qualification bar: real_deal/actively_looking AND
+    completed_projects != "0" AND credit_band == at_or_above_640. Override
+    any field to test fail paths.
+    """
     base = {
         "liquidity_source": "cash",
         "completed_projects": "1_to_2",
+        "deal_status": "real_deal",
+        "credit_band": "at_or_above_640",
         "exit_strategy": "sale",
         "occupancy": "investment",
         "decision_maker": "yes",
@@ -87,18 +98,61 @@ class TestEvaluateGatePass:
             result = evaluate_gate(_passing_answers(liquidity_source=source))
             assert result.passed is True, f"liquidity_source={source!r} should pass"
 
-    def test_all_valid_completed_projects_pass(self):
-        for val in COMPLETED_PROJECTS:
+    def test_completed_projects_1_to_2_and_3_plus_pass_zero_does_not(self):
+        """0 experience is valid but fails the BOOK qualification (D2) — it
+        routes to nurture, it is not an invalid code and not a kill."""
+        for val in ("1_to_2", "3_plus"):
             result = evaluate_gate(_passing_answers(completed_projects=val))
-            assert result.passed is True
+            assert result.passed is True, f"completed_projects={val!r} should pass"
 
-    def test_all_valid_exit_strategies_pass(self):
-        for val in EXIT_STRATEGIES:
+        zero_result = evaluate_gate(_passing_answers(completed_projects="0"))
+        assert zero_result.passed is False
+        assert zero_result.failed_field is None
+        assert zero_result.reason == "insufficient_qualification"
+
+    def test_exit_strategy_never_gates_regardless_of_value(self):
+        """D2: exit_strategy is captured but fully optional — never validated,
+        never required, never fails the gate, even with a garbage value."""
+        for val in (*EXIT_STRATEGIES, None, "", "not_a_real_strategy"):
             result = evaluate_gate(_passing_answers(exit_strategy=val))
-            assert result.passed is True
+            assert result.passed is True, f"exit_strategy={val!r} must never gate"
 
     def test_all_valid_occupancy_investment_passes(self):
         result = evaluate_gate(_passing_answers(occupancy="investment"))
+        assert result.passed is True
+
+    def test_all_qualifying_deal_status_values_pass(self):
+        for val in DEAL_STATUS_QUALIFYING_VALUES:
+            result = evaluate_gate(_passing_answers(deal_status=val))
+            assert result.passed is True, f"deal_status={val!r} should pass"
+
+    def test_neither_deal_status_fails_qualification_not_validation(self):
+        result = evaluate_gate(_passing_answers(deal_status="neither"))
+        assert result.passed is False
+        assert result.failed_field is None
+        assert result.reason == "insufficient_qualification"
+
+    def test_at_or_above_640_credit_band_passes(self):
+        result = evaluate_gate(_passing_answers(credit_band="at_or_above_640"))
+        assert result.passed is True
+
+    def test_below_640_and_unsure_credit_band_fail_qualification_not_validation(self):
+        for val in ("below_640", "unsure"):
+            result = evaluate_gate(_passing_answers(credit_band=val))
+            assert result.passed is False
+            assert result.failed_field is None
+            assert result.reason == "insufficient_qualification"
+
+    def test_target_market_satisfies_the_address_requirement(self):
+        """D2: property address OR target market — actively_looking callers
+        give a target market instead of a specific address."""
+        result = evaluate_gate(
+            _passing_answers(
+                deal_status="actively_looking",
+                property_address=None,
+                target_market="Tampa Bay area",
+            )
+        )
         assert result.passed is True
 
     def test_liquidity_amount_is_optional_and_never_gates(self):
@@ -128,16 +182,25 @@ class TestEvaluateGateKillConditions:
         assert result.failed_field == "decision_maker"
         assert result.reason == "not_decision_maker"
 
-    def test_blank_property_address_is_killed(self):
+    def test_blank_property_address_with_no_target_market_is_killed(self):
         result = evaluate_gate(_passing_answers(property_address=""))
         assert result.passed is False
         assert result.failed_field == "property_address"
-        assert result.reason == "missing_address"
+        assert result.reason == "missing_address_or_market"
 
-    def test_whitespace_only_address_is_killed(self):
+    def test_whitespace_only_address_with_no_target_market_is_killed(self):
         result = evaluate_gate(_passing_answers(property_address="   "))
         assert result.passed is False
         assert result.failed_field == "property_address"
+        assert result.reason == "missing_address_or_market"
+
+    def test_blank_target_market_with_no_address_is_killed(self):
+        result = evaluate_gate(
+            _passing_answers(property_address=None, target_market="   ")
+        )
+        assert result.passed is False
+        assert result.failed_field == "property_address"
+        assert result.reason == "missing_address_or_market"
 
     def test_kill_order_liquidity_before_homestead(self):
         # Both kill conditions present — liquidity checked first.
@@ -159,10 +222,17 @@ class TestEvaluateGateInvalidCodes:
         assert result.passed is False
         assert result.failed_field == "completed_projects"
 
-    def test_unknown_exit_strategy_fails(self):
-        result = evaluate_gate(_passing_answers(exit_strategy="flip"))
+    def test_unknown_deal_status_fails(self):
+        result = evaluate_gate(_passing_answers(deal_status="maybe_sort_of"))
         assert result.passed is False
-        assert result.failed_field == "exit_strategy"
+        assert result.failed_field == "deal_status"
+        assert result.reason == "invalid_code"
+
+    def test_unknown_credit_band_fails(self):
+        result = evaluate_gate(_passing_answers(credit_band="720"))
+        assert result.passed is False
+        assert result.failed_field == "credit_band"
+        assert result.reason == "invalid_code"
 
     def test_unknown_occupancy_fails(self):
         result = evaluate_gate(_passing_answers(occupancy="vacation"))
@@ -196,14 +266,29 @@ class TestNoFinancialFields:
         stored = {
             "liquidity_source": answers.liquidity_source,
             "completed_projects": answers.completed_projects,
+            "deal_status": answers.deal_status,
+            "credit_band": answers.credit_band,
             "exit_strategy": answers.exit_strategy,
             "occupancy": answers.occupancy,
             "decision_maker": answers.decision_maker,
             "property_address": answers.property_address,
+            "target_market": answers.target_market,
         }
         for field in stored:
             assert field not in self.FORBIDDEN_FIELDS, (
                 f"Financial field {field!r} must not appear in gate answers"
+            )
+
+    def test_credit_band_value_is_never_a_bare_number(self):
+        """credit_band is a caller-asked estimate, never a pulled score —
+        "at_or_above_640" names a band (640 is the threshold in its label,
+        same as a human would say it), but the stored value itself must
+        never be a bare digit string, which is what an actual score would
+        look like if one were mistakenly stored."""
+        for val in CREDIT_BANDS:
+            assert not val.isdigit(), (
+                f"CREDIT_BANDS value {val!r} is a bare number — looks like a "
+                f"real pulled score, not a caller-asked band"
             )
 
     def test_gate_answer_values_do_not_match_financial_terms_regex(self):
@@ -219,6 +304,8 @@ class TestNoFinancialFields:
         for field in (
             answers.liquidity_source,
             answers.completed_projects,
+            answers.deal_status,
+            answers.credit_band,
             answers.exit_strategy,
             answers.occupancy,
             answers.decision_maker,

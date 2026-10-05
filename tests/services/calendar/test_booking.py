@@ -876,3 +876,118 @@ class TestPr296ReviewFixes:
         assert calendar.get_busy(
             calendar_id=CALENDAR_ID, start=_slot(11).start, end=_slot(11).end
         ) == [], "the orphaned meeting must be taken back"
+
+
+class _NestableRecordingSession(_RecordingSession):
+    """_RecordingSession plus a no-op begin_nested() context manager, for
+    exercising the booking-confirmed notification's savepoint usage."""
+
+    class _Nested:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def begin_nested(self):
+        return self._Nested()
+
+
+class TestBookingConfirmedNotification:
+    """WP-GL-10 depends on book() posting this payload (CLAUDE.md: '#323
+    emits no booking event... the GL-5 owner must send the payload'). These
+    exercise _notify_booking_confirmed directly so the payload shape and the
+    fail-closed fallback are provable without src.lending existing yet."""
+
+    @pytest.fixture(autouse=True)
+    def _gate_bypassed(self):
+        with _bypass_gate():
+            yield
+
+    def test_missing_lending_module_does_not_fail_the_booking(self, caplog):
+        """src.lending.booking_messages does not exist on this branch yet —
+        confirms the ImportError path logs and never raises."""
+        session = _NestableRecordingSession()
+        with _allow_all():
+            result = book(
+                client=FakeCalendar(), session=session, calendar_id=CALENDAR_ID,
+                slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate",
+            )
+
+        assert result.booked is True
+        assert "not available yet" in caplog.text
+
+    def test_payload_carries_gate_answers_property_address_and_booked_by(self):
+        """property_address comes from the gate row's stored answers, and
+        booked_by from the gate's captured_by — book() itself knows neither."""
+        import json
+        import sys
+        import types
+        from unittest.mock import MagicMock
+
+        fake_module = types.ModuleType("src.lending.booking_messages")
+        captured_payload = {}
+
+        def _fake_handle_booking_confirmed(db, payload):
+            captured_payload.update(payload)
+
+        fake_module.handle_booking_confirmed = _fake_handle_booking_confirmed
+
+        gate_row = {
+            "gate_id": "test_gate",
+            "list_key": None,
+            "result": "pass",
+            "captured_by": "caller_jane",
+            "answers": json.dumps({"property_address": "123 Main St, Tampa FL"}),
+        }
+
+        session = _NestableRecordingSession()
+        slot = _slot(11)
+        with (
+            _allow_all(),
+            patch("src.services.calendar.gate.get_passed_gate_by_id", return_value=gate_row),
+            patch.dict(sys.modules, {"src.lending.booking_messages": fake_module}),
+        ):
+            result = book(
+                client=FakeCalendar(), session=session, calendar_id=CALENDAR_ID,
+                slot=slot, attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate", phone="+18135551234", first_name="Maria",
+                text_consent=True,
+            )
+
+        assert result.booked is True
+        assert captured_payload["property_address"] == "123 Main St, Tampa FL"
+        assert captured_payload["booked_by"] == "caller_jane"
+        assert captured_payload["phone"] == "+18135551234"
+        assert captured_payload["first_name"] == "Maria"
+        assert captured_payload["text_consent"] is True
+        assert captured_payload["email"] == ATTENDEE
+        assert captured_payload["slot_start_utc"] == slot.start
+        assert captured_payload["booking_ref"] == result.booking_ref
+
+    def test_notification_failure_does_not_undo_an_already_committed_booking(self):
+        """A booking is real and calendared before this notification ever
+        runs — a failure here must never be reported as a failed booking."""
+        import sys
+        import types
+
+        fake_module = types.ModuleType("src.lending.booking_messages")
+
+        def _raising_handle_booking_confirmed(db, payload):
+            raise RuntimeError("lending DB unreachable")
+
+        fake_module.handle_booking_confirmed = _raising_handle_booking_confirmed
+
+        session = _NestableRecordingSession()
+        with (
+            _allow_all(),
+            patch.dict(sys.modules, {"src.lending.booking_messages": fake_module}),
+        ):
+            result = book(
+                client=FakeCalendar(), session=session, calendar_id=CALENDAR_ID,
+                slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate",
+            )
+
+        assert result.booked is True, "a notification failure must not undo the booking"

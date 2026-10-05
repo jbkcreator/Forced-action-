@@ -125,15 +125,25 @@ def book(
     person_id: Optional[Any] = None,
     tracked_link_id: Optional[int] = None,
     gate_id: Optional[str] = None,
+    phone: Optional[str] = None,
+    first_name: Optional[str] = None,
+    text_consent: bool = False,
 ) -> BookingResult:
     """Book a slot for an attendee, refusing if suppressed or already taken.
 
     gate_id must reference a passed fa_max_booking_gates row. If omitted or
     invalid, the booking is refused — fail closed. This enforces WP-GL-5's
     requirement that no booking reaches Josh's calendar without a caller
-    completing the six-field gate. The daily cap (config/booking_gate.py
+    completing the gate. The daily cap (config/booking_gate.py
     CALENDAR_DAILY_CAP) is checked with a Postgres advisory lock to prevent
     concurrent bypass.
+
+    phone/first_name/text_consent are passed straight through to the
+    booking-confirmed notification (see _notify_booking_confirmed) — the
+    gate table holds enum codes only (no phone, name or consent), so a
+    caller that has this contact detail must supply it here. text_consent
+    is G6's "is it okay if we text you the confirmation?" yes, asked and
+    logged at the booking close, not part of the earlier gate screening.
 
     Commits. The row claiming the slot must be durable before the calendar
     event is created, or a crash in between leaves a meeting in the
@@ -239,7 +249,93 @@ def book(
     logger.info(
         "calendar.book: booked booking_ref=%s event_id=%s", booking_ref, event.event_id
     )
+
+    _notify_booking_confirmed(
+        session=session,
+        booking_ref=booking_ref,
+        provider_event_id=event.event_id,
+        person_id=person_id,
+        phone=phone,
+        first_name=first_name,
+        email=attendee_email,
+        text_consent=text_consent,
+        slot_start_utc=slot.start,
+        gate_row=gate_row,
+        captured_by=gate_row.get("captured_by") if gate_row else None,
+    )
+
     return BookingResult(booked=True, event=event, booking_ref=booking_ref)
+
+
+def _notify_booking_confirmed(
+    *,
+    session,
+    booking_ref: str,
+    provider_event_id: Optional[str],
+    person_id: Optional[Any],
+    phone: Optional[str],
+    first_name: Optional[str],
+    email: str,
+    text_consent: bool,
+    slot_start_utc: datetime,
+    gate_row: Optional[Any],
+    captured_by: Optional[str],
+) -> None:
+    """Best-effort notification so WP-GL-10 can schedule confirmation/
+    reminder messages. Never raises — a notification failure must not undo
+    an already-committed, already-calendared booking.
+
+    Calls src.lending.booking_messages.handle_booking_confirmed directly
+    (same process — both routers mount on src.api.main) rather than a
+    self-loopback HTTP call to /webhooks/lending/booking-confirmed, which
+    that module's own docstring offers as an alternative transport. Import
+    is lazy and wrapped: per the agreed merge order (#328 before #323),
+    this module will exist by the time this code ships, but must degrade
+    to a logged no-op rather than crash a booking if it does not.
+    """
+    property_address = None
+    if gate_row is not None:
+        answers = gate_row.get("answers") if hasattr(gate_row, "get") else gate_row["answers"]
+        if isinstance(answers, str):
+            import json
+
+            answers = json.loads(answers)
+        property_address = (answers or {}).get("property_address")
+
+    payload = {
+        "booking_ref": booking_ref,
+        "provider_event_id": provider_event_id,
+        "person_id": str(person_id) if person_id is not None else None,
+        "phone": phone,
+        "first_name": first_name,
+        "email": email,
+        "text_consent": bool(text_consent),
+        "slot_start_utc": slot_start_utc,
+        "property_address": property_address,
+        "booked_by": captured_by,
+    }
+
+    try:
+        from src.lending.booking_messages import handle_booking_confirmed
+
+        # Savepoint, not a bare try/except: handle_booking_confirmed does not
+        # commit itself, and a raised exception here must not leave the
+        # session's real transaction aborted for whatever the caller does
+        # with it next — the booking itself already committed.
+        with session.begin_nested():
+            handle_booking_confirmed(session, payload)
+        session.commit()
+    except ImportError:
+        logger.warning(
+            "calendar.book: booking_ref=%s — src.lending.booking_messages not "
+            "available yet (expected before #328 merges); no reminders scheduled",
+            booking_ref,
+        )
+    except Exception:
+        logger.exception(
+            "calendar.book: booking_ref=%s — booking-confirmed notification failed, "
+            "booking stands, reminders will not fire for this one", booking_ref,
+        )
 
 
 def _cached_busy(client, calendar_id: str, start: datetime, end: datetime):

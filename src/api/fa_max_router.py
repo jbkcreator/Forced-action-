@@ -32,11 +32,19 @@ class GateSubmission(BaseModel):
         default=None,
         description="Caller-reported rough amount (brief p.1) — free text, not validated, never gates the booking on its own.",
     )
-    completed_projects: str = Field(description="0 | 1_to_2 | 3_plus")
-    exit_strategy: str = Field(description="sale | refinance | other")
+    completed_projects: str = Field(description="experience: 0 | 1_to_2 | 3_plus (0 routes to nurture, not a kill)")
+    deal_status: str = Field(description="real_deal | actively_looking | neither")
+    credit_band: str = Field(
+        description="Caller-asked estimate only, never a pulled score: at_or_above_640 | below_640 | unsure"
+    )
     occupancy: str = Field(description="investment | homestead")
     decision_maker: str = Field(description="yes | no")
-    property_address: str = Field(min_length=1, max_length=500)
+    exit_strategy: Optional[str] = Field(default=None, description="sale | refinance | other — optional, never gates")
+    property_address: Optional[str] = Field(default=None, max_length=500)
+    target_market: Optional[str] = Field(
+        default=None, max_length=200,
+        description="Required instead of property_address when deal_status is actively_looking",
+    )
     person_id: Optional[int] = None
     list_key: Optional[str] = None
     captured_by: Optional[str] = None
@@ -50,11 +58,16 @@ def submit_gate(
 ) -> dict:
     """Record a caller's booking gate evaluation for a tracked link.
 
+    Seven fields per Josh's locked bar (D2): experience, deal status, credit
+    band, liquidity, occupancy, decision maker, address-or-target-market.
+    exit_strategy is an optional eighth field that never gates.
+
     Returns the gate_id and whether it passed. If it failed, the contact is
     automatically enqueued in fa_max_nurture_queue and surfaced to EXCEPTIONS.
 
     Gate answers are stored as enum codes only — never free text financial
-    data — per the _FINANCIAL_TERMS and relay-payload CHECK constraints.
+    data, never a pulled credit score — per the _FINANCIAL_TERMS and
+    relay-payload CHECK constraints.
     """
     from src.services.calendar.gate import GateAnswers, store_gate
 
@@ -62,10 +75,13 @@ def submit_gate(
         liquidity_source=payload.liquidity_source,
         liquidity_amount=payload.liquidity_amount,
         completed_projects=payload.completed_projects,
-        exit_strategy=payload.exit_strategy,
+        deal_status=payload.deal_status,
+        credit_band=payload.credit_band,
         occupancy=payload.occupancy,
         decision_maker=payload.decision_maker,
+        exit_strategy=payload.exit_strategy,
         property_address=payload.property_address,
+        target_market=payload.target_market,
     )
 
     gate_id, result = store_gate(
