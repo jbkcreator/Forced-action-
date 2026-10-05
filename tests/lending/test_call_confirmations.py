@@ -70,12 +70,12 @@ def test_decision_maker_not_on_the_call_is_known_false():
 
 
 def test_confirmations_raise_the_rank_and_replace_the_question():
-    """Rank 10 also needs known equity; PropertyRadar equity is an estimate, so this stops below 10."""
+    """Confirmed maturity and decision maker, with estimated equity over 35%, reach rank 10."""
     before = score_lead(_signals_from_row(ROW), today=date(2026, 10, 6))
     confirmed = _signals_from_row({**ROW, "confirmed_maturity_date": date(2026, 11, 15),
                                    "decision_maker_on_call": True})
     after = score_lead(confirmed, today=date(2026, 10, 6))
     assert before.caller_questions and not after.caller_questions
     assert set(after.signals_met) == {"maturity_within_window", "entity_in_good_standing",
-                                      "decision_maker_confirmed"}
-    assert after.rank > before.rank
+                                      "equity_above_threshold", "decision_maker_confirmed"}
+    assert after.rank == 10 > before.rank

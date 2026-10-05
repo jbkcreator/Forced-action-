@@ -44,7 +44,7 @@ def test_full_card():
         "permits": "Residential alteration, 2026-08-14",
         "equity": "About 42% (estimated)",
         "prior_contact": "Called 2026-10-01, voicemail",
-        "score": "2/10",
+        "score": "4/10",
         "ask": "Is the loan coming due around November 2026?",
     }
 

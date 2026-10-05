@@ -4,7 +4,9 @@ Rules only: no trained model until enough held outcomes exist. The go-live
 brief defines rank 10 (verified maturity inside 90 days, borrowing entity in
 good standing on Sunbiz, known equity over 35 percent, decision maker
 confirmed) and asks that loan size and repeat-operator signals lift builders
-and portfolio owners above one-property flippers. The ladder below rank 10 and
+and portfolio owners above one-property flippers. Equity counts toward rank 10
+when estimated: every equity figure rests on an estimated mortgage balance, so
+none is ever known, and the card still labels it as an estimate. The ladder below rank 10 and
 the two thresholds are the team's proposal, pending client confirmation.
 """
 from __future__ import annotations
@@ -18,7 +20,7 @@ MIN_RANK = 1
 MATURITY_WINDOW_DAYS = 90
 EQUITY_THRESHOLD_PCT = Decimal("35")
 
-# Base rank by how many of the four rank-10 signals are known and met (0-3).
+# Base rank by how many of the four rank-10 signals are met (0-3); equity may be estimated.
 BASE_RANK_BY_SIGNALS_MET = (1, 3, 5, 7)
 
 # Each bonus applies once, only when its signal is known.
