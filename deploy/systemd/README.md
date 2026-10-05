@@ -29,6 +29,8 @@ sudo systemctl start   fa-api lifecycle cora
 
 Both hold a Postgres advisory lock, so a second copy only skips cycles. Until `BATCHDIALER_API_KEY` and the endpoints in `config/lending_dialer.py` are set, dialer removals are recorded as pending and complete on a later cycle.
 
+The GoHighLevel opt-out sync (poller) and the 15-minute DND backstop (cron) use the **Next Deal Lending sub-account only**: set `LENDING_GHL_API_KEY` and `LENDING_GHL_LOCATION_ID` in the server `.env`. They never fall back to the platform's `GHL_*` account; until both are set, the GHL sync waits and the backstop logs an error and exits.
+
 ```bash
 # smoke test one cycle each first
 PYTHONPATH=. .venv/bin/python -m src.lending.opt_out_poller --once
