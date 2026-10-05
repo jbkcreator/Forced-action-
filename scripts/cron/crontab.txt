@@ -1180,6 +1180,14 @@ COUNTY_ID=hillsborough
 # records live through Tracerfy (ledger-gated, SKIP_TRACE_MAX_RUN_COST_CENTS cap); no CSV step.
 # 30 2 * * * $PROJECT/scripts/cron/run.sh src.tasks.property_radar_runner --apply --mode daily --state FL
 
+# PropertyRadar -> calling pool bridge: stage property_radar_records (+ traced phones joined
+# by address+zip) as the pr_maturity pool the dialer reads. Runs after the 02:00 pull and any
+# trace, before the Monday dialer scrub/load. No credit spend (reads existing traces only);
+# phone-less rows are staged too so a later trace joins without a re-extract.
+# DISABLED until Josh turns PropertyRadar on — enable alongside the pull/runner above.
+# Dry check first: PYTHONPATH=. python -m src.tasks.lending_pr_maturity_bridge
+# 0 3 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_pr_maturity_bridge --apply
+
 # Lending call dispositions — retry Google Sheet / Slack #dial-tasks delivery for
 # calls whose first delivery failed or whose result was changed by the caller.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_disposition_delivery_retry
@@ -1213,5 +1221,22 @@ COUNTY_ID=hillsborough
 # (default) or OFR_BROKER_DOWNLOAD_URL unset; enable in prod once the box can
 # reach flofr.gov.
 0 5 1 * * $PROJECT/scripts/cron/run.sh src.tasks.ofr_broker_load
+
+# OFR individual Loan Originator (LO) refresh — List 4 "brokers and LOs" gap
+# (WP-W0-1 Pool 3). OFR publishes 3 surname-range files (AI/JR/SZ) monthly;
+# one run of this task downloads + unzips + loads all 3 into
+# ofr_loan_originators. Runs 1st of month 05:05 UTC, right after the broker
+# refresh above (same cadence, same host dependency). Fully automated — no
+# manual download/unzip needed once this runs on the server; it only needed
+# a manual path this session because dev work happened from a sandboxed
+# environment that cannot reach flofr.com (confirmed: DNS resolves, TCP times
+# out — a network boundary of that environment, not of production). Guard:
+# no-ops (raises, logged) when OFR_LO_ENABLED=false (default) or any of the
+# 3 OFR_LO_DOWNLOAD_URL_* vars are unset.
+#
+# NOT auto-wired to affect dialing until the client confirms LOs are in scope
+# (flagged gap) — this cron only keeps ofr_loan_originators fresh; Pool 3
+# reads it whenever the table holds rows, same fail-closed pattern as brokers.
+5 5 1 * * $PROJECT/scripts/cron/run.sh src.tasks.ofr_lo_load
 
 # === END FORCED-ACTION-PLATFORM ===

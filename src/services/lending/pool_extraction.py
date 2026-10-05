@@ -1,31 +1,59 @@
-"""Wave 0 Calling Pool Extraction — WP-W0-1.
+"""Wave 0 Calling Pool Extraction — WP-W0-1 / WP-GL-2.
 
-Reads the existing FA database (Hillsborough + Pinellas) and produces three
-calling pools for the Lending Engine (Cora):
+Reconciled 2026-10-02 from two branches that diverged after a common ancestor
+and independently built overlapping work: this branch (originally
+feat/calling-pool-extraction-intent-filter, PR #318) and
+feat/lending-w0-dev2-compliance-floor (PR #320). #320's schema move
+(lending.calling_pool_staging), List 6/7/9 extractors, and List-7 financing-
+exclusion check were kept as the base; this branch's Pasco scope, line_type
+field, corrected DBPR-based Pool 2, and per-campaign summary/export were
+ported on top. See PR #318's comment thread for the full before/after.
 
-    Pool 1  wholesaler_flipper  — buyer_entities with buyer_type IN ('wholesaler','flipper')
-    Pool 2  active_builder      — structural permits (12 mo), no permanent financing recorded
-    Pool 3  mortgage_broker     — STUB; blocked on O4 (OFR registry source unconfirmed)
+Reads the existing FA database (Hillsborough, Pinellas, Pasco) and produces
+five calling pools for the Lending Engine (Cora), each tagged with Josh's
+List 1-9 taxonomy (source_tag, client_commnets_answers.md Section 2):
 
-Output lands in ``lending.calling_pool_staging`` in the FA database.  This is
-a Wave 0 placeholder location.  The final isolated lending schema (O1) is
-owned by Developer 2 — once that schema ships, this writer swaps in the real
-target table without logic changes.
+    Pool 1  wholesaler_flipper — buyer_entities with buyer_type IN ('wholesaler','flipper')
+                                  List 2 "cash buyers" normally, List 9 "stalled flips"
+                                  once the purchase is >=90 days old and unsold
+    Pool 2  active_builder     — List 3: DBPR-licensed Cert Building/Residential contractors
+    Pool 3  mortgage_broker    — List 4: OFR "Ch 494 MBR-MBRB" registry (brokers only, not
+                                  individual LOs — see the source_tag_for() docstring)
+    permit_owner               — List 7: property owners behind a new-construction permit,
+                                  with no permanent financing recorded since
+    auction_winner             — List 6: tax-deed auction winners (phoneless, trace-only)
+
+Output lands in ``lending.calling_pool_staging``.
 
 Open items this file is waiting on:
-  O1   — Lending-schema location (Dev 2). Staging table used as placeholder.
-  O4   — FL mortgage broker registry source (OFR, not DBPR). Pool 3 is empty stub.
   O11  — Wholesaler definition (buyer_type vs raw deed-velocity). Using buyer_type.
   O12  — Builder permit_type definitions. Using STRUCTURAL_KEYWORDS from config.
-  O13  — Broker contact sourcing. Pool 3 returns [].
   O14  — Intent filter applicability to non-property pools. Applied where property
           anchor exists; non-anchored records pass through at tier='unscored'.
-  O15  — No-phone handling. Rows without a normalised phone are staged with
-          phone_available=False for Dev 2's skip-trace enrichment (WP-W0-3).
-  O16  — Multi-pool dedup precedence. Pool 2 > Pool 1 (same entity in both pools
-          keeps the Pool 2 row; pools never share a unique phone).
-  O28  — Estimated Loan Value formula. Interim formulas in POOL_ELV_FACTORS below.
+  O15  — No-phone handling: RESOLVED by lead — Tracerfy only (both skip-trace AND
+          DNC check), per client. BatchData is explicitly NOT used (no credits
+          available). Rows without a normalised phone are staged with
+          phone_available=False for WP-W0-3's Tracerfy-only enrichment pass.
+  O16  — Multi-pool dedup precedence. Pool 2 > Pool 1 > Pool 3 (same entity in
+          multiple pools keeps the higher-priority pool's row; List 6/7 are
+          phoneless or dedup against already-claimed phones separately).
+  O28  — Estimated Loan Value formula. Interim formulas below (CONSTRUCTION_LTC etc).
   O29  — Recent Permit Details for non-builder pools. Omitted; field is NULL.
+
+Pasco/Builders (RESOLVED by lead + verified 2026-10-02 on prod): Pasco has ZERO
+DBPR builder records today (Cert Building + Cert Residental both empty, query
+run directly on the production server). Pool 2 (List 3) correctly returns 0
+Pasco rows as a result — no fabrication, no code change needed. List 7
+(permit_owner) does not depend on DBPR and has NOT yet been checked for Pasco
+building_permits coverage — worth a follow-up query:
+    SELECT COUNT(*) FROM building_permits WHERE county_id = 'pasco';
+
+List 4 "brokers and LOs" gap: Pool 3 only loads the OFR broker-business file
+(MBR/MBRB), not the individual Loan Originator file. Confirmed from real OFR
+sample data (2026-10-02): the LO file is a nationwide NMLS registry (most
+records are out-of-state), and phone coverage is ~0% even after narrowing to
+our target counties. Flagged pending a client scope decision — not built
+blind this close to launch.
 
 IMPORTANT: estimated_loan_value is an INTERNAL CALLER REFERENCE only.  It is
 derived from public-record job_value / sale_price.  It is never a quote, term,
@@ -55,7 +83,7 @@ logger = logging.getLogger(__name__)
 # and Pinellas counties only."
 # ---------------------------------------------------------------------------
 
-WAVE0_COUNTY_NAMES: tuple[str, ...] = ("Hillsborough", "Pinellas")
+WAVE0_COUNTY_NAMES: tuple[str, ...] = ("Hillsborough", "Pinellas", "Pasco")
 
 # Aircall campaign tags — spec §4.3
 AIRCALL_TAG: dict[str, str] = {
@@ -66,8 +94,9 @@ AIRCALL_TAG: dict[str, str] = {
     "permit_owner": "DESK_CONSTRUCTION",
 }
 
-# Go Live Brief 2.5 source lists. A flipper is List 9 only while its flip is stalled:
-# the latest purchase is at least this old and the property has not been resold.
+# Go Live Brief 2.5 source lists (Josh's List 1-9 taxonomy, client_commnets_answers.md
+# Section 2 table). A flipper is List 9 only while its flip is stalled: the latest
+# purchase is at least this old and the property has not been resold.
 # 90 days: the median flipper hold is 8 days, and deeds only reach back to 2026-01-01.
 STALLED_FLIP_MIN_DAYS: int = 90
 # List 7 = owners behind a new-construction permit (brief: "new construction is the repeat
@@ -82,9 +111,22 @@ def is_stalled_flip(bought: Optional[date], *, resold: bool, today: Optional[dat
 
 
 def source_tag_for(pool_name: str, source_table: str, *, stalled: bool = False) -> Optional[str]:
-    """Brief source list for a staged record; None when it belongs to no launch list."""
-    # Pool 2 rows are contractors (List 3). List 7 (owners pulling NOCs/permits) is
-    # property-level and has no extractor yet.
+    """Josh's List 1-9 taxonomy for a staged record; None when it belongs to no launch list.
+
+    wholesaler_flipper -> List 2 "cash buyers" while NOT stalled (the spec's own Pool 1
+    data source, buyer_entities.total_cash_volume, matches Josh's "cash buyers" label —
+    INFERRED, not confirmed by him by number; gates his "Lists 2 and 4 blocked from
+    booking" rule, client_commnets_answers.md "Two booking gates" item — confirm with
+    Josh if there's any doubt before relying on it operationally), List 9 "stalled
+    flips" once stalled.
+
+    mortgage_broker -> List 4 "brokers and LOs" — NOTE: Pool 3 currently loads the OFR
+    business (MBR/MBRB) file only, NOT the individual Loan Originator file, so this
+    list is under-covered relative to Josh's own naming. Flagged to the team pending a
+    scope decision on whether to ingest the LO file before launch — NOT silently built
+    (the file's phone-field availability needs checking first; real sample data from
+    OFR's bulk "LO" download shows ~0% phone coverage even after narrowing to FL).
+    """
     if pool_name == "active_builder":
         return "list_3"
     if pool_name == "mortgage_broker":
@@ -93,8 +135,8 @@ def source_tag_for(pool_name: str, source_table: str, *, stalled: bool = False) 
         return "list_6"
     if pool_name == "permit_owner":
         return "list_7"
-    if pool_name == "wholesaler_flipper" and stalled:
-        return "list_9"
+    if pool_name == "wholesaler_flipper":
+        return "list_9" if stalled else "list_2"
     return None
 
 # Permit lookback window — spec §4.1 "12-month active permits"
@@ -129,18 +171,25 @@ CONSTRUCTION_AVG_LOAN = 525_000  # spec p1 (fallback when no job_value)
 FLIP_MIN_LOAN = 100_000          # spec p8
 FLIP_LOAN_FACTOR = 0.75          # bridge estimate off last sale_price
 
-# O12 — a real "Active Builder" is a contractor with N+ permits (spec §5.9 / p18
-# "project history 3+ projects"). The mechanism is spec-correct (count-based
-# qualification per normalized contractor); the threshold is configurable.
-#
-# Spec target is 3. But Wave 0 permit data barely captures contractor names
-# (verified on prod: only 2 contractors DB-wide have 3+ permits), because the
-# lifetime-permit-history aggregation is §5.9's Builder Permit Enrichment Engine
-# — a WAVE 1 component that normalizes names, maps DBPR/GA-SOS licenses and
-# aggregates FL+GA feeds. Until that runs, 3 yields an empty pool. So Wave 0
-# uses 1 (any identifiable builder with recent activity); flip to 3 once §5.9
-# populates builder history.
-BUILDER_MIN_PROJECTS = 1  # spec target: 3 (see note above; raise once §5.9 lands)
+# O12 — Builder identification. The spec (§5.9 / p18) defines a builder via DBPR
+# licensing + permit history. Prod permit data barely captures the contractor
+# (only 61 of 52k permits have a name), so the permit-only path finds ~32.
+# The real builder population is the DBPR construction registry. Pool 2 sources
+# from DBPR (matching §5.9's "maps active state license numbers from DBPR") —
+# phones come via skip-trace (WP-W0-3), same as the other pools.
+BUILDER_MIN_PROJECTS = 1  # retained for the permit-history refinement (§5.9 Wave 1)
+
+# DBPR license types scoped to spec §4.1's "single-family and infill" builder,
+# per FL Statute 489 license classes (verified, not keyword-guessed):
+#   Cert Residential (CRC) — single/duplex/triplex/fourplex only, <=2 stories:
+#       the exact "single-family" match.
+#   Cert Building (CBC) — up to 3 stories, residential + light commercial:
+#       covers infill/small multi-family.
+#   Cert General (CGC) — EXCLUDED: unlimited scope (high-rise, commercial,
+#       industrial) — too broad, does not match "single-family and infill."
+# ('Residental' is a real misspelling in the source data — matched verbatim,
+# not by pattern, so this list is an exact license_type_desc match, not ILIKE.)
+BUILDER_DBPR_LICENSE_TYPES: list[str] = ["Cert Building", "Cert Residental"]
 
 # SQL ILIKE patterns built once from STRUCTURAL_KEYWORDS
 _STRUCTURAL_PATTERNS: list[str] = [f"%{kw}%" for kw in STRUCTURAL_KEYWORDS]
@@ -228,6 +277,7 @@ class CallingPoolRecord:
     # ── Contact ─────────────────────────────────────────────────────────
     normalized_phone: Optional[str]       # E.164 or None (see O15)
     phone_available: bool
+    line_type: Optional[str]              # 'mobile' | 'landline' | 'unknown' | None
     email: Optional[str]
 
     # ── Intent filter (spec §4.1 "Filter: Intent Scoring") ──────────────
@@ -235,7 +285,7 @@ class CallingPoolRecord:
     intent_tier: Optional[str]            # high | medium | low | unscored
     recommended_product: Optional[str]
 
-    # ── Routing + provenance ────────────────────────────────────────────
+    # ── Routing + campaign taxonomy ─────────────────────────────────────
     aircall_campaign_tag: str
     buyer_entity_id: Optional[int]        # set for Pool 1
     permit_number: Optional[str]          # set for Pool 2
@@ -246,6 +296,10 @@ class CallingPoolRecord:
     # Go Live: brief source list (list_1..list_9); set by _finalize_run_metadata.
     source_tag: Optional[str] = None
     stalled_flip: bool = False
+    # F8 (Josh, Oct 4 §2): owner-occupied status of the target property, from
+    # financials.homestead_exempt. None for pools with no single subject property
+    # (mortgage_broker: the record is a professional, not a property owner).
+    homestead_exempt: Optional[bool] = None
 
 
 # ---------------------------------------------------------------------------
@@ -291,29 +345,8 @@ def extract_calling_pools(
         "run_id": run_id,
         "dry_run": dry_run,
         "county_ids": county_ids,
-        "pools": {
-            "wholesaler_flipper": {
-                "total": sum(1 for r in all_records if r.pool_name == "wholesaler_flipper"),
-                "phone_available": sum(
-                    1 for r in all_records
-                    if r.pool_name == "wholesaler_flipper" and r.phone_available
-                ),
-            },
-            "active_builder": {
-                "total": sum(1 for r in all_records if r.pool_name == "active_builder"),
-                "phone_available": sum(
-                    1 for r in all_records
-                    if r.pool_name == "active_builder" and r.phone_available
-                ),
-            },
-            "mortgage_broker": {
-                "total": sum(1 for r in all_records if r.pool_name == "mortgage_broker"),
-                "note": (
-                    "Spec §4.1 source (OFR/NMLS professional licensing registry) not ingested "
-                    "in FA — fail-closed, 0 records. Blocked on O4/O13."
-                ),
-            },
-        },
+        "pools": _summarize_by_pool(all_records),
+        "source_tags": _summarize_by_source_tag(all_records),
         "total_records": len(all_records),
         "total_phone_available": sum(1 for r in all_records if r.phone_available),
     }
@@ -326,6 +359,45 @@ def extract_calling_pools(
         logger.info("run_id=%s dry_run=True skipping DB write (%d records)", run_id, len(all_records))
 
     return summary
+
+
+def _summarize_by_pool(records: list[CallingPoolRecord]) -> dict[str, dict[str, int]]:
+    """Total / phone_available per internal pool_name (wholesaler_flipper, active_builder,
+    mortgage_broker, permit_owner, auction_winner).
+
+    Coarser than _summarize_by_source_tag — wholesaler_flipper mixes List 2 (not stalled)
+    and List 9 (stalled) here. Kept for backward-compat callers that key off pool_name.
+    """
+    out: dict[str, dict[str, int]] = {}
+    for r in records:
+        bucket = out.setdefault(r.pool_name, {"total": 0, "phone_available": 0})
+        bucket["total"] += 1
+        if r.phone_available:
+            bucket["phone_available"] += 1
+    return out
+
+
+def _summarize_by_source_tag(records: list[CallingPoolRecord]) -> dict[str, dict[str, Any]]:
+    """Total / phone_available per Josh's List 1-9 taxonomy (source_tag) — the shape of
+    the table he asked for (client_commnets_answers.md Section 2): "each campaign...
+    raw records, records with a phone". A record with source_tag=None (not yet mapped
+    to any launch list) groups under 'unassigned' rather than silently vanishing.
+
+    NOTE: this is "raw records" / "records with a phone" only — NOT "dialable after DNC
+    and suppression", which needs WP-W0-2's compliance pass output, not this extraction step.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for r in records:
+        key = r.source_tag or "unassigned"
+        bucket = out.setdefault(key, {"total": 0, "phone_available": 0, "pool_names": set()})
+        bucket["total"] += 1
+        bucket["pool_names"].add(r.pool_name)
+        if r.phone_available:
+            bucket["phone_available"] += 1
+    # Sets aren't JSON-serializable — convert to a sorted list for the summary dict.
+    for bucket in out.values():
+        bucket["pool_names"] = sorted(bucket["pool_names"])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -356,8 +428,8 @@ def _extract_pool1_wholesaler_flipper(
                 -- the entity's OWN linked owner records (the same person, clustered
                 -- by the resolver). NOT enriched_contacts by the transacted
                 -- property (that's the seller/owner of that deal, a different person).
-                COALESCE(be.primary_phone, oc.owner_phone) AS raw_phone,
-                COALESCE(be.primary_email, oc.owner_email) AS email,
+                COALESCE(be.primary_phone, oc.owner_phone, ecc.ec_phone) AS raw_phone,
+                COALESCE(be.primary_email, oc.owner_email, ecc.ec_email) AS email,
                 d.property_id                   AS source_property_id,
                 p.county_id                     AS county_id,
                 c.display_name                  AS county_name,
@@ -366,6 +438,7 @@ def _extract_pool1_wholesaler_flipper(
                 p.city                          AS prop_city,
                 p.state                         AS prop_state,
                 p.zip                           AS prop_zip,
+                f.homestead_exempt              AS homestead_exempt,
                 d.sale_price                    AS last_sale_price,
                 d.record_date                   AS last_purchase_date,
                 EXISTS (SELECT 1 FROM deeds later
@@ -376,6 +449,7 @@ def _extract_pool1_wholesaler_flipper(
                                        AND bel.source_table IN ('deeds', 'deed_wholesaler')
             JOIN deeds d    ON d.id = bel.source_id
             JOIN properties p ON p.id = d.property_id
+            LEFT JOIN financials f ON f.property_id = p.id
             JOIN counties c   ON c.county_id = p.county_id
             -- The entity's OWN contact, via its clustered owner records
             -- (buyer_entity_links source_table='owners' → owners). These records
@@ -391,6 +465,22 @@ def _extract_pool1_wholesaler_flipper(
                   AND COALESCE(o.phone_1, o.phone_2, o.phone_3) IS NOT NULL
                 LIMIT 1
             ) oc ON TRUE
+            -- Enriched (skip-traced) phone on the entity's OWN properties, via its
+            -- clustered owner records — the same person, not the transacted deed's owner.
+            LEFT JOIN LATERAL (
+                SELECT COALESCE(ec.mobile_phone, ec.landline) AS ec_phone,
+                       ec.email                                AS ec_email
+                FROM buyer_entity_links bl
+                JOIN owners o ON o.id = bl.source_id
+                JOIN enriched_contacts ec ON ec.property_id = o.property_id
+                                         AND ec.superseded_at IS NULL
+                                         AND ec.match_success
+                WHERE bl.buyer_entity_id = be.id
+                  AND bl.source_table = 'owners'
+                  AND COALESCE(ec.mobile_phone, ec.landline) IS NOT NULL
+                ORDER BY ec.confidence DESC NULLS LAST, ec.enriched_at DESC
+                LIMIT 1
+            ) ecc ON TRUE
             WHERE be.buyer_type IN ('wholesaler', 'flipper')
               AND p.county_id = ANY(:county_ids)
             ORDER BY be.id, d.record_date DESC NULLS LAST
@@ -435,6 +525,7 @@ def _extract_pool1_wholesaler_flipper(
             state=row.prop_state or WAVE0_STATE,
             normalized_phone=norm,
             phone_available=norm is not None,
+            line_type="unknown",           # buyer_entity phone source doesn't distinguish mobile/landline
             email=row.email,
             financing_intent_score=None,   # attached by _attach_intent_scores
             intent_tier=None,
@@ -446,6 +537,7 @@ def _extract_pool1_wholesaler_flipper(
             source_property_id=row.source_property_id,
             source_table="buyer_entities",
             stalled_flip=is_stalled_flip(_as_date(row.last_purchase_date), resold=bool(row.resold)),
+            homestead_exempt=_buyer_homestead(row.homestead_exempt, bool(row.resold)),
         ))
 
     logger.info("Pool 1 wholesaler_flipper: %d raw rows", len(records))
@@ -460,118 +552,68 @@ def _extract_pool2_active_builder(
     session: Session,
     county_ids: list[str],
 ) -> list[CallingPoolRecord]:
-    """Active builders = contractors with 3+ permits (spec §5.9 / p18).
+    """Builders = DBPR-licensed construction contractors (spec §5.9 / p18).
 
-    O12 (spec-backed): a real "Active Builder" is not any permit — it is a
-    contractor whose permit history meets the 3-project threshold (§5.9 Builder
-    Permit Enrichment Engine; p18 credit box "project history 3+ projects").
-    This is one row PER BUILDER, keyed by normalized contractor/holder name, with:
-      - 3+ non-enforcement structural permits (their qualifying history),
-      - at least one recent (12-month) permit in a target county (active now),
-      - no permanent financing recorded on the recent project.
+    O12: prod permit data barely captures the contractor (only 61 of 52k permits
+    carry a name), so the permit-only path finds ~32. The real builder population
+    is the DBPR construction registry, scoped to Cert Building + Cert Residential
+    (single-family/infill per spec §4.1 — Cert General excluded as out-of-scope,
+    see BUILDER_DBPR_LICENSE_TYPES). Pool 2 sources from DBPR (this is §5.9's
+    "maps active state license numbers from DBPR"), one row per licensed contractor.
 
-    Phone is the CONTRACTOR's: permit column → DBPR registry by license →
-    name-matched owner-builder fallback. Never the property owner's blindly.
-    (permit_staging is excluded here — it carries no contractor identity, so it
-    cannot meet the 3-project builder test.)
+    Phone: DBPR's own phone fields first (mobile/phone/landline). DBPR phones are
+    populated by the separate DBPR enrichment; anything still phone-less flows to
+    the shared skip-trace queue (WP-W0-3) with every other phone-less pool row.
+
+    This is List 3 only. List 7 (NOC/permits — property owners with active
+    construction permits, a related but distinct population) is a separate
+    extractor, _extract_list7_permit_owners(), called directly from
+    extract_calling_pools() rather than nested here.
     """
-    structural_patterns = _STRUCTURAL_PATTERNS
-
     rows = session.execute(
         text("""
-            WITH builder_permits AS (
-                -- Every qualifying permit with an identifiable builder.
-                SELECT
-                    bp.id,
-                    lower(trim(COALESCE(NULLIF(TRIM(bp.contractor_name), ''),
-                                        NULLIF(TRIM(bp.holder_name), '')))) AS builder_key,
-                    bp.contractor_name, bp.holder_name, bp.contractor_license,
-                    bp.contractor_phone, bp.contractor_email,
-                    bp.county_id, bp.permit_number, bp.permit_type, bp.issue_date,
-                    bp.job_value, bp.property_id
-                FROM building_permits bp
-                WHERE bp.is_enforcement_permit = FALSE
-                  AND COALESCE(NULLIF(TRIM(bp.contractor_name), ''),
-                               NULLIF(TRIM(bp.holder_name), '')) IS NOT NULL
-                  AND EXISTS (
-                      SELECT 1 FROM unnest(CAST(:structural_patterns AS text[])) kw
-                      WHERE bp.permit_type ILIKE kw OR bp.description ILIKE kw
-                  )
-            ),
-            counts AS (
-                SELECT builder_key, count(*) AS project_count
-                FROM builder_permits
-                GROUP BY builder_key
-                HAVING count(*) >= :min_projects       -- 3+ projects = real builder
-            )
-            -- Most recent qualifying permit per builder that is active (12mo) in a
-            -- target county and has no permanent financing recorded on it.
-            SELECT DISTINCT ON (bpr.builder_key)
-                bpr.builder_key,
-                cnt.project_count,
-                bpr.contractor_name         AS borrower_name,
-                bpr.holder_name             AS entity_name,
-                COALESCE(bpr.contractor_phone, dc.mobile_phone, dc.phone, dc.landline_phone) AS raw_phone,
-                COALESCE(bpr.contractor_email, dc.email)                                     AS email,
-                bpr.job_value,
-                bpr.permit_type,
-                bpr.issue_date,
-                bpr.permit_number,
-                bpr.county_id,
+            SELECT
+                dc.license_number,
+                dc.full_name                AS borrower_name,
+                dc.company_name             AS entity_name,
+                dc.license_type_desc,
+                dc.license_expiry,
+                dc.address                  AS prop_address,
+                dc.city                     AS prop_city,
+                dc.state                    AS prop_state,
+                dc.zip_code                 AS prop_zip,
+                dc.county_id,
                 c.display_name              AS county_name,
-                bpr.property_id             AS source_property_id,
-                p.parcel_id                 AS parcel_id,
-                p.address                   AS prop_address,
-                p.city                      AS prop_city,
-                p.state                     AS prop_state,
-                p.zip                       AS prop_zip,
-                o.owner_name                AS owner_name,
-                COALESCE(o.phone_1, o.phone_2, o.phone_3) AS owner_phone,
-                o.email_1                   AS owner_email
-            FROM builder_permits bpr
-            JOIN counts cnt ON cnt.builder_key = bpr.builder_key
-            JOIN counties c ON c.county_id = bpr.county_id
-            LEFT JOIN properties p ON p.id = bpr.property_id
-            LEFT JOIN dbpr_contacts dc ON dc.license_number = bpr.contractor_license
-            LEFT JOIN owners o ON o.property_id = bpr.property_id
-            WHERE bpr.county_id = ANY(:county_ids)
-              AND bpr.issue_date >= CURRENT_DATE - INTERVAL '12 months'
-              AND NOT EXISTS (
-                  SELECT 1 FROM deeds d
-                  WHERE d.property_id = bpr.property_id
-                    AND d.mortgage_amount > 0
-                    AND d.record_date >= bpr.issue_date
-              )
-            ORDER BY bpr.builder_key, bpr.issue_date DESC
+                COALESCE(dc.mobile_phone, dc.phone, dc.landline_phone) AS raw_phone,
+                -- Capture which DBPR phone field was used so line_type is deterministic.
+                -- DBPR stores mobile and landline in separate columns; 'phone' is untyped.
+                CASE
+                    WHEN dc.mobile_phone IS NOT NULL THEN 'mobile'
+                    WHEN dc.phone IS NOT NULL THEN 'unknown'
+                    WHEN dc.landline_phone IS NOT NULL THEN 'landline'
+                    ELSE NULL
+                END AS phone_line_type,
+                dc.email
+            FROM dbpr_contacts dc
+            JOIN counties c ON c.county_id = dc.county_id
+            WHERE dc.county_id = ANY(:county_ids)
+              AND dc.license_type_desc = ANY(:lic_types)
         """),
         {
             "county_ids": county_ids,
-            "structural_patterns": structural_patterns,
-            "min_projects": BUILDER_MIN_PROJECTS,
+            "lic_types": BUILDER_DBPR_LICENSE_TYPES,
         },
     ).fetchall()
 
     records: list[CallingPoolRecord] = []
     for row in rows:
         norm = normalize_phone(row.raw_phone)
-        email = row.email
-        # Owner-builder fallback: borrow the property owner's phone ONLY when the
-        # owner's name matches the builder's (owner-builder on their own lot).
-        if norm is None and row.owner_phone:
-            builder_name = row.borrower_name or row.entity_name
-            if _names_match(builder_name, row.owner_name):
-                norm = normalize_phone(row.owner_phone)
-                email = email or row.owner_email
-
-        # O28 New Construction: 85% LTC of the permit job value; fall back to the
-        # $525K construction average when job_value is missing. Internal estimate.
-        if row.job_value:
-            elv = Decimal(str(row.job_value)) * Decimal(str(CONSTRUCTION_LTC))
-        else:
-            elv = Decimal(str(CONSTRUCTION_AVG_LOAN))
-
-        permit_details = _compose_permit_details(row.permit_type, row.issue_date, row.job_value)
-        detail = f"{row.project_count} permits" + (f" · {permit_details}" if permit_details else "")
+        # O28 New Construction: no per-deal job value from DBPR → the spec's
+        # $525K construction average as the internal estimate.
+        elv = Decimal(str(CONSTRUCTION_AVG_LOAN))
+        detail = row.license_type_desc + (
+            f" · lic {row.license_number}" if row.license_number else ""
+        ) + (f" · exp {row.license_expiry}" if row.license_expiry else "")
 
         records.append(CallingPoolRecord(
             run_id="",
@@ -585,25 +627,30 @@ def _extract_pool2_active_builder(
             ),
             estimated_loan_value=elv,
             recent_permit_details=detail,
-            entity_status=None,   # builders have no structured legal type (Dev 2: NULL → fail-closed in GA)
-            parcel_id=row.parcel_id,
+            entity_status=_entity_status_from_firm_name(row.entity_name),
+            parcel_id=None,                       # DBPR is contractor-level, no property anchor
             zip=row.prop_zip,
             state=row.prop_state or WAVE0_STATE,
             normalized_phone=norm,
             phone_available=norm is not None,
-            email=email,
+            line_type=row.phone_line_type,        # 'mobile'|'landline'|'unknown' from DBPR columns
+            email=row.email,
             financing_intent_score=None,
             intent_tier=None,
             recommended_product=None,
             aircall_campaign_tag=AIRCALL_TAG["active_builder"],
             buyer_entity_id=None,
-            permit_number=row.permit_number,
-            dbpr_license_number=None,
-            source_property_id=row.source_property_id,
-            source_table="building_permits",
+            permit_number=None,
+            dbpr_license_number=row.license_number,
+            source_property_id=None,
+            source_table="dbpr_contacts",
         ))
 
-    logger.info("Pool 2 active_builder: %d builders (min %d projects)", len(records), BUILDER_MIN_PROJECTS)
+    logger.info(
+        "Pool 2 active_builder (List 3): %d DBPR contractors, %d with phone",
+        len(records),
+        sum(1 for r in records if r.phone_available),
+    )
     return records
 
 
@@ -649,24 +696,38 @@ def _extract_pool3_mortgage_broker(session: Session, county_ids: list[str]) -> l
     - NMLS (MBR-MBRB)" bulk download, loaded into ofr_mortgage_brokers by
     src/tasks/ofr_broker_load.py.  We use the BUSINESS (MBR/MBRB) file — the
     broker firms, which in FL includes solo brokers licensed as their own LLC.
-    The individual Loan Originator (LO) file is intentionally NOT used: those
-    are employees (not brokers), carry no employer link, and have no phone.
 
-    This pool stays fail-closed until the table exists AND holds rows, so an
-    empty/absent load never fabricates brokers.
+    List 4 is "brokers AND LOs" per Josh's own taxonomy — individual Loan
+    Originators are now included too, via _extract_pool3b_loan_originators()
+    (OFR's separate "LO" bulk file, ofr_loan_originators table). Confirmed from
+    real sample data: the LO file is a NATIONWIDE NMLS registry (most records
+    are out-of-state individuals holding a remote FL license), and phone
+    coverage is ~0% even after narrowing to our target counties — virtually
+    every LO record needs skip-trace. Same county-match filter as brokers
+    narrows the out-of-state noise down to locally-based LOs, consistent with
+    the referral-relationship use case (Caller Playbook's broker/LO hook).
+
+    This pool stays fail-closed until each table exists AND holds rows, so an
+    empty/absent load never fabricates brokers or LOs.
 
     Aircall tag: DESK_RESCUE.
     """
+    # Target counties, upper-cased to match OFR's COUNTY text column. Derived
+    # from the actually-requested county_ids (slugs, e.g. "hillsborough" ->
+    # "HILLSBOROUGH"), not the global WAVE0_COUNTY_NAMES constant — a
+    # single-county CLI run (--counties Hillsborough) must not silently stage
+    # every other county's brokers/LOs too.
+    target_counties = [c.upper() for c in county_ids]
+
+    # Brokers and LOs are independent OFR datasets with independent load status —
+    # one being missing/empty must never silently suppress the other.
     if not _ofr_registry_available(session):
         logger.warning(
             "Pool 3 mortgage_broker: ofr_mortgage_brokers table not present — "
-            "returning 0 records (fail-closed). Run migrations/apply_ofr_mortgage_brokers.py "
+            "0 broker records (fail-closed). Run migrations/apply_ofr_mortgage_brokers.py "
             "+ src.tasks.ofr_broker_load."
         )
-        return []
-
-    # Wave 0 target counties, upper-cased to match OFR's COUNTY text column.
-    target_counties = [c.upper() for c in WAVE0_COUNTY_NAMES]
+        return _extract_pool3b_loan_originators(session, target_counties)
 
     rows = session.execute(
         text("""
@@ -677,6 +738,7 @@ def _extract_pool3_mortgage_broker(session: Session, county_ids: list[str]) -> l
             FROM ofr_mortgage_brokers
             WHERE status = 'Approved'
               AND UPPER(COALESCE(county, '')) = ANY(:counties)
+              AND UPPER(COALESCE(prim_state, '')) = 'FL'
         """),
         {"counties": target_counties},
     ).fetchall()
@@ -702,6 +764,7 @@ def _extract_pool3_mortgage_broker(session: Session, county_ids: list[str]) -> l
             state=row.prim_state or WAVE0_STATE,
             normalized_phone=row.normalized_phone,
             phone_available=row.normalized_phone is not None,
+            line_type="unknown",                      # OFR does not distinguish mobile/landline
             email=None,                               # not in OFR — skip-trace optional
             financing_intent_score=None,
             intent_tier=None,
@@ -714,12 +777,116 @@ def _extract_pool3_mortgage_broker(session: Session, county_ids: list[str]) -> l
             source_table="ofr_mortgage_brokers",
         ))
 
+    lo_records = _extract_pool3b_loan_originators(session, target_counties)
+    records.extend(lo_records)
+
     logger.info(
-        "Pool 3 mortgage_broker: %d Approved brokers in %s (%d with phone)",
+        "Pool 3 mortgage_broker: %d broker businesses + %d LOs in %s, %d with phone",
+        len(records) - len(lo_records), len(lo_records), target_counties,
+        sum(1 for r in records if r.phone_available),
+    )
+    return records
+
+
+def _extract_pool3b_loan_originators(session: Session, target_counties: list[str]) -> list[CallingPoolRecord]:
+    """List 4 (part 2): individual Loan Originators — Josh's 'brokers and LOs' naming.
+
+    Same county-match filter as the broker query, PLUS a prim_state='FL' check:
+    the OFR LO file is a nationwide NMLS registry where 'county' is the
+    individual's own home county, frequently out-of-state (confirmed from real
+    sample data — Michigan, Oregon addresses). County-name matching alone is
+    not sufficient: "Hillsborough" is also a real county in New Hampshire, so
+    an NH-based LO holding a remote FL license would otherwise match on county
+    name and get staged with state='NH', silently entering the Florida nurture
+    queue and inflating Hillsborough-FL counts in client reports (found in
+    code review). The state filter is required, not optional.
+
+    Fail-closed until ofr_loan_originators exists AND holds rows, same as
+    the broker table — never fabricates LOs from an absent/empty load.
+    """
+    if not _ofr_lo_registry_available(session):
+        logger.warning(
+            "Pool 3b loan_originator: ofr_loan_originators table not present — "
+            "returning 0 records (fail-closed). Run migrations/apply_ofr_loan_originators.py "
+            "+ src.tasks.ofr_lo_load."
+        )
+        return []
+
+    rows = session.execute(
+        text("""
+            SELECT
+                license_number, nmls_id, last_name, first_name, middle_name,
+                prim_address_1, prim_address_2, prim_city, county, prim_state, prim_zip,
+                normalized_phone
+            FROM ofr_loan_originators
+            WHERE status = 'Approved'
+              AND UPPER(COALESCE(county, '')) = ANY(:counties)
+              AND UPPER(COALESCE(prim_state, '')) = 'FL'
+        """),
+        {"counties": target_counties},
+    ).fetchall()
+
+    records: list[CallingPoolRecord] = []
+    for row in rows:
+        addr_line = " ".join(p for p in [row.prim_address_1, row.prim_address_2] if p)
+        full_name = " ".join(p for p in [row.first_name, row.middle_name, row.last_name] if p)
+        records.append(CallingPoolRecord(
+            run_id="",
+            pool_name="mortgage_broker",
+            county_id=(row.county or "").lower(),
+            county_name=(row.county or "").title(),
+            borrower_name=full_name or None,          # individual — unlike the firm-level broker rows
+            entity_name=None,                         # no firm/employer link in the LO file
+            target_property_address=_compose_address(
+                addr_line, row.prim_city, row.prim_state, row.prim_zip
+            ),
+            estimated_loan_value=None,                # O28 — no basis for LOs
+            recent_permit_details=None,               # O29 — n/a
+            entity_status="NATURAL_PERSON",
+            parcel_id=None,                           # LOs have no property anchor
+            zip=row.prim_zip,
+            state=row.prim_state or WAVE0_STATE,
+            normalized_phone=row.normalized_phone,
+            phone_available=row.normalized_phone is not None,
+            line_type="unknown",                      # OFR does not distinguish mobile/landline
+            email=None,                               # not in OFR — skip-trace optional
+            financing_intent_score=None,
+            intent_tier=None,
+            recommended_product=None,
+            aircall_campaign_tag=AIRCALL_TAG["mortgage_broker"],
+            buyer_entity_id=None,
+            permit_number=None,
+            dbpr_license_number=row.license_number,    # OFR license # (repurposed provenance field)
+            source_property_id=None,
+            source_table="ofr_loan_originators",
+        ))
+
+    logger.info(
+        "Pool 3b loan_originator: %d Approved LOs in %s (%d with phone)",
         len(records), target_counties,
         sum(1 for r in records if r.phone_available),
     )
     return records
+
+
+def _ofr_lo_registry_available(session: Session) -> bool:
+    """True if ofr_loan_originators exists AND holds at least one row.
+
+    Fail-closed on both a missing table and an empty table, so the LO half of
+    Pool 3 never activates before the OFR LO files have actually been loaded.
+    """
+    exists = session.execute(
+        text("""
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+              AND table_name = 'ofr_loan_originators'
+            LIMIT 1
+        """)
+    ).first()
+    if not exists:
+        return False
+    return session.execute(text("SELECT 1 FROM ofr_loan_originators LIMIT 1")).first() is not None
 
 
 def _entity_status_from_firm_name(firm_name: Optional[str]) -> Optional[str]:
@@ -913,13 +1080,21 @@ def permit_owner_record(row: Any) -> CallingPoolRecord:
         entity_status=_entity_status_from_firm_name(row.owner_name),
         parcel_id=row.parcel_id, zip=row.prop_zip, state=row.prop_state or WAVE0_STATE,
         normalized_phone=norm, phone_available=norm is not None,
+        line_type="unknown",  # owners table phone_1/2/3 has no line type
         email=(row.owner_email or "").strip().lower() or None,
         financing_intent_score=None, intent_tier=None, recommended_product=None,
         aircall_campaign_tag=AIRCALL_TAG["permit_owner"],
         buyer_entity_id=None, permit_number=row.permit_number, dbpr_license_number=None,
         source_property_id=row.source_property_id, source_table="building_permits",
         source_tag="list_7",
+        homestead_exempt=row.homestead_exempt,
     )
+
+
+def _buyer_homestead(homestead_exempt: Optional[bool], resold: bool) -> Optional[bool]:
+    """A resold deed property's appraiser flag describes its new (often owner-occupant)
+    owner, not the flipper, so it must not screen the flipper out."""
+    return None if resold else homestead_exempt
 
 
 def drop_claimed_phones(records: list[CallingPoolRecord], claimed: set[str]) -> list[CallingPoolRecord]:
@@ -947,11 +1122,13 @@ def _extract_list7_permit_owners(session: Session, county_ids: list[str]) -> lis
                 bp.property_id AS source_property_id, bp.permit_number, bp.permit_type, bp.issue_date,
                 bp.job_value, bp.county_id, c.display_name AS county_name,
                 p.parcel_id, p.address AS prop_address, p.city AS prop_city, p.state AS prop_state,
-                p.zip AS prop_zip, o.owner_name, COALESCE(o.phone_1, o.phone_2, o.phone_3) AS owner_phone,
+                p.zip AS prop_zip, f.homestead_exempt, o.owner_name,
+                COALESCE(o.phone_1, o.phone_2, o.phone_3) AS owner_phone,
                 o.email_1 AS owner_email
             FROM building_permits bp
             JOIN counties c ON c.county_id = bp.county_id
             JOIN properties p ON p.id = bp.property_id
+            LEFT JOIN financials f ON f.property_id = bp.property_id
             LEFT JOIN owners o ON o.property_id = bp.property_id
             WHERE bp.is_enforcement_permit = FALSE
               AND bp.county_id = ANY(:county_ids)
@@ -984,12 +1161,15 @@ def auction_winner_record(row: Any) -> CallingPoolRecord:
         recent_permit_details=None,
         entity_status=_entity_status_from_firm_name(row.sold_to),
         parcel_id=row.parcel_id, zip=row.prop_zip, state=row.prop_state or WAVE0_STATE,
-        normalized_phone=None, phone_available=False, email=None,
+        normalized_phone=None, phone_available=False, line_type="unknown", email=None,
         financing_intent_score=None, intent_tier=None, recommended_product=None,
         aircall_campaign_tag=AIRCALL_TAG["auction_winner"],
         buyer_entity_id=None, permit_number=None, dbpr_license_number=None,
         source_property_id=row.property_id, source_table="tax_deed_auctions",
         source_tag="list_6",
+        # The appraiser flag on this parcel describes the former owner the winner just
+        # bought it from, not the winner, so it is never used to screen them.
+        homestead_exempt=None,
     )
 
 
@@ -1059,20 +1239,28 @@ def _write_to_staging(session: Session, records: list[CallingPoolRecord]) -> int
         "borrower_name", "entity_name", "target_property_address",
         "estimated_loan_value", "recent_permit_details",
         "entity_status", "parcel_id", "zip", "state",
-        "normalized_phone", "phone_available", "email",
+        "normalized_phone", "phone_available", "line_type", "email",
         "financing_intent_score", "intent_tier", "recommended_product",
         "aircall_campaign_tag",
         "buyer_entity_id", "permit_number", "dbpr_license_number",
-        "source_property_id", "source_table", "created_at", "source_tag",
+        "source_property_id", "source_table", "created_at", "source_tag", "homestead_exempt",
     ]
 
     # One multi-row INSERT per batch: a single round trip, unlike per-row executemany
-    # (a ~19k-row run took minutes over the remote connection). Commit per batch.
+    # (a ~19k-row run took minutes over the remote connection). All batches share one
+    # transaction, committed only once every batch has succeeded — a mid-run failure
+    # (a dropped connection on batch 3 of 5, say) must leave nothing committed from
+    # this run_id, not a partial run that latest_run_id() would otherwise pick as
+    # "newest" over the previous complete one (finding #12).
     batch_size = 1000
     written = 0
-    for i in range(0, len(records), batch_size):
-        batch = [{c: getattr(r, c) for c in cols} for r in records[i:i + batch_size]]
-        session.execute(insert(LendingCallingPoolStaging).values(batch))
+    try:
+        for i in range(0, len(records), batch_size):
+            batch = [{c: getattr(r, c) for c in cols} for r in records[i:i + batch_size]]
+            session.execute(insert(LendingCallingPoolStaging).values(batch))
+            written += len(batch)
         session.commit()
-        written += len(batch)
+    except Exception:
+        session.rollback()
+        raise
     return written

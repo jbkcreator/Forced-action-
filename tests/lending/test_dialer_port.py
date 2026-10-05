@@ -200,12 +200,12 @@ def test_record_style_upsert_still_works_for_the_rules_code():
     assert BatchDialerAdapter(http=http, endpoints=ENDPOINTS).upsert_contact({"phone": PHONE}) == "42"
 
 
-def test_pool_campaign_tags_name_the_three_launch_queues():
+def test_pool_campaign_tags_name_the_four_ranked_queues_plus_nurture():
     from config import lending_queues as q
     from config.lending_dialer import POOL_CAMPAIGN_TAGS
     assert POOL_CAMPAIGN_TAGS == {q.VERIFIED_MATURITY: "Verified maturity",
                                   q.TRANSACTION_READY: "Transaction ready", q.BUILDERS: "Builders",
-                                  q.NURTURE: "Nurture"}
+                                  q.PARTNERS: "Partners", q.NURTURE: "Nurture"}
 
 
 # ── HTTP transport ──
@@ -248,6 +248,20 @@ def test_transport_get_goes_through_the_get_retry_helper(monkeypatch):
 
     monkeypatch.setattr(dialer_port, "requests_get_with_retry", lambda url, **kw: _Resp(200, b"[]"))
     assert dialer_port._requests_http("k")("GET", "/campaigns") == {"id": 9}
+
+
+def test_a_non_json_2xx_reply_is_a_dialer_request_error_not_a_crash(monkeypatch):
+    """Finding 6: callers only handle DialerRequestError, so a proxy error page or truncated
+    body with a 2xx status must not escape as a ValueError."""
+    from src.lending import dialer_port
+
+    class _NotJson(_Resp):
+        def json(self):
+            raise ValueError("Expecting value")
+
+    monkeypatch.setattr(dialer_port, "requests_get_with_retry", lambda url, **kw: _NotJson(200, b"<html>"))
+    with pytest.raises(DialerRequestError):
+        dialer_port._requests_http("k")("GET", "/campaigns")
 
 
 # ── DNC safety: holds never use the DNC list, restores never delete a DNC entry ──

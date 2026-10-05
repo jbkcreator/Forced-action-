@@ -24,7 +24,20 @@ SHIFT_GROUPS: dict[str, tuple[time, time]] = {
 AGENT_SHIFT_GROUPS: dict[str, str] = {}
 MAX_ATTEMPTS_PER_PERIOD = 3
 ATTEMPT_PERIOD_HOURS = 24        # rolling
+# Josh (Oct 4 answers, §6 "Attempts"): 3 per 24h, 6 total over 10 business days, then nurture.
+MAX_ATTEMPTS_TOTAL = 6
+ATTEMPT_HISTORY_BUSINESS_DAYS = 10
 DNC_SCRUB_MAX_AGE_DAYS = 7
+# The weekly job (cron: Mondays) must rescrub every phone whose scrub would turn stale for the
+# sweep before the next run: age > DNC_SCRUB_MAX_AGE_DAYS - period. With period == max age that
+# is every loaded phone. A threshold equal to the max age (the old behaviour) skips a phone that
+# is 6d23h old, which then sits stale for the sweep until the following Monday (~half the pool).
+WEEKLY_SCRUB_PERIOD_DAYS = 7
+WEEKLY_RESCRUB_AFTER_DAYS = max(0, DNC_SCRUB_MAX_AGE_DAYS - WEEKLY_SCRUB_PERIOD_DAYS)
+# If more than this share of the loaded pool looks stale the weekly job (or Tracerfy) is down,
+# not 20% of the numbers: the sweep alerts instead of mass-pulling the pool from the dialer.
+SCRUB_STALE_BREAKER_PCT = 25
+SCRUB_STALE_BREAKER_MIN_POOL = 20
 STOP_PROPAGATION_SLA_SECONDS = 60
 OPT_OUT_POLL_SECONDS = 15        # FA opt-out poller interval; worst case well inside the SLA
 # GoHighLevel opt-out sync: every lending opt-out becomes DND on the GHL contact.
@@ -35,6 +48,13 @@ GHL_BACKSTOP_PAGE_SIZE = 100     # GHL contact search page size (DND backstop)
 GHL_BACKSTOP_MAX_PAGES = 50      # bound per backstop run (~5,000 DND contacts)
 DIALER_SWEEP_SECONDS = 60        # window/cap pull-and-restore sweep interval
 GEORGIA_ALLOWED_ENTITY_TYPES = frozenset({"LLC", "LP", "CORPORATION"})
+# F8 (Josh, Oct 4 §2): "Owner is an LLC, LP or corporation, or a non owner occupied
+# investor. Homestead is out." Universal (not Georgia-specific); same allowed set as
+# the Georgia stop today, kept as its own name since the two rules can diverge later.
+INVESTOR_ENTITY_TYPES = frozenset({"LLC", "LP", "CORPORATION"})
+# List 4 (brokers and LOs) is a professional referral list, never screened as a
+# property owner — the homestead/entity gate does not apply to it.
+HOMESTEAD_GATE_EXCLUDED_SOURCE_TAGS = frozenset({"list_4"})
 
 # Recipient timezone by area code (lending-owned copy; FA SMS keeps its own).
 # 850 spans ET/CT → Central, the over-suppressing direction.
@@ -94,6 +114,9 @@ class OptOutStatus(str, Enum):
 class SuppressionReason(str, Enum):
     OPT_OUT = "OPT_OUT"
     LITIGATOR = "LITIGATOR"
+    # Josh's personal/warm network (Oct 4 §2): permanently suppressed from the cold
+    # queue, never an opt-out event — he still works these relationships himself.
+    WARM_NETWORK = "WARM_NETWORK"
 
 
 class ReasonCode(str, Enum):
@@ -107,8 +130,10 @@ class ReasonCode(str, Enum):
     LITIGATOR = "LITIGATOR"
     SUPPRESSED = "SUPPRESSED"
     GA_NATURAL_PERSON = "GA_NATURAL_PERSON"
+    HOMESTEAD_OWNER_OCCUPIED = "HOMESTEAD_OWNER_OCCUPIED"
     OUTSIDE_CALL_WINDOW = "OUTSIDE_CALL_WINDOW"
     ATTEMPT_CAP_REACHED = "ATTEMPT_CAP_REACHED"
+    ATTEMPT_HISTORY_EXCEEDED = "ATTEMPT_HISTORY_EXCEEDED"
     # Owned by WP-W0-4 (Developer 3); tag name is O6.
     BACKFLIP_CONFLICT = "BACKFLIP_CONFLICT"
     BACKFLIP_FEED_STALE = "BACKFLIP_FEED_STALE"
@@ -122,6 +147,8 @@ class RemovalReason(str, Enum):
     OPT_OUT = "opt_out"
     CALL_WINDOW = "call_window"
     ATTEMPT_CAP = "attempt_cap"
+    SCRUB_STALE = "scrub_stale"
+    ATTEMPT_HISTORY = "attempt_history"
 
 
 def validate_lending_compliance_config() -> None:
@@ -138,3 +165,7 @@ def validate_lending_compliance_config() -> None:
         raise ValueError("OPT_OUT_POLL_SECONDS must leave room inside the stop-propagation SLA")
     if ATTEMPT_PERIOD_HOURS < 1 or DNC_SCRUB_MAX_AGE_DAYS < 1 or STOP_PROPAGATION_SLA_SECONDS < 1:
         raise ValueError("periods and SLAs must be positive")
+    if not 1 <= WEEKLY_SCRUB_PERIOD_DAYS <= DNC_SCRUB_MAX_AGE_DAYS:
+        raise ValueError("WEEKLY_SCRUB_PERIOD_DAYS must not exceed DNC_SCRUB_MAX_AGE_DAYS")
+    if not 0 < SCRUB_STALE_BREAKER_PCT <= 100 or SCRUB_STALE_BREAKER_MIN_POOL < 1:
+        raise ValueError("scrub-stale breaker thresholds must be positive (pct <= 100)")
