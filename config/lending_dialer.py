@@ -1,15 +1,4 @@
-"""Lending dialer load: Aircall write limits and retry policy.
-
-Aircall allows 120 Public API requests per minute per company and returns
-HTTP 429 beyond that. The account sends no rate-limit headers, so the client
-paces itself to the documented limit rather than reacting to headers.
-"""
-
-AIRCALL_REQUESTS_PER_MINUTE: int = 120
-AIRCALL_MAX_ATTEMPTS: int = 5
-AIRCALL_RETRY_BASE_SECONDS: float = 2.0
-AIRCALL_MAX_RETRY_WAIT_SECONDS: float = 60.0
-AIRCALL_REQUEST_TIMEOUT_SECONDS: float = 20.0
+"""Lending dialer load: queue -> BatchDialer campaign names, hook lines and endpoints."""
 
 # Pool (launch queue) -> dialer campaign name (Go Live Brief 2.5). The campaigns must
 # exist in BatchDialer with these exact names; a live load refuses any unmapped pool.

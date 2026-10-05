@@ -11,7 +11,10 @@ Usage:
         --trace-results path/to/trace_results.csv --apply
     PYTHONPATH=. python -m src.tasks.property_radar_lead_handoff --live-trace --apply  # paid Tracerfy trace
 
---live-trace spends Tracerfy credits (1 per hit) and needs PROPERTY_RADAR_ENABLED=true.
+--live-trace spends Tracerfy credits (1 per hit), needs PROPERTY_RADAR_ENABLED=true and
+requires --apply: a dry run discards everything, so a rehearsal would pay for contacts and
+lose them. Paid contacts are stored (property_radar_traced_contacts, migrations/
+apply_property_radar_traced_contacts.py) with the ledger rows, and a later run reuses them.
 
 Contact rules (consent rows) follow PROPERTY_RADAR_CONTACT_RULES_ENABLED and
 cannot be switched on from the command line.
@@ -59,6 +62,26 @@ def _write_usage_ledger(session, entries: list[dict]) -> None:
     session.commit()
 
 
+def _write_traced_contacts(session, contacts: dict[str, LeadContacts]) -> None:
+    """Not committed here: the ledger write that follows commits both together."""
+    if not contacts:
+        return
+    session.execute(
+        text("INSERT INTO property_radar_traced_contacts (radar_id, phones, emails) "
+             "VALUES (:radar_id, :phones, :emails) ON CONFLICT (radar_id) DO UPDATE "
+             "SET phones = EXCLUDED.phones, emails = EXCLUDED.emails, traced_at = now()"),
+        [{"radar_id": rid, "phones": list(c.phones), "emails": list(c.emails)} for rid, c in contacts.items()],
+    )
+
+
+def _stored_contacts(session, radar_ids: list[str]) -> dict[str, LeadContacts]:
+    rows = session.execute(
+        text("SELECT radar_id, phones, emails FROM property_radar_traced_contacts WHERE radar_id = ANY(:ids)"),
+        {"ids": radar_ids},
+    ).all()
+    return {r.radar_id: LeadContacts(emails=tuple(r.emails), phones=tuple(r.phones)) for r in rows}
+
+
 def _live_trace(session, campaign: str) -> dict[str, LeadContacts]:
     settings = get_settings()
     if not settings.property_radar_enabled:
@@ -70,11 +93,13 @@ def _live_trace(session, campaign: str) -> dict[str, LeadContacts]:
         ledger=already_traced(session, "tracerfy", keys),
         submit=_tracerfy_submit,
         write_ledger=lambda entries: _write_usage_ledger(session, entries),
+        write_contacts=lambda contacts: _write_traced_contacts(session, contacts),
         cap=RunSpendCap(settings.skip_trace_max_run_cost_cents),
     )
-    logger.info("PropertyRadar live trace: submitted=%d already_traced=%d unkeyable=%d capped=%d",
-                outcome.submitted, outcome.skipped_already_traced, outcome.skipped_unkeyable, outcome.skipped_cap)
-    return outcome.contacts
+    logger.info("PropertyRadar live trace: submitted=%d already_traced=%d unkeyable=%d capped=%d no_result=%d",
+                outcome.submitted, outcome.skipped_already_traced, outcome.skipped_unkeyable,
+                outcome.skipped_cap, outcome.skipped_no_result)
+    return {**_stored_contacts(session, [lead.radar_id for lead in leads]), **outcome.contacts}
 
 
 def run(
@@ -85,6 +110,8 @@ def run(
     apply: bool = False,
     live_trace: bool = False,
 ) -> HandoffReport:
+    if live_trace and not apply:
+        raise ValueError("--live-trace spends Tracerfy credits and needs --apply; a dry run would discard the contacts")
     settings = get_settings()
     thin_path = settings.property_radar_thin_path_only if thin_path_only is None else thin_path_only
     contacts = load_trace_contacts(trace_results) if trace_results else {}
@@ -116,6 +143,8 @@ def main() -> None:
                         help="Trace staged addresses with Tracerfy now (spends credits; ledger-gated)")
     parser.add_argument("--apply", action="store_true", help="Write to FA Max (default: dry run)")
     args = parser.parse_args()
+    if args.live_trace and not args.apply:
+        parser.error("--live-trace spends Tracerfy credits and requires --apply")
     report = run(
         campaign=args.campaign, trace_results=args.trace_results,
         thin_path_only=args.thin_path, apply=args.apply, live_trace=args.live_trace,

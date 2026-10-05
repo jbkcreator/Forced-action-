@@ -19,6 +19,9 @@ SHIFT_GROUPS: dict[str, tuple[time, time]] = {
     "A": (time(9, 0), time(15, 0)),
     "B": (time(13, 0), time(19, 15)),
 }
+# BatchDialer agent id -> shift group. Filled once callers are named. An unmapped agent's
+# call is allowed (the 09:00-19:15 ET and recipient-local rails still apply) and warned.
+AGENT_SHIFT_GROUPS: dict[str, str] = {}
 MAX_ATTEMPTS_PER_PERIOD = 3
 ATTEMPT_PERIOD_HOURS = 24        # rolling
 DNC_SCRUB_MAX_AGE_DAYS = 7

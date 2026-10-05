@@ -13,6 +13,7 @@ value from a field that was never mapped.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Optional
@@ -23,6 +24,7 @@ from src.services.fa_max_backflip_feed import normalize_email
 
 NOT_AVAILABLE = "Not available"
 INFORMATION_MAX_CHARS = 1000
+_CITY_STATE_ZIP = re.compile(r"^(.+?)\s+[A-Za-z]{2}(\s+\d{5}(?:-\d{4})?)?$")
 
 
 @dataclass(frozen=True)
@@ -94,11 +96,23 @@ def _information(display: DialerDisplay) -> str:
 
 
 def _street_and_city(address: Optional[str]) -> tuple[Optional[str], Optional[str]]:
-    """"123 Main St, Tampa, FL 33602" -> ("123 Main St", "Tampa"); a bare street keeps no city."""
+    """"123 Main St, Tampa, FL 33602" and the pool's "123 MAIN ST, TAMPA FL 33602" ->
+    (street, city); "TAMPA FL 33602" -> (None, city); a bare street keeps no city."""
     if not address:
         return None, None
     parts = [p.strip() for p in address.split(",")]
-    return parts[0] or None, (parts[1] or None) if len(parts) > 2 else None
+    if len(parts) == 1:
+        city = _city_before_state_zip(parts[0], zip_required=True)  # "9 Oak St" is a street
+        return (None, city) if city else (parts[0] or None, None)
+    city = parts[1] if len(parts) > 2 else (_city_before_state_zip(parts[1]) or parts[1])
+    return parts[0] or None, city or None
+
+
+def _city_before_state_zip(text_: str, zip_required: bool = False) -> Optional[str]:
+    match = _CITY_STATE_ZIP.match(text_)
+    if not match or (zip_required and match.group(2) is None):
+        return None
+    return match.group(1).strip()
 
 
 def dialer_fields(display: DialerDisplay, email: Optional[str] = None) -> DialerContactFields:

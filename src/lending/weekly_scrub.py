@@ -4,6 +4,8 @@ Only loaded numbers whose newest scrub is older than the freshness window are se
 to Tracerfy (1 credit each). ``max_credits`` is a hard cap: the run stops before any
 batch that would exceed it. A number that now fails a scrub leaves the dialer for
 good (reason ``opt_out`` = the vendor's permanent DNC list) and its load row closes.
+A removal that fails (or has no dialer configured) leaves the load row open; the next run
+retries it without re-scrubbing, and the run exits non-zero until every flagged number is out.
 
 Usage:
     python -m src.lending.weekly_scrub --max-credits 5000
@@ -39,6 +41,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BATCH_SIZE = 500
 EXIT_CAP_REACHED = 4
+EXIT_REMOVAL_FAILED = 5
 
 
 @dataclass
@@ -47,14 +50,28 @@ class WeeklyScrubResult:
     blocked: int = 0
     credits_used: int = 0
     aborted: bool = False
+    left_unscrubbed: int = 0  # not reached under the cap: still loaded and dialable, scrub overdue
+    removal_failed: int = 0  # flagged numbers the dialer removal did not take out
+
+
+def _loaded_phones(db) -> list[str]:
+    raw = db.execute(text(
+        "SELECT DISTINCT phone FROM lending.dialer_load_records WHERE active AND phone IS NOT NULL"
+    )).scalars().all()
+    return sorted({p for p in (normalize_phone(r) for r in raw) if p})
+
+
+def blocked_loaded_phones(db) -> list[str]:
+    """Loaded numbers whose newest stored scrub fails: an earlier run flagged them but the
+    dialer removal did not land, and a fresh scrub would otherwise hide them for a week."""
+    loaded = _loaded_phones(db)
+    stored = _stored_scrubs(db, loaded) if loaded else {}
+    return [p for p in loaded if p in stored and not _verdict(p, stored[p]).allowed]
 
 
 def stale_loaded_phones(db, *, now: Optional[datetime] = None) -> list[str]:
     now = now or datetime.now(timezone.utc)
-    raw = db.execute(text(
-        "SELECT DISTINCT phone FROM lending.dialer_load_records WHERE active AND phone IS NOT NULL"
-    )).scalars().all()
-    loaded = sorted({p for p in (normalize_phone(r) for r in raw) if p})
+    loaded = _loaded_phones(db)
     if not loaded:
         return []
     cutoff = now - timedelta(days=DNC_SCRUB_MAX_AGE_DAYS)
@@ -75,6 +92,13 @@ def _close_load_rows(db, phones: list[str]) -> None:
     )
 
 
+def _take_out_of_dialer(db, blocked: list[str], dialer_remover: Optional[DialerRemover],
+                        result: WeeklyScrubResult) -> None:
+    removed = _remove_from_dialer(blocked, dialer_remover, RemovalReason.OPT_OUT)
+    _close_load_rows(db, list(removed))
+    result.removal_failed += len(blocked) - len(removed)
+
+
 def weekly_scrub(
     db,
     *,
@@ -88,12 +112,20 @@ def weekly_scrub(
     """Does not commit; the caller commits after each successful run."""
     targets = phones if phones is not None else stale_loaded_phones(db, now=now)
     result = WeeklyScrubResult()
+    if phones is None:
+        due = set(targets)
+        retry = [p for p in blocked_loaded_phones(db) if p not in due]
+        if retry:
+            logger.warning("[weekly-scrub] retrying the dialer removal of %d previously flagged number(s)", len(retry))
+            _take_out_of_dialer(db, retry, dialer_remover, result)
     for start in range(0, len(targets), batch_size):
         batch = targets[start:start + batch_size]
         if result.credits_used + len(batch) > max_credits:
             result.aborted = True
-            logger.warning("[weekly-scrub] credit cap %d reached after %d credits; stopping",
-                           max_credits, result.credits_used)
+            result.left_unscrubbed = len(targets) - start
+            logger.warning("[weekly-scrub] credit cap %d reached after %d credits; %d number(s) left "
+                           "unscrubbed and still dialable until a later run scrubs them",
+                           max_credits, result.credits_used, result.left_unscrubbed)
             break
         scrubs = _scrub(db, batch, scrubber)
         result.credits_used += len(batch)
@@ -105,10 +137,10 @@ def weekly_scrub(
             continue
         result.blocked += len(blocked)
         _flag_nurture(db, [p for p in blocked if verdicts[p].reason in NURTURE_REASONS])
-        removed = _remove_from_dialer(blocked, dialer_remover, RemovalReason.OPT_OUT)
-        _close_load_rows(db, list(removed))
-    logger.info("[weekly-scrub] scrubbed=%d blocked=%d credits=%d aborted=%s",
-                result.scrubbed, result.blocked, result.credits_used, result.aborted)
+        _take_out_of_dialer(db, blocked, dialer_remover, result)
+    logger.info("[weekly-scrub] scrubbed=%d blocked=%d credits=%d aborted=%s left_unscrubbed=%d removal_failed=%d",
+                result.scrubbed, result.blocked, result.credits_used, result.aborted, result.left_unscrubbed,
+                result.removal_failed)
     return result
 
 
@@ -124,7 +156,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         with get_db_context() as session:
             due = len(stale_loaded_phones(session))
-        logger.info("[weekly-scrub] dry run: %d number(s) would be scrubbed (%d credits)", due, due)
+            retry = len(blocked_loaded_phones(session))
+        logger.info("[weekly-scrub] dry run: %d number(s) would be scrubbed (%d credits), %d flagged number(s) "
+                    "still to take out of the dialer", due, due, retry)
         return 0
     if args.max_credits is None:
         parser.error("--max-credits is required unless --dry-run")
@@ -132,6 +166,9 @@ def main(argv: list[str] | None = None) -> int:
         result = weekly_scrub(session, scrubber=tracerfy_scrub, max_credits=args.max_credits,
                               batch_size=args.batch_size)
         session.commit()
+    if result.removal_failed:
+        logger.error("[weekly-scrub] %d flagged number(s) are still in the dialer", result.removal_failed)
+        return EXIT_REMOVAL_FAILED
     return EXIT_CAP_REACHED if result.aborted else 0
 
 

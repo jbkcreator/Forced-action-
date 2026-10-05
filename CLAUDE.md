@@ -44,10 +44,6 @@ PYTHONPATH=. python migrations/apply_fa_max_wp_t2_2_tool_call_log_claimed_status
 PYTHONPATH=. python migrations/apply_fa_max_wp_t2_3.py  # FA Max WP-T2-3: opportunity_id on relay_approval_queue, backflip_attribution_owner/set_at on fa_max_opportunities, fa_max_backflip_suppression_decisions audit table (idempotent, run after WP-T2-2)
 PYTHONPATH=. python migrations/apply_backflip_conflict_identifiers.py  # Backflip borrower conflict check: entity_name/parcel_id identifier kinds on fa_max_backflip_campaign_contacts (idempotent)
 PYTHONPATH=. python migrations/apply_backflip_dialer_audit_removal.py  # Removes the dialer gate + subject_ref/matched_criteria from fa_max_backflip_suppression_decisions; conflict decisions go to lending.load_exclusions (idempotent, refuses while dialer rows exist)
-PYTHONPATH=. python migrations/apply_lending_dialer_load_records.py  # lending.dialer_load_records: records loaded into the Aircall dialer, one active row per phone (idempotent, run after apply_lending_compliance.py)
-
-# Lending dialer load: pool export -> compliance filter -> Backflip conflict check -> Aircall. Dry run unless --live
-python -m src.tasks.lending_dialer_load --input pools.json
 PYTHONPATH=. python migrations/apply_lending_call_extractions.py  # lending.call_extractions: the twelve fields extracted from each call transcript, one row per dialer call (idempotent)
 PYTHONPATH=. python migrations/apply_lending_lead_call_confirmations.py  # lending.lead_call_confirmations: borrower-confirmed maturity and decision maker per property, read by lead scoring as known inputs (idempotent)
 PYTHONPATH=. python migrations/apply_lending_first_contact_snapshots.py  # lending.first_contact_snapshots: write-once scoring inputs, rank, caller and script version per phone at first contact (idempotent)

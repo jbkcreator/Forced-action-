@@ -14,6 +14,7 @@ import argparse
 import logging
 import time
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Any, Optional
 
 from sqlalchemy import text
@@ -22,10 +23,13 @@ from config.lending_missed_call import (
     CDR_DISPOSITION_FIELDS, CDR_MAX_PAGES, CDR_PAGE_LENGTH, CDR_POLL_PATH, DNC_DISPOSITIONS, POLL_LOCK_KEY,
     POLL_SECONDS,
 )
+from config.lending_compliance import AGENT_SHIFT_GROUPS, SHIFT_GROUPS
 from config.settings import get_settings
 from src.lending.call_log import record_call_attempts
 from src.lending.compliance import on_attempt_recorded, propagate_opt_out
-from src.lending.missed_call_text import call_record_fields, consent_gated_sender, parse_cdr, process_missed_calls
+from src.lending.missed_call_text import (
+    parse_time, call_record_fields, consent_gated_sender, parse_cdr, process_missed_calls,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +92,32 @@ def _record_opt_outs(db, records: list[dict]) -> int:
     return opted
 
 
+_ET = ZoneInfo("America/New_York")
+
+
+def _check_shifts(db, records: list[dict]) -> None:
+    """Allow and warn: record each call's shift group, and warn when the agent has no group
+    or called outside it. The call itself is already made; the hard rails are elsewhere."""
+    grouped = []
+    for record in records:
+        agent = _agent_id(record)
+        if agent is None or record.get("id") is None:
+            continue  # a dropped multi-line call has no agent
+        group = AGENT_SHIFT_GROUPS.get(agent)
+        if group is None:
+            logger.warning("[missed-call-poller] agent %s has no shift group; call allowed", agent)
+            continue
+        grouped.append({"c": str(record["id"]), "g": group})
+        started = parse_time(record.get("callStartTime"))
+        if started is not None and group in SHIFT_GROUPS:
+            start, end = SHIFT_GROUPS[group]
+            if not (start <= started.astimezone(_ET).time() <= end):
+                logger.warning("[missed-call-poller] agent %s called outside shift group %s", agent, group)
+    if grouped:
+        db.execute(text("UPDATE lending.call_dispositions SET seat_group = :g "
+                        "WHERE dialer_call_id = :c AND seat_group IS NULL"), grouped)
+
+
 def run_cycle(db, *, http, enabled: bool, now: Optional[datetime] = None) -> Optional[dict[str, int]]:
     """None when another poller holds the lock. Does not commit."""
     if not db.execute(text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": POLL_LOCK_KEY}).scalar():
@@ -98,6 +128,7 @@ def run_cycle(db, *, http, enabled: bool, now: Optional[datetime] = None) -> Opt
     for phone in dict.fromkeys(record_call_attempts(db, records)):
         on_attempt_recorded(db, phone, now=now)
     _record_opt_outs(db, records)
+    _check_shifts(db, records)
     calls = [c for c in (parse_cdr(r) for r in records) if c is not None]
     return process_missed_calls(db, calls, sender=consent_gated_sender(db), enabled=enabled, now=now)
 

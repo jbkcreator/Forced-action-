@@ -12,9 +12,11 @@ loadable pool has no campaign tag, or while a phone would load for more than
 one record; the dry run reports both.
 
 Dry run: nothing is sent to dialer or Tracerfy, and the caller rolls back.
-Live: records reach dialer one at a time (paced by the client) and their
-load rows are committed in chunks, so a stop part-way leaves every loaded
-contact tracked; a re-run updates contacts instead of duplicating them.
+Live: records reach dialer one at a time (paced by the client) and each load row is
+committed right after its push, so a stop part-way leaves every loaded contact
+tracked (an opt-out can only delete contacts we hold an id for); a re-run updates
+contacts instead of duplicating them. A contact created but left without its fields
+is tracked too (see ``ContactFieldsNotSet``) and finished by the next run.
 """
 from __future__ import annotations
 
@@ -37,7 +39,12 @@ from src.lending.backflip_conflict import (
 )
 from src.lending.compliance import GateResult, Scrubber, dial_blocks, filter_loadable, phone_hash
 from src.lending.dialer_contact import DialerDisplay, dialer_fields, display_from_record
-from src.lending.dialer_port import ContactUpsertResult, DialerContactFields, DialerRequestError
+from src.lending.dialer_port import (
+    ContactFieldsNotSet,
+    ContactUpsertResult,
+    DialerContactFields,
+    DialerRequestError,
+)
 from src.lending.context_card import NO_PRIOR_CONTACT, build_context_card
 from src.lending.lead_facts import LeadFacts, load_lead_facts
 from src.lending.lead_scoring import LeadSignals, score_lead
@@ -45,7 +52,7 @@ from src.services.phone_utils import normalize as normalize_phone
 
 logger = logging.getLogger(__name__)
 
-COMMIT_CHUNK_SIZE = 50
+COMMIT_CHUNK_SIZE = 1  # the client paces pushes one at a time, so a commit per push costs nothing
 SUPERSEDED = "superseded"
 REASON_SCRUB_FAILED = "SCRUB_FAILED"
 REASON_NEEDS_SCRUB = "NEEDS_SCRUB"
@@ -55,7 +62,7 @@ class DialerContacts(Protocol):
     def upsert_contact(self, phone: str, fields: DialerContactFields, *, campaign: Optional[str] = None,
                        vendor_contact_id: Optional[str] = None) -> ContactUpsertResult: ...
     def update_contact(self, contact_id: Any, fields: DialerContactFields, *,
-                       phone: Optional[str] = None) -> dict: ...
+                       phone: Optional[str] = None, vendor_contact_id: Optional[str] = None) -> dict: ...
 
 
 class LoadRefused(RuntimeError):
@@ -200,6 +207,7 @@ def _push_contact(dialer: DialerContacts, item: _Loadable, known_contact_id: Opt
     """Update by the stored contact id when known (search can lag); else upsert by phone."""
     if known_contact_id is not None:
         try:
+            # full PUT: resend our record id or BatchDialer clears it
             dialer.update_contact(known_contact_id, fields, phone=item.phone,
                                   vendor_contact_id=item.record_ref or None)
             return ContactUpsertResult(contact_id=known_contact_id, created=False)
@@ -442,11 +450,15 @@ def run_dialer_load(
         except DialerRequestError as exc:
             report.failed.append({"record_ref": item.record_ref, "error": type(exc).__name__,
                                   "status": getattr(exc, "status", None)})
-            continue
-        report.loaded += 1
-        report.created += int(result.created)
-        report.updated += int(not result.created)
-        chunk.append((item, result.contact_id))
+            if not isinstance(exc, ContactFieldsNotSet):
+                continue
+            contact_id = exc.contact_id  # live in the dialer: track it so opt-out can delete it
+        else:
+            report.loaded += 1
+            report.created += int(result.created)
+            report.updated += int(not result.created)
+            contact_id = result.contact_id
+        chunk.append((item, contact_id))
         if len(chunk) >= COMMIT_CHUNK_SIZE:
             _store_chunk(db, run_id, chunk, active)
             commit()

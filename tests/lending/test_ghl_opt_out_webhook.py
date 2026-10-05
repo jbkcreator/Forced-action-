@@ -6,6 +6,7 @@ import os
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
@@ -34,7 +35,7 @@ def client(db, monkeypatch):
     from src.api.deps import get_db
     from src.api.lending_ghl_router import router
     from config.settings import get_settings
-    monkeypatch.setattr(get_settings(), "lending_ghl_webhook_secret", SECRET, raising=False)
+    monkeypatch.setattr(get_settings(), "lending_ghl_webhook_secret", SecretStr(SECRET), raising=False)
     app = FastAPI()
     app.include_router(router)
     app.dependency_overrides[get_db] = lambda: db

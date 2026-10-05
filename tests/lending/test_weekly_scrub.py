@@ -82,6 +82,8 @@ def test_credit_cap_aborts_before_a_batch_that_would_exceed_it(db):
                           dialer_remover=Remover())
     assert scrubber.calls == [PHONES[:2]]      # 2nd batch would reach 4 > 3
     assert result.aborted and result.credits_used == 2 and result.scrubbed == 2
+    # The 3 not reached are still loaded and dialable; they are reported, not hidden.
+    assert result.left_unscrubbed == 3
 
 
 def test_new_dnc_hits_leave_the_dialer_and_flag_nurture(db):
@@ -110,6 +112,7 @@ def test_filter_loadable_flags_nurture_for_dnc_blocked_numbers(db):
 def test_dry_run_reports_the_count_and_spends_nothing(monkeypatch, caplog):
     from src.lending import weekly_scrub as ws
     monkeypatch.setattr(ws, "stale_loaded_phones", lambda db, now=None: PHONES[:3])
+    monkeypatch.setattr(ws, "blocked_loaded_phones", lambda db: [])
     monkeypatch.setattr(ws, "tracerfy_scrub", lambda phones: pytest.fail("dry run must not scrub"))
     caplog.set_level("INFO")
     assert ws.main(["--dry-run"]) == 0
@@ -123,3 +126,47 @@ def test_loaded_phones_are_normalized_on_read_and_write(db):
     _load(db, "+18135558407")
     _close_load_rows(db, ["813-555-8407"])
     assert db.execute(text("SELECT active FROM lending.dialer_load_records WHERE phone = '+18135558407'")).scalar() is False
+
+
+def _dnc_scrub(db, phone, age_days=1):
+    db.execute(text(
+        "INSERT INTO lending.dnc_scrubs (phone, national_dnc, litigator, state_dnc, checked_at) "
+        "VALUES (:p, true, false, false, :at)"), {"p": phone, "at": NOW - timedelta(days=age_days)})
+
+
+def _active(db, phone):
+    return db.execute(text("SELECT active FROM lending.dialer_load_records WHERE phone = :p"), {"p": phone}).scalar()
+
+
+class FailingRemover:
+    def __call__(self, phone, *, reason):
+        raise RuntimeError("dialer down")
+
+
+def test_a_flagged_number_whose_removal_failed_is_retried_on_the_next_run_without_a_new_scrub(db):
+    from src.lending.weekly_scrub import weekly_scrub
+    _load(db, PHONES[0])
+    first = weekly_scrub(db, scrubber=Scrubber(dnc={PHONES[0]}), max_credits=10, now=NOW, phones=[PHONES[0]],
+                         dialer_remover=FailingRemover())
+    assert first.removal_failed == 1 and _active(db, PHONES[0]) is True
+    _dnc_scrub(db, PHONES[0])                        # the verdict is stored and fresh: no longer "due"
+    scrubber, remover = Scrubber(), Remover()
+    second = weekly_scrub(db, scrubber=scrubber, max_credits=10, now=NOW, dialer_remover=remover)
+    assert scrubber.calls == [] and second.credits_used == 0     # no credit spent on the retry
+    assert remover.removed == [(PHONES[0], "opt_out")] and second.removal_failed == 0
+    assert _active(db, PHONES[0]) is False
+
+
+def test_a_flagged_number_with_no_dialer_configured_counts_as_a_failed_removal(db, monkeypatch):
+    from src.lending import compliance
+    from src.lending.weekly_scrub import weekly_scrub
+    monkeypatch.setattr(compliance, "_default_dialer_remover", lambda: None)
+    _load(db, PHONES[1])
+    result = weekly_scrub(db, scrubber=Scrubber(dnc={PHONES[1]}), max_credits=10, now=NOW, phones=[PHONES[1]])
+    assert result.blocked == 1 and result.removal_failed == 1 and _active(db, PHONES[1]) is True
+
+
+def test_the_run_exits_non_zero_while_a_flagged_number_is_still_in_the_dialer(monkeypatch):
+    from src.lending import weekly_scrub as ws
+    monkeypatch.setattr(ws, "weekly_scrub", lambda *a, **k: ws.WeeklyScrubResult(removal_failed=1))
+    assert ws.main(["--max-credits", "5"]) == ws.EXIT_REMOVAL_FAILED
