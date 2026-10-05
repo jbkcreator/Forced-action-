@@ -256,6 +256,24 @@ class TestLiveLoad:
         _run(db, [_record("a", P1)], aircall=aircall)
         assert db.execute(text("SELECT count(*) FROM lending.dialer_unconfirmed_creates")).scalar_one() == 0
 
+    def test_a_number_that_opts_out_after_the_gate_is_not_pushed(self, db):
+        _fresh_scrub(db, P1, P2)
+        aircall = FakeAircall()
+        real_upsert = aircall.upsert_contact
+
+        def upsert(phone, *args, **kwargs):
+            if phone == P1:  # P2 opts out while P1 is being pushed
+                db.execute(text("INSERT INTO lending.suppression_list (phone, reason, source_channel) VALUES (:p, 'OPT_OUT', 'sms')"),
+                           {"p": P2})
+            return real_upsert(phone, *args, **kwargs)
+
+        aircall.upsert_contact = upsert
+        with patch.object(dialer_load, "SUPPRESSION_RECHECK_BATCH", 1):
+            report, _ = _run(db, [_record("a", P1), _record("b", P2)], aircall=aircall)
+        assert aircall.upserts == [P1]
+        assert report.suppressed_mid_run == 1
+        assert [r.reason for r in _exclusions(db)] == ["SUPPRESSED"]
+
     def test_one_aircall_failure_does_not_stop_the_rest(self, db):
         _fresh_scrub(db, P1, P2)
         report, _ = _run(db, [_record("a", P1), _record("b", P2)], aircall=FakeAircall(fail_phones={P1}))

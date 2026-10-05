@@ -36,7 +36,14 @@ from src.lending.backflip_conflict import (
     find_borrower_conflicts,
     load_backflip_identifier_index,
 )
-from src.lending.compliance import GateResult, Scrubber, dial_blocks, filter_loadable, phone_hash
+from src.lending.compliance import (
+    GateResult,
+    Scrubber,
+    _suppressed_phones,
+    dial_blocks,
+    filter_loadable,
+    phone_hash,
+)
 from src.lending.dialer_contact import DialerDisplay, dialer_fields, display_from_record
 from src.lending.dialer_port import (
     ContactFieldsNotSet,
@@ -52,6 +59,8 @@ logger = logging.getLogger(__name__)
 COMMIT_CHUNK_SIZE = 1  # the client paces pushes one at a time, so a commit per push costs nothing
 SUPERSEDED = "superseded"
 REASON_SCRUB_FAILED = "SCRUB_FAILED"
+REASON_SUPPRESSED = "SUPPRESSED"
+SUPPRESSION_RECHECK_BATCH = 25  # phones re-checked per query, just before they are pushed
 REASON_NEEDS_SCRUB = "NEEDS_SCRUB"
 
 
@@ -100,6 +109,7 @@ class LoadReport:
     failed: list[dict] = field(default_factory=list)
     active_not_in_run: int = 0
     backflip_check: bool = True
+    suppressed_mid_run: int = 0  # opted out after the start-of-run gate; skipped before the push
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -119,6 +129,7 @@ class LoadReport:
             "failed": self.failed,
             "active_not_in_run": self.active_not_in_run,
             "backflip_check": self.backflip_check,
+            "suppressed_mid_run": self.suppressed_mid_run,
         }
 
 
@@ -431,7 +442,17 @@ def run_dialer_load(
     active = _active_rows(db, loadable_phones)
     chunk: list[tuple[_Loadable, int]] = []
     try:
-        for item in loadable:
+        suppressed_now: set[str] = set()
+        for position, item in enumerate(loadable):
+            if position % SUPPRESSION_RECHECK_BATCH == 0:
+                suppressed_now = _suppressed_phones(
+                    db, sorted({i.phone for i in loadable[position:position + SUPPRESSION_RECHECK_BATCH]}))
+            if item.phone in suppressed_now:
+                report.suppressed_mid_run += 1
+                _write_exclusions(db, run_id, [{
+                    "phone_hash": phone_hash(item.phone), "reason": REASON_SUPPRESSED,
+                    "detail": json.dumps({"stage": "recheck_before_push", "record_ref": item.record_ref})}])
+                continue
             fields = dialer_fields(item.display, email=item.record.get("email"))
             try:
                 _, known_contact_id, known_campaign_tag = active.get(item.phone, (None, None, None))

@@ -30,6 +30,8 @@ from src.services.phone_utils import normalize as normalize_phone
 logger = logging.getLogger(__name__)
 
 Endpoint = Optional[tuple[str, str]]
+# A retried create after a server-side success would create a second, untracked contact.
+_NO_RETRY_POSTS = frozenset({"/contacts"})
 LOAD_ENDPOINTS = ("contacts_add_to_campaign", "contact_update")
 Http = Callable[..., Mapping[str, Any]]
 
@@ -291,7 +293,7 @@ def _requests_http(api_key: str) -> Http:
                 response.raise_for_status()
             elif method == "GET":
                 response = requests_get_with_retry(url, max_retries=3, retry_delay=2, **kwargs)
-            elif method == "POST":
+            elif method == "POST" and path not in _NO_RETRY_POSTS:
                 response = requests_post_with_retry(url, json=json, **kwargs)
             else:
                 response = requests.request(method, url, json=json, **kwargs)
