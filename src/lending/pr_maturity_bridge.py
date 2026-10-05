@@ -20,9 +20,10 @@ Pure mapping functions take no database and are unit-tested directly; the two
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from decimal import Decimal, InvalidOperation
-from typing import Any, Mapping, Optional
+from typing import Any, Iterator, Mapping, Optional
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -42,9 +43,15 @@ CAMPAIGN_TAG = POOL_CAMPAIGN_TAGS["verified_maturity"]
 # LLC / CORPORATION (config.lending_compliance.GEORGIA_ALLOWED_ENTITY_TYPES minus
 # LP, which the staging CHECK does not permit); TRUST and NATURAL_PERSON are kept
 # so FL records carry a truthful status and GA fails closed on them.
-_LLC_TOKENS = ("LLC", "L.L.C", "L L C")
-_CORP_TOKENS = ("CORP", "INCORPORATED", " INC", "INC.", "COMPANY", "CORPORATION", "CORPORATE", "LP", "LLP", "PARTNERS")
-_TRUST_TOKENS = ("TRUST", "TRUSTEE", "LIVING TR")
+#
+# Matched on WORD BOUNDARIES, never as substrings: this status drives the GA
+# cold-calling gate, so "RALPH SMITH" must not match "LP" and become CORPORATION
+# (which would fail the gate open on a natural person — exactly what GA forbids).
+_LLC_RE = re.compile(r"\bL\.?\s?L\.?\s?C\b")
+_TRUST_RE = re.compile(r"\b(?:TRUST|TRUSTEE|LIVING TR)\b")
+_CORP_RE = re.compile(
+    r"\b(?:CORP|CORPORATION|CORPORATE|INC|INCORPORATED|COMPANY|LP|LLP|LTD|PARTNERS)\b"
+)
 
 
 def map_entity_status(ownership_type: Optional[str], owner_name: Optional[str]) -> Optional[str]:
@@ -53,15 +60,18 @@ def map_entity_status(ownership_type: Optional[str], owner_name: Optional[str]) 
     Checks the owner name first (``ACME LLC`` is unambiguous) then the coarser
     PropertyRadar ownership_type. Returns None only when there is nothing to
     classify — a None status fails the GA gate closed, which is the safe default.
+
+    Entity tokens match on word boundaries so a natural-person name is never
+    misread as a business (which, for GA, would fail the compliance gate open).
     """
     haystack = " ".join(p for p in (owner_name, ownership_type) if p).upper()
     if not haystack.strip():
         return None
-    if any(tok in haystack for tok in _LLC_TOKENS):
+    if _LLC_RE.search(haystack):
         return "LLC"
-    if any(tok in haystack for tok in _TRUST_TOKENS):
+    if _TRUST_RE.search(haystack):
         return "TRUST"
-    if any(tok in haystack for tok in _CORP_TOKENS):
+    if _CORP_RE.search(haystack):
         return "CORPORATION"
     ot = (ownership_type or "").strip().upper()
     if ot in ("COMPANY", "BUSINESS", "FINANCIAL", "CORPORATE"):
@@ -134,24 +144,38 @@ def build_pool_row(
     }
 
 
+# Keyset-paged so a statewide maturity table is never materialized in one fetch
+# (CLAUDE.md "stream large result sets / never fetchall an unbounded result").
+RECORD_PAGE_SIZE = 1000
+
 _RECORDS_SQL = """
-    SELECT radar_id, apn, state, county_name, property_address, city, zip,
+    SELECT id, radar_id, apn, state, county_name, property_address, city, zip,
            owner_name, ownership_type, principal_name, loan_amount, campaign,
            est_maturity_date, property_id
     FROM property_radar_records
-    WHERE status = 'active'
+    WHERE status = 'active' AND id > :after_id
     {state_filter}
     ORDER BY id
+    LIMIT :limit
 """
 
 
-def _load_records(session: Session, *, state: Optional[str]) -> list[dict[str, Any]]:
+def _iter_record_pages(
+    session: Session, *, state: Optional[str], page_size: int = RECORD_PAGE_SIZE
+) -> Iterator[list[dict[str, Any]]]:
+    """Yield active PropertyRadar records in id order, one bounded page at a time."""
     clause = "AND state = :state" if state else ""
-    rows = session.execute(
-        text(_RECORDS_SQL.format(state_filter=clause)),
-        {"state": state.upper()} if state else {},
-    ).mappings().all()
-    return [dict(r) for r in rows]
+    sql = text(_RECORDS_SQL.format(state_filter=clause))
+    after_id = 0
+    while True:
+        params: dict[str, Any] = {"after_id": after_id, "limit": page_size}
+        if state:
+            params["state"] = state.upper()
+        rows = session.execute(sql, params).mappings().all()
+        if not rows:
+            return
+        after_id = rows[-1]["id"]
+        yield [dict(r) for r in rows]
 
 
 def _load_trace_contacts(session: Session, keys: list[str]) -> dict[str, dict[str, list]]:
@@ -176,55 +200,61 @@ def _first_phone(phones: list) -> Optional[str]:
     return None
 
 
+def _is_ga(row: Mapping[str, Any]) -> bool:
+    return (row["state"] or "").upper() == "GA"
+
+
+def _is_ga_dialable(row: Mapping[str, Any]) -> bool:
+    """A GA row that will survive _georgia_blocked and has a number to call."""
+    return _is_ga(row) and row["entity_status"] in ("LLC", "CORPORATION") and row["phone_available"]
+
+
 def extract_pr_maturity_pool(
     session: Session, *, dry_run: bool = False, state: Optional[str] = None
 ) -> dict[str, Any]:
     """Build the pr_maturity pool from PropertyRadar records + traced contacts.
 
-    One staging run (``run_id``) per call. With ``dry_run`` the rows are built
-    and counted but nothing is written. Records with no traced phone are still
-    written (phone_available=False) so a later trace can be joined without a
-    re-extract — matching the WP-W0-1 O15 convention.
+    One staging run (``run_id``) per call. Records are read and written in
+    bounded pages, so a statewide maturity table is never fully materialized.
+    With ``dry_run`` the rows are built and counted but nothing is written.
+    Records with no traced phone are still written (phone_available=False) so a
+    later trace can be joined without a re-extract (WP-W0-1 O15 convention).
     """
     run_id = str(uuid.uuid4())
-    records = _load_records(session, state=state)
-    keys = list({trace_key(r.get("property_address"), r.get("zip")) for r in records})
-    contacts = _load_trace_contacts(session, keys)
+    total = with_phone = ga = ga_dialable = written = 0
 
-    rows: list[dict[str, Any]] = []
-    for r in records:
-        key = trace_key(r.get("property_address"), r.get("zip"))
-        c = contacts.get(key, {"phones": [], "emails": []})
-        phone = _first_phone(c["phones"])
-        email = (c["emails"][0].lower() if c["emails"] else None)
-        rows.append(build_pool_row(r, run_id=run_id, phone=phone, email=email))
+    for records in _iter_record_pages(session, state=state):
+        keys = list({trace_key(r.get("property_address"), r.get("zip")) for r in records})
+        contacts = _load_trace_contacts(session, keys)
+        rows: list[dict[str, Any]] = []
+        for r in records:
+            c = contacts.get(trace_key(r.get("property_address"), r.get("zip")), {"phones": [], "emails": []})
+            email = c["emails"][0].lower() if c["emails"] else None
+            rows.append(build_pool_row(r, run_id=run_id, phone=_first_phone(c["phones"]), email=email))
 
-    with_phone = sum(1 for row in rows if row["phone_available"])
-    ga = sum(1 for row in rows if (row["state"] or "").upper() == "GA")
-    ga_dialable = sum(
-        1 for row in rows
-        if (row["state"] or "").upper() == "GA"
-        and row["entity_status"] in ("LLC", "CORPORATION")
-        and row["phone_available"]
-    )
+        total += len(rows)
+        with_phone += sum(1 for row in rows if row["phone_available"])
+        ga += sum(1 for row in rows if _is_ga(row))
+        ga_dialable += sum(1 for row in rows if _is_ga_dialable(row))
+        if not dry_run and rows:
+            written += _write_rows(session, rows)
+
     summary = {
         "run_id": run_id,
         "dry_run": dry_run,
         "state_filter": state,
-        "total_records": len(rows),
+        "total_records": total,
         "phone_available": with_phone,
         "ga_records": ga,
         "ga_dialable_est": ga_dialable,
     }
-
-    if not dry_run and rows:
-        written = _write_rows(session, rows)
+    if not dry_run:
         summary["rows_written"] = written
         logger.info("pr_maturity_bridge: run_id=%s wrote %d rows (%d with phone)", run_id, written, with_phone)
     else:
         logger.info(
-            "pr_maturity_bridge: run_id=%s dry_run=%s built %d rows (%d with phone) — no write",
-            run_id, dry_run, len(rows), with_phone,
+            "pr_maturity_bridge: run_id=%s dry_run=True built %d rows (%d with phone) — no write",
+            run_id, total, with_phone,
         )
     return summary
 

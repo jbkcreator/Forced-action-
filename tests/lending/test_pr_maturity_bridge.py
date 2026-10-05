@@ -29,6 +29,17 @@ class TestMapEntityStatus:
     def test_classification(self, owner, otype, expected):
         assert map_entity_status(otype, owner) == expected
 
+    @pytest.mark.parametrize("name", [
+        "RALPH SMITH",       # contains "LP" as a substring
+        "ALPHONSE GREEN",    # contains "LP"
+        "VINCENT ROBINSON",  # contains "INC"
+        "PRINCESS WARE",     # contains "INC"
+    ])
+    def test_natural_person_names_with_entity_substrings_are_not_businesses(self, name):
+        # Must match on word boundaries, not substrings: a GA natural person
+        # misread as CORPORATION would fail the GA cold-calling gate open.
+        assert map_entity_status("Individual", name) == "NATURAL_PERSON"
+
     def test_nothing_to_classify_is_none(self):
         assert map_entity_status(None, None) is None
         assert map_entity_status("", "  ") is None

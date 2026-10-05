@@ -34,7 +34,7 @@ def main(argv: list[str] | None = None) -> int:
         summary = extract_pr_maturity_pool(session, dry_run=not args.apply, state=args.state)
         if args.apply:
             session.commit()
-    print(summary)
+    logger.info("lending_pr_maturity_bridge: %s", summary)
     return 0
 
 
