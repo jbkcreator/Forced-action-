@@ -321,12 +321,19 @@ class TestNoFinancialFields:
 
 
 class TestIsListBlocked:
-    def test_empty_blocked_set_never_blocks(self):
-        # BLOCKED_LIST_KEYS is currently frozenset() — nothing is blocked.
-        assert _is_list_blocked("wholesaler_flipper") is False
-        assert _is_list_blocked("active_builder") is False
-        assert _is_list_blocked("mortgage_broker") is False
-        assert _is_list_blocked(None) is False
+    """BLOCKED_LIST_KEYS default blocks list_4 (brokers/LOs, Josh's Oct 4
+    email §2) — the key format matches source_tag_for()'s real output for
+    pool_name="mortgage_broker" (src/services/lending/pool_extraction.py),
+    confirmed against calling_pool_staging.source_tag on the real DB."""
+
+    def test_list_4_is_blocked_by_default(self):
+        assert _is_list_blocked("list_4") is True
+
+    def test_other_lists_are_not_blocked(self):
+        assert _is_list_blocked("list_1") is False
+        assert _is_list_blocked("list_2") is False
+        assert _is_list_blocked("list_3") is False
+        assert _is_list_blocked("list_9") is False
 
     def test_none_list_key_never_blocks(self):
         assert _is_list_blocked(None) is False

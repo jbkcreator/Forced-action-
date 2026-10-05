@@ -16,12 +16,13 @@ check. It is stored as the enum below, not a number — this keeps it
 structurally the same shape as every other gate field (a short code, never
 a financial record) rather than a credit-score column.
 
-Open: BLOCKED_LIST_KEYS must be populated once the list-to-pool tagging
-mechanism exists — nothing in the pipeline yet tags a lead/booking with
-which numbered list it came from (see src/services/calendar/gate.py's
-module docstring). Per Josh's Oct 4 email §2, only List 4 (brokers and
-LOs) is meant to be blocked from booking; List 2 (cash buyers) moved out
-of nurture into an active dial rank and is no longer blocked.
+BLOCKED_LIST_KEYS blocks List 4 (brokers/LOs) from booking, per Josh's
+Oct 4 email §2 — List 2 (cash buyers) moved out of nurture into an active
+dial rank and is no longer blocked. The key format ("list_4") matches
+src/services/lending/pool_extraction.py's source_tag_for(), confirmed
+against calling_pool_staging.source_tag on the real DB (list_1, list_3
+through list_9 all present). Override via env var
+GATE_BLOCKED_LIST_KEYS (comma-separated list keys).
 """
 import os
 from datetime import date
@@ -73,11 +74,13 @@ CREDIT_BAND_QUALIFYING_VALUES: FrozenSet[str] = frozenset({"at_or_above_640"})
 # Pool / list blocking.
 # Per Josh's Oct 4 email §2: only List 4 (brokers/LOs) blocks from booking.
 # List 2 (cash buyers) moved to an active dial rank and is not blocked.
-# Still empty: no code yet tags a lead/booking with its source list, so
-# populating this with a guessed key would be a no-op, not a real block.
+# Default matches source_tag_for()'s "list_4" for pool_name="mortgage_broker".
 # ---------------------------------------------------------------------------
 
-BLOCKED_LIST_KEYS: FrozenSet[str] = frozenset()
+_raw_blocked_list_keys = os.environ.get("GATE_BLOCKED_LIST_KEYS", "list_4")
+BLOCKED_LIST_KEYS: FrozenSet[str] = frozenset(
+    key.strip() for key in _raw_blocked_list_keys.split(",") if key.strip()
+)
 
 # ISO date string — gate blocks bookings from BLOCKED_LIST_KEYS until this date.
 # Value chosen as December 1 2026; update via env var GATE_LIST_UNBLOCK_DATE
