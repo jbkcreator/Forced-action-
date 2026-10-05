@@ -877,9 +877,8 @@ class AppSettings(BaseSettings):
 	aircall_webhook_token: Optional[SecretStr] = Field(default=None, env="AIRCALL_WEBHOOK_TOKEN")
 
 	# ── Lending engine: call disposition logging ──
-	# Dialer webhook secret, Slack bot and Sheet, separate from the FA settings above.
+	# Slack bot and Sheet, separate from the FA settings above.
 	# All optional so the app boots without lending configured. Uses DATABASE_URL.
-	lending_dialer_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_DIALER_WEBHOOK_SECRET")
 	lending_dialer_campaign_ids: str = Field(default="", env="LENDING_DIALER_CAMPAIGN_IDS")  # comma-separated; empty ignores every event
 	lending_seat_groups: str = Field(default="", env="LENDING_SEAT_GROUPS")  # "agentid:A,agentid:B" (BatchDialer agent id) -> shift group per seat
 	lending_disposition_missing_alert_minutes: int = Field(default=10, env="LENDING_DISPOSITION_MISSING_ALERT_MINUTES")
