@@ -184,6 +184,24 @@ def test_a_stale_scrub_is_pulled_from_the_dialer_even_inside_the_window(db):
     assert _hold(db).reason == "scrub_stale"
 
 
+def test_a_mostly_stale_pool_is_not_mass_pulled(db):
+    """Finding 1: when the weekly rescrub is down nearly every loaded phone looks stale.
+    The sweep must alert, not empty the dialer (the per-dial gate still blocks each one)."""
+    aircall = FakeAircall()
+    pool = [f"+1813555{n:04d}" for n in range(7100, 7125)]       # 25 phones, none scrubbed
+    result = _sweep(db, NOON_LOCAL, aircall, loaded=pool)
+    assert result.pulled == 0 and aircall.removed == []
+
+
+def test_a_stale_minority_of_a_large_pool_is_still_pulled(db):
+    aircall = FakeAircall()
+    pool = [f"+1813555{n:04d}" for n in range(7100, 7125)]
+    for phone in pool[1:]:
+        _fresh_scrub(db, phone, NOON_LOCAL - timedelta(days=1))
+    result = _sweep(db, NOON_LOCAL, aircall, loaded=pool)
+    assert aircall.removed == [(pool[0], "scrub_stale")] and result.pulled == 1
+
+
 def test_a_stale_scrub_hold_is_not_restored_until_rescrubbed(db):
     aircall = FakeAircall()
     _sweep(db, NOON_LOCAL, aircall)  # pulled for staleness

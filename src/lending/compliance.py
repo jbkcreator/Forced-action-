@@ -36,6 +36,8 @@ from config.lending_compliance import (
     DIALER_SWEEP_LOCK_KEY,
     DIALER_OPT_OUT_SOURCE,
     DNC_SCRUB_MAX_AGE_DAYS,
+    SCRUB_STALE_BREAKER_MIN_POOL,
+    SCRUB_STALE_BREAKER_PCT,
     GHL_DND_BATCH,
     GEORGIA_ALLOWED_ENTITY_TYPES,
     HOMESTEAD_GATE_EXCLUDED_SOURCE_TAGS,
@@ -663,6 +665,13 @@ def _stale_scrub_phones(db, phones: list[str], now: datetime) -> set[str]:
     return {p for p in phones if p not in scrubs or scrubs[p].checked_at < cutoff}
 
 
+def _scrub_stale_breaker_tripped(*, stale: int, pool: int) -> bool:
+    """True when so much of the loaded pool looks stale that the weekly rescrub (or Tracerfy)
+    is down. Pulling it all would empty the dialer; the per-dial gate still blocks each
+    stale number at dial time, so the sweep alerts instead."""
+    return pool >= SCRUB_STALE_BREAKER_MIN_POOL and stale * 100 > pool * SCRUB_STALE_BREAKER_PCT
+
+
 def dial_blocks(db, phones: list[str], *, now: Optional[datetime] = None) -> dict[str, ReasonCode]:
     """``can_dial_now`` for many phones in one query: phone -> reason for each one that
     cannot be dialed now (attempt cap, total attempt history, the calling window, then
@@ -733,6 +742,11 @@ def sweep_dialer_pool(
     active = [p for p in loaded if p not in held]
     counts = _attempt_counts(db, active, now) if active else {}
     stale = _stale_scrub_phones(db, active, now) if active else set()
+    if _scrub_stale_breaker_tripped(stale=len(stale), pool=len(active)):
+        logger.error("[lending-compliance] %d of %d loaded phone(s) have a stale scrub (> %d%%): the weekly "
+                     "rescrub looks down; not mass-pulling them this cycle", len(stale), len(active),
+                     SCRUB_STALE_BREAKER_PCT)
+        stale = set()
     exhausted = _attempt_history_exhausted_phones(db, active, now) if active else set()
     to_pull = {
         p: r for p in active

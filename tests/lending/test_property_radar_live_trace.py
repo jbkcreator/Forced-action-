@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from src.services.property_radar.live_trace import trace_staged_leads
+from src.services.property_radar.live_trace import CENTS_PER_HIT, TraceBilledError, trace_staged_leads
 from src.services.property_radar.trace_contacts import parse_contacts
 from src.services.skip_trace_ledger import RunSpendCap, trace_key
 
@@ -89,36 +89,51 @@ def test_a_newly_traced_hit_is_persisted_for_a_later_run_to_read_back():
 
 
 class FlakyVendor:
-    """Succeeds on the first batch, raises on every batch after."""
+    """Succeeds on the first batch, then raises ``second_error`` on every batch after."""
 
-    def __init__(self, first_batch_rows):
-        self.first_batch_rows, self.submitted, self._calls = first_batch_rows, [], 0
+    def __init__(self, first_batch_rows, second_error):
+        self.first_batch_rows, self.second_error = first_batch_rows, second_error
+        self.submitted, self._calls = [], 0
 
     def __call__(self, batch):
         self._calls += 1
         self.submitted.append([r["address"] for r in batch])
         if self._calls == 1:
             return self.first_batch_rows
-        raise RuntimeError("tracerfy 500")
+        raise self.second_error
 
 
-def test_a_later_batch_failure_still_returns_the_earlier_batchs_contacts():
-    """Finding #8's own suggested regression: the second of two batches raises, and
-    the first batch's contacts/ledger entries must not be thrown away with it."""
-    vendor = FlakyVendor([HIT])
+def _two_batch_run(vendor, cap=None):
     written = []
-    leads = [lead("R1", "100 Main St"), lead("R2", "200 Oak St", name="Other")]
+    leads = [lead("R1", "100 Main St"), lead("R2", "200 Oak St", name="Other"), lead("R3", "300 Elm St", name="Third")]
+    cap = cap or RunSpendCap(None)
     outcome = trace_staged_leads(
-        leads, ledger={}, submit=vendor, write_ledger=written.extend,
-        cap=RunSpendCap(None), batch_size=1,
+        leads, ledger={}, submit=vendor, write_ledger=written.extend, cap=cap, batch_size=1,
     )
-    assert vendor.submitted == [["100 Main St"], ["200 Oak St"]]   # both attempted
-    assert outcome.contacts == {"R1": outcome.contacts["R1"]}      # R1 survived; R2 did not raise up
-    assert outcome.submitted == 2
-    # The failed batch's key is still written to the ledger (as a zero-cost miss), so a
-    # later run's already_traced() check won't bill it again.
-    failed_entry = next(e for e in written if e["target_address"] == trace_key("200 Oak St", "33602"))
-    assert failed_entry["success"] is False and failed_entry["cost_cents"] == 0
+    return outcome, written, cap
+
+
+def test_a_failed_submit_ledgers_nothing_and_stops_the_run():
+    """Nothing was billed when the submit step itself fails (bad key, no credits, 5xx,
+    timeout), so no address may be ledgered as consumed and the run must not keep
+    trying later batches against the same broken vendor."""
+    vendor = FlakyVendor([HIT], RuntimeError("tracerfy 401"))
+    outcome, written, cap = _two_batch_run(vendor)
+    assert vendor.submitted == [["100 Main St"], ["200 Oak St"]]       # stopped; R3 never attempted
+    assert outcome.aborted is True
+    assert set(outcome.contacts) == {"R1"}                              # earlier batch's contacts kept
+    assert [e["target_address"] for e in written] == [trace_key("100 Main St", "33602")]
+    assert outcome.submitted == 1
+    assert cap.projected_cents == CENTS_PER_HIT                         # failed batch not charged to the cap
+
+
+def test_a_poll_failure_after_billing_ledgers_the_batch_as_consumed_with_its_queue_id():
+    vendor = FlakyVendor([HIT], TraceBilledError("94858"))
+    outcome, written, _ = _two_batch_run(vendor)
+    assert outcome.aborted is False
+    assert vendor.submitted == [["100 Main St"], ["200 Oak St"], ["300 Elm St"]]
+    consumed = next(e for e in written if e["target_address"] == trace_key("200 Oak St", "33602"))
+    assert consumed["success"] is False and consumed["cost_cents"] == 0 and consumed["request_ref"] == "94858"
 
 
 def test_an_already_traced_key_reads_its_persisted_contact_back():

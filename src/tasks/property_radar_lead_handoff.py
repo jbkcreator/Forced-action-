@@ -33,7 +33,7 @@ from src.services.property_radar.lead_handoff import (
     pretrace_eligible,
     run_handoff,
 )
-from src.services.property_radar.live_trace import trace_staged_leads
+from src.services.property_radar.live_trace import TraceBilledError, trace_staged_leads
 from src.services.property_radar.trace_contacts import LeadContacts, load_trace_contacts
 from src.services.skip_trace_ledger import RunSpendCap, already_traced, trace_key
 
@@ -47,7 +47,10 @@ def _tracerfy_submit(rows: list[dict]) -> list[dict]:
 
     api_key = get_settings().tracerfy_api_key.get_secret_value()
     queue_id, wait = _submit_trace_batch(rows, api_key)
-    return _poll_trace_queue(queue_id, api_key, wait)
+    try:
+        return _poll_trace_queue(queue_id, api_key, wait)
+    except Exception as exc:
+        raise TraceBilledError(str(queue_id)) from exc
 
 
 def _write_usage_ledger(session, entries: list[dict]) -> None:
@@ -118,8 +121,9 @@ def _live_trace(session, campaign: str, *, thin_path_only: bool) -> dict[str, Le
         read_contacts=lambda ks: _read_trace_contacts(session, ks),
         write_contacts=lambda cs: _write_trace_contacts(session, cs),
     )
-    logger.info("PropertyRadar live trace: submitted=%d already_traced=%d unkeyable=%d capped=%d",
-                outcome.submitted, outcome.skipped_already_traced, outcome.skipped_unkeyable, outcome.skipped_cap)
+    logger.info("PropertyRadar live trace: submitted=%d already_traced=%d unkeyable=%d capped=%d aborted=%s",
+                outcome.submitted, outcome.skipped_already_traced, outcome.skipped_unkeyable, outcome.skipped_cap,
+                outcome.aborted)
     return outcome.contacts
 
 

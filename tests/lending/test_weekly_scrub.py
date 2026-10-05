@@ -77,16 +77,18 @@ class FailOnceRemover:
             raise RuntimeError("transient dialer error")
 
 
-def test_only_loaded_numbers_with_a_stale_or_missing_scrub_are_selected(db):
+def test_every_loaded_number_is_rescrubbed_each_weekly_run_but_not_inactive_ones(db):
+    """Finding 1: a scrub only 2 days old still turns stale for the sweep before the next
+    weekly run, so it is selected too. Inactive load rows are never scrubbed."""
     from src.lending.weekly_scrub import stale_loaded_phones
     for p in PHONES[:4]:
         _load(db, p)
     _load(db, PHONES[4], active=False)         # inactive: not in the dialer
-    _scrubbed(db, PHONES[0], age_days=2)       # fresh
-    _scrubbed(db, PHONES[1], age_days=9)       # stale
+    _scrubbed(db, PHONES[0], age_days=2)
+    _scrubbed(db, PHONES[1], age_days=9)
     # PHONES[2], PHONES[3]: never scrubbed
     picked = set(stale_loaded_phones(db, now=NOW)) & set(PHONES)
-    assert picked == {PHONES[1], PHONES[2], PHONES[3]}
+    assert picked == set(PHONES[:4])
 
 
 class FailingScrubber:

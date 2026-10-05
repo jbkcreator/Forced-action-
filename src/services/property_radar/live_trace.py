@@ -27,9 +27,19 @@ ReadContacts = Callable[[list[str]], dict[str, LeadContacts]]
 WriteContacts = Callable[[dict[str, LeadContacts]], None]
 
 
+class TraceBilledError(Exception):
+    """The batch was accepted (and billed) by Tracerfy but its results could not be fetched.
+    Any other exception from ``submit`` means the batch was never billed."""
+
+    def __init__(self, queue_id: str):
+        super().__init__(f"queue_id={queue_id}")
+        self.queue_id = queue_id
+
+
 @dataclass
 class TraceOutcome:
     contacts: dict[str, LeadContacts] = field(default_factory=dict)
+    aborted: bool = False
     submitted: int = 0
     skipped_already_traced: int = 0
     skipped_unkeyable: int = 0
@@ -95,23 +105,28 @@ def trace_staged_leads(
             outcome.skipped_cap += sum(len(by_key[k]) for k in keys[start:])
             logger.warning("[pr-live-trace] spend cap reached; %d address(es) left untraced", len(keys) - start)
             break
-        cap.add(len(batch_keys) * CENTS_PER_HIT)
         rows = [_submit_row(by_key[k][0]) for k in batch_keys]
         try:
             results = submit(rows)
-        except Exception as exc:
-            # submit() covers both the billing POST and the result poll; a poll failure
-            # happens only after Tracerfy already billed the batch, and we can't tell
-            # that apart from a submit-time failure here. Either way, a retry risks a
-            # double charge, so this batch's keys are written to the ledger as consumed
-            # (a zero-cost miss) rather than left to be re-submitted next run, and
-            # earlier batches' already-returned contacts are kept, not thrown away by
-            # letting this exception propagate out of the whole function.
-            logger.error("[pr-live-trace] batch submit/poll failed for %d address(es); treating as "
-                        "billed and consumed, not retrying: %s", len(batch_keys), type(exc).__name__)
-            write_ledger([_ledger_entry(key, False) for key in batch_keys])
+        except TraceBilledError as exc:
+            # Tracerfy billed the batch but the result poll failed: ledger the keys as
+            # consumed (a zero-cost miss, queue_id kept for manual recovery) so a retry
+            # can't double-charge. Earlier batches' contacts are kept.
+            logger.error("[pr-live-trace] results poll failed after billing for %d address(es), "
+                         "queue_id=%s; ledgered as consumed", len(batch_keys), exc.queue_id)
+            cap.add(len(batch_keys) * CENTS_PER_HIT)
+            write_ledger([_ledger_entry(key, False, request_ref=exc.queue_id) for key in batch_keys])
             outcome.submitted += len(batch_keys)
             continue
+        except Exception as exc:
+            # The submit step failed before billing (bad key, no credits, 429, 5xx,
+            # timeout): nothing was spent, so ledger nothing and stop rather than keep
+            # hitting a broken vendor. These addresses are retried on the next run.
+            logger.error("[pr-live-trace] batch submit failed before billing for %d address(es); "
+                         "stopping the run, nothing ledgered: %s", len(batch_keys), type(exc).__name__)
+            outcome.aborted = True
+            break
+        cap.add(len(batch_keys) * CENTS_PER_HIT)
         outcome.submitted += len(batch_keys)
         hits = {_core(trace_key(r.get("address"), "")): r for r in results if r.get("address")}
         entries = []
@@ -137,7 +152,7 @@ def _submit_row(lead: Any) -> dict:
             "first_name": first, "last_name": last, "label": lead.radar_id}
 
 
-def _ledger_entry(key: str, success: bool) -> dict:
+def _ledger_entry(key: str, success: bool, *, request_ref: Optional[str] = None) -> dict:
     return {"vendor": "tracerfy", "purpose": "skip_trace", "success": success,
             "cost_cents": CENTS_PER_HIT if success else 0, "property_id": None,
-            "target_address": key, "request_ref": None, "created_at": datetime.now(timezone.utc)}
+            "target_address": key, "request_ref": request_ref, "created_at": datetime.now(timezone.utc)}

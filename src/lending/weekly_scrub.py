@@ -1,7 +1,8 @@
 """Weekly DNC / litigator re-scrub of numbers loaded in the dialer (Go Live G10).
 
-Only loaded numbers whose newest scrub is older than the freshness window are sent
-to Tracerfy (1 credit each). ``max_credits`` is a hard cap: the run stops before any
+Loaded numbers whose newest scrub would turn stale for the dialer sweep before the next
+weekly run (``WEEKLY_RESCRUB_AFTER_DAYS``; every loaded number at a 7-day cron and a
+7-day freshness window) are sent to Tracerfy (1 credit each). ``max_credits`` is a hard cap: the run stops before any
 batch that would exceed it. A number that now fails a scrub leaves the dialer for
 good (reason ``opt_out`` = the vendor's permanent DNC list) and its load row closes.
 
@@ -21,7 +22,7 @@ from sqlalchemy import text
 
 from src.services.phone_utils import normalize as normalize_phone
 
-from config.lending_compliance import DNC_SCRUB_MAX_AGE_DAYS, RemovalReason
+from config.lending_compliance import WEEKLY_RESCRUB_AFTER_DAYS, RemovalReason
 from src.lending.compliance import (
     DialerRemover,
     NURTURE_REASONS,
@@ -60,7 +61,7 @@ def stale_loaded_phones(db, *, now: Optional[datetime] = None) -> list[str]:
     loaded = sorted({p for p in (normalize_phone(r) for r in raw) if p})
     if not loaded:
         return []
-    cutoff = now - timedelta(days=DNC_SCRUB_MAX_AGE_DAYS)
+    cutoff = now - timedelta(days=WEEKLY_RESCRUB_AFTER_DAYS)
     stored = _stored_scrubs(db, loaded)
     return [p for p in loaded if p not in stored or stored[p].checked_at < cutoff]
 
