@@ -1,8 +1,7 @@
 """PropertyRadar campaign criteria and lender-name variants.
 
 ENABLED_STATES — states whose campaigns run in production pulls.
-  FL is live. GA is fully defined but disabled; flip ENABLED_STATES to
-  activate it with no code changes (state-swap replicability requirement).
+  FL and GA are live (Next Deal Lending dials both statewide).
 
 CAMPAIGN_CRITERIA — keyed by (state, campaign_key). Each value is a list of
   PropertyRadar Criteria dicts passed as the ``Criteria`` body parameter.
@@ -10,6 +9,18 @@ CAMPAIGN_CRITERIA — keyed by (state, campaign_key). Each value is a list of
   ``maturity_target_lender`` is the primary campaign: corporate-owned
   properties where the first loan was recorded 8–15 months ago by one of
   Josh's target hard-money lenders and the property is not listed for sale.
+
+  Lending campaigns, mapped to Josh's source lists (pull order 5, 8, 9, 6):
+    maturity_target_lender  List 1 (FL) / List 5 (GA) — named hard-money lenders
+    private_maturity        List 8 — first loan coded Private by PropertyRadar
+    stalled_flip            List 9 — financed (private) purchase, not resold
+    auction_winner          List 6 — trustee-sale buyers
+  PropertyRadar does not code the named hard-money lenders as Private, so
+  maturity_target_lender and private_maturity never overlap. stalled_flip
+  excludes loans inside the state's private_maturity window so the same
+  record is not bought twice under two campaigns (seen_ids is per campaign).
+  None of these lending campaigns has a handoff entry in
+  config/property_radar_handoff.py, so the FA Max handoff skips them.
 
   NOTE: FirstTermInYears is an EXPORT-ONLY field — it cannot be used as an
   API filter criterion (confirmed by inspection of api-reference/criteria.json
@@ -28,7 +39,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 from typing import Optional
 
-ENABLED_STATES: frozenset[str] = frozenset({"FL"})
+ENABLED_STATES: frozenset[str] = frozenset({"FL", "GA"})
 
 # ---------------------------------------------------------------------------
 # Lender name variants — only spellings confirmed to return results
@@ -54,13 +65,40 @@ _ALL_LENDER_NAMES: list[str] = [
 ]
 
 
+# Date windows as (older_days, newer_days) before today.
+_MATURITY_WINDOW_DAYS: tuple[int, int] = (15 * 30, 8 * 30)  # recorded ~8–15 months ago
+
+# List 8 window per state. FL dials only loans 30–90 days from maturity on a
+# 12-month term (recorded 275–335 days ago); GA takes the full 8–15 month
+# window because GA starts at zero records.
+PRIVATE_MATURITY_WINDOW_DAYS: dict[str, tuple[int, int]] = {
+    "FL": (365 - 30, 365 - 90),
+    "GA": _MATURITY_WINDOW_DAYS,
+}
+
+# List 9: last purchase 90–365 days ago and not resold since.
+STALLED_FLIP_PURCHASE_WINDOW_DAYS: tuple[int, int] = (365, 90)
+
+# List 6: trustee-sale purchase in the last 12 months.
+AUCTION_WINNER_PURCHASE_WINDOW_DAYS: tuple[int, int] = (365, 0)
+
+# Far-past lower bound for an open-ended "before" date range.
+_EARLIEST_DATE = date(1990, 1, 1)
+
+
+def _window_dates(
+    older_days: int, newer_days: int, as_of: Optional[date] = None
+) -> tuple[date, date]:
+    """Return (start, end) for records dated ``older_days``..``newer_days`` before
+    ``as_of`` (default today)."""
+    ref = as_of or date.today()
+    return ref - timedelta(days=older_days), ref - timedelta(days=newer_days)
+
+
 def _maturity_window_dates(as_of: Optional[date] = None) -> tuple[date, date]:
     """Return (start, end) dates for loans recorded 8–15 months ago, as of ``as_of``
     (default today). Returns real ``date`` objects — callers format for the API."""
-    ref = as_of or date.today()
-    end = ref - timedelta(days=8 * 30)    # ~8 months ago
-    start = ref - timedelta(days=15 * 30) # ~15 months ago
-    return start, end
+    return _window_dates(*_MATURITY_WINDOW_DAYS, as_of=as_of)
 
 
 def _fmt(d: date) -> str:
@@ -91,24 +129,40 @@ def build_campaign_criteria(
     return _CAMPAIGN_BUILDERS[key](daily_since)
 
 
-def _maturity_date_criterion(daily_since: Optional[date]) -> dict:
+def _date_window_criterion(
+    name: str, window_days: tuple[int, int], daily_since: Optional[date]
+) -> dict:
     if daily_since is None:
-        start, end = _maturity_window_dates()
+        start, end = _window_dates(*window_days)
     else:
         # The window's near edge (`end`) moves forward by 1 day every day.
-        # "Newly entered the window since daily_since" = loans whose FirstDate
+        # "Newly entered the window since daily_since" = records whose date
         # falls between where that edge was on daily_since and where it is
         # today. +1 day on the lower bound avoids re-matching the boundary
         # date already covered by the previous run.
-        _, prev_end = _maturity_window_dates(as_of=daily_since)
+        _, prev_end = _window_dates(*window_days, as_of=daily_since)
         start = prev_end + timedelta(days=1)
-        _, end = _maturity_window_dates()
+        _, end = _window_dates(*window_days)
         if start > end:
             # daily_since was today or in the future (e.g. two runs same day,
             # or a clock skew) — degenerate to an empty window rather than
             # accidentally widening it.
             start = end
-    return {"name": "FirstDate", "value": [f"from: {_fmt(start)} to: {_fmt(end)}"]}
+    return {"name": name, "value": [f"from: {_fmt(start)} to: {_fmt(end)}"]}
+
+
+def _outside_window_criterion(name: str, window_days: tuple[int, int]) -> dict:
+    """Dates before or after today's window. PropertyRadar has no NOT, but a
+    criterion's value list is OR, so two ranges express "outside"."""
+    start, end = _window_dates(*window_days)
+    return {"name": name, "value": [
+        f"from: {_fmt(_EARLIEST_DATE)} to: {_fmt(start - timedelta(days=1))}",
+        f"from: {_fmt(end + timedelta(days=1))} to: {_fmt(date.today())}",
+    ]}
+
+
+def _maturity_date_criterion(daily_since: Optional[date]) -> dict:
+    return _date_window_criterion("FirstDate", _MATURITY_WINDOW_DAYS, daily_since)
 
 
 def _fl_maturity_target_lender(daily_since: Optional[date] = None) -> list[dict]:
@@ -140,10 +194,63 @@ def _ga_maturity_target_lender(daily_since: Optional[date] = None) -> list[dict]
     ]
 
 
+_CORPORATE = {"name": "OwnershipType", "value": ["Corporate"]}
+_NOT_LISTED = {"name": "isListedForSale", "value": ["0"]}
+_PRIVATE_FIRST_LOAN = {"name": "FirstLoanType", "value": ["P"]}
+
+
+def _state(state: str) -> dict:
+    return {"name": "State", "value": [state]}
+
+
+def _private_maturity(state: str, daily_since: Optional[date] = None) -> list[dict]:
+    return [
+        _CORPORATE,
+        _NOT_LISTED,
+        _PRIVATE_FIRST_LOAN,
+        _date_window_criterion("FirstDate", PRIVATE_MATURITY_WINDOW_DAYS[state], daily_since),
+        _state(state),
+    ]
+
+
+def _stalled_flip(state: str, daily_since: Optional[date] = None) -> list[dict]:
+    return [
+        _CORPORATE,
+        _NOT_LISTED,
+        _PRIVATE_FIRST_LOAN,
+        # The last transfer is the flipper's own purchase: not resold since.
+        _date_window_criterion("LastTransferRecDate", STALLED_FLIP_PURCHASE_WINDOW_DAYS, daily_since),
+        # Records already covered by private_maturity are not bought again.
+        _outside_window_criterion("FirstDate", PRIVATE_MATURITY_WINDOW_DAYS[state]),
+        _state(state),
+    ]
+
+
+def _auction_winner(state: str, daily_since: Optional[date] = None) -> list[dict]:
+    return [
+        {"name": "ForeclosureStage", "value": ["3rd Owned"]},
+        _date_window_criterion("LastTransferRecDate", AUCTION_WINNER_PURCHASE_WINDOW_DAYS, daily_since),
+        _state(state),
+    ]
+
+
+def _for_state(builder, state: str):
+    return lambda daily_since=None: builder(state, daily_since)
+
+
 # Campaign builder registry — add new campaigns/states here without touching callers
 _CAMPAIGN_BUILDERS: dict[tuple[str, str], object] = {
     ("FL", "maturity_target_lender"): _fl_maturity_target_lender,
     ("GA", "maturity_target_lender"): _ga_maturity_target_lender,
+    **{
+        (state, key): _for_state(builder, state)
+        for state in ("FL", "GA")
+        for key, builder in (
+            ("private_maturity", _private_maturity),
+            ("stalled_flip", _stalled_flip),
+            ("auction_winner", _auction_winner),
+        )
+    },
 }
 
 # Default campaign run for each state — the daily/backlog pull targets this
