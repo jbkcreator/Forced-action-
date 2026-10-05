@@ -165,6 +165,24 @@ def _mark_seen(session, state: str, campaign: str, radar_ids: list[str]) -> None
     )
 
 
+_SAVE_EXCLUDED_SQL = """
+    INSERT INTO property_radar_excluded_records
+        (radar_id, state, campaign, reason, loan_term_years, raw, pull_run_id)
+    VALUES (:radar_id, :state, :campaign, :reason, :loan_term_years, CAST(:raw AS jsonb), :pull_run_id)
+    ON CONFLICT (state, campaign, radar_id) DO UPDATE SET
+        reason = EXCLUDED.reason,
+        loan_term_years = EXCLUDED.loan_term_years,
+        raw = EXCLUDED.raw,
+        pull_run_id = EXCLUDED.pull_run_id
+"""
+
+
+def _save_excluded(session, rows: list[dict]) -> None:
+    """Keep bought-but-dropped records: every export is billed, so nothing is discarded."""
+    if rows:
+        session.execute(text(_SAVE_EXCLUDED_SQL), rows)
+
+
 def _last_successful_run_date(session, state: str, campaign: str) -> Optional[date]:
     """Return the calendar date of the most recent 'done' run for (state,
     campaign), or None if there isn't one yet. This is the watermark daily
@@ -285,10 +303,13 @@ def _run_pull(
     excluded: Counter[str] = Counter()
     batch_ids: list[str] = []
     staging_batch: list[dict] = []
+    excluded_batch: list[dict] = []
     inserted_total = updated_total = skipped_total = 0
 
     def _flush_staging_batch() -> None:
-        nonlocal inserted_total, updated_total, skipped_total, staging_batch
+        nonlocal inserted_total, updated_total, skipped_total, staging_batch, excluded_batch
+        _save_excluded(session, excluded_batch)
+        excluded_batch = []
         if not staging_batch:
             return
         ins, upd, skp = upsert_records(session, staging_batch)
@@ -305,7 +326,22 @@ def _run_pull(
 
             normalized = normalize(record, state=state, campaign=campaign)
             if normalized is None:
-                excluded[exclusion_reason(record, state=state) or "unknown"] += 1
+                reason = exclusion_reason(record, state=state) or "unknown"
+                excluded[reason] += 1
+                term = record.raw.get("FirstTermInYears")
+                excluded_batch.append({
+                    "radar_id": record.radar_id,
+                    "state": state,
+                    "campaign": campaign,
+                    "reason": reason,
+                    "loan_term_years": None if term is None else str(term),
+                    "raw": json.dumps(record.raw, default=str),
+                    "pull_run_id": run_row,
+                })
+                if len(excluded_batch) >= 100:
+                    _save_excluded(session, excluded_batch)
+                    session.commit()
+                    excluded_batch = []
                 continue
 
             records_fetched += 1
@@ -329,7 +365,7 @@ def _run_pull(
         _flush_staging_batch()
         if batch_ids:
             _mark_seen(session, state, campaign, batch_ids)
-            session.commit()
+        session.commit()
 
         # Link newly-staged records to FA properties where the county is
         # loaded (Dev 2's contract: call once after all pages are upserted,

@@ -929,3 +929,80 @@ class TestExclusionReasons:
         assert result["records_fetched"] == 1
         assert result["excluded"] == 3
         assert result["excluded_by_reason"] == {"long_term_loan": 2, "unmapped_county": 1}
+
+
+class TestExcludedRecordsAreKept:
+    def test_run_pull_hands_every_excluded_record_to_the_writer(self):
+        from unittest.mock import MagicMock
+        from src.tasks.property_radar_maturity_pull import _run_pull
+
+        port = FakePropertyRadarPort(canned_records=[
+            _raw_record("K1"),
+            _raw_record("L1", term="30"),
+            _raw_record("U1", county="NOT A COUNTY"),
+        ])
+        saved: list[dict] = []
+        with patch("src.tasks.property_radar_maturity_pull.get_property_radar_port", return_value=port), \
+             patch("src.tasks.property_radar_maturity_pull.upsert_records", return_value=(1, 0, 0)), \
+             patch("src.tasks.property_radar_maturity_pull._mark_seen"), \
+             patch("src.tasks.property_radar_maturity_pull._load_seen_ids", return_value=frozenset()), \
+             patch("src.tasks.property_radar_maturity_pull._save_excluded",
+                   side_effect=lambda session, rows: saved.extend(rows)):
+            _run_pull(
+                mode="backlog", state="FL", campaign="private_maturity",
+                dry_run=False, session=MagicMock(), link=False,
+            )
+        by_id = {r["radar_id"]: r for r in saved}
+        assert set(by_id) == {"L1", "U1"}
+        assert by_id["L1"]["reason"] == "long_term_loan"
+        assert by_id["L1"]["loan_term_years"] == "30"
+        assert by_id["U1"]["reason"] == "unmapped_county"
+        assert json.loads(by_id["L1"]["raw"])["RadarID"] == "L1"
+
+
+class TestExcludedRecordsTable:
+    """DB-backed: needs migrations/apply_property_radar_excluded_records.py applied."""
+    RADAR_ID_PREFIX = "INTTESTEX"
+
+    def _cleanup(self, session):
+        from sqlalchemy import text
+        p = {"p": f"{self.RADAR_ID_PREFIX}%"}
+        session.execute(text("DELETE FROM property_radar_excluded_records WHERE radar_id LIKE :p"), p)
+        session.execute(text("DELETE FROM property_radar_records WHERE radar_id LIKE :p"), p)
+        session.execute(text("DELETE FROM property_radar_seen_ids WHERE radar_id LIKE :p"), p)
+        session.commit()
+
+    def test_excluded_record_is_saved_once_with_reason_and_raw(self):
+        from sqlalchemy import text
+        from src.core.database import get_db_context
+        from src.tasks.property_radar_maturity_pull import _run_pull
+
+        port = FakePropertyRadarPort(canned_records=[_raw_record("INTTESTEX01", term="30")])
+        run_ids: list[int] = []
+        with get_db_context() as session:
+            self._cleanup(session)
+            try:
+                with patch("src.tasks.property_radar_maturity_pull.get_property_radar_port", return_value=port):
+                    for _ in range(2):
+                        result = _run_pull(
+                            mode="backlog", state="FL", campaign="private_maturity",
+                            dry_run=False, session=session, link=False,
+                        )
+                        run_ids.append(result["run_id"])
+                rows = session.execute(
+                    text(
+                        "SELECT reason, loan_term_years, raw->>'RadarID' AS rid, pull_run_id "
+                        "FROM property_radar_excluded_records WHERE radar_id LIKE :p"
+                    ),
+                    {"p": f"{self.RADAR_ID_PREFIX}%"},
+                ).mappings().all()
+                assert len(rows) == 1
+                assert rows[0]["reason"] == "long_term_loan"
+                assert rows[0]["loan_term_years"] == "30"
+                assert rows[0]["rid"] == "INTTESTEX01"
+                assert rows[0]["pull_run_id"] == run_ids[-1]
+            finally:
+                self._cleanup(session)
+                for run_id in run_ids:
+                    session.execute(text("DELETE FROM property_radar_pull_runs WHERE id = :id"), {"id": run_id})
+                session.commit()

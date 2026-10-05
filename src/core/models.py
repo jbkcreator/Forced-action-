@@ -12570,6 +12570,33 @@ class PropertyRadarTraceContact(Base):
     )
 
 
+class PropertyRadarExcludedRecord(Base):
+    """A bought PropertyRadar record the normalizer dropped (e.g. a 20+ year
+    loan). Every export is billed, so the raw payload is kept here instead of
+    being discarded. Kept apart from property_radar_records so no lead reader
+    (handoff, linking, lending extraction) ever treats it as a lead."""
+
+    __tablename__ = "property_radar_excluded_records"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    radar_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    state: Mapped[str] = mapped_column(String(2), nullable=False)
+    campaign: Mapped[str] = mapped_column(String(80), nullable=False)
+    reason: Mapped[str] = mapped_column(String(40), nullable=False)
+    loan_term_years: Mapped[Optional[str]] = mapped_column(Text)
+    raw: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    pull_run_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("property_radar_pull_runs.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint("state", "campaign", "radar_id", name="uq_pr_excluded_state_campaign_radar"),
+        Index("ix_pr_excluded_reason", "reason"),
+    )
+
 # ============================================================================
 # PropertyRadar staging — Developer 2 (property_radar_records)
 # ============================================================================
