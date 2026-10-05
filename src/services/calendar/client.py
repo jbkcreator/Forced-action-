@@ -122,7 +122,7 @@ def get_calendar_id() -> str:
     """The calendar bookings are written to.
 
     "ghl" mode reads a separate id — FA_MAX_CALENDAR_ID and
-    FA_MAX_GHL_CALENDAR_ID name calendars in two different systems, and a
+    LENDING_GHL_CALENDAR_ID name calendars in two different systems, and a
     stale Google id left over from "live" mode must never silently get
     passed to the GHL client.
     """
@@ -130,9 +130,9 @@ def get_calendar_id() -> str:
 
     settings = get_settings()
     if settings.fa_max_calendar_mode == "ghl":
-        calendar_id = settings.fa_max_ghl_calendar_id
+        calendar_id = settings.lending_ghl_calendar_id
         if not calendar_id:
-            raise ValueError("FA_MAX_GHL_CALENDAR_ID is not set")
+            raise ValueError("LENDING_GHL_CALENDAR_ID is not set")
         return calendar_id
 
     calendar_id = settings.fa_max_calendar_id

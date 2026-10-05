@@ -186,14 +186,26 @@ class TestCancelEvent:
 class TestFromSettings:
     def test_requires_api_key(self):
         with patch("config.settings.get_settings") as settings:
-            settings.return_value.ghl_api_key = None
-            settings.return_value.ghl_location_id = LOCATION_ID
-            with pytest.raises(ValueError, match="GHL_API_KEY"):
+            settings.return_value.lending_ghl_api_key = None
+            settings.return_value.lending_ghl_location_id = LOCATION_ID
+            with pytest.raises(ValueError, match="LENDING_GHL_API_KEY"):
                 GHLCalendarClient.from_settings()
 
     def test_requires_location_id(self):
         with patch("config.settings.get_settings") as settings:
-            settings.return_value.ghl_api_key = MagicMock(get_secret_value=lambda: "key")
-            settings.return_value.ghl_location_id = None
-            with pytest.raises(ValueError, match="GHL_LOCATION_ID"):
+            settings.return_value.lending_ghl_api_key = MagicMock(get_secret_value=lambda: "key")
+            settings.return_value.lending_ghl_location_id = None
+            with pytest.raises(ValueError, match="LENDING_GHL_LOCATION_ID"):
                 GHLCalendarClient.from_settings()
+
+    def test_uses_lending_credentials_not_the_bay_street_generic_ones(self):
+        """GHL_API_KEY/GHL_LOCATION_ID belong to Bay Street Capital and are
+        already depended on elsewhere — the calendar must never read them."""
+        with patch("config.settings.get_settings") as settings:
+            settings.return_value.lending_ghl_api_key = MagicMock(get_secret_value=lambda: "lending-key")
+            settings.return_value.lending_ghl_location_id = "lending-location"
+            settings.return_value.ghl_api_key = MagicMock(get_secret_value=lambda: "bay-street-key")
+            settings.return_value.ghl_location_id = "bay-street-location"
+            client = GHLCalendarClient.from_settings()
+        assert client._api_key == "lending-key"
+        assert client._location_id == "lending-location"

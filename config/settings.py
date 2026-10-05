@@ -709,9 +709,19 @@ class AppSettings(BaseSettings):
 	fa_max_calendar_subject: Optional[str] = Field(default=None, env="FA_MAX_CALENDAR_SUBJECT")
 	# GHL calendar id bookings are written to when fa_max_calendar_mode ==
 	# "ghl". Distinct from GHL_AP_PRO_CALENDAR_ID — that's an unrelated
-	# calendar for a different venture. Auth reuses GHL_API_KEY/
-	# GHL_LOCATION_ID, the same credentials ghl_webhook.py already uses.
-	fa_max_ghl_calendar_id: Optional[str] = Field(default=None, env="FA_MAX_GHL_CALENDAR_ID")
+	# calendar for a different venture. Named LENDING_GHL_* to match the
+	# sub-account's other credentials below, not FA_MAX_* — it lives in
+	# Next Deal Lending's GHL account, same naming family as the api
+	# key/location id it's read alongside.
+	lending_ghl_calendar_id: Optional[str] = Field(default=None, env="LENDING_GHL_CALENDAR_ID")
+	# Next Deal Lending's own GHL sub-account — NOT GHL_API_KEY/
+	# GHL_LOCATION_ID, which are Bay Street Capital's and already depended
+	# on elsewhere (ghl_webhook.py's lead push). Shared with WP-GL-10
+	# (confirmation/reminder texts) — same sub-account, same credentials,
+	# same field names, so both features read one pair instead of each
+	# minting its own.
+	lending_ghl_api_key: Optional[SecretStr] = Field(default=None, env="LENDING_GHL_API_KEY")
+	lending_ghl_location_id: Optional[str] = Field(default=None, env="LENDING_GHL_LOCATION_ID")
 	# Fallback for the Command Center's self-message filter when Slack's
 	# auth.test is unreachable at startup. Normally resolved dynamically.
 	fa_max_slack_bot_user_id: Optional[str] = Field(default=None, env="FA_MAX_SLACK_BOT_USER_ID")

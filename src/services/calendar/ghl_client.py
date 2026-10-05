@@ -14,10 +14,12 @@ shape was confirmed during the Wave 0 compliance work. Treat this as the
 documented, best-effort shape — run one real booking before trusting it in
 production, and correct field names here if the live call disagrees.
 
-Auth reuses GHL_API_KEY / GHL_LOCATION_ID — the same credentials
-src/services/ghl_webhook.py already uses for contact/pipeline pushes.
-FA_MAX_GHL_CALENDAR_ID is a separate setting from GHL_AP_PRO_CALENDAR_ID,
-which is an unrelated calendar for a different venture.
+Auth uses LENDING_GHL_API_KEY / LENDING_GHL_LOCATION_ID — Next Deal
+Lending's own GHL sub-account, not the generic GHL_API_KEY / GHL_LOCATION_ID
+src/services/ghl_webhook.py uses for Bay Street Capital's contact/pipeline
+pushes. LENDING_GHL_CALENDAR_ID is a separate setting from
+GHL_AP_PRO_CALENDAR_ID, which is an unrelated calendar for a different
+venture.
 """
 from __future__ import annotations
 
@@ -53,17 +55,27 @@ class GHLCalendarClient:
 
     @classmethod
     def from_settings(cls) -> "GHLCalendarClient":
+        """Uses LENDING_GHL_API_KEY/LENDING_GHL_LOCATION_ID — Next Deal
+        Lending's own GHL sub-account, shared with WP-GL-10's confirmation/
+        reminder texts (same sub-account, one credential pair). NOT the
+        generic GHL_API_KEY/GHL_LOCATION_ID — those are Bay Street Capital's
+        and already depended on elsewhere (ghl_webhook.py's lead push);
+        pointing those at a different sub-account would silently break Bay
+        Street's existing GHL usage.
+        """
         from config.settings import get_settings
 
         settings = get_settings()
-        if settings.ghl_api_key is None:
-            raise ValueError("GHL_API_KEY is not set")
-        if not settings.ghl_location_id:
-            raise ValueError("GHL_LOCATION_ID is not set")
-        logger.info("calendar.ghl: authenticated for location %s", settings.ghl_location_id)
+        if settings.lending_ghl_api_key is None:
+            raise ValueError("LENDING_GHL_API_KEY is not set")
+        if not settings.lending_ghl_location_id:
+            raise ValueError("LENDING_GHL_LOCATION_ID is not set")
+        logger.info(
+            "calendar.ghl: authenticated for location %s", settings.lending_ghl_location_id
+        )
         return cls(
-            api_key=settings.ghl_api_key.get_secret_value(),
-            location_id=settings.ghl_location_id,
+            api_key=settings.lending_ghl_api_key.get_secret_value(),
+            location_id=settings.lending_ghl_location_id,
         )
 
     def _headers(self) -> dict:

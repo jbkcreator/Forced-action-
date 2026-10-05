@@ -174,7 +174,7 @@ class TestWrapperConversion:
 
         with patch("config.settings.get_settings") as settings:
             settings.return_value.fa_max_calendar_mode = "ghl"
-            settings.return_value.fa_max_ghl_calendar_id = "ghl_cal_1"
+            settings.return_value.lending_ghl_calendar_id = "ghl_cal_1"
             settings.return_value.fa_max_calendar_id = "google_cal_1"
             assert get_calendar_id() == "ghl_cal_1"
 
@@ -183,6 +183,6 @@ class TestWrapperConversion:
 
         with patch("config.settings.get_settings") as settings:
             settings.return_value.fa_max_calendar_mode = "ghl"
-            settings.return_value.fa_max_ghl_calendar_id = None
-            with pytest.raises(ValueError, match="FA_MAX_GHL_CALENDAR_ID"):
+            settings.return_value.lending_ghl_calendar_id = None
+            with pytest.raises(ValueError, match="LENDING_GHL_CALENDAR_ID"):
                 get_calendar_id()
