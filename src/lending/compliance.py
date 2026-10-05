@@ -565,11 +565,11 @@ def _attempt_history_exhausted_phones(db, phones: list[str], now: datetime) -> s
 
 
 def _close_exhausted_load_row(db, phone: str) -> None:
-    """Permanently closes the load row once total attempt history crosses the cap.
-    Unlike a CALL_WINDOW/ATTEMPT_CAP/SCRUB_STALE hold, this can never un-do itself
-    (the count only grows), so the contact must leave the active pool for good and
-    move to nurture — the same disposition as a DNC/litigator verdict, not a
-    temporary sweep hold."""
+    """Closes the load row once total attempt history crosses the cap, and the contact
+    moves to nurture — the same disposition as a DNC/litigator verdict, not a temporary
+    sweep hold. The count is a rolling ATTEMPT_HISTORY_BUSINESS_DAYS window, so it can
+    fall again as attempts age out, but nothing reopens this row: the contact only
+    returns if a later load run re-pushes it."""
     db.execute(
         text(
             "UPDATE lending.dialer_load_records SET active = false, deactivated_at = now(), "
@@ -588,8 +588,9 @@ def on_attempt_recorded(
 ) -> Optional[GateResult]:
     """WP-W0-6 hook, called after every call.ended row commits. At the 24h cap, pull
     the contact from the dialer pool (restoring after 24h is the step-5 sweep's job).
-    At the total-history cap, the move is permanent: flag nurture, remove from the
-    dialer and close the load row, rather than a temporary hold. Idempotent: a replay
+    At the total-history cap, flag nurture, remove from the dialer and close the load
+    row, rather than a temporary hold; that outranks the 24h cap when both apply, so the
+    nurture flag is never skipped. Idempotent: a replay
     re-counts the same rows and re-issues the same removal (a no-op for a contact
     already out of the pool). Does not commit."""
     normalized = normalize_phone(phone) if phone else None
@@ -597,10 +598,6 @@ def on_attempt_recorded(
         return None
     now = now or datetime.now(timezone.utc)
     result = _attempt_cap(db, normalized, now)
-    if not result.allowed:
-        if _remove_from_dialer([normalized], dialer_remover, RemovalReason.ATTEMPT_CAP):
-            _open_holds(db, {normalized: RemovalReason.ATTEMPT_CAP})
-        return result
     if _attempt_history_exhausted_phones(db, [normalized], now):
         _flag_nurture(db, [normalized])
         # Close the row only once the dialer confirmed the removal: the sweep and weekly
@@ -609,6 +606,9 @@ def on_attempt_recorded(
         if _remove_from_dialer([normalized], dialer_remover, RemovalReason.ATTEMPT_HISTORY):
             _close_exhausted_load_row(db, normalized)
         return _blocked(normalized, ReasonCode.ATTEMPT_HISTORY_EXCEEDED)
+    if not result.allowed:
+        if _remove_from_dialer([normalized], dialer_remover, RemovalReason.ATTEMPT_CAP):
+            _open_holds(db, {normalized: RemovalReason.ATTEMPT_CAP})
     return result
 
 
@@ -707,8 +707,8 @@ def _hold_reason(
         # Defense in depth: on_attempt_recorded already closes the load row and
         # removes the contact the moment the total-history cap is crossed, so the
         # sweep should never actually find one of these still active. If it does
-        # (a missed disposition event, say), this never releases — the count can
-        # only grow — matching on_attempt_recorded's permanent-move-to-nurture intent.
+        # (a missed disposition event, say), it stays held while the rolling window
+        # still counts the attempts, matching on_attempt_recorded's move to nurture.
         return RemovalReason.ATTEMPT_HISTORY
     if _outside_call_window(phone, now):
         return RemovalReason.CALL_WINDOW
