@@ -326,6 +326,8 @@ def _notify_booking_confirmed(
             handle_booking_confirmed(session, payload)
         session.commit()
     except ImportError:
+        # Known, temporary, and every booking hits it until #328 merges —
+        # an EXCEPTIONS alert per booking here would be noise, not signal.
         logger.warning(
             "calendar.book: booking_ref=%s — src.lending.booking_messages not "
             "available yet (expected before #328 merges); no reminders scheduled",
@@ -335,6 +337,30 @@ def _notify_booking_confirmed(
         logger.exception(
             "calendar.book: booking_ref=%s — booking-confirmed notification failed, "
             "booking stands, reminders will not fire for this one", booking_ref,
+        )
+        _alert_booking_confirmed_failed(booking_ref)
+
+
+def _alert_booking_confirmed_failed(booking_ref: str) -> None:
+    """Surface a silent-reminder-gap on EXCEPTIONS. Never raises — an alert
+    failure must not compound onto an already-failed notification."""
+    try:
+        from src.services.relay import exceptions_alert_queue
+
+        exceptions_alert_queue.enqueue_and_attempt(
+            venture_key=CALENDAR_VENTURE_KEY,
+            rule="booking_confirmed_notify_failed",
+            message=(
+                f"*Booking confirmed but reminders not scheduled* — `{booking_ref}`\n"
+                f"The booking-confirmed notification to WP-GL-10 failed. The booking "
+                f"itself is real and calendared; no confirmation/reminder texts will "
+                f"fire for it unless this is retried by hand."
+            ),
+        )
+    except Exception:
+        logger.exception(
+            "calendar.book: booking_ref=%s — EXCEPTIONS alert for the failed "
+            "booking-confirmed notification also failed", booking_ref,
         )
 
 

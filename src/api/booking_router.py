@@ -282,6 +282,14 @@ class BookingRequest(BaseModel):
     ends_at: str
     name: str = Field(min_length=1, max_length=120)
     email: str = Field(min_length=3, max_length=320)
+    # Optional: lets WP-GL-10 text confirmation/reminders when a borrower
+    # gives a number on the public page. No text_consent field here on
+    # purpose — a website text-consent checkbox needs a real evidentiary
+    # record (IP, timestamp, the disclosure text shown, the submission
+    # URL), which a bare boolean can't provide. Only the caller flow
+    # (calendar_book) carries text_consent, where a human caller asks the
+    # question live and logs the answer.
+    phone: Optional[str] = Field(default=None, max_length=32)
 
 
 @router.post("/api/book/{slug}")
@@ -327,6 +335,8 @@ def submit_booking(
         description=f"Booked by {payload.name} via the Forced Action booking page.",
         tracked_link_id=link.id,
         gate_id=gate_id,
+        phone=payload.phone,
+        first_name=payload.name.split()[0] if payload.name.strip() else None,
     )
 
     if not result.booked:

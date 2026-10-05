@@ -991,3 +991,49 @@ class TestBookingConfirmedNotification:
             )
 
         assert result.booked is True, "a notification failure must not undo the booking"
+
+
+class TestBookingConfirmedAgainstRealLendingModule:
+    """Runs the real handle_booking_confirmed, not the stub, once #328 has
+    merged and src.lending.booking_messages actually exists on this branch.
+    Skips cleanly until then rather than failing on an absent dependency."""
+
+    @pytest.fixture(autouse=True)
+    def _gate_bypassed(self):
+        with _bypass_gate():
+            yield
+
+    def test_real_handle_booking_confirmed_schedules_messages(self, bookings_db):
+        pytest.importorskip(
+            "src.lending.booking_messages",
+            reason="src.lending.booking_messages lands with #328 — not on this branch yet",
+        )
+        from sqlalchemy import text as sa_text
+
+        has_table = bookings_db.execute(
+            sa_text("SELECT to_regclass('lending.booking_messages')")
+        ).scalar()
+        if has_table is None:
+            pytest.skip(
+                "lending.booking_messages absent — run "
+                "migrations/apply_lending_booking_messages.py"
+            )
+
+        with _allow_all():
+            result = book(
+                client=FakeCalendar(), session=bookings_db, calendar_id=CALENDAR_ID,
+                slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate", phone="+18135551234", first_name="Maria",
+                text_consent=True,
+            )
+
+        assert result.booked is True
+
+        rows = bookings_db.execute(
+            sa_text(
+                "SELECT kind FROM lending.booking_messages WHERE booking_ref = :ref"
+            ),
+            {"ref": result.booking_ref},
+        ).mappings().all()
+        kinds = {row["kind"] for row in rows}
+        assert kinds, "handle_booking_confirmed should have scheduled at least one message"
