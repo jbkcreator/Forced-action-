@@ -28,6 +28,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import text as sa_text
 
 from config.calendar import (
+    BLOCKED_CALENDAR_DATES,
     CALENDAR_TIMEZONE,
     CALENDAR_VENTURE_KEY,
     DEFAULT_SLOT_DURATION_MINUTES,
@@ -168,6 +169,10 @@ def book(
     if gate_row is None:
         logger.info("calendar.book: refused — gate_id=%s not passed or list blocked", gate_id)
         return BookingResult(booked=False, reason="gate_not_passed")
+
+    if slot.start.astimezone(_TZ).date() in BLOCKED_CALENDAR_DATES:
+        logger.info("calendar.book: refused — %s is a blocked calendar date", slot.start.date())
+        return BookingResult(booked=False, reason="calendar_date_blocked")
 
     suppression = check_suppression(
         recipient=attendee_email, channel="email", session=session

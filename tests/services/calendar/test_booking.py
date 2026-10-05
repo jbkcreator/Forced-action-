@@ -993,6 +993,59 @@ class TestBookingConfirmedNotification:
         assert result.booked is True, "a notification failure must not undo the booking"
 
 
+class TestBlockedCalendarDates:
+    """Josh's E1 answer: 'Block October 18, 19 and 20, I'm traveling.'
+    book() must refuse even if called directly with a slot on a blocked
+    date — get_slots() already excludes them, but book() is fail-closed on
+    its own re-check, same pattern as the daily cap and gate checks."""
+
+    @pytest.fixture(autouse=True)
+    def _gate_bypassed(self):
+        with _bypass_gate():
+            yield
+
+    def test_refuses_a_slot_on_a_blocked_date(self):
+        from datetime import date as _date
+
+        blocked_slot = Slot(
+            start=datetime(2026, 10, 19, 11, tzinfo=ET),
+            end=datetime(2026, 10, 19, 11, 30, tzinfo=ET),
+        )
+        session = _NestableRecordingSession()
+        with (
+            _allow_all(),
+            patch(
+                "src.services.calendar.booking.BLOCKED_CALENDAR_DATES",
+                frozenset({_date(2026, 10, 19)}),
+            ),
+        ):
+            result = book(
+                client=FakeCalendar(), session=session, calendar_id=CALENDAR_ID,
+                slot=blocked_slot, attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate",
+            )
+
+        assert result.booked is False
+        assert result.reason == "calendar_date_blocked"
+
+    def test_an_unaffected_date_still_books(self):
+        session = _NestableRecordingSession()
+        with (
+            _allow_all(),
+            patch(
+                "src.services.calendar.booking.BLOCKED_CALENDAR_DATES",
+                frozenset(),
+            ),
+        ):
+            result = book(
+                client=FakeCalendar(), session=session, calendar_id=CALENDAR_ID,
+                slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate",
+            )
+
+        assert result.booked is True
+
+
 class TestGhlPipelinePush:
     """WP-GL-5: a successful booking also pushes the contact into the
     Booked stage of Next Deal Lending's GHL pipeline (_push_booking_to_ghl).
