@@ -14,6 +14,7 @@ and a post that failed is retried on redelivery. Logs carry ids and phone hashes
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from dataclasses import dataclass
@@ -100,21 +101,38 @@ def _pick(body: Mapping[str, Any], *paths: tuple[str, ...]) -> Any:
     return None
 
 
-def parse_event(body: Mapping[str, Any]) -> Optional[ReplyEvent]:
-    """Pull the fields out of a GHL workflow webhook; None when there is no message id or text.
+FALLBACK_ID_WINDOW_SECONDS = 900
+
+
+def _fallback_message_id(contact_id: Optional[str], direction: str, body: str, now: Optional[datetime]) -> str:
+    """A stable id for a message whose webhook body carries none: the same message redelivered within 15 minutes
+    maps to the same id (so a retry does not post twice), while the same words sent later are a new message."""
+    moment = now or datetime.now(timezone.utc)
+    bucket = int(moment.timestamp() // FALLBACK_ID_WINDOW_SECONDS)
+    digest = hashlib.sha1(f"{contact_id}|{direction}|{body.strip()}|{bucket}".encode("utf8")).hexdigest()
+    return f"auto-{digest[:24]}"
+
+
+def parse_event(body: Mapping[str, Any], now: Optional[datetime] = None) -> Optional[ReplyEvent]:
+    """Pull the fields out of a GHL workflow webhook; None when there is no message text.
     UNVERIFIED field names: they follow GHL's public reference, not a captured payload."""
-    message_id = _pick(body, ("messageId",), ("message", "id"), ("id",))
     text_body = _pick(body, ("body",), ("message", "body"), ("text",), ("message",))
-    if not message_id or not isinstance(text_body, str) or not text_body.strip():
+    if not isinstance(text_body, str) or not text_body.strip():
         return None
     direction = str(_pick(body, ("direction",), ("message", "direction")) or "inbound").lower()
+    direction = "outbound" if direction.startswith("out") else "inbound"
+    contact_id = str(_pick(body, ("contactId",), ("contact_id",), ("contact", "id")) or "") or None
+    # A top-level "id" is the CONTACT's id in GHL's default workflow body, so it is never used as the message id.
+    message_id = _pick(body, ("messageId",), ("message", "id"), ("message", "messageId"))
+    if not message_id:
+        message_id = _fallback_message_id(contact_id, direction, text_body, now)
     phone = _pick(body, ("phone",), ("contact", "phone"))
     return ReplyEvent(
         message_id=str(message_id),
-        direction="outbound" if direction.startswith("out") else "inbound",
+        direction=direction,
         body=text_body.strip(),
-        contact_id=str(_pick(body, ("contactId",), ("contact", "id")) or "") or None,
-        first_name=str(_pick(body, ("firstName",), ("contact", "firstName")) or "") or None,
+        contact_id=contact_id,
+        first_name=str(_pick(body, ("firstName",), ("first_name",), ("contact", "firstName")) or "") or None,
         phone=normalize(str(phone)) if phone else None,
         handoff=bool(_pick(body, ("handoff",), ("aiHandoff",), ("humanHandoff",))),
         from_user=bool(_pick(body, ("userId",), ("user", "id"), ("message", "userId"))),

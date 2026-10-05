@@ -88,7 +88,7 @@ def test_parse_event_reads_the_common_ghl_shapes_and_drops_empty_ones():
     assert (parsed.message_id, parsed.body, parsed.contact_id, parsed.first_name, parsed.phone) == (
         "m9", "What are the fees?", "c9", "Dana", "+18135550147")
     assert parse_event({"messageId": "m9", "body": "  "}) is None
-    assert parse_event({"body": "hi"}) is None
+    assert parse_event({"body": "hi"}).message_id.startswith("auto-")   # no id in the body: a stable fallback, never the contact id
     assert parse_event({"messageId": "m", "body": "ok", "direction": "outbound"}).direction == "outbound"
 
 
