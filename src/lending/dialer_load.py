@@ -58,7 +58,7 @@ class DialerContacts(Protocol):
     def upsert_contact(self, phone: str, fields: DialerContactFields, *, campaign: Optional[str] = None,
                        vendor_contact_id: Optional[str] = None) -> ContactUpsertResult: ...
     def update_contact(self, contact_id: Any, fields: DialerContactFields, *,
-                       phone: Optional[str] = None) -> dict: ...
+                       phone: Optional[str] = None, vendor_contact_id: Optional[str] = None) -> dict: ...
 
 
 class LoadRefused(RuntimeError):
@@ -203,7 +203,9 @@ def _push_contact(dialer: DialerContacts, item: _Loadable, known_contact_id: Opt
     """Update by the stored contact id when known (search can lag); else upsert by phone."""
     if known_contact_id is not None:
         try:
-            dialer.update_contact(known_contact_id, fields, phone=item.phone)
+            # full PUT: resend our record id or BatchDialer clears it
+            dialer.update_contact(known_contact_id, fields, phone=item.phone,
+                                  vendor_contact_id=item.record_ref or None)
             return ContactUpsertResult(contact_id=known_contact_id, created=False)
         except DialerRequestError as exc:
             if exc.status != 404:

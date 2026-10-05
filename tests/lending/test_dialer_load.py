@@ -50,10 +50,11 @@ class FakeAircall:
             raise ContactFieldsNotSet(self._next_id, DialerRequestError("PUT", status=500))
         return ContactUpsertResult(contact_id=self._next_id, created=True)
 
-    def update_contact(self, contact_id, fields, *, phone=None):
+    def update_contact(self, contact_id, fields, *, phone=None, vendor_contact_id=None):
         if contact_id in self._missing:
             raise DialerRequestError("POST /contacts/id", status=404)
         self.updates.append(contact_id)
+        self.update_vendor_ids = getattr(self, "update_vendor_ids", []) + [vendor_contact_id]
         return {"id": contact_id}
 
 
@@ -239,6 +240,13 @@ class TestPartialLoad:
 
 
 class TestReload:
+    def test_reload_update_keeps_our_vendor_contact_id(self, db):
+        # BatchDialer's PUT replaces every field: without the id our record link is wiped
+        _fresh_scrub(db, P1)
+        _run(db, [_record("a", P1)], run_id="run-1")
+        _, second = _run(db, [_record("a", P1)], run_id="run-2")
+        assert second.update_vendor_ids == ["a"]
+
     def test_reload_updates_by_stored_contact_and_supersedes_old_row(self, db):
         _fresh_scrub(db, P1)
         _, first = _run(db, [_record("a", P1)], run_id="run-1")
