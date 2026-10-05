@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from src.api.deps import get_db
 from src.api.lending_ghl_router import _verify_secret
+from src.lending.payload_shape import log_shape
 from src.lending.reply_guard import handle_reply_event, parse_event, slack_poster
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,7 @@ def ghl_reply(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     _verify_secret(x_webhook_secret)
+    log_shape("ghl-reply", body)
     event = parse_event(body)
     if event is None:
         return {"status": "ignored", "reason": "no_message"}

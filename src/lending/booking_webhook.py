@@ -30,6 +30,7 @@ from src.api.deps import get_db
 from src.api.lending_ghl_router import _verify_secret
 from src.lending.booking_messages import cancel_by_provider_event, handle_booking_confirmed, handle_booking_gate_failed, handle_nurture_entry
 from src.lending.confirmation_tasks import complete_confirmation_task
+from src.lending.payload_shape import log_shape
 
 logger = logging.getLogger(__name__)
 
@@ -66,8 +67,10 @@ def ghl_appointment(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     _verify_secret(x_webhook_secret)
-    appointment_id = _first(body, ("appointmentId",), ("appointment", "id"), ("id",))
-    status = (_first(body, ("appointmentStatus",), ("status",), ("appointment", "appointmentStatus")) or "").lower()
+    log_shape("ghl-appointment", body)
+    appointment_id = _first(body, ("appointmentId",), ("appointment", "id"), ("calendar", "appointmentId"), ("id",))
+    status = (_first(body, ("appointmentStatus",), ("status",), ("appointment", "appointmentStatus"),
+                     ("calendar", "appointmentStatus"), ("calendar", "appoinmentStatus"), ("calendar", "status")) or "").lower()
     if not appointment_id:
         return {"status": "noop", "reason": "no_appointment_id"}
     if status in SCHEDULING_STATUSES or (status == "rescheduled" and _start_time(body) is not None):
@@ -110,7 +113,7 @@ def _schedule_from_appointment(db: Session, body: dict[str, Any], appointment_id
         "provider_event_id": appointment_id,
         "person_id": known["person_id"] if known else None,
         "phone": _first(body, ("phone",), ("contact", "phone")) or (known["contact_phone"] if known else None),
-        "first_name": _first(body, ("firstName",), ("contact", "firstName")) or (known["first_name"] if known else None),
+        "first_name": _first(body, ("firstName",), ("first_name",), ("contact", "firstName")) or (known["first_name"] if known else None),
         "email": _first(body, ("email",), ("contact", "email")) or (known["contact_email"] if known else None),
         "property_address": known["property_address"] if known else None,
         "booked_by": known["booked_by"] if known else None,
@@ -195,6 +198,7 @@ def ghl_nurture(
     is ignored. Add it as a second webhook action on the same workflow that feeds ``/ghl-stage``.
     UNVERIFIED: the field names follow the ``/ghl-stage`` body (stage_name, phone) and GHL's public reference."""
     _verify_secret(x_webhook_secret)
+    log_shape("ghl-nurture", body)
     stage = (_first(body, ("stage_name",), ("stageName",), ("pipelineStageName",)) or "").strip().lower()
     if stage != "nurture":
         return {"status": "noop", "reason": "stage_not_handled"}

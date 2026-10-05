@@ -58,6 +58,33 @@ suppression and consent checks: confirmation right after booking, reminder the e
 confirmed by Josh, Oct 4), reminder 90 minutes before. Wording is the client-approved text in
 `config/lending_reminders.py`. Switch on with `BOOKING_REMINDER_TEXT_ENABLED=true` only after 10DLC clears.
 
+## GHL account check (Oct 5, read-only API calls)
+
+The configured lending account is the **Next Deal Lending** sub-account (not Bay Street). Already in place: calendar
+"NDL Calender" (30-minute slots; id matches `LENDING_GHL_CALENDAR_ID`), pipeline "Booked Calls" with the stages Booked,
+Held, No Show, Application, Submitted to Lender, Funded, Nurture and Lost (ids match `LENDING_GHL_PIPELINE_ID`,
+`LENDING_GHL_STAGE_BOOKED`, `LENDING_GHL_STAGE_NURTURE`), and the contact fields Property Address and Text Consent.
+**Not yet in place:** no workflows (so none of the four webhooks below exist), no texting number found, Conversation AI
+not checked (the public API does not expose it). GHL's API cannot create workflows, pipelines or the AI agent, so those
+are built in the GHL screens.
+
+### Creating the workflows (GHL: Automation > Workflows > Webhook action)
+
+Every webhook action: method POST, header `X-Webhook-Secret` = the value of `LENDING_GHL_WEBHOOK_SECRET` (generate one with
+`python -c "import secrets; print(secrets.token_urlsafe(32))"`, set it in the server `.env`, and paste it only into GHL).
+In the webhook action use **Custom Data** to send the keys the code reads, so the names are not guesswork:
+
+| Workflow trigger | URL (`<API>` = the public API host) | Custom data keys the code reads |
+|---|---|---|
+| Customer replied / Conversation AI sent a message | `<API>/webhooks/lending/ghl-reply` | `messageId`, `body`, `direction` (inbound/outbound), `contactId`, `firstName`, `phone`; `userId` only on a message a person typed |
+| Appointment status changed (new, confirmed, rescheduled, cancelled) | `<API>/webhooks/lending/ghl-appointment` | `appointmentId`, `appointmentStatus`, `startTime` (ISO 8601 with offset, e.g. 2026-10-07T10:00:00-04:00), `firstName`, `phone`, `email` |
+| Pipeline stage changed (add as a second webhook on the stage workflow) | `<API>/webhooks/lending/ghl-nurture` | `stage_name`, `phone` |
+| Contact DND changed | `<API>/webhooks/lending/ghl-opt-out` (WP-GL-9) | per the WP-GL-9 runbook |
+
+The code also accepts GHL's default nested payloads (`contact.*`, `calendar.*`), but custom data is unambiguous. To confirm
+what GHL really sends, set `LENDING_GHL_LOG_PAYLOAD_SHAPE=true` on the server, fire one test event per workflow, and read
+the `[ghl-payload-shape]` log lines (key paths and value types only, never values). Turn it off afterwards.
+
 ## Entry point and task list
 
 A confirmed booking reaches the scheduler through `POST /webhooks/lending/booking-confirmed` (header `X-Webhook-Secret`, payload documented in `src/lending/booking_messages.py`; idempotent per `booking_ref`). Open: the GL-5 owner must call it when a booking is confirmed. Confirmation calls due are posted at 9am ET to `LENDING_DIAL_TASKS_CHANNEL` by `src.tasks.lending_confirmation_tasks`.
