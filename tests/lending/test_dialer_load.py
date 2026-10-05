@@ -221,6 +221,20 @@ class TestLiveLoad:
         assert report.failed == [{"record_ref": "a", "error": "DialerRequestError", "status": 500}]
         assert [r.phone for r in _load_rows(db)] == [P2]
 
+    def test_a_crash_mid_load_still_records_the_contacts_already_pushed(self, db):
+        """Finding 6: contacts pushed before an unexpected error must have load rows, or a
+        later opt-out cannot find and remove them from the dialer."""
+        class Crashy(FakeAircall):
+            def upsert_contact(self, phone, fields, *, campaign=None, vendor_contact_id=None):
+                if phone == P3:
+                    raise RuntimeError("worker killed")
+                return super().upsert_contact(phone, fields, campaign=campaign, vendor_contact_id=vendor_contact_id)
+
+        _fresh_scrub(db, P1, P2, P3)
+        with pytest.raises(RuntimeError):
+            _run(db, [_record("a", P1), _record("b", P2), _record("c", P3)], aircall=Crashy())
+        assert sorted(r.phone for r in _load_rows(db)) == [P1, P2]
+
     def test_live_load_needs_scrubber_and_aircall(self, db):
         with pytest.raises(ValueError):
             run_dialer_load([], db, run_id="r", dry_run=False)

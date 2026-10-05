@@ -247,6 +247,20 @@ def test_transport_get_goes_through_the_get_retry_helper(monkeypatch):
     assert dialer_port._requests_http("k")("GET", "/campaigns") == {"id": 9}
 
 
+def test_a_non_json_2xx_reply_is_a_dialer_request_error_not_a_crash(monkeypatch):
+    """Finding 6: callers only handle DialerRequestError, so a proxy error page or truncated
+    body with a 2xx status must not escape as a ValueError."""
+    from src.lending import dialer_port
+
+    class _NotJson(_Resp):
+        def json(self):
+            raise ValueError("Expecting value")
+
+    monkeypatch.setattr(dialer_port, "requests_get_with_retry", lambda url, **kw: _NotJson(200, b"<html>"))
+    with pytest.raises(DialerRequestError):
+        dialer_port._requests_http("k")("GET", "/campaigns")
+
+
 # ── DNC safety: holds never use the DNC list, restores never delete a DNC entry ──
 
 @pytest.mark.parametrize("reason", [RemovalReason.CALL_WINDOW.value, RemovalReason.ATTEMPT_CAP.value])
