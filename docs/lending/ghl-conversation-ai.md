@@ -55,7 +55,7 @@ to it. Open: how Josh wants to be alerted and his business hours for the one-hou
 
 Sent by `python -m src.lending.reminder_worker`, not by a GHL workflow, so every text passes the lending
 suppression and consent checks: confirmation right after booking, reminder the evening before (6 PM ET,
-pending Josh's confirmation), reminder 90 minutes before. Wording is the client-approved text in
+confirmed by Josh, Oct 4), reminder 90 minutes before. Wording is the client-approved text in
 `config/lending_reminders.py`. Switch on with `BOOKING_REMINDER_TEXT_ENABLED=true` only after 10DLC clears.
 
 ## Entry point and task list

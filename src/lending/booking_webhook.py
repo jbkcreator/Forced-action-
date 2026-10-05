@@ -1,8 +1,9 @@
-"""WP-GL-10: GoHighLevel appointment-status webhook -> cancel the booking's pending messages.
+"""WP-GL-10: GoHighLevel appointment-status webhook -> schedule or cancel the booking's messages.
 
 A GHL workflow ("Appointment status changed" -> Webhook) POSTs here. A cancelled or rescheduled
 appointment cancels its pending confirmation / reminders so nobody is texted about a call that no
-longer exists. Auth is the same shared secret as the other lending GHL webhooks
+longer exists. A new / confirmed appointment schedules them (the fallback when the booking flow does
+not post ``/booking-confirmed``; see ``_schedule_from_appointment``). Auth is the same shared secret as the other lending GHL webhooks
 (``X-Webhook-Secret`` = LENDING_GHL_WEBHOOK_SECRET; closed while unset).
 
 The appointment id is matched against ``booking_messages.provider_event_id`` (the id GHL returned
@@ -22,6 +23,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from src.api.deps import get_db
@@ -35,6 +37,14 @@ router = APIRouter(prefix="/webhooks/lending", tags=["lending"])
 
 CANCELLING_STATUSES = {"cancelled": "booking_cancelled", "showed_cancelled": "booking_cancelled",
                        "rescheduled": "booking_rescheduled"}
+
+
+SCHEDULING_STATUSES = frozenset({"new", "confirmed", "booked"})
+
+_KNOWN_APPOINTMENT = text("""
+    SELECT booking_ref, person_id, property_address, booked_by FROM lending.booking_messages
+     WHERE provider_event_id = :event_id ORDER BY id LIMIT 1
+""")
 
 
 def _first(body: dict[str, Any], *paths: tuple[str, ...]) -> Optional[str]:
@@ -58,6 +68,8 @@ def ghl_appointment(
     status = (_first(body, ("appointmentStatus",), ("status",), ("appointment", "appointmentStatus")) or "").lower()
     if not appointment_id:
         return {"status": "noop", "reason": "no_appointment_id"}
+    if status in SCHEDULING_STATUSES:
+        return _schedule_from_appointment(db, body, appointment_id)
     reason = CANCELLING_STATUSES.get(status)
     if reason is None:
         return {"status": "noop", "reason": "status_not_handled"}
@@ -65,6 +77,45 @@ def ghl_appointment(
     db.commit()
     logger.info("[booking-webhook] appointment status=%s cancelled=%d", status, cancelled)
     return {"status": status, "cancelled": cancelled}
+
+
+def _schedule_from_appointment(db: Session, body: dict[str, Any], appointment_id: str) -> dict[str, Any]:
+    """The fallback path when the booking flow does not post ``/booking-confirmed``: a caller creates the GHL
+    appointment by hand and this event schedules the confirmation and reminders from what GHL sends (the
+    contact's phone, name and email and the start time). There is no property address, caller or text-consent
+    flag in a GHL event, so the address phrase is dropped, the confirmation call goes to Josh, and a text goes
+    out only if consent was already recorded elsewhere (``has_text_consent``). An appointment the booking flow
+    already scheduled keeps its ``booking_ref``, address and booker, so the two paths never double-schedule."""
+    raw_start = _first(body, ("startTime",), ("appointment", "startTime"), ("calendar", "startTime"))
+    try:
+        slot = datetime.fromisoformat(raw_start.replace("Z", "+00:00")) if raw_start else None
+    except ValueError:
+        slot = None
+    if slot is None or slot.tzinfo is None:
+        logger.warning("[booking-webhook] appointment %s has no usable timezone-aware start time; nothing scheduled",
+                       appointment_id)
+        return {"status": "noop", "reason": "no_start_time"}
+    known = db.execute(_KNOWN_APPOINTMENT, {"event_id": appointment_id}).mappings().first()
+    payload = {
+        "booking_ref": known["booking_ref"] if known else f"ghl-{appointment_id}",
+        "provider_event_id": appointment_id,
+        "person_id": known["person_id"] if known else None,
+        "phone": _first(body, ("phone",), ("contact", "phone")),
+        "first_name": _first(body, ("firstName",), ("contact", "firstName")),
+        "email": _first(body, ("email",), ("contact", "email")),
+        "property_address": known["property_address"] if known else None,
+        "booked_by": known["booked_by"] if known else None,
+        "slot_start_utc": slot,
+    }
+    try:
+        result = handle_booking_confirmed(db, payload)
+        db.commit()
+    except Exception as exc:  # class only: the payload carries a phone number
+        logger.error("[booking-webhook] appointment %s scheduling failed (%s)", appointment_id, type(exc).__name__)
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Could not schedule the booking messages") from None
+    outcome = "skipped" if result.skip_reason else "scheduled" if result.inserted else "duplicate"
+    return {"status": outcome, "inserted": result.inserted, "skip_reason": result.skip_reason}
 
 
 def _parse_booking(body: dict[str, Any]) -> dict[str, Any]:

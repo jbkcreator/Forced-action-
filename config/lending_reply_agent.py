@@ -21,6 +21,14 @@ RATE_TERMS_PHRASES = (
     "down payment", "interest only", "how many points",
 )
 
+# Inbound words that mean the contact wants to move or cancel the booked call. Josh answers these himself
+# (client Oct 4: "I answer reschedules"); the confirmation text invites a reply to reschedule.
+RESCHEDULE_PHRASES = (
+    "reschedule", "re schedule", "another time", "different time", "different day", "other time",
+    "can t make it", "cant make it", "cannot make it", "move our call", "move the call",
+    "push the call", "push it back", "change the time", "change our call", "change the call",
+)
+
 # Outbound (AI reply) patterns that look like a quoted number: money amounts, percentages, "N points".
 QUOTED_NUMBER_PATTERNS = (
     r"\$\s?\d",                                  # $5,000  $ 5k
@@ -32,5 +40,6 @@ QUOTED_NUMBER_PATTERNS = (
 
 SNIPPET_CHARS = 300
 KIND_RATE_TERMS = "rate_terms_handoff"
+KIND_RESCHEDULE = "reschedule_request"
 KIND_AI_HANDOFF = "ai_handoff"
 KIND_AI_QUOTED_NUMBERS = "ai_quoted_numbers"

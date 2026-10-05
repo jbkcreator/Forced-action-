@@ -18,7 +18,7 @@ from config.lending_text_back import MAX_TEXT_CHARS, QUIET_END_HOUR, QUIET_START
 
 TIMEZONE = ZoneInfo("America/New_York")  # same convention as WP-GL-9: one Eastern clock
 
-NIGHT_BEFORE_HOUR_ET = 18  # OPEN QUESTION (A1): developer default, 6:00 PM ET the evening before
+NIGHT_BEFORE_HOUR_ET = 18  # 6:00 PM ET the evening before (Josh, Oct 4 email)
 NIGHT_BEFORE_MINUTE_ET = 0
 NINETY_MIN_SECONDS = 90 * 60
 

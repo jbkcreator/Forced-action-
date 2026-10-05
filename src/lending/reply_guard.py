@@ -25,9 +25,11 @@ from config.lending_reply_agent import (
     KIND_AI_HANDOFF,
     KIND_AI_QUOTED_NUMBERS,
     KIND_RATE_TERMS,
+    KIND_RESCHEDULE,
     QUOTED_NUMBER_PATTERNS,
     RATE_TERMS_PHRASES,
     RATE_TERMS_WORDS,
+    RESCHEDULE_PHRASES,
     SNIPPET_CHARS,
 )
 from config.settings import get_settings
@@ -54,6 +56,12 @@ def asks_rate_or_terms(message: str) -> bool:
     if any(phrase in norm for phrase in RATE_TERMS_PHRASES):
         return True
     return any(word in RATE_TERMS_WORDS for word in _WORDS.findall(message.lower()))
+
+
+def asks_to_reschedule(message: str) -> bool:
+    """True when an inbound message asks to move or cancel the booked call."""
+    norm = _normalized(message)
+    return any(phrase in norm for phrase in RESCHEDULE_PHRASES)
 
 
 def quotes_numbers(reply: str) -> bool:
@@ -108,6 +116,8 @@ def classify(event: ReplyEvent) -> Optional[str]:
         return KIND_AI_QUOTED_NUMBERS if quotes_numbers(event.body) else None
     if asks_rate_or_terms(event.body):
         return KIND_RATE_TERMS
+    if asks_to_reschedule(event.body):
+        return KIND_RESCHEDULE
     return KIND_AI_HANDOFF if event.handoff else None
 
 
@@ -123,6 +133,8 @@ def format_slack(kind: str, event: ReplyEvent) -> str:
     ref = f"\nGHL contact: {_slack_safe(event.contact_id)}" if event.contact_id else ""
     if kind == KIND_RATE_TERMS:
         head = "*Rate / terms question: needs Josh* (reply within one business hour; nothing was quoted)"
+    elif kind == KIND_RESCHEDULE:
+        head = "*Reschedule request: Josh answers* (reply within one business hour; the old reminders stay until the appointment changes in GHL)"
     elif kind == KIND_AI_HANDOFF:
         head = "*The reply agent handed this conversation to Josh*"
     else:
