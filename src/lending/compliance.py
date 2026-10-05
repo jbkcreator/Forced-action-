@@ -603,8 +603,11 @@ def on_attempt_recorded(
         return result
     if _attempt_history_exhausted_phones(db, [normalized], now):
         _flag_nurture(db, [normalized])
-        _remove_from_dialer([normalized], dialer_remover, RemovalReason.ATTEMPT_HISTORY)
-        _close_exhausted_load_row(db, normalized)
+        # Close the row only once the dialer confirmed the removal: the sweep and weekly
+        # job read active rows only, so closing it after a failed removal would leave the
+        # contact dialable with nothing left to retry the removal.
+        if _remove_from_dialer([normalized], dialer_remover, RemovalReason.ATTEMPT_HISTORY):
+            _close_exhausted_load_row(db, normalized)
         return _blocked(normalized, ReasonCode.ATTEMPT_HISTORY_EXCEEDED)
     return result
 
