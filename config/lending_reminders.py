@@ -61,7 +61,8 @@ FALLBACK_ASSIGNEE = "jbkantor@gmail.com"
 KIND_CONFIRMATION = "confirmation"
 KIND_NIGHT_BEFORE = "night_before"
 KIND_NINETY_MIN = "ninety_min"
-ALL_KINDS = (KIND_CONFIRMATION, KIND_NIGHT_BEFORE, KIND_NINETY_MIN)
+KIND_GATE_FAIL = "gate_fail"
+ALL_KINDS = (KIND_CONFIRMATION, KIND_NIGHT_BEFORE, KIND_NINETY_MIN, KIND_GATE_FAIL)
 
 # ── Approved text templates (B3, Josh Oct 2) ────────────────────────────────
 
@@ -109,6 +110,22 @@ EMAIL_FROM_NAME = "Next Deal Lending"
 EMAIL_SUBJECT_CONFIRMATION = "Your call with Josh is confirmed"
 EMAIL_SUBJECT_NIGHT_BEFORE = "Reminder: your call with Josh is tomorrow"
 EMAIL_SUBJECT_NINETY_MIN = "Your call with Josh starts in 90 minutes"
+EMAIL_SUBJECT_GATE_FAIL = "Your call with Next Deal Lending"
+
+# Sent when the caller's check does not pass for a call the AI booked (client Oct 4, "approved as written"):
+# the contact already got "confirming your call", so they are told once, kindly, that no call is coming. The
+# slot is released and the contact moved to nurture by the booking flow (WP-GL-5); GL-10 cancels the reminders
+# and sends this. No STOP language: it is a service message, not a promotion.
+GATE_FAIL_TEXT = (
+    "Hi {first_name}, this is Next Deal Lending. We're not able to hold the call we mentioned. "
+    "Thanks for your interest, and we'll be in touch if anything changes."
+)
+EMAIL_GATE_FAIL = (
+    "Hi {first_name},\n\n"
+    "This is Next Deal Lending. We're not able to hold the call we mentioned. "
+    "Thanks for your interest, and we'll be in touch if anything changes.\n\n"
+    "Next Deal Lending\nhello@nextdeallending.com"
+)
 
 # Email bodies mirror the text templates; no STOP language (email uses
 # unsubscribe links per CAN-SPAM, handled by the email sender).

@@ -42,11 +42,15 @@ from config.lending_reminders import (
     EMAIL_NIGHT_BEFORE_NO_ADDRESS,
     EMAIL_NIGHT_BEFORE_WITH_ADDRESS,
     EMAIL_NINETY_MIN_NO_ADDRESS,
+    EMAIL_GATE_FAIL,
     EMAIL_NINETY_MIN_WITH_ADDRESS,
+    EMAIL_SUBJECT_GATE_FAIL,
     EMAIL_SUBJECT_CONFIRMATION,
     EMAIL_SUBJECT_NIGHT_BEFORE,
     EMAIL_SUBJECT_NINETY_MIN,
+    GATE_FAIL_TEXT,
     KIND_CONFIRMATION,
+    KIND_GATE_FAIL,
     KIND_NIGHT_BEFORE,
     KIND_NINETY_MIN,
     MAX_TEXT_CHARS,
@@ -65,6 +69,7 @@ from config.lending_reminders import (
     TIMEZONE,
 )
 from src.lending.compliance import phone_hash
+from src.lending.confirmation_tasks import AI_BOOKER
 from src.lending.consent import record_consent
 from src.lending.text_back import first_name_of
 from src.services.phone_utils import normalize as normalize_phone
@@ -138,7 +143,7 @@ def handle_booking_confirmed(db, payload: Mapping[str, Any], *, now: Optional[da
     A booking with no resolvable person or no phone/email still gets its rows, recorded as skipped
     with the reason, so the gap is visible instead of silent.
     """
-    from src.lending.confirmation_tasks import AI_BOOKER, assign_confirmation_task
+    from src.lending.confirmation_tasks import assign_confirmation_task
 
     now = now or datetime.now(timezone.utc)
     booking_ref = str(payload["booking_ref"])
@@ -219,6 +224,43 @@ def cancel_by_provider_event(db, provider_event_id: str, reason: str) -> int:
     return n
 
 
+_BOOKING_CONTACT = text("""
+    SELECT person_id, first_name, contact_phone, contact_email, property_address, slot_start_utc, booked_by,
+           provider_event_id
+      FROM lending.booking_messages WHERE booking_ref = :ref ORDER BY id LIMIT 1
+""")
+
+
+def handle_booking_gate_failed(db, booking_ref: str, *, now: Optional[datetime] = None) -> str:
+    """The caller's check did not pass for an AI-booked call: cancel its pending reminders and queue the one
+    "we can't hold the call" message to the contact (text if they consented, email otherwise; the worker applies
+    the same suppression / consent / window gates as every other message). Returns "queued", "duplicate",
+    "unknown_booking" or "not_ai_booked". Idempotent per booking. Does not commit.
+
+    Releasing the calendar slot and moving the contact to nurture belong to the booking flow (WP-GL-5)."""
+    now = now or datetime.now(timezone.utc)
+    contact = db.execute(_BOOKING_CONTACT, {"ref": booking_ref}).mappings().first()
+    if contact is None:
+        logger.warning("[booking-messages] gate failed for unknown booking_ref=%s; nothing sent", booking_ref)
+        return "unknown_booking"
+    if contact["booked_by"] not in (None, AI_BOOKER):
+        logger.warning("[booking-messages] booking_ref=%s was booked by a caller; gate-fail message not sent", booking_ref)
+        return "not_ai_booked"
+    cancel_by_booking_ref(db, booking_ref, "gate_failed")
+    skip = None if contact["contact_phone"] or contact["contact_email"] else "no_contact_method"
+    row = {
+        "booking_ref": booking_ref, "provider_event_id": contact["provider_event_id"], "person_id": contact["person_id"],
+        "kind": KIND_GATE_FAIL, "send_at": now, "status": STATUS_SKIPPED if skip else STATUS_PENDING,
+        "skip_reason": skip, "first_name": contact["first_name"], "contact_phone": contact["contact_phone"],
+        "contact_email": contact["contact_email"], "property_address": contact["property_address"],
+        "slot_start_utc": contact["slot_start_utc"], "booked_by": contact["booked_by"],
+    }
+    queued = db.execute(_INSERT, row).rowcount
+    logger.info("[booking-messages] booking_ref=%s gate failed; gate_fail message %s", booking_ref,
+                "queued" if queued else "already queued")
+    return "queued" if queued else "duplicate"
+
+
 def cancel_by_booking_ref(db, booking_ref: str, reason: str) -> int:
     n = db.execute(_CANCEL_BY_REF, {"ref": booking_ref, "reason": reason}).rowcount
     db.execute(_CANCEL_TASK_BY_REF, {"ref": booking_ref})
@@ -285,14 +327,17 @@ _TEXT = {
     KIND_CONFIRMATION: (CONFIRMATION_NO_ADDRESS, CONFIRMATION_WITH_ADDRESS),
     KIND_NIGHT_BEFORE: (NIGHT_BEFORE_NO_ADDRESS, NIGHT_BEFORE_WITH_ADDRESS),
     KIND_NINETY_MIN: (NINETY_MIN_NO_ADDRESS, NINETY_MIN_WITH_ADDRESS),
+    KIND_GATE_FAIL: (GATE_FAIL_TEXT, GATE_FAIL_TEXT),
 }
 _EMAIL = {
     KIND_CONFIRMATION: (EMAIL_CONFIRMATION_NO_ADDRESS, EMAIL_CONFIRMATION_WITH_ADDRESS),
     KIND_NIGHT_BEFORE: (EMAIL_NIGHT_BEFORE_NO_ADDRESS, EMAIL_NIGHT_BEFORE_WITH_ADDRESS),
     KIND_NINETY_MIN: (EMAIL_NINETY_MIN_NO_ADDRESS, EMAIL_NINETY_MIN_WITH_ADDRESS),
+    KIND_GATE_FAIL: (EMAIL_GATE_FAIL, EMAIL_GATE_FAIL),
 }
 _EMAIL_SUBJECT = {
     KIND_CONFIRMATION: EMAIL_SUBJECT_CONFIRMATION,
     KIND_NIGHT_BEFORE: EMAIL_SUBJECT_NIGHT_BEFORE,
     KIND_NINETY_MIN: EMAIL_SUBJECT_NINETY_MIN,
+    KIND_GATE_FAIL: EMAIL_SUBJECT_GATE_FAIL,
 }

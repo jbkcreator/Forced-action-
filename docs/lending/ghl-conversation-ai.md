@@ -62,6 +62,10 @@ confirmed by Josh, Oct 4), reminder 90 minutes before. Wording is the client-app
 
 A confirmed booking reaches the scheduler through `POST /webhooks/lending/booking-confirmed` (header `X-Webhook-Secret`, payload documented in `src/lending/booking_messages.py`; idempotent per `booking_ref`). Open: the GL-5 owner must call it when a booking is confirmed. Confirmation calls due are posted at 9am ET to `LENDING_DIAL_TASKS_CHANNEL` by `src.tasks.lending_confirmation_tasks`.
 
+## Failed caller check on an AI-booked call
+
+Josh approved (Oct 4): release the slot, send the contact one short message (text if they consented, email otherwise), move them to nurture, cancel their reminders. GL-10 does the message and the reminder cancel via `POST /webhooks/lending/booking-gate-failed` (`{"booking_ref": ...}`, same secret); GL-5 must call it and do the slot release and the nurture move. Wording: `GATE_FAIL_TEXT` in `config/lending_reminders.py`. Email waits on the email sender.
+
 ## Done-when checks (use a consented test contact)
 
 1. Reply "Thursday works" -> the agent answers within seconds and offers a slot.

@@ -61,6 +61,9 @@ def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
             sent_at             timestamptz,
             CONSTRAINT uq_lending_booking_messages_ref_kind UNIQUE (booking_ref, kind)
         )""",
+        # an already-migrated table has the old kind CHECK: widen it to include gate_fail
+        f"ALTER TABLE {messages} DROP CONSTRAINT IF EXISTS booking_messages_kind_check",
+        f"ALTER TABLE {messages} ADD CONSTRAINT booking_messages_kind_check CHECK (kind IN ({_in(ALL_KINDS)}))",
         f"CREATE INDEX IF NOT EXISTS ix_lending_booking_messages_due ON {messages} (send_at) WHERE status = 'pending'",
         f"CREATE INDEX IF NOT EXISTS ix_lending_booking_messages_stale ON {messages} (decided_at) WHERE status = 'sending'",
         f"CREATE INDEX IF NOT EXISTS ix_lending_booking_messages_event ON {messages} (provider_event_id) "

@@ -28,7 +28,7 @@ from sqlalchemy.orm import Session
 
 from src.api.deps import get_db
 from src.api.lending_ghl_router import _verify_secret
-from src.lending.booking_messages import cancel_by_provider_event, handle_booking_confirmed
+from src.lending.booking_messages import cancel_by_provider_event, handle_booking_confirmed, handle_booking_gate_failed
 from src.lending.confirmation_tasks import complete_confirmation_task
 
 logger = logging.getLogger(__name__)
@@ -172,3 +172,26 @@ def confirmation_task_complete(
     completed = complete_confirmation_task(db, booking_ref)
     db.commit()
     return {"status": "completed" if completed else "no_open_task"}
+
+
+@router.post("/booking-gate-failed")
+def booking_gate_failed(
+    body: dict[str, Any],
+    x_webhook_secret: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """The caller's check did not pass for an AI-booked call: cancel its reminders and send the contact the one
+    "we can't hold the call" message. The booking flow (WP-GL-5) posts here when it releases the slot and moves
+    the contact to nurture. Idempotent per ``booking_ref``."""
+    _verify_secret(x_webhook_secret)
+    booking_ref = str(body.get("booking_ref") or "").strip()
+    if not booking_ref:
+        raise HTTPException(status_code=422, detail="booking_ref is required")
+    try:
+        outcome = handle_booking_gate_failed(db, booking_ref)
+        db.commit()
+    except Exception as exc:
+        logger.error("[booking-webhook] booking_ref=%s gate-fail handling failed (%s)", booking_ref, type(exc).__name__)
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Could not process the gate failure") from None
+    return {"status": outcome}
