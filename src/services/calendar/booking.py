@@ -159,11 +159,6 @@ def book(
         logger.info("calendar.book: refused — gate_id=%s not passed or list blocked", gate_id)
         return BookingResult(booked=False, reason="gate_not_passed")
 
-    # Daily cap — advisory lock serialises concurrent requests.
-    if not enforce_daily_cap(session):
-        logger.info("calendar.book: refused — daily cap reached")
-        return BookingResult(booked=False, reason="daily_cap_reached")
-
     suppression = check_suppression(
         recipient=attendee_email, channel="email", session=session
     )
@@ -176,10 +171,21 @@ def book(
             booked=False, reason="suppressed", detail=suppression["reason"]
         )
 
+    # A retried request for an already-claimed slot must replay the original
+    # outcome, not get refused on the cap — the agent loop re-runs steps by
+    # design, and a replay must never look like a fresh failure. Checked
+    # before the cap for that reason.
     key = _idempotency_key(calendar_id, slot, attendee_email)
     replay = _existing_booking(session, key)
     if replay is not None:
         return replay
+
+    # Daily cap — advisory lock serialises concurrent requests. Checked
+    # against the calendar day slot.start falls on, not the day the request
+    # happens to arrive.
+    if not enforce_daily_cap(session, slot.start):
+        logger.info("calendar.book: refused — daily cap reached")
+        return BookingResult(booked=False, reason="daily_cap_reached")
 
     if _is_taken(client=client, calendar_id=calendar_id, slot=slot):
         logger.info("calendar.book: refused — slot taken since it was offered")

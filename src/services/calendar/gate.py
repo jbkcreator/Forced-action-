@@ -18,11 +18,13 @@ from __future__ import annotations
 import logging
 import secrets
 from dataclasses import dataclass
-from datetime import date, timedelta, timezone
+from datetime import date, datetime, timedelta
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import text as sa_text
 
+from config.calendar import CALENDAR_TIMEZONE
 from config.booking_gate import (
     BLOCKED_LIST_KEYS,
     CALENDAR_DAILY_CAP,
@@ -145,7 +147,7 @@ def store_gate(
                 (gate_id, tracked_link_id, person_id, answers, result,
                  failed_field, list_key, rules_version, captured_by, evaluated_at)
             VALUES
-                (:gate_id, :tracked_link_id, :person_id, :answers::jsonb, :result,
+                (:gate_id, :tracked_link_id, :person_id, CAST(:answers AS jsonb), :result,
                  :failed_field, :list_key, :rules_version, :captured_by, NOW())
             """
         ),
@@ -185,7 +187,13 @@ def store_gate(
 
 
 def get_passed_gate_for_link(session, tracked_link_id: int) -> Optional[str]:
-    """Return the gate_id of the most-recent passing gate for a tracked link.
+    """Return the gate_id of the link's gate, if its most recent attempt passed.
+
+    Takes the single latest row for the link regardless of result, then
+    requires that row to be a pass — a stale pass from an earlier call must
+    never outrank a later re-screening that failed (e.g. a second call
+    discovers the property is a homestead). Filtering on result='pass' before
+    ordering would let an old pass win over a fresh disqualification.
 
     Also enforces the list-block: a passed gate whose list_key is currently
     blocked (BLOCKED_LIST_KEYS, not yet unblocked by GATE_LIST_UNBLOCK_DATE)
@@ -196,10 +204,9 @@ def get_passed_gate_for_link(session, tracked_link_id: int) -> Optional[str]:
     row = session.execute(
         sa_text(
             """
-            SELECT gate_id, list_key
+            SELECT gate_id, list_key, result
             FROM fa_max_booking_gates
             WHERE tracked_link_id = :link_id
-              AND result = 'pass'
             ORDER BY evaluated_at DESC
             LIMIT 1
             """
@@ -207,7 +214,7 @@ def get_passed_gate_for_link(session, tracked_link_id: int) -> Optional[str]:
         {"link_id": tracked_link_id},
     ).mappings().first()
 
-    if row is None:
+    if row is None or row["result"] != "pass":
         return None
 
     if _is_list_blocked(row["list_key"]):
@@ -246,8 +253,14 @@ def _is_list_blocked(list_key: Optional[str]) -> bool:
     return date.today() < GATE_LIST_UNBLOCK_DATE
 
 
-def enforce_daily_cap(session) -> bool:
-    """Returns True if there is still capacity for another booking today.
+def enforce_daily_cap(session, slot_start: datetime) -> bool:
+    """Returns True if the calendar day *slot_start* falls on still has capacity.
+
+    The cap is per calendar day of the booking being made, not per day the
+    request happens to arrive — a booking for next Tuesday must be checked
+    against next Tuesday's count, not today's. The day boundary is computed
+    in CALENDAR_TIMEZONE (the business's wall-clock day), not UTC, so it
+    doesn't shift at the wrong moment relative to "6 to 8 held calls a day."
 
     Uses pg_advisory_xact_lock so concurrent requests serialize rather than
     racing. Counts 'pending' and 'confirmed' bookings only — cancelled slots
@@ -261,27 +274,27 @@ def enforce_daily_cap(session) -> bool:
         {"key": DAILY_CAP_ADVISORY_KEY},
     )
 
-    today_start = _today_utc_start()
-    tomorrow_start = today_start + timedelta(days=1)
+    day_start, day_end = _calendar_day_bounds(slot_start)
     count_row = session.execute(
         sa_text(
             """
             SELECT COUNT(*) AS n
             FROM fa_max_bookings
-            WHERE starts_at >= :today
-              AND starts_at < :tomorrow
+            WHERE starts_at >= :day_start
+              AND starts_at < :day_end
               AND status IN ('pending', 'confirmed')
             """
         ),
-        {"today": today_start, "tomorrow": tomorrow_start},
+        {"day_start": day_start, "day_end": day_end},
     ).mappings().first()
 
     held = count_row["n"] if count_row else 0
     return held < CALENDAR_DAILY_CAP
 
 
-def _today_utc_start():
-    from datetime import datetime
-
-    today = date.today()
-    return datetime(today.year, today.month, today.day, tzinfo=timezone.utc)
+def _calendar_day_bounds(moment: datetime) -> tuple[datetime, datetime]:
+    """[start, end) of *moment*'s calendar day in CALENDAR_TIMEZONE, as UTC-aware bounds."""
+    tz = ZoneInfo(CALENDAR_TIMEZONE)
+    local_date = moment.astimezone(tz).date()
+    local_start = datetime(local_date.year, local_date.month, local_date.day, tzinfo=tz)
+    return local_start, local_start + timedelta(days=1)

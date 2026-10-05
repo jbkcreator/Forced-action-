@@ -42,10 +42,17 @@ def _calendar_configured():
     # router imported the name, so patching src.core.redis_client leaves the
     # bound reference pointing at the real counter — which is shared, and
     # would trip the rate limit partway through the suite.
+    #
+    # get_passed_gate_for_link defaults to a passing gate: none of these
+    # tests are exercising the gate itself, and a bare MagicMock() db session
+    # must not be allowed to decide that question by what a mocked row's
+    # truthiness happens to do. A test that specifically wants a failed/
+    # missing gate overrides this patch locally.
     with patch("src.api.booking_router.get_calendar_client", return_value=FakeCalendar()), \
          patch("src.api.booking_router.get_calendar_id", return_value=CALENDAR_ID), \
          patch("src.api.booking_router.record_click"), \
          patch("src.api.booking_router.has_live_booking", return_value=False), \
+         patch("src.api.booking_router.get_passed_gate_for_link", return_value="test_gate_id"), \
          patch("src.api.booking_router.rincr", return_value=1):
         yield
 

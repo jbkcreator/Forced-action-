@@ -271,6 +271,48 @@ def gate_db(fresh_db):
     return fresh_db
 
 
+class TestStoreGateCompilesWithoutDatabase:
+    """Review finding: `:answers::jsonb` inside sa_text() is not a bind
+    parameter to SQLAlchemy — it's a literal cast suffix glued onto a name
+    that never matches `:answers`, so the param silently drops and Postgres
+    receives the literal text `:answers::jsonb`. Catches that class of bug
+    without needing a real database: every param store_gate's INSERT passes
+    must actually appear, bound, in the compiled statement.
+    """
+
+    def test_every_bound_param_survives_compilation(self):
+        from sqlalchemy.dialects import postgresql
+        import src.services.calendar.gate as gate_module
+
+        captured = {}
+
+        class _CapturingSession:
+            def execute(self, stmt, params=None):
+                captured["stmt"] = stmt
+                captured["params"] = params
+                result = MagicMock()
+                result.mappings.return_value.first.return_value = None
+                return result
+
+            def commit(self):
+                pass
+
+        with _no_real_alert():
+            gate_module.store_gate(
+                _CapturingSession(),
+                answers=_passing_answers(),
+                tracked_link_id=1,
+                captured_by="test_caller",
+            )
+
+        compiled = captured["stmt"].compile(dialect=postgresql.dialect())
+        for key in captured["params"]:
+            assert key in compiled.params, (
+                f"param {key!r} was passed to execute() but dropped by "
+                f"compilation — likely a `:{key}::cast` literal-cast bug"
+            )
+
+
 @pytest.mark.integration
 class TestStoreGateIntegration:
     def test_passing_gate_is_stored_and_retrievable(self, gate_db):
@@ -363,6 +405,50 @@ class TestStoreGateIntegration:
             {"g": gate_id},
         ).mappings().first()
         assert nrow is None
+
+    def test_a_later_fail_invalidates_an_earlier_pass_on_the_same_link(self, gate_db):
+        """Review finding: get_passed_gate_for_link must not let a stale pass
+        outrank a fresh re-screening that failed on the same tracked_link."""
+        from src.services.calendar.gate import get_passed_gate_for_link, store_gate
+
+        link_id = 919191  # arbitrary — no FK on tracked_link_id in this table
+
+        with _no_real_alert():
+            store_gate(
+                gate_db,
+                answers=_passing_answers(),
+                tracked_link_id=link_id,
+                captured_by="test_caller",
+            )
+            store_gate(
+                gate_db,
+                answers=_passing_answers(occupancy="homestead"),
+                tracked_link_id=link_id,
+                captured_by="test_caller",
+            )
+
+        assert get_passed_gate_for_link(gate_db, link_id) is None
+
+    def test_a_later_pass_is_found_after_an_earlier_fail(self, gate_db):
+        from src.services.calendar.gate import get_passed_gate_for_link, store_gate
+
+        link_id = 919192
+
+        with _no_real_alert():
+            store_gate(
+                gate_db,
+                answers=_passing_answers(occupancy="homestead"),
+                tracked_link_id=link_id,
+                captured_by="test_caller",
+            )
+            gate_id, _ = store_gate(
+                gate_db,
+                answers=_passing_answers(),
+                tracked_link_id=link_id,
+                captured_by="test_caller",
+            )
+
+        assert get_passed_gate_for_link(gate_db, link_id) == gate_id
 
 
 # ---------------------------------------------------------------------------
@@ -482,7 +568,7 @@ class TestDailyCapBoundary:
         session.execute.return_value.mappings.return_value.first.return_value = {
             "n": current_held
         }
-        return enforce_daily_cap(session)
+        return enforce_daily_cap(session, datetime(2026, 10, 5, 14, 0, tzinfo=ET))
 
     def test_zero_held_allows_booking(self):
         assert self._run_cap_check(0) is True
@@ -496,11 +582,41 @@ class TestDailyCapBoundary:
     def test_cap_plus_one_blocks_booking(self):
         assert self._run_cap_check(CALENDAR_DAILY_CAP + 1) is False
 
+    def test_queries_the_day_slot_start_falls_on_not_the_current_day(self):
+        """Review finding: enforce_daily_cap must count the calendar day being
+        booked, not whatever day the request happens to arrive on."""
+        from src.services.calendar.gate import enforce_daily_cap
+
+        session = MagicMock()
+        session.execute.return_value.mappings.return_value.first.return_value = {"n": 0}
+
+        future_slot_start = datetime(2026, 12, 25, 14, 0, tzinfo=ET)
+        enforce_daily_cap(session, future_slot_start)
+
+        # The second execute() call is the COUNT query (the first is the
+        # advisory lock) — its bound day_start must be Dec 25, not today.
+        count_call_params = session.execute.call_args_list[1].args[1]
+        assert count_call_params["day_start"].date() == future_slot_start.date()
+
+    def test_day_boundary_uses_calendar_timezone_not_utc(self):
+        """11pm ET and the next UTC day must not be treated as different
+        calendar days — the cap is a wall-clock-day concept in CALENDAR_TIMEZONE."""
+        from src.services.calendar.gate import _calendar_day_bounds
+
+        late_et = datetime(2026, 10, 5, 23, 30, tzinfo=ET)  # 2026-10-06 03:30 UTC
+        start, end = _calendar_day_bounds(late_et)
+        assert start.astimezone(ET).date() == late_et.date()
+        assert end == start + timedelta(days=1)
+
     def test_book_refuses_at_daily_cap(self):
         from src.services.calendar.booking import book
         from src.services.calendar import FakeCalendar
 
         session = MagicMock()
+        # No existing booking for this idempotency key — the replay check
+        # (which now runs before the cap check) must see None, not a
+        # MagicMock row, or it would short-circuit with a bogus replay.
+        session.execute.return_value.mappings.return_value.first.return_value = None
         fake_gate_row = {"gate_id": "g_cap", "list_key": None, "result": "pass"}
 
         with (
