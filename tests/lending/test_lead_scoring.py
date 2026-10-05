@@ -52,8 +52,18 @@ def test_known_maturity_outside_the_window_does_not_count():
     assert _score(replace(TOP, maturity_date=Signal.known(date(2027, 6, 1)))).rank == 7
 
 
-def test_estimated_equity_does_not_count():
-    assert _score(replace(TOP, equity_pct=Signal.estimated(Decimal("60")))).rank == 7
+def test_estimated_equity_above_the_threshold_counts():
+    score = _score(replace(TOP, equity_pct=Signal.estimated(Decimal("60"))))
+    assert score.rank == 10
+    assert score.labels["equity_pct"] == "estimated"
+
+
+def test_estimated_equity_at_the_threshold_does_not_count():
+    assert _score(replace(TOP, equity_pct=Signal.estimated(Decimal("35")))).rank == 7
+
+
+def test_missing_equity_does_not_count():
+    assert _score(replace(TOP, equity_pct=Signal.missing())).rank == 7
 
 
 def test_equity_must_be_above_the_threshold():

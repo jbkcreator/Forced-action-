@@ -2,7 +2,7 @@
 
 Pure functions over explicit inputs: no clock, no database. Every input
 carries a provenance label (known, estimated, missing), and only a known input
-can earn rank. An estimated maturity inside the window never counts as a
+can earn rank, except equity, which counts when estimated. An estimated maturity inside the window never counts as a
 deadline; it becomes a question for the caller instead.
 """
 from __future__ import annotations
@@ -99,7 +99,9 @@ def _core_signals_met(signals: LeadSignals, today: date) -> tuple[str, ...]:
         met.append("maturity_within_window")
     if signals.entity_status.is_known and signals.entity_status.value == SUNBIZ_GOOD_STANDING:
         met.append("entity_in_good_standing")
-    if signals.equity_pct.is_known and signals.equity_pct.value > EQUITY_THRESHOLD_PCT:
+    # Equity counts known or estimated: every database equity figure rests on an estimated
+    # mortgage balance, so requiring "known" would make rank 10 unreachable.
+    if signals.equity_pct.value is not None and signals.equity_pct.value > EQUITY_THRESHOLD_PCT:
         met.append("equity_above_threshold")
     if signals.decision_maker_confirmed.is_known and signals.decision_maker_confirmed.value:
         met.append("decision_maker_confirmed")

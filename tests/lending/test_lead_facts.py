@@ -6,7 +6,7 @@ from decimal import Decimal
 from unittest.mock import MagicMock
 
 from src.lending.lead_facts import _signals_from_row, load_lead_facts, parse_maturity
-from src.lending.lead_scoring import Provenance
+from src.lending.lead_scoring import Provenance, score_lead
 
 ROW = {
     "property_id": 7, "property_address": "1 Test St", "entity_status": "ACTIVE",
@@ -33,6 +33,13 @@ def test_row_provenance():
     assert signals.entity_status.value == "ACTIVE" and signals.entity_status.is_known
     assert signals.entity_property_count.value == 3
     assert signals.decision_maker_confirmed.provenance is Provenance.MISSING
+
+
+def test_database_row_meeting_all_four_signals_is_rank_ten():
+    today = date(2026, 10, 5)
+    row = {**ROW, "equity_pct": Decimal("40"), "confirmed_maturity_date": date(2026, 11, 20),
+           "decision_maker_on_call": True}
+    assert score_lead(_signals_from_row(row), today=today).rank == 10
 
 
 def test_unmatched_sunbiz_owner_has_no_entity_status():

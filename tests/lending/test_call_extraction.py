@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import date
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from pydantic import ValidationError
@@ -72,6 +72,18 @@ def test_empty_transcript_skips_the_model():
 def test_blocked_model_call_raises_instead_of_storing_empty():
     with pytest.raises(RuntimeError):
         _extract(None)
+
+
+def test_vendor_cost_pause_blocks_extraction_before_any_model_call():
+    db = MagicMock()
+    pause = MagicMock(reason="cost spike")
+    with patch("src.services.claude_router.get_active_pause", return_value=pause) as get_pause, \
+            patch("src.services.claude_router._log_usage"), \
+            patch("src.services.claude_router._build_client") as build_client:
+        with pytest.raises(RuntimeError):
+            extract_call_fields(TRANSCRIPT, today=TODAY, db=db)
+    get_pause.assert_called_once_with(db, "claude", EXTRACTION_TASK_TYPE)
+    build_client.return_value.messages.create.assert_not_called()
 
 
 def test_qualification_fields_are_extracted():
