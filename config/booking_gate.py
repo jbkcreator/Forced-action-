@@ -16,24 +16,12 @@ check. It is stored as the enum below, not a number — this keeps it
 structurally the same shape as every other gate field (a short code, never
 a financial record) rather than a credit-score column.
 
-Per Josh's Oct 4 email §2, only List 4 (brokers and LOs) is meant to be
-blocked from booking; List 2 (cash buyers) moved out of nurture into an
-active dial rank and is no longer blocked.
-
-The list-to-pool tagging mechanism this depends on exists (PR #318): every
-staged lending record carries its list_key as `source_tag`
-(src/services/lending/pool_extraction.py:source_tag_for(),
-lending.calling_pool_staging.source_tag, documented in
-lending.list_catalog). What still has to happen per booking is supplying
-`list_key` on the gate submission itself (POST /api/fa-max/gates — see
-src/api/fa_max_router.py) — `tracked_link_id`/`person_id` (the self-serve
-pre-fill flow's own identity) have no FK or join path to
-lending.calling_pool_staging today, so this can't be resolved by a
-server-side lookup. It is caller-supplied, the same way every other gate
-field already is: the dialer card shown to the caller already carries the
-contact's campaign/list, so whatever UI or script submits a lending
-booking's gate must include that list_key in the payload, same as
-experience/credit/deal_status/etc.
+Open: BLOCKED_LIST_KEYS must be populated once the list-to-pool tagging
+mechanism exists — nothing in the pipeline yet tags a lead/booking with
+which numbered list it came from (see src/services/calendar/gate.py's
+module docstring). Per Josh's Oct 4 email §2, only List 4 (brokers and
+LOs) is meant to be blocked from booking; List 2 (cash buyers) moved out
+of nurture into an active dial rank and is no longer blocked.
 """
 import os
 from datetime import date
@@ -85,12 +73,11 @@ CREDIT_BAND_QUALIFYING_VALUES: FrozenSet[str] = frozenset({"at_or_above_640"})
 # Pool / list blocking.
 # Per Josh's Oct 4 email §2: only List 4 (brokers/LOs) blocks from booking.
 # List 2 (cash buyers) moved to an active dial rank and is not blocked.
-# Real, not a no-op: PR #318 tags every staged lending record's source_tag
-# (list_1..list_9); this only blocks a gate submission whose caller-supplied
-# list_key (see module docstring) matches one of these keys.
+# Still empty: no code yet tags a lead/booking with its source list, so
+# populating this with a guessed key would be a no-op, not a real block.
 # ---------------------------------------------------------------------------
 
-BLOCKED_LIST_KEYS: FrozenSet[str] = frozenset({"list_4"})
+BLOCKED_LIST_KEYS: FrozenSet[str] = frozenset()
 
 # ISO date string — gate blocks bookings from BLOCKED_LIST_KEYS until this date.
 # Value chosen as December 1 2026; update via env var GATE_LIST_UNBLOCK_DATE
