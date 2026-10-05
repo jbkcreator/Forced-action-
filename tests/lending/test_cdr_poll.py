@@ -67,6 +67,14 @@ def test_other_campaigns_and_inbound_calls_are_ignored(lending_db):
     assert [r[0] for r in _rows(lending_db)] == ["3"] and stats.processed == 1
 
 
+def test_dnc_on_a_non_lending_campaign_is_not_stored_but_warned(lending_db, caplog):
+    http = FakeHttp(last=[_cdr(1, campaign={"id": 999}, disposition="DNC_REQUEST"), _cdr(2, campaign={"id": 999})])
+    with caplog.at_level("WARNING"):
+        stats = cdr_poll.poll_new(lending_db, http)
+    assert _rows(lending_db) == [] and stats.processed == 0
+    assert "DNC request on CDR 1 ignored" in caplog.text and "CDR 2" not in caplog.text
+
+
 def test_one_bad_cdr_does_not_stop_the_batch(lending_db, monkeypatch):
     real = cdr_poll.process_event
 
