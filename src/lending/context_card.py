@@ -96,7 +96,12 @@ def build_context_card(
     hook: Optional[str] = None,
     prior_contact: Optional[str] = None,
 ) -> ContextCard:
-    """Render the card for one lead. ``prior_contact`` is a one-line summary of earlier calls."""
+    """Render the card for one lead.
+
+    ``prior_contact`` is a one-line summary of earlier calls; pass ``NO_PRIOR_CONTACT``
+    only when the call history was read and is empty. ``None`` means the history is
+    unknown and shows as not available, never as "no prior contact".
+    """
     signals = facts.signals
     fields = {
         "first_name": _text(first_name),
@@ -109,7 +114,7 @@ def build_context_card(
         "maturity": _maturity(signals.maturity_date),
         "permits": _text(facts.latest_permit),
         "equity": _equity(signals.equity_pct),
-        "prior_contact": _text(prior_contact) if prior_contact else NO_PRIOR_CONTACT,
+        "prior_contact": _text(prior_contact),
         "score": f"{score.rank}/10",
     }
     if score.caller_questions:

@@ -1,14 +1,16 @@
 """Context card sent to BatchDialer, vendor id kept on reload, and call transcripts."""
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from src.lending import dialer_load
+from src.lending.context_card import NO_PRIOR_CONTACT
 from src.lending.dialer_contact import display_from_record
+from src.lending.dialer_display import NOT_AVAILABLE
 from src.lending.dialer_load import _cards, _Loadable, _push_contact
 from src.lending.dialer_port import BatchDialerAdapter, DialerContactFields, DialerRequestError, _contact_body
 from src.lending.lead_facts import LeadFacts
@@ -65,6 +67,41 @@ class TestCardsForALoad:
     def test_facts_failure_loads_without_cards(self):
         with patch.object(dialer_load, "load_lead_facts", side_effect=RuntimeError("db")):
             assert _cards(MagicMock(), [_item()]) == {}
+
+
+def _history_db(rows):
+    db = MagicMock()
+    db.execute.return_value.mappings.return_value.all.return_value = rows
+    return db
+
+
+class TestPriorContact:
+    def test_reloaded_phone_with_logged_calls_shows_its_history(self):
+        db = _history_db([{"phone": RECORD["phone"], "calls": 2, "last_disposition": "callback_requested",
+                           "last_ended": datetime(2026, 10, 2, 1, 30, tzinfo=timezone.utc)}])
+        with patch.object(dialer_load, "load_lead_facts", return_value={}):
+            card = _cards(db, [_item()])["staging:11"]
+        assert card["prior_contact"] == "2 calls, last 2026-10-01; last outcome: callback requested"
+        assert db.execute.call_args.args[1] == {"phones": [RECORD["phone"]]}
+
+    def test_call_without_a_disposition_omits_the_outcome(self):
+        db = _history_db([{"phone": RECORD["phone"], "calls": 1, "last_disposition": None,
+                           "last_ended": datetime(2026, 10, 3, 15, 0, tzinfo=timezone.utc)}])
+        with patch.object(dialer_load, "load_lead_facts", return_value={}):
+            card = _cards(db, [_item()])["staging:11"]
+        assert card["prior_contact"] == "1 call, last 2026-10-03"
+
+    def test_phone_never_called_shows_no_prior_contact(self):
+        with patch.object(dialer_load, "load_lead_facts", return_value={}):
+            card = _cards(_history_db([]), [_item()])["staging:11"]
+        assert card["prior_contact"] == NO_PRIOR_CONTACT
+
+    def test_unreadable_history_is_not_available_never_no_prior_contact(self):
+        db = MagicMock()
+        db.execute.side_effect = RuntimeError("db")
+        with patch.object(dialer_load, "load_lead_facts", return_value={}):
+            card = _cards(db, [_item()])["staging:11"]
+        assert card["prior_contact"] == NOT_AVAILABLE
 
 
 class TestReloadKeepsTheVendorId:

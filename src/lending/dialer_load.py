@@ -38,7 +38,7 @@ from src.lending.backflip_conflict import (
 from src.lending.compliance import GateResult, Scrubber, dial_blocks, filter_loadable, phone_hash
 from src.lending.dialer_contact import DialerDisplay, dialer_fields, display_from_record
 from src.lending.dialer_port import ContactUpsertResult, DialerContactFields, DialerRequestError
-from src.lending.context_card import build_context_card
+from src.lending.context_card import NO_PRIOR_CONTACT, build_context_card
 from src.lending.lead_facts import LeadFacts, load_lead_facts
 from src.lending.lead_scoring import LeadSignals, score_lead
 from src.services.phone_utils import normalize as normalize_phone
@@ -259,12 +259,49 @@ def _first_name(borrower_name: Optional[str]) -> Optional[str]:
     return parts[0] if parts else None
 
 
+def _prior_contact_line(calls: int, last_ended: datetime, last_disposition: Optional[str]) -> str:
+    line = f"{calls} call{'s' if calls != 1 else ''}, last {last_ended.astimezone(CARD_TIMEZONE):%Y-%m-%d}"
+    if last_disposition:
+        line += f"; last outcome: {last_disposition.replace('_', ' ')}"
+    return line
+
+
+def _prior_contacts(db, phones: Sequence[str]) -> Optional[dict[str, str]]:
+    """Prior-contact line per phone with logged calls, from one query; None when unreadable.
+
+    Counts every logged call to or from the number. The outcome is the latest call
+    that has a disposition, since the newest call may not be dispositioned yet.
+    """
+    if not phones:
+        return {}
+    try:
+        with db.begin_nested():
+            rows = db.execute(
+                text(
+                    "SELECT phone, count(*) AS calls, max(call_ended_at) AS last_ended, "
+                    "(array_agg(disposition ORDER BY call_ended_at DESC) "
+                    " FILTER (WHERE disposition IS NOT NULL))[1] AS last_disposition "
+                    "FROM lending.call_dispositions WHERE phone = ANY(:phones) GROUP BY phone"
+                ),
+                {"phones": list(phones)},
+            ).mappings().all()
+    except Exception as exc:
+        logger.warning("[dialer-load] call history unavailable (%s); prior contact left unknown",
+                       type(exc).__name__)
+        return None
+    return {
+        row["phone"]: _prior_contact_line(int(row["calls"]), row["last_ended"], row["last_disposition"])
+        for row in rows if row["last_ended"] is not None
+    }
+
+
 def _cards(db, loadable: Sequence["_Loadable"]) -> dict[str, dict[str, str]]:
     """Context-card custom fields per record ref, from one batched facts query.
 
     The card is extra context for the caller, never a reason to skip a load: if
     the facts query fails, every record loads without a card (inside a savepoint,
-    so the load's transaction stays usable).
+    so the load's transaction stays usable). Prior contact comes from the logged
+    calls; if they can't be read, it shows as not available.
     """
     today = datetime.now(CARD_TIMEZONE).date()
     property_ids = sorted({int(item.record["property_id"]) for item in loadable
@@ -277,6 +314,7 @@ def _cards(db, loadable: Sequence["_Loadable"]) -> dict[str, dict[str, str]]:
         except Exception as exc:
             logger.warning("[dialer-load] card facts unavailable (%s); loading without cards", type(exc).__name__)
             return {}
+    history = _prior_contacts(db, sorted({item.phone for item in loadable}))
     cards: dict[str, dict[str, str]] = {}
     for item in loadable:
         property_id = item.record.get("property_id")
@@ -288,6 +326,7 @@ def _cards(db, loadable: Sequence["_Loadable"]) -> dict[str, dict[str, str]]:
             lead, score_lead(lead.signals, today=today),
             first_name=_first_name(item.display.borrower_name), county=item.display.county,
             campaign=item.display.campaign_tag, hook=item.display.hook,
+            prior_contact=None if history is None else history.get(item.phone, NO_PRIOR_CONTACT),
         )
         cards[item.record_ref] = card.custom_fields
     return cards
