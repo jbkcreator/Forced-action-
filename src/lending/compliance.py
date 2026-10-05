@@ -110,7 +110,7 @@ def _homestead_blocked(record: dict) -> bool:
 
     Blocks only a *confirmed* homestead-exempt property (``homestead_exempt is
     True``). Josh's rule describes two allowed categories and says nothing about
-    an unverified status, and properties.homestead_exempt has no backfill pipeline
+    an unverified status, and financials.homestead_exempt has few confirmed values
     yet — nearly every current record is NULL. Treating NULL as blocked would gate
     out virtually the entire pool, directly against his #1 stated priority (lead
     volume). Unknown passes through like every other unscored field here; this

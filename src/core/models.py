@@ -12743,7 +12743,7 @@ class LendingCallingPoolStaging(Base):
     # Go Live Brief 2.5 source list (list_1..list_9); apply_lending_pool_source_tags.py
     source_tag: Mapped[Optional[str]] = mapped_column(String)
     # F8 (Josh, Oct 4 §2): owner-occupied status of the target property, from
-    # properties.homestead_exempt. NULL for pools with no single subject property
+    # financials.homestead_exempt. NULL for pools with no single subject property
     # (mortgage_broker: the record is a professional, not a property owner).
     homestead_exempt: Mapped[Optional[bool]] = mapped_column(Boolean)
 
