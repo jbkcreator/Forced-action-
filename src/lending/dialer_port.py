@@ -61,11 +61,15 @@ class UnconfirmedCapability(DialerRemovalUndecided):
 
 
 class DialerRequestError(RuntimeError):
-    """A dialer request failed; ``status`` is the HTTP status when there was one."""
+    """A dialer request failed; ``status`` is the HTTP status when there was one.
 
-    def __init__(self, message: str, status: Optional[int] = None) -> None:
+    ``maybe_created`` is set only on a create whose outcome is unknown (timeout, 5xx, a 2xx
+    with no contact id): the contact may exist even though the call reported failure."""
+
+    def __init__(self, message: str, status: Optional[int] = None, *, maybe_created: bool = False) -> None:
         super().__init__(message)
         self.status = status
+        self.maybe_created = maybe_created
 
 
 class UnreconciledContact(RuntimeError):
@@ -157,16 +161,20 @@ class BatchDialerAdapter:
             if self._endpoints.get("contacts_add_to_campaign") is None:
                 raise UnconfirmedCapability("BatchDialer endpoint 'contacts_add_to_campaign' is not confirmed")
             campaign_id = self._campaign_id(campaign)
-            body = self._call("contacts_add_to_campaign", {
-                "campaignids": [campaign_id],
-                "contacts": [_import_contact(phone, fields, vendor_contact_id)],
-            })
+            try:
+                body = self._call("contacts_add_to_campaign", {
+                    "campaignids": [campaign_id],
+                    "contacts": [_import_contact(phone, fields, vendor_contact_id)],
+                })
+            except DialerRequestError as exc:
+                exc.maybe_created = exc.status is None or exc.status >= 500 or exc.status == 408
+                raise
             if body.get("success") is False:
                 raise DialerRequestError("BatchDialer contact import failed")
             ids = body.get("ids") or []
             contact_id = ids[0] if ids else None
         if contact_id is None:
-            raise DialerRequestError("dialer returned no contact id")
+            raise DialerRequestError("dialer returned no contact id", maybe_created=campaign is not None)
         if campaign is not None:
             try:
                 self.update_contact(contact_id, fields, phone=phone, vendor_contact_id=vendor_contact_id)
@@ -295,7 +303,15 @@ def _requests_http(api_key: str) -> Http:
         except requests.RequestException as exc:
             logger.warning("[dialer] BatchDialer %s %s failed: %s", method, path, type(exc).__name__)
             raise DialerRequestError(f"BatchDialer {method} {path}: {type(exc).__name__}") from exc
-        return response.json() if response.content else {}
+        if not response.content:
+            return {}
+        try:
+            return response.json()
+        except ValueError as exc:
+            # A 2xx that is not JSON (proxy error page, truncated body) is a failed call,
+            # not a crash: callers only handle DialerRequestError.
+            logger.warning("[dialer] BatchDialer %s %s returned a non-JSON body", method, path)
+            raise DialerRequestError(f"BatchDialer {method} {path}: non-JSON response") from exc
 
     return call
 

@@ -245,13 +245,28 @@ FIPS_BY_STATE: dict[str, dict[str, str]] = {
 }
 
 
+# Spellings PropertyRadar returns in exported records that differ from the
+# keys above (seen in live FL exports 2026-10-05).
+COUNTY_ALIASES: dict[str, dict[str, str]] = {
+    "FL": {
+        "DADE": "MIAMI-DADE",
+        "SAINT JOHNS": "ST. JOHNS",
+        "SAINT LUCIE": "ST. LUCIE",
+        "DE SOTO": "DESOTO",
+    },
+}
+
+
 def county_fips(state: str, county_name: str) -> str | None:
     """Return the FIPS code for a county, or None if unknown.
 
     ``county_name`` is matched case-insensitively against the stored keys
-    (which are uppercase to match PropertyRadar's ``County`` field values).
+    (which are uppercase to match PropertyRadar's ``County`` field values),
+    after resolving known PropertyRadar spelling aliases.
     """
-    return FIPS_BY_STATE.get(state.upper(), {}).get(county_name.upper())
+    st, name = state.upper(), county_name.upper()
+    name = COUNTY_ALIASES.get(st, {}).get(name, name)
+    return FIPS_BY_STATE.get(st, {}).get(name)
 
 
 # 2-digit state FIPS prefix — Dev 2's storage layer keys county maps by this.

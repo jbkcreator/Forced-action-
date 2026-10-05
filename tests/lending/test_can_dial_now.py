@@ -101,6 +101,49 @@ def test_block_ends_once_oldest_attempt_is_older_than_24h(db):
     assert _check(db, NOON_LOCAL).allowed
 
 
+def test_six_attempts_over_10_business_days_blocks_with_history_exceeded(db):
+    """Finding F10 (Josh, Oct 4 §6): 3 per 24h, 6 total over 10 business days, then
+    nurture. Spread 1 attempt/day (never tripping the 24h cap) across 6 of the 7
+    business days before NOON_LOCAL (2026-09-29, a Tuesday)."""
+    for days_back in (1, 2, 3, 4, 7, 8):   # skips the weekend (5, 6 back = Sat/Sun)
+        _attempt(db, NOON_LOCAL - timedelta(days=days_back))
+    assert _check(db, NOON_LOCAL).reason == ReasonCode.ATTEMPT_HISTORY_EXCEEDED
+
+
+def test_five_attempts_over_10_business_days_is_still_allowed(db):
+    for days_back in (1, 2, 3, 4, 7):
+        _attempt(db, NOON_LOCAL - timedelta(days=days_back))
+    assert _check(db, NOON_LOCAL).allowed
+
+
+def test_an_attempt_older_than_10_business_days_ages_out_of_the_count(db):
+    for days_back in (1, 2, 3, 4, 7, 15):   # 15 business days back: outside the window
+        _attempt(db, NOON_LOCAL - timedelta(days=days_back))
+    assert _check(db, NOON_LOCAL).allowed
+
+
+def test_on_attempt_recorded_flags_nurture_and_closes_the_load_row_at_the_history_cap(db):
+    from src.lending.compliance import on_attempt_recorded
+
+    db.execute(text(
+        "INSERT INTO lending.dialer_load_records (run_id, pool, source_record_ref, phone, phone_hash, active) "
+        "VALUES ('t', 'builders', 'r1', :p, 'h', true)"), {"p": PHONE})
+    db.execute(text("INSERT INTO lending.contacts (phone, phone_hash, nurture) VALUES (:p, 'h', false)"), {"p": PHONE})
+    for days_back in (2, 3, 4, 7, 8):   # 5 prior attempts, none within the 24h cap
+        _attempt(db, NOON_LOCAL - timedelta(days=days_back))
+    _attempt(db, NOON_LOCAL)   # the 6th: on_attempt_recorded fires after this row commits
+    dialer = FakeDialer()
+    result = on_attempt_recorded(db, PHONE, now=NOON_LOCAL, dialer_remover=dialer)
+    assert result.reason == ReasonCode.ATTEMPT_HISTORY_EXCEEDED
+    assert dialer.removed == [PHONE] and dialer.reasons == ["attempt_history"]
+    nurture = db.execute(text("SELECT nurture FROM lending.contacts WHERE phone = :p"), {"p": PHONE}).scalar()
+    assert nurture is True
+    active = db.execute(
+        text("SELECT active FROM lending.dialer_load_records WHERE phone = :p"), {"p": PHONE}
+    ).scalar()
+    assert active is False
+
+
 def test_recipient_timezone_is_lending_owned_and_conservative_for_850():
     from src.lending.compliance import recipient_timezone
     assert recipient_timezone("+18505551234").key == "America/Chicago"
@@ -108,18 +151,50 @@ def test_recipient_timezone_is_lending_owned_and_conservative_for_850():
     assert recipient_timezone("+18135551234", zip_code="33602").key == "America/New_York"
 
 
-def test_florida_overlay_area_codes_are_known_eastern():
+def test_a_pacific_area_code_is_resolved_via_the_full_nanp_table_not_defaulted_to_eastern():
+    """Finding #5: 310 (Los Angeles) isn't in AREA_CODE_TZ's FL/GA-only list; it must
+    resolve to Pacific via the full NANP table, not silently fall back to Eastern."""
     from src.lending.compliance import recipient_timezone
-    for phone in ("+16565551234", "+16895551234", "+19435551234"):  # Tampa, Orlando, Atlanta overlays
-        assert recipient_timezone(phone).key == "America/New_York"
+    assert recipient_timezone("+13105551234").key == "America/Los_Angeles"
 
 
-def test_unknown_area_code_is_blocked_not_assumed_eastern(db):
-    from src.lending.compliance import can_dial_now, recipient_timezone
-    assert recipient_timezone("+13125551234") is None  # 312 Central, not in the table
-    for phone in ("+13125551234", "+13105551234"):
-        result = can_dial_now(phone, db, now=datetime(2026, 9, 29, 14, 30, tzinfo=timezone.utc))  # 10:30 ET
-        assert result.reason == ReasonCode.OUTSIDE_CALL_WINDOW
+def test_a_310_number_at_0930_et_is_blocked_its_only_0630_local(db):
+    """Finding #5's own suggested regression: 09:30 ET is 06:30 PT, before the 08:00
+    local floor. The old code defaulted an unmapped 310 to Eastern and allowed this."""
+    from src.lending.compliance import can_dial_now
+    result = can_dial_now("+13105551234", db, now=datetime(2026, 9, 29, 13, 30, tzinfo=timezone.utc))
+    assert result.reason == ReasonCode.OUTSIDE_CALL_WINDOW
+
+
+def test_an_undeterminable_timezone_fails_closed_not_eastern(db, monkeypatch):
+    """A number libphonenumber can't place in exactly one zone must never fall back
+    to 'assume Eastern' — that is exactly the bug. Simulated via monkeypatch since a
+    real NANP number almost always resolves to one zone at full 10-digit precision."""
+    from src.lending import compliance
+    from src.lending.compliance import can_dial_now
+
+    monkeypatch.setattr(compliance, "_nanp_timezone", lambda phone: None)
+    assert compliance.recipient_timezone("+13105551234") is None
+    result = can_dial_now("+13105551234", db, now=datetime(2026, 9, 29, 16, 0, tzinfo=timezone.utc))
+    assert result.reason == ReasonCode.OUTSIDE_CALL_WINDOW
+
+
+def test_dial_blocks_blocks_a_phone_with_no_fresh_scrub(db):
+    """Finding #6: dial_blocks (what the sweep and the live dial path both check) must
+    block a stale-scrub phone, not just the weekly job's own load-time check."""
+    from src.lending.compliance import dial_blocks
+
+    # No scrub at all for PHONE: stale by definition.
+    blocks = dial_blocks(db, [PHONE], now=NOON_LOCAL)
+    assert blocks[PHONE] == ReasonCode.NO_FRESH_SCRUB
+
+
+def test_dial_blocks_allows_a_phone_with_a_fresh_scrub(db):
+    from src.lending.compliance import dial_blocks
+
+    db.execute(text("INSERT INTO lending.dnc_scrubs (phone, national_dnc, litigator, state_dnc, checked_at) "
+                    "VALUES (:p, false, false, false, :at)"), {"p": PHONE, "at": NOON_LOCAL})
+    assert dial_blocks(db, [PHONE], now=NOON_LOCAL) == {}
 
 
 class FakeDialer:
