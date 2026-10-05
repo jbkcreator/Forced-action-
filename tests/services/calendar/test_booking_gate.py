@@ -321,12 +321,17 @@ class TestNoFinancialFields:
 
 
 class TestIsListBlocked:
-    def test_empty_blocked_set_never_blocks(self):
-        # BLOCKED_LIST_KEYS is currently frozenset() — nothing is blocked.
-        assert _is_list_blocked("wholesaler_flipper") is False
-        assert _is_list_blocked("active_builder") is False
-        assert _is_list_blocked("mortgage_broker") is False
-        assert _is_list_blocked(None) is False
+    def test_list_4_brokers_and_los_is_blocked(self):
+        """Josh, Oct 4 email §2: only List 4 (brokers/LOs) blocks from booking."""
+        assert _is_list_blocked("list_4") is True
+
+    def test_list_2_cash_buyers_is_no_longer_blocked(self):
+        """Moved out of nurture into an active dial rank — no longer blocked."""
+        assert _is_list_blocked("list_2") is False
+
+    @pytest.mark.parametrize("key", ["list_1", "list_3", "list_5", "list_6", "list_7", "list_8", "list_9"])
+    def test_every_other_list_is_not_blocked(self, key):
+        assert _is_list_blocked(key) is False
 
     def test_none_list_key_never_blocks(self):
         assert _is_list_blocked(None) is False

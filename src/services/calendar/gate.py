@@ -19,10 +19,11 @@ out of the borrower-financial-data prohibition. This keeps gate data clear
 of both the relay payload CHECK constraint and the voice-intake
 _FINANCIAL_TERMS regex. See config/booking_gate.py for vocabularies.
 
-OPEN DEPENDENCY: BLOCKED_LIST_KEYS in config/booking_gate.py is empty — no
-code yet tags a lead/booking with which numbered list it came from. Per
-Josh's Oct 4 email, only List 4 (brokers/LOs) is meant to block; List 2
-(cash buyers) no longer does.
+Per Josh's Oct 4 email, only List 4 (brokers/LOs) is meant to block; List 2
+(cash buyers) no longer does. See config/booking_gate.py's module docstring
+for how `list_key` reaches a gate submission (caller-supplied, same as every
+other gate field — there is no server-side join from tracked_link_id/
+person_id back to lending.calling_pool_staging today).
 """
 from __future__ import annotations
 
