@@ -78,8 +78,18 @@ _INSERT = text("""
     VALUES
         (:booking_ref, :provider_event_id, :person_id, :kind, :send_at, :status, :skip_reason, :first_name,
          :contact_phone, :contact_email, :property_address, :slot_start_utc, :booked_by)
-    ON CONFLICT (booking_ref, kind) DO NOTHING
+    ON CONFLICT (booking_ref, kind) DO UPDATE SET
+        provider_event_id = EXCLUDED.provider_event_id, person_id = EXCLUDED.person_id,
+        send_at = EXCLUDED.send_at, status = EXCLUDED.status, skip_reason = EXCLUDED.skip_reason,
+        cancel_reason = NULL, channel = NULL, attempts = 0, first_name = EXCLUDED.first_name,
+        contact_phone = EXCLUDED.contact_phone, contact_email = EXCLUDED.contact_email,
+        property_address = EXCLUDED.property_address, slot_start_utc = EXCLUDED.slot_start_utc,
+        booked_by = EXCLUDED.booked_by, provider_message_id = NULL, decided_at = NULL, sent_at = NULL
+     WHERE lending.booking_messages.slot_start_utc IS DISTINCT FROM EXCLUDED.slot_start_utc
+       AND lending.booking_messages.status <> 'sending'
 """)
+
+_KNOWN_BOOKING = text("SELECT EXISTS (SELECT 1 FROM lending.booking_messages WHERE booking_ref = :ref)")
 
 _PERSON = text("""
     SELECT COALESCE(m.full_name, p.full_name) AS full_name,
@@ -98,11 +108,20 @@ _CANCEL_BY_EVENT = text("""
     UPDATE lending.booking_messages SET status = 'cancelled', cancel_reason = :reason, decided_at = now()
      WHERE provider_event_id = :event_id AND status = 'pending'
 """)
+_CANCEL_TASK_BY_REF = text("""
+    UPDATE lending.confirmation_tasks SET cancelled_at = now()
+     WHERE booking_ref = :ref AND cancelled_at IS NULL AND completed_at IS NULL
+""")
+_CANCEL_TASK_BY_EVENT = text("""
+    UPDATE lending.confirmation_tasks SET cancelled_at = now()
+     WHERE booking_ref IN (SELECT booking_ref FROM lending.booking_messages WHERE provider_event_id = :event_id)
+       AND cancelled_at IS NULL AND completed_at IS NULL
+""")
 
 
 @dataclass(frozen=True)
 class ScheduleResult:
-    inserted: int
+    inserted: int               # rows written: new rows, or rows re-planned for a changed slot
     skip_reason: Optional[str]  # set when every row was recorded as skipped (no person / no contact method)
     assignee: Optional[str]     # who owns the confirmation call
 
@@ -112,7 +131,10 @@ class ScheduleResult:
 def handle_booking_confirmed(db, payload: Mapping[str, Any], *, now: Optional[datetime] = None) -> ScheduleResult:
     """Schedule the three messages and the confirmation-call task for one confirmed booking.
 
-    Idempotent: a redelivered event inserts nothing and changes nothing. Does not commit.
+    Idempotent: a redelivered event (same slot) writes nothing and changes nothing. The same ``booking_ref``
+    with a different ``slot_start_utc`` is a reschedule: its rows are re-planned for the new time (a row being
+    sent right now is left alone). Consent is recorded on the first delivery only, so a redelivery or a
+    reschedule never re-grants consent the contact has since revoked. Does not commit.
     A booking with no resolvable person or no phone/email still gets its rows, recorded as skipped
     with the reason, so the gap is visible instead of silent.
     """
@@ -150,13 +172,14 @@ def handle_booking_confirmed(db, payload: Mapping[str, Any], *, now: Optional[da
         _row(common, KIND_NIGHT_BEFORE, night_before_send_at(slot_start), skip_reason, now=now),
         _row(common, KIND_NINETY_MIN, slot_start - timedelta(seconds=NINETY_MIN_SECONDS), skip_reason, now=now),
     ]
+    first_delivery = not db.execute(_KNOWN_BOOKING, {"ref": booking_ref}).scalar()
     inserted = sum(db.execute(_INSERT, row).rowcount for row in rows)  # 3 rows; per-statement rowcount is exact
     if skip_reason:
         logger.warning("[booking-messages] booking_ref=%s recorded as skipped (%s)", booking_ref, skip_reason)
     else:
         logger.info("[booking-messages] booking_ref=%s scheduled %d rows phone_hash=%s",
                     booking_ref, inserted, phone_hash(phone)[:12] if phone else "-")
-    if payload.get("text_consent") is True and phone and payload.get("booked_by") not in (None, AI_BOOKER):
+    if first_delivery and payload.get("text_consent") is True and phone and payload.get("booked_by") not in (None, AI_BOOKER):
         record_consent(db, phone, "on_call_yes", captured_by=payload["booked_by"])
     assignee = assign_confirmation_task(db, booking_ref=booking_ref, person_id=person_id,
                                         booked_by=payload.get("booked_by"), slot_start_utc=slot_start, booked_at=now)
@@ -191,12 +214,14 @@ def cancel_by_provider_event(db, provider_event_id: str, reason: str) -> int:
     """Cancel pending messages for the booking whose GHL appointment id this is. Does not commit.
     A message already claimed for sending cannot be recalled."""
     n = db.execute(_CANCEL_BY_EVENT, {"event_id": provider_event_id, "reason": reason}).rowcount
+    db.execute(_CANCEL_TASK_BY_EVENT, {"event_id": provider_event_id})
     logger.info("[booking-messages] cancelled %d pending rows (event) reason=%s", n, reason)
     return n
 
 
 def cancel_by_booking_ref(db, booking_ref: str, reason: str) -> int:
     n = db.execute(_CANCEL_BY_REF, {"ref": booking_ref, "reason": reason}).rowcount
+    db.execute(_CANCEL_TASK_BY_REF, {"ref": booking_ref})
     logger.info("[booking-messages] cancelled %d pending rows booking_ref=%s reason=%s", n, booking_ref, reason)
     return n
 

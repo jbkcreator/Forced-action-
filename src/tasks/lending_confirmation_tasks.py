@@ -2,8 +2,9 @@
 
 ``lending.confirmation_tasks`` is the list of calls a caller must make to confirm a booked call. Nothing
 else surfaces it, so this posts, once a morning, every task that is due today or overdue (up to
-``LOOKBACK_DAYS``) for a call that has not started yet, grouped by assignee. A task drops off by itself
-once its call starts. Cron fires at 13:00 and 14:00 UTC; only the one that is 9:xx ET acts.
+``LOOKBACK_DAYS``) for a call that has not started yet, grouped by assignee. A task drops off when it is
+completed (``POST /webhooks/lending/confirmation-task-complete``), when its booking is cancelled or
+rescheduled, or once its call starts. Cron fires at 13:00 and 14:00 UTC; only the one that is 9:xx ET acts.
 
 Shows first name and the last four digits of the phone only, never the full number.
 """
@@ -30,7 +31,7 @@ _OPEN_TASKS = text("""
     SELECT t.booking_ref, t.assignee, t.due_date, m.first_name, m.contact_phone, m.slot_start_utc
       FROM lending.confirmation_tasks t
       JOIN lending.booking_messages m ON m.booking_ref = t.booking_ref AND m.kind = 'confirmation'
-     WHERE t.completed_at IS NULL
+     WHERE t.completed_at IS NULL AND t.cancelled_at IS NULL
        AND t.due_date <= :today AND t.due_date >= :floor
        AND m.slot_start_utc > :now
      ORDER BY t.assignee, m.slot_start_utc

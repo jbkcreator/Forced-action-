@@ -28,7 +28,13 @@ AI_BOOKER = "ai"
 _INSERT = text("""
     INSERT INTO lending.confirmation_tasks (booking_ref, person_id, assignee, due_date)
     VALUES (:booking_ref, :person_id, :assignee, :due_date)
-    ON CONFLICT (booking_ref) DO NOTHING
+    ON CONFLICT (booking_ref) DO UPDATE SET
+        assignee = EXCLUDED.assignee, due_date = EXCLUDED.due_date, cancelled_at = NULL, completed_at = NULL
+     WHERE lending.confirmation_tasks.cancelled_at IS NOT NULL
+""")
+_COMPLETE = text("""
+    UPDATE lending.confirmation_tasks SET completed_at = now()
+     WHERE booking_ref = :ref AND completed_at IS NULL AND cancelled_at IS NULL
 """)
 
 
@@ -72,9 +78,17 @@ def due_date_for(booked_by: Optional[str], slot_start_utc: datetime, booked_at: 
     return max(day_before, booked_on)
 
 
+def complete_confirmation_task(db, booking_ref: str) -> bool:
+    """Mark the confirmation call done so it leaves the morning list. False when there was no open task.
+    Does not commit."""
+    done = bool(db.execute(_COMPLETE, {"ref": booking_ref}).rowcount)
+    logger.info("[confirmation-tasks] booking_ref=%s completed=%s", booking_ref, done)
+    return done
+
+
 def assign_confirmation_task(db, *, booking_ref: str, person_id: Optional[str], booked_by: Optional[str],
                              slot_start_utc: datetime, booked_at: Optional[datetime] = None) -> str:
-    """Record the confirmation call and return its assignee. Idempotent on booking_ref; does not commit."""
+    """Record the confirmation call and return its assignee. Idempotent on booking_ref (a cancelled task is revived by a rescheduled booking); does not commit."""
     due_date = due_date_for(booked_by, slot_start_utc, booked_at or datetime.now(timezone.utc))
     assignee = resolve_assignee(booked_by, due_date)
     db.execute(_INSERT, {"booking_ref": booking_ref, "person_id": person_id, "assignee": assignee,

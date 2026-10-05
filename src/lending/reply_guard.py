@@ -111,11 +111,16 @@ def classify(event: ReplyEvent) -> Optional[str]:
     return KIND_AI_HANDOFF if event.handoff else None
 
 
+def _slack_safe(value: str) -> str:
+    """Slack treats <!channel>, <!here> and <url|label> as live markup unless & < > are escaped."""
+    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def format_slack(kind: str, event: ReplyEvent) -> str:
-    who = event.first_name or "Unknown contact"
+    who = _slack_safe(event.first_name or "Unknown contact")
     tail = f" (…{event.phone[-4:]})" if event.phone else ""
-    snippet = event.body[:SNIPPET_CHARS] + ("…" if len(event.body) > SNIPPET_CHARS else "")
-    ref = f"\nGHL contact: {event.contact_id}" if event.contact_id else ""
+    snippet = _slack_safe(event.body[:SNIPPET_CHARS]) + ("…" if len(event.body) > SNIPPET_CHARS else "")
+    ref = f"\nGHL contact: {_slack_safe(event.contact_id)}" if event.contact_id else ""
     if kind == KIND_RATE_TERMS:
         head = "*Rate / terms question: needs Josh* (reply within one business hour; nothing was quoted)"
     elif kind == KIND_AI_HANDOFF:

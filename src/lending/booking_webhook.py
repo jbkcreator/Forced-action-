@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 from src.api.deps import get_db
 from src.api.lending_ghl_router import _verify_secret
 from src.lending.booking_messages import cancel_by_provider_event, handle_booking_confirmed
+from src.lending.confirmation_tasks import complete_confirmation_task
 
 logger = logging.getLogger(__name__)
 
@@ -103,3 +104,20 @@ def booking_confirmed(
         raise HTTPException(status_code=500, detail="Could not schedule the booking messages") from None
     outcome = "skipped" if result.skip_reason else "scheduled" if result.inserted else "duplicate"
     return {"status": outcome, "inserted": result.inserted, "skip_reason": result.skip_reason}
+
+
+@router.post("/confirmation-task-complete")
+def confirmation_task_complete(
+    body: dict[str, Any],
+    x_webhook_secret: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """A caller finished the confirmation call: take it off the 9am list. Same secret as the other lending
+    webhooks, so a GHL workflow button or a script can call it."""
+    _verify_secret(x_webhook_secret)
+    booking_ref = str(body.get("booking_ref") or "").strip()
+    if not booking_ref:
+        raise HTTPException(status_code=422, detail="booking_ref is required")
+    completed = complete_confirmation_task(db, booking_ref)
+    db.commit()
+    return {"status": "completed" if completed else "no_open_task"}

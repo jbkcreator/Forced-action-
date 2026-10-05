@@ -37,4 +37,6 @@ def ghl_reply(
         logger.error("[reply-webhook] handling message %s failed (%s)", event.message_id, type(exc).__name__)
         db.rollback()
         raise HTTPException(status_code=502, detail="Could not post the handoff; it will be retried") from None
+    if outcome == "not_configured":
+        raise HTTPException(status_code=503, detail="Reply handoff channel is not configured; it will be retried")
     return {"status": outcome}

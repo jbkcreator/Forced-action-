@@ -72,8 +72,10 @@ def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
             assignee     varchar(255) NOT NULL,
             due_date     date         NOT NULL,
             created_at   timestamptz  NOT NULL DEFAULT now(),
-            completed_at timestamptz
+            completed_at timestamptz,
+            cancelled_at timestamptz
         )""",
+        f"ALTER TABLE {tasks} ADD COLUMN IF NOT EXISTS cancelled_at timestamptz",
         f"CREATE INDEX IF NOT EXISTS ix_lending_confirmation_tasks_open ON {tasks} (due_date, assignee) "
         f"WHERE completed_at IS NULL",
         f"""CREATE TABLE IF NOT EXISTS {handoffs} (
