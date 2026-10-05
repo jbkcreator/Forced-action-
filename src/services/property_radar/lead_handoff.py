@@ -135,6 +135,29 @@ def phone_digits(phone: str) -> str:
     return "".join(ch for ch in phone if ch.isdigit())[-10:]
 
 
+def pretrace_eligible(
+    lead: StagedLead,
+    facts: ScreeningFacts,
+    *,
+    thin_path_only: bool,
+) -> tuple[bool, str]:
+    """The subset of ``decide``'s rules that don't need contacts: whether this lead is
+    even worth paying Tracerfy to trace. Shared so live-trace pre-filtering can never
+    drift from the handoff's own skip rules. Excludes the Backflip-feed-freshness
+    check: ``decide`` evaluates that only after the contact checks, so it is tested
+    separately by the live-trace caller instead of folded in here.
+    """
+    if lead.campaign not in CAMPAIGN_OPPORTUNITY_TYPES or lead.campaign not in CAMPAIGN_SOURCE_TYPES:
+        return False, "campaign_not_configured"
+    if lead.status != ACTIVE_STATUS:
+        return False, f"record_{lead.status}"
+    if thin_path_only and lead.county_fips not in THIN_PATH_COUNTY_FIPS:
+        return False, "outside_thin_path"
+    if lead.radar_id in facts.handed_off_radar_ids:
+        return False, "already_handed_off"
+    return True, ""
+
+
 def decide(
     lead: StagedLead,
     contacts: LeadContacts,
@@ -143,14 +166,9 @@ def decide(
     thin_path_only: bool,
 ) -> tuple[HandoffOutcome, str]:
     """Apply the handoff rules to one record. Pure: no I/O."""
-    if lead.campaign not in CAMPAIGN_OPPORTUNITY_TYPES or lead.campaign not in CAMPAIGN_SOURCE_TYPES:
-        return HandoffOutcome.SKIPPED, "campaign_not_configured"
-    if lead.status != ACTIVE_STATUS:
-        return HandoffOutcome.SKIPPED, f"record_{lead.status}"
-    if thin_path_only and lead.county_fips not in THIN_PATH_COUNTY_FIPS:
-        return HandoffOutcome.SKIPPED, "outside_thin_path"
-    if lead.radar_id in facts.handed_off_radar_ids:
-        return HandoffOutcome.SKIPPED, "already_handed_off"
+    eligible, reason = pretrace_eligible(lead, facts, thin_path_only=thin_path_only)
+    if not eligible:
+        return HandoffOutcome.SKIPPED, reason
     if contacts.is_empty:
         return HandoffOutcome.SKIPPED, "no_contact_data"
     if any(email in facts.opted_out_emails for email in contacts.emails):

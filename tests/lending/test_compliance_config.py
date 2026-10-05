@@ -14,6 +14,8 @@ def test_spec_values():
     assert cfg.SHIFT_GROUPS == {"A": (time(9, 0), time(15, 0)), "B": (time(13, 0), time(19, 15))}
     assert cfg.MAX_ATTEMPTS_PER_PERIOD == 3
     assert cfg.ATTEMPT_PERIOD_HOURS == 24
+    assert cfg.MAX_ATTEMPTS_TOTAL == 6
+    assert cfg.ATTEMPT_HISTORY_BUSINESS_DAYS == 10
     assert cfg.DNC_SCRUB_MAX_AGE_DAYS == 7
     assert cfg.STOP_PROPAGATION_SLA_SECONDS == 60
     assert cfg.GEORGIA_ALLOWED_ENTITY_TYPES == frozenset({"LLC", "LP", "CORPORATION"})
@@ -23,8 +25,15 @@ def test_reason_codes_are_stable_strings():
     assert cfg.ReasonCode.NO_FRESH_SCRUB.value == "NO_FRESH_SCRUB"
     assert {c.value for c in cfg.ReasonCode} == {
         "INVALID_PHONE", "NO_FRESH_SCRUB", "SCRUB_FAILED", "NATIONAL_DNC", "STATE_DNC", "LITIGATOR",
-        "SUPPRESSED", "GA_NATURAL_PERSON", "OUTSIDE_CALL_WINDOW", "ATTEMPT_CAP_REACHED",
+        "SUPPRESSED", "GA_NATURAL_PERSON", "HOMESTEAD_OWNER_OCCUPIED", "OUTSIDE_CALL_WINDOW",
+        "ATTEMPT_CAP_REACHED", "ATTEMPT_HISTORY_EXCEEDED",
         "BACKFLIP_CONFLICT", "BACKFLIP_FEED_STALE", "BACKFLIP_FEED_UNAVAILABLE",
+    }
+
+
+def test_removal_reasons_are_stable_strings():
+    assert {r.value for r in cfg.RemovalReason} == {
+        "opt_out", "call_window", "attempt_cap", "scrub_stale", "attempt_history",
     }
 
 

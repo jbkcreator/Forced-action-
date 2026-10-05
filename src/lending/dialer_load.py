@@ -37,6 +37,7 @@ from src.lending.backflip_conflict import (
 from src.lending.compliance import GateResult, Scrubber, dial_blocks, filter_loadable, phone_hash
 from src.lending.dialer_contact import DialerDisplay, dialer_fields, display_from_record
 from src.lending.dialer_port import ContactUpsertResult, DialerContactFields, DialerRequestError
+from src.lending.dialer_removal import DialerRemovalUndecided
 from src.services.phone_utils import normalize as normalize_phone
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,7 @@ class DialerContacts(Protocol):
                        vendor_contact_id: Optional[str] = None) -> ContactUpsertResult: ...
     def update_contact(self, contact_id: Any, fields: DialerContactFields, *,
                        phone: Optional[str] = None) -> dict: ...
+    def remove(self, phone: str, *, reason: str) -> None: ...
 
 
 class LoadRefused(RuntimeError):
@@ -168,17 +170,17 @@ def _write_exclusions(db, run_id: str, rows: list[dict]) -> None:
     )
 
 
-def _active_rows(db, phones: list[str]) -> dict[str, tuple[int, Optional[int]]]:
+def _active_rows(db, phones: list[str]) -> dict[str, tuple[int, Optional[int], Optional[str]]]:
     if not phones:
         return {}
     rows = db.execute(
         text(
-            "SELECT phone, id, dialer_contact_id FROM lending.dialer_load_records "
+            "SELECT phone, id, dialer_contact_id, campaign_tag FROM lending.dialer_load_records "
             "WHERE active AND phone = ANY(CAST(:phones AS varchar[]))"
         ),
         {"phones": phones},
     ).fetchall()
-    return {row.phone: (row.id, row.dialer_contact_id) for row in rows}
+    return {row.phone: (row.id, row.dialer_contact_id, row.campaign_tag) for row in rows}
 
 
 def _count_active_not_in(db, phones: list[str]) -> int:
@@ -191,9 +193,28 @@ def _count_active_not_in(db, phones: list[str]) -> int:
     ).scalar_one()
 
 
+CAMPAIGN_CHANGED = "pool_changed"
+
+
 def _push_contact(dialer: DialerContacts, item: _Loadable, known_contact_id: Optional[str],
-                  fields: DialerContactFields) -> ContactUpsertResult:
-    """Update by the stored contact id when known (search can lag); else upsert by phone."""
+                  known_campaign_tag: Optional[str], fields: DialerContactFields) -> ContactUpsertResult:
+    """Update by the stored contact id when known (search can lag); else upsert by phone.
+
+    A phone whose pool changed between staging runs must move dialer campaigns, not
+    just get its card fields updated in place — a bare update would leave BatchDialer
+    dialing the old campaign forever while the database says a different one (finding
+    #10). If the removal from the old campaign can't be confirmed, this raises
+    DialerRequestError so the caller flags the record instead of silently writing the
+    new campaign_tag as if the move had actually happened.
+    """
+    new_campaign = item.display.campaign_tag
+    if known_contact_id is not None and known_campaign_tag is not None and known_campaign_tag != new_campaign:
+        try:
+            dialer.remove(item.phone, reason=CAMPAIGN_CHANGED)
+        except DialerRemovalUndecided as exc:
+            raise DialerRequestError(f"campaign move unconfirmed: {exc}") from exc
+        return dialer.upsert_contact(item.phone, fields, campaign=new_campaign,
+                                     vendor_contact_id=item.record_ref or None)
     if known_contact_id is not None:
         try:
             dialer.update_contact(known_contact_id, fields, phone=item.phone)
@@ -201,7 +222,7 @@ def _push_contact(dialer: DialerContacts, item: _Loadable, known_contact_id: Opt
         except DialerRequestError as exc:
             if exc.status != 404:
                 raise
-    return dialer.upsert_contact(item.phone, fields, campaign=item.display.campaign_tag,
+    return dialer.upsert_contact(item.phone, fields, campaign=new_campaign,
                                  vendor_contact_id=item.record_ref or None)
 
 
@@ -350,7 +371,8 @@ def run_dialer_load(
     for item in loadable:
         fields = dialer_fields(item.display, email=item.record.get("email"))
         try:
-            result = _push_contact(dialer, item, active.get(item.phone, (None, None))[1], fields)
+            _, known_contact_id, known_campaign_tag = active.get(item.phone, (None, None, None))
+            result = _push_contact(dialer, item, known_contact_id, known_campaign_tag, fields)
         except DialerRequestError as exc:
             report.failed.append({"record_ref": item.record_ref, "error": type(exc).__name__,
                                   "status": getattr(exc, "status", None)})

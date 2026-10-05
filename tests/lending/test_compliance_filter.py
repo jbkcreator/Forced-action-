@@ -67,6 +67,82 @@ def test_suppression_list_phone_is_blocked_without_scrub(db):
     assert out[P_SUPP].reason == ReasonCode.SUPPRESSED
 
 
+def test_warm_network_phone_is_blocked_without_scrub(db):
+    """F8: Josh's warm network is permanently suppressed from the cold queue — same
+    gate as opt-out/litigator, a different SuppressionReason."""
+    from src.lending.compliance import suppress_warm_network_phones
+
+    _dnc(db, P_SUPP, age_days=1)
+    assert suppress_warm_network_phones(db, [P_SUPP]) == 1
+    out = _run(db, [{"phone": P_SUPP}])
+    assert out[P_SUPP].reason == ReasonCode.SUPPRESSED
+    reason = db.execute(text("SELECT reason FROM lending.suppression_list WHERE phone = :p"), {"p": P_SUPP}).scalar()
+    assert reason == "WARM_NETWORK"
+
+
+def test_suppress_warm_network_phones_is_idempotent_and_normalizes(db):
+    from src.lending.compliance import suppress_warm_network_phones
+
+    assert suppress_warm_network_phones(db, ["(813) 555-7777", "invalid"]) == 1
+    assert suppress_warm_network_phones(db, ["813-555-7777"]) == 1  # same phone, re-run: no error, no dup
+    count = db.execute(
+        text("SELECT count(*) FROM lending.suppression_list WHERE phone = :p"), {"p": "+18135557777"}
+    ).scalar()
+    assert count == 1
+
+
+def test_attempt_history_exceeded_blocks_at_load_time_and_flags_nurture(db):
+    """F10 at the load-time gate: a phone already attempt-exhausted must not be
+    reloaded as if it were fresh."""
+    for n, days_back in enumerate((1, 2, 3, 4, 7, 8)):
+        db.execute(
+            text("INSERT INTO lending.call_dispositions (dialer_call_id, phone, direction, call_ended_at, raw_event) "
+                 "VALUES (:cid, :p, 'outbound', :t, '{}')"),
+            {"cid": f"t-{n}", "p": P_CLEAN, "t": NOW - timedelta(days=days_back)},
+        )
+    out = _run(db, [{"phone": P_CLEAN}])
+    assert out[P_CLEAN].reason == ReasonCode.ATTEMPT_HISTORY_EXCEEDED
+
+
+def test_confirmed_homestead_natural_person_is_blocked(db):
+    """F8: owner must be LLC/LP/Corp or a non-owner-occupied investor. A confirmed
+    homestead-exempt property on a natural-person owner is blocked."""
+    _dnc(db, P_CLEAN, age_days=1)
+    out = _run(db, [{"phone": P_CLEAN, "entity_status": "NATURAL_PERSON", "homestead_exempt": True}])
+    assert out[P_CLEAN].reason == ReasonCode.HOMESTEAD_OWNER_OCCUPIED
+
+
+def test_non_owner_occupied_natural_person_passes(db):
+    _dnc(db, P_CLEAN, age_days=1)
+    out = _run(db, [{"phone": P_CLEAN, "entity_status": "NATURAL_PERSON", "homestead_exempt": False}])
+    assert out[P_CLEAN].allowed
+
+
+def test_llc_owner_passes_even_if_homestead_is_unknown(db):
+    _dnc(db, P_CLEAN, age_days=1)
+    out = _run(db, [{"phone": P_CLEAN, "entity_status": "LLC", "homestead_exempt": None}])
+    assert out[P_CLEAN].allowed
+
+
+def test_unknown_homestead_status_passes_no_backfill_pipeline_yet(db):
+    """Josh's rule names two allowed categories and never addresses unverified
+    status; properties.homestead_exempt has no backfill yet, so blocking on NULL
+    would gate out virtually the entire pool against his #1 stated priority
+    (lead volume). Unknown must pass, same as every other unscored field."""
+    _dnc(db, P_CLEAN, age_days=1)
+    out = _run(db, [{"phone": P_CLEAN, "entity_status": "NATURAL_PERSON"}])  # no homestead_exempt key at all
+    assert out[P_CLEAN].allowed
+
+
+def test_homestead_gate_does_not_apply_to_brokers_list_4(db):
+    """List 4 (brokers/LOs) is a professional referral list, never screened as a
+    property owner — must never be blocked by this gate."""
+    _dnc(db, P_CLEAN, age_days=1)
+    out = _run(db, [{"phone": P_CLEAN, "entity_status": "NATURAL_PERSON", "homestead_exempt": True,
+                     "source_tag": "list_4"}])
+    assert out[P_CLEAN].allowed
+
+
 def test_invalid_phone_is_blocked(db):
     out = _run(db, [{"phone": "123"}])
     assert out["123"].reason == ReasonCode.INVALID_PHONE

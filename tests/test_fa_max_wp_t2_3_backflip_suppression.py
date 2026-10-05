@@ -17,12 +17,14 @@ Test categories per testing-verification skill:
 from __future__ import annotations
 
 import ast
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import create_engine, text
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
@@ -646,6 +648,53 @@ class TestFeedAdapters:
             port = get_backflip_feed_port(csv_path=None)
 
         assert isinstance(port, NotImplementedBackflipFeedPort)
+
+
+# ---------------------------------------------------------------------------
+# E2. Real-Postgres column-width test — mocked sessions above don't enforce
+#     VARCHAR length, which is exactly how the identifier_kind truncation bug
+#     (column created VARCHAR(10), 'entity_name' is 11 chars) shipped unnoticed.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="requires a live Postgres DATABASE_URL")
+class TestBackflipSnapshotRealPostgres:
+    def test_entity_name_identifier_inserts_without_truncation(self):
+        from src.services.fa_max_backflip_feed import replace_backflip_snapshot
+
+        engine = create_engine(os.environ["DATABASE_URL"])
+        conn = engine.connect()
+        tx = conn.begin()
+        try:
+            with patch(
+                "src.services.fa_max_backflip_feed.get_db_context",
+                return_value=_ConnContext(conn),
+            ):
+                count = replace_backflip_snapshot({("entity_name", "Test Borrower LLC")})
+            assert count == 1
+            stored = conn.execute(
+                text("SELECT identifier_kind FROM fa_max_backflip_campaign_contacts "
+                     "WHERE identifier_value = :v"),
+                {"v": "TEST BORROWER LLC"},
+            ).scalar()
+            assert stored == "entity_name"
+        finally:
+            tx.rollback()
+            conn.close()
+            engine.dispose()
+
+
+class _ConnContext:
+    """Adapts an open SQLAlchemy connection to the get_db_context() contract
+    (a context manager yielding something .execute()-able) without committing."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def __enter__(self):
+        return self._conn
+
+    def __exit__(self, *exc):
+        return False
 
 
 # ---------------------------------------------------------------------------

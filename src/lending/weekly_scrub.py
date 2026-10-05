@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BATCH_SIZE = 500
 EXIT_CAP_REACHED = 4
+EXIT_SCRUB_FAILED = 3
 
 
 @dataclass
@@ -48,6 +49,7 @@ class WeeklyScrubResult:
     credits_used: int = 0
     aborted: bool = False
     left_unscrubbed: int = 0  # not reached under the cap: blocked at dial time until rescrubbed
+    scrub_batch_failures: int = 0  # the vendor call itself failed; no credits spent, nothing verdicted
 
 
 def stale_loaded_phones(db, *, now: Optional[datetime] = None) -> list[str]:
@@ -61,6 +63,34 @@ def stale_loaded_phones(db, *, now: Optional[datetime] = None) -> list[str]:
     cutoff = now - timedelta(days=DNC_SCRUB_MAX_AGE_DAYS)
     stored = _stored_scrubs(db, loaded)
     return [p for p in loaded if p not in stored or stored[p].checked_at < cutoff]
+
+
+def pending_removal_phones(db) -> list[str]:
+    """Loaded phones already known to be blocked (suppressed, or a stored scrub verdict
+    says blocked) whose dialer removal has not yet succeeded.
+
+    A phone only reaches this state when a prior ``_remove_from_dialer`` call failed:
+    success always closes its load row (``_close_load_rows``), so an active row plus a
+    blocked verdict means the removal itself is still outstanding. Because the verdict
+    is already known, retrying costs no Tracerfy credit and the phone would otherwise
+    never resurface — ``stale_loaded_phones`` only selects phones with no fresh scrub,
+    and this one's scrub (the one that found it blocked) is fresh.
+    """
+    raw = db.execute(text(
+        "SELECT DISTINCT phone FROM lending.dialer_load_records WHERE active AND phone IS NOT NULL"
+    )).scalars().all()
+    loaded = sorted({p for p in (normalize_phone(r) for r in raw) if p})
+    if not loaded:
+        return []
+    suppressed = db.execute(
+        text("SELECT phone FROM lending.suppression_list WHERE phone = ANY(:phones)"),
+        {"phones": loaded},
+    ).scalars().all()
+    pending = set(suppressed)
+    for phone, scrub in _stored_scrubs(db, loaded).items():
+        if not _verdict(phone, scrub).allowed:
+            pending.add(phone)
+    return sorted(pending)
 
 
 def _close_load_rows(db, phones: list[str]) -> None:
@@ -87,8 +117,17 @@ def weekly_scrub(
     dialer_remover: Optional[DialerRemover] = None,
 ) -> WeeklyScrubResult:
     """Does not commit; the caller commits after each successful run."""
-    targets = phones if phones is not None else stale_loaded_phones(db, now=now)
     result = WeeklyScrubResult()
+    # Retry removals a prior run already knows are due (no new scrub, no credit spent) —
+    # these never appear in stale_loaded_phones once their blocking scrub is fresh.
+    pending = pending_removal_phones(db)
+    if pending:
+        removed = _remove_from_dialer(pending, dialer_remover, RemovalReason.OPT_OUT, retry=True)
+        if removed:
+            result.blocked += len(removed)
+            _close_load_rows(db, list(removed))
+
+    targets = phones if phones is not None else stale_loaded_phones(db, now=now)
     for start in range(0, len(targets), batch_size):
         batch = targets[start:start + batch_size]
         if result.credits_used + len(batch) > max_credits:
@@ -99,6 +138,16 @@ def weekly_scrub(
                            max_credits, result.credits_used, result.left_unscrubbed)
             break
         scrubs = _scrub(db, batch, scrubber)
+        if not scrubs:
+            # _scrub returns {} only when the vendor call itself raised (already logged
+            # at ERROR there) — a legitimate all-miss response still returns one
+            # ScrubResult per phone. Nothing was actually billed, and these phones stay
+            # stale (blocked at dial time by dial_blocks/_hold_reason) until a later
+            # run's scrub succeeds, instead of being silently skipped forever.
+            result.scrub_batch_failures += 1
+            logger.error("[weekly-scrub] scrub batch of %d phone(s) returned no results; "
+                         "0 credits charged, phones remain stale and blocked at dial time", len(batch))
+            continue
         result.credits_used += len(batch)
         _stamp_contacts(db, scrubs)
         result.scrubbed += len(scrubs)
@@ -135,7 +184,11 @@ def main(argv: list[str] | None = None) -> int:
         result = weekly_scrub(session, scrubber=tracerfy_scrub, max_credits=args.max_credits,
                               batch_size=args.batch_size)
         session.commit()
-    return EXIT_CAP_REACHED if result.aborted else 0
+    if result.aborted:
+        return EXIT_CAP_REACHED
+    if result.scrub_batch_failures:
+        return EXIT_SCRUB_FAILED
+    return 0
 
 
 if __name__ == "__main__":

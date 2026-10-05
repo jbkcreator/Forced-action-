@@ -23,6 +23,8 @@ DEFAULT_BATCH_SIZE = 250
 
 Submit = Callable[[list[dict]], list[dict]]
 WriteLedger = Callable[[list[dict]], None]
+ReadContacts = Callable[[list[str]], dict[str, LeadContacts]]
+WriteContacts = Callable[[dict[str, LeadContacts]], None]
 
 
 @dataclass
@@ -59,17 +61,32 @@ def trace_staged_leads(
     write_ledger: WriteLedger,
     cap: RunSpendCap,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    read_contacts: Optional[ReadContacts] = None,
+    write_contacts: Optional[WriteContacts] = None,
 ) -> TraceOutcome:
+    """``read_contacts``/``write_contacts`` persist hits keyed by address, so a lead
+    already billed for (``ledger`` says so) but not used by *this* run's handoff still
+    has its paid-for contacts available on a later run, instead of being re-reported as
+    ``no_contact_data`` forever."""
     outcome = TraceOutcome()
     by_key: dict[str, list[Any]] = {}
+    already_traced_leads: list[Any] = []
     for lead in leads:
         key = trace_key(lead.property_address, lead.zip)
         if not key:
             outcome.skipped_unkeyable += 1
         elif not should_submit(key, NORMAL, ledger, BillingModel.PER_HIT):
             outcome.skipped_already_traced += 1
+            already_traced_leads.append(lead)
         else:
             by_key.setdefault(key, []).append(lead)
+
+    if already_traced_leads and read_contacts:
+        persisted = read_contacts([trace_key(lead.property_address, lead.zip) for lead in already_traced_leads])
+        for lead in already_traced_leads:
+            contacts = persisted.get(trace_key(lead.property_address, lead.zip))
+            if contacts and not contacts.is_empty:
+                outcome.contacts[lead.radar_id] = contacts
 
     keys = list(by_key)
     for start in range(0, len(keys), batch_size):
@@ -80,18 +97,37 @@ def trace_staged_leads(
             break
         cap.add(len(batch_keys) * CENTS_PER_HIT)
         rows = [_submit_row(by_key[k][0]) for k in batch_keys]
-        results = submit(rows)
+        try:
+            results = submit(rows)
+        except Exception as exc:
+            # submit() covers both the billing POST and the result poll; a poll failure
+            # happens only after Tracerfy already billed the batch, and we can't tell
+            # that apart from a submit-time failure here. Either way, a retry risks a
+            # double charge, so this batch's keys are written to the ledger as consumed
+            # (a zero-cost miss) rather than left to be re-submitted next run, and
+            # earlier batches' already-returned contacts are kept, not thrown away by
+            # letting this exception propagate out of the whole function.
+            logger.error("[pr-live-trace] batch submit/poll failed for %d address(es); treating as "
+                        "billed and consumed, not retrying: %s", len(batch_keys), type(exc).__name__)
+            write_ledger([_ledger_entry(key, False) for key in batch_keys])
+            outcome.submitted += len(batch_keys)
+            continue
         outcome.submitted += len(batch_keys)
         hits = {_core(trace_key(r.get("address"), "")): r for r in results if r.get("address")}
         entries = []
+        new_contacts: dict[str, LeadContacts] = {}
         for key in batch_keys:
             row = hits.get(_core(key))
             contacts = _contacts_from_row(row) if row else LeadContacts()
             for lead in by_key[key]:
                 if not contacts.is_empty:
                     outcome.contacts[lead.radar_id] = contacts
+            if not contacts.is_empty:
+                new_contacts[key] = contacts
             entries.append(_ledger_entry(key, not contacts.is_empty))
         write_ledger(entries)
+        if new_contacts and write_contacts:
+            write_contacts(new_contacts)
     return outcome
 
 

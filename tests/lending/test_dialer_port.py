@@ -135,6 +135,29 @@ def test_an_unconfirmed_campaign_step_refuses_before_any_contact_is_created():
     assert not [c for c in http.calls if c[0] != "GET"]
 
 
+class _PutFailsHttp(CampaignHttp):
+    """POST (add to campaign) succeeds; the follow-up PUT (card fields) always fails."""
+
+    def __call__(self, method, path, *, json=None):
+        if method == "PUT":
+            self.calls.append((method, path, json))
+            raise DialerRequestError("BatchDialer PUT /contact/55 HTTP 500", status=500)
+        return super().__call__(method, path, json=json)
+
+
+def test_a_failed_card_field_update_still_returns_the_created_contact_id(caplog):
+    """Finding #2: the contact is already live in BatchDialer's campaign once the POST
+    succeeds, so a failing field-update PUT must not make upsert_contact raise — that
+    would make the loader drop the record and leave a dialable contact with no
+    lending.dialer_load_records row to track or retry it."""
+    http = _PutFailsHttp([{"id": 7, "name": "Builders"}], body={"ids": [55], "success": True})
+    with caplog.at_level("WARNING"):
+        result = BatchDialerAdapter(http=http, endpoints=ENDPOINTS).upsert_contact(
+            PHONE, FIELDS, campaign="Builders", vendor_contact_id="staging:9")
+    assert result.contact_id == 55 and result.created is True
+    assert any("field update failed" in r.getMessage() for r in caplog.records)
+
+
 def test_update_is_a_full_put_that_keeps_the_phone():
     http = FakeHttp(body={})
     BatchDialerAdapter(http=http, endpoints=ENDPOINTS).update_contact("55", FIELDS, phone=PHONE)
@@ -174,12 +197,12 @@ def test_record_style_upsert_still_works_for_the_rules_code():
     assert BatchDialerAdapter(http=http, endpoints=ENDPOINTS).upsert_contact({"phone": PHONE}) == "42"
 
 
-def test_pool_campaign_tags_name_the_three_launch_queues():
+def test_pool_campaign_tags_name_the_four_ranked_queues_plus_nurture():
     from config import lending_queues as q
     from config.lending_dialer import POOL_CAMPAIGN_TAGS
     assert POOL_CAMPAIGN_TAGS == {q.VERIFIED_MATURITY: "Verified maturity",
                                   q.TRANSACTION_READY: "Transaction ready", q.BUILDERS: "Builders",
-                                  q.NURTURE: "Nurture"}
+                                  q.PARTNERS: "Partners", q.NURTURE: "Nurture"}
 
 
 # ── HTTP transport ──

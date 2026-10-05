@@ -30,6 +30,7 @@ from src.services.property_radar.lead_handoff import (
     HandoffReport,
     SqlHandoffStore,
     iter_staged_leads,
+    pretrace_eligible,
     run_handoff,
 )
 from src.services.property_radar.live_trace import trace_staged_leads
@@ -56,14 +57,57 @@ def _write_usage_ledger(session, entries: list[dict]) -> None:
              ":property_id, :target_address, :request_ref, :created_at)"),
         entries,
     )
+    # A real Tracerfy charge already happened for this batch (it is billed on submit,
+    # not on this write) — committing per batch, not at the end of the whole run,
+    # means a later batch's failure can never lose an earlier batch's paid-for ledger
+    # row or its persisted contacts (finding #8).
     session.commit()
 
 
-def _live_trace(session, campaign: str) -> dict[str, LeadContacts]:
+def _read_trace_contacts(session, keys: list[str]) -> dict[str, LeadContacts]:
+    if not keys:
+        return {}
+    rows = session.execute(
+        text("SELECT trace_key, emails, phones FROM property_radar_trace_contacts "
+             "WHERE trace_key = ANY(:keys)"),
+        {"keys": keys},
+    ).fetchall()
+    return {r.trace_key: LeadContacts(emails=tuple(r.emails), phones=tuple(r.phones)) for r in rows}
+
+
+def _write_trace_contacts(session, contacts_by_key: dict[str, LeadContacts]) -> None:
+    import json
+
+    session.execute(
+        text("INSERT INTO property_radar_trace_contacts (trace_key, emails, phones, traced_at) "
+             "VALUES (:trace_key, CAST(:emails AS jsonb), CAST(:phones AS jsonb), now()) "
+             "ON CONFLICT (trace_key) DO UPDATE SET emails = EXCLUDED.emails, "
+             "phones = EXCLUDED.phones, traced_at = EXCLUDED.traced_at"),
+        [
+            {"trace_key": key, "emails": json.dumps(list(c.emails)), "phones": json.dumps(list(c.phones))}
+            for key, c in contacts_by_key.items()
+        ],
+    )
+    session.commit()
+
+
+def _live_trace(session, campaign: str, *, thin_path_only: bool) -> dict[str, LeadContacts]:
     settings = get_settings()
     if not settings.property_radar_enabled:
         raise RuntimeError("--live-trace needs PROPERTY_RADAR_ENABLED=true")
-    leads = [lead for page in iter_staged_leads(session, campaign=campaign) for lead in page]
+    all_leads = [lead for page in iter_staged_leads(session, campaign=campaign) for lead in page]
+    facts = SqlHandoffStore(session).screening_facts(all_leads, {})
+    if not facts.backflip_feed_fresh:
+        logger.warning("[pr-live-trace] Backflip feed is stale; the handoff would skip every "
+                       "lead on backflip_feed_stale regardless of contacts, so skipping the "
+                       "trace entirely rather than paying Tracerfy for leads that can't be used")
+        return {}
+    leads = [
+        lead for lead in all_leads
+        if pretrace_eligible(lead, facts, thin_path_only=thin_path_only)[0]
+    ]
+    logger.info("PropertyRadar live trace: %d of %d staged leads are eligible to trace "
+                "(status/campaign/thin-path/already-handed-off filtered)", len(leads), len(all_leads))
     keys = {trace_key(lead.property_address, lead.zip) for lead in leads}
     outcome = trace_staged_leads(
         leads,
@@ -71,6 +115,8 @@ def _live_trace(session, campaign: str) -> dict[str, LeadContacts]:
         submit=_tracerfy_submit,
         write_ledger=lambda entries: _write_usage_ledger(session, entries),
         cap=RunSpendCap(settings.skip_trace_max_run_cost_cents),
+        read_contacts=lambda ks: _read_trace_contacts(session, ks),
+        write_contacts=lambda cs: _write_trace_contacts(session, cs),
     )
     logger.info("PropertyRadar live trace: submitted=%d already_traced=%d unkeyable=%d capped=%d",
                 outcome.submitted, outcome.skipped_already_traced, outcome.skipped_unkeyable, outcome.skipped_cap)
@@ -85,12 +131,17 @@ def run(
     apply: bool = False,
     live_trace: bool = False,
 ) -> HandoffReport:
+    if live_trace and not apply:
+        # Tracerfy bills on submit; a dry run can roll back its own DB writes but
+        # cannot un-charge a real trace, so --live-trace without --apply would spend
+        # real money and discard the result on every run.
+        raise RuntimeError("--live-trace requires --apply: it is billed immediately and cannot be a dry run")
     settings = get_settings()
     thin_path = settings.property_radar_thin_path_only if thin_path_only is None else thin_path_only
     contacts = load_trace_contacts(trace_results) if trace_results else {}
     with get_db_context() as session:
         if live_trace:
-            contacts = {**contacts, **_live_trace(session, campaign)}
+            contacts = {**contacts, **_live_trace(session, campaign, thin_path_only=thin_path)}
         report = run_handoff(
             store=SqlHandoffStore(session),
             pages=iter_staged_leads(session, campaign=campaign),

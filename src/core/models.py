@@ -11464,7 +11464,7 @@ class FaMaxBackflipCampaignContact(Base):
     """Current Backflip campaign membership; separate from permanent opt-outs."""
     __tablename__ = "fa_max_backflip_campaign_contacts"
 
-    identifier_kind: Mapped[str] = mapped_column(String(10), primary_key=True)
+    identifier_kind: Mapped[str] = mapped_column(String(20), primary_key=True)
     identifier_value: Mapped[str] = mapped_column(Text, primary_key=True)
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
     imported_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
@@ -12742,6 +12742,10 @@ class LendingCallingPoolStaging(Base):
     source_table: Mapped[str] = mapped_column(String, nullable=False)
     # Go Live Brief 2.5 source list (list_1..list_9); apply_lending_pool_source_tags.py
     source_tag: Mapped[Optional[str]] = mapped_column(String)
+    # F8 (Josh, Oct 4 §2): owner-occupied status of the target property, from
+    # properties.homestead_exempt. NULL for pools with no single subject property
+    # (mortgage_broker: the record is a professional, not a property owner).
+    homestead_exempt: Mapped[Optional[bool]] = mapped_column(Boolean)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

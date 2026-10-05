@@ -46,7 +46,7 @@ class LendingSuppression(LendingBase):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     phone: Mapped[Optional[str]] = mapped_column(String(20), unique=True)  # phone_utils.normalize
     email: Mapped[Optional[str]] = mapped_column(String(255), unique=True)  # lower-cased
-    reason: Mapped[str] = mapped_column(String(30), nullable=False)  # SuppressionReason: OPT_OUT / LITIGATOR
+    reason: Mapped[str] = mapped_column(String(30), nullable=False)  # SuppressionReason: OPT_OUT / LITIGATOR / WARM_NETWORK
     source_channel: Mapped[str] = mapped_column(String(30), nullable=False)  # sms / email / dialer / backfill:*
     source_ref: Mapped[Optional[str]] = mapped_column(String(100))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))

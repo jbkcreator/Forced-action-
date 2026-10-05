@@ -296,6 +296,10 @@ class CallingPoolRecord:
     # Go Live: brief source list (list_1..list_9); set by _finalize_run_metadata.
     source_tag: Optional[str] = None
     stalled_flip: bool = False
+    # F8 (Josh, Oct 4 §2): owner-occupied status of the target property, from
+    # properties.homestead_exempt. None for pools with no single subject property
+    # (mortgage_broker: the record is a professional, not a property owner).
+    homestead_exempt: Optional[bool] = None
 
 
 # ---------------------------------------------------------------------------
@@ -434,6 +438,7 @@ def _extract_pool1_wholesaler_flipper(
                 p.city                          AS prop_city,
                 p.state                         AS prop_state,
                 p.zip                           AS prop_zip,
+                p.homestead_exempt              AS homestead_exempt,
                 d.sale_price                    AS last_sale_price,
                 d.record_date                   AS last_purchase_date,
                 EXISTS (SELECT 1 FROM deeds later
@@ -531,6 +536,7 @@ def _extract_pool1_wholesaler_flipper(
             source_property_id=row.source_property_id,
             source_table="buyer_entities",
             stalled_flip=is_stalled_flip(_as_date(row.last_purchase_date), resold=bool(row.resold)),
+            homestead_exempt=row.homestead_exempt,
         ))
 
     logger.info("Pool 1 wholesaler_flipper: %d raw rows", len(records))
@@ -705,8 +711,12 @@ def _extract_pool3_mortgage_broker(session: Session, county_ids: list[str]) -> l
 
     Aircall tag: DESK_RESCUE.
     """
-    # Wave 0 target counties, upper-cased to match OFR's COUNTY text column.
-    target_counties = [c.upper() for c in WAVE0_COUNTY_NAMES]
+    # Target counties, upper-cased to match OFR's COUNTY text column. Derived
+    # from the actually-requested county_ids (slugs, e.g. "hillsborough" ->
+    # "HILLSBOROUGH"), not the global WAVE0_COUNTY_NAMES constant — a
+    # single-county CLI run (--counties Hillsborough) must not silently stage
+    # every other county's brokers/LOs too.
+    target_counties = [c.upper() for c in county_ids]
 
     # Brokers and LOs are independent OFR datasets with independent load status —
     # one being missing/empty must never silently suppress the other.
@@ -727,6 +737,7 @@ def _extract_pool3_mortgage_broker(session: Session, county_ids: list[str]) -> l
             FROM ofr_mortgage_brokers
             WHERE status = 'Approved'
               AND UPPER(COALESCE(county, '')) = ANY(:counties)
+              AND UPPER(COALESCE(prim_state, '')) = 'FL'
         """),
         {"counties": target_counties},
     ).fetchall()
@@ -779,13 +790,15 @@ def _extract_pool3_mortgage_broker(session: Session, county_ids: list[str]) -> l
 def _extract_pool3b_loan_originators(session: Session, target_counties: list[str]) -> list[CallingPoolRecord]:
     """List 4 (part 2): individual Loan Originators — Josh's 'brokers and LOs' naming.
 
-    Same county-match filter as the broker query (not prim_state): the OFR LO
-    file is a nationwide NMLS registry where 'county' is the individual's own
-    home county, frequently out-of-state (confirmed from real sample data —
-    Michigan, Oregon addresses). Matching on county naturally narrows this down
-    to LOs actually based in our target counties — the population that makes
-    sense for an in-person/local referral relationship, not a nationwide cold-
-    call list.
+    Same county-match filter as the broker query, PLUS a prim_state='FL' check:
+    the OFR LO file is a nationwide NMLS registry where 'county' is the
+    individual's own home county, frequently out-of-state (confirmed from real
+    sample data — Michigan, Oregon addresses). County-name matching alone is
+    not sufficient: "Hillsborough" is also a real county in New Hampshire, so
+    an NH-based LO holding a remote FL license would otherwise match on county
+    name and get staged with state='NH', silently entering the Florida nurture
+    queue and inflating Hillsborough-FL counts in client reports (found in
+    code review). The state filter is required, not optional.
 
     Fail-closed until ofr_loan_originators exists AND holds rows, same as
     the broker table — never fabricates LOs from an absent/empty load.
@@ -807,6 +820,7 @@ def _extract_pool3b_loan_originators(session: Session, target_counties: list[str
             FROM ofr_loan_originators
             WHERE status = 'Approved'
               AND UPPER(COALESCE(county, '')) = ANY(:counties)
+              AND UPPER(COALESCE(prim_state, '')) = 'FL'
         """),
         {"counties": target_counties},
     ).fetchall()
@@ -1072,6 +1086,7 @@ def permit_owner_record(row: Any) -> CallingPoolRecord:
         buyer_entity_id=None, permit_number=row.permit_number, dbpr_license_number=None,
         source_property_id=row.source_property_id, source_table="building_permits",
         source_tag="list_7",
+        homestead_exempt=row.homestead_exempt,
     )
 
 
@@ -1100,7 +1115,8 @@ def _extract_list7_permit_owners(session: Session, county_ids: list[str]) -> lis
                 bp.property_id AS source_property_id, bp.permit_number, bp.permit_type, bp.issue_date,
                 bp.job_value, bp.county_id, c.display_name AS county_name,
                 p.parcel_id, p.address AS prop_address, p.city AS prop_city, p.state AS prop_state,
-                p.zip AS prop_zip, o.owner_name, COALESCE(o.phone_1, o.phone_2, o.phone_3) AS owner_phone,
+                p.zip AS prop_zip, p.homestead_exempt, o.owner_name,
+                COALESCE(o.phone_1, o.phone_2, o.phone_3) AS owner_phone,
                 o.email_1 AS owner_email
             FROM building_permits bp
             JOIN counties c ON c.county_id = bp.county_id
@@ -1143,6 +1159,7 @@ def auction_winner_record(row: Any) -> CallingPoolRecord:
         buyer_entity_id=None, permit_number=None, dbpr_license_number=None,
         source_property_id=row.property_id, source_table="tax_deed_auctions",
         source_tag="list_6",
+        homestead_exempt=row.homestead_exempt,
     )
 
 
@@ -1152,7 +1169,8 @@ def _extract_auction_winners(session: Session, county_ids: list[str]) -> list[Ca
             SELECT tda.id AS auction_id, tda.sold_to, tda.sold_amount, tda.property_id,
                    COALESCE(tda.parcel_id, p.parcel_id) AS parcel_id,
                    tda.county_id, c.display_name AS county_name,
-                   p.address AS prop_address, p.city AS prop_city, p.state AS prop_state, p.zip AS prop_zip
+                   p.address AS prop_address, p.city AS prop_city, p.state AS prop_state, p.zip AS prop_zip,
+                   p.homestead_exempt
             FROM tax_deed_auctions tda
             LEFT JOIN properties p ON p.id = tda.property_id
             LEFT JOIN counties c ON c.county_id = tda.county_id
@@ -1216,16 +1234,24 @@ def _write_to_staging(session: Session, records: list[CallingPoolRecord]) -> int
         "financing_intent_score", "intent_tier", "recommended_product",
         "aircall_campaign_tag",
         "buyer_entity_id", "permit_number", "dbpr_license_number",
-        "source_property_id", "source_table", "created_at", "source_tag",
+        "source_property_id", "source_table", "created_at", "source_tag", "homestead_exempt",
     ]
 
     # One multi-row INSERT per batch: a single round trip, unlike per-row executemany
-    # (a ~19k-row run took minutes over the remote connection). Commit per batch.
+    # (a ~19k-row run took minutes over the remote connection). All batches share one
+    # transaction, committed only once every batch has succeeded — a mid-run failure
+    # (a dropped connection on batch 3 of 5, say) must leave nothing committed from
+    # this run_id, not a partial run that latest_run_id() would otherwise pick as
+    # "newest" over the previous complete one (finding #12).
     batch_size = 1000
     written = 0
-    for i in range(0, len(records), batch_size):
-        batch = [{c: getattr(r, c) for c in cols} for r in records[i:i + batch_size]]
-        session.execute(insert(LendingCallingPoolStaging).values(batch))
+    try:
+        for i in range(0, len(records), batch_size):
+            batch = [{c: getattr(r, c) for c in cols} for r in records[i:i + batch_size]]
+            session.execute(insert(LendingCallingPoolStaging).values(batch))
+            written += len(batch)
         session.commit()
-        written += len(batch)
+    except Exception:
+        session.rollback()
+        raise
     return written

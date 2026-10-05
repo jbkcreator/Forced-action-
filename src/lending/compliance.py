@@ -22,8 +22,10 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
 
+from src.lending.dialer_removal import DialerRemovalUndecided
 from config.lending_compliance import (
     AREA_CODE_TZ,
+    ATTEMPT_HISTORY_BUSINESS_DAYS,
     ATTEMPT_PERIOD_HOURS,
     CALL_WINDOW_END,
     CALL_WINDOW_START,
@@ -36,7 +38,10 @@ from config.lending_compliance import (
     DNC_SCRUB_MAX_AGE_DAYS,
     GHL_DND_BATCH,
     GEORGIA_ALLOWED_ENTITY_TYPES,
+    HOMESTEAD_GATE_EXCLUDED_SOURCE_TAGS,
+    INVESTOR_ENTITY_TYPES,
     MAX_ATTEMPTS_PER_PERIOD,
+    MAX_ATTEMPTS_TOTAL,
     OPT_OUT_EXCLUDED_SOURCES,
     OPT_OUT_POLL_LOCK_KEY,
     SMS_OPT_OUT_SOURCES,
@@ -96,6 +101,26 @@ def _georgia_blocked(record: dict) -> bool:
     return (record.get("entity_status") or "").strip().upper() not in GEORGIA_ALLOWED_ENTITY_TYPES
 
 
+def _homestead_blocked(record: dict) -> bool:
+    """F8 (Josh, Oct 4 §2): "Owner is an LLC, LP or corporation, or a non owner
+    occupied investor. Homestead is out." Does not apply to List 4 (brokers/LOs)
+    — a professional referral list, never screened as a property owner.
+
+    Blocks only a *confirmed* homestead-exempt property (``homestead_exempt is
+    True``). Josh's rule describes two allowed categories and says nothing about
+    an unverified status, and properties.homestead_exempt has no backfill pipeline
+    yet — nearly every current record is NULL. Treating NULL as blocked would gate
+    out virtually the entire pool, directly against his #1 stated priority (lead
+    volume). Unknown passes through like every other unscored field here; this
+    narrows automatically as real homestead data backfills in.
+    """
+    if (record.get("source_tag") or "").strip().lower() in HOMESTEAD_GATE_EXCLUDED_SOURCE_TAGS:
+        return False
+    if (record.get("entity_status") or "").strip().upper() in INVESTOR_ENTITY_TYPES:
+        return False
+    return record.get("homestead_exempt") is True
+
+
 def _suppressed_phones(db, phones: list[str]) -> set[str]:
     rows = db.execute(
         text(
@@ -106,6 +131,27 @@ def _suppressed_phones(db, phones: list[str]) -> set[str]:
         {"phones": phones, "tracerfy": TRACERFY_DNC_SOURCE},
     ).fetchall()
     return {r[0] for r in rows}
+
+
+def suppress_warm_network_phones(db, phones: list[str], *, source_ref: Optional[str] = None) -> int:
+    """Permanently suppress Josh's warm network from the cold dialer queue (Oct 4
+    §2: "not in my warm network, permanently suppressed from the cold queue"). Not
+    an opt-out — he still works these relationships himself — so it is its own
+    SuppressionReason, but it is checked by the exact same ``_suppressed_phones``
+    gate every other suppression_list row already goes through: no second filter
+    path to keep in sync. Idempotent (ON CONFLICT on the unique phone column); does
+    not commit."""
+    normalized = sorted({p for p in (normalize_phone(x) for x in phones) if p})
+    if not normalized:
+        return 0
+    db.execute(
+        text(
+            "INSERT INTO lending.suppression_list (phone, reason, source_channel, source_ref) "
+            "VALUES (:phone, :reason, 'warm_network', :source_ref) ON CONFLICT (phone) DO NOTHING"
+        ),
+        [{"phone": p, "reason": SuppressionReason.WARM_NETWORK.value, "source_ref": source_ref} for p in normalized],
+    )
+    return len(normalized)
 
 
 def _stored_scrubs(db, phones: list[str]) -> dict[str, ScrubResult]:
@@ -159,6 +205,8 @@ def filter_loadable(
             early[i] = _blocked(raw, ReasonCode.INVALID_PHONE)
         elif _georgia_blocked(record):
             early[i] = _blocked(phone, ReasonCode.GA_NATURAL_PERSON)
+        elif _homestead_blocked(record):
+            early[i] = _blocked(phone, ReasonCode.HOMESTEAD_OWNER_OCCUPIED)
 
     candidates = sorted({p for i, p in enumerate(phones) if p and i not in early})
     by_phone: dict[str, GateResult] = {}
@@ -166,6 +214,10 @@ def filter_loadable(
     suppressed = _suppressed_phones(db, candidates) if candidates else set()
     by_phone.update({p: _blocked(p, ReasonCode.SUPPRESSED) for p in suppressed})
     candidates = [p for p in candidates if p not in suppressed]
+
+    exhausted = _attempt_history_exhausted_phones(db, candidates, now) if candidates else set()
+    by_phone.update({p: _blocked(p, ReasonCode.ATTEMPT_HISTORY_EXCEEDED) for p in exhausted})
+    candidates = [p for p in candidates if p not in exhausted]
 
     scrubs = _stored_scrubs(db, candidates) if candidates else {}
     fresh = {p: s for p, s in scrubs.items() if s.checked_at >= cutoff}
@@ -270,7 +322,7 @@ def _stamp_contacts(db, scrubs: dict[str, ScrubResult]) -> None:
     )
 
 
-NURTURE_REASONS = frozenset({ReasonCode.NATIONAL_DNC, ReasonCode.STATE_DNC})
+NURTURE_REASONS = frozenset({ReasonCode.NATIONAL_DNC, ReasonCode.STATE_DNC, ReasonCode.ATTEMPT_HISTORY_EXCEEDED})
 
 
 def _flag_nurture(db, phones: list[str]) -> None:
@@ -373,9 +425,12 @@ def a2_coverage_report(db, phones: list[str], *, now: Optional[datetime] = None)
 # ── Call-time gate (WP-W0-3) ─────────────────────────────────────────────────
 
 
-def recipient_timezone(phone: str, zip_code: Optional[str] = None) -> ZoneInfo:
-    """Wave 0 pools are Hillsborough/Pinellas: a ZIP in either is Eastern.
-    Otherwise area code, defaulting to Eastern."""
+def recipient_timezone(phone: str, zip_code: Optional[str] = None) -> Optional[ZoneInfo]:
+    """Wave 0 pools are Hillsborough/Pinellas: a ZIP in either is Eastern. Otherwise
+    area code: ``AREA_CODE_TZ``'s deliberate FL/GA overrides first (850 is kept
+    Central even though NANP assigns it Eastern, the over-suppressing direction),
+    then the full NANP table. ``None`` means the timezone could not be determined —
+    the caller must fail closed (never treat an unmapped code as Eastern)."""
     if zip_code:
         from src.utils.zip_centroids import get_zip_centroid
 
@@ -384,7 +439,30 @@ def recipient_timezone(phone: str, zip_code: Optional[str] = None) -> ZoneInfo:
     digits = "".join(c for c in phone if c.isdigit())
     if digits.startswith("1"):
         digits = digits[1:]
-    return ZoneInfo(AREA_CODE_TZ.get(digits[:3], DEFAULT_TZ))
+    mapped = AREA_CODE_TZ.get(digits[:3])
+    if mapped:
+        return ZoneInfo(mapped)
+    tz_name = _nanp_timezone(phone)
+    return ZoneInfo(tz_name) if tz_name else None
+
+
+def _nanp_timezone(phone: str) -> Optional[str]:
+    """One unambiguous IANA zone for a NANP number via libphonenumber's own area-code
+    table (already a project dependency), or None if the number is invalid or maps to
+    more than one zone (an area code spanning zones must fail closed, not guess)."""
+    import phonenumbers
+    from phonenumbers import timezone as phonenumbers_timezone
+
+    try:
+        parsed = phonenumbers.parse(phone if phone.startswith("+") else f"+1{phone}", None)
+    except phonenumbers.NumberParseException:
+        return None
+    if not phonenumbers.is_valid_number(parsed):
+        return None
+    zones = phonenumbers_timezone.time_zones_for_number(parsed)
+    if len(zones) != 1 or zones[0] == "Etc/Unknown":
+        return None
+    return zones[0]
 
 
 def can_dial_now(
@@ -410,13 +488,23 @@ def can_dial_now(
     if _outside_call_window(normalized, now, zip_code, seat_group):
         return _blocked(normalized, ReasonCode.OUTSIDE_CALL_WINDOW)
 
-    return _attempt_cap(db, normalized, now)
+    cap_result = _attempt_cap(db, normalized, now)
+    if not cap_result.allowed:
+        return cap_result
+    if _attempt_history_exhausted_phones(db, [normalized], now):
+        return _blocked(normalized, ReasonCode.ATTEMPT_HISTORY_EXCEEDED)
+    return cap_result
 
 
 def _outside_call_window(
     phone: str, now: datetime, zip_code: Optional[str] = None, seat_group: Optional[str] = None
 ) -> bool:
-    local = now.astimezone(recipient_timezone(phone, zip_code)).time()
+    tz = recipient_timezone(phone, zip_code)
+    if tz is None:
+        logger.warning("[lending-compliance] no timezone for phone_hash=%s; call window fails closed",
+                       phone_hash(phone)[:12])
+        return True
+    local = now.astimezone(tz).time()
     if not (CALL_WINDOW_START <= local < CALL_WINDOW_END):
         return True
     start, end = SHIFT_GROUPS.get(seat_group, (ET_WINDOW_START, ET_WINDOW_END)) if seat_group else (
@@ -439,6 +527,56 @@ def _attempt_cap(db, phone: str, now: datetime) -> GateResult:
     return GateResult(phone=phone, allowed=True)
 
 
+def _business_days_ago(now: datetime, business_days: int) -> datetime:
+    """``now`` minus N business days, skipping Sat/Sun — a rolling compliance window,
+    not a trading-holiday calendar."""
+    remaining = business_days
+    cursor = now
+    while remaining > 0:
+        cursor -= timedelta(days=1)
+        if cursor.weekday() < 5:  # Mon=0 .. Fri=4
+            remaining -= 1
+    return cursor
+
+
+def _total_attempt_counts(db, phones: list[str], since: datetime, now: datetime) -> dict[str, int]:
+    """All outbound attempts per phone since ``since`` — unlike ``_attempt_counts``'s
+    rolling 24h, this spans the full ``ATTEMPT_HISTORY_BUSINESS_DAYS`` window (Josh,
+    Oct 4 answers §6: 3 per 24h, 6 total over 10 business days, then nurture)."""
+    if not phones:
+        return {}
+    rows = db.execute(
+        text(
+            "SELECT phone, count(*) FROM lending.call_dispositions "
+            "WHERE phone = ANY(:phones) AND (direction = 'outbound' OR direction IS NULL) "
+            "AND call_ended_at > :since AND call_ended_at <= :now GROUP BY phone"
+        ),
+        {"phones": phones, "since": since, "now": now},
+    ).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
+def _attempt_history_exhausted_phones(db, phones: list[str], now: datetime) -> set[str]:
+    since = _business_days_ago(now, ATTEMPT_HISTORY_BUSINESS_DAYS)
+    counts = _total_attempt_counts(db, phones, since, now)
+    return {p for p, n in counts.items() if n >= MAX_ATTEMPTS_TOTAL}
+
+
+def _close_exhausted_load_row(db, phone: str) -> None:
+    """Permanently closes the load row once total attempt history crosses the cap.
+    Unlike a CALL_WINDOW/ATTEMPT_CAP/SCRUB_STALE hold, this can never un-do itself
+    (the count only grows), so the contact must leave the active pool for good and
+    move to nurture — the same disposition as a DNC/litigator verdict, not a
+    temporary sweep hold."""
+    db.execute(
+        text(
+            "UPDATE lending.dialer_load_records SET active = false, deactivated_at = now(), "
+            "deactivation_reason = 'attempt_history_exhausted' WHERE active AND phone = :phone"
+        ),
+        {"phone": phone},
+    )
+
+
 def on_attempt_recorded(
     db,
     phone: Optional[str],
@@ -446,17 +584,26 @@ def on_attempt_recorded(
     now: Optional[datetime] = None,
     dialer_remover: Optional[DialerRemover] = None,
 ) -> Optional[GateResult]:
-    """WP-W0-6 hook, called after every call.ended row commits. At the cap, pull the
-    contact from the dialer pool. Idempotent: a replay re-counts the same rows and
-    re-issues the same removal (a no-op for a contact already out of the pool).
-    Restoring after 24 h is the step-5 sweep's job. Does not commit."""
+    """WP-W0-6 hook, called after every call.ended row commits. At the 24h cap, pull
+    the contact from the dialer pool (restoring after 24h is the step-5 sweep's job).
+    At the total-history cap, the move is permanent: flag nurture, remove from the
+    dialer and close the load row, rather than a temporary hold. Idempotent: a replay
+    re-counts the same rows and re-issues the same removal (a no-op for a contact
+    already out of the pool). Does not commit."""
     normalized = normalize_phone(phone) if phone else None
     if not normalized:
         return None
-    result = _attempt_cap(db, normalized, now or datetime.now(timezone.utc))
+    now = now or datetime.now(timezone.utc)
+    result = _attempt_cap(db, normalized, now)
     if not result.allowed:
         if _remove_from_dialer([normalized], dialer_remover, RemovalReason.ATTEMPT_CAP):
             _open_holds(db, {normalized: RemovalReason.ATTEMPT_CAP})
+        return result
+    if _attempt_history_exhausted_phones(db, [normalized], now):
+        _flag_nurture(db, [normalized])
+        _remove_from_dialer([normalized], dialer_remover, RemovalReason.ATTEMPT_HISTORY)
+        _close_exhausted_load_row(db, normalized)
+        return _blocked(normalized, ReasonCode.ATTEMPT_HISTORY_EXCEEDED)
     return result
 
 
@@ -504,27 +651,57 @@ def _attempt_counts(db, phones: list[str], now: datetime) -> dict[str, int]:
     return {r[0]: r[1] for r in rows}
 
 
+def _stale_scrub_phones(db, phones: list[str], now: datetime) -> set[str]:
+    """Phones with no scrub, or one older than the freshness window — the weekly job's
+    README says these are "blocked from dialing until rescrubbed"; this is what
+    actually enforces that, since the weekly job itself only checks freshness at load
+    time, not at every dial."""
+    if not phones:
+        return set()
+    cutoff = now - timedelta(days=DNC_SCRUB_MAX_AGE_DAYS)
+    scrubs = _stored_scrubs(db, phones)
+    return {p for p in phones if p not in scrubs or scrubs[p].checked_at < cutoff}
+
+
 def dial_blocks(db, phones: list[str], *, now: Optional[datetime] = None) -> dict[str, ReasonCode]:
     """``can_dial_now`` for many phones in one query: phone -> reason for each one that
-    cannot be dialed now (attempt cap first, then the calling window)."""
+    cannot be dialed now (attempt cap, total attempt history, the calling window, then
+    scrub freshness)."""
     if not phones:
         return {}
     now = now or datetime.now(timezone.utc)
     counts = _attempt_counts(db, phones, now)
+    stale = _stale_scrub_phones(db, phones, now)
+    exhausted = _attempt_history_exhausted_phones(db, phones, now)
     blocks: dict[str, ReasonCode] = {}
     for phone in phones:
         if counts.get(phone, 0) >= MAX_ATTEMPTS_PER_PERIOD:
             blocks[phone] = ReasonCode.ATTEMPT_CAP_REACHED
+        elif phone in exhausted:
+            blocks[phone] = ReasonCode.ATTEMPT_HISTORY_EXCEEDED
         elif _outside_call_window(phone, now):
             blocks[phone] = ReasonCode.OUTSIDE_CALL_WINDOW
+        elif phone in stale:
+            blocks[phone] = ReasonCode.NO_FRESH_SCRUB
     return blocks
 
 
-def _hold_reason(phone: str, attempts: int, now: datetime) -> Optional[RemovalReason]:
+def _hold_reason(
+    phone: str, attempts: int, now: datetime, *, stale_scrub: bool = False, history_exhausted: bool = False,
+) -> Optional[RemovalReason]:
     if attempts >= MAX_ATTEMPTS_PER_PERIOD:
         return RemovalReason.ATTEMPT_CAP
+    if history_exhausted:
+        # Defense in depth: on_attempt_recorded already closes the load row and
+        # removes the contact the moment the total-history cap is crossed, so the
+        # sweep should never actually find one of these still active. If it does
+        # (a missed disposition event, say), this never releases — the count can
+        # only grow — matching on_attempt_recorded's permanent-move-to-nurture intent.
+        return RemovalReason.ATTEMPT_HISTORY
     if _outside_call_window(phone, now):
         return RemovalReason.CALL_WINDOW
+    if stale_scrub:
+        return RemovalReason.SCRUB_STALE
     return None
 
 
@@ -555,10 +732,16 @@ def sweep_dialer_pool(
     loaded = sorted({p for p in (normalize_phone(x) for x in (loaded_phones or _default_loaded_phones)(db)) if p})
     active = [p for p in loaded if p not in held]
     counts = _attempt_counts(db, active, now) if active else {}
-    to_pull = {p: r for p in active if (r := _hold_reason(p, counts.get(p, 0), now))}
+    stale = _stale_scrub_phones(db, active, now) if active else set()
+    exhausted = _attempt_history_exhausted_phones(db, active, now) if active else set()
+    to_pull = {
+        p: r for p in active
+        if (r := _hold_reason(p, counts.get(p, 0), now, stale_scrub=p in stale, history_exhausted=p in exhausted))
+    }
 
     pulled = 0
-    for reason in (RemovalReason.ATTEMPT_CAP, RemovalReason.CALL_WINDOW):
+    for reason in (RemovalReason.ATTEMPT_CAP, RemovalReason.CALL_WINDOW, RemovalReason.SCRUB_STALE,
+                   RemovalReason.ATTEMPT_HISTORY):
         phones = [p for p, r in to_pull.items() if r is reason]
         done = _remove_from_dialer(phones, dialer_remover, reason)
         if done:
@@ -577,8 +760,12 @@ def _release_holds(db, held: list[str], now: datetime, dialer_restorer: Optional
         return 0
     suppressed = _suppressed_phones(db, held)
     counts = _attempt_counts(db, held, now)
+    stale = _stale_scrub_phones(db, held, now)
+    exhausted = _attempt_history_exhausted_phones(db, held, now)
     closing: list[dict] = [{"phone": p, "why": "suppressed"} for p in held if p in suppressed]
-    ready = [p for p in held if p not in suppressed and _hold_reason(p, counts.get(p, 0), now) is None]
+    ready = [p for p in held if p not in suppressed
+             and _hold_reason(p, counts.get(p, 0), now, stale_scrub=p in stale,
+                              history_exhausted=p in exhausted) is None]
 
     restorer = dialer_restorer or _default_dialer_restorer()
     restored = 0
@@ -856,11 +1043,6 @@ def _propagate(db, opt_outs: list[_OptOut], dialer_remover: Optional[DialerRemov
     return event_ids
 
 
-# The dialer adapter raises this while an endpoint is unconfirmed (UnconfirmedCapability).
-# Expected state, not a fault: warn on the first attempt, stay quiet on 15 s retries.
-_UNDECIDED_REMOVAL = "DialerRemovalUndecided"
-
-
 def _remove_from_dialer(
     phones: list[str],
     dialer_remover: Optional[DialerRemover],
@@ -881,7 +1063,11 @@ def _remove_from_dialer(
             done[phone] = datetime.now(timezone.utc)
         except Exception as exc:
             kind = _error_kind(exc)
-            if kind == _UNDECIDED_REMOVAL:
+            # The dialer adapter raises DialerRemovalUndecided (e.g. UnconfirmedCapability)
+            # while an endpoint is unconfirmed. Expected state, not a fault: warn on the
+            # first attempt, stay quiet on 15 s retries. Checked on the exception instance,
+            # not the stringified class name, so subclasses are still recognized.
+            if isinstance(exc, DialerRemovalUndecided):
                 level = logger.debug if retry else logger.warning
             else:
                 level = logger.error

@@ -143,7 +143,18 @@ class BatchDialerAdapter:
         if contact_id is None:
             raise DialerRequestError("dialer returned no contact id")
         if campaign is not None:
-            self.update_contact(contact_id, fields, phone=phone, vendor_contact_id=vendor_contact_id)
+            try:
+                self.update_contact(contact_id, fields, phone=phone, vendor_contact_id=vendor_contact_id)
+            except DialerRequestError as exc:
+                # The contact already exists in the campaign and will be dialed regardless
+                # of whether the card-field PUT lands, so this must not be treated like a
+                # failed upsert (losing the contact id would leave a live contact with no
+                # load record). Let the caller store it with this id: the next load run's
+                # known-contact-id path (_push_contact) retries the PUT.
+                logger.warning(
+                    "[dialer] BatchDialer contact %s created but field update failed: %s",
+                    contact_id, type(exc).__name__,
+                )
         return ContactUpsertResult(contact_id=contact_id, created=True)
 
     def update_contact(self, contact_id: Any, fields: DialerContactFields, *, phone: Optional[str] = None,

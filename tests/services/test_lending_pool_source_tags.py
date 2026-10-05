@@ -43,12 +43,14 @@ def test_stalled_flip_rule(bought, resold, stalled):
 def test_auction_winner_row_becomes_a_phoneless_list_6_record():
     row = SimpleNamespace(sold_to="ACME HOLDINGS LLC", sold_amount=150000, property_id=9, parcel_id="P-9",
                           county_id="hillsborough", county_name="Hillsborough", prop_address="1 Main St",
-                          prop_city="Tampa", prop_state="FL", prop_zip="33602", auction_id=77)
+                          prop_city="Tampa", prop_state="FL", prop_zip="33602", auction_id=77,
+                          homestead_exempt=None)
     rec = pe.auction_winner_record(row)
     assert rec.pool_name == "auction_winner" and rec.source_tag == "list_6"
     assert rec.entity_name == "ACME HOLDINGS LLC" and rec.entity_status == "LLC"
     assert rec.phone_available is False and rec.normalized_phone is None
     assert rec.source_table == "tax_deed_auctions" and rec.target_property_address.startswith("1 Main St")
+    assert rec.homestead_exempt is None
 
 
 @pytest.mark.skipif(not __import__("os").environ.get("DATABASE_URL"), reason="requires a live Postgres DATABASE_URL")
@@ -101,7 +103,8 @@ def test_staging_write_persists_every_column_including_source_tag():
         run_id = str(uuid.uuid4())
         row = SimpleNamespace(sold_to="ACME HOLDINGS LLC", sold_amount=150000, property_id=None, parcel_id="P-9",
                               county_id="hillsborough", county_name="Hillsborough", prop_address="1 Main St",
-                              prop_city="Tampa", prop_state="FL", prop_zip="33602", auction_id=77)
+                              prop_city="Tampa", prop_state="FL", prop_zip="33602", auction_id=77,
+                              homestead_exempt=None)
         rec = pe.auction_winner_record(row)
         rec.run_id = run_id
         assert pe._write_to_staging(session, [rec]) == 1
@@ -122,7 +125,8 @@ def _permit_row(**over):
                job_value=400000, permit_type="Residential New Construction and Additions",
                issue_date=date(2026, 8, 1), permit_number="BP-77", county_id="hillsborough",
                county_name="Hillsborough", source_property_id=5, parcel_id="P-77",
-               prop_address="77 Oak St", prop_city="Tampa", prop_state="FL", prop_zip="33602")
+               prop_address="77 Oak St", prop_city="Tampa", prop_state="FL", prop_zip="33602",
+               homestead_exempt=None)
     row.update(over)
     return SimpleNamespace(**row)
 
@@ -134,6 +138,15 @@ def test_a_permit_owner_becomes_a_list_7_builders_record():
     assert rec.entity_name == "SUNSHINE HOMES LLC" and rec.entity_status == "LLC"
     assert rec.estimated_loan_value == Decimal("340000.00")          # 85% LTC of the permit value
     assert "New Construction" in rec.recent_permit_details and rec.permit_number == "BP-77"
+
+
+def test_a_permit_owners_homestead_status_flows_through_to_the_record():
+    """F8: the gate checks CallingPoolRecord.homestead_exempt, so it must actually
+    carry the property's real status through, not just default silently to None."""
+    rec = pe.permit_owner_record(_permit_row(homestead_exempt=True))
+    assert rec.homestead_exempt is True
+    rec = pe.permit_owner_record(_permit_row(homestead_exempt=False))
+    assert rec.homestead_exempt is False
 
 
 def test_a_permit_owner_without_a_phone_is_staged_for_tracing():

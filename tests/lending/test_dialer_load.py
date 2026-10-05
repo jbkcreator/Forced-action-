@@ -31,13 +31,16 @@ EMPTY_INDEX = BackflipIdentifierIndex(block_reason=None)
 
 
 class FakeAircall:
-    def __init__(self, fail_phones=(), missing_ids=()):
+    def __init__(self, fail_phones=(), missing_ids=(), fail_remove_phones=(), undecided_remove_phones=()):
         self.upserts: list[str] = []
         self.campaigns: list = []
         self.updates: list[int] = []
+        self.removed: list[tuple[str, str]] = []
         self._next_id = 1000
         self._fail = set(fail_phones)
         self._missing = set(missing_ids)
+        self._fail_remove = set(fail_remove_phones)
+        self._undecided_remove = set(undecided_remove_phones)
 
     def upsert_contact(self, phone, fields, *, campaign=None, vendor_contact_id=None):
         self.campaigns.append(campaign)
@@ -52,6 +55,14 @@ class FakeAircall:
             raise DialerRequestError("POST /contacts/id", status=404)
         self.updates.append(contact_id)
         return {"id": contact_id}
+
+    def remove(self, phone, *, reason):
+        if phone in self._undecided_remove:
+            from src.lending.dialer_port import UnconfirmedCapability
+            raise UnconfirmedCapability("campaign_remove not confirmed")
+        if phone in self._fail_remove:
+            raise DialerRequestError("POST /campaign/remove", status=500)
+        self.removed.append((phone, reason))
 
 
 @pytest.fixture
@@ -232,6 +243,33 @@ class TestReload:
         assert [(r.run_id, r.active, r.deactivation_reason) for r in rows] == [
             ("run-1", False, "superseded"), ("run-2", True, None)]
         assert rows[0].dialer_contact_id == rows[1].dialer_contact_id
+
+    def test_a_changed_pool_moves_the_dialer_campaign_not_just_the_fields(self, db):
+        """Finding #10: a phone re-loaded under a different pool must leave its old
+        campaign and join the new one, not just get an in-place field update that
+        leaves BatchDialer dialing the old campaign forever."""
+        _fresh_scrub(db, P1)
+        _run(db, [_record("a", P1, pool="builders")], run_id="run-1")
+        report, aircall = _run(db, [_record("a", P1, pool="wholesalers")], run_id="run-2")
+        assert aircall.removed == [(P1, "pool_changed")]
+        assert aircall.campaigns[-1] == TAGS["wholesalers"]   # re-added via upsert, not a bare update
+        assert report.updated == 0 and report.created == 1
+        rows = _load_rows(db)
+        assert [(r.run_id, r.active, r.campaign_tag) for r in rows] == [
+            ("run-1", False, TAGS["builders"]), ("run-2", True, TAGS["wholesalers"])]
+
+    def test_an_unconfirmed_campaign_move_flags_the_record_not_silently_updates(self, db):
+        """If the removal from the old campaign can't be confirmed, the record must be
+        flagged (report.failed) and the old load row must stay exactly as it was —
+        never silently overwritten with a campaign_tag the dialer never actually moved."""
+        _fresh_scrub(db, P1)
+        _run(db, [_record("a", P1, pool="builders")], run_id="run-1")
+        report, aircall = _run(db, [_record("a", P1, pool="wholesalers")], run_id="run-2",
+                               aircall=FakeAircall(undecided_remove_phones={P1}))
+        assert report.loaded == 0 and len(report.failed) == 1
+        assert report.failed[0]["record_ref"] == "a"
+        rows = _load_rows(db)
+        assert [(r.run_id, r.active, r.campaign_tag) for r in rows] == [("run-1", True, TAGS["builders"])]
 
     def test_contact_deleted_in_aircall_falls_back_to_upsert(self, db):
         _fresh_scrub(db, P1)
