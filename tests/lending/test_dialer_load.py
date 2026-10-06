@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from src.lending import dialer_load
 from src.lending.backflip_conflict import BackflipIdentifierIndex, hash_phone
 from src.lending.dialer_load import LoadRefused, run_dialer_load
-from src.lending.models import LendingDialerLoadRecord
+from src.lending.models import LendingDialerLoadRecord, LendingDialerUnconfirmedCreate
 from src.lending.dialer_port import ContactFieldsNotSet, ContactUpsertResult, DialerRequestError
 
 pytestmark = pytest.mark.skipif(
@@ -31,13 +31,17 @@ EMPTY_INDEX = BackflipIdentifierIndex(block_reason=None)
 
 
 class FakeAircall:
-    def __init__(self, fail_phones=(), missing_ids=(), fields_fail_phones=()):
+    def __init__(self, fail_phones=(), missing_ids=(), fields_fail_phones=(), fail_remove_phones=(),
+                 undecided_remove_phones=()):
         self.upserts: list[str] = []
         self.campaigns: list = []
         self.updates: list[int] = []
+        self.removed: list[tuple[str, str]] = []
         self._next_id = 1000
         self._fail = set(fail_phones)
         self._missing = set(missing_ids)
+        self._fail_remove = set(fail_remove_phones)
+        self._undecided_remove = set(undecided_remove_phones)
         self._fields_fail = set(fields_fail_phones)
 
     def upsert_contact(self, phone, fields, *, campaign=None, vendor_contact_id=None):
@@ -57,6 +61,14 @@ class FakeAircall:
         self.update_vendor_ids = getattr(self, "update_vendor_ids", []) + [vendor_contact_id]
         return {"id": contact_id}
 
+    def remove(self, phone, *, reason):
+        if phone in self._undecided_remove:
+            from src.lending.dialer_port import UnconfirmedCapability
+            raise UnconfirmedCapability("campaign_remove not confirmed")
+        if phone in self._fail_remove:
+            raise DialerRequestError("POST /campaign/remove", status=500)
+        self.removed.append((phone, reason))
+
 
 @pytest.fixture
 def db():
@@ -64,6 +76,7 @@ def db():
     conn = engine.connect()
     tx = conn.begin()
     LendingDialerLoadRecord.__table__.create(conn, checkfirst=True)
+    LendingDialerUnconfirmedCreate.__table__.create(conn, checkfirst=True)
     session = Session(bind=conn)
     yield session
     session.close()
@@ -207,12 +220,97 @@ class TestLiveLoad:
             _run(db, [_record("a", P1), _record("a2", P1)], aircall=aircall)
         assert aircall.upserts == []
 
+    def test_a_refused_run_never_pays_for_a_scrub(self, db):
+        scrub_calls = []
+        records = [_record("a", P1, pool="brokers"), _record("b", P2)]  # P1, P2 have no fresh scrub
+        with patch.object(dialer_load, "load_backflip_identifier_index", return_value=EMPTY_INDEX):
+            with pytest.raises(LoadRefused, match="brokers"):
+                run_dialer_load(records, db, run_id="run-1", dry_run=False,
+                                scrubber=lambda phones: scrub_calls.append(phones) or [],
+                                dialer=FakeAircall(), campaign_tags=TAGS, commit=db.flush, now=NOON_ET)
+        assert scrub_calls == []
+
+    def test_a_create_that_fails_with_a_5xx_is_recorded_as_unconfirmed(self, db):
+        _fresh_scrub(db, P1, P2)
+        aircall = FakeAircall(fail_phones=[P1])
+        real_upsert = aircall.upsert_contact
+
+        def upsert(phone, *args, **kwargs):
+            try:
+                return real_upsert(phone, *args, **kwargs)
+            except DialerRequestError as exc:
+                exc.maybe_created = True  # what the BatchDialer adapter sets for a 5xx on the create
+                raise
+
+        aircall.upsert_contact = upsert
+        report, _ = _run(db, [_record("a", P1), _record("b", P2)], aircall=aircall)
+        assert report.loaded == 1
+        rows = db.execute(text(
+            "SELECT phone, error_status, resolved_at FROM lending.dialer_unconfirmed_creates")).fetchall()
+        assert [(r.phone, r.error_status, r.resolved_at) for r in rows] == [(P1, 500, None)]
+
+    def test_a_create_rejected_with_a_4xx_is_not_unconfirmed(self, db):
+        _fresh_scrub(db, P1)
+        aircall = FakeAircall()
+        aircall.upsert_contact = lambda *a, **k: (_ for _ in ()).throw(DialerRequestError("POST", status=422))
+        _run(db, [_record("a", P1)], aircall=aircall)
+        assert db.execute(text("SELECT count(*) FROM lending.dialer_unconfirmed_creates")).scalar_one() == 0
+
+    def test_a_number_that_opts_out_after_the_gate_is_not_pushed(self, db):
+        _fresh_scrub(db, P1, P2)
+        aircall = FakeAircall()
+        real_upsert = aircall.upsert_contact
+
+        def upsert(phone, *args, **kwargs):
+            if phone == P1:  # P2 opts out while P1 is being pushed
+                db.execute(text("INSERT INTO lending.suppression_list (phone, reason, source_channel) VALUES (:p, 'OPT_OUT', 'sms')"),
+                           {"p": P2})
+            return real_upsert(phone, *args, **kwargs)
+
+        aircall.upsert_contact = upsert
+        report, _ = _run(db, [_record("a", P1), _record("b", P2)], aircall=aircall)
+        assert aircall.upserts == [P1]
+        assert report.suppressed_mid_run == 1
+        assert [r.reason for r in _exclusions(db)] == ["SUPPRESSED"]
+
+    def test_a_number_that_opts_out_while_it_is_being_pushed_is_pulled_straight_after(self, db):
+        _fresh_scrub(db, P1)
+        aircall = FakeAircall()
+        real_upsert = aircall.upsert_contact
+
+        def upsert(phone, *args, **kwargs):
+            result = real_upsert(phone, *args, **kwargs)
+            db.execute(text("INSERT INTO lending.suppression_list (phone, reason, source_channel) "
+                            "VALUES (:p, 'OPT_OUT', 'sms')"), {"p": phone})  # STOP lands mid-push
+            return result
+
+        aircall.upsert_contact = upsert
+        report, _ = _run(db, [_record("a", P1)], aircall=aircall)
+        assert aircall.removed == [(P1, "opt_out")]
+        assert report.suppressed_mid_run == 1
+        rows = _load_rows(db)
+        assert [(r.active, r.deactivation_reason) for r in rows] == [(False, "opted_out_during_push")]
+
     def test_one_aircall_failure_does_not_stop_the_rest(self, db):
         _fresh_scrub(db, P1, P2)
         report, _ = _run(db, [_record("a", P1), _record("b", P2)], aircall=FakeAircall(fail_phones={P1}))
         assert report.loaded == 1
         assert report.failed == [{"record_ref": "a", "error": "DialerRequestError", "status": 500}]
         assert [r.phone for r in _load_rows(db)] == [P2]
+
+    def test_a_crash_mid_load_still_records_the_contacts_already_pushed(self, db):
+        """Finding 6: contacts pushed before an unexpected error must have load rows, or a
+        later opt-out cannot find and remove them from the dialer."""
+        class Crashy(FakeAircall):
+            def upsert_contact(self, phone, fields, *, campaign=None, vendor_contact_id=None):
+                if phone == P3:
+                    raise RuntimeError("worker killed")
+                return super().upsert_contact(phone, fields, campaign=campaign, vendor_contact_id=vendor_contact_id)
+
+        _fresh_scrub(db, P1, P2, P3)
+        with pytest.raises(RuntimeError):
+            _run(db, [_record("a", P1), _record("b", P2), _record("c", P3)], aircall=Crashy())
+        assert sorted(r.phone for r in _load_rows(db)) == [P1, P2]
 
     def test_live_load_needs_scrubber_and_aircall(self, db):
         with pytest.raises(ValueError):
@@ -258,6 +356,33 @@ class TestReload:
         assert [(r.run_id, r.active, r.deactivation_reason) for r in rows] == [
             ("run-1", False, "superseded"), ("run-2", True, None)]
         assert rows[0].dialer_contact_id == rows[1].dialer_contact_id
+
+    def test_a_changed_pool_moves_the_dialer_campaign_not_just_the_fields(self, db):
+        """Finding #10: a phone re-loaded under a different pool must leave its old
+        campaign and join the new one, not just get an in-place field update that
+        leaves BatchDialer dialing the old campaign forever."""
+        _fresh_scrub(db, P1)
+        _run(db, [_record("a", P1, pool="builders")], run_id="run-1")
+        report, aircall = _run(db, [_record("a", P1, pool="wholesalers")], run_id="run-2")
+        assert aircall.removed == [(P1, "pool_changed")]
+        assert aircall.campaigns[-1] == TAGS["wholesalers"]   # re-added via upsert, not a bare update
+        assert report.updated == 0 and report.created == 1
+        rows = _load_rows(db)
+        assert [(r.run_id, r.active, r.campaign_tag) for r in rows] == [
+            ("run-1", False, TAGS["builders"]), ("run-2", True, TAGS["wholesalers"])]
+
+    def test_an_unconfirmed_campaign_move_flags_the_record_not_silently_updates(self, db):
+        """If the removal from the old campaign can't be confirmed, the record must be
+        flagged (report.failed) and the old load row must stay exactly as it was —
+        never silently overwritten with a campaign_tag the dialer never actually moved."""
+        _fresh_scrub(db, P1)
+        _run(db, [_record("a", P1, pool="builders")], run_id="run-1")
+        report, aircall = _run(db, [_record("a", P1, pool="wholesalers")], run_id="run-2",
+                               aircall=FakeAircall(undecided_remove_phones={P1}))
+        assert report.loaded == 0 and len(report.failed) == 1
+        assert report.failed[0]["record_ref"] == "a"
+        rows = _load_rows(db)
+        assert [(r.run_id, r.active, r.campaign_tag) for r in rows] == [("run-1", True, TAGS["builders"])]
 
     def test_contact_deleted_in_aircall_falls_back_to_upsert(self, db):
         _fresh_scrub(db, P1)

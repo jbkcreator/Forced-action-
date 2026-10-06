@@ -30,6 +30,8 @@ from src.services.phone_utils import normalize as normalize_phone
 logger = logging.getLogger(__name__)
 
 Endpoint = Optional[tuple[str, str]]
+# A retried create after a server-side success would create a second, untracked contact.
+_NO_RETRY_POSTS = frozenset({"/contacts"})
 LOAD_ENDPOINTS = ("contacts_add_to_campaign", "contact_update")
 Http = Callable[..., Mapping[str, Any]]
 
@@ -61,11 +63,20 @@ class UnconfirmedCapability(DialerRemovalUndecided):
 
 
 class DialerRequestError(RuntimeError):
-    """A dialer request failed; ``status`` is the HTTP status when there was one."""
+    """A dialer request failed; ``status`` is the HTTP status when there was one.
 
-    def __init__(self, message: str, status: Optional[int] = None) -> None:
+    ``maybe_created`` is set only on a create whose outcome is unknown (timeout, 5xx, a 2xx
+    with no contact id): the contact may exist even though the call reported failure."""
+
+    def __init__(self, message: str, status: Optional[int] = None, *, maybe_created: bool = False) -> None:
         super().__init__(message)
         self.status = status
+        self.maybe_created = maybe_created
+
+
+class UnreconciledContact(RuntimeError):
+    """An earlier create for this phone failed ambiguously, so a dialer contact may exist that we
+    hold no id for. Raised on opt-out so it stays pending (and alarms) instead of completing."""
 
 
 class ContactFieldsNotSet(DialerRequestError):
@@ -109,8 +120,10 @@ class InMemoryDialer:
 
 class BatchDialerAdapter:
     def __init__(self, *, http: Http, endpoints: Mapping[str, Endpoint] = BATCHDIALER_ENDPOINTS,
-                 contact_ids: Optional[Callable[[str], list[str]]] = None) -> None:
+                 contact_ids: Optional[Callable[[str], list[str]]] = None,
+                 has_unconfirmed_create: Optional[Callable[[str], bool]] = None) -> None:
         self._http = http
+        self._has_unconfirmed_create = has_unconfirmed_create
         self._endpoints = endpoints
         self._contact_ids = contact_ids
         self._campaign_ids: Optional[dict[str, Any]] = None
@@ -150,16 +163,20 @@ class BatchDialerAdapter:
             if self._endpoints.get("contacts_add_to_campaign") is None:
                 raise UnconfirmedCapability("BatchDialer endpoint 'contacts_add_to_campaign' is not confirmed")
             campaign_id = self._campaign_id(campaign)
-            body = self._call("contacts_add_to_campaign", {
-                "campaignids": [campaign_id],
-                "contacts": [_import_contact(phone, fields, vendor_contact_id)],
-            })
+            try:
+                body = self._call("contacts_add_to_campaign", {
+                    "campaignids": [campaign_id],
+                    "contacts": [_import_contact(phone, fields, vendor_contact_id)],
+                })
+            except DialerRequestError as exc:
+                exc.maybe_created = exc.status is None or exc.status >= 500 or exc.status == 408
+                raise
             if body.get("success") is False:
                 raise DialerRequestError("BatchDialer contact import failed")
             ids = body.get("ids") or []
             contact_id = ids[0] if ids else None
         if contact_id is None:
-            raise DialerRequestError("dialer returned no contact id")
+            raise DialerRequestError("dialer returned no contact id", maybe_created=campaign is not None)
         if campaign is not None:
             try:
                 self.update_contact(contact_id, fields, phone=phone, vendor_contact_id=vendor_contact_id)
@@ -214,6 +231,8 @@ class BatchDialerAdapter:
             except DialerRequestError as exc:
                 if exc.status != 404:  # already gone: the opt-out is done for this contact
                     raise
+        if self._has_unconfirmed_create is not None and self._has_unconfirmed_create(phone):
+            raise UnreconciledContact("an earlier dialer create for this phone is unconfirmed")
 
     def restore(self, phone: str) -> None:
         self._call("campaign_restore", {"phone": phone})
@@ -274,7 +293,7 @@ def _requests_http(api_key: str) -> Http:
                 response.raise_for_status()
             elif method == "GET":
                 response = requests_get_with_retry(url, max_retries=3, retry_delay=2, **kwargs)
-            elif method == "POST":
+            elif method == "POST" and path not in _NO_RETRY_POSTS:
                 response = requests_post_with_retry(url, json=json, **kwargs)
             else:
                 response = requests.request(method, url, json=json, **kwargs)
@@ -286,7 +305,15 @@ def _requests_http(api_key: str) -> Http:
         except requests.RequestException as exc:
             logger.warning("[dialer] BatchDialer %s %s failed: %s", method, path, type(exc).__name__)
             raise DialerRequestError(f"BatchDialer {method} {path}: {type(exc).__name__}") from exc
-        return response.json() if response.content else {}
+        if not response.content:
+            return {}
+        try:
+            return response.json()
+        except ValueError as exc:
+            # A 2xx that is not JSON (proxy error page, truncated body) is a failed call,
+            # not a crash: callers only handle DialerRequestError.
+            logger.warning("[dialer] BatchDialer %s %s returned a non-JSON body", method, path)
+            raise DialerRequestError(f"BatchDialer {method} {path}: non-JSON response") from exc
 
     return call
 
@@ -296,7 +323,8 @@ def get_dialer() -> Optional[Dialer]:
     key = get_settings().batchdialer_api_key
     if key is None or not BATCHDIALER_BASE_URL:
         return None
-    return BatchDialerAdapter(http=_requests_http(key.get_secret_value()), contact_ids=_loaded_contact_ids)
+    return BatchDialerAdapter(http=_requests_http(key.get_secret_value()), contact_ids=_loaded_contact_ids,
+                              has_unconfirmed_create=_has_unconfirmed_create)
 
 
 def _loaded_contact_ids(phone: str) -> list[str]:
@@ -309,6 +337,17 @@ def _loaded_contact_ids(phone: str) -> list[str]:
                  "WHERE phone = :p AND dialer_contact_id IS NOT NULL"),
             {"p": normalize_phone(phone)},
         )]
+
+
+def _has_unconfirmed_create(phone: str) -> bool:
+    from src.core.database import get_db_context
+
+    with get_db_context() as db:
+        return db.execute(
+            text("SELECT EXISTS (SELECT 1 FROM lending.dialer_unconfirmed_creates "
+                 "WHERE phone = :p AND resolved_at IS NULL)"),
+            {"p": normalize_phone(phone)},
+        ).scalar_one()
 
 
 def get_http() -> Optional[Http]:

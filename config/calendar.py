@@ -6,6 +6,9 @@ UTC offset cannot express that.
 """
 from __future__ import annotations
 
+import os
+from datetime import date
+
 CALENDAR_TIMEZONE = "America/New_York"
 
 BUSINESS_HOURS_START_HOUR = 9
@@ -33,6 +36,27 @@ SLOT_ALIGNMENT_MINUTES = 30
 
 # datetime.weekday(): Monday is 0, so Saturday and Sunday are 5 and 6.
 WEEKEND_WEEKDAYS = frozenset({5, 6})
+
+# Dates with no bookable slots at all, regardless of busy/free state — Josh's
+# answer (E1) locks in "Block October 18, 19 and 20, I'm traveling." Override
+# via LENDING_CALENDAR_BLOCKED_DATES, a comma-separated list of YYYY-MM-DD.
+def _parse_blocked_dates(raw: str) -> frozenset[date]:
+    dates = set()
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            dates.add(date.fromisoformat(token))
+        except ValueError:
+            continue
+    return frozenset(dates)
+
+
+_raw_blocked_dates = os.environ.get(
+    "LENDING_CALENDAR_BLOCKED_DATES", "2026-10-18,2026-10-19,2026-10-20"
+)
+BLOCKED_CALENDAR_DATES: frozenset[date] = _parse_blocked_dates(_raw_blocked_dates)
 
 # Which venture's EXCEPTIONS lane a reschedule request is surfaced on.
 CALENDAR_VENTURE_KEY = "fa_max_lending"

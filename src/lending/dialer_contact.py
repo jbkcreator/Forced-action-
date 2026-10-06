@@ -24,6 +24,7 @@ from src.services.fa_max_backflip_feed import normalize_email
 
 NOT_AVAILABLE = "Not available"
 INFORMATION_MAX_CHARS = 1000
+MAX_LOAN_VALUE = Decimal(10) ** 12  # lending.dialer_load_records.estimated_loan_value is Numeric(14,2)
 _CITY_STATE_ZIP = re.compile(r"^(.+?)\s+[A-Za-z]{2}(\s+\d{5}(?:-\d{4})?)?$")
 
 
@@ -55,7 +56,7 @@ def _money(value: Any) -> Optional[Decimal]:
         amount = Decimal(str(value).replace("$", "").replace(",", "").strip())
     except InvalidOperation:
         return None
-    return amount if amount >= 0 else None
+    return amount if amount.is_finite() and 0 <= amount < MAX_LOAN_VALUE else None
 
 
 def display_from_record(record: Mapping[str, Any], campaign_tag: Optional[str]) -> DialerDisplay:

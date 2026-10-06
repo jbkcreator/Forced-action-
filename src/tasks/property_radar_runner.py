@@ -237,7 +237,7 @@ def default_stages(trace_results: Optional[Path] = None) -> Stages:
             # Go Live: the scheduled run traces staged records live through Tracerfy
             # (ledger-gated, spend-capped; refuses unless PROPERTY_RADAR_ENABLED=true).
             from src.tasks.property_radar_lead_handoff import _live_trace
-            contacts = _live_trace(session, campaign)
+            contacts = _live_trace(session, campaign, thin_path_only=settings.property_radar_thin_path_only)
         else:
             contacts = {}
         if not contacts:

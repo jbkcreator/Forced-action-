@@ -297,22 +297,23 @@ def test_opt_out_removals_pass_reason_opt_out(db):
     assert dialer.reasons == ["opt_out"]
 
 
-class DialerRemovalUndecided(Exception):
-    """Same class name Dev 3's client raises until O31 is decided."""
-
-
 def test_undecided_removal_warns_once_not_every_poll(db, caplog):
     from src.lending.compliance import poll_fa_opt_outs, propagate_opt_out
+    from src.lending.dialer_port import UnconfirmedCapability
 
     class Undecided:
+        """Raises a DialerRemovalUndecided *subclass*, as the real BatchDialer
+        adapter does (UnconfirmedCapability) when an endpoint is still unconfirmed —
+        not the base class itself."""
+
         def __call__(self, phone, *, reason):
-            raise DialerRemovalUndecided()
+            raise UnconfirmedCapability("endpoint not confirmed")
 
     from src.lending.compliance import phone_hash
 
     def mine(records):  # the shared DB holds real FA opt-outs that get their own first attempt
         tag = phone_hash(PHONE)[:12]
-        return [r for r in records if "DialerRemovalUndecided" in r.getMessage() and tag in r.getMessage()]
+        return [r for r in records if "UnconfirmedCapability" in r.getMessage() and tag in r.getMessage()]
 
     with caplog.at_level("DEBUG"):
         propagate_opt_out(db, phone=PHONE, source_ref="call_96", dialer_remover=Undecided())
