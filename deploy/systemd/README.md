@@ -63,9 +63,11 @@ sudo nginx -t && sudo systemctl reload nginx
 sudo journalctl -u lending-api -f
 ```
 
-`deploy.sh` installs, enables and restarts `lending-api` with the other lending units (warn, never fail). The nginx block is a one-time manual step and must be in place in the same deploy that ships this change: `fa-api` no longer serves
-`/webhooks/lending/*`, so without them those webhooks return 404. Rollback: remove the nginx block and deploy the
-previous `fa-api`.
+`deploy.sh` installs, enables and restarts `lending-api` with the other lending units, then enforces two hard gates (the deploy fails and rolls back):
+`deploy/verify_lending_routing.sh` (before `fa-api` restarts: nginx must have an active `location /webhooks/lending/` proxying to `127.0.0.1:8010`)
+and a retrying `curl` of `http://127.0.0.1:8010/health` (after the restart). The nginx block is a one-time manual step, so **add it and reload nginx
+before deploying this change**: `fa-api` no longer serves `/webhooks/lending/*`, and a dropped GHL opt-out is a do-not-contact compliance gap.
+Rollback: remove the nginx block and deploy the previous `fa-api`.
 
 ## Prerequisites the units assume
 
