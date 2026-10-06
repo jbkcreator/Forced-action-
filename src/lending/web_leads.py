@@ -163,6 +163,14 @@ def save_web_lead(db, data: WebLeadInput) -> tuple[int, bool]:
     return int(lead_id), True
 
 
+def will_be_contacted(db, lead_id: int) -> bool:
+    """True when the visitor ticked the call/text box and the number is not suppressed, i.e. the team
+    may follow up. The form page shows its "we will call you back" line only for this case."""
+    return bool(db.execute(
+        text("SELECT sms_consent AND NOT suppressed FROM lending.web_leads WHERE id = :id"), {"id": lead_id},
+    ).scalar())
+
+
 def merge_into_existing(db, lead_id: int, data: WebLeadInput) -> bool:
     """A repeat submission inside the dedup window fills in details the stored lead lacks (an email
     added on the second try) and never overwrites one it has. Returns True when something was

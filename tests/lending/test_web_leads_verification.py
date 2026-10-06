@@ -232,7 +232,7 @@ def test_an_opt_out_after_the_form_revokes_the_consent(factory):
         assert has_text_consent(s, PHONE) is False
 
 
-def test_the_response_does_not_reveal_whether_a_number_is_suppressed(factory):
+def test_the_response_tells_the_page_not_to_promise_contact_to_a_suppressed_number(factory):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
@@ -256,7 +256,10 @@ def test_the_response_does_not_reveal_whether_a_number_is_suppressed(factory):
         s.execute(text("INSERT INTO lending.suppression_list (phone, reason, source_channel) VALUES (:p, 'OPT_OUT', 'sms')"), {"p": PHONE})
         s.commit()
     suppressed_resp = client.post("/api/lending/web-leads", data=form)
-    assert (clean_resp.status_code, clean_resp.json()) == (suppressed_resp.status_code, suppressed_resp.json())
+    # Deliberate trade-off: the page must not promise a call to an opted-out number, so the response
+    # does differ. Nothing else about the suppression (which list, why) is ever returned.
+    assert (clean_resp.status_code, clean_resp.json()) == (200, {"received": True, "will_contact": True})
+    assert (suppressed_resp.status_code, suppressed_resp.json()) == (200, {"received": True, "will_contact": False})
 
 
 # --------------------------------------------- failure / retry / restart (HTTP path)
@@ -374,4 +377,4 @@ def test_nothing_the_form_writes_to_ghl_states_a_rate_term_or_commitment():
 def test_the_endpoint_replies_with_no_price_term_or_commitment(factory, monkeypatch):
     client, _ = _client(factory, monkeypatch, None)
     body = client.post("/api/lending/web-leads", data={"name": "Dana", "phone": "(813) 555-0142"}).json()
-    assert body == {"received": True}
+    assert body == {"received": True, "will_contact": False}  # only booleans: no price, term or text

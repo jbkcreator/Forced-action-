@@ -41,7 +41,7 @@ def _count(db):
 
 def test_a_submission_is_stored_and_queued_for_delivery(client, web_leads_db, delivered):
     response = client.post(URL, data=FORM)
-    assert response.status_code == 200 and response.json() == {"received": True}
+    assert response.status_code == 200 and response.json() == {"received": True, "will_contact": False}  # box not ticked
     assert _count(web_leads_db) == 1 and len(delivered) == 1
 
 
@@ -79,7 +79,7 @@ def test_a_double_submit_is_stored_and_delivered_once(client, web_leads_db, deli
 
 
 def test_only_a_repeat_inside_the_window_is_flagged_as_a_duplicate(client):
-    assert client.post(URL, data=FORM).json() == {"received": True}
+    assert client.post(URL, data=FORM).json() == {"received": True, "will_contact": False}
     assert client.post(URL, data=FORM).json() == {"received": True, "duplicate": True}
 
 
@@ -102,9 +102,18 @@ def test_a_repeat_with_nothing_new_is_not_requeued(client, web_leads_db, deliver
     assert len(delivered) == 1
 
 
-def test_a_suppressed_number_looks_the_same_to_the_visitor(client, web_leads_db):
-    web_leads_db.execute(text("INSERT INTO lending.suppression_list (phone, reason, source_channel) VALUES (:p, 'test', 'manual')"), {"p": PHONE})
-    assert client.post(URL, data={**FORM, "sms_consent": "yes"}).json() == {"received": True}
+def test_will_contact_is_true_only_for_a_ticked_box_on_a_clear_number(client, web_leads_db):
+    clear_ticked = client.post(URL, data={**FORM, "sms_consent": "yes"}).json()
+    clear_unticked = client.post(URL, data={**FORM, "phone": "(813) 555-0143"}).json()
+    web_leads_db.execute(text("INSERT INTO lending.suppression_list (phone, reason, source_channel) VALUES ('+18135550144', 'test', 'manual')"))
+    suppressed_ticked = client.post(URL, data={**FORM, "phone": "(813) 555-0144", "sms_consent": "yes"}).json()
+    assert clear_ticked == {"received": True, "will_contact": True}
+    assert clear_unticked == {"received": True, "will_contact": False}
+    assert suppressed_ticked == {"received": True, "will_contact": False}
+
+
+def test_a_filled_honeypot_answers_in_the_normal_shape_without_promising_contact(client):
+    assert client.post(URL, data={**FORM, "sms_consent": "yes", "company_website": "x"}).json() == {"received": True, "will_contact": False}
 
 
 def test_the_endpoint_is_rate_limited_per_ip(client, monkeypatch):
