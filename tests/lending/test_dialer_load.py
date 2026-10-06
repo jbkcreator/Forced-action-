@@ -268,11 +268,28 @@ class TestLiveLoad:
             return real_upsert(phone, *args, **kwargs)
 
         aircall.upsert_contact = upsert
-        with patch.object(dialer_load, "SUPPRESSION_RECHECK_BATCH", 1):
-            report, _ = _run(db, [_record("a", P1), _record("b", P2)], aircall=aircall)
+        report, _ = _run(db, [_record("a", P1), _record("b", P2)], aircall=aircall)
         assert aircall.upserts == [P1]
         assert report.suppressed_mid_run == 1
         assert [r.reason for r in _exclusions(db)] == ["SUPPRESSED"]
+
+    def test_a_number_that_opts_out_while_it_is_being_pushed_is_pulled_straight_after(self, db):
+        _fresh_scrub(db, P1)
+        aircall = FakeAircall()
+        real_upsert = aircall.upsert_contact
+
+        def upsert(phone, *args, **kwargs):
+            result = real_upsert(phone, *args, **kwargs)
+            db.execute(text("INSERT INTO lending.suppression_list (phone, reason, source_channel) "
+                            "VALUES (:p, 'OPT_OUT', 'sms')"), {"p": phone})  # STOP lands mid-push
+            return result
+
+        aircall.upsert_contact = upsert
+        report, _ = _run(db, [_record("a", P1)], aircall=aircall)
+        assert aircall.removed == [(P1, "opt_out")]
+        assert report.suppressed_mid_run == 1
+        rows = _load_rows(db)
+        assert [(r.active, r.deactivation_reason) for r in rows] == [(False, "opted_out_during_push")]
 
     def test_one_aircall_failure_does_not_stop_the_rest(self, db):
         _fresh_scrub(db, P1, P2)

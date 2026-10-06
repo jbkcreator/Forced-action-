@@ -29,6 +29,7 @@ from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
 from sqlalchemy import text
 
+from config.lending_compliance import RemovalReason
 from config.lending_dialer import POOL_CAMPAIGN_TAGS
 from config.settings import get_settings
 from src.lending.backflip_conflict import (
@@ -60,7 +61,6 @@ COMMIT_CHUNK_SIZE = 1  # the client paces pushes one at a time, so a commit per 
 SUPERSEDED = "superseded"
 REASON_SCRUB_FAILED = "SCRUB_FAILED"
 REASON_SUPPRESSED = "SUPPRESSED"
-SUPPRESSION_RECHECK_BATCH = 25  # phones re-checked per query, just before they are pushed
 REASON_NEEDS_SCRUB = "NEEDS_SCRUB"
 
 
@@ -262,6 +262,31 @@ def _record_unconfirmed_create(db, run_id: str, item: _Loadable, status: Optiona
     )
 
 
+def _pull_if_suppressed_after_push(db, dialer: DialerContacts, chunk: list[tuple[_Loadable, int]],
+                                   commit: Callable[[], None]) -> int:
+    """A STOP that landed while a contact was being pushed: the opt-out poller found no load row
+    and completed the event, so the contact must be pulled here, now that its row exists."""
+    suppressed = _suppressed_phones(db, [item.phone for item, _ in chunk])
+    pulled = 0
+    for item, _ in chunk:
+        if item.phone not in suppressed:
+            continue
+        try:
+            dialer.remove(item.phone, reason=RemovalReason.OPT_OUT.value)
+        except Exception as exc:
+            logger.error("[dialer-load] phone_hash=%s opted out during its push and could not be removed "
+                         "(%s); remove it from the dialer by hand", phone_hash(item.phone)[:12], type(exc).__name__)
+            continue
+        db.execute(
+            text("UPDATE lending.dialer_load_records SET active = false, deactivated_at = now(), "
+                 "deactivation_reason = :reason WHERE phone = :phone AND active"),
+            {"reason": "opted_out_during_push", "phone": item.phone},
+        )
+        commit()
+        pulled += 1
+    return pulled
+
+
 def _record_pushed_before_abort(db, run_id: str, chunk: list[tuple[_Loadable, int]],
                                 active: dict[str, tuple[int, Optional[int], Optional[str]]],
                                 commit: Callable[[], None]) -> None:
@@ -442,12 +467,8 @@ def run_dialer_load(
     active = _active_rows(db, loadable_phones)
     chunk: list[tuple[_Loadable, int]] = []
     try:
-        suppressed_now: set[str] = set()
-        for position, item in enumerate(loadable):
-            if position % SUPPRESSION_RECHECK_BATCH == 0:
-                suppressed_now = _suppressed_phones(
-                    db, sorted({i.phone for i in loadable[position:position + SUPPRESSION_RECHECK_BATCH]}))
-            if item.phone in suppressed_now:
+        for item in loadable:
+            if _suppressed_phones(db, [item.phone]):  # one indexed lookup per push (a push is 3 HTTP calls)
                 report.suppressed_mid_run += 1
                 _write_exclusions(db, run_id, [{
                     "phone_hash": phone_hash(item.phone), "reason": REASON_SUPPRESSED,
@@ -475,6 +496,7 @@ def run_dialer_load(
             if len(chunk) >= COMMIT_CHUNK_SIZE:
                 _store_chunk(db, run_id, chunk, active)
                 commit()
+                report.suppressed_mid_run += _pull_if_suppressed_after_push(db, dialer, chunk, commit)
                 chunk = []
     except BaseException:
         # SIGTERM, a crash or an unexpected error mid-run: contacts already pushed to the
