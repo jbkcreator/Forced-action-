@@ -79,7 +79,7 @@ CREDIT_BAND_QUALIFYING_VALUES: FrozenSet[str] = frozenset({"at_or_above_640"})
 
 _raw_blocked_list_keys = os.environ.get("GATE_BLOCKED_LIST_KEYS", "list_4")
 BLOCKED_LIST_KEYS: FrozenSet[str] = frozenset(
-    key.strip() for key in _raw_blocked_list_keys.split(",") if key.strip()
+    key.strip().lower() for key in _raw_blocked_list_keys.split(",") if key.strip()
 )
 
 # ISO date string — gate blocks bookings from BLOCKED_LIST_KEYS until this date.

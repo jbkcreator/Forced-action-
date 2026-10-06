@@ -19,10 +19,11 @@ out of the borrower-financial-data prohibition. This keeps gate data clear
 of both the relay payload CHECK constraint and the voice-intake
 _FINANCIAL_TERMS regex. See config/booking_gate.py for vocabularies.
 
-OPEN DEPENDENCY: BLOCKED_LIST_KEYS in config/booking_gate.py is empty — no
-code yet tags a lead/booking with which numbered list it came from. Per
-Josh's Oct 4 email, only List 4 (brokers/LOs) is meant to block; List 2
-(cash buyers) no longer does.
+The source list is never taken from the caller. resolve_list_key() looks it up
+from the tag each lending record was staged or called under, and an unknown
+list counts as blocked: the List 4 rule cannot be checked, so the booking
+must not proceed. Per Josh's Oct 4 email, only List 4 (brokers/LOs) blocks;
+List 2 (cash buyers) no longer does.
 """
 from __future__ import annotations
 
@@ -36,6 +37,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import text as sa_text
 
 from config.calendar import CALENDAR_TIMEZONE
+from src.services.phone_utils import normalize as normalize_phone
 from config.booking_gate import (
     BLOCKED_LIST_KEYS,
     CALENDAR_DAILY_CAP,
@@ -167,14 +169,18 @@ def store_gate(
     answers: GateAnswers,
     tracked_link_id: Optional[int] = None,
     person_id: Optional[int] = None,
-    list_key: Optional[str] = None,
+    list_key: str,
     captured_by: Optional[str] = None,
 ) -> tuple[str, "GateResult"]:
     """Evaluate and durably store a gate attempt. Returns (gate_id, result).
 
     Always writes a row regardless of pass/fail so the caller-bonus
-    calculation has a complete audit trail.
+    calculation has a complete audit trail. ``list_key`` is required and
+    must come from resolve_list_key(), never from the caller's request.
     """
+    if not (list_key or "").strip():
+        raise ValueError("store_gate needs the contact's source list (resolve_list_key)")
+    list_key = list_key.strip().lower()
     result = evaluate_gate(answers)
     gate_id = secrets.token_urlsafe(16)
 
@@ -275,7 +281,7 @@ def get_passed_gate_for_link(session, tracked_link_id: int) -> Optional[str]:
 
     if _is_list_blocked(row["list_key"]):
         logger.info(
-            "gate: tracked_link_id=%s blocked — list_key=%s blocked until %s",
+            "gate: tracked_link_id=%s blocked — list_key=%r (blocked list until %s, or no source list)",
             tracked_link_id, row["list_key"], GATE_LIST_UNBLOCK_DATE,
         )
         return None
@@ -307,10 +313,51 @@ def get_passed_gate_by_id(session, gate_id: str) -> Optional[Any]:
 
 
 def _is_list_blocked(list_key: Optional[str]) -> bool:
-    """True if this list_key is blocked and the unblock date has not passed."""
-    if not list_key or list_key not in BLOCKED_LIST_KEYS:
+    """True if the booking must not proceed for this source list.
+
+    A missing list is blocked (fail closed): without it the List 4 rule cannot
+    be checked. A blocked list stays blocked until GATE_LIST_UNBLOCK_DATE.
+    """
+    key = (list_key or "").strip().lower()
+    if not key:
+        return True
+    if key not in BLOCKED_LIST_KEYS:
         return False
     return date.today() < GATE_LIST_UNBLOCK_DATE
+
+
+def resolve_list_key(session, phone: Optional[str]) -> Optional[str]:
+    """The contact's source list, looked up from our own records by phone.
+
+    Reads the source_tag each number was staged under (calling_pool_staging)
+    and called under (call_dispositions). A number seen under a blocked list
+    resolves to that list even if it also appears under another, so a broker
+    cannot book because the same number is also in a builder pool. Returns
+    None when no tag is on file; the caller must treat that as blocked.
+
+    ponytail: any-run, any-call match, so a number once staged as List 4 stays
+    blocked after it moves lists. Narrow to the latest run if that over-blocks.
+    """
+    e164 = normalize_phone(phone)
+    if not e164:
+        return None
+    tags = session.execute(
+        sa_text(
+            """
+            SELECT lower(btrim(source_tag)) FROM lending.calling_pool_staging
+            WHERE normalized_phone = :phone AND btrim(source_tag) <> ''
+            UNION
+            SELECT lower(btrim(source_tag)) FROM lending.call_dispositions
+            WHERE phone = :phone AND btrim(source_tag) <> ''
+            """
+        ),
+        {"phone": e164},
+    ).scalars().all()
+    found = sorted(tag for tag in tags if tag)
+    blocked = [tag for tag in found if tag in BLOCKED_LIST_KEYS]
+    if blocked:
+        return blocked[0]
+    return found[0] if found else None
 
 
 def enforce_daily_cap(session, slot_start: datetime) -> bool:

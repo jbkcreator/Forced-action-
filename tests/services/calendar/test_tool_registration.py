@@ -118,7 +118,7 @@ class TestWrapperConversion:
             ),
             patch(
                 "src.services.calendar.gate.get_passed_gate_by_id",
-                return_value={"gate_id": "test_gate", "list_key": None, "result": "pass"},
+                return_value={"gate_id": "test_gate", "list_key": "list_1", "result": "pass"},
             ),
             patch("src.services.calendar.gate.enforce_daily_cap", return_value=True),
         ):

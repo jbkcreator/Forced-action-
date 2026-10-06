@@ -45,8 +45,11 @@ class GateSubmission(BaseModel):
         default=None, max_length=200,
         description="Required instead of property_address when deal_status is actively_looking",
     )
+    phone: str = Field(
+        min_length=7, max_length=32,
+        description="The contact's phone. The source list (List 4 block) is looked up from it server-side, never sent by the caller.",
+    )
     person_id: Optional[int] = None
-    list_key: Optional[str] = None
     captured_by: Optional[str] = None
 
 
@@ -65,11 +68,15 @@ def submit_gate(
     Returns the gate_id and whether it passed. If it failed, the contact is
     automatically enqueued in fa_max_nurture_queue and surfaced to EXCEPTIONS.
 
+    The source list (the List 4 booking block) is looked up from ``phone``
+    against our own staging and call records, never sent by the caller. When
+    no list is on file the gate is refused with 422 and no booking can follow.
+
     Gate answers are stored as enum codes only — never free text financial
     data, never a pulled credit score — per the _FINANCIAL_TERMS and
     relay-payload CHECK constraints.
     """
-    from src.services.calendar.gate import GateAnswers, store_gate
+    from src.services.calendar.gate import GateAnswers, resolve_list_key, store_gate
 
     answers = GateAnswers(
         liquidity_source=payload.liquidity_source,
@@ -84,12 +91,25 @@ def submit_gate(
         target_market=payload.target_market,
     )
 
+    try:
+        list_key = resolve_list_key(db, payload.phone)
+    except Exception as exc:
+        db.rollback()
+        logger.error("gate.submit: source-list lookup failed link=%s: %s", payload.tracked_link_id, type(exc).__name__)
+        raise HTTPException(status_code=500, detail="Could not verify the contact's source list") from exc
+    if list_key is None:
+        logger.warning("gate.submit: no source list on file, gate refused link=%s", payload.tracked_link_id)
+        raise HTTPException(
+            status_code=422,
+            detail="No source list is on file for this contact, so the gate cannot be recorded and the booking is blocked.",
+        )
+
     gate_id, result = store_gate(
         db,
         answers=answers,
         tracked_link_id=payload.tracked_link_id,
         person_id=payload.person_id,
-        list_key=payload.list_key,
+        list_key=list_key,
         captured_by=payload.captured_by or admin.get("sub"),
     )
 
