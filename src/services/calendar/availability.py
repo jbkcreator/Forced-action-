@@ -18,6 +18,7 @@ from typing import Iterator, Sequence
 from zoneinfo import ZoneInfo
 
 from config.calendar import (
+    BLOCKED_CALENDAR_DATES,
     BOOKING_HORIZON_DAYS,
     BUSINESS_HOURS_END_HOUR,
     BUSINESS_HOURS_START_HOUR,
@@ -134,6 +135,9 @@ def _business_windows(
     final: date = latest.astimezone(_TZ).date()
 
     while current <= final:
+        if current in BLOCKED_CALENDAR_DATES:
+            current += timedelta(days=1)
+            continue
         if include_weekends or current.weekday() not in WEEKEND_WEEKDAYS:
             opens = datetime.combine(current, time(BUSINESS_HOURS_START_HOUR), tzinfo=_TZ)
             closes = datetime.combine(current, time(BUSINESS_HOURS_END_HOUR), tzinfo=_TZ)

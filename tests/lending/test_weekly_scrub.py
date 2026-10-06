@@ -63,16 +63,77 @@ class Remover:
         self.removed.append((phone, reason))
 
 
-def test_only_loaded_numbers_with_a_stale_or_missing_scrub_are_selected(db):
+class FailOnceRemover:
+    """Raises for a phone the first time it's called, succeeds every time after."""
+
+    def __init__(self):
+        self.calls = []
+        self._failed_once = set()
+
+    def __call__(self, phone, *, reason):
+        self.calls.append(phone)
+        if phone not in self._failed_once:
+            self._failed_once.add(phone)
+            raise RuntimeError("transient dialer error")
+
+
+def test_every_loaded_number_is_rescrubbed_each_weekly_run_but_not_inactive_ones(db):
+    """Finding 1: a scrub only 2 days old still turns stale for the sweep before the next
+    weekly run, so it is selected too. Inactive load rows are never scrubbed."""
     from src.lending.weekly_scrub import stale_loaded_phones
     for p in PHONES[:4]:
         _load(db, p)
     _load(db, PHONES[4], active=False)         # inactive: not in the dialer
-    _scrubbed(db, PHONES[0], age_days=2)       # fresh
-    _scrubbed(db, PHONES[1], age_days=9)       # stale
+    _scrubbed(db, PHONES[0], age_days=2)
+    _scrubbed(db, PHONES[1], age_days=9)
     # PHONES[2], PHONES[3]: never scrubbed
     picked = set(stale_loaded_phones(db, now=NOW)) & set(PHONES)
-    assert picked == {PHONES[1], PHONES[2], PHONES[3]}
+    assert picked == set(PHONES[:4])
+
+
+class FailingScrubber:
+    """Simulates a Tracerfy outage: the vendor call itself raises."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, phones):
+        self.calls += 1
+        raise RuntimeError("tracerfy down")
+
+
+def test_a_failing_scrub_batch_charges_no_credits_and_leaves_numbers_stale(db):
+    """Finding #6: a Tracerfy outage must not be silently absorbed as success — no
+    credits counted, and the phone stays reachable as stale next run."""
+    from src.lending.weekly_scrub import weekly_scrub
+
+    result = weekly_scrub(db, scrubber=FailingScrubber(), max_credits=10, now=NOW, phones=[PHONES[0]],
+                          dialer_remover=Remover())
+    assert result.scrub_batch_failures == 1
+    assert result.credits_used == 0
+    assert result.scrubbed == 0
+
+
+def test_main_exits_non_zero_when_a_scrub_batch_fails(monkeypatch):
+    from src.lending import weekly_scrub as ws
+
+    monkeypatch.setattr(ws, "stale_loaded_phones", lambda db, now=None: [PHONES[0]])
+    monkeypatch.setattr(ws, "blocked_loaded_phones", lambda db: [])
+    monkeypatch.setattr(ws, "tracerfy_scrub", FailingScrubber())
+
+    class _FakeSession:
+        def commit(self):
+            pass
+
+    class _Ctx:
+        def __enter__(self):
+            return _FakeSession()
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr("src.core.database.get_db_context", lambda: _Ctx())
+    assert ws.main(["--max-credits", "10"]) == ws.EXIT_SCRUB_FAILED
 
 
 def test_credit_cap_aborts_before_a_batch_that_would_exceed_it(db):
@@ -101,6 +162,36 @@ def test_new_dnc_hits_leave_the_dialer_and_flag_nurture(db):
     nurture = dict(db.execute(text("SELECT phone, nurture FROM lending.contacts WHERE phone = ANY(:p)"),
                               {"p": PHONES[:2]}).fetchall())
     assert nurture == {PHONES[0]: True, PHONES[1]: False}
+
+
+def test_a_failed_dialer_removal_is_retried_on_the_next_run_at_no_credit_cost(db):
+    """Finding #3: a transient dialer failure on removal must not strand the number —
+    the next run has to retry it without spending another Tracerfy credit, because the
+    blocking verdict is already known."""
+    from src.lending.weekly_scrub import weekly_scrub
+
+    phone = PHONES[0]
+    _load(db, phone)
+    scrubber = Scrubber(dnc={phone})
+    remover = FailOnceRemover()
+
+    first = weekly_scrub(db, scrubber=scrubber, max_credits=10, now=NOW, phones=[phone],
+                         dialer_remover=remover)
+    assert first.blocked == 1
+    assert remover.calls == [phone]
+    still_active = db.execute(
+        text("SELECT active FROM lending.dialer_load_records WHERE phone = :p"), {"p": phone}
+    ).scalar()
+    assert still_active is True, "removal failed: the load row must stay active, not close"
+
+    second = weekly_scrub(db, scrubber=scrubber, max_credits=10, now=NOW, phones=[], dialer_remover=remover)
+    assert remover.calls == [phone, phone]          # retried
+    assert scrubber.calls == [[phone]]              # no second scrub: no credit spent on the retry
+    assert second.blocked == 1
+    now_active = db.execute(
+        text("SELECT active FROM lending.dialer_load_records WHERE phone = :p"), {"p": phone}
+    ).scalar()
+    assert now_active is False, "the retried removal succeeded: the load row must close"
 
 
 def test_filter_loadable_flags_nurture_for_dnc_blocked_numbers(db):
