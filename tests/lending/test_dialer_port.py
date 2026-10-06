@@ -438,3 +438,23 @@ def test_a_failure_before_the_create_is_never_marked_maybe_created():
         BatchDialerAdapter(http=CampaignHttp([]), endpoints=ENDPOINTS).upsert_contact(
             PHONE, FIELDS, campaign="Builders")
     assert caught.value.maybe_created is False
+
+
+def test_the_campaign_create_is_never_auto_retried(monkeypatch):
+    import requests
+
+    from src.lending import dialer_port
+
+    attempts = []
+
+    def failing_request(method, url, **kwargs):
+        attempts.append(url)
+        raise requests.ConnectionError("boom")
+
+    monkeypatch.setattr(dialer_port.requests, "request", failing_request)
+    monkeypatch.setattr(dialer_port, "requests_post_with_retry",
+                        lambda *a, **k: pytest.fail("a create must not go through the retrying helper"))
+    http = dialer_port._requests_http("key")
+    with pytest.raises(DialerRequestError):
+        http("POST", "/contacts", json={})
+    assert len(attempts) == 1

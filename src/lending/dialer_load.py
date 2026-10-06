@@ -29,6 +29,7 @@ from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
 from sqlalchemy import text
 
+from config.lending_compliance import RemovalReason
 from config.lending_dialer import POOL_CAMPAIGN_TAGS
 from config.settings import get_settings
 from src.lending.backflip_conflict import (
@@ -36,7 +37,14 @@ from src.lending.backflip_conflict import (
     find_borrower_conflicts,
     load_backflip_identifier_index,
 )
-from src.lending.compliance import GateResult, Scrubber, dial_blocks, filter_loadable, phone_hash
+from src.lending.compliance import (
+    GateResult,
+    Scrubber,
+    _suppressed_phones,
+    dial_blocks,
+    filter_loadable,
+    phone_hash,
+)
 from src.lending.dialer_contact import DialerDisplay, dialer_fields, display_from_record
 from src.lending.dialer_port import (
     ContactFieldsNotSet,
@@ -52,6 +60,7 @@ logger = logging.getLogger(__name__)
 COMMIT_CHUNK_SIZE = 1  # the client paces pushes one at a time, so a commit per push costs nothing
 SUPERSEDED = "superseded"
 REASON_SCRUB_FAILED = "SCRUB_FAILED"
+REASON_SUPPRESSED = "SUPPRESSED"
 REASON_NEEDS_SCRUB = "NEEDS_SCRUB"
 
 
@@ -100,6 +109,7 @@ class LoadReport:
     failed: list[dict] = field(default_factory=list)
     active_not_in_run: int = 0
     backflip_check: bool = True
+    suppressed_mid_run: int = 0  # opted out after the start-of-run gate; skipped before the push
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -119,6 +129,7 @@ class LoadReport:
             "failed": self.failed,
             "active_not_in_run": self.active_not_in_run,
             "backflip_check": self.backflip_check,
+            "suppressed_mid_run": self.suppressed_mid_run,
         }
 
 
@@ -249,6 +260,31 @@ def _record_unconfirmed_create(db, run_id: str, item: _Loadable, status: Optiona
         {"run_id": run_id, "phone": item.phone, "phone_hash": phone_hash(item.phone),
          "ref": item.record_ref, "status": status},
     )
+
+
+def _pull_if_suppressed_after_push(db, dialer: DialerContacts, chunk: list[tuple[_Loadable, int]],
+                                   commit: Callable[[], None]) -> int:
+    """A STOP that landed while a contact was being pushed: the opt-out poller found no load row
+    and completed the event, so the contact must be pulled here, now that its row exists."""
+    suppressed = _suppressed_phones(db, [item.phone for item, _ in chunk])
+    pulled = 0
+    for item, _ in chunk:
+        if item.phone not in suppressed:
+            continue
+        try:
+            dialer.remove(item.phone, reason=RemovalReason.OPT_OUT.value)
+        except Exception as exc:
+            logger.error("[dialer-load] phone_hash=%s opted out during its push and could not be removed "
+                         "(%s); remove it from the dialer by hand", phone_hash(item.phone)[:12], type(exc).__name__)
+            continue
+        db.execute(
+            text("UPDATE lending.dialer_load_records SET active = false, deactivated_at = now(), "
+                 "deactivation_reason = :reason WHERE phone = :phone AND active"),
+            {"reason": "opted_out_during_push", "phone": item.phone},
+        )
+        commit()
+        pulled += 1
+    return pulled
 
 
 def _record_pushed_before_abort(db, run_id: str, chunk: list[tuple[_Loadable, int]],
@@ -432,6 +468,12 @@ def run_dialer_load(
     chunk: list[tuple[_Loadable, int]] = []
     try:
         for item in loadable:
+            if _suppressed_phones(db, [item.phone]):  # one indexed lookup per push (a push is 3 HTTP calls)
+                report.suppressed_mid_run += 1
+                _write_exclusions(db, run_id, [{
+                    "phone_hash": phone_hash(item.phone), "reason": REASON_SUPPRESSED,
+                    "detail": json.dumps({"stage": "recheck_before_push", "record_ref": item.record_ref})}])
+                continue
             fields = dialer_fields(item.display, email=item.record.get("email"))
             try:
                 _, known_contact_id, known_campaign_tag = active.get(item.phone, (None, None, None))
@@ -454,6 +496,7 @@ def run_dialer_load(
             if len(chunk) >= COMMIT_CHUNK_SIZE:
                 _store_chunk(db, run_id, chunk, active)
                 commit()
+                report.suppressed_mid_run += _pull_if_suppressed_after_push(db, dialer, chunk, commit)
                 chunk = []
     except BaseException:
         # SIGTERM, a crash or an unexpected error mid-run: contacts already pushed to the
