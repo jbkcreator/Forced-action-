@@ -73,10 +73,15 @@ def test_known_maturity_is_shown_as_a_date_without_a_question():
     assert "ask" not in card.fields
 
 
-def test_missing_values_show_not_available_and_no_prior_contact():
+def test_missing_values_show_not_available():
     facts = LeadFacts(7, None, None, None, LeadSignals())
     card = build_context_card(facts, score_lead(facts.signals, today=TODAY), first_name="  ")
     for name in ("first_name", "property", "county", "campaign", "hook", "loan", "lender",
-                 "maturity", "permits", "equity"):
+                 "maturity", "permits", "equity", "prior_contact"):
         assert card.fields[name] == NOT_AVAILABLE
+
+
+def test_no_prior_contact_only_when_passed_explicitly():
+    facts = LeadFacts(7, None, None, None, LeadSignals())
+    card = build_context_card(facts, score_lead(facts.signals, today=TODAY), prior_contact=NO_PRIOR_CONTACT)
     assert card.fields["prior_contact"] == NO_PRIOR_CONTACT

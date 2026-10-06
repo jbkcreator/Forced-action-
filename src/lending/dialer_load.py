@@ -23,8 +23,9 @@ from __future__ import annotations
 import json
 import logging
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
 from sqlalchemy import text
@@ -53,6 +54,9 @@ from src.lending.dialer_port import (
     DialerRequestError,
 )
 from src.lending.dialer_removal import DialerRemovalUndecided
+from src.lending.context_card import NO_PRIOR_CONTACT, build_context_card
+from src.lending.lead_facts import LeadFacts, load_lead_facts
+from src.lending.lead_scoring import LeadSignals, score_lead
 from src.services.phone_utils import normalize as normalize_phone
 
 logger = logging.getLogger(__name__)
@@ -341,6 +345,87 @@ def _store_chunk(db, run_id: str, loaded: list[tuple[_Loadable, int]],
     )
 
 
+CARD_TIMEZONE = ZoneInfo("America/New_York")
+
+
+def _first_name(borrower_name: Optional[str]) -> Optional[str]:
+    parts = (borrower_name or "").split()
+    return parts[0] if parts else None
+
+
+def _prior_contact_line(calls: int, last_ended: datetime, last_disposition: Optional[str]) -> str:
+    line = f"{calls} call{'s' if calls != 1 else ''}, last {last_ended.astimezone(CARD_TIMEZONE):%Y-%m-%d}"
+    if last_disposition:
+        line += f"; last outcome: {last_disposition.replace('_', ' ')}"
+    return line
+
+
+def _prior_contacts(db, phones: Sequence[str]) -> Optional[dict[str, str]]:
+    """Prior-contact line per phone with logged calls, from one query; None when unreadable.
+
+    Counts every logged call to or from the number. The outcome is the latest call
+    that has a disposition, since the newest call may not be dispositioned yet.
+    """
+    if not phones:
+        return {}
+    try:
+        with db.begin_nested():
+            rows = db.execute(
+                text(
+                    "SELECT phone, count(*) AS calls, max(call_ended_at) AS last_ended, "
+                    "(array_agg(disposition ORDER BY call_ended_at DESC) "
+                    " FILTER (WHERE disposition IS NOT NULL))[1] AS last_disposition "
+                    "FROM lending.call_dispositions WHERE phone = ANY(:phones) GROUP BY phone"
+                ),
+                {"phones": list(phones)},
+            ).mappings().all()
+    except Exception as exc:
+        logger.warning("[dialer-load] call history unavailable (%s); prior contact left unknown",
+                       type(exc).__name__)
+        return None
+    return {
+        row["phone"]: _prior_contact_line(int(row["calls"]), row["last_ended"], row["last_disposition"])
+        for row in rows if row["last_ended"] is not None
+    }
+
+
+def _cards(db, loadable: Sequence["_Loadable"]) -> dict[str, dict[str, str]]:
+    """Context-card custom fields per record ref, from one batched facts query.
+
+    The card is extra context for the caller, never a reason to skip a load: if
+    the facts query fails, every record loads without a card (inside a savepoint,
+    so the load's transaction stays usable). Prior contact comes from the logged
+    calls; if they can't be read, it shows as not available.
+    """
+    today = datetime.now(CARD_TIMEZONE).date()
+    property_ids = sorted({int(item.record["property_id"]) for item in loadable
+                           if item.record.get("property_id") is not None})
+    facts: dict[int, LeadFacts] = {}
+    if property_ids:
+        try:
+            with db.begin_nested():
+                facts = load_lead_facts(db, property_ids, today=today)
+        except Exception as exc:
+            logger.warning("[dialer-load] card facts unavailable (%s); loading without cards", type(exc).__name__)
+            return {}
+    history = _prior_contacts(db, sorted({item.phone for item in loadable}))
+    cards: dict[str, dict[str, str]] = {}
+    for item in loadable:
+        property_id = item.record.get("property_id")
+        lead = facts.get(int(property_id)) if property_id is not None else None
+        lead = lead or LeadFacts(property_id=int(property_id or 0), property_address=item.display.property_address,
+                                 lender_name=None, latest_permit=item.display.recent_permit_details,
+                                 signals=LeadSignals())
+        card = build_context_card(
+            lead, score_lead(lead.signals, today=today),
+            first_name=_first_name(item.display.borrower_name), county=item.display.county,
+            campaign=item.display.campaign_tag, hook=item.display.hook,
+            prior_contact=None if history is None else history.get(item.phone, NO_PRIOR_CONTACT),
+        )
+        cards[item.record_ref] = card.custom_fields
+    return cards
+
+
 def _raise_if_refused(unmapped_pools: Sequence[str], duplicate_phones: int) -> None:
     if unmapped_pools:
         raise LoadRefused(f"no campaign tag for pool(s): {', '.join(unmapped_pools)}")
@@ -466,6 +551,7 @@ def run_dialer_load(
     commit()
     active = _active_rows(db, loadable_phones)
     chunk: list[tuple[_Loadable, int]] = []
+    cards = _cards(db, loadable)
     try:
         for item in loadable:
             if _suppressed_phones(db, [item.phone]):  # one indexed lookup per push (a push is 3 HTTP calls)
@@ -474,7 +560,8 @@ def run_dialer_load(
                     "phone_hash": phone_hash(item.phone), "reason": REASON_SUPPRESSED,
                     "detail": json.dumps({"stage": "recheck_before_push", "record_ref": item.record_ref})}])
                 continue
-            fields = dialer_fields(item.display, email=item.record.get("email"))
+            fields = replace(dialer_fields(item.display, email=item.record.get("email")),
+                             card=cards.get(item.record_ref, {}))
             try:
                 _, known_contact_id, known_campaign_tag = active.get(item.phone, (None, None, None))
                 result = _push_contact(dialer, item, known_contact_id, known_campaign_tag, fields)
