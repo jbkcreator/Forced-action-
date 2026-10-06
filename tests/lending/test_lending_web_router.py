@@ -1,6 +1,8 @@
 """WP-GL-11: POST /api/lending/web-leads, the endpoint the static page submits to."""
 from __future__ import annotations
 
+import itertools
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -11,6 +13,7 @@ from src.lending.consent import has_text_consent
 
 PHONE = "+18135550142"
 URL = "/api/lending/web-leads"
+_ip_counter = itertools.count(1)
 FORM = {"name": "Dana Builder", "phone": "(813) 555-0142", "email": "dana@example.com",
         "property_city": "Tampa", "deal_type": "Fix and flip", "completed_projects_3y": "1 to 2"}
 
@@ -32,7 +35,9 @@ def client(web_leads_db, delivered):
     app = FastAPI()
     app.include_router(router)
     app.dependency_overrides[get_db] = lambda: web_leads_db
-    return TestClient(app)
+    # a fresh IP per test: other test modules can leave the shared limiter backend filled, and every
+    # TestClient request would otherwise count against the same bucket
+    return TestClient(app, headers={"x-forwarded-for": f"198.18.0.{next(_ip_counter)}"})
 
 
 def _count(db):

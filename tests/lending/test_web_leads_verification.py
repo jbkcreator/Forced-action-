@@ -7,6 +7,7 @@ disposable database: set NDL_DISPOSABLE_DB=1. They never run against the shared 
 from __future__ import annotations
 
 import ast
+import itertools
 import os
 import re
 import threading
@@ -27,6 +28,12 @@ pytestmark = pytest.mark.skipif(os.environ.get("NDL_DISPOSABLE_DB") != "1",
 
 ROOT = Path(__file__).resolve().parents[2]
 PHONE = "+18135550142"
+_ip_counter = itertools.count(1)
+
+
+def _fresh_ip() -> str:
+    """A new client IP per test client, so a shared request-limiter backend can't carry counts between tests."""
+    return f"198.19.0.{next(_ip_counter)}"
 
 
 @pytest.fixture(scope="module")
@@ -247,7 +254,7 @@ def test_the_response_tells_the_page_not_to_promise_contact_to_a_suppressed_numb
     app = FastAPI()
     app.include_router(router)
     app.dependency_overrides[get_db] = override
-    client = TestClient(app)
+    client = TestClient(app, headers={"x-forwarded-for": _fresh_ip()})
     reset_local_buckets()
     form = {"name": "Dana", "phone": "(813) 555-0142", "sms_consent": "yes"}
     clean_resp = client.post("/api/lending/web-leads", data=form)
@@ -290,7 +297,7 @@ def _client(factory, monkeypatch, sink):
     app.include_router(router_mod.router)
     app.dependency_overrides[get_db] = override
     reset_local_buckets()
-    return TestClient(app), session
+    return TestClient(app, headers={"x-forwarded-for": _fresh_ip()}), session
 
 
 def _row(factory):
