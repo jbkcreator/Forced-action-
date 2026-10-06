@@ -1194,8 +1194,6 @@ COUNTY_ID=hillsborough
 
 # Lending: warn once per call when a connected call has no disposition after N minutes.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_missing_disposition_alert
-# Open unconfirmed dialer creates keep a phone's opt-out pending; remind #dial-tasks hourly (runbook: docs/lending/unconfirmed-creates-runbook.md).
-0 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_unconfirmed_create_alert
 
 # Lending: is each call recording readable with our key? forbidden (permission off) ones are rechecked every 30 min.
 */10 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_recording_check
