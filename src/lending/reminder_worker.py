@@ -42,6 +42,7 @@ from src.lending.booking_messages import next_text_window, render_email, render_
 from src.lending.compliance import phone_hash
 from src.lending.consent import has_text_consent
 from src.lending.db import lending_session
+from src.lending.ghl_email import get_email_sender
 from src.lending.ghl_sms import GhlSmsError, get_sender, texting_number
 
 logger = logging.getLogger(__name__)
@@ -68,7 +69,11 @@ class FakeTextSender:
         return f"fake-{len(self.sent)}"
 
 
-EmailSender = Callable[[str, str, str], str]  # (to, subject, body) -> provider message id; none exists yet
+class EmailSender(Protocol):
+    """The email-sending port: ``GhlEmailSender`` in production. Raises ``GhlSmsError`` like the text sender."""
+
+    def __call__(self, to: str, subject: str, body: str, *, phone: Optional[str], first_name: Optional[str],
+                 deadline: datetime) -> str: ...
 
 _COLUMNS = ("id, booking_ref, kind, send_at, first_name, contact_phone, contact_email, "
             "property_address, slot_start_utc, attempts")
@@ -149,7 +154,7 @@ def _decide(db, row: Mapping[str, Any], *, now: datetime, text_sender: Optional[
     if phone and has_text_consent(db, phone):
         return _send_text(db, row, now=now, sender=text_sender, enabled=text_enabled, number=number, started=started)
     if email:
-        return _send_email(db, row, sender=email_sender, enabled=email_enabled, number=number, started=started)
+        return _send_email(db, row, now=now, sender=email_sender, enabled=email_enabled, number=number, started=started)
     _record(db, rid, "skipped", "no_consent")
     return "skipped_no_consent"
 
@@ -198,7 +203,7 @@ def _send_text(db, row: Mapping[str, Any], *, now: datetime, sender: Optional[Te
     return "sent"
 
 
-def _send_email(db, row: Mapping[str, Any], *, sender: Optional[EmailSender], enabled: bool,
+def _send_email(db, row: Mapping[str, Any], *, now: datetime, sender: Optional[EmailSender], enabled: bool,
                 number: Optional[str], started: list[bool]) -> str:
     rid = row["id"]
     if not enabled:
@@ -210,7 +215,18 @@ def _send_email(db, row: Mapping[str, Any], *, sender: Optional[EmailSender], en
     subject, body = render_email(row["kind"], first_name=row["first_name"], slot_start_utc=row["slot_start_utc"],
                                  property_address=row["property_address"], number=number)
     started[0] = True
-    message_id = sender(row["contact_email"], subject, body)
+    try:
+        message_id = sender(row["contact_email"], subject, body, phone=row["contact_phone"],
+                            first_name=row["first_name"], deadline=row["slot_start_utc"])
+    except GhlSmsError as exc:
+        if exc.ambiguous:
+            _record(db, rid, "send_unknown", "ambiguous_send_error", CHANNEL_EMAIL)
+            return "send_unknown"
+        if row["attempts"] >= MAX_SEND_ATTEMPTS:
+            _record(db, rid, "failed", "send_failed", CHANNEL_EMAIL)
+            return "failed"
+        _requeue(db, row, now + timedelta(seconds=RETRY_DELAY_SECONDS), "send_failed_retry", count_attempt=True)
+        return "retry"
     _record(db, rid, "sent", None, CHANNEL_EMAIL, message_id)
     return "sent"
 
@@ -258,7 +274,7 @@ def run_cycle(*, now: Optional[datetime] = None) -> dict[str, int]:
     """One pass with real settings and its own session."""
     settings = get_settings()
     with lending_session() as db:
-        return process_due(db, text_sender=get_sender(), email_sender=None,
+        return process_due(db, text_sender=get_sender(), email_sender=get_email_sender(),
                            text_enabled=settings.booking_reminder_text_enabled,
                            email_enabled=settings.booking_reminder_email_enabled, number=texting_number(), now=now)
 

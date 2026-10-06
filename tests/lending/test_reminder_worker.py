@@ -37,7 +37,7 @@ class EmailSender:
     def __init__(self):
         self.calls = []
 
-    def __call__(self, to, subject, body):
+    def __call__(self, to, subject, body, *, phone=None, first_name=None, deadline=None):
         self.calls.append((to, subject, body))
         return f"mail-{len(self.calls)}"
 

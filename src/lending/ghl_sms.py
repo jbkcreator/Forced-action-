@@ -115,6 +115,8 @@ def _single_attempt(method: str, url: str, **kwargs: Any) -> requests.Response:
 
 
 class GhlSmsSender:
+    _log_prefix = "[lending-ghl-sms]"
+
     def __init__(self, account: GhlAccount, from_number: str, request: Optional[Request] = None) -> None:
         """``request`` (tests) replaces both calls; unset, both are single attempts."""
         self._account, self._from, self._request = account, from_number, request
@@ -128,10 +130,10 @@ class GhlSmsSender:
             response = request("POST", f"{ghl_webhook._GHL_BASE}{path}",
                                      headers=ghl_headers(self._account.api_key, version), json=body)
         except Exception as exc:  # class only: the message can carry request detail
-            logger.warning("[lending-ghl-sms] %s request error: %s", what, type(exc).__name__)
+            logger.warning("%s %s request error: %s", self._log_prefix, what, type(exc).__name__)
             raise GhlSmsError(f"GHL {what} request error ({type(exc).__name__})", ambiguous=is_send) from None
         if response.status_code >= 400:
-            logger.warning("[lending-ghl-sms] %s failed: HTTP %s", what, response.status_code)
+            logger.warning("%s %s failed: HTTP %s", self._log_prefix, what, response.status_code)
             raise GhlSmsError(f"GHL {what} failed: HTTP {response.status_code}",
                               ambiguous=is_send and response.status_code >= 500)
         try:
