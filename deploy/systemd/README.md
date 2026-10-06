@@ -19,6 +19,56 @@ sudo systemctl enable  fa-api lifecycle cora
 sudo systemctl start   fa-api lifecycle cora
 ```
 
+## Lending compliance workers
+
+`deploy.sh` installs, enables and restarts `fa-lending-opt-out-poller` and `fa-lending-dialer-sweep` on every deploy (client requirement: STOP propagation must run before callers dial). It is best-effort: a lending unit that fails to install or start prints a warning and never aborts or rolls back the deploy. `fa-lending-missed-call-poller` is not installed by `deploy.sh`; install it by hand if it is wanted (see below).
+
+- `fa-lending-opt-out-poller` — every 15 s mirrors FA opt-outs (SMS/email) into `lending.suppression_list` and removes the number from the dialer (60 s stop SLA).
+- `fa-lending-missed-call-poller` — every 15 s reads BatchDialer call records and decides the missed-call text for each new no-answer. Sends only when `MISSED_CALL_TEXT_ENABLED=true`, through the consent-gated SMS path; otherwise logs `dry_run`.
+- `fa-lending-dialer-sweep` — every 60 s pulls dialer contacts outside 09:00–19:15 ET / 8–20 local or at 3 attempts per 24 h, and restores them when allowed.
+
+Both hold a Postgres advisory lock, so a second copy only skips cycles. Until `BATCHDIALER_API_KEY` and the endpoints in `config/lending_dialer.py` are set, dialer removals are recorded as pending and complete on a later cycle.
+
+The GoHighLevel opt-out sync (poller) and the 15-minute DND backstop (cron) use the **Next Deal Lending sub-account only**: set `LENDING_GHL_API_KEY` and `LENDING_GHL_LOCATION_ID` in the server `.env`. They never fall back to the platform's `GHL_*` account; until both are set, the GHL sync waits and the backstop logs an error and exits.
+
+```bash
+# smoke test one cycle each first
+PYTHONPATH=. .venv/bin/python -m src.lending.opt_out_poller --once
+PYTHONPATH=. .venv/bin/python -m src.lending.dialer_sweep --once
+
+# the missed-call poller is the only one still installed by hand
+sudo cp deploy/systemd/fa-lending-missed-call-poller.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now fa-lending-missed-call-poller
+
+# watch all three
+sudo journalctl -u fa-lending-opt-out-poller -u fa-lending-dialer-sweep -u fa-lending-missed-call-poller -f
+```
+
+`fa-lending-cdr-poller` (BatchDialer call log: 15 s fast poll of `/v2/cdrs/last`, 2 min rescan of today and yesterday) is installed the same way: `sudo cp deploy/systemd/fa-lending-cdr-poller.service /etc/systemd/system/`, then `sudo systemctl daemon-reload && sudo systemctl enable --now fa-lending-cdr-poller`. It needs `BATCHDIALER_API_KEY`, `DATABASE_URL` and `LENDING_DIALER_CAMPAIGN_IDS`. Run exactly one copy (a Postgres advisory lock enforces it): the `/last` watermark is server-side per API key, and `--once` advances it too.
+
+## Lending API (lending-api)
+
+Every `/webhooks/lending/*` route is served by `lending-api` (`src/lending/api.py`, gunicorn on `127.0.0.1:8010`), not by
+`fa-api`, so a lending deploy or crash never touches the main API. Public webhook URLs do not change: nginx routes the
+`/webhooks/lending/` prefix to port 8010 (`deploy/nginx/lending-api.conf.example`, placed above the generic `/webhooks/` block).
+
+```bash
+sudo cp deploy/systemd/lending-api.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now lending-api
+curl -s http://127.0.0.1:8010/health           # {"status":"ok"}
+# add the nginx location block, then:
+sudo nginx -t && sudo systemctl reload nginx
+sudo journalctl -u lending-api -f
+```
+
+`deploy.sh` installs, enables and restarts `lending-api` with the other lending units, then enforces two hard gates (the deploy fails and rolls back):
+`deploy/verify_lending_routing.sh` (before `fa-api` restarts: nginx must have an active `location /webhooks/lending/` proxying to `127.0.0.1:8010`)
+and a retrying `curl` of `http://127.0.0.1:8010/health` (after the restart). The nginx block is a one-time manual step, so **add it and reload nginx
+before deploying this change**: `fa-api` no longer serves `/webhooks/lending/*`, and a dropped GHL opt-out is a do-not-contact compliance gap.
+Rollback: remove the nginx block and deploy the previous `fa-api`.
+
 ## Prerequisites the units assume
 
 - `/root/Forced-action-/` — the checked-out repo

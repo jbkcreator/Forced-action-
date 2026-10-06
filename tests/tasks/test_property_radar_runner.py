@@ -243,3 +243,36 @@ def test_to_contract_accepts_contract_named_records():
         "1 MAIN ST", "33701", "LIMA ONE", "2025-03-01", "BOSTON",
     )
     assert c["city"] is None
+
+
+# ── Go Live: the scheduled runner traces live instead of needing a CSV ──
+
+def _handoff_with(monkeypatch, *, apply, trace_results=None):
+    from src.services.property_radar import lead_handoff
+    from src.tasks import property_radar_lead_handoff, property_radar_runner
+
+    traced, handed = [], {}
+    monkeypatch.setattr(property_radar_lead_handoff, "_live_trace",
+                        lambda session, campaign, *, thin_path_only: traced.append(campaign) or {"R1": "contacts"})
+
+    def fake_run_handoff(**kwargs):
+        handed.update(kwargs)
+        return type("Report", (), {"decisions": []})()
+
+    monkeypatch.setattr(lead_handoff, "run_handoff", fake_run_handoff)
+    monkeypatch.setattr(lead_handoff, "iter_staged_leads", lambda session, campaign: iter(()))
+    monkeypatch.setattr(lead_handoff, "SqlHandoffStore", lambda session: None)
+    monkeypatch.setattr("src.services.property_radar_port.get_property_radar_port", lambda: None)
+    stages = property_radar_runner.default_stages(trace_results)
+    stages.handoff(None, "maturity_target_lender", apply, None)
+    return traced, handed
+
+
+def test_applied_run_without_a_csv_traces_live(monkeypatch):
+    traced, handed = _handoff_with(monkeypatch, apply=True)
+    assert traced == ["maturity_target_lender"] and handed["contacts_by_radar"] == {"R1": "contacts"}
+
+
+def test_dry_run_never_spends_on_a_live_trace(monkeypatch):
+    traced, handed = _handoff_with(monkeypatch, apply=False)
+    assert traced == [] and handed["contacts_by_radar"] == {}

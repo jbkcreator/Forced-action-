@@ -1,18 +1,19 @@
 """FA Max borrower intelligence API.
 
 Routes:
-  GET /api/fa-max/persons/{person_id}/profile — return the stored buy-box /
-      velocity / next-need profile for a person, or 404 if not yet computed.
+  GET  /api/fa-max/persons/{person_id}/profile — buy-box/velocity/next-need profile.
+  POST /api/fa-max/gates                        — submit a caller booking gate (WP-GL-5).
 
-Auth: admin JWT required (same HS256 token issued by POST /api/admin/login).
-This endpoint exposes internal borrower intelligence (predicted need, intent
-evidence, property preferences) and must never be public.
+Auth: admin JWT required on all routes. These endpoints expose internal
+borrower intelligence and caller gate results; they must never be public.
 """
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from src.api.admin_router import get_current_admin
@@ -22,6 +23,113 @@ from src.services.borrower_profile_service import get_person_profile
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/fa-max", tags=["fa-max"])
+
+
+class GateSubmission(BaseModel):
+    tracked_link_id: int
+    liquidity_source: str = Field(description="cash | loc | partner | none")
+    liquidity_amount: Optional[str] = Field(
+        default=None,
+        description="Caller-reported rough amount (brief p.1) — free text, not validated, never gates the booking on its own.",
+    )
+    completed_projects: str = Field(description="experience: 0 | 1_to_2 | 3_plus (0 routes to nurture, not a kill)")
+    deal_status: str = Field(description="real_deal | actively_looking | neither")
+    credit_band: str = Field(
+        description="Caller-asked estimate only, never a pulled score: at_or_above_640 | below_640 | unsure"
+    )
+    occupancy: str = Field(description="investment | homestead")
+    decision_maker: str = Field(description="yes | no")
+    exit_strategy: Optional[str] = Field(default=None, description="sale | refinance | other — optional, never gates")
+    property_address: Optional[str] = Field(default=None, max_length=500)
+    target_market: Optional[str] = Field(
+        default=None, max_length=200,
+        description="Required instead of property_address when deal_status is actively_looking",
+    )
+    phone: Optional[str] = Field(
+        default=None, max_length=32,
+        description="The contact's phone. The source list (List 4 block) is looked up from it in lending.calling_pool_staging.",
+    )
+    person_id: Optional[int] = None
+    list_key: Optional[str] = Field(
+        default=None, max_length=40,
+        description="Fallback only, used when our records have no list for the phone. The server's lookup always wins.",
+    )
+    captured_by: Optional[str] = None
+
+
+@router.post("/gates", status_code=201)
+def submit_gate(
+    payload: GateSubmission,
+    db: Session = Depends(get_db),
+    admin: dict = Depends(get_current_admin),
+) -> dict:
+    """Record a caller's booking gate evaluation for a tracked link.
+
+    Seven fields per Josh's locked bar (D2): experience, deal status, credit
+    band, liquidity, occupancy, decision maker, address-or-target-market.
+    exit_strategy is an optional eighth field that never gates.
+
+    Returns the gate_id and whether it passed. If it failed, the contact is
+    automatically enqueued in fa_max_nurture_queue and surfaced to EXCEPTIONS.
+
+    The source list (the List 4 booking block) is looked up from ``phone`` in
+    lending.calling_pool_staging and wins over any ``list_key`` sent. A contact
+    with no list on file is not blocked: the caller's ``list_key`` is stored if
+    one was sent, otherwise none.
+
+    Gate answers are stored as enum codes only — never free text financial
+    data, never a pulled credit score — per the _FINANCIAL_TERMS and
+    relay-payload CHECK constraints.
+    """
+    from src.services.calendar.gate import GateAnswers, resolve_list_key, store_gate
+
+    answers = GateAnswers(
+        liquidity_source=payload.liquidity_source,
+        liquidity_amount=payload.liquidity_amount,
+        completed_projects=payload.completed_projects,
+        deal_status=payload.deal_status,
+        credit_band=payload.credit_band,
+        occupancy=payload.occupancy,
+        decision_maker=payload.decision_maker,
+        exit_strategy=payload.exit_strategy,
+        property_address=payload.property_address,
+        target_market=payload.target_market,
+    )
+
+    list_key = payload.list_key
+    if payload.phone:
+        try:
+            known = resolve_list_key(db, payload.phone)
+        except Exception as exc:
+            db.rollback()
+            logger.error("gate.submit: source-list lookup failed link=%s: %s", payload.tracked_link_id, type(exc).__name__)
+            known = None
+        if known:
+            if payload.list_key and payload.list_key.strip().lower() != known:
+                logger.warning("gate.submit: caller list_key differs from our records link=%s; using ours", payload.tracked_link_id)
+            list_key = known
+
+    gate_id, result = store_gate(
+        db,
+        answers=answers,
+        tracked_link_id=payload.tracked_link_id,
+        person_id=payload.person_id,
+        list_key=list_key,
+        captured_by=payload.captured_by or admin.get("sub"),
+    )
+
+    logger.info(
+        "gate.submit: gate_id=%s link=%s result=%s caller=%s",
+        gate_id, payload.tracked_link_id,
+        "pass" if result.passed else "fail",
+        payload.captured_by or admin.get("sub"),
+    )
+    return {
+        "gate_id": gate_id,
+        "passed": result.passed,
+        "failed_field": result.failed_field,
+        "reason": result.reason,
+    }
 
 
 @router.get("/persons/{person_id}/profile")
