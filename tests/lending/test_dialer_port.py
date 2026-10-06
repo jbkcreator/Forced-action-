@@ -200,12 +200,12 @@ def test_record_style_upsert_still_works_for_the_rules_code():
     assert BatchDialerAdapter(http=http, endpoints=ENDPOINTS).upsert_contact({"phone": PHONE}) == "42"
 
 
-def test_pool_campaign_tags_name_the_three_launch_queues():
+def test_pool_campaign_tags_name_the_four_ranked_queues_plus_nurture():
     from config import lending_queues as q
     from config.lending_dialer import POOL_CAMPAIGN_TAGS
     assert POOL_CAMPAIGN_TAGS == {q.VERIFIED_MATURITY: "Verified maturity",
                                   q.TRANSACTION_READY: "Transaction ready", q.BUILDERS: "Builders",
-                                  q.NURTURE: "Nurture"}
+                                  q.PARTNERS: "Partners", q.NURTURE: "Nurture"}
 
 
 # ── HTTP transport ──
@@ -248,6 +248,20 @@ def test_transport_get_goes_through_the_get_retry_helper(monkeypatch):
 
     monkeypatch.setattr(dialer_port, "requests_get_with_retry", lambda url, **kw: _Resp(200, b"[]"))
     assert dialer_port._requests_http("k")("GET", "/campaigns") == {"id": 9}
+
+
+def test_a_non_json_2xx_reply_is_a_dialer_request_error_not_a_crash(monkeypatch):
+    """Finding 6: callers only handle DialerRequestError, so a proxy error page or truncated
+    body with a 2xx status must not escape as a ValueError."""
+    from src.lending import dialer_port
+
+    class _NotJson(_Resp):
+        def json(self):
+            raise ValueError("Expecting value")
+
+    monkeypatch.setattr(dialer_port, "requests_get_with_retry", lambda url, **kw: _NotJson(200, b"<html>"))
+    with pytest.raises(DialerRequestError):
+        dialer_port._requests_http("k")("GET", "/campaigns")
 
 
 # ── DNC safety: holds never use the DNC list, restores never delete a DNC entry ──
@@ -377,3 +391,70 @@ def test_the_card_update_keeps_our_vendor_contact_id():
     BatchDialerAdapter(http=http, endpoints=ENDPOINTS).upsert_contact(
         PHONE, FIELDS, campaign="Builders", vendor_contact_id="staging:9")
     assert http.calls[-1][2]["vendorcontactid"] == "staging:9"
+
+
+def test_an_opt_out_stays_pending_while_an_earlier_create_for_the_phone_is_unconfirmed():
+    from src.lending.dialer_port import UnreconciledContact
+
+    http = FakeHttp()
+    adapter = BatchDialerAdapter(http=http, endpoints=ENDPOINTS, contact_ids=lambda phone: ["77"],
+                                 has_unconfirmed_create=lambda phone: True)
+    with pytest.raises(UnreconciledContact):
+        adapter.remove(PHONE, reason=RemovalReason.OPT_OUT.value)
+    assert [(c[0], c[1]) for c in http.calls] == [("DELETE", "/contact/77")]  # known contacts still deleted
+
+
+def test_an_opt_out_completes_when_no_create_is_unconfirmed():
+    BatchDialerAdapter(http=FakeHttp(), endpoints=ENDPOINTS, contact_ids=lambda phone: [],
+                       has_unconfirmed_create=lambda phone: False).remove(
+        PHONE, reason=RemovalReason.OPT_OUT.value)
+
+
+class FailingAdd(CampaignHttp):
+    def __init__(self, *args, error, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._error = error
+
+    def __call__(self, method, path, *, json=None):
+        if (method, path) == ("POST", "/contacts"):
+            raise self._error
+        return super().__call__(method, path, json=json)
+
+
+@pytest.mark.parametrize("error,maybe_created", [
+    (DialerRequestError("POST /contacts", status=500), True),
+    (DialerRequestError("POST /contacts"), True),                 # timeout / network error
+    (DialerRequestError("POST /contacts", status=422), False),    # rejected: nothing was created
+])
+def test_only_an_ambiguous_create_failure_is_marked_maybe_created(error, maybe_created):
+    http = FailingAdd([{"id": 7, "name": "Builders"}], error=error)
+    with pytest.raises(DialerRequestError) as caught:
+        BatchDialerAdapter(http=http, endpoints=ENDPOINTS).upsert_contact(PHONE, FIELDS, campaign="Builders")
+    assert caught.value.maybe_created is maybe_created
+
+
+def test_a_failure_before_the_create_is_never_marked_maybe_created():
+    with pytest.raises(DialerRequestError) as caught:  # campaign missing: nothing was sent
+        BatchDialerAdapter(http=CampaignHttp([]), endpoints=ENDPOINTS).upsert_contact(
+            PHONE, FIELDS, campaign="Builders")
+    assert caught.value.maybe_created is False
+
+
+def test_the_campaign_create_is_never_auto_retried(monkeypatch):
+    import requests
+
+    from src.lending import dialer_port
+
+    attempts = []
+
+    def failing_request(method, url, **kwargs):
+        attempts.append(url)
+        raise requests.ConnectionError("boom")
+
+    monkeypatch.setattr(dialer_port.requests, "request", failing_request)
+    monkeypatch.setattr(dialer_port, "requests_post_with_retry",
+                        lambda *a, **k: pytest.fail("a create must not go through the retrying helper"))
+    http = dialer_port._requests_http("key")
+    with pytest.raises(DialerRequestError):
+        http("POST", "/contacts", json={})
+    assert len(attempts) == 1

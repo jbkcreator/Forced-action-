@@ -59,6 +59,7 @@ import argparse
 import json
 import logging
 import sys
+from collections import Counter
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -72,9 +73,8 @@ from config.property_radar_campaigns import (
 )
 from config.settings import settings
 from src.core.database import get_db_context
-from src.services.property_radar_normalizer import normalize
+from src.services.property_radar_normalizer import exclusion_reason, normalize
 from src.services.property_radar_port import get_property_radar_port
-from src.services.property_radar.linking import link_unlinked
 from src.services.property_radar.staging import upsert_records
 from src.tasks import property_radar_lead_handoff
 from src.utils.logger import setup_logging
@@ -87,13 +87,20 @@ logger = logging.getLogger(__name__)
 # Budget guard
 # ---------------------------------------------------------------------------
 
-def _check_budget(port, criteria: list[dict], state: str, campaign: str) -> int:
+def _check_budget(
+    port, criteria: list[dict], state: str, campaign: str, max_records: Optional[int] = None
+) -> int:
     """Return the safe export count, or raise RuntimeError if over budget.
 
-    Calls count() (free) first, then checks remaining allowance and per-run cap.
+    Calls count() (free) first, then checks remaining allowance and per-run cap
+    against the records this run will actually buy (``max_records`` caps it).
     """
-    total = port.count(criteria)
-    logger.info("PropertyRadar count [%s/%s]: %d records match", state, campaign, total)
+    matching = port.count(criteria)
+    total = matching if max_records is None else min(matching, max_records)
+    logger.info(
+        "PropertyRadar count [%s/%s]: %d records match, %d to buy",
+        state, campaign, matching, total,
+    )
     if total == 0:
         return 0
 
@@ -156,6 +163,24 @@ def _mark_seen(session, state: str, campaign: str, radar_ids: list[str]) -> None
         ),
         {"s": state, "c": campaign, "ids": radar_ids},
     )
+
+
+_SAVE_EXCLUDED_SQL = """
+    INSERT INTO property_radar_excluded_records
+        (radar_id, state, campaign, reason, loan_term_years, raw, pull_run_id)
+    VALUES (:radar_id, :state, :campaign, :reason, :loan_term_years, CAST(:raw AS jsonb), :pull_run_id)
+    ON CONFLICT (state, campaign, radar_id) DO UPDATE SET
+        reason = EXCLUDED.reason,
+        loan_term_years = EXCLUDED.loan_term_years,
+        raw = EXCLUDED.raw,
+        pull_run_id = EXCLUDED.pull_run_id
+"""
+
+
+def _save_excluded(session, rows: list[dict]) -> None:
+    """Keep bought-but-dropped records: every export is billed, so nothing is discarded."""
+    if rows:
+        session.execute(text(_SAVE_EXCLUDED_SQL), rows)
 
 
 def _last_successful_run_date(session, state: str, campaign: str) -> Optional[date]:
@@ -225,6 +250,8 @@ def _run_pull(
     campaign: str,
     dry_run: bool,
     session,
+    max_records: Optional[int] = None,
+    link: bool = True,
 ) -> dict:
     port = get_property_radar_port()
 
@@ -250,7 +277,7 @@ def _run_pull(
 
     # Budget guard — free count first
     if not dry_run:
-        _check_budget(port, criteria, state, campaign)
+        _check_budget(port, criteria, state, campaign, max_records)
     else:
         count = port.count(criteria)
         logger.info("[dry-run] Would fetch %d records from PropertyRadar", count)
@@ -273,13 +300,16 @@ def _run_pull(
 
     records_fetched = 0
     exports_consumed = 0
-    excluded = 0
+    excluded: Counter[str] = Counter()
     batch_ids: list[str] = []
     staging_batch: list[dict] = []
+    excluded_batch: list[dict] = []
     inserted_total = updated_total = skipped_total = 0
 
     def _flush_staging_batch() -> None:
-        nonlocal inserted_total, updated_total, skipped_total, staging_batch
+        nonlocal inserted_total, updated_total, skipped_total, staging_batch, excluded_batch
+        _save_excluded(session, excluded_batch)
+        excluded_batch = []
         if not staging_batch:
             return
         ins, upd, skp = upsert_records(session, staging_batch)
@@ -289,14 +319,29 @@ def _run_pull(
         staging_batch = []
 
     try:
-        for record in port.purchase(criteria):
+        for record in port.purchase(criteria, max_records=max_records):
             exports_consumed += 1
             if record.radar_id in seen:
                 continue
 
             normalized = normalize(record, state=state, campaign=campaign)
             if normalized is None:
-                excluded += 1
+                reason = exclusion_reason(record, state=state) or "unknown"
+                excluded[reason] += 1
+                term = record.raw.get("FirstTermInYears")
+                excluded_batch.append({
+                    "radar_id": record.radar_id,
+                    "state": state,
+                    "campaign": campaign,
+                    "reason": reason,
+                    "loan_term_years": None if term is None else str(term),
+                    "raw": json.dumps(record.raw, default=str),
+                    "pull_run_id": run_row,
+                })
+                if len(excluded_batch) >= 100:
+                    _save_excluded(session, excluded_batch)
+                    session.commit()
+                    excluded_batch = []
                 continue
 
             records_fetched += 1
@@ -320,13 +365,23 @@ def _run_pull(
         _flush_staging_batch()
         if batch_ids:
             _mark_seen(session, state, campaign, batch_ids)
-            session.commit()
+        session.commit()
 
         # Link newly-staged records to FA properties where the county is
         # loaded (Dev 2's contract: call once after all pages are upserted,
-        # not per page).
-        link_counts = link_unlinked(session)
-        session.commit()
+        # not per page). --skip-link defers this to a later runner pass.
+        link_counts = None
+        if link:
+            from src.services.property_radar.linking import link_unlinked
+
+            link_counts = link_unlinked(session)
+            session.commit()
+        if max_records is not None and exports_consumed >= max_records:
+            logger.warning(
+                "PropertyRadar pull [%s/%s] stopped at --max-records %d; the rest of "
+                "the backlog was not bought and a later daily run will not see it",
+                state, campaign, max_records,
+            )
         logger.info(
             "PropertyRadar staging: %d inserted, %d updated, %d skipped; link: %s",
             inserted_total, updated_total, skipped_total, link_counts,
@@ -368,8 +423,14 @@ def _run_pull(
         "campaign": campaign,
         "records_fetched": records_fetched,
         "exports_consumed": exports_consumed,
-        "excluded_long_term": excluded,
+        "excluded": sum(excluded.values()),
+        "excluded_by_reason": dict(excluded),
     }
+    if excluded:
+        logger.info(
+            "PropertyRadar pull [%s/%s] excluded %d of %d bought records: %s",
+            state, campaign, sum(excluded.values()), exports_consumed, dict(excluded),
+        )
     logger.info("PropertyRadar pull complete: %s", result)
     return result
 
@@ -454,6 +515,17 @@ def main() -> None:
              "always skips it regardless of --apply-handoff.",
     )
     parser.add_argument(
+        "--max-records",
+        type=int,
+        default=None,
+        help="Buy at most this many records (export credits) in this run",
+    )
+    parser.add_argument(
+        "--skip-link",
+        action="store_true",
+        help="Do not link staged records to FA properties in this run",
+    )
+    parser.add_argument(
         "--apply-handoff",
         action="store_true",
         help="Actually write handed-off leads to FA Max (default: dry run, matching "
@@ -504,6 +576,8 @@ def main() -> None:
             campaign=args.campaign,
             dry_run=False,
             session=session,
+            max_records=args.max_records,
+            link=not args.skip_link,
         )
 
     print(json.dumps(result), file=sys.stderr)

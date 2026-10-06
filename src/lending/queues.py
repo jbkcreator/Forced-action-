@@ -6,7 +6,7 @@ from typing import Any, Mapping, Optional, Sequence
 
 from sqlalchemy import text
 
-from config.lending_queues import NURTURE, NURTURE_ONLY_TAGS, SOURCE_TAG_QUEUES
+from config.lending_queues import NEVER_BOOKABLE_QUEUES, NURTURE, NURTURE_ONLY_TAGS, SOURCE_TAG_QUEUES
 from src.lending.dialer_load import run_dialer_load
 from src.services.phone_utils import normalize as normalize_phone
 
@@ -47,11 +47,13 @@ def tracerfy_hit_rate(db, *, since: Optional[datetime] = None) -> Optional[float
 def assign_queue(record: Mapping[str, Any]) -> dict[str, Any]:
     """Copy of the record with ``queue``, ``pool`` and ``bookable`` set from its ``source_tag``.
 
-    Launch lists are bookable. Nurture lists (2, 4) are dialed in the nurture queue but
-    never bookable. Unknown tags get ``queue`` None and are never dialed."""
+    Every ranked queue is bookable except NEVER_BOOKABLE_QUEUES (Partners/List 4:
+    dialed as a real queue, partner script only, never pitched or booked as
+    borrowers). A tag with no rank falls back to the nurture queue, never bookable.
+    Unknown tags get ``queue`` None and are never dialed."""
     tag = str(record.get("source_tag") or "")
     queue = SOURCE_TAG_QUEUES.get(tag)
-    bookable = queue is not None
+    bookable = queue is not None and queue not in NEVER_BOOKABLE_QUEUES
     if queue is None and tag in NURTURE_ONLY_TAGS:
         queue = NURTURE
     return {**record, "queue": queue, "pool": queue, "bookable": bookable}

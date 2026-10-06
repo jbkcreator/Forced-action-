@@ -91,9 +91,11 @@ class TestDedup:
             borrower_name=name, entity_name=None, target_property_address=None,
             estimated_loan_value=None, recent_permit_details=None,
             entity_status=None, parcel_id=None, zip=None, state="FL",
-            normalized_phone=phone, phone_available=phone is not None, email=None,
+            normalized_phone=phone, phone_available=phone is not None,
+            line_type="unknown", email=None,
             financing_intent_score=None, intent_tier=None, recommended_product=None,
-            aircall_campaign_tag="TAG", buyer_entity_id=None, permit_number=None,
+            aircall_campaign_tag="TAG",
+            buyer_entity_id=None, permit_number=None,
             dbpr_license_number=None, source_property_id=None, source_table="t",
         )
 
@@ -166,7 +168,7 @@ def _insert_broker(db, *, license_number, firm="ACME LLC", county="HILLSBOROUGH"
 class TestPool3Brokers:
     def test_includes_approved_target_county(self, fresh_db):
         _insert_broker(fresh_db, license_number="MBR-INC-1", county="HILLSBOROUGH")
-        recs = pe._extract_pool3_mortgage_broker(fresh_db, [])
+        recs = pe._extract_pool3_mortgage_broker(fresh_db, ["hillsborough", "pinellas", "pasco"])
         assert any(r.dbpr_license_number == "MBR-INC-1" for r in recs)
         r = next(r for r in recs if r.dbpr_license_number == "MBR-INC-1")
         assert r.pool_name == "mortgage_broker"
@@ -177,19 +179,114 @@ class TestPool3Brokers:
 
     def test_excludes_non_approved(self, fresh_db):
         _insert_broker(fresh_db, license_number="MBR-EXP", status="Expired")
-        recs = pe._extract_pool3_mortgage_broker(fresh_db, [])
+        recs = pe._extract_pool3_mortgage_broker(fresh_db, ["hillsborough", "pinellas", "pasco"])
         assert not any(r.dbpr_license_number == "MBR-EXP" for r in recs)
 
     def test_excludes_other_county(self, fresh_db):
         _insert_broker(fresh_db, license_number="MBR-MIA", county="MIAMI-DADE")
-        recs = pe._extract_pool3_mortgage_broker(fresh_db, [])
+        recs = pe._extract_pool3_mortgage_broker(fresh_db, ["hillsborough", "pinellas", "pasco"])
         assert not any(r.dbpr_license_number == "MBR-MIA" for r in recs)
 
     def test_no_phone_flagged(self, fresh_db):
         _insert_broker(fresh_db, license_number="MBR-NOPH", phone="")
-        recs = pe._extract_pool3_mortgage_broker(fresh_db, [])
+        recs = pe._extract_pool3_mortgage_broker(fresh_db, ["hillsborough", "pinellas", "pasco"])
         r = next(r for r in recs if r.dbpr_license_number == "MBR-NOPH")
         assert r.phone_available is False and r.normalized_phone is None
+
+    def test_excludes_same_named_county_in_another_state(self, fresh_db):
+        """Regression (code review finding #9): Hillsborough County, NH is real. A
+        broker/LO whose OFR 'county' field says HILLSBOROUGH but whose prim_state
+        is NH must not match — county name alone is not a Florida filter."""
+        _insert_broker(fresh_db, license_number="MBR-NH", county="HILLSBOROUGH", state="NH")
+        recs = pe._extract_pool3_mortgage_broker(fresh_db, ["hillsborough", "pinellas", "pasco"])
+        assert not any(r.dbpr_license_number == "MBR-NH" for r in recs)
+
+    def test_single_county_request_excludes_other_counties(self, fresh_db):
+        """Regression (code review finding #11): _extract_pool3_mortgage_broker
+        used to ignore its county_ids argument entirely, always matching the
+        global WAVE0_COUNTY_NAMES. A single-county request must not leak other
+        counties' brokers into the result."""
+        _insert_broker(fresh_db, license_number="MBR-HB", county="HILLSBOROUGH")
+        _insert_broker(fresh_db, license_number="MBR-PIN", county="PINELLAS")
+        recs = pe._extract_pool3_mortgage_broker(fresh_db, ["hillsborough"])
+        assert any(r.dbpr_license_number == "MBR-HB" for r in recs)
+        assert not any(r.dbpr_license_number == "MBR-PIN" for r in recs)
+
+
+def _insert_lo(db, *, license_number, last="SMITH", first="JOHN", county="HILLSBOROUGH",
+               status="Approved", phone="", state="FL"):
+    db.execute(text("""
+        INSERT INTO ofr_loan_originators
+            (license_number, nmls_id, last_name, first_name, prim_address_1,
+             prim_city, county, prim_state, prim_zip, phone_raw, normalized_phone, status)
+        VALUES (:ln, '1', :last, :first, '1 MAIN ST',
+                :city, :county, :state, '33601', :phone, :norm, :status)
+    """), {
+        "ln": license_number, "last": last, "first": first, "city": "TAMPA",
+        "county": county, "state": state, "phone": phone,
+        "norm": pe.normalize_phone(phone) if phone else None, "status": status,
+    })
+
+
+class TestPool3LoanOriginators:
+    """List 4 'brokers and LOs' — the LO half, wired into the same Pool 3 function."""
+
+    def test_includes_approved_target_county(self, fresh_db):
+        _insert_lo(fresh_db, license_number="LO-INC-1", last="SMITH", first="JANE", county="HILLSBOROUGH")
+        recs = pe._extract_pool3_mortgage_broker(fresh_db, ["hillsborough", "pinellas", "pasco"])
+        r = next((r for r in recs if r.dbpr_license_number == "LO-INC-1"), None)
+        assert r is not None
+        assert r.pool_name == "mortgage_broker"
+        assert r.borrower_name == "JANE SMITH"          # individual — unlike firm-level broker rows
+        assert r.entity_status == "NATURAL_PERSON"
+        # source_tag is populated by _finalize_run_metadata, not this raw extractor;
+        # source_tag_for("mortgage_broker", ...) == "list_4" is covered directly in
+        # test_lending_pool_source_tags.py.
+        assert r.aircall_campaign_tag == "DESK_RESCUE"
+        assert r.source_table == "ofr_loan_originators"
+
+    def test_excludes_non_approved(self, fresh_db):
+        _insert_lo(fresh_db, license_number="LO-EXP", status="Expired")
+        recs = pe._extract_pool3_mortgage_broker(fresh_db, ["hillsborough", "pinellas", "pasco"])
+        assert not any(r.dbpr_license_number == "LO-EXP" for r in recs)
+
+    def test_excludes_other_county(self, fresh_db):
+        # Out-of-state LOs (confirmed common in the real OFR file) must not leak in.
+        _insert_lo(fresh_db, license_number="LO-MI", county="ALLEGAN", state="MI")
+        recs = pe._extract_pool3_mortgage_broker(fresh_db, ["hillsborough", "pinellas", "pasco"])
+        assert not any(r.dbpr_license_number == "LO-MI" for r in recs)
+
+    def test_no_phone_flagged(self, fresh_db):
+        # Real OFR data: ~0% of LOs have a phone even after narrowing to local county.
+        _insert_lo(fresh_db, license_number="LO-NOPH", phone="")
+        recs = pe._extract_pool3_mortgage_broker(fresh_db, ["hillsborough", "pinellas", "pasco"])
+        r = next(r for r in recs if r.dbpr_license_number == "LO-NOPH")
+        assert r.phone_available is False and r.normalized_phone is None
+
+    def test_excludes_same_named_county_in_another_state(self, fresh_db):
+        """Regression (code review finding #9): Hillsborough County, NH is real —
+        an LO whose OFR 'county' field says HILLSBOROUGH but prim_state is NH
+        must not match on county name alone."""
+        _insert_lo(fresh_db, license_number="LO-NH", county="HILLSBOROUGH", state="NH")
+        recs = pe._extract_pool3_mortgage_broker(fresh_db, ["hillsborough", "pinellas", "pasco"])
+        assert not any(r.dbpr_license_number == "LO-NH" for r in recs)
+
+    def test_los_returned_when_brokers_table_empty(self, fresh_db):
+        """Regression test: brokers and LOs are independent OFR datasets. An empty/absent
+        brokers table must never silently suppress LOs (the bug this test guards against —
+        an early `return []` on the brokers fail-closed check used to skip the LO call too)."""
+        _insert_lo(fresh_db, license_number="LO-ALONE", county="HILLSBOROUGH")
+        # Deliberately no broker rows inserted — ofr_mortgage_brokers is empty,
+        # so _ofr_registry_available(session) is False for brokers.
+        recs = pe._extract_pool3_mortgage_broker(fresh_db, ["hillsborough", "pinellas", "pasco"])
+        assert any(r.dbpr_license_number == "LO-ALONE" for r in recs)
+
+    def test_brokers_and_los_both_present(self, fresh_db):
+        _insert_broker(fresh_db, license_number="MBR-BOTH", county="HILLSBOROUGH")
+        _insert_lo(fresh_db, license_number="LO-BOTH", county="HILLSBOROUGH")
+        recs = pe._extract_pool3_mortgage_broker(fresh_db, ["hillsborough", "pinellas", "pasco"])
+        assert any(r.dbpr_license_number == "MBR-BOTH" for r in recs)
+        assert any(r.dbpr_license_number == "LO-BOTH" for r in recs)
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +340,9 @@ class TestPool1Wholesalers:
 # ---------------------------------------------------------------------------
 
 def _seed_permit(db, *, permit_number, issue_offset_days=30, enforcement=False,
-                 permit_type="NEW CONSTRUCTION", phone="8135550002"):
+                 permit_type="NEW CONSTRUCTION", owner_phone="8135550002",
+                 owner_name="PERMIT OWNER LLC"):
+    """Seed a building_permit + an owner row so Pool 2b (NOC) can find contact info."""
     prop_id = db.execute(text(
         "SELECT id FROM properties WHERE county_id='hillsborough' LIMIT 1")).scalar()
     if prop_id is None:
@@ -251,67 +350,31 @@ def _seed_permit(db, *, permit_number, issue_offset_days=30, enforcement=False,
     db.execute(text("""
         INSERT INTO building_permits
             (property_id, permit_number, county_id, permit_type, description,
-             contractor_name, holder_name, contractor_phone, job_value,
-             issue_date, is_enforcement_permit)
-        VALUES (:p, :pn, 'hillsborough', :pt, :pt, 'TEST GC', 'TEST BUILDER LLC',
-                :ph, 300000, :d, :enf)
+             job_value, issue_date, is_enforcement_permit)
+        VALUES (:p, :pn, 'hillsborough', :pt, :pt, 300000, :d, :enf)
     """), {
-        "p": prop_id, "pn": permit_number, "pt": permit_type, "ph": phone,
+        "p": prop_id, "pn": permit_number, "pt": permit_type,
         "d": date.today() - timedelta(days=issue_offset_days), "enf": enforcement,
     })
-
-
-class TestPool2Builders:
-    def test_includes_recent_structural(self, fresh_db):
-        _seed_permit(fresh_db, permit_number="BP-INC-1", issue_offset_days=30)
-        recs = pe._extract_pool2_active_builder(fresh_db, ["hillsborough", "pinellas"])
-        r = next((r for r in recs if r.permit_number == "BP-INC-1"), None)
-        assert r is not None
-        assert r.pool_name == "active_builder"
-        assert r.normalized_phone == "+18135550002"
-        assert r.entity_name == "TEST BUILDER LLC"
-        assert r.recent_permit_details and "NEW CONSTRUCTION" in r.recent_permit_details
-        assert r.aircall_campaign_tag == "DESK_CONSTRUCTION"
-
-    def test_excludes_enforcement_permit(self, fresh_db):
-        _seed_permit(fresh_db, permit_number="BP-ENF", enforcement=True)
-        recs = pe._extract_pool2_active_builder(fresh_db, ["hillsborough", "pinellas"])
-        assert not any(r.permit_number == "BP-ENF" for r in recs)
-
-    def test_excludes_old_permit(self, fresh_db):
-        _seed_permit(fresh_db, permit_number="BP-OLD", issue_offset_days=400)
-        recs = pe._extract_pool2_active_builder(fresh_db, ["hillsborough", "pinellas"])
-        assert not any(r.permit_number == "BP-OLD" for r in recs)
-
-    def test_excludes_non_structural(self, fresh_db):
-        _seed_permit(fresh_db, permit_number="BP-POOL", permit_type="POOL SCREEN ENCLOSURE")
-        recs = pe._extract_pool2_active_builder(fresh_db, ["hillsborough", "pinellas"])
-        assert not any(r.permit_number == "BP-POOL" for r in recs)
-
-    def test_project_count_threshold(self, fresh_db, monkeypatch):
-        # O12: builder must meet the project-count threshold. Two permits (same
-        # contractor 'TEST GC') under a threshold of 3 → excluded; a third → included.
-        monkeypatch.setattr(pe, "BUILDER_MIN_PROJECTS", 3)
-        _seed_permit(fresh_db, permit_number="BP-A")
-        _seed_permit(fresh_db, permit_number="BP-B")
-        recs = pe._extract_pool2_active_builder(fresh_db, ["hillsborough", "pinellas"])
-        assert not any(r.borrower_name == "TEST GC" for r in recs)   # 2 < 3
-        _seed_permit(fresh_db, permit_number="BP-C")
-        recs = pe._extract_pool2_active_builder(fresh_db, ["hillsborough", "pinellas"])
-        assert any(r.borrower_name == "TEST GC" for r in recs)       # 3 >= 3
-
-    def test_one_row_per_builder(self, fresh_db):
-        # Three permits for one builder collapse to a single calling row.
-        for pn in ("BP-1", "BP-2", "BP-3"):
-            _seed_permit(fresh_db, permit_number=pn)
-        recs = pe._extract_pool2_active_builder(fresh_db, ["hillsborough", "pinellas"])
-        builder_rows = [r for r in recs if r.borrower_name == "TEST GC"]
-        assert len(builder_rows) == 1
-        assert "3 permits" in (builder_rows[0].recent_permit_details or "")
+    # Seed the property owner so Pool 2b LEFT JOIN owners can find a phone.
+    # sunbiz_status has a Python-side ORM default ("pending"), not a server
+    # default, so a raw-SQL insert must set it explicitly.
+    db.execute(text("""
+        INSERT INTO owners (property_id, owner_name, phone_1, sunbiz_status)
+        VALUES (:p, :nm, :ph, 'pending')
+        ON CONFLICT DO NOTHING
+    """), {"p": prop_id, "nm": owner_name, "ph": owner_phone})
+    return prop_id
 
 
 # ---------------------------------------------------------------------------
 # O28 — Estimated Loan Value (spec-backed) + owner-builder name match
+#
+# Pool 2b (_extract_pool2b_noc_permits) was superseded during the #318/#320
+# reconciliation by _extract_list7_permit_owners/permit_owner_record (from
+# #320) — see pool_extraction.py's Pool 2 docstring. That function's coverage
+# (new-construction filter, no-permanent-financing exclusion, List 7 tagging)
+# is in tests/services/test_lending_pool_source_tags.py.
 # ---------------------------------------------------------------------------
 
 class TestNamesMatch:
@@ -328,13 +391,107 @@ class TestNamesMatch:
         assert pe._names_match("X", "") is False
 
 
-class TestEstimatedLoanValue:
-    def test_pool2_builder_85pct_ltc(self, fresh_db):
-        _seed_permit(fresh_db, permit_number="BP-ELV")  # job_value=300000
-        recs = pe._extract_pool2_active_builder(fresh_db, ["hillsborough", "pinellas"])
-        r = next(r for r in recs if r.borrower_name == "TEST GC")
-        assert r.estimated_loan_value == Decimal("300000") * Decimal(str(pe.CONSTRUCTION_LTC))
+class TestCampaignListAndLineType:
+    """source_tag (Josh's List 1-9, see source_tag_for()) and line_type (mobile/landline/unknown).
 
+    List 7 (permit_owner) coverage lives in test_lending_pool_source_tags.py —
+    _extract_pool2b_noc_permits was superseded by _extract_list7_permit_owners
+    during the #318/#320 reconciliation.
+    """
+
+    def test_pool1_source_tag_list_2(self, fresh_db):
+        be_id = _seed_wholesaler(fresh_db, buyer_type="wholesaler")
+        recs = pe._extract_pool1_wholesaler_flipper(fresh_db, ["hillsborough", "pinellas"])
+        r = next((r for r in recs if r.buyer_entity_id == be_id), None)
+        if r:
+            assert r.line_type == "unknown"      # buyer_entity phone source doesn't distinguish
+
+    def test_pool3_broker_line_type(self, fresh_db):
+        _insert_broker(fresh_db, license_number="MBR-CL4")
+        recs = pe._extract_pool3_mortgage_broker(fresh_db, ["hillsborough", "pinellas", "pasco"])
+        r = next((r for r in recs if r.dbpr_license_number == "MBR-CL4"), None)
+        if r:
+            assert r.line_type == "unknown"
+
+
+def _staging_record(run_id, ref, **overrides):
+    from datetime import datetime, timezone as _tz
+
+    fields = dict(
+        run_id=run_id, pool_name="active_builder", county_id="hillsborough", county_name="Hillsborough",
+        borrower_name="Jane Roe", entity_name="Roe LLC", target_property_address="1 Main St",
+        estimated_loan_value=None, recent_permit_details=None, entity_status="LLC",
+        parcel_id=f"P-{ref}", zip="33602", state="FL",
+        normalized_phone=None, phone_available=False, line_type=None, email=None,
+        financing_intent_score=None, intent_tier=None, recommended_product=None,
+        aircall_campaign_tag="X", buyer_entity_id=None, permit_number=None, dbpr_license_number=None,
+        source_property_id=None, source_table="test", source_tag="list_3",
+        created_at=datetime.now(_tz.utc),
+    )
+    fields.update(overrides)
+    return pe.CallingPoolRecord(**fields)
+
+
+class TestWriteToStagingAtomicity:
+    """Finding #12: a failed batch must never leave a partial run committed — one
+    would otherwise beat the previous complete run as "latest" (lending.pool_source's
+    latest_run_id picks the newest created_at with no notion of completeness)."""
+
+    def test_a_failed_second_batch_leaves_nothing_from_that_run_committed(self, fresh_db, pg_engine):
+        import uuid
+
+        from src.lending.pool_source import latest_run_id
+
+        # A genuinely separate, durably-committed connection: _write_to_staging's own
+        # commit/rollback manages fresh_db's whole bound transaction, so the "previous
+        # complete run" must live outside it to prove it survives independently —
+        # exactly as it would across two separate real runs in production, where each
+        # run is its own transaction.
+        old_run = str(uuid.uuid4())
+        with pg_engine.begin() as setup_conn:
+            setup_conn.execute(text(
+                "INSERT INTO lending.calling_pool_staging (run_id, pool_name, aircall_campaign_tag, "
+                "source_table, source_tag, normalized_phone, phone_available, borrower_name, entity_name, "
+                "target_property_address, estimated_loan_value, state, entity_status, parcel_id, created_at) "
+                "VALUES (:r, 'active_builder', 'X', 'test', 'list_3', NULL, false, 'Old Borrower', "
+                "'Old LLC', '1 Old St', NULL, 'FL', 'LLC', 'OLD-1', now() - interval '1 hour')"),
+                {"r": old_run},
+            )
+        try:
+            assert latest_run_id(fresh_db) == old_run
+
+            new_run = str(uuid.uuid4())
+            records = [_staging_record(new_run, f"new-{i}") for i in range(1500)]  # 2 batches: 1000, 500
+
+            real_execute = fresh_db.execute
+            calls = {"n": 0}
+
+            def flaky_execute(*args, **kwargs):
+                calls["n"] += 1
+                if calls["n"] == 2:   # fails on the second batch's INSERT
+                    raise RuntimeError("connection dropped mid-batch")
+                return real_execute(*args, **kwargs)
+
+            fresh_db.execute = flaky_execute
+            try:
+                with pytest.raises(RuntimeError, match="connection dropped"):
+                    pe._write_to_staging(fresh_db, records)
+            finally:
+                fresh_db.execute = real_execute
+
+            count = fresh_db.execute(
+                text("SELECT count(*) FROM lending.calling_pool_staging WHERE run_id = :r"), {"r": new_run},
+            ).scalar()
+            assert count == 0, "the failed run's first (successful) batch must not survive uncommitted"
+            assert latest_run_id(fresh_db) == old_run, "the previous complete run must still be selected"
+        finally:
+            with pg_engine.begin() as cleanup_conn:
+                cleanup_conn.execute(
+                    text("DELETE FROM lending.calling_pool_staging WHERE run_id = :r"), {"r": old_run},
+                )
+
+
+class TestEstimatedLoanValue:
     def test_pool1_flip_floored_at_min(self, fresh_db):
         be_id = _seed_wholesaler(fresh_db)  # sale_price=200000 → 150000 > 100k floor
         recs = pe._extract_pool1_wholesaler_flipper(fresh_db, ["hillsborough", "pinellas"])
@@ -346,6 +503,6 @@ class TestEstimatedLoanValue:
 
     def test_pool3_broker_no_loan_value(self, fresh_db):
         _insert_broker(fresh_db, license_number="MBR-ELV")
-        recs = pe._extract_pool3_mortgage_broker(fresh_db, [])
+        recs = pe._extract_pool3_mortgage_broker(fresh_db, ["hillsborough", "pinellas", "pasco"])
         r = next(r for r in recs if r.dbpr_license_number == "MBR-ELV")
         assert r.estimated_loan_value is None

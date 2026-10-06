@@ -97,3 +97,9 @@ def test_a_bare_street_address_still_fills_the_address_field():
     assert fields.address == "9 Oak Ave" and fields.city is None
     fields = dialer_fields(display_from_record({"property_address": "9 Oak St"}, "Builders"))
     assert fields.address == "9 Oak St" and fields.city is None
+
+
+def test_non_finite_or_oversized_loan_value_is_shown_as_not_available():
+    for bad in (float("nan"), "NaN", "Infinity", "-5", 10 ** 12):
+        display = display_from_record({"estimated_loan_value": bad}, None)
+        assert display.estimated_loan_value is None

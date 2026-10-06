@@ -137,8 +137,8 @@ def test_a_save_failure_is_a_generic_500_that_leaks_nothing(client, monkeypatch,
     assert delivered == []
 
 
-def test_the_router_is_mounted_on_the_app():
-    from src.api.main import app
+def test_the_router_is_mounted_on_the_lending_app():
+    from src.lending.api import app
 
     # openapi() resolves nested routers, which app.routes does not in newer FastAPI versions
     assert "post" in app.openapi()["paths"].get(URL, {})
