@@ -111,15 +111,23 @@ class TestWrapperConversion:
         start = datetime.fromisoformat(window_start).replace(
             hour=14, minute=0, second=0, microsecond=0
         )
-        with patch(
-            "src.agents.fa_max.tool_registry.check_suppression",
-            return_value={"suppressed": True, "reason": "opted_out"},
+        with (
+            patch(
+                "src.agents.fa_max.tool_registry.check_suppression",
+                return_value={"suppressed": True, "reason": "opted_out"},
+            ),
+            patch(
+                "src.services.calendar.gate.get_passed_gate_by_id",
+                return_value={"gate_id": "test_gate", "list_key": None, "result": "pass"},
+            ),
+            patch("src.services.calendar.gate.enforce_daily_cap", return_value=True),
         ):
             result = get_fa_max_tool("calendar.book").func(
                 starts_at=start.isoformat(),
                 ends_at=(start + timedelta(minutes=30)).isoformat(),
                 attendee_email="borrower@example.invalid",
                 topic="Intro call",
+                gate_id="test_gate",
                 calendar_id=CALENDAR_ID,
                 session=None,
             )
@@ -134,7 +142,7 @@ class TestWrapperConversion:
         with patch("config.settings.get_settings") as settings, patch(
             "src.services.calendar.google_client.GoogleCalendarClient.from_settings"
         ) as from_settings:
-            settings.return_value.fa_max_calendar_mode = "live"
+            settings.return_value.lending_calendar_mode = "live"
             client = get_calendar_client()
 
         from_settings.assert_called_once()
@@ -144,6 +152,37 @@ class TestWrapperConversion:
         from src.services.calendar.client import get_calendar_client
 
         with patch("config.settings.get_settings") as settings:
-            settings.return_value.fa_max_calendar_mode = "stage"
-            with pytest.raises(ValueError, match="Unknown FA_MAX_CALENDAR_MODE"):
+            settings.return_value.lending_calendar_mode = "stage"
+            with pytest.raises(ValueError, match="Unknown LENDING_CALENDAR_MODE"):
                 get_calendar_client()
+
+    def test_ghl_mode_builds_the_ghl_client_not_the_fake(self):
+        from src.services.calendar.client import get_calendar_client
+        from src.services.calendar.fakes import FakeCalendar
+
+        with patch("config.settings.get_settings") as settings, patch(
+            "src.services.calendar.ghl_client.GHLCalendarClient.from_settings"
+        ) as from_settings:
+            settings.return_value.lending_calendar_mode = "ghl"
+            client = get_calendar_client()
+
+        from_settings.assert_called_once()
+        assert not isinstance(client, FakeCalendar)
+
+    def test_ghl_mode_reads_the_ghl_calendar_id_not_the_google_one(self):
+        from src.services.calendar.client import get_calendar_id
+
+        with patch("config.settings.get_settings") as settings:
+            settings.return_value.lending_calendar_mode = "ghl"
+            settings.return_value.lending_ghl_calendar_id = "ghl_cal_1"
+            settings.return_value.fa_max_calendar_id = "google_cal_1"
+            assert get_calendar_id() == "ghl_cal_1"
+
+    def test_ghl_mode_without_ghl_calendar_id_raises(self):
+        from src.services.calendar.client import get_calendar_id
+
+        with patch("config.settings.get_settings") as settings:
+            settings.return_value.lending_calendar_mode = "ghl"
+            settings.return_value.lending_ghl_calendar_id = None
+            with pytest.raises(ValueError, match="LENDING_GHL_CALENDAR_ID"):
+                get_calendar_id()
