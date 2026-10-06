@@ -12,7 +12,7 @@ from config.lending_compliance import DEFAULT_TZ
 from config.settings import get_settings
 from src.lending.db import lending_session
 from src.lending.dialer_port import get_http
-from src.lending.scoreboard import build_scoreboard, format_slack
+from src.lending.scoreboard import build_scoreboard, format_blocks, format_slack
 
 logger = logging.getLogger(__name__)
 
@@ -33,10 +33,10 @@ def campaign_names() -> Mapping[str, str]:
         return {}
 
 
-def _post_with_retry(client, channel: str, message: str) -> None:
+def _post_with_retry(client, channel: str, message: str, blocks: list) -> None:
     for attempt in range(1, SLACK_ATTEMPTS + 1):
         try:
-            client.chat_postMessage(channel=channel, text=message)
+            client.chat_postMessage(channel=channel, text=message, blocks=blocks)
             return
         except Exception:
             if attempt == SLACK_ATTEMPTS:
@@ -60,9 +60,10 @@ def main(argv=None, *, now: Optional[datetime] = None) -> int:
     day = now_et.date()
     try:
         with lending_session() as db:
-            message = format_slack(build_scoreboard(db, day, campaign_names()), day)
+            data = build_scoreboard(db, day, campaign_names())
         from slack_sdk import WebClient
-        _post_with_retry(WebClient(token=s.lending_slack_bot_token.get_secret_value()), channel, message)
+        _post_with_retry(WebClient(token=s.lending_slack_bot_token.get_secret_value()), channel,
+                         format_slack(data, day), format_blocks(data, day))
     except Exception:
         logger.exception("[lending] scoreboard post failed for %s", day)
         return 1

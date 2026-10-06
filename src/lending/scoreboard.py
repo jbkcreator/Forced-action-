@@ -80,14 +80,71 @@ def build_scoreboard(db, day: date, campaign_names: Optional[Mapping[str, str]] 
     return ScoreboardData(callers, campaigns, hooks, total)
 
 
-def _line(r: Row) -> str:
-    return (f"{r.name}: Dials {r.dials} | Live {r.live} | Gated {r.gated} | Booked {r.booked} | "
-            f"Showed n/a (GHL) | Nurture {r.nurture} | Connect {r.connect_rate:.0%} | Book rate {r.book_rate:.0%}")
+_COLUMNS = ("Dials", "Live", "Gated", "Booked", "Nurture", "Connect", "Book rate")
+MAX_TABLE_ROWS = 25  # a Slack section holds 3000 chars
+MAX_NAME_CHARS = 26
+LEGEND = ("Live = real conversation · Gated = booked or failed the gate · Nurture = nurture sent · "
+          "Connect = Live ÷ Dials · Book rate = Booked ÷ Live · Showed comes from GHL (not connected yet)")
+
+
+def _cells(r: Row) -> list[str]:
+    return [str(r.dials), str(r.live), str(r.gated), str(r.booked), str(r.nurture),
+            f"{r.connect_rate:.0%}", f"{r.book_rate:.0%}"]
+
+
+def _name(raw: str) -> str:
+    clean = raw.replace("`", "'")
+    return clean if len(clean) <= MAX_NAME_CHARS else clean[:MAX_NAME_CHARS - 1] + "…"
+
+
+def _table(label: str, rows: list[Row]) -> str:
+    """Aligned monospace table in a code fence (Slack has no native tables)."""
+    if not rows:
+        return "_no dials_"
+    shown = rows[:MAX_TABLE_ROWS]
+    names, body = [_name(r.name) for r in shown], [_cells(r) for r in shown]
+    first = max(len(label), *map(len, names))
+    widths = [max(len(h), *(len(c[i]) for c in body)) for i, h in enumerate(_COLUMNS)]
+    lines = [label.ljust(first) + "  " + "  ".join(h.rjust(w) for h, w in zip(_COLUMNS, widths))]
+    lines.append("-" * len(lines[0]))
+    lines += [n.ljust(first) + "  " + "  ".join(c.rjust(w) for c, w in zip(cells, widths)) for n, cells in zip(names, body)]
+    if len(rows) > len(shown):
+        lines.append(f"... and {len(rows) - len(shown)} more")
+    return "```\n" + "\n".join(lines) + "\n```"
+
+
+def _sections(data: ScoreboardData) -> list[tuple[str, str, list[Row]]]:
+    return [("By caller", "Caller", data.by_caller), ("By campaign", "Campaign", data.by_campaign),
+            ("By hook (campaign tag): which hook works", "Hook", data.by_hook)]
+
+
+def _title(day: date) -> str:
+    return f"Lending scoreboard · {day:%a %b} {day.day}, {day.year}"
+
+
+def _totals(t: Row) -> list[tuple[str, str]]:
+    return [("Dials", str(t.dials)), ("Live", str(t.live)), ("Gated", str(t.gated)), ("Booked", str(t.booked)),
+            ("Nurture", str(t.nurture)), ("Showed", "n/a (GHL)"), ("Connect", f"{t.connect_rate:.0%}"),
+            ("Book rate", f"{t.book_rate:.0%}")]
 
 
 def format_slack(data: ScoreboardData, day: date) -> str:
-    out = [f"*Lending scoreboard {day.isoformat()} (through 7:15pm ET)*", _line(data.total), "", "*By caller*"]
-    out += [_line(r) for r in data.by_caller] or ["no dials"]
-    out += ["", "*By campaign*"] + ([_line(r) for r in data.by_campaign] or ["no dials"])
-    out += ["", "*By hook (campaign tag): which hook works*"] + ([_line(r) for r in data.by_hook] or ["no dials"])
+    """Plain mrkdwn version: the notification preview and the fallback when blocks are unavailable."""
+    totals = " | ".join(f"{k} {v}" for k, v in _totals(data.total))
+    out = [f"*{_title(day)}* (through 7:15pm ET)", f"TOTAL: {totals}"]
+    for title, label, rows in _sections(data):
+        out += ["", f"*{title}*", _table(label, rows)]
     return "\n".join(out)
+
+
+def format_blocks(data: ScoreboardData, day: date) -> list[dict]:
+    blocks: list[dict] = [
+        {"type": "header", "text": {"type": "plain_text", "text": f":telephone_receiver: {_title(day)}", "emoji": True}},
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": "Outbound dials through 7:15pm ET"}]},
+        {"type": "section", "fields": [{"type": "mrkdwn", "text": f"*{k}*\n{v}"} for k, v in _totals(data.total)]},
+    ]
+    for title, label, rows in _sections(data):
+        blocks += [{"type": "divider"},
+                   {"type": "section", "text": {"type": "mrkdwn", "text": f"*{title}*\n{_table(label, rows)}"}}]
+    blocks += [{"type": "divider"}, {"type": "context", "elements": [{"type": "mrkdwn", "text": LEGEND}]}]
+    return blocks
