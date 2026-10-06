@@ -45,6 +45,7 @@ PYTHONPATH=. python migrations/apply_fa_max_wp_t2_3.py  # FA Max WP-T2-3: opport
 PYTHONPATH=. python migrations/apply_property_radar_pull_runs.py  # PropertyRadar ingestion adapter (Dev 1): property_radar_pull_runs (run checkpoint) + property_radar_seen_ids (dedup) (idempotent)
 PYTHONPATH=. python migrations/apply_fa_max_booking_gates.py  # WP-GL-5: fa_max_booking_gates table + gate_id FK on fa_max_bookings (idempotent, run after apply_fa_max_bookings_integrity.py)
 PYTHONPATH=. python migrations/apply_fa_max_nurture_queue.py  # WP-GL-5: fa_max_nurture_queue — holds gate-fail contacts pending nurture routing (idempotent, run after apply_fa_max_booking_gates.py)
+PYTHONPATH=. python migrations/apply_lending_dialer_unconfirmed_creates.py  # Lending dialer load: lending.dialer_unconfirmed_creates (ambiguous creates; keeps an opt-out pending until resolved) (idempotent)
 PYTHONPATH=. python migrations/apply_property_radar_traced_contacts.py  # PropertyRadar live Tracerfy trace: property_radar_traced_contacts (paid contacts stored with the ledger rows; run before the first --live-trace) (idempotent)
 
 PYTHONPATH=. python migrations/apply_lending_call_dispositions.py  # lending.call_dispositions (idempotent); runbook docs/lending/dialer-disposition-runbook.md
