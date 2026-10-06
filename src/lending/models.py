@@ -333,3 +333,46 @@ class LendingMissedCallText(LendingBase):
         Index("uq_lending_missed_call_texts_sent_day", "phone", "event_date_et", unique=True,
               postgresql_where=text("outcome = 'sent'")),
     )
+
+
+class LendingWebLead(LendingBase):
+    """One nextdeallending.com form submission (WP-GL-11), stored before any GHL call.
+
+    ``sms_consent`` / ``deal_drop_optin`` hold exactly what the visitor ticked, with the label
+    text, page URL, IP and timestamp that make it evidence. A later unticked submission never
+    edits an earlier row; every submission is its own row. ``ghl_status`` is the delivery
+    state: pending -> synced / contact_only (no new-lead stage configured) / failed.
+    """
+
+    __tablename__ = "web_leads"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    phone: Mapped[str] = mapped_column(String(20), nullable=False)  # phone_utils.normalize
+    email: Mapped[Optional[str]] = mapped_column(String(255))  # lower-cased
+    property_city: Mapped[Optional[str]] = mapped_column(String(80))
+    deal_type: Mapped[Optional[str]] = mapped_column(String(60))
+    completed_projects_3y: Mapped[Optional[str]] = mapped_column(String(30))
+    sms_consent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    deal_drop_optin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    consent_text: Mapped[Optional[str]] = mapped_column(Text)  # the label the visitor saw, verbatim
+    consent_text_matches: Mapped[Optional[bool]] = mapped_column(Boolean)  # equals config.lending_web.SMS_CONSENT_TEXT
+    page_url: Mapped[Optional[str]] = mapped_column(String(300))
+    ip_address: Mapped[Optional[str]] = mapped_column(String(45))
+    user_agent: Mapped[Optional[str]] = mapped_column(String(300))
+    suppressed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    suppression_reason: Mapped[Optional[str]] = mapped_column(String(30))  # suppression_list | do_not_contact; NULL when not suppressed
+    ghl_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending", server_default=text("'pending'"))
+    ghl_contact_id: Mapped[Optional[str]] = mapped_column(String(64))
+    ghl_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    ghl_last_error: Mapped[Optional[str]] = mapped_column(String(200))
+    ghl_last_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    ghl_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    ghl_alerted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # Slack warning sent: not in GHL after the alert wait
+
+    __table_args__ = (
+        CheckConstraint("ghl_status IN ('pending', 'synced', 'contact_only', 'failed')", name="ck_lending_web_leads_ghl_status"),
+        Index("idx_lending_web_leads_delivery", "ghl_status", "received_at"),
+        Index("idx_lending_web_leads_phone", "phone", "received_at"),
+    )

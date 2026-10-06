@@ -23,6 +23,7 @@ def _paths(application) -> set[str]:
 def test_lending_app_serves_the_lending_webhooks_and_health():
     paths = _paths(app)
     assert "/webhooks/lending/ghl-opt-out" in paths
+    assert "/api/lending/web-leads" in paths
     assert "/health" in paths
 
 
