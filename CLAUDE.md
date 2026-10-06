@@ -48,7 +48,7 @@ PYTHONPATH=. python migrations/apply_property_radar_traced_contacts.py  # Proper
 PYTHONPATH=. python migrations/apply_lending_call_dispositions.py  # lending.call_dispositions (idempotent); runbook docs/lending/dialer-disposition-runbook.md
 PYTHONPATH=. python migrations/apply_lending_call_dispositions_dialer.py  # vendor-neutral rename + dialer-logging columns + lending.missed_call_events (idempotent, run after apply_lending_call_dispositions.py)
 PYTHONPATH=. python migrations/apply_lending_pr319_client_feedback.py  # lending.text_consents + recording_status and dialer_campaign_id columns (idempotent, run after apply_lending_call_dispositions_dialer.py)
-PYTHONPATH=. python migrations/apply_lending_web_leads.py  # WP-GL-11: lending.web_leads, nextdeallending.com form submissions + consent evidence + GHL delivery state (idempotent, run after apply_lending_compliance.py)
+PYTHONPATH=. python migrations/apply_lending_web_leads.py  # WP-GL-11: lending.web_leads, nextdeallending.com form submissions + consent evidence + GHL delivery state + suppression_reason (idempotent, also adds suppression_reason to an existing table; run after apply_lending_compliance.py)
 # PropertyRadar daily target-lender maturity pull (separate cron, disabled until PROPERTY_RADAR_ENABLED=true — see scripts/cron/crontab.txt)
 python -m src.tasks.property_radar_maturity_pull --mode daily --state FL
 

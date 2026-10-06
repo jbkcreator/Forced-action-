@@ -340,6 +340,7 @@ class LendingWebLead(LendingBase):
     ip_address: Mapped[Optional[str]] = mapped_column(String(45))
     user_agent: Mapped[Optional[str]] = mapped_column(String(300))
     suppressed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    suppression_reason: Mapped[Optional[str]] = mapped_column(String(30))  # suppression_list | do_not_contact; NULL when not suppressed
     ghl_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending", server_default=text("'pending'"))
     ghl_contact_id: Mapped[Optional[str]] = mapped_column(String(64))
     ghl_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))

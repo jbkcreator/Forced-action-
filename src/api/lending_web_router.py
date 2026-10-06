@@ -17,7 +17,7 @@ from config.lending_web import RATE_LIMIT_PER_WINDOW, RATE_LIMIT_SCOPE, RATE_LIM
 from src.api.deps import get_db
 from src.lending.db import lending_session
 from src.lending.web_lead_ghl import get_live_sink
-from src.lending.web_leads import InvalidWebLead, build_input, deliver_pending, save_web_lead
+from src.lending.web_leads import InvalidWebLead, build_input, deliver_pending, merge_into_existing, save_web_lead
 from src.services.rate_limit import client_ip, enforce_or_429
 
 logger = logging.getLogger(__name__)
@@ -70,11 +70,12 @@ def create_web_lead(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     try:
         lead_id, created = save_web_lead(db, data)
+        enriched = False if created else merge_into_existing(db, lead_id, data)
         db.commit()
     except Exception as exc:
         db.rollback()
         logger.error("[lending-web] could not save lead: %s", type(exc).__name__)
         raise HTTPException(status_code=500, detail="We could not save your request. Please call us.") from exc
-    if created:
+    if created or enriched:
         background_tasks.add_task(deliver_in_background, lead_id)
-    return {"received": True}
+    return {"received": True} if created else {"received": True, "duplicate": True}

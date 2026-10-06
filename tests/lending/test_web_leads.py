@@ -119,6 +119,24 @@ def test_suppressed_by_email_alone(web_leads_db):
     assert _row(web_leads_db, lead_id)["suppressed"] is True
 
 
+def test_the_reason_a_lead_was_suppressed_is_stored(web_leads_db):
+    web_leads_db.execute(text("INSERT INTO lending.suppression_list (phone, reason, source_channel) VALUES (:p, 'OPT_OUT', 'sms')"), {"p": PHONE})
+    on_list, _ = save_web_lead(web_leads_db, _data())
+    web_leads_db.execute(text("INSERT INTO lending.contacts (phone, do_not_contact) VALUES ('+18135550166', true)"))
+    flagged, _ = save_web_lead(web_leads_db, _data(phone="(813) 555-0166"))
+    clear, _ = save_web_lead(web_leads_db, _data(phone="(813) 555-0155"))
+    assert [_row(web_leads_db, i)["suppression_reason"] for i in (on_list, flagged, clear)] == [
+        "suppression_list", "do_not_contact", None]
+    assert [_row(web_leads_db, i)["suppressed"] for i in (on_list, flagged, clear)] == [True, True, False]
+
+
+def test_the_opt_out_list_is_the_reason_when_both_gates_fire(web_leads_db):
+    web_leads_db.execute(text("INSERT INTO lending.suppression_list (phone, reason, source_channel) VALUES (:p, 'OPT_OUT', 'sms')"), {"p": PHONE})
+    web_leads_db.execute(text("INSERT INTO lending.contacts (phone, do_not_contact) VALUES (:p, true)"), {"p": PHONE})
+    lead_id, _ = save_web_lead(web_leads_db, _data())
+    assert _row(web_leads_db, lead_id)["suppression_reason"] == "suppression_list"
+
+
 def test_unticked_later_submission_does_not_erase_earlier_consent(web_leads_db):
     save_web_lead(web_leads_db, _data(sms_consent="yes"))
     web_leads_db.execute(text("UPDATE lending.web_leads SET received_at = now() - interval '1 day'"))

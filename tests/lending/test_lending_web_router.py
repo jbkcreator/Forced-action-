@@ -78,6 +78,35 @@ def test_a_double_submit_is_stored_and_delivered_once(client, web_leads_db, deli
     assert _count(web_leads_db) == 1 and len(delivered) == 1
 
 
+def test_only_a_repeat_inside_the_window_is_flagged_as_a_duplicate(client):
+    assert client.post(URL, data=FORM).json() == {"received": True}
+    assert client.post(URL, data=FORM).json() == {"received": True, "duplicate": True}
+
+
+def test_a_repeat_adds_a_missing_email_but_never_overwrites_or_touches_consent(client, web_leads_db, delivered):
+    no_email = {k: v for k, v in FORM.items() if k != "email"}
+    client.post(URL, data={**no_email, "sms_consent": "yes"})
+    web_leads_db.execute(text("UPDATE lending.web_leads SET ghl_status = 'synced', ghl_attempts = 1"))
+    response = client.post(URL, data={**FORM, "sms_consent": "yes", "property_city": "Orlando"})
+    row = web_leads_db.execute(text("SELECT email, property_city, sms_consent, ghl_status, ghl_attempts FROM lending.web_leads")).one()
+    assert response.json() == {"received": True, "duplicate": True}
+    assert row == ("dana@example.com", "Tampa", True, "pending", 0)  # email added, city kept, re-queued
+    assert len(delivered) == 2 and _count(web_leads_db) == 1
+
+
+def test_a_repeat_with_nothing_new_is_not_requeued(client, web_leads_db, delivered):
+    client.post(URL, data=FORM)
+    web_leads_db.execute(text("UPDATE lending.web_leads SET ghl_status = 'synced', ghl_attempts = 1"))
+    client.post(URL, data=FORM)
+    assert web_leads_db.execute(text("SELECT ghl_status FROM lending.web_leads")).scalar() == "synced"
+    assert len(delivered) == 1
+
+
+def test_a_suppressed_number_looks_the_same_to_the_visitor(client, web_leads_db):
+    web_leads_db.execute(text("INSERT INTO lending.suppression_list (phone, reason, source_channel) VALUES (:p, 'test', 'manual')"), {"p": PHONE})
+    assert client.post(URL, data={**FORM, "sms_consent": "yes"}).json() == {"received": True}
+
+
 def test_the_endpoint_is_rate_limited_per_ip(client, monkeypatch):
     monkeypatch.setattr("src.api.lending_web_router.RATE_LIMIT_PER_WINDOW", 2)
     statuses = [client.post(URL, data={**FORM, "phone": f"(813) 555-01{n:02d}"}).status_code for n in range(4)]

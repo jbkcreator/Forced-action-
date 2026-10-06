@@ -16,6 +16,16 @@ def test_apply_creates_web_leads_and_is_safe_to_rerun(lending_db):
             "ghl_status", "ghl_attempts", "ghl_contact_id"} <= columns
 
 
+def test_a_table_created_before_suppression_reason_gets_the_column(lending_db):
+    conn = lending_db.get_bind()
+    apply_to(conn)
+    conn.execute(text("ALTER TABLE lending.web_leads DROP COLUMN suppression_reason"))
+    assert "suppression_reason" not in {c["name"] for c in inspect(conn).get_columns("web_leads", schema="lending")}
+    apply_to(conn)
+    apply_to(conn)
+    assert "suppression_reason" in {c["name"] for c in inspect(conn).get_columns("web_leads", schema="lending")}
+
+
 def test_consent_columns_default_to_false(web_leads_db):
     web_leads_db.execute(text("INSERT INTO lending.web_leads (name, phone) VALUES ('A', '+18135550100')"))
     assert web_leads_db.execute(text("SELECT sms_consent, deal_drop_optin, ghl_status FROM lending.web_leads")).one() == (False, False, "pending")

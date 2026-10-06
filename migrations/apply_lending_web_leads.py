@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
 
 from config.settings import get_settings
@@ -21,9 +21,17 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 
+# create never alters an existing table; columns added after first apply go here.
+_ALTERS = [
+    'ALTER TABLE "{t}".web_leads ADD COLUMN IF NOT EXISTS suppression_reason varchar(30)',
+]
+
+
 def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
     translated = conn.execution_options(schema_translate_map={LENDING_SCHEMA: schema})
     LendingWebLead.__table__.create(translated, checkfirst=True)
+    for stmt in _ALTERS:
+        conn.execute(text(stmt.format(t=schema)))
 
 
 def apply(engine: Engine | None = None, schema: str = LENDING_SCHEMA) -> None:

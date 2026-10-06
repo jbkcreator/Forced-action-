@@ -107,17 +107,19 @@ def build_input(form: Mapping[str, Optional[str]], *, ip_address: Optional[str],
     )
 
 
-def _is_suppressed(db, phone: str, email: Optional[str]) -> bool:
-    """Same exclusions has_text_consent applies, so the lead's stored flag and the consent gate agree."""
+def _suppression_reason(db, phone: str, email: Optional[str]) -> Optional[str]:
+    """Same exclusions has_text_consent applies, so the lead's stored flag and the consent gate agree.
+    Returns which gate fired (the opt-out list wins when both do), or None when the contact is clear."""
     row = db.execute(
         text("SELECT EXISTS (SELECT 1 FROM lending.suppression_list "
              "WHERE phone = :p OR (CAST(:e AS text) IS NOT NULL AND email = CAST(:e AS text))) AS on_list, "
              "EXISTS (SELECT 1 FROM lending.contacts WHERE phone = :p AND do_not_contact) AS dnc"),
         {"p": phone, "e": email},
     ).one()
-    if row.on_list or row.dnc:
-        logger.info("[lending-web] submission suppressed gate=%s", "suppression_list" if row.on_list else "do_not_contact")
-    return bool(row.on_list or row.dnc)
+    reason = "suppression_list" if row.on_list else "do_not_contact" if row.dnc else None
+    if reason:
+        logger.info("[lending-web] submission suppressed gate=%s", reason)
+    return reason
 
 
 def _recent_duplicate(db, data: WebLeadInput) -> Optional[int]:
@@ -137,11 +139,13 @@ def save_web_lead(db, data: WebLeadInput) -> tuple[int, bool]:
     existing = _recent_duplicate(db, data)
     if existing is not None:
         return int(existing), False
-    suppressed = _is_suppressed(db, data.phone, data.email)
+    reason = _suppression_reason(db, data.phone, data.email)
+    suppressed = reason is not None
     lead_id = db.execute(
         text("INSERT INTO lending.web_leads (name, phone, email, property_city, deal_type, completed_projects_3y, "
-             "sms_consent, deal_drop_optin, consent_text, consent_text_matches, page_url, ip_address, user_agent, suppressed) "
-             "VALUES (:name, :phone, :email, :city, :deal, :projects, :sms, :drop, :ctext, :cmatch, :url, :ip, :ua, :sup) "
+             "sms_consent, deal_drop_optin, consent_text, consent_text_matches, page_url, ip_address, user_agent, "
+             "suppressed, suppression_reason) "
+             "VALUES (:name, :phone, :email, :city, :deal, :projects, :sms, :drop, :ctext, :cmatch, :url, :ip, :ua, :sup, :reason) "
              "RETURNING id"),
         {
             "name": data.name, "phone": data.phone, "email": data.email, "city": data.property_city,
@@ -149,6 +153,7 @@ def save_web_lead(db, data: WebLeadInput) -> tuple[int, bool]:
             "sms": data.sms_consent, "drop": data.deal_drop_optin, "ctext": data.consent_text,
             "cmatch": None if data.consent_text is None else data.consent_text == SMS_CONSENT_TEXT,
             "url": data.page_url, "ip": data.ip_address, "ua": data.user_agent, "sup": suppressed,
+            "reason": reason,
         },
     ).scalar_one()
     if data.sms_consent and not suppressed:
@@ -156,6 +161,32 @@ def save_web_lead(db, data: WebLeadInput) -> tuple[int, bool]:
     logger.info("[lending-web] lead saved id=%s sms_consent=%s deal_drop=%s suppressed=%s",
                 lead_id, data.sms_consent, data.deal_drop_optin, suppressed)
     return int(lead_id), True
+
+
+def merge_into_existing(db, lead_id: int, data: WebLeadInput) -> bool:
+    """A repeat submission inside the dedup window fills in details the stored lead lacks (an email
+    added on the second try) and never overwrites one it has. Returns True when something was
+    added; the lead is then queued for delivery again so GoHighLevel gets the new detail. Consent
+    values are never touched: they stay exactly what the first submission recorded."""
+    changed = db.execute(
+        text("UPDATE lending.web_leads SET "
+             "email = COALESCE(email, CAST(:email AS text)), "
+             "property_city = COALESCE(property_city, CAST(:city AS text)), "
+             "deal_type = COALESCE(deal_type, CAST(:deal AS text)), "
+             "completed_projects_3y = COALESCE(completed_projects_3y, CAST(:projects AS text)), "
+             "ghl_status = 'pending', ghl_attempts = 0, ghl_last_error = NULL "
+             "WHERE id = :id AND ("
+             "(email IS NULL AND CAST(:email AS text) IS NOT NULL) OR "
+             "(property_city IS NULL AND CAST(:city AS text) IS NOT NULL) OR "
+             "(deal_type IS NULL AND CAST(:deal AS text) IS NOT NULL) OR "
+             "(completed_projects_3y IS NULL AND CAST(:projects AS text) IS NOT NULL)) "
+             "RETURNING id"),
+        {"id": lead_id, "email": data.email, "city": data.property_city,
+         "deal": data.deal_type, "projects": data.completed_projects_3y},
+    ).first()
+    if changed is not None:
+        logger.info("[lending-web] repeat submission added details to lead id=%s", lead_id)
+    return changed is not None
 
 
 _DELIVERABLE = (
