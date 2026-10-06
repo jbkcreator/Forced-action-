@@ -46,7 +46,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
 
     if not lending_campaign_ids():
-        logger.warning("[lending-cdr-poller] LENDING_DIALER_CAMPAIGN_IDS is empty: every CDR will be ignored")
+        logger.error("[lending-cdr-poller] LENDING_DIALER_CAMPAIGN_IDS is empty: every CDR, DNC requests included, "
+                     "would be ignored; refusing to start")
+        return 2
 
     with lending_session() as lock_db:
         if not lock_db.execute(text("SELECT pg_try_advisory_lock(:k)"), {"k": CDR_POLL_LOCK_KEY}).scalar():

@@ -40,7 +40,12 @@ SYSTEM_DISPOSITION_ALIASES: dict[str, str] = {
     "CALL_BACK": "CALLBACK_REQUESTED",
     "FAILED": "CALL_FAILED",
     "CONGESTION": "CALL_FAILED",
+    # Client-approved 2026-10-02. Abandoned is a multi-line drop (the person picked up, no caller was free):
+    # logged as NO_ANSWER and counted as an attempt, but never queued for the missed-call text.
+    "ABANDONED": "NO_ANSWER",
+    "VOICEMAIL": "LEFT_VOICEMAIL",
 }
+ABANDONED_RESULT = "ABANDONED"
 
 # Unfunded-cause tags (brief §2.7). Required values for every unfunded outcome.
 CAUSE_TAGS = frozenset({

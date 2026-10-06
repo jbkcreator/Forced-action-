@@ -28,6 +28,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import text as sa_text
 
 from config.calendar import (
+    BLOCKED_CALENDAR_DATES,
     CALENDAR_TIMEZONE,
     CALENDAR_VENTURE_KEY,
     DEFAULT_SLOT_DURATION_MINUTES,
@@ -124,8 +125,26 @@ def book(
     description: str = "",
     person_id: Optional[Any] = None,
     tracked_link_id: Optional[int] = None,
+    gate_id: Optional[str] = None,
+    phone: Optional[str] = None,
+    first_name: Optional[str] = None,
+    text_consent: bool = False,
 ) -> BookingResult:
     """Book a slot for an attendee, refusing if suppressed or already taken.
+
+    gate_id must reference a passed fa_max_booking_gates row. If omitted or
+    invalid, the booking is refused — fail closed. This enforces WP-GL-5's
+    requirement that no booking reaches Josh's calendar without a caller
+    completing the gate. The daily cap (config/booking_gate.py
+    CALENDAR_DAILY_CAP) is checked with a Postgres advisory lock to prevent
+    concurrent bypass.
+
+    phone/first_name/text_consent are passed straight through to the
+    booking-confirmed notification (see _notify_booking_confirmed) — the
+    gate table holds enum codes only (no phone, name or consent), so a
+    caller that has this contact detail must supply it here. text_consent
+    is G6's "is it okay if we text you the confirmation?" yes, asked and
+    logged at the booking close, not part of the earlier gate screening.
 
     Commits. The row claiming the slot must be durable before the calendar
     event is created, or a crash in between leaves a meeting in the
@@ -133,11 +152,27 @@ def book(
     a stray meeting is not.
     """
     from src.agents.fa_max.tool_registry import check_suppression
+    from src.services.calendar.gate import enforce_daily_cap, get_passed_gate_by_id
 
     # A naive time would crash the tz-aware busy comparison, or be stored in
     # TIMESTAMPTZ at whatever offset the DB session happens to use.
     _require_aware(slot.start, "slot.start")
     _require_aware(slot.end, "slot.end")
+
+    # Gate re-validation: confirm the gate_id still passes at booking time.
+    # Stored as code-only JSONB — never inspect free-text financial fields here.
+    if not gate_id:
+        logger.info("calendar.book: refused — no gate_id provided")
+        return BookingResult(booked=False, reason="gate_required")
+
+    gate_row = get_passed_gate_by_id(session, gate_id)
+    if gate_row is None:
+        logger.info("calendar.book: refused — gate_id=%s not passed or list blocked", gate_id)
+        return BookingResult(booked=False, reason="gate_not_passed")
+
+    if slot.start.astimezone(_TZ).date() in BLOCKED_CALENDAR_DATES:
+        logger.info("calendar.book: refused — %s is a blocked calendar date", slot.start.date())
+        return BookingResult(booked=False, reason="calendar_date_blocked")
 
     suppression = check_suppression(
         recipient=attendee_email, channel="email", session=session
@@ -151,10 +186,21 @@ def book(
             booked=False, reason="suppressed", detail=suppression["reason"]
         )
 
+    # A retried request for an already-claimed slot must replay the original
+    # outcome, not get refused on the cap — the agent loop re-runs steps by
+    # design, and a replay must never look like a fresh failure. Checked
+    # before the cap for that reason.
     key = _idempotency_key(calendar_id, slot, attendee_email)
     replay = _existing_booking(session, key)
     if replay is not None:
         return replay
+
+    # Daily cap — advisory lock serialises concurrent requests. Checked
+    # against the calendar day slot.start falls on, not the day the request
+    # happens to arrive.
+    if not enforce_daily_cap(session, slot.start):
+        logger.info("calendar.book: refused — daily cap reached")
+        return BookingResult(booked=False, reason="daily_cap_reached")
 
     if _is_taken(client=client, calendar_id=calendar_id, slot=slot):
         logger.info("calendar.book: refused — slot taken since it was offered")
@@ -163,7 +209,7 @@ def book(
     claim = _claim_slot(
         session=session, calendar_id=calendar_id, slot=slot,
         attendee_email=attendee_email, topic=topic, person_id=person_id,
-        tracked_link_id=tracked_link_id, idempotency_key=key,
+        tracked_link_id=tracked_link_id, idempotency_key=key, gate_id=gate_id,
     )
     if claim is None:
         # Another booking holds this slot or this key. Whoever committed
@@ -208,7 +254,148 @@ def book(
     logger.info(
         "calendar.book: booked booking_ref=%s event_id=%s", booking_ref, event.event_id
     )
+
+    _notify_booking_confirmed(
+        session=session,
+        booking_ref=booking_ref,
+        provider_event_id=event.event_id,
+        person_id=person_id,
+        phone=phone,
+        first_name=first_name,
+        email=attendee_email,
+        text_consent=text_consent,
+        slot_start_utc=slot.start,
+        gate_row=gate_row,
+        captured_by=gate_row.get("captured_by") if gate_row else None,
+    )
+    _push_booking_to_ghl(
+        phone=phone, email=attendee_email, first_name=first_name,
+        topic=topic, booking_ref=booking_ref,
+    )
+
     return BookingResult(booked=True, event=event, booking_ref=booking_ref)
+
+
+def _push_booking_to_ghl(
+    *, phone: Optional[str], email: str, first_name: Optional[str], topic: str, booking_ref: str,
+) -> None:
+    """Push the booking into the Booked stage of the Next Deal Lending GHL
+    pipeline (WP-GL-5 scope). Never raises — a push failure must not undo an
+    already-committed, already-calendared booking.
+    """
+    try:
+        from src.services.calendar.ghl_pipeline import push_booking_to_booked_stage
+
+        pushed = push_booking_to_booked_stage(
+            phone=phone, email=email, first_name=first_name,
+            opportunity_name=f"{topic} ({booking_ref})",
+        )
+        if not pushed:
+            logger.warning(
+                "calendar.book: booking_ref=%s — GHL Booked-stage push did not "
+                "happen (see prior log line for why)", booking_ref,
+            )
+    except Exception:
+        logger.exception(
+            "calendar.book: booking_ref=%s — GHL Booked-stage push raised", booking_ref,
+        )
+
+
+def _notify_booking_confirmed(
+    *,
+    session,
+    booking_ref: str,
+    provider_event_id: Optional[str],
+    person_id: Optional[Any],
+    phone: Optional[str],
+    first_name: Optional[str],
+    email: str,
+    text_consent: bool,
+    slot_start_utc: datetime,
+    gate_row: Optional[Any],
+    captured_by: Optional[str],
+) -> None:
+    """Best-effort notification so WP-GL-10 can schedule confirmation/
+    reminder messages. Never raises — a notification failure must not undo
+    an already-committed, already-calendared booking.
+
+    Calls src.lending.booking_messages.handle_booking_confirmed directly
+    (same process — both routers mount on src.api.main) rather than a
+    self-loopback HTTP call to /webhooks/lending/booking-confirmed, which
+    that module's own docstring offers as an alternative transport. Import
+    is lazy and wrapped: per the agreed merge order (#328 before #323),
+    this module will exist by the time this code ships, but must degrade
+    to a logged no-op rather than crash a booking if it does not.
+    """
+    property_address = None
+    if gate_row is not None:
+        answers = gate_row.get("answers") if hasattr(gate_row, "get") else gate_row["answers"]
+        if isinstance(answers, str):
+            import json
+
+            answers = json.loads(answers)
+        property_address = (answers or {}).get("property_address")
+
+    payload = {
+        "booking_ref": booking_ref,
+        "provider_event_id": provider_event_id,
+        "person_id": str(person_id) if person_id is not None else None,
+        "phone": phone,
+        "first_name": first_name,
+        "email": email,
+        "text_consent": bool(text_consent),
+        "slot_start_utc": slot_start_utc,
+        "property_address": property_address,
+        "booked_by": captured_by,
+    }
+
+    try:
+        from src.lending.booking_messages import handle_booking_confirmed
+
+        # Savepoint, not a bare try/except: handle_booking_confirmed does not
+        # commit itself, and a raised exception here must not leave the
+        # session's real transaction aborted for whatever the caller does
+        # with it next — the booking itself already committed.
+        with session.begin_nested():
+            handle_booking_confirmed(session, payload)
+        session.commit()
+    except ImportError:
+        # Known, temporary, and every booking hits it until #328 merges —
+        # an EXCEPTIONS alert per booking here would be noise, not signal.
+        logger.warning(
+            "calendar.book: booking_ref=%s — src.lending.booking_messages not "
+            "available yet (expected before #328 merges); no reminders scheduled",
+            booking_ref,
+        )
+    except Exception:
+        logger.exception(
+            "calendar.book: booking_ref=%s — booking-confirmed notification failed, "
+            "booking stands, reminders will not fire for this one", booking_ref,
+        )
+        _alert_booking_confirmed_failed(booking_ref)
+
+
+def _alert_booking_confirmed_failed(booking_ref: str) -> None:
+    """Surface a silent-reminder-gap on EXCEPTIONS. Never raises — an alert
+    failure must not compound onto an already-failed notification."""
+    try:
+        from src.services.relay import exceptions_alert_queue
+
+        exceptions_alert_queue.enqueue_and_attempt(
+            venture_key=CALENDAR_VENTURE_KEY,
+            rule="booking_confirmed_notify_failed",
+            message=(
+                f"*Booking confirmed but reminders not scheduled* — `{booking_ref}`\n"
+                f"The booking-confirmed notification to WP-GL-10 failed. The booking "
+                f"itself is real and calendared; no confirmation/reminder texts will "
+                f"fire for it unless this is retried by hand."
+            ),
+        )
+    except Exception:
+        logger.exception(
+            "calendar.book: booking_ref=%s — EXCEPTIONS alert for the failed "
+            "booking-confirmed notification also failed", booking_ref,
+        )
 
 
 def _cached_busy(client, calendar_id: str, start: datetime, end: datetime):
@@ -305,6 +492,7 @@ def _claim_slot(
     person_id: Optional[Any],
     tracked_link_id: Optional[int],
     idempotency_key: str,
+    gate_id: Optional[str] = None,
 ) -> Optional[str]:
     """Durably claim the slot. Returns the booking ref, or None if lost.
 
@@ -321,10 +509,10 @@ def _claim_slot(
                 """
                 INSERT INTO fa_max_bookings
                     (booking_ref, idempotency_key, tracked_link_id, calendar_id,
-                     person_id, attendee_email, topic, starts_at, ends_at, status)
+                     person_id, attendee_email, topic, starts_at, ends_at, status, gate_id)
                 VALUES
                     (:booking_ref, :idempotency_key, :tracked_link_id, :calendar_id,
-                     :person_id, :attendee_email, :topic, :starts_at, :ends_at, 'pending')
+                     :person_id, :attendee_email, :topic, :starts_at, :ends_at, 'pending', :gate_id)
                 """
             ),
             {
@@ -337,6 +525,7 @@ def _claim_slot(
                 "topic": topic,
                 "starts_at": slot.start,
                 "ends_at": slot.end,
+                "gate_id": gate_id,
             },
         )
         session.commit()

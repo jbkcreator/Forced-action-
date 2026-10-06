@@ -18,7 +18,9 @@ from sqlalchemy import text
 
 from config.lending_dispositions import DNC_CODE
 from src.lending.call_pipeline import follow_up, lending_campaign_ids, process_event
+from src.lending.consent import record_consent
 from src.lending.dispositions import DialerCallEvent, normalize_code, parse_event
+from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +48,9 @@ def _path(path: str, **params: Any) -> str:
 
 def fetch_last(http: Http) -> list[dict]:
     body = http("GET", "/v2/cdrs/last")
-    return list(body.get("items") or []) if isinstance(body, dict) else []
+    if isinstance(body, dict):  # /last has answered with a bare array; /v2/cdrs wraps it in {"items": ...}
+        return list(body.get("items") or [])
+    return list(body or []) if isinstance(body, list) else []
 
 
 def iter_day(http: Http, day: date, *, max_pages: int = 200) -> Iterator[dict]:
@@ -96,12 +100,44 @@ def _finished(ev: DialerCallEvent) -> DialerCallEvent:
     return dataclasses.replace(ev, ended_at=end)
 
 
+def _grant_inbound_consent(db, ev: DialerCallEvent) -> None:
+    """An answered inbound call is consent to text (client Q27). Inbound calls get no call row, so this
+    is the only place the poller sees them. Skipped when a live grant exists or the number opted out
+    after this call, so the day rescan never re-grants a revoked consent."""
+    phone = normalize(ev.phone) if ev.phone else None
+    if not phone:
+        return
+    at = ev.started_at or ev.ended_at or datetime.now(timezone.utc)
+    if db.execute(
+        text("SELECT EXISTS (SELECT 1 FROM lending.text_consents WHERE phone = :p AND source = 'inbound_call' "
+             "AND (revoked_at IS NULL OR revoked_at >= :at))"),
+        {"p": phone, "at": at},
+    ).scalar():
+        return
+    record_consent(db, phone, "inbound_call", call_id=ev.call_id, at=at)
+    db.commit()
+
+
 def ingest(db, items: list[dict], *, only_changed: bool) -> IngestStats:
     stats = IngestStats(seen=len(items))
     campaigns = lending_campaign_ids()
-    events = [ev for ev in (parse_event(i) for i in items)
-              if ev and ev.campaign_id in campaigns
+    parsed = [ev for ev in (parse_event(i) for i in items) if ev]
+    for ev in parsed:
+        if ev.campaign_id not in campaigns and normalize_code(ev.disposition_raw)[0] == DNC_CODE:
+            logger.warning("[lending] DNC request on CDR %s ignored: campaign %s is not a lending campaign",
+                           ev.call_id, ev.campaign_id)
+    events = [ev for ev in parsed
+              if ev.campaign_id in campaigns
               and (ev.direction != "inbound" or normalize_code(ev.disposition_raw)[0] == DNC_CODE)]
+    recorded_ids = {ev.call_id for ev in events}
+    for ev in parsed:
+        if (ev.campaign_id in campaigns and ev.direction == "inbound" and (ev.duration or 0) > 0
+                and ev.call_id not in recorded_ids):
+            try:
+                _grant_inbound_consent(db, ev)
+            except Exception as exc:  # consent capture must never stop ingestion
+                db.rollback()
+                logger.error("[lending] CDR %s inbound consent failed: %s", ev.call_id, type(exc).__name__)
     if only_changed:
         pending = _changed(db, events)
         stats.skipped = len(events) - len(pending)

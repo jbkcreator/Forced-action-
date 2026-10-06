@@ -12,9 +12,11 @@ loadable pool has no campaign tag, or while a phone would load for more than
 one record; the dry run reports both.
 
 Dry run: nothing is sent to dialer or Tracerfy, and the caller rolls back.
-Live: records reach dialer one at a time (paced by the client) and their
-load rows are committed in chunks, so a stop part-way leaves every loaded
-contact tracked; a re-run updates contacts instead of duplicating them.
+Live: records reach dialer one at a time (paced by the client) and each load row is
+committed right after its push, so a stop part-way leaves every loaded contact
+tracked (an opt-out can only delete contacts we hold an id for); a re-run updates
+contacts instead of duplicating them. A contact created but left without its fields
+is tracked too (see ``ContactFieldsNotSet``) and finished by the next run.
 """
 from __future__ import annotations
 
@@ -27,6 +29,7 @@ from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
 from sqlalchemy import text
 
+from config.lending_compliance import RemovalReason
 from config.lending_dialer import POOL_CAMPAIGN_TAGS
 from config.settings import get_settings
 from src.lending.backflip_conflict import (
@@ -34,16 +37,30 @@ from src.lending.backflip_conflict import (
     find_borrower_conflicts,
     load_backflip_identifier_index,
 )
-from src.lending.compliance import GateResult, Scrubber, dial_blocks, filter_loadable, phone_hash
+from src.lending.compliance import (
+    GateResult,
+    Scrubber,
+    _suppressed_phones,
+    dial_blocks,
+    filter_loadable,
+    phone_hash,
+)
 from src.lending.dialer_contact import DialerDisplay, dialer_fields, display_from_record
-from src.lending.dialer_port import ContactUpsertResult, DialerContactFields, DialerRequestError
+from src.lending.dialer_port import (
+    ContactFieldsNotSet,
+    ContactUpsertResult,
+    DialerContactFields,
+    DialerRequestError,
+)
+from src.lending.dialer_removal import DialerRemovalUndecided
 from src.services.phone_utils import normalize as normalize_phone
 
 logger = logging.getLogger(__name__)
 
-COMMIT_CHUNK_SIZE = 50
+COMMIT_CHUNK_SIZE = 1  # the client paces pushes one at a time, so a commit per push costs nothing
 SUPERSEDED = "superseded"
 REASON_SCRUB_FAILED = "SCRUB_FAILED"
+REASON_SUPPRESSED = "SUPPRESSED"
 REASON_NEEDS_SCRUB = "NEEDS_SCRUB"
 
 
@@ -51,7 +68,8 @@ class DialerContacts(Protocol):
     def upsert_contact(self, phone: str, fields: DialerContactFields, *, campaign: Optional[str] = None,
                        vendor_contact_id: Optional[str] = None) -> ContactUpsertResult: ...
     def update_contact(self, contact_id: Any, fields: DialerContactFields, *,
-                       phone: Optional[str] = None) -> dict: ...
+                       phone: Optional[str] = None, vendor_contact_id: Optional[str] = None) -> dict: ...
+    def remove(self, phone: str, *, reason: str) -> None: ...
 
 
 class LoadRefused(RuntimeError):
@@ -91,6 +109,7 @@ class LoadReport:
     failed: list[dict] = field(default_factory=list)
     active_not_in_run: int = 0
     backflip_check: bool = True
+    suppressed_mid_run: int = 0  # opted out after the start-of-run gate; skipped before the push
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -110,6 +129,7 @@ class LoadReport:
             "failed": self.failed,
             "active_not_in_run": self.active_not_in_run,
             "backflip_check": self.backflip_check,
+            "suppressed_mid_run": self.suppressed_mid_run,
         }
 
 
@@ -168,17 +188,17 @@ def _write_exclusions(db, run_id: str, rows: list[dict]) -> None:
     )
 
 
-def _active_rows(db, phones: list[str]) -> dict[str, tuple[int, Optional[int]]]:
+def _active_rows(db, phones: list[str]) -> dict[str, tuple[int, Optional[int], Optional[str]]]:
     if not phones:
         return {}
     rows = db.execute(
         text(
-            "SELECT phone, id, dialer_contact_id FROM lending.dialer_load_records "
+            "SELECT phone, id, dialer_contact_id, campaign_tag FROM lending.dialer_load_records "
             "WHERE active AND phone = ANY(CAST(:phones AS varchar[]))"
         ),
         {"phones": phones},
     ).fetchall()
-    return {row.phone: (row.id, row.dialer_contact_id) for row in rows}
+    return {row.phone: (row.id, row.dialer_contact_id, row.campaign_tag) for row in rows}
 
 
 def _count_active_not_in(db, phones: list[str]) -> int:
@@ -191,22 +211,97 @@ def _count_active_not_in(db, phones: list[str]) -> int:
     ).scalar_one()
 
 
+CAMPAIGN_CHANGED = "pool_changed"
+
+
 def _push_contact(dialer: DialerContacts, item: _Loadable, known_contact_id: Optional[str],
-                  fields: DialerContactFields) -> ContactUpsertResult:
-    """Update by the stored contact id when known (search can lag); else upsert by phone."""
+                  known_campaign_tag: Optional[str], fields: DialerContactFields) -> ContactUpsertResult:
+    """Update by the stored contact id when known (search can lag); else upsert by phone.
+
+    A phone whose pool changed between staging runs must move dialer campaigns, not
+    just get its card fields updated in place — a bare update would leave BatchDialer
+    dialing the old campaign forever while the database says a different one (finding
+    #10). If the removal from the old campaign can't be confirmed, this raises
+    DialerRequestError so the caller flags the record instead of silently writing the
+    new campaign_tag as if the move had actually happened.
+    """
+    new_campaign = item.display.campaign_tag
+    if known_contact_id is not None and known_campaign_tag is not None and known_campaign_tag != new_campaign:
+        try:
+            dialer.remove(item.phone, reason=CAMPAIGN_CHANGED)
+        except DialerRemovalUndecided as exc:
+            raise DialerRequestError(f"campaign move unconfirmed: {exc}") from exc
+        return dialer.upsert_contact(item.phone, fields, campaign=new_campaign,
+                                     vendor_contact_id=item.record_ref or None)
     if known_contact_id is not None:
         try:
-            dialer.update_contact(known_contact_id, fields, phone=item.phone)
+            # full PUT: resend our record id or BatchDialer clears it
+            dialer.update_contact(known_contact_id, fields, phone=item.phone,
+                                  vendor_contact_id=item.record_ref or None)
             return ContactUpsertResult(contact_id=known_contact_id, created=False)
         except DialerRequestError as exc:
             if exc.status != 404:
                 raise
-    return dialer.upsert_contact(item.phone, fields, campaign=item.display.campaign_tag,
-                                 vendor_contact_id=item.record_ref or None)
+    return dialer.upsert_contact(item.phone, fields, campaign=new_campaign,
+                                     vendor_contact_id=item.record_ref or None)
+
+
+def _create_outcome_unknown(exc: DialerRequestError) -> bool:
+    return exc.maybe_created and not isinstance(exc, ContactFieldsNotSet)
+
+
+def _record_unconfirmed_create(db, run_id: str, item: _Loadable, status: Optional[int]) -> None:
+    db.execute(
+        text(
+            "INSERT INTO lending.dialer_unconfirmed_creates "
+            "(run_id, phone, phone_hash, source_record_ref, error_status) "
+            "VALUES (:run_id, :phone, :phone_hash, :ref, :status)"
+        ),
+        {"run_id": run_id, "phone": item.phone, "phone_hash": phone_hash(item.phone),
+         "ref": item.record_ref, "status": status},
+    )
+
+
+def _pull_if_suppressed_after_push(db, dialer: DialerContacts, chunk: list[tuple[_Loadable, int]],
+                                   commit: Callable[[], None]) -> int:
+    """A STOP that landed while a contact was being pushed: the opt-out poller found no load row
+    and completed the event, so the contact must be pulled here, now that its row exists."""
+    suppressed = _suppressed_phones(db, [item.phone for item, _ in chunk])
+    pulled = 0
+    for item, _ in chunk:
+        if item.phone not in suppressed:
+            continue
+        try:
+            dialer.remove(item.phone, reason=RemovalReason.OPT_OUT.value)
+        except Exception as exc:
+            logger.error("[dialer-load] phone_hash=%s opted out during its push and could not be removed "
+                         "(%s); remove it from the dialer by hand", phone_hash(item.phone)[:12], type(exc).__name__)
+            continue
+        db.execute(
+            text("UPDATE lending.dialer_load_records SET active = false, deactivated_at = now(), "
+                 "deactivation_reason = :reason WHERE phone = :phone AND active"),
+            {"reason": "opted_out_during_push", "phone": item.phone},
+        )
+        commit()
+        pulled += 1
+    return pulled
+
+
+def _record_pushed_before_abort(db, run_id: str, chunk: list[tuple[_Loadable, int]],
+                                active: dict[str, tuple[int, Optional[int], Optional[str]]],
+                                commit: Callable[[], None]) -> None:
+    if not chunk:
+        return
+    try:
+        _store_chunk(db, run_id, chunk, active)
+        commit()
+    except Exception as exc:
+        logger.error("[dialer-load] run %s aborted with %d pushed contact(s) not recorded (%s); "
+                     "reconcile them against the dialer", run_id, len(chunk), type(exc).__name__)
 
 
 def _store_chunk(db, run_id: str, loaded: list[tuple[_Loadable, int]],
-                 active: dict[str, tuple[int, Optional[int]]]) -> None:
+                 active: dict[str, tuple[int, Optional[int], Optional[str]]]) -> None:
     superseded = [active[item.phone][0] for item, _ in loaded if item.phone in active]
     if superseded:
         db.execute(
@@ -246,6 +341,31 @@ def _store_chunk(db, run_id: str, loaded: list[tuple[_Loadable, int]],
     )
 
 
+def _raise_if_refused(unmapped_pools: Sequence[str], duplicate_phones: int) -> None:
+    if unmapped_pools:
+        raise LoadRefused(f"no campaign tag for pool(s): {', '.join(unmapped_pools)}")
+    if duplicate_phones:
+        raise LoadRefused(f"{duplicate_phones} phone(s) would load for more than one record")
+
+
+def _refuse_before_scrub(records: Sequence[Mapping[str, Any]], phones: Sequence[Optional[str]], db,
+                         campaign_tags: Mapping[str, str], backflip_check: bool) -> None:
+    """Refusal checks that must run before the paid Tracerfy scrub, which a refused run would
+    otherwise pay for and then roll back. A number the scrub could still clear counts as
+    loadable, so this can only over-refuse, never under-refuse."""
+    results = filter_loadable(list(records), db, scrubber=no_scrub)
+    blocks = {i: r for i, r in _gate_blocks(records, results).items() if r != REASON_SCRUB_FAILED}
+    if backflip_check:
+        candidates = [i for i in range(len(records)) if i not in blocks]
+        blocks.update(_conflict_blocks(db, records, candidates, phones)[0])
+    blocked = set(blocks) | set(_propagate_by_phone(phones, blocks))
+    possible = [i for i in range(len(records)) if i not in blocked]
+    pools = sorted({str(records[i].get("pool") or "") for i in possible
+                    if not campaign_tags.get(str(records[i].get("pool") or ""))})
+    per_phone = Counter(phones[i] for i in possible if phones[i])
+    _raise_if_refused(pools, sum(1 for n in per_phone.values() if n > 1))
+
+
 def run_dialer_load(
     records: Sequence[Mapping[str, Any]],
     db,
@@ -272,6 +392,8 @@ def run_dialer_load(
     if not dry_run and (scrubber is None or dialer is None):
         raise ValueError("a live load needs a scrubber and a dialer")
     phones = [normalize_phone(r.get("normalized_phone") or r.get("phone") or "") for r in records]
+    if not dry_run:
+        _refuse_before_scrub(records, phones, db, campaign_tags, backflip_check)
 
     gate_results = filter_loadable(
         list(records), db, scrubber=no_scrub if dry_run else scrubber,
@@ -337,32 +459,51 @@ def run_dialer_load(
         logger.info("[dialer-load] dry run %s: %s", run_id, json.dumps(report.as_dict()))
         return report
 
-    if report.unmapped_pools:
-        raise LoadRefused(f"no campaign tag for pool(s): {', '.join(report.unmapped_pools)}")
-    if report.duplicate_phones:
-        raise LoadRefused(f"{report.duplicate_phones} phone(s) would load for more than one record")
+    _raise_if_refused(report.unmapped_pools, report.duplicate_phones)
 
     _write_exclusions(db, run_id, exclusion_rows)
     commit = commit or db.commit
     commit()
     active = _active_rows(db, loadable_phones)
     chunk: list[tuple[_Loadable, int]] = []
-    for item in loadable:
-        fields = dialer_fields(item.display, email=item.record.get("email"))
-        try:
-            result = _push_contact(dialer, item, active.get(item.phone, (None, None))[1], fields)
-        except DialerRequestError as exc:
-            report.failed.append({"record_ref": item.record_ref, "error": type(exc).__name__,
-                                  "status": getattr(exc, "status", None)})
-            continue
-        report.loaded += 1
-        report.created += int(result.created)
-        report.updated += int(not result.created)
-        chunk.append((item, result.contact_id))
-        if len(chunk) >= COMMIT_CHUNK_SIZE:
-            _store_chunk(db, run_id, chunk, active)
-            commit()
-            chunk = []
+    try:
+        for item in loadable:
+            if _suppressed_phones(db, [item.phone]):  # one indexed lookup per push (a push is 3 HTTP calls)
+                report.suppressed_mid_run += 1
+                _write_exclusions(db, run_id, [{
+                    "phone_hash": phone_hash(item.phone), "reason": REASON_SUPPRESSED,
+                    "detail": json.dumps({"stage": "recheck_before_push", "record_ref": item.record_ref})}])
+                continue
+            fields = dialer_fields(item.display, email=item.record.get("email"))
+            try:
+                _, known_contact_id, known_campaign_tag = active.get(item.phone, (None, None, None))
+                result = _push_contact(dialer, item, known_contact_id, known_campaign_tag, fields)
+            except DialerRequestError as exc:
+                report.failed.append({"record_ref": item.record_ref, "error": type(exc).__name__,
+                                      "status": getattr(exc, "status", None)})
+                if _create_outcome_unknown(exc):
+                    _record_unconfirmed_create(db, run_id, item, exc.status)
+                    commit()
+                if not isinstance(exc, ContactFieldsNotSet):
+                    continue
+                contact_id = exc.contact_id  # live in the dialer: track it so opt-out can delete it
+            else:
+                report.loaded += 1
+                report.created += int(result.created)
+                report.updated += int(not result.created)
+                contact_id = result.contact_id
+            chunk.append((item, contact_id))
+            if len(chunk) >= COMMIT_CHUNK_SIZE:
+                _store_chunk(db, run_id, chunk, active)
+                commit()
+                report.suppressed_mid_run += _pull_if_suppressed_after_push(db, dialer, chunk, commit)
+                chunk = []
+    except BaseException:
+        # SIGTERM, a crash or an unexpected error mid-run: contacts already pushed to the
+        # dialer but not yet recorded would be live with no load row, invisible to a later
+        # opt-out removal. Record them before the error propagates.
+        _record_pushed_before_abort(db, run_id, chunk, active, commit)
+        raise
     if chunk:
         _store_chunk(db, run_id, chunk, active)
         commit()

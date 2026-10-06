@@ -70,6 +70,17 @@ def test_connected_call_without_a_disposition_alerts_once(alert_env, lending_db)
     assert slack.chat_postMessage.call_count == 1
 
 
+@pytestmark_db
+def test_failed_slack_post_unclaims_the_call_so_the_next_run_retries(alert_env, lending_db):
+    _call(lending_db, "late", 30)
+    slack = MagicMock()
+    slack.chat_postMessage.side_effect = RuntimeError("slack down")
+    assert alert_env.run(slack_client=slack) == 1
+    slack.chat_postMessage.side_effect = None
+    assert alert_env.run(slack_client=slack) == 1
+    assert alert_env.run(slack_client=slack) == 0
+
+
 def test_approved_thirteen_codes_are_pinned_and_three_stay_separate():
     from config.lending_dispositions import DISPOSITIONS
 

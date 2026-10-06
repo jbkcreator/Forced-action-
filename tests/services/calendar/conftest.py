@@ -35,6 +35,20 @@ def bookings_db(fresh_db):
             "fa_max_bookings lacks idempotency_key — "
             "run migrations/apply_fa_max_bookings_integrity.py"
         )
+
+    # WP-GL-5: gate_id FK column added by apply_fa_max_booking_gates.py.
+    has_gate_col = fresh_db.execute(
+        text(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name = 'fa_max_bookings' AND column_name = 'gate_id'"
+        )
+    ).first()
+    if has_gate_col is None:
+        pytest.skip(
+            "fa_max_bookings lacks gate_id — "
+            "run migrations/apply_fa_max_booking_gates.py"
+        )
+
     return fresh_db
 
 

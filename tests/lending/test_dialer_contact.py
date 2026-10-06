@@ -81,6 +81,25 @@ def test_the_property_address_is_split_into_the_dialer_address_fields():
     assert (fields.address, fields.city, fields.state, fields.postal_code) == ("123 Main St", "Tampa", "FL", "33602")
 
 
+def test_the_pool_address_format_fills_the_city():
+    # calling-pool addresses read "STREET, CITY ST ZIP" (one comma)
+    fields = dialer_fields(display_from_record({"property_address": "14213 BLUE DASHER DR, LITHIA FL 33547"}, "Builders"))
+    assert (fields.address, fields.city) == ("14213 BLUE DASHER DR", "LITHIA")
+
+
+def test_a_city_only_address_fills_the_city_not_the_street():
+    fields = dialer_fields(display_from_record({"property_address": "LUTZ FL 33559"}, "Builders"))
+    assert (fields.address, fields.city) == (None, "LUTZ")
+
+
 def test_a_bare_street_address_still_fills_the_address_field():
     fields = dialer_fields(display_from_record({"property_address": "9 Oak Ave"}, "Builders"))
     assert fields.address == "9 Oak Ave" and fields.city is None
+    fields = dialer_fields(display_from_record({"property_address": "9 Oak St"}, "Builders"))
+    assert fields.address == "9 Oak St" and fields.city is None
+
+
+def test_non_finite_or_oversized_loan_value_is_shown_as_not_available():
+    for bad in (float("nan"), "NaN", "Infinity", "-5", 10 ** 12):
+        display = display_from_record({"estimated_loan_value": bad}, None)
+        assert display.estimated_loan_value is None

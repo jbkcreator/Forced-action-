@@ -21,6 +21,7 @@ from sqlalchemy import text
 
 from config.lending_compliance import DEFAULT_TZ
 from config.lending_dispositions import (
+    ABANDONED_RESULT,
     CDR_ANSWERED_STATUSES,
     BOOKED_CODE,
     DEFAULT_CAUSE,
@@ -190,6 +191,10 @@ def normalize_code(raw: Optional[str]) -> tuple[Optional[str], bool]:
     return None, False
 
 
+def is_abandoned(raw: Optional[str]) -> bool:
+    return bool(raw) and re.sub(r"[^A-Z0-9]+", "_", raw.upper()).strip("_") == ABANDONED_RESULT
+
+
 def seat_group_for(seat_id: Optional[str]) -> Optional[str]:
     if not seat_id:
         return None
@@ -314,6 +319,9 @@ def record_dialer_event(db, ev: DialerCallEvent) -> RecordedCall:
                 text("UPDATE lending.call_dispositions SET disposition_raw = :raw, disposition_at = clock_timestamp() WHERE id = :id"),
                 {"raw": ev.disposition_raw, "id": row["id"]},
             )
+        elif code is not None and code != disposition and disposition == DNC_CODE and row["opt_out_propagated_at"] is None:
+            logger.warning("[lending] call %s: kept DNC_REQUEST over a later %s until the opt-out is propagated",
+                           ev.call_id, code)
         elif code is not None and code != disposition:
             cause = DEFAULT_CAUSE.get(code or "") if not row["unfunded_cause"] else None
             db.execute(
@@ -345,7 +353,8 @@ def record_dialer_event(db, ev: DialerCallEvent) -> RecordedCall:
         db.execute(text("UPDATE lending.call_dispositions SET booking_blocked = true WHERE id = :id"), {"id": row["id"]})
 
     unanswered = (row["call_ended_at"] is not None and ev.direction != "inbound"
-                  and _is_unanswered(ev, code, True) and row["phone"] is not None)
+                  and _is_unanswered(ev, code, True) and row["phone"] is not None
+                  and not is_abandoned(ev.disposition_raw))
     if unanswered:
         queue_missed_call(db, ev.call_id, row["phone"], ev.caller_id_number, record, row["call_ended_at"])
 

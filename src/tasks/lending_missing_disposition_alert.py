@@ -21,6 +21,9 @@ def run(slack_client: Any = None, minutes: Optional[int] = None) -> int:
     """Post one warning per seat for calls past the grace period; returns calls flagged."""
     settings = get_settings()
     minutes = minutes if minutes is not None else settings.lending_disposition_missing_alert_minutes
+    if not (slack_client or _configured_slack()):
+        logger.error("[lending] missing-disposition alert skipped: Slack is not configured")
+        return 0
     with lending_session() as db:
         rows = db.execute(
             text(
@@ -39,10 +42,8 @@ def run(slack_client: Any = None, minutes: Optional[int] = None) -> int:
     by_seat: dict[str, list[str]] = {}
     for call_id, seat, name in rows:
         by_seat.setdefault(name or seat or "unknown seat", []).append(call_id)
-    if not (slack_client or _configured_slack()):
-        logger.error("[lending] %d call(s) missing a disposition and Slack is not configured", len(rows))
-        return len(rows)
     client = slack_client or _slack_client()
+    unsent: list[str] = []
     for seat, ids in by_seat.items():
         try:
             client.chat_postMessage(
@@ -52,6 +53,12 @@ def run(slack_client: Any = None, minutes: Optional[int] = None) -> int:
             )
         except Exception as exc:
             logger.error("[lending] missing-disposition alert failed: %s", type(exc).__name__)
+            unsent += ids
+    if unsent:
+        with lending_session() as db:  # un-claim so the next run retries the post
+            db.execute(text("UPDATE lending.call_dispositions SET disposition_missing_alerted_at = NULL "
+                            "WHERE dialer_call_id = ANY(:ids)"), {"ids": unsent})
+            db.commit()
     return len(rows)
 
 
