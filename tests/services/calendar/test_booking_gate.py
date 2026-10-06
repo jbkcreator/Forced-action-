@@ -335,11 +335,13 @@ class TestIsListBlocked:
         assert _is_list_blocked("list_3") is False
         assert _is_list_blocked("list_9") is False
 
-    def test_missing_list_key_is_blocked(self):
-        """Fail closed: with no list on file the List 4 rule cannot be checked."""
-        assert _is_list_blocked(None) is True
-        assert _is_list_blocked("") is True
-        assert _is_list_blocked("   ") is True
+    def test_none_list_key_never_blocks(self):
+        assert _is_list_blocked(None) is False
+
+    def test_blank_list_key_is_not_blocked(self):
+        """An unknown list is not blocked: contacts we have no record of book as usual."""
+        assert _is_list_blocked("") is False
+        assert _is_list_blocked("   ") is False
 
     def test_list_key_is_matched_case_and_space_insensitively(self):
         assert _is_list_blocked("List_4") is True
@@ -371,7 +373,7 @@ class _TagSession:
 
 
 class TestResolveListKey:
-    """The source list is looked up server-side by phone, never taken from the caller."""
+    """The source list is looked up from calling_pool_staging.source_tag by phone."""
 
     def test_phone_is_normalised_before_the_lookup(self):
         from src.services.calendar.gate import resolve_list_key
@@ -380,7 +382,7 @@ class TestResolveListKey:
         assert resolve_list_key(session, "(813) 555-0142") == "list_1"
         assert session.params == {"phone": "+18135550142"}
 
-    def test_no_tag_on_file_returns_none(self):
+    def test_phone_with_no_staged_tag_returns_none(self):
         from src.services.calendar.gate import resolve_list_key
 
         assert resolve_list_key(_TagSession([]), "+18135550142") is None
@@ -390,6 +392,7 @@ class TestResolveListKey:
 
         session = _TagSession(["list_4"])
         assert resolve_list_key(session, "not a phone") is None
+        assert resolve_list_key(session, None) is None
         assert session.params is None
 
     def test_blocked_list_wins_when_the_number_is_in_several_lists(self):
@@ -399,7 +402,7 @@ class TestResolveListKey:
 
 
 class TestSubmitGateListLookup:
-    """POST /api/fa-max/gates resolves the list itself and refuses when it cannot."""
+    """POST /api/fa-max/gates: our staging tag wins; unknown contacts are not blocked."""
 
     @staticmethod
     def _payload(**extra):
@@ -408,54 +411,56 @@ class TestSubmitGateListLookup:
         return GateSubmission(
             tracked_link_id=7, liquidity_source="cash", completed_projects="1_to_2",
             deal_status="real_deal", credit_band="at_or_above_640", occupancy="investment",
-            decision_maker="yes", property_address="1 Main St", phone="+18135550142", **extra,
+            decision_maker="yes", property_address="1 Main St", **extra,
         )
 
-    def test_caller_cannot_supply_the_list(self):
-        assert "list_key" not in self._payload(list_key="list_1").model_dump()
-
-    def test_unknown_list_refuses_the_gate_and_stores_nothing(self):
-        from fastapi import HTTPException
-        from src.api.fa_max_router import submit_gate
-
-        with patch("src.services.calendar.gate.resolve_list_key", return_value=None),                 patch("src.services.calendar.gate.store_gate") as store:
-            with pytest.raises(HTTPException) as exc:
-                submit_gate(self._payload(), db=MagicMock(), admin={"sub": "caller"})
-        assert exc.value.status_code == 422
-        store.assert_not_called()
-
-    def test_failed_lookup_refuses_the_gate_and_stores_nothing(self):
-        from fastapi import HTTPException
-        from src.api.fa_max_router import submit_gate
-
-        db = MagicMock()
-        with patch("src.services.calendar.gate.resolve_list_key", side_effect=RuntimeError("db down")),                 patch("src.services.calendar.gate.store_gate") as store:
-            with pytest.raises(HTTPException) as exc:
-                submit_gate(self._payload(), db=db, admin={"sub": "caller"})
-        assert exc.value.status_code == 500
-        assert "db down" not in exc.value.detail
-        db.rollback.assert_called_once()
-        store.assert_not_called()
-
-    def test_resolved_list_is_what_gets_stored(self):
+    @staticmethod
+    def _submit(payload, *, resolved=None, resolve_error=None):
         from src.api.fa_max_router import submit_gate
 
         stored = MagicMock(return_value=("g1", GateResult(passed=True, failed_field=None, reason=None)))
-        with patch("src.services.calendar.gate.resolve_list_key", return_value="list_4"),                 patch("src.services.calendar.gate.store_gate", stored):
-            out = submit_gate(self._payload(), db=MagicMock(), admin={"sub": "caller"})
-        assert stored.call_args.kwargs["list_key"] == "list_4"
+        lookup = MagicMock(return_value=resolved, side_effect=resolve_error)
+        db = MagicMock()
+        with patch("src.services.calendar.gate.resolve_list_key", lookup),                 patch("src.services.calendar.gate.store_gate", stored):
+            out = submit_gate(payload, db=db, admin={"sub": "caller"})
+        return out, stored, lookup, db
+
+    def test_list_4_in_our_records_wins_over_a_wrong_or_missing_caller_list_key(self):
+        for sent in (None, "list_1", "List_9"):
+            _, stored, _, _ = self._submit(self._payload(phone="+18135550142", list_key=sent), resolved="list_4")
+            assert stored.call_args.kwargs["list_key"] == "list_4"
+
+    def test_unknown_phone_falls_back_to_the_caller_list_key(self):
+        _, stored, _, _ = self._submit(self._payload(phone="+18135550142", list_key="list_2"), resolved=None)
+        assert stored.call_args.kwargs["list_key"] == "list_2"
+
+    def test_unknown_phone_and_no_list_key_is_stored_unblocked(self):
+        out, stored, _, _ = self._submit(self._payload(phone="+18135550142"), resolved=None)
+        assert stored.call_args.kwargs["list_key"] is None
+        assert out["gate_id"] == "g1"
+
+    def test_no_phone_skips_the_lookup(self):
+        _, stored, lookup, _ = self._submit(self._payload(list_key="list_3"))
+        lookup.assert_not_called()
+        assert stored.call_args.kwargs["list_key"] == "list_3"
+
+    def test_a_failed_lookup_does_not_stop_the_gate_from_being_stored(self):
+        out, stored, _, db = self._submit(
+            self._payload(phone="+18135550142", list_key="list_2"), resolve_error=RuntimeError("db down"),
+        )
+        db.rollback.assert_called_once()
+        assert stored.call_args.kwargs["list_key"] == "list_2"
         assert out["gate_id"] == "g1"
 
 
-class TestStoreGateRequiresAList:
-    def test_blank_list_key_is_rejected_before_anything_is_written(self):
+class TestStoreGateListKey:
+    def test_list_key_is_stored_trimmed_and_lower_cased_and_blank_is_null(self):
         import src.services.calendar.gate as gate_module
 
-        session = MagicMock()
-        for blank in ("", "   "):
-            with pytest.raises(ValueError):
-                gate_module.store_gate(session, answers=_passing_answers(), list_key=blank)
-        session.execute.assert_not_called()
+        for sent, expected in ((" List_4 ", "list_4"), ("", None), ("   ", None), (None, None)):
+            session = MagicMock()
+            gate_module.store_gate(session, answers=_passing_answers(), list_key=sent)
+            assert session.execute.call_args[0][1]["list_key"] == expected
 
 
 # ---------------------------------------------------------------------------
@@ -516,7 +521,6 @@ class TestStoreGateCompilesWithoutDatabase:
                 _CapturingSession(),
                 answers=_passing_answers(),
                 tracked_link_id=1,
-                list_key="list_1",
                 captured_by="test_caller",
             )
 
@@ -536,7 +540,6 @@ class TestStoreGateIntegration:
         with _no_real_alert():
             gate_id, _ = store_gate(
                 gate_db,
-                list_key="list_1",
                 answers=_passing_answers(),
                 tracked_link_id=None,
                 captured_by="test_caller",
@@ -554,7 +557,6 @@ class TestStoreGateIntegration:
         with _no_real_alert():
             gate_id, _ = store_gate(
                 gate_db,
-                list_key="list_1",
                 answers=_passing_answers(liquidity_source="none"),
                 captured_by="test_caller",
             )
@@ -569,7 +571,6 @@ class TestStoreGateIntegration:
         with _no_real_alert():
             gate_id, _ = store_gate(
                 gate_db,
-                list_key="list_1",
                 answers=_passing_answers(),
                 captured_by="test_caller",
             )
@@ -593,7 +594,6 @@ class TestStoreGateIntegration:
         with _no_real_alert():
             gate_id, _ = store_gate(
                 gate_db,
-                list_key="list_1",
                 answers=_passing_answers(occupancy="homestead"),
                 captured_by="test_caller",
             )
@@ -615,7 +615,6 @@ class TestStoreGateIntegration:
         with _no_real_alert():
             gate_id, _ = store_gate(
                 gate_db,
-                list_key="list_1",
                 answers=_passing_answers(),
                 captured_by="test_caller",
             )
@@ -671,7 +670,6 @@ class TestStoreGateIntegration:
         with _no_real_alert():
             earlier_pass_id, _ = store_gate(
                 gate_db,
-                list_key="list_1",
                 answers=_passing_answers(),
                 tracked_link_id=link_id,
                 captured_by="test_caller",
@@ -680,7 +678,6 @@ class TestStoreGateIntegration:
 
             store_gate(
                 gate_db,
-                list_key="list_1",
                 answers=_passing_answers(occupancy="homestead"),
                 tracked_link_id=link_id,
                 captured_by="test_caller",
@@ -696,7 +693,6 @@ class TestStoreGateIntegration:
         with _no_real_alert():
             earlier_fail_id, _ = store_gate(
                 gate_db,
-                list_key="list_1",
                 answers=_passing_answers(occupancy="homestead"),
                 tracked_link_id=link_id,
                 captured_by="test_caller",
@@ -705,7 +701,6 @@ class TestStoreGateIntegration:
 
             gate_id, _ = store_gate(
                 gate_db,
-                list_key="list_1",
                 answers=_passing_answers(),
                 tracked_link_id=link_id,
                 captured_by="test_caller",
@@ -783,7 +778,7 @@ class TestBookRefusesWithoutGate:
         from src.services.calendar.booking import book
         from src.services.calendar import FakeCalendar
 
-        fake_gate_row = {"gate_id": "g123", "list_key": "list_1", "result": "pass"}
+        fake_gate_row = {"gate_id": "g123", "list_key": None, "result": "pass"}
 
         with (
             _no_real_alert(),
@@ -880,7 +875,7 @@ class TestDailyCapBoundary:
         # (which now runs before the cap check) must see None, not a
         # MagicMock row, or it would short-circuit with a bogus replay.
         session.execute.return_value.mappings.return_value.first.return_value = None
-        fake_gate_row = {"gate_id": "g_cap", "list_key": "list_1", "result": "pass"}
+        fake_gate_row = {"gate_id": "g_cap", "list_key": None, "result": "pass"}
 
         with (
             patch("src.services.calendar.gate.get_passed_gate_by_id", return_value=fake_gate_row),

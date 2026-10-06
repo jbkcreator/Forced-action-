@@ -179,7 +179,7 @@ def _bypass_gate():
     invariants (slot-conflict resolution, idempotency, suppression, etc.)
     against the real DB schema. Bypassing here keeps them green and focused.
     """
-    _fake_gate_row = {"gate_id": "test_gate", "list_key": "list_1", "result": "pass"}
+    _fake_gate_row = {"gate_id": "test_gate", "list_key": None, "result": "pass"}
     from contextlib import ExitStack
     from unittest.mock import patch as _patch
 
@@ -936,7 +936,7 @@ class TestBookingConfirmedNotification:
 
         gate_row = {
             "gate_id": "test_gate",
-            "list_key": "list_1",
+            "list_key": None,
             "result": "pass",
             "captured_by": "caller_jane",
             "answers": json.dumps({"property_address": "123 Main St, Tampa FL"}),

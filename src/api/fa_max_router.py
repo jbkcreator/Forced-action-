@@ -45,11 +45,15 @@ class GateSubmission(BaseModel):
         default=None, max_length=200,
         description="Required instead of property_address when deal_status is actively_looking",
     )
-    phone: str = Field(
-        min_length=7, max_length=32,
-        description="The contact's phone. The source list (List 4 block) is looked up from it server-side, never sent by the caller.",
+    phone: Optional[str] = Field(
+        default=None, max_length=32,
+        description="The contact's phone. The source list (List 4 block) is looked up from it in lending.calling_pool_staging.",
     )
     person_id: Optional[int] = None
+    list_key: Optional[str] = Field(
+        default=None, max_length=40,
+        description="Fallback only, used when our records have no list for the phone. The server's lookup always wins.",
+    )
     captured_by: Optional[str] = None
 
 
@@ -68,9 +72,10 @@ def submit_gate(
     Returns the gate_id and whether it passed. If it failed, the contact is
     automatically enqueued in fa_max_nurture_queue and surfaced to EXCEPTIONS.
 
-    The source list (the List 4 booking block) is looked up from ``phone``
-    against our own staging and call records, never sent by the caller. When
-    no list is on file the gate is refused with 422 and no booking can follow.
+    The source list (the List 4 booking block) is looked up from ``phone`` in
+    lending.calling_pool_staging and wins over any ``list_key`` sent. A contact
+    with no list on file is not blocked: the caller's ``list_key`` is stored if
+    one was sent, otherwise none.
 
     Gate answers are stored as enum codes only — never free text financial
     data, never a pulled credit score — per the _FINANCIAL_TERMS and
@@ -91,18 +96,18 @@ def submit_gate(
         target_market=payload.target_market,
     )
 
-    try:
-        list_key = resolve_list_key(db, payload.phone)
-    except Exception as exc:
-        db.rollback()
-        logger.error("gate.submit: source-list lookup failed link=%s: %s", payload.tracked_link_id, type(exc).__name__)
-        raise HTTPException(status_code=500, detail="Could not verify the contact's source list") from exc
-    if list_key is None:
-        logger.warning("gate.submit: no source list on file, gate refused link=%s", payload.tracked_link_id)
-        raise HTTPException(
-            status_code=422,
-            detail="No source list is on file for this contact, so the gate cannot be recorded and the booking is blocked.",
-        )
+    list_key = payload.list_key
+    if payload.phone:
+        try:
+            known = resolve_list_key(db, payload.phone)
+        except Exception as exc:
+            db.rollback()
+            logger.error("gate.submit: source-list lookup failed link=%s: %s", payload.tracked_link_id, type(exc).__name__)
+            known = None
+        if known:
+            if payload.list_key and payload.list_key.strip().lower() != known:
+                logger.warning("gate.submit: caller list_key differs from our records link=%s; using ours", payload.tracked_link_id)
+            list_key = known
 
     gate_id, result = store_gate(
         db,
