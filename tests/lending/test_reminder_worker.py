@@ -249,6 +249,7 @@ def test_a_crash_mid_send_is_closed_as_unknown_never_resent(db):
     sender = TextSender(RuntimeError("process died"))
     assert cycle(db, text_sender=sender) == {}
     assert row(db)["status"] == "sending"
+    db.execute(text("UPDATE lending.booking_messages SET decided_at = :t WHERE status = 'sending'"), {"t": NOON})  # claim time on the test clock, not the DB's
     later = NOON + timedelta(seconds=STALE_SEND_SECONDS + 5)
     assert cycle(db, text_sender=TextSender(), now=later) == {}
     assert (row(db)["status"], row(db)["skip_reason"]) == ("send_unknown", "stale_claim")

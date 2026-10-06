@@ -17,7 +17,7 @@ FA_API_MAIN = Path(__file__).resolve().parents[2] / "src" / "api" / "main.py"
 
 
 def _paths(application) -> set[str]:
-    return {route.path for route in application.routes}
+    return set(application.openapi()["paths"])   # not app.routes: newer FastAPI wraps included routers
 
 
 def test_lending_app_serves_the_lending_webhooks_and_health():
