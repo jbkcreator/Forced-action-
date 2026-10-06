@@ -1079,6 +1079,8 @@ class AppSettings(BaseSettings):
 	lending_ghl_email_from: Optional[str] = Field(default=None, env="LENDING_GHL_EMAIL_FROM")
 	# Logs the key paths (never values) of each incoming lending GHL webhook, to confirm the real field names.
 	lending_ghl_log_payload_shape: bool = Field(default=False, env="LENDING_GHL_LOG_PAYLOAD_SHAPE")
+	# A failed caller check cancels the AI-booked GHL appointment (frees Josh's slot). Off until the end-to-end test.
+	lending_ghl_release_slot_enabled: bool = Field(default=False, env="LENDING_GHL_RELEASE_SLOT_ENABLED")
 
 
 @lru_cache

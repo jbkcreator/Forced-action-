@@ -85,6 +85,42 @@ The code also accepts GHL's default nested payloads (`contact.*`, `calendar.*`),
 what GHL really sends, set `LENDING_GHL_LOG_PAYLOAD_SHAPE=true` on the server, fire one test event per workflow, and read
 the `[ghl-payload-shape]` log lines (key paths and value types only, never values). Turn it off afterwards.
 
+## The agent as built in GHL (Oct 6) and where it is served
+
+**Served by:** the lending-api service (`127.0.0.1:8010`, systemd `lending-api`), behind its own nginx site for
+`api.nextdeallending.com` (and the server IP, for tests). Forced Action's site does not serve lending paths. Workflow URLs
+are `https://api.nextdeallending.com/webhooks/lending/<path>`; they need the DNS record and the certificate first (the secret
+travels in a header, so never use plain http in production).
+
+**Agent "NDL Reply Agent"** (Conversation AI, Prompt Based, started from scratch; model GPT 4.1; SMS only; Mode Off until the
+deploy, the texting number and 10DLC are done):
+- *Instructions:* the six hard rules and the rate and terms reply above; offer only open calendar times, at most three; book
+  30-minute calls with Josh; hand off anything it cannot answer, a request for a person, a complaint or a lawyer mention; never
+  change, cancel or move a call itself (hand off to Josh).
+- *Actions:* **Appointment Booking** on "NDL Calender" (pause the bot for 7 days after booking; the bot may not cancel or
+  reschedule); **Stop Bot** with three scenarios, each with *Reactivate bot after* off:
+  1. *Rate or terms question* (rates, interest, points, fees, payments, costs, pricing, loan terms, LTV, LTC, ARV, how much they
+     can borrow or you can lend, any quote): final message "Honestly, I'd rather get you on a call with Josh than guess over text.
+     He'll give you real numbers on your deal and follow up shortly." (GHL caps the final message at 150 characters, so it cannot
+     also offer slots).
+  2. *Wants Josh* (a person, a complaint, a lawyer, or to reschedule, cancel or move the call): "Thanks for letting us know. Josh
+     will follow up with you shortly."
+  3. *Opt-out* (wrong number, don't text me again, remove me): "Understood, sorry for the mix-up. We won't text you again." (GHL
+     requires a non-empty final message; a bare STOP is handled by GHL's own DND and never reaches the bot).
+- *Timing:* 2-second wait, at most 15 messages a conversation, sleep on a manual message (Josh or a caller typing), not on
+  workflow messages (so it still answers replies to our automated texts). Response behaviour: images and voice notes off.
+- *Knowledge base:* empty until the website copy and an FAQ Josh has read exist.
+
+**Tested in GHL's test panel (no SMS sent):** a day request offers three real slots; rate, fee, LTV, LTC, "how much can you
+lend me", a ballpark push and "what do other lenders charge" all hand off with no number; "can I get approved with bad credit"
+promises nothing; an SSN is refused and not repeated; "do you use Backflip" is not confirmed; a call request, a lawyer mention
+and a reschedule request hand off; "wrong number" gets the single confirmation. **The test panel books a real appointment**
+on the live calendar (cancel it afterwards); it is not a sandbox.
+
+**Slot release on a failed check:** when a contact enters the Nurture stage before an AI-booked call, `/ghl-nurture` also cancels
+the GHL appointment (`LENDING_GHL_RELEASE_SLOT_ENABLED=true`, off by default; turn it on after the end-to-end test). If GHL
+refuses, a message is posted to the replies channel so the slot is cancelled by hand.
+
 ## Entry point and task list
 
 A confirmed booking reaches the scheduler through `POST /webhooks/lending/booking-confirmed` (header `X-Webhook-Secret`, payload documented in `src/lending/booking_messages.py`; idempotent per `booking_ref`). Open: the GL-5 owner must call it when a booking is confirmed. Confirmation calls due are posted at 9am ET to `LENDING_DIAL_TASKS_CHANNEL` by `src.tasks.lending_confirmation_tasks`.

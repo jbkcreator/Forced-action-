@@ -28,9 +28,11 @@ from sqlalchemy.orm import Session
 
 from src.api.deps import get_db
 from src.api.lending_ghl_router import _verify_secret
-from src.lending.booking_messages import cancel_by_provider_event, handle_booking_confirmed, handle_booking_gate_failed, handle_nurture_entry
+from src.lending.booking_messages import cancel_by_provider_event, find_ai_booking, handle_booking_confirmed, handle_booking_gate_failed, handle_nurture_entry
 from src.lending.confirmation_tasks import complete_confirmation_task
+from src.lending.ghl_appointments import get_appointment_canceller
 from src.lending.payload_shape import log_shape
+from src.lending.reply_guard import slack_poster
 
 logger = logging.getLogger(__name__)
 
@@ -206,13 +208,37 @@ def ghl_nurture(
     if not phone:
         return {"status": "noop", "reason": "no_phone"}
     try:
+        booking = find_ai_booking(db, phone)
         outcome = handle_nurture_entry(db, phone)
         db.commit()
     except Exception as exc:  # class only: the payload carries a phone number
         logger.error("[booking-webhook] nurture handling failed (%s)", type(exc).__name__)
         db.rollback()
         raise HTTPException(status_code=500, detail="Could not process the stage change") from None
-    return {"status": outcome}
+    response: dict[str, Any] = {"status": outcome}
+    if outcome == "queued" and booking and booking["provider_event_id"]:
+        released = _release_slot(booking["provider_event_id"])
+        if released is not None:
+            response["slot_released"] = released
+    return response
+
+
+def _release_slot(appointment_id: str) -> Optional[bool]:
+    """Cancel the GHL appointment after the failed-check handling is committed. None when slot release is off.
+    A refusal is posted to the replies channel so a held slot is never left unnoticed."""
+    canceller = get_appointment_canceller()
+    if canceller is None:
+        return None
+    released = canceller(appointment_id)
+    if not released:
+        poster = slack_poster()
+        if poster is not None:
+            try:
+                poster(f"*Could not release a GHL slot after a failed check*\nAppointment {appointment_id}: cancel it by hand "
+                       "in GHL (Calendars). The contact has already been messaged and the reminders cancelled.")
+            except Exception as exc:
+                logger.error("[booking-webhook] could not post the unreleased-slot alert (%s)", type(exc).__name__)
+    return released
 
 
 @router.post("/booking-gate-failed")
