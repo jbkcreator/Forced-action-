@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from sqlalchemy import text
 
-from config.lending_web import GHL_MAX_ATTEMPTS, SMS_CONSENT_TEXT
+from config.lending_web import SMS_CONSENT_TEXT
 from src.lending.consent import has_text_consent
 from src.lending.web_leads import (
     DeliveryError,
@@ -191,13 +191,51 @@ def test_sweep_retries_failed_leads_only_after_the_wait(web_leads_db):
     assert _row(web_leads_db, lead_id)["ghl_status"] == "synced"
 
 
-def test_leads_past_the_attempt_cap_are_left_failed(web_leads_db):
+def _fail_once(db, lead_id, now, **error_kwargs):
+    deliver_pending(db, RecordingSink(error=DeliveryError("contact upsert: HTTP 500", **error_kwargs)), lead_id=lead_id, now=now)
+
+
+@pytest.mark.parametrize("failures,wait_minutes", [(1, 2), (2, 5), (3, 15), (4, 60), (5, 240), (9, 240)])
+def test_the_wait_before_a_retry_grows_with_each_failure_and_then_holds(web_leads_db, failures, wait_minutes):
     lead_id, _ = save_web_lead(web_leads_db, _data())
-    web_leads_db.execute(text("UPDATE lending.web_leads SET ghl_status = 'failed', ghl_attempts = :n WHERE id = :i"),
-                         {"n": GHL_MAX_ATTEMPTS, "i": lead_id})
+    now = datetime.now(timezone.utc)
+    web_leads_db.execute(text("UPDATE lending.web_leads SET ghl_status = 'failed', ghl_attempts = :n, ghl_last_attempt_at = :t WHERE id = :i"),
+                         {"n": failures, "t": now, "i": lead_id})
+    assert deliver_pending(web_leads_db, RecordingSink(), now=now + timedelta(minutes=wait_minutes, seconds=-30)) == 0
+    assert deliver_pending(web_leads_db, RecordingSink(), now=now + timedelta(minutes=wait_minutes, seconds=30)) == 1
+
+
+def test_a_long_outage_does_not_strand_the_lead_it_is_delivered_once_ghl_recovers(web_leads_db):
+    lead_id, _ = save_web_lead(web_leads_db, _data())
+    now = datetime.now(timezone.utc)
+    _fail_once(web_leads_db, lead_id, now)
+    for hours in range(2, 17, 2):  # sweeps every two hours for 16h, all failing: far past the old 20-minute budget
+        deliver_pending(web_leads_db, RecordingSink(error=DeliveryError("contact upsert: HTTP 503")), now=now + timedelta(hours=hours))
+    row = _row(web_leads_db, lead_id)
+    assert row["ghl_status"] == "failed" and row["ghl_attempts"] >= 6
+    recovered = RecordingSink()
+    assert deliver_pending(web_leads_db, recovered, now=now + timedelta(hours=30)) == 1
+    assert _row(web_leads_db, lead_id)["ghl_status"] == "synced" and len(recovered.pushed) == 1
+
+
+def test_a_rejected_key_does_not_use_up_attempts_and_is_retried_every_sweep(web_leads_db):
+    lead_id, _ = save_web_lead(web_leads_db, _data())
+    now = datetime.now(timezone.utc)
+    for step in range(8):
+        deliver_pending(web_leads_db, RecordingSink(error=DeliveryError("contact upsert: HTTP 401", config_error=True)),
+                        now=now + timedelta(minutes=5 * step), **({"lead_id": lead_id} if step == 0 else {}))
+    row = _row(web_leads_db, lead_id)
+    assert row["ghl_attempts"] == 0 and row["ghl_status"] == "failed" and row["ghl_last_error"] == "contact upsert: HTTP 401"
+    fixed = RecordingSink()
+    assert deliver_pending(web_leads_db, fixed, now=now + timedelta(minutes=45)) == 1  # key fixed: next sweep delivers
+
+
+def test_a_lead_older_than_the_give_up_window_is_left_alone(web_leads_db):
+    lead_id, _ = save_web_lead(web_leads_db, _data())
+    web_leads_db.execute(text("UPDATE lending.web_leads SET ghl_status = 'failed', received_at = now() - interval '73 hours' WHERE id = :i"),
+                         {"i": lead_id})
     sink = RecordingSink()
-    assert deliver_pending(web_leads_db, sink, now=datetime.now(timezone.utc) + timedelta(hours=1)) == 0
-    assert sink.pushed == []
+    assert deliver_pending(web_leads_db, sink) == 0 and sink.pushed == []
 
 
 def test_without_ghl_configured_leads_wait_and_no_attempt_is_burned(web_leads_db):

@@ -19,7 +19,7 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
-from config.lending_web import DEDUP_WINDOW_MINUTES, GHL_MAX_ATTEMPTS, GHL_RETRY_AFTER_MINUTES, SMS_CONSENT_TEXT
+from config.lending_web import DEDUP_WINDOW_MINUTES, GHL_GIVE_UP_AFTER_HOURS, GHL_RETRY_BACKOFF_MINUTES, SMS_CONSENT_TEXT
 from src.lending.consent import has_text_consent
 from src.lending.web_leads import DeliveryError, PushResult, build_input, deliver_pending, save_web_lead
 
@@ -169,15 +169,19 @@ def test_dedup_window_boundary(factory, age, is_duplicate):
     assert (not created) is is_duplicate and (second == first) is is_duplicate
 
 
-@pytest.mark.parametrize("attempts,deliverable", [(GHL_MAX_ATTEMPTS - 1, True), (GHL_MAX_ATTEMPTS, False)])
-def test_attempt_cap_boundary(factory, attempts, deliverable):
+@pytest.mark.parametrize("age,deliverable", [
+    (timedelta(hours=GHL_GIVE_UP_AFTER_HOURS) - timedelta(seconds=1), True),
+    (timedelta(hours=GHL_GIVE_UP_AFTER_HOURS) + timedelta(seconds=1), False),
+])
+def test_give_up_age_boundary(factory, age, deliverable):
+    now = datetime.now(timezone.utc)
     with factory() as s:
         lead_id, _ = save_web_lead(s, _data())
-        s.execute(text("UPDATE lending.web_leads SET ghl_status = 'failed', ghl_attempts = :n"), {"n": attempts})
+        s.execute(text("UPDATE lending.web_leads SET ghl_status = 'failed', ghl_attempts = 50, received_at = :t"), {"t": now - age})
         s.commit()
     sink = Sink()
     with factory() as s:
-        deliver_pending(s, sink, now=datetime.now(timezone.utc) + timedelta(hours=1))
+        deliver_pending(s, sink, now=now)
         s.commit()
     assert (sink.pushed == [lead_id]) is deliverable
 
@@ -188,7 +192,7 @@ def test_retry_wait_boundary(factory, extra_seconds, retried):
     with factory() as s:
         save_web_lead(s, _data())
         s.execute(text("UPDATE lending.web_leads SET ghl_status = 'failed', ghl_attempts = 1, ghl_last_attempt_at = :t"),
-                  {"t": now - timedelta(minutes=GHL_RETRY_AFTER_MINUTES, seconds=extra_seconds)})
+                  {"t": now - timedelta(minutes=GHL_RETRY_BACKOFF_MINUTES[0], seconds=extra_seconds)})
         s.commit()
     sink = Sink()
     with factory() as s:
@@ -329,20 +333,81 @@ def test_ghl_not_configured_keeps_the_lead_pending_and_still_answers_200(factory
     assert tuple(_row(factory)) == ("pending", 0, None)
 
 
-def test_a_lead_that_exhausts_its_attempts_stays_failed_and_is_logged_at_error(factory, caplog):
+def test_a_rejected_key_is_logged_at_error_and_does_not_use_up_an_attempt(factory, caplog):
     import logging
 
     with factory() as s:
         lead_id, _ = save_web_lead(s, _data())
-        s.execute(text("UPDATE lending.web_leads SET ghl_status = 'failed', ghl_attempts = :n"), {"n": GHL_MAX_ATTEMPTS - 1})
         s.commit()
     with caplog.at_level(logging.ERROR, logger="src.lending.web_leads"):
         with factory() as s:
-            deliver_pending(s, Sink(error=DeliveryError("contact upsert: HTTP 500")), now=datetime.now(timezone.utc) + timedelta(hours=1))
+            deliver_pending(s, Sink(error=DeliveryError("contact upsert: HTTP 401", config_error=True)), now=datetime.now(timezone.utc))
             s.commit()
-    assert tuple(_row(factory)[:2]) == ("failed", GHL_MAX_ATTEMPTS)
+    assert tuple(_row(factory)) == ("failed", 0, "contact upsert: HTTP 401")
     assert any(r.levelno == logging.ERROR and str(lead_id) in r.getMessage() for r in caplog.records)
     assert "8135550142" not in caplog.text and "dana@example.com" not in caplog.text  # no PII in logs
+
+
+class FakeSlack:
+    def __init__(self, fail=False):
+        self.fail, self.posts = fail, []
+
+    def chat_postMessage(self, **kwargs):
+        if self.fail:
+            raise RuntimeError("slack down")
+        self.posts.append(kwargs)
+
+
+def _sweep_with_factory_sessions(factory, monkeypatch):
+    from contextlib import contextmanager
+
+    import src.tasks.lending_web_lead_sweep as sweep
+
+    @contextmanager
+    def session():
+        with factory() as s:
+            yield s
+            s.commit()
+
+    monkeypatch.setattr(sweep, "lending_session", session)
+    return sweep
+
+
+def test_a_lead_still_not_in_ghl_after_an_hour_is_posted_to_slack_once_without_personal_data(factory, monkeypatch):
+    sweep = _sweep_with_factory_sessions(factory, monkeypatch)
+    with factory() as s:
+        save_web_lead(s, _data(phone="(813) 555-0101"))  # arrived just now: not stale yet
+        stale, _ = save_web_lead(s, _data())
+        s.execute(text("UPDATE lending.web_leads SET ghl_status = 'failed', ghl_last_error = 'contact upsert: HTTP 401', "
+                       "received_at = now() - interval '61 minutes' WHERE id = :i"), {"i": stale})
+        s.commit()
+    slack = FakeSlack()
+    assert sweep.alert_undelivered(slack_client=slack) == 1
+    message = slack.posts[0]["text"]
+    assert f"{stale}" in message and "HTTP 401" in message and "1 website lead" in message
+    assert "8135550142" not in message and "dana" not in message.lower()
+    assert sweep.alert_undelivered(slack_client=slack) == 0 and len(slack.posts) == 1  # flagged once
+
+
+def test_a_failed_slack_post_is_retried_on_the_next_sweep(factory, monkeypatch):
+    sweep = _sweep_with_factory_sessions(factory, monkeypatch)
+    with factory() as s:
+        stale, _ = save_web_lead(s, _data())
+        s.execute(text("UPDATE lending.web_leads SET received_at = now() - interval '61 minutes' WHERE id = :i"), {"i": stale})
+        s.commit()
+    assert sweep.alert_undelivered(slack_client=FakeSlack(fail=True)) == 0
+    working = FakeSlack()
+    assert sweep.alert_undelivered(slack_client=working) == 1 and len(working.posts) == 1
+
+
+def test_a_delivered_lead_is_never_alerted_about(factory, monkeypatch):
+    sweep = _sweep_with_factory_sessions(factory, monkeypatch)
+    with factory() as s:
+        done, _ = save_web_lead(s, _data())
+        s.execute(text("UPDATE lending.web_leads SET ghl_status = 'synced', received_at = now() - interval '5 hours' WHERE id = :i"), {"i": done})
+        s.commit()
+    slack = FakeSlack()
+    assert sweep.alert_undelivered(slack_client=slack) == 0 and slack.posts == []
 
 
 # -------------------------------------------------------- compliance (structural)

@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 # create never alters an existing table; columns added after first apply go here.
 _ALTERS = [
     'ALTER TABLE "{t}".web_leads ADD COLUMN IF NOT EXISTS suppression_reason varchar(30)',
+    'ALTER TABLE "{t}".web_leads ADD COLUMN IF NOT EXISTS ghl_alerted_at timestamptz',
 ]
 
 

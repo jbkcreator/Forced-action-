@@ -17,8 +17,8 @@ from sqlalchemy import text
 from config.lending_web import (
     DEDUP_WINDOW_MINUTES,
     FIELD_MAX_LENGTHS,
-    GHL_MAX_ATTEMPTS,
-    GHL_RETRY_AFTER_MINUTES,
+    GHL_GIVE_UP_AFTER_HOURS,
+    GHL_RETRY_BACKOFF_MINUTES,
     SMS_CONSENT_TEXT,
     SWEEP_BATCH_SIZE,
 )
@@ -65,7 +65,14 @@ class LeadSink(Protocol):
 
 
 class DeliveryError(Exception):
-    """Delivery failed; the message is a short, PII-free reason for ``ghl_last_error``."""
+    """Delivery failed; the message is a short, PII-free reason for ``ghl_last_error``.
+
+    ``config_error`` marks a rejected key or setup (HTTP 401/403): the lead is fine, the integration
+    is not, so the failure does not use up one of the lead's attempts."""
+
+    def __init__(self, message: str, *, config_error: bool = False) -> None:
+        super().__init__(message)
+        self.config_error = config_error
 
 
 def _clean(value: Optional[str], field: str) -> Optional[str]:
@@ -197,28 +204,40 @@ def merge_into_existing(db, lead_id: int, data: WebLeadInput) -> bool:
     return changed is not None
 
 
+def _backoff_minutes_sql() -> str:
+    """Minutes to wait after N failures, from config (ints only, never user input): 0 failures -> no
+    wait, then the configured schedule, its last value repeating."""
+    steps = GHL_RETRY_BACKOFF_MINUTES
+    whens = " ".join(f"WHEN {n} THEN {int(minutes)}" for n, minutes in enumerate(steps[:-1], start=1))
+    return f"CASE ghl_attempts WHEN 0 THEN 0 {whens} ELSE {int(steps[-1])} END"
+
+
 _DELIVERABLE = (
     "SELECT id, name, phone, email, property_city, deal_type, completed_projects_3y, sms_consent, "
     "deal_drop_optin, suppressed, received_at, ghl_attempts FROM lending.web_leads "
-    "WHERE ghl_status IN ('pending', 'failed') AND ghl_attempts < :max {extra} "
+    "WHERE ghl_status IN ('pending', 'failed') AND received_at > :oldest {extra} "
     "ORDER BY received_at LIMIT :limit FOR UPDATE SKIP LOCKED"
 )
 
 
 def deliver_pending(db, sink: Optional[LeadSink], *, lead_id: Optional[int] = None, now: Optional[datetime] = None) -> int:
     """Deliver stored leads to the sink; returns how many reached it. One lead (``lead_id``, used
-    right after submit) or the retry backlog. With no sink (GHL not configured) leads stay pending
-    and no attempt is counted, so configuring GHL later drains them. Never raises per lead."""
+    right after submit) or the retry backlog. The backlog is every lead not yet in GHL that is younger
+    than GHL_GIVE_UP_AFTER_HOURS and past its backoff wait, so a long outage is retried for days, not
+    minutes. With no sink (GHL not configured) leads stay pending and no attempt is counted, so
+    configuring GHL later drains them. Never raises per lead."""
     now = now or datetime.now(timezone.utc)
     if sink is None:
         logger.warning("[lending-web] GHL is not configured: web leads stay pending")
         return 0
-    extra = "AND id = :lead_id" if lead_id is not None else "AND (ghl_last_attempt_at IS NULL OR ghl_last_attempt_at < :cutoff)"
-    params: dict[str, Any] = {"max": GHL_MAX_ATTEMPTS, "limit": SWEEP_BATCH_SIZE}
+    params: dict[str, Any] = {"limit": SWEEP_BATCH_SIZE, "oldest": now - timedelta(hours=GHL_GIVE_UP_AFTER_HOURS)}
     if lead_id is not None:
+        extra = "AND id = :lead_id"
         params["lead_id"] = lead_id
     else:
-        params["cutoff"] = now - timedelta(minutes=GHL_RETRY_AFTER_MINUTES)
+        extra = (f"AND (ghl_last_attempt_at IS NULL OR "
+                 f"ghl_last_attempt_at < CAST(:now AS timestamptz) - make_interval(mins => {_backoff_minutes_sql()}))")
+        params["now"] = now
     rows = db.execute(text(_DELIVERABLE.format(extra=extra)), params).mappings().all()
     delivered = 0
     for row in rows:
@@ -230,7 +249,7 @@ def _deliver_one(db, sink: LeadSink, lead: dict[str, Any], now: datetime) -> int
     try:
         result = sink.push(lead)
     except DeliveryError as exc:
-        _record_failure(db, lead, str(exc)[:200], now)
+        _record_failure(db, lead, str(exc)[:200], now, config_error=exc.config_error)
         return 0
     except Exception as exc:
         _record_failure(db, lead, f"unexpected {type(exc).__name__}", now)
@@ -244,14 +263,15 @@ def _deliver_one(db, sink: LeadSink, lead: dict[str, Any], now: datetime) -> int
     return 1
 
 
-def _record_failure(db, lead: dict[str, Any], reason: str, now: datetime) -> None:
-    attempts = int(lead["ghl_attempts"]) + 1
-    status = "failed"
+def _record_failure(db, lead: dict[str, Any], reason: str, now: datetime, *, config_error: bool = False) -> None:
+    """A rejected key or setup keeps the attempt count where it was: the lead is not at fault, and it
+    is retried on every sweep until the integration is fixed."""
+    attempts = int(lead["ghl_attempts"]) + (0 if config_error else 1)
     db.execute(
-        text("UPDATE lending.web_leads SET ghl_status = :s, ghl_attempts = :a, ghl_last_attempt_at = :now, "
+        text("UPDATE lending.web_leads SET ghl_status = 'failed', ghl_attempts = :a, ghl_last_attempt_at = :now, "
              "ghl_last_error = :err WHERE id = :id"),
-        {"s": status, "a": attempts, "now": now, "err": reason, "id": lead["id"]},
+        {"a": attempts, "now": now, "err": reason, "id": lead["id"]},
     )
-    level = logging.ERROR if attempts >= GHL_MAX_ATTEMPTS else logging.WARNING
-    logger.log(level, "[lending-web] GHL delivery failed id=%s attempt=%d/%d reason=%s",
-               lead["id"], attempts, GHL_MAX_ATTEMPTS, reason)
+    logger.log(logging.ERROR if config_error else logging.WARNING,
+               "[lending-web] GHL delivery failed id=%s failures=%d config_error=%s reason=%s",
+               lead["id"], attempts, config_error, reason)

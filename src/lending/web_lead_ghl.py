@@ -18,6 +18,7 @@ from datetime import timezone
 from typing import Any, Mapping, Optional
 
 from config.lending_web import (
+    GHL_CONFIG_ERROR_STATUS_CODES,
     GHL_SOURCE,
     GHL_TAG_DEAL_DROP_OPTIN,
     GHL_TAG_SMS_CONSENT_NO,
@@ -88,7 +89,8 @@ class GhlLeadSink:
         except Exception as exc:
             raise DeliveryError(f"{step}: {type(exc).__name__}") from exc
         if response.status_code >= 400:
-            raise DeliveryError(f"{step}: HTTP {response.status_code}")
+            raise DeliveryError(f"{step}: HTTP {response.status_code}",
+                                config_error=response.status_code in GHL_CONFIG_ERROR_STATUS_CODES)
         try:
             return response.json()
         except ValueError:

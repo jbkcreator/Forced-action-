@@ -20,8 +20,14 @@ RATE_LIMIT_WINDOW_SECONDS = 3600
 # A double-click or a retried request inside this window returns the stored lead.
 DEDUP_WINDOW_MINUTES = 10
 
-GHL_MAX_ATTEMPTS = 5
-GHL_RETRY_AFTER_MINUTES = 2
+# Minutes to wait after the Nth failed delivery (the last value repeats) before the sweep tries again.
+# A lead is never given up on by attempt count: it keeps retrying until GHL_GIVE_UP_AFTER_HOURS old.
+GHL_RETRY_BACKOFF_MINUTES = (2, 5, 15, 60, 240)
+GHL_GIVE_UP_AFTER_HOURS = 72
+# A lead still not in GHL this long after arriving is posted to Slack once.
+GHL_ALERT_AFTER_MINUTES = 60
+# A rejected key or setup (not a problem with the lead) does not use up an attempt.
+GHL_CONFIG_ERROR_STATUS_CODES = (401, 403)
 SWEEP_BATCH_SIZE = 50
 
 GHL_SOURCE = "Website form"

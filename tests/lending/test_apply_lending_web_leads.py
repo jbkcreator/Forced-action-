@@ -16,14 +16,16 @@ def test_apply_creates_web_leads_and_is_safe_to_rerun(lending_db):
             "ghl_status", "ghl_attempts", "ghl_contact_id"} <= columns
 
 
-def test_a_table_created_before_suppression_reason_gets_the_column(lending_db):
+def test_a_table_created_before_the_later_columns_gets_them(lending_db):
     conn = lending_db.get_bind()
     apply_to(conn)
-    conn.execute(text("ALTER TABLE lending.web_leads DROP COLUMN suppression_reason"))
-    assert "suppression_reason" not in {c["name"] for c in inspect(conn).get_columns("web_leads", schema="lending")}
+    conn.execute(text("ALTER TABLE lending.web_leads DROP COLUMN suppression_reason, DROP COLUMN ghl_alerted_at"))
+    names = {c["name"] for c in inspect(conn).get_columns("web_leads", schema="lending")}
+    assert not {"suppression_reason", "ghl_alerted_at"} & names
     apply_to(conn)
     apply_to(conn)
-    assert "suppression_reason" in {c["name"] for c in inspect(conn).get_columns("web_leads", schema="lending")}
+    names = {c["name"] for c in inspect(conn).get_columns("web_leads", schema="lending")}
+    assert {"suppression_reason", "ghl_alerted_at"} <= names
 
 
 def test_consent_columns_default_to_false(web_leads_db):
