@@ -47,6 +47,26 @@ sudo journalctl -u fa-lending-opt-out-poller -u fa-lending-dialer-sweep -u fa-le
 
 `fa-lending-cdr-poller` (BatchDialer call log: 15 s fast poll of `/v2/cdrs/last`, 2 min rescan of today and yesterday) is installed the same way: `sudo cp deploy/systemd/fa-lending-cdr-poller.service /etc/systemd/system/`, then `sudo systemctl daemon-reload && sudo systemctl enable --now fa-lending-cdr-poller`. It needs `BATCHDIALER_API_KEY`, `DATABASE_URL` and `LENDING_DIALER_CAMPAIGN_IDS`. Run exactly one copy (a Postgres advisory lock enforces it): the `/last` watermark is server-side per API key, and `--once` advances it too.
 
+## Lending API (lending-api)
+
+Every `/webhooks/lending/*` route is served by `lending-api` (`src/lending/api.py`, gunicorn on `127.0.0.1:8010`), not by
+`fa-api`, so a lending deploy or crash never touches the main API. Public webhook URLs do not change: nginx routes the
+`/webhooks/lending/` prefix to port 8010 (`deploy/nginx/lending-api.conf.example`, placed above the generic `/webhooks/` block).
+
+```bash
+sudo cp deploy/systemd/lending-api.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now lending-api
+curl -s http://127.0.0.1:8010/health           # {"status":"ok"}
+# add the nginx location block, then:
+sudo nginx -t && sudo systemctl reload nginx
+sudo journalctl -u lending-api -f
+```
+
+`deploy.sh` installs, enables and restarts `lending-api` with the other lending units (warn, never fail). The nginx block is a one-time manual step and must be in place in the same deploy that ships this change: `fa-api` no longer serves
+`/webhooks/lending/*`, so without them those webhooks return 404. Rollback: remove the nginx block and deploy the
+previous `fa-api`.
+
 ## Prerequisites the units assume
 
 - `/root/Forced-action-/` — the checked-out repo

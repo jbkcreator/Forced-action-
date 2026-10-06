@@ -34,7 +34,8 @@ RELAY_UNIT_DST="/etc/systemd/system/fa-relay-slack-listener.service"
 # attempt-cap sweep. Best-effort on purpose — a lending unit that fails to install or
 # start warns but never aborts (and so never rolls back) a deploy of the FA platform.
 # The missed-call poller is not listed: it is retired by the GL-9 text-back work.
-LENDING_UNITS=(fa-lending-opt-out-poller fa-lending-dialer-sweep)
+# lending-api serves every /webhooks/lending/* route (nginx sends that prefix to 127.0.0.1:8010).
+LENDING_UNITS=(fa-lending-opt-out-poller fa-lending-dialer-sweep lending-api)
 
 cd "$PROJECT_DIR"
 
