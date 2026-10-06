@@ -11464,7 +11464,7 @@ class FaMaxBackflipCampaignContact(Base):
     """Current Backflip campaign membership; separate from permanent opt-outs."""
     __tablename__ = "fa_max_backflip_campaign_contacts"
 
-    identifier_kind: Mapped[str] = mapped_column(String(10), primary_key=True)
+    identifier_kind: Mapped[str] = mapped_column(String(20), primary_key=True)
     identifier_value: Mapped[str] = mapped_column(Text, primary_key=True)
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
     imported_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
@@ -12553,6 +12553,33 @@ class PropertyRadarPullRun(Base):
     )
 
 
+class PropertyRadarExcludedRecord(Base):
+    """A bought PropertyRadar record the normalizer dropped (e.g. a 20+ year
+    loan). Every export is billed, so the raw payload is kept here instead of
+    being discarded. Kept apart from property_radar_records so no lead reader
+    (handoff, linking, lending extraction) ever treats it as a lead."""
+
+    __tablename__ = "property_radar_excluded_records"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    radar_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    state: Mapped[str] = mapped_column(String(2), nullable=False)
+    campaign: Mapped[str] = mapped_column(String(80), nullable=False)
+    reason: Mapped[str] = mapped_column(String(40), nullable=False)
+    loan_term_years: Mapped[Optional[str]] = mapped_column(Text)
+    raw: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    pull_run_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("property_radar_pull_runs.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint("state", "campaign", "radar_id", name="uq_pr_excluded_state_campaign_radar"),
+        Index("ix_pr_excluded_reason", "reason"),
+    )
+
 # ============================================================================
 # PropertyRadar staging — Developer 2 (property_radar_records)
 # ============================================================================
@@ -12648,6 +12675,24 @@ class PropertyRadarRecord(Base):
     )
 
 
+class PropertyRadarTracedContact(Base):
+    """Contacts bought by the live Tracerfy trace, one row per staged record.
+
+    Written in the same transaction as the enrichment_usage_logs ledger rows that
+    pay for them, so a later crash cannot leave an address ledgered (and therefore
+    never re-traced) with its paid contacts lost. The handoff reads these back.
+    """
+
+    __tablename__ = "property_radar_traced_contacts"
+
+    radar_id: Mapped[str] = mapped_column(String(50), primary_key=True)
+    phones: Mapped[list] = mapped_column(ARRAY(String), nullable=False, server_default=text("'{}'"))
+    emails: Mapped[list] = mapped_column(ARRAY(String), nullable=False, server_default=text("'{}'"))
+    traced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class LeadCampaignAssignment(Base):
     """Which campaign owns a person — at most one active owner per person.
 
@@ -12721,6 +12766,7 @@ class LendingCallingPoolStaging(Base):
     # Contact
     normalized_phone: Mapped[Optional[str]] = mapped_column(String)  # E.164 or NULL
     phone_available: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    line_type: Mapped[Optional[str]] = mapped_column(String)  # 'mobile'|'landline'|'unknown'
     email: Mapped[Optional[str]] = mapped_column(String)
 
     # Intent (O14)
@@ -12741,6 +12787,10 @@ class LendingCallingPoolStaging(Base):
     source_table: Mapped[str] = mapped_column(String, nullable=False)
     # Go Live Brief 2.5 source list (list_1..list_9); apply_lending_pool_source_tags.py
     source_tag: Mapped[Optional[str]] = mapped_column(String)
+    # F8 (Josh, Oct 4 §2): owner-occupied status of the target property, from
+    # financials.homestead_exempt. NULL for pools with no single subject property
+    # (mortgage_broker: the record is a professional, not a property owner).
+    homestead_exempt: Mapped[Optional[bool]] = mapped_column(Boolean)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -12748,7 +12798,7 @@ class LendingCallingPoolStaging(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "pool_name IN ('wholesaler_flipper', 'active_builder', 'mortgage_broker', 'auction_winner', 'permit_owner')",
+            "pool_name IN ('wholesaler_flipper', 'active_builder', 'mortgage_broker', 'auction_winner', 'permit_owner', 'pr_maturity')",
             name="lending_calling_pool_staging_pool_name_check",
         ),
         Index("idx_lcps_run_id", "run_id"),
@@ -12796,4 +12846,50 @@ class OfrMortgageBroker(Base):
     __table_args__ = (
         Index("idx_ofr_brokers_status_county", "status", "county"),
         Index("idx_ofr_brokers_nmls", "nmls_id"),
+    )
+
+
+class OfrLoanOriginator(Base):
+    """List 4 "brokers and LOs" gap: individual OFR Loan Originator licenses.
+
+    Loaded from the OFR "LO" bulk download (3 monthly zips split by surname
+    range: AI, JR, SZ) by src/tasks/ofr_lo_load.py. NATIONWIDE NMLS registry —
+    most records are out-of-state individuals holding a remote FL LO license
+    (confirmed from real sample data: Michigan/Oregon addresses), NOT a
+    Florida-residents file. Phone is blank on virtually every record (confirmed
+    from real sample data) — every row needs skip-trace before it is callable.
+
+    NOT YET WIRED into Pool 3's extraction — loader-only until the client
+    confirms LOs are in scope for launch (flagged gap, WP-W0-1).
+    """
+    __tablename__ = "ofr_loan_originators"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    license_number: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    nmls_id: Mapped[Optional[str]] = mapped_column(String, index=True)
+    last_name: Mapped[Optional[str]] = mapped_column(String)
+    first_name: Mapped[Optional[str]] = mapped_column(String)
+    middle_name: Mapped[Optional[str]] = mapped_column(String)
+
+    prim_address_1: Mapped[Optional[str]] = mapped_column(String)
+    prim_address_2: Mapped[Optional[str]] = mapped_column(String)
+    prim_city: Mapped[Optional[str]] = mapped_column(String)
+    county: Mapped[Optional[str]] = mapped_column(String)
+    prim_state: Mapped[Optional[str]] = mapped_column(String)
+    prim_zip: Mapped[Optional[str]] = mapped_column(String)
+
+    phone_raw: Mapped[Optional[str]] = mapped_column(String)       # blank on nearly every row
+    normalized_phone: Mapped[Optional[str]] = mapped_column(String)  # E.164 or NULL
+
+    status: Mapped[Optional[str]] = mapped_column(String)  # Approved | Expired | ...
+    status_effective_date: Mapped[Optional[date]] = mapped_column(Date)
+    initial_approval: Mapped[Optional[date]] = mapped_column(Date)
+
+    loaded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("idx_ofr_los_status_state", "status", "prim_state"),
+        Index("idx_ofr_los_nmls", "nmls_id"),
     )

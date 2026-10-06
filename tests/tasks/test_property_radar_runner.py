@@ -253,7 +253,7 @@ def _handoff_with(monkeypatch, *, apply, trace_results=None):
 
     traced, handed = [], {}
     monkeypatch.setattr(property_radar_lead_handoff, "_live_trace",
-                        lambda session, campaign: traced.append(campaign) or {"R1": "contacts"})
+                        lambda session, campaign, *, thin_path_only: traced.append(campaign) or {"R1": "contacts"})
 
     def fake_run_handoff(**kwargs):
         handed.update(kwargs)

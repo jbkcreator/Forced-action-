@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Iterator, Protocol
+from typing import Iterator, Optional, Protocol
 
 import requests
 
@@ -98,8 +98,11 @@ class PropertyRadarPort(Protocol):
         """Return the current monthly export allowance."""
         ...
 
-    def purchase(self, criteria: list[dict]) -> Iterator[PropertyRadarRecord]:
-        """Yield all matching records, paged. Each record costs 1 export credit."""
+    def purchase(
+        self, criteria: list[dict], max_records: Optional[int] = None
+    ) -> Iterator[PropertyRadarRecord]:
+        """Yield matching records, paged, at most ``max_records`` when given.
+        Each record costs 1 export credit."""
         ...
 
 
@@ -136,9 +139,11 @@ class FakePropertyRadarPort:
     def allowance(self) -> AllowanceInfo:
         return self.canned_allowance
 
-    def purchase(self, criteria: list[dict]) -> Iterator[PropertyRadarRecord]:
+    def purchase(
+        self, criteria: list[dict], max_records: Optional[int] = None
+    ) -> Iterator[PropertyRadarRecord]:
         self.purchase_calls.append(criteria)
-        for raw in self.canned_records:
+        for raw in self.canned_records[:max_records]:
             yield PropertyRadarRecord(radar_id=raw["RadarID"], raw=raw)
 
 
@@ -216,13 +221,20 @@ class LivePropertyRadarPort:
             verified=False,
         )
 
-    def purchase(self, criteria: list[dict]) -> Iterator[PropertyRadarRecord]:
+    def purchase(
+        self, criteria: list[dict], max_records: Optional[int] = None
+    ) -> Iterator[PropertyRadarRecord]:
+        # Every returned record is billed, so a cap must shrink the page
+        # request itself rather than stop reading a page already bought.
         start = 0
         while True:
+            limit = _PAGE_SIZE if max_records is None else min(_PAGE_SIZE, max_records - start)
+            if limit <= 0:
+                break
             body = self._post(
                 params={
                     "Purchase": 1,
-                    "Limit": _PAGE_SIZE,
+                    "Limit": limit,
                     "Start": start,
                     "Fields": ",".join(_EXPORT_FIELDS),
                 },

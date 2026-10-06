@@ -21,7 +21,17 @@ from src.core.database import get_db_context
 
 STATEMENTS: list[tuple[str, str]] = [
     (
-        "WIDEN fa_max_backflip_campaign_contacts.identifier_kind",
+        "WIDEN fa_max_backflip_campaign_contacts.identifier_kind column to VARCHAR(20)",
+        # The column was created as VARCHAR(10) (apply_fa_max_wp2_queues.py); 'entity_name'
+        # is 11 characters, so widening only the CHECK constraint below still leaves every
+        # entity_name insert failing with "value too long for type character varying(10)".
+        """
+        ALTER TABLE fa_max_backflip_campaign_contacts
+            ALTER COLUMN identifier_kind TYPE VARCHAR(20);
+        """,
+    ),
+    (
+        "WIDEN fa_max_backflip_campaign_contacts.identifier_kind constraint",
         """
         ALTER TABLE fa_max_backflip_campaign_contacts
             DROP CONSTRAINT IF EXISTS ck_fa_max_backflip_identifier_kind;

@@ -48,7 +48,7 @@ class LendingSuppression(LendingBase):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     phone: Mapped[Optional[str]] = mapped_column(String(20), unique=True)  # phone_utils.normalize
     email: Mapped[Optional[str]] = mapped_column(String(255), unique=True)  # lower-cased
-    reason: Mapped[str] = mapped_column(String(30), nullable=False)  # SuppressionReason: OPT_OUT / LITIGATOR
+    reason: Mapped[str] = mapped_column(String(30), nullable=False)  # SuppressionReason: OPT_OUT / LITIGATOR / WARM_NETWORK
     source_channel: Mapped[str] = mapped_column(String(30), nullable=False)  # sms / email / dialer / backfill:*
     source_ref: Mapped[Optional[str]] = mapped_column(String(100))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
@@ -189,6 +189,28 @@ class LendingDialerLoadRecord(LendingBase):
         Index("idx_lending_dialer_load_records_contact", "dialer_contact_id",
               postgresql_where=text("dialer_contact_id IS NOT NULL")),
         CheckConstraint("active OR deactivated_at IS NOT NULL", name="ck_lending_dialer_load_deactivated_at"),
+    )
+
+
+class LendingDialerUnconfirmedCreate(LendingBase):
+    """A dialer create that failed ambiguously (timeout / 5xx): the contact may exist with no
+    load row, so an opt-out cannot be reported complete for this phone until someone checks the
+    dialer and sets ``resolved_at``."""
+
+    __tablename__ = "dialer_unconfirmed_creates"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    phone: Mapped[str] = mapped_column(String(20), nullable=False)
+    phone_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_record_ref: Mapped[str] = mapped_column(String(100), nullable=False)
+    error_status: Mapped[Optional[int]] = mapped_column()  # HTTP status; NULL for a network error
+    attempted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    resolution_note: Mapped[Optional[str]] = mapped_column(Text)
+
+    __table_args__ = (
+        Index("idx_lending_dialer_unconfirmed_creates_open", "phone", postgresql_where=text("resolved_at IS NULL")),
     )
 
 

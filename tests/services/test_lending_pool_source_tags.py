@@ -18,7 +18,11 @@ TODAY = date(2026, 9, 30)
     ("active_builder", "dbpr_contacts", False, "list_3"),
     ("mortgage_broker", "ofr_mortgage_brokers", False, "list_4"),
     ("wholesaler_flipper", "buyer_entities", True, "list_9"),
-    ("wholesaler_flipper", "buyer_entities", False, None),
+    # Not stalled -> List 2 "cash buyers" (#318/#320 reconciliation 2026-10-02): the
+    # original source_tag_for returned None here, silently excluding non-stalled
+    # wholesalers from every brief list. Pool 1's own data source (total_cash_volume)
+    # matches Josh's "cash buyers" label — see source_tag_for's own docstring.
+    ("wholesaler_flipper", "buyer_entities", False, "list_2"),
     ("auction_winner", "tax_deed_auctions", False, "list_6"),
 ])
 def test_source_tag_by_pool_and_source(pool, source_table, stalled, tag):
@@ -39,12 +43,14 @@ def test_stalled_flip_rule(bought, resold, stalled):
 def test_auction_winner_row_becomes_a_phoneless_list_6_record():
     row = SimpleNamespace(sold_to="ACME HOLDINGS LLC", sold_amount=150000, property_id=9, parcel_id="P-9",
                           county_id="hillsborough", county_name="Hillsborough", prop_address="1 Main St",
-                          prop_city="Tampa", prop_state="FL", prop_zip="33602", auction_id=77)
+                          prop_city="Tampa", prop_state="FL", prop_zip="33602", auction_id=77,
+                          homestead_exempt=None)
     rec = pe.auction_winner_record(row)
     assert rec.pool_name == "auction_winner" and rec.source_tag == "list_6"
     assert rec.entity_name == "ACME HOLDINGS LLC" and rec.entity_status == "LLC"
     assert rec.phone_available is False and rec.normalized_phone is None
     assert rec.source_table == "tax_deed_auctions" and rec.target_property_address.startswith("1 Main St")
+    assert rec.homestead_exempt is None
 
 
 @pytest.mark.skipif(not __import__("os").environ.get("DATABASE_URL"), reason="requires a live Postgres DATABASE_URL")
@@ -97,7 +103,8 @@ def test_staging_write_persists_every_column_including_source_tag():
         run_id = str(uuid.uuid4())
         row = SimpleNamespace(sold_to="ACME HOLDINGS LLC", sold_amount=150000, property_id=None, parcel_id="P-9",
                               county_id="hillsborough", county_name="Hillsborough", prop_address="1 Main St",
-                              prop_city="Tampa", prop_state="FL", prop_zip="33602", auction_id=77)
+                              prop_city="Tampa", prop_state="FL", prop_zip="33602", auction_id=77,
+                              homestead_exempt=None)
         rec = pe.auction_winner_record(row)
         rec.run_id = run_id
         assert pe._write_to_staging(session, [rec]) == 1
@@ -118,7 +125,8 @@ def _permit_row(**over):
                job_value=400000, permit_type="Residential New Construction and Additions",
                issue_date=date(2026, 8, 1), permit_number="BP-77", county_id="hillsborough",
                county_name="Hillsborough", source_property_id=5, parcel_id="P-77",
-               prop_address="77 Oak St", prop_city="Tampa", prop_state="FL", prop_zip="33602")
+               prop_address="77 Oak St", prop_city="Tampa", prop_state="FL", prop_zip="33602",
+               homestead_exempt=None)
     row.update(over)
     return SimpleNamespace(**row)
 
@@ -130,6 +138,15 @@ def test_a_permit_owner_becomes_a_list_7_builders_record():
     assert rec.entity_name == "SUNSHINE HOMES LLC" and rec.entity_status == "LLC"
     assert rec.estimated_loan_value == Decimal("340000.00")          # 85% LTC of the permit value
     assert "New Construction" in rec.recent_permit_details and rec.permit_number == "BP-77"
+
+
+def test_a_permit_owners_homestead_status_flows_through_to_the_record():
+    """F8: the gate checks CallingPoolRecord.homestead_exempt, so it must actually
+    carry the property's real status through, not just default silently to None."""
+    rec = pe.permit_owner_record(_permit_row(homestead_exempt=True))
+    assert rec.homestead_exempt is True
+    rec = pe.permit_owner_record(_permit_row(homestead_exempt=False))
+    assert rec.homestead_exempt is False
 
 
 def test_a_permit_owner_without_a_phone_is_staged_for_tracing():
@@ -157,3 +174,40 @@ def test_the_pool_check_allows_permit_owners():
     assert "permit_owner" in POOLS
     check = [str(c.sqltext) for c in M.__table__.constraints if c.name == "lending_calling_pool_staging_pool_name_check"][0]
     assert "permit_owner" in check
+
+
+# ── F8 homestead: the flag lives on financials, not properties (PR 318 re-review #3) ──
+
+def _captured_sql(extractor):
+    from unittest.mock import MagicMock
+    session = MagicMock()
+    session.execute.return_value.fetchall.return_value = []
+    extractor(session, ["hillsborough"])
+    return " ".join(str(session.execute.call_args_list[0].args[0]).split())
+
+
+@pytest.mark.parametrize("extractor", [pe._extract_pool1_wholesaler_flipper, pe._extract_list7_permit_owners])
+def test_homestead_is_read_from_financials_not_properties(extractor):
+    sql = _captured_sql(extractor)
+    assert "f.homestead_exempt" in sql and "LEFT JOIN financials f ON f.property_id" in sql
+    assert "p.homestead_exempt" not in sql
+
+
+def test_auction_winner_query_never_reads_the_former_owners_homestead_flag():
+    assert "homestead_exempt" not in _captured_sql(pe._extract_auction_winners)
+
+
+def test_an_auction_winner_is_never_screened_on_the_parcels_homestead_flag():
+    row = SimpleNamespace(sold_to="JANE ROE", sold_amount=90000, property_id=1, parcel_id="P-1",
+                          county_id="hillsborough", county_name="Hillsborough", prop_address="1 Main St",
+                          prop_city="Tampa", prop_state="FL", prop_zip="33602", auction_id=1,
+                          homestead_exempt=True)
+    assert pe.auction_winner_record(row).homestead_exempt is None
+
+
+@pytest.mark.parametrize("flag,resold,expected", [
+    (True, False, True), (False, False, False), (None, False, None),
+    (True, True, None),    # resold: the flag now describes the new owner-occupant, not the flipper
+])
+def test_a_flippers_homestead_flag_is_dropped_once_the_property_is_resold(flag, resold, expected):
+    assert pe._buyer_homestead(flag, resold) is expected

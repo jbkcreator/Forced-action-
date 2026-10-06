@@ -113,11 +113,23 @@ def test_a_sender_needs_an_account_and_the_texting_number(monkeypatch):
     assert isinstance(get_sender(), GhlSmsSender) and texting_number() == "+18135550100"
 
 
-def test_dnd_uses_the_same_account_as_the_sender(monkeypatch):
+def test_dnd_never_falls_back_to_the_shared_account(monkeypatch):
+    """The DND sync uses only the Next Deal Lending sub-account (src.lending.ghl_account): with only the
+    shared Bay Street credentials set it writes nothing."""
     from src.lending import ghl_dnd
     s = _clear(monkeypatch, *ALL)
     monkeypatch.setattr(s, "ghl_api_key", SecretStr("bay-key"), raising=False)
     monkeypatch.setattr(s, "ghl_location_id", "loc-bay", raising=False)
+    calls = []
+    monkeypatch.setattr("src.services.ghl_webhook._ghl_request", lambda *a, **k: calls.append(k) or Resp(200, {}))
+    assert ghl_dnd.set_ghl_dnd(PHONE) is False and calls == []
+
+
+def test_dnd_uses_the_next_deal_lending_account(monkeypatch):
+    from src.lending import ghl_dnd
+    s = _clear(monkeypatch, *ALL)
+    monkeypatch.setattr(s, "lending_ghl_api_key", SecretStr("ndl-key"), raising=False)
+    monkeypatch.setattr(s, "lending_ghl_location_id", "loc-ndl", raising=False)
     seen = {}
 
     def fake(method, url, **kw):
@@ -125,7 +137,7 @@ def test_dnd_uses_the_same_account_as_the_sender(monkeypatch):
         return Resp(200, {})
     monkeypatch.setattr("src.services.ghl_webhook._ghl_request", fake)
     assert ghl_dnd.set_ghl_dnd(PHONE) is True
-    assert seen["json"]["locationId"] == "loc-bay" and seen["headers"]["Authorization"] == "Bearer bay-key"
+    assert seen["json"]["locationId"] == "loc-ndl" and seen["headers"]["Authorization"] == "Bearer ndl-key"
     assert seen["headers"]["Version"] == "2021-07-28"
 
 

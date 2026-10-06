@@ -226,7 +226,6 @@ app.include_router(competitor_benchmark_router)
 
 from src.api.metrics_router import router as metrics_router  # noqa: E402
 from src.api.alert_webhook_router import router as alert_webhook_router  # noqa: E402
-from src.api.lending_ghl_router import router as lending_ghl_router  # noqa: E402
 from src.api.revenue_metrics_router import router as revenue_metrics_router  # noqa: E402
 from src.api.admin_leads_router import router as admin_leads_router  # noqa: E402
 from src.api.funnel_analytics_router import router as funnel_analytics_router  # noqa: E402
@@ -235,7 +234,6 @@ from src.api.vera_router import router as vera_router  # noqa: E402
 from src.api.identity_router import router as identity_router  # noqa: E402
 app.include_router(metrics_router)
 app.include_router(alert_webhook_router)
-app.include_router(lending_ghl_router)
 app.include_router(revenue_metrics_router)
 app.include_router(admin_leads_router)
 app.include_router(funnel_analytics_router)
@@ -312,13 +310,9 @@ app.include_router(demo_router)
 from src.api.deal_room_router import router as deal_room_router  # noqa: E402
 from src.api.selfserve_router import router as selfserve_router  # noqa: E402
 from src.api.booking_router import router as booking_router  # noqa: E402
-from src.lending.booking_webhook import router as lending_booking_webhook_router  # noqa: E402
-from src.lending.reply_webhook import router as lending_reply_webhook_router  # noqa: E402
 app.include_router(deal_room_router)
 app.include_router(selfserve_router)
 app.include_router(booking_router)
-app.include_router(lending_booking_webhook_router)
-app.include_router(lending_reply_webhook_router)
 
 
 # ---------------------------------------------------------------------------

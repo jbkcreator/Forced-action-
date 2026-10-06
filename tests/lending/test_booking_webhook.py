@@ -118,6 +118,6 @@ def test_booking_confirmed_needs_the_secret(client, db):
     assert db.execute(text("SELECT count(*) FROM lending.booking_messages WHERE booking_ref = 'ref-new'")).scalar() == 0
 
 
-def test_the_router_is_mounted_in_the_app():
-    from src.api.main import app
+def test_the_router_is_mounted_in_the_lending_app():
+    from src.lending.api import app
     assert "/webhooks/lending/booking-confirmed" in app.openapi()["paths"]

@@ -1,7 +1,8 @@
 """Availability rules: business hours, notice, horizon, buffer, DST, alignment."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -11,6 +12,7 @@ from config.calendar import (
     BUSINESS_HOURS_END_HOUR,
     BUSINESS_HOURS_START_HOUR,
     MINIMUM_NOTICE_HOURS,
+    _parse_blocked_dates,
     validate_calendar_config,
 )
 from src.services.calendar.availability import BusyBlock, compute_free_slots
@@ -72,6 +74,50 @@ class TestBusinessHours:
             include_weekends=True,
         )
         assert slots
+
+
+class TestBlockedDates:
+    """Josh's E1 answer: 'Block October 18, 19 and 20, I'm traveling.'"""
+
+    def test_default_blocks_josh_s_travel_window(self):
+        assert date(2026, 10, 18) in _parse_blocked_dates("2026-10-18,2026-10-19,2026-10-20")
+        assert date(2026, 10, 19) in _parse_blocked_dates("2026-10-18,2026-10-19,2026-10-20")
+        assert date(2026, 10, 20) in _parse_blocked_dates("2026-10-18,2026-10-19,2026-10-20")
+
+    def test_malformed_entries_are_dropped_not_raised(self):
+        assert _parse_blocked_dates("2026-10-18, not-a-date, ,2026-10-19") == {
+            date(2026, 10, 18), date(2026, 10, 19),
+        }
+
+    def test_blocked_date_yields_no_slots(self):
+        blocked_monday = _et(2026, 10, 19, 0)
+        with patch(
+            "src.services.calendar.availability.BLOCKED_CALENDAR_DATES",
+            frozenset({date(2026, 10, 19)}),
+        ):
+            slots = _slots(
+                window_start=blocked_monday,
+                window_end=blocked_monday + timedelta(days=1),
+                now=blocked_monday - timedelta(days=2),
+            )
+        assert slots == []
+
+    def test_days_around_a_blocked_date_are_unaffected(self):
+        sunday = _et(2026, 10, 18, 0) - timedelta(days=1)
+        with patch(
+            "src.services.calendar.availability.BLOCKED_CALENDAR_DATES",
+            frozenset({date(2026, 10, 19)}),
+        ):
+            slots = _slots(
+                window_start=sunday,
+                window_end=sunday + timedelta(days=4),
+                now=sunday - timedelta(days=2),
+                include_weekends=True,
+            )
+        days_with_slots = {s.start.astimezone(ET).date() for s in slots}
+        assert date(2026, 10, 19) not in days_with_slots
+        assert date(2026, 10, 18) in days_with_slots
+        assert date(2026, 10, 20) in days_with_slots
 
 
 class TestMinimumNotice:

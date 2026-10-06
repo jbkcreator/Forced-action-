@@ -427,11 +427,26 @@ def calendar_book(
     ends_at: str,
     attendee_email: str,
     topic: str,
+    gate_id: str,
     person_id: Optional[str] = None,
     calendar_id: Optional[str] = None,
+    phone: Optional[str] = None,
+    first_name: Optional[str] = None,
+    text_consent: bool = False,
     session=None,
 ) -> Dict[str, Any]:
-    """Book a slot and invite the attendee, refusing a suppressed recipient."""
+    """Book a slot and invite the attendee.
+
+    gate_id is required (WP-GL-5). Must reference a passed fa_max_booking_gates
+    row. The booking is refused without it — fail closed. A suppressed recipient
+    is also refused. The daily cap (CALENDAR_DAILY_CAP) is enforced inside book().
+
+    phone/first_name/text_consent are the caller-flow contact details WP-GL-10
+    needs to schedule confirmation/reminder messages — the gate table holds
+    enum codes only, never a phone or a consent flag. text_consent is G6's
+    "is it okay if we text you the confirmation?" yes, asked and logged by the
+    caller at booking close, not part of the earlier gate screening.
+    """
     from datetime import datetime
 
     from src.services.calendar import Slot, book
@@ -447,6 +462,10 @@ def calendar_book(
         attendee_email=attendee_email,
         topic=topic,
         person_id=person_id,
+        gate_id=gate_id,
+        phone=phone,
+        first_name=first_name,
+        text_consent=text_consent,
     )
     return {
         "booked": result.booked,
