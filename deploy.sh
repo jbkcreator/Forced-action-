@@ -30,6 +30,13 @@ CC_UNIT_DST="/etc/systemd/system/cora-command-center.service"
 # this service was never bounced.
 RELAY_UNIT_SRC="$PROJECT_DIR/deploy/systemd/fa-relay-slack-listener.service"
 RELAY_UNIT_DST="/etc/systemd/system/fa-relay-slack-listener.service"
+# Lending compliance workers: FA opt-out mirror (60 s STOP SLA) and the calling-window /
+# attempt-cap sweep. Best-effort on purpose — a lending unit that fails to install or
+# start warns but never aborts (and so never rolls back) a deploy of the FA platform.
+# The missed-call poller is not listed: it is retired by the GL-9 text-back work.
+# lending-api serves every /webhooks/lending/* route (nginx sends that prefix to 127.0.0.1:8010).
+# Unlike the others it IS a hard gate: deploy fails if nginx lacks the route or :8010/health is down.
+LENDING_UNITS=(fa-lending-opt-out-poller fa-lending-dialer-sweep lending-api)
 
 cd "$PROJECT_DIR"
 
@@ -197,10 +204,34 @@ if ! cmp -s "$RELAY_UNIT_SRC" "$RELAY_UNIT_DST" 2>/dev/null; then
 fi
 systemctl enable fa-relay-slack-listener || fail "systemctl enable fa-relay-slack-listener"
 
+# Lending compliance workers — see LENDING_UNITS comment above (warn, never fail).
+for unit in "${LENDING_UNITS[@]}"; do
+    unit_src="$PROJECT_DIR/deploy/systemd/$unit.service"
+    unit_dst="/etc/systemd/system/$unit.service"
+    if [ ! -f "$unit_src" ]; then
+        echo "WARNING: $unit.service not found at $unit_src — skipping" >&2
+        continue
+    fi
+    if ! cmp -s "$unit_src" "$unit_dst" 2>/dev/null; then
+        if ! { cp "$unit_src" "$unit_dst" && systemctl daemon-reload; }; then
+            echo "WARNING: install of $unit.service failed — skipping" >&2
+            continue
+        fi
+    fi
+    systemctl enable "$unit" || echo "WARNING: systemctl enable $unit failed" >&2
+done
+
+# fa-api stops serving /webhooks/lending/* the moment it restarts, so nginx must already route that
+# prefix to lending-api. Hard gate (unlike the warn-only lending units): a miss drops GHL opt-outs.
+bash "$PROJECT_DIR/deploy/verify_lending_routing.sh" || fail "nginx does not route /webhooks/lending/ to lending-api (see deploy/nginx/lending-api.conf.example)"
+
 systemctl restart fa-api || fail "systemctl restart fa-api"
 systemctl restart lifecycle || fail "systemctl restart lifecycle"
 systemctl restart cora || fail "systemctl restart cora"
 systemctl restart fa-relay-slack-listener || fail "systemctl restart fa-relay-slack-listener"
+for unit in "${LENDING_UNITS[@]}"; do
+    systemctl restart "$unit" || echo "WARNING: systemctl restart $unit failed" >&2
+done
 
 RESTART_TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
@@ -209,6 +240,11 @@ sleep 2
 systemctl is-active --quiet lifecycle || fail "lifecycle service not active after restart"
 systemctl is-active --quiet cora || fail "cora service not active after restart"
 systemctl is-active --quiet fa-relay-slack-listener || fail "fa-relay-slack-listener service not active after restart"
+for unit in "${LENDING_UNITS[@]}"; do
+    systemctl is-active --quiet "$unit" || echo "WARNING: $unit not active after restart — check: journalctl -u $unit -n 50" >&2
+done
+curl -sf --retry 5 --retry-delay 2 --retry-connrefused http://127.0.0.1:8010/health >/dev/null \
+    || fail "lending-api not answering on 127.0.0.1:8010/health — /webhooks/lending/* (GHL opt-outs) is down"
 systemctl restart cora_throughput || fail "systemctl restart cora_throughput"
 sleep 2
 systemctl is-active --quiet cora_throughput || fail "cora_throughput service not active after restart"

@@ -336,6 +336,15 @@ class AppSettings(BaseSettings):
 	ofr_broker_enabled: bool = Field(default=False, env="OFR_BROKER_ENABLED")
 	ofr_broker_download_url: Optional[str] = Field(default=None, env="OFR_BROKER_DOWNLOAD_URL")
 
+	# OFR individual Loan Originator (LO) ingestion — List 4 "brokers and LOs" (flagged gap,
+	# WP-W0-1). Split across 3 monthly zips by surname range (A-I, J-R, S-Z) at
+	# real.flofr.com/Public/LO/. Disabled by default — NOT yet wired into Pool 3's
+	# extraction; loader-only until the client confirms LOs are in scope for launch.
+	ofr_lo_enabled: bool = Field(default=False, env="OFR_LO_ENABLED")
+	ofr_lo_download_url_ai: Optional[str] = Field(default=None, env="OFR_LO_DOWNLOAD_URL_AI")
+	ofr_lo_download_url_jr: Optional[str] = Field(default=None, env="OFR_LO_DOWNLOAD_URL_JR")
+	ofr_lo_download_url_sz: Optional[str] = Field(default=None, env="OFR_LO_DOWNLOAD_URL_SZ")
+
 	# PropertyRadar ingestion adapter (Developer 1)
 	# Solo plan: 10,000 export credits/month. Purchase=0 counts are free and
 	# never billed. Set property_radar_mode="fake" (default) in tests/local;
@@ -703,15 +712,43 @@ class AppSettings(BaseSettings):
 	fa_max_slack_bot_token: Optional[SecretStr] = Field(default=None, env="FA_MAX_SLACK_BOT_TOKEN")
 	fa_max_slack_app_token: Optional[SecretStr] = Field(default=None, env="FA_MAX_SLACK_APP_TOKEN")
 	fa_max_slack_signing_secret: Optional[SecretStr] = Field(default=None, env="FA_MAX_SLACK_SIGNING_SECRET")
-	# Calendar scheduling. "fake" keeps every booking in memory; only "live"
-	# reaches a real calendar, and it stays the non-default so a misconfigured
-	# environment cannot put a test meeting on the client's real day.
-	fa_max_calendar_mode: str = Field(default="fake", env="FA_MAX_CALENDAR_MODE")
+	# Calendar scheduling. "fake" keeps every booking in memory; "live" writes
+	# directly to Google Calendar; "ghl" writes to a GHL calendar instead,
+	# relying on GHL's own two-way Google sync to reflect busy times — the
+	# client's chosen setup (GHL calendar is master, synced to Google), so no
+	# mode here reads Google directly once "ghl" is in use. None is the
+	# default so a misconfigured environment cannot put a test meeting on the
+	# client's real day.
+	# Named LENDING_* (not FA_MAX_*): this toggle exists for the Next Deal
+	# Lending booking flow specifically, same naming family as the
+	# LENDING_GHL_* credentials it switches between.
+	lending_calendar_mode: str = Field(default="fake", env="LENDING_CALENDAR_MODE")
 	fa_max_calendar_id: Optional[str] = Field(default=None, env="FA_MAX_CALENDAR_ID")
 	# Domain-wide delegation impersonates a named user; this is whose calendar
 	# bookings land on. Must be inside the Workspace the service account is
-	# delegated within.
+	# delegated within. Only read when lending_calendar_mode == "live".
 	fa_max_calendar_subject: Optional[str] = Field(default=None, env="FA_MAX_CALENDAR_SUBJECT")
+	# GHL calendar id bookings are written to when lending_calendar_mode ==
+	# "ghl". Distinct from GHL_AP_PRO_CALENDAR_ID — that's an unrelated
+	# calendar for a different venture. Named LENDING_GHL_* to match the
+	# sub-account's other credentials below — it lives in Next Deal
+	# Lending's GHL account, same naming family as the api key/location id
+	# it's read alongside.
+	lending_ghl_calendar_id: Optional[str] = Field(default=None, env="LENDING_GHL_CALENDAR_ID")
+	# Next Deal Lending's own GHL sub-account — NOT GHL_API_KEY/
+	# GHL_LOCATION_ID, which are Bay Street Capital's and already depended
+	# on elsewhere (ghl_webhook.py's lead push). Shared with WP-GL-10
+	# (confirmation/reminder texts) — same sub-account, same credentials,
+	# same field names, so both features read one pair instead of each
+	# minting its own.
+	lending_ghl_api_key: Optional[SecretStr] = Field(default=None, env="LENDING_GHL_API_KEY")
+	lending_ghl_location_id: Optional[str] = Field(default=None, env="LENDING_GHL_LOCATION_ID")
+	# "Booked Calls" pipeline (WP-GL-5 scope: push bookings to Booked, gate
+	# fails to Nurture — both stages live in this one pipeline, confirmed
+	# directly against the real GHL account on 2026-10-05).
+	lending_ghl_pipeline_id: Optional[str] = Field(default=None, env="LENDING_GHL_PIPELINE_ID")
+	lending_ghl_stage_booked: Optional[str] = Field(default=None, env="LENDING_GHL_STAGE_BOOKED")
+	lending_ghl_stage_nurture: Optional[str] = Field(default=None, env="LENDING_GHL_STAGE_NURTURE")
 	# Fallback for the Command Center's self-message filter when Slack's
 	# auth.test is unreachable at startup. Normally resolved dynamically.
 	fa_max_slack_bot_user_id: Optional[str] = Field(default=None, env="FA_MAX_SLACK_BOT_USER_ID")
@@ -874,7 +911,22 @@ class AppSettings(BaseSettings):
 	lending_backflip_check_enabled: bool = Field(default=False, env="LENDING_BACKFLIP_CHECK_ENABLED")
 	# Shared secret the GHL "DND changed" workflow sends in X-Webhook-Secret. Unset = endpoint closed.
 	lending_ghl_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_GHL_WEBHOOK_SECRET")
+	# lending_ghl_api_key / lending_ghl_location_id are defined once, above,
+	# alongside the rest of the LENDING_GHL_* credential group.
 	aircall_webhook_token: Optional[SecretStr] = Field(default=None, env="AIRCALL_WEBHOOK_TOKEN")
+
+	# ── Lending engine: call disposition logging ──
+	# Slack bot and Sheet, separate from the FA settings above.
+	# All optional so the app boots without lending configured. Uses DATABASE_URL.
+	lending_dialer_campaign_ids: str = Field(default="", env="LENDING_DIALER_CAMPAIGN_IDS")  # comma-separated; empty ignores every event
+	lending_seat_groups: str = Field(default="", env="LENDING_SEAT_GROUPS")  # "agentid:A,agentid:B" (BatchDialer agent id) -> shift group per seat
+	lending_disposition_missing_alert_minutes: int = Field(default=10, env="LENDING_DISPOSITION_MISSING_ALERT_MINUTES")
+	lending_slack_bot_token: Optional[SecretStr] = Field(default=None, env="LENDING_SLACK_BOT_TOKEN")
+	lending_dial_tasks_channel: str = Field(default="", env="LENDING_DIAL_TASKS_CHANNEL")
+	lending_daily_channel: str = Field(default="", env="LENDING_DAILY_CHANNEL")  # 7pm scoreboard; channel ID
+	lending_sheets_service_account_key_path: str = Field(default="", env="LENDING_SHEETS_SERVICE_ACCOUNT_KEY_PATH")
+	lending_disposition_sheet_id: str = Field(default="", env="LENDING_DISPOSITION_SHEET_ID")
+	lending_disposition_sheet_tab: str = Field(default="Dispositions", env="LENDING_DISPOSITION_SHEET_TAB")
 	# ── Meta Conversions API (CAPI) — S2 ────────────────────────────────────
 	# Server-side Purchase reporting for closed-loop Meta ad attribution.
 	# Feature-gated and OFF by default — when disabled, or when pixel_id /

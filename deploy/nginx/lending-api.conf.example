@@ -1,0 +1,11 @@
+# Lending webhooks go to the lending-api service (127.0.0.1:8010), not fa-api.
+# Add inside the existing server block, ABOVE the generic "location /webhooks/" block.
+# The longer prefix wins, so only /webhooks/lending/* moves; public URLs stay the same.
+location /webhooks/lending/ {
+    proxy_pass http://127.0.0.1:8010;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_read_timeout 30s;
+}

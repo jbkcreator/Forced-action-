@@ -4,9 +4,10 @@
 # exist in BatchDialer with these exact names; a live load refuses any unmapped pool.
 POOL_CAMPAIGN_TAGS: dict[str, str] = {
     "verified_maturity": "Verified maturity",
-    "transaction_ready": "Transaction ready",
+    "transaction_ready": "Transaction ready",  # List 2 (cash buyers) rides along here too (Oct 4 §2)
     "builders": "Builders",
-    "nurture": "Nurture",  # Lists 2/4: dialed for data, never bookable
+    "partners": "Partners",  # List 4: dialed as a real queue, partner script only, never bookable
+    "nurture": "Nurture",    # fallback for any future list with no rank of its own
 }
 
 # Hook line per campaign, shown on the caller's card. Seeded from the client's voicemail
@@ -15,6 +16,7 @@ CAMPAIGN_HOOKS: dict[str, str] = {
     "Verified maturity": "It looks like the loan on it is coming up; we help investors get ahead of that.",
     "Transaction ready": "Saw you picked up the property; we can help fund your next deal.",
     "Builders": "Saw your project; we fund builders and investors in your county.",
+    "Partners": "You move deals, we fund buyers; let's connect our pipelines.",
 }
 
 
@@ -24,10 +26,13 @@ CAMPAIGN_HOOKS: dict[str, str] = {
 # Confirmed 2026-09-30 with the client key (GET /campaigns, /contacts, /cdrs, /lists -> 200).
 BATCHDIALER_BASE_URL: str = "https://app.batchdialer.com/api"
 BATCHDIALER_TIMEOUT_SECONDS: float = 20.0
+BATCHDIALER_QUICK_TIMEOUT_SECONDS: float = 5.0  # single attempt, no retry: the on-call consent read
 BATCHDIALER_ENDPOINTS: dict[str, "tuple[str, str] | None"] = {
     # Confirmed live 2026-09-30: create/read/update/delete on a test contact.
     "contact_upsert": ("POST", "/contact"),
     "contact_update": ("PUT", "/contact/{id}"),
+    # Read-only (API notes 2.3): the contact's custom fields, incl. the caller-set text_consent.
+    "contact_get": ("GET", "/contact/{id}"),
     # Public API docs, "Add contacts": imports straight into the given campaign ids.
     # Exercised live with the first campaign.
     "contacts_add_to_campaign": ("POST", "/contacts"),

@@ -33,6 +33,7 @@ from src.services.property_radar.lead_handoff import (
     HandoffReport,
     SqlHandoffStore,
     iter_staged_leads,
+    pretrace_eligible,
     run_handoff,
 )
 from src.services.property_radar.live_trace import trace_staged_leads
@@ -82,11 +83,26 @@ def _stored_contacts(session, radar_ids: list[str]) -> dict[str, LeadContacts]:
     return {r.radar_id: LeadContacts(emails=tuple(r.emails), phones=tuple(r.phones)) for r in rows}
 
 
-def _live_trace(session, campaign: str) -> dict[str, LeadContacts]:
+def _live_trace(session, campaign: str, *, thin_path_only: bool) -> dict[str, LeadContacts]:
     settings = get_settings()
     if not settings.property_radar_enabled:
         raise RuntimeError("--live-trace needs PROPERTY_RADAR_ENABLED=true")
-    leads = [lead for page in iter_staged_leads(session, campaign=campaign) for lead in page]
+    if session.execute(text("SELECT to_regclass('property_radar_traced_contacts')")).scalar() is None:
+        raise RuntimeError("property_radar_traced_contacts is missing: run "
+                           "migrations/apply_property_radar_traced_contacts.py before --live-trace")
+    all_leads = [lead for page in iter_staged_leads(session, campaign=campaign) for lead in page]
+    facts = SqlHandoffStore(session).screening_facts(all_leads, {})
+    if not facts.backflip_feed_fresh:
+        logger.warning("[pr-live-trace] Backflip feed is stale; the handoff would skip every "
+                       "lead on backflip_feed_stale regardless of contacts, so skipping the "
+                       "trace entirely rather than paying Tracerfy for leads that can't be used")
+        return {}
+    leads = [
+        lead for lead in all_leads
+        if pretrace_eligible(lead, facts, thin_path_only=thin_path_only)[0]
+    ]
+    logger.info("PropertyRadar live trace: %d of %d staged leads are eligible to trace "
+                "(status/campaign/thin-path/already-handed-off filtered)", len(leads), len(all_leads))
     keys = {trace_key(lead.property_address, lead.zip) for lead in leads}
     outcome = trace_staged_leads(
         leads,
@@ -117,7 +133,7 @@ def run(
     contacts = load_trace_contacts(trace_results) if trace_results else {}
     with get_db_context() as session:
         if live_trace:
-            contacts = {**contacts, **_live_trace(session, campaign)}
+            contacts = {**contacts, **_live_trace(session, campaign, thin_path_only=thin_path)}
         report = run_handoff(
             store=SqlHandoffStore(session),
             pages=iter_staged_leads(session, campaign=campaign),

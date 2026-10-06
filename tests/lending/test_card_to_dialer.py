@@ -107,7 +107,7 @@ class TestPriorContact:
 class TestReloadKeepsTheVendorId:
     def test_update_by_known_contact_resends_the_vendor_contact_id(self):
         dialer = MagicMock()
-        _push_contact(dialer, _item(), "555", DialerContactFields())
+        _push_contact(dialer, _item(), "555", "Verified maturity", DialerContactFields())
         assert dialer.update_contact.call_args.kwargs["vendor_contact_id"] == "staging:11"
 
 
