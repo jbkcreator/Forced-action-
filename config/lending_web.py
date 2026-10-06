@@ -31,6 +31,8 @@ GHL_CONFIG_ERROR_STATUS_CODES = (401, 403)
 SWEEP_BATCH_SIZE = 50
 
 GHL_SOURCE = "Website form"
+# the dropdown value written to the consent custom fields (their options are "Yes" / "No")
+GHL_CUSTOM_FIELD_YES = "Yes"
 GHL_TAG_WEB_LEAD = "web-lead"
 GHL_TAG_SMS_CONSENT_YES = "web-sms-consent-yes"
 GHL_TAG_SMS_CONSENT_NO = "web-sms-consent-no"

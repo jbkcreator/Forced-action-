@@ -140,10 +140,19 @@ def test_custom_fields_are_sent_only_when_their_ids_are_configured_and_only_for_
     monkeypatch.setattr(settings, "lending_ghl_cf_deal_drop_optin", "cf_drop", raising=False)
     ghl = FakeGhl(monkeypatch, _routes())
     GhlLeadSink(ACCOUNT).push(_lead(sms_consent=True))
-    assert ghl.body("POST", "/contacts/upsert")["json"]["customFields"] == [{"id": "cf_sms", "value": "yes"}]
+    assert ghl.body("POST", "/contacts/upsert")["json"]["customFields"] == [{"id": "cf_sms", "value": "Yes"}]  # the fields' dropdown option
 
     ghl = FakeGhl(monkeypatch, _routes())
-    GhlLeadSink(ACCOUNT).push(_lead())  # unticked: never overwrite an earlier "yes" with "no"
+    GhlLeadSink(ACCOUNT).push(_lead(sms_consent=True, deal_drop_optin=True))
+    assert ghl.body("POST", "/contacts/upsert")["json"]["customFields"] == [
+        {"id": "cf_sms", "value": "Yes"}, {"id": "cf_drop", "value": "Yes"}]
+
+    ghl = FakeGhl(monkeypatch, _routes())
+    GhlLeadSink(ACCOUNT).push(_lead(sms_consent=True, deal_drop_optin=True, suppressed=True))  # opted out: no consent written
+    assert "customFields" not in ghl.body("POST", "/contacts/upsert")["json"]
+
+    ghl = FakeGhl(monkeypatch, _routes())
+    GhlLeadSink(ACCOUNT).push(_lead())  # unticked: never overwrite an earlier "Yes" with "No"
     assert "customFields" not in ghl.body("POST", "/contacts/upsert")["json"]
 
 

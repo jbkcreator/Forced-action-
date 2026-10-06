@@ -19,6 +19,7 @@ from typing import Any, Mapping, Optional
 
 from config.lending_web import (
     GHL_CONFIG_ERROR_STATUS_CODES,
+    GHL_CUSTOM_FIELD_YES,
     GHL_SOURCE,
     GHL_TAG_DEAL_DROP_OPTIN,
     GHL_TAG_SMS_CONSENT_NO,
@@ -55,9 +56,9 @@ def _custom_fields(lead: Mapping[str, Any]) -> list[dict[str, str]]:
     settings = get_settings()
     fields = []
     if settings.lending_ghl_cf_sms_consent and _consent_effective(lead):
-        fields.append({"id": settings.lending_ghl_cf_sms_consent, "value": "yes"})
+        fields.append({"id": settings.lending_ghl_cf_sms_consent, "value": GHL_CUSTOM_FIELD_YES})
     if settings.lending_ghl_cf_deal_drop_optin and _deal_drop_effective(lead):
-        fields.append({"id": settings.lending_ghl_cf_deal_drop_optin, "value": "yes"})
+        fields.append({"id": settings.lending_ghl_cf_deal_drop_optin, "value": GHL_CUSTOM_FIELD_YES})
     return fields
 
 
