@@ -586,18 +586,19 @@ def run_dialer_load(
                     _record_unconfirmed_create(db, run_id, item, exc.status)
                     commit()
                 consecutive_failures += 1
+                if isinstance(exc, ContactFieldsNotSet):
+                    # Live in the dialer: track it before any abort so opt-out can delete it.
+                    chunk.append((item, exc.contact_id))
                 if max_consecutive_failures and consecutive_failures >= max_consecutive_failures:
                     raise LoadAborted(f"{consecutive_failures} consecutive dialer failures", report)
                 if not isinstance(exc, ContactFieldsNotSet):
                     continue
-                contact_id = exc.contact_id  # live in the dialer: track it so opt-out can delete it
             else:
                 consecutive_failures = 0
                 report.loaded += 1
                 report.created += int(result.created)
                 report.updated += int(not result.created)
-                contact_id = result.contact_id
-            chunk.append((item, contact_id))
+                chunk.append((item, result.contact_id))
             if len(chunk) >= COMMIT_CHUNK_SIZE:
                 _store_chunk(db, run_id, chunk, active)
                 commit()

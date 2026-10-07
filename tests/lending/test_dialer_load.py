@@ -481,3 +481,12 @@ class TestConsecutiveFailureAbort:
             self._run_with_limit(db, [_record("a", P1), _record("b", P2), _record("c", P3)],
                                  FakeAircall(fail_phones={P2, P3}), 2)
         assert [r.phone for r in _load_rows(db)] == [P1]
+
+    def test_a_contact_created_without_its_fields_is_recorded_when_it_trips_the_abort(self, db):
+        _fresh_scrub(db, P1, P2)
+        with pytest.raises(dialer_load.LoadAborted):
+            self._run_with_limit(db, [_record("a", P1), _record("b", P2)],
+                                 FakeAircall(fields_fail_phones={P1, P2}), 2)
+        rows = _load_rows(db)
+        assert [(r.phone, r.active) for r in rows] == [(P1, True), (P2, True)]
+        assert all(r.dialer_contact_id for r in rows)
