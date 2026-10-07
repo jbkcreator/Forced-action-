@@ -81,7 +81,13 @@ class LoadRefused(RuntimeError):
 
 
 class LoadAborted(RuntimeError):
-    """A live load stopped after too many consecutive dialer failures (dialer likely down)."""
+    """A live load stopped after too many consecutive dialer failures (dialer likely down).
+
+    ``report`` holds the live counts up to the abort; contacts already pushed are recorded."""
+
+    def __init__(self, message: str, report: "LoadReport"):
+        super().__init__(message)
+        self.report = report
 
 
 def no_scrub(phones: list[str]) -> list[dict]:
@@ -476,7 +482,7 @@ def run_dialer_load(
     through ``commit`` (default ``db.commit``) after each chunk of loads.
     ``backflip_check`` defaults to the ``LENDING_BACKFLIP_CHECK_ENABLED`` setting.
     ``max_consecutive_failures`` raises ``LoadAborted`` after that many dialer
-    failures in a row; pushed contacts are recorded first. None = never abort.
+    failures in a row; pushed contacts are recorded first. None or 0 = never abort.
     """
     if backflip_check is None:
         backflip_check = get_settings().lending_backflip_check_enabled
@@ -581,7 +587,7 @@ def run_dialer_load(
                     commit()
                 consecutive_failures += 1
                 if max_consecutive_failures and consecutive_failures >= max_consecutive_failures:
-                    raise LoadAborted(f"{consecutive_failures} consecutive dialer failures")
+                    raise LoadAborted(f"{consecutive_failures} consecutive dialer failures", report)
                 if not isinstance(exc, ContactFieldsNotSet):
                     continue
                 contact_id = exc.contact_id  # live in the dialer: track it so opt-out can delete it

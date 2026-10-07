@@ -14,8 +14,8 @@ from src.tasks import lending_dialer_autoload as autoload
 def _settings(**over):
     base = dict(lending_dialer_autoload_mode="live", lending_dialer_autoload_max_records=1000,
                 lending_dialer_autoload_max_growth=2.0, lending_dialer_autoload_max_scrub_credits=200,
-                lending_dialer_autoload_max_consecutive_failures=10, lending_dialer_alert_channel="C-ALERT",
-                lending_dial_tasks_channel="C-TASKS")
+                lending_dialer_autoload_max_consecutive_failures=10, lending_dialer_autoload_tracerfy_floor=500,
+                lending_dial_tasks_channel="C-TASKS", lending_slack_bot_token=None)
     return SimpleNamespace(**{**base, **over})
 
 
@@ -46,8 +46,8 @@ class FakeDialer:
 
 @pytest.fixture
 def wired(monkeypatch):
-    state = {"paused": False, "active": 0, "preview": _report(), "live_calls": [], "live_error": None}
-    monkeypatch.setattr(autoload, "_paused", lambda s: state["paused"])
+    state = {"paused": [False, False], "active": 0, "preview": _report(), "live_calls": [], "live_error": None}
+    monkeypatch.setattr(autoload, "_paused", lambda s: state["paused"].pop(0))
     monkeypatch.setattr(autoload, "_active_contacts", lambda s: state["active"])
     monkeypatch.setattr(autoload, "staged_pool_records", lambda s: [])
     monkeypatch.setattr(autoload, "launch_queue_records", lambda recs: [{"pool": "builders"}])
@@ -64,9 +64,9 @@ def wired(monkeypatch):
     return state
 
 
-def _run(settings, dialer=FakeDialer()):
+def _run(settings, dialer=FakeDialer(), balance=10_000, scrubber=lambda phones: []):
     return autoload.run_autoload(settings=settings, session_factory=_factory, get_dialer=lambda: dialer,
-                                 scrubber=lambda phones: [])
+                                 scrubber=scrubber, read_balance=lambda: balance)
 
 
 class TestGuardrails:
@@ -82,8 +82,30 @@ class TestGuardrails:
     def test_growth_is_skipped_while_nothing_is_active(self):
         assert autoload.guardrail_trips(_report(loadable=900), 0, _settings()) == []
 
-    def test_scrub_credit_cap(self):
-        assert "credit cap 200" in autoload.guardrail_trips(_report(needs_scrub=201), 0, _settings())[0]
+    def test_numbers_needing_a_scrub_never_halt_the_run(self):
+        assert autoload.guardrail_trips(_report(needs_scrub=5000), 0, _settings()) == []
+
+
+class TestScrubBudget:
+    def test_per_run_cap(self):
+        assert autoload.scrub_budget(10_000, _settings()) == 200
+
+    def test_balance_floor(self):
+        assert autoload.scrub_budget(550, _settings()) == 50
+
+    def test_below_the_floor_scrubs_nothing(self):
+        assert autoload.scrub_budget(400, _settings()) == 0
+
+    def test_unreadable_balance_scrubs_nothing(self):
+        assert autoload.scrub_budget(None, _settings()) == 0
+
+    def test_capped_scrubber_sends_only_the_budget(self):
+        sent = []
+        autoload.capped_scrubber(lambda phones: sent.extend(phones) or [], 2)(["a", "b", "c"])
+        assert sent == ["a", "b"]
+
+    def test_zero_budget_never_calls_tracerfy(self):
+        assert autoload.capped_scrubber(lambda phones: pytest.fail("called"), 0)(["a"]) == []
 
     def test_queue_without_a_campaign(self):
         trips = autoload.guardrail_trips(_report(unmapped_pools=["builders"]), 0, _settings())
@@ -99,7 +121,7 @@ class TestRunAutoload:
         assert _run(_settings(lending_dialer_autoload_mode="yes")).status == "refused"
 
     def test_active_pause_stops_the_run(self, wired):
-        wired["paused"] = True
+        wired["paused"] = [True]
         assert _run(_settings()).status == "paused" and wired["live_calls"] == []
 
     def test_dry_run_mode_never_pushes(self, wired):
@@ -111,6 +133,15 @@ class TestRunAutoload:
         out = _run(_settings())
         assert out.status == "halted" and out.reasons and wired["live_calls"] == []
 
+    def test_pause_set_before_the_push_stops_it(self, wired):
+        wired["paused"] = [False, True]
+        assert _run(_settings()).status == "paused" and wired["live_calls"] == []
+
+    def test_over_cap_numbers_are_deferred_not_halted(self, wired):
+        wired["preview"] = _report(needs_scrub=350)
+        out = _run(_settings())
+        assert out.status == "loaded" and out.scrub_deferred == 150
+
     def test_live_push_passes_the_failure_limit(self, wired):
         out = _run(_settings())
         assert out.status == "loaded" and wired["live_calls"][0]["max_consecutive_failures"] == 10
@@ -119,26 +150,31 @@ class TestRunAutoload:
         assert _run(_settings(), dialer=None).status == "refused"
 
     def test_abort_is_reported(self, wired):
-        wired["live_error"] = LoadAborted("10 consecutive dialer failures")
+        live = _report(dry_run=False, loaded=7)
+        wired["live_error"] = LoadAborted("10 consecutive dialer failures", live)
         out = _run(_settings())
         assert out.status == "aborted" and "10 consecutive" in out.reasons[0]
+        assert out.report is live and out.report.loaded == 7
 
 
 class TestNotify:
     def _posts(self, monkeypatch, outcome):
         posts = []
-        monkeypatch.setattr(autoload, "_post", lambda ch, msg: posts.append(ch))
+        monkeypatch.setattr(autoload, "_post_summary", lambda settings, msg: posts.append("summary"))
+        monkeypatch.setattr(autoload, "post_exceptions_alert", lambda **kw: posts.append("exceptions"))
         autoload.notify(outcome, _settings())
         return posts
 
-    def test_summary_goes_to_the_tasks_channel(self, monkeypatch):
-        assert self._posts(monkeypatch, autoload.Outcome("loaded", report=_report(dry_run=False))) == ["C-TASKS"]
+    def test_a_clean_run_posts_only_the_summary(self, monkeypatch):
+        failed = _report(dry_run=False, failed=[{"record_ref": "x"}])
+        assert self._posts(monkeypatch, autoload.Outcome(autoload.Status.LOADED, report=failed)) == ["summary"]
 
-    def test_halt_goes_to_the_alert_channel(self, monkeypatch):
-        assert self._posts(monkeypatch, autoload.Outcome("halted", report=_report(), reasons=["x"])) == ["C-ALERT"]
+    def test_a_halt_also_goes_to_exceptions(self, monkeypatch):
+        out = autoload.Outcome(autoload.Status.HALTED, report=_report(), reasons=["x"])
+        assert self._posts(monkeypatch, out) == ["summary", "exceptions"]
 
     def test_off_posts_nothing(self, monkeypatch):
-        assert self._posts(monkeypatch, autoload.Outcome("off")) == []
+        assert self._posts(monkeypatch, autoload.Outcome(autoload.Status.OFF)) == []
 
 
 class TestRunHour:
@@ -148,7 +184,18 @@ class TestRunHour:
 
     def test_9am_et_runs(self, monkeypatch):
         ran = []
-        monkeypatch.setattr(autoload, "run_autoload", lambda **kw: ran.append(1) or autoload.Outcome("off"))
+        monkeypatch.setattr(autoload, "run_autoload", lambda **kw: ran.append(1) or autoload.Outcome(autoload.Status.OFF))
         monkeypatch.setattr(autoload, "notify", lambda o, s: None)
         assert autoload.main([], now=datetime(2026, 10, 7, 13, 5, tzinfo=timezone.utc)) == 0  # 09:05 EDT
         assert ran == [1]
+
+
+class TestUnexpectedError:
+    def test_an_unexpected_failure_still_alerts(self, monkeypatch):
+        sent = []
+        def boom(**kw):
+            raise RuntimeError("db down")
+        monkeypatch.setattr(autoload, "run_autoload", boom)
+        monkeypatch.setattr(autoload, "notify", lambda o, s: sent.append(o))
+        assert autoload.main(["--force"]) == 1
+        assert sent[0].status == "error" and "RuntimeError" in sent[0].reasons[0]
