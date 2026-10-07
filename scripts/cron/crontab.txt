@@ -1212,6 +1212,14 @@ COUNTY_ID=hillsborough
 # Dry check first: PYTHONPATH=. python -m src.lending.weekly_scrub --dry-run
 0 6 * * 1 $PROJECT/scripts/cron/run.sh src.lending.weekly_scrub --max-credits 1000
 
+# Lending daily automatic dialer load (newest staging run -> BatchDialer), 9:05am ET, inside the
+# 09:00-19:15 call window the live load enforces. Two lines because ET is UTC-4 until Nov 1 and
+# UTC-5 after; the task acts only at 09:xx ET. No-op until LENDING_DIALER_AUTOLOAD_MODE is
+# dry_run (report only) or live (push behind guardrails). Pause: vendor_cost_pauses
+# (batchdialer, lending_dialer_autoload).
+5 13 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_dialer_autoload
+5 14 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_dialer_autoload
+
 # Lending GHL opt-out backstop: every GHL contact with do-not-disturb on is suppressed in
 # lending, in case the GHL "DND changed" workflow webhook is missing or down. Idempotent.
 */15 * * * * $PROJECT/scripts/cron/run.sh src.lending.ghl_dnd_backstop

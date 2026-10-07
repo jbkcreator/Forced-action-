@@ -453,3 +453,31 @@ def test_live_task_refuses_while_a_load_endpoint_is_unconfirmed(tmp_path, monkey
     pools = tmp_path / "pools.json"
     pools.write_text("[]", encoding="utf-8")
     assert task.main(["--input", str(pools), "--live"]) == 3
+
+
+class TestConsecutiveFailureAbort:
+    def _run_with_limit(self, db, records, aircall, limit):
+        with patch.object(dialer_load, "load_backflip_identifier_index", return_value=EMPTY_INDEX):
+            return run_dialer_load(records, db, run_id="run-1", dry_run=False, scrubber=lambda phones: [],
+                                   dialer=aircall, campaign_tags=TAGS, commit=db.flush, now=NOON_ET,
+                                   backflip_check=True, max_consecutive_failures=limit)
+
+    def test_the_load_aborts_after_the_limit_of_failures_in_a_row(self, db):
+        _fresh_scrub(db, P1, P2, P3)
+        aircall = FakeAircall(fail_phones={P1, P2, P3})
+        with pytest.raises(dialer_load.LoadAborted):
+            self._run_with_limit(db, [_record("a", P1), _record("b", P2), _record("c", P3)], aircall, 2)
+        assert len(aircall.campaigns) == 2
+
+    def test_a_success_resets_the_count(self, db):
+        _fresh_scrub(db, P1, P2, P3, P4)
+        records = [_record("a", P1), _record("b", P2), _record("c", P3), _record("d", P4)]
+        report = self._run_with_limit(db, records, FakeAircall(fail_phones={P1, P3}), 2)
+        assert report.loaded == 2 and len(report.failed) == 2
+
+    def test_contacts_pushed_before_the_abort_keep_their_load_rows(self, db):
+        _fresh_scrub(db, P1, P2, P3)
+        with pytest.raises(dialer_load.LoadAborted):
+            self._run_with_limit(db, [_record("a", P1), _record("b", P2), _record("c", P3)],
+                                 FakeAircall(fail_phones={P2, P3}), 2)
+        assert [r.phone for r in _load_rows(db)] == [P1]

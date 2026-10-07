@@ -929,6 +929,14 @@ class AppSettings(BaseSettings):
 	lending_disposition_missing_alert_minutes: int = Field(default=10, env="LENDING_DISPOSITION_MISSING_ALERT_MINUTES")
 	lending_slack_bot_token: Optional[SecretStr] = Field(default=None, env="LENDING_SLACK_BOT_TOKEN")
 	lending_dial_tasks_channel: str = Field(default="", env="LENDING_DIAL_TASKS_CHANNEL")
+	# Daily automatic dialer load (src/tasks/lending_dialer_autoload.py).
+	# off = no-op; dry_run = gate + post the report only; live = push when every guardrail passes.
+	lending_dialer_autoload_mode: str = Field(default="off", env="LENDING_DIALER_AUTOLOAD_MODE")
+	lending_dialer_autoload_max_records: int = Field(default=1000, env="LENDING_DIALER_AUTOLOAD_MAX_RECORDS")
+	lending_dialer_autoload_max_growth: float = Field(default=2.0, env="LENDING_DIALER_AUTOLOAD_MAX_GROWTH")  # x active contacts
+	lending_dialer_autoload_max_scrub_credits: int = Field(default=200, env="LENDING_DIALER_AUTOLOAD_MAX_SCRUB_CREDITS")
+	lending_dialer_autoload_max_consecutive_failures: int = Field(default=10, env="LENDING_DIALER_AUTOLOAD_MAX_CONSECUTIVE_FAILURES")
+	lending_dialer_alert_channel: str = Field(default="", env="LENDING_DIALER_ALERT_CHANNEL")  # aborts/guardrails; empty = dial tasks channel
 	lending_daily_channel: str = Field(default="", env="LENDING_DAILY_CHANNEL")  # 7pm scoreboard; channel ID
 	lending_sheets_service_account_key_path: str = Field(default="", env="LENDING_SHEETS_SERVICE_ACCOUNT_KEY_PATH")
 	lending_disposition_sheet_id: str = Field(default="", env="LENDING_DISPOSITION_SHEET_ID")
