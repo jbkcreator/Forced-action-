@@ -37,20 +37,17 @@ run them. Everything below the first section is the checklist that remains once 
 
 ## 2. Environment (server `.env`, never committed)
 
-Interim (the existing Bay Street Capital sub-account, used automatically):
+Next Deal Lending is the only GHL account lending uses (texts, the opt-out DND sync and the DND backstop); there is no
+fallback to the platform's `GHL_API_KEY` / `GHL_LOCATION_ID`.
 
-- `GHL_API_KEY` / `GHL_LOCATION_ID`: already in `.env`; no change.
+- `LENDING_GHL_API_KEY` (Private Integration token of the Next Deal Lending sub-account) and `LENDING_GHL_LOCATION_ID`: set **both**.
+  Restart `fa-api`, `fa-lending-cdr-poller` **and** `fa-lending-opt-out-poller` after changing them (settings are cached per process:
+  the texts are sent by the CDR poller and the DND sync runs in the opt-out poller, so a process left on old values would keep
+  using them). Setting only **one** of the two is a misconfiguration: texts and DND fail closed (no account is used) with an ERROR log.
 - `LENDING_GHL_SMS_FROM_NUMBER`: E.164 of the **one number used for calling and texting**. It is also the number printed in
   "call or text me back at ...". There is no separate text-back number setting.
 - `LENDING_GHL_WEBHOOK_SECRET`: shared secret for the `X-Webhook-Secret` header on the GHL webhooks (already exists).
 - `MISSED_CALL_TEXT_ENABLED=false` until section 5(e).
-
-When the client provides the Next Deal Lending sub-account: set **both** `LENDING_GHL_API_KEY` (Private Integration token of that
-sub-account) and `LENDING_GHL_LOCATION_ID`, then restart `fa-api`, `fa-lending-cdr-poller` **and** `fa-lending-opt-out-poller`
-(settings are cached per process: the texts are sent by the CDR poller and the DND sync runs in the opt-out poller, so a process left on
-the old account would keep texting or writing DND on it). Nothing else changes: texts and the
-opt-out (DND) leg both follow. Setting only **one** of the two is a misconfiguration: texts and DND fail closed (no account is used)
-with an ERROR log; it does not fall back to the Bay Street account.
 
 ## 3. GHL-side setup, in order
 
@@ -63,17 +60,15 @@ Client gives `hari@heu.ai` Agency Admin and a card first (client answers B2/B1).
 3. Settings -> Phone Numbers -> Add Number: US, Local, SMS + Voice, area code 813 or 727. Complete identity verification. Record the
    number in `LENDING_GHL_SMS_FROM_NUMBER`. A number normally lives with one provider: confirm with the client how the same number
    serves BatchDialer calls and GHL SMS (v2 Q8).
-4. Credentials. Interim: the existing Bay Street token needs scopes contacts write and conversations/messages write (the
-   `--send-test` in section 5 proves it). Later: create a Private Integration token with those scopes in the Next Deal Lending
-   sub-account and set `LENDING_GHL_API_KEY` + `LENDING_GHL_LOCATION_ID`.
+4. Credentials. Create a Private Integration token with the scopes contacts write and conversations/messages write in the Next
+   Deal Lending sub-account and set `LENDING_GHL_API_KEY` + `LENDING_GHL_LOCATION_ID` (the `--send-test` in section 5 proves it).
 5. **10DLC (Trust Center)**, only after `nextdeallending.com` is public (WP-GL-11): Standard Brand, brand **Next Deal Lending**, legal
    entity HEU AI LLC, address 971 US Highway 202N, Ste N, Branchburg, NJ 08876 (client C3), website URL. Use case: missed-call
    text-back, booking confirmations, reminders, replies. Sample messages: the three templates in `config/lending_text_back.py` plus
    the three approved confirmation/reminder texts. Opt-in: website form checkbox (unchecked by default) plus verbal consent on the
    call ("Is it okay if we text you the confirmation?"). Opt-out: "Reply STOP". **Confirm with the client** whether the existing
    HEU AI LLC registration is updated or a new GHL registration is filed (open question H3 / v2 Q18), and whether HEU AI LLC is the
-   legal entity or Next Deal Lending is a DBA. While on the Bay Street account, an A2P registration belongs to that account, not
-   Next Deal Lending.
+   legal entity or Next Deal Lending is a DBA.
 6. Wait for approval. The number must show **A2P Verified** before any live text. If not approved by launch: calls-only with live
    voicemail; texting switches on the day it clears.
 
@@ -127,52 +122,9 @@ f. Run the verification in section 6.
 
 **Rollback:** set `MISSED_CALL_TEXT_ENABLED=false` and restart; new events return to `dry_run`.
 
-**Cutover from the Bay Street account to Next Deal Lending:**
-1. Opt-outs previously mirrored to the Bay Street account's DND are **not replayed** to the new account. Before turning texting on
-   there, backfill them. `poll_fa_opt_outs` (inside `fa-lending-opt-out-poller`) writes DND for every `lending.opt_out_events` row with
-   `ghl_dnd_at IS NULL` and a phone hash (50 per 15 s cycle). After step 2 below, run once:
-   ```sql
-   UPDATE lending.opt_out_events SET ghl_dnd_at = NULL WHERE phone_hash IS NOT NULL;
-   ```
-   and let the poller drain it (`SELECT count(*) FROM lending.opt_out_events WHERE ghl_dnd_at IS NULL AND phone_hash IS NOT NULL` must reach 0; email-only opt-outs have no phone hash and are never synced, so leave them out of the count). This does **not**
-   cover `lending.suppression_list` rows that have no `lending.opt_out_events` row (litigator and other backfilled entries, or numbers
-   suppressed before the sync existed). Those are manual: list them with
-   ```sql
-   SELECT s.phone FROM lending.suppression_list s
-   WHERE s.phone IS NOT NULL AND NOT EXISTS (
-     SELECT 1 FROM lending.opt_out_events e JOIN lending.contacts c ON c.phone_hash = e.phone_hash WHERE c.phone = s.phone);
-   ```
-   and push each through `src.lending.ghl_dnd.set_ghl_dnd(phone)` from a one-off script run by a developer with the new credentials
-   loaded (it returns True when GHL accepted the update).
-2. Set both `LENDING_GHL_API_KEY` and `LENDING_GHL_LOCATION_ID`; restart `fa-api`, `fa-lending-cdr-poller` and `fa-lending-opt-out-poller`.
-3. Re-run `--send-test`.
-4. Re-point the three GHL workflows (opt-out, inbound reply, form submitted) to the new sub-account.
-
-## 6. Verification (the spec's "done when")
-
-Against a consented test contact:
-
-- Unanswered outbound call -> exactly one text within 60 s from the calling/texting number.
-- A second unanswered call the same day -> no text (`duplicate_day`).
-- A non-consented number -> no text (`skipped_no_consent`).
-- Reply STOP -> no further text, the contact is DND in GHL and in `lending.suppression_list` (the durable block). Then place an
-  answered call to the contact (an answered call never texts, but it would normally re-grant `on_call_yes` consent), followed by an
-  unanswered call: that event must end `blocked` or `skipped_no_consent`, never `sent`, and `has_text_consent` stays false.
-
-```sql
-SELECT dialer_call_id, status, template_key, decided_at - created_at
-FROM lending.missed_call_events ORDER BY id DESC LIMIT 20;
-```
-
-## 7. Caller script lines
-
-Add to the booking close and the call: "Is it okay if we text you the confirmation?" The caller sets the BatchDialer contact field
-`text_consent` = `yes`; the CDR poller records `on_call_yes` with date, time and caller (client G6, Q27). Answered inbound calls
-count as `inbound_call` consent automatically.
-
 ## 8. Decisions taken (team lead, 2026-10-02)
 
-- Interim GHL account is Bay Street Capital (`GHL_API_KEY` / `GHL_LOCATION_ID`), switched to Next Deal Lending by env vars later.
+- Next Deal Lending's GHL sub-account is the only GHL account lending uses (2026-10-08): no fallback to the shared `GHL_*` account.
 - One number for calling and texting. Texting stays off until it is A2P Verified.
 - Missing first name -> "Hi"; missing caller -> "our team"; Option 1/2 fall back to Option 3 without address/county.
 - **Outbound calls only.** An unanswered inbound callback creates no automated text: inbound speed-to-lead is month-two scope, an

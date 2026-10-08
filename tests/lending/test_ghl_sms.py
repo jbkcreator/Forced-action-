@@ -9,7 +9,7 @@ import requests
 from pydantic import SecretStr
 
 from config.settings import get_settings
-from src.lending import ghl_sms
+from src.lending import ghl_account, ghl_sms
 from src.lending.ghl_sms import GhlAccount, GhlSmsError, GhlSmsSender, get_sender, lending_ghl_account, texting_number
 
 PHONE = "+18135558601"
@@ -88,17 +88,15 @@ def test_no_account_when_nothing_is_configured(monkeypatch):
     assert lending_ghl_account() is None and get_sender() is None
 
 
-def test_it_falls_back_to_the_bay_street_account_until_next_deal_lending_exists(monkeypatch):
+def test_it_never_falls_back_to_the_shared_account(monkeypatch):
     s = _clear(monkeypatch, *ALL)
     monkeypatch.setattr(s, "ghl_api_key", SecretStr("bay-key"), raising=False)
     monkeypatch.setattr(s, "ghl_location_id", "loc-bay", raising=False)
-    assert lending_ghl_account() == GhlAccount("bay-key", "loc-bay")
+    assert lending_ghl_account() is None and get_sender() is None
 
 
-def test_the_next_deal_lending_settings_win_once_both_are_set(monkeypatch):
+def test_the_next_deal_lending_settings_are_used_once_both_are_set(monkeypatch):
     s = _clear(monkeypatch, *ALL)
-    monkeypatch.setattr(s, "ghl_api_key", SecretStr("bay-key"), raising=False)
-    monkeypatch.setattr(s, "ghl_location_id", "loc-bay", raising=False)
     monkeypatch.setattr(s, "lending_ghl_api_key", SecretStr("ndl-key"), raising=False)
     monkeypatch.setattr(s, "lending_ghl_location_id", "loc-ndl", raising=False)
     assert lending_ghl_account() == GhlAccount("ndl-key", "loc-ndl")
@@ -106,8 +104,8 @@ def test_the_next_deal_lending_settings_win_once_both_are_set(monkeypatch):
 
 def test_a_sender_needs_an_account_and_the_texting_number(monkeypatch):
     s = _clear(monkeypatch, *ALL)
-    monkeypatch.setattr(s, "ghl_api_key", SecretStr("bay-key"), raising=False)
-    monkeypatch.setattr(s, "ghl_location_id", "loc-bay", raising=False)
+    monkeypatch.setattr(s, "lending_ghl_api_key", SecretStr("ndl-key"), raising=False)
+    monkeypatch.setattr(s, "lending_ghl_location_id", "loc-ndl", raising=False)
     assert get_sender() is None and texting_number() is None
     monkeypatch.setattr(s, "lending_ghl_sms_from_number", "(813) 555-0100", raising=False)
     assert isinstance(get_sender(), GhlSmsSender) and texting_number() == "+18135550100"
@@ -143,8 +141,7 @@ def test_dnd_uses_the_next_deal_lending_account(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _reset_warning_flags(monkeypatch):
-    monkeypatch.setattr(ghl_sms, "_warned_fallback", False)
-    monkeypatch.setattr(ghl_sms, "_warned_partial", False)
+    monkeypatch.setattr(ghl_account, "_warned_partial", False)
 
 
 def _bay(monkeypatch):
@@ -176,22 +173,13 @@ def test_empty_strings_count_as_unset(monkeypatch):
     s = _bay(monkeypatch)
     monkeypatch.setattr(s, "lending_ghl_api_key", SecretStr(""), raising=False)
     monkeypatch.setattr(s, "lending_ghl_location_id", "", raising=False)
-    assert lending_ghl_account() == GhlAccount("bay-key", "loc-bay")
-    monkeypatch.setattr(s, "ghl_api_key", SecretStr(""), raising=False)
     assert lending_ghl_account() is None
 
 
-def test_the_fallback_warning_is_logged_once(monkeypatch, caplog):
-    _bay(monkeypatch)
-    with caplog.at_level(logging.INFO):
-        lending_ghl_account()
-        lending_ghl_account()
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING and "shared GHL_*" in r.getMessage()]
-    assert len(warnings) == 1 and "bay-key" not in caplog.text
-
-
 def test_an_invalid_texting_number_disables_texting_without_logging_it(monkeypatch, caplog):
-    s = _bay(monkeypatch)
+    s = _clear(monkeypatch, *ALL)
+    monkeypatch.setattr(s, "lending_ghl_api_key", SecretStr("ndl-key"), raising=False)
+    monkeypatch.setattr(s, "lending_ghl_location_id", "loc-ndl", raising=False)
     monkeypatch.setattr(s, "lending_ghl_sms_from_number", "555-nope-99", raising=False)
     with caplog.at_level(logging.INFO):
         assert texting_number() is None and get_sender() is None
@@ -286,9 +274,10 @@ def test_api_versions_per_endpoint():
 
 def test_set_ghl_dnd_failure_paths(monkeypatch):
     from src.lending import ghl_dnd
-    _clear(monkeypatch, *ALL)
+    s = _clear(monkeypatch, *ALL)
     assert ghl_dnd.set_ghl_dnd(PHONE) is False
-    _bay(monkeypatch)
+    monkeypatch.setattr(s, "lending_ghl_api_key", SecretStr("ndl-key"), raising=False)
+    monkeypatch.setattr(s, "lending_ghl_location_id", "loc-ndl", raising=False)
     monkeypatch.setattr("src.services.ghl_webhook._ghl_request", lambda *a, **k: Resp(422, {}))
     assert ghl_dnd.set_ghl_dnd(PHONE) is False
 
@@ -299,7 +288,9 @@ def test_set_ghl_dnd_failure_paths(monkeypatch):
 
 
 def test_send_test_cli_reports_a_failed_send_without_a_traceback(monkeypatch):
-    s = _bay(monkeypatch)
+    s = _clear(monkeypatch, *ALL)
+    monkeypatch.setattr(s, "lending_ghl_api_key", SecretStr("ndl-key"), raising=False)
+    monkeypatch.setattr(s, "lending_ghl_location_id", "loc-ndl", raising=False)
     monkeypatch.setattr(s, "lending_ghl_sms_from_number", "(813) 555-0100", raising=False)
     monkeypatch.setattr("src.services.ghl_webhook._ghl_request", Boom(ConnectionError("x")))
     assert ghl_sms.main(["--send-test", "(813) 555-8601"]) == 1
