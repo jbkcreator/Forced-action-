@@ -18,7 +18,7 @@ import json
 from dataclasses import replace
 from datetime import date
 from typing import Iterator
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -1020,3 +1020,34 @@ class TestCountyAliases:
 
     def test_dade_record_is_kept_not_excluded(self):
         assert normalize(_record(county="DADE"), state="FL", campaign="x").county_fips == "12025"
+
+
+class _SeenSession:
+    def __init__(self):
+        self.params = None
+
+    def execute(self, _stmt, params=None):
+        self.params = params
+        result = MagicMock()
+        result.fetchall.return_value = [("R1",), ("R2",)]
+        return result
+
+
+class TestSharedSeenIds:
+    def test_stalled_flip_also_skips_records_private_maturity_bought(self):
+        from src.tasks.property_radar_maturity_pull import _load_seen_ids
+        session = _SeenSession()
+        assert _load_seen_ids(session, "FL", "stalled_flip") == frozenset({"R1", "R2"})
+        assert set(session.params["cs"]) == {"stalled_flip", "private_maturity"}
+
+    def test_private_maturity_also_skips_stalled_flip(self):
+        from src.tasks.property_radar_maturity_pull import _load_seen_ids
+        session = _SeenSession()
+        _load_seen_ids(session, "FL", "private_maturity")
+        assert set(session.params["cs"]) == {"private_maturity", "stalled_flip"}
+
+    def test_unrelated_campaign_reads_only_its_own(self):
+        from src.tasks.property_radar_maturity_pull import _load_seen_ids
+        session = _SeenSession()
+        _load_seen_ids(session, "GA", "auction_winner")
+        assert list(session.params["cs"]) == ["auction_winner"]

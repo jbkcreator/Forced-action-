@@ -151,6 +151,7 @@ class TestRunSelection:
         monkeypatch.setattr(bridge, "latest_run_id", lambda session: latest)
         monkeypatch.setattr(bridge, "_iter_record_pages", lambda session, state: iter([[record]]))
         monkeypatch.setattr(bridge, "_load_trace_contacts", lambda session, keys: {})
+        monkeypatch.setattr(bridge, "_phones_in_other_pools", lambda session, run_id: set())
         monkeypatch.setattr(bridge, "_clear_previous_rows",
                             lambda session, run_id, state: calls["cleared"].append(run_id))
         monkeypatch.setattr(bridge, "_write_rows",
