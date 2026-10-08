@@ -5,17 +5,20 @@ suppressed in every lending store and removed from the dialer, the same as a dia
 "do not call". Auth: ``X-Webhook-Secret`` must equal LENDING_GHL_WEBHOOK_SECRET; the
 endpoint is closed while the secret is unset.
 
-Endpoints: POST /webhooks/lending/ghl-opt-out, POST /webhooks/lending/ghl-text-consent
+Endpoints: POST /webhooks/lending/ghl-opt-out, POST /webhooks/lending/ghl-text-consent, POST /webhooks/lending/ghl-stage (scoreboard "showed")
 """
 from __future__ import annotations
 
 import hmac
+import json
 import logging
 import re
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy.orm import Session
+
+from sqlalchemy import text
 
 from config.lending_compliance import OptOutChannel
 from config.lending_text_back import SOFT_DECLINE_PHRASES, STOP_KEYWORDS, STOP_TOKENS
@@ -142,3 +145,31 @@ def ghl_text_consent(
         logger.error("[lending-ghl] consent webhook failed: %s", type(exc).__name__)
         raise HTTPException(status_code=500, detail="Consent could not be recorded") from exc
     return {"recorded": True, "revoked": False}
+
+
+@router.post("/ghl-stage")
+def ghl_stage(
+    body: dict[str, Any],
+    x_webhook_secret: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """A GHL workflow ("Pipeline Stage Changed" -> Webhook) reports an opportunity entering a stage.
+    Body: opportunity_id, stage_name, optional pipeline_id, phone, booked_by."""
+    _verify_secret(x_webhook_secret)
+    opportunity_id, stage = _field(body, "opportunity_id") or _field(body, "id"), _field(body, "stage_name")
+    if not opportunity_id or not stage:
+        raise HTTPException(status_code=422, detail="opportunity_id and stage_name are required")
+    try:
+        inserted = db.execute(
+            text("INSERT INTO lending.ghl_stage_events (ghl_opportunity_id, pipeline_id, stage_name, stage_key, phone, "
+                 "booked_by, raw_event) VALUES (:opp, :pipe, :stage, :key, :phone, :by, CAST(:raw AS jsonb)) "
+                 "ON CONFLICT (ghl_opportunity_id, stage_key) DO NOTHING"),
+            {"opp": opportunity_id, "pipe": _field(body, "pipeline_id"), "stage": stage, "key": stage.strip().lower(),
+             "phone": normalize(_field(body, "phone")), "by": _field(body, "booked_by"), "raw": json.dumps(body)},
+        ).rowcount
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.error("[lending-ghl] stage webhook failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=500, detail="Stage event could not be recorded") from exc
+    return {"recorded": bool(inserted)}
