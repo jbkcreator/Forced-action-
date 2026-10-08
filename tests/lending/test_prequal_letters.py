@@ -137,3 +137,44 @@ def test_gives_up_after_window_and_flags_once(prequal_db, caplog):
     with caplog.at_level("WARNING"):
         send_pending(prequal_db, FakeSink(), fits, enabled=True, pct=10, now=NOW)
     assert not any("giving up" in r.message for r in caplog.records)
+
+
+def _mark_failing_on_sent(only_id=None):
+    real_mark = prequal_letters._mark
+
+    def failing_mark(db, letter_id, status, now, **kw):
+        if status == "sent" and (only_id is None or letter_id == only_id):
+            raise RuntimeError("db down")
+        return real_mark(db, letter_id, status, now, **kw)
+
+    return real_mark, failing_mark
+
+
+def test_outcome_not_saved_is_flagged_uncertain_and_never_resent(prequal_db, monkeypatch):
+    """Review repro: the email goes out, then saving 'sent' fails. It must not be sent again."""
+    lid = _q(prequal_db)
+    sink = FakeSink()
+    real_mark, failing_mark = _mark_failing_on_sent()
+    monkeypatch.setattr(prequal_letters, "_mark", failing_mark)
+    assert send_pending(prequal_db, sink, fits, enabled=True, pct=10, letter_id=lid, now=NOW) == 0
+    assert len(sink.calls) == 1
+    assert _row(prequal_db, lid)["status"] == "sending"
+    monkeypatch.setattr(prequal_letters, "_mark", real_mark)
+    assert send_pending(prequal_db, sink, fits, enabled=True, pct=10, now=NOW + timedelta(minutes=5)) == 0
+    assert send_pending(prequal_db, sink, fits, enabled=True, pct=10, now=NOW + timedelta(minutes=31)) == 0
+    assert len(sink.calls) == 1
+    row = _row(prequal_db, lid)
+    assert row["status"] == "uncertain" and row["last_error"].startswith("send outcome unknown")
+
+
+def test_one_failed_save_does_not_resend_the_rest_of_the_batch(prequal_db, monkeypatch):
+    a, b = _q(prequal_db, ref="lf-a"), _q(prequal_db, ref="lf-b")
+    sink = FakeSink()
+    real_mark, failing_mark = _mark_failing_on_sent(only_id=b)
+    monkeypatch.setattr(prequal_letters, "_mark", failing_mark)
+    assert send_pending(prequal_db, sink, fits, enabled=True, pct=10, now=NOW) == 1
+    monkeypatch.setattr(prequal_letters, "_mark", real_mark)
+    assert send_pending(prequal_db, sink, fits, enabled=True, pct=10, now=NOW + timedelta(hours=1)) == 0
+    assert sorted(c[0] for c in sink.calls) == sorted([a, b])
+    assert _row(prequal_db, a)["status"] == "sent"
+    assert _row(prequal_db, b)["status"] == "uncertain"

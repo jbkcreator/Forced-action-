@@ -383,7 +383,8 @@ class LendingPrequalLetter(LendingBase):
 
     The unique (lead_source, lead_ref) key is the once-per-lead guard: a retried or re-delivered
     lead never queues a second letter. The four core fields are kept so a retry can re-render.
-    ``status``: pending -> sent / skipped (incomplete or no fitting lender) / failed (retried).
+    ``status``: pending -> sending (claimed) -> sent / skipped (no fitting lender) / failed (retried);
+    a ``sending`` row whose outcome was never saved becomes ``uncertain`` (checked by hand, never resent).
     """
 
     __tablename__ = "prequal_letters"
@@ -405,7 +406,8 @@ class LendingPrequalLetter(LendingBase):
     sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (
-        CheckConstraint("status IN ('pending', 'sent', 'skipped', 'failed')", name="ck_lending_prequal_letters_status"),
+        CheckConstraint("status IN ('pending', 'sending', 'sent', 'skipped', 'failed', 'uncertain')",
+                        name="ck_lending_prequal_letters_status"),
         Index("uq_lending_prequal_letters_lead", "lead_source", "lead_ref", unique=True),
         Index("idx_lending_prequal_letters_delivery", "status", "created_at"),
     )

@@ -1,7 +1,8 @@
 """T-07 Minute-5 pre-qualification letter: queue once per lead, then render and send.
 
 Order matters: the letter row is committed before anything is rendered or sent, so a GHL outage
-never loses it and a repeat of the same lead never sends twice (unique lead_source + lead_ref).
+never loses it and a repeat of the same lead never queues twice (unique lead_source + lead_ref).
+A letter whose send outcome could not be saved is flagged ``uncertain`` and never resent automatically.
 Sending is one function used by both the lead's background task and the retry sweep.
 Logs carry the letter id only, never names, amounts or credit bands.
 """
@@ -13,7 +14,7 @@ from typing import Any, Optional
 
 from sqlalchemy import text
 
-from config.lending_prequal import GIVE_UP_AFTER_HOURS, RETRY_BACKOFF_MINUTES, SWEEP_BATCH_SIZE
+from config.lending_prequal import GIVE_UP_AFTER_HOURS, RETRY_BACKOFF_MINUTES, SENDING_STALE_MINUTES, SWEEP_BATCH_SIZE
 from src.lending.pdf.render import NON_BINDING_PREQUAL_WATERMARK, render_pdf
 from src.lending.prequal import TEMPLATE, PrequalLead, PrequalSink, build_context, should_generate
 from src.lending.prequal_fit import FitEvaluator
@@ -45,10 +46,11 @@ def _backoff_minutes_sql() -> str:
     return f"CASE attempts WHEN 0 THEN 0 {whens} ELSE {int(steps[-1])} END"
 
 
-_SENDABLE = (
-    "SELECT id, ghl_contact_id, credit_band, loan_amount, property_state, loan_type, attempts "
-    "FROM lending.prequal_letters WHERE status IN ('pending', 'failed') AND created_at > :oldest {extra} "
-    "ORDER BY created_at LIMIT :limit FOR UPDATE SKIP LOCKED"
+_CLAIM = (
+    "UPDATE lending.prequal_letters SET status = 'sending', last_attempt_at = :now WHERE id IN ("
+    "SELECT id FROM lending.prequal_letters WHERE status IN ('pending', 'failed') AND created_at > :oldest {extra} "
+    "ORDER BY created_at LIMIT :limit FOR UPDATE SKIP LOCKED) "
+    "RETURNING id, ghl_contact_id, credit_band, loan_amount, property_state, loan_type, attempts"
 )
 
 
@@ -57,25 +59,39 @@ def send_pending(db, sink: Optional[PrequalSink], evaluator: Optional[FitEvaluat
                  now: Optional[datetime] = None) -> int:
     """Send queued letters; returns how many went out. One letter (``letter_id``, right after the
     lead arrives) or the retry backlog. With the flag off, no sink or no fit evaluator nothing is
-    attempted and rows stay pending. Never raises per letter."""
+    attempted and rows stay pending. Never raises per letter. Commits as it goes: rows are claimed
+    (``sending``) and committed first, then each letter's outcome is committed on its own, so a crash
+    or failed commit mid-batch never re-sends letters that already went out."""
     now = now or datetime.now(timezone.utc)
     if not enabled:
         return 0
     if letter_id is None:
         _expire_stale(db, now)
+        _flag_uncertain(db, now)
+        db.commit()
     if sink is None or evaluator is None:
         logger.warning("[prequal] not sending: %s not configured", "GHL" if sink is None else "lender fit engine")
         return 0
-    params: dict[str, Any] = {"limit": SWEEP_BATCH_SIZE, "oldest": now - timedelta(hours=GIVE_UP_AFTER_HOURS)}
+    params: dict[str, Any] = {"limit": SWEEP_BATCH_SIZE, "now": now,
+                              "oldest": now - timedelta(hours=GIVE_UP_AFTER_HOURS)}
     if letter_id is not None:
         extra = "AND id = :letter_id"
         params["letter_id"] = letter_id
     else:
         extra = (f"AND (last_attempt_at IS NULL OR "
                  f"last_attempt_at < CAST(:now AS timestamptz) - make_interval(mins => {_backoff_minutes_sql()}))")
-        params["now"] = now
-    rows = db.execute(text(_SENDABLE.format(extra=extra)), params).mappings().all()
-    return sum(_send_one(db, sink, evaluator, dict(row), pct, now) for row in rows)
+    rows = [dict(r) for r in db.execute(text(_CLAIM.format(extra=extra)), params).mappings().all()]
+    db.commit()  # claimed: another sweep or background task can no longer pick these up
+    sent = 0
+    for row in rows:
+        try:
+            sent += _send_one(db, sink, evaluator, row, pct, now)
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            logger.error("[prequal] letter id=%s outcome not recorded (%s): left as sending, "
+                         "will be flagged uncertain, not resent", row["id"], type(exc).__name__)
+    return sent
 
 
 _EXPIRED_ERROR = f"gave up: not sent within {GIVE_UP_AFTER_HOURS}h"
@@ -97,6 +113,23 @@ def _expire_stale(db, now: datetime) -> int:
     return len(rows)
 
 
+_UNCERTAIN_ERROR = "send outcome unknown: check GHL before resending"
+
+
+def _flag_uncertain(db, now: datetime) -> int:
+    """Letters stuck in ``sending`` (process died, or the outcome could not be saved) may already have
+    been emailed. Move them to ``uncertain`` for a manual check instead of risking a duplicate."""
+    rows = db.execute(
+        text("UPDATE lending.prequal_letters SET status = 'uncertain', last_error = :err "
+             "WHERE status = 'sending' AND last_attempt_at < :cutoff RETURNING id"),
+        {"err": _UNCERTAIN_ERROR, "cutoff": now - timedelta(minutes=SENDING_STALE_MINUTES)},
+    ).all()
+    if rows:
+        logger.warning("[prequal] %d letter(s) with unknown send outcome, not retried: ids=%s",
+                       len(rows), [r[0] for r in rows][:20])
+    return len(rows)
+
+
 def _send_one(db, sink: PrequalSink, evaluator: FitEvaluator, row: dict[str, Any], pct: int, now: datetime) -> int:
     lead = PrequalLead(credit_band=row["credit_band"], loan_amount=int(row["loan_amount"]),
                        property_state=row["property_state"], loan_type=row["loan_type"])
@@ -107,8 +140,6 @@ def _send_one(db, sink: PrequalSink, evaluator: FitEvaluator, row: dict[str, Any
             logger.info("[prequal] letter id=%s skipped: no fitting lender", row["id"])
             return 0
         pdf = render_pdf(TEMPLATE, ctx, watermark=NON_BINDING_PREQUAL_WATERMARK)
-        # The email goes out before the row is marked sent. If that commit then fails, the sweep
-        # sends again: a rare duplicate email is preferred over a letter silently never sent.
         sink.deliver(row["id"], row["ghl_contact_id"], pdf)
     except DeliveryError as exc:
         _record_failure(db, row, str(exc)[:200], now, config_error=exc.config_error)
