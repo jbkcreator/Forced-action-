@@ -171,7 +171,32 @@ class TestGetSlots:
         assert taken.start not in starts
 
 
-def _book(calendar, session, *, slot=None, attendee=ATTENDEE):
+def _bypass_gate():
+    """Patch out WP-GL-5 gate + cap checks for tests that don't test gate logic.
+
+    Tests that existed before WP-GL-5 call book() without a gate_id. The
+    gate is now a hard requirement, but these tests are verifying other
+    invariants (slot-conflict resolution, idempotency, suppression, etc.)
+    against the real DB schema. Bypassing here keeps them green and focused.
+    """
+    _fake_gate_row = {"gate_id": "test_gate", "list_key": None, "result": "pass"}
+    from contextlib import ExitStack
+    from unittest.mock import patch as _patch
+
+    stack = ExitStack()
+    stack.enter_context(
+        _patch(
+            "src.services.calendar.gate.get_passed_gate_by_id",
+            return_value=_fake_gate_row,
+        )
+    )
+    stack.enter_context(
+        _patch("src.services.calendar.gate.enforce_daily_cap", return_value=True)
+    )
+    return stack
+
+
+def _book(calendar, session, *, slot=None, attendee=ATTENDEE, gate_id="test_gate"):
     return book(
         client=calendar,
         session=session,
@@ -179,10 +204,16 @@ def _book(calendar, session, *, slot=None, attendee=ATTENDEE):
         slot=slot or _slot(11),
         attendee_email=attendee,
         topic="Intro call",
+        gate_id=gate_id,
     )
 
 
 class TestBook:
+    @pytest.fixture(autouse=True)
+    def _gate_bypassed(self):
+        with _bypass_gate():
+            yield
+
     def test_books_an_open_slot(self, bookings_db):
         calendar = FakeCalendar()
         with _allow_all():
@@ -261,6 +292,11 @@ class TestBook:
 
 
 class TestReschedule:
+    @pytest.fixture(autouse=True)
+    def _gate_bypassed(self):
+        with _bypass_gate():
+            yield
+
     def _booked(self, calendar, session):
         with _allow_all():
             return _book(calendar, session, slot=_slot(11))
@@ -403,10 +439,11 @@ class TestAvailabilityCaching:
         calendar, _ = self._counting_calendar()
         session = _RecordingSession()
 
-        with patch("src.services.calendar.booking._cached_busy") as cached, _allow_all():
+        with patch("src.services.calendar.booking._cached_busy") as cached, _allow_all(), _bypass_gate():
             book(
                 client=calendar, session=session, calendar_id=cache_id, slot=_slot(11),
                 attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate",
             )
 
         cached.assert_not_called()
@@ -419,6 +456,11 @@ class TestIntegrityAgainstPostgres:
     it. These run against the real schema so a missing index fails here
     rather than in front of two borrowers.
     """
+
+    @pytest.fixture(autouse=True)
+    def _gate_bypassed(self):
+        with _bypass_gate():
+            yield
 
     def test_the_slot_index_rejects_a_second_live_booking(self, bookings_db):
         from sqlalchemy.exc import IntegrityError
@@ -491,6 +533,7 @@ class TestIntegrityAgainstPostgres:
                 client=FakeCalendar(), session=bookings_db, calendar_id=CALENDAR_ID,
                 slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
                 tracked_link_id=link_id,
+                gate_id="test_gate",
             )
         assert booked.booked
         assert has_live_booking(bookings_db, tracked_link_id=link_id)
@@ -558,6 +601,11 @@ class TestWrittenSqlWithoutDatabase:
     migrations/apply_fa_max_bookings.py has been run.
     """
 
+    @pytest.fixture(autouse=True)
+    def _gate_bypassed(self):
+        with _bypass_gate():
+            yield
+
     def test_book_claims_the_slot_then_confirms_it(self):
         session = _RecordingSession()
         slot = _slot(11)
@@ -567,6 +615,7 @@ class TestWrittenSqlWithoutDatabase:
                 slot=slot, attendee_email=ATTENDEE, topic="Intro call",
                 person_id="11111111-1111-1111-1111-111111111111",
                 tracked_link_id=99,
+                gate_id="test_gate",
             )
 
         inserts = session.statements_containing("INSERT INTO fa_max_bookings")
@@ -600,6 +649,7 @@ class TestWrittenSqlWithoutDatabase:
             book(
                 client=_WatchingCalendar(), session=session, calendar_id=CALENDAR_ID,
                 slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate",
             )
 
         assert commits_at_create == [1], "the claim was not durable before the event"
@@ -612,6 +662,7 @@ class TestWrittenSqlWithoutDatabase:
                 book(
                     client=FakeCalendar(), session=session, calendar_id=CALENDAR_ID,
                     slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                    gate_id="test_gate",
                 )
             keys.append(
                 session.statements_containing("INSERT INTO fa_max_bookings")[0][1][
@@ -627,6 +678,7 @@ class TestWrittenSqlWithoutDatabase:
                 book(
                     client=FakeCalendar(), session=session, calendar_id=CALENDAR_ID,
                     slot=slot, attendee_email=attendee, topic="Intro call",
+                    gate_id="test_gate",
                 )
             return session.statements_containing("INSERT INTO fa_max_bookings")[0][1][
                 "idempotency_key"
@@ -646,6 +698,7 @@ class TestWrittenSqlWithoutDatabase:
             result = book(
                 client=calendar, session=session, calendar_id=CALENDAR_ID,
                 slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate",
             )
 
         assert result.booked
@@ -663,6 +716,7 @@ class TestWrittenSqlWithoutDatabase:
             result = book(
                 client=calendar, session=session, calendar_id=CALENDAR_ID,
                 slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate",
             )
 
         assert not result.booked, "a pending claim may have no meeting behind it"
@@ -679,6 +733,7 @@ class TestWrittenSqlWithoutDatabase:
             result = book(
                 client=calendar, session=session, calendar_id=CALENDAR_ID,
                 slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate",
             )
 
         assert result.booked
@@ -692,6 +747,7 @@ class TestWrittenSqlWithoutDatabase:
             book(
                 client=calendar, session=session, calendar_id=CALENDAR_ID,
                 slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate",
             )
 
         released = session.statements_containing("SET status = 'cancelled'")
@@ -706,6 +762,7 @@ class TestWrittenSqlWithoutDatabase:
             book(
                 client=FakeCalendar(), session=session, calendar_id=CALENDAR_ID,
                 slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate",
             )
         assert session.calls == []
 
@@ -717,6 +774,7 @@ class TestWrittenSqlWithoutDatabase:
             book(
                 client=calendar, session=session, calendar_id=CALENDAR_ID, slot=slot,
                 attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate",
             )
         # The idempotency lookup still runs; nothing is written.
         assert session.statements_containing("INSERT INTO fa_max_bookings") == []
@@ -757,6 +815,11 @@ class TestWrittenSqlWithoutDatabase:
 
 class TestPr296ReviewFixes:
     """Regressions for the PR #296 review: overlap, naive times, expired claims."""
+
+    @pytest.fixture(autouse=True)
+    def _gate_bypassed(self):
+        with _bypass_gate():
+            yield
 
     def test_overlapping_slot_with_a_different_start_is_refused(self, bookings_db):
         with _allow_all():
@@ -805,6 +868,7 @@ class TestPr296ReviewFixes:
             result = book(
                 client=calendar, session=session, calendar_id=CALENDAR_ID,
                 slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate",
             )
 
         assert not result.booked
@@ -812,3 +876,284 @@ class TestPr296ReviewFixes:
         assert calendar.get_busy(
             calendar_id=CALENDAR_ID, start=_slot(11).start, end=_slot(11).end
         ) == [], "the orphaned meeting must be taken back"
+
+
+class _NestableRecordingSession(_RecordingSession):
+    """_RecordingSession plus a no-op begin_nested() context manager, for
+    exercising the booking-confirmed notification's savepoint usage."""
+
+    class _Nested:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def begin_nested(self):
+        return self._Nested()
+
+
+class TestBookingConfirmedNotification:
+    """WP-GL-10 depends on book() posting this payload (CLAUDE.md: '#323
+    emits no booking event... the GL-5 owner must send the payload'). These
+    exercise _notify_booking_confirmed directly so the payload shape and the
+    fail-closed fallback are provable without src.lending existing yet."""
+
+    @pytest.fixture(autouse=True)
+    def _gate_bypassed(self):
+        with _bypass_gate():
+            yield
+
+    def test_missing_lending_module_does_not_fail_the_booking(self, caplog):
+        """src.lending.booking_messages does not exist on this branch yet —
+        confirms the ImportError path logs and never raises."""
+        session = _NestableRecordingSession()
+        with _allow_all():
+            result = book(
+                client=FakeCalendar(), session=session, calendar_id=CALENDAR_ID,
+                slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate",
+            )
+
+        assert result.booked is True
+        assert "not available yet" in caplog.text
+
+    def test_payload_carries_gate_answers_property_address_and_booked_by(self):
+        """property_address comes from the gate row's stored answers, and
+        booked_by from the gate's captured_by — book() itself knows neither."""
+        import json
+        import sys
+        import types
+        from unittest.mock import MagicMock
+
+        fake_module = types.ModuleType("src.lending.booking_messages")
+        captured_payload = {}
+
+        def _fake_handle_booking_confirmed(db, payload):
+            captured_payload.update(payload)
+
+        fake_module.handle_booking_confirmed = _fake_handle_booking_confirmed
+
+        gate_row = {
+            "gate_id": "test_gate",
+            "list_key": None,
+            "result": "pass",
+            "captured_by": "caller_jane",
+            "answers": json.dumps({"property_address": "123 Main St, Tampa FL"}),
+        }
+
+        session = _NestableRecordingSession()
+        slot = _slot(11)
+        with (
+            _allow_all(),
+            patch("src.services.calendar.gate.get_passed_gate_by_id", return_value=gate_row),
+            patch.dict(sys.modules, {"src.lending.booking_messages": fake_module}),
+        ):
+            result = book(
+                client=FakeCalendar(), session=session, calendar_id=CALENDAR_ID,
+                slot=slot, attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate", phone="+18135551234", first_name="Maria",
+                text_consent=True,
+            )
+
+        assert result.booked is True
+        assert captured_payload["property_address"] == "123 Main St, Tampa FL"
+        assert captured_payload["booked_by"] == "caller_jane"
+        assert captured_payload["phone"] == "+18135551234"
+        assert captured_payload["first_name"] == "Maria"
+        assert captured_payload["text_consent"] is True
+        assert captured_payload["email"] == ATTENDEE
+        assert captured_payload["slot_start_utc"] == slot.start
+        assert captured_payload["booking_ref"] == result.booking_ref
+
+    def test_notification_failure_does_not_undo_an_already_committed_booking(self):
+        """A booking is real and calendared before this notification ever
+        runs — a failure here must never be reported as a failed booking."""
+        import sys
+        import types
+
+        fake_module = types.ModuleType("src.lending.booking_messages")
+
+        def _raising_handle_booking_confirmed(db, payload):
+            raise RuntimeError("lending DB unreachable")
+
+        fake_module.handle_booking_confirmed = _raising_handle_booking_confirmed
+
+        session = _NestableRecordingSession()
+        with (
+            _allow_all(),
+            patch.dict(sys.modules, {"src.lending.booking_messages": fake_module}),
+        ):
+            result = book(
+                client=FakeCalendar(), session=session, calendar_id=CALENDAR_ID,
+                slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate",
+            )
+
+        assert result.booked is True, "a notification failure must not undo the booking"
+
+
+class TestBlockedCalendarDates:
+    """Josh's E1 answer: 'Block October 18, 19 and 20, I'm traveling.'
+    book() must refuse even if called directly with a slot on a blocked
+    date — get_slots() already excludes them, but book() is fail-closed on
+    its own re-check, same pattern as the daily cap and gate checks."""
+
+    @pytest.fixture(autouse=True)
+    def _gate_bypassed(self):
+        with _bypass_gate():
+            yield
+
+    def test_refuses_a_slot_on_a_blocked_date(self):
+        from datetime import date as _date
+
+        blocked_slot = Slot(
+            start=datetime(2026, 10, 19, 11, tzinfo=ET),
+            end=datetime(2026, 10, 19, 11, 30, tzinfo=ET),
+        )
+        session = _NestableRecordingSession()
+        with (
+            _allow_all(),
+            patch(
+                "src.services.calendar.booking.BLOCKED_CALENDAR_DATES",
+                frozenset({_date(2026, 10, 19)}),
+            ),
+        ):
+            result = book(
+                client=FakeCalendar(), session=session, calendar_id=CALENDAR_ID,
+                slot=blocked_slot, attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate",
+            )
+
+        assert result.booked is False
+        assert result.reason == "calendar_date_blocked"
+
+    def test_an_unaffected_date_still_books(self):
+        session = _NestableRecordingSession()
+        with (
+            _allow_all(),
+            patch(
+                "src.services.calendar.booking.BLOCKED_CALENDAR_DATES",
+                frozenset(),
+            ),
+        ):
+            result = book(
+                client=FakeCalendar(), session=session, calendar_id=CALENDAR_ID,
+                slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate",
+            )
+
+        assert result.booked is True
+
+
+class TestGhlPipelinePush:
+    """WP-GL-5: a successful booking also pushes the contact into the
+    Booked stage of Next Deal Lending's GHL pipeline (_push_booking_to_ghl).
+    Never undoes an already-committed, already-calendared booking."""
+
+    @pytest.fixture(autouse=True)
+    def _gate_bypassed(self):
+        with _bypass_gate():
+            yield
+
+    def test_successful_push_is_made_with_booking_details(self):
+        session = _NestableRecordingSession()
+        with (
+            _allow_all(),
+            patch(
+                "src.services.calendar.ghl_pipeline.push_booking_to_booked_stage",
+                return_value=True,
+            ) as mock_push,
+        ):
+            result = book(
+                client=FakeCalendar(), session=session, calendar_id=CALENDAR_ID,
+                slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate", phone="+18135551234", first_name="Maria",
+            )
+
+        assert result.booked is True
+        mock_push.assert_called_once()
+        assert mock_push.call_args.kwargs["phone"] == "+18135551234"
+        assert mock_push.call_args.kwargs["email"] == ATTENDEE
+        assert mock_push.call_args.kwargs["first_name"] == "Maria"
+        assert result.booking_ref in mock_push.call_args.kwargs["opportunity_name"]
+
+    def test_push_returning_false_does_not_fail_the_booking(self):
+        session = _NestableRecordingSession()
+        with (
+            _allow_all(),
+            patch(
+                "src.services.calendar.ghl_pipeline.push_booking_to_booked_stage",
+                return_value=False,
+            ),
+        ):
+            result = book(
+                client=FakeCalendar(), session=session, calendar_id=CALENDAR_ID,
+                slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate",
+            )
+
+        assert result.booked is True
+
+    def test_push_raising_does_not_fail_the_booking(self):
+        session = _NestableRecordingSession()
+        with (
+            _allow_all(),
+            patch(
+                "src.services.calendar.ghl_pipeline.push_booking_to_booked_stage",
+                side_effect=RuntimeError("GHL unreachable"),
+            ),
+        ):
+            result = book(
+                client=FakeCalendar(), session=session, calendar_id=CALENDAR_ID,
+                slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate",
+            )
+
+        assert result.booked is True, "a GHL push failure must not undo the booking"
+
+
+class TestBookingConfirmedAgainstRealLendingModule:
+    """Runs the real handle_booking_confirmed, not the stub, once #328 has
+    merged and src.lending.booking_messages actually exists on this branch.
+    Skips cleanly until then rather than failing on an absent dependency."""
+
+    @pytest.fixture(autouse=True)
+    def _gate_bypassed(self):
+        with _bypass_gate():
+            yield
+
+    def test_real_handle_booking_confirmed_schedules_messages(self, bookings_db):
+        pytest.importorskip(
+            "src.lending.booking_messages",
+            reason="src.lending.booking_messages lands with #328 — not on this branch yet",
+        )
+        from sqlalchemy import text as sa_text
+
+        has_table = bookings_db.execute(
+            sa_text("SELECT to_regclass('lending.booking_messages')")
+        ).scalar()
+        if has_table is None:
+            pytest.skip(
+                "lending.booking_messages absent — run "
+                "migrations/apply_lending_booking_messages.py"
+            )
+
+        with _allow_all():
+            result = book(
+                client=FakeCalendar(), session=bookings_db, calendar_id=CALENDAR_ID,
+                slot=_slot(11), attendee_email=ATTENDEE, topic="Intro call",
+                gate_id="test_gate", phone="+18135551234", first_name="Maria",
+                text_consent=True,
+            )
+
+        assert result.booked is True
+
+        rows = bookings_db.execute(
+            sa_text(
+                "SELECT kind FROM lending.booking_messages WHERE booking_ref = :ref"
+            ),
+            {"ref": result.booking_ref},
+        ).mappings().all()
+        kinds = {row["kind"] for row in rows}
+        assert kinds, "handle_booking_confirmed should have scheduled at least one message"

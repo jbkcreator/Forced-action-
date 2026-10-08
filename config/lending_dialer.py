@@ -4,9 +4,10 @@
 # exist in BatchDialer with these exact names; a live load refuses any unmapped pool.
 POOL_CAMPAIGN_TAGS: dict[str, str] = {
     "verified_maturity": "Verified maturity",
-    "transaction_ready": "Transaction ready",
+    "transaction_ready": "Transaction ready",  # List 2 (cash buyers) rides along here too (Oct 4 §2)
     "builders": "Builders",
-    "nurture": "Nurture",  # Lists 2/4: dialed for data, never bookable
+    "partners": "Partners",  # List 4: dialed as a real queue, partner script only, never bookable
+    "nurture": "Nurture",    # fallback for any future list with no rank of its own
 }
 
 # Hook line per campaign, shown on the caller's card. Seeded from the client's voicemail
@@ -15,6 +16,7 @@ CAMPAIGN_HOOKS: dict[str, str] = {
     "Verified maturity": "It looks like the loan on it is coming up; we help investors get ahead of that.",
     "Transaction ready": "Saw you picked up the property; we can help fund your next deal.",
     "Builders": "Saw your project; we fund builders and investors in your county.",
+    "Partners": "You move deals, we fund buyers; let's connect our pipelines.",
 }
 
 
@@ -39,6 +41,8 @@ BATCHDIALER_ENDPOINTS: dict[str, "tuple[str, str] | None"] = {
     "dnc_add": None,
     # Opt-outs delete the contact (no DNC endpoint in the public API). Confirmed live 2026-09-30.
     "contact_delete": ("DELETE", "/contact/{id}"),
+    # Public API docs, "Get Transcription (JSON)": timed {time, role, text} segments per call.
+    "call_transcription": ("GET", "/cdrs/{id}/transcription"),
 }
 # Path discovery (read-only, 2026-09-30): GET-405 (exists, other method) on /contact,
 # /dnclist, /campaigns/search; GET-200 on /cdrs (call records, paged) and /lists.

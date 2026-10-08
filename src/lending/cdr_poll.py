@@ -57,7 +57,9 @@ def iter_day(http: Http, day: date, *, max_pages: int = 200) -> Iterator[dict]:
     cursor: Optional[str] = None
     seen_cursors: set[str] = set()
     for _ in range(max_pages):
-        body = http("GET", _path("/v2/cdrs", callDate=f"{day.isoformat()}T00:00:00Z", pagelength=100, next_page=cursor))
+        # Plain date only: BatchDialer answers callDate=YYYY-MM-DD, but returns an empty list for a
+        # timestamp such as YYYY-MM-DDT00:00:00Z (checked live 2026-10-06).
+        body = http("GET", _path("/v2/cdrs", callDate=day.isoformat(), pagelength=100, next_page=cursor))
         if not isinstance(body, dict):
             logger.warning("[lending] CDR day scan for %s ended early: non-dict response", day)
             return

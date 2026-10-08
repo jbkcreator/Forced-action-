@@ -5,8 +5,8 @@ Every dialer call becomes one row in `lending.call_dispositions`; unanswered cal
 within 30 seconds. This runbook is vendor-neutral; the BatchDialer-specific steps are marked.
 
 Call results are ingested by **polling BatchDialer call records (CDRs)** with the service
-`python -m src.lending.cdr_poller` (`deploy/systemd/fa-lending-cdr-poller.service`). The webhook route
-`/webhooks/lending/dialer` still exists but is **not used** unless BatchDialer's payload carries the CDR id.
+`python -m src.lending.cdr_poller` (`deploy/systemd/fa-lending-cdr-poller.service`). BatchDialer has no
+webhooks, so there is no dialer webhook route.
 
 **Unverified until the live check in `docs/lending/batchdialer-api-findings.md` (Task 0, not yet done)
 is filled in:** the CDR field strings (for example `"ANSWER"`), whether an unanswered call appears as a
@@ -27,7 +27,7 @@ CDR, and how a contact is held. Confirm them before go-live.
    - `BATCHDIALER_API_KEY` (the API token: **User icon → Settings → Integrations → Custom Integration**; shared with the dialer load; `.env` only, never in chat or PRs)
 3. Start `fa-lending-cdr-poller` (`deploy/systemd/fa-lending-cdr-poller.service`). Run **exactly one
    instance**: the `/v2/cdrs/last` watermark is per API key, so a second poller (or anything else using
-   that endpoint with the same key) steals records. `lending-api` and its Nginx block are not needed for ingestion.
+   that endpoint with the same key) steals records.
    Poller behavior to know:
    - Inbound calls get no call row, except calls disposed `DNC_REQUEST` (those are opted out; no attempt is counted). An answered inbound call (duration > 0) records `inbound_call` text consent, so the inbound/callback queue's campaign id must be in `LENDING_DIALER_CAMPAIGN_IDS`.
    - The day rescan re-reads today and yesterday (UTC) every few minutes. After an outage longer than that,

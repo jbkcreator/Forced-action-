@@ -1,5 +1,5 @@
 [Unit]
-Description=Lending API (lending-api) — dialer disposition webhook
+Description=Lending API (lending-api) — lending webhooks
 After=network.target
 
 [Service]

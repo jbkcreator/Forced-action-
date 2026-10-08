@@ -1,8 +1,8 @@
 """Opt-out sync into GoHighLevel: mark the contact do-not-disturb on every channel.
 
-Uses the same GHL account the texts are sent from (see ghl_sms.lending_ghl_account). Upsert by phone:
-an existing contact is updated, and a number GHL has never seen gets a DND-only
-contact, so a later form or import with that phone stays blocked.
+Uses the Next Deal Lending sub-account only (LENDING_GHL_API_KEY / LENDING_GHL_LOCATION_ID, see
+ghl_account). Upsert by phone: an existing contact is updated, and a number GHL has never seen
+gets a DND-only contact, so a later form or import with that phone stays blocked.
 """
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import logging
 from typing import Callable, Optional
 
 from config.lending_compliance import GHL_DND_CHANNELS, GHL_OPT_OUT_TAG
-from src.lending.ghl_sms import ghl_headers, lending_ghl_account
+from src.lending.ghl_account import ghl_headers, lending_ghl_account
 
 logger = logging.getLogger(__name__)
 
@@ -45,5 +45,6 @@ def set_ghl_dnd(phone: str) -> bool:
 
 
 def get_ghl_dnd() -> Optional[GhlDnd]:
-    """The GHL DND writer, or None when GHL is not configured (the sync then waits)."""
+    """The GHL DND writer, or None when the Next Deal Lending account is not configured
+    (the sync then waits)."""
     return set_ghl_dnd if lending_ghl_account() is not None else None

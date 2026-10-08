@@ -17,7 +17,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 TABLES = {"suppression_list", "contacts", "opt_out_events", "load_exclusions", "dnc_scrubs", "dialer_holds",
-          "dialer_load_records", "call_dispositions", "missed_call_events", "missed_call_texts", "text_consents"}
+          "dialer_load_records", "call_dispositions", "missed_call_events", "missed_call_texts", "text_consents", "web_leads",
+          "dialer_unconfirmed_creates"}
 
 
 @pytest.fixture

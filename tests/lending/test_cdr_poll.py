@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -65,6 +65,14 @@ def test_other_campaigns_and_inbound_calls_are_ignored(lending_db):
     http = FakeHttp(last=[_cdr(1, campaign={"id": 999}), _cdr(2, direction="in"), _cdr(3)])
     stats = cdr_poll.poll_new(lending_db, http)
     assert [r[0] for r in _rows(lending_db)] == ["3"] and stats.processed == 1
+
+
+def test_dnc_on_a_non_lending_campaign_is_not_stored_but_warned(lending_db, caplog):
+    http = FakeHttp(last=[_cdr(1, campaign={"id": 999}, disposition="DNC_REQUEST"), _cdr(2, campaign={"id": 999})])
+    with caplog.at_level("WARNING"):
+        stats = cdr_poll.poll_new(lending_db, http)
+    assert _rows(lending_db) == [] and stats.processed == 0
+    assert "DNC request on CDR 1 ignored" in caplog.text and "CDR 2" not in caplog.text
 
 
 def test_one_bad_cdr_does_not_stop_the_batch(lending_db, monkeypatch):
@@ -178,6 +186,13 @@ def test_phoneless_dnc_is_not_reselected_by_the_rescan(lending_db, monkeypatch):
     stats = cdr_poll.rescan_today(lending_db, FakeHttp(days={"2026-09-29": [[dnc]]}),
                                   now=datetime(2026, 9, 29, 17, 0, tzinfo=timezone.utc))
     assert stats.skipped == 1 and stats.processed == 0
+
+
+def test_day_scan_sends_a_plain_date_which_batchdialer_accepts():
+    """BatchDialer returns an empty list for callDate=YYYY-MM-DDT00:00:00Z; only the plain date works."""
+    http = FakeHttp(days={"2026-10-06": [[_cdr(1)]]})
+    assert len(list(cdr_poll.iter_day(http, date(2026, 10, 6)))) == 1
+    assert http.calls == ["/v2/cdrs?callDate=2026-10-06&pagelength=100"]
 
 
 def test_rescan_days_controls_how_many_days_are_requested(lending_db):
