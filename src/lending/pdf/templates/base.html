@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{% block title %}{% endblock %}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;750;850&display=swap" rel="stylesheet">
+<style>
+  /* Brand tokens mirror nextdeallending.com */
+  :root { --navy:#15283A; --navy-deep:#0F1F2E; --paper:#F2F4F3; --gold:#E8B130; --gold-deep:#C9951C;
+          --green:#2E6A5C; --green-tint:#DCE8E4; --mist:#C9D3DC; --ink-2:#3E4F5E; --line:#D3DBD8; --red:#B8472F; }
+  @page { size: Letter; margin: 0; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: "Archivo", "Helvetica Neue", Helvetica, Arial, sans-serif;
+         color: var(--navy); background: #fff; font-size: 11.5pt; line-height: 1.5; -webkit-print-color-adjust: exact; }
+  .header { background: var(--navy); color: var(--paper); padding: 22px 48px; display: flex; align-items: center; gap: 12px; }
+  .header .brand { font-size: 20pt; font-weight: 850; letter-spacing: -.01em; }
+  .header .tag { margin-left: auto; font-size: 9pt; color: var(--mist); letter-spacing: .08em; text-transform: uppercase; }
+  .accent { height: 5px; background: var(--gold); }
+  .content { padding: 36px 48px 150px; }
+  .footer { background: var(--navy); color: var(--mist); font-size: 9pt; padding: 12px 48px; display: flex; gap: 22px; }
+  .footer strong { color: var(--paper); }
+  /* position: fixed repeats on every printed page */
+  .watermark-band { position: fixed; bottom: 0; left: 0; right: 0; background: #fff; text-align: center;
+                    font-size: 8.5pt; font-weight: 750; letter-spacing: .04em; color: var(--red);
+                    border-top: 2px solid var(--red); padding: 8px 48px 10px; }
+  .watermark-diag { position: fixed; top: 45%; left: 0; right: 0; text-align: center; transform: rotate(-24deg);
+                    font-size: 21pt; font-weight: 850; color: rgba(184,71,47,.07); z-index: 0; pointer-events: none; }
+  .footer-wrap { position: fixed; bottom: 38px; left: 0; right: 0; }
+  .content { position: relative; z-index: 1; }
+</style>
+</head>
+<body>
+<div class="header">
+  <svg width="34" height="34" viewBox="0 0 34 34" fill="none" stroke="#E8B130" stroke-width="3" aria-hidden="true"><path d="M4 26 L14 16 L20 22 L30 8"/><path d="M22 8 L30 8 L30 16"/></svg>
+  <span class="brand">Next Deal Lending</span>
+  <span class="tag">Pre-Qualification Estimate</span>
+</div>
+<div class="accent"></div>
+<div class="watermark-diag">{{ watermark }}</div>
+<div class="content">
+{% block body %}{% endblock %}
+</div>
+<div class="footer-wrap">
+  <div class="footer">
+    <span><strong>Next Deal Lending</strong> &middot; Tampa, Florida</span>
+    <span>(727) 436-9951</span>
+    <span>hello@nextdeallending.com</span>
+  </div>
+</div>
+<div class="watermark-band">{{ watermark }}</div>
+</body>
+</html>
