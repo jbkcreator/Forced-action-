@@ -18,7 +18,7 @@ from src.core.database import get_db_context
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-POOLS = ("wholesaler_flipper", "active_builder", "mortgage_broker", "auction_winner", "permit_owner")
+POOLS = ("wholesaler_flipper", "active_builder", "mortgage_broker", "auction_winner", "permit_owner", "pr_maturity")
 
 
 def apply(session, table: str = "lending.calling_pool_staging") -> None:
