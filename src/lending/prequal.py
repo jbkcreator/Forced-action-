@@ -38,7 +38,23 @@ class FitLimits:
 
 
 class PrequalSink(Protocol):
-    def deliver(self, lead_id: int, pdf: bytes) -> None: ...
+    def deliver(self, lead_id: int, contact_id: str, pdf: bytes) -> None: ...
+
+
+class PdfStore(Protocol):
+    def save(self, lead_id: int, pdf: bytes) -> str:
+        """Store the PDF and return the secure URL the borrower opens."""
+
+
+class LinkDeliverySink:
+    """Stores the PDF, then publishes its link to the CRM contact."""
+
+    def __init__(self, store: PdfStore, publisher) -> None:
+        self._store = store
+        self._publisher = publisher
+
+    def deliver(self, lead_id: int, contact_id: str, pdf: bytes) -> None:
+        self._publisher.publish(contact_id, self._store.save(lead_id, pdf))
 
 
 def should_generate(lead: PrequalLead) -> bool:
@@ -78,7 +94,7 @@ def build_context(lead: PrequalLead, fits: Sequence[FitLimits], pct: int) -> Opt
     }
 
 
-def generate_and_deliver(lead_id: int, lead: PrequalLead, fits: Sequence[FitLimits],
+def generate_and_deliver(lead_id: int, contact_id: str, lead: PrequalLead, fits: Sequence[FitLimits],
                          sink: PrequalSink, *, enabled: bool, pct: int) -> bool:
     """Render the letter and hand it to the sink. Returns True if delivered. Never logs PII."""
     if not enabled:
@@ -88,6 +104,6 @@ def generate_and_deliver(lead_id: int, lead: PrequalLead, fits: Sequence[FitLimi
         logger.info("[prequal] lead_id=%s skipped (incomplete or no fitting lender)", lead_id)
         return False
     pdf = render_pdf(TEMPLATE, ctx, watermark=NON_BINDING_PREQUAL_WATERMARK)
-    sink.deliver(lead_id, pdf)
+    sink.deliver(lead_id, contact_id, pdf)
     logger.info("[prequal] lead_id=%s delivered", lead_id)
     return True

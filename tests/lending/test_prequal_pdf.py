@@ -54,18 +54,18 @@ class FakeSink:
     def __init__(self):
         self.calls = []
 
-    def deliver(self, lead_id, pdf):
-        self.calls.append((lead_id, pdf))
+    def deliver(self, lead_id, contact_id, pdf):
+        self.calls.append((lead_id, contact_id, pdf))
 
 
 def test_flag_off_no_delivery():
     sink = FakeSink()
-    assert prequal.generate_and_deliver(1, PrequalLead(**FULL), FITS, sink, enabled=False, pct=10) is False
+    assert prequal.generate_and_deliver(1, "c1", PrequalLead(**FULL), FITS, sink, enabled=False, pct=10) is False
     assert sink.calls == []
 
 
 def test_delivery_when_enabled(monkeypatch):
     monkeypatch.setattr(prequal, "render_pdf", lambda t, c, watermark: b"%PDF-fake")
     sink = FakeSink()
-    assert prequal.generate_and_deliver(7, PrequalLead(**FULL), FITS, sink, enabled=True, pct=10) is True
-    assert sink.calls == [(7, b"%PDF-fake")]
+    assert prequal.generate_and_deliver(7, "c7", PrequalLead(**FULL), FITS, sink, enabled=True, pct=10) is True
+    assert sink.calls == [(7, "c7", b"%PDF-fake")]
