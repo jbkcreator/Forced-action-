@@ -37,6 +37,11 @@ class FakeLenderFitEvaluator:
     When constructed with no arguments, returns a canned "one fitting lender"
     result so callers that don't care about the specific response don't need
     to build one themselves.
+
+    Do NOT assert on the default result's lender_fit_score (or any other
+    default value) in downstream tests.  The score is a placeholder: its scale
+    is still open (Q2) and will change when T-05 ships the real formula.
+    Tests that care about a specific value must pass their own LenderFitResult.
     """
 
     _DEFAULT_RESULT = LenderFitResult(

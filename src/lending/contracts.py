@@ -19,9 +19,11 @@ Compliance notes:
     (Josh, Oct 1 answers D2).  No numeric-score field exists here.
   - LenderFitResult is internal analysis only.  It never states a rate, term,
     or commitment to a borrower (SPEC §4.3 non-binding language, playbook rule).
-  - phone/email on LendingFlowLeadCreated have repr=False so a stray log line
-    cannot leak PII.  The producer (T-11) normalises phone via
-    src.services.phone_utils.normalize before constructing the event.
+  - phone/email on LendingFlowLeadCreated have repr=False so logging the event
+    object cannot leak PII.  Serialised output (model_dump / model_dump_json)
+    still includes them — see the class docstring.  The producer (T-11)
+    normalises phone via src.services.phone_utils.normalize before
+    constructing the event.
 """
 from __future__ import annotations
 
@@ -218,7 +220,11 @@ class LendingFlowLeadCreated(BaseModel):
       T-10 — 2-minute / 5-minute uncalled push alarms
       T-12 — background enrichment card + routing
 
-    phone/email: repr=False so the fields never appear in log output.
+    phone/email: repr=False only stops them appearing when the event object
+        itself is logged or printed.  It does NOT protect serialised output:
+        model_dump() and model_dump_json() still include both in plaintext.
+        Consumers must use model_dump(exclude={"phone", "email"}) (or log
+        lead_id only) for any log or audit line.
         The producer (T-11) must pass phone through phone_utils.normalize
         before constructing this event.
 
