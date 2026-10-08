@@ -231,16 +231,22 @@ def _pick_phone(phones: list, taken: set[str]) -> Optional[str]:
     return None
 
 
-def _phones_in_other_pools(session: Session, run_id: str) -> set[str]:
-    """Phones the other pools already staged in this run."""
+def _phones_in_other_pools(session: Session, run_id: str, state: Optional[str] = None) -> set[str]:
+    """Phones already staged in this run that this extract will not replace: every other
+    pool, plus (state-scoped run) this pool's rows for other states."""
+    clause = "pool_name <> :pool"
+    params: dict[str, Any] = {"run_id": run_id, "pool": POOL_NAME}
+    if state:
+        clause = "(pool_name <> :pool OR state <> :state)"
+        params["state"] = state.upper()
     rows = session.execute(
         text(
             "SELECT normalized_phone FROM lending.calling_pool_staging "
-            "WHERE run_id = CAST(:run_id AS uuid) AND pool_name <> :pool"
+            f"WHERE run_id = CAST(:run_id AS uuid) AND {clause}"
         ),
-        {"run_id": run_id, "pool": POOL_NAME},
+        params,
     ).scalars()
-    return {p for p in rows if p}
+    return {n for n in (normalize_phone(str(p)) for p in rows if p) if n}
 
 
 def _clear_previous_rows(session: Session, run_id: str, *, state: Optional[str]) -> None:
@@ -286,7 +292,7 @@ def extract_pr_maturity_pool(
     run_id = latest_run_id(session) or str(uuid.uuid4())
     if not dry_run:
         _clear_previous_rows(session, run_id, state=state)
-    taken = _phones_in_other_pools(session, run_id)
+    taken = _phones_in_other_pools(session, run_id, state)
     total = with_phone = ga = ga_dialable = written = 0
 
     for records in _iter_record_pages(session, state=state):
