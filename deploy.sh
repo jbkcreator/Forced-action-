@@ -30,6 +30,10 @@ CC_UNIT_DST="/etc/systemd/system/cora-command-center.service"
 # this service was never bounced.
 RELAY_UNIT_SRC="$PROJECT_DIR/deploy/systemd/fa-relay-slack-listener.service"
 RELAY_UNIT_DST="/etc/systemd/system/fa-relay-slack-listener.service"
+# Lending BatchDialer CDR poller (writes lending.call_dispositions, feeds the 7pm
+# scoreboard). Exactly one instance may run: the /v2/cdrs/last watermark is per API key.
+LENDING_CDR_UNIT_SRC="$PROJECT_DIR/deploy/systemd/fa-lending-cdr-poller.service"
+LENDING_CDR_UNIT_DST="/etc/systemd/system/fa-lending-cdr-poller.service"
 # Lending compliance workers: FA opt-out mirror (60 s STOP SLA) and the calling-window /
 # attempt-cap sweep. Best-effort on purpose — a lending unit that fails to install or
 # start warns but never aborts (and so never rolls back) a deploy of the FA platform.
@@ -109,6 +113,9 @@ rollback() {
     fi
     if systemctl list-unit-files fa-relay-slack-listener.service &>/dev/null; then
         systemctl restart fa-relay-slack-listener || echo "ROLLBACK WARNING: fa-relay-slack-listener restart failed" >&2
+    fi
+    if systemctl list-unit-files fa-lending-cdr-poller.service &>/dev/null; then
+        systemctl restart fa-lending-cdr-poller || echo "ROLLBACK WARNING: fa-lending-cdr-poller restart failed" >&2
     fi
     echo "== ROLLBACK COMPLETE — prod running $good_sha ==" >&2
     echo "NOTE: if $good_sha predates the cora->lifecycle DB rename, schema and code are now mismatched — this deploy cannot undo a completed DB rename. Manual DB recovery required." >&2
@@ -204,6 +211,15 @@ if ! cmp -s "$RELAY_UNIT_SRC" "$RELAY_UNIT_DST" 2>/dev/null; then
 fi
 systemctl enable fa-relay-slack-listener || fail "systemctl enable fa-relay-slack-listener"
 
+# Lending CDR poller — own unit file, see LENDING_CDR_UNIT_SRC comment above.
+if [ ! -f "$LENDING_CDR_UNIT_SRC" ]; then
+    fail "fa-lending-cdr-poller.service unit file not found at $LENDING_CDR_UNIT_SRC"
+fi
+if ! cmp -s "$LENDING_CDR_UNIT_SRC" "$LENDING_CDR_UNIT_DST" 2>/dev/null; then
+    cp "$LENDING_CDR_UNIT_SRC" "$LENDING_CDR_UNIT_DST" || fail "install fa-lending-cdr-poller.service"
+    systemctl daemon-reload || fail "systemctl daemon-reload (fa-lending-cdr-poller)"
+fi
+systemctl enable fa-lending-cdr-poller || fail "systemctl enable fa-lending-cdr-poller"
 # Lending compliance workers — see LENDING_UNITS comment above (warn, never fail).
 for unit in "${LENDING_UNITS[@]}"; do
     unit_src="$PROJECT_DIR/deploy/systemd/$unit.service"
@@ -251,6 +267,9 @@ systemctl is-active --quiet cora_throughput || fail "cora_throughput service not
 systemctl restart cora-command-center || fail "systemctl restart cora-command-center"
 sleep 2
 systemctl is-active --quiet cora-command-center || fail "cora-command-center service not active after restart"
+systemctl restart fa-lending-cdr-poller || fail "systemctl restart fa-lending-cdr-poller"
+sleep 2
+systemctl is-active --quiet fa-lending-cdr-poller || fail "fa-lending-cdr-poller service not active after restart"
 
 RESTART_TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
