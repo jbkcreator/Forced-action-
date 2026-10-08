@@ -913,8 +913,8 @@ class AppSettings(BaseSettings):
 	lending_prequal_pdf_enabled: bool = Field(default=False, env="LENDING_PREQUAL_PDF_ENABLED")
 	# Placeholder range: +/- this percent around the requested amount, clamped to fitting lenders' limits.
 	lending_prequal_range_pct: int = Field(default=10, env="LENDING_PREQUAL_RANGE_PCT")
-	# GHL contact custom field ("Prequal PDF Link") the pre-qual workflow's email reads. Unset = link not published.
-	lending_ghl_cf_prequal_pdf_link: Optional[str] = Field(default=None, env="LENDING_GHL_CF_PREQUAL_PDF_LINK")
+	# Sender of the pre-qual email. Set a verified Next Deal Lending mailbox before enabling; unset = GHL's shared address.
+	lending_prequal_email_from: Optional[str] = Field(default=None, env="LENDING_PREQUAL_EMAIL_FROM")
 	# Shared secret the GHL "DND changed" workflow sends in X-Webhook-Secret. Unset = endpoint closed.
 	lending_ghl_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_GHL_WEBHOOK_SECRET")
 	# lending_ghl_api_key / lending_ghl_location_id are defined once, above,

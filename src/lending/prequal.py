@@ -41,22 +41,6 @@ class PrequalSink(Protocol):
     def deliver(self, lead_id: int, contact_id: str, pdf: bytes) -> None: ...
 
 
-class PdfStore(Protocol):
-    def save(self, lead_id: int, pdf: bytes) -> str:
-        """Store the PDF and return the secure URL the borrower opens."""
-
-
-class LinkDeliverySink:
-    """Stores the PDF, then publishes its link to the CRM contact."""
-
-    def __init__(self, store: PdfStore, publisher) -> None:
-        self._store = store
-        self._publisher = publisher
-
-    def deliver(self, lead_id: int, contact_id: str, pdf: bytes) -> None:
-        self._publisher.publish(contact_id, self._store.save(lead_id, pdf))
-
-
 def should_generate(lead: PrequalLead) -> bool:
     """All 4 core fields present (spec 4.3). Zero is not a loan amount."""
     return bool(
