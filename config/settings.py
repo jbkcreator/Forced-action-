@@ -722,7 +722,11 @@ class AppSettings(BaseSettings):
 	# Named LENDING_* (not FA_MAX_*): this toggle exists for the Next Deal
 	# Lending booking flow specifically, same naming family as the
 	# LENDING_GHL_* credentials it switches between.
-	lending_calendar_mode: str = Field(default="fake", env="LENDING_CALENDAR_MODE")
+	# FA_MAX_CALENDAR_MODE is the pre-WP-GL-5 name; drop the fallback once prod .env is migrated.
+	lending_calendar_mode: str = Field(
+		default="fake",
+		validation_alias=AliasChoices("LENDING_CALENDAR_MODE", "FA_MAX_CALENDAR_MODE"),
+	)
 	fa_max_calendar_id: Optional[str] = Field(default=None, env="FA_MAX_CALENDAR_ID")
 	# Domain-wide delegation impersonates a named user; this is whose calendar
 	# bookings land on. Must be inside the Workspace the service account is
