@@ -3,10 +3,10 @@
 <head>
 <meta charset="utf-8">
 <title>{% block title %}{% endblock %}</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;750;850&display=swap" rel="stylesheet">
 <style>
+  /* Archivo (SIL OFL, fonts/OFL.txt) embedded so rendering needs no network */
+  @font-face { font-family: "Archivo"; font-style: normal; font-weight: 400 900;
+               src: url(data:font/woff2;base64,{{ archivo_woff2_b64 }}) format("woff2"); }
   /* Brand tokens mirror nextdeallending.com */
   :root { --navy:#15283A; --navy-deep:#0F1F2E; --paper:#F2F4F3; --gold:#E8B130; --gold-deep:#C9951C;
           --green:#2E6A5C; --green-tint:#DCE8E4; --mist:#C9D3DC; --ink-2:#3E4F5E; --line:#D3DBD8; --red:#B8472F; }

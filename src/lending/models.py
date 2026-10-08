@@ -376,3 +376,36 @@ class LendingWebLead(LendingBase):
         Index("idx_lending_web_leads_delivery", "ghl_status", "received_at"),
         Index("idx_lending_web_leads_phone", "phone", "received_at"),
     )
+
+
+class LendingPrequalLetter(LendingBase):
+    """One Minute-5 pre-qualification letter per lead (T-07), queued before any render or GHL call.
+
+    The unique (lead_source, lead_ref) key is the once-per-lead guard: a retried or re-delivered
+    lead never queues a second letter. The four core fields are kept so a retry can re-render.
+    ``status``: pending -> sent / skipped (incomplete or no fitting lender) / failed (retried).
+    """
+
+    __tablename__ = "prequal_letters"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    lead_source: Mapped[str] = mapped_column(String(30), nullable=False)  # e.g. lendingflow
+    lead_ref: Mapped[str] = mapped_column(String(64), nullable=False)  # the source's own lead id
+    ghl_contact_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    credit_band: Mapped[str] = mapped_column(String(40), nullable=False)
+    loan_amount: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    property_state: Mapped[str] = mapped_column(String(20), nullable=False)
+    loan_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending", server_default=text("'pending'"))
+    skip_reason: Mapped[Optional[str]] = mapped_column(String(60))
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    last_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[Optional[str]] = mapped_column(String(200))
+    sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint("status IN ('pending', 'sent', 'skipped', 'failed')", name="ck_lending_prequal_letters_status"),
+        Index("uq_lending_prequal_letters_lead", "lead_source", "lead_ref", unique=True),
+        Index("idx_lending_prequal_letters_delivery", "status", "created_at"),
+    )

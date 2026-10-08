@@ -76,3 +76,18 @@ def web_leads_db(lending_db):
 
     apply_web_leads(lending_db.get_bind())
     return lending_db
+
+
+@pytest.fixture(autouse=True)
+def _no_live_prequal_sink(monkeypatch):
+    """A test must never email a pre-qual letter through the real Next Deal Lending GHL account."""
+    monkeypatch.setattr("src.lending.prequal_ghl.get_live_sink", lambda: None)
+
+
+@pytest.fixture
+def prequal_db(lending_db):
+    """lending_db plus lending.prequal_letters (rolled back with the test)."""
+    from migrations.apply_lending_prequal_letters import apply_to as apply_prequal
+
+    apply_prequal(lending_db.get_bind())
+    return lending_db

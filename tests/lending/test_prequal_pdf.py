@@ -1,3 +1,5 @@
+import re
+
 import pytest
 
 from src.lending import prequal
@@ -45,7 +47,8 @@ def test_no_fitting_lender_no_pdf():
 
 def test_letter_has_no_rate_or_term_language():
     ctx = prequal.build_context(PrequalLead(**FULL), FITS, 10)
-    html = render_html(prequal.TEMPLATE, ctx, watermark=NON_BINDING_PREQUAL_WATERMARK).lower()
+    html = render_html(prequal.TEMPLATE, ctx, watermark=NON_BINDING_PREQUAL_WATERMARK)
+    html = re.sub(r"<style.*?</style>", "", html, flags=re.S).lower()  # embedded font data is not copy
     for word in ("interest rate", "apr", "points", "per annum", "months"):
         assert word not in html
 
@@ -69,3 +72,10 @@ def test_delivery_when_enabled(monkeypatch):
     sink = FakeSink()
     assert prequal.generate_and_deliver(7, "c7", PrequalLead(**FULL), FITS, sink, enabled=True, pct=10) is True
     assert sink.calls == [(7, "c7", b"%PDF-fake")]
+
+
+def test_rendered_html_needs_no_network():
+    ctx = prequal.build_context(PrequalLead(**FULL), FITS, 10)
+    html = render_html(prequal.TEMPLATE, ctx, watermark=NON_BINDING_PREQUAL_WATERMARK)
+    assert "http://" not in html and "https://" not in html
+    assert "data:font/woff2;base64," in html
