@@ -1157,3 +1157,25 @@ class TestBookingConfirmedAgainstRealLendingModule:
         ).mappings().all()
         kinds = {row["kind"] for row in rows}
         assert kinds, "handle_booking_confirmed should have scheduled at least one message"
+
+
+class TestCreateOutcomeUnknown:
+    def test_claim_is_kept_and_exceptions_paged(self):
+        from unittest.mock import MagicMock
+
+        from src.services.calendar import booking as booking_module
+        from src.services.calendar.client import CalendarOutcomeUnknown
+
+        client = MagicMock()
+        client.create_event.side_effect = CalendarOutcomeUnknown("lost answer")
+        with _allow_all(), _bypass_gate(), \
+             patch.object(booking_module, "_existing_booking", return_value=None), \
+             patch.object(booking_module, "_is_taken", return_value=False), \
+             patch.object(booking_module, "_claim_slot", return_value="ref1"), \
+             patch.object(booking_module, "_release_claim") as release, \
+             patch.object(booking_module, "_alert_create_outcome_unknown") as alert:
+            with pytest.raises(CalendarOutcomeUnknown):
+                booking_module.book(client=client, session=MagicMock(), calendar_id="cal", slot=_slot(10),
+                                    attendee_email=ATTENDEE, topic="Call", gate_id="test_gate")
+        release.assert_not_called()
+        alert.assert_called_once_with("ref1")
