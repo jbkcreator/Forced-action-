@@ -178,3 +178,15 @@ class TestEnqueueNurture:
             queue_id = nurture.enqueue_nurture(session, gate_id="g1")
         assert queue_id == -1
         assert session.rollbacks == 1
+
+
+class TestInsertFailure:
+    def test_failed_insert_still_pushes_and_alerts(self):
+        session = MagicMock()
+        session.execute.side_effect = RuntimeError("db down")
+        with patch.object(nurture, "_route_to_ghl_nurture", return_value=True) as push, \
+             patch.object(nurture, "_alert_exceptions") as alert:
+            assert nurture.enqueue_nurture(session, gate_id="g1", failed_field="homestead") == -1
+        push.assert_called_once()
+        alert.assert_called_once()
+        assert alert.call_args.kwargs["queue_id"] is None

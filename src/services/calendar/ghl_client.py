@@ -29,10 +29,10 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 import requests
-from requests.exceptions import ConnectionError, RequestException, Timeout
+from requests.exceptions import ConnectionError, ConnectTimeout, RequestException, Timeout
 
 from src.services.calendar.availability import BusyBlock
-from src.services.calendar.client import CalendarEvent, CalendarUnavailable
+from src.services.calendar.client import CalendarEvent, CalendarOutcomeUnknown, CalendarUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +85,7 @@ class GHLCalendarClient:
             "Content-Type": "application/json",
         }
 
-    def _request(self, method: str, path: str, **kwargs) -> requests.Response:
+    def _request(self, method: str, path: str, *, idempotent: bool = True, **kwargs) -> requests.Response:
         """Same retry-on-429 pattern as src/services/ghl_webhook.py::_ghl_request.
 
         Never hangs indefinitely and never silently swallows a failure — a
@@ -100,6 +100,11 @@ class GHLCalendarClient:
             try:
                 resp = requests.request(method, url, headers=self._headers(), **kwargs)
             except (ConnectionError, Timeout) as exc:
+                if not idempotent and not isinstance(exc, ConnectTimeout):
+                    logger.error("calendar.ghl: %s %s sent but no answer — not retrying", method, path)
+                    raise CalendarOutcomeUnknown(
+                        f"GHL {method} {path} outcome unknown after a network error"
+                    ) from exc
                 last_exc = exc
                 wait = 2**attempt
                 logger.warning(
@@ -186,6 +191,7 @@ class GHLCalendarClient:
         resp = self._request(
             "POST",
             "/calendars/events/appointments",
+            idempotent=False,
             json={
                 "locationId": self._location_id,
                 "calendarId": calendar_id,

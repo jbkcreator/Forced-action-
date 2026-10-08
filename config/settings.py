@@ -722,7 +722,11 @@ class AppSettings(BaseSettings):
 	# Named LENDING_* (not FA_MAX_*): this toggle exists for the Next Deal
 	# Lending booking flow specifically, same naming family as the
 	# LENDING_GHL_* credentials it switches between.
-	lending_calendar_mode: str = Field(default="fake", env="LENDING_CALENDAR_MODE")
+	# FA_MAX_CALENDAR_MODE is the pre-WP-GL-5 name; drop the fallback once prod .env is migrated.
+	lending_calendar_mode: str = Field(
+		default="fake",
+		validation_alias=AliasChoices("LENDING_CALENDAR_MODE", "FA_MAX_CALENDAR_MODE"),
+	)
 	fa_max_calendar_id: Optional[str] = Field(default=None, env="FA_MAX_CALENDAR_ID")
 	# Domain-wide delegation impersonates a named user; this is whose calendar
 	# bookings land on. Must be inside the Workspace the service account is
@@ -911,6 +915,7 @@ class AppSettings(BaseSettings):
 	lending_backflip_check_enabled: bool = Field(default=False, env="LENDING_BACKFLIP_CHECK_ENABLED")
 	# Shared secret the GHL "DND changed" workflow sends in X-Webhook-Secret. Unset = endpoint closed.
 	lending_ghl_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_GHL_WEBHOOK_SECRET")
+	lending_ghl_sms_from_number: Optional[str] = Field(default=None, env="LENDING_GHL_SMS_FROM_NUMBER")  # E.164; the one number used for calling and texting
 	# lending_ghl_api_key / lending_ghl_location_id are defined once, above,
 	# alongside the rest of the LENDING_GHL_* credential group.
 	# WP-GL-11 website lead form. A stage in the "Booked Calls" pipeline (LENDING_GHL_PIPELINE_ID, above) for new web inquiries. With
@@ -929,6 +934,7 @@ class AppSettings(BaseSettings):
 	lending_disposition_missing_alert_minutes: int = Field(default=10, env="LENDING_DISPOSITION_MISSING_ALERT_MINUTES")
 	lending_slack_bot_token: Optional[SecretStr] = Field(default=None, env="LENDING_SLACK_BOT_TOKEN")
 	lending_dial_tasks_channel: str = Field(default="", env="LENDING_DIAL_TASKS_CHANNEL")
+	lending_replies_channel: str = Field(default="", env="LENDING_REPLIES_CHANNEL")  # WP-GL-10 rate/terms handoffs; channel ID, the Cora Lending bot must be a member
 	lending_daily_channel: str = Field(default="", env="LENDING_DAILY_CHANNEL")  # 7pm scoreboard; channel ID
 	lending_sheets_service_account_key_path: str = Field(default="", env="LENDING_SHEETS_SERVICE_ACCOUNT_KEY_PATH")
 	lending_disposition_sheet_id: str = Field(default="", env="LENDING_DISPOSITION_SHEET_ID")
@@ -1069,6 +1075,27 @@ class AppSettings(BaseSettings):
 	fa_max_autonomous_dispatch_confirmed: bool = Field(
 		default=False, env="FA_MAX_AUTONOMOUS_DISPATCH_CONFIRMED"
 	)
+
+	# ── WP-GL-10 — Booking confirmations and reminders ───────────────────────
+	# Texts go through GoHighLevel only (src/lending/ghl_sms.py, same account and number as
+	# WP-GL-9). Off until the 10DLC registration clears; the worker then records every due text
+	# as skipped_text_not_enabled instead of sending. Separate from MISSED_CALL_TEXT_ENABLED so
+	# each message family has its own off switch (open question: one switch or two).
+	booking_reminder_text_enabled: bool = Field(default=False, env="BOOKING_REMINDER_TEXT_ENABLED")
+	# Email fallback (B4) stays off until hello@nextdeallending.com has a sender behind it
+	# (Porkbun DNS + Google Workspace are not provisioned). Off = recorded as skipped, never "sent".
+	booking_reminder_email_enabled: bool = Field(default=False, env="BOOKING_REMINDER_EMAIL_ENABLED")
+	# Verified GHL sending address for those emails (hello@nextdeallending.com). Unset = no email sender.
+	lending_ghl_email_from: Optional[str] = Field(default=None, env="LENDING_GHL_EMAIL_FROM")
+	# Logs the key paths (never values) of each incoming lending GHL webhook, to confirm the real field names.
+	lending_ghl_log_payload_shape: bool = Field(default=False, env="LENDING_GHL_LOG_PAYLOAD_SHAPE")
+	# A failed caller check cancels the AI-booked GHL appointment (frees Josh's slot). Off until the end-to-end test.
+	lending_ghl_release_slot_enabled: bool = Field(default=False, env="LENDING_GHL_RELEASE_SLOT_ENABLED")
+	# Which GHL appointment field marks a Conversation-AI booking (dotted path, e.g. "appointment.source")
+	# and its values (comma-separated). Unset: a booking with no booker counts as AI-booked (today's rule).
+	# Set it once LENDING_GHL_LOG_PAYLOAD_SHAPE has shown the real field; then Nurture cancels only AI bookings.
+	lending_ghl_ai_source_path: Optional[str] = Field(default=None, env="LENDING_GHL_AI_SOURCE_PATH")
+	lending_ghl_ai_source_values: str = Field(default="", env="LENDING_GHL_AI_SOURCE_VALUES")
 
 
 @lru_cache

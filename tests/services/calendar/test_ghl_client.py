@@ -209,3 +209,36 @@ class TestFromSettings:
             client = GHLCalendarClient.from_settings()
         assert client._api_key == "lending-key"
         assert client._location_id == "lending-location"
+
+
+from requests.exceptions import ConnectTimeout, ReadTimeout  # noqa: E402
+
+from src.services.calendar.client import CalendarOutcomeUnknown  # noqa: E402
+
+_START = datetime(2099, 10, 7, 14, 0, tzinfo=timezone.utc)
+
+
+def _create(client):
+    return client.create_event(calendar_id="cal", start=_START, end=_START + timedelta(minutes=30),
+                               summary="Call", attendee_email="a@example.com")
+
+
+class TestCreateIsNotBlindlyRetried:
+    def test_read_timeout_on_create_raises_outcome_unknown_after_one_call(self):
+        with patch("requests.request", side_effect=ReadTimeout()) as req, patch("time.sleep"):
+            with pytest.raises(CalendarOutcomeUnknown):
+                _create(_client())
+        assert req.call_count == 1
+
+    def test_connect_timeout_on_create_is_retried(self):
+        ok = _response(json_body={"appointment": {"id": "e1", "startTime": _START.isoformat(),
+                                                  "endTime": (_START + timedelta(minutes=30)).isoformat()}})
+        with patch("requests.request", side_effect=[ConnectTimeout(), ok]) as req, patch("time.sleep"):
+            assert _create(_client()).event_id == "e1"
+        assert req.call_count == 2
+
+    def test_reads_still_retry_on_read_timeout(self):
+        with patch("requests.request", side_effect=ReadTimeout()) as req, patch("time.sleep"):
+            with pytest.raises(CalendarUnavailable):
+                _client().get_busy(calendar_id="cal", start=_START, end=_START + timedelta(hours=1))
+        assert req.call_count == 4

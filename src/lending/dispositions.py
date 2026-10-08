@@ -35,6 +35,7 @@ from config.lending_dispositions import (
     UNANSWERED_CODES,
 )
 from config.lending_queues import NURTURE
+from config.lending_text_back import SLOT_HOLDING_SQL
 from config.settings import get_settings
 from src.services.phone_utils import normalize
 
@@ -384,7 +385,7 @@ def queue_missed_call(db, call_id: str, phone: str, caller_id_number: Optional[s
     else:
         taken = db.execute(
             text("SELECT 1 FROM lending.missed_call_events WHERE phone = :p AND event_date_et = :d "
-                 "AND status <> 'duplicate_day' AND dialer_call_id <> :c"),
+                 f"AND {SLOT_HOLDING_SQL} AND dialer_call_id <> :c"),
             {"p": phone, "d": day, "c": call_id},
         ).first()
         status = "duplicate_day" if taken else "pending"
