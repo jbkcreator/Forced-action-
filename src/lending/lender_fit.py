@@ -238,10 +238,10 @@ def _check_rules(
         purchase = request.purchase_price
         rehab = request.rehab_budget
         if purchase is None or rehab is None:
-            for f in ("purchase_price", "rehab_budget"):
-                if getattr(request, f.replace("rehab_budget", "rehab_budget")) is None:
-                    if f not in missing:
-                        missing.append(f)
+            if purchase is None:
+                missing.append("purchase_price")
+            if rehab is None:
+                missing.append("rehab_budget")
             reasons.append(
                 f"LTC cannot be calculated — purchase price or rehab budget missing"
             )

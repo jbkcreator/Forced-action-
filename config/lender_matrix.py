@@ -14,8 +14,9 @@ route the lender to ``non_fitting`` with reason
 than silently treating the lender as eligible.
 
 Current status (2026-10-08):
-  generic_backflip — PARTIALLY VERIFIED: values taken from Josh's Oct 1/Oct 2
-      emails (client_comments §1.1 "context on the Backflip box").  Two open
+  generic_backflip_* — CLIENT-STATED, NOT YET CONFIRMED (verified=False):
+      values copied by hand from Josh's Oct 1 email ("context on the Backflip
+      box") and Consolidated §1.1.  Josh must confirm before they count.  Open
       items: (Q2) confirm 7.75–8% is a rate spread and 12-month hold is the
       correct cost basis; (Q3) confirm whether the 36-month window on the
       ground-up build rule must be tracked separately in the profile.
@@ -136,16 +137,15 @@ class LenderRules:
 _BACKFLIP_FLIP = LenderRules(
     key="generic_backflip_flip",
     name="Backflip (Fix & Flip)",
-    verified=True,                      # Josh Oct 1 — "credit floor 640, min purchase ~85k, ARV cap 75%, 100% rehab"
+    verified=False,                     # client-stated (Josh Oct 1); awaiting his confirmation
     loan_types=frozenset({LoanType.FIX_AND_FLIP, LoanType.BRIDGE}),
-    min_loan_amount=Decimal("100_000"),  # Josh Oct 1 Consolidated §3.4.1 — $100K min flip
+    min_loan_amount=Decimal("100_000"),  # Consolidated intake diagram: "$100K for flip"
     max_loan_amount=None,               # not stated; no cap modelled
     max_ltv=Decimal("0.75"),            # ARV cap 75% == max LTV of 75% of ARV
     max_rehab_funding_pct=Decimal("1.00"),  # 100% of rehab funded
     min_purchase_price=Decimal("85_000"),   # ~$85K per Josh Oct 1
     credit_floor=640,
     min_completed_projects=0,
-    approved_states=frozenset({"FL", "GA"}),  # statewide FL + GA as of spec
     origination_points=None,            # Q2: not confirmed
     rate_spread=None,                   # Q2: Josh to confirm spread for flip product
     hold_months=12,
@@ -154,15 +154,13 @@ _BACKFLIP_FLIP = LenderRules(
 _BACKFLIP_CONSTRUCTION = LenderRules(
     key="generic_backflip_construction",
     name="Backflip (Ground-Up Construction)",
-    verified=True,                      # Josh Oct 1 and Consolidated §1.1
+    verified=False,                     # client-stated (Josh Oct 1, Consolidated §1.1); awaiting confirmation
     loan_types=frozenset({LoanType.GROUND_UP_CONSTRUCTION}),
     min_loan_amount=Decimal("500_000"),  # $500K min per Josh Oct 1 / Consolidated §1.1
     max_loan_amount=None,
-    max_ltc=Decimal("0.85"),            # "85% LTC ground-up" per Cora rule example; Q2 to confirm
     credit_floor=680,                   # Josh Oct 1 — "credit floor 680"
     min_completed_projects=3,           # "3+ completed projects"
     requires_ground_up_build=True,      # "including ≥1 ground-up build" per Josh Oct 1
-    approved_states=frozenset({"FL", "GA"}),
     origination_points=None,
     rate_spread=Decimal("0.0775"),      # 7.75% (lower bound of 7.75–8.00% stated by Consolidated §1.1; Q2)
     hold_months=12,
