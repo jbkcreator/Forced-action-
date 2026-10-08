@@ -81,13 +81,10 @@ class LenderRules:
     min_loan_amount: Optional[Decimal] = None
     max_loan_amount: Optional[Decimal] = None
 
-    # LTC / LTV / ARV cap as decimals (e.g. Decimal("0.85") for 85%)
+    # LTC / LTV as decimals (e.g. Decimal("0.85") for 85%).  LTV is loan / ARV,
+    # so a lender's "ARV cap" is expressed here as max_ltv.
     max_ltc: Optional[Decimal] = None
     max_ltv: Optional[Decimal] = None
-    max_arv_cap: Optional[Decimal] = None  # max ARV as a fraction of purchase+rehab
-
-    # Rehab funding (e.g. Decimal("1.00") = 100% of rehab funded)
-    max_rehab_funding_pct: Optional[Decimal] = None
 
     # Minimum purchase price (separate from loan amount per Josh Oct 1)
     min_purchase_price: Optional[Decimal] = None
@@ -142,7 +139,8 @@ _BACKFLIP_FLIP = LenderRules(
     min_loan_amount=Decimal("100_000"),  # Consolidated intake diagram: "$100K for flip"
     max_loan_amount=None,               # not stated; no cap modelled
     max_ltv=Decimal("0.75"),            # ARV cap 75% == max LTV of 75% of ARV
-    max_rehab_funding_pct=Decimal("1.00"),  # 100% of rehab funded
+    # "100% of rehab funded" (Josh Oct 1) is not modelled: LoanRequest has no
+    # input for how much of the rehab the loan covers, so it cannot be checked.
     min_purchase_price=Decimal("85_000"),   # ~$85K per Josh Oct 1
     credit_floor=640,
     min_completed_projects=0,
@@ -236,8 +234,7 @@ def validate_lender_matrix(matrix: tuple[LenderRules, ...] = LENDER_MATRIX) -> N
                 f"exceeds max_loan_amount {rules.max_loan_amount}"
             )
 
-        for pct_field in ("max_ltc", "max_ltv", "max_arv_cap",
-                          "max_rehab_funding_pct", "origination_points", "rate_spread"):
+        for pct_field in ("max_ltc", "max_ltv", "origination_points", "rate_spread"):
             val = getattr(rules, pct_field)
             if val is not None and (val < 0 or val > 10):
                 raise ValueError(

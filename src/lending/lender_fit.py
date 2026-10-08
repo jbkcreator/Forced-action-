@@ -254,15 +254,17 @@ def _check_rules(
                         f"LTC {ltc:.1%} exceeds {rules.max_ltc:.0%} limit"
                     )
 
-    # 7. Rehab funding cap
-    if rules.max_rehab_funding_pct is not None:
-        if request.rehab_budget is None:
-            if "rehab_budget" not in missing:
-                missing.append("rehab_budget")
-        # Pass: "100% of rehab funded" means no limit to check against
-        # (it's a feature, not a floor); only modelled as a cap if < 1.0.
+    # 6b. Property type
+    if rules.allowed_property_types:
+        if request.property_type is None:
+            missing.append("property_type")
+            reasons.append("property type unknown — capture on call")
+        elif request.property_type.strip().lower() not in {
+            t.lower() for t in rules.allowed_property_types
+        }:
+            reasons.append(f"property type {request.property_type!r} not accepted")
 
-    # 8. Credit band (caller-asked, never a pulled score — Josh Oct 1 D2)
+    # 7. Credit band (caller-asked, never a pulled score — Josh Oct 1 D2)
     if rules.credit_floor is not None:
         band = profile.credit_band_min_fico
         if band is _CREDIT_UNKNOWN:
@@ -279,7 +281,7 @@ def _check_rules(
                 f"credit band {band_label} below lender floor {rules.credit_floor}"
             )
 
-    # 9. Borrower experience
+    # 8. Borrower experience
     if rules.min_completed_projects > 0:
         projects = profile.completed_projects
         if projects is None:

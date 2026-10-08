@@ -560,3 +560,47 @@ def test_lender_box_re_exports_evaluate_lender_fit() -> None:
     """evaluate_lender_fit is importable from src.services.lender_box (SPEC §4.3 path)."""
     from src.services.lender_box import evaluate_lender_fit as fn
     assert callable(fn)
+
+
+# ---------------------------------------------------------------------------
+# Review fixes F1/F2 — every constraint field on LenderRules must be enforced
+# ---------------------------------------------------------------------------
+
+def test_every_lender_rules_constraint_field_is_read_by_the_evaluator() -> None:
+    """A LenderRules field that _check_rules/_total_borrower_cost never reads is a
+    silently ignored constraint (the defect behind review F1/F2)."""
+    import dataclasses
+    import inspect
+
+    from src.lending import lender_fit
+
+    source = inspect.getsource(lender_fit._check_rules) + inspect.getsource(
+        lender_fit._total_borrower_cost
+    )
+    identity_fields = {"key", "name", "verified"}
+    unread = [
+        f.name
+        for f in dataclasses.fields(LenderRules)
+        if f.name not in identity_fields and f"rules.{f.name}" not in source
+    ]
+    assert unread == [], f"LenderRules fields never enforced: {unread}"
+
+
+def test_property_type_not_in_allowed_set_rejected() -> None:
+    lender = LenderRules(
+        key="sfr_only", name="SFR Only", verified=True,
+        allowed_property_types=frozenset({"single_family"}),
+    )
+    profile = BorrowerProfile(state="FL")
+    base = dict(loan_type=LoanType.FIX_AND_FLIP, loan_amount=Decimal("200_000"), state="FL")
+
+    ok = evaluate_lender_fit(profile, LoanRequest(property_type="Single_Family ", **base), matrix=(lender,))
+    assert [f.lender_key for f in ok.fitting] == ["sfr_only"]
+
+    bad = evaluate_lender_fit(profile, LoanRequest(property_type="condo", **base), matrix=(lender,))
+    assert bad.fitting == []
+    assert any("property type" in r for r in bad.non_fitting[0].reasons)
+
+    unknown = evaluate_lender_fit(profile, LoanRequest(**base), matrix=(lender,))
+    assert unknown.fitting == []
+    assert "property_type" in unknown.missing_fields
