@@ -26,10 +26,11 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from config.settings import get_settings
 from src.api.deps import get_db
 from src.api.lending_ghl_router import _verify_secret
 from src.lending.booking_messages import cancel_by_provider_event, find_ai_booking, handle_booking_confirmed, handle_booking_gate_failed, handle_nurture_entry
-from src.lending.confirmation_tasks import complete_confirmation_task
+from src.lending.confirmation_tasks import AI_BOOKER, complete_confirmation_task
 from src.lending.ghl_appointments import get_appointment_canceller
 from src.lending.payload_shape import log_shape
 from src.lending.reply_guard import slack_poster
@@ -60,6 +61,16 @@ def _first(body: dict[str, Any], *paths: tuple[str, ...]) -> Optional[str]:
         if node:
             return str(node)
     return None
+
+
+def _is_ai_source(body: dict[str, Any]) -> bool:
+    """True when the configured GHL field says the AI agent made this appointment."""
+    settings = get_settings()
+    if not settings.lending_ghl_ai_source_path:
+        return False
+    wanted = {v.strip().lower() for v in settings.lending_ghl_ai_source_values.split(",") if v.strip()}
+    value = _first(body, tuple(settings.lending_ghl_ai_source_path.split(".")))
+    return bool(value) and value.strip().lower() in wanted
 
 
 @router.post("/ghl-appointment")
@@ -118,7 +129,7 @@ def _schedule_from_appointment(db: Session, body: dict[str, Any], appointment_id
         "first_name": _first(body, ("firstName",), ("first_name",), ("contact", "firstName")) or (known["first_name"] if known else None),
         "email": _first(body, ("email",), ("contact", "email")) or (known["contact_email"] if known else None),
         "property_address": known["property_address"] if known else None,
-        "booked_by": known["booked_by"] if known else None,
+        "booked_by": known["booked_by"] if known else (AI_BOOKER if _is_ai_source(body) else None),
         "slot_start_utc": slot,
     }
     try:

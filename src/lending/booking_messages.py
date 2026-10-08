@@ -287,27 +287,34 @@ def handle_booking_gate_failed(db, booking_ref: str, *, now: Optional[datetime] 
     return "queued" if queued else "duplicate"
 
 
-_AI_BOOKING_BY_PHONE = text("""
+_AI_BOOKING_BY_PHONE = """
     SELECT booking_ref, provider_event_id FROM lending.booking_messages
-     WHERE contact_phone = :phone AND kind = 'confirmation' AND (booked_by IS NULL OR booked_by = 'ai')
+     WHERE contact_phone = :phone AND kind = 'confirmation' AND {booker}
        AND slot_start_utc > :now
      ORDER BY slot_start_utc LIMIT 1
-""")
+"""
+_BOOKER_AI_OR_UNKNOWN = "(booked_by IS NULL OR booked_by = 'ai')"
+_BOOKER_AI_ONLY = "booked_by = 'ai'"
 
 
 def find_ai_booking(db, phone: str, now: Optional[datetime] = None) -> Optional[Mapping[str, Any]]:
-    """The upcoming AI-booked call for this phone (``booking_ref`` and its GHL ``provider_event_id``), or None."""
+    """The upcoming AI-booked call for this phone (``booking_ref`` and its GHL ``provider_event_id``), or None.
+    Until LENDING_GHL_AI_SOURCE_PATH is set, a booking with no booker counts as AI-booked."""
     norm = normalize_phone(phone or "")
     if not norm:
         return None
-    return db.execute(_AI_BOOKING_BY_PHONE, {"phone": norm, "now": now or datetime.now(timezone.utc)}).mappings().first()
+    from config.settings import get_settings
+    booker = _BOOKER_AI_ONLY if get_settings().lending_ghl_ai_source_path else _BOOKER_AI_OR_UNKNOWN
+    return db.execute(text(_AI_BOOKING_BY_PHONE.format(booker=booker)),
+                      {"phone": norm, "now": now or datetime.now(timezone.utc)}).mappings().first()
 
 
 def handle_nurture_entry(db, phone: str, *, now: Optional[datetime] = None) -> str:
     """A contact entered the GHL Nurture stage. If an AI-booked call for them is still ahead, the caller's check
     did not pass (Josh: a failed check moves the contact to nurture), so run the failed-check handling for that
     booking. Returns the handling outcome, or "no_ai_booking" when there is nothing to do. A call that already
-    happened, or one a caller booked, is never touched. Does not commit."""
+    happened, or one with a named caller as booker, is never touched; a booking with no booker counts as AI until
+    LENDING_GHL_AI_SOURCE_PATH is set. Does not commit."""
     now = now or datetime.now(timezone.utc)
     booking = find_ai_booking(db, phone, now)
     if booking is None:

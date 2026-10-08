@@ -1081,6 +1081,11 @@ class AppSettings(BaseSettings):
 	lending_ghl_log_payload_shape: bool = Field(default=False, env="LENDING_GHL_LOG_PAYLOAD_SHAPE")
 	# A failed caller check cancels the AI-booked GHL appointment (frees Josh's slot). Off until the end-to-end test.
 	lending_ghl_release_slot_enabled: bool = Field(default=False, env="LENDING_GHL_RELEASE_SLOT_ENABLED")
+	# Which GHL appointment field marks a Conversation-AI booking (dotted path, e.g. "appointment.source")
+	# and its values (comma-separated). Unset: a booking with no booker counts as AI-booked (today's rule).
+	# Set it once LENDING_GHL_LOG_PAYLOAD_SHAPE has shown the real field; then Nurture cancels only AI bookings.
+	lending_ghl_ai_source_path: Optional[str] = Field(default=None, env="LENDING_GHL_AI_SOURCE_PATH")
+	lending_ghl_ai_source_values: str = Field(default="", env="LENDING_GHL_AI_SOURCE_VALUES")
 
 
 @lru_cache

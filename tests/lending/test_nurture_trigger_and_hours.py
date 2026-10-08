@@ -115,3 +115,36 @@ def test_a_rate_question_outside_hours_says_it_waits_for_morning_and_inside_hour
 def test_the_quoted_number_alert_is_not_held_for_business_hours():
     alert = format_slack("ai_quoted_numbers", event(direction="outbound", body="Rates start at 9%"), now=SAT_NOON)
     assert "first thing next business morning" not in alert
+
+
+def _ai_source(monkeypatch, path="appointment.source", values="ai_bot"):
+    from config.settings import get_settings
+    monkeypatch.setattr(get_settings(), "lending_ghl_ai_source_path", path, raising=False)
+    monkeypatch.setattr(get_settings(), "lending_ghl_ai_source_values", values, raising=False)
+
+
+def test_without_the_source_setting_a_blank_booker_still_counts_as_ai(db):
+    book(db, booked_by=None)
+    assert handle_nurture_entry(db, PHONE, now=BOOKED) == "queued"
+
+
+def test_with_the_source_setting_a_blank_booker_is_left_alone(db, monkeypatch):
+    _ai_source(monkeypatch)
+    book(db, booked_by=None)
+    assert handle_nurture_entry(db, PHONE, now=BOOKED) == "no_ai_booking"
+    book(db, ref="r2", phone="+18135550222", booked_by="ai")
+    assert handle_nurture_entry(db, "+18135550222", now=BOOKED) == "queued"
+
+
+def test_is_ai_source_reads_the_configured_path(monkeypatch):
+    from src.lending.booking_webhook import _is_ai_source
+    _ai_source(monkeypatch, values="ai_bot, Conversation_AI")
+    assert _is_ai_source({"appointment": {"source": "conversation_ai"}}) is True
+    assert _is_ai_source({"appointment": {"source": "calendar_page"}}) is False
+
+
+def test_missing_source_field_is_not_ai(monkeypatch):
+    from src.lending.booking_webhook import _is_ai_source
+    _ai_source(monkeypatch)
+    assert _is_ai_source({"appointment": {}}) is False
+    assert _is_ai_source({}) is False
