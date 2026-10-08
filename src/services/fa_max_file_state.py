@@ -114,6 +114,9 @@ def ensure_file_state(
         """),
         {"opportunity_id": opportunity_id, "person_id": person_id, "contact_email": contact_email},
     )
+    from src.services.fa_max_portal_completion import halt_for_portal_completion
+
+    halt_for_portal_completion(session, person_id)
     session.commit()
     created = get_file_state(session, opportunity_id=opportunity_id)
     if created is None:
@@ -344,7 +347,15 @@ def send_governed_email(
     a prohibited-financial-term regex, so an unchecked borrower-facing
     payload raises IntegrityError and the caller retries it forever.
     """
+    from src.services import fa_max_outbound_links
     from src.services import fa_max_send_governance as governance
+
+    links = fa_max_outbound_links.resolve_or_alert(
+        session, agent_name=agent_name, person_id=person_id, opportunity_id=opportunity_id,
+    )
+    if links is None:
+        return False
+    body = fa_max_outbound_links.add_booking_line(body, links)
 
     try:
         governance.validate_safe_payload({"subject": subject, "body": body})

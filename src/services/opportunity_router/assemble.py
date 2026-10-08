@@ -220,11 +220,12 @@ def _evaluate_lender_box_batch(
 ) -> dict:
     """Call Lender Box evaluate() for each opportunity. Returns {opp_id: EligibilityResult}."""
     try:
-        from src.services.lender_box import DealInput, evaluate
+        from src.services.lender_box import DealInput, load_active_programs, evaluate
     except ImportError:
         logger.warning("lender_box module not available — all opps will be uncertain")
         return {}
 
+    programs = load_active_programs(db)
     results = {}
     for oid in ids:
         row = opp_by_id.get(oid)
@@ -242,7 +243,7 @@ def _evaluate_lender_box_batch(
                 arv=Decimal(str(prop["assessed_value_mkt"])) if prop.get("assessed_value_mkt") else None,
                 borrower_prior_loans=None,
             )
-            results[oid] = evaluate(deal, db)
+            results[oid] = evaluate(deal, db, programs=programs)
         except Exception:
             logger.exception("lender_box.evaluate failed for opportunity %s", oid)
     return results

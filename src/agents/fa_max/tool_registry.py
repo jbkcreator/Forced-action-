@@ -314,6 +314,16 @@ def send(
             f"send attempt log_id={log_id} already timed out by the agent loop"
         )
 
+    if isinstance(payload, dict) and payload.get("body"):
+        from src.services import fa_max_outbound_links
+
+        links = fa_max_outbound_links.resolve_or_alert(
+            session, agent_name=agent_name, person_id=person_id, opportunity_id=opportunity_id,
+        )
+        if links is None:
+            return {"item_id": None, "status": "withheld", "reason": "link_unresolved"}
+        payload = {**payload, "body": fa_max_outbound_links.add_booking_line(payload["body"], links)}
+
     gate = check_tier_gate(agent_name, autonomy_tier_at_send, session)
 
     item = relay_queue.enqueue(

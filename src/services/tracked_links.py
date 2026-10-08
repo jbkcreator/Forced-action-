@@ -43,7 +43,8 @@ def mint_link(
     """Create a TrackedLink with an opaque, non-enumerable slug.
 
     Retries on the vanishingly rare slug collision, same pattern as
-    affiliate_engine.mint_affiliate.
+    affiliate_engine.mint_affiliate. Each attempt runs in a savepoint, so a
+    collision rolls back only that attempt — never the caller's pending work.
     """
     last_err: Optional[IntegrityError] = None
     for _ in range(_MINT_RETRIES):
@@ -58,14 +59,16 @@ def mint_link(
             destination=destination,
             created_by=created_by,
         )
+        savepoint = db.begin_nested()
         db.add(link)
         try:
             db.flush()
+            savepoint.commit()
             logger.info("Minted tracked_link id=%s kind=%s", link.id, kind)
             return link
         except IntegrityError as exc:
             last_err = exc
-            db.rollback()
+            savepoint.rollback()
     raise RuntimeError("Failed to mint tracked link after retries") from last_err
 
 
