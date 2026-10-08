@@ -35,6 +35,7 @@ def wired(monkeypatch):
     monkeypatch.setattr(task, "campaign_names", lambda: {})
     monkeypatch.setattr(task, "build_scoreboard", lambda db, day, names: days.append(day) or "data")
     monkeypatch.setattr(task, "format_slack", lambda data, day: f"board {day}")
+    monkeypatch.setattr(task, "format_blocks", lambda data, day: [{"type": "divider"}])
     monkeypatch.setattr("slack_sdk.WebClient", FakeClient)
     return posted, days
 
@@ -48,6 +49,26 @@ def test_at_7_20pm_et_it_posts_once(wired):
     posted, days = wired
     assert task.main([], now=SEVEN_PM_UTC) == 0
     assert [p["text"] for p in posted] == ["board 2026-10-06"] and posted[0]["channel"] == "C1"
+    assert posted[0]["blocks"] == [{"type": "divider"}]
+
+
+def test_rendered_scoreboard_has_aligned_tables_and_a_totals_grid():
+    from datetime import date
+
+    from src.lending.scoreboard import Row, ScoreboardData, format_blocks, format_slack
+
+    maria, josh = Row("Maria", 21, 7, 4, 2, 2), Row("Josh `the` closer with a very long display name", 16, 5, 2, 1, 0)
+    data = ScoreboardData([maria, josh], [maria], [], Row("TOTAL", 37, 12, 6, 3, 2))
+    blocks = format_blocks(data, date(2026, 10, 5))
+    assert blocks[0]["type"] == "header" and "Mon Oct 5, 2026" in blocks[0]["text"]["text"]
+    grid = next(b for b in blocks if b["type"] == "section" and "fields" in b)["fields"]
+    assert [f["text"] for f in grid][:2] == ["*Dials*\n37", "*Live*\n12"] and "*Showed*\nn/a (GHL)" in [f["text"] for f in grid]
+    tables = [b["text"]["text"] for b in blocks if b["type"] == "section" and "text" in b]
+    assert len(tables) == 3 and "_no dials_" in tables[2]
+    rows = tables[0].split("```")[1].strip().splitlines()
+    assert len({len(r) for r in rows if not r.startswith("-")}) == 1  # every row padded to the same width
+    assert "`the`" not in tables[0] and "…" in tables[0]
+    assert "Showed" in format_slack(data, date(2026, 10, 5))
 
 
 def test_force_uses_the_eastern_date_not_the_utc_date(wired):

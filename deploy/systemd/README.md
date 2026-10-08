@@ -21,7 +21,7 @@ sudo systemctl start   fa-api lifecycle cora
 
 ## Lending compliance workers
 
-`deploy.sh` installs, enables and restarts `fa-lending-opt-out-poller` and `fa-lending-dialer-sweep` on every deploy (client requirement: STOP propagation must run before callers dial). It is best-effort: a lending unit that fails to install or start prints a warning and never aborts or rolls back the deploy. `fa-lending-missed-call-poller` is not installed by `deploy.sh`; install it by hand if it is wanted (see below).
+`deploy.sh` installs, enables and restarts `fa-lending-opt-out-poller` and `fa-lending-dialer-sweep` on every deploy (client requirement: STOP propagation must run before callers dial). It is best-effort: a lending unit that fails to install or start prints a warning and never aborts or rolls back the deploy. `fa-lending-missed-call-poller` is superseded by WP-GL-9 and is not installed (see below).
 
 - `fa-lending-opt-out-poller` — every 15 s mirrors FA opt-outs (SMS/email) into `lending.suppression_list` and removes the number from the dialer (60 s stop SLA).
 - `fa-lending-missed-call-poller` — SUPERSEDED by WP-GL-9: the text-back runs inside `fa-lending-cdr-poller`. Do not install; if it was installed, remove it: `sudo systemctl disable --now fa-lending-missed-call-poller`.
@@ -37,8 +37,7 @@ The GoHighLevel opt-out sync (poller) and the 15-minute DND backstop (cron) use 
 PYTHONPATH=. .venv/bin/python -m src.lending.opt_out_poller --once
 PYTHONPATH=. .venv/bin/python -m src.lending.dialer_sweep --once
 
-# both are installed and restarted by deploy.sh; the missed-call poller is superseded by the
-# text-back in the CDR poller (do not install it)
+# watch both (installed and restarted by deploy.sh)
 sudo journalctl -u fa-lending-opt-out-poller -u fa-lending-dialer-sweep -f
 ```
 
@@ -48,7 +47,7 @@ sudo journalctl -u fa-lending-opt-out-poller -u fa-lending-dialer-sweep -f
 
 Every `/webhooks/lending/*` route is served by `lending-api` (`src/lending/api.py`, gunicorn on `127.0.0.1:8010`), not by
 `fa-api`, so a lending deploy or crash never touches the main API. Public webhook URLs do not change: nginx routes the
-`/webhooks/lending/` prefix to port 8010 (`deploy/nginx/lending-api.conf.example`, placed above the generic `/webhooks/` block).
+`/webhooks/lending/` and `/api/lending/` (website lead form) prefixes to port 8010 (`deploy/nginx/lending-api.conf.example`, placed above the generic `/webhooks/` and `/api/` blocks).
 
 ```bash
 sudo cp deploy/systemd/lending-api.service /etc/systemd/system/

@@ -9,7 +9,7 @@ opt-out path already treats as "removal stays pending".
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional, Protocol, Union
 
 import requests
@@ -50,6 +50,8 @@ class DialerContactFields:
     state: Optional[str] = None
     postal_code: Optional[str] = None
     customfields: Optional[Mapping[str, str]] = None  # merged over what the dialer already holds
+    # Context-card values (src/lending/context_card.py), sent as extra custom fields.
+    card: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -237,6 +239,26 @@ class BatchDialerAdapter:
     def restore(self, phone: str) -> None:
         self._call("campaign_restore", {"phone": phone})
 
+    def call_transcript(self, call_record_id: Any) -> Optional[str]:
+        """The call's transcript as "role: text" lines, or None when there is none.
+
+        Reads ``GET /cdrs/{id}/transcription`` (public API docs, "Get Transcription
+        (JSON)"), which returns timed segments of ``{time, role, text}``.
+        """
+        try:
+            segments = self._call("call_transcription", {}, id=call_record_id)
+        except DialerRequestError as exc:
+            if exc.status == 404:
+                return None
+            raise
+        items = segments.get("items", []) if isinstance(segments, Mapping) else segments
+        lines = [
+            f"{segment.get('role') or 'unknown'}: {' '.join(str(segment.get('text') or '').split())}"
+            for segment in items or []
+            if isinstance(segment, Mapping) and str(segment.get("text") or "").strip()
+        ]
+        return "\n".join(lines) or None
+
 
 def _contact_id(body: Mapping[str, Any]) -> Any:
     return body.get("id") if body.get("id") is not None else body.get("contactId")
@@ -270,6 +292,7 @@ def _contact_body(phone: Optional[str], fields: DialerContactFields) -> dict:
         "state": fields.state or "",
         "postalcode": fields.postal_code or "",
         "customfields": {
+            **{f"card_{name}": value for name, value in fields.card.items()},
             "entity_name": fields.company_name or "",
             "details": fields.information or "",
             "email": fields.email or "",

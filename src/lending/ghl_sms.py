@@ -1,11 +1,8 @@
 """GoHighLevel SMS sender for the Next Deal Lending sub-account (WP-GL-9).
 
-Credentials: LENDING_GHL_API_KEY + LENDING_GHL_LOCATION_ID (the Next Deal Lending sub-account,
-client answer B1) when both are set, else the shared GHL_API_KEY / GHL_LOCATION_ID, which today
-point at the Bay Street Capital sub-account. The fallback is an interim, team-lead-approved
-decision until the client provides the Next Deal Lending sub-account; switching is two env vars.
-Exactly one of the two LENDING_GHL_* set is a misconfiguration and fails closed (no account), so a
-half-finished switch can never text or opt out through the wrong sub-account.
+Credentials: LENDING_GHL_API_KEY + LENDING_GHL_LOCATION_ID, the Next Deal Lending sub-account, which is the
+only GHL account lending uses (see src.lending.ghl_account: no fallback to the platform's GHL_* account,
+and one of the two set without the other fails closed, with no account).
 
 Both the contact upsert and the message send make exactly ONE attempt. The send must never repeat: after
 a read timeout GHL may already have accepted the text, and a retry would double-text a borrower. The
@@ -25,13 +22,13 @@ from __future__ import annotations
 
 import argparse
 import logging
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 import requests
 
 from config.settings import get_settings
+from src.lending.ghl_account import GhlAccount, ghl_headers, lending_ghl_account
 from src.services import ghl_webhook
 from src.services.phone_utils import normalize
 
@@ -53,49 +50,6 @@ class GhlSmsError(RuntimeError):
     def __init__(self, message: str, *, ambiguous: bool = False) -> None:
         super().__init__(message)
         self.ambiguous = ambiguous
-
-
-@dataclass(frozen=True)
-class GhlAccount:
-    api_key: str
-    location_id: str
-
-
-_warned_fallback = False
-_warned_partial = False
-
-
-def _secret(value: Any) -> str:
-    return value.get_secret_value() if value is not None else ""
-
-
-def lending_ghl_account() -> Optional[GhlAccount]:
-    """Next Deal Lending credentials when both are set, the shared (Bay Street) ones when neither is,
-    None when nothing is configured or the Next Deal Lending pair is only half set."""
-    global _warned_fallback, _warned_partial
-    s = get_settings()
-    lending_key, lending_location = _secret(s.lending_ghl_api_key), s.lending_ghl_location_id or ""
-    if lending_key and lending_location:
-        return GhlAccount(lending_key, lending_location)
-    if lending_key or lending_location:
-        if not _warned_partial:
-            missing = "LENDING_GHL_LOCATION_ID" if lending_key else "LENDING_GHL_API_KEY"
-            logger.error("[lending-ghl] LENDING_GHL_* is only partially set (%s is missing): "
-                         "no GHL account will be used until both are set or both are removed", missing)
-            _warned_partial = True
-        return None
-    shared_key = _secret(s.ghl_api_key)
-    if not shared_key or not s.ghl_location_id:
-        return None
-    if not _warned_fallback:
-        logger.warning("[lending-ghl] LENDING_GHL_* not set: using the shared GHL_* account (interim, Bay Street Capital)")
-        _warned_fallback = True
-    return GhlAccount(shared_key, s.ghl_location_id)
-
-
-def ghl_headers(api_key: str, version: str = "2021-07-28") -> dict[str, str]:
-    return {"Authorization": f"Bearer {api_key}", "Version": version,
-            "Content-Type": "application/json", "Accept": "application/json"}
 
 
 def texting_number() -> Optional[str]:

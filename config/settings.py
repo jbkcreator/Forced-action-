@@ -915,9 +915,15 @@ class AppSettings(BaseSettings):
 	lending_backflip_check_enabled: bool = Field(default=False, env="LENDING_BACKFLIP_CHECK_ENABLED")
 	# Shared secret the GHL "DND changed" workflow sends in X-Webhook-Secret. Unset = endpoint closed.
 	lending_ghl_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_GHL_WEBHOOK_SECRET")
+	lending_ghl_sms_from_number: Optional[str] = Field(default=None, env="LENDING_GHL_SMS_FROM_NUMBER")  # E.164; the one number used for calling and texting
 	# lending_ghl_api_key / lending_ghl_location_id are defined once, above,
 	# alongside the rest of the LENDING_GHL_* credential group.
-	lending_ghl_sms_from_number: Optional[str] = Field(default=None, env="LENDING_GHL_SMS_FROM_NUMBER")  # E.164; the one number used for calling and texting
+	# WP-GL-11 website lead form. A stage in the "Booked Calls" pipeline (LENDING_GHL_PIPELINE_ID, above) for new web inquiries. With
+	# either unset the lead is saved to the contact only (no pipeline card): the pipeline has no
+	# new-lead stage until Josh decides one. Optional GHL custom field ids for the ticked consent values.
+	lending_ghl_stage_new_lead: Optional[str] = Field(default=None, env="LENDING_GHL_STAGE_NEW_LEAD")
+	lending_ghl_cf_sms_consent: Optional[str] = Field(default=None, env="LENDING_GHL_CF_SMS_CONSENT")
+	lending_ghl_cf_deal_drop_optin: Optional[str] = Field(default=None, env="LENDING_GHL_CF_DEAL_DROP_OPTIN")
 	aircall_webhook_token: Optional[SecretStr] = Field(default=None, env="AIRCALL_WEBHOOK_TOKEN")
 
 	# ── Lending engine: call disposition logging ──
