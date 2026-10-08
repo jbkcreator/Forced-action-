@@ -3,14 +3,10 @@
 Stand-in types until Dev 2's T-04 contracts (BorrowerProfile / LoanRequest / LenderFitResult)
 land on dev; swap the imports then. No rates, points or terms ever appear in the letter.
 """
-import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, Protocol, Sequence
 
-from src.lending.pdf.render import NON_BINDING_PREQUAL_WATERMARK, render_pdf
-
-logger = logging.getLogger(__name__)
 
 TEMPLATE = "prequal_letter.html"
 
@@ -76,18 +72,3 @@ def build_context(lead: PrequalLead, fits: Sequence[FitLimits], pct: int) -> Opt
         "range_low": f"${rng[0]:,}",
         "range_high": f"${rng[1]:,}",
     }
-
-
-def generate_and_deliver(lead_id: int, contact_id: str, lead: PrequalLead, fits: Sequence[FitLimits],
-                         sink: PrequalSink, *, enabled: bool, pct: int) -> bool:
-    """Render the letter and hand it to the sink. Returns True if delivered. Never logs PII."""
-    if not enabled:
-        return False
-    ctx = build_context(lead, fits, pct)
-    if ctx is None:
-        logger.info("[prequal] lead_id=%s skipped (incomplete or no fitting lender)", lead_id)
-        return False
-    pdf = render_pdf(TEMPLATE, ctx, watermark=NON_BINDING_PREQUAL_WATERMARK)
-    sink.deliver(lead_id, contact_id, pdf)
-    logger.info("[prequal] lead_id=%s delivered", lead_id)
-    return True

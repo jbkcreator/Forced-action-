@@ -83,7 +83,7 @@ def test_email_copy_has_no_rate_or_term_language():
 
 def _real_upload(monkeypatch, resp):
     from src.services import ghl_webhook
-    monkeypatch.setattr(ghl_webhook, "_ghl_request", lambda *a, **k: resp)
+    monkeypatch.setattr(ghl_webhook, "ghl_post_multipart", lambda *a, **k: resp)
     return GhlPrequalAttachmentSink(_Account())
 
 

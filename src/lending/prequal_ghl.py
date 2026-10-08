@@ -13,7 +13,7 @@ from typing import Optional
 
 from config.lending_web import GHL_CONFIG_ERROR_STATUS_CODES
 from config.settings import get_settings
-from src.lending.ghl_account import ghl_headers, lending_ghl_account
+from src.lending.ghl_account import ghl_multipart_headers, lending_ghl_account
 from src.lending.prequal import PrequalSink
 from src.lending.web_lead_ghl import GhlLeadSink
 from src.lending.web_leads import DeliveryError
@@ -33,7 +33,7 @@ EMAIL_HTML = (
 
 
 class GhlPrequalAttachmentSink(GhlLeadSink):
-    """Reuses GhlLeadSink's JSON request and error handling; the multipart upload is new."""
+    """Reuses GhlLeadSink's JSON request and error handling for the send; the upload is multipart."""
 
     def deliver(self, lead_id: int, contact_id: str, pdf: bytes) -> None:
         url = self._upload(contact_id, pdf)
@@ -46,13 +46,11 @@ class GhlPrequalAttachmentSink(GhlLeadSink):
         logger.info("[prequal] email sent lead_id=%s", lead_id)
 
     def _upload(self, contact_id: str, pdf: bytes) -> str:
-        from src.services import ghl_webhook
+        from src.services.ghl_webhook import ghl_post_multipart
 
-        headers = ghl_headers(self._account.api_key)
-        headers.pop("Content-Type")  # requests sets the multipart boundary
         try:
-            response = ghl_webhook._ghl_request(
-                "POST", f"{ghl_webhook._GHL_BASE}/conversations/messages/upload", headers=headers,
+            response = ghl_post_multipart(
+                "/conversations/messages/upload", headers=ghl_multipart_headers(self._account.api_key),
                 files={"fileAttachment": (PDF_FILENAME, pdf, "application/pdf")}, data={"contactId": contact_id},
             )
         except Exception as exc:

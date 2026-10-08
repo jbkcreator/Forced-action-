@@ -53,29 +53,28 @@ def test_letter_has_no_rate_or_term_language():
         assert word not in html
 
 
-class FakeSink:
-    def __init__(self):
-        self.calls = []
-
-    def deliver(self, lead_id, contact_id, pdf):
-        self.calls.append((lead_id, contact_id, pdf))
-
-
-def test_flag_off_no_delivery():
-    sink = FakeSink()
-    assert prequal.generate_and_deliver(1, "c1", PrequalLead(**FULL), FITS, sink, enabled=False, pct=10) is False
-    assert sink.calls == []
-
-
-def test_delivery_when_enabled(monkeypatch):
-    monkeypatch.setattr(prequal, "render_pdf", lambda t, c, watermark: b"%PDF-fake")
-    sink = FakeSink()
-    assert prequal.generate_and_deliver(7, "c7", PrequalLead(**FULL), FITS, sink, enabled=True, pct=10) is True
-    assert sink.calls == [(7, "c7", b"%PDF-fake")]
-
-
 def test_rendered_html_needs_no_network():
     ctx = prequal.build_context(PrequalLead(**FULL), FITS, 10)
     html = render_html(prequal.TEMPLATE, ctx, watermark=NON_BINDING_PREQUAL_WATERMARK)
     assert "http://" not in html and "https://" not in html
     assert "data:font/woff2;base64," in html
+
+
+def test_watermark_in_real_pdf():
+    """Renders through Chromium; skipped where Playwright/Chromium is not installed."""
+    import io
+    import logging as _logging
+
+    pdfplumber = pytest.importorskip("pdfplumber")
+    from src.lending.pdf.render import render_pdf
+
+    ctx = prequal.build_context(PrequalLead(**FULL), FITS, 10)
+    try:
+        pdf = render_pdf(prequal.TEMPLATE, ctx, watermark=NON_BINDING_PREQUAL_WATERMARK)
+    except Exception as exc:
+        pytest.skip(f"Chromium not available: {type(exc).__name__}")
+    _logging.getLogger("pdfminer").setLevel(_logging.ERROR)
+    with pdfplumber.open(io.BytesIO(pdf)) as doc:
+        text = " ".join((page.extract_text() or "") for page in doc.pages).replace(chr(10), " ")
+    assert "NON-BINDING PRE-QUALIFICATION ESTIMATE" in text
+    assert "FOR INFORMATIONAL PURPOSES ONLY" in text

@@ -61,6 +61,8 @@ def send_pending(db, sink: Optional[PrequalSink], evaluator: Optional[FitEvaluat
     now = now or datetime.now(timezone.utc)
     if not enabled:
         return 0
+    if letter_id is None:
+        _expire_stale(db, now)
     if sink is None or evaluator is None:
         logger.warning("[prequal] not sending: %s not configured", "GHL" if sink is None else "lender fit engine")
         return 0
@@ -76,6 +78,25 @@ def send_pending(db, sink: Optional[PrequalSink], evaluator: Optional[FitEvaluat
     return sum(_send_one(db, sink, evaluator, dict(row), pct, now) for row in rows)
 
 
+_EXPIRED_ERROR = f"gave up: not sent within {GIVE_UP_AFTER_HOURS}h"
+
+
+def _expire_stale(db, now: datetime) -> int:
+    """Close out letters past the give-up window so none is dropped silently (e.g. queued while the
+    lender engine or GHL was unavailable). Each letter is flagged and logged once."""
+    rows = db.execute(
+        text("UPDATE lending.prequal_letters SET status = 'failed', last_error = :err "
+             "WHERE status IN ('pending', 'failed') AND created_at <= :oldest "
+             "AND last_error IS DISTINCT FROM :err RETURNING id"),
+        {"err": _EXPIRED_ERROR, "oldest": now - timedelta(hours=GIVE_UP_AFTER_HOURS)},
+    ).all()
+    if rows:
+        ids = [r[0] for r in rows]
+        logger.warning("[prequal] %d letter(s) not sent within %dh, giving up: ids=%s",
+                       len(ids), GIVE_UP_AFTER_HOURS, ids[:20])
+    return len(rows)
+
+
 def _send_one(db, sink: PrequalSink, evaluator: FitEvaluator, row: dict[str, Any], pct: int, now: datetime) -> int:
     lead = PrequalLead(credit_band=row["credit_band"], loan_amount=int(row["loan_amount"]),
                        property_state=row["property_state"], loan_type=row["loan_type"])
@@ -86,6 +107,8 @@ def _send_one(db, sink: PrequalSink, evaluator: FitEvaluator, row: dict[str, Any
             logger.info("[prequal] letter id=%s skipped: no fitting lender", row["id"])
             return 0
         pdf = render_pdf(TEMPLATE, ctx, watermark=NON_BINDING_PREQUAL_WATERMARK)
+        # The email goes out before the row is marked sent. If that commit then fails, the sweep
+        # sends again: a rare duplicate email is preferred over a letter silently never sent.
         sink.deliver(row["id"], row["ghl_contact_id"], pdf)
     except DeliveryError as exc:
         _record_failure(db, row, str(exc)[:200], now, config_error=exc.config_error)

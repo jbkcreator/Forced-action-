@@ -124,9 +124,16 @@ def test_unexpected_error_recorded_without_detail(prequal_db):
     assert _row(prequal_db, lid)["last_error"] == "unexpected RuntimeError"
 
 
-def test_gives_up_after_window(prequal_db):
+def test_gives_up_after_window_and_flags_once(prequal_db, caplog):
     lid = _q(prequal_db)
     prequal_db.execute(text("UPDATE lending.prequal_letters SET created_at = :t WHERE id = :id"),
                        {"t": NOW - timedelta(hours=25), "id": lid})
-    assert send_pending(prequal_db, FakeSink(), fits, enabled=True, pct=10, now=NOW) == 0
-    assert _row(prequal_db, lid)["status"] == "pending"
+    with caplog.at_level("WARNING"):
+        assert send_pending(prequal_db, FakeSink(), None, enabled=True, pct=10, now=NOW) == 0
+    row = _row(prequal_db, lid)
+    assert row["status"] == "failed" and row["last_error"].startswith("gave up")
+    assert any("giving up" in r.message for r in caplog.records)
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        send_pending(prequal_db, FakeSink(), fits, enabled=True, pct=10, now=NOW)
+    assert not any("giving up" in r.message for r in caplog.records)
