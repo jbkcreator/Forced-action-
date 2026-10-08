@@ -55,16 +55,17 @@ def test_at_7_20pm_et_it_posts_once(wired):
 def test_rendered_scoreboard_has_aligned_tables_and_a_totals_grid():
     from datetime import date
 
-    from src.lending.scoreboard import Row, ScoreboardData, format_blocks, format_slack
+    from src.lending.scoreboard import NumberRow, Row, ScoreboardData, format_blocks, format_slack
 
-    maria, josh = Row("Maria", 21, 7, 4, 2, 2), Row("Josh `the` closer with a very long display name", 16, 5, 2, 1, 0)
-    data = ScoreboardData([maria, josh], [maria], [], Row("TOTAL", 37, 12, 6, 3, 2))
+    maria, josh = Row("Maria", 21, 7, 4, 2, 2, 1), Row("Josh `the` closer with a very long display name", 16, 5, 2, 1, 0)
+    data = ScoreboardData([maria, josh], [maria], [], Row("TOTAL", 37, 12, 6, 3, 2, 1), [NumberRow("+18135550100", 37, 20)])
     blocks = format_blocks(data, date(2026, 10, 5))
     assert blocks[0]["type"] == "header" and "Mon Oct 5, 2026" in blocks[0]["text"]["text"]
     grid = next(b for b in blocks if b["type"] == "section" and "fields" in b)["fields"]
-    assert [f["text"] for f in grid][:2] == ["*Dials*\n37", "*Live*\n12"] and "*Showed*\nn/a (GHL)" in [f["text"] for f in grid]
+    assert [f["text"] for f in grid][:2] == ["*Dials*\n37", "*Live*\n12"] and "*Showed*\n1" in [f["text"] for f in grid]
     tables = [b["text"]["text"] for b in blocks if b["type"] == "section" and "text" in b]
-    assert len(tables) == 3 and "_no dials_" in tables[2]
+    assert len(tables) == 4 and "_no dials_" in tables[2]
+    assert "+18135550100" in tables[3] and "54%" in tables[3]  # caller-ID answer rate table
     rows = tables[0].split("```")[1].strip().splitlines()
     assert len({len(r) for r in rows if not r.startswith("-")}) == 1  # every row padded to the same width
     assert "`the`" not in tables[0] and "…" in tables[0]
