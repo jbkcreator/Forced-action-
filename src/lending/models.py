@@ -27,6 +27,8 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from config.lending_text_back import SLOT_HOLDING_SQL
+
 LENDING_SCHEMA = "lending"
 
 
@@ -292,11 +294,15 @@ class LendingMissedCallEvent(LendingBase):
     caller_id_number: Mapped[Optional[str]] = mapped_column(String(50))
     property_address: Mapped[Optional[str]] = mapped_column(String(300))
     reason: Mapped[Optional[str]] = mapped_column(String(300))
-    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending", server_default="pending")  # pending / blocked / duplicate_day
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="pending", server_default="pending")
+    # pending / sending / sent / send_unknown / dry_run / failed / blocked / duplicate_day / skipped_*
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    template_key: Mapped[Optional[str]] = mapped_column(String(20))
+    provider_message_id: Mapped[Optional[str]] = mapped_column(String(100))
 
     __table_args__ = (
-        Index("uq_lending_missed_call_phone_day", "phone", "event_date_et", unique=True, postgresql_where=text("status <> 'duplicate_day'")),
+        Index("uq_lending_missed_call_phone_day", "phone", "event_date_et", unique=True, postgresql_where=text(SLOT_HOLDING_SQL)),
         Index("idx_lending_missed_call_events_pending", "created_at", postgresql_where=text("status = 'pending'")),
     )
 
@@ -315,6 +321,28 @@ class LendingTextConsent(LendingBase):
     revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (Index("uq_lending_text_consents_phone_source", "phone", "source", unique=True),)
+
+
+class LendingGhlStageEvent(LendingBase):
+    """A GHL opportunity entering a pipeline stage (workflow webhook). One row per opportunity + stage:
+    a redelivered webhook is a no-op, so the scoreboard counts each stage entry once."""
+
+    __tablename__ = "ghl_stage_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    ghl_opportunity_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    pipeline_id: Mapped[Optional[str]] = mapped_column(String(100))
+    stage_name: Mapped[str] = mapped_column(String(100), nullable=False)  # as GHL sent it
+    stage_key: Mapped[str] = mapped_column(String(100), nullable=False)  # lower-cased, for matching config
+    phone: Mapped[Optional[str]] = mapped_column(String(20))  # phone_utils.normalize
+    booked_by: Mapped[Optional[str]] = mapped_column(String(200))  # fallback when no BOOKED call matches the phone
+    event_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    raw_event: Mapped[dict] = mapped_column(JSONB, nullable=False)
+
+    __table_args__ = (
+        Index("uq_lending_ghl_stage_events_opp_stage", "ghl_opportunity_id", "stage_key", unique=True),
+        Index("idx_lending_ghl_stage_events_stage_at", "stage_key", "event_at"),
+    )
 
 
 class LendingMissedCallText(LendingBase):

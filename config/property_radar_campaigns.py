@@ -17,8 +17,9 @@ CAMPAIGN_CRITERIA — keyed by (state, campaign_key). Each value is a list of
     auction_winner          List 6 — trustee-sale buyers
   PropertyRadar does not code the named hard-money lenders as Private, so
   maturity_target_lender and private_maturity never overlap. stalled_flip
-  excludes loans inside the state's private_maturity window so the same
-  record is not bought twice under two campaigns (seen_ids is per campaign).
+  and private_maturity overlap as a loan ages, so they share seen_ids
+  (SHARED_SEEN_CAMPAIGNS); stalled_flip also excludes today's private_maturity
+  window to save export credits.
   None of these lending campaigns has a handoff entry in
   config/property_radar_handoff.py, so the FA Max handoff skips them.
 
@@ -255,3 +256,10 @@ _CAMPAIGN_BUILDERS: dict[tuple[str, str], object] = {
 
 # Default campaign run for each state — the daily/backlog pull targets this
 DEFAULT_CAMPAIGN: str = "maturity_target_lender"
+
+# Campaigns whose criteria overlap over time: a record either one bought is
+# skipped by the other, so it is never billed twice.
+SHARED_SEEN_CAMPAIGNS: dict[str, tuple[str, ...]] = {
+    "stalled_flip": ("private_maturity",),
+    "private_maturity": ("stalled_flip",),
+}

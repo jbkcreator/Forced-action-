@@ -10,6 +10,8 @@ from src.lending.pr_maturity_bridge import (
     SOURCE_TABLE,
     _compose_address,
     _first_phone,
+    _phones_in_other_pools,
+    _pick_phone,
     _to_decimal,
     build_pool_row,
     map_entity_status,
@@ -151,6 +153,7 @@ class TestRunSelection:
         monkeypatch.setattr(bridge, "latest_run_id", lambda session: latest)
         monkeypatch.setattr(bridge, "_iter_record_pages", lambda session, state: iter([[record]]))
         monkeypatch.setattr(bridge, "_load_trace_contacts", lambda session, keys: {})
+        monkeypatch.setattr(bridge, "_phones_in_other_pools", lambda session, run_id, state=None: set())
         monkeypatch.setattr(bridge, "_clear_previous_rows",
                             lambda session, run_id, state: calls["cleared"].append(run_id))
         monkeypatch.setattr(bridge, "_write_rows",
@@ -168,6 +171,16 @@ class TestRunSelection:
         bridge, calls = self._patch(monkeypatch, latest=None)
         summary = bridge.extract_pr_maturity_pool(session=None, dry_run=False)
         assert summary["run_id"] and summary["run_id"] != "extract-run-1"
+
+    def test_shared_traced_phone_goes_to_one_row_only(self, monkeypatch):
+        bridge, calls = self._patch(monkeypatch, latest="extract-run-1")
+        r1, r2 = TestBuildPoolRow()._record(radar_id="R1"), TestBuildPoolRow()._record(radar_id="R2")
+        monkeypatch.setattr(bridge, "_iter_record_pages", lambda session, state: iter([[r1], [r2]]))
+        shared = {"phones": ["8135550142"], "emails": []}
+        monkeypatch.setattr(bridge, "_load_trace_contacts",
+                            lambda session, keys: {k: shared for k in keys})
+        bridge.extract_pr_maturity_pool(session=None, dry_run=False)
+        assert [r["phone_available"] for r in calls["written"]] == [True, False]
 
     def test_dry_run_clears_nothing(self, monkeypatch):
         bridge, calls = self._patch(monkeypatch, latest="extract-run-1")
@@ -192,3 +205,49 @@ def test_traced_contacts_are_read_from_the_table_the_live_trace_writes_by_radar_
     assert "property_radar_traced_contacts" in sql and "radar_id" in sql and "trace_key" not in sql
     assert got == {"R1": {"phones": ["8135550111"], "emails": ["a@b.co"]}, "R2": {"phones": [], "emails": []}}
     assert bridge._load_trace_contacts(session, []) == {}
+
+
+class TestPickPhone:
+    def test_first_free_phone_is_taken_and_reserved(self):
+        taken: set[str] = set()
+        assert _pick_phone(["(813) 555-0142"], taken) == "+18135550142"
+        assert taken == {"+18135550142"}
+
+    def test_same_phone_on_a_second_record_is_not_reused(self):
+        taken = {"+18135550142"}
+        assert _pick_phone(["813-555-0142"], taken) is None
+
+    def test_second_phone_is_used_when_first_is_taken(self):
+        taken = {"+18135550142"}
+        assert _pick_phone(["8135550142", "8135550199"], taken) == "+18135550199"
+        assert "+18135550199" in taken
+
+    def test_junk_and_empty_lists_give_none(self):
+        assert _pick_phone(["nope"], set()) is None
+        assert _pick_phone([], set()) is None
+
+
+class _PhoneSession:
+    def __init__(self, phones):
+        self._phones, self.params = phones, None
+
+    def execute(self, _stmt, params=None):
+        self.params = params
+        phones = self._phones
+
+        class _R:
+            def scalars(self_inner):
+                return phones
+        return _R()
+
+
+def test_phones_in_other_pools_excludes_our_pool_and_nulls():
+    session = _PhoneSession(["+18135550142", None, "junk", "(813) 555-0199"])
+    assert _phones_in_other_pools(session, "run-1") == {"+18135550142", "+18135550199"}
+    assert session.params == {"run_id": "run-1", "pool": "pr_maturity"}
+
+
+def test_state_scoped_run_also_reserves_other_states_of_our_pool():
+    session = _PhoneSession([])
+    _phones_in_other_pools(session, "run-1", "fl")
+    assert session.params == {"run_id": "run-1", "pool": "pr_maturity", "state": "FL"}

@@ -1,5 +1,4 @@
-"""Call-record poller: every finished call becomes an attempt row (3-attempt rail), and each
-new no-answer gets its missed-call text decision (WP-GL-9).
+"""SUPERSEDED (WP-GL-9): the missed-call text now runs inside src.lending.cdr_poller. Kept for its tests; do not run.
 
 Sends only when MISSED_CALL_TEXT_ENABLED=true; otherwise every no-answer is logged as
 ``dry_run``. One cycle at a time (advisory lock), one transaction per cycle.
@@ -134,6 +133,9 @@ def run_cycle(db, *, http, enabled: bool, now: Optional[datetime] = None) -> Opt
 
 
 def main(argv: list[str] | None = None) -> None:
+    logger.error("[missed-call-poller] superseded by the text-back step in src.lending.cdr_poller (WP-GL-9, GHL sender); "
+                 "not starting. Running two readers of the call feed would double-count attempts.")
+    return
     from src.core.database import get_db_context
     from src.lending.dialer_port import _requests_http
 

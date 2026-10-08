@@ -12,7 +12,7 @@ from __future__ import annotations
 import argparse
 import logging
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 from sqlalchemy import text
 
@@ -25,12 +25,29 @@ from src.lending.dialer_port import get_http
 logger = logging.getLogger(__name__)
 
 
-def run_cycle(db, http, *, rescan: bool) -> IngestStats:
+def run_cycle(db, http, *, rescan: bool, after_poll: Optional[Callable[[], None]] = None) -> IngestStats:
+    """``after_poll`` runs right after the fast poll and before the (slower) rescan, so a text queued by
+    the poll is not delayed by the rescan; the 60 s window applies."""
     retry_unpropagated_dnc(db)
     stats = poll_new(db, http)
+    if after_poll is not None:
+        db.commit()  # the step reads the events in its own session, so they must be visible
+        after_poll()
     if rescan:
         stats = stats + rescan_today(db, http)
     return stats
+
+
+def text_back_step() -> None:
+    """WP-GL-9: send the missed-call texts queued by the cycle that just ran. Never blocks ingestion."""
+    try:
+        from src.lending.text_back import run_text_back_cycle
+
+        counts = run_text_back_cycle()
+        if counts:
+            logger.info("[lending-cdr-poller] text-back %s", counts)
+    except Exception as exc:  # class only: bodies carry phone numbers
+        logger.error("[lending-cdr-poller] text-back cycle failed (%s); retrying next interval", type(exc).__name__)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -65,7 +82,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             due = time.monotonic() >= next_rescan
             try:
                 with lending_session() as db:
-                    stats = run_cycle(db, http, rescan=due or args.once)
+                    stats = run_cycle(db, http, rescan=due or args.once, after_poll=text_back_step)
                 if due:
                     next_rescan = time.monotonic() + CDR_RESCAN_SECONDS
                 if stats.processed or stats.failed:
@@ -75,6 +92,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 logger.error("[lending-cdr-poller] cycle failed (%s); retrying next interval", type(exc).__name__)
                 if args.once:
                     raise
+            text_back_step()
             if args.once:
                 return 0
             time.sleep(CDR_POLL_SECONDS)

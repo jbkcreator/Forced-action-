@@ -31,3 +31,10 @@ def test_both_possible_names_of_the_old_pool_name_check_are_dropped_before_the_n
     assert " calling_pool_staging_pool_name_check" in dropped     # name from a fresh, migrations-only build
     assert all(i < add for i in drops)
     assert "auction_winner" in session.statements[add] and "permit_owner" in session.statements[add]
+
+
+def test_rebuilt_check_keeps_the_pr_maturity_pool():
+    session = _RecordingSession()
+    _load_migration().apply(session)
+    add = next(s for s in session.statements if "ADD CONSTRAINT" in s)
+    assert "'pr_maturity'" in add

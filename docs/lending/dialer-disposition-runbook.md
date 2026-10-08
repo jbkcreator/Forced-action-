@@ -1,7 +1,7 @@
 # Dialer call disposition logging: setup runbook
 
 Every dialer call becomes one row in `lending.call_dispositions`; unanswered calls also queue a
-`lending.missed_call_events` row (no consumer; see the handoff section). The result reaches the Google Sheet and Slack `#dial-tasks`
+`lending.missed_call_events` row (consumed by the WP-GL-9 text-back; see the handoff section). The result reaches the Google Sheet and Slack `#dial-tasks`
 within 30 seconds. This runbook is vendor-neutral; the BatchDialer-specific steps are marked.
 
 Call results are ingested by **polling BatchDialer call records (CDRs)** with the service
@@ -27,7 +27,7 @@ CDR, and how a contact is held. Confirm them before go-live.
    - `BATCHDIALER_API_KEY` (the API token: **User icon → Settings → Integrations → Custom Integration**; shared with the dialer load; `.env` only, never in chat or PRs)
 3. Start `fa-lending-cdr-poller` (`deploy/systemd/fa-lending-cdr-poller.service`). Run **exactly one
    instance**: the `/v2/cdrs/last` watermark is per API key, so a second poller (or anything else using
-   that endpoint with the same key) steals records.
+   that endpoint with the same key) steals records. The GHL webhooks are served by `lending-api` (`127.0.0.1:8010`), not fa-api.
    Poller behavior to know:
    - Inbound calls get no call row, except calls disposed `DNC_REQUEST` (those are opted out; no attempt is counted). An answered inbound call (duration > 0) records `inbound_call` text consent, so the inbound/callback queue's campaign id must be in `LENDING_DIALER_CAMPAIGN_IDS`.
    - The day rescan re-reads today and yesterday (UTC) every few minutes. After an outage longer than that,
@@ -102,16 +102,12 @@ All 13 results exist in BatchDialer (group "Lending", created). Only the three b
 
 ### Handoff to the text-back task
 
-- The sender is PR #320's WP-GL-9 pipeline: `src/lending/missed_call_text.py`, `missed_call_poller.py`, table `lending.missed_call_texts`,
-  setting `missed_call_text_enabled`. It reads BatchDialer CDRs itself.
-- Its `consent_gated_sender` uses FA `send_sms` (Telnyx) and currently blocks every send (`skipped_sms_gate`). The client wants GHL on a
-  Next Deal Lending number, consented numbers only, and no text if 10DLC does not clear. That developer should replace the gate with
-  `src.lending.consent.has_text_consent(db, phone)` and the sender with GHL. Nothing else from #319 is promised to the sender.
+- The text-back is built (WP-GL-9): `src/lending/text_back.py`, run from `fa-lending-cdr-poller`. It consumes
+  `lending.missed_call_events`, gates on `src.lending.consent.has_text_consent`, and sends through GoHighLevel. PR #320's
+  `missed_call_poller` / `missed_call_texts` are superseded. Setup, rules and go-live: `docs/lending/text-back-runbook.md`.
 - `record_consent` re-grants a revoked consent because the BatchDialer field `text_consent=yes` stays on the contact, so whoever calls
-  `revoke_consent()` must also clear that dialer field. Today STOP/DNC are enforced through suppression/`do_not_contact` inside
-  `has_text_consent`, so nothing calls revoke yet.
-- #319's `lending.missed_call_events` / `queue_missed_call()` is not read by that pipeline. Follow-up cleanup: remove it once #320 is merged and
-  the text-back task is live (not deleted here; existing tests and the migration cover it).
+  `revoke_consent()` must also clear that dialer field. A STOP is enforced through suppression/`do_not_contact` inside
+  `has_text_consent` (the dialer field is still `yes`), not by clearing the field.
 
 ### Recordings
 
@@ -127,11 +123,13 @@ All 13 results exist in BatchDialer (group "Lending", created). Only the three b
 
 ### Daily scoreboard
 
-- `src.tasks.lending_daily_scoreboard` posts to `LENDING_DAILY_CHANNEL` at 7:20pm ET, retrying Slack 3 times (two UTC cron lines; only the one at 19:xx ET acts).
+- `src.tasks.lending_daily_scoreboard` posts to `LENDING_DAILY_CHANNEL` (channel ID) at 7:20pm ET, retrying Slack 3 times, after the dialer stops at 7:15pm (UTC cron lines 23:20 and 00:20; only the one at 19:xx ET acts).
   Tables: by caller, by BatchDialer campaign (`dialer_campaign_id`, names from `GET /campaigns`), and by hook (`campaign_tag`).
 - Definitions live in `config/lending_dispositions.py` (`LIVE_CONVERSATION_CODES`, `GATED_CODES`, `NURTURE_SENT_CODES`).
-  Booked excludes `booking_blocked`; Showed is not in the log (client marks Held in GHL), so it prints `n/a (GHL)`.
-- The dialer stops at 7:15pm ET, so the post runs at 7:20pm (cron 23:20 and 00:20 UTC; the 19:xx ET guard picks the right one).
+  Booked excludes `booking_blocked`; Showed comes from GHL stage events (see "GHL showed feed" below), not the log.
+- The post goes out at 7:20pm ET, after the dialer stops at 7:15pm, so every call of the day is counted.
+- A fourth table, by caller-ID number, shows dials, answered (`ANSWERED_CODES`: a person picked up) and answer rate, to spot numbers that drop or get spam-flagged.
+- Not built: abandon rate per campaign. The dialer feed carries no abandoned-call signal and multi-line power dial is not live; add it when BatchDialer reports abandons.
 - Test calls count like real ones. Run with `--force` only after the Friday test, or filter by a test campaign.
 
 ## 4. Acceptance check
@@ -145,3 +143,10 @@ All 13 results exist in BatchDialer (group "Lending", created). Only the three b
 6. A connected call with no disposition after N minutes raises one Slack warning.
 7. The poller logs `processed=N` within 20 s of a test call, and the call row appears; a non-lending campaign is ignored.
 8. `pytest tests/lending/`.
+
+## GHL "showed" feed for the 7pm scoreboard
+
+1. Run `PYTHONPATH=. python migrations/apply_lending_ghl_stage_events.py` (idempotent), and set `LENDING_GHL_WEBHOOK_SECRET` and `LENDING_DAILY_CHANNEL` in `.env`.
+2. In GHL (sub-account): Automation -> Workflows -> new workflow, trigger **Pipeline Stage Changed** on the booked pipeline (stage = the held / showed stage; names matched case-insensitively against `SHOWED_STAGE_KEYS` in `config/lending_dispositions.py`).
+3. Action **Webhook** (POST) to `https://<api host>/webhooks/lending/ghl-stage` with header `X-Webhook-Secret: <the secret>` and JSON body: `opportunity_id` (`{{opportunity.id}}`), `stage_name` (`{{opportunity.pipleline_stage_name}}`), `pipeline_id`, `phone` (`{{contact.phone}}`), optional `booked_by` (the "Booked by" custom field). Use the GHL merge-field picker for the exact variable names.
+4. Showed is credited to the caller / campaign of the latest BOOKED call to that phone; `booked_by` is only the fallback. A repeat delivery of the same opportunity + stage counts once.

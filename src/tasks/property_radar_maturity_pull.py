@@ -67,6 +67,7 @@ from typing import Optional
 from sqlalchemy import text
 
 from config.property_radar_campaigns import (
+    SHARED_SEEN_CAMPAIGNS,
     DEFAULT_CAMPAIGN,
     ENABLED_STATES,
     build_campaign_criteria,
@@ -138,12 +139,13 @@ def _check_budget(
 # ---------------------------------------------------------------------------
 
 def _load_seen_ids(session, state: str, campaign: str) -> frozenset[str]:
+    campaigns = [campaign, *SHARED_SEEN_CAMPAIGNS.get(campaign, ())]
     rows = session.execute(
         text(
             "SELECT radar_id FROM property_radar_seen_ids "
-            "WHERE state = :s AND campaign = :c"
+            "WHERE state = :s AND campaign = ANY(:cs)"
         ),
-        {"s": state, "c": campaign},
+        {"s": state, "cs": campaigns},
     ).fetchall()
     return frozenset(r[0] for r in rows)
 

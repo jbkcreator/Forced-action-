@@ -289,20 +289,31 @@ def get_passed_gate_for_link(session, tracked_link_id: int) -> Optional[str]:
 
 
 def get_passed_gate_by_id(session, gate_id: str) -> Optional[Any]:
-    """Return the gate row if gate_id exists and passed. None otherwise.
+    """Return the gate row if gate_id passed and is still its link's latest gate. None otherwise.
 
     Includes answers/captured_by so book() can forward property_address and
     booked_by to the booking-confirmed payload without a second query.
     """
     row = session.execute(
         sa_text(
-            "SELECT gate_id, list_key, result, answers, captured_by "
-            "FROM fa_max_booking_gates WHERE gate_id = :gate_id"
+            """
+            SELECT g.gate_id, g.list_key, g.result, g.answers, g.captured_by,
+                   (SELECT l.gate_id FROM fa_max_booking_gates l
+                     WHERE l.tracked_link_id = g.tracked_link_id
+                     ORDER BY l.evaluated_at DESC LIMIT 1) AS latest_gate_id
+              FROM fa_max_booking_gates g
+             WHERE g.gate_id = :gate_id
+            """
         ),
         {"gate_id": gate_id},
     ).mappings().first()
 
     if row is None or row["result"] != "pass":
+        return None
+
+    # Same rule as get_passed_gate_for_link: a later re-screen on the same link
+    # (pass or fail) supersedes this one, so a stale pass never books.
+    if row["latest_gate_id"] is not None and row["latest_gate_id"] != row["gate_id"]:
         return None
 
     if _is_list_blocked(row["list_key"]):

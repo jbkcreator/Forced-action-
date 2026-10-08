@@ -30,6 +30,15 @@ def db():
     engine.dispose()
 
 
+@pytest.fixture(autouse=True)
+def removed_from_dialer(monkeypatch):
+    """Never reach the real dialer: record the removals instead."""
+    removed = []
+    monkeypatch.setattr("src.lending.compliance._default_dialer_remover",
+                        lambda: lambda phone, reason=None: removed.append(phone))
+    return removed
+
+
 @pytest.fixture
 def client(db, monkeypatch):
     from src.api.deps import get_db

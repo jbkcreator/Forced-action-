@@ -40,7 +40,7 @@ from src.services.calendar.availability import (
     _require_aware,
     compute_free_slots,
 )
-from src.services.calendar.client import CalendarClient, CalendarEvent
+from src.services.calendar.client import CalendarClient, CalendarEvent, CalendarOutcomeUnknown
 
 logger = logging.getLogger(__name__)
 
@@ -228,6 +228,12 @@ def book(
             attendee_email=attendee_email,
             description=description,
         )
+    except CalendarOutcomeUnknown:
+        # GHL may hold the meeting already. Keep the claim so no one else gets the
+        # slot, and page a human to check GHL. Releasing it could double-book.
+        logger.error("calendar.book: create outcome unknown booking_ref=%s — claim kept", booking_ref)
+        _alert_create_outcome_unknown(booking_ref)
+        raise
     except Exception:
         # Release the slot: a pending row holds it against everyone else, and
         # no meeting was created to justify that.
@@ -373,6 +379,25 @@ def _notify_booking_confirmed(
             "booking stands, reminders will not fire for this one", booking_ref,
         )
         _alert_booking_confirmed_failed(booking_ref)
+
+
+def _alert_create_outcome_unknown(booking_ref: str) -> None:
+    """Page EXCEPTIONS when GHL may or may not have created the meeting. Never raises."""
+    try:
+        from src.services.relay import exceptions_alert_queue
+
+        exceptions_alert_queue.enqueue_and_attempt(
+            venture_key=CALENDAR_VENTURE_KEY,
+            rule="booking_create_outcome_unknown",
+            message=(
+                f"*Booking outcome unknown* — `{booking_ref}`\n"
+                f"GHL did not answer the create-appointment call. Check Josh's GHL calendar for this "
+                f"slot: if the meeting exists, confirm the booking by hand; if not, cancel the pending row."
+            ),
+        )
+    except Exception:
+        logger.exception("calendar.book: booking_ref=%s — EXCEPTIONS alert for unknown outcome failed",
+                         booking_ref)
 
 
 def _alert_booking_confirmed_failed(booking_ref: str) -> None:

@@ -28,6 +28,11 @@ class CalendarUnavailable(RuntimeError):
     """
 
 
+class CalendarOutcomeUnknown(CalendarUnavailable):
+    """A write was sent but no answer came back: the provider may or may not have
+    applied it. Never retried, because a blind retry can double-create."""
+
+
 @dataclass(frozen=True)
 class CalendarEvent:
     """A booking as the calendar provider reports it back."""

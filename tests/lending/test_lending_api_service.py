@@ -17,7 +17,7 @@ FA_API_MAIN = Path(__file__).resolve().parents[2] / "src" / "api" / "main.py"
 
 
 def _paths(application) -> set[str]:
-    return {route.path for route in application.routes}
+    return set(application.openapi()["paths"])   # not app.routes: newer FastAPI wraps included routers
 
 
 def test_lending_app_serves_the_lending_webhooks_and_health():
@@ -25,6 +25,13 @@ def test_lending_app_serves_the_lending_webhooks_and_health():
     assert "/webhooks/lending/ghl-opt-out" in paths
     assert "/api/lending/web-leads" in paths
     assert "/health" in paths
+
+
+def test_lending_app_serves_the_booking_reply_and_consent_webhooks():
+    paths = _paths(app)
+    for path in ("/ghl-appointment", "/booking-confirmed", "/confirmation-task-complete", "/ghl-nurture",
+                 "/booking-gate-failed", "/ghl-reply", "/ghl-text-consent"):
+        assert f"/webhooks/lending{path}" in paths, path
 
 
 def test_health():

@@ -959,3 +959,38 @@ class TestBookingPageGateEnforcement:
         data = resp.json()
         assert data["booked"] is False
         assert data["reason"] == "gate_not_passed"
+
+
+class _GateRowSession:
+    def __init__(self, row):
+        self._row = row
+
+    def execute(self, _stmt, _params=None):
+        result = MagicMock()
+        result.mappings.return_value.first.return_value = self._row
+        return result
+
+
+def _gate_row(**over):
+    row = {"gate_id": "g1", "list_key": None, "result": "pass", "answers": {}, "captured_by": "dana",
+           "latest_gate_id": "g1"}
+    row.update(over)
+    return row
+
+
+class TestPassedGateMustBeLatest:
+    def test_latest_pass_books(self):
+        from src.services.calendar.gate import get_passed_gate_by_id
+        assert get_passed_gate_by_id(_GateRowSession(_gate_row()), "g1")["gate_id"] == "g1"
+
+    def test_pass_superseded_by_a_later_gate_is_refused(self):
+        from src.services.calendar.gate import get_passed_gate_by_id
+        assert get_passed_gate_by_id(_GateRowSession(_gate_row(latest_gate_id="g2")), "g1") is None
+
+    def test_gate_without_link_still_books(self):
+        from src.services.calendar.gate import get_passed_gate_by_id
+        assert get_passed_gate_by_id(_GateRowSession(_gate_row(latest_gate_id=None)), "g1") is not None
+
+    def test_failed_gate_is_refused(self):
+        from src.services.calendar.gate import get_passed_gate_by_id
+        assert get_passed_gate_by_id(_GateRowSession(_gate_row(result="fail")), "g1") is None

@@ -11,6 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from config.settings import get_settings
 from src.api.lending_ghl_router import router as lending_ghl_router
+from src.lending.booking_webhook import router as lending_booking_webhook_router
+from src.lending.reply_webhook import router as lending_reply_webhook_router
 from src.api.lending_web_router import router as lending_web_router
 
 app = FastAPI(title="Lending API", docs_url=None, redoc_url=None)
@@ -23,6 +25,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(lending_ghl_router)
+app.include_router(lending_booking_webhook_router)
+app.include_router(lending_reply_webhook_router)
 app.include_router(lending_web_router)
 
 
