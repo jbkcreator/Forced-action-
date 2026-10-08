@@ -71,10 +71,10 @@ def enqueue_nurture(
         queue_id = row["id"] if row else None
     except Exception:
         logger.exception(
-            "nurture.enqueue: DB write failed gate_id=%s", gate_id
+            "nurture.enqueue: DB write failed gate_id=%s — still pushing to GHL", gate_id
         )
         session.rollback()
-        return -1
+        queue_id = None
 
     pushed = _route_to_ghl_nurture(
         session,
