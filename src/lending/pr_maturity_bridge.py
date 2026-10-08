@@ -220,6 +220,29 @@ def _first_phone(phones: list) -> Optional[str]:
     return None
 
 
+def _pick_phone(phones: list, taken: set[str]) -> Optional[str]:
+    """First normalized phone not already in this run; reserves it. The dialer load
+    refuses a run where one phone sits on two records, so each phone goes to one row."""
+    for raw in phones:
+        norm = normalize_phone(str(raw))
+        if norm and norm not in taken:
+            taken.add(norm)
+            return norm
+    return None
+
+
+def _phones_in_other_pools(session: Session, run_id: str) -> set[str]:
+    """Phones the other pools already staged in this run."""
+    rows = session.execute(
+        text(
+            "SELECT normalized_phone FROM lending.calling_pool_staging "
+            "WHERE run_id = CAST(:run_id AS uuid) AND pool_name <> :pool"
+        ),
+        {"run_id": run_id, "pool": POOL_NAME},
+    ).scalars()
+    return {p for p in rows if p}
+
+
 def _clear_previous_rows(session: Session, run_id: str, *, state: Optional[str]) -> None:
     """Drop this pool's earlier rows in the run so a re-run replaces them."""
     clause = " AND state = :state" if state else ""
@@ -257,10 +280,13 @@ def extract_pr_maturity_pool(
     With ``dry_run`` the rows are built and counted but nothing is written.
     Records with no traced phone are still written (phone_available=False) so a
     later trace can be joined without a re-extract (WP-W0-1 O15 convention).
+    Each phone goes to one row only: a phone already in the run (any pool) is skipped
+    and the record gets its next traced phone, or none.
     """
     run_id = latest_run_id(session) or str(uuid.uuid4())
     if not dry_run:
         _clear_previous_rows(session, run_id, state=state)
+    taken = _phones_in_other_pools(session, run_id)
     total = with_phone = ga = ga_dialable = written = 0
 
     for records in _iter_record_pages(session, state=state):
@@ -269,7 +295,7 @@ def extract_pr_maturity_pool(
         for r in records:
             c = contacts.get(r["radar_id"], {"phones": [], "emails": []})
             email = c["emails"][0].lower() if c["emails"] else None
-            rows.append(build_pool_row(r, run_id=run_id, phone=_first_phone(c["phones"]), email=email))
+            rows.append(build_pool_row(r, run_id=run_id, phone=_pick_phone(c["phones"], taken), email=email))
 
         total += len(rows)
         with_phone += sum(1 for row in rows if row["phone_available"])

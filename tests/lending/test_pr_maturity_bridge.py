@@ -192,3 +192,46 @@ def test_traced_contacts_are_read_from_the_table_the_live_trace_writes_by_radar_
     assert "property_radar_traced_contacts" in sql and "radar_id" in sql and "trace_key" not in sql
     assert got == {"R1": {"phones": ["8135550111"], "emails": ["a@b.co"]}, "R2": {"phones": [], "emails": []}}
     assert bridge._load_trace_contacts(session, []) == {}
+
+
+from src.lending.pr_maturity_bridge import _phones_in_other_pools, _pick_phone
+
+
+class TestPickPhone:
+    def test_first_free_phone_is_taken_and_reserved(self):
+        taken: set[str] = set()
+        assert _pick_phone(["(813) 555-0142"], taken) == "+18135550142"
+        assert taken == {"+18135550142"}
+
+    def test_same_phone_on_a_second_record_is_not_reused(self):
+        taken = {"+18135550142"}
+        assert _pick_phone(["813-555-0142"], taken) is None
+
+    def test_second_phone_is_used_when_first_is_taken(self):
+        taken = {"+18135550142"}
+        assert _pick_phone(["8135550142", "8135550199"], taken) == "+18135550199"
+        assert "+18135550199" in taken
+
+    def test_junk_and_empty_lists_give_none(self):
+        assert _pick_phone(["nope"], set()) is None
+        assert _pick_phone([], set()) is None
+
+
+class _PhoneSession:
+    def __init__(self, phones):
+        self._phones, self.params = phones, None
+
+    def execute(self, _stmt, params=None):
+        self.params = params
+        phones = self._phones
+
+        class _R:
+            def scalars(self_inner):
+                return phones
+        return _R()
+
+
+def test_phones_in_other_pools_excludes_our_pool_and_nulls():
+    session = _PhoneSession(["+18135550142", None])
+    assert _phones_in_other_pools(session, "run-1") == {"+18135550142"}
+    assert session.params == {"run_id": "run-1", "pool": "pr_maturity"}
