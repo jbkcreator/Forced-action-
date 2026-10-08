@@ -359,3 +359,11 @@ def evaluate_batch(
     geography cache here if the batch is large and all deals share a state.
     """
     return [(ref, evaluate(deal, db)) for ref, deal in deals]
+
+
+# ---------------------------------------------------------------------------
+# T-05 generic multi-lender engine — re-exported here for spec compliance.
+# Implementation lives in src/lending/lender_fit.py (no DB dependency).
+# Existing callers of evaluate() and evaluate_batch() above are unaffected.
+# ---------------------------------------------------------------------------
+from src.lending.lender_fit import evaluate_lender_fit as evaluate_lender_fit  # noqa: E402,F401
