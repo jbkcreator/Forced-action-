@@ -18,6 +18,7 @@ from config.lending_prequal import GIVE_UP_AFTER_HOURS, RETRY_BACKOFF_MINUTES, S
 from src.lending.pdf.render import NON_BINDING_PREQUAL_WATERMARK, render_pdf
 from src.lending.prequal import TEMPLATE, PrequalLead, PrequalSink, build_context, should_generate
 from src.lending.prequal_fit import FitEvaluator
+from src.lending.prequal_ghl import SendOutcomeUnknown
 from src.lending.web_leads import DeliveryError
 
 logger = logging.getLogger(__name__)
@@ -130,6 +131,16 @@ def _flag_uncertain(db, now: datetime) -> int:
     return len(rows)
 
 
+def _mark_uncertain(db, letter_id: int, reason: str, now: datetime) -> None:
+    """The email may have gone out: never retried automatically, checked in GHL by hand."""
+    db.execute(
+        text("UPDATE lending.prequal_letters SET status = 'uncertain', last_attempt_at = :now, "
+             "last_error = :err WHERE id = :id"),
+        {"now": now, "err": f"{_UNCERTAIN_ERROR} ({reason})"[:200], "id": letter_id},
+    )
+    logger.warning("[prequal] letter id=%s send outcome unknown, not retried: %s", letter_id, reason)
+
+
 def _send_one(db, sink: PrequalSink, evaluator: FitEvaluator, row: dict[str, Any], pct: int, now: datetime) -> int:
     lead = PrequalLead(credit_band=row["credit_band"], loan_amount=int(row["loan_amount"]),
                        property_state=row["property_state"], loan_type=row["loan_type"])
@@ -141,6 +152,9 @@ def _send_one(db, sink: PrequalSink, evaluator: FitEvaluator, row: dict[str, Any
             return 0
         pdf = render_pdf(TEMPLATE, ctx, watermark=NON_BINDING_PREQUAL_WATERMARK)
         sink.deliver(row["id"], row["ghl_contact_id"], pdf)
+    except SendOutcomeUnknown as exc:
+        _mark_uncertain(db, row["id"], str(exc)[:200], now)
+        return 0
     except DeliveryError as exc:
         _record_failure(db, row, str(exc)[:200], now, config_error=exc.config_error)
         return 0

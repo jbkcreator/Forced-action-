@@ -93,6 +93,14 @@ def ghl_post_multipart(path: str, *, headers: Dict[str, str], files: Dict[str, A
     return _ghl_request("POST", f"{_GHL_BASE}{path}", headers=headers, files=files, data=data)
 
 
+def ghl_post_once(path: str, *, headers: Dict[str, str], json: Dict[str, Any]) -> requests.Response:
+    """Single-attempt POST for a non-idempotent send (e.g. an email). Never retried: a timeout or a
+    dropped connection can come after GHL accepted the request, so a retry could send it twice.
+    Network errors are raised to the caller, which decides what an unknown outcome means."""
+    time.sleep(0.5)  # same baseline throttle as _ghl_request
+    return requests.request("POST", f"{_GHL_BASE}{path}", headers=headers, json=json, timeout=_DEFAULT_TIMEOUT)
+
+
 def _is_configured() -> bool:
     """Return True only if the minimum required GHL env vars are present."""
     return bool(settings.ghl_api_key is not None and settings.ghl_location_id)

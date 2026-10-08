@@ -37,9 +37,8 @@ class RecordingSink(GhlPrequalAttachmentSink):
         self.calls.append(("upload", contact_id, pdf))
         return FILE_URL
 
-    def _call(self, step, method, path, **kwargs):
-        self.calls.append((step, method, path, kwargs.get("json")))
-        return {}
+    def _send_email(self, body):
+        self.calls.append(("prequal email send", "POST", "/conversations/messages", body))
 
 
 @pytest.fixture
@@ -99,3 +98,64 @@ def test_upload_http_error_raises(monkeypatch):
 def test_upload_without_url_raises(monkeypatch):
     with pytest.raises(DeliveryError):
         _real_upload(monkeypatch, _Resp(payload={"uploadedFiles": {}}))._upload("cid1", b"%PDF")
+
+
+def _send_with(monkeypatch, outcome):
+    """Real _send_email against a stubbed single-attempt POST; returns the number of POSTs made."""
+    from src.services import ghl_webhook
+
+    calls = []
+
+    def fake_post_once(path, **kwargs):
+        calls.append(path)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(ghl_webhook, "ghl_post_once", fake_post_once)
+    sink = GhlPrequalAttachmentSink(_Account())
+    try:
+        sink._send_email({"type": "Email"})
+        return calls, None
+    except DeliveryError as exc:
+        return calls, exc
+
+
+def test_send_read_timeout_is_unknown_and_not_retried(monkeypatch):
+    from requests.exceptions import ReadTimeout
+
+    calls, exc = _send_with(monkeypatch, ReadTimeout("slow"))
+    assert calls == ["/conversations/messages"]
+    assert isinstance(exc, prequal_ghl.SendOutcomeUnknown)
+
+
+def test_send_dropped_connection_is_unknown(monkeypatch):
+    from requests.exceptions import ConnectionError as RequestsConnectionError
+
+    calls, exc = _send_with(monkeypatch, RequestsConnectionError("reset"))
+    assert len(calls) == 1 and isinstance(exc, prequal_ghl.SendOutcomeUnknown)
+
+
+def test_send_server_error_is_unknown(monkeypatch):
+    calls, exc = _send_with(monkeypatch, _Resp(status=502, payload={}))
+    assert len(calls) == 1 and isinstance(exc, prequal_ghl.SendOutcomeUnknown)
+
+
+def test_send_connect_timeout_is_a_plain_failure(monkeypatch):
+    from requests.exceptions import ConnectTimeout
+
+    calls, exc = _send_with(monkeypatch, ConnectTimeout("no route"))
+    assert len(calls) == 1
+    assert isinstance(exc, DeliveryError) and not isinstance(exc, prequal_ghl.SendOutcomeUnknown)
+
+
+@pytest.mark.parametrize("status,config", [(429, False), (422, False), (401, True)])
+def test_send_rejected_is_a_plain_failure(monkeypatch, status, config):
+    calls, exc = _send_with(monkeypatch, _Resp(status=status, payload={}))
+    assert len(calls) == 1
+    assert not isinstance(exc, prequal_ghl.SendOutcomeUnknown) and exc.config_error is config
+
+
+def test_send_accepted(monkeypatch):
+    calls, exc = _send_with(monkeypatch, _Resp(status=201, payload={"messageId": "m"}))
+    assert len(calls) == 1 and exc is None

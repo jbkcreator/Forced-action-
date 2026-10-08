@@ -13,7 +13,9 @@ from typing import Optional
 
 from config.lending_web import GHL_CONFIG_ERROR_STATUS_CODES
 from config.settings import get_settings
-from src.lending.ghl_account import ghl_multipart_headers, lending_ghl_account
+from requests.exceptions import ConnectTimeout, RequestException
+
+from src.lending.ghl_account import ghl_headers, ghl_multipart_headers, lending_ghl_account
 from src.lending.prequal import PrequalSink
 from src.lending.web_lead_ghl import GhlLeadSink
 from src.lending.web_leads import DeliveryError
@@ -32,8 +34,13 @@ EMAIL_HTML = (
 )
 
 
+class SendOutcomeUnknown(DeliveryError):
+    """The email request may or may not have reached GHL (timeout, dropped connection, 5xx).
+    The letter must not be retried automatically: that could send the borrower a second email."""
+
+
 class GhlPrequalAttachmentSink(GhlLeadSink):
-    """Reuses GhlLeadSink's JSON request and error handling for the send; the upload is multipart."""
+    """Upload is idempotent and keeps the normal retries; the email send is a single attempt."""
 
     def deliver(self, lead_id: int, contact_id: str, pdf: bytes) -> None:
         url = self._upload(contact_id, pdf)
@@ -42,8 +49,23 @@ class GhlPrequalAttachmentSink(GhlLeadSink):
         email_from = get_settings().lending_prequal_email_from
         if email_from:
             body["emailFrom"] = email_from
-        self._call("prequal email send", "POST", "/conversations/messages", json=body)
+        self._send_email(body)
         logger.info("[prequal] email sent lead_id=%s", lead_id)
+
+    def _send_email(self, body: dict) -> None:
+        from src.services.ghl_webhook import ghl_post_once
+
+        try:
+            response = ghl_post_once("/conversations/messages", headers=ghl_headers(self._account.api_key), json=body)
+        except ConnectTimeout as exc:  # never connected: nothing was sent, safe to retry later
+            raise DeliveryError("prequal email send: ConnectTimeout") from exc
+        except RequestException as exc:
+            raise SendOutcomeUnknown(f"prequal email send: {type(exc).__name__}") from exc
+        if response.status_code >= 500:
+            raise SendOutcomeUnknown(f"prequal email send: HTTP {response.status_code}")
+        if response.status_code >= 400:  # rejected (incl. 429): not sent
+            raise DeliveryError(f"prequal email send: HTTP {response.status_code}",
+                                config_error=response.status_code in GHL_CONFIG_ERROR_STATUS_CODES)
 
     def _upload(self, contact_id: str, pdf: bytes) -> str:
         from src.services.ghl_webhook import ghl_post_multipart

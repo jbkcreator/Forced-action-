@@ -178,3 +178,17 @@ def test_one_failed_save_does_not_resend_the_rest_of_the_batch(prequal_db, monke
     assert sorted(c[0] for c in sink.calls) == sorted([a, b])
     assert _row(prequal_db, a)["status"] == "sent"
     assert _row(prequal_db, b)["status"] == "uncertain"
+
+
+def test_unknown_send_outcome_marks_uncertain_and_is_never_retried(prequal_db):
+    """PR review: a timeout on the email POST must not lead to a second email."""
+    from src.lending.prequal_ghl import SendOutcomeUnknown
+
+    lid = _q(prequal_db)
+    flaky = FakeSink(SendOutcomeUnknown("prequal email send: ReadTimeout"))
+    assert send_pending(prequal_db, flaky, fits, enabled=True, pct=10, letter_id=lid, now=NOW) == 0
+    row = _row(prequal_db, lid)
+    assert row["status"] == "uncertain" and "ReadTimeout" in row["last_error"]
+    sink = FakeSink()
+    assert send_pending(prequal_db, sink, fits, enabled=True, pct=10, now=NOW + timedelta(hours=2)) == 0
+    assert sink.calls == []
