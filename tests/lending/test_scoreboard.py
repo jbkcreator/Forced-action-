@@ -124,4 +124,5 @@ def test_answer_rate_per_caller_id_number(lending_db):
     by = {r.number: r for r in data.by_number}
     assert (by["+18135550001"].dials, by["+18135550001"].answered) == (2, 1)
     assert (by["+18135550002"].dials, by["+18135550002"].answered) == (3, 1)
-    assert "Answer rate 50%" in format_slack(data, DAY)
+    number_section = format_slack(data, DAY).split("By caller-ID number")[1]
+    assert "Answer rate" in number_section and "50%" in number_section

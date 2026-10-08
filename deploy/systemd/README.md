@@ -51,7 +51,7 @@ sudo journalctl -u fa-lending-opt-out-poller -u fa-lending-dialer-sweep -u fa-le
 
 Every `/webhooks/lending/*` route is served by `lending-api` (`src/lending/api.py`, gunicorn on `127.0.0.1:8010`), not by
 `fa-api`, so a lending deploy or crash never touches the main API. Public webhook URLs do not change: nginx routes the
-`/webhooks/lending/` prefix to port 8010 (`deploy/nginx/lending-api.conf.example`, placed above the generic `/webhooks/` block).
+`/webhooks/lending/` and `/api/lending/` (website lead form) prefixes to port 8010 (`deploy/nginx/lending-api.conf.example`, placed above the generic `/webhooks/` and `/api/` blocks).
 
 ```bash
 sudo cp deploy/systemd/lending-api.service /etc/systemd/system/

@@ -62,3 +62,19 @@ def _no_live_ghl(monkeypatch):
     """The shared DB holds real opt-outs: a test poll must never write them to the real GHL
     account. Tests that cover the GHL sync pass their own ``ghl_dnd``."""
     monkeypatch.setattr("src.lending.ghl_dnd.get_ghl_dnd", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_web_lead_sink(monkeypatch):
+    """A test must never push a website lead into the real Next Deal Lending GHL account."""
+    monkeypatch.setattr("src.lending.web_lead_ghl.get_live_sink", lambda: None)
+    monkeypatch.setattr("src.api.lending_web_router.get_live_sink", lambda: None)
+
+
+@pytest.fixture
+def web_leads_db(lending_db):
+    """lending_db plus lending.web_leads (rolled back with the test)."""
+    from migrations.apply_lending_web_leads import apply_to as apply_web_leads
+
+    apply_web_leads(lending_db.get_bind())
+    return lending_db

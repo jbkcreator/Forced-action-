@@ -41,6 +41,8 @@ BATCHDIALER_ENDPOINTS: dict[str, "tuple[str, str] | None"] = {
     "dnc_add": None,
     # Opt-outs delete the contact (no DNC endpoint in the public API). Confirmed live 2026-09-30.
     "contact_delete": ("DELETE", "/contact/{id}"),
+    # Public API docs, "Get Transcription (JSON)": timed {time, role, text} segments per call.
+    "call_transcription": ("GET", "/cdrs/{id}/transcription"),
 }
 # Path discovery (read-only, 2026-09-30): GET-405 (exists, other method) on /contact,
 # /dnclist, /campaigns/search; GET-200 on /cdrs (call records, paged) and /lists.

@@ -104,7 +104,7 @@ def test_standard_message_shows_full_phone_and_details():
     assert "Call result: CONNECTED_NOT_INTERESTED" in fallback
     assert "+18135550142" in body
     assert "Pat Builder" in body and "12 Oak St" in body and "builders" in body
-    assert "https://dialer.example/rec/c1" in body
+    assert "https://dialer.example/rec/c1" not in body
 
 
 def test_booked_gets_the_highlighted_card():
@@ -277,15 +277,9 @@ def test_dnc_removal_pending_alert_says_to_remove_manually_and_never_raises():
     dd.alert_dnc_removal_pending("c9", None, client=slack)
 
 
-def test_recording_line_carries_contact_and_status():
+def test_card_never_shows_a_recording_link():
     record = {"borrower_name": "Pat Doe", "property_address": "1 Main St"}
-    texts = {}
     for status in ("readable", "pending", "forbidden", "missing"):
         _, blocks = dd.build_slack_message(_row(recording_status=status), record)
-        texts[status] = blocks[1]["text"]["text"]
-    assert "Open call recording>" in texts["readable"] and "(Pat Doe | 1 Main St)" in texts["readable"]
-    assert "recording ready" in texts["readable"]
-    assert "recording pending (permission)" in texts["forbidden"]
-    assert "recording not found" in texts["missing"]
-    _, blocks = dd.build_slack_message(_row(recording_ref=None), record)
-    assert "recording" not in blocks[1]["text"]["text"]
+        assert "recording" not in blocks[1]["text"]["text"].lower()
+        assert "https://dialer.example/rec/c1" not in str(blocks)

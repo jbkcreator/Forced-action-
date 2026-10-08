@@ -60,6 +60,9 @@ def _client_ip(request: Request) -> str:
     return "unknown"
 
 
+client_ip = _client_ip  # public name for routers that store the same IP the limiter keyed on
+
+
 def _redis_check(key: str, limit: int, window_seconds: int) -> bool:
     """Returns True if the request should be allowed, False if rate-limited."""
     count = rincr(key, ttl_seconds=window_seconds)

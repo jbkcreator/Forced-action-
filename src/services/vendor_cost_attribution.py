@@ -46,6 +46,7 @@ TASK_TO_PAUSE_TARGET: dict[str, str] = {
     "referral_milestone_sms": "referral_milestone_sms",
     "referral_milestone_email": "referral_milestone_email",
     "edge_case": "edge_case",
+    "lending_call_extraction": "lending_call_extraction",
 }
 
 
