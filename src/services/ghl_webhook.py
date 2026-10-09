@@ -22,7 +22,7 @@ GHL API v2 reference:
 
 import logging
 import time
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 from requests.exceptions import ConnectionError, Timeout, RequestException
@@ -85,6 +85,20 @@ def _ghl_request(method: str, url: str, **kwargs) -> requests.Response:
 
     # resp is the last 429 response after retry exhaustion
     return resp
+
+
+def ghl_post_multipart(path: str, *, headers: Dict[str, str], files: Dict[str, Any], data: Dict[str, Any]) -> requests.Response:
+    """Multipart POST (file upload) to GHL with the same throttle/retry as every other call.
+    ``headers`` must not set Content-Type: requests adds the multipart boundary."""
+    return _ghl_request("POST", f"{_GHL_BASE}{path}", headers=headers, files=files, data=data)
+
+
+def ghl_post_once(path: str, *, headers: Dict[str, str], json: Dict[str, Any]) -> requests.Response:
+    """Single-attempt POST for a non-idempotent send (e.g. an email). Never retried: a timeout or a
+    dropped connection can come after GHL accepted the request, so a retry could send it twice.
+    Network errors are raised to the caller, which decides what an unknown outcome means."""
+    time.sleep(0.5)  # same baseline throttle as _ghl_request
+    return requests.request("POST", f"{_GHL_BASE}{path}", headers=headers, json=json, timeout=_DEFAULT_TIMEOUT)
 
 
 def _is_configured() -> bool:
