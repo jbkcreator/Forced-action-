@@ -30,12 +30,13 @@
   .footer-wrap { position: fixed; bottom: 38px; left: 0; right: 0; }
   .content { position: relative; z-index: 1; }
 </style>
+{% block extra_head %}{% endblock %}
 </head>
 <body>
 <div class="header">
   <svg width="34" height="34" viewBox="0 0 34 34" fill="none" stroke="#E8B130" stroke-width="3" aria-hidden="true"><path d="M4 26 L14 16 L20 22 L30 8"/><path d="M22 8 L30 8 L30 16"/></svg>
   <span class="brand">Next Deal Lending</span>
-  <span class="tag">Pre-Qualification Estimate</span>
+  <span class="tag">{% block header_tag %}Pre-Qualification Estimate{% endblock %}</span>
 </div>
 <div class="accent"></div>
 <div class="watermark-diag">{{ watermark }}</div>
