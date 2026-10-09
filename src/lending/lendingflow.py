@@ -43,8 +43,8 @@ _LOAN_TYPES = {
 
 
 class ParseError(ValueError):
-    """The payload cannot become a lead. The message is safe to return to the sender: it never
-    contains the phone, email or any other value from the payload."""
+    """The payload cannot become a lead. The message is for our logs only (never contains a payload
+    value); the sender always gets one fixed 400 message."""
 
 
 @dataclass(frozen=True)
@@ -229,11 +229,32 @@ _INSERT_LEAD = (
 )
 
 
+def _record_duplicate(db, parsed: ParsedLendingFlowLead, digest: str, now: datetime) -> Optional[SaveResult]:
+    """Count a re-delivery against the existing lead (vendor-id match preferred) and keep its certificate.
+    None when no lead matches either key."""
+    existing = db.execute(
+        text("UPDATE lending.lendingflow_leads SET duplicate_count = duplicate_count + 1, last_duplicate_at = :now "
+             "WHERE id = (SELECT id FROM lending.lendingflow_leads WHERE vendor_lead_id = :v OR dedupe_hash = :h "
+             "ORDER BY (vendor_lead_id = :v) DESC LIMIT 1) RETURNING id, lead_uuid"),
+        {"v": parsed.vendor_lead_id, "h": digest, "now": now},
+    ).one_or_none()
+    if existing is None:
+        return None
+    if parsed.certificate:
+        store_certificate(db, existing.id, parsed.certificate, duplicate=True, now=now)
+    logger.info("[lendingflow] duplicate delivery lead=%s vendor=%s", existing.id, parsed.vendor_lead_id)
+    return SaveResult(existing.id, str(existing.lead_uuid), created=False)
+
+
 def save_lead(db, parsed: ParsedLendingFlowLead, raw_payload: Any, *, now: Optional[datetime] = None) -> SaveResult:
-    """Insert the lead, or record a duplicate. Dedupe is enforced by the two UNIQUE indexes, so
-    concurrent deliveries of one lead cannot create two rows. The caller commits."""
+    """Insert the lead, or record a duplicate. A duplicate is detected before anything else is written,
+    so it never touches lending.contacts. The two UNIQUE indexes still decide a concurrent race: the
+    losing insert does nothing and is recorded as a duplicate. The caller commits."""
     now = now or datetime.now(timezone.utc)
     digest = dedupe_hash(parsed.phone, parsed.email)
+    duplicate = _record_duplicate(db, parsed, digest, now)
+    if duplicate is not None:
+        return duplicate
     contact_id = _upsert_contact(db, parsed.phone, parsed.email)
     reason = _suppression_reason(db, parsed.phone, parsed.email)
     row = db.execute(text(_INSERT_LEAD), {
@@ -246,21 +267,15 @@ def save_lead(db, parsed: ParsedLendingFlowLead, raw_payload: Any, *, now: Optio
         "suppressed": reason is not None, "reason": reason, "ghl": "skipped" if reason else "pending",
         "raw": json.dumps(raw_payload, ensure_ascii=False),
     }).one_or_none()
-    if row is not None:
-        if parsed.certificate:
-            store_certificate(db, row.id, parsed.certificate, duplicate=False, now=now)
-        logger.info("[lendingflow] lead created id=%s vendor=%s suppressed=%s", row.id, parsed.vendor_lead_id, reason is not None)
-        return SaveResult(row.id, str(row.lead_uuid), created=True, suppressed=reason is not None)
-    existing = db.execute(
-        text("UPDATE lending.lendingflow_leads SET duplicate_count = duplicate_count + 1, last_duplicate_at = :now "
-             "WHERE id = (SELECT id FROM lending.lendingflow_leads WHERE vendor_lead_id = :v OR dedupe_hash = :h "
-             "ORDER BY (vendor_lead_id = :v) DESC LIMIT 1) RETURNING id, lead_uuid"),
-        {"v": parsed.vendor_lead_id, "h": digest, "now": now},
-    ).one()
+    if row is None:  # lost a concurrent race on one of the UNIQUE keys
+        raced = _record_duplicate(db, parsed, digest, now)
+        if raced is None:
+            raise RuntimeError("lendingflow insert conflicted but no matching lead was found")
+        return raced
     if parsed.certificate:
-        store_certificate(db, existing.id, parsed.certificate, duplicate=True, now=now)
-    logger.info("[lendingflow] duplicate delivery lead=%s vendor=%s", existing.id, parsed.vendor_lead_id)
-    return SaveResult(existing.id, str(existing.lead_uuid), created=False)
+        store_certificate(db, row.id, parsed.certificate, duplicate=False, now=now)
+    logger.info("[lendingflow] lead created id=%s vendor=%s suppressed=%s", row.id, parsed.vendor_lead_id, reason is not None)
+    return SaveResult(row.id, str(row.lead_uuid), created=True, suppressed=reason is not None)
 
 
 # --------------------------------------------------------------------------- delivery

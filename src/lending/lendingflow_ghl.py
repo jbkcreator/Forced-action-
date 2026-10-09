@@ -3,7 +3,7 @@
 Same rules as ``web_lead_ghl``: the upsert never carries ``dnd``, ``tags`` or ``source`` (GHL's
 upsert REPLACES tags), tags go through the add-tags call, and a pipeline card is created only when
 a LendingFlow stage is configured and the contact has no card yet (never moved). The note carries
-the vendor lead id only, no phone or email.
+the lead id and vendor id only, no phone or email.
 """
 from __future__ import annotations
 
@@ -92,8 +92,7 @@ class LendingFlowGhlSink:
 
     def _add_note(self, lead: Mapping[str, Any], contact_id: str) -> None:
         """Best effort: the evidence of record is lending.lendingflow_leads + lead_consent_certificates."""
-        body = (f"LendingFlow lead {lead['vendor_lead_id']} received "
-                f"{lead['received_at'].strftime('%Y-%m-%d %H:%M:%S UTC')}. Consent certificate: {lead['consent_status']}.")
+        body = f"LendingFlow lead {lead['lead_uuid']} (vendor id {lead['vendor_lead_id']})."
         try:
             self._call("note", "POST", f"/contacts/{contact_id}/notes", json={"body": body})
         except DeliveryError as exc:

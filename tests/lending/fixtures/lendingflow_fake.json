@@ -1,0 +1,20 @@
+{
+  "lead_id": "LF-1",
+  "first_name": "Test",
+  "last_name": "Borrower",
+  "phone": "(727) 555-0100",
+  "email": "Test.Borrower@Example.com",
+  "credit_score_range": "680-719",
+  "loan_amount": 250000,
+  "loan_purpose": "fix_and_flip",
+  "property_state": "fl",
+  "consent": {
+    "certificate_id": "cert-abc",
+    "certificate_url": "https://cert.example/abc",
+    "timestamp": "2026-10-09T14:03:22Z",
+    "ip_address": "203.0.113.7",
+    "page_url": "https://lendingflow.example/apply",
+    "disclosure_text": "By clicking Submit you agree",
+    "raw": "  -----CERT-----\n  consent ✓ line two\t\n"
+  }
+}

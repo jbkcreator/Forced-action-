@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -27,18 +28,12 @@ from src.lending.web_leads import DeliveryError, PushResult
 
 SECRET = "s3cret"
 CERT_RAW = "  -----CERT-----\n  consent ✓ line two\t\n"
+FIXTURE = Path(__file__).parent / "fixtures" / "lendingflow_fake.json"
 
 
 def _payload(**overrides):
-    body = {
-        "lead_id": "LF-1", "first_name": "Test", "last_name": "Borrower", "phone": "(727) 555-0100",
-        "email": "Test.Borrower@Example.com", "credit_score_range": "680-719", "loan_amount": 250000,
-        "loan_purpose": "fix_and_flip", "property_state": "fl",
-        "consent": {"certificate_id": "cert-abc", "certificate_url": "https://cert.example/abc",
-                    "timestamp": "2026-10-09T14:03:22Z", "ip_address": "203.0.113.7",
-                    "page_url": "https://lendingflow.example/apply", "disclosure_text": "By clicking Submit you agree",
-                    "raw": CERT_RAW},
-    }
+    """The Fake LendingFlow payload (D1); swap the fixture when David's real schema lands."""
+    body = json.loads(FIXTURE.read_text(encoding="utf-8"))
     body.update(overrides)
     return body
 
@@ -157,7 +152,7 @@ def test_same_phone_email_different_vendor_id(client, lf_db):
                                  json.dumps({"lead_id": "1", "phone": "12345"})])
 def test_malformed_payload_is_400_with_detail(client, lf_db, raw):
     response = _post(client, raw=raw)
-    assert response.status_code == 400 and "detail" in response.json()
+    assert response.status_code == 400 and response.json() == {"detail": "Invalid LendingFlow payload"}
     assert _count(lf_db, "lendingflow_leads") == 0
 
 
@@ -206,6 +201,14 @@ def test_duplicate_has_no_delivery_event_or_prequal(client, lf_db, seen):
     _post(client)
     _post(client)
     assert len(client.scheduled) == 1 and events == [] and prequal == []
+
+
+def test_duplicate_never_touches_contacts(client, lf_db):
+    body = _payload()
+    del body["email"]
+    _post(client, body)
+    _post(client, _payload(phone="(727) 555-0100", email="late@example.com", lead_id="LF-1"))
+    assert lf_db.execute(text("SELECT email FROM lending.contacts WHERE phone = '+17275550100'")).scalar_one() is None
 
 
 def test_flag_off_is_503_and_stores_nothing(client, lf_db, monkeypatch):
@@ -328,7 +331,7 @@ def test_ghl_sink_tags_missing_consent_and_skips_card_without_stage(monkeypatch)
 
     from src.services import ghl_webhook
     monkeypatch.setattr(ghl_webhook, "_ghl_request", fake)
-    lead = {"id": 1, "vendor_lead_id": "LF-1", "phone": "+17275550100", "email": None, "first_name": None,
+    lead = {"id": 1, "lead_uuid": "u-1", "vendor_lead_id": "LF-1", "phone": "+17275550100", "email": None, "first_name": None,
             "last_name": None, "consent_status": "missing", "received_at": datetime(2026, 10, 9, tzinfo=timezone.utc)}
     result = LendingFlowGhlSink(GhlAccount("k", "loc")).push(lead)
     assert result == PushResult(contact_id="c1", pipeline_card=False)
@@ -336,6 +339,8 @@ def test_ghl_sink_tags_missing_consent_and_skips_card_without_stage(monkeypatch)
     assert "dnd" not in upsert[2] and "tags" not in upsert[2] and "email" not in upsert[2]
     tags = next(c for c in calls if c[1] == "tags")
     assert tags[2]["tags"] == ["lendingflow", "lendingflow-consent-missing"]
+    note = next(c for c in calls if c[1] == "notes")
+    assert note[2]["body"] == "LendingFlow lead u-1 (vendor id LF-1)."
 
 
 def test_logs_carry_no_phone_or_email(client, lf_db, seen, caplog):

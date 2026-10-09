@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/lending", tags=["lending"])
 
+INVALID_PAYLOAD = "Invalid LendingFlow payload"
+
 
 def _verify_lendingflow_secret(received: Optional[str]) -> None:
     """The one place sender authentication lives (swap for HMAC / allow-list if David specifies one)."""
@@ -54,11 +56,13 @@ async def receive_lendingflow_lead(
     try:
         payload = json.loads(body)
     except (ValueError, UnicodeDecodeError):
-        raise HTTPException(status_code=400, detail="Body is not valid JSON") from None
+        logger.warning("[lendingflow] rejected payload: not JSON")
+        raise HTTPException(status_code=400, detail=INVALID_PAYLOAD) from None
     try:
         parsed = parse_lendingflow(payload)
     except ParseError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from None
+        logger.warning("[lendingflow] rejected payload: %s", exc)
+        raise HTTPException(status_code=400, detail=INVALID_PAYLOAD) from None
     try:
         result = save_lead(db, parsed, payload)
         db.commit()
