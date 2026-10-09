@@ -1199,6 +1199,10 @@ COUNTY_ID=hillsborough
 # LendingFlowLeadCreated event + pre-qual hand-off. No-op while LENDING_LENDINGFLOW_ENABLED=false.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_lendingflow_sweep
 
+# Lending LendingFlow background enrichment card + routing (T-12) — build rows for leads whose event was missed and
+# retry failed ones. No-op while LENDING_ENRICHMENT_ENABLED=false.
+*/5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_enrichment_sweep
+
 # Lending Minute-5 pre-qualification letter (T-07) — retry letters not yet sent.
 # No-op while LENDING_PREQUAL_PDF_ENABLED is off.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_prequal_sweep
