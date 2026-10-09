@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -47,6 +48,16 @@ SQLITE_DDL = (
     )
     """,
     "CREATE UNIQUE INDEX uq_pending_actions_idempotency_key ON pending_actions (idempotency_key)",
+    """
+    CREATE TABLE agent_memory (
+        memory_id TEXT PRIMARY KEY,
+        category TEXT NOT NULL,
+        rule_text TEXT NOT NULL,
+        source_thread_ts TEXT,
+        is_active BOOLEAN DEFAULT 1,
+        created_at TIMESTAMP
+    )
+    """,
 )
 
 APPROVER = "U_APPROVER"
@@ -128,6 +139,35 @@ class Clock:
 @pytest.fixture
 def clock() -> Clock:
     return Clock()
+
+
+class FakeMessages:
+    """Scripted stand-in for ``anthropic.Anthropic().messages``: returns queued responses, records requests."""
+
+    def __init__(self, *responses: Any) -> None:
+        self._responses = list(responses)
+        self.requests: list[dict[str, Any]] = []
+
+    def create(self, **kwargs: Any) -> Any:
+        self.requests.append(kwargs)
+        if not self._responses:
+            raise AssertionError("FakeMessages ran out of scripted responses")
+        response = self._responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+def text_block(value: str) -> Any:
+    return SimpleNamespace(type="text", text=value)
+
+
+def tool_block(tool_use_id: str, name: str, tool_input: dict) -> Any:
+    return SimpleNamespace(type="tool_use", id=tool_use_id, name=name, input=tool_input)
+
+
+def response(*blocks: Any, stop_reason: str = "end_turn") -> Any:
+    return SimpleNamespace(content=list(blocks), stop_reason=stop_reason)
 
 
 def enqueue_sms(queue: PendingActionQueue, body: str = "Hi Sam, Josh here.", **extra: Any) -> int:

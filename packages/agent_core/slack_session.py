@@ -64,7 +64,13 @@ class InboundMessage:
     is_direct: bool
 
     @property
-    def reply_thread_ts(self) -> str:
+    def reply_thread_ts(self) -> str | None:
+        """Where replies go: the message's thread if it is in one, otherwise inline in the channel."""
+        return self.thread_ts
+
+    @property
+    def conversation_ts(self) -> str:
+        """Stable id of the conversation this message belongs to (thread parent, or the message itself)."""
         return self.thread_ts or self.ts
 
 
