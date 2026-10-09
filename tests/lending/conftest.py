@@ -78,3 +78,39 @@ def web_leads_db(lending_db):
 
     apply_web_leads(lending_db.get_bind())
     return lending_db
+
+
+@pytest.fixture(autouse=True)
+def _no_live_prequal_sink(monkeypatch):
+    """A test must never email a pre-qual letter through the real Next Deal Lending GHL account."""
+    monkeypatch.setattr("src.lending.prequal_ghl.get_live_sink", lambda: None)
+
+
+@pytest.fixture
+def prequal_db():
+    """Only lending.prequal_letters, created inside one rolled-back transaction. Unlike lending_db it
+    runs no DDL on live lending tables, and the lock/statement timeouts make a stuck run fail fast
+    instead of queuing behind (or blocking) production work on the shared database."""
+    from config.settings import get_settings
+    from migrations.apply_lending_prequal_letters import apply_to as apply_prequal
+
+    url = get_settings().database_url
+    if not url:
+        pytest.skip("requires a live Postgres DATABASE_URL")
+    engine = create_engine(str(url), connect_args={"connect_timeout": 5})
+    try:
+        conn = engine.connect()
+    except Exception:
+        engine.dispose()
+        pytest.skip("Postgres is not reachable")
+    tx = conn.begin()
+    conn.execute(text("SET LOCAL lock_timeout = '5s'"))
+    conn.execute(text("SET LOCAL statement_timeout = '30s'"))
+    conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{LENDING_SCHEMA}"'))
+    apply_prequal(conn)
+    session = Session(bind=conn, join_transaction_mode="create_savepoint")
+    yield session
+    session.close()
+    tx.rollback()
+    conn.close()
+    engine.dispose()
