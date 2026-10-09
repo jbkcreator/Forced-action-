@@ -3,7 +3,8 @@
 Opens an outbound WebSocket with the app-level token, so interactivity needs no public endpoint.
 Every envelope is acknowledged first, then routed:
 
-* Messages (direct messages, or channel messages that mention the bot) from an allowed user:
+* Messages from an allowed user: direct messages, any message in the agent's own channel, or a
+  message elsewhere that mentions the bot:
   1. halt / resume commands, always first and approvers only: a shadowed kill switch is a
      broken kill switch;
   2. a reply from a user with an open revision is the revision instruction (or ``cancel``);
@@ -147,9 +148,11 @@ class SlackSession:
         if not user_id or user_id == self.bot_user_id:
             return None
         is_direct = event.get("channel_type") == "im"
-        if event["type"] == "message" and not is_direct and not mentions_bot(event, self.bot_user_id):
-            return None
         channel, ts = event.get("channel") or "", event.get("ts") or ""
+        # The agent's own channel is a conversation with it: no mention needed there.
+        in_own_channel = bool(channel) and channel == self._config.slack_channel_id
+        if event["type"] == "message" and not (is_direct or in_own_channel or mentions_bot(event, self.bot_user_id)):
+            return None
         # A mention arrives as both a message and an app_mention event with the same (channel, ts).
         if not self._seen.first_sighting(f"message:{channel}:{ts}"):
             return None

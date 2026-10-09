@@ -74,6 +74,21 @@ def test_channel_message_needs_a_mention_and_is_routed_once(harness: Harness) ->
     assert [message.text for message in harness.messages] == ["pipeline status?"]
 
 
+def test_own_channel_needs_no_mention(harness: Harness) -> None:
+    harness.session.handle_request("events_api", {"event": {
+        "type": "message", "channel_type": "channel", "channel": "C_CORA", "user": OPERATOR,
+        "text": "how many leads today?", "ts": "3.1"}})
+    assert [(message.text, message.is_direct) for message in harness.messages] == [("how many leads today?", False)]
+
+
+def test_own_channel_still_ignores_strangers_and_bots(harness: Harness) -> None:
+    for event in ({"user": STRANGER, "ts": "4.1"}, {"user": OPERATOR, "bot_id": "B1", "ts": "4.2"},
+                  {"user": OPERATOR, "subtype": "channel_join", "ts": "4.3"}):
+        harness.session.handle_request("events_api", {"event": {
+            "type": "message", "channel_type": "channel", "channel": "C_CORA", "text": "hi", **event}})
+    assert harness.messages == []
+
+
 def test_approver_halts_and_resumes(harness: Harness, halt: HaltSwitch) -> None:
     harness.dm(APPROVER, "stop all", ts="1")
     assert halt.is_halted()
