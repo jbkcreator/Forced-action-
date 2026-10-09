@@ -391,3 +391,18 @@ def test_logs_carry_no_phone_numbers(db, caplog):
         cycle(db, 120, sms=Sms(error=RuntimeError(LEAD_PHONE)))
         cycle(db, 300, sms=Sms(), slack=Slack())
     assert LEAD_PHONE not in caplog.text and JOSH not in caplog.text and "Jane" not in caplog.text
+
+
+from src.lending import uncalled_alarm_worker  # noqa: E402
+
+
+def test_run_cycle_does_nothing_when_disabled(monkeypatch):
+    class Settings:
+        lending_uncalled_alarms_enabled = False
+
+    def no_db():
+        raise AssertionError("no DB access when disabled")
+
+    monkeypatch.setattr(uncalled_alarm_worker, "get_settings", lambda: Settings())
+    monkeypatch.setattr(uncalled_alarm_worker, "lending_session", no_db)
+    assert uncalled_alarm_worker.run_cycle() == {}

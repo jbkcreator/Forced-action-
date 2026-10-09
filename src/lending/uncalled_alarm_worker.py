@@ -264,3 +264,53 @@ def process_due(db, *, now: Optional[datetime] = None, sms: Optional[Callable[..
         level = logging.WARNING if "failed" in outcome or "not_configured" in outcome else logging.INFO
         logger.log(level, "[uncalled-alarm] lead=%s outcome=%s", row["lead_uuid"], outcome)
     return counts
+
+
+def run_cycle(*, now: Optional[datetime] = None) -> dict[str, int]:
+    """One pass with real settings and its own session; does nothing while the flag is off."""
+    settings = get_settings()
+    if not settings.lending_uncalled_alarms_enabled:
+        return {}
+    from src.lending.disposition_delivery import _slack_client
+    from src.lending.ghl_account import lending_ghl_account
+    from src.lending.ghl_sms import get_sender
+
+    account = lending_ghl_account()
+    slack = _slack_client() if settings.lending_slack_bot_token else None
+    with lending_session() as db:
+        return process_due(db, now=now, sms=get_sender(), slack=slack,
+                           ghl_status=ghl_call_lookup(account) if account else None,
+                           sms_to=normalize(settings.lending_alarm_sms_to), ops_channel=settings.lending_ops_channel)
+
+
+_running = True
+
+
+def _stop(signum, _frame) -> None:
+    global _running
+    logger.info("[uncalled-alarm] signal %s received, stopping after this cycle", signum)
+    _running = False
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="T-10 uncalled-lead alarm worker")
+    parser.add_argument("--once", action="store_true", help="run a single cycle and exit")
+    args = parser.parse_args(argv)
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+    logger.info("[uncalled-alarm] starting (enabled=%s)", get_settings().lending_uncalled_alarms_enabled)
+    while _running:
+        try:
+            counts = run_cycle()
+            if counts:
+                logger.info("[uncalled-alarm] cycle %s", counts)
+        except Exception as exc:  # class only
+            logger.error("[uncalled-alarm] cycle failed (%s); retrying next interval", type(exc).__name__)
+        if args.once:
+            break
+        time.sleep(POLL_SECONDS)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
