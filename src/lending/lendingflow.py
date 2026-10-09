@@ -161,14 +161,14 @@ def parse_lendingflow(payload: Any) -> ParsedLendingFlowLead:
     if email:
         email = email.lower()
         if not _EMAIL.match(email):
-            raise ParseError("email is not valid")
+            email = None  # a bad email never costs a paid lead; phone is the contact key
     amount = payload.get("loan_amount")
     try:
         loan_amount = int(float(amount)) if amount not in (None, "") else None
     except (TypeError, ValueError):
-        raise ParseError("loan_amount must be a number") from None
+        loan_amount = None
     if loan_amount is not None and loan_amount <= 0:
-        raise ParseError("loan_amount must be positive")
+        loan_amount = None
     band = _str(payload, "credit_score_range", "credit_band", limit=40)
     purpose = _str(payload, "loan_purpose", "loan_type", limit=60)
     loan_type = _LOAN_TYPES.get(purpose.lower().replace("-", "_")) if purpose else None

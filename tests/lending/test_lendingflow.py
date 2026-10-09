@@ -106,11 +106,16 @@ def test_credit_band_min_fico(raw, expected):
 
 
 @pytest.mark.parametrize("payload", [[], "x", {}, {"lead_id": "1"}, {"lead_id": "1", "phone": "12345"},
-                                     {"lead_id": "1", "phone": "7275550100", "email": "nope"},
-                                     {"lead_id": "1", "phone": "7275550100", "loan_amount": "abc"}])
+                                     ])
 def test_parse_rejects_malformed(payload):
     with pytest.raises(ParseError):
         parse_lendingflow(payload)
+
+
+@pytest.mark.parametrize("field,value", [("email", "nope"), ("loan_amount", "abc"), ("loan_amount", -5)])
+def test_bad_optional_field_is_dropped_not_rejected(field, value):
+    parsed = parse_lendingflow({"lead_id": "1", "phone": "7275550100", field: value})
+    assert getattr(parsed, field) is None
 
 
 def test_parse_error_never_echoes_values():
@@ -185,6 +190,22 @@ def test_auth(client, monkeypatch):
     from src.lending import lendingflow_webhook as hook
     monkeypatch.setattr(hook.get_settings(), "lending_lendingflow_webhook_secret", None)
     assert _post(client).status_code == 503
+
+
+def test_non_ascii_secret_is_401_not_500(client):
+    from fastapi import HTTPException
+    from src.lending.lendingflow_webhook import _verify_lendingflow_secret
+
+    with pytest.raises(HTTPException) as exc:  # a raw header can carry non-ASCII; str compare_digest would raise TypeError
+        _verify_lendingflow_secret("sécret")
+    assert exc.value.status_code == 401
+
+
+def test_duplicate_has_no_delivery_event_or_prequal(client, lf_db, seen):
+    events, prequal = seen
+    _post(client)
+    _post(client)
+    assert len(client.scheduled) == 1 and events == [] and prequal == []
 
 
 def test_flag_off_is_503_and_stores_nothing(client, lf_db, monkeypatch):

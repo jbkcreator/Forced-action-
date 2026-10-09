@@ -15,7 +15,7 @@ from typing import Any, Optional
 
 from sqlalchemy import text
 
-from config.lending_lendingflow import GHL_ALERT_AFTER_MINUTES, GHL_GIVE_UP_AFTER_HOURS
+from config.lending_lendingflow import GHL_ALERT_AFTER_MINUTES, GHL_GIVE_UP_AFTER_HOURS, SWEEP_BATCH_SIZE
 from config.settings import get_settings
 from src.lending.db import lending_session
 from src.lending.disposition_delivery import _configured_slack, _slack_client
@@ -38,8 +38,8 @@ def alert_undelivered(slack_client: Any = None, minutes: Optional[int] = None) -
                 text("UPDATE lending.lendingflow_leads SET ghl_alerted_at = now() WHERE id IN ("
                      "SELECT id FROM lending.lendingflow_leads WHERE ghl_status IN ('pending', 'failed') "
                      "AND NOT suppressed AND ghl_alerted_at IS NULL AND received_at < now() - make_interval(mins => :m) "
-                     "ORDER BY received_at LIMIT 50 FOR UPDATE SKIP LOCKED) RETURNING id, ghl_last_error"),
-                {"m": minutes},
+                     "ORDER BY received_at LIMIT :limit FOR UPDATE SKIP LOCKED) RETURNING id, ghl_last_error"),
+                {"m": minutes, "limit": SWEEP_BATCH_SIZE},
             ).all()
         if not rows:
             return 0

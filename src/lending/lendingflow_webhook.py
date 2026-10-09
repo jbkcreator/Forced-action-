@@ -32,7 +32,7 @@ def _verify_lendingflow_secret(received: Optional[str]) -> None:
     secret = settings.lending_lendingflow_webhook_secret
     if not settings.lending_lendingflow_enabled or secret is None:
         raise HTTPException(status_code=503, detail="LendingFlow intake is disabled")
-    if not received or not hmac.compare_digest(received, secret.get_secret_value()):
+    if not received or not hmac.compare_digest(received.encode(), secret.get_secret_value().encode()):
         raise HTTPException(status_code=401, detail="Invalid webhook secret")
 
 
