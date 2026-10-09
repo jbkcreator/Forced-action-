@@ -20,6 +20,7 @@ from sqlalchemy import (
     Integer,
     MetaData,
     Numeric,
+    SmallInteger,
     String,
     Text,
     text,
@@ -403,4 +404,63 @@ class LendingWebLead(LendingBase):
         CheckConstraint("ghl_status IN ('pending', 'synced', 'contact_only', 'failed')", name="ck_lending_web_leads_ghl_status"),
         Index("idx_lending_web_leads_delivery", "ghl_status", "received_at"),
         Index("idx_lending_web_leads_phone", "phone", "received_at"),
+    )
+
+
+class LendingAgentHaltState(LendingBase):
+    """Cora's kill switch: one row, read by every Cora process before it acts (packages/agent_core/halt.py)."""
+
+    __tablename__ = "agent_halt_state"
+
+    id: Mapped[int] = mapped_column(SmallInteger, primary_key=True, autoincrement=False)
+    halted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    set_by: Mapped[Optional[str]] = mapped_column(String(32))  # Slack user id
+    set_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (CheckConstraint("id = 1", name="ck_agent_halt_state_single_row"),)
+
+
+class LendingPendingAction(LendingBase):
+    """One external send Cora drafted, frozen until an approver clicks (packages/agent_core/pending_actions.py)."""
+
+    __tablename__ = "pending_actions"
+
+    action_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    tool_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    channel: Mapped[str] = mapped_column(String(64), nullable=False)  # relay executor key, e.g. ghl_sms
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)  # exactly what is sent on approval
+    summary: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", server_default=text("'pending'"))
+    requested_by: Mapped[Optional[str]] = mapped_column(String(32))
+    source_channel: Mapped[Optional[str]] = mapped_column(String(32))
+    source_thread_ts: Mapped[Optional[str]] = mapped_column(String(64))
+    card_channel: Mapped[Optional[str]] = mapped_column(String(32))
+    card_ts: Mapped[Optional[str]] = mapped_column(String(64))
+    decided_by: Mapped[Optional[str]] = mapped_column(String(32))  # approved or rejected it
+    decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    revised_by: Mapped[Optional[str]] = mapped_column(String(32))  # opened the last revision
+    revision_note: Mapped[Optional[str]] = mapped_column(Text)
+    revisions: Mapped[list] = mapped_column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))  # replaced drafts, oldest first
+    recipient_phone: Mapped[Optional[str]] = mapped_column(String(20))  # phone_utils.normalize; read by the send-time opt-out check
+    recipient_email: Mapped[Optional[str]] = mapped_column(String(255))  # lower-cased
+    contact_ref: Mapped[Optional[str]] = mapped_column(String(64))
+    deal_ref: Mapped[Optional[str]] = mapped_column(String(64))
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(128))  # e.g. the model's tool_use_id; a repeat returns the same row
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    executed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    provider_ref: Mapped[Optional[str]] = mapped_column(String(200))
+    error: Mapped[Optional[str]] = mapped_column(Text)  # long digit runs masked
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'revising', 'approved', 'rejected', 'sending', 'sent', 'failed', 'blocked', 'expired')",
+            name="ck_pending_actions_status",
+        ),
+        Index("ix_pending_actions_status", "status", "decided_at"),
+        Index("uq_pending_actions_idempotency_key", "idempotency_key", unique=True),
+        Index("ix_pending_actions_revised_by", "revised_by", postgresql_where=text("status = 'revising'")),
+        Index("ix_pending_actions_expires_at", "expires_at", postgresql_where=text("status IN ('pending', 'revising')")),
     )

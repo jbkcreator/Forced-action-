@@ -939,6 +939,19 @@ class AppSettings(BaseSettings):
 	lending_sheets_service_account_key_path: str = Field(default="", env="LENDING_SHEETS_SERVICE_ACCOUNT_KEY_PATH")
 	lending_disposition_sheet_id: str = Field(default="", env="LENDING_DISPOSITION_SHEET_ID")
 	lending_disposition_sheet_tab: str = Field(default="Dispositions", env="LENDING_DISPOSITION_SHEET_TAB")
+	# ── Lending Cora agent (packages/agent_core, systemd fa-lending-cora) ──
+	# A dedicated Slack app, separate from LENDING_SLACK_BOT_TOKEN (ops alerts). The app token
+	# (xapp-) opens the Socket Mode connection; approvers are the only users whose clicks release
+	# an external send, so keep that list to Josh's Slack user id.
+	lending_cora_slack_bot_token: Optional[SecretStr] = Field(default=None, env="LENDING_CORA_SLACK_BOT_TOKEN")
+	lending_cora_slack_app_token: Optional[SecretStr] = Field(default=None, env="LENDING_CORA_SLACK_APP_TOKEN")
+	lending_cora_channel: str = Field(default="", env="LENDING_CORA_CHANNEL")  # channel ID for approval cards
+	lending_cora_approver_user_ids: str = Field(default="", env="LENDING_CORA_APPROVER_USER_IDS")  # comma-separated Slack user ids
+	lending_cora_operator_user_ids: str = Field(default="", env="LENDING_CORA_OPERATOR_USER_IDS")  # may chat, may not approve
+	lending_cora_model: str = Field(default="claude-sonnet-5-5", env="LENDING_CORA_MODEL")
+	lending_cora_pending_action_ttl_hours: int = Field(default=72, env="LENDING_CORA_PENDING_ACTION_TTL_HOURS")  # unapproved drafts expire after this
+	lending_cora_calendar_id: str = Field(default="", env="LENDING_CORA_CALENDAR_ID")
+	lending_cora_calendar_service_account_key_path: str = Field(default="", env="LENDING_CORA_CALENDAR_SERVICE_ACCOUNT_KEY_PATH")
 	# ── Meta Conversions API (CAPI) — S2 ────────────────────────────────────
 	# Server-side Purchase reporting for closed-loop Meta ad attribution.
 	# Feature-gated and OFF by default — when disabled, or when pixel_id /
