@@ -93,6 +93,8 @@ class LendingFlowGhlSink:
     def _add_note(self, lead: Mapping[str, Any], contact_id: str) -> None:
         """Best effort: the evidence of record is lending.lendingflow_leads + lead_consent_certificates."""
         body = f"LendingFlow lead {lead['lead_uuid']} (vendor id {lead['vendor_lead_id']})."
+        if lead.get("lead_source_campaign"):
+            body += f" Source: {lead['lead_source_campaign']}."
         try:
             self._call("note", "POST", f"/contacts/{contact_id}/notes", json={"body": body})
         except DeliveryError as exc:

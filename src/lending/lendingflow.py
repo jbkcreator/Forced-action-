@@ -34,12 +34,32 @@ _BAND_RANGE = re.compile(r"^\s*(\d{3})\s*(?:-|to|–)\s*\d{3}\s*$", re.IGNORECAS
 _BAND_PLUS = re.compile(r"^\s*(\d{3})\s*\+\s*$")
 
 _LOAN_TYPES = {
-    "fix_and_flip": LoanType.FIX_AND_FLIP, "fix and flip": LoanType.FIX_AND_FLIP, "flip": LoanType.FIX_AND_FLIP,
+    "fix_and_flip": LoanType.FIX_AND_FLIP, "flip": LoanType.FIX_AND_FLIP,
     "ground_up": LoanType.GROUND_UP_CONSTRUCTION, "construction": LoanType.GROUND_UP_CONSTRUCTION,
-    "ground_up_construction": LoanType.GROUND_UP_CONSTRUCTION,
+    "ground_up_construction": LoanType.GROUND_UP_CONSTRUCTION, "new_construction": LoanType.GROUND_UP_CONSTRUCTION,
     "dscr": LoanType.DSCR_RENTAL, "rental": LoanType.DSCR_RENTAL, "dscr_rental": LoanType.DSCR_RENTAL,
     "bridge": LoanType.BRIDGE,
 }
+_LOAN_TYPE_SEPARATORS = re.compile(r"[\s\-/]+")
+
+# LendingFlow's sample lead shows the full state name ("Florida"); lender rules use USPS codes.
+_STATE_CODES = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR", "california": "CA", "colorado": "CO",
+    "connecticut": "CT", "delaware": "DE", "district of columbia": "DC", "florida": "FL", "georgia": "GA",
+    "hawaii": "HI", "idaho": "ID", "illinois": "IL", "indiana": "IN", "iowa": "IA", "kansas": "KS",
+    "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD", "massachusetts": "MA",
+    "michigan": "MI", "minnesota": "MN", "mississippi": "MS", "missouri": "MO", "montana": "MT",
+    "nebraska": "NE", "nevada": "NV", "new hampshire": "NH", "new jersey": "NJ", "new mexico": "NM",
+    "new york": "NY", "north carolina": "NC", "north dakota": "ND", "ohio": "OH", "oklahoma": "OK",
+    "oregon": "OR", "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC", "south dakota": "SD",
+    "tennessee": "TN", "texas": "TX", "utah": "UT", "vermont": "VT", "virginia": "VA", "washington": "WA",
+    "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY",
+}
+_STATE_CODE_SET = frozenset(_STATE_CODES.values())
+
+# "$500K", "1M", "250,000", "$1.5M"
+_MONEY = re.compile(r"\$?\s*(\d[\d,]*(?:\.\d+)?)\s*([km])?", re.IGNORECASE)
+_MULTIPLIERS = {"k": 1_000, "m": 1_000_000}
 
 
 class ParseError(ValueError):
@@ -67,12 +87,17 @@ class ParsedLendingFlowLead:
     last_name: Optional[str] = None
     credit_band: Optional[str] = None
     credit_band_min_fico: Optional[int] = None
-    loan_amount: Optional[int] = None
+    loan_amount: Optional[int] = None  # low end of the range: what the event and the pre-qual letter use
+    loan_amount_range: Optional[str] = None  # as LendingFlow sent it, e.g. "$500K - $1M"
+    loan_amount_min: Optional[int] = None
+    loan_amount_max: Optional[int] = None
     loan_type: Optional[str] = None  # LoanType value
     property_state: Optional[str] = None
     property_address: Optional[str] = None
     property_city: Optional[str] = None
     property_zip: Optional[str] = None
+    lead_source_campaign: Optional[str] = None  # LendingFlow's "Source", e.g. "60 Second Loan Match"
+    submitted_at: Optional[datetime] = None  # when the borrower submitted on LendingFlow
     certificate: Optional[ParsedCertificate] = None
 
 
@@ -114,6 +139,52 @@ def _credit_band_min_fico(raw: Optional[str]) -> Optional[int]:
         return None
     match = _BAND_RANGE.match(raw) or _BAND_PLUS.match(raw)
     return int(match.group(1)) if match else None
+
+
+def _money(text_value: str) -> Optional[int]:
+    match = _MONEY.search(text_value)
+    if not match:
+        return None
+    amount = float(match.group(1).replace(",", "")) * _MULTIPLIERS.get((match.group(2) or "").lower(), 1)
+    return int(amount) if amount > 0 else None
+
+
+def _loan_amount(value: Any) -> tuple[Optional[str], Optional[int], Optional[int]]:
+    """``(raw, min, max)``. LendingFlow sends a band (``"$500K - $1M"``); a plain number is a band of one.
+    ``"$1M+"`` has no max; ``"Under $100K"`` has no min. Anything unreadable is (raw, None, None)."""
+    if value is None or value == "" or isinstance(value, bool):
+        return None, None, None
+    if isinstance(value, (int, float)):
+        amount = int(value) if value > 0 else None
+        return str(value), amount, amount
+    raw = str(value).strip()[:40]
+    lowered = raw.lower()
+    parts = re.split(r"\s*(?:-|–|to)\s*", raw, maxsplit=1)
+    if len(parts) == 2 and parts[0] and parts[1]:
+        return raw, _money(parts[0]), _money(parts[1])
+    amount = _money(raw)
+    if lowered.startswith(("under", "below", "<", "less than", "up to")):
+        return raw, None, amount
+    if raw.endswith("+") or lowered.startswith(("over", "above", ">")):
+        return raw, amount, None
+    return raw, amount, amount
+
+
+def _state_code(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    upper = value.strip().upper()
+    if upper in _STATE_CODE_SET:
+        return upper
+    return _STATE_CODES.get(" ".join(value.lower().split()))
+
+
+def _loan_type(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    key = _LOAN_TYPE_SEPARATORS.sub("_", value.lower().replace("&", "and")).strip("_")
+    loan_type = _LOAN_TYPES.get(key)
+    return loan_type.value if loan_type else None
 
 
 def _parse_time(value: Any) -> Optional[datetime]:
@@ -162,17 +233,8 @@ def parse_lendingflow(payload: Any) -> ParsedLendingFlowLead:
         email = email.lower()
         if not _EMAIL.match(email):
             email = None  # a bad email never costs a paid lead; phone is the contact key
-    amount = payload.get("loan_amount")
-    try:
-        loan_amount = int(float(amount)) if amount not in (None, "") else None
-    except (TypeError, ValueError):
-        loan_amount = None
-    if loan_amount is not None and loan_amount <= 0:
-        loan_amount = None
-    band = _str(payload, "credit_score_range", "credit_band", limit=40)
-    purpose = _str(payload, "loan_purpose", "loan_type", limit=60)
-    loan_type = _LOAN_TYPES.get(purpose.lower().replace("-", "_")) if purpose else None
-    state = _str(payload, "property_state", "state", limit=20)
+    amount_raw, amount_min, amount_max = _loan_amount(payload.get("loan_amount"))
+    band = _str(payload, "credit_score_range", "credit_score", "credit_band", limit=40)
     return ParsedLendingFlowLead(
         vendor_lead_id=vendor_id,
         phone=phone,
@@ -181,12 +243,17 @@ def parse_lendingflow(payload: Any) -> ParsedLendingFlowLead:
         last_name=_str(payload, "last_name", limit=80),
         credit_band=band,
         credit_band_min_fico=_credit_band_min_fico(band),
-        loan_amount=loan_amount,
-        loan_type=loan_type.value if loan_type else None,
-        property_state=state.upper() if state else None,
+        loan_amount=amount_min,
+        loan_amount_range=amount_raw,
+        loan_amount_min=amount_min,
+        loan_amount_max=amount_max,
+        loan_type=_loan_type(_str(payload, "loan_purpose", "loan_type", limit=60)),
+        property_state=_state_code(_str(payload, "property_state", "state", limit=40)),
         property_address=_str(payload, "property_address", limit=200),
         property_city=_str(payload, "property_city", limit=80),
         property_zip=_str(payload, "property_zip", limit=10),
+        lead_source_campaign=_str(payload, "source", "lead_source", limit=100),
+        submitted_at=_parse_time(payload.get("submitted_at")),
         certificate=_parse_certificate(payload.get("consent")),
     )
 
@@ -221,10 +288,12 @@ def store_certificate(db, lead_id: int, cert: ParsedCertificate, *, duplicate: b
 
 _INSERT_LEAD = (
     "INSERT INTO lending.lendingflow_leads (vendor_lead_id, dedupe_hash, contact_id, received_at, first_name, last_name, "
-    "phone, email, credit_band, credit_band_min_fico, loan_amount, loan_type, property_state, property_address, "
-    "property_city, property_zip, consent_status, suppressed, suppression_reason, ghl_status, raw_payload) "
-    "VALUES (:vendor, :hash, :contact, :now, :first, :last, :phone, :email, :band, :fico, :amount, :ltype, :state, "
-    ":addr, :city, :zip, :consent, :suppressed, :reason, :ghl, CAST(:raw AS jsonb)) "
+    "phone, email, credit_band, credit_band_min_fico, loan_amount, loan_amount_range, loan_amount_min, loan_amount_max, "
+    "loan_type, property_state, property_address, property_city, property_zip, lead_source_campaign, submitted_at, "
+    "consent_status, suppressed, suppression_reason, ghl_status, raw_payload) "
+    "VALUES (:vendor, :hash, :contact, :now, :first, :last, :phone, :email, :band, :fico, :amount, :arange, :amin, :amax, "
+    ":ltype, :state, :addr, :city, :zip, :campaign, :submitted, "
+    ":consent, :suppressed, :reason, :ghl, CAST(:raw AS jsonb)) "
     "ON CONFLICT DO NOTHING RETURNING id, lead_uuid"
 )
 
@@ -263,6 +332,8 @@ def save_lead(db, parsed: ParsedLendingFlowLead, raw_payload: Any, *, now: Optio
         "band": parsed.credit_band, "fico": parsed.credit_band_min_fico, "amount": parsed.loan_amount,
         "ltype": parsed.loan_type, "state": parsed.property_state, "addr": parsed.property_address,
         "city": parsed.property_city, "zip": parsed.property_zip,
+        "arange": parsed.loan_amount_range, "amin": parsed.loan_amount_min, "amax": parsed.loan_amount_max,
+        "campaign": parsed.lead_source_campaign, "submitted": parsed.submitted_at,
         "consent": "present" if parsed.certificate else "missing",
         "suppressed": reason is not None, "reason": reason, "ghl": "skipped" if reason else "pending",
         "raw": json.dumps(raw_payload, ensure_ascii=False),
@@ -288,7 +359,7 @@ def _backoff_minutes_sql() -> str:
 
 _DELIVERABLE = (
     "SELECT id, lead_uuid, vendor_lead_id, first_name, last_name, phone, email, credit_band, credit_band_min_fico, "
-    "loan_amount, loan_type, property_state, consent_status, received_at, ghl_attempts "
+    "loan_amount, loan_type, property_state, lead_source_campaign, consent_status, received_at, ghl_attempts "
     "FROM lending.lendingflow_leads "
     "WHERE ghl_status IN ('pending', 'failed') AND NOT suppressed AND received_at > :oldest {extra} "
     "ORDER BY received_at LIMIT :limit FOR UPDATE SKIP LOCKED"

@@ -467,12 +467,17 @@ class LendingLendingFlowLead(LendingBase):
     email: Mapped[Optional[str]] = mapped_column(String(255))  # lower-cased
     credit_band: Mapped[Optional[str]] = mapped_column(String(40))
     credit_band_min_fico: Mapped[Optional[int]] = mapped_column(Integer)
-    loan_amount: Mapped[Optional[int]] = mapped_column(BigInteger)
+    loan_amount: Mapped[Optional[int]] = mapped_column(BigInteger)  # = loan_amount_min (event / pre-qual input)
+    loan_amount_range: Mapped[Optional[str]] = mapped_column(String(40))  # raw band, e.g. "$500K - $1M"
+    loan_amount_min: Mapped[Optional[int]] = mapped_column(BigInteger)
+    loan_amount_max: Mapped[Optional[int]] = mapped_column(BigInteger)
     loan_type: Mapped[Optional[str]] = mapped_column(String(40))
-    property_state: Mapped[Optional[str]] = mapped_column(String(20))
+    property_state: Mapped[Optional[str]] = mapped_column(String(20))  # USPS code
     property_address: Mapped[Optional[str]] = mapped_column(String(200))
     property_city: Mapped[Optional[str]] = mapped_column(String(80))
     property_zip: Mapped[Optional[str]] = mapped_column(String(10))
+    lead_source_campaign: Mapped[Optional[str]] = mapped_column(String(100))  # LendingFlow "Source"
+    submitted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # borrower submit time on LendingFlow
     consent_status: Mapped[str] = mapped_column(String(10), nullable=False, default="missing", server_default=text("'missing'"))
     suppressed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     suppression_reason: Mapped[Optional[str]] = mapped_column(String(30))

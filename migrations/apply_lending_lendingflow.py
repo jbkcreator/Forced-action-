@@ -21,7 +21,13 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 # create never alters an existing table; columns added after first apply go here.
-_ALTERS: list[str] = []
+_ALTERS: list[str] = [
+    'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS loan_amount_range varchar(40)',
+    'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS loan_amount_min bigint',
+    'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS loan_amount_max bigint',
+    'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS lead_source_campaign varchar(100)',
+    'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS submitted_at timestamptz',
+]
 
 
 def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:

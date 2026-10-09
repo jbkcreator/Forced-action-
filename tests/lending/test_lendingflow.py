@@ -90,12 +90,16 @@ def _count(db, table):
 def test_parse_normalizes_and_maps():
     parsed = parse_lendingflow(_payload())
     assert parsed.phone == "+17275550100" and parsed.email == "test.borrower@example.com"
-    assert parsed.loan_type == "FIX_AND_FLIP" and parsed.property_state == "FL"
-    assert parsed.credit_band_min_fico == 680 and parsed.loan_amount == 250000
+    assert parsed.loan_type == "DSCR_RENTAL" and parsed.property_state == "FL"
+    assert parsed.credit_band_min_fico == 740 and parsed.loan_amount == 500_000
+    assert (parsed.loan_amount_range, parsed.loan_amount_min, parsed.loan_amount_max) == ("$500K - $1M", 500_000, 1_000_000)
+    assert parsed.lead_source_campaign == "60 Second Loan Match"
+    assert parsed.submitted_at == datetime(2026, 10, 9, 15, 42, 17, tzinfo=timezone.utc)
     assert parsed.certificate.consented_at == datetime(2026, 10, 9, 14, 3, 22, tzinfo=timezone.utc)
 
 
-@pytest.mark.parametrize("raw,expected", [("680-719", 680), ("720+", 720), ("Excellent", None), (None, None), ("", None)])
+@pytest.mark.parametrize("raw,expected", [("680-719", 680), ("740+", 740), ("Below 620", None), ("Excellent", None),
+                                          (None, None), ("", None)])
 def test_credit_band_min_fico(raw, expected):
     assert _credit_band_min_fico(raw) == expected
 
@@ -105,6 +109,34 @@ def test_credit_band_min_fico(raw, expected):
 def test_parse_rejects_malformed(payload):
     with pytest.raises(ParseError):
         parse_lendingflow(payload)
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("$500K - $1M", ("$500K - $1M", 500_000, 1_000_000)),
+    ("$250,000", ("$250,000", 250_000, 250_000)),
+    ("$1.5M to $2M", ("$1.5M to $2M", 1_500_000, 2_000_000)),
+    ("$1M+", ("$1M+", 1_000_000, None)),
+    ("Under $100K", ("Under $100K", None, 100_000)),
+    (750000, ("750000", 750_000, 750_000)),
+    ("call me", ("call me", None, None)),
+])
+def test_loan_amount_band(raw, expected):
+    parsed = parse_lendingflow({"lead_id": "1", "phone": "7275550100", "loan_amount": raw})
+    assert (parsed.loan_amount_range, parsed.loan_amount_min, parsed.loan_amount_max) == expected
+    assert parsed.loan_amount == expected[1]
+
+
+@pytest.mark.parametrize("raw,expected", [("Florida", "FL"), ("florida", "FL"), ("FL", "FL"), ("fl", "FL"),
+                                          ("New  York", "NY"), ("Atlantis", None)])
+def test_state_code(raw, expected):
+    assert parse_lendingflow({"lead_id": "1", "phone": "7275550100", "state": raw}).property_state == expected
+
+
+@pytest.mark.parametrize("raw,expected", [("DSCR", "DSCR_RENTAL"), ("Fix & Flip", "FIX_AND_FLIP"), ("fix-and-flip", "FIX_AND_FLIP"),
+                                          ("Ground Up", "GROUND_UP_CONSTRUCTION"), ("New Construction", "GROUND_UP_CONSTRUCTION"),
+                                          ("Bridge", "BRIDGE"), ("Rehab", None)])
+def test_loan_type_names(raw, expected):
+    assert parse_lendingflow({"lead_id": "1", "phone": "7275550100", "loan_type": raw}).loan_type == expected
 
 
 @pytest.mark.parametrize("field,value", [("email", "nope"), ("loan_amount", "abc"), ("loan_amount", -5)])
@@ -265,8 +297,8 @@ def test_delivery_emits_event_once_and_queues_prequal(lf_db, seen):
     followups = deliver_pending(lf_db, sink)
     run_followups(followups)
     assert len(sink.pushed) == 1 and sink.pushed[0]["phone"] == "+17275550100"
-    assert len(events) == 1 and events[0].loan_type is LoanType.FIX_AND_FLIP and events[0].credit_band_min_fico == 680
-    assert events[0].phone == "+17275550100" and events[0].loan_amount == 250000
+    assert len(events) == 1 and events[0].loan_type is LoanType.DSCR_RENTAL and events[0].credit_band_min_fico == 740
+    assert events[0].phone == "+17275550100" and events[0].loan_amount == 500_000
     assert len(prequal) == 1 and prequal[0]["lead_source"] == "lendingflow" and prequal[0]["lead_ref"] == "LF-1"
     assert prequal[0]["contact_id"] == "ghl_1" and prequal[0]["lead"].property_state == "FL"
     assert deliver_pending(lf_db, sink) == [] and len(sink.pushed) == 1  # nothing left to deliver
@@ -331,7 +363,7 @@ def test_ghl_sink_tags_missing_consent_and_skips_card_without_stage(monkeypatch)
 
     from src.services import ghl_webhook
     monkeypatch.setattr(ghl_webhook, "_ghl_request", fake)
-    lead = {"id": 1, "lead_uuid": "u-1", "vendor_lead_id": "LF-1", "phone": "+17275550100", "email": None, "first_name": None,
+    lead = {"id": 1, "lead_uuid": "u-1", "vendor_lead_id": "LF-1", "lead_source_campaign": "60 Second Loan Match", "phone": "+17275550100", "email": None, "first_name": None,
             "last_name": None, "consent_status": "missing", "received_at": datetime(2026, 10, 9, tzinfo=timezone.utc)}
     result = LendingFlowGhlSink(GhlAccount("k", "loc")).push(lead)
     assert result == PushResult(contact_id="c1", pipeline_card=False)
@@ -340,7 +372,7 @@ def test_ghl_sink_tags_missing_consent_and_skips_card_without_stage(monkeypatch)
     tags = next(c for c in calls if c[1] == "tags")
     assert tags[2]["tags"] == ["lendingflow", "lendingflow-consent-missing"]
     note = next(c for c in calls if c[1] == "notes")
-    assert note[2]["body"] == "LendingFlow lead u-1 (vendor id LF-1)."
+    assert note[2]["body"] == "LendingFlow lead u-1 (vendor id LF-1). Source: 60 Second Loan Match."
 
 
 def test_logs_carry_no_phone_or_email(client, lf_db, seen, caplog):
