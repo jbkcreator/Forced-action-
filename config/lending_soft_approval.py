@@ -22,6 +22,13 @@ SOFT_APPROVAL_LOAN_TYPES: frozenset[LoanType] = frozenset({LoanType.FIX_AND_FLIP
 OPEN_FORM_ACTION_ID = "soft_approval_open"
 FORM_CALLBACK_ID = "soft_approval_form"
 
+# Card retry (src/tasks/lending_soft_approval_card_retry.py): a finished call with no card row is retried every
+# cron cycle. The age floor keeps the sweep off a call whose first attempt is still running; the window bounds
+# the backfill (it is also what enabling the feature can post for calls that ended just before it was switched on).
+CARD_RETRY_MIN_AGE_SECONDS = 120
+CARD_RETRY_WINDOW_HOURS = 6
+CARD_RETRY_BATCH_LIMIT = 50
+
 
 @dataclass(frozen=True)
 class SoftApprovalParams:

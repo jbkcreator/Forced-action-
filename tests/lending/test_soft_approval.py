@@ -31,6 +31,7 @@ from src.lending.soft_approval.calc import CalculationUnavailable, LenderTerms, 
 from src.lending.soft_approval.facts import SoftApprovalFacts
 from src.lending.soft_approval.lead_source import FakeLeadProfileSource, LeadProfile
 from src.lending.soft_approval.service import generate_soft_approval
+from src.tasks import lending_soft_approval_card_retry as card_retry
 
 PHONE = "+17275550101"
 LENDER = "test_flip"
@@ -362,6 +363,72 @@ class TestCard:
         tasks.clear()
         follow_up(RecordedCall(call_ended=False, **base), lambda fn, *a: tasks.append(fn.__name__))
         assert "post_soft_approval_card" not in tasks
+
+
+@pytest.fixture
+def retry(wired, soft_db, monkeypatch):
+    @contextmanager
+    def session():
+        with soft_db.begin_nested():
+            yield soft_db
+
+    monkeypatch.setattr(card_retry, "lending_session", session)
+    monkeypatch.setattr(card_retry, "get_settings", lambda: _settings())
+    monkeypatch.setattr(slack_card, "slack_client", lambda: wired)
+    return card_retry
+
+
+def _ended(db, row_id, minutes_ago=10):
+    db.execute(
+        text("UPDATE lending.call_dispositions SET call_ended_at = now() - make_interval(mins => :m) WHERE id = :id"),
+        {"m": minutes_ago, "id": row_id},
+    )
+
+
+class TestCardRetry:
+    def test_a_card_that_failed_to_post_is_posted_by_the_retry_cycle_exactly_once(self, wired, soft_db, retry):
+        row_id = _call(soft_db)
+        _ended(soft_db, row_id)
+        recorded = RecordedCall(row_id=row_id, call_id="call-1", phone=PHONE, caller_seat=None, disposition=None,
+                                opt_out_propagated=False, call_ended=True)
+        wired.fail = True
+        follow_up(recorded, lambda fn, *a: fn(*a) if fn.__name__ == "post_soft_approval_card" else None)
+        assert wired.posts == []
+        assert soft_db.execute(text("SELECT count(*) FROM lending.soft_approval_cards")).scalar() == 0
+
+        wired.fail = False  # the CDR row is unchanged, so the poller never calls follow_up for it again
+        assert retry.run() == 1
+        assert retry.run() == 0
+        assert len(wired.posts) == 1 and wired.posts[0]["blocks"][1]["elements"][0]["value"] == "call-1"
+        assert soft_db.execute(text("SELECT message_ts FROM lending.soft_approval_cards")).scalar() == "1.1"
+
+    def test_a_call_that_already_has_a_card_is_not_retried(self, wired, soft_db, retry):
+        row_id = _call(soft_db)
+        _ended(soft_db, row_id)
+        slack_card.post_soft_approval_card(row_id, client=wired)
+        assert retry.run() == 0
+        assert len(wired.posts) == 1
+
+    @pytest.mark.parametrize("call, minutes_ago", [
+        ({"talk": 0}, 10),
+        ({"disposition": "DNC_REQUEST"}, 10),
+        ({}, 0),            # ended just now: its first attempt may still be running
+        ({}, 7 * 60),       # older than the 6-hour retry window
+        ({}, None),         # never ended
+    ])
+    def test_only_eligible_recent_calls_are_retried(self, wired, soft_db, retry, call, minutes_ago):
+        row_id = _call(soft_db, **call)
+        if minutes_ago is not None:
+            _ended(soft_db, row_id, minutes_ago)
+        assert retry.run() == 0
+        assert wired.posts == []
+
+    def test_disabled_feature_retries_nothing(self, wired, soft_db, retry, monkeypatch):
+        row_id = _call(soft_db)
+        _ended(soft_db, row_id)
+        monkeypatch.setattr(retry, "get_settings", lambda: _settings(lending_soft_approval_enabled=False))
+        assert retry.run() == 0
+        assert wired.posts == []
 
 
 # ---- signature + route -------------------------------------------------------------------------
