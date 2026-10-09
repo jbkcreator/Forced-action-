@@ -80,6 +80,16 @@ class LoadRefused(RuntimeError):
     """A live load cannot run until an open decision is made."""
 
 
+class LoadAborted(RuntimeError):
+    """A live load stopped after too many consecutive dialer failures (dialer likely down).
+
+    ``report`` holds the live counts up to the abort; contacts already pushed are recorded."""
+
+    def __init__(self, message: str, report: "LoadReport"):
+        super().__init__(message)
+        self.report = report
+
+
 def no_scrub(phones: list[str]) -> list[dict]:
     """Dry-run scrubber: scrubs nothing, so stale numbers show as needing a scrub."""
     return []
@@ -463,6 +473,7 @@ def run_dialer_load(
     commit: Optional[Callable[[], None]] = None,
     now: Optional[datetime] = None,
     backflip_check: Optional[bool] = None,
+    max_consecutive_failures: Optional[int] = None,
 ) -> LoadReport:
     """Gate every record, then (live only) load the survivors into dialer.
 
@@ -470,6 +481,8 @@ def run_dialer_load(
     back afterwards. Live requires ``scrubber`` and ``dialer`` and commits
     through ``commit`` (default ``db.commit``) after each chunk of loads.
     ``backflip_check`` defaults to the ``LENDING_BACKFLIP_CHECK_ENABLED`` setting.
+    ``max_consecutive_failures`` raises ``LoadAborted`` after that many dialer
+    failures in a row; pushed contacts are recorded first. None or 0 = never abort.
     """
     if backflip_check is None:
         backflip_check = get_settings().lending_backflip_check_enabled
@@ -552,6 +565,7 @@ def run_dialer_load(
     active = _active_rows(db, loadable_phones)
     chunk: list[tuple[_Loadable, int]] = []
     cards = _cards(db, loadable)
+    consecutive_failures = 0
     try:
         for item in loadable:
             if _suppressed_phones(db, [item.phone]):  # one indexed lookup per push (a push is 3 HTTP calls)
@@ -571,15 +585,20 @@ def run_dialer_load(
                 if _create_outcome_unknown(exc):
                     _record_unconfirmed_create(db, run_id, item, exc.status)
                     commit()
+                consecutive_failures += 1
+                if isinstance(exc, ContactFieldsNotSet):
+                    # Live in the dialer: track it before any abort so opt-out can delete it.
+                    chunk.append((item, exc.contact_id))
+                if max_consecutive_failures and consecutive_failures >= max_consecutive_failures:
+                    raise LoadAborted(f"{consecutive_failures} consecutive dialer failures", report)
                 if not isinstance(exc, ContactFieldsNotSet):
                     continue
-                contact_id = exc.contact_id  # live in the dialer: track it so opt-out can delete it
             else:
+                consecutive_failures = 0
                 report.loaded += 1
                 report.created += int(result.created)
                 report.updated += int(not result.created)
-                contact_id = result.contact_id
-            chunk.append((item, contact_id))
+                chunk.append((item, result.contact_id))
             if len(chunk) >= COMMIT_CHUNK_SIZE:
                 _store_chunk(db, run_id, chunk, active)
                 commit()
