@@ -439,3 +439,38 @@ class LendingPrequalLetter(LendingBase):
         Index("uq_lending_prequal_letters_lead", "lead_source", "lead_ref", unique=True),
         Index("idx_lending_prequal_letters_delivery", "status", "created_at"),
     )
+
+
+class LendingUncalledAlarm(LendingBase):
+    """T-10: one stopwatch per LendingFlow lead, copied from T-11's ``lending.lendingflow_leads``.
+
+    ``lendingflow_lead_id`` is deliberately not a foreign key, so this table does not depend on T-11's
+    migration order. ``fired_120_at`` / ``fired_300_at`` are claims committed before the send: an alarm fires
+    at most once. ``*_status``: sent / failed / not_configured / skipped_late. ``alarm_*_kind``: no_call /
+    not_reached. ``resolved_reason``: connected / escalated / preexisting (existed before T-10 was switched on).
+    """
+
+    __tablename__ = "uncalled_alarms"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    lendingflow_lead_id: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
+    lead_uuid: Mapped[str] = mapped_column(String(36), nullable=False)
+    phone: Mapped[str] = mapped_column(String(20), nullable=False)  # phone_utils.normalize (from T-11)
+    arrived_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    fired_120_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    fired_300_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    alarm_120_kind: Mapped[Optional[str]] = mapped_column(String(12))
+    alarm_300_kind: Mapped[Optional[str]] = mapped_column(String(12))
+    sms_120_status: Mapped[Optional[str]] = mapped_column(String(20))
+    sms_300_status: Mapped[Optional[str]] = mapped_column(String(20))
+    slack_300_status: Mapped[Optional[str]] = mapped_column(String(20))
+    last_error: Mapped[Optional[str]] = mapped_column(String(200))  # exception class only, no PII
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    resolved_reason: Mapped[Optional[str]] = mapped_column(String(20))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint("resolved_reason IN ('connected', 'escalated', 'preexisting')",
+                        name="ck_lending_uncalled_alarms_reason"),
+        Index("idx_lending_uncalled_alarms_open", "arrived_at", postgresql_where=text("resolved_at IS NULL")),
+    )
