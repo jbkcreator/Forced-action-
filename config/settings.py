@@ -935,6 +935,10 @@ class AppSettings(BaseSettings):
 	lending_lendingflow_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_LENDINGFLOW_WEBHOOK_SECRET")
 	# Pipeline stage (in LENDING_GHL_PIPELINE_ID) for new LendingFlow leads; unset = contact only.
 	lending_ghl_stage_lendingflow_new: Optional[str] = Field(default=None, env="LENDING_GHL_STAGE_LENDINGFLOW_NEW")
+	# T-12 background enrichment card + routing. Off: no card is built, the deal-facts webhook returns 503.
+	lending_enrichment_enabled: bool = Field(default=False, env="LENDING_ENRICHMENT_ENABLED")
+	# Street View Static API (metadata lookup only; the key is never put in a posted link). Unset = no Street View.
+	google_maps_api_key: Optional[SecretStr] = Field(default=None, env="GOOGLE_MAPS_API_KEY")
 	aircall_webhook_token: Optional[SecretStr] = Field(default=None, env="AIRCALL_WEBHOOK_TOKEN")
 
 	# ── Lending engine: call disposition logging ──

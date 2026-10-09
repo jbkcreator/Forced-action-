@@ -531,3 +531,46 @@ class LendingLeadConsentCertificate(LendingBase):
         CheckConstraint("verification_method IN ('certificate_timestamp', 'receipt_only')",
                         name="ck_lending_lead_consent_certificates_method"),
     )
+
+
+class LendingLendingFlowEnrichment(LendingBase):
+    """Background enrichment card + routing for one LendingFlow lead (T-12), one row per lead.
+
+    ``captured_address`` / ``target_close_date`` come from the call or booking form and win over the
+    address LendingFlow sent; ``routing_tag`` is FULL_MACHINE or NURTURE (a DB value only; it is not
+    the ``lending.contacts.nurture`` DNC flag and moves no GHL stage). ``card`` and ``fit`` hold what
+    was shown to Josh; ``post_signature`` guards the deal-thread post so an unchanged address is never
+    posted twice. Re-running updates the row quietly (Josh B3).
+    ``status``: pending -> running (claimed) -> ready / failed (retried with backoff, capped).
+    """
+
+    __tablename__ = "lendingflow_enrichment"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    lead_id: Mapped[int] = mapped_column(ForeignKey("lending.lendingflow_leads.id"), nullable=False, unique=True)
+    status: Mapped[str] = mapped_column(String(10), nullable=False, default="pending", server_default=text("'pending'"))
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    last_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[Optional[str]] = mapped_column(String(200))
+    captured_address: Mapped[Optional[str]] = mapped_column(String(200))
+    target_close_date: Mapped[Optional[date]] = mapped_column(Date)
+    facts_source: Mapped[Optional[str]] = mapped_column(String(30))  # who last supplied them: booking_form / slack_form
+    property_id: Mapped[Optional[int]] = mapped_column(BigInteger)
+    match_confidence: Mapped[Optional[int]] = mapped_column(Integer)
+    routing_tag: Mapped[Optional[str]] = mapped_column(String(15))
+    routing_reason: Mapped[Optional[str]] = mapped_column(String(40))
+    closer_priority: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    card: Mapped[Optional[dict]] = mapped_column(JSONB)
+    fit: Mapped[Optional[dict]] = mapped_column(JSONB)
+    thread_ts: Mapped[Optional[str]] = mapped_column(String(40))
+    post_signature: Mapped[Optional[str]] = mapped_column(String(64))
+    posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint("status IN ('pending', 'running', 'ready', 'failed')", name="ck_lending_lendingflow_enrichment_status"),
+        CheckConstraint("routing_tag IS NULL OR routing_tag IN ('FULL_MACHINE', 'NURTURE')",
+                        name="ck_lending_lendingflow_enrichment_routing"),
+        Index("idx_lending_lendingflow_enrichment_sweep", "status", "last_attempt_at"),
+    )
