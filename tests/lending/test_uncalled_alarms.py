@@ -96,3 +96,33 @@ def test_migration_marks_existing_leads_preexisting(db):
     apply_to(db.connection())  # the deploy step re-runs the migration right before the flag goes on
     row = alarm(db, lead_id)
     assert row["resolved_reason"] == "preexisting" and row["fired_120_at"] is None
+
+
+from src.lending.uncalled_alarm_worker import pick_up_new_leads  # noqa: E402
+
+
+def test_pickup_starts_the_stopwatch_at_received_at(db):
+    lead_id = lead(db)
+    pick_up_new_leads(db)
+    row = alarm(db, lead_id)
+    assert row["arrived_at"] == ARRIVED and row["phone"] == LEAD_PHONE and row["resolved_at"] is None
+
+
+def test_pickup_twice_makes_one_alarm(db):
+    lead_id = lead(db)
+    pick_up_new_leads(db)
+    pick_up_new_leads(db)
+    assert db.execute(text("SELECT count(*) FROM lending.uncalled_alarms WHERE lendingflow_lead_id = :i"),
+                      {"i": lead_id}).scalar() == 1
+
+
+def test_suppressed_lead_is_never_picked_up(db):
+    lead_id = lead(db, suppressed=True)
+    pick_up_new_leads(db)
+    assert alarm(db, lead_id) is None
+
+
+def test_old_lead_is_still_picked_up(db):
+    lead_id = lead(db, arrived=ARRIVED - timedelta(hours=3))
+    pick_up_new_leads(db)
+    assert alarm(db, lead_id)["resolved_at"] is None
