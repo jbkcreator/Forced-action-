@@ -151,3 +151,116 @@ def ghl_call_lookup(account, *, http: Optional[Callable[..., Any]] = None) -> Gh
         return ATTEMPTED if attempted else NONE
 
     return status
+
+
+_DUE = text("""
+    SELECT a.id, a.lead_uuid, a.phone, a.arrived_at, a.fired_120_at, l.first_name, l.property_state, l.ghl_contact_id
+      FROM lending.uncalled_alarms a
+      LEFT JOIN lending.lendingflow_leads l ON l.id = a.lendingflow_lead_id
+     WHERE a.resolved_at IS NULL AND a.arrived_at <= :first_due
+       AND (a.fired_120_at IS NULL OR a.arrived_at <= :escalation_due)
+     ORDER BY a.arrived_at LIMIT :limit
+""")
+
+_RESOLVE_CONNECTED = text("""
+    UPDATE lending.uncalled_alarms SET resolved_at = :now, resolved_reason = 'connected'
+     WHERE id = :id AND resolved_at IS NULL
+""")
+
+_CLAIM_FIRST = text("""
+    UPDATE lending.uncalled_alarms SET fired_120_at = :now, alarm_120_kind = :kind
+     WHERE id = :id AND fired_120_at IS NULL AND resolved_at IS NULL RETURNING id
+""")
+
+# The escalation also closes the row; a first alarm never sent by now is recorded as skipped_late.
+_CLAIM_ESCALATION = text("""
+    UPDATE lending.uncalled_alarms
+       SET fired_300_at = :now, alarm_300_kind = :kind, resolved_at = :now, resolved_reason = 'escalated',
+           sms_120_status = CASE WHEN fired_120_at IS NULL THEN 'skipped_late' ELSE sms_120_status END
+     WHERE id = :id AND fired_300_at IS NULL AND resolved_at IS NULL RETURNING id
+""")
+
+_RECORD_FIRST = text("UPDATE lending.uncalled_alarms SET sms_120_status = :sms, last_error = COALESCE(:err, last_error) "
+                     "WHERE id = :id")
+_RECORD_ESCALATION = text("UPDATE lending.uncalled_alarms SET sms_300_status = :sms, slack_300_status = :slack, "
+                          "last_error = COALESCE(:err, last_error) WHERE id = :id")
+
+
+def _lead_label(row: Mapping[str, Any]) -> str:
+    name = (row["first_name"] or "").strip() or "(no name)"
+    return f"{name} ({row['property_state']})" if row["property_state"] else name
+
+
+def _send_sms(sms: Optional[Callable[..., str]], to: Optional[str], body: str) -> tuple[str, Optional[str]]:
+    if sms is None or not to:
+        return "not_configured", None
+    try:
+        sms(to, body, None)
+        return "sent", None
+    except Exception as exc:  # class only: GHL errors can carry request detail
+        return "failed", type(exc).__name__
+
+
+def _post_slack(slack: Any, channel: str, body: str) -> tuple[str, Optional[str]]:
+    if slack is None or not channel:
+        return "not_configured", None
+    try:
+        slack.chat_postMessage(channel=channel, text=body)
+        return "sent", None
+    except Exception as exc:
+        return "failed", type(exc).__name__
+
+
+def _decide(db, row: Mapping[str, Any], *, now: datetime, sms: Optional[Callable[..., str]], slack: Any,
+            ghl_status: Optional[GhlCallStatus], sms_to: Optional[str], ops_channel: str) -> str:
+    calls = call_status(db, row, ghl_status)
+    if calls == CONNECTED:
+        db.execute(_RESOLVE_CONNECTED, {"id": row["id"], "now": now})
+        db.commit()
+        return "connected"
+    kind = KIND_NOT_REACHED if calls == ATTEMPTED else KIND_NO_CALL
+    escalate = row["arrived_at"] <= now - timedelta(seconds=ESCALATION_SECONDS)
+    claim = _CLAIM_ESCALATION if escalate else _CLAIM_FIRST
+    if db.execute(claim, {"id": row["id"], "now": now, "kind": kind}).first() is None:
+        db.commit()
+        return "already_claimed"
+    db.commit()  # the claim is durable before anything is sent: never a second alarm
+
+    fields = {"lead": _lead_label(row), "ref": str(row["lead_uuid"])[:8],
+              "minutes": int((now - row["arrived_at"]).total_seconds() // 60),
+              "state": f" ({row['property_state']})" if row["property_state"] else ""}
+    if not escalate:
+        status, err = _send_sms(sms, sms_to, SMS_TEXT[(FIRST_ALARM_SECONDS, kind)].format(**fields))
+        db.execute(_RECORD_FIRST, {"id": row["id"], "sms": status, "err": err})
+        db.commit()
+        return f"first_{kind}_sms_{status}"
+    sms_status, sms_err = _send_sms(sms, sms_to, SMS_TEXT[(ESCALATION_SECONDS, kind)].format(**fields))
+    slack_status, slack_err = _post_slack(slack, ops_channel, SLACK_TEXT[kind].format(**fields))
+    db.execute(_RECORD_ESCALATION, {"id": row["id"], "sms": sms_status, "slack": slack_status,
+                                    "err": sms_err or slack_err})
+    db.commit()
+    return f"escalation_{kind}_sms_{sms_status}_slack_{slack_status}"
+
+
+def process_due(db, *, now: Optional[datetime] = None, sms: Optional[Callable[..., str]], slack: Any,
+                ghl_status: Optional[GhlCallStatus], sms_to: Optional[str], ops_channel: str,
+                limit: int = BATCH_SIZE) -> dict[str, int]:
+    """One cycle: pick up new leads, then decide every alarm that is due."""
+    now = now or _utcnow()
+    pick_up_new_leads(db)
+    rows = db.execute(_DUE, {"first_due": now - timedelta(seconds=FIRST_ALARM_SECONDS),
+                             "escalation_due": now - timedelta(seconds=ESCALATION_SECONDS),
+                             "limit": limit}).mappings().all()
+    counts: dict[str, int] = {}
+    for row in rows:
+        try:
+            outcome = _decide(db, row, now=now, sms=sms, slack=slack, ghl_status=ghl_status,
+                              sms_to=sms_to, ops_channel=ops_channel)
+        except Exception as exc:  # class only: SQL errors embed bound params (phones)
+            db.rollback()
+            logger.error("[uncalled-alarm] lead=%s crashed (%s)", row["lead_uuid"], type(exc).__name__)
+            outcome = "error"
+        counts[outcome] = counts.get(outcome, 0) + 1
+        level = logging.WARNING if "failed" in outcome or "not_configured" in outcome else logging.INFO
+        logger.log(level, "[uncalled-alarm] lead=%s outcome=%s", row["lead_uuid"], outcome)
+    return counts

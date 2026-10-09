@@ -238,3 +238,156 @@ def test_ghl_lookup_naive_or_bad_dates_count_as_no_call():
         {"direction": "outbound"},
     ]))
     assert lookup("ghl-1", ARRIVED) == NONE
+
+
+from src.lending.uncalled_alarm_worker import process_due  # noqa: E402
+
+
+def cycle(db, seconds, *, sms=None, slack=None, ghl_status=None, sms_to: str | None = JOSH, ops=OPS):
+    return process_due(db, now=ARRIVED + timedelta(seconds=seconds), sms=sms, slack=slack,
+                       ghl_status=ghl_status, sms_to=sms_to, ops_channel=ops)
+
+
+def test_uncalled_lead_alarms_once_at_120_then_escalates_once_at_300(db):
+    lead_id = lead(db)
+    sms, slack = Sms(), Slack()
+    for seconds in (30, 119):
+        cycle(db, seconds, sms=sms, slack=slack)
+    assert sms.sent == [] and slack.posts == []
+
+    cycle(db, 120, sms=sms, slack=slack)
+    cycle(db, 200, sms=sms, slack=slack)
+    assert len(sms.sent) == 1 and slack.posts == []
+    to, body = sms.sent[0]
+    assert to == JOSH
+    assert body.startswith("NDL LEAD ALERT: New LendingFlow lead Jane (FL) came in 2 min ago and no call is logged yet.")
+    assert "If you're already on the phone with them, ignore this." in body
+
+    cycle(db, 300, sms=sms, slack=slack)
+    cycle(db, 400, sms=sms, slack=slack)
+    assert len(sms.sent) == 2 and sms.sent[1][1].startswith("URGENT - NDL LEAD STILL UNCALLED: ")
+    assert "came in 5 min ago" in sms.sent[1][1]
+    assert len(slack.posts) == 1 and slack.posts[0][0] == OPS
+    assert slack.posts[0][1].startswith(":rotating_light: *URGENT: LendingFlow lead still uncalled*")
+    assert "Jane" not in slack.posts[0][1] and LEAD_PHONE not in slack.posts[0][1]
+    row = alarm(db, lead_id)
+    assert (row["alarm_120_kind"], row["alarm_300_kind"]) == ("no_call", "no_call")
+    assert (row["sms_120_status"], row["sms_300_status"], row["slack_300_status"]) == ("sent", "sent", "sent")
+    assert row["resolved_reason"] == "escalated"
+
+
+def test_unanswered_attempt_sends_not_reached_alarms(db):
+    lead_id = lead(db)
+    call(db, started=ARRIVED + timedelta(seconds=60), disposition="NO_ANSWER", talk_seconds=0)
+    sms, slack = Sms(), Slack()
+    cycle(db, 120, sms=sms, slack=slack)
+    cycle(db, 300, sms=sms, slack=slack)
+    assert sms.sent[0][1].startswith("NDL LEAD ALERT - NOT REACHED: LendingFlow lead Jane (FL) was called but not reached")
+    assert sms.sent[1][1].startswith("URGENT - NDL LEAD STILL NOT REACHED: ")
+    assert slack.posts[0][1].startswith(":warning: *URGENT: LendingFlow lead not reached*")
+    row = alarm(db, lead_id)
+    assert (row["alarm_120_kind"], row["alarm_300_kind"]) == ("not_reached", "not_reached")
+
+
+def test_connected_before_120_never_alarms(db):
+    lead_id = lead(db)
+    call(db, started=ARRIVED + timedelta(seconds=90), disposition="BOOKED")
+    sms, slack = Sms(), Slack()
+    for seconds in (120, 300):
+        cycle(db, seconds, sms=sms, slack=slack)
+    assert sms.sent == [] and slack.posts == []
+    assert alarm(db, lead_id)["resolved_reason"] == "connected"
+
+
+def test_connected_between_alarms_stops_the_escalation(db):
+    lead_id = lead(db)
+    sms, slack = Sms(), Slack()
+    cycle(db, 120, sms=sms, slack=slack)
+    call(db, started=ARRIVED + timedelta(seconds=200), disposition="CALLBACK_REQUESTED")
+    cycle(db, 300, sms=sms, slack=slack)
+    assert len(sms.sent) == 1 and slack.posts == []
+    assert alarm(db, lead_id)["resolved_reason"] == "connected"
+
+
+def test_late_start_sends_only_the_escalation(db):
+    lead_id = lead(db)
+    sms, slack = Sms(), Slack()
+    cycle(db, 360, sms=sms, slack=slack)  # worker was down through the 2-minute mark
+    assert len(sms.sent) == 1 and sms.sent[0][1].startswith("URGENT") and "came in 6 min ago" in sms.sent[0][1]
+    assert len(slack.posts) == 1
+    assert alarm(db, lead_id)["sms_120_status"] == "skipped_late"
+
+
+def test_old_lead_is_still_picked_up_and_alarms_late(db):
+    lead(db, arrived=ARRIVED - timedelta(minutes=37))
+    sms = Sms()
+    cycle(db, 0, sms=sms, slack=Slack())
+    assert len(sms.sent) == 1 and "came in 37 min ago" in sms.sent[0][1]
+
+
+def test_worker_restart_still_escalates_once(db):
+    lead_id = lead(db)
+    cycle(db, 120, sms=Sms(), slack=Slack())
+    sms, slack = Sms(), Slack()  # a fresh process: new senders, state only in Postgres
+    for seconds in (150, 300, 310):
+        cycle(db, seconds, sms=sms, slack=slack)
+    assert len(sms.sent) == 1 and sms.sent[0][1].startswith("URGENT") and len(slack.posts) == 1
+    assert alarm(db, lead_id)["resolved_reason"] == "escalated"
+
+
+def test_claimed_alarm_is_never_sent_twice(db):
+    lead_id = lead(db)
+    pick_up_new_leads(db)
+    db.execute(text("UPDATE lending.uncalled_alarms SET fired_120_at = :t WHERE lendingflow_lead_id = :i"),
+               {"t": ARRIVED + timedelta(seconds=120), "i": lead_id})  # claimed, then the process died before sending
+    sms = Sms()
+    cycle(db, 130, sms=sms)
+    assert sms.sent == [] and alarm(db, lead_id)["sms_120_status"] is None
+
+
+def test_sms_failure_does_not_block_slack_and_is_not_resent(db):
+    lead_id = lead(db)
+    failing, slack = Sms(error=RuntimeError("boom")), Slack()
+    for seconds in (120, 150, 300):
+        cycle(db, seconds, sms=failing, slack=slack)
+    row = alarm(db, lead_id)
+    assert (row["sms_120_status"], row["sms_300_status"], row["slack_300_status"]) == ("failed", "failed", "sent")
+    assert row["last_error"] == "RuntimeError"
+    assert len(slack.posts) == 1
+
+
+def test_missing_josh_number_or_channel_records_not_configured(db):
+    lead_id = lead(db)
+    cycle(db, 300, sms=Sms(), slack=None, sms_to=None, ops="")
+    row = alarm(db, lead_id)
+    assert (row["sms_300_status"], row["slack_300_status"]) == ("not_configured", "not_configured")
+
+
+def test_alarm_text_without_name_or_state(db):
+    lead(db, first_name=None, state=None)
+    sms = Sms()
+    cycle(db, 120, sms=sms)
+    assert "lead (no name) came in" in sms.sent[0][1]
+
+
+def test_preexisting_lead_never_alarms(db):
+    lead_id = lead(db)
+    apply_to(db.connection())  # marks it preexisting, as the deploy step does
+    sms = Sms()
+    cycle(db, 300, sms=sms, slack=Slack())
+    assert sms.sent == [] and alarm(db, lead_id)["resolved_reason"] == "preexisting"
+
+
+def test_messages_are_plain_ascii():
+    from config.lending_alarms import SLACK_TEXT, SMS_TEXT
+
+    for template in [*SMS_TEXT.values(), *SLACK_TEXT.values()]:
+        assert template.isascii(), template
+
+
+def test_logs_carry_no_phone_numbers(db, caplog):
+    lead(db)
+    with caplog.at_level(logging.DEBUG):
+        cycle(db, 120, sms=Sms(error=RuntimeError(LEAD_PHONE)))
+        cycle(db, 300, sms=Sms(), slack=Slack())
+    assert LEAD_PHONE not in caplog.text and JOSH not in caplog.text and "Jane" not in caplog.text
