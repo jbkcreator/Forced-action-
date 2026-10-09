@@ -23,6 +23,7 @@ from src.lending.disposition_delivery import (
 from src.lending.consent import record_consent
 from src.lending.dialer_port import get_dialer
 from src.lending.dispositions import DialerCallEvent, RecordedCall, record_dialer_event
+from src.lending.soft_approval.slack_card import post_soft_approval_card
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +131,8 @@ def retry_unpropagated_dnc(db: Session) -> int:
 
 def follow_up(recorded: RecordedCall, add_task: Callable[..., None]) -> None:
     add_task(deliver_disposition, recorded.row_id)
+    if recorded.call_ended:
+        add_task(post_soft_approval_card, recorded.row_id)
     if recorded.unknown_code:
         add_task(alert_unknown_code, recorded.call_id, recorded.unknown_code, recorded.caller_seat)
     if recorded.dnc_requested and not recorded.phone:

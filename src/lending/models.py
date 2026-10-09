@@ -18,6 +18,7 @@ from sqlalchemy import (
     DateTime,
     Index,
     Integer,
+    LargeBinary,
     MetaData,
     Numeric,
     String,
@@ -403,4 +404,50 @@ class LendingWebLead(LendingBase):
         CheckConstraint("ghl_status IN ('pending', 'synced', 'contact_only', 'failed')", name="ck_lending_web_leads_ghl_status"),
         Index("idx_lending_web_leads_delivery", "ghl_status", "received_at"),
         Index("idx_lending_web_leads_phone", "phone", "received_at"),
+    )
+
+
+class LendingSoftApprovalCard(LendingBase):
+    """The Slack card posted for one finished call (T-08): one per call, claimed before posting."""
+
+    __tablename__ = "soft_approval_cards"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    dialer_call_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
+    phone: Mapped[str] = mapped_column(String(20), nullable=False)  # phone_utils.normalize
+    channel: Mapped[Optional[str]] = mapped_column(String(40))
+    message_ts: Mapped[Optional[str]] = mapped_column(String(50))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+
+class LendingSoftApproval(LendingBase):
+    """The Call-One soft approval for one lead (T-08), keyed by normalized phone.
+
+    Interim "deal record": the Person/Property/Deal tables arrive with T-11. One row per lead; a
+    resubmission with changed figures updates it in place and appends the replaced values to ``history``.
+    ``pdf`` is NULL unless ``status`` is ``generated``. ``lender_key`` is internal; the PDF never names it.
+    """
+
+    __tablename__ = "soft_approvals"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    phone: Mapped[str] = mapped_column(String(20), nullable=False, unique=True)  # phone_utils.normalize
+    dialer_call_id: Mapped[str] = mapped_column(String(100), nullable=False)  # call of the latest submission
+    status: Mapped[str] = mapped_column(String(30), nullable=False)
+    reason: Mapped[Optional[str]] = mapped_column(String(60))
+    lender_key: Mapped[Optional[str]] = mapped_column(String(60))
+    facts: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    figures: Mapped[Optional[dict]] = mapped_column(JSONB)
+    pdf: Mapped[Optional[bytes]] = mapped_column(LargeBinary)
+    template_version: Mapped[Optional[str]] = mapped_column(String(20))
+    submitted_by: Mapped[Optional[str]] = mapped_column(String(40))  # Slack user id
+    history: Mapped[list] = mapped_column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('generated', 'no_fit', 'no_lead', 'out_of_scope', 'terms_unconfirmed', 'render_failed')",
+            name="ck_lending_soft_approvals_status",
+        ),
     )

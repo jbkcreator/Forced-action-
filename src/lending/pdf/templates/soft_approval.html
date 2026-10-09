@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}Soft Approval Summary{% endblock %}
+{% block header_tag %}Soft Approval Summary{% endblock %}
+{% block extra_head %}
+<style>
+  .date { color: var(--ink-2); font-size: 10pt; margin: 0 0 22px; }
+  h1 { font-size: 22pt; font-weight: 850; margin: 0 0 6px; letter-spacing: -.01em; }
+  .address { font-size: 13pt; font-weight: 750; color: var(--green); margin: 0 0 18px; }
+  .figure-card { background: var(--navy); color: var(--paper); border-radius: 4px; padding: 20px 26px; margin: 18px 0; border-left: 6px solid var(--gold); }
+  .figure-card .label { font-size: 9.5pt; color: var(--mist); letter-spacing: .08em; text-transform: uppercase; }
+  .figure-card .amount { font-size: 26pt; font-weight: 850; margin-top: 4px; }
+  table.facts { width: 100%; border-collapse: collapse; margin: 6px 0 22px; }
+  table.facts td { padding: 9px 0; border-bottom: 1px solid var(--line); font-size: 11pt; }
+  table.facts td:first-child { color: var(--ink-2); width: 55%; }
+  table.facts td:last-child { font-weight: 750; text-align: right; }
+  .note { background: var(--green-tint); border-left: 4px solid var(--green); padding: 12px 16px; font-size: 10pt; color: var(--navy-deep); margin-top: 14px; }
+  .next { font-size: 11pt; margin-top: 20px; }
+</style>
+{% endblock %}
+{% block body %}
+<p class="date">{{ generated_date }}</p>
+<h1>Your soft approval summary</h1>
+<p class="address">{{ property_address }}</p>
+<p>Thanks for talking with us. Based on the details you shared on our call, here is a property-specific estimate.</p>
+
+<div class="figure-card">
+  <div class="label">Estimated loan amount</div>
+  <div class="amount">{{ net_loan }}</div>
+</div>
+
+<table class="facts">
+  <tr><td>Estimated rehab funding</td><td>{{ rehab_funding }}</td></tr>
+  {% if max_purchase_price %}<tr><td>Estimated maximum purchase price</td><td>{{ max_purchase_price }}</td></tr>{% endif %}
+</table>
+
+<table class="facts">
+  <tr><td>Purchase price you shared</td><td>{{ purchase_price }}</td></tr>
+  <tr><td>Rehab budget you shared</td><td>{{ rehab_budget }}</td></tr>
+  <tr><td>Estimated after-repair value you shared</td><td>{{ arv }}</td></tr>
+</table>
+
+<div class="note">
+  This is a non-binding estimate for informational purposes only, based on information provided on the call.
+  It is not a commitment to lend, a loan approval, or an offer of specific terms. Final eligibility and terms
+  depend on a full review of your file and lender approval.
+</div>
+
+<p class="next">Questions or ready to talk through your deal? Call or text <strong>(727) 436-9951</strong>
+or reply to this email.</p>
+{# PLACEHOLDER COPY: wording, signer and required disclosures pending Josh and a qualified professional's review. #}
+{% endblock %}
