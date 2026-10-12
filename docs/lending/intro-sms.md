@@ -36,7 +36,7 @@ Workflow name: `NDL - Lead Intro SMS`. Create the tag `lendingflow-intro-ready` 
 
 1. **Trigger:** *Contact tag* -> "Tag added" includes **`lendingflow-intro-ready`**. One trigger only, no extra filters (extra filters combine with AND). Do **not** use *Contact created* or the `lendingflow` tag.
 2. **No If/Else.** Delete the "Consent check" step. Consent is decided before the tag is added.
-3. **Send SMS:** From = the number Josh buys; body = the copy Josh approves. Add this action only after Josh's number exists. Draft D3 (not final): `Hi {{contact.first_name | default: 'there'}}, this is Josh Kantor with Next Deal Lending. Thanks for your loan request. I'd like to talk it through. Pick a time that works here: https://api.leadconnectorhq.com/widget/bookings/ndl-calender. Reply STOP to opt out.` Confirm the exact fallback syntax in GHL's merge-field picker. No property details. Keep the apostrophe in "I'd" a straight `'`. About 226 characters: two SMS segments, which is fine.
+3. **Send SMS:** body = the copy Josh approves. This action has **no From-number field**: it sends from the sub-account's **default SMS number**, so Josh's number must be set as the default (Settings -> Phone Numbers) and no other number may be the default. Build the action now but keep the workflow in Draft until Josh's number exists. Do not click the action's "Send test SMS" button until then: it sends a real text from the default number. Draft D3 (not final): `Hi {{contact.first_name | default: 'there'}}, this is Josh Kantor with Next Deal Lending. Thanks for your loan request. I'd like to talk it through. Pick a time that works here: https://api.leadconnectorhq.com/widget/bookings/ndl-calender. Reply STOP to opt out.` Confirm the exact fallback syntax in GHL's merge-field picker. No property details. Keep the apostrophe in "I'd" a straight `'`. About 226 characters: two SMS segments, which is fine.
 4. **Add tag `intro-sms-sent`** directly after Send SMS (check that it does not run when Send SMS errors). The Smart List `LendingFlow - not texted` (Tags include `lendingflow-intro-ready` and do not include `intro-sms-sent`) then shows leads that were never texted.
 5. **Workflow settings:** **Allow re-entry off**, **Allow multiple opportunities off**, **Stop on response off**, no time window, no wait step. Do **not** add a Remove-tag step: the ready tag staying on the contact is what stops a retried push from triggering again.
 6. Leave GHL's DND handling on (the Send SMS action skips contacts with DND set).
@@ -66,9 +66,10 @@ SELECT lead_uuid, received_at, ghl_status, ghl_contact_id FROM lending.lendingfl
 
 - [ ] Sarath's task update report to Josh says Test 1 should read "fires from the GHL SMS number", not (727) 436-9951
 - [ ] Follow-up (Sarath with Josh; not a build blocker): Josh's email received and the "NDL Calender" assigned to his GHL user, with his availability set; open the booking link once and confirm a slot can be picked
-- [ ] GHL SMS number bought and ID-verified (Josh); set as the workflow's "From"
+- [ ] GHL SMS number bought and ID-verified (Josh); set as the sub-account's **default** SMS number (the Send SMS action has no From picker); no other number is the default
 - [ ] 10DLC / A2P approved for it, or the D2 fallback evidence agreed
 - [ ] Josh-approved copy and calendar link in the workflow; placeholder wording gone
+- [ ] First-name fallback checked with a lead that has no first name (the action's merge field has no confirmed default)
 - [ ] D1 answers applied (consent, DNC); known limits above re-read
 - [ ] One live test lead through T-11: the text arrives on a handset in under 10 s; repeat 10 times and record the worst case
 - [ ] A human publishes the workflow with the Send SMS step
