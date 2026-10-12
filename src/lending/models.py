@@ -449,7 +449,8 @@ class LendingLendingFlowLead(LendingBase):
     Two UNIQUE keys enforce dedupe in the database: ``vendor_lead_id`` and ``dedupe_hash``
     (sha256 of normalized phone + lower-cased email). ``ghl_status``: pending -> synced /
     contact_only / failed; ``skipped`` = suppressed number, never pushed. ``event_emitted_at``
-    guards the once-per-lead ``LendingFlowLeadCreated`` event. ``raw_payload`` is kept for reparse.
+    is set once the ``LendingFlowLeadCreated`` event was emitted; ``followup_done_at`` once the event and the
+    pre-qual hand-off both succeeded (the sweep redoes a synced lead whose follow-ups never finished). ``raw_payload`` is kept for reparse.
     """
 
     __tablename__ = "lendingflow_leads"
@@ -489,6 +490,7 @@ class LendingLendingFlowLead(LendingBase):
     ghl_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     ghl_alerted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     event_emitted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    followup_done_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # event emitted AND pre-qual handed off
     duplicate_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     last_duplicate_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     raw_payload: Mapped[Any] = mapped_column(JSONB, nullable=False)

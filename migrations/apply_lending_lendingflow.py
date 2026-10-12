@@ -27,6 +27,9 @@ _ALTERS: list[str] = [
     'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS loan_amount_max bigint',
     'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS lead_source_campaign varchar(100)',
     'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS submitted_at timestamptz',
+    'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS followup_done_at timestamptz',
+    # leads whose event was claimed before this column existed are treated as done
+    'UPDATE "{t}".lendingflow_leads SET followup_done_at = event_emitted_at WHERE followup_done_at IS NULL AND event_emitted_at IS NOT NULL',
 ]
 
 
