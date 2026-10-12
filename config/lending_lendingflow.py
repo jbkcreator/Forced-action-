@@ -14,3 +14,6 @@ GHL_GIVE_UP_AFTER_HOURS = 72
 GHL_ALERT_AFTER_MINUTES = 15
 GHL_CONFIG_ERROR_STATUS_CODES = (401, 403)
 SWEEP_BATCH_SIZE = 50
+# A synced lead whose follow-ups are still not done after this long was lost to a crash or a failed
+# hand-off, not to the background task that is still running; the sweep redoes them.
+FOLLOWUP_RECOVERY_AFTER_MINUTES = 5

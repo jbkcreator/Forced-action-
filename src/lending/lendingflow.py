@@ -3,7 +3,8 @@
 Order matters, as for web leads: the lead and its consent certificate are committed before GHL is
 called, so a GHL outage never loses a paid lead. ``parse_lendingflow`` is the only function that
 knows LendingFlow's payload shape. After the GHL contact exists the lead's
-``LendingFlowLeadCreated`` event is emitted once and the T-07 pre-qual letter is queued.
+``LendingFlowLeadCreated`` event is emitted and the T-07 pre-qual letter is queued; a lead is marked
+done only when both succeeded, so a crash or a failed hand-off is redone by the sweep.
 """
 from __future__ import annotations
 
@@ -18,6 +19,7 @@ from typing import Any, Mapping, Optional, Protocol
 from sqlalchemy import text
 
 from config.lending_lendingflow import (
+    FOLLOWUP_RECOVERY_AFTER_MINUTES,
     GHL_GIVE_UP_AFTER_HOURS,
     GHL_RETRY_BACKOFF_MINUTES,
     LEAD_SOURCE,
@@ -359,18 +361,29 @@ def _backoff_minutes_sql() -> str:
 
 _DELIVERABLE = (
     "SELECT id, lead_uuid, vendor_lead_id, first_name, last_name, phone, email, credit_band, credit_band_min_fico, "
-    "loan_amount, loan_type, property_state, lead_source_campaign, consent_status, received_at, ghl_attempts "
+    "loan_amount, loan_type, property_state, lead_source_campaign, consent_status, received_at, ghl_attempts, "
+    "ghl_contact_id, event_emitted_at "
     "FROM lending.lendingflow_leads "
     "WHERE ghl_status IN ('pending', 'failed') AND NOT suppressed AND received_at > :oldest {extra} "
     "ORDER BY received_at LIMIT :limit FOR UPDATE SKIP LOCKED"
 )
 
 
+_RECOVERABLE = (
+    "SELECT id, lead_uuid, vendor_lead_id, first_name, last_name, phone, email, credit_band, credit_band_min_fico, "
+    "loan_amount, loan_type, property_state, lead_source_campaign, consent_status, received_at, ghl_attempts, "
+    "ghl_contact_id, event_emitted_at "
+    "FROM lending.lendingflow_leads "
+    "WHERE ghl_status IN ('synced', 'contact_only') AND NOT suppressed AND followup_done_at IS NULL "
+    "AND ghl_synced_at < :cutoff ORDER BY ghl_synced_at LIMIT :limit FOR UPDATE SKIP LOCKED"
+)
+
+
 def deliver_pending(db, sink: Optional[LeadSink], *, lead_id: Optional[int] = None,
                     now: Optional[datetime] = None) -> list[FollowUp]:
-    """Push stored leads to GHL. Returns a follow-up for each lead that reached GHL and whose
-    ``LendingFlowLeadCreated`` event was claimed here (once per lead). Never raises per lead; with
-    no sink, leads stay pending and no attempt is counted."""
+    """Push stored leads to GHL. Returns a follow-up for each lead that reached GHL, plus (sweep only) each
+    already-delivered lead whose follow-ups never finished. Never raises per lead; with no sink, leads stay
+    pending and no attempt is counted."""
     now = now or datetime.now(timezone.utc)
     if sink is None:
         logger.warning("[lendingflow] GHL is not configured: leads stay pending")
@@ -387,9 +400,20 @@ def deliver_pending(db, sink: Optional[LeadSink], *, lead_id: Optional[int] = No
     followups: list[FollowUp] = []
     for row in rows:
         lead = dict(row)
-        if _deliver_one(db, sink, lead, now) and _claim_event(db, lead["id"], now):
+        if _deliver_one(db, sink, lead, now):
             followups.append(FollowUp(lead))
+    if lead_id is None:
+        followups.extend(_recoverable_followups(db, now))
     return followups
+
+
+def _recoverable_followups(db, now: datetime) -> list[FollowUp]:
+    rows = db.execute(text(_RECOVERABLE), {
+        "cutoff": now - timedelta(minutes=FOLLOWUP_RECOVERY_AFTER_MINUTES), "limit": SWEEP_BATCH_SIZE,
+    }).mappings().all()
+    if rows:
+        logger.warning("[lendingflow] recovering unfinished follow-ups for %d lead(s)", len(rows))
+    return [FollowUp(dict(row)) for row in rows]
 
 
 def _deliver_one(db, sink: LeadSink, lead: dict[str, Any], now: datetime) -> bool:
@@ -423,37 +447,64 @@ def _record_failure(db, lead: dict[str, Any], reason: str, now: datetime, *, con
                lead["id"], attempts, config_error, reason)
 
 
-def _claim_event(db, lead_id: int, now: datetime) -> bool:
-    return db.execute(
-        text("UPDATE lending.lendingflow_leads SET event_emitted_at = :now "
-             "WHERE id = :id AND event_emitted_at IS NULL RETURNING id"),
-        {"now": now, "id": lead_id},
-    ).first() is not None
+def _mark(db, lead_id: int, column: str, now: datetime) -> None:
+    db.execute(text(f"UPDATE lending.lendingflow_leads SET {column} = :now WHERE id = :id AND {column} IS NULL"),
+               {"now": now, "id": lead_id})
+    db.commit()
 
 
-def run_followups(followups: list[FollowUp]) -> None:
-    """After commit: emit the event, then queue the pre-qual letter when the 4 core fields are present.
-    Never raises; logs lead id only."""
+def _emit_event(db, lead: Mapping[str, Any]) -> bool:
     from src.lending.lendingflow_events import build_event, emit
+
+    if lead.get("event_emitted_at") is not None:
+        return True
+    try:
+        emit(build_event(lead))
+    except Exception as exc:
+        logger.error("[lendingflow] event emit failed lead=%s: %s", lead["id"], type(exc).__name__)
+        return False
+    try:
+        _mark(db, lead["id"], "event_emitted_at", datetime.now(timezone.utc))
+    except Exception as exc:
+        db.rollback()
+        logger.error("[lendingflow] event mark failed lead=%s: %s", lead["id"], type(exc).__name__)
+        return False
+    return True
+
+
+def _hand_off_prequal(lead: Mapping[str, Any]) -> bool:
     from src.lending.prequal import PrequalLead
     from src.lending.prequal_letters import queue_and_send_in_background
 
+    prequal = PrequalLead(credit_band=lead["credit_band"], loan_amount=lead["loan_amount"],
+                          property_state=lead["property_state"], loan_type=lead["loan_type"])
+    if not all((prequal.credit_band, prequal.loan_amount, prequal.property_state, prequal.loan_type)):
+        logger.info("[lendingflow] prequal_skipped_missing_fields lead=%s", lead["id"])
+        return True
+    try:
+        queue_and_send_in_background(lead_source=LEAD_SOURCE, lead_ref=lead["vendor_lead_id"],
+                                     contact_id=lead["ghl_contact_id"], lead=prequal, strict=True)
+    except Exception as exc:
+        logger.error("[lendingflow] prequal hand-off failed lead=%s: %s", lead["id"], type(exc).__name__)
+        return False
+    return True
+
+
+def run_followups(db, followups: list[FollowUp]) -> None:
+    """After the delivery commit: emit the event, then queue the pre-qual letter when the 4 core fields are
+    present. A lead is marked done only when both succeeded; otherwise the sweep redoes the missing step
+    (the event is skipped once ``event_emitted_at`` is set; the letter is idempotent on its lead ref).
+    Never raises; logs lead id only."""
     for item in followups:
         lead = item.lead
-        try:
-            emit(build_event(lead))
-        except Exception as exc:
-            logger.error("[lendingflow] event emit failed lead=%s: %s", lead["id"], type(exc).__name__)
-        prequal = PrequalLead(credit_band=lead["credit_band"], loan_amount=lead["loan_amount"],
-                              property_state=lead["property_state"], loan_type=lead["loan_type"])
-        if not all((prequal.credit_band, prequal.loan_amount, prequal.property_state, prequal.loan_type)):
-            logger.info("[lendingflow] prequal_skipped_missing_fields lead=%s", lead["id"])
-            continue
-        try:
-            queue_and_send_in_background(lead_source=LEAD_SOURCE, lead_ref=lead["vendor_lead_id"],
-                                         contact_id=lead["ghl_contact_id"], lead=prequal)
-        except Exception as exc:
-            logger.error("[lendingflow] prequal hand-off failed lead=%s: %s", lead["id"], type(exc).__name__)
+        event_ok = _emit_event(db, lead)
+        prequal_ok = _hand_off_prequal(lead)
+        if event_ok and prequal_ok:
+            try:
+                _mark(db, lead["id"], "followup_done_at", datetime.now(timezone.utc))
+            except Exception as exc:
+                db.rollback()
+                logger.error("[lendingflow] follow-up mark failed lead=%s: %s", lead["id"], type(exc).__name__)
 
 
 def deliver_and_follow_up(sink: Optional[LeadSink], *, lead_id: Optional[int] = None) -> int:
@@ -463,7 +514,8 @@ def deliver_and_follow_up(sink: Optional[LeadSink], *, lead_id: Optional[int] = 
     try:
         with lending_session() as db:
             followups = deliver_pending(db, sink, lead_id=lead_id)
-        run_followups(followups)
+            db.commit()  # delivery state is durable before any follow-up runs
+            run_followups(db, followups)
         return len(followups)
     except Exception as exc:
         logger.error("[lendingflow] background delivery crashed lead=%s: %s", lead_id, type(exc).__name__)

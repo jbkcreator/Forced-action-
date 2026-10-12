@@ -1,0 +1,26 @@
+[Unit]
+Description=Forced Action - Next Deal Lending Cora Slack operator (Socket Mode)
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/Forced-action-
+Environment="PATH=/root/Forced-action-/.venv/bin"
+Environment="PYTHONPATH=/root/Forced-action-"
+EnvironmentFile=/root/Forced-action-/.env
+# Needs LENDING_CORA_SLACK_BOT_TOKEN, LENDING_CORA_SLACK_APP_TOKEN, LENDING_CORA_CHANNEL and
+# LENDING_CORA_APPROVER_USER_IDS; exits with status 1 if any is missing.
+ExecStart=/root/Forced-action-/.venv/bin/python -m src.lending.cora_agent
+Restart=always
+RestartSec=15
+StartLimitIntervalSec=120
+StartLimitBurst=5
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fa-lending-cora
+
+[Install]
+WantedBy=multi-user.target

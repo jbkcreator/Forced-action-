@@ -27,15 +27,34 @@ _ALTERS: list[str] = [
     'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS loan_amount_max bigint',
     'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS lead_source_campaign varchar(100)',
     'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS submitted_at timestamptz',
+    'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS followup_done_at timestamptz',
 ]
+
+# Leads whose event was claimed before followup_done_at existed are treated as done. Run only in the
+# apply that adds the column: afterwards "event sent, letter not queued" is a live state the sweep must retry.
+_BACKFILL_FOLLOWUP_DONE = (
+    'UPDATE "{t}".lendingflow_leads SET followup_done_at = event_emitted_at '
+    "WHERE followup_done_at IS NULL AND event_emitted_at IS NOT NULL"
+)
+
+
+def _has_column(conn: Connection, schema: str, table: str, column: str) -> bool:
+    return conn.execute(
+        text("SELECT 1 FROM information_schema.columns "
+             "WHERE table_schema = :s AND table_name = :t AND column_name = :c"),
+        {"s": schema, "t": table, "c": column},
+    ).first() is not None
 
 
 def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
     translated = conn.execution_options(schema_translate_map={LENDING_SCHEMA: schema})
     LendingLendingFlowLead.__table__.create(translated, checkfirst=True)
     LendingLeadConsentCertificate.__table__.create(translated, checkfirst=True)
+    followup_column_existed = _has_column(conn, schema, "lendingflow_leads", "followup_done_at")
     for stmt in _ALTERS:
         conn.execute(text(stmt.format(t=schema)))
+    if not followup_column_existed:
+        conn.execute(text(_BACKFILL_FOLLOWUP_DONE.format(t=schema)))
 
 
 def apply(engine: Engine | None = None, schema: str = LENDING_SCHEMA) -> None:

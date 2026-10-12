@@ -295,7 +295,7 @@ def test_delivery_emits_event_once_and_queues_prequal(lf_db, seen):
     _saved(lf_db)
     sink = RecordingSink()
     followups = deliver_pending(lf_db, sink)
-    run_followups(followups)
+    run_followups(lf_db, followups)
     assert len(sink.pushed) == 1 and sink.pushed[0]["phone"] == "+17275550100"
     assert len(events) == 1 and events[0].loan_type is LoanType.DSCR_RENTAL and events[0].credit_band_min_fico == 740
     assert events[0].phone == "+17275550100" and events[0].loan_amount == 500_000
@@ -312,15 +312,15 @@ def test_failed_push_then_sweep_emits_exactly_once(lf_db, seen):
                              "FROM lending.lendingflow_leads")).one()
     assert row.ghl_status == "failed" and row.ghl_attempts == 1 and row.event_emitted_at is None
     later = datetime.now(timezone.utc) + timedelta(hours=2)
-    run_followups(deliver_pending(lf_db, RecordingSink(), now=later))
-    run_followups(deliver_pending(lf_db, RecordingSink(), now=later))
+    run_followups(lf_db, deliver_pending(lf_db, RecordingSink(), now=later))
+    run_followups(lf_db, deliver_pending(lf_db, RecordingSink(), now=later))
     assert len(events) == 1
 
 
 def test_missing_prequal_field_still_emits_but_skips_prequal(lf_db, seen):
     events, prequal = seen
     _saved(lf_db, loan_amount=None)
-    run_followups(deliver_pending(lf_db, RecordingSink()))
+    run_followups(lf_db, deliver_pending(lf_db, RecordingSink()))
     assert len(events) == 1 and prequal == []
 
 
@@ -332,7 +332,7 @@ def test_event_handler_failure_does_not_stop_prequal(lf_db, seen):
 
     lendingflow_events._handlers.insert(0, boom)
     _saved(lf_db)
-    run_followups(deliver_pending(lf_db, RecordingSink()))
+    run_followups(lf_db, deliver_pending(lf_db, RecordingSink()))
     assert len(events) == 1 and len(prequal) == 1
 
 
@@ -378,6 +378,88 @@ def test_ghl_sink_tags_missing_consent_and_skips_card_without_stage(monkeypatch)
 def test_logs_carry_no_phone_or_email(client, lf_db, seen, caplog):
     caplog.set_level(logging.DEBUG)
     _post(client)
-    run_followups(deliver_pending(lf_db, RecordingSink()))
+    run_followups(lf_db, deliver_pending(lf_db, RecordingSink()))
     text_logged = caplog.text
     assert "5550100" not in text_logged and "example.com" not in text_logged.lower()
+
+
+# ------------------------------------------------------------------ follow-up recovery
+
+def _row(db):
+    return db.execute(text("SELECT ghl_status, event_emitted_at, followup_done_at FROM lending.lendingflow_leads")).one()
+
+
+def test_failed_prequal_handoff_is_retried_by_the_sweep(lf_db, seen, monkeypatch):
+    events, prequal = seen
+    calls = []
+
+    def flaky(**kw):
+        calls.append(kw)
+        if len(calls) == 1:
+            raise RuntimeError("connection blip")
+        prequal.append(kw)
+
+    monkeypatch.setattr("src.lending.prequal_letters.queue_and_send_in_background", flaky)
+    _saved(lf_db)
+    run_followups(lf_db, deliver_pending(lf_db, RecordingSink()))
+    row = _row(lf_db)
+    assert row.ghl_status == "contact_only" and row.event_emitted_at is not None and row.followup_done_at is None
+    later = datetime.now(timezone.utc) + timedelta(minutes=10)
+    run_followups(lf_db, deliver_pending(lf_db, RecordingSink(), now=later))
+    assert _row(lf_db).followup_done_at is not None
+    assert len(events) == 1 and len(prequal) == 1  # event not re-emitted, letter handed off once
+
+
+def test_failed_event_emit_is_retried_by_the_sweep(lf_db, seen, monkeypatch):
+    events, prequal = seen
+    real_build = lendingflow_events.build_event
+    attempts = []
+
+    def flaky_build(lead):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("bug")
+        return real_build(lead)
+
+    monkeypatch.setattr(lendingflow_events, "build_event", flaky_build)
+    _saved(lf_db)
+    run_followups(lf_db, deliver_pending(lf_db, RecordingSink()))
+    assert _row(lf_db).event_emitted_at is None and events == []
+    later = datetime.now(timezone.utc) + timedelta(minutes=10)
+    run_followups(lf_db, deliver_pending(lf_db, RecordingSink(), now=later))
+    assert len(events) == 1 and _row(lf_db).followup_done_at is not None
+
+
+def test_crash_after_delivery_commit_is_recovered(lf_db, seen):
+    events, prequal = seen
+    _saved(lf_db)
+    deliver_pending(lf_db, RecordingSink())  # delivered and committed; the process dies before run_followups
+    assert events == [] and _row(lf_db).followup_done_at is None
+    sink = RecordingSink()
+    run_followups(lf_db, deliver_pending(lf_db, sink))  # inside the grace window: the background task may still be running
+    assert events == []
+    later = datetime.now(timezone.utc) + timedelta(minutes=10)
+    run_followups(lf_db, deliver_pending(lf_db, sink, now=later))
+    assert len(events) == 1 and len(prequal) == 1 and sink.pushed == []  # recovery never re-pushes to GHL
+    assert _row(lf_db).followup_done_at is not None
+    run_followups(lf_db, deliver_pending(lf_db, sink, now=later))
+    assert len(events) == 1 and len(prequal) == 1  # done leads are never picked up again
+
+
+def test_migration_rerun_keeps_unfinished_followup_pending(lf_db):
+    from migrations.apply_lending_lendingflow import apply_to
+
+    _saved(lf_db)
+    lf_db.execute(text("UPDATE lending.lendingflow_leads SET ghl_status = 'synced', event_emitted_at = now()"))
+    apply_to(lf_db.get_bind())  # event sent, letter not queued: must stay retryable
+    assert _row(lf_db).followup_done_at is None
+
+
+def test_migration_backfills_only_when_it_adds_the_column(lf_db):
+    from migrations.apply_lending_lendingflow import apply_to
+
+    _saved(lf_db)
+    lf_db.execute(text("UPDATE lending.lendingflow_leads SET ghl_status = 'synced', event_emitted_at = now()"))
+    lf_db.execute(text("ALTER TABLE lending.lendingflow_leads DROP COLUMN followup_done_at"))
+    apply_to(lf_db.get_bind())  # first apply of the column: earlier claimed leads count as done
+    assert _row(lf_db).followup_done_at is not None
