@@ -12,7 +12,10 @@ to #lendingops. SMS go through GoHighLevel (``ghl_sms.GhlSmsSender``, single att
 
 Calls are only visible once they END, so a long call that starts before 2:00 still alarms; the wording says so.
 A GHL lookup that fails counts as GHL finding nothing: a false alarm is better than a silent miss.
-Each alarm is claimed (committed) before it is sent and is never re-sent. Logs carry lead ids only.
+Each alarm is claimed (committed) before it is sent. Delivery has three outcomes per channel: sent; definitely not
+sent (GHL contact/4xx rejection, Slack API rejection), retried up to MAX_SEND_ATTEMPTS times with short waits, then
+'failed' with an ERROR log; and possibly sent (timeout, 5xx, unexpected error), which is never resent. A 2-minute
+retry is dropped when the escalation fires or the lead has been reached. Logs carry lead ids only.
 """
 from __future__ import annotations
 
@@ -23,6 +26,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping, Optional
 
+from slack_sdk.errors import SlackApiError
 from sqlalchemy import text
 
 from config.lending_alarms import (
@@ -33,19 +37,25 @@ from config.lending_alarms import (
     GHL_TIMEOUT_SECONDS,
     KIND_NO_CALL,
     KIND_NOT_REACHED,
+    MAX_SEND_ATTEMPTS,
     NOT_CONNECTED_CODES,
     POLL_SECONDS,
+    RETRY_DELAYS_SECONDS,
+    RETRY_WINDOW_SECONDS,
     SLACK_TEXT,
     SMS_TEXT,
+    STALE_SEND_SECONDS,
 )
 from config.settings import get_settings
 from src.lending.db import lending_session
+from src.lending.ghl_sms import GhlSmsError
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
 
 CONNECTED, ATTEMPTED, NONE = "connected", "attempted", "none"
 GhlCallStatus = Callable[[str, datetime], str]  # (ghl_contact_id, since) -> CONNECTED / ATTEMPTED / NONE
+Clock = Callable[[], datetime]
 
 _PICKUP = text("""
     INSERT INTO lending.uncalled_alarms (lendingflow_lead_id, lead_uuid, phone, arrived_at)
@@ -153,11 +163,20 @@ def ghl_call_lookup(account, *, http: Optional[Callable[..., Any]] = None) -> Gh
     return status
 
 
+CHANNELS = ("sms_120", "sms_300", "slack_300")
+_FIRED_COLUMN = {"sms_120": "fired_120_at", "sms_300": "fired_300_at", "slack_300": "fired_300_at"}
+_KIND_COLUMN = {"sms_120": "alarm_120_kind", "sms_300": "alarm_300_kind", "slack_300": "alarm_300_kind"}
+
+# Channel / alarm statuses. SENT and the three terminal ones below are never revisited; RETRY is the only
+# status that causes another send (the provider provably did not take it); UNKNOWN is never resent.
+SENT, RETRY, SENDING, UNKNOWN, FAILED = "sent", "retry", "sending", "send_unknown", "failed"
+SUPERSEDED, NOT_CONFIGURED = "superseded", "not_configured"
+
 _DUE = text("""
     SELECT a.id, a.lead_uuid, a.phone, a.arrived_at, a.fired_120_at, l.first_name, l.property_state, l.ghl_contact_id
       FROM lending.uncalled_alarms a
       LEFT JOIN lending.lendingflow_leads l ON l.id = a.lendingflow_lead_id
-     WHERE a.resolved_at IS NULL AND a.arrived_at <= :first_due
+     WHERE a.resolved_at IS NULL AND a.fired_300_at IS NULL AND a.arrived_at <= :first_due
        AND (a.fired_120_at IS NULL OR a.arrived_at <= :escalation_due)
      ORDER BY a.arrived_at LIMIT :limit
 """)
@@ -172,18 +191,59 @@ _CLAIM_FIRST = text("""
      WHERE id = :id AND fired_120_at IS NULL AND resolved_at IS NULL RETURNING id
 """)
 
-# The escalation also closes the row; a first alarm never sent by now is recorded as skipped_late.
+# The escalation supersedes a pending 2-minute retry; a first alarm never sent by now is recorded as skipped_late.
+# The row is closed later, by _SETTLE, once every channel has reached a final status.
 _CLAIM_ESCALATION = text("""
     UPDATE lending.uncalled_alarms
-       SET fired_300_at = :now, alarm_300_kind = :kind, resolved_at = :now, resolved_reason = 'escalated',
-           sms_120_status = CASE WHEN fired_120_at IS NULL THEN 'skipped_late' ELSE sms_120_status END
+       SET fired_300_at = :now, alarm_300_kind = :kind,
+           sms_120_status = CASE WHEN fired_120_at IS NULL THEN 'skipped_late'
+                                 WHEN sms_120_status = 'retry' THEN 'superseded'
+                                 ELSE sms_120_status END
      WHERE id = :id AND fired_300_at IS NULL AND resolved_at IS NULL RETURNING id
 """)
 
-_RECORD_FIRST = text("UPDATE lending.uncalled_alarms SET sms_120_status = :sms, last_error = COALESCE(:err, last_error) "
-                     "WHERE id = :id")
-_RECORD_ESCALATION = text("UPDATE lending.uncalled_alarms SET sms_300_status = :sms, slack_300_status = :slack, "
-                          "last_error = COALESCE(:err, last_error) WHERE id = :id")
+_RETRY_DUE = text("""
+    SELECT a.id, a.lead_uuid, a.phone, a.arrived_at, a.fired_120_at, a.fired_300_at, a.alarm_120_kind, a.alarm_300_kind,
+           a.sms_120_status, a.sms_300_status, a.slack_300_status,
+           a.sms_120_attempts, a.sms_300_attempts, a.slack_300_attempts,
+           l.first_name, l.property_state, l.ghl_contact_id
+      FROM lending.uncalled_alarms a
+      LEFT JOIN lending.lendingflow_leads l ON l.id = a.lendingflow_lead_id
+     WHERE a.retry_at <= :now AND 'retry' IN (a.sms_120_status, a.sms_300_status, a.slack_300_status)
+     ORDER BY a.retry_at LIMIT :limit
+""")
+
+# Channel names come from the closed CHANNELS tuple above, never from input; values are bind parameters.
+_RECORD = {c: text(f"UPDATE lending.uncalled_alarms SET {c}_status = :status, {c}_attempts = :attempts, "
+                   "retry_at = CASE WHEN :status = 'retry' THEN :retry_at ELSE retry_at END, "
+                   "last_error = COALESCE(:err, last_error) WHERE id = :id") for c in CHANNELS}
+_SET_FROM_RETRY = {c: text(f"UPDATE lending.uncalled_alarms SET {c}_status = :status "
+                           f"WHERE id = :id AND {c}_status = 'retry'") for c in CHANNELS}
+_CLAIM_RETRY = {c: text(f"UPDATE lending.uncalled_alarms SET {c}_status = 'sending', claimed_at = :now "
+                        f"WHERE id = :id AND {c}_status = 'retry' RETURNING id") for c in CHANNELS}
+
+# A retry claimed but never recorded (crash) is unknown, not retried; so is an escalation claimed but never recorded.
+_STALE_SENDING = text("""
+    UPDATE lending.uncalled_alarms SET
+        sms_120_status = CASE WHEN sms_120_status = 'sending' THEN 'send_unknown' ELSE sms_120_status END,
+        sms_300_status = CASE WHEN sms_300_status = 'sending' THEN 'send_unknown' ELSE sms_300_status END,
+        slack_300_status = CASE WHEN slack_300_status = 'sending' THEN 'send_unknown' ELSE slack_300_status END
+     WHERE claimed_at < :cutoff AND 'sending' IN (sms_120_status, sms_300_status, slack_300_status)
+""")
+_STALE_ESCALATION = text("""
+    UPDATE lending.uncalled_alarms SET sms_300_status = COALESCE(sms_300_status, 'send_unknown'),
+                                       slack_300_status = COALESCE(slack_300_status, 'send_unknown')
+     WHERE resolved_at IS NULL AND fired_300_at < :cutoff AND (sms_300_status IS NULL OR slack_300_status IS NULL)
+""")
+
+# The escalated row closes once nothing is left to retry or in flight.
+_SETTLE = text("""
+    UPDATE lending.uncalled_alarms SET resolved_at = :now, resolved_reason = 'escalated'
+     WHERE resolved_at IS NULL AND fired_300_at IS NOT NULL
+       AND sms_300_status IS NOT NULL AND slack_300_status IS NOT NULL
+       AND COALESCE(sms_120_status, '') NOT IN ('retry', 'sending')
+       AND sms_300_status NOT IN ('retry', 'sending') AND slack_300_status NOT IN ('retry', 'sending')
+""")
 
 
 def _lead_label(row: Mapping[str, Any]) -> str:
@@ -191,29 +251,71 @@ def _lead_label(row: Mapping[str, Any]) -> str:
     return f"{name} ({row['property_state']})" if row["property_state"] else name
 
 
+def _fields(row: Mapping[str, Any], now: datetime) -> dict[str, Any]:
+    return {"lead": _lead_label(row), "ref": str(row["lead_uuid"])[:8],
+            "minutes": int((now - row["arrived_at"]).total_seconds() // 60),
+            "state": f" ({row['property_state']})" if row["property_state"] else ""}
+
+
+def _failure_status(exc: Exception) -> str:
+    """RETRY only when the provider provably did not take the message; everything else may have gone out."""
+    if isinstance(exc, GhlSmsError):
+        return UNKNOWN if exc.ambiguous else RETRY
+    if isinstance(exc, SlackApiError):  # Slack answered ok=false: nothing was posted
+        return RETRY
+    return UNKNOWN  # timeouts, connection errors and unexpected exceptions: the outcome is not known
+
+
 def _send_sms(sms: Optional[Callable[..., str]], to: Optional[str], body: str) -> tuple[str, Optional[str]]:
     if sms is None or not to:
-        return "not_configured", None
+        return NOT_CONFIGURED, None
     try:
         sms(to, body, None)
-        return "sent", None
+        return SENT, None
     except Exception as exc:  # class only: GHL errors can carry request detail
-        return "failed", type(exc).__name__
+        return _failure_status(exc), type(exc).__name__
 
 
 def _post_slack(slack: Any, channel: str, body: str) -> tuple[str, Optional[str]]:
     if slack is None or not channel:
-        return "not_configured", None
+        return NOT_CONFIGURED, None
     try:
         slack.chat_postMessage(channel=channel, text=body)
-        return "sent", None
+        return SENT, None
     except Exception as exc:
-        return "failed", type(exc).__name__
+        return _failure_status(exc), type(exc).__name__
 
 
-def _decide(db, row: Mapping[str, Any], *, now: datetime, sms: Optional[Callable[..., str]], slack: Any,
+def _send_channel(channel: str, row: Mapping[str, Any], kind: str, now: datetime, *, sms, slack,
+                  sms_to: Optional[str], ops_channel: str) -> tuple[str, Optional[str]]:
+    fields = _fields(row, now)
+    if channel == "slack_300":
+        return _post_slack(slack, ops_channel, SLACK_TEXT[kind].format(**fields))
+    seconds = FIRST_ALARM_SECONDS if channel == "sms_120" else ESCALATION_SECONDS
+    return _send_sms(sms, sms_to, SMS_TEXT[(seconds, kind)].format(**fields))
+
+
+def _record(db, row: Mapping[str, Any], channel: str, status: str, err: Optional[str], attempts_before: int,
+            now: datetime) -> str:
+    """Store one send attempt. A definite failure becomes 'failed' once the attempts are used up."""
+    attempts = attempts_before + 1
+    retry_at = None
+    if status == RETRY:
+        if attempts >= MAX_SEND_ATTEMPTS:
+            status = FAILED
+            logger.error("[uncalled-alarm] lead=%s %s gave up after %d attempts (%s)", row["lead_uuid"], channel,
+                         attempts, err)
+        else:
+            retry_at = now + timedelta(seconds=RETRY_DELAYS_SECONDS[min(attempts, len(RETRY_DELAYS_SECONDS)) - 1])
+    db.execute(_RECORD[channel], {"id": row["id"], "status": status, "attempts": attempts, "retry_at": retry_at,
+                                  "err": err})
+    return status
+
+
+def _decide(db, row: Mapping[str, Any], *, tick: Clock, sms: Optional[Callable[..., str]], slack: Any,
             ghl_status: Optional[GhlCallStatus], sms_to: Optional[str], ops_channel: str) -> str:
     calls = call_status(db, row, ghl_status)
+    now = tick()  # after the slow lookup: an earlier lead in the batch may have used up minutes
     if calls == CONNECTED:
         db.execute(_RESOLVE_CONNECTED, {"id": row["id"], "now": now})
         db.commit()
@@ -226,43 +328,99 @@ def _decide(db, row: Mapping[str, Any], *, now: datetime, sms: Optional[Callable
         return "already_claimed"
     db.commit()  # the claim is durable before anything is sent: never a second alarm
 
-    fields = {"lead": _lead_label(row), "ref": str(row["lead_uuid"])[:8],
-              "minutes": int((now - row["arrived_at"]).total_seconds() // 60),
-              "state": f" ({row['property_state']})" if row["property_state"] else ""}
+    send = dict(sms=sms, slack=slack, sms_to=sms_to, ops_channel=ops_channel)
     if not escalate:
-        status, err = _send_sms(sms, sms_to, SMS_TEXT[(FIRST_ALARM_SECONDS, kind)].format(**fields))
-        db.execute(_RECORD_FIRST, {"id": row["id"], "sms": status, "err": err})
+        status, err = _send_channel("sms_120", row, kind, tick(), **send)
+        status = _record(db, row, "sms_120", status, err, 0, tick())
         db.commit()
         return f"first_{kind}_sms_{status}"
-    sms_status, sms_err = _send_sms(sms, sms_to, SMS_TEXT[(ESCALATION_SECONDS, kind)].format(**fields))
-    slack_status, slack_err = _post_slack(slack, ops_channel, SLACK_TEXT[kind].format(**fields))
-    db.execute(_RECORD_ESCALATION, {"id": row["id"], "sms": sms_status, "slack": slack_status,
-                                    "err": sms_err or slack_err})
+    outcomes = []
+    for channel in ("sms_300", "slack_300"):
+        status, err = _send_channel(channel, row, kind, tick(), **send)
+        outcomes.append(_record(db, row, channel, status, err, 0, tick()))
     db.commit()
-    return f"escalation_{kind}_sms_{sms_status}_slack_{slack_status}"
+    return f"escalation_{kind}_sms_{outcomes[0]}_slack_{outcomes[1]}"
 
 
-def process_due(db, *, now: Optional[datetime] = None, sms: Optional[Callable[..., str]], slack: Any,
-                ghl_status: Optional[GhlCallStatus], sms_to: Optional[str], ops_channel: str,
+def _retry_row(db, row: Mapping[str, Any], *, tick: Clock, sms, slack, ghl_status: Optional[GhlCallStatus],
+               sms_to: Optional[str], ops_channel: str) -> list[str]:
+    """Retry every channel of this alarm that is waiting in 'retry'; each is claimed before it is sent."""
+    outcomes: list[str] = []
+    reached = call_status(db, row, ghl_status) == CONNECTED
+    now = tick()
+    for channel in CHANNELS:
+        if row[f"{channel}_status"] != RETRY:
+            continue
+        fired = row[_FIRED_COLUMN[channel]]
+        if reached:  # the lead has been called meanwhile: the alert is stale
+            db.execute(_SET_FROM_RETRY[channel], {"id": row["id"], "status": SUPERSEDED})
+            outcomes.append(f"retry_{channel}_{SUPERSEDED}")
+        elif fired is None or now - fired > timedelta(seconds=RETRY_WINDOW_SECONDS):
+            db.execute(_SET_FROM_RETRY[channel], {"id": row["id"], "status": FAILED})
+            logger.error("[uncalled-alarm] lead=%s %s gave up: retry window over", row["lead_uuid"], channel)
+            outcomes.append(f"retry_{channel}_{FAILED}")
+        else:
+            if db.execute(_CLAIM_RETRY[channel], {"id": row["id"], "now": now}).first() is None:
+                continue
+            db.commit()  # claimed before the send, like the first attempt
+            kind = row[_KIND_COLUMN[channel]]
+            status, err = _send_channel(channel, row, kind, tick(), sms=sms, slack=slack, sms_to=sms_to,
+                                        ops_channel=ops_channel)
+            recorded = _record(db, row, channel, status, err, row[f"{channel}_attempts"], tick())
+            outcomes.append(f"retry_{channel}_{recorded}")
+        db.commit()
+    return outcomes
+
+
+def process_due(db, *, now: Optional[datetime] = None, clock: Clock = _utcnow, sms: Optional[Callable[..., str]],
+                slack: Any, ghl_status: Optional[GhlCallStatus], sms_to: Optional[str], ops_channel: str,
                 limit: int = BATCH_SIZE) -> dict[str, int]:
-    """One cycle: pick up new leads, then decide every alarm that is due."""
-    now = now or _utcnow()
+    """One cycle: pick up new leads, decide the alarms that are due, retry definite failures, close settled rows.
+
+    ``now`` freezes the clock (tests); otherwise ``clock`` is read again for every lead, because a batch of leads
+    with slow providers can take minutes and a later lead must be judged by its real age, not the cycle's start.
+    """
+    tick: Clock = (lambda: now) if now is not None else clock
+    now = tick()
     pick_up_new_leads(db)
-    rows = db.execute(_DUE, {"first_due": now - timedelta(seconds=FIRST_ALARM_SECONDS),
-                             "escalation_due": now - timedelta(seconds=ESCALATION_SECONDS),
-                             "limit": limit}).mappings().all()
+    cutoff = now - timedelta(seconds=STALE_SEND_SECONDS)
+    db.execute(_STALE_SENDING, {"cutoff": cutoff})
+    db.execute(_STALE_ESCALATION, {"cutoff": cutoff})
+    db.commit()
     counts: dict[str, int] = {}
-    for row in rows:
+
+    def count(outcome: str, lead_uuid: Any) -> None:
+        counts[outcome] = counts.get(outcome, 0) + 1
+        noisy = any(word in outcome for word in (FAILED, NOT_CONFIGURED, RETRY, "error"))
+        logger.log(logging.WARNING if noisy else logging.INFO, "[uncalled-alarm] lead=%s outcome=%s", lead_uuid, outcome)
+
+    due = db.execute(_DUE, {"first_due": now - timedelta(seconds=FIRST_ALARM_SECONDS),
+                            "escalation_due": now - timedelta(seconds=ESCALATION_SECONDS),
+                            "limit": limit}).mappings().all()
+    for row in due:
         try:
-            outcome = _decide(db, row, now=now, sms=sms, slack=slack, ghl_status=ghl_status,
+            outcome = _decide(db, row, tick=tick, sms=sms, slack=slack, ghl_status=ghl_status,
                               sms_to=sms_to, ops_channel=ops_channel)
         except Exception as exc:  # class only: SQL errors embed bound params (phones)
             db.rollback()
             logger.error("[uncalled-alarm] lead=%s crashed (%s)", row["lead_uuid"], type(exc).__name__)
             outcome = "error"
-        counts[outcome] = counts.get(outcome, 0) + 1
-        level = logging.WARNING if "failed" in outcome or "not_configured" in outcome else logging.INFO
-        logger.log(level, "[uncalled-alarm] lead=%s outcome=%s", row["lead_uuid"], outcome)
+        count(outcome, row["lead_uuid"])
+
+    # After the decisions, so an escalation that fires this cycle supersedes a pending 2-minute retry first.
+    for row in db.execute(_RETRY_DUE, {"now": now, "limit": limit}).mappings().all():
+        try:
+            outcomes = _retry_row(db, row, tick=tick, sms=sms, slack=slack, ghl_status=ghl_status,
+                                  sms_to=sms_to, ops_channel=ops_channel)
+        except Exception as exc:
+            db.rollback()
+            logger.error("[uncalled-alarm] lead=%s retry crashed (%s)", row["lead_uuid"], type(exc).__name__)
+            outcomes = ["error"]
+        for outcome in outcomes:
+            count(outcome, row["lead_uuid"])
+
+    db.execute(_SETTLE, {"now": tick()})
+    db.commit()
     return counts
 
 

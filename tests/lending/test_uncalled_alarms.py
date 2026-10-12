@@ -345,13 +345,13 @@ def test_claimed_alarm_is_never_sent_twice(db):
     assert sms.sent == [] and alarm(db, lead_id)["sms_120_status"] is None
 
 
-def test_sms_failure_does_not_block_slack_and_is_not_resent(db):
+def test_unexpected_sms_error_is_unknown_never_resent_and_does_not_block_slack(db):
     lead_id = lead(db)
     failing, slack = Sms(error=RuntimeError("boom")), Slack()
     for seconds in (120, 150, 300):
         cycle(db, seconds, sms=failing, slack=slack)
     row = alarm(db, lead_id)
-    assert (row["sms_120_status"], row["sms_300_status"], row["slack_300_status"]) == ("failed", "failed", "sent")
+    assert (row["sms_120_status"], row["sms_300_status"], row["slack_300_status"]) == ("send_unknown", "send_unknown", "sent")
     assert row["last_error"] == "RuntimeError"
     assert len(slack.posts) == 1
 
@@ -406,3 +406,221 @@ def test_run_cycle_does_nothing_when_disabled(monkeypatch):
     monkeypatch.setattr(uncalled_alarm_worker, "get_settings", lambda: Settings())
     monkeypatch.setattr(uncalled_alarm_worker, "lending_session", no_db)
     assert uncalled_alarm_worker.run_cycle() == {}
+
+
+# --- delivery retries: definite failures retry, unknown outcomes never resend -------------------------------------
+
+from src.lending.ghl_sms import GhlSmsError  # noqa: E402
+from slack_sdk.errors import SlackApiError  # noqa: E402
+
+DEFINITE = GhlSmsError("GHL contact upsert failed: HTTP 500", ambiguous=False)
+UNKNOWN = GhlSmsError("GHL message send failed: HTTP 502", ambiguous=True)
+
+
+class FlakySms(Sms):
+    """Raises ``errors`` in order, then succeeds."""
+
+    def __init__(self, errors):
+        super().__init__()
+        self.errors, self.attempts = list(errors), 0
+
+    def __call__(self, to, body, first_name=None, *, deadline=None):
+        self.attempts += 1
+        if self.errors:
+            raise self.errors.pop(0)
+        return super().__call__(to, body, first_name, deadline=deadline)
+
+
+def states(db, lead_id):
+    row = alarm(db, lead_id)
+    return {k: row[k] for k in ("sms_120_status", "sms_300_status", "slack_300_status",
+                                "sms_120_attempts", "sms_300_attempts", "slack_300_attempts", "resolved_reason")}
+
+
+def test_definite_sms_failure_is_retried_after_a_short_wait_then_sent(db):
+    lead_id = lead(db)
+    sms = FlakySms([DEFINITE])
+    cycle(db, 120, sms=sms)
+    assert states(db, lead_id)["sms_120_status"] == "retry" and states(db, lead_id)["sms_120_attempts"] == 1
+    cycle(db, 130, sms=sms)  # before the 15 s wait is over
+    assert sms.attempts == 1
+    cycle(db, 135, sms=sms)
+    assert sms.attempts == 2 and len(sms.sent) == 1
+    assert "came in 2 min ago" in sms.sent[0][1]
+    assert states(db, lead_id)["sms_120_status"] == "sent" and states(db, lead_id)["sms_120_attempts"] == 2
+    cycle(db, 200, sms=sms)
+    assert sms.attempts == 2  # a sent alarm is never repeated
+
+
+def test_unknown_sms_outcome_is_never_resent(db):
+    lead_id = lead(db)
+    sms = FlakySms([UNKNOWN])
+    for seconds in (120, 135, 200):
+        cycle(db, seconds, sms=sms)
+    assert sms.attempts == 1 and states(db, lead_id)["sms_120_status"] == "send_unknown"
+
+
+def test_retries_stop_after_three_attempts_and_log_an_error(db, caplog):
+    lead_id = lead(db)
+    sms = FlakySms([DEFINITE] * 10)
+    with caplog.at_level(logging.ERROR):
+        for seconds in (120, 135, 179, 180, 240, 280):
+            cycle(db, seconds, sms=sms)
+    assert sms.attempts == 3  # 120 s, +15 s, +45 s
+    assert states(db, lead_id)["sms_120_status"] == "failed"
+    assert any("gave up" in r.getMessage() and "sms_120" in r.getMessage() for r in caplog.records)
+    assert LEAD_PHONE not in caplog.text and JOSH not in caplog.text
+
+
+def test_pending_first_alarm_retry_is_dropped_when_the_escalation_fires(db):
+    lead_id = lead(db)
+    sms = FlakySms([DEFINITE])
+    cycle(db, 120, sms=sms)        # fails, retry due at 135
+    cycle(db, 300, sms=sms, slack=Slack())   # escalation: the 2-minute retry is superseded
+    assert states(db, lead_id)["sms_120_status"] == "superseded"
+    assert len(sms.sent) == 1 and sms.sent[0][1].startswith("URGENT")
+
+
+def test_escalation_stays_open_until_its_retries_settle_then_resolves(db):
+    lead_id = lead(db)
+    sms, slack = FlakySms([DEFINITE]), Slack()
+    cycle(db, 300, sms=sms, slack=slack)
+    state = states(db, lead_id)
+    assert (state["sms_300_status"], state["slack_300_status"], state["resolved_reason"]) == ("retry", "sent", None)
+    cycle(db, 315, sms=sms, slack=slack)
+    state = states(db, lead_id)
+    assert (state["sms_300_status"], state["resolved_reason"]) == ("sent", "escalated")
+    assert len(sms.sent) == 1 and len(slack.posts) == 1
+
+
+def test_slack_rejection_is_retried_until_the_bot_is_in_the_channel(db):
+    lead_id = lead(db)
+    slack = Slack(error=SlackApiError("x", {"ok": False, "error": "not_in_channel"}))
+    sms = Sms()
+    cycle(db, 300, sms=sms, slack=slack)
+    assert states(db, lead_id)["slack_300_status"] == "retry"
+    slack.error = None  # someone invites the bot
+    cycle(db, 315, sms=sms, slack=slack)
+    assert states(db, lead_id)["slack_300_status"] == "sent" and len(slack.posts) == 1
+    assert states(db, lead_id)["resolved_reason"] == "escalated"
+
+
+def test_slack_timeout_is_unknown_and_not_reposted(db):
+    lead_id = lead(db)
+    slack = Slack(error=TimeoutError())
+    for seconds in (300, 315, 400):
+        cycle(db, seconds, sms=Sms(), slack=slack)
+    assert states(db, lead_id)["slack_300_status"] == "send_unknown"
+
+
+def test_retry_is_skipped_when_the_lead_has_been_reached_meanwhile(db):
+    lead_id = lead(db)
+    sms = FlakySms([DEFINITE])
+    cycle(db, 120, sms=sms)
+    call(db, started=ARRIVED + timedelta(seconds=130), disposition="BOOKED")
+    cycle(db, 135, sms=sms)
+    assert sms.attempts == 1 and states(db, lead_id)["sms_120_status"] == "superseded"
+
+
+def test_retry_after_the_window_is_expired_not_sent(db):
+    lead_id = lead(db)
+    sms = FlakySms([DEFINITE])
+    cycle(db, 300, sms=sms, slack=Slack())   # sms_300 fails, slack sent
+    cycle(db, 300 + 20 * 60, sms=sms, slack=Slack())   # worker was down for 20 minutes
+    assert sms.attempts == 1 and states(db, lead_id)["sms_300_status"] == "failed"
+    assert states(db, lead_id)["resolved_reason"] == "escalated"
+
+
+def test_channels_retry_independently(db):
+    lead_id = lead(db)
+    sms = FlakySms([DEFINITE])
+    slack = Slack(error=SlackApiError("x", {"ok": False, "error": "channel_not_found"}))
+    cycle(db, 300, sms=sms, slack=slack)
+    slack.error = None
+    cycle(db, 315, sms=sms, slack=slack)
+    state = states(db, lead_id)
+    assert (state["sms_300_status"], state["slack_300_status"]) == ("sent", "sent")
+    assert (state["sms_300_attempts"], state["slack_300_attempts"]) == (2, 2)
+
+
+def test_crash_after_a_retry_claim_becomes_unknown_and_is_not_resent(db):
+    lead_id = lead(db)
+    sms = FlakySms([DEFINITE])
+    cycle(db, 120, sms=sms)
+    db.execute(text("UPDATE lending.uncalled_alarms SET sms_120_status = 'sending', claimed_at = :t "
+                    "WHERE lendingflow_lead_id = :i"), {"t": ARRIVED + timedelta(seconds=135), "i": lead_id})
+    cycle(db, 140, sms=sms)   # claim is fresh: left alone
+    assert states(db, lead_id)["sms_120_status"] == "sending"
+    cycle(db, 135 + 130, sms=sms)   # claim is stale
+    assert sms.attempts == 1
+    assert states(db, lead_id)["sms_120_status"] == "send_unknown"
+
+
+def test_crash_after_the_escalation_claim_is_settled_as_unknown(db):
+    lead_id = lead(db)
+    pick_up_new_leads(db)
+    db.execute(text("UPDATE lending.uncalled_alarms SET fired_120_at = :t, fired_300_at = :t, alarm_300_kind = 'no_call' "
+                    "WHERE lendingflow_lead_id = :i"), {"t": ARRIVED + timedelta(seconds=300), "i": lead_id})
+    sms = Sms()
+    cycle(db, 310, sms=sms, slack=Slack())   # fresh claim: nothing is resent, nothing is settled yet
+    assert states(db, lead_id)["resolved_reason"] is None
+    cycle(db, 300 + 130, sms=sms, slack=Slack())
+    state = states(db, lead_id)
+    assert (state["sms_300_status"], state["slack_300_status"], state["resolved_reason"]) == (
+        "send_unknown", "send_unknown", "escalated")
+    assert sms.sent == []
+
+
+def test_migration_adds_the_retry_columns_to_an_existing_table(db):
+    conn = db.connection()
+    for column in ("sms_120_attempts", "sms_300_attempts", "slack_300_attempts", "retry_at", "claimed_at"):
+        conn.execute(text(f"ALTER TABLE lending.uncalled_alarms DROP COLUMN {column}"))
+    apply_to(conn)
+    columns = {r[0] for r in conn.execute(text(
+        "SELECT column_name FROM information_schema.columns WHERE table_schema='lending' AND table_name='uncalled_alarms'"))}
+    assert {"sms_120_attempts", "sms_300_attempts", "slack_300_attempts", "retry_at", "claimed_at"} <= columns
+
+
+# --- live clock: a slow batch must not judge later leads by the cycle's start time ---------------------------------
+
+
+def test_a_slow_batch_escalates_later_leads_directly(db):
+    state = {"t": ARRIVED + timedelta(seconds=120)}
+
+    class SlowSms(Sms):
+        """Every send takes 40 s of wall-clock time."""
+
+        def __call__(self, to, body, first_name=None, *, deadline=None):
+            result = super().__call__(to, body, first_name, deadline=deadline)
+            state["t"] += timedelta(seconds=40)
+            return result
+
+    ids = [lead(db, phone=f"+1727555020{n}") for n in range(6)]
+    sms, slack = SlowSms(), Slack()
+    process_due(db, clock=lambda: state["t"], sms=sms, slack=slack, ghl_status=None, sms_to=JOSH, ops_channel=OPS)
+
+    bodies = [body for _to, body in sms.sent]
+    assert len(bodies) == 6
+    assert sum(b.startswith("URGENT") for b in bodies) == 1  # the 6th lead, reached at 5 min 20 s
+    escalated = next(b for b in bodies if b.startswith("URGENT"))
+    assert "came in 5 min ago" in escalated and len(slack.posts) == 1
+    first = [b for b in bodies if not b.startswith("URGENT")]
+    assert all("came in" in b for b in first)
+    rows = [alarm(db, i) for i in ids]
+    assert sum(r["resolved_reason"] == "escalated" for r in rows) == 1
+    assert sum(r["sms_120_status"] == "skipped_late" for r in rows) == 1
+
+
+def test_message_age_is_taken_after_the_slow_call_lookup_not_at_cycle_start(db):
+    state = {"t": ARRIVED + timedelta(seconds=120)}
+
+    class SlowCallLookup:
+        def __call__(self, contact_id, since):
+            state["t"] += timedelta(seconds=70)   # the GHL history lookup is slow
+            return "none"
+
+    lead(db, ghl_contact_id="g-1")
+    sms = Sms()
+    process_due(db, clock=lambda: state["t"], sms=sms, slack=None, ghl_status=SlowCallLookup(), sms_to=JOSH,
+                ops_channel="")
+    assert len(sms.sent) == 1 and "came in 3 min ago" in sms.sent[0][1]   # 190 s, not the cycle's 120 s

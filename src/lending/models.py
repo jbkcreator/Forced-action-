@@ -446,8 +446,9 @@ class LendingUncalledAlarm(LendingBase):
 
     ``lendingflow_lead_id`` is deliberately not a foreign key, so this table does not depend on T-11's
     migration order. ``fired_120_at`` / ``fired_300_at`` are claims committed before the send: an alarm fires
-    at most once. ``*_status``: sent / failed / not_configured / skipped_late. ``alarm_*_kind``: no_call /
-    not_reached. ``resolved_reason``: connected / escalated / preexisting (existed before T-10 was switched on).
+    at most once. ``*_status``: sent / retry (definitely not sent, will be retried) / sending (a retry is claimed) /
+    send_unknown (may have been sent: never resent) / failed (retries used up) / superseded (no longer needed) /
+    not_configured / skipped_late. ``alarm_*_kind``: no_call / not_reached. ``resolved_reason``: connected / escalated / preexisting (existed before T-10 was switched on).
     """
 
     __tablename__ = "uncalled_alarms"
@@ -464,6 +465,11 @@ class LendingUncalledAlarm(LendingBase):
     sms_120_status: Mapped[Optional[str]] = mapped_column(String(20))
     sms_300_status: Mapped[Optional[str]] = mapped_column(String(20))
     slack_300_status: Mapped[Optional[str]] = mapped_column(String(20))
+    sms_120_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    sms_300_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    slack_300_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    retry_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # next retry of any channel in 'retry'
+    claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # when a retry send was claimed
     last_error: Mapped[Optional[str]] = mapped_column(String(200))  # exception class only, no PII
     resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     resolved_reason: Mapped[Optional[str]] = mapped_column(String(20))

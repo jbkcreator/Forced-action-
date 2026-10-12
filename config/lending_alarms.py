@@ -18,6 +18,13 @@ POLL_SECONDS = 5
 BATCH_SIZE = 50
 GHL_TIMEOUT_SECONDS = 5
 
+# Delivery retries. Only a send that provably never reached the provider is retried (GhlSmsError with
+# ambiguous=False, a Slack API rejection); a possible duplicate is never created from an unknown outcome.
+MAX_SEND_ATTEMPTS = 3
+RETRY_DELAYS_SECONDS = (15, 45)   # wait after attempt 1, after attempt 2
+RETRY_WINDOW_SECONDS = 15 * 60    # a retry still pending this long after its alarm fired is dropped
+STALE_SEND_SECONDS = 120          # a claimed send with no recorded outcome after this long is 'send_unknown'
+
 # A CDR with one of these dispositions is an attempt that did not reach the lead.
 NOT_CONNECTED_CODES = tuple(sorted(UNANSWERED_CODES | {"BAD_NUMBER"}))
 # GHL call message meta.callStatus values that mean the lead was reached (GHL OpenAPI; unverified live).
