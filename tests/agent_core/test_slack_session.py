@@ -97,6 +97,14 @@ def test_approver_halts_and_resumes(harness: Harness, halt: HaltSwitch) -> None:
     assert harness.messages == []
 
 
+@pytest.mark.parametrize("message_text", ["do not resume", "don't resume", "should I resume?"])
+def test_do_not_resume_keeps_the_agent_halted(harness: Harness, halt: HaltSwitch, message_text: str) -> None:
+    harness.dm(APPROVER, "stop all", ts="1")
+    harness.dm(APPROVER, message_text, ts="2")
+    assert halt.is_halted()
+    assert [message.text for message in harness.messages] == [message_text]  # handled as conversation, not a command
+
+
 def test_operator_cannot_halt(harness: Harness, halt: HaltSwitch) -> None:
     harness.dm(OPERATOR, "stop all")
     assert not halt.is_halted()

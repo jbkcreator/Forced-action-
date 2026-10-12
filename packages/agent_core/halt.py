@@ -30,6 +30,10 @@ _GLOBAL_FILLER = frozenset({"all", "everything", "evrything", "everythin", "ever
                             "immediately", "right", "asap", "already", "just", "and", "completely",
                             "sending", "sends"})
 _UNHALT_PHRASES = frozenset({"start again", "turn back on"})
+# Resuming releases held sends, so a missed resume is the safe outcome: only these words may come
+# before the resume word. "do not resume", "don't resume" and "should I resume?" are not resumes.
+_RESUME_LEAD_IN = frozenset({"please", "ok", "okay", "alright", "yes", "yeah", "hey", "go", "ahead",
+                             "and", "now", "you", "can", "could", "the", "bot", "agent"})
 _WORD = re.compile(r"[a-z]+")
 
 
@@ -37,10 +41,14 @@ class AgentHalted(RuntimeError):
     """Raised by :meth:`HaltSwitch.check` while the halt flag is set."""
 
 
-def _is_global_command(text_value: str, tokens: frozenset[str], filler: frozenset[str]) -> bool:
+def _is_global_command(text_value: str, tokens: frozenset[str], filler: frozenset[str],
+                       lead_in: frozenset[str] | None = None) -> bool:
+    """A command word followed only by filler; with ``lead_in``, also preceded only by those words."""
     words = _WORD.findall((text_value or "").lower())
     index = next((i for i, word in enumerate(words) if word in tokens), None)
     if index is None:
+        return False
+    if lead_in is not None and not all(word in lead_in for word in words[:index]):
         return False
     return all(word in filler for word in words[index + 1:])
 
@@ -50,8 +58,9 @@ class HaltSwitch:
         self._store = store
         self._table = store.table("agent_halt_state")
         self._clock = clock
-        # Lets "stop cora" and "resume cora" read as global commands.
+        # Lets "stop cora", "resume cora" and "cora, resume" read as global commands.
         self._filler = _GLOBAL_FILLER | {agent_name.lower()}
+        self._resume_lead_in = _RESUME_LEAD_IN | {agent_name.lower()}
         self._agent_name = agent_name
 
     def _read(self) -> tuple[bool, str]:
@@ -105,4 +114,4 @@ class HaltSwitch:
     def is_resume_command(self, message: str) -> bool:
         if (message or "").strip().lower().rstrip("!. ") in _UNHALT_PHRASES:
             return True
-        return _is_global_command(message, _UNHALT_TOKENS, self._filler)
+        return _is_global_command(message, _UNHALT_TOKENS, self._filler, lead_in=self._resume_lead_in)

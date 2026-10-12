@@ -43,9 +43,19 @@ def test_targeted_or_unrelated_messages_are_not_halts(halt: HaltSwitch, message:
     assert not halt.is_halt_command(message)
 
 
-@pytest.mark.parametrize("message", ["resume", "resume cora", "Resume everything!", "start again", "unpause"])
+@pytest.mark.parametrize("message", ["resume", "resume cora", "Resume everything!", "start again", "unpause",
+                                     "please resume", "ok resume", "Cora, resume", "can you resume?",
+                                     "go ahead and resume"])
 def test_global_resume_phrasings(halt: HaltSwitch, message: str) -> None:
     assert halt.is_resume_command(message)
+
+
+@pytest.mark.parametrize("message", ["do not resume", "Do NOT resume!", "don't resume", "dont resume",
+                                     "never resume", "no, don't resume yet", "should I resume?",
+                                     "why did you resume", "not yet, do not restart", "don't start again",
+                                     "do not turn back on"])
+def test_negated_or_questioned_resume_is_not_a_resume(halt: HaltSwitch, message: str) -> None:
+    assert not halt.is_resume_command(message)
 
 
 @pytest.mark.parametrize("message", ["resume texting Smith", "continue the Smith thread"])
