@@ -1199,6 +1199,10 @@ COUNTY_ID=hillsborough
 # No-op while LENDING_PREQUAL_PDF_ENABLED is off.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_prequal_sweep
 
+# Lending soft approval (T-08) — post the #dial-tasks deal-facts card for finished calls whose first post failed.
+# No-op while LENDING_SOFT_APPROVAL_ENABLED is off.
+*/5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_soft_approval_card_retry
+
 # Lending: warn once per call when a connected call has no disposition after N minutes.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_missing_disposition_alert
 
