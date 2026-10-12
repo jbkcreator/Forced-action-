@@ -921,7 +921,7 @@ class AppSettings(BaseSettings):
 	lending_prequal_email_from: Optional[str] = Field(default=None, env="LENDING_PREQUAL_EMAIL_FROM")
 	# Shared secret the GHL "DND changed" workflow sends in X-Webhook-Secret. Unset = endpoint closed.
 	lending_ghl_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_GHL_WEBHOOK_SECRET")
-	lending_ghl_sms_from_number: Optional[str] = Field(default=None, env="LENDING_GHL_SMS_FROM_NUMBER")  # E.164; the one number used for calling and texting
+	lending_ghl_sms_from_number: Optional[str] = Field(default=None, env="LENDING_GHL_SMS_FROM_NUMBER")  # E.164; the GHL SMS number (texting only). Calls run through BatchDialer on a different number
 	# lending_ghl_api_key / lending_ghl_location_id are defined once, above,
 	# alongside the rest of the LENDING_GHL_* credential group.
 	# WP-GL-11 website lead form. A stage in the "Booked Calls" pipeline (LENDING_GHL_PIPELINE_ID, above) for new web inquiries. With
