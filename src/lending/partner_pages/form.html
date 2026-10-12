@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Send a file to Next Deal Lending</h1>
+<p class="lead">Submitting as {{ partner.name }}{% if partner.company %} · {{ partner.company }}{% endif %}.
+  Takes about 3 minutes. <a href="/api/lending/partners/{{ token }}/status">See your files</a></p>
+
+{% if errors %}
+<div class="errors" role="alert">
+  {% for error in errors %}<div>{{ error }}</div>{% endfor %}
+</div>
+{% endif %}
+
+<form method="post" action="/api/lending/partners/{{ token }}/files" enctype="multipart/form-data">
+  <fieldset>
+    <legend>Borrower</legend>
+    <div class="row">
+      <div><label for="f-first">First name</label>
+        <input id="f-first" name="borrower_first_name" value="{{ values.borrower_first_name }}" required autocomplete="off"></div>
+      <div><label for="f-last">Last name</label>
+        <input id="f-last" name="borrower_last_name" value="{{ values.borrower_last_name }}" required autocomplete="off"></div>
+    </div>
+    <label for="f-phone">Phone</label>
+    <input id="f-phone" name="borrower_phone" type="tel" inputmode="tel" value="{{ values.borrower_phone }}" required>
+    <label for="f-email">Email (optional)</label>
+    <input id="f-email" name="borrower_email" type="email" value="{{ values.borrower_email }}">
+    <label for="f-projects">Completed projects (last 3 years)</label>
+    <input id="f-projects" name="completed_projects" type="number" min="0" inputmode="numeric" value="{{ values.completed_projects }}">
+    <label for="f-credit">Credit range</label>
+    <select id="f-credit" name="credit_band" required>
+      <option value="">Choose…</option>
+      {% for band in credit_bands %}<option value="{{ band }}" {% if values.credit_band == band %}selected{% endif %}>{{ band }}</option>{% endfor %}
+    </select>
+  </fieldset>
+
+  <fieldset>
+    <legend>Property</legend>
+    <label for="f-address">Street address</label>
+    <input id="f-address" name="property_address" value="{{ values.property_address }}" required autocomplete="off">
+    <div class="row">
+      <div><label for="f-city">City</label><input id="f-city" name="property_city" value="{{ values.property_city }}"></div>
+      <div><label for="f-state">State</label>
+        <input id="f-state" name="property_state" maxlength="2" placeholder="FL" value="{{ values.property_state }}" required></div>
+    </div>
+    <label for="f-zip">ZIP (optional)</label>
+    <input id="f-zip" name="property_zip" inputmode="numeric" value="{{ values.property_zip }}">
+  </fieldset>
+
+  <fieldset>
+    <legend>Deal</legend>
+    <label for="f-product">Loan type</label>
+    <select id="f-product" name="product" required>
+      <option value="">Choose…</option>
+      {% for key, label in products.items() %}<option value="{{ key }}" {% if values.product == key %}selected{% endif %}>{{ label }}</option>{% endfor %}
+    </select>
+    <div class="row">
+      <div><label for="f-price">Purchase price</label>
+        <input id="f-price" name="purchase_price" inputmode="numeric" placeholder="$" value="{{ values.purchase_price }}"></div>
+      <div><label for="f-rehab">Rehab or build budget</label>
+        <input id="f-rehab" name="rehab_budget" inputmode="numeric" placeholder="$" value="{{ values.rehab_budget }}"></div>
+    </div>
+    <div class="row">
+      <div><label for="f-amount">Loan amount requested</label>
+        <input id="f-amount" name="loan_amount" inputmode="numeric" placeholder="$" value="{{ values.loan_amount }}" required></div>
+      <div><label for="f-arv">ARV or completed value</label>
+        <input id="f-arv" name="arv" inputmode="numeric" placeholder="$" value="{{ values.arv }}"></div>
+    </div>
+    <label for="f-timeline">Timeline</label>
+    <select id="f-timeline" name="timeline">
+      <option value="">Choose…</option>
+      {% for option in timelines %}<option value="{{ option }}" {% if values.timeline == option %}selected{% endif %}>{{ option }}</option>{% endfor %}
+    </select>
+    <label for="f-notes">Notes (optional)</label>
+    <textarea id="f-notes" name="notes" maxlength="2000">{{ values.notes }}</textarea>
+    <label for="f-docs">Documents (optional)</label>
+    <input id="f-docs" name="documents" type="file" multiple accept=".pdf,.jpg,.jpeg,.png,.heic">
+    <div class="hint">Purchase contract, scope, photos. Up to {{ max_uploads }} files, {{ max_upload_mb }} MB each.</div>
+  </fieldset>
+
+  <div class="hp" aria-hidden="true">
+    <label for="f-website">Company website</label>
+    <input id="f-website" name="company_website" tabindex="-1" autocomplete="off">
+  </div>
+
+  <fieldset>
+    <label class="consent" for="f-consent">
+      <input id="f-consent" name="consent" type="checkbox" value="yes" required>
+      <span>{{ consent_text }}</span>
+    </label>
+  </fieldset>
+
+  <button type="submit">Submit file</button>
+</form>
+{% endblock %}

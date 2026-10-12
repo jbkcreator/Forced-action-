@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="referrer" content="no-referrer">
+  <title>{% block title %}Next Deal Lending · Partner{% endblock %}</title>
+  <style>
+    :root { --ink: #1b1f24; --muted: #5b6470; --line: #d9dee4; --accent: #0b5cad; --bad: #b42318; --bg: #f6f7f9; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+           color: var(--ink); background: var(--bg); }
+    main { max-width: 640px; margin: 0 auto; padding: 16px; }
+    h1 { font-size: 1.35rem; margin: 8px 0 4px; }
+    p.lead { color: var(--muted); margin: 0 0 16px; }
+    fieldset { border: 1px solid var(--line); border-radius: 10px; background: #fff; margin: 0 0 14px; padding: 12px 14px; }
+    legend { font-weight: 600; padding: 0 4px; }
+    label { display: block; font-size: .92rem; margin: 10px 0 4px; }
+    input, select, textarea { width: 100%; font: inherit; padding: 10px; border: 1px solid var(--line);
+                              border-radius: 8px; background: #fff; }
+    textarea { min-height: 84px; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }
+    .consent { display: flex; gap: 10px; align-items: flex-start; font-size: .9rem; }
+    .consent input { width: auto; margin-top: 4px; }
+    .hint { color: var(--muted); font-size: .85rem; }
+    .errors { background: #fdecea; color: var(--bad); border-radius: 8px; padding: 10px 14px; margin-bottom: 14px; }
+    button { width: 100%; font: inherit; font-weight: 600; padding: 14px; border: 0; border-radius: 10px;
+             background: var(--accent); color: #fff; }
+    .hp { position: absolute; left: -10000px; }
+    table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 10px; overflow: hidden; }
+    th, td { text-align: left; padding: 10px; border-bottom: 1px solid var(--line); font-size: .92rem; }
+    .status { font-weight: 600; text-transform: capitalize; }
+    a { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <main>{% block content %}{% endblock %}</main>
+</body>
+</html>

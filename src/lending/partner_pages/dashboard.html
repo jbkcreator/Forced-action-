@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Your files</h1>
+<p class="lead">{{ partner.name }}{% if partner.company %} · {{ partner.company }}{% endif %} ·
+  <a href="/api/lending/partners/{{ token }}">Send a new file</a></p>
+{% if files %}
+<table>
+  <thead><tr><th>Ref</th><th>Borrower / property</th><th>Loan</th><th>Status</th></tr></thead>
+  <tbody>
+  {% for file in files %}
+    <tr>
+      <td>#{{ file.id }}</td>
+      <td>{{ file.borrower_first_name }} {{ file.borrower_last_name }}<br>
+        <span class="hint">{{ file.property_address or "" }} {{ file.property_state }}</span></td>
+      <td>{{ products.get(file.product, file.product) }}<br><span class="hint">${{ "{:,}".format(file.loan_amount) }}</span></td>
+      <td class="status">{{ "In review" if file.status in ("received", "held") else file.status }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>No files yet.</p>
+{% endif %}
+{% endblock %}

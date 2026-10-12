@@ -1,0 +1,6 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Thanks, we received it</h1>
+<p class="lead">{% if file_id %}Your reference is #{{ file_id }}. {% endif %}We'll email you as the file moves along.</p>
+<p><a href="/api/lending/partners/{{ token }}/status">See your files</a> · <a href="/api/lending/partners/{{ token }}">Send another file</a></p>
+{% endblock %}
