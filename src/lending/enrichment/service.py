@@ -16,7 +16,7 @@ import hashlib
 import json
 import logging
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Optional
 
 from sqlalchemy import text
@@ -49,7 +49,7 @@ from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
 
-READY, FAILED, BUSY, SKIPPED = "ready", "failed", "busy", "skipped"
+READY, FAILED, BUSY, SKIPPED, SUPERSEDED = "ready", "failed", "busy", "skipped", "superseded"
 
 
 def enabled() -> bool:
@@ -105,7 +105,7 @@ UPDATE lending.lendingflow_enrichment SET status = 'running', attempts = attempt
        updated_at = now()
  WHERE lead_id = :id AND (status IN ('pending', 'failed')
        OR (status = 'running' AND last_attempt_at < now() - make_interval(mins => :stale)))
-RETURNING captured_address, target_close_date, thread_ts, post_signature
+RETURNING captured_address, target_close_date, thread_ts, post_signature, analysis_signature
 """)
 
 _LEAD_SQL = text("""
@@ -114,16 +114,23 @@ SELECT id, suppressed, property_address, property_city, property_zip, property_s
   FROM lending.lendingflow_leads WHERE id = :id
 """)
 
+# Lands only while the row is still this run's and still holds the facts the run built from. A corrected address or
+# close date saved mid-run (record_deal_facts puts the row back to pending) must not be overwritten by old results.
 _SAVE_SQL = text("""
 UPDATE lending.lendingflow_enrichment SET status = 'ready', last_error = NULL, property_id = :property_id,
        match_confidence = :confidence, routing_tag = :tag, routing_reason = :reason, closer_priority = :priority,
-       card = CAST(:card AS jsonb), fit = CAST(:fit AS jsonb), updated_at = now() WHERE lead_id = :id
+       card = CAST(:card AS jsonb), fit = CAST(:fit AS jsonb), updated_at = now()
+ WHERE lead_id = :id AND status = 'running'
+   AND captured_address IS NOT DISTINCT FROM CAST(:claimed_address AS text)
+   AND target_close_date IS NOT DISTINCT FROM CAST(:claimed_close AS date)
 """)
 
 
 def _fail(db: Session, lead_id: int, reason: str) -> EnrichmentOutcome:
+    """Mark the run failed (running, or ready when the failure is the post after the save), unless newer facts
+    already put the row back to pending: that request must survive."""
     db.execute(text("UPDATE lending.lendingflow_enrichment SET status = 'failed', last_error = :e, updated_at = now() "
-                    "WHERE lead_id = :id"), {"e": reason[:200], "id": lead_id})
+                    "WHERE lead_id = :id AND status IN ('running', 'ready')"), {"e": reason[:200], "id": lead_id})
     db.commit()
     return EnrichmentOutcome(lead_id, FAILED)
 
@@ -220,13 +227,17 @@ def enrich_lead(
         card = {"address_source": ("call" if from_call else "lendingflow") if address else None,
                 "property_matched": match is not None, "facts": facts.to_json() if facts else None,
                 "coverage_note": None if facts else coverage}
-        db.execute(_SAVE_SQL, {
+        saved = db.execute(_SAVE_SQL, {
             "id": lead_id, "property_id": match.property_id if match else None,
             "confidence": match.confidence if match else None, "tag": decision.tag.value, "reason": decision.reason,
             "priority": decision.tag is RoutingTag.FULL_MACHINE, "card": json.dumps(card, default=str),
             "fit": json.dumps(fit.to_json()),
+            "claimed_address": claimed["captured_address"], "claimed_close": claimed["target_close_date"],
         })
         db.commit()
+        if saved.rowcount == 0:
+            logger.info("[enrichment] lead=%s facts changed during the run; the newer request stays queued", lead_id)
+            return EnrichmentOutcome(lead_id, SUPERSEDED)
         logger.info("[enrichment] lead=%s tag=%s reason=%s matched=%s fit_score=%s", lead_id, decision.tag.value,
                     decision.reason, match is not None, fit.score)
     except Exception as exc:
@@ -240,36 +251,48 @@ def enrich_lead(
 
     return _post_if_needed(
         db, lead_id, decision.tag, address, close, facts, fit, coverage, from_call=from_call,
-        thread_ts=claimed["thread_ts"], last_signature=claimed["post_signature"], match=match,
+        thread_ts=claimed["thread_ts"], last_signature=claimed["post_signature"],
+        last_analysis_signature=claimed["analysis_signature"], match=match,
         street_view=street_view, comps=comps, thread=thread,
     )
 
 
 def _post_if_needed(db, lead_id, tag, address, close, facts, fit, coverage, *, from_call, thread_ts, last_signature,
-                    match, street_view, comps, thread) -> EnrichmentOutcome:
+                    last_analysis_signature, match, street_view, comps, thread) -> EnrichmentOutcome:
     """Post the card to the deal thread for FULL_MACHINE leads and for any lead whose address was captured on
-    the call, once per (address, close date, tag). A failed post marks the row failed so the sweep retries."""
+    the call, once per (address, close date, tag). A call-captured address also gets a second reply with Street
+    View and comps. The two deliveries are recorded apart (post_signature, analysis_signature), so a failed reply
+    is retried alone and never repeats the card. Any failed delivery marks the row failed so the sweep retries."""
     signature = _signature(address, close, tag)
-    if not (tag is RoutingTag.FULL_MACHINE or from_call) or signature == last_signature:
+    wants_analysis = from_call and bool(address)
+    card_done = signature == last_signature
+    analysis_done = not wants_analysis or signature == last_analysis_signature
+    if not (tag is RoutingTag.FULL_MACHINE or from_call) or (card_done and analysis_done):
         return EnrichmentOutcome(lead_id, READY, tag.value)
     try:
         thread = thread or default_deal_thread()
         if isinstance(thread, UnavailableDealThread):
             logger.warning("[enrichment] lead=%s deal thread not posted: Slack is not configured", lead_id)
             return EnrichmentOutcome(lead_id, READY, tag.value)
-        root = thread.post(render_card_text(lead_id, address, tag, facts, fit, coverage_note=coverage),
-                           thread_ts=thread_ts)
-        if root is None:
-            return _fail(db, lead_id, "deal_thread_unavailable")
-        if from_call and address:
+        root = thread_ts
+        if not card_done:
+            root = thread.post(render_card_text(lead_id, address, tag, facts, fit, coverage_note=coverage),
+                               thread_ts=thread_ts)
+            if root is None:
+                return _fail(db, lead_id, "deal_thread_unavailable")
+            db.execute(text("UPDATE lending.lendingflow_enrichment SET thread_ts = :ts, post_signature = :sig, "
+                            "posted_at = now(), updated_at = now() WHERE lead_id = :id"),
+                       {"ts": root, "sig": signature, "id": lead_id})
+            db.commit()
+        if not analysis_done:
             link = (street_view or default_street_view()).link(address)
             comps_view = (comps or ForcedActionComps()).comps(db, match.property_id) if match else CompsView(
                 available=False, reason="no_property_match")
-            thread.post(_render_comps_text(comps_view, link), thread_ts=root)
-        db.execute(text("UPDATE lending.lendingflow_enrichment SET thread_ts = :ts, post_signature = :sig, "
-                        "posted_at = now(), updated_at = now() WHERE lead_id = :id"),
-                   {"ts": root, "sig": signature, "id": lead_id})
-        db.commit()
+            if thread.post(_render_comps_text(comps_view, link), thread_ts=root) is None:
+                return _fail(db, lead_id, "deal_thread_reply_failed")
+            db.execute(text("UPDATE lending.lendingflow_enrichment SET analysis_signature = :sig, updated_at = now() "
+                            "WHERE lead_id = :id"), {"sig": signature, "id": lead_id})
+            db.commit()
     except Exception as exc:
         db.rollback()
         logger.error("[enrichment] lead=%s deal thread post failed: %s", lead_id, type(exc).__name__)
@@ -295,15 +318,23 @@ def on_lead_created(event) -> None:
         enrich_lead(db, lead_id)
 
 
-def _due(row: Any, now: datetime) -> bool:
-    if row["status"] == "pending" or row["last_attempt_at"] is None:
-        return True
-    if row["status"] == "running":
-        return row["last_attempt_at"] < now - timedelta(minutes=RUNNING_STALE_MINUTES)
-    if row["attempts"] >= MAX_ATTEMPTS:
-        return False
-    wait = RETRY_BACKOFF_MINUTES[min(max(row["attempts"], 1), len(RETRY_BACKOFF_MINUTES)) - 1]
-    return row["last_attempt_at"] <= now - timedelta(minutes=wait)
+def _backoff_minutes_sql() -> str:
+    """Minutes to wait after the Nth failed attempt, from RETRY_BACKOFF_MINUTES (the last value repeats)."""
+    arms = " ".join(f"WHEN attempts <= {n} THEN {int(minutes)}"
+                    for n, minutes in enumerate(RETRY_BACKOFF_MINUTES[:-1], start=1))
+    return f"CASE {arms} ELSE {int(RETRY_BACKOFF_MINUTES[-1])} END"
+
+
+# Eligibility is decided here, before the LIMIT: rows that are exhausted, still backing off or still being worked
+# never fill the batch, so they cannot hide the rows that do need running.
+_DUE_SQL = text(f"""
+SELECT lead_id FROM lending.lendingflow_enrichment
+ WHERE status = 'pending'
+    OR (status = 'running' AND last_attempt_at < :now - make_interval(mins => :stale))
+    OR (status = 'failed' AND attempts < :max_attempts
+        AND (last_attempt_at IS NULL OR last_attempt_at <= :now - make_interval(mins => {_backoff_minutes_sql()})))
+ ORDER BY updated_at LIMIT :limit
+""")
 
 
 def run_sweep(db: Session, *, now: Optional[datetime] = None, **ports) -> int:
@@ -315,15 +346,8 @@ def run_sweep(db: Session, *, now: Optional[datetime] = None, **ports) -> int:
         "AND NOT EXISTS (SELECT 1 FROM lending.lendingflow_enrichment e WHERE e.lead_id = l.id) "
         "ORDER BY l.id LIMIT :limit ON CONFLICT (lead_id) DO NOTHING"), {"limit": SWEEP_BATCH_SIZE})
     db.commit()
-    rows = db.execute(text(
-        "SELECT lead_id, status, attempts, last_attempt_at FROM lending.lendingflow_enrichment "
-        "WHERE status IN ('pending', 'failed', 'running') ORDER BY updated_at LIMIT :limit"),
-        {"limit": SWEEP_BATCH_SIZE * 4}).mappings().all()
-    ran = 0
-    for row in rows:
-        if ran >= SWEEP_BATCH_SIZE:
-            break
-        if _due(row, now):
-            enrich_lead(db, row["lead_id"], now=now, **ports)
-            ran += 1
-    return ran
+    lead_ids = db.execute(_DUE_SQL, {"now": now, "stale": RUNNING_STALE_MINUTES, "max_attempts": MAX_ATTEMPTS,
+                                     "limit": SWEEP_BATCH_SIZE}).scalars().all()
+    for lead_id in lead_ids:
+        enrich_lead(db, lead_id, now=now, **ports)
+    return len(lead_ids)

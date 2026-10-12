@@ -563,7 +563,8 @@ class LendingLendingFlowEnrichment(LendingBase):
     card: Mapped[Optional[dict]] = mapped_column(JSONB)
     fit: Mapped[Optional[dict]] = mapped_column(JSONB)
     thread_ts: Mapped[Optional[str]] = mapped_column(String(40))
-    post_signature: Mapped[Optional[str]] = mapped_column(String(64))
+    post_signature: Mapped[Optional[str]] = mapped_column(String(64))  # the card was delivered for this signature
+    analysis_signature: Mapped[Optional[str]] = mapped_column(String(64))  # the Street View / comps reply was too
     posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
