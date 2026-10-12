@@ -951,6 +951,10 @@ class AppSettings(BaseSettings):
 	lending_dial_tasks_channel: str = Field(default="", env="LENDING_DIAL_TASKS_CHANNEL")
 	lending_replies_channel: str = Field(default="", env="LENDING_REPLIES_CHANNEL")  # WP-GL-10 rate/terms handoffs; channel ID, the Cora Lending bot must be a member
 	lending_daily_channel: str = Field(default="", env="LENDING_DAILY_CHANNEL")  # 7pm scoreboard; channel ID
+	# T-10 uncalled-lead alarms (src/lending/uncalled_alarm_worker.py)
+	lending_uncalled_alarms_enabled: bool = Field(default=False, env="LENDING_UNCALLED_ALARMS_ENABLED")
+	lending_alarm_sms_to: Optional[str] = Field(default=None, env="LENDING_ALARM_SMS_TO")  # Josh's mobile; normalized before use
+	lending_ops_channel: str = Field(default="", env="LENDING_OPS_CHANNEL")  # #lendingops channel ID; 5-minute escalation post
 	lending_sheets_service_account_key_path: str = Field(default="", env="LENDING_SHEETS_SERVICE_ACCOUNT_KEY_PATH")
 	lending_disposition_sheet_id: str = Field(default="", env="LENDING_DISPOSITION_SHEET_ID")
 	lending_disposition_sheet_tab: str = Field(default="Dispositions", env="LENDING_DISPOSITION_SHEET_TAB")
@@ -958,11 +962,9 @@ class AppSettings(BaseSettings):
 	lending_soft_approval_enabled: bool = Field(default=False, env="LENDING_SOFT_APPROVAL_ENABLED")
 	lending_slack_signing_secret: Optional[SecretStr] = Field(default=None, env="LENDING_SLACK_SIGNING_SECRET")  # verifies Slack interactivity posts to lending-api
 	# ── Lending Cora agent (packages/agent_core, systemd fa-lending-cora) ──
-	# A dedicated Slack app, separate from LENDING_SLACK_BOT_TOKEN (ops alerts). The app token
-	# (xapp-) opens the Socket Mode connection; approvers are the only users whose clicks release
-	# an external send, so keep that list to Josh's Slack user id.
-	lending_cora_slack_bot_token: Optional[SecretStr] = Field(default=None, env="LENDING_CORA_SLACK_BOT_TOKEN")
-	lending_cora_slack_app_token: Optional[SecretStr] = Field(default=None, env="LENDING_CORA_SLACK_APP_TOKEN")
+	# Cora runs on the lending Slack app (LENDING_SLACK_BOT_TOKEN, LENDING_SLACK_SIGNING_SECRET) in HTTP mode:
+	# events at /webhooks/lending/slack-events, clicks at /webhooks/lending/slack-interactivity. Approvers are
+	# the only users whose clicks release an external send, so keep that list to Josh's Slack user id.
 	lending_cora_channel: str = Field(default="", env="LENDING_CORA_CHANNEL")  # channel ID for approval cards
 	lending_cora_approver_user_ids: str = Field(default="", env="LENDING_CORA_APPROVER_USER_IDS")  # comma-separated Slack user ids
 	lending_cora_operator_user_ids: str = Field(default="", env="LENDING_CORA_OPERATOR_USER_IDS")  # may chat, may not approve

@@ -48,9 +48,15 @@ class AgentCoreConfig:
 
     def missing_for_live_session(self) -> list[str]:
         """Names of settings a live Socket Mode session cannot start without."""
+        missing = self.missing_for_http_session()
+        if not self.slack_app_token:
+            missing.insert(1, "slack_app_token")
+        return missing
+
+    def missing_for_http_session(self) -> list[str]:
+        """Names of settings an HTTP (Events API) session cannot run without. No app-level token needed."""
         required = {
             "slack_bot_token": self.slack_bot_token,
-            "slack_app_token": self.slack_app_token,
             "slack_channel_id": self.slack_channel_id,
             "approver_user_ids": self.approver_user_ids,
         }

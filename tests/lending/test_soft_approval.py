@@ -19,17 +19,24 @@ from sqlalchemy import text
 
 from config.lender_matrix import LENDER_MATRIX, LenderRules
 from config.lending_soft_approval import SoftApprovalParams
+from migrations.apply_lending_lendingflow import apply_to as apply_lendingflow
 from migrations.apply_lending_soft_approvals import apply_to as apply_soft_approvals
 from src.lending import soft_approval_webhook as webhook
 from src.lending.call_pipeline import follow_up
 from src.lending.contracts import BorrowerProfile, LenderFit, LenderFitResult, LoanType
 from src.lending.dispositions import RecordedCall
 from src.lending.fakes import FakeLenderFitEvaluator
+from src.lending.models import LendingContact
 from src.lending.pdf.render import render_html
 from src.lending.soft_approval import slack_card
 from src.lending.soft_approval.calc import CalculationUnavailable, LenderTerms, calculate_figures
 from src.lending.soft_approval.facts import SoftApprovalFacts
-from src.lending.soft_approval.lead_source import FakeLeadProfileSource, LeadProfile
+from src.lending.soft_approval.lead_source import (
+    FakeLeadProfileSource,
+    LeadProfile,
+    LendingFlowLeadProfileSource,
+    default_lead_source,
+)
 from src.lending.soft_approval.service import generate_soft_approval
 from src.tasks import lending_soft_approval_card_retry as card_retry
 
@@ -47,8 +54,21 @@ LEAD = LeadProfile(lead_ref="lf-1", borrower=BorrowerProfile(credit_band_min_fic
 
 @pytest.fixture
 def soft_db(lending_db):
-    apply_soft_approvals(lending_db.get_bind())
+    conn = lending_db.get_bind()
+    LendingContact.__table__.create(bind=conn, checkfirst=True)  # lendingflow_leads.contact_id references it
+    apply_lendingflow(conn)
+    apply_soft_approvals(conn)
     return lending_db
+
+
+def _flow_lead(db, *, vendor="v1", phone=PHONE, fico=640, amount=290000, loan_type="FIX_AND_FLIP", state="FL",
+               suppressed=False, received="2026-10-01 10:00:00+00"):
+    db.execute(
+        text("INSERT INTO lending.lendingflow_leads (vendor_lead_id, dedupe_hash, phone, credit_band_min_fico, loan_amount, "
+             "loan_type, property_state, suppressed, received_at, raw_payload) "
+             "VALUES (:v, :v, :p, :fico, :amt, :lt, :st, :sup, :rec, '{}'::jsonb)"),
+        {"v": vendor, "p": phone, "fico": fico, "amt": amount, "lt": loan_type, "st": state, "sup": suppressed, "rec": received},
+    )
 
 
 def _generate(db, *, facts=FACTS, lead=LEAD, evaluator=None, params=PARAMS, renderer=None, call_id="call-1"):
@@ -233,12 +253,13 @@ class TestService:
         assert len(row["history"]) == 1 and row["history"][0]["figures"]["net_loan"] == "290000"
 
     def test_production_defaults_produce_no_pdf(self, soft_db):
-        """Real evaluator + real matrix (all lenders unverified) + no LendingFlow store: closed, never a guess."""
+        """Real lead source + real evaluator + real matrix (all lenders unverified): closed, never a guess."""
         out = generate_soft_approval(soft_db, phone=PHONE, dialer_call_id="c", facts=FACTS, submitted_by=None)
-        assert out.status == "no_lead" and _row(soft_db)["pdf"] is None
-        out = generate_soft_approval(soft_db, phone=PHONE, dialer_call_id="c", facts=FACTS, submitted_by=None,
-                                     lead_source=FakeLeadProfileSource({PHONE: LEAD}))
-        assert out.status in {"no_fit", "terms_unconfirmed"} and not any(r.verified for r in LENDER_MATRIX)
+        assert out.status == "no_lead" and _row(soft_db)["pdf"] is None  # no LendingFlow lead for the phone
+        _flow_lead(soft_db)
+        out = generate_soft_approval(soft_db, phone=PHONE, dialer_call_id="c", facts=FACTS, submitted_by=None)
+        assert out.status in {"no_fit", "terms_unconfirmed"} and _row(soft_db)["pdf"] is None
+        assert not any(r.verified for r in LENDER_MATRIX)
 
     def test_migration_is_idempotent(self, soft_db):
         apply_soft_approvals(soft_db.get_bind())
@@ -250,6 +271,54 @@ class TestService:
 CONTEXT = {"generated_date": "October 9, 2026", "property_address": "12 Palm Ave, Tampa, FL", "net_loan": "$290,000",
            "rehab_funding": "$40,000", "max_purchase_price": "$260,000", "purchase_price": "$250,000",
            "rehab_budget": "$40,000", "arv": "$400,000"}
+
+
+class TestLendingFlowLeadSource:
+    SOURCE = LendingFlowLeadProfileSource()
+
+    def test_the_default_source_reads_lendingflow(self):
+        assert isinstance(default_lead_source(), LendingFlowLeadProfileSource)
+
+    def test_maps_the_leads_fields(self, soft_db):
+        _flow_lead(soft_db)
+        lead = self.SOURCE.for_phone(soft_db, PHONE)
+        assert lead.loan_type is LoanType.FIX_AND_FLIP and lead.loan_amount == D(290000) and lead.state == "FL"
+        assert lead.borrower.credit_band_min_fico == 640 and lead.has_core_fields()
+
+    def test_the_most_recent_lead_for_the_phone_wins(self, soft_db):
+        _flow_lead(soft_db, vendor="old", amount=100000, received="2026-09-01 10:00:00+00")
+        _flow_lead(soft_db, vendor="new", amount=250000, received="2026-10-01 10:00:00+00")
+        assert self.SOURCE.for_phone(soft_db, PHONE).loan_amount == D(250000)
+
+    def test_an_unformatted_phone_matches(self, soft_db):
+        _flow_lead(soft_db)
+        assert self.SOURCE.for_phone(soft_db, "(727) 555-0101") is not None
+
+    @pytest.mark.parametrize("phone", ["+17275559999", "", "not a phone"])
+    def test_no_lead_for_an_unknown_or_unusable_phone(self, soft_db, phone):
+        _flow_lead(soft_db)
+        assert self.SOURCE.for_phone(soft_db, phone) is None
+
+    def test_a_suppressed_latest_lead_blocks_even_when_an_older_one_is_fine(self, soft_db):
+        _flow_lead(soft_db, vendor="old", suppressed=False, received="2026-09-01 10:00:00+00")
+        _flow_lead(soft_db, vendor="new", suppressed=True, received="2026-10-01 10:00:00+00")
+        assert self.SOURCE.for_phone(soft_db, PHONE) is None
+
+    @pytest.mark.parametrize("over", [{"loan_type": "TOWNHOUSE_LOAN"}, {"loan_type": None}, {"amount": None}, {"state": None}])
+    def test_a_missing_or_unrecognised_core_value_is_reported_as_missing_never_guessed(self, soft_db, over):
+        _flow_lead(soft_db, **over)
+        lead = self.SOURCE.for_phone(soft_db, PHONE)
+        assert lead is not None and not lead.has_core_fields()
+        out = generate_soft_approval(soft_db, phone=PHONE, dialer_call_id="c", facts=FACTS, submitted_by=None)
+        assert (out.status, out.reason) == ("no_lead", "lead_missing_core_fields") and _row(soft_db)["pdf"] is None
+
+    def test_a_lead_in_the_database_reaches_a_stored_pdf_through_the_default_source(self, soft_db):
+        _flow_lead(soft_db)
+        out = generate_soft_approval(
+            soft_db, phone=PHONE, dialer_call_id="c", facts=FACTS, submitted_by="U1",
+            evaluator=FakeLenderFitEvaluator(FITTING), rules_lookup=lambda key: RULES if key == LENDER else None,
+            params=PARAMS, renderer=lambda ctx: b"%PDF-test")
+        assert out.status == "generated" and bytes(_row(soft_db)["pdf"]) == b"%PDF-test"
 
 
 class TestTemplate:
@@ -499,7 +568,7 @@ class TestRoute:
         assert res["response_action"] == "errors" and "purchase" in res["errors"]
         assert soft_db.execute(text("SELECT count(*) FROM lending.soft_approvals")).scalar() == 0
 
-    def test_valid_submission_without_a_lead_store_stores_no_pdf_and_replies_in_thread(self, client, wired, soft_db):
+    def test_valid_submission_without_a_lead_stores_no_pdf_and_replies_in_thread(self, client, wired, soft_db):
         _call(soft_db)
         body = _payload({"type": "view_submission", "user": {"id": "U1"}, "view": {
             "callback_id": "soft_approval_form",
