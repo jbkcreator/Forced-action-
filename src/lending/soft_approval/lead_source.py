@@ -1,9 +1,13 @@
 """Where the borrower profile and core loan facts come from.
 
-ASSUMPTION (not yet confirmed against David's LendingFlow schema, due Oct 10): credit band, loan type,
-loan amount and state come from the borrower's LendingFlow lead, matched to the call by normalized
-phone. The lead store belongs to T-11, which is not built, so the production source below is
-unavailable and returns nothing; the feature stays closed until T-11 supplies a real source.
+Credit band, loan type, loan amount and state come from the borrower's LendingFlow lead
+(``lending.lendingflow_leads``, T-11), matched to the call by normalized phone. T-11 already stores the
+loan type as a ``LoanType`` value (unrecognised spellings are saved as NULL) and the phone normalized.
+
+ASSUMPTION (field names and loan type spellings not yet confirmed against David's LendingFlow schema):
+the lead's ``credit_band_min_fico``, ``loan_amount``, ``loan_type`` and ``property_state`` mean the same
+as the soft approval's inputs. A missing or unrecognised value is never guessed: the lead comes back with
+that field empty and the service stops with ``lead_missing_core_fields``.
 """
 from __future__ import annotations
 
@@ -12,9 +16,11 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Mapping, Optional, Protocol
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from src.lending.contracts import BorrowerProfile, LoanType
+from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
 
@@ -33,15 +39,43 @@ class LeadProfile:
 
 class LeadProfileSource(Protocol):
     def for_phone(self, db: Session, phone: str) -> Optional[LeadProfile]:
-        """The lead for a normalized phone, or None."""
+        """The lead for a phone, or None."""
 
 
-class UnavailableLeadProfileSource:
-    """Production placeholder until T-11 stores LendingFlow leads. Finds nothing; it never guesses a profile."""
+class LendingFlowLeadProfileSource:
+    """The most recent LendingFlow lead for a phone. Finds nothing rather than guessing, and never looks past a suppressed lead."""
 
     def for_phone(self, db: Session, phone: str) -> Optional[LeadProfile]:
-        logger.warning("[soft-approval] no LendingFlow lead store is available yet (T-11); no profile for the call")
-        return None
+        normalized = normalize(phone)
+        if not normalized:
+            return None
+        row = db.execute(
+            text(
+                "SELECT lead_uuid, credit_band_min_fico, loan_amount, loan_type, property_state, suppressed "
+                "FROM lending.lendingflow_leads WHERE phone = :phone "
+                "ORDER BY received_at DESC LIMIT 1"
+            ),
+            {"phone": normalized},
+        ).first()
+        if row is None or row.suppressed:
+            return None
+        loan_type = self._loan_type(row.loan_type)
+        if row.loan_type and loan_type is None:
+            logger.warning("[soft-approval] lead %s has an unrecognised loan type; treated as missing", row.lead_uuid)
+        return LeadProfile(
+            lead_ref=str(row.lead_uuid),
+            borrower=BorrowerProfile(credit_band_min_fico=row.credit_band_min_fico, state=row.property_state),
+            loan_type=loan_type,
+            loan_amount=Decimal(row.loan_amount) if row.loan_amount is not None else None,
+            state=row.property_state,
+        )
+
+    @staticmethod
+    def _loan_type(value: Optional[str]) -> Optional[LoanType]:
+        try:
+            return LoanType(value) if value else None
+        except ValueError:
+            return None
 
 
 class FakeLeadProfileSource:
@@ -55,4 +89,4 @@ class FakeLeadProfileSource:
 
 
 def default_lead_source() -> LeadProfileSource:
-    return UnavailableLeadProfileSource()
+    return LendingFlowLeadProfileSource()
