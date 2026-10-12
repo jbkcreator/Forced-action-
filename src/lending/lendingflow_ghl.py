@@ -4,6 +4,7 @@ Same rules as ``web_lead_ghl``: the upsert never carries ``dnd``, ``tags`` or ``
 upsert REPLACES tags), tags go through the add-tags call, and a pipeline card is created only when
 a LendingFlow stage is configured and the contact has no card yet (never moved). The note carries
 the lead id and vendor id only, no phone or email.
+A lead with a consent certificate also gets the tag that starts the intro-SMS workflow, in a second add-tags call.
 """
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ from config.lending_lendingflow import (
     GHL_CONFIG_ERROR_STATUS_CODES,
     GHL_SOURCE,
     GHL_TAG_CONSENT_MISSING,
+    GHL_TAG_INTRO_READY,
     GHL_TAG_LENDINGFLOW,
 )
 from config.settings import get_settings
@@ -28,6 +30,11 @@ def _tags(lead: Mapping[str, Any]) -> list[str]:
     if lead["consent_status"] != "present":
         tags.append(GHL_TAG_CONSENT_MISSING)
     return tags
+
+
+def _intro_ready_tags(lead: Mapping[str, Any]) -> list[str]:
+    """The tag that starts the GHL intro-SMS workflow: only for a lead with a consent certificate."""
+    return [GHL_TAG_INTRO_READY] if lead["consent_status"] == "present" else []
 
 
 class LendingFlowGhlSink:
@@ -54,6 +61,9 @@ class LendingFlowGhlSink:
     def push(self, lead: Mapping[str, Any]) -> PushResult:
         contact_id = self._upsert_contact(lead)
         self._call("add tags", "POST", f"/contacts/{contact_id}/tags", json={"tags": _tags(lead)})
+        ready = _intro_ready_tags(lead)
+        if ready:  # its own call, after the other tags are in place; a failure fails the push and the sweep retries it
+            self._call("add intro-ready tag", "POST", f"/contacts/{contact_id}/tags", json={"tags": ready})
         pipeline_card = self._ensure_pipeline_card(lead, contact_id)
         self._add_note(lead, contact_id)
         return PushResult(contact_id=contact_id, pipeline_card=pipeline_card)
