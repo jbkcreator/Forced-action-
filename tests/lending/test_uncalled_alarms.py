@@ -495,7 +495,7 @@ def test_escalation_stays_open_until_its_retries_settle_then_resolves(db):
 
 def test_slack_rejection_is_retried_until_the_bot_is_in_the_channel(db):
     lead_id = lead(db)
-    slack = Slack(error=SlackApiError("x", {"ok": False, "error": "not_in_channel"}))
+    slack = Slack(error=slack_error("not_in_channel"))
     sms = Sms()
     cycle(db, 300, sms=sms, slack=slack)
     assert states(db, lead_id)["slack_300_status"] == "retry"
@@ -534,7 +534,7 @@ def test_retry_after_the_window_is_expired_not_sent(db):
 def test_channels_retry_independently(db):
     lead_id = lead(db)
     sms = FlakySms([DEFINITE])
-    slack = Slack(error=SlackApiError("x", {"ok": False, "error": "channel_not_found"}))
+    slack = Slack(error=slack_error("channel_not_found"))
     cycle(db, 300, sms=sms, slack=slack)
     slack.error = None
     cycle(db, 315, sms=sms, slack=slack)
@@ -624,3 +624,47 @@ def test_message_age_is_taken_after_the_slow_call_lookup_not_at_cycle_start(db):
     process_due(db, clock=lambda: state["t"], sms=sms, slack=None, ghl_status=SlowCallLookup(), sms_to=JOSH,
                 ops_channel="")
     assert len(sms.sent) == 1 and "came in 3 min ago" in sms.sent[0][1]   # 190 s, not the cycle's 120 s
+
+
+# --- Slack error semantics: only a documented rejection is retried ---------------------------------------------------
+
+from slack_sdk.web import SlackResponse  # noqa: E402
+
+
+def slack_error(error, status=200):
+    """The exception slack_sdk raises for ``ok=false`` (HTTP 200) or a non-200 reply, built from a real SlackResponse."""
+    response = SlackResponse(client=None, http_verb="POST", api_url="https://slack.com/api/chat.postMessage",
+                             req_args={}, data={"ok": False, "error": error}, headers={}, status_code=status)
+    return SlackApiError("The request to the Slack API failed.", response)
+
+
+@pytest.mark.parametrize("error,status", [
+    ("channel_not_found", 200), ("not_in_channel", 200), ("is_archived", 200), ("invalid_auth", 200),
+    ("account_inactive", 200), ("missing_scope", 200), ("restricted_action", 200), ("ratelimited", 429)])
+def test_a_documented_slack_rejection_is_retried(db, error, status):
+    lead_id = lead(db)
+    cycle(db, 300, sms=Sms(), slack=Slack(error=slack_error(error, status)))
+    assert states(db, lead_id)["slack_300_status"] == "retry"
+
+
+@pytest.mark.parametrize("error,status", [
+    ("internal_error", 200),        # Slack: "some aspect of the operation" may have succeeded
+    ("fatal_error", 200),           # same wording
+    ("internal_error", 500),        # an HTTP 500 raises SlackApiError too
+    ("service_unavailable", 503),
+    ("request_timeout", 200),       # the request body was cut off: not proof that nothing was posted
+    ("some_future_error_code", 200)])   # default-deny: an error we do not recognise is never retried
+def test_an_uncertain_slack_error_is_unknown_and_never_reposted(db, error, status):
+    lead_id = lead(db)
+    slack = Slack(error=slack_error(error, status))
+    for seconds in (300, 315, 400):
+        cycle(db, seconds, sms=Sms(), slack=slack)
+    assert states(db, lead_id)["slack_300_status"] == "send_unknown"
+    assert states(db, lead_id)["slack_300_attempts"] == 1 and slack.posts == []
+    assert states(db, lead_id)["resolved_reason"] == "escalated"
+
+
+def test_a_server_error_status_is_unknown_even_with_a_rejection_code(db):
+    lead_id = lead(db)
+    cycle(db, 300, sms=Sms(), slack=Slack(error=slack_error("channel_not_found", status=502)))
+    assert states(db, lead_id)["slack_300_status"] == "send_unknown"

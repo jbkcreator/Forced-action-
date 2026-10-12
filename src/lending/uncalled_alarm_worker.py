@@ -42,6 +42,7 @@ from config.lending_alarms import (
     POLL_SECONDS,
     RETRY_DELAYS_SECONDS,
     RETRY_WINDOW_SECONDS,
+    SLACK_REJECTED_ERRORS,
     SLACK_TEXT,
     SMS_TEXT,
     STALE_SEND_SECONDS,
@@ -261,9 +262,20 @@ def _failure_status(exc: Exception) -> str:
     """RETRY only when the provider provably did not take the message; everything else may have gone out."""
     if isinstance(exc, GhlSmsError):
         return UNKNOWN if exc.ambiguous else RETRY
-    if isinstance(exc, SlackApiError):  # Slack answered ok=false: nothing was posted
-        return RETRY
+    if isinstance(exc, SlackApiError):
+        return RETRY if _slack_rejected(exc) else UNKNOWN
     return UNKNOWN  # timeouts, connection errors and unexpected exceptions: the outcome is not known
+
+
+def _slack_rejected(exc: SlackApiError) -> bool:
+    """True only for an error Slack documents as a rejected request. SlackApiError is also raised for server errors
+    (HTTP 5xx, internal_error, fatal_error) after which part of the operation may have succeeded: those, and any
+    code not on the list, are unknown."""
+    response = exc.response
+    status = getattr(response, "status_code", 200)
+    data = getattr(response, "data", response)
+    error = data.get("error") if isinstance(data, dict) else None
+    return isinstance(status, int) and status < 500 and error in SLACK_REJECTED_ERRORS
 
 
 def _send_sms(sms: Optional[Callable[..., str]], to: Optional[str], body: str) -> tuple[str, Optional[str]]:

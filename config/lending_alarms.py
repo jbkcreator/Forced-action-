@@ -19,7 +19,17 @@ BATCH_SIZE = 50
 GHL_TIMEOUT_SECONDS = 5
 
 # Delivery retries. Only a send that provably never reached the provider is retried (GhlSmsError with
-# ambiguous=False, a Slack API rejection); a possible duplicate is never created from an unknown outcome.
+# ambiguous=False, a documented Slack rejection); a possible duplicate is never created from an unknown outcome.
+# Slack errors that mean the request was REJECTED, so nothing was posted (Slack Web API, chat.postMessage error
+# list). Default-deny: any other error, including internal_error / fatal_error ("some aspect of the operation may have
+# succeeded"), service_unavailable, request_timeout, an HTTP 5xx and any code not listed here, is an unknown outcome.
+SLACK_REJECTED_ERRORS = frozenset({
+    "channel_not_found", "not_in_channel", "is_archived", "no_permission", "access_denied", "accesslimited",
+    "account_inactive", "invalid_auth", "not_authed", "token_revoked", "token_expired", "missing_scope",
+    "not_allowed_token_type", "team_access_not_granted", "org_login_required", "ekm_access_denied",
+    "restricted_action", "restricted_action_read_only_channel", "restricted_action_thread_only_channel",
+    "restricted_action_non_threadable_channel", "rate_limited", "ratelimited",
+})
 MAX_SEND_ATTEMPTS = 3
 RETRY_DELAYS_SECONDS = (15, 45)   # wait after attempt 1, after attempt 2
 RETRY_WINDOW_SECONDS = 15 * 60    # a retry still pending this long after its alarm fired is dropped
