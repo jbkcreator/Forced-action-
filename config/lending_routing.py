@@ -9,17 +9,27 @@ PENDING ANSWERS (these defaults ship until Josh replies)
 Q1  Seat cap counting action.  Default: 'funded' (only funded loans count
     against the monthly cap).  Change SEAT_CAP_COUNTED_ACTION to 'routed'
     if Josh wants the cap on files accepted, not funded.
-Q2  One-click decline records reason 'unspecified' by default.
-Q3  'held' is the 5th action added to the events table (test 3 uses it for
-    the exhausted terminal state).
-Q5  Rule gaps (ground-up >= $500k outside primary footprint, etc.) fall
-    through to rule 6 (hold queue, reason 'no_match').
+Q2  One-click decline records reason 'unspecified' by default.  The reason
+    must be a code in lending.decline_reason_codes (Josh supplies the enum;
+    the seeded codes are placeholders).  Filling a reason in afterwards is
+    not supported: the events table is append-only.
+Q3  'held' is a 5th action beyond the spec's routed/declined/approved/funded
+    (used for the hold-queue and exhausted terminal states).  Josh to confirm
+    what "all four events" in acceptance test 3 means.
+Q5  Rule gaps (ground-up >= $500k outside primary footprint, BRIDGE, "other")
+    fall through to rule 6 (hold queue).  Matches the spec's "never silently
+    dropped".
 Q6  Loan amount for threshold checks uses loan_amount (= band minimum from
     LendingFlow).  Josh to confirm.
 Q7  Admin API is built on lending-api with LENDING_ROUTING_ADMIN_SECRET.
-    UI is in forced-action-ui (out of scope for this PR).
-Q8  Files with suppressed=True are routed (routing is not borrower contact).
-    Josh or compliance to confirm.
+    The admin screen / decline button (UI) is in forced-action-ui, not in
+    this PR.
+Q8  Files with suppressed=True are NOT routed: enrichment skips them before
+    routing and route_file holds them with reason 'suppressed'.  Compliance
+    to confirm that is the wanted behaviour.
+
+Seed values stated by the spec (not open questions): the primary lender's
+seat cap defaults to 15 and its ground-up minimum to $500,000.
 """
 from __future__ import annotations
 
@@ -31,7 +41,16 @@ ROUTING_TZ = ZoneInfo("America/New_York")
 # Q1: Josh to confirm whether to count 'funded' or 'routed'.
 SEAT_CAP_COUNTED_ACTION: str = "funded"
 
-# Default reason code recorded on a one-click Backflip decline (Q2).
+# Spec defaults for the primary lender's row: "seat cap is a config value, default 15 funded
+# per month"; ground-up routes to the primary at >= $500,000.
+PRIMARY_DEFAULT_SEAT_CAP: int = 15
+PRIMARY_DEFAULT_CONSTRUCTION_MIN: int = 500_000
+
+# Actions an operator may record against a file's current lender (spec: routed / declined /
+# approved / funded; routed and declined are written by the router and the decline handler).
+OUTCOME_ACTIONS: tuple[str, ...] = ("approved", "funded")
+
+# Default reason code recorded on a one-click decline (Q2).
 DEFAULT_DECLINE_REASON: str = "unspecified"
 
 # Seed decline reason codes. Josh to supply the real enum.

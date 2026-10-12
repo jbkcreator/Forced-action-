@@ -41,6 +41,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from config.lending_routing import MAX_WATERFALL_DEPTH, ROUTABLE_AGREEMENT_STATUSES
+from src.lending.contracts import LoanType
 from src.lending.routing.notify import post_route_event, post_hold_event
 from src.lending.routing.rules import (
     FileProfile,
@@ -53,10 +54,12 @@ from src.lending.routing.seat import seat_at_cap
 
 logger = logging.getLogger(__name__)
 
-# Loan-type groupings used by rules 1–5 (values from LoanType enum in contracts.py)
-_GROUND_UP = "ground_up_construction"
-_FLIP = "fix_and_flip"
-_DSCR_TYPES = {"dscr_rental", "refi"}
+# Loan-type groupings used by rules 1–5.  These are the values LendingFlow leads actually carry
+# (LoanType in contracts.py, stored by the T-11 parser).  The spec's rule 5 says "DSCR or refi",
+# but LendingFlow has no refi product: a refi file arrives with no loan type and goes to rule 6.
+_GROUND_UP = LoanType.GROUND_UP_CONSTRUCTION.value
+_FLIP = LoanType.FIX_AND_FLIP.value
+_DSCR_TYPES = frozenset({LoanType.DSCR_RENTAL.value})
 
 
 # ── Internal helpers ─────────────────────────────────────────────────────────
@@ -101,7 +104,7 @@ def _waterfall(
 
 def _build_profile(lead: dict) -> FileProfile:
     return FileProfile(
-        loan_type=lead.get("loan_type") or "",
+        loan_type=(lead.get("loan_type") or "").upper(),
         loan_amount=int(lead.get("loan_amount") or 0),
         state=lead.get("property_state") or "",
         credit_band_min_fico=lead.get("credit_band_min_fico"),
@@ -249,6 +252,14 @@ def route_file(lead_id: int, db: Session) -> None:
 
     # Patch the lead_id into routing dict (needed by _set_routed/_set_held)
     routing = {**routing, "lead_id": lead_id}
+
+    if lead.get("suppressed"):
+        # Opted-out borrowers are never routed; the hold queue keeps the file visible (Q8).
+        logger.warning("route_file lead_id=%d: lead is suppressed — holding (suppressed)", lead_id)
+        event_id = _set_held(routing, "suppressed", db)
+        db.commit()
+        post_hold_event(lead, event_id, reason="suppressed", db=db)
+        return
 
     profile = _build_profile(lead)
     all_lenders = load_active_lenders(db)

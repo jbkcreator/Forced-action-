@@ -9,13 +9,15 @@ Josh uses these endpoints directly until the UI ships.
 Endpoints:
   GET    /api/lending/routing/lenders             list all lenders (sorted by priority)
   POST   /api/lending/routing/lenders             add a lender
-  PATCH  /api/lending/routing/lenders/{id}        update a lender (including is_primary)
+  PATCH  /api/lending/routing/lenders/{id}        update a lender
+  POST   /api/lending/routing/lenders/{id}/make-primary  move the primary flag here (atomic)
   GET    /api/lending/routing/lenders/{id}/boxes  list product boxes
   POST   /api/lending/routing/lenders/{id}/boxes  add a product box
   DELETE /api/lending/routing/lenders/{id}/boxes/{box_id}  remove a product box
   GET    /api/lending/routing/decline-reasons      list decline reason codes
   POST   /api/lending/routing/decline-reasons      add a reason code
   POST   /api/lending/routing/events/{event_id}/decline  one-click decline (R-1)
+  POST   /api/lending/routing/files/{lead_id}/outcome    record approved / funded (moves the seat cap)
   GET    /api/lending/routing/hold-queue           current hold queue summary
 """
 from __future__ import annotations
@@ -26,12 +28,19 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from config.lending_routing import AGREEMENT_STATUS_CHOICES, DEFAULT_DECLINE_REASON
+from config.lending_routing import (
+    AGREEMENT_STATUS_CHOICES,
+    DEFAULT_DECLINE_REASON,
+    OUTCOME_ACTIONS,
+    PRIMARY_DEFAULT_CONSTRUCTION_MIN,
+    PRIMARY_DEFAULT_SEAT_CAP,
+)
 from config.settings import get_settings
+from src.lending.contracts import LoanType
 from src.lending.db import get_lending_db
 
 logger = logging.getLogger(__name__)
@@ -83,6 +92,18 @@ class LenderPatch(BaseModel):
 
 class ProductBoxIn(BaseModel):
     loan_types: list[str]
+
+    @field_validator("loan_types")
+    @classmethod
+    def _known_loan_types(cls, value: list[str]) -> list[str]:
+        """A box must name real LendingFlow loan types; a typo would silently never match."""
+        known = {m.value for m in LoanType}
+        normalised = [v.strip().upper() for v in value]
+        unknown = [v for v in normalised if v not in known]
+        if not normalised or unknown:
+            raise ValueError(f"loan_types must be a non-empty subset of {sorted(known)}; got {unknown or value}")
+        return normalised
+
     min_loan_amount: Optional[int] = None
     max_loan_amount: Optional[int] = None
     approved_states: Optional[list[str]] = None
@@ -101,6 +122,12 @@ class DeclineReasonIn(BaseModel):
 
 class DeclineIn(BaseModel):
     reason_code: str = DEFAULT_DECLINE_REASON
+    actor: str = "josh"
+    free_text: Optional[str] = None
+
+
+class OutcomeIn(BaseModel):
+    action: str
     actor: str = "josh"
     free_text: Optional[str] = None
 
@@ -135,6 +162,10 @@ def create_lender(
         raise HTTPException(status_code=422, detail=f"Invalid agreement_status: {body.agreement_status!r}")
     if body.is_primary:
         _enforce_single_primary(None, db)
+        if body.monthly_cap is None:
+            body.monthly_cap = PRIMARY_DEFAULT_SEAT_CAP
+        if body.construction_min_amount is None:
+            body.construction_min_amount = PRIMARY_DEFAULT_CONSTRUCTION_MIN
     now = datetime.now(timezone.utc)
     row = db.execute(
         text(
@@ -186,6 +217,43 @@ def update_lender(
     )
     db.commit()
     return {"id": lender_id, "updated": list(updates.keys())}
+
+
+@router.post("/lenders/{lender_id}/make-primary")
+def make_primary(
+    lender_id: int,
+    _: None = Depends(_verify_admin),
+    db: Session = Depends(get_lending_db),
+) -> dict:
+    """Move the primary flag to this lender in one transaction.
+
+    The previous primary is demoted and this lender gets first look.  The spec defaults
+    (seat cap 15, ground-up minimum $500,000) fill any value the lender does not already have, so
+    the seat cap applies to the new primary straight away.
+    """
+    _require_lender(lender_id, db)
+    now = datetime.now(timezone.utc)
+    demoted = db.execute(
+        text(
+            "UPDATE lending.lender_routing_rules SET is_primary = FALSE, updated_at = :now"
+            " WHERE is_primary AND id <> :id RETURNING id"
+        ),
+        {"id": lender_id, "now": now},
+    ).scalars().all()
+    db.execute(
+        text(
+            "UPDATE lending.lender_routing_rules"
+            "   SET is_primary = TRUE,"
+            "       monthly_cap = COALESCE(monthly_cap, :cap),"
+            "       construction_min_amount = COALESCE(construction_min_amount, :cmin),"
+            "       updated_at = :now"
+            " WHERE id = :id"
+        ),
+        {"id": lender_id, "cap": PRIMARY_DEFAULT_SEAT_CAP, "cmin": PRIMARY_DEFAULT_CONSTRUCTION_MIN, "now": now},
+    )
+    db.commit()
+    logger.info("make_primary lender_id=%d demoted=%s", lender_id, demoted)
+    return {"id": lender_id, "demoted": demoted}
 
 
 # ── Product boxes ─────────────────────────────────────────────────────────────
@@ -314,6 +382,29 @@ def decline_event(
     return {"detail": "decline recorded"}
 
 
+# ── Outcome (approved / funded) ───────────────────────────────────────────────
+
+
+@router.post("/files/{lead_id}/outcome", status_code=200)
+def file_outcome(
+    lead_id: int,
+    body: OutcomeIn,
+    _: None = Depends(_verify_admin),
+    db: Session = Depends(get_lending_db),
+) -> dict[str, Any]:
+    from src.lending.routing.outcome import record_outcome
+
+    if body.action not in OUTCOME_ACTIONS:
+        raise HTTPException(status_code=422, detail=f"action must be one of {list(OUTCOME_ACTIONS)}")
+    try:
+        recorded = record_outcome(
+            lead_id, action=body.action, actor=body.actor, db=db, free_text=body.free_text,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return {"detail": "recorded" if recorded else "already recorded"}
+
+
 # ── Hold queue ────────────────────────────────────────────────────────────────
 
 
@@ -366,6 +457,6 @@ def _enforce_single_primary(except_id: Optional[int], db: Session) -> None:
             status_code=409,
             detail=(
                 f"Lender {row} is already marked primary. "
-                "Move the primary flag from that lender first (PATCH lenders/{row} is_primary=false)."
+                f"Use POST lenders/{{id}}/make-primary to move the primary flag in one step."
             ),
         )

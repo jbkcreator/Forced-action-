@@ -110,7 +110,7 @@ def load_active_lenders(db: Session) -> list[LenderRow]:
     boxes_by_lender: dict[int, list[ProductBox]] = {}
     for b in box_rows:
         box = ProductBox(
-            loan_types=frozenset(b["loan_types"] or []),
+            loan_types=frozenset(str(t).upper() for t in (b["loan_types"] or [])),
             min_loan_amount=b["min_loan_amount"],
             max_loan_amount=b["max_loan_amount"],
             approved_states=frozenset(b["approved_states"]) if b["approved_states"] else None,

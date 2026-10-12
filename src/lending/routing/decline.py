@@ -42,8 +42,8 @@ def record_decline(
 
     Args:
         event_id: The ``file_routing_events.id`` of the 'routed' event being declined.
-        reason_code: Decline reason code from lending.decline_reason_codes.
-                     Defaults to Q2's 'unspecified'.
+        reason_code: Decline reason code from lending.decline_reason_codes (a fixed enum).
+                     Defaults to Q2's 'unspecified'.  An unknown code raises ValueError.
         actor: Identifier of the user declining (e.g. 'josh', admin user id).
         db: SQLAlchemy session.
         free_text: Optional free text to accompany the reason.
@@ -71,7 +71,7 @@ def record_decline(
     # Check file_routing is in 'routed' state for this lender (idempotency guard).
     routing = db.execute(
         text(
-            "SELECT status, current_lender_id"
+            "SELECT status, current_lender_id, route_position"
             "  FROM lending.file_routing"
             " WHERE lead_id = :lid"
             " FOR UPDATE"
@@ -107,15 +107,13 @@ def record_decline(
 
     code = reason_code or DEFAULT_DECLINE_REASON
 
-    # Validate reason code exists (warn-only so an unknown code is stored raw, never dropped)
+    # The reason comes from a fixed enum Josh supplies (lending.decline_reason_codes).
     valid = db.execute(
         text("SELECT 1 FROM lending.decline_reason_codes WHERE code = :code AND active"),
         {"code": code},
     ).scalar()
     if not valid:
-        logger.warning(
-            "record_decline: reason_code %r not in decline_reason_codes — storing raw", code
-        )
+        raise ValueError(f"reason_code {code!r} is not an active decline reason")
 
     # Append the declined event.
     decline_event_id = db.execute(
@@ -149,11 +147,17 @@ def record_decline(
     )
     db.commit()
 
-    # Notify Slack.
+    # Notify Slack (file ID, last name, product, amount, lender, position).
     try:
-        post_decline_event(lead_id, event["lender_name"], code, decline_event_id, db=db)
+        lead = db.execute(
+            text("SELECT id, last_name, loan_type, loan_amount FROM lending.lendingflow_leads WHERE id = :id"),
+            {"id": lead_id},
+        ).mappings().one()
+        post_decline_event(
+            dict(lead), event["lender_name"], routing["route_position"], code, decline_event_id, db=db,
+        )
     except Exception:
-        logger.exception("record_decline: Slack post failed — continuing")
+        logger.exception("record_decline lead_id=%d: Slack post failed — continuing", lead_id)
 
     # Re-run the waterfall. The router will see the current lender in lenders_tried
     # and skip to the next one.

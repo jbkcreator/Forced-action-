@@ -2,69 +2,82 @@
 
 Cron: */5 * * * *  (every 5 minutes, same cadence as the enrichment sweep)
 
-Picks up files that:
-  - Have a file_routing row with status='unrouted', or
-  - Have no file_routing row yet (created before R-1 was deployed), or
-  - Have a file_routing_events row with slack_posted_at IS NULL (Slack retry).
+The spec routes a file once it has been scored by the lender box, which the T-12 enrichment does.
+So the sweep picks up files that:
+  - have finished enrichment (lendingflow_enrichment.status = 'ready') and are not suppressed,
+    but have no file_routing row yet (the in-process call after enrichment missed them), or
+  - have a file_routing row with status 'unrouted' (for example after a decline re-open), or
+  - have a routing event with slack_posted_at IS NULL (Slack retry).
+
+GoHighLevel sync state is deliberately not a condition: routing is internal and does not need the
+CRM push to have happened.  Suppressed leads are never routed (Q8).
 """
 import logging
 import sys
+from typing import Optional
 
 from sqlalchemy import text
+from sqlalchemy.orm import Session
 
 from src.lending.db import lending_session
 
 logger = logging.getLogger(__name__)
 
 
-def run_routing_sweep() -> None:
-    from config.lending_routing import SWEEP_BATCH_SIZE, SWEEP_UNROUTED_AFTER_MINUTES
+def sweep(db: Session) -> None:
+    """One sweep pass on an open session (the caller commits / closes it)."""
+    from config.lending_routing import SWEEP_BATCH_SIZE
     from src.lending.routing.router import route_file
     from src.lending.routing.notify import retry_unposted_events
 
-    with lending_session() as db:
-        # Create file_routing rows for leads that don't have one yet.
-        db.execute(
-            text(
-                "INSERT INTO lending.file_routing (lead_id, status)"
-                " SELECT id, 'unrouted'"
-                "   FROM lending.lendingflow_leads ll"
-                "  WHERE NOT EXISTS ("
-                "       SELECT 1 FROM lending.file_routing fr"
-                "        WHERE fr.lead_id = ll.id"
-                "  )"
-                "    AND ll.ghl_status IN ('synced', 'contact_only')"
-                "    AND ll.suppressed = FALSE"
-                " ON CONFLICT (lead_id) DO NOTHING"
-            )
+    db.execute(
+        text(
+            "INSERT INTO lending.file_routing (lead_id, status)"
+            " SELECT ll.id, 'unrouted'"
+            "   FROM lending.lendingflow_leads ll"
+            "   JOIN lending.lendingflow_enrichment e ON e.lead_id = ll.id"
+            "  WHERE e.status = 'ready'"
+            "    AND ll.suppressed = FALSE"
+            "    AND NOT EXISTS ("
+            "         SELECT 1 FROM lending.file_routing fr WHERE fr.lead_id = ll.id)"
+            " ON CONFLICT (lead_id) DO NOTHING"
         )
-        db.commit()
+    )
+    db.commit()
 
-        lead_ids = db.execute(
-            text(
-                "SELECT lead_id FROM lending.file_routing"
-                " WHERE status = 'unrouted'"
-                " ORDER BY created_at"
-                " LIMIT :batch"
-                " FOR UPDATE SKIP LOCKED"
-            ),
-            {"batch": SWEEP_BATCH_SIZE},
-        ).scalars().all()
+    lead_ids = db.execute(
+        text(
+            "SELECT lead_id FROM lending.file_routing"
+            " WHERE status = 'unrouted'"
+            " ORDER BY created_at"
+            " LIMIT :batch"
+            " FOR UPDATE SKIP LOCKED"
+        ),
+        {"batch": SWEEP_BATCH_SIZE},
+    ).scalars().all()
 
-        if not lead_ids:
-            logger.debug("lending_routing_sweep: no unrouted files")
-        else:
-            logger.info("lending_routing_sweep: routing %d files", len(lead_ids))
-            for lead_id in lead_ids:
-                try:
-                    route_file(lead_id, db)
-                except Exception:
-                    logger.exception("lending_routing_sweep: route_file lead_id=%d failed", lead_id)
+    if not lead_ids:
+        logger.debug("lending_routing_sweep: no unrouted files")
+    else:
+        logger.info("lending_routing_sweep: routing %d files", len(lead_ids))
+        for lead_id in lead_ids:
+            try:
+                route_file(lead_id, db)
+            except Exception:
+                db.rollback()
+                logger.exception("lending_routing_sweep: route_file lead_id=%d failed", lead_id)
 
-        # Retry unposted Slack events.
-        posted = retry_unposted_events(db)
-        if posted:
-            logger.info("lending_routing_sweep: retried %d Slack posts", posted)
+    posted = retry_unposted_events(db)
+    if posted:
+        logger.info("lending_routing_sweep: retried %d Slack posts", posted)
+
+
+def run_routing_sweep(db: Optional[Session] = None) -> None:
+    if db is not None:
+        sweep(db)
+        return
+    with lending_session() as session:
+        sweep(session)
 
 
 if __name__ == "__main__":

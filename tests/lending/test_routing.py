@@ -29,9 +29,12 @@ from sqlalchemy.orm import Session
 
 from migrations.apply_lending_lendingflow import apply_to as apply_lf
 
-LOAN_TYPE_FLIP = "fix_and_flip"
-LOAN_TYPE_GU = "ground_up_construction"
-LOAN_TYPE_DSCR = "dscr_rental"
+from src.lending.contracts import LoanType
+
+# The values LendingFlow leads actually carry (the T-11 parser stores LoanType values).
+LOAN_TYPE_FLIP = LoanType.FIX_AND_FLIP.value
+LOAN_TYPE_GU = LoanType.GROUND_UP_CONSTRUCTION.value
+LOAN_TYPE_DSCR = LoanType.DSCR_RENTAL.value
 FL = "FL"
 
 
@@ -45,11 +48,13 @@ def rdb(lending_db):
     disposable Postgres (docker), not the shared DB: the routing tables have
     unique constraints that clash with any leftover rows.
     """
+    from migrations.apply_lending_lendingflow_enrichment import apply_to as apply_enrichment
     from src.lending.models import LendingContact
 
     conn = lending_db.get_bind()
     LendingContact.__table__.create(bind=conn, checkfirst=True)  # FK target on a fresh database
     apply_lf(conn)
+    apply_enrichment(conn)
     _apply_routing(conn)
     return lending_db
 
@@ -121,6 +126,9 @@ def _make_lead(
     loan_amount: int = 300_000,
     state: str = FL,
     phone_suffix: str = "0001",
+    suppressed: bool = False,
+    ghl_status: str = "synced",
+    last_name: Optional[str] = None,
 ) -> int:
     """Insert a minimal lendingflow_leads row and return its id."""
     from src.services.phone_utils import normalize
@@ -130,8 +138,8 @@ def _make_lead(
         text(
             "INSERT INTO lending.lendingflow_leads"
             "  (vendor_lead_id, dedupe_hash, phone, loan_type, loan_amount,"
-            "   property_state, ghl_status, suppressed, raw_payload, consent_status)"
-            " VALUES (:vid, :dh, :ph, :lt, :la, :st, 'synced', false, '{}'::jsonb, 'present')"
+            "   property_state, ghl_status, suppressed, raw_payload, consent_status, last_name)"
+            " VALUES (:vid, :dh, :ph, :lt, :la, :st, :gs, :sup, '{}'::jsonb, 'present', :ln)"
             " RETURNING id"
         ),
         {
@@ -141,6 +149,9 @@ def _make_lead(
             "lt": loan_type,
             "la": loan_amount,
             "st": state,
+            "gs": ghl_status,
+            "sup": suppressed,
+            "ln": last_name,
         },
     ).scalar_one()
     db.commit()
@@ -549,3 +560,249 @@ def test_hold_summary_skips_non_8am():
     at_9 = datetime(2026, 10, 10, 9, 0, tzinfo=ET)
     assert _is_summary_hour(at_8) is True
     assert _is_summary_hour(at_9) is False
+
+
+# ── Spec gap fixes (A–F, sweep trigger, suppressed leads) ─────────────────────
+
+class _FakeSlack:
+    def __init__(self):
+        self.sent: list[str] = []
+
+    def chat_postMessage(self, channel, text):  # noqa: N802 - slack_sdk API name
+        self.sent.append(text)
+        return {"ts": f"{len(self.sent)}.0"}
+
+
+@pytest.fixture
+def fake_slack(monkeypatch):
+    client = _FakeSlack()
+    monkeypatch.setattr("src.lending.routing.notify._client", lambda: client)
+    monkeypatch.setattr("src.lending.routing.notify._channel", lambda: "C-TEST")
+    return client
+
+
+def test_funded_outcome_moves_seat_cap_end_to_end(rdb):
+    """A: the cap counts funded files, and record_outcome is the production path that writes them."""
+    from src.lending.routing.outcome import record_outcome
+
+    primary = _add_lender(rdb, name="Cap Primary", is_primary=True, priority=1, monthly_cap=2)
+    _add_box(rdb, primary, loan_types=[LOAN_TYPE_FLIP])
+    overflow = _add_lender(rdb, name="Overflow", priority=2)
+    _add_box(rdb, overflow, loan_types=[LOAN_TYPE_FLIP])
+
+    leads = [_make_lead(rdb, phone_suffix=f"11{i}0") for i in range(4)]
+    _route(rdb, leads[0])
+    _route(rdb, leads[1])
+    _route(rdb, leads[2])  # nothing funded yet, so the cap has not filled
+    assert _fr(rdb, leads[2])["current_lender_name"] == "Cap Primary"
+
+    assert record_outcome(leads[0], action="funded", actor="josh", db=rdb) is True
+    assert record_outcome(leads[1], action="funded", actor="josh", db=rdb) is True
+    _route(rdb, leads[3])
+    assert _fr(rdb, leads[3])["current_lender_name"] == "Overflow"
+
+
+def test_outcome_idempotent_and_guarded(rdb):
+    from src.lending.routing.outcome import record_outcome
+
+    l1 = _add_lender(rdb, name="Only", priority=1)
+    _add_box(rdb, l1, loan_types=[LOAN_TYPE_FLIP])
+    lead = _make_lead(rdb, phone_suffix="1201")
+    _route(rdb, lead)
+
+    assert record_outcome(lead, action="approved", actor="josh", db=rdb) is True
+    assert record_outcome(lead, action="funded", actor="josh", db=rdb) is True
+    assert record_outcome(lead, action="funded", actor="josh", db=rdb) is False
+    assert sum(1 for e in _events(rdb, lead) if e["action"] == "funded") == 1
+
+    with pytest.raises(ValueError):
+        record_outcome(lead, action="declined", actor="josh", db=rdb)
+
+    held = _make_lead(rdb, loan_type="other", phone_suffix="1202")
+    _route(rdb, held)
+    assert _fr(rdb, held)["status"] == "held"
+    with pytest.raises(ValueError):
+        record_outcome(held, action="funded", actor="josh", db=rdb)
+
+
+def test_decline_rejects_unknown_reason(rdb):
+    """E: the reason must be in the fixed enum; nothing is written for an unknown code."""
+    from src.lending.routing.decline import record_decline
+
+    l1 = _add_lender(rdb, name="A", priority=1)
+    _add_box(rdb, l1, loan_types=[LOAN_TYPE_FLIP])
+    lead = _make_lead(rdb, phone_suffix="1301")
+    _route(rdb, lead)
+    ev = _routed_event_id(rdb, lead)
+
+    with pytest.raises(ValueError):
+        record_decline(ev, reason_code="not_a_code", actor="josh", db=rdb)
+    assert not any(e["action"] == "declined" for e in _events(rdb, lead))
+    assert _fr(rdb, lead)["status"] == "routed"
+
+
+def test_make_primary_is_atomic_and_applies_spec_defaults(rdb):
+    """F + C: one call moves the flag; the new primary gets cap 15 and the $500k ground-up minimum."""
+    from src.lending.routing.admin_api import make_primary
+
+    old = _add_lender(rdb, name="Old", is_primary=True, priority=1, monthly_cap=5)
+    new = _add_lender(rdb, name="New", priority=2)
+
+    result = make_primary(new, None, rdb)
+    assert result["demoted"] == [old]
+    rows = {r["name"]: r for r in rdb.execute(text(
+        "SELECT name, is_primary, monthly_cap, construction_min_amount FROM lending.lender_routing_rules"
+    )).mappings()}
+    assert rows["Old"]["is_primary"] is False and rows["Old"]["monthly_cap"] == 5
+    assert rows["New"]["is_primary"] is True
+    assert rows["New"]["monthly_cap"] == 15
+    assert rows["New"]["construction_min_amount"] == 500_000
+
+
+def test_real_loan_type_values_route_not_hold(rdb):
+    """The router must match the values the T-11 parser stores (uppercase LoanType values).
+
+    Guards the production bug where lowercase constants sent every real file to the hold queue.
+    """
+    assert LOAN_TYPE_FLIP == "FIX_AND_FLIP" and LOAN_TYPE_GU == "GROUND_UP_CONSTRUCTION"
+    lender = _add_lender(rdb, name="Real Values", priority=1)
+    _add_box(rdb, lender, loan_types=["fix_and_flip"])  # a hand-typed lowercase box still matches
+    lead = _make_lead(rdb, loan_type="FIX_AND_FLIP", phone_suffix="1801")
+    _route(rdb, lead)
+    assert _fr(rdb, lead)["current_lender_name"] == "Real Values"
+
+
+def test_product_box_rejects_unknown_loan_types():
+    """A typo in a box would silently never match, so the admin API refuses it and normalises case."""
+    from pydantic import ValidationError
+
+    from src.lending.routing.admin_api import ProductBoxIn
+
+    assert ProductBoxIn(loan_types=["fix_and_flip", "Dscr_Rental"]).loan_types == ["FIX_AND_FLIP", "DSCR_RENTAL"]
+    for bad in (["flip"], ["refi"], []):
+        with pytest.raises(ValidationError):
+            ProductBoxIn(loan_types=bad)
+
+
+def test_create_primary_defaults_cap_to_15(rdb):
+    from src.lending.routing.admin_api import LenderIn, create_lender
+
+    created = create_lender(LenderIn(name="P", is_primary=True, priority=1), None, rdb)
+    cap = rdb.execute(text("SELECT monthly_cap FROM lending.lender_routing_rules WHERE id = :i"),
+                      {"i": created["id"]}).scalar()
+    assert cap == 15
+
+
+def test_slack_message_carries_all_spec_fields():
+    """D: file ID, last name, product, amount, lender and position on route and decline posts."""
+    from src.lending.routing.notify import build_message
+
+    for action in ("routed", "declined"):
+        msg = build_message(action, lead_id=42, last_name="Kowalski", loan_type="fix_and_flip",
+                            loan_amount=300000, lender_name="Lender X", position=2, reason_code="ltv")
+        for part in ("42", "Kowalski", "fix_and_flip", "$300,000", "Lender X", "position 2"):
+            assert part in msg, f"{part!r} missing from {action} message"
+    assert build_message("funded", lead_id=1, last_name=None, loan_type=None, loan_amount=None,
+                         lender_name=None, position=None) is None
+
+
+def test_retry_posts_full_messages_and_skips_outcomes(rdb, fake_slack):
+    """D: the retry path posts the same fields, with the real position, and never clogs on outcomes."""
+    from src.lending.routing.decline import record_decline
+    from src.lending.routing.notify import retry_unposted_events
+    from src.lending.routing.outcome import record_outcome
+
+    a = _add_lender(rdb, name="First", priority=1)
+    _add_box(rdb, a, loan_types=[LOAN_TYPE_FLIP])
+    b = _add_lender(rdb, name="Second", priority=2)
+    _add_box(rdb, b, loan_types=[LOAN_TYPE_FLIP])
+    lead = _make_lead(rdb, phone_suffix="1401", last_name="Nowak")
+
+    _route(rdb, lead)
+    record_decline(_routed_event_id(rdb, lead), reason_code="ltv", actor="josh", db=rdb)
+    record_outcome(lead, action="funded", actor="josh", db=rdb)
+    rdb.execute(text("UPDATE lending.file_routing_events SET slack_ts = NULL, slack_posted_at = NULL"))
+    rdb.commit()
+    fake_slack.sent.clear()
+
+    posted = retry_unposted_events(rdb)
+    assert posted == 3  # routed (First), declined (First), routed (Second); funded is not posted
+    text_all = "\n".join(fake_slack.sent)
+    assert "Nowak" in text_all and "$300,000" in text_all and LOAN_TYPE_FLIP in text_all
+    assert "position 1" in text_all and "position 2" in text_all
+    assert "funded" not in text_all.lower()
+    assert retry_unposted_events(rdb) == 0
+
+
+def test_sweep_routes_enriched_files_regardless_of_ghl_status(rdb):
+    """Q4: routing triggers on finished enrichment, not on GoHighLevel sync state."""
+    from src.tasks.lending_routing_sweep import sweep
+
+    l1 = _add_lender(rdb, name="Sweep Lender", priority=1)
+    _add_box(rdb, l1, loan_types=[LOAN_TYPE_FLIP])
+
+    ready_pending_ghl = _make_lead(rdb, phone_suffix="1501", ghl_status="pending")
+    ready_failed_ghl = _make_lead(rdb, phone_suffix="1502", ghl_status="failed")
+    not_enriched = _make_lead(rdb, phone_suffix="1503")
+    suppressed = _make_lead(rdb, phone_suffix="1504", suppressed=True)
+    for lead, status in ((ready_pending_ghl, "ready"), (ready_failed_ghl, "ready"),
+                         (not_enriched, "pending"), (suppressed, "ready")):
+        rdb.execute(text("INSERT INTO lending.lendingflow_enrichment (lead_id, status) VALUES (:l, :s)"),
+                    {"l": lead, "s": status})
+    rdb.commit()
+
+    sweep(rdb)
+
+    assert _fr(rdb, ready_pending_ghl)["current_lender_name"] == "Sweep Lender"
+    assert _fr(rdb, ready_failed_ghl)["current_lender_name"] == "Sweep Lender"
+    assert _fr(rdb, not_enriched) == {}
+    assert _fr(rdb, suppressed) == {}
+
+
+def test_route_file_holds_suppressed_lead(rdb):
+    """Q8: a suppressed lead is never routed, even by a direct route_file call; it stays visible."""
+    l1 = _add_lender(rdb, name="Would Match", priority=1)
+    _add_box(rdb, l1, loan_types=[LOAN_TYPE_FLIP])
+    lead = _make_lead(rdb, phone_suffix="1601", suppressed=True)
+    _route(rdb, lead)
+    fr = _fr(rdb, lead)
+    assert fr["status"] == "held" and fr["hold_reason"] == "suppressed"
+    assert not any(e["lender_name"] == "Would Match" for e in _events(rdb, lead))
+
+
+def test_seed_from_t05_matrix_is_inert_idempotent_and_correct(rdb):
+    """B: the six T-05 rows seed the table as pending lenders; nothing routes until they are signed."""
+    from migrations.apply_lending_lender_routing_seed import apply_to as seed
+
+    conn = rdb.get_bind()
+    assert seed(conn) == 5  # six matrix rows, two of which share the primary lender
+    assert seed(conn) == 0  # idempotent
+
+    lenders = rdb.execute(text(
+        "SELECT id, name, is_primary, agreement_status, monthly_cap, construction_min_amount"
+        "  FROM lending.lender_routing_rules ORDER BY priority"
+    )).mappings().all()
+    assert len(lenders) == 5
+    assert all(r["agreement_status"] == "pending" for r in lenders)
+    primaries = [r for r in lenders if r["is_primary"]]
+    assert len(primaries) == 1
+    assert primaries[0]["monthly_cap"] == 15 and primaries[0]["construction_min_amount"] == 500_000
+    assert rdb.execute(text("SELECT COUNT(*) FROM lending.lender_product_boxes")).scalar() == 6
+
+    flip = _make_lead(rdb, phone_suffix="1701")
+    _route(rdb, flip)
+    assert _fr(rdb, flip)["status"] == "held" and _fr(rdb, flip)["hold_reason"] == "no_match"
+
+    # Once signed, the seeded boxes route real files: primary first for flips and for $650k ground-up,
+    # the first signed ground-up overflow lender for $450k ground-up.
+    rdb.execute(text("UPDATE lending.lender_routing_rules SET agreement_status = 'signed'"))
+    rdb.commit()
+    primary_name = primaries[0]["name"]
+    flip2 = _make_lead(rdb, phone_suffix="1702")
+    gu_650 = _make_lead(rdb, loan_type=LOAN_TYPE_GU, loan_amount=650_000, phone_suffix="1703")
+    gu_450 = _make_lead(rdb, loan_type=LOAN_TYPE_GU, loan_amount=450_000, phone_suffix="1704")
+    for lead in (flip2, gu_650, gu_450):
+        _route(rdb, lead)
+    assert _fr(rdb, flip2)["current_lender_name"] == primary_name
+    assert _fr(rdb, gu_650)["current_lender_name"] == primary_name
+    assert _fr(rdb, gu_450)["current_lender_name"] not in (None, primary_name)

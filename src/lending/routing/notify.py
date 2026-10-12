@@ -1,18 +1,22 @@
 """Slack notifications for R-1 routing events.
 
-Post target: LENDING_ROUTING_CHANNEL (config/settings.py).  The Cora Lending
-bot token (LENDING_SLACK_BOT_TOKEN) must be a member of that channel.
+Post target: LENDING_ROUTING_CHANNEL (config/settings.py), the #next-deal-lending channel.  The
+lending bot token (LENDING_SLACK_BOT_TOKEN) must be a member of that channel.
+
+Spec: every route and every decline posts file ID, borrower last name, product, amount, lender
+and position in the waterfall.  One builder (``build_message``) serves the live post and the
+retry sweep so the two can never drift.
 
 Nothing here is sent to a borrower.  Log lines carry IDs only (no PII).
 Slack messages carry last name only (never phone/email).
 
-Failure behaviour: post functions log a WARNING and return — they never raise.
-A failed post leaves slack_posted_at NULL on the event row, which the routing
-sweep retries.
+Failure behaviour: post functions log a WARNING and return; they never raise.
+A failed post leaves slack_posted_at NULL on the event row, which the routing sweep retries.
 """
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import text
@@ -42,9 +46,42 @@ def _channel() -> str:
     return get_settings().lending_routing_channel
 
 
+def _amount(value) -> str:
+    try:
+        return f"${int(value):,}" if value else "unknown"
+    except (TypeError, ValueError):
+        return "unknown"
+
+
+def build_message(
+    action: str,
+    *,
+    lead_id: int,
+    last_name: Optional[str],
+    loan_type: Optional[str],
+    loan_amount,
+    lender_name: Optional[str],
+    position: Optional[int],
+    reason_code: Optional[str] = None,
+    hold_reason: Optional[str] = None,
+) -> Optional[str]:
+    """The Slack text for one routing event, or None for an action that is not posted."""
+    head = (
+        f"File #{lead_id} · {last_name or 'Unknown'} · {loan_type or 'unknown'} · {_amount(loan_amount)}"
+    )
+    where = f"Lender: *{lender_name or 'unknown'}* (position {position if position else '?'} in waterfall)"
+    if action == "routed":
+        return f":arrow_right: *Routed* | {head}\n{where}"
+    if action == "declined":
+        return f":x: *Declined* | {head}\n{where} · reason: {reason_code or 'unspecified'}"
+    if action == "held":
+        why = f" · reason: {hold_reason}" if hold_reason else ""
+        return f":warning: *Held* | {head}{why}\nNo lender matched — flagged for Josh."
+    return None
+
+
 def _mark_posted(event_id: int, ts: str, db: Session) -> None:
     """Update slack_ts / slack_posted_at on the event row (only these two columns may be updated)."""
-    from datetime import datetime, timezone
     db.execute(
         text(
             "UPDATE lending.file_routing_events"
@@ -56,6 +93,19 @@ def _mark_posted(event_id: int, ts: str, db: Session) -> None:
     db.commit()
 
 
+def _post(message: str, event_id: int, db: Session, *, what: str, lead_id) -> None:
+    client = _client()
+    channel = _channel()
+    if not client or not channel:
+        logger.warning("notify.%s: Slack not configured — skipping", what)
+        return
+    try:
+        resp = client.chat_postMessage(channel=channel, text=message)
+        _mark_posted(event_id, resp["ts"], db)
+    except Exception:
+        logger.exception("notify.%s lead_id=%s event_id=%d — will retry", what, lead_id, event_id)
+
+
 def post_route_event(
     lead: dict,
     lender: LenderRow,
@@ -64,54 +114,31 @@ def post_route_event(
     *,
     db: Session,
 ) -> None:
-    """Post a 'routed' notification to #next-deal-lending (best-effort)."""
-    client = _client()
-    channel = _channel()
-    if not client or not channel:
-        logger.warning("notify.post_route_event: Slack not configured — skipping")
-        return
-
-    last_name = lead.get("last_name") or "Unknown"
-    loan_type = lead.get("loan_type") or "unknown"
-    amount = lead.get("loan_amount")
-    amount_str = f"${int(amount):,}" if amount else "unknown"
-    lead_id = lead.get("id")
-
-    text_body = (
-        f":arrow_right: *Routed* | File #{lead_id} · {last_name} · {loan_type} · {amount_str}"
-        f"\nLender: *{lender.name}* (position {position} in waterfall)"
+    """Post a 'routed' notification (best-effort)."""
+    message = build_message(
+        "routed", lead_id=lead.get("id"), last_name=lead.get("last_name"),
+        loan_type=lead.get("loan_type"), loan_amount=lead.get("loan_amount"),
+        lender_name=lender.name, position=position,
     )
-    try:
-        resp = client.chat_postMessage(channel=channel, text=text_body)
-        _mark_posted(event_id, resp["ts"], db)
-    except Exception:
-        logger.exception("notify.post_route_event lead_id=%s event_id=%d — will retry", lead_id, event_id)
+    _post(message, event_id, db, what="post_route_event", lead_id=lead.get("id"))
 
 
 def post_decline_event(
-    lead_id: int,
+    lead: dict,
     lender_name: Optional[str],
+    position: Optional[int],
     reason_code: str,
     event_id: int,
     *,
     db: Session,
 ) -> None:
-    """Post a 'declined' notification to #next-deal-lending (best-effort)."""
-    client = _client()
-    channel = _channel()
-    if not client or not channel:
-        logger.warning("notify.post_decline_event: Slack not configured — skipping")
-        return
-
-    text_body = (
-        f":x: *Declined* | File #{lead_id} · lender: {lender_name or 'unknown'}"
-        f" · reason: {reason_code}"
+    """Post a 'declined' notification (best-effort)."""
+    message = build_message(
+        "declined", lead_id=lead.get("id"), last_name=lead.get("last_name"),
+        loan_type=lead.get("loan_type"), loan_amount=lead.get("loan_amount"),
+        lender_name=lender_name, position=position, reason_code=reason_code,
     )
-    try:
-        resp = client.chat_postMessage(channel=channel, text=text_body)
-        _mark_posted(event_id, resp["ts"], db)
-    except Exception:
-        logger.exception("notify.post_decline_event lead_id=%d event_id=%d — will retry", lead_id, event_id)
+    _post(message, event_id, db, what="post_decline_event", lead_id=lead.get("id"))
 
 
 def post_hold_event(
@@ -121,30 +148,21 @@ def post_hold_event(
     reason: str,
     db: Session,
 ) -> None:
-    """Post a 'held' notification to #next-deal-lending (best-effort)."""
-    client = _client()
-    channel = _channel()
-    if not client or not channel:
-        return
-
-    lead_id = lead.get("id")
-    last_name = lead.get("last_name") or "Unknown"
-    text_body = (
-        f":warning: *Held* | File #{lead_id} · {last_name} · reason: {reason}"
-        f"\nNo lender matched — flagged for Josh."
+    """Post a 'held' notification (best-effort)."""
+    message = build_message(
+        "held", lead_id=lead.get("id"), last_name=lead.get("last_name"),
+        loan_type=lead.get("loan_type"), loan_amount=lead.get("loan_amount"),
+        lender_name=None, position=None, hold_reason=reason,
     )
-    try:
-        resp = client.chat_postMessage(channel=channel, text=text_body)
-        _mark_posted(event_id, resp["ts"], db)
-    except Exception:
-        logger.exception("notify.post_hold_event lead_id=%s event_id=%d — will retry", lead_id, event_id)
+    _post(message, event_id, db, what="post_hold_event", lead_id=lead.get("id"))
 
 
 def retry_unposted_events(db: Session) -> int:
     """Retry Slack posts for events where slack_posted_at IS NULL.
 
     Called by the routing sweep so failed initial posts are eventually delivered.
-    Returns the number of events successfully retried.
+    Returns the number of events successfully posted.  Only routed / declined / held events
+    are posted; approved / funded outcomes are never posted, so they are not retried.
     """
     client = _client()
     channel = _channel()
@@ -154,10 +172,15 @@ def retry_unposted_events(db: Session) -> int:
     rows = db.execute(
         text(
             "SELECT fre.id, fre.lead_id, fre.lender_name, fre.action, fre.reason_code,"
-            "       ll.last_name, ll.loan_type, ll.loan_amount"
+            "       ll.last_name, ll.loan_type, ll.loan_amount,"
+            "       (SELECT COUNT(*) FROM lending.file_routing_events r"
+            "         WHERE r.lead_id = fre.lead_id AND r.action = 'routed' AND r.id <= fre.id) AS position,"
+            "       fr.hold_reason"
             "  FROM lending.file_routing_events fre"
             "  JOIN lending.lendingflow_leads ll ON ll.id = fre.lead_id"
+            "  LEFT JOIN lending.file_routing fr ON fr.lead_id = fre.lead_id"
             " WHERE fre.slack_posted_at IS NULL"
+            "   AND fre.action IN ('routed', 'declined', 'held')"
             " ORDER BY fre.created_at"
             " LIMIT 100"
         )
@@ -165,30 +188,16 @@ def retry_unposted_events(db: Session) -> int:
 
     posted = 0
     for row in rows:
-        action = row["action"]
-        lead_id = row["lead_id"]
-        last_name = row["last_name"] or "Unknown"
-        lender_name = row["lender_name"] or "unknown"
-        amount = row["loan_amount"]
-        amount_str = f"${int(amount):,}" if amount else "unknown"
-
-        if action == "routed":
-            msg = (
-                f":arrow_right: *Routed* | File #{lead_id} · {last_name}"
-                f" · {row['loan_type']} · {amount_str}\nLender: *{lender_name}*"
-            )
-        elif action == "declined":
-            msg = (
-                f":x: *Declined* | File #{lead_id} · lender: {lender_name}"
-                f" · reason: {row['reason_code'] or 'unspecified'}"
-            )
-        elif action == "held":
-            msg = f":warning: *Held* | File #{lead_id} · {last_name} — no lender matched"
-        else:
+        message = build_message(
+            row["action"], lead_id=row["lead_id"], last_name=row["last_name"],
+            loan_type=row["loan_type"], loan_amount=row["loan_amount"],
+            lender_name=row["lender_name"], position=int(row["position"]) or None,
+            reason_code=row["reason_code"], hold_reason=row["hold_reason"],
+        )
+        if message is None:
             continue
-
         try:
-            resp = client.chat_postMessage(channel=channel, text=msg)
+            resp = client.chat_postMessage(channel=channel, text=message)
             _mark_posted(row["id"], resp["ts"], db)
             posted += 1
         except Exception:
