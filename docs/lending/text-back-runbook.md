@@ -44,7 +44,7 @@ fallback to the platform's `GHL_API_KEY` / `GHL_LOCATION_ID`.
   Restart `fa-api`, `fa-lending-cdr-poller` **and** `fa-lending-opt-out-poller` after changing them (settings are cached per process:
   the texts are sent by the CDR poller and the DND sync runs in the opt-out poller, so a process left on old values would keep
   using them). Setting only **one** of the two is a misconfiguration: texts and DND fail closed (no account is used) with an ERROR log.
-- `LENDING_GHL_SMS_FROM_NUMBER`: E.164 of the **one number used for calling and texting**. It is also the number printed in
+- `LENDING_GHL_SMS_FROM_NUMBER`: E.164 of the **GHL SMS number** (texting only: calls run through BatchDialer on a different number). It is also the number printed in
   "call or text me back at ...". There is no separate text-back number setting.
 - `LENDING_GHL_WEBHOOK_SECRET`: shared secret for the `X-Webhook-Secret` header on the GHL webhooks (already exists).
 - `MISSED_CALL_TEXT_ENABLED=false` until section 5(e).
@@ -58,8 +58,8 @@ Client gives `hari@heu.ai` Agency Admin and a card first (client answers B2/B1).
 2. Send the client the expected monthly cost (number rental, per-message, 10DLC one-time plus monthly campaign fee) **before**
    buying (client question 10).
 3. Settings -> Phone Numbers -> Add Number: US, Local, SMS + Voice, area code 813 or 727. Complete identity verification. Record the
-   number in `LENDING_GHL_SMS_FROM_NUMBER`. A number normally lives with one provider: confirm with the client how the same number
-   serves BatchDialer calls and GHL SMS (v2 Q8).
+   number in `LENDING_GHL_SMS_FROM_NUMBER`. The GHL SMS number and the BatchDialer calling number are different numbers (decision 2026-10-12): the
+   client buys this one in GHL because only the client can complete the identity verification.
 4. Credentials. Create a Private Integration token with the scopes contacts write and conversations/messages write in the Next
    Deal Lending sub-account and set `LENDING_GHL_API_KEY` + `LENDING_GHL_LOCATION_ID` (the `--send-test` in section 5 proves it).
 5. **10DLC (Trust Center)**, only after `nextdeallending.com` is public (WP-GL-11): Standard Brand, brand **Next Deal Lending**, legal

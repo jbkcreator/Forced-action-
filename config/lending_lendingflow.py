@@ -6,6 +6,9 @@ MAX_BODY_BYTES = 256 * 1024
 
 GHL_TAG_LENDINGFLOW = "lendingflow"
 GHL_TAG_CONSENT_MISSING = "lendingflow-consent-missing"
+# Added only for a lead with a consent certificate, in a call of its own after the other tags: it starts the GHL intro-SMS
+# workflow (docs/lending/intro-sms.md). The consent decision is made here, never inside GHL.
+GHL_TAG_INTRO_READY = "lendingflow-intro-ready"
 GHL_SOURCE = "LendingFlow"
 
 # Same schedule shape as config.lending_web: minutes to wait after the Nth failure (last value repeats).
