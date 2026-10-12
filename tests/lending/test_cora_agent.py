@@ -4,6 +4,8 @@ No Slack or database is touched: the send check runs against a scripted connecti
 """
 from __future__ import annotations
 
+import signal
+import threading
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -52,6 +54,47 @@ def test_main_refuses_to_start_without_approvers(monkeypatch) -> None:
 def test_main_refuses_to_start_without_the_bot_token(monkeypatch) -> None:
     monkeypatch.setattr(cora_agent, "get_settings", lambda: _settings(lending_slack_bot_token=None))
     assert cora_agent.main() == 1
+
+
+def test_sweep_worker_starts_runs_the_sweep_and_stops(monkeypatch) -> None:
+    """A configured worker installs its SIGTERM handler, runs the sweep, and exits on stop."""
+    services = object()
+    handlers: list = []
+    swept: list = []
+    stop = threading.Event()
+
+    def sweep(given):
+        swept.append(given)
+        stop.set()
+
+    monkeypatch.setattr(cora_agent, "get_settings", lambda: _settings())
+    monkeypatch.setattr(cora_agent, "build_live_services", lambda settings: services)
+    monkeypatch.setattr(cora_agent, "run_sweep", sweep)
+    monkeypatch.setattr(cora_agent, "SWEEP_SECONDS", 0.01)
+    monkeypatch.setattr(cora_agent.signal, "signal", lambda signum, handler: handlers.append((signum, handler)))
+    assert cora_agent.main(stop=stop) == 0
+    assert swept == [services]
+    assert [signum for signum, _ in handlers] == [signal.SIGTERM]
+    handlers[0][1]()  # SIGTERM sets the stop event
+    assert stop.is_set()
+
+
+def test_a_failing_sweep_does_not_stop_the_worker(monkeypatch) -> None:
+    stop = threading.Event()
+    runs: list = []
+
+    def sweep(_):
+        runs.append(1)
+        if len(runs) == 1:
+            raise RuntimeError("db down")
+        stop.set()
+
+    monkeypatch.setattr(cora_agent, "get_settings", lambda: _settings())
+    monkeypatch.setattr(cora_agent, "build_live_services", lambda settings: object())
+    monkeypatch.setattr(cora_agent, "run_sweep", sweep)
+    monkeypatch.setattr(cora_agent, "SWEEP_SECONDS", 0.01)
+    monkeypatch.setattr(cora_agent.signal, "signal", lambda *args: None)
+    assert cora_agent.main(stop=stop) == 0 and len(runs) == 2
 
 
 def test_missing_settings_are_named() -> None:

@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import signal
 import threading
 from collections.abc import Callable
 from datetime import timedelta

@@ -35,8 +35,31 @@ def _settings(**overrides) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
 
+class FakeRedis:
+    """Just enough of redis-py for the receipt: SET key value NX EX."""
+
+    def __init__(self, fail: bool = False) -> None:
+        self.keys: dict[str, object] = {}
+        self.fail = fail
+
+    def set(self, key, value, nx=False, ex=None):
+        if self.fail:
+            raise ConnectionError("redis down")
+        if nx and key in self.keys:
+            return None
+        self.keys[key] = value
+        return True
+
+
 @pytest.fixture
-def handled(monkeypatch) -> list[tuple]:
+def redis(monkeypatch) -> FakeRedis:
+    fake = FakeRedis()
+    monkeypatch.setattr("src.core.redis_client.get_redis", lambda: fake)
+    return fake
+
+
+@pytest.fixture
+def handled(monkeypatch, redis) -> list[tuple]:
     calls: list[tuple] = []
     record = lambda *args: calls.append(args)  # noqa: E731 - tiny recorder
     monkeypatch.setattr(cora_events_webhook, "handle_slack_request", record)
@@ -93,10 +116,48 @@ def test_message_event_is_acknowledged_and_handed_to_cora(client, handled) -> No
                                                   "text": "how many leads?", "ts": "1.1"}}, "Ev123")]
 
 
-def test_slack_retries_are_acknowledged_but_not_handled_again(client, handled) -> None:
+def test_retry_of_an_accepted_event_is_dropped(client, handled) -> None:
     body = _event()
+    assert client.post(EVENTS, content=body, headers=_signed(body)).status_code == 200
     assert client.post(EVENTS, content=body, headers=_signed(body, retry="1")).status_code == 200
-    assert handled == []
+    assert client.post(EVENTS, content=body, headers=_signed(body)).status_code == 200  # a plain repeat too
+    assert len(handled) == 1
+
+
+def test_retry_of_an_event_that_never_arrived_is_processed(client, handled) -> None:
+    """The first delivery failed before reaching us (e.g. nginx 502 during a restart); Slack's retry is all we get."""
+    body = _event()
+    response = client.post(EVENTS, content=body, headers=_signed(body, retry="1"))
+    assert response.status_code == 200 and len(handled) == 1 and handled[0][2] == "Ev123"
+
+
+def test_receipt_is_shared_by_every_worker(handled, monkeypatch) -> None:
+    monkeypatch.setattr(cora_events_webhook, "get_settings", lambda: _settings())
+    workers = []
+    for _ in range(2):
+        app = FastAPI()
+        app.include_router(cora_events_webhook.router)
+        workers.append(TestClient(app))
+    body = _event()
+    workers[0].post(EVENTS, content=body, headers=_signed(body))
+    workers[1].post(EVENTS, content=body, headers=_signed(body, retry="1"))
+    assert len(handled) == 1
+
+
+def test_different_events_are_each_processed(client, handled) -> None:
+    for event_id in ("EvA", "EvB"):
+        body = json.dumps({"type": "event_callback", "event_id": event_id, "event": {"type": "message"}}).encode()
+        client.post(EVENTS, content=body, headers=_signed(body))
+    assert [call[2] for call in handled] == ["EvA", "EvB"]
+
+
+@pytest.mark.parametrize("broken", ["unavailable", "erroring"])
+def test_events_are_processed_when_redis_cannot_be_used(client, handled, monkeypatch, broken) -> None:
+    fake = None if broken == "unavailable" else FakeRedis(fail=True)
+    monkeypatch.setattr("src.core.redis_client.get_redis", lambda: fake)
+    body = _event()
+    client.post(EVENTS, content=body, headers=_signed(body))
+    assert len(handled) == 1  # never lost; a duplicate answer is the accepted risk
 
 
 def test_malformed_or_unknown_payloads(client, handled) -> None:
