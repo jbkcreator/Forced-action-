@@ -930,6 +930,11 @@ class AppSettings(BaseSettings):
 	lending_ghl_stage_new_lead: Optional[str] = Field(default=None, env="LENDING_GHL_STAGE_NEW_LEAD")
 	lending_ghl_cf_sms_consent: Optional[str] = Field(default=None, env="LENDING_GHL_CF_SMS_CONSENT")
 	lending_ghl_cf_deal_drop_optin: Optional[str] = Field(default=None, env="LENDING_GHL_CF_DEAL_DROP_OPTIN")
+	# T-11 LendingFlow intake. Off by default; the receiver is closed (503) until the flag is on AND the secret is set.
+	lending_lendingflow_enabled: bool = Field(default=False, env="LENDING_LENDINGFLOW_ENABLED")
+	lending_lendingflow_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_LENDINGFLOW_WEBHOOK_SECRET")
+	# Pipeline stage (in LENDING_GHL_PIPELINE_ID) for new LendingFlow leads; unset = contact only.
+	lending_ghl_stage_lendingflow_new: Optional[str] = Field(default=None, env="LENDING_GHL_STAGE_LENDINGFLOW_NEW")
 	aircall_webhook_token: Optional[SecretStr] = Field(default=None, env="AIRCALL_WEBHOOK_TOKEN")
 
 	# ── Lending engine: call disposition logging ──

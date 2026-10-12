@@ -15,6 +15,7 @@ from src.lending.booking_webhook import router as lending_booking_webhook_router
 from src.lending.reply_webhook import router as lending_reply_webhook_router
 from src.lending.soft_approval_webhook import router as lending_soft_approval_router
 from src.api.lending_web_router import router as lending_web_router
+from src.lending.lendingflow_webhook import router as lending_lendingflow_router
 
 app = FastAPI(title="Lending API", docs_url=None, redoc_url=None)
 # The website form posts cross-origin when the site is served from another host; the allowed
@@ -30,6 +31,7 @@ app.include_router(lending_booking_webhook_router)
 app.include_router(lending_reply_webhook_router)
 app.include_router(lending_soft_approval_router)
 app.include_router(lending_web_router)
+app.include_router(lending_lendingflow_router)
 
 
 @app.get("/health")

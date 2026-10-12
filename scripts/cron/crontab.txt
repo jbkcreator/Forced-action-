@@ -1195,6 +1195,10 @@ COUNTY_ID=hillsborough
 # Lending website lead form (WP-GL-11) — retry delivery of leads not yet in GoHighLevel.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_web_lead_sweep
 
+# Lending LendingFlow intake (T-11) — retry GHL delivery of leads not yet in GoHighLevel, then emit the
+# LendingFlowLeadCreated event + pre-qual hand-off. No-op while LENDING_LENDINGFLOW_ENABLED=false.
+*/5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_lendingflow_sweep
+
 # Lending Minute-5 pre-qualification letter (T-07) — retry letters not yet sent.
 # No-op while LENDING_PREQUAL_PDF_ENABLED is off.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_prequal_sweep
