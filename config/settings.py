@@ -913,6 +913,12 @@ class AppSettings(BaseSettings):
 	# Backflip borrower conflict check on the lending load. Off for launch: there is no
 	# Backflip export, and a missing or stale feed blocks every record when it is on.
 	lending_backflip_check_enabled: bool = Field(default=False, env="LENDING_BACKFLIP_CHECK_ENABLED")
+	# T-07 Minute-5 pre-qualification PDF. Off until Josh + compliance review the template.
+	lending_prequal_pdf_enabled: bool = Field(default=False, env="LENDING_PREQUAL_PDF_ENABLED")
+	# Placeholder range: +/- this percent around the requested amount, clamped to fitting lenders' limits.
+	lending_prequal_range_pct: int = Field(default=10, env="LENDING_PREQUAL_RANGE_PCT")
+	# Sender of the pre-qual email. Set a verified Next Deal Lending mailbox before enabling; unset = GHL's shared address.
+	lending_prequal_email_from: Optional[str] = Field(default=None, env="LENDING_PREQUAL_EMAIL_FROM")
 	# Shared secret the GHL "DND changed" workflow sends in X-Webhook-Secret. Unset = endpoint closed.
 	lending_ghl_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_GHL_WEBHOOK_SECRET")
 	lending_ghl_sms_from_number: Optional[str] = Field(default=None, env="LENDING_GHL_SMS_FROM_NUMBER")  # E.164; the one number used for calling and texting

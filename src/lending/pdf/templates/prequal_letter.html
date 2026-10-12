@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Pre-Qualification Estimate{% endblock %}
+{% block body %}
+<style>
+  .date { color: var(--ink-2); font-size: 10pt; margin: 0 0 22px; }
+  h1 { font-size: 22pt; font-weight: 850; margin: 0 0 10px; letter-spacing: -.01em; }
+  .range-card { background: var(--navy); color: var(--paper); border-radius: 4px; padding: 22px 26px; margin: 22px 0; border-left: 6px solid var(--gold); }
+  .range-card .label { font-size: 9.5pt; color: var(--mist); letter-spacing: .08em; text-transform: uppercase; }
+  .range-card .amount { font-size: 28pt; font-weight: 850; margin-top: 4px; }
+  table.facts { width: 100%; border-collapse: collapse; margin: 6px 0 22px; }
+  table.facts td { padding: 9px 0; border-bottom: 1px solid var(--line); font-size: 11pt; }
+  table.facts td:first-child { color: var(--ink-2); width: 40%; }
+  table.facts td:last-child { font-weight: 750; }
+  .note { background: var(--green-tint); border-left: 4px solid var(--green); padding: 12px 16px; font-size: 10pt; color: var(--navy-deep); }
+  .next { font-size: 11pt; margin-top: 20px; }
+</style>
+<p class="date">{{ generated_date }}</p>
+<h1>Your pre-qualification estimate</h1>
+<p>Thanks for sending your request. Based on what you shared, here is a rough range for the loan amount you may qualify for.</p>
+
+<div class="range-card">
+  <div class="label">Estimated loan amount range</div>
+  <div class="amount">{{ range_low }} &ndash; {{ range_high }}</div>
+</div>
+
+<table class="facts">
+  <tr><td>Loan type</td><td>{{ loan_type_label|capitalize }}</td></tr>
+  <tr><td>Property state</td><td>{{ property_state }}</td></tr>
+  <tr><td>Credit band you provided</td><td>{{ credit_band }}</td></tr>
+</table>
+
+<div class="note">
+  This is a non-binding estimate for informational purposes only. It is not a commitment to lend,
+  a loan approval, or an offer of specific terms. Final eligibility and terms depend on a full review of your file.
+</div>
+
+<p class="next">Questions or ready to talk through your deal? Call or text <strong>(727) 436-9951</strong>
+or reply to this email.</p>
+{# PLACEHOLDER COPY: final wording, signer, logo and required disclosures pending Josh (Q11, Q14, 15g) and compliance review. #}
+{% endblock %}

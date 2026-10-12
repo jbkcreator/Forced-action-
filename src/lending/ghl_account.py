@@ -43,3 +43,8 @@ def lending_ghl_account() -> Optional[GhlAccount]:
 def ghl_headers(api_key: str, version: str = "2021-07-28") -> dict[str, str]:
     return {"Authorization": f"Bearer {api_key}", "Version": version,
             "Content-Type": "application/json", "Accept": "application/json"}
+
+
+def ghl_multipart_headers(api_key: str, version: str = "2021-07-28") -> dict[str, str]:
+    """Headers for a file upload: no Content-Type, so requests sets the multipart boundary."""
+    return {"Authorization": f"Bearer {api_key}", "Version": version, "Accept": "application/json"}
