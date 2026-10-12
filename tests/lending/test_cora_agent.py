@@ -16,8 +16,8 @@ from src.lending import cora_agent
 
 def _settings(**overrides) -> SimpleNamespace:
     values = dict(
-        lending_cora_slack_bot_token=SecretStr("xoxb-test"),
-        lending_cora_slack_app_token=SecretStr("xapp-test"),
+        lending_slack_bot_token=SecretStr("xoxb-test"),
+        anthropic_api_key=SecretStr("sk-test"),
         lending_cora_channel="C_CORA",
         lending_cora_approver_user_ids="U_JOSH",
         lending_cora_operator_user_ids="U_OPS1, U_OPS2,",
@@ -40,7 +40,8 @@ def test_build_config_maps_settings() -> None:
     assert config.db_schema == "lending"
     assert config.pending_action_ttl_hours == 48
     assert config.calendar_id is None
-    assert config.missing_for_live_session() == []
+    assert config.slack_app_token is None  # HTTP mode: no Socket Mode token
+    assert config.missing_for_http_session() == [] and cora_agent.missing_settings(config) == []
 
 
 def test_main_refuses_to_start_without_approvers(monkeypatch) -> None:
@@ -48,9 +49,15 @@ def test_main_refuses_to_start_without_approvers(monkeypatch) -> None:
     assert cora_agent.main() == 1
 
 
-def test_main_refuses_to_start_without_tokens(monkeypatch) -> None:
-    monkeypatch.setattr(cora_agent, "get_settings", lambda: _settings(lending_cora_slack_app_token=None))
+def test_main_refuses_to_start_without_the_bot_token(monkeypatch) -> None:
+    monkeypatch.setattr(cora_agent, "get_settings", lambda: _settings(lending_slack_bot_token=None))
     assert cora_agent.main() == 1
+
+
+def test_missing_settings_are_named() -> None:
+    config = cora_agent.build_config(_settings(lending_slack_bot_token=None, lending_cora_channel="", anthropic_api_key=None))
+    assert cora_agent.missing_settings(config) == ["slack_bot_token", "slack_channel_id", "anthropic_api_key"]
+    assert cora_agent.build_live_services(_settings(lending_cora_approver_user_ids="")) is None
 
 
 def test_no_egress_channel_is_registered_yet() -> None:

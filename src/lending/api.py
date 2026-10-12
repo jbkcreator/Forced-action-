@@ -14,6 +14,7 @@ from src.api.lending_ghl_router import router as lending_ghl_router
 from src.lending.booking_webhook import router as lending_booking_webhook_router
 from src.lending.reply_webhook import router as lending_reply_webhook_router
 from src.lending.soft_approval_webhook import router as lending_soft_approval_router
+from src.lending.cora_events_webhook import router as lending_cora_events_router
 from src.api.lending_web_router import router as lending_web_router
 from src.lending.lendingflow_webhook import router as lending_lendingflow_router
 from src.lending import lendingflow_events
@@ -33,6 +34,7 @@ app.include_router(lending_ghl_router)
 app.include_router(lending_booking_webhook_router)
 app.include_router(lending_reply_webhook_router)
 app.include_router(lending_soft_approval_router)
+app.include_router(lending_cora_events_router)
 app.include_router(lending_web_router)
 app.include_router(lending_lendingflow_router)
 app.include_router(lending_enrichment_router)
