@@ -930,6 +930,15 @@ class AppSettings(BaseSettings):
 	lending_ghl_stage_new_lead: Optional[str] = Field(default=None, env="LENDING_GHL_STAGE_NEW_LEAD")
 	lending_ghl_cf_sms_consent: Optional[str] = Field(default=None, env="LENDING_GHL_CF_SMS_CONSENT")
 	lending_ghl_cf_deal_drop_optin: Optional[str] = Field(default=None, env="LENDING_GHL_CF_DEAL_DROP_OPTIN")
+	# T-11 LendingFlow intake. Off by default; the receiver is closed (503) until the flag is on AND the secret is set.
+	lending_lendingflow_enabled: bool = Field(default=False, env="LENDING_LENDINGFLOW_ENABLED")
+	lending_lendingflow_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_LENDINGFLOW_WEBHOOK_SECRET")
+	# Pipeline stage (in LENDING_GHL_PIPELINE_ID) for new LendingFlow leads; unset = contact only.
+	lending_ghl_stage_lendingflow_new: Optional[str] = Field(default=None, env="LENDING_GHL_STAGE_LENDINGFLOW_NEW")
+	# T-12 background enrichment card + routing. Off: no card is built, the deal-facts webhook returns 503.
+	lending_enrichment_enabled: bool = Field(default=False, env="LENDING_ENRICHMENT_ENABLED")
+	# Street View Static API (metadata lookup only; the key is never put in a posted link). Unset = no Street View.
+	google_maps_api_key: Optional[SecretStr] = Field(default=None, env="GOOGLE_MAPS_API_KEY")
 	aircall_webhook_token: Optional[SecretStr] = Field(default=None, env="AIRCALL_WEBHOOK_TOKEN")
 
 	# ── Lending engine: call disposition logging ──
@@ -949,6 +958,22 @@ class AppSettings(BaseSettings):
 	lending_sheets_service_account_key_path: str = Field(default="", env="LENDING_SHEETS_SERVICE_ACCOUNT_KEY_PATH")
 	lending_disposition_sheet_id: str = Field(default="", env="LENDING_DISPOSITION_SHEET_ID")
 	lending_disposition_sheet_tab: str = Field(default="Dispositions", env="LENDING_DISPOSITION_SHEET_TAB")
+	# Call-One soft approval PDF (T-08): off until Josh approves the template and the calculation inputs.
+	lending_soft_approval_enabled: bool = Field(default=False, env="LENDING_SOFT_APPROVAL_ENABLED")
+	lending_slack_signing_secret: Optional[SecretStr] = Field(default=None, env="LENDING_SLACK_SIGNING_SECRET")  # verifies Slack interactivity posts to lending-api
+	# ── Lending Cora agent (packages/agent_core, systemd fa-lending-cora) ──
+	# A dedicated Slack app, separate from LENDING_SLACK_BOT_TOKEN (ops alerts). The app token
+	# (xapp-) opens the Socket Mode connection; approvers are the only users whose clicks release
+	# an external send, so keep that list to Josh's Slack user id.
+	lending_cora_slack_bot_token: Optional[SecretStr] = Field(default=None, env="LENDING_CORA_SLACK_BOT_TOKEN")
+	lending_cora_slack_app_token: Optional[SecretStr] = Field(default=None, env="LENDING_CORA_SLACK_APP_TOKEN")
+	lending_cora_channel: str = Field(default="", env="LENDING_CORA_CHANNEL")  # channel ID for approval cards
+	lending_cora_approver_user_ids: str = Field(default="", env="LENDING_CORA_APPROVER_USER_IDS")  # comma-separated Slack user ids
+	lending_cora_operator_user_ids: str = Field(default="", env="LENDING_CORA_OPERATOR_USER_IDS")  # may chat, may not approve
+	lending_cora_model: str = Field(default="claude-sonnet-5-5", env="LENDING_CORA_MODEL")
+	lending_cora_pending_action_ttl_hours: int = Field(default=72, env="LENDING_CORA_PENDING_ACTION_TTL_HOURS")  # unapproved drafts expire after this
+	lending_cora_calendar_id: str = Field(default="", env="LENDING_CORA_CALENDAR_ID")
+	lending_cora_calendar_service_account_key_path: str = Field(default="", env="LENDING_CORA_CALENDAR_SERVICE_ACCOUNT_KEY_PATH")
 	# ── Meta Conversions API (CAPI) — S2 ────────────────────────────────────
 	# Server-side Purchase reporting for closed-loop Meta ad attribution.
 	# Feature-gated and OFF by default — when disabled, or when pixel_id /
