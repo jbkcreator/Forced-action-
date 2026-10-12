@@ -33,8 +33,12 @@ def _tags(lead: Mapping[str, Any]) -> list[str]:
 
 
 def _intro_ready_tags(lead: Mapping[str, Any]) -> list[str]:
-    """The tag that starts the GHL intro-SMS workflow: only for a lead with a consent certificate."""
-    return [GHL_TAG_INTRO_READY] if lead["consent_status"] == "present" else []
+    """The tag that starts the GHL intro-SMS workflow. Only for a lead with a consent certificate AND an explicit
+    ``sms_clear`` flag, which ``deliver_pending`` sets after re-checking the current suppression list and
+    do-not-contact flag at push time. A lead without that flag is never tagged (fail closed)."""
+    if lead["consent_status"] == "present" and lead.get("sms_clear") is True:
+        return [GHL_TAG_INTRO_READY]
+    return []
 
 
 class LendingFlowGhlSink:

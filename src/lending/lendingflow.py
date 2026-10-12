@@ -416,7 +416,23 @@ def _recoverable_followups(db, now: datetime) -> list[FollowUp]:
     return [FollowUp(dict(row)) for row in rows]
 
 
+def _sms_clear(db, lead: Mapping[str, Any]) -> bool:
+    """Whether the borrower may still be texted. Re-checked at every push: an opt-out after intake does not change the
+    stored ``suppressed`` flag, and a lead can sit in retry for up to GHL_GIVE_UP_AFTER_HOURS. Fails closed: if the
+    lookup errors the intro-SMS trigger tag is withheld; the CRM delivery is never blocked by this check."""
+    try:
+        with db.begin_nested():  # a failed lookup must not abort the delivery transaction
+            reason = _suppression_reason(db, lead["phone"], lead["email"])
+    except Exception as exc:
+        logger.error("[lendingflow] suppression re-check failed lead=%s: %s", lead["id"], type(exc).__name__)
+        return False
+    if reason:
+        logger.info("[lendingflow] intro SMS withheld, borrower suppressed since intake lead=%s gate=%s", lead["id"], reason)
+    return reason is None
+
+
 def _deliver_one(db, sink: LeadSink, lead: dict[str, Any], now: datetime) -> bool:
+    lead["sms_clear"] = _sms_clear(db, lead)
     try:
         result = sink.push(lead)
     except DeliveryError as exc:

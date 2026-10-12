@@ -25,9 +25,9 @@ The SMS number is a GHL number Josh buys (ID verification, client only). It is *
 
 ## What the workflow relies on (do not change without updating the workflow)
 
-- T-11 adds `lendingflow-intro-ready` **only** for a lead with `consent_status = 'present'`, in its own add-tags call after the first. Pinned by `tests/lending/test_intro_sms_trigger.py` (tag names, consent / no consent, call order, failure behaviour).
+- T-11 adds `lendingflow-intro-ready` **only** for a lead with `consent_status = 'present'` **and** a clear suppression re-check, in its own add-tags call after the first. `deliver_pending` re-checks the current suppression list (phone or email) and `lending.contacts.do_not_contact` on **every push, including retries**, because an opt-out after intake does not change the lead's stored `suppressed` flag and a lead can sit in retry for up to 72 hours. If the re-check finds an opt-out, or the lookup itself fails, the contact is still delivered to GHL but the ready tag is withheld (fail closed); the sink adds the tag only when the flag is explicitly true. Pinned by `tests/lending/test_intro_sms_trigger.py` (tag names, consent / no consent, the explicit clear flag, call order, failure behaviour, and a retry after a phone-suppression, email-only-suppression and `do_not_contact` opt-out).
 - If the ready-tag call fails, the push fails and T-11's sweep retries it (re-adding a tag that is already present does not trigger the workflow again, so a retry never double-texts). The lead's enrichment card and pre-qual letter wait for that retry, like any other failed GHL call in the push.
-- T-11 never pushes a suppressed lead (`ghl_status = 'skipped'`), so a suppressed number never reaches GHL and never gets a text.
+- A lead suppressed **at intake** (`ghl_status = 'skipped'`) is never pushed, so it never reaches GHL. A lead suppressed **after** intake and still waiting in retry is still delivered to GHL as a contact (existing T-11 behaviour) but never gets the ready tag, so it is never texted by this workflow.
 - A duplicate LendingFlow lead is not pushed again. A second lead from the same phone is upserted onto the same GHL contact; the ready tag is already there, so GHL does not trigger again and no second intro is sent.
 
 ## Workflow build steps (Next Deal Lending sub-account only)
@@ -57,6 +57,7 @@ SELECT lead_uuid, received_at, ghl_status, ghl_contact_id FROM lending.lendingfl
 - **No record in our database and no alert.** If the workflow fails or the number is not approved, it fails in GHL's execution log only. Check the log during the first live days and use the `LendingFlow - not texted` Smart List.
 - **One intro per contact, ever.** A returning borrower (same phone, new LendingFlow lead) keeps the old ready tag, so they get no new intro.
 - **Anyone adding `lendingflow-intro-ready` by hand in GHL triggers a text.**
+- **A small window remains between our suppression check and GHL's send** (seconds): an opt-out landing in that gap relies on GHL's own do-not-disturb handling, which can lag for phone-based opt-outs and does not exist for email-only opt-outs.
 - **Texts go out at any hour, including overnight** (client decision 2026-10-12). This is outside the repo's own 8 AM-8 PM ET floor used by GL-9/GL-10, and Josh's D1(b) is unanswered.
 - **Consent:** `consent_status = 'present'` means the LendingFlow payload carried a non-empty consent field; its content is not validated. **DNC:** no national or state DNC scrub is run (a Tracerfy scrub is a minutes-long batch job on frozen credits); T-11 checks only our own suppression list and the contact's `do_not_contact` flag. Both are open compliance questions for Josh (D1(a), D1(c)).
 - **UNVERIFIED until the live check:** the Send SMS step itself (no number yet), the Add-tag-after-SMS behaviour, and the real send time. A lead with no first name reads "Hi , this is Josh Kantor..." (no fallback).
