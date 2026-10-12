@@ -470,6 +470,22 @@ class LendingAgentHaltState(LendingBase):
     __table_args__ = (CheckConstraint("id = 1", name="ck_agent_halt_state_single_row"),)
 
 
+class LendingAgentMemory(LendingBase):
+    """Cora's standing rules, compiled into <standing_rules> on every turn (packages/agent_core/memory.py).
+
+    Columns exactly as the CORA-CORE specification gives them; rules are deactivated, never deleted.
+    """
+
+    __tablename__ = "agent_memory"
+
+    memory_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
+    category: Mapped[str] = mapped_column(String(64), nullable=False)
+    rule_text: Mapped[str] = mapped_column(Text, nullable=False)
+    source_thread_ts: Mapped[Optional[str]] = mapped_column(String(64))  # Slack thread the rule was given in
+    is_active: Mapped[Optional[bool]] = mapped_column(Boolean, server_default=text("true"))
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), server_default=text("CURRENT_TIMESTAMP"))
+
+
 class LendingPendingAction(LendingBase):
     """One external send Cora drafted, frozen until an approver clicks (packages/agent_core/pending_actions.py)."""
 

@@ -21,6 +21,10 @@ class ChatPort(Protocol):
 
     def update(self, *, channel: str, ts: str, text: str, blocks: list[dict] | None = None) -> PostResult: ...
 
+    def replies(self, *, channel: str, thread_ts: str, limit: int) -> list[dict[str, Any]]: ...
+
+    def history(self, *, channel: str, limit: int) -> list[dict[str, Any]]: ...
+
 
 @dataclass
 class FakeChatPort:
@@ -29,6 +33,14 @@ class FakeChatPort:
     default_channel: str = "C_TEST"
     posts: list[dict[str, Any]] = field(default_factory=list)
     updates: list[dict[str, Any]] = field(default_factory=list)
+    threads: dict[tuple[str, str], list[dict[str, Any]]] = field(default_factory=dict)
+    channels: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+
+    def replies(self, *, channel: str, thread_ts: str, limit: int) -> list[dict[str, Any]]:
+        return list(self.threads.get((channel, thread_ts), []))[-limit:]
+
+    def history(self, *, channel: str, limit: int) -> list[dict[str, Any]]:
+        return list(self.channels.get(channel, []))[-limit:]
 
     def post(self, *, text: str, blocks: list[dict] | None = None, channel: str | None = None,
              thread_ts: str | None = None) -> PostResult:
@@ -74,3 +86,21 @@ class SlackChatPort:
             logger.error("slack chat.update on %s failed (%s)", channel, type(exc).__name__)
             return PostResult(ok=False, channel=channel, ts=ts)
         return PostResult(ok=bool(response.get("ok")), channel=channel, ts=ts)
+
+    def replies(self, *, channel: str, thread_ts: str, limit: int) -> list[dict[str, Any]]:
+        """The thread's latest messages, oldest first. Empty on failure: the agent answers without history."""
+        try:
+            response = self._web.conversations_replies(channel=channel, ts=thread_ts, limit=200)
+        except Exception as exc:
+            logger.warning("slack conversations.replies on %s failed (%s)", channel, type(exc).__name__)
+            return []
+        return list(response.get("messages") or [])[-limit:]
+
+    def history(self, *, channel: str, limit: int) -> list[dict[str, Any]]:
+        """The channel's latest top-level messages, oldest first. Empty on failure."""
+        try:
+            response = self._web.conversations_history(channel=channel, limit=limit)
+        except Exception as exc:
+            logger.warning("slack conversations.history on %s failed (%s)", channel, type(exc).__name__)
+            return []
+        return list(reversed(response.get("messages") or []))
