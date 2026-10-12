@@ -76,8 +76,16 @@ class ToolOutcome:
     action_id: int | None = None
 
 
+@dataclass(frozen=True)
+class QueuedDraft:
+    """A draft frozen into ``pending_actions``; ``card_posted`` is False when Slack refused the card."""
+
+    action_id: int
+    card_posted: bool
+
+
 class DraftSubmitter(Protocol):
-    def submit(self, draft: EgressDraft, *, tool_name: str, context: ToolContext) -> int: ...
+    def submit(self, draft: EgressDraft, *, tool_name: str, context: ToolContext) -> QueuedDraft: ...
 
 
 def _render(result: Any) -> str:
@@ -135,9 +143,15 @@ class ToolRegistry:
         draft = tool.handler(arguments, context)
         if not isinstance(draft, EgressDraft):
             raise TypeError(f"egress tool {tool.name} must return an EgressDraft")
-        action_id = self.gate.submit(draft, tool_name=tool.name, context=context)
+        queued = self.gate.submit(draft, tool_name=tool.name, context=context)
+        if not queued.card_posted:
+            return ToolOutcome(
+                f"Saved as action #{queued.action_id}, but the approval card could not be posted to Slack yet. "
+                "It will be retried automatically. Tell the user the card is delayed; nothing has been sent.",
+                action_id=queued.action_id,
+            )
         return ToolOutcome(
-            f"Queued for approval as action #{action_id}. Nothing has been sent; an approver must click "
+            f"Queued for approval as action #{queued.action_id}. Nothing has been sent; an approver must click "
             "Approve on the card first.",
-            action_id=action_id,
+            action_id=queued.action_id,
         )

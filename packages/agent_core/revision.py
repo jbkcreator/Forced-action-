@@ -17,6 +17,7 @@ from .agent_loop import MessagesClient
 from .governance import compile_system_prompt
 from .pending_actions import PendingAction, PendingActionQueue
 from .send_gate import SendGate
+from .tools import QueuedDraft
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +43,8 @@ class DraftReviser:
     rules_provider: Callable[[], Sequence[str]]
     editable_fields: Mapping[str, tuple[str, ...]]
 
-    def revise(self, action: PendingAction, instruction: str, user_id: str) -> int:
-        """Apply the instruction to ``action`` and post a fresh card. Returns the action id."""
+    def revise(self, action: PendingAction, instruction: str, user_id: str) -> QueuedDraft:
+        """Apply the instruction to ``action`` and post a fresh card (the sweep retries it if Slack refuses)."""
         fields = self.editable_fields.get(action.channel)
         if not fields:
             raise RevisionFailed(f"drafts on channel {action.channel} have no editable fields")
@@ -71,6 +72,6 @@ class DraftReviser:
         if not self.queue.apply_revision(action.action_id, payload=payload, summary=action.summary,
                                          note=instruction[:_NOTE_LIMIT]):
             raise RevisionFailed("the draft is no longer open for revision")
-        self.gate.post_card(action.action_id)
-        logger.info("revision: action %s redrafted for %s", action.action_id, user_id)
-        return action.action_id
+        card_posted = self.gate.post_card(action.action_id)
+        logger.info("revision: action %s redrafted for %s (card posted: %s)", action.action_id, user_id, card_posted)
+        return QueuedDraft(action.action_id, card_posted)

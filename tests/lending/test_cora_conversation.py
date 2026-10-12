@@ -11,8 +11,9 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import StaticPool
 
-from packages.agent_core.chatport import FakeChatPort
+from packages.agent_core.chatport import FakeChatPort, PostResult
 from packages.agent_core.config import AgentCoreConfig
+from packages.agent_core.memory import MAX_ACTIVE_RULES, AgentMemory
 from packages.agent_core.pending_actions import ActionStatus, PendingActionQueue
 from packages.agent_core.store import AgentStore
 from src.lending import cora_agent
@@ -48,8 +49,9 @@ class Cora:
     def __init__(self, store: AgentStore, client: FakeMessages) -> None:
         self.chat = FakeChatPort(default_channel="C_CORA")
         self.client = client
-        self.session, self.relay = cora_agent.build_session(_config(), store, self.chat, BOT, messages_client=client,
-                                                            toolkit_factory=_toolkit_factory)
+        self.services = cora_agent.build_session(_config(), store, self.chat, BOT, messages_client=client,
+                                                 toolkit_factory=_toolkit_factory)
+        self.session, self.relay = self.services.session, self.services.relay
         self.queue = PendingActionQueue(store)
 
     def say(self, user: str, message_text: str, ts: str, thread_ts: str | None = None) -> None:
@@ -190,6 +192,67 @@ def test_revise_reply_redrafts_and_posts_a_fresh_card(store: AgentStore) -> None
     assert action.payload["to_phone"] == "+17275550100"
     assert action.card_ts and action.card_ts != first_card
     assert "Revised action #1" in cora.chat.posts[-1]["text"]
+
+
+class SlackRefusesCards(FakeChatPort):
+    """Slack that rejects messages carrying blocks (approval cards) until ``recover()`` is called."""
+
+    def __init__(self) -> None:
+        super().__init__(default_channel="C_CORA")
+        self.refusing = True
+
+    def post(self, *, text, blocks=None, channel=None, thread_ts=None) -> PostResult:
+        if blocks and self.refusing:
+            return PostResult(ok=False, channel=channel)
+        return super().post(text=text, blocks=blocks, channel=channel, thread_ts=thread_ts)
+
+
+def test_failed_card_post_is_reported_and_retried_by_the_sweep(store: AgentStore) -> None:
+    cora = Cora(store, FakeMessages(
+        response(tool_block("toolu_s", "draft_sms", {"lead_ref": "web_lead:7", "body": "Hi Sam"}), stop_reason="tool_use"),
+        response(text_block("The approval card is delayed; I'll get it posted.")),
+    ))
+    slack = SlackRefusesCards()
+    cora.chat = slack
+    cora.services = cora_agent.build_session(_config(), store, slack, BOT, messages_client=cora.client,
+                                             toolkit_factory=_toolkit_factory)
+    cora.session = cora.services.session
+    cora.say(JOSH, "text Sam", ts="90.0")
+
+    tool_result = cora.client.requests[1]["messages"][-1]["content"][0]["content"]
+    assert "could not be posted" in tool_result and "Queued for approval" not in tool_result
+    assert cora.queue.get(1).card_ts is None
+
+    cora_agent.run_sweep(cora.services)  # Slack still down: nothing posted, nothing lost
+    assert cora.queue.get(1).card_ts is None
+    slack.refusing = False
+    cora_agent.run_sweep(cora.services)
+    action = cora.queue.get(1)
+    assert action.card_ts and action.status is ActionStatus.PENDING
+    cora_agent.run_sweep(cora.services)  # posted once, not again
+    assert len([post for post in slack.posts if post["blocks"]]) == 1
+
+
+def test_save_beyond_the_rule_limit_is_refused_and_the_newest_rules_apply(store: AgentStore) -> None:
+    memory = AgentMemory(store)
+    for number in range(MAX_ACTIVE_RULES - 1):
+        memory.save_rule(category="messaging", rule_text=f"Rule number {number}", source_thread_ts=None)
+    cora = Cora(store, FakeMessages(
+        response(tool_block("t1", "save_standing_rule", {"category": "messaging", "rule_text": "The newest rule"}),
+                 stop_reason="tool_use"),
+        response(tool_block("t2", "save_standing_rule", {"category": "messaging", "rule_text": "One rule too many"}),
+                 stop_reason="tool_use"),
+        response(text_block("Saved the first; the second needs a rule removed first.")),
+        response(text_block("ok")),
+    ))
+    cora.say(JOSH, "save two rules", ts="95.0")
+    results = [m["content"][0] for m in cora.client.requests[2]["messages"] if m["role"] == "user"
+               and isinstance(m["content"], list)]
+    assert not results[0]["is_error"]
+    assert results[1]["is_error"] and "deactivate" in results[1]["content"]
+    cora.say(JOSH, "anything", ts="96.0")
+    assert "- The newest rule" in cora.client.requests[-1]["system"]
+    assert "One rule too many" not in cora.client.requests[-1]["system"]
 
 
 def test_model_outage_gets_a_plain_reply(store: AgentStore) -> None:

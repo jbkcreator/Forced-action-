@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from packages.agent_core.memory import AgentMemory
+import pytest
+from sqlalchemy import text
+
+from packages.agent_core.memory import MAX_ACTIVE_RULES, AgentMemory, MemoryFull
 from packages.agent_core.store import AgentStore
 from packages.agent_core.thread_history import build_history
 
@@ -27,6 +30,35 @@ def test_identical_rule_is_not_duplicated(store: AgentStore) -> None:
     second, created = memory.save_rule(category="scheduling", rule_text="never TEXT before 9am ", source_thread_ts="2")
     assert not created and second.memory_id == first.memory_id
     assert len(memory.active_rules()) == 1
+
+
+def test_every_active_rule_is_loaded_even_past_the_cap(store: AgentStore) -> None:
+    """Rules that got in some other way (or before the cap existed) are never silently dropped."""
+    with store.transaction() as conn:
+        for number in range(MAX_ACTIVE_RULES + 10):
+            conn.execute(text("INSERT INTO agent_memory (memory_id, category, rule_text, is_active, created_at) "
+                              "VALUES (:id, 'messaging', :rule, 1, :at)"),
+                         {"id": f"00000000-0000-0000-0000-{number:012d}", "rule": f"Rule {number}",
+                          "at": f"2026-10-01 00:{number // 60:02d}:{number % 60:02d}"})
+    rules = AgentMemory(store).active_rules()
+    assert len(rules) == MAX_ACTIVE_RULES + 10
+    assert rules[-1].rule_text == f"Rule {MAX_ACTIVE_RULES + 9}"
+
+
+def test_saving_past_the_cap_is_refused_not_silently_ignored(store: AgentStore) -> None:
+    memory = AgentMemory(store)
+    for number in range(MAX_ACTIVE_RULES):
+        memory.save_rule(category="messaging", rule_text=f"Rule {number}", source_thread_ts=None)
+    with pytest.raises(MemoryFull, match="deactivate one"):
+        memory.save_rule(category="messaging", rule_text="One too many", source_thread_ts=None)
+    assert "One too many" not in [r.rule_text for r in memory.active_rules()]
+
+    _, created = memory.save_rule(category="messaging", rule_text=f"rule {MAX_ACTIVE_RULES - 1}", source_thread_ts=None)
+    assert not created  # a duplicate of the newest rule is still recognised at the cap
+
+    memory.deactivate_rule(memory.active_rules()[0].memory_id)
+    _, created = memory.save_rule(category="messaging", rule_text="One too many", source_thread_ts=None)
+    assert created
 
 
 def test_rule_survives_into_a_new_memory_instance(store: AgentStore) -> None:

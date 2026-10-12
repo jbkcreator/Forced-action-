@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from pydantic import BaseModel, ConfigDict, Field
 
-from packages.agent_core.chatport import FakeChatPort
+from packages.agent_core.chatport import FakeChatPort, PostResult
 from packages.agent_core.governance import SafetyLevel
 from packages.agent_core.pending_actions import ActionStatus, PendingActionQueue
 from packages.agent_core.send_gate import SendGate
@@ -114,6 +114,48 @@ def test_repeated_tool_call_queues_one_action_and_one_card(harness: Harness, que
     assert first.action_id == second.action_id
     assert len(harness.chat.posts) == 1
     assert queue.get(first.action_id).payload["body"] == "Hi"
+
+
+class SlackDown(FakeChatPort):
+    def __init__(self) -> None:
+        super().__init__(default_channel="C_CORA")
+        self.down = True
+
+    def post(self, *, text, blocks=None, channel=None, thread_ts=None) -> PostResult:
+        if self.down:
+            return PostResult(ok=False, channel=channel)
+        return super().post(text=text, blocks=blocks, channel=channel, thread_ts=thread_ts)
+
+
+def test_failed_card_is_reported_honestly_then_retried(queue: PendingActionQueue, clock) -> None:
+    slack = SlackDown()
+    gate = SendGate(queue, slack, "C_CORA")
+    registry = ToolRegistry([Tool("draft_sms", "x", SmsInput, SafetyLevel.EXTERNAL_EGRESS,
+                                  lambda a, c: EgressDraft(channel="ghl_sms", payload={"body": a.body}, summary="s"))],
+                            gate)
+    outcome = registry.execute("draft_sms", {"body": "Hi"}, _context())
+    assert "could not be posted" in outcome.content and "Queued for approval" not in outcome.content
+    assert queue.awaiting_card() == [outcome.action_id]
+
+    assert gate.retry_missing_cards() == 0  # still down: stays waiting, nothing lost
+    slack.down = False
+    assert gate.retry_missing_cards() == 1
+    assert queue.get(outcome.action_id).card_ts == slack.posts[-1]["ts"]
+    assert queue.awaiting_card() == [] and gate.retry_missing_cards() == 0
+
+
+def test_expired_or_decided_drafts_are_not_reposted(queue: PendingActionQueue, clock) -> None:
+    from datetime import timedelta
+
+    slack = SlackDown()
+    gate = SendGate(queue, slack, "C_CORA")
+    stale = queue.enqueue(tool_name="t", channel="ghl_sms", payload={}, summary="s", ttl=timedelta(hours=1))
+    rejected = queue.enqueue(tool_name="t", channel="ghl_sms", payload={}, summary="s")
+    queue.reject(rejected, APPROVER)
+    clock.advance(timedelta(hours=2))
+    slack.down = False
+    assert gate.retry_missing_cards() == 0
+    assert slack.posts == [] and stale
 
 
 def test_egress_handler_returning_the_wrong_type_is_an_error(queue: PendingActionQueue) -> None:

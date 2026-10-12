@@ -14,6 +14,7 @@ from src.lending.cora_tools import (
     DraftSmsInput,
     _Lead,
     check_read_only_sql,
+    relations_outside_schema,
 )
 
 CONTEXT = ToolContext(user_id="U_JOSH", is_approver=True, channel="C", thread_ts="1.0", tool_use_id="toolu_1")
@@ -41,10 +42,60 @@ def test_read_only_lookups_are_allowed(sql: str) -> None:
     ("SELECT pg_read_file('/etc/passwd')", "not allowed"),
     ("SELECT pg_sleep(30)", "not allowed"),
     ("SELECT * FROM lending.web_leads w JOIN properties p ON true", "only lending"),
+    ("SELECT * FROM lending.web_leads, public.subscribers", "only lending"),
+    ("SELECT * FROM lending.web_leads w, subscribers s WHERE s.id = w.id", "only lending"),
+    ("SELECT * FROM lending.web_leads AS w , lending.contacts c, public.users u", "only lending"),
+    ("SELECT count(*) FROM (SELECT 1 FROM lending.contacts) x, public.subscribers", "only lending"),
 ])
 def test_writes_other_schemas_and_server_functions_are_refused(sql: str, reason: str) -> None:
     with pytest.raises(ToolInputError, match=reason):
         check_read_only_sql(sql)
+
+
+def test_comma_list_of_lending_tables_is_allowed() -> None:
+    sql = "SELECT count(*) FROM lending.web_leads w, lending.contacts c WHERE c.phone = w.phone"
+    assert check_read_only_sql(sql) == sql
+
+
+def _scan(schema: str, relation: str) -> dict:
+    return {"Node Type": "Seq Scan", "Schema": schema, "Relation Name": relation}
+
+
+def test_query_plan_check_finds_every_table_outside_lending() -> None:
+    plan = [{"Plan": {"Node Type": "Nested Loop", "Plans": [
+        _scan("lending", "web_leads"),
+        {"Node Type": "Subquery Scan", "Plans": [_scan("public", "subscribers")]},
+        {"Node Type": "Hash", "Plans": [_scan("pg_catalog", "pg_authid")]},
+    ]}}]
+    assert relations_outside_schema(plan) == {"public.subscribers", "pg_catalog.pg_authid"}
+    assert relations_outside_schema([{"Plan": _scan("lending", "contacts")}]) == set()
+
+
+def test_query_tool_refuses_a_plan_that_reads_outside_lending(monkeypatch) -> None:
+    plan = [{"Plan": _scan("public", "subscribers")}]
+    executed: list[str] = []
+
+    class FakeSession:
+        def execute(self, statement, *args):
+            executed.append(str(statement))
+            return type("R", (), {"scalar": lambda self: plan})()
+
+    toolkit = CoraToolkit(engine=None, memory=None)  # type: ignore[arg-type]
+    monkeypatch.setattr(toolkit, "_read_only", lambda: _context_manager(FakeSession()))
+    with pytest.raises(ToolInputError, match="public.subscribers"):
+        toolkit.query_lending_data(cora_tools.QueryInput(sql="SELECT * FROM lending.web_leads_view"), CONTEXT)
+    assert len(executed) == 1 and executed[0].startswith("EXPLAIN")  # the query itself never ran
+
+
+class _context_manager:
+    def __init__(self, value) -> None:
+        self._value = value
+
+    def __enter__(self):
+        return self._value
+
+    def __exit__(self, *exc) -> bool:
+        return False
 
 
 def _toolkit(monkeypatch, lead: _Lead | None) -> CoraToolkit:

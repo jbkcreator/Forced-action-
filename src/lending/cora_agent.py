@@ -16,7 +16,7 @@ import logging
 import threading
 from collections.abc import Callable
 from datetime import timedelta
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -65,6 +65,12 @@ _SUPPRESSED = text("""
 """)
 
 _MODEL_UNAVAILABLE = "I couldn't reach my language model just now. Nothing was sent; please try again in a minute."
+
+
+class CoraServices(NamedTuple):
+    session: SlackSession
+    relay: Relay
+    gate: SendGate
 
 
 def _secret(value) -> Optional[str]:
@@ -168,8 +174,11 @@ class CoraConversation:
 
     def on_revision(self, action: PendingAction, message: InboundMessage) -> None:
         try:
-            self._reviser.revise(action, message.text, message.user_id)
-            answer = f"Revised action #{action.action_id}. A fresh approval card is posted; nothing has been sent."
+            queued = self._reviser.revise(action, message.text, message.user_id)
+            answer = (f"Revised action #{action.action_id}. A fresh approval card is posted; nothing has been sent."
+                      if queued.card_posted else
+                      f"Revised action #{action.action_id}, but Slack refused the new approval card; it will be "
+                      "retried automatically. Nothing has been sent.")
         except RevisionFailed as error:
             answer = (f"I couldn't revise action #{action.action_id} ({error}). Reply with another instruction, "
                       "or say `cancel` to keep the draft as it is.")
@@ -184,7 +193,7 @@ class CoraConversation:
 
 def build_session(config: AgentCoreConfig, store: AgentStore, chat: ChatPort, bot_user_id: str, *,
                   messages_client: MessagesClient, send_check: Optional[SendCheck] = None,
-                  toolkit_factory: Callable[[Engine, AgentMemory], Any] = CoraToolkit) -> tuple[SlackSession, Relay]:
+                  toolkit_factory: Callable[[Engine, AgentMemory], Any] = CoraToolkit) -> CoraServices:
     """Wire Cora. ``toolkit_factory(engine, memory)`` builds the tool set; tests swap the lead lookups."""
     queue = PendingActionQueue(store, default_ttl=timedelta(hours=config.pending_action_ttl_hours))
     halt = HaltSwitch(store, config.agent_name)
@@ -204,14 +213,19 @@ def build_session(config: AgentCoreConfig, store: AgentStore, chat: ChatPort, bo
     session = SlackSession(config=config, chat=chat, queue=queue, halt=halt, relay=relay,
                            on_message=conversation.on_message, on_revision=conversation.on_revision,
                            bot_user_id=bot_user_id)
-    return session, relay
+    return CoraServices(session, relay, gate)
 
 
-def run_sweep(session: SlackSession, relay: Relay) -> None:
-    """One pass: expire stale drafts (always, even while halted), then send approved actions."""
-    expired = session.expire_stale_actions()
+def run_sweep(services: CoraServices) -> None:
+    """One pass: expire stale drafts and retry missing approval cards (always, even while halted),
+    then send approved actions."""
+    expired = services.session.expire_stale_actions()
     if expired:
         logger.info("[cora] expired %s stale draft(s)", expired)
+    reposted = services.gate.retry_missing_cards()
+    if reposted:
+        logger.info("[cora] posted %s delayed approval card(s)", reposted)
+    relay = services.relay
     try:
         result = relay.run()
     except AgentHalted:
@@ -220,10 +234,10 @@ def run_sweep(session: SlackSession, relay: Relay) -> None:
         logger.info("[cora] relay sweep sent=%s failed=%s blocked=%s", result.sent, result.failed, result.blocked)
 
 
-def _sweep_forever(session: SlackSession, relay: Relay, stop: threading.Event) -> None:
+def _sweep_forever(services: CoraServices, stop: threading.Event) -> None:
     while not stop.wait(SWEEP_SECONDS):
         try:
-            run_sweep(session, relay)
+            run_sweep(services)
         except Exception as exc:
             logger.error("[cora] sweep failed (%s); retrying next interval", type(exc).__name__)
 
@@ -254,12 +268,12 @@ def main() -> int:
     engine = create_engine(settings.database_url, pool_pre_ping=True)
     store = AgentStore(engine, config.db_schema)
     messages_client = anthropic.Anthropic(api_key=config.anthropic_api_key, timeout=90.0, max_retries=2).messages
-    session, relay = build_session(config, store, SlackChatPort(web, config.slack_channel_id), bot_user_id,
-                                   messages_client=messages_client, send_check=make_send_check(engine))
+    services = build_session(config, store, SlackChatPort(web, config.slack_channel_id), bot_user_id,
+                             messages_client=messages_client, send_check=make_send_check(engine))
     stop = threading.Event()
-    threading.Thread(target=_sweep_forever, args=(session, relay, stop), name="cora-sweep", daemon=True).start()
+    threading.Thread(target=_sweep_forever, args=(services, stop), name="cora-sweep", daemon=True).start()
     logger.info("[cora] starting Socket Mode session as %s (model %s)", bot_user_id, config.model)
-    run_socket_mode(session, app_token=config.slack_app_token, web_client=web)
+    run_socket_mode(services.session, app_token=config.slack_app_token, web_client=web)
     return 0
 
 

@@ -8,6 +8,7 @@ number or address) and return an :class:`EgressDraft` for the send gate.
 """
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -23,7 +24,7 @@ from sqlalchemy.orm import Session
 
 from config.lending_compliance import DEFAULT_TZ
 from packages.agent_core.governance import SafetyLevel
-from packages.agent_core.memory import AgentMemory
+from packages.agent_core.memory import AgentMemory, MemoryFull
 from packages.agent_core.tools import EgressDraft, Tool, ToolContext, ToolInputError
 from src.lending.contracts import BorrowerProfile, LoanRequest
 from src.lending.lender_fit import evaluate_lender_fit
@@ -44,7 +45,16 @@ _SQL_FORBIDDEN = re.compile(
     r"|\bpg_\w+\s*\(|\bdblink\b|\blo_\w+\s*\(|\binto\b",
     re.IGNORECASE,
 )
-_SQL_RELATION = re.compile(r"\b(?:from|join)\s+([a-zA-Z_\"][\w\".]*)", re.IGNORECASE)
+_SQL_JOINED = re.compile(r"\bjoin\s+(?:lateral\s+)?([a-zA-Z_\"][\w\".]*)", re.IGNORECASE)
+_SQL_FROM = re.compile(r"\bfrom\b", re.IGNORECASE)
+_SQL_PAREN_GROUP = re.compile(r"\([^()]*\)")
+_SUBQUERY_MARK = "__group__"
+# Where a FROM list ends: the next clause keyword, a join, or the subquery's closing parenthesis.
+_SQL_FROM_LIST_END = re.compile(
+    r"\b(?:where|group|order|limit|having|union|intersect|except|window|offset|fetch|on|using|join|inner|"
+    r"left|right|full|cross|natural)\b|\)",
+    re.IGNORECASE,
+)
 
 LENDING_TABLES_HELP = (
     "Tables (schema lending): call_dispositions (one row per dialer call: caller_name, phone, disposition, "
@@ -149,6 +159,33 @@ def _iso(value: Any) -> Any:
     return value.isoformat() if isinstance(value, (datetime, date)) else value
 
 
+def _named_relations(statement: str) -> list[str]:
+    """Every table name written after FROM (including comma-separated lists) or JOIN.
+
+    A quick, readable first check. The authoritative one is :func:`relations_outside_schema` over
+    PostgreSQL's own query plan, which also sees through views and nested subqueries.
+    """
+    # Peel parenthesised groups innermost-first so each level's FROM list reads as one flat run:
+    # "FROM (SELECT ... FROM a) x, b" is scanned as "SELECT ... FROM a" and "FROM <group> x, b".
+    pieces, remaining = [], statement
+    while (group := _SQL_PAREN_GROUP.search(remaining)) is not None:
+        pieces.append(group.group()[1:-1])
+        remaining = f"{remaining[:group.start()]} {_SUBQUERY_MARK} {remaining[group.end():]}"
+    pieces.append(remaining)
+
+    names: list[str] = []
+    for piece in pieces:
+        names.extend(_SQL_JOINED.findall(piece))
+        for match in _SQL_FROM.finditer(piece):
+            rest = piece[match.end():]
+            end = _SQL_FROM_LIST_END.search(rest)
+            for item in rest[: end.start() if end else len(rest)].split(","):
+                words = item.split()
+                if words and words[0] != _SUBQUERY_MARK:
+                    names.append(words[0])
+    return names
+
+
 def check_read_only_sql(sql: str) -> str:
     """Return the statement to run, or raise ToolInputError explaining why it is refused."""
     statement = sql.strip().rstrip(";").strip()
@@ -159,12 +196,27 @@ def check_read_only_sql(sql: str) -> str:
     if _SQL_FORBIDDEN.search(statement):
         raise ToolInputError("the query uses a keyword or function that is not allowed in a read-only lookup")
     cte_names = {name.lower() for name in re.findall(r"\b(\w+)\s+as\s*\(", statement, re.IGNORECASE)}
-    for relation in _SQL_RELATION.findall(statement):
+    for relation in _named_relations(statement):
         cleaned = relation.replace('"', "").lower()
         if cleaned in cte_names or cleaned.startswith("lending."):
             continue
         raise ToolInputError(f"only lending.* tables can be queried (found {relation})")
     return statement
+
+
+def relations_outside_schema(plan: Any, schema: str = "lending") -> set[str]:
+    """Tables a PostgreSQL ``EXPLAIN (VERBOSE, FORMAT JSON)`` plan reads outside ``schema``."""
+    found: set[str] = set()
+    stack = [plan]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            if "Relation Name" in node and node.get("Schema") != schema:
+                found.add(f"{node.get('Schema')}.{node['Relation Name']}")
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return found
 
 
 class CoraToolkit:
@@ -309,6 +361,11 @@ class CoraToolkit:
     def query_lending_data(self, args: QueryInput, _: ToolContext) -> dict[str, Any]:
         statement = check_read_only_sql(args.sql)
         with self._read_only() as session:
+            # EXPLAIN plans without executing; the plan names every table the query would really read.
+            plan = session.execute(text(f"EXPLAIN (VERBOSE, FORMAT JSON) {statement}")).scalar()
+            outside = relations_outside_schema(json.loads(plan) if isinstance(plan, str) else plan)
+            if outside:
+                raise ToolInputError(f"only lending.* tables can be queried (the query reads {sorted(outside)})")
             result = session.execute(text(f"SELECT * FROM ({statement}) AS cora_query LIMIT {MAX_ROWS}"))
             columns = list(result.keys())
             rows = [{column: _iso(value) for column, value in zip(columns, row)} for row in result.all()]
@@ -317,8 +374,11 @@ class CoraToolkit:
     # -- memory --------------------------------------------------------------------------
 
     def save_rule(self, args: SaveRuleInput, context: ToolContext) -> dict[str, Any]:
-        rule, created = self._memory.save_rule(category=args.category, rule_text=args.rule_text,
-                                               source_thread_ts=context.thread_ts)
+        try:
+            rule, created = self._memory.save_rule(category=args.category, rule_text=args.rule_text,
+                                                   source_thread_ts=context.thread_ts)
+        except MemoryFull as error:
+            raise ToolInputError(f"{error}; list_standing_rules shows them, deactivate_standing_rule removes one") from error
         return {"memory_id": rule.memory_id, "saved": created,
                 "note": "saved; confirm it to the user" if created else "an identical active rule already exists"}
 
