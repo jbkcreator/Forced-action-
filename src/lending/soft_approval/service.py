@@ -15,13 +15,19 @@ from typing import Callable, Mapping, Optional
 
 from config.lender_matrix import LENDER_MATRIX, LenderRules
 from config.lending_soft_approval import (
+    DEMO_LENDER_KEY,
+    DEMO_PARAMS,
+    DEMO_RULES,
+    DEMO_SOFT_APPROVAL_WATERMARK,
+    DEMO_TEMPLATE_VERSION,
     NON_BINDING_SOFT_APPROVAL_WATERMARK,
     SOFT_APPROVAL_LOAN_TYPES,
     SOFT_APPROVAL_PARAMS,
     SOFT_APPROVAL_TEMPLATE,
     SoftApprovalParams,
 )
-from src.lending.contracts import LenderFitEvaluator, LoanRequest
+from config.settings import get_settings
+from src.lending.contracts import LenderFit, LenderFitEvaluator, LenderFitResult, LoanRequest, LoanType
 from src.lending.lender_fit import evaluate_lender_fit
 from src.lending.pdf.render import render_pdf
 from src.lending.soft_approval.calc import CalculationUnavailable, LenderTerms, SoftApprovalFigures, calculate_figures
@@ -51,8 +57,25 @@ def _matrix_rules_lookup(key: str) -> Optional[LenderRules]:
     return next((rules for rules in LENDER_MATRIX if rules.key == key), None)
 
 
+class DemoLenderFitEvaluator:
+    """TEST ONLY: the invented demo lender fits every fix-and-flip request, nothing else."""
+
+    def evaluate(self, borrower_profile, loan_request):
+        if loan_request.loan_type is not LoanType.FIX_AND_FLIP:
+            return LenderFitResult(fitting=[])
+        return LenderFitResult(fitting=[LenderFit(lender_key=DEMO_LENDER_KEY, lender_name=DEMO_RULES.name)])
+
+
+def _demo_rules_lookup(key: str) -> Optional[LenderRules]:
+    return DEMO_RULES if key == DEMO_LENDER_KEY else None
+
+
 def _default_renderer(context: dict) -> bytes:
     return render_pdf(SOFT_APPROVAL_TEMPLATE, context, watermark=NON_BINDING_SOFT_APPROVAL_WATERMARK)
+
+
+def _demo_renderer(context: dict) -> bytes:
+    return render_pdf(SOFT_APPROVAL_TEMPLATE, context, watermark=DEMO_SOFT_APPROVAL_WATERMARK)
 
 
 @dataclass(frozen=True)
@@ -61,6 +84,8 @@ class SoftApprovalOutcome:
     reason: Optional[str]
     approval_id: Optional[int]
     lender_key: Optional[str] = None
+    pdf: Optional[bytes] = None
+    demo: bool = False
 
 
 def _money(value: Decimal) -> str:
@@ -108,23 +133,30 @@ def generate_soft_approval(
     submitted_by: Optional[str],
     lead_source: Optional[LeadProfileSource] = None,
     evaluator: Optional[LenderFitEvaluator] = None,
-    rules_lookup: RulesLookup = _matrix_rules_lookup,
-    params: Mapping[str, SoftApprovalParams] = SOFT_APPROVAL_PARAMS,
-    renderer: Renderer = _default_renderer,
+    rules_lookup: Optional[RulesLookup] = None,
+    params: Optional[Mapping[str, SoftApprovalParams]] = None,
+    renderer: Optional[Renderer] = None,
     now: Optional[datetime] = None,
 ) -> SoftApprovalOutcome:
     """Evaluate, render and store. Commits nothing; the caller owns the transaction."""
     lead_source = lead_source or default_lead_source()
+    demo = evaluator is None and get_settings().lending_soft_approval_demo_lender  # TEST ONLY switch, off by default
+    if demo:
+        logger.warning("[soft-approval] call=%s DEMO lender in use: the figures come from invented rules", dialer_call_id)
+        evaluator = DemoLenderFitEvaluator()
     evaluator = evaluator or MatrixLenderFitEvaluator()
+    rules_lookup = rules_lookup or (_demo_rules_lookup if demo else _matrix_rules_lookup)
+    params = params if params is not None else (DEMO_PARAMS if demo else SOFT_APPROVAL_PARAMS)
+    renderer = renderer or (_demo_renderer if demo else _default_renderer)
 
     def finish(status, reason, *, figures=None, lender_key=None, pdf=None):
         approval_id = save_soft_approval(
             db, phone=phone, dialer_call_id=dialer_call_id, status=status, reason=reason, facts=facts,
             figures=figures, lender_key=lender_key, pdf=pdf,
-            template_version=TEMPLATE_VERSION if pdf else None, submitted_by=submitted_by,
+            template_version=(DEMO_TEMPLATE_VERSION if demo else TEMPLATE_VERSION) if pdf else None, submitted_by=submitted_by,
         )
         logger.info("[soft-approval] call=%s status=%s reason=%s", dialer_call_id, status, reason)
-        return SoftApprovalOutcome(status, reason, approval_id, lender_key)
+        return SoftApprovalOutcome(status, reason, approval_id, lender_key, pdf=pdf, demo=demo)
 
     lead = lead_source.for_phone(db, phone)
     if lead is None:

@@ -50,8 +50,24 @@ def _open_form(payload: dict) -> None:
         logger.error("[soft-approval] opening the form failed: %s", type(exc).__name__)
 
 
+def _post_status(call_id: str, channel: str, message_ts: str, status_text: str, pdf: Optional[bytes]) -> None:
+    """The thread reply: the PDF attached when LENDING_SOFT_APPROVAL_SLACK_PDF is on, else (or if the upload fails) text only."""
+    client = slack_client()
+    if pdf and get_settings().lending_soft_approval_slack_pdf:
+        try:
+            client.files_upload_v2(
+                channel=channel, thread_ts=message_ts, file=pdf, filename=f"soft-approval-{call_id}.pdf",
+                title="Soft approval summary", initial_comment=status_text)
+            return
+        except Exception as exc:
+            logger.error("[soft-approval] call %s PDF upload failed: %s", call_id, type(exc).__name__)
+            status_text += " (The PDF could not be attached to this thread.)"
+    client.chat_postMessage(channel=channel, thread_ts=message_ts, text=status_text)
+
+
 def _process_submission(call_id: str, facts: SoftApprovalFacts, user_id: str, channel: str, message_ts: str) -> None:
     status_text = "The soft approval could not be processed. Please tell the engineering team."
+    pdf: Optional[bytes] = None
     try:
         with lending_session() as db:
             phone = db.execute(
@@ -62,12 +78,14 @@ def _process_submission(call_id: str, facts: SoftApprovalFacts, user_id: str, ch
             else:
                 outcome = generate_soft_approval(
                     db, phone=phone, dialer_call_id=call_id, facts=facts, submitted_by=user_id or None)
-                status_text = OUTCOME_MESSAGES.get(outcome.status, status_text)
+                status_key = "generated_demo" if outcome.demo and outcome.status == "generated" else outcome.status
+                status_text = OUTCOME_MESSAGES.get(status_key, status_text)
+                pdf = outcome.pdf if outcome.status == "generated" else None
     except Exception as exc:  # class only: SQL errors embed bound params (phones)
         logger.error("[soft-approval] call %s submission failed: %s", call_id, type(exc).__name__)
     if channel and message_ts:
         try:
-            slack_client().chat_postMessage(channel=channel, thread_ts=message_ts, text=status_text)
+            _post_status(call_id, channel, message_ts, status_text, pdf)
         except Exception as exc:
             logger.error("[soft-approval] call %s status reply failed: %s", call_id, type(exc).__name__)
 

@@ -36,6 +36,11 @@ Property address, purchase price, rehab budget, estimated ARV, property type (op
 11. **Copy safety:** the PDF shows three dollar estimates plus the facts the borrower gave. It carries no percentages, rates, points, terms or lender names (a test enforces this). The rule comes from Consolidated §5.2 (message generation) and the org policy; applying it to this PDF is our extension. Wording is a placeholder pending review.
 12. **Header block:** `base.html` gained a `header_tag` block so this PDF does not say "Pre-Qualification Estimate". The same one-line change should be made in PR #342 so the two do not conflict.
 
+## Test switches (both off by default)
+
+- `LENDING_SOFT_APPROVAL_DEMO_LENDER=true` — **TEST ONLY.** Adds an invented lender (75% of ARV, 100% purchase and rehab advance) so the whole workflow produces a PDF before Josh confirms real lender rules. The PDF is watermarked "DEMO ONLY — INVENTED LENDER RULES — NOT AN ESTIMATE", the stored row has `lender_key = demo_lender` and `template_version = demo`, and the Slack reply says it is a demo. It applies only when no evaluator is injected and is never part of `LENDER_MATRIX`. Never leave it on in production.
+- `LENDING_SOFT_APPROVAL_SLACK_PDF=true` — attaches the generated PDF to the card's Slack thread (with the status text) so it can be opened and downloaded. Needs the `files:write` bot scope (reinstall the app after adding it). If the upload fails the reply falls back to text with a note. This puts the borrower's property address and the three estimates in the internal #dial-tasks channel, so it is a product decision (open question B11); it is off until confirmed.
+
 ## Operating it
 
 - Migration (idempotent): `PYTHONPATH=. python migrations/apply_lending_soft_approvals.py`

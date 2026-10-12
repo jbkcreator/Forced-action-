@@ -41,6 +41,7 @@ _FIELD_TO_BLOCK = {field: block for block, field in _BLOCKS.items()}
 
 OUTCOME_MESSAGES = {
     "generated": ":white_check_mark: Soft approval PDF is ready and stored for this lead.",
+    "generated_demo": ":white_check_mark: DEMO soft approval PDF stored. The lender rules are invented, so this is not an estimate.",
     "no_lead": ":warning: No LendingFlow lead was found for this call, so no soft approval was made.",
     "no_fit": ":no_entry_sign: No lender fits, so nothing was made.",
     "out_of_scope": ":no_entry_sign: This loan type is not covered by the soft approval yet, so nothing was made.",

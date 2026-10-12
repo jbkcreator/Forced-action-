@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Mapping, Optional
 
+from config.lender_matrix import LenderRules
 from src.lending.contracts import LoanType
 
 NON_BINDING_SOFT_APPROVAL_WATERMARK = "NON-BINDING SOFT APPROVAL ESTIMATE — FOR INFORMATIONAL PURPOSES ONLY"
@@ -18,6 +19,14 @@ SOFT_APPROVAL_TEMPLATE = "soft_approval.html"
 
 # Flip only until Josh confirms bridge sizing; DSCR has no rehab or ARV and construction has no stated ARV cap.
 SOFT_APPROVAL_LOAN_TYPES: frozenset[LoanType] = frozenset({LoanType.FIX_AND_FLIP})
+
+# TEST ONLY (LENDING_SOFT_APPROVAL_DEMO_LENDER): an invented lender so the whole workflow can be shown before Josh confirms
+# real lender rules. Its numbers are made up and its PDF carries a DEMO watermark; it is never part of LENDER_MATRIX.
+DEMO_LENDER_KEY = "demo_lender"
+DEMO_SOFT_APPROVAL_WATERMARK = "DEMO ONLY — INVENTED LENDER RULES — NOT AN ESTIMATE"
+DEMO_TEMPLATE_VERSION = "demo"
+DEMO_RULES = LenderRules(key=DEMO_LENDER_KEY, name="Demo Lender", verified=True,
+                         loan_types=frozenset({LoanType.FIX_AND_FLIP}), max_ltv=Decimal("0.75"))
 
 OPEN_FORM_ACTION_ID = "soft_approval_open"
 FORM_CALLBACK_ID = "soft_approval_form"
@@ -45,4 +54,8 @@ SOFT_APPROVAL_PARAMS: Mapping[str, SoftApprovalParams] = {
     # "Funds up to 100% of rehab" is Josh's Oct 1 wording (client-stated, not confirmed as a lender rule).
     # The purchase advance is not stated anywhere, so this lender stays unusable until Josh gives it.
     "generic_backflip_flip": SoftApprovalParams(rehab_funding_pct=Decimal("1"), purchase_advance_pct=None),
+}
+
+DEMO_PARAMS: Mapping[str, SoftApprovalParams] = {  # invented, TEST ONLY
+    DEMO_LENDER_KEY: SoftApprovalParams(rehab_funding_pct=Decimal("1"), purchase_advance_pct=Decimal("1")),
 }

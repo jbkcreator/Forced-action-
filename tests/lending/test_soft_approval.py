@@ -18,7 +18,7 @@ from pydantic import ValidationError
 from sqlalchemy import text
 
 from config.lender_matrix import LENDER_MATRIX, LenderRules
-from config.lending_soft_approval import SoftApprovalParams
+from config.lending_soft_approval import DEMO_SOFT_APPROVAL_WATERMARK, SoftApprovalParams
 from migrations.apply_lending_lendingflow import apply_to as apply_lendingflow
 from migrations.apply_lending_soft_approvals import apply_to as apply_soft_approvals
 from src.lending import soft_approval_webhook as webhook
@@ -28,7 +28,7 @@ from src.lending.dispositions import RecordedCall
 from src.lending.fakes import FakeLenderFitEvaluator
 from src.lending.models import LendingContact
 from src.lending.pdf.render import render_html
-from src.lending.soft_approval import slack_card
+from src.lending.soft_approval import service, slack_card
 from src.lending.soft_approval.calc import CalculationUnavailable, LenderTerms, calculate_figures
 from src.lending.soft_approval.facts import SoftApprovalFacts
 from src.lending.soft_approval.lead_source import (
@@ -321,6 +321,78 @@ class TestLendingFlowLeadSource:
         assert out.status == "generated" and bytes(_row(soft_db)["pdf"]) == b"%PDF-test"
 
 
+class TestDemoLender:
+    """TEST ONLY switch: invented lender + DEMO watermark, off by default, never overrides an injected evaluator."""
+
+    @staticmethod
+    def _demo(monkeypatch, on):
+        monkeypatch.setattr(service, "get_settings", lambda: SimpleNamespace(lending_soft_approval_demo_lender=on))
+        monkeypatch.setattr(service, "render_pdf", lambda template, ctx, *, watermark: watermark.encode())
+
+    def test_off_by_default_nothing_is_made_up(self, soft_db, monkeypatch):
+        self._demo(monkeypatch, on=False)
+        _flow_lead(soft_db)
+        out = generate_soft_approval(soft_db, phone=PHONE, dialer_call_id="c", facts=FACTS, submitted_by=None)
+        assert out.status in {"no_fit", "terms_unconfirmed"} and out.pdf is None and not out.demo
+
+    def test_on_a_lead_gets_a_marked_demo_pdf(self, soft_db, monkeypatch):
+        self._demo(monkeypatch, on=True)
+        _flow_lead(soft_db)
+        out = generate_soft_approval(soft_db, phone=PHONE, dialer_call_id="c", facts=FACTS, submitted_by="U1")
+        row = _row(soft_db)
+        assert (out.status, out.demo, out.lender_key) == ("generated", True, "demo_lender")
+        assert (row["lender_key"], row["template_version"]) == ("demo_lender", "demo")
+        assert bytes(row["pdf"]).decode() == DEMO_SOFT_APPROVAL_WATERMARK  # rendered with the DEMO watermark
+        assert row["figures"]["net_loan"] == "290000"
+
+    def test_the_demo_never_replaces_an_injected_evaluator(self, soft_db, monkeypatch):
+        self._demo(monkeypatch, on=True)
+        out = _generate(soft_db)
+        assert out.demo is False and _row(soft_db)["template_version"] == "draft-1"
+
+
+class TestSlackPdf:
+    URL = "/webhooks/lending/slack-interactivity"
+
+    @pytest.fixture
+    def demo_flow(self, soft_db, monkeypatch):
+        monkeypatch.setattr(service, "get_settings", lambda: SimpleNamespace(lending_soft_approval_demo_lender=True))
+        monkeypatch.setattr(service, "render_pdf", lambda template, ctx, *, watermark: b"%PDF-demo")
+        _call(soft_db)
+        _flow_lead(soft_db)
+
+    def _submit(self, client):
+        body = _payload({"type": "view_submission", "user": {"id": "U1"}, "view": {
+            "callback_id": "soft_approval_form",
+            "private_metadata": json.dumps({"call_id": "call-1", "channel": "CDIAL", "message_ts": "1.1"}),
+            "state": {"values": _state()}}})
+        assert client.post(self.URL, content=body, headers=_signed(body)).json() == {}
+
+    def test_the_pdf_is_attached_to_the_card_thread_when_the_switch_is_on(self, client, wired, demo_flow, monkeypatch):
+        monkeypatch.setattr(webhook, "get_settings", lambda: _settings(lending_soft_approval_slack_pdf=True))
+        self._submit(client)
+        up = wired.uploads[-1]
+        assert up["file"] == b"%PDF-demo" and up["thread_ts"] == "1.1" and up["channel"] == "CDIAL"
+        assert up["filename"] == "soft-approval-call-1.pdf" and "DEMO" in up["initial_comment"]
+        assert wired.posts == []  # one message: the file with its comment
+
+    def test_text_only_when_the_switch_is_off(self, client, wired, demo_flow):
+        self._submit(client)
+        assert wired.uploads == [] and "DEMO soft approval PDF stored" in wired.posts[-1]["text"]
+
+    def test_a_failed_upload_falls_back_to_the_text_with_a_note(self, client, wired, demo_flow, monkeypatch):
+        monkeypatch.setattr(webhook, "get_settings", lambda: _settings(lending_soft_approval_slack_pdf=True))
+        wired.fail_upload = True
+        self._submit(client)
+        assert wired.uploads == [] and "could not be attached" in wired.posts[-1]["text"]
+
+    def test_nothing_is_uploaded_when_no_pdf_was_made(self, client, wired, soft_db, monkeypatch):
+        monkeypatch.setattr(webhook, "get_settings", lambda: _settings(lending_soft_approval_slack_pdf=True))
+        _call(soft_db)  # no lead for the phone
+        self._submit(client)
+        assert wired.uploads == [] and "No LendingFlow lead" in wired.posts[-1]["text"]
+
+
 class TestTemplate:
     WATERMARK = "NON-BINDING SOFT APPROVAL ESTIMATE — FOR INFORMATIONAL PURPOSES ONLY"
 
@@ -350,7 +422,12 @@ class TestTemplate:
 
 class FakeSlack:
     def __init__(self):
-        self.posts, self.views, self.fail = [], [], False
+        self.posts, self.views, self.uploads, self.fail, self.fail_upload = [], [], [], False, False
+
+    def files_upload_v2(self, **kwargs):
+        if self.fail_upload:
+            raise RuntimeError("missing_scope")
+        self.uploads.append(kwargs)
 
     def chat_postMessage(self, **kwargs):
         if self.fail:
@@ -363,7 +440,8 @@ class FakeSlack:
 
 
 def _settings(**over):
-    base = dict(lending_soft_approval_enabled=True, lending_dial_tasks_channel="CDIAL",
+    base = dict(lending_soft_approval_enabled=True, lending_soft_approval_demo_lender=False,
+                lending_soft_approval_slack_pdf=False, lending_dial_tasks_channel="CDIAL",
                 lending_slack_bot_token=SimpleNamespace(get_secret_value=lambda: "xoxb-test"),
                 lending_slack_signing_secret=SimpleNamespace(get_secret_value=lambda: "sig-secret"))
     base.update(over)

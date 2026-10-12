@@ -960,6 +960,8 @@ class AppSettings(BaseSettings):
 	lending_disposition_sheet_tab: str = Field(default="Dispositions", env="LENDING_DISPOSITION_SHEET_TAB")
 	# Call-One soft approval PDF (T-08): off until Josh approves the template and the calculation inputs.
 	lending_soft_approval_enabled: bool = Field(default=False, env="LENDING_SOFT_APPROVAL_ENABLED")
+	lending_soft_approval_demo_lender: bool = Field(default=False, env="LENDING_SOFT_APPROVAL_DEMO_LENDER")  # TEST ONLY: invented lender rules, DEMO watermark
+	lending_soft_approval_slack_pdf: bool = Field(default=False, env="LENDING_SOFT_APPROVAL_SLACK_PDF")  # attach the generated PDF to the card thread (needs files:write)
 	lending_slack_signing_secret: Optional[SecretStr] = Field(default=None, env="LENDING_SLACK_SIGNING_SECRET")  # verifies Slack interactivity posts to lending-api
 	# ── Lending Cora agent (packages/agent_core, systemd fa-lending-cora) ──
 	# A dedicated Slack app, separate from LENDING_SLACK_BOT_TOKEN (ops alerts). The app token
