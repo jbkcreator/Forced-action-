@@ -7,11 +7,8 @@ every submission stores the submitter's Slack user id.
 """
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import logging
-import time
 from typing import Any, Mapping, Optional
 
 from pydantic import ValidationError
@@ -22,11 +19,10 @@ from config.lending_soft_approval import FORM_CALLBACK_ID, OPEN_FORM_ACTION_ID
 from config.settings import get_settings
 from src.lending.db import lending_session
 from src.lending.dispositions import last4
+from src.lending.slack_signature import SIGNATURE_TOLERANCE_SECONDS, verify_slack_signature  # noqa: F401 - re-exported
 from src.lending.soft_approval.facts import SoftApprovalFacts
 
 logger = logging.getLogger(__name__)
-
-SIGNATURE_TOLERANCE_SECONDS = 300
 
 # modal block id -> field name on SoftApprovalFacts
 _BLOCKS = {
@@ -47,23 +43,6 @@ OUTCOME_MESSAGES = {
     "terms_unconfirmed": ":warning: The matching lender's calculation inputs are not confirmed yet, so nothing was made.",
     "render_failed": ":x: The PDF could not be generated. Please tell the engineering team.",
 }
-
-
-def verify_slack_signature(
-    secret: str, timestamp: Optional[str], signature: Optional[str], body: bytes, *, now: Optional[float] = None,
-) -> bool:
-    """Slack's v0 request signature. False for a missing header, a stale timestamp or a bad digest."""
-    if not secret or not timestamp or not signature:
-        return False
-    try:
-        age = abs((now if now is not None else time.time()) - int(timestamp))
-    except ValueError:
-        return False
-    if age > SIGNATURE_TOLERANCE_SECONDS:
-        return False
-    base = b"v0:" + timestamp.encode() + b":" + body
-    expected = "v0=" + hmac.new(secret.encode(), base, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, signature)
 
 
 def build_card_blocks(*, call_id: str, phone: Optional[str], caller: Optional[str]) -> tuple[str, list[dict]]:

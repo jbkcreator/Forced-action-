@@ -2,9 +2,10 @@
 
 Served by lending-api (nginx /webhooks/lending/). Slack must be in HTTP mode (Socket Mode off) with this
 URL set under Interactivity. The same URL also receives Cora's approval-card clicks (``agent_core_*``
-action ids), which are handed to Cora before any soft-approval handling. Every request is signature-checked with LENDING_SLACK_SIGNING_SECRET; the
-route is closed (503) while the secret is unset. The form submission is acknowledged at once and the
-evaluation, rendering and storage run in a background task.
+action ids), which are handed to Cora before any soft-approval handling. Every request is
+signature-checked with LENDING_SLACK_SIGNING_SECRET; the route is closed (503) while the secret is
+unset. The form submission is acknowledged at once and the evaluation, rendering and storage run in
+a background task.
 """
 from __future__ import annotations
 
@@ -40,9 +41,9 @@ _CORA_ACTION_IDS = frozenset(action.value for action in ApprovalAction)
 
 
 def is_cora_click(payload: dict) -> bool:
-    """A click on one of Cora's Approve / Revise / Reject card buttons."""
-    return payload.get("type") == "block_actions" and any(
-        action.get("action_id") in _CORA_ACTION_IDS for action in payload.get("actions") or [])
+    """A click on one of Cora's Approve / Revise / Reject card buttons (Cora acts on the first action only)."""
+    actions = payload.get("actions") or []
+    return payload.get("type") == "block_actions" and bool(actions) and actions[0].get("action_id") in _CORA_ACTION_IDS
 
 
 def _open_form(payload: dict) -> None:

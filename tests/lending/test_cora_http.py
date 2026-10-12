@@ -30,7 +30,8 @@ def _signed(body: bytes, *, secret: str = SECRET, retry: str | None = None) -> d
 
 
 def _settings(**overrides) -> SimpleNamespace:
-    values = {"lending_slack_signing_secret": SecretStr(SECRET), "lending_soft_approval_enabled": True}
+    values = {"lending_slack_signing_secret": SecretStr(SECRET), "lending_soft_approval_enabled": True,
+              "redis_url": None}
     values.update(overrides)
     return SimpleNamespace(**values)
 
@@ -55,6 +56,8 @@ class FakeRedis:
 def redis(monkeypatch) -> FakeRedis:
     fake = FakeRedis()
     monkeypatch.setattr("src.core.redis_client.get_redis", lambda: fake)
+    monkeypatch.setattr(cora_events_webhook, "_own_client", None)
+    monkeypatch.setattr(cora_events_webhook, "_next_connect_at", 0.0)
     return fake
 
 
@@ -215,6 +218,58 @@ def test_interactivity_keeps_its_signature_and_disabled_behaviour(client, handle
     assert handled == []
 
 
+def test_receipts_reconnect_when_the_shared_client_gave_up(handled, monkeypatch) -> None:
+    """get_redis() stays None if Redis was down at its one connection attempt; Cora keeps retrying her own."""
+    monkeypatch.setattr("src.core.redis_client.get_redis", lambda: None)
+    monkeypatch.setattr(cora_events_webhook, "get_settings", lambda: _settings(redis_url="redis://cache:6379/0"))
+    monkeypatch.setattr(cora_events_webhook, "RECONNECT_SECONDS", 0)
+    recovered = FakeRedis()
+    recovered.ping = lambda: True
+    attempts: list = []
+
+    def from_url(url, **kwargs):
+        attempts.append(kwargs)
+        if len(attempts) == 1:
+            raise ConnectionError("still down")
+        return recovered
+
+    import redis as redis_lib
+
+    monkeypatch.setattr(redis_lib.Redis, "from_url", staticmethod(from_url))
+    assert cora_events_webhook.accept_event_once("Ev1") is True  # down: processed, not lost
+    assert cora_events_webhook.accept_event_once("Ev2") is True  # reconnected: receipt taken
+    assert cora_events_webhook.accept_event_once("Ev2") is False  # repeat of an accepted event
+    assert len(attempts) == 2 and attempts[0]["socket_timeout"] == 1
+
+
+def test_reconnect_attempts_are_rate_limited(monkeypatch) -> None:
+    monkeypatch.setattr("src.core.redis_client.get_redis", lambda: None)
+    monkeypatch.setattr(cora_events_webhook, "get_settings", lambda: _settings(redis_url="redis://cache:6379/0"))
+    monkeypatch.setattr(cora_events_webhook, "_own_client", None)
+    monkeypatch.setattr(cora_events_webhook, "_next_connect_at", 0.0)
+    attempts: list = []
+
+    import redis as redis_lib
+
+    def failing(url, **kwargs):
+        attempts.append(1)
+        raise ConnectionError("down")
+
+    monkeypatch.setattr(redis_lib.Redis, "from_url", staticmethod(failing))
+    for event_id in ("A", "B", "C"):
+        assert cora_events_webhook.accept_event_once(event_id) is True
+    assert len(attempts) == 1  # one try per RECONNECT_SECONDS, not one per message
+
+
+def test_only_the_first_action_decides_the_route() -> None:
+    first_cora = {"type": "block_actions", "actions": [{"action_id": "agent_core_approve"}, {"action_id": "x"}]}
+    later_cora = {"type": "block_actions", "actions": [{"action_id": "x"}, {"action_id": "agent_core_approve"}]}
+    assert interactivity.is_cora_click(first_cora)
+    assert not interactivity.is_cora_click(later_cora)
+    assert not interactivity.is_cora_click({"type": "block_actions", "actions": []})
+    assert not interactivity.is_cora_click({"type": "view_submission", "actions": [{"action_id": "agent_core_approve"}]})
+
+
 # -- runtime ----------------------------------------------------------------------------------------
 
 @pytest.fixture
@@ -227,9 +282,32 @@ def fresh_runtime():
 def test_unconfigured_cora_is_not_rebuilt_on_every_message(fresh_runtime, monkeypatch) -> None:
     builds: list = []
     monkeypatch.setattr(cora_runtime, "build_live_services", lambda settings: builds.append(1))
+    monkeypatch.setattr(cora_runtime, "missing_settings", lambda config: ["approver_user_ids"])
     cora_runtime.handle_slack_request("events_api", {"event": {}}, "Ev1")
     cora_runtime.handle_slack_request("events_api", {"event": {}}, "Ev2")
     assert len(builds) == 1  # remembered as unavailable; no auth.test per message
+
+
+def test_a_slack_blip_is_retried_soon_not_after_five_minutes(fresh_runtime, monkeypatch) -> None:
+    """auth.test failing once (settings present) must not silence Cora for the long unconfigured window."""
+    results = [None, SimpleNamespace(session=SimpleNamespace(handle_request=lambda *args: None))]
+    monkeypatch.setattr(cora_runtime, "build_live_services", lambda settings: results.pop(0))
+    monkeypatch.setattr(cora_runtime, "missing_settings", lambda config: [])
+    monkeypatch.setattr(cora_runtime, "RETRY_UNREACHABLE_SECONDS", 0)
+    assert cora_runtime.cora_services() is None
+    assert cora_runtime.cora_services() is not None and results == []
+
+
+def test_unconfigured_and_unreachable_use_different_waits(fresh_runtime, monkeypatch) -> None:
+    monkeypatch.setattr(cora_runtime, "build_live_services", lambda settings: None)
+    monkeypatch.setattr(cora_runtime, "missing_settings", lambda config: [])
+    before = time.monotonic()
+    cora_runtime.cora_services()
+    assert cora_runtime._unavailable_until - before <= cora_runtime.RETRY_UNREACHABLE_SECONDS + 1
+    cora_runtime.reset()
+    monkeypatch.setattr(cora_runtime, "missing_settings", lambda config: ["slack_channel_id"])
+    cora_runtime.cora_services()
+    assert cora_runtime._unavailable_until - before >= cora_runtime.RETRY_UNCONFIGURED_SECONDS - 1
 
 
 def test_configured_cora_is_built_once_and_handles_requests(fresh_runtime, monkeypatch) -> None:

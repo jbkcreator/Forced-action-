@@ -240,25 +240,34 @@ def run_sweep(services: CoraServices) -> None:
         logger.info("[cora] relay sweep sent=%s failed=%s blocked=%s", result.sent, result.failed, result.blocked)
 
 
-def missing_settings(config: AgentCoreConfig) -> list[str]:
+def missing_settings(config: AgentCoreConfig, *, needs_model: bool = True) -> list[str]:
+    """Settings Cora cannot run without. The sweep worker never calls Claude, so it skips the key."""
     missing = config.missing_for_http_session()
-    if not config.anthropic_api_key:
+    if needs_model and not config.anthropic_api_key:
         missing.append("anthropic_api_key")
     return missing
 
 
-def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
-    """Cora wired to Slack, PostgreSQL and Claude, or None (logged) when it is not configured.
+class _NoModel:
+    """Stands in for the Claude client in the sweep worker, which only expires, re-posts and relays."""
 
-    Fails closed: without approvers no click could ever be trusted to release a send.
+    def create(self, **_: Any) -> Any:
+        raise RuntimeError("the sweep worker does not call the model")
+
+
+def build_live_services(settings: AppSettings, *, needs_model: bool = True) -> Optional[CoraServices]:
+    """Cora wired to Slack, PostgreSQL and (when ``needs_model``) Claude; None (logged) when it cannot be built.
+
+    None means either missing settings (see :func:`missing_settings`, a configuration problem) or a
+    Slack ``auth.test`` failure (usually transient). Fails closed: without approvers no click could
+    ever be trusted to release a send.
     """
     config = build_config(settings)
-    missing = missing_settings(config)
+    missing = missing_settings(config, needs_model=needs_model)
     if missing:
         logger.error("[cora] not configured; missing settings: %s", ", ".join(missing))
         return None
 
-    import anthropic
     from slack_sdk.web import WebClient
 
     web = WebClient(token=config.slack_bot_token)
@@ -268,20 +277,38 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
         logger.error("[cora] Slack auth.test failed (%s); check LENDING_SLACK_BOT_TOKEN", type(exc).__name__)
         return None
     engine = create_engine(settings.database_url, pool_pre_ping=True)
-    messages_client = anthropic.Anthropic(api_key=config.anthropic_api_key, timeout=90.0, max_retries=2).messages
+    if needs_model:
+        import anthropic
+
+        messages_client: MessagesClient = anthropic.Anthropic(
+            api_key=config.anthropic_api_key, timeout=90.0, max_retries=2).messages
+    else:
+        messages_client = _NoModel()
     return build_session(config, AgentStore(engine, config.db_schema), SlackChatPort(web, config.slack_channel_id),
                          bot_user_id, messages_client=messages_client, send_check=make_send_check(engine))
 
 
 def main(stop: Optional[threading.Event] = None) -> int:
-    """The sweep worker. Slack events arrive at lending-api, not here."""
+    """The sweep worker. Slack events arrive at lending-api, not here.
+
+    Exits 1 only for missing settings (a configuration problem a restart cannot fix). A failed
+    Slack ``auth.test`` is retried in-process every sweep interval, so a Slack outage at boot never
+    exhausts systemd's restart limit and leaves the worker dead.
+    """
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    services = build_live_services(get_settings())
-    if services is None:
-        return 1
     stop = stop or threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    settings = get_settings()
+    if missing_settings(build_config(settings), needs_model=False):
+        build_live_services(settings, needs_model=False)  # logs exactly what is missing
+        return 1
+    services = build_live_services(settings, needs_model=False)
+    while services is None:
+        logger.warning("[cora] sweep worker could not reach Slack; retrying in %ss", SWEEP_SECONDS)
+        if stop.wait(SWEEP_SECONDS):
+            return 0
+        services = build_live_services(settings, needs_model=False)
     logger.info("[cora] sweep worker started (every %ss)", SWEEP_SECONDS)
     while not stop.wait(SWEEP_SECONDS):
         try:

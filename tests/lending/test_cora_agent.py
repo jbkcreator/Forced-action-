@@ -46,6 +46,12 @@ def test_build_config_maps_settings() -> None:
     assert config.missing_for_http_session() == [] and cora_agent.missing_settings(config) == []
 
 
+@pytest.fixture(autouse=True)
+def _no_real_sigterm_handler(monkeypatch):
+    """main() installs a SIGTERM handler; keep it out of the test process."""
+    monkeypatch.setattr(cora_agent.signal, "signal", lambda *args: None)
+
+
 def test_main_refuses_to_start_without_approvers(monkeypatch) -> None:
     monkeypatch.setattr(cora_agent, "get_settings", lambda: _settings(lending_cora_approver_user_ids=""))
     assert cora_agent.main() == 1
@@ -68,7 +74,7 @@ def test_sweep_worker_starts_runs_the_sweep_and_stops(monkeypatch) -> None:
         stop.set()
 
     monkeypatch.setattr(cora_agent, "get_settings", lambda: _settings())
-    monkeypatch.setattr(cora_agent, "build_live_services", lambda settings: services)
+    monkeypatch.setattr(cora_agent, "build_live_services", lambda settings, **kwargs: services)
     monkeypatch.setattr(cora_agent, "run_sweep", sweep)
     monkeypatch.setattr(cora_agent, "SWEEP_SECONDS", 0.01)
     monkeypatch.setattr(cora_agent.signal, "signal", lambda signum, handler: handlers.append((signum, handler)))
@@ -90,11 +96,52 @@ def test_a_failing_sweep_does_not_stop_the_worker(monkeypatch) -> None:
         stop.set()
 
     monkeypatch.setattr(cora_agent, "get_settings", lambda: _settings())
-    monkeypatch.setattr(cora_agent, "build_live_services", lambda settings: object())
+    monkeypatch.setattr(cora_agent, "build_live_services", lambda settings, **kwargs: object())
     monkeypatch.setattr(cora_agent, "run_sweep", sweep)
     monkeypatch.setattr(cora_agent, "SWEEP_SECONDS", 0.01)
     monkeypatch.setattr(cora_agent.signal, "signal", lambda *args: None)
     assert cora_agent.main(stop=stop) == 0 and len(runs) == 2
+
+
+def test_sweep_worker_retries_slack_at_boot_instead_of_exiting(monkeypatch) -> None:
+    """A Slack outage at boot must not exhaust systemd's restart limit: the worker waits and retries."""
+    attempts: list = []
+    stop = threading.Event()
+
+    def build(settings, **kwargs):
+        attempts.append(kwargs)
+        return None if len(attempts) < 3 else object()
+
+    monkeypatch.setattr(cora_agent, "get_settings", lambda: _settings())
+    monkeypatch.setattr(cora_agent, "build_live_services", build)
+    monkeypatch.setattr(cora_agent, "run_sweep", lambda services: stop.set())
+    monkeypatch.setattr(cora_agent, "SWEEP_SECONDS", 0.01)
+    assert cora_agent.main(stop=stop) == 0
+    assert len(attempts) == 3 and all(call == {"needs_model": False} for call in attempts)
+
+
+def test_sweep_worker_stops_cleanly_while_waiting_for_slack(monkeypatch) -> None:
+    stop = threading.Event()
+    stop.set()
+    monkeypatch.setattr(cora_agent, "get_settings", lambda: _settings())
+    monkeypatch.setattr(cora_agent, "build_live_services", lambda settings, **kwargs: None)
+    assert cora_agent.main(stop=stop) == 0
+
+
+def test_sweep_worker_exits_only_for_missing_settings(monkeypatch) -> None:
+    builds: list = []
+    monkeypatch.setattr(cora_agent, "get_settings", lambda: _settings(lending_cora_channel=""))
+    monkeypatch.setattr(cora_agent, "build_live_services", lambda settings, **kwargs: builds.append(1))
+    assert cora_agent.main(stop=threading.Event()) == 1
+    assert len(builds) == 1  # one build, only to log what is missing; no retry loop
+
+
+def test_sweep_worker_does_not_need_the_claude_key() -> None:
+    config = cora_agent.build_config(_settings(anthropic_api_key=None))
+    assert cora_agent.missing_settings(config, needs_model=False) == []
+    assert cora_agent.missing_settings(config) == ["anthropic_api_key"]
+    with pytest.raises(RuntimeError):
+        cora_agent._NoModel().create(model="x")
 
 
 def test_missing_settings_are_named() -> None:

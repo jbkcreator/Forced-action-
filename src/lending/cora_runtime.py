@@ -1,8 +1,9 @@
 """Cora inside lending-api: one session per worker process, fed by the Slack HTTP endpoints.
 
-Built lazily on the first Slack request a worker receives, then reused. When Cora is not
-configured (or Slack rejects the bot token) the failure is remembered for a short while so a
-busy channel does not trigger a Slack ``auth.test`` on every message.
+Built lazily on the first Slack request a worker receives, then reused. A failed build is
+remembered so a busy channel does not trigger a Slack ``auth.test`` on every message: for five
+minutes when settings are missing (nothing will change until someone sets them), but only for a
+few seconds when Slack could not be reached, so a network blip does not silence Cora for long.
 """
 from __future__ import annotations
 
@@ -11,11 +12,12 @@ import threading
 import time
 from typing import Any, Optional
 
-from src.lending.cora_agent import CoraServices, build_live_services
+from src.lending.cora_agent import CoraServices, build_config, build_live_services, missing_settings
 
 logger = logging.getLogger(__name__)
 
 RETRY_UNCONFIGURED_SECONDS = 300
+RETRY_UNREACHABLE_SECONDS = 15
 
 _lock = threading.Lock()
 _services: Optional[CoraServices] = None
@@ -33,9 +35,12 @@ def cora_services() -> Optional[CoraServices]:
             return None
         from config.settings import get_settings
 
-        _services = build_live_services(get_settings())
+        settings = get_settings()
+        _services = build_live_services(settings)
         if _services is None:
-            _unavailable_until = time.monotonic() + RETRY_UNCONFIGURED_SECONDS
+            unconfigured = bool(missing_settings(build_config(settings)))
+            _unavailable_until = time.monotonic() + (
+                RETRY_UNCONFIGURED_SECONDS if unconfigured else RETRY_UNREACHABLE_SECONDS)
         return _services
 
 
