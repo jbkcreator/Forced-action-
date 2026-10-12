@@ -12,6 +12,7 @@ from datetime import date, datetime, timezone
 from typing import Any, Optional
 
 from sqlalchemy import (
+    ARRAY,
     BigInteger,
     Boolean,
     CheckConstraint,
@@ -573,4 +574,147 @@ class LendingLendingFlowEnrichment(LendingBase):
         CheckConstraint("routing_tag IS NULL OR routing_tag IN ('FULL_MACHINE', 'NURTURE')",
                         name="ck_lending_lendingflow_enrichment_routing"),
         Index("idx_lending_lendingflow_enrichment_sweep", "status", "last_attempt_at"),
+    )
+
+
+# ── R-1 Overflow Router ───────────────────────────────────────────────────────
+
+class LendingDeclineReasonCode(LendingBase):
+    """Decline reason codes supplied by Josh — stored as data so the enum is editable.
+
+    Seeded by ``migrations/apply_lending_lender_routing.py``.
+    """
+
+    __tablename__ = "decline_reason_codes"
+
+    code: Mapped[str] = mapped_column(String(50), primary_key=True)
+    label: Mapped[str] = mapped_column(String(200), nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=text("true"))
+
+
+class LendingLenderRoutingRule(LendingBase):
+    """One row per lender in the routing waterfall.
+
+    ``is_primary``: at most one row has this flag.  The primary lender gets first look
+    and carries the seat cap.  Moving the primary flag to a different lender is a table
+    edit (no deploy).
+
+    ``agreement_status``: only rows with status 'signed' are ever routed to.
+
+    ``construction_min_amount``: minimum loan amount for the primary lender's
+    ground-up product (rule 1 threshold, currently $500,000 per the addendum spec;
+    editable without a deploy).
+
+    ``takes_ground_up``: marks overflow lenders eligible for rule 3 (ground-up below
+    the primary's construction minimum).
+
+    OPEN (Q1 / task-analysis): ``monthly_cap`` counts actions in
+    ``SEAT_CAP_COUNTED_ACTION`` (default 'funded'); Josh to confirm.
+    """
+
+    __tablename__ = "lender_routing_rules"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=text("true"))
+    is_primary: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    agreement_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending", server_default=text("'pending'"))
+    priority: Mapped[int] = mapped_column(Integer, nullable=False)
+    monthly_cap: Mapped[Optional[int]] = mapped_column(Integer)
+    construction_min_amount: Mapped[Optional[int]] = mapped_column(BigInteger)
+    points_paid_to_broker: Mapped[Optional[float]] = mapped_column(Numeric(5, 4))
+    takes_ground_up: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint(
+            "agreement_status IN ('signed','pending','none','terminated')",
+            name="ck_lender_routing_rules_agreement",
+        ),
+    )
+
+
+class LendingLenderProductBox(LendingBase):
+    """Per-lender eligibility rules for one product group (e.g. flip, construction, DSCR).
+
+    A lender may have multiple product-box rows.  The router evaluates each box for the
+    file's loan type; a file that matches any of the lender's boxes is eligible (subject
+    to the lender's agreement_status and active flag).
+    """
+
+    __tablename__ = "lender_product_boxes"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    lender_id: Mapped[int] = mapped_column(ForeignKey("lending.lender_routing_rules.id", ondelete="CASCADE"), nullable=False, index=True)
+    loan_types: Mapped[list[str]] = mapped_column(ARRAY(String), nullable=False)
+    min_loan_amount: Mapped[Optional[int]] = mapped_column(BigInteger)
+    max_loan_amount: Mapped[Optional[int]] = mapped_column(BigInteger)
+    approved_states: Mapped[Optional[list[str]]] = mapped_column(ARRAY(String))  # NULL = all states
+    credit_floor: Mapped[Optional[int]] = mapped_column(Integer)
+    max_ltv: Mapped[Optional[float]] = mapped_column(Numeric(5, 4))
+    max_ltc: Mapped[Optional[float]] = mapped_column(Numeric(5, 4))
+    min_completed_projects: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    requires_ground_up_build: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+
+class LendingFileRouting(LendingBase):
+    """Current routing state for one LendingFlow file (1:1 with lendingflow_leads).
+
+    ``lenders_tried``: ordered list of lender IDs already offered the file (so
+    the decline cascade can skip them on the next pass).
+    ``hold_reason``: 'no_match' or 'exhausted'.
+    """
+
+    __tablename__ = "file_routing"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    lead_id: Mapped[int] = mapped_column(ForeignKey("lending.lendingflow_leads.id"), nullable=False, unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="unrouted", server_default=text("'unrouted'"))
+    current_lender_id: Mapped[Optional[int]] = mapped_column(ForeignKey("lending.lender_routing_rules.id"))
+    current_lender_name: Mapped[Optional[str]] = mapped_column(String(100))
+    route_position: Mapped[Optional[int]] = mapped_column(Integer)
+    lenders_tried: Mapped[list[int]] = mapped_column(ARRAY(Integer), nullable=False, default=list, server_default=text("'{}'"))
+    hold_reason: Mapped[Optional[str]] = mapped_column(String(30))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint("status IN ('unrouted','routed','held','exhausted')", name="ck_file_routing_status"),
+        Index("idx_file_routing_sweep", "status", "lead_id"),
+    )
+
+
+class LendingFileRoutingEvent(LendingBase):
+    """Append-only routing event log (DELETE and core-field UPDATE blocked by DB trigger).
+
+    ``action``:
+      routed   — file offered to a lender.
+      declined — lender declined the file.
+      approved — lender approved the file.
+      funded   — loan funded (used for seat-cap counting — Q1).
+      held     — file entered the hold queue (reason in hold_reason on file_routing).
+
+    ``slack_ts`` / ``slack_posted_at``: only these two columns may be updated
+    (the immutability trigger permits it for idempotent Slack retry).
+    """
+
+    __tablename__ = "file_routing_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    lead_id: Mapped[int] = mapped_column(ForeignKey("lending.lendingflow_leads.id"), nullable=False, index=True)
+    lender_id: Mapped[Optional[int]] = mapped_column(ForeignKey("lending.lender_routing_rules.id"))
+    lender_name: Mapped[Optional[str]] = mapped_column(String(100))
+    action: Mapped[str] = mapped_column(String(20), nullable=False)
+    reason_code: Mapped[Optional[str]] = mapped_column(String(50))
+    free_text: Mapped[Optional[str]] = mapped_column(Text)
+    actor: Mapped[str] = mapped_column(String(100), nullable=False, default="system", server_default=text("'system'"))
+    slack_ts: Mapped[Optional[str]] = mapped_column(String(40))
+    slack_posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint("action IN ('routed','declined','approved','funded','held')", name="ck_file_routing_events_action"),
+        Index("idx_fre_lead_created", "lead_id", "created_at"),
     )

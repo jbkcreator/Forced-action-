@@ -951,6 +951,8 @@ class AppSettings(BaseSettings):
 	lending_dial_tasks_channel: str = Field(default="", env="LENDING_DIAL_TASKS_CHANNEL")
 	lending_replies_channel: str = Field(default="", env="LENDING_REPLIES_CHANNEL")  # WP-GL-10 rate/terms handoffs; channel ID, the Cora Lending bot must be a member
 	lending_daily_channel: str = Field(default="", env="LENDING_DAILY_CHANNEL")  # 7pm scoreboard; channel ID
+	lending_routing_channel: str = Field(default="", env="LENDING_ROUTING_CHANNEL")  # R-1: #next-deal-lending; Cora Lending bot must be a member
+	lending_routing_admin_secret: Optional[SecretStr] = Field(default=None, env="LENDING_ROUTING_ADMIN_SECRET")  # R-1 admin API secret
 	lending_sheets_service_account_key_path: str = Field(default="", env="LENDING_SHEETS_SERVICE_ACCOUNT_KEY_PATH")
 	lending_disposition_sheet_id: str = Field(default="", env="LENDING_DISPOSITION_SHEET_ID")
 	lending_disposition_sheet_tab: str = Field(default="Dispositions", env="LENDING_DISPOSITION_SHEET_TAB")

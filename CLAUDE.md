@@ -60,6 +60,7 @@ PYTHONPATH=. python migrations/apply_lending_gl9_text_back.py  # WP-GL-9 text-ba
 PYTHONPATH=. python migrations/apply_lending_booking_messages.py  # WP-GL-10 lending.booking_messages (confirmation + night-before + 90-minute schedule) and lending.confirmation_tasks (idempotent)
 PYTHONPATH=. python migrations/apply_lending_web_leads.py  # WP-GL-11: lending.web_leads, nextdeallending.com form submissions + consent evidence + GHL delivery state + suppression_reason + ghl_alerted_at (idempotent, also adds the later columns to an existing table; run after apply_lending_compliance.py)
 PYTHONPATH=. python migrations/apply_lending_lendingflow_enrichment.py  # T-12: lending.lendingflow_enrichment, LendingFlow background enrichment card + FULL_MACHINE/NURTURE routing (idempotent, run after apply_lending_lendingflow.py; closed behind LENDING_ENRICHMENT_ENABLED; docs/lending/lendingflow-enrichment.md)
+PYTHONPATH=. python migrations/apply_lending_lender_routing.py  # R-1 Overflow Router: lender_routing_rules, lender_product_boxes, file_routing, append-only file_routing_events, decline_reason_codes (idempotent, run after apply_lending_lendingflow.py); cron src.tasks.lending_routing_sweep (*/5) + lending_routing_hold_summary (8am ET)
 # PropertyRadar daily target-lender maturity pull (separate cron, disabled until PROPERTY_RADAR_ENABLED=true — see scripts/cron/crontab.txt)
 python -m src.tasks.property_radar_maturity_pull --mode daily --state FL
 
