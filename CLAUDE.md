@@ -64,6 +64,8 @@ PYTHONPATH=. python migrations/apply_lending_pending_action_safeguards.py  # pen
 PYTHONPATH=. python migrations/apply_lending_web_leads.py  # WP-GL-11: lending.web_leads, nextdeallending.com form submissions + consent evidence + GHL delivery state + suppression_reason + ghl_alerted_at (idempotent, also adds the later columns to an existing table; run after apply_lending_compliance.py)
 PYTHONPATH=. python migrations/apply_lending_lendingflow_enrichment.py  # T-12: lending.lendingflow_enrichment, LendingFlow background enrichment card + FULL_MACHINE/NURTURE routing (idempotent, run after apply_lending_lendingflow.py; closed behind LENDING_ENRICHMENT_ENABLED; docs/lending/lendingflow-enrichment.md)
 PYTHONPATH=. python migrations/apply_lending_soft_approvals.py  # T-08: lending.soft_approval_cards + lending.soft_approvals (Call-One soft approval PDF per lead) (idempotent)
+PYTHONPATH=. python migrations/apply_lending_uncalled_alarms.py  # T-10: lending.uncalled_alarms (2-min/5-min LendingFlow lead alarms); also marks existing leads 'preexisting' — re-run right before enabling (idempotent, no FK to T-11)
+python -m src.lending.uncalled_alarm_worker  # T-10 alarm worker (systemd fa-lending-uncalled-alarm-worker, installed by deploy.sh LENDING_UNITS (warn-only); idles until LENDING_UNCALLED_ALARMS_ENABLED=true; LENDING_ALARM_SMS_TO, LENDING_OPS_CHANNEL)
 # PropertyRadar daily target-lender maturity pull (separate cron, disabled until PROPERTY_RADAR_ENABLED=true — see scripts/cron/crontab.txt)
 python -m src.tasks.property_radar_maturity_pull --mode daily --state FL
 
