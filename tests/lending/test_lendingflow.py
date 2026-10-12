@@ -444,3 +444,22 @@ def test_crash_after_delivery_commit_is_recovered(lf_db, seen):
     assert _row(lf_db).followup_done_at is not None
     run_followups(lf_db, deliver_pending(lf_db, sink, now=later))
     assert len(events) == 1 and len(prequal) == 1  # done leads are never picked up again
+
+
+def test_migration_rerun_keeps_unfinished_followup_pending(lf_db):
+    from migrations.apply_lending_lendingflow import apply_to
+
+    _saved(lf_db)
+    lf_db.execute(text("UPDATE lending.lendingflow_leads SET ghl_status = 'synced', event_emitted_at = now()"))
+    apply_to(lf_db.get_bind())  # event sent, letter not queued: must stay retryable
+    assert _row(lf_db).followup_done_at is None
+
+
+def test_migration_backfills_only_when_it_adds_the_column(lf_db):
+    from migrations.apply_lending_lendingflow import apply_to
+
+    _saved(lf_db)
+    lf_db.execute(text("UPDATE lending.lendingflow_leads SET ghl_status = 'synced', event_emitted_at = now()"))
+    lf_db.execute(text("ALTER TABLE lending.lendingflow_leads DROP COLUMN followup_done_at"))
+    apply_to(lf_db.get_bind())  # first apply of the column: earlier claimed leads count as done
+    assert _row(lf_db).followup_done_at is not None
