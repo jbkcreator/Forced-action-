@@ -463,6 +463,9 @@ class LendingPendingAction(LendingBase):
         Index("uq_pending_actions_idempotency_key", "idempotency_key", unique=True),
         Index("ix_pending_actions_revised_by", "revised_by", postgresql_where=text("status = 'revising'")),
         Index("ix_pending_actions_expires_at", "expires_at", postgresql_where=text("status IN ('pending', 'revising')")),
+    )
+
+
 class LendingPrequalLetter(LendingBase):
     """One Minute-5 pre-qualification letter per lead (T-07), queued before any render or GHL call.
 
