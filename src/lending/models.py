@@ -643,6 +643,7 @@ class LendingLendingFlowLead(LendingBase):
     ghl_alerted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     event_emitted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     followup_done_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # event emitted AND pre-qual handed off
+    intro_sms_tagged_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # T-09: ready tag added (starts the GHL intro text); NULL = not yet, or held for the send window
     duplicate_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     last_duplicate_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     raw_payload: Mapped[Any] = mapped_column(JSONB, nullable=False)

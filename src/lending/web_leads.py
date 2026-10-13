@@ -56,6 +56,7 @@ class WebLeadInput:
 class PushResult:
     contact_id: str
     pipeline_card: bool  # False when no new-lead stage is configured: contact only
+    intro_ready_tagged: bool = False  # T-09: the push added the tag that starts the GHL intro-SMS workflow
 
 
 class LeadSink(Protocol):

@@ -28,6 +28,8 @@ _ALTERS: list[str] = [
     'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS lead_source_campaign varchar(100)',
     'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS submitted_at timestamptz',
     'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS followup_done_at timestamptz',
+    # T-09: set when the intro-SMS ready tag is added; NULL for a lead still held for the 8am-8pm send window.
+    'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS intro_sms_tagged_at timestamptz',
 ]
 
 # Leads whose event was claimed before followup_done_at existed are treated as done. Run only in the
