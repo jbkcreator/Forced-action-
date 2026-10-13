@@ -20,7 +20,6 @@ from sqlalchemy import text
 from config.lender_matrix import LENDER_MATRIX, LenderRules
 from config.lending_soft_approval import SoftApprovalParams
 from migrations.apply_lending_lendingflow import apply_to as apply_lendingflow
-from migrations.apply_lending_lendingflow_enrichment import apply_to as apply_enrichment
 from migrations.apply_lending_soft_approvals import apply_to as apply_soft_approvals
 from src.lending import soft_approval_webhook as webhook
 from src.lending.call_pipeline import follow_up
@@ -667,6 +666,35 @@ def client(wired):
     return TestClient(app)
 
 
+class TestMovedCoraCards:
+    """Cora cards the lending app posted before Cora had her own app: a click retires the card."""
+
+    CLICK = {"type": "block_actions", "channel": {"id": "CCORA"}, "message": {"ts": "9.9"},
+             "actions": [{"action_id": "agent_core_approve", "value": "7"}]}
+
+    def test_only_cora_buttons_count_as_moved_cora_clicks(self):
+        assert webhook.is_moved_cora_click(self.CLICK)
+        soft = {**self.CLICK, "actions": [{"action_id": "soft_approval_open", "value": "call-1"}]}
+        assert not webhook.is_moved_cora_click(soft)
+        assert not webhook.is_moved_cora_click({"type": "view_submission"})
+
+    def test_the_old_card_loses_its_buttons_and_points_to_the_new_one(self, monkeypatch):
+        updates: list[dict] = []
+        client = SimpleNamespace(chat_update=lambda **kwargs: updates.append(kwargs))
+        monkeypatch.setattr(webhook, "slack_client", lambda: client)
+        webhook._retire_moved_cora_card(self.CLICK)
+        assert updates[0]["channel"] == "CCORA" and updates[0]["ts"] == "9.9"
+        assert updates[0]["text"] == webhook.MOVED_CORA_CARD_TEXT
+        assert all(block["type"] != "actions" for block in updates[0]["blocks"])
+
+    def test_a_slack_failure_while_retiring_is_swallowed(self, monkeypatch):
+        def boom(**kwargs):
+            raise RuntimeError("slack down")
+
+        monkeypatch.setattr(webhook, "slack_client", lambda: SimpleNamespace(chat_update=boom))
+        webhook._retire_moved_cora_card(self.CLICK)  # no exception
+
+
 class TestSignature:
     def test_valid_signature(self):
         body = b"payload=x"
@@ -704,6 +732,13 @@ class TestRoute:
         assert wired.views[0]["trigger_id"] == "trig"
         assert json.loads(view["private_metadata"])["call_id"] == "call-1"
         assert {b["block_id"] for b in view["blocks"]} == {"address", "purchase", "rehab", "arv", "ptype", "close"}
+
+    def test_a_cora_card_click_is_not_handled_here(self, client, wired):
+        """Cora's cards belong to her own Slack app; a stray agent_core click opens nothing."""
+        body = _payload({"type": "block_actions", "trigger_id": "trig", "channel": {"id": "CCORA"},
+                         "message": {"ts": "2.2"}, "actions": [{"action_id": "agent_core_approve", "value": "7"}]})
+        assert client.post(self.URL, content=body, headers=_signed(body)).json() == {}
+        assert wired.views == []
 
     def test_invalid_submission_returns_inline_errors_and_stores_nothing(self, client, soft_db):
         body = _payload({"type": "view_submission", "user": {"id": "U1"}, "view": {
@@ -824,24 +859,6 @@ class TestRoute:
         body = self._submit_body("U1")  # no call row seeded
         client.post(self.URL, content=body, headers=_signed(body))
         assert wired.updates == []
-
-    def test_the_form_facts_reach_the_deal_facts_store_when_enrichment_is_on(self, client, wired, soft_db, flow, monkeypatch):
-        apply_enrichment(soft_db.get_bind())
-        reruns = []
-        monkeypatch.setattr(webhook, "enrichment_enabled", lambda: True)
-        monkeypatch.setattr(webhook, "enrich_lead", lambda db, lead_id: reruns.append(lead_id))
-        body = self._submit_body("U1")
-        client.post(self.URL, content=body, headers=_signed(body))
-        row = soft_db.execute(text("SELECT lead_id, captured_address, facts_source FROM lending.lendingflow_enrichment")).mappings().one()
-        assert (row["captured_address"], row["facts_source"]) == ("12 Palm Ave", "slack_form")
-        assert reruns == [row["lead_id"]]
-
-    def test_nothing_is_recorded_while_enrichment_is_off(self, client, wired, soft_db, flow, monkeypatch):
-        apply_enrichment(soft_db.get_bind())
-        monkeypatch.setattr(webhook, "enrichment_enabled", lambda: False)
-        body = self._submit_body("U1")
-        client.post(self.URL, content=body, headers=_signed(body))
-        assert soft_db.execute(text("SELECT count(*) FROM lending.lendingflow_enrichment")).scalar() == 0
 
     def test_disabled_feature_ignores_a_signed_request(self, client, monkeypatch):
         monkeypatch.setattr(webhook, "get_settings", lambda: _settings(lending_soft_approval_enabled=False))

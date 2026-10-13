@@ -32,6 +32,7 @@ from config.lending_compliance import (
     ET_WINDOW_END,
     ET_WINDOW_START,
     SHIFT_GROUPS,
+    STATE_TZ,
     DEFAULT_TZ,
     DIALER_SWEEP_LOCK_KEY,
     DIALER_OPT_OUT_SOURCE,
@@ -427,17 +428,26 @@ def a2_coverage_report(db, phones: list[str], *, now: Optional[datetime] = None)
 # ── Call-time gate (WP-W0-3) ─────────────────────────────────────────────────
 
 
+def _zip_timezone(zip_code: Optional[str]) -> Optional[ZoneInfo]:
+    """Wave 0 pools are Hillsborough/Pinellas: a ZIP in either is Eastern. Any other ZIP says nothing."""
+    if not zip_code:
+        return None
+    from src.utils.zip_centroids import get_zip_centroid
+
+    if get_zip_centroid(zip_code, "hillsborough") or get_zip_centroid(zip_code, "pinellas"):
+        return ZoneInfo(DEFAULT_TZ)
+    return None
+
+
 def recipient_timezone(phone: str, zip_code: Optional[str] = None) -> Optional[ZoneInfo]:
-    """Wave 0 pools are Hillsborough/Pinellas: a ZIP in either is Eastern. Otherwise
+    """A Hillsborough/Pinellas ZIP is Eastern and wins. Otherwise
     area code: ``AREA_CODE_TZ``'s deliberate FL/GA overrides first (850 is kept
     Central even though NANP assigns it Eastern, the over-suppressing direction),
     then the full NANP table. ``None`` means the timezone could not be determined —
     the caller must fail closed (never treat an unmapped code as Eastern)."""
-    if zip_code:
-        from src.utils.zip_centroids import get_zip_centroid
-
-        if get_zip_centroid(zip_code, "hillsborough") or get_zip_centroid(zip_code, "pinellas"):
-            return ZoneInfo(DEFAULT_TZ)
+    zip_tz = _zip_timezone(zip_code)
+    if zip_tz is not None:
+        return zip_tz
     digits = "".join(c for c in phone if c.isdigit())
     if digits.startswith("1"):
         digits = digits[1:]
@@ -513,6 +523,34 @@ def _outside_call_window(
         ET_WINDOW_START, ET_WINDOW_END)
     eastern = now.astimezone(ZoneInfo(DEFAULT_TZ)).time()
     return not (start <= eastern < end)
+
+
+def text_window_open(
+    phone: str,
+    *,
+    property_state: Optional[str] = None,
+    property_zip: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Whether it is 8:00-20:00 for the borrower in EVERY timezone we can derive: the phone's area code, a
+    Hillsborough/Pinellas property ZIP, and each zone the property's state touches. They are resolved
+    independently and all must be open: a borrower may have moved since their number was issued, and a
+    property ZIP must never hide the phone's own zone. Fails closed: no derivable timezone means no text.
+    Unlike ``can_dial_now`` this has no Eastern-time narrowing (client: 8am-8pm local)."""
+    zones: set[str] = set()
+    for tz in (recipient_timezone(phone), _zip_timezone(property_zip)):
+        if tz is not None:
+            zones.add(tz.key)
+    zones.update(STATE_TZ.get((property_state or "").strip().upper(), ()))
+    if not zones:
+        logger.warning("[lending-compliance] no timezone for phone_hash=%s; text window fails closed",
+                       phone_hash(phone)[:12])
+        return False
+    return _zones_inside_window(zones, now or datetime.now(timezone.utc))
+
+
+def _zones_inside_window(zones: set[str], now: datetime) -> bool:
+    return all(CALL_WINDOW_START <= now.astimezone(ZoneInfo(zone)).time() < CALL_WINDOW_END for zone in zones)
 
 
 def _attempt_cap(db, phone: str, now: datetime) -> GateResult:

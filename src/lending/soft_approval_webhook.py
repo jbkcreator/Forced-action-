@@ -1,11 +1,12 @@
 """POST /webhooks/lending/slack-interactivity: the Slack Interactivity Request URL for the soft approval form.
 
 Served by lending-api (nginx /webhooks/lending/). Slack must be in HTTP mode (Socket Mode off) with this
-URL set under Interactivity. The same URL also receives Cora's approval-card clicks (``agent_core_*``
-action ids), which are handed to Cora before any soft-approval handling. Every request is
-signature-checked with LENDING_SLACK_SIGNING_SECRET; the route is closed (503) while the secret is
-unset. The form submission is acknowledged at once and the evaluation, rendering and storage run in
-a background task.
+URL set under Interactivity. Every request is signature-checked with LENDING_SLACK_SIGNING_SECRET; the
+route is closed (503) while the secret is unset. The form submission is acknowledged at once and the
+evaluation, rendering and storage run in a background task. Cora's approval cards belong to her own
+Slack app; a click on a Cora card this app posted before that move retires the card (see
+:func:`_retire_moved_cora_card`) and changes nothing. Only the Slack users on the allow-list can open and
+submit the form (B11: Josh only until he names callers; :func:`allowed_user_ids`).
 """
 from __future__ import annotations
 
@@ -22,10 +23,8 @@ from sqlalchemy import text
 
 from config.lending_soft_approval import FORM_CALLBACK_ID, OPEN_FORM_ACTION_ID
 from config.settings import get_settings
-from packages.agent_core.approval import ApprovalAction
-from src.lending.cora_runtime import handle_slack_request
 from src.lending.db import lending_session
-from src.lending.enrichment.service import enabled as enrichment_enabled, enrich_lead, record_deal_facts
+from src.lending.soft_approval.enrichment_link import share_facts_with_enrichment
 from src.lending.soft_approval.facts import SoftApprovalFacts
 from src.lending.soft_approval.service import generate_soft_approval
 from src.lending.soft_approval.slack_card import (
@@ -42,14 +41,31 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/webhooks/lending", tags=["lending"])
 
-_CORA_ACTION_IDS = frozenset(action.value for action in ApprovalAction)
-SLACK_FORM_SOURCE = "slack_form"  # a value enrichment.webhook.ALLOWED_SOURCES already accepts
+# Approve / Revise / Reject buttons on Cora cards this app posted before Cora had her own app.
+_MOVED_CORA_ACTION_PREFIX = "agent_core_"
+MOVED_CORA_CARD_TEXT = (":arrows_counterclockwise: *This approval card has moved* to Cora's own Slack app. "
+                        "Use the newer card for this action in the Cora channel. Nothing was approved or sent "
+                        "from this card.")
 
 
-def is_cora_click(payload: dict) -> bool:
-    """A click on one of Cora's Approve / Revise / Reject card buttons (Cora acts on the first action only)."""
+def is_moved_cora_click(payload: dict) -> bool:
     actions = payload.get("actions") or []
-    return payload.get("type") == "block_actions" and bool(actions) and actions[0].get("action_id") in _CORA_ACTION_IDS
+    return (payload.get("type") == "block_actions" and bool(actions)
+            and str(actions[0].get("action_id") or "").startswith(_MOVED_CORA_ACTION_PREFIX))
+
+
+def _retire_moved_cora_card(payload: dict) -> None:
+    """Replace the old card's buttons with a pointer to the new card. The draft itself is untouched:
+    Cora reposts open drafts under her own app at startup."""
+    channel = str((payload.get("channel") or {}).get("id") or "")
+    ts = str((payload.get("message") or {}).get("ts") or "")
+    if not (channel and ts):
+        return
+    try:
+        slack_client().chat_update(channel=channel, ts=ts, text=MOVED_CORA_CARD_TEXT, blocks=[
+            {"type": "section", "text": {"type": "mrkdwn", "text": MOVED_CORA_CARD_TEXT}}])
+    except Exception as exc:  # class only
+        logger.error("[soft-approval] retiring a moved Cora card failed: %s", type(exc).__name__)
 
 
 def allowed_user_ids() -> frozenset[str]:
@@ -87,36 +103,13 @@ def _open_form(payload: dict) -> None:
     message = payload.get("message") or {}
     view = build_form_view(
         call_id=str(action.get("value") or ""),
-        channel=str((payload.get("channel") or {}).get("id") or ""),
+        channel=channel,
         message_ts=str(message.get("ts") or ""),
     )
     try:
         slack_client().views_open(trigger_id=payload.get("trigger_id", ""), view=view)
     except Exception as exc:  # class only
         logger.error("[soft-approval] opening the form failed: %s", type(exc).__name__)
-
-
-def _record_deal_facts(db, phone: str, facts: SoftApprovalFacts) -> Optional[int]:
-    """F5: the address and close date the caller entered reach the lead card and routing (source slack_form).
-    Never blocks the soft approval; only runs while T-12 enrichment is switched on."""
-    if not enrichment_enabled():
-        return None
-    try:
-        with db.begin_nested():
-            return record_deal_facts(
-                db, phone=phone, address=facts.property_address,
-                target_close_date=facts.target_close_date, source=SLACK_FORM_SOURCE)
-    except Exception as exc:  # class only: SQL errors embed bound params (phones)
-        logger.error("[soft-approval] recording the deal facts failed: %s", type(exc).__name__)
-        return None
-
-
-def _enrich_after_form(lead_id: int) -> None:
-    try:
-        with lending_session() as db:
-            enrich_lead(db, lead_id)
-    except Exception as exc:
-        logger.error("[soft-approval] enrichment re-run failed lead=%s: %s", lead_id, type(exc).__name__)
 
 
 def _digits(value: str) -> str:
@@ -163,7 +156,7 @@ def _refresh_card(client, *, channel: str, message_ts: str, call_id: str, phone:
 
 def _process_submission(call_id: str, facts: SoftApprovalFacts, user_id: str, channel: str, message_ts: str) -> None:
     status_text = "The soft approval could not be processed. Please tell the engineering team."
-    lead_id: Optional[int] = None
+    phone = None
     card: Optional[tuple[str, Optional[str], str]] = None  # (phone, caller, outcome key)
     client = slack_client()
     try:
@@ -176,7 +169,6 @@ def _process_submission(call_id: str, facts: SoftApprovalFacts, user_id: str, ch
             if not phone:
                 status_text = ":warning: That call was not found, so no soft approval was made."
             else:
-                lead_id = _record_deal_facts(db, phone, facts)
                 outcome = generate_soft_approval(
                     db, phone=phone, dialer_call_id=call_id, facts=facts, submitted_by=user_id or None)
                 status_text = _status_text(outcome) or status_text
@@ -186,7 +178,6 @@ def _process_submission(call_id: str, facts: SoftApprovalFacts, user_id: str, ch
                                 channel=channel, message_ts=message_ts)
     except Exception as exc:  # class only: SQL errors embed bound params (phones)
         logger.error("[soft-approval] call %s submission failed: %s", call_id, type(exc).__name__)
-        lead_id = None
     if channel and message_ts:
         try:
             client.chat_postMessage(channel=channel, thread_ts=message_ts, text=status_text)
@@ -195,8 +186,8 @@ def _process_submission(call_id: str, facts: SoftApprovalFacts, user_id: str, ch
         if card is not None:
             _refresh_card(client, channel=channel, message_ts=message_ts, call_id=call_id,
                           phone=card[0], caller=card[1], key=card[2])
-    if lead_id is not None:
-        _enrich_after_form(lead_id)
+    if phone:
+        share_facts_with_enrichment(call_id, phone, facts)
 
 
 def _handle_submission(payload: dict, background: BackgroundTasks) -> dict[str, Any]:
@@ -216,7 +207,7 @@ def _handle_submission(payload: dict, background: BackgroundTasks) -> dict[str, 
     if not call_id:
         return {"response_action": "errors", "errors": {"address": "This form has expired. Open it again from the card."}}
     background.add_task(
-        _process_submission, call_id, facts, str((payload.get("user") or {}).get("id") or ""),
+        _process_submission, call_id, facts, _user_id(payload),
         str(meta.get("channel") or ""), str(meta.get("message_ts") or ""),
     )
     return {}
@@ -237,11 +228,9 @@ async def slack_interactivity(request: Request, background: BackgroundTasks) -> 
         payload: Optional[dict] = json.loads(parse_qs(body.decode()).get("payload", [""])[0])
     except ValueError:
         payload = None
-    # The lending app has one Interactivity URL: Cora's approval-card clicks share it. They are routed
-    # before the soft-approval switch so turning soft approval off never strands a Cora approval.
-    if isinstance(payload, dict) and is_cora_click(payload):
-        action = (payload.get("actions") or [{}])[0]
-        background.add_task(handle_slack_request, "interactive", payload, str(action.get("action_ts") or ""))
+    # Checked before the soft-approval switch: an old Cora card must never look clickable but dead.
+    if isinstance(payload, dict) and is_moved_cora_click(payload):
+        background.add_task(_retire_moved_cora_card, payload)
         return {}
     if not get_settings().lending_soft_approval_enabled:
         return {}

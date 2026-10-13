@@ -78,3 +78,15 @@ def test_watermark_in_real_pdf():
         text = " ".join((page.extract_text() or "") for page in doc.pages).replace(chr(10), " ")
     assert "NON-BINDING PRE-QUALIFICATION ESTIMATE" in text
     assert "FOR INFORMATIONAL PURPOSES ONLY" in text
+
+
+def test_letter_has_no_company_name_and_is_signed_by_josh():
+    ctx = prequal.build_context(PrequalLead("680-719", 300_000, "FL", "FIX_AND_FLIP"), [FitLimits(75_000, 2_000_000)], 10)
+    html = render_html(prequal.TEMPLATE, ctx, watermark=NON_BINDING_PREQUAL_WATERMARK)
+    assert "next deal lending" not in html.lower()
+    assert "Josh Kantor, Loan Officer" in html
+    assert "subject to lender confirmation" in html
+
+
+def test_range_has_no_upper_clamp_when_a_lender_states_no_maximum():
+    assert prequal.compute_range(500_000, [FitLimits(75_000, None)], 10) == (450_000, 550_000)

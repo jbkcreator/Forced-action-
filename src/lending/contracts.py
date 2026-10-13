@@ -151,6 +151,9 @@ class BorrowerProfile(BaseModel):
     raising.
 
     credit_band_min_fico: lower bound of the caller-asked credit band.
+    credit_band_max_fico: upper bound of a closed band ("600-639" -> 639); None when the band is
+        open-ended ("640+") or unknown. A band whose upper bound is below a lender's floor cannot
+        qualify, so it declines instead of showing as possible.
         "Is your credit generally above 640 or below?" → 640 or None.
         640 = Backflip flip-product floor; 680 = construction floor.
         An exact FICO score is never captured (playbook rule, Josh Oct 1 D2).
@@ -173,6 +176,7 @@ class BorrowerProfile(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     credit_band_min_fico: Optional[int] = None
+    credit_band_max_fico: Optional[int] = None  # upper bound of a closed band; None = open-ended or unknown
     completed_projects: Optional[int] = None
     completed_ground_up_builds: Optional[int] = None
     has_live_deal: Optional[bool] = None

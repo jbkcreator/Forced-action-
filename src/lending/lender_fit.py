@@ -332,8 +332,15 @@ def _check_rules(
                 f"{_unconfirmed(source, 'credit_floor')}",
                 DeclineReason.CREDIT_BELOW_MIN,
             ))
+        elif profile.credit_band_max_fico is not None and profile.credit_band_max_fico < rules.credit_floor:
+            # A closed band whose top is below the floor cannot qualify.
+            declines.append((
+                f"credit band {band}-{profile.credit_band_max_fico} below lender floor {rules.credit_floor}"
+                f"{_unconfirmed(source, 'credit_floor')}",
+                DeclineReason.CREDIT_BELOW_MIN,
+            ))
         else:
-            # The band is "this value or higher", so it may or may not clear the floor.
+            # An open-ended band ("band+") or a closed one that crosses the floor may or may not clear it.
             unknowns.append(
                 f"credit band {band}+ straddles the {rules.credit_floor} floor — "
                 f"needs confirmation on the call"
