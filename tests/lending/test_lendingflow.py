@@ -30,6 +30,7 @@ from src.lending.web_leads import DeliveryError, PushResult
 SECRET = "s3cret"
 CERT_RAW = "  -----CERT-----\n  consent ✓ line two\t\n"
 FIXTURE = Path(__file__).parent / "fixtures" / "lendingflow_fake.json"
+_LF_TABLES = ("lendingflow_leads", "lead_consent_certificates")
 
 
 def _payload(**overrides):
@@ -56,8 +57,10 @@ def lf_db(lending_db):
     from migrations.apply_lending_web_leads import apply_to as apply_web  # noqa: F401  (schema parity)
 
     apply_to(lending_db.get_bind())
-    # The shared DB can already hold real rows; counts in these tests are rows added by the test itself.
-    lending_db.info["baseline"] = {t: _raw_count(lending_db, t) for t in ("lendingflow_leads", "lead_consent_certificates")}
+    # The shared DB can already hold real rows: these tests only count and read rows they added.
+    lending_db.info["baseline"] = {t: _raw_count(lending_db, t) for t in _LF_TABLES}
+    lending_db.info["max_id"] = {t: lending_db.execute(text(f"SELECT COALESCE(max(id), 0) FROM lending.{t}")).scalar_one()
+                                 for t in _LF_TABLES}
     return lending_db
 
 
@@ -90,6 +93,12 @@ def _raw_count(db, table):
 
 def _count(db, table):
     return _raw_count(db, table) - db.info.get("baseline", {}).get(table, 0)
+
+
+def _select_added(db, table, columns):
+    """``SELECT columns`` over the rows this test added only, never real rows on the shared DB."""
+    return db.execute(text(f"SELECT {columns} FROM lending.{table} WHERE id > :base"),
+                      {"base": db.info.get("max_id", {}).get(table, 0)})
 
 
 # ------------------------------------------------------------------ parsing
@@ -166,7 +175,7 @@ def test_new_lead_creates_lead_contact_certificate(client, lf_db):
     assert _count(lf_db, "lendingflow_leads") == 1 and _count(lf_db, "lead_consent_certificates") == 1
     assert lf_db.execute(text("SELECT count(*) FROM lending.contacts WHERE phone = '+17275550100'")).scalar_one() == 1
     assert len(client.scheduled) == 1
-    row = lf_db.execute(text("SELECT contact_id, consent_status, ghl_status FROM lending.lendingflow_leads")).one()
+    row = _select_added(lf_db, "lendingflow_leads", "contact_id, consent_status, ghl_status").one()
     assert row.contact_id is not None and row.consent_status == "present" and row.ghl_status == "pending"
 
 
@@ -175,7 +184,7 @@ def test_duplicate_vendor_id(client, lf_db):
     second = _post(client, _payload(phone="(813) 555-0142", email="other@example.com")).json()
     assert second == {"status": "duplicate", "lead_id": first["lead_id"]}
     assert _count(lf_db, "lendingflow_leads") == 1
-    assert lf_db.execute(text("SELECT duplicate_count FROM lending.lendingflow_leads")).scalar_one() == 1
+    assert _select_added(lf_db, "lendingflow_leads", "duplicate_count").scalar_one() == 1
     assert _count(lf_db, "lead_consent_certificates") == 2  # the duplicate's evidence is kept
     assert len(client.scheduled) == 1  # no second delivery
 
@@ -197,7 +206,7 @@ def test_malformed_payload_is_400_with_detail(client, lf_db, raw):
 
 def test_certificate_stored_verbatim(client, lf_db):
     _post(client)
-    cert = lf_db.execute(text("SELECT * FROM lending.lead_consent_certificates")).mappings().one()
+    cert = _select_added(lf_db, "lead_consent_certificates", "*").mappings().one()
     assert cert["raw_certificate"] == CERT_RAW
     assert cert["client_ip"] == "203.0.113.7" and cert["source_url"] == "https://lendingflow.example/apply"
     assert cert["tcpa_disclosure_text"] == "By clicking Submit you agree"
@@ -206,7 +215,7 @@ def test_certificate_stored_verbatim(client, lf_db):
 
 def test_certificate_without_timestamp_is_receipt_only(client, lf_db):
     _post(client, _payload(consent={"raw": "abc"}))
-    cert = lf_db.execute(text("SELECT verified_at, received_at, verification_method FROM lending.lead_consent_certificates")).one()
+    cert = _select_added(lf_db, "lead_consent_certificates", "verified_at, received_at, verification_method").one()
     assert cert.verification_method == "receipt_only" and cert.verified_at == cert.received_at
 
 
@@ -214,7 +223,7 @@ def test_no_certificate_marks_consent_missing(client, lf_db):
     body = _payload()
     del body["consent"]
     assert _post(client, body).status_code == 200
-    assert lf_db.execute(text("SELECT consent_status FROM lending.lendingflow_leads")).scalar_one() == "missing"
+    assert _select_added(lf_db, "lendingflow_leads", "consent_status").scalar_one() == "missing"
     assert _count(lf_db, "lead_consent_certificates") == 0 and len(client.scheduled) == 1
 
 
@@ -265,7 +274,7 @@ def test_suppressed_phone_is_stored_but_never_delivered(client, lf_db):
     lf_db.execute(text("INSERT INTO lending.contacts (phone, do_not_contact) VALUES ('+17275550100', true) "
                        "ON CONFLICT (phone) DO UPDATE SET do_not_contact = true"))
     assert _post(client).json()["status"] == "created"
-    row = lf_db.execute(text("SELECT suppressed, suppression_reason, ghl_status FROM lending.lendingflow_leads")).one()
+    row = _select_added(lf_db, "lendingflow_leads", "suppressed, suppression_reason, ghl_status").one()
     assert row.suppressed and row.suppression_reason == "do_not_contact" and row.ghl_status == "skipped"
     assert client.scheduled == []
     assert deliver_pending(lf_db, RecordingSink()) == []
@@ -315,8 +324,7 @@ def test_failed_push_then_sweep_emits_exactly_once(lf_db, seen):
     events, _ = seen
     _saved(lf_db)
     assert deliver_pending(lf_db, RecordingSink(error=DeliveryError("contact upsert: HTTP 500"))) == []
-    row = lf_db.execute(text("SELECT ghl_status, ghl_attempts, ghl_last_error, event_emitted_at "
-                             "FROM lending.lendingflow_leads")).one()
+    row = _select_added(lf_db, "lendingflow_leads", "ghl_status, ghl_attempts, ghl_last_error, event_emitted_at").one()
     assert row.ghl_status == "failed" and row.ghl_attempts == 1 and row.event_emitted_at is None
     later = datetime.now(timezone.utc) + timedelta(hours=2)
     run_followups(lf_db, deliver_pending(lf_db, RecordingSink(), now=later))
@@ -346,7 +354,7 @@ def test_event_handler_failure_does_not_stop_prequal(lf_db, seen):
 def test_no_sink_leaves_lead_pending(lf_db):
     _saved(lf_db)
     assert deliver_pending(lf_db, None) == []
-    assert lf_db.execute(text("SELECT ghl_status, ghl_attempts FROM lending.lendingflow_leads")).one() == ("pending", 0)
+    assert _select_added(lf_db, "lendingflow_leads", "ghl_status, ghl_attempts").one() == ("pending", 0)
 
 
 def test_ghl_sink_tags_missing_consent_and_skips_card_without_stage(monkeypatch):
@@ -393,7 +401,7 @@ def test_logs_carry_no_phone_or_email(client, lf_db, seen, caplog):
 # ------------------------------------------------------------------ follow-up recovery
 
 def _row(db):
-    return db.execute(text("SELECT ghl_status, event_emitted_at, followup_done_at FROM lending.lendingflow_leads")).one()
+    return _select_added(db, "lendingflow_leads", "ghl_status, event_emitted_at, followup_done_at").one()
 
 
 def test_failed_prequal_handoff_is_retried_by_the_sweep(lf_db, seen, monkeypatch):
@@ -484,10 +492,12 @@ def test_missing_lead_id_gets_the_no_lead_id_tag():
     assert "lendingflow-no-lead-id" not in _tags({"consent_status": "present", "vendor_lead_id": "LF-1"})
 
 
-def test_missing_lead_id_is_logged_without_phone_or_email(caplog):
-    with caplog.at_level("WARNING"):
-        parse_lendingflow({"phone": "7275550100", "email": "a@example.com"})
-    assert "7275550100" not in caplog.text and "example.com" not in caplog.text
+def test_missing_lead_id_is_logged_by_row_id_only(lf_db, caplog):
+    payload = {"phone": "7275550100", "email": "a@example.com"}
+    with caplog.at_level("INFO"):
+        result = save_lead(lf_db, parse_lendingflow(payload), payload)
+    assert f"lead created id={result.lead_id} without a LendingFlow lead id" in caplog.text
+    assert "7275550100" not in caplog.text and "example.com" not in caplog.text and "missing:" not in caplog.text
 
 
 def test_payload_without_lead_id_is_created_then_deduped(client, lf_db):

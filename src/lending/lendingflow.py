@@ -237,7 +237,6 @@ def parse_lendingflow(payload: Any) -> ParsedLendingFlowLead:
     if not vendor_id:
         # Stored and flagged, never rejected: the id is derived from phone + email, so a resend still dedupes.
         vendor_id = MISSING_LEAD_ID_PREFIX + dedupe_hash(phone, email)
-        logger.warning("[lendingflow] lead without a lead id, stored as %s", vendor_id[:20])
     amount_raw, amount_min, amount_max = _loan_amount(payload.get("loan_amount"))
     band = _str(payload, "credit_score_range", "credit_score", "credit_band", limit=40)
     return ParsedLendingFlowLead(
@@ -350,7 +349,12 @@ def save_lead(db, parsed: ParsedLendingFlowLead, raw_payload: Any, *, now: Optio
         return raced
     if parsed.certificate:
         store_certificate(db, row.id, parsed.certificate, duplicate=False, now=now)
-    logger.info("[lendingflow] lead created id=%s vendor=%s suppressed=%s", row.id, parsed.vendor_lead_id, reason is not None)
+    if parsed.vendor_lead_id.startswith(MISSING_LEAD_ID_PREFIX):
+        logger.warning("[lendingflow] lead created id=%s without a LendingFlow lead id", row.id)
+        logger.info("[lendingflow] lead created id=%s suppressed=%s", row.id, reason is not None)
+    else:
+        logger.info("[lendingflow] lead created id=%s vendor=%s suppressed=%s", row.id, parsed.vendor_lead_id,
+                    reason is not None)
     return SaveResult(row.id, str(row.lead_uuid), created=True, suppressed=reason is not None)
 
 
