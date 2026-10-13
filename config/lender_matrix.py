@@ -6,12 +6,13 @@ Josh can update them without touching business logic.
 
 VERIFICATION STATUS
 -------------------
-``verified=True`` on a lender means its parameter values have been reviewed
-and confirmed by Josh Kantor.  ``verified=False`` means the shell is
-structurally complete but the values are placeholders; the evaluator will
-route the lender to ``non_fitting`` with reason
-"lender parameters not yet verified — awaiting Josh confirmation" rather
-than silently treating the lender as eligible.
+``verified=True`` on a lender means all of its parameter values have been
+confirmed by Josh Kantor.  ``verified=False`` means the values are
+placeholders: every parameter carries a status (``field_status``: confirmed /
+placeholder / confirm_at_submission), and a parameter the lender has no value
+for takes ``PLACEHOLDER_BOX`` (Josh, A1, Oct 8).  The evaluator still evaluates
+such a lender; a pass is flagged ``subject_to_confirmation`` and the fit score
+stays hidden until every lender is confirmed.
 
 Current status (2026-10-08):
   generic_backflip_* — CLIENT-STATED, NOT YET CONFIRMED (verified=False):
@@ -49,11 +50,11 @@ a specific rate or term being offered to a borrower.  See Consolidated §5.2
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
-from typing import Optional
+from typing import Mapping, Optional
 
-from src.lending.contracts import LoanType
+from src.lending.contracts import FieldStatus, LoanType
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +113,56 @@ class LenderRules:
     origination_points: Optional[Decimal] = None
     rate_spread: Optional[Decimal] = None
     hold_months: int = 12          # Q2: confirm with Josh
+
+    # Per-field status (Josh, A1): confirmed / placeholder / confirm_at_submission.
+    # A parameter not listed is CONFIRMED when ``verified`` is True, else PLACEHOLDER.
+    field_status: Mapping[str, FieldStatus] = field(default_factory=dict, compare=False, hash=False)
+
+
+# The parameters that carry a status (everything except identity and the status map itself).
+PARAMETER_FIELDS: tuple[str, ...] = (
+    "loan_types", "min_loan_amount", "max_loan_amount", "max_ltc", "max_ltv",
+    "min_purchase_price", "credit_floor", "min_completed_projects",
+    "requires_ground_up_build", "approved_states", "allowed_property_types",
+    "origination_points", "rate_spread", "hold_months",
+)
+
+# Josh's generic placeholder box (A1, Oct 8): used for any parameter a lender has no value for
+# until he marks it confirmed. Every number here is a placeholder. His 85% purchase advance and
+# 100% rehab funding are sizing shares, kept with the soft-approval parameters, not the fit rules.
+PLACEHOLDER_BOX: dict[str, object] = {
+    "loan_types": frozenset({LoanType.FIX_AND_FLIP}),
+    "min_loan_amount": Decimal("75_000"),
+    "max_loan_amount": Decimal("2_000_000"),
+    "max_ltc": Decimal("0.85"),
+    "max_ltv": Decimal("0.70"),
+    "credit_floor": 680,
+    "approved_states": frozenset({"FL", "GA", "TX"}),
+}
+
+
+def field_status_of(rules: LenderRules, name: str) -> FieldStatus:
+    explicit = rules.field_status.get(name)
+    if explicit is not None:
+        return explicit
+    return FieldStatus.CONFIRMED if rules.verified else FieldStatus.PLACEHOLDER
+
+
+def fully_confirmed(rules: LenderRules) -> bool:
+    """True only when every parameter of this lender is confirmed."""
+    return all(field_status_of(rules, name) is FieldStatus.CONFIRMED for name in PARAMETER_FIELDS)
+
+
+def effective_rules(rules: LenderRules) -> LenderRules:
+    """The rules to evaluate: unset, unconfirmed parameters take the placeholder value (A1: an
+    unknown cap is never skipped). A confirmed parameter that is unset means "no limit"."""
+    fills = {}
+    for name, value in PLACEHOLDER_BOX.items():
+        current = getattr(rules, name)
+        unset = current is None or (isinstance(current, frozenset) and not current)
+        if unset and field_status_of(rules, name) is not FieldStatus.CONFIRMED:
+            fills[name] = value
+    return replace(rules, **fills) if fills else rules
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +294,12 @@ def validate_lender_matrix(matrix: tuple[LenderRules, ...] = LENDER_MATRIX) -> N
 
         if rules.hold_months < 1:
             raise ValueError(f"{rules.key}: hold_months must be ≥ 1")
+
+        unknown = set(rules.field_status) - set(PARAMETER_FIELDS)
+        if unknown:
+            raise ValueError(f"{rules.key}: field_status names unknown parameters {sorted(unknown)}")
+        if rules.verified and any(s is not FieldStatus.CONFIRMED for s in rules.field_status.values()):
+            raise ValueError(f"{rules.key}: verified=True but a field is not confirmed")
 
 
 validate_lender_matrix()

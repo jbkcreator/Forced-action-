@@ -933,6 +933,9 @@ class AppSettings(BaseSettings):
 	# T-11 LendingFlow intake. Off by default; the receiver is closed (503) until the flag is on AND the secret is set.
 	lending_lendingflow_enabled: bool = Field(default=False, env="LENDING_LENDINGFLOW_ENABLED")
 	lending_lendingflow_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_LENDINGFLOW_WEBHOOK_SECRET")
+	# Off: no lead gets the lendingflow-intro-ready tag, so the GHL intro-SMS workflow cannot start (client: keep the
+	# intro text off until LendingFlow confirms its consent covers it and whether it runs a DNC/litigator check).
+	lending_lendingflow_intro_sms_enabled: bool = Field(default=False, env="LENDING_LENDINGFLOW_INTRO_SMS_ENABLED")
 	# Pipeline stage (in LENDING_GHL_PIPELINE_ID) for new LendingFlow leads; unset = contact only.
 	lending_ghl_stage_lendingflow_new: Optional[str] = Field(default=None, env="LENDING_GHL_STAGE_LENDINGFLOW_NEW")
 	# T-09 intro SMS. Off: the tag that starts the GHL intro workflow is never added, so nobody is texted. Turn on only after
@@ -964,11 +967,14 @@ class AppSettings(BaseSettings):
 	lending_disposition_sheet_tab: str = Field(default="Dispositions", env="LENDING_DISPOSITION_SHEET_TAB")
 	# Call-One soft approval PDF (T-08): off until Josh approves the template and the calculation inputs.
 	lending_soft_approval_enabled: bool = Field(default=False, env="LENDING_SOFT_APPROVAL_ENABLED")
+	# Lender rules read from lending.lender_rule_values (T-05): off until the table is migrated and seeded; off = config/lender_matrix.py.
+	lending_rules_from_db: bool = Field(default=False, env="LENDING_RULES_FROM_DB")
 	lending_slack_signing_secret: Optional[SecretStr] = Field(default=None, env="LENDING_SLACK_SIGNING_SECRET")  # verifies Slack interactivity posts to lending-api
 	# ── Lending Cora agent (packages/agent_core, systemd fa-lending-cora) ──
-	# Cora runs on the lending Slack app (LENDING_SLACK_BOT_TOKEN, LENDING_SLACK_SIGNING_SECRET) in HTTP mode:
-	# events at /webhooks/lending/slack-events, clicks at /webhooks/lending/slack-interactivity. Approvers are
-	# the only users whose clicks release an external send, so keep that list to Josh's Slack user id.
+	# Cora has her own Slack app, connected over Socket Mode from fa-lending-cora (no public endpoint).
+	# Approvers are the only users whose clicks release an external send, so keep that list to Josh's Slack user id.
+	lending_cora_slack_bot_token: Optional[SecretStr] = Field(default=None, env="LENDING_CORA_SLACK_BOT_TOKEN")  # xoxb- of Cora's own app
+	lending_cora_slack_app_token: Optional[SecretStr] = Field(default=None, env="LENDING_CORA_SLACK_APP_TOKEN")  # xapp- (connections:write) for Socket Mode
 	lending_cora_channel: str = Field(default="", env="LENDING_CORA_CHANNEL")  # channel ID for approval cards
 	lending_cora_approver_user_ids: str = Field(default="", env="LENDING_CORA_APPROVER_USER_IDS")  # comma-separated Slack user ids
 	lending_cora_operator_user_ids: str = Field(default="", env="LENDING_CORA_OPERATOR_USER_IDS")  # may chat, may not approve

@@ -128,6 +128,16 @@ def test_rule_from_one_thread_governs_a_fresh_thread(store: AgentStore) -> None:
     assert f"<standing_rules>\n- {rule}\n</standing_rules>" in fresh["system"]
 
 
+def test_no_quoting_rule_and_masking_are_in_every_turn(store: AgentStore) -> None:
+    """The no-quoting rule governs borrower drafts even when a standing rule pulls the other way."""
+    cora = Cora(store, FakeMessages(response(text_block("ok"))))
+    cora.say(JOSH, "hello", ts="40.0")
+    system = cora.client.requests[-1]["system"]
+    assert "never quotes a rate, term, point, fee, ratio, payment or any range or ballpark" in system
+    assert "A standing rule never overrides this" in system
+    assert "email addresses only masked" in system and "Never quote consent wording" in system
+
+
 def test_operator_cannot_set_a_standing_rule(store: AgentStore) -> None:
     cora = Cora(store, FakeMessages(
         response(tool_block("toolu_r", "save_standing_rule", {"category": "messaging", "rule_text": "Never call"}),
@@ -169,7 +179,8 @@ def test_approved_draft_is_not_sent_without_a_registered_sender(store: AgentStor
         "type": "block_actions", "user": {"id": JOSH}, "channel": {"id": "C_CORA"}, "message": {"ts": card_ts},
         "actions": [{"action_id": "agent_core_approve", "value": "1"}]}, "env-1")
     assert cora.queue.get(1).status is ActionStatus.FAILED
-    assert "send failed" in cora.chat.updates[-1]["text"]
+    assert "Approved, not sent" in cora.chat.updates[-1]["text"]
+    assert "isn't switched on yet" in cora.chat.updates[-1]["text"]
 
 
 def test_revise_reply_redrafts_and_posts_a_fresh_card(store: AgentStore) -> None:
@@ -177,21 +188,56 @@ def test_revise_reply_redrafts_and_posts_a_fresh_card(store: AgentStore) -> None
         response(tool_block("toolu_s", "draft_sms", {"lead_ref": "web_lead:7", "body": "Hi Sam, Josh here."}),
                  stop_reason="tool_use"),
         response(text_block("Drafted.")),
-        response(text_block(json.dumps({"body": "Sam, Josh here: 100% rehab funding for flips. Free to talk?"}))),
+        response(text_block(json.dumps({"body": "Sam, Josh here: we fund rehab on flips too. Free to talk?"}))),
     ))
     cora.say(JOSH, "text Sam", ts="70.0")
     first_card = cora.queue.get(1).card_ts
     cora.session.handle_request("interactive", {
         "type": "block_actions", "user": {"id": JOSH}, "channel": {"id": "C_CORA"}, "message": {"ts": first_card},
         "actions": [{"action_id": "agent_core_revise", "value": "1"}]}, "env-2")
-    cora.say(JOSH, "mention 100% rehab funding", ts="71.0", thread_ts="70.0")
+    cora.say(JOSH, "mention that we fund rehab", ts="71.0", thread_ts="70.0")
 
     action = cora.queue.get(1)
     assert action.status is ActionStatus.PENDING
-    assert action.payload["body"].startswith("Sam, Josh here: 100% rehab")
+    assert action.payload["body"].startswith("Sam, Josh here: we fund rehab")
     assert action.payload["to_phone"] == "+17275550100"
     assert action.card_ts and action.card_ts != first_card
     assert "Revised action #1" in cora.chat.posts[-1]["text"]
+
+
+def test_a_revision_cannot_add_quoted_numbers(store: AgentStore) -> None:
+    """The no-quoting rule is enforced on the redraft too, so "Revise" cannot get around it."""
+    cora = Cora(store, FakeMessages(
+        response(tool_block("toolu_s", "draft_sms", {"lead_ref": "web_lead:7", "body": "Hi Sam, Josh here."}),
+                 stop_reason="tool_use"),
+        response(text_block("Drafted.")),
+        response(text_block(json.dumps({"body": "Sam, Josh here: 100% rehab funding for flips. Free to talk?"}))),
+    ))
+    cora.say(JOSH, "text Sam", ts="72.0")
+    card = cora.queue.get(1).card_ts
+    cora.session.handle_request("interactive", {
+        "type": "block_actions", "user": {"id": JOSH}, "channel": {"id": "C_CORA"}, "message": {"ts": card},
+        "actions": [{"action_id": "agent_core_revise", "value": "1"}]}, "env-3")
+    cora.say(JOSH, "mention 100% rehab funding", ts="73.0", thread_ts="72.0")
+
+    action = cora.queue.get(1)
+    assert action.payload["body"] == "Hi Sam, Josh here."  # the original draft is kept
+    assert "couldn't revise action #1" in cora.chat.posts[-1]["text"]
+    assert "never quote numbers" in cora.chat.posts[-1]["text"]
+
+
+def test_a_draft_quoting_numbers_is_refused_and_never_queued(store: AgentStore) -> None:
+    cora = Cora(store, FakeMessages(
+        response(tool_block("toolu_q", "draft_sms",
+                            {"lead_ref": "web_lead:7", "body": "Sam, we offer 100% rehab funding at 10.5%."}),
+                 stop_reason="tool_use"),
+        response(text_block("I can't quote numbers to a borrower, so I left them out.")),
+    ))
+    cora.say(JOSH, "text Sam about our rates", ts="74.0")
+    assert cora.queue.get(1) is None
+    result = next(m["content"][0] for m in cora.client.requests[-1]["messages"]
+                  if m["role"] == "user" and isinstance(m["content"], list))
+    assert result["is_error"] and "never quote numbers" in result["content"]
 
 
 class SlackRefusesCards(FakeChatPort):

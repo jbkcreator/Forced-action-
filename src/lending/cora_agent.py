@@ -1,16 +1,15 @@
-"""Cora, the Next Deal Lending Slack operator: wiring, and the sweep worker (systemd ``fa-lending-cora``).
+"""Cora, the Next Deal Lending Slack operator: process entry point (systemd ``fa-lending-cora``).
 
-Cora runs on the existing lending Slack app in HTTP mode (Events API). Slack delivers messages to
-``POST /webhooks/lending/slack-events`` and Approve / Revise / Reject clicks to the shared
-``POST /webhooks/lending/slack-interactivity``; both are served by ``lending-api``, which hands
-them to the session from :func:`build_live_services` (see ``cora_runtime``). Each message is
-answered by the native Messages API loop (``agent_core.agent_loop``) with the conversation so far
-as history, the standing rules from ``lending.agent_memory`` in the system prompt, and Cora's
+Cora has her own Slack app and connects over Socket Mode (an outbound WebSocket, so no public
+endpoint). Messages and Approve / Revise / Reject clicks arrive on that connection. Each message
+is answered by the native Messages API loop (``agent_core.agent_loop``) with the conversation so
+far as history, the standing rules from ``lending.agent_memory`` in the system prompt, and Cora's
 lending tools. Draft tools only queue approval cards.
 
-This module's ``main()`` is the sweep worker: once a minute it expires stale drafts, re-posts
-approval cards Slack refused, and sends approved actions that were not sent at click time. Every
-send first passes the lending send-time check (suppressed / do-not-contact / text consent).
+Alongside the session, a sweep runs once a minute: it expires stale drafts, re-posts approval
+cards Slack refused, and sends approved actions that were not sent at click time. Every send first
+passes the lending send-time check (suppressed / do-not-contact / text consent). Run exactly one
+instance.
 
 Usage:
     PYTHONPATH=. python -m src.lending.cora_agent
@@ -37,13 +36,13 @@ from packages.agent_core.pending_actions import PendingAction, PendingActionQueu
 from packages.agent_core.relay import EgressExecutor, Relay, SendCheck
 from packages.agent_core.revision import DraftReviser, RevisionFailed
 from packages.agent_core.send_gate import SendGate
-from packages.agent_core.slack_session import InboundMessage, SlackSession
+from packages.agent_core.slack_session import InboundMessage, SlackSession, run_socket_mode
 from packages.agent_core.store import AgentStore
 from packages.agent_core.thread_history import build_history
 from packages.agent_core.tools import ToolContext, ToolRegistry
 from src.lending.consent import has_text_consent
 from src.lending.cora_prompt import CORA_BASE_PROMPT, REVISION_PROMPT
-from src.lending.cora_tools import CoraToolkit
+from src.lending.cora_tools import CoraToolkit, draft_content_check
 from src.lending.models import LENDING_SCHEMA
 from src.services.phone_utils import normalize
 
@@ -77,6 +76,7 @@ class CoraServices(NamedTuple):
     session: SlackSession
     relay: Relay
     gate: SendGate
+    web_client: Any = None  # the Slack WebClient Socket Mode replies through; None in tests
 
 
 def _secret(value) -> Optional[str]:
@@ -86,8 +86,8 @@ def _secret(value) -> Optional[str]:
 def build_config(settings: AppSettings) -> AgentCoreConfig:
     return AgentCoreConfig(
         agent_name=AGENT_NAME,
-        # The lending Slack app's bot, in HTTP mode: no app-level (Socket Mode) token.
-        slack_bot_token=_secret(settings.lending_slack_bot_token),
+        slack_bot_token=_secret(settings.lending_cora_slack_bot_token),
+        slack_app_token=_secret(settings.lending_cora_slack_app_token),
         slack_channel_id=settings.lending_cora_channel or None,
         approver_user_ids=parse_user_ids(settings.lending_cora_approver_user_ids),
         operator_user_ids=parse_user_ids(settings.lending_cora_operator_user_ids),
@@ -214,7 +214,8 @@ def build_session(config: AgentCoreConfig, store: AgentStore, chat: ChatPort, bo
     loop = AgentLoop(client=messages_client, model=config.model, registry=ToolRegistry(toolkit.tools(), gate),
                      base_prompt=CORA_BASE_PROMPT, rules_provider=rules)
     reviser = DraftReviser(client=messages_client, model=config.model, queue=queue, gate=gate,
-                           base_prompt=REVISION_PROMPT, rules_provider=rules, editable_fields=EDITABLE_FIELDS)
+                           base_prompt=REVISION_PROMPT, rules_provider=rules, editable_fields=EDITABLE_FIELDS,
+                           content_check=draft_content_check)
     conversation = CoraConversation(config=config, chat=chat, loop=loop, reviser=reviser, bot_user_id=bot_user_id)
     session = SlackSession(config=config, chat=chat, queue=queue, halt=halt, relay=relay,
                            on_message=conversation.on_message, on_revision=conversation.on_revision,
@@ -240,82 +241,101 @@ def run_sweep(services: CoraServices) -> None:
         logger.info("[cora] relay sweep sent=%s failed=%s blocked=%s", result.sent, result.failed, result.blocked)
 
 
-def missing_settings(config: AgentCoreConfig, *, needs_model: bool = True) -> list[str]:
-    """Settings Cora cannot run without. The sweep worker never calls Claude, so it skips the key."""
-    missing = config.missing_for_http_session()
-    if needs_model and not config.anthropic_api_key:
+def missing_settings(config: AgentCoreConfig) -> list[str]:
+    """Settings Cora cannot run without."""
+    missing = config.missing_for_live_session()
+    if not config.anthropic_api_key:
         missing.append("anthropic_api_key")
     return missing
 
 
-class _NoModel:
-    """Stands in for the Claude client in the sweep worker, which only expires, re-posts and relays."""
-
-    def create(self, **_: Any) -> Any:
-        raise RuntimeError("the sweep worker does not call the model")
-
-
-def build_live_services(settings: AppSettings, *, needs_model: bool = True) -> Optional[CoraServices]:
-    """Cora wired to Slack, PostgreSQL and (when ``needs_model``) Claude; None (logged) when it cannot be built.
+def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
+    """Cora wired to Slack, PostgreSQL and Claude; None (logged) when it cannot be built.
 
     None means either missing settings (see :func:`missing_settings`, a configuration problem) or a
     Slack ``auth.test`` failure (usually transient). Fails closed: without approvers no click could
     ever be trusted to release a send.
     """
     config = build_config(settings)
-    missing = missing_settings(config, needs_model=needs_model)
+    missing = missing_settings(config)
     if missing:
         logger.error("[cora] not configured; missing settings: %s", ", ".join(missing))
         return None
 
+    import anthropic
     from slack_sdk.web import WebClient
 
     web = WebClient(token=config.slack_bot_token)
     try:
         bot_user_id = web.auth_test()["user_id"]
     except Exception as exc:
-        logger.error("[cora] Slack auth.test failed (%s); check LENDING_SLACK_BOT_TOKEN", type(exc).__name__)
+        logger.error("[cora] Slack auth.test failed (%s); check LENDING_CORA_SLACK_BOT_TOKEN", type(exc).__name__)
         return None
     engine = create_engine(settings.database_url, pool_pre_ping=True)
-    if needs_model:
-        import anthropic
-
-        messages_client: MessagesClient = anthropic.Anthropic(
-            api_key=config.anthropic_api_key, timeout=90.0, max_retries=2).messages
-    else:
-        messages_client = _NoModel()
-    return build_session(config, AgentStore(engine, config.db_schema), SlackChatPort(web, config.slack_channel_id),
-                         bot_user_id, messages_client=messages_client, send_check=make_send_check(engine))
+    messages_client: MessagesClient = anthropic.Anthropic(
+        api_key=config.anthropic_api_key, timeout=90.0, max_retries=2).messages
+    services = build_session(config, AgentStore(engine, config.db_schema), SlackChatPort(web, config.slack_channel_id),
+                             bot_user_id, messages_client=messages_client, send_check=make_send_check(engine))
+    return services._replace(web_client=web)
 
 
-def main(stop: Optional[threading.Event] = None) -> int:
-    """The sweep worker. Slack events arrive at lending-api, not here.
+def _adopt_open_cards(services: CoraServices) -> None:
+    """Replace approval cards Cora's app cannot act on (those the lending app posted before Cora had
+    her own app) so every open draft stays approvable. Best effort: a failure never blocks startup."""
+    try:
+        reposted = services.gate.adopt_cards()
+    except Exception as exc:
+        logger.error("[cora] checking open approval cards failed (%s); continuing", type(exc).__name__)
+        return
+    if reposted:
+        logger.info("[cora] posted %s replacement approval card(s) under Cora's app", reposted)
 
-    Exits 1 only for missing settings (a configuration problem a restart cannot fix). A failed
-    Slack ``auth.test`` is retried in-process every sweep interval, so a Slack outage at boot never
-    exhausts systemd's restart limit and leaves the worker dead.
-    """
-    if not logging.getLogger().handlers:
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    stop = stop or threading.Event()
-    signal.signal(signal.SIGTERM, lambda *_: stop.set())
-    settings = get_settings()
-    if missing_settings(build_config(settings), needs_model=False):
-        build_live_services(settings, needs_model=False)  # logs exactly what is missing
-        return 1
-    services = build_live_services(settings, needs_model=False)
-    while services is None:
-        logger.warning("[cora] sweep worker could not reach Slack; retrying in %ss", SWEEP_SECONDS)
-        if stop.wait(SWEEP_SECONDS):
-            return 0
-        services = build_live_services(settings, needs_model=False)
-    logger.info("[cora] sweep worker started (every %ss)", SWEEP_SECONDS)
+
+def _sweep_until_stopped(services: CoraServices, stop: threading.Event) -> None:
     while not stop.wait(SWEEP_SECONDS):
         try:
             run_sweep(services)
         except Exception as exc:
             logger.error("[cora] sweep failed (%s); retrying next interval", type(exc).__name__)
-    logger.info("[cora] sweep worker stopped")
+
+
+def main(stop: Optional[threading.Event] = None) -> int:
+    """Run Cora's Socket Mode session and the minute sweep until SIGTERM or Ctrl+C.
+
+    Exits 1 only for missing settings (a configuration problem a restart cannot fix). A failed
+    Slack ``auth.test`` or Socket Mode connect is retried in-process every sweep interval, so a
+    Slack outage at boot never exhausts systemd's restart limit and leaves the worker dead.
+    """
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    stop = stop or threading.Event()
+    # systemctl stop sends SIGTERM; Ctrl+C sends SIGINT. Both close the socket and end cleanly.
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(signum, lambda *_: stop.set())
+    settings = get_settings()
+    config = build_config(settings)
+    missing = missing_settings(config)
+    if missing:
+        logger.error("[cora] not starting; missing settings: %s", ", ".join(missing))
+        return 1
+    services = build_live_services(settings)
+    while services is None:
+        logger.warning("[cora] could not reach Slack; retrying in %ss", SWEEP_SECONDS)
+        if stop.wait(SWEEP_SECONDS):
+            return 0
+        services = build_live_services(settings)
+    _adopt_open_cards(services)
+    threading.Thread(target=_sweep_until_stopped, args=(services, stop), name="cora-sweep", daemon=True).start()
+    logger.info("[cora] starting Socket Mode session (model %s, sweep every %ss)", config.model, SWEEP_SECONDS)
+    while not stop.is_set():
+        try:
+            run_socket_mode(services.session, app_token=config.slack_app_token, web_client=services.web_client,
+                            stop=stop)
+        except Exception as exc:
+            logger.error("[cora] Socket Mode session failed (%s); reconnecting in %ss", type(exc).__name__,
+                         SWEEP_SECONDS)
+            stop.wait(SWEEP_SECONDS)
+    logger.info("[cora] stopped")
     return 0
 
 

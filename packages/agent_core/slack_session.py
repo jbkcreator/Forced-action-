@@ -35,6 +35,7 @@ from .relay import DispatchOutcome, Relay
 logger = logging.getLogger(__name__)
 
 _DEDUP_CAPACITY = 4096
+_STOP_POLL_SECONDS = 1.0
 _IGNORED_SUBTYPES = frozenset({"bot_message", "message_changed", "message_deleted", "channel_join",
                                "channel_leave", "thread_broadcast"})
 
@@ -249,6 +250,9 @@ class SlackSession:
             return ":white_check_mark: *Approved and sent.*"
         if result.outcome is DispatchOutcome.BLOCKED:
             return f":no_entry: *Approved, blocked at send*: {slack_safe(result.reason or 'not allowed')}. Nothing was sent."
+        if result.outcome is DispatchOutcome.NOT_ENABLED:
+            return (":information_source: *Approved, not sent*: sending through this channel isn't switched on "
+                    "yet. Nothing was sent.")
         if result.outcome is DispatchOutcome.FAILED:
             return ":warning: *Approved, send failed.* Nothing was retried; check the action before re-queuing."
         return "Already handled elsewhere; nothing more was sent."
@@ -272,19 +276,33 @@ class SlackSession:
         self._chat.update(channel=channel, ts=ts, text=status_text, blocks=render_decided_card(action, status_text))
 
 
-def run_socket_mode(session: SlackSession, *, app_token: str, web_client: Any) -> None:
-    """Connect over Socket Mode and block forever. Ack first (Slack expects it within 3 s), then route."""
-    from slack_sdk.socket_mode import SocketModeClient
-    from slack_sdk.socket_mode.request import SocketModeRequest
+def run_socket_mode(session: SlackSession, *, app_token: str, web_client: Any,
+                    stop: threading.Event | None = None, client_factory: Callable[..., Any] | None = None) -> None:
+    """Connect over Socket Mode and block until ``stop`` is set (forever without one).
+
+    Each envelope is acked first (Slack expects it within 3 s), then routed. The SDK client
+    reconnects on its own after a dropped connection. ``client_factory`` is the test seam.
+    """
     from slack_sdk.socket_mode.response import SocketModeResponse
 
-    client = SocketModeClient(app_token=app_token, web_client=web_client)
+    if client_factory is None:
+        from slack_sdk.socket_mode import SocketModeClient as client_factory
+    client = client_factory(app_token=app_token, web_client=web_client)
 
-    def on_request(socket_client: SocketModeClient, request: SocketModeRequest) -> None:
+    def on_request(socket_client: Any, request: Any) -> None:
         socket_client.send_socket_mode_response(SocketModeResponse(envelope_id=request.envelope_id))
         session.handle_request(request.type, request.payload or {}, request.envelope_id or "")
 
     client.socket_mode_request_listeners.append(on_request)
-    client.connect()
-    logger.info("socket mode session connected")
-    threading.Event().wait()
+    stop = stop or threading.Event()
+    # The client starts its worker threads when it is built, so it is closed even when connect()
+    # fails: the caller retries, and an unclosed client per attempt would leak threads.
+    try:
+        client.connect()
+        logger.info("socket mode session connected")
+        # Short waits, not one unbounded wait: on Windows an unbounded wait never sees Ctrl+C.
+        while not stop.wait(_STOP_POLL_SECONDS):
+            pass
+    finally:
+        client.close()
+        logger.info("socket mode session closed")
