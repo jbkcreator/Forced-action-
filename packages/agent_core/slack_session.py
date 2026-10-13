@@ -35,6 +35,7 @@ from .relay import DispatchOutcome, Relay
 logger = logging.getLogger(__name__)
 
 _DEDUP_CAPACITY = 4096
+_STOP_POLL_SECONDS = 1.0
 _IGNORED_SUBTYPES = frozenset({"bot_message", "message_changed", "message_deleted", "channel_join",
                                "channel_leave", "thread_broadcast"})
 
@@ -249,6 +250,9 @@ class SlackSession:
             return ":white_check_mark: *Approved and sent.*"
         if result.outcome is DispatchOutcome.BLOCKED:
             return f":no_entry: *Approved, blocked at send*: {slack_safe(result.reason or 'not allowed')}. Nothing was sent."
+        if result.outcome is DispatchOutcome.NOT_ENABLED:
+            return (":information_source: *Approved, not sent*: sending through this channel isn't switched on "
+                    "yet. Nothing was sent.")
         if result.outcome is DispatchOutcome.FAILED:
             return ":warning: *Approved, send failed.* Nothing was retried; check the action before re-queuing."
         return "Already handled elsewhere; nothing more was sent."
@@ -292,8 +296,11 @@ def run_socket_mode(session: SlackSession, *, app_token: str, web_client: Any,
     client.socket_mode_request_listeners.append(on_request)
     client.connect()
     logger.info("socket mode session connected")
+    stop = stop or threading.Event()
     try:
-        (stop or threading.Event()).wait()
+        # Short waits, not one unbounded wait: on Windows an unbounded wait never sees Ctrl+C.
+        while not stop.wait(_STOP_POLL_SECONDS):
+            pass
     finally:
         client.close()
         logger.info("socket mode session closed")

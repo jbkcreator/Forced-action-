@@ -179,7 +179,8 @@ def test_approved_draft_is_not_sent_without_a_registered_sender(store: AgentStor
         "type": "block_actions", "user": {"id": JOSH}, "channel": {"id": "C_CORA"}, "message": {"ts": card_ts},
         "actions": [{"action_id": "agent_core_approve", "value": "1"}]}, "env-1")
     assert cora.queue.get(1).status is ActionStatus.FAILED
-    assert "send failed" in cora.chat.updates[-1]["text"]
+    assert "Approved, not sent" in cora.chat.updates[-1]["text"]
+    assert "isn't switched on yet" in cora.chat.updates[-1]["text"]
 
 
 def test_revise_reply_redrafts_and_posts_a_fresh_card(store: AgentStore) -> None:

@@ -102,7 +102,7 @@ def test_main_runs_the_socket_session_and_the_sweep_until_sigterm(monkeypatch, s
     monkeypatch.setattr(cora_agent.signal, "signal", lambda signum, handler: handlers.append((signum, handler)))
     assert cora_agent.main(stop=stop) == 0
     assert swept[0] is services and stop.is_set()
-    assert [signum for signum, _ in handlers] == [signal.SIGTERM]
+    assert [signum for signum, _ in handlers] == [signal.SIGTERM, signal.SIGINT]
     assert socket_runs == [{"session": "session", "app_token": "xapp-test", "web_client": "web"}]
 
 

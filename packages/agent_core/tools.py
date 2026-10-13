@@ -95,6 +95,16 @@ def _render(result: Any) -> str:
     return text if len(text) <= _RESULT_CHAR_LIMIT else text[:_RESULT_CHAR_LIMIT] + "\n…(truncated)"
 
 
+def _sqlstate_suffix(error: BaseException) -> str:
+    """``", SQLSTATE 57014"`` for a database error wrapped by SQLAlchemy, else empty.
+
+    Duck-typed (psycopg2 ``pgcode``, psycopg 3 ``sqlstate``) so the package needs no driver import.
+    """
+    original = getattr(error, "orig", None) or error
+    code = getattr(original, "pgcode", None) or getattr(original, "sqlstate", None)
+    return f", SQLSTATE {code}" if isinstance(code, str) and code else ""
+
+
 def _validation_message(error: ValidationError) -> str:
     problems = [f"{'.'.join(str(part) for part in issue['loc']) or 'input'}: {issue['msg']}"
                 for issue in error.errors()[:5]]
@@ -136,7 +146,9 @@ class ToolRegistry:
         except ToolInputError as error:
             return ToolOutcome(str(error), is_error=True)
         except Exception as error:
-            logger.error("tool %s failed (%s)", name, type(error).__name__)
+            # The class and SQLSTATE tell a timeout from a lock wait or a dropped connection; the
+            # message is never logged, since driver errors embed bound parameters (phones, emails).
+            logger.error("tool %s failed (%s%s)", name, type(error).__name__, _sqlstate_suffix(error))
             return ToolOutcome(f"{name} failed ({type(error).__name__}); nothing was changed", is_error=True)
 
     def _queue_for_approval(self, tool: Tool, arguments: BaseModel, context: ToolContext) -> ToolOutcome:

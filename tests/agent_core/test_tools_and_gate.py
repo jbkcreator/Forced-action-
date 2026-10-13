@@ -12,6 +12,14 @@ from packages.agent_core.tools import EgressDraft, Tool, ToolContext, ToolInputE
 from .conftest import APPROVER, OPERATOR
 
 
+class OperationalError(Exception):
+    """Shaped like SQLAlchemy's wrapper: the driver error (with its SQLSTATE) sits on ``orig``."""
+
+    def __init__(self, message: str, pgcode: str) -> None:
+        super().__init__(message)
+        self.orig = type("DriverError", (Exception,), {"pgcode": pgcode})(message)
+
+
 class LookupInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str = Field(..., min_length=2)
@@ -38,6 +46,9 @@ class Harness:
                 raise ToolInputError("no lead matched")
             if args.name == "boom":
                 raise RuntimeError("db exploded with phone 727-555-0100")
+            if args.name == "slow":
+                raise OperationalError("canceling statement due to statement timeout; phone=+17275550100",
+                                       pgcode="57014")
             return {"name": args.name, "phone": "+17275550100", "email": "sam.smith@example.com"}
 
         def draft_sms(args: SmsInput, _: ToolContext) -> EgressDraft:
@@ -90,6 +101,14 @@ def test_unknown_tool_and_handler_failures_are_error_results(harness: Harness) -
     assert harness.registry.execute("lookup", {"name": "nobody"}, _context()).content == "no lead matched"
     crashed = harness.registry.execute("lookup", {"name": "boom"}, _context())
     assert crashed.is_error and crashed.content == "lookup failed (RuntimeError); nothing was changed"
+
+
+def test_a_database_failure_logs_its_sqlstate_but_never_its_message(harness: Harness, caplog) -> None:
+    with caplog.at_level("ERROR", logger="packages.agent_core.tools"):
+        outcome = harness.registry.execute("lookup", {"name": "slow"}, _context())
+    assert outcome.is_error
+    assert "tool lookup failed (OperationalError, SQLSTATE 57014)" in caplog.text
+    assert "7275550100" not in caplog.text and "statement timeout" not in caplog.text
 
 
 def test_approver_only_tool_refuses_operators(harness: Harness) -> None:

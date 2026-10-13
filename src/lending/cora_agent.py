@@ -287,7 +287,7 @@ def _sweep_until_stopped(services: CoraServices, stop: threading.Event) -> None:
 
 
 def main(stop: Optional[threading.Event] = None) -> int:
-    """Run Cora's Socket Mode session and the minute sweep until SIGTERM.
+    """Run Cora's Socket Mode session and the minute sweep until SIGTERM or Ctrl+C.
 
     Exits 1 only for missing settings (a configuration problem a restart cannot fix). A failed
     Slack ``auth.test`` or Socket Mode connect is retried in-process every sweep interval, so a
@@ -296,7 +296,9 @@ def main(stop: Optional[threading.Event] = None) -> int:
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     stop = stop or threading.Event()
-    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    # systemctl stop sends SIGTERM; Ctrl+C sends SIGINT. Both close the socket and end cleanly.
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(signum, lambda *_: stop.set())
     settings = get_settings()
     config = build_config(settings)
     missing = missing_settings(config)
