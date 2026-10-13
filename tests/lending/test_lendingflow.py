@@ -508,3 +508,20 @@ def test_payload_without_lead_id_is_created_then_deduped(client, lf_db):
     assert first.status_code == 200 and first.json()["status"] == "created"
     assert second.json() == {"status": "duplicate", "lead_id": first.json()["lead_id"]}
     assert _count(lf_db, "lendingflow_leads") == 1
+
+
+@pytest.mark.parametrize("statement", [
+    "UPDATE lending.lead_consent_certificates SET raw_certificate = 'edited' WHERE id = :id",
+    "DELETE FROM lending.lead_consent_certificates WHERE id = :id",
+    "TRUNCATE lending.lead_consent_certificates",
+])
+def test_consent_certificates_are_append_only(lf_db, statement):
+    from sqlalchemy.exc import DBAPIError
+
+    _saved(lf_db)
+    cert_id = lf_db.execute(text("SELECT max(id) FROM lending.lead_consent_certificates")).scalar_one()
+    with pytest.raises(DBAPIError, match="append-only"), lf_db.begin_nested():
+        lf_db.execute(text(statement), {"id": cert_id})
+    raw = lf_db.execute(text("SELECT raw_certificate FROM lending.lead_consent_certificates WHERE id = :id"),
+                        {"id": cert_id}).scalar_one()
+    assert raw != "edited"

@@ -38,6 +38,25 @@ _BACKFILL_FOLLOWUP_DONE = (
 )
 
 
+# Consent evidence is append-only in the database, not just by convention: rows can be inserted, never
+# changed or removed (an UPDATE, DELETE or TRUNCATE raises).
+_APPEND_ONLY_FUNCTION = (
+    'CREATE OR REPLACE FUNCTION "{t}".lead_consent_certificates_append_only() RETURNS trigger AS $$ '
+    "BEGIN RAISE EXCEPTION 'lending.lead_consent_certificates is append-only: % is not allowed', TG_OP; END; "
+    "$$ LANGUAGE plpgsql"
+)
+_APPEND_ONLY_TRIGGERS = (
+    'DROP TRIGGER IF EXISTS trg_lead_consent_certificates_append_only ON "{t}".lead_consent_certificates',
+    'CREATE TRIGGER trg_lead_consent_certificates_append_only BEFORE UPDATE OR DELETE '
+    'ON "{t}".lead_consent_certificates FOR EACH ROW '
+    'EXECUTE FUNCTION "{t}".lead_consent_certificates_append_only()',
+    'DROP TRIGGER IF EXISTS trg_lead_consent_certificates_no_truncate ON "{t}".lead_consent_certificates',
+    'CREATE TRIGGER trg_lead_consent_certificates_no_truncate BEFORE TRUNCATE '
+    'ON "{t}".lead_consent_certificates FOR EACH STATEMENT '
+    'EXECUTE FUNCTION "{t}".lead_consent_certificates_append_only()',
+)
+
+
 def _has_column(conn: Connection, schema: str, table: str, column: str) -> bool:
     return conn.execute(
         text("SELECT 1 FROM information_schema.columns "
@@ -55,6 +74,9 @@ def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
         conn.execute(text(stmt.format(t=schema)))
     if not followup_column_existed:
         conn.execute(text(_BACKFILL_FOLLOWUP_DONE.format(t=schema)))
+    conn.execute(text(_APPEND_ONLY_FUNCTION.format(t=schema)))
+    for stmt in _APPEND_ONLY_TRIGGERS:
+        conn.execute(text(stmt.format(t=schema)))
 
 
 def apply(engine: Engine | None = None, schema: str = LENDING_SCHEMA) -> None:
