@@ -164,6 +164,8 @@ def render_card_text(lead_id: int, address: Optional[str], tag: RoutingTag, fact
         score = f"{fit.score}" if fit.score is not None else f"{NOT_AVAILABLE} ({fit.note})"
         lines.append(f"Lender fit score: {score}")
         lines.append("Fitting lenders: " + (", ".join(fit.ranked) or "none"))
+        if fit.possible:
+            lines.append("Possible, confirm on the call: " + ", ".join(fit.possible))
         lines += [f"Note: {s}" for s in fit.straddles]
     else:
         lines.append(f"Lender fit: {fit.note}")

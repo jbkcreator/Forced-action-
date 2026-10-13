@@ -20,6 +20,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from src.lending.contracts import BorrowerProfile, LoanType
+from src.lending.enrichment.fit_card import parse_band_bounds
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
@@ -51,7 +52,7 @@ class LendingFlowLeadProfileSource:
             return None
         row = db.execute(
             text(
-                "SELECT lead_uuid, credit_band_min_fico, loan_amount, loan_type, property_state, suppressed "
+                "SELECT lead_uuid, credit_band, credit_band_min_fico, loan_amount, loan_type, property_state, suppressed "
                 "FROM lending.lendingflow_leads WHERE phone = :phone "
                 "ORDER BY received_at DESC LIMIT 1"
             ),
@@ -64,7 +65,9 @@ class LendingFlowLeadProfileSource:
             logger.warning("[soft-approval] lead %s has an unrecognised loan type; treated as missing", row.lead_uuid)
         return LeadProfile(
             lead_ref=str(row.lead_uuid),
-            borrower=BorrowerProfile(credit_band_min_fico=row.credit_band_min_fico, state=row.property_state),
+            borrower=BorrowerProfile(credit_band_min_fico=row.credit_band_min_fico,
+                                     credit_band_max_fico=(parse_band_bounds(row.credit_band) or (None, None))[1],
+                                     state=row.property_state),
             loan_type=loan_type,
             loan_amount=Decimal(row.loan_amount) if row.loan_amount is not None else None,
             state=row.property_state,

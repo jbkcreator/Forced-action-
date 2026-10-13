@@ -456,6 +456,35 @@ class LendingSoftApproval(LendingBase):
     )
 
 
+class LendingLenderRuleValue(LendingBase):
+    """One lender parameter and its status (T-05, Josh A1): one row per lender key and field.
+
+    A row per field, not a column per field, so a field Josh changes his mind about is a new or edited
+    row, never a migration. ``value`` is JSON (number, string, list or null); the loader in
+    ``src/lending/lender_rules_store.py`` validates it. ``status`` is confirmed / placeholder /
+    confirm_at_submission. ``lender_key`` and ``field`` are the names in ``config/lender_matrix.py``.
+    """
+
+    __tablename__ = "lender_rule_values"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    lender_key: Mapped[str] = mapped_column(String(60), nullable=False)
+    field: Mapped[str] = mapped_column(String(60), nullable=False)
+    value: Mapped[Any] = mapped_column(JSONB, nullable=False, server_default=text("'null'::jsonb"))
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="placeholder", server_default=text("'placeholder'"))
+    note: Mapped[Optional[str]] = mapped_column(Text)
+    updated_by: Mapped[Optional[str]] = mapped_column(String(60))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('confirmed', 'placeholder', 'confirm_at_submission')",
+            name="ck_lending_lender_rule_values_status",
+        ),
+        Index("uq_lending_lender_rule_values_key_field", "lender_key", "field", unique=True),
+    )
+
+
 class LendingAgentHaltState(LendingBase):
     """Cora's kill switch: one row, read by every Cora process before it acts (packages/agent_core/halt.py)."""
 
