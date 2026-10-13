@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Callable, Mapping, Optional
 
-from config.lender_matrix import LENDER_MATRIX, LenderRules
+from config.lender_matrix import LenderRules
 from config.lending_soft_approval import (
     NON_BINDING_SOFT_APPROVAL_WATERMARK,
     SOFT_APPROVAL_LOAN_TYPES,
@@ -23,6 +23,7 @@ from config.lending_soft_approval import (
 )
 from src.lending.contracts import LenderFitEvaluator, LoanRequest
 from src.lending.lender_fit import evaluate_lender_fit
+from src.lending.lender_rules_store import current_matrix
 from src.lending.pdf.render import render_pdf
 from src.lending.soft_approval.calc import CalculationUnavailable, LenderTerms, SoftApprovalFigures, calculate_figures
 from src.lending.soft_approval.facts import SoftApprovalFacts
@@ -40,7 +41,7 @@ RulesLookup = Callable[[str], Optional[LenderRules]]
 class MatrixLenderFitEvaluator:
     """The real evaluator (T-05) behind the LenderFitEvaluator protocol."""
 
-    def __init__(self, matrix: tuple[LenderRules, ...] = LENDER_MATRIX) -> None:
+    def __init__(self, matrix: Optional[tuple[LenderRules, ...]] = None) -> None:
         self._matrix = matrix
 
     def evaluate(self, borrower_profile, loan_request):
@@ -48,7 +49,7 @@ class MatrixLenderFitEvaluator:
 
 
 def _matrix_rules_lookup(key: str) -> Optional[LenderRules]:
-    return next((rules for rules in LENDER_MATRIX if rules.key == key), None)
+    return next((rules for rules in current_matrix() if rules.key == key), None)
 
 
 def _default_renderer(context: dict) -> bytes:

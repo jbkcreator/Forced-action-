@@ -154,6 +154,14 @@ Sources: `Chunk1_Developer_Split.md`, `Next_Deal_Lending-Questions_for_Josh_2026
 - Evidence: `test_enrichment.py` + `test_lender_fit.py` 67 passed, 20 skipped (no DB); `test_enrichment.py` + `test_soft_approval.py` on the throwaway DB (127.0.0.1:58123, r1test) 116 passed, 0 skipped.
 - Open: review finding 2 (rules still need a deploy to change; purchase/rehab shares stay in `config/lending_soft_approval.py`) and the Q1 to Q6 plan questions.
 
+### 2026-10-14, lender rules as data (closes review finding 2 / plan Q5; stacked on the T-05 gap-fix, uncommitted)
+- Question asked: new table or extend R-1's `lender_product_boxes`? R-1 (`feat/ndl-r1-overflow-router`) will not merge now, and Josh is unsure of the fields and values. Decision: a new table, one row per lender key and field (value JSON + status), so a changed field is a row edit, never a migration. Not added to the R-1 tables (unmerged, fixed columns, no per-field status).
+- Done: `lending.lender_rule_values` (model in `src/lending/models.py`, `migrations/apply_lending_lender_rule_values.py` creates it and seeds one row per lender and field from `config/lender_matrix.py`, never overwriting an edit), loader `src/lending/lender_rules_store.py` (`apply_rows`, `load_matrix`, `current_matrix`), flag `LENDING_RULES_FROM_DB` (default off). `evaluate_lender_fit`, `fit_card.evaluate_fit` and `soft_approval/service.py` now default to `current_matrix()`. Runbook: `docs/lending/lender-rules-runbook.md`.
+- Behaviour: a row overrides that field's value and status; a lender is confirmed only when all its fields are. An invalid row is skipped and logged at ERROR (the field keeps its config value); an invalid merged matrix, a missing table or an unreachable DB falls back to the config. A new lender or field still needs a code change.
+- Assumed defaults (not Josh's words): edit route for now is SQL (Slack form or Google Sheet sync is later, per his R1.4 note); the flag stays off until the migration is applied to the shared DB (not applied yet).
+- Evidence: `test_lender_rules_store.py` 33 passed on the throwaway DB (127.0.0.1:58123, r1test), including a seed, rerun, edit and fallback round trip; with `test_lender_fit.py`, `test_enrichment.py`, `test_soft_approval.py`, `test_contracts.py`: 235 passed, 1 failed. The failure (`test_soft_approval.py::TestRoute::test_invalid_submission_returns_inline_errors_and_stores_nothing`) fails the same on the T-05 branch without these changes.
+- Open: apply the migration to the shared DB and turn the flag on (needs a go-ahead); purchase and rehab shares still in `config/lending_soft_approval.py` (move in the T-08 PR; `soft_approval/service.py` changed here, so the T-08 branch needs a rebase); reconcile with R-1's tables when R-1 merges; tell the R-1 owner.
+
 ## T-11: LendingFlow webhook, dedupe, consent vault
 
 _No entries yet._

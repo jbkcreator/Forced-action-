@@ -960,6 +960,8 @@ class AppSettings(BaseSettings):
 	lending_disposition_sheet_tab: str = Field(default="Dispositions", env="LENDING_DISPOSITION_SHEET_TAB")
 	# Call-One soft approval PDF (T-08): off until Josh approves the template and the calculation inputs.
 	lending_soft_approval_enabled: bool = Field(default=False, env="LENDING_SOFT_APPROVAL_ENABLED")
+	# Lender rules read from lending.lender_rule_values (T-05): off until the table is migrated and seeded; off = config/lender_matrix.py.
+	lending_rules_from_db: bool = Field(default=False, env="LENDING_RULES_FROM_DB")
 	lending_slack_signing_secret: Optional[SecretStr] = Field(default=None, env="LENDING_SLACK_SIGNING_SECRET")  # verifies Slack interactivity posts to lending-api
 	# ── Lending Cora agent (packages/agent_core, systemd fa-lending-cora) ──
 	# Cora runs on the lending Slack app (LENDING_SLACK_BOT_TOKEN, LENDING_SLACK_SIGNING_SECRET) in HTTP mode:

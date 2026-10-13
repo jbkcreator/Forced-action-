@@ -20,7 +20,7 @@ from datetime import datetime, time, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Callable, Mapping, Optional
 
-from config.lender_matrix import LENDER_MATRIX, LenderRules
+from config.lender_matrix import LenderRules
 from config.lending_enrichment import (
     BACKFLIP_KEY_PREFIX,
     BACKFLIP_LENDER,
@@ -29,6 +29,7 @@ from config.lending_enrichment import (
 )
 from src.lending.contracts import BorrowerProfile, LenderFitResult, LoanRequest, LoanType
 from src.lending.lender_fit import evaluate_lender_fit
+from src.lending.lender_rules_store import current_matrix
 
 logger = logging.getLogger(__name__)
 
@@ -101,9 +102,10 @@ def evaluate_fit(
     address: Optional[str],
     target_close_date=None,
     evaluator: Optional[Evaluator] = None,
-    matrix: tuple[LenderRules, ...] = LENDER_MATRIX,
+    matrix: Optional[tuple[LenderRules, ...]] = None,
 ) -> FitView:
     """Fit view for one LendingFlow lead row. Never raises for missing inputs: it reports them."""
+    matrix = current_matrix() if matrix is None else matrix
     missing = _missing(lead)
     amount = _decimal(lead.get("loan_amount"))
     if missing or amount is None:
