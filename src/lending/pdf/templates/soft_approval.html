@@ -1,9 +1,6 @@
 {% extends "base.html" %}
 {% block title %}Soft Approval Summary{% endblock %}
 {% block header_tag %}Soft Approval Summary{% endblock %}
-{# B2 (Josh, Oct 8): no company name on anything the borrower sees; everything is signed by Josh. #}
-{% block brand %}{% endblock %}
-{% block footer_brand %}<strong>Josh Kantor</strong> &middot; Loan Officer{% endblock %}
 {% block extra_head %}
 <style>
   .date { color: var(--ink-2); font-size: 10pt; margin: 0 0 22px; }
@@ -42,6 +39,9 @@
   <tr><td>Estimated after-repair value you shared</td><td>{{ arv }}</td></tr>
 </table>
 
+{% if subject_to_confirmation is defined and subject_to_confirmation %}
+<div class="note">These figures are subject to lender confirmation.</div>
+{% endif %}
 <div class="note">
   This is a non-binding estimate for informational purposes only, based on information provided on the call.
   It is not a commitment to lend, a loan approval, or an offer of specific terms. Final eligibility and terms
@@ -49,6 +49,5 @@
 </div>
 
 <p class="next">Questions or ready to talk through your deal? Call or text <strong>(727) 436-9951</strong>.</p>
-<p class="next signoff">Josh Kantor, Loan Officer</p>
 {# PLACEHOLDER COPY: wording, signer and required disclosures pending Josh and a qualified professional's review. #}
 {% endblock %}

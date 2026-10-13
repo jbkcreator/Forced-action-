@@ -203,6 +203,7 @@ def generate_soft_approval(
         "purchase_price": _money(facts.purchase_price),
         "rehab_budget": _money(facts.rehab_budget),
         "arv": _money(facts.arv),
+        "subject_to_confirmation": picked.subject_to_confirmation,
     }
     try:
         pdf = renderer(context)

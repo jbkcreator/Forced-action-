@@ -209,3 +209,12 @@ _No entries yet._
 - Open: Q1, Q2, Q3, Q4, Q6, D6, the F5 booking form, and T-07's owner applying B2 to the pre-qualification letter.
 
 
+
+### T-08 follow-up: cross-check against dev, card status, PDF mark (2026-10-13)
+- Done: re-checked every T-08 requirement against this branch and `origin/dev` (`6103978f`). None of T-04, T-05 or T-08 is on `dev`; every B1(c), A1, B7, B11 and F5 item exists only here.
+- Decision: B2 branding comes from T-07 on `dev` (`BORROWER_SIGNER` / `BORROWER_CALLBACK_PHONE` through `render.py` and `base.html`). The `base.html` brand blocks and the signoff line added earlier in this PR were removed so the two do not collide; this PR keeps only "reply to this email" removed (B7). `test_b2_no_company_name_and_signed_by_josh` became `test_b7_nothing_is_emailed...`.
+- Done (from the T-05 owner's heads-up): the PDF itself now prints "These figures are subject to lender confirmation" when the result is flagged (`subject_to_confirmation` passed into the render context; the template guards it with `is defined`, so the T-07 and old contexts still render). Wording is placeholder pending Josh (B4).
+- Done: after each submit the Slack card shows the last result with its time and the button reads "Re-enter deal facts" once a PDF exists (`chat_update`, best-effort, `chat:write` only).
+- Open: "possible" lenders never reach sizing (`_candidate_keys` reads only `fitting` and cap-only declines); Josh has not said whether they should. Left as is.
+- Open: rebase onto the T-05 tip (`6bb4a128`): keep `current_matrix()` in `soft_approval/service.py`; `resolve_params` stays the one reader of the purchase and rehab shares so they can move into the rules table later.
+- Open: the footer address `hello@nextdeallending.com` (on `dev`) and the website consent text still name the company; not T-08, ask whether B2 covers them.

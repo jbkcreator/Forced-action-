@@ -242,6 +242,7 @@ class TestService:
         assert row["figures"]["purchase_advance"] == "250000" and row["figures"]["cash_at_closing"] == "0"
         assert row["figures"]["subject_to_confirmation"] is False and out.subject_to_confirmation is False
         assert seen["net_loan"] == "$290,000" and seen["property_address"] == FACTS.property_address
+        assert seen["subject_to_confirmation"] is False
         assert "Test Lender" not in json.dumps(seen)
 
     def test_no_lead_stores_no_pdf(self, soft_db):
@@ -264,8 +265,10 @@ class TestService:
     def test_unconfirmed_shares_take_the_placeholder_and_the_result_is_flagged(self, soft_db):
         """A1: a share Josh has not confirmed is never skipped; it takes 85% purchase / 100% rehab."""
         unconfirmed = {LENDER: SoftApprovalParams(rehab_funding_pct=D(1), purchase_advance_pct=None)}
-        out = _generate(soft_db, params=unconfirmed)
+        seen = {}
+        out = _generate(soft_db, params=unconfirmed, renderer=lambda ctx: seen.update(ctx) or b"%PDF-ok")
         row = _row(soft_db)
+        assert seen["subject_to_confirmation"] is True  # the PDF itself is told to print the mark
         assert out.status == "generated" and out.subject_to_confirmation is True
         assert row["figures"]["subject_to_confirmation"] is True
         assert row["figures"]["net_loan"] == "252000"  # 250,000 x 0.85 + 40,000 = 252,500, rounded down
@@ -452,10 +455,16 @@ class TestTemplate:
         for forbidden in ("%", "interest", "apr", "ltc", "ltv", "origination", "points", "backflip", "rcn", "kiavi", "easy street"):
             assert forbidden not in body
 
-    def test_b2_no_company_name_and_signed_by_josh(self):
+    def test_b7_nothing_is_emailed_so_the_copy_never_says_reply_to_this_email(self):
+        # B2 (no company name, signed by Josh) is T-07's shared signer in base.html on dev; this PR does not repeat it.
         html = render_html("soft_approval.html", CONTEXT, watermark=self.WATERMARK)
-        assert "Next Deal Lending" not in html and "reply to this email" not in html
-        assert html.count("Josh Kantor") >= 2 and "Loan Officer" in html
+        assert "reply to this email" not in html
+
+    def test_the_subject_to_confirmation_line_prints_only_when_flagged(self):
+        flagged = render_html("soft_approval.html", {**CONTEXT, "subject_to_confirmation": True}, watermark=self.WATERMARK)
+        plain = render_html("soft_approval.html", {**CONTEXT, "subject_to_confirmation": False}, watermark=self.WATERMARK)
+        assert "subject to lender confirmation" in flagged and "subject to lender confirmation" not in plain
+        assert "subject to lender confirmation" not in render_html("soft_approval.html", CONTEXT, watermark=self.WATERMARK)
 
     def test_omits_max_price_when_there_is_none(self):
         html = render_html("soft_approval.html", {**CONTEXT, "max_purchase_price": ""}, watermark=self.WATERMARK)
