@@ -204,3 +204,14 @@ Answers are the team lead's approved defaults, not Josh's; each stays an open co
 | F7/R6 | Needs Josh; card shows "Not available" | `UnavailableStreetView` fallback | Matches; blocked on Josh |
 
 Still open: F3 (owner + decision), Q1 (fit % hidden while any lender unconfirmed — assumed yes), Josh's sign-off on F2 and F4.
+
+### 2026-10-13 — Final T-12 implementation decisions (team decisions; no further code change)
+
+| Item | Source check | Decision implemented |
+|---|---|---|
+| Soft approval on FULL_MACHINE | Spec §4.4 says "closer priority + soft approval compiling"; no trigger detail | Option A (team lead): no new trigger. Every finished call already gets a soft approval card (`call_pipeline.follow_up`, T-08), so FULL_MACHINE leads are covered. |
+| F3 counties | Not in spec; no Josh answer | Dropped: lead data comes from LendingFlow. A lead outside Hillsborough/Pinellas still gets fit + borrower details; property facts show "Not available". |
+| Q1 fit % hidden | Spec §4.4 says only "append fit score"; Josh A1 question stated the score stays hidden until all five lenders are confirmed, and his reply did not object | Team decision: % hidden until every lender is fully confirmed; per-lender Fits / Possible – confirm on the call / Doesn't fit, with "subject to lender confirmation" where caps are placeholders. |
+| Nurture cadence | Spec §4.4: "long-term cadence", no content; J10/J12 open with Josh | Left as is: NURTURE is a tag only, nothing is sent until Josh defines the cadence. |
+| F2 closer | Spec names no closer; no Josh answer | Team decision: Slack card says "closer priority, assigned to Josh"; no GHL task/stage/tag. |
+| F4 past / >30 days | Spec covers only ≤30 days and missing facts; Josh doc "decisions we have made" (no reply needed): both go to nurture | Implemented: past and >30 days → NURTURE; exactly 30 days → FULL_MACHINE. Settled. |
