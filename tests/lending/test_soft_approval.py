@@ -23,7 +23,10 @@ from migrations.apply_lending_lendingflow import apply_to as apply_lendingflow
 from migrations.apply_lending_soft_approvals import apply_to as apply_soft_approvals
 from src.lending import soft_approval_webhook as webhook
 from src.lending.call_pipeline import follow_up
-from src.lending.contracts import BorrowerProfile, LenderFit, LenderFitResult, LoanType
+from src.lending.contracts import (
+    BindingCap, BorrowerProfile, DeclineReason, LenderFit, LenderFitResult, LenderMiss, LoanRequest, LoanType,
+    SizingFlag,
+)
 from src.lending.dispositions import RecordedCall
 from src.lending.fakes import FakeLenderFitEvaluator
 from src.lending.models import LendingContact
@@ -37,6 +40,7 @@ from src.lending.soft_approval.lead_source import (
     LendingFlowLeadProfileSource,
     default_lead_source,
 )
+from src.lending.soft_approval import service as sa_service
 from src.lending.soft_approval.service import generate_soft_approval
 from src.tasks import lending_soft_approval_card_retry as card_retry
 
@@ -85,58 +89,110 @@ def _row(db):
     return db.execute(text("SELECT * FROM lending.soft_approvals WHERE phone = :p"), {"p": PHONE}).mappings().first()
 
 
-# ---- calculation -------------------------------------------------------------------------------
+# ---- calculation (Josh, B1(c)) -----------------------------------------------------------------
+
+def _terms(a=1, f=1, arv=None, ltc=None, cap=None, minimum=None):
+    def opt(value):
+        return None if value is None else D(value)
+
+    return LenderTerms(rehab_funding_pct=D(f), purchase_advance_pct=D(a), arv_cap=opt(arv), ltc_cap=opt(ltc),
+                       max_loan=opt(cap), min_loan=opt(minimum))
+
 
 class TestCalc:
-    ARV_ONLY = LenderTerms(rehab_funding_pct=D(1), purchase_advance_pct=D(1), arv_cap=D("0.75"))
+    def test_requested_loan_when_no_cap_cuts_it(self):
+        f = calculate_figures(D(250000), D(40000), D(400000), _terms(arv="0.75"))
+        assert (f.net_loan, f.rehab_funding, f.purchase_advance, f.cash_at_closing) == (D(290000), D(40000), D(250000), D(0))
+        assert f.binding_cap is BindingCap.REQUESTED and f.max_purchase_price == D(260000) and f.flags == ()
 
-    def test_price_under_the_limit(self):
-        f = calculate_figures(D(250000), D(40000), D(400000), self.ARV_ONLY)
-        assert (f.net_loan, f.rehab_funding, f.max_purchase_price, f.cash_needed) == (D(290000), D(40000), D(260000), D(0))
+    def test_arv_cap_binds_and_the_purchase_advance_is_cut_first(self):
+        f = calculate_figures(D(280000), D(40000), D(400000), _terms(arv="0.75"))
+        assert f.net_loan == D(300000) and f.binding_cap is BindingCap.ARV
+        assert f.rehab_funding == D(40000)  # rehab stays whole
+        assert (f.purchase_advance, f.cash_at_closing, f.max_purchase_price) == (D(260000), D(20000), D(260000))
 
-    def test_price_over_the_limit_caps_the_loan(self):
-        f = calculate_figures(D(280000), D(40000), D(400000), self.ARV_ONLY)
-        assert (f.net_loan, f.max_purchase_price, f.cash_needed) == (D(300000), D(260000), D(20000))
+    def test_ltc_cap_binds(self):
+        f = calculate_figures(D(200000), D(100000), D(1_000_000), _terms(ltc="0.85"))
+        assert f.net_loan == D(255000) and f.binding_cap is BindingCap.LTC
+        assert (f.rehab_funding, f.purchase_advance, f.cash_at_closing) == (D(100000), D(155000), D(45000))
+        assert f.full_advance_unavailable and f.max_purchase_price is None  # no price avoids a cut
 
-    def test_ltc_limit_is_solved_for_price_not_taken_from_the_actual_price(self):
-        terms = LenderTerms(rehab_funding_pct=D("0.5"), purchase_advance_pct=D("0.9"), ltc_cap=D("0.8"), max_loan=D(10_000_000))
-        f = calculate_figures(D(200000), D(100000), D(1_000_000), terms)
-        # a*P + f*R <= l*(P+R)  ->  P <= R*(l-f)/(a-l) = 100000*0.3/0.1
-        assert f.max_purchase_price == D(300000)
+    def test_max_loan_binds_and_rehab_funding_never_exceeds_the_loan(self):
+        f = calculate_figures(D(100000), D(50000), D(400000), _terms(cap=30000))
+        assert f.net_loan == D(30000) and f.binding_cap is BindingCap.MAX_LOAN
+        assert (f.rehab_funding, f.purchase_advance, f.cash_at_closing) == (D(30000), D(0), D(100000))
 
-    def test_ltc_that_cannot_give_the_full_advance_is_a_note_not_an_error(self):
-        terms = LenderTerms(rehab_funding_pct=D(1), purchase_advance_pct=D("0.9"), ltc_cap=D("0.85"))
-        f = calculate_figures(D(200000), D(40000), D(500000), terms)
-        assert f.full_advance_unavailable and f.max_purchase_price is None
-        assert f.net_loan == (D("0.85") * D(240000))
+    def test_max_price_is_stepped_so_it_holds_whichever_cap_binds(self):
+        terms = _terms(a="0.9", f="0.5", ltc="0.8", cap=10_000_000)
+        assert calculate_figures(D(200000), D(100000), D(1_000_000), terms).max_purchase_price == D(300000)
+        # the same price is not cut by the LTC cap, and one step higher is
+        at = calculate_figures(D(300000), D(100000), D(1_000_000), terms)
+        above = calculate_figures(D(301000), D(100000), D(1_000_000), terms)
+        assert at.binding_cap is BindingCap.REQUESTED and above.binding_cap is BindingCap.LTC
 
-    def test_rehab_funding_never_exceeds_the_cap(self):
-        terms = LenderTerms(rehab_funding_pct=D(1), purchase_advance_pct=D(1), max_loan=D(30000))
-        f = calculate_figures(D(100000), D(50000), D(400000), terms)
-        assert f.rehab_funding == D(30000) and f.net_loan == D(30000)
+    def test_the_loan_is_rounded_down_to_the_nearest_thousand(self):
+        f = calculate_figures(D(100500), D(10250), D(150000), _terms())
+        assert f.net_loan == D(110000) and f.binding_cap is BindingCap.REQUESTED  # 110,750 requested
+        assert calculate_figures(D(299999), D(0), D(500000), _terms()).net_loan == D(299000)
 
-    def test_amounts_round_down_and_cash_needed_rounds_up(self):
-        terms = LenderTerms(rehab_funding_pct=D(1), purchase_advance_pct=D(1), arv_cap=D("0.7777"))
-        f = calculate_figures(D(100000), D(10000), D(150000), terms)
-        assert f.net_loan == f.net_loan.to_integral_value() and f.net_loan < D("0.7777") * D(150000) + 1
-        assert f.cash_needed >= D(110000) - D("0.7777") * D(150000)
+    def test_no_cap_at_all_is_not_an_error(self):
+        f = calculate_figures(D(250000), D(40000), D(400000), _terms())
+        assert f.net_loan == D(290000) and f.max_purchase_price is None and not f.full_advance_unavailable
+
+    @pytest.mark.parametrize("rehab,ok", [(D(39999), False), (D(40000), True)])
+    def test_loan_below_the_lender_minimum_is_no_fit(self, rehab, ok):
+        terms = _terms(minimum=100000)  # purchase 60,000 + rehab: 99,999 rounds down to 99,000
+        if ok:
+            assert calculate_figures(D(60000), rehab, D(300000), terms).net_loan == D(100000)
+        else:
+            with pytest.raises(CalculationUnavailable) as exc:
+                calculate_figures(D(60000), rehab, D(300000), terms)
+            assert exc.value.reason == "loan_too_small"
+
+    def test_a_loan_that_rounds_to_zero_is_too_small(self):
+        with pytest.raises(CalculationUnavailable) as exc:
+            calculate_figures(D(500), D(0), D(1000), _terms())
+        assert exc.value.reason == "loan_too_small"
+
+    def test_upside_down_flag_is_not_a_rejection(self):
+        f = calculate_figures(D(150000), D(60000), D(200000), _terms())
+        assert SizingFlag.UPSIDE_DOWN in f.flags and f.net_loan > 0
+        assert SizingFlag.UPSIDE_DOWN not in calculate_figures(D(150000), D(60000), D(210000), _terms()).flags  # equal
+
+    def test_arv_over_three_times_the_price_flags_a_possible_typo(self):
+        assert SizingFlag.ARV_OVER_3X in calculate_figures(D(100000), D(0), D(300001), _terms()).flags
+        assert SizingFlag.ARV_OVER_3X not in calculate_figures(D(100000), D(0), D(300000), _terms()).flags  # exactly 3x
 
     @pytest.mark.parametrize("a,f,reason", [(D(0), D(1), "invalid_lender_terms"), (D("1.1"), D(1), "invalid_lender_terms"),
                                             (D(1), D("-0.1"), "invalid_lender_terms")])
-    def test_bad_lender_terms_are_refused(self, a, f, reason):
+    def test_bad_lender_shares_are_refused(self, a, f, reason):
         with pytest.raises(CalculationUnavailable) as exc:
             calculate_figures(D(1000), D(100), D(2000), LenderTerms(rehab_funding_pct=f, purchase_advance_pct=a, arv_cap=D("0.7")))
         assert exc.value.reason == reason
 
-    def test_no_limit_at_all_is_refused(self):
+    def test_a_non_positive_cap_is_refused(self):
         with pytest.raises(CalculationUnavailable) as exc:
-            calculate_figures(D(1000), D(100), D(2000), LenderTerms(rehab_funding_pct=D(1), purchase_advance_pct=D(1)))
-        assert exc.value.reason == "no_loan_limit"
+            calculate_figures(D(1000), D(100), D(2000), _terms(arv="0"))
+        assert exc.value.reason == "invalid_lender_terms"
 
     @pytest.mark.parametrize("p,r,v", [(D(0), D(1), D(1)), (D(1), D(-1), D(1)), (D(1), D(1), D(0))])
     def test_bad_inputs_are_refused(self, p, r, v):
-        with pytest.raises(CalculationUnavailable):
-            calculate_figures(p, r, v, self.ARV_ONLY)
+        with pytest.raises(CalculationUnavailable) as exc:
+            calculate_figures(p, r, v, _terms(arv="0.75"))
+        assert exc.value.reason == "invalid_inputs"
+
+    @pytest.mark.parametrize("purchase", [D(50000), D(120000), D(333333)])
+    @pytest.mark.parametrize("rehab", [D(0), D(25000), D(90000)])
+    @pytest.mark.parametrize("terms", [_terms(arv="0.7"), _terms(ltc="0.85"), _terms(cap=80000), _terms(a="0.85", ltc="0.8")])
+    def test_outputs_are_never_negative_and_the_loan_is_in_whole_thousands(self, purchase, rehab, terms):
+        try:
+            f = calculate_figures(purchase, rehab, D(400000), terms)
+        except CalculationUnavailable:
+            return
+        assert f.net_loan % 1000 == 0 and f.net_loan > 0
+        assert min(f.rehab_funding, f.purchase_advance, f.cash_at_closing) >= 0
+        assert f.rehab_funding + f.purchase_advance == f.net_loan
+        assert all(isinstance(v, D) for v in (f.net_loan, f.rehab_funding, f.purchase_advance, f.cash_at_closing))
 
 
 # ---- facts / form parsing ----------------------------------------------------------------------
@@ -182,7 +238,11 @@ class TestService:
         row = _row(soft_db)
         assert out.status == "generated" and bytes(row["pdf"]) == b"%PDF-ok" and row["lender_key"] == LENDER
         assert row["figures"]["net_loan"] == "290000" and row["submitted_by"] == "U123"
+        assert row["figures"]["binding_cap"] == "requested" and row["figures"]["flags"] == []
+        assert row["figures"]["purchase_advance"] == "250000" and row["figures"]["cash_at_closing"] == "0"
+        assert row["figures"]["subject_to_confirmation"] is False and out.subject_to_confirmation is False
         assert seen["net_loan"] == "$290,000" and seen["property_address"] == FACTS.property_address
+        assert seen["subject_to_confirmation"] is False
         assert "Test Lender" not in json.dumps(seen)
 
     def test_no_lead_stores_no_pdf(self, soft_db):
@@ -202,10 +262,61 @@ class TestService:
         out = _generate(soft_db, evaluator=FakeLenderFitEvaluator(LenderFitResult()))
         assert out.status == "no_fit" and _row(soft_db)["pdf"] is None
 
-    def test_unconfirmed_lender_inputs_fail_closed(self, soft_db):
+    def test_unconfirmed_shares_take_the_placeholder_and_the_result_is_flagged(self, soft_db):
+        """A1: a share Josh has not confirmed is never skipped; it takes 85% purchase / 100% rehab."""
         unconfirmed = {LENDER: SoftApprovalParams(rehab_funding_pct=D(1), purchase_advance_pct=None)}
-        out = _generate(soft_db, params=unconfirmed)
-        assert out.status == "terms_unconfirmed" and _row(soft_db)["pdf"] is None
+        seen = {}
+        out = _generate(soft_db, params=unconfirmed, renderer=lambda ctx: seen.update(ctx) or b"%PDF-ok")
+        row = _row(soft_db)
+        assert seen["subject_to_confirmation"] is True  # the PDF itself is told to print the mark
+        assert out.status == "generated" and out.subject_to_confirmation is True
+        assert row["figures"]["subject_to_confirmation"] is True
+        assert row["figures"]["net_loan"] == "252000"  # 250,000 x 0.85 + 40,000 = 252,500, rounded down
+
+    def test_a_lender_with_no_share_entry_at_all_uses_the_placeholder_box(self, soft_db):
+        out = _generate(soft_db, params={})
+        assert out.status == "generated" and _row(soft_db)["figures"]["subject_to_confirmation"] is True
+
+    def test_a_loan_below_the_lender_minimum_is_no_fit_loan_too_small(self, soft_db):
+        big_minimum = LenderRules(key=LENDER, name="Test Lender", verified=True, min_loan_amount=D("1000000"))
+        out = generate_soft_approval(
+            soft_db, phone=PHONE, dialer_call_id="c", facts=FACTS, submitted_by=None,
+            lead_source=FakeLeadProfileSource({PHONE: LEAD}), evaluator=FakeLenderFitEvaluator(FITTING),
+            rules_lookup=lambda key: big_minimum, params=PARAMS, renderer=lambda ctx: b"%PDF")
+        assert (out.status, out.reason) == ("no_fit", "loan_too_small") and _row(soft_db)["pdf"] is None
+
+    def test_a_lender_declined_only_on_the_ltv_ltc_caps_is_sized_not_dropped(self, soft_db):
+        """B1(c): the formulas cut the loan to the caps; the re-fit at the computed loan decides."""
+        capped = LenderFitResult(non_fitting=[LenderMiss(lender_key=LENDER, lender_name="L", reasons=["LTC over"],
+                                                          reason_codes=[DeclineReason.LTC_OVER_MAX])])
+
+        asked_for_more = LeadProfile(lead_ref="lf-9", borrower=BorrowerProfile(credit_band_min_fico=640),
+                                     loan_type=LoanType.FIX_AND_FLIP, loan_amount=D("350000"), state="FL")
+
+        class Evaluator:
+            def evaluate(self, profile, request):
+                return capped if request.loan_amount == asked_for_more.loan_amount else FITTING
+
+        out = _generate(soft_db, lead=asked_for_more, evaluator=Evaluator())
+        assert out.status == "generated" and out.lender_key == LENDER
+
+    def test_a_lender_declined_for_another_reason_is_not_sized(self, soft_db):
+        wrong_state = LenderFitResult(non_fitting=[LenderMiss(lender_key=LENDER, lender_name="L", reasons=["state"],
+                                                              reason_codes=[DeclineReason.STATE_NOT_COVERED])])
+        assert _generate(soft_db, evaluator=FakeLenderFitEvaluator(wrong_state)).status == "no_fit"
+
+    def test_backflip_is_tried_first_even_when_ranked_after_another_lender(self, soft_db):
+        other = LenderRules(key="other_lender", name="Other", verified=True, max_ltv=D("0.75"))
+        backflip = LenderRules(key="generic_backflip_flip", name="Backflip", verified=True, max_ltv=D("0.75"))
+        ranked = LenderFitResult(fitting=[LenderFit(lender_key="other_lender", lender_name="O"),
+                                          LenderFit(lender_key="generic_backflip_flip", lender_name="B")])
+        both = {"other_lender": PARAMS[LENDER], "generic_backflip_flip": PARAMS[LENDER]}
+        out = generate_soft_approval(
+            soft_db, phone=PHONE, dialer_call_id="c", facts=FACTS, submitted_by=None,
+            lead_source=FakeLeadProfileSource({PHONE: LEAD}), evaluator=FakeLenderFitEvaluator(ranked),
+            rules_lookup=lambda k: {"other_lender": other, "generic_backflip_flip": backflip}.get(k),
+            params=both, renderer=lambda ctx: b"%PDF")
+        assert out.lender_key == "generic_backflip_flip"
 
     def test_next_lender_is_used_when_the_first_no_longer_fits_at_the_computed_loan(self, soft_db):
         second = LenderRules(key="second", name="Second", verified=True, max_ltv=D("0.75"))
@@ -252,13 +363,20 @@ class TestService:
         assert row["figures"]["net_loan"] == "300000" and row["dialer_call_id"] == "call-2"
         assert len(row["history"]) == 1 and row["history"][0]["figures"]["net_loan"] == "290000"
 
-    def test_production_defaults_produce_no_pdf(self, soft_db):
-        """Real lead source + real evaluator + real matrix (all lenders unverified): closed, never a guess."""
-        out = generate_soft_approval(soft_db, phone=PHONE, dialer_call_id="c", facts=FACTS, submitted_by=None)
+    def test_production_defaults_produce_a_flagged_pdf_on_the_placeholder_inputs(self, soft_db):
+        """Real lead source + real evaluator (T-05) + real matrix: every lender is unconfirmed, so the PDF is made
+        on Josh's placeholder box and flagged subject to lender confirmation (A1). The feature itself stays closed
+        behind LENDING_SOFT_APPROVAL_ENABLED."""
+        out = generate_soft_approval(soft_db, phone=PHONE, dialer_call_id="c", facts=FACTS, submitted_by=None,
+                                     renderer=lambda ctx: b"%PDF-prod")
         assert out.status == "no_lead" and _row(soft_db)["pdf"] is None  # no LendingFlow lead for the phone
         _flow_lead(soft_db)
-        out = generate_soft_approval(soft_db, phone=PHONE, dialer_call_id="c", facts=FACTS, submitted_by=None)
-        assert out.status in {"no_fit", "terms_unconfirmed"} and _row(soft_db)["pdf"] is None
+        out = generate_soft_approval(soft_db, phone=PHONE, dialer_call_id="c", facts=FACTS, submitted_by=None,
+                                     renderer=lambda ctx: b"%PDF-prod")
+        row = _row(soft_db)
+        assert out.status == "generated" and out.lender_key == "generic_backflip_flip"
+        assert row["figures"]["subject_to_confirmation"] is True and row["figures"]["binding_cap"] == "ltc"
+        assert row["figures"]["net_loan"] == "246000"  # the placeholder 85% LTC cap on 290,000 total cost
         assert not any(r.verified for r in LENDER_MATRIX)
 
     def test_migration_is_idempotent(self, soft_db):
@@ -284,6 +402,19 @@ class TestLendingFlowLeadSource:
         lead = self.SOURCE.for_phone(soft_db, PHONE)
         assert lead.loan_type is LoanType.FIX_AND_FLIP and lead.loan_amount == D(290000) and lead.state == "FL"
         assert lead.borrower.credit_band_min_fico == 640 and lead.has_core_fields()
+
+    def test_a_closed_band_carries_its_upper_bound_so_a_higher_floor_is_a_decline(self, soft_db):
+        """Review on #363: "680-719" must reach the evaluator as 680 to 719, never as an open-ended 680+."""
+        _flow_lead(soft_db, fico=680)
+        soft_db.execute(text("UPDATE lending.lendingflow_leads SET credit_band = '680-719' WHERE phone = :p"), {"p": PHONE})
+        lead = self.SOURCE.for_phone(soft_db, PHONE)
+        assert (lead.borrower.credit_band_min_fico, lead.borrower.credit_band_max_fico) == (680, 719)
+        strict = LenderRules(key="strict", name="Strict", verified=True, loan_types=frozenset({LoanType.FIX_AND_FLIP}),
+                             credit_floor=740)
+        request = LoanRequest(loan_type=lead.loan_type, loan_amount=lead.loan_amount, state=lead.state)
+        result = sa_service.MatrixLenderFitEvaluator(matrix=(strict,)).evaluate(lead.borrower, request)
+        assert not result.fitting and not result.possible
+        assert DeclineReason.CREDIT_BELOW_MIN in result.non_fitting[0].reason_codes
 
     def test_the_most_recent_lead_for_the_phone_wins(self, soft_db):
         _flow_lead(soft_db, vendor="old", amount=100000, received="2026-09-01 10:00:00+00")
@@ -337,6 +468,17 @@ class TestTemplate:
         for forbidden in ("%", "interest", "apr", "ltc", "ltv", "origination", "points", "backflip", "rcn", "kiavi", "easy street"):
             assert forbidden not in body
 
+    def test_b7_nothing_is_emailed_so_the_copy_never_says_reply_to_this_email(self):
+        # B2 (no company name, signed by Josh) is T-07's shared signer in base.html on dev; this PR does not repeat it.
+        html = render_html("soft_approval.html", CONTEXT, watermark=self.WATERMARK)
+        assert "reply to this email" not in html
+
+    def test_the_subject_to_confirmation_line_prints_only_when_flagged(self):
+        flagged = render_html("soft_approval.html", {**CONTEXT, "subject_to_confirmation": True}, watermark=self.WATERMARK)
+        plain = render_html("soft_approval.html", {**CONTEXT, "subject_to_confirmation": False}, watermark=self.WATERMARK)
+        assert "subject to lender confirmation" in flagged and "subject to lender confirmation" not in plain
+        assert "subject to lender confirmation" not in render_html("soft_approval.html", CONTEXT, watermark=self.WATERMARK)
+
     def test_omits_max_price_when_there_is_none(self):
         html = render_html("soft_approval.html", {**CONTEXT, "max_purchase_price": ""}, watermark=self.WATERMARK)
         assert "maximum purchase price" not in html
@@ -351,6 +493,21 @@ class TestTemplate:
 class FakeSlack:
     def __init__(self):
         self.posts, self.views, self.fail = [], [], False
+        self.ephemerals, self.files, self.upload_fail = [], [], False
+        self.updates, self.update_fail = [], False
+
+    def chat_postEphemeral(self, **kwargs):
+        self.ephemerals.append(kwargs)
+
+    def chat_update(self, **kwargs):
+        if self.update_fail:
+            raise RuntimeError("cannot edit the card")
+        self.updates.append(kwargs)
+
+    def files_upload_v2(self, **kwargs):
+        if self.upload_fail:
+            raise RuntimeError("files:write missing")
+        self.files.append(kwargs)
 
     def chat_postMessage(self, **kwargs):
         if self.fail:
@@ -364,6 +521,7 @@ class FakeSlack:
 
 def _settings(**over):
     base = dict(lending_soft_approval_enabled=True, lending_dial_tasks_channel="CDIAL",
+                lending_soft_approval_user_ids="U1", lending_cora_approver_user_ids="",
                 lending_slack_bot_token=SimpleNamespace(get_secret_value=lambda: "xoxb-test"),
                 lending_slack_signing_secret=SimpleNamespace(get_secret_value=lambda: "sig-secret"))
     base.update(over)
@@ -580,7 +738,7 @@ class TestRoute:
         assert client.post(self.URL, content=body, headers=_signed(body, secret="wrong")).status_code == 401
 
     def test_button_click_opens_the_form_for_that_call(self, client, wired):
-        body = _payload({"type": "block_actions", "trigger_id": "trig",
+        body = _payload({"type": "block_actions", "trigger_id": "trig", "user": {"id": "U1"},
                          "channel": {"id": "CDIAL"}, "message": {"ts": "1.1"},
                          "actions": [{"action_id": "soft_approval_open", "value": "call-1"}]})
         assert client.post(self.URL, content=body, headers=_signed(body)).status_code == 200
@@ -615,6 +773,106 @@ class TestRoute:
         assert row["status"] == "no_lead" and row["pdf"] is None and row["submitted_by"] == "U1"
         assert wired.posts[-1]["thread_ts"] == "1.1" and "No LendingFlow lead" in wired.posts[-1]["text"]
         assert "250000" not in json.dumps(wired.posts[-1])
+
+    # ---- B11: who may open and submit the form -----------------------------------------------
+
+    def _open_body(self, user):
+        return _payload({"type": "block_actions", "trigger_id": "trig", "user": {"id": user},
+                         "channel": {"id": "CDIAL"}, "message": {"ts": "1.1"},
+                         "actions": [{"action_id": "soft_approval_open", "value": "call-1"}]})
+
+    def _submit_body(self, user, **state):
+        return _payload({"type": "view_submission", "user": {"id": user}, "view": {
+            "callback_id": "soft_approval_form",
+            "private_metadata": json.dumps({"call_id": "call-1", "channel": "CDIAL", "message_ts": "1.1"}),
+            "state": {"values": _state(**state)}}})
+
+    def test_a_user_not_on_the_allow_list_cannot_open_the_form(self, client, wired):
+        body = self._open_body("UOTHER")
+        assert client.post(self.URL, content=body, headers=_signed(body)).status_code == 200
+        assert wired.views == [] and wired.ephemerals[0]["user"] == "UOTHER"
+
+    def test_a_user_not_on_the_allow_list_cannot_submit_and_nothing_is_stored(self, client, wired, soft_db):
+        _call(soft_db)
+        body = self._submit_body("UOTHER")
+        res = client.post(self.URL, content=body, headers=_signed(body)).json()
+        assert res["response_action"] == "errors"
+        assert soft_db.execute(text("SELECT count(*) FROM lending.soft_approvals")).scalar() == 0
+
+    def test_an_empty_allow_list_blocks_everyone(self, client, wired, monkeypatch):
+        monkeypatch.setattr(webhook, "get_settings", lambda: _settings(
+            lending_soft_approval_user_ids="", lending_cora_approver_user_ids=""))
+        body = self._open_body("U1")
+        client.post(self.URL, content=body, headers=_signed(body))
+        assert wired.views == []
+
+    def test_the_cora_approver_ids_are_the_fallback_allow_list(self, client, wired, monkeypatch):
+        monkeypatch.setattr(webhook, "get_settings", lambda: _settings(
+            lending_soft_approval_user_ids="", lending_cora_approver_user_ids="UJOSH, U2"))
+        body = self._open_body("UJOSH")
+        client.post(self.URL, content=body, headers=_signed(body))
+        assert len(wired.views) == 1
+
+    # ---- B7 (PDF opened from the thread) and F5 (facts reach the lead card) -----------------
+
+    @pytest.fixture
+    def flow(self, soft_db, monkeypatch):
+        _flow_lead(soft_db)
+        _call(soft_db)
+        monkeypatch.setattr(sa_service, "render_pdf", lambda *a, **k: b"%PDF-route")
+
+    def test_the_stored_pdf_is_uploaded_to_the_cards_thread_with_a_flagged_status(self, client, wired, soft_db, flow):
+        body = self._submit_body("U1")
+        assert client.post(self.URL, content=body, headers=_signed(body)).json() == {}
+        assert _row(soft_db)["status"] == "generated"
+        upload = wired.files[0]
+        assert (upload["channel"], upload["thread_ts"], upload["content"]) == ("CDIAL", "1.1", b"%PDF-route")
+        assert upload["filename"] == "soft-approval-0101.pdf" and "12 Palm" not in json.dumps(upload, default=str)
+        assert "Subject to lender confirmation" in wired.posts[-1]["text"]
+
+    def test_a_failed_upload_never_fails_the_soft_approval(self, client, wired, soft_db, flow):
+        wired.upload_fail = True
+        body = self._submit_body("U1")
+        client.post(self.URL, content=body, headers=_signed(body))
+        assert _row(soft_db)["status"] == "generated" and wired.posts[-1]["thread_ts"] == "1.1"
+
+    def test_no_upload_when_nothing_was_generated(self, client, wired, soft_db):
+        _call(soft_db)  # no LendingFlow lead for the phone
+        body = self._submit_body("U1")
+        client.post(self.URL, content=body, headers=_signed(body))
+        assert wired.files == []
+
+    def test_the_card_shows_a_flagged_pdf_ready_line_and_offers_the_form_again(self, client, wired, soft_db, flow):
+        body = self._submit_body("U1")
+        client.post(self.URL, content=body, headers=_signed(body))
+        update = wired.updates[0]
+        assert (update["channel"], update["ts"]) == ("CDIAL", "1.1")
+        status = next(b for b in update["blocks"] if b["type"] == "context")["elements"][0]["text"]
+        assert "PDF ready" in status and "subject to lender confirmation" in status and "<!date^" in status
+        button = next(b for b in update["blocks"] if b["type"] == "actions")["elements"][0]
+        assert button["text"]["text"] == "Re-enter deal facts"
+        assert (button["action_id"], button["value"]) == (webhook.OPEN_FORM_ACTION_ID, "call-1")
+        dumped = json.dumps(update, default=str)
+        assert "12 Palm" not in dumped and PHONE not in dumped
+
+    def test_the_card_shows_why_no_pdf_was_made_and_keeps_the_original_button(self, client, wired, soft_db, flow):
+        body = self._submit_body("U1", arv="40000")  # the ARV cap cuts the loan below the lender minimum
+        client.post(self.URL, content=body, headers=_signed(body))
+        blocks = wired.updates[0]["blocks"]
+        status = next(b for b in blocks if b["type"] == "context")["elements"][0]["text"]
+        assert "No PDF" in status and wired.files == []
+        assert next(b for b in blocks if b["type"] == "actions")["elements"][0]["text"]["text"] == "Enter deal facts"
+
+    def test_a_failed_card_update_never_fails_the_soft_approval(self, client, wired, soft_db, flow):
+        wired.update_fail = True
+        body = self._submit_body("U1")
+        client.post(self.URL, content=body, headers=_signed(body))
+        assert _row(soft_db)["status"] == "generated" and wired.files and wired.posts[-1]["thread_ts"] == "1.1"
+
+    def test_the_card_is_left_alone_when_the_call_is_unknown(self, client, wired, soft_db):
+        body = self._submit_body("U1")  # no call row seeded
+        client.post(self.URL, content=body, headers=_signed(body))
+        assert wired.updates == []
 
     def test_disabled_feature_ignores_a_signed_request(self, client, monkeypatch):
         monkeypatch.setattr(webhook, "get_settings", lambda: _settings(lending_soft_approval_enabled=False))
