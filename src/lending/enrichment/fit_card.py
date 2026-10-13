@@ -3,9 +3,9 @@
 Runs the T-05 evaluator, then presents the result the way Josh asked:
 
 - Score = percent of lenders that fit (A3: 3 of 5 = 60). Backflip's rule rows count as one lender.
-  The score is read from the T-05 evaluator (``LenderFitResult.lender_fit_score``), which returns None
-  until every lender in the matrix is fully confirmed — a percentage over partly-unknown rules would
-  read as a real answer (A1).
+  The card computes this itself on grouped lenders (the evaluator's ``lender_fit_score`` counts raw
+  rows) and withholds it until every lender is fully confirmed — a percentage over partly-unknown
+  rules would read as a real answer (A1).
 - Ranking (A2): Backflip first whenever it fits, then the other fitting lenders cheapest first. When
   Backflip does not fit, every other fitting lender is shown.
 - A fitting lender whose cap values are still placeholder (A1): shown with note "subject to lender

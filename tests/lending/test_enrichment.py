@@ -530,3 +530,18 @@ def test_full_machine_card_says_assigned_to_josh_and_nurture_does_not():
     nurture = service.render_card_text(7, None, RoutingTag.NURTURE, None, view, coverage_note=None)
     assert "closer priority, assigned to Josh" in full
     assert "assigned to Josh" not in nurture
+
+
+def test_a_band_entirely_below_the_floor_is_not_listed_as_possible():
+    """Review finding: 600-639 against Backflip's 640 floor cannot qualify, so it is not 'possible'."""
+    view = evaluate_fit(_lead(credit_band="600-639", credit_band_min_fico=600), address=None, matrix=_matrix())
+    assert "Backflip" not in view.possible and "Backflip" not in view.ranked
+    assert view.straddles == []
+
+
+def test_a_band_that_crosses_the_floor_is_still_possible_and_open_ended_stays_possible():
+    crossing = evaluate_fit(_lead(credit_band="620-679", credit_band_min_fico=620), address=None, matrix=_matrix())
+    assert crossing.straddles == ["Backflip: credit needs confirmation on the call"]
+    assert "Backflip" in crossing.possible
+    open_ended = evaluate_fit(_lead(credit_band="600+", credit_band_min_fico=600), address=None, matrix=_matrix())
+    assert "Backflip" in open_ended.possible  # no upper bound: it may still clear the floor
