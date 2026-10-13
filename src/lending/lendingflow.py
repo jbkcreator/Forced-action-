@@ -24,6 +24,7 @@ from config.lending_lendingflow import (
     GHL_RETRY_BACKOFF_MINUTES,
     LEAD_SOURCE,
     MISSING_LEAD_ID_PREFIX,
+    is_missing_lead_id,
     SWEEP_BATCH_SIZE,
 )
 from src.lending.contracts import LoanType
@@ -349,9 +350,9 @@ def save_lead(db, parsed: ParsedLendingFlowLead, raw_payload: Any, *, now: Optio
         return raced
     if parsed.certificate:
         store_certificate(db, row.id, parsed.certificate, duplicate=False, now=now)
-    if parsed.vendor_lead_id.startswith(MISSING_LEAD_ID_PREFIX):
-        logger.warning("[lendingflow] lead created id=%s without a LendingFlow lead id", row.id)
-        logger.info("[lendingflow] lead created id=%s suppressed=%s", row.id, reason is not None)
+    if is_missing_lead_id(parsed.vendor_lead_id):
+        logger.warning("[lendingflow] lead created id=%s without a LendingFlow lead id suppressed=%s",
+                       row.id, reason is not None)
     else:
         logger.info("[lendingflow] lead created id=%s vendor=%s suppressed=%s", row.id, parsed.vendor_lead_id,
                     reason is not None)

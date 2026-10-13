@@ -18,7 +18,7 @@ from config.lending_lendingflow import (
     GHL_TAG_INTRO_READY,
     GHL_TAG_LENDINGFLOW,
     GHL_TAG_NO_LEAD_ID,
-    MISSING_LEAD_ID_PREFIX,
+    is_missing_lead_id,
 )
 from config.settings import get_settings
 from src.lending.ghl_account import GhlAccount, ghl_headers, lending_ghl_account
@@ -31,7 +31,7 @@ def _tags(lead: Mapping[str, Any]) -> list[str]:
     tags = [GHL_TAG_LENDINGFLOW]
     if lead["consent_status"] != "present":
         tags.append(GHL_TAG_CONSENT_MISSING)
-    if str(lead.get("vendor_lead_id") or "").startswith(MISSING_LEAD_ID_PREFIX):
+    if is_missing_lead_id(lead.get("vendor_lead_id") or ""):
         tags.append(GHL_TAG_NO_LEAD_ID)
     return tags
 

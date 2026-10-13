@@ -13,6 +13,12 @@ GHL_SOURCE = "LendingFlow"
 # A lead that arrives without a LendingFlow lead id is stored, not rejected (client, Oct 2026): its vendor id is this
 # prefix + the phone/email dedupe hash, and GHL gets this tag so the missing id is visible.
 MISSING_LEAD_ID_PREFIX = "missing:"
+
+
+def is_missing_lead_id(vendor_lead_id: str) -> bool:
+    """True for a lead stored without a LendingFlow lead id (its vendor id was made up from phone + email)."""
+    return vendor_lead_id.startswith(MISSING_LEAD_ID_PREFIX)
+
 GHL_TAG_NO_LEAD_ID = "lendingflow-no-lead-id"
 
 # Same schedule shape as config.lending_web: minutes to wait after the Nth failure (last value repeats).
