@@ -23,6 +23,7 @@ from config.settings import get_settings
 from packages.agent_core.approval import ApprovalAction
 from src.lending.cora_runtime import handle_slack_request
 from src.lending.db import lending_session
+from src.lending.soft_approval.enrichment_link import share_facts_with_enrichment
 from src.lending.soft_approval.facts import SoftApprovalFacts
 from src.lending.soft_approval.service import generate_soft_approval
 from src.lending.soft_approval.slack_card import (
@@ -64,6 +65,7 @@ def _open_form(payload: dict) -> None:
 
 def _process_submission(call_id: str, facts: SoftApprovalFacts, user_id: str, channel: str, message_ts: str) -> None:
     status_text = "The soft approval could not be processed. Please tell the engineering team."
+    phone = None
     try:
         with lending_session() as db:
             phone = db.execute(
@@ -82,6 +84,8 @@ def _process_submission(call_id: str, facts: SoftApprovalFacts, user_id: str, ch
             slack_client().chat_postMessage(channel=channel, thread_ts=message_ts, text=status_text)
         except Exception as exc:
             logger.error("[soft-approval] call %s status reply failed: %s", call_id, type(exc).__name__)
+    if phone:
+        share_facts_with_enrichment(call_id, phone, facts)
 
 
 def _handle_submission(payload: dict, background: BackgroundTasks) -> dict[str, Any]:
