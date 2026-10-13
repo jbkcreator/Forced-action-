@@ -330,7 +330,7 @@ def test_a_held_lead_is_tagged_once_when_the_window_opens(lf_db, ghl_calls, intr
 
 
 def test_a_lead_is_never_released_a_day_late(lf_db, ghl_calls, intro_on):
-    lead_id = _held_lead(lf_db, received=OPEN_NOW - timedelta(hours=15))
+    lead_id = _held_lead(lf_db, received=OPEN_NOW - timedelta(hours=25))
     assert release_held_intro_sms(lf_db, LendingFlowGhlSink(GhlAccount("k", "loc")), now=OPEN_NOW) == 0
     assert _tagged_at(lf_db, lead_id) is None
 
@@ -359,3 +359,41 @@ def test_a_failed_release_is_left_for_the_next_sweep(lf_db, ghl_calls, intro_on)
     assert release_held_intro_sms(lf_db, TagFails(), now=OPEN_NOW) == 0
     assert _tagged_at(lf_db, lead_id) is None
     assert release_held_intro_sms(lf_db, LendingFlowGhlSink(GhlAccount("k", "loc")), now=OPEN_NOW) == 1
+
+
+# ------------------------------------------------------------------ PR #360 review findings (database)
+
+PACIFIC_PHONE, TAMPA_ZIP = "+16502530000", "33602"
+
+
+def _make_pacific_with_tampa_property(db, lead_id):
+    db.execute(text("UPDATE lending.lendingflow_leads SET phone = :p, property_zip = :z, property_state = 'FL' "
+                    "WHERE id = :i"), {"p": PACIFIC_PHONE, "z": TAMPA_ZIP, "i": lead_id})
+
+
+def test_a_pacific_borrower_with_a_tampa_property_is_held_until_8am_pacific(lf_db, ghl_calls, intro_on):
+    """9:00 ET is 6:00 PT. The Tampa ZIP must not stand in for the phone's zone, at push or at release."""
+    lead_id = _save_eligible_lead(lf_db)
+    _make_pacific_with_tampa_property(lf_db, lead_id)
+    nine_et = datetime(2026, 10, 14, 13, 0, tzinfo=timezone.utc)
+    eleven_et = datetime(2026, 10, 14, 15, 0, tzinfo=timezone.utc)  # 8:00 PT
+    _received_at(lf_db, lead_id, nine_et - timedelta(hours=2))
+    _deliver(lf_db, lead_id, nine_et)  # initial delivery
+    assert _tag_calls(ghl_calls) == [["lendingflow"]] and _tagged_at(lf_db, lead_id) is None
+    sink = LendingFlowGhlSink(GhlAccount("k", "loc"))
+    assert release_held_intro_sms(lf_db, sink, now=nine_et) == 0  # deferred release, still 6:00 PT
+    assert release_held_intro_sms(lf_db, sink, now=eleven_et) == 1
+    assert _tagged_at(lf_db, lead_id) == eleven_et
+
+
+def test_an_overnight_lead_is_still_released_when_its_window_opens(lf_db, ghl_calls, intro_on):
+    """Pacific phone + Florida property: open 11:00-20:00 ET. A lead arriving at 20:05 ET waits 14 h 55 min."""
+    lead_id = _save_eligible_lead(lf_db)
+    _make_pacific_with_tampa_property(lf_db, lead_id)
+    arrived = datetime(2026, 10, 14, 0, 5, tzinfo=timezone.utc)  # 20:05 ET the evening before
+    opens = datetime(2026, 10, 14, 15, 0, tzinfo=timezone.utc)   # 11:00 ET = 8:00 PT
+    _received_at(lf_db, lead_id, arrived)
+    _deliver(lf_db, lead_id, arrived + timedelta(minutes=1))
+    assert _tagged_at(lf_db, lead_id) is None
+    assert release_held_intro_sms(lf_db, LendingFlowGhlSink(GhlAccount("k", "loc")), now=opens) == 1
+    assert _tagged_at(lf_db, lead_id) == opens
