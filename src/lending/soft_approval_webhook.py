@@ -1,11 +1,10 @@
 """POST /webhooks/lending/slack-interactivity: the Slack Interactivity Request URL for the soft approval form.
 
 Served by lending-api (nginx /webhooks/lending/). Slack must be in HTTP mode (Socket Mode off) with this
-URL set under Interactivity. The same URL also receives Cora's approval-card clicks (``agent_core_*``
-action ids), which are handed to Cora before any soft-approval handling. Every request is
-signature-checked with LENDING_SLACK_SIGNING_SECRET; the route is closed (503) while the secret is
-unset. The form submission is acknowledged at once and the evaluation, rendering and storage run in
-a background task.
+URL set under Interactivity. Every request is signature-checked with LENDING_SLACK_SIGNING_SECRET; the
+route is closed (503) while the secret is unset. The form submission is acknowledged at once and the
+evaluation, rendering and storage run in a background task. Cora's approval cards belong to her own
+Slack app and never arrive here.
 """
 from __future__ import annotations
 
@@ -20,8 +19,6 @@ from sqlalchemy import text
 
 from config.lending_soft_approval import FORM_CALLBACK_ID, OPEN_FORM_ACTION_ID
 from config.settings import get_settings
-from packages.agent_core.approval import ApprovalAction
-from src.lending.cora_runtime import handle_slack_request
 from src.lending.db import lending_session
 from src.lending.soft_approval.facts import SoftApprovalFacts
 from src.lending.soft_approval.service import generate_soft_approval
@@ -36,14 +33,6 @@ from src.lending.soft_approval.slack_card import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/webhooks/lending", tags=["lending"])
-
-_CORA_ACTION_IDS = frozenset(action.value for action in ApprovalAction)
-
-
-def is_cora_click(payload: dict) -> bool:
-    """A click on one of Cora's Approve / Revise / Reject card buttons (Cora acts on the first action only)."""
-    actions = payload.get("actions") or []
-    return payload.get("type") == "block_actions" and bool(actions) and actions[0].get("action_id") in _CORA_ACTION_IDS
 
 
 def _open_form(payload: dict) -> None:
@@ -116,18 +105,12 @@ async def slack_interactivity(request: Request, background: BackgroundTasks) -> 
         request.headers.get("X-Slack-Signature"), body,
     ):
         raise HTTPException(status_code=401, detail="Invalid signature")
+    if not get_settings().lending_soft_approval_enabled:
+        return {}
     try:
         payload: Optional[dict] = json.loads(parse_qs(body.decode()).get("payload", [""])[0])
     except ValueError:
         payload = None
-    # The lending app has one Interactivity URL: Cora's approval-card clicks share it. They are routed
-    # before the soft-approval switch so turning soft approval off never strands a Cora approval.
-    if isinstance(payload, dict) and is_cora_click(payload):
-        action = (payload.get("actions") or [{}])[0]
-        background.add_task(handle_slack_request, "interactive", payload, str(action.get("action_ts") or ""))
-        return {}
-    if not get_settings().lending_soft_approval_enabled:
-        return {}
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Malformed payload")
     kind: Optional[str] = payload.get("type")

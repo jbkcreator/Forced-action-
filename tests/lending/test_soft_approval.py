@@ -560,6 +560,13 @@ class TestRoute:
         assert json.loads(view["private_metadata"])["call_id"] == "call-1"
         assert {b["block_id"] for b in view["blocks"]} == {"address", "purchase", "rehab", "arv", "ptype", "close"}
 
+    def test_a_cora_card_click_is_not_handled_here(self, client, wired):
+        """Cora's cards belong to her own Slack app; a stray agent_core click opens nothing."""
+        body = _payload({"type": "block_actions", "trigger_id": "trig", "channel": {"id": "CCORA"},
+                         "message": {"ts": "2.2"}, "actions": [{"action_id": "agent_core_approve", "value": "7"}]})
+        assert client.post(self.URL, content=body, headers=_signed(body)).json() == {}
+        assert wired.views == []
+
     def test_invalid_submission_returns_inline_errors_and_stores_nothing(self, client, soft_db):
         body = _payload({"type": "view_submission", "user": {"id": "U1"}, "view": {
             "callback_id": "soft_approval_form", "private_metadata": json.dumps({"call_id": "call-1"}),

@@ -962,9 +962,10 @@ class AppSettings(BaseSettings):
 	lending_soft_approval_enabled: bool = Field(default=False, env="LENDING_SOFT_APPROVAL_ENABLED")
 	lending_slack_signing_secret: Optional[SecretStr] = Field(default=None, env="LENDING_SLACK_SIGNING_SECRET")  # verifies Slack interactivity posts to lending-api
 	# ── Lending Cora agent (packages/agent_core, systemd fa-lending-cora) ──
-	# Cora runs on the lending Slack app (LENDING_SLACK_BOT_TOKEN, LENDING_SLACK_SIGNING_SECRET) in HTTP mode:
-	# events at /webhooks/lending/slack-events, clicks at /webhooks/lending/slack-interactivity. Approvers are
-	# the only users whose clicks release an external send, so keep that list to Josh's Slack user id.
+	# Cora has her own Slack app, connected over Socket Mode from fa-lending-cora (no public endpoint).
+	# Approvers are the only users whose clicks release an external send, so keep that list to Josh's Slack user id.
+	lending_cora_slack_bot_token: Optional[SecretStr] = Field(default=None, env="LENDING_CORA_SLACK_BOT_TOKEN")  # xoxb- of Cora's own app
+	lending_cora_slack_app_token: Optional[SecretStr] = Field(default=None, env="LENDING_CORA_SLACK_APP_TOKEN")  # xapp- (connections:write) for Socket Mode
 	lending_cora_channel: str = Field(default="", env="LENDING_CORA_CHANNEL")  # channel ID for approval cards
 	lending_cora_approver_user_ids: str = Field(default="", env="LENDING_CORA_APPROVER_USER_IDS")  # comma-separated Slack user ids
 	lending_cora_operator_user_ids: str = Field(default="", env="LENDING_CORA_OPERATOR_USER_IDS")  # may chat, may not approve

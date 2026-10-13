@@ -56,6 +56,12 @@ _SQL_FROM_LIST_END = re.compile(
     re.IGNORECASE,
 )
 
+# Verbatim consent wording and certificates stay out of Slack: the yes/no consent fields answer
+# every operational question. Named in a query -> refused; picked up by SELECT * -> blanked.
+CONSENT_TEXT_COLUMNS = frozenset({"consent_text", "raw_certificate", "tcpa_disclosure_text"})
+_CONSENT_TEXT = re.compile(r"\b(?:" + "|".join(sorted(CONSENT_TEXT_COLUMNS)) + r")\b", re.IGNORECASE)
+CONSENT_TEXT_HIDDEN = "[consent text not shown]"
+
 LENDING_TABLES_HELP = (
     "Tables (schema lending): call_dispositions (one row per dialer call: caller_name, phone, disposition, "
     "direction, talk_duration_sec, call_started_at, call_ended_at, dialer_campaign_id, campaign_tag), "
@@ -195,6 +201,9 @@ def check_read_only_sql(sql: str) -> str:
         raise ToolInputError("the query must start with SELECT or WITH")
     if _SQL_FORBIDDEN.search(statement):
         raise ToolInputError("the query uses a keyword or function that is not allowed in a read-only lookup")
+    if _CONSENT_TEXT.search(statement):
+        raise ToolInputError("consent wording and certificates are not shown in Slack; use the yes/no consent "
+                             "fields (web_leads.sms_consent, text_consents) instead")
     cte_names = {name.lower() for name in re.findall(r"\b(\w+)\s+as\s*\(", statement, re.IGNORECASE)}
     for relation in _named_relations(statement):
         cleaned = relation.replace('"', "").lower()
@@ -368,7 +377,9 @@ class CoraToolkit:
                 raise ToolInputError(f"only lending.* tables can be queried (the query reads {sorted(outside)})")
             result = session.execute(text(f"SELECT * FROM ({statement}) AS cora_query LIMIT {MAX_ROWS}"))
             columns = list(result.keys())
-            rows = [{column: _iso(value) for column, value in zip(columns, row)} for row in result.all()]
+            hidden = {column for column in columns if column.lower() in CONSENT_TEXT_COLUMNS}
+            rows = [{column: CONSENT_TEXT_HIDDEN if column in hidden and value is not None else _iso(value)
+                     for column, value in zip(columns, row)} for row in result.all()]
         return {"columns": columns, "rows": rows, "row_count": len(rows), "row_cap": MAX_ROWS}
 
     # -- memory --------------------------------------------------------------------------

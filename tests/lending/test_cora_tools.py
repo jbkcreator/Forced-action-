@@ -46,6 +46,9 @@ def test_read_only_lookups_are_allowed(sql: str) -> None:
     ("SELECT * FROM lending.web_leads w, subscribers s WHERE s.id = w.id", "only lending"),
     ("SELECT * FROM lending.web_leads AS w , lending.contacts c, public.users u", "only lending"),
     ("SELECT count(*) FROM (SELECT 1 FROM lending.contacts) x, public.subscribers", "only lending"),
+    ("SELECT consent_text FROM lending.web_leads", "consent wording"),
+    ("SELECT RAW_CERTIFICATE AS c FROM lending.lead_consent_certificates", "consent wording"),
+    ("SELECT w.id FROM lending.web_leads w WHERE tcpa_disclosure_text IS NOT NULL", "consent wording"),
 ])
 def test_writes_other_schemas_and_server_functions_are_refused(sql: str, reason: str) -> None:
     with pytest.raises(ToolInputError, match=reason):
@@ -85,6 +88,34 @@ def test_query_tool_refuses_a_plan_that_reads_outside_lending(monkeypatch) -> No
     with pytest.raises(ToolInputError, match="public.subscribers"):
         toolkit.query_lending_data(cora_tools.QueryInput(sql="SELECT * FROM lending.web_leads_view"), CONTEXT)
     assert len(executed) == 1 and executed[0].startswith("EXPLAIN")  # the query itself never ran
+
+
+def test_consent_match_flag_is_not_mistaken_for_consent_text() -> None:
+    sql = "SELECT count(*) FROM lending.web_leads WHERE consent_text_matches"
+    assert check_read_only_sql(sql) == sql
+
+
+def test_select_star_blanks_consent_text_but_keeps_other_columns(monkeypatch) -> None:
+    class Result:
+        def keys(self):
+            return ["id", "sms_consent", "consent_text"]
+
+        def all(self):
+            return [(1, True, "I agree to receive texts from Next Deal Lending"), (2, False, None)]
+
+    class FakeSession:
+        def execute(self, statement, *args):
+            if str(statement).startswith("EXPLAIN"):
+                return type("R", (), {"scalar": lambda self: [{"Plan": _scan("lending", "web_leads")}]})()
+            return Result()
+
+    toolkit = CoraToolkit(engine=None, memory=None)  # type: ignore[arg-type]
+    monkeypatch.setattr(toolkit, "_read_only", lambda: _context_manager(FakeSession()))
+    result = toolkit.query_lending_data(cora_tools.QueryInput(sql="SELECT * FROM lending.web_leads"), CONTEXT)
+    assert result["rows"] == [
+        {"id": 1, "sms_consent": True, "consent_text": cora_tools.CONSENT_TEXT_HIDDEN},
+        {"id": 2, "sms_consent": False, "consent_text": None},
+    ]
 
 
 class _context_manager:

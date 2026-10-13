@@ -4,7 +4,7 @@ from datetime import timedelta
 
 from packages.agent_core.approval import ApprovalAction, apply_click, render_action_card, render_decided_card
 from packages.agent_core.pending_actions import ActionStatus, PendingActionQueue
-from packages.agent_core.redaction import mask_long_digit_runs
+from packages.agent_core.redaction import mask_emails, mask_long_digit_runs
 
 from .conftest import APPROVER, OPERATOR, Clock, enqueue_sms
 
@@ -32,6 +32,20 @@ def test_card_masks_long_digit_runs_and_escapes_markup(queue: PendingActionQueue
 
 def test_mask_leaves_short_numbers_alone() -> None:
     assert mask_long_digit_runs("Loan $350000 at 12 months") == "Loan $350000 at 12 months"
+
+
+def test_email_card_shows_the_address_masked(queue: PendingActionQueue) -> None:
+    action_id = queue.enqueue(tool_name="draft_email", channel="ghl_email",
+                              payload={"to_email": "sam.smith@example.com", "subject": "Hi", "body": "Hello"},
+                              summary="Email to Sam <sam.smith@example.com>: Hi")
+    rendered = str(render_action_card(queue.get(action_id)))
+    assert "sam.smith@example.com" not in rendered
+    assert "s***@example.com" in rendered
+
+
+def test_email_mask_keeps_first_letter_and_domain_only() -> None:
+    assert mask_emails("write to Sam.Lee+loans@mail.example.co.uk today") == "write to S***@mail.example.co.uk today"
+    assert mask_emails("no address here, just @mentions") == "no address here, just @mentions"
 
 
 def test_decided_card_has_no_buttons(queue: PendingActionQueue) -> None:

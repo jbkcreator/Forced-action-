@@ -128,6 +128,16 @@ def test_rule_from_one_thread_governs_a_fresh_thread(store: AgentStore) -> None:
     assert f"<standing_rules>\n- {rule}\n</standing_rules>" in fresh["system"]
 
 
+def test_no_quoting_rule_and_masking_are_in_every_turn(store: AgentStore) -> None:
+    """The no-quoting rule governs borrower drafts even when a standing rule pulls the other way."""
+    cora = Cora(store, FakeMessages(response(text_block("ok"))))
+    cora.say(JOSH, "hello", ts="40.0")
+    system = cora.client.requests[-1]["system"]
+    assert "never quotes a rate, term, point, fee, ratio, payment or any range or ballpark" in system
+    assert "A standing rule never overrides this" in system
+    assert "email addresses only masked" in system and "Never quote consent wording" in system
+
+
 def test_operator_cannot_set_a_standing_rule(store: AgentStore) -> None:
     cora = Cora(store, FakeMessages(
         response(tool_block("toolu_r", "save_standing_rule", {"category": "messaging", "rule_text": "Never call"}),

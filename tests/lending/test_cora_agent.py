@@ -18,7 +18,8 @@ from src.lending import cora_agent
 
 def _settings(**overrides) -> SimpleNamespace:
     values = dict(
-        lending_slack_bot_token=SecretStr("xoxb-test"),
+        lending_cora_slack_bot_token=SecretStr("xoxb-test"),
+        lending_cora_slack_app_token=SecretStr("xapp-test"),
         anthropic_api_key=SecretStr("sk-test"),
         lending_cora_channel="C_CORA",
         lending_cora_approver_user_ids="U_JOSH",
@@ -42,8 +43,13 @@ def test_build_config_maps_settings() -> None:
     assert config.db_schema == "lending"
     assert config.pending_action_ttl_hours == 48
     assert config.calendar_id is None
-    assert config.slack_app_token is None  # HTTP mode: no Socket Mode token
-    assert config.missing_for_http_session() == [] and cora_agent.missing_settings(config) == []
+    assert config.slack_app_token == "xapp-test"
+    assert cora_agent.missing_settings(config) == []
+
+
+def test_cora_uses_her_own_slack_app_not_the_lending_app() -> None:
+    config = cora_agent.build_config(_settings(lending_slack_bot_token=SecretStr("xoxb-lending")))
+    assert config.slack_bot_token == "xoxb-test"
 
 
 @pytest.fixture(autouse=True)
@@ -52,40 +58,55 @@ def _no_real_sigterm_handler(monkeypatch):
     monkeypatch.setattr(cora_agent.signal, "signal", lambda *args: None)
 
 
+@pytest.fixture
+def socket_runs(monkeypatch) -> list[dict]:
+    """Replaces the Socket Mode connection: records each call and blocks until stop, like the real one."""
+    runs: list[dict] = []
+
+    def fake_run_socket_mode(session, *, app_token, web_client, stop):
+        runs.append({"session": session, "app_token": app_token, "web_client": web_client})
+        stop.wait()
+
+    monkeypatch.setattr(cora_agent, "run_socket_mode", fake_run_socket_mode)
+    return runs
+
+
+def _services(session="session", web="web") -> SimpleNamespace:
+    return SimpleNamespace(session=session, web_client=web)
+
+
 def test_main_refuses_to_start_without_approvers(monkeypatch) -> None:
     monkeypatch.setattr(cora_agent, "get_settings", lambda: _settings(lending_cora_approver_user_ids=""))
     assert cora_agent.main() == 1
 
 
-def test_main_refuses_to_start_without_the_bot_token(monkeypatch) -> None:
-    monkeypatch.setattr(cora_agent, "get_settings", lambda: _settings(lending_slack_bot_token=None))
+def test_main_refuses_to_start_without_the_app_token(monkeypatch) -> None:
+    monkeypatch.setattr(cora_agent, "get_settings", lambda: _settings(lending_cora_slack_app_token=None))
     assert cora_agent.main() == 1
 
 
-def test_sweep_worker_starts_runs_the_sweep_and_stops(monkeypatch) -> None:
-    """A configured worker installs its SIGTERM handler, runs the sweep, and exits on stop."""
-    services = object()
+def test_main_runs_the_socket_session_and_the_sweep_until_sigterm(monkeypatch, socket_runs) -> None:
+    services = _services()
     handlers: list = []
     swept: list = []
     stop = threading.Event()
 
     def sweep(given):
         swept.append(given)
-        stop.set()
+        handlers[0][1]()  # SIGTERM sets the stop event
 
     monkeypatch.setattr(cora_agent, "get_settings", lambda: _settings())
-    monkeypatch.setattr(cora_agent, "build_live_services", lambda settings, **kwargs: services)
+    monkeypatch.setattr(cora_agent, "build_live_services", lambda settings: services)
     monkeypatch.setattr(cora_agent, "run_sweep", sweep)
     monkeypatch.setattr(cora_agent, "SWEEP_SECONDS", 0.01)
     monkeypatch.setattr(cora_agent.signal, "signal", lambda signum, handler: handlers.append((signum, handler)))
     assert cora_agent.main(stop=stop) == 0
-    assert swept == [services]
+    assert swept[0] is services and stop.is_set()
     assert [signum for signum, _ in handlers] == [signal.SIGTERM]
-    handlers[0][1]()  # SIGTERM sets the stop event
-    assert stop.is_set()
+    assert socket_runs == [{"session": "session", "app_token": "xapp-test", "web_client": "web"}]
 
 
-def test_a_failing_sweep_does_not_stop_the_worker(monkeypatch) -> None:
+def test_a_failing_sweep_does_not_stop_the_worker(monkeypatch, socket_runs) -> None:
     stop = threading.Event()
     runs: list = []
 
@@ -96,57 +117,68 @@ def test_a_failing_sweep_does_not_stop_the_worker(monkeypatch) -> None:
         stop.set()
 
     monkeypatch.setattr(cora_agent, "get_settings", lambda: _settings())
-    monkeypatch.setattr(cora_agent, "build_live_services", lambda settings, **kwargs: object())
+    monkeypatch.setattr(cora_agent, "build_live_services", lambda settings: _services())
     monkeypatch.setattr(cora_agent, "run_sweep", sweep)
     monkeypatch.setattr(cora_agent, "SWEEP_SECONDS", 0.01)
-    monkeypatch.setattr(cora_agent.signal, "signal", lambda *args: None)
     assert cora_agent.main(stop=stop) == 0 and len(runs) == 2
 
 
-def test_sweep_worker_retries_slack_at_boot_instead_of_exiting(monkeypatch) -> None:
+def test_a_dropped_socket_session_reconnects(monkeypatch) -> None:
+    stop = threading.Event()
+    attempts: list = []
+
+    def flaky_run_socket_mode(session, *, app_token, web_client, stop):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise ConnectionError("socket refused")
+        stop.set()
+
+    monkeypatch.setattr(cora_agent, "run_socket_mode", flaky_run_socket_mode)
+    monkeypatch.setattr(cora_agent, "get_settings", lambda: _settings())
+    monkeypatch.setattr(cora_agent, "build_live_services", lambda settings: _services())
+    monkeypatch.setattr(cora_agent, "run_sweep", lambda services: None)
+    monkeypatch.setattr(cora_agent, "SWEEP_SECONDS", 0.01)
+    assert cora_agent.main(stop=stop) == 0 and len(attempts) == 2
+
+
+def test_main_retries_slack_at_boot_instead_of_exiting(monkeypatch, socket_runs) -> None:
     """A Slack outage at boot must not exhaust systemd's restart limit: the worker waits and retries."""
     attempts: list = []
     stop = threading.Event()
 
-    def build(settings, **kwargs):
-        attempts.append(kwargs)
-        return None if len(attempts) < 3 else object()
+    def build(settings):
+        attempts.append(1)
+        return None if len(attempts) < 3 else _services()
 
     monkeypatch.setattr(cora_agent, "get_settings", lambda: _settings())
     monkeypatch.setattr(cora_agent, "build_live_services", build)
     monkeypatch.setattr(cora_agent, "run_sweep", lambda services: stop.set())
     monkeypatch.setattr(cora_agent, "SWEEP_SECONDS", 0.01)
     assert cora_agent.main(stop=stop) == 0
-    assert len(attempts) == 3 and all(call == {"needs_model": False} for call in attempts)
+    assert len(attempts) == 3 and len(socket_runs) == 1
 
 
-def test_sweep_worker_stops_cleanly_while_waiting_for_slack(monkeypatch) -> None:
+def test_main_stops_cleanly_while_waiting_for_slack(monkeypatch, socket_runs) -> None:
     stop = threading.Event()
     stop.set()
     monkeypatch.setattr(cora_agent, "get_settings", lambda: _settings())
-    monkeypatch.setattr(cora_agent, "build_live_services", lambda settings, **kwargs: None)
-    assert cora_agent.main(stop=stop) == 0
+    monkeypatch.setattr(cora_agent, "build_live_services", lambda settings: None)
+    assert cora_agent.main(stop=stop) == 0 and socket_runs == []
 
 
-def test_sweep_worker_exits_only_for_missing_settings(monkeypatch) -> None:
+def test_main_exits_only_for_missing_settings(monkeypatch, socket_runs) -> None:
     builds: list = []
     monkeypatch.setattr(cora_agent, "get_settings", lambda: _settings(lending_cora_channel=""))
-    monkeypatch.setattr(cora_agent, "build_live_services", lambda settings, **kwargs: builds.append(1))
+    monkeypatch.setattr(cora_agent, "build_live_services", lambda settings: builds.append(1))
     assert cora_agent.main(stop=threading.Event()) == 1
-    assert len(builds) == 1  # one build, only to log what is missing; no retry loop
-
-
-def test_sweep_worker_does_not_need_the_claude_key() -> None:
-    config = cora_agent.build_config(_settings(anthropic_api_key=None))
-    assert cora_agent.missing_settings(config, needs_model=False) == []
-    assert cora_agent.missing_settings(config) == ["anthropic_api_key"]
-    with pytest.raises(RuntimeError):
-        cora_agent._NoModel().create(model="x")
+    assert builds == [] and socket_runs == []  # no Slack call, no retry loop
 
 
 def test_missing_settings_are_named() -> None:
-    config = cora_agent.build_config(_settings(lending_slack_bot_token=None, lending_cora_channel="", anthropic_api_key=None))
-    assert cora_agent.missing_settings(config) == ["slack_bot_token", "slack_channel_id", "anthropic_api_key"]
+    config = cora_agent.build_config(_settings(lending_cora_slack_bot_token=None, lending_cora_slack_app_token=None,
+                                               lending_cora_channel="", anthropic_api_key=None))
+    assert cora_agent.missing_settings(config) == ["slack_bot_token", "slack_app_token", "slack_channel_id",
+                                                   "anthropic_api_key"]
     assert cora_agent.build_live_services(_settings(lending_cora_approver_user_ids="")) is None
 
 

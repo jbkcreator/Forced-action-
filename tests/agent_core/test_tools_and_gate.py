@@ -38,7 +38,7 @@ class Harness:
                 raise ToolInputError("no lead matched")
             if args.name == "boom":
                 raise RuntimeError("db exploded with phone 727-555-0100")
-            return {"name": args.name, "phone": "+17275550100"}
+            return {"name": args.name, "phone": "+17275550100", "email": "sam.smith@example.com"}
 
         def draft_sms(args: SmsInput, _: ToolContext) -> EgressDraft:
             self.sms_handler_calls += 1
@@ -71,10 +71,11 @@ def test_duplicate_tool_names_are_rejected(harness: Harness) -> None:
         ToolRegistry([tool, tool], harness.gate)
 
 
-def test_read_tool_runs_and_masks_long_numbers(harness: Harness) -> None:
+def test_read_tool_runs_and_masks_long_numbers_and_emails(harness: Harness) -> None:
     outcome = harness.registry.execute("lookup", {"name": "Sam"}, _context())
     assert not outcome.is_error
     assert "+17275550100" not in outcome.content and "[…0100]" in outcome.content
+    assert "sam.smith@example.com" not in outcome.content and "s***@example.com" in outcome.content
 
 
 @pytest.mark.parametrize("raw,expected", [({"name": "S"}, "invalid input: name"), ({"nme": "Sam"}, "invalid input"),

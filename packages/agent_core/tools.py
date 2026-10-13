@@ -16,7 +16,7 @@ from typing import Any, Protocol
 from pydantic import BaseModel, ValidationError
 
 from .governance import SafetyLevel, requires_human_approval
-from .redaction import mask_long_digit_runs
+from .redaction import mask_personal_data
 
 logger = logging.getLogger(__name__)
 
@@ -90,8 +90,8 @@ class DraftSubmitter(Protocol):
 
 def _render(result: Any) -> str:
     text = result if isinstance(result, str) else json.dumps(result, default=str, sort_keys=True)
-    # Tool output reaches the model and, through its answers, Slack: no full phone or account numbers.
-    text = mask_long_digit_runs(text)
+    # Tool output reaches the model and, through its answers, Slack: no full phone, account number or email.
+    text = mask_personal_data(text)
     return text if len(text) <= _RESULT_CHAR_LIMIT else text[:_RESULT_CHAR_LIMIT] + "\n…(truncated)"
 
 
