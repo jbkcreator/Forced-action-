@@ -13,15 +13,17 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Callable, Mapping, Optional
 
-from config.lender_matrix import LenderRules
+from config.lender_matrix import LenderRules, effective_rules
 from config.lending_soft_approval import (
     NON_BINDING_SOFT_APPROVAL_WATERMARK,
     SOFT_APPROVAL_LOAN_TYPES,
     SOFT_APPROVAL_PARAMS,
     SOFT_APPROVAL_TEMPLATE,
     SoftApprovalParams,
+    resolve_params,
 )
-from src.lending.contracts import LenderFitEvaluator, LoanRequest
+from config.lending_enrichment import BACKFLIP_KEY_PREFIX
+from src.lending.contracts import DeclineReason, LenderFitEvaluator, LoanRequest
 from src.lending.lender_fit import evaluate_lender_fit
 from src.lending.lender_rules_store import current_matrix
 from src.lending.pdf.render import render_pdf
@@ -62,6 +64,7 @@ class SoftApprovalOutcome:
     reason: Optional[str]
     approval_id: Optional[int]
     lender_key: Optional[str] = None
+    subject_to_confirmation: bool = False
 
 
 def _money(value: Decimal) -> str:
@@ -69,35 +72,63 @@ def _money(value: Decimal) -> str:
 
 
 def _terms(rules: LenderRules, params: SoftApprovalParams) -> LenderTerms:
+    """Calculation inputs from the lender's *effective* rules: an unset, unconfirmed cap takes Josh's
+    placeholder instead of being skipped (A1), and the lender minimum feeds ``loan_too_small`` (B1(c))."""
+    effective = effective_rules(rules)
     return LenderTerms(
         rehab_funding_pct=params.rehab_funding_pct,
         purchase_advance_pct=params.purchase_advance_pct,
-        arv_cap=rules.max_ltv,
-        ltc_cap=rules.max_ltc,
-        max_loan=rules.max_loan_amount,
+        arv_cap=effective.max_ltv,
+        ltc_cap=effective.max_ltc,
+        max_loan=effective.max_loan_amount,
+        min_loan=effective.min_loan_amount,
     )
 
 
+@dataclass(frozen=True)
+class _Pick:
+    lender_key: str
+    figures: SoftApprovalFigures
+    subject_to_confirmation: bool
+
+
+_CAP_ONLY_DECLINES = frozenset({DeclineReason.LTV_OVER_MAX, DeclineReason.LTC_OVER_MAX})
+
+
+def _candidate_keys(first_fit) -> list[str]:
+    """Lenders to size, in order. Josh's B1(c) formulas cut the loan to the LTV/LTC/max-loan caps instead of
+    declining the deal, so a lender whose only decline reasons are those two caps is still a candidate; the
+    re-fit at its computed loan decides. Backflip first (A2), then the evaluator's ranking."""
+    keys = [fit.lender_key for fit in first_fit.fitting]
+    keys += [miss.lender_key for miss in first_fit.non_fitting
+             if miss.reason_codes and set(miss.reason_codes) <= _CAP_ONLY_DECLINES]
+    return sorted(dict.fromkeys(keys), key=lambda key: not key.startswith(BACKFLIP_KEY_PREFIX))
+
+
 def _pick_lender(first_fit, borrower, request, facts, *, evaluator, rules_lookup, params):
-    """The first ranked lender that still fits at its computed loan amount, else (None, reason)."""
-    skipped_unconfirmed = False
-    for fit in first_fit.fitting:
-        rules = rules_lookup(fit.lender_key)
-        lender_params = params.get(fit.lender_key)
-        if rules is None or lender_params is None or not lender_params.confirmed():
-            skipped_unconfirmed = True
+    """The first ranked lender that still fits at its computed loan amount, else (None, reason).
+
+    A lender whose rules or shares are unconfirmed is used on the placeholder values and the pick is
+    flagged ``subject_to_confirmation`` (Josh, A1). Which lender feeds the PDF is unanswered (B1(c)):
+    the first-ranked fit is the provisional rule."""
+    too_small = False
+    for lender_key in _candidate_keys(first_fit):
+        rules = rules_lookup(lender_key)
+        if rules is None:
             continue
+        lender_params, params_confirmed = resolve_params(params.get(lender_key))
         try:
             figures = calculate_figures(facts.purchase_price, facts.rehab_budget, facts.arv, _terms(rules, lender_params))
         except CalculationUnavailable as exc:
-            logger.info("[soft-approval] lender %s skipped: %s", fit.lender_key, exc.reason)
-            continue
-        if figures.net_loan <= 0:
+            logger.info("[soft-approval] lender %s skipped: %s", lender_key, exc.reason)
+            too_small = too_small or exc.reason == "loan_too_small"
             continue
         refit = evaluator.evaluate(borrower, request.model_copy(update={"loan_amount": figures.net_loan}))
-        if any(f.lender_key == fit.lender_key for f in refit.fitting):
-            return (fit.lender_key, figures), "ok"
-    return None, "terms_unconfirmed" if skipped_unconfirmed else "no_lender_fits"
+        refit_fit = next((f for f in refit.fitting if f.lender_key == lender_key), None)
+        if refit_fit is not None:
+            subject = refit_fit.subject_to_confirmation or not params_confirmed
+            return _Pick(lender_key, figures, subject), "ok"
+    return None, "loan_too_small" if too_small else "no_lender_fits"
 
 
 def generate_soft_approval(
@@ -118,14 +149,14 @@ def generate_soft_approval(
     lead_source = lead_source or default_lead_source()
     evaluator = evaluator or MatrixLenderFitEvaluator()
 
-    def finish(status, reason, *, figures=None, lender_key=None, pdf=None):
+    def finish(status, reason, *, figures=None, lender_key=None, pdf=None, subject_to_confirmation=False):
         approval_id = save_soft_approval(
             db, phone=phone, dialer_call_id=dialer_call_id, status=status, reason=reason, facts=facts,
             figures=figures, lender_key=lender_key, pdf=pdf,
             template_version=TEMPLATE_VERSION if pdf else None, submitted_by=submitted_by,
         )
         logger.info("[soft-approval] call=%s status=%s reason=%s", dialer_call_id, status, reason)
-        return SoftApprovalOutcome(status, reason, approval_id, lender_key)
+        return SoftApprovalOutcome(status, reason, approval_id, lender_key, subject_to_confirmation)
 
     lead = lead_source.for_phone(db, phone)
     if lead is None:
@@ -149,15 +180,19 @@ def generate_soft_approval(
     picked, reason = _pick_lender(first_fit, lead.borrower, request, facts,
                                   evaluator=evaluator, rules_lookup=rules_lookup, params=params)
     if picked is None:
-        return finish("terms_unconfirmed" if reason == "terms_unconfirmed" else "no_fit", reason)
+        return finish("no_fit", reason)
 
-    lender_key, figures = picked
+    lender_key, figures = picked.lender_key, picked.figures
     figures_json = {
         "net_loan": str(figures.net_loan),
         "rehab_funding": str(figures.rehab_funding),
+        "purchase_advance": str(figures.purchase_advance),
+        "cash_at_closing": str(figures.cash_at_closing),
         "max_purchase_price": str(figures.max_purchase_price) if figures.max_purchase_price is not None else None,
         "full_advance_unavailable": figures.full_advance_unavailable,
-        "cash_needed": str(figures.cash_needed),
+        "binding_cap": figures.binding_cap.value,
+        "flags": [flag.value for flag in figures.flags],
+        "subject_to_confirmation": picked.subject_to_confirmation,
     }
     context = {
         "generated_date": (now or datetime.now(timezone.utc)).strftime("%B %d, %Y"),
@@ -174,4 +209,5 @@ def generate_soft_approval(
     except Exception as exc:  # class only: the context carries the borrower's property address
         logger.error("[soft-approval] call=%s render failed: %s", dialer_call_id, type(exc).__name__)
         return finish("render_failed", type(exc).__name__)
-    return finish("generated", None, figures=figures_json, lender_key=lender_key, pdf=pdf)
+    return finish("generated", None, figures=figures_json, lender_key=lender_key, pdf=pdf,
+                  subject_to_confirmation=picked.subject_to_confirmation)

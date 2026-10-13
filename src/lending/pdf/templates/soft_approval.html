@@ -1,6 +1,9 @@
 {% extends "base.html" %}
 {% block title %}Soft Approval Summary{% endblock %}
 {% block header_tag %}Soft Approval Summary{% endblock %}
+{# B2 (Josh, Oct 8): no company name on anything the borrower sees; everything is signed by Josh. #}
+{% block brand %}{% endblock %}
+{% block footer_brand %}<strong>Josh Kantor</strong> &middot; Loan Officer{% endblock %}
 {% block extra_head %}
 <style>
   .date { color: var(--ink-2); font-size: 10pt; margin: 0 0 22px; }
@@ -45,7 +48,7 @@
   depend on a full review of your file and lender approval.
 </div>
 
-<p class="next">Questions or ready to talk through your deal? Call or text <strong>(727) 436-9951</strong>
-or reply to this email.</p>
+<p class="next">Questions or ready to talk through your deal? Call or text <strong>(727) 436-9951</strong>.</p>
+<p class="next signoff">Josh Kantor, Loan Officer</p>
 {# PLACEHOLDER COPY: wording, signer and required disclosures pending Josh and a qualified professional's review. #}
 {% endblock %}

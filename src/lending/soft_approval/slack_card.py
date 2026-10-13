@@ -2,8 +2,8 @@
 
 The card goes to ``LENDING_DIAL_TASKS_CHANNEL`` (#dial-tasks, next to the call's result message) once per finished call, with a button that opens the form.
 The caller enters only the property facts; credit, loan type and amount come from the LendingFlow lead
-(see lead_source.py). Anyone who can see the card can submit (decided with the team, recorded in the PR);
-every submission stores the submitter's Slack user id.
+(see lead_source.py). Only the Slack users on the allow-list can open and submit the form (B11: Josh only until
+he names callers; ``soft_approval_webhook.allowed_user_ids``); every submission stores the submitter's Slack user id.
 """
 from __future__ import annotations
 
@@ -37,6 +37,9 @@ _FIELD_TO_BLOCK = {field: block for block, field in _BLOCKS.items()}
 
 OUTCOME_MESSAGES = {
     "generated": ":white_check_mark: Soft approval PDF is ready and stored for this lead.",
+    "generated_unconfirmed": (":white_check_mark: Soft approval PDF is ready and stored for this lead. "
+                              ":warning: Subject to lender confirmation: the lender inputs are placeholders."),
+    "loan_too_small": ":no_entry_sign: The loan works out below the lender's minimum, so nothing was made.",
     "no_lead": ":warning: No LendingFlow lead was found for this call, so no soft approval was made.",
     "no_fit": ":no_entry_sign: No lender fits, so nothing was made.",
     "out_of_scope": ":no_entry_sign: This loan type is not covered by the soft approval yet, so nothing was made.",
