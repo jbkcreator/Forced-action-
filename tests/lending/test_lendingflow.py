@@ -18,6 +18,7 @@ from src.lending.db import get_lending_db
 from src.lending.lendingflow import (
     ParseError,
     credit_band_min_fico,
+    dedupe_hash,
     deliver_pending,
     parse_lendingflow,
     run_followups,
@@ -55,6 +56,8 @@ def lf_db(lending_db):
     from migrations.apply_lending_web_leads import apply_to as apply_web  # noqa: F401  (schema parity)
 
     apply_to(lending_db.get_bind())
+    # The shared DB can already hold real rows; counts in these tests are rows added by the test itself.
+    lending_db.info["baseline"] = {t: _raw_count(lending_db, t) for t in ("lendingflow_leads", "lead_consent_certificates")}
     return lending_db
 
 
@@ -81,8 +84,12 @@ def _post(client, payload=None, *, raw=None, secret=SECRET):
     return client.post("/api/lending/lendingflow", content=data, headers=headers)
 
 
-def _count(db, table):
+def _raw_count(db, table):
     return db.execute(text(f"SELECT count(*) FROM lending.{table}")).scalar_one()
+
+
+def _count(db, table):
+    return _raw_count(db, table) - db.info.get("baseline", {}).get(table, 0)
 
 
 # ------------------------------------------------------------------ parsing
@@ -105,7 +112,7 @@ def test_credit_band_min_fico(raw, expected):
 
 
 @pytest.mark.parametrize("payload", [[], "x", {}, {"lead_id": "1"}, {"lead_id": "1", "phone": "12345"},
-                                     ])
+                                     {"phone": "12345"}])
 def test_parse_rejects_malformed(payload):
     with pytest.raises(ParseError):
         parse_lendingflow(payload)
@@ -180,7 +187,7 @@ def test_same_phone_email_different_vendor_id(client, lf_db):
     assert _count(lf_db, "lendingflow_leads") == 1 and len(client.scheduled) == 1
 
 
-@pytest.mark.parametrize("raw", ["not json", "[]", json.dumps({"phone": "7275550100"}),
+@pytest.mark.parametrize("raw", ["not json", "[]", json.dumps({"lead_id": "1"}),
                                  json.dumps({"lead_id": "1", "phone": "12345"})])
 def test_malformed_payload_is_400_with_detail(client, lf_db, raw):
     response = _post(client, raw=raw)
@@ -463,3 +470,31 @@ def test_migration_backfills_only_when_it_adds_the_column(lf_db):
     lf_db.execute(text("ALTER TABLE lending.lendingflow_leads DROP COLUMN followup_done_at"))
     apply_to(lf_db.get_bind())  # first apply of the column: earlier claimed leads count as done
     assert _row(lf_db).followup_done_at is not None
+
+
+def test_missing_lead_id_is_stored_with_an_id_derived_from_phone_and_email():
+    parsed = parse_lendingflow({"phone": "(727) 555-0100", "email": "A@Example.com"})
+    assert parsed.vendor_lead_id == "missing:" + dedupe_hash("+17275550100", "a@example.com")
+    assert parse_lendingflow({"phone": "7275550100", "email": "a@example.com"}).vendor_lead_id == parsed.vendor_lead_id
+
+
+def test_missing_lead_id_gets_the_no_lead_id_tag():
+    from src.lending.lendingflow_ghl import _tags
+    assert "lendingflow-no-lead-id" in _tags({"consent_status": "present", "vendor_lead_id": "missing:abc"})
+    assert "lendingflow-no-lead-id" not in _tags({"consent_status": "present", "vendor_lead_id": "LF-1"})
+
+
+def test_missing_lead_id_is_logged_without_phone_or_email(caplog):
+    with caplog.at_level("WARNING"):
+        parse_lendingflow({"phone": "7275550100", "email": "a@example.com"})
+    assert "7275550100" not in caplog.text and "example.com" not in caplog.text
+
+
+def test_payload_without_lead_id_is_created_then_deduped(client, lf_db):
+    body = json.loads(FIXTURE.read_text())
+    body.pop("lead_id")
+    first = _post(client, raw=json.dumps(body))
+    second = _post(client, raw=json.dumps(body))
+    assert first.status_code == 200 and first.json()["status"] == "created"
+    assert second.json() == {"status": "duplicate", "lead_id": first.json()["lead_id"]}
+    assert _count(lf_db, "lendingflow_leads") == 1

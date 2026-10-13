@@ -933,6 +933,9 @@ class AppSettings(BaseSettings):
 	# T-11 LendingFlow intake. Off by default; the receiver is closed (503) until the flag is on AND the secret is set.
 	lending_lendingflow_enabled: bool = Field(default=False, env="LENDING_LENDINGFLOW_ENABLED")
 	lending_lendingflow_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_LENDINGFLOW_WEBHOOK_SECRET")
+	# Off: no lead gets the lendingflow-intro-ready tag, so the GHL intro-SMS workflow cannot start (client: keep the
+	# intro text off until LendingFlow confirms its consent covers it and whether it runs a DNC/litigator check).
+	lending_lendingflow_intro_sms_enabled: bool = Field(default=False, env="LENDING_LENDINGFLOW_INTRO_SMS_ENABLED")
 	# Pipeline stage (in LENDING_GHL_PIPELINE_ID) for new LendingFlow leads; unset = contact only.
 	lending_ghl_stage_lendingflow_new: Optional[str] = Field(default=None, env="LENDING_GHL_STAGE_LENDINGFLOW_NEW")
 	# T-12 background enrichment card + routing. Off: no card is built, the deal-facts webhook returns 503.

@@ -10,6 +10,10 @@ GHL_TAG_CONSENT_MISSING = "lendingflow-consent-missing"
 # workflow (docs/lending/intro-sms.md). The consent decision is made here, never inside GHL.
 GHL_TAG_INTRO_READY = "lendingflow-intro-ready"
 GHL_SOURCE = "LendingFlow"
+# A lead that arrives without a LendingFlow lead id is stored, not rejected (client, Oct 2026): its vendor id is this
+# prefix + the phone/email dedupe hash, and GHL gets this tag so the missing id is visible.
+MISSING_LEAD_ID_PREFIX = "missing:"
+GHL_TAG_NO_LEAD_ID = "lendingflow-no-lead-id"
 
 # Same schedule shape as config.lending_web: minutes to wait after the Nth failure (last value repeats).
 GHL_RETRY_BACKOFF_MINUTES = (1, 2, 5, 15, 60)

@@ -23,6 +23,7 @@ from config.lending_lendingflow import (
     GHL_GIVE_UP_AFTER_HOURS,
     GHL_RETRY_BACKOFF_MINUTES,
     LEAD_SOURCE,
+    MISSING_LEAD_ID_PREFIX,
     SWEEP_BATCH_SIZE,
 )
 from src.lending.contracts import LoanType
@@ -224,9 +225,6 @@ def parse_lendingflow(payload: Any) -> ParsedLendingFlowLead:
     """The only function that knows LendingFlow's payload shape (Fake shape until David's schema lands)."""
     if not isinstance(payload, dict):
         raise ParseError("payload must be a JSON object")
-    vendor_id = _str(payload, "lead_id", "vendor_lead_id", limit=100)
-    if not vendor_id:
-        raise ParseError("lead_id is required")
     phone = normalize(_str(payload, "phone", limit=40))
     if not phone:
         raise ParseError("a valid US phone number is required")
@@ -235,6 +233,11 @@ def parse_lendingflow(payload: Any) -> ParsedLendingFlowLead:
         email = email.lower()
         if not _EMAIL.match(email):
             email = None  # a bad email never costs a paid lead; phone is the contact key
+    vendor_id = _str(payload, "lead_id", "vendor_lead_id", limit=100)
+    if not vendor_id:
+        # Stored and flagged, never rejected: the id is derived from phone + email, so a resend still dedupes.
+        vendor_id = MISSING_LEAD_ID_PREFIX + dedupe_hash(phone, email)
+        logger.warning("[lendingflow] lead without a lead id, stored as %s", vendor_id[:20])
     amount_raw, amount_min, amount_max = _loan_amount(payload.get("loan_amount"))
     band = _str(payload, "credit_score_range", "credit_score", "credit_band", limit=40)
     return ParsedLendingFlowLead(
