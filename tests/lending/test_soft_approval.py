@@ -24,7 +24,8 @@ from migrations.apply_lending_soft_approvals import apply_to as apply_soft_appro
 from src.lending import soft_approval_webhook as webhook
 from src.lending.call_pipeline import follow_up
 from src.lending.contracts import (
-    BindingCap, BorrowerProfile, DeclineReason, LenderFit, LenderFitResult, LenderMiss, LoanType, SizingFlag,
+    BindingCap, BorrowerProfile, DeclineReason, LenderFit, LenderFitResult, LenderMiss, LoanRequest, LoanType,
+    SizingFlag,
 )
 from src.lending.dispositions import RecordedCall
 from src.lending.fakes import FakeLenderFitEvaluator
@@ -401,6 +402,19 @@ class TestLendingFlowLeadSource:
         lead = self.SOURCE.for_phone(soft_db, PHONE)
         assert lead.loan_type is LoanType.FIX_AND_FLIP and lead.loan_amount == D(290000) and lead.state == "FL"
         assert lead.borrower.credit_band_min_fico == 640 and lead.has_core_fields()
+
+    def test_a_closed_band_carries_its_upper_bound_so_a_higher_floor_is_a_decline(self, soft_db):
+        """Review on #363: "680-719" must reach the evaluator as 680 to 719, never as an open-ended 680+."""
+        _flow_lead(soft_db, fico=680)
+        soft_db.execute(text("UPDATE lending.lendingflow_leads SET credit_band = '680-719' WHERE phone = :p"), {"p": PHONE})
+        lead = self.SOURCE.for_phone(soft_db, PHONE)
+        assert (lead.borrower.credit_band_min_fico, lead.borrower.credit_band_max_fico) == (680, 719)
+        strict = LenderRules(key="strict", name="Strict", verified=True, loan_types=frozenset({LoanType.FIX_AND_FLIP}),
+                             credit_floor=740)
+        request = LoanRequest(loan_type=lead.loan_type, loan_amount=lead.loan_amount, state=lead.state)
+        result = sa_service.MatrixLenderFitEvaluator(matrix=(strict,)).evaluate(lead.borrower, request)
+        assert not result.fitting and not result.possible
+        assert DeclineReason.CREDIT_BELOW_MIN in result.non_fitting[0].reason_codes
 
     def test_the_most_recent_lead_for_the_phone_wins(self, soft_db):
         _flow_lead(soft_db, vendor="old", amount=100000, received="2026-09-01 10:00:00+00")

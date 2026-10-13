@@ -803,6 +803,9 @@ def test_property_type_not_in_allowed_set_rejected() -> None:
     (640, None, 680, "possible"),  # open-ended "640+"
     (660, 719, 680, "possible"),
     (680, 719, 680, "fit"),
+    (680, 719, 740, "decline"),    # review on #363: "680-719" is not "680+", it never reaches a 740 floor
+    (700, 759, 740, "possible"),   # a band that straddles the floor needs confirming on the call
+    (680, None, 740, "possible"),  # open-ended "680+" can reach 740
 ])
 def test_closed_credit_band_declines_only_when_its_top_is_below_the_floor(band_min, band_max, floor, outcome):
     lender = LenderRules(key="band_lender", name="Band Lender", verified=True,
