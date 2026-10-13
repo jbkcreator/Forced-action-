@@ -23,7 +23,7 @@ from config.settings import get_settings
 from packages.agent_core.approval import ApprovalAction
 from src.lending.cora_runtime import handle_slack_request
 from src.lending.db import lending_session
-from src.lending.enrichment.service import enabled as enrichment_enabled, enrich_lead, record_deal_facts
+from src.lending.soft_approval.enrichment_link import share_facts_with_enrichment
 from src.lending.soft_approval.facts import SoftApprovalFacts
 from src.lending.soft_approval.service import generate_soft_approval
 from src.lending.soft_approval.slack_card import (
@@ -63,26 +63,9 @@ def _open_form(payload: dict) -> None:
         logger.error("[soft-approval] opening the form failed: %s", type(exc).__name__)
 
 
-def _share_with_enrichment(call_id: str, phone: str, facts: SoftApprovalFacts) -> None:
-    """The address and target close date typed on this form are the facts the T-12 enrichment card routes on.
-    Best-effort and independent of the soft approval: a failure here is logged and never changes its outcome."""
-    if not enrichment_enabled():
-        return
-    try:
-        with lending_session() as db:
-            lead_id = record_deal_facts(
-                db, phone=phone, address=facts.property_address, target_close_date=facts.target_close_date,
-                source="slack_form")
-            db.commit()
-            if lead_id is not None:
-                enrich_lead(db, lead_id)
-    except Exception as exc:  # class only: SQL errors embed bound params (phones)
-        logger.error("[soft-approval] call %s enrichment hand-off failed: %s", call_id, type(exc).__name__)
-
-
 def _process_submission(call_id: str, facts: SoftApprovalFacts, user_id: str, channel: str, message_ts: str) -> None:
     status_text = "The soft approval could not be processed. Please tell the engineering team."
-    phone: Optional[str] = None
+    phone = None
     try:
         with lending_session() as db:
             phone = db.execute(
@@ -102,7 +85,7 @@ def _process_submission(call_id: str, facts: SoftApprovalFacts, user_id: str, ch
         except Exception as exc:
             logger.error("[soft-approval] call %s status reply failed: %s", call_id, type(exc).__name__)
     if phone:
-        _share_with_enrichment(call_id, phone, facts)
+        share_facts_with_enrichment(call_id, phone, facts)
 
 
 def _handle_submission(payload: dict, background: BackgroundTasks) -> dict[str, Any]:
