@@ -218,3 +218,10 @@ _No entries yet._
 - Open: "possible" lenders never reach sizing (`_candidate_keys` reads only `fitting` and cap-only declines); Josh has not said whether they should. Left as is.
 - Open: rebase onto the T-05 tip (`6bb4a128`): keep `current_matrix()` in `soft_approval/service.py`; `resolve_params` stays the one reader of the purchase and rehab shares so they can move into the rules table later.
 - Open: the footer address `hello@nextdeallending.com` (on `dev`) and the website consent text still name the company; not T-08, ask whether B2 covers them.
+
+### T-08 follow-up: PR #355 (T-07) PDF layer check (2026-10-13)
+- Done: read #355 (merged 2026-10-13 09:52 UTC) and rendered this branch's `soft_approval.html` on `origin/dev`'s PDF layer in a temporary worktree (since removed). Result: one page, all sections in order, no company name, signer in header and footer, no "reply to this email", flagged line prints. No code change needed here.
+- Findings: #355 left the CSS and the `render_pdf` / `render_html` signature alone. It now passes `signer` and `callback_phone` (from `config/lending_prequal.py`) to every template; `base.html` shows the signer; `soft_approval.html` uses `{{ callback_phone }}`.
+- Decision (at merge, not now): resolve the `soft_approval.html` conflict on the last paragraph by taking `{{ callback_phone }}` from `dev`, dropping "or reply to this email" and keeping the `subject_to_confirmation` block. This branch keeps the hard-coded phone because its base lacks #355 and the template would fail to render under StrictUndefined.
+- Open: T-07's letter always prints "All figures are subject to lender confirmation."; this PDF prints it only when the result is flagged. Awaiting a decision on whether to match.
+- Open: `hello@nextdeallending.com` stays in the footer on `dev`; it names the company, so it is part of the B2 question for Josh.
