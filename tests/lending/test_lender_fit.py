@@ -26,6 +26,8 @@ from config.lender_matrix import (
 )
 from src.lending.contracts import (
     BorrowerProfile,
+    DeclineReason,
+    FieldStatus,
     LenderFitResult,
     LoanRequest,
     LoanType,
@@ -132,7 +134,8 @@ def test_s1_fix_and_flip_borrower_qualifies_for_flip_lender() -> None:
     assert "fixture_construction" not in fitting_keys, (
         "Construction lender should not fit a FIX_AND_FLIP loan type"
     )
-    assert result.lender_fit_score is not None
+    # The fixture matrix holds an unconfirmed lender, so the score stays hidden (A1).
+    assert result.lender_fit_score is None
 
 
 def test_s1_flip_lender_ranked_by_cost_ascending() -> None:
@@ -299,8 +302,8 @@ def test_s3_credit_below_640_rejected_by_all_verified_lenders() -> None:
     assert all("620" not in r and "600" not in r for r in flip_miss.reasons)
 
 
-def test_s3_unknown_credit_gives_conservative_rejection_with_missing_field() -> None:
-    """Credit not captured on call: lender rejects with 'capture on call' reason."""
+def test_s3_unknown_credit_is_possible_not_a_decline() -> None:
+    """Credit not captured on call: "possible, confirm on the call" (Josh, A3)."""
     profile = BorrowerProfile(
         credit_band_min_fico=None,  # unknown
         completed_projects=2,
@@ -317,11 +320,11 @@ def test_s3_unknown_credit_gives_conservative_rejection_with_missing_field() -> 
     result = evaluate_lender_fit(profile, request, matrix=FIXTURE_MATRIX)
 
     assert "credit_band_min_fico" in result.missing_fields
-    flip_miss = next(
-        (m for m in result.non_fitting if m.lender_key == "fixture_flip"), None
-    )
-    assert flip_miss is not None
-    assert any("credit band unknown" in r.lower() for r in flip_miss.reasons)
+    assert all(m.lender_key != "fixture_flip" for m in result.non_fitting)
+    assert all(f.lender_key != "fixture_flip" for f in result.fitting)
+    flip_possible = next((p for p in result.possible if p.lender_key == "fixture_flip"), None)
+    assert flip_possible is not None
+    assert any("credit band unknown" in r.lower() for r in flip_possible.why_unknown)
 
 
 # ---------------------------------------------------------------------------
@@ -369,15 +372,21 @@ def test_s4_non_qualifying_exact_failure_reasons() -> None:
         f"Expected loan type mismatch reason; got {flip_miss.reasons}"
     )
 
-    # Unverified shell: always rejected with 'not yet verified' reason
+    # Unconfirmed shell: evaluated against the placeholder box (fix and flip only), so a
+    # construction loan is a decline that says the rule is unconfirmed.
     unverified_miss = next(
         (m for m in result.non_fitting if m.lender_key == "fixture_unverified"), None
     )
     assert unverified_miss is not None
-    assert any("not yet verified" in r for r in unverified_miss.reasons)
+    assert any("unconfirmed rule" in r for r in unverified_miss.reasons)
 
-    # fit_score: 0 fitting / 3 verified = 0.0
-    assert result.lender_fit_score == Decimal("0.0")
+    # Exact decline codes alongside the reason strings.
+    assert DeclineReason.LOAN_TOO_SMALL in construction_miss.reason_codes
+    assert DeclineReason.STATE_NOT_COVERED in construction_miss.reason_codes
+    assert DeclineReason.CREDIT_BELOW_MIN in construction_miss.reason_codes
+
+    # An unconfirmed lender is in the matrix, so no score is shown (A1).
+    assert result.lender_fit_score is None
 
 
 # ---------------------------------------------------------------------------
@@ -427,8 +436,8 @@ def test_partial_input_missing_purchase_price_reported() -> None:
 # Unverified lender always in non_fitting
 # ---------------------------------------------------------------------------
 
-def test_unverified_lender_never_in_fitting() -> None:
-    """An unverified lender is always routed to non_fitting regardless of other inputs."""
+def test_unconfirmed_lender_with_unknown_deal_facts_is_possible() -> None:
+    """An unconfirmed lender is evaluated on the placeholder box; unknown deal facts leave it possible."""
     profile = BorrowerProfile(credit_band_min_fico=700, completed_projects=5, state="FL")
     request = LoanRequest(
         loan_type=LoanType.FIX_AND_FLIP,
@@ -439,9 +448,186 @@ def test_unverified_lender_never_in_fitting() -> None:
     result = evaluate_lender_fit(profile, request, matrix=(_UNVERIFIED_SHELL,))
 
     assert result.fitting == []
-    assert len(result.non_fitting) == 1
-    assert result.non_fitting[0].lender_key == "fixture_unverified"
-    assert result.lender_fit_score is None  # no verified lenders → None (Q4)
+    assert result.non_fitting == []
+    assert [p.lender_key for p in result.possible] == ["fixture_unverified"]
+    assert result.lender_fit_score is None  # not every lender confirmed (A1)
+
+
+def test_unconfirmed_lender_that_passes_every_check_fits_subject_to_confirmation() -> None:
+    profile = BorrowerProfile(credit_band_min_fico=700, state="FL")
+    request = LoanRequest(
+        loan_type=LoanType.FIX_AND_FLIP, loan_amount=Decimal("300_000"), state="FL",
+        purchase_price=Decimal("300_000"), rehab_budget=Decimal("100_000"), arv=Decimal("600_000"),
+    )
+
+    result = evaluate_lender_fit(profile, request, matrix=(_UNVERIFIED_SHELL, _FLIP_LENDER))
+
+    by_key = {f.lender_key: f for f in result.fitting}
+    assert by_key["fixture_unverified"].subject_to_confirmation is True
+    assert by_key["fixture_flip"].subject_to_confirmation is False
+    assert result.lender_fit_score is None
+
+
+# ---------------------------------------------------------------------------
+# Josh A1 / A2 / A3 / B1(c) behaviour
+# ---------------------------------------------------------------------------
+
+def _flip_request(**overrides) -> LoanRequest:
+    base = dict(loan_type=LoanType.FIX_AND_FLIP, loan_amount=Decimal("300_000"), state="FL",
+                purchase_price=Decimal("300_000"), rehab_budget=Decimal("100_000"), arv=Decimal("600_000"))
+    base.update(overrides)
+    return LoanRequest(**base)
+
+
+def test_placeholder_box_fills_an_unset_cap_and_is_not_skipped() -> None:
+    """A1: the unset LTC of an unconfirmed lender takes the 85% placeholder, so 300K on 330K cost declines."""
+    shell = LenderRules(key="shell", name="Shell", verified=False, loan_types=frozenset({LoanType.FIX_AND_FLIP}))
+    profile = BorrowerProfile(credit_band_min_fico=700, state="FL")
+
+    result = evaluate_lender_fit(profile, _flip_request(rehab_budget=Decimal("30_000")), matrix=(shell,))
+
+    miss = result.non_fitting[0]
+    assert DeclineReason.LTC_OVER_MAX in miss.reason_codes
+    assert any("unconfirmed rule" in r for r in miss.reasons)
+
+
+def test_confirmed_lender_with_unset_cap_means_no_limit() -> None:
+    lender = LenderRules(key="conf", name="Conf", verified=True, loan_types=frozenset({LoanType.FIX_AND_FLIP}))
+    profile = BorrowerProfile(credit_band_min_fico=700, state="FL")
+
+    result = evaluate_lender_fit(profile, _flip_request(rehab_budget=Decimal("30_000")), matrix=(lender,))
+
+    assert [f.lender_key for f in result.fitting] == ["conf"]
+
+
+def test_per_field_status_all_confirmed_makes_a_lender_confirmed() -> None:
+    from config.lender_matrix import PARAMETER_FIELDS, fully_confirmed
+
+    unconfirmed = LenderRules(key="a", name="A", verified=False)
+    confirmed = LenderRules(
+        key="b", name="B", verified=False,
+        field_status={name: FieldStatus.CONFIRMED for name in PARAMETER_FIELDS},
+    )
+    one_pending = LenderRules(
+        key="c", name="C", verified=False,
+        field_status={**{name: FieldStatus.CONFIRMED for name in PARAMETER_FIELDS},
+                      "max_ltc": FieldStatus.CONFIRM_AT_SUBMISSION},
+    )
+    assert fully_confirmed(unconfirmed) is False
+    assert fully_confirmed(confirmed) is True
+    assert fully_confirmed(one_pending) is False
+
+
+def test_validate_lender_matrix_rejects_bad_field_status() -> None:
+    with pytest.raises(ValueError, match="unknown parameters"):
+        validate_lender_matrix((LenderRules(key="x", name="X", verified=False,
+                                            field_status={"not_a_field": FieldStatus.CONFIRMED}),))
+    with pytest.raises(ValueError, match="not confirmed"):
+        validate_lender_matrix((LenderRules(key="y", name="Y", verified=True,
+                                            field_status={"max_ltc": FieldStatus.PLACEHOLDER}),))
+
+
+def test_score_shown_only_when_every_lender_is_confirmed() -> None:
+    profile = BorrowerProfile(credit_band_min_fico=640, state="FL")
+    request = LoanRequest(loan_type=LoanType.FIX_AND_FLIP, loan_amount=Decimal("200_000"), state="FL")
+
+    confirmed = evaluate_lender_fit(profile, request, matrix=(_FLIP_LENDER, _DSCR_LENDER))
+    pending = evaluate_lender_fit(profile, request, matrix=(_FLIP_LENDER, _UNVERIFIED_SHELL))
+
+    assert confirmed.lender_fit_score is not None
+    assert pending.lender_fit_score is None
+
+
+@pytest.mark.parametrize("band,expect", [
+    (None, "possible"),     # unknown
+    (0, "decline"),         # "below 640" is below every floor
+    (640, "possible"),      # 640+ may or may not reach 680
+    (679, "possible"),
+    (680, "fit"),           # at the floor
+    (700, "fit"),
+])
+def test_credit_band_against_a_680_floor(band, expect) -> None:
+    lender = LenderRules(key="l", name="L", verified=True, loan_types=frozenset({LoanType.FIX_AND_FLIP}),
+                         credit_floor=680)
+    result = evaluate_lender_fit(BorrowerProfile(credit_band_min_fico=band, state="FL"),
+                                 _flip_request(), matrix=(lender,))
+    got = "fit" if result.fitting else "possible" if result.possible else "decline"
+    assert got == expect
+    if expect == "decline":
+        assert DeclineReason.CREDIT_BELOW_MIN in result.non_fitting[0].reason_codes
+
+
+def test_unknown_state_is_possible_and_wrong_state_is_declined() -> None:
+    lender = LenderRules(key="l", name="L", verified=True, loan_types=frozenset({LoanType.FIX_AND_FLIP}),
+                         approved_states=frozenset({"FL"}))
+    profile = BorrowerProfile(credit_band_min_fico=700)
+
+    unknown = evaluate_lender_fit(profile, _flip_request(state=""), matrix=(lender,))
+    wrong = evaluate_lender_fit(profile, _flip_request(state="NY"), matrix=(lender,))
+
+    assert [p.lender_key for p in unknown.possible] == ["l"]
+    assert "state" in unknown.missing_fields
+    assert wrong.non_fitting[0].reason_codes == [DeclineReason.STATE_NOT_COVERED]
+
+
+@pytest.mark.parametrize("amount,expect", [
+    (Decimal("99_999"), "decline"),   # one under the minimum
+    (Decimal("100_000"), "fit"),      # at the minimum
+    (Decimal("2_000_000"), "fit"),    # at the maximum
+    (Decimal("2_000_001"), "decline"),
+])
+def test_loan_amount_boundaries_and_codes(amount, expect) -> None:
+    lender = LenderRules(key="l", name="L", verified=True, loan_types=frozenset({LoanType.FIX_AND_FLIP}),
+                         min_loan_amount=Decimal("100_000"), max_loan_amount=Decimal("2_000_000"))
+    result = evaluate_lender_fit(BorrowerProfile(state="FL"), _flip_request(loan_amount=amount,
+                                 purchase_price=None, rehab_budget=None, arv=None), matrix=(lender,))
+    assert ("fit" if result.fitting else "decline") == expect
+    if expect == "decline":
+        wanted = DeclineReason.LOAN_TOO_SMALL if amount < Decimal("100_000") else DeclineReason.LOAN_TOO_LARGE
+        assert result.non_fitting[0].reason_codes == [wanted]
+
+
+def test_ratio_experience_and_property_codes() -> None:
+    lender = LenderRules(
+        key="l", name="L", verified=True, loan_types=frozenset({LoanType.FIX_AND_FLIP}),
+        max_ltv=Decimal("0.4"), max_ltc=Decimal("0.5"), min_completed_projects=3,
+        allowed_property_types=frozenset({"single_family"}),
+    )
+    result = evaluate_lender_fit(
+        BorrowerProfile(completed_projects=1, state="FL"),
+        _flip_request(property_type="condo"), matrix=(lender,),
+    )
+    assert set(result.non_fitting[0].reason_codes) == {
+        DeclineReason.LTV_OVER_MAX, DeclineReason.LTC_OVER_MAX,
+        DeclineReason.EXPERIENCE_BELOW_MIN, DeclineReason.PROPERTY_TYPE_EXCLUDED,
+    }
+
+
+def test_backflip_ranks_first_even_when_costlier() -> None:
+    def lender(key, points):
+        return LenderRules(key=key, name=key, verified=True, loan_types=frozenset({LoanType.FIX_AND_FLIP}),
+                           origination_points=points, rate_spread=Decimal("0.10"))
+
+    matrix = (lender("cheap_other", Decimal("0.01")), lender("generic_backflip_flip", Decimal("0.05")),
+              lender("mid_other", Decimal("0.02")))
+    profile = BorrowerProfile(state="FL")
+
+    result = evaluate_lender_fit(profile, _flip_request(), matrix=matrix)
+    assert [f.lender_key for f in result.fitting] == ["generic_backflip_flip", "cheap_other", "mid_other"]
+
+    without_backflip = evaluate_lender_fit(profile, _flip_request(), matrix=(matrix[0], matrix[2]))
+    assert [f.lender_key for f in without_backflip.fitting] == ["cheap_other", "mid_other"]
+
+
+def test_production_matrix_never_fits_without_the_confirmation_flag() -> None:
+    profile = BorrowerProfile(credit_band_min_fico=700, completed_projects=5, completed_ground_up_builds=2, state="FL")
+    for loan_type in LoanType:
+        request = LoanRequest(loan_type=loan_type, loan_amount=Decimal("300_000"), state="FL",
+                              purchase_price=Decimal("300_000"), rehab_budget=Decimal("100_000"),
+                              arv=Decimal("600_000"), property_type="single_family")
+        result = evaluate_lender_fit(profile, request)
+        assert all(f.subject_to_confirmation for f in result.fitting)
+        assert result.lender_fit_score is None
 
 
 # ---------------------------------------------------------------------------
@@ -577,7 +763,7 @@ def test_every_lender_rules_constraint_field_is_read_by_the_evaluator() -> None:
     source = inspect.getsource(lender_fit._check_rules) + inspect.getsource(
         lender_fit._total_borrower_cost
     )
-    identity_fields = {"key", "name", "verified"}
+    identity_fields = {"key", "name", "verified", "field_status"}
     unread = [
         f.name
         for f in dataclasses.fields(LenderRules)

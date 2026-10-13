@@ -110,6 +110,27 @@ def test_credit_band_straddling_a_floor_asks_for_confirmation():
     assert view.straddles == ["Backflip: credit needs confirmation on the call"]
 
 
+def test_unknown_credit_lists_lenders_as_possible_not_fitting_or_declined():
+    """A3: unknown eligibility shows 'possible, confirm on the call'; a lender with no floor still fits."""
+    view = evaluate_fit(_lead(credit_band=None, credit_band_min_fico=None), address=None, matrix=_matrix())
+    assert view.possible == ["Backflip"]  # both Backflip rows have a credit floor; one entry per lender
+    assert "Backflip" not in view.ranked
+    assert view.ranked == ["RCN Capital", "Easy Street Capital", "Kiavi Affiliate", "Asset Based Lending (ABL)"]
+    assert view.to_json()["possible"] == ["Backflip"]
+
+
+def test_a_lender_that_fits_is_never_also_listed_as_possible():
+    # Backflip's flip row fits a 700 band; its construction row is a loan-type mismatch (a decline).
+    view = evaluate_fit(_lead(), address=None, matrix=_matrix())
+    assert view.possible == []
+
+
+def test_card_text_lists_possible_lenders():
+    view = evaluate_fit(_lead(credit_band=None, credit_band_min_fico=None), address=None, matrix=_matrix())
+    text_ = service.render_card_text(7, None, RoutingTag.NURTURE, None, view, coverage_note=None)
+    assert "Possible, confirm on the call: Backflip" in text_
+
+
 def test_open_ended_band_never_straddles():
     view = evaluate_fit(_lead(credit_band="740+", credit_band_min_fico=740), address=None, matrix=_matrix())
     assert view.straddles == []

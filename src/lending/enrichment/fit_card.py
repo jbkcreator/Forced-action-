@@ -8,6 +8,8 @@ Runs the T-05 evaluator, then presents the result the way Josh asked:
 - Ranking (A2): Backflip first whenever it fits, then the other fitting lenders cheapest first. When
   Backflip does not fit, every other fitting lender is shown.
 - A credit band that straddles a lender's floor shows "needs confirmation on the call" (A4).
+- A lender whose eligibility is unknown (A3) is listed as "possible, confirm on the call": not a fit and
+  not a decline, and never counted in the score.
 """
 from __future__ import annotations
 
@@ -41,13 +43,14 @@ class FitView:
     score: Optional[int] = None
     note: Optional[str] = None
     ranked: list[str] = field(default_factory=list)
+    possible: list[str] = field(default_factory=list)
     straddles: list[str] = field(default_factory=list)
     missing_fields: list[str] = field(default_factory=list)
 
     def to_json(self) -> dict:
         return {
             "evaluated": self.evaluated, "score": self.score, "note": self.note, "ranked": self.ranked,
-            "straddles": self.straddles, "missing_fields": self.missing_fields,
+            "possible": self.possible, "straddles": self.straddles, "missing_fields": self.missing_fields,
         }
 
 
@@ -125,6 +128,10 @@ def evaluate_fit(
         ordered.remove(BACKFLIP_LENDER)
         ordered.insert(0, BACKFLIP_LENDER)
 
+    fitting_set = set(fitting_groups)
+    possible_groups = [g for g in dict.fromkeys(lender_group(p.lender_key) for p in result.possible)
+                       if g not in fitting_set]
+
     all_groups = set(names_by_group)
     all_verified = bool(matrix) and all(r.verified for r in matrix)
     score = round(100 * len(set(fitting_groups)) / len(all_groups)) if all_verified and all_groups else None
@@ -133,6 +140,7 @@ def evaluate_fit(
         score=score,
         note=None if all_verified else FIT_RULES_PENDING,
         ranked=[names_by_group.get(g, g) for g in ordered],
+        possible=[names_by_group.get(g, g) for g in possible_groups],
         straddles=_straddles(parse_band_bounds(lead.get("credit_band")), request, matrix),
         missing_fields=list(result.missing_fields),
     )
