@@ -17,7 +17,7 @@ from src.lending.contracts import LoanType
 from src.lending.db import get_lending_db
 from src.lending.lendingflow import (
     ParseError,
-    _credit_band_min_fico,
+    credit_band_min_fico,
     deliver_pending,
     parse_lendingflow,
     run_followups,
@@ -101,7 +101,7 @@ def test_parse_normalizes_and_maps():
 @pytest.mark.parametrize("raw,expected", [("680-719", 680), ("740+", 740), ("Below 620", None), ("Excellent", None),
                                           (None, None), ("", None)])
 def test_credit_band_min_fico(raw, expected):
-    assert _credit_band_min_fico(raw) == expected
+    assert credit_band_min_fico(raw) == expected
 
 
 @pytest.mark.parametrize("payload", [[], "x", {}, {"lead_id": "1"}, {"lead_id": "1", "phone": "12345"},

@@ -159,3 +159,13 @@ def test_send_rejected_is_a_plain_failure(monkeypatch, status, config):
 def test_send_accepted(monkeypatch):
     calls, exc = _send_with(monkeypatch, _Resp(status=201, payload={"messageId": "m"}))
     assert len(calls) == 1 and exc is None
+
+
+def test_email_has_no_company_name_and_is_signed_by_josh():
+    text = prequal_ghl.EMAIL_SUBJECT + prequal_ghl.EMAIL_HTML
+    assert "next deal lending" not in text.lower()
+    assert "Josh Kantor, Loan Officer" in prequal_ghl.EMAIL_HTML
+
+
+def test_email_says_figures_are_subject_to_lender_confirmation():
+    assert "subject to lender confirmation" in prequal_ghl.EMAIL_HTML

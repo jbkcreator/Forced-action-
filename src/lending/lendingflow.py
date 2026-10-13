@@ -134,7 +134,7 @@ def _str(payload: Mapping[str, Any], *names: str, limit: int = 200) -> Optional[
     return None
 
 
-def _credit_band_min_fico(raw: Optional[str]) -> Optional[int]:
+def credit_band_min_fico(raw: Optional[str]) -> Optional[int]:
     """Lower bound of a band: ``"680-719"`` -> 680, ``"720+"`` -> 720, anything else None.
     Stand-in until David / Josh confirm LendingFlow's real band values."""
     if not raw:
@@ -244,7 +244,7 @@ def parse_lendingflow(payload: Any) -> ParsedLendingFlowLead:
         first_name=_str(payload, "first_name", limit=80),
         last_name=_str(payload, "last_name", limit=80),
         credit_band=band,
-        credit_band_min_fico=_credit_band_min_fico(band),
+        credit_band_min_fico=credit_band_min_fico(band),
         loan_amount=amount_min,
         loan_amount_range=amount_raw,
         loan_amount_min=amount_min,
