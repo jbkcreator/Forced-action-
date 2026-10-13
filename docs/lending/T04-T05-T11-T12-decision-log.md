@@ -175,4 +175,43 @@ _No entries yet._
 
 ## T-12: Enrichment card + pipeline routing
 
-_No entries yet._
+### 2026-10-13 — T12-2: fit_card partial-rule model wired to T-05 (feat/ndl-t12-fit-card-partial-rules)
+
+**Done:** Wired `fit_card.evaluate_fit` to consume the T-05 partial-rule model (Josh A1, Oct 8).
+
+**Decisions applied:**
+- **T12-1 (rebase) already done**: `feat/ndl-t12-enrichment-card` commits are all in `feat/ndl-t05-lender-fit-gap-fix` history (T-12 is an ancestor). No rebase needed; new branch `feat/ndl-t12-fit-card-partial-rules` stacks on T-05.
+- **Score computation kept grouped** (`fully_confirmed` replaces `r.verified`; Backflip rows still counted as one lender). The T-05 evaluator's `lender_fit_score` counts raw rows (Q4 pending) and would give the wrong denominator (6 vs 5), so fit_card.py continues to compute the score itself on grouped lenders.
+- **`_straddles` uses `field_status_of(rules, "credit_floor") is FieldStatus.CONFIRMED`** instead of `rules.verified`. An unconfirmed floor is never straddled here; the evaluator already puts those lenders in `possible`.
+- **Note priority (A1):** `FIT_SUBJECT_TO_CONFIRMATION` ("subject to lender confirmation") takes priority over `FIT_RULES_PENDING` when at least one lender fits using placeholder cap values (`result.fitting` has a row with `subject_to_confirmation=True`). This is the case when a lender's eligibility is known but its cap fields are still placeholder.
+
+**Open confirmations (carry to PR):**
+- Q1 (task-analysis): Is the fit % kept hidden while any lender is unconfirmed? (assumed yes per original design; Josh hasn't contradicted this).
+- All F1–F7, R6, B8, D6 questions remain open per the task-analysis table.
+
+### 2026-10-13 — F1–F7 team-lead answers applied (feat/ndl-t12-fit-card-partial-rules)
+
+Answers are the team lead's approved defaults, not Josh's; each stays an open confirmation for Josh.
+
+| # | Team-lead answer | Code | Status |
+|---|---|---|---|
+| F1 | DB + Slack thread in dial-tasks channel; no GHL writes | Already so (`ports.default_deal_thread`) | Matches, no change |
+| F2 | Assign to Josh, post in Slack; no GHL task/stage/tag | Card now reads "closer priority, assigned to Josh" (`FULL_MACHINE_ASSIGNEE_NOTE`); test added | Changed |
+| F3 | No answer | Hillsborough + Pinellas only; Pasco not matched | **Open** |
+| F4 | >30 days and past → NURTURE; exactly 30 is in the window | Already so (`routing.route_lead`) | Matches |
+| F5 | We define fields and connect both; Slack form via PR #354; booking form waits on R4 | PR #354 is merged (not open); booking form unconnected | Matches; booking form blocked on R4 |
+| F6 | Condition 3 (Average) | `COMPS_AFTER_REPAIR_CONDITION = 3`, comment updated | Matches |
+| F7/R6 | Needs Josh; card shows "Not available" | `UnavailableStreetView` fallback | Matches; blocked on Josh |
+
+Still open: F3 (owner + decision), Q1 (fit % hidden while any lender unconfirmed — assumed yes), Josh's sign-off on F2 and F4.
+
+### 2026-10-13 — Final T-12 implementation decisions (team decisions; no further code change)
+
+| Item | Source check | Decision implemented |
+|---|---|---|
+| Soft approval on FULL_MACHINE | Spec §4.4 says "closer priority + soft approval compiling"; no trigger detail | Option A (team lead): no new trigger. Every finished call already gets a soft approval card (`call_pipeline.follow_up`, T-08), so FULL_MACHINE leads are covered. |
+| F3 counties | Not in spec; no Josh answer | Dropped: lead data comes from LendingFlow. A lead outside Hillsborough/Pinellas still gets fit + borrower details; property facts show "Not available". |
+| Q1 fit % hidden | Spec §4.4 says only "append fit score"; Josh A1 question stated the score stays hidden until all five lenders are confirmed, and his reply did not object | Team decision: % hidden until every lender is fully confirmed; per-lender Fits / Possible – confirm on the call / Doesn't fit, with "subject to lender confirmation" where caps are placeholders. |
+| Nurture cadence | Spec §4.4: "long-term cadence", no content; J10/J12 open with Josh | Left as is: NURTURE is a tag only, nothing is sent until Josh defines the cadence. |
+| F2 closer | Spec names no closer; no Josh answer | Team decision: Slack card says "closer priority, assigned to Josh"; no GHL task/stage/tag. |
+| F4 past / >30 days | Spec covers only ≤30 days and missing facts; Josh doc "decisions we have made" (no reply needed): both go to nurture | Implemented: past and >30 days → NURTURE; exactly 30 days → FULL_MACHINE. Settled. |

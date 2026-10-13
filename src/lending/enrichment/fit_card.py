@@ -3,11 +3,16 @@
 Runs the T-05 evaluator, then presents the result the way Josh asked:
 
 - Score = percent of lenders that fit (A3: 3 of 5 = 60). Backflip's rule rows count as one lender.
-  The score is withheld while any lender's rules are unverified (A1: all five still pending): a
-  percentage over a partly-unknown matrix would read as a real answer.
+  The card computes this itself on grouped lenders (the evaluator's ``lender_fit_score`` counts raw
+  rows) and withholds it until every lender is fully confirmed — a percentage over partly-unknown
+  rules would read as a real answer (A1).
 - Ranking (A2): Backflip first whenever it fits, then the other fitting lenders cheapest first. When
   Backflip does not fit, every other fitting lender is shown.
-- A credit band that straddles a lender's floor shows "needs confirmation on the call" (A4).
+- A fitting lender whose cap values are still placeholder (A1): shown with note "subject to lender
+  confirmation".  The eligibility checks (state, loan type, credit) used confirmed values only, so a
+  fit is real — it just carries provisional sizing figures.
+- A credit band that straddles a confirmed floor shows "needs confirmation on the call" (A4).  An
+  unconfirmed floor is never straddled here; the evaluator already puts those lenders in ``possible``.
 - A lender whose eligibility is unknown (A3) is listed as "possible, confirm on the call": not a fit and
   not a decline, and never counted in the score.
 """
@@ -20,14 +25,15 @@ from datetime import datetime, time, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Callable, Mapping, Optional
 
-from config.lender_matrix import LenderRules
+from config.lender_matrix import LenderRules, field_status_of, fully_confirmed
 from config.lending_enrichment import (
     BACKFLIP_KEY_PREFIX,
     BACKFLIP_LENDER,
     CREDIT_STRADDLE_NOTE,
     FIT_RULES_PENDING,
+    FIT_SUBJECT_TO_CONFIRMATION,
 )
-from src.lending.contracts import BorrowerProfile, LenderFitResult, LoanRequest, LoanType
+from src.lending.contracts import BorrowerProfile, FieldStatus, LenderFitResult, LoanRequest, LoanType
 from src.lending.lender_fit import evaluate_lender_fit
 from src.lending.lender_rules_store import current_matrix
 
@@ -70,12 +76,18 @@ def parse_band_bounds(raw: Optional[str]) -> Optional[tuple[int, int]]:
 
 
 def _straddles(band: Optional[tuple[int, int]], request: LoanRequest, matrix: tuple[LenderRules, ...]) -> list[str]:
+    """Return straddle notes only for lenders with a *confirmed* credit floor.
+
+    An unconfirmed floor is never straddled here: the T-05 evaluator already puts those lenders in
+    ``possible`` (eligibility unknown).  Generating a straddle note on top of that would be a
+    duplicate and would imply a credit-floor value the lender hasn't actually confirmed (A1).
+    """
     if band is None:
         return []
     low, high = band
     notes: dict[str, str] = {}
     for rules in matrix:
-        if not rules.verified or rules.credit_floor is None:
+        if field_status_of(rules, "credit_floor") is not FieldStatus.CONFIRMED or rules.credit_floor is None:
             continue
         if rules.loan_types and request.loan_type not in rules.loan_types:
             continue
@@ -136,13 +148,36 @@ def evaluate_fit(
     possible_groups = [g for g in dict.fromkeys(lender_group(p.lender_key) for p in result.possible)
                        if g not in fitting_set]
 
+    # Score = % of unique lenders that fit (Josh: "3 of 5 = 60"). Backflip's two rule rows are one
+    # lender, so we group by key prefix before counting — the T-05 evaluator's lender_fit_score
+    # counts raw rows (Q4 pending), which would give the wrong denominator (6 vs 5).
+    # Shown only once every lender is fully confirmed (fully_confirmed replaces the old r.verified
+    # binary flag; a lender with field_status entries can be partially confirmed — A1).
     all_groups = set(names_by_group)
-    all_verified = bool(matrix) and all(r.verified for r in matrix)
-    score = round(100 * len(set(fitting_groups)) / len(all_groups)) if all_verified and all_groups else None
+    all_confirmed = bool(matrix) and all(fully_confirmed(r) for r in matrix)
+    score = round(100 * len(set(fitting_groups)) / len(all_groups)) if all_confirmed and all_groups else None
+
+    # Note priority (A1):
+    # - Some fitting lenders used placeholder cap values → "subject to lender confirmation".
+    #   This takes priority over the generic "rules pending" message when fits DO exist, because it
+    #   tells Josh that the fit is real but sizing is provisional (e.g., using the 85%/70% defaults).
+    # - No fitting lenders and rules are not all confirmed → "Lender rules pending confirmation".
+    # - All lenders confirmed (score visible) → no note; nothing is provisional.
+    # Note: when all_confirmed=True, fully_confirmed(r) is True for every lender, so
+    # subject_to_confirmation=False for all fitting entries, making any_provisional always False
+    # in that branch. The note is therefore None, which is correct.
+    any_provisional = any(f.subject_to_confirmation for f in result.fitting)
+    if any_provisional:
+        note: Optional[str] = FIT_SUBJECT_TO_CONFIRMATION
+    elif score is None:
+        note = FIT_RULES_PENDING
+    else:
+        note = None
+
     return FitView(
         evaluated=True,
         score=score,
-        note=None if all_verified else FIT_RULES_PENDING,
+        note=note,
         ranked=[names_by_group.get(g, g) for g in ordered],
         possible=[names_by_group.get(g, g) for g in possible_groups],
         straddles=_straddles(band, request, matrix),

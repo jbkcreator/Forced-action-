@@ -13,7 +13,7 @@ from pydantic import SecretStr
 from sqlalchemy import text
 
 from config.lender_matrix import LenderRules
-from src.lending.contracts import LoanType, RoutingTag
+from src.lending.contracts import FieldStatus, LoanType, RoutingTag
 from src.lending.db import get_lending_db
 from src.lending.enrichment import service
 from src.lending.enrichment.fit_card import evaluate_fit, parse_band_bounds
@@ -447,6 +447,89 @@ def test_webhook_auth_and_flag(client, enr_db, monkeypatch):
 
     monkeypatch.setattr(hook.get_settings(), "lending_enrichment_enabled", False)
     assert _post(client, body).status_code == 503
+
+
+# ---------------------------------------------------------------------------
+# T12-2: fit_card partial-rule model (A1 — "subject to lender confirmation")
+# ---------------------------------------------------------------------------
+
+def _lender_no_cap_checks(key: str, name: str, *, verified: bool = False) -> LenderRules:
+    """A lender whose cap fields (LTV, LTC, min_purchase_price) are explicitly
+    CONFIRMED as None, so effective_rules() leaves them None and no cap check runs.
+    Only the placeholder min/max loan amount and credit floor (PLACEHOLDER) are in
+    effect.  With credit_band_min_fico=700 ≥ placeholder floor of 680 the lead
+    passes, and the lender ends up in ``fitting`` with ``subject_to_confirmation=True``
+    (because the lender is not fully_confirmed).
+    """
+    return LenderRules(
+        key=key,
+        name=name,
+        verified=verified,
+        field_status={
+            "max_ltv": FieldStatus.CONFIRMED,        # confirmed as None → no LTV check
+            "max_ltc": FieldStatus.CONFIRMED,        # confirmed as None → no LTC check
+            "min_purchase_price": FieldStatus.CONFIRMED,  # confirmed as None → no price check
+        },
+        origination_points=Decimal("0.02"),
+        rate_spread=Decimal("0.08"),
+    )
+
+
+def test_provisional_fit_note_when_lender_fits_with_placeholder_rules():
+    """A lender with verified=False whose cap fields are confirmed as None (so no
+    cap check runs) passes all remaining checks for a standard lead.  The card
+    note must be FIT_SUBJECT_TO_CONFIRMATION, NOT FIT_RULES_PENDING, because at
+    least one lender is in ``fitting`` with subject_to_confirmation=True (A1)."""
+    from config.lending_enrichment import FIT_SUBJECT_TO_CONFIRMATION
+
+    matrix = (_lender_no_cap_checks("rcn_capital", "RCN Capital"),)
+    view = evaluate_fit(_lead(), address=None, matrix=matrix)
+    assert view.evaluated is True
+    assert view.score is None  # hidden: lender not fully confirmed
+    assert view.note == FIT_SUBJECT_TO_CONFIRMATION
+    assert "RCN Capital" in view.ranked  # the lender fits with placeholder rules
+
+
+def test_rules_pending_note_when_no_lenders_fit():
+    """When no lender fits (all go to possible or non_fitting), the note is
+    FIT_RULES_PENDING, never FIT_SUBJECT_TO_CONFIRMATION."""
+    from config.lending_enrichment import FIT_RULES_PENDING
+
+    # Loan amount below the placeholder minimum ($75K) → all lenders decline.
+    matrix = (_lender_no_cap_checks("rcn_capital", "RCN Capital"),)
+    view = evaluate_fit(_lead(loan_amount=10000), address=None, matrix=matrix)
+    assert view.evaluated is True
+    assert view.score is None
+    assert view.note == FIT_RULES_PENDING
+    assert view.ranked == []
+
+
+def test_straddle_note_only_for_confirmed_credit_floor():
+    """_straddles must NOT produce a note for a lender whose credit_floor is
+    placeholder (unconfirmed): the evaluator already places that lender in
+    ``possible``, so a second straddle note would be a duplicate and would imply
+    a concrete floor value the lender hasn't confirmed (A1)."""
+    # One lender has verified=True and a confirmed floor; another has verified=False.
+    confirmed_lender = LenderRules(key="rcn_capital", name="RCN Capital", verified=True,
+                                   credit_floor=720, origination_points=Decimal("0.01"),
+                                   rate_spread=Decimal("0.05"))
+    unconfirmed_lender = LenderRules(key="abl", name="ABL", verified=False,
+                                     origination_points=Decimal("0.02"), rate_spread=Decimal("0.09"))
+    matrix = (confirmed_lender, unconfirmed_lender)
+    # Credit band 700-739 straddles RCN's confirmed 720 floor.
+    view = evaluate_fit(_lead(credit_band="700-739", credit_band_min_fico=700), address=None, matrix=matrix)
+    # Straddle note for confirmed lender only; ABL's floor (placeholder) must not appear.
+    assert any("RCN Capital" in s for s in view.straddles), "expected straddle note for RCN Capital"
+    assert not any("ABL" in s for s in view.straddles), "ABL has no confirmed floor; no straddle note expected"
+
+
+def test_full_machine_card_says_assigned_to_josh_and_nurture_does_not():
+    """F2 (team lead 2026-10-13): FULL_MACHINE leads are assigned to Josh in the Slack card only."""
+    view = evaluate_fit(_lead(), address=None, matrix=_matrix())
+    full = service.render_card_text(7, "1 Main St", RoutingTag.FULL_MACHINE, None, view, coverage_note=None)
+    nurture = service.render_card_text(7, None, RoutingTag.NURTURE, None, view, coverage_note=None)
+    assert "closer priority, assigned to Josh" in full
+    assert "assigned to Josh" not in nurture
 
 
 def test_a_band_entirely_below_the_floor_is_not_listed_as_possible():
