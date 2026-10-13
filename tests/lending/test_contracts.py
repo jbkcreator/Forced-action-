@@ -18,15 +18,20 @@ from datetime import datetime, timezone
 import pytest
 
 from src.lending.contracts import (
+    BindingCap,
     BorrowerProfile,
+    DeclineReason,
+    FieldStatus,
     LenderFit,
     LenderFitEvaluator,
     LenderFitResult,
     LenderMiss,
+    LenderPossible,
     LendingFlowLeadCreated,
     LoanRequest,
     LoanType,
     RoutingTag,
+    SizingFlag,
 )
 from src.lending.fakes import FakeLenderFitEvaluator
 
@@ -34,6 +39,48 @@ from src.lending.fakes import FakeLenderFitEvaluator
 # ---------------------------------------------------------------------------
 # Enumerations
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# New enumerations (G1, G2, G3 gap-fix)
+# ---------------------------------------------------------------------------
+
+class TestFieldStatus:
+    def test_three_values(self):
+        assert FieldStatus.CONFIRMED.value == "confirmed"
+        assert FieldStatus.PLACEHOLDER.value == "placeholder"
+        assert FieldStatus.CONFIRM_AT_SUBMISSION.value == "confirm_at_submission"
+
+    def test_is_str_enum(self):
+        assert isinstance(FieldStatus.CONFIRMED, str)
+
+
+class TestDeclineReason:
+    def test_joshes_exact_list(self):
+        """Every code Josh listed (Oct 8 addendum) must be present."""
+        expected = {
+            "credit_below_min", "experience_below_min", "ltv_over_max",
+            "ltc_over_max", "loan_too_small", "loan_too_large",
+            "property_type_excluded", "state_not_covered", "owner_occupied",
+            "seat_cap_reached", "borrower_unresponsive", "borrower_withdrew",
+            "docs_incomplete", "other",
+        }
+        actual = {r.value for r in DeclineReason}
+        assert expected == actual
+
+    def test_is_str_enum(self):
+        assert isinstance(DeclineReason.LOAN_TOO_SMALL, str)
+
+
+class TestBindingCap:
+    def test_four_caps(self):
+        assert {c.value for c in BindingCap} == {"requested", "ltc", "arv", "max_loan"}
+
+
+class TestSizingFlag:
+    def test_two_flags(self):
+        assert SizingFlag.UPSIDE_DOWN.value == "upside_down"
+        assert SizingFlag.ARV_OVER_3X.value == "arv_over_3x"
+
 
 class TestLoanType:
     def test_all_four_values_present(self):
@@ -119,23 +166,73 @@ class TestLoanRequest:
 # LenderFitResult
 # ---------------------------------------------------------------------------
 
+class TestLenderFit:
+    def test_subject_to_confirmation_default_false(self):
+        fit = LenderFit(lender_key="rcn_capital", lender_name="RCN Capital")
+        assert fit.subject_to_confirmation is False
+
+    def test_subject_to_confirmation_set(self):
+        fit = LenderFit(
+            lender_key="generic_backflip",
+            lender_name="Backflip (Generic)",
+            subject_to_confirmation=True,
+        )
+        assert fit.subject_to_confirmation is True
+
+
+class TestLenderMissReasonCodes:
+    def test_reason_codes_default_empty(self):
+        miss = LenderMiss(lender_key="rcn", lender_name="RCN", reasons=["too small"])
+        assert miss.reason_codes == []
+
+    def test_reason_codes_set(self):
+        miss = LenderMiss(
+            lender_key="rcn",
+            lender_name="RCN",
+            reasons=["Loan amount below minimum"],
+            reason_codes=[DeclineReason.LOAN_TOO_SMALL],
+        )
+        assert DeclineReason.LOAN_TOO_SMALL in miss.reason_codes
+
+
+class TestLenderPossible:
+    def test_construct(self):
+        p = LenderPossible(
+            lender_key="easy_street",
+            lender_name="Easy Street Capital",
+            why_unknown=["credit band unknown — caller did not capture above/below 640"],
+        )
+        assert p.lender_key == "easy_street"
+        assert len(p.why_unknown) == 1
+
+    def test_frozen(self):
+        p = LenderPossible(lender_key="x", lender_name="X", why_unknown=["unknown"])
+        with pytest.raises(Exception):
+            p.lender_key = "y"  # type: ignore[misc]
+
+
 class TestLenderFitResult:
     def test_empty_result(self):
         r = LenderFitResult()
         assert r.fitting == []
+        assert r.possible == []
         assert r.non_fitting == []
         assert r.missing_fields == []
         assert r.lender_fit_score is None
 
-    def test_fitting_and_non_fitting_are_separate_lists(self):
+    def test_three_buckets_independent(self):
         r = LenderFitResult(
             fitting=[LenderFit(lender_key="rcn", lender_name="RCN Capital")],
-            non_fitting=[LenderMiss(lender_key="easy", lender_name="Easy Street",
-                                    reasons=["FICO 620 below 640 floor"])],
+            possible=[LenderPossible(lender_key="easy", lender_name="Easy Street",
+                                     why_unknown=["credit unknown"])],
+            non_fitting=[LenderMiss(lender_key="kiavi", lender_name="Kiavi",
+                                    reasons=["FICO 620 below 640 floor"],
+                                    reason_codes=[DeclineReason.CREDIT_BELOW_MIN])],
         )
         assert len(r.fitting) == 1
+        assert len(r.possible) == 1
         assert len(r.non_fitting) == 1
-        assert r.non_fitting[0].reasons == ["FICO 620 below 640 floor"]
+        assert r.non_fitting[0].reason_codes == [DeclineReason.CREDIT_BELOW_MIN]
 
     def test_reasons_are_strings(self):
         miss = LenderMiss(
@@ -160,27 +257,54 @@ class TestLendingFlowLeadCreated:
         defaults = dict(
             lead_id=uuid4(),
             phone="+17275550001",
-            email="test@example.com",
             created_at=datetime.now(timezone.utc),
         )
         defaults.update(kwargs)
         return LendingFlowLeadCreated(**defaults)
 
-    def test_construct_minimal(self):
+    def test_construct_minimal_no_email(self):
+        """G4 (D-1): email is Optional; a lead without one is valid."""
         ev = self._event()
+        assert ev.email is None
         assert ev.credit_band_min_fico is None
         assert ev.loan_amount is None
+
+    def test_construct_with_email(self):
+        ev = self._event(email="test@example.com")
+        assert ev.email == "test@example.com"
+
+    def test_vendor_lead_id_default_none(self):
+        """G4 (D-1): vendor_lead_id is Optional; absent when schema pending."""
+        ev = self._event()
+        assert ev.vendor_lead_id is None
+
+    def test_needs_review_default_false(self):
+        ev = self._event()
+        assert ev.needs_review is False
+
+    def test_needs_review_set_when_no_vendor_id(self):
+        """G4 (D-1): producer must set needs_review=True when vendor id missing."""
+        ev = self._event(needs_review=True)
+        assert ev.needs_review is True
+        assert ev.vendor_lead_id is None  # both can coexist
+
+    def test_with_vendor_lead_id(self):
+        ev = self._event(vendor_lead_id="LF-12345", needs_review=False)
+        assert ev.vendor_lead_id == "LF-12345"
+        assert ev.needs_review is False
 
     def test_phone_not_in_repr(self):
         ev = self._event()
         assert "+17275550001" not in repr(ev)
 
     def test_email_not_in_repr(self):
-        ev = self._event()
+        ev = self._event(email="test@example.com")
         assert "test@example.com" not in repr(ev)
 
     def test_json_round_trip(self):
         ev = self._event(
+            email="test@example.com",
+            vendor_lead_id="LF-99",
             credit_band_min_fico=640,
             loan_amount=Decimal("300000"),
             state="FL",
@@ -191,6 +315,7 @@ class TestLendingFlowLeadCreated:
         assert ev2.lead_id == ev.lead_id
         assert ev2.loan_type is LoanType.FIX_AND_FLIP
         assert ev2.loan_amount == Decimal("300000")
+        assert ev2.vendor_lead_id == "LF-99"
 
     def test_frozen(self):
         ev = self._event()
