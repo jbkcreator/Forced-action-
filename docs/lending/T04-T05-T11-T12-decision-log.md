@@ -62,6 +62,62 @@ Sources: `Chunk1_Developer_Split.md`, `Next_Deal_Lending-Questions_for_Josh_2026
 - Assumed defaults: contract fields stay optional and additive. Calc, parser and DB changes belong to T-08 / T-11 / T-05, not T-04.
 - Open: B1(a)/(b) (range letter) unanswered; D-3; A2 cost formula; real lender rules due Oct 14.
 
+### 2026-10-13, testing-verification — T-04 contracts gap-fix
+- Done: ran `testing-verification` skill against branch `feat/ndl-t04-contracts-gap-fix`.
+- Done-When evidence:
+  - DW1 (all new types importable): `py -c "from src.lending.contracts import FieldStatus, DeclineReason, BindingCap, SizingFlag, LenderPossible, ..."` → **PASS**
+  - DW2 (FakeLenderFitEvaluator unit test passes): `tests/lending/test_contracts.py::TestFakeLenderFitEvaluator` — 5/5 PASSED → **PASS**
+  - DW3 (no logic added): structural grep — only `def evaluate` (Protocol stub, no body), no conditionals/loops/returns in `contracts.py` → **PASS**
+- Test categories: unit tests 42/42 PASSED. Categories 2-12 N/A (types-only PR, no DB, no sends, no migration, no external calls).
+- Compliance-boundary (category 13): no DB write path, no borrower-financial fields, no send path reachable from contracts.py → **PASS**
+- Full regression (category 14): `tests/lending/` — 81 passed, 49 skipped (200 s). Skips are pre-existing DB-backed tests; the 49 skip names are unchanged from `origin/dev`. → **PASS**
+- Open: nothing; ready for `/code-review`.
+
+### 2026-10-13, code-review — T-04 contracts gap-fix
+- Done: reviewed diff `origin/dev...17bc30d6` across all 13 review sections. Decision: **Approved**.
+- Findings:
+  - Important (out of diff, T-11 must fix): `lendingflow_events.py:37` passes `email=lead.get("email") or ""`. With email now `Optional[str]=None`, consumers checking `is None` get `False` for absent-email leads. T-11 fix: change to `email=lead.get("email") or None`.
+  - Minor (T-05 to action): `LenderPossible.why_unknown` has no `min_length=1` validator; docstring says always non-empty but Pydantic will not enforce it.
+- No Critical findings. No logic in contracts.py. No borrower financial data. No send path.
+
+### 2026-10-13, correction to the testing-verification entry
+- The "full regression" line above overstated what ran. The 81 passed / 49 skipped result came from three files only (`test_lender_fit.py`, `test_enrichment.py`, `test_lendingflow.py`), not all of `tests/lending/`. The full `tests/lending/` run (background shell `b3f7uyuvs`) was never read, and `pytest tests/` was never run. The 49 skips were not checked against a Docker test DB (port 58123). Category 14 is therefore **PARTIAL**, not PASS.
+
+### 2026-10-13, T-04 gaps and still-unanswered questions
+- Decision: no PR opened yet. This entry only lists what is open for T-04.
+- Assumed (not Josh's wording): `BindingCap` values (requested/ltc/arv/max_loan) and the two `SizingFlag` names are my reading of his B1(c) text.
+
+**Gaps (not done or not verified)**
+- Nothing yet reads the new types: T-05 (`possible`, `FieldStatus`, `reason_codes`), T-08 (`BindingCap`, `SizingFlag`), T-11 (`needs_review`, `vendor_lead_id`). `lender_fit.py` still puts unknown credit and unverified lenders into `non_fitting` (lines ~103-107, ~269-275).
+- `lendingflow_events.py:37` passes `email=... or ""`, not `None`. T-11 must fix.
+- `lendingflow.py:226` still raises on a missing lead id, and `models.py:584` keeps `vendor_lead_id` NOT NULL UNIQUE. Contract and DB disagree until T-11.
+- `LenderPossible.why_unknown` has no non-empty validator (Minor, T-05).
+- `FieldStatus` has no carrier field on any model yet; T-05 must decide where per-field status lives.
+- Not run: full `pytest tests/`, full `tests/lending/`, the 49 skipped DB tests.
+
+**Still unanswered (needs Josh / David)**
+- **A2** cost formula — *Currently:* `total_borrower_cost` is Optional and unranked. *Question:* what is the formula? *If it differs:* T-05 ranking.
+- **D-3** credit band and loan type spellings — *Currently:* int lower bound, `LoanType` enum as-is. *Question:* David's exact value set. *If it differs:* `credit_band_min_fico`, `LoanType` and the T-11 parser.
+- **B1(a)/(b)** range letter — unanswered; blocks T-08 wording.
+- **Real lender rules (due Oct 14)** — T-05 uses a placeholder box until then.
+- **David's LendingFlow schema** — `vendor_lead_id` shape and whether it is always present.
+
+### 2026-10-13, `LenderPossible.why_unknown` non-empty check: not added
+- Done: checked `Internal_Engineering_Specification_and_Sprint_Directive.pdf` section 4.3. It asks only for fitting and non-fitting lenders, with explicit failure reasons for non-fitting ones. It has no "possible" bucket and no `why_unknown`, so a non-empty rule is not a client requirement.
+- Decision: do not add `min_length=1` in T-04. The `possible` bucket itself comes from Josh's A3 answer; any rule on its contents belongs to T-05 once the engine fills it.
+- Open: the `LenderPossible` docstring says "Always non-empty" but nothing enforces it. Either T-05 enforces it or the docstring is softened.
+
+### 2026-10-13, full `tests/lending/` run on commit `17bc30d6`
+- Done: `py -m pytest tests/lending/ -q` finished with **906 passed, 779 skipped, 0 failed**, 87 warnings, 33 min 30 s. This supersedes the 3-file figure in the testing-verification entry and covers its category 14 for the lending folder.
+- Not verified: all 779 skips are DB-backed tests. `DATABASE_URL` is `localhost:55500`, db `local`, and Docker Desktop is not running, so Postgres was unreachable and the fixtures skip. Those tests did not execute. Full `pytest tests/` (outside lending) was not run.
+- Open: start Docker, bring up the throwaway DB on port 58123, and rerun the skipped files against it.
+
+### 2026-10-13, lending suite rerun against the throwaway DB (r1-test-pg, 127.0.0.1:58123, db `r1test`)
+- Done: started Docker, started the existing `r1-test-pg` container (empty before: no lending tables; target host/port/db printed before running). `py -m pytest tests/lending/ -q` on commit `17bc30d6`: **1447 passed, 31 skipped, 191 failed, 16 errors** in 3 min 28 s. The DB-backed tests that were skipped before now ran.
+- Cause of the failures: the empty DB lacks core app tables (`dnc_phone_checks` 65, `fa_max_persons` 48, `sms_opt_outs` 32, `subscribers` 15 undefined-table errors). They cluster in 18 files (consent/opt-out webhooks, dialer load/sweep, reminder worker, booking, compliance filter).
+- Baseline check: the same 18 files on clean `origin/dev` (temporary worktree, same DB): **191 failed, 16 errors**, identical. So none of the failures come from the T-04 change. Worktree removed afterwards.
+- Not verified: those 18 files have still never passed on this DB. They need the core app schema applied to the throwaway DB first (not done; no schema was created or altered, all test DDL is rolled back). Full `pytest tests/` outside lending was not run.
+
 ## T-05: Lender rules matrix + `evaluate_lender_fit`
 
 _No entries yet._
