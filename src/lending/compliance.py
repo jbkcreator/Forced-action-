@@ -32,6 +32,7 @@ from config.lending_compliance import (
     ET_WINDOW_END,
     ET_WINDOW_START,
     SHIFT_GROUPS,
+    STATE_TZ,
     DEFAULT_TZ,
     DIALER_SWEEP_LOCK_KEY,
     DIALER_OPT_OUT_SOURCE,
@@ -513,6 +514,30 @@ def _outside_call_window(
         ET_WINDOW_START, ET_WINDOW_END)
     eastern = now.astimezone(ZoneInfo(DEFAULT_TZ)).time()
     return not (start <= eastern < end)
+
+
+def text_window_open(
+    phone: str,
+    *,
+    property_state: Optional[str] = None,
+    property_zip: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Whether it is 8:00-20:00 for the borrower in EVERY timezone we can derive: the phone's area code (or a
+    Hillsborough/Pinellas ZIP) and each zone the property's state touches. A borrower may have moved since their
+    number was issued and a state may span zones, so the strictest reading wins. Fails closed: no derivable
+    timezone means no text. Unlike ``can_dial_now`` this has no Eastern-time narrowing (client: 8am-8pm local)."""
+    zones: set[str] = set()
+    tz = recipient_timezone(phone, property_zip)
+    if tz is not None:
+        zones.add(tz.key)
+    zones.update(STATE_TZ.get((property_state or "").strip().upper(), ()))
+    if not zones:
+        logger.warning("[lending-compliance] no timezone for phone_hash=%s; text window fails closed",
+                       phone_hash(phone)[:12])
+        return False
+    now = now or datetime.now(timezone.utc)
+    return all(CALL_WINDOW_START <= now.astimezone(ZoneInfo(zone)).time() < CALL_WINDOW_END for zone in zones)
 
 
 def _attempt_cap(db, phone: str, now: datetime) -> GateResult:

@@ -11,6 +11,13 @@ GHL_TAG_CONSENT_MISSING = "lendingflow-consent-missing"
 GHL_TAG_INTRO_READY = "lendingflow-intro-ready"
 GHL_SOURCE = "LendingFlow"
 
+# The intro text greets the borrower with this contact custom field (LENDING_GHL_CF_INTRO_NAME), never with GHL's own
+# first-name merge field, which has no fallback: the field holds the lead's first name, or this word when it has none.
+INTRO_NAME_FALLBACK = "there"
+# A lead held back for the send window is released only while it is still this fresh (a night is at most 12 h), so a
+# lead never gets an intro text a day late.
+INTRO_SMS_HOLD_MAX_HOURS = 14
+
 # Same schedule shape as config.lending_web: minutes to wait after the Nth failure (last value repeats).
 GHL_RETRY_BACKOFF_MINUTES = (1, 2, 5, 15, 60)
 GHL_GIVE_UP_AFTER_HOURS = 72

@@ -70,6 +70,22 @@ AREA_CODE_TZ: dict[str, str] = {
     )},
 }
 
+# Every IANA zone a state touches, by USPS code. A state that spans zones lists them all: the intro-text window
+# (compliance.text_window_open) must hold in each of them, the over-suppressing direction.
+_ET, _CT, _MT, _PT = "America/New_York", "America/Chicago", "America/Denver", "America/Los_Angeles"
+STATE_TZ: dict[str, tuple[str, ...]] = {
+    **{s: (_ET,) for s in ("CT", "DE", "DC", "GA", "ME", "MD", "MA", "NH", "NJ", "NY", "NC", "OH", "PA", "RI", "SC", "VT", "VA", "WV")},
+    **{s: (_ET, _CT) for s in ("FL", "IN", "KY", "MI", "TN")},
+    **{s: (_CT,) for s in ("AL", "AR", "IL", "IA", "LA", "MN", "MS", "MO", "OK", "WI")},
+    **{s: (_CT, _MT) for s in ("KS", "NE", "ND", "SD", "TX")},
+    **{s: (_MT,) for s in ("CO", "MT", "NM", "UT", "WY")},
+    **{s: (_MT, _PT) for s in ("ID", "NV", "OR")},
+    **{s: (_PT,) for s in ("CA", "WA")},
+    "AZ": ("America/Phoenix",),
+    "AK": ("America/Anchorage",),
+    "HI": ("Pacific/Honolulu",),
+}
+
 # FA sms_opt_outs rows written by the Tracerfy DNC refresh are national-DNC hits,
 # re-verified inside the scrub freshness window — never a permanent opt-out.
 TRACERFY_DNC_SOURCE = "tracerfy_dnc_refresh"
