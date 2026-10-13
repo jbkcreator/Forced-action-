@@ -145,7 +145,12 @@ def _send_one(db, sink: PrequalSink, evaluator: FitEvaluator, row: dict[str, Any
     lead = PrequalLead(credit_band=row["credit_band"], loan_amount=int(row["loan_amount"]),
                        property_state=row["property_state"], loan_type=row["loan_type"])
     try:
-        ctx = build_context(lead, evaluator(lead), pct)
+        fits = evaluator(lead)
+        if fits is None:
+            _mark(db, row["id"], "pending", now)
+            logger.info("[prequal] letter id=%s waiting: lender fit undecided for this lead", row["id"])
+            return 0
+        ctx = build_context(lead, fits, pct)
         if ctx is None:
             _mark(db, row["id"], "skipped", now, skip_reason="no fitting lender")
             logger.info("[prequal] letter id=%s skipped: no fitting lender", row["id"])

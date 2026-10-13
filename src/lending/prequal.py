@@ -30,7 +30,7 @@ class PrequalLead:
 class FitLimits:
     """Min/max loan amount of one fitting lender (stand-in for LenderFitResult)."""
     min_amount: int
-    max_amount: int
+    max_amount: Optional[int]  # None = the lender states no maximum
 
 
 class PrequalSink(Protocol):
@@ -54,7 +54,8 @@ def compute_range(amount: int, fits: Sequence[FitLimits], pct: int) -> Optional[
     lo = int(amount * (100 - pct) / 100)
     hi = int(amount * (100 + pct) / 100)
     lo = max(lo, min(f.min_amount for f in fits))
-    hi = min(hi, max(f.max_amount for f in fits))
+    if all(f.max_amount is not None for f in fits):
+        hi = min(hi, max(f.max_amount for f in fits))
     return (lo, hi) if lo <= hi else None
 
 

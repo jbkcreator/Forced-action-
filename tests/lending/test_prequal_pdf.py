@@ -86,3 +86,7 @@ def test_letter_has_no_company_name_and_is_signed_by_josh():
     assert "next deal lending" not in html.lower()
     assert "Josh Kantor, Loan Officer" in html
     assert "subject to lender confirmation" in html
+
+
+def test_range_has_no_upper_clamp_when_a_lender_states_no_maximum():
+    assert prequal.compute_range(500_000, [FitLimits(75_000, None)], 10) == (450_000, 550_000)

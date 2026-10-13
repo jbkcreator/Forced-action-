@@ -1,6 +1,8 @@
 """T-07 seam to the T-05 Lender Box engine: which leads get a letter, and with which loan bounds."""
 from decimal import Decimal
 
+import pytest
+
 from config.lender_matrix import LenderRules
 from src.lending.contracts import LoanType
 from src.lending.prequal import FitLimits, PrequalLead
@@ -41,8 +43,13 @@ def test_no_fit_for_other_loan_type():
     assert evaluate_prequal_fit(_lead(loan_type="DSCR_RENTAL"), (PLACEHOLDER_BOX,)) == []
 
 
-def test_unknown_loan_type_gets_no_fit_instead_of_an_error():
-    assert evaluate_prequal_fit(_lead(loan_type="SOMETHING_ELSE"), (PLACEHOLDER_BOX,)) == []
+def test_unknown_loan_type_is_undecided_not_declined():
+    assert evaluate_prequal_fit(_lead(loan_type="SOMETHING_ELSE"), (PLACEHOLDER_BOX,)) is None
+
+
+@pytest.mark.parametrize("band", ["Excellent", "", None])
+def test_unreadable_credit_band_is_undecided_not_declined(band):
+    assert evaluate_prequal_fit(_lead(credit_band=band), (PLACEHOLDER_BOX,)) is None
 
 
 def test_lowercase_state_and_loan_type_are_read():
@@ -51,8 +58,7 @@ def test_lowercase_state_and_loan_type_are_read():
 
 def test_lender_without_bounds_does_not_limit_the_range():
     open_box = LenderRules(key="open", name="Open", verified=True)
-    [limits] = evaluate_prequal_fit(_lead(), (open_box,))
-    assert limits.min_amount == 0 and limits.max_amount > 2_000_000
+    assert evaluate_prequal_fit(_lead(), (open_box,)) == [FitLimits(0, None)]
 
 
 def test_seam_stays_closed_while_every_lender_is_unverified():

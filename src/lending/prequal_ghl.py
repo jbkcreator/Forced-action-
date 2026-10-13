@@ -28,7 +28,7 @@ EMAIL_SUBJECT = "Your pre-qualification estimate"
 EMAIL_HTML = (
     "<p>Thanks for sending your request. Your pre-qualification estimate is attached.</p>"
     "<p>This is a non-binding estimate for informational purposes only. It is not a commitment "
-    "to lend or an offer of specific terms.</p>"
+    "to lend or an offer of specific terms. All figures are subject to lender confirmation.</p>"
     "<p>Questions? Call or text (727) 436-9951, or reply to this email.</p>"
     "<p>Josh Kantor, Loan Officer</p>"
 )
