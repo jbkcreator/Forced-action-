@@ -463,3 +463,20 @@ def test_migration_backfills_only_when_it_adds_the_column(lf_db):
     lf_db.execute(text("ALTER TABLE lending.lendingflow_leads DROP COLUMN followup_done_at"))
     apply_to(lf_db.get_bind())  # first apply of the column: earlier claimed leads count as done
     assert _row(lf_db).followup_done_at is not None
+
+
+@pytest.mark.parametrize("statement", [
+    "UPDATE lending.lead_consent_certificates SET raw_certificate = 'edited' WHERE id = :id",
+    "DELETE FROM lending.lead_consent_certificates WHERE id = :id",
+    "TRUNCATE lending.lead_consent_certificates",
+])
+def test_consent_certificates_are_append_only(lf_db, statement):
+    from sqlalchemy.exc import DBAPIError
+
+    _saved(lf_db)
+    cert_id = lf_db.execute(text("SELECT max(id) FROM lending.lead_consent_certificates")).scalar_one()
+    with pytest.raises(DBAPIError, match="append-only"), lf_db.begin_nested():
+        lf_db.execute(text(statement), {"id": cert_id})
+    raw = lf_db.execute(text("SELECT raw_certificate FROM lending.lead_consent_certificates WHERE id = :id"),
+                        {"id": cert_id}).scalar_one()
+    assert raw != "edited"
