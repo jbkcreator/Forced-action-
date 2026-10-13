@@ -13,6 +13,8 @@ class PostResult:
     ok: bool
     channel: str | None = None
     ts: str | None = None
+    # Slack's error code on failure (e.g. "cant_update_message"); None on success or a network error.
+    error: str | None = None
 
 
 class ChatPort(Protocol):
@@ -35,6 +37,8 @@ class FakeChatPort:
     updates: list[dict[str, Any]] = field(default_factory=list)
     threads: dict[tuple[str, str], list[dict[str, Any]]] = field(default_factory=dict)
     channels: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    # Message ts values posted by another Slack app: updating them fails as Slack would.
+    foreign_ts: set[str] = field(default_factory=set)
 
     def replies(self, *, channel: str, thread_ts: str, limit: int) -> list[dict[str, Any]]:
         return list(self.threads.get((channel, thread_ts), []))[-limit:]
@@ -50,8 +54,20 @@ class FakeChatPort:
         return PostResult(ok=True, channel=target, ts=ts)
 
     def update(self, *, channel: str, ts: str, text: str, blocks: list[dict] | None = None) -> PostResult:
+        if ts in self.foreign_ts:
+            return PostResult(ok=False, channel=channel, ts=ts, error="cant_update_message")
         self.updates.append({"channel": channel, "ts": ts, "text": text, "blocks": blocks})
         return PostResult(ok=True, channel=channel, ts=ts)
+
+
+def _slack_error(exc: BaseException) -> str | None:
+    """Slack's error code from a ``SlackApiError`` (duck-typed: the package does not import the SDK here)."""
+    response = getattr(exc, "response", None)
+    try:
+        error = response.get("error") if response is not None else None
+    except Exception:
+        return None
+    return error if isinstance(error, str) else None
 
 
 class SlackChatPort:
@@ -83,9 +99,11 @@ class SlackChatPort:
         try:
             response = self._web.chat_update(**kwargs)
         except Exception as exc:
-            logger.error("slack chat.update on %s failed (%s)", channel, type(exc).__name__)
-            return PostResult(ok=False, channel=channel, ts=ts)
-        return PostResult(ok=bool(response.get("ok")), channel=channel, ts=ts)
+            error = _slack_error(exc)
+            logger.error("slack chat.update on %s failed (%s%s)", channel, type(exc).__name__,
+                         f": {error}" if error else "")
+            return PostResult(ok=False, channel=channel, ts=ts, error=error)
+        return PostResult(ok=bool(response.get("ok")), channel=channel, ts=ts, error=response.get("error"))
 
     def replies(self, *, channel: str, thread_ts: str, limit: int) -> list[dict[str, Any]]:
         """The thread's latest messages, oldest first. Empty on failure: the agent answers without history."""

@@ -42,6 +42,9 @@ class DraftReviser:
     base_prompt: str
     rules_provider: Callable[[], Sequence[str]]
     editable_fields: Mapping[str, tuple[str, ...]]
+    # The host's content rule for a redraft: (channel, revised fields) -> reason to refuse, or None.
+    # The same rule the host applies when a draft is first made, so a revision cannot get around it.
+    content_check: Callable[[str, Mapping[str, str]], str | None] | None = None
 
     def revise(self, action: PendingAction, instruction: str, user_id: str) -> QueuedDraft:
         """Apply the instruction to ``action`` and post a fresh card (the sweep retries it if Slack refuses)."""
@@ -67,6 +70,9 @@ class DraftReviser:
             raise RevisionFailed("the redraft was not valid JSON") from exc
         if set(revised) != set(fields) or not all(isinstance(value, str) and value.strip() for value in revised.values()):
             raise RevisionFailed("the redraft did not return every editable field")
+        problem = self.content_check(action.channel, revised) if self.content_check else None
+        if problem:
+            raise RevisionFailed(problem)
 
         payload = {**action.payload, **{name: revised[name].strip() for name in fields}}
         if not self.queue.apply_revision(action.action_id, payload=payload, summary=action.summary,

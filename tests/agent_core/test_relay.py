@@ -52,12 +52,18 @@ def test_executor_error_marks_failed_without_retry(queue: PendingActionQueue, ha
     assert relay.run().sent == ()
 
 
-def test_unknown_channel_is_failed_not_sent(queue: PendingActionQueue, halt: HaltSwitch,
-                                            executor: RecordingExecutor) -> None:
+def test_channel_without_an_executor_is_not_enabled_and_never_sent(queue: PendingActionQueue, halt: HaltSwitch,
+                                                                   executor: RecordingExecutor) -> None:
     relay = Relay(queue, halt, {"ghl_email": executor})
     action_id = _approved(queue)
-    assert relay.dispatch(action_id).outcome is DispatchOutcome.FAILED
+    assert relay.dispatch(action_id).outcome is DispatchOutcome.NOT_ENABLED
+    assert queue.get(action_id).status is ActionStatus.FAILED  # stored as failed, so never retried
     assert executor.sent == []
+
+
+def test_sweep_counts_a_channel_without_an_executor_as_failed(queue: PendingActionQueue, halt: HaltSwitch) -> None:
+    action_id = _approved(queue)
+    assert Relay(queue, halt, {}).run().failed == (action_id,)
 
 
 def test_send_check_sees_the_action_and_can_block(queue: PendingActionQueue, halt: HaltSwitch,

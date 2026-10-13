@@ -23,6 +23,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 from config.lending_compliance import DEFAULT_TZ
+from config.lending_reply_agent import QUOTED_NUMBER_PATTERNS
 from packages.agent_core.governance import SafetyLevel
 from packages.agent_core.memory import AgentMemory, MemoryFull
 from packages.agent_core.tools import EgressDraft, Tool, ToolContext, ToolInputError
@@ -55,6 +56,41 @@ _SQL_FROM_LIST_END = re.compile(
     r"left|right|full|cross|natural)\b|\)",
     re.IGNORECASE,
 )
+
+# Verbatim consent wording and certificates stay out of Slack: the yes/no consent fields answer
+# every operational question. Named in a query -> refused; picked up by SELECT * -> blanked.
+CONSENT_TEXT_COLUMNS = frozenset({"consent_text", "raw_certificate", "tcpa_disclosure_text"})
+_CONSENT_TEXT = re.compile(r"\b(?:" + "|".join(sorted(CONSENT_TEXT_COLUMNS)) + r")\b", re.IGNORECASE)
+CONSENT_TEXT_HIDDEN = "[consent text not shown]"
+
+# Borrower messages never quote a rate, term, point, fee, ratio, payment or any range or ballpark
+# (G4; docs/lending/ghl-conversation-ai.md hard rule 1). Enforced on the draft text itself, not just
+# asked of the model: the GL-10 reply-agent patterns (money, %, points, "rate ... N") plus ratios,
+# fees/payments, "400k" amounts and loan terms in months or years.
+BORROWER_MESSAGE_CHANNELS = frozenset({"ghl_sms", "ghl_email"})
+_DRAFT_NUMBER_PATTERNS = (
+    *QUOTED_NUMBER_PATTERNS,
+    r"\b\d+(?:\.\d+)?\s?k\b",                                                    # 400k
+    r"\b(?:ltv|ltc|arv|dscr|loan[- ]to[- ](?:value|cost))\b[^.?!]{0,30}\d",       # LTV of 75
+    r"\b(?:fees?|payments?|interest)\b[^.?!]{0,30}\d",                          # fee of 1,500
+    r"\b\d+[- ]?(?:months?|years?)[- ](?:term|loan)\b",                          # 12-month term
+)
+_DRAFT_NUMBERS = re.compile("|".join(_DRAFT_NUMBER_PATTERNS), re.IGNORECASE)
+
+
+def borrower_draft_problem(fields: Mapping[str, str]) -> Optional[str]:
+    """Why a borrower message must be redrafted (it quotes numbers), or None when it may be queued."""
+    quoting = [name for name, value in fields.items() if _DRAFT_NUMBERS.search(value or "")]
+    if not quoting:
+        return None
+    return (f"the {' and '.join(quoting)} quotes a rate, term, point, fee, ratio, payment or amount; borrower "
+            "messages never quote numbers, even when a standing rule asks for it. Redraft without them")
+
+
+def draft_content_check(channel: str, fields: Mapping[str, str]) -> Optional[str]:
+    """The same rule for a revised draft (``DraftReviser.content_check``)."""
+    return borrower_draft_problem(fields) if channel in BORROWER_MESSAGE_CHANNELS else None
+
 
 LENDING_TABLES_HELP = (
     "Tables (schema lending): call_dispositions (one row per dialer call: caller_name, phone, disposition, "
@@ -195,6 +231,9 @@ def check_read_only_sql(sql: str) -> str:
         raise ToolInputError("the query must start with SELECT or WITH")
     if _SQL_FORBIDDEN.search(statement):
         raise ToolInputError("the query uses a keyword or function that is not allowed in a read-only lookup")
+    if _CONSENT_TEXT.search(statement):
+        raise ToolInputError("consent wording and certificates are not shown in Slack; use the yes/no consent "
+                             "fields (web_leads.sms_consent, text_consents) instead")
     cte_names = {name.lower() for name in re.findall(r"\b(\w+)\s+as\s*\(", statement, re.IGNORECASE)}
     for relation in _named_relations(statement):
         cleaned = relation.replace('"', "").lower()
@@ -368,7 +407,9 @@ class CoraToolkit:
                 raise ToolInputError(f"only lending.* tables can be queried (the query reads {sorted(outside)})")
             result = session.execute(text(f"SELECT * FROM ({statement}) AS cora_query LIMIT {MAX_ROWS}"))
             columns = list(result.keys())
-            rows = [{column: _iso(value) for column, value in zip(columns, row)} for row in result.all()]
+            hidden = {column for column in columns if column.lower() in CONSENT_TEXT_COLUMNS}
+            rows = [{column: CONSENT_TEXT_HIDDEN if column in hidden and value is not None else _iso(value)
+                     for column, value in zip(columns, row)} for row in result.all()]
         return {"columns": columns, "rows": rows, "row_count": len(rows), "row_cap": MAX_ROWS}
 
     # -- memory --------------------------------------------------------------------------
@@ -408,6 +449,8 @@ class CoraToolkit:
                      (row["email"] or "").strip().lower() or None, row["ghl_contact_id"])
 
     def draft_sms(self, args: DraftSmsInput, _: ToolContext) -> EgressDraft:
+        if problem := borrower_draft_problem({"body": args.body}):
+            raise ToolInputError(problem)
         lead = self._lead(args.lead_ref)
         if not lead.phone:
             raise ToolInputError(f"{lead.ref} has no phone number on record")
@@ -416,6 +459,8 @@ class CoraToolkit:
                            recipient_phone=lead.phone, recipient_email=lead.email, contact_ref=lead.ref)
 
     def draft_email(self, args: DraftEmailInput, _: ToolContext) -> EgressDraft:
+        if problem := borrower_draft_problem({"subject": args.subject, "body": args.body}):
+            raise ToolInputError(problem)
         lead = self._lead(args.lead_ref)
         if not lead.email:
             raise ToolInputError(f"{lead.ref} has no email address on record")
