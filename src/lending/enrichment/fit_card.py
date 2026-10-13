@@ -120,7 +120,9 @@ def evaluate_fit(
     )
     request = LoanRequest(loan_type=loan_type, loan_amount=amount, state=lead["property_state"],
                           property_address=address, target_close_date=close_dt)
-    borrower = BorrowerProfile(credit_band_min_fico=lead.get("credit_band_min_fico"), state=lead["property_state"])
+    band = parse_band_bounds(lead.get("credit_band"))
+    borrower = BorrowerProfile(credit_band_min_fico=lead.get("credit_band_min_fico"),
+                               credit_band_max_fico=band[1] if band else None, state=lead["property_state"])
     result = (evaluator or (lambda b, r: evaluate_lender_fit(b, r, matrix=matrix)))(borrower, request)
 
     fitting_groups = [lender_group(f.lender_key) for f in result.fitting]  # T-05 order: cheapest first
@@ -143,6 +145,6 @@ def evaluate_fit(
         note=None if all_verified else FIT_RULES_PENDING,
         ranked=[names_by_group.get(g, g) for g in ordered],
         possible=[names_by_group.get(g, g) for g in possible_groups],
-        straddles=_straddles(parse_band_bounds(lead.get("credit_band")), request, matrix),
+        straddles=_straddles(band, request, matrix),
         missing_fields=list(result.missing_fields),
     )

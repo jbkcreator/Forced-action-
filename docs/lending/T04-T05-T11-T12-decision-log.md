@@ -163,6 +163,12 @@ Sources: `Chunk1_Developer_Split.md`, `Next_Deal_Lending-Questions_for_Josh_2026
 - 2026-10-14, applied: user said to use the live DB. `apply_lending_lender_rule_values.py` ran on the live `distress_db` (`lending` schema present, table absent beforehand): 84 seed rows inserted (6 lenders x 14 fields, all placeholder), a re-run inserted 0, and `load_matrix` on the live table equals the config. `LENDING_RULES_FROM_DB` is still off: it is a server env setting plus a `lending-api` restart, not done from here.
 - Open: turn the flag on (server `.env` + restart `lending-api`); purchase and rehab shares still in `config/lending_soft_approval.py` (move in the T-08 PR; `soft_approval/service.py` changed here, so the T-08 branch needs a rebase); reconcile with R-1's tables when R-1 merges; tell the R-1 owner.
 
+### 2026-10-14, review finding: a closed credit band below a floor is a decline, not "possible" (T-05 branch)
+- Finding (Medium): intake stores a closed band such as 600-639 with 600 as its lower bound; the evaluator read it as "600 or higher", so Backflip's 640 floor showed "possible" although the whole band is below it.
+- Done: `BorrowerProfile.credit_band_max_fico` (optional; None = open-ended or unknown); the credit check declines (`credit_below_min`, reason "credit band 600-639 below lender floor 640") when that upper bound is below the floor, and stays `possible` when the band crosses the floor or is open-ended. The fit card (`evaluate_fit`) and the soft-approval lead source pass the upper bound, parsed from the stored `credit_band` text with the fit card's existing `parse_band_bounds`; no schema change. Only these two sites build a `BorrowerProfile` from a stored lead.
+- Evidence: new cases in `test_lender_fit.py` (600-639 vs 640 and 640-679 vs 680 decline; 620-679 vs 640, 640+ vs 680 and 660-719 vs 680 possible; 680-719 vs 680 fits) and `test_enrichment.py` (card does not list Backflip for 600-639). 249 passed, 1 failed (the known stale `lending.soft_approvals` row on the throwaway DB) across `test_lender_fit`, `test_enrichment`, `test_soft_approval`, `test_contracts`, `test_lender_rules_store`.
+- Open: the band text is LendingFlow's stand-in vocabulary until D-3; `lendingflow_events.build_event` does not carry the upper bound (it builds the event, not the profile).
+
 ## T-11: LendingFlow webhook, dedupe, consent vault
 
 _No entries yet._

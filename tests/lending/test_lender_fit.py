@@ -790,3 +790,37 @@ def test_property_type_not_in_allowed_set_rejected() -> None:
     unknown = evaluate_lender_fit(profile, LoanRequest(**base), matrix=(lender,))
     assert unknown.fitting == []
     assert "property_type" in unknown.missing_fields
+
+
+# ---------------------------------------------------------------------------
+# Closed credit bands: the upper bound decides decline vs possible (review: 600-639 vs a 640 floor)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("band_min, band_max, floor, outcome", [
+    (600, 639, 640, "decline"),    # the whole band is below the floor
+    (640, 679, 680, "decline"),
+    (620, 679, 640, "possible"),   # the band crosses the floor
+    (640, None, 680, "possible"),  # open-ended "640+"
+    (660, 719, 680, "possible"),
+    (680, 719, 680, "fit"),
+])
+def test_closed_credit_band_declines_only_when_its_top_is_below_the_floor(band_min, band_max, floor, outcome):
+    lender = LenderRules(key="band_lender", name="Band Lender", verified=True,
+                         loan_types=frozenset({LoanType.FIX_AND_FLIP}), credit_floor=floor)
+    profile = BorrowerProfile(credit_band_min_fico=band_min, credit_band_max_fico=band_max, state="FL")
+    request = LoanRequest(loan_type=LoanType.FIX_AND_FLIP, loan_amount=Decimal("300_000"), state="FL")
+    result = evaluate_lender_fit(profile, request, matrix=(lender,))
+    found = ("decline" if result.non_fitting else "possible" if result.possible else "fit")
+    assert found == outcome
+    if outcome == "decline":
+        assert DeclineReason.CREDIT_BELOW_MIN in result.non_fitting[0].reason_codes
+        assert f"{band_min}-{band_max}" in result.non_fitting[0].reasons[0]
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("600-639", (600, 639)), ("680 to 719", (680, 719)), ("720+", None), ("below 640", None), ("", None), (None, None),
+])
+def test_band_bounds_parser_gives_an_upper_bound_only_for_a_closed_band(raw, expected):
+    from src.lending.enrichment.fit_card import parse_band_bounds
+
+    assert parse_band_bounds(raw) == expected
