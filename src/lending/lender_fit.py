@@ -51,7 +51,6 @@ from decimal import Decimal
 from typing import Optional
 
 from config.lender_matrix import (
-    LENDER_MATRIX,
     LenderRules,
     effective_rules,
     field_status_of,
@@ -69,6 +68,7 @@ from src.lending.contracts import (
     LoanRequest,
     LoanType,
 )
+from src.lending.lender_rules_store import current_matrix
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +94,7 @@ def evaluate_lender_fit(
     borrower_profile: BorrowerProfile,
     loan_request: LoanRequest,
     *,
-    matrix: tuple[LenderRules, ...] = LENDER_MATRIX,
+    matrix: Optional[tuple[LenderRules, ...]] = None,
 ) -> LenderFitResult:
     """Evaluate all active lenders against the borrower + loan.
 
@@ -102,7 +102,7 @@ def evaluate_lender_fit(
         borrower_profile: Borrower facts captured by the caller.
         loan_request: Loan and property details.
         matrix: Lender rules to evaluate against.  Defaults to
-            ``LENDER_MATRIX`` from config; tests inject fixture matrices.
+            ``current_matrix()`` (the config, or the table when LENDING_RULES_FROM_DB is on); tests inject fixtures.
 
     Returns:
         LenderFitResult with:
@@ -117,6 +117,7 @@ def evaluate_lender_fit(
     ``None`` means unknown.  A positive band below a lender's floor straddles it
     (the band is read as "this value or higher"), so it is ``possible``.
     """
+    matrix = current_matrix() if matrix is None else matrix
     fitting: list[LenderFit] = []
     possible: list[LenderPossible] = []
     non_fitting: list[LenderMiss] = []
