@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from datetime import datetime, timezone
 from typing import Any, Optional
 from urllib.parse import parse_qs
 
@@ -30,7 +31,9 @@ from src.lending.soft_approval.service import generate_soft_approval
 from src.lending.soft_approval.slack_card import (
     OUTCOME_MESSAGES,
     slack_client,
+    build_card_blocks,
     build_form_view,
+    card_status,
     parse_submission,
     verify_slack_signature,
 )
@@ -134,21 +137,42 @@ def _upload_pdf(client, db, *, approval_id: int, phone: str, channel: str, messa
         logger.error("[soft-approval] PDF upload failed approval=%s: %s", approval_id, type(exc).__name__)
 
 
-def _status_text(outcome) -> str:
+def _outcome_key(outcome) -> str:
     if outcome.status == "generated" and outcome.subject_to_confirmation:
-        return OUTCOME_MESSAGES["generated_unconfirmed"]
-    return OUTCOME_MESSAGES.get(outcome.reason) or OUTCOME_MESSAGES.get(outcome.status) or ""
+        return "generated_unconfirmed"
+    return outcome.reason if outcome.reason in OUTCOME_MESSAGES else outcome.status
+
+
+def _status_text(outcome) -> str:
+    return OUTCOME_MESSAGES.get(_outcome_key(outcome)) or ""
+
+
+def _refresh_card(client, *, channel: str, message_ts: str, call_id: str, phone: str,
+                  caller: Optional[str], key: str) -> None:
+    """The card itself shows the last result and offers the form again; best-effort (the thread reply and the
+    stored PDF are the record)."""
+    fallback, blocks = build_card_blocks(
+        call_id=call_id, phone=phone, caller=caller,
+        status=card_status(key, when=datetime.now(timezone.utc)),
+        button_label="Re-enter deal facts" if key.startswith("generated") else "Enter deal facts")
+    try:
+        client.chat_update(channel=channel, ts=message_ts, text=fallback, blocks=blocks)
+    except Exception as exc:  # class only
+        logger.error("[soft-approval] call %s card update failed: %s", call_id, type(exc).__name__)
 
 
 def _process_submission(call_id: str, facts: SoftApprovalFacts, user_id: str, channel: str, message_ts: str) -> None:
     status_text = "The soft approval could not be processed. Please tell the engineering team."
     lead_id: Optional[int] = None
+    card: Optional[tuple[str, Optional[str], str]] = None  # (phone, caller, outcome key)
     client = slack_client()
     try:
         with lending_session() as db:
-            phone = db.execute(
-                text("SELECT phone FROM lending.call_dispositions WHERE dialer_call_id = :id"), {"id": call_id},
-            ).scalar()
+            call = db.execute(
+                text("SELECT phone, caller_name FROM lending.call_dispositions WHERE dialer_call_id = :id"),
+                {"id": call_id},
+            ).first()
+            phone = call[0] if call else None
             if not phone:
                 status_text = ":warning: That call was not found, so no soft approval was made."
             else:
@@ -156,6 +180,7 @@ def _process_submission(call_id: str, facts: SoftApprovalFacts, user_id: str, ch
                 outcome = generate_soft_approval(
                     db, phone=phone, dialer_call_id=call_id, facts=facts, submitted_by=user_id or None)
                 status_text = _status_text(outcome) or status_text
+                card = (phone, call[1], _outcome_key(outcome))
                 if outcome.status == "generated" and outcome.approval_id and channel and message_ts:
                     _upload_pdf(client, db, approval_id=outcome.approval_id, phone=phone,
                                 channel=channel, message_ts=message_ts)
@@ -167,6 +192,9 @@ def _process_submission(call_id: str, facts: SoftApprovalFacts, user_id: str, ch
             client.chat_postMessage(channel=channel, thread_ts=message_ts, text=status_text)
         except Exception as exc:
             logger.error("[soft-approval] call %s status reply failed: %s", call_id, type(exc).__name__)
+        if card is not None:
+            _refresh_card(client, channel=channel, message_ts=message_ts, call_id=call_id,
+                          phone=card[0], caller=card[1], key=card[2])
     if lead_id is not None:
         _enrich_after_form(lead_id)
 

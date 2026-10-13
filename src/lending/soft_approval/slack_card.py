@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime
 from typing import Any, Mapping, Optional
 
 from pydantic import ValidationError
@@ -48,16 +49,40 @@ OUTCOME_MESSAGES = {
 }
 
 
-def build_card_blocks(*, call_id: str, phone: Optional[str], caller: Optional[str]) -> tuple[str, list[dict]]:
+CARD_STATUS_LINES = {
+    "generated": ":white_check_mark: PDF ready",
+    "generated_unconfirmed": ":white_check_mark: PDF ready · subject to lender confirmation",
+    "loan_too_small": ":no_entry_sign: No PDF: loan below the lender's minimum",
+    "no_lead": ":warning: No PDF: no LendingFlow lead for this call",
+    "no_fit": ":no_entry_sign: No PDF: no lender fits",
+    "out_of_scope": ":no_entry_sign: No PDF: loan type not covered yet",
+    "terms_unconfirmed": ":warning: No PDF: lender inputs not confirmed",
+    "render_failed": ":x: PDF could not be generated",
+}
+
+
+def card_status(outcome_key: str, *, when: datetime) -> str:
+    """The line shown on the card after a submit; the time renders in each viewer's own time zone."""
+    line = CARD_STATUS_LINES.get(outcome_key, ":warning: Not processed")
+    return f"{line} · <!date^{int(when.timestamp())}^{{time}}|{when:%H:%M} UTC>"
+
+
+def build_card_blocks(
+    *, call_id: str, phone: Optional[str], caller: Optional[str],
+    status: Optional[str] = None, button_label: str = "Enter deal facts",
+) -> tuple[str, list[dict]]:
     summary = f"Call {call_id} · {last4(phone)} · caller {caller or '—'}"
     fallback = f"Enter deal facts for the soft approval — {summary}"
-    return fallback, [
+    blocks: list[dict] = [
         {"type": "section", "text": {"type": "mrkdwn", "text": f":house: *Enter deal facts after the call*\n{summary}"}},
-        {"type": "actions", "elements": [{
-            "type": "button", "style": "primary", "action_id": OPEN_FORM_ACTION_ID, "value": call_id,
-            "text": {"type": "plain_text", "text": "Enter deal facts"},
-        }]},
     ]
+    if status:
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": status}]})
+    blocks.append({"type": "actions", "elements": [{
+        "type": "button", "style": "primary", "action_id": OPEN_FORM_ACTION_ID, "value": call_id,
+        "text": {"type": "plain_text", "text": button_label},
+    }]})
+    return fallback, blocks
 
 
 def _input(block_id: str, label: str, element: dict, *, optional: bool = False) -> dict:

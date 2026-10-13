@@ -472,9 +472,15 @@ class FakeSlack:
     def __init__(self):
         self.posts, self.views, self.fail = [], [], False
         self.ephemerals, self.files, self.upload_fail = [], [], False
+        self.updates, self.update_fail = [], False
 
     def chat_postEphemeral(self, **kwargs):
         self.ephemerals.append(kwargs)
+
+    def chat_update(self, **kwargs):
+        if self.update_fail:
+            raise RuntimeError("cannot edit the card")
+        self.updates.append(kwargs)
 
     def files_upload_v2(self, **kwargs):
         if self.upload_fail:
@@ -717,11 +723,11 @@ class TestRoute:
                          "channel": {"id": "CDIAL"}, "message": {"ts": "1.1"},
                          "actions": [{"action_id": "soft_approval_open", "value": "call-1"}]})
 
-    def _submit_body(self, user):
+    def _submit_body(self, user, **state):
         return _payload({"type": "view_submission", "user": {"id": user}, "view": {
             "callback_id": "soft_approval_form",
             "private_metadata": json.dumps({"call_id": "call-1", "channel": "CDIAL", "message_ts": "1.1"}),
-            "state": {"values": _state()}}})
+            "state": {"values": _state(**state)}}})
 
     def test_a_user_not_on_the_allow_list_cannot_open_the_form(self, client, wired):
         body = self._open_body("UOTHER")
@@ -777,6 +783,38 @@ class TestRoute:
         body = self._submit_body("U1")
         client.post(self.URL, content=body, headers=_signed(body))
         assert wired.files == []
+
+    def test_the_card_shows_a_flagged_pdf_ready_line_and_offers_the_form_again(self, client, wired, soft_db, flow):
+        body = self._submit_body("U1")
+        client.post(self.URL, content=body, headers=_signed(body))
+        update = wired.updates[0]
+        assert (update["channel"], update["ts"]) == ("CDIAL", "1.1")
+        status = next(b for b in update["blocks"] if b["type"] == "context")["elements"][0]["text"]
+        assert "PDF ready" in status and "subject to lender confirmation" in status and "<!date^" in status
+        button = next(b for b in update["blocks"] if b["type"] == "actions")["elements"][0]
+        assert button["text"]["text"] == "Re-enter deal facts"
+        assert (button["action_id"], button["value"]) == (webhook.OPEN_FORM_ACTION_ID, "call-1")
+        dumped = json.dumps(update, default=str)
+        assert "12 Palm" not in dumped and PHONE not in dumped
+
+    def test_the_card_shows_why_no_pdf_was_made_and_keeps_the_original_button(self, client, wired, soft_db, flow):
+        body = self._submit_body("U1", arv="40000")  # the ARV cap cuts the loan below the lender minimum
+        client.post(self.URL, content=body, headers=_signed(body))
+        blocks = wired.updates[0]["blocks"]
+        status = next(b for b in blocks if b["type"] == "context")["elements"][0]["text"]
+        assert "No PDF" in status and wired.files == []
+        assert next(b for b in blocks if b["type"] == "actions")["elements"][0]["text"]["text"] == "Enter deal facts"
+
+    def test_a_failed_card_update_never_fails_the_soft_approval(self, client, wired, soft_db, flow):
+        wired.update_fail = True
+        body = self._submit_body("U1")
+        client.post(self.URL, content=body, headers=_signed(body))
+        assert _row(soft_db)["status"] == "generated" and wired.files and wired.posts[-1]["thread_ts"] == "1.1"
+
+    def test_the_card_is_left_alone_when_the_call_is_unknown(self, client, wired, soft_db):
+        body = self._submit_body("U1")  # no call row seeded
+        client.post(self.URL, content=body, headers=_signed(body))
+        assert wired.updates == []
 
     def test_the_form_facts_reach_the_deal_facts_store_when_enrichment_is_on(self, client, wired, soft_db, flow, monkeypatch):
         apply_enrichment(soft_db.get_bind())
