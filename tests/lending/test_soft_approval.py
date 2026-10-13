@@ -522,6 +522,35 @@ def client(wired):
     return TestClient(app)
 
 
+class TestMovedCoraCards:
+    """Cora cards the lending app posted before Cora had her own app: a click retires the card."""
+
+    CLICK = {"type": "block_actions", "channel": {"id": "CCORA"}, "message": {"ts": "9.9"},
+             "actions": [{"action_id": "agent_core_approve", "value": "7"}]}
+
+    def test_only_cora_buttons_count_as_moved_cora_clicks(self):
+        assert webhook.is_moved_cora_click(self.CLICK)
+        soft = {**self.CLICK, "actions": [{"action_id": "soft_approval_open", "value": "call-1"}]}
+        assert not webhook.is_moved_cora_click(soft)
+        assert not webhook.is_moved_cora_click({"type": "view_submission"})
+
+    def test_the_old_card_loses_its_buttons_and_points_to_the_new_one(self, monkeypatch):
+        updates: list[dict] = []
+        client = SimpleNamespace(chat_update=lambda **kwargs: updates.append(kwargs))
+        monkeypatch.setattr(webhook, "slack_client", lambda: client)
+        webhook._retire_moved_cora_card(self.CLICK)
+        assert updates[0]["channel"] == "CCORA" and updates[0]["ts"] == "9.9"
+        assert updates[0]["text"] == webhook.MOVED_CORA_CARD_TEXT
+        assert all(block["type"] != "actions" for block in updates[0]["blocks"])
+
+    def test_a_slack_failure_while_retiring_is_swallowed(self, monkeypatch):
+        def boom(**kwargs):
+            raise RuntimeError("slack down")
+
+        monkeypatch.setattr(webhook, "slack_client", lambda: SimpleNamespace(chat_update=boom))
+        webhook._retire_moved_cora_card(self.CLICK)  # no exception
+
+
 class TestSignature:
     def test_valid_signature(self):
         body = b"payload=x"

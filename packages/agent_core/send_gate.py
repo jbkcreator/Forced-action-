@@ -18,6 +18,9 @@ from .tools import EgressDraft, QueuedDraft, ToolContext
 
 logger = logging.getLogger(__name__)
 
+# chat.update errors meaning the card can never carry this app's buttons again.
+_CARD_NOT_OURS = frozenset({"cant_update_message", "message_not_found"})
+
 
 class SendGate:
     def __init__(self, queue: PendingActionQueue, chat: ChatPort, card_channel: str | None) -> None:
@@ -48,6 +51,34 @@ class SendGate:
             return False
         self._queue.attach_card(action_id, posted.channel, posted.ts)
         return True
+
+    def adopt_cards(self) -> int:
+        """Give every open draft a card this app can act on. Returns how many were reposted.
+
+        Run once at startup. Each open card is re-rendered in place; a card Slack will not let
+        this app edit (posted by another app, e.g. before a move to a dedicated bot) or that no
+        longer exists is replaced by a fresh card, since clicks on it can never reach this app.
+        Any other failure leaves the card alone, so a Slack outage cannot double-post.
+        """
+        reposted = 0
+        for action_id in self._queue.carded_open_ids():
+            action = self._queue.get(action_id)
+            if action is None or not (action.card_channel and action.card_ts):
+                continue
+            refreshed = self._chat.update(channel=action.card_channel, ts=action.card_ts,
+                                          text=f"Approval needed: {action.tool_name} (action {action_id})",
+                                          blocks=render_action_card(action))
+            if refreshed.ok or refreshed.error not in _CARD_NOT_OURS:
+                continue
+            posted = self._chat.post(text=f"Approval needed: {action.tool_name} (action {action_id})",
+                                     blocks=render_action_card(action), channel=self._card_channel)
+            if posted.ok and posted.channel and posted.ts:
+                self._queue.attach_card(action_id, posted.channel, posted.ts)
+                reposted += 1
+                logger.info("send gate: action %s had a card this app cannot use; posted a new one", action_id)
+            else:
+                logger.error("send gate: replacement card for action %s could not be posted", action_id)
+        return reposted
 
     def retry_missing_cards(self) -> int:
         """Post cards for open drafts that have none (a failed post, or a failed repost after a revise)."""

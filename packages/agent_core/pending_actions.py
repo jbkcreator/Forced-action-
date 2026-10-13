@@ -329,6 +329,16 @@ class PendingActionQueue:
             ).scalars().all()
         return [int(action_id) for action_id in rows]
 
+    def carded_open_ids(self, limit: int = 200) -> list[int]:
+        """Open, unexpired drafts that already have an approval card in Slack, oldest first."""
+        with self._store.transaction() as conn:
+            rows = conn.execute(
+                text(f"SELECT action_id FROM {self._table} WHERE status = :pending AND card_ts IS NOT NULL "
+                     "AND (expires_at IS NULL OR expires_at > :now) ORDER BY action_id LIMIT :limit"),
+                {"pending": ActionStatus.PENDING.value, "now": self._clock(), "limit": limit},
+            ).scalars().all()
+        return [int(action_id) for action_id in rows]
+
     def approved_ids(self, limit: int = 50) -> list[int]:
         with self._store.transaction() as conn:
             rows = conn.execute(

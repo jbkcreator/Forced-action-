@@ -294,10 +294,12 @@ def run_socket_mode(session: SlackSession, *, app_token: str, web_client: Any,
         session.handle_request(request.type, request.payload or {}, request.envelope_id or "")
 
     client.socket_mode_request_listeners.append(on_request)
-    client.connect()
-    logger.info("socket mode session connected")
     stop = stop or threading.Event()
+    # The client starts its worker threads when it is built, so it is closed even when connect()
+    # fails: the caller retries, and an unclosed client per attempt would leak threads.
     try:
+        client.connect()
+        logger.info("socket mode session connected")
         # Short waits, not one unbounded wait: on Windows an unbounded wait never sees Ctrl+C.
         while not stop.wait(_STOP_POLL_SECONDS):
             pass

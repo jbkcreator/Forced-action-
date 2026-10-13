@@ -42,7 +42,7 @@ from packages.agent_core.thread_history import build_history
 from packages.agent_core.tools import ToolContext, ToolRegistry
 from src.lending.consent import has_text_consent
 from src.lending.cora_prompt import CORA_BASE_PROMPT, REVISION_PROMPT
-from src.lending.cora_tools import CoraToolkit
+from src.lending.cora_tools import CoraToolkit, draft_content_check
 from src.lending.models import LENDING_SCHEMA
 from src.services.phone_utils import normalize
 
@@ -214,7 +214,8 @@ def build_session(config: AgentCoreConfig, store: AgentStore, chat: ChatPort, bo
     loop = AgentLoop(client=messages_client, model=config.model, registry=ToolRegistry(toolkit.tools(), gate),
                      base_prompt=CORA_BASE_PROMPT, rules_provider=rules)
     reviser = DraftReviser(client=messages_client, model=config.model, queue=queue, gate=gate,
-                           base_prompt=REVISION_PROMPT, rules_provider=rules, editable_fields=EDITABLE_FIELDS)
+                           base_prompt=REVISION_PROMPT, rules_provider=rules, editable_fields=EDITABLE_FIELDS,
+                           content_check=draft_content_check)
     conversation = CoraConversation(config=config, chat=chat, loop=loop, reviser=reviser, bot_user_id=bot_user_id)
     session = SlackSession(config=config, chat=chat, queue=queue, halt=halt, relay=relay,
                            on_message=conversation.on_message, on_revision=conversation.on_revision,
@@ -278,6 +279,18 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
     return services._replace(web_client=web)
 
 
+def _adopt_open_cards(services: CoraServices) -> None:
+    """Replace approval cards Cora's app cannot act on (those the lending app posted before Cora had
+    her own app) so every open draft stays approvable. Best effort: a failure never blocks startup."""
+    try:
+        reposted = services.gate.adopt_cards()
+    except Exception as exc:
+        logger.error("[cora] checking open approval cards failed (%s); continuing", type(exc).__name__)
+        return
+    if reposted:
+        logger.info("[cora] posted %s replacement approval card(s) under Cora's app", reposted)
+
+
 def _sweep_until_stopped(services: CoraServices, stop: threading.Event) -> None:
     while not stop.wait(SWEEP_SECONDS):
         try:
@@ -311,6 +324,7 @@ def main(stop: Optional[threading.Event] = None) -> int:
         if stop.wait(SWEEP_SECONDS):
             return 0
         services = build_live_services(settings)
+    _adopt_open_cards(services)
     threading.Thread(target=_sweep_until_stopped, args=(services, stop), name="cora-sweep", daemon=True).start()
     logger.info("[cora] starting Socket Mode session (model %s, sweep every %ss)", config.model, SWEEP_SECONDS)
     while not stop.is_set():

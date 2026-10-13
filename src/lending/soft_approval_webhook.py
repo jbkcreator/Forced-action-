@@ -4,7 +4,8 @@ Served by lending-api (nginx /webhooks/lending/). Slack must be in HTTP mode (So
 URL set under Interactivity. Every request is signature-checked with LENDING_SLACK_SIGNING_SECRET; the
 route is closed (503) while the secret is unset. The form submission is acknowledged at once and the
 evaluation, rendering and storage run in a background task. Cora's approval cards belong to her own
-Slack app and never arrive here.
+Slack app; a click on a Cora card this app posted before that move retires the card (see
+:func:`_retire_moved_cora_card`) and changes nothing.
 """
 from __future__ import annotations
 
@@ -33,6 +34,32 @@ from src.lending.soft_approval.slack_card import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/webhooks/lending", tags=["lending"])
+
+# Approve / Revise / Reject buttons on Cora cards this app posted before Cora had her own app.
+_MOVED_CORA_ACTION_PREFIX = "agent_core_"
+MOVED_CORA_CARD_TEXT = (":arrows_counterclockwise: *This approval card has moved* to Cora's own Slack app. "
+                        "Use the newer card for this action in the Cora channel. Nothing was approved or sent "
+                        "from this card.")
+
+
+def is_moved_cora_click(payload: dict) -> bool:
+    actions = payload.get("actions") or []
+    return (payload.get("type") == "block_actions" and bool(actions)
+            and str(actions[0].get("action_id") or "").startswith(_MOVED_CORA_ACTION_PREFIX))
+
+
+def _retire_moved_cora_card(payload: dict) -> None:
+    """Replace the old card's buttons with a pointer to the new card. The draft itself is untouched:
+    Cora reposts open drafts under her own app at startup."""
+    channel = str((payload.get("channel") or {}).get("id") or "")
+    ts = str((payload.get("message") or {}).get("ts") or "")
+    if not (channel and ts):
+        return
+    try:
+        slack_client().chat_update(channel=channel, ts=ts, text=MOVED_CORA_CARD_TEXT, blocks=[
+            {"type": "section", "text": {"type": "mrkdwn", "text": MOVED_CORA_CARD_TEXT}}])
+    except Exception as exc:  # class only
+        logger.error("[soft-approval] retiring a moved Cora card failed: %s", type(exc).__name__)
 
 
 def _open_form(payload: dict) -> None:
@@ -105,12 +132,16 @@ async def slack_interactivity(request: Request, background: BackgroundTasks) -> 
         request.headers.get("X-Slack-Signature"), body,
     ):
         raise HTTPException(status_code=401, detail="Invalid signature")
-    if not get_settings().lending_soft_approval_enabled:
-        return {}
     try:
         payload: Optional[dict] = json.loads(parse_qs(body.decode()).get("payload", [""])[0])
     except ValueError:
         payload = None
+    # Checked before the soft-approval switch: an old Cora card must never look clickable but dead.
+    if isinstance(payload, dict) and is_moved_cora_click(payload):
+        background.add_task(_retire_moved_cora_card, payload)
+        return {}
+    if not get_settings().lending_soft_approval_enabled:
+        return {}
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Malformed payload")
     kind: Optional[str] = payload.get("type")

@@ -164,6 +164,46 @@ def test_sms_draft_takes_the_recipient_from_the_database(monkeypatch) -> None:
     assert "…0100" in draft.summary and "+1727" not in draft.summary
 
 
+@pytest.mark.parametrize("text_value", [
+    "We can do 100% rehab funding",
+    "Rates start at 9.5%",
+    "That's about $350,000 total",
+    "Around 400k purchase price",
+    "2 points at closing",
+    "Rate of 11 on this one",
+    "LTV up to 75 on purchase",
+    "The origination fee is 1,500",
+    "Monthly payment around 2,100",
+    "A 12-month term works",
+    "We usually go 90 percent of cost",
+])
+def test_borrower_drafts_that_quote_numbers_are_refused(text_value: str) -> None:
+    assert cora_tools.borrower_draft_problem({"body": text_value}) is not None
+
+
+@pytest.mark.parametrize("text_value", [
+    "Hi Laira, thanks for your fix and flip inquiry in Tampa. When are you hoping to close?",
+    "Do you have a property under contract? Reply STOP to opt out.",
+    "You mentioned 1 to 2 completed projects. Grab a time that works for you here.",
+    "Call me back at (727) 436-9951 when you have 10 minutes.",
+])
+def test_ordinary_borrower_drafts_pass(text_value: str) -> None:
+    assert cora_tools.borrower_draft_problem({"body": text_value}) is None
+
+
+def test_quoting_drafts_are_refused_before_any_lookup(monkeypatch) -> None:
+    toolkit = _toolkit(monkeypatch, SAM)
+    with pytest.raises(ToolInputError, match="never quote numbers"):
+        toolkit.draft_sms(DraftSmsInput(lead_ref="web_lead:7", body="Rates from 9.5%"), CONTEXT)
+    with pytest.raises(ToolInputError, match="subject"):
+        toolkit.draft_email(DraftEmailInput(lead_ref="web_lead:7", subject="Rates from 9.5%", body="Hi"), CONTEXT)
+
+
+def test_revision_check_covers_messages_but_not_stage_moves() -> None:
+    assert cora_tools.draft_content_check("ghl_email", {"subject": "Hi", "body": "Rates from 9.5%"})
+    assert cora_tools.draft_content_check("ghl_stage", {"stage": "Funded 2026"}) is None
+
+
 def test_draft_input_cannot_carry_a_phone_number() -> None:
     with pytest.raises(ValueError):
         DraftSmsInput(lead_ref="web_lead:7", body="x", to_phone="+19995550000")

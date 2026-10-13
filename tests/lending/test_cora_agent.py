@@ -71,8 +71,41 @@ def socket_runs(monkeypatch) -> list[dict]:
     return runs
 
 
-def _services(session="session", web="web") -> SimpleNamespace:
-    return SimpleNamespace(session=session, web_client=web)
+class _Gate:
+    def __init__(self, error: Exception | None = None) -> None:
+        self.adopted = 0
+        self._error = error
+
+    def adopt_cards(self) -> int:
+        self.adopted += 1
+        if self._error:
+            raise self._error
+        return 0
+
+
+def _services(session="session", web="web", gate: _Gate | None = None) -> SimpleNamespace:
+    return SimpleNamespace(session=session, web_client=web, gate=gate or _Gate())
+
+
+def test_main_adopts_open_cards_once_before_connecting(monkeypatch, socket_runs) -> None:
+    gate = _Gate()
+    stop = threading.Event()
+    monkeypatch.setattr(cora_agent, "get_settings", lambda: _settings())
+    monkeypatch.setattr(cora_agent, "build_live_services", lambda settings: _services(gate=gate))
+    monkeypatch.setattr(cora_agent, "run_sweep", lambda services: stop.set())
+    monkeypatch.setattr(cora_agent, "SWEEP_SECONDS", 0.01)
+    assert cora_agent.main(stop=stop) == 0
+    assert gate.adopted == 1 and len(socket_runs) == 1
+
+
+def test_a_failing_card_check_does_not_block_startup(monkeypatch, socket_runs) -> None:
+    stop = threading.Event()
+    monkeypatch.setattr(cora_agent, "get_settings", lambda: _settings())
+    monkeypatch.setattr(cora_agent, "build_live_services",
+                        lambda settings: _services(gate=_Gate(error=RuntimeError("db down"))))
+    monkeypatch.setattr(cora_agent, "run_sweep", lambda services: stop.set())
+    monkeypatch.setattr(cora_agent, "SWEEP_SECONDS", 0.01)
+    assert cora_agent.main(stop=stop) == 0 and len(socket_runs) == 1
 
 
 def test_main_refuses_to_start_without_approvers(monkeypatch) -> None:

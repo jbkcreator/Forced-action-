@@ -218,6 +218,8 @@ class FakeSocketClient:
         self.closed = False
 
     def connect(self) -> None:
+        if self.kwargs.get("fail"):
+            raise ConnectionError("socket refused")
         for envelope in self.envelopes:
             for listener in self.socket_mode_request_listeners:
                 listener(self, envelope)
@@ -246,3 +248,18 @@ def test_socket_mode_acks_routes_and_closes_on_stop(harness: Harness) -> None:
     assert client.acks == ["env-9"]
     assert [message.text for message in harness.messages] == ["hi"]
     assert client.closed
+
+
+def test_a_failed_connect_still_closes_the_client(harness: Harness) -> None:
+    """The SDK starts worker threads when the client is built; every failed attempt must close it."""
+    clients: list[FakeSocketClient] = []
+
+    def factory(**kwargs) -> FakeSocketClient:
+        clients.append(FakeSocketClient([], fail=True, **kwargs))
+        return clients[-1]
+
+    for _ in range(3):
+        with pytest.raises(ConnectionError):
+            run_socket_mode(harness.session, app_token="xapp-1", web_client="web", stop=threading.Event(),
+                            client_factory=factory)
+    assert len(clients) == 3 and all(client.closed for client in clients)
