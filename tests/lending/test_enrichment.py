@@ -521,3 +521,12 @@ def test_straddle_note_only_for_confirmed_credit_floor():
     # Straddle note for confirmed lender only; ABL's floor (placeholder) must not appear.
     assert any("RCN Capital" in s for s in view.straddles), "expected straddle note for RCN Capital"
     assert not any("ABL" in s for s in view.straddles), "ABL has no confirmed floor; no straddle note expected"
+
+
+def test_full_machine_card_says_assigned_to_josh_and_nurture_does_not():
+    """F2 (team lead 2026-10-13): FULL_MACHINE leads are assigned to Josh in the Slack card only."""
+    view = evaluate_fit(_lead(), address=None, matrix=_matrix())
+    full = service.render_card_text(7, "1 Main St", RoutingTag.FULL_MACHINE, None, view, coverage_note=None)
+    nurture = service.render_card_text(7, None, RoutingTag.NURTURE, None, view, coverage_note=None)
+    assert "closer priority, assigned to Josh" in full
+    assert "assigned to Josh" not in nurture

@@ -21,6 +21,8 @@ FIT_RULES_PENDING = "Lender rules pending confirmation"
 # Shown on a fitting lender whose cap values are still placeholder (A1: "subject to lender confirmation").
 FIT_SUBJECT_TO_CONFIRMATION = "subject to lender confirmation"
 CREDIT_STRADDLE_NOTE = "needs confirmation on the call"  # Josh A4
+# F2 (team lead, 2026-10-13, pending Josh): FULL_MACHINE leads are assigned to Josh; Slack only, no GHL task/stage/tag.
+FULL_MACHINE_ASSIGNEE_NOTE = "closer priority, assigned to Josh"
 
 # Comps shown in the deal thread (internal only; never sent to the borrower).
 COMPS_SHOWN = 5
@@ -28,7 +30,7 @@ OFFICERS_SHOWN = 5
 DEEDS_SHOWN = 3
 PERMITS_SHOWN = 3
 # The ARV engine normalises comps to a target repaired condition (1-5); 3 = "Average", the neutral value
-# the engine itself uses when condition is unknown. Josh has not specified one.
+# the engine itself uses when condition is unknown. F6 (team lead, 2026-10-13): keep 3, pending Josh.
 COMPS_AFTER_REPAIR_CONDITION = 3
 
 # Sweep: minutes to wait after the Nth failed attempt (last value repeats), give up after the cap.

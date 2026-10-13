@@ -188,3 +188,19 @@ _No entries yet._
 **Open confirmations (carry to PR):**
 - Q1 (task-analysis): Is the fit % kept hidden while any lender is unconfirmed? (assumed yes per original design; Josh hasn't contradicted this).
 - All F1–F7, R6, B8, D6 questions remain open per the task-analysis table.
+
+### 2026-10-13 — F1–F7 team-lead answers applied (feat/ndl-t12-fit-card-partial-rules)
+
+Answers are the team lead's approved defaults, not Josh's; each stays an open confirmation for Josh.
+
+| # | Team-lead answer | Code | Status |
+|---|---|---|---|
+| F1 | DB + Slack thread in dial-tasks channel; no GHL writes | Already so (`ports.default_deal_thread`) | Matches, no change |
+| F2 | Assign to Josh, post in Slack; no GHL task/stage/tag | Card now reads "closer priority, assigned to Josh" (`FULL_MACHINE_ASSIGNEE_NOTE`); test added | Changed |
+| F3 | No answer | Hillsborough + Pinellas only; Pasco not matched | **Open** |
+| F4 | >30 days and past → NURTURE; exactly 30 is in the window | Already so (`routing.route_lead`) | Matches |
+| F5 | We define fields and connect both; Slack form via PR #354; booking form waits on R4 | PR #354 is merged (not open); booking form unconnected | Matches; booking form blocked on R4 |
+| F6 | Condition 3 (Average) | `COMPS_AFTER_REPAIR_CONDITION = 3`, comment updated | Matches |
+| F7/R6 | Needs Josh; card shows "Not available" | `UnavailableStreetView` fallback | Matches; blocked on Josh |
+
+Still open: F3 (owner + decision), Q1 (fit % hidden while any lender unconfirmed — assumed yes), Josh's sign-off on F2 and F4.

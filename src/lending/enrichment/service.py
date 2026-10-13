@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 
 from config.lending_enrichment import (
     COVERED_STATE,
+    FULL_MACHINE_ASSIGNEE_NOTE,
     MAX_ATTEMPTS,
     NOT_AVAILABLE,
     RETRY_BACKOFF_MINUTES,
@@ -146,7 +147,7 @@ def _money(value: Any) -> str:
 
 def render_card_text(lead_id: int, address: Optional[str], tag: RoutingTag, facts: Optional[PropertyFacts],
                      fit: FitView, *, coverage_note: Optional[str]) -> str:
-    lines = [f"*LendingFlow lead #{lead_id}*: {tag.value}" + (" (closer priority)" if tag is RoutingTag.FULL_MACHINE else ""),
+    lines = [f"*LendingFlow lead #{lead_id}*: {tag.value}" + (f" ({FULL_MACHINE_ASSIGNEE_NOTE})" if tag is RoutingTag.FULL_MACHINE else ""),
              f"Property: {address or NOT_AVAILABLE}"]
     if facts is None:
         lines.append(f"Forced Action facts: {coverage_note or NOT_AVAILABLE}")
