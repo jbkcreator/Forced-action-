@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+from config.lending_prequal import BORROWER_CALLBACK_PHONE, BORROWER_SIGNER
 from config.lending_web import GHL_CONFIG_ERROR_STATUS_CODES
 from config.settings import get_settings
 from requests.exceptions import ConnectTimeout, RequestException
@@ -29,8 +30,8 @@ EMAIL_HTML = (
     "<p>Thanks for sending your request. Your pre-qualification estimate is attached.</p>"
     "<p>This is a non-binding estimate for informational purposes only. It is not a commitment "
     "to lend or an offer of specific terms. All figures are subject to lender confirmation.</p>"
-    "<p>Questions? Call or text (727) 436-9951, or reply to this email.</p>"
-    "<p>Josh Kantor, Loan Officer</p>"
+    f"<p>Questions? Call or text {BORROWER_CALLBACK_PHONE}, or reply to this email.</p>"
+    f"<p>{BORROWER_SIGNER}</p>"
 )
 
 
