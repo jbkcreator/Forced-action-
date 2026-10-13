@@ -18,6 +18,8 @@ BACKFLIP_KEY_PREFIX = "generic_backflip"
 
 NOT_AVAILABLE = "Not available"
 FIT_RULES_PENDING = "Lender rules pending confirmation"
+# Shown on a fitting lender whose cap values are still placeholder (A1: "subject to lender confirmation").
+FIT_SUBJECT_TO_CONFIRMATION = "subject to lender confirmation"
 CREDIT_STRADDLE_NOTE = "needs confirmation on the call"  # Josh A4
 
 # Comps shown in the deal thread (internal only; never sent to the borrower).

@@ -175,4 +175,16 @@ _No entries yet._
 
 ## T-12: Enrichment card + pipeline routing
 
-_No entries yet._
+### 2026-10-13 — T12-2: fit_card partial-rule model wired to T-05 (feat/ndl-t12-fit-card-partial-rules)
+
+**Done:** Wired `fit_card.evaluate_fit` to consume the T-05 partial-rule model (Josh A1, Oct 8).
+
+**Decisions applied:**
+- **T12-1 (rebase) already done**: `feat/ndl-t12-enrichment-card` commits are all in `feat/ndl-t05-lender-fit-gap-fix` history (T-12 is an ancestor). No rebase needed; new branch `feat/ndl-t12-fit-card-partial-rules` stacks on T-05.
+- **Score computation kept grouped** (`fully_confirmed` replaces `r.verified`; Backflip rows still counted as one lender). The T-05 evaluator's `lender_fit_score` counts raw rows (Q4 pending) and would give the wrong denominator (6 vs 5), so fit_card.py continues to compute the score itself on grouped lenders.
+- **`_straddles` uses `field_status_of(rules, "credit_floor") is FieldStatus.CONFIRMED`** instead of `rules.verified`. An unconfirmed floor is never straddled here; the evaluator already puts those lenders in `possible`.
+- **Note priority (A1):** `FIT_SUBJECT_TO_CONFIRMATION` ("subject to lender confirmation") takes priority over `FIT_RULES_PENDING` when at least one lender fits using placeholder cap values (`result.fitting` has a row with `subject_to_confirmation=True`). This is the case when a lender's eligibility is known but its cap fields are still placeholder.
+
+**Open confirmations (carry to PR):**
+- Q1 (task-analysis): Is the fit % kept hidden while any lender is unconfirmed? (assumed yes per original design; Josh hasn't contradicted this).
+- All F1–F7, R6, B8, D6 questions remain open per the task-analysis table.
