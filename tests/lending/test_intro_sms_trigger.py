@@ -41,6 +41,22 @@ class _Calls(list):
     status: dict
 
 
+@pytest.fixture(autouse=True)
+def intro_sms_on(monkeypatch):
+    """These tests pin the tag logic with the intro text switched on; the off switch has its own tests."""
+    monkeypatch.setattr(get_settings(), "lending_lendingflow_intro_sms_enabled", True)
+
+
+def test_intro_sms_switch_defaults_off():
+    from config.settings import AppSettings
+    assert AppSettings.model_fields["lending_lendingflow_intro_sms_enabled"].default is False
+
+
+def test_switch_off_means_no_ready_tag_even_for_a_clear_consented_lead(monkeypatch):
+    monkeypatch.setattr(get_settings(), "lending_lendingflow_intro_sms_enabled", False)
+    assert _intro_ready_tags({"consent_status": "present", "sms_clear": True}) == []
+
+
 @pytest.fixture
 def ghl_calls(monkeypatch):
     """Record every GHL call the sink makes; no pipeline stage is configured, whatever the local .env says."""
@@ -105,6 +121,12 @@ def test_lead_with_consent_gets_the_ready_tag_in_a_second_call_after_the_first(g
     steps = [c[1] for c in ghl_calls]
     assert steps.index("upsert") < steps.index("tags") < len(steps) - 1 - steps[::-1].index("tags")
     assert steps[-1] == "notes"  # the rest of the push is unchanged and still runs after the ready tag
+
+
+def test_switch_off_push_adds_no_ready_tag_call(ghl_calls, monkeypatch):
+    monkeypatch.setattr(get_settings(), "lending_lendingflow_intro_sms_enabled", False)
+    LendingFlowGhlSink(GhlAccount("k", "loc")).push(_lead("present"))
+    assert _tag_calls(ghl_calls) == [["lendingflow"]]
 
 
 def test_lead_without_consent_never_gets_the_ready_tag(ghl_calls):

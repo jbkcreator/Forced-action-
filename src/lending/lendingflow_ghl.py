@@ -17,6 +17,8 @@ from config.lending_lendingflow import (
     GHL_TAG_CONSENT_MISSING,
     GHL_TAG_INTRO_READY,
     GHL_TAG_LENDINGFLOW,
+    GHL_TAG_NO_LEAD_ID,
+    is_missing_lead_id,
 )
 from config.settings import get_settings
 from src.lending.ghl_account import GhlAccount, ghl_headers, lending_ghl_account
@@ -29,13 +31,18 @@ def _tags(lead: Mapping[str, Any]) -> list[str]:
     tags = [GHL_TAG_LENDINGFLOW]
     if lead["consent_status"] != "present":
         tags.append(GHL_TAG_CONSENT_MISSING)
+    if is_missing_lead_id(lead.get("vendor_lead_id") or ""):
+        tags.append(GHL_TAG_NO_LEAD_ID)
     return tags
 
 
 def _intro_ready_tags(lead: Mapping[str, Any]) -> list[str]:
     """The tag that starts the GHL intro-SMS workflow. Only for a lead with a consent certificate AND an explicit
     ``sms_clear`` flag, which ``deliver_pending`` sets after re-checking the current suppression list and
-    do-not-contact flag at push time. A lead without that flag is never tagged (fail closed)."""
+    do-not-contact flag at push time. A lead without that flag is never tagged (fail closed). Nothing is tagged
+    while ``LENDING_LENDINGFLOW_INTRO_SMS_ENABLED`` is off."""
+    if not get_settings().lending_lendingflow_intro_sms_enabled:
+        return []
     if lead["consent_status"] == "present" and lead.get("sms_clear") is True:
         return [GHL_TAG_INTRO_READY]
     return []
