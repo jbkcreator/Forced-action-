@@ -107,6 +107,23 @@ hard go-live prerequisite (section 5). The DND sync only runs while `fa-lending-
 - **Pipeline stage changed** -> `.../webhooks/lending/ghl-stage` (scoreboard "Showed", PR #326; lives on that branch, not this one,
   until merged).
 
+**When an opt-out webhook fails.** If `/ghl-opt-out` or `/ghl-text-consent` fails after GHL delivered it (most often a database
+outage), the payload is saved to `lending.webhook_failures` and an alert goes to `LENDING_OPS_CHANNEL` (GHL contact id and error class,
+never a phone or message). `python -m src.lending.webhook_failures` (cron */5) replays saved failures through the same handlers until
+they succeed; after 5 attempts it gives up and alerts again. A saved consent **grant** is never replayed over a newer refusal: if the number's consent was revoked after the grant failed, it is closed as superseded. If the save itself fails, the alert says the change is **not recorded**:
+re-run the GHL workflow for that contact once the database is healthy. Keyword STOPs are also re-synced by `ghl_dnd_backstop` (cron
+*/15); free-text opt-outs have only this path. Migration: `migrations/apply_lending_webhook_failures.py`.
+
+**Opt-out email address.** The site publishes `optout@nextdeallending.com`. `python -m src.lending.email_opt_out` (cron */5) reads
+the mailbox over IMAP, read-only, and acts only on mail addressed to `LENDING_OPTOUT_ADDRESS` (`To`, `Cc`, `Delivered-To`,
+`X-Original-To`), so it works with a dedicated `optout@` mailbox or with `optout@` forwarded into `hello@`: only the
+`LENDING_OPTOUT_IMAP_USER` / `_PASSWORD` change. Each opt-out email suppresses the sender's address and every US phone number in the
+subject or body (our own numbers excepted), sets do-not-contact, removes the numbers from the dialer and posts a masked note to
+`LENDING_OPS_CHANNEL`. Bounces and auto-replies are ignored. The IMAP search returns only mail addressed to the opt-out address, and
+every examined message is tracked in `lending.email_opt_out_messages` (migration `apply_lending_email_opt_out_messages.py`), so each
+sweep takes the oldest unsettled messages and no opt-out can be crowded out; a failed one is retried (10 attempts, then an ops
+alert). Looks back 30 days. Idle until the IMAP user and password are set.
+
 ## 5. Go-live sequence
 
 a. `PYTHONPATH=. python migrations/apply_lending_gl9_text_back.py` (idempotent; run after `apply_lending_call_dispositions_dialer.py`).
