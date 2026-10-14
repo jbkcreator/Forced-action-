@@ -7,7 +7,8 @@ the server stores that verbatim and records whether it still matches this consta
 from __future__ import annotations
 
 SMS_CONSENT_TEXT = (
-    "I agree that Next Deal Lending may call and text me at the number above about my inquiry, "
+    "I agree that Next Deal Lending may call and text me at the number above with transactional messages "
+    "about my inquiry, such as replies, missed-call follow-ups, and call confirmations and reminders, "
     "including with automated technology. Consent is not a condition of any financing. "
     "Calls are recorded. Message frequency varies and message and data rates may apply. "
     "Reply STOP to opt out, HELP for help."
