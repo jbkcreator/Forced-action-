@@ -771,3 +771,29 @@ class LendingUncalledAlarm(LendingBase):
                         name="ck_lending_uncalled_alarms_reason"),
         Index("idx_lending_uncalled_alarms_open", "arrived_at", postgresql_where=text("resolved_at IS NULL")),
     )
+
+
+class LendingWebhookFailure(LendingBase):
+    """A GHL opt-out or consent webhook call that failed after it was received (for example while the database
+    was unavailable). ``payload`` is the body GHL sent, replayed by ``src.lending.webhook_failures`` through the
+    same handler until it succeeds; ``gave_up_at`` is set after MAX_RETRY_ATTEMPTS and ops is alerted once.
+    ``endpoint``: ghl_opt_out / ghl_text_consent. ``last_error`` is an exception class only, no PII."""
+
+    __tablename__ = "webhook_failures"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    endpoint: Mapped[str] = mapped_column(String(40), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    ghl_contact_id: Mapped[Optional[str]] = mapped_column(String(64))
+    last_error: Mapped[Optional[str]] = mapped_column(String(200))
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False,
+                                                 server_default=text("now()"))
+    last_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    gave_up_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        Index("idx_lending_webhook_failures_open", "created_at",
+              postgresql_where=text("resolved_at IS NULL AND gave_up_at IS NULL")),
+    )

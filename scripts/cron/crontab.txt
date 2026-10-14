@@ -1239,6 +1239,14 @@ COUNTY_ID=hillsborough
 # lending, in case the GHL "DND changed" workflow webhook is missing or down. Idempotent.
 */15 * * * * $PROJECT/scripts/cron/run.sh src.lending.ghl_dnd_backstop
 
+# Lending opt-out mailbox: email sent to LENDING_OPTOUT_ADDRESS is suppressed (address + any phone in it) and
+# posted to LENDING_OPS_CHANNEL. Reads the mailbox read-only over IMAP; idle until LENDING_OPTOUT_IMAP_USER/_PASSWORD are set.
+*/5 * * * * $PROJECT/scripts/cron/run.sh src.lending.email_opt_out
+
+# Lending opt-out webhook recovery: replays GHL opt-out / consent webhook calls that failed (saved in
+# lending.webhook_failures) until they succeed; alerts LENDING_OPS_CHANNEL when one is given up.
+*/5 * * * * $PROJECT/scripts/cron/run.sh src.lending.webhook_failures
+
 # OFR mortgage-broker refresh (WP-W0-1 Pool 3) — MONTHLY.
 # OFR publishes the MBR-MBRB file monthly; this downloads + unzips + loads it
 # into ofr_mortgage_brokers (Pool 3's source). Runs 1st of month 05:00 UTC,
