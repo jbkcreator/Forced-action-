@@ -5,6 +5,7 @@ No database: the save, the session and the handlers are scripted.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -46,8 +47,9 @@ def test_when_the_save_also_fails_the_alert_says_it_is_not_recorded():
 class FakeDb:
     """Records statements; begin_nested rolls nothing back but lets exceptions through like a savepoint."""
 
-    def __init__(self, rows):
+    def __init__(self, rows, revoked_since: bool = False):
         self.rows = rows
+        self.revoked_since = revoked_since  # answer to "was this number's consent revoked after the failure?"
         self.updates: list[dict] = []
 
     @contextmanager
@@ -56,19 +58,24 @@ class FakeDb:
 
     def execute(self, statement, params=None):
         sql = str(statement)
+        if "revoked_at >=" in sql:
+            return SimpleNamespace(scalar=lambda: self.revoked_since)
         if sql.lstrip().startswith("SELECT"):
             return SimpleNamespace(all=lambda: self.rows)
         self.updates.append({"sql": sql, **(params or {})})
         return SimpleNamespace()
 
 
-def _row(failure_id=1, endpoint=GHL_TEXT_CONSENT, attempts=1):
-    return SimpleNamespace(id=failure_id, endpoint=endpoint, payload=dict(BODY), ghl_contact_id="ghl-c-42",
-                           attempts=attempts)
+FAILED_AT = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
 
 
-def _sweep(monkeypatch, rows, handler):
-    db = FakeDb(rows)
+def _row(failure_id=1, endpoint=GHL_TEXT_CONSENT, attempts=1, payload=None):
+    return SimpleNamespace(id=failure_id, endpoint=endpoint, payload=dict(payload or BODY), ghl_contact_id="ghl-c-42",
+                           attempts=attempts, created_at=FAILED_AT)
+
+
+def _sweep(monkeypatch, rows, handler, revoked_since: bool = False):
+    db = FakeDb(rows, revoked_since=revoked_since)
 
     @contextmanager
     def session():
@@ -151,3 +158,45 @@ def test_an_invalid_payload_is_a_422_and_not_reported_as_a_failure(client, monke
     response = test_client.post("/webhooks/lending/ghl-opt-out", json={"contact_id": "x"},
                                 headers={"X-Webhook-Secret": SECRET})
     assert response.status_code == 422 and reported == []
+
+
+# ---- a replayed consent grant never overrides a newer refusal ------------------------------------------------
+
+GRANT = {"source": "inbound_text", "contact_id": "ghl-c-42", "phone": PHONE, "message": "Yes, call me tomorrow"}
+
+
+def test_a_failed_grant_is_not_replayed_after_a_newer_revocation(monkeypatch):
+    """Saved grant, then a newer 'not interested' revokes consent, then the sweep: texting must stay blocked."""
+    replayed: list[dict] = []
+    result, db, alerts = _sweep(monkeypatch, [_row(payload=GRANT)], lambda db, body: replayed.append(body),
+                                revoked_since=True)
+    assert replayed == [] and result.superseded == 1 and result.resolved == 0 and alerts == []
+    assert "superseded_by_newer_revocation" in db.updates[0]["sql"]
+
+
+def test_a_failed_grant_is_replayed_when_nothing_revoked_it_since(monkeypatch):
+    replayed: list[dict] = []
+    result, _, _ = _sweep(monkeypatch, [_row(payload=GRANT)], lambda db, body: replayed.append(body),
+                          revoked_since=False)
+    assert replayed == [GRANT] and result.resolved == 1
+
+
+@pytest.mark.parametrize("payload", [
+    {"source": "inbound_text", "phone": PHONE, "message": "STOP"},
+    {"source": "inbound_text", "phone": PHONE, "message": "not interested"},
+])
+def test_an_opt_out_or_decline_is_always_replayed(monkeypatch, payload):
+    replayed: list[dict] = []
+    result, _, _ = _sweep(monkeypatch, [_row(payload=payload)], lambda db, body: replayed.append(body),
+                          revoked_since=True)
+    assert replayed == [payload] and result.resolved == 1
+
+
+def test_granted_phone_matches_what_the_handler_would_grant():
+    from src.lending.ghl_consent_events import granted_phone
+
+    assert granted_phone(GRANT) == PHONE
+    assert granted_phone({**GRANT, "message": "STOP"}) is None
+    assert granted_phone({**GRANT, "message": "please don't text me"}) is None
+    assert granted_phone({"source": "web_form", "phone": PHONE, "consent": "checked"}) == PHONE
+    assert granted_phone({"source": "web_form", "phone": PHONE, "consent": ""}) is None

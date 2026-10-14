@@ -4,7 +4,9 @@ When the opt-out or consent webhook fails after GHL delivered it (most often bec
 unavailable), ``report_webhook_failure`` alerts the ops channel and saves the payload. The Slack alert does not
 need the database, so it still goes out when the save fails too; it then says the event must be replayed by
 hand. ``retry_pending`` (cron, every 5 minutes) replays saved payloads through the same handlers the webhooks
-use, until they succeed or MAX_RETRY_ATTEMPTS is reached, when ops is alerted once more.
+use, until they succeed or MAX_RETRY_ATTEMPTS is reached, when ops is alerted once more. A replayed consent
+grant never overrides a newer refusal: if the number's consent was revoked after the grant first failed, the
+grant is closed as superseded instead of applied.
 
 Alerts carry the GHL contact id, the endpoint and the error class: never a phone number or message text.
 Keyword STOPs are also covered by the 15-minute GHL DND backstop; free-text opt-outs are covered only here.
@@ -23,7 +25,13 @@ from typing import Any, Optional
 from sqlalchemy import text
 
 from src.lending.db import lending_session
-from src.lending.ghl_consent_events import InvalidEvent, contact_id_of, record_ghl_opt_out, record_inbound_consent
+from src.lending.ghl_consent_events import (
+    InvalidEvent,
+    contact_id_of,
+    granted_phone,
+    record_ghl_opt_out,
+    record_inbound_consent,
+)
 from src.lending.ops_alerts import post_ops_alert
 
 logger = logging.getLogger(__name__)
@@ -43,10 +51,18 @@ _INSERT = text(
     "VALUES (:endpoint, CAST(:payload AS jsonb), :contact, :error, 1, now()) RETURNING id"
 )
 _OPEN = text(
-    "SELECT id, endpoint, payload, ghl_contact_id, attempts FROM lending.webhook_failures "
+    "SELECT id, endpoint, payload, ghl_contact_id, attempts, created_at FROM lending.webhook_failures "
     "WHERE resolved_at IS NULL AND gave_up_at IS NULL ORDER BY id LIMIT :limit FOR UPDATE SKIP LOCKED"
 )
 _RESOLVED = text("UPDATE lending.webhook_failures SET resolved_at = now(), last_attempt_at = now() WHERE id = :id")
+# A consent grant is older than any revocation made after it failed: replaying it would undo a newer refusal.
+_REVOKED_SINCE = text(
+    "SELECT EXISTS (SELECT 1 FROM lending.text_consents WHERE phone = :phone AND revoked_at >= :since)"
+)
+_SUPERSEDED = text(
+    "UPDATE lending.webhook_failures SET resolved_at = now(), last_attempt_at = now(), "
+    "last_error = 'superseded_by_newer_revocation' WHERE id = :id"
+)
 _FAILED_AGAIN = text(
     "UPDATE lending.webhook_failures SET attempts = :attempts, last_error = :error, last_attempt_at = now(), "
     "gave_up_at = CASE WHEN :give_up THEN now() ELSE NULL END WHERE id = :id"
@@ -92,14 +108,29 @@ def report_webhook_failure(endpoint: str, body: dict[str, Any], error: BaseExcep
 @dataclass
 class RetryResult:
     resolved: int = 0
+    superseded: int = 0
     still_failing: int = 0
     gave_up: int = 0
     alerts: list[str] = field(default_factory=list)
 
 
+def _superseded_grant(db, endpoint: str, payload: dict[str, Any], failed_at) -> bool:
+    """True for a consent grant whose number had its consent revoked after this event first failed. Only grants
+    are checked: an opt-out or a decline is always safe to replay, since it can only narrow permission."""
+    if endpoint != GHL_TEXT_CONSENT:
+        return False
+    phone = granted_phone(payload)
+    return bool(phone and db.execute(_REVOKED_SINCE, {"phone": phone, "since": failed_at}).scalar())
+
+
 def _retry_one(db, row, result: RetryResult) -> None:
     handler = ENDPOINT_HANDLERS.get(row.endpoint)
     payload = row.payload if isinstance(row.payload, dict) else json.loads(row.payload)
+    if _superseded_grant(db, row.endpoint, payload, row.created_at):
+        db.execute(_SUPERSEDED, {"id": row.id})
+        result.superseded += 1
+        logger.info("[lending-webhook-failure] #%s not replayed: consent was revoked after it failed", row.id)
+        return
     try:
         with db.begin_nested():
             if handler is None:
@@ -147,9 +178,9 @@ def main() -> int:
     except Exception as exc:  # class only
         logger.error("[lending-webhook-failure] retry sweep failed: %s", type(exc).__name__)
         return 1
-    if result.resolved or result.still_failing or result.gave_up:
-        logger.info("[lending-webhook-failure] resolved=%d still_failing=%d gave_up=%d", result.resolved,
-                    result.still_failing, result.gave_up)
+    if result.resolved or result.superseded or result.still_failing or result.gave_up:
+        logger.info("[lending-webhook-failure] resolved=%d superseded=%d still_failing=%d gave_up=%d",
+                    result.resolved, result.superseded, result.still_failing, result.gave_up)
     return 0
 
 

@@ -77,6 +77,22 @@ def record_ghl_opt_out(db, body: dict[str, Any]) -> Optional[int]:
                              channel=OptOutChannel.GHL)
 
 
+def granted_phone(body: dict[str, Any]) -> Optional[str]:
+    """The phone a consent event would grant texting permission for, or None when it grants nothing (an
+    opt-out, a decline, an unchecked box, an empty reply or an invalid payload). Same rules as
+    :func:`record_inbound_consent`, without touching the database."""
+    source = field(body, "source")
+    phone = normalize(field(body, "phone"))
+    if source not in CONSENT_SOURCES or not phone:
+        return None
+    if source == "inbound_text":
+        tokens = message_tokens(body)
+        if not tokens or is_hard_opt_out(tokens) or is_soft_decline(tokens):
+            return None
+        return phone
+    return phone if str(field(body, "consent") or "").strip().lower() in _TRUTHY else None
+
+
 def record_inbound_consent(db, body: dict[str, Any]) -> dict[str, bool]:
     """A GHL workflow reports text consent. ``web_form``: the lead form's consent box (only a checked box
     counts). ``inbound_text``: the contact texted the Next Deal Lending number; a hard opt-out revokes and

@@ -8,9 +8,15 @@ read-only: nothing is marked read, moved or deleted.
 Each opt-out goes through ``compliance.propagate_opt_out`` (channel ``email``): the sender's address, and every
 US phone number written in the subject or body, is suppressed, set do-not-contact and removed from the dialer.
 A phone number in a signature is therefore blocked too; failing that way is the safe direction. Our own
-business numbers, which appear in quoted replies, are never suppressed. Each message is keyed by a hash of its
-Message-ID, so re-reading the mailbox never records an opt-out twice. Each new opt-out is posted to the ops
+business numbers, which appear in quoted replies, are never suppressed. Each new opt-out is posted to the ops
 channel with the address masked and no phone number.
+
+Nothing can be skipped. The IMAP search itself returns only mail addressed to the opt-out address, and every
+examined message is recorded in ``lending.email_opt_out_messages`` (keyed by a hash of its Message-ID). Each
+sweep drops settled messages before taking its batch, oldest first, so an unprocessed opt-out is always reached,
+however much mail arrives after it. A failed attempt is retried on later sweeps (up to MAX_MESSAGE_ATTEMPTS, then
+ops is alerted); an unreadable message is alerted at once. The opt-out itself is also keyed by Message-ID, so a
+message is never recorded twice.
 
 Logs carry message keys and counts only, never addresses, phone numbers or message text.
 
@@ -23,13 +29,13 @@ import hashlib
 import imaplib
 import logging
 import re
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from email import message_from_bytes, policy
 from email.message import EmailMessage
 from email.utils import getaddresses, parseaddr
-from typing import Optional
+from typing import Optional, Protocol
 
 from sqlalchemy import text
 
@@ -44,8 +50,9 @@ from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
 
-LOOKBACK_DAYS = 7
+LOOKBACK_DAYS = 30
 MAX_MESSAGES_PER_RUN = 200
+MAX_MESSAGE_ATTEMPTS = 10
 IMAP_TIMEOUT_SECONDS = 30
 SOURCE_REF_PREFIX = "email:"
 
@@ -129,51 +136,174 @@ def record_opt_out(db, opt_out: EmailOptOut) -> Optional[int]:
     return event_id
 
 
-def fetch_recent_messages(*, host: str, port: int, user: str, password: str, since: date) -> Iterator[bytes]:
-    """Raw messages received since ``since``, newest last, at most MAX_MESSAGES_PER_RUN. Read-only."""
-    with imaplib.IMAP4_SSL(host, port, timeout=IMAP_TIMEOUT_SECONDS) as imap:
-        imap.login(user, password)
-        imap.select("INBOX", readonly=True)
-        _, data = imap.search(None, "SINCE", since.strftime("%d-%b-%Y"))
-        for number in (data[0] or b"").split()[-MAX_MESSAGES_PER_RUN:]:
-            _, parts = imap.fetch(number, "(BODY.PEEK[])")
-            raw = next((part[1] for part in parts if isinstance(part, tuple)), None)
-            if raw:
-                yield raw
+def header_key(header_bytes: bytes) -> str:
+    """The tracking key of a message from its headers alone, so a settled message is never fetched in full again:
+    a hash of the Message-ID, or of the whole header block when a message has none."""
+    message = message_from_bytes(header_bytes, policy=policy.default)
+    message_id = str(message.get("Message-ID", "")).strip()
+    return hashlib.sha256((message_id or header_bytes.decode("latin-1")).encode("utf-8")).hexdigest()[:40]
 
 
-def process_messages(raw_messages: Iterable[bytes], *, optout_address: str, own_numbers: frozenset[str],
-                     session_factory: Callable = lending_session,
-                     notify: Callable[[str], bool] = post_ops_alert) -> int:
-    """Record every new opt-out, one transaction each, and alert once per new one. Returns how many were new."""
-    recorded = 0
-    for raw in raw_messages:
-        try:
-            opt_out = parse_opt_out(raw, optout_address=optout_address, own_numbers=own_numbers)
-        except Exception as exc:  # a malformed message must not stop the rest
-            logger.warning("[lending-email-opt-out] unreadable message skipped: %s", type(exc).__name__)
-            continue
-        if opt_out is None:
-            continue
-        try:
-            with session_factory() as db:
-                event_id = record_opt_out(db, opt_out)
-        except Exception as exc:  # class only: SQL errors embed bound parameters (addresses, phones)
-            logger.error("[lending-email-opt-out] opt-out %s not recorded: %s", opt_out.key, type(exc).__name__)
-            continue
-        if event_id is None:
-            continue
-        recorded += 1
-        logger.info("[lending-email-opt-out] recorded opt-out %s (event %s, %d phone(s))", opt_out.key, event_id,
-                    len(opt_out.phones))
-        phones_note = f" and {len(opt_out.phones)} phone number(s) from the message" if opt_out.phones else ""
-        notify(f":no_entry: Opt-out email from {mask_emails(opt_out.sender)}: suppressed the address{phones_note} "
-               f"(texts, calls and the dialer). Opt-out event #{event_id}.")
-    return recorded
+class Mailbox(Protocol):
+    def matching_ids(self, since: date) -> list[bytes]:
+        """Messages since ``since`` addressed to the opt-out address (filtered on the server), oldest first."""
+
+    def header_key(self, message_number: bytes) -> str: ...
+
+    def raw(self, message_number: bytes) -> bytes: ...
+
+
+class ImapMailbox:
+    """The live mailbox, opened read-only: nothing is marked read, moved or deleted."""
+
+    def __init__(self, *, host: str, port: int, user: str, password: str, optout_address: str) -> None:
+        self._host, self._port, self._user, self._password = host, port, user, password
+        self._address = optout_address.strip().lower()
+        self._imap: Optional[imaplib.IMAP4_SSL] = None
+
+    def __enter__(self) -> "ImapMailbox":
+        self._imap = imaplib.IMAP4_SSL(self._host, self._port, timeout=IMAP_TIMEOUT_SECONDS)
+        self._imap.login(self._user, self._password)
+        self._imap.select("INBOX", readonly=True)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self._imap is not None:
+            try:
+                self._imap.logout()
+            except Exception:  # the session may already be gone
+                pass
+
+    def matching_ids(self, since: date) -> list[bytes]:
+        quoted = f'"{self._address}"'
+        # OR (OR To Cc) (OR Delivered-To X-Original-To): only opt-out mail comes back, so other mail in a shared
+        # inbox never competes for the sweep. parse_opt_out still checks the headers exactly.
+        _, data = self._imap.search(None, "SINCE", since.strftime("%d-%b-%Y"), "OR", "OR", "TO", quoted, "CC", quoted,
+                                    "OR", "HEADER", "Delivered-To", quoted, "HEADER", "X-Original-To", quoted)
+        return (data[0] or b"").split()
+
+    def _fetch(self, message_number: bytes, part: str) -> bytes:
+        _, parts = self._imap.fetch(message_number, f"({part})")
+        return next((piece[1] for piece in parts if isinstance(piece, tuple)), b"") or b""
+
+    def header_key(self, message_number: bytes) -> str:
+        message_id = self._fetch(message_number, "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]")
+        if b":" in message_id:
+            return header_key(message_id)
+        return header_key(self._fetch(message_number, "BODY.PEEK[HEADER]"))
+
+    def raw(self, message_number: bytes) -> bytes:
+        return self._fetch(message_number, "BODY.PEEK[]")
+
+
+class MessageLog(Protocol):
+    def settled(self, keys: set[str]) -> set[str]:
+        """The keys that need no further work (recorded, not an opt-out, given up or unreadable)."""
+
+    def mark(self, key: str, outcome: str, *, event_id: Optional[int] = None, error: Optional[str] = None) -> None: ...
+
+    def mark_failed(self, key: str, error: str) -> int:
+        """Record a failed attempt; returns the attempt count."""
+
+
+class SqlMessageLog:
+    """``lending.email_opt_out_messages``: durable progress across sweeps."""
+
+    _SETTLED = text("SELECT message_key FROM lending.email_opt_out_messages "
+                    "WHERE message_key = ANY(:keys) AND outcome <> 'failed'")
+    _MARK = text(
+        "INSERT INTO lending.email_opt_out_messages (message_key, outcome, opt_out_event_id, last_error) "
+        "VALUES (:key, :outcome, :event_id, :error) ON CONFLICT (message_key) DO UPDATE SET "
+        "outcome = EXCLUDED.outcome, opt_out_event_id = COALESCE(EXCLUDED.opt_out_event_id, "
+        "lending.email_opt_out_messages.opt_out_event_id), last_error = EXCLUDED.last_error, last_attempt_at = now()"
+    )
+    _FAILED = text(
+        "INSERT INTO lending.email_opt_out_messages (message_key, outcome, attempts, last_error) "
+        "VALUES (:key, 'failed', 1, :error) ON CONFLICT (message_key) DO UPDATE SET outcome = 'failed', "
+        "attempts = lending.email_opt_out_messages.attempts + 1, last_error = EXCLUDED.last_error, "
+        "last_attempt_at = now() RETURNING attempts"
+    )
+
+    def __init__(self, session_factory: Callable = lending_session) -> None:
+        self._session_factory = session_factory
+
+    def settled(self, keys: set[str]) -> set[str]:
+        if not keys:
+            return set()
+        with self._session_factory() as db:
+            return set(db.execute(self._SETTLED, {"keys": sorted(keys)}).scalars().all())
+
+    def mark(self, key: str, outcome: str, *, event_id: Optional[int] = None, error: Optional[str] = None) -> None:
+        with self._session_factory() as db:
+            db.execute(self._MARK, {"key": key, "outcome": outcome, "event_id": event_id, "error": error})
+
+    def mark_failed(self, key: str, error: str) -> int:
+        with self._session_factory() as db:
+            return int(db.execute(self._FAILED, {"key": key, "error": error}).scalar_one())
+
+
+@dataclass
+class SweepResult:
+    examined: int = 0
+    recorded: int = 0
+    failed: int = 0
+
+
+def _process_one(mailbox: Mailbox, log: MessageLog, message_number: bytes, key: str, *, optout_address: str,
+                 own_numbers: frozenset[str], session_factory: Callable, notify: Callable[[str], bool],
+                 result: SweepResult) -> None:
+    try:
+        opt_out = parse_opt_out(mailbox.raw(message_number), optout_address=optout_address, own_numbers=own_numbers)
+    except Exception as exc:  # unreadable: needs a person, retrying will not help
+        log.mark(key, "unreadable", error=type(exc).__name__)
+        notify(f":warning: An email to the opt-out address could not be read ({type(exc).__name__}, message {key}). "
+               "Please check the opt-out mailbox and record the opt-out by hand if it is one.")
+        return
+    if opt_out is None:
+        log.mark(key, "not_opt_out")
+        return
+    try:
+        with session_factory() as db:
+            event_id = record_opt_out(db, opt_out)
+    except Exception as exc:  # class only: SQL errors embed bound parameters (addresses, phones)
+        result.failed += 1
+        attempts = log.mark_failed(key, type(exc).__name__)
+        logger.error("[lending-email-opt-out] opt-out %s not recorded (attempt %d): %s", key, attempts,
+                     type(exc).__name__)
+        if attempts >= MAX_MESSAGE_ATTEMPTS:
+            log.mark(key, "gave_up", error=type(exc).__name__)
+            notify(f":rotating_light: An opt-out email from {mask_emails(opt_out.sender)} could not be recorded after "
+                   f"{attempts} attempts ({type(exc).__name__}, message {key}). It is NOT recorded: record it by hand.")
+        return
+    log.mark(key, "recorded", event_id=event_id)
+    if event_id is None:
+        return
+    result.recorded += 1
+    logger.info("[lending-email-opt-out] recorded opt-out %s (event %s, %d phone(s))", key, event_id,
+                len(opt_out.phones))
+    phones_note = f" and {len(opt_out.phones)} phone number(s) from the message" if opt_out.phones else ""
+    notify(f":no_entry: Opt-out email from {mask_emails(opt_out.sender)}: suppressed the address{phones_note} "
+           f"(texts, calls and the dialer). Opt-out event #{event_id}.")
+
+
+def sweep(mailbox: Mailbox, log: MessageLog, *, since: date, optout_address: str, own_numbers: frozenset[str],
+          session_factory: Callable = lending_session, notify: Callable[[str], bool] = post_ops_alert,
+          limit: int = MAX_MESSAGES_PER_RUN) -> SweepResult:
+    """Settle up to ``limit`` unsettled opt-out messages, oldest first. Settled messages are skipped before the
+    limit is applied, so an unprocessed opt-out is always reached in a later sweep, however much mail follows it."""
+    result = SweepResult()
+    keyed = [(number, mailbox.header_key(number)) for number in mailbox.matching_ids(since)]
+    settled = log.settled({key for _, key in keyed})
+    pending = [(number, key) for number, key in keyed if key not in settled][:limit]
+    for number, key in pending:
+        result.examined += 1
+        _process_one(mailbox, log, number, key, optout_address=optout_address, own_numbers=own_numbers,
+                     session_factory=session_factory, notify=notify, result=result)
+    return result
 
 
 def run(now: Optional[datetime] = None) -> int:
-    """One pass. Returns 0 on success or when not configured, 1 when the mailbox could not be read."""
+    """One pass. Returns 0 on success or when not configured, 1 when the mailbox or the database failed."""
     settings = get_settings()
     password = settings.lending_optout_imap_password
     if not (settings.lending_optout_imap_user and password):
@@ -181,15 +311,16 @@ def run(now: Optional[datetime] = None) -> int:
         return 0
     since = (now or datetime.now(timezone.utc)).date() - timedelta(days=LOOKBACK_DAYS)
     try:
-        raw_messages = list(fetch_recent_messages(
-            host=settings.lending_optout_imap_host, port=settings.lending_optout_imap_port,
-            user=settings.lending_optout_imap_user, password=password.get_secret_value(), since=since))
-    except Exception as exc:  # class only: IMAP errors can echo the login
-        logger.error("[lending-email-opt-out] mailbox could not be read: %s", type(exc).__name__)
+        with ImapMailbox(host=settings.lending_optout_imap_host, port=settings.lending_optout_imap_port,
+                         user=settings.lending_optout_imap_user, password=password.get_secret_value(),
+                         optout_address=settings.lending_optout_address) as mailbox:
+            result = sweep(mailbox, SqlMessageLog(), since=since, optout_address=settings.lending_optout_address,
+                           own_numbers=own_business_numbers())
+    except Exception as exc:  # class only: IMAP and SQL errors can echo the login or addresses
+        logger.error("[lending-email-opt-out] sweep failed: %s", type(exc).__name__)
         return 1
-    recorded = process_messages(raw_messages, optout_address=settings.lending_optout_address,
-                                own_numbers=own_business_numbers())
-    logger.info("[lending-email-opt-out] checked %d message(s), %d new opt-out(s)", len(raw_messages), recorded)
+    logger.info("[lending-email-opt-out] examined %d message(s), %d new opt-out(s), %d failed", result.examined,
+                result.recorded, result.failed)
     return 0
 
 

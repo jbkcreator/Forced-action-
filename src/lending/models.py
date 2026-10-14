@@ -797,3 +797,28 @@ class LendingWebhookFailure(LendingBase):
         Index("idx_lending_webhook_failures_open", "created_at",
               postgresql_where=text("resolved_at IS NULL AND gave_up_at IS NULL")),
     )
+
+
+class LendingEmailOptOutMessage(LendingBase):
+    """One row per message the opt-out mailbox listener has examined, keyed like the opt-out itself (a hash of
+    the Message-ID), so every sweep fetches only messages it has not settled: a burst of other mail can never push
+    an unprocessed opt-out out of a sweep. ``outcome``: recorded (an opt-out, new or already known) /
+    not_opt_out (not addressed to the opt-out address, or a bounce / auto-reply) / failed (retried until
+    MAX_MESSAGE_ATTEMPTS) / gave_up (ops alerted) / unreadable (ops alerted). No addresses or message text."""
+
+    __tablename__ = "email_opt_out_messages"
+
+    message_key: Mapped[str] = mapped_column(String(40), primary_key=True)
+    outcome: Mapped[str] = mapped_column(String(20), nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
+    opt_out_event_id: Mapped[Optional[int]] = mapped_column(Integer)
+    last_error: Mapped[Optional[str]] = mapped_column(String(200))  # exception class only
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False,
+                                                    server_default=text("now()"))
+    last_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False,
+                                                      server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint("outcome IN ('recorded', 'not_opt_out', 'failed', 'gave_up', 'unreadable')",
+                        name="ck_lending_email_opt_out_messages_outcome"),
+    )

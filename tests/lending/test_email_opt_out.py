@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.lending import email_opt_out
-from src.lending.email_opt_out import EmailOptOut, parse_opt_out, process_messages
+from src.lending.email_opt_out import EmailOptOut, parse_opt_out
 
 OPTOUT = "optout@nextdeallending.com"
 OWN = frozenset({"+17274369951", "+16562211100"})
@@ -89,7 +89,50 @@ def _session():
     yield SimpleNamespace()
 
 
-def test_each_new_opt_out_is_recorded_once_and_alerted_without_pii(monkeypatch):
+class FakeMailbox:
+    """An inbox of raw messages; ``matching_ids`` filters by recipient like the IMAP search does."""
+
+    def __init__(self, messages: list[bytes]) -> None:
+        self.messages = messages
+        self.full_fetches: list[bytes] = []
+
+    def _message(self, number: bytes) -> bytes:
+        return self.messages[int(number) - 1]
+
+    def matching_ids(self, since) -> list[bytes]:
+        return [str(i).encode() for i, raw in enumerate(self.messages, start=1) if OPTOUT.encode() in raw.lower()]
+
+    def header_key(self, number: bytes) -> str:
+        raw = self._message(number)
+        return email_opt_out.header_key(raw.split(b"\n\n", 1)[0])
+
+    def raw(self, number: bytes) -> bytes:
+        self.full_fetches.append(number)
+        return self._message(number)
+
+
+class MemoryLog:
+    """In-memory stand-in for lending.email_opt_out_messages."""
+
+    def __init__(self) -> None:
+        self.rows: dict[str, dict] = {}
+
+    def settled(self, keys):
+        return {key for key in keys if key in self.rows and self.rows[key]["outcome"] != "failed"}
+
+    def mark(self, key, outcome, *, event_id=None, error=None):
+        row = self.rows.setdefault(key, {"attempts": 1})
+        row.update(outcome=outcome, event_id=event_id)
+
+    def mark_failed(self, key, error):
+        row = self.rows.setdefault(key, {"attempts": 0})
+        row["attempts"] += 1
+        row["outcome"] = "failed"
+        return row["attempts"]
+
+
+def _recorder(monkeypatch):
+    """record_opt_out scripted: a new id per new key, None for one already recorded."""
     recorded: dict[str, int] = {}
 
     def fake_record(db, opt_out):
@@ -98,14 +141,61 @@ def test_each_new_opt_out_is_recorded_once_and_alerted_without_pii(monkeypatch):
         recorded[opt_out.key] = len(recorded) + 1
         return recorded[opt_out.key]
 
-    alerts: list[str] = []
     monkeypatch.setattr(email_opt_out, "record_opt_out", fake_record)
-    messages = [_raw(body="Remove 813-555-0123"), _raw(to="hello@nextdeallending.com"), _raw()]  # 3rd repeats 1st
-    count = process_messages(messages, optout_address=OPTOUT, own_numbers=OWN, session_factory=_session,
-                             notify=alerts.append)
-    assert count == 1 and len(alerts) == 1
-    assert "s***@example.com" in alerts[0] and "1 phone number" in alerts[0]
+    return recorded
+
+
+def _sweep(mailbox, log, alerts, limit=email_opt_out.MAX_MESSAGES_PER_RUN):
+    return email_opt_out.sweep(mailbox, log, since=None, optout_address=OPTOUT, own_numbers=OWN,
+                               session_factory=_session, notify=alerts.append, limit=limit)
+
+
+def test_each_new_opt_out_is_recorded_once_and_alerted_without_pii(monkeypatch):
+    _recorder(monkeypatch)
+    alerts: list[str] = []
+    mailbox, log = FakeMailbox([_raw(body="Remove 813-555-0123"), _raw(to="hello@nextdeallending.com")]), MemoryLog()
+    assert _sweep(mailbox, log, alerts).recorded == 1
+    assert _sweep(mailbox, log, alerts).recorded == 0  # settled: not fetched again
+    assert len(alerts) == 1 and "s***@example.com" in alerts[0] and "1 phone number" in alerts[0]
     assert "sam.lee@example.com" not in alerts[0].lower() and "555" not in alerts[0]
+    assert mailbox.full_fetches == [b"1"]
+
+
+def test_an_opt_out_followed_by_200_other_messages_is_still_recorded(monkeypatch):
+    """Other mail never competes for the sweep: the search returns only opt-out mail."""
+    _recorder(monkeypatch)
+    others = [_raw(to="hello@nextdeallending.com", message_id=f"<other{i}@example.com>") for i in range(200)]
+    mailbox, log = FakeMailbox([_raw(message_id="<optout@example.com>"), *others]), MemoryLog()
+    assert _sweep(mailbox, log, []).recorded == 1
+
+
+def test_a_backlog_larger_than_one_batch_is_cleared_over_later_sweeps(monkeypatch):
+    """Settled messages are dropped before the batch is taken, so later opt-outs are never crowded out."""
+    recorded = _recorder(monkeypatch)
+    messages = [_raw(sender=f"user{i}@example.com", message_id=f"<m{i}@example.com>") for i in range(250)]
+    mailbox, log = FakeMailbox(messages), MemoryLog()
+    assert _sweep(mailbox, log, [], limit=200).recorded == 200
+    assert _sweep(mailbox, log, [], limit=200).recorded == 50
+    assert _sweep(mailbox, log, [], limit=200).examined == 0
+    assert len(recorded) == 250
+
+
+def test_a_failed_opt_out_is_retried_on_later_sweeps_then_alerted(monkeypatch):
+    calls: list[str] = []
+
+    def failing(db, opt_out):
+        calls.append(opt_out.key)
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(email_opt_out, "record_opt_out", failing)
+    monkeypatch.setattr(email_opt_out, "MAX_MESSAGE_ATTEMPTS", 3)
+    alerts: list[str] = []
+    mailbox, log = FakeMailbox([_raw()]), MemoryLog()
+    for _ in range(4):
+        _sweep(mailbox, log, alerts)
+    assert len(calls) == 3  # retried until the limit, then settled as given up
+    assert len(alerts) == 1 and "NOT recorded" in alerts[0] and "sam.lee@example.com" not in alerts[0].lower()
+    assert next(iter(log.rows.values()))["outcome"] == "gave_up"
 
 
 def test_a_failure_on_one_message_does_not_stop_the_rest(monkeypatch):
@@ -119,9 +209,27 @@ def test_a_failure_on_one_message_does_not_stop_the_rest(monkeypatch):
 
     monkeypatch.setattr(email_opt_out, "record_opt_out", flaky_record)
     alerts: list[str] = []
-    count = process_messages([_raw(), _raw(message_id="<m2@example.com>"), b"\xff\xfe not an email"],
-                             optout_address=OPTOUT, own_numbers=OWN, session_factory=_session, notify=alerts.append)
-    assert count == 1 and len(calls) == 2 and len(alerts) == 1
+    mailbox, log = FakeMailbox([_raw(), _raw(message_id="<m2@example.com>")]), MemoryLog()
+    result = _sweep(mailbox, log, alerts)
+    assert result.recorded == 1 and result.failed == 1 and len(alerts) == 1
+
+
+def test_an_unreadable_message_is_alerted_once_and_not_retried(monkeypatch):
+    _recorder(monkeypatch)
+    monkeypatch.setattr(email_opt_out, "parse_opt_out", lambda raw, **kwargs: (_ for _ in ()).throw(ValueError()))
+    alerts: list[str] = []
+    mailbox, log = FakeMailbox([_raw()]), MemoryLog()
+    _sweep(mailbox, log, alerts)
+    _sweep(mailbox, log, alerts)
+    assert len(alerts) == 1 and "could not be read" in alerts[0] and mailbox.full_fetches == [b"1"]
+
+
+def test_the_header_key_matches_with_or_without_a_message_id():
+    with_id = _raw(message_id="<m1@example.com>")
+    assert email_opt_out.header_key(with_id.split(b"\n\n", 1)[0]) == email_opt_out.header_key(
+        b"Message-ID: <m1@example.com>\r\n")
+    without_id = b"From: sam@example.com\r\nTo: optout@nextdeallending.com\r\n"
+    assert len(email_opt_out.header_key(without_id)) == 40
 
 
 class ScriptedDb:
@@ -154,7 +262,7 @@ def test_an_already_recorded_opt_out_writes_nothing(monkeypatch):
 def test_without_mailbox_credentials_the_listener_does_nothing(monkeypatch):
     monkeypatch.setattr(email_opt_out, "get_settings", lambda: SimpleNamespace(
         lending_optout_imap_user="", lending_optout_imap_password=None))
-    monkeypatch.setattr(email_opt_out, "fetch_recent_messages", lambda **kwargs: pytest.fail("mailbox was read"))
+    monkeypatch.setattr(email_opt_out, "ImapMailbox", lambda **kwargs: pytest.fail("mailbox was opened"))
     assert email_opt_out.run() == 0
 
 
@@ -165,9 +273,15 @@ def test_an_unreadable_mailbox_is_reported_not_raised(monkeypatch):
         lending_optout_imap_user="hello@nextdeallending.com", lending_optout_imap_password=SecretStr("x"),
         lending_optout_imap_host="imap.example.com", lending_optout_imap_port=993, lending_optout_address=OPTOUT))
 
-    def refuse(**kwargs):
-        raise ConnectionRefusedError("imap down")
-        yield  # pragma: no cover - makes this a generator like the real one
+    class Refusing:
+        def __init__(self, **kwargs):
+            pass
 
-    monkeypatch.setattr(email_opt_out, "fetch_recent_messages", refuse)
+        def __enter__(self):
+            raise ConnectionRefusedError("imap down")
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(email_opt_out, "ImapMailbox", Refusing)
     assert email_opt_out.run() == 1
