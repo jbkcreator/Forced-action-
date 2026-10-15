@@ -19,6 +19,7 @@ Plus unit tests for:
 """
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, timezone
 from typing import Optional
@@ -1768,3 +1769,159 @@ def test_reseeding_never_adds_a_duplicate_of_a_renamed_lender(rdb):
     rdb.commit()
     assert seed(conn) == 0
     assert rdb.execute(text("SELECT COUNT(*) FROM lending.lender_routing_rules")).scalar() == 5
+
+
+# ── Slack lender form (R1.4: edit the rules from Slack, not a web screen) ─────
+
+def _form(action: str, *, lender: Optional[int] = None, value: str = "", types=(), states: str = "",
+          min_amount: str = "", max_amount: str = "", credit: str = "") -> dict:
+    def txt(raw):
+        return {"v": {"type": "plain_text_input", "value": raw}}
+
+    values = {
+        "action_b": {"v": {"type": "static_select", "selected_option": {"value": action}}},
+        "value_b": txt(value), "states_b": txt(states), "min_b": txt(min_amount), "max_b": txt(max_amount),
+        "credit_b": txt(credit),
+        "types_b": {"v": {"type": "multi_static_select", "selected_options": [{"value": t} for t in types]}},
+    }
+    if lender is not None:
+        values["lender_b"] = {"v": {"type": "static_select", "selected_option": {"value": str(lender)}}}
+    return values
+
+
+@pytest.fixture
+def slack_form(rdb, monkeypatch):
+    """The real submission handler on the test session, with Slack captured and Josh as the only editor."""
+    from contextlib import contextmanager
+
+    from src.lending.routing import slack_admin
+
+    posted: list[str] = []
+
+    class Client:
+        def chat_postMessage(self, channel, text):  # noqa: N802 - slack_sdk API name
+            posted.append(text)
+            return {"ts": f"{len(posted)}.0"}
+
+    @contextmanager
+    def session():
+        yield rdb
+
+    monkeypatch.setattr(slack_admin, "lending_session", session)
+    monkeypatch.setattr(slack_admin.notify, "_client", lambda: Client())
+    monkeypatch.setattr(slack_admin.notify, "_channel", lambda: "C-TEST")
+    monkeypatch.setattr(slack_admin, "allowed_user_ids", lambda: frozenset({"UJOSH"}))
+
+    def submit(values, user="UJOSH"):
+        payload = {"type": "view_submission", "user": {"id": user},
+                   "view": {"callback_id": slack_admin.CALLBACK_ID, "state": {"values": values}}}
+        return slack_admin.handle_submission(payload)
+
+    submit.posted = posted
+    return submit
+
+
+def test_slack_form_adds_a_lender_with_a_box_and_it_then_receives_a_matching_file(rdb, slack_form):
+    slack_form(_form("add_lender", value="Form Lender", types=[LOAN_TYPE_FLIP], states="fl"))
+    row = rdb.execute(text("SELECT id, agreement_status, priority FROM lending.lender_routing_rules"
+                           " WHERE name = 'Form Lender'")).one()
+    assert row.agreement_status == "pending"  # safe default: nothing routes until Josh signs it
+    assert rdb.execute(text("SELECT approved_states FROM lending.lender_product_boxes WHERE lender_id = :i"),
+                       {"i": row.id}).scalar() == ["FL"]
+    lead = _make_lead(rdb, phone_suffix="6101")
+    _route(rdb, lead)
+    assert _fr(rdb, lead)["status"] == "held"  # unsigned is invisible
+    assert slack_form(_form("agreement", lender=row.id, value="signed")) == {}
+    rdb.execute(text("UPDATE lending.file_routing SET status = 'unrouted' WHERE lead_id = :l"), {"l": lead})
+    rdb.commit()
+    _route(rdb, lead)
+    assert _fr(rdb, lead)["current_lender_name"] == "Form Lender"
+    changes = [m for m in slack_form.posted if "Lender rules changed" in m]
+    assert len(changes) == 2 and all("<@UJOSH>" in m for m in changes)
+
+
+def test_slack_form_pause_resume_cap_reorder_and_primary(rdb, slack_form):
+    a, b = _two_flip_lenders(rdb)
+    assert slack_form(_form("pause", lender=a)) == {}
+    assert rdb.execute(text("SELECT active FROM lending.lender_routing_rules WHERE id = :i"), {"i": a}).scalar() is False
+    slack_form(_form("resume", lender=a))
+    slack_form(_form("seat_cap", lender=a, value="3"))
+    assert rdb.execute(text("SELECT monthly_cap FROM lending.lender_routing_rules WHERE id = :i"), {"i": a}).scalar() == 3
+    slack_form(_form("seat_cap", lender=a, value="none"))
+    assert rdb.execute(text("SELECT monthly_cap FROM lending.lender_routing_rules WHERE id = :i"), {"i": a}).scalar() is None
+    slack_form(_form("move_down", lender=a))
+    order = [r[0] for r in rdb.execute(text("SELECT id FROM lending.lender_routing_rules ORDER BY priority"))]
+    assert order == [b, a]
+    slack_form(_form("make_primary", lender=b))
+    assert rdb.execute(text("SELECT is_primary FROM lending.lender_routing_rules WHERE id = :i"), {"i": b}).scalar() is True
+
+
+def test_slack_form_refuses_strangers_and_bad_input_and_changes_nothing(rdb, slack_form):
+    a, _ = _two_flip_lenders(rdb)
+    stranger = slack_form(_form("pause", lender=a), user="USTRANGER")
+    assert stranger["response_action"] == "errors" and slack_form.posted == []
+    assert rdb.execute(text("SELECT active FROM lending.lender_routing_rules WHERE id = :i"), {"i": a}).scalar() is True
+    for values in (
+        _form("agreement", lender=a, value="maybe"),
+        _form("seat_cap", lender=a, value="lots"),
+        _form("add_lender", value=""),
+        _form("add_lender", value="No Box Types", types=[LOAN_TYPE_FLIP], min_amount="900", max_amount="100"),
+        _form("add_box", lender=a),
+        _form("move_up", lender=a),  # already first
+        _form("pause"),  # no lender chosen
+    ):
+        response = slack_form(values)
+        assert response["response_action"] == "errors" and response["errors"]["value_b"], values
+    assert rdb.execute(text("SELECT COUNT(*) FROM lending.lender_routing_rules WHERE name = 'No Box Types'")).scalar() == 0
+    assert slack_form.posted == []  # nothing applied, nothing announced
+
+
+def test_slack_form_is_reached_through_the_interactivity_url_and_the_command_checks_the_signature(rdb, monkeypatch):
+    import hashlib
+    import hmac
+    import time
+    from urllib.parse import urlencode
+
+    from fastapi.testclient import TestClient
+    from pydantic import SecretStr
+
+    from config.settings import get_settings
+    from src.lending.api import app
+    from src.lending.routing import slack_admin
+
+    secret = "signing-secret-for-test"
+    monkeypatch.setattr(get_settings(), "lending_slack_signing_secret", SecretStr(secret), raising=False)
+    monkeypatch.setattr(slack_admin, "allowed_user_ids", lambda: frozenset({"UJOSH"}))
+    opened: list[str] = []
+    monkeypatch.setattr(slack_admin, "_open_modal", lambda trigger_id: opened.append(trigger_id))
+    client = TestClient(app)
+
+    def post(path, form, signed=True):
+        body = urlencode(form)
+        ts = str(int(time.time()))
+        sig = "v0=" + hmac.new(secret.encode(), f"v0:{ts}:{body}".encode(), hashlib.sha256).hexdigest()
+        headers = {"X-Slack-Request-Timestamp": ts, "X-Slack-Signature": sig if signed else "v0=bad",
+                   "Content-Type": "application/x-www-form-urlencoded"}
+        return client.post(path, content=body, headers=headers)
+
+    assert post("/webhooks/lending/slack-lenders", {"user_id": "UJOSH", "trigger_id": "T1"}, signed=False).status_code == 401
+    assert post("/webhooks/lending/slack-lenders", {"user_id": "UJOSH", "trigger_id": "T1"}).status_code == 200
+    assert opened == ["T1"]
+    refused = post("/webhooks/lending/slack-lenders", {"user_id": "UOTHER", "trigger_id": "T2"}).json()
+    assert "Only approved users" in refused["text"] and opened == ["T1"]
+
+    seen: list[dict] = []
+    monkeypatch.setattr(slack_admin, "handle_submission", lambda payload: seen.append(payload) or {})
+    payload = {"type": "view_submission", "user": {"id": "UJOSH"}, "view": {"callback_id": slack_admin.CALLBACK_ID}}
+    assert post("/webhooks/lending/slack-interactivity", {"payload": json.dumps(payload)}).status_code == 200
+    assert len(seen) == 1  # routed to the lender form even while the soft-approval switch is off
+
+
+def test_the_lender_form_lists_the_waterfall_and_nobody_may_edit_when_no_editor_is_configured(rdb):
+    from src.lending.routing import slack_admin
+
+    _two_flip_lenders(rdb)
+    view = slack_admin.build_form_view(slack_admin._lenders(rdb))
+    assert view["callback_id"] == slack_admin.CALLBACK_ID
+    assert "Alpha Capital" in view["blocks"][0]["text"]["text"] and "Beta Funding" in view["blocks"][0]["text"]["text"]
+    assert slack_admin.allowed_user_ids() == frozenset()  # default: fail closed
