@@ -15,13 +15,14 @@
             --green: #2E6A5C; --green-tint: #DCE8E4; --red: #B8472F; --paper: #F2F4F3; --line: #D3DBD8;
             --mist: #C9D3DC; --field: #8A99A6; --white: #FFFFFF; }
     * { box-sizing: border-box; }
-    body { margin: 0; font: 16px/1.45 "Archivo", "Helvetica Neue", Helvetica, sans-serif; color: var(--navy);
+    body { margin: 0; min-height: 100vh; display: flex; flex-direction: column; font: 16px/1.45 "Archivo", "Helvetica Neue", Helvetica, sans-serif; color: var(--navy);
            background: var(--paper); -webkit-font-smoothing: antialiased; }
-    header.site { display: flex; align-items: center; padding: 16px; background: var(--navy); color: var(--paper); }
+    header.site { padding: 16px; background: var(--navy); color: var(--paper); }
+    .inner { max-width: 640px; margin: 0 auto; }
     .brand { display: flex; align-items: center; gap: 10px; font-size: 21px; font-weight: 850; font-stretch: 72%;
              white-space: nowrap; color: var(--paper); text-decoration: none; }
     .brand svg { width: 28px; height: 28px; }
-    main { max-width: 640px; margin: 0 auto; padding: 16px 16px 96px; }
+    main { flex: 1; width: 100%; max-width: 672px; margin: 0 auto; padding: 16px 16px 48px; }
     h1 { font-size: 1.5rem; font-weight: 800; font-stretch: 85%; margin: 12px 0 4px; }
     p.lead { color: var(--slate); margin: 0 0 16px; }
     fieldset { border: 1px solid var(--line); border-radius: 6px; background: var(--white); margin: 0 0 14px; padding: 12px 14px; }
@@ -43,25 +44,24 @@
     .hp { position: absolute; left: -10000px; }
     table { width: 100%; border-collapse: collapse; background: var(--white); border-radius: 6px; overflow: hidden; }
     th, td { text-align: left; padding: 10px; border-bottom: 1px solid var(--line); font-size: .92rem; vertical-align: top; }
-    th { background: var(--navy); color: var(--paper); font-weight: 650; }
-    .badge { display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: .8rem; font-weight: 700;
+    th { background: var(--navy); color: var(--paper); font-weight: 650; white-space: nowrap; }
+    .badge { display: inline-block; padding: 4px 8px; border-radius: 4px; line-height: 1.3; font-size: .8rem; font-weight: 700;
              background: var(--terms, #E4E9E7); color: var(--slate); }
     .badge-routed { background: #DDE7F2; color: var(--navy); }
     .badge-declined { background: #F6E3DE; color: var(--red); }
     .badge-approved, .badge-funded { background: var(--green-tint); color: var(--green); }
     a { color: var(--green); }
     footer.site { padding: 24px 16px 32px; background: var(--navy); color: var(--mist); font-size: 13px; line-height: 1.6; }
-    footer.site .inner { max-width: 640px; margin: 0 auto; }
     footer.site a { color: var(--mist); }
     footer.site .name { color: var(--paper); font-weight: 800; font-size: 16px; }
   </style>
 </head>
 <body>
   <header class="site">
-    <span class="brand">
+    <div class="inner"><span class="brand">
       <svg viewBox="0 0 34 34" fill="none" stroke="#E8B130" stroke-width="3" aria-hidden="true"><path d="M4 26 L14 16 L20 22 L30 8"/><path d="M22 8 L30 8 L30 16"/></svg>
       Next Deal Lending
-    </span>
+    </span></div>
   </header>
   <main>{% block content %}{% endblock %}</main>
   <footer class="site">
