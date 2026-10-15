@@ -3,7 +3,8 @@
 Order matters, as for web leads: the lead and its consent certificate are committed before GHL is
 called, so a GHL outage never loses a paid lead. ``parse_lendingflow`` is the only function that
 knows LendingFlow's payload shape. After the GHL contact exists the lead's
-``LendingFlowLeadCreated`` event is emitted once and the T-07 pre-qual letter is queued.
+``LendingFlowLeadCreated`` event is emitted and the T-07 pre-qual letter is queued; a lead is marked
+done only when both succeeded, so a crash or a failed hand-off is redone by the sweep.
 """
 from __future__ import annotations
 
@@ -18,11 +19,17 @@ from typing import Any, Mapping, Optional, Protocol
 from sqlalchemy import text
 
 from config.lending_lendingflow import (
+    FOLLOWUP_RECOVERY_AFTER_MINUTES,
     GHL_GIVE_UP_AFTER_HOURS,
     GHL_RETRY_BACKOFF_MINUTES,
+    INTRO_SMS_HOLD_MAX_HOURS,
     LEAD_SOURCE,
+    MISSING_LEAD_ID_PREFIX,
+    is_missing_lead_id,
     SWEEP_BATCH_SIZE,
 )
+from config.settings import get_settings
+from src.lending.compliance import text_window_open
 from src.lending.contracts import LoanType
 from src.lending.web_leads import DeliveryError, PushResult, _suppression_reason
 from src.services.phone_utils import normalize
@@ -132,7 +139,7 @@ def _str(payload: Mapping[str, Any], *names: str, limit: int = 200) -> Optional[
     return None
 
 
-def _credit_band_min_fico(raw: Optional[str]) -> Optional[int]:
+def credit_band_min_fico(raw: Optional[str]) -> Optional[int]:
     """Lower bound of a band: ``"680-719"`` -> 680, ``"720+"`` -> 720, anything else None.
     Stand-in until David / Josh confirm LendingFlow's real band values."""
     if not raw:
@@ -222,9 +229,6 @@ def parse_lendingflow(payload: Any) -> ParsedLendingFlowLead:
     """The only function that knows LendingFlow's payload shape (Fake shape until David's schema lands)."""
     if not isinstance(payload, dict):
         raise ParseError("payload must be a JSON object")
-    vendor_id = _str(payload, "lead_id", "vendor_lead_id", limit=100)
-    if not vendor_id:
-        raise ParseError("lead_id is required")
     phone = normalize(_str(payload, "phone", limit=40))
     if not phone:
         raise ParseError("a valid US phone number is required")
@@ -233,6 +237,10 @@ def parse_lendingflow(payload: Any) -> ParsedLendingFlowLead:
         email = email.lower()
         if not _EMAIL.match(email):
             email = None  # a bad email never costs a paid lead; phone is the contact key
+    vendor_id = _str(payload, "lead_id", "vendor_lead_id", limit=100)
+    if not vendor_id:
+        # Stored and flagged, never rejected: the id is derived from phone + email, so a resend still dedupes.
+        vendor_id = MISSING_LEAD_ID_PREFIX + dedupe_hash(phone, email)
     amount_raw, amount_min, amount_max = _loan_amount(payload.get("loan_amount"))
     band = _str(payload, "credit_score_range", "credit_score", "credit_band", limit=40)
     return ParsedLendingFlowLead(
@@ -242,7 +250,7 @@ def parse_lendingflow(payload: Any) -> ParsedLendingFlowLead:
         first_name=_str(payload, "first_name", limit=80),
         last_name=_str(payload, "last_name", limit=80),
         credit_band=band,
-        credit_band_min_fico=_credit_band_min_fico(band),
+        credit_band_min_fico=credit_band_min_fico(band),
         loan_amount=amount_min,
         loan_amount_range=amount_raw,
         loan_amount_min=amount_min,
@@ -345,7 +353,12 @@ def save_lead(db, parsed: ParsedLendingFlowLead, raw_payload: Any, *, now: Optio
         return raced
     if parsed.certificate:
         store_certificate(db, row.id, parsed.certificate, duplicate=False, now=now)
-    logger.info("[lendingflow] lead created id=%s vendor=%s suppressed=%s", row.id, parsed.vendor_lead_id, reason is not None)
+    if is_missing_lead_id(parsed.vendor_lead_id):
+        logger.warning("[lendingflow] lead created id=%s without a LendingFlow lead id suppressed=%s",
+                       row.id, reason is not None)
+    else:
+        logger.info("[lendingflow] lead created id=%s vendor=%s suppressed=%s", row.id, parsed.vendor_lead_id,
+                    reason is not None)
     return SaveResult(row.id, str(row.lead_uuid), created=True, suppressed=reason is not None)
 
 
@@ -359,18 +372,29 @@ def _backoff_minutes_sql() -> str:
 
 _DELIVERABLE = (
     "SELECT id, lead_uuid, vendor_lead_id, first_name, last_name, phone, email, credit_band, credit_band_min_fico, "
-    "loan_amount, loan_type, property_state, lead_source_campaign, consent_status, received_at, ghl_attempts "
+    "loan_amount, loan_type, property_state, property_zip, lead_source_campaign, consent_status, received_at, "
+    "ghl_attempts, ghl_contact_id, event_emitted_at "
     "FROM lending.lendingflow_leads "
     "WHERE ghl_status IN ('pending', 'failed') AND NOT suppressed AND received_at > :oldest {extra} "
     "ORDER BY received_at LIMIT :limit FOR UPDATE SKIP LOCKED"
 )
 
 
+_RECOVERABLE = (
+    "SELECT id, lead_uuid, vendor_lead_id, first_name, last_name, phone, email, credit_band, credit_band_min_fico, "
+    "loan_amount, loan_type, property_state, lead_source_campaign, consent_status, received_at, ghl_attempts, "
+    "ghl_contact_id, event_emitted_at "
+    "FROM lending.lendingflow_leads "
+    "WHERE ghl_status IN ('synced', 'contact_only') AND NOT suppressed AND followup_done_at IS NULL "
+    "AND ghl_synced_at < :cutoff ORDER BY ghl_synced_at LIMIT :limit FOR UPDATE SKIP LOCKED"
+)
+
+
 def deliver_pending(db, sink: Optional[LeadSink], *, lead_id: Optional[int] = None,
                     now: Optional[datetime] = None) -> list[FollowUp]:
-    """Push stored leads to GHL. Returns a follow-up for each lead that reached GHL and whose
-    ``LendingFlowLeadCreated`` event was claimed here (once per lead). Never raises per lead; with
-    no sink, leads stay pending and no attempt is counted."""
+    """Push stored leads to GHL. Returns a follow-up for each lead that reached GHL, plus (sweep only) each
+    already-delivered lead whose follow-ups never finished. Never raises per lead; with no sink, leads stay
+    pending and no attempt is counted."""
     now = now or datetime.now(timezone.utc)
     if sink is None:
         logger.warning("[lendingflow] GHL is not configured: leads stay pending")
@@ -387,12 +411,63 @@ def deliver_pending(db, sink: Optional[LeadSink], *, lead_id: Optional[int] = No
     followups: list[FollowUp] = []
     for row in rows:
         lead = dict(row)
-        if _deliver_one(db, sink, lead, now) and _claim_event(db, lead["id"], now):
+        if _deliver_one(db, sink, lead, now):
             followups.append(FollowUp(lead))
+    if lead_id is None:
+        followups.extend(_recoverable_followups(db, now))
     return followups
 
 
+def _recoverable_followups(db, now: datetime) -> list[FollowUp]:
+    rows = db.execute(text(_RECOVERABLE), {
+        "cutoff": now - timedelta(minutes=FOLLOWUP_RECOVERY_AFTER_MINUTES), "limit": SWEEP_BATCH_SIZE,
+    }).mappings().all()
+    if rows:
+        logger.warning("[lendingflow] recovering unfinished follow-ups for %d lead(s)", len(rows))
+    return [FollowUp(dict(row)) for row in rows]
+
+
+def _sms_clear(db, lead: Mapping[str, Any]) -> bool:
+    """Whether the borrower may still be texted. Re-checked at every push: an opt-out after intake does not change the
+    stored ``suppressed`` flag, and a lead can sit in retry for up to GHL_GIVE_UP_AFTER_HOURS. Fails closed: if the
+    lookup errors the intro-SMS trigger tag is withheld; the CRM delivery is never blocked by this check."""
+    try:
+        with db.begin_nested():  # a failed lookup must not abort the delivery transaction
+            reason = _suppression_reason(db, lead["phone"], lead["email"])
+    except Exception as exc:
+        logger.error("[lendingflow] suppression re-check failed lead=%s: %s", lead["id"], type(exc).__name__)
+        return False
+    if reason:
+        logger.info("[lendingflow] intro SMS withheld, borrower suppressed since intake lead=%s gate=%s", lead["id"], reason)
+    return reason is None
+
+
+def _intro_sms_on() -> bool:
+    """The T-09 off switch. On also needs the GHL custom field the text greets the borrower with: without it the
+    workflow would read an empty name, so nobody is texted and the misconfiguration is logged."""
+    settings = get_settings()
+    if not settings.lending_intro_sms_enabled:
+        return False
+    if not settings.lending_ghl_cf_intro_name:
+        logger.error("[lendingflow] LENDING_INTRO_SMS_ENABLED is on but LENDING_GHL_CF_INTRO_NAME is not set: no intro texts")
+        return False
+    return True
+
+
+def _may_text_now(db, lead: Mapping[str, Any], now: datetime) -> bool:
+    """Switch on, inside the borrower's 8am-8pm window, and not suppressed. A lead that fails only the window is
+    held: ``release_held_intro_sms`` tags it once the window opens."""
+    if not _intro_sms_on():
+        return False
+    if not text_window_open(lead["phone"], property_state=lead.get("property_state"),
+                            property_zip=lead.get("property_zip"), now=now):
+        logger.info("[lendingflow] intro SMS held for the send window lead=%s", lead["id"])
+        return False
+    return _sms_clear(db, lead)
+
+
 def _deliver_one(db, sink: LeadSink, lead: dict[str, Any], now: datetime) -> bool:
+    lead["sms_clear"] = _may_text_now(db, lead, now)
     try:
         result = sink.push(lead)
     except DeliveryError as exc:
@@ -404,8 +479,10 @@ def _deliver_one(db, sink: LeadSink, lead: dict[str, Any], now: datetime) -> boo
     lead["ghl_contact_id"] = result.contact_id
     db.execute(
         text("UPDATE lending.lendingflow_leads SET ghl_status = :s, ghl_contact_id = :c, ghl_attempts = ghl_attempts + 1, "
-             "ghl_last_attempt_at = :now, ghl_synced_at = :now, ghl_last_error = NULL WHERE id = :id"),
-        {"s": "synced" if result.pipeline_card else "contact_only", "c": result.contact_id, "now": now, "id": lead["id"]},
+             "ghl_last_attempt_at = :now, ghl_synced_at = :now, ghl_last_error = NULL, "
+             "intro_sms_tagged_at = CASE WHEN :tagged THEN :now ELSE intro_sms_tagged_at END WHERE id = :id"),
+        {"s": "synced" if result.pipeline_card else "contact_only", "c": result.contact_id, "now": now, "id": lead["id"],
+         "tagged": result.intro_ready_tagged},
     )
     logger.info("[lendingflow] lead delivered id=%s pipeline_card=%s", lead["id"], result.pipeline_card)
     return True
@@ -423,37 +500,119 @@ def _record_failure(db, lead: dict[str, Any], reason: str, now: datetime, *, con
                lead["id"], attempts, config_error, reason)
 
 
-def _claim_event(db, lead_id: int, now: datetime) -> bool:
-    return db.execute(
-        text("UPDATE lending.lendingflow_leads SET event_emitted_at = :now "
-             "WHERE id = :id AND event_emitted_at IS NULL RETURNING id"),
-        {"now": now, "id": lead_id},
-    ).first() is not None
+def _mark(db, lead_id: int, column: str, now: datetime) -> None:
+    db.execute(text(f"UPDATE lending.lendingflow_leads SET {column} = :now WHERE id = :id AND {column} IS NULL"),
+               {"now": now, "id": lead_id})
+    db.commit()
 
 
-def run_followups(followups: list[FollowUp]) -> None:
-    """After commit: emit the event, then queue the pre-qual letter when the 4 core fields are present.
-    Never raises; logs lead id only."""
+def _emit_event(db, lead: Mapping[str, Any]) -> bool:
     from src.lending.lendingflow_events import build_event, emit
+
+    if lead.get("event_emitted_at") is not None:
+        return True
+    try:
+        emit(build_event(lead))
+    except Exception as exc:
+        logger.error("[lendingflow] event emit failed lead=%s: %s", lead["id"], type(exc).__name__)
+        return False
+    try:
+        _mark(db, lead["id"], "event_emitted_at", datetime.now(timezone.utc))
+    except Exception as exc:
+        db.rollback()
+        logger.error("[lendingflow] event mark failed lead=%s: %s", lead["id"], type(exc).__name__)
+        return False
+    return True
+
+
+def _hand_off_prequal(lead: Mapping[str, Any]) -> bool:
     from src.lending.prequal import PrequalLead
     from src.lending.prequal_letters import queue_and_send_in_background
 
-    for item in followups:
-        lead = item.lead
-        try:
-            emit(build_event(lead))
-        except Exception as exc:
-            logger.error("[lendingflow] event emit failed lead=%s: %s", lead["id"], type(exc).__name__)
-        prequal = PrequalLead(credit_band=lead["credit_band"], loan_amount=lead["loan_amount"],
-                              property_state=lead["property_state"], loan_type=lead["loan_type"])
-        if not all((prequal.credit_band, prequal.loan_amount, prequal.property_state, prequal.loan_type)):
-            logger.info("[lendingflow] prequal_skipped_missing_fields lead=%s", lead["id"])
+    prequal = PrequalLead(credit_band=lead["credit_band"], loan_amount=lead["loan_amount"],
+                          property_state=lead["property_state"], loan_type=lead["loan_type"])
+    if not all((prequal.credit_band, prequal.loan_amount, prequal.property_state, prequal.loan_type)):
+        logger.info("[lendingflow] prequal_skipped_missing_fields lead=%s", lead["id"])
+        return True
+    try:
+        queue_and_send_in_background(lead_source=LEAD_SOURCE, lead_ref=lead["vendor_lead_id"],
+                                     contact_id=lead["ghl_contact_id"], lead=prequal, strict=True)
+    except Exception as exc:
+        logger.error("[lendingflow] prequal hand-off failed lead=%s: %s", lead["id"], type(exc).__name__)
+        return False
+    return True
+
+
+_HELD_FOR_WINDOW = (
+    "SELECT id, phone, email, property_state, property_zip, ghl_contact_id FROM lending.lendingflow_leads "
+    "WHERE consent_status = 'present' AND NOT suppressed AND ghl_status IN ('synced', 'contact_only') "
+    "AND ghl_contact_id IS NOT NULL AND intro_sms_tagged_at IS NULL AND received_at > :cutoff "
+    "ORDER BY received_at LIMIT :limit FOR UPDATE SKIP LOCKED"
+)
+
+
+def release_held_intro_sms(db, sink: Optional[Any], *, now: Optional[datetime] = None) -> int:
+    """Add the intro-SMS ready tag to delivered leads that were held back (outside the borrower's 8am-8pm window, or
+    switch off at push time) once it is allowed. Only leads younger than INTRO_SMS_HOLD_MAX_HOURS: an intro text
+    never goes out a day late. The caller commits. Never raises per lead; returns how many were tagged."""
+    if sink is None or not _intro_sms_on():
+        return 0
+    # ponytail: oldest-first batch; 50+ permanently blocked leads (unknown timezone) would starve newer ones for up to
+    # INTRO_SMS_HOLD_MAX_HOURS. Add a skip marker if volume ever gets there.
+    now = now or datetime.now(timezone.utc)
+    rows = db.execute(text(_HELD_FOR_WINDOW), {
+        "cutoff": now - timedelta(hours=INTRO_SMS_HOLD_MAX_HOURS), "limit": SWEEP_BATCH_SIZE,
+    }).mappings().all()
+    released = 0
+    for row in rows:
+        lead = dict(row)
+        if not text_window_open(lead["phone"], property_state=lead["property_state"],
+                                property_zip=lead["property_zip"], now=now):
+            continue
+        if not _sms_clear(db, lead):
             continue
         try:
-            queue_and_send_in_background(lead_source=LEAD_SOURCE, lead_ref=lead["vendor_lead_id"],
-                                         contact_id=lead["ghl_contact_id"], lead=prequal)
+            sink.add_intro_ready_tag(lead["ghl_contact_id"])
         except Exception as exc:
-            logger.error("[lendingflow] prequal hand-off failed lead=%s: %s", lead["id"], type(exc).__name__)
+            logger.warning("[lendingflow] release of held intro SMS failed lead=%s: %s", lead["id"], type(exc).__name__)
+            continue
+        db.execute(text("UPDATE lending.lendingflow_leads SET intro_sms_tagged_at = :now WHERE id = :id"),
+                   {"now": now, "id": lead["id"]})
+        released += 1
+    if released:
+        logger.info("[lendingflow] released %d held intro SMS lead(s)", released)
+    return released
+
+
+def release_held_and_commit(sink: Optional[Any]) -> int:
+    """Sweep entry point: own session, committed. Never raises."""
+    from src.lending.db import lending_session
+
+    try:
+        with lending_session() as db:
+            released = release_held_intro_sms(db, sink)
+            db.commit()
+        return released
+    except Exception as exc:
+        logger.error("[lendingflow] held intro SMS release crashed: %s", type(exc).__name__)
+        return 0
+
+
+def run_followups(db, followups: list[FollowUp]) -> None:
+    """After the delivery commit: emit the event, then queue the pre-qual letter when the 4 core fields are
+    present. A lead is marked done only when both succeeded; otherwise the sweep redoes the missing step
+    (the event is skipped once ``event_emitted_at`` is set; the letter is idempotent on its lead ref).
+    Never raises; logs lead id only."""
+    for item in followups:
+        lead = item.lead
+        event_ok = _emit_event(db, lead)
+        prequal_ok = _hand_off_prequal(lead)
+        if event_ok and prequal_ok:
+            try:
+                _mark(db, lead["id"], "followup_done_at", datetime.now(timezone.utc))
+            except Exception as exc:
+                db.rollback()
+                logger.error("[lendingflow] follow-up mark failed lead=%s: %s", lead["id"], type(exc).__name__)
 
 
 def deliver_and_follow_up(sink: Optional[LeadSink], *, lead_id: Optional[int] = None) -> int:
@@ -463,7 +622,8 @@ def deliver_and_follow_up(sink: Optional[LeadSink], *, lead_id: Optional[int] = 
     try:
         with lending_session() as db:
             followups = deliver_pending(db, sink, lead_id=lead_id)
-        run_followups(followups)
+            db.commit()  # delivery state is durable before any follow-up runs
+            run_followups(db, followups)
         return len(followups)
     except Exception as exc:
         logger.error("[lendingflow] background delivery crashed lead=%s: %s", lead_id, type(exc).__name__)

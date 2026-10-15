@@ -921,7 +921,7 @@ class AppSettings(BaseSettings):
 	lending_prequal_email_from: Optional[str] = Field(default=None, env="LENDING_PREQUAL_EMAIL_FROM")
 	# Shared secret the GHL "DND changed" workflow sends in X-Webhook-Secret. Unset = endpoint closed.
 	lending_ghl_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_GHL_WEBHOOK_SECRET")
-	lending_ghl_sms_from_number: Optional[str] = Field(default=None, env="LENDING_GHL_SMS_FROM_NUMBER")  # E.164; the one number used for calling and texting
+	lending_ghl_sms_from_number: Optional[str] = Field(default=None, env="LENDING_GHL_SMS_FROM_NUMBER")  # E.164; the GHL SMS number (texting only). Calls run through BatchDialer on a different number
 	# lending_ghl_api_key / lending_ghl_location_id are defined once, above,
 	# alongside the rest of the LENDING_GHL_* credential group.
 	# WP-GL-11 website lead form. A stage in the "Booked Calls" pipeline (LENDING_GHL_PIPELINE_ID, above) for new web inquiries. With
@@ -933,8 +933,15 @@ class AppSettings(BaseSettings):
 	# T-11 LendingFlow intake. Off by default; the receiver is closed (503) until the flag is on AND the secret is set.
 	lending_lendingflow_enabled: bool = Field(default=False, env="LENDING_LENDINGFLOW_ENABLED")
 	lending_lendingflow_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_LENDINGFLOW_WEBHOOK_SECRET")
+	# Off: no lead gets the lendingflow-intro-ready tag, so the GHL intro-SMS workflow cannot start (client: keep the
+	# intro text off until LendingFlow confirms its consent covers it and whether it runs a DNC/litigator check).
+	lending_lendingflow_intro_sms_enabled: bool = Field(default=False, env="LENDING_LENDINGFLOW_INTRO_SMS_ENABLED")
 	# Pipeline stage (in LENDING_GHL_PIPELINE_ID) for new LendingFlow leads; unset = contact only.
 	lending_ghl_stage_lendingflow_new: Optional[str] = Field(default=None, env="LENDING_GHL_STAGE_LENDINGFLOW_NEW")
+	# T-09 intro SMS. Off: the tag that starts the GHL intro workflow is never added, so nobody is texted. Turn on only after
+	# Josh confirms LendingFlow's consent and DNC check. Needs the id of the GHL contact custom field "intro_name".
+	lending_intro_sms_enabled: bool = Field(default=False, env="LENDING_INTRO_SMS_ENABLED")
+	lending_ghl_cf_intro_name: Optional[str] = Field(default=None, env="LENDING_GHL_CF_INTRO_NAME")
 	# T-12 background enrichment card + routing. Off: no card is built, the deal-facts webhook returns 503.
 	lending_enrichment_enabled: bool = Field(default=False, env="LENDING_ENRICHMENT_ENABLED")
 	# Street View Static API (metadata lookup only; the key is never put in a posted link). Unset = no Street View.
@@ -953,9 +960,40 @@ class AppSettings(BaseSettings):
 	lending_daily_channel: str = Field(default="", env="LENDING_DAILY_CHANNEL")  # 7pm scoreboard; channel ID
 	lending_routing_channel: str = Field(default="", env="LENDING_ROUTING_CHANNEL")  # R-1: #next-deal-lending; Cora Lending bot must be a member
 	lending_routing_admin_secret: Optional[SecretStr] = Field(default=None, env="LENDING_ROUTING_ADMIN_SECRET")  # R-1 admin API secret
+	# T-10 uncalled-lead alarms (src/lending/uncalled_alarm_worker.py)
+	lending_uncalled_alarms_enabled: bool = Field(default=False, env="LENDING_UNCALLED_ALARMS_ENABLED")
+	lending_alarm_sms_to: Optional[str] = Field(default=None, env="LENDING_ALARM_SMS_TO")  # Josh's mobile; normalized before use
+	lending_ops_channel: str = Field(default="", env="LENDING_OPS_CHANNEL")  # #lendingops channel ID; 5-minute escalation post, opt-out alerts
+	# Opt-out mailbox listener (src/lending/email_opt_out.py): reads mail sent to LENDING_OPTOUT_ADDRESS over IMAP.
+	# The mailbox is either a dedicated optout@ mailbox or the one optout@ forwards into; off while user or password is unset.
+	lending_optout_imap_host: str = Field(default="imap.porkbun.com", env="LENDING_OPTOUT_IMAP_HOST")
+	lending_optout_imap_port: int = Field(default=993, env="LENDING_OPTOUT_IMAP_PORT")
+	lending_optout_imap_user: str = Field(default="", env="LENDING_OPTOUT_IMAP_USER")
+	lending_optout_imap_password: Optional[SecretStr] = Field(default=None, env="LENDING_OPTOUT_IMAP_PASSWORD")
+	lending_optout_address: str = Field(default="optout@nextdeallending.com", env="LENDING_OPTOUT_ADDRESS")
 	lending_sheets_service_account_key_path: str = Field(default="", env="LENDING_SHEETS_SERVICE_ACCOUNT_KEY_PATH")
 	lending_disposition_sheet_id: str = Field(default="", env="LENDING_DISPOSITION_SHEET_ID")
 	lending_disposition_sheet_tab: str = Field(default="Dispositions", env="LENDING_DISPOSITION_SHEET_TAB")
+	# Call-One soft approval PDF (T-08): off until Josh approves the template and the calculation inputs.
+	lending_soft_approval_enabled: bool = Field(default=False, env="LENDING_SOFT_APPROVAL_ENABLED")
+	# Lender rules read from lending.lender_rule_values (T-05): off until the table is migrated and seeded; off = config/lender_matrix.py.
+	lending_rules_from_db: bool = Field(default=False, env="LENDING_RULES_FROM_DB")
+	# Who may open and submit the after-call form (B11: Josh only until he names callers). Comma-separated Slack
+	# user ids; when empty it falls back to LENDING_CORA_APPROVER_USER_IDS; when both are empty nobody may.
+	lending_soft_approval_user_ids: str = Field(default="", env="LENDING_SOFT_APPROVAL_USER_IDS")
+	lending_slack_signing_secret: Optional[SecretStr] = Field(default=None, env="LENDING_SLACK_SIGNING_SECRET")  # verifies Slack interactivity posts to lending-api
+	# ── Lending Cora agent (packages/agent_core, systemd fa-lending-cora) ──
+	# Cora has her own Slack app, connected over Socket Mode from fa-lending-cora (no public endpoint).
+	# Approvers are the only users whose clicks release an external send, so keep that list to Josh's Slack user id.
+	lending_cora_slack_bot_token: Optional[SecretStr] = Field(default=None, env="LENDING_CORA_SLACK_BOT_TOKEN")  # xoxb- of Cora's own app
+	lending_cora_slack_app_token: Optional[SecretStr] = Field(default=None, env="LENDING_CORA_SLACK_APP_TOKEN")  # xapp- (connections:write) for Socket Mode
+	lending_cora_channel: str = Field(default="", env="LENDING_CORA_CHANNEL")  # channel ID for approval cards
+	lending_cora_approver_user_ids: str = Field(default="", env="LENDING_CORA_APPROVER_USER_IDS")  # comma-separated Slack user ids
+	lending_cora_operator_user_ids: str = Field(default="", env="LENDING_CORA_OPERATOR_USER_IDS")  # may chat, may not approve
+	lending_cora_model: str = Field(default="claude-sonnet-5-5", env="LENDING_CORA_MODEL")
+	lending_cora_pending_action_ttl_hours: int = Field(default=72, env="LENDING_CORA_PENDING_ACTION_TTL_HOURS")  # unapproved drafts expire after this
+	lending_cora_calendar_id: str = Field(default="", env="LENDING_CORA_CALENDAR_ID")
+	lending_cora_calendar_service_account_key_path: str = Field(default="", env="LENDING_CORA_CALENDAR_SERVICE_ACCOUNT_KEY_PATH")
 	# ── Meta Conversions API (CAPI) — S2 ────────────────────────────────────
 	# Server-side Purchase reporting for closed-loop Meta ad attribution.
 	# Feature-gated and OFF by default — when disabled, or when pixel_id /

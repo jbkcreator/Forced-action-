@@ -10,6 +10,8 @@ Runs the T-05 evaluator, then presents the result the way Josh asked:
   cheapest first.  When the routing table is unavailable the module falls back to the
   ``BACKFLIP_KEY_PREFIX`` constant (R-1 F4 fix: removed hard-coded name dependency).
 - A credit band that straddles a lender's floor shows "needs confirmation on the call" (A4).
+- A lender whose eligibility is unknown (A3) is listed as "possible, confirm on the call": not a fit and
+  not a decline, and never counted in the score.
 """
 from __future__ import annotations
 
@@ -20,7 +22,7 @@ from datetime import datetime, time, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Callable, Mapping, Optional
 
-from config.lender_matrix import LENDER_MATRIX, LenderRules
+from config.lender_matrix import LenderRules
 from config.lending_enrichment import (
     BACKFLIP_KEY_PREFIX,
     BACKFLIP_LENDER,
@@ -29,6 +31,7 @@ from config.lending_enrichment import (
 )
 from src.lending.contracts import BorrowerProfile, LenderFitResult, LoanRequest, LoanType
 from src.lending.lender_fit import evaluate_lender_fit
+from src.lending.lender_rules_store import current_matrix
 
 logger = logging.getLogger(__name__)
 
@@ -43,13 +46,14 @@ class FitView:
     score: Optional[int] = None
     note: Optional[str] = None
     ranked: list[str] = field(default_factory=list)
+    possible: list[str] = field(default_factory=list)
     straddles: list[str] = field(default_factory=list)
     missing_fields: list[str] = field(default_factory=list)
 
     def to_json(self) -> dict:
         return {
             "evaluated": self.evaluated, "score": self.score, "note": self.note, "ranked": self.ranked,
-            "straddles": self.straddles, "missing_fields": self.missing_fields,
+            "possible": self.possible, "straddles": self.straddles, "missing_fields": self.missing_fields,
         }
 
 
@@ -114,7 +118,7 @@ def evaluate_fit(
     address: Optional[str],
     target_close_date=None,
     evaluator: Optional[Evaluator] = None,
-    matrix: tuple[LenderRules, ...] = LENDER_MATRIX,
+    matrix: Optional[tuple[LenderRules, ...]] = None,
     primary_prefix: Optional[str] = None,
 ) -> FitView:
     """Fit view for one LendingFlow lead row. Never raises for missing inputs: it reports them.
@@ -123,6 +127,7 @@ def evaluate_fit(
     (R-1 F4 fix).  The primary lender ranks first in the fit view.  Falls back to the
     ``BACKFLIP_KEY_PREFIX`` constant when the routing table is unavailable.
     """
+    matrix = current_matrix() if matrix is None else matrix
     missing = _missing(lead)
     amount = _decimal(lead.get("loan_amount"))
     if missing or amount is None:
@@ -137,7 +142,9 @@ def evaluate_fit(
     )
     request = LoanRequest(loan_type=loan_type, loan_amount=amount, state=lead["property_state"],
                           property_address=address, target_close_date=close_dt)
-    borrower = BorrowerProfile(credit_band_min_fico=lead.get("credit_band_min_fico"), state=lead["property_state"])
+    band = parse_band_bounds(lead.get("credit_band"))
+    borrower = BorrowerProfile(credit_band_min_fico=lead.get("credit_band_min_fico"),
+                               credit_band_max_fico=band[1] if band else None, state=lead["property_state"])
     result = (evaluator or (lambda b, r: evaluate_lender_fit(b, r, matrix=matrix)))(borrower, request)
 
     fitting_groups = [lender_group(f.lender_key, primary_prefix=primary_prefix) for f in result.fitting]
@@ -148,6 +155,10 @@ def evaluate_fit(
         ordered.remove(BACKFLIP_LENDER)
         ordered.insert(0, BACKFLIP_LENDER)
 
+    fitting_set = set(fitting_groups)
+    possible_groups = [g for g in dict.fromkeys(lender_group(p.lender_key, primary_prefix=primary_prefix) for p in result.possible)
+                       if g not in fitting_set]
+
     all_groups = set(names_by_group)
     all_verified = bool(matrix) and all(r.verified for r in matrix)
     score = round(100 * len(set(fitting_groups)) / len(all_groups)) if all_verified and all_groups else None
@@ -156,6 +167,7 @@ def evaluate_fit(
         score=score,
         note=None if all_verified else FIT_RULES_PENDING,
         ranked=[names_by_group.get(g, g) for g in ordered],
-        straddles=_straddles(parse_band_bounds(lead.get("credit_band")), request, matrix, primary_prefix=primary_prefix),
+        possible=[names_by_group.get(g, g) for g in possible_groups],
+        straddles=_straddles(band, request, matrix, primary_prefix=primary_prefix),
         missing_fields=list(result.missing_fields),
     )

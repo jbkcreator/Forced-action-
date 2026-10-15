@@ -1,6 +1,7 @@
 """T-12: ``lending.lendingflow_enrichment``, the background enrichment card + routing per LendingFlow lead.
 
 Idempotent; run after apply_lending_lendingflow.py (T-11 creates ``lending.lendingflow_leads``).
+Also adds ``analysis_signature`` to a table an earlier run of this script already created.
 
 Usage:
     PYTHONPATH=. python migrations/apply_lending_lendingflow_enrichment.py
@@ -9,7 +10,7 @@ from __future__ import annotations
 
 import logging
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
 
 from config.settings import get_settings
@@ -22,6 +23,8 @@ logger = logging.getLogger(__name__)
 def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
     translated = conn.execution_options(schema_translate_map={LENDING_SCHEMA: schema})
     LendingLendingFlowEnrichment.__table__.create(translated, checkfirst=True)
+    # create(checkfirst=True) leaves an existing table as it is, so a column added later needs its own statement.
+    conn.execute(text(f'ALTER TABLE "{schema}".lendingflow_enrichment ADD COLUMN IF NOT EXISTS analysis_signature VARCHAR(64)'))
 
 
 def apply(engine: Engine | None = None, schema: str = LENDING_SCHEMA) -> None:

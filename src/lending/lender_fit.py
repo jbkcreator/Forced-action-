@@ -4,17 +4,30 @@
 entry point.  It evaluates the BorrowerProfile + LoanRequest against every
 LenderRules row in the matrix and returns a LenderFitResult.
 
-PRODUCTION CALLER STATUS (2026-10-08)
---------------------------------------
-This function has no production caller yet.  It is consumed by:
-  - T-07 (Minute-5 Pre-Qual PDF) and T-08 (Call-One Soft Approval PDF):
-    invoked at PDF-trigger time.  Both tasks build against FakeLenderFitEvaluator
-    until their own PRs wire the real function.
-  - T-12 (background enrichment card): will call this and append the fit score
-    to the GHL contact card.  T-12 is M2 (target Oct 15).
+PRODUCTION CALLERS
+------------------
+  - ``enrichment/fit_card.py`` (T-12): the lead card's fit view.
+  - ``soft_approval/service.py`` (T-08): through ``MatrixLenderFitEvaluator``;
+    it walks ``fitting`` in order, so the ranking below decides the lender used.
+  - T-07's ``prequal_fit.py`` seam is not wired yet.
 
-Until T-12 merges, ``evaluate_lender_fit`` is callable but never invoked
-automatically.  This is expected and documented here so the gap is visible.
+THREE OUTCOMES PER LENDER (Josh, A1/A3, Oct 8)
+----------------------------------------------
+  fitting      every check passes.  ``subject_to_confirmation`` is True while any
+               of the lender's parameters is not confirmed (placeholder values).
+  possible     eligibility cannot be decided: credit, state, or a deal fact is
+               unknown, or the credit band straddles the floor.  Shown as
+               "possible, confirm on the call" - never a fit and never a decline.
+  non_fitting  a known value fails.  Carries the free-text reasons and Josh's
+               ``DeclineReason`` codes.
+
+A parameter a lender has no value for takes Josh's placeholder box until he
+marks it confirmed (``config.lender_matrix.effective_rules``); it is never
+skipped.  A decline that rests on an unconfirmed value says so in its reason.
+
+RANKING (Josh, A2): Backflip rows first whenever they fit, then the others
+cheapest first (unknown cost last).  ``lender_fit_score`` stays None until every
+lender in the matrix is confirmed (A1).
 
 COMPLIANCE
 ----------
@@ -27,8 +40,9 @@ OPEN QUESTIONS (block Test 2 sign-off, not the Oct 10 shell — see config/lende
 Q1  credit_band_min_fico=0 encodes "below 640"; None = unknown.  Pending David's schema Oct 10.
 Q2  Total-borrower-cost formula provisional: points + spread × hold.  Josh to confirm.
 Q3  Ground-up 36-month window: profile carries count but not dates.  Josh to confirm.
-Q4  lender_fit_score meaning on card: fraction of verified lenders that fit (0–100 int).
-Q5  Real values for rcn_capital, easy_street, kiavi_affiliate, abl.
+Q4  lender_fit_score meaning on card: fraction of lenders that fit (0–100), shown only
+    once every lender is confirmed.
+Q5  Real values for rcn_capital, easy_street, kiavi_affiliate, abl (due Oct 14).
 """
 from __future__ import annotations
 
@@ -36,15 +50,25 @@ import logging
 from decimal import Decimal
 from typing import Optional
 
-from config.lender_matrix import LENDER_MATRIX, LenderRules
+from config.lender_matrix import (
+    LenderRules,
+    effective_rules,
+    field_status_of,
+    fully_confirmed,
+)
+from config.lending_enrichment import BACKFLIP_KEY_PREFIX
 from src.lending.contracts import (
     BorrowerProfile,
+    DeclineReason,
+    FieldStatus,
     LenderFit,
     LenderFitResult,
     LenderMiss,
+    LenderPossible,
     LoanRequest,
     LoanType,
 )
+from src.lending.lender_rules_store import current_matrix
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +83,8 @@ _CREDIT_BELOW_640 = 0
 # Sentinel used when total_borrower_cost cannot be computed (Q2 pending).
 _COST_UNKNOWN: Optional[Decimal] = None
 
+_Decline = tuple[str, DeclineReason]
+
 
 # ---------------------------------------------------------------------------
 # Public entry point
@@ -68,7 +94,7 @@ def evaluate_lender_fit(
     borrower_profile: BorrowerProfile,
     loan_request: LoanRequest,
     *,
-    matrix: tuple[LenderRules, ...] = LENDER_MATRIX,
+    matrix: Optional[tuple[LenderRules, ...]] = None,
 ) -> LenderFitResult:
     """Evaluate all active lenders against the borrower + loan.
 
@@ -76,67 +102,66 @@ def evaluate_lender_fit(
         borrower_profile: Borrower facts captured by the caller.
         loan_request: Loan and property details.
         matrix: Lender rules to evaluate against.  Defaults to
-            ``LENDER_MATRIX`` from config; tests inject fixture matrices.
+            ``current_matrix()`` (the config, or the table when LENDING_RULES_FROM_DB is on); tests inject fixtures.
 
     Returns:
         LenderFitResult with:
-          - fitting: qualifying lenders ranked by lowest total_borrower_cost
-            (cost=None sorted last — Q2 pending).
-          - non_fitting: disqualified lenders with explicit reason strings.
+          - fitting: qualifying lenders, Backflip first then lowest
+            total_borrower_cost (cost=None last — Q2 pending).
+          - possible: lenders whose eligibility is unknown ("confirm on the call").
+          - non_fitting: disqualified lenders with reasons and decline codes.
           - missing_fields: inputs the evaluator needed but couldn't find.
-          - lender_fit_score: provisional 0–100 int or None (Q4).
+          - lender_fit_score: 0–100, or None until every lender is confirmed (A1).
 
-    Credit-band note: ``credit_band_min_fico=0`` means "below 640".
-    ``credit_band_min_fico=None`` means unknown.  A lender that requires
-    credit ≥ 640 will reject a ``0`` borrower and treat ``None`` as
-    "unknown — cannot confirm" with a reason string saying so.
+    Credit-band note: ``credit_band_min_fico=0`` means "below 640" and declines.
+    ``None`` means unknown.  A positive band below a lender's floor straddles it
+    (the band is read as "this value or higher"), so it is ``possible``.
     """
+    matrix = current_matrix() if matrix is None else matrix
     fitting: list[LenderFit] = []
+    possible: list[LenderPossible] = []
     non_fitting: list[LenderMiss] = []
     all_missing: set[str] = set()
 
-    # Track which lenders are verified (for fit_score numerator/denominator).
-    verified_lender_keys: set[str] = set()
-    fitting_verified_keys: set[str] = set()
-
-    for rules in matrix:
-        if not rules.verified:
-            non_fitting.append(LenderMiss(
-                lender_key=rules.key,
-                lender_name=rules.name,
-                reasons=["lender parameters not yet verified — awaiting Josh confirmation (Q5)"],
-            ))
-            continue
-
-        verified_lender_keys.add(rules.key)
-        reasons, missing = _check_rules(rules, borrower_profile, loan_request)
+    for source in matrix:
+        rules = effective_rules(source)
+        declines, unknowns, missing = _check_rules(rules, borrower_profile, loan_request, source)
         all_missing.update(missing)
 
-        if reasons:
+        if declines:
             non_fitting.append(LenderMiss(
                 lender_key=rules.key,
                 lender_name=rules.name,
-                reasons=reasons,
+                reasons=[reason for reason, _ in declines],
+                reason_codes=list(dict.fromkeys(code for _, code in declines)),
+            ))
+        elif unknowns:
+            possible.append(LenderPossible(
+                lender_key=rules.key,
+                lender_name=rules.name,
+                why_unknown=unknowns,
             ))
         else:
-            cost = _total_borrower_cost(rules, loan_request.loan_amount)
             fitting.append(LenderFit(
                 lender_key=rules.key,
                 lender_name=rules.name,
-                total_borrower_cost=cost,
+                total_borrower_cost=_total_borrower_cost(rules, loan_request.loan_amount),
+                subject_to_confirmation=not fully_confirmed(source),
             ))
-            fitting_verified_keys.add(rules.key)
 
-    # Rank qualifying lenders by lowest total_borrower_cost; unknown cost last.
-    fitting.sort(key=lambda f: (f.total_borrower_cost is None, f.total_borrower_cost or 0))
+    # Backflip first, then lowest total_borrower_cost; unknown cost last.
+    fitting.sort(key=lambda f: (
+        not f.lender_key.startswith(BACKFLIP_KEY_PREFIX),
+        f.total_borrower_cost is None,
+        f.total_borrower_cost or 0,
+    ))
 
-    fit_score = _fit_score(
-        fitting_verified_count=len(fitting_verified_keys),
-        verified_total=len(verified_lender_keys),
-    )
+    all_confirmed = bool(matrix) and all(fully_confirmed(r) for r in matrix)
+    fit_score = _fit_score(len(fitting), len(matrix)) if all_confirmed else None
 
     result = LenderFitResult(
         fitting=fitting,
+        possible=possible,
         non_fitting=non_fitting,
         missing_fields=sorted(all_missing),
         lender_fit_score=fit_score,
@@ -144,11 +169,12 @@ def evaluate_lender_fit(
 
     logger.info(
         "lender_fit evaluated loan_type=%s loan_amount=%s state=%s "
-        "fitting=%d non_fitting=%d missing=%s fit_score=%s",
+        "fitting=%d possible=%d non_fitting=%d missing=%s fit_score=%s",
         loan_request.loan_type,
         loan_request.loan_amount,
         loan_request.state,
         len(result.fitting),
+        len(result.possible),
         len(result.non_fitting),
         result.missing_fields or "none",
         result.lender_fit_score,
@@ -157,81 +183,102 @@ def evaluate_lender_fit(
 
 
 # ---------------------------------------------------------------------------
-# Rule checker — returns (reasons, missing_fields) for one LenderRules row
+# Rule checker — returns (declines, unknowns, missing_fields) for one lender
 # ---------------------------------------------------------------------------
+
+def _unconfirmed(source: LenderRules, field: str) -> str:
+    """Suffix for a decline that rests on a value Josh has not confirmed."""
+    if field_status_of(source, field) is FieldStatus.CONFIRMED:
+        return ""
+    return " (unconfirmed rule)"
+
 
 def _check_rules(
     rules: LenderRules,
     profile: BorrowerProfile,
     request: LoanRequest,
-) -> tuple[list[str], list[str]]:
-    """Check a single verified LenderRules row.
+    source: Optional[LenderRules] = None,
+) -> tuple[list[_Decline], list[str], list[str]]:
+    """Check one lender (``rules`` is the effective rules, ``source`` the configured row).
 
     Returns:
-        reasons — non-empty means this lender does not qualify.
-        missing — fields that were needed but absent (informational only;
-                  a missing field causes a conservative failure reason, not
-                  a silent pass).
+        declines — (reason, code) pairs for known values that fail.
+        unknowns — why eligibility cannot be decided (needs a capture on the call).
+        missing  — input fields that were needed but absent.
     """
-    reasons: list[str] = []
+    source = source or rules
+    declines: list[_Decline] = []
+    unknowns: list[str] = []
     missing: list[str] = []
 
     # 1. Loan type
     if rules.loan_types and request.loan_type not in rules.loan_types:
-        reasons.append(
+        declines.append((
             f"loan type {request.loan_type.value} not accepted "
             f"(accepted: {', '.join(lt.value for lt in sorted(rules.loan_types, key=str))})"
-        )
+            f"{_unconfirmed(source, 'loan_types')}",
+            DeclineReason.OTHER,
+        ))
         # Remaining checks are moot if loan type is wrong.
-        return reasons, missing
+        return declines, unknowns, missing
 
     # 2. Geography (state)
-    if rules.approved_states and request.state not in rules.approved_states:
-        reasons.append(
-            f"state {request.state!r} not in approved states "
-            f"({', '.join(sorted(rules.approved_states))})"
-        )
+    if rules.approved_states:
+        if not (request.state or "").strip():
+            missing.append("state")
+            unknowns.append("state not confirmed — capture on call")
+        elif request.state not in rules.approved_states:
+            declines.append((
+                f"state {request.state!r} not in approved states "
+                f"({', '.join(sorted(rules.approved_states))}){_unconfirmed(source, 'approved_states')}",
+                DeclineReason.STATE_NOT_COVERED,
+            ))
 
     # 3. Loan amount
     if rules.min_loan_amount is not None and request.loan_amount < rules.min_loan_amount:
-        reasons.append(
+        declines.append((
             f"loan amount ${request.loan_amount:,.0f} below "
-            f"${rules.min_loan_amount:,.0f} minimum"
-        )
+            f"${rules.min_loan_amount:,.0f} minimum{_unconfirmed(source, 'min_loan_amount')}",
+            DeclineReason.LOAN_TOO_SMALL,
+        ))
     if rules.max_loan_amount is not None and request.loan_amount > rules.max_loan_amount:
-        reasons.append(
+        declines.append((
             f"loan amount ${request.loan_amount:,.0f} exceeds "
-            f"${rules.max_loan_amount:,.0f} maximum"
-        )
+            f"${rules.max_loan_amount:,.0f} maximum{_unconfirmed(source, 'max_loan_amount')}",
+            DeclineReason.LOAN_TOO_LARGE,
+        ))
 
     # 4. Minimum purchase price (separate from loan amount — Josh Oct 1)
     if rules.min_purchase_price is not None:
         if request.purchase_price is None:
             missing.append("purchase_price")
-            reasons.append(
+            unknowns.append(
                 f"purchase price unknown — lender requires minimum "
                 f"${rules.min_purchase_price:,.0f} (capture on call)"
             )
         elif request.purchase_price < rules.min_purchase_price:
-            reasons.append(
+            declines.append((
                 f"purchase price ${request.purchase_price:,.0f} below "
-                f"${rules.min_purchase_price:,.0f} minimum"
-            )
+                f"${rules.min_purchase_price:,.0f} minimum{_unconfirmed(source, 'min_purchase_price')}",
+                DeclineReason.OTHER,
+            ))
 
     # 5. LTV (loan / ARV)
     if rules.max_ltv is not None:
         if request.arv is None:
             missing.append("arv")
-            reasons.append(
+            unknowns.append(
                 f"ARV unknown — cannot verify LTV ≤ {rules.max_ltv:.0%} (capture on call)"
             )
         elif request.arv > 0:
             ltv = request.loan_amount / request.arv
             if ltv > rules.max_ltv:
-                reasons.append(
+                declines.append((
                     f"LTV {ltv:.1%} exceeds {rules.max_ltv:.0%} ARV cap "
                     f"(loan ${request.loan_amount:,.0f} / ARV ${request.arv:,.0f})"
-                )
+                    f"{_unconfirmed(source, 'max_ltv')}",
+                    DeclineReason.LTV_OVER_MAX,
+                ))
 
     # 6. LTC (loan / (purchase + rehab))
     if rules.max_ltc is not None:
@@ -242,43 +289,61 @@ def _check_rules(
                 missing.append("purchase_price")
             if rehab is None:
                 missing.append("rehab_budget")
-            reasons.append(
-                f"LTC cannot be calculated — purchase price or rehab budget missing"
-            )
+            unknowns.append("LTC cannot be calculated — purchase price or rehab budget missing (capture on call)")
         else:
             total_cost = purchase + rehab
             if total_cost > 0:
                 ltc = request.loan_amount / total_cost
                 if ltc > rules.max_ltc:
-                    reasons.append(
-                        f"LTC {ltc:.1%} exceeds {rules.max_ltc:.0%} limit"
-                    )
+                    declines.append((
+                        f"LTC {ltc:.1%} exceeds {rules.max_ltc:.0%} limit{_unconfirmed(source, 'max_ltc')}",
+                        DeclineReason.LTC_OVER_MAX,
+                    ))
 
     # 6b. Property type
     if rules.allowed_property_types:
         if request.property_type is None:
             missing.append("property_type")
-            reasons.append("property type unknown — capture on call")
+            unknowns.append("property type unknown — capture on call")
         elif request.property_type.strip().lower() not in {
             t.lower() for t in rules.allowed_property_types
         }:
-            reasons.append(f"property type {request.property_type!r} not accepted")
+            declines.append((
+                f"property type {request.property_type!r} not accepted"
+                f"{_unconfirmed(source, 'allowed_property_types')}",
+                DeclineReason.PROPERTY_TYPE_EXCLUDED,
+            ))
 
     # 7. Credit band (caller-asked, never a pulled score — Josh Oct 1 D2)
     if rules.credit_floor is not None:
         band = profile.credit_band_min_fico
         if band is _CREDIT_UNKNOWN:
-            # Unknown credit → conservative: cannot confirm eligibility.
             missing.append("credit_band_min_fico")
-            reasons.append(
+            unknowns.append(
                 f"credit band unknown — caller did not capture above/below "
                 f"{rules.credit_floor} (capture on call)"
             )
-        elif band < rules.credit_floor:
-            # band == 0 means "below 640" per Q1 encoding.
-            band_label = f"below {640}" if band == _CREDIT_BELOW_640 else f"{band}"
-            reasons.append(
-                f"credit band {band_label} below lender floor {rules.credit_floor}"
+        elif band >= rules.credit_floor:
+            pass
+        elif band == _CREDIT_BELOW_640:
+            # "below 640" is below every floor.
+            declines.append((
+                f"credit band below 640 below lender floor {rules.credit_floor}"
+                f"{_unconfirmed(source, 'credit_floor')}",
+                DeclineReason.CREDIT_BELOW_MIN,
+            ))
+        elif profile.credit_band_max_fico is not None and profile.credit_band_max_fico < rules.credit_floor:
+            # A closed band whose top is below the floor cannot qualify.
+            declines.append((
+                f"credit band {band}-{profile.credit_band_max_fico} below lender floor {rules.credit_floor}"
+                f"{_unconfirmed(source, 'credit_floor')}",
+                DeclineReason.CREDIT_BELOW_MIN,
+            ))
+        else:
+            # An open-ended band ("band+") or a closed one that crosses the floor may or may not clear it.
+            unknowns.append(
+                f"credit band {band}+ straddles the {rules.credit_floor} floor — "
+                f"needs confirmation on the call"
             )
 
     # 8. Borrower experience
@@ -286,31 +351,34 @@ def _check_rules(
         projects = profile.completed_projects
         if projects is None:
             missing.append("completed_projects")
-            reasons.append(
+            unknowns.append(
                 f"experience unknown — lender requires "
                 f"{rules.min_completed_projects}+ completed projects (capture on call)"
             )
         elif projects < rules.min_completed_projects:
-            reasons.append(
+            declines.append((
                 f"{projects} completed project(s) below "
                 f"{rules.min_completed_projects}+ minimum"
-            )
+                f"{_unconfirmed(source, 'min_completed_projects')}",
+                DeclineReason.EXPERIENCE_BELOW_MIN,
+            ))
         elif rules.requires_ground_up_build:
             # Ground-up build sub-rule (Josh Oct 1 / Consolidated §1.1, Q3)
             ground_up = profile.completed_ground_up_builds
             if ground_up is None:
                 missing.append("completed_ground_up_builds")
-                reasons.append(
+                unknowns.append(
                     "ground-up build count unknown — lender requires ≥1 "
                     "ground-up build among the 3+ projects (capture on call)"
                 )
             elif ground_up < 1:
-                reasons.append(
+                declines.append((
                     "no ground-up builds — lender requires ≥1 ground-up "
-                    "build among completed projects"
-                )
+                    f"build among completed projects{_unconfirmed(source, 'requires_ground_up_build')}",
+                    DeclineReason.EXPERIENCE_BELOW_MIN,
+                ))
 
-    return reasons, missing
+    return declines, unknowns, missing
 
 
 # ---------------------------------------------------------------------------
@@ -336,9 +404,9 @@ def _total_borrower_cost(rules: LenderRules, loan_amount: Decimal) -> Optional[D
 def _fit_score(fitting_verified_count: int, verified_total: int) -> Optional[Decimal]:
     """Provisional lender_fit_score (Q4 — pending Josh confirmation on meaning).
 
-    Returns the proportion of verified lenders that qualify, scaled 0–100,
-    rounded to one decimal place.  Returns None when there are no verified
-    lenders in the matrix (all shells), so the card shows nothing rather than 0.
+    Returns the proportion of lenders that qualify, scaled 0–100, rounded to
+    one decimal place.  Returns None when there are no lenders to count.  The
+    caller passes it only once every lender is confirmed (A1).
     """
     if verified_total == 0:
         return None

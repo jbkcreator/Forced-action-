@@ -17,6 +17,7 @@ import sys
 
 from sqlalchemy import create_engine, text
 
+from config.lending_routing import LEGACY_PLACEHOLDER_REASONS, SEED_DECLINE_REASONS
 from config.settings import get_settings
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -221,26 +222,18 @@ DDL = [
         END IF;
     END $$
     """,
+    # Link to the T-05 lenders whose rule values define this lender's eligibility (NULL = own boxes).
+    "ALTER TABLE lending.lender_routing_rules ADD COLUMN IF NOT EXISTS rule_keys TEXT[]",
 ]
 
-SEED_REASONS = [
-    ("unspecified", "Not specified"),
-    ("ltv", "LTV out of range"),
-    ("credit", "Credit too low"),
-    ("experience", "Insufficient borrower experience"),
-    ("product", "Product mismatch"),
-    ("geography", "Property outside footprint"),
-    ("amount", "Loan amount out of range"),
-    ("cap_exceeded", "Monthly cap reached"),
-    ("other", "Other (see free text)"),
-]
+SEED_REASONS = SEED_DECLINE_REASONS  # Josh's enum, one source: config/lending_routing.py
 
 
 def apply_to(conn) -> None:
     """Execute all DDL + seed data against an existing connection/transaction.
 
     Called by tests that wrap everything in a rolled-back transaction.
-    Does NOT commit — the caller is responsible.
+    Does NOT commit: the caller is responsible.
     """
     for stmt in DDL:
         conn.execute(text(stmt))
@@ -253,29 +246,17 @@ def apply_to(conn) -> None:
             ),
             {"code": code, "label": label},
         )
+    # Switch off only the placeholders seeded before Josh's enum arrived; codes added later are never touched.
+    conn.execute(
+        text("UPDATE lending.decline_reason_codes SET active = FALSE WHERE code = ANY(:old) AND active"),
+        {"old": list(LEGACY_PLACEHOLDER_REASONS)},
+    )
 
 
 def main() -> None:
     engine = create_engine(str(get_settings().database_url), pool_pre_ping=True)
-    with engine.connect() as conn:
-        for stmt in DDL:
-            conn.execute(text(stmt))
-            conn.commit()
-        log.info("DDL applied")
-
-        # Seed decline reason codes (idempotent: ON CONFLICT DO NOTHING)
-        for code, label in SEED_REASONS:
-            conn.execute(
-                text(
-                    "INSERT INTO lending.decline_reason_codes (code, label)"
-                    " VALUES (:code, :label)"
-                    " ON CONFLICT (code) DO NOTHING"
-                ),
-                {"code": code, "label": label},
-            )
-        conn.commit()
-        log.info("Seed data applied")
-
+    with engine.begin() as conn:
+        apply_to(conn)
     log.info("apply_lending_lender_routing: done")
 
 

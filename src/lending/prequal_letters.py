@@ -145,7 +145,12 @@ def _send_one(db, sink: PrequalSink, evaluator: FitEvaluator, row: dict[str, Any
     lead = PrequalLead(credit_band=row["credit_band"], loan_amount=int(row["loan_amount"]),
                        property_state=row["property_state"], loan_type=row["loan_type"])
     try:
-        ctx = build_context(lead, evaluator(lead), pct)
+        fits = evaluator(lead)
+        if fits is None:
+            _mark(db, row["id"], "pending", now)
+            logger.info("[prequal] letter id=%s waiting: lender fit undecided for this lead", row["id"])
+            return 0
+        ctx = build_context(lead, fits, pct)
         if ctx is None:
             _mark(db, row["id"], "skipped", now, skip_reason="no fitting lender")
             logger.info("[prequal] letter id=%s skipped: no fitting lender", row["id"])
@@ -189,9 +194,12 @@ def _record_failure(db, row: dict[str, Any], reason: str, now: datetime, *, conf
                row["id"], attempts, config_error, reason)
 
 
-def queue_and_send_in_background(*, lead_source: str, lead_ref: str, contact_id: str, lead: PrequalLead) -> None:
+def queue_and_send_in_background(*, lead_source: str, lead_ref: str, contact_id: str, lead: PrequalLead,
+                                 strict: bool = False) -> None:
     """Entry point for a lead source (e.g. the LendingFlow webhook) to schedule as a background task once the
-    lead and its GHL contact exist. Queues and commits first, then sends; never raises (the sweep retries)."""
+    lead and its GHL contact exist. Queues and commits first, then sends; never raises (the sweep retries).
+    With ``strict`` a failure to queue the letter is re-raised so the caller can retry the hand-off; a send
+    failure never is, because the queued letter is retried by the pre-qual sweep."""
     from config.settings import get_settings
     from src.lending.db import lending_session
     from src.lending.prequal_fit import get_fit_evaluator
@@ -203,8 +211,14 @@ def queue_and_send_in_background(*, lead_source: str, lead_ref: str, contact_id:
     try:
         with lending_session() as db:
             letter_id = enqueue(db, lead_source=lead_source, lead_ref=lead_ref, contact_id=contact_id, lead=lead)
-        if letter_id is None:
-            return
+    except Exception as exc:
+        logger.error("[prequal] enqueue failed source=%s: %s", lead_source, type(exc).__name__)
+        if strict:
+            raise
+        return
+    if letter_id is None:
+        return
+    try:
         with lending_session() as db:
             send_pending(db, get_live_sink(), get_fit_evaluator(), enabled=True,
                          pct=settings.lending_prequal_range_pct, letter_id=letter_id)

@@ -47,6 +47,7 @@ from config.lending_routing import (
     SEAT_CAP_COUNTED_ACTION,
 )
 from config.settings import get_settings
+from config.lender_matrix import LENDER_MATRIX
 from src.lending.contracts import LoanType
 from src.lending.db import get_lending_db
 
@@ -73,6 +74,18 @@ def _verify_admin(x_routing_admin_secret: Optional[str] = Header(default=None)) 
 # ── Schemas ───────────────────────────────────────────────────────────────────
 
 
+def _check_rule_keys(value: Optional[list[str]]) -> Optional[list[str]]:
+    """``rule_keys`` must be T-05 lender keys (config/lender_matrix.py); a typo would leave the lender with no rules."""
+    if value is None:
+        return None
+    known = {r.key for r in LENDER_MATRIX}
+    cleaned = [k.strip() for k in value]
+    unknown = [k for k in cleaned if k not in known]
+    if not cleaned or unknown:
+        raise ValueError(f"rule_keys must be a non-empty subset of {sorted(known)}; got {unknown or value}")
+    return cleaned
+
+
 class LenderIn(BaseModel):
     name: str
     active: bool = True
@@ -83,6 +96,12 @@ class LenderIn(BaseModel):
     construction_min_amount: Optional[int] = None
     points_paid_to_broker: Optional[float] = None
     takes_ground_up: bool = False
+    rule_keys: Optional[list[str]] = None
+
+    @field_validator("rule_keys")
+    @classmethod
+    def _rule_keys_known(cls, value: Optional[list[str]]) -> Optional[list[str]]:
+        return _check_rule_keys(value)
 
 
 class LenderPatch(BaseModel):
@@ -95,6 +114,12 @@ class LenderPatch(BaseModel):
     construction_min_amount: Optional[int] = None
     points_paid_to_broker: Optional[float] = None
     takes_ground_up: Optional[bool] = None
+    rule_keys: Optional[list[str]] = None
+
+    @field_validator("rule_keys")
+    @classmethod
+    def _rule_keys_known(cls, value: Optional[list[str]]) -> Optional[list[str]]:
+        return _check_rule_keys(value)
 
 
 class ProductBoxIn(BaseModel):
@@ -149,7 +174,7 @@ class ReorderIn(BaseModel):
     ordered_ids: list[int] = Field(min_length=1)
 
 
-_NULLABLE_LENDER_FIELDS = frozenset({"monthly_cap", "construction_min_amount", "points_paid_to_broker"})
+_NULLABLE_LENDER_FIELDS = frozenset({"monthly_cap", "construction_min_amount", "points_paid_to_broker", "rule_keys"})
 _FILE_STATUSES = ("unrouted", "routed", "held", "exhausted")
 
 
@@ -171,7 +196,7 @@ def list_lenders(
     rows = db.execute(
         text(
             "SELECT id, name, active, is_primary, agreement_status, priority,"
-            "       monthly_cap, construction_min_amount, takes_ground_up,"
+            "       monthly_cap, construction_min_amount, takes_ground_up, rule_keys,"
             "       created_at, updated_at"
             "  FROM lending.lender_routing_rules"
             " ORDER BY priority ASC, id ASC"
@@ -201,9 +226,9 @@ def create_lender(
                 "INSERT INTO lending.lender_routing_rules"
                 "  (name, active, is_primary, agreement_status, priority,"
                 "   monthly_cap, construction_min_amount, points_paid_to_broker,"
-                "   takes_ground_up, created_at, updated_at)"
+                "   takes_ground_up, rule_keys, created_at, updated_at)"
                 " VALUES (:name, :active, :primary, :status, :priority,"
-                "         :cap, :cmin, :pts, :gu, :now, :now)"
+                "         :cap, :cmin, :pts, :gu, :keys, :now, :now)"
                 " RETURNING id"
             ),
             {
@@ -211,7 +236,7 @@ def create_lender(
                 "status": body.agreement_status, "priority": body.priority,
                 "cap": body.monthly_cap, "cmin": body.construction_min_amount,
                 "pts": body.points_paid_to_broker, "gu": body.takes_ground_up,
-                "now": now,
+                "keys": body.rule_keys, "now": now,
             },
         ).scalar_one()
         db.commit()
@@ -364,6 +389,15 @@ def add_box(
     db: Session = Depends(get_lending_db),
 ) -> dict:
     _require_lender(lender_id, db)
+    keys = db.execute(
+        text("SELECT rule_keys FROM lending.lender_routing_rules WHERE id = :id"), {"id": lender_id},
+    ).scalar()
+    if keys:
+        raise HTTPException(
+            status_code=409,
+            detail=(f"This lender's rules come from the T-05 rule values ({', '.join(keys)}), so a box added here "
+                    "would be ignored. Edit its values in lending.lender_rule_values instead."),
+        )
     row_id = db.execute(
         text(
             "INSERT INTO lending.lender_product_boxes"

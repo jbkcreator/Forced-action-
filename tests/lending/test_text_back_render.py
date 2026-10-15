@@ -19,14 +19,14 @@ def _item(**over) -> PendingText:
     return PendingText(**base)
 
 
-def test_the_three_client_approved_texts_are_unchanged():
-    assert TEMPLATES["maturity"] == ("{greeting}, it's {caller} with Next Deal Lending. Sorry I missed you. "
+def test_the_three_texts_carry_no_company_name():
+    assert TEMPLATES["maturity"] == ("{greeting}, it's {caller} with Josh Kantor, Loan Officer. Sorry I missed you. "
                                      "I was calling about the loan on {property}. "
                                      "Call or text me back at {number} when it suits you. Reply STOP to opt out.")
-    assert TEMPLATES["deal_drop"] == ("{greeting}, {caller} from Next Deal Lending here. Just tried you about {property}. "
+    assert TEMPLATES["deal_drop"] == ("{greeting}, {caller} with Josh Kantor, Loan Officer here. Just tried you about {property}. "
                                       "We help investors in {county} fund their next deal. Text back if you'd like to chat. "
                                       "Reply STOP to opt out.")
-    assert TEMPLATES["general"] == ("{greeting}, this is {caller} with Next Deal Lending. Sorry we missed each other. "
+    assert TEMPLATES["general"] == ("{greeting}, this is {caller} with Josh Kantor, Loan Officer. Sorry we missed each other. "
                                     "Reply here or call {number} whenever works. Reply STOP to opt out.")
 
 
@@ -57,13 +57,13 @@ def test_first_name_is_a_real_first_name_or_nothing(name, expected):
 
 def test_maturity_text_renders_exactly():
     assert render_body(_item(), "maturity", number=NUMBER) == (
-        "Hi Sam, it's Alex with Next Deal Lending. Sorry I missed you. I was calling about the loan on 123 Main St. "
+        "Hi Sam, it's Alex with Josh Kantor, Loan Officer. Sorry I missed you. I was calling about the loan on 123 Main St. "
         "Call or text me back at (813) 555-0100 when it suits you. Reply STOP to opt out.")
 
 
 def test_no_first_name_or_caller_still_reads_naturally():
     body = render_body(_item(borrower_name="Acme Holdings LLC", caller_name=None), "general", number=NUMBER)
-    assert body.startswith("Hi, this is our team with Next Deal Lending.")
+    assert body.startswith("Hi, this is our team with Josh Kantor, Loan Officer.")
 
 
 def test_format_number_shows_a_us_number_and_passes_anything_else_through():
@@ -113,12 +113,12 @@ def test_braces_in_data_render_literally_without_exception():
 
 def test_deal_drop_text_renders_exactly():
     assert render_body(_item(queue="transaction_ready"), "deal_drop", number=NUMBER) == (
-        "Hi Sam, Alex from Next Deal Lending here. Just tried you about 123 Main St. "
+        "Hi Sam, Alex with Josh Kantor, Loan Officer here. Just tried you about 123 Main St. "
         "We help investors in Hillsborough fund their next deal. Text back if you'd like to chat. "
         "Reply STOP to opt out.")
 
 
 def test_general_text_renders_exactly():
     assert render_body(_item(queue="nurture"), "general", number=NUMBER) == (
-        "Hi Sam, this is Alex with Next Deal Lending. Sorry we missed each other. "
+        "Hi Sam, this is Alex with Josh Kantor, Loan Officer. Sorry we missed each other. "
         "Reply here or call (813) 555-0100 whenever works. Reply STOP to opt out.")

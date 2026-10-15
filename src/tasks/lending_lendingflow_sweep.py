@@ -4,7 +4,8 @@ Same shape as lending_web_lead_sweep: retries pending/failed leads with growing 
 (config.lending_lendingflow.GHL_RETRY_BACKOFF_MINUTES) until a lead is GHL_GIVE_UP_AFTER_HOURS old,
 and posts a lead still not in GHL GHL_ALERT_AFTER_MINUTES after arriving to Slack once (ids and last
 error only). The event and pre-qual hand-off fire from here too when this path is the one that
-gets the lead into GHL. Off with LENDING_LENDINGFLOW_ENABLED=false. Cron: every 5 minutes.
+gets the lead into GHL. Each run also tags delivered leads whose intro text was held for the borrower's 8am-8pm window
+(T-09, needs LENDING_INTRO_SMS_ENABLED). Off with LENDING_LENDINGFLOW_ENABLED=false. Cron: every 5 minutes.
 
     python -m src.tasks.lending_lendingflow_sweep
 """
@@ -19,7 +20,7 @@ from config.lending_lendingflow import GHL_ALERT_AFTER_MINUTES, GHL_GIVE_UP_AFTE
 from config.settings import get_settings
 from src.lending.db import lending_session
 from src.lending.disposition_delivery import _configured_slack, _slack_client
-from src.lending.lendingflow import deliver_and_follow_up
+from src.lending.lendingflow import deliver_and_follow_up, release_held_and_commit
 from src.lending.lendingflow_ghl import get_live_sink
 
 logger = logging.getLogger(__name__)
@@ -68,8 +69,10 @@ def alert_undelivered(slack_client: Any = None, minutes: Optional[int] = None) -
 def run() -> int:
     if not get_settings().lending_lendingflow_enabled:
         return 0
-    delivered = deliver_and_follow_up(get_live_sink())
-    logger.info("[lendingflow] sweep delivered=%d", delivered)
+    sink = get_live_sink()
+    delivered = deliver_and_follow_up(sink)
+    released = release_held_and_commit(sink)
+    logger.info("[lendingflow] sweep delivered=%d intro_released=%d", delivered, released)
     alert_undelivered()
     return delivered
 

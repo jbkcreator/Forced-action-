@@ -48,6 +48,7 @@ def rdb(lending_db):
     disposable Postgres (docker), not the shared DB: the routing tables have
     unique constraints that clash with any leftover rows.
     """
+    from migrations.apply_lending_lender_rule_values import apply_to as apply_rule_values
     from migrations.apply_lending_lendingflow_enrichment import apply_to as apply_enrichment
     from src.lending.models import LendingContact
 
@@ -55,6 +56,7 @@ def rdb(lending_db):
     LendingContact.__table__.create(bind=conn, checkfirst=True)  # FK target on a fresh database
     apply_lf(conn)
     apply_enrichment(conn)
+    apply_rule_values(conn)
     _apply_routing(conn)
     return lending_db
 
@@ -77,19 +79,21 @@ def _add_lender(
     construction_min_amount: Optional[int] = None,
     takes_ground_up: bool = False,
     active: bool = True,
+    rule_keys: Optional[list[str]] = None,
 ) -> int:
     """Insert a lender row and return its id."""
     lid = db.execute(
         text(
             "INSERT INTO lending.lender_routing_rules"
             "  (name, active, is_primary, agreement_status, priority,"
-            "   monthly_cap, construction_min_amount, takes_ground_up)"
-            " VALUES (:n, :a, :p, :s, :prio, :cap, :cmin, :gu)"
+            "   monthly_cap, construction_min_amount, takes_ground_up, rule_keys)"
+            " VALUES (:n, :a, :p, :s, :prio, :cap, :cmin, :gu, :rk)"
             " RETURNING id"
         ),
         {
             "n": name, "a": active, "p": is_primary, "s": agreement_status,
             "prio": priority, "cap": monthly_cap, "cmin": construction_min_amount, "gu": takes_ground_up,
+            "rk": rule_keys,
         },
     ).scalar_one()
     db.commit()
@@ -280,15 +284,15 @@ def test_decline_cascade_exhausted(rdb):
     assert _fr(rdb, lead_id)["current_lender_name"] == "Primary Flip"
 
     ev1 = _routed_event_id(rdb, lead_id)
-    record_decline(ev1, reason_code="ltv", actor="josh", db=rdb)
+    record_decline(ev1, reason_code="ltv_over_max", actor="josh", db=rdb)
     assert _fr(rdb, lead_id)["current_lender_name"] == "Overflow One"
 
     ev2 = _routed_event_id(rdb, lead_id)
-    record_decline(ev2, reason_code="ltv", actor="josh", db=rdb)
+    record_decline(ev2, reason_code="ltv_over_max", actor="josh", db=rdb)
     assert _fr(rdb, lead_id)["current_lender_name"] == "Overflow Two"
 
     ev3 = _routed_event_id(rdb, lead_id)
-    record_decline(ev3, reason_code="ltv", actor="josh", db=rdb)
+    record_decline(ev3, reason_code="ltv_over_max", actor="josh", db=rdb)
     fr = _fr(rdb, lead_id)
     assert fr["status"] == "exhausted"
 
@@ -442,8 +446,8 @@ def test_double_decline_same_event_is_noop(rdb):
     lead_id = _make_lead(rdb, phone_suffix="9601")
     _route(rdb, lead_id)
     ev = _routed_event_id(rdb, lead_id)
-    record_decline(ev, reason_code="ltv", actor="josh", db=rdb)
-    record_decline(ev, reason_code="ltv", actor="josh", db=rdb)
+    record_decline(ev, reason_code="ltv_over_max", actor="josh", db=rdb)
+    record_decline(ev, reason_code="ltv_over_max", actor="josh", db=rdb)
 
     events = _events(rdb, lead_id)
     assert sum(1 for e in events if e["action"] == "declined") == 1
@@ -719,7 +723,7 @@ def test_retry_posts_full_messages_and_skips_outcomes(rdb, fake_slack):
     lead = _make_lead(rdb, phone_suffix="1401", last_name="Nowak")
 
     _route(rdb, lead)
-    record_decline(_routed_event_id(rdb, lead), reason_code="ltv", actor="josh", db=rdb)
+    record_decline(_routed_event_id(rdb, lead), reason_code="ltv_over_max", actor="josh", db=rdb)
     record_outcome(lead, action="funded", actor="josh", db=rdb)
     rdb.execute(text("UPDATE lending.file_routing_events SET slack_ts = NULL, slack_posted_at = NULL"))
     rdb.commit()
@@ -787,7 +791,10 @@ def test_seed_from_t05_matrix_is_inert_idempotent_and_correct(rdb):
     primaries = [r for r in lenders if r["is_primary"]]
     assert len(primaries) == 1
     assert primaries[0]["monthly_cap"] == 15 and primaries[0]["construction_min_amount"] == 500_000
-    assert rdb.execute(text("SELECT COUNT(*) FROM lending.lender_product_boxes")).scalar() == 6
+    assert rdb.execute(text("SELECT COUNT(*) FROM lending.lender_product_boxes")).scalar() == 0  # numbers live in T-05
+    keyed = {r["name"]: r["rule_keys"] for r in rdb.execute(text(
+        "SELECT name, rule_keys FROM lending.lender_routing_rules")).mappings()}
+    assert all(keyed.values()) and sum(len(v) for v in keyed.values()) == 6  # six T-05 rows, five lenders
 
     flip = _make_lead(rdb, phone_suffix="1701")
     _route(rdb, flip)
@@ -845,10 +852,10 @@ def test_file_record_shows_current_next_and_history_and_one_click_decline(rdb, a
     rec = api.get(f"/api/lending/routing/files/{lead}").json()
     assert rec["current"]["name"] == "Second" and rec["next"] is None
     assert [h["action"] for h in rec["history"]] == ["routed", "declined", "routed"]
-    assert rec["history"][1]["reason_code"] == "unspecified" and rec["history"][1]["actor"] == "josh"
+    assert rec["history"][1]["reason_code"] == "other" and rec["history"][1]["actor"] == "josh"
 
     assert api.post(f"/api/lending/routing/files/{lead}/decline",
-                    json={"reason_code": "ltv", "actor": "josh"}).status_code == 200
+                    json={"reason_code": "ltv_over_max", "actor": "josh"}).status_code == 200
     rec = api.get(f"/api/lending/routing/files/{lead}").json()
     assert rec["file"]["status"] == "exhausted" and rec["current"] is None and rec["can_decline"] is False
     assert api.post(f"/api/lending/routing/files/{lead}/decline", json={}).status_code == 422
@@ -954,4 +961,118 @@ def test_a_failing_route_hook_does_not_poison_the_enrichment_session(rdb, monkey
 def test_meta_lists_the_vocabularies(api):
     meta = api.get("/api/lending/routing/meta").json()
     assert meta["loan_types"] == ["FIX_AND_FLIP", "GROUND_UP_CONSTRUCTION", "DSCR_RENTAL", "BRIDGE"]
-    assert "signed" in meta["agreement_statuses"] and meta["default_decline_reason"] == "unspecified"
+    assert "signed" in meta["agreement_statuses"] and meta["default_decline_reason"] == "other"
+
+
+# ── Reconcile with T-05: one source of truth for lender rule values ───────────
+
+FLIP_KEY = "generic_backflip_flip"  # a T-05 lender key (config/lender_matrix.py): flip, min loan $100,000
+
+
+def test_a_lender_with_rule_keys_is_judged_by_the_t05_values_not_by_its_own_boxes(rdb):
+    """T-05's numbers win. A box added directly on the lender (which the API forbids) is ignored."""
+    lender = _add_lender(rdb, name="T05 Lender", priority=1, rule_keys=[FLIP_KEY])
+    _add_box(rdb, lender, loan_types=[LOAN_TYPE_FLIP])  # would accept anything; must be ignored
+
+    small = _make_lead(rdb, loan_amount=50_000, phone_suffix="3001")  # below the T-05 flip minimum of $100,000
+    fits = _make_lead(rdb, loan_amount=300_000, phone_suffix="3002")
+    _route(rdb, small)
+    _route(rdb, fits)
+    assert _fr(rdb, small)["status"] == "held" and _fr(rdb, small)["hold_reason"] == "no_match"
+    assert _fr(rdb, fits)["current_lender_name"] == "T05 Lender"
+
+
+def test_routing_follows_edits_to_the_t05_rule_values_when_the_switch_is_on(rdb, monkeypatch):
+    """Same switch as the fit card: LENDING_RULES_FROM_DB reads lending.lender_rule_values for routing too."""
+    from config.settings import get_settings
+
+    _add_lender(rdb, name="Edited In Table", priority=1, rule_keys=[FLIP_KEY])
+    rdb.execute(text(
+        "UPDATE lending.lender_rule_values SET value = '400000'::jsonb, status = 'confirmed'"
+        " WHERE lender_key = :k AND field = 'min_loan_amount'"), {"k": FLIP_KEY})
+    rdb.commit()
+
+    switch_off = _make_lead(rdb, loan_amount=300_000, phone_suffix="3101")
+    _route(rdb, switch_off)  # switch off: the config value ($100,000) applies, the edit is not read
+    assert _fr(rdb, switch_off)["current_lender_name"] == "Edited In Table"
+
+    monkeypatch.setattr(get_settings(), "lending_rules_from_db", True)
+    switch_on = _make_lead(rdb, loan_amount=300_000, phone_suffix="3102")
+    _route(rdb, switch_on)  # switch on: the edited minimum ($400,000) applies
+    assert _fr(rdb, switch_on)["status"] == "held"
+
+
+def test_a_lender_with_no_rules_at_all_is_never_routed_to(rdb):
+    """Unknown eligibility must not mean "accepts everything": a signed lender with no rules gets nothing."""
+    _add_lender(rdb, name="No Rules Yet", priority=1)  # signed and active, no rule_keys, no boxes
+    lead = _make_lead(rdb, phone_suffix="3201")
+    _route(rdb, lead)
+    assert _fr(rdb, lead)["status"] == "held" and _fr(rdb, lead)["hold_reason"] == "no_match"
+
+
+def test_an_unknown_rule_key_fails_closed_without_crashing(rdb):
+    _add_lender(rdb, name="Typo Key", priority=1, rule_keys=["not_a_t05_lender"])
+    lead = _make_lead(rdb, phone_suffix="3301")
+    _route(rdb, lead)
+    assert _fr(rdb, lead)["status"] == "held"
+
+
+def test_admin_api_validates_rule_keys_and_refuses_boxes_on_a_t05_lender(api):
+    base = "/api/lending/routing"
+    assert api.post(f"{base}/lenders", json={"name": "Bad", "priority": 1, "rule_keys": ["nope"]}).status_code == 422
+    made = api.post(f"{base}/lenders", json={"name": "Linked", "priority": 1, "rule_keys": [FLIP_KEY]})
+    assert made.status_code == 201
+    lender_id = made.json()["id"]
+    listed = {r["name"]: r for r in api.get(f"{base}/lenders").json()}
+    assert listed["Linked"]["rule_keys"] == [FLIP_KEY]
+
+    blocked = api.post(f"{base}/lenders/{lender_id}/boxes", json={"loan_types": ["fix_and_flip"]})
+    assert blocked.status_code == 409 and "lender_rule_values" in blocked.json()["detail"]
+
+    assert api.patch(f"{base}/lenders/{lender_id}", json={"rule_keys": None}).status_code == 200  # unlink
+    assert api.post(f"{base}/lenders/{lender_id}/boxes", json={"loan_types": ["fix_and_flip"]}).status_code == 201
+
+
+# ── Josh's decline-reason enum ────────────────────────────────────────────────
+
+def test_decline_reasons_are_joshs_enum_and_the_old_placeholders_are_off(api):
+    from config.lending_routing import SEED_DECLINE_REASONS
+
+    rows = api.get("/api/lending/routing/decline-reasons").json()
+    active = {r["code"] for r in rows if r["active"]}
+    assert active == {code for code, _ in SEED_DECLINE_REASONS} and len(active) == 14
+    assert {"credit_below_min", "ltv_over_max", "seat_cap_reached", "borrower_withdrew", "other"} <= active
+    assert "unspecified" not in active
+
+
+def test_a_decline_must_use_a_code_from_joshs_enum(rdb):
+    from src.lending.routing.decline import record_decline
+
+    a = _add_lender(rdb, name="Enum A", priority=1)
+    _add_box(rdb, a, loan_types=[LOAN_TYPE_FLIP])
+    b = _add_lender(rdb, name="Enum B", priority=2)
+    _add_box(rdb, b, loan_types=[LOAN_TYPE_FLIP])
+    lead = _make_lead(rdb, phone_suffix="3401")
+    _route(rdb, lead)
+    ev = _routed_event_id(rdb, lead)
+
+    for retired in ("unspecified", "ltv", "credit"):  # the placeholders used before Josh's list
+        with pytest.raises(ValueError):
+            record_decline(ev, reason_code=retired, actor="josh", db=rdb)
+    assert not any(e["action"] == "declined" for e in _events(rdb, lead))
+    record_decline(ev, reason_code="credit_below_min", actor="josh", db=rdb)
+    assert [e["reason_code"] for e in _events(rdb, lead) if e["action"] == "declined"] == ["credit_below_min"]
+
+
+def test_rerunning_the_migration_retires_old_placeholders_but_keeps_codes_added_later(rdb):
+    from migrations.apply_lending_lender_routing import apply_to
+
+    conn = rdb.get_bind()
+    conn.execute(text("INSERT INTO lending.decline_reason_codes (code, label, active) VALUES"
+                      " ('unspecified', 'old placeholder', TRUE), ('appraisal_low', 'added by Josh later', TRUE)"
+                      " ON CONFLICT (code) DO UPDATE SET active = TRUE"))
+    apply_to(conn)
+    state = {r["code"]: r["active"] for r in rdb.execute(text(
+        "SELECT code, active FROM lending.decline_reason_codes WHERE code IN ('unspecified', 'appraisal_low', 'other')"
+    )).mappings()}
+    assert state == {"unspecified": False, "appraisal_low": True, "other": True}  # off, never deleted

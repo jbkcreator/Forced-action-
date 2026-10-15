@@ -9,6 +9,8 @@ from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
+from config.lending_prequal import BORROWER_CALLBACK_PHONE, BORROWER_SIGNER
+
 _TEMPLATES_DIR = Path(__file__).parent / "templates"
 _ARCHIVO_WOFF2 = Path(__file__).parent / "fonts" / "Archivo-latin-var.woff2"
 
@@ -28,7 +30,8 @@ def render_html(template_name: str, context: dict, *, watermark: str) -> str:
         autoescape=True,
         undefined=StrictUndefined,
     )
-    return env.get_template(template_name).render(**context, watermark=watermark, archivo_woff2_b64=_archivo_b64())
+    return env.get_template(template_name).render(**context, watermark=watermark, archivo_woff2_b64=_archivo_b64(),
+                                                  signer=BORROWER_SIGNER, callback_phone=BORROWER_CALLBACK_PHONE)
 
 
 def render_pdf(template_name: str, context: dict, *, watermark: str) -> bytes:

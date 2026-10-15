@@ -9,10 +9,10 @@ PENDING ANSWERS (these defaults ship until Josh replies)
 Q1  Seat cap counting action.  Default: 'funded' (only funded loans count
     against the monthly cap).  Change SEAT_CAP_COUNTED_ACTION to 'routed'
     if Josh wants the cap on files accepted, not funded.
-Q2  One-click decline records reason 'unspecified' by default.  The reason
-    must be a code in lending.decline_reason_codes (Josh supplies the enum;
-    the seeded codes are placeholders).  Filling a reason in afterwards is
-    not supported: the events table is append-only.
+Q2  One-click decline records reason 'other' by default (Josh's enum has no
+    'unspecified').  The reason must be a code in lending.decline_reason_codes,
+    which holds Josh's enum.  Filling a reason in afterwards is not supported:
+    the events table is append-only.
 Q3  'held' is a 5th action beyond the spec's routed/declined/approved/funded
     (used for the hold-queue and exhausted terminal states).  Josh to confirm
     what "all four events" in acceptance test 3 means.
@@ -50,21 +50,33 @@ PRIMARY_DEFAULT_CONSTRUCTION_MIN: int = 500_000
 # approved / funded; routed and declined are written by the router and the decline handler).
 OUTCOME_ACTIONS: tuple[str, ...] = ("approved", "funded")
 
-# Default reason code recorded on a one-click decline (Q2).
-DEFAULT_DECLINE_REASON: str = "unspecified"
+# Default reason recorded on a one-click decline (Q2). Josh's enum has no "unspecified", so the one-click
+# decline records "other"; the team still has to confirm that is what he wants (open question Q2).
+DEFAULT_DECLINE_REASON: str = "other"
 
-# Seed decline reason codes. Josh to supply the real enum.
+# Josh's fixed decline-reason enum (his reply, "Inputs for the addendum"). Stored as data, so it stays editable.
 SEED_DECLINE_REASONS: list[tuple[str, str]] = [
-    ("unspecified", "Not specified"),
-    ("ltv", "LTV out of range"),
-    ("credit", "Credit too low"),
-    ("experience", "Insufficient borrower experience"),
-    ("product", "Product mismatch"),
-    ("geography", "Property outside footprint"),
-    ("amount", "Loan amount out of range"),
-    ("cap_exceeded", "Monthly cap reached"),
+    ("credit_below_min", "Credit below the lender's minimum"),
+    ("experience_below_min", "Experience below the lender's minimum"),
+    ("ltv_over_max", "LTV over the lender's maximum"),
+    ("ltc_over_max", "LTC over the lender's maximum"),
+    ("loan_too_small", "Loan too small"),
+    ("loan_too_large", "Loan too large"),
+    ("property_type_excluded", "Property type excluded"),
+    ("state_not_covered", "State not covered"),
+    ("owner_occupied", "Owner occupied"),
+    ("seat_cap_reached", "Lender's seat cap reached"),
+    ("borrower_unresponsive", "Borrower unresponsive"),
+    ("borrower_withdrew", "Borrower withdrew"),
+    ("docs_incomplete", "Documents incomplete"),
     ("other", "Other (see free text)"),
 ]
+
+# Placeholder codes seeded before Josh supplied his enum. The migration switches these off (never deletes them,
+# so any event that used one still reads correctly); codes added later through the API are left alone.
+LEGACY_PLACEHOLDER_REASONS: tuple[str, ...] = (
+    "unspecified", "ltv", "credit", "experience", "product", "geography", "amount", "cap_exceeded",
+)
 
 # Routing engine: maximum qualifying lenders evaluated per file per run.
 MAX_WATERFALL_DEPTH = 50

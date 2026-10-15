@@ -110,6 +110,27 @@ def test_credit_band_straddling_a_floor_asks_for_confirmation():
     assert view.straddles == ["Backflip: credit needs confirmation on the call"]
 
 
+def test_unknown_credit_lists_lenders_as_possible_not_fitting_or_declined():
+    """A3: unknown eligibility shows 'possible, confirm on the call'; a lender with no floor still fits."""
+    view = evaluate_fit(_lead(credit_band=None, credit_band_min_fico=None), address=None, matrix=_matrix())
+    assert view.possible == ["Backflip"]  # both Backflip rows have a credit floor; one entry per lender
+    assert "Backflip" not in view.ranked
+    assert view.ranked == ["RCN Capital", "Easy Street Capital", "Kiavi Affiliate", "Asset Based Lending (ABL)"]
+    assert view.to_json()["possible"] == ["Backflip"]
+
+
+def test_a_lender_that_fits_is_never_also_listed_as_possible():
+    # Backflip's flip row fits a 700 band; its construction row is a loan-type mismatch (a decline).
+    view = evaluate_fit(_lead(), address=None, matrix=_matrix())
+    assert view.possible == []
+
+
+def test_card_text_lists_possible_lenders():
+    view = evaluate_fit(_lead(credit_band=None, credit_band_min_fico=None), address=None, matrix=_matrix())
+    text_ = service.render_card_text(7, None, RoutingTag.NURTURE, None, view, coverage_note=None)
+    assert "Possible, confirm on the call: Backflip" in text_
+
+
 def test_open_ended_band_never_straddles():
     view = evaluate_fit(_lead(credit_band="740+", credit_band_min_fico=740), address=None, matrix=_matrix())
     assert view.straddles == []
@@ -277,6 +298,96 @@ def test_sweep_creates_rows_for_missed_events_and_retries_failures(enr_db, facts
     assert service.run_sweep(enr_db, thread=FakeDealThread()) == 0  # attempts capped
 
 
+def test_exhausted_failures_do_not_starve_newer_work(enr_db, facts, monkeypatch):
+    monkeypatch.setattr(service, "SWEEP_BATCH_SIZE", 1)
+    exhausted = [_make_lead(enr_db, vendor=f"LF-X{n}", phone=f"(727) 555-02{n:02d}") for n in range(4)]
+    for lead_id in exhausted:
+        service.ensure_row(enr_db, lead_id)
+    enr_db.execute(text("UPDATE lending.lendingflow_enrichment SET status = 'failed', attempts = 8, "
+                        "last_attempt_at = now() - interval '2 days', updated_at = now() - interval '2 days' "
+                        "WHERE lead_id = ANY(:ids)"), {"ids": exhausted})
+    fresh = _make_lead(enr_db, vendor="LF-NEW", phone="(727) 555-0333")
+    service.ensure_row(enr_db, fresh)
+    enr_db.commit()
+    # the exhausted rows are older and fill the candidate window; the sweep must still reach the new lead
+    assert service.run_sweep(enr_db, thread=FakeDealThread()) == 1
+    assert _row(enr_db, fresh)["status"] == "ready"
+    assert all(_row(enr_db, lead_id)["status"] == "failed" for lead_id in exhausted)
+
+
+def test_facts_saved_mid_run_are_not_overwritten_by_the_old_run(enr_db, monkeypatch):
+    lead_id = _make_lead(enr_db, address="12 Main St")
+    service.ensure_row(enr_db, lead_id)
+    enr_db.commit()
+    corrected = []
+
+    def match_while_facts_arrive(db, *args, **kwargs):  # the corrected facts land while the first run is working
+        if not corrected:
+            corrected.append(True)
+            service.record_deal_facts(db, phone="(727) 555-0100", address="99 Oak Ave",
+                                      target_close_date=date(2026, 11, 1), source="slack_form")
+            db.commit()
+        return PropertyMatch(42, 100, "hillsborough")
+
+    monkeypatch.setattr(service, "match_property", match_while_facts_arrive)
+    monkeypatch.setattr(service, "load_property_facts", lambda *a, **k: PropertyFacts(deed_count=1))
+    thread, now = FakeDealThread(), datetime(2026, 10, 9, 16, tzinfo=timezone.utc)
+    assert service.enrich_lead(enr_db, lead_id, thread=thread, now=now).status == "superseded"
+    row = _row(enr_db, lead_id)
+    assert row["status"] == "pending" and row["captured_address"] == "99 Oak Ave"
+    assert row["routing_tag"] is None and thread.posts == []  # nothing built from the old facts was kept or posted
+    outcome = service.enrich_lead(enr_db, lead_id, thread=thread, street_view=FakeStreetView(), comps=FakeComps(), now=now)
+    row = _row(enr_db, lead_id)
+    assert outcome.status == "ready" and row["status"] == "ready"
+    assert row["routing_tag"] == "FULL_MACHINE" and "99 Oak Ave" in thread.posts[0][1]
+
+
+class _ReplyFailsOnce(FakeDealThread):
+    """Slack accepts the card, then drops the first Street View / comps reply (the live port returns None)."""
+
+    def __init__(self):
+        super().__init__()
+        self.reply_dropped = False
+
+    def post(self, text, *, thread_ts=None):
+        if thread_ts is not None and "Street View" in text and not self.reply_dropped:
+            self.reply_dropped = True
+            return None
+        return super().post(text, thread_ts=thread_ts)
+
+
+def test_failed_analysis_reply_is_retried_without_repeating_the_card(enr_db, facts):
+    lead_id = _make_lead(enr_db)
+    service.record_deal_facts(enr_db, phone="(727) 555-0100", address="99 Oak Ave", target_close_date=None, source="slack_form")
+    enr_db.commit()
+    thread = _ReplyFailsOnce()
+    ports = {"thread": thread, "street_view": FakeStreetView({"99 Oak Ave": "https://maps.example/pano/1"}), "comps": FakeComps()}
+    first = service.enrich_lead(enr_db, lead_id, **ports)
+    row = _row(enr_db, lead_id)
+    assert first.status == "failed" and row["last_error"] == "deal_thread_reply_failed"
+    assert row["thread_ts"] and row["post_signature"] and row["analysis_signature"] is None
+    assert len(thread.posts) == 1  # only the card was delivered
+    second = service.enrich_lead(enr_db, lead_id, **ports)
+    row = _row(enr_db, lead_id)
+    assert second.status == "ready" and row["status"] == "ready" and row["analysis_signature"] == row["post_signature"]
+    assert len(thread.posts) == 2 and "pano/1" in thread.posts[1][1]  # the reply alone; the card was not posted again
+    service.record_deal_facts(enr_db, phone="(727) 555-0100", address="99 Oak Ave", target_close_date=None, source="slack_form")
+    enr_db.commit()
+    service.enrich_lead(enr_db, lead_id, **ports)
+    assert len(thread.posts) == 2  # both deliveries are recorded: a replay posts nothing
+
+
+def test_migration_adds_the_analysis_column_to_an_existing_table_and_reruns_cleanly(enr_db):
+    from migrations.apply_lending_lendingflow_enrichment import apply_to
+
+    conn = enr_db.get_bind()
+    conn.execute(text("ALTER TABLE lending.lendingflow_enrichment DROP COLUMN analysis_signature"))  # first-release table
+    apply_to(conn)
+    apply_to(conn)
+    assert enr_db.execute(text("SELECT count(*) FROM information_schema.columns WHERE table_schema = 'lending' "
+                               "AND table_name = 'lendingflow_enrichment' AND column_name = 'analysis_signature'")).scalar() == 1
+
+
 def test_event_handler_is_a_no_op_while_the_flag_is_off(enr_db, monkeypatch):
     monkeypatch.setattr(service, "enabled", lambda: False)
     service.on_lead_created(object())  # would raise on .lead_id if it did any work
@@ -336,3 +447,18 @@ def test_webhook_auth_and_flag(client, enr_db, monkeypatch):
 
     monkeypatch.setattr(hook.get_settings(), "lending_enrichment_enabled", False)
     assert _post(client, body).status_code == 503
+
+
+def test_a_band_entirely_below_the_floor_is_not_listed_as_possible():
+    """Review finding: 600-639 against Backflip's 640 floor cannot qualify, so it is not 'possible'."""
+    view = evaluate_fit(_lead(credit_band="600-639", credit_band_min_fico=600), address=None, matrix=_matrix())
+    assert "Backflip" not in view.possible and "Backflip" not in view.ranked
+    assert view.straddles == []
+
+
+def test_a_band_that_crosses_the_floor_is_still_possible_and_open_ended_stays_possible():
+    crossing = evaluate_fit(_lead(credit_band="620-679", credit_band_min_fico=620), address=None, matrix=_matrix())
+    assert crossing.straddles == ["Backflip: credit needs confirmation on the call"]
+    assert "Backflip" in crossing.possible
+    open_ended = evaluate_fit(_lead(credit_band="600+", credit_band_min_fico=600), address=None, matrix=_matrix())
+    assert "Backflip" in open_ended.possible  # no upper bound: it may still clear the floor

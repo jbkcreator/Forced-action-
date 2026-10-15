@@ -1,9 +1,12 @@
 """R-1: seed lending.lender_routing_rules from the T-05 lender matrix.
 
 The spec: "The six rows in #341 become the seed of lender_routing_rules."  The six T-05 rows
-(config/lender_matrix.py) become lender rows and product boxes, derived from that data; this
-script names no lender itself.  The two rows that share the primary key prefix become one lender
-with two boxes (a flip box and a ground-up box).
+(config/lender_matrix.py) become lender rows, derived from that data; this script names no lender
+itself.  The two rows that share the primary key prefix become one lender.
+
+Each seeded lender records its T-05 ``rule_keys`` and gets NO boxes of its own: the router reads the
+eligibility numbers from the T-05 rule values (the same ones the lead card's fit score uses), so the
+numbers live in one place.  Boxes in ``lender_product_boxes`` are only for lenders T-05 does not define.
 
 Safe defaults, so nothing routes until Josh acts:
   - every seeded lender has agreement_status 'pending' (the router never routes to a lender
@@ -13,9 +16,7 @@ Safe defaults, so nothing routes until Josh acts:
   - priorities continue after any existing rows; an existing lender (matched by name) is skipped
     whole, so re-running adds nothing and never overwrites Josh's edits.
 
-Not carried over (the table has no column for them): minimum purchase price, property types and
-cost parameters.  The T-05 fit evaluator for the enrichment card still reads config/lender_matrix.py
-until it is cut over to this table.
+The fit evaluator for the enrichment card keeps reading the T-05 rule values; nothing is copied here.
 
 Run:  PYTHONPATH=. python migrations/apply_lending_lender_routing_seed.py
 Run after apply_lending_lender_routing.py.
@@ -54,7 +55,7 @@ def _int(value):
 
 
 def apply_to(conn) -> int:
-    """Insert missing lenders and their boxes on an open connection. Returns lenders inserted.
+    """Insert missing lenders (linked to their T-05 rule keys) on an open connection. Returns lenders inserted.
 
     Does not commit; the caller is responsible.
     """
@@ -78,35 +79,18 @@ def apply_to(conn) -> int:
                 PRIMARY_DEFAULT_CONSTRUCTION_MIN,
             )
             has_primary = True
-        lender_id = conn.execute(
+        conn.execute(
             text(
                 "INSERT INTO lending.lender_routing_rules"
                 "  (name, active, is_primary, agreement_status, priority, monthly_cap,"
-                "   construction_min_amount, takes_ground_up)"
-                " VALUES (:name, TRUE, :primary, 'pending', :prio, :cap, :cmin, :gu)"
-                " RETURNING id"
+                "   construction_min_amount, takes_ground_up, rule_keys)"
+                " VALUES (:name, TRUE, :primary, 'pending', :prio, :cap, :cmin, :gu, :keys)"
             ),
             {
                 "name": name, "primary": is_primary, "prio": priority, "cap": monthly_cap,
-                "cmin": construction_min, "gu": bool(ground_up),
+                "cmin": construction_min, "gu": bool(ground_up), "keys": [r.key for r in rows],
             },
-        ).scalar_one()
-        for r in rows:
-            conn.execute(
-                text(
-                    "INSERT INTO lending.lender_product_boxes"
-                    "  (lender_id, loan_types, min_loan_amount, max_loan_amount, approved_states,"
-                    "   credit_floor, max_ltv, max_ltc, min_completed_projects, requires_ground_up_build)"
-                    " VALUES (:lid, :lt, :min, :max, :states, :credit, :ltv, :ltc, :proj, :gu)"
-                ),
-                {
-                    "lid": lender_id, "lt": sorted(t.value for t in r.loan_types),
-                    "min": _int(r.min_loan_amount), "max": _int(r.max_loan_amount),
-                    "states": sorted(r.approved_states) or None, "credit": r.credit_floor,
-                    "ltv": r.max_ltv, "ltc": r.max_ltc, "proj": r.min_completed_projects,
-                    "gu": r.requires_ground_up_build,
-                },
-            )
+        )
         inserted += 1
     return inserted
 

@@ -5,9 +5,15 @@ T-05 evaluator (``src.lending.lender_fit``) continues to exist for the
 enrichment card; this module is the routing engine's own, DB-backed
 equivalent.
 
-Design: all lenders — including the primary lender — are rows in
-``lending.lender_routing_rules``.  Their eligibility constraints live in
-``lending.lender_product_boxes``.  The router never names any specific lender.
+Design: all lenders, including the primary lender, are rows in
+``lending.lender_routing_rules``.  The router never names any specific lender.
+
+Where a lender's eligibility comes from (one source of truth, no copies of the same numbers):
+  - a lender with ``rule_keys`` uses the T-05 rule values for those keys (``config/lender_matrix.py``, with
+    ``lending.lender_rule_values`` applied when ``LENDING_RULES_FROM_DB`` is on): the same values and
+    statuses the lead card's fit score reads.
+  - a lender without ``rule_keys`` (one T-05 does not define) uses its own ``lending.lender_product_boxes``.
+  - a lender with neither has no known rules and is never routed to; the file goes to the hold queue.
 """
 from __future__ import annotations
 
@@ -17,6 +23,10 @@ from typing import Optional
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+
+from config.lender_matrix import LENDER_MATRIX, LenderRules
+from config.settings import get_settings
+from src.lending.lender_rules_store import load_matrix
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +83,43 @@ class FileProfile:
     rehab_budget: Optional[int] = None
 
 
+# ── T-05 rule values -> boxes ─────────────────────────────────────────────
+
+
+def _box_from_t05(rules: LenderRules) -> ProductBox:
+    """A routing box from one T-05 rule row.  An unset limit means "not enforced", exactly as in T-05."""
+    return ProductBox(
+        loan_types=frozenset(t.value for t in rules.loan_types),
+        min_loan_amount=int(rules.min_loan_amount) if rules.min_loan_amount is not None else None,
+        max_loan_amount=int(rules.max_loan_amount) if rules.max_loan_amount is not None else None,
+        approved_states=frozenset(rules.approved_states) if rules.approved_states else None,
+        credit_floor=rules.credit_floor,
+        max_ltv=float(rules.max_ltv) if rules.max_ltv is not None else None,
+        max_ltc=float(rules.max_ltc) if rules.max_ltc is not None else None,
+        min_completed_projects=rules.min_completed_projects,
+        requires_ground_up_build=rules.requires_ground_up_build,
+    )
+
+
+def _t05_boxes(db: Session, keys_by_lender: dict[int, list[str]]) -> dict[int, list[ProductBox]]:
+    """Boxes for every lender that names T-05 ``rule_keys``, read once per load.
+
+    Uses the same switch as the fit card: the rule-values table when ``LENDING_RULES_FROM_DB`` is on, else the
+    config.  A key T-05 does not define yields no box for it (so, with no other key, the lender is never routed).
+    """
+    if not keys_by_lender:
+        return {}
+    matrix = load_matrix(db) if get_settings().lending_rules_from_db else LENDER_MATRIX
+    by_key = {rules.key: rules for rules in matrix}
+    boxes: dict[int, list[ProductBox]] = {}
+    for lender_id, keys in keys_by_lender.items():
+        found = [by_key[k] for k in keys if k in by_key]
+        for missing in (k for k in keys if k not in by_key):
+            logger.error("lender_routing_rules id=%d names unknown T-05 rule key %r; it adds no box", lender_id, missing)
+        boxes[lender_id] = [_box_from_t05(r) for r in found]
+    return boxes
+
+
 # ── Loader ────────────────────────────────────────────────────────────────
 
 
@@ -85,7 +132,7 @@ def load_active_lenders(db: Session) -> list[LenderRow]:
     lender_rows = db.execute(
         text(
             "SELECT id, name, active, is_primary, agreement_status, priority,"
-            "       monthly_cap, construction_min_amount, takes_ground_up"
+            "       monthly_cap, construction_min_amount, takes_ground_up, rule_keys"
             "  FROM lending.lender_routing_rules"
             " WHERE active = TRUE"
             " ORDER BY priority ASC, id ASC"
@@ -122,6 +169,7 @@ def load_active_lenders(db: Session) -> list[LenderRow]:
         )
         boxes_by_lender.setdefault(b["lender_id"], []).append(box)
 
+    t05_boxes = _t05_boxes(db, {r["id"]: r["rule_keys"] for r in lender_rows if r["rule_keys"]})
     return [
         LenderRow(
             id=r["id"],
@@ -133,7 +181,7 @@ def load_active_lenders(db: Session) -> list[LenderRow]:
             monthly_cap=r["monthly_cap"],
             construction_min_amount=r["construction_min_amount"],
             takes_ground_up=r["takes_ground_up"],
-            boxes=tuple(boxes_by_lender.get(r["id"], [])),
+            boxes=tuple(t05_boxes[r["id"]] if r["rule_keys"] else boxes_by_lender.get(r["id"], [])),
         )
         for r in lender_rows
     ]
@@ -145,7 +193,7 @@ def load_active_lenders(db: Session) -> list[LenderRow]:
 def _box_matches(box: ProductBox, profile: FileProfile) -> tuple[bool, list[str]]:
     """Return (matches, rejection_reasons) for one product box.
 
-    A lender with no boxes has no restrictions and accepts everything.
+    A box with an unset limit does not enforce it.
     """
     reasons: list[str] = []
 
@@ -182,9 +230,11 @@ def _box_matches(box: ProductBox, profile: FileProfile) -> tuple[bool, list[str]
 
 
 def lender_passes_box(lender: LenderRow, profile: FileProfile) -> bool:
-    """True when the file passes at least one of the lender's product boxes."""
-    if not lender.boxes:
-        return True  # no boxes = no restrictions
+    """True when the file passes at least one of the lender's product boxes.
+
+    A lender with no boxes has no known rules, so it never matches: unknown eligibility must not mean
+    "accepts everything" (the file goes on to the next lender or the hold queue instead).
+    """
     return any(_box_matches(box, profile)[0] for box in lender.boxes)
 
 
