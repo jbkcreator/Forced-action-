@@ -325,7 +325,8 @@ def _services(recorder: Recorder, tmp_path, fit: LenderFitResult | None = None,
         slack=recorder.slack.append, render_pdf=render, evaluate_fit=lambda borrower, loan, matrix: fit,
         fit_limits=lambda result, matrix: [FitLimits(100_000, 1_000_000)] if result.fitting else [],
         load_matrix=lambda: matrix,
-        phone_opted_out=lambda phone: False, email_opted_out=lambda email: False, text_window_open=lambda phone: True,
+        opt_outs=lambda phone, email: partner_pipeline.OptOuts(phone=False, email=False),
+        text_window_open=lambda phone: True,
         upload_dir=str(tmp_path / "uploads"), prequal_pct=10,
     )
 
@@ -445,12 +446,13 @@ def test_attribution_report_counts_funded_files_per_partner(session_factory) -> 
     assert dict(last_month) == {"Partner A": 0, "Partner B": 0}
 
 
-def test_partner_who_agreed_to_texts_gets_a_text_instead_of_an_email(engine, session_factory, tmp_path) -> None:
+def test_partner_who_agreed_to_texts_gets_the_email_and_a_text(engine, session_factory, tmp_path) -> None:
     _, token = _partner(session_factory, sms_consent=True)
     file_id = _submit(session_factory, token)
     recorder = Recorder()
     partner_pipeline.process_new_file(file_id, _services(recorder, tmp_path), session_factory)
-    assert [phone for phone, _ in recorder.texts] == ["+17275550199"] and recorder.emails == []
+    assert [phone for phone, _ in recorder.texts] == ["+17275550199"]
+    assert [email[0] for email in recorder.emails] == ["maria@example.com"]
 
 
 def test_failed_text_falls_back_to_email(engine, session_factory, tmp_path) -> None:
@@ -467,10 +469,10 @@ def test_failed_text_falls_back_to_email(engine, session_factory, tmp_path) -> N
 
 
 @pytest.mark.parametrize("override", [
-    {"phone_opted_out": lambda phone: True},  # partner texted STOP
+    {"opt_outs": lambda phone, email: partner_pipeline.OptOuts(phone=True, email=False)},  # partner texted STOP
     {"text_window_open": lambda phone: False},  # night time for the partner
 ])
-def test_opted_out_number_or_closed_window_gets_email_not_text(engine, session_factory, tmp_path, override) -> None:
+def test_opted_out_number_or_closed_window_gets_email_only(engine, session_factory, tmp_path, override) -> None:
     _, token = _partner(session_factory, sms_consent=True)
     file_id = _submit(session_factory, token)
     recorder = Recorder()
@@ -483,7 +485,8 @@ def test_opted_out_email_is_never_emailed(engine, session_factory, tmp_path) -> 
     _, token = _partner(session_factory)
     file_id = _submit(session_factory, token)
     recorder = Recorder()
-    services = dataclasses.replace(_services(recorder, tmp_path), email_opted_out=lambda email: True)
+    services = dataclasses.replace(_services(recorder, tmp_path),
+                                   opt_outs=lambda phone, email: partner_pipeline.OptOuts(phone=False, email=True))
     partner_pipeline.process_new_file(file_id, services, session_factory)
     assert recorder.emails == [] and recorder.texts == []
     assert _rows(engine, "partner_submissions")[0]["partner_confirmed_at"] is None
@@ -494,12 +497,28 @@ def test_failing_opt_out_check_blocks_the_send(engine, session_factory, tmp_path
     file_id = _submit(session_factory, token)
     recorder = Recorder()
 
-    def broken(value):
+    def broken(phone, email):
         raise RuntimeError("db down")
 
-    partner_pipeline.process_new_file(file_id, dataclasses.replace(_services(recorder, tmp_path), email_opted_out=broken),
+    partner_pipeline.process_new_file(file_id, dataclasses.replace(_services(recorder, tmp_path), opt_outs=broken),
                                       session_factory)
-    assert recorder.emails == []
+    assert recorder.emails == [] and recorder.texts == []
+
+
+def test_revoked_page_is_plain(session_factory, client) -> None:
+    partner_id, token = _partner(session_factory)
+    with session_factory() as db:
+        partners.revoke_link(db, partner_id)
+    page = client.get(f"/api/lending/partners/{token}")
+    assert page.status_code == 404 and "This link is no longer active." in page.text
+    assert "<style" not in page.text and "Next Deal Lending" not in page.text
+
+
+def test_upload_error_is_shown_as_its_user_message(session_factory, client) -> None:
+    _, token = _partner(session_factory)
+    page = client.post(f"/api/lending/partners/{token}/files", data=FORM,
+                       files=[("documents", ("virus.exe", b"MZ", "application/octet-stream"))])
+    assert page.status_code == 400 and "virus.exe: only PDF, JPG, PNG or HEIC files can be attached" in page.text
 
 
 def test_change_status_commits_and_tells_the_partner(engine, session_factory, tmp_path) -> None:

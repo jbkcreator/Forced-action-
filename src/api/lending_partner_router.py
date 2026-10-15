@@ -176,7 +176,7 @@ def submit_file(
         db.commit()
     except InvalidSubmission as error:
         db.rollback()
-        return _form(token, partner, consent_text, values=values, errors=[str(error)], status_code=400)
+        return _form(token, partner, consent_text, values=values, errors=[error.user_message], status_code=400)
     except Exception as error:
         db.rollback()
         logger.error("[partner-door] could not save submission partner=%s (%s)", partner.id, type(error).__name__)

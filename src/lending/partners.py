@@ -55,7 +55,11 @@ _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 class InvalidSubmission(ValueError):
-    """The submission cannot be saved; the message is safe to show on the form."""
+    """The submission cannot be saved. ``user_message`` is the copy shown on the form."""
+
+    def __init__(self, user_message: str) -> None:
+        super().__init__(user_message)
+        self.user_message = user_message
 
 
 def _utcnow() -> datetime:
