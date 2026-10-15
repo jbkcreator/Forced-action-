@@ -30,6 +30,7 @@ from config.lending_partners import (
     RATE_LIMIT_PER_WINDOW,
     RATE_LIMIT_SCOPE,
     RATE_LIMIT_WINDOW_SECONDS,
+    STATUS_LABELS,
     TIMELINES,
 )
 from config.settings import get_settings
@@ -191,4 +192,4 @@ def partner_status(token: str, db: Session = Depends(get_lending_db)) -> HTMLRes
     if partner is None:
         return _inactive()
     return _page("dashboard.html", token=token, partner=partner, files=partner_files(db, partner.id),
-                 products=PRODUCT_LABELS)
+                 products=PRODUCT_LABELS, status_labels=STATUS_LABELS)

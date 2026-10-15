@@ -279,6 +279,16 @@ def test_dashboard_lists_only_that_partners_files(session_factory, client) -> No
     assert "In review" in page.text
 
 
+def test_dashboard_shows_friendly_status_and_received_page_does_not_promise_email(engine, session_factory, client) -> None:
+    _, token = _partner(session_factory)
+    received = client.post(f"/api/lending/partners/{token}/files", data=FORM)
+    assert "keep you updated" in received.text and "email you" not in received.text
+    with session_factory() as db:
+        partners.record_status_change(db, _rows(engine, "loan_files")[0]["id"], "declined", "ltv")
+    page = client.get(f"/api/lending/partners/{token}/status")
+    assert "Declined by a lender, looking at next option" in page.text and ">declined<" not in page.text
+
+
 # -- pipeline -------------------------------------------------------------------------------------
 
 class Recorder:

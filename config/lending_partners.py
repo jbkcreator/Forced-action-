@@ -39,6 +39,15 @@ TIMELINES = ("Under 2 weeks", "2-4 weeks", "1-3 months", "3+ months", "Not sure"
 
 # Shared-file statuses. R-1 moves files between them; P-1 only sets received / held.
 FILE_STATUSES = ("received", "held", "routed", "declined", "approved", "funded")
+# What the partner sees on their dashboard for each status.
+STATUS_LABELS = {
+    "received": "In review",
+    "held": "In review",
+    "routed": "With a lender",
+    "declined": "Declined by a lender, looking at next option",
+    "approved": "Approved",
+    "funded": "Funded",
+}
 PARTNER_NOTIFY_STATUSES = frozenset({"routed", "declined", "approved", "funded"})
 SOURCE_PARTNER = "partner"
 AWAITING_ROUTER_REASON = "awaiting router"
