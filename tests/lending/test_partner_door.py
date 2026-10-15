@@ -307,6 +307,7 @@ def _services(recorder: Recorder, tmp_path, fit: LenderFitResult | None = None,
         slack=recorder.slack.append, render_pdf=render, evaluate_fit=lambda borrower, loan, matrix: fit,
         fit_limits=lambda result, matrix: [FitLimits(100_000, 1_000_000)] if result.fitting else [],
         load_matrix=lambda: matrix,
+        phone_opted_out=lambda phone: False, email_opted_out=lambda email: False, text_window_open=lambda phone: True,
         upload_dir=str(tmp_path / "uploads"), prequal_pct=10,
     )
 
@@ -445,6 +446,42 @@ def test_failed_text_falls_back_to_email(engine, session_factory, tmp_path) -> N
     services = dataclasses.replace(_services(recorder, tmp_path), sms=broken_sms)
     partner_pipeline.process_new_file(file_id, services, session_factory)
     assert [email[0] for email in recorder.emails] == ["maria@example.com"]
+
+
+@pytest.mark.parametrize("override", [
+    {"phone_opted_out": lambda phone: True},  # partner texted STOP
+    {"text_window_open": lambda phone: False},  # night time for the partner
+])
+def test_opted_out_number_or_closed_window_gets_email_not_text(engine, session_factory, tmp_path, override) -> None:
+    _, token = _partner(session_factory, sms_consent=True)
+    file_id = _submit(session_factory, token)
+    recorder = Recorder()
+    partner_pipeline.process_new_file(file_id, dataclasses.replace(_services(recorder, tmp_path), **override),
+                                      session_factory)
+    assert recorder.texts == [] and [email[0] for email in recorder.emails] == ["maria@example.com"]
+
+
+def test_opted_out_email_is_never_emailed(engine, session_factory, tmp_path) -> None:
+    _, token = _partner(session_factory)
+    file_id = _submit(session_factory, token)
+    recorder = Recorder()
+    services = dataclasses.replace(_services(recorder, tmp_path), email_opted_out=lambda email: True)
+    partner_pipeline.process_new_file(file_id, services, session_factory)
+    assert recorder.emails == [] and recorder.texts == []
+    assert _rows(engine, "partner_submissions")[0]["partner_confirmed_at"] is None
+
+
+def test_failing_opt_out_check_blocks_the_send(engine, session_factory, tmp_path) -> None:
+    _, token = _partner(session_factory)
+    file_id = _submit(session_factory, token)
+    recorder = Recorder()
+
+    def broken(value):
+        raise RuntimeError("db down")
+
+    partner_pipeline.process_new_file(file_id, dataclasses.replace(_services(recorder, tmp_path), email_opted_out=broken),
+                                      session_factory)
+    assert recorder.emails == []
 
 
 def test_change_status_commits_and_tells_the_partner(engine, session_factory, tmp_path) -> None:

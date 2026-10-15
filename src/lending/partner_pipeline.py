@@ -49,6 +49,7 @@ PdfRenderer = Callable[[str, dict], bytes]  # (template, context) -> PDF bytes
 Matrix = Sequence[LenderRules]
 FitEvaluator = Callable[[BorrowerProfile, LoanRequest, Matrix], LenderFitResult]
 FitLimitsLookup = Callable[[LenderFitResult, Matrix], list[FitLimits]]  # fitting lenders -> their loan-amount limits
+ContactCheck = Callable[[str], bool]  # phone or email -> True when blocked / allowed (see field)
 MatrixLoader = Callable[[], Matrix]  # the lender rules in force (config, or the DB table when LENDING_RULES_FROM_DB)
 
 _STATUS_WORDING = {
@@ -70,6 +71,9 @@ class PipelineServices:
     evaluate_fit: FitEvaluator
     fit_limits: FitLimitsLookup
     load_matrix: MatrixLoader
+    phone_opted_out: ContactCheck  # STOP / suppression list: never text this number
+    email_opted_out: ContactCheck  # email opt-out: never email this address
+    text_window_open: ContactCheck  # 8am-8pm in the recipient's timezone(s); closed = email instead
     upload_dir: str
     prequal_pct: int
 
@@ -83,6 +87,7 @@ def live_services() -> PipelineServices:
     from src.lending.ghl_email import get_email_sender
     from src.lending.ghl_sms import get_sender
     from src.lending.lender_fit import evaluate_lender_fit
+    from src.lending.compliance import text_window_open
     from src.lending.lender_rules_store import current_matrix
     from src.lending.pdf.render import NON_BINDING_PREQUAL_WATERMARK, render_pdf
 
@@ -106,9 +111,37 @@ def live_services() -> PipelineServices:
         evaluate_fit=lambda borrower, loan, matrix: evaluate_lender_fit(borrower, loan, matrix=tuple(matrix)),
         fit_limits=fit_limits_from_result,
         load_matrix=current_matrix,
+        phone_opted_out=_phone_opted_out,
+        email_opted_out=_email_opted_out,
+        text_window_open=lambda phone: text_window_open(phone),
         upload_dir=settings.lending_partner_upload_dir,
         prequal_pct=settings.lending_prequal_range_pct,
     )
+
+
+def _phone_opted_out(phone: str) -> bool:
+    from src.lending.compliance import _suppressed_phones
+    from src.lending.db import lending_session
+
+    with lending_session() as db:
+        return bool(_suppressed_phones(db, [phone]))
+
+
+def _email_opted_out(email: str) -> bool:
+    from src.lending.db import lending_session
+    from src.services.email_suppression import is_email_suppressed
+
+    with lending_session() as db:
+        return is_email_suppressed(db, email)
+
+
+def _allowed(check: ContactCheck, value: str, partner_id: int, what: str) -> bool:
+    """Run one opt-out check; a failing check blocks the send (fail closed)."""
+    try:
+        return not check(value)
+    except Exception as exc:
+        logger.error("[partner-door] %s opt-out check failed partner=%s (%s)", what, partner_id, type(exc).__name__)
+        return False
 
 
 def _money(value: Optional[int]) -> Optional[Decimal]:
@@ -170,21 +203,36 @@ def _place(address: Optional[str], last_name: str) -> str:
 
 
 def _send_partner(services: PipelineServices, partner: Partner, subject: str, body: str) -> bool:
-    """Text the partner when they agreed to texts, otherwise email them (also email when the text fails).
-    True when a message went out."""
-    if partner.sms_consent and partner.phone and services.sms is not None:
+    """Text the partner when they agreed to texts, otherwise email them. A number that opted out (STOP),
+    a closed text window (8am-8pm their time) or a failed text falls back to email; an opted-out email
+    address is never emailed. True when a message went out."""
+    can_text = (partner.sms_consent and bool(partner.phone) and services.sms is not None
+                and _allowed(services.phone_opted_out, partner.phone, partner.id, "phone"))
+    if can_text and not _window_open(services, partner):
+        logger.info("[partner-door] text window closed partner=%s; emailing instead", partner.id)
+        can_text = False
+    if can_text:
         try:
             services.sms(partner.phone, f"{subject}. {body}")
             return True
         except Exception as exc:
             logger.error("[partner-door] partner text failed partner=%s (%s)", partner.id, type(exc).__name__)
-    if partner.email and services.email is not None:
+    if (partner.email and services.email is not None
+            and _allowed(services.email_opted_out, partner.email, partner.id, "email")):
         try:
             services.email(partner.email, subject, body)
             return True
         except Exception as exc:
             logger.error("[partner-door] partner email failed partner=%s (%s)", partner.id, type(exc).__name__)
     return False
+
+
+def _window_open(services: PipelineServices, partner: Partner) -> bool:
+    try:
+        return services.text_window_open(partner.phone)
+    except Exception as exc:
+        logger.error("[partner-door] text window check failed partner=%s (%s)", partner.id, type(exc).__name__)
+        return False
 
 
 def process_new_file(file_id: int, services: Optional[PipelineServices] = None,
