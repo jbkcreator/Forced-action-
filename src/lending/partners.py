@@ -130,30 +130,34 @@ def revoke_link(db, partner_id: int, now: Optional[datetime] = None) -> bool:
     return result.rowcount == 1
 
 
+_PARTNER_COLUMNS = "id, name, company, partner_type, email, phone, sms_consent"
+
+
+def _row_to_partner(row: Optional[Any]) -> Optional[Partner]:
+    if row is None:
+        return None
+    return Partner(int(row["id"]), row["name"], row["company"], row["partner_type"], row["email"], row["phone"],
+                   bool(row["sms_consent"]))
+
+
 def partner_for_token(db, token: str) -> Optional[Partner]:
     """The partner whose live link this is; None for an unknown, revoked or inactive link."""
     if not token or len(token) > 200:
         return None
     row = db.execute(
-        text("SELECT id, name, company, partner_type, email, phone, sms_consent FROM lending.partners "
+        text(f"SELECT {_PARTNER_COLUMNS} FROM lending.partners "
              "WHERE token_hash = :hash AND token_revoked_at IS NULL AND active"),
         {"hash": hash_token(token)},
     ).mappings().first()
-    if row is None:
-        return None
-    return Partner(int(row["id"]), row["name"], row["company"], row["partner_type"], row["email"], row["phone"],
-                   bool(row["sms_consent"]))
+    return _row_to_partner(row)
 
 
 def partner_by_id(db, partner_id: int) -> Optional[Partner]:
     row = db.execute(
-        text("SELECT id, name, company, partner_type, email, phone, sms_consent FROM lending.partners WHERE id = :id"),
+        text(f"SELECT {_PARTNER_COLUMNS} FROM lending.partners WHERE id = :id"),
         {"id": partner_id},
     ).mappings().first()
-    if row is None:
-        return None
-    return Partner(int(row["id"]), row["name"], row["company"], row["partner_type"], row["email"], row["phone"],
-                   bool(row["sms_consent"]))
+    return _row_to_partner(row)
 
 
 # -- submissions -------------------------------------------------------------------------------
@@ -351,9 +355,9 @@ def record_status_change(db, file_id: int, status: str, reason: Optional[str] = 
                          now: Optional[datetime] = None) -> Optional[StatusChange]:
     """Move a file to ``status``. The router (R-1) calls this on every route, decline, approval and funding.
 
-    Returns a :class:`StatusChange` when the partner should be told (pass it to
-    ``partner_pipeline.notify_partner_status`` after committing); None when nothing changed or the
-    status is internal. The caller commits.
+    Returns a :class:`StatusChange` when the partner should be told; None when nothing changed or the
+    status is internal. The caller commits. The router and the CLI call ``partner_pipeline.change_status``
+    instead, which commits and notifies the partner in one step.
     """
     if status not in FILE_STATUSES:
         raise ValueError(f"status must be one of {FILE_STATUSES}")
@@ -389,11 +393,14 @@ def partner_files(db, partner_id: int, limit: int = 200) -> list[dict[str, Any]]
 
 
 def funded_by_partner(db, month_start: date, month_end: date) -> list[tuple[str, int]]:
-    """``(partner name, funded files)`` for every partner, funded within [month_start, month_end)."""
+    """``(partner name, funded files)`` for every partner, funded within [month_start, month_end).
+
+    A funded file without ``funded_at`` (status set outside ``record_status_change``) counts by its status time.
+    """
     rows = db.execute(
         text("SELECT p.name, COUNT(f.id) AS funded FROM lending.partners p "
              "LEFT JOIN lending.loan_files f ON f.partner_id = p.id AND f.status = 'funded' "
-             "AND f.funded_at >= :start AND f.funded_at < :end "
+             "AND COALESCE(f.funded_at, f.status_at) >= :start AND COALESCE(f.funded_at, f.status_at) < :end "
              "GROUP BY p.id, p.name ORDER BY funded DESC, p.name"),
         {"start": datetime.combine(month_start, datetime.min.time(), tzinfo=timezone.utc),
          "end": datetime.combine(month_end, datetime.min.time(), tzinfo=timezone.utc)},
@@ -471,12 +478,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         logger.info("partner %s link revoked", args.partner_id)
         return 0
     if args.command == "set-status":
-        from src.lending.partner_pipeline import notify_partner_status
+        from src.lending.partner_pipeline import change_status
 
-        with lending_session() as db:
-            change = record_status_change(db, args.file_id, args.status, args.reason)
-        if change is not None:
-            notify_partner_status(change)
+        change_status(args.file_id, args.status, args.reason)
         logger.info("file %s -> %s", args.file_id, args.status)
         return 0
     start, end = _month_bounds(args.month)

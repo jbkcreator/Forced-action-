@@ -6,9 +6,10 @@ consent capture, revocation, attribution, plus submission, pipeline and partner 
 """
 from __future__ import annotations
 
+import dataclasses
 import re
 from contextlib import contextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -398,6 +399,58 @@ def test_attribution_report_counts_funded_files_per_partner(session_factory) -> 
         last_month = partners.funded_by_partner(db, date(2026, 9, 1), date(2026, 10, 1))
     assert report == [("Partner A", 1), ("Partner B", 0)]
     assert dict(last_month) == {"Partner A": 0, "Partner B": 0}
+
+
+def test_partner_who_agreed_to_texts_gets_a_text_instead_of_an_email(engine, session_factory, tmp_path) -> None:
+    _, token = _partner(session_factory, sms_consent=True)
+    file_id = _submit(session_factory, token)
+    recorder = Recorder()
+    partner_pipeline.process_new_file(file_id, _services(recorder, tmp_path), session_factory)
+    assert [phone for phone, _ in recorder.texts] == ["+17275550199"] and recorder.emails == []
+
+
+def test_failed_text_falls_back_to_email(engine, session_factory, tmp_path) -> None:
+    _, token = _partner(session_factory, sms_consent=True)
+    file_id = _submit(session_factory, token)
+    recorder = Recorder()
+
+    def broken_sms(phone, body):
+        raise RuntimeError("provider down")
+
+    services = dataclasses.replace(_services(recorder, tmp_path), sms=broken_sms)
+    partner_pipeline.process_new_file(file_id, services, session_factory)
+    assert [email[0] for email in recorder.emails] == ["maria@example.com"]
+
+
+def test_change_status_commits_and_tells_the_partner(engine, session_factory, tmp_path) -> None:
+    _, token = _partner(session_factory)
+    file_id = _submit(session_factory, token)
+    recorder = Recorder()
+    change = partner_pipeline.change_status(file_id, "declined", "ltv", _services(recorder, tmp_path), session_factory)
+    assert change is not None and _rows(engine, "loan_files")[0]["status"] == "declined"
+    assert len(recorder.emails) == 1 and "declined" in recorder.emails[0][2]
+    assert partner_pipeline.change_status(file_id, "held", "x", _services(recorder, tmp_path), session_factory) is None
+    assert len(recorder.emails) == 1  # internal status: no notice
+
+
+def test_funded_file_without_funded_at_still_counts(engine, session_factory) -> None:
+    _, token = _partner(session_factory, name="Partner A")
+    file_id = _submit(session_factory, token)
+    with engine.begin() as conn:  # status moved by something other than record_status_change
+        conn.execute(text("UPDATE lending.loan_files SET status = 'funded', status_at = :at WHERE id = :id"),
+                     {"at": datetime(2026, 10, 5, tzinfo=timezone.utc), "id": file_id})
+    with session_factory() as db:
+        assert partners.funded_by_partner(db, date(2026, 10, 1), date(2026, 11, 1)) == [("Partner A", 1)]
+
+
+def test_sweep_finds_only_files_whose_run_never_finished(engine, session_factory, tmp_path) -> None:
+    _, token = _partner(session_factory)
+    stuck, done = _submit(session_factory, token), _submit(session_factory, token)
+    partner_pipeline.process_new_file(done, _services(Recorder(), tmp_path), session_factory)
+    later = datetime.now(timezone.utc) + timedelta(minutes=30)
+    with session_factory() as db:
+        assert partner_pipeline.unprocessed_file_ids(db, 10, 20, now=later) == [stuck]
+        assert partner_pipeline.unprocessed_file_ids(db, 10, 20) == []  # too fresh to call stuck
 
 
 def test_month_bounds() -> None:

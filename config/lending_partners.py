@@ -49,3 +49,6 @@ TOKEN_BYTES = 24  # 192-bit link token; only its SHA-256 is stored
 RATE_LIMIT_SCOPE = "lending_partner_submit"
 RATE_LIMIT_PER_WINDOW = 20
 RATE_LIMIT_WINDOW_SECONDS = 3600
+# Sweep: a partner file still 'received' this long after it arrived lost its background run (crash/restart).
+SWEEP_AFTER_MINUTES = 10
+SWEEP_BATCH_SIZE = 20

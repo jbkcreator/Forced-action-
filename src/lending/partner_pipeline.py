@@ -1,7 +1,8 @@
 """Partner Door (P-1): what happens after a partner's file is saved, and partner status messages.
 
 Runs after the submission has committed (a FastAPI background task), so the partner gets an
-immediate answer and a failure here never loses the file. In order:
+immediate answer and a failure here never loses the file; ``src.tasks.lending_partner_sweep`` reruns
+a file whose run never finished (still 'received'). In order:
 
 1. Lender box (T-05) scores the file; the result is stored on it (internal only).
 2. The minute-5 pre-qual PDF (T-07) is generated and stored with the file when a lender fits and its
@@ -18,14 +19,14 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Optional
 
 from sqlalchemy import text
 
-from config.lending_partners import AWAITING_ROUTER_REASON, CREDIT_BANDS, PRODUCT_LABELS, PRODUCTS
+from config.lending_partners import AWAITING_ROUTER_REASON, CREDIT_BANDS, PRODUCT_LABELS, PRODUCTS, SOURCE_PARTNER
 from src.lending.contracts import BorrowerProfile, LenderFitResult, LoanRequest
 from src.lending.partners import Partner, StatusChange, partner_by_id, record_status_change
 from src.lending.prequal import TEMPLATE, FitLimits, PrequalLead, build_context
@@ -86,8 +87,8 @@ def live_services() -> PipelineServices:
         WebClient(token=token.get_secret_value()).chat_postMessage(channel=channel, text=message)
 
     return PipelineServices(
-        email=(lambda to, subject, body: email_sender(to, subject, body)) if email_sender else None,
-        sms=(lambda phone, body: sms_sender(phone, body)) if sms_sender else None,
+        email=email_sender,
+        sms=sms_sender,
         slack=slack,
         render_pdf=lambda template, context: render_pdf(template, context, watermark=NON_BINDING_PREQUAL_WATERMARK),
         evaluate_fit=evaluate_lender_fit,
@@ -149,21 +150,21 @@ def _place(address: Optional[str], last_name: str) -> str:
 
 
 def _send_partner(services: PipelineServices, partner: Partner, subject: str, body: str) -> bool:
-    """Email the partner; also text them when they agreed to texts. True when at least one went out."""
-    sent = False
-    if partner.email and services.email is not None:
-        try:
-            services.email(partner.email, subject, body)
-            sent = True
-        except Exception as exc:
-            logger.error("[partner-door] partner email failed partner=%s (%s)", partner.id, type(exc).__name__)
+    """Text the partner when they agreed to texts, otherwise email them (also email when the text fails).
+    True when a message went out."""
     if partner.sms_consent and partner.phone and services.sms is not None:
         try:
             services.sms(partner.phone, f"{subject}. {body}")
-            sent = True
+            return True
         except Exception as exc:
             logger.error("[partner-door] partner text failed partner=%s (%s)", partner.id, type(exc).__name__)
-    return sent
+    if partner.email and services.email is not None:
+        try:
+            services.email(partner.email, subject, body)
+            return True
+        except Exception as exc:
+            logger.error("[partner-door] partner email failed partner=%s (%s)", partner.id, type(exc).__name__)
+    return False
 
 
 def process_new_file(file_id: int, services: Optional[PipelineServices] = None,
@@ -253,3 +254,26 @@ def notify_partner_status(change: StatusChange, services: Optional[PipelineServi
     except Exception as exc:
         logger.error("[partner-door] status notice failed file=%s (%s)", change.file_id, type(exc).__name__)
         return False
+
+
+def change_status(file_id: int, status: str, reason: Optional[str] = None, services: Optional[PipelineServices] = None,
+                  session_factory: Optional[Callable[[], Any]] = None) -> Optional[StatusChange]:
+    """Move a file to ``status``, commit, then tell the partner. The one call R-1 makes on every route,
+    decline, approval and funding, so no status change can skip the partner notice."""
+    if session_factory is None:
+        from src.lending.db import lending_session as session_factory
+    with session_factory() as db:
+        change = record_status_change(db, file_id, status, reason)
+    if change is not None:
+        notify_partner_status(change, services=services, session_factory=session_factory)
+    return change
+
+
+def unprocessed_file_ids(db, older_than_minutes: int, limit: int, now: Optional[datetime] = None) -> list[int]:
+    """Partner files still 'received' after ``older_than_minutes``: their background run never finished."""
+    rows = db.execute(
+        text("SELECT id FROM lending.loan_files WHERE source = :source AND status = 'received' "
+             "AND created_at < :cutoff ORDER BY created_at LIMIT :limit"),
+        {"source": SOURCE_PARTNER, "cutoff": (now or _utcnow()) - timedelta(minutes=older_than_minutes), "limit": limit},
+    ).all()
+    return [int(row[0]) for row in rows]
