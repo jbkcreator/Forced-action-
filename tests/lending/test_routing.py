@@ -1036,13 +1036,14 @@ def test_admin_api_validates_rule_keys_and_refuses_boxes_on_a_t05_lender(api):
 # ── Josh's decline-reason enum ────────────────────────────────────────────────
 
 def test_decline_reasons_are_joshs_enum_and_the_old_placeholders_are_off(api):
-    from config.lending_routing import SEED_DECLINE_REASONS
+    from config.lending_routing import LEGACY_PLACEHOLDER_REASONS, SEED_DECLINE_REASONS
 
     rows = api.get("/api/lending/routing/decline-reasons").json()
     active = {r["code"] for r in rows if r["active"]}
-    assert active == {code for code, _ in SEED_DECLINE_REASONS} and len(active) == 14
+    josh = {code for code, _ in SEED_DECLINE_REASONS}
+    assert len(josh) == 14 and josh <= active  # codes Josh adds later may sit alongside; his 14 must all be on
     assert {"credit_below_min", "ltv_over_max", "seat_cap_reached", "borrower_withdrew", "other"} <= active
-    assert "unspecified" not in active
+    assert not (set(LEGACY_PLACEHOLDER_REASONS) - {"other"}) & active  # the old placeholders are off
 
 
 def test_a_decline_must_use_a_code_from_joshs_enum(rdb):
