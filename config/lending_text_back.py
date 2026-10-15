@@ -23,17 +23,17 @@ STALE_SENDING_SECONDS = 300
 # greeting, which is "Hi <first name>" or just "Hi" when the borrower has no usable first name.
 TEMPLATES: dict[str, str] = {
     "maturity": (
-        "{greeting}, it's {caller} with Next Deal Lending. Sorry I missed you. "
+        "{greeting}, it's {caller} with Josh Kantor, Loan Officer. Sorry I missed you. "
         "I was calling about the loan on {property}. "
         "Call or text me back at {number} when it suits you. Reply STOP to opt out."
     ),
     "deal_drop": (
-        "{greeting}, {caller} from Next Deal Lending here. Just tried you about {property}. "
+        "{greeting}, {caller} with Josh Kantor, Loan Officer here. Just tried you about {property}. "
         "We help investors in {county} fund their next deal. Text back if you'd like to chat. "
         "Reply STOP to opt out."
     ),
     "general": (
-        "{greeting}, this is {caller} with Next Deal Lending. Sorry we missed each other. "
+        "{greeting}, this is {caller} with Josh Kantor, Loan Officer. Sorry we missed each other. "
         "Reply here or call {number} whenever works. Reply STOP to opt out."
     ),
 }

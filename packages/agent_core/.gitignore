@@ -1,0 +1,3 @@
+# Local wheel builds (pip wheel packages/agent_core)
+build/
+*.egg-info/

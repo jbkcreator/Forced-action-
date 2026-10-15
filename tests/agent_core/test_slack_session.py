@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import threading
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -9,7 +11,12 @@ from packages.agent_core.config import AgentCoreConfig
 from packages.agent_core.halt import HaltSwitch
 from packages.agent_core.pending_actions import ActionStatus, PendingAction, PendingActionQueue
 from packages.agent_core.relay import Relay
-from packages.agent_core.slack_session import InboundMessage, SlackSession, is_cancel_revision
+from packages.agent_core.slack_session import (
+    InboundMessage,
+    SlackSession,
+    is_cancel_revision,
+    run_socket_mode,
+)
 
 from .conftest import APPROVER, BOT, OPERATOR, STRANGER, Clock, RecordingExecutor, enqueue_sms
 
@@ -198,3 +205,61 @@ def test_foreign_or_malformed_clicks_are_ignored(harness: Harness, queue: Pendin
     enqueue_sms(queue)
     harness.click(APPROVER, value, button=button)
     assert harness.chat.updates == [] and harness.chat.posts == []
+
+
+class FakeSocketClient:
+    """Stands in for slack_sdk's SocketModeClient: delivers scripted envelopes on connect."""
+
+    def __init__(self, envelopes: list[SimpleNamespace], **kwargs) -> None:
+        self.kwargs = kwargs
+        self.envelopes = envelopes
+        self.socket_mode_request_listeners: list = []
+        self.acks: list[str] = []
+        self.closed = False
+
+    def connect(self) -> None:
+        if self.kwargs.get("fail"):
+            raise ConnectionError("socket refused")
+        for envelope in self.envelopes:
+            for listener in self.socket_mode_request_listeners:
+                listener(self, envelope)
+
+    def send_socket_mode_response(self, response) -> None:
+        self.acks.append(response.envelope_id)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_socket_mode_acks_routes_and_closes_on_stop(harness: Harness) -> None:
+    envelope = SimpleNamespace(type="events_api", envelope_id="env-9", payload={"event": {
+        "type": "message", "channel_type": "im", "channel": "D_JOSH", "user": OPERATOR, "text": "hi", "ts": "9.9"}})
+    clients: list[FakeSocketClient] = []
+
+    def factory(**kwargs) -> FakeSocketClient:
+        clients.append(FakeSocketClient([envelope], **kwargs))
+        return clients[-1]
+
+    stop = threading.Event()
+    stop.set()
+    run_socket_mode(harness.session, app_token="xapp-1", web_client="web", stop=stop, client_factory=factory)
+    client = clients[0]
+    assert client.kwargs == {"app_token": "xapp-1", "web_client": "web"}
+    assert client.acks == ["env-9"]
+    assert [message.text for message in harness.messages] == ["hi"]
+    assert client.closed
+
+
+def test_a_failed_connect_still_closes_the_client(harness: Harness) -> None:
+    """The SDK starts worker threads when the client is built; every failed attempt must close it."""
+    clients: list[FakeSocketClient] = []
+
+    def factory(**kwargs) -> FakeSocketClient:
+        clients.append(FakeSocketClient([], fail=True, **kwargs))
+        return clients[-1]
+
+    for _ in range(3):
+        with pytest.raises(ConnectionError):
+            run_socket_mode(harness.session, app_token="xapp-1", web_client="web", stop=threading.Event(),
+                            client_factory=factory)
+    assert len(clients) == 3 and all(client.closed for client in clients)

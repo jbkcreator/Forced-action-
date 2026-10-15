@@ -2,7 +2,8 @@
 
 ``base_statements`` creates the tables; ``safeguard_statements`` adds the send safeguards
 (revision history, recipient and lead references, idempotency key, expiry, separate reviser,
-widened status set). Each list is safe to re-run, and :func:`apply_to` runs both in order.
+widened status set); ``memory_statements`` creates the standing-rules table. Each list is safe
+to re-run, and :func:`apply_to` runs all three in order.
 """
 from __future__ import annotations
 
@@ -84,8 +85,25 @@ def safeguard_statements(schema: str) -> list[str]:
     ]
 
 
+def memory_statements(schema: str) -> list[str]:
+    """The standing-rules table, column for column as the CORA-CORE specification gives it."""
+    return [
+        f'CREATE SCHEMA IF NOT EXISTS "{schema}"',
+        f"""
+        CREATE TABLE IF NOT EXISTS "{schema}".agent_memory (
+            memory_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            category VARCHAR(64) NOT NULL,
+            rule_text TEXT NOT NULL,
+            source_thread_ts VARCHAR(64),
+            is_active BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+    ]
+
+
 def ddl_statements(schema: str) -> list[str]:
-    return [*base_statements(schema), *safeguard_statements(schema)]
+    return [*base_statements(schema), *safeguard_statements(schema), *memory_statements(schema)]
 
 
 def apply_base(conn: Connection, schema: str) -> None:
@@ -98,6 +116,12 @@ def apply_safeguards(conn: Connection, schema: str) -> None:
         conn.execute(text(statement))
 
 
+def apply_memory(conn: Connection, schema: str) -> None:
+    for statement in memory_statements(schema):
+        conn.execute(text(statement))
+
+
 def apply_to(conn: Connection, schema: str) -> None:
     apply_base(conn, schema)
     apply_safeguards(conn, schema)
+    apply_memory(conn, schema)

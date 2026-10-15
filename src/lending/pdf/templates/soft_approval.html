@@ -39,13 +39,15 @@
   <tr><td>Estimated after-repair value you shared</td><td>{{ arv }}</td></tr>
 </table>
 
+{% if subject_to_confirmation is defined and subject_to_confirmation %}
+<div class="note">These figures are subject to lender confirmation.</div>
+{% endif %}
 <div class="note">
   This is a non-binding estimate for informational purposes only, based on information provided on the call.
   It is not a commitment to lend, a loan approval, or an offer of specific terms. Final eligibility and terms
   depend on a full review of your file and lender approval.
 </div>
 
-<p class="next">Questions or ready to talk through your deal? Call or text <strong>(727) 436-9951</strong>
-or reply to this email.</p>
+<p class="next">Questions or ready to talk through your deal? Call or text <strong>{{ callback_phone }}</strong>.</p>
 {# PLACEHOLDER COPY: wording, signer and required disclosures pending Josh and a qualified professional's review. #}
 {% endblock %}

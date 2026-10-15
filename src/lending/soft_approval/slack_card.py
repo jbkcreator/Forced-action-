@@ -2,16 +2,14 @@
 
 The card goes to ``LENDING_DIAL_TASKS_CHANNEL`` (#dial-tasks, next to the call's result message) once per finished call, with a button that opens the form.
 The caller enters only the property facts; credit, loan type and amount come from the LendingFlow lead
-(see lead_source.py). Anyone who can see the card can submit (decided with the team, recorded in the PR);
-every submission stores the submitter's Slack user id.
+(see lead_source.py). Only the Slack users on the allow-list can open and submit the form (B11: Josh only until
+he names callers; ``soft_approval_webhook.allowed_user_ids``); every submission stores the submitter's Slack user id.
 """
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import logging
-import time
+from datetime import datetime
 from typing import Any, Mapping, Optional
 
 from pydantic import ValidationError
@@ -22,11 +20,10 @@ from config.lending_soft_approval import FORM_CALLBACK_ID, OPEN_FORM_ACTION_ID
 from config.settings import get_settings
 from src.lending.db import lending_session
 from src.lending.dispositions import last4
+from src.lending.slack_signature import SIGNATURE_TOLERANCE_SECONDS, verify_slack_signature  # noqa: F401 - re-exported
 from src.lending.soft_approval.facts import SoftApprovalFacts
 
 logger = logging.getLogger(__name__)
-
-SIGNATURE_TOLERANCE_SECONDS = 300
 
 # modal block id -> field name on SoftApprovalFacts
 _BLOCKS = {
@@ -41,6 +38,9 @@ _FIELD_TO_BLOCK = {field: block for block, field in _BLOCKS.items()}
 
 OUTCOME_MESSAGES = {
     "generated": ":white_check_mark: Soft approval PDF is ready and stored for this lead.",
+    "generated_unconfirmed": (":white_check_mark: Soft approval PDF is ready and stored for this lead. "
+                              ":warning: Subject to lender confirmation: the lender inputs are placeholders."),
+    "loan_too_small": ":no_entry_sign: The loan works out below the lender's minimum, so nothing was made.",
     "no_lead": ":warning: No LendingFlow lead was found for this call, so no soft approval was made.",
     "no_fit": ":no_entry_sign: No lender fits, so nothing was made.",
     "out_of_scope": ":no_entry_sign: This loan type is not covered by the soft approval yet, so nothing was made.",
@@ -49,33 +49,40 @@ OUTCOME_MESSAGES = {
 }
 
 
-def verify_slack_signature(
-    secret: str, timestamp: Optional[str], signature: Optional[str], body: bytes, *, now: Optional[float] = None,
-) -> bool:
-    """Slack's v0 request signature. False for a missing header, a stale timestamp or a bad digest."""
-    if not secret or not timestamp or not signature:
-        return False
-    try:
-        age = abs((now if now is not None else time.time()) - int(timestamp))
-    except ValueError:
-        return False
-    if age > SIGNATURE_TOLERANCE_SECONDS:
-        return False
-    base = b"v0:" + timestamp.encode() + b":" + body
-    expected = "v0=" + hmac.new(secret.encode(), base, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, signature)
+CARD_STATUS_LINES = {
+    "generated": ":white_check_mark: PDF ready",
+    "generated_unconfirmed": ":white_check_mark: PDF ready · subject to lender confirmation",
+    "loan_too_small": ":no_entry_sign: No PDF: loan below the lender's minimum",
+    "no_lead": ":warning: No PDF: no LendingFlow lead for this call",
+    "no_fit": ":no_entry_sign: No PDF: no lender fits",
+    "out_of_scope": ":no_entry_sign: No PDF: loan type not covered yet",
+    "terms_unconfirmed": ":warning: No PDF: lender inputs not confirmed",
+    "render_failed": ":x: PDF could not be generated",
+}
 
 
-def build_card_blocks(*, call_id: str, phone: Optional[str], caller: Optional[str]) -> tuple[str, list[dict]]:
+def card_status(outcome_key: str, *, when: datetime) -> str:
+    """The line shown on the card after a submit; the time renders in each viewer's own time zone."""
+    line = CARD_STATUS_LINES.get(outcome_key, ":warning: Not processed")
+    return f"{line} · <!date^{int(when.timestamp())}^{{time}}|{when:%H:%M} UTC>"
+
+
+def build_card_blocks(
+    *, call_id: str, phone: Optional[str], caller: Optional[str],
+    status: Optional[str] = None, button_label: str = "Enter deal facts",
+) -> tuple[str, list[dict]]:
     summary = f"Call {call_id} · {last4(phone)} · caller {caller or '—'}"
     fallback = f"Enter deal facts for the soft approval — {summary}"
-    return fallback, [
+    blocks: list[dict] = [
         {"type": "section", "text": {"type": "mrkdwn", "text": f":house: *Enter deal facts after the call*\n{summary}"}},
-        {"type": "actions", "elements": [{
-            "type": "button", "style": "primary", "action_id": OPEN_FORM_ACTION_ID, "value": call_id,
-            "text": {"type": "plain_text", "text": "Enter deal facts"},
-        }]},
     ]
+    if status:
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": status}]})
+    blocks.append({"type": "actions", "elements": [{
+        "type": "button", "style": "primary", "action_id": OPEN_FORM_ACTION_ID, "value": call_id,
+        "text": {"type": "plain_text", "text": button_label},
+    }]})
+    return fallback, blocks
 
 
 def _input(block_id: str, label: str, element: dict, *, optional: bool = False) -> dict:

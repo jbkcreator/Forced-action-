@@ -88,6 +88,16 @@ def test_no_fitting_lender_skipped(prequal_db):
     assert row["status"] == "skipped" and row["skip_reason"] == "no fitting lender"
 
 
+def test_undecided_lead_stays_pending_and_is_not_skipped(prequal_db):
+    lid = _q(prequal_db)
+    sink = FakeSink()
+    assert send_pending(prequal_db, sink, lambda _lead: None, enabled=True, pct=10, letter_id=lid, now=NOW) == 0
+    assert sink.calls == []
+    row = _row(prequal_db, lid)
+    assert row["status"] == "pending" and row["attempts"] == 0 and row["skip_reason"] is None
+    assert send_pending(prequal_db, sink, fits, enabled=True, pct=10, letter_id=lid, now=NOW) == 1  # decided later
+
+
 def test_flag_off_or_unconfigured_leaves_pending(prequal_db):
     lid = _q(prequal_db)
     assert send_pending(prequal_db, FakeSink(), fits, enabled=False, pct=10, letter_id=lid, now=NOW) == 0

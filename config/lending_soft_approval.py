@@ -2,8 +2,8 @@
 
 ``SOFT_APPROVAL_PARAMS`` holds the two inputs the lender matrix does not carry:
 the share of the purchase price a lender advances and the share of the rehab it funds.
-A value of ``None`` means Josh has not confirmed it, and a lender without both values is
-never used for a PDF. Nothing here is a confirmed lender rule.
+A value of ``None`` means Josh has not confirmed it: it takes ``PLACEHOLDER_PARAMS`` and the
+result is flagged subject to lender confirmation. Nothing here is a confirmed lender rule.
 """
 from __future__ import annotations
 
@@ -41,8 +41,25 @@ class SoftApprovalParams:
         return self.rehab_funding_pct is not None and self.purchase_advance_pct is not None
 
 
+# Josh's generic placeholder box (A1, Oct 8): 85% of the purchase price, 100% of the rehab. A share a lender
+# has no confirmed value for takes this until he marks it confirmed; the result is then flagged
+# "subject to lender confirmation" (never skipped, never presented as confirmed).
+PLACEHOLDER_PARAMS = SoftApprovalParams(rehab_funding_pct=Decimal("1"), purchase_advance_pct=Decimal("0.85"))
+
+
+def resolve_params(params: Optional[SoftApprovalParams]) -> tuple[SoftApprovalParams, bool]:
+    """The shares to calculate with, and whether every one of them is confirmed."""
+    own = params or SoftApprovalParams()
+    filled = SoftApprovalParams(
+        rehab_funding_pct=own.rehab_funding_pct if own.rehab_funding_pct is not None else PLACEHOLDER_PARAMS.rehab_funding_pct,
+        purchase_advance_pct=(own.purchase_advance_pct if own.purchase_advance_pct is not None
+                              else PLACEHOLDER_PARAMS.purchase_advance_pct),
+    )
+    return filled, own.confirmed()
+
+
 SOFT_APPROVAL_PARAMS: Mapping[str, SoftApprovalParams] = {
     # "Funds up to 100% of rehab" is Josh's Oct 1 wording (client-stated, not confirmed as a lender rule).
-    # The purchase advance is not stated anywhere, so this lender stays unusable until Josh gives it.
+    # The purchase advance is not stated anywhere, so it takes the placeholder (85%) until Josh gives it.
     "generic_backflip_flip": SoftApprovalParams(rehab_funding_pct=Decimal("1"), purchase_advance_pct=None),
 }

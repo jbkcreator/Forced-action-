@@ -44,7 +44,7 @@ fallback to the platform's `GHL_API_KEY` / `GHL_LOCATION_ID`.
   Restart `fa-api`, `fa-lending-cdr-poller` **and** `fa-lending-opt-out-poller` after changing them (settings are cached per process:
   the texts are sent by the CDR poller and the DND sync runs in the opt-out poller, so a process left on old values would keep
   using them). Setting only **one** of the two is a misconfiguration: texts and DND fail closed (no account is used) with an ERROR log.
-- `LENDING_GHL_SMS_FROM_NUMBER`: E.164 of the **one number used for calling and texting**. It is also the number printed in
+- `LENDING_GHL_SMS_FROM_NUMBER`: E.164 of the **GHL SMS number** (texting only: calls run through BatchDialer on a different number). It is also the number printed in
   "call or text me back at ...". There is no separate text-back number setting.
 - `LENDING_GHL_WEBHOOK_SECRET`: shared secret for the `X-Webhook-Secret` header on the GHL webhooks (already exists).
 - `MISSED_CALL_TEXT_ENABLED=false` until section 5(e).
@@ -58,8 +58,8 @@ Client gives `hari@heu.ai` Agency Admin and a card first (client answers B2/B1).
 2. Send the client the expected monthly cost (number rental, per-message, 10DLC one-time plus monthly campaign fee) **before**
    buying (client question 10).
 3. Settings -> Phone Numbers -> Add Number: US, Local, SMS + Voice, area code 813 or 727. Complete identity verification. Record the
-   number in `LENDING_GHL_SMS_FROM_NUMBER`. A number normally lives with one provider: confirm with the client how the same number
-   serves BatchDialer calls and GHL SMS (v2 Q8).
+   number in `LENDING_GHL_SMS_FROM_NUMBER`. The GHL SMS number and the BatchDialer calling number are different numbers (decision 2026-10-12): the
+   client buys this one in GHL because only the client can complete the identity verification.
 4. Credentials. Create a Private Integration token with the scopes contacts write and conversations/messages write in the Next
    Deal Lending sub-account and set `LENDING_GHL_API_KEY` + `LENDING_GHL_LOCATION_ID` (the `--send-test` in section 5 proves it).
 5. **10DLC (Trust Center)**, only after `nextdeallending.com` is public (WP-GL-11): Standard Brand, brand **Next Deal Lending**, legal
@@ -106,6 +106,23 @@ hard go-live prerequisite (section 5). The DND sync only runs while `fa-lending-
 
 - **Pipeline stage changed** -> `.../webhooks/lending/ghl-stage` (scoreboard "Showed", PR #326; lives on that branch, not this one,
   until merged).
+
+**When an opt-out webhook fails.** If `/ghl-opt-out` or `/ghl-text-consent` fails after GHL delivered it (most often a database
+outage), the payload is saved to `lending.webhook_failures` and an alert goes to `LENDING_OPS_CHANNEL` (GHL contact id and error class,
+never a phone or message). `python -m src.lending.webhook_failures` (cron */5) replays saved failures through the same handlers until
+they succeed; after 5 attempts it gives up and alerts again. A saved consent **grant** is never replayed over a newer refusal: if the number's consent was revoked after the grant failed, it is closed as superseded. If the save itself fails, the alert says the change is **not recorded**:
+re-run the GHL workflow for that contact once the database is healthy. Keyword STOPs are also re-synced by `ghl_dnd_backstop` (cron
+*/15); free-text opt-outs have only this path. Migration: `migrations/apply_lending_webhook_failures.py`.
+
+**Opt-out email address.** The site publishes `optout@nextdeallending.com`. `python -m src.lending.email_opt_out` (cron */5) reads
+the mailbox over IMAP, read-only, and acts only on mail addressed to `LENDING_OPTOUT_ADDRESS` (`To`, `Cc`, `Delivered-To`,
+`X-Original-To`), so it works with a dedicated `optout@` mailbox or with `optout@` forwarded into `hello@`: only the
+`LENDING_OPTOUT_IMAP_USER` / `_PASSWORD` change. Each opt-out email suppresses the sender's address and every US phone number in the
+subject or body (our own numbers excepted), sets do-not-contact, removes the numbers from the dialer and posts a masked note to
+`LENDING_OPS_CHANNEL`. Bounces and auto-replies are ignored. The IMAP search returns only mail addressed to the opt-out address, and
+every examined message is tracked in `lending.email_opt_out_messages` (migration `apply_lending_email_opt_out_messages.py`), so each
+sweep takes the oldest unsettled messages and no opt-out can be crowded out; a failed one is retried (10 attempts, then an ops
+alert). Looks back 30 days. Idle until the IMAP user and password are set.
 
 ## 5. Go-live sequence
 

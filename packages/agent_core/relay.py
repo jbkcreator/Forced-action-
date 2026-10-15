@@ -27,6 +27,9 @@ SendCheck = Callable[[PendingAction], "str | None"]
 class DispatchOutcome(str, Enum):
     SENT = "sent"
     FAILED = "failed"
+    # No executor is registered for the channel: sending there is not switched on yet. Stored as
+    # failed (never retried), but reported apart so an expected gap does not read as an error.
+    NOT_ENABLED = "not_enabled"
     BLOCKED = "blocked"
     NOT_CLAIMED = "not_claimed"
 
@@ -75,9 +78,10 @@ class Relay:
         executor = self._executors.get(action.channel)
         if executor is None:
             reason = f"no executor registered for channel {action.channel}"
-            logger.error("relay: %s (action %s)", reason, action_id)
+            logger.warning("relay: sending via %s is not switched on; action %s was not sent", action.channel,
+                           action_id)
             self._queue.mark_failed(action_id, reason)
-            return DispatchResult(DispatchOutcome.FAILED, reason)
+            return DispatchResult(DispatchOutcome.NOT_ENABLED, reason)
 
         reason = self._blocking_reason(action)
         if reason is not None:
@@ -105,7 +109,7 @@ class Relay:
             buckets[self.dispatch(action_id).outcome].append(action_id)
         return RelayResult(
             sent=tuple(buckets[DispatchOutcome.SENT]),
-            failed=tuple(buckets[DispatchOutcome.FAILED]),
+            failed=tuple(buckets[DispatchOutcome.FAILED] + buckets[DispatchOutcome.NOT_ENABLED]),
             blocked=tuple(buckets[DispatchOutcome.BLOCKED]),
             not_claimed=tuple(buckets[DispatchOutcome.NOT_CLAIMED]),
         )

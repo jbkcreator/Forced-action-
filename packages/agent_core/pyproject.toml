@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-core"
+version = "0.1.0"
+description = "Portable agent core: Slack Socket Mode session, human send gate, egress relay and kill switch."
+readme = { text = "Self-contained agent runtime. The host passes an AgentCoreConfig and a SQLAlchemy Engine; the package never reads the environment.", content-type = "text/plain" }
+requires-python = ">=3.11"
+dependencies = [
+    "sqlalchemy>=2.0.0",
+    "pydantic>=2.12.5",
+]
+
+[project.optional-dependencies]
+# Socket Mode session (slack_session.run_socket_mode)
+slack = ["slack-sdk>=3.33.0"]
+# Read-only Google Calendar availability (calendarport)
+calendar = ["google-api-python-client>=2.180.0", "google-auth>=2.40.0"]
+
+[tool.setuptools]
+# This directory is the package itself: installed, it imports as ``agent_core``. Inside this
+# repository it is still imported as ``packages.agent_core``.
+packages = ["agent_core"]
+package-dir = { "agent_core" = "." }

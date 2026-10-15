@@ -7,16 +7,17 @@ lender-engine/dev2-compliance-floor/adr/0001-lending-schema-in-shared-fa-db.md.
 """
 from __future__ import annotations
 
+import uuid
 from datetime import date, datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
     Date,
-    DateTime,
     ForeignKey,
+    DateTime,
     Index,
     Integer,
     LargeBinary,
@@ -27,7 +28,7 @@ from sqlalchemy import (
     Text,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from config.lending_text_back import SLOT_HOLDING_SQL
@@ -455,6 +456,35 @@ class LendingSoftApproval(LendingBase):
     )
 
 
+class LendingLenderRuleValue(LendingBase):
+    """One lender parameter and its status (T-05, Josh A1): one row per lender key and field.
+
+    A row per field, not a column per field, so a field Josh changes his mind about is a new or edited
+    row, never a migration. ``value`` is JSON (number, string, list or null); the loader in
+    ``src/lending/lender_rules_store.py`` validates it. ``status`` is confirmed / placeholder /
+    confirm_at_submission. ``lender_key`` and ``field`` are the names in ``config/lender_matrix.py``.
+    """
+
+    __tablename__ = "lender_rule_values"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    lender_key: Mapped[str] = mapped_column(String(60), nullable=False)
+    field: Mapped[str] = mapped_column(String(60), nullable=False)
+    value: Mapped[Any] = mapped_column(JSONB, nullable=False, server_default=text("'null'::jsonb"))
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="placeholder", server_default=text("'placeholder'"))
+    note: Mapped[Optional[str]] = mapped_column(Text)
+    updated_by: Mapped[Optional[str]] = mapped_column(String(60))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('confirmed', 'placeholder', 'confirm_at_submission')",
+            name="ck_lending_lender_rule_values_status",
+        ),
+        Index("uq_lending_lender_rule_values_key_field", "lender_key", "field", unique=True),
+    )
+
+
 class LendingAgentHaltState(LendingBase):
     """Cora's kill switch: one row, read by every Cora process before it acts (packages/agent_core/halt.py)."""
 
@@ -467,6 +497,22 @@ class LendingAgentHaltState(LendingBase):
     set_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 
     __table_args__ = (CheckConstraint("id = 1", name="ck_agent_halt_state_single_row"),)
+
+
+class LendingAgentMemory(LendingBase):
+    """Cora's standing rules, compiled into <standing_rules> on every turn (packages/agent_core/memory.py).
+
+    Columns exactly as the CORA-CORE specification gives them; rules are deactivated, never deleted.
+    """
+
+    __tablename__ = "agent_memory"
+
+    memory_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
+    category: Mapped[str] = mapped_column(String(64), nullable=False)
+    rule_text: Mapped[str] = mapped_column(Text, nullable=False)
+    source_thread_ts: Mapped[Optional[str]] = mapped_column(String(64))  # Slack thread the rule was given in
+    is_active: Mapped[Optional[bool]] = mapped_column(Boolean, server_default=text("true"))
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), server_default=text("CURRENT_TIMESTAMP"))
 
 
 class LendingPendingAction(LendingBase):
@@ -546,6 +592,235 @@ class LendingPrequalLetter(LendingBase):
                         name="ck_lending_prequal_letters_status"),
         Index("uq_lending_prequal_letters_lead", "lead_source", "lead_ref", unique=True),
         Index("idx_lending_prequal_letters_delivery", "status", "created_at"),
+    )
+
+
+class LendingLendingFlowLead(LendingBase):
+    """One deduplicated LendingFlow lead (T-11): the Deal record, linked to its Person (``lending.contacts``).
+
+    Two UNIQUE keys enforce dedupe in the database: ``vendor_lead_id`` and ``dedupe_hash``
+    (sha256 of normalized phone + lower-cased email). ``ghl_status``: pending -> synced /
+    contact_only / failed; ``skipped`` = suppressed number, never pushed. ``event_emitted_at``
+    is set once the ``LendingFlowLeadCreated`` event was emitted; ``followup_done_at`` once the event and the
+    pre-qual hand-off both succeeded (the sweep redoes a synced lead whose follow-ups never finished). ``raw_payload`` is kept for reparse.
+    """
+
+    __tablename__ = "lendingflow_leads"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    lead_uuid: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, unique=True, default=uuid.uuid4,
+                                                 server_default=text("gen_random_uuid()"))
+    vendor_lead_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    dedupe_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    contact_id: Mapped[Optional[int]] = mapped_column(ForeignKey("lending.contacts.id"))
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    first_name: Mapped[Optional[str]] = mapped_column(String(80))
+    last_name: Mapped[Optional[str]] = mapped_column(String(80))
+    phone: Mapped[str] = mapped_column(String(20), nullable=False)  # phone_utils.normalize
+    email: Mapped[Optional[str]] = mapped_column(String(255))  # lower-cased
+    credit_band: Mapped[Optional[str]] = mapped_column(String(40))
+    credit_band_min_fico: Mapped[Optional[int]] = mapped_column(Integer)
+    loan_amount: Mapped[Optional[int]] = mapped_column(BigInteger)  # = loan_amount_min (event / pre-qual input)
+    loan_amount_range: Mapped[Optional[str]] = mapped_column(String(40))  # raw band, e.g. "$500K - $1M"
+    loan_amount_min: Mapped[Optional[int]] = mapped_column(BigInteger)
+    loan_amount_max: Mapped[Optional[int]] = mapped_column(BigInteger)
+    loan_type: Mapped[Optional[str]] = mapped_column(String(40))
+    property_state: Mapped[Optional[str]] = mapped_column(String(20))  # USPS code
+    property_address: Mapped[Optional[str]] = mapped_column(String(200))
+    property_city: Mapped[Optional[str]] = mapped_column(String(80))
+    property_zip: Mapped[Optional[str]] = mapped_column(String(10))
+    lead_source_campaign: Mapped[Optional[str]] = mapped_column(String(100))  # LendingFlow "Source"
+    submitted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # borrower submit time on LendingFlow
+    consent_status: Mapped[str] = mapped_column(String(10), nullable=False, default="missing", server_default=text("'missing'"))
+    suppressed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    suppression_reason: Mapped[Optional[str]] = mapped_column(String(30))
+    ghl_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending", server_default=text("'pending'"))
+    ghl_contact_id: Mapped[Optional[str]] = mapped_column(String(64))
+    ghl_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    ghl_last_error: Mapped[Optional[str]] = mapped_column(String(200))
+    ghl_last_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    ghl_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    ghl_alerted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    event_emitted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    followup_done_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # event emitted AND pre-qual handed off
+    intro_sms_tagged_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # T-09: ready tag added (starts the GHL intro text); NULL = not yet, or held for the send window
+    duplicate_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    last_duplicate_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    raw_payload: Mapped[Any] = mapped_column(JSONB, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("consent_status IN ('present', 'missing')", name="ck_lending_lendingflow_leads_consent"),
+        CheckConstraint("ghl_status IN ('pending', 'synced', 'contact_only', 'failed', 'skipped')",
+                        name="ck_lending_lendingflow_leads_ghl_status"),
+        Index("uq_lending_lendingflow_leads_vendor", "vendor_lead_id", unique=True),
+        Index("uq_lending_lendingflow_leads_dedupe", "dedupe_hash", unique=True),
+        Index("idx_lending_lendingflow_leads_delivery", "ghl_status", "received_at"),
+        Index("idx_lending_lendingflow_leads_phone", "phone", "received_at"),
+    )
+
+
+class LendingLeadConsentCertificate(LendingBase):
+    """Append-only consent evidence for a LendingFlow lead (T-11). ``raw_certificate`` is verbatim.
+
+    ``verified_at`` is the timestamp inside the certificate (``certificate_timestamp``) or, when it
+    carries none, the receipt time (``receipt_only``). No third-party verification is claimed.
+    """
+
+    __tablename__ = "lead_consent_certificates"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    lead_id: Mapped[int] = mapped_column(ForeignKey("lending.lendingflow_leads.id"), nullable=False, index=True)
+    lead_source: Mapped[str] = mapped_column(String(30), nullable=False, default="lendingflow", server_default=text("'lendingflow'"))
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    raw_certificate: Mapped[str] = mapped_column(Text, nullable=False)
+    certificate_id: Mapped[Optional[str]] = mapped_column(String(200))
+    certificate_url: Mapped[Optional[str]] = mapped_column(String(500))
+    verified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    verification_method: Mapped[str] = mapped_column(String(30), nullable=False)
+    client_ip: Mapped[Optional[str]] = mapped_column(String(45))
+    source_url: Mapped[Optional[str]] = mapped_column(String(500))
+    tcpa_disclosure_text: Mapped[Optional[str]] = mapped_column(Text)
+    is_duplicate_delivery: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+
+    __table_args__ = (
+        CheckConstraint("verification_method IN ('certificate_timestamp', 'receipt_only')",
+                        name="ck_lending_lead_consent_certificates_method"),
+    )
+
+
+class LendingLendingFlowEnrichment(LendingBase):
+    """Background enrichment card + routing for one LendingFlow lead (T-12), one row per lead.
+
+    ``captured_address`` / ``target_close_date`` come from the call or booking form and win over the
+    address LendingFlow sent; ``routing_tag`` is FULL_MACHINE or NURTURE (a DB value only; it is not
+    the ``lending.contacts.nurture`` DNC flag and moves no GHL stage). ``card`` and ``fit`` hold what
+    was shown to Josh; ``post_signature`` guards the deal-thread post so an unchanged address is never
+    posted twice. Re-running updates the row quietly (Josh B3).
+    ``status``: pending -> running (claimed) -> ready / failed (retried with backoff, capped).
+    """
+
+    __tablename__ = "lendingflow_enrichment"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    lead_id: Mapped[int] = mapped_column(ForeignKey("lending.lendingflow_leads.id"), nullable=False, unique=True)
+    status: Mapped[str] = mapped_column(String(10), nullable=False, default="pending", server_default=text("'pending'"))
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    last_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[Optional[str]] = mapped_column(String(200))
+    captured_address: Mapped[Optional[str]] = mapped_column(String(200))
+    target_close_date: Mapped[Optional[date]] = mapped_column(Date)
+    facts_source: Mapped[Optional[str]] = mapped_column(String(30))  # who last supplied them: booking_form / slack_form
+    property_id: Mapped[Optional[int]] = mapped_column(BigInteger)
+    match_confidence: Mapped[Optional[int]] = mapped_column(Integer)
+    routing_tag: Mapped[Optional[str]] = mapped_column(String(15))
+    routing_reason: Mapped[Optional[str]] = mapped_column(String(40))
+    closer_priority: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    card: Mapped[Optional[dict]] = mapped_column(JSONB)
+    fit: Mapped[Optional[dict]] = mapped_column(JSONB)
+    thread_ts: Mapped[Optional[str]] = mapped_column(String(40))
+    post_signature: Mapped[Optional[str]] = mapped_column(String(64))  # the card was delivered for this signature
+    analysis_signature: Mapped[Optional[str]] = mapped_column(String(64))  # the Street View / comps reply was too
+    posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint("status IN ('pending', 'running', 'ready', 'failed')", name="ck_lending_lendingflow_enrichment_status"),
+        CheckConstraint("routing_tag IS NULL OR routing_tag IN ('FULL_MACHINE', 'NURTURE')",
+                        name="ck_lending_lendingflow_enrichment_routing"),
+        Index("idx_lending_lendingflow_enrichment_sweep", "status", "last_attempt_at"),
+    )
+
+
+class LendingUncalledAlarm(LendingBase):
+    """T-10: one stopwatch per LendingFlow lead, copied from T-11's ``lending.lendingflow_leads``.
+
+    ``lendingflow_lead_id`` is deliberately not a foreign key, so this table does not depend on T-11's
+    migration order. ``fired_120_at`` / ``fired_300_at`` are claims committed before the send: an alarm fires
+    at most once. ``*_status``: sent / retry (definitely not sent, will be retried) / sending (a retry is claimed) /
+    send_unknown (may have been sent: never resent) / failed (retries used up) / superseded (no longer needed) /
+    not_configured / skipped_late. ``alarm_*_kind``: no_call / not_reached. ``resolved_reason``: connected / escalated / preexisting (existed before T-10 was switched on).
+    """
+
+    __tablename__ = "uncalled_alarms"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    lendingflow_lead_id: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
+    lead_uuid: Mapped[str] = mapped_column(String(36), nullable=False)
+    phone: Mapped[str] = mapped_column(String(20), nullable=False)  # phone_utils.normalize (from T-11)
+    arrived_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    fired_120_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    fired_300_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    alarm_120_kind: Mapped[Optional[str]] = mapped_column(String(12))
+    alarm_300_kind: Mapped[Optional[str]] = mapped_column(String(12))
+    sms_120_status: Mapped[Optional[str]] = mapped_column(String(20))
+    sms_300_status: Mapped[Optional[str]] = mapped_column(String(20))
+    slack_300_status: Mapped[Optional[str]] = mapped_column(String(20))
+    sms_120_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    sms_300_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    slack_300_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    retry_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # next retry of any channel in 'retry'
+    claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # when a retry send was claimed
+    last_error: Mapped[Optional[str]] = mapped_column(String(200))  # exception class only, no PII
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    resolved_reason: Mapped[Optional[str]] = mapped_column(String(20))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint("resolved_reason IN ('connected', 'escalated', 'preexisting')",
+                        name="ck_lending_uncalled_alarms_reason"),
+        Index("idx_lending_uncalled_alarms_open", "arrived_at", postgresql_where=text("resolved_at IS NULL")),
+    )
+
+
+class LendingWebhookFailure(LendingBase):
+    """A GHL opt-out or consent webhook call that failed after it was received (for example while the database
+    was unavailable). ``payload`` is the body GHL sent, replayed by ``src.lending.webhook_failures`` through the
+    same handler until it succeeds; ``gave_up_at`` is set after MAX_RETRY_ATTEMPTS and ops is alerted once.
+    ``endpoint``: ghl_opt_out / ghl_text_consent. ``last_error`` is an exception class only, no PII."""
+
+    __tablename__ = "webhook_failures"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    endpoint: Mapped[str] = mapped_column(String(40), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    ghl_contact_id: Mapped[Optional[str]] = mapped_column(String(64))
+    last_error: Mapped[Optional[str]] = mapped_column(String(200))
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False,
+                                                 server_default=text("now()"))
+    last_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    gave_up_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        Index("idx_lending_webhook_failures_open", "created_at",
+              postgresql_where=text("resolved_at IS NULL AND gave_up_at IS NULL")),
+    )
+
+
+class LendingEmailOptOutMessage(LendingBase):
+    """One row per message the opt-out mailbox listener has examined, keyed like the opt-out itself (a hash of
+    the Message-ID), so every sweep fetches only messages it has not settled: a burst of other mail can never push
+    an unprocessed opt-out out of a sweep. ``outcome``: recorded (an opt-out, new or already known) /
+    not_opt_out (not addressed to the opt-out address, or a bounce / auto-reply) / failed (retried until
+    MAX_MESSAGE_ATTEMPTS) / gave_up (ops alerted) / unreadable (ops alerted). No addresses or message text."""
+
+    __tablename__ = "email_opt_out_messages"
+
+    message_key: Mapped[str] = mapped_column(String(40), primary_key=True)
+    outcome: Mapped[str] = mapped_column(String(20), nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
+    opt_out_event_id: Mapped[Optional[int]] = mapped_column(Integer)
+    last_error: Mapped[Optional[str]] = mapped_column(String(200))  # exception class only
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False,
+                                                    server_default=text("now()"))
+    last_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False,
+                                                      server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint("outcome IN ('recorded', 'not_opt_out', 'failed', 'gave_up', 'unreadable')",
+                        name="ck_lending_email_opt_out_messages_outcome"),
     )
 
 
