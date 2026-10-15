@@ -22,11 +22,19 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from sqlalchemy import text
 
-from config.lending_partners import AWAITING_ROUTER_REASON, CREDIT_BANDS, PRODUCT_LABELS, PRODUCTS, SOURCE_PARTNER
+from config.lender_matrix import LenderRules
+from config.lending_partners import (
+    AWAITING_ROUTER_REASON,
+    CREDIT_BAND_MAX_FICO,
+    CREDIT_BANDS,
+    PRODUCT_LABELS,
+    PRODUCTS,
+    SOURCE_PARTNER,
+)
 from src.lending.contracts import BorrowerProfile, LenderFitResult, LoanRequest
 from src.lending.partners import Partner, StatusChange, partner_by_id, record_status_change
 from src.lending.prequal import TEMPLATE, FitLimits, PrequalLead, build_context
@@ -38,8 +46,10 @@ EmailSender = Callable[[str, str, str], Any]  # (to, subject, body) -> provider 
 SmsSender = Callable[[str, str], Any]  # (phone, body) -> provider message id
 SlackPoster = Callable[[str], None]
 PdfRenderer = Callable[[str, dict], bytes]  # (template, context) -> PDF bytes
-FitEvaluator = Callable[[BorrowerProfile, LoanRequest], LenderFitResult]
-FitLimitsLookup = Callable[[LenderFitResult], list[FitLimits]]  # fitting lenders -> their loan-amount limits
+Matrix = Sequence[LenderRules]
+FitEvaluator = Callable[[BorrowerProfile, LoanRequest, Matrix], LenderFitResult]
+FitLimitsLookup = Callable[[LenderFitResult, Matrix], list[FitLimits]]  # fitting lenders -> their loan-amount limits
+MatrixLoader = Callable[[], Matrix]  # the lender rules in force (config, or the DB table when LENDING_RULES_FROM_DB)
 
 _STATUS_WORDING = {
     "routed": "has been sent to a lender for review",
@@ -59,6 +69,7 @@ class PipelineServices:
     render_pdf: Optional[PdfRenderer]
     evaluate_fit: FitEvaluator
     fit_limits: FitLimitsLookup
+    load_matrix: MatrixLoader
     upload_dir: str
     prequal_pct: int
 
@@ -72,6 +83,7 @@ def live_services() -> PipelineServices:
     from src.lending.ghl_email import get_email_sender
     from src.lending.ghl_sms import get_sender
     from src.lending.lender_fit import evaluate_lender_fit
+    from src.lending.lender_rules_store import current_matrix
     from src.lending.pdf.render import NON_BINDING_PREQUAL_WATERMARK, render_pdf
 
     settings = get_settings()
@@ -91,8 +103,9 @@ def live_services() -> PipelineServices:
         sms=sms_sender,
         slack=slack,
         render_pdf=lambda template, context: render_pdf(template, context, watermark=NON_BINDING_PREQUAL_WATERMARK),
-        evaluate_fit=evaluate_lender_fit,
+        evaluate_fit=lambda borrower, loan, matrix: evaluate_lender_fit(borrower, loan, matrix=tuple(matrix)),
         fit_limits=fit_limits_from_result,
+        load_matrix=current_matrix,
         upload_dir=settings.lending_partner_upload_dir,
         prequal_pct=settings.lending_prequal_range_pct,
     )
@@ -102,26 +115,32 @@ def _money(value: Optional[int]) -> Optional[Decimal]:
     return Decimal(value) if value is not None else None
 
 
-def _score(services: PipelineServices, file: dict[str, Any]) -> Optional[LenderFitResult]:
+def _score(services: PipelineServices, file: dict[str, Any], matrix: Matrix) -> Optional[LenderFitResult]:
     loan_type = PRODUCTS.get(file["product"])
     if loan_type is None:
         return None
-    borrower = BorrowerProfile(credit_band_min_fico=CREDIT_BANDS.get(file["credit_band"] or ""),
+    band = file["credit_band"] or ""
+    borrower = BorrowerProfile(credit_band_min_fico=CREDIT_BANDS.get(band), credit_band_max_fico=CREDIT_BAND_MAX_FICO.get(band),
                                completed_projects=file["completed_projects"], state=file["property_state"])
     loan = LoanRequest(loan_type=loan_type, loan_amount=Decimal(file["loan_amount"]), state=file["property_state"],
                        purchase_price=_money(file["purchase_price"]), rehab_budget=_money(file["rehab_budget"]),
                        arv=_money(file["arv"]), property_address=file["property_address"])
-    return services.evaluate_fit(borrower, loan)
+    return services.evaluate_fit(borrower, loan, matrix)
 
 
-def _prequal_pdf(services: PipelineServices, file: dict[str, Any], fit: LenderFitResult) -> Optional[str]:
-    """Render the pre-qual letter and store it next to the file's uploads. None when no lender fits."""
-    if services.render_pdf is None:
+def _prequal_pdf(services: PipelineServices, file: dict[str, Any], fit: LenderFitResult,
+                 matrix: Matrix) -> Optional[str]:
+    """Render the pre-qual letter and store it next to the file's uploads. None when no lender fits.
+
+    Same rule as T-07 (``prequal_fit.get_fit_evaluator``): while no lender in the matrix is verified,
+    no letter is produced, so a letter never rests on unconfirmed lender values alone.
+    """
+    if services.render_pdf is None or not any(rules.verified for rules in matrix):
         return None
     loan_type = PRODUCTS[file["product"]]
     lead = PrequalLead(credit_band=file["credit_band"], loan_amount=int(file["loan_amount"]),
                        property_state=file["property_state"], loan_type=loan_type.value)
-    context = build_context(lead, services.fit_limits(fit), services.prequal_pct)
+    context = build_context(lead, services.fit_limits(fit, matrix), services.prequal_pct)
     if context is None:
         return None
     folder = Path(services.upload_dir) / str(file["id"])
@@ -138,11 +157,12 @@ def route_file(db, file_id: int, now: Optional[datetime] = None) -> None:
 
 def _josh_note(file: dict[str, Any], partner: Partner, fit: Optional[LenderFitResult]) -> str:
     fitting = len(fit.fitting) if fit is not None else 0
+    possible = len(fit.possible) if fit is not None else 0
     return (f"New partner file #{file['id']} from {partner.name}"
             f"{f' ({partner.company})' if partner.company else ''}: "
             f"{PRODUCT_LABELS.get(file['product'], file['product'])}, ${int(file['loan_amount']):,}, "
             f"{file['property_state']}, borrower {file['borrower_last_name']}. "
-            f"Lenders fitting: {fitting}. Status: held, awaiting router.")
+            f"Lenders fitting: {fitting}, possible (confirm on call): {possible}. Status: held, awaiting router.")
 
 
 def _place(address: Optional[str], last_name: str) -> str:
@@ -189,14 +209,16 @@ def _process(file_id: int, services: PipelineServices, session_factory: Callable
         partner = partner_by_id(db, int(file["partner_id"]))
 
     fit: Optional[LenderFitResult] = None
+    matrix: Matrix = ()
     try:
-        fit = _score(services, file)
+        matrix = services.load_matrix()
+        fit = _score(services, file, matrix)
     except Exception as exc:
         logger.error("[partner-door] lender fit failed file=%s (%s)", file_id, type(exc).__name__)
     pdf_path: Optional[str] = None
     if fit is not None:
         try:
-            pdf_path = _prequal_pdf(services, file, fit)
+            pdf_path = _prequal_pdf(services, file, fit, matrix)
         except Exception as exc:
             logger.error("[partner-door] pre-qual PDF failed file=%s (%s)", file_id, type(exc).__name__)
 

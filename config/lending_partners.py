@@ -1,6 +1,8 @@
 """Partner Door (P-1): vocabularies and limits for partner records and partner-submitted files."""
 from __future__ import annotations
 
+from typing import Optional
+
 from src.lending.contracts import LoanType
 
 PARTNER_TYPES = ("wholesaler", "broker", "referral", "other")
@@ -24,6 +26,14 @@ CREDIT_BANDS: dict[str, int] = {
     "680-719": 680,
     "720-759": 720,
     "760+": 760,
+}
+# Upper bound of each closed band, so a band wholly below a lender's floor is a decline, not "possible".
+CREDIT_BAND_MAX_FICO: dict[str, Optional[int]] = {
+    "Below 640": 639,
+    "640-679": 679,
+    "680-719": 719,
+    "720-759": 759,
+    "760+": None,
 }
 TIMELINES = ("Under 2 weeks", "2-4 weeks", "1-3 months", "3+ months", "Not sure")
 

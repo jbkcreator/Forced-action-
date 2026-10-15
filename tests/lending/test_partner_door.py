@@ -27,6 +27,7 @@ from src.lending import partner_pipeline, partners
 from src.lending.contracts import LenderFit, LenderFitResult
 from src.lending.db import get_lending_db
 from src.lending.prequal import FitLimits
+from config.lender_matrix import LenderRules
 from src.lending.models import LendingLoanFile, LendingPartner, LendingPartnerFileUpload, LendingPartnerSubmission
 
 CONSENT = "I confirm I have the borrower's permission to share this information with Next Deal Lending."
@@ -288,7 +289,11 @@ class Recorder:
         self.pdfs: list[dict] = []
 
 
-def _services(recorder: Recorder, tmp_path, fit: LenderFitResult | None = None) -> partner_pipeline.PipelineServices:
+VERIFIED_BOX = LenderRules(key="test_lender", name="Test Lender", verified=True)
+
+
+def _services(recorder: Recorder, tmp_path, fit: LenderFitResult | None = None,
+              matrix: tuple = (VERIFIED_BOX,)) -> partner_pipeline.PipelineServices:
     # The live matrix has no verified lender with both loan limits yet, so the limits are supplied here.
     fit = fit or LenderFitResult(fitting=[LenderFit(lender_key="test_lender", lender_name="Test Lender")])
 
@@ -299,8 +304,9 @@ def _services(recorder: Recorder, tmp_path, fit: LenderFitResult | None = None) 
     return partner_pipeline.PipelineServices(
         email=lambda to, subject, body: recorder.emails.append((to, subject, body)),
         sms=lambda phone, body: recorder.texts.append((phone, body)),
-        slack=recorder.slack.append, render_pdf=render, evaluate_fit=lambda borrower, loan: fit,
-        fit_limits=lambda result: [FitLimits(100_000, 1_000_000)] if result.fitting else [],
+        slack=recorder.slack.append, render_pdf=render, evaluate_fit=lambda borrower, loan, matrix: fit,
+        fit_limits=lambda result, matrix: [FitLimits(100_000, 1_000_000)] if result.fitting else [],
+        load_matrix=lambda: matrix,
         upload_dir=str(tmp_path / "uploads"), prequal_pct=10,
     )
 
@@ -359,6 +365,25 @@ def test_no_fitting_lender_means_no_prequal_pdf(engine, session_factory, tmp_pat
     recorder = Recorder()
     partner_pipeline.process_new_file(file_id, _services(recorder, tmp_path, fit=LenderFitResult()), session_factory)
     assert _rows(engine, "loan_files")[0]["prequal_pdf_path"] is None and recorder.pdfs == []
+
+
+def test_no_prequal_pdf_while_no_lender_is_verified(engine, session_factory, tmp_path) -> None:
+    _, token = _partner(session_factory)
+    file_id = _submit(session_factory, token)
+    recorder = Recorder()
+    unverified = (LenderRules(key="test_lender", name="Test Lender", verified=False),)
+    partner_pipeline.process_new_file(file_id, _services(recorder, tmp_path, matrix=unverified), session_factory)
+    assert _rows(engine, "loan_files")[0]["prequal_pdf_path"] is None and recorder.pdfs == []
+
+
+def test_closed_credit_band_sends_its_upper_bound(engine, session_factory, tmp_path) -> None:
+    _, token = _partner(session_factory)
+    file_id = _submit(session_factory, token, credit_band="640-679")
+    seen = []
+    services = dataclasses.replace(_services(Recorder(), tmp_path),
+                                   evaluate_fit=lambda borrower, loan, matrix: seen.append(borrower) or LenderFitResult())
+    partner_pipeline.process_new_file(file_id, services, session_factory)
+    assert (seen[0].credit_band_min_fico, seen[0].credit_band_max_fico) == (640, 679)
 
 
 def test_pipeline_failure_never_raises(session_factory, tmp_path) -> None:
