@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 EmailSender = Callable[[str, str, str], Any]  # (to, subject, body) -> provider message id
 SmsSender = Callable[[str, str], Any]  # (phone, body) -> provider message id
-SlackPoster = Callable[[str], None]
+SlackPoster = Callable[["SlackNote"], None]
 PdfRenderer = Callable[[str, dict], bytes]  # (template, context) -> PDF bytes
 Matrix = Sequence[LenderRules]
 FitEvaluator = Callable[[BorrowerProfile, LoanRequest, Matrix], LenderFitResult]
@@ -59,6 +59,14 @@ _STATUS_WORDING = {
     "approved": "was approved by a lender",
     "funded": "has funded. Thank you",
 }
+
+
+@dataclass(frozen=True)
+class SlackNote:
+    """``text`` is the notification / fallback line; ``blocks`` is the card Slack shows."""
+
+    text: str
+    blocks: list[dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -103,14 +111,14 @@ def live_services() -> PipelineServices:
     settings = get_settings()
     email_sender, sms_sender = get_email_sender(), get_sender()
 
-    def slack(message: str) -> None:
-        channel, token = settings.lending_dial_tasks_channel, settings.lending_slack_bot_token  # Josh's work channel; R-1 posts here too
+    def slack(note: SlackNote) -> None:
+        channel, token = settings.lending_routing_channel, settings.lending_slack_bot_token  # #next-deal-lending, with R-1's route posts
         if not (channel and token):
-            logger.info("[partner-door] Slack note skipped: LENDING_DIAL_TASKS_CHANNEL or bot token not set")
+            logger.info("[partner-door] Slack note skipped: LENDING_ROUTING_CHANNEL or bot token not set")
             return
         from slack_sdk import WebClient
 
-        WebClient(token=token.get_secret_value()).chat_postMessage(channel=channel, text=message)
+        WebClient(token=token.get_secret_value()).chat_postMessage(channel=channel, text=note.text, blocks=note.blocks)
 
     return PipelineServices(
         email=email_sender,
@@ -200,14 +208,31 @@ def route_file(db, file_id: int, now: Optional[datetime] = None) -> None:
     route_loan_file(file_id, db)
 
 
-def _josh_note(file: dict[str, Any], partner: Partner, fit: Optional[LenderFitResult], status: str) -> str:
+def _mrkdwn(value: Any) -> str:
+    """Escape the three characters Slack mrkdwn treats as markup."""
+    return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _josh_note(file: dict[str, Any], partner: Partner, fit: Optional[LenderFitResult], status: str) -> SlackNote:
     fitting = len(fit.fitting) if fit is not None else 0
     possible = len(fit.possible) if fit is not None else 0
-    return (f"New partner file #{file['id']} from {partner.name}"
-            f"{f' ({partner.company})' if partner.company else ''}: "
-            f"{PRODUCT_LABELS.get(file['product'], file['product'])}, ${int(file['loan_amount']):,}, "
-            f"{file['property_state']}, borrower {file['borrower_last_name']}. "
-            f"Lenders fitting: {fitting}, possible (confirm on call): {possible}. Status: {status}.")
+    who = partner.name + (f" · {partner.company}" if partner.company else "")
+    loan = f"{PRODUCT_LABELS.get(file['product'], file['product'])} · ${int(file['loan_amount']):,}"
+    lender_fit = f"{fitting} fit · {possible} possible" if fit is not None else "Not scored"
+    text = f"New partner file #{file['id']} from {who}: {loan}, {file['property_state']}, borrower {file['borrower_last_name']}"
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn",
+                                     "text": f"*New partner file  #{file['id']}*\n{_mrkdwn(who)}"}},
+        {"type": "section", "fields": [
+            {"type": "mrkdwn", "text": f"*Loan*\n{_mrkdwn(loan)}"},
+            {"type": "mrkdwn", "text": f"*State*\n{_mrkdwn(file['property_state'])}"},
+            {"type": "mrkdwn", "text": f"*Borrower*\n{_mrkdwn(file['borrower_last_name'])}"},
+            {"type": "mrkdwn", "text": f"*Lender fit*\n{lender_fit}"},
+        ]},
+        {"type": "context", "elements": [{"type": "mrkdwn",
+                                          "text": f"Status: {_mrkdwn(status)}  ·  Borrower not contacted (partner consent only)"}]},
+    ]
+    return SlackNote(text=text, blocks=blocks)
 
 
 def _place(address: Optional[str], last_name: str) -> str:

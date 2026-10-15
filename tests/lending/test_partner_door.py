@@ -303,7 +303,7 @@ class Recorder:
     def __init__(self) -> None:
         self.emails: list[tuple[str, str, str]] = []
         self.texts: list[tuple[str, str]] = []
-        self.slack: list[str] = []
+        self.slack: list = []
         self.pdfs: list[dict] = []
 
 
@@ -350,7 +350,11 @@ def test_new_file_is_scored_prequalified_held_and_announced(engine, session_fact
     assert '"fitting"' in file["lender_fit"]
     assert file["prequal_pdf_path"] and open(file["prequal_pdf_path"], "rb").read() == b"%PDF fake"
     assert len(recorder.pdfs) == 1  # one letter rendered for the file
-    assert len(recorder.slack) == 1 and f"#{file_id}" in recorder.slack[0] and "Reyes" in recorder.slack[0]
+    note = recorder.slack[0]
+    assert len(recorder.slack) == 1 and f"#{file_id}" in note.text and "Reyes" in note.text
+    assert note.blocks[0]["text"]["text"].startswith(f"*New partner file  #{file_id}*")
+    fields = [field["text"] for field in note.blocks[1]["fields"]]
+    assert fields[0] == "*Loan*\nFix and flip · $200,000" and fields[3] == "*Lender fit*\n1 fit · 0 possible"
     assert [email[0] for email in recorder.emails] == ["maria@example.com"]
     assert "412 Palm Ave" in recorder.emails[0][1]
 
