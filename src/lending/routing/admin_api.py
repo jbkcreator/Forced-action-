@@ -16,6 +16,11 @@ Endpoints:
   DELETE /api/lending/routing/lenders/{id}/boxes/{box_id}  remove a product box
   GET    /api/lending/routing/decline-reasons      list decline reason codes
   POST   /api/lending/routing/decline-reasons      add a reason code
+  POST   /api/lending/routing/lenders/reorder     set the waterfall order (atomic)
+  GET    /api/lending/routing/meta                vocabularies for the admin screen
+  GET    /api/lending/routing/files               file list (status, last-name filters)
+  GET    /api/lending/routing/files/{lead_id}     file record: current lender, next lender, history
+  POST   /api/lending/routing/files/{lead_id}/decline  one-click decline of the current lender
   POST   /api/lending/routing/events/{event_id}/decline  one-click decline (R-1)
   POST   /api/lending/routing/files/{lead_id}/outcome    record approved / funded (moves the seat cap)
   GET    /api/lending/routing/hold-queue           current hold queue summary
@@ -27,9 +32,10 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from config.lending_routing import (
@@ -38,6 +44,7 @@ from config.lending_routing import (
     OUTCOME_ACTIONS,
     PRIMARY_DEFAULT_CONSTRUCTION_MIN,
     PRIMARY_DEFAULT_SEAT_CAP,
+    SEAT_CAP_COUNTED_ACTION,
 )
 from config.settings import get_settings
 from src.lending.contracts import LoanType
@@ -132,6 +139,27 @@ class OutcomeIn(BaseModel):
     free_text: Optional[str] = None
 
 
+class FileDeclineIn(BaseModel):
+    reason_code: str = DEFAULT_DECLINE_REASON
+    actor: str = "josh"
+    free_text: Optional[str] = None
+
+
+class ReorderIn(BaseModel):
+    ordered_ids: list[int] = Field(min_length=1)
+
+
+_NULLABLE_LENDER_FIELDS = frozenset({"monthly_cap", "construction_min_amount", "points_paid_to_broker"})
+_FILE_STATUSES = ("unrouted", "routed", "held", "exhausted")
+
+
+def _priority_taken() -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail="That priority is already used by an active lender. Use the reorder control to change the order.",
+    )
+
+
 # ── Lender CRUD ───────────────────────────────────────────────────────────────
 
 
@@ -167,25 +195,29 @@ def create_lender(
         if body.construction_min_amount is None:
             body.construction_min_amount = PRIMARY_DEFAULT_CONSTRUCTION_MIN
     now = datetime.now(timezone.utc)
-    row = db.execute(
-        text(
-            "INSERT INTO lending.lender_routing_rules"
-            "  (name, active, is_primary, agreement_status, priority,"
-            "   monthly_cap, construction_min_amount, points_paid_to_broker,"
-            "   takes_ground_up, created_at, updated_at)"
-            " VALUES (:name, :active, :primary, :status, :priority,"
-            "         :cap, :cmin, :pts, :gu, :now, :now)"
-            " RETURNING id"
-        ),
-        {
-            "name": body.name, "active": body.active, "primary": body.is_primary,
-            "status": body.agreement_status, "priority": body.priority,
-            "cap": body.monthly_cap, "cmin": body.construction_min_amount,
-            "pts": body.points_paid_to_broker, "gu": body.takes_ground_up,
-            "now": now,
-        },
-    ).scalar_one()
-    db.commit()
+    try:
+        row = db.execute(
+            text(
+                "INSERT INTO lending.lender_routing_rules"
+                "  (name, active, is_primary, agreement_status, priority,"
+                "   monthly_cap, construction_min_amount, points_paid_to_broker,"
+                "   takes_ground_up, created_at, updated_at)"
+                " VALUES (:name, :active, :primary, :status, :priority,"
+                "         :cap, :cmin, :pts, :gu, :now, :now)"
+                " RETURNING id"
+            ),
+            {
+                "name": body.name, "active": body.active, "primary": body.is_primary,
+                "status": body.agreement_status, "priority": body.priority,
+                "cap": body.monthly_cap, "cmin": body.construction_min_amount,
+                "pts": body.points_paid_to_broker, "gu": body.takes_ground_up,
+                "now": now,
+            },
+        ).scalar_one()
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise _priority_taken()
     return {"id": row, "name": body.name}
 
 
@@ -202,21 +234,66 @@ def update_lender(
     if body.is_primary is True:
         _enforce_single_primary(lender_id, db)
 
-    updates = {k: v for k, v in body.model_dump(exclude_none=True).items()}
+    # Only fields the caller sent. An explicit null clears a nullable limit (for example "no seat cap");
+    # for any other field null is meaningless and is rejected.
+    updates = body.model_dump(exclude_unset=True)
     if not updates:
         return {"detail": "no changes"}
+    bad_null = [k for k, v in updates.items() if v is None and k not in _NULLABLE_LENDER_FIELDS]
+    if bad_null:
+        raise HTTPException(status_code=422, detail=f"{bad_null} cannot be null")
 
     updates["id"] = lender_id
     updates["now"] = datetime.now(timezone.utc)
     set_clause = ", ".join(
         f"{k} = :{k}" for k in updates if k not in ("id", "now")
     ) + ", updated_at = :now"
+    try:
+        db.execute(
+            text(f"UPDATE lending.lender_routing_rules SET {set_clause} WHERE id = :id"),
+            updates,
+        )
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise _priority_taken()
+    return {"id": lender_id, "updated": [k for k in updates if k not in ("id", "now")]}
+
+
+@router.post("/lenders/reorder")
+def reorder_lenders(
+    body: ReorderIn,
+    _: None = Depends(_verify_admin),
+    db: Session = Depends(get_lending_db),
+) -> dict:
+    """Set the waterfall order in one transaction: ``ordered_ids[0]`` becomes priority 1, and so on.
+
+    Priorities are unique among active lenders, so they cannot be swapped one PATCH at a time. Every
+    active lender must be in the list, otherwise the new numbers could collide with one left out.
+    """
+    ids = body.ordered_ids
+    if len(set(ids)) != len(ids):
+        raise HTTPException(status_code=422, detail="ordered_ids contains duplicates")
+    known = {r["id"]: r["active"] for r in db.execute(
+        text("SELECT id, active FROM lending.lender_routing_rules")).mappings()}
+    unknown = [i for i in ids if i not in known]
+    if unknown:
+        raise HTTPException(status_code=404, detail=f"Unknown lender ids: {unknown}")
+    missing_active = sorted(i for i, active in known.items() if active and i not in set(ids))
+    if missing_active:
+        raise HTTPException(status_code=422, detail=f"Every active lender must be listed; missing {missing_active}")
+    now = datetime.now(timezone.utc)
+    # Two passes: park the listed rows on negative numbers, then assign the final order.
     db.execute(
-        text(f"UPDATE lending.lender_routing_rules SET {set_clause} WHERE id = :id"),
-        updates,
+        text("UPDATE lending.lender_routing_rules SET priority = -id WHERE id = ANY(:ids)"), {"ids": ids},
     )
+    for position, lender_id in enumerate(ids, start=1):
+        db.execute(
+            text("UPDATE lending.lender_routing_rules SET priority = :p, updated_at = :now WHERE id = :id"),
+            {"p": position, "now": now, "id": lender_id},
+        )
     db.commit()
-    return {"id": lender_id, "updated": list(updates.keys())}
+    return {"ordered_ids": ids}
 
 
 @router.post("/lenders/{lender_id}/make-primary")
@@ -403,6 +480,130 @@ def file_outcome(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     return {"detail": "recorded" if recorded else "already recorded"}
+
+
+# ── Meta ──────────────────────────────────────────────────────────────────────
+
+
+@router.get("/meta")
+def meta(_: None = Depends(_verify_admin)) -> dict:
+    """Vocabularies the admin screen offers, so it never hard-codes them."""
+    return {
+        "loan_types": [m.value for m in LoanType],
+        "agreement_statuses": list(AGREEMENT_STATUS_CHOICES),
+        "file_statuses": list(_FILE_STATUSES),
+        "outcome_actions": list(OUTCOME_ACTIONS),
+        "default_decline_reason": DEFAULT_DECLINE_REASON,
+        "seat_cap_counted_action": SEAT_CAP_COUNTED_ACTION,
+    }
+
+
+# ── File record (list, detail with next lender + history, one-click decline) ──
+
+
+@router.get("/files")
+def list_files(
+    status: Optional[str] = Query(default=None),
+    q: Optional[str] = Query(default=None, max_length=60, description="borrower last name contains"),
+    limit: int = Query(default=100, ge=1, le=500),
+    _: None = Depends(_verify_admin),
+    db: Session = Depends(get_lending_db),
+) -> dict:
+    if status is not None and status not in _FILE_STATUSES:
+        raise HTTPException(status_code=422, detail=f"status must be one of {list(_FILE_STATUSES)}")
+    rows = db.execute(
+        text(
+            "SELECT fr.lead_id, ll.first_name, ll.last_name, ll.loan_type, ll.loan_amount,"
+            "       ll.property_state, fr.status, fr.current_lender_name, fr.route_position,"
+            "       fr.hold_reason, fr.updated_at"
+            "  FROM lending.file_routing fr"
+            "  JOIN lending.lendingflow_leads ll ON ll.id = fr.lead_id"
+            " WHERE (CAST(:status AS text) IS NULL OR fr.status = :status)"
+            "   AND (CAST(:q AS text) IS NULL OR ll.last_name ILIKE :qlike)"
+            " ORDER BY fr.updated_at DESC, fr.lead_id DESC"
+            " LIMIT :limit"
+        ),
+        {"status": status, "q": q, "qlike": f"%{q}%" if q else None, "limit": limit},
+    ).mappings().all()
+    return {"count": len(rows), "files": [dict(r) for r in rows]}
+
+
+@router.get("/files/{lead_id}")
+def file_record(
+    lead_id: int,
+    _: None = Depends(_verify_admin),
+    db: Session = Depends(get_lending_db),
+) -> dict:
+    """One file: where it is, who is next, and its full route history."""
+    from src.lending.routing.router import preview_next
+
+    file = db.execute(
+        text(
+            "SELECT fr.lead_id, fr.status, fr.current_lender_id, fr.current_lender_name,"
+            "       fr.route_position, fr.lenders_tried, fr.hold_reason, fr.updated_at,"
+            "       ll.first_name, ll.last_name, ll.loan_type, ll.loan_amount, ll.property_state"
+            "  FROM lending.file_routing fr"
+            "  JOIN lending.lendingflow_leads ll ON ll.id = fr.lead_id"
+            " WHERE fr.lead_id = :lid"
+        ),
+        {"lid": lead_id},
+    ).mappings().one_or_none()
+    if file is None:
+        raise HTTPException(status_code=404, detail=f"No routing record for file {lead_id}")
+
+    history = db.execute(
+        text(
+            "SELECT id, action, lender_id, lender_name, reason_code, free_text, actor, created_at"
+            "  FROM lending.file_routing_events WHERE lead_id = :lid ORDER BY id"
+        ),
+        {"lid": lead_id},
+    ).mappings().all()
+
+    routed = file["status"] == "routed"
+    return {
+        "file": {k: file[k] for k in (
+            "lead_id", "first_name", "last_name", "loan_type", "loan_amount", "property_state",
+            "status", "hold_reason", "updated_at",
+        )},
+        "current": (
+            {"lender_id": file["current_lender_id"], "name": file["current_lender_name"],
+             "position": file["route_position"]} if routed else None
+        ),
+        "next": preview_next(lead_id, db) if file["status"] in ("routed", "unrouted") else None,
+        "tried_lender_ids": list(file["lenders_tried"] or []),
+        "history": [dict(h) for h in history],
+        "can_decline": routed,
+        "can_record_outcome": routed,
+    }
+
+
+@router.post("/files/{lead_id}/decline", status_code=200)
+def decline_file(
+    lead_id: int,
+    body: FileDeclineIn,
+    _: None = Depends(_verify_admin),
+    db: Session = Depends(get_lending_db),
+) -> dict[str, Any]:
+    """One-click decline of the file's current lender (the file record's Decline button)."""
+    from src.lending.routing.decline import record_decline
+
+    event_id = db.execute(
+        text(
+            "SELECT e.id FROM lending.file_routing_events e"
+            "  JOIN lending.file_routing fr ON fr.lead_id = e.lead_id AND fr.status = 'routed'"
+            " WHERE e.lead_id = :lid AND e.action = 'routed' ORDER BY e.id DESC LIMIT 1"
+        ),
+        {"lid": lead_id},
+    ).scalar()
+    if event_id is None:
+        raise HTTPException(status_code=422, detail=f"File {lead_id} is not currently routed to a lender")
+    try:
+        record_decline(
+            event_id, reason_code=body.reason_code, actor=body.actor, db=db, free_text=body.free_text,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return {"detail": "decline recorded"}
 
 
 # ── Hold queue ────────────────────────────────────────────────────────────────

@@ -102,6 +102,69 @@ def _waterfall(
     return None
 
 
+def _choose(
+    profile: FileProfile,
+    signed: list[LenderRow],
+    tried: list[int],
+    db: Session,
+) -> Optional[LenderRow]:
+    """Rules 1–5, first match wins; None means rule 6 (hold queue).
+
+    The single place the rules live: ``route_file`` writes the result, ``preview_next`` only reads it.
+    """
+    primary = primary_lender(signed)
+    loan_type = profile.loan_type
+    amount = profile.loan_amount
+
+    if loan_type == _GROUND_UP and primary is not None:
+        construction_min = primary.construction_min_amount or 0
+        if amount >= construction_min and primary.id not in tried:
+            if lender_passes_box(primary, profile) and not seat_at_cap(primary, db):
+                return primary   # Rule 1
+
+    if loan_type == _FLIP and primary is not None and primary.id not in tried:
+        if lender_passes_box(primary, profile) and not seat_at_cap(primary, db):
+            return primary   # Rule 2
+
+    if loan_type == _GROUND_UP:
+        construction_min = (primary.construction_min_amount or 0) if primary else 0
+        if amount < construction_min or primary is None:
+            chosen = _waterfall(signed, loan_type, profile, tried, ground_up_only=True)  # Rule 3
+            if chosen is not None:
+                return chosen
+
+    if loan_type == _FLIP:
+        chosen = _waterfall(signed, loan_type, profile, tried)  # Rule 4
+        if chosen is not None:
+            return chosen
+
+    if loan_type in _DSCR_TYPES:
+        return _waterfall(signed, loan_type, profile, tried, dscr_only=True)  # Rule 5
+
+    return None
+
+
+def preview_next(lead_id: int, db: Session) -> Optional[dict]:
+    """Who the file would go to next, without writing anything.
+
+    For a routed file the current lender is already in ``lenders_tried``, so the answer is the lender a
+    decline would send it to.  For an unrouted file it is the lender it would be routed to first.  None
+    when no lender qualifies (the file would go to the hold queue).
+    """
+    lead = _load_lead(lead_id, db)
+    if lead.get("suppressed"):
+        return None
+    row = db.execute(
+        text("SELECT lenders_tried FROM lending.file_routing WHERE lead_id = :lid"), {"lid": lead_id},
+    ).mappings().one_or_none()
+    tried = list(row["lenders_tried"] or []) if row else []
+    signed = _signed(load_active_lenders(db))
+    chosen = _choose(_build_profile(lead), signed, tried, db) if signed else None
+    if chosen is None:
+        return None
+    return {"lender_id": chosen.id, "name": chosen.name, "position": len(tried) + 1}
+
+
 def _build_profile(lead: dict) -> FileProfile:
     return FileProfile(
         loan_type=(lead.get("loan_type") or "").upper(),
@@ -272,35 +335,10 @@ def route_file(lead_id: int, db: Session) -> None:
         post_hold_event(lead, event_id, reason="no_match", db=db)
         return
 
-    primary = primary_lender(signed)
-    loan_type = profile.loan_type
-    amount = profile.loan_amount
     tried: list[int] = list(routing["lenders_tried"] or [])
     position = len(tried) + 1
 
-    chosen: Optional[LenderRow] = None
-
-    if loan_type == _GROUND_UP and primary is not None:
-        construction_min = primary.construction_min_amount or 0
-        if amount >= construction_min and primary.id not in tried:
-            if lender_passes_box(primary, profile) and not seat_at_cap(primary, db):
-                chosen = primary   # Rule 1
-
-    if chosen is None and loan_type == _FLIP and primary is not None:
-        if primary.id not in tried:
-            if lender_passes_box(primary, profile) and not seat_at_cap(primary, db):
-                chosen = primary   # Rule 2
-
-    if chosen is None and loan_type == _GROUND_UP:
-        construction_min = (primary.construction_min_amount or 0) if primary else 0
-        if amount < construction_min or primary is None:
-            chosen = _waterfall(signed, loan_type, profile, tried, ground_up_only=True)  # Rule 3
-
-    if chosen is None and loan_type == _FLIP:
-        chosen = _waterfall(signed, loan_type, profile, tried)  # Rule 4
-
-    if chosen is None and loan_type in _DSCR_TYPES:
-        chosen = _waterfall(signed, loan_type, profile, tried, dscr_only=True)  # Rule 5
+    chosen = _choose(profile, signed, tried, db)
 
     # Rule 6: no lender matched
     if chosen is None:

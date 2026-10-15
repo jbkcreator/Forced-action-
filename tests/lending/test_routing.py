@@ -806,3 +806,152 @@ def test_seed_from_t05_matrix_is_inert_idempotent_and_correct(rdb):
     assert _fr(rdb, flip2)["current_lender_name"] == primary_name
     assert _fr(rdb, gu_650)["current_lender_name"] == primary_name
     assert _fr(rdb, gu_450)["current_lender_name"] not in (None, primary_name)
+
+
+# ── Admin screen backend: file record, reorder, safe PATCH ────────────────────
+
+@pytest.fixture
+def api(rdb):
+    """The routing admin router on its own throwaway app, bound to the test transaction."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from src.lending.db import get_lending_db
+    from src.lending.routing.admin_api import _verify_admin, router
+
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[_verify_admin] = lambda: None
+    app.dependency_overrides[get_lending_db] = lambda: rdb
+    return TestClient(app)
+
+
+def test_file_record_shows_current_next_and_history_and_one_click_decline(rdb, api):
+    a = _add_lender(rdb, name="First", priority=1)
+    _add_box(rdb, a, loan_types=[LOAN_TYPE_FLIP])
+    b = _add_lender(rdb, name="Second", priority=2)
+    _add_box(rdb, b, loan_types=[LOAN_TYPE_FLIP])
+    lead = _make_lead(rdb, phone_suffix="1901", last_name="Wozniak")
+    _route(rdb, lead)
+
+    rec = api.get(f"/api/lending/routing/files/{lead}").json()
+    assert rec["file"]["last_name"] == "Wozniak" and rec["file"]["status"] == "routed"
+    assert rec["current"]["name"] == "First" and rec["current"]["position"] == 1
+    assert rec["next"]["name"] == "Second" and rec["next"]["position"] == 2
+    assert [h["action"] for h in rec["history"]] == ["routed"]
+    assert rec["can_decline"] is True
+
+    assert api.post(f"/api/lending/routing/files/{lead}/decline", json={}).status_code == 200
+    rec = api.get(f"/api/lending/routing/files/{lead}").json()
+    assert rec["current"]["name"] == "Second" and rec["next"] is None
+    assert [h["action"] for h in rec["history"]] == ["routed", "declined", "routed"]
+    assert rec["history"][1]["reason_code"] == "unspecified" and rec["history"][1]["actor"] == "josh"
+
+    assert api.post(f"/api/lending/routing/files/{lead}/decline",
+                    json={"reason_code": "ltv", "actor": "josh"}).status_code == 200
+    rec = api.get(f"/api/lending/routing/files/{lead}").json()
+    assert rec["file"]["status"] == "exhausted" and rec["current"] is None and rec["can_decline"] is False
+    assert api.post(f"/api/lending/routing/files/{lead}/decline", json={}).status_code == 422
+    assert api.get("/api/lending/routing/files/999999").status_code == 404
+
+
+def test_preview_next_agrees_with_the_real_router(rdb):
+    """The screen's "who is next" must be exactly what the router then does."""
+    from src.lending.routing.router import preview_next
+
+    a = _add_lender(rdb, name="Alpha", priority=1)
+    _add_box(rdb, a, loan_types=[LOAN_TYPE_FLIP])
+    b = _add_lender(rdb, name="Beta", priority=2)
+    _add_box(rdb, b, loan_types=[LOAN_TYPE_FLIP])
+    lead = _make_lead(rdb, phone_suffix="1902")
+
+    predicted = preview_next(lead, rdb)  # an unrouted file: the lender it would go to first
+    assert predicted == {"lender_id": a, "name": "Alpha", "position": 1}
+    assert _fr(rdb, lead) == {}  # a preview writes nothing
+    _route(rdb, lead)
+    assert _fr(rdb, lead)["current_lender_name"] == predicted["name"]
+
+
+def test_file_list_filters_by_status_and_last_name(rdb, api):
+    l1 = _add_lender(rdb, name="Lister", priority=1)
+    _add_box(rdb, l1, loan_types=[LOAN_TYPE_FLIP])
+    routed = _make_lead(rdb, phone_suffix="2001", last_name="Alvarez")
+    held = _make_lead(rdb, loan_type="other", phone_suffix="2002", last_name="Brandt")
+    _route(rdb, routed)
+    _route(rdb, held)
+
+    everything = api.get("/api/lending/routing/files").json()
+    assert {f["lead_id"] for f in everything["files"]} == {routed, held}
+    only_held = api.get("/api/lending/routing/files", params={"status": "held"}).json()
+    assert [f["lead_id"] for f in only_held["files"]] == [held]
+    by_name = api.get("/api/lending/routing/files", params={"q": "alvar"}).json()
+    assert [f["lead_id"] for f in by_name["files"]] == [routed]
+    assert api.get("/api/lending/routing/files", params={"status": "bogus"}).status_code == 422
+
+
+def test_reorder_is_atomic_validated_and_changes_routing(rdb, api):
+    ids = {}
+    for i, name in enumerate(("Aye", "Bee", "Sea"), start=1):
+        ids[name] = _add_lender(rdb, name=name, priority=i)
+        _add_box(rdb, ids[name], loan_types=[LOAN_TYPE_FLIP])
+    first = _make_lead(rdb, phone_suffix="2101")
+    _route(rdb, first)
+    assert _fr(rdb, first)["current_lender_name"] == "Aye"
+
+    order = [ids["Sea"], ids["Aye"], ids["Bee"]]
+    assert api.post("/api/lending/routing/lenders/reorder", json={"ordered_ids": order}).status_code == 200
+    listed = [r["name"] for r in api.get("/api/lending/routing/lenders").json()]
+    assert listed == ["Sea", "Aye", "Bee"]
+    second = _make_lead(rdb, phone_suffix="2102")
+    _route(rdb, second)
+    assert _fr(rdb, second)["current_lender_name"] == "Sea"
+
+    assert api.post("/api/lending/routing/lenders/reorder",
+                    json={"ordered_ids": [ids["Sea"], ids["Aye"]]}).status_code == 422  # an active one left out
+    assert api.post("/api/lending/routing/lenders/reorder",
+                    json={"ordered_ids": order + [99999]}).status_code == 404
+    assert api.post("/api/lending/routing/lenders/reorder",
+                    json={"ordered_ids": [order[0], order[0], order[1], order[2]]}).status_code == 422
+    assert [r["name"] for r in api.get("/api/lending/routing/lenders").json()] == ["Sea", "Aye", "Bee"]
+
+
+def test_patch_and_create_report_priority_clash_as_409_and_allow_clearing_a_cap(rdb, api):
+    a = _add_lender(rdb, name="One", priority=1, monthly_cap=4)
+    b = _add_lender(rdb, name="Two", priority=2)
+
+    assert api.patch(f"/api/lending/routing/lenders/{b}", json={"priority": 1}).status_code == 409
+    assert api.post("/api/lending/routing/lenders", json={"name": "Dup", "priority": 1}).status_code == 409
+    # Pausing frees the priority for the active lenders.
+    assert api.patch(f"/api/lending/routing/lenders/{a}", json={"active": False}).status_code == 200
+    assert api.patch(f"/api/lending/routing/lenders/{b}", json={"priority": 1}).status_code == 200
+
+    assert api.patch(f"/api/lending/routing/lenders/{a}", json={"monthly_cap": None}).status_code == 200
+    cap = rdb.execute(text("SELECT monthly_cap FROM lending.lender_routing_rules WHERE id = :i"), {"i": a}).scalar()
+    assert cap is None
+    assert api.patch(f"/api/lending/routing/lenders/{a}", json={"name": None}).status_code == 422
+
+
+def test_a_failing_route_hook_does_not_poison_the_enrichment_session(rdb, monkeypatch):
+    """The R-1 hook after enrichment is best-effort: when routing fails (say the R-1 tables are not migrated
+    yet), the caller's session must stay usable so the next lead in the same sweep can still be enriched."""
+    from src.lending.enrichment import service
+    from src.lending.enrichment.ports import FakeDealThread
+
+    monkeypatch.setattr(service, "match_property", lambda *a, **k: None)
+    lead = _make_lead(rdb, phone_suffix="2201")
+    service.ensure_row(rdb, lead)
+
+    def boom(lead_id, db):
+        db.execute(text("SELECT 1 FROM lending.table_that_does_not_exist"))  # aborts the transaction
+
+    monkeypatch.setattr("src.lending.routing.router.route_file", boom)
+    assert service.enrich_lead(rdb, lead, thread=FakeDealThread()).status == "ready"
+    status = rdb.execute(text("SELECT status FROM lending.lendingflow_enrichment WHERE lead_id = :l"),
+                         {"l": lead}).scalar()
+    assert status == "ready"  # raises InFailedSqlTransaction if the failed route left the session aborted
+
+
+def test_meta_lists_the_vocabularies(api):
+    meta = api.get("/api/lending/routing/meta").json()
+    assert meta["loan_types"] == ["FIX_AND_FLIP", "GROUND_UP_CONSTRUCTION", "DSCR_RENTAL", "BRIDGE"]
+    assert "signed" in meta["agreement_statuses"] and meta["default_decline_reason"] == "unspecified"
