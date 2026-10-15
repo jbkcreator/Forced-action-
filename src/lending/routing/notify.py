@@ -22,7 +22,9 @@ from typing import Optional
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from config.lending_partners import PRODUCTS
 from config.settings import get_settings
+from src.lending.routing.file_key import key_from_row
 from src.lending.routing.rules import LenderRow
 
 logger = logging.getLogger(__name__)
@@ -64,10 +66,11 @@ def build_message(
     position: Optional[int],
     reason_code: Optional[str] = None,
     hold_reason: Optional[str] = None,
+    label: Optional[str] = None,
 ) -> Optional[str]:
     """The Slack text for one routing event, or None for an action that is not posted."""
     head = (
-        f"File #{lead_id} · {last_name or 'Unknown'} · {loan_type or 'unknown'} · {_amount(loan_amount)}"
+        f"{label or f'File #{lead_id}'} · {last_name or 'Unknown'} · {loan_type or 'unknown'} · {_amount(loan_amount)}"
     )
     where = f"Lender: *{lender_name or 'unknown'}* (position {position if position else '?'} in waterfall)"
     if action == "routed":
@@ -118,7 +121,7 @@ def post_route_event(
     message = build_message(
         "routed", lead_id=lead.get("id"), last_name=lead.get("last_name"),
         loan_type=lead.get("loan_type"), loan_amount=lead.get("loan_amount"),
-        lender_name=lender.name, position=position,
+        lender_name=lender.name, position=position, label=lead.get("label"),
     )
     _post(message, event_id, db, what="post_route_event", lead_id=lead.get("id"))
 
@@ -136,7 +139,7 @@ def post_decline_event(
     message = build_message(
         "declined", lead_id=lead.get("id"), last_name=lead.get("last_name"),
         loan_type=lead.get("loan_type"), loan_amount=lead.get("loan_amount"),
-        lender_name=lender_name, position=position, reason_code=reason_code,
+        lender_name=lender_name, position=position, reason_code=reason_code, label=lead.get("label"),
     )
     _post(message, event_id, db, what="post_decline_event", lead_id=lead.get("id"))
 
@@ -152,7 +155,7 @@ def post_hold_event(
     message = build_message(
         "held", lead_id=lead.get("id"), last_name=lead.get("last_name"),
         loan_type=lead.get("loan_type"), loan_amount=lead.get("loan_amount"),
-        lender_name=None, position=None, hold_reason=reason,
+        lender_name=None, position=None, hold_reason=reason, label=lead.get("label"),
     )
     _post(message, event_id, db, what="post_hold_event", lead_id=lead.get("id"))
 
@@ -171,14 +174,21 @@ def retry_unposted_events(db: Session) -> int:
 
     rows = db.execute(
         text(
-            "SELECT fre.id, fre.lead_id, fre.lender_name, fre.action, fre.reason_code,"
-            "       ll.last_name, ll.loan_type, ll.loan_amount,"
+            "SELECT fre.id, fre.lead_id, fre.loan_file_id, fre.lender_name, fre.action, fre.reason_code,"
+            "       COALESCE(ll.last_name, lf.borrower_last_name) AS last_name,"
+            "       ll.loan_type, lf.product,"
+            "       COALESCE(ll.loan_amount, lf.loan_amount) AS loan_amount,"
             "       (SELECT COUNT(*) FROM lending.file_routing_events r"
-            "         WHERE r.lead_id = fre.lead_id AND r.action = 'routed' AND r.id <= fre.id) AS position,"
+            "         WHERE r.action = 'routed' AND r.id <= fre.id"
+            "           AND ((fre.lead_id IS NOT NULL AND r.lead_id = fre.lead_id)"
+            "             OR (fre.loan_file_id IS NOT NULL AND r.loan_file_id = fre.loan_file_id))) AS position,"
             "       fr.hold_reason"
             "  FROM lending.file_routing_events fre"
-            "  JOIN lending.lendingflow_leads ll ON ll.id = fre.lead_id"
-            "  LEFT JOIN lending.file_routing fr ON fr.lead_id = fre.lead_id"
+            "  LEFT JOIN lending.lendingflow_leads ll ON ll.id = fre.lead_id"
+            "  LEFT JOIN lending.loan_files lf ON lf.id = fre.loan_file_id"
+            "  LEFT JOIN lending.file_routing fr"
+            "    ON (fre.lead_id IS NOT NULL AND fr.lead_id = fre.lead_id)"
+            "    OR (fre.loan_file_id IS NOT NULL AND fr.loan_file_id = fre.loan_file_id)"
             " WHERE fre.slack_posted_at IS NULL"
             "   AND fre.action IN ('routed', 'declined', 'held')"
             " ORDER BY fre.created_at"
@@ -188,11 +198,16 @@ def retry_unposted_events(db: Session) -> int:
 
     posted = 0
     for row in rows:
+        key = key_from_row(row)
+        loan_type = row["loan_type"]
+        if row["product"] is not None:  # a partner file stores its product, not a lender-box loan type
+            product_type = PRODUCTS.get(row["product"])
+            loan_type = product_type.value if product_type is not None else None
         message = build_message(
-            row["action"], lead_id=row["lead_id"], last_name=row["last_name"],
-            loan_type=row["loan_type"], loan_amount=row["loan_amount"],
+            row["action"], lead_id=key.id, last_name=row["last_name"],
+            loan_type=loan_type, loan_amount=row["loan_amount"],
             lender_name=row["lender_name"], position=int(row["position"]) or None,
-            reason_code=row["reason_code"], hold_reason=row["hold_reason"],
+            reason_code=row["reason_code"], hold_reason=row["hold_reason"], label=key.label,
         )
         if message is None:
             continue

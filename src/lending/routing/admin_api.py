@@ -18,11 +18,11 @@ Endpoints:
   POST   /api/lending/routing/decline-reasons      add a reason code
   POST   /api/lending/routing/lenders/reorder     set the waterfall order (atomic)
   GET    /api/lending/routing/meta                vocabularies for the admin screen
-  GET    /api/lending/routing/files               file list (status, last-name filters)
-  GET    /api/lending/routing/files/{lead_id}     file record: current lender, next lender, history
-  POST   /api/lending/routing/files/{lead_id}/decline  one-click decline of the current lender
+  GET    /api/lending/routing/files               file list, both kinds (status, last-name, source filters)
+  GET    /api/lending/routing/files/{file_id}     file record: current lender, next lender, history  (?source=partner)
+  POST   /api/lending/routing/files/{file_id}/decline  one-click decline of the current lender  (?source=partner)
   POST   /api/lending/routing/events/{event_id}/decline  one-click decline (R-1)
-  POST   /api/lending/routing/files/{lead_id}/outcome    record approved / funded (moves the seat cap)
+  POST   /api/lending/routing/files/{file_id}/outcome    record approved / funded (moves the seat cap)  (?source=partner)
   GET    /api/lending/routing/hold-queue           current hold queue summary
 """
 from __future__ import annotations
@@ -48,8 +48,10 @@ from config.lending_routing import (
 )
 from config.settings import get_settings
 from config.lender_matrix import LENDER_MATRIX
+from config.lending_partners import PRODUCTS
 from src.lending.contracts import LoanType
 from src.lending.db import get_lending_db
+from src.lending.routing.file_key import FileKey, key_from_source
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +178,7 @@ class ReorderIn(BaseModel):
 
 _NULLABLE_LENDER_FIELDS = frozenset({"monthly_cap", "construction_min_amount", "points_paid_to_broker", "rule_keys"})
 _FILE_STATUSES = ("unrouted", "routed", "held", "exhausted")
+_FILE_SOURCES = ("lendingflow", "partner")
 
 
 def _priority_taken() -> HTTPException:
@@ -493,23 +496,89 @@ def decline_event(
     return {"detail": "decline recorded"}
 
 
+# ── Files: LendingFlow leads and partner files ────────────────────────────────
+#
+# A file is a LendingFlow lead (source "lendingflow") or a partner file from the Partner Door (source
+# "partner"). Every file endpoint takes ``source`` (default "lendingflow") and the file's id within it.
+
+
+def _file_key(source: str, file_id: int) -> FileKey:
+    try:
+        return key_from_source(source, file_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+def _loan_type_of_product(product: Optional[str]) -> Optional[str]:
+    """A partner file stores a product (flip, ground_up...); show it as the lender-box loan type."""
+    mapped = PRODUCTS.get(product) if product else None
+    return mapped.value if mapped is not None else None
+
+
+def _partner_files_available(db: Session) -> bool:
+    """True when the Partner Door tables exist (its migration may not have run in this database yet)."""
+    return db.execute(text("SELECT to_regclass('lending.loan_files') IS NOT NULL")).scalar() is True
+
+
+_LEAD_FILE_ROWS = (
+    "SELECT 'lendingflow' AS source, fr.lead_id AS file_id, ll.first_name, ll.last_name, ll.loan_type,"
+    "       ll.loan_amount, ll.property_state, NULL::text AS partner_name, fr.status,"
+    "       fr.current_lender_name, fr.route_position, fr.hold_reason, fr.updated_at"
+    "  FROM lending.file_routing fr"
+    "  JOIN lending.lendingflow_leads ll ON ll.id = fr.lead_id"
+)
+_PARTNER_FILE_ROWS = (
+    "SELECT 'partner' AS source, fr.loan_file_id AS file_id, lf.borrower_first_name AS first_name,"
+    "       lf.borrower_last_name AS last_name, lf.product AS loan_type,"
+    "       lf.loan_amount, lf.property_state, p.name AS partner_name, fr.status,"
+    "       fr.current_lender_name, fr.route_position, fr.hold_reason, fr.updated_at"
+    "  FROM lending.file_routing fr"
+    "  JOIN lending.loan_files lf ON lf.id = fr.loan_file_id"
+    "  LEFT JOIN lending.partners p ON p.id = lf.partner_id"
+)
+
+
+def _file_rows(db: Session, *, where: str, params: dict, order_limit: str, source: Optional[str] = None) -> list[dict]:
+    """File rows from both kinds of file, newest first. ``where`` references the aliases ``f.*`` of the union."""
+    parts = []
+    if source in (None, "lendingflow"):
+        parts.append(_LEAD_FILE_ROWS)
+    if source in (None, "partner") and _partner_files_available(db):
+        parts.append(_PARTNER_FILE_ROWS)
+    if not parts:
+        return []
+    rows = db.execute(
+        text(f"SELECT * FROM ({' UNION ALL '.join(parts)}) f WHERE {where} {order_limit}"), params,
+    ).mappings().all()
+    out = []
+    for row in rows:
+        item = dict(row)
+        if item["source"] == "partner":
+            item["loan_type"] = _loan_type_of_product(item["loan_type"])
+        item["lead_id"] = item["file_id"] if item["source"] == "lendingflow" else None  # kept for older callers
+        out.append(item)
+    return out
+
+
 # ── Outcome (approved / funded) ───────────────────────────────────────────────
 
 
-@router.post("/files/{lead_id}/outcome", status_code=200)
+@router.post("/files/{file_id}/outcome", status_code=200)
 def file_outcome(
-    lead_id: int,
+    file_id: int,
     body: OutcomeIn,
+    source: str = Query(default="lendingflow"),
     _: None = Depends(_verify_admin),
     db: Session = Depends(get_lending_db),
 ) -> dict[str, Any]:
     from src.lending.routing.outcome import record_outcome
 
+    key = _file_key(source, file_id)
     if body.action not in OUTCOME_ACTIONS:
         raise HTTPException(status_code=422, detail=f"action must be one of {list(OUTCOME_ACTIONS)}")
     try:
         recorded = record_outcome(
-            lead_id, action=body.action, actor=body.actor, db=db, free_text=body.free_text,
+            key.id, action=body.action, actor=body.actor, db=db, free_text=body.free_text, kind=key.kind,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
@@ -526,6 +595,7 @@ def meta(_: None = Depends(_verify_admin)) -> dict:
         "loan_types": [m.value for m in LoanType],
         "agreement_statuses": list(AGREEMENT_STATUS_CHOICES),
         "file_statuses": list(_FILE_STATUSES),
+        "file_sources": list(_FILE_SOURCES),
         "outcome_actions": list(OUTCOME_ACTIONS),
         "default_decline_reason": DEFAULT_DECLINE_REASON,
         "seat_cap_counted_action": SEAT_CAP_COUNTED_ACTION,
@@ -539,98 +609,99 @@ def meta(_: None = Depends(_verify_admin)) -> dict:
 def list_files(
     status: Optional[str] = Query(default=None),
     q: Optional[str] = Query(default=None, max_length=60, description="borrower last name contains"),
+    source: Optional[str] = Query(default=None, description="lendingflow or partner; omit for both"),
     limit: int = Query(default=100, ge=1, le=500),
     _: None = Depends(_verify_admin),
     db: Session = Depends(get_lending_db),
 ) -> dict:
     if status is not None and status not in _FILE_STATUSES:
         raise HTTPException(status_code=422, detail=f"status must be one of {list(_FILE_STATUSES)}")
-    rows = db.execute(
-        text(
-            "SELECT fr.lead_id, ll.first_name, ll.last_name, ll.loan_type, ll.loan_amount,"
-            "       ll.property_state, fr.status, fr.current_lender_name, fr.route_position,"
-            "       fr.hold_reason, fr.updated_at"
-            "  FROM lending.file_routing fr"
-            "  JOIN lending.lendingflow_leads ll ON ll.id = fr.lead_id"
-            " WHERE (CAST(:status AS text) IS NULL OR fr.status = :status)"
-            "   AND (CAST(:q AS text) IS NULL OR ll.last_name ILIKE :qlike)"
-            " ORDER BY fr.updated_at DESC, fr.lead_id DESC"
-            " LIMIT :limit"
-        ),
-        {"status": status, "q": q, "qlike": f"%{q}%" if q else None, "limit": limit},
-    ).mappings().all()
-    return {"count": len(rows), "files": [dict(r) for r in rows]}
+    if source is not None and source not in _FILE_SOURCES:
+        raise HTTPException(status_code=422, detail=f"source must be one of {list(_FILE_SOURCES)}")
+    files = _file_rows(
+        db,
+        where="(CAST(:status AS text) IS NULL OR f.status = :status)"
+              " AND (CAST(:q AS text) IS NULL OR f.last_name ILIKE :qlike)",
+        params={"status": status, "q": q, "qlike": f"%{q}%" if q else None, "limit": limit},
+        order_limit="ORDER BY f.updated_at DESC, f.file_id DESC LIMIT :limit",
+        source=source,
+    )
+    return {"count": len(files), "files": files}
 
 
-@router.get("/files/{lead_id}")
+@router.get("/files/{file_id}")
 def file_record(
-    lead_id: int,
+    file_id: int,
+    source: str = Query(default="lendingflow"),
     _: None = Depends(_verify_admin),
     db: Session = Depends(get_lending_db),
 ) -> dict:
     """One file: where it is, who is next, and its full route history."""
     from src.lending.routing.router import preview_next
 
-    file = db.execute(
-        text(
-            "SELECT fr.lead_id, fr.status, fr.current_lender_id, fr.current_lender_name,"
-            "       fr.route_position, fr.lenders_tried, fr.hold_reason, fr.updated_at,"
-            "       ll.first_name, ll.last_name, ll.loan_type, ll.loan_amount, ll.property_state"
-            "  FROM lending.file_routing fr"
-            "  JOIN lending.lendingflow_leads ll ON ll.id = fr.lead_id"
-            " WHERE fr.lead_id = :lid"
-        ),
-        {"lid": lead_id},
-    ).mappings().one_or_none()
-    if file is None:
-        raise HTTPException(status_code=404, detail=f"No routing record for file {lead_id}")
+    key = _file_key(source, file_id)
+    summary = _file_rows(
+        db, where="f.file_id = :id", params={"id": key.id}, order_limit="LIMIT 1", source=key.source,
+    )
+    if not summary:
+        raise HTTPException(status_code=404, detail=f"No routing record for file {file_id}")
+    file = summary[0]
 
+    routing = db.execute(
+        text(
+            "SELECT current_lender_id, lenders_tried FROM lending.file_routing"
+            f" WHERE {key.column} = :id"
+        ),
+        {"id": key.id},
+    ).mappings().one()
     history = db.execute(
         text(
             "SELECT id, action, lender_id, lender_name, reason_code, free_text, actor, created_at"
-            "  FROM lending.file_routing_events WHERE lead_id = :lid ORDER BY id"
+            f"  FROM lending.file_routing_events WHERE {key.column} = :id ORDER BY id"
         ),
-        {"lid": lead_id},
+        {"id": key.id},
     ).mappings().all()
 
     routed = file["status"] == "routed"
     return {
         "file": {k: file[k] for k in (
-            "lead_id", "first_name", "last_name", "loan_type", "loan_amount", "property_state",
-            "status", "hold_reason", "updated_at",
+            "source", "file_id", "lead_id", "first_name", "last_name", "loan_type", "loan_amount",
+            "property_state", "partner_name", "status", "hold_reason", "updated_at",
         )},
         "current": (
-            {"lender_id": file["current_lender_id"], "name": file["current_lender_name"],
+            {"lender_id": routing["current_lender_id"], "name": file["current_lender_name"],
              "position": file["route_position"]} if routed else None
         ),
-        "next": preview_next(lead_id, db) if file["status"] in ("routed", "unrouted") else None,
-        "tried_lender_ids": list(file["lenders_tried"] or []),
+        "next": preview_next(key.id, db, kind=key.kind) if file["status"] in ("routed", "unrouted") else None,
+        "tried_lender_ids": list(routing["lenders_tried"] or []),
         "history": [dict(h) for h in history],
         "can_decline": routed,
         "can_record_outcome": routed,
     }
 
 
-@router.post("/files/{lead_id}/decline", status_code=200)
+@router.post("/files/{file_id}/decline", status_code=200)
 def decline_file(
-    lead_id: int,
+    file_id: int,
     body: FileDeclineIn,
+    source: str = Query(default="lendingflow"),
     _: None = Depends(_verify_admin),
     db: Session = Depends(get_lending_db),
 ) -> dict[str, Any]:
     """One-click decline of the file's current lender (the file record's Decline button)."""
     from src.lending.routing.decline import record_decline
 
+    key = _file_key(source, file_id)
     event_id = db.execute(
         text(
             "SELECT e.id FROM lending.file_routing_events e"
-            "  JOIN lending.file_routing fr ON fr.lead_id = e.lead_id AND fr.status = 'routed'"
-            " WHERE e.lead_id = :lid AND e.action = 'routed' ORDER BY e.id DESC LIMIT 1"
+            f"  JOIN lending.file_routing fr ON fr.{key.column} = e.{key.column} AND fr.status = 'routed'"
+            f" WHERE e.{key.column} = :id AND e.action = 'routed' ORDER BY e.id DESC LIMIT 1"
         ),
-        {"lid": lead_id},
+        {"id": key.id},
     ).scalar()
     if event_id is None:
-        raise HTTPException(status_code=422, detail=f"File {lead_id} is not currently routed to a lender")
+        raise HTTPException(status_code=422, detail=f"File {file_id} is not currently routed to a lender")
     try:
         record_decline(
             event_id, reason_code=body.reason_code, actor=body.actor, db=db, free_text=body.free_text,
@@ -648,22 +719,13 @@ def hold_queue(
     _: None = Depends(_verify_admin),
     db: Session = Depends(get_lending_db),
 ) -> dict:
-    rows = db.execute(
-        text(
-            "SELECT fr.lead_id, fr.status, fr.hold_reason,"
-            "       ll.first_name, ll.last_name, ll.loan_type, ll.loan_amount,"
-            "       fr.updated_at"
-            "  FROM lending.file_routing fr"
-            "  JOIN lending.lendingflow_leads ll ON ll.id = fr.lead_id"
-            " WHERE fr.status IN ('held','exhausted')"
-            " ORDER BY fr.updated_at DESC"
-            " LIMIT 200"
-        )
-    ).mappings().all()
-    return {
-        "count": len(rows),
-        "files": [dict(r) for r in rows],
-    }
+    files = _file_rows(
+        db,
+        where="f.status IN ('held','exhausted')",
+        params={},
+        order_limit="ORDER BY f.updated_at DESC LIMIT 200",
+    )
+    return {"count": len(files), "files": files}
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────

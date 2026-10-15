@@ -50,6 +50,7 @@ def rdb(lending_db):
     """
     from migrations.apply_lending_lender_rule_values import apply_to as apply_rule_values
     from migrations.apply_lending_lendingflow_enrichment import apply_to as apply_enrichment
+    from migrations.apply_lending_partner_door import apply_to as apply_partner_door
     from src.lending.models import LendingContact
 
     conn = lending_db.get_bind()
@@ -57,6 +58,7 @@ def rdb(lending_db):
     apply_lf(conn)
     apply_enrichment(conn)
     apply_rule_values(conn)
+    apply_partner_door(conn)  # the router also routes partner files, so it needs loan_files
     _apply_routing(conn)
     return lending_db
 
@@ -1077,3 +1079,337 @@ def test_rerunning_the_migration_retires_old_placeholders_but_keeps_codes_added_
         "SELECT code, active FROM lending.decline_reason_codes WHERE code IN ('unspecified', 'appraisal_low', 'other')"
     )).mappings()}
     assert state == {"unspecified": False, "appraisal_low": True, "other": True}  # off, never deleted
+
+
+# ── Partner files (P-1) go through the same router and keep the partner informed ──
+
+def _make_partner(db: Session, *, name: str = "Maria Lopez", email: str = "maria@example.com") -> int:
+    import hashlib
+    import uuid
+
+    pid = db.execute(
+        text(
+            "INSERT INTO lending.partners (name, partner_type, email, agreement_status, token_hash)"
+            " VALUES (:n, 'wholesaler', :e, 'signed', :h) RETURNING id"
+        ),
+        {"n": name, "e": email, "h": hashlib.sha256(uuid.uuid4().bytes).hexdigest()},
+    ).scalar_one()
+    db.commit()
+    return pid
+
+
+def _make_partner_file(
+    db: Session,
+    partner_id: int,
+    *,
+    product: str = "flip",
+    amount: int = 300_000,
+    state: str = FL,
+    band: Optional[str] = "680-719",
+    projects: Optional[int] = 4,
+    last_name: str = "Reyes",
+    status: str = "received",
+    status_reason: Optional[str] = None,
+) -> int:
+    fid = db.execute(
+        text(
+            "INSERT INTO lending.loan_files (source, partner_id, borrower_first_name, borrower_last_name, product,"
+            "   loan_amount, property_state, credit_band, completed_projects, status, status_reason)"
+            " VALUES ('partner', :p, 'Ana', :ln, :prod, :amt, :st, :band, :proj, :status, :reason) RETURNING id"
+        ),
+        {"p": partner_id, "ln": last_name, "prod": product, "amt": amount, "st": state, "band": band,
+         "proj": projects, "status": status, "reason": status_reason},
+    ).scalar_one()
+    db.commit()
+    return fid
+
+
+def _pfr(db: Session, file_id: int) -> dict:
+    row = db.execute(
+        text("SELECT status, current_lender_name, route_position, hold_reason"
+             "  FROM lending.file_routing WHERE loan_file_id = :f"), {"f": file_id},
+    ).mappings().one_or_none()
+    return dict(row) if row else {}
+
+
+def _pevents(db: Session, file_id: int) -> list[str]:
+    return [r[0] for r in db.execute(
+        text("SELECT action FROM lending.file_routing_events WHERE loan_file_id = :f ORDER BY id"), {"f": file_id})]
+
+
+def _file_status(db: Session, file_id: int) -> tuple:
+    row = db.execute(text("SELECT status, status_reason, funded_at FROM lending.loan_files WHERE id = :f"),
+                     {"f": file_id}).one()
+    return row[0], row[1], row[2]
+
+
+def _two_flip_lenders(db: Session) -> tuple[int, int]:
+    a = _add_lender(db, name="Alpha Capital", priority=1)
+    _add_box(db, a, loan_types=[LOAN_TYPE_FLIP])
+    b = _add_lender(db, name="Beta Funding", priority=2)
+    _add_box(db, b, loan_types=[LOAN_TYPE_FLIP])
+    return a, b
+
+
+@pytest.fixture
+def partner_mail(rdb, monkeypatch):
+    """P-1's real ``change_status`` on the test session, with the partner's emails captured.
+
+    The router calls ``partner_link.mirror_status``; here it reaches the real status change and notice, so the
+    tests prove the whole chain (router, then file status, then partner notice), not just that a call was made.
+    """
+    from contextlib import contextmanager
+
+    from src.lending import partner_pipeline
+    from src.lending.routing import partner_link
+
+    sent: list[tuple[str, str, str]] = []
+    services = partner_pipeline.PipelineServices(
+        email=lambda to, subject, body: sent.append((to, subject, body)), sms=None, slack=None, render_pdf=None,
+        evaluate_fit=lambda *a, **k: None, fit_limits=lambda *a, **k: [], load_matrix=lambda: (),
+        opt_outs=lambda phone, email: partner_pipeline.OptOuts(False, False),
+        text_window_open=lambda phone: False, upload_dir="", prequal_pct=10,
+    )
+
+    @contextmanager
+    def session_factory():
+        yield rdb
+        rdb.commit()
+
+    def mirror(key, status, reason=None):
+        if key.kind == "loan_file":
+            partner_pipeline.change_status(key.id, status, reason, services=services, session_factory=session_factory)
+
+    monkeypatch.setattr(partner_link, "mirror_status", mirror)
+    return sent
+
+
+def test_a_partner_file_is_routed_like_any_file_and_the_partner_is_told(rdb, partner_mail):
+    from src.lending.routing.router import route_loan_file
+
+    _two_flip_lenders(rdb)
+    fid = _make_partner_file(rdb, _make_partner(rdb))
+    route_loan_file(fid, rdb)
+
+    assert _pfr(rdb, fid)["current_lender_name"] == "Alpha Capital" and _pfr(rdb, fid)["route_position"] == 1
+    assert _pevents(rdb, fid) == ["routed"]
+    assert _file_status(rdb, fid)[0] == "routed"
+    assert len(partner_mail) == 1
+    to, subject, body = partner_mail[0]
+    assert to == "maria@example.com" and "sent to a lender" in body and f"#{fid}" in body
+    assert "Alpha" not in body and "Alpha" not in subject  # the partner never learns which lender
+
+
+def test_a_partner_file_walks_the_decline_cascade_and_each_step_reaches_the_partner(rdb, partner_mail):
+    from src.lending.routing.decline import record_decline
+    from src.lending.routing.router import route_loan_file
+
+    _two_flip_lenders(rdb)
+    fid = _make_partner_file(rdb, _make_partner(rdb))
+    route_loan_file(fid, rdb)
+
+    def routed_event() -> int:
+        return rdb.execute(text("SELECT id FROM lending.file_routing_events"
+                                " WHERE loan_file_id = :f AND action = 'routed' ORDER BY id DESC LIMIT 1"),
+                           {"f": fid}).scalar_one()
+
+    record_decline(routed_event(), reason_code="ltv_over_max", actor="josh", db=rdb)
+    assert _pfr(rdb, fid)["current_lender_name"] == "Beta Funding"
+    assert _file_status(rdb, fid)[0] == "routed"
+
+    record_decline(routed_event(), reason_code="credit_below_min", actor="josh", db=rdb)
+    assert _pfr(rdb, fid)["status"] == "exhausted"
+    assert _file_status(rdb, fid)[:2] == ("held", "exhausted")  # "held" on the shared file, the reason says why
+    assert _pevents(rdb, fid) == ["routed", "declined", "routed", "declined", "held"]
+
+    wording = [m[2] for m in partner_mail]  # routed, declined, routed, declined; a hold is internal, no notice
+    assert [("sent to a lender" in w, "declined" in w) for w in wording] == [
+        (True, False), (False, True), (True, False), (False, True)]
+
+
+def test_funding_a_partner_file_counts_against_the_seat_cap_and_tells_the_partner(rdb, partner_mail):
+    from src.lending.routing.outcome import record_outcome
+    from src.lending.routing.router import route_loan_file
+
+    primary = _add_lender(rdb, name="Capped Primary", is_primary=True, priority=1, monthly_cap=1)
+    _add_box(rdb, primary, loan_types=[LOAN_TYPE_FLIP])
+    overflow = _add_lender(rdb, name="Overflow", priority=2)
+    _add_box(rdb, overflow, loan_types=[LOAN_TYPE_FLIP])
+    fid = _make_partner_file(rdb, _make_partner(rdb))
+    route_loan_file(fid, rdb)
+    assert _pfr(rdb, fid)["current_lender_name"] == "Capped Primary"
+
+    assert record_outcome(fid, action="funded", actor="josh", db=rdb, kind="loan_file") is True
+    assert record_outcome(fid, action="funded", actor="josh", db=rdb, kind="loan_file") is False  # idempotent
+    status, _, funded_at = _file_status(rdb, fid)
+    assert status == "funded" and funded_at is not None
+    assert "has funded" in partner_mail[-1][2]
+
+    later_lead = _make_lead(rdb, phone_suffix="4001")  # a LendingFlow lead now sees the primary at its cap
+    _route(rdb, later_lead)
+    assert _fr(rdb, later_lead)["current_lender_name"] == "Overflow"
+
+
+def test_a_partner_file_with_no_matching_lender_is_held_visibly_and_not_announced(rdb, partner_mail):
+    from src.lending.routing.router import route_loan_file
+
+    lender = _add_lender(rdb, name="Flip Only", priority=1)
+    _add_box(rdb, lender, loan_types=[LOAN_TYPE_FLIP])
+    other = _make_partner_file(rdb, _make_partner(rdb), product="other")  # no lender-box loan type
+    route_loan_file(other, rdb)
+
+    assert _pfr(rdb, other)["status"] == "held" and _pfr(rdb, other)["hold_reason"] == "no_match"
+    assert _file_status(rdb, other)[:2] == ("held", "no_match")
+    assert partner_mail == []  # a hold is internal; the partner dashboard simply keeps saying "in review"
+
+
+def test_the_partners_credit_band_and_experience_are_read_by_the_boxes(rdb, partner_mail):
+    from src.lending.routing.router import route_loan_file
+
+    strict = _add_lender(rdb, name="Strict", priority=1)
+    rdb.execute(text(
+        "INSERT INTO lending.lender_product_boxes (lender_id, loan_types, credit_floor, min_completed_projects)"
+        " VALUES (:l, ARRAY['FIX_AND_FLIP'], 640, 3)"), {"l": strict})
+    easy = _add_lender(rdb, name="Easy", priority=2)
+    _add_box(rdb, easy, loan_types=[LOAN_TYPE_FLIP])
+    rdb.commit()
+    partner = _make_partner(rdb)
+
+    low_credit = _make_partner_file(rdb, partner, band="Below 640", projects=5)
+    green = _make_partner_file(rdb, partner, band="720-759", projects=1)
+    fits = _make_partner_file(rdb, partner, band="720-759", projects=4)
+    for fid in (low_credit, green, fits):
+        route_loan_file(fid, rdb)
+    assert _pfr(rdb, low_credit)["current_lender_name"] == "Easy"  # band below the floor
+    assert _pfr(rdb, green)["current_lender_name"] == "Easy"  # too few projects
+    assert _pfr(rdb, fits)["current_lender_name"] == "Strict"
+
+
+def test_the_sweep_routes_partner_files_parked_before_the_router_existed(rdb, partner_mail):
+    from config.lending_partners import AWAITING_ROUTER_REASON
+    from src.tasks.lending_routing_sweep import sweep
+
+    _two_flip_lenders(rdb)
+    partner = _make_partner(rdb)
+    parked = _make_partner_file(rdb, partner, status="held", status_reason=AWAITING_ROUTER_REASON)
+    still_received = _make_partner_file(rdb, partner, status="received")  # the Partner Door's own sweep owns this
+    sweep(rdb)
+
+    assert _pfr(rdb, parked)["current_lender_name"] == "Alpha Capital"
+    assert _file_status(rdb, parked)[0] == "routed" and len(partner_mail) == 1
+    assert _pfr(rdb, still_received) == {}
+
+
+def test_a_routed_partner_file_that_never_took_its_status_is_healed_without_undoing_an_outcome(
+        rdb, partner_mail, monkeypatch):
+    from src.lending.routing import partner_link
+    from src.lending.routing.outcome import record_outcome
+    from src.lending.routing.router import route_loan_file
+
+    _two_flip_lenders(rdb)
+    fid = _make_partner_file(rdb, _make_partner(rdb))
+    real_mirror = partner_link.mirror_status
+    monkeypatch.setattr(partner_link, "mirror_status", lambda *a, **k: None)  # the sync after the commit failed
+    route_loan_file(fid, rdb)
+    assert _pfr(rdb, fid)["status"] == "routed" and _file_status(rdb, fid)[0] == "received"
+
+    monkeypatch.setattr(partner_link, "mirror_status", real_mirror)
+    route_loan_file(fid, rdb)  # a rerun sees it is routed and gives the file the status it already earned
+    assert _file_status(rdb, fid)[0] == "routed" and len(partner_mail) == 1
+
+    record_outcome(fid, action="funded", actor="josh", db=rdb, kind="loan_file")
+    route_loan_file(fid, rdb)  # a later rerun must never pull a funded file back to "routed"
+    assert _file_status(rdb, fid)[0] == "funded"
+
+
+def test_the_partner_door_hands_a_file_to_the_router_when_it_is_installed(rdb, partner_mail):
+    from src.lending import partner_pipeline
+
+    _two_flip_lenders(rdb)
+    fid = _make_partner_file(rdb, _make_partner(rdb))
+    partner_pipeline.route_file(rdb, fid)  # the Partner Door's hand-off, not the router's own entry point
+    assert _pfr(rdb, fid)["current_lender_name"] == "Alpha Capital"
+    assert _file_status(rdb, fid)[0] == "routed"  # not "held, awaiting router"
+
+
+def test_partner_files_appear_in_the_admin_api_beside_leads(rdb, api, partner_mail):
+    from src.lending.routing.router import route_loan_file
+
+    _two_flip_lenders(rdb)
+    lead = _make_lead(rdb, phone_suffix="4101", last_name="Lead")
+    _route(rdb, lead)
+    fid = _make_partner_file(rdb, _make_partner(rdb, name="Maria Lopez"), last_name="Partnerfile")
+    route_loan_file(fid, rdb)
+    base = "/api/lending/routing"
+
+    listed = api.get(f"{base}/files").json()["files"]
+    by_source = {f["source"]: f for f in listed}
+    assert set(by_source) == {"lendingflow", "partner"}
+    assert by_source["partner"]["partner_name"] == "Maria Lopez" and by_source["partner"]["file_id"] == fid
+    assert by_source["partner"]["loan_type"] == "FIX_AND_FLIP"  # the product, shown as the lender-box loan type
+    assert [f["file_id"] for f in api.get(f"{base}/files", params={"source": "partner"}).json()["files"]] == [fid]
+    assert api.get(f"{base}/files", params={"source": "bogus"}).status_code == 422
+
+    rec = api.get(f"{base}/files/{fid}", params={"source": "partner"}).json()
+    assert rec["file"]["source"] == "partner" and rec["current"]["name"] == "Alpha Capital"
+    assert rec["next"]["name"] == "Beta Funding" and [h["action"] for h in rec["history"]] == ["routed"]
+    assert api.get(f"{base}/files/{fid}").status_code == 404  # the same id as a lead is a different file
+    assert api.get(f"{base}/files/{lead}").json()["file"]["source"] == "lendingflow"
+
+    assert api.post(f"{base}/files/{fid}/decline", params={"source": "partner"}, json={}).status_code == 200
+    rec = api.get(f"{base}/files/{fid}", params={"source": "partner"}).json()
+    assert rec["current"]["name"] == "Beta Funding"
+    assert [h["action"] for h in rec["history"]] == ["routed", "declined", "routed"]
+    assert api.post(f"{base}/files/{fid}/outcome", params={"source": "partner"},
+                    json={"action": "funded"}).status_code == 200
+    assert _file_status(rdb, fid)[0] == "funded"
+
+
+def test_the_hold_queue_lists_held_partner_files(rdb, api, partner_mail):
+    from src.lending.routing.router import route_loan_file
+
+    fid = _make_partner_file(rdb, _make_partner(rdb), last_name="Held")
+    route_loan_file(fid, rdb)  # no lenders yet
+    held = api.get("/api/lending/routing/hold-queue").json()["files"]
+    assert [(f["source"], f["file_id"], f["hold_reason"]) for f in held] == [("partner", fid, "no_match")]
+
+
+def test_slack_posts_and_retries_say_partner_file_and_never_mix_ids_with_leads(rdb, fake_slack, partner_mail):
+    from src.lending.routing.notify import retry_unposted_events
+    from src.lending.routing.router import route_loan_file
+
+    _two_flip_lenders(rdb)
+    lead = _make_lead(rdb, phone_suffix="4201", last_name="Leadname")
+    fid = _make_partner_file(rdb, _make_partner(rdb), last_name="Partnername")
+    _route(rdb, lead)
+    route_loan_file(fid, rdb)
+    posted = "\n".join(fake_slack.sent)
+    assert f"File #{lead} " in posted and f"Partner file #{fid} " in posted
+    assert "Partnername" in posted and "Leadname" in posted
+
+    rdb.execute(text("UPDATE lending.file_routing_events SET slack_ts = NULL, slack_posted_at = NULL"))
+    rdb.commit()
+    fake_slack.sent.clear()
+    assert retry_unposted_events(rdb) == 2
+    retried = "\n".join(fake_slack.sent)
+    assert f"Partner file #{fid} " in retried and "position 1" in retried and "FIX_AND_FLIP" in retried
+
+
+def test_a_file_has_exactly_one_key_and_the_event_log_stays_append_only(rdb):
+    from sqlalchemy.exc import DatabaseError
+
+    lender = _add_lender(rdb, name="Keyed", priority=1)
+    lead = _make_lead(rdb, phone_suffix="4301")
+    fid = _make_partner_file(rdb, _make_partner(rdb))
+    insert = ("INSERT INTO lending.file_routing_events (lead_id, loan_file_id, lender_id, action)"
+              " VALUES (:lead, :file, :lender, 'routed')")
+    for lead_id, file_id in ((lead, fid), (None, None)):  # both keys, or neither
+        with pytest.raises(DatabaseError):
+            with rdb.begin_nested():
+                rdb.execute(text(insert), {"lead": lead_id, "file": file_id, "lender": lender})
+
+    rdb.execute(text(insert), {"lead": None, "file": fid, "lender": lender})
+    with pytest.raises(DatabaseError, match="append-only"):
+        with rdb.begin_nested():
+            rdb.execute(text("UPDATE lending.file_routing_events SET loan_file_id = NULL, lead_id = :l"
+                             " WHERE loan_file_id = :f"), {"l": lead, "f": fid})

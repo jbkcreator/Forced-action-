@@ -3,15 +3,20 @@
 ``route_file(lead_id, db)`` is the single production entry point.  It:
 1. Locks the file's routing state row (or creates it).
 2. Loads active lenders ordered by priority.
-3. Evaluates rules 1–6 generically (no lender name in code).
+3. Evaluates rules 1â€“6 generically (no lender name in code).
 4. Writes the routing decision to ``file_routing`` + ``file_routing_events``.
 5. Posts to Slack (best-effort; failure does not roll back the route).
 
 Caller paths:
-  - ``src.lending.enrichment.service`` (on lead creation, after enrichment)
-  - ``src.tasks.lending_routing_sweep`` (cron for unrouted files)
+  - ``src.lending.enrichment.service`` (a LendingFlow lead, after enrichment): ``route_file``
+  - ``src.lending.partner_pipeline`` (a partner file, after it is scored): ``route_loan_file``
+  - ``src.tasks.lending_routing_sweep`` (cron for unrouted files of either kind)
+  - ``src.lending.routing.decline`` (re-route after a decline)
 
-RULE LOGIC (generic — no lender name in code)
+A file is a LendingFlow lead or a partner file (see ``file_key``). After every committed decision on a
+partner file the router moves that file's status and tells the partner (``partner_link``).
+
+RULE LOGIC (generic â€” no lender name in code)
 ---------------------------------------------
 The primary lender is whichever row has ``is_primary=TRUE`` and
 ``agreement_status='signed'``.  Its ``construction_min_amount`` is the
@@ -19,17 +24,17 @@ threshold for rule 1 vs rule 3.  Only ``agreement_status='signed'`` lenders
 participate in routing; the rest are invisible.
 
 Rule 1: ground-up AND amount >= primary.construction_min_amount
-         AND primary.box passes AND primary not at cap → primary
-Rule 2: flip AND primary.box passes AND primary not at cap → primary
+         AND primary.box passes AND primary not at cap â†’ primary
+Rule 2: flip AND primary.box passes AND primary not at cap â†’ primary
 Rule 3: ground-up AND amount < primary.construction_min_amount (or no primary)
-         → overflow waterfall, lenders with takes_ground_up=TRUE
+         â†’ overflow waterfall, lenders with takes_ground_up=TRUE
 Rule 4: flip AND (primary box fail OR at cap)
-         → overflow waterfall, flip lenders
-Rule 5: DSCR or refi → overflow waterfall, DSCR lenders
-Rule 6: no lender matches → hold queue ('no_match')
+         â†’ overflow waterfall, flip lenders
+Rule 5: DSCR or refi â†’ overflow waterfall, DSCR lenders
+Rule 6: no lender matches â†’ hold queue ('no_match')
 
 BRIDGE and other products not in the spec's rules fall through to rule 6
-(never silently dropped — Q5 default).
+(never silently dropped â€” Q5 default).
 """
 from __future__ import annotations
 
@@ -42,6 +47,9 @@ from sqlalchemy.orm import Session
 
 from config.lending_routing import MAX_WATERFALL_DEPTH, ROUTABLE_AGREEMENT_STATUSES
 from src.lending.contracts import LoanType
+from config.lending_partners import CREDIT_BANDS, PRODUCTS
+from src.lending.routing import partner_link
+from src.lending.routing.file_key import FileKey, LEAD, lead_key, loan_file_key
 from src.lending.routing.notify import post_route_event, post_hold_event
 from src.lending.routing.rules import (
     FileProfile,
@@ -54,7 +62,7 @@ from src.lending.routing.seat import seat_at_cap
 
 logger = logging.getLogger(__name__)
 
-# Loan-type groupings used by rules 1–5.  These are the values LendingFlow leads actually carry
+# Loan-type groupings used by rules 1â€“5.  These are the values LendingFlow leads actually carry
 # (LoanType in contracts.py, stored by the T-11 parser).  The spec's rule 5 says "DSCR or refi",
 # but LendingFlow has no refi product: a refi file arrives with no loan type and goes to rule 6.
 _GROUND_UP = LoanType.GROUND_UP_CONSTRUCTION.value
@@ -62,7 +70,7 @@ _FLIP = LoanType.FIX_AND_FLIP.value
 _DSCR_TYPES = frozenset({LoanType.DSCR_RENTAL.value})
 
 
-# ── Internal helpers ─────────────────────────────────────────────────────────
+# â”€â”€ Internal helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 def _signed(lenders: list[LenderRow]) -> list[LenderRow]:
@@ -108,7 +116,7 @@ def _choose(
     tried: list[int],
     db: Session,
 ) -> Optional[LenderRow]:
-    """Rules 1–5, first match wins; None means rule 6 (hold queue).
+    """Rules 1â€“5, first match wins; None means rule 6 (hold queue).
 
     The single place the rules live: ``route_file`` writes the result, ``preview_next`` only reads it.
     """
@@ -144,76 +152,103 @@ def _choose(
     return None
 
 
-def preview_next(lead_id: int, db: Session) -> Optional[dict]:
+def preview_next(file_id: int, db: Session, kind: str = LEAD) -> Optional[dict]:
     """Who the file would go to next, without writing anything.
 
     For a routed file the current lender is already in ``lenders_tried``, so the answer is the lender a
     decline would send it to.  For an unrouted file it is the lender it would be routed to first.  None
     when no lender qualifies (the file would go to the hold queue).
     """
-    lead = _load_lead(lead_id, db)
-    if lead.get("suppressed"):
+    key = FileKey(kind, file_id)
+    file = _load_file(key, db)
+    if file.get("suppressed"):
         return None
     row = db.execute(
-        text("SELECT lenders_tried FROM lending.file_routing WHERE lead_id = :lid"), {"lid": lead_id},
+        text(f"SELECT lenders_tried FROM lending.file_routing WHERE {key.column} = :id"), {"id": key.id},
     ).mappings().one_or_none()
     tried = list(row["lenders_tried"] or []) if row else []
     signed = _signed(load_active_lenders(db))
-    chosen = _choose(_build_profile(lead), signed, tried, db) if signed else None
+    chosen = _choose(_build_profile(file), signed, tried, db) if signed else None
     if chosen is None:
         return None
     return {"lender_id": chosen.id, "name": chosen.name, "position": len(tried) + 1}
 
 
-def _build_profile(lead: dict) -> FileProfile:
+def _build_profile(file: dict) -> FileProfile:
     return FileProfile(
-        loan_type=(lead.get("loan_type") or "").upper(),
-        loan_amount=int(lead.get("loan_amount") or 0),
-        state=lead.get("property_state") or "",
-        credit_band_min_fico=lead.get("credit_band_min_fico"),
-        completed_projects=None,   # not captured by LendingFlow in v1
+        loan_type=(file.get("loan_type") or "").upper(),
+        loan_amount=int(file.get("loan_amount") or 0),
+        state=file.get("property_state") or "",
+        credit_band_min_fico=file.get("credit_band_min_fico"),
+        completed_projects=file.get("completed_projects"),  # a partner supplies it; LendingFlow does not
     )
 
 
-def _load_lead(lead_id: int, db: Session) -> dict:
+def _load_file(key: FileKey, db: Session) -> dict:
+    """The facts the router needs, in one shape for both kinds of file (plus ``id`` and ``label``)."""
+    if key.kind == LEAD:
+        row = db.execute(
+            text(
+                "SELECT id, first_name, last_name, loan_type, loan_amount,"
+                "       property_state, credit_band_min_fico, suppressed"
+                "  FROM lending.lendingflow_leads"
+                " WHERE id = :id"
+            ),
+            {"id": key.id},
+        ).mappings().one_or_none()
+        if row is None:
+            raise ValueError(f"lendingflow_leads.id={key.id} not found")
+        return {**dict(row), "completed_projects": None, "label": key.label}
+
     row = db.execute(
         text(
-            "SELECT id, first_name, last_name, loan_type, loan_amount,"
-            "       property_state, credit_band_min_fico, suppressed"
-            "  FROM lending.lendingflow_leads"
+            "SELECT id, borrower_first_name AS first_name, borrower_last_name AS last_name, product,"
+            "       loan_amount, property_state, credit_band, completed_projects"
+            "  FROM lending.loan_files"
             " WHERE id = :id"
         ),
-        {"id": lead_id},
+        {"id": key.id},
     ).mappings().one_or_none()
     if row is None:
-        raise ValueError(f"lendingflow_leads.id={lead_id} not found")
-    return dict(row)
+        raise ValueError(f"loan_files.id={key.id} not found")
+    file = dict(row)
+    loan_type = PRODUCTS.get(file.pop("product"))  # "other" has no lender-box loan type, so no rule matches it
+    band = file.pop("credit_band")
+    return {
+        **file,
+        "loan_type": loan_type.value if loan_type is not None else "",
+        "credit_band_min_fico": CREDIT_BANDS.get(band) if band else None,
+        "suppressed": False,  # routing is not contact with the borrower, and a partner file is never contacted
+        "label": key.label,
+    }
 
 
-def _upsert_file_routing(lead_id: int, db: Session) -> dict:
+def _upsert_file_routing(key: FileKey, db: Session) -> dict:
     """Get or create the file_routing row, locked for update."""
+    conflict = "(lead_id)" if key.kind == LEAD else "(loan_file_id) WHERE loan_file_id IS NOT NULL"
     db.execute(
         text(
-            "INSERT INTO lending.file_routing (lead_id, status)"
-            " VALUES (:lid, 'unrouted')"
-            " ON CONFLICT (lead_id) DO NOTHING"
+            f"INSERT INTO lending.file_routing ({key.column}, status)"
+            f" VALUES (:id, 'unrouted')"
+            f" ON CONFLICT {conflict} DO NOTHING"
         ),
-        {"lid": lead_id},
+        {"id": key.id},
     )
     row = db.execute(
         text(
             "SELECT id, status, current_lender_id, current_lender_name,"
             "       route_position, lenders_tried, hold_reason"
             "  FROM lending.file_routing"
-            " WHERE lead_id = :lid"
+            f" WHERE {key.column} = :id"
             " FOR UPDATE"
         ),
-        {"lid": lead_id},
+        {"id": key.id},
     ).mappings().one()
     return dict(row)
 
 
 def _set_routed(
+    key: FileKey,
     routing: dict,
     lender: LenderRow,
     position: int,
@@ -243,23 +278,18 @@ def _set_routed(
             "pk": routing["id"],
         },
     )
-    event_id = db.execute(
+    return db.execute(
         text(
-            "INSERT INTO lending.file_routing_events"
-            "  (lead_id, lender_id, lender_name, action, actor)"
-            " VALUES (:lead_id, :lid, :name, 'routed', 'system')"
-            " RETURNING id"
+            f"INSERT INTO lending.file_routing_events"
+            f"  ({key.column}, lender_id, lender_name, action, actor)"
+            f" VALUES (:id, :lid, :name, 'routed', 'system')"
+            f" RETURNING id"
         ),
-        {"lead_id": routing["lead_id"], "lid": lender.id, "name": lender.name},
+        {"id": key.id, "lid": lender.id, "name": lender.name},
     ).scalar_one()
-    return event_id
 
 
-def _set_held(
-    routing: dict,
-    reason: str,
-    db: Session,
-) -> int:
+def _set_held(key: FileKey, reason: str, db: Session) -> int:
     """Write the 'held' state and append an event. Returns the event id."""
     now = datetime.now(timezone.utc)
     db.execute(
@@ -271,68 +301,78 @@ def _set_held(
             "       route_position = NULL,"
             "       hold_reason = :reason,"
             "       updated_at = :now"
-            " WHERE lead_id = :lead"
+            f" WHERE {key.column} = :id"
         ),
         {
             "status": "exhausted" if reason == "exhausted" else "held",
             "reason": reason,
             "now": now,
-            "lead": routing.get("lead_id"),
+            "id": key.id,
         },
     )
-    event_id = db.execute(
+    return db.execute(
         text(
-            "INSERT INTO lending.file_routing_events"
-            "  (lead_id, lender_id, lender_name, action, actor)"
-            " VALUES (:lead_id, NULL, NULL, 'held', 'system')"
-            " RETURNING id"
+            f"INSERT INTO lending.file_routing_events"
+            f"  ({key.column}, lender_id, lender_name, action, actor)"
+            f" VALUES (:id, NULL, NULL, 'held', 'system')"
+            f" RETURNING id"
         ),
-        {"lead_id": routing.get("lead_id")},
+        {"id": key.id},
     ).scalar_one()
-    return event_id
 
 
-# ── Public entry point ────────────────────────────────────────────────────────
+# â”€â”€ Public entry points â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 def route_file(lead_id: int, db: Session) -> None:
-    """Evaluate routing rules 1–6 for a file and commit the result.
+    """Route a LendingFlow lead: rules 1â€“6, then commit the result (see ``_route``)."""
+    _route(lead_key(lead_id), db)
+
+
+def route_loan_file(loan_file_id: int, db: Session) -> None:
+    """Route a partner file (lending.loan_files) the same way, then sync its status and tell the partner."""
+    _route(loan_file_key(loan_file_id), db)
+
+
+def _hold(key: FileKey, file: dict, reason: str, db: Session) -> None:
+    event_id = _set_held(key, reason, db)
+    db.commit()
+    post_hold_event(file, event_id, reason=reason, db=db)
+    partner_link.mirror_status(key, partner_link.STATUS_FOR_HOLD, reason)
+
+
+def _route(key: FileKey, db: Session) -> None:
+    """Evaluate routing rules 1â€“6 for a file and commit the result.
 
     Idempotent: a file already routed to a lender is not re-routed.
     A file already held/exhausted is not changed.
 
-    This function does not raise on a Slack failure — the route is committed
+    This function does not raise on a Slack failure â€” the route is committed
     and the event is retried by a sweep on slack_posted_at IS NULL.
     """
-    lead = _load_lead(lead_id, db)
-    routing = _upsert_file_routing(lead_id, db)
+    file = _load_file(key, db)
+    routing = _upsert_file_routing(key, db)
 
     if routing["status"] in ("routed", "held", "exhausted"):
-        logger.debug(
-            "route_file lead_id=%d already %s — skipping", lead_id, routing["status"]
-        )
+        logger.debug("route %s %d already %s - skipping", key.kind, key.id, routing["status"])
+        if key.kind != LEAD:
+            # Routed earlier, but the file never took the status (the sync after the commit failed): heal it.
+            db.commit()  # release our locks first; the sync uses its own session on the same file row
+            partner_link.resync_if_never_synced(key, routing["status"], routing["hold_reason"], db)
         return
 
-    # Patch the lead_id into routing dict (needed by _set_routed/_set_held)
-    routing = {**routing, "lead_id": lead_id}
-
-    if lead.get("suppressed"):
+    if file.get("suppressed"):
         # Opted-out borrowers are never routed; the hold queue keeps the file visible (Q8).
-        logger.warning("route_file lead_id=%d: lead is suppressed — holding (suppressed)", lead_id)
-        event_id = _set_held(routing, "suppressed", db)
-        db.commit()
-        post_hold_event(lead, event_id, reason="suppressed", db=db)
+        logger.warning("route %s %d: borrower is suppressed â€” holding (suppressed)", key.kind, key.id)
+        _hold(key, file, "suppressed", db)
         return
 
-    profile = _build_profile(lead)
-    all_lenders = load_active_lenders(db)
-    signed = _signed(all_lenders)
+    profile = _build_profile(file)
+    signed = _signed(load_active_lenders(db))
 
     if not signed:
-        logger.warning("route_file lead_id=%d: no signed lenders — holding (no_match)", lead_id)
-        event_id = _set_held(routing, "no_match", db)
-        db.commit()
-        post_hold_event(lead, event_id, reason="no_match", db=db)
+        logger.warning("route %s %d: no signed lenders â€” holding (no_match)", key.kind, key.id)
+        _hold(key, file, "no_match", db)
         return
 
     tried: list[int] = list(routing["lenders_tried"] or [])
@@ -343,19 +383,19 @@ def route_file(lead_id: int, db: Session) -> None:
     # Rule 6: no lender matched
     if chosen is None:
         hold_reason = "exhausted" if tried else "no_match"
-        logger.info(
-            "route_file lead_id=%d holding reason=%s tried=%s",
-            lead_id, hold_reason, tried,
-        )
-        event_id = _set_held(routing, hold_reason, db)
-        db.commit()
-        post_hold_event(lead, event_id, reason=hold_reason, db=db)
+        logger.info("route %s %d holding reason=%s tried=%s", key.kind, key.id, hold_reason, tried)
+        _hold(key, file, hold_reason, db)
         return
 
     logger.info(
-        "route_file lead_id=%d -> lender_id=%d name=%r position=%d",
-        lead_id, chosen.id, chosen.name, position,
+        "route %s %d -> lender_id=%d name=%r position=%d", key.kind, key.id, chosen.id, chosen.name, position,
     )
-    event_id = _set_routed(routing, chosen, position, db)
+    event_id = _set_routed(key, routing, chosen, position, db)
     db.commit()
-    post_route_event(lead, chosen, position, event_id, db=db)
+    post_route_event(file, chosen, position, event_id, db=db)
+    partner_link.mirror_status(key, "routed")
+
+
+# Public name for the loader, used by the decline handler to build its Slack post.
+load_file = _load_file
+

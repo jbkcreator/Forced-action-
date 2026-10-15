@@ -3,25 +3,29 @@
 ``record_decline`` is called by the decline endpoint.  It:
 1. Validates the event is a 'routed' event belonging to the file's current lender.
 2. Appends a 'declined' event.
-3. Calls ``route_file`` to run the next pass of the waterfall.
+3. Tells the partner (a partner file's status moves to 'declined').
+4. Calls the router to run the next pass of the waterfall, which routes the file on or holds it.
+
+The file is a LendingFlow lead or a partner file; the event row says which.
 
 The one-click decline flow (Q2 default):
-  POST /api/lending/routing/events/{event_id}/decline
-  Body: {"reason_code": "unspecified", "actor": "josh", "free_text": ""}
+  POST /api/lending/routing/files/{file_id}/decline
+  Body: {"reason_code": "other", "actor": "josh", "free_text": ""}
 
-OPEN Q2: One-click records reason 'unspecified' and returns.  Josh to confirm
+OPEN Q2: One-click records reason 'other' (Josh's enum has no 'unspecified') and returns.  Josh to confirm
 whether the reason can be updated in a later call.
 """
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from config.lending_routing import DEFAULT_DECLINE_REASON
+from src.lending.routing import partner_link
+from src.lending.routing.file_key import LEAD, key_from_row
 from src.lending.routing.notify import post_decline_event
 
 logger = logging.getLogger(__name__)
@@ -37,21 +41,21 @@ def record_decline(
 ) -> None:
     """Record a decline against a 'routed' event and re-run the waterfall.
 
-    Idempotent: if the event is already declined (i.e. a 'declined' event with
-    the same source_event_id already exists), the call is a no-op.
+    Idempotent: a repeated or stale decline of the same event is a no-op.
 
     Args:
         event_id: The ``file_routing_events.id`` of the 'routed' event being declined.
         reason_code: Decline reason code from lending.decline_reason_codes (a fixed enum).
-                     Defaults to Q2's 'unspecified'.  An unknown code raises ValueError.
+                     Defaults to Q2's 'other'.  An unknown code raises ValueError.
         actor: Identifier of the user declining (e.g. 'josh', admin user id).
         db: SQLAlchemy session.
         free_text: Optional free text to accompany the reason.
     """
-    # Load the routed event to get lead_id and lender info.
+    from src.lending.routing.router import load_file, route_file, route_loan_file
+
     event = db.execute(
         text(
-            "SELECT id, lead_id, lender_id, lender_name, action"
+            "SELECT id, lead_id, loan_file_id, lender_id, lender_name, action"
             "  FROM lending.file_routing_events"
             " WHERE id = :eid"
             " FOR UPDATE"
@@ -66,26 +70,26 @@ def record_decline(
             f"Event {event_id} has action {event['action']!r}; only 'routed' events can be declined"
         )
 
-    lead_id = event["lead_id"]
+    key = key_from_row(event)
 
     # Check file_routing is in 'routed' state for this lender (idempotency guard).
     routing = db.execute(
         text(
             "SELECT status, current_lender_id, route_position"
             "  FROM lending.file_routing"
-            " WHERE lead_id = :lid"
+            f" WHERE {key.column} = :id"
             " FOR UPDATE"
         ),
-        {"lid": lead_id},
+        {"id": key.id},
     ).mappings().one_or_none()
 
     if routing is None:
-        raise ValueError(f"file_routing row not found for lead_id={lead_id}")
+        raise ValueError(f"file_routing row not found for {key.column}={key.id}")
 
     if routing["status"] in ("held", "exhausted"):
         logger.warning(
-            "record_decline event_id=%d lead_id=%d: file already %s — no-op",
-            event_id, lead_id, routing["status"],
+            "record_decline event_id=%d %s=%d: file already %s - no-op",
+            event_id, key.column, key.id, routing["status"],
         )
         return
 
@@ -94,14 +98,14 @@ def record_decline(
     superseded = db.execute(
         text(
             "SELECT 1 FROM lending.file_routing_events"
-            " WHERE lead_id = :lid AND id > :eid LIMIT 1"
+            f" WHERE {key.column} = :id AND id > :eid LIMIT 1"
         ),
-        {"lid": lead_id, "eid": event_id},
+        {"id": key.id, "eid": event_id},
     ).scalar()
     if superseded or routing["status"] != "routed" or routing["current_lender_id"] != event["lender_id"]:
         logger.warning(
-            "record_decline event_id=%d lead_id=%d: event no longer current — no-op",
-            event_id, lead_id,
+            "record_decline event_id=%d %s=%d: event no longer current - no-op",
+            event_id, key.column, key.id,
         )
         return
 
@@ -119,12 +123,12 @@ def record_decline(
     decline_event_id = db.execute(
         text(
             "INSERT INTO lending.file_routing_events"
-            "  (lead_id, lender_id, lender_name, action, reason_code, free_text, actor)"
-            " VALUES (:lead_id, :lid, :name, 'declined', :code, :text, :actor)"
+            f"  ({key.column}, lender_id, lender_name, action, reason_code, free_text, actor)"
+            " VALUES (:id, :lid, :name, 'declined', :code, :text, :actor)"
             " RETURNING id"
         ),
         {
-            "lead_id": lead_id,
+            "id": key.id,
             "lid": event["lender_id"],
             "name": event["lender_name"],
             "code": code,
@@ -132,7 +136,7 @@ def record_decline(
             "actor": actor,
         },
     ).scalar_one()
-    # Reopen the file so route_file's idempotency guard lets the next pass run;
+    # Reopen the file so the router's idempotency guard lets the next pass run;
     # lenders_tried is kept so the declined lender is skipped.
     db.execute(
         text(
@@ -141,26 +145,25 @@ def record_decline(
             "       current_lender_id = NULL,"
             "       current_lender_name = NULL,"
             "       updated_at = NOW()"
-            " WHERE lead_id = :lead_id"
+            f" WHERE {key.column} = :id"
         ),
-        {"lead_id": lead_id},
+        {"id": key.id},
     )
     db.commit()
 
-    # Notify Slack (file ID, last name, product, amount, lender, position).
+    # Notify Slack (file, last name, product, amount, lender, position).
     try:
-        lead = db.execute(
-            text("SELECT id, last_name, loan_type, loan_amount FROM lending.lendingflow_leads WHERE id = :id"),
-            {"id": lead_id},
-        ).mappings().one()
         post_decline_event(
-            dict(lead), event["lender_name"], routing["route_position"], code, decline_event_id, db=db,
+            load_file(key, db), event["lender_name"], routing["route_position"], code, decline_event_id, db=db,
         )
     except Exception:
-        logger.exception("record_decline lead_id=%d: Slack post failed — continuing", lead_id)
+        logger.exception("record_decline %s=%d: Slack post failed - continuing", key.column, key.id)
 
-    # Re-run the waterfall. The router will see the current lender in lenders_tried
-    # and skip to the next one.
-    from src.lending.routing.router import route_file  # local import avoids circular
+    # A partner file's status moves to 'declined' and the partner is told, before the next pass runs.
+    partner_link.mirror_status(key, "declined", code)
 
-    route_file(lead_id, db)
+    # Re-run the waterfall. The router sees the declined lender in lenders_tried and skips to the next one.
+    if key.kind == LEAD:
+        route_file(key.id, db)
+    else:
+        route_loan_file(key.id, db)

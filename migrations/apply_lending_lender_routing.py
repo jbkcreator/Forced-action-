@@ -192,6 +192,7 @@ DDL = [
         -- Only slack bookkeeping columns may be updated.
         IF NEW.id            IS DISTINCT FROM OLD.id
         OR NEW.lead_id       IS DISTINCT FROM OLD.lead_id
+        OR NEW.loan_file_id  IS DISTINCT FROM OLD.loan_file_id
         OR NEW.lender_id     IS DISTINCT FROM OLD.lender_id
         OR NEW.lender_name   IS DISTINCT FROM OLD.lender_name
         OR NEW.action        IS DISTINCT FROM OLD.action
@@ -224,6 +225,40 @@ DDL = [
     """,
     # Link to the T-05 lenders whose rule values define this lender's eligibility (NULL = own boxes).
     "ALTER TABLE lending.lender_routing_rules ADD COLUMN IF NOT EXISTS rule_keys TEXT[]",
+    # A file is a LendingFlow lead OR a partner file (lending.loan_files): exactly one key per row.
+    "ALTER TABLE lending.file_routing ALTER COLUMN lead_id DROP NOT NULL",
+    "ALTER TABLE lending.file_routing ADD COLUMN IF NOT EXISTS loan_file_id BIGINT",
+    "ALTER TABLE lending.file_routing_events ALTER COLUMN lead_id DROP NOT NULL",
+    "ALTER TABLE lending.file_routing_events ADD COLUMN IF NOT EXISTS loan_file_id BIGINT",
+    """
+    DO $$ BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_file_routing_one_file') THEN
+            ALTER TABLE lending.file_routing
+                ADD CONSTRAINT ck_file_routing_one_file CHECK ((lead_id IS NULL) <> (loan_file_id IS NULL));
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_fre_one_file') THEN
+            ALTER TABLE lending.file_routing_events
+                ADD CONSTRAINT ck_fre_one_file CHECK ((lead_id IS NULL) <> (loan_file_id IS NULL));
+        END IF;
+    END $$
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_file_routing_loan_file ON lending.file_routing (loan_file_id) WHERE loan_file_id IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_fre_loan_file ON lending.file_routing_events (loan_file_id, created_at)",
+    # The foreign keys need the Partner Door table; where it is not installed yet they are added by a later run.
+    """
+    DO $$ BEGIN
+        IF to_regclass('lending.loan_files') IS NOT NULL THEN
+            IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_file_routing_loan_file') THEN
+                ALTER TABLE lending.file_routing ADD CONSTRAINT fk_file_routing_loan_file
+                    FOREIGN KEY (loan_file_id) REFERENCES lending.loan_files (id);
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_fre_loan_file') THEN
+                ALTER TABLE lending.file_routing_events ADD CONSTRAINT fk_fre_loan_file
+                    FOREIGN KEY (loan_file_id) REFERENCES lending.loan_files (id);
+            END IF;
+        END IF;
+    END $$
+    """,
 ]
 
 SEED_REASONS = SEED_DECLINE_REASONS  # Josh's enum, one source: config/lending_routing.py

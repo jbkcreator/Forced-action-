@@ -819,7 +819,9 @@ class LendingLenderProductBox(LendingBase):
 
 
 class LendingFileRouting(LendingBase):
-    """Current routing state for one LendingFlow file (1:1 with lendingflow_leads).
+    """Current routing state for one file: a LendingFlow lead (``lead_id``) or a partner file (``loan_file_id``).
+
+    Exactly one of the two keys is set. The file is 1:1 with that row.
 
     ``lenders_tried``: ordered list of lender IDs already offered the file (so
     the decline cascade can skip them on the next pass).
@@ -829,7 +831,8 @@ class LendingFileRouting(LendingBase):
     __tablename__ = "file_routing"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    lead_id: Mapped[int] = mapped_column(ForeignKey("lending.lendingflow_leads.id"), nullable=False, unique=True, index=True)
+    lead_id: Mapped[Optional[int]] = mapped_column(ForeignKey("lending.lendingflow_leads.id"), unique=True, index=True)
+    loan_file_id: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("lending.loan_files.id"), unique=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="unrouted", server_default=text("'unrouted'"))
     current_lender_id: Mapped[Optional[int]] = mapped_column(ForeignKey("lending.lender_routing_rules.id"))
     current_lender_name: Mapped[Optional[str]] = mapped_column(String(100))
@@ -841,6 +844,7 @@ class LendingFileRouting(LendingBase):
 
     __table_args__ = (
         CheckConstraint("status IN ('unrouted','routed','held','exhausted')", name="ck_file_routing_status"),
+        CheckConstraint("(lead_id IS NULL) <> (loan_file_id IS NULL)", name="ck_file_routing_one_file"),
         Index("idx_file_routing_sweep", "status", "lead_id"),
     )
 
@@ -862,7 +866,8 @@ class LendingFileRoutingEvent(LendingBase):
     __tablename__ = "file_routing_events"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    lead_id: Mapped[int] = mapped_column(ForeignKey("lending.lendingflow_leads.id"), nullable=False, index=True)
+    lead_id: Mapped[Optional[int]] = mapped_column(ForeignKey("lending.lendingflow_leads.id"), index=True)
+    loan_file_id: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("lending.loan_files.id"), index=True)
     lender_id: Mapped[Optional[int]] = mapped_column(ForeignKey("lending.lender_routing_rules.id"))
     lender_name: Mapped[Optional[str]] = mapped_column(String(100))
     action: Mapped[str] = mapped_column(String(20), nullable=False)
@@ -875,6 +880,7 @@ class LendingFileRoutingEvent(LendingBase):
 
     __table_args__ = (
         CheckConstraint("action IN ('routed','declined','approved','funded','held')", name="ck_file_routing_events_action"),
+        CheckConstraint("(lead_id IS NULL) <> (loan_file_id IS NULL)", name="ck_fre_one_file"),
         Index("idx_fre_lead_created", "lead_id", "created_at"),
     )
 
@@ -969,3 +975,116 @@ class LendingEmailOptOutMessage(LendingBase):
         CheckConstraint("outcome IN ('recorded', 'not_opt_out', 'failed', 'gave_up', 'unreadable')",
                         name="ck_lending_email_opt_out_messages_outcome"),
     )
+
+
+class LendingLoanFile(LendingBase):
+    """One borrower file in the lending pipeline, whatever its source (P-1 creates partner files).
+
+    Columns are the ones any source can fill. The router (R-1) adds its routing columns and moves
+    ``status``; source-specific evidence lives in its own table pointing here (``partner_submissions``).
+    """
+
+    __tablename__ = "loan_files"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(20), nullable=False)  # partner (LendingFlow joins later)
+    partner_id: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("lending.partners.id"))
+    borrower_first_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    borrower_last_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    borrower_phone: Mapped[Optional[str]] = mapped_column(String(20))  # phone_utils.normalize
+    borrower_email: Mapped[Optional[str]] = mapped_column(String(255))  # lower-cased
+    product: Mapped[str] = mapped_column(String(20), nullable=False)  # flip / ground_up / dscr / other
+    loan_amount: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    property_address: Mapped[Optional[str]] = mapped_column(String(200))
+    property_city: Mapped[Optional[str]] = mapped_column(String(80))
+    property_state: Mapped[str] = mapped_column(String(2), nullable=False)  # USPS code
+    property_zip: Mapped[Optional[str]] = mapped_column(String(10))
+    purchase_price: Mapped[Optional[int]] = mapped_column(BigInteger)
+    rehab_budget: Mapped[Optional[int]] = mapped_column(BigInteger)  # rehab or build budget
+    arv: Mapped[Optional[int]] = mapped_column(BigInteger)  # ARV or completed value
+    completed_projects: Mapped[Optional[int]] = mapped_column(Integer)
+    credit_band: Mapped[Optional[str]] = mapped_column(String(20))
+    timeline: Mapped[Optional[str]] = mapped_column(String(40))
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="received", server_default=text("'received'"))
+    status_reason: Mapped[Optional[str]] = mapped_column(String(200))
+    status_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    lender_fit: Mapped[Optional[dict]] = mapped_column(JSONB)  # evaluate_lender_fit result (internal only)
+    prequal_pdf_path: Mapped[Optional[str]] = mapped_column(String(300))  # generated, never sent to the borrower
+    funded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint("status IN ('received', 'held', 'routed', 'declined', 'approved', 'funded')",
+                        name="ck_lending_loan_files_status"),
+        Index("idx_lending_loan_files_partner", "partner_id", "created_at"),
+        Index("idx_lending_loan_files_status", "status", "status_at"),
+    )
+
+
+class LendingPartner(LendingBase):
+    """A wholesaler, broker or referral partner who may submit files through their own link (P-1).
+
+    Only the SHA-256 of the link token is stored; the raw token is shown once when it is issued.
+    Revoking sets ``token_revoked_at``; the record and the partner's files are kept.
+    """
+
+    __tablename__ = "partners"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    company: Mapped[Optional[str]] = mapped_column(String(160))
+    partner_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    phone: Mapped[Optional[str]] = mapped_column(String(20))  # phone_utils.normalize
+    email: Mapped[Optional[str]] = mapped_column(String(255))
+    states: Mapped[Optional[str]] = mapped_column(String(200))  # comma-separated USPS codes
+    agreement_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending", server_default=text("'pending'"))
+    referral_terms: Mapped[Optional[str]] = mapped_column(Text)
+    sms_consent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=text("true"))
+    created_by: Mapped[Optional[str]] = mapped_column(String(80))
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    token_revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint("partner_type IN ('wholesaler', 'broker', 'referral', 'other')", name="ck_lending_partners_type"),
+        CheckConstraint("agreement_status IN ('pending', 'signed', 'terminated')", name="ck_lending_partners_agreement"),
+    )
+
+
+class LendingPartnerSubmission(LendingBase):
+    """The partner's consent evidence for one submitted file. Partner consent is never borrower consent."""
+
+    __tablename__ = "partner_submissions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    file_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("lending.loan_files.id"), nullable=False, unique=True)
+    partner_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("lending.partners.id"), nullable=False)
+    consent_checked: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    consent_text: Mapped[str] = mapped_column(Text, nullable=False)  # exactly what the form showed
+    consented_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ip_address: Mapped[Optional[str]] = mapped_column(String(45))
+    page_url: Mapped[Optional[str]] = mapped_column(String(300))  # the link token is removed before storing
+    user_agent: Mapped[Optional[str]] = mapped_column(String(300))
+    partner_confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    josh_notified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+
+class LendingPartnerFileUpload(LendingBase):
+    """A document the partner attached (purchase contract, scope, photos). Stored on disk, path recorded here."""
+
+    __tablename__ = "partner_file_uploads"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    file_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("lending.loan_files.id"), nullable=False)
+    original_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    stored_path: Mapped[str] = mapped_column(String(300), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (Index("idx_lending_partner_file_uploads_file", "file_id"),)

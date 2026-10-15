@@ -17,7 +17,7 @@ from functools import partial
 from typing import Callable, Optional, Sequence
 
 from config.lender_matrix import LENDER_MATRIX, LenderRules
-from src.lending.contracts import BorrowerProfile, LoanRequest, LoanType
+from src.lending.contracts import BorrowerProfile, LenderFitResult, LoanRequest, LoanType
 from src.lending.lender_fit import evaluate_lender_fit
 from src.lending.lendingflow import credit_band_min_fico
 from src.lending.prequal import FitLimits, PrequalLead
@@ -32,6 +32,13 @@ def _limits(rules: LenderRules) -> FitLimits:
         min_amount=int(rules.min_loan_amount) if rules.min_loan_amount is not None else 0,
         max_amount=int(rules.max_loan_amount) if rules.max_loan_amount is not None else None,
     )
+
+
+def fit_limits_from_result(result: LenderFitResult,
+                           matrix: Sequence[LenderRules] = LENDER_MATRIX) -> list[FitLimits]:
+    """Loan bounds of each lender in an already-scored result (partner files score themselves)."""
+    rules_by_key = {rules.key: rules for rules in matrix}
+    return [_limits(rules_by_key[fit.lender_key]) for fit in result.fitting if fit.lender_key in rules_by_key]
 
 
 def evaluate_prequal_fit(lead: PrequalLead, matrix: tuple[LenderRules, ...] = LENDER_MATRIX) -> Optional[list[FitLimits]]:
@@ -49,8 +56,7 @@ def evaluate_prequal_fit(lead: PrequalLead, matrix: tuple[LenderRules, ...] = LE
         LoanRequest(loan_type=loan_type, loan_amount=Decimal(lead.loan_amount), state=state),
         matrix=matrix,
     )
-    rules_by_key = {rules.key: rules for rules in matrix}
-    return [_limits(rules_by_key[fit.lender_key]) for fit in result.fitting if fit.lender_key in rules_by_key]
+    return fit_limits_from_result(result, matrix)
 
 
 def get_fit_evaluator(matrix: tuple[LenderRules, ...] = LENDER_MATRIX) -> Optional[FitEvaluator]:

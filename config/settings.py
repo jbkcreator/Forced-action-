@@ -919,6 +919,9 @@ class AppSettings(BaseSettings):
 	lending_prequal_range_pct: int = Field(default=10, env="LENDING_PREQUAL_RANGE_PCT")
 	# Sender of the pre-qual email. Set a verified Next Deal Lending mailbox before enabling; unset = GHL's shared address.
 	lending_prequal_email_from: Optional[str] = Field(default=None, env="LENDING_PREQUAL_EMAIL_FROM")
+	# P-1 Partner Door. The form will not open until Josh's consent wording is set here (shown verbatim, stored on each file).
+	lending_partner_consent_text: str = Field(default="", env="LENDING_PARTNER_CONSENT_TEXT")
+	lending_partner_upload_dir: str = Field(default="data/partner_uploads", env="LENDING_PARTNER_UPLOAD_DIR")  # uploads + generated pre-qual PDFs
 	# Shared secret the GHL "DND changed" workflow sends in X-Webhook-Secret. Unset = endpoint closed.
 	lending_ghl_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_GHL_WEBHOOK_SECRET")
 	lending_ghl_sms_from_number: Optional[str] = Field(default=None, env="LENDING_GHL_SMS_FROM_NUMBER")  # E.164; the GHL SMS number (texting only). Calls run through BatchDialer on a different number
