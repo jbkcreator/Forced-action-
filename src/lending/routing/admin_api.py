@@ -22,6 +22,8 @@ Endpoints:
   GET    /api/lending/routing/files/{file_id}     file record: current lender, next lender, history  (?source=partner)
   POST   /api/lending/routing/files/{file_id}/decline  one-click decline of the current lender  (?source=partner)
   POST   /api/lending/routing/events/{event_id}/decline  one-click decline (R-1)
+  POST   /api/lending/routing/files/{file_id}/requeue    send a held file back to the router (?source=partner)
+  POST   /api/lending/routing/hold-queue/requeue         reopen every file held for a reason (no_match / exhausted)
   POST   /api/lending/routing/files/{file_id}/outcome    record approved / funded (moves the seat cap)  (?source=partner)
   GET    /api/lending/routing/hold-queue           current hold queue summary
 """
@@ -30,10 +32,10 @@ from __future__ import annotations
 import hmac
 import logging
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Annotated, Any, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
-from pydantic import BaseModel, Field, field_validator
+from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -75,6 +77,10 @@ def _verify_admin(x_routing_admin_secret: Optional[str] = Header(default=None)) 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
 
+_MAX_INT = 2_147_483_647  # the id columns' range; anything larger would be a database error, not a 404
+IdPath = Annotated[int, Path(ge=1, le=_MAX_INT)]
+_MAX_MONEY = 1_000_000_000_000
+
 
 def _check_rule_keys(value: Optional[list[str]]) -> Optional[list[str]]:
     """``rule_keys`` must be T-05 lender keys (config/lender_matrix.py); a typo would leave the lender with no rules."""
@@ -88,17 +94,31 @@ def _check_rule_keys(value: Optional[list[str]]) -> Optional[list[str]]:
     return cleaned
 
 
+def _check_name(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        raise ValueError("name cannot be blank")
+    return cleaned
+
+
 class LenderIn(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=100)
     active: bool = True
     is_primary: bool = False
     agreement_status: str = "pending"
-    priority: int
-    monthly_cap: Optional[int] = None
-    construction_min_amount: Optional[int] = None
-    points_paid_to_broker: Optional[float] = None
+    priority: int = Field(ge=1, le=100_000)
+    monthly_cap: Optional[int] = Field(default=None, ge=0, le=100_000)
+    construction_min_amount: Optional[int] = Field(default=None, ge=0, le=_MAX_MONEY)
+    points_paid_to_broker: Optional[float] = Field(default=None, ge=0, lt=10)  # NUMERIC(5,4)
     takes_ground_up: bool = False
     rule_keys: Optional[list[str]] = None
+
+    @field_validator("name")
+    @classmethod
+    def _name_not_blank(cls, value: str) -> str:
+        return _check_name(value)
 
     @field_validator("rule_keys")
     @classmethod
@@ -107,16 +127,21 @@ class LenderIn(BaseModel):
 
 
 class LenderPatch(BaseModel):
-    name: Optional[str] = None
+    name: Optional[str] = Field(default=None, min_length=1, max_length=100)
     active: Optional[bool] = None
     is_primary: Optional[bool] = None
     agreement_status: Optional[str] = None
-    priority: Optional[int] = None
-    monthly_cap: Optional[int] = None
-    construction_min_amount: Optional[int] = None
-    points_paid_to_broker: Optional[float] = None
+    priority: Optional[int] = Field(default=None, ge=1, le=100_000)
+    monthly_cap: Optional[int] = Field(default=None, ge=0, le=100_000)
+    construction_min_amount: Optional[int] = Field(default=None, ge=0, le=_MAX_MONEY)
+    points_paid_to_broker: Optional[float] = Field(default=None, ge=0, lt=10)
     takes_ground_up: Optional[bool] = None
     rule_keys: Optional[list[str]] = None
+
+    @field_validator("name")
+    @classmethod
+    def _name_not_blank(cls, value: Optional[str]) -> Optional[str]:
+        return _check_name(value)
 
     @field_validator("rule_keys")
     @classmethod
@@ -126,6 +151,14 @@ class LenderPatch(BaseModel):
 
 class ProductBoxIn(BaseModel):
     loan_types: list[str]
+    min_loan_amount: Optional[int] = Field(default=None, ge=0, le=_MAX_MONEY)
+    max_loan_amount: Optional[int] = Field(default=None, ge=0, le=_MAX_MONEY)
+    approved_states: Optional[list[str]] = None
+    credit_floor: Optional[int] = Field(default=None, ge=0, le=900)
+    max_ltv: Optional[float] = Field(default=None, ge=0, lt=10)  # NUMERIC(5,4): 10 or more overflows it
+    max_ltc: Optional[float] = Field(default=None, ge=0, lt=10)
+    min_completed_projects: int = Field(default=0, ge=0, le=1000)
+    requires_ground_up_build: bool = False
 
     @field_validator("loan_types")
     @classmethod
@@ -138,47 +171,57 @@ class ProductBoxIn(BaseModel):
             raise ValueError(f"loan_types must be a non-empty subset of {sorted(known)}; got {unknown or value}")
         return normalised
 
-    min_loan_amount: Optional[int] = None
-    max_loan_amount: Optional[int] = None
-    approved_states: Optional[list[str]] = None
-    credit_floor: Optional[int] = None
-    max_ltv: Optional[float] = Field(default=None, ge=0, le=10)
-    max_ltc: Optional[float] = Field(default=None, ge=0, le=10)
-    min_completed_projects: int = 0
-    requires_ground_up_build: bool = False
+    @field_validator("approved_states")
+    @classmethod
+    def _states_as_codes(cls, value: Optional[list[str]]) -> Optional[list[str]]:
+        """Two-letter codes in capitals, as the files carry them; a lowercase "fl" would never match."""
+        if not value:
+            return None
+        cleaned = [s.strip().upper() for s in value]
+        bad = [s for s in cleaned if len(s) != 2 or not s.isalpha()]
+        if bad:
+            raise ValueError(f"approved_states must be two-letter state codes; got {bad}")
+        return cleaned
+
+    @model_validator(mode="after")
+    def _min_not_above_max(self) -> "ProductBoxIn":
+        if (self.min_loan_amount is not None and self.max_loan_amount is not None
+                and self.min_loan_amount > self.max_loan_amount):
+            raise ValueError("min_loan_amount cannot be above max_loan_amount")
+        return self
 
 
 class DeclineReasonIn(BaseModel):
-    code: str
-    label: str
+    code: str = Field(min_length=1, max_length=50, pattern=r"^[a-z0-9_]+$")
+    label: str = Field(min_length=1, max_length=200)
     active: bool = True
 
 
 class DeclineIn(BaseModel):
-    reason_code: str = DEFAULT_DECLINE_REASON
-    actor: str = "josh"
-    free_text: Optional[str] = None
+    reason_code: str = Field(default=DEFAULT_DECLINE_REASON, min_length=1, max_length=50)
+    actor: str = Field(default="josh", min_length=1, max_length=100)
+    free_text: Optional[str] = Field(default=None, max_length=2000)
 
 
 class OutcomeIn(BaseModel):
-    action: str
-    actor: str = "josh"
-    free_text: Optional[str] = None
-
-
-class FileDeclineIn(BaseModel):
-    reason_code: str = DEFAULT_DECLINE_REASON
-    actor: str = "josh"
-    free_text: Optional[str] = None
+    action: str = Field(min_length=1, max_length=20)
+    actor: str = Field(default="josh", min_length=1, max_length=100)
+    free_text: Optional[str] = Field(default=None, max_length=2000)
 
 
 class ReorderIn(BaseModel):
-    ordered_ids: list[int] = Field(min_length=1)
+    ordered_ids: list[Annotated[int, Field(ge=1, le=_MAX_INT)]] = Field(min_length=1, max_length=500)
+
+
+class RequeueIn(BaseModel):
+    reason: str = Field(default="no_match", pattern=r"^(no_match|exhausted)$")
+    limit: int = Field(default=200, ge=1, le=1000)
 
 
 _NULLABLE_LENDER_FIELDS = frozenset({"monthly_cap", "construction_min_amount", "points_paid_to_broker", "rule_keys"})
 _FILE_STATUSES = ("unrouted", "routed", "held", "exhausted")
 _FILE_SOURCES = ("lendingflow", "partner")
+_HOLD_QUEUE_LIMIT = 200
 
 
 def _priority_taken() -> HTTPException:
@@ -186,6 +229,22 @@ def _priority_taken() -> HTTPException:
         status_code=409,
         detail="That priority is already used by an active lender. Use the reorder control to change the order.",
     )
+
+
+def _conflict(exc: IntegrityError) -> HTTPException:
+    """409 for a unique-index clash, saying which rule was broken (a second primary, or a duplicate priority)."""
+    constraint = getattr(getattr(exc.orig, "diag", None), "constraint_name", "") or ""
+    if "primary" in constraint:
+        return HTTPException(
+            status_code=409,
+            detail="Another lender is already primary. Use POST lenders/{id}/make-primary to move the flag in one step.",
+        )
+    return _priority_taken()
+
+
+def _lock_lenders(db: Session) -> None:
+    """Serialise changes to the waterfall order and the primary flag (two admins acting at once)."""
+    db.execute(text("SELECT id FROM lending.lender_routing_rules ORDER BY id FOR UPDATE"))
 
 
 # ── Lender CRUD ───────────────────────────────────────────────────────────────
@@ -199,7 +258,7 @@ def list_lenders(
     rows = db.execute(
         text(
             "SELECT id, name, active, is_primary, agreement_status, priority,"
-            "       monthly_cap, construction_min_amount, takes_ground_up, rule_keys,"
+            "       monthly_cap, construction_min_amount, points_paid_to_broker, takes_ground_up, rule_keys,"
             "       created_at, updated_at"
             "  FROM lending.lender_routing_rules"
             " ORDER BY priority ASC, id ASC"
@@ -243,15 +302,15 @@ def create_lender(
             },
         ).scalar_one()
         db.commit()
-    except IntegrityError:
+    except IntegrityError as exc:
         db.rollback()
-        raise _priority_taken()
+        raise _conflict(exc)
     return {"id": row, "name": body.name}
 
 
 @router.patch("/lenders/{lender_id}")
 def update_lender(
-    lender_id: int,
+    lender_id: IdPath,
     body: LenderPatch,
     _: None = Depends(_verify_admin),
     db: Session = Depends(get_lending_db),
@@ -282,9 +341,9 @@ def update_lender(
             updates,
         )
         db.commit()
-    except IntegrityError:
+    except IntegrityError as exc:
         db.rollback()
-        raise _priority_taken()
+        raise _conflict(exc)
     return {"id": lender_id, "updated": [k for k in updates if k not in ("id", "now")]}
 
 
@@ -302,6 +361,7 @@ def reorder_lenders(
     ids = body.ordered_ids
     if len(set(ids)) != len(ids):
         raise HTTPException(status_code=422, detail="ordered_ids contains duplicates")
+    _lock_lenders(db)
     known = {r["id"]: r["active"] for r in db.execute(
         text("SELECT id, active FROM lending.lender_routing_rules")).mappings()}
     unknown = [i for i in ids if i not in known]
@@ -311,22 +371,26 @@ def reorder_lenders(
     if missing_active:
         raise HTTPException(status_code=422, detail=f"Every active lender must be listed; missing {missing_active}")
     now = datetime.now(timezone.utc)
-    # Two passes: park the listed rows on negative numbers, then assign the final order.
-    db.execute(
-        text("UPDATE lending.lender_routing_rules SET priority = -id WHERE id = ANY(:ids)"), {"ids": ids},
-    )
-    for position, lender_id in enumerate(ids, start=1):
+    try:
+        # Two passes: park the listed rows on negative numbers, then assign the final order.
         db.execute(
-            text("UPDATE lending.lender_routing_rules SET priority = :p, updated_at = :now WHERE id = :id"),
-            {"p": position, "now": now, "id": lender_id},
+            text("UPDATE lending.lender_routing_rules SET priority = -id WHERE id = ANY(:ids)"), {"ids": ids},
         )
-    db.commit()
+        for position, lender_id in enumerate(ids, start=1):
+            db.execute(
+                text("UPDATE lending.lender_routing_rules SET priority = :p, updated_at = :now WHERE id = :id"),
+                {"p": position, "now": now, "id": lender_id},
+            )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise _conflict(exc)
     return {"ordered_ids": ids}
 
 
 @router.post("/lenders/{lender_id}/make-primary")
 def make_primary(
-    lender_id: int,
+    lender_id: IdPath,
     _: None = Depends(_verify_admin),
     db: Session = Depends(get_lending_db),
 ) -> dict:
@@ -337,26 +401,36 @@ def make_primary(
     the seat cap applies to the new primary straight away.
     """
     _require_lender(lender_id, db)
+    _lock_lenders(db)
+    active = db.execute(
+        text("SELECT active FROM lending.lender_routing_rules WHERE id = :id"), {"id": lender_id},
+    ).scalar()
+    if not active:
+        raise HTTPException(status_code=422, detail="Resume the lender before making it primary.")
     now = datetime.now(timezone.utc)
-    demoted = db.execute(
-        text(
-            "UPDATE lending.lender_routing_rules SET is_primary = FALSE, updated_at = :now"
-            " WHERE is_primary AND id <> :id RETURNING id"
-        ),
-        {"id": lender_id, "now": now},
-    ).scalars().all()
-    db.execute(
-        text(
-            "UPDATE lending.lender_routing_rules"
-            "   SET is_primary = TRUE,"
-            "       monthly_cap = COALESCE(monthly_cap, :cap),"
-            "       construction_min_amount = COALESCE(construction_min_amount, :cmin),"
-            "       updated_at = :now"
-            " WHERE id = :id"
-        ),
-        {"id": lender_id, "cap": PRIMARY_DEFAULT_SEAT_CAP, "cmin": PRIMARY_DEFAULT_CONSTRUCTION_MIN, "now": now},
-    )
-    db.commit()
+    try:
+        demoted = db.execute(
+            text(
+                "UPDATE lending.lender_routing_rules SET is_primary = FALSE, updated_at = :now"
+                " WHERE is_primary AND id <> :id RETURNING id"
+            ),
+            {"id": lender_id, "now": now},
+        ).scalars().all()
+        db.execute(
+            text(
+                "UPDATE lending.lender_routing_rules"
+                "   SET is_primary = TRUE,"
+                "       monthly_cap = COALESCE(monthly_cap, :cap),"
+                "       construction_min_amount = COALESCE(construction_min_amount, :cmin),"
+                "       updated_at = :now"
+                " WHERE id = :id"
+            ),
+            {"id": lender_id, "cap": PRIMARY_DEFAULT_SEAT_CAP, "cmin": PRIMARY_DEFAULT_CONSTRUCTION_MIN, "now": now},
+        )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise _conflict(exc)
     logger.info("make_primary lender_id=%d demoted=%s", lender_id, demoted)
     return {"id": lender_id, "demoted": demoted}
 
@@ -366,7 +440,7 @@ def make_primary(
 
 @router.get("/lenders/{lender_id}/boxes")
 def list_boxes(
-    lender_id: int,
+    lender_id: IdPath,
     _: None = Depends(_verify_admin),
     db: Session = Depends(get_lending_db),
 ) -> list[dict]:
@@ -386,7 +460,7 @@ def list_boxes(
 
 @router.post("/lenders/{lender_id}/boxes", status_code=201)
 def add_box(
-    lender_id: int,
+    lender_id: IdPath,
     body: ProductBoxIn,
     _: None = Depends(_verify_admin),
     db: Session = Depends(get_lending_db),
@@ -425,7 +499,7 @@ def add_box(
 
 @router.delete("/lenders/{lender_id}/boxes/{box_id}", status_code=204)
 def delete_box(
-    lender_id: int,
+    lender_id: IdPath,
     box_id: int,
     _: None = Depends(_verify_admin),
     db: Session = Depends(get_lending_db),
@@ -459,6 +533,8 @@ def add_decline_reason(
     _: None = Depends(_verify_admin),
     db: Session = Depends(get_lending_db),
 ) -> dict:
+    if body.code == DEFAULT_DECLINE_REASON and not body.active:
+        raise HTTPException(status_code=422, detail="The default decline reason cannot be switched off.")
     db.execute(
         text(
             "INSERT INTO lending.decline_reason_codes (code, label, active)"
@@ -476,7 +552,7 @@ def add_decline_reason(
 
 @router.post("/events/{event_id}/decline", status_code=200)
 def decline_event(
-    event_id: int,
+    event_id: IdPath,
     body: DeclineIn,
     _: None = Depends(_verify_admin),
     db: Session = Depends(get_lending_db),
@@ -565,7 +641,7 @@ def _file_rows(db: Session, *, where: str, params: dict, order_limit: str, sourc
 
 @router.post("/files/{file_id}/outcome", status_code=200)
 def file_outcome(
-    file_id: int,
+    file_id: IdPath,
     body: OutcomeIn,
     source: str = Query(default="lendingflow"),
     _: None = Depends(_verify_admin),
@@ -618,11 +694,13 @@ def list_files(
         raise HTTPException(status_code=422, detail=f"status must be one of {list(_FILE_STATUSES)}")
     if source is not None and source not in _FILE_SOURCES:
         raise HTTPException(status_code=422, detail=f"source must be one of {list(_FILE_SOURCES)}")
+    q = (q or "").strip() or None
+    pattern = None if q is None else "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
     files = _file_rows(
         db,
         where="(CAST(:status AS text) IS NULL OR f.status = :status)"
-              " AND (CAST(:q AS text) IS NULL OR f.last_name ILIKE :qlike)",
-        params={"status": status, "q": q, "qlike": f"%{q}%" if q else None, "limit": limit},
+              " AND (CAST(:q AS text) IS NULL OR f.last_name ILIKE :qlike ESCAPE '\\')",
+        params={"status": status, "q": q, "qlike": pattern, "limit": limit},
         order_limit="ORDER BY f.updated_at DESC, f.file_id DESC LIMIT :limit",
         source=source,
     )
@@ -631,7 +709,7 @@ def list_files(
 
 @router.get("/files/{file_id}")
 def file_record(
-    file_id: int,
+    file_id: IdPath,
     source: str = Query(default="lendingflow"),
     _: None = Depends(_verify_admin),
     db: Session = Depends(get_lending_db),
@@ -682,8 +760,8 @@ def file_record(
 
 @router.post("/files/{file_id}/decline", status_code=200)
 def decline_file(
-    file_id: int,
-    body: FileDeclineIn,
+    file_id: IdPath,
+    body: DeclineIn,
     source: str = Query(default="lendingflow"),
     _: None = Depends(_verify_admin),
     db: Session = Depends(get_lending_db),
@@ -711,6 +789,40 @@ def decline_file(
     return {"detail": "decline recorded"}
 
 
+@router.post("/files/{file_id}/requeue", status_code=200)
+def requeue_file(
+    file_id: IdPath,
+    source: str = Query(default="lendingflow"),
+    _: None = Depends(_verify_admin),
+    db: Session = Depends(get_lending_db),
+) -> dict[str, Any]:
+    """Send a held or exhausted file back to the router now (after a lender was signed or a box was edited)."""
+    from src.lending.routing.file_key import LEAD
+    from src.lending.routing.router import reopen_file, route_file, route_loan_file
+
+    key = _file_key(source, file_id)
+    if not reopen_file(key, db):
+        raise HTTPException(status_code=422, detail=f"File {file_id} is not in the hold queue")
+    if key.kind == LEAD:
+        route_file(key.id, db)
+    else:
+        route_loan_file(key.id, db)
+    return {"detail": "sent back to the router"}
+
+
+@router.post("/hold-queue/requeue", status_code=200)
+def requeue_held(
+    body: RequeueIn,
+    _: None = Depends(_verify_admin),
+    db: Session = Depends(get_lending_db),
+) -> dict[str, Any]:
+    """Reopen every file held for ``reason``; the routing sweep then routes them in batches, oldest first."""
+    from src.lending.routing.router import reopen_held
+
+    return {"reopened": reopen_held(db, body.reason, body.limit),
+            "detail": "reopened; the routing sweep routes them in batches"}
+
+
 # ── Hold queue ────────────────────────────────────────────────────────────────
 
 
@@ -722,10 +834,11 @@ def hold_queue(
     files = _file_rows(
         db,
         where="f.status IN ('held','exhausted')",
-        params={},
-        order_limit="ORDER BY f.updated_at DESC LIMIT 200",
+        params={"limit": _HOLD_QUEUE_LIMIT + 1},
+        order_limit="ORDER BY f.updated_at DESC LIMIT :limit",
     )
-    return {"count": len(files), "files": files}
+    truncated = len(files) > _HOLD_QUEUE_LIMIT
+    return {"count": min(len(files), _HOLD_QUEUE_LIMIT), "truncated": truncated, "files": files[:_HOLD_QUEUE_LIMIT]}
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────

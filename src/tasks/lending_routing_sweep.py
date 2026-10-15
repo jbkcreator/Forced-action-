@@ -70,7 +70,7 @@ def sweep(db: Session) -> None:
         text(
             "SELECT lead_id, loan_file_id FROM lending.file_routing"
             " WHERE status = 'unrouted'"
-            " ORDER BY created_at"
+            " ORDER BY updated_at, id"
             " LIMIT :batch"
             " FOR UPDATE SKIP LOCKED"
         ),
@@ -93,6 +93,14 @@ def sweep(db: Session) -> None:
                     "lending_routing_sweep: routing failed lead_id=%s loan_file_id=%s",
                     row["lead_id"], row["loan_file_id"],
                 )
+                # Move a file that keeps failing to the back of the queue, so it cannot starve the healthy ones.
+                db.execute(
+                    text("UPDATE lending.file_routing SET updated_at = clock_timestamp()"
+                         " WHERE (lead_id IS NOT NULL AND lead_id = :lead)"
+                         "    OR (loan_file_id IS NOT NULL AND loan_file_id = :file)"),
+                    {"lead": row["lead_id"], "file": row["loan_file_id"]},
+                )
+                db.commit()
 
     posted = retry_unposted_events(db)
     if posted:

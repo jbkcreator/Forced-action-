@@ -72,10 +72,18 @@ SEED_DECLINE_REASONS: list[tuple[str, str]] = [
     ("other", "Other (see free text)"),
 ]
 
-# Placeholder codes seeded before Josh supplied his enum. The migration switches these off (never deletes them,
-# so any event that used one still reads correctly); codes added later through the API are left alone.
-LEGACY_PLACEHOLDER_REASONS: tuple[str, ...] = (
-    "unspecified", "ltv", "credit", "experience", "product", "geography", "amount", "cap_exceeded",
+# Placeholder codes seeded before Josh supplied his enum, with the exact label each was seeded with. The
+# migration switches off a row only while it still carries that placeholder label (never deletes it, so any
+# event that used one still reads correctly); a code someone has since re-labelled or added is left alone.
+LEGACY_PLACEHOLDER_REASONS: tuple[tuple[str, str], ...] = (
+    ("unspecified", "Not specified"),
+    ("ltv", "LTV out of range"),
+    ("credit", "Credit too low"),
+    ("experience", "Insufficient borrower experience"),
+    ("product", "Product mismatch"),
+    ("geography", "Property outside footprint"),
+    ("amount", "Loan amount out of range"),
+    ("cap_exceeded", "Monthly cap reached"),
 )
 
 # Routing engine: maximum qualifying lenders evaluated per file per run.

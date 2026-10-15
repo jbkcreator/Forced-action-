@@ -71,16 +71,17 @@ class FileProfile:
 
     Q6 (open): loan_amount uses the band minimum from lendingflow_leads.loan_amount.
     Josh to confirm whether min or max should be used for threshold checks.
+
+    An unknown credit band or experience count (None) means that check is not applied, in line with
+    "possible, confirm on the call": the router recommends a lender and Josh submits manually.  A box's
+    max_ltv / max_ltc are not applied here either, because the file facts carry no ARV, price or rehab figures.
     """
 
-    loan_type: str               # LoanType value, e.g. 'fix_and_flip'
+    loan_type: str               # LoanType value, e.g. 'FIX_AND_FLIP'
     loan_amount: int             # USD, band minimum (Q6)
     state: str                   # 2-letter USPS code
     credit_band_min_fico: Optional[int] = None
     completed_projects: Optional[int] = None
-    arv: Optional[int] = None
-    purchase_price: Optional[int] = None
-    rehab_budget: Optional[int] = None
 
 
 # ── T-05 rule values -> boxes ─────────────────────────────────────────────

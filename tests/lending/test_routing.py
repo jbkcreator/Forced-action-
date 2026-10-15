@@ -1072,8 +1072,8 @@ def test_rerunning_the_migration_retires_old_placeholders_but_keeps_codes_added_
 
     conn = rdb.get_bind()
     conn.execute(text("INSERT INTO lending.decline_reason_codes (code, label, active) VALUES"
-                      " ('unspecified', 'old placeholder', TRUE), ('appraisal_low', 'added by Josh later', TRUE)"
-                      " ON CONFLICT (code) DO UPDATE SET active = TRUE"))
+                      " ('unspecified', 'Not specified', TRUE), ('appraisal_low', 'added by Josh later', TRUE)"
+                      " ON CONFLICT (code) DO UPDATE SET label = EXCLUDED.label, active = TRUE"))
     apply_to(conn)
     state = {r["code"]: r["active"] for r in rdb.execute(text(
         "SELECT code, active FROM lending.decline_reason_codes WHERE code IN ('unspecified', 'appraisal_low', 'other')"
@@ -1413,3 +1413,358 @@ def test_a_file_has_exactly_one_key_and_the_event_log_stays_append_only(rdb):
         with rdb.begin_nested():
             rdb.execute(text("UPDATE lending.file_routing_events SET loan_file_id = NULL, lead_id = :l"
                              " WHERE loan_file_id = :f"), {"l": lead, "f": fid})
+
+
+# ── Code-review follow-ups ────────────────────────────────────────────────────
+
+def test_ground_up_above_the_minimum_goes_to_overflow_after_the_primary_declines(rdb):
+    """The decline cascade must not dead-end a large ground-up file at 'exhausted' while ground-up lenders remain."""
+    from src.lending.routing.decline import record_decline
+
+    primary = _add_lender(rdb, name="Big Primary", is_primary=True, priority=1, construction_min_amount=500_000)
+    _add_box(rdb, primary, loan_types=[LOAN_TYPE_GU])
+    overflow = _add_lender(rdb, name="GU Overflow", priority=2, takes_ground_up=True)
+    _add_box(rdb, overflow, loan_types=[LOAN_TYPE_GU])
+    lead = _make_lead(rdb, loan_type=LOAN_TYPE_GU, loan_amount=800_000, phone_suffix="5001")
+    _route(rdb, lead)
+    assert _fr(rdb, lead)["current_lender_name"] == "Big Primary"
+
+    record_decline(_routed_event_id(rdb, lead), reason_code="ltv_over_max", actor="josh", db=rdb)
+    assert _fr(rdb, lead)["current_lender_name"] == "GU Overflow"  # not "exhausted"
+
+
+def test_the_ground_up_minimum_is_inclusive_at_exactly_500000(rdb):
+    primary = _add_lender(rdb, name="Edge Primary", is_primary=True, priority=1, construction_min_amount=500_000)
+    _add_box(rdb, primary, loan_types=[LOAN_TYPE_GU])
+    overflow = _add_lender(rdb, name="Edge Overflow", priority=2, takes_ground_up=True)
+    _add_box(rdb, overflow, loan_types=[LOAN_TYPE_GU])
+    at_minimum = _make_lead(rdb, loan_type=LOAN_TYPE_GU, loan_amount=500_000, phone_suffix="5011")
+    one_below = _make_lead(rdb, loan_type=LOAN_TYPE_GU, loan_amount=499_999, phone_suffix="5012")
+    _route(rdb, at_minimum)
+    _route(rdb, one_below)
+    assert _fr(rdb, at_minimum)["current_lender_name"] == "Edge Primary"
+    assert _fr(rdb, one_below)["current_lender_name"] == "Edge Overflow"
+
+
+def test_the_seat_is_open_one_below_the_cap_and_closes_at_it(rdb):
+    from src.lending.routing.outcome import record_outcome
+
+    primary = _add_lender(rdb, name="Two Seats", is_primary=True, priority=1, monthly_cap=2)
+    _add_box(rdb, primary, loan_types=[LOAN_TYPE_FLIP])
+    overflow = _add_lender(rdb, name="Spill", priority=2)
+    _add_box(rdb, overflow, loan_types=[LOAN_TYPE_FLIP])
+    leads = [_make_lead(rdb, phone_suffix=f"502{i}") for i in range(3)]
+    _route(rdb, leads[0])
+    record_outcome(leads[0], action="funded", actor="josh", db=rdb)  # 1 funded of 2
+    _route(rdb, leads[1])
+    assert _fr(rdb, leads[1])["current_lender_name"] == "Two Seats"  # one below the cap: still open
+    record_outcome(leads[1], action="funded", actor="josh", db=rdb)  # 2 funded of 2
+    _route(rdb, leads[2])
+    assert _fr(rdb, leads[2])["current_lender_name"] == "Spill"
+
+
+def test_the_seat_count_resets_on_the_first_of_the_month_in_eastern_time_not_utc(rdb, monkeypatch):
+    """23:59:59 on 31 October Eastern is already 1 November in UTC; the month (and DST edge) must follow Eastern."""
+    from zoneinfo import ZoneInfo
+
+    from src.lending.routing import seat
+
+    class Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 11, 15, 12, 0, tzinfo=ZoneInfo("America/New_York")).astimezone(tz)
+
+    monkeypatch.setattr(seat, "datetime", Frozen)
+    primary = _add_lender(rdb, name="Monthly", is_primary=True, priority=1, monthly_cap=1)
+    _add_box(rdb, primary, loan_types=[LOAN_TYPE_FLIP])
+    overflow = _add_lender(rdb, name="Next Month Spill", priority=2)
+    _add_box(rdb, overflow, loan_types=[LOAN_TYPE_FLIP])
+    holder = _make_lead(rdb, phone_suffix="5031")
+
+    def funded_at(moment: datetime) -> None:
+        rdb.execute(
+            text("INSERT INTO lending.file_routing_events (lead_id, lender_id, lender_name, action, created_at)"
+                 " VALUES (:l, :lid, 'Monthly', 'funded', :ts)"),
+            {"l": holder, "lid": primary, "ts": moment},
+        )
+        rdb.commit()
+
+    # 3:59:59 UTC on 1 November is 23:59:59 EDT on 31 October: October, so it does not count in November.
+    funded_at(datetime(2026, 11, 1, 3, 59, 59, tzinfo=timezone.utc))
+    first = _make_lead(rdb, phone_suffix="5032")
+    _route(rdb, first)
+    assert _fr(rdb, first)["current_lender_name"] == "Monthly"
+
+    # 4:00:00 UTC on 1 November is 00:00:00 EDT, the very first second of November: it counts.
+    funded_at(datetime(2026, 11, 1, 4, 0, 0, tzinfo=timezone.utc))
+    second = _make_lead(rdb, phone_suffix="5033")
+    _route(rdb, second)
+    assert _fr(rdb, second)["current_lender_name"] == "Next Month Spill"
+
+
+def test_a_route_and_a_decline_post_to_slack_at_once_and_a_slack_failure_never_blocks_routing(
+        rdb, fake_slack, monkeypatch):
+    from src.lending.routing.decline import record_decline
+
+    _two_flip_lenders(rdb)
+    lead = _make_lead(rdb, phone_suffix="5201", last_name="Slackname")
+    _route(rdb, lead)
+    assert len(fake_slack.sent) == 1 and "Routed" in fake_slack.sent[0] and "Slackname" in fake_slack.sent[0]
+    posted = rdb.execute(text("SELECT slack_posted_at FROM lending.file_routing_events WHERE lead_id = :l"),
+                         {"l": lead}).scalar()
+    assert posted is not None  # marked posted at the moment it was sent, not only by the retry
+
+    record_decline(_routed_event_id(rdb, lead), reason_code="ltv_over_max", actor="josh", db=rdb)
+    assert any("Declined" in m for m in fake_slack.sent) and len(fake_slack.sent) == 3  # route, decline, re-route
+
+    class SlackDown:
+        def chat_postMessage(self, **kwargs):  # noqa: N802 - slack_sdk API name
+            raise RuntimeError("slack is down")
+
+    monkeypatch.setattr("src.lending.routing.notify._client", lambda: SlackDown())
+    other = _make_lead(rdb, phone_suffix="5202")
+    _route(rdb, other)
+    assert _fr(rdb, other)["status"] == "routed"  # the committed decision stands
+    assert rdb.execute(text("SELECT slack_posted_at FROM lending.file_routing_events WHERE lead_id = :l"),
+                       {"l": other}).scalar() is None  # left for the retry
+    assert rdb.execute(text("SELECT 1")).scalar() == 1  # and the session is still usable
+
+
+def test_a_held_file_is_routed_after_a_lender_is_signed_once_it_is_sent_back(rdb, api):
+    lender = _add_lender(rdb, name="Signs Later", priority=1, agreement_status="pending")
+    _add_box(rdb, lender, loan_types=[LOAN_TYPE_FLIP])
+    lead = _make_lead(rdb, phone_suffix="5301")
+    _route(rdb, lead)
+    assert _fr(rdb, lead)["hold_reason"] == "no_match"
+    _route(rdb, lead)
+    assert _fr(rdb, lead)["status"] == "held"  # a held file stays held on its own
+
+    rdb.execute(text("UPDATE lending.lender_routing_rules SET agreement_status = 'signed' WHERE id = :i"), {"i": lender})
+    rdb.commit()
+    assert api.post(f"/api/lending/routing/files/{lead}/requeue").status_code == 200
+    assert _fr(rdb, lead)["current_lender_name"] == "Signs Later"
+    assert api.post(f"/api/lending/routing/files/{lead}/requeue").status_code == 422  # no longer held
+
+
+def test_the_whole_no_match_backlog_is_reopened_and_the_sweep_routes_it(rdb, api):
+    from src.tasks.lending_routing_sweep import sweep
+
+    lender = _add_lender(rdb, name="Backlog Lender", priority=1, agreement_status="pending")
+    _add_box(rdb, lender, loan_types=[LOAN_TYPE_FLIP])
+    leads = [_make_lead(rdb, phone_suffix=f"530{i}") for i in range(2, 5)]
+    for lead in leads:
+        _route(rdb, lead)
+    rdb.execute(text("UPDATE lending.lender_routing_rules SET agreement_status = 'signed' WHERE id = :i"), {"i": lender})
+    rdb.commit()
+
+    reopened = api.post("/api/lending/routing/hold-queue/requeue", json={"reason": "no_match"}).json()
+    assert reopened["reopened"] == 3
+    assert api.post("/api/lending/routing/hold-queue/requeue", json={"reason": "bogus"}).status_code == 422
+    sweep(rdb)
+    assert all(_fr(rdb, lead)["current_lender_name"] == "Backlog Lender" for lead in leads)
+
+
+def test_a_requeued_exhausted_file_skips_lenders_that_already_declined_and_tries_a_new_one(rdb, api):
+    from src.lending.routing.decline import record_decline
+
+    a, b = _two_flip_lenders(rdb)
+    lead = _make_lead(rdb, phone_suffix="5401")
+    _route(rdb, lead)
+    record_decline(_routed_event_id(rdb, lead), reason_code="ltv_over_max", actor="josh", db=rdb)
+    record_decline(_routed_event_id(rdb, lead), reason_code="ltv_over_max", actor="josh", db=rdb)
+    assert _fr(rdb, lead)["status"] == "exhausted"
+
+    new = _add_lender(rdb, name="Third Option", priority=3)
+    _add_box(rdb, new, loan_types=[LOAN_TYPE_FLIP])
+    assert api.post(f"/api/lending/routing/files/{lead}/requeue").status_code == 200
+    assert _fr(rdb, lead)["current_lender_name"] == "Third Option"  # never Alpha or Beta again
+
+
+def test_a_held_partner_file_is_sent_back_the_same_way_and_the_partner_hears_of_it(rdb, api, partner_mail):
+    from src.lending.routing.router import route_loan_file
+
+    lender = _add_lender(rdb, name="Partner Signs Later", priority=1, agreement_status="pending")
+    _add_box(rdb, lender, loan_types=[LOAN_TYPE_FLIP])
+    fid = _make_partner_file(rdb, _make_partner(rdb))
+    route_loan_file(fid, rdb)
+    assert _pfr(rdb, fid)["status"] == "held" and partner_mail == []
+
+    rdb.execute(text("UPDATE lending.lender_routing_rules SET agreement_status = 'signed' WHERE id = :i"), {"i": lender})
+    rdb.commit()
+    assert api.post(f"/api/lending/routing/files/{fid}/requeue", params={"source": "partner"}).status_code == 200
+    assert _pfr(rdb, fid)["current_lender_name"] == "Partner Signs Later"
+    assert _file_status(rdb, fid)[0] == "routed" and len(partner_mail) == 1
+
+
+def test_a_file_that_keeps_failing_is_moved_back_so_healthy_files_still_get_routed(rdb, monkeypatch):
+    import config.lending_routing as routing_config
+    from src.lending.routing import router
+    from src.tasks.lending_routing_sweep import sweep
+
+    _two_flip_lenders(rdb)
+    poison = _make_lead(rdb, phone_suffix="5601")
+    healthy = _make_lead(rdb, phone_suffix="5602")
+    for lead in (poison, healthy):
+        rdb.execute(text("INSERT INTO lending.file_routing (lead_id, status) VALUES (:l, 'unrouted')"), {"l": lead})
+        rdb.commit()
+    real_route = router.route_file
+
+    def flaky(lead_id, db):
+        if lead_id == poison:
+            raise RuntimeError("cannot route this one")
+        return real_route(lead_id, db)
+
+    monkeypatch.setattr(router, "route_file", flaky)
+    monkeypatch.setattr(routing_config, "SWEEP_BATCH_SIZE", 1)
+    sweep(rdb)  # the oldest file is the poisoned one: it fails and goes to the back
+    assert _fr(rdb, poison)["status"] == "unrouted" and _fr(rdb, healthy)["status"] == "unrouted"
+    sweep(rdb)  # the healthy file is now first
+    assert _fr(rdb, healthy)["status"] == "routed"
+
+
+def test_slack_retry_still_works_when_the_partner_door_table_is_not_installed(rdb, fake_slack):
+    from src.lending.routing.notify import retry_unposted_events
+
+    _two_flip_lenders(rdb)
+    lead = _make_lead(rdb, phone_suffix="5701", last_name="Retry")
+    _route(rdb, lead)
+    rdb.execute(text("UPDATE lending.file_routing_events SET slack_ts = NULL, slack_posted_at = NULL"))
+    rdb.execute(text("DROP TABLE lending.loan_files CASCADE"))  # inside the test's rolled-back transaction
+    fake_slack.sent.clear()
+    assert retry_unposted_events(rdb) == 1 and "Routed" in fake_slack.sent[0]
+
+
+def test_the_real_partner_status_sync_ignores_leads_and_never_raises(rdb, monkeypatch, caplog):
+    from src.lending import partner_pipeline
+    from src.lending.routing import partner_link
+    from src.lending.routing.file_key import lead_key, loan_file_key
+
+    calls: list = []
+    monkeypatch.setattr(partner_pipeline, "change_status", lambda *args, **kwargs: calls.append(args))
+    partner_link.mirror_status(lead_key(5), "routed")
+    assert calls == []  # a LendingFlow lead has no partner
+    partner_link.mirror_status(loan_file_key(5), "routed", None)
+    assert calls == [(5, "routed", None)]
+
+    def down(*args, **kwargs):
+        raise RuntimeError("database down")
+
+    monkeypatch.setattr(partner_pipeline, "change_status", down)
+    partner_link.mirror_status(loan_file_key(5), "declined", "ltv_over_max")  # must not raise
+    assert "partner status sync failed" in caplog.text and "ltv_over_max" not in caplog.text
+
+
+def test_admin_inputs_that_would_overflow_or_mean_nothing_are_refused_with_422_not_500(api):
+    base = "/api/lending/routing"
+    for body in (
+        {"name": "x", "priority": 1, "points_paid_to_broker": 10},
+        {"name": "x", "priority": 0},
+        {"name": "x", "priority": 1_000_000},
+        {"name": "   ", "priority": 1},
+        {"name": "y" * 101, "priority": 1},
+        {"name": "x", "priority": 1, "monthly_cap": -1},
+    ):
+        assert api.post(f"{base}/lenders", json=body).status_code == 422, body
+    lender = api.post(f"{base}/lenders", json={"name": "Valid", "priority": 1}).json()["id"]
+    for box in (
+        {"loan_types": ["FIX_AND_FLIP"], "max_ltv": 10},
+        {"loan_types": ["FIX_AND_FLIP"], "min_loan_amount": 9, "max_loan_amount": 1},
+        {"loan_types": ["FIX_AND_FLIP"], "approved_states": ["Florida"]},
+        {"loan_types": ["FIX_AND_FLIP"], "credit_floor": 901},
+    ):
+        assert api.post(f"{base}/lenders/{lender}/boxes", json=box).status_code == 422, box
+    made = api.post(f"{base}/lenders/{lender}/boxes", json={"loan_types": ["fix_and_flip"], "approved_states": ["fl", "ga"]})
+    assert made.status_code == 201
+    assert api.get(f"{base}/lenders/{lender}/boxes").json()[0]["approved_states"] == ["FL", "GA"]
+
+    assert api.post(f"{base}/decline-reasons", json={"code": "x" * 51, "label": "too long"}).status_code == 422
+    assert api.post(f"{base}/decline-reasons", json={"code": "Has Space", "label": "bad code"}).status_code == 422
+    assert api.post(f"{base}/decline-reasons", json={"code": "other", "label": "x", "active": False}).status_code == 422
+    assert api.post(f"{base}/events/1/decline", json={"actor": "a" * 101}).status_code == 422
+    assert api.get(f"{base}/files/99999999999").status_code == 422  # out of the id range, not a database error
+    assert api.patch(f"{base}/lenders/99999999999", json={"active": False}).status_code == 422
+
+
+def test_file_search_treats_blank_as_no_filter_and_percent_and_underscore_as_text(rdb, api):
+    smith = _make_lead(rdb, phone_suffix="5801", last_name="Smith")
+    odd = _make_lead(rdb, phone_suffix="5802", last_name="Sm_th")
+    _route(rdb, smith)
+    _route(rdb, odd)  # no lenders: both are held, which is enough to list them
+    files = lambda **params: {f["file_id"] for f in api.get("/api/lending/routing/files", params=params).json()["files"]}  # noqa: E731
+    assert files(q="") == {smith, odd}  # a blank search is no filter
+    assert files(q="Sm_th") == {odd}  # "_" is not a wildcard
+    assert files(q="%") == set()  # "%" is not a wildcard
+
+
+def test_the_hold_queue_says_when_it_is_cut_off(rdb, api, monkeypatch):
+    monkeypatch.setattr("src.lending.routing.admin_api._HOLD_QUEUE_LIMIT", 2)
+    for i in range(3):
+        _route(rdb, _make_lead(rdb, phone_suffix=f"590{i}"))
+    queue = api.get("/api/lending/routing/hold-queue").json()
+    assert queue["truncated"] is True and queue["count"] == 2 and len(queue["files"]) == 2
+
+
+def test_make_primary_refuses_a_paused_lender_and_conflicts_say_which_rule_was_broken(rdb, api):
+    from sqlalchemy.exc import IntegrityError
+
+    from src.lending.routing.admin_api import _conflict
+
+    paused = _add_lender(rdb, name="Paused One", priority=1, active=False)
+    assert api.post(f"/api/lending/routing/lenders/{paused}/make-primary").status_code == 422
+
+    class _Diag:
+        def __init__(self, name):
+            self.constraint_name = name
+
+    class _Orig(Exception):
+        def __init__(self, name):
+            super().__init__("clash")
+            self.diag = _Diag(name)
+
+    primary_clash = _conflict(IntegrityError("stmt", {}, _Orig("uq_lender_routing_rules_primary")))
+    priority_clash = _conflict(IntegrityError("stmt", {}, _Orig("uq_lender_routing_rules_priority")))
+    assert primary_clash.status_code == 409 and "primary" in primary_clash.detail
+    assert priority_clash.status_code == 409 and "priority" in priority_clash.detail
+
+
+def test_api_errors_do_not_expose_table_or_column_names(api):
+    base = "/api/lending/routing"
+    for response in (
+        api.post(f"{base}/events/999999/decline", json={}),
+        api.post(f"{base}/files/999999/decline", json={}),
+        api.post(f"{base}/files/999999/outcome", json={"action": "funded"}),
+    ):
+        assert response.status_code == 422
+        detail = response.json()["detail"]
+        assert not any(word in detail for word in ("file_routing", "lead_id", "loan_file_id", "lendingflow", "lending."))
+
+
+def test_the_migration_retires_untouched_placeholder_reasons_but_never_one_someone_relabelled(rdb):
+    from migrations.apply_lending_lender_routing import apply_to
+
+    conn = rdb.get_bind()
+    conn.execute(text(
+        "INSERT INTO lending.decline_reason_codes (code, label, active) VALUES"
+        " ('unspecified', 'Not specified', TRUE), ('credit', 'Our own credit wording', TRUE),"
+        " ('appraisal_low', 'added by Josh later', TRUE)"
+        " ON CONFLICT (code) DO UPDATE SET label = EXCLUDED.label, active = TRUE"))
+    apply_to(conn)
+    state = {r["code"]: r["active"] for r in rdb.execute(text(
+        "SELECT code, active FROM lending.decline_reason_codes"
+        " WHERE code IN ('unspecified', 'credit', 'appraisal_low', 'other')")).mappings()}
+    assert state == {"unspecified": False, "credit": True, "appraisal_low": True, "other": True}
+    apply_to(conn)  # and a second run changes nothing
+    assert {r["code"]: r["active"] for r in rdb.execute(text(
+        "SELECT code, active FROM lending.decline_reason_codes"
+        " WHERE code IN ('unspecified', 'credit', 'appraisal_low', 'other')")).mappings()} == state
+
+
+def test_reseeding_never_adds_a_duplicate_of_a_renamed_lender(rdb):
+    from migrations.apply_lending_lender_routing_seed import apply_to as seed
+
+    conn = rdb.get_bind()
+    assert seed(conn) == 5
+    rdb.execute(text("UPDATE lending.lender_routing_rules SET name = 'Renamed Primary' WHERE is_primary"))
+    rdb.commit()
+    assert seed(conn) == 0
+    assert rdb.execute(text("SELECT COUNT(*) FROM lending.lender_routing_rules")).scalar() == 5

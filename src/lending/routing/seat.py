@@ -5,9 +5,13 @@ Default is 'funded' (``config.lending_routing.SEAT_CAP_COUNTED_ACTION``).
 
 The count is derived live from ``file_routing_events`` for the current
 Eastern calendar month, so no reset job is needed and the count survives
-restarts.  The cap check runs under a SELECT FOR UPDATE SKIP LOCKED on the
-primary lender's routing row (via the caller's locking in router.py), so
-concurrent routing runs never double-count.
+restarts.
+
+Concurrency: the check is a plain count with no lock.  With the default ``funded``
+counting that is safe, because routing never writes ``funded`` events.  If Q1 is
+answered "routed", two files routed at the same moment could both see the seat
+free and overshoot the cap by one; add a lock on the primary lender row before
+switching the counted action.
 """
 from __future__ import annotations
 

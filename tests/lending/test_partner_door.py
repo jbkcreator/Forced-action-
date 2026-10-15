@@ -587,3 +587,19 @@ def test_money_parses_to_whole_dollars() -> None:
     data = partners.SubmissionInput.model_validate({k: v for k, v in FORM.items() if k != "consent"})
     assert data.purchase_price == 180000 and isinstance(data.loan_amount, int)
     assert Decimal(data.loan_amount) == Decimal(200000)
+
+
+def test_a_router_crash_does_not_stop_the_confirmation_and_josh_note(engine, session_factory, tmp_path, monkeypatch) -> None:
+    _, token = _partner(session_factory)
+    file_id = _submit(session_factory, token)
+
+    def crash(*args, **kwargs):
+        raise RuntimeError("router down")
+
+    monkeypatch.setattr(partner_pipeline, "route_file", crash)
+    recorder = Recorder()
+    partner_pipeline.process_new_file(file_id, _services(recorder, tmp_path), session_factory)
+
+    file = _rows(engine, "loan_files")[0]
+    assert file["status"] == "received" and '"fitting"' in file["lender_fit"]  # scoring kept; the sweep heals the status
+    assert len(recorder.slack) == 1 and len(recorder.emails) == 1

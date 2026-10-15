@@ -49,11 +49,9 @@ def record_outcome(
         {"id": key.id},
     ).mappings().one_or_none()
     if routing is None:
-        raise ValueError(f"no routing row for {key.column}={key.id}")
+        raise ValueError("no routing record for this file")
     if routing["status"] != "routed" or routing["current_lender_id"] is None:
-        raise ValueError(
-            f"{key.column}={key.id} is {routing['status']!r}, not routed to a lender; cannot record {action}"
-        )
+        raise ValueError(f"the file is {routing['status']!r}, not routed to a lender; cannot record {action}")
 
     already = db.execute(
         text(

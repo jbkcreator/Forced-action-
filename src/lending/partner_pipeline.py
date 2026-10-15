@@ -285,7 +285,14 @@ def _process(file_id: int, services: PipelineServices, session_factory: Callable
                  "WHERE id = :id"),
             {"fit": fit.model_dump_json() if fit is not None else None, "pdf": pdf_path, "now": now, "id": file_id},
         )
-        route_file(db, file_id, now=now)
+        db.commit()  # keep the score and PDF even if routing fails below
+        try:
+            route_file(db, file_id, now=now)
+        except Exception as exc:
+            # The file stays 'received', so the Partner Door sweep tries it again; the partner and Josh are
+            # still told it arrived.
+            db.rollback()
+            logger.error("[partner-door] routing failed file=%s (%s)", file_id, type(exc).__name__)
 
     if partner is None:
         return

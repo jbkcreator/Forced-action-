@@ -106,6 +106,7 @@ def _post(message: str, event_id: int, db: Session, *, what: str, lead_id) -> No
         resp = client.chat_postMessage(channel=channel, text=message)
         _mark_posted(event_id, resp["ts"], db)
     except Exception:
+        db.rollback()  # a failed bookkeeping write must not leave the caller's session aborted
         logger.exception("notify.%s lead_id=%s event_id=%d — will retry", what, lead_id, event_id)
 
 
@@ -172,12 +173,18 @@ def retry_unposted_events(db: Session) -> int:
     if not client or not channel:
         return 0
 
+    # The Partner Door table may not be installed yet; the three fragments below are fixed literals.
+    partner = db.execute(text("SELECT to_regclass('lending.loan_files') IS NOT NULL")).scalar() is True
+    last_name_sql = "COALESCE(ll.last_name, lf.borrower_last_name)" if partner else "ll.last_name"
+    product_sql = "lf.product" if partner else "CAST(NULL AS text)"
+    amount_sql = "COALESCE(ll.loan_amount, lf.loan_amount)" if partner else "ll.loan_amount"
+    partner_join = "  LEFT JOIN lending.loan_files lf ON lf.id = fre.loan_file_id" if partner else ""
     rows = db.execute(
         text(
             "SELECT fre.id, fre.lead_id, fre.loan_file_id, fre.lender_name, fre.action, fre.reason_code,"
-            "       COALESCE(ll.last_name, lf.borrower_last_name) AS last_name,"
-            "       ll.loan_type, lf.product,"
-            "       COALESCE(ll.loan_amount, lf.loan_amount) AS loan_amount,"
+            f"       {last_name_sql} AS last_name,"
+            f"       ll.loan_type, {product_sql} AS product,"
+            f"       {amount_sql} AS loan_amount,"
             "       (SELECT COUNT(*) FROM lending.file_routing_events r"
             "         WHERE r.action = 'routed' AND r.id <= fre.id"
             "           AND ((fre.lead_id IS NOT NULL AND r.lead_id = fre.lead_id)"
@@ -185,7 +192,7 @@ def retry_unposted_events(db: Session) -> int:
             "       fr.hold_reason"
             "  FROM lending.file_routing_events fre"
             "  LEFT JOIN lending.lendingflow_leads ll ON ll.id = fre.lead_id"
-            "  LEFT JOIN lending.loan_files lf ON lf.id = fre.loan_file_id"
+            f"{partner_join}"
             "  LEFT JOIN lending.file_routing fr"
             "    ON (fre.lead_id IS NOT NULL AND fr.lead_id = fre.lead_id)"
             "    OR (fre.loan_file_id IS NOT NULL AND fr.loan_file_id = fre.loan_file_id)"
@@ -216,6 +223,7 @@ def retry_unposted_events(db: Session) -> int:
             _mark_posted(row["id"], resp["ts"], db)
             posted += 1
         except Exception:
+            db.rollback()  # keep the session usable for the rest of the batch
             logger.exception("retry_unposted_events event_id=%d — will retry again", row["id"])
 
     if posted:

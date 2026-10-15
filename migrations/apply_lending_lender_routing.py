@@ -8,6 +8,9 @@ Tables added:
   lending.decline_reason_codes   - Josh's decline reason enum, stored as data
 
 Run:  PYTHONPATH=. python migrations/apply_lending_lender_routing.py
+Run it after apply_lending_lendingflow.py and apply_lending_partner_door.py (a partner file is routed through
+``loan_file_id``).  If it runs before the Partner Door migration the tables are still created, without the
+foreign keys to lending.loan_files; run it again afterwards to add them.
 
 Idempotent: every statement uses IF NOT EXISTS or IF column/constraint/trigger
 does not already exist.  Safe to re-run against a live database.
@@ -281,11 +284,19 @@ def apply_to(conn) -> None:
             ),
             {"code": code, "label": label},
         )
-    # Switch off only the placeholders seeded before Josh's enum arrived; codes added later are never touched.
-    conn.execute(
-        text("UPDATE lending.decline_reason_codes SET active = FALSE WHERE code = ANY(:old) AND active"),
-        {"old": list(LEGACY_PLACEHOLDER_REASONS)},
-    )
+    # Switch off a placeholder seeded before Josh's enum arrived, but only while it still has its placeholder
+    # label: a code someone has since re-labelled or re-added is theirs, and a re-run never undoes that.
+    for code, label in LEGACY_PLACEHOLDER_REASONS:
+        conn.execute(
+            text("UPDATE lending.decline_reason_codes SET active = FALSE"
+                 " WHERE code = :code AND label = :label AND active"),
+            {"code": code, "label": label},
+        )
+    if conn.execute(text("SELECT to_regclass('lending.loan_files')")).scalar() is None:
+        log.warning(
+            "lending.loan_files does not exist yet, so the routing tables have no foreign key to it. "
+            "Run apply_lending_partner_door.py, then run this script again to add them."
+        )
 
 
 def main() -> None:

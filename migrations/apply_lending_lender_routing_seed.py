@@ -60,12 +60,19 @@ def apply_to(conn) -> int:
     Does not commit; the caller is responsible.
     """
     existing = set(conn.execute(text("SELECT name FROM lending.lender_routing_rules")).scalars().all())
+    claimed_keys = {
+        key
+        for keys in conn.execute(text("SELECT rule_keys FROM lending.lender_routing_rules WHERE rule_keys IS NOT NULL")).scalars()
+        for key in keys
+    }
     priority = conn.execute(text("SELECT COALESCE(MAX(priority), 0) FROM lending.lender_routing_rules")).scalar()
     has_primary = bool(conn.execute(text("SELECT 1 FROM lending.lender_routing_rules WHERE is_primary LIMIT 1")).scalar())
 
     inserted = 0
     for name, rows in _lenders().items():
-        if name in existing:
+        # Skip a lender that already exists by name, or whose T-05 keys another row already uses (it was renamed):
+        # re-seeding must never add an unsigned duplicate of a lender Josh already manages.
+        if name in existing or claimed_keys & {r.key for r in rows}:
             continue
         priority += 1
         is_primary = (name == PRIMARY_DISPLAY_NAME) and not has_primary

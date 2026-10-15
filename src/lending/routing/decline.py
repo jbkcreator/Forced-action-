@@ -64,11 +64,9 @@ def record_decline(
     ).mappings().one_or_none()
 
     if event is None:
-        raise ValueError(f"file_routing_events.id={event_id} not found")
+        raise ValueError("that routing event was not found")
     if event["action"] != "routed":
-        raise ValueError(
-            f"Event {event_id} has action {event['action']!r}; only 'routed' events can be declined"
-        )
+        raise ValueError(f"only a 'routed' event can be declined (this one is {event['action']!r})")
 
     key = key_from_row(event)
 
@@ -84,7 +82,7 @@ def record_decline(
     ).mappings().one_or_none()
 
     if routing is None:
-        raise ValueError(f"file_routing row not found for {key.column}={key.id}")
+        raise ValueError("no routing record for this file")
 
     if routing["status"] in ("held", "exhausted"):
         logger.warning(
