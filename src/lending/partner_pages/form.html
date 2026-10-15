@@ -10,7 +10,7 @@
 </div>
 {% endif %}
 
-<form method="post" action="/api/lending/partners/{{ token }}/files" enctype="multipart/form-data">
+<form id="partner-form" method="post" action="/api/lending/partners/{{ token }}/files" enctype="multipart/form-data">
   <fieldset>
     <legend>Borrower</legend>
     <div class="row">
@@ -54,15 +54,15 @@
     </select>
     <div class="row">
       <div><label for="f-price">Purchase price</label>
-        <input id="f-price" name="purchase_price" inputmode="numeric" placeholder="$" value="{{ values.purchase_price }}"></div>
+        <input id="f-price" name="purchase_price" class="money" inputmode="numeric" placeholder="$" value="{{ values.purchase_price }}"></div>
       <div><label for="f-rehab">Rehab or build budget</label>
-        <input id="f-rehab" name="rehab_budget" inputmode="numeric" placeholder="$" value="{{ values.rehab_budget }}"></div>
+        <input id="f-rehab" name="rehab_budget" class="money" inputmode="numeric" placeholder="$" value="{{ values.rehab_budget }}"></div>
     </div>
     <div class="row">
       <div><label for="f-amount">Loan amount requested</label>
-        <input id="f-amount" name="loan_amount" inputmode="numeric" placeholder="$" value="{{ values.loan_amount }}" required></div>
+        <input id="f-amount" name="loan_amount" class="money" inputmode="numeric" placeholder="$" value="{{ values.loan_amount }}" required></div>
       <div><label for="f-arv">ARV or completed value</label>
-        <input id="f-arv" name="arv" inputmode="numeric" placeholder="$" value="{{ values.arv }}"></div>
+        <input id="f-arv" name="arv" class="money" inputmode="numeric" placeholder="$" value="{{ values.arv }}"></div>
     </div>
     <label for="f-timeline">Timeline</label>
     <select id="f-timeline" name="timeline">
@@ -88,6 +88,24 @@
     </label>
   </fieldset>
 
-  <button type="submit">Submit file</button>
+  <div class="submit-bar"><button type="submit" id="f-submit">Submit file</button></div>
 </form>
+{% endblock %}
+{% block scripts %}
+<script>
+(function () {
+  // Show money as $180,000 while typing; the server strips "$" and "," before validating.
+  var format = function (input) {
+    var digits = input.value.replace(/[^0-9]/g, "");
+    input.value = digits ? "$" + Number(digits).toLocaleString("en-US") : "";
+  };
+  document.querySelectorAll("input.money").forEach(function (input) {
+    format(input);
+    input.addEventListener("input", function () { format(input); });
+  });
+  // One tap, one file: lock the button once the browser accepts the submit.
+  var form = document.getElementById("partner-form"), button = document.getElementById("f-submit");
+  form.addEventListener("submit", function () { button.disabled = true; button.textContent = "Sending…"; });
+})();
+</script>
 {% endblock %}

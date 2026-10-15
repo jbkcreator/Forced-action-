@@ -6,35 +6,72 @@
   <meta name="robots" content="noindex, nofollow">
   <meta name="referrer" content="no-referrer">
   <title>{% block title %}Next Deal Lending · Partner{% endblock %}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..850&display=swap" rel="stylesheet">
   <style>
-    :root { --ink: #1b1f24; --muted: #5b6470; --line: #d9dee4; --accent: #0b5cad; --bad: #b42318; --bg: #f6f7f9; }
+    /* Brand tokens copied from the nextdeallending.com site (forced-action-ui, next-deal-lending-site). */
+    :root { --navy: #15283A; --navy-deep: #0F1F2E; --slate: #2A3E52; --gold: #E8B130; --gold-deep: #C9951C;
+            --green: #2E6A5C; --green-tint: #DCE8E4; --red: #B8472F; --paper: #F2F4F3; --line: #D3DBD8;
+            --mist: #C9D3DC; --field: #8A99A6; --white: #FFFFFF; }
     * { box-sizing: border-box; }
-    body { margin: 0; font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-           color: var(--ink); background: var(--bg); }
-    main { max-width: 640px; margin: 0 auto; padding: 16px; }
-    h1 { font-size: 1.35rem; margin: 8px 0 4px; }
-    p.lead { color: var(--muted); margin: 0 0 16px; }
-    fieldset { border: 1px solid var(--line); border-radius: 10px; background: #fff; margin: 0 0 14px; padding: 12px 14px; }
-    legend { font-weight: 600; padding: 0 4px; }
+    body { margin: 0; font: 16px/1.45 "Archivo", "Helvetica Neue", Helvetica, sans-serif; color: var(--navy);
+           background: var(--paper); -webkit-font-smoothing: antialiased; }
+    header.site { display: flex; align-items: center; padding: 16px; background: var(--navy); color: var(--paper); }
+    .brand { display: flex; align-items: center; gap: 10px; font-size: 21px; font-weight: 850; font-stretch: 72%;
+             white-space: nowrap; color: var(--paper); text-decoration: none; }
+    .brand svg { width: 28px; height: 28px; }
+    main { max-width: 640px; margin: 0 auto; padding: 16px 16px 96px; }
+    h1 { font-size: 1.5rem; font-weight: 800; font-stretch: 85%; margin: 12px 0 4px; }
+    p.lead { color: var(--slate); margin: 0 0 16px; }
+    fieldset { border: 1px solid var(--line); border-radius: 6px; background: var(--white); margin: 0 0 14px; padding: 12px 14px; }
+    legend { font-weight: 750; padding: 0 4px; }
     label { display: block; font-size: .92rem; margin: 10px 0 4px; }
-    input, select, textarea { width: 100%; font: inherit; padding: 10px; border: 1px solid var(--line);
-                              border-radius: 8px; background: #fff; }
+    input, select, textarea { width: 100%; font: inherit; color: var(--navy); padding: 12px 10px; border: 1px solid var(--line);
+                              border-radius: 4px; background: var(--white); }
+    input:focus, select:focus, textarea:focus { outline: 2px solid var(--gold); border-color: var(--gold); }
     textarea { min-height: 84px; }
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }
     .consent { display: flex; gap: 10px; align-items: flex-start; font-size: .9rem; }
     .consent input { width: auto; margin-top: 4px; }
-    .hint { color: var(--muted); font-size: .85rem; }
-    .errors { background: #fdecea; color: var(--bad); border-radius: 8px; padding: 10px 14px; margin-bottom: 14px; }
-    button { width: 100%; font: inherit; font-weight: 600; padding: 14px; border: 0; border-radius: 10px;
-             background: var(--accent); color: #fff; }
+    .hint { color: var(--field); font-size: .85rem; }
+    .errors { background: #F6E3DE; color: var(--red); border-radius: 4px; padding: 10px 14px; margin-bottom: 14px; }
+    .submit-bar { position: sticky; bottom: 0; padding: 12px 0; background: linear-gradient(transparent, var(--paper) 30%); }
+    button { width: 100%; min-height: 56px; font: inherit; font-size: 18px; font-weight: 750; border: 0; border-radius: 4px;
+             background: var(--gold); color: var(--navy); cursor: pointer; }
+    button:disabled { background: var(--mist); color: var(--slate); cursor: wait; }
     .hp { position: absolute; left: -10000px; }
-    table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 10px; overflow: hidden; }
-    th, td { text-align: left; padding: 10px; border-bottom: 1px solid var(--line); font-size: .92rem; }
-    .status { font-weight: 600; text-transform: capitalize; }
-    a { color: var(--accent); }
+    table { width: 100%; border-collapse: collapse; background: var(--white); border-radius: 6px; overflow: hidden; }
+    th, td { text-align: left; padding: 10px; border-bottom: 1px solid var(--line); font-size: .92rem; vertical-align: top; }
+    th { background: var(--navy); color: var(--paper); font-weight: 650; }
+    .badge { display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: .8rem; font-weight: 700;
+             background: var(--terms, #E4E9E7); color: var(--slate); }
+    .badge-routed { background: #DDE7F2; color: var(--navy); }
+    .badge-declined { background: #F6E3DE; color: var(--red); }
+    .badge-approved, .badge-funded { background: var(--green-tint); color: var(--green); }
+    a { color: var(--green); }
+    footer.site { padding: 24px 16px 32px; background: var(--navy); color: var(--mist); font-size: 13px; line-height: 1.6; }
+    footer.site .inner { max-width: 640px; margin: 0 auto; }
+    footer.site a { color: var(--mist); }
+    footer.site .name { color: var(--paper); font-weight: 800; font-size: 16px; }
   </style>
 </head>
 <body>
+  <header class="site">
+    <span class="brand">
+      <svg viewBox="0 0 34 34" fill="none" stroke="#E8B130" stroke-width="3" aria-hidden="true"><path d="M4 26 L14 16 L20 22 L30 8"/><path d="M22 8 L30 8 L30 16"/></svg>
+      Next Deal Lending
+    </span>
+  </header>
   <main>{% block content %}{% endblock %}</main>
+  <footer class="site">
+    <div class="inner">
+      <div class="name">Next Deal Lending · Partner desk</div>
+      <p>Tampa, Florida · <a href="tel:+17274369951">(727) 436-9951</a> · <a href="mailto:hello@nextdeallending.com">hello@nextdeallending.com</a></p>
+      <p>Next Deal Lending is not a lender and does not make loans. Financing is provided by independent capital partners
+        and is subject to their review and approval. Nothing here is an offer or commitment to lend.</p>
+    </div>
+  </footer>
+  {% block scripts %}{% endblock %}
 </body>
 </html>

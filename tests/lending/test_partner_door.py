@@ -287,6 +287,14 @@ def test_dashboard_shows_friendly_status_and_received_page_does_not_promise_emai
         partners.record_status_change(db, _rows(engine, "loan_files")[0]["id"], "declined", "ltv")
     page = client.get(f"/api/lending/partners/{token}/status")
     assert "Declined by a lender, looking at next option" in page.text and ">declined<" not in page.text
+    assert 'class="badge badge-declined"' in page.text
+
+
+def test_form_is_branded_formats_money_and_locks_submit(session_factory, client) -> None:
+    _, token = _partner(session_factory)
+    page = client.get(f"/api/lending/partners/{token}").text
+    assert "Next Deal Lending" in page and "is not a lender" in page
+    assert page.count('class="money"') == 4 and 'id="f-submit"' in page and "button.disabled = true" in page
 
 
 # -- pipeline -------------------------------------------------------------------------------------

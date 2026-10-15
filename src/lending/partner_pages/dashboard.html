@@ -13,7 +13,7 @@
       <td>{{ file.borrower_first_name }} {{ file.borrower_last_name }}<br>
         <span class="hint">{{ file.property_address or "" }} {{ file.property_state }}</span></td>
       <td>{{ products.get(file.product, file.product) }}<br><span class="hint">${{ "{:,}".format(file.loan_amount) }}</span></td>
-      <td class="status">{{ status_labels.get(file.status, "In review") }}</td>
+      <td><span class="badge badge-{{ file.status }}">{{ status_labels.get(file.status, "In review") }}</span></td>
     </tr>
   {% endfor %}
   </tbody>
