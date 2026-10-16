@@ -137,8 +137,8 @@ def build_form_view(lenders: list[dict], boxes: Optional[dict[int, list[str]]] =
                              {"type": "static_select", "action_id": "v", "options": [option(str(l["id"]), _label(l)) for l in lenders[:100]]}))
     blocks += [
         _input("value_b", "Value", _text("a name, signed/pending, a number, yes/no")),
-        _input("label_b", "Label (for a new decline reason)", _text("Appraisal came in low"),
-               hint="Only used by 'Add a decline reason'. Value is its code, like appraisal_low."),
+        _input("label_b", "Label", _text("Appraisal came in low"),
+               hint="Only used by 'Add a decline reason': the wording people will see. Value is its code, like appraisal_low."),
         _input("types_b", "Box: loan types",
                {"type": "multi_static_select", "action_id": "v",
                 "options": [option(m.value, m.value.replace("_", " ").title()) for m in LoanType]},
