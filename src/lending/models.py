@@ -799,6 +799,44 @@ class LendingWebhookFailure(LendingBase):
     )
 
 
+class LendingCoraInboxItem(LendingBase):
+    """One event for Cora to raise with the operator in her main thread before it goes to a team channel.
+
+    Jobs add rows through ``src.lending.cora_inbox.add_to_inbox``; ``(event_type, dedup_key)`` is unique so a
+    retried job never raises the same event twice. ``status``: new -> surfaced (listed in a digest Cora posted in
+    her channel; ``surfaced_channel``/``surfaced_ts`` identify that post, shared by every item it lists, so a reply
+    can be matched back) -> routed (posted to
+    ``target_channel``) or dismissed. ``target_channel`` is a channel key, not a Slack ID. ``channel_posted_at``
+    is set when the raising job already posted the event to its channel itself, so Cora never posts it again.
+    ``payload`` holds references and masked values only: no raw phone numbers, emails or consent text."""
+
+    __tablename__ = "cora_inbox"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    event_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    dedup_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    target_channel: Mapped[Optional[str]] = mapped_column(String(64))
+    channel_posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="new", server_default=text("'new'"))
+    surfaced_channel: Mapped[Optional[str]] = mapped_column(String(32))
+    surfaced_ts: Mapped[Optional[str]] = mapped_column(String(64))
+    surfaced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    decided_by: Mapped[Optional[str]] = mapped_column(String(32))  # Slack user who routed or dismissed it
+    decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint("status IN ('new', 'surfaced', 'routed', 'dismissed')", name="ck_cora_inbox_status"),
+        Index("uq_cora_inbox_event", "event_type", "dedup_key", unique=True),
+        Index("ix_cora_inbox_new", "created_at", postgresql_where=text("status = 'new'")),
+        Index("ix_cora_inbox_surfaced_post", "surfaced_channel", "surfaced_ts",
+              postgresql_where=text("surfaced_ts IS NOT NULL")),
+    )
+
+
 class LendingEmailOptOutMessage(LendingBase):
     """One row per message the opt-out mailbox listener has examined, keyed like the opt-out itself (a hash of
     the Message-ID), so every sweep fetches only messages it has not settled: a burst of other mail can never push

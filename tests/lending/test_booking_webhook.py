@@ -121,3 +121,26 @@ def test_booking_confirmed_needs_the_secret(client, db):
 def test_the_router_is_mounted_in_the_lending_app():
     from src.lending.api import app
     assert "/webhooks/lending/booking-confirmed" in app.openapi()["paths"]
+
+
+# ── Cora's inbox ─────────────────────────────────────────────────────────────
+
+def test_an_unreleased_slot_is_raised_in_coras_inbox(inbox_writes, monkeypatch):
+    from src.lending import booking_webhook
+
+    posts: list[str] = []
+    monkeypatch.setattr(booking_webhook, "get_appointment_canceller", lambda: (lambda appointment_id: False))
+    monkeypatch.setattr(booking_webhook, "slack_poster", lambda: posts.append)
+    assert booking_webhook._release_slot("appt-9") is False
+    assert len(posts) == 1
+    event = inbox_writes[0]
+    assert (event["event_type"], event["dedup_key"], event["target_channel"], event["channel_posted"]) == (
+        "slot_release_failed", "appt-9", "replies", True)
+
+
+def test_a_released_slot_raises_nothing(inbox_writes, monkeypatch):
+    from src.lending import booking_webhook
+
+    monkeypatch.setattr(booking_webhook, "get_appointment_canceller", lambda: (lambda appointment_id: True))
+    assert booking_webhook._release_slot("appt-9") is True
+    assert inbox_writes == []

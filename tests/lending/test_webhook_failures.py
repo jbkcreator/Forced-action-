@@ -200,3 +200,24 @@ def test_granted_phone_matches_what_the_handler_would_grant():
     assert granted_phone({**GRANT, "message": "please don't text me"}) is None
     assert granted_phone({"source": "web_form", "phone": PHONE, "consent": "checked"}) == PHONE
     assert granted_phone({"source": "web_form", "phone": PHONE, "consent": ""}) is None
+
+
+# ── Cora's inbox ─────────────────────────────────────────────────────────────
+
+def test_a_failure_given_up_is_raised_in_coras_inbox_without_the_phone(monkeypatch, inbox_writes):
+    def still_down(db, body):
+        raise DatabaseDown()
+
+    _sweep(monkeypatch, [_row(failure_id=7, attempts=webhook_failures.MAX_RETRY_ATTEMPTS - 1)], still_down)
+    assert len(inbox_writes) == 1
+    event = inbox_writes[0]
+    assert (event["event_type"], event["dedup_key"], event["target_channel"]) == ("consent_webhook_gave_up", "7", "ops")
+    assert "ghl-c-42" in event["payload"] and PHONE not in event["payload"]
+
+
+def test_a_failure_still_retrying_raises_nothing(monkeypatch, inbox_writes):
+    def still_down(db, body):
+        raise DatabaseDown()
+
+    _sweep(monkeypatch, [_row(attempts=1)], still_down)
+    assert inbox_writes == []

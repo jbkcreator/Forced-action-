@@ -44,6 +44,7 @@ from config.lending_prequal import BORROWER_CALLBACK_PHONE
 from config.settings import get_settings
 from packages.agent_core.redaction import mask_emails
 from src.lending.compliance import propagate_opt_out
+from src.lending.cora_inbox import add_to_inbox_in_own_session
 from src.lending.db import lending_session
 from src.lending.ops_alerts import post_ops_alert
 from src.services.phone_utils import normalize
@@ -256,8 +257,13 @@ def _process_one(mailbox: Mailbox, log: MessageLog, message_number: bytes, key: 
         opt_out = parse_opt_out(mailbox.raw(message_number), optout_address=optout_address, own_numbers=own_numbers)
     except Exception as exc:  # unreadable: needs a person, retrying will not help
         log.mark(key, "unreadable", error=type(exc).__name__)
-        notify(f":warning: An email to the opt-out address could not be read ({type(exc).__name__}, message {key}). "
-               "Please check the opt-out mailbox and record the opt-out by hand if it is one.")
+        posted = notify(f":warning: An email to the opt-out address could not be read ({type(exc).__name__}, "
+                        f"message {key}). Please check the opt-out mailbox and record the opt-out by hand if it is one.")
+        add_to_inbox_in_own_session(
+            event_type="opt_out_email_unreadable", dedup_key=key, target_channel="ops", channel_posted=bool(posted),
+            summary="An opt-out mailbox email could not be read: check it and record the opt-out by hand",
+            payload={"message_key": key, "error": type(exc).__name__},
+        )
         return
     if opt_out is None:
         log.mark(key, "not_opt_out")
@@ -272,8 +278,16 @@ def _process_one(mailbox: Mailbox, log: MessageLog, message_number: bytes, key: 
                      type(exc).__name__)
         if attempts >= MAX_MESSAGE_ATTEMPTS:
             log.mark(key, "gave_up", error=type(exc).__name__)
-            notify(f":rotating_light: An opt-out email from {mask_emails(opt_out.sender)} could not be recorded after "
-                   f"{attempts} attempts ({type(exc).__name__}, message {key}). It is NOT recorded: record it by hand.")
+            posted = notify(f":rotating_light: An opt-out email from {mask_emails(opt_out.sender)} could not be "
+                            f"recorded after {attempts} attempts ({type(exc).__name__}, message {key}). It is NOT "
+                            "recorded: record it by hand.")
+            add_to_inbox_in_own_session(
+                event_type="opt_out_email_not_recorded", dedup_key=key, target_channel="ops",
+                channel_posted=bool(posted),
+                summary="An opt-out email could not be recorded after every retry: record it by hand",
+                payload={"message_key": key, "sender_masked": mask_emails(opt_out.sender), "attempts": attempts,
+                         "error": type(exc).__name__},
+            )
         return
     log.mark(key, "recorded", event_id=event_id)
     if event_id is None:

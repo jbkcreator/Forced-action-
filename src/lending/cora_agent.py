@@ -25,6 +25,7 @@ from typing import Any, NamedTuple, Optional
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session
 
 from config.settings import AppSettings, get_settings
 from packages.agent_core.agent_loop import AgentLoop, MessagesClient
@@ -41,6 +42,7 @@ from packages.agent_core.store import AgentStore
 from packages.agent_core.thread_history import build_history
 from packages.agent_core.tools import ToolContext, ToolRegistry
 from src.lending.consent import has_text_consent
+from src.lending.cora_inbox import surface_new_items
 from src.lending.cora_prompt import CORA_BASE_PROMPT, REVISION_PROMPT
 from src.lending.cora_tools import CoraToolkit, draft_content_check
 from src.lending.models import LENDING_SCHEMA
@@ -77,6 +79,25 @@ class CoraServices(NamedTuple):
     relay: Relay
     gate: SendGate
     web_client: Any = None  # the Slack WebClient Socket Mode replies through; None in tests
+    inbox_digest: Optional[Callable[[], int]] = None  # posts new inbox items to Cora's channel; returns how many
+
+
+def lending_channel_ids(settings: AppSettings) -> dict[str, str]:
+    """Inbox channel keys -> Slack channel ids, for naming where an item was already posted."""
+    channels = {"replies": settings.lending_replies_channel, "ops": settings.lending_ops_channel,
+                "dial_tasks": settings.lending_dial_tasks_channel, "daily": settings.lending_daily_channel}
+    return {key: channel_id for key, channel_id in channels.items() if channel_id}
+
+
+def make_inbox_digest(engine: Engine, chat: ChatPort, channel: str,
+                      channel_ids: dict[str, str]) -> Callable[[], int]:
+    """One sweep's digest in its own transaction: the claimed items stay locked until they are marked surfaced."""
+
+    def digest() -> int:
+        with Session(engine) as db, db.begin():
+            return surface_new_items(db, chat, channel=channel, channel_ids=channel_ids)
+
+    return digest
 
 
 def _secret(value) -> Optional[str]:
@@ -224,14 +245,22 @@ def build_session(config: AgentCoreConfig, store: AgentStore, chat: ChatPort, bo
 
 
 def run_sweep(services: CoraServices) -> None:
-    """One pass: expire stale drafts and retry missing approval cards (always, even while halted),
-    then send approved actions."""
+    """One pass: expire stale drafts, retry missing approval cards and post the inbox digest (always, even
+    while halted: the halt stops sends to borrowers, not Cora's own channel), then send approved actions."""
     expired = services.session.expire_stale_actions()
     if expired:
         logger.info("[cora] expired %s stale draft(s)", expired)
     reposted = services.gate.retry_missing_cards()
     if reposted:
         logger.info("[cora] posted %s delayed approval card(s)", reposted)
+    if services.inbox_digest is not None:
+        try:
+            surfaced = services.inbox_digest()
+        except Exception as exc:  # class only: SQL errors embed bound parameters; never skip the sends below
+            logger.error("[cora] inbox digest failed (%s); retrying next sweep", type(exc).__name__)
+        else:
+            if surfaced:
+                logger.info("[cora] surfaced %s inbox item(s)", surfaced)
     relay = services.relay
     try:
         result = relay.run()
@@ -274,9 +303,11 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
     engine = create_engine(settings.database_url, pool_pre_ping=True)
     messages_client: MessagesClient = anthropic.Anthropic(
         api_key=config.anthropic_api_key, timeout=90.0, max_retries=2).messages
-    services = build_session(config, AgentStore(engine, config.db_schema), SlackChatPort(web, config.slack_channel_id),
+    chat = SlackChatPort(web, config.slack_channel_id)
+    services = build_session(config, AgentStore(engine, config.db_schema), chat,
                              bot_user_id, messages_client=messages_client, send_check=make_send_check(engine))
-    return services._replace(web_client=web)
+    digest = make_inbox_digest(engine, chat, config.slack_channel_id, lending_channel_ids(settings))
+    return services._replace(web_client=web, inbox_digest=digest)
 
 
 def _adopt_open_cards(services: CoraServices) -> None:
