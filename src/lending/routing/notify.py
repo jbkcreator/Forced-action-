@@ -83,32 +83,40 @@ def build_message(
     return None
 
 
+def _button(action_id: str, event_id: int, label: str, style: Optional[str] = None, confirm: Optional[str] = None) -> dict:
+    element = {"type": "button", "action_id": action_id, "value": str(event_id), "text": {"type": "plain_text", "text": label}}
+    if style:
+        element["style"] = style
+    if confirm:
+        element["confirm"] = {
+            "title": {"type": "plain_text", "text": "Are you sure?"},
+            "text": {"type": "mrkdwn", "text": confirm},
+            "confirm": {"type": "plain_text", "text": "Yes"}, "deny": {"type": "plain_text", "text": "Cancel"}}
+    return element
+
+
+def details_block(event_id: int) -> dict:
+    """The Details button on its own: what stays on a post once its file has moved on."""
+    from config.lending_routing import ACTION_DETAILS
+
+    return {"type": "actions", "block_id": f"routing_details_{event_id}", "elements": [_button(ACTION_DETAILS, event_id, "Details")]}
+
+
 def _action_blocks(message: str, action: str, event_id: int) -> Optional[list[dict]]:
-    """Decline / Approved / Funded buttons under a 'routed' post (None for every other kind of post)."""
-    if action != "routed":
+    """Buttons under a post: Details on every route, decline and hold; Decline / Approved / Funded only on a route."""
+    if action not in ("routed", "declined", "held"):
         return None
-    from config.lending_routing import ACTION_APPROVED, ACTION_DECLINE, ACTION_FUNDED
+    from config.lending_routing import ACTION_APPROVED, ACTION_DECLINE, ACTION_DETAILS, ACTION_FUNDED
 
-    def button(action_id: str, label: str, style: Optional[str] = None, confirm: Optional[str] = None) -> dict:
-        element = {"type": "button", "action_id": action_id, "value": str(event_id),
-                   "text": {"type": "plain_text", "text": label}}
-        if style:
-            element["style"] = style
-        if confirm:
-            element["confirm"] = {
-                "title": {"type": "plain_text", "text": "Are you sure?"},
-                "text": {"type": "mrkdwn", "text": confirm},
-                "confirm": {"type": "plain_text", "text": "Yes"}, "deny": {"type": "plain_text", "text": "Cancel"}}
-        return element
-
-    return [
-        {"type": "section", "text": {"type": "mrkdwn", "text": message}},
-        {"type": "actions", "block_id": f"routing_{event_id}", "elements": [
-            button(ACTION_DECLINE, "Decline", "danger"),
-            button(ACTION_APPROVED, "Approved"),
-            button(ACTION_FUNDED, "Funded", "primary", "This uses one of the lender's monthly seats. Mark it funded?"),
-        ]},
-    ]
+    elements = [_button(ACTION_DETAILS, event_id, "Details")]
+    if action == "routed":
+        elements = [
+            _button(ACTION_DECLINE, event_id, "Decline", "danger"),
+            _button(ACTION_APPROVED, event_id, "Approved"),
+            _button(ACTION_FUNDED, event_id, "Funded", "primary", "This uses one of the lender's monthly seats. Mark it funded?"),
+        ] + elements
+    return [{"type": "section", "text": {"type": "mrkdwn", "text": message}},
+            {"type": "actions", "block_id": f"routing_{event_id}", "elements": elements}]
 
 
 def _mark_posted(event_id: int, ts: str, db: Session) -> None:
@@ -172,7 +180,7 @@ def post_decline_event(
         loan_type=lead.get("loan_type"), loan_amount=lead.get("loan_amount"),
         lender_name=lender_name, position=position, reason_code=reason_code, label=lead.get("label"),
     )
-    _post(message, event_id, db, what="post_decline_event", lead_id=lead.get("id"))
+    _post(message, event_id, db, what="post_decline_event", lead_id=lead.get("id"), action="declined")
 
 
 def post_hold_event(
@@ -188,7 +196,7 @@ def post_hold_event(
         loan_type=lead.get("loan_type"), loan_amount=lead.get("loan_amount"),
         lender_name=None, position=None, hold_reason=reason, label=lead.get("label"),
     )
-    _post(message, event_id, db, what="post_hold_event", lead_id=lead.get("id"))
+    _post(message, event_id, db, what="post_hold_event", lead_id=lead.get("id"), action="held")
 
 
 def retry_unposted_events(db: Session) -> int:

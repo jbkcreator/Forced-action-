@@ -347,6 +347,36 @@ def update_lender(
     return {"id": lender_id, "updated": [k for k in updates if k not in ("id", "now")]}
 
 
+@router.delete("/lenders/{lender_id}", status_code=200)
+def delete_lender(
+    lender_id: IdPath,
+    _: None = Depends(_verify_admin),
+    db: Session = Depends(get_lending_db),
+) -> dict:
+    """Remove a lender row for good. Refused for the primary lender and for any lender that has routed a file,
+    because the routing history must keep pointing at it; pause it or set its agreement to terminated instead."""
+    _require_lender(lender_id, db)
+    _lock_lenders(db)
+    name, is_primary = db.execute(
+        text("SELECT name, is_primary FROM lending.lender_routing_rules WHERE id = :id"), {"id": lender_id},
+    ).one()
+    if is_primary:
+        raise HTTPException(status_code=409, detail=f"{name} is the primary lender. Make another lender primary first.")
+    used = db.execute(
+        text("SELECT (SELECT COUNT(*) FROM lending.file_routing_events WHERE lender_id = :id)"
+             "     + (SELECT COUNT(*) FROM lending.file_routing WHERE current_lender_id = :id)"),
+        {"id": lender_id},
+    ).scalar()
+    if used:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{name} has routing history, so it cannot be deleted. Pause it or set its agreement to terminated.")
+    db.execute(text("DELETE FROM lending.lender_product_boxes WHERE lender_id = :id"), {"id": lender_id})
+    db.execute(text("DELETE FROM lending.lender_routing_rules WHERE id = :id"), {"id": lender_id})
+    db.commit()
+    return {"id": lender_id, "deleted": True}
+
+
 @router.post("/lenders/reorder")
 def reorder_lenders(
     body: ReorderIn,

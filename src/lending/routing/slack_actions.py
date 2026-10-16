@@ -18,9 +18,13 @@ from typing import Any, Callable, Optional
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from config.lending_routing import ACTION_APPROVED, ACTION_DECLINE, ACTION_FUNDED, CATCH_ALL_DECLINE_REASON
+from config.lending_routing import (
+    ACTION_APPROVED, ACTION_DECLINE, ACTION_DETAILS, ACTION_FUNDED, CATCH_ALL_DECLINE_REASON, ROUTING_TZ,
+)
 from src.lending.db import lending_session
+from src.lending.routing import admin_api
 from src.lending.routing.file_key import key_from_row
+from src.lending.routing.notify import details_block
 from src.lending.routing.slack_admin import _input, _user_id, _value, allowed_user_ids
 
 logger = logging.getLogger(__name__)
@@ -35,7 +39,7 @@ Scheduler = Callable[..., None]  # run_later(fn, *args): do the slow part after 
 def is_routing_action(payload: dict) -> bool:
     actions = payload.get("actions") or []
     return (payload.get("type") == "block_actions" and bool(actions)
-            and actions[0].get("action_id") in {ACTION_DECLINE, *_OUTCOME_BUTTONS})
+            and actions[0].get("action_id") in {ACTION_DECLINE, ACTION_DETAILS, *_OUTCOME_BUTTONS})
 
 
 def is_decline_submission(payload: dict) -> bool:
@@ -94,6 +98,48 @@ def _decline_view(event_id: int, lender: str, channel: str, ts: str, original: s
         ]}
 
 
+def format_record(record: dict) -> str:
+    """The file record as Slack text: where it is, who is next, and the route history (times in Eastern)."""
+    file = record["file"]
+    head = (f"*File #{file['file_id']} · {file['last_name'] or 'Unknown'} · "
+            f"{str(file['loan_type'] or 'unknown').replace('_', ' ').title()} · "
+            f"${int(file['loan_amount']):,}* · status: {file['status']}" if file.get("loan_amount") else
+            f"*File #{file['file_id']} · {file['last_name'] or 'Unknown'}* · status: {file['status']}")
+    current, nxt = record.get("current"), record.get("next")
+    lines = [head,
+             f"Current lender: *{current['name']}* (position {current['position']})" if current else "Current lender: none",
+             f"Next in line: *{nxt['name']}* (position {nxt['position']})" if nxt else "Next in line: none"]
+    if file.get("hold_reason"):
+        lines.append(f"Held because: {file['hold_reason']}")
+    lines.append("*Route history*")
+    for item in record["history"][-15:]:
+        when = item["created_at"].astimezone(ROUTING_TZ).strftime("%b %d %I:%M %p")
+        line = f"• {when} · {item['action']} · {item['lender_name'] or '-'}"
+        if item.get("reason_code"):
+            line += f" · {item['reason_code']}"
+        if item.get("free_text"):
+            line += f" ({item['free_text'][:120]})"
+        lines.append(f"{line} · {item['actor'] or 'system'}")
+    return "\n".join(lines)
+
+
+def _show_details(client: Any, channel: str, user: str, event_id: int) -> None:
+    """The file record, shown privately to whoever clicked Details."""
+    try:
+        with lending_session() as db:
+            event = db.execute(text("SELECT lead_id, loan_file_id FROM lending.file_routing_events WHERE id = :e"),
+                               {"e": event_id}).mappings().one_or_none()
+            if event is None:
+                _tell(client, channel, user, "That file was not found.")
+                return
+            key = key_from_row(event)
+            record = admin_api.file_record(file_id=key.id, source=key.source, _=None, db=db)
+        _tell(client, channel, user, format_record(record))
+    except Exception as exc:  # class only
+        logger.error("[routing-slack] details failed event=%s: %s", event_id, type(exc).__name__)
+        _tell(client, channel, user, "Something went wrong; nothing was changed.")
+
+
 def _buttons_left_after_approval(message: dict) -> list[dict]:
     """The post's buttons without Approved (done now); Decline and Funded stay, the file is not finished."""
     return [{**block, "elements": [e for e in block.get("elements") or [] if e.get("action_id") != ACTION_APPROVED]}
@@ -111,6 +157,9 @@ def handle_action(payload: dict, client: Any) -> None:
     action = payload["actions"][0]
     message = payload.get("message") or {}
     ts, original = str(message.get("ts") or ""), str(message.get("text") or "")
+    if action["action_id"] == ACTION_DETAILS:
+        _show_details(client, channel, user, int(action.get("value") or 0))
+        return
     try:
         event_id = int(action.get("value") or 0)
         with lending_session() as db:
@@ -132,7 +181,7 @@ def handle_action(payload: dict, client: Any) -> None:
         _tell(client, channel, user, "Something went wrong; nothing was changed.")
         return
     note = f":white_check_mark: *{outcome.title()}* by <@{user}>" if written else f"_{outcome.title()} was already recorded._"
-    buttons = _buttons_left_after_approval(message) if outcome == "approved" else []
+    buttons = _buttons_left_after_approval(message) if outcome == "approved" else [details_block(event_id)]
     _update_post(client, channel, ts, original, note, keep_buttons=buttons)
 
 
@@ -146,7 +195,8 @@ def _run_decline(client: Any, event_id: int, reason: str, details: str, user: st
         logger.error("[routing-slack] decline failed event=%s: %s", event_id, type(exc).__name__)
         _tell(client, channel, user, "The decline could not be recorded. Nothing was changed.")
         return
-    _update_post(client, channel, ts, original, f":x: *Declined* (reason: {reason}) by <@{user}>")
+    _update_post(client, channel, ts, original, f":x: *Declined* (reason: {reason}) by <@{user}>",
+                 keep_buttons=[details_block(event_id)])
 
 
 def handle_decline_submission(payload: dict, client: Any, run_later: Scheduler) -> dict[str, Any]:

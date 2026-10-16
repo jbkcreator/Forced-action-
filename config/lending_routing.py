@@ -59,6 +59,7 @@ CATCH_ALL_DECLINE_REASON: str = "other"
 ACTION_DECLINE: str = "routing_decline"
 ACTION_APPROVED: str = "routing_approved"
 ACTION_FUNDED: str = "routing_funded"
+ACTION_DETAILS: str = "routing_details"
 
 # Josh's fixed decline-reason enum (his reply, "Inputs for the addendum"). Stored as data, so it stays editable.
 SEED_DECLINE_REASONS: list[tuple[str, str]] = [

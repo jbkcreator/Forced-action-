@@ -1976,11 +1976,13 @@ def test_only_a_routed_post_carries_the_buttons(rdb, fake_slack):
     lead = _make_lead(rdb, phone_suffix="6201")
     _route(rdb, lead)
     actions = [b for b in fake_slack.blocks[0] if b["type"] == "actions"][0]["elements"]
-    assert [e["action_id"] for e in actions] == ["routing_decline", "routing_approved", "routing_funded"]
+    assert [e["action_id"] for e in actions] == ["routing_decline", "routing_approved", "routing_funded", "routing_details"]
     assert {e["value"] for e in actions} == {str(_routed_event_id(rdb, lead))}
     assert "confirm" in actions[2]  # funded asks "are you sure" first
     record_decline(_routed_event_id(rdb, lead), reason_code="ltv_over_max", actor="josh", db=rdb)
-    assert [bool(b) for b in fake_slack.blocks] == [True, False, True]  # routed, declined, re-routed
+    assert [bool(b) for b in fake_slack.blocks] == [True, True, True]  # routed, declined, re-routed: each has Details
+    declined_buttons = [b for b in fake_slack.blocks[1] if b["type"] == "actions"][0]["elements"]
+    assert [e["action_id"] for e in declined_buttons] == ["routing_details"]  # a decline post only offers Details
 
 
 @pytest.fixture
@@ -2022,7 +2024,8 @@ def buttons(rdb, monkeypatch):
             "type": "block_actions", "user": {"id": user}, "trigger_id": "T1", "channel": {"id": "C1"},
             "message": {"ts": "1.0", "text": "Routed | File", "blocks": [
                 {"type": "section"}, {"type": "actions", "elements": [
-                    {"action_id": "routing_decline"}, {"action_id": "routing_approved"}, {"action_id": "routing_funded"}]}]},
+                    {"action_id": "routing_decline"}, {"action_id": "routing_approved"}, {"action_id": "routing_funded"},
+                    {"action_id": "routing_details"}]}]},
             "actions": [{"action_id": action_id, "value": str(event_id)}]}) is True
 
     def submit(event_id, reason="", details="", user="UJOSH"):
@@ -2095,10 +2098,11 @@ def test_approved_and_funded_buttons_record_the_outcome_and_funded_uses_a_seat(r
     assert [e["action"] for e in _events(rdb, first)] == ["routed", "approved"]
     kept = buttons.calls["updated"][-1][1][-1]
     assert kept["type"] == "actions"  # the file can still fund or decline
-    assert [e["action_id"] for e in kept["elements"]] == ["routing_decline", "routing_funded"]  # Approved is done
+    assert [e["action_id"] for e in kept["elements"]] == ["routing_decline", "routing_funded", "routing_details"]  # Approved is done
     buttons.click("routing_funded", event)
     assert [e["action"] for e in _events(rdb, first)] == ["routed", "approved", "funded"]
-    assert all(b["type"] != "actions" for b in buttons.calls["updated"][-1][1])  # funded closes the post
+    closed = [b for b in buttons.calls["updated"][-1][1] if b["type"] == "actions"]
+    assert [e["action_id"] for e in closed[0]["elements"]] == ["routing_details"]  # funded closes the post but keeps Details
     assert rdb.execute(text("SELECT actor FROM lending.file_routing_events WHERE action = 'funded'")).scalar() == "slack:UJOSH"
     buttons.click("routing_funded", event)  # a second click records nothing more
     assert [e["action"] for e in _events(rdb, first)].count("funded") == 1
@@ -2152,3 +2156,91 @@ def test_a_file_can_still_be_declined_after_it_was_approved_but_not_after_it_fun
     buttons.click("routing_funded", funded_event)
     assert "no longer" in buttons.submit(funded_event, reason="ltv_over_max")["errors"]["reason_b"]  # funded is final
     assert [e["action"] for e in _events(rdb, second)] == ["routed", "funded"]
+
+
+# ── Details button, remove a lender, boxes and ground-up settings from Slack ──
+
+def test_details_button_shows_current_next_and_the_route_history_privately(rdb, buttons, fake_slack):
+    _two_flip_lenders(rdb)
+    lead = _make_lead(rdb, phone_suffix="6801", last_name="Detailname")
+    _route(rdb, lead)
+    event = _routed_event_id(rdb, lead)
+    buttons.click("routing_decline", event)  # opens the form, changes nothing
+    assert buttons.submit(event, reason="ltv_over_max", details="") == {}
+    buttons.calls["told"].clear()
+    buttons.click("routing_details", event, user="UJOSH")
+    shown = buttons.calls["told"][-1][1]
+    assert "Detailname" in shown and "status: routed" in shown
+    assert "Current lender: *Beta Funding* (position 2)" in shown and "Next in line: none" in shown
+    assert shown.count("routed") >= 3 and "declined" in shown and "ltv_over_max" in shown and "slack:UJOSH" in shown
+    buttons.click("routing_details", event, user="USTRANGER")
+    assert "Only approved users" in buttons.calls["told"][-1][1]
+
+
+def test_slack_form_removes_a_lender_only_with_its_name_typed_and_never_one_that_routed(rdb, slack_form):
+    a, b = _two_flip_lenders(rdb)
+    spare = _add_lender(rdb, name="Spare Lender", priority=3)
+    assert "Spare Lender" in slack_form(_form("remove", lender=spare, value="wrong name"))["errors"]["value_b"]
+    assert rdb.execute(text("SELECT COUNT(*) FROM lending.lender_routing_rules WHERE id = :i"), {"i": spare}).scalar() == 1
+    assert slack_form(_form("remove", lender=spare, value="spare lender")) == {}
+    assert rdb.execute(text("SELECT COUNT(*) FROM lending.lender_routing_rules WHERE id = :i"), {"i": spare}).scalar() == 0
+    assert "removed lender" in slack_form.posted[-1]
+
+    lead = _make_lead(rdb, phone_suffix="6802")
+    _route(rdb, lead)  # Alpha now has routing history
+    blocked = slack_form(_form("remove", lender=a, value="Alpha Capital"))
+    assert "routing history" in blocked["errors"]["lender_b"] and "Pause" in blocked["errors"]["lender_b"]
+    rdb.execute(text("UPDATE lending.lender_routing_rules SET is_primary = TRUE WHERE id = :i"), {"i": b})
+    rdb.commit()
+    assert "primary" in slack_form(_form("remove", lender=b, value="Beta Funding"))["errors"]["lender_b"]
+
+
+def test_slack_form_replaces_and_clears_boxes_and_sets_ground_up_settings(rdb, slack_form):
+    a, _ = _two_flip_lenders(rdb)
+    boxes = lambda: rdb.execute(text("SELECT loan_types, approved_states FROM lending.lender_product_boxes"  # noqa: E731
+                                     " WHERE lender_id = :i"), {"i": a}).all()
+    assert len(boxes()) == 1
+    slack_form(_form("replace_boxes", lender=a, types=[LOAN_TYPE_GU], states="tx"))
+    assert [(list(t), st) for t, st in boxes()] == [([LOAN_TYPE_GU], ["TX"])]  # the old flip box is gone
+    # A refused replacement keeps what was there.
+    refused = slack_form(_form("replace_boxes", lender=a, types=[LOAN_TYPE_FLIP], min_amount="900", max_amount="100"))
+    assert "max_b" in refused["errors"] and len(boxes()) == 1 and boxes()[0][0] == [LOAN_TYPE_GU]
+    assert "types_b" in slack_form(_form("replace_boxes", lender=a))["errors"]
+    slack_form(_form("clear_boxes", lender=a))
+    assert boxes() == []
+
+    slack_form(_form("ground_up_min", lender=a, value="$750,000"))
+    slack_form(_form("takes_ground_up", lender=a, value="yes"))
+    row = rdb.execute(text("SELECT construction_min_amount, takes_ground_up FROM lending.lender_routing_rules"
+                           " WHERE id = :i"), {"i": a}).one()
+    assert tuple(row) == (750000, True)
+    slack_form(_form("ground_up_min", lender=a, value="none"))
+    assert rdb.execute(text("SELECT construction_min_amount FROM lending.lender_routing_rules WHERE id = :i"),
+                       {"i": a}).scalar() is None
+    for bad in (_form("ground_up_min", lender=a, value="lots"), _form("takes_ground_up", lender=a, value="maybe")):
+        assert list(slack_form(bad)["errors"]) == ["value_b"]
+
+
+def test_the_form_lists_each_lenders_boxes_and_ground_up_settings(rdb):
+    from src.lending.routing import slack_admin
+
+    a, _ = _two_flip_lenders(rdb)
+    rdb.execute(text("UPDATE lending.lender_routing_rules SET construction_min_amount = 500000, takes_ground_up = TRUE,"
+                     " monthly_cap = 4 WHERE id = :i"), {"i": a})
+    rdb.execute(text("UPDATE lending.lender_product_boxes SET approved_states = ARRAY['FL','GA'], min_loan_amount = 100000,"
+                     " max_loan_amount = 900000, credit_floor = 680 WHERE lender_id = :i"), {"i": a})
+    rdb.commit()
+    listing = slack_admin.build_form_view(slack_admin._lenders(rdb), slack_admin._boxes_by_lender(rdb))["blocks"][0]["text"]["text"]
+    assert "cap 4" in listing and "ground-up min $500,000" in listing and "takes ground-up" in listing
+    assert "Fix And Flip · FL, GA · $100,000-$900,000 · min credit 680" in listing
+
+
+def test_the_api_deletes_a_lender_that_never_routed_and_refuses_the_rest(rdb, api):
+    a, _ = _two_flip_lenders(rdb)
+    spare = _add_lender(rdb, name="Spare", priority=3)
+    _add_box(rdb, spare, loan_types=[LOAN_TYPE_FLIP])
+    assert api.delete(f"/api/lending/routing/lenders/{spare}").status_code == 200
+    assert rdb.execute(text("SELECT COUNT(*) FROM lending.lender_product_boxes WHERE lender_id = :i"), {"i": spare}).scalar() == 0
+    assert api.delete(f"/api/lending/routing/lenders/{spare}").status_code == 404
+    _route(rdb, _make_lead(rdb, phone_suffix="6803"))
+    assert api.delete(f"/api/lending/routing/lenders/{a}").status_code == 409  # it routed a file

@@ -33,13 +33,18 @@ CALLBACK_ID = "routing_lender_form"
 ACTIONS: tuple[tuple[str, str], ...] = (
     ("add_lender", "Add a lender (name in Value, box fields below)"),
     ("add_box", "Add a product box to the chosen lender"),
+    ("replace_boxes", "Replace the chosen lender's boxes with the box below"),
+    ("clear_boxes", "Remove all product boxes from the chosen lender"),
     ("pause", "Pause the chosen lender"),
     ("resume", "Resume the chosen lender"),
     ("agreement", "Set agreement status (Value: signed, pending, none or terminated)"),
     ("seat_cap", "Set monthly seat cap (Value: a number, or none)"),
+    ("ground_up_min", "Set ground-up minimum (Value: dollars, or none)"),
+    ("takes_ground_up", "Set takes ground-up (Value: yes or no)"),
     ("move_up", "Move the chosen lender up one place"),
     ("move_down", "Move the chosen lender down one place"),
     ("make_primary", "Make the chosen lender primary"),
+    ("remove", "Remove the chosen lender for good (Value: type its name)"),
 )
 _NEEDS_LENDER = {a for a, _ in ACTIONS} - {"add_lender"}
 _BOX_FIELDS = ("types_b", "states_b", "min_b", "max_b", "credit_b")
@@ -57,9 +62,35 @@ def _user_id(payload: dict) -> str:
 
 def _lenders(db: Session) -> list[dict]:
     rows = db.execute(text(
-        "SELECT id, name, active, is_primary, agreement_status, priority, monthly_cap"
+        "SELECT id, name, active, is_primary, agreement_status, priority, monthly_cap,"
+        "       construction_min_amount, takes_ground_up"
         "  FROM lending.lender_routing_rules ORDER BY priority ASC, id ASC")).mappings().all()
     return [dict(r) for r in rows]
+
+
+def _box_ids(db: Session, lender_id: int) -> list[int]:
+    return list(db.execute(text("SELECT id FROM lending.lender_product_boxes WHERE lender_id = :l ORDER BY id"),
+                           {"l": lender_id}).scalars())
+
+
+def _box_line(row: Any) -> str:
+    types = ", ".join(t.replace("_", " ").title() for t in row.loan_types)
+    states = ", ".join(row.approved_states) if row.approved_states else "all states"
+    low, high = row.min_loan_amount, row.max_loan_amount
+    amount = (f"${low:,}-${high:,}" if low is not None and high is not None else f"from ${low:,}" if low is not None
+              else f"up to ${high:,}" if high is not None else "any amount")
+    credit = f" · min credit {row.credit_floor}" if row.credit_floor else ""
+    return f"{types} · {states} · {amount}{credit}"
+
+
+def _boxes_by_lender(db: Session) -> dict[int, list[str]]:
+    rows = db.execute(text(
+        "SELECT lender_id, loan_types, approved_states, min_loan_amount, max_loan_amount, credit_floor"
+        "  FROM lending.lender_product_boxes ORDER BY lender_id, id")).all()
+    boxes: dict[int, list[str]] = {}
+    for row in rows:
+        boxes.setdefault(row.lender_id, []).append(_box_line(row))
+    return boxes
 
 
 def _label(lender: dict) -> str:
@@ -79,9 +110,19 @@ def _text(placeholder: str = "") -> dict:
     return {"type": "plain_text_input", "action_id": "v", "placeholder": {"type": "plain_text", "text": placeholder or " "}}
 
 
-def build_form_view(lenders: list[dict]) -> dict:
-    listing = "\n".join(f"{_label(l)}" + (f" · cap {l['monthly_cap']}" if l["monthly_cap"] is not None else "")
-                        for l in lenders) or "No lenders yet."
+def _listing(lenders: list[dict], boxes: dict[int, list[str]]) -> str:
+    lines: list[str] = []
+    for l in lenders:
+        extras = [f"cap {l['monthly_cap']}" if l["monthly_cap"] is not None else "",
+                  f"ground-up min ${l['construction_min_amount']:,}" if l.get("construction_min_amount") else "",
+                  "takes ground-up" if l.get("takes_ground_up") else ""]
+        lines.append(_label(l) + "".join(f" · {e}" for e in extras if e))
+        lines += [f"      - {box}" for box in boxes.get(l["id"], [])] or ["      - no box: receives nothing"]
+    return ("\n".join(lines) or "No lenders yet.")[:2800]
+
+
+def build_form_view(lenders: list[dict], boxes: Optional[dict[int, list[str]]] = None) -> dict:
+    listing = _listing(lenders, boxes or {})
     option = lambda value, label: {"text": {"type": "plain_text", "text": label[:75]}, "value": value}  # noqa: E731
     blocks: list[dict] = [
         {"type": "section", "text": {"type": "mrkdwn", "text": f"*Waterfall order*\n```{listing}```"}},
@@ -92,11 +133,11 @@ def build_form_view(lenders: list[dict]) -> dict:
         blocks.append(_input("lender_b", "Lender (not needed to add one)",
                              {"type": "static_select", "action_id": "v", "options": [option(str(l["id"]), _label(l)) for l in lenders[:100]]}))
     blocks += [
-        _input("value_b", "Value", _text("name, signed/pending, or seat cap")),
+        _input("value_b", "Value", _text("a name, signed/pending, a number, yes/no")),
         _input("types_b", "Box: loan types",
                {"type": "multi_static_select", "action_id": "v",
                 "options": [option(m.value, m.value.replace("_", " ").title()) for m in LoanType]},
-               hint="Used by 'Add a lender' and 'Add a product box'. A lender with no box receives nothing."),
+               hint="Used by 'Add a lender', 'Add a product box' and 'Replace boxes'. A lender with no box receives nothing."),
         _input("states_b", "Box: states", _text("FL, GA (blank = all states)")),
         _input("min_b", "Box: min loan ($)", _text()),
         _input("max_b", "Box: max loan ($)", _text()),
@@ -204,17 +245,25 @@ def collect_errors(values: dict, db: Session) -> dict[str, str]:
             lender = next((l for l in lenders if l["id"] == int(raw)), None)
             if lender is None:
                 errors["lender_b"] = "That lender no longer exists. Close this and open the form again."
-    if action in ("add_lender", "add_box"):
+    if action in ("add_lender", "add_box", "replace_boxes"):
         _, box_errors = _box_errors(values)
         errors.update(box_errors)
         has_types = bool(_value(values, "types_b"))
         filled = any(_value(values, b) for b in ("states_b", "min_b", "max_b", "credit_b"))
-        if action == "add_box" and not has_types:
+        if action in ("add_box", "replace_boxes") and not has_types:
             errors["types_b"] = "Pick at least one loan type for the box."
         elif action == "add_lender" and filled and not has_types:
             errors["types_b"] = "Pick a loan type for the box fields you filled in."
         if action == "add_lender" and not value:
             errors["value_b"] = "Type the lender's name in Value."
+    elif action == "remove" and lender is not None and value.strip().lower() != lender["name"].lower():
+        errors["value_b"] = f"Type the lender's name ({lender['name']}) in Value to confirm removing it."
+    elif action == "ground_up_min" and value.lower() not in ("none", "no minimum"):
+        digits = value.replace(",", "").replace("$", "").strip()
+        if not digits.isdigit() or int(digits) > 1_000_000_000_000:
+            errors["value_b"] = "Value must be a dollar amount, like 500000, or none."
+    elif action == "takes_ground_up" and value.lower() not in ("yes", "no", "y", "n", "true", "false"):
+        errors["value_b"] = "Value must be yes or no."
     elif action == "agreement" and value not in AGREEMENT_STATUS_CHOICES:
         errors["value_b"] = f"Value must be one of: {', '.join(AGREEMENT_STATUS_CHOICES)}."
     elif action == "seat_cap" and value.lower() not in ("none", "no cap"):
@@ -288,6 +337,27 @@ def apply_change(values: dict, db: Session) -> str:
             raise FormError("Pick at least one loan type for the box.", "types_b")
         admin_api.add_box(lender_id=lender["id"], body=_box_from(values), _=None, db=db)
         return f"added a product box to *{name}*"
+    if action == "replace_boxes":
+        old_boxes = _box_ids(db, lender["id"])
+        admin_api.add_box(lender_id=lender["id"], body=_box_from(values), _=None, db=db)  # new box first: a refusal keeps the old ones
+        for box_id in old_boxes:
+            admin_api.delete_box(lender_id=lender["id"], box_id=box_id, _=None, db=db)
+        return f"replaced the product boxes of *{name}* with one new box"
+    if action == "clear_boxes":
+        for box_id in _box_ids(db, lender["id"]):
+            admin_api.delete_box(lender_id=lender["id"], box_id=box_id, _=None, db=db)
+        return f"removed all product boxes from *{name}* (it receives nothing until a box is added)"
+    if action == "ground_up_min":
+        amount = None if value.lower() in ("none", "no minimum") else _int_or_none(value.replace("$", ""), "Ground-up minimum")
+        admin_api.update_lender(lender_id=lender["id"], body=admin_api.LenderPatch(construction_min_amount=amount), _=None, db=db)
+        return f"set *{name}* ground-up minimum to {'none' if amount is None else f'${amount:,}'}"
+    if action == "takes_ground_up":
+        flag = value.lower() in ("yes", "y", "true")
+        admin_api.update_lender(lender_id=lender["id"], body=admin_api.LenderPatch(takes_ground_up=flag), _=None, db=db)
+        return f"set *{name}* takes ground-up to {'yes' if flag else 'no'}"
+    if action == "remove":
+        admin_api.delete_lender(lender_id=lender["id"], _=None, db=db)
+        return f"removed lender *{name}* for good"
     if action in ("pause", "resume"):
         admin_api.update_lender(lender_id=lender["id"], body=admin_api.LenderPatch(active=action == "resume"), _=None, db=db)
         return f"{'resumed' if action == 'resume' else 'paused'} *{name}*"
@@ -363,7 +433,7 @@ def open_form(client: Any, payload: dict) -> None:
         return
     try:
         with lending_session() as db:
-            view = build_form_view(_lenders(db))
+            view = build_form_view(_lenders(db), _boxes_by_lender(db))
         client.views_open(trigger_id=payload.get("trigger_id", ""), view=view)
     except Exception as exc:  # class only
         logger.error("[routing-slack] opening the form failed: %s", type(exc).__name__)
