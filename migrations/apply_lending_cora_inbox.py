@@ -24,14 +24,17 @@ logger = logging.getLogger(__name__)
 _HAS_COLUMN = text("SELECT 1 FROM information_schema.columns WHERE table_schema = :schema "
                    "AND table_name = 'cora_inbox' AND column_name = :column")
 _HAS_INDEX = text("SELECT 1 FROM pg_indexes WHERE schemaname = :schema AND indexname = :index")
+# Columns added after the table first shipped; a table created above already has them.
+_LATER_COLUMNS = (("channel_posted_at", "timestamptz"), ("routed_channel", "varchar(64)"), ("decision_note", "text"))
 
 
 def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
     translated = conn.execution_options(schema_translate_map={LENDING_SCHEMA: schema})
     LendingCoraInboxItem.__table__.create(translated, checkfirst=True)
 
-    if not conn.execute(_HAS_COLUMN, {"schema": schema, "column": "channel_posted_at"}).scalar():
-        conn.execute(text(f'ALTER TABLE "{schema}".cora_inbox ADD COLUMN channel_posted_at timestamptz'))
+    for column, ddl in _LATER_COLUMNS:
+        if not conn.execute(_HAS_COLUMN, {"schema": schema, "column": column}).scalar():
+            conn.execute(text(f'ALTER TABLE "{schema}".cora_inbox ADD COLUMN {column} {ddl}'))
 
     # One digest post lists many items, so the post no longer identifies a single row.
     if conn.execute(_HAS_INDEX, {"schema": schema, "index": "uq_cora_inbox_surfaced_post"}).scalar():

@@ -104,6 +104,36 @@ def test_top_level_message_gets_an_inline_reply_with_channel_history(store: Agen
     ]
 
 
+def test_a_top_level_message_sees_only_the_last_hour_of_the_channel(store: AgentStore) -> None:
+    cora = Cora(store, FakeMessages(response(text_block("Done."))))
+    now = 1_800_000_000.0
+    cora.chat.channels["C_CORA"] = [
+        {"ts": f"{now - 7200:.6f}", "user": JOSH, "text": "draft an email to Laira"},  # two hours old: dropped
+        {"ts": f"{now - 7100:.6f}", "user": BOT, "bot_id": "B1", "text": "Queued action #2 for approval."},
+        {"ts": f"{now - 600:.6f}", "user": JOSH, "text": "how many web leads today?"},
+        {"ts": f"{now - 590:.6f}", "user": BOT, "bot_id": "B1", "text": "3 web leads today."},
+        {"ts": f"{now:.6f}", "user": JOSH, "text": "dismiss 134"},
+    ]
+    cora.say(JOSH, "dismiss 134", ts=f"{now:.6f}")
+    assert cora.client.requests[0]["messages"] == [
+        {"role": "user", "content": f"<@{JOSH}>: how many web leads today?"},
+        {"role": "assistant", "content": "3 web leads today."},
+        {"role": "user", "content": f"<@{JOSH}>: dismiss 134"},
+    ]
+
+
+def test_a_top_level_message_sees_at_most_a_few_recent_turns(store: AgentStore) -> None:
+    cora = Cora(store, FakeMessages(response(text_block("Done."))))
+    now = 1_800_000_000.0
+    chatter = [{"ts": f"{now - 100 + n:.6f}", "user": BOT if n % 2 else JOSH, **({"bot_id": "B1"} if n % 2 else {}),
+                "text": f"message {n}"} for n in range(20)]
+    cora.chat.channels["C_CORA"] = chatter
+    cora.say(JOSH, "latest", ts=f"{now:.6f}")
+    history = cora.client.requests[0]["messages"][:-1]
+    assert len(history) <= cora_agent.TOP_LEVEL_HISTORY_TURNS and history[0]["role"] == "user"
+    assert history[-1]["content"] == "message 19"
+
+
 def test_message_in_a_thread_is_answered_in_that_thread(store: AgentStore) -> None:
     cora = Cora(store, FakeMessages(response(text_block("Sure."))))
     cora.chat.channels["C_CORA"] = [{"ts": "12.0", "user": JOSH, "text": "unrelated channel chatter"}]
@@ -306,3 +336,44 @@ def test_model_outage_gets_a_plain_reply(store: AgentStore) -> None:
     cora = Cora(store, FakeMessages(outage))
     cora.say(JOSH, "how many leads?", ts="80.0")
     assert cora.last_answer() == cora_agent._MODEL_UNAVAILABLE
+
+
+# ── inbox items in a digest thread ───────────────────────────────────────────
+
+DIGEST_TS = "90.0"
+INBOX_BLOCK = '<inbox_items>\n{"id": 41, "summary": "Rate question: Marcus"}\n</inbox_items>'
+
+
+def _cora_with_inbox(store: AgentStore, lookup) -> Cora:
+    cora = Cora(store, FakeMessages(response(text_block("Done: #41 dismissed."))))
+    cora.services = cora_agent.build_session(_config(), store, cora.chat, BOT, messages_client=cora.client,
+                                             toolkit_factory=_toolkit_factory, inbox_context=lookup)
+    cora.session = cora.services.session
+    return cora
+
+
+def _last_user_turn(cora: Cora) -> str:
+    return cora.client.requests[0]["messages"][-1]["content"]
+
+
+def test_a_reply_in_a_digest_thread_comes_with_its_inbox_items(store: AgentStore) -> None:
+    cora = _cora_with_inbox(store, lambda channel, ts: INBOX_BLOCK if (channel, ts) == ("C_CORA", DIGEST_TS) else "")
+    cora.say(JOSH, "dismiss 41, I called him", ts="90.5", thread_ts=DIGEST_TS)
+    assert _last_user_turn(cora) == f"{INBOX_BLOCK}\n<@{JOSH}>: dismiss 41, I called him"
+
+
+def test_a_top_level_message_gets_no_inbox_block(store: AgentStore) -> None:
+    lookups: list[tuple[str, str]] = []
+    cora = _cora_with_inbox(store, lambda channel, ts: lookups.append((channel, ts)) or INBOX_BLOCK)
+    cora.say(JOSH, "what is still open?", ts="91.0")
+    assert lookups == [] and _last_user_turn(cora) == f"<@{JOSH}>: what is still open?"
+
+
+def test_a_failed_inbox_lookup_still_gets_an_answer(store: AgentStore) -> None:
+    def database_down(channel: str, ts: str) -> str:
+        raise RuntimeError("database unavailable")
+
+    cora = _cora_with_inbox(store, database_down)
+    cora.say(JOSH, "dismiss 41", ts="92.5", thread_ts="92.0")
+    assert _last_user_turn(cora) == f"<@{JOSH}>: dismiss 41"
+    assert cora.last_answer() == "Done: #41 dismissed."

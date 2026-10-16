@@ -102,7 +102,7 @@ _MARK_SURFACED = text("""
 """)
 
 
-def _slack_safe(value: str) -> str:
+def slack_safe(value: str) -> str:
     """Slack treats <!channel>, <!here> and <url|label> as live markup unless & < > are escaped."""
     return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -111,7 +111,7 @@ def format_digest(items: Sequence[Mapping[str, Any]], channel_ids: Mapping[str, 
     """One plain-text line per item, numbered by inbox id so the operator can refer to it in a reply."""
     lines = [f"*{len(items)} new item{'s' if len(items) != 1 else ''}*"]
     for item in items:
-        line = f"#{item['id']}  {_slack_safe(item['summary'] or 'No summary')}"
+        line = f"#{item['id']}  {slack_safe(item['summary'] or 'No summary')}"
         if item["channel_posted"] and item["target_channel"]:
             channel_id = channel_ids.get(item["target_channel"])
             line += f"  _(already in {f'<#{channel_id}>' if channel_id else item['target_channel']})_"
@@ -138,3 +138,68 @@ def surface_new_items(db, chat: Any, *, channel: str, channel_ids: Mapping[str, 
     db.execute(_MARK_SURFACED, {"ids": [item["id"] for item in items], "channel": result.channel or channel,
                                 "ts": result.ts})
     return len(items)
+
+
+# ── Acting on items: what Cora sees, and closing an item ─────────────────────
+
+# Channel keys an approver can route an item to; each maps to a lending channel setting.
+ROUTABLE_CHANNELS = ("replies", "ops", "dial_tasks", "daily")
+OPEN_STATUSES = ("new", "surfaced")
+
+_ITEM_COLUMNS = """
+    id, event_type, summary, payload, status, target_channel, channel_posted_at IS NOT NULL AS channel_posted,
+    routed_channel, decided_by, decided_at, created_at
+"""
+_ITEMS_ON_POST = text(f"""
+    SELECT {_ITEM_COLUMNS} FROM lending.cora_inbox
+     WHERE surfaced_channel = :channel AND surfaced_ts = :ts
+     ORDER BY id
+""")
+_OPEN_ITEMS = text(f"""
+    SELECT {_ITEM_COLUMNS} FROM lending.cora_inbox
+     WHERE status IN ('new', 'surfaced')
+     ORDER BY created_at, id
+     LIMIT :limit
+""")
+_ITEM = text(f"SELECT {_ITEM_COLUMNS} FROM lending.cora_inbox WHERE id = :id")
+_ITEM_FOR_UPDATE = text(f"SELECT {_ITEM_COLUMNS} FROM lending.cora_inbox WHERE id = :id FOR UPDATE")
+_CLOSE = text("""
+    UPDATE lending.cora_inbox
+       SET status = :status, decided_by = :decided_by, decided_at = now(), decision_note = :note,
+           routed_channel = :routed_channel, updated_at = now()
+     WHERE id = :id AND status IN ('new', 'surfaced')
+    RETURNING id
+""")
+
+
+def items_on_post(db, channel: str, ts: str) -> list[dict[str, Any]]:
+    """The items a digest post listed, by the post's channel and ts (a reply's thread_ts)."""
+    return [dict(row) for row in db.execute(_ITEMS_ON_POST, {"channel": channel, "ts": ts}).mappings()]
+
+
+def open_items(db, limit: int = DIGEST_LIMIT) -> list[dict[str, Any]]:
+    return [dict(row) for row in db.execute(_OPEN_ITEMS, {"limit": limit}).mappings()]
+
+
+def get_item(db, item_id: int, *, for_update: bool = False) -> Optional[dict[str, Any]]:
+    row = db.execute(_ITEM_FOR_UPDATE if for_update else _ITEM, {"id": item_id}).mappings().first()
+    return dict(row) if row else None
+
+
+def close_item(db, item_id: int, *, status: str, decided_by: str, note: Optional[str] = None,
+               routed_channel: Optional[str] = None) -> bool:
+    """Mark an open item routed or dismissed. False when it is no longer open. Does not commit."""
+    if status not in ("routed", "dismissed"):
+        raise ValueError(f"an item is closed as routed or dismissed, not {status!r}")
+    return db.execute(_CLOSE, {"id": item_id, "status": status, "decided_by": decided_by, "note": note,
+                               "routed_channel": routed_channel}).first() is not None
+
+
+def format_inbox_context(items: Sequence[Mapping[str, Any]]) -> str:
+    """The items a digest thread is about, prepended to a reply in that thread so Cora knows what each
+    number refers to (her own digest post is not part of the thread history she is given)."""
+    lines = [json.dumps({"id": item["id"], "type": item["event_type"], "summary": item["summary"],
+                         "status": item["status"], "intended_channel": item["target_channel"],
+                         "already_posted_there": item["channel_posted"], "details": item["payload"]},
+                        default=str, sort_keys=True) for item in items]
+    return "<inbox_items>\n" + "\n".join(lines) + "\n</inbox_items>"

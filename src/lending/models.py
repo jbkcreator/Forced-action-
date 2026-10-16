@@ -825,6 +825,8 @@ class LendingCoraInboxItem(LendingBase):
     surfaced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     decided_by: Mapped[Optional[str]] = mapped_column(String(32))  # Slack user who routed or dismissed it
     decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    routed_channel: Mapped[Optional[str]] = mapped_column(String(64))  # channel key it was sent to; may differ from target_channel
+    decision_note: Mapped[Optional[str]] = mapped_column(Text)  # the approver's note given with the route or dismissal
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 

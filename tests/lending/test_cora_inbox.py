@@ -1,6 +1,7 @@
 """Cora's inbox table and add_to_inbox, against Postgres inside a rolled-back transaction."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import date
 
 import pytest
@@ -9,13 +10,17 @@ from sqlalchemy.exc import IntegrityError
 
 from migrations.apply_lending_cora_inbox import apply_to
 from packages.agent_core.chatport import FakeChatPort, PostResult
+from packages.agent_core.tools import ToolContext, ToolRegistry
 from src.lending.cora_inbox import (
     add_to_inbox,
     add_to_inbox_in_own_session,
     add_to_inbox_safely,
     format_digest,
+    format_inbox_context,
+    items_on_post,
     surface_new_items,
 )
+from src.lending.cora_tools import CoraToolkit
 
 
 @pytest.fixture
@@ -178,3 +183,126 @@ def test_the_digest_escapes_slack_markup_and_names_unknown_channels_by_key():
     ], CHANNEL_IDS)
     assert "<!channel>" not in text_out and "&lt;!channel&gt; &amp; &lt;http://x|y&gt;" in text_out
     assert text_out.splitlines()[2] == "#8  DNC removal pending  _(already in dial_tasks)_"
+
+
+# ── acting on items: what Cora sees, and the dismiss / route tools ───────────
+
+JOSH, OPS = "U_JOSH", "U_OPS"
+
+
+def _surfaced(db, chat=None):
+    """Two items in one digest: a reply handoff already in #replies, and a deal not posted anywhere."""
+    handoff = add_to_inbox(db, event_type="reply_handoff", dedup_key="act-m1", summary="Rate question: Marcus",
+                           target_channel="replies", channel_posted=True, payload={"phone_last4": "0147"})
+    deal = add_to_inbox(db, event_type="partner_deal", dedup_key="act-p1", summary="New partner deal",
+                        target_channel="routing")
+    chat = chat or FakeChatPort(default_channel="C_CORA")
+    surface_new_items(db, chat, channel="C_CORA", channel_ids=CHANNEL_IDS)
+    return handoff, deal, chat.posts[-1]["ts"]
+
+
+class Poster:
+    def __init__(self, error: Exception | None = None):
+        self.posts, self.error = [], error
+
+    def __call__(self, channel_id: str, message: str) -> None:
+        if self.error:
+            raise self.error
+        self.posts.append((channel_id, message))
+
+
+def _toolkit(db, poster=None) -> CoraToolkit:
+    @contextmanager
+    def scope():
+        with db.begin_nested():  # a savepoint stands in for the tool's own transaction
+            yield db
+
+    return CoraToolkit(engine=None, memory=None, channel_ids={"replies": "C_REPLIES", "ops": "C_OPS",  # type: ignore[arg-type]
+                                                              "dial_tasks": "C_DIAL"},
+                       channel_poster=poster, inbox_session=scope)
+
+
+def _run(toolkit: CoraToolkit, name: str, raw: dict, user: str = JOSH):
+    registry = ToolRegistry(toolkit.tools(), gate=None)  # type: ignore[arg-type]
+    context = ToolContext(user_id=user, is_approver=user == JOSH, channel="C_CORA", thread_ts="1.0",
+                          tool_use_id="t1")
+    return registry.execute(name, raw, context)
+
+
+def test_a_digest_threads_items_are_found_by_its_post(digest_db):
+    handoff, deal, ts = _surfaced(digest_db)
+    items = items_on_post(digest_db, "C_CORA", ts)
+    assert [item["id"] for item in items] == [handoff, deal]
+    assert items_on_post(digest_db, "C_CORA", "999.000000") == []
+    context = format_inbox_context(items)
+    assert context.startswith("<inbox_items>\n") and context.endswith("\n</inbox_items>")
+    assert f'"id": {handoff}' in context and '"already_posted_there": true' in context
+
+
+def test_an_approver_dismisses_an_item_with_a_note(digest_db):
+    handoff, _, _ = _surfaced(digest_db)
+    outcome = _run(_toolkit(digest_db), "dismiss_inbox_item", {"item_id": handoff, "note": "called him"})
+    assert not outcome.is_error
+    row = _row(digest_db, handoff)
+    assert (row["status"], row["decided_by"], row["decision_note"]) == ("dismissed", JOSH, "called him")
+    assert row["decided_at"] is not None
+
+
+def test_only_an_approver_can_dismiss_or_route(digest_db):
+    handoff, deal, _ = _surfaced(digest_db)
+    poster = Poster()
+    toolkit = _toolkit(digest_db, poster)
+    assert _run(toolkit, "dismiss_inbox_item", {"item_id": handoff}, user=OPS).is_error
+    assert _run(toolkit, "route_inbox_item", {"item_id": deal, "channel_key": "ops"}, user=OPS).is_error
+    assert _status(digest_db, handoff, deal) == ["surfaced", "surfaced"] and poster.posts == []
+    assert not _run(toolkit, "list_inbox_items", {}, user=OPS).is_error  # anyone may look
+
+
+def test_an_approver_routes_an_item_to_a_team_channel(digest_db):
+    _, deal, _ = _surfaced(digest_db)
+    poster = Poster()
+    outcome = _run(_toolkit(digest_db, poster), "route_inbox_item",
+                   {"item_id": deal, "channel_key": "ops", "note": "Sarah, please call today"})
+    assert not outcome.is_error
+    assert poster.posts == [("C_OPS", f"*New partner deal*\nSarah, please call today\n"
+                                      f"_Sent by <@{JOSH}> via Cora (inbox #{deal})_")]
+    row = _row(digest_db, deal)
+    assert (row["status"], row["routed_channel"], row["decided_by"]) == ("routed", "ops", JOSH)
+
+
+def test_a_refused_post_leaves_the_item_open(digest_db):
+    _, deal, _ = _surfaced(digest_db)
+    outcome = _run(_toolkit(digest_db, Poster(RuntimeError("channel_not_found"))), "route_inbox_item",
+                   {"item_id": deal, "channel_key": "ops"})
+    assert outcome.is_error and "still open" in outcome.content
+    assert _status(digest_db, deal) == ["surfaced"]
+
+
+def test_a_closed_item_cannot_be_acted_on_again(digest_db):
+    handoff, _, _ = _surfaced(digest_db)
+    toolkit = _toolkit(digest_db, Poster())
+    _run(toolkit, "dismiss_inbox_item", {"item_id": handoff})
+    again = _run(toolkit, "route_inbox_item", {"item_id": handoff, "channel_key": "ops"})
+    assert again.is_error and "already dismissed" in again.content
+    assert _row(digest_db, handoff)["routed_channel"] is None
+
+
+def test_routing_is_refused_to_the_channel_the_item_is_already_in(digest_db):
+    handoff, _, _ = _surfaced(digest_db)
+    poster = Poster()
+    outcome = _run(_toolkit(digest_db, poster), "route_inbox_item", {"item_id": handoff, "channel_key": "replies"})
+    assert outcome.is_error and "already in the replies channel" in outcome.content and poster.posts == []
+
+
+def test_routing_is_refused_outside_the_lending_channels_or_when_not_configured(digest_db):
+    _, deal, _ = _surfaced(digest_db)
+    assert _run(_toolkit(digest_db, Poster()), "route_inbox_item", {"item_id": deal, "channel_key": "general"}).is_error
+    unconfigured = _run(_toolkit(digest_db, Poster()), "route_inbox_item", {"item_id": deal, "channel_key": "daily"})
+    assert unconfigured.is_error and "not configured" in unconfigured.content
+    assert _run(_toolkit(digest_db, None), "route_inbox_item", {"item_id": deal, "channel_key": "ops"}).is_error
+    assert _status(digest_db, deal) == ["surfaced"]
+
+
+def test_an_unknown_item_number_is_reported(digest_db):
+    outcome = _run(_toolkit(digest_db), "list_inbox_items", {"item_id": 987654321})
+    assert outcome.is_error and "no inbox item #987654321" in outcome.content

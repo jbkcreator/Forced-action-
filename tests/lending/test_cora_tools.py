@@ -146,12 +146,15 @@ SAM = _Lead("web_lead:7", "Sam Smith", "+17275550100", "sam@example.com", "ghl-1
 
 def test_tool_set_and_safety_levels() -> None:
     tools = {tool.name: tool for tool in CoraToolkit(engine=None, memory=None).tools()}  # type: ignore[arg-type]
-    assert len(tools) == 13
+    assert len(tools) == 16
     egress = {name for name, tool in tools.items() if tool.safety is SafetyLevel.EXTERNAL_EGRESS}
     assert egress == {"draft_sms", "draft_email", "draft_pipeline_move"}
-    assert {name for name, tool in tools.items() if tool.approver_only} == {"save_standing_rule",
-                                                                          "deactivate_standing_rule"}
+    assert {name for name, tool in tools.items() if tool.approver_only} == {
+        "save_standing_rule", "deactivate_standing_rule", "dismiss_inbox_item", "route_inbox_item"}
     assert tools["query_lending_data"].safety is SafetyLevel.READ_ONLY
+    assert tools["list_inbox_items"].safety is SafetyLevel.READ_ONLY
+    # Inbox routing posts to the team's own channels, never to a borrower: no approval card, the approver's ask is it.
+    assert tools["route_inbox_item"].safety is SafetyLevel.INTERNAL_WRITE
 
 
 def test_sms_draft_takes_the_recipient_from_the_database(monkeypatch) -> None:

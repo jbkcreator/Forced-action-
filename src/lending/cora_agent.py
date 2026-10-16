@@ -42,7 +42,7 @@ from packages.agent_core.store import AgentStore
 from packages.agent_core.thread_history import build_history
 from packages.agent_core.tools import ToolContext, ToolRegistry
 from src.lending.consent import has_text_consent
-from src.lending.cora_inbox import surface_new_items
+from src.lending.cora_inbox import format_inbox_context, items_on_post, surface_new_items
 from src.lending.cora_prompt import CORA_BASE_PROMPT, REVISION_PROMPT
 from src.lending.cora_tools import CoraToolkit, draft_content_check
 from src.lending.models import LENDING_SCHEMA
@@ -53,6 +53,9 @@ logger = logging.getLogger(__name__)
 AGENT_NAME = "Cora"
 SWEEP_SECONDS = 60
 HISTORY_FETCH_LIMIT = 40  # Slack messages fetched; build_history keeps the latest 20 turns of them
+# A top-level message sees only the channel's recent exchange, not every earlier topic in it.
+TOP_LEVEL_HISTORY_SECONDS = 60 * 60
+TOP_LEVEL_HISTORY_TURNS = 6
 PLACEHOLDER_TEXT = "Working on it…"
 
 # Egress channels Cora may send through once approved. Empty: drafts are approvable, but an approved
@@ -100,6 +103,33 @@ def make_inbox_digest(engine: Engine, chat: ChatPort, channel: str,
     return digest
 
 
+def make_inbox_context(engine: Engine) -> Callable[[str, str], str]:
+    """The ``<inbox_items>`` block for a reply in a digest thread; empty for any other thread."""
+
+    def lookup(channel: str, thread_ts: str) -> str:
+        with Session(engine) as db:
+            items = items_on_post(db, channel, thread_ts)
+        return format_inbox_context(items) if items else ""
+
+    return lookup
+
+
+def make_channel_poster(settings: AppSettings) -> Optional[Callable[[str, str], None]]:
+    """Posts a routed inbox item with the lending bot, which is already a member of the lending channels.
+    None (routing reports "not configured") until LENDING_SLACK_BOT_TOKEN is set."""
+    token = _secret(settings.lending_slack_bot_token)
+    if not token:
+        return None
+    from slack_sdk.web import WebClient
+
+    client = WebClient(token=token)
+
+    def post(channel_id: str, message: str) -> None:
+        client.chat_postMessage(channel=channel_id, text=message, unfurl_links=False, unfurl_media=False)
+
+    return post
+
+
 def _secret(value) -> Optional[str]:
     return value.get_secret_value() if value else None
 
@@ -139,6 +169,14 @@ def make_send_check(engine: Engine) -> SendCheck:
     return check
 
 
+def _ts_seconds(ts: Optional[str]) -> float:
+    """A Slack ts ("1792145692.511199") as epoch seconds; 0 for a missing or malformed one."""
+    try:
+        return float(ts or 0)
+    except ValueError:
+        return 0.0
+
+
 def _is_model_error(error: Exception) -> bool:
     """Anthropic SDK errors (rate limit, overload, network). Imported lazily so tests need no SDK client."""
     try:
@@ -152,25 +190,42 @@ class CoraConversation:
     """Turns one Slack message (or revise reply) into an answer in the same thread."""
 
     def __init__(self, *, config: AgentCoreConfig, chat: ChatPort, loop: AgentLoop, reviser: DraftReviser,
-                 bot_user_id: str) -> None:
+                 bot_user_id: str, inbox_context: Optional[Callable[[str, str], str]] = None) -> None:
         self._config = config
         self._chat = chat
         self._loop = loop
         self._reviser = reviser
         self._bot_user_id = bot_user_id
+        self._inbox_context = inbox_context
+
+    def _thread_inbox_items(self, message: InboundMessage) -> str:
+        """The inbox items a digest thread lists, so a reply like "dismiss 41" has its items in view. A failed
+        lookup only costs that context: Cora still answers and can call list_inbox_items herself."""
+        if not (message.thread_ts and self._inbox_context):
+            return ""
+        try:
+            return self._inbox_context(message.channel, message.thread_ts)
+        except Exception as error:  # class only: SQL errors embed bound parameters
+            logger.error("[cora] inbox lookup for thread %s failed (%s)", message.thread_ts, type(error).__name__)
+            return ""
 
     def _context(self, message: InboundMessage, tool_use_id: str) -> ToolContext:
         return ToolContext(user_id=message.user_id, is_approver=message.user_id in self._config.approver_user_ids,
                            channel=message.channel, thread_ts=message.conversation_ts, tool_use_id=tool_use_id)
 
     def _conversation_so_far(self, message: InboundMessage) -> list[dict[str, Any]]:
-        """Inside a thread: that thread. Top level: the channel's recent messages, since replies are inline."""
+        """Inside a thread: that thread. Top level: only the channel's last few messages from the past hour.
+        The channel is one long running conversation; older top-level topics in the history read to the
+        model as open business, and it revisits them unasked."""
         if message.thread_ts:
             recent = self._chat.replies(channel=message.channel, thread_ts=message.thread_ts, limit=HISTORY_FETCH_LIMIT)
-        else:
-            recent = self._chat.history(channel=message.channel, limit=HISTORY_FETCH_LIMIT)
+            return build_history(recent, bot_user_id=self._bot_user_id, before_ts=message.ts,
+                                 skip_texts=frozenset({PLACEHOLDER_TEXT}))
+        since = _ts_seconds(message.ts) - TOP_LEVEL_HISTORY_SECONDS
+        recent = [item for item in self._chat.history(channel=message.channel, limit=HISTORY_FETCH_LIMIT)
+                  if _ts_seconds(item.get("ts")) >= since]
         return build_history(recent, bot_user_id=self._bot_user_id, before_ts=message.ts,
-                             skip_texts=frozenset({PLACEHOLDER_TEXT}))
+                             skip_texts=frozenset({PLACEHOLDER_TEXT}), limit=TOP_LEVEL_HISTORY_TURNS)
 
     def _finish(self, message: InboundMessage, placeholder_ts: Optional[str], answer: str) -> None:
         if placeholder_ts:
@@ -186,8 +241,12 @@ class CoraConversation:
         placeholder = self._chat.post(text=PLACEHOLDER_TEXT, channel=message.channel,
                                       thread_ts=message.reply_thread_ts)
         history = self._conversation_so_far(message)
+        user_text = f"<@{message.user_id}>: {message.text}"
+        inbox_items = self._thread_inbox_items(message)
+        if inbox_items:
+            user_text = f"{inbox_items}\n{user_text}"
         try:
-            reply = self._loop.run(history=history, user_text=f"<@{message.user_id}>: {message.text}",
+            reply = self._loop.run(history=history, user_text=user_text,
                                    context_for=lambda tool_use_id: self._context(message, tool_use_id))
             answer = reply.text
             logger.info("[cora] answered ts=%s rounds=%s tools=%s queued=%s stop=%s", message.ts, reply.rounds,
@@ -220,8 +279,10 @@ class CoraConversation:
 
 def build_session(config: AgentCoreConfig, store: AgentStore, chat: ChatPort, bot_user_id: str, *,
                   messages_client: MessagesClient, send_check: Optional[SendCheck] = None,
-                  toolkit_factory: Callable[[Engine, AgentMemory], Any] = CoraToolkit) -> CoraServices:
-    """Wire Cora. ``toolkit_factory(engine, memory)`` builds the tool set; tests swap the lead lookups."""
+                  toolkit_factory: Callable[[Engine, AgentMemory], Any] = CoraToolkit,
+                  inbox_context: Optional[Callable[[str, str], str]] = None) -> CoraServices:
+    """Wire Cora. ``toolkit_factory(engine, memory)`` builds the tool set; tests swap the lead lookups.
+    ``inbox_context(channel, thread_ts)`` returns the inbox items a digest thread lists (empty when none)."""
     queue = PendingActionQueue(store, default_ttl=timedelta(hours=config.pending_action_ttl_hours))
     halt = HaltSwitch(store, config.agent_name)
     relay = Relay(queue, halt, EGRESS_EXECUTORS, send_check=send_check)
@@ -237,7 +298,8 @@ def build_session(config: AgentCoreConfig, store: AgentStore, chat: ChatPort, bo
     reviser = DraftReviser(client=messages_client, model=config.model, queue=queue, gate=gate,
                            base_prompt=REVISION_PROMPT, rules_provider=rules, editable_fields=EDITABLE_FIELDS,
                            content_check=draft_content_check)
-    conversation = CoraConversation(config=config, chat=chat, loop=loop, reviser=reviser, bot_user_id=bot_user_id)
+    conversation = CoraConversation(config=config, chat=chat, loop=loop, reviser=reviser, bot_user_id=bot_user_id,
+                                    inbox_context=inbox_context)
     session = SlackSession(config=config, chat=chat, queue=queue, halt=halt, relay=relay,
                            on_message=conversation.on_message, on_revision=conversation.on_revision,
                            bot_user_id=bot_user_id)
@@ -304,9 +366,16 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
     messages_client: MessagesClient = anthropic.Anthropic(
         api_key=config.anthropic_api_key, timeout=90.0, max_retries=2).messages
     chat = SlackChatPort(web, config.slack_channel_id)
+    channel_ids = lending_channel_ids(settings)
+    poster = make_channel_poster(settings)
+
+    def toolkit_factory(toolkit_engine: Engine, memory: AgentMemory) -> CoraToolkit:
+        return CoraToolkit(toolkit_engine, memory, channel_ids=channel_ids, channel_poster=poster)
+
     services = build_session(config, AgentStore(engine, config.db_schema), chat,
-                             bot_user_id, messages_client=messages_client, send_check=make_send_check(engine))
-    digest = make_inbox_digest(engine, chat, config.slack_channel_id, lending_channel_ids(settings))
+                             bot_user_id, messages_client=messages_client, send_check=make_send_check(engine),
+                             toolkit_factory=toolkit_factory, inbox_context=make_inbox_context(engine))
+    digest = make_inbox_digest(engine, chat, config.slack_channel_id, channel_ids)
     return services._replace(web_client=web, inbox_digest=digest)
 
 
