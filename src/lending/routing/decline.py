@@ -8,12 +8,11 @@
 
 The file is a LendingFlow lead or a partner file; the event row says which.
 
-The one-click decline flow (Q2 default):
+A decline always carries a reason code picked from Josh's list (his answer to Q2: no default, because a
+decline for one lender may still work for another). The catch-all reason 'other' also needs a free-text
+explanation.
   POST /api/lending/routing/files/{file_id}/decline
-  Body: {"reason_code": "other", "actor": "josh", "free_text": ""}
-
-OPEN Q2: One-click records reason 'other' (Josh's enum has no 'unspecified') and returns.  Josh to confirm
-whether the reason can be updated in a later call.
+  Body: {"reason_code": "ltv_over_max", "actor": "josh", "free_text": ""}
 """
 from __future__ import annotations
 
@@ -23,7 +22,7 @@ from typing import Optional
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from config.lending_routing import DEFAULT_DECLINE_REASON
+from config.lending_routing import CATCH_ALL_DECLINE_REASON
 from src.lending.routing import partner_link
 from src.lending.routing.file_key import LEAD, key_from_row
 from src.lending.routing.notify import post_decline_event
@@ -45,12 +44,19 @@ def record_decline(
 
     Args:
         event_id: The ``file_routing_events.id`` of the 'routed' event being declined.
-        reason_code: Decline reason code from lending.decline_reason_codes (a fixed enum).
-                     Defaults to Q2's 'other'.  An unknown code raises ValueError.
+        reason_code: Decline reason code from lending.decline_reason_codes (a fixed enum). Required: a
+                     missing or unknown code raises ValueError.
+
         actor: Identifier of the user declining (e.g. 'josh', admin user id).
         db: SQLAlchemy session.
-        free_text: Optional free text to accompany the reason.
+        free_text: Free text to accompany the reason. Required when the reason is the catch-all 'other'.
     """
+    code = (reason_code or "").strip()
+    if not code:
+        raise ValueError("a decline reason is required")
+    if code == CATCH_ALL_DECLINE_REASON and not (free_text or "").strip():
+        raise ValueError("say why in the free text when the reason is 'other'")
+
     from src.lending.routing.router import load_file, route_file, route_loan_file
 
     event = db.execute(
@@ -106,8 +112,6 @@ def record_decline(
             event_id, key.column, key.id,
         )
         return
-
-    code = reason_code or DEFAULT_DECLINE_REASON
 
     # The reason comes from a fixed enum Josh supplies (lending.decline_reason_codes).
     valid = db.execute(

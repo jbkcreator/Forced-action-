@@ -538,22 +538,27 @@ def test_no_lender_name_hard_coded_in_routing_package():
                 )
 
 
-# ── Decline default reason ────────────────────────────────────────────────────
+# ── A decline always needs a reason (Josh: no default) ────────────────────────
 
-def test_decline_stores_default_reason_when_none_given(rdb):
-    from config.lending_routing import DEFAULT_DECLINE_REASON
+def test_a_decline_needs_a_reason_and_other_needs_details(rdb):
     from src.lending.routing.decline import record_decline
 
-    l1 = _add_lender(rdb, name="Default Reason Lender", priority=1)
+    l1 = _add_lender(rdb, name="Reason Lender", priority=1)
     _add_box(rdb, l1, loan_types=[LOAN_TYPE_FLIP])
     lead_id = _make_lead(rdb, phone_suffix="9501")
     _route(rdb, lead_id)
     ev_id = _routed_event_id(rdb, lead_id)
-    record_decline(ev_id, reason_code=None, actor="josh", db=rdb)
+    for missing in (None, "", "   "):
+        with pytest.raises(ValueError, match="reason is required"):
+            record_decline(ev_id, reason_code=missing, actor="josh", db=rdb)
+    for no_details in (None, "", "  "):
+        with pytest.raises(ValueError, match="say why"):
+            record_decline(ev_id, reason_code="other", actor="josh", db=rdb, free_text=no_details)
+    assert [e["action"] for e in _events(rdb, lead_id)] == ["routed"]  # nothing was recorded
 
-    events = _events(rdb, lead_id)
-    decline_ev = next(e for e in events if e["action"] == "declined")
-    assert decline_ev["reason_code"] == DEFAULT_DECLINE_REASON
+    record_decline(ev_id, reason_code="other", actor="josh", db=rdb, free_text="Lender is out of the market")
+    declined = next(e for e in _events(rdb, lead_id) if e["action"] == "declined")
+    assert declined["reason_code"] == "other"
 
 
 # ── Hold summary: hour check ──────────────────────────────────────────────────
@@ -575,8 +580,9 @@ class _FakeSlack:
     def __init__(self):
         self.sent: list[str] = []
 
-    def chat_postMessage(self, channel, text):  # noqa: N802 - slack_sdk API name
+    def chat_postMessage(self, channel, text, blocks=None):  # noqa: N802 - slack_sdk API name
         self.sent.append(text)
+        self.blocks = getattr(self, "blocks", []) + [blocks]
         return {"ts": f"{len(self.sent)}.0"}
 
 
@@ -851,7 +857,12 @@ def test_file_record_shows_current_next_and_history_and_one_click_decline(rdb, a
     assert [h["action"] for h in rec["history"]] == ["routed"]
     assert rec["can_decline"] is True
 
-    assert api.post(f"/api/lending/routing/files/{lead}/decline", json={}).status_code == 200
+    assert api.post(f"/api/lending/routing/files/{lead}/decline", json={}).status_code == 422  # a reason is required
+    assert api.get(f"/api/lending/routing/files/{lead}").json()["current"]["name"] == "First"
+    assert api.post(f"/api/lending/routing/files/{lead}/decline",
+                    json={"reason_code": "other"}).status_code == 422  # 'other' needs details
+    assert api.post(f"/api/lending/routing/files/{lead}/decline",
+                    json={"reason_code": "other", "free_text": "Lender left the market"}).status_code == 200
     rec = api.get(f"/api/lending/routing/files/{lead}").json()
     assert rec["current"]["name"] == "Second" and rec["next"] is None
     assert [h["action"] for h in rec["history"]] == ["routed", "declined", "routed"]
@@ -861,7 +872,8 @@ def test_file_record_shows_current_next_and_history_and_one_click_decline(rdb, a
                     json={"reason_code": "ltv_over_max", "actor": "josh"}).status_code == 200
     rec = api.get(f"/api/lending/routing/files/{lead}").json()
     assert rec["file"]["status"] == "exhausted" and rec["current"] is None and rec["can_decline"] is False
-    assert api.post(f"/api/lending/routing/files/{lead}/decline", json={}).status_code == 422
+    assert api.post(f"/api/lending/routing/files/{lead}/decline",
+                    json={"reason_code": "ltv_over_max"}).status_code == 422  # exhausted: nothing to decline
     assert api.get("/api/lending/routing/files/999999").status_code == 404
 
 
@@ -964,7 +976,7 @@ def test_a_failing_route_hook_does_not_poison_the_enrichment_session(rdb, monkey
 def test_meta_lists_the_vocabularies(api):
     meta = api.get("/api/lending/routing/meta").json()
     assert meta["loan_types"] == ["FIX_AND_FLIP", "GROUND_UP_CONSTRUCTION", "DSCR_RENTAL", "BRIDGE"]
-    assert "signed" in meta["agreement_statuses"] and meta["default_decline_reason"] == "other"
+    assert "signed" in meta["agreement_statuses"] and meta["catch_all_decline_reason"] == "other"
 
 
 # ── Reconcile with T-05: one source of truth for lender rule values ───────────
@@ -1357,7 +1369,8 @@ def test_partner_files_appear_in_the_admin_api_beside_leads(rdb, api, partner_ma
     assert api.get(f"{base}/files/{fid}").status_code == 404  # the same id as a lead is a different file
     assert api.get(f"{base}/files/{lead}").json()["file"]["source"] == "lendingflow"
 
-    assert api.post(f"{base}/files/{fid}/decline", params={"source": "partner"}, json={}).status_code == 200
+    assert api.post(f"{base}/files/{fid}/decline", params={"source": "partner"},
+                    json={"reason_code": "ltv_over_max"}).status_code == 200
     rec = api.get(f"{base}/files/{fid}", params={"source": "partner"}).json()
     assert rec["current"]["name"] == "Beta Funding"
     assert [h["action"] for h in rec["history"]] == ["routed", "declined", "routed"]
@@ -1681,7 +1694,7 @@ def test_admin_inputs_that_would_overflow_or_mean_nothing_are_refused_with_422_n
     assert api.post(f"{base}/decline-reasons", json={"code": "x" * 51, "label": "too long"}).status_code == 422
     assert api.post(f"{base}/decline-reasons", json={"code": "Has Space", "label": "bad code"}).status_code == 422
     assert api.post(f"{base}/decline-reasons", json={"code": "other", "label": "x", "active": False}).status_code == 422
-    assert api.post(f"{base}/events/1/decline", json={"actor": "a" * 101}).status_code == 422
+    assert api.post(f"{base}/events/1/decline", json={"reason_code": "ltv_over_max", "actor": "a" * 101}).status_code == 422
     assert api.get(f"{base}/files/99999999999").status_code == 422  # out of the id range, not a database error
     assert api.patch(f"{base}/lenders/99999999999", json={"active": False}).status_code == 422
 
@@ -1731,8 +1744,8 @@ def test_make_primary_refuses_a_paused_lender_and_conflicts_say_which_rule_was_b
 def test_api_errors_do_not_expose_table_or_column_names(api):
     base = "/api/lending/routing"
     for response in (
-        api.post(f"{base}/events/999999/decline", json={}),
-        api.post(f"{base}/files/999999/decline", json={}),
+        api.post(f"{base}/events/999999/decline", json={"reason_code": "ltv_over_max"}),
+        api.post(f"{base}/files/999999/decline", json={"reason_code": "ltv_over_max"}),
         api.post(f"{base}/files/999999/outcome", json={"action": "funded"}),
     ):
         assert response.status_code == 422
@@ -1799,7 +1812,7 @@ def slack_form(rdb, monkeypatch):
     posted: list[str] = []
 
     class Client:
-        def chat_postMessage(self, channel, text):  # noqa: N802 - slack_sdk API name
+        def chat_postMessage(self, channel, text, blocks=None):  # noqa: N802 - slack_sdk API name
             posted.append(text)
             return {"ts": f"{len(posted)}.0"}
 
@@ -1925,3 +1938,172 @@ def test_the_lender_form_lists_the_waterfall_and_nobody_may_edit_when_no_editor_
     assert view["callback_id"] == slack_admin.CALLBACK_ID
     assert "Alpha Capital" in view["blocks"][0]["text"]["text"] and "Beta Funding" in view["blocks"][0]["text"]["text"]
     assert slack_admin.allowed_user_ids() == frozenset()  # default: fail closed
+
+
+# ── Slack buttons on a routed post (Decline needs a reason; Approved; Funded) ─
+
+def test_only_a_routed_post_carries_the_buttons(rdb, fake_slack):
+    from src.lending.routing.decline import record_decline
+
+    _two_flip_lenders(rdb)
+    lead = _make_lead(rdb, phone_suffix="6201")
+    _route(rdb, lead)
+    actions = [b for b in fake_slack.blocks[0] if b["type"] == "actions"][0]["elements"]
+    assert [e["action_id"] for e in actions] == ["routing_decline", "routing_approved", "routing_funded"]
+    assert {e["value"] for e in actions} == {str(_routed_event_id(rdb, lead))}
+    assert "confirm" in actions[2]  # funded asks "are you sure" first
+    record_decline(_routed_event_id(rdb, lead), reason_code="ltv_over_max", actor="josh", db=rdb)
+    assert [bool(b) for b in fake_slack.blocks] == [True, False, True]  # routed, declined, re-routed
+
+
+@pytest.fixture
+def buttons(rdb, monkeypatch):
+    """The real button and form handlers on the test session, Josh the only allowed user, Slack calls recorded."""
+    from contextlib import contextmanager
+
+    from fastapi import BackgroundTasks
+
+    from src.lending.routing import slack_actions
+
+    calls: dict[str, list] = {"opened": [], "updated": [], "told": []}
+
+    class Client:
+        def views_open(self, trigger_id, view):
+            calls["opened"].append(view)
+
+        def chat_update(self, channel, ts, text, blocks):
+            calls["updated"].append((text, blocks))
+
+        def chat_postEphemeral(self, channel, user, text):  # noqa: N802 - slack_sdk API name
+            calls["told"].append((user, text))
+
+    @contextmanager
+    def session():
+        yield rdb
+
+    monkeypatch.setattr(slack_actions, "lending_session", session)
+    monkeypatch.setattr(slack_actions, "slack_client", lambda: Client())
+    monkeypatch.setattr(slack_actions, "allowed_user_ids", lambda: frozenset({"UJOSH"}))
+
+    class Env:
+        pass
+
+    env = Env()
+    env.calls = calls
+
+    def click(action_id, event_id, user="UJOSH"):
+        slack_actions.handle_action({
+            "type": "block_actions", "user": {"id": user}, "trigger_id": "T1", "channel": {"id": "C1"},
+            "message": {"ts": "1.0", "text": "Routed | File", "blocks": [{"type": "actions"}]},
+            "actions": [{"action_id": action_id, "value": str(event_id)}]})
+
+    def submit(event_id, reason="", details="", user="UJOSH"):
+        values = {"reason_b": {"v": {"type": "static_select", "selected_option": {"value": reason} if reason else None}},
+                  "text_b": {"v": {"type": "plain_text_input", "value": details}}}
+        payload = {"type": "view_submission", "user": {"id": user}, "view": {
+            "callback_id": slack_actions.DECLINE_CALLBACK_ID, "state": {"values": values},
+            "private_metadata": json.dumps({"event_id": event_id, "channel": "C1", "ts": "1.0", "original": "Routed | File"})}}
+        background = BackgroundTasks()
+        response = slack_actions.handle_decline_submission(payload, background)
+        for task in background.tasks:
+            task.func(*task.args, **task.kwargs)
+        return response
+
+    env.click, env.submit = click, submit
+    return env
+
+
+def test_decline_button_opens_a_form_with_josh_reasons_and_a_stranger_is_refused(rdb, buttons, fake_slack):
+    _two_flip_lenders(rdb)
+    lead = _make_lead(rdb, phone_suffix="6301")
+    _route(rdb, lead)
+    event = _routed_event_id(rdb, lead)
+    buttons.click("routing_decline", event, user="USTRANGER")
+    assert buttons.calls["opened"] == [] and "Only approved users" in buttons.calls["told"][0][1]
+    buttons.click("routing_decline", event)
+    view = buttons.calls["opened"][0]
+    reasons = [o["value"] for o in view["blocks"][1]["element"]["options"]]
+    assert "ltv_over_max" in reasons and view["blocks"][1]["optional"] is False  # a reason is mandatory
+
+
+def test_a_decline_from_slack_needs_a_reason_and_other_needs_details(rdb, buttons, fake_slack):
+    _two_flip_lenders(rdb)
+    lead = _make_lead(rdb, phone_suffix="6401")
+    _route(rdb, lead)
+    event = _routed_event_id(rdb, lead)
+    assert buttons.submit(event)["errors"]["reason_b"]
+    assert buttons.submit(event, reason="other")["errors"]["text_b"]
+    assert buttons.submit(event, reason="ltv_over_max", user="USTRANGER")["response_action"] == "errors"
+    assert _fr(rdb, lead)["current_lender_name"] == "Alpha Capital"  # nothing happened yet
+
+    assert buttons.submit(event, reason="other", details="Lender paused new loans") == {}
+    declined = next(e for e in _events(rdb, lead) if e["action"] == "declined")
+    assert declined["reason_code"] == "other"
+    assert rdb.execute(text("SELECT free_text, actor FROM lending.file_routing_events WHERE action = 'declined'"
+                            " AND lead_id = :l"), {"l": lead}).one() == ("Lender paused new loans", "slack:UJOSH")
+    assert _fr(rdb, lead)["current_lender_name"] == "Beta Funding"  # re-routed to the next lender
+    assert "Declined" in buttons.calls["updated"][-1][0]  # the old post no longer offers buttons
+
+
+def test_an_old_post_cannot_act_on_a_later_lender(rdb, buttons, fake_slack):
+    _two_flip_lenders(rdb)
+    lead = _make_lead(rdb, phone_suffix="6501")
+    _route(rdb, lead)
+    first = _routed_event_id(rdb, lead)
+    assert buttons.submit(first, reason="ltv_over_max") == {}  # declined; the file is now with Beta
+    assert "no longer" in buttons.submit(first, reason="ltv_over_max")["errors"]["reason_b"]
+    buttons.click("routing_funded", first)
+    assert "no longer" in buttons.calls["told"][-1][1]
+    assert [e["action"] for e in _events(rdb, lead)] == ["routed", "declined", "routed"]  # no funded on Beta
+
+
+def test_approved_and_funded_buttons_record_the_outcome_and_funded_uses_a_seat(rdb, buttons, fake_slack):
+    primary = _add_lender(rdb, name="One Seat", is_primary=True, priority=1, monthly_cap=1)
+    _add_box(rdb, primary, loan_types=[LOAN_TYPE_FLIP])
+    spill = _add_lender(rdb, name="Spill Over", priority=2)
+    _add_box(rdb, spill, loan_types=[LOAN_TYPE_FLIP])
+    first, second = _make_lead(rdb, phone_suffix="6601"), _make_lead(rdb, phone_suffix="6602")
+    _route(rdb, first)
+    event = _routed_event_id(rdb, first)
+    buttons.click("routing_approved", event)
+    assert [e["action"] for e in _events(rdb, first)] == ["routed", "approved"]
+    assert buttons.calls["updated"][-1][1][-1]["type"] == "actions"  # approved keeps the buttons
+    buttons.click("routing_funded", event)
+    assert [e["action"] for e in _events(rdb, first)] == ["routed", "approved", "funded"]
+    assert all(b["type"] != "actions" for b in buttons.calls["updated"][-1][1])  # funded closes the post
+    assert rdb.execute(text("SELECT actor FROM lending.file_routing_events WHERE action = 'funded'")).scalar() == "slack:UJOSH"
+    buttons.click("routing_funded", event)  # a second click records nothing more
+    assert [e["action"] for e in _events(rdb, first)].count("funded") == 1
+    _route(rdb, second)
+    assert _fr(rdb, second)["current_lender_name"] == "Spill Over"  # the seat is used
+
+
+def test_button_and_form_clicks_are_dispatched_from_the_interactivity_url(rdb, monkeypatch):
+    import hashlib
+    import hmac
+    import time
+    from urllib.parse import urlencode
+
+    from fastapi.testclient import TestClient
+    from pydantic import SecretStr
+
+    from config.settings import get_settings
+    from src.lending.api import app
+    from src.lending.routing import slack_actions
+
+    secret = "signing-secret-for-test"
+    monkeypatch.setattr(get_settings(), "lending_slack_signing_secret", SecretStr(secret), raising=False)
+    seen: list[str] = []
+    monkeypatch.setattr(slack_actions, "handle_action", lambda payload: seen.append("click"))
+    monkeypatch.setattr(slack_actions, "handle_decline_submission", lambda payload, background: seen.append("form") or {})
+
+    def post(payload):
+        body = urlencode({"payload": json.dumps(payload)})
+        ts = str(int(time.time()))
+        sig = "v0=" + hmac.new(secret.encode(), f"v0:{ts}:{body}".encode(), hashlib.sha256).hexdigest()
+        return TestClient(app).post("/webhooks/lending/slack-interactivity", content=body, headers={
+            "X-Slack-Request-Timestamp": ts, "X-Slack-Signature": sig, "Content-Type": "application/x-www-form-urlencoded"})
+
+    assert post({"type": "block_actions", "actions": [{"action_id": "routing_funded", "value": "1"}]}).status_code == 200
+    assert post({"type": "view_submission", "view": {"callback_id": slack_actions.DECLINE_CALLBACK_ID}}).status_code == 200
+    assert seen == ["click", "form"]

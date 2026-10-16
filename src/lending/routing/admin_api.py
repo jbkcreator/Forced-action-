@@ -42,7 +42,7 @@ from sqlalchemy.orm import Session
 
 from config.lending_routing import (
     AGREEMENT_STATUS_CHOICES,
-    DEFAULT_DECLINE_REASON,
+    CATCH_ALL_DECLINE_REASON,
     OUTCOME_ACTIONS,
     PRIMARY_DEFAULT_CONSTRUCTION_MIN,
     PRIMARY_DEFAULT_SEAT_CAP,
@@ -198,7 +198,7 @@ class DeclineReasonIn(BaseModel):
 
 
 class DeclineIn(BaseModel):
-    reason_code: str = Field(default=DEFAULT_DECLINE_REASON, min_length=1, max_length=50)
+    reason_code: str = Field(min_length=1, max_length=50)
     actor: str = Field(default="josh", min_length=1, max_length=100)
     free_text: Optional[str] = Field(default=None, max_length=2000)
 
@@ -533,8 +533,8 @@ def add_decline_reason(
     _: None = Depends(_verify_admin),
     db: Session = Depends(get_lending_db),
 ) -> dict:
-    if body.code == DEFAULT_DECLINE_REASON and not body.active:
-        raise HTTPException(status_code=422, detail="The default decline reason cannot be switched off.")
+    if body.code == CATCH_ALL_DECLINE_REASON and not body.active:
+        raise HTTPException(status_code=422, detail="The catch-all decline reason ('other') cannot be switched off.")
     db.execute(
         text(
             "INSERT INTO lending.decline_reason_codes (code, label, active)"
@@ -673,7 +673,7 @@ def meta(_: None = Depends(_verify_admin)) -> dict:
         "file_statuses": list(_FILE_STATUSES),
         "file_sources": list(_FILE_SOURCES),
         "outcome_actions": list(OUTCOME_ACTIONS),
-        "default_decline_reason": DEFAULT_DECLINE_REASON,
+        "catch_all_decline_reason": CATCH_ALL_DECLINE_REASON,
         "seat_cap_counted_action": SEAT_CAP_COUNTED_ACTION,
     }
 
@@ -766,7 +766,7 @@ def decline_file(
     _: None = Depends(_verify_admin),
     db: Session = Depends(get_lending_db),
 ) -> dict[str, Any]:
-    """One-click decline of the file's current lender (the file record's Decline button)."""
+    """Decline the file's current lender. A reason is required (and free text when it is 'other')."""
     from src.lending.routing.decline import record_decline
 
     key = _file_key(source, file_id)

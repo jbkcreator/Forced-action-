@@ -50,9 +50,15 @@ PRIMARY_DEFAULT_CONSTRUCTION_MIN: int = 500_000
 # approved / funded; routed and declined are written by the router and the decline handler).
 OUTCOME_ACTIONS: tuple[str, ...] = ("approved", "funded")
 
-# Default reason recorded on a one-click decline (Q2). Josh's enum has no "unspecified", so the one-click
-# decline records "other"; the team still has to confirm that is what he wants (open question Q2).
-DEFAULT_DECLINE_REASON: str = "other"
+# The catch-all reason. It is never a default: a decline always needs a reason picked (Josh's answer to Q2),
+# and choosing this one also needs a free-text explanation. It cannot be deactivated, so there is always an
+# honest choice when none of Josh's specific reasons fits.
+CATCH_ALL_DECLINE_REASON: str = "other"
+
+# Slack action ids on the buttons of a routed message (R-1 decline / outcome buttons).
+ACTION_DECLINE: str = "routing_decline"
+ACTION_APPROVED: str = "routing_approved"
+ACTION_FUNDED: str = "routing_funded"
 
 # Josh's fixed decline-reason enum (his reply, "Inputs for the addendum"). Stored as data, so it stays editable.
 SEED_DECLINE_REASONS: list[tuple[str, str]] = [

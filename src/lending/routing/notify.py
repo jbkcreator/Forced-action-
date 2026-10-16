@@ -83,6 +83,34 @@ def build_message(
     return None
 
 
+def _action_blocks(message: str, action: str, event_id: int) -> Optional[list[dict]]:
+    """Decline / Approved / Funded buttons under a 'routed' post (None for every other kind of post)."""
+    if action != "routed":
+        return None
+    from config.lending_routing import ACTION_APPROVED, ACTION_DECLINE, ACTION_FUNDED
+
+    def button(action_id: str, label: str, style: Optional[str] = None, confirm: Optional[str] = None) -> dict:
+        element = {"type": "button", "action_id": action_id, "value": str(event_id),
+                   "text": {"type": "plain_text", "text": label}}
+        if style:
+            element["style"] = style
+        if confirm:
+            element["confirm"] = {
+                "title": {"type": "plain_text", "text": "Are you sure?"},
+                "text": {"type": "mrkdwn", "text": confirm},
+                "confirm": {"type": "plain_text", "text": "Yes"}, "deny": {"type": "plain_text", "text": "Cancel"}}
+        return element
+
+    return [
+        {"type": "section", "text": {"type": "mrkdwn", "text": message}},
+        {"type": "actions", "block_id": f"routing_{event_id}", "elements": [
+            button(ACTION_DECLINE, "Decline", "danger"),
+            button(ACTION_APPROVED, "Approved"),
+            button(ACTION_FUNDED, "Funded", "primary", "This uses one of the lender's monthly seats. Mark it funded?"),
+        ]},
+    ]
+
+
 def _mark_posted(event_id: int, ts: str, db: Session) -> None:
     """Update slack_ts / slack_posted_at on the event row (only these two columns may be updated)."""
     db.execute(
@@ -96,14 +124,16 @@ def _mark_posted(event_id: int, ts: str, db: Session) -> None:
     db.commit()
 
 
-def _post(message: str, event_id: int, db: Session, *, what: str, lead_id) -> None:
+def _post(message: str, event_id: int, db: Session, *, what: str, lead_id, action: str = "") -> None:
     client = _client()
     channel = _channel()
     if not client or not channel:
         logger.warning("notify.%s: Slack not configured — skipping", what)
         return
     try:
-        resp = client.chat_postMessage(channel=channel, text=message)
+        blocks = _action_blocks(message, action, event_id)
+        resp = (client.chat_postMessage(channel=channel, text=message, blocks=blocks) if blocks
+                else client.chat_postMessage(channel=channel, text=message))
         _mark_posted(event_id, resp["ts"], db)
     except Exception:
         db.rollback()  # a failed bookkeeping write must not leave the caller's session aborted
@@ -124,7 +154,7 @@ def post_route_event(
         loan_type=lead.get("loan_type"), loan_amount=lead.get("loan_amount"),
         lender_name=lender.name, position=position, label=lead.get("label"),
     )
-    _post(message, event_id, db, what="post_route_event", lead_id=lead.get("id"))
+    _post(message, event_id, db, what="post_route_event", lead_id=lead.get("id"), action="routed")
 
 
 def post_decline_event(
@@ -219,7 +249,9 @@ def retry_unposted_events(db: Session) -> int:
         if message is None:
             continue
         try:
-            resp = client.chat_postMessage(channel=channel, text=message)
+            blocks = _action_blocks(message, row["action"], row["id"])
+            resp = (client.chat_postMessage(channel=channel, text=message, blocks=blocks) if blocks
+                    else client.chat_postMessage(channel=channel, text=message))
             _mark_posted(row["id"], resp["ts"], db)
             posted += 1
         except Exception:

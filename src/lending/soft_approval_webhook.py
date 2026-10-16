@@ -24,7 +24,7 @@ from sqlalchemy import text
 from config.lending_soft_approval import FORM_CALLBACK_ID, OPEN_FORM_ACTION_ID
 from config.settings import get_settings
 from src.lending.db import lending_session
-from src.lending.routing import slack_admin
+from src.lending.routing import slack_actions, slack_admin
 from src.lending.soft_approval.enrichment_link import share_facts_with_enrichment
 from src.lending.soft_approval.facts import SoftApprovalFacts
 from src.lending.soft_approval.service import generate_soft_approval
@@ -235,6 +235,11 @@ async def slack_interactivity(request: Request, background: BackgroundTasks) -> 
         return {}
     if isinstance(payload, dict) and slack_admin.is_routing_submission(payload):
         return await run_in_threadpool(slack_admin.handle_submission, payload)
+    if isinstance(payload, dict) and slack_actions.is_routing_action(payload):
+        await run_in_threadpool(slack_actions.handle_action, payload)
+        return {}
+    if isinstance(payload, dict) and slack_actions.is_decline_submission(payload):
+        return await run_in_threadpool(slack_actions.handle_decline_submission, payload, background)
     if not get_settings().lending_soft_approval_enabled:
         return {}
     if not isinstance(payload, dict):
