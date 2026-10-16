@@ -301,8 +301,15 @@ def _process(file_id: int, services: PipelineServices, session_factory: Callable
         )
         route_file(db, file_id, now=now)
 
+    _send_new_file_notices(file, partner, fit, services, session_factory)
+
+
+def _send_new_file_notices(file: dict[str, Any], partner: Optional[Partner], fit: Optional[LenderFitResult],
+                           services: PipelineServices, session_factory: Callable[[], Any]) -> None:
+    """Josh's Slack card and the partner's confirmation, each sent once (stamped on success)."""
     if partner is None:
         return
+    file_id = file["id"]
     with session_factory() as db:
         flags = db.execute(text("SELECT josh_notified_at, partner_confirmed_at FROM lending.partner_submissions "
                                 "WHERE file_id = :id"), {"id": file_id}).mappings().first() or {}
@@ -318,6 +325,25 @@ def _process(file_id: int, services: PipelineServices, session_factory: Callable
                 f"(reference #{file['id']}). You can follow its status from the same link you used to submit it.")
         if _send_partner(services, partner, f"We received your file for {place}", body):
             _stamp(session_factory, file_id, "partner_confirmed_at")
+
+
+def send_pending_notices(file_id: int, services: Optional[PipelineServices] = None,
+                         session_factory: Optional[Callable[[], Any]] = None) -> None:
+    """Retry the new-file notices for a file that was already scored and routed. Never raises."""
+    try:
+        if session_factory is None:
+            from src.lending.db import lending_session as session_factory
+        services = services or live_services()
+        with session_factory() as db:
+            file = db.execute(text("SELECT * FROM lending.loan_files WHERE id = :id"), {"id": file_id}).mappings().first()
+            if file is None:
+                return
+            file = dict(file)
+            partner = partner_by_id(db, int(file["partner_id"]))
+        fit = LenderFitResult.model_validate_json(file["lender_fit"]) if file["lender_fit"] else None
+        _send_new_file_notices(file, partner, fit, services, session_factory)
+    except Exception as exc:
+        logger.error("[partner-door] notice retry failed file=%s (%s)", file_id, type(exc).__name__)
 
 
 def _stamp(session_factory: Callable[[], Any], file_id: int, column: str) -> None:
@@ -367,5 +393,21 @@ def unprocessed_file_ids(db, older_than_minutes: int, limit: int, now: Optional[
         text("SELECT id FROM lending.loan_files WHERE source = :source AND status = 'received' "
              "AND created_at < :cutoff ORDER BY created_at LIMIT :limit"),
         {"source": SOURCE_PARTNER, "cutoff": (now or _utcnow()) - timedelta(minutes=older_than_minutes), "limit": limit},
+    ).all()
+    return [int(row[0]) for row in rows]
+
+
+def unnotified_file_ids(db, older_than_minutes: int, max_age_hours: int, limit: int,
+                        now: Optional[datetime] = None) -> list[int]:
+    """Partner files already past 'received' whose Slack card or partner confirmation never went out
+    (e.g. Slack down, email failed). Retried until ``max_age_hours`` after the file arrived."""
+    now = now or _utcnow()
+    rows = db.execute(
+        text("SELECT f.id FROM lending.loan_files f JOIN lending.partner_submissions s ON s.file_id = f.id "
+             "WHERE f.source = :source AND f.status <> 'received' "
+             "AND (s.josh_notified_at IS NULL OR s.partner_confirmed_at IS NULL) "
+             "AND f.created_at < :cutoff AND f.created_at > :oldest ORDER BY f.created_at LIMIT :limit"),
+        {"source": SOURCE_PARTNER, "cutoff": now - timedelta(minutes=older_than_minutes),
+         "oldest": now - timedelta(hours=max_age_hours), "limit": limit},
     ).all()
     return [int(row[0]) for row in rows]

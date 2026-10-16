@@ -592,3 +592,38 @@ def test_money_parses_to_whole_dollars() -> None:
     assert data.purchase_price == 180000 and isinstance(data.loan_amount, int)
     assert Decimal(data.loan_amount) == Decimal(200000)
 
+
+
+def test_sweep_retries_the_slack_card_when_slack_failed_after_routing(engine, session_factory, tmp_path) -> None:
+    _, token = _partner(session_factory)
+    file_id = _submit(session_factory, token)
+    recorder = Recorder()
+    services = _services(recorder, tmp_path)
+
+    def slack_down(note):
+        raise RuntimeError("slack down")
+
+    partner_pipeline.process_new_file(file_id, dataclasses.replace(services, slack=slack_down), session_factory)
+    assert _rows(engine, "loan_files")[0]["status"] == "held"
+    assert _rows(engine, "partner_submissions")[0]["josh_notified_at"] is None
+    later = datetime.now(timezone.utc) + timedelta(minutes=30)
+    with session_factory() as db:
+        assert partner_pipeline.unprocessed_file_ids(db, 10, 20, now=later) == []
+        assert partner_pipeline.unnotified_file_ids(db, 10, 24, 20, now=later) == [file_id]
+    partner_pipeline.send_pending_notices(file_id, services, session_factory)
+    assert len(recorder.slack) == 1 and _rows(engine, "partner_submissions")[0]["josh_notified_at"] is not None
+    assert len(recorder.emails) == 1  # partner confirmation was already sent; not repeated
+    with session_factory() as db:
+        assert partner_pipeline.unnotified_file_ids(db, 10, 24, 20, now=later) == []
+        assert partner_pipeline.unnotified_file_ids(db, 10, 24, 20, now=later + timedelta(days=2)) == []
+
+
+def test_editing_the_reason_on_a_funded_file_keeps_its_funded_date(engine, session_factory) -> None:
+    _, token = _partner(session_factory)
+    file_id = _submit(session_factory, token)
+    first = datetime(2026, 10, 5, tzinfo=timezone.utc)
+    with session_factory() as db:
+        partners.record_status_change(db, file_id, "funded", now=first)
+        partners.record_status_change(db, file_id, "funded", "wire confirmed", now=datetime(2026, 11, 2, tzinfo=timezone.utc))
+        assert partners.funded_by_partner(db, date(2026, 10, 1), date(2026, 11, 1)) == [("Maria Lopez", 1)]
+    assert str(_rows(engine, "loan_files")[0]["funded_at"]).startswith("2026-10-05")

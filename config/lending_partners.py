@@ -71,3 +71,5 @@ RATE_LIMIT_WINDOW_SECONDS = 3600
 # Sweep: a partner file still 'received' this long after it arrived lost its background run (crash/restart).
 SWEEP_AFTER_MINUTES = 10
 SWEEP_BATCH_SIZE = 20
+# A file whose Slack card or partner confirmation failed is retried by the sweep for this long.
+NOTICE_RETRY_HOURS = 24
