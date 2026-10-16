@@ -106,9 +106,11 @@ def _action_blocks(message: str, action: str, event_id: int) -> Optional[list[di
     """Buttons under a post: Details on every route, decline and hold; Decline / Approved / Funded only on a route."""
     if action not in ("routed", "declined", "held"):
         return None
-    from config.lending_routing import ACTION_APPROVED, ACTION_DECLINE, ACTION_DETAILS, ACTION_FUNDED
+    from config.lending_routing import ACTION_APPROVED, ACTION_DECLINE, ACTION_DETAILS, ACTION_FUNDED, ACTION_REROUTE
 
     elements = [_button(ACTION_DETAILS, event_id, "Details")]
+    if action == "held":
+        elements = [_button(ACTION_REROUTE, event_id, "Re-route", "primary")] + elements
     if action == "routed":
         elements = [
             _button(ACTION_DECLINE, event_id, "Decline", "danger"),

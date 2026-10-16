@@ -19,10 +19,10 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from config.lending_routing import (
-    ACTION_APPROVED, ACTION_DECLINE, ACTION_DETAILS, ACTION_FUNDED, CATCH_ALL_DECLINE_REASON, ROUTING_TZ,
+    ACTION_APPROVED, ACTION_DECLINE, ACTION_DETAILS, ACTION_FUNDED, ACTION_REROUTE, CATCH_ALL_DECLINE_REASON, ROUTING_TZ,
 )
 from src.lending.db import lending_session
-from src.lending.routing import admin_api
+from src.lending.routing import lender_service
 from src.lending.routing.file_key import key_from_row
 from src.lending.routing.notify import details_block
 from src.lending.routing.slack_admin import _input, _user_id, _value, allowed_user_ids
@@ -39,7 +39,7 @@ Scheduler = Callable[..., None]  # run_later(fn, *args): do the slow part after 
 def is_routing_action(payload: dict) -> bool:
     actions = payload.get("actions") or []
     return (payload.get("type") == "block_actions" and bool(actions)
-            and actions[0].get("action_id") in {ACTION_DECLINE, ACTION_DETAILS, *_OUTCOME_BUTTONS})
+            and actions[0].get("action_id") in {ACTION_DECLINE, ACTION_DETAILS, ACTION_REROUTE, *_OUTCOME_BUTTONS})
 
 
 def is_decline_submission(payload: dict) -> bool:
@@ -133,11 +133,36 @@ def _show_details(client: Any, channel: str, user: str, event_id: int) -> None:
                 _tell(client, channel, user, "That file was not found.")
                 return
             key = key_from_row(event)
-            record = admin_api.file_record(file_id=key.id, source=key.source, _=None, db=db)
+            record = lender_service.file_record(key, db)
         _tell(client, channel, user, format_record(record))
     except Exception as exc:  # class only
         logger.error("[routing-slack] details failed event=%s: %s", event_id, type(exc).__name__)
         _tell(client, channel, user, "Something went wrong; nothing was changed.")
+
+
+def _reroute(client: Any, channel: str, user: str, ts: str, original: str, event_id: int) -> None:
+    """Send a held or exhausted file back to the router now (after a lender was signed or a box was changed)."""
+    from src.lending.routing.file_key import LEAD
+    from src.lending.routing.router import reopen_file, route_file, route_loan_file
+
+    try:
+        with lending_session() as db:
+            event = db.execute(text("SELECT lead_id, loan_file_id, action FROM lending.file_routing_events WHERE id = :e"),
+                               {"e": event_id}).mappings().one_or_none()
+            if event is None or event["action"] != "held":
+                _tell(client, channel, user, "That post is not a held file.")
+                return
+            key = key_from_row(event)
+            if not reopen_file(key, db):
+                _tell(client, channel, user, "That file is no longer in the hold queue.")
+                return
+            (route_file if key.kind == LEAD else route_loan_file)(key.id, db)
+    except Exception as exc:  # class only
+        logger.error("[routing-slack] re-route failed event=%s: %s", event_id, type(exc).__name__)
+        _tell(client, channel, user, "Something went wrong; nothing was changed.")
+        return
+    _update_post(client, channel, ts, original, f":recycle: *Sent back to the router* by <@{user}>",
+                 keep_buttons=[details_block(event_id)])
 
 
 def _buttons_left_after_approval(message: dict) -> list[dict]:
@@ -159,6 +184,9 @@ def handle_action(payload: dict, client: Any) -> None:
     ts, original = str(message.get("ts") or ""), str(message.get("text") or "")
     if action["action_id"] == ACTION_DETAILS:
         _show_details(client, channel, user, int(action.get("value") or 0))
+        return
+    if action["action_id"] == ACTION_REROUTE:
+        _reroute(client, channel, user, ts, original, int(action.get("value") or 0))
         return
     try:
         event_id = int(action.get("value") or 0)

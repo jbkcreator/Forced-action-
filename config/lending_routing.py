@@ -21,7 +21,7 @@ Q5  Rule gaps (ground-up >= $500k outside primary footprint, BRIDGE, "other")
     dropped".
 Q6  Loan amount for threshold checks uses loan_amount (= band minimum from
     LendingFlow).  Josh to confirm.
-Q7  Admin API is built on lending-api with LENDING_ROUTING_ADMIN_SECRET.
+Q7  Lender rules are edited from Slack (Josh's R1.4: a Slack form, not a web screen); there is no HTTP admin API.
     The admin screen / decline button (UI) is in forced-action-ui, not in
     this PR.
 Q8  Files with suppressed=True are NOT routed: enrichment skips them before
@@ -60,6 +60,7 @@ ACTION_DECLINE: str = "routing_decline"
 ACTION_APPROVED: str = "routing_approved"
 ACTION_FUNDED: str = "routing_funded"
 ACTION_DETAILS: str = "routing_details"
+ACTION_REROUTE: str = "routing_reroute"
 
 # Josh's fixed decline-reason enum (his reply, "Inputs for the addendum"). Stored as data, so it stays editable.
 SEED_DECLINE_REASONS: list[tuple[str, str]] = [

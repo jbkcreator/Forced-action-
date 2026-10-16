@@ -656,12 +656,12 @@ def test_decline_rejects_unknown_reason(rdb):
 
 def test_make_primary_is_atomic_and_applies_spec_defaults(rdb):
     """F + C: one call moves the flag; the new primary gets cap 15 and the $500k ground-up minimum."""
-    from src.lending.routing.admin_api import make_primary
+    from src.lending.routing.lender_service import make_primary
 
     old = _add_lender(rdb, name="Old", is_primary=True, priority=1, monthly_cap=5)
     new = _add_lender(rdb, name="New", priority=2)
 
-    result = make_primary(new, None, rdb)
+    result = make_primary(new, rdb)
     assert result["demoted"] == [old]
     rows = {r["name"]: r for r in rdb.execute(text(
         "SELECT name, is_primary, monthly_cap, construction_min_amount FROM lending.lender_routing_rules"
@@ -686,10 +686,10 @@ def test_real_loan_type_values_route_not_hold(rdb):
 
 
 def test_product_box_rejects_unknown_loan_types():
-    """A typo in a box would silently never match, so the admin API refuses it and normalises case."""
+    """A typo in a box would silently never match, so the service refuses it and normalises case."""
     from pydantic import ValidationError
 
-    from src.lending.routing.admin_api import ProductBoxIn
+    from src.lending.routing.lender_service import ProductBoxIn
 
     assert ProductBoxIn(loan_types=["fix_and_flip", "Dscr_Rental"]).loan_types == ["FIX_AND_FLIP", "DSCR_RENTAL"]
     for bad in (["flip"], ["refi"], []):
@@ -698,9 +698,9 @@ def test_product_box_rejects_unknown_loan_types():
 
 
 def test_create_primary_defaults_cap_to_15(rdb):
-    from src.lending.routing.admin_api import LenderIn, create_lender
+    from src.lending.routing.lender_service import LenderIn, create_lender
 
-    created = create_lender(LenderIn(name="P", is_primary=True, priority=1), None, rdb)
+    created = create_lender(LenderIn(name="P", is_primary=True, priority=1), rdb)
     cap = rdb.execute(text("SELECT monthly_cap FROM lending.lender_routing_rules WHERE id = :i"),
                       {"i": created["id"]}).scalar()
     assert cap == 15
@@ -826,23 +826,11 @@ def test_seed_from_t05_matrix_is_inert_idempotent_and_correct(rdb):
 
 # ── Admin screen backend: file record, reorder, safe PATCH ────────────────────
 
-@pytest.fixture
-def api(rdb):
-    """The routing admin router on its own throwaway app, bound to the test transaction."""
-    from fastapi import FastAPI
-    from fastapi.testclient import TestClient
+def test_file_record_shows_current_next_and_history(rdb):
+    from src.lending.routing.decline import record_decline
+    from src.lending.routing.file_key import lead_key
+    from src.lending.routing.lender_service import NOT_FOUND, RoutingError, file_record
 
-    from src.lending.db import get_lending_db
-    from src.lending.routing.admin_api import _verify_admin, router
-
-    app = FastAPI()
-    app.include_router(router)
-    app.dependency_overrides[_verify_admin] = lambda: None
-    app.dependency_overrides[get_lending_db] = lambda: rdb
-    return TestClient(app)
-
-
-def test_file_record_shows_current_next_and_history_and_one_click_decline(rdb, api):
     a = _add_lender(rdb, name="First", priority=1)
     _add_box(rdb, a, loan_types=[LOAN_TYPE_FLIP])
     b = _add_lender(rdb, name="Second", priority=2)
@@ -850,31 +838,24 @@ def test_file_record_shows_current_next_and_history_and_one_click_decline(rdb, a
     lead = _make_lead(rdb, phone_suffix="1901", last_name="Wozniak")
     _route(rdb, lead)
 
-    rec = api.get(f"/api/lending/routing/files/{lead}").json()
+    rec = file_record(lead_key(lead), rdb)
     assert rec["file"]["last_name"] == "Wozniak" and rec["file"]["status"] == "routed"
     assert rec["current"]["name"] == "First" and rec["current"]["position"] == 1
     assert rec["next"]["name"] == "Second" and rec["next"]["position"] == 2
     assert [h["action"] for h in rec["history"]] == ["routed"]
-    assert rec["can_decline"] is True
 
-    assert api.post(f"/api/lending/routing/files/{lead}/decline", json={}).status_code == 422  # a reason is required
-    assert api.get(f"/api/lending/routing/files/{lead}").json()["current"]["name"] == "First"
-    assert api.post(f"/api/lending/routing/files/{lead}/decline",
-                    json={"reason_code": "other"}).status_code == 422  # 'other' needs details
-    assert api.post(f"/api/lending/routing/files/{lead}/decline",
-                    json={"reason_code": "other", "free_text": "Lender left the market"}).status_code == 200
-    rec = api.get(f"/api/lending/routing/files/{lead}").json()
+    record_decline(_routed_event_id(rdb, lead), reason_code="other", free_text="Lender left the market", actor="josh", db=rdb)
+    rec = file_record(lead_key(lead), rdb)
     assert rec["current"]["name"] == "Second" and rec["next"] is None
     assert [h["action"] for h in rec["history"]] == ["routed", "declined", "routed"]
     assert rec["history"][1]["reason_code"] == "other" and rec["history"][1]["actor"] == "josh"
 
-    assert api.post(f"/api/lending/routing/files/{lead}/decline",
-                    json={"reason_code": "ltv_over_max", "actor": "josh"}).status_code == 200
-    rec = api.get(f"/api/lending/routing/files/{lead}").json()
-    assert rec["file"]["status"] == "exhausted" and rec["current"] is None and rec["can_decline"] is False
-    assert api.post(f"/api/lending/routing/files/{lead}/decline",
-                    json={"reason_code": "ltv_over_max"}).status_code == 422  # exhausted: nothing to decline
-    assert api.get("/api/lending/routing/files/999999").status_code == 404
+    record_decline(_routed_event_id(rdb, lead), reason_code="ltv_over_max", actor="josh", db=rdb)
+    rec = file_record(lead_key(lead), rdb)
+    assert rec["file"]["status"] == "exhausted" and rec["current"] is None
+    with pytest.raises(RoutingError) as missing:
+        file_record(lead_key(999999), rdb)
+    assert missing.value.kind == NOT_FOUND
 
 
 def test_preview_next_agrees_with_the_real_router(rdb):
@@ -894,63 +875,54 @@ def test_preview_next_agrees_with_the_real_router(rdb):
     assert _fr(rdb, lead)["current_lender_name"] == predicted["name"]
 
 
-def test_file_list_filters_by_status_and_last_name(rdb, api):
-    l1 = _add_lender(rdb, name="Lister", priority=1)
-    _add_box(rdb, l1, loan_types=[LOAN_TYPE_FLIP])
-    routed = _make_lead(rdb, phone_suffix="2001", last_name="Alvarez")
-    held = _make_lead(rdb, loan_type="other", phone_suffix="2002", last_name="Brandt")
-    _route(rdb, routed)
-    _route(rdb, held)
+def test_reorder_is_atomic_validated_and_changes_routing(rdb):
+    from src.lending.routing.lender_service import NOT_FOUND, ReorderIn, RoutingError, reorder_lenders
 
-    everything = api.get("/api/lending/routing/files").json()
-    assert {f["lead_id"] for f in everything["files"]} == {routed, held}
-    only_held = api.get("/api/lending/routing/files", params={"status": "held"}).json()
-    assert [f["lead_id"] for f in only_held["files"]] == [held]
-    by_name = api.get("/api/lending/routing/files", params={"q": "alvar"}).json()
-    assert [f["lead_id"] for f in by_name["files"]] == [routed]
-    assert api.get("/api/lending/routing/files", params={"status": "bogus"}).status_code == 422
-
-
-def test_reorder_is_atomic_validated_and_changes_routing(rdb, api):
     ids = {}
     for i, name in enumerate(("Aye", "Bee", "Sea"), start=1):
         ids[name] = _add_lender(rdb, name=name, priority=i)
         _add_box(rdb, ids[name], loan_types=[LOAN_TYPE_FLIP])
+    listed = lambda: [r[0] for r in rdb.execute(text("SELECT name FROM lending.lender_routing_rules ORDER BY priority"))]  # noqa: E731
     first = _make_lead(rdb, phone_suffix="2101")
     _route(rdb, first)
     assert _fr(rdb, first)["current_lender_name"] == "Aye"
 
     order = [ids["Sea"], ids["Aye"], ids["Bee"]]
-    assert api.post("/api/lending/routing/lenders/reorder", json={"ordered_ids": order}).status_code == 200
-    listed = [r["name"] for r in api.get("/api/lending/routing/lenders").json()]
-    assert listed == ["Sea", "Aye", "Bee"]
+    reorder_lenders(ReorderIn(ordered_ids=order), rdb)
+    assert listed() == ["Sea", "Aye", "Bee"]
     second = _make_lead(rdb, phone_suffix="2102")
     _route(rdb, second)
     assert _fr(rdb, second)["current_lender_name"] == "Sea"
 
-    assert api.post("/api/lending/routing/lenders/reorder",
-                    json={"ordered_ids": [ids["Sea"], ids["Aye"]]}).status_code == 422  # an active one left out
-    assert api.post("/api/lending/routing/lenders/reorder",
-                    json={"ordered_ids": order + [99999]}).status_code == 404
-    assert api.post("/api/lending/routing/lenders/reorder",
-                    json={"ordered_ids": [order[0], order[0], order[1], order[2]]}).status_code == 422
-    assert [r["name"] for r in api.get("/api/lending/routing/lenders").json()] == ["Sea", "Aye", "Bee"]
+    with pytest.raises(RoutingError, match="Every active lender"):  # an active one left out
+        reorder_lenders(ReorderIn(ordered_ids=[ids["Sea"], ids["Aye"]]), rdb)
+    with pytest.raises(RoutingError) as unknown:
+        reorder_lenders(ReorderIn(ordered_ids=order + [99999]), rdb)
+    assert unknown.value.kind == NOT_FOUND
+    with pytest.raises(RoutingError, match="duplicates"):
+        reorder_lenders(ReorderIn(ordered_ids=[order[0], order[0], order[1], order[2]]), rdb)
+    assert listed() == ["Sea", "Aye", "Bee"]  # every refusal left the order alone
 
 
-def test_patch_and_create_report_priority_clash_as_409_and_allow_clearing_a_cap(rdb, api):
+def test_a_priority_clash_is_a_conflict_and_a_seat_cap_can_be_cleared(rdb):
+    from src.lending.routing.lender_service import CONFLICT, LenderIn, LenderPatch, RoutingError, create_lender, update_lender
+
     a = _add_lender(rdb, name="One", priority=1, monthly_cap=4)
     b = _add_lender(rdb, name="Two", priority=2)
 
-    assert api.patch(f"/api/lending/routing/lenders/{b}", json={"priority": 1}).status_code == 409
-    assert api.post("/api/lending/routing/lenders", json={"name": "Dup", "priority": 1}).status_code == 409
-    # Pausing frees the priority for the active lenders.
-    assert api.patch(f"/api/lending/routing/lenders/{a}", json={"active": False}).status_code == 200
-    assert api.patch(f"/api/lending/routing/lenders/{b}", json={"priority": 1}).status_code == 200
+    with pytest.raises(RoutingError) as clash:
+        update_lender(b, LenderPatch(priority=1), rdb)
+    assert clash.value.kind == CONFLICT
+    with pytest.raises(RoutingError) as duplicate:
+        create_lender(LenderIn(name="Dup", priority=1), rdb)
+    assert duplicate.value.kind == CONFLICT
+    update_lender(a, LenderPatch(active=False), rdb)  # pausing frees the priority for the active lenders
+    update_lender(b, LenderPatch(priority=1), rdb)
 
-    assert api.patch(f"/api/lending/routing/lenders/{a}", json={"monthly_cap": None}).status_code == 200
-    cap = rdb.execute(text("SELECT monthly_cap FROM lending.lender_routing_rules WHERE id = :i"), {"i": a}).scalar()
-    assert cap is None
-    assert api.patch(f"/api/lending/routing/lenders/{a}", json={"name": None}).status_code == 422
+    update_lender(a, LenderPatch(monthly_cap=None), rdb)  # an explicit None clears the cap
+    assert rdb.execute(text("SELECT monthly_cap FROM lending.lender_routing_rules WHERE id = :i"), {"i": a}).scalar() is None
+    with pytest.raises(RoutingError, match="cannot be empty"):
+        update_lender(a, LenderPatch(name=None), rdb)
 
 
 def test_a_failing_route_hook_does_not_poison_the_enrichment_session(rdb, monkeypatch):
@@ -971,12 +943,6 @@ def test_a_failing_route_hook_does_not_poison_the_enrichment_session(rdb, monkey
     status = rdb.execute(text("SELECT status FROM lending.lendingflow_enrichment WHERE lead_id = :l"),
                          {"l": lead}).scalar()
     assert status == "ready"  # raises InFailedSqlTransaction if the failed route left the session aborted
-
-
-def test_meta_lists_the_vocabularies(api):
-    meta = api.get("/api/lending/routing/meta").json()
-    assert meta["loan_types"] == ["FIX_AND_FLIP", "GROUND_UP_CONSTRUCTION", "DSCR_RENTAL", "BRIDGE"]
-    assert "signed" in meta["agreement_statuses"] and meta["catch_all_decline_reason"] == "other"
 
 
 # ── Reconcile with T-05: one source of truth for lender rule values ───────────
@@ -1032,33 +998,36 @@ def test_an_unknown_rule_key_fails_closed_without_crashing(rdb):
     assert _fr(rdb, lead)["status"] == "held"
 
 
-def test_admin_api_validates_rule_keys_and_refuses_boxes_on_a_t05_lender(api):
-    base = "/api/lending/routing"
-    assert api.post(f"{base}/lenders", json={"name": "Bad", "priority": 1, "rule_keys": ["nope"]}).status_code == 422
-    made = api.post(f"{base}/lenders", json={"name": "Linked", "priority": 1, "rule_keys": [FLIP_KEY]})
-    assert made.status_code == 201
-    lender_id = made.json()["id"]
-    listed = {r["name"]: r for r in api.get(f"{base}/lenders").json()}
-    assert listed["Linked"]["rule_keys"] == [FLIP_KEY]
+def test_rule_keys_are_validated_and_a_t05_lender_refuses_boxes(rdb):
+    from pydantic import ValidationError
 
-    blocked = api.post(f"{base}/lenders/{lender_id}/boxes", json={"loan_types": ["fix_and_flip"]})
-    assert blocked.status_code == 409 and "lender_rule_values" in blocked.json()["detail"]
+    from src.lending.routing.lender_service import (
+        CONFLICT, LenderIn, LenderPatch, ProductBoxIn, RoutingError, add_box, create_lender, update_lender)
 
-    assert api.patch(f"{base}/lenders/{lender_id}", json={"rule_keys": None}).status_code == 200  # unlink
-    assert api.post(f"{base}/lenders/{lender_id}/boxes", json={"loan_types": ["fix_and_flip"]}).status_code == 201
+    with pytest.raises(ValidationError):
+        LenderIn(name="Bad", priority=1, rule_keys=["nope"])
+    lender_id = create_lender(LenderIn(name="Linked", priority=1, rule_keys=[FLIP_KEY]), rdb)["id"]
+    assert rdb.execute(text("SELECT rule_keys FROM lending.lender_routing_rules WHERE id = :i"), {"i": lender_id}).scalar() == [FLIP_KEY]
+
+    with pytest.raises(RoutingError) as blocked:
+        add_box(lender_id, ProductBoxIn(loan_types=["fix_and_flip"]), rdb)
+    assert blocked.value.kind == CONFLICT and "lender_rule_values" in str(blocked.value)
+
+    update_lender(lender_id, LenderPatch(rule_keys=None), rdb)  # unlink
+    assert add_box(lender_id, ProductBoxIn(loan_types=["fix_and_flip"]), rdb)["id"]
 
 
 # ── Josh's decline-reason enum ────────────────────────────────────────────────
 
-def test_decline_reasons_are_joshs_enum_and_the_old_placeholders_are_off(api):
+def test_decline_reasons_are_joshs_enum_and_the_old_placeholders_are_off(rdb):
     from config.lending_routing import LEGACY_PLACEHOLDER_REASONS, SEED_DECLINE_REASONS
 
-    rows = api.get("/api/lending/routing/decline-reasons").json()
-    active = {r["code"] for r in rows if r["active"]}
+    active = {code for code, on in rdb.execute(text("SELECT code, active FROM lending.decline_reason_codes")) if on}
     josh = {code for code, _ in SEED_DECLINE_REASONS}
     assert len(josh) == 14 and josh <= active  # codes Josh adds later may sit alongside; his 14 must all be on
     assert {"credit_below_min", "ltv_over_max", "seat_cap_reached", "borrower_withdrew", "other"} <= active
-    assert not (set(LEGACY_PLACEHOLDER_REASONS) - {"other"}) & active  # the old placeholders are off
+    legacy_codes = {code for code, _ in LEGACY_PLACEHOLDER_REASONS}
+    assert not (legacy_codes - {"other"}) & active  # the old placeholders are off
 
 
 def test_a_decline_must_use_a_code_from_joshs_enum(rdb):
@@ -1345,7 +1314,11 @@ def test_the_partner_door_hands_a_file_to_the_router_when_it_is_installed(rdb, p
     assert _file_status(rdb, fid)[0] == "routed"  # not "held, awaiting router"
 
 
-def test_partner_files_appear_in_the_admin_api_beside_leads(rdb, api, partner_mail):
+def test_a_partner_file_has_its_own_record_beside_leads(rdb, partner_mail):
+    from src.lending.routing.decline import record_decline
+    from src.lending.routing.file_key import lead_key, loan_file_key
+    from src.lending.routing.lender_service import NOT_FOUND, RoutingError, file_record
+    from src.lending.routing.outcome import record_outcome
     from src.lending.routing.router import route_loan_file
 
     _two_flip_lenders(rdb)
@@ -1353,40 +1326,26 @@ def test_partner_files_appear_in_the_admin_api_beside_leads(rdb, api, partner_ma
     _route(rdb, lead)
     fid = _make_partner_file(rdb, _make_partner(rdb, name="Maria Lopez"), last_name="Partnerfile")
     route_loan_file(fid, rdb)
-    base = "/api/lending/routing"
 
-    listed = api.get(f"{base}/files").json()["files"]
-    by_source = {f["source"]: f for f in listed}
-    assert set(by_source) == {"lendingflow", "partner"}
-    assert by_source["partner"]["partner_name"] == "Maria Lopez" and by_source["partner"]["file_id"] == fid
-    assert by_source["partner"]["loan_type"] == "FIX_AND_FLIP"  # the product, shown as the lender-box loan type
-    assert [f["file_id"] for f in api.get(f"{base}/files", params={"source": "partner"}).json()["files"]] == [fid]
-    assert api.get(f"{base}/files", params={"source": "bogus"}).status_code == 422
+    rec = file_record(loan_file_key(fid), rdb)
+    assert rec["file"]["source"] == "partner" and rec["file"]["partner_name"] == "Maria Lopez" and rec["file"]["file_id"] == fid
+    assert rec["file"]["loan_type"] == "FIX_AND_FLIP"  # the product, shown as the lender-box loan type
+    assert rec["current"]["name"] == "Alpha Capital" and rec["next"]["name"] == "Beta Funding"
+    assert [h["action"] for h in rec["history"]] == ["routed"]
+    assert file_record(lead_key(lead), rdb)["file"]["source"] == "lendingflow"  # the same id as a lead is a different file
 
-    rec = api.get(f"{base}/files/{fid}", params={"source": "partner"}).json()
-    assert rec["file"]["source"] == "partner" and rec["current"]["name"] == "Alpha Capital"
-    assert rec["next"]["name"] == "Beta Funding" and [h["action"] for h in rec["history"]] == ["routed"]
-    same_id_as_lead = api.get(f"{base}/files/{fid}")  # the same id as a lead is a different file
-    assert same_id_as_lead.status_code == 404 or same_id_as_lead.json()["file"]["source"] == "lendingflow"
-    assert api.get(f"{base}/files/{lead}").json()["file"]["source"] == "lendingflow"
-
-    assert api.post(f"{base}/files/{fid}/decline", params={"source": "partner"},
-                    json={"reason_code": "ltv_over_max"}).status_code == 200
-    rec = api.get(f"{base}/files/{fid}", params={"source": "partner"}).json()
+    routed_event = rdb.execute(text("SELECT id FROM lending.file_routing_events WHERE loan_file_id = :f AND action = 'routed'"),
+                               {"f": fid}).scalar_one()
+    record_decline(routed_event, reason_code="ltv_over_max", actor="josh", db=rdb)
+    rec = file_record(loan_file_key(fid), rdb)
     assert rec["current"]["name"] == "Beta Funding"
     assert [h["action"] for h in rec["history"]] == ["routed", "declined", "routed"]
-    assert api.post(f"{base}/files/{fid}/outcome", params={"source": "partner"},
-                    json={"action": "funded"}).status_code == 200
+    key = loan_file_key(fid)
+    record_outcome(key.id, action="funded", actor="josh", db=rdb, kind=key.kind)
     assert _file_status(rdb, fid)[0] == "funded"
-
-
-def test_the_hold_queue_lists_held_partner_files(rdb, api, partner_mail):
-    from src.lending.routing.router import route_loan_file
-
-    fid = _make_partner_file(rdb, _make_partner(rdb), last_name="Held")
-    route_loan_file(fid, rdb)  # no lenders yet
-    held = api.get("/api/lending/routing/hold-queue").json()["files"]
-    assert [(f["source"], f["file_id"], f["hold_reason"]) for f in held] == [("partner", fid, "no_match")]
+    with pytest.raises(RoutingError) as missing:
+        file_record(loan_file_key(999999), rdb)
+    assert missing.value.kind == NOT_FOUND
 
 
 def test_slack_posts_and_retries_say_partner_file_and_never_mix_ids_with_leads(rdb, fake_slack, partner_mail):
@@ -1545,7 +1504,12 @@ def test_a_route_and_a_decline_post_to_slack_at_once_and_a_slack_failure_never_b
     assert rdb.execute(text("SELECT 1")).scalar() == 1  # and the session is still usable
 
 
-def test_a_held_file_is_routed_after_a_lender_is_signed_once_it_is_sent_back(rdb, api):
+def _held_event_id(db: Session, key_column: str, key_id: int) -> int:
+    return db.execute(text(f"SELECT id FROM lending.file_routing_events WHERE {key_column} = :i AND action = 'held'"
+                           " ORDER BY id DESC LIMIT 1"), {"i": key_id}).scalar_one()
+
+
+def test_a_held_file_is_routed_after_a_lender_is_signed_once_it_is_sent_back(rdb, buttons):
     lender = _add_lender(rdb, name="Signs Later", priority=1, agreement_status="pending")
     _add_box(rdb, lender, loan_types=[LOAN_TYPE_FLIP])
     lead = _make_lead(rdb, phone_suffix="5301")
@@ -1556,12 +1520,15 @@ def test_a_held_file_is_routed_after_a_lender_is_signed_once_it_is_sent_back(rdb
 
     rdb.execute(text("UPDATE lending.lender_routing_rules SET agreement_status = 'signed' WHERE id = :i"), {"i": lender})
     rdb.commit()
-    assert api.post(f"/api/lending/routing/files/{lead}/requeue").status_code == 200
+    held_post = _held_event_id(rdb, "lead_id", lead)
+    buttons.click("routing_reroute", held_post)
     assert _fr(rdb, lead)["current_lender_name"] == "Signs Later"
-    assert api.post(f"/api/lending/routing/files/{lead}/requeue").status_code == 422  # no longer held
+    assert "Sent back to the router" in buttons.calls["updated"][-1][0]
+    buttons.click("routing_reroute", held_post)  # a second click: it is no longer held
+    assert "no longer in the hold queue" in buttons.calls["told"][-1][1]
 
 
-def test_the_whole_no_match_backlog_is_reopened_and_the_sweep_routes_it(rdb, api):
+def test_the_whole_no_match_backlog_is_reopened_and_the_sweep_routes_it(rdb, slack_form):
     from src.tasks.lending_routing_sweep import sweep
 
     lender = _add_lender(rdb, name="Backlog Lender", priority=1, agreement_status="pending")
@@ -1572,14 +1539,13 @@ def test_the_whole_no_match_backlog_is_reopened_and_the_sweep_routes_it(rdb, api
     rdb.execute(text("UPDATE lending.lender_routing_rules SET agreement_status = 'signed' WHERE id = :i"), {"i": lender})
     rdb.commit()
 
-    reopened = api.post("/api/lending/routing/hold-queue/requeue", json={"reason": "no_match"}).json()
-    assert reopened["reopened"] == 3
-    assert api.post("/api/lending/routing/hold-queue/requeue", json={"reason": "bogus"}).status_code == 422
+    assert slack_form(_form("reopen_held")) == {}
+    assert "sent 3 held file(s) back" in slack_form.posted[-1]
     sweep(rdb)
     assert all(_fr(rdb, lead)["current_lender_name"] == "Backlog Lender" for lead in leads)
 
 
-def test_a_requeued_exhausted_file_skips_lenders_that_already_declined_and_tries_a_new_one(rdb, api):
+def test_a_requeued_exhausted_file_skips_lenders_that_already_declined_and_tries_a_new_one(rdb, buttons):
     from src.lending.routing.decline import record_decline
 
     a, b = _two_flip_lenders(rdb)
@@ -1591,11 +1557,11 @@ def test_a_requeued_exhausted_file_skips_lenders_that_already_declined_and_tries
 
     new = _add_lender(rdb, name="Third Option", priority=3)
     _add_box(rdb, new, loan_types=[LOAN_TYPE_FLIP])
-    assert api.post(f"/api/lending/routing/files/{lead}/requeue").status_code == 200
+    buttons.click("routing_reroute", _held_event_id(rdb, "lead_id", lead))
     assert _fr(rdb, lead)["current_lender_name"] == "Third Option"  # never Alpha or Beta again
 
 
-def test_a_held_partner_file_is_sent_back_the_same_way_and_the_partner_hears_of_it(rdb, api, partner_mail):
+def test_a_held_partner_file_is_sent_back_the_same_way_and_the_partner_hears_of_it(rdb, buttons, partner_mail):
     from src.lending.routing.router import route_loan_file
 
     lender = _add_lender(rdb, name="Partner Signs Later", priority=1, agreement_status="pending")
@@ -1606,7 +1572,7 @@ def test_a_held_partner_file_is_sent_back_the_same_way_and_the_partner_hears_of_
 
     rdb.execute(text("UPDATE lending.lender_routing_rules SET agreement_status = 'signed' WHERE id = :i"), {"i": lender})
     rdb.commit()
-    assert api.post(f"/api/lending/routing/files/{fid}/requeue", params={"source": "partner"}).status_code == 200
+    buttons.click("routing_reroute", _held_event_id(rdb, "loan_file_id", fid))
     assert _pfr(rdb, fid)["current_lender_name"] == "Partner Signs Later"
     assert _file_status(rdb, fid)[0] == "routed" and len(partner_mail) == 1
 
@@ -1669,8 +1635,11 @@ def test_the_real_partner_status_sync_ignores_leads_and_never_raises(rdb, monkey
     assert "partner status sync failed" in caplog.text and "ltv_over_max" not in caplog.text
 
 
-def test_admin_inputs_that_would_overflow_or_mean_nothing_are_refused_with_422_not_500(api):
-    base = "/api/lending/routing"
+def test_inputs_that_would_overflow_or_mean_nothing_are_refused_before_the_database(rdb):
+    from pydantic import ValidationError
+
+    from src.lending.routing.lender_service import LenderIn, ProductBoxIn, ReorderIn
+
     for body in (
         {"name": "x", "priority": 1, "points_paid_to_broker": 10},
         {"name": "x", "priority": 0},
@@ -1679,53 +1648,29 @@ def test_admin_inputs_that_would_overflow_or_mean_nothing_are_refused_with_422_n
         {"name": "y" * 101, "priority": 1},
         {"name": "x", "priority": 1, "monthly_cap": -1},
     ):
-        assert api.post(f"{base}/lenders", json=body).status_code == 422, body
-    lender = api.post(f"{base}/lenders", json={"name": "Valid", "priority": 1}).json()["id"]
+        with pytest.raises(ValidationError):
+            LenderIn(**body)
     for box in (
         {"loan_types": ["FIX_AND_FLIP"], "max_ltv": 10},
         {"loan_types": ["FIX_AND_FLIP"], "min_loan_amount": 9, "max_loan_amount": 1},
         {"loan_types": ["FIX_AND_FLIP"], "approved_states": ["Florida"]},
         {"loan_types": ["FIX_AND_FLIP"], "credit_floor": 901},
     ):
-        assert api.post(f"{base}/lenders/{lender}/boxes", json=box).status_code == 422, box
-    made = api.post(f"{base}/lenders/{lender}/boxes", json={"loan_types": ["fix_and_flip"], "approved_states": ["fl", "ga"]})
-    assert made.status_code == 201
-    assert api.get(f"{base}/lenders/{lender}/boxes").json()[0]["approved_states"] == ["FL", "GA"]
-
-    assert api.post(f"{base}/decline-reasons", json={"code": "x" * 51, "label": "too long"}).status_code == 422
-    assert api.post(f"{base}/decline-reasons", json={"code": "Has Space", "label": "bad code"}).status_code == 422
-    assert api.post(f"{base}/decline-reasons", json={"code": "other", "label": "x", "active": False}).status_code == 422
-    assert api.post(f"{base}/events/1/decline", json={"reason_code": "ltv_over_max", "actor": "a" * 101}).status_code == 422
-    assert api.get(f"{base}/files/99999999999").status_code == 422  # out of the id range, not a database error
-    assert api.patch(f"{base}/lenders/99999999999", json={"active": False}).status_code == 422
+        with pytest.raises(ValidationError):
+            ProductBoxIn(**box)
+    assert ProductBoxIn(loan_types=["fix_and_flip"], approved_states=["fl", "ga"]).approved_states == ["FL", "GA"]
+    with pytest.raises(ValidationError):
+        ReorderIn(ordered_ids=[99999999999])  # outside the id range: not a database error later
 
 
-def test_file_search_treats_blank_as_no_filter_and_percent_and_underscore_as_text(rdb, api):
-    smith = _make_lead(rdb, phone_suffix="5801", last_name="Smith")
-    odd = _make_lead(rdb, phone_suffix="5802", last_name="Sm_th")
-    _route(rdb, smith)
-    _route(rdb, odd)  # no lenders: both are held, which is enough to list them
-    files = lambda **params: {f["file_id"] for f in api.get("/api/lending/routing/files", params=params).json()["files"]}  # noqa: E731
-    assert files(q="") == {smith, odd}  # a blank search is no filter
-    assert files(q="Sm_th") == {odd}  # "_" is not a wildcard
-    assert files(q="%") == set()  # "%" is not a wildcard
-
-
-def test_the_hold_queue_says_when_it_is_cut_off(rdb, api, monkeypatch):
-    monkeypatch.setattr("src.lending.routing.admin_api._HOLD_QUEUE_LIMIT", 2)
-    for i in range(3):
-        _route(rdb, _make_lead(rdb, phone_suffix=f"590{i}"))
-    queue = api.get("/api/lending/routing/hold-queue").json()
-    assert queue["truncated"] is True and queue["count"] == 2 and len(queue["files"]) == 2
-
-
-def test_make_primary_refuses_a_paused_lender_and_conflicts_say_which_rule_was_broken(rdb, api):
+def test_make_primary_refuses_a_paused_lender_and_conflicts_say_which_rule_was_broken(rdb):
     from sqlalchemy.exc import IntegrityError
 
-    from src.lending.routing.admin_api import _conflict
+    from src.lending.routing.lender_service import CONFLICT, RoutingError, _conflict, make_primary
 
     paused = _add_lender(rdb, name="Paused One", priority=1, active=False)
-    assert api.post(f"/api/lending/routing/lenders/{paused}/make-primary").status_code == 422
+    with pytest.raises(RoutingError, match="Resume the lender"):
+        make_primary(paused, rdb)
 
     class _Diag:
         def __init__(self, name):
@@ -1738,20 +1683,24 @@ def test_make_primary_refuses_a_paused_lender_and_conflicts_say_which_rule_was_b
 
     primary_clash = _conflict(IntegrityError("stmt", {}, _Orig("uq_lender_routing_rules_primary")))
     priority_clash = _conflict(IntegrityError("stmt", {}, _Orig("uq_lender_routing_rules_priority")))
-    assert primary_clash.status_code == 409 and "primary" in primary_clash.detail
-    assert priority_clash.status_code == 409 and "priority" in priority_clash.detail
+    assert primary_clash.kind == CONFLICT and "primary" in str(primary_clash)
+    assert priority_clash.kind == CONFLICT and "priority" in str(priority_clash)
 
 
-def test_api_errors_do_not_expose_table_or_column_names(api):
-    base = "/api/lending/routing"
-    for response in (
-        api.post(f"{base}/events/999999/decline", json={"reason_code": "ltv_over_max"}),
-        api.post(f"{base}/files/999999/decline", json={"reason_code": "ltv_over_max"}),
-        api.post(f"{base}/files/999999/outcome", json={"action": "funded"}),
+def test_refusals_do_not_expose_table_or_column_names(rdb):
+    from src.lending.routing.decline import record_decline
+    from src.lending.routing.file_key import lead_key
+    from src.lending.routing.lender_service import RoutingError, file_record
+    from src.lending.routing.outcome import record_outcome
+
+    for call in (
+        lambda: record_decline(999999, reason_code="ltv_over_max", actor="josh", db=rdb),
+        lambda: record_outcome(999999, action="funded", actor="josh", db=rdb),
+        lambda: file_record(lead_key(999999), rdb),
     ):
-        assert response.status_code == 422
-        detail = response.json()["detail"]
-        assert not any(word in detail for word in ("file_routing", "lead_id", "loan_file_id", "lendingflow", "lending."))
+        with pytest.raises((ValueError, RoutingError)) as refused:
+            call()
+        assert not any(word in str(refused.value) for word in ("file_routing", "lead_id", "loan_file_id", "lendingflow", "lending."))
 
 
 def test_the_migration_retires_untouched_placeholder_reasons_but_never_one_someone_relabelled(rdb):
@@ -2235,12 +2184,33 @@ def test_the_form_lists_each_lenders_boxes_and_ground_up_settings(rdb):
     assert "Fix And Flip · FL, GA · $100,000-$900,000 · min credit 680" in listing
 
 
-def test_the_api_deletes_a_lender_that_never_routed_and_refuses_the_rest(rdb, api):
+def test_a_lender_that_never_routed_can_be_deleted_and_the_rest_are_refused(rdb):
+    from src.lending.routing.lender_service import CONFLICT, NOT_FOUND, RoutingError, delete_lender
+
     a, _ = _two_flip_lenders(rdb)
     spare = _add_lender(rdb, name="Spare", priority=3)
     _add_box(rdb, spare, loan_types=[LOAN_TYPE_FLIP])
-    assert api.delete(f"/api/lending/routing/lenders/{spare}").status_code == 200
+    delete_lender(spare, rdb)
     assert rdb.execute(text("SELECT COUNT(*) FROM lending.lender_product_boxes WHERE lender_id = :i"), {"i": spare}).scalar() == 0
-    assert api.delete(f"/api/lending/routing/lenders/{spare}").status_code == 404
+    with pytest.raises(RoutingError) as gone:
+        delete_lender(spare, rdb)
+    assert gone.value.kind == NOT_FOUND
     _route(rdb, _make_lead(rdb, phone_suffix="6803"))
-    assert api.delete(f"/api/lending/routing/lenders/{a}").status_code == 409  # it routed a file
+    with pytest.raises(RoutingError) as used:
+        delete_lender(a, rdb)  # it routed a file
+    assert used.value.kind == CONFLICT
+
+def test_a_held_post_offers_re_route_and_details(rdb, fake_slack):
+    lead = _make_lead(rdb, phone_suffix="6901")
+    _route(rdb, lead)  # no lenders: the file is held
+    held = [b for b in fake_slack.blocks[-1] if b["type"] == "actions"][0]["elements"]
+    assert [e["action_id"] for e in held] == ["routing_reroute", "routing_details"]
+
+
+def test_reroute_is_refused_for_a_post_that_is_not_a_held_file(rdb, buttons):
+    _two_flip_lenders(rdb)
+    lead = _make_lead(rdb, phone_suffix="6902")
+    _route(rdb, lead)
+    buttons.click("routing_reroute", _routed_event_id(rdb, lead))  # a Routed post, not a Held one
+    assert "not a held file" in buttons.calls["told"][-1][1]
+    assert _fr(rdb, lead)["status"] == "routed"

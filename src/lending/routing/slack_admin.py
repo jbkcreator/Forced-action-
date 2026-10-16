@@ -15,7 +15,6 @@ import json
 import logging
 from typing import Any, Optional
 
-from fastapi import HTTPException
 from pydantic import ValidationError
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -24,7 +23,8 @@ from config.lending_routing import AGREEMENT_STATUS_CHOICES
 from config.settings import get_settings
 from src.lending.contracts import LoanType
 from src.lending.db import lending_session
-from src.lending.routing import admin_api, notify
+from src.lending.routing import lender_service, notify
+from src.lending.routing.lender_service import RoutingError
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +45,9 @@ ACTIONS: tuple[tuple[str, str], ...] = (
     ("move_down", "Move the chosen lender down one place"),
     ("make_primary", "Make the chosen lender primary"),
     ("remove", "Remove the chosen lender for good (Value: type its name)"),
+    ("reopen_held", "Re-route every file held with no lender match"),
 )
-_NEEDS_LENDER = {a for a, _ in ACTIONS} - {"add_lender"}
+_NEEDS_LENDER = {a for a, _ in ACTIONS} - {"add_lender", "reopen_held"}
 _BOX_FIELDS = ("types_b", "states_b", "min_b", "max_b", "credit_b")
 
 
@@ -174,10 +175,10 @@ def _int_or_none(raw: str, label: str, block: str = "value_b") -> Optional[int]:
     return int(cleaned)
 
 
-def _box_from(values: dict) -> admin_api.ProductBoxIn:
+def _box_from(values: dict) -> lender_service.ProductBoxIn:
     types = [t for t in _value(values, "types_b").split(",") if t]
     states = [s for s in _value(values, "states_b").replace(" ", "").split(",") if s]
-    return admin_api.ProductBoxIn(
+    return lender_service.ProductBoxIn(
         loan_types=types, approved_states=states or None,
         min_loan_amount=_int_or_none(_value(values, "min_b"), "Min loan", "min_b"),
         max_loan_amount=_int_or_none(_value(values, "max_b"), "Max loan", "max_b"),
@@ -205,7 +206,7 @@ class FormErrors(ValueError):
         self.errors = errors
 
 
-def _box_errors(values: dict) -> tuple[Optional[admin_api.ProductBoxIn], dict[str, str]]:
+def _box_errors(values: dict) -> tuple[Optional[lender_service.ProductBoxIn], dict[str, str]]:
     """The product box the form describes (None when it has no loan type), and every problem with its fields."""
     errors: dict[str, str] = {}
     numbers: dict[str, Optional[int]] = {}
@@ -220,7 +221,7 @@ def _box_errors(values: dict) -> tuple[Optional[admin_api.ProductBoxIn], dict[st
     if not types:
         return None, errors
     try:
-        box = admin_api.ProductBoxIn(loan_types=types, approved_states=states or None, **numbers)
+        box = lender_service.ProductBoxIn(loan_types=types, approved_states=states or None, **numbers)
     except ValidationError as exc:
         for block, message in _form_errors(exc, values).items():
             errors.setdefault(block, message)
@@ -297,11 +298,11 @@ def _form_errors(exc: Exception, values: dict) -> dict[str, str]:
             errors.setdefault(block, message)
         return errors
     block = "lender_b" if _value(values, "lender_b") else "value_b"
-    return {block: str(exc.detail if isinstance(exc, HTTPException) else exc)[:250]}
+    return {block: str(exc)[:250]}
 
 
 def apply_change(values: dict, db: Session) -> str:
-    """Apply one submitted form. Returns the audit sentence; raises ``ValueError``/``HTTPException`` with a clean message."""
+    """Apply one submitted form. Returns the audit sentence; raises ``ValueError``/``RoutingError`` with a clean message."""
     problems = collect_errors(values, db)
     if problems:
         raise FormErrors(problems)
@@ -324,53 +325,58 @@ def apply_change(values: dict, db: Session) -> str:
             raise FormError("Type the lender's name in Value.", "value_b")
         box = _box_from(values) if _value(values, "types_b") else None
         taken = max([l["priority"] for l in _lenders(db)], default=0) + 1
-        created = admin_api.create_lender(
-            body=admin_api.LenderIn(name=value, priority=taken, agreement_status="pending",
+        created = lender_service.create_lender(
+            body=lender_service.LenderIn(name=value, priority=taken, agreement_status="pending",
                                     takes_ground_up=bool(box and LoanType.GROUND_UP_CONSTRUCTION.value in box.loan_types)),
-            _=None, db=db)
+            db=db)
         if box is not None:
-            admin_api.add_box(lender_id=created["id"], body=box, _=None, db=db)
+            lender_service.add_box(lender_id=created["id"], body=box, db=db)
         note = " with a box" if box else " (no box yet: it receives nothing until one is added)"
         return f"added lender *{value}* at position {taken}, agreement pending{note}"
     if action == "add_box":
         if not _value(values, "types_b"):
             raise FormError("Pick at least one loan type for the box.", "types_b")
-        admin_api.add_box(lender_id=lender["id"], body=_box_from(values), _=None, db=db)
+        lender_service.add_box(lender_id=lender["id"], body=_box_from(values), db=db)
         return f"added a product box to *{name}*"
+    if action == "reopen_held":
+        from src.lending.routing.router import reopen_held
+
+        count = reopen_held(db, "no_match", 200)
+        return f"sent {count} held file(s) back to the router; the routing sweep routes them within 5 minutes"
     if action == "replace_boxes":
         old_boxes = _box_ids(db, lender["id"])
-        admin_api.add_box(lender_id=lender["id"], body=_box_from(values), _=None, db=db)  # new box first: a refusal keeps the old ones
+        lender_service.add_box(lender_id=lender["id"], body=_box_from(values), db=db)  # new box first: a refusal keeps the old ones
         for box_id in old_boxes:
-            admin_api.delete_box(lender_id=lender["id"], box_id=box_id, _=None, db=db)
+            lender_service.delete_box(lender_id=lender["id"], box_id=box_id, db=db)
         return f"replaced the product boxes of *{name}* with one new box"
     if action == "clear_boxes":
         for box_id in _box_ids(db, lender["id"]):
-            admin_api.delete_box(lender_id=lender["id"], box_id=box_id, _=None, db=db)
+            lender_service.delete_box(lender_id=lender["id"], box_id=box_id, db=db)
         return f"removed all product boxes from *{name}* (it receives nothing until a box is added)"
     if action == "ground_up_min":
         amount = None if value.lower() in ("none", "no minimum") else _int_or_none(value.replace("$", ""), "Ground-up minimum")
-        admin_api.update_lender(lender_id=lender["id"], body=admin_api.LenderPatch(construction_min_amount=amount), _=None, db=db)
+        lender_service.update_lender(lender_id=lender["id"], body=lender_service.LenderPatch(construction_min_amount=amount), db=db)
         return f"set *{name}* ground-up minimum to {'none' if amount is None else f'${amount:,}'}"
     if action == "takes_ground_up":
         flag = value.lower() in ("yes", "y", "true")
-        admin_api.update_lender(lender_id=lender["id"], body=admin_api.LenderPatch(takes_ground_up=flag), _=None, db=db)
+        lender_service.update_lender(lender_id=lender["id"], body=lender_service.LenderPatch(takes_ground_up=flag), db=db)
         return f"set *{name}* takes ground-up to {'yes' if flag else 'no'}"
     if action == "remove":
-        admin_api.delete_lender(lender_id=lender["id"], _=None, db=db)
+        lender_service.delete_lender(lender_id=lender["id"], db=db)
         return f"removed lender *{name}* for good"
     if action in ("pause", "resume"):
-        admin_api.update_lender(lender_id=lender["id"], body=admin_api.LenderPatch(active=action == "resume"), _=None, db=db)
+        lender_service.update_lender(lender_id=lender["id"], body=lender_service.LenderPatch(active=action == "resume"), db=db)
         return f"{'resumed' if action == 'resume' else 'paused'} *{name}*"
     if action == "agreement":
         if value not in AGREEMENT_STATUS_CHOICES:
             raise FormError(f"Value must be one of: {', '.join(AGREEMENT_STATUS_CHOICES)}.", "value_b")
-        admin_api.update_lender(lender_id=lender["id"], body=admin_api.LenderPatch(agreement_status=value), _=None, db=db)
+        lender_service.update_lender(lender_id=lender["id"], body=lender_service.LenderPatch(agreement_status=value), db=db)
         return f"set *{name}* agreement status to {value}"
     if action == "seat_cap":
         cap = None if value.lower() in ("none", "no cap") else _int_or_none(value, "Seat cap")
         if cap is None and value.lower() not in ("none", "no cap"):
             raise FormError("Value must be a number, or none.", "value_b")
-        admin_api.update_lender(lender_id=lender["id"], body=admin_api.LenderPatch(monthly_cap=cap), _=None, db=db)
+        lender_service.update_lender(lender_id=lender["id"], body=lender_service.LenderPatch(monthly_cap=cap), db=db)
         return f"set *{name}* seat cap to {'none' if cap is None else cap}"
     if action in ("move_up", "move_down"):
         order = [l["id"] for l in _lenders(db)]
@@ -379,9 +385,9 @@ def apply_change(values: dict, db: Session) -> str:
         if not 0 <= target < len(order):
             raise FormError(f"{name} is already {'first' if action == 'move_up' else 'last'}.", "lender_b")
         order[index], order[target] = order[target], order[index]
-        admin_api.reorder_lenders(body=admin_api.ReorderIn(ordered_ids=order), _=None, db=db)
+        lender_service.reorder_lenders(body=lender_service.ReorderIn(ordered_ids=order), db=db)
         return f"moved *{name}* {'up' if action == 'move_up' else 'down'} to position {target + 1}"
-    admin_api.make_primary(lender_id=lender["id"], _=None, db=db)
+    lender_service.make_primary(lender_id=lender["id"], db=db)
     return f"made *{name}* the primary lender"
 
 
@@ -406,7 +412,7 @@ def handle_submission(payload: dict) -> dict[str, Any]:
     try:
         with lending_session() as db:
             summary = apply_change(values, db)
-    except (ValueError, HTTPException, ValidationError) as exc:
+    except (ValueError, RoutingError, ValidationError) as exc:
         return {"response_action": "errors", "errors": _form_errors(exc, values)}
     except Exception as exc:  # class only: SQL errors can embed bound values
         logger.error("[routing-slack] applying a lender change failed: %s", type(exc).__name__)
