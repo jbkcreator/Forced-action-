@@ -668,3 +668,45 @@ def test_a_server_error_status_is_unknown_even_with_a_rejection_code(db):
     lead_id = lead(db)
     cycle(db, 300, sms=Sms(), slack=Slack(error=slack_error("channel_not_found", status=502)))
     assert states(db, lead_id)["slack_300_status"] == "send_unknown"
+
+
+# ── Cora's inbox ─────────────────────────────────────────────────────────────
+
+def _inbox_rows(db):
+    return db.execute(text("SELECT dedup_key, target_channel, channel_posted_at, payload, summary, "
+                           "row_to_json(r)::text AS raw FROM lending.cora_inbox r WHERE event_type = 'lead_uncalled'")
+                      ).mappings().all()
+
+
+def test_the_escalation_is_raised_in_coras_inbox_once_without_the_phone(db):
+    from migrations.apply_lending_cora_inbox import apply_to as apply_cora_inbox
+
+    apply_cora_inbox(db.connection())
+    lead_id = lead(db)
+    sms, slack = Sms(), Slack()
+    for seconds in (120, 300, 400):
+        cycle(db, seconds, sms=sms, slack=slack)
+    rows = [r for r in _inbox_rows(db) if r["dedup_key"] == str(alarm(db, lead_id)["id"])]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["target_channel"] == "ops" and row["channel_posted_at"] is not None
+    assert row["payload"]["kind"] == "no_call" and row["payload"]["first_name"] == "Jane"
+    assert LEAD_PHONE not in row["raw"] and "5550100" not in row["raw"]
+
+
+def test_a_failed_inbox_write_never_undoes_the_escalation(db, monkeypatch):
+    from migrations.apply_lending_cora_inbox import apply_to as apply_cora_inbox
+
+    apply_cora_inbox(db.connection())
+
+    def inbox_down(*args, **kwargs):
+        raise RuntimeError("inbox unavailable")
+
+    monkeypatch.setattr("src.lending.cora_inbox.add_to_inbox", inbox_down)
+    lead_id = lead(db)
+    sms, slack = Sms(), Slack()
+    cycle(db, 120, sms=sms, slack=slack)
+    cycle(db, 300, sms=sms, slack=slack)
+    row = alarm(db, lead_id)
+    assert (row["sms_300_status"], row["slack_300_status"], row["resolved_reason"]) == ("sent", "sent", "escalated")
+    assert len(slack.posts) == 1

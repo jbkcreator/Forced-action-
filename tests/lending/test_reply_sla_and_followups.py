@@ -171,3 +171,31 @@ def test_the_fake_text_sender_sits_behind_the_port(db):
     sender = FakeTextSender()
     assert process_due(db, text_sender=sender, text_enabled=True, email_enabled=False, number="+18135550100", now=BOOKED) == {"sent": 1}
     assert sender.sent and sender.sent[0][0] == PHONE
+
+
+# ── Cora's inbox ─────────────────────────────────────────────────────────────
+
+def test_each_overdue_handoff_is_raised_in_coras_inbox(db, monkeypatch):
+    from contextlib import contextmanager
+
+    from migrations.apply_lending_cora_inbox import apply_to as apply_cora_inbox
+
+    apply_cora_inbox(db.connection())
+    handoff(db, message_id="m-late-1", contact="c-late-1")
+    handoff(db, message_id="m-late-2", contact="c-late-2", kind="reschedule_request")
+
+    @contextmanager
+    def test_session():
+        yield db
+
+    posts: list[str] = []
+    monkeypatch.setattr(sla, "lending_session", test_session)
+    monkeypatch.setattr(sla, "slack_poster", lambda: posts.append)
+    assert sla.main(now=TUE_10 + timedelta(hours=2)) == 0
+    assert len(posts) == 1
+    rows = db.execute(text("SELECT dedup_key, target_channel, channel_posted_at, payload FROM lending.cora_inbox "
+                           "WHERE event_type = 'reply_overdue' AND dedup_key LIKE 'm-late-%' ORDER BY dedup_key")
+                      ).mappings().all()
+    assert [r["dedup_key"] for r in rows] == ["m-late-1", "m-late-2"]
+    assert all(r["target_channel"] == "replies" and r["channel_posted_at"] is not None for r in rows)
+    assert rows[0]["payload"]["ghl_contact_id"] == "c-late-1"

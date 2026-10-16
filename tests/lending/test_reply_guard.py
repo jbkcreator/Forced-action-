@@ -195,3 +195,22 @@ def test_a_failed_slack_post_returns_an_error_so_ghl_retries(client, monkeypatch
     monkeypatch.setattr(reply_webhook, "slack_poster", lambda: boom)
     response = post(client, {"messageId": "m1", "body": "What's your rate?"})
     assert response.status_code == 502 and "slack" not in response.text.lower()
+
+
+# ── Cora's inbox ─────────────────────────────────────────────────────────────
+
+def test_a_posted_handoff_is_raised_in_coras_inbox_once_without_the_message_text(db):
+    from migrations.apply_lending_cora_inbox import apply_to as apply_cora_inbox
+
+    apply_cora_inbox(db.connection())
+    handle_reply_event(db, event(body="my secret rate question 123"), poster=Poster())
+    handle_reply_event(db, event(body="my secret rate question 123"), poster=Poster())  # redelivered
+    rows = db.execute(text("SELECT target_channel, channel_posted_at, payload, summary, row_to_json(r)::text AS raw "
+                           "FROM lending.cora_inbox r WHERE event_type = 'reply_handoff' AND dedup_key = 'm1'")
+                      ).mappings().all()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["target_channel"] == "replies" and row["channel_posted_at"] is not None
+    assert row["payload"]["kind"] == "rate_terms_handoff" and row["payload"]["phone_last4"] == "0147"
+    assert "Marcus" in row["summary"]
+    assert "secret" not in row["raw"] and "+1813" not in row["raw"]

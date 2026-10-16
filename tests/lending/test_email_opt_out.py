@@ -285,3 +285,28 @@ def test_an_unreadable_mailbox_is_reported_not_raised(monkeypatch):
 
     monkeypatch.setattr(email_opt_out, "ImapMailbox", Refusing)
     assert email_opt_out.run() == 1
+
+
+# ── Cora's inbox ─────────────────────────────────────────────────────────────
+
+def test_an_unreadable_message_is_raised_in_coras_inbox_once(monkeypatch, inbox_writes):
+    _recorder(monkeypatch)
+    monkeypatch.setattr(email_opt_out, "parse_opt_out", lambda raw, **kwargs: (_ for _ in ()).throw(ValueError()))
+    mailbox, log = FakeMailbox([_raw()]), MemoryLog()
+    _sweep(mailbox, log, [])
+    _sweep(mailbox, log, [])
+    assert [e["event_type"] for e in inbox_writes] == ["opt_out_email_unreadable"]
+    assert inbox_writes[0]["target_channel"] == "ops"
+
+
+def test_an_opt_out_given_up_is_raised_in_coras_inbox_without_the_address(monkeypatch, inbox_writes):
+    def failing(db, opt_out):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(email_opt_out, "record_opt_out", failing)
+    monkeypatch.setattr(email_opt_out, "MAX_MESSAGE_ATTEMPTS", 2)
+    mailbox, log = FakeMailbox([_raw()]), MemoryLog()
+    for _ in range(3):
+        _sweep(mailbox, log, [])
+    assert [e["event_type"] for e in inbox_writes] == ["opt_out_email_not_recorded"]
+    assert "sam.lee@example.com" not in inbox_writes[0]["payload"].lower()

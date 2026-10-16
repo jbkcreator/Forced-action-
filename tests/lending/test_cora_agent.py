@@ -273,3 +273,53 @@ def test_no_recipient_is_blocked_without_querying(channel: str) -> None:
     reason = cora_agent.make_send_check(engine)(_action(channel, phone=None, email=None))
     assert reason == "no recipient recorded, so opt-out status cannot be verified"
     assert engine.queries == []
+
+
+# ── the inbox digest in the sweep ────────────────────────────────────────────
+
+class _SweepParts:
+    """Stands in for the session, gate and relay: nothing to expire or retry, records whether sends ran."""
+
+    def __init__(self, halted: bool = False):
+        self.halted, self.relay_runs = halted, 0
+
+    def expire_stale_actions(self) -> int:
+        return 0
+
+    def retry_missing_cards(self) -> int:
+        return 0
+
+    def run(self):
+        from packages.agent_core.halt import AgentHalted
+        from packages.agent_core.relay import RelayResult
+
+        self.relay_runs += 1
+        if self.halted:
+            raise AgentHalted("halted")
+        return RelayResult((), (), (), ())
+
+
+def _sweep_services(parts: _SweepParts, digest) -> cora_agent.CoraServices:
+    return cora_agent.CoraServices(session=parts, relay=parts, gate=parts, inbox_digest=digest)
+
+
+def test_the_sweep_posts_the_inbox_digest_even_while_halted() -> None:
+    digests: list[int] = []
+    parts = _SweepParts(halted=True)
+    cora_agent.run_sweep(_sweep_services(parts, lambda: digests.append(1) or 1))
+    assert digests == [1]
+
+
+def test_a_failing_digest_never_stops_the_sends() -> None:
+    def database_down() -> int:
+        raise RuntimeError("database unavailable")
+
+    parts = _SweepParts()
+    cora_agent.run_sweep(_sweep_services(parts, database_down))
+    assert parts.relay_runs == 1
+
+
+def test_inbox_channel_ids_skip_unset_channels() -> None:
+    settings = SimpleNamespace(lending_replies_channel="C_REPLIES", lending_ops_channel="",
+                               lending_dial_tasks_channel="C_DIAL", lending_daily_channel="")
+    assert cora_agent.lending_channel_ids(settings) == {"replies": "C_REPLIES", "dial_tasks": "C_DIAL"}

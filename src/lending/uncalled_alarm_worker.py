@@ -48,6 +48,7 @@ from config.lending_alarms import (
     STALE_SEND_SECONDS,
 )
 from config.settings import get_settings
+from src.lending.cora_inbox import add_to_inbox_safely
 from src.lending.db import lending_session
 from src.lending.ghl_sms import GhlSmsError
 from src.services.phone_utils import normalize
@@ -324,6 +325,19 @@ def _record(db, row: Mapping[str, Any], channel: str, status: str, err: Optional
     return status
 
 
+def _queue_for_cora(db, row: Mapping[str, Any], kind: str, now: datetime, *, slack_sent: bool) -> None:
+    """Raise the escalation in Cora's main thread too; a failed inbox write never undoes the recorded alarm."""
+    fields = _fields(row, now)
+    add_to_inbox_safely(
+        db, event_type="lead_uncalled", dedup_key=str(row["id"]), target_channel="ops", channel_posted=slack_sent,
+        summary=f"LendingFlow lead {fields['ref']}{fields['state']} still {kind.replace('_', ' ')} after "
+                f"{fields['minutes']} min",
+        payload={"kind": kind, "lead_ref": fields["ref"], "first_name": row["first_name"],
+                 "property_state": row["property_state"], "minutes_since_arrival": fields["minutes"],
+                 "ghl_contact_id": row["ghl_contact_id"]},
+    )
+
+
 def _decide(db, row: Mapping[str, Any], *, tick: Clock, sms: Optional[Callable[..., str]], slack: Any,
             ghl_status: Optional[GhlCallStatus], sms_to: Optional[str], ops_channel: str) -> str:
     calls = call_status(db, row, ghl_status)
@@ -350,6 +364,7 @@ def _decide(db, row: Mapping[str, Any], *, tick: Clock, sms: Optional[Callable[.
     for channel in ("sms_300", "slack_300"):
         status, err = _send_channel(channel, row, kind, tick(), **send)
         outcomes.append(_record(db, row, channel, status, err, 0, tick()))
+    _queue_for_cora(db, row, kind, tick(), slack_sent=outcomes[1] == SENT)
     db.commit()
     return f"escalation_{kind}_sms_{outcomes[0]}_slack_{outcomes[1]}"
 

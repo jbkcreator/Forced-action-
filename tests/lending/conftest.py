@@ -6,6 +6,8 @@ nothing persists in the shared database.
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -69,6 +71,30 @@ def _no_live_web_lead_sink(monkeypatch):
     """A test must never push a website lead into the real Next Deal Lending GHL account."""
     monkeypatch.setattr("src.lending.web_lead_ghl.get_live_sink", lambda: None)
     monkeypatch.setattr("src.api.lending_web_router.get_live_sink", lambda: None)
+
+
+class _InboxRecorder:
+    """Stands in for the session ``add_to_inbox_in_own_session`` opens: records each event, writes nothing."""
+
+    def __init__(self):
+        self.events: list[dict] = []
+
+    @contextmanager
+    def __call__(self):
+        yield self
+
+    def execute(self, statement, params=None):
+        self.events.append(dict(params or {}))
+        return SimpleNamespace(scalar_one_or_none=lambda: len(self.events))
+
+
+@pytest.fixture(autouse=True)
+def inbox_writes(monkeypatch):
+    """Events alert paths add to Cora's inbox on their own session. A test must never commit one to the shared
+    database; events added on a test's own (rolled-back) session are unaffected."""
+    recorder = _InboxRecorder()
+    monkeypatch.setattr("src.lending.cora_inbox._own_session_factory", recorder)
+    return recorder.events
 
 
 @pytest.fixture

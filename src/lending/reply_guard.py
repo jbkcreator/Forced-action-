@@ -40,6 +40,7 @@ from config.lending_reply_agent import (
 )
 from config.settings import get_settings
 from src.lending.compliance import phone_hash
+from src.lending.cora_inbox import add_to_inbox_safely
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
@@ -200,6 +201,25 @@ _STATE = text("SELECT posted_at IS NOT NULL FROM lending.reply_handoffs WHERE me
 _POSTED = text("UPDATE lending.reply_handoffs SET posted_at = now() WHERE message_id = :message_id")
 
 
+_INBOX_SUMMARY = {
+    KIND_RATE_TERMS: "Rate / terms question for Josh",
+    KIND_RESCHEDULE: "Reschedule request for Josh",
+    KIND_AI_HANDOFF: "Reply agent handed a conversation to Josh",
+    KIND_AI_QUOTED_NUMBERS: "Reply agent quoted a number it must not quote",
+}
+
+
+def _queue_for_cora(db, kind: str, event: ReplyEvent) -> None:
+    """Raise the posted handoff in Cora's main thread too. No message text: ids, first name and last 4 only."""
+    who = event.first_name or "Unknown contact"
+    add_to_inbox_safely(
+        db, event_type="reply_handoff", dedup_key=event.message_id, target_channel="replies", channel_posted=True,
+        summary=f"{_INBOX_SUMMARY.get(kind, kind)}: {who}",
+        payload={"kind": kind, "ghl_message_id": event.message_id, "ghl_contact_id": event.contact_id,
+                 "first_name": event.first_name, "phone_last4": event.phone[-4:] if event.phone else None},
+    )
+
+
 def handle_reply_event(db, event: ReplyEvent, *, poster: Optional[SlackPoster]) -> str:
     """Returns "ignored", "duplicate", "posted" or "not_configured". Commits the claim before posting (so
     a failed post is retried on redelivery) and the post result after. Raises if the post itself fails."""
@@ -222,6 +242,7 @@ def handle_reply_event(db, event: ReplyEvent, *, poster: Optional[SlackPoster]) 
         return "not_configured"
     poster(format_slack(kind, event))
     db.execute(_POSTED, {"message_id": event.message_id})
+    _queue_for_cora(db, kind, event)
     db.commit()
     logger.info("[reply-guard] posted %s message=%s phone_hash=%s", kind, event.message_id,
                 phone_hash(event.phone)[:12] if event.phone else "-")
