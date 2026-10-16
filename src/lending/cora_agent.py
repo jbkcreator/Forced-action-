@@ -42,6 +42,7 @@ from packages.agent_core.store import AgentStore
 from packages.agent_core.thread_history import build_history
 from packages.agent_core.tools import ToolContext, ToolRegistry
 from src.lending.consent import has_text_consent
+from src.lending.cora_channels import ChannelDirectory
 from src.lending.cora_inbox import format_inbox_context, items_on_post, surface_new_items
 from src.lending.cora_prompt import CORA_BASE_PROMPT, REVISION_PROMPT
 from src.lending.cora_tools import CoraToolkit, draft_content_check
@@ -112,22 +113,6 @@ def make_inbox_context(engine: Engine) -> Callable[[str, str], str]:
         return format_inbox_context(items) if items else ""
 
     return lookup
-
-
-def make_channel_poster(settings: AppSettings) -> Optional[Callable[[str, str], None]]:
-    """Posts a routed inbox item with the lending bot, which is already a member of the lending channels.
-    None (routing reports "not configured") until LENDING_SLACK_BOT_TOKEN is set."""
-    token = _secret(settings.lending_slack_bot_token)
-    if not token:
-        return None
-    from slack_sdk.web import WebClient
-
-    client = WebClient(token=token)
-
-    def post(channel_id: str, message: str) -> None:
-        client.chat_postMessage(channel=channel_id, text=message, unfurl_links=False, unfurl_media=False)
-
-    return post
 
 
 def _secret(value) -> Optional[str]:
@@ -367,10 +352,11 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
         api_key=config.anthropic_api_key, timeout=90.0, max_retries=2).messages
     chat = SlackChatPort(web, config.slack_channel_id)
     channel_ids = lending_channel_ids(settings)
-    poster = make_channel_poster(settings)
+    # Cora's own bot lists, reads and routes to the channels it has been invited to.
+    channels = ChannelDirectory(web, own_channel_id=config.slack_channel_id, key_ids=channel_ids)
 
     def toolkit_factory(toolkit_engine: Engine, memory: AgentMemory) -> CoraToolkit:
-        return CoraToolkit(toolkit_engine, memory, channel_ids=channel_ids, channel_poster=poster)
+        return CoraToolkit(toolkit_engine, memory, channels=channels)
 
     services = build_session(config, AgentStore(engine, config.db_schema), chat,
                              bot_user_id, messages_client=messages_client, send_check=make_send_check(engine),

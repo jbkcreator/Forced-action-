@@ -20,7 +20,9 @@ from src.lending.cora_inbox import (
     items_on_post,
     surface_new_items,
 )
+from src.lending.cora_channels import ChannelDirectory
 from src.lending.cora_tools import CoraToolkit
+from tests.lending.test_cora_channels import FakeSlack
 
 
 @pytest.fixture
@@ -201,25 +203,20 @@ def _surfaced(db, chat=None):
     return handoff, deal, chat.posts[-1]["ts"]
 
 
-class Poster:
-    def __init__(self, error: Exception | None = None):
-        self.posts, self.error = [], error
-
-    def __call__(self, channel_id: str, message: str) -> None:
-        if self.error:
-            raise self.error
-        self.posts.append((channel_id, message))
+class SlackRefusesPosts(FakeSlack):
+    def chat_postMessage(self, **kwargs):
+        raise RuntimeError("not_in_channel")
 
 
-def _toolkit(db, poster=None) -> CoraToolkit:
+def _toolkit(db, slack=None) -> CoraToolkit:
     @contextmanager
     def scope():
         with db.begin_nested():  # a savepoint stands in for the tool's own transaction
             yield db
 
-    return CoraToolkit(engine=None, memory=None, channel_ids={"replies": "C_REPLIES", "ops": "C_OPS",  # type: ignore[arg-type]
-                                                              "dial_tasks": "C_DIAL"},
-                       channel_poster=poster, inbox_session=scope)
+    channels = None if slack is None else ChannelDirectory(
+        slack, own_channel_id="C_CORA", key_ids={"replies": "C_REPLIES", "ops": "C_OPS"})
+    return CoraToolkit(engine=None, memory=None, channels=channels, inbox_session=scope)  # type: ignore[arg-type]
 
 
 def _run(toolkit: CoraToolkit, name: str, raw: dict, user: str = JOSH):
@@ -250,57 +247,67 @@ def test_an_approver_dismisses_an_item_with_a_note(digest_db):
 
 def test_only_an_approver_can_dismiss_or_route(digest_db):
     handoff, deal, _ = _surfaced(digest_db)
-    poster = Poster()
-    toolkit = _toolkit(digest_db, poster)
+    slack = FakeSlack()
+    toolkit = _toolkit(digest_db, slack)
     assert _run(toolkit, "dismiss_inbox_item", {"item_id": handoff}, user=OPS).is_error
-    assert _run(toolkit, "route_inbox_item", {"item_id": deal, "channel_key": "ops"}, user=OPS).is_error
-    assert _status(digest_db, handoff, deal) == ["surfaced", "surfaced"] and poster.posts == []
+    assert _run(toolkit, "route_inbox_item", {"item_id": deal, "channel": "lending-ops"}, user=OPS).is_error
+    assert _status(digest_db, handoff, deal) == ["surfaced", "surfaced"] and slack.posts == []
     assert not _run(toolkit, "list_inbox_items", {}, user=OPS).is_error  # anyone may look
 
 
-def test_an_approver_routes_an_item_to_a_team_channel(digest_db):
+def test_an_approver_routes_an_item_to_a_channel_cora_is_in(digest_db):
     _, deal, _ = _surfaced(digest_db)
-    poster = Poster()
-    outcome = _run(_toolkit(digest_db, poster), "route_inbox_item",
-                   {"item_id": deal, "channel_key": "ops", "note": "Sarah, please call today"})
-    assert not outcome.is_error
-    assert poster.posts == [("C_OPS", f"*New partner deal*\nSarah, please call today\n"
-                                      f"_Sent by <@{JOSH}> via Cora (inbox #{deal})_")]
+    slack = FakeSlack()
+    outcome = _run(_toolkit(digest_db, slack), "route_inbox_item",
+                   {"item_id": deal, "channel": "#lending-ops", "note": "Sarah, please call today"})
+    assert not outcome.is_error and "#lending-ops" in outcome.content
+    assert slack.posts == [("C_OPS", f"*New partner deal*\nSarah, please call today\n"
+                                     f"_Sent by <@{JOSH}> via Cora (inbox #{deal})_")]
     row = _row(digest_db, deal)
-    assert (row["status"], row["routed_channel"], row["decided_by"]) == ("routed", "ops", JOSH)
+    assert (row["status"], row["routed_channel"], row["decided_by"]) == ("routed", "lending-ops", JOSH)
+
+
+def test_an_inbox_channel_key_still_works_as_a_channel_name(digest_db):
+    _, deal, _ = _surfaced(digest_db)
+    slack = FakeSlack()
+    assert not _run(_toolkit(digest_db, slack), "route_inbox_item", {"item_id": deal, "channel": "ops"}).is_error
+    assert slack.posts[0][0] == "C_OPS"
 
 
 def test_a_refused_post_leaves_the_item_open(digest_db):
     _, deal, _ = _surfaced(digest_db)
-    outcome = _run(_toolkit(digest_db, Poster(RuntimeError("channel_not_found"))), "route_inbox_item",
-                   {"item_id": deal, "channel_key": "ops"})
+    outcome = _run(_toolkit(digest_db, SlackRefusesPosts()), "route_inbox_item",
+                   {"item_id": deal, "channel": "lending-ops"})
     assert outcome.is_error and "still open" in outcome.content
     assert _status(digest_db, deal) == ["surfaced"]
 
 
 def test_a_closed_item_cannot_be_acted_on_again(digest_db):
     handoff, _, _ = _surfaced(digest_db)
-    toolkit = _toolkit(digest_db, Poster())
+    toolkit = _toolkit(digest_db, FakeSlack())
     _run(toolkit, "dismiss_inbox_item", {"item_id": handoff})
-    again = _run(toolkit, "route_inbox_item", {"item_id": handoff, "channel_key": "ops"})
+    again = _run(toolkit, "route_inbox_item", {"item_id": handoff, "channel": "lending-ops"})
     assert again.is_error and "already dismissed" in again.content
     assert _row(digest_db, handoff)["routed_channel"] is None
 
 
 def test_routing_is_refused_to_the_channel_the_item_is_already_in(digest_db):
-    handoff, _, _ = _surfaced(digest_db)
-    poster = Poster()
-    outcome = _run(_toolkit(digest_db, poster), "route_inbox_item", {"item_id": handoff, "channel_key": "replies"})
-    assert outcome.is_error and "already in the replies channel" in outcome.content and poster.posts == []
+    handoff, _, _ = _surfaced(digest_db)  # already posted to the replies channel by its job
+    slack = FakeSlack()
+    outcome = _run(_toolkit(digest_db, slack), "route_inbox_item", {"item_id": handoff, "channel": "lending-replies"})
+    assert outcome.is_error and "already in #lending-replies" in outcome.content and slack.posts == []
 
 
-def test_routing_is_refused_outside_the_lending_channels_or_when_not_configured(digest_db):
+def test_routing_is_refused_to_cora_s_own_channel_one_she_is_not_in_or_without_slack(digest_db):
     _, deal, _ = _surfaced(digest_db)
-    assert _run(_toolkit(digest_db, Poster()), "route_inbox_item", {"item_id": deal, "channel_key": "general"}).is_error
-    unconfigured = _run(_toolkit(digest_db, Poster()), "route_inbox_item", {"item_id": deal, "channel_key": "daily"})
+    slack = FakeSlack()
+    own = _run(_toolkit(digest_db, slack), "route_inbox_item", {"item_id": deal, "channel": "cora"})
+    assert own.is_error and "my own channel" in own.content
+    absent = _run(_toolkit(digest_db, slack), "route_inbox_item", {"item_id": deal, "channel": "general"})
+    assert absent.is_error and "invite me" in absent.content
+    unconfigured = _run(_toolkit(digest_db, None), "route_inbox_item", {"item_id": deal, "channel": "ops"})
     assert unconfigured.is_error and "not configured" in unconfigured.content
-    assert _run(_toolkit(digest_db, None), "route_inbox_item", {"item_id": deal, "channel_key": "ops"}).is_error
-    assert _status(digest_db, deal) == ["surfaced"]
+    assert _status(digest_db, deal) == ["surfaced"] and slack.posts == []
 
 
 def test_an_unknown_item_number_is_reported(digest_db):

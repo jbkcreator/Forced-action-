@@ -142,8 +142,6 @@ def surface_new_items(db, chat: Any, *, channel: str, channel_ids: Mapping[str, 
 
 # ── Acting on items: what Cora sees, and closing an item ─────────────────────
 
-# Channel keys an approver can route an item to; each maps to a lending channel setting.
-ROUTABLE_CHANNELS = ("replies", "ops", "dial_tasks", "daily")
 OPEN_STATUSES = ("new", "surfaced")
 
 _ITEM_COLUMNS = """
