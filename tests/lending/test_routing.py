@@ -2020,7 +2020,9 @@ def buttons(rdb, monkeypatch):
     def click(action_id, event_id, user="UJOSH"):
         assert extension.handle("interactive", {
             "type": "block_actions", "user": {"id": user}, "trigger_id": "T1", "channel": {"id": "C1"},
-            "message": {"ts": "1.0", "text": "Routed | File", "blocks": [{"type": "actions"}]},
+            "message": {"ts": "1.0", "text": "Routed | File", "blocks": [
+                {"type": "section"}, {"type": "actions", "elements": [
+                    {"action_id": "routing_decline"}, {"action_id": "routing_approved"}, {"action_id": "routing_funded"}]}]},
             "actions": [{"action_id": action_id, "value": str(event_id)}]}) is True
 
     def submit(event_id, reason="", details="", user="UJOSH"):
@@ -2091,7 +2093,9 @@ def test_approved_and_funded_buttons_record_the_outcome_and_funded_uses_a_seat(r
     event = _routed_event_id(rdb, first)
     buttons.click("routing_approved", event)
     assert [e["action"] for e in _events(rdb, first)] == ["routed", "approved"]
-    assert buttons.calls["updated"][-1][1][-1]["type"] == "actions"  # approved keeps the buttons
+    kept = buttons.calls["updated"][-1][1][-1]
+    assert kept["type"] == "actions"  # the file can still fund or decline
+    assert [e["action_id"] for e in kept["elements"]] == ["routing_decline", "routing_funded"]  # Approved is done
     buttons.click("routing_funded", event)
     assert [e["action"] for e in _events(rdb, first)] == ["routed", "approved", "funded"]
     assert all(b["type"] != "actions" for b in buttons.calls["updated"][-1][1])  # funded closes the post

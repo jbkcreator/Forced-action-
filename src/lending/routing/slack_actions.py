@@ -93,6 +93,12 @@ def _decline_view(event_id: int, lender: str, channel: str, ts: str, original: s
         ]}
 
 
+def _buttons_left_after_approval(message: dict) -> list[dict]:
+    """The post's buttons without Approved (done now); Decline and Funded stay, the file is not finished."""
+    return [{**block, "elements": [e for e in block.get("elements") or [] if e.get("action_id") != ACTION_APPROVED]}
+            for block in message.get("blocks") or [] if block.get("type") == "actions"]
+
+
 def handle_action(payload: dict, client: Any) -> None:
     """A click on Decline / Approved / Funded under a routed post."""
     user = _user_id(payload)
@@ -125,7 +131,7 @@ def handle_action(payload: dict, client: Any) -> None:
         _tell(client, channel, user, "Something went wrong; nothing was changed.")
         return
     note = f":white_check_mark: *{outcome.title()}* by <@{user}>" if written else f"_{outcome.title()} was already recorded._"
-    buttons = [b for b in (message.get("blocks") or []) if b.get("type") == "actions"] if outcome == "approved" else []
+    buttons = _buttons_left_after_approval(message) if outcome == "approved" else []
     _update_post(client, channel, ts, original, note, keep_buttons=buttons)
 
 
