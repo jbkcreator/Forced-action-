@@ -2110,3 +2110,23 @@ def test_clicks_that_are_not_routings_are_left_to_cora(rdb):
     assert extension.handle("interactive", approval) is False  # Cora's own approval card
     assert extension.respond("interactive", approval) is None
     assert extension.handle("events_api", {"event": {"type": "message"}}) is False
+
+
+def test_slack_form_reports_every_problem_in_one_pass_each_under_its_own_field(rdb, slack_form):
+    a, _ = _two_flip_lenders(rdb)
+    # Four mistakes at once: no name, box fields filled with no loan type, a min loan that is not a number, a bad max.
+    response = slack_form(_form("add_lender", value="", states="FL", min_amount="abc", max_amount="-5"))
+    assert set(response["errors"]) == {"value_b", "types_b", "min_b", "max_b"}, response
+    # With a loan type: bad number, bad states and bad credit are all shown together.
+    response = slack_form(_form("add_lender", value="Many Mistakes", types=[LOAN_TYPE_FLIP],
+                                min_amount="abc", states="Florida", credit="950"))
+    assert set(response["errors"]) == {"min_b", "states_b", "credit_b"}, response
+    # No lender and a bad value together.
+    response = slack_form(_form("agreement", value="maybe"))
+    assert set(response["errors"]) == {"lender_b", "value_b"}, response
+    assert rdb.execute(text("SELECT COUNT(*) FROM lending.lender_routing_rules WHERE name = 'Many Mistakes'")).scalar() == 0
+    assert slack_form.posted == []  # nothing applied, nothing announced
+    # Fixing them all in one go works.
+    assert slack_form(_form("add_lender", value="Fixed Lender", types=[LOAN_TYPE_FLIP], min_amount="100000",
+                            max_amount="900000", states="fl, ga", credit="680")) == {}
+    assert rdb.execute(text("SELECT COUNT(*) FROM lending.lender_routing_rules WHERE name = 'Fixed Lender'")).scalar() == 1

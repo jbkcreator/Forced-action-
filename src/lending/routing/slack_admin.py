@@ -156,8 +156,83 @@ _FIELD_ERRORS = {
 }
 
 
+class FormErrors(ValueError):
+    """Several problems found in one pass: ``errors`` maps each input block to its message."""
+
+    def __init__(self, errors: dict[str, str]) -> None:
+        super().__init__("; ".join(errors.values()))
+        self.errors = errors
+
+
+def _box_errors(values: dict) -> tuple[Optional[admin_api.ProductBoxIn], dict[str, str]]:
+    """The product box the form describes (None when it has no loan type), and every problem with its fields."""
+    errors: dict[str, str] = {}
+    numbers: dict[str, Optional[int]] = {}
+    for block, label, key in (("min_b", "Min loan", "min_loan_amount"), ("max_b", "Max loan", "max_loan_amount"),
+                              ("credit_b", "Min credit", "credit_floor")):
+        try:
+            numbers[key] = _int_or_none(_value(values, block), label, block)
+        except FormError as exc:
+            errors[exc.block] = str(exc)
+    types = [t for t in _value(values, "types_b").split(",") if t]
+    states = [x for x in _value(values, "states_b").replace(" ", "").split(",") if x]
+    if not types:
+        return None, errors
+    try:
+        box = admin_api.ProductBoxIn(loan_types=types, approved_states=states or None, **numbers)
+    except ValidationError as exc:
+        for block, message in _form_errors(exc, values).items():
+            errors.setdefault(block, message)
+        return None, errors
+    return (box if not errors else None), errors
+
+
+def collect_errors(values: dict, db: Session) -> dict[str, str]:
+    """Every problem with the submitted form, found in one pass so the person fixes them all at once."""
+    errors: dict[str, str] = {}
+    action = _value(values, "action_b")
+    value = _value(values, "value_b")
+    if action not in {a for a, _ in ACTIONS}:
+        return {"action_b": "Choose an action."}
+    lender: Optional[dict] = None
+    lenders = _lenders(db)
+    if action in _NEEDS_LENDER:
+        raw = _value(values, "lender_b")
+        if not raw.isdigit():
+            errors["lender_b"] = "Choose a lender for this action."
+        else:
+            lender = next((l for l in lenders if l["id"] == int(raw)), None)
+            if lender is None:
+                errors["lender_b"] = "That lender no longer exists. Close this and open the form again."
+    if action in ("add_lender", "add_box"):
+        _, box_errors = _box_errors(values)
+        errors.update(box_errors)
+        has_types = bool(_value(values, "types_b"))
+        filled = any(_value(values, b) for b in ("states_b", "min_b", "max_b", "credit_b"))
+        if action == "add_box" and not has_types:
+            errors["types_b"] = "Pick at least one loan type for the box."
+        elif action == "add_lender" and filled and not has_types:
+            errors["types_b"] = "Pick a loan type for the box fields you filled in."
+        if action == "add_lender" and not value:
+            errors["value_b"] = "Type the lender's name in Value."
+    elif action == "agreement" and value not in AGREEMENT_STATUS_CHOICES:
+        errors["value_b"] = f"Value must be one of: {', '.join(AGREEMENT_STATUS_CHOICES)}."
+    elif action == "seat_cap" and value.lower() not in ("none", "no cap"):
+        digits = value.replace(",", "").strip()
+        if not digits.isdigit() or int(digits) > 100_000:
+            errors["value_b"] = "Value must be a whole number up to 100000, or none."
+    elif action in ("move_up", "move_down") and lender is not None:
+        order = [l["id"] for l in lenders]
+        index = order.index(lender["id"])
+        if (action == "move_up" and index == 0) or (action == "move_down" and index == len(order) - 1):
+            errors["lender_b"] = f"{lender['name']} is already {'first' if action == 'move_up' else 'last'}."
+    return errors
+
+
 def _form_errors(exc: Exception, values: dict) -> dict[str, str]:
     """Slack's ``errors`` map for a rejected submission: each message under the field it is about."""
+    if isinstance(exc, FormErrors):
+        return exc.errors
     if isinstance(exc, FormError):
         return {exc.block: str(exc)}
     if isinstance(exc, ValidationError):
@@ -178,6 +253,9 @@ def _form_errors(exc: Exception, values: dict) -> dict[str, str]:
 
 def apply_change(values: dict, db: Session) -> str:
     """Apply one submitted form. Returns the audit sentence; raises ``ValueError``/``HTTPException`` with a clean message."""
+    problems = collect_errors(values, db)
+    if problems:
+        raise FormErrors(problems)
     action = _value(values, "action_b")
     value = _value(values, "value_b")
     lender_raw = _value(values, "lender_b")
