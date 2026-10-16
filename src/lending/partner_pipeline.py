@@ -7,9 +7,10 @@ a file whose run never finished (still 'received'). In order:
 1. Lender box (T-05) scores the file; the result is stored on it (internal only).
 2. The minute-5 pre-qual PDF (T-07) is generated and stored with the file when a lender fits and its
    loan limits are known. It is not sent: borrower contact for partner files is off until Josh confirms it.
-3. ``route_file`` hands the file to the router. Until the overflow router (R-1) exists, the file is
-   held with reason "awaiting router".
-4. Josh gets a Slack note; the partner gets a confirmation email.
+3. ``route_file`` hands the file to the overflow router (R-1), which routes it to a lender or holds it and
+   moves the file's status (telling the partner). Where the router's tables are not installed yet, the file
+   is held with reason "awaiting router" instead, and a later run routes it.
+4. Josh gets a Slack note with the file's status; the partner gets a confirmation email.
 
 Nothing here texts, emails or creates a CRM contact for the borrower. Partner consent is not
 borrower consent.
@@ -24,7 +25,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 
 from config.lender_matrix import LenderRules
 from config.lending_partners import (
@@ -208,8 +209,18 @@ def _prequal_pdf(services: PipelineServices, file: dict[str, Any], fit: LenderFi
 
 
 def route_file(db, file_id: int, now: Optional[datetime] = None) -> None:
-    """Hand the file to the router. Until the overflow router exists, hold it as "awaiting router"."""
-    record_status_change(db, file_id, "held", AWAITING_ROUTER_REASON, now=now)
+    """Hand the file to the overflow router (R-1).
+
+    The router commits its decision and moves the file's status itself (``change_status``), so the partner
+    is told. Where the router's tables are not installed yet (this migration ran first), hold the file as
+    "awaiting router"; the router picks such files up once it is installed.
+    """
+    if not inspect(db.connection()).has_table("file_routing", schema="lending"):
+        record_status_change(db, file_id, "held", AWAITING_ROUTER_REASON, now=now)
+        return
+    from src.lending.routing.router import route_loan_file
+
+    route_loan_file(file_id, db)
 
 
 def _mrkdwn(value: Any) -> str:
@@ -217,7 +228,7 @@ def _mrkdwn(value: Any) -> str:
     return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _josh_note(file: dict[str, Any], partner: Partner, fit: Optional[LenderFitResult]) -> SlackNote:
+def _josh_note(file: dict[str, Any], partner: Partner, fit: Optional[LenderFitResult], status: str) -> SlackNote:
     fitting = len(fit.fitting) if fit is not None else 0
     possible = len(fit.possible) if fit is not None else 0
     who = partner.name + (f" · {partner.company}" if partner.company else "")
@@ -234,7 +245,7 @@ def _josh_note(file: dict[str, Any], partner: Partner, fit: Optional[LenderFitRe
             {"type": "mrkdwn", "text": f"*Lender fit*\n{lender_fit}"},
         ]},
         {"type": "context", "elements": [{"type": "mrkdwn",
-                                          "text": "Held, awaiting router  ·  Borrower not contacted (partner consent only)"}]},
+                                          "text": f"Status: {_mrkdwn(status)}  ·  Borrower not contacted (partner consent only)"}]},
     ]
     return SlackNote(text=text, blocks=blocks)
 
@@ -332,7 +343,14 @@ def _process(file_id: int, services: PipelineServices, session_factory: Callable
                  "WHERE id = :id"),
             {"fit": fit.model_dump_json() if fit is not None else None, "pdf": pdf_path, "now": now, "id": file_id},
         )
-        route_file(db, file_id, now=now)
+        db.commit()  # keep the score and PDF even if routing fails below
+        try:
+            route_file(db, file_id, now=now)
+        except Exception as exc:
+            # The file stays 'received', so the Partner Door sweep tries it again; the partner and Josh are
+            # still told it arrived.
+            db.rollback()
+            logger.error("[partner-door] routing failed file=%s (%s)", file_id, type(exc).__name__)
 
     file["prequal_pdf_path"] = pdf_path
     _after_routing(file, partner, fit, services, session_factory)
@@ -349,9 +367,12 @@ def _after_routing(file: dict[str, Any], partner: Optional[Partner], fit: Option
         flags = db.execute(text("SELECT josh_notified_at, partner_confirmed_at, partner_emailed_at, partner_texted_at, "
                                 "prequal_sent_at FROM lending.partner_submissions WHERE file_id = :id"),
                            {"id": file_id}).mappings().first() or {}
+        state = db.execute(text("SELECT status, status_reason FROM lending.loan_files WHERE id = :id"),
+                           {"id": file_id}).first()
+    status_text = (state[0] + (f" ({state[1]})" if state[1] else "")) if state else "unknown"
     if not flags.get("josh_notified_at") and services.slack is not None:
         try:
-            services.slack(_josh_note(file, partner, fit))
+            services.slack(_josh_note(file, partner, fit, status_text))
             _stamp(session_factory, file_id, "josh_notified_at")
         except Exception as exc:
             logger.error("[partner-door] Slack note failed file=%s (%s)", file_id, type(exc).__name__)

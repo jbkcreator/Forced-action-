@@ -121,7 +121,7 @@ def mentions_bot(event: dict[str, Any], bot_user_id: str) -> bool:
 class SlackSession:
     def __init__(self, *, config: AgentCoreConfig, chat: ChatPort, queue: PendingActionQueue,
                  halt: HaltSwitch, relay: Relay, on_message: MessageHandler,
-                 on_revision: RevisionHandler, bot_user_id: str = "") -> None:
+                 on_revision: RevisionHandler, bot_user_id: str = "", extension: Any = None) -> None:
         self._config = config
         self._chat = chat
         self._queue = queue
@@ -130,6 +130,11 @@ class SlackSession:
         self._on_message = on_message
         self._on_revision = on_revision
         self.bot_user_id = bot_user_id
+        # Optional host hook for traffic this package does not own (a host's own buttons, forms and slash
+        # commands). ``respond(request_type, payload) -> dict | None`` runs before the ack and may return the ack
+        # payload (a form's validation errors); ``handle(request_type, payload) -> bool`` runs after the ack and
+        # returns True when it consumed the request. Either may be absent; neither may raise into the socket.
+        self._extension = extension
         self._seen = _RecentKeys()
 
     # -- entry point -------------------------------------------------------------------------
@@ -137,12 +142,26 @@ class SlackSession:
     def handle_request(self, request_type: str, payload: dict[str, Any], envelope_id: str = "") -> None:
         """Route one Socket Mode envelope. Never raises: a failed handler must not kill the socket."""
         try:
+            handle = getattr(self._extension, "handle", None)
+            if handle is not None and handle(request_type, payload):
+                return
             if request_type == "events_api":
                 self._handle_event(payload.get("event") or {})
             elif request_type == "interactive" and self._seen.first_sighting(f"envelope:{envelope_id}"):
                 self._handle_interactive(payload)
         except Exception:
             logger.exception("%s session: unhandled error routing %s", self._config.agent_name, request_type)
+
+    def respond(self, request_type: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+        """The ack payload for a request that needs an answer in the ack itself (a form submission's errors)."""
+        respond = getattr(self._extension, "respond", None)
+        if respond is None:
+            return None
+        try:
+            return respond(request_type, payload)
+        except Exception:
+            logger.exception("%s session: extension respond failed for %s", self._config.agent_name, request_type)
+            return None
 
     # -- messages ----------------------------------------------------------------------------
 
@@ -290,7 +309,8 @@ def run_socket_mode(session: SlackSession, *, app_token: str, web_client: Any,
     client = client_factory(app_token=app_token, web_client=web_client)
 
     def on_request(socket_client: Any, request: Any) -> None:
-        socket_client.send_socket_mode_response(SocketModeResponse(envelope_id=request.envelope_id))
+        body = session.respond(request.type, request.payload or {})
+        socket_client.send_socket_mode_response(SocketModeResponse(envelope_id=request.envelope_id, payload=body))
         session.handle_request(request.type, request.payload or {}, request.envelope_id or "")
 
     client.socket_mode_request_listeners.append(on_request)

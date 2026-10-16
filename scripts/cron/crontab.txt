@@ -1208,6 +1208,13 @@ COUNTY_ID=hillsborough
 # No-op while LENDING_PREQUAL_PDF_ENABLED is off.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_prequal_sweep
 
+# R-1 Overflow Router: route unrouted files + retry failed Slack posts every 5 min.
+*/5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_routing_sweep
+
+# R-1 hold-queue daily summary at 8:00 AM ET (two lines for DST; task checks the hour).
+0 12 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_routing_hold_summary
+0 13 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_routing_hold_summary
+
 # Lending soft approval (T-08) — post the #dial-tasks deal-facts card for finished calls whose first post failed.
 # No-op while LENDING_SOFT_APPROVAL_ENABLED is off.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_soft_approval_card_retry
