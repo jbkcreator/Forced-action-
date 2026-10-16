@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Optional
 
 from pydantic import ValidationError
@@ -46,8 +47,9 @@ ACTIONS: tuple[tuple[str, str], ...] = (
     ("make_primary", "Make the chosen lender primary"),
     ("remove", "Remove the chosen lender for good (Value: type its name)"),
     ("reopen_held", "Re-route every file held with no lender match"),
+    ("add_reason", "Add a decline reason (Value: its code, Label: the wording)"),
 )
-_NEEDS_LENDER = {a for a, _ in ACTIONS} - {"add_lender", "reopen_held"}
+_NEEDS_LENDER = {a for a, _ in ACTIONS} - {"add_lender", "reopen_held", "add_reason"}
 _BOX_FIELDS = ("types_b", "states_b", "min_b", "max_b", "credit_b")
 
 
@@ -135,6 +137,8 @@ def build_form_view(lenders: list[dict], boxes: Optional[dict[int, list[str]]] =
                              {"type": "static_select", "action_id": "v", "options": [option(str(l["id"]), _label(l)) for l in lenders[:100]]}))
     blocks += [
         _input("value_b", "Value", _text("a name, signed/pending, a number, yes/no")),
+        _input("label_b", "Label (for a new decline reason)", _text("Appraisal came in low"),
+               hint="Only used by 'Add a decline reason'. Value is its code, like appraisal_low."),
         _input("types_b", "Box: loan types",
                {"type": "multi_static_select", "action_id": "v",
                 "options": [option(m.value, m.value.replace("_", " ").title()) for m in LoanType]},
@@ -257,6 +261,12 @@ def collect_errors(values: dict, db: Session) -> dict[str, str]:
             errors["types_b"] = "Pick a loan type for the box fields you filled in."
         if action == "add_lender" and not value:
             errors["value_b"] = "Type the lender's name in Value."
+    elif action == "add_reason":
+        code, label = value.strip(), _value(values, "label_b")
+        if not code or not re.fullmatch(r"[a-z0-9_]{1,50}", code):
+            errors["value_b"] = "The code is lowercase letters, numbers and underscores only, like appraisal_low (50 characters at most)."
+        if not label or len(label) > 200:
+            errors["label_b"] = "Type the wording people will see, up to 200 characters."
     elif action == "remove" and lender is not None and value.strip().lower() != lender["name"].lower():
         errors["value_b"] = f"Type the lender's name ({lender['name']}) in Value to confirm removing it."
     elif action == "ground_up_min" and value.lower() not in ("none", "no minimum"):
@@ -338,6 +348,10 @@ def apply_change(values: dict, db: Session) -> str:
             raise FormError("Pick at least one loan type for the box.", "types_b")
         lender_service.add_box(lender_id=lender["id"], body=_box_from(values), db=db)
         return f"added a product box to *{name}*"
+    if action == "add_reason":
+        reason = lender_service.add_decline_reason(
+            lender_service.DeclineReasonIn(code=value.strip(), label=_value(values, "label_b")), db)
+        return f"{'added' if reason['created'] else 'updated'} decline reason *{reason['code']}* ({_value(values, 'label_b')})"
     if action == "reopen_held":
         from src.lending.routing.router import reopen_held
 

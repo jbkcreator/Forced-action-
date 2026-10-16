@@ -388,6 +388,30 @@ def delete_box(lender_id: int, box_id: int, db: Session) -> None:
         raise RoutingError("Box not found", NOT_FOUND)
 
 
+# ── Decline reasons ───────────────────────────────────────────────────────────
+
+class DeclineReasonIn(BaseModel):
+    code: str = Field(min_length=1, max_length=50, pattern=r"^[a-z0-9_]+$")
+    label: str = Field(min_length=1, max_length=200)
+
+    @field_validator("label")
+    @classmethod
+    def _label_not_blank(cls, value: str) -> str:
+        return _check_name(value)
+
+
+def add_decline_reason(body: DeclineReasonIn, db: Session) -> dict:
+    """Add a reason to Josh's list, or change the wording of one that exists (and switch it back on)."""
+    existed = db.execute(text("SELECT 1 FROM lending.decline_reason_codes WHERE code = :c"), {"c": body.code}).scalar()
+    db.execute(
+        text("INSERT INTO lending.decline_reason_codes (code, label, active) VALUES (:code, :label, TRUE)"
+             " ON CONFLICT (code) DO UPDATE SET label = EXCLUDED.label, active = TRUE"),
+        {"code": body.code, "label": body.label},
+    )
+    db.commit()
+    return {"code": body.code, "created": not existed}
+
+
 # ── The file record: where a file is, who is next, and its history ────────────
 
 _LEAD_FILE_ROW = (

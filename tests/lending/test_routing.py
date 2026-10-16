@@ -2214,3 +2214,29 @@ def test_reroute_is_refused_for_a_post_that_is_not_a_held_file(rdb, buttons):
     buttons.click("routing_reroute", _routed_event_id(rdb, lead))  # a Routed post, not a Held one
     assert "not a held file" in buttons.calls["told"][-1][1]
     assert _fr(rdb, lead)["status"] == "routed"
+
+
+def test_slack_form_adds_a_decline_reason_that_the_decline_form_then_offers(rdb, slack_form, buttons):
+    def label_form(code, label):
+        values = _form("add_reason", value=code)
+        values["label_b"] = {"v": {"type": "plain_text_input", "value": label}}
+        return values
+
+    assert slack_form(label_form("title_issue_found", "Title issue found")) == {}
+    assert "added decline reason *title_issue_found*" in slack_form.posted[-1]
+    assert rdb.execute(text("SELECT label, active FROM lending.decline_reason_codes WHERE code = 'title_issue_found'")).one() == (
+        "Title issue found", True)
+    slack_form(label_form("title_issue_found", "Title problem found"))  # the same code again changes the wording
+    assert "updated decline reason" in slack_form.posted[-1]
+    assert rdb.execute(text("SELECT label FROM lending.decline_reason_codes WHERE code = 'title_issue_found'")).scalar() == "Title problem found"
+
+    _two_flip_lenders(rdb)
+    lead = _make_lead(rdb, phone_suffix="7001")
+    _route(rdb, lead)
+    buttons.click("routing_decline", _routed_event_id(rdb, lead))
+    offered = [o["value"] for o in buttons.calls["opened"][-1]["blocks"][1]["element"]["options"]]
+    assert "title_issue_found" in offered and "ltv_over_max" in offered
+
+    for bad, blocks in ((label_form("Has Space", "x"), {"value_b"}), (label_form("ok_code", ""), {"label_b"}),
+                        (label_form("", ""), {"value_b", "label_b"}), (label_form("x" * 51, "long"), {"value_b"})):
+        assert set(slack_form(bad)["errors"]) == blocks, bad
