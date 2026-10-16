@@ -96,8 +96,40 @@ _GIT_TIMEOUT_SECONDS = 15
 # are the only DDL shapes recognized — anything else (role/grant DO $$ blocks,
 # ALTER TYPE, index-only migrations) reports as "unrecognized", never silently
 # assumed applied or not.
-_TABLE_RE = re.compile(r"CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+(\w+)", re.IGNORECASE)
-_COLUMN_RE = re.compile(r"ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+(\w+)", re.IGNORECASE)
+#
+# An optional schema prefix (`lending.`, `"lending".`, `"{t}".`) is skipped so
+# the captured name is the bare table; the table name is matched whole, so a
+# prefixed name is never read as the schema. CREATE TABLE must be followed by
+# the column list `(`, which keeps prose such as "CREATE TABLE IF NOT EXISTS
+# throughout." in a docstring or comment from being read as DDL.
+_SCHEMA_PREFIX = r'(?:"?[\w{}]+"?\.)?'
+_IDENT = r'"?(\w+)"?'
+_TABLE_RE = re.compile(
+    rf"CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+{_SCHEMA_PREFIX}{_IDENT}\s*\(", re.IGNORECASE,
+)
+_COLUMN_RE = re.compile(
+    rf"ALTER\s+TABLE\s+{_SCHEMA_PREFIX}{_IDENT}\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+{_IDENT}",
+    re.IGNORECASE,
+)
+
+# Existence is read from pg_catalog, not information_schema: information_schema
+# only lists objects the connecting role holds a privilege on, and vera_readonly
+# holds none on the `lending` schema. pg_catalog is readable by every role,
+# whatever its grants, and exposes names only — no row data.
+_TABLE_EXISTS_SQL = (
+    "SELECT 1 FROM pg_catalog.pg_class c "
+    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+    "WHERE c.relname = :t AND c.relkind IN ('r', 'p') "
+    "AND n.nspname NOT IN ('pg_catalog', 'information_schema') LIMIT 1"
+)
+_COLUMN_EXISTS_SQL = (
+    "SELECT 1 FROM pg_catalog.pg_class c "
+    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+    "JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid "
+    "WHERE c.relname = :t AND a.attname = :c AND a.attnum > 0 AND NOT a.attisdropped "
+    "AND c.relkind IN ('r', 'p') "
+    "AND n.nspname NOT IN ('pg_catalog', 'information_schema') LIMIT 1"
+)
 
 # module (as invoked by scripts/cron/run.sh) -> source_type(s) it feeds in
 # scraper_run_stats. Hand-verified against scripts/cron/crontab.txt and
@@ -186,29 +218,19 @@ def _extract_migration_targets(file_text: str) -> tuple[list[str], list[tuple[st
 
 def _classify_migration(session, file_text: str) -> str:
     """applied / not_applied / unrecognized, verified against the live schema
-    via information_schema — no migration ledger table needed (ADR 0024 keeps
-    none)."""
+    via pg_catalog — no migration ledger table needed (ADR 0024 keeps none).
+    Table and column names are matched in any schema, so `public` and `lending`
+    objects are checked the same way."""
     tables, columns = _extract_migration_targets(file_text)
     if not tables and not columns:
         return "unrecognized"
 
     for table in tables:
-        exists = session.execute(
-            text("SELECT 1 FROM information_schema.tables WHERE table_name = :t"),
-            {"t": table},
-        ).scalar()
-        if not exists:
+        if not session.execute(text(_TABLE_EXISTS_SQL), {"t": table}).scalar():
             return "not_applied"
 
     for table, column in columns:
-        exists = session.execute(
-            text(
-                "SELECT 1 FROM information_schema.columns "
-                "WHERE table_name = :t AND column_name = :c"
-            ),
-            {"t": table, "c": column},
-        ).scalar()
-        if not exists:
+        if not session.execute(text(_COLUMN_EXISTS_SQL), {"t": table, "c": column}).scalar():
             return "not_applied"
 
     return "applied"
