@@ -941,7 +941,6 @@ class AppSettings(BaseSettings):
 	lending_lendingflow_intro_sms_enabled: bool = Field(default=False, env="LENDING_LENDINGFLOW_INTRO_SMS_ENABLED")
 	# Pipeline stage (in LENDING_GHL_PIPELINE_ID) for new LendingFlow leads; unset = contact only.
 	lending_ghl_stage_lendingflow_new: Optional[str] = Field(default=None, env="LENDING_GHL_STAGE_LENDINGFLOW_NEW")
-	lending_ghl_stage_partner_new: Optional[str] = Field(default=None, env="LENDING_GHL_STAGE_PARTNER_NEW")  # P-1 "Partner - New" stage; unset = no GHL card for partner files
 	# T-09 intro SMS. Off: the tag that starts the GHL intro workflow is never added, so nobody is texted. Turn on only after
 	# Josh confirms LendingFlow's consent and DNC check. Needs the id of the GHL contact custom field "intro_name".
 	lending_intro_sms_enabled: bool = Field(default=False, env="LENDING_INTRO_SMS_ENABLED")

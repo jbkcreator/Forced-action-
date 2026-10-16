@@ -51,7 +51,6 @@ FitEvaluator = Callable[[BorrowerProfile, LoanRequest, Matrix], LenderFitResult]
 FitLimitsLookup = Callable[[LenderFitResult, Matrix], list[FitLimits]]  # fitting lenders -> their loan-amount limits
 ContactCheck = Callable[[str], bool]  # phone -> True when the text window is open
 MatrixLoader = Callable[[], Matrix]
-GhlPush = Callable[[dict, str], str]  # (file, partner name) -> borrower's GHL contact id
 LetterSender = Callable[["Partner", dict, bytes], None]  # emails the pre-qual PDF to the partner  # the lender rules in force (config, or the DB table when LENDING_RULES_FROM_DB)
 
 _STATUS_WORDING = {
@@ -94,7 +93,6 @@ class PipelineServices:
     text_window_open: ContactCheck  # 8am-8pm in the recipient's timezone(s); closed = email instead
     upload_dir: str
     prequal_pct: int
-    ghl_push: Optional[GhlPush] = None  # None = GHL account or "Partner - New" stage not configured
     send_letter: Optional[LetterSender] = None  # None = GHL account not configured
 
 
@@ -111,11 +109,11 @@ def live_services() -> PipelineServices:
     from src.lending.lender_rules_store import current_matrix
     from src.lending.pdf.render import NON_BINDING_PREQUAL_WATERMARK, render_pdf
 
-    from src.lending.partner_ghl import get_partner_ghl_sink, partner_stage_id
+    from src.lending.partner_ghl import get_partner_letter_sink
 
     settings = get_settings()
     email_sender, sms_sender = get_email_sender(), get_sender()
-    ghl, stage_id = get_partner_ghl_sink(), partner_stage_id()
+    letters = get_partner_letter_sink()
 
     def slack(note: SlackNote) -> None:
         channel, token = settings.lending_partner_channel, settings.lending_slack_bot_token  # #ndl-partner-deals
@@ -138,10 +136,9 @@ def live_services() -> PipelineServices:
         text_window_open=lambda phone: text_window_open(phone),
         upload_dir=settings.lending_partner_upload_dir,
         prequal_pct=settings.lending_prequal_range_pct,
-        ghl_push=(lambda file, partner_name: ghl.push_file(file, partner_name, stage_id)) if ghl and stage_id else None,
-        send_letter=(lambda partner, file, pdf: ghl.send_letter(
+        send_letter=(lambda partner, file, pdf: letters.send_letter(
             partner.email, partner.name, _place(file["property_address"], file["borrower_last_name"]), file["id"], pdf))
-        if ghl else None,
+        if letters else None,
     )
 
 
@@ -337,17 +334,15 @@ def _process(file_id: int, services: PipelineServices, session_factory: Callable
 
 def _after_routing(file: dict[str, Any], partner: Optional[Partner], fit: Optional[LenderFitResult],
                    services: PipelineServices, session_factory: Callable[[], Any]) -> None:
-    """GHL card, Josh's Slack card, the partner's confirmation and the pre-qual letter to the partner.
+    """Josh's Slack card, the partner's confirmation and the pre-qual letter to the partner.
     Each is done once (stamped on success); the sweep retries whatever is still unstamped."""
     if partner is None:
         return
     file_id = file["id"]
     with session_factory() as db:
         flags = db.execute(text("SELECT josh_notified_at, partner_confirmed_at, partner_emailed_at, partner_texted_at, "
-                                "ghl_synced_at, prequal_sent_at FROM lending.partner_submissions WHERE file_id = :id"),
+                                "prequal_sent_at FROM lending.partner_submissions WHERE file_id = :id"),
                            {"id": file_id}).mappings().first() or {}
-    if not flags.get("ghl_synced_at") and services.ghl_push is not None:
-        _push_to_ghl(services, file, partner, session_factory)
     if not flags.get("josh_notified_at") and services.slack is not None:
         try:
             services.slack(_josh_note(file, partner, fit))
@@ -372,18 +367,6 @@ def _record_confirmation(session_factory: Callable[[], Any], file_id: int, sent:
                         "partner_texted_at = CASE WHEN :t THEN COALESCE(partner_texted_at, :now) END, "
                         "partner_confirmed_at = CASE WHEN :c THEN :now END WHERE file_id = :id"),
                    {"e": sent.emailed, "t": sent.texted, "c": sent.complete, "now": _utcnow(), "id": file_id})
-
-
-def _push_to_ghl(services: PipelineServices, file: dict[str, Any], partner: Partner,
-                 session_factory: Callable[[], Any]) -> None:
-    try:
-        contact_id = services.ghl_push(file, partner.name)
-    except Exception as exc:
-        logger.error("[partner-door] GHL push failed file=%s (%s)", file["id"], type(exc).__name__)
-        return
-    with session_factory() as db:
-        db.execute(text("UPDATE lending.partner_submissions SET ghl_contact_id = :c, ghl_synced_at = :now "
-                        "WHERE file_id = :id"), {"c": contact_id, "now": _utcnow(), "id": file["id"]})
 
 
 def _send_letter(services: PipelineServices, file: dict[str, Any], partner: Partner,
@@ -523,9 +506,9 @@ def unprocessed_file_ids(db, older_than_minutes: int, limit: int, now: Optional[
 
 
 def unnotified_file_ids(db, older_than_minutes: int, max_age_hours: int, limit: int,
-                        now: Optional[datetime] = None, *, ghl: bool = False, letters: bool = False) -> list[int]:
+                        now: Optional[datetime] = None, *, letters: bool = False) -> list[int]:
     """Partner files already past 'received' with something still unsent: the Slack card, the partner
-    confirmation, and (when configured) the GHL card or the pre-qual letter to a partner with an email.
+    confirmation, and (when configured) the pre-qual letter to a partner with an email.
     Retried until ``max_age_hours`` after the file arrived."""
     now = now or _utcnow()
     rows = db.execute(
@@ -533,11 +516,10 @@ def unnotified_file_ids(db, older_than_minutes: int, max_age_hours: int, limit: 
              "JOIN lending.partners p ON p.id = f.partner_id "
              "WHERE f.source = :source AND f.status <> 'received' "
              "AND (s.josh_notified_at IS NULL OR s.partner_confirmed_at IS NULL "
-             "     OR (:ghl AND s.ghl_synced_at IS NULL) "
              "     OR (:letters AND f.prequal_pdf_path IS NOT NULL AND s.prequal_sent_at IS NULL "
              "         AND p.email IS NOT NULL)) "
              "AND f.created_at < :cutoff AND f.created_at > :oldest ORDER BY f.created_at LIMIT :limit"),
         {"source": SOURCE_PARTNER, "cutoff": now - timedelta(minutes=older_than_minutes),
-         "oldest": now - timedelta(hours=max_age_hours), "limit": limit, "ghl": ghl, "letters": letters},
+         "oldest": now - timedelta(hours=max_age_hours), "limit": limit, "letters": letters},
     ).all()
     return [int(row[0]) for row in rows]
