@@ -918,6 +918,9 @@ class LendingPartnerSubmission(LendingBase):
     user_agent: Mapped[Optional[str]] = mapped_column(String(300))
     partner_confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     josh_notified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    ghl_contact_id: Mapped[Optional[str]] = mapped_column(String(64))  # the borrower's GHL contact
+    ghl_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    prequal_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # letter emailed to the partner
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 
 

@@ -48,7 +48,8 @@ SQLITE_DDL = (
     """CREATE TABLE lending.partner_submissions (id INTEGER PRIMARY KEY AUTOINCREMENT, file_id INTEGER NOT NULL UNIQUE,
         partner_id INTEGER NOT NULL, consent_checked BOOLEAN NOT NULL, consent_text TEXT NOT NULL,
         consented_at TIMESTAMP NOT NULL, ip_address TEXT, page_url TEXT, user_agent TEXT,
-        partner_confirmed_at TIMESTAMP, josh_notified_at TIMESTAMP, created_at TIMESTAMP)""",
+        partner_confirmed_at TIMESTAMP, josh_notified_at TIMESTAMP, ghl_contact_id TEXT, ghl_synced_at TIMESTAMP,
+        prequal_sent_at TIMESTAMP, created_at TIMESTAMP)""",
     """CREATE TABLE lending.partner_file_uploads (id INTEGER PRIMARY KEY AUTOINCREMENT, file_id INTEGER NOT NULL,
         original_name TEXT NOT NULL, stored_path TEXT NOT NULL, content_type TEXT NOT NULL, size_bytes INTEGER NOT NULL,
         created_at TIMESTAMP)""",
@@ -627,3 +628,136 @@ def test_editing_the_reason_on_a_funded_file_keeps_its_funded_date(engine, sessi
         partners.record_status_change(db, file_id, "funded", "wire confirmed", now=datetime(2026, 11, 2, tzinfo=timezone.utc))
         assert partners.funded_by_partner(db, date(2026, 10, 1), date(2026, 11, 1)) == [("Maria Lopez", 1)]
     assert str(_rows(engine, "loan_files")[0]["funded_at"]).startswith("2026-10-05")
+
+
+# -- GHL card and pre-qual letter to the partner -------------------------------------------------------
+
+def _ghl_services(recorder: Recorder, tmp_path, *, push=None, letter=None):
+    recorder.pushes, recorder.letters = [], []
+
+    def default_push(file, partner_name):
+        recorder.pushes.append((file["id"], partner_name))
+        return "ghl-contact-1"
+
+    def default_letter(partner, file, pdf):
+        recorder.letters.append((partner.email, file["id"], pdf))
+
+    return dataclasses.replace(_services(recorder, tmp_path), ghl_push=push or default_push,
+                               send_letter=letter or default_letter)
+
+
+def _submission(engine) -> dict:
+    return _rows(engine, "partner_submissions")[0]
+
+
+def test_partner_file_goes_to_ghl_and_the_letter_goes_to_the_partner_once(engine, session_factory, tmp_path) -> None:
+    _, token = _partner(session_factory)
+    file_id = _submit(session_factory, token)
+    recorder = Recorder()
+    services = _ghl_services(recorder, tmp_path)
+    partner_pipeline.process_new_file(file_id, services, session_factory)
+
+    assert recorder.pushes == [(file_id, "Maria Lopez")]
+    assert recorder.letters == [("maria@example.com", file_id, b"%PDF fake")]
+    row = _submission(engine)
+    assert row["ghl_contact_id"] == "ghl-contact-1" and row["ghl_synced_at"] and row["prequal_sent_at"]
+
+    partner_pipeline.send_pending_notices(file_id, services, session_factory)
+    assert len(recorder.pushes) == 1 and len(recorder.letters) == 1
+
+
+def test_no_letter_without_a_partner_email(engine, session_factory, tmp_path) -> None:
+    _, token = _partner(session_factory, email=None)
+    file_id = _submit(session_factory, token)
+    recorder = Recorder()
+    partner_pipeline.process_new_file(file_id, _ghl_services(recorder, tmp_path), session_factory)
+    assert recorder.letters == [] and _submission(engine)["prequal_sent_at"] is None
+    later = datetime.now(timezone.utc) + timedelta(minutes=30)
+    with session_factory() as db:  # the missing letter adds no retry: there is no email to send it to
+        assert (partner_pipeline.unnotified_file_ids(db, 10, 24, 20, now=later, letters=True)
+                == partner_pipeline.unnotified_file_ids(db, 10, 24, 20, now=later))
+
+
+def test_failed_ghl_push_is_retried_by_the_sweep(engine, session_factory, tmp_path) -> None:
+    _, token = _partner(session_factory)
+    file_id = _submit(session_factory, token)
+    recorder = Recorder()
+
+    def ghl_down(file, partner_name):
+        raise RuntimeError("ghl down")
+
+    partner_pipeline.process_new_file(file_id, _ghl_services(recorder, tmp_path, push=ghl_down), session_factory)
+    assert _submission(engine)["ghl_synced_at"] is None
+    later = datetime.now(timezone.utc) + timedelta(minutes=30)
+    with session_factory() as db:
+        assert partner_pipeline.unnotified_file_ids(db, 10, 24, 20, now=later, ghl=True) == [file_id]
+        assert partner_pipeline.unnotified_file_ids(db, 10, 24, 20, now=later) == []  # GHL not configured
+    partner_pipeline.send_pending_notices(file_id, _ghl_services(recorder, tmp_path), session_factory)
+    assert recorder.pushes == [(file_id, "Maria Lopez")] and _submission(engine)["ghl_contact_id"] == "ghl-contact-1"
+
+
+def test_letter_with_unknown_outcome_is_never_sent_twice(engine, session_factory, tmp_path) -> None:
+    from src.lending.prequal_ghl import SendOutcomeUnknown
+
+    _, token = _partner(session_factory)
+    file_id = _submit(session_factory, token)
+    recorder = Recorder()
+
+    def timed_out(partner, file, pdf):
+        recorder.letters.append(file["id"])
+        raise SendOutcomeUnknown("prequal email send: ReadTimeout")
+
+    services = _ghl_services(recorder, tmp_path, letter=timed_out)
+    partner_pipeline.process_new_file(file_id, services, session_factory)
+    partner_pipeline.send_pending_notices(file_id, services, session_factory)
+    assert recorder.letters == [file_id] and _submission(engine)["prequal_sent_at"] is not None
+
+
+class _FakeGhl:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, dict]] = []
+
+    def __call__(self, step, method, path, **kwargs):
+        self.calls.append((method, path, kwargs.get("json") or kwargs.get("params") or {}))
+        if path == "/contacts/upsert":
+            return {"contact": {"id": "c-1"}}
+        return {}
+
+
+def test_ghl_sink_creates_a_tagged_borrower_contact_and_a_partner_card(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from src.lending import partner_ghl
+
+    sink = partner_ghl.PartnerGhlSink(SimpleNamespace(location_id="loc", api_key="k"))
+    fake = _FakeGhl()
+    monkeypatch.setattr(sink, "_call", fake)
+    monkeypatch.setattr(get_settings(), "lending_ghl_pipeline_id", "pipe")
+    file = {"id": 7, "borrower_first_name": "Dave", "borrower_last_name": "Reyes", "borrower_phone": "+18135550142",
+            "borrower_email": "dave@example.com", "loan_amount": 200000}
+    assert sink.push_file(file, "Maria Lopez", "stage-partner") == "c-1"
+
+    upsert = fake.calls[0][2]
+    assert upsert["phone"] == "+18135550142" and not {"tags", "dnd", "source"} & set(upsert)
+    assert fake.calls[1][2] == {"tags": ["partner-file", "partner-no-borrower-consent"]}
+    card = next(body for method, path, body in fake.calls if path == "/opportunities/")
+    assert card["pipelineStageId"] == "stage-partner" and card["name"] == "Partner - Dave Reyes"
+    assert "intro" not in str(fake.calls)  # never the SMS-trigger tag
+
+
+def test_ghl_sink_emails_the_letter_to_the_partner(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from src.lending import partner_ghl
+
+    sink = partner_ghl.PartnerGhlSink(SimpleNamespace(location_id="loc", api_key="k"))
+    fake, sent = _FakeGhl(), []
+    monkeypatch.setattr(sink, "_call", fake)
+    monkeypatch.setattr(sink, "_upload", lambda contact_id, pdf: f"https://files/{contact_id}.pdf")
+    monkeypatch.setattr(sink, "_send_email", sent.append)
+    sink.send_letter("maria@example.com", "Maria Lopez", "412 Palm Ave", 7, b"%PDF")
+
+    assert fake.calls[0][2]["email"] == "maria@example.com"
+    assert sent[0]["contactId"] == "c-1" and sent[0]["attachments"] == ["https://files/c-1.pdf"]
+    assert sent[0]["subject"] == "Pre-qualification estimate for 412 Palm Ave (ref #7)"
+    assert "non-binding" in sent[0]["html"] and "share it with the borrower" in sent[0]["html"]

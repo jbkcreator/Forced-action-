@@ -71,5 +71,21 @@ RATE_LIMIT_WINDOW_SECONDS = 3600
 # Sweep: a partner file still 'received' this long after it arrived lost its background run (crash/restart).
 SWEEP_AFTER_MINUTES = 10
 SWEEP_BATCH_SIZE = 20
-# A file whose Slack card or partner confirmation failed is retried by the sweep for this long.
+# A file whose Slack card, partner confirmation, GHL card or partner letter failed is retried by the sweep for this long.
 NOTICE_RETRY_HOURS = 24
+
+# GHL: a partner file becomes a borrower contact + an opportunity in the "Partner - New" stage, like a LendingFlow lead.
+# The borrower gave no consent of their own, so the contact never gets an SMS-trigger tag.
+GHL_SOURCE_PARTNER = "Partner Door"
+GHL_TAG_PARTNER_FILE = "partner-file"
+GHL_TAG_NO_BORROWER_CONSENT = "partner-no-borrower-consent"
+
+# Pre-qual letter to the partner (the borrower is never contacted). Disclaimer wording as T-07.
+PARTNER_LETTER_SUBJECT = "Pre-qualification estimate for {place} (ref #{file_id})"
+PARTNER_LETTER_HTML = (
+    "<p>Attached is the non-binding pre-qualification estimate for this file. It is not a commitment to lend or "
+    "an offer of specific terms; all figures are subject to lender confirmation. Please share it with the borrower "
+    "as you see fit.</p>"
+    "<p>Questions? Call or text {callback}.</p>"
+    "<p>{signer}</p>"
+)

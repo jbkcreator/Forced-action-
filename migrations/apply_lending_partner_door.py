@@ -96,6 +96,9 @@ def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
             user_agent           varchar(300),
             partner_confirmed_at timestamptz,
             josh_notified_at     timestamptz,
+            ghl_contact_id       varchar(64),
+            ghl_synced_at        timestamptz,
+            prequal_sent_at      timestamptz,
             created_at           timestamptz  NOT NULL DEFAULT now()
         )""",
         f"""CREATE TABLE IF NOT EXISTS {uploads} (
