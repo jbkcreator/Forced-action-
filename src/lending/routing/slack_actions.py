@@ -157,11 +157,15 @@ def _reroute(client: Any, channel: str, user: str, ts: str, original: str, event
                 _tell(client, channel, user, "That file is no longer in the hold queue.")
                 return
             (route_file if key.kind == LEAD else route_loan_file)(key.id, db)
+            result = db.execute(text(f"SELECT status, current_lender_name FROM lending.file_routing WHERE {key.column} = :id"),
+                                {"id": key.id}).one()
     except Exception as exc:  # class only
         logger.error("[routing-slack] re-route failed event=%s: %s", event_id, type(exc).__name__)
         _tell(client, channel, user, "Something went wrong; nothing was changed.")
         return
-    _update_post(client, channel, ts, original, f":recycle: *Sent back to the router* by <@{user}>",
+    outcome = (f"now with *{result.current_lender_name}*" if result.status == "routed"
+               else "but no lender matches yet, so it is held again (a new Held post follows)")
+    _update_post(client, channel, ts, original, f":recycle: *Sent back to the router* by <@{user}>: {outcome}",
                  keep_buttons=[details_block(event_id)])
 
 

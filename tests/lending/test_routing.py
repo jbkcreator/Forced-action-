@@ -1523,7 +1523,7 @@ def test_a_held_file_is_routed_after_a_lender_is_signed_once_it_is_sent_back(rdb
     held_post = _held_event_id(rdb, "lead_id", lead)
     buttons.click("routing_reroute", held_post)
     assert _fr(rdb, lead)["current_lender_name"] == "Signs Later"
-    assert "Sent back to the router" in buttons.calls["updated"][-1][0]
+    assert "Sent back to the router" in buttons.calls["updated"][-1][0] and "now with *Signs Later*" in buttons.calls["updated"][-1][0]
     buttons.click("routing_reroute", held_post)  # a second click: it is no longer held
     assert "no longer in the hold queue" in buttons.calls["told"][-1][1]
 
@@ -2240,3 +2240,12 @@ def test_slack_form_adds_a_decline_reason_that_the_decline_form_then_offers(rdb,
     for bad, blocks in ((label_form("Has Space", "x"), {"value_b"}), (label_form("ok_code", ""), {"label_b"}),
                         (label_form("", ""), {"value_b", "label_b"}), (label_form("x" * 51, "long"), {"value_b"})):
         assert set(slack_form(bad)["errors"]) == blocks, bad
+
+
+def test_reroute_says_so_when_no_lender_matches_yet_and_the_file_is_held_again(rdb, buttons):
+    lead = _make_lead(rdb, phone_suffix="7101")
+    _route(rdb, lead)  # no lenders at all: held
+    buttons.click("routing_reroute", _held_event_id(rdb, "lead_id", lead))
+    said = buttons.calls["updated"][-1][0]
+    assert "held again" in said and "no lender matches yet" in said
+    assert _fr(rdb, lead)["status"] == "held"
