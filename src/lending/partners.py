@@ -369,9 +369,12 @@ def record_status_change(db, file_id: int, status: str, reason: Optional[str] = 
     result = db.execute(
         text("UPDATE lending.loan_files SET status = :status, status_reason = :reason, status_at = :now, "
              "funded_at = CASE WHEN :status = 'funded' AND (status <> 'funded' OR funded_at IS NULL) THEN :now "
-             "ELSE funded_at END, updated_at = :now "
+             "ELSE funded_at END, updated_at = :now, "
+             "notice_status = CASE WHEN :notify THEN :status ELSE NULL END, notice_emailed_at = NULL, "
+             "notice_texted_at = NULL "
              "WHERE id = :id AND (status <> :status OR COALESCE(status_reason, '') <> COALESCE(:reason, ''))"),
-        {"status": status, "reason": (reason or None) and reason[:200], "now": now, "id": file_id},
+        {"status": status, "reason": (reason or None) and reason[:200], "now": now, "id": file_id,
+         "notify": status in PARTNER_NOTIFY_STATUSES},
     )
     if result.rowcount != 1 or status not in PARTNER_NOTIFY_STATUSES:
         return None

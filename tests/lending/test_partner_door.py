@@ -44,11 +44,13 @@ SQLITE_DDL = (
         completed_projects INTEGER, credit_band TEXT, timeline TEXT, notes TEXT, status TEXT NOT NULL DEFAULT 'received'
         CHECK (status IN ('received','held','routed','declined','approved','funded')), status_reason TEXT,
         status_at TIMESTAMP NOT NULL, lender_fit TEXT, prequal_pdf_path TEXT, funded_at TIMESTAMP,
+        notice_status TEXT, notice_emailed_at TIMESTAMP, notice_texted_at TIMESTAMP,
         created_at TIMESTAMP NOT NULL, updated_at TIMESTAMP NOT NULL)""",
     """CREATE TABLE lending.partner_submissions (id INTEGER PRIMARY KEY AUTOINCREMENT, file_id INTEGER NOT NULL UNIQUE,
         partner_id INTEGER NOT NULL, consent_checked BOOLEAN NOT NULL, consent_text TEXT NOT NULL,
         consented_at TIMESTAMP NOT NULL, ip_address TEXT, page_url TEXT, user_agent TEXT,
-        partner_confirmed_at TIMESTAMP, josh_notified_at TIMESTAMP, ghl_contact_id TEXT, ghl_synced_at TIMESTAMP,
+        partner_confirmed_at TIMESTAMP, partner_emailed_at TIMESTAMP, partner_texted_at TIMESTAMP,
+        josh_notified_at TIMESTAMP, ghl_contact_id TEXT, ghl_synced_at TIMESTAMP,
         prequal_sent_at TIMESTAMP, created_at TIMESTAMP)""",
     """CREATE TABLE lending.partner_file_uploads (id INTEGER PRIMARY KEY AUTOINCREMENT, file_id INTEGER NOT NULL,
         original_name TEXT NOT NULL, stored_path TEXT NOT NULL, content_type TEXT NOT NULL, size_bytes INTEGER NOT NULL,
@@ -494,7 +496,8 @@ def test_opted_out_email_is_never_emailed(engine, session_factory, tmp_path) -> 
                                    opt_outs=lambda phone, email: partner_pipeline.OptOuts(phone=False, email=True))
     partner_pipeline.process_new_file(file_id, services, session_factory)
     assert recorder.emails == [] and recorder.texts == []
-    assert _rows(engine, "partner_submissions")[0]["partner_confirmed_at"] is None
+    row = _rows(engine, "partner_submissions")[0]
+    assert row["partner_emailed_at"] is None and row["partner_confirmed_at"] is not None  # nothing left to retry
 
 
 def test_failing_opt_out_check_blocks_the_send(engine, session_factory, tmp_path) -> None:
@@ -508,6 +511,7 @@ def test_failing_opt_out_check_blocks_the_send(engine, session_factory, tmp_path
     partner_pipeline.process_new_file(file_id, dataclasses.replace(_services(recorder, tmp_path), opt_outs=broken),
                                       session_factory)
     assert recorder.emails == [] and recorder.texts == []
+    assert _rows(engine, "partner_submissions")[0]["partner_confirmed_at"] is None  # retried by the sweep
 
 
 def test_revoked_page_is_plain(session_factory, client) -> None:
@@ -761,3 +765,65 @@ def test_ghl_sink_emails_the_letter_to_the_partner(monkeypatch) -> None:
     assert sent[0]["contactId"] == "c-1" and sent[0]["attachments"] == ["https://files/c-1.pdf"]
     assert sent[0]["subject"] == "Pre-qualification estimate for 412 Palm Ave (ref #7)"
     assert "non-binding" in sent[0]["html"] and "share it with the borrower" in sent[0]["html"]
+
+
+# -- review: per-channel retries, status notice retries, Postgres jsonb ---------------------------------
+
+def test_failed_email_is_retried_without_resending_the_text(engine, session_factory, tmp_path) -> None:
+    _, token = _partner(session_factory, sms_consent=True)
+    file_id = _submit(session_factory, token)
+    recorder = Recorder()
+
+    def email_down(to, subject, body):
+        raise RuntimeError("email down")
+
+    partner_pipeline.process_new_file(file_id, dataclasses.replace(_services(recorder, tmp_path), email=email_down),
+                                      session_factory)
+    row = _rows(engine, "partner_submissions")[0]
+    assert len(recorder.texts) == 1 and row["partner_texted_at"] and row["partner_confirmed_at"] is None
+    partner_pipeline.send_pending_notices(file_id, _services(recorder, tmp_path), session_factory)
+    row = _rows(engine, "partner_submissions")[0]
+    assert len(recorder.emails) == 1 and len(recorder.texts) == 1  # email recovered, text not repeated
+    assert row["partner_emailed_at"] and row["partner_confirmed_at"]
+
+
+def test_failed_status_notice_is_retried_without_changing_the_status(engine, session_factory, tmp_path) -> None:
+    _, token = _partner(session_factory)
+    file_id = _submit(session_factory, token)
+    recorder = Recorder()
+
+    def email_down(to, subject, body):
+        raise RuntimeError("email down")
+
+    partner_pipeline.change_status(file_id, "declined", "ltv",
+                                   dataclasses.replace(_services(recorder, tmp_path), email=email_down), session_factory)
+    assert _rows(engine, "loan_files")[0]["notice_status"] == "declined"
+    later = datetime.now(timezone.utc) + timedelta(minutes=30)
+    with session_factory() as db:
+        assert partner_pipeline.pending_status_notice_ids(db, 10, 24, 20, now=later) == [file_id]
+    assert partner_pipeline.retry_status_notice(file_id, _services(recorder, tmp_path), session_factory)
+    assert len(recorder.emails) == 1 and "declined" in recorder.emails[0][2]
+    file = _rows(engine, "loan_files")[0]
+    assert file["status"] == "declined" and file["notice_status"] is None
+    with session_factory() as db:
+        assert partner_pipeline.pending_status_notice_ids(db, 10, 24, 20, now=later) == []
+    assert not partner_pipeline.retry_status_notice(file_id, _services(recorder, tmp_path), session_factory)
+    assert len(recorder.emails) == 1
+
+
+def test_internal_status_clears_a_queued_notice(engine, session_factory) -> None:
+    _, token = _partner(session_factory)
+    file_id = _submit(session_factory, token)
+    with session_factory() as db:
+        partners.record_status_change(db, file_id, "routed")
+        assert _rows(engine, "loan_files")[0]["notice_status"] == "routed"
+        partners.record_status_change(db, file_id, "held", "back to router")
+    assert _rows(engine, "loan_files")[0]["notice_status"] is None
+
+
+@pytest.mark.parametrize("stored", ["json", "dict"])
+def test_stored_fit_reads_sqlite_text_and_postgres_jsonb(stored) -> None:
+    fit = LenderFitResult(fitting=[LenderFit(lender_key="a", lender_name="A")])
+    value = fit.model_dump_json() if stored == "json" else fit.model_dump(mode="json")
+    assert partner_pipeline._stored_fit(value) == fit
+    assert partner_pipeline._stored_fit(None) is None
