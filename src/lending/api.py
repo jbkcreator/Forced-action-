@@ -20,7 +20,6 @@ from src.lending import lendingflow_events
 from src.lending.enrichment.service import on_lead_created as enrich_on_lead_created
 from src.lending.enrichment.webhook import router as lending_enrichment_router
 from src.lending.routing.admin_api import router as lending_routing_router
-from src.lending.routing.slack_admin import router as lending_routing_slack_router
 from src.api.lending_partner_router import router as lending_partner_router
 
 app = FastAPI(title="Lending API", docs_url=None, redoc_url=None)
@@ -40,7 +39,6 @@ app.include_router(lending_web_router)
 app.include_router(lending_lendingflow_router)
 app.include_router(lending_enrichment_router)
 app.include_router(lending_routing_router)
-app.include_router(lending_routing_slack_router)
 # T-12: build the enrichment card when a LendingFlow lead is created (the cron sweep covers other processes).
 lendingflow_events.subscribe(enrich_on_lead_created)
 app.include_router(lending_partner_router)

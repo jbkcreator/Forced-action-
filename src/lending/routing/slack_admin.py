@@ -1,23 +1,21 @@
 """R-1 lender rules edited from Slack (Josh's R1.4: a Slack form, not a web admin screen).
 
-``/lenders`` (Slack slash command -> ``POST /webhooks/lending/slack-lenders``) opens one modal: pick an action,
-pick a lender, type a value. The submission arrives on the existing Slack interactivity URL, which hands it to
-:func:`handle_submission` here. Every change goes through the same functions the admin API uses, so the same
+``/lenders`` (a slash command on Cora's Slack app, which runs over Socket Mode) opens one modal: pick an action,
+pick a lender, type a value. Cora's Socket Mode listener hands the command and the submission to
+``slack_extension.RoutingSlack``, which calls :func:`open_form` and :func:`handle_submission` here. Every change goes through the same functions the admin API uses, so the same
 validation, locking and conflict rules apply; nothing here writes to the rule tables itself.
 
-Only the Slack users in ``LENDING_ROUTING_EDITOR_USER_IDS`` may open or submit the form; an empty list means
-nobody (fail closed). Each applied change is posted to the routing channel (``LENDING_ROUTING_CHANNEL``,
-#next-deal-lending) with the person who made it: that post is the audit trail.
+Only Cora's approvers (``LENDING_CORA_APPROVER_USER_IDS``) may open or submit the form; an empty list means
+nobody (fail closed). Each applied change is posted to Cora's channel (``LENDING_CORA_CHANNEL``) with the person who
+made it: that post is the audit trail.
 """
 from __future__ import annotations
 
 import json
 import logging
 from typing import Any, Optional
-from urllib.parse import parse_qs
 
-from fastapi import APIRouter, HTTPException, Request
-from fastapi.concurrency import run_in_threadpool
+from fastapi import HTTPException
 from pydantic import ValidationError
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -27,11 +25,8 @@ from config.settings import get_settings
 from src.lending.contracts import LoanType
 from src.lending.db import lending_session
 from src.lending.routing import admin_api, notify
-from src.lending.soft_approval.slack_card import slack_client, verify_slack_signature
 
 logger = logging.getLogger(__name__)
-
-router = APIRouter(prefix="/webhooks/lending", tags=["lending"])
 
 CALLBACK_ID = "routing_lender_form"
 
@@ -51,7 +46,8 @@ _BOX_FIELDS = ("types_b", "states_b", "min_b", "max_b", "credit_b")
 
 
 def allowed_user_ids() -> frozenset[str]:
-    raw = getattr(get_settings(), "lending_routing_editor_user_ids", "") or ""
+    settings = get_settings()
+    raw = getattr(settings, "lending_cora_approver_user_ids", "") or ""
     return frozenset(item.strip() for item in raw.split(",") if item.strip())
 
 
@@ -211,7 +207,7 @@ def apply_change(values: dict, db: Session) -> str:
 def _post_audit(user_id: str, summary: str) -> None:
     client, channel = notify._client(), notify._channel()
     if client is None or not channel:
-        logger.warning("[routing-slack] change applied but LENDING_ROUTING_CHANNEL or the bot token is not set")
+        logger.warning("[routing-slack] change applied but LENDING_CORA_CHANNEL or LENDING_CORA_SLACK_BOT_TOKEN is not set")
         return
     try:
         client.chat_postMessage(channel=channel, text=f":gear: Lender rules changed by <@{user_id}>: {summary}")
@@ -243,29 +239,20 @@ def is_routing_submission(payload: dict) -> bool:
     return payload.get("type") == "view_submission" and (payload.get("view") or {}).get("callback_id") == CALLBACK_ID
 
 
-def _open_modal(trigger_id: str) -> None:
+def open_form(client: Any, payload: dict) -> None:
+    """The ``/lenders`` slash command: open the form for an allowed user, otherwise say no (privately)."""
+    user = str(payload.get("user_id") or "")
+    if user not in allowed_user_ids():
+        logger.warning("[routing-slack] user %s is not allowed to open the lender form", user or "unknown")
+        try:
+            client.chat_postEphemeral(channel=payload.get("channel_id", ""), user=user,
+                                      text="Only approved users can edit lender rules.")
+        except Exception as exc:  # class only
+            logger.error("[routing-slack] denial notice failed: %s", type(exc).__name__)
+        return
     try:
         with lending_session() as db:
             view = build_form_view(_lenders(db))
-        slack_client().views_open(trigger_id=trigger_id, view=view)
+        client.views_open(trigger_id=payload.get("trigger_id", ""), view=view)
     except Exception as exc:  # class only
         logger.error("[routing-slack] opening the form failed: %s", type(exc).__name__)
-
-
-@router.post("/slack-lenders")
-async def slack_lenders_command(request: Request) -> dict[str, Any]:
-    """Slash command ``/lenders``: opens the lender form for an allowed user."""
-    secret = get_settings().lending_slack_signing_secret
-    if not secret:
-        raise HTTPException(status_code=503, detail="Slack commands are not configured")
-    body = await request.body()
-    if not verify_slack_signature(secret.get_secret_value(), request.headers.get("X-Slack-Request-Timestamp"),
-                                  request.headers.get("X-Slack-Signature"), body):
-        raise HTTPException(status_code=401, detail="Invalid signature")
-    form = {k: v[0] for k, v in parse_qs(body.decode()).items()}
-    user = form.get("user_id", "")
-    if user not in allowed_user_ids():
-        logger.warning("[routing-slack] user %s is not allowed to open the lender form", user or "unknown")
-        return {"response_type": "ephemeral", "text": "Only approved users can edit lender rules."}
-    await run_in_threadpool(_open_modal, form.get("trigger_id", ""))
-    return {}

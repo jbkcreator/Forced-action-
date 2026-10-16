@@ -1,7 +1,8 @@
 """Slack notifications for R-1 routing events.
 
-Post target: LENDING_ROUTING_CHANNEL (config/settings.py), the #next-deal-lending channel.  The
-lending bot token (LENDING_SLACK_BOT_TOKEN) must be a member of that channel.
+Post target: Cora's channel (LENDING_CORA_CHANNEL), posted by Cora's bot (LENDING_CORA_SLACK_BOT_TOKEN), the
+app that already runs over Socket Mode. Nothing else is read: no other channel, no other bot token. Her listener
+receives the Decline / Approved / Funded clicks (see slack_extension.py).
 
 Spec: every route and every decline posts file ID, borrower last name, product, amount, lender
 and position in the waterfall.  One builder (``build_message``) serves the live post and the
@@ -31,9 +32,8 @@ logger = logging.getLogger(__name__)
 
 
 def _client():
-    """Return a Slack WebClient using the lending bot token, or None if unconfigured."""
-    settings = get_settings()
-    token = settings.lending_slack_bot_token
+    """A Slack WebClient on Cora's bot, or None if it is not configured."""
+    token = get_settings().lending_cora_slack_bot_token
     if not token:
         return None
     try:
@@ -45,7 +45,7 @@ def _client():
 
 
 def _channel() -> str:
-    return get_settings().lending_routing_channel
+    return get_settings().lending_cora_channel
 
 
 def _amount(value) -> str:

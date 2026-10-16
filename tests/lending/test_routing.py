@@ -1889,45 +1889,66 @@ def test_slack_form_refuses_strangers_and_bad_input_and_changes_nothing(rdb, sla
     assert slack_form.posted == []  # nothing applied, nothing announced
 
 
-def test_slack_form_is_reached_through_the_interactivity_url_and_the_command_checks_the_signature(rdb, monkeypatch):
-    import hashlib
-    import hmac
-    import time
-    from urllib.parse import urlencode
+def test_the_slash_command_opens_the_form_for_an_allowed_user_only(rdb, monkeypatch):
+    from src.lending.routing import slack_admin
+    from src.lending.routing.slack_extension import RoutingSlack
 
-    from fastapi.testclient import TestClient
+    monkeypatch.setattr(slack_admin, "allowed_user_ids", lambda: frozenset({"UJOSH"}))
+
+    class Client:
+        def __init__(self):
+            self.opened, self.told = [], []
+
+        def views_open(self, trigger_id, view):
+            self.opened.append((trigger_id, view["callback_id"]))
+
+        def chat_postEphemeral(self, channel, user, text):  # noqa: N802 - slack_sdk API name
+            self.told.append((user, text))
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def session():
+        yield rdb
+
+    monkeypatch.setattr(slack_admin, "lending_session", session)
+    client = Client()
+    extension = RoutingSlack(client)
+    assert extension.handle("slash_commands", {"command": "/lenders", "user_id": "UJOSH", "trigger_id": "T1"}) is True
+    assert client.opened == [("T1", slack_admin.CALLBACK_ID)]
+    assert extension.handle("slash_commands", {"command": "/lenders", "user_id": "UOTHER", "trigger_id": "T2",
+                                               "channel_id": "C1"}) is True
+    assert client.opened == [("T1", slack_admin.CALLBACK_ID)] and "Only approved users" in client.told[0][1]
+    assert extension.handle("slash_commands", {"command": "/something-else"}) is False  # not ours: left alone
+    assert extension.respond("events_api", {}) is None
+
+
+def test_only_coras_approvers_may_edit_lenders_and_act_on_files(monkeypatch):
+    from config.settings import get_settings
+    from src.lending.routing import slack_admin
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "lending_cora_approver_user_ids", "UJOSH, UOTHER", raising=False)
+    assert slack_admin.allowed_user_ids() == frozenset({"UJOSH", "UOTHER"})
+    monkeypatch.setattr(settings, "lending_cora_approver_user_ids", "", raising=False)
+    assert slack_admin.allowed_user_ids() == frozenset()  # nobody configured: nobody allowed
+    assert not hasattr(settings, "lending_routing_editor_user_ids")  # there is no second list to fall back to
+
+
+def test_routing_posts_use_only_coras_bot_and_channel(monkeypatch):
     from pydantic import SecretStr
 
     from config.settings import get_settings
-    from src.lending.api import app
-    from src.lending.routing import slack_admin
+    from src.lending.routing import notify
 
-    secret = "signing-secret-for-test"
-    monkeypatch.setattr(get_settings(), "lending_slack_signing_secret", SecretStr(secret), raising=False)
-    monkeypatch.setattr(slack_admin, "allowed_user_ids", lambda: frozenset({"UJOSH"}))
-    opened: list[str] = []
-    monkeypatch.setattr(slack_admin, "_open_modal", lambda trigger_id: opened.append(trigger_id))
-    client = TestClient(app)
-
-    def post(path, form, signed=True):
-        body = urlencode(form)
-        ts = str(int(time.time()))
-        sig = "v0=" + hmac.new(secret.encode(), f"v0:{ts}:{body}".encode(), hashlib.sha256).hexdigest()
-        headers = {"X-Slack-Request-Timestamp": ts, "X-Slack-Signature": sig if signed else "v0=bad",
-                   "Content-Type": "application/x-www-form-urlencoded"}
-        return client.post(path, content=body, headers=headers)
-
-    assert post("/webhooks/lending/slack-lenders", {"user_id": "UJOSH", "trigger_id": "T1"}, signed=False).status_code == 401
-    assert post("/webhooks/lending/slack-lenders", {"user_id": "UJOSH", "trigger_id": "T1"}).status_code == 200
-    assert opened == ["T1"]
-    refused = post("/webhooks/lending/slack-lenders", {"user_id": "UOTHER", "trigger_id": "T2"}).json()
-    assert "Only approved users" in refused["text"] and opened == ["T1"]
-
-    seen: list[dict] = []
-    monkeypatch.setattr(slack_admin, "handle_submission", lambda payload: seen.append(payload) or {})
-    payload = {"type": "view_submission", "user": {"id": "UJOSH"}, "view": {"callback_id": slack_admin.CALLBACK_ID}}
-    assert post("/webhooks/lending/slack-interactivity", {"payload": json.dumps(payload)}).status_code == 200
-    assert len(seen) == 1  # routed to the lender form even while the soft-approval switch is off
+    settings = get_settings()
+    assert not hasattr(settings, "lending_routing_channel")  # there is no other routing channel
+    monkeypatch.setattr(settings, "lending_cora_channel", "C_CORA", raising=False)
+    monkeypatch.setattr(settings, "lending_cora_slack_bot_token", SecretStr("xoxb-cora"), raising=False)
+    monkeypatch.setattr(settings, "lending_slack_bot_token", SecretStr("xoxb-lending"), raising=False)
+    assert notify._channel() == "C_CORA" and notify._client().token == "xoxb-cora"
+    monkeypatch.setattr(settings, "lending_cora_slack_bot_token", None, raising=False)
+    assert notify._client() is None  # the lending bot is never a fallback
 
 
 def test_the_lender_form_lists_the_waterfall_and_nobody_may_edit_when_no_editor_is_configured(rdb):
@@ -1961,9 +1982,8 @@ def buttons(rdb, monkeypatch):
     """The real button and form handlers on the test session, Josh the only allowed user, Slack calls recorded."""
     from contextlib import contextmanager
 
-    from fastapi import BackgroundTasks
-
     from src.lending.routing import slack_actions
+    from src.lending.routing.slack_extension import RoutingSlack
 
     calls: dict[str, list] = {"opened": [], "updated": [], "told": []}
 
@@ -1982,8 +2002,8 @@ def buttons(rdb, monkeypatch):
         yield rdb
 
     monkeypatch.setattr(slack_actions, "lending_session", session)
-    monkeypatch.setattr(slack_actions, "slack_client", lambda: Client())
     monkeypatch.setattr(slack_actions, "allowed_user_ids", lambda: frozenset({"UJOSH"}))
+    extension = RoutingSlack(Client(), run_later=lambda fn, *args: fn(*args))
 
     class Env:
         pass
@@ -1992,10 +2012,10 @@ def buttons(rdb, monkeypatch):
     env.calls = calls
 
     def click(action_id, event_id, user="UJOSH"):
-        slack_actions.handle_action({
+        assert extension.handle("interactive", {
             "type": "block_actions", "user": {"id": user}, "trigger_id": "T1", "channel": {"id": "C1"},
             "message": {"ts": "1.0", "text": "Routed | File", "blocks": [{"type": "actions"}]},
-            "actions": [{"action_id": action_id, "value": str(event_id)}]})
+            "actions": [{"action_id": action_id, "value": str(event_id)}]}) is True
 
     def submit(event_id, reason="", details="", user="UJOSH"):
         values = {"reason_b": {"v": {"type": "static_select", "selected_option": {"value": reason} if reason else None}},
@@ -2003,10 +2023,8 @@ def buttons(rdb, monkeypatch):
         payload = {"type": "view_submission", "user": {"id": user}, "view": {
             "callback_id": slack_actions.DECLINE_CALLBACK_ID, "state": {"values": values},
             "private_metadata": json.dumps({"event_id": event_id, "channel": "C1", "ts": "1.0", "original": "Routed | File"})}}
-        background = BackgroundTasks()
-        response = slack_actions.handle_decline_submission(payload, background)
-        for task in background.tasks:
-            task.func(*task.args, **task.kwargs)
+        response = extension.respond("interactive", payload) or {}
+        assert extension.handle("interactive", payload) is True  # consumed, not handled twice
         return response
 
     env.click, env.submit = click, submit
@@ -2078,32 +2096,11 @@ def test_approved_and_funded_buttons_record_the_outcome_and_funded_uses_a_seat(r
     assert _fr(rdb, second)["current_lender_name"] == "Spill Over"  # the seat is used
 
 
-def test_button_and_form_clicks_are_dispatched_from_the_interactivity_url(rdb, monkeypatch):
-    import hashlib
-    import hmac
-    import time
-    from urllib.parse import urlencode
+def test_clicks_that_are_not_routings_are_left_to_cora(rdb):
+    from src.lending.routing.slack_extension import RoutingSlack
 
-    from fastapi.testclient import TestClient
-    from pydantic import SecretStr
-
-    from config.settings import get_settings
-    from src.lending.api import app
-    from src.lending.routing import slack_actions
-
-    secret = "signing-secret-for-test"
-    monkeypatch.setattr(get_settings(), "lending_slack_signing_secret", SecretStr(secret), raising=False)
-    seen: list[str] = []
-    monkeypatch.setattr(slack_actions, "handle_action", lambda payload: seen.append("click"))
-    monkeypatch.setattr(slack_actions, "handle_decline_submission", lambda payload, background: seen.append("form") or {})
-
-    def post(payload):
-        body = urlencode({"payload": json.dumps(payload)})
-        ts = str(int(time.time()))
-        sig = "v0=" + hmac.new(secret.encode(), f"v0:{ts}:{body}".encode(), hashlib.sha256).hexdigest()
-        return TestClient(app).post("/webhooks/lending/slack-interactivity", content=body, headers={
-            "X-Slack-Request-Timestamp": ts, "X-Slack-Signature": sig, "Content-Type": "application/x-www-form-urlencoded"})
-
-    assert post({"type": "block_actions", "actions": [{"action_id": "routing_funded", "value": "1"}]}).status_code == 200
-    assert post({"type": "view_submission", "view": {"callback_id": slack_actions.DECLINE_CALLBACK_ID}}).status_code == 200
-    assert seen == ["click", "form"]
+    extension = RoutingSlack(object())
+    approval = {"type": "block_actions", "actions": [{"action_id": "agent_core_approve", "value": "7"}]}
+    assert extension.handle("interactive", approval) is False  # Cora's own approval card
+    assert extension.respond("interactive", approval) is None
+    assert extension.handle("events_api", {"event": {"type": "message"}}) is False

@@ -112,9 +112,9 @@ def live_services() -> PipelineServices:
     email_sender, sms_sender = get_email_sender(), get_sender()
 
     def slack(note: SlackNote) -> None:
-        channel, token = settings.lending_routing_channel, settings.lending_slack_bot_token  # #next-deal-lending, with R-1's route posts
+        channel, token = getattr(settings, "lending_routing_channel", ""), settings.lending_slack_bot_token  # P-1 sets up its own Slack
         if not (channel and token):
-            logger.info("[partner-door] Slack note skipped: LENDING_ROUTING_CHANNEL or bot token not set")
+            logger.info("[partner-door] Slack note skipped: no partner channel or bot token configured")
             return
         from slack_sdk import WebClient
 
