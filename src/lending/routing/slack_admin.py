@@ -208,15 +208,15 @@ def build_form_view(lenders: list[dict], boxes: Optional[dict[int, list[str]]] =
                 chosen = next((o for o in lender_options if o["value"] == _value(values, "lender_b")), None)
                 if chosen:
                     element["initial_option"] = chosen
-                blocks.append(_input("lender_b", "Lender", element))
+                blocks.append(_input("lender_b", "Lender", element, optional=False))
             else:
                 blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": "No lenders yet: add one first."}]})
         if spec.value:
             label, example, hint = spec.value
-            blocks.append(_input("value_b", label, _text_input(example, _value(values, "value_b")), hint=hint))
+            blocks.append(_input("value_b", label, _text_input(example, _value(values, "value_b")), optional=False, hint=hint))
         if spec.label:
             blocks.append(_input("label_b", "Label", _text_input("Appraisal came in low", _value(values, "label_b")),
-                                 hint="The wording people will see in the Decline form."))
+                                 optional=False, hint="The wording people will see in the Decline form."))
         if spec.box:
             type_options = [option(m.value, m.value.replace("_", " ").title()) for m in LoanType]
             chosen_types = [o for o in type_options if o["value"] in _value(values, "types_b").split(",")]
@@ -224,7 +224,7 @@ def build_form_view(lenders: list[dict], boxes: Optional[dict[int, list[str]]] =
             if chosen_types:
                 types_element["initial_options"] = chosen_types
             blocks += [
-                _input("types_b", "Box: loan types", types_element, hint=_BOX_NOTE),
+                _input("types_b", "Box: loan types", types_element, optional=action == "add_lender", hint=_BOX_NOTE),
                 _input("states_b", "Box: states", _text_input("FL, GA (blank = all states)", _value(values, "states_b"))),
                 _input("min_b", "Box: min loan ($)", _text_input(" ", _value(values, "min_b"))),
                 _input("max_b", "Box: max loan ($)", _text_input(" ", _value(values, "max_b"))),

@@ -2276,6 +2276,13 @@ def test_the_form_shows_only_the_fields_the_chosen_action_needs(rdb):
     for action in slack_admin.FIELDS:  # every action's fields are exactly what the checks can complain about
         assert set(_ids(build(action))) == slack_admin.shown_blocks(action)
 
+    required = lambda action: {b["block_id"] for b in build(action)["blocks"] if b.get("type") == "input" and not b["optional"]}  # noqa: E731
+    assert required("add_lender") == {"action_b", "value_b"}  # a name is needed; a box is not
+    assert required("add_box") == {"action_b", "lender_b", "types_b"}
+    assert required("add_reason") == {"action_b", "value_b", "label_b"}
+    assert required("pause") == {"action_b", "lender_b"}
+    assert required("seat_cap") == {"action_b", "lender_b", "value_b"}
+
     labelled = {b["block_id"]: b["label"]["text"] for b in build("seat_cap")["blocks"] if b.get("type") == "input"}
     assert labelled["value_b"] == "Monthly seat cap"  # Value says what it is for this action
 
