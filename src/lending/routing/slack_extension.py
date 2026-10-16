@@ -48,6 +48,9 @@ class RoutingSlack:
             return True
         if request_type != "interactive":
             return False
+        if slack_admin.is_form_action_change(payload):
+            slack_admin.refresh_form(self._web, payload)
+            return True
         if slack_actions.is_routing_action(payload):
             slack_actions.handle_action(payload, self._web)
             return True

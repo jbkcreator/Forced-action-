@@ -2249,3 +2249,86 @@ def test_reroute_says_so_when_no_lender_matches_yet_and_the_file_is_held_again(r
     said = buttons.calls["updated"][-1][0]
     assert "held again" in said and "no lender matches yet" in said
     assert _fr(rdb, lead)["status"] == "held"
+
+
+# ── The form follows the chosen action ────────────────────────────────────────
+
+def _ids(view: dict) -> list[str]:
+    return [b["block_id"] for b in view["blocks"] if b.get("type") == "input"]
+
+
+def test_the_form_shows_only_the_fields_the_chosen_action_needs(rdb):
+    from src.lending.routing import slack_admin
+
+    _two_flip_lenders(rdb)
+    lenders = slack_admin._lenders(rdb)
+    build = lambda action=None, values=None: slack_admin.build_form_view(lenders, {}, action, values)  # noqa: E731
+
+    assert _ids(build()) == ["action_b"]  # nothing chosen yet: just the Action field
+    action_block = [b for b in build()["blocks"] if b.get("block_id") == "action_b"][0]
+    assert action_block["dispatch_action"] is True  # Slack tells us when it changes
+    assert _ids(build("pause")) == ["action_b", "lender_b"]
+    assert _ids(build("agreement")) == ["action_b", "lender_b", "value_b"]
+    assert _ids(build("add_reason")) == ["action_b", "value_b", "label_b"]  # the Label appears only here
+    assert _ids(build("add_lender")) == ["action_b", "value_b", "types_b", "states_b", "min_b", "max_b", "credit_b"]
+    assert _ids(build("replace_boxes")) == ["action_b", "lender_b", "types_b", "states_b", "min_b", "max_b", "credit_b"]
+    assert _ids(build("reopen_held")) == ["action_b"]
+    for action in slack_admin.FIELDS:  # every action's fields are exactly what the checks can complain about
+        assert set(_ids(build(action))) == slack_admin.shown_blocks(action)
+
+    labelled = {b["block_id"]: b["label"]["text"] for b in build("seat_cap")["blocks"] if b.get("type") == "input"}
+    assert labelled["value_b"] == "Monthly seat cap"  # Value says what it is for this action
+
+
+def test_changing_the_action_rebuilds_the_form_and_keeps_what_was_typed(rdb, monkeypatch):
+    from contextlib import contextmanager
+
+    from src.lending.routing import slack_admin
+    from src.lending.routing.slack_extension import RoutingSlack
+
+    a, _ = _two_flip_lenders(rdb)
+    monkeypatch.setattr(slack_admin, "allowed_user_ids", lambda: frozenset({"UJOSH"}))
+
+    @contextmanager
+    def session():
+        yield rdb
+
+    monkeypatch.setattr(slack_admin, "lending_session", session)
+
+    class Client:
+        def __init__(self):
+            self.updated = []
+
+        def views_update(self, view_id, view):
+            self.updated.append((view_id, view))
+
+    client = Client()
+    values = {"lender_b": {"v": {"type": "static_select", "selected_option": {"value": str(a)}}},
+              "value_b": {"v": {"type": "plain_text_input", "value": "typed earlier"}}}
+
+    def change(to, user="UJOSH"):
+        payload = {"type": "block_actions", "user": {"id": user}, "actions": [
+            {"block_id": "action_b", "action_id": "v", "selected_option": {"value": to}}],
+            "view": {"id": "V1", "callback_id": slack_admin.CALLBACK_ID, "state": {"values": values}}}
+        return RoutingSlack(client).handle("interactive", payload)
+
+    assert change("agreement") is True
+    view_id, view = client.updated[-1]
+    assert view_id == "V1" and _ids(view) == ["action_b", "lender_b", "value_b"]
+    value_block = [b for b in view["blocks"] if b.get("block_id") == "value_b"][0]
+    lender_block = [b for b in view["blocks"] if b.get("block_id") == "lender_b"][0]
+    assert value_block["element"]["initial_value"] == "typed earlier"
+    assert lender_block["element"]["initial_option"]["value"] == str(a)
+    assert change("add_reason") is True and _ids(client.updated[-1][1]) == ["action_b", "value_b", "label_b"]
+    count = len(client.updated)
+    assert change("pause", user="USTRANGER") is True and len(client.updated) == count  # a stranger changes nothing
+
+
+def test_an_error_on_a_field_the_form_does_not_show_moves_to_the_action_field():
+    from src.lending.routing import slack_admin
+
+    values = {"action_b": {"v": {"type": "static_select", "selected_option": {"value": "reopen_held"}}}}
+    assert slack_admin._on_shown_fields({"value_b": "oops", "lender_b": "oops too"}, values) == {"action_b": "oops"}
+    pause = {"action_b": {"v": {"type": "static_select", "selected_option": {"value": "pause"}}}}
+    assert slack_admin._on_shown_fields({"lender_b": "needs a lender", "value_b": "x"}, pause) == {
+        "lender_b": "needs a lender", "action_b": "x"}

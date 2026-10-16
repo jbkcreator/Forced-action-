@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from pydantic import ValidationError
@@ -124,30 +125,111 @@ def _listing(lenders: list[dict], boxes: dict[int, list[str]]) -> str:
     return ("\n".join(lines) or "No lenders yet.")[:2800]
 
 
-def build_form_view(lenders: list[dict], boxes: Optional[dict[int, list[str]]] = None) -> dict:
-    listing = _listing(lenders, boxes or {})
+@dataclass(frozen=True)
+class _Fields:
+    """What an action needs on the form: the lender, a Value (label, example, hint), a Label, the box fields."""
+
+    lender: bool = False
+    value: Optional[tuple[str, str, str]] = None
+    label: bool = False
+    box: bool = False
+
+
+_BOX_NOTE = "A lender with no box receives nothing."
+FIELDS: dict[str, _Fields] = {
+    "add_lender": _Fields(value=("Lender name", "Acme Lending", "The new lender starts as pending. Sign it afterwards."), box=True),
+    "add_box": _Fields(lender=True, box=True),
+    "replace_boxes": _Fields(lender=True, box=True),
+    "clear_boxes": _Fields(lender=True),
+    "pause": _Fields(lender=True),
+    "resume": _Fields(lender=True),
+    "agreement": _Fields(lender=True, value=("Agreement status", "signed", "signed, pending, none or terminated.")),
+    "seat_cap": _Fields(lender=True, value=("Monthly seat cap", "15", "A whole number, or none for no cap.")),
+    "ground_up_min": _Fields(lender=True, value=("Ground-up minimum ($)", "500000", "Dollars, or none.")),
+    "takes_ground_up": _Fields(lender=True, value=("Takes ground-up", "yes", "yes or no.")),
+    "move_up": _Fields(lender=True),
+    "move_down": _Fields(lender=True),
+    "make_primary": _Fields(lender=True),
+    "remove": _Fields(lender=True, value=("Type the lender's name to confirm", "Spare",
+                                           "Removing is for good. A lender that has routed a file cannot be removed.")),
+    "reopen_held": _Fields(),
+    "add_reason": _Fields(value=("Reason code", "appraisal_low", "Lowercase letters, numbers and underscores."), label=True),
+}
+
+
+def shown_blocks(action: str) -> set[str]:
+    """The input blocks the form shows for an action (errors are always shown under one of these)."""
+    spec = FIELDS.get(action)
+    shown = {"action_b"}
+    if spec is None:
+        return shown
+    if spec.lender:
+        shown.add("lender_b")
+    if spec.value:
+        shown.add("value_b")
+    if spec.label:
+        shown.add("label_b")
+    if spec.box:
+        shown |= set(_BOX_FIELDS)
+    return shown
+
+
+def _text_input(placeholder: str, previous: str = "") -> dict:
+    element = _text(placeholder)
+    if previous:
+        element["initial_value"] = previous
+    return element
+
+
+def build_form_view(lenders: list[dict], boxes: Optional[dict[int, list[str]]] = None,
+                    action: Optional[str] = None, values: Optional[dict] = None) -> dict:
+    """The lender form. Before an action is chosen only the list and the Action field show; choosing an action
+    rebuilds the form (:func:`refresh_form`) with just the fields that action needs, keeping what was typed."""
+    values = values or {}
     option = lambda value, label: {"text": {"type": "plain_text", "text": label[:75]}, "value": value}  # noqa: E731
+    action_options = [option(a, t) for a, t in ACTIONS]
+    action_element: dict = {"type": "static_select", "action_id": "v", "options": action_options}
+    spec = FIELDS.get(action or "")
+    if spec is not None:
+        action_element["initial_option"] = next(o for o in action_options if o["value"] == action)
+    action_block = _input("action_b", "Action", action_element, optional=False)
+    action_block["dispatch_action"] = True  # Slack tells us when it changes, so the fields below can follow
     blocks: list[dict] = [
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Waterfall order*\n```{listing}```"}},
-        _input("action_b", "Action", {"type": "static_select", "action_id": "v", "options": [option(a, t) for a, t in ACTIONS]},
-               optional=False),
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Waterfall order*\n```{_listing(lenders, boxes or {})}```"}},
+        action_block,
     ]
-    if lenders:
-        blocks.append(_input("lender_b", "Lender (not needed to add one)",
-                             {"type": "static_select", "action_id": "v", "options": [option(str(l["id"]), _label(l)) for l in lenders[:100]]}))
-    blocks += [
-        _input("value_b", "Value", _text("a name, signed/pending, a number, yes/no")),
-        _input("label_b", "Label", _text("Appraisal came in low"),
-               hint="Only used by 'Add a decline reason': the wording people will see. Value is its code, like appraisal_low."),
-        _input("types_b", "Box: loan types",
-               {"type": "multi_static_select", "action_id": "v",
-                "options": [option(m.value, m.value.replace("_", " ").title()) for m in LoanType]},
-               hint="Used by 'Add a lender', 'Add a product box' and 'Replace boxes'. A lender with no box receives nothing."),
-        _input("states_b", "Box: states", _text("FL, GA (blank = all states)")),
-        _input("min_b", "Box: min loan ($)", _text()),
-        _input("max_b", "Box: max loan ($)", _text()),
-        _input("credit_b", "Box: min credit score", _text()),
-    ]
+    if spec is None:
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": "Pick an action: the fields it needs appear here."}]})
+    else:
+        if spec.lender:
+            if lenders:
+                lender_options = [option(str(l["id"]), _label(l)) for l in lenders[:100]]
+                element = {"type": "static_select", "action_id": "v", "options": lender_options}
+                chosen = next((o for o in lender_options if o["value"] == _value(values, "lender_b")), None)
+                if chosen:
+                    element["initial_option"] = chosen
+                blocks.append(_input("lender_b", "Lender", element))
+            else:
+                blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": "No lenders yet: add one first."}]})
+        if spec.value:
+            label, example, hint = spec.value
+            blocks.append(_input("value_b", label, _text_input(example, _value(values, "value_b")), hint=hint))
+        if spec.label:
+            blocks.append(_input("label_b", "Label", _text_input("Appraisal came in low", _value(values, "label_b")),
+                                 hint="The wording people will see in the Decline form."))
+        if spec.box:
+            type_options = [option(m.value, m.value.replace("_", " ").title()) for m in LoanType]
+            chosen_types = [o for o in type_options if o["value"] in _value(values, "types_b").split(",")]
+            types_element: dict = {"type": "multi_static_select", "action_id": "v", "options": type_options}
+            if chosen_types:
+                types_element["initial_options"] = chosen_types
+            blocks += [
+                _input("types_b", "Box: loan types", types_element, hint=_BOX_NOTE),
+                _input("states_b", "Box: states", _text_input("FL, GA (blank = all states)", _value(values, "states_b"))),
+                _input("min_b", "Box: min loan ($)", _text_input(" ", _value(values, "min_b"))),
+                _input("max_b", "Box: max loan ($)", _text_input(" ", _value(values, "max_b"))),
+                _input("credit_b", "Box: min credit score", _text_input(" ", _value(values, "credit_b"))),
+            ]
     return {"type": "modal", "callback_id": CALLBACK_ID, "title": {"type": "plain_text", "text": "Lender rules"},
             "submit": {"type": "plain_text", "text": "Apply"}, "close": {"type": "plain_text", "text": "Cancel"},
             "blocks": blocks}
@@ -416,6 +498,15 @@ def _post_audit(user_id: str, summary: str) -> None:
         logger.error("[routing-slack] audit post failed: %s", type(exc).__name__)
 
 
+def _on_shown_fields(errors: dict[str, str], values: dict) -> dict[str, str]:
+    """Slack refuses an error under a field that is not on the form, so move it to the Action field."""
+    shown = shown_blocks(_value(values, "action_b"))
+    moved: dict[str, str] = {}
+    for block, message in errors.items():
+        moved.setdefault(block if block in shown else "action_b", message)
+    return moved
+
+
 def handle_submission(payload: dict) -> dict[str, Any]:
     """Slack ``view_submission`` for the lender modal. Returns the Slack response (errors keep the modal open)."""
     user = _user_id(payload)
@@ -427,10 +518,10 @@ def handle_submission(payload: dict) -> dict[str, Any]:
         with lending_session() as db:
             summary = apply_change(values, db)
     except (ValueError, RoutingError, ValidationError) as exc:
-        return {"response_action": "errors", "errors": _form_errors(exc, values)}
+        return {"response_action": "errors", "errors": _on_shown_fields(_form_errors(exc, values), values)}
     except Exception as exc:  # class only: SQL errors can embed bound values
         logger.error("[routing-slack] applying a lender change failed: %s", type(exc).__name__)
-        return {"response_action": "errors", "errors": {"value_b": "Something went wrong; nothing was changed."}}
+        return {"response_action": "errors", "errors": _on_shown_fields({"value_b": "Something went wrong; nothing was changed."}, values)}
     logger.info("[routing-slack] lender change by %s: %s", user, summary.replace("*", ""))
     _post_audit(user, summary)
     return {}
@@ -438,6 +529,27 @@ def handle_submission(payload: dict) -> dict[str, Any]:
 
 def is_routing_submission(payload: dict) -> bool:
     return payload.get("type") == "view_submission" and (payload.get("view") or {}).get("callback_id") == CALLBACK_ID
+
+
+def is_form_action_change(payload: dict) -> bool:
+    actions = payload.get("actions") or []
+    return (payload.get("type") == "block_actions" and (payload.get("view") or {}).get("callback_id") == CALLBACK_ID
+            and bool(actions) and actions[0].get("block_id") == "action_b")
+
+
+def refresh_form(client: Any, payload: dict) -> None:
+    """The Action field changed: show only the fields that action needs, keeping what was already typed."""
+    if _user_id(payload) not in allowed_user_ids():
+        return
+    view = payload["view"]
+    values = (view.get("state") or {}).get("values") or {}
+    action = str(((payload["actions"][0]).get("selected_option") or {}).get("value") or "")
+    try:
+        with lending_session() as db:
+            updated = build_form_view(_lenders(db), _boxes_by_lender(db), action or None, values)
+        client.views_update(view_id=view["id"], view=updated)
+    except Exception as exc:  # class only
+        logger.error("[routing-slack] refreshing the form failed: %s", type(exc).__name__)
 
 
 def open_form(client: Any, payload: dict) -> None:
