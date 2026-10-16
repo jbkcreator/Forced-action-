@@ -44,11 +44,13 @@ SQLITE_DDL = (
         completed_projects INTEGER, credit_band TEXT, timeline TEXT, notes TEXT, status TEXT NOT NULL DEFAULT 'received'
         CHECK (status IN ('received','held','routed','declined','approved','funded')), status_reason TEXT,
         status_at TIMESTAMP NOT NULL, lender_fit TEXT, prequal_pdf_path TEXT, funded_at TIMESTAMP,
+        notice_status TEXT, notice_emailed_at TIMESTAMP, notice_texted_at TIMESTAMP,
         created_at TIMESTAMP NOT NULL, updated_at TIMESTAMP NOT NULL)""",
     """CREATE TABLE lending.partner_submissions (id INTEGER PRIMARY KEY AUTOINCREMENT, file_id INTEGER NOT NULL UNIQUE,
         partner_id INTEGER NOT NULL, consent_checked BOOLEAN NOT NULL, consent_text TEXT NOT NULL,
         consented_at TIMESTAMP NOT NULL, ip_address TEXT, page_url TEXT, user_agent TEXT,
-        partner_confirmed_at TIMESTAMP, josh_notified_at TIMESTAMP, created_at TIMESTAMP)""",
+        partner_confirmed_at TIMESTAMP, partner_emailed_at TIMESTAMP, partner_texted_at TIMESTAMP,
+        josh_notified_at TIMESTAMP, prequal_sent_at TIMESTAMP, created_at TIMESTAMP)""",
     """CREATE TABLE lending.partner_file_uploads (id INTEGER PRIMARY KEY AUTOINCREMENT, file_id INTEGER NOT NULL,
         original_name TEXT NOT NULL, stored_path TEXT NOT NULL, content_type TEXT NOT NULL, size_bytes INTEGER NOT NULL,
         created_at TIMESTAMP)""",
@@ -493,7 +495,8 @@ def test_opted_out_email_is_never_emailed(engine, session_factory, tmp_path) -> 
                                    opt_outs=lambda phone, email: partner_pipeline.OptOuts(phone=False, email=True))
     partner_pipeline.process_new_file(file_id, services, session_factory)
     assert recorder.emails == [] and recorder.texts == []
-    assert _rows(engine, "partner_submissions")[0]["partner_confirmed_at"] is None
+    row = _rows(engine, "partner_submissions")[0]
+    assert row["partner_emailed_at"] is None and row["partner_confirmed_at"] is not None  # nothing left to retry
 
 
 def test_failing_opt_out_check_blocks_the_send(engine, session_factory, tmp_path) -> None:
@@ -507,6 +510,7 @@ def test_failing_opt_out_check_blocks_the_send(engine, session_factory, tmp_path
     partner_pipeline.process_new_file(file_id, dataclasses.replace(_services(recorder, tmp_path), opt_outs=broken),
                                       session_factory)
     assert recorder.emails == [] and recorder.texts == []
+    assert _rows(engine, "partner_submissions")[0]["partner_confirmed_at"] is None  # retried by the sweep
 
 
 def test_revoked_page_is_plain(session_factory, client) -> None:
@@ -607,3 +611,210 @@ def test_a_router_crash_does_not_stop_the_confirmation_and_josh_note(engine, ses
     file = _rows(engine, "loan_files")[0]
     assert file["status"] == "received" and '"fitting"' in file["lender_fit"]  # scoring kept; the sweep heals the status
     assert len(recorder.slack) == 1 and len(recorder.emails) == 1
+
+
+def test_sweep_retries_the_slack_card_when_slack_failed_after_routing(engine, session_factory, tmp_path) -> None:
+    _, token = _partner(session_factory)
+    file_id = _submit(session_factory, token)
+    recorder = Recorder()
+    services = _services(recorder, tmp_path)
+
+    def slack_down(note):
+        raise RuntimeError("slack down")
+
+    partner_pipeline.process_new_file(file_id, dataclasses.replace(services, slack=slack_down), session_factory)
+    assert _rows(engine, "loan_files")[0]["status"] == "held"
+    assert _rows(engine, "partner_submissions")[0]["josh_notified_at"] is None
+    later = datetime.now(timezone.utc) + timedelta(minutes=30)
+    with session_factory() as db:
+        assert partner_pipeline.unprocessed_file_ids(db, 10, 20, now=later) == []
+        assert partner_pipeline.unnotified_file_ids(db, 10, 24, 20, now=later) == [file_id]
+    partner_pipeline.send_pending_notices(file_id, services, session_factory)
+    assert len(recorder.slack) == 1 and _rows(engine, "partner_submissions")[0]["josh_notified_at"] is not None
+    assert len(recorder.emails) == 1  # partner confirmation was already sent; not repeated
+    with session_factory() as db:
+        assert partner_pipeline.unnotified_file_ids(db, 10, 24, 20, now=later) == []
+        assert partner_pipeline.unnotified_file_ids(db, 10, 24, 20, now=later + timedelta(days=2)) == []
+
+
+def test_editing_the_reason_on_a_funded_file_keeps_its_funded_date(engine, session_factory) -> None:
+    _, token = _partner(session_factory)
+    file_id = _submit(session_factory, token)
+    first = datetime(2026, 10, 5, tzinfo=timezone.utc)
+    with session_factory() as db:
+        partners.record_status_change(db, file_id, "funded", now=first)
+        partners.record_status_change(db, file_id, "funded", "wire confirmed", now=datetime(2026, 11, 2, tzinfo=timezone.utc))
+        assert partners.funded_by_partner(db, date(2026, 10, 1), date(2026, 11, 1)) == [("Maria Lopez", 1)]
+    assert str(_rows(engine, "loan_files")[0]["funded_at"]).startswith("2026-10-05")
+
+
+# -- pre-qual letter to the partner -------------------------------------------------------------------
+
+def _letter_services(recorder: Recorder, tmp_path, *, letter=None):
+    recorder.letters = []
+
+    def default_letter(partner, file, pdf):
+        recorder.letters.append((partner.email, file["id"], pdf))
+
+    return dataclasses.replace(_services(recorder, tmp_path), send_letter=letter or default_letter)
+
+
+def _submission(engine) -> dict:
+    return _rows(engine, "partner_submissions")[0]
+
+
+def test_the_letter_goes_to_the_partner_once(engine, session_factory, tmp_path) -> None:
+    _, token = _partner(session_factory)
+    file_id = _submit(session_factory, token)
+    recorder = Recorder()
+    services = _letter_services(recorder, tmp_path)
+    partner_pipeline.process_new_file(file_id, services, session_factory)
+
+    assert recorder.letters == [("maria@example.com", file_id, b"%PDF fake")]
+    assert _submission(engine)["prequal_sent_at"]
+
+    partner_pipeline.send_pending_notices(file_id, services, session_factory)
+    assert len(recorder.letters) == 1
+
+
+def test_no_letter_without_a_partner_email(engine, session_factory, tmp_path) -> None:
+    _, token = _partner(session_factory, email=None)
+    file_id = _submit(session_factory, token)
+    recorder = Recorder()
+    partner_pipeline.process_new_file(file_id, _letter_services(recorder, tmp_path), session_factory)
+    assert recorder.letters == [] and _submission(engine)["prequal_sent_at"] is None
+    later = datetime.now(timezone.utc) + timedelta(minutes=30)
+    with session_factory() as db:  # the missing letter adds no retry: there is no email to send it to
+        assert (partner_pipeline.unnotified_file_ids(db, 10, 24, 20, now=later, letters=True)
+                == partner_pipeline.unnotified_file_ids(db, 10, 24, 20, now=later))
+
+
+def test_letter_with_unknown_outcome_is_never_sent_twice(engine, session_factory, tmp_path) -> None:
+    from src.lending.prequal_ghl import SendOutcomeUnknown
+
+    _, token = _partner(session_factory)
+    file_id = _submit(session_factory, token)
+    recorder = Recorder()
+
+    def timed_out(partner, file, pdf):
+        recorder.letters.append(file["id"])
+        raise SendOutcomeUnknown("prequal email send: ReadTimeout")
+
+    services = _letter_services(recorder, tmp_path, letter=timed_out)
+    partner_pipeline.process_new_file(file_id, services, session_factory)
+    partner_pipeline.send_pending_notices(file_id, services, session_factory)
+    assert recorder.letters == [file_id] and _submission(engine)["prequal_sent_at"] is not None
+
+
+class _FakeGhl:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, dict]] = []
+
+    def __call__(self, step, method, path, **kwargs):
+        self.calls.append((method, path, kwargs.get("json") or kwargs.get("params") or {}))
+        if path == "/contacts/upsert":
+            return {"contact": {"id": "c-1"}}
+        return {}
+
+
+def test_ghl_sink_emails_the_letter_to_the_partner(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from src.lending import partner_ghl
+
+    sink = partner_ghl.PartnerLetterSink(SimpleNamespace(location_id="loc", api_key="k"))
+    fake, sent = _FakeGhl(), []
+    monkeypatch.setattr(sink, "_call", fake)
+    monkeypatch.setattr(sink, "_upload", lambda contact_id, pdf: f"https://files/{contact_id}.pdf")
+    monkeypatch.setattr(sink, "_send_email", sent.append)
+    sink.send_letter("maria@example.com", "Maria Lopez", "412 Palm Ave", 7, b"%PDF")
+
+    assert fake.calls[0][2]["email"] == "maria@example.com"
+    assert sent[0]["contactId"] == "c-1" and sent[0]["attachments"] == ["https://files/c-1.pdf"]
+    assert sent[0]["subject"] == "Pre-qualification estimate for 412 Palm Ave (ref #7)"
+    assert "non-binding" in sent[0]["html"] and "share it with the borrower" in sent[0]["html"]
+
+
+# -- review: per-channel retries, status notice retries, Postgres jsonb ---------------------------------
+
+def test_failed_email_is_retried_without_resending_the_text(engine, session_factory, tmp_path) -> None:
+    _, token = _partner(session_factory, sms_consent=True)
+    file_id = _submit(session_factory, token)
+    recorder = Recorder()
+
+    def email_down(to, subject, body):
+        raise RuntimeError("email down")
+
+    partner_pipeline.process_new_file(file_id, dataclasses.replace(_services(recorder, tmp_path), email=email_down),
+                                      session_factory)
+    row = _rows(engine, "partner_submissions")[0]
+    assert len(recorder.texts) == 1 and row["partner_texted_at"] and row["partner_confirmed_at"] is None
+    partner_pipeline.send_pending_notices(file_id, _services(recorder, tmp_path), session_factory)
+    row = _rows(engine, "partner_submissions")[0]
+    assert len(recorder.emails) == 1 and len(recorder.texts) == 1  # email recovered, text not repeated
+    assert row["partner_emailed_at"] and row["partner_confirmed_at"]
+
+
+def test_failed_status_notice_is_retried_without_changing_the_status(engine, session_factory, tmp_path) -> None:
+    _, token = _partner(session_factory)
+    file_id = _submit(session_factory, token)
+    recorder = Recorder()
+
+    def email_down(to, subject, body):
+        raise RuntimeError("email down")
+
+    partner_pipeline.change_status(file_id, "declined", "ltv",
+                                   dataclasses.replace(_services(recorder, tmp_path), email=email_down), session_factory)
+    assert _rows(engine, "loan_files")[0]["notice_status"] == "declined"
+    later = datetime.now(timezone.utc) + timedelta(minutes=30)
+    with session_factory() as db:
+        assert partner_pipeline.pending_status_notice_ids(db, 10, 24, 20, now=later) == [file_id]
+    assert partner_pipeline.retry_status_notice(file_id, _services(recorder, tmp_path), session_factory)
+    assert len(recorder.emails) == 1 and "declined" in recorder.emails[0][2]
+    file = _rows(engine, "loan_files")[0]
+    assert file["status"] == "declined" and file["notice_status"] is None
+    with session_factory() as db:
+        assert partner_pipeline.pending_status_notice_ids(db, 10, 24, 20, now=later) == []
+    assert not partner_pipeline.retry_status_notice(file_id, _services(recorder, tmp_path), session_factory)
+    assert len(recorder.emails) == 1
+
+
+def test_internal_status_clears_a_queued_notice(engine, session_factory) -> None:
+    _, token = _partner(session_factory)
+    file_id = _submit(session_factory, token)
+    with session_factory() as db:
+        partners.record_status_change(db, file_id, "routed")
+        assert _rows(engine, "loan_files")[0]["notice_status"] == "routed"
+        partners.record_status_change(db, file_id, "held", "back to router")
+    assert _rows(engine, "loan_files")[0]["notice_status"] is None
+
+
+@pytest.mark.parametrize("stored", ["json", "dict"])
+def test_stored_fit_reads_sqlite_text_and_postgres_jsonb(stored) -> None:
+    fit = LenderFitResult(fitting=[LenderFit(lender_key="a", lender_name="A")])
+    value = fit.model_dump_json() if stored == "json" else fit.model_dump(mode="json")
+    assert partner_pipeline._stored_fit(value) == fit
+    assert partner_pipeline._stored_fit(None) is None
+
+
+@pytest.mark.parametrize("ambiguous, retried", [(True, False), (False, True)])
+def test_status_notice_with_unknown_outcome_is_not_resent(engine, session_factory, tmp_path, ambiguous, retried) -> None:
+    from src.lending.ghl_sms import GhlSmsError
+
+    _, token = _partner(session_factory)
+    file_id = _submit(session_factory, token)
+    recorder, attempts = Recorder(), []
+
+    def flaky_email(to, subject, body):
+        attempts.append(to)
+        raise GhlSmsError("GHL message send returned no message id", ambiguous=ambiguous)
+
+    partner_pipeline.change_status(file_id, "approved", None,
+                                   dataclasses.replace(_services(recorder, tmp_path), email=flaky_email), session_factory)
+    later = datetime.now(timezone.utc) + timedelta(minutes=30)
+    with session_factory() as db:
+        pending = partner_pipeline.pending_status_notice_ids(db, 10, 24, 20, now=later)
+    assert (pending == [file_id]) is retried
+    partner_pipeline.retry_status_notice(file_id, dataclasses.replace(_services(recorder, tmp_path), email=flaky_email),
+                                         session_factory)
+    assert len(attempts) == (2 if retried else 1)

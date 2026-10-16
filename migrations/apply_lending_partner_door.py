@@ -79,6 +79,9 @@ def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
             lender_fit          jsonb,
             prequal_pdf_path    varchar(300),
             funded_at           timestamptz,
+            notice_status       varchar(20),
+            notice_emailed_at   timestamptz,
+            notice_texted_at    timestamptz,
             created_at          timestamptz  NOT NULL DEFAULT now(),
             updated_at          timestamptz  NOT NULL DEFAULT now()
         )""",
@@ -95,7 +98,10 @@ def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
             page_url             varchar(300),
             user_agent           varchar(300),
             partner_confirmed_at timestamptz,
+            partner_emailed_at   timestamptz,
+            partner_texted_at    timestamptz,
             josh_notified_at     timestamptz,
+            prequal_sent_at      timestamptz,
             created_at           timestamptz  NOT NULL DEFAULT now()
         )""",
         f"""CREATE TABLE IF NOT EXISTS {uploads} (

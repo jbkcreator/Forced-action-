@@ -1012,6 +1012,9 @@ class LendingLoanFile(LendingBase):
     lender_fit: Mapped[Optional[dict]] = mapped_column(JSONB)  # evaluate_lender_fit result (internal only)
     prequal_pdf_path: Mapped[Optional[str]] = mapped_column(String(300))  # generated, never sent to the borrower
     funded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    notice_status: Mapped[Optional[str]] = mapped_column(String(20))  # status whose partner notice is not fully sent
+    notice_emailed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    notice_texted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 
@@ -1069,8 +1072,11 @@ class LendingPartnerSubmission(LendingBase):
     ip_address: Mapped[Optional[str]] = mapped_column(String(45))
     page_url: Mapped[Optional[str]] = mapped_column(String(300))  # the link token is removed before storing
     user_agent: Mapped[Optional[str]] = mapped_column(String(300))
-    partner_confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    partner_confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # every required channel sent
+    partner_emailed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    partner_texted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     josh_notified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    prequal_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # letter emailed to the partner
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 
 

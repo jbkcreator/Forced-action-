@@ -51,7 +51,8 @@ Matrix = Sequence[LenderRules]
 FitEvaluator = Callable[[BorrowerProfile, LoanRequest, Matrix], LenderFitResult]
 FitLimitsLookup = Callable[[LenderFitResult, Matrix], list[FitLimits]]  # fitting lenders -> their loan-amount limits
 ContactCheck = Callable[[str], bool]  # phone -> True when the text window is open
-MatrixLoader = Callable[[], Matrix]  # the lender rules in force (config, or the DB table when LENDING_RULES_FROM_DB)
+MatrixLoader = Callable[[], Matrix]
+LetterSender = Callable[["Partner", dict, bytes], None]  # emails the pre-qual PDF to the partner  # the lender rules in force (config, or the DB table when LENDING_RULES_FROM_DB)
 
 _STATUS_WORDING = {
     "routed": "has been sent to a lender for review",
@@ -93,6 +94,7 @@ class PipelineServices:
     text_window_open: ContactCheck  # 8am-8pm in the recipient's timezone(s); closed = email instead
     upload_dir: str
     prequal_pct: int
+    send_letter: Optional[LetterSender] = None  # None = GHL account not configured
 
 
 def _utcnow() -> datetime:
@@ -108,13 +110,16 @@ def live_services() -> PipelineServices:
     from src.lending.lender_rules_store import current_matrix
     from src.lending.pdf.render import NON_BINDING_PREQUAL_WATERMARK, render_pdf
 
+    from src.lending.partner_ghl import get_partner_letter_sink
+
     settings = get_settings()
     email_sender, sms_sender = get_email_sender(), get_sender()
+    letters = get_partner_letter_sink()
 
     def slack(note: SlackNote) -> None:
-        channel, token = getattr(settings, "lending_routing_channel", ""), settings.lending_slack_bot_token  # P-1 sets up its own Slack
+        channel, token = settings.lending_partner_channel, settings.lending_slack_bot_token  # #ndl-partner-deals
         if not (channel and token):
-            logger.info("[partner-door] Slack note skipped: no partner channel or bot token configured")
+            logger.info("[partner-door] Slack note skipped: LENDING_PARTNER_CHANNEL or bot token not set")
             return
         from slack_sdk import WebClient
 
@@ -132,6 +137,9 @@ def live_services() -> PipelineServices:
         text_window_open=lambda phone: text_window_open(phone),
         upload_dir=settings.lending_partner_upload_dir,
         prequal_pct=settings.lending_prequal_range_pct,
+        send_letter=(lambda partner, file, pdf: letters.send_letter(
+            partner.email, partner.name, _place(file["property_address"], file["borrower_last_name"]), file["id"], pdf))
+        if letters else None,
     )
 
 
@@ -145,13 +153,20 @@ def _opt_outs(phone: Optional[str], email: Optional[str]) -> OptOuts:
                        email=bool(email) and is_email_suppressed(db, email))
 
 
-def _read_opt_outs(services: PipelineServices, partner: Partner) -> OptOuts:
-    """Both opt-outs for the partner; a failing lookup blocks both channels (fail closed)."""
+def _read_opt_outs(services: PipelineServices, partner: Partner) -> Optional[OptOuts]:
+    """Both opt-outs for the partner; None when the lookup fails, which blocks both channels (fail closed)."""
     try:
         return services.opt_outs(partner.phone, partner.email)
     except Exception as exc:
         logger.error("[partner-door] opt-out check failed partner=%s (%s)", partner.id, type(exc).__name__)
-        return OptOuts(phone=True, email=True)
+        return None
+
+
+def _stored_fit(value: Any) -> Optional[LenderFitResult]:
+    """``lender_fit`` as read back: Postgres jsonb arrives decoded (a dict), SQLite as JSON text."""
+    if not value:
+        return None
+    return LenderFitResult.model_validate(value) if isinstance(value, dict) else LenderFitResult.model_validate_json(value)
 
 
 def _money(value: Optional[int]) -> Optional[Decimal]:
@@ -239,25 +254,43 @@ def _place(address: Optional[str], last_name: str) -> str:
     return address or f"the {last_name} file"
 
 
-def _send_partner(services: PipelineServices, partner: Partner, subject: str, body: str) -> bool:
-    """Always email the partner; also text them when they agreed to texts and it is 8am-8pm their time.
-    An opted-out email address or number (STOP) is never used. True when at least one message went out."""
+@dataclass(frozen=True)
+class Delivery:
+    emailed: bool
+    texted: bool
+    complete: bool  # every channel the partner should get has gone out; nothing left to retry
+
+
+def _deliver(services: PipelineServices, partner: Partner, subject: str, body: str, *,
+             emailed: bool = False, texted: bool = False) -> Delivery:
+    """Email the partner, and also text them when they agreed to texts and it is 8am-8pm their time. An opted-out
+    address or number (STOP) is never used. ``emailed`` / ``texted`` say which channel already went out, so a retry
+    sends only the missing one. Complete = the email went out; for a partner with no usable email, the text did."""
     opted_out = _read_opt_outs(services, partner)
-    sent = False
-    if partner.email and services.email is not None and not opted_out.email:
-        try:
-            services.email(partner.email, subject, body)
-            sent = True
-        except Exception as exc:
-            logger.error("[partner-door] partner email failed partner=%s (%s)", partner.id, type(exc).__name__)
-    if (partner.sms_consent and partner.phone and services.sms is not None and not opted_out.phone
-            and _window_open(services, partner)):
-        try:
-            services.sms(partner.phone, f"{subject}. {body}")
-            sent = True
-        except Exception as exc:
-            logger.error("[partner-door] partner text failed partner=%s (%s)", partner.id, type(exc).__name__)
-    return sent
+    if opted_out is None:
+        return Delivery(emailed, texted, complete=False)
+    can_email = bool(partner.email) and services.email is not None and not opted_out.email
+    can_text = bool(partner.sms_consent and partner.phone) and services.sms is not None and not opted_out.phone
+    if can_email and not emailed:
+        emailed = _send_once("email", partner, lambda: services.email(partner.email, subject, body))
+    if can_text and not texted and _window_open(services, partner):
+        texted = _send_once("text", partner, lambda: services.sms(partner.phone, f"{subject}. {body}"))
+    complete = emailed if can_email else (texted if can_text else True)
+    return Delivery(emailed, texted, complete)
+
+
+def _send_once(channel: str, partner: Partner, send: Callable[[], Any]) -> bool:
+    """True when the channel counts as sent. A GHL error flagged ``ambiguous`` (timeout, 5xx, accepted without a
+    message id) may have gone out, so it counts as sent and is never retried: the partner must not get it twice."""
+    try:
+        send()
+        return True
+    except Exception as exc:
+        if getattr(exc, "ambiguous", False):
+            logger.error("[partner-door] partner %s outcome unknown partner=%s; not retried", channel, partner.id)
+            return True
+        logger.error("[partner-door] partner %s failed partner=%s (%s)", channel, partner.id, type(exc).__name__)
+        return False
 
 
 def _window_open(services: PipelineServices, partner: Partner) -> bool:
@@ -319,11 +352,21 @@ def _process(file_id: int, services: PipelineServices, session_factory: Callable
             db.rollback()
             logger.error("[partner-door] routing failed file=%s (%s)", file_id, type(exc).__name__)
 
+    file["prequal_pdf_path"] = pdf_path
+    _after_routing(file, partner, fit, services, session_factory)
+
+
+def _after_routing(file: dict[str, Any], partner: Optional[Partner], fit: Optional[LenderFitResult],
+                   services: PipelineServices, session_factory: Callable[[], Any]) -> None:
+    """Josh's Slack card, the partner's confirmation and the pre-qual letter to the partner.
+    Each is done once (stamped on success); the sweep retries whatever is still unstamped."""
     if partner is None:
         return
+    file_id = file["id"]
     with session_factory() as db:
-        flags = db.execute(text("SELECT josh_notified_at, partner_confirmed_at FROM lending.partner_submissions "
-                                "WHERE file_id = :id"), {"id": file_id}).mappings().first() or {}
+        flags = db.execute(text("SELECT josh_notified_at, partner_confirmed_at, partner_emailed_at, partner_texted_at, "
+                                "prequal_sent_at FROM lending.partner_submissions WHERE file_id = :id"),
+                           {"id": file_id}).mappings().first() or {}
         state = db.execute(text("SELECT status, status_reason FROM lending.loan_files WHERE id = :id"),
                            {"id": file_id}).first()
     status_text = (state[0] + (f" ({state[1]})" if state[1] else "")) if state else "unknown"
@@ -337,12 +380,61 @@ def _process(file_id: int, services: PipelineServices, session_factory: Callable
         place = _place(file["property_address"], file["borrower_last_name"])
         body = (f"Hi {partner.name.split()[0]}, we received your file for {place} "
                 f"(reference #{file['id']}). You can follow its status from the same link you used to submit it.")
-        if _send_partner(services, partner, f"We received your file for {place}", body):
-            _stamp(session_factory, file_id, "partner_confirmed_at")
+        sent = _deliver(services, partner, f"We received your file for {place}", body,
+                        emailed=bool(flags.get("partner_emailed_at")), texted=bool(flags.get("partner_texted_at")))
+        _record_confirmation(session_factory, file_id, sent)
+    if not flags.get("prequal_sent_at") and file.get("prequal_pdf_path") and services.send_letter is not None:
+        _send_letter(services, file, partner, session_factory)
+
+
+def _record_confirmation(session_factory: Callable[[], Any], file_id: int, sent: Delivery) -> None:
+    with session_factory() as db:
+        db.execute(text("UPDATE lending.partner_submissions SET "
+                        "partner_emailed_at = CASE WHEN :e THEN COALESCE(partner_emailed_at, :now) END, "
+                        "partner_texted_at = CASE WHEN :t THEN COALESCE(partner_texted_at, :now) END, "
+                        "partner_confirmed_at = CASE WHEN :c THEN :now END WHERE file_id = :id"),
+                   {"e": sent.emailed, "t": sent.texted, "c": sent.complete, "now": _utcnow(), "id": file_id})
+
+
+def _send_letter(services: PipelineServices, file: dict[str, Any], partner: Partner,
+                 session_factory: Callable[[], Any]) -> None:
+    """Email the pre-qual PDF to the partner, never the borrower. A send whose outcome is unknown is stamped
+    anyway so the partner never gets the letter twice."""
+    from src.lending.prequal_ghl import SendOutcomeUnknown
+
+    opted_out = _read_opt_outs(services, partner)
+    if not partner.email or opted_out is None or opted_out.email:
+        return
+    try:
+        services.send_letter(partner, file, Path(file["prequal_pdf_path"]).read_bytes())
+    except SendOutcomeUnknown as exc:
+        logger.error("[partner-door] pre-qual letter outcome unknown file=%s (%s); not retried", file["id"], exc)
+    except Exception as exc:
+        logger.error("[partner-door] pre-qual letter failed file=%s (%s)", file["id"], type(exc).__name__)
+        return
+    _stamp(session_factory, file["id"], "prequal_sent_at")
+
+
+def send_pending_notices(file_id: int, services: Optional[PipelineServices] = None,
+                         session_factory: Optional[Callable[[], Any]] = None) -> None:
+    """Retry the new-file notices for a file that was already scored and routed. Never raises."""
+    try:
+        if session_factory is None:
+            from src.lending.db import lending_session as session_factory
+        services = services or live_services()
+        with session_factory() as db:
+            file = db.execute(text("SELECT * FROM lending.loan_files WHERE id = :id"), {"id": file_id}).mappings().first()
+            if file is None:
+                return
+            file = dict(file)
+            partner = partner_by_id(db, int(file["partner_id"]))
+        _after_routing(file, partner, _stored_fit(file["lender_fit"]), services, session_factory)
+    except Exception as exc:
+        logger.error("[partner-door] notice retry failed file=%s (%s)", file_id, type(exc).__name__)
 
 
 def _stamp(session_factory: Callable[[], Any], file_id: int, column: str) -> None:
-    if column not in {"josh_notified_at", "partner_confirmed_at"}:
+    if column not in {"josh_notified_at", "prequal_sent_at"}:
         raise ValueError(column)
     with session_factory() as db:
         db.execute(text(f"UPDATE lending.partner_submissions SET {column} = :now WHERE file_id = :id"),
@@ -351,21 +443,55 @@ def _stamp(session_factory: Callable[[], Any], file_id: int, column: str) -> Non
 
 def notify_partner_status(change: StatusChange, services: Optional[PipelineServices] = None,
                           session_factory: Optional[Callable[[], Any]] = None) -> bool:
-    """Tell the partner their file moved (routed / declined / approved / funded). Never raises."""
+    """Tell the partner their file moved (routed / declined / approved / funded). ``record_status_change`` queued
+    the notice on the file (``notice_status``); it is cleared only once every required channel went out, so the
+    sweep retries a failed send without the status changing again. True when complete. Never raises."""
     try:
         if session_factory is None:
             from src.lending.db import lending_session as session_factory
         services = services or live_services()
         with session_factory() as db:
             partner = partner_by_id(db, change.partner_id)
-        if partner is None:
+            pending = db.execute(text("SELECT notice_status, notice_emailed_at, notice_texted_at FROM lending.loan_files "
+                                      "WHERE id = :id"), {"id": change.file_id}).mappings().first()
+        if partner is None or pending is None or pending["notice_status"] != change.status:
             return False
         place = _place(change.property_address, change.borrower_last_name)
         wording = _STATUS_WORDING.get(change.status, f"is now {change.status}")
-        return _send_partner(services, partner, f"Update on {place}",
-                             f"Your file for {place} (reference #{change.file_id}) {wording}.")
+        sent = _deliver(services, partner, f"Update on {place}",
+                        f"Your file for {place} (reference #{change.file_id}) {wording}.",
+                        emailed=bool(pending["notice_emailed_at"]), texted=bool(pending["notice_texted_at"]))
+        with session_factory() as db:
+            db.execute(text("UPDATE lending.loan_files SET "
+                            "notice_emailed_at = CASE WHEN :e THEN COALESCE(notice_emailed_at, :now) END, "
+                            "notice_texted_at = CASE WHEN :t THEN COALESCE(notice_texted_at, :now) END, "
+                            "notice_status = CASE WHEN :c THEN NULL ELSE notice_status END "
+                            "WHERE id = :id AND notice_status = :status"),
+                       {"e": sent.emailed, "t": sent.texted, "c": sent.complete, "now": _utcnow(),
+                        "id": change.file_id, "status": change.status})
+        return sent.complete
     except Exception as exc:
         logger.error("[partner-door] status notice failed file=%s (%s)", change.file_id, type(exc).__name__)
+        return False
+
+
+def retry_status_notice(file_id: int, services: Optional[PipelineServices] = None,
+                        session_factory: Optional[Callable[[], Any]] = None) -> bool:
+    """Resend the queued status notice for a file (sweep). Never raises."""
+    try:
+        if session_factory is None:
+            from src.lending.db import lending_session as session_factory
+        with session_factory() as db:
+            row = db.execute(text("SELECT partner_id, notice_status, property_address, borrower_last_name "
+                                  "FROM lending.loan_files WHERE id = :id AND partner_id IS NOT NULL"),
+                             {"id": file_id}).mappings().first()
+        if row is None or not row["notice_status"]:
+            return False
+        change = StatusChange(file_id, int(row["partner_id"]), row["notice_status"], None, row["property_address"],
+                              row["borrower_last_name"])
+        return notify_partner_status(change, services=services, session_factory=session_factory)
+    except Exception as exc:
+        logger.error("[partner-door] status notice retry failed file=%s (%s)", file_id, type(exc).__name__)
         return False
 
 
@@ -382,11 +508,45 @@ def change_status(file_id: int, status: str, reason: Optional[str] = None, servi
     return change
 
 
+def pending_status_notice_ids(db, older_than_minutes: int, max_age_hours: int, limit: int,
+                              now: Optional[datetime] = None) -> list[int]:
+    """Partner files whose last status notice has not fully gone out, retried until ``max_age_hours`` after the
+    status change."""
+    now = now or _utcnow()
+    rows = db.execute(
+        text("SELECT id FROM lending.loan_files WHERE source = :source AND notice_status IS NOT NULL "
+             "AND status_at < :cutoff AND status_at > :oldest ORDER BY status_at LIMIT :limit"),
+        {"source": SOURCE_PARTNER, "cutoff": now - timedelta(minutes=older_than_minutes),
+         "oldest": now - timedelta(hours=max_age_hours), "limit": limit},
+    ).all()
+    return [int(row[0]) for row in rows]
+
+
 def unprocessed_file_ids(db, older_than_minutes: int, limit: int, now: Optional[datetime] = None) -> list[int]:
     """Partner files still 'received' after ``older_than_minutes``: their background run never finished."""
     rows = db.execute(
         text("SELECT id FROM lending.loan_files WHERE source = :source AND status = 'received' "
              "AND created_at < :cutoff ORDER BY created_at LIMIT :limit"),
         {"source": SOURCE_PARTNER, "cutoff": (now or _utcnow()) - timedelta(minutes=older_than_minutes), "limit": limit},
+    ).all()
+    return [int(row[0]) for row in rows]
+
+
+def unnotified_file_ids(db, older_than_minutes: int, max_age_hours: int, limit: int,
+                        now: Optional[datetime] = None, *, letters: bool = False) -> list[int]:
+    """Partner files already past 'received' with something still unsent: the Slack card, the partner
+    confirmation, and (when configured) the pre-qual letter to a partner with an email.
+    Retried until ``max_age_hours`` after the file arrived."""
+    now = now or _utcnow()
+    rows = db.execute(
+        text("SELECT f.id FROM lending.loan_files f JOIN lending.partner_submissions s ON s.file_id = f.id "
+             "JOIN lending.partners p ON p.id = f.partner_id "
+             "WHERE f.source = :source AND f.status <> 'received' "
+             "AND (s.josh_notified_at IS NULL OR s.partner_confirmed_at IS NULL "
+             "     OR (:letters AND f.prequal_pdf_path IS NOT NULL AND s.prequal_sent_at IS NULL "
+             "         AND p.email IS NOT NULL)) "
+             "AND f.created_at < :cutoff AND f.created_at > :oldest ORDER BY f.created_at LIMIT :limit"),
+        {"source": SOURCE_PARTNER, "cutoff": now - timedelta(minutes=older_than_minutes),
+         "oldest": now - timedelta(hours=max_age_hours), "limit": limit, "letters": letters},
     ).all()
     return [int(row[0]) for row in rows]
