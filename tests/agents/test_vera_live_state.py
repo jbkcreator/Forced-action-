@@ -72,6 +72,78 @@ def test_extract_migration_targets_unrecognized_shape_is_empty():
     assert columns == []
 
 
+def test_extract_migration_targets_schema_prefixed_table_reads_bare_name():
+    # Before the fix `lending.call_extractions` was read as a table called "lending".
+    sql_text = "CREATE TABLE IF NOT EXISTS lending.call_extractions (\n    id BIGSERIAL PRIMARY KEY\n)"
+    tables, columns = _extract_migration_targets(sql_text)
+    assert tables == ["call_extractions"]
+    assert columns == []
+
+
+def test_extract_migration_targets_quoted_and_templated_schema():
+    sql_text = (
+        "'CREATE TABLE IF NOT EXISTS \"{t}\".web_leads (id int)'\n"
+        "'ALTER TABLE \"{t}\".lendingflow_leads ADD COLUMN IF NOT EXISTS intro_sms_tagged_at timestamptz'\n"
+        "ALTER TABLE lending.web_leads ADD COLUMN IF NOT EXISTS ghl_alerted_at timestamptz;\n"
+    )
+    tables, columns = _extract_migration_targets(sql_text)
+    assert tables == ["web_leads"]
+    assert columns == [
+        ("lendingflow_leads", "intro_sms_tagged_at"),
+        ("web_leads", "ghl_alerted_at"),
+    ]
+
+
+def test_extract_migration_targets_ignores_prose_mentions():
+    # Docstring/comment text that quotes the DDL phrase is not a table declaration.
+    prose = (
+        "Idempotent — CREATE TABLE IF NOT EXISTS throughout.\n"
+        "# CREATE TABLE IF NOT EXISTS alone cannot add a default.\n"
+    )
+    tables, columns = _extract_migration_targets(prose)
+    assert tables == []
+    assert columns == []
+
+
+class _FakeSession:
+    """Returns True from .scalar() when the queried name is in `present`."""
+
+    def __init__(self, present_tables=(), present_columns=()):
+        self.present_tables = set(present_tables)
+        self.present_columns = set(present_columns)
+        self.sql = []
+
+    def execute(self, statement, params):
+        self.sql.append(str(statement))
+        if "c" in params:
+            found = (params["t"], params["c"]) in self.present_columns
+        else:
+            found = params["t"] in self.present_tables
+        return type("R", (), {"scalar": staticmethod(lambda: 1 if found else None)})()
+
+
+def test_classify_migration_checks_the_bare_table_name_in_pg_catalog():
+    migration = "CREATE TABLE IF NOT EXISTS lending.call_extractions (id int)"
+    session = _FakeSession(present_tables={"call_extractions"})
+    assert live_state._classify_migration(session, migration) == "applied"
+    assert session.sql and all("pg_catalog.pg_class" in sql for sql in session.sql)
+
+
+def test_classify_migration_not_applied_when_table_or_column_missing():
+    table_migration = "CREATE TABLE IF NOT EXISTS lending.call_extractions (id int)"
+    assert live_state._classify_migration(_FakeSession(), table_migration) == "not_applied"
+
+    column_migration = "ALTER TABLE lending.web_leads ADD COLUMN IF NOT EXISTS ghl_alerted_at timestamptz"
+    session = _FakeSession(present_columns={("web_leads", "other_column")})
+    assert live_state._classify_migration(session, column_migration) == "not_applied"
+    session = _FakeSession(present_columns={("web_leads", "ghl_alerted_at")})
+    assert live_state._classify_migration(session, column_migration) == "applied"
+
+
+def test_classify_migration_unrecognized_when_no_ddl_shape_found():
+    assert live_state._classify_migration(_FakeSession(), "DO $$ BEGIN CREATE ROLE x; END $$;") == "unrecognized"
+
+
 def test_scheduled_source_types_ignores_commented_lines():
     crontab_text = (
         "# comment line, ignored\n"
