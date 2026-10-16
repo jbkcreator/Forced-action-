@@ -780,3 +780,26 @@ def test_stored_fit_reads_sqlite_text_and_postgres_jsonb(stored) -> None:
     value = fit.model_dump_json() if stored == "json" else fit.model_dump(mode="json")
     assert partner_pipeline._stored_fit(value) == fit
     assert partner_pipeline._stored_fit(None) is None
+
+
+@pytest.mark.parametrize("ambiguous, retried", [(True, False), (False, True)])
+def test_status_notice_with_unknown_outcome_is_not_resent(engine, session_factory, tmp_path, ambiguous, retried) -> None:
+    from src.lending.ghl_sms import GhlSmsError
+
+    _, token = _partner(session_factory)
+    file_id = _submit(session_factory, token)
+    recorder, attempts = Recorder(), []
+
+    def flaky_email(to, subject, body):
+        attempts.append(to)
+        raise GhlSmsError("GHL message send returned no message id", ambiguous=ambiguous)
+
+    partner_pipeline.change_status(file_id, "approved", None,
+                                   dataclasses.replace(_services(recorder, tmp_path), email=flaky_email), session_factory)
+    later = datetime.now(timezone.utc) + timedelta(minutes=30)
+    with session_factory() as db:
+        pending = partner_pipeline.pending_status_notice_ids(db, 10, 24, 20, now=later)
+    assert (pending == [file_id]) is retried
+    partner_pipeline.retry_status_notice(file_id, dataclasses.replace(_services(recorder, tmp_path), email=flaky_email),
+                                         session_factory)
+    assert len(attempts) == (2 if retried else 1)

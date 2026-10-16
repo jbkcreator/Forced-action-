@@ -261,19 +261,25 @@ def _deliver(services: PipelineServices, partner: Partner, subject: str, body: s
     can_email = bool(partner.email) and services.email is not None and not opted_out.email
     can_text = bool(partner.sms_consent and partner.phone) and services.sms is not None and not opted_out.phone
     if can_email and not emailed:
-        try:
-            services.email(partner.email, subject, body)
-            emailed = True
-        except Exception as exc:
-            logger.error("[partner-door] partner email failed partner=%s (%s)", partner.id, type(exc).__name__)
+        emailed = _send_once("email", partner, lambda: services.email(partner.email, subject, body))
     if can_text and not texted and _window_open(services, partner):
-        try:
-            services.sms(partner.phone, f"{subject}. {body}")
-            texted = True
-        except Exception as exc:
-            logger.error("[partner-door] partner text failed partner=%s (%s)", partner.id, type(exc).__name__)
+        texted = _send_once("text", partner, lambda: services.sms(partner.phone, f"{subject}. {body}"))
     complete = emailed if can_email else (texted if can_text else True)
     return Delivery(emailed, texted, complete)
+
+
+def _send_once(channel: str, partner: Partner, send: Callable[[], Any]) -> bool:
+    """True when the channel counts as sent. A GHL error flagged ``ambiguous`` (timeout, 5xx, accepted without a
+    message id) may have gone out, so it counts as sent and is never retried: the partner must not get it twice."""
+    try:
+        send()
+        return True
+    except Exception as exc:
+        if getattr(exc, "ambiguous", False):
+            logger.error("[partner-door] partner %s outcome unknown partner=%s; not retried", channel, partner.id)
+            return True
+        logger.error("[partner-door] partner %s failed partner=%s (%s)", channel, partner.id, type(exc).__name__)
+        return False
 
 
 def _window_open(services: PipelineServices, partner: Partner) -> bool:
