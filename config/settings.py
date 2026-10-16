@@ -962,6 +962,7 @@ class AppSettings(BaseSettings):
 	lending_replies_channel: str = Field(default="", env="LENDING_REPLIES_CHANNEL")  # WP-GL-10 rate/terms handoffs; channel ID, the Cora Lending bot must be a member
 	lending_daily_channel: str = Field(default="", env="LENDING_DAILY_CHANNEL")  # 7pm scoreboard; channel ID
 	lending_routing_channel: str = Field(default="", env="LENDING_ROUTING_CHANNEL")  # R-1: #next-deal-lending; Cora Lending bot must be a member
+	lending_partner_channel: str = Field(default="", env="LENDING_PARTNER_CHANNEL")  # P-1 partner file cards (#ndl-partner-deals); unset = LENDING_ROUTING_CHANNEL
 	# T-10 uncalled-lead alarms (src/lending/uncalled_alarm_worker.py)
 	lending_uncalled_alarms_enabled: bool = Field(default=False, env="LENDING_UNCALLED_ALARMS_ENABLED")
 	lending_alarm_sms_to: Optional[str] = Field(default=None, env="LENDING_ALARM_SMS_TO")  # Josh's mobile; normalized before use

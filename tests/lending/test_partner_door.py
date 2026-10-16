@@ -591,3 +591,12 @@ def test_money_parses_to_whole_dollars() -> None:
     data = partners.SubmissionInput.model_validate({k: v for k, v in FORM.items() if k != "consent"})
     assert data.purchase_price == 180000 and isinstance(data.loan_amount, int)
     assert Decimal(data.loan_amount) == Decimal(200000)
+
+
+@pytest.mark.parametrize("partner, routing, expected", [
+    ("C_PARTNER", "C_ROUTING", "C_PARTNER"),
+    ("", "C_ROUTING", "C_ROUTING"),
+])
+def test_partner_cards_go_to_the_partner_channel_else_routing(partner, routing, expected):
+    settings = dataclasses.make_dataclass("S", ["lending_partner_channel", "lending_routing_channel"])(partner, routing)
+    assert partner_pipeline.partner_channel(settings) == expected

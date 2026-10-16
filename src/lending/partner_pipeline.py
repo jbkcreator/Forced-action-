@@ -111,9 +111,10 @@ def live_services() -> PipelineServices:
     email_sender, sms_sender = get_email_sender(), get_sender()
 
     def slack(note: SlackNote) -> None:
-        channel, token = settings.lending_routing_channel, settings.lending_slack_bot_token  # #next-deal-lending, with R-1's route posts
+        channel = partner_channel(settings)
+        token = settings.lending_slack_bot_token
         if not (channel and token):
-            logger.info("[partner-door] Slack note skipped: LENDING_ROUTING_CHANNEL or bot token not set")
+            logger.info("[partner-door] Slack note skipped: LENDING_PARTNER_CHANNEL / LENDING_ROUTING_CHANNEL or bot token not set")
             return
         from slack_sdk import WebClient
 
@@ -132,6 +133,11 @@ def live_services() -> PipelineServices:
         upload_dir=settings.lending_partner_upload_dir,
         prequal_pct=settings.lending_prequal_range_pct,
     )
+
+
+def partner_channel(settings) -> str:
+    """Channel for partner file cards: #ndl-partner-deals when set, else R-1's routing channel."""
+    return settings.lending_partner_channel or settings.lending_routing_channel
 
 
 def _opt_outs(phone: Optional[str], email: Optional[str]) -> OptOuts:
