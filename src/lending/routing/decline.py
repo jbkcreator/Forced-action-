@@ -97,12 +97,13 @@ def record_decline(
         )
         return
 
-    # Stale or repeated request: any later event on this file (a prior decline of this
-    # same event, or the re-route it triggered) means this routed event is no longer current.
+    # Stale or repeated request: a later event on this file (a prior decline of this same event, the re-route
+    # it triggered, or a funding) means this routed event is no longer current. An approval does not: a lender
+    # that approved can still decline before funding.
     superseded = db.execute(
         text(
             "SELECT 1 FROM lending.file_routing_events"
-            f" WHERE {key.column} = :id AND id > :eid LIMIT 1"
+            f" WHERE {key.column} = :id AND id > :eid AND action <> 'approved' LIMIT 1"
         ),
         {"id": key.id, "eid": event_id},
     ).scalar()

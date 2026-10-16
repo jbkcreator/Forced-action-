@@ -2134,3 +2134,21 @@ def test_slack_form_reports_every_problem_in_one_pass_each_under_its_own_field(r
     assert slack_form(_form("add_lender", value="Fixed Lender", types=[LOAN_TYPE_FLIP], min_amount="100000",
                             max_amount="900000", states="fl, ga", credit="680")) == {}
     assert rdb.execute(text("SELECT COUNT(*) FROM lending.lender_routing_rules WHERE name = 'Fixed Lender'")).scalar() == 1
+
+
+def test_a_file_can_still_be_declined_after_it_was_approved_but_not_after_it_funded(rdb, buttons, fake_slack):
+    _two_flip_lenders(rdb)
+    lead = _make_lead(rdb, phone_suffix="6701")
+    _route(rdb, lead)
+    event = _routed_event_id(rdb, lead)
+    buttons.click("routing_approved", event)
+    assert buttons.submit(event, reason="ltv_over_max") == {}  # the lender approved, then changed its mind
+    assert [e["action"] for e in _events(rdb, lead)] == ["routed", "approved", "declined", "routed"]
+    assert _fr(rdb, lead)["current_lender_name"] == "Beta Funding"
+
+    second = _make_lead(rdb, phone_suffix="6702")
+    _route(rdb, second)
+    funded_event = _routed_event_id(rdb, second)
+    buttons.click("routing_funded", funded_event)
+    assert "no longer" in buttons.submit(funded_event, reason="ltv_over_max")["errors"]["reason_b"]  # funded is final
+    assert [e["action"] for e in _events(rdb, second)] == ["routed", "funded"]

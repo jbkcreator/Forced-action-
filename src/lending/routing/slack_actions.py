@@ -43,14 +43,15 @@ def is_decline_submission(payload: dict) -> bool:
 
 
 def _current_route(db: Session, event_id: int, *, strict: bool) -> Optional[dict]:
-    """The 'routed' event if it is still its file's current route. ``strict``: nothing at all happened since."""
+    """The 'routed' event if it is still its file's current route. ``strict`` (a decline): a funding also ends it.
+    An approval never does: a lender that approved can still decline, and an approved file can still be funded."""
     event = db.execute(
         text("SELECT id, lead_id, loan_file_id, lender_name, action FROM lending.file_routing_events WHERE id = :e"),
         {"e": event_id}).mappings().one_or_none()
     if event is None or event["action"] != "routed":
         return None
     key = key_from_row(event)
-    later = ("routed", "declined", "held", "approved", "funded") if strict else ("routed", "declined", "held")
+    later = ("routed", "declined", "held", "funded") if strict else ("routed", "declined", "held")
     newer = db.execute(
         text(f"SELECT 1 FROM lending.file_routing_events WHERE {key.column} = :id AND id > :e AND action = ANY(:acts) LIMIT 1"),
         {"id": key.id, "e": event_id, "acts": list(later)}).scalar()
