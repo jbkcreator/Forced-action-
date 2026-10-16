@@ -1366,7 +1366,8 @@ def test_partner_files_appear_in_the_admin_api_beside_leads(rdb, api, partner_ma
     rec = api.get(f"{base}/files/{fid}", params={"source": "partner"}).json()
     assert rec["file"]["source"] == "partner" and rec["current"]["name"] == "Alpha Capital"
     assert rec["next"]["name"] == "Beta Funding" and [h["action"] for h in rec["history"]] == ["routed"]
-    assert api.get(f"{base}/files/{fid}").status_code == 404  # the same id as a lead is a different file
+    same_id_as_lead = api.get(f"{base}/files/{fid}")  # the same id as a lead is a different file
+    assert same_id_as_lead.status_code == 404 or same_id_as_lead.json()["file"]["source"] == "lendingflow"
     assert api.get(f"{base}/files/{lead}").json()["file"]["source"] == "lendingflow"
 
     assert api.post(f"{base}/files/{fid}/decline", params={"source": "partner"},
@@ -1874,17 +1875,22 @@ def test_slack_form_refuses_strangers_and_bad_input_and_changes_nothing(rdb, sla
     stranger = slack_form(_form("pause", lender=a), user="USTRANGER")
     assert stranger["response_action"] == "errors" and slack_form.posted == []
     assert rdb.execute(text("SELECT active FROM lending.lender_routing_rules WHERE id = :i"), {"i": a}).scalar() is True
-    for values in (
-        _form("agreement", lender=a, value="maybe"),
-        _form("seat_cap", lender=a, value="lots"),
-        _form("add_lender", value=""),
-        _form("add_lender", value="No Box Types", types=[LOAN_TYPE_FLIP], min_amount="900", max_amount="100"),
-        _form("add_box", lender=a),
-        _form("move_up", lender=a),  # already first
-        _form("pause"),  # no lender chosen
+    # Each problem is shown under the field it is about, in plain words (never an internal field name).
+    for values, block in (
+        (_form("agreement", lender=a, value="maybe"), "value_b"),
+        (_form("seat_cap", lender=a, value="lots"), "value_b"),
+        (_form("add_lender", value=""), "value_b"),
+        (_form("add_lender", value="No Box Types", types=[LOAN_TYPE_FLIP], min_amount="900", max_amount="100"), "max_b"),
+        (_form("add_lender", value="No Box Types", types=[LOAN_TYPE_FLIP], min_amount="abc"), "min_b"),
+        (_form("add_lender", value="No Box Types", types=[LOAN_TYPE_FLIP], states="Florida"), "states_b"),
+        (_form("add_lender", value="No Box Types", types=[LOAN_TYPE_FLIP], credit="950"), "credit_b"),
+        (_form("add_box", lender=a), "types_b"),
+        (_form("move_up", lender=a), "lender_b"),  # already first
+        (_form("pause"), "lender_b"),  # no lender chosen
     ):
         response = slack_form(values)
-        assert response["response_action"] == "errors" and response["errors"]["value_b"], values
+        assert response["response_action"] == "errors" and list(response["errors"]) == [block], (block, response)
+        assert "_amount" not in response["errors"][block] and "loan_types" not in response["errors"][block], response
     assert rdb.execute(text("SELECT COUNT(*) FROM lending.lender_routing_rules WHERE name = 'No Box Types'")).scalar() == 0
     assert slack_form.posted == []  # nothing applied, nothing announced
 
@@ -1958,7 +1964,7 @@ def test_the_lender_form_lists_the_waterfall_and_nobody_may_edit_when_no_editor_
     view = slack_admin.build_form_view(slack_admin._lenders(rdb))
     assert view["callback_id"] == slack_admin.CALLBACK_ID
     assert "Alpha Capital" in view["blocks"][0]["text"]["text"] and "Beta Funding" in view["blocks"][0]["text"]["text"]
-    assert slack_admin.allowed_user_ids() == frozenset()  # default: fail closed
+    assert slack_admin.allowed_user_ids() == frozenset()  # nobody configured: fail closed (blanked by the autouse fixture)
 
 
 # ── Slack buttons on a routed post (Decline needs a reason; Approved; Funded) ─

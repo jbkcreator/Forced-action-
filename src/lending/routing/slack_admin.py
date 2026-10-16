@@ -116,12 +116,20 @@ def _value(values: dict, block: str) -> str:
     return str(cell.get("value") or "").strip()
 
 
-def _int_or_none(raw: str, label: str) -> Optional[int]:
+class FormError(ValueError):
+    """A problem with one field of the form: Slack shows ``message`` under the input block ``block``."""
+
+    def __init__(self, message: str, block: str = "value_b") -> None:
+        super().__init__(message)
+        self.block = block
+
+
+def _int_or_none(raw: str, label: str, block: str = "value_b") -> Optional[int]:
     cleaned = raw.replace(",", "").replace("$", "").strip()
     if not cleaned:
         return None
     if not cleaned.isdigit():
-        raise ValueError(f"{label} must be a whole number")
+        raise FormError(f"{label} must be a whole number.", block)
     return int(cleaned)
 
 
@@ -130,17 +138,42 @@ def _box_from(values: dict) -> admin_api.ProductBoxIn:
     states = [s for s in _value(values, "states_b").replace(" ", "").split(",") if s]
     return admin_api.ProductBoxIn(
         loan_types=types, approved_states=states or None,
-        min_loan_amount=_int_or_none(_value(values, "min_b"), "Min loan"),
-        max_loan_amount=_int_or_none(_value(values, "max_b"), "Max loan"),
-        credit_floor=_int_or_none(_value(values, "credit_b"), "Min credit"))
+        min_loan_amount=_int_or_none(_value(values, "min_b"), "Min loan", "min_b"),
+        max_loan_amount=_int_or_none(_value(values, "max_b"), "Max loan", "max_b"),
+        credit_floor=_int_or_none(_value(values, "credit_b"), "Min credit", "credit_b"))
 
 
-def _reason(exc: Exception) -> str:
-    if isinstance(exc, HTTPException):
-        return str(exc.detail)
+# Which input block a rejected value belongs to, and what to tell the person (never the internal field name).
+_FIELD_ERRORS = {
+    "loan_types": ("types_b", "Pick at least one loan type."),
+    "approved_states": ("states_b", "States must be two-letter codes, like FL, GA."),
+    "min_loan_amount": ("min_b", "Min loan must be 0 or more."),
+    "max_loan_amount": ("max_b", "Max loan must be 0 or more."),
+    "credit_floor": ("credit_b", "Min credit must be between 0 and 900."),
+    "name": ("value_b", "The name must be 1 to 100 characters."),
+    "monthly_cap": ("value_b", "The seat cap must be a number from 0 to 100000."),
+    "agreement_status": ("value_b", f"Value must be one of: {', '.join(AGREEMENT_STATUS_CHOICES)}."),
+}
+
+
+def _form_errors(exc: Exception, values: dict) -> dict[str, str]:
+    """Slack's ``errors`` map for a rejected submission: each message under the field it is about."""
+    if isinstance(exc, FormError):
+        return {exc.block: str(exc)}
     if isinstance(exc, ValidationError):
-        return "; ".join(str(e["msg"]).removeprefix("Value error, ") for e in exc.errors())[:250]
-    return str(exc)[:250]
+        errors: dict[str, str] = {}
+        for item in exc.errors():
+            field = str(item["loc"][0]) if item["loc"] else ""
+            if field in _FIELD_ERRORS:
+                block, message = _FIELD_ERRORS[field]
+            elif "min_loan_amount" in str(item["msg"]):
+                block, message = "max_b", "Max loan must be at least the min loan."
+            else:
+                block, message = "value_b", str(item["msg"]).removeprefix("Value error, ")[:200]
+            errors.setdefault(block, message)
+        return errors
+    block = "lender_b" if _value(values, "lender_b") else "value_b"
+    return {block: str(exc.detail if isinstance(exc, HTTPException) else exc)[:250]}
 
 
 def apply_change(values: dict, db: Session) -> str:
@@ -149,19 +182,19 @@ def apply_change(values: dict, db: Session) -> str:
     value = _value(values, "value_b")
     lender_raw = _value(values, "lender_b")
     if action not in {a for a, _ in ACTIONS}:
-        raise ValueError("Choose an action.")
+        raise FormError("Choose an action.", "action_b")
     lender: Optional[dict] = None
     if action in _NEEDS_LENDER:
         if not lender_raw.isdigit():
-            raise ValueError("Choose a lender for this action.")
+            raise FormError("Choose a lender for this action.", "lender_b")
         lender = next((l for l in _lenders(db) if l["id"] == int(lender_raw)), None)
         if lender is None:
-            raise ValueError("That lender no longer exists. Open the form again.")
+            raise FormError("That lender no longer exists. Close this and open the form again.", "lender_b")
     name = lender["name"] if lender else value
 
     if action == "add_lender":
         if not value:
-            raise ValueError("Type the lender's name in Value.")
+            raise FormError("Type the lender's name in Value.", "value_b")
         box = _box_from(values) if _value(values, "types_b") else None
         taken = max([l["priority"] for l in _lenders(db)], default=0) + 1
         created = admin_api.create_lender(
@@ -174,7 +207,7 @@ def apply_change(values: dict, db: Session) -> str:
         return f"added lender *{value}* at position {taken}, agreement pending{note}"
     if action == "add_box":
         if not _value(values, "types_b"):
-            raise ValueError("Pick at least one loan type for the box.")
+            raise FormError("Pick at least one loan type for the box.", "types_b")
         admin_api.add_box(lender_id=lender["id"], body=_box_from(values), _=None, db=db)
         return f"added a product box to *{name}*"
     if action in ("pause", "resume"):
@@ -182,13 +215,13 @@ def apply_change(values: dict, db: Session) -> str:
         return f"{'resumed' if action == 'resume' else 'paused'} *{name}*"
     if action == "agreement":
         if value not in AGREEMENT_STATUS_CHOICES:
-            raise ValueError(f"Value must be one of: {', '.join(AGREEMENT_STATUS_CHOICES)}.")
+            raise FormError(f"Value must be one of: {', '.join(AGREEMENT_STATUS_CHOICES)}.", "value_b")
         admin_api.update_lender(lender_id=lender["id"], body=admin_api.LenderPatch(agreement_status=value), _=None, db=db)
         return f"set *{name}* agreement status to {value}"
     if action == "seat_cap":
         cap = None if value.lower() in ("none", "no cap") else _int_or_none(value, "Seat cap")
         if cap is None and value.lower() not in ("none", "no cap"):
-            raise ValueError("Value must be a number, or none.")
+            raise FormError("Value must be a number, or none.", "value_b")
         admin_api.update_lender(lender_id=lender["id"], body=admin_api.LenderPatch(monthly_cap=cap), _=None, db=db)
         return f"set *{name}* seat cap to {'none' if cap is None else cap}"
     if action in ("move_up", "move_down"):
@@ -196,7 +229,7 @@ def apply_change(values: dict, db: Session) -> str:
         index = order.index(lender["id"])
         target = index - 1 if action == "move_up" else index + 1
         if not 0 <= target < len(order):
-            raise ValueError(f"{name} is already {'first' if action == 'move_up' else 'last'}.")
+            raise FormError(f"{name} is already {'first' if action == 'move_up' else 'last'}.", "lender_b")
         order[index], order[target] = order[target], order[index]
         admin_api.reorder_lenders(body=admin_api.ReorderIn(ordered_ids=order), _=None, db=db)
         return f"moved *{name}* {'up' if action == 'move_up' else 'down'} to position {target + 1}"
@@ -226,7 +259,7 @@ def handle_submission(payload: dict) -> dict[str, Any]:
         with lending_session() as db:
             summary = apply_change(values, db)
     except (ValueError, HTTPException, ValidationError) as exc:
-        return {"response_action": "errors", "errors": {"value_b": _reason(exc)}}
+        return {"response_action": "errors", "errors": _form_errors(exc, values)}
     except Exception as exc:  # class only: SQL errors can embed bound values
         logger.error("[routing-slack] applying a lender change failed: %s", type(exc).__name__)
         return {"response_action": "errors", "errors": {"value_b": "Something went wrong; nothing was changed."}}
