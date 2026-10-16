@@ -113,7 +113,7 @@ def format_record(record: dict) -> str:
         lines.append(f"Held because: {file['hold_reason']}")
     lines.append("*Route history*")
     for item in record["history"][-15:]:
-        when = item["created_at"].astimezone(ROUTING_TZ).strftime("%b %d %I:%M %p")
+        when = item["created_at"].astimezone(ROUTING_TZ).strftime("%b %d %I:%M %p ET")
         line = f"• {when} · {item['action']} · {item['lender_name'] or '-'}"
         if item.get("reason_code"):
             line += f" · {item['reason_code']}"
