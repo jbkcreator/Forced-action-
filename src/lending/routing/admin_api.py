@@ -1,10 +1,11 @@
 """Admin API for R-1 lender routing rules.
 
-Mounted on lending-api (/api/lending/routing/...).  Auth: shared secret in
-X-Routing-Admin-Secret (LENDING_ROUTING_ADMIN_SECRET).
-
-Q7 (open): UI is in forced-action-ui (separate repo), out of scope for this PR.
-Josh uses these endpoints directly until the UI ships.
+The lender, box, decline-reason, file and hold-queue operations behind R-1's Slack form and buttons
+(``slack_admin.py`` / ``slack_actions.py`` call these functions directly, so the validation and conflict rules are
+written once). Josh's R1.4 is a Slack form, not a web screen, so the HTTP routes below are NOT mounted on
+lending-api: ``src/lending/api.py`` does not include ``router``. To serve them (for example for a script or a later
+screen), include ``router`` there; auth is then the shared secret in X-Routing-Admin-Secret
+(LENDING_ROUTING_ADMIN_SECRET), and an unset secret answers 503. Route paths: /api/lending/routing/...
 
 Endpoints:
   GET    /api/lending/routing/lenders             list all lenders (sorted by priority)
