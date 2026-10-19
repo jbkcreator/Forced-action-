@@ -154,6 +154,15 @@ TEXT_CONSENT_YES = "yes"
 # extraction. Off unless LENDING_TRANSCRIPT_INGEST_ENABLED (every extraction is a Claude call).
 TRANSCRIPT_DONE = "done"        # transcript fetched and extracted
 TRANSCRIPT_MISSING = "missing"  # none arrived within TRANSCRIPT_MAX_WAIT_SECONDS of the call end
-TRANSCRIPT_STATUSES = frozenset({TRANSCRIPT_DONE, TRANSCRIPT_MISSING})  # NULL = still pending
+TRANSCRIPT_FAILED = "failed"    # transcript fetched but extraction failed: never retried (each try is a Claude call)
+TRANSCRIPT_STATUSES = (TRANSCRIPT_DONE, TRANSCRIPT_MISSING, TRANSCRIPT_FAILED)  # NULL = still pending; DB CHECK
+# Per-tick counter keys for calls left pending (not stored).
+TRANSCRIPT_NOT_READY = "not_ready"
+TRANSCRIPT_FETCH_FAILED = "fetch_failed"
+TRANSCRIPT_RATE_LIMITED = "rate_limited"
+# The one definition of "pending": the poller's queries and the migration's partial index
+# both use it, so the index always matches the query.
+TRANSCRIPT_PENDING_PREDICATE = "transcript_status IS NULL AND talk_duration_sec > 0"
 TRANSCRIPT_BATCH_SIZE = 10
 TRANSCRIPT_MAX_WAIT_SECONDS = 30 * 60
+TRANSCRIPT_RETRY_SECONDS = 30   # a not-ready call waits this long before its next fetch

@@ -2,10 +2,17 @@
 
 BatchDialer offers no live audio stream (no WebSocket in its API); the closest thing is the
 call transcript it exposes once a call ends (``GET /cdrs/{id}/transcription``). Each poller
-tick takes a small batch of answered, finished calls with no ``transcript_status`` yet,
-fetches the transcript and runs the existing call extraction. A transcript not ready yet is
-retried on the next tick; a call still without one ``TRANSCRIPT_MAX_WAIT_SECONDS`` after it
-ended is marked ``missing`` and never fetched again.
+tick takes a small batch of answered, finished calls still pending, fetches the transcript and
+runs the existing call extraction.
+
+- Not ready yet / fetch error: ``transcript_attempted_at`` is stamped and the call waits
+  ``TRANSCRIPT_RETRY_SECONDS``; never-tried calls go first, so stuck calls cannot block new ones.
+- Rate limited (HTTP 429): the batch stops at once.
+- Extraction error: the call is marked ``failed`` and never retried (each try is a Claude call).
+- Still pending ``TRANSCRIPT_MAX_WAIT_SECONDS`` after the call ended: marked ``missing``.
+
+The single-poller advisory lock guarantees one consumer, so no row locks are held across the
+HTTP fetch and the Claude call.
 """
 from __future__ import annotations
 
@@ -19,16 +26,23 @@ from sqlalchemy import text
 
 from config.lending_dispositions import (
     TRANSCRIPT_DONE,
+    TRANSCRIPT_FAILED,
+    TRANSCRIPT_FETCH_FAILED,
     TRANSCRIPT_MAX_WAIT_SECONDS,
     TRANSCRIPT_MISSING,
+    TRANSCRIPT_NOT_READY,
+    TRANSCRIPT_PENDING_PREDICATE,
+    TRANSCRIPT_RATE_LIMITED,
+    TRANSCRIPT_RETRY_SECONDS,
 )
 from src.lending.dialer_port import DialerRequestError
+from src.lending.models import LENDING_SCHEMA
+from src.services.phone_utils import normalize as normalize_phone
 
 logger = logging.getLogger(__name__)
 
-NOT_READY = "not_ready"
-FETCH_FAILED = "fetch_failed"
-EXTRACT_FAILED = "extract_failed"
+_TABLE = f"{LENDING_SCHEMA}.call_dispositions"
+_HTTP_TOO_MANY_REQUESTS = 429
 
 
 @dataclass(frozen=True)
@@ -42,8 +56,15 @@ class TranscriptSource(Protocol):
     def call_transcript(self, call_record_id: str) -> Optional[str]: ...
 
 
-Extract = Callable[..., object]
-Mark = Callable[[str, str], None]
+class ExtractCall(Protocol):
+    def __call__(self, db, *, dialer_call_id: str, phone: Optional[str], transcript: str,
+                 extracted_at: datetime) -> object: ...
+
+
+class CallStore(Protocol):
+    def extract_and_mark_done(self, call: PendingCall, transcript: str, *, now: datetime) -> None: ...
+    def mark_failed(self, dialer_call_id: str) -> None: ...
+    def mark_attempted(self, dialer_call_ids: Sequence[str], *, now: datetime) -> None: ...
 
 
 def _cutoff(now: datetime) -> datetime:
@@ -53,77 +74,104 @@ def _cutoff(now: datetime) -> datetime:
 def expire_stale(db, *, now: datetime) -> int:
     """Mark answered calls past the wait cap as missing, in one statement."""
     result = db.execute(text(
-        "UPDATE lending.call_dispositions SET transcript_status = :missing, updated_at = now() "
-        "WHERE transcript_status IS NULL AND talk_duration_sec > 0 AND call_ended_at < :cutoff"
+        f"UPDATE {_TABLE} SET transcript_status = :missing, updated_at = now() "
+        f"WHERE {TRANSCRIPT_PENDING_PREDICATE} AND call_ended_at < :cutoff"
     ), {"missing": TRANSCRIPT_MISSING, "cutoff": _cutoff(now)})
     return int(result.rowcount or 0)
 
 
 def fetch_pending(db, *, now: datetime, limit: int) -> list[PendingCall]:
-    """Answered, finished calls inside the wait window with no transcript status, oldest first."""
+    """Pending calls inside the wait window, never-tried first, skipping ones tried just now."""
     rows = db.execute(text(
-        "SELECT dialer_call_id, phone, call_ended_at FROM lending.call_dispositions "
-        "WHERE transcript_status IS NULL AND talk_duration_sec > 0 "
+        f"SELECT dialer_call_id, phone, call_ended_at FROM {_TABLE} "
+        f"WHERE {TRANSCRIPT_PENDING_PREDICATE} "
         "AND call_ended_at IS NOT NULL AND call_ended_at >= :cutoff "
-        "ORDER BY call_ended_at LIMIT :limit FOR UPDATE SKIP LOCKED"
-    ), {"cutoff": _cutoff(now), "limit": limit}).all()
-    return [PendingCall(str(r[0]), r[1], r[2]) for r in rows]
+        "AND (transcript_attempted_at IS NULL OR transcript_attempted_at < :retry_before) "
+        "ORDER BY transcript_attempted_at NULLS FIRST, call_ended_at LIMIT :limit"
+    ), {"cutoff": _cutoff(now), "retry_before": now - timedelta(seconds=TRANSCRIPT_RETRY_SECONDS),
+        "limit": limit}).all()
+    return [PendingCall(str(r[0]), normalize_phone(r[1] or "") or None, r[2]) for r in rows]
 
 
-def mark_status(db, dialer_call_id: str, status: str) -> None:
+def _set_status(db, dialer_call_id: str, status: str) -> None:
     db.execute(text(
-        "UPDATE lending.call_dispositions SET transcript_status = :status, updated_at = now() "
-        "WHERE dialer_call_id = :id"
+        f"UPDATE {_TABLE} SET transcript_status = :status, updated_at = now() WHERE dialer_call_id = :id"
     ), {"status": status, "id": dialer_call_id})
 
 
-def ingest_calls(
-    calls: Sequence[PendingCall],
-    dialer: TranscriptSource,
-    *,
-    now: datetime,
-    extract: Extract,
-    mark: Mark,
-) -> Counter:
-    """Fetch and extract each call's transcript; one failure never stops the batch."""
+class DbCallStore:
+    """Writes through ``db``. Each finished call commits on its own (a deliberate exception to
+    batch writes): an extraction is a paid Claude call, and a later error in the batch must never
+    roll it back and cause it to be billed again."""
+
+    def __init__(self, db, *, extract: ExtractCall) -> None:
+        self._db, self._extract = db, extract
+
+    def extract_and_mark_done(self, call: PendingCall, transcript: str, *, now: datetime) -> None:
+        with self._db.begin_nested():
+            self._extract(self._db, dialer_call_id=call.dialer_call_id, phone=call.phone,
+                          transcript=transcript, extracted_at=now)
+            _set_status(self._db, call.dialer_call_id, TRANSCRIPT_DONE)
+        self._db.commit()
+
+    def mark_failed(self, dialer_call_id: str) -> None:
+        _set_status(self._db, dialer_call_id, TRANSCRIPT_FAILED)
+        self._db.commit()
+
+    def mark_attempted(self, dialer_call_ids: Sequence[str], *, now: datetime) -> None:
+        if not dialer_call_ids:
+            return
+        self._db.execute(text(
+            f"UPDATE {_TABLE} SET transcript_attempted_at = :now, updated_at = now() "
+            "WHERE dialer_call_id = ANY(:ids)"
+        ), {"now": now, "ids": list(dialer_call_ids)})
+
+
+def ingest_calls(calls: Sequence[PendingCall], dialer: TranscriptSource, store: CallStore, *,
+                 now: datetime) -> Counter:
+    """Fetch and extract each call's transcript; only a rate limit stops the batch."""
     counts: Counter = Counter()
-    cutoff = _cutoff(now)
+    attempted: list[str] = []
     for call in calls:
-        if call.call_ended_at < cutoff:
-            mark(call.dialer_call_id, TRANSCRIPT_MISSING)
-            counts[TRANSCRIPT_MISSING] += 1
-            continue
         try:
             transcript = dialer.call_transcript(call.dialer_call_id)
         except DialerRequestError as exc:
+            attempted.append(call.dialer_call_id)
+            if exc.status == _HTTP_TOO_MANY_REQUESTS:
+                logger.warning("[transcript-ingest] rate limited by the dialer; stopping this batch")
+                counts[TRANSCRIPT_RATE_LIMITED] += 1
+                break
             logger.warning("[transcript-ingest] fetch failed for call %s (status %s)", call.dialer_call_id, exc.status)
-            counts[FETCH_FAILED] += 1
+            counts[TRANSCRIPT_FETCH_FAILED] += 1
             continue
         if not transcript:
-            counts[NOT_READY] += 1
+            attempted.append(call.dialer_call_id)
+            counts[TRANSCRIPT_NOT_READY] += 1
             continue
         try:
-            extract(dialer_call_id=call.dialer_call_id, phone=call.phone, transcript=transcript, extracted_at=now)
+            store.extract_and_mark_done(call, transcript, now=now)
         except Exception as exc:  # class only: the transcript is borrower speech
-            logger.error("[transcript-ingest] extraction failed for call %s (%s)", call.dialer_call_id, type(exc).__name__)
-            counts[EXTRACT_FAILED] += 1
+            logger.error("[transcript-ingest] extraction failed for call %s (%s); marked failed",
+                         call.dialer_call_id, type(exc).__name__)
+            store.mark_failed(call.dialer_call_id)
+            counts[TRANSCRIPT_FAILED] += 1
             continue
-        mark(call.dialer_call_id, TRANSCRIPT_DONE)
         counts[TRANSCRIPT_DONE] += 1
+    store.mark_attempted(attempted, now=now)
     return counts
 
 
-def run_transcript_ingest(db, dialer: TranscriptSource, *, now: datetime, limit: int) -> Counter:
-    """One poller tick: expire stale calls, then ingest one batch. The caller commits."""
-    from src.lending.call_extraction_store import extract_and_store_call
+def run_transcript_ingest(db, dialer: TranscriptSource, *, now: datetime, limit: int,
+                          extract: Optional[ExtractCall] = None) -> Counter:
+    """One poller tick: expire stale calls, then ingest one batch. The caller commits the rest."""
+    if extract is None:
+        from src.lending.call_extraction_store import extract_and_store_call as extract
 
     counts: Counter = Counter()
     expired = expire_stale(db, now=now)
     if expired:
         counts[TRANSCRIPT_MISSING] += expired
-    counts += ingest_calls(
-        fetch_pending(db, now=now, limit=limit), dialer, now=now,
-        extract=lambda **kw: extract_and_store_call(db, **kw),
-        mark=lambda call_id, status: mark_status(db, call_id, status),
-    )
+    calls = fetch_pending(db, now=now, limit=limit)
+    db.commit()
+    counts += ingest_calls(calls, dialer, DbCallStore(db, extract=extract), now=now)
     return counts
