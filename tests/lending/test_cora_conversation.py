@@ -486,3 +486,15 @@ def test_only_an_approver_can_halt(store: AgentStore) -> None:
     cora = _email_cora(store, GhlRecorder())
     cora.say(OPS, "halt", ts="82.0")
     assert "Only an approver" in cora.chat.posts[-1]["text"]
+
+
+def test_emergency_halt_through_coras_session_sets_the_lending_wide_halt(store: AgentStore, monkeypatch) -> None:
+    from src.lending import global_halt
+
+    saved = []
+    monkeypatch.setattr(global_halt, "set_global_halt", lambda halted, **kw: saved.append((halted, kw["set_by"])))
+    cora = Cora(store, FakeMessages())
+    cora.say(JOSH, "<@U_BOT> emergency halt", ts="90.0")
+    assert saved == [(True, JOSH)]
+    assert cora.services.relay._halt.is_halted()  # Cora's own sends are held too
+    assert cora.client.requests == []  # handled before the model

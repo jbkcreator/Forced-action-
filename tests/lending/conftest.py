@@ -140,3 +140,23 @@ def prequal_db():
     tx.rollback()
     conn.close()
     engine.dispose()
+
+
+class _NotHalted:
+    """Stands in for the emergency-halt flag read: off, and never a query to the shared database."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, statement, params=None):
+        return SimpleNamespace(scalar=lambda: False)
+
+
+@pytest.fixture(autouse=True)
+def global_halt_off(monkeypatch):
+    """The lending emergency halt reads Postgres before every GHL send and dialer load; tests run with it off.
+    Tests of the halt itself swap in their own session factory."""
+    monkeypatch.setattr("src.lending.global_halt._session_factory", _NotHalted)

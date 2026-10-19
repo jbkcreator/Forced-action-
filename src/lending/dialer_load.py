@@ -33,6 +33,7 @@ from sqlalchemy import text
 from config.lending_compliance import RemovalReason
 from config.lending_dialer import POOL_CAMPAIGN_TAGS
 from config.settings import get_settings
+from src.lending.global_halt import is_globally_halted
 from src.lending.backflip_conflict import (
     BorrowerRecord,
     find_borrower_conflicts,
@@ -476,6 +477,8 @@ def run_dialer_load(
     report = LoadReport(run_id=run_id, dry_run=dry_run, total=len(records), backflip_check=backflip_check)
     if not dry_run and (scrubber is None or dialer is None):
         raise ValueError("a live load needs a scrubber and a dialer")
+    if not dry_run and is_globally_halted():
+        raise LoadRefused("lending emergency halt is on; nothing loaded into the dialer")
     phones = [normalize_phone(r.get("normalized_phone") or r.get("phone") or "") for r in records]
     if not dry_run:
         _refuse_before_scrub(records, phones, db, campaign_tags, backflip_check)

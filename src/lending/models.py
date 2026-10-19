@@ -852,6 +852,32 @@ class LendingCoraMorningDigest(LendingBase):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 
 
+class LendingGlobalHalt(LendingBase):
+    """``LENDING_GLOBAL_HALT``: one row (id 1) set by ``@Cora emergency halt`` (``src.lending.global_halt``)."""
+
+    __tablename__ = "global_halt"
+
+    id: Mapped[int] = mapped_column(SmallInteger, primary_key=True)
+    halted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    set_by: Mapped[Optional[str]] = mapped_column(String(32))
+    set_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (CheckConstraint("id = 1", name="ck_global_halt_single_row"),)
+
+
+class LendingGlobalHaltEvent(LendingBase):
+    """Every set or clear of the emergency halt, oldest first: who, when, why."""
+
+    __tablename__ = "global_halt_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    halted: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    set_by: Mapped[Optional[str]] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+
 class LendingEmailOptOutMessage(LendingBase):
     """One row per message the opt-out mailbox listener has examined, keyed like the opt-out itself (a hash of
     the Message-ID), so every sweep fetches only messages it has not settled: a burst of other mail can never push

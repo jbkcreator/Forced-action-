@@ -28,6 +28,7 @@ from typing import Any, Callable, Optional
 import requests
 
 from config.settings import get_settings
+from src.lending.global_halt import is_globally_halted
 from src.lending.ghl_account import GhlAccount, ghl_headers, lending_ghl_account
 from src.services import ghl_webhook
 from src.services.phone_utils import normalize
@@ -80,6 +81,9 @@ class GhlSmsSender:
 
     def _post(self, request: Request, path: str, body: dict, what: str, version: str = "2021-07-28",
               is_send: bool = False) -> dict:
+        if is_send and is_globally_halted():
+            logger.warning("%s %s refused: lending emergency halt is on", self._log_prefix, what)
+            raise GhlSmsError("lending emergency halt is on; nothing sent")
         try:
             response = request("POST", f"{ghl_webhook._GHL_BASE}{path}",
                                      headers=ghl_headers(self._account.api_key, version), json=body)

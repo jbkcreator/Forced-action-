@@ -121,7 +121,9 @@ def mentions_bot(event: dict[str, Any], bot_user_id: str) -> bool:
 class SlackSession:
     def __init__(self, *, config: AgentCoreConfig, chat: ChatPort, queue: PendingActionQueue,
                  halt: HaltSwitch, relay: Relay, on_message: MessageHandler,
-                 on_revision: RevisionHandler, bot_user_id: str = "") -> None:
+                 on_revision: RevisionHandler, bot_user_id: str = "",
+                 command_hook: Callable[[InboundMessage], bool] | None = None) -> None:
+        """``command_hook`` sees every operator message first; returning True means it handled the message."""
         self._config = config
         self._chat = chat
         self._queue = queue
@@ -130,6 +132,7 @@ class SlackSession:
         self._on_message = on_message
         self._on_revision = on_revision
         self.bot_user_id = bot_user_id
+        self._command_hook = command_hook
         self._seen = _RecentKeys()
 
     # -- entry point -------------------------------------------------------------------------
@@ -175,6 +178,8 @@ class SlackSession:
             return
         if message.user_id not in self._config.allowed_user_ids:
             logger.info("%s session: ignored message from non-operator %s", self._config.agent_name, message.user_id)
+            return
+        if self._command_hook is not None and self._command_hook(message):
             return
         if self._handle_halt_commands(message):
             return

@@ -986,6 +986,7 @@ class AppSettings(BaseSettings):
 	lending_cora_slack_bot_token: Optional[SecretStr] = Field(default=None, env="LENDING_CORA_SLACK_BOT_TOKEN")  # xoxb- of Cora's own app
 	lending_cora_slack_app_token: Optional[SecretStr] = Field(default=None, env="LENDING_CORA_SLACK_APP_TOKEN")  # xapp- (connections:write) for Socket Mode
 	lending_cora_channel: str = Field(default="", env="LENDING_CORA_CHANNEL")  # channel ID for approval cards
+	lending_progress_channel: str = Field(default="", env="LENDING_PROGRESS_CHANNEL")  # #next-deal-lending channel ID; emergency halt alerts (Cora's bot must be a member)
 	lending_cora_approver_user_ids: str = Field(default="", env="LENDING_CORA_APPROVER_USER_IDS")  # comma-separated Slack user ids
 	lending_cora_operator_user_ids: str = Field(default="", env="LENDING_CORA_OPERATOR_USER_IDS")  # may chat, may not approve
 	lending_cora_model: str = Field(default="claude-sonnet-5-5", env="LENDING_CORA_MODEL")

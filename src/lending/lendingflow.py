@@ -29,6 +29,7 @@ from config.lending_lendingflow import (
     SWEEP_BATCH_SIZE,
 )
 from config.settings import get_settings
+from src.lending.global_halt import is_globally_halted
 from src.lending.compliance import text_window_open
 from src.lending.contracts import LoanType
 from src.lending.web_leads import DeliveryError, PushResult, _suppression_reason
@@ -555,7 +556,7 @@ def release_held_intro_sms(db, sink: Optional[Any], *, now: Optional[datetime] =
     """Add the intro-SMS ready tag to delivered leads that were held back (outside the borrower's 8am-8pm window, or
     switch off at push time) once it is allowed. Only leads younger than INTRO_SMS_HOLD_MAX_HOURS: an intro text
     never goes out a day late. The caller commits. Never raises per lead; returns how many were tagged."""
-    if sink is None or not _intro_sms_on():
+    if sink is None or not _intro_sms_on() or is_globally_halted():
         return 0
     # ponytail: oldest-first batch; 50+ permanently blocked leads (unknown timezone) would starve newer ones for up to
     # INTRO_SMS_HOLD_MAX_HOURS. Add a skip marker if volume ever gets there.
