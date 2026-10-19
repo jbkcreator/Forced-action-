@@ -839,6 +839,19 @@ class LendingCoraInboxItem(LendingBase):
     )
 
 
+class LendingCoraMorningDigest(LendingBase):
+    """One row per ET day Cora posted her 7:30 AM morning digest (``src.lending.cora_morning_digest``). The row
+    is written in the same transaction as the Slack post, so a restart or second sweep never posts twice."""
+
+    __tablename__ = "cora_morning_digests"
+
+    digest_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    slack_channel: Mapped[Optional[str]] = mapped_column(String(32))
+    slack_ts: Mapped[Optional[str]] = mapped_column(String(64))
+    posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+
+
 class LendingEmailOptOutMessage(LendingBase):
     """One row per message the opt-out mailbox listener has examined, keyed like the opt-out itself (a hash of
     the Message-ID), so every sweep fetches only messages it has not settled: a burst of other mail can never push

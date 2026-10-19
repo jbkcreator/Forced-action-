@@ -47,6 +47,7 @@ from src.lending.cora_inbox import format_inbox_context, items_on_post, surface_
 from src.lending.cora_prompt import CORA_BASE_PROMPT, REVISION_PROMPT
 from src.lending.cora_tools import CoraToolkit, draft_content_check
 from src.lending.ghl_email import GhlEmailSender, get_email_sender
+from src.lending.cora_morning_digest import post_morning_digest
 from src.lending.models import LENDING_SCHEMA
 from src.services.phone_utils import normalize
 
@@ -82,6 +83,7 @@ class CoraServices(NamedTuple):
     gate: SendGate
     web_client: Any = None  # the Slack WebClient Socket Mode replies through; None in tests
     inbox_digest: Optional[Callable[[], int]] = None  # posts new inbox items to Cora's channel; returns how many
+    morning_digest: Optional[Callable[[], bool]] = None  # posts the 7:30 AM ET digest once a day; True when posted
 
 
 def lending_channel_ids(settings: AppSettings) -> dict[str, str]:
@@ -89,6 +91,17 @@ def lending_channel_ids(settings: AppSettings) -> dict[str, str]:
     channels = {"replies": settings.lending_replies_channel, "ops": settings.lending_ops_channel,
                 "dial_tasks": settings.lending_dial_tasks_channel, "daily": settings.lending_daily_channel}
     return {key: channel_id for key, channel_id in channels.items() if channel_id}
+
+
+def make_morning_digest(engine: Engine, store: AgentStore, chat: ChatPort, config: AgentCoreConfig) -> Callable[[], bool]:
+    """The 7:30 AM digest, posted to Cora's channel; reads the kill switch each time so the digest shows it."""
+    halt = HaltSwitch(store, config.agent_name)
+
+    def digest() -> bool:
+        return post_morning_digest(engine, chat, config.slack_channel_id, halted=halt.is_halted(),
+                                   halt_reason=halt.reason())
+
+    return digest
 
 
 def make_inbox_digest(engine: Engine, chat: ChatPort, channel: str,
@@ -313,8 +326,9 @@ def build_session(config: AgentCoreConfig, store: AgentStore, chat: ChatPort, bo
 
 
 def run_sweep(services: CoraServices) -> None:
-    """One pass: expire stale drafts, retry missing approval cards and post the inbox digest (always, even
-    while halted: the halt stops sends to borrowers, not Cora's own channel), then send approved actions."""
+    """One pass: expire stale drafts, retry missing approval cards, post the inbox digest and the 7:30 AM
+    morning digest (always, even while halted: the halt stops sends to borrowers, not Cora's own channel), then
+    send approved actions."""
     expired = services.session.expire_stale_actions()
     if expired:
         logger.info("[cora] expired %s stale draft(s)", expired)
@@ -329,6 +343,11 @@ def run_sweep(services: CoraServices) -> None:
         else:
             if surfaced:
                 logger.info("[cora] surfaced %s inbox item(s)", surfaced)
+    if services.morning_digest is not None:
+        try:
+            services.morning_digest()
+        except Exception as exc:  # class only, like the inbox digest; the claim is rolled back and retried
+            logger.error("[cora] morning digest failed (%s); retrying next sweep", type(exc).__name__)
     relay = services.relay
     try:
         result = relay.run()
@@ -379,12 +398,14 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
     def toolkit_factory(toolkit_engine: Engine, memory: AgentMemory) -> CoraToolkit:
         return CoraToolkit(toolkit_engine, memory, channels=channels)
 
-    services = build_session(config, AgentStore(engine, config.db_schema), chat,
+    store = AgentStore(engine, config.db_schema)
+    services = build_session(config, store, chat,
                              bot_user_id, messages_client=messages_client, send_check=make_send_check(engine),
                              toolkit_factory=toolkit_factory, inbox_context=make_inbox_context(engine),
                              executors=build_egress_executors())
     digest = make_inbox_digest(engine, chat, config.slack_channel_id, channel_ids)
-    return services._replace(web_client=web, inbox_digest=digest)
+    return services._replace(web_client=web, inbox_digest=digest,
+                             morning_digest=make_morning_digest(engine, store, chat, config))
 
 
 def _adopt_open_cards(services: CoraServices) -> None:

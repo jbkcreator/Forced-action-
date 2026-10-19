@@ -13,6 +13,7 @@ from sqlalchemy.pool import StaticPool
 
 from packages.agent_core.chatport import FakeChatPort, PostResult
 from packages.agent_core.config import AgentCoreConfig
+from packages.agent_core.halt import AgentHalted
 from packages.agent_core.memory import MAX_ACTIVE_RULES, AgentMemory
 from packages.agent_core.pending_actions import ActionStatus, PendingActionQueue
 from packages.agent_core.store import AgentStore
@@ -462,3 +463,26 @@ def test_a_failed_inbox_lookup_still_gets_an_answer(store: AgentStore) -> None:
     cora.say(JOSH, "dismiss 41", ts="92.5", thread_ts="92.0")
     assert _last_user_turn(cora) == f"<@{JOSH}>: dismiss 41"
     assert cora.last_answer() == "Done: #41 dismissed."
+
+
+def test_kill_switch_holds_an_approved_email_until_resume(store: AgentStore) -> None:
+    request = GhlRecorder(GhlResp(200, {"contact": {"id": "ct1"}}), GhlResp(201, {"messageId": "m-90"}))
+    cora = _email_cora(store, request)
+    cora.say(JOSH, "halt", ts="80.0")
+    _approve(cora)
+    assert cora.queue.get(1).status is ActionStatus.APPROVED and request.calls == []
+    assert "Approved, held" in cora.chat.updates[-1]["text"]
+
+    with pytest.raises(AgentHalted):
+        cora.relay.run()
+    assert request.calls == []
+
+    cora.say(JOSH, "resume", ts="81.0")
+    cora.relay.run()
+    assert cora.queue.get(1).status is ActionStatus.SENT and len(request.calls) == 2
+
+
+def test_only_an_approver_can_halt(store: AgentStore) -> None:
+    cora = _email_cora(store, GhlRecorder())
+    cora.say(OPS, "halt", ts="82.0")
+    assert "Only an approver" in cora.chat.posts[-1]["text"]
