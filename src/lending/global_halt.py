@@ -36,8 +36,13 @@ _HALT_WORDS = frozenset({"halt", "stop"})
 _RESUME_WORDS = frozenset({"resume"})
 _FILLER = frozenset({"cora", "please", "now"})
 
-NOT_STOPPED_HERE = ("Still to do by hand: pause the lending campaigns in BatchDialer (its API has no pause call) "
-                    "and turn off any GoHighLevel workflows or Conversation AI that send on their own.")
+# Runbook § 7 asks for these two to stop automatically; neither has an API we can call. Shipped as a manual
+# checklist only once Hari and Josh accept it in writing (Hari, 2026-10-19).
+MANUAL_CHECKLIST = (
+    "*Do these by hand now (the system cannot stop them):*\n"
+    ":white_square: Pause the lending campaigns in BatchDialer\n"
+    ":white_square: Turn off GoHighLevel workflows and Conversation AI that send on their own"
+)
 
 
 def _default_session():
@@ -118,9 +123,11 @@ class EmergencyHalt:
                                  "Pause BatchDialer and GoHighLevel by hand now.")
             return
         self._cora_halt.set(reason=reason, user_id=message.user_id)
-        alert = (f":rotating_light: *Lending emergency halt* by <@{message.user_id}>. Stopped: every GoHighLevel "
-                 "text and email this system sends, the LendingFlow intro text, new dialer loads and Cora's sends. "
-                 f"{NOT_STOPPED_HERE} Say `@Cora emergency resume` to lift it.")
+        alert = (f":rotating_light: *Lending emergency halt* by <@{message.user_id}>.\n"
+                 "*Stopped automatically:* every GoHighLevel text and email this system sends, the LendingFlow intro "
+                 "text, new dialer loads and Cora's sends.\n"
+                 f"{MANUAL_CHECKLIST}\n"
+                 "Say `@Cora emergency resume` to lift it.")
         posted = self._alert_channel and self._chat.post(text=alert, channel=self._alert_channel).ok
         if not posted:
             logger.error("[global-halt] alert not posted to the progress channel")

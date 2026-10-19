@@ -108,3 +108,12 @@ Sources: `Launch_Protocol_Runbook_Dev_Split.md`, `Next_Deal_Lending_Launch_Proto
 - Phone settings (not Slack): notifications allowed with sound (iPhone: Settings → Notifications → Slack; Android: Settings → Apps → Slack → Notifications); Slack allowed during Focus / Do Not Disturb (iPhone: Settings → Focus → each Focus → Apps → add Slack; Android: Settings → Do Not Disturb → Exceptions → add Slack).
 - Slack app: mobile notification level (Profile → Notifications → Mobile); #lending-ops not muted (channel name → Notifications); notification schedule / pause hours (Profile → Notifications → Notification schedule; desktop: Preferences → Notifications).
 - The client message draft should name these two places separately before the team lead sends it.
+
+## Answers from Hari (2026-10-19)
+
+### 2026-10-19, Q-34 / Q-3 / T-03 manual steps / Q-4 answered
+- Q-34 (T-01 sender): Hari: "yes proceed". GHL with hello@nextdeallending.com is the sender. T-01 unchanged.
+- Q-3 (T-02 "Cora Task 7"): only the label on Runbook § 3 Line 4; build to Line 4's pass condition (service in Socket Mode with the bot token, kill switch tested, 7:30 AM digest). Hari is asking the client whether it means more. Note: the 7:30 AM digest IS built on this branch (`cora_morning_digest.py`, T-02 entries above, content per Chunk 2 Task E5); #369 alone has only the per-minute inbox digest.
+- T-03 manual steps: Hari: not OK to assume. The runbook asks for BatchDialer and GHL to pause automatically, so the partial stop ships only if Hari and Josh accept the two manual steps IN WRITING, and the stop alert must show them as a checklist. Done: `global_halt.MANUAL_CHECKLIST` adds ":white_square: Pause the lending campaigns in BatchDialer" and ":white_square: Turn off GoHighLevel workflows and Conversation AI that send on their own" to the alert, under "Stopped automatically". Test updated (`test_global_halt.py`).
+- Q-4 (Section 8a): Hari pointed to the § 7 bullets themselves; the three bullets are the spec. T-03 unchanged.
+- Open: written acceptance from Hari and Josh of the two manual halt steps (blocks shipping T-03's partial stop); client answer on "Task 7".

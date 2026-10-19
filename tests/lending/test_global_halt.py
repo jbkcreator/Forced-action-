@@ -94,7 +94,9 @@ def test_approver_halt_sets_the_flag_halts_cora_and_alerts_the_channel(halt_db) 
     assert _command(chat, cora_halt)(_message("<@U_BOT> emergency halt"))
     assert is_globally_halted() and cora_halt.halted_by == JOSH
     alert = next(post for post in chat.posts if post["channel"] == "C_NDL")
-    assert "Lending emergency halt" in alert["text"] and "BatchDialer" in alert["text"]
+    assert "Lending emergency halt" in alert["text"]
+    assert ":white_square: Pause the lending campaigns in BatchDialer" in alert["text"]
+    assert ":white_square: Turn off GoHighLevel workflows" in alert["text"]
     assert any(post["channel"] == "C_CORA" for post in chat.posts)
 
 
