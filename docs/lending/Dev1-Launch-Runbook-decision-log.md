@@ -117,3 +117,7 @@ Sources: `Launch_Protocol_Runbook_Dev_Split.md`, `Next_Deal_Lending_Launch_Proto
 - T-03 manual steps: Hari: not OK to assume. The runbook asks for BatchDialer and GHL to pause automatically, so the partial stop ships only if Hari and Josh accept the two manual steps IN WRITING, and the stop alert must show them as a checklist. Done: `global_halt.MANUAL_CHECKLIST` adds ":white_square: Pause the lending campaigns in BatchDialer" and ":white_square: Turn off GoHighLevel workflows and Conversation AI that send on their own" to the alert, under "Stopped automatically". Test updated (`test_global_halt.py`).
 - Q-4 (Section 8a): Hari pointed to the § 7 bullets themselves; the three bullets are the spec. T-03 unchanged.
 - Open: written acceptance from Hari and Josh of the two manual halt steps (blocks shipping T-03's partial stop); client answer on "Task 7".
+
+### 2026-10-19, server settings update (T-03 / T-05)
+- Done: `LENDING_OPS_CHANNEL` = `C0C7LFEKRDM` (#lending-ops) is set on the server (user confirmed); Josh and the Cora Lending app are in #lending-ops.
+- Clarified: `LENDING_PROGRESS_CHANNEL` is our setting name for the runbook's "posts an alert to #next-deal-lending" (Runbook § 7); the client did not name it. Deploy step, no client approval: copy #next-deal-lending's channel ID into it on the server, restart `fa-lending-cora`, invite Cora's app to #next-deal-lending (a bot can only post in channels it is in). Without it the halt still works and the alert is only replied in Cora's channel.
