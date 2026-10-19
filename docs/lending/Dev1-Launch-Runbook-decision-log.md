@@ -97,3 +97,9 @@ Sources: `Launch_Protocol_Runbook_Dev_Split.md`, `Next_Deal_Lending_Launch_Proto
 - Done: `LendingFlowLeadCreated` gains optional `ghl_contact_id` (set by `lendingflow_events.build_event` from the delivered lead). The arrival alert adds "Open in GHL to call" linking to `LENDING_GHL_APP_URL/v2/location/<LENDING_GHL_LOCATION_ID>/contacts/detail/<contact id>`; without a contact id it posts without the link. New setting `LENDING_GHL_APP_URL` (default `https://app.gohighlevel.com`, change for a white-label domain). Tests in `test_lead_arrival_alert.py` (2 more).
 - Decision: URL format confirmed from a contact page in the Next Deal Lending sub-account (standard GHL domain, no white label). No ids are hard-coded; nothing to configure in GHL.
 - Open: suggestions 1 (switch on the arrival alert) and 4 (Josh's Slack mention notifications).
+
+### 2026-10-19, suggestion 4: client notification check (handed to team lead)
+- Done: drafted a client message (Josh is the client) for the team lead to review and send: arrival alerts and the 5-minute alarm tag @Josh in #lending-ops with an "Open in GHL to call" link; asks Josh to check (1) Slack Profile → Notifications → Mobile = "Direct messages, mentions & keywords" or "All new messages", (2) #lending-ops not muted, (3) phone allows Slack notifications with sound, including Focus / Do Not Disturb if he wants leads after hours; then we send one test alert.
+- Team lead checks in Slack (no client action): Josh and the lending Slack bot are both members of #lending-ops.
+- Decision: the message is a draft; the team lead reviews it before it goes to the client.
+- Open: team lead sends the message; Josh confirms; set `LENDING_LEAD_ARRIVAL_ALERT_ENABLED=true` on the server and send one test lead to confirm the alert rings Josh's phone.
