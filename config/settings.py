@@ -910,6 +910,7 @@ class AppSettings(BaseSettings):
 	aircall_api_token: Optional[SecretStr] = Field(default=None, env="AIRCALL_API_TOKEN")
 	batchdialer_api_key: Optional[SecretStr] = Field(default=None, env="BATCHDIALER_API_KEY")
 	missed_call_text_enabled: bool = Field(default=False, env="MISSED_CALL_TEXT_ENABLED")  # WP-GL-9; off until consent + sender confirmed
+	lending_transcript_ingest_enabled: bool = Field(default=False, env="LENDING_TRANSCRIPT_INGEST_ENABLED")  # T-12; off: each extraction is a Claude call
 	# Backflip borrower conflict check on the lending load. Off for launch: there is no
 	# Backflip export, and a missing or stale feed blocks every record when it is on.
 	lending_backflip_check_enabled: bool = Field(default=False, env="LENDING_BACKFLIP_CHECK_ENABLED")

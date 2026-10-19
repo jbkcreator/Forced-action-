@@ -1,4 +1,4 @@
-"""BatchDialer CDR poller: fast poll for new calls, periodic day rescan.
+"""BatchDialer CDR poller: fast poll for new calls, periodic day rescan, transcript ingest (T-12).
 
 Usage:
     python -m src.lending.cdr_poller            # loop
@@ -12,15 +12,22 @@ from __future__ import annotations
 import argparse
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Callable, Optional
 
 from sqlalchemy import text
 
-from config.lending_dispositions import CDR_POLL_LOCK_KEY, CDR_POLL_SECONDS, CDR_RESCAN_SECONDS
+from config.lending_dispositions import (
+    CDR_POLL_LOCK_KEY,
+    CDR_POLL_SECONDS,
+    CDR_RESCAN_SECONDS,
+    TRANSCRIPT_BATCH_SIZE,
+)
+from config.settings import get_settings
 from src.lending.call_pipeline import lending_campaign_ids, retry_unpropagated_dnc
 from src.lending.cdr_poll import IngestStats, poll_new, rescan_today
 from src.lending.db import lending_session
-from src.lending.dialer_port import get_http
+from src.lending.dialer_port import get_dialer, get_http
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +55,25 @@ def text_back_step() -> None:
             logger.info("[lending-cdr-poller] text-back %s", counts)
     except Exception as exc:  # class only: bodies carry phone numbers
         logger.error("[lending-cdr-poller] text-back cycle failed (%s); retrying next interval", type(exc).__name__)
+
+
+def transcript_step() -> None:
+    """T-12: fetch and extract transcripts of finished calls. Off unless enabled; never blocks ingestion."""
+    if not get_settings().lending_transcript_ingest_enabled:
+        return
+    try:
+        from src.lending.transcript_ingest import run_transcript_ingest
+
+        dialer = get_dialer()
+        if dialer is None:
+            return
+        with lending_session() as db:
+            counts = run_transcript_ingest(db, dialer, now=datetime.now(timezone.utc), limit=TRANSCRIPT_BATCH_SIZE)
+            db.commit()
+        if counts:
+            logger.info("[lending-cdr-poller] transcripts %s", dict(counts))
+    except Exception as exc:  # class only: transcripts carry borrower speech
+        logger.error("[lending-cdr-poller] transcript step failed (%s); retrying next interval", type(exc).__name__)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -93,6 +119,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 if args.once:
                     raise
             text_back_step()
+            transcript_step()
             if args.once:
                 return 0
             time.sleep(CDR_POLL_SECONDS)

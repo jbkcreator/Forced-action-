@@ -123,7 +123,7 @@ DIRECTION_ALIASES: dict[str, str] = {"out": "outbound", "outbound": "outbound", 
 # connected and the caller has not chosen a result yet.
 CDR_ANSWERED_STATUSES = frozenset({"ANSWER", "ANSWERED"})
 
-CDR_POLL_SECONDS = 15      # GET /v2/cdrs/last: keeps the 60-second text reachable
+CDR_POLL_SECONDS = 5       # GET /v2/cdrs/last; Runbook § 3 line 10 / § 5.1: 5-second ingestion (T-12)
 CDR_RESCAN_SECONDS = 120   # GET /v2/cdrs for today + yesterday (UTC)
 CDR_POLL_LOCK_KEY = 7_302_020_803  # one poller at a time: the /last watermark is shared per integration
 
@@ -147,3 +147,13 @@ def validate_dispositions_config() -> None:
 # BatchDialer contact custom field the caller sets during the call ("OK if I text you?" -> yes).
 TEXT_CONSENT_FIELD = "text_consent"
 TEXT_CONSENT_YES = "yes"
+
+
+# T-12 audio fallback. BatchDialer has no live audio stream; the poller fetches each answered
+# call's transcript (GET /cdrs/{id}/transcription) once the call ends and runs the call
+# extraction. Off unless LENDING_TRANSCRIPT_INGEST_ENABLED (every extraction is a Claude call).
+TRANSCRIPT_DONE = "done"        # transcript fetched and extracted
+TRANSCRIPT_MISSING = "missing"  # none arrived within TRANSCRIPT_MAX_WAIT_SECONDS of the call end
+TRANSCRIPT_STATUSES = frozenset({TRANSCRIPT_DONE, TRANSCRIPT_MISSING})  # NULL = still pending
+TRANSCRIPT_BATCH_SIZE = 10
+TRANSCRIPT_MAX_WAIT_SECONDS = 30 * 60
