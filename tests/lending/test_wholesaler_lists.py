@@ -76,6 +76,7 @@ def harness(monkeypatch):
     def fake_load(records, session, *, run_id, dry_run, **kw):
         calls["loads"].append({"dry_run": dry_run, "records": list(records), **kw})
         report = LoadReport(run_id=run_id, dry_run=dry_run, total=len(records))
+        report.needs_scrub = 1 if dry_run else 0  # one number already has a fresh scrub
         if not dry_run:
             report.loaded = 1
             report.loaded_refs = [records[0]["source_record_ref"]]  # second one blocked by the scrub
@@ -104,13 +105,14 @@ def test_dry_run_is_default_scrubs_nothing_and_pushes_nothing(csv_path, harness)
 
 def test_live_refuses_without_matching_scrub_confirmation(csv_path, harness):
     assert task.main(["--input", str(csv_path), "--live"]) == 4
-    assert task.main(["--input", str(csv_path), "--live", "--confirm-scrub", "7"]) == 4
-    assert harness["loads"] == []
+    assert task.main(["--input", str(csv_path), "--live", "--confirm-scrub", "2"]) == 4  # 2 rows, but only 1 needs a scrub
+    assert all(load["dry_run"] for load in harness["loads"])
 
 
 def test_live_with_confirmation_loads_partners_and_tags_only_loaded_numbers_in_ghl(csv_path, harness):
-    assert task.main(["--input", str(csv_path), "--live", "--confirm-scrub", "2"]) == 0
-    (load,) = harness["loads"]
+    assert task.main(["--input", str(csv_path), "--live", "--confirm-scrub", "1"]) == 0
+    dry, load = harness["loads"]
+    assert dry["dry_run"] is True
     assert load["dry_run"] is False and load["scrubber"] is not None
     assert {r["pool"] for r in load["records"]} == {q.PARTNERS}
     assert harness["sink"].pushed == [("wholesaler:sunbiz:+18135550101",
@@ -119,5 +121,19 @@ def test_live_with_confirmation_loads_partners_and_tags_only_loaded_numbers_in_g
 
 def test_live_refuses_without_ghl_account(csv_path, harness, monkeypatch):
     monkeypatch.setattr(task, "ghl_sink", lambda: None)
-    assert task.main(["--input", str(csv_path), "--live", "--confirm-scrub", "2"]) == 3
-    assert harness["loads"] == []
+    assert task.main(["--input", str(csv_path), "--live", "--confirm-scrub", "1"]) == 3
+    assert all(load["dry_run"] for load in harness["loads"])
+
+
+def test_ghl_transport_error_names_the_step(monkeypatch):
+    from src.lending.ghl_account import GhlAccount
+    from src.lending.wholesaler_lists import GhlWholesalerSink
+    from src.services import ghl_webhook
+
+    def boom(*a, **kw):
+        raise ConnectionError("down")
+
+    monkeypatch.setattr(ghl_webhook, "_ghl_request", boom)
+    record = parse_wholesaler_csv(CSV).records[0]
+    with pytest.raises(RuntimeError, match="contact upsert: ConnectionError"):
+        GhlWholesalerSink(GhlAccount("k", "loc")).push(record, ghl_tags(record))

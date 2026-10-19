@@ -116,9 +116,13 @@ class GhlWholesalerSink:
     def _call(self, step: str, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         from src.services import ghl_webhook
 
-        response = ghl_webhook._ghl_request(
-            method, f"{ghl_webhook._GHL_BASE}{path}", headers=ghl_headers(self._account.api_key), **kwargs,
-        )
+        try:
+            response = ghl_webhook._ghl_request(
+                method, f"{ghl_webhook._GHL_BASE}{path}", headers=ghl_headers(self._account.api_key), **kwargs,
+            )
+        except Exception as exc:
+            logger.warning("[wholesaler-ghl] %s request failed: %s", step, type(exc).__name__)
+            raise RuntimeError(f"{step}: {type(exc).__name__}") from exc
         if response.status_code >= 400:
             raise RuntimeError(f"{step}: HTTP {response.status_code}")
         try:

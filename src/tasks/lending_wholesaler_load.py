@@ -49,16 +49,17 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("[wholesaler-load] %s", exc)
         return 2
     records = sort_for_load(parsed.records)
-    scrub_count = len(records)
-    logger.info("[wholesaler-load] parsed %d FL records; dropped %s; %d phone(s) would go to the Tracerfy scrub",
-                scrub_count, dict(parsed.dropped), scrub_count)
+    logger.info("[wholesaler-load] parsed %d FL records; dropped %s", len(records), dict(parsed.dropped))
     run_id = args.run_id or f"wholesaler-load-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
 
+    # Dry pass first, always: its needs_scrub is the number of phones a live run sends to Tracerfy.
+    with get_db_context() as session:
+        dry = run_dialer_load(records, session, run_id=run_id, dry_run=True)
+        session.rollback()
+    scrub_count = dry.needs_scrub
+    logger.info("[wholesaler-load] %d phone(s) would go to the Tracerfy scrub", scrub_count)
     if not args.live:
-        with get_db_context() as session:
-            report = run_dialer_load(records, session, run_id=run_id, dry_run=True)
-            session.rollback()
-        logger.info("[wholesaler-load] dry run: %s", json.dumps(report.as_dict(), indent=2))
+        logger.info("[wholesaler-load] dry run: %s", json.dumps(dry.as_dict(), indent=2))
         return 0
 
     if args.confirm_scrub != scrub_count:
@@ -82,8 +83,11 @@ def main(argv: list[str] | None = None) -> int:
     loaded = set(report.loaded_refs)
     ghl = push_to_ghl([r for r in records if r["source_record_ref"] in loaded], sink)
     logger.info("[wholesaler-load] report: %s", json.dumps(report.as_dict(), indent=2))
-    logger.info("[wholesaler-load] GHL tagged %d, failed %d; dialable loaded %d of %d target",
-                ghl.pushed, len(ghl.failed), report.loaded, DIALABLE_TARGET)
+    logger.info("[wholesaler-load] dialer loaded %d; GHL tagged %d, failed %d",
+                report.loaded, ghl.pushed, len(ghl.failed))
+    if ghl.pushed < DIALABLE_TARGET:
+        logger.warning("[wholesaler-load] %d dialable numbers in GHL, below the %d target (Section 0)",
+                       ghl.pushed, DIALABLE_TARGET)
     return 1 if report.failed or ghl.failed else 0
 
 
