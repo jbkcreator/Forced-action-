@@ -14,7 +14,7 @@ from src.lending.ghl_sms import GhlSmsError, GhlSmsSender
 
 LEAD = {"lead_uuid": "7f6c1a2e-0000-4000-8000-000000000001", "phone": "+17275550100", "email": "sam@example.com",
         "received_at": datetime(2026, 10, 19, 14, 0, tzinfo=timezone.utc), "credit_band_min_fico": 700,
-        "loan_amount": 250000, "property_state": "FL", "loan_type": "DSCR_RENTAL"}
+        "loan_amount": 250000, "property_state": "FL", "loan_type": "DSCR_RENTAL", "ghl_contact_id": "ct-123"}
 
 
 class FakeSlack:
@@ -30,7 +30,8 @@ class FakeSlack:
 
 def _settings(**overrides):
     values = dict(lending_lead_arrival_alert_enabled=True, lending_slack_bot_token="xoxb-test",
-                  lending_ops_channel="C_OPS", lending_cora_approver_user_ids="U_JOSH")
+                  lending_ops_channel="C_OPS", lending_cora_approver_user_ids="U_JOSH",
+                  lending_ghl_app_url="https://app.gohighlevel.com", lending_ghl_location_id="loc-ndl")
     values.update(overrides)
     return SimpleNamespace(**values)
 
@@ -53,6 +54,17 @@ def test_a_new_lead_mentions_josh_in_the_ops_channel(slack) -> None:
     assert post["channel"] == "C_OPS"
     assert "<@U_JOSH>" in post["text"] and "New LendingFlow lead: call now." in post["text"]
     assert "$250,000" in post["text"] and "FL" in post["text"] and "Phone ending 0100" in post["text"]
+
+
+def test_the_alert_links_to_the_ghl_contact(slack) -> None:
+    lead_arrival_alert.alert_josh(_event())
+    assert ("<https://app.gohighlevel.com/v2/location/loc-ndl/contacts/detail/ct-123|Open in GHL to call>"
+            in slack.posts[0]["text"])
+
+
+def test_without_a_contact_id_the_alert_still_posts_without_a_link(slack) -> None:
+    lead_arrival_alert.alert_josh(lendingflow_events.build_event({**LEAD, "ghl_contact_id": None}))
+    assert "Open it in GHL to call." in slack.posts[0]["text"] and "https://" not in slack.posts[0]["text"]
 
 
 def test_the_alert_never_shows_the_full_phone_or_email(slack) -> None:

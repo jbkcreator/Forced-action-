@@ -92,3 +92,8 @@ Sources: `Launch_Protocol_Runbook_Dev_Split.md`, `Next_Deal_Lending_Launch_Proto
 - Done: `uncalled_alarm_worker.MentioningSlack` wraps the alarm worker's Slack client in `run_cycle`, prefixing every alarm post with @-mentions of `LENDING_CORA_APPROVER_USER_IDS` (Josh), so the 5-minute Slack alarm pushes to his phone through the Slack app. No approvers set = post unchanged. Tests in `tests/lending/test_lead_arrival_alert.py` (2 more).
 - Decision: until R5 and 10DLC land, the 5-minute Slack post is the only alarm that reaches Josh, so it carries the mention.
 - Open: suggestions 1 (switch on the arrival alert), 3 (GHL contact link), 4 (Josh's Slack mention notifications) remain.
+
+### 2026-10-19, suggestion 3 done: GHL contact link in the arrival alert
+- Done: `LendingFlowLeadCreated` gains optional `ghl_contact_id` (set by `lendingflow_events.build_event` from the delivered lead). The arrival alert adds "Open in GHL to call" linking to `LENDING_GHL_APP_URL/v2/location/<LENDING_GHL_LOCATION_ID>/contacts/detail/<contact id>`; without a contact id it posts without the link. New setting `LENDING_GHL_APP_URL` (default `https://app.gohighlevel.com`, change for a white-label domain). Tests in `test_lead_arrival_alert.py` (2 more).
+- Decision: URL format confirmed from a contact page in the Next Deal Lending sub-account (standard GHL domain, no white label). No ids are hard-coded; nothing to configure in GHL.
+- Open: suggestions 1 (switch on the arrival alert) and 4 (Josh's Slack mention notifications).
