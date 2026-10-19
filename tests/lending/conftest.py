@@ -33,6 +33,10 @@ def lending_db():
         engine.dispose()
         pytest.skip("Postgres is not reachable")
     tx = conn.begin()
+    # The database is live and apply_to() locks call_dispositions: a test that cannot get a lock fails fast instead
+    # of queueing live jobs behind it, and a session left open by a killed run rolls back and closes after a minute.
+    conn.execute(text("SET LOCAL lock_timeout = '5s'"))
+    conn.execute(text("SET LOCAL idle_in_transaction_session_timeout = '60s'"))
     conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{LENDING_SCHEMA}"'))
     LendingCallDisposition.__table__.create(bind=conn, checkfirst=True)
     apply_to(conn)  # DDL is transactional: the vendor-neutral migration is rolled back with the test
