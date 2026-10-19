@@ -93,6 +93,7 @@ def harness(monkeypatch):
     monkeypatch.setattr(task, "get_db_context", fake_db)
     monkeypatch.setattr(task.dialer_port, "get_dialer", lambda: object())
     monkeypatch.setattr(task, "ghl_sink", lambda: calls["sink"])
+    monkeypatch.setattr(task, "active_wholesaler_total", lambda db: calls.get("total", 1500))
     return calls
 
 
@@ -104,8 +105,8 @@ def test_dry_run_is_default_scrubs_nothing_and_pushes_nothing(csv_path, harness)
 
 
 def test_live_refuses_without_matching_scrub_confirmation(csv_path, harness):
-    assert task.main(["--input", str(csv_path), "--live"]) == 4
-    assert task.main(["--input", str(csv_path), "--live", "--confirm-scrub", "2"]) == 4  # 2 rows, but only 1 needs a scrub
+    assert task.main(["--input", str(csv_path), "--live"]) == task.EXIT_SCRUB_NOT_CONFIRMED
+    assert task.main(["--input", str(csv_path), "--live", "--confirm-scrub", "2"]) == task.EXIT_SCRUB_NOT_CONFIRMED  # 2 rows, but only 1 needs a scrub
     assert all(load["dry_run"] for load in harness["loads"])
 
 
@@ -121,7 +122,7 @@ def test_live_with_confirmation_loads_partners_and_tags_only_loaded_numbers_in_g
 
 def test_live_refuses_without_ghl_account(csv_path, harness, monkeypatch):
     monkeypatch.setattr(task, "ghl_sink", lambda: None)
-    assert task.main(["--input", str(csv_path), "--live", "--confirm-scrub", "1"]) == 3
+    assert task.main(["--input", str(csv_path), "--live", "--confirm-scrub", "1"]) == task.EXIT_REFUSED
     assert all(load["dry_run"] for load in harness["loads"])
 
 
@@ -137,3 +138,9 @@ def test_ghl_transport_error_names_the_step(monkeypatch):
     record = parse_wholesaler_csv(CSV).records[0]
     with pytest.raises(RuntimeError, match="contact upsert: ConnectionError"):
         GhlWholesalerSink(GhlAccount("k", "loc")).push(record, ghl_tags(record))
+
+
+def test_live_run_below_cumulative_target_exits_with_below_target(csv_path, harness):
+    """Section 0 counts the live total across runs, not one run's loads."""
+    harness["total"] = 900
+    assert task.main(["--input", str(csv_path), "--live", "--confirm-scrub", "1"]) == task.EXIT_BELOW_TARGET

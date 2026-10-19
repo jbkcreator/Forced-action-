@@ -41,12 +41,11 @@ DIAL_ORDER: tuple[str, ...] = (PARTNERS, TRANSACTION_READY, BUILDERS, VERIFIED_M
 
 # Runbook Principle 4: max 3 lines per seat on partner, wholesaler/broker and landline
 # numbers; 5 lines only on the cold maturity queue. Set by hand per BatchDialer campaign.
-DEFAULT_MAX_LINES = 3
-COLD_MATURITY_MAX_LINES = 5
-COLD_MATURITY_QUEUE = VERIFIED_MATURITY
+# The caps are the rule; MAX_LINES is the chosen setting, checked against them.
+LINE_CAP = 3
+COLD_MATURITY_LINE_CAP = 5
 MAX_LINES: dict[str, int] = {
-    PARTNERS: DEFAULT_MAX_LINES, TRANSACTION_READY: DEFAULT_MAX_LINES,
-    BUILDERS: DEFAULT_MAX_LINES, VERIFIED_MATURITY: COLD_MATURITY_MAX_LINES,
+    PARTNERS: 3, TRANSACTION_READY: 3, BUILDERS: 3, VERIFIED_MATURITY: 5,
 }
 
 
@@ -56,7 +55,7 @@ def validate_queue_config() -> None:
     if set(MAX_LINES) != LAUNCH_QUEUES:
         raise ValueError("MAX_LINES must cover exactly the launch queues")
     for queue, lines in MAX_LINES.items():
-        cap = COLD_MATURITY_MAX_LINES if queue == COLD_MATURITY_QUEUE else DEFAULT_MAX_LINES
+        cap = COLD_MATURITY_LINE_CAP if queue == VERIFIED_MATURITY else LINE_CAP
         if not 1 <= lines <= cap:
             raise ValueError(f"{queue} may run at most {cap} lines")
     if NURTURE_ONLY_TAGS & set(SOURCE_TAG_QUEUES):

@@ -93,7 +93,12 @@ class GhlPushResult:
 
 
 def push_to_ghl(records: Sequence[Mapping[str, Any]], sink: GhlTagSink) -> GhlPushResult:
-    """Upsert + tag each record; a failure is logged (source only, no phone) and the rest still go."""
+    """Upsert + tag each record; a failure is logged (source only, no phone) and the rest still go.
+
+    One record at a time on purpose (exception to "batch I/O"): GHL has no bulk contact
+    upsert, and tags must go through the separate add-tags call because the upsert
+    REPLACES tags. About 2 calls per number, ~3,000 for the 1,500 target, one-off.
+    """
     result = GhlPushResult()
     for record in records:
         try:

@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 
 from config import lending_queues as q
-from src.lending.dial_order import order_for_dialing, queue_to_dial_now, record_score
+from src.lending.dial_order import order_for_dialing, queue_to_dial_now, score_field
 
 
 def _rec(ref, queue, **extra):
@@ -50,16 +50,10 @@ def test_records_with_no_launch_queue_are_dropped():
     assert [r["source_record_ref"] for r in order_for_dialing(records)] == ["p"]
 
 
-def test_record_score_prefers_t16_lead_score_then_falls_back_to_rank():
-    assert record_score({"lead_score": 0, "rank": 9}) == 0
-    assert record_score({"rank": 7}) == 7
-    assert record_score({}) is None
-
-
-def test_score_source_is_swappable():
-    records = [_rec("a", q.PARTNERS, x=1), _rec("b", q.PARTNERS, x=5)]
-    out = order_for_dialing(records, score=lambda r: r["x"])
-    assert [r["source_record_ref"] for r in out] == ["b", "a"]
+def test_score_field_prefers_t16_lead_score_then_rank():
+    assert score_field([{"rank": 9}, {"lead_score": 0}]) == "lead_score"
+    assert score_field([{"rank": 7}]) == "rank"
+    assert score_field([{}]) is None
 
 
 @pytest.mark.parametrize("remaining,expected", [
@@ -125,3 +119,19 @@ def test_dialer_load_task_loads_in_dial_order(monkeypatch, tmp_path):
     path.write_text(json.dumps([_rec("m", q.VERIFIED_MATURITY, lead_score=9), _rec("p", q.PARTNERS)]))
     assert task.main(["--input", str(path)]) == 0
     assert seen["refs"] == ["p", "m"]
+
+
+def test_one_score_scale_per_queue_t16_score_wins_over_old_rank():
+    """T-16's 0-10 lead_score and the old 1-10 rank are different scales: once any record in a
+    queue has a lead_score, rank-only records in that queue count as unscored."""
+    records = [
+        _rec("rank-only", q.PARTNERS, rank=10),
+        _rec("t16-low", q.PARTNERS, lead_score=2),
+        _rec("t16-high", q.PARTNERS, lead_score=8),
+    ]
+    assert [r["source_record_ref"] for r in order_for_dialing(records)] == ["t16-high", "t16-low", "rank-only"]
+
+
+def test_rank_is_used_when_no_record_in_the_queue_has_a_t16_score():
+    records = [_rec("lo", q.VERIFIED_MATURITY, rank=3), _rec("hi", q.VERIFIED_MATURITY, rank=9)]
+    assert [r["source_record_ref"] for r in order_for_dialing(records)] == ["hi", "lo"]
