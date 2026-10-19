@@ -23,7 +23,8 @@ def behind_row_ids() -> list[int]:
         rows = db.execute(
             text(
                 "SELECT id FROM lending.call_dispositions "
-                "WHERE (sheet_synced_disposition IS DISTINCT FROM disposition "
+                "WHERE call_source = 'batchdialer' "
+                "AND (sheet_synced_disposition IS DISTINCT FROM disposition "
                 "       OR slack_posted_disposition IS DISTINCT FROM disposition) "
                 "AND disposition_at < now() - make_interval(secs => :age) "
                 "ORDER BY disposition_at LIMIT :limit"

@@ -93,8 +93,10 @@ def draft_content_check(channel: str, fields: Mapping[str, str]) -> Optional[str
 
 
 LENDING_TABLES_HELP = (
-    "Tables (schema lending): call_dispositions (one row per dialer call: caller_name, phone, disposition, "
-    "direction, talk_duration_sec, call_started_at, call_ended_at, dialer_campaign_id, campaign_tag), "
+    "Tables (schema lending): call_dispositions (one row per call: caller_name, phone, disposition, "
+    "direction, talk_duration_sec, call_started_at, call_ended_at, dialer_campaign_id, campaign_tag, "
+    "call_source batchdialer or ghl; a LendingFlow lead qualifies for replacement with 5+ outbound attempts "
+    "on its phone over 5+ Eastern days since it arrived), "
     "web_leads (website form: received_at, name, phone, email, property_city, deal_type, completed_projects_3y, "
     "sms_consent, suppressed, ghl_status, ghl_contact_id), contacts (phone, email, do_not_contact, nurture), "
     "text_consents (phone, source, captured_at, revoked_at), suppression_list (phone, email, reason, created_at), "

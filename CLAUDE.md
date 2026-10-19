@@ -69,6 +69,8 @@ PYTHONPATH=. python migrations/apply_lending_webhook_failures.py  # lending.webh
 PYTHONPATH=. python migrations/apply_lending_email_opt_out_messages.py  # lending.email_opt_out_messages: every message the opt-out mailbox listener has settled, so no opt-out is skipped (idempotent)
 python -m src.lending.email_opt_out  # opt-out mailbox listener (cron */5): mail to LENDING_OPTOUT_ADDRESS is suppressed over IMAP (LENDING_OPTOUT_IMAP_USER/_PASSWORD); docs/lending/text-back-runbook.md
 PYTHONPATH=. python migrations/apply_lending_uncalled_alarms.py  # T-10: lending.uncalled_alarms (2-min/5-min LendingFlow lead alarms); also marks existing leads 'preexisting' — re-run right before enabling (idempotent, no FK to T-11)
+PYTHONPATH=. python migrations/apply_lending_followup_call_tracking.py  # 14-day follow-up: call_dispositions.call_source (batchdialer|ghl; dialer-only jobs filter batchdialer) (idempotent); replacement rule (5+ attempts over 5+ ET days): python -m src.lending.replacement_eligibility. Never put a view on call_dispositions: the dialer migration re-applies column types
+python -m src.lending.ghl_call_import  # GHL calls -> lending.call_dispositions (cron */15, off until LENDING_GHL_CALL_IMPORT_ENABLED=true); GHL workflow build + drafts: docs/lending/followup-14-day.md
 python -m src.lending.uncalled_alarm_worker  # T-10 alarm worker (systemd fa-lending-uncalled-alarm-worker, installed by deploy.sh LENDING_UNITS (warn-only); idles until LENDING_UNCALLED_ALARMS_ENABLED=true; LENDING_ALARM_SMS_TO, LENDING_OPS_CHANNEL)
 # PropertyRadar daily target-lender maturity pull (separate cron, disabled until PROPERTY_RADAR_ENABLED=true — see scripts/cron/crontab.txt)
 python -m src.tasks.property_radar_maturity_pull --mode daily --state FL

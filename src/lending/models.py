@@ -267,6 +267,10 @@ class LendingCallDisposition(LendingBase):
     recording_status: Mapped[Optional[str]] = mapped_column(String(12))  # pending | readable | forbidden | missing
     recording_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     dialer_campaign_id: Mapped[Optional[str]] = mapped_column(String(64))  # BatchDialer campaign (scoreboard)
+    # batchdialer (CDR poller) | ghl (calls made in GoHighLevel, imported for the 14-day follow-up). Dialer-only
+    # jobs (delivery, missing-disposition alert, soft approval cards) act on batchdialer rows only.
+    call_source: Mapped[str] = mapped_column(String(20), nullable=False, default="batchdialer",
+                                             server_default=text("'batchdialer'"))
 
     __table_args__ = (
         Index("idx_lending_call_dispositions_phone_ended", "phone", "call_ended_at"),

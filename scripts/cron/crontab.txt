@@ -1217,6 +1217,10 @@ COUNTY_ID=hillsborough
 # Lending: is each call recording readable with our key? forbidden (permission off) ones are rechecked every 30 min.
 */10 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_recording_check
 
+# Lending 14-day follow-up (Runbook §4.1) — record calls made in GoHighLevel in lending.call_dispositions so every
+# attempt counts toward the LendingFlow replacement rule. No-op while LENDING_GHL_CALL_IMPORT_ENABLED=false.
+*/15 * * * * $PROJECT/scripts/cron/run.sh src.lending.ghl_call_import
+
 # Lending 7:20pm ET scoreboard to Slack (Part 5.6; dialer stops 7:15pm). Two lines because ET is UTC-4 until Nov 1 and UTC-5 after; the task posts only when it is 19:xx ET.
 20 23 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_daily_scoreboard
 20 0 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_daily_scoreboard
