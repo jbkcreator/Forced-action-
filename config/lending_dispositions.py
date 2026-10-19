@@ -165,4 +165,6 @@ TRANSCRIPT_RATE_LIMITED = "rate_limited"
 TRANSCRIPT_PENDING_PREDICATE = "transcript_status IS NULL AND talk_duration_sec > 0"
 TRANSCRIPT_BATCH_SIZE = 10
 TRANSCRIPT_MAX_WAIT_SECONDS = 30 * 60
+TRANSCRIPT_POLL_SECONDS = 5    # transcript worker cycle (own process, never the CDR poller tick)
+TRANSCRIPT_WORKER_LOCK_KEY = 7_302_020_804  # one transcript worker at a time
 TRANSCRIPT_RETRY_SECONDS = 30   # a not-ready call waits this long before its next fetch

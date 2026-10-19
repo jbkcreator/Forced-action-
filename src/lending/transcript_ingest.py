@@ -1,7 +1,7 @@
-"""T-12 audio fallback: after-call transcript ingestion inside the CDR poller.
+"""T-12 audio fallback: after-call transcript ingestion in its own worker (``transcript_worker``).
 
 BatchDialer offers no live audio stream (no WebSocket in its API); the closest thing is the
-call transcript it exposes once a call ends (``GET /cdrs/{id}/transcription``). Each poller
+call transcript it exposes once a call ends (``GET /cdrs/{id}/transcription``). Each worker
 tick takes a small batch of answered, finished calls still pending, fetches the transcript and
 runs the existing call extraction.
 
@@ -11,7 +11,7 @@ runs the existing call extraction.
 - Extraction error: the call is marked ``failed`` and never retried (each try is a Claude call).
 - Still pending ``TRANSCRIPT_MAX_WAIT_SECONDS`` after the call ended: marked ``missing``.
 
-The single-poller advisory lock guarantees one consumer, so no row locks are held across the
+The transcript worker's advisory lock guarantees one consumer, so no row locks are held across the
 HTTP fetch and the Claude call.
 """
 from __future__ import annotations
@@ -163,7 +163,7 @@ def ingest_calls(calls: Sequence[PendingCall], dialer: TranscriptSource, store: 
 
 def run_transcript_ingest(db, dialer: TranscriptSource, *, now: datetime, limit: int,
                           extract: Optional[ExtractCall] = None) -> Counter:
-    """One poller tick: expire stale calls, then ingest one batch. The caller commits the rest."""
+    """One worker cycle: expire stale calls, then ingest one batch. The caller commits the rest."""
     if extract is None:
         from src.lending.call_extraction_store import extract_and_store_call as extract
 

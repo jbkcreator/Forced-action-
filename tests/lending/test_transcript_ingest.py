@@ -1,4 +1,4 @@
-"""T-12 audio fallback: fetch each finished call's transcript and extract it, inside the CDR poller."""
+"""T-12 audio fallback: fetch each finished call's transcript and extract it, in the transcript worker."""
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -7,7 +7,6 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from config import lending_dispositions as cfg
-from src.lending import cdr_poller
 from src.lending.dialer_port import DialerRequestError
 from src.lending.transcript_ingest import DbCallStore, PendingCall, ingest_calls
 
@@ -140,23 +139,6 @@ def test_db_store_extraction_failure_rolls_back_only_its_savepoint():
     with pytest.raises(RuntimeError):
         store.extract_and_mark_done(_call(), "agent: hi", now=NOW)
     assert "rollback_savepoint" in db.events and "commit" not in db.events
-
-
-def test_transcript_step_does_nothing_while_the_switch_is_off(monkeypatch):
-    monkeypatch.setattr(cdr_poller, "get_settings",
-                        lambda: type("S", (), {"lending_transcript_ingest_enabled": False})())
-    monkeypatch.setattr(cdr_poller, "get_dialer", lambda: pytest.fail("dialer must not be built"))
-    cdr_poller.transcript_step()
-
-
-def test_transcript_step_never_raises(monkeypatch):
-    monkeypatch.setattr(cdr_poller, "get_settings",
-                        lambda: type("S", (), {"lending_transcript_ingest_enabled": True})())
-
-    def boom():
-        raise RuntimeError("x")
-    monkeypatch.setattr(cdr_poller, "get_dialer", boom)
-    cdr_poller.transcript_step()
 
 
 def test_pending_query_order_retry_wait_and_expiry(lending_db):

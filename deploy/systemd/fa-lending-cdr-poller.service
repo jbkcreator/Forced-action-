@@ -1,5 +1,5 @@
 [Unit]
-Description=Forced Action — Lending BatchDialer CDR poller (5 s fast poll, 2 min rescan, transcript ingest)
+Description=Forced Action — Lending BatchDialer CDR poller (5 s fast poll, 2 min rescan)
 After=network.target postgresql.service
 
 [Service]
