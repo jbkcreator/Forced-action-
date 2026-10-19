@@ -1142,6 +1142,8 @@ class AppSettings(BaseSettings):
 	# Email fallback (B4) stays off until hello@nextdeallending.com has a sender behind it
 	# (Porkbun DNS + Google Workspace are not provisioned). Off = recorded as skipped, never "sent".
 	booking_reminder_email_enabled: bool = Field(default=False, env="BOOKING_REMINDER_EMAIL_ENABLED")
+	# Runbook §4.5: reschedule link added to the 90-minute text and email. Unset = approved wording unchanged.
+	lending_reschedule_url: Optional[str] = Field(default=None, env="LENDING_RESCHEDULE_URL")
 	# Verified GHL sending address for those emails (hello@nextdeallending.com). Unset = no email sender.
 	lending_ghl_email_from: Optional[str] = Field(default=None, env="LENDING_GHL_EMAIL_FROM")
 	# Logs the key paths (never values) of each incoming lending GHL webhook, to confirm the real field names.

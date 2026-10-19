@@ -186,7 +186,8 @@ def _send_text(db, row: Mapping[str, Any], *, now: datetime, sender: Optional[Te
             return "skipped_quiet_hours"
         _requeue(db, row, opens, "deferred_quiet_hours", count_attempt=False)
         return "deferred_quiet_hours"
-    body = render_text(kind, first_name=row["first_name"], slot_start_utc=slot, property_address=row["property_address"], number=number)
+    body = render_text(kind, first_name=row["first_name"], slot_start_utc=slot, property_address=row["property_address"],
+                       number=number, reschedule_url=get_settings().lending_reschedule_url)
     started[0] = True
     try:
         message_id = sender(row["contact_phone"], body, row["first_name"], deadline=slot)
@@ -213,7 +214,8 @@ def _send_email(db, row: Mapping[str, Any], *, now: datetime, sender: Optional[E
         _record(db, rid, "skipped", "not_configured", CHANNEL_EMAIL)
         return "skipped_not_configured"
     subject, body = render_email(row["kind"], first_name=row["first_name"], slot_start_utc=row["slot_start_utc"],
-                                 property_address=row["property_address"], number=number)
+                                 property_address=row["property_address"], number=number,
+                                 reschedule_url=get_settings().lending_reschedule_url)
     started[0] = True
     try:
         message_id = sender(row["contact_email"], subject, body, phone=row["contact_phone"],

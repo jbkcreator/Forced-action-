@@ -59,6 +59,8 @@ from config.lending_reminders import (
     NIGHT_BEFORE_NO_ADDRESS,
     NIGHT_BEFORE_WITH_ADDRESS,
     NINETY_MIN_NO_ADDRESS,
+    NINETY_MIN_RESCHEDULE_EMAIL,
+    NINETY_MIN_RESCHEDULE_TEXT,
     NINETY_MIN_SECONDS,
     NINETY_MIN_WITH_ADDRESS,
     STATUS_CANCELLED,
@@ -368,18 +370,29 @@ def _fields(first_name: Optional[str], slot_start_utc: datetime, property_addres
 
 
 def render_text(kind: str, *, first_name: Optional[str], slot_start_utc: datetime,
-                property_address: Optional[str] = None, number: Optional[str] = None) -> str:
+                property_address: Optional[str] = None, number: Optional[str] = None,
+                reschedule_url: Optional[str] = None) -> str:
     """The client-approved text for ``kind``; never longer than MAX_TEXT_CHARS. ``number`` (E.164) is the
-    text-back number the 90-minute wording asks the borrower to call; required for that kind."""
+    text-back number the 90-minute wording asks the borrower to call; required for that kind.
+    ``reschedule_url`` is appended to the 90-minute text only, and left off if it would not fit."""
     fields = _fields(first_name, slot_start_utc, property_address, number, kind)
-    template = _TEXT[kind][bool(fields["property_address"])]
-    return template.format(**fields)[:MAX_TEXT_CHARS]
+    body = _TEXT[kind][bool(fields["property_address"])].format(**fields)
+    if kind == KIND_NINETY_MIN and reschedule_url:
+        with_link = body + NINETY_MIN_RESCHEDULE_TEXT.format(url=reschedule_url)
+        if len(with_link) <= MAX_TEXT_CHARS:
+            return with_link
+        logger.warning("[booking-messages] reschedule link left off: text would exceed %d chars", MAX_TEXT_CHARS)
+    return body[:MAX_TEXT_CHARS]
 
 
 def render_email(kind: str, *, first_name: Optional[str], slot_start_utc: datetime,
-                 property_address: Optional[str] = None, number: Optional[str] = None) -> tuple[str, str]:
+                 property_address: Optional[str] = None, number: Optional[str] = None,
+                 reschedule_url: Optional[str] = None) -> tuple[str, str]:
     fields = _fields(first_name, slot_start_utc, property_address, number, kind)
     body = _EMAIL[kind][bool(fields["property_address"])].format(**fields)
+    if kind == KIND_NINETY_MIN and reschedule_url:
+        text_part, sep, signature = body.rpartition("\n\n")
+        body = f"{text_part}{sep}{NINETY_MIN_RESCHEDULE_EMAIL.format(url=reschedule_url)}{sep}{signature}"
     return _EMAIL_SUBJECT[kind], body
 
 

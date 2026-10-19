@@ -235,3 +235,52 @@ def test_confirmation_call_due_dates_follow_the_client_rules(db):
     fri_night = datetime(2026, 10, 10, 2, 0, tzinfo=timezone.utc)                      # Fri 10 pm ET
     assert str(due_date_for("ai", mon_call, fri_night)) == "2026-10-12"                # Mon, the call day: never later
     assert str(due_date_for("ai", wed_call, datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc))) == "2026-10-07"  # same-day booking
+
+
+# ── T-26: Runbook §4.5 verification + optional reschedule link ─────────────────
+
+URL = "https://link.nextdeallending.com/reschedule"
+NINETY_TODAY = ("Hi Jane, your call with Josh Kantor, Loan Officer, is in about 90 minutes, at 10:00 am ET. "
+                "Call us at (813) 555-0100 if anything's come up.")
+
+
+def test_without_reschedule_url_the_ninety_minute_text_and_email_are_unchanged():
+    assert render_text("ninety_min", first_name="Jane", slot_start_utc=SLOT, number="+18135550100",
+                       reschedule_url=None) == NINETY_TODAY
+    assert render_email("ninety_min", first_name="Jane", slot_start_utc=SLOT, number="+18135550100",
+                        reschedule_url=None) == render_email("ninety_min", first_name="Jane", slot_start_utc=SLOT,
+                                                              number="+18135550100")
+
+
+def test_reschedule_url_is_added_to_the_ninety_minute_text_with_callback_number():
+    body = render_text("ninety_min", first_name="Jane", slot_start_utc=SLOT, number="+18135550100", reschedule_url=URL)
+    assert body == NINETY_TODAY + f" Reschedule: {URL}"
+    assert "(813) 555-0100" in body and len(body) <= MAX_TEXT_CHARS
+
+
+def test_reschedule_url_is_added_to_the_ninety_minute_email_before_the_signature():
+    _, body = render_email("ninety_min", first_name="Jane", slot_start_utc=SLOT, number="+18135550100",
+                           reschedule_url=URL)
+    assert f"To reschedule: {URL}\n\nJosh Kantor, Loan Officer" in body
+    assert "Call us at (813) 555-0100" in body
+
+
+@pytest.mark.parametrize("kind", ["confirmation", "night_before", "gate_fail"])
+def test_reschedule_url_only_touches_the_ninety_minute_message(kind):
+    plain = render_text(kind, first_name="Jane", slot_start_utc=SLOT, number="+18135550100")
+    assert render_text(kind, first_name="Jane", slot_start_utc=SLOT, number="+18135550100", reschedule_url=URL) == plain
+
+
+def test_a_link_that_would_overflow_the_text_is_left_off_rather_than_cut():
+    long_url = "https://example.com/" + "x" * MAX_TEXT_CHARS
+    body = render_text("ninety_min", first_name="Jane", slot_start_utc=SLOT, number="+18135550100", reschedule_url=long_url)
+    assert body == NINETY_TODAY
+
+
+def test_runbook_timing_day_before_6pm_et_and_ninety_minutes_before_slot():
+    """Runbook §4.5: day-before at 6:00 PM ET the evening prior (matches); second reminder is built at
+    90 minutes (client-approved wording), not the Runbook's 60 (open Q-20)."""
+    from config.lending_reminders import NINETY_MIN_SECONDS
+    sent = night_before_send_at(SLOT).astimezone(ET)
+    assert (sent.date(), sent.hour, sent.minute) == ((SLOT.astimezone(ET) - timedelta(days=1)).date(), 18, 0)
+    assert NINETY_MIN_SECONDS == 90 * 60
