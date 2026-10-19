@@ -31,6 +31,7 @@ from src.api.deps import get_db
 from src.api.lending_ghl_router import _verify_secret
 from src.lending.booking_messages import cancel_by_provider_event, find_ai_booking, handle_booking_confirmed, handle_booking_gate_failed, handle_nurture_entry
 from src.lending.confirmation_tasks import AI_BOOKER, complete_confirmation_task
+from src.lending.cora_inbox import add_to_inbox_in_own_session
 from src.lending.ghl_appointments import get_appointment_canceller
 from src.lending.payload_shape import log_shape
 from src.lending.reply_guard import slack_poster
@@ -242,13 +243,20 @@ def _release_slot(appointment_id: str) -> Optional[bool]:
         return None
     released = canceller(appointment_id)
     if not released:
+        posted = False
         poster = slack_poster()
         if poster is not None:
             try:
                 poster(f"*Could not release a GHL slot after a failed check*\nAppointment {appointment_id}: cancel it by hand "
                        "in GHL (Calendars). The contact has already been messaged and the reminders cancelled.")
+                posted = True
             except Exception as exc:
                 logger.error("[booking-webhook] could not post the unreleased-slot alert (%s)", type(exc).__name__)
+        add_to_inbox_in_own_session(
+            event_type="slot_release_failed", dedup_key=appointment_id, target_channel="replies",
+            channel_posted=posted, summary="GHL slot not released after a failed check: cancel it by hand",
+            payload={"ghl_appointment_id": appointment_id},
+        )
     return released
 
 
