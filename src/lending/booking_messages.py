@@ -369,6 +369,11 @@ def _fields(first_name: Optional[str], slot_start_utc: datetime, property_addres
     }
 
 
+def reschedule_link_applies(kind: str, reschedule_url: Optional[str]) -> bool:
+    """Runbook §4.5: only the reminder before the call carries the reschedule link, and only once one is set."""
+    return kind == KIND_NINETY_MIN and bool(reschedule_url)
+
+
 def render_text(kind: str, *, first_name: Optional[str], slot_start_utc: datetime,
                 property_address: Optional[str] = None, number: Optional[str] = None,
                 reschedule_url: Optional[str] = None) -> str:
@@ -377,7 +382,7 @@ def render_text(kind: str, *, first_name: Optional[str], slot_start_utc: datetim
     ``reschedule_url`` is appended to the 90-minute text only, and left off if it would not fit."""
     fields = _fields(first_name, slot_start_utc, property_address, number, kind)
     body = _TEXT[kind][bool(fields["property_address"])].format(**fields)
-    if kind == KIND_NINETY_MIN and reschedule_url:
+    if reschedule_link_applies(kind, reschedule_url):
         with_link = body + NINETY_MIN_RESCHEDULE_TEXT.format(url=reschedule_url)
         if len(with_link) <= MAX_TEXT_CHARS:
             return with_link
@@ -390,9 +395,11 @@ def render_email(kind: str, *, first_name: Optional[str], slot_start_utc: dateti
                  reschedule_url: Optional[str] = None) -> tuple[str, str]:
     fields = _fields(first_name, slot_start_utc, property_address, number, kind)
     body = _EMAIL[kind][bool(fields["property_address"])].format(**fields)
-    if kind == KIND_NINETY_MIN and reschedule_url:
+    if reschedule_link_applies(kind, reschedule_url):
+        link = NINETY_MIN_RESCHEDULE_EMAIL.format(url=reschedule_url)
         text_part, sep, signature = body.rpartition("\n\n")
-        body = f"{text_part}{sep}{NINETY_MIN_RESCHEDULE_EMAIL.format(url=reschedule_url)}{sep}{signature}"
+        # The link goes just above the signature paragraph; with no separate signature, last on its own.
+        body = f"{text_part}\n\n{link}\n\n{signature}" if sep else f"{body}\n\n{link}"
     return _EMAIL_SUBJECT[kind], body
 
 

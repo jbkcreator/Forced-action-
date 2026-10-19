@@ -284,3 +284,19 @@ def test_runbook_timing_day_before_6pm_et_and_ninety_minutes_before_slot():
     sent = night_before_send_at(SLOT).astimezone(ET)
     assert (sent.date(), sent.hour, sent.minute) == ((SLOT.astimezone(ET) - timedelta(days=1)).date(), 18, 0)
     assert NINETY_MIN_SECONDS == 90 * 60
+
+
+def test_reschedule_link_applies_only_to_the_ninety_minute_kind_with_a_url():
+    from src.lending.booking_messages import reschedule_link_applies
+    assert reschedule_link_applies("ninety_min", URL) is True
+    assert reschedule_link_applies("ninety_min", None) is False
+    assert reschedule_link_applies("night_before", URL) is False
+
+
+def test_email_without_a_signature_paragraph_gets_the_link_as_its_own_last_paragraph(monkeypatch):
+    from src.lending import booking_messages as bm
+    plain = "Hi {first_name}, your call is at {time} ET."
+    monkeypatch.setitem(bm._EMAIL, "ninety_min", {False: plain, True: plain})
+    _, body = bm.render_email("ninety_min", first_name="Jane", slot_start_utc=SLOT, number="+18135550100",
+                              reschedule_url=URL)
+    assert body.endswith(f"ET.\n\nTo reschedule: {URL}")

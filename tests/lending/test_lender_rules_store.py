@@ -173,7 +173,8 @@ def test_the_table_is_used_when_the_flag_is_on_and_the_database_answers(monkeypa
         yield object()
 
     monkeypatch.setattr(store, "get_settings", lambda: _On())
-    monkeypatch.setattr("src.core.database.get_db_context", _db)
+    from src.core import database
+    monkeypatch.setattr(database, "get_db_context", _db)
     monkeypatch.setattr(store, "load_matrix", lambda session: sentinel)
     assert current_matrix() is sentinel
 

@@ -10,16 +10,20 @@ The ranking and codes are internal output; the letter PDF is unchanged.
 ``--send-to CONTACT_ID`` also emails the first qualifying letter through the live Next Deal Lending GHL
 account to that contact. Use only a test contact whose email you own.
 
-    PYTHONPATH=. python scripts/lending_prequal_demo.py --out demo_out
-    PYTHONPATH=. python scripts/lending_prequal_demo.py --out demo_out --send-to <test contact id>
+    python scripts/lending_prequal_demo.py --out demo_out
+    python scripts/lending_prequal_demo.py --out demo_out --send-to <test contact id>
 """
 from __future__ import annotations
 
 import argparse
 import json
 import logging
+import os
+import sys
 from dataclasses import asdict
 from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config.settings import get_settings
 from src.lending.lender_rules_store import current_matrix
@@ -54,7 +58,7 @@ def main(argv: list[str] | None = None) -> None:
             (out / f"{profile.name}.pdf").write_bytes(pdf)
             entry["letter"] = {"pdf": f"{profile.name}.pdf", "range_low": ctx["range_low"], "range_high": ctx["range_high"]}
             logger.info("%s: letter %s - %s; %d ranked lender(s), top %s (%s)", profile.name, ctx["range_low"],
-                        ctx["range_high"], len(outcome.ranking), outcome.ranking[0]["lender_name"], outcome.ranking[0]["status"])
+                        ctx["range_high"], len(outcome.ranking), outcome.ranking[0].lender_name, outcome.ranking[0].status)
             first_pdf = first_pdf or pdf
         report.append(entry)
     (out / "test2_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")

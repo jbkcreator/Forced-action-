@@ -38,7 +38,13 @@ from config.lending_reminders import (
     TIMEZONE,
 )
 from config.settings import get_settings
-from src.lending.booking_messages import next_text_window, render_email, render_text, text_window_open
+from src.lending.booking_messages import (
+    next_text_window,
+    render_email,
+    render_text,
+    reschedule_link_applies,
+    text_window_open,
+)
 from src.lending.compliance import phone_hash
 from src.lending.consent import has_text_consent
 from src.lending.db import lending_session
@@ -46,6 +52,9 @@ from src.lending.ghl_email import get_email_sender
 from src.lending.ghl_sms import GhlSmsError, get_sender, texting_number
 
 logger = logging.getLogger(__name__)
+
+# Recorded on a sent 90-minute text whose reschedule link was left off because it would not fit.
+REASON_RESCHEDULE_LINK_OMITTED = "reschedule_link_omitted_length"
 
 
 
@@ -137,7 +146,7 @@ def _requeue(db, row: Mapping[str, Any], send_at: datetime, reason: str, *, coun
 
 def _decide(db, row: Mapping[str, Any], *, now: datetime, text_sender: Optional[TextSender],
             email_sender: Optional[EmailSender], text_enabled: bool, email_enabled: bool,
-            number: Optional[str], started: list[bool]) -> str:
+            number: Optional[str], started: list[bool], reschedule_url: Optional[str] = None) -> str:
     """Run the gates and, when they pass, the send. Records the outcome; returns its label."""
     rid, phone, email, kind = row["id"], row["contact_phone"], row["contact_email"], row["kind"]
     slot = row["slot_start_utc"]
@@ -152,9 +161,11 @@ def _decide(db, row: Mapping[str, Any], *, now: datetime, text_sender: Optional[
         return "skipped_suppressed"
 
     if phone and has_text_consent(db, phone):
-        return _send_text(db, row, now=now, sender=text_sender, enabled=text_enabled, number=number, started=started)
+        return _send_text(db, row, now=now, sender=text_sender, enabled=text_enabled, number=number, started=started,
+                          reschedule_url=reschedule_url)
     if email:
-        return _send_email(db, row, now=now, sender=email_sender, enabled=email_enabled, number=number, started=started)
+        return _send_email(db, row, now=now, sender=email_sender, enabled=email_enabled, number=number, started=started,
+                           reschedule_url=reschedule_url)
     _record(db, rid, "skipped", "no_consent")
     return "skipped_no_consent"
 
@@ -169,7 +180,7 @@ def _too_late(row: Mapping[str, Any], now: datetime) -> bool:
 
 
 def _send_text(db, row: Mapping[str, Any], *, now: datetime, sender: Optional[TextSender], enabled: bool,
-               number: Optional[str], started: list[bool]) -> str:
+               number: Optional[str], started: list[bool], reschedule_url: Optional[str] = None) -> str:
     rid, kind, slot = row["id"], row["kind"], row["slot_start_utc"]
     if not enabled:
         _record(db, rid, "skipped", "text_not_enabled", CHANNEL_TEXT)
@@ -187,7 +198,8 @@ def _send_text(db, row: Mapping[str, Any], *, now: datetime, sender: Optional[Te
         _requeue(db, row, opens, "deferred_quiet_hours", count_attempt=False)
         return "deferred_quiet_hours"
     body = render_text(kind, first_name=row["first_name"], slot_start_utc=slot, property_address=row["property_address"],
-                       number=number, reschedule_url=get_settings().lending_reschedule_url)
+                       number=number, reschedule_url=reschedule_url)
+    link_omitted = reschedule_link_applies(kind, reschedule_url) and reschedule_url not in body
     started[0] = True
     try:
         message_id = sender(row["contact_phone"], body, row["first_name"], deadline=slot)
@@ -200,12 +212,12 @@ def _send_text(db, row: Mapping[str, Any], *, now: datetime, sender: Optional[Te
             return "failed"
         _requeue(db, row, now + timedelta(seconds=RETRY_DELAY_SECONDS), "send_failed_retry", count_attempt=True)
         return "retry"
-    _record(db, rid, "sent", None, CHANNEL_TEXT, message_id)
+    _record(db, rid, "sent", REASON_RESCHEDULE_LINK_OMITTED if link_omitted else None, CHANNEL_TEXT, message_id)
     return "sent"
 
 
 def _send_email(db, row: Mapping[str, Any], *, now: datetime, sender: Optional[EmailSender], enabled: bool,
-                number: Optional[str], started: list[bool]) -> str:
+                number: Optional[str], started: list[bool], reschedule_url: Optional[str] = None) -> str:
     rid = row["id"]
     if not enabled:
         _record(db, rid, "skipped", "email_not_enabled", CHANNEL_EMAIL)
@@ -215,7 +227,7 @@ def _send_email(db, row: Mapping[str, Any], *, now: datetime, sender: Optional[E
         return "skipped_not_configured"
     subject, body = render_email(row["kind"], first_name=row["first_name"], slot_start_utc=row["slot_start_utc"],
                                  property_address=row["property_address"], number=number,
-                                 reschedule_url=get_settings().lending_reschedule_url)
+                                 reschedule_url=reschedule_url)
     started[0] = True
     try:
         message_id = sender(row["contact_email"], subject, body, phone=row["contact_phone"],
@@ -235,7 +247,8 @@ def _send_email(db, row: Mapping[str, Any], *, now: datetime, sender: Optional[E
 
 def process_due(db, *, text_sender: Optional[TextSender], email_sender: Optional[EmailSender] = None,
                 text_enabled: bool, email_enabled: bool, number: Optional[str] = None,
-                now: Optional[datetime] = None, limit: int = BATCH_SIZE, clock: Callable[[], datetime] = _utcnow) -> dict[str, int]:
+                now: Optional[datetime] = None, limit: int = BATCH_SIZE, clock: Callable[[], datetime] = _utcnow,
+                reschedule_url: Optional[str] = None) -> dict[str, int]:
     """One cycle. Commits: the claim first (so a crash cannot make another worker send the same row),
     then each row's outcome on its own."""
     db.execute(_STALE, {"cutoff": (now or clock()) - timedelta(seconds=STALE_SEND_SECONDS)})
@@ -246,7 +259,8 @@ def process_due(db, *, text_sender: Optional[TextSender], email_sender: Optional
         started = [False]
         try:
             outcome = _decide(db, row, now=now or clock(), text_sender=text_sender, email_sender=email_sender,
-                              text_enabled=text_enabled, email_enabled=email_enabled, number=number, started=started)
+                              text_enabled=text_enabled, email_enabled=email_enabled, number=number, started=started,
+                              reschedule_url=reschedule_url)
             db.commit()
         except Exception as exc:  # class only: SQL / HTTP errors can embed phone numbers
             logger.error("[reminder-worker] row %s crashed (%s)", row["id"], type(exc).__name__)
@@ -278,7 +292,8 @@ def run_cycle(*, now: Optional[datetime] = None) -> dict[str, int]:
     with lending_session() as db:
         return process_due(db, text_sender=get_sender(), email_sender=get_email_sender(),
                            text_enabled=settings.booking_reminder_text_enabled,
-                           email_enabled=settings.booking_reminder_email_enabled, number=texting_number(), now=now)
+                           email_enabled=settings.booking_reminder_email_enabled, number=texting_number(), now=now,
+                           reschedule_url=settings.lending_reschedule_url)
 
 
 _running = True
