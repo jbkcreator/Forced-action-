@@ -1,8 +1,16 @@
 """Cora's 7:30 AM morning digest in her own channel (Runbook § 3, Line 4).
 
-Cora's minute sweep calls ``post_morning_digest``. From 7:30 to noon ET it posts one digest a day: drafts
-waiting for approval, calls booked for today, web leads from the last 24 hours, open inbox items and whether
-Cora is halted. ``lending.cora_morning_digests`` holds one row per ET day, written in the same transaction as
+Content follows the Chunk 2 spec, Task E5 (Morning Brief): "Josh's morning operational summary, highlighting
+overdue actions, new high-score leads, and today's calling queues". Cora's minute sweep calls
+``post_morning_digest``. From 7:30 to noon ET it posts one digest a day:
+
+  * Overdue actions: drafts waiting for approval, confirmation calls due today or earlier, open inbox items.
+  * New high-score leads (last 24 hours): LendingFlow leads, closer-priority and FULL_MACHINE first (the intake
+    classification that exists today; the Chunk 2 A0 1-10 intake score replaces it when built), plus web leads.
+  * Today's calling queues: calls booked for today and the active dialer contacts per campaign.
+  * Whether Cora is halted.
+
+ ``lending.cora_morning_digests`` holds one row per ET day, written in the same transaction as
 the post, so a restart or a second sweep never posts twice and a failed post is retried next minute. A Cora
 started after noon skips that day rather than posting a stale morning digest.
 
@@ -43,6 +51,24 @@ _PENDING_DRAFTS = text("""
     SELECT action_id, tool_name, contact_ref, count(*) OVER () AS total
       FROM lending.pending_actions WHERE status = 'pending' ORDER BY created_at LIMIT :limit
 """)
+_DUE_CONFIRMATIONS = text("""
+    SELECT booking_ref, due_date, count(*) OVER () AS total FROM lending.confirmation_tasks
+     WHERE completed_at IS NULL AND cancelled_at IS NULL AND due_date <= :day ORDER BY due_date LIMIT :limit
+""")
+_OPEN_INBOX = text("SELECT count(*) FROM lending.cora_inbox WHERE status IN ('new', 'surfaced')")
+_NEW_LENDINGFLOW_LEADS = text("""
+    SELECT l.id, l.first_name, l.loan_type, l.loan_amount_range, l.property_city, e.routing_tag,
+           coalesce(e.closer_priority, false) AS closer_priority, count(*) OVER () AS total
+      FROM lending.lendingflow_leads l LEFT JOIN lending.lendingflow_enrichment e ON e.lead_id = l.id
+     WHERE l.received_at >= :since AND NOT l.suppressed
+     ORDER BY coalesce(e.closer_priority, false) DESC, coalesce(e.routing_tag = 'FULL_MACHINE', false) DESC,
+              l.received_at DESC
+     LIMIT :limit
+""")
+_WEB_LEADS = text("""
+    SELECT count(*) AS total, count(*) FILTER (WHERE ghl_status IN ('pending', 'failed')) AS not_in_ghl
+      FROM lending.web_leads WHERE received_at >= :since
+""")
 _TODAYS_CALLS = text("""
     SELECT booking_ref, max(first_name) AS first_name, max(booked_by) AS booked_by,
            max(slot_start_utc) AS slot_start
@@ -50,11 +76,11 @@ _TODAYS_CALLS = text("""
      WHERE slot_start_utc >= :start AND slot_start_utc < :end
      GROUP BY booking_ref ORDER BY slot_start LIMIT :limit
 """)
-_WEB_LEADS = text("""
-    SELECT count(*) AS total, count(*) FILTER (WHERE ghl_status IN ('pending', 'failed')) AS not_in_ghl
-      FROM lending.web_leads WHERE received_at >= :since
+_DIALER_QUEUES = text("""
+    SELECT coalesce(campaign_tag, 'untagged') AS campaign, count(*) AS contacts
+      FROM lending.dialer_load_records WHERE active
+     GROUP BY coalesce(campaign_tag, 'untagged') ORDER BY contacts DESC
 """)
-_OPEN_INBOX = text("SELECT count(*) FROM lending.cora_inbox WHERE status IN ('new', 'surfaced')")
 
 
 @dataclass(frozen=True)
@@ -63,10 +89,23 @@ class DigestData:
     halt_reason: str
     pending_drafts: list[dict[str, Any]]
     pending_total: int
-    todays_calls: list[dict[str, Any]]
+    due_confirmations: list[dict[str, Any]]
+    due_confirmations_total: int
+    open_inbox: int
+    new_leads: list[dict[str, Any]]
+    new_leads_total: int
     web_leads: int
     web_leads_not_in_ghl: int
-    open_inbox: int
+    todays_calls: list[dict[str, Any]]
+    dialer_queues: list[dict[str, Any]]
+
+
+def _rows(db: Session, statement, params: dict[str, Any]) -> list[dict[str, Any]]:
+    return [dict(row) for row in db.execute(statement, params).mappings()]
+
+
+def _total(rows: list[dict[str, Any]]) -> int:
+    return int(rows[0]["total"]) if rows else 0
 
 
 def digest_day(now: datetime) -> Optional[date]:
@@ -77,15 +116,20 @@ def digest_day(now: datetime) -> Optional[date]:
 
 def gather(db: Session, day: date, now: datetime, *, halted: bool, halt_reason: str) -> DigestData:
     start = datetime.combine(day, time.min, ET).astimezone(timezone.utc)
-    drafts = [dict(row) for row in db.execute(_PENDING_DRAFTS, {"limit": LIST_LIMIT}).mappings()]
-    calls = [dict(row) for row in db.execute(
-        _TODAYS_CALLS, {"start": start, "end": start + timedelta(days=1), "limit": LIST_LIMIT}).mappings()]
-    leads = db.execute(_WEB_LEADS, {"since": now - timedelta(hours=24)}).mappings().one()
+    since = now - timedelta(hours=24)
+    drafts = _rows(db, _PENDING_DRAFTS, {"limit": LIST_LIMIT})
+    confirmations = _rows(db, _DUE_CONFIRMATIONS, {"day": day, "limit": LIST_LIMIT})
+    leads = _rows(db, _NEW_LENDINGFLOW_LEADS, {"since": since, "limit": LIST_LIMIT})
+    web = db.execute(_WEB_LEADS, {"since": since}).mappings().one()
+    calls = _rows(db, _TODAYS_CALLS, {"start": start, "end": start + timedelta(days=1), "limit": LIST_LIMIT})
     return DigestData(
-        halted=halted, halt_reason=halt_reason, pending_drafts=drafts,
-        pending_total=int(drafts[0]["total"]) if drafts else 0, todays_calls=calls,
-        web_leads=int(leads["total"]), web_leads_not_in_ghl=int(leads["not_in_ghl"]),
+        halted=halted, halt_reason=halt_reason,
+        pending_drafts=drafts, pending_total=_total(drafts),
+        due_confirmations=confirmations, due_confirmations_total=_total(confirmations),
         open_inbox=int(db.execute(_OPEN_INBOX).scalar() or 0),
+        new_leads=leads, new_leads_total=_total(leads),
+        web_leads=int(web["total"]), web_leads_not_in_ghl=int(web["not_in_ghl"]),
+        todays_calls=calls, dialer_queues=_rows(db, _DIALER_QUEUES, {}),
     )
 
 
@@ -93,23 +137,38 @@ def _more(shown: int, total: int) -> list[str]:
     return [f"…and {total - shown} more"] if total > shown else []
 
 
+def _lead_line(lead: dict[str, Any]) -> str:
+    flag = ":fire: " if lead["closer_priority"] else (":star: " if lead["routing_tag"] == "FULL_MACHINE" else "")
+    details = ", ".join(str(v) for v in (lead["loan_type"], lead["loan_amount_range"], lead["property_city"]) if v)
+    return f"{flag}lendingflow_lead:{lead['id']} {lead['first_name'] or 'lead'}" + (f" ({details})" if details else "")
+
+
 def render(day: date, data: DigestData) -> tuple[str, list[dict]]:
     """The digest's fallback text and Block Kit blocks."""
     status = (f":octagonal_sign: Halted ({data.halt_reason or 'no reason given'}). Approved drafts will not send "
               "until an approver says `resume`." if data.halted else ":large_green_circle: Running. Approved drafts send.")
-    drafts = [f"#{d['action_id']} {d['tool_name']}" + (f" for {d['contact_ref']}" if d["contact_ref"] else "")
-              for d in data.pending_drafts] + _more(len(data.pending_drafts), data.pending_total)
+    overdue = (
+        [f"Draft #{d['action_id']} {d['tool_name']}" + (f" for {d['contact_ref']}" if d["contact_ref"] else "")
+         + " waiting for approval" for d in data.pending_drafts]
+        + _more(len(data.pending_drafts), data.pending_total)
+        + [f"Confirmation call for booking {c['booking_ref']} due {c['due_date']}" for c in data.due_confirmations]
+        + _more(len(data.due_confirmations), data.due_confirmations_total)
+        + ([f"{data.open_inbox} open inbox item(s); reply in the inbox digest thread to route or dismiss"]
+           if data.open_inbox else [])
+    )
+    leads = [_lead_line(lead) for lead in data.new_leads] + _more(len(data.new_leads), data.new_leads_total)
+    if data.web_leads:
+        leads.append(f"{data.web_leads} web lead(s)" + (
+            f", {data.web_leads_not_in_ghl} not in GHL yet" if data.web_leads_not_in_ghl else ""))
     calls = [f"{c['slot_start'].astimezone(ET):%I:%M %p} {c['first_name'] or 'lead'} ({c['booked_by'] or 'unknown'})"
              for c in data.todays_calls]
-    leads = [f"{data.web_leads} new"] + (
-        [f"{data.web_leads_not_in_ghl} not in GHL yet"] if data.web_leads_not_in_ghl else []) if data.web_leads else []
-    inbox = [f"{data.open_inbox} open item(s); reply in the inbox digest thread to route or dismiss"] if data.open_inbox else []
+    queues = [f"Booked calls today: {len(data.todays_calls)}"] + calls + [
+        f"Dialer {q['campaign']}: {q['contacts']} contact(s) loaded" for q in data.dialer_queues]
     sections = [
         BriefSection("Cora", [status]),
-        BriefSection(f"Drafts waiting for approval ({data.pending_total})", drafts, "No drafts waiting."),
-        BriefSection(f"Calls booked today ({len(data.todays_calls)})", calls, "No calls booked today."),
-        BriefSection("Web leads, last 24 hours", leads, "No new web leads."),
-        BriefSection("Inbox", inbox, "Inbox is clear."),
+        BriefSection("Overdue actions", overdue, "Nothing overdue."),
+        BriefSection(f"New leads, last 24 hours ({data.new_leads_total + data.web_leads})", leads, "No new leads."),
+        BriefSection("Today's calling queues", queues),
     ]
     header = f"Good morning. Cora's digest for {day:%A %B} {day.day}"
     return header, render_brief_blocks(header, sections)
