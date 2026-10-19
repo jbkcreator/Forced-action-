@@ -18,6 +18,8 @@ from packages.agent_core.pending_actions import ActionStatus, PendingActionQueue
 from packages.agent_core.store import AgentStore
 from src.lending import cora_agent
 from src.lending.cora_tools import CoraToolkit, _Lead
+from src.lending.ghl_email import GhlEmailSender
+from src.lending.ghl_sms import GhlAccount
 from tests.agent_core.conftest import SQLITE_DDL, FakeMessages, response, text_block, tool_block
 
 JOSH, OPS, BOT = "U_JOSH", "U_OPS", "U_BOT"
@@ -46,11 +48,12 @@ def _toolkit_factory(engine, memory) -> CoraToolkit:
 
 
 class Cora:
-    def __init__(self, store: AgentStore, client: FakeMessages) -> None:
+    def __init__(self, store: AgentStore, client: FakeMessages, executors=None, send_check=None) -> None:
         self.chat = FakeChatPort(default_channel="C_CORA")
         self.client = client
         self.services = cora_agent.build_session(_config(), store, self.chat, BOT, messages_client=client,
-                                                 toolkit_factory=_toolkit_factory)
+                                                 toolkit_factory=_toolkit_factory, executors=executors,
+                                                 send_check=send_check)
         self.session, self.relay = self.services.session, self.services.relay
         self.queue = PendingActionQueue(store)
 
@@ -181,6 +184,88 @@ def test_approved_draft_is_not_sent_without_a_registered_sender(store: AgentStor
     assert cora.queue.get(1).status is ActionStatus.FAILED
     assert "Approved, not sent" in cora.chat.updates[-1]["text"]
     assert "isn't switched on yet" in cora.chat.updates[-1]["text"]
+
+
+class GhlRecorder:
+    """Stands in for the HTTP call inside GhlEmailSender: contact upsert, then the email send."""
+
+    def __init__(self, *responses) -> None:
+        self.calls, self._responses = [], list(responses)
+
+    def __call__(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
+        return self._responses.pop(0)
+
+
+class GhlResp:
+    def __init__(self, status: int, body: dict) -> None:
+        self.status_code, self._body = status, body
+
+    def json(self) -> dict:
+        return self._body
+
+
+def _email_cora(store: AgentStore, request, send_check=lambda action: None) -> Cora:
+    sender = GhlEmailSender(GhlAccount(api_key="k", location_id="loc-ndl"), "hello@nextdeallending.com", request)
+    cora = Cora(store, FakeMessages(
+        response(tool_block("toolu_e", "draft_email", {"lead_ref": "web_lead:7", "subject": "Your loan request",
+                                                       "body": "Hi Sam,\nThanks for reaching out."}),
+                 stop_reason="tool_use"),
+        response(text_block("Drafted.")),
+    ), executors={"ghl_email": cora_agent.email_executor(sender)}, send_check=send_check)
+    cora.say(JOSH, "email Sam", ts="70.0")
+    return cora
+
+
+def _approve(cora: Cora) -> None:
+    cora.session.handle_request("interactive", {
+        "type": "block_actions", "user": {"id": JOSH}, "channel": {"id": "C_CORA"},
+        "message": {"ts": cora.queue.get(1).card_ts},
+        "actions": [{"action_id": "agent_core_approve", "value": "1"}]}, "env-e")
+
+
+def test_approved_email_is_sent_through_ghl_exactly_as_approved(store: AgentStore) -> None:
+    request = GhlRecorder(GhlResp(200, {"contact": {"id": "ct1"}}), GhlResp(201, {"messageId": "m-77"}))
+    cora = _email_cora(store, request)
+    assert cora.queue.get(1).status is ActionStatus.PENDING and request.calls == []
+
+    _approve(cora)
+
+    action = cora.queue.get(1)
+    assert action.status is ActionStatus.SENT and action.provider_ref == "m-77"
+    send = request.calls[1][2]["json"]
+    assert send["subject"] == "Your loan request" and send["emailFrom"] == "hello@nextdeallending.com"
+    assert send["html"] == "Hi Sam,<br>Thanks for reaching out."
+    assert request.calls[0][2]["json"]["email"] == "sam@example.com"
+    assert request.calls[0][2]["json"]["phone"] == "+17275550100"
+    assert "Approved, not sent" not in cora.chat.updates[-1]["text"]
+
+
+def test_rejected_email_is_never_sent(store: AgentStore) -> None:
+    request = GhlRecorder()
+    cora = _email_cora(store, request)
+    cora.session.handle_request("interactive", {
+        "type": "block_actions", "user": {"id": JOSH}, "channel": {"id": "C_CORA"},
+        "message": {"ts": cora.queue.get(1).card_ts},
+        "actions": [{"action_id": "agent_core_reject", "value": "1"}]}, "env-r")
+    cora.relay.run()
+    assert request.calls == [] and cora.queue.get(1).status is not ActionStatus.SENT
+
+
+def test_suppressed_recipient_blocks_an_approved_email(store: AgentStore) -> None:
+    request = GhlRecorder()
+    cora = _email_cora(store, request, send_check=lambda action: "recipient is suppressed or marked do-not-contact")
+    _approve(cora)
+    assert cora.queue.get(1).status is ActionStatus.BLOCKED and request.calls == []
+
+
+def test_ghl_failure_marks_the_email_failed_and_does_not_retry(store: AgentStore) -> None:
+    request = GhlRecorder(GhlResp(200, {"contact": {"id": "ct1"}}), GhlResp(500, {}))
+    cora = _email_cora(store, request)
+    _approve(cora)
+    assert cora.queue.get(1).status is ActionStatus.FAILED
+    cora.relay.run()
+    assert len(request.calls) == 2
 
 
 def test_revise_reply_redrafts_and_posts_a_fresh_card(store: AgentStore) -> None:

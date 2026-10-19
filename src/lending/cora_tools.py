@@ -465,8 +465,8 @@ class CoraToolkit:
         if not lead.email:
             raise ToolInputError(f"{lead.ref} has no email address on record")
         return EgressDraft(channel="ghl_email",
-                           payload={"lead_ref": lead.ref, "to_email": lead.email, "subject": args.subject,
-                                    "body": args.body},
+                           payload={"lead_ref": lead.ref, "to_email": lead.email, "to_phone": lead.phone,
+                                    "subject": args.subject, "body": args.body},
                            summary=f"Email to {lead.name or 'lead'} <{lead.email}>: {args.subject}",
                            recipient_phone=lead.phone, recipient_email=lead.email, contact_ref=lead.ref)
 

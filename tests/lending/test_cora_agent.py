@@ -215,8 +215,20 @@ def test_missing_settings_are_named() -> None:
     assert cora_agent.build_live_services(_settings(lending_cora_approver_user_ids="")) is None
 
 
-def test_no_egress_channel_is_registered_yet() -> None:
-    assert cora_agent.EGRESS_EXECUTORS == {}
+def test_only_email_is_registered_when_the_ghl_sender_is_configured(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(cora_agent, "get_email_sender",
+                        lambda: lambda *args, **kwargs: calls.append((args, kwargs)) or "m1")
+    executors = cora_agent.build_egress_executors()
+    assert set(executors) == {"ghl_email"}
+    assert executors["ghl_email"]({"lead_ref": "web_lead:7", "to_email": "sam@example.com",
+                                   "subject": "Hello", "body": "Hi Sam"}) == "m1"
+    assert calls == [(("sam@example.com", "Hello", "Hi Sam"), {"phone": None})]
+
+
+def test_nothing_is_registered_without_a_configured_ghl_sender(monkeypatch) -> None:
+    monkeypatch.setattr(cora_agent, "get_email_sender", lambda: None)
+    assert cora_agent.build_egress_executors() == {}
 
 
 class ScriptedEngine:

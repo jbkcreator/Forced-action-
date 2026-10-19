@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import signal
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import timedelta
 from typing import Any, NamedTuple, Optional
 
@@ -43,6 +43,7 @@ from packages.agent_core.tools import ToolContext, ToolRegistry
 from src.lending.consent import has_text_consent
 from src.lending.cora_prompt import CORA_BASE_PROMPT, REVISION_PROMPT
 from src.lending.cora_tools import CoraToolkit, draft_content_check
+from src.lending.ghl_email import GhlEmailSender, get_email_sender
 from src.lending.models import LENDING_SCHEMA
 from src.services.phone_utils import normalize
 
@@ -53,9 +54,6 @@ SWEEP_SECONDS = 60
 HISTORY_FETCH_LIMIT = 40  # Slack messages fetched; build_history keeps the latest 20 turns of them
 PLACEHOLDER_TEXT = "Working on it…"
 
-# Egress channels Cora may send through once approved. Empty: drafts are approvable, but an approved
-# draft is marked failed instead of sent until the GHL senders are registered after copy/consent review.
-EGRESS_EXECUTORS: dict[str, EgressExecutor] = {}
 # Channels that deliver a text message and therefore need live text consent.
 SMS_CHANNELS = frozenset({"ghl_sms"})
 # What a revision may change, per draft channel. Recipient fields are never editable.
@@ -116,6 +114,27 @@ def make_send_check(engine: Engine) -> SendCheck:
         return None
 
     return check
+
+
+def email_executor(sender: GhlEmailSender) -> EgressExecutor:
+    """Sends an approved ``draft_email`` payload exactly as approved; returns the GHL message id."""
+
+    def send(payload: Mapping[str, Any]) -> str:
+        # The phone keeps GHL on the lead's existing contact; drafts made before it was added carry none.
+        return sender(payload["to_email"], payload["subject"], payload["body"], phone=payload.get("to_phone"))
+
+    return send
+
+
+def build_egress_executors() -> dict[str, EgressExecutor]:
+    """Channels Cora may send through once approved. Only email (``ghl_email``) is switched on, and only
+    when the GHL account and ``LENDING_GHL_EMAIL_FROM`` are configured. ``ghl_sms`` and ``ghl_stage`` stay
+    unregistered, so an approved draft there is marked failed with "not switched on yet"."""
+    sender = get_email_sender()
+    if sender is None:
+        logger.warning("[cora] GHL email sender not configured; approved emails will not be sent")
+        return {}
+    return {"ghl_email": email_executor(sender)}
 
 
 def _is_model_error(error: Exception) -> bool:
@@ -199,11 +218,13 @@ class CoraConversation:
 
 def build_session(config: AgentCoreConfig, store: AgentStore, chat: ChatPort, bot_user_id: str, *,
                   messages_client: MessagesClient, send_check: Optional[SendCheck] = None,
-                  toolkit_factory: Callable[[Engine, AgentMemory], Any] = CoraToolkit) -> CoraServices:
-    """Wire Cora. ``toolkit_factory(engine, memory)`` builds the tool set; tests swap the lead lookups."""
+                  toolkit_factory: Callable[[Engine, AgentMemory], Any] = CoraToolkit,
+                  executors: Optional[Mapping[str, EgressExecutor]] = None) -> CoraServices:
+    """Wire Cora. ``toolkit_factory(engine, memory)`` builds the tool set; tests swap the lead lookups.
+    ``executors`` defaults to none, so nothing sends unless the caller registers a channel."""
     queue = PendingActionQueue(store, default_ttl=timedelta(hours=config.pending_action_ttl_hours))
     halt = HaltSwitch(store, config.agent_name)
-    relay = Relay(queue, halt, EGRESS_EXECUTORS, send_check=send_check)
+    relay = Relay(queue, halt, executors or {}, send_check=send_check)
     memory = AgentMemory(store)
     gate = SendGate(queue, chat, config.slack_channel_id)
     toolkit = toolkit_factory(store.engine, memory)
@@ -275,7 +296,8 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
     messages_client: MessagesClient = anthropic.Anthropic(
         api_key=config.anthropic_api_key, timeout=90.0, max_retries=2).messages
     services = build_session(config, AgentStore(engine, config.db_schema), SlackChatPort(web, config.slack_channel_id),
-                             bot_user_id, messages_client=messages_client, send_check=make_send_check(engine))
+                             bot_user_id, messages_client=messages_client, send_check=make_send_check(engine),
+                             executors=build_egress_executors())
     return services._replace(web_client=web)
 
 
