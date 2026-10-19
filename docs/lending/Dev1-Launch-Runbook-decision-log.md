@@ -67,3 +67,7 @@ Sources: `Launch_Protocol_Runbook_Dev_Split.md`, `Next_Deal_Lending_Launch_Proto
 - Questions applied: none answered in the four client docs for D-1 to D-4 (Questions for Josh lines 175-178 list them as requests to LendingFlow only).
 - Assumed defaults: parser stays on the agreed test payload until David's real payload arrives.
 - Open: David's real test payload (D-1 to D-4) for Line 2; local `.env` has `LENDING_GHL_PIPELINE_ID` but no `LENDING_GHL_STAGE_LENDINGFLOW_NEW`, `LENDING_LENDINGFLOW_ENABLED` or `LENDING_LENDINGFLOW_WEBHOOK_SECRET` (server `.env` not visible from here; Q-25); the LendingFlow Postgres tests need a fully migrated DB.
+
+### 2026-10-19, correction: server settings
+- Done: user confirmed `LENDING_GHL_STAGE_LENDINGFLOW_NEW`, `LENDING_LENDINGFLOW_ENABLED` and `LENDING_LENDINGFLOW_WEBHOOK_SECRET` are set on the server (only the local `.env` lacks them). Q-25 pipeline assignment is configured on the server.
+- Open: David's real test payload (D-1 to D-4) only.
