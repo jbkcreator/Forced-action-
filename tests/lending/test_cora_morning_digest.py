@@ -177,3 +177,17 @@ def test_sweep_posts_the_digest_and_still_sends_when_it_fails() -> None:
     cora_agent.run_sweep(cora_agent.CoraServices(session=session, relay=Relay(), gate=gate,
                                                  morning_digest=broken_digest))
     assert calls == ["digest", "relay"]
+
+
+def test_a_missing_table_blanks_only_its_section(engine) -> None:
+    """A table whose migration has not run on the server must not stop the whole digest."""
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE lending.lendingflow_enrichment"))
+        conn.execute(text("INSERT INTO lending.pending_actions VALUES (4, 'draft_email', 'web_lead:7', 'pending',"
+                          " '2026-10-19 01:00:00')"))
+    chat = FakeChatPort(default_channel="C_CORA")
+    assert post_morning_digest(engine, chat, "C_CORA", halted=False, now=AT_7_30)
+    body = _body(chat.posts[0]["blocks"])
+    assert "Not available today: LendingFlow leads" in body
+    assert "Draft #4 draft_email for web_lead:7 waiting for approval" in body
+    assert _rows(engine) == [("2026-10-19", chat.posts[0]["ts"])]

@@ -127,3 +127,12 @@ Sources: `Launch_Protocol_Runbook_Dev_Split.md`, `Next_Deal_Lending_Launch_Proto
 - Done: the "@Cora emergency halt" alert now goes to Cora's own channel (`LENDING_CORA_CHANNEL`, #next-deal-lending-cora) instead of #next-deal-lending. `LENDING_PROGRESS_CHANNEL` removed (setting, `build_session` parameter, CLAUDE.md). When the command is typed in Cora's channel the alert is posted once (as the reply), not twice. Resume notice likewise. Test `test_typed_in_coras_channel_the_alert_is_posted_once`.
 - Decision: no new setting or channel; nothing to invite beyond Cora's app already in her channel. The command arrives over Cora's Socket Mode session (no HTTP endpoint).
 - Supersedes: the earlier "set LENDING_PROGRESS_CHANNEL / invite the bot to #next-deal-lending" deploy step.
+
+## Code review of the whole Dev 1 branch (2026-10-19)
+
+### 2026-10-19, review at 63702bee, one blocker fixed
+- Done: reviewed `origin/dev...HEAD` (48 files: T-01 to T-05 + merged #369). 587 passed / 46 skipped (Postgres) across the 19 affected test files. Single send path, fail-closed halt, masked PII, no new dependencies, every new function has a production caller.
+- Fixed (Important): the 7:30 digest read every section in one transaction, so one table missing on the server (e.g. `lending.lendingflow_enrichment`, behind the T-12 switch) stopped the whole digest. Each section now reads in its own savepoint; a failed section is listed as "Not available today" and the rest posts. Test `test_a_missing_table_blanks_only_its_section`.
+- Deploy note (Important): run `migrations/apply_lending_cora_inbox.py` (from #369) on the server; without it T-04 duplicate alerts and the inbox digest fail quietly.
+- Minor, accepted: texts refused during an emergency halt are dropped, not re-sent after resume; the arrival alert can repeat once if the lead's event mark fails after the post.
+- Decision: Approved after the fix.

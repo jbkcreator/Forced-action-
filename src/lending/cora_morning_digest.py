@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
@@ -98,6 +98,7 @@ class DigestData:
     web_leads_not_in_ghl: int
     todays_calls: list[dict[str, Any]]
     dialer_queues: list[dict[str, Any]]
+    unavailable: tuple[str, ...] = ()
 
 
 def _rows(db: Session, statement, params: dict[str, Any]) -> list[dict[str, Any]]:
@@ -114,22 +115,41 @@ def digest_day(now: datetime) -> Optional[date]:
     return local.date() if DIGEST_TIME <= local.time() < LAST_POST_TIME else None
 
 
+def _section(db: Session, name: str, read: Callable[[], Any], default: Any, unavailable: list[str]) -> Any:
+    """Read one section in its own savepoint: a missing table or failed query blanks that section only, so the
+    rest of the digest still posts (a table can be absent when its feature's migration has not run)."""
+    try:
+        with db.begin_nested():
+            return read()
+    except Exception as exc:  # class only: SQL errors embed bound parameters
+        logger.warning("[cora] morning digest section %s not available (%s)", name, type(exc).__name__)
+        unavailable.append(name)
+        return default
+
+
 def gather(db: Session, day: date, now: datetime, *, halted: bool, halt_reason: str) -> DigestData:
     start = datetime.combine(day, time.min, ET).astimezone(timezone.utc)
     since = now - timedelta(hours=24)
-    drafts = _rows(db, _PENDING_DRAFTS, {"limit": LIST_LIMIT})
-    confirmations = _rows(db, _DUE_CONFIRMATIONS, {"day": day, "limit": LIST_LIMIT})
-    leads = _rows(db, _NEW_LENDINGFLOW_LEADS, {"since": since, "limit": LIST_LIMIT})
-    web = db.execute(_WEB_LEADS, {"since": since}).mappings().one()
-    calls = _rows(db, _TODAYS_CALLS, {"start": start, "end": start + timedelta(days=1), "limit": LIST_LIMIT})
+    missing: list[str] = []
+    no_web = {"total": 0, "not_in_ghl": 0}
+    drafts = _section(db, "drafts", lambda: _rows(db, _PENDING_DRAFTS, {"limit": LIST_LIMIT}), [], missing)
+    confirmations = _section(db, "confirmation calls", lambda: _rows(
+        db, _DUE_CONFIRMATIONS, {"day": day, "limit": LIST_LIMIT}), [], missing)
+    open_inbox = _section(db, "inbox", lambda: int(db.execute(_OPEN_INBOX).scalar() or 0), 0, missing)
+    leads = _section(db, "LendingFlow leads", lambda: _rows(
+        db, _NEW_LENDINGFLOW_LEADS, {"since": since, "limit": LIST_LIMIT}), [], missing)
+    web = _section(db, "web leads", lambda: dict(db.execute(_WEB_LEADS, {"since": since}).mappings().one()),
+                   no_web, missing)
+    calls = _section(db, "booked calls", lambda: _rows(
+        db, _TODAYS_CALLS, {"start": start, "end": start + timedelta(days=1), "limit": LIST_LIMIT}), [], missing)
+    queues = _section(db, "dialer queues", lambda: _rows(db, _DIALER_QUEUES, {}), [], missing)
     return DigestData(
         halted=halted, halt_reason=halt_reason,
         pending_drafts=drafts, pending_total=_total(drafts),
         due_confirmations=confirmations, due_confirmations_total=_total(confirmations),
-        open_inbox=int(db.execute(_OPEN_INBOX).scalar() or 0),
-        new_leads=leads, new_leads_total=_total(leads),
+        open_inbox=open_inbox, new_leads=leads, new_leads_total=_total(leads),
         web_leads=int(web["total"]), web_leads_not_in_ghl=int(web["not_in_ghl"]),
-        todays_calls=calls, dialer_queues=_rows(db, _DIALER_QUEUES, {}),
+        todays_calls=calls, dialer_queues=queues, unavailable=tuple(missing),
     )
 
 
@@ -164,8 +184,10 @@ def render(day: date, data: DigestData) -> tuple[str, list[dict]]:
              for c in data.todays_calls]
     queues = [f"Booked calls today: {len(data.todays_calls)}"] + calls + [
         f"Dialer {q['campaign']}: {q['contacts']} contact(s) loaded" for q in data.dialer_queues]
+    cora_lines = [status] + ([f":warning: Not available today: {', '.join(data.unavailable)}"]
+                             if data.unavailable else [])
     sections = [
-        BriefSection("Cora", [status]),
+        BriefSection("Cora", cora_lines),
         BriefSection("Overdue actions", overdue, "Nothing overdue."),
         BriefSection(f"New leads, last 24 hours ({data.new_leads_total + data.web_leads})", leads, "No new leads."),
         BriefSection("Today's calling queues", queues),
