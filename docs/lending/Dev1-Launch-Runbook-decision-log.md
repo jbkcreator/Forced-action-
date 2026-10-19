@@ -103,3 +103,8 @@ Sources: `Launch_Protocol_Runbook_Dev_Split.md`, `Next_Deal_Lending_Launch_Proto
 - Team lead checks in Slack (no client action): Josh and the lending Slack bot are both members of #lending-ops.
 - Decision: the message is a draft; the team lead reviews it before it goes to the client.
 - Open: team lead sends the message; Josh confirms; set `LENDING_LEAD_ARRIVAL_ALERT_ENABLED=true` on the server and send one test lead to confirm the alert rings Josh's phone.
+
+### 2026-10-19, correction: where each notification setting lives
+- Phone settings (not Slack): notifications allowed with sound (iPhone: Settings → Notifications → Slack; Android: Settings → Apps → Slack → Notifications); Slack allowed during Focus / Do Not Disturb (iPhone: Settings → Focus → each Focus → Apps → add Slack; Android: Settings → Do Not Disturb → Exceptions → add Slack).
+- Slack app: mobile notification level (Profile → Notifications → Mobile); #lending-ops not muted (channel name → Notifications); notification schedule / pause hours (Profile → Notifications → Notification schedule; desktop: Preferences → Notifications).
+- The client message draft should name these two places separately before the team lead sends it.
