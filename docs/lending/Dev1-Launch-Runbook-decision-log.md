@@ -87,3 +87,8 @@ Sources: `Launch_Protocol_Runbook_Dev_Split.md`, `Next_Deal_Lending_Launch_Proto
   2. Until R5 and 10DLC land, the 2- and 5-minute alarms reach Josh only through the 5-minute Slack post; also @-mention him in that post so it pushes to his phone.
   3. Add a GHL contact link to the arrival alert so Josh can open the lead and call in one tap (the masked Slack text cannot carry the number); needs the GHL contact id passed in the event.
   4. Ask Josh to confirm the Slack app on his phone has notifications on for mentions in the ops channel, or the "push" will not ring.
+
+### 2026-10-19, suggestion 2 done: 5-minute alarm post mentions Josh
+- Done: `uncalled_alarm_worker.MentioningSlack` wraps the alarm worker's Slack client in `run_cycle`, prefixing every alarm post with @-mentions of `LENDING_CORA_APPROVER_USER_IDS` (Josh), so the 5-minute Slack alarm pushes to his phone through the Slack app. No approvers set = post unchanged. Tests in `tests/lending/test_lead_arrival_alert.py` (2 more).
+- Decision: until R5 and 10DLC land, the 5-minute Slack post is the only alarm that reaches Josh, so it carries the mention.
+- Open: suggestions 1 (switch on the arrival alert), 3 (GHL contact link), 4 (Josh's Slack mention notifications) remain.

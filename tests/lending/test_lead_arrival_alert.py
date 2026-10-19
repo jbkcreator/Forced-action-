@@ -128,3 +128,19 @@ def test_only_the_alarm_worker_uses_the_internal_alert_sender() -> None:
     users = [path.as_posix() for path in pathlib.Path("src").rglob("*.py")
              if "get_sender(internal_alert=True)" in path.read_text(encoding="utf-8")]
     assert users == ["src/lending/uncalled_alarm_worker.py"]
+
+
+def test_the_5_minute_alarm_post_mentions_josh() -> None:
+    from src.lending.uncalled_alarm_worker import MentioningSlack
+
+    inner = FakeSlack()
+    MentioningSlack(inner, frozenset({"U_JOSH"})).chat_postMessage(channel="C_OPS", text="URGENT: lead not called")
+    assert inner.posts == [{"channel": "C_OPS", "text": "<@U_JOSH> URGENT: lead not called"}]
+
+
+def test_no_approvers_means_the_alarm_post_is_unchanged() -> None:
+    from src.lending.uncalled_alarm_worker import MentioningSlack
+
+    inner = FakeSlack()
+    MentioningSlack(inner, frozenset()).chat_postMessage(channel="C_OPS", text="URGENT")
+    assert inner.posts[0]["text"] == "URGENT"

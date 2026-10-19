@@ -399,6 +399,19 @@ def _retry_row(db, row: Mapping[str, Any], *, tick: Clock, sms, slack, ghl_statu
     return outcomes
 
 
+class MentioningSlack:
+    """Prefixes each alarm post with @-mentions of the approvers (Josh), so the Slack mobile app pushes it to his
+    phone. Until his alarm number (R5) and 10DLC land, the 5-minute Slack post is the only alarm that reaches him."""
+
+    def __init__(self, slack: Any, mention_ids: frozenset[str]) -> None:
+        self._slack = slack
+        self._prefix = " ".join(f"<@{user_id}>" for user_id in sorted(mention_ids))
+
+    def chat_postMessage(self, *, channel: str, text: str, **kwargs: Any) -> Any:
+        body = f"{self._prefix} {text}" if self._prefix else text
+        return self._slack.chat_postMessage(channel=channel, text=body, **kwargs)
+
+
 def process_due(db, *, now: Optional[datetime] = None, clock: Clock = _utcnow, sms: Optional[Callable[..., str]],
                 slack: Any, ghl_status: Optional[GhlCallStatus], sms_to: Optional[str], ops_channel: str,
                 limit: int = BATCH_SIZE) -> dict[str, int]:
@@ -461,7 +474,11 @@ def run_cycle(*, now: Optional[datetime] = None) -> dict[str, int]:
     from src.lending.ghl_sms import get_sender
 
     account = lending_ghl_account()
+    from packages.agent_core.config import parse_user_ids
+
     slack = _slack_client() if settings.lending_slack_bot_token else None
+    if slack is not None:
+        slack = MentioningSlack(slack, parse_user_ids(settings.lending_cora_approver_user_ids))
     with lending_session() as db:
         return process_due(db, now=now, sms=get_sender(internal_alert=True), slack=slack,
                            ghl_status=ghl_call_lookup(account) if account else None,
