@@ -71,3 +71,19 @@ Sources: `Launch_Protocol_Runbook_Dev_Split.md`, `Next_Deal_Lending_Launch_Proto
 ### 2026-10-19, correction: server settings
 - Done: user confirmed `LENDING_GHL_STAGE_LENDINGFLOW_NEW`, `LENDING_LENDINGFLOW_ENABLED` and `LENDING_LENDINGFLOW_WEBHOOK_SECRET` are set on the server (only the local `.env` lacks them). Q-25 pipeline assignment is configured on the server.
 - Open: David's real test payload (D-1 to D-4) only.
+
+## T-05: LendingFlow direct-to-Josh path (instant SMS and mobile alert)
+
+### 2026-10-19, arrival alert to Josh, alarms survive the emergency halt
+- Done: new `src/lending/lead_arrival_alert.py` (`alert_josh`), subscribed to `LendingFlowLeadCreated` in lending-api (`src/lending/api.py`) and in the GHL retry sweep (`src/tasks/lending_lendingflow_sweep.py`), so every delivered lead alerts once whichever process gets it into GHL. It posts to `LENDING_OPS_CHANNEL` with an @-mention of each `LENDING_CORA_APPROVER_USER_IDS` (Josh): loan type, amount, state, last 4 of the phone, lead id. Off until `LENDING_LEAD_ARRIVAL_ALERT_ENABLED=true` (new setting). `GhlSmsSender(internal_alert=True)` / `get_sender(internal_alert=True)`, used only by `uncalled_alarm_worker`, skips the emergency-halt check. Tests `tests/lending/test_lead_arrival_alert.py` (12).
+- How it works today (end to end): lead arrives → saved + certificate stored (T-04) → GHL contact, `lendingflow` tag, pipeline card → `lendingflow-intro-ready` tag starts the GHL intro-SMS workflow only with consent, inside 8am-8pm borrower time and `LENDING_INTRO_SMS_ENABLED` (off) → arrival alert @-mentions Josh in Slack (new, off) → 2 min no call: SMS to `LENDING_ALARM_SMS_TO`; 5 min: URGENT SMS + Slack post (`uncalled_alarm_worker`, off until `LENDING_UNCALLED_ALARMS_ENABLED`). A connected call stops the alarms.
+- Decision (dev): alarm texts to Josh's own phone keep going during an emergency halt; the halt stops outbound to borrowers and a missed-lead alarm must not go quiet. A test pins that only the alarm worker uses the exempt sender.
+- Decision (interim, Q-36): "high-priority push" = Slack @-mention (the Slack mobile app pushes it) until Josh asks for a dedicated push app (new vendor, his call).
+- Questions applied: Client Actions § 4 note: the Slack part of the alarm does not depend on the carrier, so the Slack alert can go live before 10DLC.
+- Assumed defaults: arrival alert goes to the alarm channel (`LENDING_OPS_CHANNEL`), not a new channel.
+- Open (client): Q-36 push mechanism; R5 Josh's alarm mobile number; 10DLC approval and D1/D2 consent before any borrower text; Q-5 sending number. Test 1's 2m/5m steps are covered by the existing alarm tests, which need a fully migrated Postgres DB (skipped here).
+- Suggestions:
+  1. Switch on `LENDING_LEAD_ARRIVAL_ALERT_ENABLED` now: it is Slack only, needs no 10DLC or R5, and gives Josh a phone alert for every lead today.
+  2. Until R5 and 10DLC land, the 2- and 5-minute alarms reach Josh only through the 5-minute Slack post; also @-mention him in that post so it pushes to his phone.
+  3. Add a GHL contact link to the arrival alert so Josh can open the lead and call in one tap (the masked Slack text cannot carry the number); needs the GHL contact id passed in the event.
+  4. Ask Josh to confirm the Slack app on his phone has notifications on for mentions in the ops channel, or the "push" will not ring.

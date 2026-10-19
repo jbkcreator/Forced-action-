@@ -463,7 +463,7 @@ def run_cycle(*, now: Optional[datetime] = None) -> dict[str, int]:
     account = lending_ghl_account()
     slack = _slack_client() if settings.lending_slack_bot_token else None
     with lending_session() as db:
-        return process_due(db, now=now, sms=get_sender(), slack=slack,
+        return process_due(db, now=now, sms=get_sender(internal_alert=True), slack=slack,
                            ghl_status=ghl_call_lookup(account) if account else None,
                            sms_to=normalize(settings.lending_alarm_sms_to), ops_channel=settings.lending_ops_channel)
 
