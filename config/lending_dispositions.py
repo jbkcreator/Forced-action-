@@ -79,6 +79,12 @@ NURTURE_SENT_CODES = frozenset({"GATE_FAILED_NURTURE"})
 ANSWERED_CODES = frozenset(DISPOSITIONS) - UNANSWERED_CODES - {"BAD_NUMBER"}
 # GHL pipeline stage names (lower-cased) that count as "showed": the client moves a lead there once the held call happens.
 SHOWED_STAGE_KEYS = frozenset({"held", "showed"})
+# Hourly scoreboard (launch runbook Line 11). Defaults: a client answer is a one-line change here.
+LONG_CONVERSATION_SECONDS = 120  # "2+ min conversations": talk time of at least this many seconds
+# Codes that count as a transfer to Josh. Empty on purpose: the dialer records no transfer yet, so the
+# Transfers column shows n/a until a code is added here and to DISPOSITIONS.
+TRANSFER_CODES: frozenset[str] = frozenset()
+HOURLY_POST_HOURS_ET = tuple(range(10, 20))  # hourly posts at 10:00 through 19:00 ET, inside the 09:00-19:15 calling window
 
 # Sheet columns. Held / Gate Passed / Packet are added when WP-GL-5/6 write them.
 SHEET_COLUMNS = (
@@ -135,7 +141,8 @@ def validate_dispositions_config() -> None:
     for name, group in (("UNANSWERED_CODES", UNANSWERED_CODES), ("DEFAULT_CAUSE", set(DEFAULT_CAUSE)),
                         ("SYSTEM_DISPOSITION_ALIASES", set(SYSTEM_DISPOSITION_ALIASES.values())),
                         ("LIVE_CONVERSATION_CODES", LIVE_CONVERSATION_CODES), ("GATED_CODES", GATED_CODES),
-                        ("NURTURE_SENT_CODES", NURTURE_SENT_CODES), ("ANSWERED_CODES", ANSWERED_CODES)):
+                        ("NURTURE_SENT_CODES", NURTURE_SENT_CODES), ("ANSWERED_CODES", ANSWERED_CODES),
+                        ("TRANSFER_CODES", TRANSFER_CODES)):
         if not group <= codes:
             raise ValueError(f"{name} names a code missing from DISPOSITIONS: {sorted(group - codes)}")
     if not set(DEFAULT_CAUSE.values()) <= CAUSE_TAGS:
