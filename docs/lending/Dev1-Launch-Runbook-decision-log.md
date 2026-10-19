@@ -58,3 +58,12 @@ Sources: `Launch_Protocol_Runbook_Dev_Split.md`, `Next_Deal_Lending_Launch_Proto
 ### 2026-10-19, fakes + throwaway Postgres
 - Done: 400 Cora/agent-core/GHL/halt/digest tests pass with fakes. Throwaway Postgres (Docker, port 58123, never the shared DB): both migrations create their tables and re-run cleanly; digest posts once, stores its row, shows the E5 sections; halt flag set/clear with 2 history rows. The same 10 test files on `origin/dev` and this branch fail identically (59 failed, 80 errors: the empty DB lacks the main app tables); none fail only on this branch, 16 more pass.
 - Open: the existing text-back, reminder, intro-SMS and dialer-load Postgres tests could not run on an empty DB (fake-based tests pass); live checks on the server.
+
+## T-04: LendingFlow real-time intake live (`POST /api/lending/lendingflow`)
+
+### 2026-10-19, verified existing intake, duplicates go to a person
+- Done: checked the existing intake (T-11, PR #346, on dev): route on lending-api `/api/lending/lendingflow`, `X-Webhook-Secret` check (401 wrong, 503 while off), dedupe on `vendor_lead_id` and SHA256(phone|email), certificate stored verbatim and append-only in `lending.lead_consent_certificates`, lead saved, GHL contact tagged `lendingflow` with a pipeline card when the pipeline/stage settings exist. New: `lendingflow._record_duplicate` raises a `lendingflow_possible_duplicate` item in Cora's inbox (target `dial_tasks`) when a delivery matches an existing lead on only one key; exact re-sends stay quiet. Tests `tests/lending/test_lendingflow_duplicates.py` (6, no DB).
+- Decision: "ambiguous" = same phone+email with a different LendingFlow lead id, or same lead id with a different phone/email (Runbook § 1, Principle 3). Raised through Cora's inbox (her channel; one reply routes it to #dial-tasks-lending), with lead refs only, no phone or email. Inbox write is in a savepoint, so a failure never loses the lead.
+- Questions applied: none answered in the four client docs for D-1 to D-4 (Questions for Josh lines 175-178 list them as requests to LendingFlow only).
+- Assumed defaults: parser stays on the agreed test payload until David's real payload arrives.
+- Open: David's real test payload (D-1 to D-4) for Line 2; local `.env` has `LENDING_GHL_PIPELINE_ID` but no `LENDING_GHL_STAGE_LENDINGFLOW_NEW`, `LENDING_LENDINGFLOW_ENABLED` or `LENDING_LENDINGFLOW_WEBHOOK_SECRET` (server `.env` not visible from here; Q-25); the LendingFlow Postgres tests need a fully migrated DB.
