@@ -23,9 +23,14 @@ class InvalidEvent(ValueError):
     """The payload can never be processed (missing or unusable fields); retrying will not help."""
 
 
+def _sources(body: dict[str, Any]) -> list[dict[str, Any]]:
+    """Where a GHL webhook can carry a key: the top level, ``customData`` (the key/value body of a GHL webhook
+    action) and ``contact`` (GHL's default nested payload), in that order."""
+    return [body, *(body[key] for key in ("customData", "contact") if isinstance(body.get(key), dict))]
+
+
 def field(body: dict[str, Any], name: str) -> Optional[str]:
-    contact = body.get("contact") if isinstance(body.get("contact"), dict) else {}
-    value = body.get(name) or contact.get(name)
+    value = next((source[name] for source in _sources(body) if source.get(name)), None)
     return str(value) if value else None
 
 
@@ -35,8 +40,7 @@ def contact_id_of(body: dict[str, Any]) -> Optional[str]:
 
 def message_tokens(body: dict[str, Any]) -> list[str]:
     """Lower-cased alphanumeric tokens of the reply; empty when it is missing or not a string."""
-    contact = body.get("contact") if isinstance(body.get("contact"), dict) else {}
-    raw = body.get("message") or contact.get("message")
+    raw = next((source["message"] for source in _sources(body) if source.get("message")), None)
     return re.sub(r"[^a-z0-9]+", " ", raw.lower()).split() if isinstance(raw, str) else []
 
 

@@ -45,7 +45,8 @@ logger = logging.getLogger(__name__)
 
 # Leads ranked by arrival (from the first purchase date, ET) fill the batches ranked by purchase date. A funded stage
 # entry is credited to the latest lead on that phone delivered before it, and each lead counts its first one only.
-# The fee is accepted only as a plain amount once "$", "," and spaces are removed; anything else is ignored.
+# The fee is read at the top level of the webhook body or under customData (a GHL key/value body), and accepted
+# only as a plain amount once "$", "," and spaces are removed; anything else is ignored.
 _COHORTS = text("""
     WITH batches AS (
         SELECT id, name, purchased_at, lead_count,
@@ -63,7 +64,8 @@ _COHORTS = text("""
     ),
     funded_events AS (
         SELECT DISTINCT ON (e.id) e.id, e.event_at, p.id AS lead_id,
-               regexp_replace(e.raw_event ->> :fee_field, '[$,\\s]', '', 'g') AS fee
+               regexp_replace(COALESCE(NULLIF(e.raw_event ->> :fee_field, ''),
+                                       e.raw_event -> 'customData' ->> :fee_field), '[$,\\s]', '', 'g') AS fee
           FROM lending.ghl_stage_events e
           JOIN placed p ON p.phone = e.phone AND p.received_at <= e.event_at
          WHERE e.stage_key = ANY(:funded)

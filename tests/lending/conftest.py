@@ -26,7 +26,7 @@ def lending_db():
     url = get_settings().database_url
     if not url:
         pytest.skip("requires a live Postgres DATABASE_URL")
-    engine = create_engine(str(url), connect_args={"connect_timeout": 5})
+    engine = create_engine(str(url), connect_args={"connect_timeout": 20})  # the shared database can be slow to reach (SSH tunnel)
     try:
         conn = engine.connect()
     except Exception:
@@ -103,7 +103,7 @@ def prequal_db():
     url = get_settings().database_url
     if not url:
         pytest.skip("requires a live Postgres DATABASE_URL")
-    engine = create_engine(str(url), connect_args={"connect_timeout": 5})
+    engine = create_engine(str(url), connect_args={"connect_timeout": 20})  # the shared database can be slow to reach (SSH tunnel)
     try:
         conn = engine.connect()
     except Exception:

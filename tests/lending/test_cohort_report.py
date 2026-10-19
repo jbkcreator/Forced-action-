@@ -50,10 +50,10 @@ def _phone_of(db, lead_id: int) -> str:
     return db.execute(text("SELECT phone FROM lending.lendingflow_leads WHERE id = :id"), {"id": lead_id}).scalar()
 
 
-def _stage(db, phone: str, at: datetime, stage: str = "Funded", fee=None) -> None:
+def _stage(db, phone: str, at: datetime, stage: str = "Funded", fee=None, custom_data: bool = False) -> None:
     body = {"stage_name": stage, "phone": phone}
     if fee is not None:
-        body["monetary_value"] = fee
+        body.update({"customData": {"monetary_value": fee}} if custom_data else {"monetary_value": fee})
     db.execute(text(
         "INSERT INTO lending.ghl_stage_events (ghl_opportunity_id, stage_name, stage_key, phone, event_at, raw_event) "
         "VALUES (:opp, :stage, :key, :phone, :at, CAST(:raw AS jsonb))"),
@@ -145,6 +145,14 @@ def test_a_funded_loan_is_credited_to_the_latest_lead_on_that_phone(db):
     assert _only(rows, "A").funded_to_date == 0
     b = _only(rows, "B")
     assert b.funded == {30: 1, 60: 1, 90: 1} and b.fees_total == Decimal("2000")
+
+
+def test_a_fee_sent_under_custom_data_is_counted(db):
+    add_batch(db, name="A", purchased_at=date(2031, 1, 6), lead_count=1)
+    lead = _lead(db, ET_MORNING)
+    _stage(db, _phone_of(db, lead), ET_MORNING + timedelta(days=3), fee="$1,250", custom_data=True)
+    a = _only(cohorts(db, now=ET_MORNING + timedelta(days=100))[0], "A")
+    assert a.fees_total == Decimal("1250") and a.revenue_per_lead == Decimal("1250.00")
 
 
 def test_no_batches_means_an_empty_report(db):

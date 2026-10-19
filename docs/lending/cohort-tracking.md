@@ -63,9 +63,12 @@ The workflow "NDL – Stage Funded → cohort report" (GHL Custom Webhook, key/v
 `/webhooks/lending/ghl-stage` and passes the secret, but gets **422** (lending-api log, 2026-10-19 13:16–13:24 UTC):
 `opportunity_id` / `stage_name` are not found. The body is valid JSON (an earlier wrong secret gave 401, which is
 checked after the body). Most likely GHL nests the key/value fields under `customData`, while
-`src/lending/ghl_consent_events.field()` reads only the top level and `contact`. **Not confirmed and not fixed.**
-The fix is to also read `customData` in `field()`, which the opt-out and consent webhooks share. It needs a deploy
-of lending-api, then the funded test is re-run. Until then no funded loan reaches the report.
+`src/lending/ghl_consent_events.field()` read only the top level and `contact`.
+
+**Fixed in code (2026-10-19, not yet deployed):** `field()` now reads the top level, then `customData`, then
+`contact` (the opt-out and consent webhooks share it), and the cohort report reads the fee at the top level or under
+`customData`. Still to do: deploy lending-api, move the test opportunity to Funded again, and confirm a 200 and the
+row. `customData` is still the likely shape, not a confirmed one; that first run confirms it.
 
 ## 6. Waiting on Josh
 
