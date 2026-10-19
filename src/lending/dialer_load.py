@@ -114,6 +114,7 @@ class LoadReport:
     active_not_in_run: int = 0
     backflip_check: bool = True
     suppressed_mid_run: int = 0  # opted out after the start-of-run gate; skipped before the push
+    loaded_refs: list[str] = field(default_factory=list)  # record refs pushed live; not in as_dict
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -576,6 +577,7 @@ def run_dialer_load(
                 contact_id = exc.contact_id  # live in the dialer: track it so opt-out can delete it
             else:
                 report.loaded += 1
+                report.loaded_refs.append(item.record_ref)
                 report.created += int(result.created)
                 report.updated += int(not result.created)
                 contact_id = result.contact_id

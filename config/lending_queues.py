@@ -1,15 +1,16 @@
-"""Go Live: nine source lists -> four ranked launch queues (Josh, Oct 4 email §2).
+"""Go Live: source lists -> four ranked launch queues, dialed in strict order.
 
-Rank 1 Verified maturity = Lists 1, 5, 8 (50% dial share).
-Rank 2 Cash buyers and Transaction ready = Lists 2, 9, 6 (25%) — List 2 moved out of
-  nurture here: "cash buyers move out of Nurture into rank 2, because delayed
-  financing is a real borrower conversation."
-Rank 3 Builders = Lists 3, 7 (20%).
-Rank 4 Partners = List 4, brokers and LOs (5%), "only when ranks 1 to 3 are empty" —
-  partner script only, dialed as a real queue but never pitched or booked as borrowers.
-  The "only when empty" sequencing is a dial-time ordering rule, not a share; nothing
-  currently paces dials against DIAL_SHARE (no consumer exists yet), so this is the
-  declared target split for whenever that pacing is built, not an enforced one.
+Dial order follows the Launch Protocol Runbook (Principle 1, "Dial Order Flipped"), which
+overrides the Oct 4 email's "Partners only when ranks 1 to 3 are empty" (open Q-8, Josh):
+  1. Partners = List 4 brokers/LOs + wholesaler lists (Sunbiz, Hunter): dialed first;
+     partner script only, never pitched or booked as borrowers.
+  2. Transaction ready = Lists 2, 9, 6 (List 2 cash buyers moved out of nurture, Oct 4 §2).
+  3. Builders = Lists 3, 7.
+  4. Verified maturity = Lists 1, 5, 8: the 525-record FL maturity list, filler only,
+     touched when the queues above are cleared.
+The relative order of 2 and 3 is unchanged from Oct 4 (the Runbook names only first and
+last). LendingFlow inbound is not a dialer queue: it routes to GHL and Josh (Principle 2).
+Each queue is its own BatchDialer campaign; MAX_LINES is the Principle 4 line rule.
 """
 from __future__ import annotations
 
@@ -24,6 +25,7 @@ SOURCE_TAG_QUEUES: dict[str, str] = {
     "list_2": TRANSACTION_READY, "list_9": TRANSACTION_READY, "list_6": TRANSACTION_READY,
     "list_3": BUILDERS, "list_7": BUILDERS,
     "list_4": PARTNERS,
+    "wholesaler_sunbiz": PARTNERS, "wholesaler_hunter": PARTNERS,
 }
 # No source tag is nurture-only any more (List 2 and List 4 both moved to real
 # ranked queues above); kept as a mechanism for a future list that genuinely has
@@ -34,18 +36,29 @@ LAUNCH_QUEUES = frozenset(SOURCE_TAG_QUEUES.values())
 # "partner script only, never pitched as borrowers").
 NEVER_BOOKABLE_QUEUES = frozenset({PARTNERS})
 
-# Share of dial time per launch queue (see module docstring: declared target, not
-# yet enforced by any pacing engine).
-DIAL_SHARE: dict[str, float] = {
-    VERIFIED_MATURITY: 0.5, TRANSACTION_READY: 0.25, BUILDERS: 0.2, PARTNERS: 0.05,
+# Strict dial order: a queue is dialed only when every queue before it is empty.
+DIAL_ORDER: tuple[str, ...] = (PARTNERS, TRANSACTION_READY, BUILDERS, VERIFIED_MATURITY)
+
+# Runbook Principle 4: max 3 lines per seat on partner, wholesaler/broker and landline
+# numbers; 5 lines only on the cold maturity queue. Set by hand per BatchDialer campaign.
+DEFAULT_MAX_LINES = 3
+COLD_MATURITY_MAX_LINES = 5
+COLD_MATURITY_QUEUE = VERIFIED_MATURITY
+MAX_LINES: dict[str, int] = {
+    PARTNERS: DEFAULT_MAX_LINES, TRANSACTION_READY: DEFAULT_MAX_LINES,
+    BUILDERS: DEFAULT_MAX_LINES, VERIFIED_MATURITY: COLD_MATURITY_MAX_LINES,
 }
 
 
 def validate_queue_config() -> None:
-    if set(DIAL_SHARE) != LAUNCH_QUEUES:
-        raise ValueError("DIAL_SHARE must cover exactly the launch queues")
-    if abs(sum(DIAL_SHARE.values()) - 1.0) > 1e-9:
-        raise ValueError("DIAL_SHARE must sum to 1")
+    if len(DIAL_ORDER) != len(set(DIAL_ORDER)) or set(DIAL_ORDER) != LAUNCH_QUEUES:
+        raise ValueError("DIAL_ORDER must list every launch queue exactly once")
+    if set(MAX_LINES) != LAUNCH_QUEUES:
+        raise ValueError("MAX_LINES must cover exactly the launch queues")
+    for queue, lines in MAX_LINES.items():
+        cap = COLD_MATURITY_MAX_LINES if queue == COLD_MATURITY_QUEUE else DEFAULT_MAX_LINES
+        if not 1 <= lines <= cap:
+            raise ValueError(f"{queue} may run at most {cap} lines")
     if NURTURE_ONLY_TAGS & set(SOURCE_TAG_QUEUES):
         raise ValueError("a nurture-only list cannot also map to a queue")
     if NEVER_BOOKABLE_QUEUES - LAUNCH_QUEUES:

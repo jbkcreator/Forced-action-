@@ -171,6 +171,8 @@ class TestLiveLoad:
         _fresh_scrub(db, P1, P2)
         report, aircall = _run(db, [_record("a", P1), _record("b", P2, pool="wholesalers")])
         assert report.loaded == 2 and report.created == 2
+        assert report.loaded_refs == [_record("a", P1)["source_record_ref"], _record("b", P2)["source_record_ref"]]
+        assert "loaded_refs" not in report.as_dict()
         assert aircall.upserts == [P1, P2]
         rows = _load_rows(db)
         assert [(r.phone, r.campaign_tag, r.active) for r in rows] == [
