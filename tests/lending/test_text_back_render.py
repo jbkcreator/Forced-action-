@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from config.lending_text_back import MAX_TEXT_CHARS, TEMPLATES
+from config.lending_text_back import BOOKING_LINK, CAPS, MAX_TEXT_CHARS, TEMPLATES
 from src.lending.text_back import PendingText, choose_template, first_name_of, format_number, render_body
 
 NUMBER = "+18135550100"
@@ -22,12 +22,14 @@ def _item(**over) -> PendingText:
 def test_the_three_texts_carry_no_company_name():
     assert TEMPLATES["maturity"] == ("{greeting}, it's {caller} with Josh Kantor, Loan Officer. Sorry I missed you. "
                                      "I was calling about the loan on {property}. "
-                                     "Call or text me back at {number} when it suits you. Reply STOP to opt out.")
+                                     "Call or text me back at {number} when it suits you. "
+                                     f"Book a time: {BOOKING_LINK} Reply STOP to opt out.")
     assert TEMPLATES["deal_drop"] == ("{greeting}, {caller} with Josh Kantor, Loan Officer here. Just tried you about {property}. "
                                       "We help investors in {county} fund their next deal. Text back if you'd like to chat. "
-                                      "Reply STOP to opt out.")
+                                      f"Book a time: {BOOKING_LINK} Reply STOP to opt out.")
     assert TEMPLATES["general"] == ("{greeting}, this is {caller} with Josh Kantor, Loan Officer. Sorry we missed each other. "
-                                    "Reply here or call {number} whenever works. Reply STOP to opt out.")
+                                    "Reply here or call {number} whenever works. "
+                                    f"Book a time: {BOOKING_LINK} Reply STOP to opt out.")
 
 
 @pytest.mark.parametrize("over,expected", [
@@ -58,7 +60,8 @@ def test_first_name_is_a_real_first_name_or_nothing(name, expected):
 def test_maturity_text_renders_exactly():
     assert render_body(_item(), "maturity", number=NUMBER) == (
         "Hi Sam, it's Alex with Josh Kantor, Loan Officer. Sorry I missed you. I was calling about the loan on 123 Main St. "
-        "Call or text me back at (813) 555-0100 when it suits you. Reply STOP to opt out.")
+        "Call or text me back at (813) 555-0100 when it suits you. "
+        f"Book a time: {BOOKING_LINK} Reply STOP to opt out.")
 
 
 def test_no_first_name_or_caller_still_reads_naturally():
@@ -115,10 +118,25 @@ def test_deal_drop_text_renders_exactly():
     assert render_body(_item(queue="transaction_ready"), "deal_drop", number=NUMBER) == (
         "Hi Sam, Alex with Josh Kantor, Loan Officer here. Just tried you about 123 Main St. "
         "We help investors in Hillsborough fund their next deal. Text back if you'd like to chat. "
-        "Reply STOP to opt out.")
+        f"Book a time: {BOOKING_LINK} Reply STOP to opt out.")
 
 
 def test_general_text_renders_exactly():
     assert render_body(_item(queue="nurture"), "general", number=NUMBER) == (
         "Hi Sam, this is Alex with Josh Kantor, Loan Officer. Sorry we missed each other. "
-        "Reply here or call (813) 555-0100 whenever works. Reply STOP to opt out.")
+        "Reply here or call (813) 555-0100 whenever works. "
+        f"Book a time: {BOOKING_LINK} Reply STOP to opt out.")
+
+
+@pytest.mark.parametrize("key", ["maturity", "deal_drop", "general"])
+def test_every_text_carries_the_booking_link_before_the_stop_language(key):
+    body = render_body(_item(), key, number=NUMBER)
+    assert f"Book a time: {BOOKING_LINK} Reply STOP to opt out." in body
+
+
+@pytest.mark.parametrize("key", ["maturity", "deal_drop", "general"])
+def test_fields_at_their_caps_still_fit_with_the_booking_link(key):
+    item = _item(property_address="x" * CAPS["property"], county="x" * CAPS["county"],
+                 caller_name="x" * CAPS["caller"], borrower_name="x" * CAPS["first_name"] + " Jones")
+    body = render_body(item, key, number=NUMBER)
+    assert len(body) <= MAX_TEXT_CHARS and BOOKING_LINK in body and body.endswith("Reply STOP to opt out.")

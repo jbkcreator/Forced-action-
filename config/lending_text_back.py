@@ -18,23 +18,29 @@ QUIET_START_HOUR = 8
 QUIET_END_HOUR = 20
 STALE_SENDING_SECONDS = 300
 
+# Josh's booking calendar, added to every missed-call text (launch runbook, Line 9).
+BOOKING_LINK = "https://api.leadconnectorhq.com/widget/bookings/josh-kantor"
+
 # Client-approved wording (questionnaire F2: "Option 1 for Verified maturity, Option 2 for Transaction
 # ready and Builders, Option 3 for Nurture and anything without an address"). Verbatim except the
-# greeting, which is "Hi <first name>" or just "Hi" when the borrower has no usable first name.
+# greeting, which is "Hi <first name>" or just "Hi" when the borrower has no usable first name, and the
+# "Book a time" line with BOOKING_LINK before the STOP language.
 TEMPLATES: dict[str, str] = {
     "maturity": (
         "{greeting}, it's {caller} with Josh Kantor, Loan Officer. Sorry I missed you. "
         "I was calling about the loan on {property}. "
-        "Call or text me back at {number} when it suits you. Reply STOP to opt out."
+        "Call or text me back at {number} when it suits you. "
+        "Book a time: " + BOOKING_LINK + " Reply STOP to opt out."
     ),
     "deal_drop": (
         "{greeting}, {caller} with Josh Kantor, Loan Officer here. Just tried you about {property}. "
         "We help investors in {county} fund their next deal. Text back if you'd like to chat. "
-        "Reply STOP to opt out."
+        "Book a time: " + BOOKING_LINK + " Reply STOP to opt out."
     ),
     "general": (
         "{greeting}, this is {caller} with Josh Kantor, Loan Officer. Sorry we missed each other. "
-        "Reply here or call {number} whenever works. Reply STOP to opt out."
+        "Reply here or call {number} whenever works. "
+        "Book a time: " + BOOKING_LINK + " Reply STOP to opt out."
     ),
 }
 GENERAL = "general"
@@ -51,7 +57,7 @@ TEMPLATE_NEEDS: dict[str, tuple[str, ...]] = {  # fields a template cannot be se
 }
 
 # Per-field caps keep the worst case under MAX_TEXT_CHARS so the STOP language is never cut.
-CAPS = {"first_name": 20, "caller": 30, "property": 50, "county": 30}
+CAPS = {"first_name": 12, "caller": 20, "property": 35, "county": 14}
 FALLBACK_CALLER = "our team"
 ENTITY_TOKENS = frozenset({
     "llc", "inc", "corp", "corporation", "co", "company", "ltd", "lp", "llp", "pllc", "trust",
