@@ -299,12 +299,11 @@ def build_session(config: AgentCoreConfig, store: AgentStore, chat: ChatPort, bo
                   messages_client: MessagesClient, send_check: Optional[SendCheck] = None,
                   toolkit_factory: Callable[[Engine, AgentMemory], Any] = CoraToolkit,
                   inbox_context: Optional[Callable[[str, str], str]] = None,
-                  executors: Optional[Mapping[str, EgressExecutor]] = None,
-                  progress_channel: Optional[str] = None) -> CoraServices:
+                  executors: Optional[Mapping[str, EgressExecutor]] = None) -> CoraServices:
     """Wire Cora. ``toolkit_factory(engine, memory)`` builds the tool set; tests swap the lead lookups.
     ``inbox_context(channel, thread_ts)`` returns the inbox items a digest thread lists (empty when none).
     ``executors`` defaults to none, so nothing sends unless the caller registers a channel.
-    ``progress_channel`` (#next-deal-lending) receives the "@Cora emergency halt" alert."""
+    The "@Cora emergency halt" alert goes to Cora's own channel (client answer 12)."""
     queue = PendingActionQueue(store, default_ttl=timedelta(hours=config.pending_action_ttl_hours))
     halt = HaltSwitch(store, config.agent_name)
     relay = Relay(queue, halt, executors or {}, send_check=send_check)
@@ -326,7 +325,7 @@ def build_session(config: AgentCoreConfig, store: AgentStore, chat: ChatPort, bo
                            on_message=conversation.on_message, on_revision=conversation.on_revision,
                            bot_user_id=bot_user_id,
                            command_hook=EmergencyHalt(chat=chat, cora_halt=halt, approver_ids=config.approver_user_ids,
-                                                      alert_channel=progress_channel))
+                                                      alert_channel=config.slack_channel_id))
     return CoraServices(session, relay, gate)
 
 
@@ -407,8 +406,7 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
     services = build_session(config, store, chat,
                              bot_user_id, messages_client=messages_client, send_check=make_send_check(engine),
                              toolkit_factory=toolkit_factory, inbox_context=make_inbox_context(engine),
-                             executors=build_egress_executors(),
-                             progress_channel=settings.lending_progress_channel or None)
+                             executors=build_egress_executors())
     digest = make_inbox_digest(engine, chat, config.slack_channel_id, channel_ids)
     return services._replace(web_client=web, inbox_digest=digest,
                              morning_digest=make_morning_digest(engine, store, chat, config))

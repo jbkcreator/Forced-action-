@@ -179,3 +179,13 @@ def test_no_dialer_load_while_halted(halt_db) -> None:
     set_global_halt(True, reason="test", set_by=JOSH)
     with pytest.raises(LoadRefused, match="emergency halt"):
         run_dialer_load([], None, run_id="r1", dry_run=False, scrubber=object(), dialer=object(), backflip_check=False)
+
+
+def test_typed_in_coras_channel_the_alert_is_posted_once(halt_db) -> None:
+    """Client answer 12: the alert goes to Cora's channel; a command typed there is not posted twice."""
+    chat, cora_halt = FakeChatPort(default_channel="C_CORA"), CoraHalt()
+    _command(chat, cora_halt, alert_channel="C_CORA")(_message("<@U_BOT> emergency halt"))
+    assert is_globally_halted()
+    alerts = [post for post in chat.posts if "Lending emergency halt" in post["text"]]
+    assert len(alerts) == 1 and alerts[0]["channel"] == "C_CORA"
+    assert ":white_square: Pause the lending campaigns in BatchDialer" in alerts[0]["text"]

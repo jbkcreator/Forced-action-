@@ -2,7 +2,9 @@
 
 An approver types ``@Cora emergency halt`` in a channel Cora's bot is in. That sets the flag in
 ``lending.global_halt`` (with a row in ``lending.global_halt_events``), halts Cora's own sends, and posts an alert
-to ``#next-deal-lending`` (``LENDING_PROGRESS_CHANNEL``). ``@Cora emergency resume`` clears the flag only; Cora's
+to Cora's channel ``#next-deal-lending-cora`` (``LENDING_CORA_CHANNEL``; client answer 12: use that channel for
+everything; the runbook's ``#next-deal-lending`` is not used). It arrives over Cora's Socket Mode session like any
+other message, with no HTTP endpoint. ``@Cora emergency resume`` clears the flag only; Cora's
 own halt still needs ``resume``.
 
 While the flag is set, every GoHighLevel SMS and email this code sends is refused (``ghl_sms`` send path), the
@@ -128,10 +130,13 @@ class EmergencyHalt:
                  "text, new dialer loads and Cora's sends.\n"
                  f"{MANUAL_CHECKLIST}\n"
                  "Say `@Cora emergency resume` to lift it.")
-        posted = self._alert_channel and self._chat.post(text=alert, channel=self._alert_channel).ok
+        if not self._alert_channel or message.channel == self._alert_channel:
+            self._reply(message, alert)  # typed in Cora's channel: the reply is the alert, posted once
+            return
+        posted = self._chat.post(text=alert, channel=self._alert_channel).ok
         if not posted:
-            logger.error("[global-halt] alert not posted to the progress channel")
-        self._reply(message, alert if posted else alert + "\n(The alert could not be posted to #next-deal-lending.)")
+            logger.error("[global-halt] alert not posted to Cora's channel")
+        self._reply(message, alert if posted else alert + "\n(The alert could not be posted to Cora's channel.)")
 
     def _resume(self, message: Any) -> None:
         try:
@@ -143,7 +148,7 @@ class EmergencyHalt:
         text_ = (f":arrow_forward: Lending emergency halt lifted by <@{message.user_id}>. Texts, emails, intro texts "
                  "and dialer loads may run again. Cora stays halted until an approver says `resume`; BatchDialer and "
                  "GoHighLevel must be turned back on by hand.")
-        if self._alert_channel:
+        if self._alert_channel and message.channel != self._alert_channel:
             self._chat.post(text=text_, channel=self._alert_channel)
         self._reply(message, text_)
 

@@ -121,3 +121,9 @@ Sources: `Launch_Protocol_Runbook_Dev_Split.md`, `Next_Deal_Lending_Launch_Proto
 ### 2026-10-19, server settings update (T-03 / T-05)
 - Done: `LENDING_OPS_CHANNEL` = `C0C7LFEKRDM` (#lending-ops) is set on the server (user confirmed); Josh and the Cora Lending app are in #lending-ops.
 - Clarified: `LENDING_PROGRESS_CHANNEL` is our setting name for the runbook's "posts an alert to #next-deal-lending" (Runbook § 7); the client did not name it. Deploy step, no client approval: copy #next-deal-lending's channel ID into it on the server, restart `fa-lending-cora`, invite Cora's app to #next-deal-lending (a bot can only post in channels it is in). Without it the halt still works and the alert is only replied in Cora's channel.
+
+### 2026-10-19, client answer 12: halt alert goes to Cora's channel
+- Client (answer 12): "Yes, add the Cora Lending bot to #next-deal-lending-cora and use it for everything there."
+- Done: the "@Cora emergency halt" alert now goes to Cora's own channel (`LENDING_CORA_CHANNEL`, #next-deal-lending-cora) instead of #next-deal-lending. `LENDING_PROGRESS_CHANNEL` removed (setting, `build_session` parameter, CLAUDE.md). When the command is typed in Cora's channel the alert is posted once (as the reply), not twice. Resume notice likewise. Test `test_typed_in_coras_channel_the_alert_is_posted_once`.
+- Decision: no new setting or channel; nothing to invite beyond Cora's app already in her channel. The command arrives over Cora's Socket Mode session (no HTTP endpoint).
+- Supersedes: the earlier "set LENDING_PROGRESS_CHANNEL / invite the bot to #next-deal-lending" deploy step.
