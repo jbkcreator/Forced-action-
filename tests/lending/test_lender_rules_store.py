@@ -158,6 +158,26 @@ def test_the_config_is_used_when_the_database_is_unavailable(monkeypatch, caplog
         assert current_matrix() is LENDER_MATRIX
 
 
+def test_the_table_is_used_when_the_flag_is_on_and_the_database_answers(monkeypatch):
+    """Runbook §6.3 "Dynamic DB overrides enabled via lending.lender_rule_values": with
+    LENDING_RULES_FROM_DB on, the evaluators read the table's matrix, not the config."""
+    from contextlib import contextmanager
+
+    class _On:
+        lending_rules_from_db = True
+
+    sentinel = (LENDER_MATRIX[0],)
+
+    @contextmanager
+    def _db():
+        yield object()
+
+    monkeypatch.setattr(store, "get_settings", lambda: _On())
+    monkeypatch.setattr("src.core.database.get_db_context", _db)
+    monkeypatch.setattr(store, "load_matrix", lambda session: sentinel)
+    assert current_matrix() is sentinel
+
+
 def test_the_database_round_trip_and_rerun_never_overwrites_an_edit(lending_db):
     conn = lending_db.connection()
     assert apply_to(conn) == len(seed_rows())
