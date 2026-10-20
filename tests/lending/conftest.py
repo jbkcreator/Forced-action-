@@ -67,6 +67,18 @@ def _no_live_ghl(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_live_slack(monkeypatch):
+    """A developer's .env may hold the real Cora Slack app (token, channel, approvers): a test must never post to it.
+    Every lending test starts with those settings blank; a test that needs them sets its own."""
+    from config.settings import get_settings
+
+    settings = get_settings()
+    for name, blank in (("lending_cora_slack_bot_token", None), ("lending_cora_slack_app_token", None),
+                        ("lending_cora_channel", ""), ("lending_cora_approver_user_ids", "")):
+        monkeypatch.setattr(settings, name, blank, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _no_live_web_lead_sink(monkeypatch):
     """A test must never push a website lead into the real Next Deal Lending GHL account."""
     monkeypatch.setattr("src.lending.web_lead_ghl.get_live_sink", lambda: None)

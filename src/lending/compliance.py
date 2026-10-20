@@ -136,6 +136,11 @@ def _suppressed_phones(db, phones: list[str]) -> set[str]:
     return {r[0] for r in rows}
 
 
+def is_phone_suppressed(db, phone: str) -> bool:
+    """Whether this number is on the lending suppression list or opted out of texts (STOP)."""
+    return bool(_suppressed_phones(db, [phone]))
+
+
 def suppress_warm_network_phones(db, phones: list[str], *, source_ref: Optional[str] = None) -> int:
     """Permanently suppress Josh's warm network from the cold dialer queue (Oct 4
     §2: "not in my warm network, permanently suppressed from the cold queue"). Not

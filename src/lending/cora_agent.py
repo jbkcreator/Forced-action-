@@ -50,6 +50,7 @@ from src.lending.global_halt import EmergencyHalt
 from src.lending.ghl_email import GhlEmailSender, get_email_sender
 from src.lending.cora_morning_digest import post_morning_digest
 from src.lending.models import LENDING_SCHEMA
+from src.lending.routing.slack_extension import RoutingSlack
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
@@ -299,10 +300,12 @@ def build_session(config: AgentCoreConfig, store: AgentStore, chat: ChatPort, bo
                   messages_client: MessagesClient, send_check: Optional[SendCheck] = None,
                   toolkit_factory: Callable[[Engine, AgentMemory], Any] = CoraToolkit,
                   inbox_context: Optional[Callable[[str, str], str]] = None,
-                  executors: Optional[Mapping[str, EgressExecutor]] = None) -> CoraServices:
+                  executors: Optional[Mapping[str, EgressExecutor]] = None,
+                  extension: Any = None) -> CoraServices:
     """Wire Cora. ``toolkit_factory(engine, memory)`` builds the tool set; tests swap the lead lookups.
     ``inbox_context(channel, thread_ts)`` returns the inbox items a digest thread lists (empty when none).
     ``executors`` defaults to none, so nothing sends unless the caller registers a channel.
+    ``extension`` is the session's hook for host-owned Slack traffic (``SlackSession``).
     The "@Cora emergency halt" alert goes to Cora's own channel (client answer 12)."""
     queue = PendingActionQueue(store, default_ttl=timedelta(hours=config.pending_action_ttl_hours))
     halt = HaltSwitch(store, config.agent_name)
@@ -325,7 +328,8 @@ def build_session(config: AgentCoreConfig, store: AgentStore, chat: ChatPort, bo
                            on_message=conversation.on_message, on_revision=conversation.on_revision,
                            bot_user_id=bot_user_id,
                            command_hook=EmergencyHalt(chat=chat, cora_halt=halt, approver_ids=config.approver_user_ids,
-                                                      alert_channel=config.slack_channel_id))
+                                                      alert_channel=config.slack_channel_id),
+                           extension=extension)
     return CoraServices(session, relay, gate)
 
 
@@ -406,7 +410,7 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
     services = build_session(config, store, chat,
                              bot_user_id, messages_client=messages_client, send_check=make_send_check(engine),
                              toolkit_factory=toolkit_factory, inbox_context=make_inbox_context(engine),
-                             executors=build_egress_executors())
+                             executors=build_egress_executors(), extension=RoutingSlack(web))
     digest = make_inbox_digest(engine, chat, config.slack_channel_id, channel_ids)
     return services._replace(web_client=web, inbox_digest=digest,
                              morning_digest=make_morning_digest(engine, store, chat, config))
