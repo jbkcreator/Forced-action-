@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -193,6 +193,38 @@ def test_db_store_saves_inside_a_savepoint_after_the_claude_call():
     assert db.events[0] == "savepoint" and db.events[-1] == "commit"
     assert ("sql", "UPDATE", cfg.TRANSCRIPT_DONE) in db.events
     assert saved[0]["phone"] == "+18135550101" and saved[0]["extraction"] == {"fields": "agent: hi"}
+
+
+@pytest.mark.parametrize("ended_at, processed_at, expected_deadline", [
+    (datetime(2026, 10, 19, 15, tzinfo=timezone.utc), datetime(2026, 10, 21, 15, tzinfo=timezone.utc),
+     date(2026, 10, 20)),
+    (datetime(2026, 10, 20, 2, tzinfo=timezone.utc), datetime(2026, 10, 21, 15, tzinfo=timezone.utc),
+     date(2026, 10, 20)),  # Monday evening ET, despite the Tuesday UTC date
+    (datetime(2026, 11, 1, 3, 30, tzinfo=timezone.utc), datetime(2026, 11, 2, 15, tzinfo=timezone.utc),
+     date(2026, 11, 1)),  # Saturday evening ET, before the DST transition
+    (NOW, NOW, date(2026, 10, 20)),
+])
+def test_relative_deadline_uses_the_call_day_after_delayed_processing(
+    monkeypatch, ended_at, processed_at, expected_deadline,
+):
+    import re
+
+    from src.lending.call_extraction import extract_call_fields
+
+    def model_answer(**request):
+        # Script only the external model: resolve "tomorrow" from the reference date it receives.
+        reference = re.search(r"Today is \w+, (\d{4}-\d{2}-\d{2})", request["system"])
+        tomorrow = date.fromisoformat(reference.group(1)) + timedelta(days=1)
+        return {"tool_input": {"next_action": "Call tomorrow", "deadline": tomorrow.isoformat()}}
+
+    monkeypatch.setattr("src.services.claude_router.call_claude_with_usage", model_answer)
+    saved = []
+    store = _store(FakeSession(), extract=extract_call_fields, saved=saved)
+    call = PendingCall("delayed", "+18135550101", ended_at)
+    store.extract_and_mark_done(call, "Borrower: Please call me tomorrow.", now=processed_at)
+
+    assert saved[0]["extraction"].deadline == expected_deadline
+    assert saved[0]["extracted_at"] == processed_at
 
 
 def test_billed_answer_that_fails_validation_keeps_its_usage_record():

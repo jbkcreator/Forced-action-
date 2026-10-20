@@ -149,7 +149,8 @@ class DbCallStore:
     def extract_and_mark_done(self, call: PendingCall, transcript: str, *, now: datetime) -> None:
         from src.lending.first_contact import LENDING_TIMEZONE
 
-        extraction = self._extract(transcript, today=now.astimezone(LENDING_TIMEZONE).date(), db=self._db)
+        call_day = call.call_ended_at.astimezone(LENDING_TIMEZONE).date()
+        extraction = self._extract(transcript, today=call_day, db=self._db)
         with self._db.begin_nested():
             self._save(self._db, dialer_call_id=call.dialer_call_id, phone=call.phone,
                        extraction=extraction, extracted_at=now)
