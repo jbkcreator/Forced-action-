@@ -911,6 +911,9 @@ class AppSettings(BaseSettings):
 	batchdialer_api_key: Optional[SecretStr] = Field(default=None, env="BATCHDIALER_API_KEY")
 	missed_call_text_enabled: bool = Field(default=False, env="MISSED_CALL_TEXT_ENABLED")  # WP-GL-9; off until consent + sender confirmed
 	lending_transcript_ingest_enabled: bool = Field(default=False, env="LENDING_TRANSCRIPT_INGEST_ENABLED")  # T-12; off: each extraction is a Claude call
+	# Josh's booking link in the missed-call texts (launch runbook Line 9). Off until the 10DLC campaign declares
+	# embedded links and the client approves the added line; off = the approved wording, no link.
+	lending_text_back_booking_link_enabled: bool = Field(default=False, env="LENDING_TEXT_BACK_BOOKING_LINK_ENABLED")
 	# Backflip borrower conflict check on the lending load. Off for launch: there is no
 	# Backflip export, and a missing or stale feed blocks every record when it is on.
 	lending_backflip_check_enabled: bool = Field(default=False, env="LENDING_BACKFLIP_CHECK_ENABLED")
@@ -965,8 +968,15 @@ class AppSettings(BaseSettings):
 	lending_partner_channel: str = Field(default="", env="LENDING_PARTNER_CHANNEL")  # P-1 partner file cards (#ndl-partner-deals); Cora Lending bot must be a member; unset = no card
 	# T-10 uncalled-lead alarms (src/lending/uncalled_alarm_worker.py)
 	lending_uncalled_alarms_enabled: bool = Field(default=False, env="LENDING_UNCALLED_ALARMS_ENABLED")
+	lending_ghl_app_url: str = Field(default="https://app.gohighlevel.com", env="LENDING_GHL_APP_URL")  # GHL web app base for contact links (white-label domain if any)
+	lending_lead_arrival_alert_enabled: bool = Field(default=False, env="LENDING_LEAD_ARRIVAL_ALERT_ENABLED")  # T-05: @-mention Josh in LENDING_OPS_CHANNEL when a LendingFlow lead arrives
 	lending_alarm_sms_to: Optional[str] = Field(default=None, env="LENDING_ALARM_SMS_TO")  # Josh's mobile; normalized before use
 	lending_ops_channel: str = Field(default="", env="LENDING_OPS_CHANNEL")  # #lendingops channel ID; 5-minute escalation post, opt-out alerts
+	# 14-day follow-up (src/lending/ghl_call_import.py): record calls made in GoHighLevel in lending.call_dispositions
+	lending_ghl_call_import_enabled: bool = Field(default=False, env="LENDING_GHL_CALL_IMPORT_ENABLED")
+	# Retargeting audience export (src/tasks/lending_audience_export.py): nightly hashed files, written only when both are set
+	lending_audience_export_enabled: bool = Field(default=False, env="LENDING_AUDIENCE_EXPORT_ENABLED")
+	lending_audience_export_dir: Optional[str] = Field(default=None, env="LENDING_AUDIENCE_EXPORT_DIR")
 	# Opt-out mailbox listener (src/lending/email_opt_out.py): reads mail sent to LENDING_OPTOUT_ADDRESS over IMAP.
 	# The mailbox is either a dedicated optout@ mailbox or the one optout@ forwards into; off while user or password is unset.
 	lending_optout_imap_host: str = Field(default="imap.porkbun.com", env="LENDING_OPTOUT_IMAP_HOST")
@@ -1143,6 +1153,20 @@ class AppSettings(BaseSettings):
 	# Email fallback (B4) stays off until hello@nextdeallending.com has a sender behind it
 	# (Porkbun DNS + Google Workspace are not provisioned). Off = recorded as skipped, never "sent".
 	booking_reminder_email_enabled: bool = Field(default=False, env="BOOKING_REMINDER_EMAIL_ENABLED")
+	# Reschedule link added to the 90-minute text and email. Unset or blank = approved wording unchanged.
+	lending_reschedule_url: Optional[str] = Field(default=None, env="LENDING_RESCHEDULE_URL")
+
+	@field_validator("lending_reschedule_url", mode="before")
+	@classmethod
+	def _https_reschedule_url(cls, value):
+		if value is None:
+			return None
+		url = str(value).strip()
+		if not url:
+			return None
+		if not url.startswith("https://") or any(c.isspace() for c in url):
+			raise ValueError("LENDING_RESCHEDULE_URL must be a single https:// URL")
+		return url
 	# Verified GHL sending address for those emails (hello@nextdeallending.com). Unset = no email sender.
 	lending_ghl_email_from: Optional[str] = Field(default=None, env="LENDING_GHL_EMAIL_FROM")
 	# Logs the key paths (never values) of each incoming lending GHL webhook, to confirm the real field names.

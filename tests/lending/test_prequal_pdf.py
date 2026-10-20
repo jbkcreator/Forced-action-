@@ -90,3 +90,8 @@ def test_letter_has_no_company_name_and_is_signed_by_josh():
 
 def test_range_has_no_upper_clamp_when_a_lender_states_no_maximum():
     assert prequal.compute_range(500_000, [FitLimits(75_000, None)], 10) == (450_000, 550_000)
+
+
+def test_watermark_text_is_the_runbook_string_exactly():
+    """The pre-qual watermark text must not change."""
+    assert NON_BINDING_PREQUAL_WATERMARK == "NON-BINDING PRE-QUALIFICATION ESTIMATE — FOR INFORMATIONAL PURPOSES ONLY"

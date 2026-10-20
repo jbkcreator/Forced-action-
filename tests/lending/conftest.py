@@ -6,6 +6,8 @@ nothing persists in the shared database.
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -14,6 +16,7 @@ from sqlalchemy.orm import Session
 from migrations.apply_lending_call_dispositions_dialer import apply_to
 from migrations.apply_lending_ghl_stage_events import apply_to as apply_to_stage_events
 from migrations.apply_lending_pr319_client_feedback import apply_to as apply_to_feedback
+from migrations.apply_lending_followup_call_tracking import apply_to as apply_to_followup
 from src.lending.models import LENDING_SCHEMA, LendingCallDisposition
 
 
@@ -25,18 +28,23 @@ def lending_db():
     url = get_settings().database_url
     if not url:
         pytest.skip("requires a live Postgres DATABASE_URL")
-    engine = create_engine(str(url), connect_args={"connect_timeout": 5})
+    engine = create_engine(str(url), connect_args={"connect_timeout": 20})  # the shared database can be slow to reach (SSH tunnel)
     try:
         conn = engine.connect()
     except Exception:
         engine.dispose()
         pytest.skip("Postgres is not reachable")
     tx = conn.begin()
+    # The database is live and apply_to() locks call_dispositions: a test that cannot get a lock fails fast instead
+    # of queueing live jobs behind it, and a session left open by a killed run rolls back and closes after a minute.
+    conn.execute(text("SET LOCAL lock_timeout = '5s'"))
+    conn.execute(text("SET LOCAL idle_in_transaction_session_timeout = '60s'"))
     conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{LENDING_SCHEMA}"'))
     LendingCallDisposition.__table__.create(bind=conn, checkfirst=True)
     apply_to(conn)  # DDL is transactional: the vendor-neutral migration is rolled back with the test
     apply_to_feedback(conn)
     apply_to_stage_events(conn)
+    apply_to_followup(conn)  # call_source column (checked first, so no lock on the live table)
     session = Session(bind=conn, join_transaction_mode="create_savepoint")
     yield session
     session.close()
@@ -83,6 +91,30 @@ def _no_live_web_lead_sink(monkeypatch):
     monkeypatch.setattr("src.api.lending_web_router.get_live_sink", lambda: None)
 
 
+class _InboxRecorder:
+    """Stands in for the session ``add_to_inbox_in_own_session`` opens: records each event, writes nothing."""
+
+    def __init__(self):
+        self.events: list[dict] = []
+
+    @contextmanager
+    def __call__(self):
+        yield self
+
+    def execute(self, statement, params=None):
+        self.events.append(dict(params or {}))
+        return SimpleNamespace(scalar_one_or_none=lambda: len(self.events))
+
+
+@pytest.fixture(autouse=True)
+def inbox_writes(monkeypatch):
+    """Events alert paths add to Cora's inbox on their own session. A test must never commit one to the shared
+    database; events added on a test's own (rolled-back) session are unaffected."""
+    recorder = _InboxRecorder()
+    monkeypatch.setattr("src.lending.cora_inbox._own_session_factory", recorder)
+    return recorder.events
+
+
 @pytest.fixture
 def web_leads_db(lending_db):
     """lending_db plus lending.web_leads (rolled back with the test)."""
@@ -109,7 +141,7 @@ def prequal_db():
     url = get_settings().database_url
     if not url:
         pytest.skip("requires a live Postgres DATABASE_URL")
-    engine = create_engine(str(url), connect_args={"connect_timeout": 5})
+    engine = create_engine(str(url), connect_args={"connect_timeout": 20})  # the shared database can be slow to reach (SSH tunnel)
     try:
         conn = engine.connect()
     except Exception:
@@ -126,3 +158,23 @@ def prequal_db():
     tx.rollback()
     conn.close()
     engine.dispose()
+
+
+class _NotHalted:
+    """Stands in for the emergency-halt flag read: off, and never a query to the shared database."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, statement, params=None):
+        return SimpleNamespace(scalar=lambda: False)
+
+
+@pytest.fixture(autouse=True)
+def global_halt_off(monkeypatch):
+    """The lending emergency halt reads Postgres before every GHL send and dialer load; tests run with it off.
+    Tests of the halt itself swap in their own session factory."""
+    monkeypatch.setattr("src.lending.global_halt._session_factory", _NotHalted)

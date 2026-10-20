@@ -22,6 +22,7 @@ from config.lending_dispositions import (
     SHEET_TIMEZONE,
 )
 from config.settings import get_settings
+from src.lending.cora_inbox import add_to_inbox_in_own_session
 from src.lending.db import lending_session
 from src.lending.dispositions import last4, lookup_load_record
 
@@ -247,17 +248,24 @@ def _deliver_slack(db, row: dict, client: Any) -> None:
 
 def alert_unpropagated_dnc(call_id: str, caller_seat: Optional[str], client: Any = None) -> None:
     """Tell #dial-tasks a DNC request could not be propagated (no usable phone number). Never raises."""
+    posted = False
     if not (client or _configured_slack()):
         logger.error("[lending] call %s: DNC request could not be propagated and Slack is not configured", call_id)
-        return
-    try:
-        (client or _slack_client()).chat_postMessage(
-            channel=get_settings().lending_dial_tasks_channel,
-            text=(f":rotating_light: DNC request NOT propagated — call {call_id} (caller seat {caller_seat or 'unknown'}) "
-                  "has no usable phone number. Add the contact to the suppression list manually."),
-        )
-    except Exception as exc:
-        logger.error("[lending] call %s: DNC alert failed: %s", call_id, type(exc).__name__)
+    else:
+        try:
+            (client or _slack_client()).chat_postMessage(
+                channel=get_settings().lending_dial_tasks_channel,
+                text=(f":rotating_light: DNC request NOT propagated — call {call_id} (caller seat {caller_seat or 'unknown'}) "
+                      "has no usable phone number. Add the contact to the suppression list manually."),
+            )
+            posted = True
+        except Exception as exc:
+            logger.error("[lending] call %s: DNC alert failed: %s", call_id, type(exc).__name__)
+    add_to_inbox_in_own_session(
+        event_type="dnc_not_propagated", dedup_key=call_id, target_channel="dial_tasks", channel_posted=posted,
+        summary="DNC request not propagated (no usable phone): add the contact to the suppression list by hand",
+        payload={"dialer_call_id": call_id, "caller_seat": caller_seat},
+    )
 
 
 def alert_unknown_code(call_id: str, raw_code: str, caller_seat: Optional[str], client: Any = None) -> None:
@@ -278,15 +286,22 @@ def alert_unknown_code(call_id: str, raw_code: str, caller_seat: Optional[str], 
 def alert_dnc_removal_pending(call_id: str, caller_seat: Optional[str], client: Any = None) -> None:
     """Tell #dial-tasks a DNC request is recorded everywhere except the dialer, where the
     removal is not confirmed: the person may still be dialable. Never raises."""
+    posted = False
     if not (client or _configured_slack()):
         logger.error("[lending] call %s: DNC removal from the dialer is pending and Slack is not configured", call_id)
-        return
-    try:
-        (client or _slack_client()).chat_postMessage(
-            channel=get_settings().lending_dial_tasks_channel,
-            text=(f":rotating_light: DNC request recorded but NOT yet removed from the dialer — call {call_id} "
-                  f"(caller seat {caller_seat or 'unknown'}). Remove the contact in the dialer manually until the "
-                  "automatic removal is confirmed."),
-        )
-    except Exception as exc:
-        logger.error("[lending] call %s: DNC removal-pending alert failed: %s", call_id, type(exc).__name__)
+    else:
+        try:
+            (client or _slack_client()).chat_postMessage(
+                channel=get_settings().lending_dial_tasks_channel,
+                text=(f":rotating_light: DNC request recorded but NOT yet removed from the dialer — call {call_id} "
+                      f"(caller seat {caller_seat or 'unknown'}). Remove the contact in the dialer manually until the "
+                      "automatic removal is confirmed."),
+            )
+            posted = True
+        except Exception as exc:
+            logger.error("[lending] call %s: DNC removal-pending alert failed: %s", call_id, type(exc).__name__)
+    add_to_inbox_in_own_session(
+        event_type="dnc_removal_pending", dedup_key=call_id, target_channel="dial_tasks", channel_posted=posted,
+        summary="DNC recorded but not yet removed from the dialer: remove the contact in the dialer by hand",
+        payload={"dialer_call_id": call_id, "caller_seat": caller_seat},
+    )

@@ -33,6 +33,7 @@ from sqlalchemy import text
 from config.lending_compliance import RemovalReason
 from config.lending_dialer import POOL_CAMPAIGN_TAGS
 from config.settings import get_settings
+from src.lending.global_halt import is_globally_halted
 from src.lending.backflip_conflict import (
     BorrowerRecord,
     find_borrower_conflicts,
@@ -114,6 +115,8 @@ class LoadReport:
     active_not_in_run: int = 0
     backflip_check: bool = True
     suppressed_mid_run: int = 0  # opted out after the start-of-run gate; skipped before the push
+    halted_mid_run: int = 0  # not pushed: the emergency halt was set while the run was loading
+    loaded_refs: list[str] = field(default_factory=list)  # record refs pushed live; not in as_dict
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -134,6 +137,7 @@ class LoadReport:
             "active_not_in_run": self.active_not_in_run,
             "backflip_check": self.backflip_check,
             "suppressed_mid_run": self.suppressed_mid_run,
+            "halted_mid_run": self.halted_mid_run,
         }
 
 
@@ -476,6 +480,8 @@ def run_dialer_load(
     report = LoadReport(run_id=run_id, dry_run=dry_run, total=len(records), backflip_check=backflip_check)
     if not dry_run and (scrubber is None or dialer is None):
         raise ValueError("a live load needs a scrubber and a dialer")
+    if not dry_run and is_globally_halted():
+        raise LoadRefused("lending emergency halt is on; nothing loaded into the dialer")
     phones = [normalize_phone(r.get("normalized_phone") or r.get("phone") or "") for r in records]
     if not dry_run:
         _refuse_before_scrub(records, phones, db, campaign_tags, backflip_check)
@@ -553,7 +559,12 @@ def run_dialer_load(
     chunk: list[tuple[_Loadable, int]] = []
     cards = _cards(db, loadable)
     try:
-        for item in loadable:
+        for position, item in enumerate(loadable):
+            if is_globally_halted():  # rechecked per push: an approver can halt while a long run is loading
+                report.halted_mid_run = len(loadable) - position
+                logger.warning("[dialer-load] live run %s stopped by the lending emergency halt; %d not loaded",
+                               run_id, report.halted_mid_run)
+                break
             if _suppressed_phones(db, [item.phone]):  # one indexed lookup per push (a push is 3 HTTP calls)
                 report.suppressed_mid_run += 1
                 _write_exclusions(db, run_id, [{
@@ -576,6 +587,7 @@ def run_dialer_load(
                 contact_id = exc.contact_id  # live in the dialer: track it so opt-out can delete it
             else:
                 report.loaded += 1
+                report.loaded_refs.append(item.record_ref)
                 report.created += int(result.created)
                 report.updated += int(not result.created)
                 contact_id = result.contact_id

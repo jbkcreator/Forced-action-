@@ -27,6 +27,7 @@ from config.lending_reply_agent import (
     REPLY_SLA_BUSINESS_MINUTES,
     REPLY_WEEKDAYS,
 )
+from src.lending.cora_inbox import add_to_inbox_safely
 from src.lending.db import lending_session
 from src.lending.reply_guard import slack_poster
 
@@ -84,6 +85,16 @@ def format_alert(rows: Sequence[Mapping[str, Any]]) -> str:
     return "\n".join([head, *lines])
 
 
+def _queue_for_cora(db, row: Mapping[str, Any]) -> None:
+    """Raise each overdue handoff in Cora's main thread too, one event per handoff."""
+    add_to_inbox_safely(
+        db, event_type="reply_overdue", dedup_key=row["message_id"], target_channel="replies", channel_posted=True,
+        summary=f"Unanswered {row['kind'].replace('_', ' ')} past the one-business-hour window",
+        payload={"kind": row["kind"], "ghl_message_id": row["message_id"], "ghl_contact_id": row["contact_id"],
+                 "posted_at": row["posted_at"]},
+    )
+
+
 def main(*, now: Optional[datetime] = None) -> int:
     now = now or datetime.now(timezone.utc)
     poster = slack_poster()
@@ -97,6 +108,8 @@ def main(*, now: Optional[datetime] = None) -> int:
                 return 0
             poster(format_alert(rows))
             db.execute(_MARK_ALERTED, {"ids": [r["message_id"] for r in rows]})
+            for row in rows:
+                _queue_for_cora(db, row)
             db.commit()
     except Exception as exc:  # class only: rows carry GHL contact ids
         logger.error("[reply-sla] check failed (%s)", type(exc).__name__)

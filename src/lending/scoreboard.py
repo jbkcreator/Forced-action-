@@ -1,4 +1,4 @@
-"""7:20pm scoreboard from the disposition log (client Part 5.6): per caller and per campaign."""
+"""Scoreboard from the disposition log (client Part 5.6, launch runbook Line 11): the 7:20pm board and the hourly day-so-far board."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -10,7 +10,10 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import text
 
 from config.lending_compliance import DEFAULT_TZ
-from config.lending_dispositions import ANSWERED_CODES, BOOKED_CODE, GATED_CODES, LIVE_CONVERSATION_CODES, NURTURE_SENT_CODES, SHOWED_STAGE_KEYS
+from config.lending_dispositions import (
+    ANSWERED_CODES, BOOKED_CODE, GATED_CODES, LIVE_CONVERSATION_CODES, LONG_CONVERSATION_SECONDS, NURTURE_SENT_CODES,
+    SHOWED_STAGE_KEYS, TRANSFER_CODES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +22,8 @@ _KEYS = {  # SQL literals, never user input
     "caller": "COALESCE(NULLIF(caller_name, ''), NULLIF(caller_seat, ''), '(unknown)')",
     "campaign": "COALESCE(NULLIF(dialer_campaign_id, ''), '')",
     "hook": "COALESCE(NULLIF(campaign_tag, ''), '')",
+    "seat": "COALESCE(NULLIF(caller_seat, ''), '(unknown)')",
+    "source": "COALESCE(NULLIF(source_tag, ''), '')",
 }
 
 
@@ -31,10 +36,18 @@ class Row:
     booked: int
     nurture: int
     showed: int = 0
+    long_calls: int = 0
+    transfers: int = 0
 
     @property
     def connect_rate(self) -> float:
         return self.live / self.dials if self.dials else 0.0
+
+    @property
+    def show_rate(self) -> Optional[float]:
+        """Held today / Booked today; None when nothing was booked, so there is no division. The two counts are
+        different calls (a call held today may have been booked on an earlier day), so this is not a conversion rate."""
+        return self.showed / self.booked if self.booked else None
 
     @property
     def book_rate(self) -> float:
@@ -59,6 +72,8 @@ class ScoreboardData:
     by_hook: list[Row]
     total: Row
     by_number: list[NumberRow] = field(default_factory=list)
+    by_seat: list[Row] = field(default_factory=list)
+    by_source: list[Row] = field(default_factory=list)
 
 
 def _bounds(day: date) -> tuple[datetime, datetime]:
@@ -66,19 +81,27 @@ def _bounds(day: date) -> tuple[datetime, datetime]:
     return (datetime.combine(day, time.min, tzinfo=tz), datetime.combine(day + timedelta(days=1), time.min, tzinfo=tz))
 
 
-def _query(db, key: str, day: date) -> list[tuple[str, int, int, int, int, int]]:
+def _query(db, key: str, day: date) -> list[tuple[str, int, int, int, int, int, int, int]]:
     start, end = _bounds(day)
+    params = {"live": sorted(LIVE_CONVERSATION_CODES), "gated": sorted(GATED_CODES), "nurture": sorted(NURTURE_SENT_CODES),
+              "booked": BOOKED_CODE, "long": LONG_CONVERSATION_SECONDS, "start": start, "end": end}
+    if TRANSFER_CODES:
+        transfers = "count(*) FILTER (WHERE disposition = ANY(:transfer))"
+        params["transfer"] = sorted(TRANSFER_CODES)
+    else:
+        transfers = "0"  # the dialer records no transfer yet; the board shows n/a
     rows = db.execute(
         text(f"SELECT {_KEYS[key]} AS k, count(*) AS dials, "
              "count(*) FILTER (WHERE disposition = ANY(:live)) AS live, "
              "count(*) FILTER (WHERE disposition = ANY(:gated)) AS gated, "
              "count(*) FILTER (WHERE disposition = :booked AND NOT booking_blocked) AS booked, "
-             "count(*) FILTER (WHERE disposition = ANY(:nurture)) AS nurture "
+             "count(*) FILTER (WHERE disposition = ANY(:nurture)) AS nurture, "
+             "count(*) FILTER (WHERE talk_duration_sec >= :long) AS long_calls, "
+             f"{transfers} AS transfers "
              "FROM lending.call_dispositions "
              "WHERE direction = 'outbound' AND call_ended_at >= :start AND call_ended_at < :end "
              "GROUP BY 1 ORDER BY dials DESC, k"),
-        {"live": sorted(LIVE_CONVERSATION_CODES), "gated": sorted(GATED_CODES), "nurture": sorted(NURTURE_SENT_CODES),
-         "booked": BOOKED_CODE, "start": start, "end": end},
+        params,
     ).all()
     return [tuple(r) for r in rows]
 
@@ -109,8 +132,8 @@ def _showed(db, key: str, day: date) -> dict[str, int]:
             rows = db.execute(
                 text(f"SELECT {_KEYS[key]} AS k, count(*) FROM ("
                      "SELECT COALESCE(NULLIF(b.caller_name, ''), e.booked_by) AS caller_name, b.caller_seat, "
-                     "b.dialer_campaign_id, b.campaign_tag FROM lending.ghl_stage_events e "
-                     "LEFT JOIN LATERAL (SELECT caller_name, caller_seat, dialer_campaign_id, campaign_tag "
+                     "b.dialer_campaign_id, b.campaign_tag, b.source_tag FROM lending.ghl_stage_events e "
+                     "LEFT JOIN LATERAL (SELECT caller_name, caller_seat, dialer_campaign_id, campaign_tag, source_tag "
                      "FROM lending.call_dispositions d WHERE d.phone = e.phone AND d.disposition = :booked "
                      "ORDER BY d.call_ended_at DESC NULLS LAST LIMIT 1) b ON true "
                      "WHERE e.stage_key = ANY(:showed) AND e.event_at >= :start AND e.event_at < :end) s GROUP BY 1"),
@@ -125,8 +148,9 @@ def _showed(db, key: str, day: date) -> dict[str, int]:
 def _rows(raw, showed: dict[str, int], name_of) -> list[Row]:
     by_key = {k: vals for k, *vals in raw}
     for k in showed:  # booked on an earlier day, showed today: no dials today, still counted
-        by_key.setdefault(k, [0, 0, 0, 0, 0])
-    return [Row(name_of(k), *vals, showed.get(k, 0)) for k, vals in by_key.items()]
+        by_key.setdefault(k, [0, 0, 0, 0, 0, 0, 0])
+    # query order: dials, live, gated, booked, nurture, long_calls, transfers; Row puts showed after nurture
+    return [Row(name_of(k), *vals[:5], showed.get(k, 0), *vals[5:]) for k, vals in by_key.items()]
 
 
 def build_scoreboard(db, day: date, campaign_names: Optional[Mapping[str, str]] = None) -> ScoreboardData:
@@ -135,22 +159,44 @@ def build_scoreboard(db, day: date, campaign_names: Optional[Mapping[str, str]] 
     campaigns = _rows(_query(db, "campaign", day), _showed(db, "campaign", day),
                       lambda k: names.get(k, f"Campaign {k}") if k else UNATTRIBUTED)
     hooks = _rows(_query(db, "hook", day), _showed(db, "hook", day), lambda k: k or UNATTRIBUTED)
-    total = Row("TOTAL", *(sum(getattr(r, f) for r in callers) for f in ("dials", "live", "gated", "booked", "nurture", "showed")))
-    return ScoreboardData(callers, campaigns, hooks, total, _by_number(db, day))
+    seats = _rows(_query(db, "seat", day), _showed(db, "seat", day), lambda k: k)
+    sources = _rows(_query(db, "source", day), _showed(db, "source", day), lambda k: k or UNATTRIBUTED)
+    total = Row("TOTAL", *(sum(getattr(r, f) for r in callers)
+                           for f in ("dials", "live", "gated", "booked", "nurture", "showed", "long_calls", "transfers")))
+    return ScoreboardData(callers, campaigns, hooks, total, _by_number(db, day), seats, sources)
 
 
-_COLUMNS = ("Dials", "Live", "Gated", "Booked", "Showed", "Nurture", "Connect", "Book rate")
+_COLUMNS = ("Dials", "Contacts", "2m+", "Gated", "Booked", "Xfer", "Showed", "Show%", "Nurture", "Connect", "Book rate")
+_XFER = _COLUMNS.index("Xfer")
 _NUMBER_COLUMNS = ("Dials", "Answered", "Answer rate")
-MAX_TABLE_ROWS = 25  # a Slack section holds 3000 chars
+MAX_TABLE_ROWS = 20  # a Slack section holds 3000 chars
 MAX_NAME_CHARS = 26
-LEGEND = ("Live = real conversation · Gated = booked or failed the gate · Nurture = nurture sent · "
-          "Showed = moved to Held in GHL, credited to the caller who booked it · "
-          "Connect = Live ÷ Dials · Book rate = Booked ÷ Live")
+LEGEND = ("Contacts = real conversation · 2m+ = calls with 2+ min of talk time, any result (incl. long voicemails) · "
+          "Gated = booked or failed the gate · "
+          "Xfer = transferred to Josh (in the totals only, n/a until the dialer records transfers) · Nurture = nurture sent · "
+          "Showed = moved to Held in GHL today, credited to the caller who booked it · "
+          "Show% = Held today ÷ Booked today (different calls, not a conversion rate) · "
+          "Connect = Contacts ÷ Dials · Book rate = Booked ÷ Contacts")
+TOTALS_PER_SECTION = 6  # a Slack section holds at most 10 fields
+
+
+def _transfers(n: int) -> str:
+    return str(n) if TRANSFER_CODES else "n/a"
+
+
+def _show_rate(r: Row) -> str:
+    return f"{r.show_rate:.0%}" if r.show_rate is not None else "–"
+
+
+def _table_columns() -> tuple[str, ...]:
+    """Xfer is left out of the per-section tables while it can only show n/a: it keeps them narrow on Slack mobile."""
+    return _COLUMNS if TRANSFER_CODES else _COLUMNS[:_XFER] + _COLUMNS[_XFER + 1:]
 
 
 def _cells(r: Row) -> list[str]:
-    return [str(r.dials), str(r.live), str(r.gated), str(r.booked), str(r.showed), str(r.nurture),
-            f"{r.connect_rate:.0%}", f"{r.book_rate:.0%}"]
+    cells = [str(r.dials), str(r.live), str(r.long_calls), str(r.gated), str(r.booked), _transfers(r.transfers),
+             str(r.showed), _show_rate(r), str(r.nurture), f"{r.connect_rate:.0%}", f"{r.book_rate:.0%}"]
+    return cells if TRANSFER_CODES else cells[:_XFER] + cells[_XFER + 1:]
 
 
 def _number_cells(r: NumberRow) -> list[str]:
@@ -179,7 +225,7 @@ def _table(label: str, rows: list[Row]) -> str:
     if not rows:
         return "_no dials_"
     shown = rows[:MAX_TABLE_ROWS]
-    return _render(label, _COLUMNS, [r.name for r in shown], [_cells(r) for r in shown], len(rows))
+    return _render(label, _table_columns(), [r.name for r in shown], [_cells(r) for r in shown], len(rows))
 
 
 def _number_table(rows: list[NumberRow]) -> str:
@@ -190,7 +236,8 @@ def _number_table(rows: list[NumberRow]) -> str:
 
 
 def _sections(data: ScoreboardData) -> list[tuple[str, str, list[Row]]]:
-    return [("By caller", "Caller", data.by_caller), ("By campaign", "Campaign", data.by_campaign),
+    return [("By seat", "Seat", data.by_seat), ("By source", "Source", data.by_source),
+            ("By caller", "Caller", data.by_caller), ("By campaign", "Campaign", data.by_campaign),
             ("By hook (campaign tag): which hook works", "Hook", data.by_hook)]
 
 
@@ -202,27 +249,37 @@ def _title(day: date) -> str:
 
 
 def _totals(t: Row) -> list[tuple[str, str]]:
-    return [("Dials", str(t.dials)), ("Live", str(t.live)), ("Gated", str(t.gated)), ("Booked", str(t.booked)),
-            ("Showed", str(t.showed)), ("Nurture", str(t.nurture)), ("Connect", f"{t.connect_rate:.0%}"),
+    return [("Dials", str(t.dials)), ("Contacts", str(t.live)), ("Calls 2+ min", str(t.long_calls)),
+            ("Gated", str(t.gated)), ("Booked", str(t.booked)), ("Transfers", _transfers(t.transfers)),
+            ("Showed", str(t.showed)), ("Held ÷ Booked", _show_rate(t)), ("Nurture", str(t.nurture)), ("Connect", f"{t.connect_rate:.0%}"),
             ("Book rate", f"{t.book_rate:.0%}")]
 
 
-def format_slack(data: ScoreboardData, day: date) -> str:
-    """Plain mrkdwn version: the notification preview and the fallback when blocks are unavailable."""
+def _clock(moment: datetime) -> str:
+    return f"{moment.hour % 12 or 12}:{moment.minute:02d} {'am' if moment.hour < 12 else 'pm'} ET"
+
+
+def format_slack(data: ScoreboardData, day: date, as_of: Optional[datetime] = None) -> str:
+    """Plain mrkdwn version: the notification preview and the fallback when blocks are unavailable.
+    ``as_of`` (Eastern) marks an hourly day-so-far board; without it this is the closing 7:20pm board."""
     totals = " | ".join(f"{k} {v}" for k, v in _totals(data.total))
-    out = [f"*{_title(day)}* (through 7:15pm ET)", f"TOTAL: {totals}"]
+    span = f"as of {_clock(as_of)}" if as_of else "through 7:15pm ET"
+    out = [f"*{_title(day)}* ({span})", f"TOTAL: {totals}"]
     for title, label, rows in _sections(data):
         out += ["", f"*{title}*", _table(label, rows)]
     out += ["", f"*{NUMBER_TITLE}*", _number_table(data.by_number)]
     return "\n".join(out)
 
 
-def format_blocks(data: ScoreboardData, day: date) -> list[dict]:
+def format_blocks(data: ScoreboardData, day: date, as_of: Optional[datetime] = None) -> list[dict]:
+    span = f"Outbound dials today, as of {_clock(as_of)}" if as_of else "Outbound dials through 7:15pm ET"
+    fields = [{"type": "mrkdwn", "text": f"*{k}*\n{v}"} for k, v in _totals(data.total)]
     blocks: list[dict] = [
         {"type": "header", "text": {"type": "plain_text", "text": f":telephone_receiver: {_title(day)}", "emoji": True}},
-        {"type": "context", "elements": [{"type": "mrkdwn", "text": "Outbound dials through 7:15pm ET"}]},
-        {"type": "section", "fields": [{"type": "mrkdwn", "text": f"*{k}*\n{v}"} for k, v in _totals(data.total)]},
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": span}]},
     ]
+    blocks += [{"type": "section", "fields": fields[i:i + TOTALS_PER_SECTION]}
+               for i in range(0, len(fields), TOTALS_PER_SECTION)]
     for title, label, rows in _sections(data):
         blocks += [{"type": "divider"},
                    {"type": "section", "text": {"type": "mrkdwn", "text": f"*{title}*\n{_table(label, rows)}"}}]
