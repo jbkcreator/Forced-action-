@@ -910,6 +910,7 @@ class AppSettings(BaseSettings):
 	aircall_api_token: Optional[SecretStr] = Field(default=None, env="AIRCALL_API_TOKEN")
 	batchdialer_api_key: Optional[SecretStr] = Field(default=None, env="BATCHDIALER_API_KEY")
 	missed_call_text_enabled: bool = Field(default=False, env="MISSED_CALL_TEXT_ENABLED")  # WP-GL-9; off until consent + sender confirmed
+	lending_transcript_ingest_enabled: bool = Field(default=False, env="LENDING_TRANSCRIPT_INGEST_ENABLED")  # T-12; off: each extraction is a Claude call
 	# Josh's booking link in the missed-call texts (launch runbook Line 9). Off until the 10DLC campaign declares
 	# embedded links and the client approves the added line; off = the approved wording, no link.
 	lending_text_back_booking_link_enabled: bool = Field(default=False, env="LENDING_TEXT_BACK_BOOKING_LINK_ENABLED")

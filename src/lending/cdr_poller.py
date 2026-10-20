@@ -1,5 +1,7 @@
 """BatchDialer CDR poller: fast poll for new calls, periodic day rescan.
 
+Transcript ingest (T-12) runs in its own process, ``src.lending.transcript_worker``.
+
 Usage:
     python -m src.lending.cdr_poller            # loop
     python -m src.lending.cdr_poller --once     # single fast poll + rescan (smoke test)
@@ -16,7 +18,11 @@ from typing import Callable, Optional
 
 from sqlalchemy import text
 
-from config.lending_dispositions import CDR_POLL_LOCK_KEY, CDR_POLL_SECONDS, CDR_RESCAN_SECONDS
+from config.lending_dispositions import (
+    CDR_POLL_LOCK_KEY,
+    CDR_POLL_SECONDS,
+    CDR_RESCAN_SECONDS,
+)
 from src.lending.call_pipeline import lending_campaign_ids, retry_unpropagated_dnc
 from src.lending.cdr_poll import IngestStats, poll_new, rescan_today
 from src.lending.db import lending_session

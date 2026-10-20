@@ -130,7 +130,7 @@ DIRECTION_ALIASES: dict[str, str] = {"out": "outbound", "outbound": "outbound", 
 # connected and the caller has not chosen a result yet.
 CDR_ANSWERED_STATUSES = frozenset({"ANSWER", "ANSWERED"})
 
-CDR_POLL_SECONDS = 15      # GET /v2/cdrs/last: keeps the 60-second text reachable
+CDR_POLL_SECONDS = 5       # GET /v2/cdrs/last; Runbook § 3 line 10 / § 5.1: 5-second ingestion (T-12)
 CDR_RESCAN_SECONDS = 120   # GET /v2/cdrs for today + yesterday (UTC)
 CDR_POLL_LOCK_KEY = 7_302_020_803  # one poller at a time: the /last watermark is shared per integration
 
@@ -155,3 +155,28 @@ def validate_dispositions_config() -> None:
 # BatchDialer contact custom field the caller sets during the call ("OK if I text you?" -> yes).
 TEXT_CONSENT_FIELD = "text_consent"
 TEXT_CONSENT_YES = "yes"
+
+
+# T-12 audio fallback. BatchDialer has no live audio stream; the poller fetches each answered
+# call's transcript (GET /cdrs/{id}/transcription) once the call ends and runs the call
+# extraction. Off unless LENDING_TRANSCRIPT_INGEST_ENABLED (every extraction is a Claude call).
+TRANSCRIPT_DONE = "done"        # transcript fetched and extracted
+TRANSCRIPT_MISSING = "missing"  # none arrived within TRANSCRIPT_MAX_WAIT_SECONDS of the call end
+TRANSCRIPT_FAILED = "failed"    # invalid extraction output, or out of retries: never retried (each try is a Claude call)
+TRANSCRIPT_DEFERRED = "deferred"  # transcript fetched, extraction waiting: AI paused or a temporary API error
+TRANSCRIPT_STATUSES = (TRANSCRIPT_DONE, TRANSCRIPT_MISSING, TRANSCRIPT_FAILED, TRANSCRIPT_DEFERRED)  # NULL = still pending; DB CHECK
+# Per-tick counter keys for calls left pending (not stored).
+TRANSCRIPT_NOT_READY = "not_ready"
+TRANSCRIPT_FETCH_FAILED = "fetch_failed"
+TRANSCRIPT_RATE_LIMITED = "rate_limited"
+TRANSCRIPT_PAUSED = "paused"            # extraction deferred: vendor cost pause active
+TRANSCRIPT_EXTRACT_RETRY = "extract_retry"  # extraction deferred: temporary API error
+# The one definition of "pending": the poller's queries and the migration's partial index
+# both use it, so the index always matches the query.
+TRANSCRIPT_PENDING_PREDICATE = "transcript_status IS NULL AND talk_duration_sec > 0"
+TRANSCRIPT_BATCH_SIZE = 10
+TRANSCRIPT_MAX_WAIT_SECONDS = 30 * 60
+TRANSCRIPT_POLL_SECONDS = 5    # transcript worker cycle (own process, never the CDR poller tick)
+TRANSCRIPT_WORKER_LOCK_KEY = 7_302_020_804  # one transcript worker at a time
+TRANSCRIPT_RETRY_SECONDS = 30   # a not-ready call waits this long before its next fetch
+TRANSCRIPT_MAX_EXTRACT_ATTEMPTS = 3  # temporary API errors per call before it is marked failed (pauses do not count)

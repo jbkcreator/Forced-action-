@@ -258,6 +258,9 @@ class LendingCallDisposition(LendingBase):
     slack_posted_disposition: Mapped[Optional[str]] = mapped_column(String(50))
     slack_ts: Mapped[Optional[str]] = mapped_column(String(50))
     opt_out_propagated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    transcript_status: Mapped[Optional[str]] = mapped_column(String(20))  # T-12: NULL pending, done, missing, failed, deferred
+    transcript_attempted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # T-12: last not-ready fetch
+    transcript_attempts: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=0, server_default=text("0"))  # temporary extraction errors
     raw_event: Mapped[dict] = mapped_column(JSONB, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
