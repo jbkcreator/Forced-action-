@@ -267,6 +267,39 @@ def test_an_approver_routes_an_item_to_a_channel_cora_is_in(digest_db):
     assert (row["status"], row["routed_channel"], row["decided_by"]) == ("routed", "lending-ops", JOSH)
 
 
+@pytest.mark.parametrize("event", [
+    # the payloads booking_webhook and disposition_delivery store: the ids live only here, not in the summary
+    {"event_type": "slot_release_failed", "dedup_key": "route-appt-1", "target_channel": "replies",
+     "summary": "GHL slot not released after a failed check: cancel it by hand",
+     "payload": {"ghl_appointment_id": "route-appt-1"}, "expected": ["ghl appointment id: route-appt-1"]},
+    {"event_type": "dnc_removal_pending", "dedup_key": "route-call-9", "target_channel": "dial_tasks",
+     "summary": "DNC recorded but not yet removed from the dialer: remove the contact in the dialer by hand",
+     "payload": {"dialer_call_id": "route-call-9", "caller_seat": "seat-3"},
+     "expected": ["dialer call id: route-call-9", "caller seat: seat-3"]},
+], ids=["slot_release_failed", "dnc_removal_pending"])
+def test_a_routed_item_carries_the_ids_from_its_payload_without_a_note(digest_db, event):
+    expected = event.pop("expected")
+    item_id = add_to_inbox(digest_db, **event)
+    slack = FakeSlack()
+    outcome = _run(_toolkit(digest_db, slack), "route_inbox_item", {"item_id": item_id, "channel": "lending-ops"})
+    assert not outcome.is_error
+    lines = slack.posts[0][1].splitlines()
+    assert lines[0] == f"*{event['summary']}*" and sorted(lines[1:-1]) == sorted(expected)  # jsonb reorders keys
+    assert lines[-1] == f"_Sent by <@{JOSH}> via Cora (inbox #{item_id})_"
+    assert _row(digest_db, item_id)["status"] == "routed"
+
+
+def test_routed_details_skip_empty_values_and_escape_slack_markup():
+    from src.lending.cora_tools import _routed_post
+
+    item = {"id": 7, "summary": "Opt-out email not recorded",
+            "payload": {"message_key": "<!channel>", "sender_masked": "a***@example.com", "error": None,
+                        "attempts": 5, "phones": ["…0147"]}}
+    assert _routed_post(item, None, JOSH).splitlines() == [
+        "*Opt-out email not recorded*", "message key: &lt;!channel&gt;", "sender masked: a***@example.com",
+        "attempts: 5", 'phones: ["…0147"]', f"_Sent by <@{JOSH}> via Cora (inbox #7)_"]
+
+
 def test_an_inbox_channel_key_still_works_as_a_channel_name(digest_db):
     _, deal, _ = _surfaced(digest_db)
     slack = FakeSlack()

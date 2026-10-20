@@ -17,6 +17,7 @@ from config.settings import get_settings
 from requests.exceptions import ConnectTimeout, RequestException
 
 from src.lending.ghl_account import ghl_headers, ghl_multipart_headers, lending_ghl_account
+from src.lending.global_halt import is_globally_halted
 from src.lending.prequal import PrequalSink
 from src.lending.web_lead_ghl import GhlLeadSink
 from src.lending.web_leads import DeliveryError
@@ -40,10 +41,19 @@ class SendOutcomeUnknown(DeliveryError):
     The letter must not be retried automatically: that could send the borrower a second email."""
 
 
+def _refuse_if_halted() -> None:
+    """The lending emergency halt stops this email like every other borrower send. Raised as a setup failure so
+    the letter keeps its attempts and the sweep sends it once the halt is lifted."""
+    if is_globally_halted():
+        logger.warning("[prequal] email refused: lending emergency halt is on")
+        raise DeliveryError("prequal email: lending emergency halt is on; nothing sent", config_error=True)
+
+
 class GhlPrequalAttachmentSink(GhlLeadSink):
     """Upload is idempotent and keeps the normal retries; the email send is a single attempt."""
 
     def deliver(self, lead_id: int, contact_id: str, pdf: bytes) -> None:
+        _refuse_if_halted()
         url = self._upload(contact_id, pdf)
         body = {"type": "Email", "contactId": contact_id, "subject": EMAIL_SUBJECT,
                 "html": EMAIL_HTML, "attachments": [url]}
@@ -56,6 +66,7 @@ class GhlPrequalAttachmentSink(GhlLeadSink):
     def _send_email(self, body: dict) -> None:
         from src.services.ghl_webhook import ghl_post_once
 
+        _refuse_if_halted()  # rechecked here: the halt can be set while the PDF uploads
         try:
             response = ghl_post_once("/conversations/messages", headers=ghl_headers(self._account.api_key), json=body)
         except ConnectTimeout as exc:  # never connected: nothing was sent, safe to retry later

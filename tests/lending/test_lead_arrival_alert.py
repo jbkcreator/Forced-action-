@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
+from slack_sdk.errors import SlackApiError
 
 from src.lending import global_halt, lead_arrival_alert, lendingflow_events
 from src.lending.ghl_account import GhlAccount
@@ -85,6 +86,65 @@ def test_a_slack_failure_is_logged_and_never_raised(monkeypatch) -> None:
     monkeypatch.setattr(lead_arrival_alert, "_client_factory", lambda: FakeSlack(fail=True))
     monkeypatch.setattr(lead_arrival_alert, "get_settings", _settings)
     assert lead_arrival_alert.alert_josh(_event()) is False
+
+
+class FlakySlack:
+    """Raises each queued error in turn, then accepts the post."""
+
+    def __init__(self, *errors: Exception) -> None:
+        self.attempts = 0
+        self.posts: list[dict] = []
+        self._errors = list(errors)
+
+    def chat_postMessage(self, **kwargs):
+        self.attempts += 1
+        if self._errors:
+            raise self._errors.pop(0)
+        self.posts.append(kwargs)
+
+
+def _rejected(error: str = "ratelimited") -> SlackApiError:
+    return SlackApiError("rejected", {"ok": False, "error": error})
+
+
+@pytest.fixture
+def flaky(monkeypatch):
+    sleeps: list[float] = []
+    monkeypatch.setattr(lead_arrival_alert, "_sleep", sleeps.append)
+    monkeypatch.setattr(lead_arrival_alert, "get_settings", _settings)
+
+    def install(client: FlakySlack) -> list[float]:
+        monkeypatch.setattr(lead_arrival_alert, "_client_factory", lambda: client)
+        return sleeps
+
+    return install
+
+
+def test_a_post_slack_refused_is_retried_until_it_lands(flaky, inbox_writes) -> None:
+    client = FlakySlack(_rejected(), _rejected())
+    sleeps = flaky(client)
+    assert lead_arrival_alert.alert_josh(_event()) is True
+    assert client.attempts == 3 and len(client.posts) == 1
+    assert sleeps == list(lead_arrival_alert.RETRY_DELAYS_SECONDS)
+    assert inbox_writes == []
+
+
+def test_a_post_that_may_have_gone_out_is_not_retried_but_lands_in_coras_inbox(flaky, inbox_writes) -> None:
+    client = FlakySlack(TimeoutError("read timed out"))
+    sleeps = flaky(client)
+    assert lead_arrival_alert.alert_josh(_event()) is False
+    assert client.attempts == 1 and sleeps == []  # never risk pinging Josh twice
+    [queued] = inbox_writes
+    assert (queued["event_type"], queued["dedup_key"], queued["target_channel"]) == (
+        "lead_arrival_alert_failed", LEAD["lead_uuid"], "ops")
+    assert "+17275550100" not in queued["payload"] and "0100" in queued["payload"]
+
+
+def test_a_post_refused_every_time_lands_in_coras_inbox(flaky, inbox_writes) -> None:
+    client = FlakySlack(_rejected(), _rejected(), _rejected())
+    flaky(client)
+    assert lead_arrival_alert.alert_josh(_event()) is False
+    assert client.attempts == 3 and [e["event_type"] for e in inbox_writes] == ["lead_arrival_alert_failed"]
 
 
 def test_the_alert_is_wired_to_the_lead_created_event_in_both_processes() -> None:

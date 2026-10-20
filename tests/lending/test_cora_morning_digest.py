@@ -132,7 +132,7 @@ def test_digest_follows_the_e5_morning_brief(engine) -> None:
     assert "1 open inbox item(s)" in body
     assert "New leads, last 24 hours (4)" in body  # 2 LendingFlow (suppressed and old ones left out) + 2 web
     assert body.index("lendingflow_lead:11 Ben") < body.index("lendingflow_lead:10 Ana")  # closer priority first
-    assert ":star: lendingflow_lead:10 Ana (Fix & Flip, $250K - $500K, Tampa)" in body
+    assert ":star: lendingflow_lead:10 Ana (Fix &amp; Flip, $250K - $500K, Tampa)" in body  # Slack shows "&"
     assert "Cy" not in body and "Old" not in body
     assert "2 web lead(s), 1 not in GHL yet" in body
     assert "Dialer maturity: 2 contact(s) loaded" in body and "Dialer permits: 1 contact(s) loaded" in body
@@ -153,6 +153,20 @@ def test_render_lists_todays_calls_in_et() -> None:
     body = _body(blocks)
     assert header == "Good morning. Cora's digest for Monday October 19"
     assert "Booked calls today: 1" in body and "10:00 AM Sam (ai)" in body and "Running" in body
+
+
+def test_lead_and_booking_fields_cannot_inject_slack_mentions_or_links() -> None:
+    lead = {"id": 12, "first_name": "<!channel>", "loan_type": "<https://evil.example|Fix & Flip>",
+            "loan_amount_range": "<!here>", "property_city": "<@U_JOSH>", "routing_tag": None, "closer_priority": False}
+    body = _body(render(date(2026, 10, 19), _empty(
+        new_leads=[lead], new_leads_total=1,
+        due_confirmations=[{"booking_ref": "<!everyone>", "due_date": date(2026, 10, 19)}], due_confirmations_total=1,
+        todays_calls=[{"booking_ref": "b1", "first_name": "<!channel>", "booked_by": "<https://evil.example|ai>",
+                       "slot_start": datetime(2026, 10, 19, 14, 0, tzinfo=timezone.utc)}]))[1])
+    for token in ("<!channel>", "<!here>", "<!everyone>", "<@U_JOSH>", "<https://evil.example"):
+        assert token not in body
+    assert "lendingflow_lead:12 &lt;!channel&gt;" in body
+    assert "&lt;https://evil.example|Fix &amp; Flip&gt;" in body
 
 
 def test_an_empty_morning_says_so() -> None:

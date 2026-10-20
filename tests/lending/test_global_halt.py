@@ -12,11 +12,13 @@ from sqlalchemy.pool import StaticPool
 
 from packages.agent_core.chatport import FakeChatPort, PostResult
 from packages.agent_core.slack_session import InboundMessage
-from src.lending import global_halt, lendingflow, lendingflow_ghl
+from src.lending import global_halt, lendingflow, lendingflow_ghl, prequal_ghl
 from src.lending.dialer_load import LoadRefused, run_dialer_load
 from src.lending.ghl_account import GhlAccount
 from src.lending.ghl_sms import GhlSmsError, GhlSmsSender
 from src.lending.global_halt import EmergencyHalt, emergency_command, is_globally_halted, set_global_halt
+from src.lending.prequal_ghl import GhlPrequalAttachmentSink
+from src.lending.web_leads import DeliveryError
 
 JOSH, OPS = "U_JOSH", "U_OPS"
 
@@ -158,6 +160,56 @@ def test_ghl_text_and_email_are_refused_while_halted(halt_db) -> None:
     with pytest.raises(GhlSmsError, match="emergency halt"):
         GhlSmsSender(GhlAccount(api_key="k", location_id="loc"), "+18135550000", request)("+17275550100", "Hi")
     assert not any("/conversations/messages" in url for url in calls)
+
+
+def _recorded_ghl_posts(monkeypatch) -> list[str]:
+    from src.services import ghl_webhook
+
+    calls: list[str] = []
+
+    def post_once(path, **kwargs):
+        calls.append(path)
+        return Resp(201, {"messageId": "m1"})
+
+    def post_multipart(path, **kwargs):
+        calls.append(path)
+        return Resp(201, {"uploadedFiles": {"Pre-Qualification-Estimate.pdf": "https://files.example/a.pdf"}})
+
+    monkeypatch.setattr(ghl_webhook, "ghl_post_once", post_once)
+    monkeypatch.setattr(ghl_webhook, "ghl_post_multipart", post_multipart)
+    monkeypatch.setattr(prequal_ghl, "get_settings", lambda: SimpleNamespace(lending_prequal_email_from=None))
+    return calls
+
+
+def test_prequal_email_is_refused_while_halted_and_keeps_its_attempts(halt_db, monkeypatch) -> None:
+    calls = _recorded_ghl_posts(monkeypatch)
+    set_global_halt(True, reason="test", set_by=JOSH)
+    with pytest.raises(DeliveryError, match="emergency halt") as refused:
+        GhlPrequalAttachmentSink(GhlAccount(api_key="k", location_id="loc")).deliver(1, "ct1", b"%PDF")
+    assert calls == []
+    assert refused.value.config_error  # the letter is not at fault: retried after resume, no attempt used
+
+
+def test_prequal_email_is_refused_when_the_halt_lands_during_the_upload(halt_db, monkeypatch) -> None:
+    calls = _recorded_ghl_posts(monkeypatch)
+    sink = GhlPrequalAttachmentSink(GhlAccount(api_key="k", location_id="loc"))
+    real_upload = sink._upload
+
+    def upload_then_halt(contact_id, pdf):
+        url = real_upload(contact_id, pdf)
+        set_global_halt(True, reason="test", set_by=JOSH)
+        return url
+
+    sink._upload = upload_then_halt
+    with pytest.raises(DeliveryError, match="emergency halt"):
+        sink.deliver(1, "ct1", b"%PDF")
+    assert calls == ["/conversations/messages/upload"]
+
+
+def test_prequal_email_is_sent_when_not_halted(halt_db, monkeypatch) -> None:
+    calls = _recorded_ghl_posts(monkeypatch)
+    GhlPrequalAttachmentSink(GhlAccount(api_key="k", location_id="loc")).deliver(1, "ct1", b"%PDF")
+    assert calls == ["/conversations/messages/upload", "/conversations/messages"]
 
 
 def test_intro_sms_tag_is_not_added_while_halted(halt_db, monkeypatch) -> None:

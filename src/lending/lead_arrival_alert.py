@@ -8,18 +8,28 @@ The mention is what makes the Slack mobile app push it to his phone. This is the
 
 Off until ``LENDING_LEAD_ARRIVAL_ALERT_ENABLED=true``. Internal only: it never contacts the borrower, so it needs no
 consent or 10DLC approval and runs during the lending emergency halt. The phone is shown as its last 4 digits only.
-A failed post is logged by lead id and never affects the lead; the 2- and 5-minute alarms still follow.
+A post Slack provably refused (e.g. rate limited) is retried twice after a short wait; a post that may have gone out
+(timeout, 5xx) is never retried, so Josh is not pinged twice. A post that still fails is logged by lead id and
+queued in Cora's inbox for the ops channel, so it is surfaced instead of lost; it never affects the lead, and the
+2- and 5-minute alarms still follow.
 """
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Callable, Optional
+
+from slack_sdk.errors import SlackApiError
 
 from config.settings import get_settings
 from packages.agent_core.config import parse_user_ids
 from src.lending.contracts import LendingFlowLeadCreated
+from src.lending.cora_inbox import add_to_inbox_in_own_session
 
 logger = logging.getLogger(__name__)
+
+# Waits before the 2nd and 3rd attempt. Short: the handler runs inline with the lead's processing.
+RETRY_DELAYS_SECONDS = (1, 2)
 
 
 def _slack_client() -> Any:
@@ -30,6 +40,13 @@ def _slack_client() -> Any:
 
 # Read at call time so tests swap in a fake client and never post to Slack.
 _client_factory: Callable[[], Any] = _slack_client
+_sleep: Callable[[float], None] = time.sleep
+
+
+def _provably_not_posted(exc: Exception) -> bool:
+    from src.lending.uncalled_alarm_worker import _slack_rejected
+
+    return isinstance(exc, SlackApiError) and _slack_rejected(exc)
 
 
 def ghl_contact_url(app_url: str, location_id: Optional[str], contact_id: Optional[str]) -> Optional[str]:
@@ -60,12 +77,28 @@ def alert_josh(event: LendingFlowLeadCreated) -> Optional[bool]:
     if not (settings.lending_lead_arrival_alert_enabled and settings.lending_slack_bot_token and channel
             and mention_ids):
         return None
-    try:
-        contact_url = ghl_contact_url(settings.lending_ghl_app_url, settings.lending_ghl_location_id,
-                                      event.ghl_contact_id)
-        _client_factory().chat_postMessage(channel=channel, text=alert_text(event, mention_ids, contact_url))
-    except Exception as exc:  # class only: Slack errors can echo the message text
-        logger.error("[lead-arrival-alert] lead=%s alert not posted (%s)", event.lead_id, type(exc).__name__)
-        return False
-    logger.info("[lead-arrival-alert] lead=%s alert posted", event.lead_id)
-    return True
+    contact_url = ghl_contact_url(settings.lending_ghl_app_url, settings.lending_ghl_location_id, event.ghl_contact_id)
+    text = alert_text(event, mention_ids, contact_url)
+    for attempt in range(len(RETRY_DELAYS_SECONDS) + 1):
+        try:
+            _client_factory().chat_postMessage(channel=channel, text=text)
+        except Exception as exc:  # class only: Slack errors can echo the message text
+            if attempt < len(RETRY_DELAYS_SECONDS) and _provably_not_posted(exc):
+                _sleep(RETRY_DELAYS_SECONDS[attempt])
+                continue
+            logger.error("[lead-arrival-alert] lead=%s alert not posted (%s)", event.lead_id, type(exc).__name__)
+            _queue_unposted(event)
+            return False
+        logger.info("[lead-arrival-alert] lead=%s alert posted", event.lead_id)
+        return True
+    return False
+
+
+def _queue_unposted(event: LendingFlowLeadCreated) -> None:
+    """Cora surfaces it in her inbox digest. Ids and the last 4 digits only, per the inbox contract."""
+    add_to_inbox_in_own_session(
+        event_type="lead_arrival_alert_failed", dedup_key=str(event.lead_id), target_channel="ops",
+        summary="New LendingFlow lead alert did not post to Slack: call the lead now",
+        payload={"lead_id": str(event.lead_id), "ghl_contact_id": event.ghl_contact_id,
+                 "phone_last4": event.phone[-4:]},
+    )

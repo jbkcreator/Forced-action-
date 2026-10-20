@@ -31,6 +31,7 @@ from sqlalchemy.orm import Session
 
 from packages.agent_core.briefing import BriefSection, render_brief_blocks
 from packages.agent_core.chatport import ChatPort
+from src.lending.cora_inbox import slack_safe
 
 logger = logging.getLogger(__name__)
 
@@ -158,9 +159,12 @@ def _more(shown: int, total: int) -> list[str]:
 
 
 def _lead_line(lead: dict[str, Any]) -> str:
+    # Lead fields come from the borrower's form: escaped so a "<!channel>" name cannot ping the channel.
     flag = ":fire: " if lead["closer_priority"] else (":star: " if lead["routing_tag"] == "FULL_MACHINE" else "")
-    details = ", ".join(str(v) for v in (lead["loan_type"], lead["loan_amount_range"], lead["property_city"]) if v)
-    return f"{flag}lendingflow_lead:{lead['id']} {lead['first_name'] or 'lead'}" + (f" ({details})" if details else "")
+    details = ", ".join(slack_safe(str(v)) for v in (lead["loan_type"], lead["loan_amount_range"],
+                                                      lead["property_city"]) if v)
+    return (f"{flag}lendingflow_lead:{lead['id']} {slack_safe(lead['first_name'] or 'lead')}"
+            + (f" ({details})" if details else ""))
 
 
 def render(day: date, data: DigestData) -> tuple[str, list[dict]]:
@@ -171,7 +175,8 @@ def render(day: date, data: DigestData) -> tuple[str, list[dict]]:
         [f"Draft #{d['action_id']} {d['tool_name']}" + (f" for {d['contact_ref']}" if d["contact_ref"] else "")
          + " waiting for approval" for d in data.pending_drafts]
         + _more(len(data.pending_drafts), data.pending_total)
-        + [f"Confirmation call for booking {c['booking_ref']} due {c['due_date']}" for c in data.due_confirmations]
+        + [f"Confirmation call for booking {slack_safe(str(c['booking_ref']))} due {c['due_date']}"
+           for c in data.due_confirmations]
         + _more(len(data.due_confirmations), data.due_confirmations_total)
         + ([f"{data.open_inbox} open inbox item(s); reply in the inbox digest thread to route or dismiss"]
            if data.open_inbox else [])
@@ -180,8 +185,8 @@ def render(day: date, data: DigestData) -> tuple[str, list[dict]]:
     if data.web_leads:
         leads.append(f"{data.web_leads} web lead(s)" + (
             f", {data.web_leads_not_in_ghl} not in GHL yet" if data.web_leads_not_in_ghl else ""))
-    calls = [f"{c['slot_start'].astimezone(ET):%I:%M %p} {c['first_name'] or 'lead'} ({c['booked_by'] or 'unknown'})"
-             for c in data.todays_calls]
+    calls = [f"{c['slot_start'].astimezone(ET):%I:%M %p} {slack_safe(c['first_name'] or 'lead')} "
+             f"({slack_safe(c['booked_by'] or 'unknown')})" for c in data.todays_calls]
     queues = [f"Booked calls today: {len(data.todays_calls)}"] + calls + [
         f"Dialer {q['campaign']}: {q['contacts']} contact(s) loaded" for q in data.dialer_queues]
     cora_lines = [status] + ([f":warning: Not available today: {', '.join(data.unavailable)}"]

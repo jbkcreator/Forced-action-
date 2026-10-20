@@ -230,8 +230,20 @@ def _slack_time(ts: Optional[str]) -> Optional[str]:
         return None
 
 
+def _detail_lines(payload: Optional[Mapping[str, Any]]) -> list[str]:
+    """The item's payload as "key: value" lines, so the receiving team gets the ids the original alert carried
+    (an appointment id, a dialer call id, a message key). Payloads hold ids and masked values only."""
+    lines = []
+    for key, value in (payload or {}).items():
+        if value is None or value == "":
+            continue
+        shown = json.dumps(value, default=str, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
+        lines.append(f"{slack_safe(key.replace('_', ' '))}: {slack_safe(shown)}")
+    return lines
+
+
 def _routed_post(item: Mapping[str, Any], note: Optional[str], user_id: str) -> str:
-    lines = [f"*{slack_safe(item['summary'] or 'Inbox item')}*"]
+    lines = [f"*{slack_safe(item['summary'] or 'Inbox item')}*", *_detail_lines(item.get("payload"))]
     if note:
         lines.append(slack_safe(note))
     lines.append(f"_Sent by <@{user_id}> via Cora (inbox #{item['id']})_")

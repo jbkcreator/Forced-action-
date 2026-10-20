@@ -115,6 +115,7 @@ class LoadReport:
     active_not_in_run: int = 0
     backflip_check: bool = True
     suppressed_mid_run: int = 0  # opted out after the start-of-run gate; skipped before the push
+    halted_mid_run: int = 0  # not pushed: the emergency halt was set while the run was loading
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -135,6 +136,7 @@ class LoadReport:
             "active_not_in_run": self.active_not_in_run,
             "backflip_check": self.backflip_check,
             "suppressed_mid_run": self.suppressed_mid_run,
+            "halted_mid_run": self.halted_mid_run,
         }
 
 
@@ -556,7 +558,12 @@ def run_dialer_load(
     chunk: list[tuple[_Loadable, int]] = []
     cards = _cards(db, loadable)
     try:
-        for item in loadable:
+        for position, item in enumerate(loadable):
+            if is_globally_halted():  # rechecked per push: an approver can halt while a long run is loading
+                report.halted_mid_run = len(loadable) - position
+                logger.warning("[dialer-load] live run %s stopped by the lending emergency halt; %d not loaded",
+                               run_id, report.halted_mid_run)
+                break
             if _suppressed_phones(db, [item.phone]):  # one indexed lookup per push (a push is 3 HTTP calls)
                 report.suppressed_mid_run += 1
                 _write_exclusions(db, run_id, [{
