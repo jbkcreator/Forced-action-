@@ -203,11 +203,16 @@ def handle_action(payload: dict, client: Any) -> None:
                 view = _decline_view(event_id, current["lender"], channel, ts, original, db)
                 client.views_open(trigger_id=payload.get("trigger_id", ""), view=view)
                 return
-            from src.lending.routing.outcome import record_outcome
+            from src.lending.routing.outcome import StaleRoute, record_outcome
 
             outcome = _OUTCOME_BUTTONS[action["action_id"]]
             key = current["key"]
-            written = record_outcome(key.id, action=outcome, actor=f"slack:{user}", db=db, kind=key.kind)
+            try:
+                written = record_outcome(key.id, action=outcome, actor=f"slack:{user}", db=db, kind=key.kind,
+                                         routed_event_id=event_id)
+            except StaleRoute:  # re-routed between the check above and the locked write
+                _tell(client, channel, user, NOT_CURRENT)
+                return
     except Exception as exc:  # class only: SQL errors can embed bound values
         logger.error("[routing-slack] a routed-post button failed: %s", type(exc).__name__)
         _tell(client, channel, user, "Something went wrong; nothing was changed.")
