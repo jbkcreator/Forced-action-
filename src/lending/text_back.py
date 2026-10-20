@@ -18,7 +18,7 @@ from sqlalchemy import text
 
 from config.lending_missed_call import MAX_LATE_SECONDS, TIMEZONE
 from config.lending_text_back import (
-    CAPS, ENTITY_TOKENS, FALLBACK_CALLER, GENERAL, QUEUE_TEMPLATES, QUIET_END_HOUR, QUIET_START_HOUR,
+    BOOKING_LINE, CAPS, ENTITY_TOKENS, FALLBACK_CALLER, GENERAL, QUEUE_TEMPLATES, QUIET_END_HOUR, QUIET_START_HOUR,
     STALE_SENDING_SECONDS, TEMPLATES, TEMPLATE_NEEDS,
 )
 from src.lending.compliance import phone_hash
@@ -108,24 +108,29 @@ def format_number(e164: str) -> str:
     return e164
 
 
-def render_body(item: PendingText, template_key: str, *, number: str) -> str:
+def _clip(value: str, cap: str) -> str:
+    """Whitespace collapsed, then cut to ``CAPS[cap]`` at the last whole word (mid-word only when one word is too long)."""
+    clean = " ".join(value.split())
+    limit = CAPS[cap]
+    if len(clean) <= limit:
+        return clean
+    cut = clean[:limit + 1].rsplit(" ", 1)[0] if " " in clean[:limit + 1] else clean[:limit]
+    return cut.rstrip(" ,")
+
+
+def render_body(item: PendingText, template_key: str, *, number: str, booking_link: bool = False) -> str:
     if not number or not number.strip():
         raise ValueError("a texting number is required")
 
     first = first_name_of(item.borrower_name)
-    street = _street(item)
-
-    # Collapse whitespace in all substituted values
-    caller = " ".join((item.caller_name or "").split())[:CAPS["caller"]] or FALLBACK_CALLER
-    county = " ".join((item.county or "").split())[:CAPS["county"]]
-    street = " ".join(street.split())[:CAPS["property"]]
 
     return TEMPLATES[template_key].format(
-        greeting=f"Hi {first[:CAPS['first_name']]}" if first else "Hi",
-        caller=caller,
-        property=street,
-        county=county,
+        greeting=f"Hi {_clip(first, 'first_name')}" if first else "Hi",
+        caller=_clip(item.caller_name or "", "caller") or FALLBACK_CALLER,
+        property=_clip(_street(item), "property"),
+        county=_clip(item.county or "", "county"),
         number=format_number(number),
+        booking=BOOKING_LINE if booking_link else "",
     )
 
 
@@ -211,13 +216,13 @@ def _decide(db, item: PendingText, *, sender: Optional[TextSender], enabled: boo
     return "send"
 
 
-def _render(item: PendingText, number: str) -> tuple[Optional[str], Optional[str]]:
+def _render(item: PendingText, number: str, booking_link: bool = False) -> tuple[Optional[str], Optional[str]]:
     """(template_key, body), or (None, None) when rendering fails: nothing has gone out, so the
     caller records 'failed' instead of leaving the claim for the stale sweep (which would hold the
     day's slot for a text that never left)."""
     try:
         key = choose_template(item)
-        return key, render_body(item, key, number=number)
+        return key, render_body(item, key, number=number, booking_link=booking_link)
     except Exception as exc:  # class only: never log values
         logger.error("[text-back] event %s could not be rendered (%s)", item.event_id, type(exc).__name__)
         return None, None
@@ -243,7 +248,7 @@ def _mark_unsent_failed(db, item: PendingText) -> Optional[str]:
 
 
 def _decide_and_send(db, item: PendingText, *, sender: Optional[TextSender], enabled: bool, number: Optional[str],
-                     now: datetime, started: list[bool]) -> str:
+                     now: datetime, started: list[bool], booking_link: bool = False) -> str:
     """Run the gates and, if all pass, the send; record and return the outcome (the caller commits).
     ``started`` is set the moment the sender is about to be called: from then on a failure is unknown."""
     outcome = _decide(db, item, sender=sender, enabled=enabled, now=now)
@@ -252,7 +257,7 @@ def _decide_and_send(db, item: PendingText, *, sender: Optional[TextSender], ena
         if not number:
             outcome = "skipped_not_configured"
         else:
-            template_key, body = _render(item, number)
+            template_key, body = _render(item, number, booking_link)
             if body is None:
                 outcome = "failed"
             else:
@@ -271,7 +276,7 @@ def _decide_and_send(db, item: PendingText, *, sender: Optional[TextSender], ena
 
 def process_pending(db, *, sender: Optional[TextSender], enabled: bool, number: Optional[str],
                     now: Optional[datetime] = None, limit: int = 50,
-                    clock: Optional[Callable[[], datetime]] = None) -> dict[str, int]:
+                    clock: Optional[Callable[[], datetime]] = None, booking_link: bool = False) -> dict[str, int]:
     """Decide every pending missed-call event once. Commits: the claim first (so a crash cannot make
     a second worker send the same text), then each event's outcome on its own.
 
@@ -286,7 +291,7 @@ def process_pending(db, *, sender: Optional[TextSender], enabled: bool, number: 
         started = [False]
         try:
             outcome = _decide_and_send(db, item, sender=sender, enabled=enabled, number=number,
-                                       now=now or clock(), started=started)
+                                       now=now or clock(), started=started, booking_link=booking_link)
             db.commit()
         except Exception as exc:  # class only: SQL / HTTP errors can embed phones
             logger.error("[text-back] event %s crashed (%s)", item.event_id, type(exc).__name__)
@@ -305,6 +310,8 @@ def run_text_back_cycle(*, now: Optional[datetime] = None) -> dict[str, int]:
     from src.lending.db import lending_session
     from src.lending.ghl_sms import get_sender, texting_number
 
+    settings = get_settings()
     with lending_session() as db:
-        return process_pending(db, sender=get_sender(), enabled=get_settings().missed_call_text_enabled,
-                               number=texting_number(), now=now)
+        return process_pending(db, sender=get_sender(), enabled=settings.missed_call_text_enabled,
+                               number=texting_number(), now=now,
+                               booking_link=settings.lending_text_back_booking_link_enabled)
