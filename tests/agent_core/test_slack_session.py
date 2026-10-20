@@ -215,6 +215,7 @@ class FakeSocketClient:
         self.envelopes = envelopes
         self.socket_mode_request_listeners: list = []
         self.acks: list[str] = []
+        self.ack_payloads: list = []
         self.closed = False
 
     def connect(self) -> None:
@@ -226,6 +227,7 @@ class FakeSocketClient:
 
     def send_socket_mode_response(self, response) -> None:
         self.acks.append(response.envelope_id)
+        self.ack_payloads.append(response.payload)
 
     def close(self) -> None:
         self.closed = True
@@ -263,3 +265,60 @@ def test_a_failed_connect_still_closes_the_client(harness: Harness) -> None:
             run_socket_mode(harness.session, app_token="xapp-1", web_client="web", stop=threading.Event(),
                             client_factory=factory)
     assert len(clients) == 3 and all(client.closed for client in clients)
+
+
+class _Extension:
+    def __init__(self) -> None:
+        self.handled: list[str] = []
+
+    def respond(self, request_type, payload):
+        return {"response_action": "errors", "errors": {"x": "no"}} if payload.get("type") == "view_submission" else None
+
+    def handle(self, request_type, payload) -> bool:
+        self.handled.append(request_type)
+        return request_type == "slash_commands"
+
+
+def test_an_extension_can_answer_the_ack_and_consume_its_own_requests(config, queue, halt, relay) -> None:
+    extension = _Extension()
+    messages: list[InboundMessage] = []
+    session = SlackSession(config=config, chat=FakeChatPort(default_channel="C_CORA"), queue=queue, halt=halt, relay=relay,
+                           on_message=messages.append, on_revision=lambda *a: None, bot_user_id=BOT, extension=extension)
+    assert session.respond("interactive", {"type": "view_submission"})["response_action"] == "errors"
+    assert session.respond("events_api", {}) is None
+    session.handle_request("slash_commands", {"command": "/lenders"})
+    session.handle_request("events_api", {"event": {
+        "type": "message", "channel_type": "im", "channel": "D_JOSH", "user": OPERATOR, "text": "hi", "ts": "5.5"}})
+    assert extension.handled == ["slash_commands", "events_api"]
+    assert [m.text for m in messages] == ["hi"]  # a request the extension declines is still Cora's
+
+
+def test_a_failing_extension_never_breaks_the_socket(config, queue, halt, relay) -> None:
+    class Broken:
+        def respond(self, *a):
+            raise RuntimeError("boom")
+
+        def handle(self, *a):
+            raise RuntimeError("boom")
+
+    session = SlackSession(config=config, chat=FakeChatPort(default_channel="C_CORA"), queue=queue, halt=halt, relay=relay,
+                           on_message=lambda m: None, on_revision=lambda *a: None, bot_user_id=BOT, extension=Broken())
+    assert session.respond("interactive", {"type": "view_submission"}) is None
+    session.handle_request("slash_commands", {"command": "/lenders"})  # logged, not raised
+
+
+def test_socket_mode_carries_the_extension_answer_in_the_ack(config, queue, halt, relay) -> None:
+    extension = _Extension()
+    session = SlackSession(config=config, chat=FakeChatPort(default_channel="C_CORA"), queue=queue, halt=halt, relay=relay,
+                           on_message=lambda m: None, on_revision=lambda *a: None, bot_user_id=BOT, extension=extension)
+    envelope = SimpleNamespace(type="interactive", envelope_id="env-7", payload={"type": "view_submission"})
+    clients: list[FakeSocketClient] = []
+
+    def factory(**kwargs) -> FakeSocketClient:
+        clients.append(FakeSocketClient([envelope], **kwargs))
+        return clients[-1]
+
+    stop = threading.Event()
+    stop.set()
+    run_socket_mode(session, app_token="xapp-1", web_client="web", stop=stop, client_factory=factory)
+    assert clients[0].acks == ["env-7"] and clients[0].ack_payloads == [{"response_action": "errors", "errors": {"x": "no"}}]

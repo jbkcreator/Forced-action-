@@ -37,5 +37,11 @@ keeps its config value. Watch the log after an edit.
 ## Not covered
 - A new lender or a new field needs a code change; the table only edits what the config defines.
 - The purchase and rehab shares used by the soft approval PDF are still in `config/lending_soft_approval.py`.
-- Overlap with R-1's `lender_routing_rules` / `lender_product_boxes` (branch `feat/ndl-r1-overflow-router`,
-  not merged): this table is separate. Reconcile when R-1 merges.
+- **R-1 routing uses these same values** (no second copy of the numbers). Each row of
+  `lending.lender_routing_rules` can name `rule_keys` (the lender keys above); the router then judges a file
+  against those keys' values, read the same way as the fit card (the table when `LENDING_RULES_FROM_DB=true`,
+  else the config). So a rule edit or a "confirmed" mark changes the fit score and where a file is routed.
+  `lending.lender_routing_rules` holds only what is about routing: waterfall order, agreement status, seat cap,
+  primary flag. A lender T-05 does not define (a new one Josh adds) has no `rule_keys` and uses its own
+  `lender_product_boxes`. A lender with neither is never routed to (the file goes to the hold queue).
+  The fit card still lists only the T-05 lenders; a new routing-only lender does not change its score.
