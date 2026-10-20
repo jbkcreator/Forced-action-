@@ -18,8 +18,12 @@ GHL_CAMPAIGN_TAG = "ghl"
 
 # Leads whose GHL calls are imported: received within the 14-day cadence plus a margin for late calls.
 IMPORT_WINDOW_DAYS = 16
-# Contacts read per run, newest leads first; each costs one search call plus one call per conversation.
+# Contacts read per run; each costs one search call plus one call per conversation page. With more eligible
+# contacts than this, successive runs take successive slices (newest leads first), so every contact is read
+# within ceil(eligible / limit) runs.
 IMPORT_CONTACT_LIMIT = 200
+# The cron interval of src.lending.ghl_call_import; it numbers the runs that pick the slice.
+IMPORT_RUN_INTERVAL_MINUTES = 15
 
 # Runbook § 4.1: "leads with 5+ attempts over 5+ days are eligible for replacement credit".
 REPLACEMENT_MIN_ATTEMPTS = 5

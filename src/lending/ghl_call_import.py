@@ -4,9 +4,11 @@ The Runbook asks that every call attempt in the 14-day follow-up is written to l
 LendingFlow leads with 5+ attempts over 5+ days can be claimed for replacement credit. BatchDialer calls already
 arrive through the CDR poller; LendingFlow leads go straight to Josh, who calls from GoHighLevel, and those calls
 were recorded nowhere. This import reads the outbound call messages of every LendingFlow and website lead still in
-its follow-up window and stores each one once:
+its follow-up window and stores each one once. When more contacts are in the window than one run reads
+(IMPORT_CONTACT_LIMIT), successive runs read successive slices, so every contact is covered.
 
-* ``dialer_call_id`` = ``ghl:<message id>`` (unique, so a re-run never duplicates a call)
+* ``dialer_call_id`` = ``ghl:<message id>`` (unique, so a re-run never duplicates a call); a call seen again with
+  a new outcome or talk time (imported while it was still in progress) is updated in place
 * ``call_source`` = ``ghl``, ``caller_seat`` / ``campaign_tag`` = ``ghl`` (its own scoreboard line)
 * ``disposition`` stays NULL (GHL outcomes are not lending disposition codes); GHL's outcome is kept in
   ``disposition_raw`` as ``ghl:<callStatus>``, which also keeps it out of the missing-disposition alert
@@ -25,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -38,6 +41,7 @@ from config.lending_followup import (
     GHL_CALLER_SEAT,
     GHL_CAMPAIGN_TAG,
     IMPORT_CONTACT_LIMIT,
+    IMPORT_RUN_INTERVAL_MINUTES,
     IMPORT_WINDOW_DAYS,
 )
 from src.lending.ghl_calls import call_duration_seconds, call_state, message_time
@@ -49,7 +53,7 @@ CallReader = Callable[[str], list[dict[str, Any]]]  # ghl_contact_id -> call mes
 
 # One row per GHL contact: a contact can hold both a LendingFlow and a website lead; calls count from the
 # earliest arrival, and the lead's own normalised phone is the one stored on the call.
-_CONTACTS = text("""
+_ELIGIBLE = """
     SELECT ghl_contact_id, min(received_at) AS since, (array_agg(phone ORDER BY received_at))[1] AS phone
       FROM (SELECT ghl_contact_id, received_at, phone FROM lending.lendingflow_leads
              WHERE ghl_contact_id IS NOT NULL AND received_at >= :window_start
@@ -57,27 +61,46 @@ _CONTACTS = text("""
             SELECT ghl_contact_id, received_at, phone FROM lending.web_leads
              WHERE ghl_contact_id IS NOT NULL AND received_at >= :window_start) leads
      GROUP BY ghl_contact_id
-     ORDER BY min(received_at) DESC
-     LIMIT :limit
-""")
+"""
+_ELIGIBLE_COUNT = text(f"SELECT count(*) FROM ({_ELIGIBLE}) eligible")
+# ghl_contact_id breaks ties, so the slices of one rotation do not overlap.
+_CONTACTS = text(_ELIGIBLE + " ORDER BY min(received_at) DESC, ghl_contact_id LIMIT :limit OFFSET :offset")
 
-_INSERT = text("""
-    INSERT INTO lending.call_dispositions
+# A call already stored is updated only when GHL now reports something new (a call imported while in progress
+# gains its final outcome and talk time); an unknown outcome or a missing duration never erases a known one.
+# Only rows this import owns (call_source 'ghl') are touched. ``inserted`` is false for an update; an unchanged
+# call returns no row.
+_UPSERT = text("""
+    INSERT INTO lending.call_dispositions AS d
         (dialer_call_id, call_source, direction, phone, caller_seat, campaign_tag, disposition_raw,
          talk_duration_sec, call_started_at, call_ended_at, raw_event)
     VALUES (:call_id, :source, 'outbound', :phone, :seat, :tag, :raw_outcome,
             :talk, :started, :ended, CAST(:raw_event AS jsonb))
-    ON CONFLICT (dialer_call_id) DO NOTHING
-    RETURNING id
+    ON CONFLICT (dialer_call_id) DO UPDATE SET
+        disposition_raw = CASE WHEN EXCLUDED.disposition_raw = :unknown_outcome THEN d.disposition_raw
+                               ELSE EXCLUDED.disposition_raw END,
+        talk_duration_sec = COALESCE(EXCLUDED.talk_duration_sec, d.talk_duration_sec),
+        call_ended_at = CASE WHEN EXCLUDED.talk_duration_sec IS NULL THEN d.call_ended_at
+                             ELSE EXCLUDED.call_ended_at END,
+        raw_event = EXCLUDED.raw_event
+     WHERE d.call_source = :source
+       AND ((EXCLUDED.disposition_raw <> :unknown_outcome AND EXCLUDED.disposition_raw IS DISTINCT FROM d.disposition_raw)
+            OR (EXCLUDED.talk_duration_sec IS NOT NULL
+                AND EXCLUDED.talk_duration_sec IS DISTINCT FROM d.talk_duration_sec))
+    RETURNING (xmax = 0) AS inserted
 """)
+UNKNOWN_OUTCOME = "ghl:unknown"
 
 
 @dataclass
 class ImportStats:
     contacts: int = 0
     imported: int = 0
+    updated: int = 0
     already_recorded: int = 0
     lookup_failures: int = 0
+    eligible: int = 0
+    offset: int = 0
 
 
 def _call_row(message: Mapping[str, Any], contact_id: str, phone: str, since: datetime) -> Optional[dict[str, Any]]:
@@ -94,7 +117,7 @@ def _call_row(message: Mapping[str, Any], contact_id: str, phone: str, since: da
         "phone": phone,
         "seat": GHL_CALLER_SEAT,
         "tag": GHL_CAMPAIGN_TAG,
-        "raw_outcome": f"ghl:{outcome or 'unknown'}"[:100],
+        "raw_outcome": f"ghl:{outcome}"[:100] if outcome else UNKNOWN_OUTCOME,
         "talk": talk,
         "started": started,
         "ended": started + timedelta(seconds=talk) if talk else started,
@@ -104,13 +127,28 @@ def _call_row(message: Mapping[str, Any], contact_id: str, phone: str, since: da
     }
 
 
+def rotation_offset(eligible: int, limit: int, now: datetime,
+                    interval_minutes: int = IMPORT_RUN_INTERVAL_MINUTES) -> int:
+    """The first contact this run reads: run N (numbered by the cron interval) takes slice N mod the slice count,
+    so successive runs walk every slice of the newest-first list instead of re-reading the newest ``limit``."""
+    slices = math.ceil(eligible / limit) if limit > 0 else 0
+    if slices <= 1:
+        return 0
+    run_number = int(now.timestamp() // (interval_minutes * 60))
+    return (run_number % slices) * limit
+
+
 def import_calls(db, read_calls: CallReader, *, now: Optional[datetime] = None,
                  window_days: int = IMPORT_WINDOW_DAYS, limit: int = IMPORT_CONTACT_LIMIT) -> ImportStats:
-    """Store the outbound GHL calls of every lead in the window. Each contact runs in its own savepoint, so a
-    failed lookup or insert never loses the calls already stored for other contacts. Does not commit."""
+    """Store the outbound GHL calls of this run's slice of the leads in the window (see :func:`rotation_offset`).
+    Each contact runs in its own savepoint, so a failed lookup or insert never loses the calls already stored for
+    other contacts. Does not commit."""
     now = now or datetime.now(timezone.utc)
     stats = ImportStats()
-    contacts = db.execute(_CONTACTS, {"window_start": now - timedelta(days=window_days), "limit": limit}).all()
+    window = {"window_start": now - timedelta(days=window_days)}
+    stats.eligible = db.execute(_ELIGIBLE_COUNT, window).scalar() or 0
+    stats.offset = rotation_offset(stats.eligible, limit, now)
+    contacts = db.execute(_CONTACTS, {**window, "limit": limit, "offset": stats.offset}).all()
     for contact_id, since, raw_phone in contacts:
         stats.contacts += 1
         phone = normalize(raw_phone) if raw_phone else None
@@ -128,10 +166,13 @@ def import_calls(db, read_calls: CallReader, *, now: Optional[datetime] = None,
         try:
             with db.begin_nested():
                 for row in rows:
-                    if db.execute(_INSERT, row).first() is None:
+                    stored = db.execute(_UPSERT, {**row, "unknown_outcome": UNKNOWN_OUTCOME}).first()
+                    if stored is None:
                         stats.already_recorded += 1
-                    else:
+                    elif stored.inserted:
                         stats.imported += 1
+                    else:
+                        stats.updated += 1
         except Exception as exc:  # class only: SQL errors embed bound parameters
             logger.error("[ghl-call-import] contact %s: calls not stored (%s)", contact_id, type(exc).__name__)
     return stats
@@ -154,8 +195,9 @@ def main() -> int:
         return 1
     with lending_session() as db:
         stats = import_calls(db, call_messages_reader(account))
-    logger.info("[ghl-call-import] contacts=%d imported=%d already_recorded=%d lookup_failures=%d",
-                stats.contacts, stats.imported, stats.already_recorded, stats.lookup_failures)
+    logger.info("[ghl-call-import] eligible=%d offset=%d contacts=%d imported=%d updated=%d already_recorded=%d "
+                "lookup_failures=%d", stats.eligible, stats.offset, stats.contacts, stats.imported, stats.updated,
+                stats.already_recorded, stats.lookup_failures)
     return 0
 
 

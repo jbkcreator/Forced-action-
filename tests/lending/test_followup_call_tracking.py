@@ -137,6 +137,73 @@ def test_the_reader_tags_each_message_with_its_conversation():
     assert [(m["id"], m["conversationId"]) for m in messages] == [("1", "conv-a"), ("2", "conv-own")]
 
 
+def _paged_http(pages: dict, requests: list):
+    """GHL's message pages keyed by the lastMessageId cursor sent (None = first page); records each request."""
+    class Response:
+        def __init__(self, body):
+            self.body = body
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self.body
+
+    def http(url, **kwargs):
+        if url.endswith("/conversations/search"):
+            return Response({"conversations": [{"id": "conv-a"}]})
+        cursor = kwargs["params"].get("lastMessageId")
+        requests.append(cursor)
+        return Response(pages[cursor])
+
+    return http
+
+
+def test_the_reader_follows_every_page_of_a_conversation():
+    first = [{"id": f"m{i}"} for i in range(20)]  # GHL's default page size
+    pages = {None: {"messages": {"messages": first, "nextPage": True, "lastMessageId": "m19"}},
+             "m19": {"messages": {"messages": [{"id": "m20"}], "nextPage": False, "lastMessageId": "m20"}}}
+    requests: list = []
+    messages = call_messages_reader(MagicMock(api_key="k", location_id="loc"), http=_paged_http(pages, requests))("c-1")
+    assert len(messages) == 21 and messages[-1]["id"] == "m20"
+    assert requests == [None, "m19"]  # the second page was asked for with the cursor
+
+
+def test_the_reader_stops_on_a_cursor_that_does_not_move():
+    pages = {None: {"messages": {"messages": [{"id": "m1"}], "nextPage": True, "lastMessageId": "m1"}},
+             "m1": {"messages": {"messages": [{"id": "m1"}], "nextPage": True, "lastMessageId": "m1"}}}
+    requests: list = []
+    call_messages_reader(MagicMock(api_key="k", location_id="loc"), http=_paged_http(pages, requests))("c-1")
+    assert requests == [None, "m1"]
+
+
+def test_the_reader_stops_at_the_page_cap(monkeypatch):
+    from src.lending import ghl_calls
+
+    monkeypatch.setattr(ghl_calls, "MAX_MESSAGE_PAGES", 3)
+
+    class Endless(dict):
+        def __missing__(self, cursor):
+            n = int(cursor or 0) + 1
+            return {"messages": {"messages": [{"id": str(n)}], "nextPage": True, "lastMessageId": str(n)}}
+
+    requests: list = []
+    messages = call_messages_reader(MagicMock(api_key="k", location_id="loc"),
+                                    http=_paged_http(Endless(), requests))("c-1")
+    assert len(requests) == 3 and len(messages) == 3
+
+
+def test_successive_runs_cover_every_slice_of_the_eligible_contacts():
+    from src.lending.ghl_call_import import rotation_offset
+
+    runs = [NOW + timedelta(minutes=15 * n) for n in range(4)]
+    offsets = [rotation_offset(201, 200, run) for run in runs]
+    assert set(offsets) == {0, 200}  # 201 contacts: the oldest one is read every second run
+    assert offsets[0] != offsets[1]
+    assert {rotation_offset(450, 200, NOW + timedelta(minutes=15 * n)) for n in range(3)} == {0, 200, 400}
+    assert rotation_offset(200, 200, NOW) == 0 and rotation_offset(0, 200, NOW) == 0
+
+
 # ── against the database (rolled back) ──────────────────────────────────────
 
 def _lendingflow_lead(db, *, phone, contact_id, received=ARRIVED) -> int:
@@ -218,6 +285,50 @@ def test_a_failed_lookup_skips_only_that_contact(lending_db):
 
     stats = import_calls(lending_db, read, now=NOW)
     assert stats.lookup_failures >= 1 and len(_ghl_rows(lending_db, working_phone)) == 1
+
+
+def test_successive_runs_read_every_contact_when_there_are_more_than_one_run_reads(lending_db):
+    contacts = [f"c-{uuid.uuid4().hex[:8]}" for _ in range(3)]
+    for n, contact in enumerate(contacts):
+        _lendingflow_lead(lending_db, phone=_phone(), contact_id=contact, received=ARRIVED + timedelta(minutes=n))
+    reads: set[str] = set()
+    first = import_calls(lending_db, lambda cid: reads.add(cid) or [], now=NOW, limit=2)
+    runs = -(-first.eligible // 2)  # the shared database can hold other leads in the window too
+    for n in range(1, runs):
+        import_calls(lending_db, lambda cid: reads.add(cid) or [], now=NOW + timedelta(minutes=15 * n), limit=2)
+    assert set(contacts) <= reads
+
+
+def test_a_call_imported_in_progress_gains_its_final_outcome_and_talk_time(lending_db):
+    phone, contact = _phone(), f"c-{uuid.uuid4().hex[:8]}"
+    _lendingflow_lead(lending_db, phone=phone, contact_id=contact)
+    in_progress = _msg(f"{contact}-1", status="in-progress")
+    completed = _msg(f"{contact}-1", status="completed", meta_extra={"call": {"duration": 180}})
+    unknown = {**_msg(f"{contact}-1"), "meta": {}}
+
+    import_calls(lending_db, lambda cid: [in_progress] if cid == contact else [], now=NOW)
+    later = import_calls(lending_db, lambda cid: [completed] if cid == contact else [], now=NOW)
+    again = import_calls(lending_db, lambda cid: [unknown] if cid == contact else [], now=NOW)
+
+    row = lending_db.execute(text("SELECT disposition_raw, talk_duration_sec, call_ended_at - call_started_at AS span "
+                                  "FROM lending.call_dispositions WHERE dialer_call_id = :id"),
+                             {"id": f"ghl:{contact}-1"}).mappings().one()
+    assert (row["disposition_raw"], row["talk_duration_sec"], row["span"]) == (
+        "ghl:completed", 180, timedelta(seconds=180))
+    assert later.updated >= 1 and again.updated == 0  # an unknown outcome never erases a known one
+    assert len(_ghl_rows(lending_db, phone)) == 1
+
+
+def test_a_dialer_row_with_the_same_id_is_never_overwritten(lending_db):
+    phone, contact = _phone(), f"c-{uuid.uuid4().hex[:8]}"
+    _lendingflow_lead(lending_db, phone=phone, contact_id=contact)
+    lending_db.execute(text(
+        "INSERT INTO lending.call_dispositions (dialer_call_id, direction, phone, call_started_at, call_ended_at, "
+        "disposition_raw, raw_event) VALUES (:id, 'outbound', :p, :s, :s, 'dialer', '{}')"),
+        {"id": f"ghl:{contact}-1", "p": phone, "s": ARRIVED})
+    import_calls(lending_db, lambda cid: [_msg(f"{contact}-1", status="completed")] if cid == contact else [], now=NOW)
+    assert lending_db.execute(text("SELECT disposition_raw FROM lending.call_dispositions WHERE dialer_call_id = :id"),
+                              {"id": f"ghl:{contact}-1"}).scalar() == "dialer"
 
 
 def _eligibility(db, lead_id):

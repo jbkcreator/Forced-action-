@@ -82,6 +82,41 @@ def test_both_files_hold_headers_and_hashes_only(fixed_contacts, tmp_path):
     assert not list(tmp_path.glob("*.partial"))
 
 
+def test_the_file_is_created_owner_only_before_any_hash_is_written(fixed_contacts, tmp_path, monkeypatch):
+    import os
+
+    opened: list[tuple[str, int, int]] = []
+    real_open = os.open
+
+    def spy(path, flags, mode=0o777, **kwargs):
+        opened.append((os.fspath(path), flags, mode))
+        return real_open(path, flags, mode, **kwargs)
+
+    monkeypatch.setattr(export_task.os, "open", spy)
+    (tmp_path / f"google_customer_match_{DAY}.partial").write_text("stale, maybe world-readable")
+    export(None, tmp_path, day=DAY)
+    assert [(path.endswith(".partial"), bool(flags & os.O_EXCL), mode) for path, flags, mode in opened] == [
+        (True, True, 0o600), (True, True, 0o600)]
+    assert not list(tmp_path.glob("*.partial"))  # the stale partial was replaced, not reused with its old mode
+
+
+def test_a_failed_write_leaves_no_partial_file(fixed_contacts, tmp_path, monkeypatch):
+    class Broken:
+        def __init__(self, handle):
+            pass
+
+        def writerow(self, row):
+            pass
+
+        def writerows(self, rows):
+            raise OSError("disk full")
+
+    monkeypatch.setattr(export_task.csv, "writer", Broken)
+    with pytest.raises(OSError):
+        export(None, tmp_path, day=DAY)
+    assert not list(tmp_path.glob("*.partial")) and not list(tmp_path.glob("*.csv"))
+
+
 def test_a_dry_run_writes_nothing(fixed_contacts, tmp_path):
     result = export(None, tmp_path, day=DAY, dry_run=True)
     assert (result.google_rows, result.meta_rows) == (2, 2) and result.files == []

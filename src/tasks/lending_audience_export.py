@@ -122,13 +122,21 @@ def eligible_contacts(db) -> Iterator[Contact]:
 
 
 def _write(path: Path, headers: Sequence[str], rows: list[tuple[str, str]]) -> None:
+    """The file is created owner-only before any hash is written (a leftover partial is removed first, since an
+    existing file keeps its old mode), and a partial file is never left behind when the write fails."""
     partial = path.with_suffix(".partial")
-    with open(partial, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(headers)
-        writer.writerows(rows)
-    os.chmod(partial, 0o600)
-    os.replace(partial, path)
+    partial.unlink(missing_ok=True)
+    try:
+        with os.fdopen(os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", newline="",
+                       encoding="utf-8") as handle:
+            os.chmod(partial, 0o600)  # the umask can only remove bits; this pins the mode whatever it is
+            writer = csv.writer(handle)
+            writer.writerow(headers)
+            writer.writerows(rows)
+        os.replace(partial, path)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
 
 
 def _prune(directory: Path, pattern: str, keep: int) -> None:
