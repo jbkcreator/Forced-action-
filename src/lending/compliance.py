@@ -17,7 +17,7 @@ from collections import defaultdict
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
@@ -753,6 +753,22 @@ def _hold_reason(
     if stale_scrub:
         return RemovalReason.SCRUB_STALE
     return None
+
+
+def blocked_from_dialing(db, phones: Sequence[str], now: datetime) -> set[str]:
+    """Phones the rules forbid calling right now: suppressed, or one the dialer sweep would pull
+    (attempt cap, attempt history, call window, stale scrub). Read from the rules, not from
+    ``dialer_holds``: a hold exists only once the dialer removal succeeded."""
+    phones = list(phones)
+    if not phones:
+        return set()
+    counts = _attempt_counts(db, phones, now)
+    stale = _stale_scrub_phones(db, phones, now)
+    exhausted = _attempt_history_exhausted_phones(db, phones, now)
+    return _suppressed_phones(db, phones) | {
+        p for p in phones
+        if _hold_reason(p, counts.get(p, 0), now, stale_scrub=p in stale, history_exhausted=p in exhausted)
+    }
 
 
 def _open_holds(db, reasons: dict[str, RemovalReason]) -> None:
