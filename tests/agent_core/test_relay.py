@@ -135,3 +135,18 @@ def test_deferred_send_is_blocked_once_the_draft_expires(queue: PendingActionQue
     assert relay.dispatch(action_id).outcome is DispatchOutcome.BLOCKED
     action = queue.get(action_id)
     assert action.status is ActionStatus.BLOCKED and "expired" in action.error and executor.sent == []
+
+
+def test_a_deferred_send_that_clears_after_expiry_is_never_sent(queue: PendingActionQueue, halt: HaltSwitch, clock,
+                                                                executor: RecordingExecutor) -> None:
+    from datetime import timedelta
+    from packages.agent_core.relay import SendDeferred
+    allowed = {"now": False}
+    relay = Relay(queue, halt, {"ghl_sms": executor},
+                  send_check=lambda action: None if allowed["now"] else SendDeferred("outside the text window"))
+    action_id = _approved(queue)
+    assert relay.dispatch(action_id).outcome is DispatchOutcome.DEFERRED
+    clock.advance(timedelta(days=30))
+    allowed["now"] = True
+    assert relay.dispatch(action_id).outcome is DispatchOutcome.BLOCKED
+    assert queue.get(action_id).status is ActionStatus.BLOCKED and executor.sent == []

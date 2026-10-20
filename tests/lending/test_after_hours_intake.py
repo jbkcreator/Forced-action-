@@ -167,6 +167,8 @@ def test_endpoint_rejects_a_bad_secret_and_a_bad_body_and_is_closed_while_off(cl
     (datetime(2026, 10, 21, 11, 0, tzinfo=timezone.utc), datetime(2026, 10, 21, 23, 15, tzinfo=timezone.utc)),  # Wed 7am
     (datetime(2026, 10, 25, 15, 0, tzinfo=timezone.utc), datetime(2026, 10, 26, 23, 15, tzinfo=timezone.utc)),  # Sunday
     (datetime(2026, 10, 31, 23, 0, tzinfo=timezone.utc), datetime(2026, 11, 3, 0, 15, tzinfo=timezone.utc)),  # Sat, DST ends
+    (datetime(2026, 10, 21, 12, 56, tzinfo=timezone.utc), datetime(2026, 10, 22, 23, 15, tzinfo=timezone.utc)),  # Wed 8:56am
+    (datetime(2026, 10, 21, 12, 54, tzinfo=timezone.utc), datetime(2026, 10, 21, 23, 15, tzinfo=timezone.utc)),  # Wed 8:54am
 ])
 def test_pin_lasts_until_the_end_of_the_next_business_day_shift(when, until):
     assert pin_until(when) == until
@@ -239,3 +241,10 @@ def test_morning_job_acts_only_at_8_et_on_business_days(utc, acts):
     assert is_post_time(utc) is acts
     if not acts:
         assert main([], now=utc) == 0
+
+
+def test_morning_post_escapes_caller_supplied_slack_markup():
+    from src.tasks.lending_pinned_callbacks import format_slack
+    pin = PinnedCall(12, parse_intake({**BODY, "first_name": "<!channel>"}, now=NOW))
+    message = format_slack([MorningReply(pin, 7)])
+    assert "<!channel>" not in message and "&lt;!channel&gt;" in message

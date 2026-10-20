@@ -103,3 +103,8 @@ def test_non_finite_or_oversized_loan_value_is_shown_as_not_available():
     for bad in (float("nan"), "NaN", "Infinity", "-5", 10 ** 12):
         display = display_from_record({"estimated_loan_value": bad}, None)
         assert display.estimated_loan_value is None
+
+
+def test_entity_name_is_the_display_name_when_there_is_no_person():
+    fields = dialer_fields(display_from_record({"entity_name": "ABC MORTGAGE LLC"}, "Partners"))
+    assert (fields.first_name, fields.last_name, fields.company_name) == ("ABC MORTGAGE LLC", None, "ABC MORTGAGE LLC")

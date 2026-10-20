@@ -93,13 +93,15 @@ class Relay:
             self._queue.mark_failed(action_id, reason)
             return DispatchResult(DispatchOutcome.NOT_ENABLED, reason)
 
-        reason = self._blocking_reason(action)
+        # An expired draft never sends, whatever the send check says (a deferred send may clear only after it).
+        if action.expires_at is not None and action.expires_at <= self._queue.now():
+            reason: str | None = "the draft expired before it could be sent"
+        else:
+            reason = self._blocking_reason(action)
         if isinstance(reason, SendDeferred):
-            if action.expires_at is None or action.expires_at > self._queue.now():
-                self._queue.release_claim(action_id)
-                logger.debug("relay: action %s held for a later sweep: %s", action_id, reason)
-                return DispatchResult(DispatchOutcome.DEFERRED, reason)
-            reason = f"{reason} until the draft expired"
+            self._queue.release_claim(action_id)
+            logger.debug("relay: action %s held for a later sweep: %s", action_id, reason)
+            return DispatchResult(DispatchOutcome.DEFERRED, reason)
         if reason is not None:
             logger.warning("relay: action %s blocked at send time: %s", action_id, reason)
             self._queue.mark_blocked(action_id, reason)

@@ -216,8 +216,20 @@ def test_missing_settings_are_named() -> None:
     assert cora_agent.build_live_services(_settings(lending_cora_approver_user_ids="")) is None
 
 
-def test_no_egress_channel_is_registered_yet() -> None:
-    assert cora_agent.EGRESS_EXECUTORS == {}
+def test_only_email_is_registered_when_the_ghl_sender_is_configured(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(cora_agent, "get_email_sender",
+                        lambda: lambda *args, **kwargs: calls.append((args, kwargs)) or "m1")
+    executors = cora_agent.build_egress_executors()
+    assert set(executors) == {"ghl_email"}
+    assert executors["ghl_email"]({"lead_ref": "web_lead:7", "to_email": "sam@example.com",
+                                   "subject": "Hello", "body": "Hi Sam"}) == "m1"
+    assert calls == [(("sam@example.com", "Hello", "Hi Sam"), {"phone": None})]
+
+
+def test_nothing_is_registered_without_a_configured_ghl_sender(monkeypatch) -> None:
+    monkeypatch.setattr(cora_agent, "get_email_sender", lambda: None)
+    assert cora_agent.build_egress_executors() == {}
 
 
 class ScriptedEngine:
@@ -287,3 +299,53 @@ def test_no_recipient_is_blocked_without_querying(channel: str) -> None:
     reason = cora_agent.make_send_check(engine)(_action(channel, phone=None, email=None))
     assert reason == "no recipient recorded, so opt-out status cannot be verified"
     assert engine.queries == []
+
+
+# ── the inbox digest in the sweep ────────────────────────────────────────────
+
+class _SweepParts:
+    """Stands in for the session, gate and relay: nothing to expire or retry, records whether sends ran."""
+
+    def __init__(self, halted: bool = False):
+        self.halted, self.relay_runs = halted, 0
+
+    def expire_stale_actions(self) -> int:
+        return 0
+
+    def retry_missing_cards(self) -> int:
+        return 0
+
+    def run(self):
+        from packages.agent_core.halt import AgentHalted
+        from packages.agent_core.relay import RelayResult
+
+        self.relay_runs += 1
+        if self.halted:
+            raise AgentHalted("halted")
+        return RelayResult((), (), (), ())
+
+
+def _sweep_services(parts: _SweepParts, digest) -> cora_agent.CoraServices:
+    return cora_agent.CoraServices(session=parts, relay=parts, gate=parts, inbox_digest=digest)
+
+
+def test_the_sweep_posts_the_inbox_digest_even_while_halted() -> None:
+    digests: list[int] = []
+    parts = _SweepParts(halted=True)
+    cora_agent.run_sweep(_sweep_services(parts, lambda: digests.append(1) or 1))
+    assert digests == [1]
+
+
+def test_a_failing_digest_never_stops_the_sends() -> None:
+    def database_down() -> int:
+        raise RuntimeError("database unavailable")
+
+    parts = _SweepParts()
+    cora_agent.run_sweep(_sweep_services(parts, database_down))
+    assert parts.relay_runs == 1
+
+
+def test_inbox_channel_ids_skip_unset_channels() -> None:
+    settings = SimpleNamespace(lending_replies_channel="C_REPLIES", lending_ops_channel="",
+                               lending_dial_tasks_channel="C_DIAL", lending_daily_channel="")
+    assert cora_agent.lending_channel_ids(settings) == {"replies": "C_REPLIES", "dial_tasks": "C_DIAL"}

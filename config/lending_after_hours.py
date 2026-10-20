@@ -17,10 +17,11 @@ from datetime import time
 INTAKE_MARKER = "after_hours_voicemail"
 DEFAULT_SOURCE = "ghl_voicemail"
 
-# A pin lasts until the end of the next business-day shift (a Friday-night voicemail is on Monday's list), and
-# ends earlier at the first outbound attempt. Holidays are not skipped.
+# A pin lasts until the end of the shift on the next business day whose morning list has not been posted yet
+# (a Friday-night voicemail is on Monday's list; one left after the 08:55 post waits for the next day's), and ends
+# earlier at the first outbound attempt. Holidays are not skipped.
 BUSINESS_DAYS = frozenset({0, 1, 2, 3, 4})  # Monday-Friday
-SHIFT_START_ET = time(9, 0)
+MORNING_POST_ET = time(8, 55)
 PIN_UNTIL_ET = time(19, 15)
 
 # 08:55 ET on business days, before the shift: draft the replies (Approve cards in Cora's channel, so a draft is

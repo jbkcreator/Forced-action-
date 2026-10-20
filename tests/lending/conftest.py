@@ -6,6 +6,8 @@ nothing persists in the shared database.
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -83,6 +85,30 @@ def _no_live_web_lead_sink(monkeypatch):
     monkeypatch.setattr("src.api.lending_web_router.get_live_sink", lambda: None)
 
 
+class _InboxRecorder:
+    """Stands in for the session ``add_to_inbox_in_own_session`` opens: records each event, writes nothing."""
+
+    def __init__(self):
+        self.events: list[dict] = []
+
+    @contextmanager
+    def __call__(self):
+        yield self
+
+    def execute(self, statement, params=None):
+        self.events.append(dict(params or {}))
+        return SimpleNamespace(scalar_one_or_none=lambda: len(self.events))
+
+
+@pytest.fixture(autouse=True)
+def inbox_writes(monkeypatch):
+    """Events alert paths add to Cora's inbox on their own session. A test must never commit one to the shared
+    database; events added on a test's own (rolled-back) session are unaffected."""
+    recorder = _InboxRecorder()
+    monkeypatch.setattr("src.lending.cora_inbox._own_session_factory", recorder)
+    return recorder.events
+
+
 @pytest.fixture
 def web_leads_db(lending_db):
     """lending_db plus lending.web_leads (rolled back with the test)."""
@@ -126,3 +152,23 @@ def prequal_db():
     tx.rollback()
     conn.close()
     engine.dispose()
+
+
+class _NotHalted:
+    """Stands in for the emergency-halt flag read: off, and never a query to the shared database."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, statement, params=None):
+        return SimpleNamespace(scalar=lambda: False)
+
+
+@pytest.fixture(autouse=True)
+def global_halt_off(monkeypatch):
+    """The lending emergency halt reads Postgres before every GHL send and dialer load; tests run with it off.
+    Tests of the halt itself swap in their own session factory."""
+    monkeypatch.setattr("src.lending.global_halt._session_factory", _NotHalted)

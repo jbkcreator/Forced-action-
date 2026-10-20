@@ -22,6 +22,7 @@ from config.lending_after_hours import BUSINESS_DAYS, MORNING_POST_HOUR_ET
 from config.lending_reminders import TIMEZONE
 from config.settings import AppSettings, get_settings
 from packages.agent_core.pending_actions import PendingActionQueue
+from packages.agent_core.redaction import slack_escape
 from packages.agent_core.store import AgentStore
 from src.lending.after_hours_intake import MorningReply, draft_morning_replies, model_drafter, pins_to_call
 from src.lending.db import lending_session
@@ -34,7 +35,8 @@ def _line(reply: MorningReply) -> str:
     event = reply.pin.event
     left = event.received_at.astimezone(TIMEZONE)
     status = "reply draft waiting for Approve" if reply.action_id else "no text consent, call only"
-    return (f"• {event.first_name or 'Caller'} ({reply.pin.lead_ref}, …{event.phone[-4:]}): voicemail {left:%a} "
+    name = slack_escape(event.first_name) if event.first_name else "Caller"  # caller-supplied: no live mentions
+    return (f"• {name} ({reply.pin.lead_ref}, …{event.phone[-4:]}): voicemail {left:%a} "
             f"{left.hour % 12 or 12}:{left:%M} {'am' if left.hour < 12 else 'pm'} ET — {status}")
 
 

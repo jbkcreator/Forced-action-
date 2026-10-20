@@ -29,7 +29,9 @@ from config.lending_lendingflow import (
     SWEEP_BATCH_SIZE,
 )
 from config.settings import get_settings
+from src.lending.global_halt import is_globally_halted
 from src.lending.compliance import text_window_open
+from src.lending.cora_inbox import add_to_inbox_safely
 from src.lending.contracts import LoanType
 from src.lending.web_leads import DeliveryError, PushResult, _suppression_reason
 from src.services.phone_utils import normalize
@@ -312,7 +314,7 @@ def _record_duplicate(db, parsed: ParsedLendingFlowLead, digest: str, now: datet
     existing = db.execute(
         text("UPDATE lending.lendingflow_leads SET duplicate_count = duplicate_count + 1, last_duplicate_at = :now "
              "WHERE id = (SELECT id FROM lending.lendingflow_leads WHERE vendor_lead_id = :v OR dedupe_hash = :h "
-             "ORDER BY (vendor_lead_id = :v) DESC LIMIT 1) RETURNING id, lead_uuid"),
+             "ORDER BY (vendor_lead_id = :v) DESC LIMIT 1) RETURNING id, lead_uuid, vendor_lead_id, dedupe_hash"),
         {"v": parsed.vendor_lead_id, "h": digest, "now": now},
     ).one_or_none()
     if existing is None:
@@ -320,7 +322,26 @@ def _record_duplicate(db, parsed: ParsedLendingFlowLead, digest: str, now: datet
     if parsed.certificate:
         store_certificate(db, existing.id, parsed.certificate, duplicate=True, now=now)
     logger.info("[lendingflow] duplicate delivery lead=%s vendor=%s", existing.id, parsed.vendor_lead_id)
+    if existing.vendor_lead_id != parsed.vendor_lead_id or existing.dedupe_hash != digest:
+        _raise_possible_duplicate(db, existing.id, parsed.vendor_lead_id, digest,
+                                  same_lead_id=existing.vendor_lead_id == parsed.vendor_lead_id)
     return SaveResult(existing.id, str(existing.lead_uuid), created=False)
+
+
+def _raise_possible_duplicate(db, lead_id: int, vendor_lead_id: str, digest: str, *, same_lead_id: bool) -> None:
+    """Runbook § 1, Principle 3 ("duplicates beat silence"): a delivery that matches an existing lead on only one
+    of its two keys may be a new request, so a person is told through Cora's inbox. Each distinct delivery is
+    raised once; an exact re-send (both keys match) stays quiet. A failed inbox write never loses the lead."""
+    matched = ("the same LendingFlow lead id but a different phone or email" if same_lead_id
+               else "the same phone and email but a different LendingFlow lead id")
+    add_to_inbox_safely(
+        db, event_type="lendingflow_possible_duplicate", dedup_key=f"{lead_id}:{vendor_lead_id}:{digest[:16]}",
+        summary=f"Possible duplicate LendingFlow lead: matches lendingflow_lead:{lead_id} with {matched}. "
+                "It was not created as a new lead; check whether it is a new request.",
+        payload={"lead_ref": f"lendingflow_lead:{lead_id}", "vendor_lead_id": vendor_lead_id,
+                 "matched_on": "vendor_lead_id" if same_lead_id else "phone_email_hash"},
+        target_channel="dial_tasks",
+    )
 
 
 def save_lead(db, parsed: ParsedLendingFlowLead, raw_payload: Any, *, now: Optional[datetime] = None) -> SaveResult:
@@ -555,7 +576,7 @@ def release_held_intro_sms(db, sink: Optional[Any], *, now: Optional[datetime] =
     """Add the intro-SMS ready tag to delivered leads that were held back (outside the borrower's 8am-8pm window, or
     switch off at push time) once it is allowed. Only leads younger than INTRO_SMS_HOLD_MAX_HOURS: an intro text
     never goes out a day late. The caller commits. Never raises per lead; returns how many were tagged."""
-    if sink is None or not _intro_sms_on():
+    if sink is None or not _intro_sms_on() or is_globally_halted():
         return 0
     # ponytail: oldest-first batch; 50+ permanently blocked leads (unknown timezone) would starve newer ones for up to
     # INTRO_SMS_HOLD_MAX_HOURS. Add a skip marker if volume ever gets there.

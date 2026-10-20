@@ -29,7 +29,7 @@ from typing import Any, Callable, Mapping, Optional, Protocol
 from sqlalchemy import text
 
 from config.lending_after_hours import (BUSINESS_DAYS, DEFAULT_SOURCE, DRAFT_FORBIDDEN, DRAFT_MAX_CHARS, DRAFT_PROMPT,
-                                        DRAFT_TOOL_NAME, FALLBACK_REPLY, INTAKE_MARKER, PIN_UNTIL_ET, SHIFT_START_ET)
+                                        DRAFT_TOOL_NAME, FALLBACK_REPLY, INTAKE_MARKER, MORNING_POST_ET, PIN_UNTIL_ET)
 from config.lending_reminders import TIMEZONE
 from src.lending.consent import has_text_consent
 from src.lending.cora_tools import borrower_draft_problem
@@ -126,10 +126,11 @@ def parse_intake(body: Mapping[str, Any], *, now: datetime) -> IntakeEvent:
 
 
 def pin_until(now: datetime) -> datetime:
-    """End of the next business-day shift: the same day before the shift starts, else the next business day."""
+    """End of the shift on the next business day whose 08:55 morning list is still to come: the same day before the
+    post, else the next business day, so every pin is on one morning list."""
     local = now.astimezone(TIMEZONE)
     day = local.date()
-    if local.weekday() not in BUSINESS_DAYS or local.time() >= SHIFT_START_ET:
+    if local.weekday() not in BUSINESS_DAYS or local.time() >= MORNING_POST_ET:
         day += timedelta(days=1)
     while day.weekday() not in BUSINESS_DAYS:
         day += timedelta(days=1)

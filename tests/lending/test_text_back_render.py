@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from config.lending_text_back import MAX_TEXT_CHARS, TEMPLATES
+from config.lending_text_back import BOOKING_LINE, BOOKING_LINK, CAPS, MAX_TEXT_CHARS, TEMPLATES
 from src.lending.text_back import PendingText, choose_template, first_name_of, format_number, render_body
 
 NUMBER = "+18135550100"
@@ -22,12 +22,15 @@ def _item(**over) -> PendingText:
 def test_the_three_texts_carry_no_company_name():
     assert TEMPLATES["maturity"] == ("{greeting}, it's {caller} with Josh Kantor, Loan Officer. Sorry I missed you. "
                                      "I was calling about the loan on {property}. "
-                                     "Call or text me back at {number} when it suits you. Reply STOP to opt out.")
+                                     "Call or text me back at {number} when it suits you. "
+                                     "{booking}Reply STOP to opt out.")
     assert TEMPLATES["deal_drop"] == ("{greeting}, {caller} with Josh Kantor, Loan Officer here. Just tried you about {property}. "
                                       "We help investors in {county} fund their next deal. Text back if you'd like to chat. "
-                                      "Reply STOP to opt out.")
+                                      "{booking}Reply STOP to opt out.")
     assert TEMPLATES["general"] == ("{greeting}, this is {caller} with Josh Kantor, Loan Officer. Sorry we missed each other. "
-                                    "Reply here or call {number} whenever works. Reply STOP to opt out.")
+                                    "Reply here or call {number} whenever works. "
+                                    "{booking}Reply STOP to opt out.")
+    assert BOOKING_LINE == f"Book a time: {BOOKING_LINK} "
 
 
 @pytest.mark.parametrize("over,expected", [
@@ -56,6 +59,13 @@ def test_first_name_is_a_real_first_name_or_nothing(name, expected):
 
 
 def test_maturity_text_renders_exactly():
+    assert render_body(_item(), "maturity", number=NUMBER, booking_link=True) == (
+        "Hi Sam, it's Alex with Josh Kantor, Loan Officer. Sorry I missed you. I was calling about the loan on 123 Main St. "
+        "Call or text me back at (813) 555-0100 when it suits you. "
+        f"Book a time: {BOOKING_LINK} Reply STOP to opt out.")
+
+
+def test_with_the_booking_link_off_the_approved_wording_goes_out_unchanged():
     assert render_body(_item(), "maturity", number=NUMBER) == (
         "Hi Sam, it's Alex with Josh Kantor, Loan Officer. Sorry I missed you. I was calling about the loan on 123 Main St. "
         "Call or text me back at (813) 555-0100 when it suits you. Reply STOP to opt out.")
@@ -112,13 +122,51 @@ def test_braces_in_data_render_literally_without_exception():
 
 
 def test_deal_drop_text_renders_exactly():
-    assert render_body(_item(queue="transaction_ready"), "deal_drop", number=NUMBER) == (
+    assert render_body(_item(queue="transaction_ready"), "deal_drop", number=NUMBER, booking_link=True) == (
         "Hi Sam, Alex with Josh Kantor, Loan Officer here. Just tried you about 123 Main St. "
         "We help investors in Hillsborough fund their next deal. Text back if you'd like to chat. "
-        "Reply STOP to opt out.")
+        f"Book a time: {BOOKING_LINK} Reply STOP to opt out.")
 
 
 def test_general_text_renders_exactly():
-    assert render_body(_item(queue="nurture"), "general", number=NUMBER) == (
+    assert render_body(_item(queue="nurture"), "general", number=NUMBER, booking_link=True) == (
         "Hi Sam, this is Alex with Josh Kantor, Loan Officer. Sorry we missed each other. "
-        "Reply here or call (813) 555-0100 whenever works. Reply STOP to opt out.")
+        "Reply here or call (813) 555-0100 whenever works. "
+        f"Book a time: {BOOKING_LINK} Reply STOP to opt out.")
+
+
+@pytest.mark.parametrize("key", ["maturity", "deal_drop", "general"])
+def test_every_text_carries_the_booking_link_before_the_stop_language(key):
+    body = render_body(_item(), key, number=NUMBER, booking_link=True)
+    assert f"Book a time: {BOOKING_LINK} Reply STOP to opt out." in body
+
+
+@pytest.mark.parametrize("key", ["maturity", "deal_drop", "general"])
+def test_fields_at_their_caps_still_fit_with_the_booking_link(key):
+    item = _item(property_address="x" * CAPS["property"], county="x" * CAPS["county"],
+                 caller_name="x" * CAPS["caller"], borrower_name="x" * CAPS["first_name"] + " Jones")
+    body = render_body(item, key, number=NUMBER, booking_link=True)
+    assert len(body) <= MAX_TEXT_CHARS and BOOKING_LINK in body and body.endswith("Reply STOP to opt out.")
+
+
+@pytest.mark.parametrize("key", ["maturity", "deal_drop", "general"])
+@pytest.mark.parametrize("booking_link", [False, True])
+def test_worst_case_fields_fit_with_or_without_the_booking_link(key, booking_link):
+    long = "x" * 300
+    body = render_body(_item(property_address=long, county=long, caller_name=long, borrower_name=long + " Jones"), key,
+                       number=NUMBER, booking_link=booking_link)
+    assert len(body) <= MAX_TEXT_CHARS and body.endswith("Reply STOP to opt out.") and (BOOKING_LINK in body) is booking_link
+
+
+def test_long_values_are_cut_at_a_whole_word_not_mid_word():
+    body = render_body(_item(property_address="1234 Northwest Southern Grandview Avenue, Tampa FL",
+                             caller_name="Alexandria Montgomery Smith", county="Hillsborough County"),
+                       "deal_drop", number=NUMBER)
+    assert "about 1234 Northwest Southern Grandview." in body  # a plain slice gave "...Grandview A"
+    assert "Hi Sam, Alexandria with" in body  # a plain slice gave "Alexandria Montgomer"
+    assert "investors in Hillsborough fund" in body  # a plain slice gave "Hillsborough C"
+
+
+def test_a_single_word_longer_than_its_cap_is_still_cut_to_the_cap():
+    body = render_body(_item(caller_name="x" * 50), "general", number=NUMBER)
+    assert f"this is {'x' * CAPS['caller']} with" in body

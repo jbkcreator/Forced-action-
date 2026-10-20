@@ -25,6 +25,7 @@ from typing import Any, Optional
 from sqlalchemy import text
 
 from src.lending.after_hours_intake import record_intake
+from src.lending.cora_inbox import add_to_inbox_in_own_session
 from src.lending.db import lending_session
 from src.lending.ghl_consent_events import (
     InvalidEvent,
@@ -116,6 +117,7 @@ class RetryResult:
     still_failing: int = 0
     gave_up: int = 0
     alerts: list[str] = field(default_factory=list)
+    gave_up_events: list[dict[str, Any]] = field(default_factory=list)  # one per alert, raised in Cora's inbox
 
 
 def _superseded_grant(db, endpoint: str, payload: dict[str, Any], failed_at) -> bool:
@@ -157,6 +159,8 @@ def _retry_one(db, row, result: RetryResult) -> None:
             f":rotating_light: GHL {_label(row.endpoint)} webhook #{row.id} for GHL contact "
             f"{row.ghl_contact_id or 'unknown'} still fails after {attempts} attempt(s) ({error}). It is no longer "
             "retried: this event is NOT recorded. Check it and re-run the GHL workflow.")
+        result.gave_up_events.append({"webhook_failure_id": row.id, "endpoint": row.endpoint,
+                                      "ghl_contact_id": row.ghl_contact_id, "attempts": attempts, "error": error})
     else:
         result.still_failing += 1
         logger.warning("[lending-webhook-failure] #%s retry %s failed: %s", row.id, attempts, error)
@@ -169,8 +173,13 @@ def retry_pending(*, session_factory: Callable = lending_session,
     with session_factory() as db:
         for row in db.execute(_OPEN, {"limit": RETRY_BATCH_SIZE}).all():
             _retry_one(db, row, result)
-    for message in result.alerts:
-        notify(message)
+    for message, event in zip(result.alerts, result.gave_up_events):
+        posted = notify(message)
+        add_to_inbox_in_own_session(
+            event_type="consent_webhook_gave_up", dedup_key=str(event["webhook_failure_id"]), target_channel="ops",
+            channel_posted=bool(posted), payload=event,
+            summary=f"GHL {_label(event['endpoint'])} webhook no longer retried: the change is NOT recorded",
+        )
     return result
 
 

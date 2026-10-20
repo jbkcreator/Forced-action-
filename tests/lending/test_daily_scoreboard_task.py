@@ -11,6 +11,11 @@ from src.tasks import lending_daily_scoreboard as task
 NOON_ET = datetime(2026, 10, 6, 16, 0, tzinfo=timezone.utc)
 AFTER_MIDNIGHT_UTC = datetime(2026, 10, 7, 0, 30, tzinfo=timezone.utc)  # 20:30 ET on Oct 6
 SEVEN_PM_UTC = datetime(2026, 10, 6, 23, 20, tzinfo=timezone.utc)  # 19:20 ET on Oct 6
+NINE_AM_UTC = datetime(2026, 10, 6, 13, 0, tzinfo=timezone.utc)  # 09:00 ET: before the first hourly post
+TEN_AM_UTC = datetime(2026, 10, 6, 14, 0, tzinfo=timezone.utc)  # 10:00 ET
+SEVEN_PM_ET_ON_THE_HOUR = datetime(2026, 10, 6, 23, 0, tzinfo=timezone.utc)  # 19:00 ET
+EIGHT_PM_UTC_PLUS = datetime(2026, 10, 7, 0, 0, tzinfo=timezone.utc)  # 20:00 ET on Oct 6: after the last hourly post
+WINTER_TEN_AM_UTC = datetime(2026, 12, 1, 15, 0, tzinfo=timezone.utc)  # 10:00 ET in standard time (UTC-5)
 
 
 @pytest.fixture
@@ -33,9 +38,10 @@ def wired(monkeypatch):
     monkeypatch.setattr(task.time, "sleep", lambda s: None)
     monkeypatch.setattr(task, "lending_session", fake_session)
     monkeypatch.setattr(task, "campaign_names", lambda: {})
-    monkeypatch.setattr(task, "build_scoreboard", lambda db, day, names: days.append(day) or "data")
-    monkeypatch.setattr(task, "format_slack", lambda data, day: f"board {day}")
-    monkeypatch.setattr(task, "format_blocks", lambda data, day: [{"type": "divider"}])
+    monkeypatch.setattr(task, "build_scoreboard",
+                        lambda db, day, names: days.append(day) or SimpleNamespace(total=SimpleNamespace(dials=1)))
+    monkeypatch.setattr(task, "format_slack", lambda data, day, **kw: f"board {day}" + (" hourly" if kw.get("as_of") else ""))
+    monkeypatch.setattr(task, "format_blocks", lambda data, day, **kw: [{"type": "divider"}])
     monkeypatch.setattr("slack_sdk.WebClient", FakeClient)
     return posted, days
 
@@ -52,24 +58,93 @@ def test_at_7_20pm_et_it_posts_once(wired):
     assert posted[0]["blocks"] == [{"type": "divider"}]
 
 
+@pytest.mark.parametrize("now", [TEN_AM_UTC, NOON_ET, WINTER_TEN_AM_UTC])
+def test_hourly_mode_posts_the_day_so_far_inside_the_hourly_window(wired, now):
+    posted, _ = wired
+    assert task.main(["--hourly"], now=now) == 0
+    assert len(posted) == 1 and posted[0]["text"].endswith(" hourly")
+
+
+@pytest.mark.parametrize("now", [NINE_AM_UTC, SEVEN_PM_ET_ON_THE_HOUR, EIGHT_PM_UTC_PLUS])
+def test_hourly_mode_is_silent_outside_the_hourly_window(wired, now):
+    """7pm is left to the 7:20pm closing board, so the channel does not get two boards 20 minutes apart."""
+    posted, _ = wired
+    assert task.main(["--hourly"], now=now) == 0 and posted == []
+
+
+def test_the_closing_board_is_not_marked_hourly_and_the_hourly_flag_does_not_move_it(wired):
+    posted, _ = wired
+    assert task.main([], now=SEVEN_PM_UTC) == 0
+    assert posted[0]["text"] == "board 2026-10-06"
+    assert task.main([], now=TEN_AM_UTC) == 0 and len(posted) == 1  # no flag: still only the 19:xx ET run acts
+
+
 def test_rendered_scoreboard_has_aligned_tables_and_a_totals_grid():
     from datetime import date
 
     from src.lending.scoreboard import NumberRow, Row, ScoreboardData, format_blocks, format_slack
 
-    maria, josh = Row("Maria", 21, 7, 4, 2, 2, 1), Row("Josh `the` closer with a very long display name", 16, 5, 2, 1, 0)
-    data = ScoreboardData([maria, josh], [maria], [], Row("TOTAL", 37, 12, 6, 3, 2, 1), [NumberRow("+18135550100", 37, 20)])
+    maria, josh = Row("Maria", 21, 7, 4, 2, 2, 1, 5), Row("Josh `the` closer with a very long display name", 16, 5, 2, 1, 0)
+    total = Row("TOTAL", 37, 12, 6, 3, 2, 1, 5)
+    data = ScoreboardData([maria, josh], [maria], [], total, [NumberRow("+18135550100", 37, 20)],
+                          [Row("Seat 1", 37, 12, 6, 3, 2, 1, 5)], [Row("List 4", 37, 12, 6, 3, 2, 1, 5)])
     blocks = format_blocks(data, date(2026, 10, 5))
     assert blocks[0]["type"] == "header" and "Mon Oct 5, 2026" in blocks[0]["text"]["text"]
-    grid = next(b for b in blocks if b["type"] == "section" and "fields" in b)["fields"]
-    assert [f["text"] for f in grid][:2] == ["*Dials*\n37", "*Live*\n12"] and "*Showed*\n1" in [f["text"] for f in grid]
+    grids = [b["fields"] for b in blocks if b["type"] == "section" and "fields" in b]
+    assert all(len(g) <= 10 for g in grids)  # Slack allows at most 10 fields in one section
+    grid = [f["text"] for g in grids for f in g]
+    assert grid[:2] == ["*Dials*\n37", "*Contacts*\n12"] and len(grid) == 11
+    assert "*Calls 2+ min*\n5" in grid and "*Showed*\n1" in grid and "*Held ÷ Booked*\n33%" in grid  # 1 held / 3 booked
+    assert "*Transfers*\nn/a" in grid  # the dialer records no transfer yet
     tables = [b["text"]["text"] for b in blocks if b["type"] == "section" and "text" in b]
-    assert len(tables) == 4 and "_no dials_" in tables[2]
-    assert "+18135550100" in tables[3] and "54%" in tables[3]  # caller-ID answer rate table
-    rows = tables[0].split("```")[1].strip().splitlines()
+    assert len(tables) == 6 and "_no dials_" in tables[4]  # seat, source, caller, campaign, hook (empty), number
+    assert "Seat 1" in tables[0] and "List 4" in tables[1]
+    assert "+18135550100" in tables[5] and "54%" in tables[5]  # caller-ID answer rate table
+    rows = tables[2].split("```")[1].strip().splitlines()
     assert len({len(r) for r in rows if not r.startswith("-")}) == 1  # every row padded to the same width
-    assert "`the`" not in tables[0] and "…" in tables[0]
+    assert "`the`" not in tables[2] and "…" in tables[2]
     assert "Showed" in format_slack(data, date(2026, 10, 5))
+
+
+def test_hourly_board_says_it_is_the_day_so_far_and_the_closing_board_does_not():
+    from datetime import date
+
+    from src.lending.scoreboard import Row, ScoreboardData, format_blocks, format_slack
+
+    data = ScoreboardData([], [], [], Row("TOTAL", 0, 0, 0, 0, 0))
+    as_of = datetime(2026, 10, 6, 14, 5, tzinfo=timezone.utc).astimezone(__import__("zoneinfo").ZoneInfo("America/New_York"))
+    hourly = format_blocks(data, date(2026, 10, 6), as_of=as_of)
+    assert "as of 10:05 am ET" in hourly[1]["elements"][0]["text"]
+    assert "as of 10:05 am ET" in format_slack(data, date(2026, 10, 6), as_of=as_of)
+    assert "through 7:15pm ET" in format_blocks(data, date(2026, 10, 6))[1]["elements"][0]["text"]
+
+
+def test_show_rate_is_showed_over_booked_and_blank_when_nothing_was_booked():
+    from src.lending.scoreboard import Row
+
+    assert Row("a", 10, 4, 2, 4, 0, 3).show_rate == 0.75
+    assert Row("b", 10, 4, 2, 0, 0, 2).show_rate is None  # showed today, booked on an earlier day: no division error
+
+
+def test_a_slack_totals_section_never_holds_more_than_ten_fields():
+    from datetime import date
+
+    from src.lending.scoreboard import Row, ScoreboardData, TOTALS_PER_SECTION, format_blocks
+
+    assert TOTALS_PER_SECTION <= 10
+    blocks = format_blocks(ScoreboardData([], [], [], Row("TOTAL", 1, 1, 1, 1, 1)), date(2026, 10, 6))
+    assert all(len(b["fields"]) <= 10 for b in blocks if "fields" in b)
+
+
+def test_every_scoreboard_table_fits_in_one_slack_section_even_at_the_row_limit():
+    from datetime import date
+
+    from src.lending.scoreboard import MAX_NAME_CHARS, MAX_TABLE_ROWS, Row, ScoreboardData, format_blocks
+
+    rows = [Row("n" * MAX_NAME_CHARS, 9999, 9999, 9999, 9999, 9999, 9999, 9999, 9999) for _ in range(MAX_TABLE_ROWS + 5)]
+    blocks = format_blocks(ScoreboardData(rows, rows, rows, Row("TOTAL", 1, 1, 1, 1, 1), [], rows, rows), date(2026, 10, 6))
+    assert all(len(b["text"]["text"]) <= 3000 for b in blocks if b["type"] == "section" and "text" in b)
+    assert len(blocks) <= 50  # Slack's block limit
 
 
 def test_force_uses_the_eastern_date_not_the_utc_date(wired):
@@ -158,3 +233,24 @@ def test_client_approved_scoreboard_definitions_are_pinned():
 
     assert "DNC_REQUEST" in LIVE_CONVERSATION_CODES
     assert NURTURE_SENT_CODES == {"GATE_FAILED_NURTURE"}
+
+
+def test_an_hourly_board_with_no_dials_yet_is_not_posted(wired, monkeypatch):
+    posted, _ = wired
+    monkeypatch.setattr(task, "build_scoreboard", lambda db, day, names: SimpleNamespace(total=SimpleNamespace(dials=0)))
+    assert task.main(["--hourly"], now=TEN_AM_UTC) == 0 and posted == []
+    assert task.main([], now=SEVEN_PM_UTC) == 0 and len(posted) == 1  # the closing board still posts
+
+
+def test_section_tables_leave_out_xfer_while_transfers_are_not_recorded():
+    from datetime import date
+
+    from src.lending.scoreboard import LEGEND, Row, ScoreboardData, TRANSFER_CODES, format_blocks
+
+    assert not TRANSFER_CODES
+    row = Row("Maria", 21, 7, 4, 2, 2, 1, 5)
+    blocks = format_blocks(ScoreboardData([row], [row], [row], row, [], [row], [row]), date(2026, 10, 5))
+    tables = [b["text"]["text"] for b in blocks if b["type"] == "section" and "text" in b][:5]
+    assert all("Xfer" not in t and "Show%" in t for t in tables)
+    assert any(f["text"] == "*Transfers*\nn/a" for b in blocks for f in b.get("fields", []))  # still in the totals
+    assert "not a conversion rate" in LEGEND and "any result" in LEGEND
