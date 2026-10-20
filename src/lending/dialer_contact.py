@@ -3,7 +3,8 @@
 The contact carries fixed fields (first/last name, company, a free-text
 information field), so the five dialer display fields are placed as:
 
-- Borrower Name          -> first_name / last_name
+- Borrower Name          -> first_name / last_name (with none, the entity name is the
+                            first name, so the dialer never lists "Unknown Contact")
 - Entity Name            -> company_name
 - Target Property Address, Estimated Loan Value, Recent Permit Details,
   campaign, county, hook -> labelled lines in ``information``
@@ -118,6 +119,8 @@ def _city_before_state_zip(text_: str, zip_required: bool = False) -> Optional[s
 
 def dialer_fields(display: DialerDisplay, email: Optional[str] = None) -> DialerContactFields:
     first_name, last_name = _split_name(display.borrower_name)
+    if first_name is None:
+        first_name = display.entity_name
     street, city = _street_and_city(display.property_address)
     return DialerContactFields(
         first_name=first_name,
