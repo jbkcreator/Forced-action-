@@ -31,9 +31,9 @@ def test_cash_buyers_list_2_are_bookable_in_rank_2_not_nurture():
     assert out["queue"] == q.TRANSACTION_READY and out["bookable"] is True
 
 
-def test_partners_list_4_are_dialed_as_rank_4_but_never_bookable():
-    """Oct 4 §2: "partner script only, never pitched as borrowers" — a real ranked
-    queue now, not the old nurture-only bucket, but still never booked."""
+def test_partners_list_4_are_dialed_first_but_never_bookable():
+    """Runbook P1 dials partners first; Oct 4 §2 "partner script only, never pitched
+    as borrowers" still holds, so they are never booked (Q-7 open)."""
     out = assign_queue({"source_tag": "list_4", "phone": "+18135550001"})
     assert out["queue"] == q.PARTNERS and out["pool"] == q.PARTNERS and out["bookable"] is False
 
@@ -49,11 +49,10 @@ def test_unknown_tags_get_no_queue(tag):
     assert out["queue"] is None and out["bookable"] is False
 
 
-def test_config_is_valid_and_shares_sum_to_one():
+def test_config_is_valid_and_dial_order_is_partners_first():
     q.validate_queue_config()
-    assert q.DIAL_SHARE == {
-        q.VERIFIED_MATURITY: 0.5, q.TRANSACTION_READY: 0.25, q.BUILDERS: 0.2, q.PARTNERS: 0.05,
-    }
+    assert q.DIAL_ORDER == (q.PARTNERS, q.TRANSACTION_READY, q.BUILDERS, q.VERIFIED_MATURITY)
+    assert not hasattr(q, "DIAL_SHARE")
     assert not (q.NURTURE_ONLY_TAGS & set(q.SOURCE_TAG_QUEUES))
 
 

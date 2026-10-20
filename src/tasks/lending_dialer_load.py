@@ -14,7 +14,8 @@ only records in a launch queue; nurture-only and untagged records are never load
 
 The input is a JSON list of pool records (source_record_ref, pool, phone,
 email, borrower_name, entity_name, property_address, estimated_loan_value,
-recent_permit_details, parcel_id, state, entity_status).
+recent_permit_details, parcel_id, state, entity_status; optional lead_score / rank).
+Records are loaded in dial order (``src.lending.dial_order``).
 """
 from __future__ import annotations
 
@@ -26,6 +27,7 @@ from pathlib import Path
 
 from src.core.database import get_db_context
 from src.lending.compliance import tracerfy_scrub
+from src.lending.dial_order import sort_for_load
 from src.lending.dialer_load import LoadRefused, run_dialer_load
 from src.lending import dialer_port
 from src.lending.pool_source import staged_pool_records
@@ -61,6 +63,8 @@ def main(argv: list[str] | None = None) -> int:
     if not isinstance(records, list):
         logger.error("[dialer-load] input must be a JSON list of records")
         return 2
+    # Contacts reach the dialer in import order: partners first, highest score first.
+    records = sort_for_load(records)
     run_id = args.run_id or f"dialer-load-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
 
     dialer = dialer_port.get_dialer() if args.live else None
