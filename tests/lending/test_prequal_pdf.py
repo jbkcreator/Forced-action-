@@ -93,5 +93,5 @@ def test_range_has_no_upper_clamp_when_a_lender_states_no_maximum():
 
 
 def test_watermark_text_is_the_runbook_string_exactly():
-    """Runbook §6.3 / split T-27: the watermark text must not change."""
+    """The pre-qual watermark text must not change."""
     assert NON_BINDING_PREQUAL_WATERMARK == "NON-BINDING PRE-QUALIFICATION ESTIMATE — FOR INFORMATIONAL PURPOSES ONLY"

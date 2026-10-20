@@ -1,4 +1,4 @@
-"""T-26: the reschedule link is passed in once per cycle, and a link dropped for length is recorded
+"""The reschedule link is passed in once per cycle, and a link dropped for length is recorded
 on the sent row (skip_reason), not only logged. No DB: a recording fake stands in."""
 from __future__ import annotations
 

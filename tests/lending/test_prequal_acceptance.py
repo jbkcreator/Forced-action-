@@ -1,4 +1,4 @@
-"""Split T-27 / Runbook §8 Test 2: real lender matrix -> 3 qualifying profiles with ranked lenders,
+"""Acceptance Test 2: real lender matrix -> 3 qualifying profiles with ranked lenders,
 a 4th non-qualifying profile with structured failure codes. Placeholders never shown as confirmed."""
 from __future__ import annotations
 
@@ -95,3 +95,21 @@ def test_demo_writes_three_watermarked_pdfs_and_a_json_report(tmp_path):
     assert all(by_name[n]["qualifies"] for n in QUALIFYING) and not by_name[NON_QUALIFYING]["qualifies"]
     assert by_name[NON_QUALIFYING]["failure_codes"] == ["credit_below_min"]
     assert by_name["1_fix_and_flip"]["ranking"][0]["rank"] == 1
+
+
+def test_a_profile_with_only_possible_lenders_needs_more_data_rather_than_declining(monkeypatch):
+    from types import SimpleNamespace
+
+    from src.lending import prequal_acceptance
+
+    undecided = SimpleNamespace(fitting=[], non_fitting=[], possible=[SimpleNamespace(lender_key="rcn")])
+    monkeypatch.setattr(prequal_acceptance, "evaluate_lender_fit", lambda *_a, **_kw: undecided)
+    outcome = evaluate_profile(_profile("1_fix_and_flip"), matrix=LENDER_MATRIX)
+    assert outcome.qualifies is False and outcome.failure_codes == []
+    assert outcome.needs_more_data is True and outcome.possible == ["rcn"]
+
+
+def test_qualifying_and_declined_profiles_are_not_flagged_needs_more_data():
+    outcomes = _outcomes()
+    assert not any(outcomes[name].needs_more_data for name in QUALIFYING)
+    assert outcomes[NON_QUALIFYING].needs_more_data is False

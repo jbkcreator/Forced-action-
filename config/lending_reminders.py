@@ -100,8 +100,9 @@ NINETY_MIN_NO_ADDRESS = (
 )
 NINETY_MIN_WITH_ADDRESS = NINETY_MIN_NO_ADDRESS
 
-# Runbook §4.5: the reminder before the call carries a reschedule link. Added only when
-# LENDING_RESCHEDULE_URL is set (wording and URL pending Josh); unset = the approved text above.
+# The reminder before the call can carry a reschedule link, added only when LENDING_RESCHEDULE_URL
+# is set; unset = the approved text above. Keep it unset until the wording is approved and the
+# texting campaign allows links.
 NINETY_MIN_RESCHEDULE_TEXT = " Reschedule: {url}"
 NINETY_MIN_RESCHEDULE_EMAIL = "To reschedule: {url}"
 

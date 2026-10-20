@@ -159,7 +159,7 @@ def test_the_config_is_used_when_the_database_is_unavailable(monkeypatch, caplog
 
 
 def test_the_table_is_used_when_the_flag_is_on_and_the_database_answers(monkeypatch):
-    """Runbook §6.3 "Dynamic DB overrides enabled via lending.lender_rule_values": with
+    """Dynamic DB overrides via lending.lender_rule_values: with
     LENDING_RULES_FROM_DB on, the evaluators read the table's matrix, not the config."""
     from contextlib import contextmanager
 

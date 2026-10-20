@@ -1,19 +1,21 @@
-"""Runbook §8 Test 2 (split T-27): sample borrowers through the real Lender Box engine.
+"""Acceptance Test 2: sample borrowers through the real Lender Box engine.
 
 Each profile carries the pre-qual lead (what the letter shows) plus the call facts the engine
 needs (experience, purchase price, rehab, ARV). ``evaluate_profile`` runs ``evaluate_lender_fit``
 on the current matrix and returns:
 
   - qualifies / limits: fitting lenders' loan bounds, the input to the pre-qual letter;
-  - ranking: fitting lenders in the engine's order (Josh A2: Backflip first, then lowest
+  - ranking: fitting lenders in the engine's order (the primary lender first, then lowest
     provisional total borrower cost, unknown cost last), each marked confirmed or
     "subject to lender confirmation";
   - failure_codes: the engine's ``DeclineReason`` codes when no lender fits, from lenders that
     offer the requested loan type only; lenders that do not offer it are listed separately in
-    ``loan_type_not_offered`` (the engine reports that miss as the catch-all ``other``).
+    ``loan_type_not_offered`` (the engine reports that miss as the catch-all ``other``);
+  - needs_more_data: no lender fits yet, but some are only "possible" because inputs are
+    missing, so the profile is undecided rather than declined.
 
 Internal acceptance output only: never sent to a borrower (lender_fit COMPLIANCE). The letter
-PDF itself is unchanged (B1/B4 sign-off pending).
+PDF itself is unchanged.
 """
 from __future__ import annotations
 
@@ -25,11 +27,12 @@ from config.lender_matrix import LenderRules, effective_rules
 from src.lending.contracts import BorrowerProfile, LoanRequest, LoanType
 from src.lending.lender_fit import evaluate_lender_fit
 from src.lending.prequal import FitLimits, PrequalLead
+from src.lending.prequal_fit import fit_limits_from_result
 
 SUBJECT_TO_CONFIRMATION = "subject to lender confirmation"
 CONFIRMED = "confirmed"
-# lender_fit._total_borrower_cost; formula pending Josh (Q2), None while points/spread unconfirmed.
-COST_BASIS = "provisional: loan x origination points + loan x rate spread x hold months / 12 (Q2 pending)"
+# lender_fit._total_borrower_cost; None while a lender's points or rate spread are unconfirmed.
+COST_BASIS = "provisional: loan x origination points + loan x rate spread x hold months / 12 (cost formula unconfirmed)"
 COST_UNKNOWN = "unknown (points or rate spread not confirmed)"
 
 
@@ -72,15 +75,7 @@ class ProfileOutcome:
     failure_codes_by_lender: dict[str, list[str]] = field(default_factory=dict)
     loan_type_not_offered: list[str] = field(default_factory=list)
     possible: list[str] = field(default_factory=list)
-
-
-def _limits(rules: LenderRules) -> FitLimits:
-    # TODO(PR #367): replace with prequal_fit.fit_limits_from_result once #367 merges; same bounds
-    # as prequal_fit._limits, copied here so this branch does not edit prequal_fit.py.
-    return FitLimits(
-        min_amount=int(rules.min_loan_amount) if rules.min_loan_amount is not None else 0,
-        max_amount=int(rules.max_loan_amount) if rules.max_loan_amount is not None else None,
-    )
+    needs_more_data: bool = False
 
 
 def _ranked(i: int, fit) -> RankedLender:
@@ -94,7 +89,7 @@ def evaluate_profile(profile: Test2Profile, *, matrix: tuple[LenderRules, ...]) 
     effective = {rules.key: effective_rules(rules) for rules in matrix}
     not_offered = sorted(key for key, rules in effective.items()
                          if rules.loan_types and profile.loan.loan_type not in rules.loan_types)
-    limits = [_limits(effective[fit.lender_key]) for fit in result.fitting if fit.lender_key in effective]
+    limits = fit_limits_from_result(result, matrix=tuple(effective.values()))
     by_lender = {miss.lender_key: [code.value for code in miss.reason_codes]
                  for miss in result.non_fitting if miss.lender_key not in not_offered}
     qualifies = bool(result.fitting)
@@ -107,6 +102,7 @@ def evaluate_profile(profile: Test2Profile, *, matrix: tuple[LenderRules, ...]) 
         failure_codes_by_lender={} if qualifies else by_lender,
         loan_type_not_offered=[] if qualifies else not_offered,
         possible=[p.lender_key for p in result.possible],
+        needs_more_data=not qualifies and bool(result.possible),
     )
 
 

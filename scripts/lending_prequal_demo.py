@@ -1,4 +1,4 @@
-"""Acceptance Test 2 (Runbook §8): sample borrowers through the Lender Box engine and the pre-qual letter.
+"""Acceptance Test 2: sample borrowers through the Lender Box engine and the pre-qual letter.
 
 Runs the four profiles in ``src.lending.prequal_acceptance`` against the current lender matrix
 (config, or ``lending.lender_rule_values`` when LENDING_RULES_FROM_DB is on). Each qualifying profile
@@ -26,6 +26,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config.settings import get_settings
+from config.lender_matrix import LENDER_MATRIX
 from src.lending.lender_rules_store import current_matrix
 from src.lending.pdf.render import NON_BINDING_PREQUAL_WATERMARK, render_pdf
 from src.lending.prequal import TEMPLATE, build_context
@@ -38,13 +39,18 @@ logger = logging.getLogger(__name__)
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out", default="prequal_demo_out")
+    parser.add_argument("--config-matrix", action="store_true",
+                        help="use config/lender_matrix.py even when LENDING_RULES_FROM_DB is on (no DB read)")
     parser.add_argument("--send-to", metavar="CONTACT_ID", help="email the first qualifying letter to this GHL test contact")
     args = parser.parse_args(argv)
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     pct = get_settings().lending_prequal_range_pct
-    matrix = current_matrix()
+    from_db = get_settings().lending_rules_from_db and not args.config_matrix
+    matrix = current_matrix() if from_db else LENDER_MATRIX
+    logger.info("lender matrix source: %s", "lending.lender_rule_values (LENDING_RULES_FROM_DB)" if from_db
+                else "config/lender_matrix.py")
     first_pdf: bytes | None = None
     report = []
     for profile in TEST2_PROFILES:

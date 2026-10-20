@@ -370,7 +370,7 @@ def _fields(first_name: Optional[str], slot_start_utc: datetime, property_addres
 
 
 def reschedule_link_applies(kind: str, reschedule_url: Optional[str]) -> bool:
-    """Runbook §4.5: only the reminder before the call carries the reschedule link, and only once one is set."""
+    """Only the reminder before the call carries the reschedule link, and only once one is set."""
     return kind == KIND_NINETY_MIN and bool(reschedule_url)
 
 

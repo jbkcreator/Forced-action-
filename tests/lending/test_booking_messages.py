@@ -237,7 +237,7 @@ def test_confirmation_call_due_dates_follow_the_client_rules(db):
     assert str(due_date_for("ai", wed_call, datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc))) == "2026-10-07"  # same-day booking
 
 
-# ── T-26: Runbook §4.5 verification + optional reschedule link ─────────────────
+# ── Reminder timing + optional reschedule link ─────────────────
 
 URL = "https://link.nextdeallending.com/reschedule"
 NINETY_TODAY = ("Hi Jane, your call with Josh Kantor, Loan Officer, is in about 90 minutes, at 10:00 am ET. "
@@ -278,8 +278,8 @@ def test_a_link_that_would_overflow_the_text_is_left_off_rather_than_cut():
 
 
 def test_runbook_timing_day_before_6pm_et_and_ninety_minutes_before_slot():
-    """Runbook §4.5: day-before at 6:00 PM ET the evening prior (matches); second reminder is built at
-    90 minutes (client-approved wording), not the Runbook's 60 (open Q-20)."""
+    """Day-before at 6:00 PM ET the evening prior; the second reminder is built at 90 minutes
+    (client-approved wording; the launch spec says 60, awaiting confirmation)."""
     from config.lending_reminders import NINETY_MIN_SECONDS
     sent = night_before_send_at(SLOT).astimezone(ET)
     assert (sent.date(), sent.hour, sent.minute) == ((SLOT.astimezone(ET) - timedelta(days=1)).date(), 18, 0)
@@ -300,3 +300,17 @@ def test_email_without_a_signature_paragraph_gets_the_link_as_its_own_last_parag
     _, body = bm.render_email("ninety_min", first_name="Jane", slot_start_utc=SLOT, number="+18135550100",
                               reschedule_url=URL)
     assert body.endswith(f"ET.\n\nTo reschedule: {URL}")
+
+
+@pytest.mark.parametrize("raw, expected", [(None, None), ("", None), ("   ", None),
+                                           (" https://nextdeallending.com/r ", "https://nextdeallending.com/r")])
+def test_reschedule_url_setting_blank_means_unset_and_value_is_stripped(raw, expected):
+    from config.settings import AppSettings as Settings
+    assert Settings._https_reschedule_url(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["http://nextdeallending.com/r", "nextdeallending.com/r", "https://a b"])
+def test_reschedule_url_setting_rejects_non_https_or_spaced_values(raw):
+    from config.settings import AppSettings as Settings
+    with pytest.raises(ValueError):
+        Settings._https_reschedule_url(raw)
