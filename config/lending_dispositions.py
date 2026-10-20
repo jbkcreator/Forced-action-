@@ -154,12 +154,15 @@ TEXT_CONSENT_YES = "yes"
 # extraction. Off unless LENDING_TRANSCRIPT_INGEST_ENABLED (every extraction is a Claude call).
 TRANSCRIPT_DONE = "done"        # transcript fetched and extracted
 TRANSCRIPT_MISSING = "missing"  # none arrived within TRANSCRIPT_MAX_WAIT_SECONDS of the call end
-TRANSCRIPT_FAILED = "failed"    # transcript fetched but extraction failed: never retried (each try is a Claude call)
-TRANSCRIPT_STATUSES = (TRANSCRIPT_DONE, TRANSCRIPT_MISSING, TRANSCRIPT_FAILED)  # NULL = still pending; DB CHECK
+TRANSCRIPT_FAILED = "failed"    # invalid extraction output, or out of retries: never retried (each try is a Claude call)
+TRANSCRIPT_DEFERRED = "deferred"  # transcript fetched, extraction waiting: AI paused or a temporary API error
+TRANSCRIPT_STATUSES = (TRANSCRIPT_DONE, TRANSCRIPT_MISSING, TRANSCRIPT_FAILED, TRANSCRIPT_DEFERRED)  # NULL = still pending; DB CHECK
 # Per-tick counter keys for calls left pending (not stored).
 TRANSCRIPT_NOT_READY = "not_ready"
 TRANSCRIPT_FETCH_FAILED = "fetch_failed"
 TRANSCRIPT_RATE_LIMITED = "rate_limited"
+TRANSCRIPT_PAUSED = "paused"            # extraction deferred: vendor cost pause active
+TRANSCRIPT_EXTRACT_RETRY = "extract_retry"  # extraction deferred: temporary API error
 # The one definition of "pending": the poller's queries and the migration's partial index
 # both use it, so the index always matches the query.
 TRANSCRIPT_PENDING_PREDICATE = "transcript_status IS NULL AND talk_duration_sec > 0"
@@ -168,3 +171,4 @@ TRANSCRIPT_MAX_WAIT_SECONDS = 30 * 60
 TRANSCRIPT_POLL_SECONDS = 5    # transcript worker cycle (own process, never the CDR poller tick)
 TRANSCRIPT_WORKER_LOCK_KEY = 7_302_020_804  # one transcript worker at a time
 TRANSCRIPT_RETRY_SECONDS = 30   # a not-ready call waits this long before its next fetch
+TRANSCRIPT_MAX_EXTRACT_ATTEMPTS = 3  # temporary API errors per call before it is marked failed (pauses do not count)

@@ -1,7 +1,9 @@
 """T-12 audio fallback: transcript columns on ``lending.call_dispositions``.
 
 ``transcript_status``: NULL = pending, ``done`` = fetched and extracted, ``missing`` = none within
-30 minutes of the call end, ``failed`` = extraction failed (never retried). A CHECK constraint
+30 minutes of the call end, ``failed`` = invalid extraction output or out of retries (never retried),
+``deferred`` = transcript fetched but extraction waiting (AI spending paused, or a temporary API error;
+``transcript_attempts`` counts the API errors). A CHECK constraint
 pins the values to ``TRANSCRIPT_STATUSES``. ``transcript_attempted_at``: last not-ready or failed
 fetch, so a waiting call yields to never-tried ones. The partial index is built from
 ``TRANSCRIPT_PENDING_PREDICATE``, the same predicate the poller's queries use, so the two always
@@ -54,6 +56,7 @@ def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
     for ddl in (
         f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS transcript_status varchar(20)",
         f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS transcript_attempted_at timestamptz",
+        f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS transcript_attempts smallint NOT NULL DEFAULT 0",
         f"DROP INDEX IF EXISTS \"{schema}\".{_INDEX}",  # recreated so its columns always match the query
         index_ddl(schema),
         _check_ddl(schema),

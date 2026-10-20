@@ -29,16 +29,28 @@ class FakeDialer:
 
 
 class FakeStore:
-    def __init__(self, fail_extract=False):
-        self.done, self.failed, self.attempted, self.fail_extract = [], [], [], fail_extract
+    def __init__(self, fail_extract=False, error=None, paused=False, pause_after=None):
+        self.done, self.failed, self.attempted, self.deferred = [], [], [], []
+        self.error = error or (RuntimeError("invalid output") if fail_extract else None)
+        self.paused, self.pause_after, self.extract_calls = paused, pause_after, 0
+
+    def extraction_paused(self):
+        return self.paused
 
     def extract_and_mark_done(self, call, transcript, *, now):
-        if self.fail_extract:
-            raise RuntimeError("claude down")
+        self.extract_calls += 1
+        if self.pause_after is not None and self.extract_calls > self.pause_after:
+            self.paused = True
+            raise RuntimeError("call extraction returned no structured output")
+        if self.error is not None:
+            raise self.error
         self.done.append((call.dialer_call_id, transcript, now))
 
     def mark_failed(self, dialer_call_id):
         self.failed.append(dialer_call_id)
+
+    def mark_deferred(self, dialer_call_id, *, now, count_attempt):
+        self.deferred.append((dialer_call_id, count_attempt))
 
     def mark_attempted(self, dialer_call_ids, *, now):
         self.attempted.extend(dialer_call_ids)
@@ -69,8 +81,8 @@ def test_fetch_error_is_stamped_attempted_and_does_not_stop_the_batch():
     assert counts == {cfg.TRANSCRIPT_FETCH_FAILED: 1, cfg.TRANSCRIPT_DONE: 1}
 
 
-def test_extraction_error_is_terminal_failed_never_rebilled():
-    """A Claude failure marks the call failed once; it is not retried every 5 s for 30 minutes."""
+def test_invalid_extraction_output_is_terminal_failed_never_rebilled():
+    """Invalid output (not a pause, not an API outage) marks the call failed once; never re-billed."""
     store = FakeStore(fail_extract=True)
     counts = _run([_call()], FakeDialer({"c1": "agent: hi"}), store)
     assert store.failed == ["c1"] and store.attempted == []
@@ -119,29 +131,103 @@ class FakeSession:
         self.events.append("commit")
 
 
-def test_db_store_commits_each_extraction_inside_a_savepoint():
-    """Billing safety: a later DB error can never roll back an extraction already paid for."""
+def _api_error(kind):
+    import anthropic
+    import httpx
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    if kind == "connection":
+        return anthropic.APIConnectionError(request=request)
+    response = httpx.Response(529 if kind == "overloaded" else 500, request=request)
+    return anthropic.APIStatusError("server error", response=response, body=None)
+
+
+@pytest.mark.parametrize("kind", ["connection", "server", "overloaded"])
+def test_temporary_api_error_defers_the_call_and_counts_an_attempt(kind):
+    store = FakeStore(error=_api_error(kind))
+    counts = _run([_call()], FakeDialer({"c1": "agent: hi"}), store)
+    assert store.deferred == [("c1", True)] and store.failed == []
+    assert counts == {cfg.TRANSCRIPT_EXTRACT_RETRY: 1}
+
+
+def test_outage_then_recovery_extracts_the_deferred_call():
+    dialer = FakeDialer({"c1": "agent: hi"})
+    outage = FakeStore(error=_api_error("connection"))
+    _run([_call()], dialer, outage)
+    assert outage.deferred == [("c1", True)]
+    recovered = FakeStore()
+    assert _run([_call()], dialer, recovered) == {cfg.TRANSCRIPT_DONE: 1}
+    assert [d[0] for d in recovered.done] == ["c1"]
+
+
+def test_pause_defers_without_a_claude_call_then_resumes():
+    dialer = FakeDialer({"c1": "agent: hi", "c2": "agent: yo"})
+    paused = FakeStore(paused=True)
+    counts = _run([_call("c1"), _call("c2")], dialer, paused)
+    assert paused.extract_calls == 0 and paused.failed == []
+    assert paused.deferred == [("c1", False), ("c2", False)]  # pauses never use up retries
+    assert counts == {cfg.TRANSCRIPT_PAUSED: 2}
+    resumed = FakeStore()
+    assert _run([_call("c1"), _call("c2")], dialer, resumed) == {cfg.TRANSCRIPT_DONE: 2}
+
+
+def test_a_pause_that_starts_mid_batch_defers_the_rest_instead_of_failing_them():
+    store = FakeStore(pause_after=1)
+    dialer = FakeDialer({"c1": "a", "c2": "b", "c3": "c"})
+    counts = _run([_call("c1"), _call("c2"), _call("c3")], dialer, store)
+    assert [d[0] for d in store.done] == ["c1"] and store.failed == []
+    assert store.deferred == [("c2", False), ("c3", False)] and store.extract_calls == 2
+    assert counts == {cfg.TRANSCRIPT_DONE: 1, cfg.TRANSCRIPT_PAUSED: 2}
+
+
+def _store(db, extract=None, saved=None):
+    saved = saved if saved is not None else []
+    return DbCallStore(db, extract=extract or (lambda transcript, *, today, db: {"fields": transcript}),
+                       save=lambda db_, **kw: saved.append(kw))
+
+
+def test_db_store_saves_inside_a_savepoint_after_the_claude_call():
+    """Billing safety: the Claude call is outside the savepoint; save + status inside; one commit."""
     db = FakeSession()
-    calls = []
-    store = DbCallStore(db, extract=lambda db_, **kw: calls.append(kw["phone"]))
-    store.extract_and_mark_done(_call(), "agent: hi", now=NOW)
+    saved = []
+    _store(db, saved=saved).extract_and_mark_done(_call(), "agent: hi", now=NOW)
     assert db.events[0] == "savepoint" and db.events[-1] == "commit"
     assert ("sql", "UPDATE", cfg.TRANSCRIPT_DONE) in db.events
-    assert calls == ["+18135550101"]
+    assert saved[0]["phone"] == "+18135550101" and saved[0]["extraction"] == {"fields": "agent: hi"}
 
 
-def test_db_store_extraction_failure_rolls_back_only_its_savepoint():
+def test_billed_answer_that_fails_validation_keeps_its_usage_record():
+    """The router flushes the usage row before validation; the rejection must not roll it back."""
     db = FakeSession()
 
-    def boom(db_, **kw):
-        raise RuntimeError("claude down")
-    store = DbCallStore(db, extract=boom)
-    with pytest.raises(RuntimeError):
+    def billed_then_invalid(transcript, *, today, db):
+        db.events.append("usage_logged")
+        raise ValueError("output failed validation")
+
+    store = _store(db, extract=billed_then_invalid)
+    with pytest.raises(ValueError):
         store.extract_and_mark_done(_call(), "agent: hi", now=NOW)
-    assert "rollback_savepoint" in db.events and "commit" not in db.events
+    assert "savepoint" not in db.events and "rollback_savepoint" not in db.events
+    store.mark_failed("c1")
+    assert db.events[0] == "usage_logged" and db.events[-1] == "commit"
+    assert ("sql", "UPDATE", cfg.TRANSCRIPT_FAILED) in db.events
 
 
-def test_pending_query_order_retry_wait_and_expiry(lending_db):
+@pytest.fixture
+def transcript_db(lending_db):
+    """The shared DB, only once the transcript migration is applied: no DDL inside the test
+    transaction (an ALTER would lock the live call_dispositions table until rollback)."""
+    from sqlalchemy import text
+    have = lending_db.execute(text(
+        "SELECT count(*) FROM information_schema.columns WHERE table_schema = 'lending' "
+        "AND table_name = 'call_dispositions' AND column_name IN ('transcript_status', 'transcript_attempts')"
+    )).scalar()
+    if have < 2:
+        pytest.skip("apply migrations/apply_lending_call_transcript_status.py first")
+    return lending_db
+
+
+def test_pending_query_order_retry_wait_and_expiry(transcript_db):
+    lending_db = transcript_db
     from sqlalchemy import text
     from src.lending.transcript_ingest import expire_stale, fetch_pending
 
@@ -164,3 +250,31 @@ def test_pending_query_order_retry_wait_and_expiry(lending_db):
     pending = [c for c in fetch_pending(lending_db, now=NOW, limit=50) if c.dialer_call_id.startswith("t12-")]
     assert [c.dialer_call_id for c in pending] == ["t12-fresh", "t12-tried-long-ago"]
     assert pending[0].phone == "+18135550101"
+
+
+def test_deferred_calls_outlive_the_wait_window_and_stop_after_the_attempt_cap(transcript_db):
+    lending_db = transcript_db
+    from sqlalchemy import text
+    from src.lending.transcript_ingest import expire_stale, fetch_pending
+
+    lending_db.execute(text(
+        "INSERT INTO lending.call_dispositions (dialer_call_id, phone, talk_duration_sec, call_ended_at, "
+        "transcript_status, transcript_attempted_at, raw_event) "
+        "VALUES ('t12-deferred', '8135550101', 60, :ended, :deferred, :attempted, '{}'::jsonb)"),
+        {"ended": NOW - timedelta(hours=5), "deferred": cfg.TRANSCRIPT_DEFERRED,
+         "attempted": NOW - timedelta(minutes=10)})
+    expire_stale(lending_db, now=NOW)
+
+    def ids(**kw):
+        return [c.dialer_call_id for c in fetch_pending(lending_db, now=NOW, limit=50, **kw)
+                if c.dialer_call_id == "t12-deferred"]
+    assert ids() == ["t12-deferred"]                   # not expired, still picked up
+    assert ids(include_deferred=False) == []            # skipped while extraction is paused
+
+    store = DbCallStore(lending_db, extract=None, save=None)
+    for _ in range(cfg.TRANSCRIPT_MAX_EXTRACT_ATTEMPTS):
+        store.mark_deferred("t12-deferred", now=NOW, count_attempt=True)
+    status, attempts = lending_db.execute(text(
+        "SELECT transcript_status, transcript_attempts FROM lending.call_dispositions "
+        "WHERE dialer_call_id = 't12-deferred'")).one()
+    assert (status, attempts) == (cfg.TRANSCRIPT_FAILED, cfg.TRANSCRIPT_MAX_EXTRACT_ATTEMPTS)
