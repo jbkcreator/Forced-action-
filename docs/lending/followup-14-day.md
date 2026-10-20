@@ -125,7 +125,51 @@ link]. Josh Kantor, Loan Officer.
       task or message.
 - [x] SMS skipped without `ndl-sms-enabled`; sent with it.
 
-## 6. Known gaps
+## 6. Borrower nurture track (Runbook § 4.2, Item 2)
+
+Leads that finish the 14 days without booking move to a low-frequency nurture track. Day 14 of the follow-up adds
+the tag `ndl-nurture`, which starts it. Decisions (2026-10-19): one message **every 14 days**; the loop runs **until
+the lead books or opts out** (no automatic end); a reply creates an urgent call task and the lead **stays** in
+nurture. **Status of the wording: DRAFT, Josh approves it before publishing.**
+
+### Workflows
+
+| Workflow | Status | Setting |
+|---|---|---|
+| **"NDL – Borrower Nurture"** | draft | Trigger: Contact Tag Added `ndl-nurture`; re-entry off. DND? → Wait 14 days → DND? → email "Any deal under contract?" → SMS allowed? (`ndl-sms-enabled`): Yes → SMS → Go To "Wait 14 days"; No → Go To "Wait 14 days". Both DND? end branches have nothing after them. |
+| **"NDL – Nurture reply → urgent call"** | draft | Trigger: Customer Replied (all channels), filter tag `ndl-nurture`; re-entry on. Wait 1 minute (so a STOP reply has set DND) → DND? (enabled → End) → task "URGENT: nurture lead replied – call back now", due immediately, assigned to Hari K only (Josh once he is a user). |
+| **"NDL – Booked, stop follow-up"** | published | Also removes the contact from "NDL – Borrower Nurture" on a booking. |
+
+The pipeline-stage workflow **"NDL - Nurture"** (trigger: "Booked Calls" stage Nurture; webhook to
+`/webhooks/lending/ghl-nurture`) belongs to the booking-gate feature (`docs/lending/ghl-conversation-ai.md`) and is
+**not** part of this track. It was left unchanged.
+
+**Email (draft), subject "Any deal under contract?":** Hi {{contact.first_name}}, checking in. Do you have a property
+under contract, or one you're looking at? Send me the details and I'll run a free deal analysis so you know where it
+stands before you commit. Reply here or pick a time that suits you: [booking link]. Josh Kantor, Loan Officer
+
+**SMS (draft, behind `ndl-sms-enabled` until 10DLC clears):** Hi {{contact.first_name}}, Josh Kantor here. Got a
+property under contract or in your sights? I'll run a free deal analysis for you. Reply here or book a call:
+[booking link] Reply STOP to opt out.
+
+### Tests (2026-10-20, test contact, 1-minute copy "NDL – Nurture TEST (delete after)")
+
+- [x] **Loop:** email + SMS at 05:59 UTC and again at 06:06 UTC; the execution log shows SMS → Go To → Wait. GHL ran
+      the second 1-minute wait about 7 minutes late on the test run; immaterial for a 14-day wait.
+- [x] **Reply → urgent task:** an email reply to the nurture email reached GHL as an inbound email (06:12:17 UTC)
+      and created "URGENT: nurture lead replied – call back now" for Hari K, due 06:13 UTC.
+- [x] **Opt-out:** DND set with our real `set_ghl_dnd()`; a second email reply reached GHL (06:21:18 UTC) and the run
+      ended at the DND check, no task.
+- [x] **Booking exit:** a booking on Josh's Calendar (06:33:58 UTC) removed the contact from the test copy; no
+      nurture email or SMS afterwards.
+- SMS replies were not tested: the test phone is not a US number. Email replies use the same trigger.
+- [ ] Screenshots: both workflows, "NDL – Booked, stop follow-up", the two-round conversation, the urgent task, the
+      DND-ended run, the booking removal.
+
+### Not built
+- **Deal Drop injection** (3–5 matching off-market deals in the nurture messages): Deal Drop is not live yet.
+
+## 7. Known gaps
 
 - **Day 0 "if unanswered":** the Runbook sends the Day 0 callback, text and email only if the first call is not
   answered. GHL cannot see whether Josh's call connected, so they go out every time. A fix (a "call answered" workflow
