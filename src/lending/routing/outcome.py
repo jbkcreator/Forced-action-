@@ -9,7 +9,8 @@ Idempotent: the same action for the same lender on the same file is recorded onc
 
 A Slack click passes the ``routed`` event its card shows (``routed_event_id``); it is checked again after the
 routing row is locked, so a decline that re-routed the file in between can never move the outcome to the next
-lender (``StaleRoute``).
+lender (``StaleRoute``). Funding is terminal: once a file has a ``funded`` event, an approval is refused
+(``AlreadyFunded``) and another funding is a no-op, both decided under the same lock.
 
 The partner-file status update runs after the commit and can fail; the committed outcome event is the record of
 what the file must show, and ``partner_link.resync_outcomes`` (partner sweep) applies it until it sticks.
@@ -34,6 +35,10 @@ _ROUTE_ENDING_ACTIONS = ("routed", "declined", "held")
 
 class StaleRoute(ValueError):
     """The clicked routing event is no longer the file's current route; nothing was recorded."""
+
+
+class AlreadyFunded(ValueError):
+    """The file is already funded; an approval would move it backwards. Nothing was recorded."""
 
 
 def _still_current(db: Session, key: FileKey, routed_event_id: int, current_lender_id: int) -> bool:
@@ -68,7 +73,7 @@ def record_outcome(
     Returns True when an event was written, False when it was already recorded.
     Raises ValueError for an unknown action, a file with no routing row, or a file that is
     not currently routed to a lender; ``StaleRoute`` when ``routed_event_id`` is given and is no longer the
-    file's current route.
+    file's current route; ``AlreadyFunded`` for an approval of a funded file.
     """
     if action not in OUTCOME_ACTIONS:
         raise ValueError(f"action must be one of {OUTCOME_ACTIONS}, got {action!r}")
@@ -87,6 +92,16 @@ def record_outcome(
         raise ValueError(f"the file is {routing['status']!r}, not routed to a lender; cannot record {action}")
     if routed_event_id is not None and not _still_current(db, key, routed_event_id, routing["current_lender_id"]):
         raise StaleRoute("the clicked lender is no longer the file's current route; nothing recorded")
+
+    funded = db.execute(
+        text(f"SELECT 1 FROM lending.file_routing_events WHERE {key.column} = :id AND action = 'funded' LIMIT 1"),
+        {"id": key.id},
+    ).scalar()
+    if funded:  # terminal, checked under the routing lock: a queued Approved click cannot undo it
+        if action != "funded":
+            raise AlreadyFunded(f"the file is already funded; {action} not recorded")
+        logger.info("record_outcome %s=%d action=funded already funded - no-op", key.column, key.id)
+        return False
 
     already = db.execute(
         text(

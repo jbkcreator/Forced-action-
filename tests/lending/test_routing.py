@@ -2388,6 +2388,27 @@ def test_an_outcome_click_raced_by_a_reroute_tells_the_user_and_records_nothing(
     assert "funded" not in [e["action"] for e in _events(rdb, lead)]
 
 
+def _repair_wiring(rdb, sent: list):
+    """The outcome repair's session and partner services on the test session, emails appended to ``sent``."""
+    from contextlib import contextmanager
+
+    from src.lending import partner_pipeline
+
+    services = partner_pipeline.PipelineServices(
+        email=lambda to, subject, body: sent.append((to, subject, body)), sms=None, slack=None, render_pdf=None,
+        evaluate_fit=lambda *a, **k: None, fit_limits=lambda *a, **k: [], load_matrix=lambda: (),
+        opt_outs=lambda phone, email: partner_pipeline.OptOuts(False, False),
+        text_window_open=lambda phone: False, upload_dir="", prequal_pct=10,
+    )
+
+    @contextmanager
+    def session_factory():
+        yield rdb
+        rdb.commit()
+
+    return session_factory, services
+
+
 def test_a_failed_partner_status_update_after_funding_is_reapplied_without_a_second_funding(
         rdb, partner_mail, monkeypatch):
     from datetime import datetime, timedelta, timezone
@@ -2411,7 +2432,9 @@ def test_a_failed_partner_status_update_after_funding_is_reapplied_without_a_sec
     later = datetime.now(timezone.utc) + timedelta(minutes=1)
     lagging = partner_link.lagging_outcomes(rdb, older_than_minutes=0, limit=500, now=later)
     assert (fid, "funded") in lagging
-    partner_link.resync_outcomes([item for item in lagging if item[0] == fid])
+    session_factory, services = _repair_wiring(rdb, partner_mail)
+    assert partner_link.resync_outcomes([item for item in lagging if item[0] == fid],
+                                        session_factory=session_factory, services=services) == 1
 
     status, _, funded_at = _file_status(rdb, fid)
     assert status == "funded" and funded_at is not None
@@ -2436,4 +2459,60 @@ def test_a_later_decline_is_not_undone_by_the_outcome_repair(rdb, partner_mail):
                               " ORDER BY id DESC LIMIT 1"), {"f": fid}).scalar_one()
     record_decline(routed, reason_code="ltv_over_max", actor="josh", db=rdb)  # approved, then declined after all
     later = datetime.now(timezone.utc) + timedelta(minutes=1)
+    assert fid not in [f for f, _ in partner_link.lagging_outcomes(rdb, older_than_minutes=0, limit=500, now=later)]
+
+
+def test_funding_is_terminal_a_queued_approved_click_cannot_undo_it(rdb, partner_mail, buttons):
+    from src.lending.routing.outcome import AlreadyFunded, record_outcome
+    from src.lending.routing.router import route_loan_file
+    from src.lending.routing.slack_actions import ALREADY_FUNDED
+
+    _two_flip_lenders(rdb)
+    fid = _make_partner_file(rdb, _make_partner(rdb))
+    route_loan_file(fid, rdb)
+    card = rdb.execute(text("SELECT id FROM lending.file_routing_events WHERE loan_file_id = :f AND action = 'routed'"
+                            " ORDER BY id DESC LIMIT 1"), {"f": fid}).scalar_one()
+    assert record_outcome(fid, action="funded", actor="josh", db=rdb, kind="loan_file", routed_event_id=card) is True
+    assert _file_status(rdb, fid)[0] == "funded"
+
+    with pytest.raises(AlreadyFunded):
+        record_outcome(fid, action="approved", actor="josh", db=rdb, kind="loan_file", routed_event_id=card)
+    buttons.click("routing_approved", card)  # the same queued click through Slack
+    assert buttons.calls["told"][-1][1] == ALREADY_FUNDED and buttons.calls["updated"] == []
+
+    assert record_outcome(fid, action="funded", actor="josh", db=rdb, kind="loan_file") is False  # still a no-op
+    assert _pevents(rdb, fid) == ["routed", "funded"]
+    assert _file_status(rdb, fid)[0] == "funded"
+
+
+def test_the_repair_does_not_apply_an_outcome_a_decline_overtook_after_the_snapshot(rdb, partner_mail, monkeypatch):
+    """The sweep's snapshot says 'approved'; a decline and re-route land before the repair runs. The repair
+    re-checks under the routing lock and leaves the newer status alone."""
+    from datetime import datetime, timedelta, timezone
+
+    from src.lending.routing import partner_link
+    from src.lending.routing.decline import record_decline
+    from src.lending.routing.outcome import record_outcome
+    from src.lending.routing.router import route_loan_file
+
+    _two_flip_lenders(rdb)
+    fid = _make_partner_file(rdb, _make_partner(rdb))
+    route_loan_file(fid, rdb)
+    working_mirror = partner_link.mirror_status
+    monkeypatch.setattr(partner_link, "mirror_status", lambda *a, **k: None)  # the approval's sync fails
+    record_outcome(fid, action="approved", actor="josh", db=rdb, kind="loan_file")
+    monkeypatch.setattr(partner_link, "mirror_status", working_mirror)
+    later = datetime.now(timezone.utc) + timedelta(minutes=1)
+    snapshot = [item for item in partner_link.lagging_outcomes(rdb, older_than_minutes=0, limit=500, now=later)
+                if item[0] == fid]
+    assert snapshot == [(fid, "approved")]
+
+    routed = rdb.execute(text("SELECT id FROM lending.file_routing_events WHERE loan_file_id = :f AND action = 'routed'"
+                              " ORDER BY id DESC LIMIT 1"), {"f": fid}).scalar_one()
+    record_decline(routed, reason_code="ltv_over_max", actor="josh", db=rdb)  # declined and re-routed to Beta
+    assert _file_status(rdb, fid)[0] == "routed"
+
+    session_factory, services = _repair_wiring(rdb, partner_mail)
+    assert partner_link.resync_outcomes(snapshot, session_factory=session_factory, services=services) == 0
+    assert _file_status(rdb, fid)[0] == "routed"  # not pulled back to "approved"
     assert fid not in [f for f, _ in partner_link.lagging_outcomes(rdb, older_than_minutes=0, limit=500, now=later)]

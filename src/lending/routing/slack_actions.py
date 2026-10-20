@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 DECLINE_CALLBACK_ID = "routing_decline_form"
 _OUTCOME_BUTTONS = {ACTION_APPROVED: "approved", ACTION_FUNDED: "funded"}
 NOT_CURRENT = "That post is no longer the file's current route (it was declined, re-routed or already actioned)."
+ALREADY_FUNDED = "This file is already funded, so it cannot go back to approved. Nothing was changed."
 
 Scheduler = Callable[..., None]  # run_later(fn, *args): do the slow part after Slack has been answered
 
@@ -203,7 +204,7 @@ def handle_action(payload: dict, client: Any) -> None:
                 view = _decline_view(event_id, current["lender"], channel, ts, original, db)
                 client.views_open(trigger_id=payload.get("trigger_id", ""), view=view)
                 return
-            from src.lending.routing.outcome import StaleRoute, record_outcome
+            from src.lending.routing.outcome import AlreadyFunded, StaleRoute, record_outcome
 
             outcome = _OUTCOME_BUTTONS[action["action_id"]]
             key = current["key"]
@@ -212,6 +213,9 @@ def handle_action(payload: dict, client: Any) -> None:
                                          routed_event_id=event_id)
             except StaleRoute:  # re-routed between the check above and the locked write
                 _tell(client, channel, user, NOT_CURRENT)
+                return
+            except AlreadyFunded:  # a queued Approved click arriving after Funded
+                _tell(client, channel, user, ALREADY_FUNDED)
                 return
     except Exception as exc:  # class only: SQL errors can embed bound values
         logger.error("[routing-slack] a routed-post button failed: %s", type(exc).__name__)
