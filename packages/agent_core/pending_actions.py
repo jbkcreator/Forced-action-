@@ -303,6 +303,11 @@ class PendingActionQueue:
         return self._transition(action_id, (ActionStatus.APPROVED,), "status = :status",
                                 {"status": ActionStatus.SENDING.value})
 
+    def release_claim(self, action_id: int) -> bool:
+        """Put a claimed action back to approved, unsent, so a later sweep tries again (a deferred send)."""
+        return self._transition(action_id, (ActionStatus.SENDING,), "status = :status",
+                                {"status": ActionStatus.APPROVED.value})
+
     def mark_sent(self, action_id: int, provider_ref: str | None) -> bool:
         return self._transition(action_id, (ActionStatus.SENDING,),
                                 "status = :status, provider_ref = :provider_ref, executed_at = :now",

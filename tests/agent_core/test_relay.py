@@ -109,3 +109,29 @@ def test_run_sweeps_every_approved_action(queue: PendingActionQueue, relay: Rela
     result = relay.run()
     assert set(result.sent) == {first, second}
     assert [payload["body"] for payload in executor.sent] == ["one", "two"]
+
+
+def test_deferred_send_stays_approved_and_sends_once_allowed(queue: PendingActionQueue, halt: HaltSwitch,
+                                                             executor: RecordingExecutor) -> None:
+    from packages.agent_core.relay import SendDeferred
+    allowed = {"now": False}
+    relay = Relay(queue, halt, {"ghl_sms": executor},
+                  send_check=lambda action: None if allowed["now"] else SendDeferred("outside the text window"))
+    action_id = _approved(queue)
+    result = relay.run()
+    assert result.deferred == (action_id,) and result.blocked == ()
+    assert queue.get(action_id).status is ActionStatus.APPROVED and executor.sent == []
+    allowed["now"] = True
+    assert relay.run().sent == (action_id,)
+
+
+def test_deferred_send_is_blocked_once_the_draft_expires(queue: PendingActionQueue, halt: HaltSwitch, clock,
+                                                         executor: RecordingExecutor) -> None:
+    from datetime import timedelta
+    from packages.agent_core.relay import SendDeferred
+    relay = Relay(queue, halt, {"ghl_sms": executor}, send_check=lambda action: SendDeferred("outside the text window"))
+    action_id = _approved(queue)
+    clock.advance(timedelta(days=30))
+    assert relay.dispatch(action_id).outcome is DispatchOutcome.BLOCKED
+    action = queue.get(action_id)
+    assert action.status is ActionStatus.BLOCKED and "expired" in action.error and executor.sent == []

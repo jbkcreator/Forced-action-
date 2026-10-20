@@ -1,7 +1,7 @@
-"""T-06: ``pinned_at`` / ``pinned_until`` on ``lending.contacts``, the after-hours voicemail pin.
+"""``pinned_at`` / ``pinned_until`` on ``lending.contacts``, the after-hours voicemail pin.
 
-A pinned contact is called first the next morning; the pin ends at the first outbound attempt or at
-``pinned_until``. Partial index on the pinned rows only. Idempotent; run after apply_lending_compliance.py.
+A pinned contact is called first the next business morning; the pin ends at the first outbound attempt or
+at ``pinned_until``. Partial index on the pinned rows only. Idempotent; run after apply_lending_compliance.py.
 
 Usage:
     PYTHONPATH=. python migrations/apply_lending_contact_pins.py

@@ -9,7 +9,7 @@ The event handling lives in ``src.lending.ghl_consent_events``. A call that fail
 alerted by ``src.lending.webhook_failures`` and replayed until it succeeds, so an opt-out is never lost.
 
 Endpoints: POST /webhooks/lending/ghl-opt-out, POST /webhooks/lending/ghl-text-consent, POST /webhooks/lending/ghl-stage (scoreboard "showed"),
-POST /webhooks/lending/after-hours-intake (T-06 after-hours voicemail / answering service; see src.lending.after_hours_intake)
+POST /webhooks/lending/after-hours-intake (after-hours voicemail / answering service; see src.lending.after_hours_intake)
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from config.settings import get_settings
 from src.api.deps import get_db
 from src.lending.after_hours_intake import record_intake
 from src.lending.ghl_consent_events import InvalidEvent, field as _field, record_ghl_opt_out, record_inbound_consent
-from src.lending.webhook_failures import GHL_OPT_OUT, GHL_TEXT_CONSENT, report_webhook_failure
+from src.lending.webhook_failures import AFTER_HOURS_INTAKE, GHL_OPT_OUT, GHL_TEXT_CONSENT, report_webhook_failure
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
@@ -126,9 +126,9 @@ def after_hours_intake(
     """A caller's after-hours voicemail (GHL workflow) or answering-service message: logs the call and pins the
     contact for the next morning (src.lending.after_hours_intake). Body: phone, first_name/name,
     message/transcription, received_at, source, call_id."""
+    _verify_secret(x_webhook_secret)
     if not get_settings().lending_after_hours_intake_enabled:
         raise HTTPException(status_code=503, detail="After-hours intake is not enabled")
-    _verify_secret(x_webhook_secret)
     try:
         recorded = record_intake(db, body)
         db.commit()
@@ -138,5 +138,6 @@ def after_hours_intake(
     except Exception as exc:
         db.rollback()
         logger.error("[lending-ghl] after-hours intake failed: %s", type(exc).__name__)
+        report_webhook_failure(AFTER_HOURS_INTAKE, body, exc)
         raise HTTPException(status_code=500, detail="Intake could not be recorded") from exc
     return {"recorded": recorded}

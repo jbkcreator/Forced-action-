@@ -1225,9 +1225,9 @@ COUNTY_ID=hillsborough
 0 13 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_confirmation_tasks
 0 14 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_confirmation_tasks
 
-# Lending 08:55 ET after-hours voicemail callers (split T-06, lending.contacts pins): queues their reply drafts for Approve and posts "call these first" to Cora's channel. Two lines for EDT/EST; the task posts only when it is 8:xx ET.
-55 12 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_pinned_callbacks
-55 13 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_pinned_callbacks
+# Lending 08:55 ET business days: after-hours voicemail callers (lending.contacts pins) get reply drafts for Approve and a "call these first" post in Cora's channel. Two lines for EDT/EST; the task acts only at 8:xx ET.
+55 12 * * 1-5 $PROJECT/scripts/cron/run.sh src.tasks.lending_pinned_callbacks
+55 13 * * 1-5 $PROJECT/scripts/cron/run.sh src.tasks.lending_pinned_callbacks
 
 # Lending: alert in #lending-replies when a rate/terms or reschedule handoff is still unanswered after one business hour (Josh's hours Mon-Fri 9:00-7:15 ET, WP-GL-10).
 */10 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_reply_sla

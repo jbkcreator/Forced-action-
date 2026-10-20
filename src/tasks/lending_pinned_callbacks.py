@@ -1,10 +1,13 @@
-"""08:55 ET: draft the after-hours voicemail replies and post who to call first (split T-06, Runbook §5.3 Layer 2).
+"""08:55 ET on business days: draft the after-hours voicemail replies and post who to call first.
 
-A caller who left an after-hours voicemail is pinned (``src.lending.after_hours_intake``). Once a morning, before the
-09:00 shift, this takes every contact still pinned (not called back yet, within its 24-hour pin), queues a reply
-draft for Approve for each one with text consent (Cora's sweep posts the card within a minute), and posts the list
-to Cora's channel (``LENDING_CORA_CHANNEL``, Cora's bot token). A caller without text consent is listed as call-only.
-Cron fires at 12:55 and 13:55 UTC; only the one that is 8:xx ET acts. A rerun queues no second draft.
+A caller who left an after-hours voicemail is pinned (``src.lending.after_hours_intake``). Once a business-day
+morning, before the 09:00 shift, this takes every contact still pinned (not called back yet, within its pin), queues
+a reply draft for Approve for each one with text consent (Cora's sweep posts the card within a minute), and posts the
+list to Cora's channel (``LENDING_CORA_CHANNEL``, Cora's bot token). A caller without text consent is listed as
+call-only. Cron fires at 12:55 and 13:55 UTC Monday-Friday; only the one that is 8:xx ET acts.
+
+Drafts are idempotent per voicemail, so a rerun never drafts twice. The Slack post is not: ``--force`` reposts the
+list (use it by hand when the morning post failed; the drafts are already queued).
 
 Shows the last four digits of the phone only, never the full number.
 """
@@ -15,7 +18,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Sequence
 
-from config.lending_after_hours import MORNING_POST_HOUR_ET
+from config.lending_after_hours import BUSINESS_DAYS, MORNING_POST_HOUR_ET
 from config.lending_reminders import TIMEZONE
 from config.settings import AppSettings, get_settings
 from packages.agent_core.pending_actions import PendingActionQueue
@@ -42,6 +45,12 @@ def format_slack(replies: Sequence[MorningReply]) -> Optional[str]:
     return f"*Call these first ({len(replies)}): after-hours voicemails*\n" + "\n".join(map(_line, replies))
 
 
+def is_post_time(now: datetime) -> bool:
+    """8:xx ET on a business day (the cron's two UTC lines cover EDT and EST)."""
+    local = now.astimezone(TIMEZONE)
+    return local.hour == MORNING_POST_HOUR_ET and local.weekday() in BUSINESS_DAYS
+
+
 def _drafter(settings: AppSettings):
     import anthropic  # loaded only when there is something to draft
 
@@ -51,10 +60,10 @@ def _drafter(settings: AppSettings):
 
 def main(argv=None, *, now: Optional[datetime] = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--force", action="store_true", help="run regardless of the ET hour")
+    parser.add_argument("--force", action="store_true", help="run now (manual repost); drafts are never duplicated")
     args = parser.parse_args(argv)
     now = now or datetime.now(timezone.utc)
-    if now.astimezone(TIMEZONE).hour != MORNING_POST_HOUR_ET and not args.force:
+    if not (args.force or is_post_time(now)):
         return 0
     settings = get_settings()
     channel, token = settings.lending_cora_channel, settings.lending_cora_slack_bot_token
@@ -73,7 +82,8 @@ def main(argv=None, *, now: Optional[datetime] = None) -> int:
         from slack_sdk import WebClient
         WebClient(token=token.get_secret_value()).chat_postMessage(channel=channel, text=message)
     except Exception as exc:  # class only: rows carry phone digits
-        logger.error("[pinned-callbacks] run failed (%s)", type(exc).__name__)
+        logger.error("[pinned-callbacks] run failed (%s); drafts already queued are kept, repost with --force",
+                     type(exc).__name__)
         return 1
     logger.info("[pinned-callbacks] posted %s pinned caller(s)", len(pins))
     return 0
