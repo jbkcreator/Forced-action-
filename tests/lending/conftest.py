@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from migrations.apply_lending_call_dispositions_dialer import apply_to
 from migrations.apply_lending_ghl_stage_events import apply_to as apply_to_stage_events
 from migrations.apply_lending_pr319_client_feedback import apply_to as apply_to_feedback
+from migrations.apply_lending_followup_call_tracking import apply_to as apply_to_followup
 from src.lending.models import LENDING_SCHEMA, LendingCallDisposition
 
 
@@ -27,18 +28,23 @@ def lending_db():
     url = get_settings().database_url
     if not url:
         pytest.skip("requires a live Postgres DATABASE_URL")
-    engine = create_engine(str(url), connect_args={"connect_timeout": 5})
+    engine = create_engine(str(url), connect_args={"connect_timeout": 20})  # the shared database can be slow to reach (SSH tunnel)
     try:
         conn = engine.connect()
     except Exception:
         engine.dispose()
         pytest.skip("Postgres is not reachable")
     tx = conn.begin()
+    # The database is live and apply_to() locks call_dispositions: a test that cannot get a lock fails fast instead
+    # of queueing live jobs behind it, and a session left open by a killed run rolls back and closes after a minute.
+    conn.execute(text("SET LOCAL lock_timeout = '5s'"))
+    conn.execute(text("SET LOCAL idle_in_transaction_session_timeout = '60s'"))
     conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{LENDING_SCHEMA}"'))
     LendingCallDisposition.__table__.create(bind=conn, checkfirst=True)
     apply_to(conn)  # DDL is transactional: the vendor-neutral migration is rolled back with the test
     apply_to_feedback(conn)
     apply_to_stage_events(conn)
+    apply_to_followup(conn)  # call_source column (checked first, so no lock on the live table)
     session = Session(bind=conn, join_transaction_mode="create_savepoint")
     yield session
     session.close()
@@ -135,7 +141,7 @@ def prequal_db():
     url = get_settings().database_url
     if not url:
         pytest.skip("requires a live Postgres DATABASE_URL")
-    engine = create_engine(str(url), connect_args={"connect_timeout": 5})
+    engine = create_engine(str(url), connect_args={"connect_timeout": 20})  # the shared database can be slow to reach (SSH tunnel)
     try:
         conn = engine.connect()
     except Exception:

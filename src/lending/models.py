@@ -32,6 +32,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from config.lending_cohorts import REPLACEMENT_REQUESTED, REPLACEMENT_STATUSES
 from config.lending_text_back import SLOT_HOLDING_SQL
 
 LENDING_SCHEMA = "lending"
@@ -268,6 +269,10 @@ class LendingCallDisposition(LendingBase):
     recording_status: Mapped[Optional[str]] = mapped_column(String(12))  # pending | readable | forbidden | missing
     recording_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     dialer_campaign_id: Mapped[Optional[str]] = mapped_column(String(64))  # BatchDialer campaign (scoreboard)
+    # batchdialer (CDR poller) | ghl (calls made in GoHighLevel, imported for the 14-day follow-up). Dialer-only
+    # jobs (delivery, missing-disposition alert, soft approval cards) act on batchdialer rows only.
+    call_source: Mapped[str] = mapped_column(String(20), nullable=False, default="batchdialer",
+                                             server_default=text("'batchdialer'"))
 
     __table_args__ = (
         Index("idx_lending_call_dispositions_phone_ended", "phone", "call_ended_at"),
@@ -1053,6 +1058,45 @@ class LendingEmailOptOutMessage(LendingBase):
     __table_args__ = (
         CheckConstraint("outcome IN ('recorded', 'not_opt_out', 'failed', 'gave_up', 'unreadable')",
                         name="ck_lending_email_opt_out_messages_outcome"),
+    )
+
+
+class LendingFlowBatch(LendingBase):
+    """One LendingFlow lead purchase (Runbook § 4.6, Item 6). Delivered leads fill the batches in arrival order,
+    oldest batch first (src/lending/cohort_report.py); ``lead_count`` is the number of leads bought."""
+
+    __tablename__ = "lendingflow_batches"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
+    purchased_at: Mapped[date] = mapped_column(Date, nullable=False)
+    lead_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    note: Mapped[Optional[str]] = mapped_column(String(500))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint("lead_count > 0", name="ck_lending_lendingflow_batches_lead_count"),
+    )
+
+
+class LendingFlowReplacement(LendingBase):
+    """A replacement request for one LendingFlow lead (Runbook § 4.6): ``requested`` -> ``credited`` / ``denied``.
+    Only leads that meet the replacement rule (src/lending/replacement_eligibility.py) are recorded."""
+
+    __tablename__ = "lendingflow_replacements"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    lead_id: Mapped[int] = mapped_column(ForeignKey("lending.lendingflow_leads.id"), nullable=False, unique=True)
+    status: Mapped[str] = mapped_column(String(12), nullable=False, default=REPLACEMENT_REQUESTED,
+                                        server_default=text(f"'{REPLACEMENT_REQUESTED}'"))
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
+    decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    note: Mapped[Optional[str]] = mapped_column(String(500))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
+
+    __table_args__ = (
+        CheckConstraint(f"status IN ({', '.join(repr(s) for s in REPLACEMENT_STATUSES)})",
+                        name="ck_lending_lendingflow_replacements_status"),
     )
 
 

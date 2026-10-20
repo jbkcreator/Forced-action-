@@ -34,7 +34,6 @@ from config.lending_alarms import (
     ESCALATION_SECONDS,
     FIRST_ALARM_SECONDS,
     GHL_CONNECTED_STATUSES,
-    GHL_TIMEOUT_SECONDS,
     KIND_NO_CALL,
     KIND_NOT_REACHED,
     MAX_SEND_ATTEMPTS,
@@ -50,6 +49,7 @@ from config.lending_alarms import (
 from config.settings import get_settings
 from src.lending.cora_inbox import add_to_inbox_safely
 from src.lending.db import lending_session
+from src.lending.ghl_calls import call_messages_reader, call_state, message_time
 from src.lending.ghl_sms import GhlSmsError
 from src.services.phone_utils import normalize
 
@@ -112,54 +112,20 @@ def call_status(db, row: Mapping[str, Any], ghl_status: Optional[GhlCallStatus])
     return ATTEMPTED if ATTEMPTED in (cdr, ghl) else NONE
 
 
-def _message_time(message: Mapping[str, Any]) -> Optional[datetime]:
-    """``dateAdded`` as an aware datetime, or None when missing, unparseable or without a timezone."""
-    try:
-        added = datetime.fromisoformat(message.get("dateAdded") or "")
-    except ValueError:
-        return None
-    return added if added.tzinfo else None
-
-
-def _ghl_call_state(message: Mapping[str, Any]) -> Optional[str]:
-    return (message.get("meta") or {}).get("callStatus") or message.get("callStatus")
-
-
 def ghl_call_lookup(account, *, http: Optional[Callable[..., Any]] = None) -> GhlCallStatus:
-    """GHL source: classify the outbound call messages dated at/after ``since`` in the contact's conversations.
-
-    GET /conversations/search?contactId=… then GET /conversations/{id}/messages?type=TYPE_CALL (GHL API v2,
-    Version 2021-04-15; scopes conversations.readonly + conversations/message.readonly). Field names
-    (``conversations``, ``messages``, ``direction``, ``dateAdded``, ``meta.callStatus``) follow GHL's published
-    OpenAPI spec and are UNVERIFIED against a live response; an unexpected shape finds no call.
-    """
-    from src.lending.ghl_account import ghl_headers
-    from src.services.ghl_webhook import _GHL_BASE
-    from src.utils.http_helpers import requests_get_with_retry
-
-    get = http or (lambda url, **kw: requests_get_with_retry(url, max_retries=1, retry_delay=1,
-                                                             timeout=GHL_TIMEOUT_SECONDS, **kw))
-    headers = ghl_headers(account.api_key, "2021-04-15")
+    """GHL source: classify the outbound call messages dated at/after ``since`` in the contact's conversations
+    (read through ``src.lending.ghl_calls``)."""
+    read_calls = call_messages_reader(account, http=http)
 
     def status(contact_id: str, since: datetime) -> str:
-        found = get(f"{_GHL_BASE}/conversations/search", headers=headers,
-                    params={"locationId": account.location_id, "contactId": contact_id})
-        found.raise_for_status()
         attempted = False
-        for conversation in (found.json() or {}).get("conversations") or []:
-            page = get(f"{_GHL_BASE}/conversations/{conversation['id']}/messages", headers=headers,
-                       params={"type": "TYPE_CALL"})
-            page.raise_for_status()
-            messages = (page.json() or {}).get("messages") or []
-            if isinstance(messages, dict):  # the spec nests the list: {"messages": {"messages": [...]}}
-                messages = messages.get("messages") or []
-            for message in messages:
-                added = _message_time(message)
-                if message.get("direction") != "outbound" or added is None or added < since:
-                    continue
-                if _ghl_call_state(message) in GHL_CONNECTED_STATUSES:
-                    return CONNECTED
-                attempted = True
+        for message in read_calls(contact_id):
+            added = message_time(message)
+            if message.get("direction") != "outbound" or added is None or added < since:
+                continue
+            if call_state(message) in GHL_CONNECTED_STATUSES:
+                return CONNECTED
+            attempted = True
         return ATTEMPTED if attempted else NONE
 
     return status

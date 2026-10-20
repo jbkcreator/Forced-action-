@@ -29,7 +29,8 @@ def run(slack_client: Any = None, minutes: Optional[int] = None) -> int:
             text(
                 "UPDATE lending.call_dispositions SET disposition_missing_alerted_at = now() "
                 "WHERE id IN (SELECT id FROM lending.call_dispositions "
-                "  WHERE disposition IS NULL AND disposition_raw IS NULL AND disposition_missing_alerted_at IS NULL "
+                "  WHERE call_source = 'batchdialer' AND disposition IS NULL AND disposition_raw IS NULL "
+                "  AND disposition_missing_alerted_at IS NULL "
                 "  AND call_ended_at IS NOT NULL AND coalesce(talk_duration_sec, 0) > 0 "
                 "  AND call_ended_at < now() - make_interval(mins => :m) FOR UPDATE SKIP LOCKED) "
                 "RETURNING dialer_call_id, caller_seat, caller_name"

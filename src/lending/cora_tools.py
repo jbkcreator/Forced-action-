@@ -101,12 +101,17 @@ def draft_content_check(channel: str, fields: Mapping[str, str]) -> Optional[str
 
 
 LENDING_TABLES_HELP = (
-    "Tables (schema lending): call_dispositions (one row per dialer call: caller_name, phone, disposition, "
-    "direction, talk_duration_sec, call_started_at, call_ended_at, dialer_campaign_id, campaign_tag), "
+    "Tables (schema lending): call_dispositions (one row per call: caller_name, phone, disposition, "
+    "direction, talk_duration_sec, call_started_at, call_ended_at, dialer_campaign_id, campaign_tag, "
+    "call_source batchdialer or ghl; a LendingFlow lead qualifies for replacement with 5+ outbound attempts "
+    "on its phone over 5+ Eastern days since it arrived), "
     "web_leads (website form: received_at, name, phone, email, property_city, deal_type, completed_projects_3y, "
     "sms_consent, suppressed, ghl_status, ghl_contact_id), contacts (phone, email, do_not_contact, nurture), "
     "text_consents (phone, source, captured_at, revoked_at), suppression_list (phone, email, reason, created_at), "
-    "ghl_stage_events (ghl_opportunity_id, stage_name, phone, booked_by, event_at), booking_messages "
+    "ghl_stage_events (ghl_opportunity_id, stage_name, phone, booked_by, event_at), "
+    "lendingflow_batches (one LendingFlow purchase: name, purchased_at, lead_count; leads fill batches in arrival "
+    "order), lendingflow_replacements (lead_id, status requested/credited/denied, requested_at, decided_at), "
+    "booking_messages "
     "(booking_ref, kind, send_at, status, first_name, slot_start_utc, booked_by), confirmation_tasks "
     "(booking_ref, assignee, due_date, completed_at, cancelled_at), missed_call_events (phone, event_date_et, status), "
     "pending_actions, agent_memory."

@@ -32,7 +32,7 @@ def cards_missing_row_ids() -> list[int]:
         rows = db.execute(
             text(
                 "SELECT d.id FROM lending.call_dispositions d "
-                "WHERE d.call_ended_at IS NOT NULL "
+                "WHERE d.call_source = 'batchdialer' AND d.call_ended_at IS NOT NULL "
                 "AND d.call_ended_at > now() - make_interval(hours => :window) "
                 "AND d.call_ended_at < now() - make_interval(secs => :age) "
                 "AND d.phone IS NOT NULL AND COALESCE(d.talk_duration_sec, 0) > 0 "
