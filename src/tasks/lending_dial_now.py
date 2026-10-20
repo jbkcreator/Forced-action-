@@ -1,8 +1,9 @@
 """Ops check: which launch queue the caller should be on now, and its line setting.
 
 Runbook Principle 1 (strict order: partners first, cold maturity last) and Principle 4
-(max lines per campaign). Counts are contacts still active in the dialer per queue, from
-``lending.dialer_load_records``; BatchDialer itself is not called. Read only.
+(max lines per campaign). Counts are contacts dialable now per queue: active in
+``lending.dialer_load_records`` and not under an open ``lending.dialer_holds`` hold
+(call window, attempt cap, stale scrub); BatchDialer itself is not called. Read only.
 
 Usage:
     python -m src.tasks.lending_dial_now
@@ -28,7 +29,9 @@ EXIT_NOTHING_TO_DIAL = 5
 
 def active_by_queue(db) -> dict[str, int]:
     rows = db.execute(text(
-        "SELECT pool, count(*) FROM lending.dialer_load_records WHERE active GROUP BY pool"
+        "SELECT r.pool, count(*) FROM lending.dialer_load_records r "
+        "WHERE r.active AND NOT EXISTS (SELECT 1 FROM lending.dialer_holds h "
+        "WHERE h.phone = r.phone AND h.released_at IS NULL) GROUP BY r.pool"
     )).all()
     return {str(pool): int(n) for pool, n in rows}
 

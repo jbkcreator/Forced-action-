@@ -8,7 +8,7 @@ import pytest
 
 from config import lending_queues as q
 from src.lending.dialer_load import LoadReport
-from src.lending.wholesaler_lists import ghl_tags, parse_wholesaler_csv, push_to_ghl
+from src.lending.wholesaler_lists import ghl_tags, parse_wholesaler_csv, push_to_ghl, wholesaler_ref
 from src.tasks import lending_wholesaler_load as task
 
 CSV = """source,name,entity_name,phone,state,email
@@ -28,7 +28,8 @@ def test_parse_keeps_fl_known_sources_with_phone_and_tags_them():
     assert first["source_tag"] == "wholesaler_sunbiz" and second["source_tag"] == "wholesaler_hunter"
     assert first["pool"] == q.PARTNERS and first["state"] == "FL"
     assert first["borrower_name"] == "Ann Lee" and first["entity_name"] == "Lee Homes LLC"
-    assert first["source_record_ref"] == "wholesaler:sunbiz:+18135550101"
+    assert first["source_record_ref"] == wholesaler_ref("sunbiz", "+18135550101")
+    assert all("8135550101" not in r["source_record_ref"] for r in parsed.records)
     assert dict(parsed.dropped) == {"NOT_FL": 1, "NO_PHONE": 1, "UNKNOWN_SOURCE": 1, "DUPLICATE": 1}
 
 
@@ -116,7 +117,7 @@ def test_live_with_confirmation_loads_partners_and_tags_only_loaded_numbers_in_g
     assert dry["dry_run"] is True
     assert load["dry_run"] is False and load["scrubber"] is not None
     assert {r["pool"] for r in load["records"]} == {q.PARTNERS}
-    assert harness["sink"].pushed == [("wholesaler:sunbiz:+18135550101",
+    assert harness["sink"].pushed == [(wholesaler_ref("sunbiz", "+18135550101"),
                                        ["ndl-wholesaler", "ndl-src-sunbiz", "ndl-state-fl"])]
 
 
@@ -144,3 +145,4 @@ def test_live_run_below_cumulative_target_exits_with_below_target(csv_path, harn
     """Section 0 counts the live total across runs, not one run's loads."""
     harness["total"] = 900
     assert task.main(["--input", str(csv_path), "--live", "--confirm-scrub", "1"]) == task.EXIT_BELOW_TARGET
+

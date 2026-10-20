@@ -46,3 +46,27 @@ def test_nothing_loaded_returns_no_queue_and_exit_code_signals_it(monkeypatch):
     _patch(monkeypatch, [])
     assert task.dial_now_summary({})["queue"] is None
     assert task.main([]) == task.EXIT_NOTHING_TO_DIAL
+
+
+def test_a_fully_held_queue_is_skipped_for_the_next_one_with_dialable_work(lending_db):
+    """A partner under an open dialing hold (call window, attempt cap, stale scrub) is not
+    dialable, so it must not keep Partners selected over an available builder."""
+    from sqlalchemy import text
+
+    from src.lending.compliance import phone_hash
+
+    before = task.active_by_queue(lending_db)
+    held_partner, builder = "+18135559401", "+18135559402"
+    for pool, phone in ((q.PARTNERS, held_partner), (q.BUILDERS, builder)):
+        lending_db.execute(text(
+            "INSERT INTO lending.dialer_load_records (run_id, pool, source_record_ref, phone, phone_hash) "
+            "VALUES ('test-dial-now', :pool, :ref, :phone, :hash)"
+        ), {"pool": pool, "ref": f"test:{pool}", "phone": phone, "hash": phone_hash(phone)})
+    lending_db.execute(text("INSERT INTO lending.dialer_holds (phone, reason) VALUES (:p, 'attempt_cap')"),
+                       {"p": held_partner})
+
+    after = task.active_by_queue(lending_db)
+    assert after.get(q.PARTNERS, 0) == before.get(q.PARTNERS, 0)
+    assert after.get(q.BUILDERS, 0) == before.get(q.BUILDERS, 0) + 1
+    if not before.get(q.PARTNERS) and not before.get(q.TRANSACTION_READY):
+        assert task.dial_now_summary(after)["queue"] == q.BUILDERS

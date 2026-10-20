@@ -21,6 +21,7 @@ from config.lending_wholesalers import (
     WHOLESALER_SOURCE_TAGS,
     WHOLESALER_STATES,
 )
+from src.lending.compliance import phone_hash
 from src.lending.ghl_account import GhlAccount, ghl_headers, lending_ghl_account
 from src.lending.queues import assign_queue
 from src.services.phone_utils import normalize as normalize_phone
@@ -36,6 +37,11 @@ class ParsedList:
 
 def _cell(row: Mapping[str, Optional[str]], key: str) -> str:
     return (row.get(key) or "").strip()
+
+
+def wholesaler_ref(source: str, phone: str) -> str:
+    """Stable per-number ref with no phone in it: refs reach load reports and logs."""
+    return f"wholesaler:{source}:{phone_hash(phone)[:16]}"
 
 
 def parse_wholesaler_csv(text: str) -> ParsedList:
@@ -64,7 +70,7 @@ def parse_wholesaler_csv(text: str) -> ParsedList:
         else:
             seen.add(phone)
             parsed.records.append(assign_queue({
-                "source_record_ref": f"wholesaler:{source}:{phone}",
+                "source_record_ref": wholesaler_ref(source, phone),
                 "source_tag": tag,
                 "wholesaler_source": source,
                 "phone": phone,

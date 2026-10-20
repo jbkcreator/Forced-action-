@@ -300,6 +300,17 @@ class TestLiveLoad:
         assert report.failed == [{"record_ref": "a", "error": "DialerRequestError", "status": 500}]
         assert [r.phone for r in _load_rows(db)] == [P2]
 
+    def test_a_failed_wholesaler_push_reports_and_logs_no_phone(self, db, caplog):
+        from src.lending.wholesaler_lists import wholesaler_ref
+        _fresh_scrub(db, P1)
+        caplog.set_level("INFO")
+        record = _record(wholesaler_ref("sunbiz", P1), P1)
+        report, _ = _run(db, [record], aircall=FakeAircall(fail_phones={P1}))
+        assert report.failed and report.failed[0]["record_ref"] == record["source_record_ref"]
+        digits = P1.lstrip("+1")
+        assert digits not in json.dumps(report.as_dict())
+        assert digits not in caplog.text
+
     def test_a_crash_mid_load_still_records_the_contacts_already_pushed(self, db):
         """Finding 6: contacts pushed before an unexpected error must have load rows, or a
         later opt-out cannot find and remove them from the dialer."""
