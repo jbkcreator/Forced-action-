@@ -8,22 +8,25 @@ LENDING_GHL_WEBHOOK_SECRET; the endpoints are closed while the secret is unset.
 The event handling lives in ``src.lending.ghl_consent_events``. A call that fails after it arrived is saved and
 alerted by ``src.lending.webhook_failures`` and replayed until it succeeds, so an opt-out is never lost.
 
-Endpoints: POST /webhooks/lending/ghl-opt-out, POST /webhooks/lending/ghl-text-consent, POST /webhooks/lending/ghl-stage (scoreboard "showed")
+Endpoints: POST /webhooks/lending/ghl-opt-out, POST /webhooks/lending/ghl-text-consent, POST /webhooks/lending/ghl-stage (scoreboard "showed"),
+POST /webhooks/lending/after-hours-intake (T-06 after-hours voicemail / answering service; see src.lending.after_hours_intake)
 """
 from __future__ import annotations
 
 import hmac
 import json
 import logging
+from datetime import timedelta
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException
 from sqlalchemy.orm import Session
 
 from sqlalchemy import text
 
 from config.settings import get_settings
 from src.api.deps import get_db
+from src.lending.after_hours_intake import IntakeEvent, IntakeResult, model_drafter, queue_reply_draft, record_intake
 from src.lending.ghl_consent_events import InvalidEvent, field as _field, record_ghl_opt_out, record_inbound_consent
 from src.lending.webhook_failures import GHL_OPT_OUT, GHL_TEXT_CONSENT, report_webhook_failure
 from src.services.phone_utils import normalize
@@ -112,3 +115,55 @@ def ghl_stage(
         logger.error("[lending-ghl] stage webhook failed: %s", type(exc).__name__)
         raise HTTPException(status_code=500, detail="Stage event could not be recorded") from exc
     return {"recorded": bool(inserted)}
+
+
+def _queue_after_hours_draft(event: IntakeEvent, result: IntakeResult) -> None:
+    """Background: draft the reply and freeze it for Approve. A failure leaves the logged call and the pin."""
+    import anthropic
+    from sqlalchemy import create_engine
+
+    from packages.agent_core.pending_actions import PendingActionQueue
+    from packages.agent_core.store import AgentStore
+    from src.lending.models import LENDING_SCHEMA
+
+    settings = get_settings()
+    engine = create_engine(str(settings.database_url), pool_pre_ping=True)
+    try:
+        client = anthropic.Anthropic(api_key=settings.anthropic_api_key.get_secret_value(), timeout=30.0,
+                                     max_retries=1).messages
+        queue = PendingActionQueue(AgentStore(engine, LENDING_SCHEMA),
+                                   default_ttl=timedelta(hours=settings.lending_cora_pending_action_ttl_hours))
+        action_id = queue_reply_draft(queue, event, result, model_drafter(client, settings.lending_cora_model))
+        logger.info("[lending-ghl] after-hours reply draft queued: action %s", action_id)
+    except Exception as exc:
+        logger.error("[lending-ghl] after-hours reply draft failed (%s)", type(exc).__name__)
+    finally:
+        engine.dispose()
+
+
+@router.post("/after-hours-intake")
+def after_hours_intake(
+    body: dict[str, Any],
+    background_tasks: BackgroundTasks,
+    x_webhook_secret: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """A caller's after-hours voicemail (GHL workflow) or answering-service message. Logs the call, pins the
+    contact first for the next morning and queues a reply draft for Approve. Body: phone, first_name/name,
+    message/transcription, received_at, source, call_id."""
+    if not get_settings().lending_after_hours_intake_enabled:
+        raise HTTPException(status_code=503, detail="After-hours intake is not enabled")
+    _verify_secret(x_webhook_secret)
+    try:
+        event, result = record_intake(db, body)
+        db.commit()
+    except InvalidEvent as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    except Exception as exc:
+        db.rollback()
+        logger.error("[lending-ghl] after-hours intake failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=500, detail="Intake could not be recorded") from exc
+    if result.recorded and result.draft_allowed:
+        background_tasks.add_task(_queue_after_hours_draft, event, result)
+    return {"recorded": result.recorded, "pinned": result.recorded, "draft_queued": result.draft_allowed}

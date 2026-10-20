@@ -137,3 +137,11 @@ def test_queue_order_is_reproducible_with_the_same_seed():
 def test_tiebreak_orders_equal_ranks():
     leads = [RankedLead("small", 5, Decimal("100")), RankedLead("big", 5, Decimal("900"))]
     assert order_queue(leads, rng=random.Random(1), exploration_share=0) == ["big", "small"]
+
+
+def test_pinned_leads_go_first_and_stay_out_of_the_exploration_slice():
+    leads = _leads(20) + [RankedLead(item="voicemail-b", rank=1, pinned=True),
+                          RankedLead(item="voicemail-a", rank=4, pinned=True)]
+    queue = order_queue(leads, rng=random.Random(5), exploration_share=0.1)
+    assert queue[:2] == ["voicemail-a", "voicemail-b"]
+    assert len(queue) == 22 and queue.count("voicemail-b") == 1

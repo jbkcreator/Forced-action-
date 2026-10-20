@@ -159,6 +159,7 @@ class RankedLead(Generic[T]):
     item: T
     rank: int
     tiebreak: Decimal = Decimal(0)
+    pinned: bool = False  # after-hours voicemail caller: called first, never in the exploration slice
 
 
 def order_queue(
@@ -167,17 +168,19 @@ def order_queue(
     rng: random.Random,
     exploration_share: float = EXPLORATION_SHARE,
 ) -> list[T]:
-    """Highest rank first, with a small exploration slice spread through the queue.
+    """Pinned leads first (after-hours voicemail callers), then highest rank first, with a small
+    exploration slice spread through the rest of the queue.
 
     The slice is drawn at random from the lower half of the ranking and placed
     at even intervals, so callers keep reaching records the rules rate lower
     and the rules can be checked against how those calls go. ``rng`` is passed
     in so a queue can be rebuilt exactly for audit.
     """
-    ranked = sorted(leads, key=lambda lead: (-lead.rank, -lead.tiebreak))
+    pinned = sorted((lead for lead in leads if lead.pinned), key=lambda lead: (-lead.rank, -lead.tiebreak))
+    ranked = sorted((lead for lead in leads if not lead.pinned), key=lambda lead: (-lead.rank, -lead.tiebreak))
     explore_count = int(round(len(ranked) * exploration_share))
     if explore_count == 0:
-        return [lead.item for lead in ranked]
+        return [lead.item for lead in pinned + ranked]
 
     lower_half_start = len(ranked) // 2
     explore_positions = set(rng.sample(range(lower_half_start, len(ranked)), explore_count))
@@ -194,4 +197,4 @@ def order_queue(
             if nxt is not None:
                 queue.append(nxt)
     queue.extend(explored_iter)
-    return [lead.item for lead in queue]
+    return [lead.item for lead in pinned + queue]
