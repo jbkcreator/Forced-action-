@@ -13,11 +13,14 @@ from sqlalchemy.pool import StaticPool
 
 from packages.agent_core.chatport import FakeChatPort, PostResult
 from packages.agent_core.config import AgentCoreConfig
+from packages.agent_core.halt import AgentHalted
 from packages.agent_core.memory import MAX_ACTIVE_RULES, AgentMemory
 from packages.agent_core.pending_actions import ActionStatus, PendingActionQueue
 from packages.agent_core.store import AgentStore
 from src.lending import cora_agent
 from src.lending.cora_tools import CoraToolkit, _Lead
+from src.lending.ghl_email import GhlEmailSender
+from src.lending.ghl_sms import GhlAccount
 from tests.agent_core.conftest import SQLITE_DDL, FakeMessages, response, text_block, tool_block
 
 JOSH, OPS, BOT = "U_JOSH", "U_OPS", "U_BOT"
@@ -46,11 +49,12 @@ def _toolkit_factory(engine, memory) -> CoraToolkit:
 
 
 class Cora:
-    def __init__(self, store: AgentStore, client: FakeMessages) -> None:
+    def __init__(self, store: AgentStore, client: FakeMessages, executors=None, send_check=None) -> None:
         self.chat = FakeChatPort(default_channel="C_CORA")
         self.client = client
         self.services = cora_agent.build_session(_config(), store, self.chat, BOT, messages_client=client,
-                                                 toolkit_factory=_toolkit_factory)
+                                                 toolkit_factory=_toolkit_factory, executors=executors,
+                                                 send_check=send_check)
         self.session, self.relay = self.services.session, self.services.relay
         self.queue = PendingActionQueue(store)
 
@@ -102,6 +106,36 @@ def test_top_level_message_gets_an_inline_reply_with_channel_history(store: Agen
         {"role": "assistant", "content": "2 web leads this month."},
         {"role": "user", "content": f"<@{JOSH}>: which reached GHL?"},
     ]
+
+
+def test_a_top_level_message_sees_only_the_last_hour_of_the_channel(store: AgentStore) -> None:
+    cora = Cora(store, FakeMessages(response(text_block("Done."))))
+    now = 1_800_000_000.0
+    cora.chat.channels["C_CORA"] = [
+        {"ts": f"{now - 7200:.6f}", "user": JOSH, "text": "draft an email to Laira"},  # two hours old: dropped
+        {"ts": f"{now - 7100:.6f}", "user": BOT, "bot_id": "B1", "text": "Queued action #2 for approval."},
+        {"ts": f"{now - 600:.6f}", "user": JOSH, "text": "how many web leads today?"},
+        {"ts": f"{now - 590:.6f}", "user": BOT, "bot_id": "B1", "text": "3 web leads today."},
+        {"ts": f"{now:.6f}", "user": JOSH, "text": "dismiss 134"},
+    ]
+    cora.say(JOSH, "dismiss 134", ts=f"{now:.6f}")
+    assert cora.client.requests[0]["messages"] == [
+        {"role": "user", "content": f"<@{JOSH}>: how many web leads today?"},
+        {"role": "assistant", "content": "3 web leads today."},
+        {"role": "user", "content": f"<@{JOSH}>: dismiss 134"},
+    ]
+
+
+def test_a_top_level_message_sees_at_most_a_few_recent_turns(store: AgentStore) -> None:
+    cora = Cora(store, FakeMessages(response(text_block("Done."))))
+    now = 1_800_000_000.0
+    chatter = [{"ts": f"{now - 100 + n:.6f}", "user": BOT if n % 2 else JOSH, **({"bot_id": "B1"} if n % 2 else {}),
+                "text": f"message {n}"} for n in range(20)]
+    cora.chat.channels["C_CORA"] = chatter
+    cora.say(JOSH, "latest", ts=f"{now:.6f}")
+    history = cora.client.requests[0]["messages"][:-1]
+    assert len(history) <= cora_agent.TOP_LEVEL_HISTORY_TURNS and history[0]["role"] == "user"
+    assert history[-1]["content"] == "message 19"
 
 
 def test_message_in_a_thread_is_answered_in_that_thread(store: AgentStore) -> None:
@@ -181,6 +215,88 @@ def test_approved_draft_is_not_sent_without_a_registered_sender(store: AgentStor
     assert cora.queue.get(1).status is ActionStatus.FAILED
     assert "Approved, not sent" in cora.chat.updates[-1]["text"]
     assert "isn't switched on yet" in cora.chat.updates[-1]["text"]
+
+
+class GhlRecorder:
+    """Stands in for the HTTP call inside GhlEmailSender: contact upsert, then the email send."""
+
+    def __init__(self, *responses) -> None:
+        self.calls, self._responses = [], list(responses)
+
+    def __call__(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
+        return self._responses.pop(0)
+
+
+class GhlResp:
+    def __init__(self, status: int, body: dict) -> None:
+        self.status_code, self._body = status, body
+
+    def json(self) -> dict:
+        return self._body
+
+
+def _email_cora(store: AgentStore, request, send_check=lambda action: None) -> Cora:
+    sender = GhlEmailSender(GhlAccount(api_key="k", location_id="loc-ndl"), "hello@nextdeallending.com", request)
+    cora = Cora(store, FakeMessages(
+        response(tool_block("toolu_e", "draft_email", {"lead_ref": "web_lead:7", "subject": "Your loan request",
+                                                       "body": "Hi Sam,\nThanks for reaching out."}),
+                 stop_reason="tool_use"),
+        response(text_block("Drafted.")),
+    ), executors={"ghl_email": cora_agent.email_executor(sender)}, send_check=send_check)
+    cora.say(JOSH, "email Sam", ts="70.0")
+    return cora
+
+
+def _approve(cora: Cora) -> None:
+    cora.session.handle_request("interactive", {
+        "type": "block_actions", "user": {"id": JOSH}, "channel": {"id": "C_CORA"},
+        "message": {"ts": cora.queue.get(1).card_ts},
+        "actions": [{"action_id": "agent_core_approve", "value": "1"}]}, "env-e")
+
+
+def test_approved_email_is_sent_through_ghl_exactly_as_approved(store: AgentStore) -> None:
+    request = GhlRecorder(GhlResp(200, {"contact": {"id": "ct1"}}), GhlResp(201, {"messageId": "m-77"}))
+    cora = _email_cora(store, request)
+    assert cora.queue.get(1).status is ActionStatus.PENDING and request.calls == []
+
+    _approve(cora)
+
+    action = cora.queue.get(1)
+    assert action.status is ActionStatus.SENT and action.provider_ref == "m-77"
+    send = request.calls[1][2]["json"]
+    assert send["subject"] == "Your loan request" and send["emailFrom"] == "hello@nextdeallending.com"
+    assert send["html"] == "Hi Sam,<br>Thanks for reaching out."
+    assert request.calls[0][2]["json"]["email"] == "sam@example.com"
+    assert request.calls[0][2]["json"]["phone"] == "+17275550100"
+    assert "Approved, not sent" not in cora.chat.updates[-1]["text"]
+
+
+def test_rejected_email_is_never_sent(store: AgentStore) -> None:
+    request = GhlRecorder()
+    cora = _email_cora(store, request)
+    cora.session.handle_request("interactive", {
+        "type": "block_actions", "user": {"id": JOSH}, "channel": {"id": "C_CORA"},
+        "message": {"ts": cora.queue.get(1).card_ts},
+        "actions": [{"action_id": "agent_core_reject", "value": "1"}]}, "env-r")
+    cora.relay.run()
+    assert request.calls == [] and cora.queue.get(1).status is not ActionStatus.SENT
+
+
+def test_suppressed_recipient_blocks_an_approved_email(store: AgentStore) -> None:
+    request = GhlRecorder()
+    cora = _email_cora(store, request, send_check=lambda action: "recipient is suppressed or marked do-not-contact")
+    _approve(cora)
+    assert cora.queue.get(1).status is ActionStatus.BLOCKED and request.calls == []
+
+
+def test_ghl_failure_marks_the_email_failed_and_does_not_retry(store: AgentStore) -> None:
+    request = GhlRecorder(GhlResp(200, {"contact": {"id": "ct1"}}), GhlResp(500, {}))
+    cora = _email_cora(store, request)
+    _approve(cora)
+    assert cora.queue.get(1).status is ActionStatus.FAILED
+    cora.relay.run()
+    assert len(request.calls) == 2
 
 
 def test_revise_reply_redrafts_and_posts_a_fresh_card(store: AgentStore) -> None:
@@ -306,3 +422,79 @@ def test_model_outage_gets_a_plain_reply(store: AgentStore) -> None:
     cora = Cora(store, FakeMessages(outage))
     cora.say(JOSH, "how many leads?", ts="80.0")
     assert cora.last_answer() == cora_agent._MODEL_UNAVAILABLE
+
+
+# ── inbox items in a digest thread ───────────────────────────────────────────
+
+DIGEST_TS = "90.0"
+INBOX_BLOCK = '<inbox_items>\n{"id": 41, "summary": "Rate question: Marcus"}\n</inbox_items>'
+
+
+def _cora_with_inbox(store: AgentStore, lookup) -> Cora:
+    cora = Cora(store, FakeMessages(response(text_block("Done: #41 dismissed."))))
+    cora.services = cora_agent.build_session(_config(), store, cora.chat, BOT, messages_client=cora.client,
+                                             toolkit_factory=_toolkit_factory, inbox_context=lookup)
+    cora.session = cora.services.session
+    return cora
+
+
+def _last_user_turn(cora: Cora) -> str:
+    return cora.client.requests[0]["messages"][-1]["content"]
+
+
+def test_a_reply_in_a_digest_thread_comes_with_its_inbox_items(store: AgentStore) -> None:
+    cora = _cora_with_inbox(store, lambda channel, ts: INBOX_BLOCK if (channel, ts) == ("C_CORA", DIGEST_TS) else "")
+    cora.say(JOSH, "dismiss 41, I called him", ts="90.5", thread_ts=DIGEST_TS)
+    assert _last_user_turn(cora) == f"{INBOX_BLOCK}\n<@{JOSH}>: dismiss 41, I called him"
+
+
+def test_a_top_level_message_gets_no_inbox_block(store: AgentStore) -> None:
+    lookups: list[tuple[str, str]] = []
+    cora = _cora_with_inbox(store, lambda channel, ts: lookups.append((channel, ts)) or INBOX_BLOCK)
+    cora.say(JOSH, "what is still open?", ts="91.0")
+    assert lookups == [] and _last_user_turn(cora) == f"<@{JOSH}>: what is still open?"
+
+
+def test_a_failed_inbox_lookup_still_gets_an_answer(store: AgentStore) -> None:
+    def database_down(channel: str, ts: str) -> str:
+        raise RuntimeError("database unavailable")
+
+    cora = _cora_with_inbox(store, database_down)
+    cora.say(JOSH, "dismiss 41", ts="92.5", thread_ts="92.0")
+    assert _last_user_turn(cora) == f"<@{JOSH}>: dismiss 41"
+    assert cora.last_answer() == "Done: #41 dismissed."
+
+
+def test_kill_switch_holds_an_approved_email_until_resume(store: AgentStore) -> None:
+    request = GhlRecorder(GhlResp(200, {"contact": {"id": "ct1"}}), GhlResp(201, {"messageId": "m-90"}))
+    cora = _email_cora(store, request)
+    cora.say(JOSH, "halt", ts="80.0")
+    _approve(cora)
+    assert cora.queue.get(1).status is ActionStatus.APPROVED and request.calls == []
+    assert "Approved, held" in cora.chat.updates[-1]["text"]
+
+    with pytest.raises(AgentHalted):
+        cora.relay.run()
+    assert request.calls == []
+
+    cora.say(JOSH, "resume", ts="81.0")
+    cora.relay.run()
+    assert cora.queue.get(1).status is ActionStatus.SENT and len(request.calls) == 2
+
+
+def test_only_an_approver_can_halt(store: AgentStore) -> None:
+    cora = _email_cora(store, GhlRecorder())
+    cora.say(OPS, "halt", ts="82.0")
+    assert "Only an approver" in cora.chat.posts[-1]["text"]
+
+
+def test_emergency_halt_through_coras_session_sets_the_lending_wide_halt(store: AgentStore, monkeypatch) -> None:
+    from src.lending import global_halt
+
+    saved = []
+    monkeypatch.setattr(global_halt, "set_global_halt", lambda halted, **kw: saved.append((halted, kw["set_by"])))
+    cora = Cora(store, FakeMessages())
+    cora.say(JOSH, "<@U_BOT> emergency halt", ts="90.0")
+    assert saved == [(True, JOSH)]
+    assert cora.services.relay._halt.is_halted()  # Cora's own sends are held too
+    assert cora.client.requests == []  # handled before the model

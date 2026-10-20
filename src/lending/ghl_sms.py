@@ -28,6 +28,7 @@ from typing import Any, Callable, Optional
 import requests
 
 from config.settings import get_settings
+from src.lending.global_halt import is_globally_halted
 from src.lending.ghl_account import GhlAccount, ghl_headers, lending_ghl_account
 from src.services import ghl_webhook
 from src.services.phone_utils import normalize
@@ -71,15 +72,22 @@ def _single_attempt(method: str, url: str, **kwargs: Any) -> requests.Response:
 class GhlSmsSender:
     _log_prefix = "[lending-ghl-sms]"
 
-    def __init__(self, account: GhlAccount, from_number: str, request: Optional[Request] = None) -> None:
-        """``request`` (tests) replaces both calls; unset, both are single attempts."""
+    def __init__(self, account: GhlAccount, from_number: str, request: Optional[Request] = None, *,
+                 internal_alert: bool = False) -> None:
+        """``request`` (tests) replaces both calls; unset, both are single attempts. ``internal_alert`` marks a
+        sender used only for alerts to the team's own phone (T-10 alarms), which keep going during the lending
+        emergency halt: the halt stops outbound to borrowers, and a missed-lead alarm must never go quiet."""
         self._account, self._from, self._request = account, from_number, request
+        self._internal_alert = internal_alert
 
     def _http(self) -> Request:
         return self._request or _single_attempt
 
     def _post(self, request: Request, path: str, body: dict, what: str, version: str = "2021-07-28",
               is_send: bool = False) -> dict:
+        if is_send and not self._internal_alert and is_globally_halted():
+            logger.warning("%s %s refused: lending emergency halt is on", self._log_prefix, what)
+            raise GhlSmsError("lending emergency halt is on; nothing sent")
         try:
             response = request("POST", f"{ghl_webhook._GHL_BASE}{path}",
                                      headers=ghl_headers(self._account.api_key, version), json=body)
@@ -116,12 +124,13 @@ class GhlSmsSender:
         return str(message_id)
 
 
-def get_sender() -> Optional[GhlSmsSender]:
-    """None until a GHL account and the texting number are both configured."""
+def get_sender(*, internal_alert: bool = False) -> Optional[GhlSmsSender]:
+    """None until a GHL account and the texting number are both configured. ``internal_alert=True`` only for
+    texts to the team's own phone (see ``GhlSmsSender``)."""
     account, number = lending_ghl_account(), texting_number()
     if account is None or not number:
         return None
-    return GhlSmsSender(account, number)
+    return GhlSmsSender(account, number, internal_alert=internal_alert)
 
 
 def main(argv: Optional[list[str]] = None) -> int:

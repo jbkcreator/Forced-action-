@@ -40,6 +40,7 @@ def build_event(lead: Mapping[str, Any]) -> LendingFlowLeadCreated:
         loan_amount=Decimal(amount) if amount is not None else None,
         state=lead.get("property_state"),
         loan_type=LoanType(loan_type) if loan_type else None,
+        ghl_contact_id=lead.get("ghl_contact_id") or None,
     )
 
 

@@ -14,12 +14,13 @@ NAMES = {"11": "Verified maturity", "12": "Builders"}
 
 
 def _call(db, cid, *, seat="Dana", camp="11", tag="Maturity A", disp="NO_ANSWER", direction="outbound",
-          blocked=False, ended=NOON, phone=None):
+          blocked=False, ended=NOON, phone=None, talk=None, caller_seat=None, source=None):
     db.execute(text(
         "INSERT INTO lending.call_dispositions (dialer_call_id, caller_name, dialer_campaign_id, campaign_tag, "
-        "disposition, direction, booking_blocked, call_ended_at, phone, raw_event) "
-        "VALUES (:c, :s, :camp, :t, :d, :dir, :b, :e, :ph, '{}'::jsonb)"),
-        {"c": cid, "s": seat, "camp": camp, "t": tag, "d": disp, "dir": direction, "b": blocked, "e": ended, "ph": phone})
+        "disposition, direction, booking_blocked, call_ended_at, phone, talk_duration_sec, caller_seat, source_tag, raw_event) "
+        "VALUES (:c, :s, :camp, :t, :d, :dir, :b, :e, :ph, :talk, :cs, :src, '{}'::jsonb)"),
+        {"c": cid, "s": seat, "camp": camp, "t": tag, "d": disp, "dir": direction, "b": blocked, "e": ended, "ph": phone,
+         "talk": talk, "cs": caller_seat, "src": source})
 
 
 def _stage(db, opp, stage="Held", *, phone=None, booked_by=None, at=NOON):
@@ -70,7 +71,7 @@ def test_inbound_and_other_days_excluded(lending_db):
 def test_slack_text_names_every_column(lending_db):
     _call(lending_db, "1", disp="BOOKED")
     out = format_slack(build_scoreboard(lending_db, DAY, NAMES), DAY)
-    for word in ("Dials", "Live", "Gated", "Booked", "Showed", "Nurture", "Connect", "Book rate"):
+    for word in ("Dials", "Contacts", "Calls 2+ min", "Gated", "Booked", "Transfers", "Showed", "Held ÷ Booked", "Nurture", "Connect", "Book rate"):
         assert word in out
     assert "Showed 0" in out
 
@@ -126,3 +127,35 @@ def test_answer_rate_per_caller_id_number(lending_db):
     assert (by["+18135550002"].dials, by["+18135550002"].answered) == (3, 1)
     number_section = format_slack(data, DAY).split("By caller-ID number")[1]
     assert "Answer rate" in number_section and "50%" in number_section
+
+
+def test_two_plus_minute_conversations_count_calls_of_at_least_two_minutes(lending_db):
+    _call(lending_db, "1", talk=119)
+    _call(lending_db, "2", talk=120)
+    _call(lending_db, "3", talk=600)
+    _call(lending_db, "4", talk=None)
+    assert build_scoreboard(lending_db, DAY, NAMES).total.long_calls == 2
+
+
+def test_seat_and_source_sections_group_by_the_call_seat_and_source_tag(lending_db):
+    _call(lending_db, "1", caller_seat="Seat 1", source="hunter_fl", disp="BOOKED")
+    _call(lending_db, "2", caller_seat="Seat 1", source="sunbiz_fl")
+    _call(lending_db, "3", caller_seat=None, source=None)
+    data = build_scoreboard(lending_db, DAY, NAMES)
+    seats = {r.name: r for r in data.by_seat}
+    assert (seats["Seat 1"].dials, seats["Seat 1"].booked) == (2, 1) and seats["(unknown)"].dials == 1
+    sources = {r.name: r for r in data.by_source}
+    assert sources["hunter_fl"].booked == 1 and sources["sunbiz_fl"].dials == 1 and sources[UNATTRIBUTED].dials == 1
+
+
+def test_show_rate_uses_held_over_booked_per_row(lending_db):
+    _call(lending_db, "1", seat="Dana", disp="BOOKED", phone="+18135558601")
+    _call(lending_db, "2", seat="Dana", disp="BOOKED", phone="+18135558602")
+    _stage(lending_db, "opp1", phone="+18135558601")
+    dana = next(r for r in build_scoreboard(lending_db, DAY, NAMES).by_caller if r.name == "Dana")
+    assert (dana.booked, dana.showed, dana.show_rate) == (2, 1, 0.5)
+
+
+def test_transfers_are_not_counted_until_a_transfer_code_is_configured(lending_db):
+    _call(lending_db, "1", disp="BOOKED")
+    assert build_scoreboard(lending_db, DAY, NAMES).total.transfers == 0

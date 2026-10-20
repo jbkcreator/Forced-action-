@@ -283,3 +283,24 @@ def test_card_never_shows_a_recording_link():
         _, blocks = dd.build_slack_message(_row(recording_status=status), record)
         assert "recording" not in blocks[1]["text"]["text"].lower()
         assert "https://dialer.example/rec/c1" not in str(blocks)
+
+
+# ── Cora's inbox ────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("alert, event_type", [
+    (dd.alert_unpropagated_dnc, "dnc_not_propagated"),
+    (dd.alert_dnc_removal_pending, "dnc_removal_pending"),
+])
+def test_dnc_alerts_are_raised_in_coras_inbox(inbox_writes, alert, event_type):
+    alert("c9", "7", client=MagicMock())
+    failing = MagicMock()
+    failing.chat_postMessage.side_effect = RuntimeError("slack down")
+    alert("c10", "7", client=failing)
+    assert [(e["event_type"], e["dedup_key"], e["target_channel"], e["channel_posted"]) for e in inbox_writes] == [
+        (event_type, "c9", "dial_tasks", True), (event_type, "c10", "dial_tasks", False)]
+
+
+def test_a_dnc_alert_reaches_coras_inbox_when_slack_is_not_configured(inbox_writes, monkeypatch):
+    monkeypatch.setattr(dd, "_configured_slack", lambda: False)
+    dd.alert_unpropagated_dnc("c11", None)
+    assert inbox_writes[0]["dedup_key"] == "c11" and inbox_writes[0]["channel_posted"] is False

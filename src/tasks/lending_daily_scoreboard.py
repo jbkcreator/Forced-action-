@@ -1,4 +1,9 @@
-"""Post the lending scoreboard to Slack at 7:20pm ET (the dialer stops at 7:15pm). Cron fires at 23:20 and 00:20 UTC; only the one that is 19:xx ET acts."""
+"""Post the lending scoreboard to Slack.
+
+Closing board: 7:20pm ET (the dialer stops at 7:15pm). Cron fires at 23:20 and 00:20 UTC; only the one that is 19:xx ET acts.
+Hourly board (``--hourly``): the day so far, at 10:00 through 18:00 ET (the closing board is the 7pm post). Cron fires
+every UTC hour; only the hours in HOURLY_POST_HOURS_ET act, so daylight saving needs no second line. An hourly board
+with no dials yet (a weekend, a day off) is not posted."""
 from __future__ import annotations
 
 import argparse
@@ -9,6 +14,7 @@ from typing import Mapping, Optional
 from zoneinfo import ZoneInfo
 
 from config.lending_compliance import DEFAULT_TZ
+from config.lending_dispositions import HOURLY_POST_HOURS_ET
 from config.settings import get_settings
 from src.lending.db import lending_session
 from src.lending.dialer_port import get_http
@@ -48,10 +54,13 @@ def _post_with_retry(client, channel: str, message: str, blocks: list) -> None:
 def main(argv=None, *, now: Optional[datetime] = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--force", action="store_true", help="post regardless of the ET hour")
+    parser.add_argument("--hourly", action="store_true", help="post the day-so-far board; acts only at the hourly ET hours")
     args = parser.parse_args(argv)
     now_et = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo(DEFAULT_TZ))
-    if now_et.hour != 19 and not args.force:
+    due = now_et.hour in HOURLY_POST_HOURS_ET if args.hourly else now_et.hour == 19
+    if not due and not args.force:
         return 0
+    as_of = now_et if args.hourly else None
     s = get_settings()
     channel = s.lending_daily_channel
     if not (channel and s.lending_slack_bot_token):
@@ -61,9 +70,12 @@ def main(argv=None, *, now: Optional[datetime] = None) -> int:
     try:
         with lending_session() as db:
             data = build_scoreboard(db, day, campaign_names())
+        if args.hourly and not args.force and not data.total.dials:
+            logger.info("[lending] hourly scoreboard skipped for %s: no dials yet", day)
+            return 0
         from slack_sdk import WebClient
         _post_with_retry(WebClient(token=s.lending_slack_bot_token.get_secret_value()), channel,
-                         format_slack(data, day), format_blocks(data, day))
+                         format_slack(data, day, as_of=as_of), format_blocks(data, day, as_of=as_of))
     except Exception:
         logger.exception("[lending] scoreboard post failed for %s", day)
         return 1

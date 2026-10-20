@@ -381,3 +381,6 @@ class LendingFlowLeadCreated(BaseModel):
     loan_amount: Optional[Decimal] = None
     state: Optional[str] = None
     loan_type: Optional[LoanType] = None
+
+    # T-05: the lead's GoHighLevel contact, so alerts can link straight to it. None when not yet known.
+    ghl_contact_id: Optional[str] = None

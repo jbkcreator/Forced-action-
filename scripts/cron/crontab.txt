@@ -1198,6 +1198,7 @@ COUNTY_ID=hillsborough
 # Lending LendingFlow intake (T-11) — retry GHL delivery of leads not yet in GoHighLevel, then emit the
 # LendingFlowLeadCreated event + pre-qual hand-off. No-op while LENDING_LENDINGFLOW_ENABLED=false.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_lendingflow_sweep
+*/5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_partner_sweep
 
 # Lending LendingFlow background enrichment card + routing (T-12) — build rows for leads whose event was missed and
 # retry failed ones. No-op while LENDING_ENRICHMENT_ENABLED=false.
@@ -1206,6 +1207,13 @@ COUNTY_ID=hillsborough
 # Lending Minute-5 pre-qualification letter (T-07) — retry letters not yet sent.
 # No-op while LENDING_PREQUAL_PDF_ENABLED is off.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_prequal_sweep
+
+# R-1 Overflow Router: route unrouted files + retry failed Slack posts every 5 min.
+*/5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_routing_sweep
+
+# R-1 hold-queue daily summary at 8:00 AM ET (two lines for DST; task checks the hour).
+0 12 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_routing_hold_summary
+0 13 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_routing_hold_summary
 
 # Lending soft approval (T-08) — post the #dial-tasks deal-facts card for finished calls whose first post failed.
 # No-op while LENDING_SOFT_APPROVAL_ENABLED is off.
@@ -1228,6 +1236,8 @@ COUNTY_ID=hillsborough
 # Lending 7:20pm ET scoreboard to Slack (Part 5.6; dialer stops 7:15pm). Two lines because ET is UTC-4 until Nov 1 and UTC-5 after; the task posts only when it is 19:xx ET.
 20 23 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_daily_scoreboard
 20 0 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_daily_scoreboard
+# Lending hourly scoreboard (launch runbook Line 11): the day so far, posted at 10:00 through 18:00 ET (the 7:20pm closing board covers 7pm), and skipped when there are no dials yet. Runs every UTC hour; the task acts only when the ET hour is one of those, so daylight saving needs no second line.
+0 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_daily_scoreboard --hourly
 
 # Lending 9am ET list of confirmation calls due (WP-GL-10, lending.confirmation_tasks). Two lines because ET is UTC-4 until Nov 1 and UTC-5 after; the task posts only when it is 9:xx ET.
 0 13 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_confirmation_tasks

@@ -910,6 +910,9 @@ class AppSettings(BaseSettings):
 	aircall_api_token: Optional[SecretStr] = Field(default=None, env="AIRCALL_API_TOKEN")
 	batchdialer_api_key: Optional[SecretStr] = Field(default=None, env="BATCHDIALER_API_KEY")
 	missed_call_text_enabled: bool = Field(default=False, env="MISSED_CALL_TEXT_ENABLED")  # WP-GL-9; off until consent + sender confirmed
+	# Josh's booking link in the missed-call texts (launch runbook Line 9). Off until the 10DLC campaign declares
+	# embedded links and the client approves the added line; off = the approved wording, no link.
+	lending_text_back_booking_link_enabled: bool = Field(default=False, env="LENDING_TEXT_BACK_BOOKING_LINK_ENABLED")
 	# Backflip borrower conflict check on the lending load. Off for launch: there is no
 	# Backflip export, and a missing or stale feed blocks every record when it is on.
 	lending_backflip_check_enabled: bool = Field(default=False, env="LENDING_BACKFLIP_CHECK_ENABLED")
@@ -919,6 +922,9 @@ class AppSettings(BaseSettings):
 	lending_prequal_range_pct: int = Field(default=10, env="LENDING_PREQUAL_RANGE_PCT")
 	# Sender of the pre-qual email. Set a verified Next Deal Lending mailbox before enabling; unset = GHL's shared address.
 	lending_prequal_email_from: Optional[str] = Field(default=None, env="LENDING_PREQUAL_EMAIL_FROM")
+	# P-1 Partner Door. The form will not open until Josh's consent wording is set here (shown verbatim, stored on each file).
+	lending_partner_consent_text: str = Field(default="", env="LENDING_PARTNER_CONSENT_TEXT")
+	lending_partner_upload_dir: str = Field(default="data/partner_uploads", env="LENDING_PARTNER_UPLOAD_DIR")  # uploads + generated pre-qual PDFs
 	# Shared secret the GHL "DND changed" workflow sends in X-Webhook-Secret. Unset = endpoint closed.
 	lending_ghl_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_GHL_WEBHOOK_SECRET")
 	lending_ghl_sms_from_number: Optional[str] = Field(default=None, env="LENDING_GHL_SMS_FROM_NUMBER")  # E.164; the GHL SMS number (texting only). Calls run through BatchDialer on a different number
@@ -958,8 +964,11 @@ class AppSettings(BaseSettings):
 	lending_dial_tasks_channel: str = Field(default="", env="LENDING_DIAL_TASKS_CHANNEL")
 	lending_replies_channel: str = Field(default="", env="LENDING_REPLIES_CHANNEL")  # WP-GL-10 rate/terms handoffs; channel ID, the Cora Lending bot must be a member
 	lending_daily_channel: str = Field(default="", env="LENDING_DAILY_CHANNEL")  # 7pm scoreboard; channel ID
+	lending_partner_channel: str = Field(default="", env="LENDING_PARTNER_CHANNEL")  # P-1 partner file cards (#ndl-partner-deals); Cora Lending bot must be a member; unset = no card
 	# T-10 uncalled-lead alarms (src/lending/uncalled_alarm_worker.py)
 	lending_uncalled_alarms_enabled: bool = Field(default=False, env="LENDING_UNCALLED_ALARMS_ENABLED")
+	lending_ghl_app_url: str = Field(default="https://app.gohighlevel.com", env="LENDING_GHL_APP_URL")  # GHL web app base for contact links (white-label domain if any)
+	lending_lead_arrival_alert_enabled: bool = Field(default=False, env="LENDING_LEAD_ARRIVAL_ALERT_ENABLED")  # T-05: @-mention Josh in LENDING_OPS_CHANNEL when a LendingFlow lead arrives
 	lending_alarm_sms_to: Optional[str] = Field(default=None, env="LENDING_ALARM_SMS_TO")  # Josh's mobile; normalized before use
 	lending_ops_channel: str = Field(default="", env="LENDING_OPS_CHANNEL")  # #lendingops channel ID; 5-minute escalation post, opt-out alerts
 	# 14-day follow-up (src/lending/ghl_call_import.py): record calls made in GoHighLevel in lending.call_dispositions
@@ -1143,6 +1152,20 @@ class AppSettings(BaseSettings):
 	# Email fallback (B4) stays off until hello@nextdeallending.com has a sender behind it
 	# (Porkbun DNS + Google Workspace are not provisioned). Off = recorded as skipped, never "sent".
 	booking_reminder_email_enabled: bool = Field(default=False, env="BOOKING_REMINDER_EMAIL_ENABLED")
+	# Reschedule link added to the 90-minute text and email. Unset or blank = approved wording unchanged.
+	lending_reschedule_url: Optional[str] = Field(default=None, env="LENDING_RESCHEDULE_URL")
+
+	@field_validator("lending_reschedule_url", mode="before")
+	@classmethod
+	def _https_reschedule_url(cls, value):
+		if value is None:
+			return None
+		url = str(value).strip()
+		if not url:
+			return None
+		if not url.startswith("https://") or any(c.isspace() for c in url):
+			raise ValueError("LENDING_RESCHEDULE_URL must be a single https:// URL")
+		return url
 	# Verified GHL sending address for those emails (hello@nextdeallending.com). Unset = no email sender.
 	lending_ghl_email_from: Optional[str] = Field(default=None, env="LENDING_GHL_EMAIL_FROM")
 	# Logs the key paths (never values) of each incoming lending GHL webhook, to confirm the real field names.
