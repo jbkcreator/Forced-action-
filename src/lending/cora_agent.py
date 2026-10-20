@@ -34,13 +34,14 @@ from packages.agent_core.config import AgentCoreConfig, parse_user_ids
 from packages.agent_core.halt import AgentHalted, HaltSwitch
 from packages.agent_core.memory import AgentMemory
 from packages.agent_core.pending_actions import PendingAction, PendingActionQueue
-from packages.agent_core.relay import EgressExecutor, Relay, SendCheck
+from packages.agent_core.relay import EgressExecutor, Relay, SendCheck, SendDeferred
 from packages.agent_core.revision import DraftReviser, RevisionFailed
 from packages.agent_core.send_gate import SendGate
 from packages.agent_core.slack_session import InboundMessage, SlackSession, run_socket_mode
 from packages.agent_core.store import AgentStore
 from packages.agent_core.thread_history import build_history
 from packages.agent_core.tools import ToolContext, ToolRegistry
+from src.lending.compliance import text_window_open
 from src.lending.consent import has_text_consent
 from src.lending.cora_channels import ChannelDirectory
 from src.lending.cora_inbox import format_inbox_context, items_on_post, surface_new_items
@@ -149,8 +150,13 @@ def build_config(settings: AppSettings) -> AgentCoreConfig:
     )
 
 
-def make_send_check(engine: Engine) -> SendCheck:
-    """Lending rule run by the relay right before a send. Returns a reason to block, or None."""
+def make_send_check(engine: Engine, *, carrier_approved: bool = False,
+                    text_window: Callable[[str], bool] = text_window_open) -> SendCheck:
+    """Lending rule run by the relay right before a send. Returns a reason to block, or None.
+
+    A text also waits for the carrier (10DLC) approval (LENDING_SMS_CARRIER_APPROVED) and for the borrower's
+    8am-8pm window: both are deferrals, so an approved text stays approved and sends on a later sweep once both
+    hold, or is blocked when the draft expires first."""
 
     def check(action: PendingAction) -> Optional[str]:
         phone = normalize(action.recipient_phone) if action.recipient_phone else None
@@ -162,6 +168,11 @@ def make_send_check(engine: Engine) -> SendCheck:
                 return "recipient is suppressed or marked do-not-contact"
             if action.channel in SMS_CHANNELS and not (phone and has_text_consent(conn, phone)):
                 return "no text consent on record for this number"
+        if action.channel in SMS_CHANNELS:
+            if not carrier_approved:
+                return SendDeferred("texting is not approved by the carrier yet (10DLC)")
+            if not text_window(phone):
+                return SendDeferred("outside the borrower's 8am-8pm text window")
         return None
 
     return check
@@ -408,7 +419,8 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
 
     store = AgentStore(engine, config.db_schema)
     services = build_session(config, store, chat,
-                             bot_user_id, messages_client=messages_client, send_check=make_send_check(engine),
+                             bot_user_id, messages_client=messages_client, send_check=make_send_check(
+                                 engine, carrier_approved=settings.lending_sms_carrier_approved),
                              toolkit_factory=toolkit_factory, inbox_context=make_inbox_context(engine),
                              executors=build_egress_executors(), extension=RoutingSlack(web))
     digest = make_inbox_digest(engine, chat, config.slack_channel_id, channel_ids)

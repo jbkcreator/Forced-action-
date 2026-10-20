@@ -20,7 +20,15 @@ logger = logging.getLogger(__name__)
 
 # Receives the frozen payload, performs the send, returns the provider's message id (or None).
 EgressExecutor = Callable[[Mapping[str, Any]], "str | None"]
-# Returns None when the send may go ahead, or a short reason (no PII) when it must be blocked.
+
+
+class SendDeferred(str):
+    """A send-check reason meaning "not yet" (a time window, a pending approval): the action stays approved and
+    a later sweep tries again, until the action's expiry, when it is blocked."""
+
+
+# Returns None when the send may go ahead, or a short reason (no PII) when it must be blocked; a
+# :class:`SendDeferred` reason holds the send for a later sweep instead.
 SendCheck = Callable[[PendingAction], "str | None"]
 
 
@@ -31,6 +39,7 @@ class DispatchOutcome(str, Enum):
     # failed (never retried), but reported apart so an expected gap does not read as an error.
     NOT_ENABLED = "not_enabled"
     BLOCKED = "blocked"
+    DEFERRED = "deferred"
     NOT_CLAIMED = "not_claimed"
 
 
@@ -46,6 +55,7 @@ class RelayResult:
     failed: tuple[int, ...]
     blocked: tuple[int, ...]
     not_claimed: tuple[int, ...]
+    deferred: tuple[int, ...] = ()
 
 
 class Relay:
@@ -83,7 +93,15 @@ class Relay:
             self._queue.mark_failed(action_id, reason)
             return DispatchResult(DispatchOutcome.NOT_ENABLED, reason)
 
-        reason = self._blocking_reason(action)
+        # An expired draft never sends, whatever the send check says (a deferred send may clear only after it).
+        if action.expires_at is not None and action.expires_at <= self._queue.now():
+            reason: str | None = "the draft expired before it could be sent"
+        else:
+            reason = self._blocking_reason(action)
+        if isinstance(reason, SendDeferred):
+            self._queue.release_claim(action_id)
+            logger.debug("relay: action %s held for a later sweep: %s", action_id, reason)
+            return DispatchResult(DispatchOutcome.DEFERRED, reason)
         if reason is not None:
             logger.warning("relay: action %s blocked at send time: %s", action_id, reason)
             self._queue.mark_blocked(action_id, reason)
@@ -112,4 +130,5 @@ class Relay:
             failed=tuple(buckets[DispatchOutcome.FAILED] + buckets[DispatchOutcome.NOT_ENABLED]),
             blocked=tuple(buckets[DispatchOutcome.BLOCKED]),
             not_claimed=tuple(buckets[DispatchOutcome.NOT_CLAIMED]),
+            deferred=tuple(buckets[DispatchOutcome.DEFERRED]),
         )

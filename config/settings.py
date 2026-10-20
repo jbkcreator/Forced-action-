@@ -948,6 +948,10 @@ class AppSettings(BaseSettings):
 	# T-09 intro SMS. Off: the tag that starts the GHL intro workflow is never added, so nobody is texted. Turn on only after
 	# Josh confirms LendingFlow's consent and DNC check. Needs the id of the GHL contact custom field "intro_name".
 	lending_intro_sms_enabled: bool = Field(default=False, env="LENDING_INTRO_SMS_ENABLED")
+	# After-hours voicemail / answering-service intake (POST /webhooks/lending/after-hours-intake); closed (503) while off
+	lending_after_hours_intake_enabled: bool = Field(default=False, env="LENDING_AFTER_HOURS_INTAKE_ENABLED")
+	# Carrier (10DLC) approval for lending texts Cora sends after Approve; until true an approved text waits (then blocks at expiry)
+	lending_sms_carrier_approved: bool = Field(default=False, env="LENDING_SMS_CARRIER_APPROVED")
 	lending_ghl_cf_intro_name: Optional[str] = Field(default=None, env="LENDING_GHL_CF_INTRO_NAME")
 	# T-12 background enrichment card + routing. Off: no card is built, the deal-facts webhook returns 503.
 	lending_enrichment_enabled: bool = Field(default=False, env="LENDING_ENRICHMENT_ENABLED")

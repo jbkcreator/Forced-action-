@@ -24,6 +24,7 @@ from typing import Any, Optional
 
 from sqlalchemy import text
 
+from src.lending.after_hours_intake import record_intake
 from src.lending.cora_inbox import add_to_inbox_in_own_session
 from src.lending.db import lending_session
 from src.lending.ghl_consent_events import (
@@ -39,11 +40,14 @@ logger = logging.getLogger(__name__)
 
 GHL_OPT_OUT = "ghl_opt_out"
 GHL_TEXT_CONSENT = "ghl_text_consent"
+AFTER_HOURS_INTAKE = "after_hours_intake"
 ENDPOINT_HANDLERS: dict[str, Callable[[Any, dict[str, Any]], Any]] = {
     GHL_OPT_OUT: record_ghl_opt_out,
     GHL_TEXT_CONSENT: record_inbound_consent,
+    AFTER_HOURS_INTAKE: record_intake,  # a replay keeps the original call id, so it never pins twice
 }
-ENDPOINT_LABELS = {GHL_OPT_OUT: "opt-out (DND changed)", GHL_TEXT_CONSENT: "inbound text / consent"}
+ENDPOINT_LABELS = {GHL_OPT_OUT: "opt-out (DND changed)", GHL_TEXT_CONSENT: "inbound text / consent",
+                   AFTER_HOURS_INTAKE: "after-hours voicemail"}
 MAX_RETRY_ATTEMPTS = 5
 RETRY_BATCH_SIZE = 50
 
@@ -98,7 +102,7 @@ def report_webhook_failure(endpoint: str, body: dict[str, Any], error: BaseExcep
                    f"Saved as #{failure_id}; it is retried automatically every 5 minutes.")
     else:
         message = (f":rotating_light: GHL {_label(endpoint)} webhook failed ({error_name}) for GHL contact {contact}, "
-                   "and it could not be saved for retry. This opt-out or consent change is NOT recorded: re-run the "
+                   "and it could not be saved for retry. This event is NOT recorded: re-run the "
                    "GHL workflow for this contact once the database is healthy.")
     logger.error("[lending-webhook-failure] %s failed for contact %s: %s (saved=%s)", endpoint, contact, error_name,
                  failure_id)
@@ -154,7 +158,7 @@ def _retry_one(db, row, result: RetryResult) -> None:
         result.alerts.append(
             f":rotating_light: GHL {_label(row.endpoint)} webhook #{row.id} for GHL contact "
             f"{row.ghl_contact_id or 'unknown'} still fails after {attempts} attempt(s) ({error}). It is no longer "
-            "retried: this opt-out or consent change is NOT recorded. Check it and re-run the GHL workflow.")
+            "retried: this event is NOT recorded. Check it and re-run the GHL workflow.")
         result.gave_up_events.append({"webhook_failure_id": row.id, "endpoint": row.endpoint,
                                       "ghl_contact_id": row.ghl_contact_id, "attempts": attempts, "error": error})
     else:
