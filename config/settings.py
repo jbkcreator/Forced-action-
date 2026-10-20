@@ -943,6 +943,8 @@ class AppSettings(BaseSettings):
 	lending_intro_sms_enabled: bool = Field(default=False, env="LENDING_INTRO_SMS_ENABLED")
 	# T-06 after-hours voicemail / answering-service intake (POST /webhooks/lending/after-hours-intake); closed (503) while off
 	lending_after_hours_intake_enabled: bool = Field(default=False, env="LENDING_AFTER_HOURS_INTAKE_ENABLED")
+	# Carrier (10DLC) approval for lending texts sent by Cora after Approve (split Q-33); fail closed until confirmed
+	lending_sms_carrier_approved: bool = Field(default=False, env="LENDING_SMS_CARRIER_APPROVED")
 	lending_ghl_cf_intro_name: Optional[str] = Field(default=None, env="LENDING_GHL_CF_INTRO_NAME")
 	# T-12 background enrichment card + routing. Off: no card is built, the deal-facts webhook returns 503.
 	lending_enrichment_enabled: bool = Field(default=False, env="LENDING_ENRICHMENT_ENABLED")

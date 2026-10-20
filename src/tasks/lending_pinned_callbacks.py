@@ -1,9 +1,10 @@
-"""Post the after-hours voicemail callers to call first, at 08:55 ET (split T-06, Runbook §5.3 Layer 2).
+"""08:55 ET: draft the after-hours voicemail replies and post who to call first (split T-06, Runbook §5.3 Layer 2).
 
-A caller who left an after-hours voicemail is pinned (``src.lending.after_hours_intake``). This posts, once a morning
-before the 09:00 shift, every contact still pinned: not called back yet and within its 24-hour pin. Goes to Cora's
-channel (``LENDING_CORA_CHANNEL``) with Cora's bot token, where the reply drafts wait for Approve. Cron fires at 12:55
-and 13:55 UTC; only the one that is 8:xx ET acts.
+A caller who left an after-hours voicemail is pinned (``src.lending.after_hours_intake``). Once a morning, before the
+09:00 shift, this takes every contact still pinned (not called back yet, within its 24-hour pin), queues a reply
+draft for Approve for each one with text consent (Cora's sweep posts the card within a minute), and posts the list
+to Cora's channel (``LENDING_CORA_CHANNEL``, Cora's bot token). A caller without text consent is listed as call-only.
+Cron fires at 12:55 and 13:55 UTC; only the one that is 8:xx ET acts. A rerun queues no second draft.
 
 Shows the last four digits of the phone only, never the full number.
 """
@@ -11,35 +12,46 @@ from __future__ import annotations
 
 import argparse
 import logging
-from datetime import datetime, timezone
-from typing import Any, Mapping, Optional, Sequence
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Sequence
 
 from config.lending_after_hours import MORNING_POST_HOUR_ET
 from config.lending_reminders import TIMEZONE
-from config.settings import get_settings
-from src.lending.after_hours_intake import active_pins
+from config.settings import AppSettings, get_settings
+from packages.agent_core.pending_actions import PendingActionQueue
+from packages.agent_core.store import AgentStore
+from src.lending.after_hours_intake import MorningReply, draft_morning_replies, model_drafter, pins_to_call
 from src.lending.db import lending_session
+from src.lending.models import LENDING_SCHEMA
 
 logger = logging.getLogger(__name__)
 
 
-def _line(row: Mapping[str, Any]) -> str:
-    left = row["pinned_at"].astimezone(TIMEZONE)
-    return (f"• contact:{row['id']} (…{row['phone'][-4:]}): voicemail {left:%a} "
-            f"{left.hour % 12 or 12}:{left:%M} {'am' if left.hour < 12 else 'pm'} ET")
+def _line(reply: MorningReply) -> str:
+    event = reply.pin.event
+    left = event.received_at.astimezone(TIMEZONE)
+    status = "reply draft waiting for Approve" if reply.action_id else "no text consent, call only"
+    return (f"• {event.first_name or 'Caller'} ({reply.pin.lead_ref}, …{event.phone[-4:]}): voicemail {left:%a} "
+            f"{left.hour % 12 or 12}:{left:%M} {'am' if left.hour < 12 else 'pm'} ET — {status}")
 
 
-def format_slack(rows: Sequence[Mapping[str, Any]]) -> Optional[str]:
+def format_slack(replies: Sequence[MorningReply]) -> Optional[str]:
     """The Slack message, or None when nobody is pinned."""
-    if not rows:
+    if not replies:
         return None
-    return (f"*Call these first ({len(rows)}): after-hours voicemails*\n" + "\n".join(_line(row) for row in rows)
-            + "\nTheir reply texts are waiting for Approve in this channel.")
+    return f"*Call these first ({len(replies)}): after-hours voicemails*\n" + "\n".join(map(_line, replies))
+
+
+def _drafter(settings: AppSettings):
+    import anthropic  # loaded only when there is something to draft
+
+    client = anthropic.Anthropic(api_key=settings.anthropic_api_key.get_secret_value(), timeout=30.0, max_retries=1)
+    return model_drafter(client.messages, settings.lending_cora_model)
 
 
 def main(argv=None, *, now: Optional[datetime] = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--force", action="store_true", help="post regardless of the ET hour")
+    parser.add_argument("--force", action="store_true", help="run regardless of the ET hour")
     args = parser.parse_args(argv)
     now = now or datetime.now(timezone.utc)
     if now.astimezone(TIMEZONE).hour != MORNING_POST_HOUR_ET and not args.force:
@@ -47,20 +59,23 @@ def main(argv=None, *, now: Optional[datetime] = None) -> int:
     settings = get_settings()
     channel, token = settings.lending_cora_channel, settings.lending_cora_slack_bot_token
     if not (channel and token):
-        logger.error("[pinned-callbacks] not posted: LENDING_CORA_CHANNEL or LENDING_CORA_SLACK_BOT_TOKEN is not set")
+        logger.error("[pinned-callbacks] not run: LENDING_CORA_CHANNEL or LENDING_CORA_SLACK_BOT_TOKEN is not set")
         return 1
     try:
         with lending_session() as db:
-            message = format_slack(active_pins(db, now))
-        if message is None:
-            logger.info("[pinned-callbacks] no pinned callers")
-            return 0
+            pins = pins_to_call(db, now)
+            if not pins:
+                logger.info("[pinned-callbacks] no pinned callers")
+                return 0
+            queue = PendingActionQueue(AgentStore(db.get_bind(), LENDING_SCHEMA),
+                                       default_ttl=timedelta(hours=settings.lending_cora_pending_action_ttl_hours))
+            message = format_slack(draft_morning_replies(db, pins, queue, _drafter(settings)))
         from slack_sdk import WebClient
         WebClient(token=token.get_secret_value()).chat_postMessage(channel=channel, text=message)
     except Exception as exc:  # class only: rows carry phone digits
-        logger.error("[pinned-callbacks] post failed (%s)", type(exc).__name__)
+        logger.error("[pinned-callbacks] run failed (%s)", type(exc).__name__)
         return 1
-    logger.info("[pinned-callbacks] posted")
+    logger.info("[pinned-callbacks] posted %s pinned caller(s)", len(pins))
     return 0
 
 

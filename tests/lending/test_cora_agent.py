@@ -247,8 +247,20 @@ def _action(channel: str = "ghl_sms", phone: str | None = "(727) 555-0100", emai
 
 def test_consented_unsuppressed_text_may_send() -> None:
     engine = ScriptedEngine(False, True)
-    assert cora_agent.make_send_check(engine)(_action()) is None
+    check = cora_agent.make_send_check(engine, carrier_approved=True, text_window=lambda phone: True)
+    assert check(_action()) is None
     assert engine.queries[0]["p"] == "+17275550100"
+
+
+def test_text_waits_for_carrier_approval() -> None:
+    reason = cora_agent.make_send_check(ScriptedEngine(False, True), text_window=lambda phone: True)(_action())
+    assert reason == "texting is not approved by the carrier yet (10DLC)"
+
+
+def test_text_outside_the_borrower_window_is_blocked() -> None:
+    check = cora_agent.make_send_check(ScriptedEngine(False, True), carrier_approved=True,
+                                       text_window=lambda phone: False)
+    assert check(_action()) == "outside the borrower's 8am-8pm text window"
 
 
 def test_suppressed_recipient_is_blocked() -> None:

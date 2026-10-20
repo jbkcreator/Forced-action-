@@ -40,6 +40,7 @@ from packages.agent_core.slack_session import InboundMessage, SlackSession, run_
 from packages.agent_core.store import AgentStore
 from packages.agent_core.thread_history import build_history
 from packages.agent_core.tools import ToolContext, ToolRegistry
+from src.lending.compliance import text_window_open
 from src.lending.consent import has_text_consent
 from src.lending.cora_prompt import CORA_BASE_PROMPT, REVISION_PROMPT
 from src.lending.cora_tools import CoraToolkit, draft_content_check
@@ -100,8 +101,12 @@ def build_config(settings: AppSettings) -> AgentCoreConfig:
     )
 
 
-def make_send_check(engine: Engine) -> SendCheck:
-    """Lending rule run by the relay right before a send. Returns a reason to block, or None."""
+def make_send_check(engine: Engine, *, carrier_approved: bool = False,
+                    text_window: Callable[[str], bool] = text_window_open) -> SendCheck:
+    """Lending rule run by the relay right before a send. Returns a reason to block, or None.
+
+    A text also needs the carrier (10DLC) approval (split Q-33, LENDING_SMS_CARRIER_APPROVED) and the borrower's
+    8am-8pm window; both fail closed."""
 
     def check(action: PendingAction) -> Optional[str]:
         phone = normalize(action.recipient_phone) if action.recipient_phone else None
@@ -113,6 +118,11 @@ def make_send_check(engine: Engine) -> SendCheck:
                 return "recipient is suppressed or marked do-not-contact"
             if action.channel in SMS_CHANNELS and not (phone and has_text_consent(conn, phone)):
                 return "no text consent on record for this number"
+        if action.channel in SMS_CHANNELS:
+            if not carrier_approved:
+                return "texting is not approved by the carrier yet (10DLC)"
+            if not text_window(phone):
+                return "outside the borrower's 8am-8pm text window"
         return None
 
     return check
@@ -275,7 +285,8 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
     messages_client: MessagesClient = anthropic.Anthropic(
         api_key=config.anthropic_api_key, timeout=90.0, max_retries=2).messages
     services = build_session(config, AgentStore(engine, config.db_schema), SlackChatPort(web, config.slack_channel_id),
-                             bot_user_id, messages_client=messages_client, send_check=make_send_check(engine))
+                             bot_user_id, messages_client=messages_client, send_check=make_send_check(
+                                 engine, carrier_approved=settings.lending_sms_carrier_approved))
     return services._replace(web_client=web)
 
 
