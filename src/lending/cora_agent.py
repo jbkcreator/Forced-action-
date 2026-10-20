@@ -45,6 +45,7 @@ from src.lending.consent import has_text_consent
 from src.lending.cora_prompt import CORA_BASE_PROMPT, REVISION_PROMPT
 from src.lending.cora_tools import CoraToolkit, draft_content_check
 from src.lending.models import LENDING_SCHEMA
+from src.lending.routing.slack_extension import RoutingSlack
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
@@ -210,7 +211,8 @@ class CoraConversation:
 
 def build_session(config: AgentCoreConfig, store: AgentStore, chat: ChatPort, bot_user_id: str, *,
                   messages_client: MessagesClient, send_check: Optional[SendCheck] = None,
-                  toolkit_factory: Callable[[Engine, AgentMemory], Any] = CoraToolkit) -> CoraServices:
+                  toolkit_factory: Callable[[Engine, AgentMemory], Any] = CoraToolkit,
+                  extension: Any = None) -> CoraServices:
     """Wire Cora. ``toolkit_factory(engine, memory)`` builds the tool set; tests swap the lead lookups."""
     queue = PendingActionQueue(store, default_ttl=timedelta(hours=config.pending_action_ttl_hours))
     halt = HaltSwitch(store, config.agent_name)
@@ -230,7 +232,7 @@ def build_session(config: AgentCoreConfig, store: AgentStore, chat: ChatPort, bo
     conversation = CoraConversation(config=config, chat=chat, loop=loop, reviser=reviser, bot_user_id=bot_user_id)
     session = SlackSession(config=config, chat=chat, queue=queue, halt=halt, relay=relay,
                            on_message=conversation.on_message, on_revision=conversation.on_revision,
-                           bot_user_id=bot_user_id)
+                           bot_user_id=bot_user_id, extension=extension)
     return CoraServices(session, relay, gate)
 
 
@@ -287,7 +289,8 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
         api_key=config.anthropic_api_key, timeout=90.0, max_retries=2).messages
     services = build_session(config, AgentStore(engine, config.db_schema), SlackChatPort(web, config.slack_channel_id),
                              bot_user_id, messages_client=messages_client, send_check=make_send_check(
-                                 engine, carrier_approved=settings.lending_sms_carrier_approved))
+                                 engine, carrier_approved=settings.lending_sms_carrier_approved),
+                             extension=RoutingSlack(web))
     return services._replace(web_client=web)
 
 

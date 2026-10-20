@@ -919,6 +919,9 @@ class AppSettings(BaseSettings):
 	lending_prequal_range_pct: int = Field(default=10, env="LENDING_PREQUAL_RANGE_PCT")
 	# Sender of the pre-qual email. Set a verified Next Deal Lending mailbox before enabling; unset = GHL's shared address.
 	lending_prequal_email_from: Optional[str] = Field(default=None, env="LENDING_PREQUAL_EMAIL_FROM")
+	# P-1 Partner Door. The form will not open until Josh's consent wording is set here (shown verbatim, stored on each file).
+	lending_partner_consent_text: str = Field(default="", env="LENDING_PARTNER_CONSENT_TEXT")
+	lending_partner_upload_dir: str = Field(default="data/partner_uploads", env="LENDING_PARTNER_UPLOAD_DIR")  # uploads + generated pre-qual PDFs
 	# Shared secret the GHL "DND changed" workflow sends in X-Webhook-Secret. Unset = endpoint closed.
 	lending_ghl_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_GHL_WEBHOOK_SECRET")
 	lending_ghl_sms_from_number: Optional[str] = Field(default=None, env="LENDING_GHL_SMS_FROM_NUMBER")  # E.164; the GHL SMS number (texting only). Calls run through BatchDialer on a different number
@@ -962,6 +965,7 @@ class AppSettings(BaseSettings):
 	lending_dial_tasks_channel: str = Field(default="", env="LENDING_DIAL_TASKS_CHANNEL")
 	lending_replies_channel: str = Field(default="", env="LENDING_REPLIES_CHANNEL")  # WP-GL-10 rate/terms handoffs; channel ID, the Cora Lending bot must be a member
 	lending_daily_channel: str = Field(default="", env="LENDING_DAILY_CHANNEL")  # 7pm scoreboard; channel ID
+	lending_partner_channel: str = Field(default="", env="LENDING_PARTNER_CHANNEL")  # P-1 partner file cards (#ndl-partner-deals); Cora Lending bot must be a member; unset = no card
 	# T-10 uncalled-lead alarms (src/lending/uncalled_alarm_worker.py)
 	lending_uncalled_alarms_enabled: bool = Field(default=False, env="LENDING_UNCALLED_ALARMS_ENABLED")
 	lending_alarm_sms_to: Optional[str] = Field(default=None, env="LENDING_ALARM_SMS_TO")  # Josh's mobile; normalized before use
