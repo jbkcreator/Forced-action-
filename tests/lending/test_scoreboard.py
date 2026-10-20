@@ -71,7 +71,7 @@ def test_inbound_and_other_days_excluded(lending_db):
 def test_slack_text_names_every_column(lending_db):
     _call(lending_db, "1", disp="BOOKED")
     out = format_slack(build_scoreboard(lending_db, DAY, NAMES), DAY)
-    for word in ("Dials", "Contacts", "2+ min", "Gated", "Booked", "Transfers", "Showed", "Show rate", "Nurture", "Connect", "Book rate"):
+    for word in ("Dials", "Contacts", "Calls 2+ min", "Gated", "Booked", "Transfers", "Showed", "Held ÷ Booked", "Nurture", "Connect", "Book rate"):
         assert word in out
     assert "Showed 0" in out
 

@@ -84,7 +84,8 @@ LONG_CONVERSATION_SECONDS = 120  # "2+ min conversations": talk time of at least
 # Codes that count as a transfer to Josh. Empty on purpose: the dialer records no transfer yet, so the
 # Transfers column shows n/a until a code is added here and to DISPOSITIONS.
 TRANSFER_CODES: frozenset[str] = frozenset()
-HOURLY_POST_HOURS_ET = tuple(range(10, 20))  # hourly posts at 10:00 through 19:00 ET, inside the 09:00-19:15 calling window
+# Hourly posts at 10:00 through 18:00 ET. 19:00 is left out: the 7:20pm closing board is that hour's post.
+HOURLY_POST_HOURS_ET = tuple(range(10, 19))
 
 # Sheet columns. Held / Gate Passed / Packet are added when WP-GL-5/6 write them.
 SHEET_COLUMNS = (

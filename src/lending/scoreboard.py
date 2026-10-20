@@ -45,7 +45,8 @@ class Row:
 
     @property
     def show_rate(self) -> Optional[float]:
-        """Showed (Held) / Booked; None when nothing was booked, so there is no division."""
+        """Held today / Booked today; None when nothing was booked, so there is no division. The two counts are
+        different calls (a call held today may have been booked on an earlier day), so this is not a conversion rate."""
         return self.showed / self.booked if self.booked else None
 
     @property
@@ -166,12 +167,15 @@ def build_scoreboard(db, day: date, campaign_names: Optional[Mapping[str, str]] 
 
 
 _COLUMNS = ("Dials", "Contacts", "2m+", "Gated", "Booked", "Xfer", "Showed", "Show%", "Nurture", "Connect", "Book rate")
+_XFER = _COLUMNS.index("Xfer")
 _NUMBER_COLUMNS = ("Dials", "Answered", "Answer rate")
 MAX_TABLE_ROWS = 20  # a Slack section holds 3000 chars
 MAX_NAME_CHARS = 26
-LEGEND = ("Contacts = real conversation · 2m+ = conversations of 2+ min · Gated = booked or failed the gate · "
-          "Xfer = transferred to Josh (n/a until the dialer records transfers) · Nurture = nurture sent · "
-          "Showed = moved to Held in GHL, credited to the caller who booked it · Show% = Showed ÷ Booked · "
+LEGEND = ("Contacts = real conversation · 2m+ = calls with 2+ min of talk time, any result (incl. long voicemails) · "
+          "Gated = booked or failed the gate · "
+          "Xfer = transferred to Josh (in the totals only, n/a until the dialer records transfers) · Nurture = nurture sent · "
+          "Showed = moved to Held in GHL today, credited to the caller who booked it · "
+          "Show% = Held today ÷ Booked today (different calls, not a conversion rate) · "
           "Connect = Contacts ÷ Dials · Book rate = Booked ÷ Contacts")
 TOTALS_PER_SECTION = 6  # a Slack section holds at most 10 fields
 
@@ -184,9 +188,15 @@ def _show_rate(r: Row) -> str:
     return f"{r.show_rate:.0%}" if r.show_rate is not None else "–"
 
 
+def _table_columns() -> tuple[str, ...]:
+    """Xfer is left out of the per-section tables while it can only show n/a: it keeps them narrow on Slack mobile."""
+    return _COLUMNS if TRANSFER_CODES else _COLUMNS[:_XFER] + _COLUMNS[_XFER + 1:]
+
+
 def _cells(r: Row) -> list[str]:
-    return [str(r.dials), str(r.live), str(r.long_calls), str(r.gated), str(r.booked), _transfers(r.transfers),
-            str(r.showed), _show_rate(r), str(r.nurture), f"{r.connect_rate:.0%}", f"{r.book_rate:.0%}"]
+    cells = [str(r.dials), str(r.live), str(r.long_calls), str(r.gated), str(r.booked), _transfers(r.transfers),
+             str(r.showed), _show_rate(r), str(r.nurture), f"{r.connect_rate:.0%}", f"{r.book_rate:.0%}"]
+    return cells if TRANSFER_CODES else cells[:_XFER] + cells[_XFER + 1:]
 
 
 def _number_cells(r: NumberRow) -> list[str]:
@@ -215,7 +225,7 @@ def _table(label: str, rows: list[Row]) -> str:
     if not rows:
         return "_no dials_"
     shown = rows[:MAX_TABLE_ROWS]
-    return _render(label, _COLUMNS, [r.name for r in shown], [_cells(r) for r in shown], len(rows))
+    return _render(label, _table_columns(), [r.name for r in shown], [_cells(r) for r in shown], len(rows))
 
 
 def _number_table(rows: list[NumberRow]) -> str:
@@ -239,9 +249,9 @@ def _title(day: date) -> str:
 
 
 def _totals(t: Row) -> list[tuple[str, str]]:
-    return [("Dials", str(t.dials)), ("Contacts", str(t.live)), ("2+ min", str(t.long_calls)), ("Gated", str(t.gated)),
-            ("Booked", str(t.booked)), ("Transfers", _transfers(t.transfers)), ("Showed", str(t.showed)),
-            ("Show rate", _show_rate(t)), ("Nurture", str(t.nurture)), ("Connect", f"{t.connect_rate:.0%}"),
+    return [("Dials", str(t.dials)), ("Contacts", str(t.live)), ("Calls 2+ min", str(t.long_calls)),
+            ("Gated", str(t.gated)), ("Booked", str(t.booked)), ("Transfers", _transfers(t.transfers)),
+            ("Showed", str(t.showed)), ("Held ÷ Booked", _show_rate(t)), ("Nurture", str(t.nurture)), ("Connect", f"{t.connect_rate:.0%}"),
             ("Book rate", f"{t.book_rate:.0%}")]
 
 

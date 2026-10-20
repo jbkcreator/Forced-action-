@@ -18,29 +18,32 @@ QUIET_START_HOUR = 8
 QUIET_END_HOUR = 20
 STALE_SENDING_SECONDS = 300
 
-# Josh's booking calendar, added to every missed-call text (launch runbook, Line 9).
+# Josh's booking calendar (launch runbook, Line 9). Added to the missed-call texts only while
+# LENDING_TEXT_BACK_BOOKING_LINK_ENABLED is on: a link in a text can be filtered by carriers unless the 10DLC
+# campaign declares embedded links, and the line is an addition to the approved wording below.
 BOOKING_LINK = "https://api.leadconnectorhq.com/widget/bookings/josh-kantor"
+BOOKING_LINE = "Book a time: " + BOOKING_LINK + " "
 
 # Client-approved wording (questionnaire F2: "Option 1 for Verified maturity, Option 2 for Transaction
 # ready and Builders, Option 3 for Nurture and anything without an address"). Verbatim except the
-# greeting, which is "Hi <first name>" or just "Hi" when the borrower has no usable first name, and the
-# "Book a time" line with BOOKING_LINK before the STOP language.
+# greeting, which is "Hi <first name>" or just "Hi" when the borrower has no usable first name, and
+# {booking}: BOOKING_LINE before the STOP language when the booking link is on, otherwise empty.
 TEMPLATES: dict[str, str] = {
     "maturity": (
         "{greeting}, it's {caller} with Josh Kantor, Loan Officer. Sorry I missed you. "
         "I was calling about the loan on {property}. "
         "Call or text me back at {number} when it suits you. "
-        "Book a time: " + BOOKING_LINK + " Reply STOP to opt out."
+        "{booking}Reply STOP to opt out."
     ),
     "deal_drop": (
         "{greeting}, {caller} with Josh Kantor, Loan Officer here. Just tried you about {property}. "
         "We help investors in {county} fund their next deal. Text back if you'd like to chat. "
-        "Book a time: " + BOOKING_LINK + " Reply STOP to opt out."
+        "{booking}Reply STOP to opt out."
     ),
     "general": (
         "{greeting}, this is {caller} with Josh Kantor, Loan Officer. Sorry we missed each other. "
         "Reply here or call {number} whenever works. "
-        "Book a time: " + BOOKING_LINK + " Reply STOP to opt out."
+        "{booking}Reply STOP to opt out."
     ),
 }
 GENERAL = "general"
