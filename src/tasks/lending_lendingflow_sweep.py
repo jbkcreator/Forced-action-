@@ -18,12 +18,17 @@ from sqlalchemy import text
 
 from config.lending_lendingflow import GHL_ALERT_AFTER_MINUTES, GHL_GIVE_UP_AFTER_HOURS, SWEEP_BATCH_SIZE
 from config.settings import get_settings
+from src.lending import lendingflow_events
 from src.lending.db import lending_session
+from src.lending.lead_arrival_alert import alert_josh
 from src.lending.disposition_delivery import _configured_slack, _slack_client
 from src.lending.lendingflow import deliver_and_follow_up, release_held_and_commit
 from src.lending.lendingflow_ghl import get_live_sink
 
 logger = logging.getLogger(__name__)
+
+# T-05: a lead this sweep gets into GHL alerts Josh too (the event fires in this process, not lending-api).
+lendingflow_events.subscribe(alert_josh)
 
 
 def alert_undelivered(slack_client: Any = None, minutes: Optional[int] = None) -> int:

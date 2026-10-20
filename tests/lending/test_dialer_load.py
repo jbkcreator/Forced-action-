@@ -275,6 +275,24 @@ class TestLiveLoad:
         assert report.suppressed_mid_run == 1
         assert [r.reason for r in _exclusions(db)] == ["SUPPRESSED"]
 
+    def test_an_emergency_halt_set_mid_run_stops_the_remaining_pushes(self, db, monkeypatch):
+        _fresh_scrub(db, P1, P2)
+        aircall = FakeAircall()
+        real_upsert = aircall.upsert_contact
+        halted = [False]
+        monkeypatch.setattr(dialer_load, "is_globally_halted", lambda: halted[0])
+
+        def upsert(phone, *args, **kwargs):
+            result = real_upsert(phone, *args, **kwargs)
+            halted[0] = True  # an approver halts while P1 is being pushed
+            return result
+
+        aircall.upsert_contact = upsert
+        report, _ = _run(db, [_record("a", P1), _record("b", P2)], aircall=aircall)
+        assert aircall.upserts == [P1]
+        assert report.loaded == 1 and report.halted_mid_run == 1
+        assert [r.phone for r in _load_rows(db)] == [P1]  # the contact already in the dialer is still recorded
+
     def test_a_number_that_opts_out_while_it_is_being_pushed_is_pulled_straight_after(self, db):
         _fresh_scrub(db, P1)
         aircall = FakeAircall()

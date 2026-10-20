@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Literal, Optional
@@ -28,6 +28,14 @@ from packages.agent_core.governance import SafetyLevel
 from packages.agent_core.memory import AgentMemory, MemoryFull
 from packages.agent_core.tools import EgressDraft, Tool, ToolContext, ToolInputError
 from src.lending.contracts import BorrowerProfile, LoanRequest
+from src.lending.cora_channels import (
+    MAX_READ_HOURS,
+    MAX_READ_MESSAGES,
+    ChannelDirectory,
+    ChannelUnavailable,
+    SlackChannel,
+)
+from src.lending.cora_inbox import OPEN_STATUSES, close_item, get_item, open_items, slack_safe
 from src.lending.lender_fit import evaluate_lender_fit
 from src.lending.scoreboard import build_scoreboard
 from src.services.phone_utils import normalize
@@ -174,6 +182,28 @@ class DraftPipelineMoveInput(_Input):
     stage: str = Field(..., min_length=2, max_length=100, description="Target stage name in the Booked Calls pipeline.")
 
 
+class InboxListInput(_Input):
+    item_id: Optional[int] = Field(None, ge=1, description="One item by its number (the #41 in a digest). "
+                                                           "Omit to list the open items.")
+
+
+class InboxDismissInput(_Input):
+    item_id: int = Field(..., ge=1, description="The item's number, e.g. 41 for #41.")
+    note: Optional[str] = Field(None, max_length=500, description="Why it is closed, in the approver's words.")
+
+
+class InboxRouteInput(_Input):
+    item_id: int = Field(..., ge=1, description="The item's number, e.g. 41 for #41.")
+    channel: str = Field(..., min_length=1, max_length=80,
+                         description="A channel from list_channels, by name (e.g. replies or #replies).")
+    note: Optional[str] = Field(None, max_length=500, description="Anything the approver asked to add to the post.")
+
+
+class ReadChannelInput(_Input):
+    channel: str = Field(..., min_length=1, max_length=80, description="A channel from list_channels, by name.")
+    hours: int = Field(MAX_READ_HOURS, ge=1, le=MAX_READ_HOURS, description="Look back this many hours.")
+
+
 @dataclass(frozen=True)
 class _Lead:
     ref: str
@@ -181,6 +211,43 @@ class _Lead:
     phone: Optional[str]
     email: Optional[str]
     ghl_contact_id: Optional[str]
+
+
+def _inbox_view(item: Mapping[str, Any]) -> dict[str, Any]:
+    """An inbox item as the model sees it: payloads already hold ids and masked values only."""
+    return {"id": item["id"], "type": item["event_type"], "summary": item["summary"], "status": item["status"],
+            "intended_channel": item["target_channel"], "already_posted_there": item["channel_posted"],
+            "routed_to": item["routed_channel"], "decided_by": item["decided_by"],
+            "decided_at": _iso(item["decided_at"]), "created_at": _iso(item["created_at"]),
+            "details": item["payload"]}
+
+
+def _slack_time(ts: Optional[str]) -> Optional[str]:
+    """A Slack ts as an Eastern-time ISO timestamp."""
+    try:
+        return datetime.fromtimestamp(float(ts), tz=_TZ).isoformat(timespec="minutes") if ts else None
+    except ValueError:
+        return None
+
+
+def _detail_lines(payload: Optional[Mapping[str, Any]]) -> list[str]:
+    """The item's payload as "key: value" lines, so the receiving team gets the ids the original alert carried
+    (an appointment id, a dialer call id, a message key). Payloads hold ids and masked values only."""
+    lines = []
+    for key, value in (payload or {}).items():
+        if value is None or value == "":
+            continue
+        shown = json.dumps(value, default=str, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
+        lines.append(f"{slack_safe(key.replace('_', ' '))}: {slack_safe(shown)}")
+    return lines
+
+
+def _routed_post(item: Mapping[str, Any], note: Optional[str], user_id: str) -> str:
+    lines = [f"*{slack_safe(item['summary'] or 'Inbox item')}*", *_detail_lines(item.get("payload"))]
+    if note:
+        lines.append(slack_safe(note))
+    lines.append(f"_Sent by <@{user_id}> via Cora (inbox #{item['id']})_")
+    return "\n".join(lines)
 
 
 def _last4(phone: Optional[str]) -> Optional[str]:
@@ -260,10 +327,27 @@ def relations_outside_schema(plan: Any, schema: str = "lending") -> set[str]:
 
 class CoraToolkit:
     def __init__(self, engine: Engine, memory: AgentMemory,
-                 campaign_names: Optional[Mapping[str, str]] = None) -> None:
+                 campaign_names: Optional[Mapping[str, str]] = None, *,
+                 channels: Optional[ChannelDirectory] = None,
+                 inbox_session: Optional[Callable[[], AbstractContextManager[Session]]] = None) -> None:
+        """``channels`` is the channels Cora's bot is in: listed, read and routed to. ``inbox_session``
+        overrides where the inbox tools read and write; tests pass their rolled-back session."""
         self._engine = engine
         self._memory = memory
         self._campaign_names = dict(campaign_names or {})
+        self._channels = channels
+        self._inbox_session = inbox_session
+
+    @contextmanager
+    def _inbox(self) -> Iterator[Session]:
+        """A transaction for the inbox tools: committed on success, rolled back if the tool raises."""
+        if self._inbox_session is not None:
+            with self._inbox_session() as session:
+                yield session
+            return
+        with Session(self._engine) as session, session.begin():
+            session.execute(text(f"SET LOCAL statement_timeout = '{STATEMENT_TIMEOUT}'"))
+            yield session
 
     @contextmanager
     def _read_only(self) -> Iterator[Session]:
@@ -432,6 +516,84 @@ class CoraToolkit:
             raise ToolInputError("no active rule has that memory_id")
         return {"memory_id": args.memory_id, "deactivated": True}
 
+    # -- inbox (Cora's digest items) -----------------------------------------------------
+
+    def list_inbox(self, args: InboxListInput, _: ToolContext) -> dict[str, Any]:
+        with self._inbox() as session:
+            if args.item_id is not None:
+                item = get_item(session, args.item_id)
+                if item is None:
+                    raise ToolInputError(f"there is no inbox item #{args.item_id}")
+                return {"items": [_inbox_view(item)]}
+            items = open_items(session, MAX_ROWS)
+        return {"open_items": [_inbox_view(item) for item in items], "count": len(items)}
+
+    def _open_item(self, session: Session, item_id: int) -> dict[str, Any]:
+        item = get_item(session, item_id, for_update=True)
+        if item is None:
+            raise ToolInputError(f"there is no inbox item #{item_id}")
+        if item["status"] not in OPEN_STATUSES:
+            by = f" by <@{item['decided_by']}>" if item["decided_by"] else ""
+            raise ToolInputError(f"#{item_id} is already {item['status']}{by}; nothing changed")
+        return item
+
+    def dismiss_inbox(self, args: InboxDismissInput, context: ToolContext) -> dict[str, Any]:
+        with self._inbox() as session:
+            self._open_item(session, args.item_id)
+            close_item(session, args.item_id, status="dismissed", decided_by=context.user_id, note=args.note)
+        return {"item_id": args.item_id, "status": "dismissed", "note": "confirm it to the user in one line"}
+
+    def route_inbox(self, args: InboxRouteInput, context: ToolContext) -> dict[str, Any]:
+        channel = self._channel(args.channel)
+        if channel.id == self._channels.own_channel_id:
+            raise ToolInputError("that is my own channel, where the item already is; name a team channel")
+        with self._inbox() as session:
+            item = self._open_item(session, args.item_id)
+            if item["channel_posted"] and channel.id == self._channels.key_id(item["target_channel"]):
+                raise ToolInputError(f"#{args.item_id} is already in #{channel.name}; dismiss it if it is handled")
+            close_item(session, args.item_id, status="routed", decided_by=context.user_id, note=args.note,
+                       routed_channel=channel.name)
+            try:  # inside the transaction: a refused post leaves the item open
+                self._channels.post(channel, _routed_post(item, args.note, context.user_id))
+            except Exception as error:
+                raise ToolInputError(f"Slack refused the post ({type(error).__name__}); #{args.item_id} is still "
+                                     "open") from error
+        return {"item_id": args.item_id, "status": "routed", "channel": f"#{channel.name}",
+                "note": "confirm it to the user in one line"}
+
+    # -- channels (the ones Cora's bot is in) ---------------------------------------------
+
+    def _channel(self, reference: str) -> SlackChannel:
+        if self._channels is None:
+            raise ToolInputError("Slack channels are not configured; nothing changed")
+        try:
+            channel = self._channels.resolve(reference)
+        except ChannelUnavailable as error:
+            raise ToolInputError(f"Slack did not return the channel list ({error}); try again shortly") from error
+        if channel is None:
+            raise ToolInputError(f"I am not in a channel called {reference!r}; list_channels shows the ones I "
+                                 "am in, and someone has to invite me to any other")
+        return channel
+
+    def list_channels(self, _: NoInput, __: ToolContext) -> dict[str, Any]:
+        if self._channels is None:
+            raise ToolInputError("Slack channels are not configured")
+        try:
+            channels = self._channels.channels()
+        except ChannelUnavailable as error:
+            raise ToolInputError(f"Slack did not return the channel list ({error}); try again shortly") from error
+        own = self._channels.own_channel_id
+        return {"channels": [{"name": f"#{channel.name}", "purpose": channel.purpose or None,
+                              "private": channel.is_private, "is_my_channel": channel.id == own}
+                             for channel in channels]}
+
+    def read_channel(self, args: ReadChannelInput, _: ToolContext) -> dict[str, Any]:
+        channel = self._channel(args.channel)
+        messages = self._channels.read(channel, hours=args.hours)
+        return {"channel": f"#{channel.name}", "hours": args.hours, "message_count": len(messages),
+                "message_cap": MAX_READ_MESSAGES, "thread_replies_included": False,
+                "messages": [{**message, "ts": _slack_time(message["ts"])} for message in messages]}
+
     # -- drafts (gated) ------------------------------------------------------------------
 
     def _lead(self, lead_ref: str) -> _Lead:
@@ -465,8 +627,8 @@ class CoraToolkit:
         if not lead.email:
             raise ToolInputError(f"{lead.ref} has no email address on record")
         return EgressDraft(channel="ghl_email",
-                           payload={"lead_ref": lead.ref, "to_email": lead.email, "subject": args.subject,
-                                    "body": args.body},
+                           payload={"lead_ref": lead.ref, "to_email": lead.email, "to_phone": lead.phone,
+                                    "subject": args.subject, "body": args.body},
                            summary=f"Email to {lead.name or 'lead'} <{lead.email}>: {args.subject}",
                            recipient_phone=lead.phone, recipient_email=lead.email, contact_ref=lead.ref)
 
@@ -503,6 +665,19 @@ class CoraToolkit:
             Tool("list_standing_rules", "List the standing rules currently in force.", NoInput, read, self.list_rules),
             Tool("deactivate_standing_rule", "Stop applying a standing rule (by memory_id from list_standing_rules).",
                  DeactivateRuleInput, write, self.deactivate_rule, approver_only=True),
+            Tool("list_inbox_items", "Items from Cora's digest (lending alerts, numbered like #41): the open ones, "
+                 "or one item by number with its status and who closed it.", InboxListInput, read, self.list_inbox),
+            Tool("dismiss_inbox_item", "Close a digest item an approver says is handled or not needed. The "
+                 "approver's request is the approval.", InboxDismissInput, write, self.dismiss_inbox,
+                 approver_only=True),
+            Tool("route_inbox_item", "Post a digest item to a team channel I am in (see list_channels) and close it. "
+                 "The approver's request is the approval.", InboxRouteInput, write, self.route_inbox,
+                 approver_only=True),
+            Tool("list_channels", "The Slack channels I am in, with their purpose. Someone has to invite me to a "
+                 "channel before I can read or post there.", NoInput, read, self.list_channels),
+            Tool("read_channel", f"Recent top-level messages in a channel I am in, bot alerts included, oldest "
+                 f"first: at most {MAX_READ_MESSAGES} from the last {MAX_READ_HOURS} hours, no thread replies.",
+                 ReadChannelInput, read, self.read_channel),
             Tool("draft_sms", "Draft a text message to a lead. It is held for approval; nothing is sent until an "
                  "approver clicks Approve.", DraftSmsInput, egress, self.draft_sms),
             Tool("draft_email", "Draft an email to a lead. Held for approval; nothing is sent until approved.",

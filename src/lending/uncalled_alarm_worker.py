@@ -48,6 +48,7 @@ from config.lending_alarms import (
     STALE_SEND_SECONDS,
 )
 from config.settings import get_settings
+from src.lending.cora_inbox import add_to_inbox_safely
 from src.lending.db import lending_session
 from src.lending.ghl_sms import GhlSmsError
 from src.services.phone_utils import normalize
@@ -324,6 +325,19 @@ def _record(db, row: Mapping[str, Any], channel: str, status: str, err: Optional
     return status
 
 
+def _queue_for_cora(db, row: Mapping[str, Any], kind: str, now: datetime, *, slack_sent: bool) -> None:
+    """Raise the escalation in Cora's main thread too; a failed inbox write never undoes the recorded alarm."""
+    fields = _fields(row, now)
+    add_to_inbox_safely(
+        db, event_type="lead_uncalled", dedup_key=str(row["id"]), target_channel="ops", channel_posted=slack_sent,
+        summary=f"LendingFlow lead {fields['ref']}{fields['state']} still {kind.replace('_', ' ')} after "
+                f"{fields['minutes']} min",
+        payload={"kind": kind, "lead_ref": fields["ref"], "first_name": row["first_name"],
+                 "property_state": row["property_state"], "minutes_since_arrival": fields["minutes"],
+                 "ghl_contact_id": row["ghl_contact_id"]},
+    )
+
+
 def _decide(db, row: Mapping[str, Any], *, tick: Clock, sms: Optional[Callable[..., str]], slack: Any,
             ghl_status: Optional[GhlCallStatus], sms_to: Optional[str], ops_channel: str) -> str:
     calls = call_status(db, row, ghl_status)
@@ -350,6 +364,7 @@ def _decide(db, row: Mapping[str, Any], *, tick: Clock, sms: Optional[Callable[.
     for channel in ("sms_300", "slack_300"):
         status, err = _send_channel(channel, row, kind, tick(), **send)
         outcomes.append(_record(db, row, channel, status, err, 0, tick()))
+    _queue_for_cora(db, row, kind, tick(), slack_sent=outcomes[1] == SENT)
     db.commit()
     return f"escalation_{kind}_sms_{outcomes[0]}_slack_{outcomes[1]}"
 
@@ -382,6 +397,19 @@ def _retry_row(db, row: Mapping[str, Any], *, tick: Clock, sms, slack, ghl_statu
             outcomes.append(f"retry_{channel}_{recorded}")
         db.commit()
     return outcomes
+
+
+class MentioningSlack:
+    """Prefixes each alarm post with @-mentions of the approvers (Josh), so the Slack mobile app pushes it to his
+    phone. Until his alarm number (R5) and 10DLC land, the 5-minute Slack post is the only alarm that reaches him."""
+
+    def __init__(self, slack: Any, mention_ids: frozenset[str]) -> None:
+        self._slack = slack
+        self._prefix = " ".join(f"<@{user_id}>" for user_id in sorted(mention_ids))
+
+    def chat_postMessage(self, *, channel: str, text: str, **kwargs: Any) -> Any:
+        body = f"{self._prefix} {text}" if self._prefix else text
+        return self._slack.chat_postMessage(channel=channel, text=body, **kwargs)
 
 
 def process_due(db, *, now: Optional[datetime] = None, clock: Clock = _utcnow, sms: Optional[Callable[..., str]],
@@ -446,9 +474,13 @@ def run_cycle(*, now: Optional[datetime] = None) -> dict[str, int]:
     from src.lending.ghl_sms import get_sender
 
     account = lending_ghl_account()
+    from packages.agent_core.config import parse_user_ids
+
     slack = _slack_client() if settings.lending_slack_bot_token else None
+    if slack is not None:
+        slack = MentioningSlack(slack, parse_user_ids(settings.lending_cora_approver_user_ids))
     with lending_session() as db:
-        return process_due(db, now=now, sms=get_sender(), slack=slack,
+        return process_due(db, now=now, sms=get_sender(internal_alert=True), slack=slack,
                            ghl_status=ghl_call_lookup(account) if account else None,
                            sms_to=normalize(settings.lending_alarm_sms_to), ops_channel=settings.lending_ops_channel)
 
