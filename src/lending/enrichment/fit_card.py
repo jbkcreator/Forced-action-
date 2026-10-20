@@ -5,8 +5,10 @@ Runs the T-05 evaluator, then presents the result the way Josh asked:
 - Score = percent of lenders that fit (A3: 3 of 5 = 60). Backflip's rule rows count as one lender.
   The score is withheld while any lender's rules are unverified (A1: all five still pending): a
   percentage over a partly-unknown matrix would read as a real answer.
-- Ranking (A2): Backflip first whenever it fits, then the other fitting lenders cheapest first. When
-  Backflip does not fit, every other fitting lender is shown.
+- Ranking (A2): The primary lender (whoever has ``is_primary=TRUE`` in
+  ``lending.lender_routing_rules``) ranks first whenever it fits, then the other fitting lenders
+  cheapest first.  When the routing table is unavailable the module falls back to the
+  ``BACKFLIP_KEY_PREFIX`` constant (R-1 F4 fix: removed hard-coded name dependency).
 - A credit band that straddles a lender's floor shows "needs confirmation on the call" (A4).
 - A lender whose eligibility is unknown (A3) is listed as "possible, confirm on the call": not a fit and
   not a decline, and never counted in the score.
@@ -55,12 +57,20 @@ class FitView:
         }
 
 
-def lender_group(lender_key: str) -> str:
-    return BACKFLIP_LENDER if lender_key.startswith(BACKFLIP_KEY_PREFIX) else lender_key
+def lender_group(lender_key: str, primary_prefix: Optional[str] = None) -> str:
+    """Group lender keys that belong to the same physical lender (e.g. two Backflip rows).
+
+    ``primary_prefix`` is the key prefix of the primary lender from
+    ``lending.lender_routing_rules`` (loaded by the enrichment service via R-1).
+    Falls back to ``BACKFLIP_KEY_PREFIX`` when unavailable.
+    """
+    prefix = primary_prefix or BACKFLIP_KEY_PREFIX
+    return BACKFLIP_LENDER if lender_key.startswith(prefix) else lender_key
 
 
-def _group_name(rules: LenderRules) -> str:
-    return "Backflip" if lender_group(rules.key) == BACKFLIP_LENDER else rules.name
+def _group_name(rules: LenderRules, primary_prefix: Optional[str] = None) -> str:
+    prefix = primary_prefix or BACKFLIP_KEY_PREFIX
+    return "Backflip" if lender_group(rules.key, primary_prefix=prefix) == BACKFLIP_LENDER else rules.name
 
 
 def parse_band_bounds(raw: Optional[str]) -> Optional[tuple[int, int]]:
@@ -69,7 +79,12 @@ def parse_band_bounds(raw: Optional[str]) -> Optional[tuple[int, int]]:
     return (int(match.group(1)), int(match.group(2))) if match else None
 
 
-def _straddles(band: Optional[tuple[int, int]], request: LoanRequest, matrix: tuple[LenderRules, ...]) -> list[str]:
+def _straddles(
+    band: Optional[tuple[int, int]],
+    request: LoanRequest,
+    matrix: tuple[LenderRules, ...],
+    primary_prefix: Optional[str] = None,
+) -> list[str]:
     if band is None:
         return []
     low, high = band
@@ -80,7 +95,8 @@ def _straddles(band: Optional[tuple[int, int]], request: LoanRequest, matrix: tu
         if rules.loan_types and request.loan_type not in rules.loan_types:
             continue
         if low < rules.credit_floor <= high:
-            notes.setdefault(_group_name(rules), f"{_group_name(rules)}: credit {CREDIT_STRADDLE_NOTE}")
+            gname = _group_name(rules, primary_prefix=primary_prefix)
+            notes.setdefault(gname, f"{gname}: credit {CREDIT_STRADDLE_NOTE}")
     return list(notes.values())
 
 
@@ -103,8 +119,14 @@ def evaluate_fit(
     target_close_date=None,
     evaluator: Optional[Evaluator] = None,
     matrix: Optional[tuple[LenderRules, ...]] = None,
+    primary_prefix: Optional[str] = None,
 ) -> FitView:
-    """Fit view for one LendingFlow lead row. Never raises for missing inputs: it reports them."""
+    """Fit view for one LendingFlow lead row. Never raises for missing inputs: it reports them.
+
+    ``primary_prefix``: key prefix of the primary lender from ``lending.lender_routing_rules``
+    (R-1 F4 fix).  The primary lender ranks first in the fit view.  Falls back to the
+    ``BACKFLIP_KEY_PREFIX`` constant when the routing table is unavailable.
+    """
     matrix = current_matrix() if matrix is None else matrix
     missing = _missing(lead)
     amount = _decimal(lead.get("loan_amount"))
@@ -125,15 +147,16 @@ def evaluate_fit(
                                credit_band_max_fico=band[1] if band else None, state=lead["property_state"])
     result = (evaluator or (lambda b, r: evaluate_lender_fit(b, r, matrix=matrix)))(borrower, request)
 
-    fitting_groups = [lender_group(f.lender_key) for f in result.fitting]  # T-05 order: cheapest first
-    names_by_group = {lender_group(r.key): _group_name(r) for r in matrix}
+    fitting_groups = [lender_group(f.lender_key, primary_prefix=primary_prefix) for f in result.fitting]
+    names_by_group = {lender_group(r.key, primary_prefix=primary_prefix): _group_name(r, primary_prefix=primary_prefix) for r in matrix}
     ordered = [g for g in dict.fromkeys(fitting_groups)]
+    # Primary lender ranks first regardless of cost (R-1 F4; previously hard-coded to BACKFLIP_LENDER).
     if BACKFLIP_LENDER in ordered:
         ordered.remove(BACKFLIP_LENDER)
         ordered.insert(0, BACKFLIP_LENDER)
 
     fitting_set = set(fitting_groups)
-    possible_groups = [g for g in dict.fromkeys(lender_group(p.lender_key) for p in result.possible)
+    possible_groups = [g for g in dict.fromkeys(lender_group(p.lender_key, primary_prefix=primary_prefix) for p in result.possible)
                        if g not in fitting_set]
 
     all_groups = set(names_by_group)
@@ -145,6 +168,6 @@ def evaluate_fit(
         note=None if all_verified else FIT_RULES_PENDING,
         ranked=[names_by_group.get(g, g) for g in ordered],
         possible=[names_by_group.get(g, g) for g in possible_groups],
-        straddles=_straddles(band, request, matrix),
+        straddles=_straddles(band, request, matrix, primary_prefix=primary_prefix),
         missing_fields=list(result.missing_fields),
     )

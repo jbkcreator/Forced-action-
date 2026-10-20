@@ -251,12 +251,25 @@ def enrich_lead(
             db.rollback()
             return EnrichmentOutcome(lead_id, FAILED)
 
-    return _post_if_needed(
+    outcome = _post_if_needed(
         db, lead_id, decision.tag, address, close, facts, fit, coverage, from_call=from_call,
         thread_ts=claimed["thread_ts"], last_signature=claimed["post_signature"],
         last_analysis_signature=claimed["analysis_signature"], match=match,
         street_view=street_view, comps=comps, thread=thread,
     )
+
+    # R-1: route the file after enrichment completes.  Best-effort — a routing
+    # failure never rolls back the enrichment result.
+    try:
+        from src.lending.routing.router import route_file
+        route_file(lead_id, db)
+    except Exception:
+        # A failed statement leaves the transaction aborted; clear it so the caller's session (the enrichment
+        # sweep reuses one for the next lead) stays usable. Everything above is already committed.
+        db.rollback()
+        logger.exception("[enrichment] lead=%s routing failed — file will be picked up by the sweep", lead_id)
+
+    return outcome
 
 
 def _post_if_needed(db, lead_id, tag, address, close, facts, fit, coverage, *, from_call, thread_ts, last_signature,
