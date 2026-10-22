@@ -44,13 +44,13 @@ SQLITE_DDL = (
         completed_projects INTEGER, credit_band TEXT, timeline TEXT, notes TEXT, status TEXT NOT NULL DEFAULT 'received'
         CHECK (status IN ('received','held','routed','declined','approved','funded')), status_reason TEXT,
         status_at TIMESTAMP NOT NULL, lender_fit TEXT, prequal_pdf_path TEXT, funded_at TIMESTAMP,
-        notice_status TEXT, notice_emailed_at TIMESTAMP, notice_texted_at TIMESTAMP,
+        notice_status TEXT, notice_emailed_at TIMESTAMP, notice_texted_at TIMESTAMP, notice_failed_at TIMESTAMP,
         created_at TIMESTAMP NOT NULL, updated_at TIMESTAMP NOT NULL)""",
     """CREATE TABLE lending.partner_submissions (id INTEGER PRIMARY KEY AUTOINCREMENT, file_id INTEGER NOT NULL UNIQUE,
         partner_id INTEGER NOT NULL, consent_checked BOOLEAN NOT NULL, consent_text TEXT NOT NULL,
         consented_at TIMESTAMP NOT NULL, ip_address TEXT, page_url TEXT, user_agent TEXT,
         partner_confirmed_at TIMESTAMP, partner_emailed_at TIMESTAMP, partner_texted_at TIMESTAMP,
-        josh_notified_at TIMESTAMP, prequal_sent_at TIMESTAMP, created_at TIMESTAMP)""",
+        josh_notified_at TIMESTAMP, prequal_sent_at TIMESTAMP, confirm_failed_at TIMESTAMP, created_at TIMESTAMP)""",
     """CREATE TABLE lending.partner_file_uploads (id INTEGER PRIMARY KEY AUTOINCREMENT, file_id INTEGER NOT NULL,
         original_name TEXT NOT NULL, stored_path TEXT NOT NULL, content_type TEXT NOT NULL, size_bytes INTEGER NOT NULL,
         created_at TIMESTAMP)""",
@@ -777,6 +777,90 @@ def test_failed_status_notice_is_retried_without_changing_the_status(engine, ses
         assert partner_pipeline.pending_status_notice_ids(db, 10, 24, 20, now=later) == []
     assert not partner_pipeline.retry_status_notice(file_id, _services(recorder, tmp_path), session_factory)
     assert len(recorder.emails) == 1
+
+
+def _email_down(to, subject, body):
+    raise RuntimeError("email down")
+
+
+def test_unsent_confirmation_is_flagged_once_after_the_retry_window(engine, session_factory, tmp_path) -> None:
+    _, token = _partner(session_factory)
+    file_id = _submit(session_factory, token)
+    recorder = Recorder()
+    partner_pipeline.process_new_file(file_id, dataclasses.replace(_services(recorder, tmp_path), email=_email_down),
+                                      session_factory)
+    assert _rows(engine, "partner_submissions")[0]["partner_confirmed_at"] is None
+    alerts_before = len(recorder.slack)
+    now = datetime.now(timezone.utc)
+
+    assert partner_pipeline.flag_lapsed_notices(24, _services(recorder, tmp_path), session_factory,
+                                                now=now + timedelta(hours=23)) == []
+    lapsed = partner_pipeline.flag_lapsed_notices(24, _services(recorder, tmp_path), session_factory,
+                                                  now=now + timedelta(hours=25))
+    assert [(n.file_id, n.what, n.partner_name) for n in lapsed] == [(file_id, "file received confirmation", "Maria Lopez")]
+    assert len(recorder.slack) == alerts_before + 1 and "not delivered" in recorder.slack[-1].text
+    assert _rows(engine, "partner_submissions")[0]["confirm_failed_at"] is not None
+    assert partner_pipeline.flag_lapsed_notices(24, _services(recorder, tmp_path), session_factory,
+                                                now=now + timedelta(hours=26)) == []
+    assert len(recorder.slack) == alerts_before + 1
+
+
+def test_unsent_status_notice_is_flagged_and_a_new_status_clears_the_flag(engine, session_factory, tmp_path) -> None:
+    _, token = _partner(session_factory)
+    file_id = _submit(session_factory, token)
+    recorder = Recorder()
+    with session_factory() as db:
+        db.execute(text("UPDATE lending.partner_submissions SET partner_confirmed_at = :now"),
+                   {"now": datetime.now(timezone.utc)})
+    partner_pipeline.change_status(file_id, "declined", "ltv",
+                                   dataclasses.replace(_services(recorder, tmp_path), email=_email_down), session_factory)
+    later = datetime.now(timezone.utc) + timedelta(hours=25)
+
+    lapsed = partner_pipeline.flag_lapsed_notices(24, _services(recorder, tmp_path), session_factory, now=later)
+    assert [(n.file_id, n.what) for n in lapsed] == [(file_id, "declined update")]
+    file = _rows(engine, "loan_files")[0]
+    assert file["notice_failed_at"] is not None and file["notice_status"] == "declined"
+    with session_factory() as db:
+        partners.record_status_change(db, file_id, "routed")
+    assert _rows(engine, "loan_files")[0]["notice_failed_at"] is None
+
+
+def test_lapsed_notices_are_not_stamped_when_slack_is_not_configured(engine, session_factory, tmp_path) -> None:
+    _, token = _partner(session_factory)
+    file_id = _submit(session_factory, token)
+    recorder = Recorder()
+    partner_pipeline.process_new_file(file_id, dataclasses.replace(_services(recorder, tmp_path), email=_email_down),
+                                      session_factory)
+    no_slack = dataclasses.replace(_services(recorder, tmp_path), slack=None)
+    later = datetime.now(timezone.utc) + timedelta(hours=25)
+    assert partner_pipeline.flag_lapsed_notices(24, no_slack, session_factory, now=later) == []
+    assert _rows(engine, "partner_submissions")[0]["confirm_failed_at"] is None
+
+
+def test_lapsed_notices_are_not_stamped_when_the_live_partner_channel_is_unset(engine, session_factory, settings,
+                                                                               tmp_path, monkeypatch) -> None:
+    _, token = _partner(session_factory)
+    file_id = _submit(session_factory, token)
+    partner_pipeline.process_new_file(file_id, dataclasses.replace(_services(Recorder(), tmp_path), email=_email_down),
+                                      session_factory)
+    monkeypatch.setattr(settings, "lending_partner_channel", None)
+    later = datetime.now(timezone.utc) + timedelta(hours=25)
+    assert partner_pipeline.flag_lapsed_notices(24, None, session_factory, now=later) == []
+    assert _rows(engine, "partner_submissions")[0]["confirm_failed_at"] is None
+
+
+def test_lapsed_notices_are_flagged_in_batches(engine, session_factory, tmp_path) -> None:
+    _, token = _partner(session_factory)
+    file_ids = [_submit(session_factory, token) for _ in range(3)]
+    recorder = Recorder()
+    for file_id in file_ids:
+        partner_pipeline.process_new_file(file_id, dataclasses.replace(_services(recorder, tmp_path), email=_email_down),
+                                          session_factory)
+    later = datetime.now(timezone.utc) + timedelta(hours=25)
+    first = partner_pipeline.flag_lapsed_notices(24, _services(recorder, tmp_path), session_factory, now=later, limit=2)
+    second = partner_pipeline.flag_lapsed_notices(24, _services(recorder, tmp_path), session_factory, now=later, limit=2)
+    assert len(first) == 2 and len(second) == 1
+    assert {n.file_id for n in first + second} == set(file_ids)
 
 
 def test_internal_status_clears_a_queued_notice(engine, session_factory) -> None:

@@ -82,6 +82,7 @@ def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
             notice_status       varchar(20),
             notice_emailed_at   timestamptz,
             notice_texted_at    timestamptz,
+            notice_failed_at    timestamptz,
             created_at          timestamptz  NOT NULL DEFAULT now(),
             updated_at          timestamptz  NOT NULL DEFAULT now()
         )""",
@@ -102,6 +103,7 @@ def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
             partner_texted_at    timestamptz,
             josh_notified_at     timestamptz,
             prequal_sent_at      timestamptz,
+            confirm_failed_at    timestamptz,
             created_at           timestamptz  NOT NULL DEFAULT now()
         )""",
         f"""CREATE TABLE IF NOT EXISTS {uploads} (

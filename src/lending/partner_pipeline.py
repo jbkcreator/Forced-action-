@@ -25,7 +25,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
-from sqlalchemy import inspect, text
+from sqlalchemy import bindparam, inspect, text
 
 from config.lender_matrix import LenderRules
 from config.lending_partners import (
@@ -520,6 +520,93 @@ def pending_status_notice_ids(db, older_than_minutes: int, max_age_hours: int, l
          "oldest": now - timedelta(hours=max_age_hours), "limit": limit},
     ).all()
     return [int(row[0]) for row in rows]
+
+
+@dataclass(frozen=True)
+class LapsedNotice:
+    file_id: int
+    partner_name: str
+    place: str
+    what: str  # "file received confirmation" or "<status> update"
+
+
+def _live_slack_configured() -> bool:
+    from config.settings import get_settings
+
+    settings = get_settings()
+    return bool(settings.lending_partner_channel and settings.lending_slack_bot_token)
+
+
+def flag_lapsed_notices(max_age_hours: int, services: Optional[PipelineServices] = None,
+                        session_factory: Optional[Callable[[], Any]] = None,
+                        now: Optional[datetime] = None, limit: int = 20) -> list[LapsedNotice]:
+    """Partner notices still unsent after the retry window: stamp each as failed once and post one Slack alert per
+    notice so someone follows up by hand. A new status clears the status-notice stamp (``record_status_change``).
+    Nothing is stamped while Slack is not configured, so no alert is lost to a missing channel. At most ``limit``
+    of each kind per run; the rest are taken by the next sweep. The stamp commits before the post (at most one
+    alert per notice): a crash between the two loses that alert, which is the accepted trade-off against
+    duplicate alerts. Never raises."""
+    try:
+        if services is None and not _live_slack_configured():
+            logger.warning("[partner-door] lapsed-notice alerts skipped: LENDING_PARTNER_CHANNEL or bot token not set")
+            return []
+        if session_factory is None:
+            from src.lending.db import lending_session as session_factory
+        services = services or live_services()
+        if services.slack is None:
+            logger.warning("[partner-door] lapsed-notice alerts skipped: Slack is not configured")
+            return []
+        now = now or _utcnow()
+        params = {"now": now, "source": SOURCE_PARTNER, "oldest": now - timedelta(hours=max_age_hours), "limit": limit}
+        with session_factory() as db:
+            confirmations = db.execute(
+                text("UPDATE lending.partner_submissions SET confirm_failed_at = :now WHERE id IN ("
+                     "SELECT s.id FROM lending.partner_submissions s JOIN lending.loan_files f ON f.id = s.file_id "
+                     "WHERE s.confirm_failed_at IS NULL AND s.partner_confirmed_at IS NULL AND f.source = :source "
+                     "AND f.status <> 'received' AND f.created_at <= :oldest ORDER BY f.created_at LIMIT :limit) "
+                     "RETURNING file_id"),
+                params,
+            ).scalars().all()
+            updates = db.execute(
+                text("UPDATE lending.loan_files SET notice_failed_at = :now WHERE id IN ("
+                     "SELECT id FROM lending.loan_files WHERE source = :source AND notice_status IS NOT NULL "
+                     "AND notice_failed_at IS NULL AND status_at <= :oldest ORDER BY status_at LIMIT :limit) "
+                     "RETURNING id, notice_status"),
+                params,
+            ).mappings().all()
+            kinds = [(int(i), "file received confirmation") for i in confirmations]
+            kinds += [(int(row["id"]), f"{row['notice_status']} update") for row in updates]
+            if not kinds:
+                return []
+            files = {int(row["id"]): row for row in db.execute(
+                text("SELECT f.id, f.property_address, f.borrower_last_name, p.name FROM lending.loan_files f "
+                     "JOIN lending.partners p ON p.id = f.partner_id WHERE f.id IN :ids").bindparams(
+                    bindparam("ids", expanding=True)),
+                {"ids": sorted({file_id for file_id, _ in kinds})},
+            ).mappings().all()}
+        lapsed = [LapsedNotice(file_id, files[file_id]["name"],
+                               _place(files[file_id]["property_address"], files[file_id]["borrower_last_name"]), what)
+                  for file_id, what in kinds if file_id in files]
+        for notice in lapsed:
+            _post_lapsed_alert(services, notice, max_age_hours)
+        return lapsed
+    except Exception as exc:
+        logger.error("[partner-door] lapsed-notice check failed (%s)", type(exc).__name__)
+        return []
+
+
+def _post_lapsed_alert(services: PipelineServices, notice: LapsedNotice, max_age_hours: int) -> None:
+    text_line = (f"Partner notice not delivered: {notice.partner_name} never received the {notice.what} for "
+                 f"file #{notice.file_id} ({notice.place}). Retries stopped after {max_age_hours} hours; "
+                 f"please contact the partner directly.")
+    note = SlackNote(text=text_line, blocks=[{"type": "section", "text": {"type": "mrkdwn", "text":
+        f":warning: *Partner notice not delivered*  #{notice.file_id}\n"
+        f"{_mrkdwn(notice.partner_name)} never received the {_mrkdwn(notice.what)} for {_mrkdwn(notice.place)}.\n"
+        f"Retries stopped after {max_age_hours} hours. Please contact the partner directly."}}])
+    try:
+        services.slack(note)
+    except Exception as exc:
+        logger.error("[partner-door] lapsed-notice alert not posted file=%s (%s)", notice.file_id, type(exc).__name__)
 
 
 def unprocessed_file_ids(db, older_than_minutes: int, limit: int, now: Optional[datetime] = None) -> list[int]:
