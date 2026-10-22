@@ -1143,6 +1143,7 @@ class LendingLoanFile(LendingBase):
     notice_status: Mapped[Optional[str]] = mapped_column(String(20))  # status whose partner notice is not fully sent
     notice_emailed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     notice_texted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    notice_failed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # retries gave up; Slack alerted
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 
@@ -1205,6 +1206,7 @@ class LendingPartnerSubmission(LendingBase):
     partner_texted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     josh_notified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     prequal_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # letter emailed to the partner
+    confirm_failed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # confirmation gave up; Slack alerted
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 
 
