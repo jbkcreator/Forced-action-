@@ -3,12 +3,15 @@
 The Runbook asks that every call attempt in the 14-day follow-up is written to lending.call_dispositions, so that
 LendingFlow leads with 5+ attempts over 5+ days can be claimed for replacement credit. BatchDialer calls already
 arrive through the CDR poller; LendingFlow leads go straight to Josh, who calls from GoHighLevel, and those calls
-were recorded nowhere. This import reads the outbound call messages of every LendingFlow and website lead still in
-its follow-up window and stores each one once. When more contacts are in the window than one run reads
+were recorded nowhere. This import reads the call messages (Josh's outbound attempts and the lead's inbound calls
+to the Next Deal Lending number, answered and missed) of every LendingFlow and website lead still in its follow-up
+window and stores each one once. When more contacts are in the window than one run reads
 (IMPORT_CONTACT_LIMIT), successive runs read successive slices, so every contact is covered.
 
 * ``dialer_call_id`` = ``ghl:<message id>`` (unique, so a re-run never duplicates a call); a call seen again with
   a new outcome or talk time (imported while it was still in progress) is updated in place
+* ``direction`` = ``outbound`` or ``inbound`` (Q66). Only outbound rows count as attempts (attempt caps, the replacement
+  rule, the scoreboard and the uncalled alarm all filter on direction); an inbound row is a record of the call
 * ``call_source`` = ``ghl``, ``caller_seat`` / ``campaign_tag`` = ``ghl`` (its own scoreboard line)
 * ``disposition`` stays NULL (GHL outcomes are not lending disposition codes); GHL's outcome is kept in
   ``disposition_raw`` as ``ghl:<callStatus>``, which also keeps it out of the missing-disposition alert
@@ -50,6 +53,7 @@ from src.services.phone_utils import normalize
 logger = logging.getLogger(__name__)
 
 CallReader = Callable[[str], list[dict[str, Any]]]  # ghl_contact_id -> call messages
+CALL_DIRECTIONS = ("outbound", "inbound")
 
 # One row per GHL contact: a contact can hold both a LendingFlow and a website lead; calls count from the
 # earliest arrival, and the lead's own normalised phone is the one stored on the call.
@@ -74,7 +78,7 @@ _UPSERT = text("""
     INSERT INTO lending.call_dispositions AS d
         (dialer_call_id, call_source, direction, phone, caller_seat, campaign_tag, disposition_raw,
          talk_duration_sec, call_started_at, call_ended_at, raw_event)
-    VALUES (:call_id, :source, 'outbound', :phone, :seat, :tag, :raw_outcome,
+    VALUES (:call_id, :source, :direction, :phone, :seat, :tag, :raw_outcome,
             :talk, :started, :ended, CAST(:raw_event AS jsonb))
     ON CONFLICT (dialer_call_id) DO UPDATE SET
         disposition_raw = CASE WHEN EXCLUDED.disposition_raw = :unknown_outcome THEN d.disposition_raw
@@ -104,16 +108,18 @@ class ImportStats:
 
 
 def _call_row(message: Mapping[str, Any], contact_id: str, phone: str, since: datetime) -> Optional[dict[str, Any]]:
-    """The insert parameters for one GHL call message, or None when it is not an outbound attempt to record."""
+    """The insert parameters for one GHL call message, or None when it is not an outbound or inbound call to record."""
     message_id = message.get("id")
     started = message_time(message)
-    if not message_id or message.get("direction") != "outbound" or started is None or started < since:
+    direction = message.get("direction")
+    if not message_id or direction not in CALL_DIRECTIONS or started is None or started < since:
         return None
     outcome = call_state(message)
     talk = call_duration_seconds(message)
     return {
         "call_id": f"{GHL_CALL_ID_PREFIX}{message_id}"[:100],
         "source": CALL_SOURCE_GHL,
+        "direction": direction,
         "phone": phone,
         "seat": GHL_CALLER_SEAT,
         "tag": GHL_CAMPAIGN_TAG,

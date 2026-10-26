@@ -44,7 +44,7 @@ def test_an_outbound_call_after_arrival_becomes_one_ghl_row():
 
 
 @pytest.mark.parametrize("message", [
-    _msg(direction="inbound"),
+    _msg(direction="internal"),
     _msg(added=ARRIVED - timedelta(minutes=1)),
     {**_msg(), "id": None},
     {**_msg(), "dateAdded": "2026-10-12T13:05:00"},  # no timezone
@@ -52,6 +52,15 @@ def test_an_outbound_call_after_arrival_becomes_one_ghl_row():
 ])
 def test_calls_that_are_not_attempts_after_arrival_are_skipped(message):
     assert _call_row(message, "c-1", "+18135550101", ARRIVED) is None
+
+
+def test_an_inbound_call_becomes_an_inbound_ghl_row():
+    answered = _call_row(_msg("in-1", direction="inbound", status="completed", meta_extra={"call": {"duration": 40}}),
+                         "c-1", "+18135550101", ARRIVED)
+    missed = _call_row(_msg("in-2", direction="inbound", status="no-answer"), "c-1", "+18135550101", ARRIVED)
+    assert (answered["direction"], answered["raw_outcome"], answered["talk"]) == ("inbound", "ghl:completed", 40)
+    assert (missed["direction"], missed["raw_outcome"], missed["talk"]) == ("inbound", "ghl:no-answer", None)
+    assert _call_row(_msg(), "c-1", "+18135550101", ARRIVED)["direction"] == "outbound"
 
 
 def test_an_unknown_outcome_and_no_duration_are_kept_as_unknown():
@@ -229,7 +238,7 @@ def _bd_call(db, *, phone, started, talk=0) -> None:
 
 
 def _ghl_rows(db, phone):
-    return db.execute(text("SELECT dialer_call_id, call_source, caller_seat, campaign_tag, disposition, "
+    return db.execute(text("SELECT dialer_call_id, direction, call_source, caller_seat, campaign_tag, disposition, "
                            "disposition_raw, call_started_at FROM lending.call_dispositions "
                            "WHERE phone = :p AND call_source = 'ghl' ORDER BY call_started_at"),
                       {"p": phone}).mappings().all()
@@ -240,14 +249,29 @@ def test_ghl_calls_of_a_lead_in_its_window_are_stored_once(lending_db):
     _lendingflow_lead(lending_db, phone=phone, contact_id=contact)
     messages = {contact: [_msg(f"{contact}-1"), _msg(f"{contact}-2", added=ARRIVED + timedelta(days=1),
                                                        status="completed"),
-                          _msg(f"{contact}-in", direction="inbound")]}
+                          _msg(f"{contact}-in", direction="inbound", added=ARRIVED + timedelta(hours=2),
+                               status="completed")]}
     first = import_calls(lending_db, lambda cid: messages.get(cid, []), now=NOW)
     again = import_calls(lending_db, lambda cid: messages.get(cid, []), now=NOW)
     rows = _ghl_rows(lending_db, phone)
-    assert [r["dialer_call_id"] for r in rows] == [f"ghl:{contact}-1", f"ghl:{contact}-2"]
+    assert [r["dialer_call_id"] for r in rows] == [f"ghl:{contact}-1", f"ghl:{contact}-in", f"ghl:{contact}-2"]
+    assert [r["direction"] for r in rows] == ["outbound", "inbound", "outbound"]
     assert all(r["caller_seat"] == "ghl" and r["campaign_tag"] == "ghl" and r["disposition"] is None for r in rows)
-    assert rows[1]["disposition_raw"] == "ghl:completed"
-    assert first.imported >= 2 and again.imported == 0 and again.already_recorded >= 2
+    assert rows[2]["disposition_raw"] == "ghl:completed"
+    assert first.imported >= 3 and again.imported == 0 and again.already_recorded >= 3
+
+
+def test_inbound_calls_are_stored_but_never_count_as_outbound_attempts(lending_db):
+    from src.lending.compliance import MAX_ATTEMPTS_PER_PERIOD, _attempt_cap
+
+    phone, contact = _phone(), f"c-{uuid.uuid4().hex[:8]}"
+    _lendingflow_lead(lending_db, phone=phone, contact_id=contact)
+    calls = [_msg(f"{contact}-in{n}", direction="inbound", added=NOW - timedelta(hours=1, minutes=n),
+                  status="completed" if n % 2 else "no-answer") for n in range(MAX_ATTEMPTS_PER_PERIOD + 2)]
+    import_calls(lending_db, lambda cid: calls if cid == contact else [], now=NOW)
+    rows = _ghl_rows(lending_db, phone)
+    assert len(rows) == MAX_ATTEMPTS_PER_PERIOD + 2 and {r["direction"] for r in rows} == {"inbound"}
+    assert _attempt_cap(lending_db, phone, NOW).allowed  # more inbound calls than the cap, still dialable
 
 
 def test_a_contact_with_a_lendingflow_and_a_web_lead_is_read_once(lending_db):
