@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 
 from config.lending_partners import NOTICE_RETRY_HOURS, SWEEP_AFTER_MINUTES, SWEEP_BATCH_SIZE
+from config.settings import get_settings
 from src.lending.db import lending_session
 from src.lending.partner_ghl import get_partner_letter_sink
 from src.lending.routing.partner_link import lagging_outcomes, resync_outcomes
@@ -37,7 +38,8 @@ def run() -> int:
     with lending_session() as db:
         file_ids = unprocessed_file_ids(db, SWEEP_AFTER_MINUTES, SWEEP_BATCH_SIZE)
         notice_ids = unnotified_file_ids(db, SWEEP_AFTER_MINUTES, NOTICE_RETRY_HOURS, SWEEP_BATCH_SIZE,
-                                         letters=get_partner_letter_sink() is not None)
+                                         letters=get_settings().lending_prequal_pdf_enabled
+                                         and get_partner_letter_sink() is not None)
         status_ids = pending_status_notice_ids(db, SWEEP_AFTER_MINUTES, NOTICE_RETRY_HOURS, SWEEP_BATCH_SIZE)
         outcomes = lagging_outcomes(db, older_than_minutes=SWEEP_AFTER_MINUTES, limit=SWEEP_BATCH_SIZE)
     for file_id in file_ids:

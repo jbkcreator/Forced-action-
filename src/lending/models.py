@@ -1206,6 +1206,9 @@ class LendingPartnerSubmission(LendingBase):
     partner_texted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     josh_notified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     prequal_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # letter emailed to the partner
+    prequal_withheld_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # letters off: never sent
+    borrower_notified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    borrower_consent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # live first contact logged
     confirm_failed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # confirmation gave up; Slack alerted
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 
