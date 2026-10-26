@@ -48,11 +48,15 @@ from config.lending_reminders import (
     EMAIL_SUBJECT_CONFIRMATION,
     EMAIL_SUBJECT_NIGHT_BEFORE,
     EMAIL_SUBJECT_NINETY_MIN,
+    EMAIL_SUBJECT_TEN_MIN,
+    EMAIL_TEN_MIN_NO_ADDRESS,
+    EMAIL_TEN_MIN_WITH_ADDRESS,
     GATE_FAIL_TEXT,
     KIND_CONFIRMATION,
     KIND_GATE_FAIL,
     KIND_NIGHT_BEFORE,
     KIND_NINETY_MIN,
+    KIND_TEN_MIN,
     MAX_TEXT_CHARS,
     NIGHT_BEFORE_HOUR_ET,
     NIGHT_BEFORE_MINUTE_ET,
@@ -66,6 +70,9 @@ from config.lending_reminders import (
     STATUS_CANCELLED,
     STATUS_PENDING,
     STATUS_SKIPPED,
+    TEN_MIN_NO_ADDRESS,
+    TEN_MIN_SECONDS,
+    TEN_MIN_WITH_ADDRESS,
     TEXT_WINDOW_END_HOUR,
     TEXT_WINDOW_START_HOUR,
     TIMEZONE,
@@ -186,11 +193,12 @@ def handle_booking_confirmed(db, payload: Mapping[str, Any], *, now: Optional[da
         _row(common, KIND_CONFIRMATION, now, skip_reason),
         _row(common, KIND_NIGHT_BEFORE, night_before_send_at(slot_start), skip_reason, now=now),
         _row(common, KIND_NINETY_MIN, slot_start - timedelta(seconds=NINETY_MIN_SECONDS), skip_reason, now=now),
+        _row(common, KIND_TEN_MIN, slot_start - timedelta(seconds=TEN_MIN_SECONDS), skip_reason, now=now),
     ]
     known = db.execute(_KNOWN_BOOKING, {"ref": booking_ref}).mappings().one()
     first_delivery = known["n"] == 0
     repairing = known["n"] > 0 and known["n"] == known["without_contact"]   # earlier delivery had no phone or email
-    inserted = sum(db.execute(_INSERT, row).rowcount for row in rows)  # 3 rows; per-statement rowcount is exact
+    inserted = sum(db.execute(_INSERT, row).rowcount for row in rows)  # 4 rows; per-statement rowcount is exact
     if skip_reason:
         logger.warning("[booking-messages] booking_ref=%s recorded as skipped (%s)", booking_ref, skip_reason)
     else:
@@ -356,8 +364,8 @@ def display_number(e164: str) -> str:
 
 def _fields(first_name: Optional[str], slot_start_utc: datetime, property_address: Optional[str],
             number: Optional[str], kind: str) -> dict:
-    if kind == KIND_NINETY_MIN and not number:
-        raise ValueError("the 90-minute message needs the number to call")
+    if kind in (KIND_NINETY_MIN, KIND_TEN_MIN) and not number:
+        raise ValueError("the 90-minute and 10-minute messages need the number to call")
     local = slot_start_utc.astimezone(TIMEZONE)
     hour = local.hour % 12 or 12
     return {
@@ -378,7 +386,7 @@ def render_text(kind: str, *, first_name: Optional[str], slot_start_utc: datetim
                 property_address: Optional[str] = None, number: Optional[str] = None,
                 reschedule_url: Optional[str] = None) -> str:
     """The client-approved text for ``kind``; never longer than MAX_TEXT_CHARS. ``number`` (E.164) is the
-    text-back number the 90-minute wording asks the borrower to call; required for that kind.
+    text-back number the 90-minute and 10-minute wording ask the borrower to call; required for those kinds.
     ``reschedule_url`` is appended to the 90-minute text only, and left off if it would not fit."""
     fields = _fields(first_name, slot_start_utc, property_address, number, kind)
     body = _TEXT[kind][bool(fields["property_address"])].format(**fields)
@@ -408,17 +416,20 @@ _TEXT = {
     KIND_CONFIRMATION: (CONFIRMATION_NO_ADDRESS, CONFIRMATION_WITH_ADDRESS),
     KIND_NIGHT_BEFORE: (NIGHT_BEFORE_NO_ADDRESS, NIGHT_BEFORE_WITH_ADDRESS),
     KIND_NINETY_MIN: (NINETY_MIN_NO_ADDRESS, NINETY_MIN_WITH_ADDRESS),
+    KIND_TEN_MIN: (TEN_MIN_NO_ADDRESS, TEN_MIN_WITH_ADDRESS),
     KIND_GATE_FAIL: (GATE_FAIL_TEXT, GATE_FAIL_TEXT),
 }
 _EMAIL = {
     KIND_CONFIRMATION: (EMAIL_CONFIRMATION_NO_ADDRESS, EMAIL_CONFIRMATION_WITH_ADDRESS),
     KIND_NIGHT_BEFORE: (EMAIL_NIGHT_BEFORE_NO_ADDRESS, EMAIL_NIGHT_BEFORE_WITH_ADDRESS),
     KIND_NINETY_MIN: (EMAIL_NINETY_MIN_NO_ADDRESS, EMAIL_NINETY_MIN_WITH_ADDRESS),
+    KIND_TEN_MIN: (EMAIL_TEN_MIN_NO_ADDRESS, EMAIL_TEN_MIN_WITH_ADDRESS),
     KIND_GATE_FAIL: (EMAIL_GATE_FAIL, EMAIL_GATE_FAIL),
 }
 _EMAIL_SUBJECT = {
     KIND_CONFIRMATION: EMAIL_SUBJECT_CONFIRMATION,
     KIND_NIGHT_BEFORE: EMAIL_SUBJECT_NIGHT_BEFORE,
     KIND_NINETY_MIN: EMAIL_SUBJECT_NINETY_MIN,
+    KIND_TEN_MIN: EMAIL_SUBJECT_TEN_MIN,
     KIND_GATE_FAIL: EMAIL_SUBJECT_GATE_FAIL,
 }

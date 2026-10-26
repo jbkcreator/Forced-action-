@@ -89,6 +89,7 @@ def test_reminders_are_scheduled_not_sent_with_the_confirmation(db):
     record_consent(db, PHONE, "on_call_yes")
     cycle(db, text_sender=TextSender())
     assert row(db, "night_before")["status"] == "pending" and row(db, "ninety_min")["status"] == "pending"
+    assert row(db, "ten_min")["status"] == "pending"
 
 
 def test_each_reminder_goes_out_when_it_comes_due(db):
@@ -100,7 +101,10 @@ def test_each_reminder_goes_out_when_it_comes_due(db):
     assert "tomorrow at 10:00 am ET" in sender.calls[-1]["body"]
     assert cycle(db, text_sender=sender, now=SLOT - timedelta(minutes=89)) == {"sent": 1}
     assert "in about 90 minutes" in sender.calls[-1]["body"] and "(813) 555-0100" in sender.calls[-1]["body"]
-    assert [row(db, k)["status"] for k in ("confirmation", "night_before", "ninety_min")] == ["sent"] * 3
+    assert cycle(db, text_sender=sender, now=SLOT - timedelta(minutes=9)) == {"sent": 1}
+    assert "We'll be calling you shortly, at 10:00 am ET" in sender.calls[-1]["body"]
+    assert "(813) 555-0100" in sender.calls[-1]["body"] and "STOP" not in sender.calls[-1]["body"]
+    assert [row(db, k)["status"] for k in ("confirmation", "night_before", "ninety_min", "ten_min")] == ["sent"] * 4
 
 
 def test_no_consent_and_no_email_is_skipped_visibly(db):
@@ -300,3 +304,38 @@ def test_a_ninety_minute_text_that_is_very_late_is_skipped(db):
     worker_was_down = SLOT - timedelta(minutes=30)  # 60 minutes after it came due
     assert cycle(db, text_sender=sender, now=worker_was_down) == {"skipped_too_late": 1}
     assert len(sender.calls) == 2
+
+
+def test_the_ten_minute_text_is_skipped_not_delayed_when_the_window_is_closed(db):
+    early = datetime(2026, 10, 7, 11, 55, tzinfo=timezone.utc)  # Wed 7:55 ET call -> 7:45 am text, before 8 am
+    book(db, slot=early)
+    record_consent(db, PHONE, "on_call_yes")
+    sender = TextSender()
+    cycle(db, text_sender=sender)  # confirmation
+    cycle(db, text_sender=sender, now=datetime(2026, 10, 6, 22, 5, tzinfo=timezone.utc))  # night before, on time
+    cycle(db, text_sender=sender, now=early - timedelta(minutes=90))  # 6:25 am: the 90-minute text is skipped
+    assert cycle(db, text_sender=sender, now=early - timedelta(minutes=10)) == {"skipped_quiet_hours": 1}
+    assert (row(db, "ten_min")["status"], row(db, "ten_min")["skip_reason"]) == ("skipped", "quiet_hours")
+    assert len(sender.calls) == 2  # confirmation + night-before only
+
+
+def test_a_ten_minute_text_that_is_more_than_five_minutes_late_is_skipped(db):
+    book(db)
+    record_consent(db, PHONE, "on_call_yes")
+    sender = TextSender()
+    cycle(db, text_sender=sender)
+    cycle(db, text_sender=sender, now=datetime(2026, 10, 6, 22, 5, tzinfo=timezone.utc))
+    cycle(db, text_sender=sender, now=SLOT - timedelta(minutes=89))
+    worker_was_down = SLOT - timedelta(minutes=4)  # 6 minutes after it came due: "shortly" would be wrong
+    assert cycle(db, text_sender=sender, now=worker_was_down) == {"skipped_too_late": 1}
+    assert len(sender.calls) == 3
+
+
+def test_a_ten_minute_text_two_minutes_late_is_still_sent(db):
+    book(db)
+    record_consent(db, PHONE, "on_call_yes")
+    sender = TextSender()
+    cycle(db, text_sender=sender)
+    cycle(db, text_sender=sender, now=datetime(2026, 10, 6, 22, 5, tzinfo=timezone.utc))
+    cycle(db, text_sender=sender, now=SLOT - timedelta(minutes=89))
+    assert cycle(db, text_sender=sender, now=SLOT - timedelta(minutes=8)) == {"sent": 1}
