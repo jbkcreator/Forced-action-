@@ -88,6 +88,11 @@ def ghl_text_consent(
     return result
 
 
+# What a GHL merge field becomes when it does not resolve (the workflow's variable is wrong or empty). Saving such
+# a value as a stage would hide the mistake: the event would never match "funded" and nobody would be told.
+_UNRESOLVED_VALUES = frozenset({"null", "none", "undefined", "nan"})
+
+
 @router.post("/ghl-stage")
 def ghl_stage(
     body: dict[str, Any],
@@ -100,6 +105,9 @@ def ghl_stage(
     opportunity_id, stage = _field(body, "opportunity_id") or _field(body, "id"), _field(body, "stage_name")
     if not opportunity_id or not stage:
         raise HTTPException(status_code=422, detail="opportunity_id and stage_name are required")
+    if stage.strip().lower() in _UNRESOLVED_VALUES or opportunity_id.strip().lower() in _UNRESOLVED_VALUES:
+        logger.warning("[lending-ghl] stage webhook refused: a merge field did not resolve (opportunity_id/stage_name)")
+        raise HTTPException(status_code=422, detail="stage_name or opportunity_id did not resolve: check the GHL merge fields")
     try:
         inserted = db.execute(
             text("INSERT INTO lending.ghl_stage_events (ghl_opportunity_id, pipeline_id, stage_name, stage_key, phone, "
