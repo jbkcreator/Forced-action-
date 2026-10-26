@@ -188,6 +188,11 @@ def _state_code(value: Optional[str]) -> Optional[str]:
     return _STATE_CODES.get(" ".join(value.lower().split()))
 
 
+def state_code(value: Optional[str]) -> Optional[str]:
+    """USPS code for a state name or code, else None (the website form reuses LendingFlow's reading)."""
+    return _state_code(value)
+
+
 def _loan_type(value: Optional[str]) -> Optional[str]:
     if not value:
         return None

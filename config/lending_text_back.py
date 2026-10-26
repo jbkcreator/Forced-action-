@@ -1,4 +1,8 @@
-"""WP-GL-9 text-back: client-approved wording and the rules around it (values only, no logic)."""
+"""WP-GL-9 text-back: client-approved wording and the rules around it (values only, no logic).
+
+The sender is named "Next Deal Lending", never a personal name (client, Engineering Pod Action List section 2,
+Q18). Any change to the wording needs a matching update of the 10DLC campaign sample messages.
+"""
 from __future__ import annotations
 
 from config.lending_queues import BUILDERS, NURTURE, TRANSACTION_READY, VERIFIED_MATURITY
@@ -30,18 +34,18 @@ BOOKING_LINE = "Book a time: " + BOOKING_LINK + " "
 # {booking}: BOOKING_LINE before the STOP language when the booking link is on, otherwise empty.
 TEMPLATES: dict[str, str] = {
     "maturity": (
-        "{greeting}, it's {caller} with Josh Kantor, Loan Officer. Sorry I missed you. "
+        "{greeting}, it's {caller} with Next Deal Lending. Sorry I missed you. "
         "I was calling about the loan on {property}. "
         "Call or text me back at {number} when it suits you. "
         "{booking}Reply STOP to opt out."
     ),
     "deal_drop": (
-        "{greeting}, {caller} with Josh Kantor, Loan Officer here. Just tried you about {property}. "
+        "{greeting}, {caller} with Next Deal Lending here. Just tried you about {property}. "
         "We help investors in {county} fund their next deal. Text back if you'd like to chat. "
         "{booking}Reply STOP to opt out."
     ),
     "general": (
-        "{greeting}, this is {caller} with Josh Kantor, Loan Officer. Sorry we missed each other. "
+        "{greeting}, this is {caller} with Next Deal Lending. Sorry we missed each other. "
         "Reply here or call {number} whenever works. "
         "{booking}Reply STOP to opt out."
     ),

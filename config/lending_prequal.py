@@ -10,7 +10,8 @@ SWEEP_BATCH_SIZE = 50
 # gone out): it is flagged "uncertain" and never resent automatically. Well above one batch's run time.
 SENDING_STALE_MINUTES = 30
 
-# Who the borrower sees on every borrower-facing PDF and pre-qual email (client: no company name,
-# sign as the loan officer). One place to change the signer or the callback number.
-BORROWER_SIGNER = "Josh Kantor, Loan Officer"
-BORROWER_CALLBACK_PHONE = "(727) 436-9951"
+# Who the borrower sees on every borrower-facing PDF and pre-qual email: always "Next Deal Lending", never a
+# personal name (client, Engineering Pod Action List section 2, Q18). One place to change the signer or the
+# callback number; (656) 221-1100 is the number the client standardised on (Q60).
+BORROWER_SIGNER = "Next Deal Lending"
+BORROWER_CALLBACK_PHONE = "(656) 221-1100"

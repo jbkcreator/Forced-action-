@@ -4,9 +4,10 @@ Contact: upsert by phone/email (an existing contact is updated, never duplicated
 body never carries ``dnd``, so a contact an earlier STOP marked do-not-disturb stays blocked, and
 never carries ``tags`` or ``source``: GHL's upsert REPLACES tags (verified live, Oct 2026), which
 would wipe an earlier consent tag, the opt-out tag or the dialer's tags. Tags are added through
-the separate add-tags call, which cannot remove any. Positive consent tags are added whenever
-ticked; the "no" tag only on a brand-new contact, so a later unticked form never contradicts an
-earlier "yes". Custom fields (when their ids are configured) are written only for "yes".
+the separate add-tags call, which cannot remove any. Positive consent tags (text, call) are added whenever
+ticked; a "no" tag only on a brand-new contact, so a later unticked form never contradicts an
+earlier "yes". Custom fields (when their ids are configured) are written only for "yes" or a value.
+Deal Drop is the weekly email only: its tag and field say nothing about texts.
 Pipeline: a card is created only when none exists for the contact in the Booked Calls pipeline
 and a new-lead stage is configured; an existing card is never moved. Without that stage the lead
 is contact-only. Each submission also adds a timestamped note of what was ticked.
@@ -21,6 +22,8 @@ from config.lending_web import (
     GHL_CONFIG_ERROR_STATUS_CODES,
     GHL_CUSTOM_FIELD_YES,
     GHL_SOURCE,
+    GHL_TAG_CALL_CONSENT_NO,
+    GHL_TAG_CALL_CONSENT_YES,
     GHL_TAG_DEAL_DROP_OPTIN,
     GHL_TAG_SMS_CONSENT_NO,
     GHL_TAG_SMS_CONSENT_YES,
@@ -37,6 +40,10 @@ def _consent_effective(lead: Mapping[str, Any]) -> bool:
     return bool(lead["sms_consent"]) and not lead["suppressed"]
 
 
+def _call_consent_effective(lead: Mapping[str, Any]) -> bool:
+    return bool(lead["call_consent"]) and not lead["suppressed"]
+
+
 def _deal_drop_effective(lead: Mapping[str, Any]) -> bool:
     return bool(lead["deal_drop_optin"]) and not lead["suppressed"]
 
@@ -47,6 +54,10 @@ def _tags_to_add(lead: Mapping[str, Any], is_new_contact: bool) -> list[str]:
         tags.append(GHL_TAG_SMS_CONSENT_YES)
     elif is_new_contact:
         tags.append(GHL_TAG_SMS_CONSENT_NO)
+    if _call_consent_effective(lead):
+        tags.append(GHL_TAG_CALL_CONSENT_YES)
+    elif is_new_contact:
+        tags.append(GHL_TAG_CALL_CONSENT_NO)
     if _deal_drop_effective(lead):
         tags.append(GHL_TAG_DEAL_DROP_OPTIN)
     return tags
@@ -57,8 +68,14 @@ def _custom_fields(lead: Mapping[str, Any]) -> list[dict[str, str]]:
     fields = []
     if settings.lending_ghl_cf_sms_consent and _consent_effective(lead):
         fields.append({"id": settings.lending_ghl_cf_sms_consent, "value": GHL_CUSTOM_FIELD_YES})
+    if settings.lending_ghl_cf_call_consent and _call_consent_effective(lead):
+        fields.append({"id": settings.lending_ghl_cf_call_consent, "value": GHL_CUSTOM_FIELD_YES})
     if settings.lending_ghl_cf_deal_drop_optin and _deal_drop_effective(lead):
         fields.append({"id": settings.lending_ghl_cf_deal_drop_optin, "value": GHL_CUSTOM_FIELD_YES})
+    if settings.lending_ghl_cf_loan_amount and lead["loan_amount"]:
+        fields.append({"id": settings.lending_ghl_cf_loan_amount, "value": str(lead["loan_amount"])})
+    if settings.lending_ghl_cf_credit_band and lead["credit_band"]:
+        fields.append({"id": settings.lending_ghl_cf_credit_band, "value": lead["credit_band"]})
     return fields
 
 
@@ -66,11 +83,15 @@ def _note(lead: Mapping[str, Any]) -> str:
     received = lead["received_at"].astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     lines = [
         f"Website form submitted {received}.",
-        f"Text/call consent box: {'ticked' if lead['sms_consent'] else 'not ticked'}"
+        f"Text message consent box: {'ticked' if lead['sms_consent'] else 'not ticked'}"
         + (" (number was already suppressed: no consent applied)" if lead["suppressed"] and lead["sms_consent"] else "") + ".",
-        f"Deal Drop opt-in box: {'ticked' if lead['deal_drop_optin'] else 'not ticked'}.",
+        f"Call consent box: {'ticked' if lead['call_consent'] else 'not ticked'}"
+        + (" (number was already suppressed: no consent applied)" if lead["suppressed"] and lead["call_consent"] else "") + ".",
+        f"Deal Drop (weekly email) opt-in box: {'ticked' if lead['deal_drop_optin'] else 'not ticked'}.",
         f"Doing: {lead['deal_type'] or 'n/a'}. Projects finished, last 3 years: {lead['completed_projects_3y'] or 'n/a'}. "
         f"Property city: {lead['property_city'] or 'n/a'}.",
+        f"Loan amount: {'${:,}'.format(lead['loan_amount']) if lead['loan_amount'] else 'n/a'}. Credit band: {lead['credit_band'] or 'n/a'}. "
+        f"Property: {lead['property_address'] or 'n/a'}, state {lead['property_state'] or 'n/a'}.",
         f"Lead id {lead['id']}.",
     ]
     return "\n".join(lines)
@@ -100,9 +121,11 @@ class GhlLeadSink:
     def push(self, lead: Mapping[str, Any]) -> PushResult:
         contact_id, is_new = self._upsert_contact(lead)
         self._call("add tags", "POST", f"/contacts/{contact_id}/tags", json={"tags": _tags_to_add(lead, is_new)})
-        if _consent_effective(lead):
-            # only our own earlier "no" tag is ever removed, so "no" and "yes" never sit side by side
-            self._call("remove stale tag", "DELETE", f"/contacts/{contact_id}/tags", json={"tags": [GHL_TAG_SMS_CONSENT_NO]})
+        stale = ([GHL_TAG_SMS_CONSENT_NO] if _consent_effective(lead) else []) + (
+            [GHL_TAG_CALL_CONSENT_NO] if _call_consent_effective(lead) else [])
+        if stale:
+            # only our own earlier "no" tags are ever removed, so "no" and "yes" never sit side by side
+            self._call("remove stale tag", "DELETE", f"/contacts/{contact_id}/tags", json={"tags": stale})
         pipeline_card = self._ensure_pipeline_card(lead, contact_id)
         self._add_note(lead, contact_id)
         return PushResult(contact_id=contact_id, pipeline_card=pipeline_card)

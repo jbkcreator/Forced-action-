@@ -80,11 +80,12 @@ def test_watermark_in_real_pdf():
     assert "FOR INFORMATIONAL PURPOSES ONLY" in text
 
 
-def test_letter_has_no_company_name_and_is_signed_by_josh():
+def test_letter_is_signed_next_deal_lending_and_names_no_person():
     ctx = prequal.build_context(PrequalLead("680-719", 300_000, "FL", "FIX_AND_FLIP"), [FitLimits(75_000, 2_000_000)], 10)
     html = render_html(prequal.TEMPLATE, ctx, watermark=NON_BINDING_PREQUAL_WATERMARK)
-    assert "next deal lending" not in html.lower()
-    assert "Josh Kantor, Loan Officer" in html
+    assert "Next Deal Lending" in html
+    assert "Josh" not in html and "Kantor" not in html and "(727)" not in html
+    assert "(656) 221-1100" in html
     assert "subject to lender confirmation" in html
 
 
