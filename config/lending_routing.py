@@ -16,9 +16,10 @@ Q2  One-click decline records reason 'other' by default (Josh's enum has no
 Q3  'held' is a 5th action beyond the spec's routed/declined/approved/funded
     (used for the hold-queue and exhausted terminal states).  Josh to confirm
     what "all four events" in acceptance test 3 means.
-Q5  Rule gaps (ground-up >= $500k outside primary footprint, BRIDGE, "other")
-    fall through to rule 6 (hold queue).  Matches the spec's "never silently
-    dropped".
+Q5  Rule gaps (BRIDGE, "other") fall through to rule 6 (hold queue).  Matches
+    the spec's "never silently dropped".  Ground-up >= $500k that the primary
+    cannot take (outside its box, or at its seat cap) is no longer a gap: it
+    cascades to the ground-up overflow waterfall (R-1 decision 1.2.1).
 Q6  Loan amount for threshold checks uses loan_amount (= band minimum from
     LendingFlow).  Josh to confirm.
 Q7  Lender rules are edited from Slack (Josh's R1.4: a Slack form, not a web screen); there is no HTTP admin API.
@@ -45,6 +46,11 @@ SEAT_CAP_COUNTED_ACTION: str = "funded"
 # per month"; ground-up routes to the primary at >= $500,000.
 PRIMARY_DEFAULT_SEAT_CAP: int = 15
 PRIMARY_DEFAULT_CONSTRUCTION_MIN: int = 500_000
+
+# Why a ground-up file at or above the primary's minimum skipped the primary and went to the overflow
+# waterfall. Stored as reason_code on its 'routed' event (the action stays 'routed').
+OVERFLOW_PRIMARY_BOX_FAIL: str = "primary_box_fail"
+OVERFLOW_PRIMARY_AT_CAP: str = "primary_at_cap"
 
 # Actions an operator may record against a file's current lender (spec: routed / declined /
 # approved / funded; routed and declined are written by the router and the decline handler).
