@@ -316,3 +316,14 @@ def test_no_live_sink_without_the_lending_account(monkeypatch):
     monkeypatch.undo()  # the suite-wide guard replaces get_live_sink; test the real one
     monkeypatch.setattr("src.lending.web_lead_ghl.lending_ghl_account", lambda: None)
     assert web_lead_ghl.get_live_sink() is None
+
+
+def test_an_active_card_is_kept_when_the_contact_also_has_a_closed_one(monkeypatch):
+    _configure_pipeline(monkeypatch)
+    monkeypatch.setattr(get_settings(), "lending_ghl_reopen_stage_ids", "stage_nurture", raising=False)
+    ghl = FakeGhl(monkeypatch, _routes(opportunities=[
+        {"id": "o_1", "pipelineStageId": "stage_nurture", "status": "lost"},
+        {"id": "o_2", "pipelineStageId": "stage_booked", "status": "open"}]))
+    result = GhlLeadSink(ACCOUNT).push(_lead())
+    assert result.returning is True and result.moved_to_new_lead is False
+    assert not any(m == "PUT" for m, _ in ghl.paths())

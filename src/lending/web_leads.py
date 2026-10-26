@@ -21,6 +21,7 @@ from config.lending_web import (
     FIELD_MAX_LENGTHS,
     GHL_GIVE_UP_AFTER_HOURS,
     GHL_RETRY_BACKOFF_MINUTES,
+    MAX_LOAN_AMOUNT,
     SMS_CONSENT_TEXT,
     SWEEP_BATCH_SIZE,
 )
@@ -35,7 +36,7 @@ logger = logging.getLogger(__name__)
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _YES = {"yes", "true", "on", "1"}
-_NOT_DIGITS = re.compile(r"[^0-9]")
+_LOAN_AMOUNT = re.compile(r"^\$?\s*(\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?$")
 
 
 class InvalidWebLead(ValueError):
@@ -101,10 +102,11 @@ def _ticked(value: Optional[str]) -> bool:
 def _loan_amount(value: Optional[str]) -> Optional[int]:
     if value is None or not str(value).strip():
         return None
-    digits = _NOT_DIGITS.sub("", str(value).split(".")[0])
-    if not digits or int(digits) <= 0:
+    match = _LOAN_AMOUNT.match(str(value).strip())
+    amount = int(match.group(1).replace(",", "")) if match else 0
+    if not 0 < amount <= MAX_LOAN_AMOUNT:
         raise InvalidWebLead("Please check the loan amount.")
-    return int(digits)
+    return amount
 
 
 def _credit_band(value: Optional[str]) -> Optional[str]:

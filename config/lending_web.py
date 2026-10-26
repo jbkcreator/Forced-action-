@@ -54,5 +54,7 @@ FIELD_MAX_LENGTHS = {
     "page_url": 300,
     "user_agent": 300,
 }
+# A typed loan amount above this is a typo, not a deal (whole dollars).
+MAX_LOAN_AMOUNT = 100_000_000
 
 GHL_STATUSES = ("pending", "synced", "contact_only", "failed")

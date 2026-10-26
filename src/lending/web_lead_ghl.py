@@ -168,8 +168,10 @@ class GhlLeadSink:
             "opportunity search", "GET", "/opportunities/search",
             params={"location_id": self._account.location_id, "contact_id": contact_id, "pipeline_id": pipeline_id},
         )
-        if found.get("opportunities"):
-            return True, found["opportunities"][0]
+        cards = found.get("opportunities") or []
+        if cards:
+            # an active card wins: a contact mid-deal (e.g. Booked) is never pulled back to New Lead
+            return True, next((c for c in cards if not _is_closed(c)), cards[0])
         self._call("opportunity create", "POST", "/opportunities/", json={
             "pipelineId": pipeline_id,
             "locationId": self._account.location_id,

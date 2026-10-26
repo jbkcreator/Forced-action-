@@ -257,6 +257,9 @@ def test_build_input_reads_the_optional_deal_facts():
 @pytest.mark.parametrize("overrides,message", [
     ({"loan_amount": "a lot"}, "loan amount"),
     ({"loan_amount": "0"}, "loan amount"),
+    ({"loan_amount": "1.5M"}, "loan amount"),
+    ({"loan_amount": "350.000"}, "loan amount"),
+    ({"loan_amount": "9" * 30}, "loan amount"),
     ({"credit_band": "800+"}, "credit"),
 ])
 def test_build_input_rejects_unusable_deal_facts(overrides, message):
