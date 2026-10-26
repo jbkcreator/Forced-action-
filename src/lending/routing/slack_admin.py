@@ -56,6 +56,7 @@ _NEEDS_LENDER = {a for a, _ in ACTIONS} - {"add_lender", "reopen_held", "add_rea
 
 # A change that can let a held file match: the held no-match files are then re-run on their own.
 _REOPEN_LIMIT = 1000
+_VIEW_CHARS = 2700
 _RULE_CHANGES = frozenset({"resume", "add_box", "replace_boxes", "ground_up_min", "takes_ground_up"})
 _BOX_FIELDS = ("types_b", "states_b", "min_b", "max_b", "credit_b")
 
@@ -554,8 +555,10 @@ def hold_queue_view(queue: dict) -> dict:
         product = str(f["loan_type"] or "unknown").replace("_", " ").title()
         lines.append(f"{label} {f['last_name'] or 'Unknown'} · {product} · {amount} · {f['status']} "
                      f"({f['hold_reason'] or f['status']}) · {_age(f['updated_at'])}")
+    while len("\n".join(lines)) > _VIEW_CHARS:  # Slack caps a section's text: drop whole files, never cut one in half
+        lines.pop()
     shown = f", showing the newest {len(lines)}" if queue["total"] > len(lines) else ""
-    body = "```" + "\n".join(lines)[:2700] + "```" if lines else "_Nothing is held._"
+    body = "```" + "\n".join(lines) + "```" if lines else "_Nothing is held._"
     note = ("Sign a lender or change a box in /lenders and held files re-route on their own. "
             "'Re-route every file held with no lender match' retries them now.")
     return {"type": "modal", "title": {"type": "plain_text", "text": "Hold queue"}, "close": {"type": "plain_text", "text": "Close"},

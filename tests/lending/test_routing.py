@@ -2602,6 +2602,21 @@ def test_the_hold_queue_view_says_when_nothing_is_waiting(rdb, slack_form):
     assert "Nothing is held" in response["view"]["blocks"][0]["text"]["text"]
 
 
+def test_a_long_hold_queue_view_drops_whole_files_instead_of_cutting_one_in_half():
+    from datetime import datetime, timezone
+
+    from src.lending.routing import slack_admin
+
+    files = [{"source": "lendingflow", "file_id": n, "last_name": f"Waiting{n}", "loan_type": "FIX_AND_FLIP", "loan_amount": 250000,
+              "status": "held", "hold_reason": "no_match", "updated_at": datetime.now(timezone.utc)} for n in range(1, 60)]
+    view = slack_admin.hold_queue_view({"total": 59, "files": files})
+    text = view["blocks"][0]["text"]["text"]
+    shown = [line for line in text.splitlines() if line.startswith("#") or line.startswith("```#")]
+    assert 0 < len(shown) < 59 and f"showing the newest {len(shown)}" in text
+    assert all(line.rstrip("`").endswith("m") or line.rstrip("`").endswith("h") for line in shown)  # each file ends with its age: none cut off
+    assert len(text) < 3000
+
+
 def test_the_morning_summary_no_longer_points_at_the_removed_endpoint():
     import inspect
 
