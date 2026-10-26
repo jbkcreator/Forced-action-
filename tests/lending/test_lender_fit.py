@@ -214,7 +214,7 @@ def test_s2_experienced_builder_qualifies_for_construction_lender() -> None:
     )
     assert construction_miss is not None
     assert any("LTC" in r for r in construction_miss.reasons)
-    assert any("(Requested: 85.7%, Max: 85%)" in r for r in construction_miss.reasons)
+    assert any("Requested: 85.7%, Max: 85%" in r for r in construction_miss.reasons)
 
 
 def test_s2_experienced_builder_within_ltc_qualifies() -> None:

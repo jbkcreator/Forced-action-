@@ -407,12 +407,19 @@ def apply_change(values: dict, db: Session) -> str:
     summary = _apply_change(values, db)
     action = _value(values, "action_b")
     signed = action == "agreement" and _value(values, "value_b").strip().lower() == "signed"
-    if action in _WIDENING_ACTIONS or signed:
-        from src.lending.routing.router import reopen_held
+    if action not in _WIDENING_ACTIONS and not signed:
+        return summary
+    db.commit()  # the lender change stands on its own: a failed re-route below must never undo it
+    from src.lending.routing.router import reopen_held
 
+    try:
         count = reopen_held(db, "no_match", REOPEN_LIMIT)
-        if count:
-            summary += f"; {count} held file(s) sent back to the router (routed within 5 minutes)"
+    except Exception as exc:  # class only: SQL errors can embed bound values
+        db.rollback()
+        logger.error("[routing-slack] re-routing held files after a lender change failed: %s", type(exc).__name__)
+        return summary + "; held files were not re-routed (use 'Re-route every file held with no lender match')"
+    if count:
+        summary += f"; {count} held file(s) sent back to the router (routed within 5 minutes)"
     return summary
 
 

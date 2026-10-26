@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -58,6 +59,7 @@ from src.lending.routing.rules import (
     LenderRow,
     lender_passes_box,
     load_active_lenders,
+    BypassReason,
     primary_bypass_reason,
     primary_lender,
 )
@@ -113,12 +115,20 @@ def _waterfall(
     return None
 
 
+@dataclass(frozen=True)
+class Choice:
+    """The lender a file goes to, and why the primary was bypassed when rule 1 could not take it (1.2.1)."""
+
+    lender: LenderRow
+    bypass: Optional[BypassReason] = None
+
+
 def _choose(
     profile: FileProfile,
     signed: list[LenderRow],
     tried: list[int],
     db: Session,
-) -> Optional[LenderRow]:
+) -> Optional[Choice]:
     """Rules 1–5, first match wins; None means rule 6 (hold queue).
 
     The single place the rules live: ``route_file`` writes the result, ``preview_next`` only reads it.
@@ -126,44 +136,37 @@ def _choose(
     primary = primary_lender(signed)
     loan_type = profile.loan_type
     amount = profile.loan_amount
+    bypass: Optional[BypassReason] = None
 
     if loan_type == _GROUND_UP and primary is not None:
         construction_min = primary.construction_min_amount or 0
         if amount >= construction_min and primary.id not in tried:
-            if lender_passes_box(primary, profile) and not seat_at_cap(primary, db):
-                return primary   # Rule 1
+            at_cap = seat_at_cap(primary, db)
+            if lender_passes_box(primary, profile) and not at_cap:
+                return Choice(primary)   # Rule 1
+            bypass = primary_bypass_reason(primary, profile, at_cap)
 
     if loan_type == _FLIP and primary is not None and primary.id not in tried:
         if lender_passes_box(primary, profile) and not seat_at_cap(primary, db):
-            return primary   # Rule 2
+            return Choice(primary)   # Rule 2
 
     if loan_type == _GROUND_UP:
         # Rule 1 did not take it: below the primary's minimum, no primary, the primary capped or failing its box
         # (1.2.1: cascade, never hold), or the primary already declined it.
         chosen = _waterfall(signed, loan_type, profile, tried, ground_up_only=True)  # Rule 3
         if chosen is not None:
-            return chosen
+            return Choice(chosen, bypass)
 
     if loan_type == _FLIP:
         chosen = _waterfall(signed, loan_type, profile, tried)  # Rule 4
         if chosen is not None:
-            return chosen
+            return Choice(chosen)
 
     if loan_type in _DSCR_TYPES:
-        return _waterfall(signed, loan_type, profile, tried, dscr_only=True)  # Rule 5
+        chosen = _waterfall(signed, loan_type, profile, tried, dscr_only=True)  # Rule 5
+        return Choice(chosen) if chosen is not None else None
 
     return None
-
-
-def _overflow(profile: FileProfile, signed: list[LenderRow], tried: list[int], chosen: LenderRow,
-              db: Session) -> Optional[dict]:
-    """Event metadata when a ground-up file the primary would take by amount went to another lender (1.2.1)."""
-    primary = primary_lender(signed)
-    if (profile.loan_type != _GROUND_UP or primary is None or chosen.id == primary.id or primary.id in tried
-            or profile.loan_amount < (primary.construction_min_amount or 0)):
-        return None
-    return {"overflow": True,
-            "primary_bypass_reason": primary_bypass_reason(primary, profile, at_cap=seat_at_cap(primary, db))}
 
 
 def preview_next(file_id: int, db: Session, kind: str = LEAD) -> Optional[dict]:
@@ -182,10 +185,10 @@ def preview_next(file_id: int, db: Session, kind: str = LEAD) -> Optional[dict]:
     ).mappings().one_or_none()
     tried = list(row["lenders_tried"] or []) if row else []
     signed = _signed(load_active_lenders(db))
-    chosen = _choose(_build_profile(file), signed, tried, db) if signed else None
-    if chosen is None:
+    choice = _choose(_build_profile(file), signed, tried, db) if signed else None
+    if choice is None:
         return None
-    return {"lender_id": chosen.id, "name": chosen.name, "position": len(tried) + 1}
+    return {"lender_id": choice.lender.id, "name": choice.lender.name, "position": len(tried) + 1}
 
 
 def _build_profile(file: dict) -> FileProfile:
@@ -441,10 +444,10 @@ def _route(key: FileKey, db: Session) -> None:
     tried: list[int] = list(routing["lenders_tried"] or [])
     position = len(tried) + 1
 
-    chosen = _choose(profile, signed, tried, db)
+    choice = _choose(profile, signed, tried, db)
 
     # Rule 6: no lender matched
-    if chosen is None:
+    if choice is None:
         hold_reason = "exhausted" if tried else "no_match"
         logger.info("route %s %d holding reason=%s tried=%s", key.kind, key.id, hold_reason, tried)
         _hold(key, file, hold_reason, db)
@@ -453,7 +456,9 @@ def _route(key: FileKey, db: Session) -> None:
     logger.info(
         "route %s %d -> lender_id=%d name=%r position=%d", key.kind, key.id, chosen.id, chosen.name, position,
     )
-    event_id = _set_routed(key, routing, chosen, position, db, _overflow(profile, signed, tried, chosen, db))
+    chosen = choice.lender
+    overflow = {"overflow": True, "primary_bypass_reason": choice.bypass.value} if choice.bypass else None
+    event_id = _set_routed(key, routing, chosen, position, db, overflow)
     db.commit()
     post_route_event(file, chosen, position, event_id, db=db)
     partner_link.mirror_status(key, "routed")

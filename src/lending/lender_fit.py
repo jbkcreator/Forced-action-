@@ -70,6 +70,7 @@ from src.lending.contracts import (
     LoanRequest,
     LoanType,
 )
+from src.lending import leverage
 from src.lending.lender_rules_store import current_matrix, routing_priorities
 
 logger = logging.getLogger(__name__)
@@ -279,11 +280,11 @@ def _check_rules(
             unknowns.append(
                 f"ARV unknown — cannot verify LTV ≤ {rules.max_ltv:.0%} (capture on call)"
             )
-        elif request.arv > 0:
-            ltv = request.loan_amount / request.arv
-            if ltv > rules.max_ltv:
+        else:
+            deal_ltv = leverage.ltv(request.loan_amount, request.arv)
+            if leverage.over_cap(deal_ltv, rules.max_ltv):
                 declines.append((
-                    f"LTV over the ARV cap (Requested: {ltv:.1%}, Max: {rules.max_ltv:.0%}; "
+                    f"LTV over the ARV cap ({leverage.requested_vs_max(deal_ltv, rules.max_ltv)}; "
                     f"loan ${request.loan_amount:,.0f} / ARV ${request.arv:,.0f})"
                     f"{_unconfirmed(source, 'max_ltv')}",
                     DeclineReason.LTV_OVER_MAX,
@@ -300,15 +301,14 @@ def _check_rules(
                 missing.append("rehab_budget")
             unknowns.append("LTC cannot be calculated — purchase price or rehab budget missing (capture on call)")
         else:
-            total_cost = purchase + rehab
-            if total_cost > 0:
-                ltc = request.loan_amount / total_cost
-                if ltc > rules.max_ltc:
-                    declines.append((
-                        f"LTC over the limit (Requested: {ltc:.1%}, Max: {rules.max_ltc:.0%})"
-                        f"{_unconfirmed(source, 'max_ltc')}",
-                        DeclineReason.LTC_OVER_MAX,
-                    ))
+            deal_ltc = leverage.ltc(request.loan_amount, purchase, rehab)
+            if leverage.over_cap(deal_ltc, rules.max_ltc):
+                declines.append((
+                    f"LTC over the limit ({leverage.requested_vs_max(deal_ltc, rules.max_ltc)}; "
+                    f"loan ${request.loan_amount:,.0f} / cost ${purchase + rehab:,.0f})"
+                    f"{_unconfirmed(source, 'max_ltc')}",
+                    DeclineReason.LTC_OVER_MAX,
+                ))
 
     # 6b. Property type
     if rules.allowed_property_types:

@@ -2594,3 +2594,21 @@ def test_pausing_a_lender_reopens_nothing(rdb, slack_form):
     _route(rdb, lead)
     slack_form(_form("pause", lender=lender))
     assert _fr(rdb, lead)["status"] == "held"
+
+
+def test_a_failed_re_route_never_undoes_the_lender_change(rdb, slack_form, monkeypatch):
+    from src.lending.routing import router
+
+    lender = _add_lender(rdb, name="Signed Anyway", priority=1, agreement_status="pending")
+    _add_box(rdb, lender, loan_types=[LOAN_TYPE_FLIP])
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("database went away")
+
+    monkeypatch.setattr(router, "reopen_held", broken)
+    slack_form(_form("agreement", lender=lender, value="signed"))
+
+    status = rdb.execute(text("SELECT agreement_status FROM lending.lender_routing_rules WHERE id = :i"),
+                         {"i": lender}).scalar()
+    assert status == "signed"
+    assert any("were not re-routed" in line for line in slack_form.posted)
