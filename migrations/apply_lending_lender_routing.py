@@ -258,9 +258,10 @@ DDL = [
                 ALTER TABLE lending.file_routing ADD CONSTRAINT fk_file_routing_loan_file
                     FOREIGN KEY (loan_file_id) REFERENCES lending.loan_files (id);
             END IF;
+            -- NOT VALID: the append-only log keeps events for loan files since deleted; new rows are still checked.
             IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_fre_loan_file') THEN
                 ALTER TABLE lending.file_routing_events ADD CONSTRAINT fk_fre_loan_file
-                    FOREIGN KEY (loan_file_id) REFERENCES lending.loan_files (id);
+                    FOREIGN KEY (loan_file_id) REFERENCES lending.loan_files (id) NOT VALID;
             END IF;
         END IF;
     END $$
