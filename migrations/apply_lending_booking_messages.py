@@ -1,7 +1,7 @@
 """WP-GL-10: booking confirmation / reminder schedule and confirmation-call tasks.
 
 ``lending.booking_messages`` holds one row per (booking, message kind): the confirmation, the
-night-before reminder and the 90-minute reminder. ``UNIQUE (booking_ref, kind)`` makes scheduling
+night-before reminder, the 90-minute reminder and the 10-minute reminder. ``UNIQUE (booking_ref, kind)`` makes scheduling
 idempotent. A row moves pending -> sending -> sent | send_unknown | failed, or pending -> skipped |
 cancelled; a text is never re-sent from sending / send_unknown.
 

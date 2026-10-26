@@ -150,7 +150,7 @@ def test_a_rescheduled_event_with_a_new_time_re_plans_the_messages(client, db):
 
 def test_a_rescheduled_event_without_a_time_still_just_cancels(client, db):
     book(db)
-    assert appointment(client, "rescheduled").json() == {"status": "rescheduled", "cancelled": 3}
+    assert appointment(client, "rescheduled").json() == {"status": "rescheduled", "cancelled": 4}
 
 
 # ── follow-ups ───────────────────────────────────────────────────────────────

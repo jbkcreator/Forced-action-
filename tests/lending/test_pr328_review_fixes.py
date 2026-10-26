@@ -91,8 +91,8 @@ def test_a_reschedule_re_plans_the_messages_and_revives_the_task(db):
     db.execute(text("UPDATE lending.booking_messages SET status = 'sent' WHERE kind = 'confirmation'"))
     cancel_by_provider_event(db, "appt-1", "booking_rescheduled")
     assert listed(db) == []
-    assert book(db, slot=SLOT_B).inserted == 3
-    assert {k: (v[0], v[1]) for k, v in rows(db).items()} == {k: ("pending", SLOT_B) for k in ("confirmation", "night_before", "ninety_min")}
+    assert book(db, slot=SLOT_B).inserted == 4
+    assert {k: (v[0], v[1]) for k, v in rows(db).items()} == {k: ("pending", SLOT_B) for k in ("confirmation", "night_before", "ninety_min", "ten_min")}
     assert db.execute(text("SELECT due_date FROM lending.confirmation_tasks")).scalar() == date(2026, 10, 7)
     assert db.execute(text("SELECT cancelled_at FROM lending.confirmation_tasks")).scalar() is None
 
@@ -108,7 +108,7 @@ def test_a_redelivery_of_the_same_slot_after_a_cancel_stays_cancelled(db):
 def test_a_reschedule_leaves_a_row_that_is_being_sent_right_now(db):
     book(db)
     db.execute(text("UPDATE lending.booking_messages SET status = 'sending' WHERE kind = 'confirmation'"))
-    assert book(db, slot=SLOT_B).inserted == 2
+    assert book(db, slot=SLOT_B).inserted == 3
     assert rows(db)["confirmation"][0] == "sending"
 
 

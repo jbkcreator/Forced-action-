@@ -16,7 +16,7 @@ BANNED = ("Josh", "Kantor", "(727)", "436-9951", "4369951")
 _REMINDER_TEXTS = {
     name: value for name, value in vars(lending_reminders).items()
     if name.isupper() and isinstance(value, str)
-    and name.startswith(("CONFIRMATION_", "NIGHT_BEFORE_", "NINETY_MIN_", "GATE_FAIL_", "EMAIL_"))
+    and name.startswith(("CONFIRMATION_", "NIGHT_BEFORE_", "NINETY_MIN_", "TEN_MIN_", "GATE_FAIL_", "EMAIL_"))
 }
 _SMS_TEXTS = {
     **{name: value for name, value in _REMINDER_TEXTS.items()
@@ -55,7 +55,8 @@ def test_the_sender_and_signer_are_the_business():
     assert lending_prequal.BORROWER_SIGNER == BRAND
     assert all(BRAND in subject for subject in (
         lending_reminders.EMAIL_SUBJECT_CONFIRMATION, lending_reminders.EMAIL_SUBJECT_NIGHT_BEFORE,
-        lending_reminders.EMAIL_SUBJECT_NINETY_MIN, lending_reminders.EMAIL_SUBJECT_GATE_FAIL))
+        lending_reminders.EMAIL_SUBJECT_NINETY_MIN, lending_reminders.EMAIL_SUBJECT_TEN_MIN,
+        lending_reminders.EMAIL_SUBJECT_GATE_FAIL))
 
 
 def test_one_callback_number_everywhere():

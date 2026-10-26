@@ -23,15 +23,17 @@ TIMEZONE = ZoneInfo("America/New_York")  # same convention as WP-GL-9: one Easte
 NIGHT_BEFORE_HOUR_ET = 18  # 6:00 PM ET the evening before (Josh, Oct 4 email)
 NIGHT_BEFORE_MINUTE_ET = 0
 NINETY_MIN_SECONDS = 90 * 60
+TEN_MIN_SECONDS = 10 * 60  # client Q60: a third reminder, 10 minutes before the call
 
 # A reminder's wording is a statement about time ("tomorrow", "in about 90 minutes"), so a reminder the
 # worker could not send promptly (outage, backlog) is skipped as too_late rather than sent with wrong
 # wording: the night-before text is only valid on the Eastern day before the call; the 90-minute text
 # only within this many seconds after it came due.
 NINETY_MIN_MAX_LATE_SECONDS = 15 * 60
+TEN_MIN_MAX_LATE_SECONDS = 5 * 60  # "calling you shortly" is false once the call time has passed
 
 # Texts are only sent inside this ET window (WP-GL-9's safety window, same constants). A confirmation
-# or night-before text that comes due outside it waits for the window to open; the 90-minute text is
+# or night-before text that comes due outside it waits for the window to open; the 90-minute and 10-minute texts are
 # never deferred (its wording is a promise about timing) and is recorded as skipped_quiet_hours.
 TEXT_WINDOW_START_HOUR = QUIET_START_HOUR
 TEXT_WINDOW_END_HOUR = QUIET_END_HOUR
@@ -63,8 +65,9 @@ FALLBACK_ASSIGNEE = "jbkantor@gmail.com"
 KIND_CONFIRMATION = "confirmation"
 KIND_NIGHT_BEFORE = "night_before"
 KIND_NINETY_MIN = "ninety_min"
+KIND_TEN_MIN = "ten_min"
 KIND_GATE_FAIL = "gate_fail"
-ALL_KINDS = (KIND_CONFIRMATION, KIND_NIGHT_BEFORE, KIND_NINETY_MIN, KIND_GATE_FAIL)
+ALL_KINDS = (KIND_CONFIRMATION, KIND_NIGHT_BEFORE, KIND_NINETY_MIN, KIND_TEN_MIN, KIND_GATE_FAIL)
 
 # ── Approved text templates (B3, Josh Oct 2) ────────────────────────────────
 
@@ -102,6 +105,14 @@ NINETY_MIN_NO_ADDRESS = (
 )
 NINETY_MIN_WITH_ADDRESS = NINETY_MIN_NO_ADDRESS
 
+# Client Q60: the 10-minute reminder ("calling you shortly"). No address variant, like the 90-minute text,
+# and no reschedule link (the call is minutes away).
+TEN_MIN_NO_ADDRESS = (
+    "Hi {first_name}, this is Next Deal Lending. We'll be calling you shortly, at {time}. "
+    "Call us at {number} if anything's come up."
+)
+TEN_MIN_WITH_ADDRESS = TEN_MIN_NO_ADDRESS
+
 # The reminder before the call can carry a reschedule link, added only when LENDING_RESCHEDULE_URL
 # is set; unset = the approved text above. Keep it unset until the wording is approved and the
 # texting campaign allows links.
@@ -118,6 +129,7 @@ EMAIL_FROM_NAME = "Next Deal Lending"
 EMAIL_SUBJECT_CONFIRMATION = "Your call with Next Deal Lending is confirmed"
 EMAIL_SUBJECT_NIGHT_BEFORE = "Reminder: your call with Next Deal Lending is tomorrow"
 EMAIL_SUBJECT_NINETY_MIN = "Your call with Next Deal Lending starts in 90 minutes"
+EMAIL_SUBJECT_TEN_MIN = "Your call with Next Deal Lending starts shortly"
 EMAIL_SUBJECT_GATE_FAIL = "Your call with Next Deal Lending"
 
 # Sent when the caller's check does not pass for a call the AI booked (client Oct 4, "approved as written"):
@@ -179,3 +191,11 @@ EMAIL_NINETY_MIN_NO_ADDRESS = (
     "Call us at {number} if anything's come up.\n\n"
     "Next Deal Lending"
 )
+
+EMAIL_TEN_MIN_NO_ADDRESS = (
+    "Hi {first_name},\n\n"
+    "Your call with Next Deal Lending is in about 10 minutes, at {time}. We'll be calling you shortly.\n\n"
+    "Call us at {number} if anything's come up.\n\n"
+    "Next Deal Lending"
+)
+EMAIL_TEN_MIN_WITH_ADDRESS = EMAIL_TEN_MIN_NO_ADDRESS
