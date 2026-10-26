@@ -3,7 +3,8 @@
 Order matters: the row (with its consent evidence) is committed before GHL is called, so a GHL
 outage never loses a lead. Delivery is one idempotent function used by both the request's
 background task and the retry sweep. Nothing here sends anything to the visitor. A lead whose
-contact already had a GHL card is posted once to the ops channel (Chunk 1 Addendum 1.2.2).
+contact already had a GHL card is posted once to the ops channel (Chunk 1 Addendum 1.2.2). An owner-occupied
+property (1.1.2: business-purpose loans only) is saved as ``excluded`` and never delivered.
 """
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ from typing import Any, Mapping, Optional, Protocol
 
 from sqlalchemy import text
 
+from config.lending_occupancy import OWNER_OCCUPIED, UNKNOWN, occupancy_from_answer
 from config.lending_partners import CREDIT_BANDS
 from config.lending_web import (
     DEDUP_WINDOW_MINUTES,
@@ -60,6 +62,7 @@ class WebLeadInput:
     property_address: Optional[str] = None
     loan_amount: Optional[int] = None
     credit_band: Optional[str] = None
+    occupancy: str = UNKNOWN
 
 
 @dataclass(frozen=True)
@@ -146,6 +149,7 @@ def build_input(form: Mapping[str, Optional[str]], *, ip_address: Optional[str],
         property_address=_clean(form.get("property_address"), "property_address"),
         loan_amount=_loan_amount(form.get("loan_amount")),
         credit_band=_credit_band(form.get("credit_band")),
+        occupancy=occupancy_from_answer(form.get("occupancy")),
     )
 
 
@@ -186,9 +190,9 @@ def save_web_lead(db, data: WebLeadInput) -> tuple[int, bool]:
     lead_id = db.execute(
         text("INSERT INTO lending.web_leads (name, phone, email, property_city, deal_type, completed_projects_3y, "
              "sms_consent, deal_drop_optin, consent_text, consent_text_matches, page_url, ip_address, user_agent, "
-             "suppressed, suppression_reason, property_address, loan_amount, credit_band) "
+             "suppressed, suppression_reason, property_address, loan_amount, credit_band, occupancy, ghl_status) "
              "VALUES (:name, :phone, :email, :city, :deal, :projects, :sms, :drop, :ctext, :cmatch, :url, :ip, :ua, :sup, :reason, "
-             ":address, :amount, :band) "
+             ":address, :amount, :band, :occupancy, :ghl_status) "
              "RETURNING id"),
         {
             "name": data.name, "phone": data.phone, "email": data.email, "city": data.property_city,
@@ -197,12 +201,13 @@ def save_web_lead(db, data: WebLeadInput) -> tuple[int, bool]:
             "cmatch": None if data.consent_text is None else data.consent_text == SMS_CONSENT_TEXT,
             "url": data.page_url, "ip": data.ip_address, "ua": data.user_agent, "sup": suppressed,
             "reason": reason, "address": data.property_address, "amount": data.loan_amount, "band": data.credit_band,
+            "occupancy": data.occupancy, "ghl_status": "excluded" if data.occupancy == OWNER_OCCUPIED else "pending",
         },
     ).scalar_one()
     if data.sms_consent and not suppressed:
         record_consent(db, data.phone, "web_form")
-    logger.info("[lending-web] lead saved id=%s sms_consent=%s deal_drop=%s suppressed=%s",
-                lead_id, data.sms_consent, data.deal_drop_optin, suppressed)
+    logger.info("[lending-web] lead saved id=%s sms_consent=%s deal_drop=%s suppressed=%s occupancy=%s",
+                lead_id, data.sms_consent, data.deal_drop_optin, suppressed, data.occupancy)
     return int(lead_id), True
 
 
@@ -210,7 +215,8 @@ def will_be_contacted(db, lead_id: int) -> bool:
     """True when the visitor ticked the call/text box and the number is not suppressed, i.e. the team
     may follow up. The form page shows its "we will call you back" line only for this case."""
     return bool(db.execute(
-        text("SELECT sms_consent AND NOT suppressed FROM lending.web_leads WHERE id = :id"), {"id": lead_id},
+        text("SELECT sms_consent AND NOT suppressed AND ghl_status <> 'excluded' FROM lending.web_leads WHERE id = :id"),
+        {"id": lead_id},
     ).scalar())
 
 
@@ -228,7 +234,8 @@ def merge_into_existing(db, lead_id: int, data: WebLeadInput) -> bool:
              "property_address = COALESCE(property_address, CAST(:address AS text)), "
              "loan_amount = COALESCE(loan_amount, CAST(:amount AS bigint)), "
              "credit_band = COALESCE(credit_band, CAST(:band AS text)), "
-             "ghl_status = 'pending', ghl_attempts = 0, ghl_last_error = NULL "
+             "ghl_status = CASE WHEN ghl_status = 'excluded' THEN 'excluded' ELSE 'pending' END, "
+             "ghl_attempts = 0, ghl_last_error = NULL "
              "WHERE id = :id AND ("
              "(email IS NULL AND CAST(:email AS text) IS NOT NULL) OR "
              "(property_city IS NULL AND CAST(:city AS text) IS NOT NULL) OR "

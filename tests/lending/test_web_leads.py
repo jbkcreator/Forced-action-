@@ -305,3 +305,17 @@ def test_deal_facts_are_stored_and_filled_in_by_a_repeat(web_leads_db):
     assert merge_into_existing(web_leads_db, lead_id, _data(property_address="12 Elm St", credit_band="760+"))
     row = _row(web_leads_db, lead_id)
     assert (row["loan_amount"], row["property_address"], row["credit_band"]) == (350000, "12 Elm St", "760+")
+
+
+@pytest.mark.parametrize("answer,expected", [("yes", "owner_occupied"), ("no", "investment"), (None, "unknown")])
+def test_build_input_reads_the_occupancy_answer(answer, expected):
+    assert _data(occupancy=answer).occupancy == expected
+
+
+def test_an_owner_occupied_lead_is_saved_but_never_delivered(web_leads_db):
+    lead_id, _ = save_web_lead(web_leads_db, _data(occupancy="yes", sms_consent="yes"))
+    assert _row(web_leads_db, lead_id)["ghl_status"] == "excluded"
+    sink = RecordingSink()
+    assert deliver_pending(web_leads_db, sink, lead_id=lead_id) == 0 and sink.pushed == []
+    assert merge_into_existing(web_leads_db, lead_id, _data(occupancy="yes", sms_consent="yes", loan_amount="200000"))
+    assert _row(web_leads_db, lead_id)["ghl_status"] == "excluded"  # a repeat never re-queues it

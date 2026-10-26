@@ -384,7 +384,8 @@ class LendingWebLead(LendingBase):
     ``sms_consent`` / ``deal_drop_optin`` hold exactly what the visitor ticked, with the label
     text, page URL, IP and timestamp that make it evidence. A later unticked submission never
     edits an earlier row; every submission is its own row. ``ghl_status`` is the delivery
-    state: pending -> synced / contact_only (no new-lead stage configured) / failed.
+    state: pending -> synced / contact_only (no new-lead stage configured) / failed; ``excluded`` = owner-occupied
+    (Chunk 1 Addendum 1.1.2), never delivered.
     """
 
     __tablename__ = "web_leads"
@@ -417,9 +418,10 @@ class LendingWebLead(LendingBase):
     loan_amount: Mapped[Optional[int]] = mapped_column(BigInteger)  # whole dollars
     credit_band: Mapped[Optional[str]] = mapped_column(String(20))  # a config.lending_partners.CREDIT_BANDS label
     returning_alerted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # 1.2.2 ops alert posted once
+    occupancy: Mapped[str] = mapped_column(String(20), nullable=False, default="unknown", server_default=text("'unknown'"))  # config.lending_occupancy
 
     __table_args__ = (
-        CheckConstraint("ghl_status IN ('pending', 'synced', 'contact_only', 'failed')", name="ck_lending_web_leads_ghl_status"),
+        CheckConstraint("ghl_status IN ('pending', 'synced', 'contact_only', 'failed', 'excluded')", name="ck_lending_web_leads_ghl_status"),
         Index("idx_lending_web_leads_delivery", "ghl_status", "received_at"),
         Index("idx_lending_web_leads_phone", "phone", "received_at"),
     )

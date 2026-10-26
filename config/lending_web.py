@@ -57,4 +57,4 @@ FIELD_MAX_LENGTHS = {
 # A typed loan amount above this is a typo, not a deal (whole dollars).
 MAX_LOAN_AMOUNT = 100_000_000
 
-GHL_STATUSES = ("pending", "synced", "contact_only", "failed")
+GHL_STATUSES = ("pending", "synced", "contact_only", "failed", "excluded")
