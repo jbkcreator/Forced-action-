@@ -8,11 +8,13 @@ Nobody is named in the copy: the sender is "Next Deal Lending" (client, Q18).
 """
 from __future__ import annotations
 
-# Box 1: text messages only. The call consent is its own box (CALL_CONSENT_TEXT); the GHL 30896 rejection
-# was a single box covering calls and texts. Wording follows the 16 Oct resubmission draft without the
-# "(operated by HEU AI LLC)" clause, which the client has not yet approved: add it here and on the page together.
+# Box 1: text messages only, named "transactional". GHL's opt-in review fails a consent text that states no message
+# type ("Message type disclosure": promotional, transactional, alerts), and the client's own wording for this box is
+# "text-only transactional consent". The call consent is its own box (CALL_CONSENT_TEXT): the GHL 30896 rejection was
+# one box covering calls and texts. The box does not carry "(operated by HEU AI LLC)" (the footer, Privacy and Terms
+# do): if it is ever added, change it here and on the page together.
 SMS_CONSENT_TEXT = (
-    "I agree to receive text messages from Next Deal Lending at the number above about my inquiry, "
+    "I agree to receive transactional text messages from Next Deal Lending at the number above about my inquiry, "
     "including replies, missed-call follow-ups, and call confirmations and reminders. "
     "Message frequency varies. Message and data rates may apply. "
     "Reply STOP to opt out, HELP for help. Consent is not a condition of any financing."
