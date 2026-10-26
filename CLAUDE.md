@@ -187,7 +187,7 @@ Single `Dockerfile` at project root. `docker-compose.yml` runs `api` and `lifecy
 - **Phone numbers**: every read/write of a phone column MUST go through `src/services/phone_utils.normalize`.
 - **Payments**: Stripe SDK ≥11. All webhook handlers in `src/services/stripe_webhooks.py`.
 - **Cache/rate-limit**: Redis (server). Use `fakeredis` in tests/sandbox.
-- **Testing**: pytest only. Markers: `scenario`, `scenario_lifecycle`, `scenario_platform`, `scenario_chat`. Unit tests in `tests/`, scenario in `tests/scenarios/`, agents in `tests/agents/`.
+- **Testing**: pytest only. Markers: `scenario`, `scenario_lifecycle`, `scenario_platform`, `scenario_chat`. Unit tests in `tests/`, scenario in `tests/scenarios/`, agents in `tests/agents/`. **Tests never use the live database** (`tests/_database_guard.py`, imported first by `tests/conftest.py`): set `TEST_DATABASE_URL` to a throwaway Postgres (its name must contain `test` and it must not be the `DATABASE_URL` database; the run is refused otherwise) and the run uses it as `DATABASE_URL`; without it, every test that needs Postgres skips.
 - **Logging**: stdlib `logging` via `config/logging.yaml`. No `print()` in `src/`.
 
 ## Important Notes
