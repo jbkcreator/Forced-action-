@@ -110,3 +110,23 @@ def test_a_test_partner_and_its_files_are_tagged(tdb):
     tag_test_rows(tdb, apply=True)
     assert _flag(tdb, "lending.partners", partner) is True and _flag(tdb, "lending.partners", real_partner) is False
     assert _flag(tdb, "lending.loan_files", file_id) is True
+
+
+def test_leads_named_by_a_person_are_tagged_with_their_routing_rows_and_nobody_else(tdb):
+    from src.lending.routing.router import route_file
+
+    named, other = _lead(tdb, "9108", "someone@acme.io"), _lead(tdb, "9109", "other@acme.io")
+    route_file(named, tdb)
+    route_file(other, tdb)
+    report = tag_test_rows(tdb, apply=True, lead_ids=[named])
+    assert _flag(tdb, "lending.lendingflow_leads", named) is True and _flag(tdb, "lending.lendingflow_leads", other) is False
+    assert tdb.execute(text("SELECT is_test FROM lending.file_routing WHERE lead_id = :l"), {"l": named}).scalar() is True
+    assert tdb.execute(text("SELECT is_test FROM lending.file_routing WHERE lead_id = :l"), {"l": other}).scalar() is False
+    logged = tdb.execute(text("SELECT rule FROM lending.test_data_cleanup_log WHERE run_id = :r AND row_id = :i"
+                              " AND table_name = 'lending.lendingflow_leads'"), {"r": report.run_id, "i": named}).scalar()
+    assert logged == "named_by_operator"
+
+
+def test_too_many_named_leads_are_refused(tdb):
+    with pytest.raises(ValueError, match="at most"):
+        tag_test_rows(tdb, apply=False, lead_ids=list(range(1, 60)))

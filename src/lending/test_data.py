@@ -9,6 +9,7 @@ A dry run does the work inside a savepoint and rolls it back, so it reports exac
 
     python -m src.lending.test_data                       # dry run
     python -m src.lending.test_data --apply               # tag and log
+    python -m src.lending.test_data --apply --lead-ids 268,1192   # also tag test leads named by a person
     python -m src.lending.test_data --apply --delete      # also delete the tagged rows that can be deleted
 
 Deleting (``--apply --delete`` only; the cron job never deletes) removes ONLY rows already tagged ``is_test``, one row
@@ -75,14 +76,30 @@ def _table_exists(db, table: str) -> bool:
     return db.execute(text("SELECT to_regclass(:name) IS NOT NULL"), {"name": table}).scalar() is True
 
 
-def tag_test_rows(db, *, apply: bool) -> TagReport:
+MAX_NAMED_LEADS = 50
+
+
+def _steps_with_named_leads(lead_ids: list[int]) -> list[tuple[str, str, str]]:
+    """``_STEPS`` with the leads a person named inserted before the rows that follow a tagged lead."""
+    steps = list(_STEPS)
+    if lead_ids:
+        first_routing = next(i for i, (table, _, _) in enumerate(steps) if table == "lending.file_routing")
+        steps.insert(first_routing, ("lending.lendingflow_leads", "named_by_operator", "id = ANY(:lead_ids)"))
+    return steps
+
+
+def tag_test_rows(db, *, apply: bool, lead_ids: Optional[list[int]] = None) -> TagReport:
     """Tag the identifiable test rows. ``apply=False`` reports them and leaves nothing changed; ``apply=True`` leaves
-    the changes in the caller's transaction (the caller commits)."""
+    the changes in the caller's transaction (the caller commits). ``lead_ids`` names LendingFlow leads that are test
+    leads but cannot be recognised by a test email domain (rule ``named_by_operator``, logged like the rest)."""
+    lead_ids = sorted(set(lead_ids or []))
+    if len(lead_ids) > MAX_NAMED_LEADS:
+        raise ValueError(f"name at most {MAX_NAMED_LEADS} leads at a time")
     report = TagReport(run_id=f"test-tag-{uuid.uuid4().hex[:12]}", applied=apply)
-    params = {"domains": list(TEST_EMAIL_DOMAINS), "partner_prefix": f"{TEST_PARTNER_NAME_PREFIX}%"}
+    params = {"domains": list(TEST_EMAIL_DOMAINS), "partner_prefix": f"{TEST_PARTNER_NAME_PREFIX}%", "lead_ids": lead_ids}
     savepoint = db.begin_nested()
     try:
-        for table, rule, condition in _STEPS:
+        for table, rule, condition in _steps_with_named_leads(lead_ids):
             if not _table_exists(db, table):
                 if table not in report.skipped_tables:
                     report.skipped_tables.append(table)
@@ -197,15 +214,21 @@ def delete_test_rows(db, *, apply: bool) -> DeleteReport:
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Tag the identifiable test rows is_test and log them (Q42)")
     parser.add_argument("--apply", action="store_true", help="tag and log (default: dry run, nothing changes)")
+    parser.add_argument("--lead-ids", default="",
+                        help="comma-separated LendingFlow lead ids that are test leads but have no test email domain")
     parser.add_argument("--delete", action="store_true",
                         help="also delete the tagged test rows that can be deleted (a copy is kept); with --apply to act")
     args = parser.parse_args(argv)
+    try:
+        lead_ids = [int(part) for part in args.lead_ids.split(",") if part.strip()]
+    except ValueError:
+        parser.error("--lead-ids must be comma-separated numbers")
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     from src.lending.db import lending_session
 
     with lending_session() as db:
-        report = tag_test_rows(db, apply=args.apply)
+        report = tag_test_rows(db, apply=args.apply, lead_ids=lead_ids)
         deletion = delete_test_rows(db, apply=args.apply) if args.delete else None
     for label, ids in report.tagged.items():
         logger.info("[test-data] %s: %d row(s): %s", label, len(ids), ids[:50])
