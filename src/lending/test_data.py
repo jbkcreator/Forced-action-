@@ -7,8 +7,16 @@ tagged, never deleted, and nothing here touches suppression or consent. Every ta
 
 A dry run does the work inside a savepoint and rolls it back, so it reports exactly what ``--apply`` would tag.
 
-    python -m src.lending.test_data            # dry run
-    python -m src.lending.test_data --apply    # tag and log
+    python -m src.lending.test_data                       # dry run
+    python -m src.lending.test_data --apply               # tag and log
+    python -m src.lending.test_data --apply --delete      # also delete the tagged rows that can be deleted
+
+Deleting (``--apply --delete`` only; the cron job never deletes) removes ONLY rows already tagged ``is_test``, one row
+at a time in its own savepoint, after copying the row into ``lending.test_data_deleted_rows``. The database decides what
+can go: a row something still points at, or an append-only record (routing events, consent certificates), refuses the
+delete and the row is kept and counted. Never deleted: subscribers (tag only), and a test contact that is on the
+do-not-contact list, the suppression list or has an opt-out, because deleting it could let a blocked number be
+contacted again.
 """
 from __future__ import annotations
 
@@ -19,6 +27,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
 from config.lending_test_data import TEST_EMAIL_DOMAINS, TEST_PARTNER_NAME_PREFIX
 
@@ -95,9 +104,101 @@ def tag_test_rows(db, *, apply: bool) -> TagReport:
     return report
 
 
+# (table, [(child table, its foreign key column)]): a row is deleted together with the rows that point at it, in
+# one savepoint, so a refusal (an append-only record or another dependent) rolls the whole row back. Children are
+# copied to the archive too. ``public.subscribers`` is deliberately absent: tag only.
+DELETE_ORDER: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
+    ("lending.lendingflow_leads", (("lending.file_routing", "lead_id"),
+                                    ("lending.lendingflow_enrichment", "lead_id"),
+                                    ("lending.lendingflow_replacements", "lead_id"))),
+    ("lending.web_leads", ()),
+    ("lending.loan_files", (("lending.file_routing", "loan_file_id"),
+                             ("lending.partner_submissions", "file_id"),
+                             ("lending.partner_file_uploads", "file_id"))),
+    ("lending.partners", ()),
+    ("lending.contacts", ()),
+    ("public.checkout_provisioning_failures", ()),
+)
+# A test contact is only a candidate when none of these says the number must stay blocked.
+_CONTACT_PROTECTED = (
+    "do_not_contact"
+    " OR EXISTS (SELECT 1 FROM lending.suppression_list s WHERE s.phone = {t}.phone)"
+    " OR EXISTS (SELECT 1 FROM lending.opt_out_events o WHERE o.phone_hash = {t}.phone_hash)"
+)
+_ARCHIVE_DELETE = (
+    "WITH gone AS (DELETE FROM {table} AS t WHERE {where} RETURNING to_jsonb(t) AS data) "
+    "INSERT INTO lending.test_data_deleted_rows (run_id, table_name, row_id, row_data) "
+    "SELECT :run_id, '{table}', (data ->> 'id')::bigint, data FROM gone RETURNING row_id"
+)
+
+
+@dataclass
+class DeleteReport:
+    run_id: str
+    applied: bool
+    deleted: dict[str, int] = field(default_factory=dict)
+    kept: dict[str, dict[str, int]] = field(default_factory=dict)  # table -> reason -> rows
+
+    @property
+    def total_deleted(self) -> int:
+        return sum(self.deleted.values())
+
+
+def _candidate_ids(db, table: str) -> tuple[list[int], int]:
+    """(ids that may be deleted, number kept because they are protected) for the tagged rows of ``table``."""
+    ids = [row.id for row in db.execute(text(f"SELECT id FROM {table} WHERE is_test ORDER BY id")).all()]
+    if table != "lending.contacts" or not ids:
+        return ids, 0
+    protected = {row.id for row in db.execute(text(
+        f"SELECT id FROM lending.contacts WHERE is_test AND ({_CONTACT_PROTECTED.format(t='lending.contacts')})")).all()}
+    return [i for i in ids if i not in protected], len(protected)
+
+
+def delete_test_rows(db, *, apply: bool) -> DeleteReport:
+    """Delete the tagged test rows that can be deleted, copying each (and what points at it) into
+    ``lending.test_data_deleted_rows`` first. ``apply=False`` reports what would happen and leaves nothing changed.
+    Does not commit."""
+    report = DeleteReport(run_id=f"test-del-{uuid.uuid4().hex[:12]}", applied=apply)
+    outer = db.begin_nested()
+    try:
+        for table, children in DELETE_ORDER:
+            if not _table_exists(db, table):
+                continue
+            ids, protected = _candidate_ids(db, table)
+            if protected:
+                report.kept.setdefault(table, {})["protected_contact"] = protected
+            for row_id in ids:
+                row = db.begin_nested()
+                try:
+                    params = {"id": row_id, "run_id": report.run_id}
+                    for child, column in children:
+                        if _table_exists(db, child):
+                            db.execute(text(_ARCHIVE_DELETE.format(table=child, where=f"t.{column} = :id")), params).all()
+                    stored = db.execute(text(_ARCHIVE_DELETE.format(table=table, where="t.id = :id AND t.is_test")),
+                                        params).first()
+                except DBAPIError:  # something still points at it, or it is an append-only record: keep it whole
+                    row.rollback()
+                    kept = report.kept.setdefault(table, {})
+                    kept["has_dependents"] = kept.get("has_dependents", 0) + 1
+                    continue
+                row.commit()
+                if stored is not None:
+                    report.deleted[table] = report.deleted.get(table, 0) + 1
+    except Exception:
+        outer.rollback()
+        raise
+    if apply:
+        outer.commit()
+    else:
+        outer.rollback()
+    return report
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Tag the identifiable test rows is_test and log them (Q42)")
     parser.add_argument("--apply", action="store_true", help="tag and log (default: dry run, nothing changes)")
+    parser.add_argument("--delete", action="store_true",
+                        help="also delete the tagged test rows that can be deleted (a copy is kept); with --apply to act")
     args = parser.parse_args(argv)
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -105,12 +206,21 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     with lending_session() as db:
         report = tag_test_rows(db, apply=args.apply)
+        deletion = delete_test_rows(db, apply=args.apply) if args.delete else None
     for label, ids in report.tagged.items():
         logger.info("[test-data] %s: %d row(s): %s", label, len(ids), ids[:50])
     for table in report.skipped_tables:
         logger.info("[test-data] %s does not exist: skipped", table)
     logger.info("[test-data] run %s: %d row(s) %s", report.run_id, report.total,
                 "tagged and logged" if args.apply else "would be tagged (dry run: nothing changed)")
+    if deletion is not None:
+        for table, count in deletion.deleted.items():
+            logger.info("[test-data] %s: %d row(s) %s", table, count,
+                        "deleted (copy kept)" if args.apply else "would be deleted (dry run: nothing changed)")
+        for table, reasons in deletion.kept.items():
+            logger.info("[test-data] %s: kept %s", table, reasons)
+        logger.info("[test-data] delete run %s: %d row(s) %s", deletion.run_id, deletion.total_deleted,
+                    "deleted" if args.apply else "would be deleted (dry run)")
     return 0
 
 

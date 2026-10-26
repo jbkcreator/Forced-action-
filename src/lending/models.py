@@ -1127,6 +1127,24 @@ class LendingTestDataCleanupLog(LendingBase):
     )
 
 
+class LendingTestDataDeletedRow(LendingBase):
+    """A copy of every row src/lending/test_data.py deleted (Q42), so a deletion can be undone: ``row_data`` is the
+    whole row as JSON. Holds test rows only, and test rows can carry test emails and phones."""
+
+    __tablename__ = "test_data_deleted_rows"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(String(40), nullable=False)
+    table_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    row_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    row_data: Mapped[Any] = mapped_column(JSONB, nullable=False)
+    deleted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
+
+    __table_args__ = (
+        Index("idx_lending_test_data_deleted_rows_run", "run_id"),
+    )
+
+
 class LendingLoanFile(LendingBase):
     """One borrower file in the lending pipeline, whatever its source (P-1 creates partner files).
 

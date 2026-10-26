@@ -1,5 +1,6 @@
 """Global is_test flag (Q35): ``is_test BOOLEAN NOT NULL DEFAULT false`` on the tables test traffic lands in, and
-``lending.test_data_cleanup_log`` (one row per row tagged, so every cleanup can be reviewed and undone).
+``lending.test_data_cleanup_log`` (one row per row tagged, so every cleanup can be reviewed and undone) and
+``lending.test_data_deleted_rows`` (a JSON copy of every test row the cleanup deletes, so a deletion can be undone).
 
 Flagged: lending.contacts, lending.web_leads, lending.lendingflow_leads, lending.file_routing, lending.loan_files,
 lending.partners, public.checkout_provisioning_failures. (public.subscribers already has it.) The routing event log
@@ -19,7 +20,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
 
 from config.settings import get_settings
-from src.lending.models import LENDING_SCHEMA, LendingTestDataCleanupLog
+from src.lending.models import LENDING_SCHEMA, LendingTestDataCleanupLog, LendingTestDataDeletedRow
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -40,6 +41,7 @@ def apply_to(conn: Connection) -> list[str]:
     conn.execute(text("SET LOCAL lock_timeout = '5s'"))
     conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{LENDING_SCHEMA}"'))
     LendingTestDataCleanupLog.__table__.create(bind=conn, checkfirst=True)
+    LendingTestDataDeletedRow.__table__.create(bind=conn, checkfirst=True)
     flagged = []
     for table in FLAGGED_TABLES:
         if conn.execute(text("SELECT to_regclass(:name) IS NOT NULL"), {"name": table}).scalar() is not True:
