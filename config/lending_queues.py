@@ -2,8 +2,11 @@
 
 Dial order follows the Launch Protocol Runbook (Principle 1, "Dial Order Flipped"), which
 overrides the Oct 4 email's "Partners only when ranks 1 to 3 are empty" (open Q-8, Josh):
-  1. Partners = List 4 brokers/LOs + wholesaler lists (Sunbiz, Hunter): dialed first;
-     partner script only, never pitched or booked as borrowers.
+  1. Partners = List 4 brokers/LOs: dialed first; partner script only, never pitched or booked
+     as borrowers.
+  1b. Wholesalers = the wholesaler lists (Sunbiz, Hunter): their own BatchDialer campaign
+     ("Create the Wholesalers campaign", client, Oct 2026); dialed right after Partners, same
+     partner script, never booked as borrowers.
   2. Transaction ready = Lists 2, 9, 6 (List 2 cash buyers moved out of nurture, Oct 4 §2).
   3. Builders = Lists 3, 7.
   4. Verified maturity = Lists 1, 5, 8: the 525-record FL maturity list, filler only,
@@ -18,6 +21,7 @@ VERIFIED_MATURITY = "verified_maturity"
 TRANSACTION_READY = "transaction_ready"
 BUILDERS = "builders"
 PARTNERS = "partners"
+WHOLESALERS = "wholesalers"
 NURTURE = "nurture"
 
 SOURCE_TAG_QUEUES: dict[str, str] = {
@@ -25,7 +29,7 @@ SOURCE_TAG_QUEUES: dict[str, str] = {
     "list_2": TRANSACTION_READY, "list_9": TRANSACTION_READY, "list_6": TRANSACTION_READY,
     "list_3": BUILDERS, "list_7": BUILDERS,
     "list_4": PARTNERS,
-    "wholesaler_sunbiz": PARTNERS, "wholesaler_hunter": PARTNERS,
+    "wholesaler_sunbiz": WHOLESALERS, "wholesaler_hunter": WHOLESALERS,
 }
 # No source tag is nurture-only any more (List 2 and List 4 both moved to real
 # ranked queues above); kept as a mechanism for a future list that genuinely has
@@ -34,10 +38,10 @@ NURTURE_ONLY_TAGS: frozenset[str] = frozenset()
 LAUNCH_QUEUES = frozenset(SOURCE_TAG_QUEUES.values())
 # Partners (List 4) are dialed, but never pitched or booked as borrowers (Oct 4 §2:
 # "partner script only, never pitched as borrowers").
-NEVER_BOOKABLE_QUEUES = frozenset({PARTNERS})
+NEVER_BOOKABLE_QUEUES = frozenset({PARTNERS, WHOLESALERS})
 
 # Strict dial order: a queue is dialed only when every queue before it is empty.
-DIAL_ORDER: tuple[str, ...] = (PARTNERS, TRANSACTION_READY, BUILDERS, VERIFIED_MATURITY)
+DIAL_ORDER: tuple[str, ...] = (PARTNERS, WHOLESALERS, TRANSACTION_READY, BUILDERS, VERIFIED_MATURITY)
 
 # Runbook Principle 4: max 3 lines per seat on partner, wholesaler/broker and landline
 # numbers; 5 lines only on the cold maturity queue. Set by hand per BatchDialer campaign.
@@ -45,7 +49,7 @@ DIAL_ORDER: tuple[str, ...] = (PARTNERS, TRANSACTION_READY, BUILDERS, VERIFIED_M
 LINE_CAP = 3
 COLD_MATURITY_LINE_CAP = 5
 MAX_LINES: dict[str, int] = {
-    PARTNERS: 3, TRANSACTION_READY: 3, BUILDERS: 3, VERIFIED_MATURITY: 5,
+    PARTNERS: 3, WHOLESALERS: 3, TRANSACTION_READY: 3, BUILDERS: 3, VERIFIED_MATURITY: 5,
 }
 
 

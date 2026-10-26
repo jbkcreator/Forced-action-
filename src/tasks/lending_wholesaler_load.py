@@ -1,4 +1,4 @@
-"""Split T-11: load FL wholesaler lists into the Partners queue and tag them in GHL.
+"""Split T-11: load FL wholesaler lists into the Wholesalers queue (BatchDialer campaign "Wholesalers") and tag them in GHL.
 
 Dry run by default: the CSV is parsed and every dialer-load gate runs, but nothing is
 sent to Tracerfy, BatchDialer or GHL and the transaction is rolled back. A live run
@@ -52,7 +52,7 @@ def active_wholesaler_total(db) -> int:
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Load FL wholesaler lists into the Partners queue.")
+    parser = argparse.ArgumentParser(description="Load FL wholesaler lists into the Wholesalers queue.")
     parser.add_argument("--input", type=Path, required=True, help="wholesaler CSV")
     parser.add_argument("--live", action="store_true", help="scrub, load the dialer, push to GHL (default: dry run)")
     parser.add_argument("--confirm-scrub", type=int, help="phones you approve sending to the Tracerfy DNC scrub")

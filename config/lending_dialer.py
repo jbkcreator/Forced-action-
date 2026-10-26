@@ -7,6 +7,7 @@ POOL_CAMPAIGN_TAGS: dict[str, str] = {
     "transaction_ready": "Transaction ready",  # List 2 (cash buyers) rides along here too (Oct 4 §2)
     "builders": "Builders",
     "partners": "Partners",  # List 4: dialed as a real queue, partner script only, never bookable
+    "wholesalers": "Wholesalers",  # the wholesaler lists (Sunbiz, Hunter): their own campaign, same partner script
     "nurture": "Nurture",    # fallback for any future list with no rank of its own
 }
 
@@ -17,6 +18,7 @@ CAMPAIGN_HOOKS: dict[str, str] = {
     "Transaction ready": "Saw you picked up the property; we can help fund your next deal.",
     "Builders": "Saw your project; we fund builders and investors in your county.",
     "Partners": "You move deals, we fund buyers; let's connect our pipelines.",
+    "Wholesalers": "You move deals, we fund buyers; let's connect our pipelines.",  # the partner script until the client sends one
 }
 
 
