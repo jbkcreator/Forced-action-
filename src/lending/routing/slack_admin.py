@@ -57,7 +57,7 @@ _NEEDS_LENDER = {a for a, _ in ACTIONS} - {"add_lender", "reopen_held", "add_rea
 # A change that can let a held file match: the held no-match files are then re-run on their own.
 _REOPEN_LIMIT = 1000
 _VIEW_CHARS = 2700
-_RULE_CHANGES = frozenset({"resume", "add_box", "replace_boxes", "ground_up_min", "takes_ground_up"})
+_RULE_CHANGES = frozenset({"resume", "add_box", "replace_boxes", "ground_up_min", "takes_ground_up", "seat_cap"})
 _BOX_FIELDS = ("types_b", "states_b", "min_b", "max_b", "credit_b")
 
 

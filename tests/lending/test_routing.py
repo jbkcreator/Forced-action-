@@ -2559,6 +2559,38 @@ def test_resuming_or_changing_the_boxes_of_a_signed_lender_also_re_runs_held_fil
     assert "held file(s) sent back" in slack_form.posted[-1] and _fr(rdb, second)["status"] == "unrouted"
 
 
+def test_raising_or_removing_a_full_lenders_seat_cap_re_runs_the_files_held_because_of_it(rdb, slack_form):
+    from src.tasks.lending_routing_sweep import sweep
+
+    primary = _add_lender(rdb, name="Capped Primary", priority=1, is_primary=True, monthly_cap=1)
+    _add_box(rdb, primary, loan_types=[LOAN_TYPE_FLIP])
+    funded = _make_lead(rdb, phone_suffix="7501")
+    rdb.execute(text("INSERT INTO lending.file_routing_events (lead_id, lender_id, lender_name, action)"
+                     " VALUES (:l, :lender, 'Capped Primary', 'funded')"), {"l": funded, "lender": primary})
+    rdb.commit()  # this month's cap of 1 is used up
+    waiting = _make_lead(rdb, phone_suffix="7502")
+    _route(rdb, waiting)
+    assert (_fr(rdb, waiting)["status"], _fr(rdb, waiting)["hold_reason"]) == ("held", "no_match")
+
+    slack_form(_form("seat_cap", lender=primary, value="5"))
+    assert "1 held file(s) sent back to the router" in slack_form.posted[-1]
+    assert _fr(rdb, waiting)["status"] == "unrouted"
+    sweep(rdb)
+    assert _fr(rdb, waiting)["current_lender_name"] == "Capped Primary"
+
+    again = _make_lead(rdb, phone_suffix="7503")  # the cap is full again at 2 funded
+    rdb.execute(text("INSERT INTO lending.file_routing_events (lead_id, lender_id, lender_name, action)"
+                     " VALUES (:l, :lender, 'Capped Primary', 'funded')"), {"l": waiting, "lender": primary})
+    slack_form(_form("seat_cap", lender=primary, value="2"))
+    rdb.commit()
+    _route(rdb, again)
+    assert _fr(rdb, again)["status"] == "held"
+    slack_form(_form("seat_cap", lender=primary, value="none"))  # no cap at all
+    assert "1 held file(s) sent back" in slack_form.posted[-1]
+    sweep(rdb)
+    assert _fr(rdb, again)["current_lender_name"] == "Capped Primary"
+
+
 def test_exhausted_files_and_unrelated_changes_are_left_alone(rdb, slack_form):
     from src.lending.routing.decline import record_decline
 
@@ -2570,8 +2602,7 @@ def test_exhausted_files_and_unrelated_changes_are_left_alone(rdb, slack_form):
     assert _fr(rdb, lead)["status"] == "exhausted"
     held = _make_lead(rdb, loan_type=LOAN_TYPE_GU, phone_suffix="7402")
     _route(rdb, held)
-    slack_form(_form("seat_cap", lender=a, value="3"))  # a rule that cannot change who matches
-    slack_form(_form("pause", lender=b))
+    slack_form(_form("pause", lender=b))  # a change that cannot let a held file match
     slack_form(_form("agreement", lender=a, value="terminated"))
     assert _fr(rdb, held)["status"] == "held" and _fr(rdb, lead)["status"] == "exhausted"
     slack_form(_form("agreement", lender=a, value="signed"))  # a decline of its own is not a no-match hold
