@@ -81,5 +81,6 @@ def facts_from_lendingflow_lead(lead: Mapping[str, Any]) -> BorrowerFacts:
 
 
 def facts_from_web_lead(lead: Mapping[str, Any]) -> BorrowerFacts:
-    """From a lending.web_leads row: completed projects only; the form asks no state, amount or contract question."""
+    """From a lending.web_leads row: completed projects only. The form now also sends state, loan amount and credit band
+    as free text; they are not scored here until the score is wired into the queues (Q-18)."""
     return BorrowerFacts(completed_projects_36m=projects_from_band(lead.get("completed_projects_3y")))

@@ -381,7 +381,8 @@ class LendingMissedCallText(LendingBase):
 class LendingWebLead(LendingBase):
     """One nextdeallending.com form submission (WP-GL-11), stored before any GHL call.
 
-    ``sms_consent`` / ``deal_drop_optin`` hold exactly what the visitor ticked, with the label
+    ``sms_consent`` (text messages only), ``call_consent`` (calls only) and ``deal_drop_optin`` (the weekly
+    Deal Drop by email) are three separate boxes and hold exactly what the visitor ticked, with the label
     text, page URL, IP and timestamp that make it evidence. A later unticked submission never
     edits an earlier row; every submission is its own row. ``ghl_status`` is the delivery
     state: pending -> synced / contact_only (no new-lead stage configured) / failed; ``excluded`` = owner-occupied
@@ -398,10 +399,17 @@ class LendingWebLead(LendingBase):
     property_city: Mapped[Optional[str]] = mapped_column(String(80))
     deal_type: Mapped[Optional[str]] = mapped_column(String(60))
     completed_projects_3y: Mapped[Optional[str]] = mapped_column(String(30))
+    loan_amount: Mapped[Optional[int]] = mapped_column(BigInteger)  # whole dollars; the form's text is parsed (web_leads._loan_amount)
+    property_address: Mapped[Optional[str]] = mapped_column(String(200))
+    property_state: Mapped[Optional[str]] = mapped_column(String(40))  # USPS code when recognised, else as sent
+    credit_band: Mapped[Optional[str]] = mapped_column(String(20))  # as the form sent it
     sms_consent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    call_consent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     deal_drop_optin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
-    consent_text: Mapped[Optional[str]] = mapped_column(Text)  # the label the visitor saw, verbatim
+    consent_text: Mapped[Optional[str]] = mapped_column(Text)  # the text box's label the visitor saw, verbatim
     consent_text_matches: Mapped[Optional[bool]] = mapped_column(Boolean)  # equals config.lending_web.SMS_CONSENT_TEXT
+    call_consent_text: Mapped[Optional[str]] = mapped_column(Text)  # the call box's label the visitor saw, verbatim
+    call_consent_text_matches: Mapped[Optional[bool]] = mapped_column(Boolean)  # equals config.lending_web.CALL_CONSENT_TEXT
     page_url: Mapped[Optional[str]] = mapped_column(String(300))
     ip_address: Mapped[Optional[str]] = mapped_column(String(45))
     user_agent: Mapped[Optional[str]] = mapped_column(String(300))
@@ -414,9 +422,6 @@ class LendingWebLead(LendingBase):
     ghl_last_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     ghl_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     ghl_alerted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # Slack warning sent: not in GHL after the alert wait
-    property_address: Mapped[Optional[str]] = mapped_column(String(200))  # 1.2.2 deal facts, optional on the form
-    loan_amount: Mapped[Optional[int]] = mapped_column(BigInteger)  # whole dollars
-    credit_band: Mapped[Optional[str]] = mapped_column(String(20))  # a config.lending_partners.CREDIT_BANDS label
     returning_alerted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # 1.2.2 ops alert posted once
     occupancy: Mapped[str] = mapped_column(String(20), nullable=False, default="unknown", server_default=text("'unknown'"))  # config.lending_occupancy
 

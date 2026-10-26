@@ -413,13 +413,17 @@ def test_a_delivered_lead_is_never_alerted_about(factory, monkeypatch):
 # -------------------------------------------------------- compliance (structural)
 
 FORBIDDEN_COLUMN = re.compile(r"credit|fico|score|income|ssn|bank|tax|salary|liquid|reserve|balance|net_worth|asset", re.I)
+# The one deliberate exception: the client asked for the form to capture a rough credit band (Engineering Pod Action
+# List section 2: "Loan Amount, Property Address, Property State, and Credit Band"). It is a range the borrower picks,
+# never a score, and nothing else financial may be added without the same explicit decision.
+CLIENT_APPROVED_COLUMNS = frozenset({"credit_band"})
 
 
 def test_no_borrower_financial_field_exists_on_the_new_table(factory):
     with factory() as s:
         cols = [r[0] for r in s.execute(text(
             "SELECT column_name FROM information_schema.columns WHERE table_schema='lending' AND table_name='web_leads'"))]
-    assert cols and not [c for c in cols if FORBIDDEN_COLUMN.search(c)], cols
+    assert cols and not [c for c in cols if FORBIDDEN_COLUMN.search(c) and c not in CLIENT_APPROVED_COLUMNS], cols
 
 
 NEW_MODULES = ["src/lending/web_leads.py", "src/lending/web_lead_ghl.py", "src/api/lending_web_router.py",
@@ -440,7 +444,9 @@ def test_nothing_the_form_writes_to_ghl_states_a_rate_term_or_commitment():
     from src.lending.web_lead_ghl import _note, _tags_to_add
 
     lead = {"id": 1, "name": "Dana", "phone": PHONE, "email": None, "property_city": "Tampa", "deal_type": "Fix and flip",
-            "completed_projects_3y": "1 to 2", "sms_consent": True, "deal_drop_optin": True, "suppressed": False,
+            "completed_projects_3y": "1 to 2", "loan_amount": 250_000, "property_address": "12 Oak Ave",
+            "property_state": "FL", "credit_band": "680-719", "sms_consent": True, "call_consent": True,
+            "deal_drop_optin": True, "suppressed": False,
             "received_at": datetime.now(timezone.utc)}
     written = _note(lead) + " ".join(_tags_to_add(lead, True))
     assert not re.search(r"\brate\b|\bapr\b|interest|\bltv\b|\bltc\b|quote|approved|guarantee|%", written, re.I), written

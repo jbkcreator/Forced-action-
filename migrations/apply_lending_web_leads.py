@@ -25,9 +25,17 @@ logger = logging.getLogger(__name__)
 _ALTERS = [
     'ALTER TABLE "{t}".web_leads ADD COLUMN IF NOT EXISTS suppression_reason varchar(30)',
     'ALTER TABLE "{t}".web_leads ADD COLUMN IF NOT EXISTS ghl_alerted_at timestamptz',
+    # A2P resubmission: the form's four new fields and the separate call-consent box.
+    # loan_amount / property_address / credit_band already exist in the shared DB (another PR applied them first),
+    # so these three lines must keep exactly those types: bigint, varchar(200), varchar(20).
     'ALTER TABLE "{t}".web_leads ADD COLUMN IF NOT EXISTS property_address varchar(200)',
     'ALTER TABLE "{t}".web_leads ADD COLUMN IF NOT EXISTS loan_amount bigint',
     'ALTER TABLE "{t}".web_leads ADD COLUMN IF NOT EXISTS credit_band varchar(20)',
+    'ALTER TABLE "{t}".web_leads ADD COLUMN IF NOT EXISTS property_state varchar(40)',
+    'ALTER TABLE "{t}".web_leads ADD COLUMN IF NOT EXISTS call_consent boolean NOT NULL DEFAULT false',
+    'ALTER TABLE "{t}".web_leads ADD COLUMN IF NOT EXISTS call_consent_text text',
+    'ALTER TABLE "{t}".web_leads ADD COLUMN IF NOT EXISTS call_consent_text_matches boolean',
+    # Chunk 1 Addendum 1.2.2 / 1.1.2
     'ALTER TABLE "{t}".web_leads ADD COLUMN IF NOT EXISTS returning_alerted_at timestamptz',
     """ALTER TABLE "{t}".web_leads ADD COLUMN IF NOT EXISTS occupancy varchar(20) NOT NULL DEFAULT 'unknown'""",
     'ALTER TABLE "{t}".web_leads DROP CONSTRAINT IF EXISTS ck_lending_web_leads_ghl_status',
