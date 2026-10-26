@@ -32,7 +32,8 @@ Rule 3: ground-up not taken by rule 1 (below the minimum, no primary, primary ca
 Rule 4: flip AND (primary box fail OR at cap)
          → overflow waterfall, flip lenders
 Rule 5: DSCR or refi → overflow waterfall, DSCR lenders
-Rule 6: no lender matches → hold queue ('no_match')
+Rule 6: no lender matches → hold queue ('no_match'; 'out_of_footprint' when no signed lender's box takes the
+        file's state at all, Chunk 1 Addendum 1.1.2)
 
 BRIDGE and other products not in the spec's rules fall through to rule 6
 (never silently dropped — Q5 default).
@@ -50,6 +51,7 @@ from sqlalchemy.orm import Session
 
 from config.lending_routing import MAX_WATERFALL_DEPTH, ROUTABLE_AGREEMENT_STATUSES
 from src.lending.contracts import LoanType
+from config.lending_occupancy import HOMESTEAD_HOLD_REASON, OWNER_OCCUPIED
 from config.lending_partners import CREDIT_BANDS, PRODUCTS
 from src.lending.routing import partner_link
 from src.lending.routing.file_key import FileKey, LEAD, lead_key, loan_file_key
@@ -59,6 +61,7 @@ from src.lending.routing.rules import (
     LenderRow,
     lender_passes_box,
     load_active_lenders,
+    outside_footprint,
     BypassReason,
     primary_bypass_reason,
     primary_lender,
@@ -71,6 +74,9 @@ logger = logging.getLogger(__name__)
 # (LoanType in contracts.py, stored by the T-11 parser).  The spec's rule 5 says "DSCR or refi",
 # but LendingFlow has no refi product: a refi file arrives with no loan type and goes to rule 6.
 _GROUND_UP = LoanType.GROUND_UP_CONSTRUCTION.value
+OUT_OF_FOOTPRINT = "out_of_footprint"
+# Holds a newly signed lender or a widened box can clear: the /lenders re-route sends these back.
+NO_LENDER_HOLD_REASONS = ("no_match", OUT_OF_FOOTPRINT)
 _FLIP = LoanType.FIX_AND_FLIP.value
 _DSCR_TYPES = frozenset({LoanType.DSCR_RENTAL.value})
 
@@ -223,7 +229,8 @@ def _load_file(key: FileKey, db: Session) -> dict:
     row = db.execute(
         text(
             "SELECT id, borrower_first_name AS first_name, borrower_last_name AS last_name, product,"
-            "       loan_amount, property_state, credit_band, completed_projects, purchase_price, rehab_budget, arv"
+            "       loan_amount, property_state, credit_band, completed_projects, purchase_price, rehab_budget, arv,"
+            "       occupancy"
             "  FROM lending.loan_files"
             " WHERE id = :id"
         ),
@@ -433,6 +440,12 @@ def _route(key: FileKey, db: Session) -> None:
         _hold(key, file, "suppressed", db)
         return
 
+    if file.get("occupancy") == OWNER_OCCUPIED:
+        # Business-purpose loans only (1.1.2): the hold post tells Josh; nothing ever goes to the borrower.
+        logger.info("route %s %d: owner-occupied — holding (%s)", key.kind, key.id, HOMESTEAD_HOLD_REASON)
+        _hold(key, file, HOMESTEAD_HOLD_REASON, db)
+        return
+
     profile = _build_profile(file)
     signed = _signed(load_active_lenders(db))
 
@@ -448,15 +461,16 @@ def _route(key: FileKey, db: Session) -> None:
 
     # Rule 6: no lender matched
     if choice is None:
-        hold_reason = "exhausted" if tried else "no_match"
+        hold_reason = ("exhausted" if tried
+                       else OUT_OF_FOOTPRINT if outside_footprint(signed, profile.state) else "no_match")
         logger.info("route %s %d holding reason=%s tried=%s", key.kind, key.id, hold_reason, tried)
         _hold(key, file, hold_reason, db)
         return
 
+    chosen = choice.lender
     logger.info(
         "route %s %d -> lender_id=%d name=%r position=%d", key.kind, key.id, chosen.id, chosen.name, position,
     )
-    chosen = choice.lender
     overflow = {"overflow": True, "primary_bypass_reason": choice.bypass.value} if choice.bypass else None
     event_id = _set_routed(key, routing, chosen, position, db, overflow)
     db.commit()

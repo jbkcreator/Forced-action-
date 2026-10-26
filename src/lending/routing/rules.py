@@ -272,6 +272,15 @@ def primary_bypass_reason(lender: LenderRow, profile: FileProfile, at_cap: bool)
     return BypassReason.BOX_FAIL
 
 
+def outside_footprint(lenders: list[LenderRow], state: str) -> bool:
+    """Chunk 1 Addendum 1.1.2: no box of these lenders takes the file's state (a box without states takes all).
+    False for a file without a state or with no lenders: those are an ordinary no-match."""
+    if not (state and lenders):
+        return False
+    return not any(box.approved_states is None or state in box.approved_states
+                   for lender in lenders for box in lender.boxes)
+
+
 def lender_passes_box(lender: LenderRow, profile: FileProfile) -> bool:
     """True when the file passes at least one of the lender's product boxes.
 

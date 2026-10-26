@@ -71,6 +71,7 @@ def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
             completed_projects  integer,
             credit_band         varchar(20),
             timeline            varchar(40),
+            occupancy           varchar(20) NOT NULL DEFAULT 'unknown',
             notes               text,
             status              varchar(20)  NOT NULL DEFAULT 'received'
                                 CONSTRAINT ck_lending_loan_files_status CHECK (status IN ({_in(FILE_STATUSES)})),
@@ -88,6 +89,8 @@ def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
         )""",
         f"CREATE INDEX IF NOT EXISTS idx_lending_loan_files_partner ON {files} (partner_id, created_at)",
         f"CREATE INDEX IF NOT EXISTS idx_lending_loan_files_status ON {files} (status, status_at)",
+        # Chunk 1 Addendum 1.1.2; create never alters an existing table
+        f"ALTER TABLE {files} ADD COLUMN IF NOT EXISTS occupancy varchar(20) NOT NULL DEFAULT 'unknown'",
         f"""CREATE TABLE IF NOT EXISTS {submissions} (
             id                   bigserial PRIMARY KEY,
             file_id              bigint       NOT NULL UNIQUE REFERENCES {files} (id),

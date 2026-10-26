@@ -22,6 +22,7 @@ from jinja2 import Environment, FileSystemLoader
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
+from config.lending_occupancy import PARTNER_QUESTION
 from config.lending_partners import (
     CREDIT_BANDS,
     MAX_UPLOAD_BYTES,
@@ -80,7 +81,7 @@ def _form(token: str, partner: Partner, consent_text: str, *, values: Optional[d
           errors: Optional[list[str]] = None, status_code: int = 200) -> HTMLResponse:
     return _page("form.html", status_code=status_code, token=token, partner=partner, consent_text=consent_text,
                  values=values or {}, errors=errors or [], products=PRODUCT_LABELS, credit_bands=list(CREDIT_BANDS),
-                 timelines=TIMELINES, max_uploads=MAX_UPLOADS, max_upload_mb=MAX_UPLOAD_BYTES // (1024 * 1024))
+                 timelines=TIMELINES, occupancy_question=PARTNER_QUESTION, max_uploads=MAX_UPLOADS, max_upload_mb=MAX_UPLOAD_BYTES // (1024 * 1024))
 
 
 def _not_configured() -> HTMLResponse:
@@ -132,6 +133,7 @@ def submit_file(
     credit_band: str = Form(default=""),
     timeline: str = Form(default=""),
     notes: str = Form(default=""),
+    occupancy: str = Form(default=""),
     consent: str = Form(default=""),
     company_website: str = Form(default=""),  # honeypot: hidden on the page, bots fill it
     documents: list[UploadFile] = File(default=[]),
@@ -154,7 +156,7 @@ def submit_file(
         "property_city": property_city, "property_state": property_state, "property_zip": property_zip,
         "product": product, "purchase_price": purchase_price, "rehab_budget": rehab_budget,
         "loan_amount": loan_amount, "arv": arv, "completed_projects": completed_projects,
-        "credit_band": credit_band, "timeline": timeline, "notes": notes,
+        "credit_band": credit_band, "timeline": timeline, "notes": notes, "occupancy": occupancy,
     }
     if consent.lower() not in {"yes", "on", "true"}:
         return _form(token, partner, consent_text, values=values, status_code=400,

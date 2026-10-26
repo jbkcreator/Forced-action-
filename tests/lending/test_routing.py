@@ -467,6 +467,19 @@ def test_no_signed_lenders_holds_with_no_match(rdb):
     assert fr["hold_reason"] == "no_match"
 
 
+def test_a_state_no_signed_lender_takes_is_held_out_of_footprint(rdb):
+    """Chunk 1 Addendum 1.1.2: an out-of-state file is accepted and held for broker placement, never rejected."""
+    lender = _add_lender(rdb, name="FL Only", priority=1)
+    _add_box(rdb, lender, loan_types=[LOAN_TYPE_FLIP], approved_states=["FL", "GA"])
+    texas = _make_lead(rdb, state="TX", phone_suffix="9202")
+    _route(rdb, texas)
+    assert _fr(rdb, texas)["status"] == "held" and _fr(rdb, texas)["hold_reason"] == "out_of_footprint"
+
+    too_big = _make_lead(rdb, state="FL", loan_amount=300_000, loan_type=LOAN_TYPE_GU, phone_suffix="9203")
+    _route(rdb, too_big)  # in the footprint, but no box takes it: an ordinary no-match
+    assert _fr(rdb, too_big)["hold_reason"] == "no_match"
+
+
 # ── Idempotency ───────────────────────────────────────────────────────────────
 
 def test_route_file_is_idempotent(rdb):
@@ -1243,6 +1256,21 @@ def test_a_partner_file_with_no_matching_lender_is_held_visibly_and_not_announce
     assert _pfr(rdb, other)["status"] == "held" and _pfr(rdb, other)["hold_reason"] == "no_match"
     assert _file_status(rdb, other)[:2] == ("held", "no_match")
     assert partner_mail == []  # a hold is internal; the partner dashboard simply keeps saying "in review"
+
+
+def test_an_owner_occupied_partner_file_is_held_and_never_routed(rdb, partner_mail):
+    """Chunk 1 Addendum 1.1.2: business-purpose loans only; the partner keeps seeing "in review"."""
+    from src.lending.routing.router import route_loan_file
+
+    lender = _add_lender(rdb, name="Takes Anything", priority=1)
+    _add_box(rdb, lender, loan_types=[LOAN_TYPE_FLIP])
+    home = _make_partner_file(rdb, _make_partner(rdb))
+    rdb.execute(text("UPDATE lending.loan_files SET occupancy = 'owner_occupied' WHERE id = :f"), {"f": home})
+    rdb.commit()
+    route_loan_file(home, rdb)
+
+    assert _pfr(rdb, home)["status"] == "held" and _pfr(rdb, home)["hold_reason"] == "consumer_homestead_excluded"
+    assert partner_mail == []
 
 
 def test_the_partners_credit_band_and_experience_are_read_by_the_boxes(rdb, partner_mail):

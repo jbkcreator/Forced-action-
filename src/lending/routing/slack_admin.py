@@ -410,10 +410,10 @@ def apply_change(values: dict, db: Session) -> str:
     if action not in _WIDENING_ACTIONS and not signed:
         return summary
     db.commit()  # the lender change stands on its own: a failed re-route below must never undo it
-    from src.lending.routing.router import reopen_held
+    from src.lending.routing.router import NO_LENDER_HOLD_REASONS, reopen_held
 
     try:
-        count = reopen_held(db, "no_match", REOPEN_LIMIT)
+        count = sum(reopen_held(db, reason, REOPEN_LIMIT) for reason in NO_LENDER_HOLD_REASONS)
     except Exception as exc:  # class only: SQL errors can embed bound values
         db.rollback()
         logger.error("[routing-slack] re-routing held files after a lender change failed: %s", type(exc).__name__)
@@ -464,9 +464,9 @@ def _apply_change(values: dict, db: Session) -> str:
             lender_service.DeclineReasonIn(code=value.strip(), label=_value(values, "label_b")), db)
         return f"{'added' if reason['created'] else 'updated'} decline reason *{reason['code']}* ({_value(values, 'label_b')})"
     if action == "reopen_held":
-        from src.lending.routing.router import reopen_held
+        from src.lending.routing.router import NO_LENDER_HOLD_REASONS, reopen_held
 
-        count = reopen_held(db, "no_match", 200)
+        count = sum(reopen_held(db, reason, 200) for reason in NO_LENDER_HOLD_REASONS)
         return f"sent {count} held file(s) back to the router; the routing sweep routes them within 5 minutes"
     if action == "replace_boxes":
         old_boxes = _box_ids(db, lender["id"])

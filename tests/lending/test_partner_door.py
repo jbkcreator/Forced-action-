@@ -902,3 +902,11 @@ def test_status_notice_with_unknown_outcome_is_not_resent(engine, session_factor
     partner_pipeline.retry_status_notice(file_id, dataclasses.replace(_services(recorder, tmp_path), email=flaky_email),
                                          session_factory)
     assert len(attempts) == (2 if retried else 1)
+
+
+@pytest.mark.parametrize("answer,expected", [
+    ("yes", "owner_occupied"), ("no", "investment"), ("", "unknown"), ("maybe", "unknown")])
+def test_the_occupancy_answer_is_stored_and_never_blocks_the_form(answer, expected):
+    data = partners.SubmissionInput.model_validate(
+        {k: v for k, v in {**FORM, "occupancy": answer}.items() if k != "consent"})
+    assert data.occupancy == expected

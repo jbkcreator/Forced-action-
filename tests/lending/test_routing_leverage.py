@@ -7,6 +7,7 @@ from src.lending.routing.rules import (
     LenderRow,
     ProductBox,
     lender_passes_box,
+    outside_footprint,
     primary_bypass_reason,
 )
 
@@ -54,3 +55,18 @@ def test_the_bypass_reason_names_what_failed():
     assert primary_bypass_reason(lender, _file(), at_cap=True) == "SEAT_CAP"
     assert primary_bypass_reason(lender, _file(), at_cap=False) == "OUT_OF_FOOTPRINT"
     assert primary_bypass_reason(_lender(_box(max_loan_amount=600_000)), _file(), at_cap=False) == "BOX_FAIL"
+
+
+def test_a_state_no_signed_lender_covers_is_outside_the_footprint():
+    lenders = [_lender(_box(approved_states=frozenset({"FL", "GA"})))]
+    assert outside_footprint(lenders, "TX") is True
+    assert outside_footprint(lenders, "FL") is False
+
+
+def test_a_box_without_states_covers_every_state():
+    assert outside_footprint([_lender(_box(approved_states=frozenset({"FL"})), _box())], "TX") is False
+
+
+def test_a_file_without_a_state_or_no_lenders_is_never_outside_the_footprint():
+    assert outside_footprint([_lender(_box(approved_states=frozenset({"FL"})))], "") is False
+    assert outside_footprint([], "TX") is False
