@@ -1195,6 +1195,7 @@ class ConsentAcceptance(Base):
     modal_scrolled_to_end_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     accepted_text_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    is_test: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))  # test row: left out of reports, never out of suppression or consent
 
     tcpa_consent_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     tcpa_consent_version: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
@@ -4025,6 +4026,7 @@ class EmailOptOut(Base):
     # Durable per-row watermark: True once pushed to Instantly's block list.
     # Unpushed rows are retried every sync run (survives failed/partial pushes).
     pushed_to_instantly: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    is_test: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))  # test row: left out of reports, never out of suppression or consent
     opted_out_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
     def __repr__(self):
@@ -6269,6 +6271,7 @@ class NonBuyerNurtureSequence(Base):
     enrolled_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     removed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     removal_reason: Mapped[Optional[str]] = mapped_column(String(40))
+    is_test: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))  # test row: left out of reports, never out of suppression or consent
     converted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
@@ -6337,6 +6340,7 @@ class CheckoutRecovery(Base):
     # confirmed-abandonment sweep touch, not at row creation) so retried
     # sweeps/reopened episodes don't re-alert.
     founder_alerted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    is_test: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))  # test row: left out of reports, never out of suppression or consent
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False

@@ -38,6 +38,11 @@ _DOMAIN = "split_part(lower({column}), '@', 2) = ANY(:domains)"
 # (table, rule, condition). Order matters: a row is tagged by its own data first, then what hangs off a tagged row.
 _STEPS: tuple[tuple[str, str, str], ...] = (
     ("public.subscribers", "email_domain", _DOMAIN.format(column="email")),
+    ("public.consent_acceptances", "email_domain", _DOMAIN.format(column="email")),
+    ("public.non_buyer_nurture_sequences", "email_domain", _DOMAIN.format(column="email")),
+    ("public.checkout_recovery", "email_domain", _DOMAIN.format(column="email")),
+    ("public.email_opt_outs", "email_domain", _DOMAIN.format(column="email")),
+    ("lending.suppression_list", "email_domain", _DOMAIN.format(column="email")),
     ("public.checkout_provisioning_failures", "email_domain", _DOMAIN.format(column="email")),
     ("lending.contacts", "email_domain", _DOMAIN.format(column="email")),
     ("lending.lendingflow_leads", "email_domain", _DOMAIN.format(column="email")),
@@ -129,6 +134,11 @@ DELETE_ORDER: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     ("lending.partners", ()),
     ("lending.contacts", ()),
     ("public.checkout_provisioning_failures", ()),
+    ("public.consent_acceptances", ()),
+    ("public.non_buyer_nurture_sequences", ()),
+    ("public.checkout_recovery", ()),
+    ("public.email_opt_outs", ()),
+    ("lending.suppression_list", ()),
 )
 # A test contact is only a candidate when none of these says the number must stay blocked.
 _CONTACT_PROTECTED = (

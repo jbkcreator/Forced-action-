@@ -3,7 +3,8 @@
 ``lending.test_data_deleted_rows`` (a JSON copy of every test row the cleanup deletes, so a deletion can be undone).
 
 Flagged: lending.contacts, lending.web_leads, lending.lendingflow_leads, lending.file_routing, lending.loan_files,
-lending.partners, public.checkout_provisioning_failures. (public.subscribers already has it.) The routing event log
+lending.partners, lending.suppression_list, public.checkout_provisioning_failures, public.consent_acceptances,
+public.non_buyer_nurture_sequences, public.checkout_recovery, public.email_opt_outs. (public.subscribers already has it.) The routing event log
 has no column: its immutability trigger blocks updates, so events are excluded through their file_routing row.
 
 A table that does not exist yet (loan_files / partners need the P-1 migration) is skipped. Idempotent. A short lock
@@ -33,6 +34,11 @@ FLAGGED_TABLES: tuple[str, ...] = (
     f"{LENDING_SCHEMA}.loan_files",
     f"{LENDING_SCHEMA}.partners",
     "public.checkout_provisioning_failures",
+    "public.consent_acceptances",
+    "public.non_buyer_nurture_sequences",
+    "public.checkout_recovery",
+    "public.email_opt_outs",
+    f"{LENDING_SCHEMA}.suppression_list",
 )
 
 

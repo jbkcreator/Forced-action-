@@ -57,6 +57,7 @@ class LendingSuppression(LendingBase):
     reason: Mapped[str] = mapped_column(String(30), nullable=False)  # SuppressionReason: OPT_OUT / LITIGATOR / WARM_NETWORK
     source_channel: Mapped[str] = mapped_column(String(30), nullable=False)  # sms / email / dialer / backfill:*
     source_ref: Mapped[Optional[str]] = mapped_column(String(100))
+    is_test: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))  # test row: left out of reports, never out of suppression or consent
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 
     __table_args__ = (
