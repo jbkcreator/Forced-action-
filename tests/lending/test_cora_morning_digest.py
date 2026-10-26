@@ -24,12 +24,12 @@ _DDL = (
     "CREATE TABLE lending.pending_actions (action_id INTEGER PRIMARY KEY, tool_name TEXT, contact_ref TEXT,"
     " status TEXT, created_at TIMESTAMP)",
     "CREATE TABLE lending.booking_messages (booking_ref TEXT, first_name TEXT, booked_by TEXT, slot_start_utc TIMESTAMP)",
-    "CREATE TABLE lending.web_leads (id INTEGER PRIMARY KEY, received_at TIMESTAMP, ghl_status TEXT)",
+    "CREATE TABLE lending.web_leads (id INTEGER PRIMARY KEY, received_at TIMESTAMP, ghl_status TEXT, is_test BOOLEAN NOT NULL DEFAULT 0)",
     "CREATE TABLE lending.cora_inbox (id INTEGER PRIMARY KEY, status TEXT)",
     "CREATE TABLE lending.confirmation_tasks (booking_ref TEXT, due_date DATE, completed_at TIMESTAMP,"
     " cancelled_at TIMESTAMP)",
     "CREATE TABLE lending.lendingflow_leads (id INTEGER PRIMARY KEY, first_name TEXT, loan_type TEXT,"
-    " loan_amount_range TEXT, property_city TEXT, received_at TIMESTAMP, suppressed BOOLEAN)",
+    " loan_amount_range TEXT, property_city TEXT, received_at TIMESTAMP, suppressed BOOLEAN, is_test BOOLEAN NOT NULL DEFAULT 0)",
     "CREATE TABLE lending.lendingflow_enrichment (lead_id INTEGER, routing_tag TEXT, closer_priority BOOLEAN)",
     "CREATE TABLE lending.dialer_load_records (id INTEGER PRIMARY KEY, campaign_tag TEXT, active BOOLEAN)",
 )
@@ -113,13 +113,15 @@ def test_digest_follows_the_e5_morning_brief(engine) -> None:
                           " ('bk-2', '2026-10-20', NULL, NULL), ('bk-3', '2026-10-18', '2026-10-18 10:00:00', NULL)"))
         conn.execute(text("INSERT INTO lending.cora_inbox VALUES (1, 'new'), (2, 'dismissed')"))
         conn.execute(text("INSERT INTO lending.lendingflow_leads VALUES"
-                          " (10, 'Ana', 'Fix & Flip', '$250K - $500K', 'Tampa', '2026-10-19 02:00:00', 0),"
-                          " (11, 'Ben', 'DSCR', NULL, NULL, '2026-10-19 03:00:00', 0),"
-                          " (12, 'Cy', 'DSCR', NULL, NULL, '2026-10-19 04:00:00', 1),"
-                          " (13, 'Old', 'DSCR', NULL, NULL, '2026-10-01 04:00:00', 0)"))
+                          " (10, 'Ana', 'Fix & Flip', '$250K - $500K', 'Tampa', '2026-10-19 02:00:00', 0, 0),"
+                          " (11, 'Ben', 'DSCR', NULL, NULL, '2026-10-19 03:00:00', 0, 0),"
+                          " (12, 'Cy', 'DSCR', NULL, NULL, '2026-10-19 04:00:00', 1, 0),"
+                          " (13, 'Old', 'DSCR', NULL, NULL, '2026-10-01 04:00:00', 0, 0),"
+                          " (14, 'Qa', 'DSCR', NULL, NULL, '2026-10-19 05:00:00', 0, 1)"))
         conn.execute(text("INSERT INTO lending.lendingflow_enrichment VALUES (10, 'FULL_MACHINE', 0), (11, 'NURTURE', 1)"))
-        conn.execute(text("INSERT INTO lending.web_leads VALUES (1, '2026-10-19 02:00:00', 'synced'),"
-                          " (2, '2026-10-19 03:00:00', 'failed'), (3, '2026-10-01 03:00:00', 'synced')"))
+        conn.execute(text("INSERT INTO lending.web_leads VALUES (1, '2026-10-19 02:00:00', 'synced', 0),"
+                          " (2, '2026-10-19 03:00:00', 'failed', 0), (3, '2026-10-01 03:00:00', 'synced', 0),"
+                          " (4, '2026-10-19 04:00:00', 'synced', 1)"))
         conn.execute(text("INSERT INTO lending.dialer_load_records VALUES (1, 'maturity', 1), (2, 'maturity', 1),"
                           " (3, 'permits', 1), (4, 'permits', 0)"))
     chat = FakeChatPort(default_channel="C_CORA")

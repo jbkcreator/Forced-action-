@@ -47,10 +47,10 @@ logger = logging.getLogger(__name__)
 _CONTACTS = text("""
     WITH leads AS (
         SELECT 'lendingflow' AS source, phone, NULLIF(lower(btrim(email)), '') AS email
-          FROM lending.lendingflow_leads WHERE NOT suppressed
+          FROM lending.lendingflow_leads WHERE NOT suppressed AND NOT is_test
         UNION ALL
         SELECT 'web', phone, NULLIF(lower(btrim(email)), '')
-          FROM lending.web_leads WHERE NOT suppressed
+          FROM lending.web_leads WHERE NOT suppressed AND NOT is_test
     )
     SELECT l.source, l.phone, l.email
       FROM leads l

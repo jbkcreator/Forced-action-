@@ -36,7 +36,7 @@ SQLITE_DDL = (
     """CREATE TABLE lending.partners (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, company TEXT,
         partner_type TEXT NOT NULL, phone TEXT, email TEXT, states TEXT, agreement_status TEXT NOT NULL DEFAULT 'pending',
         referral_terms TEXT, sms_consent BOOLEAN NOT NULL DEFAULT 0, active BOOLEAN NOT NULL DEFAULT 1, created_by TEXT,
-        token_hash TEXT NOT NULL UNIQUE, token_revoked_at TIMESTAMP, created_at TIMESTAMP, updated_at TIMESTAMP)""",
+        token_hash TEXT NOT NULL UNIQUE, token_revoked_at TIMESTAMP, is_test BOOLEAN NOT NULL DEFAULT 0, created_at TIMESTAMP, updated_at TIMESTAMP)""",
     """CREATE TABLE lending.loan_files (id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, partner_id INTEGER,
         borrower_first_name TEXT NOT NULL, borrower_last_name TEXT NOT NULL, borrower_phone TEXT, borrower_email TEXT,
         product TEXT NOT NULL, loan_amount INTEGER NOT NULL, property_address TEXT, property_city TEXT,
@@ -44,7 +44,7 @@ SQLITE_DDL = (
         completed_projects INTEGER, credit_band TEXT, timeline TEXT, notes TEXT, status TEXT NOT NULL DEFAULT 'received'
         CHECK (status IN ('received','held','routed','declined','approved','funded')), status_reason TEXT,
         status_at TIMESTAMP NOT NULL, lender_fit TEXT, prequal_pdf_path TEXT, funded_at TIMESTAMP,
-        notice_status TEXT, notice_emailed_at TIMESTAMP, notice_texted_at TIMESTAMP, notice_failed_at TIMESTAMP,
+        notice_status TEXT, notice_emailed_at TIMESTAMP, notice_texted_at TIMESTAMP, notice_failed_at TIMESTAMP, is_test BOOLEAN NOT NULL DEFAULT 0,
         created_at TIMESTAMP NOT NULL, updated_at TIMESTAMP NOT NULL)""",
     """CREATE TABLE lending.partner_submissions (id INTEGER PRIMARY KEY AUTOINCREMENT, file_id INTEGER NOT NULL UNIQUE,
         partner_id INTEGER NOT NULL, consent_checked BOOLEAN NOT NULL, consent_text TEXT NOT NULL,

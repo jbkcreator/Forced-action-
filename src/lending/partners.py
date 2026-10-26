@@ -407,9 +407,9 @@ def funded_by_partner(db, month_start: date, month_end: date) -> list[tuple[str,
     """
     rows = db.execute(
         text("SELECT p.name, COUNT(f.id) AS funded FROM lending.partners p "
-             "LEFT JOIN lending.loan_files f ON f.partner_id = p.id AND f.status = 'funded' "
+             "LEFT JOIN lending.loan_files f ON f.partner_id = p.id AND f.status = 'funded' AND NOT f.is_test "
              "AND COALESCE(f.funded_at, f.status_at) >= :start AND COALESCE(f.funded_at, f.status_at) < :end "
-             "GROUP BY p.id, p.name ORDER BY funded DESC, p.name"),
+             "WHERE NOT p.is_test GROUP BY p.id, p.name ORDER BY funded DESC, p.name"),
         {"start": datetime.combine(month_start, datetime.min.time(), tzinfo=timezone.utc),
          "end": datetime.combine(month_end, datetime.min.time(), tzinfo=timezone.utc)},
     ).all()
