@@ -74,7 +74,8 @@ class FileProfile:
 
     An unknown credit band or experience count (None) means that check is not applied, in line with
     "possible, confirm on the call": the router recommends a lender and Josh submits manually.  A box's
-    max_ltv / max_ltc are not applied here either, because the file facts carry no ARV, price or rehab figures.
+    max_ltv / max_ltc apply only when the file carries the figures (partner files do; LendingFlow leads do not,
+    so their leverage is checked on the call: PENDING_CALL_FACTS).
     """
 
     loan_type: str               # LoanType value, e.g. 'FIX_AND_FLIP'
@@ -82,6 +83,9 @@ class FileProfile:
     state: str                   # 2-letter USPS code
     credit_band_min_fico: Optional[int] = None
     completed_projects: Optional[int] = None
+    purchase_price: Optional[int] = None
+    rehab_budget: Optional[int] = None
+    arv: Optional[int] = None
 
 
 # ── T-05 rule values -> boxes ─────────────────────────────────────────────
@@ -227,7 +231,55 @@ def _box_matches(box: ProductBox, profile: FileProfile) -> tuple[bool, list[str]
                 f"{box.min_completed_projects}+ minimum"
             )
 
+    reasons.extend(_leverage_breaches(box, profile))
     return len(reasons) == 0, reasons
+
+
+LEVERAGE_PREFIX = "leverage: "
+STATE_PREFIX = "state "
+
+BYPASS_SEAT_CAP = "SEAT_CAP"
+BYPASS_BOX_FAIL = "BOX_FAIL"
+BYPASS_LEVERAGE_EXCEEDED = "LEVERAGE_EXCEEDED"
+BYPASS_OUT_OF_FOOTPRINT = "OUT_OF_FOOTPRINT"
+
+
+def _leverage_breaches(box: ProductBox, profile: FileProfile) -> list[str]:
+    """LTV (loan / ARV) and LTC (loan / (purchase + rehab)) over the box caps; a missing figure skips its check."""
+    breaches: list[str] = []
+    if box.max_ltv is not None and profile.arv:
+        ltv = profile.loan_amount / profile.arv
+        if ltv > box.max_ltv:
+            breaches.append(f"{LEVERAGE_PREFIX}LTV (Requested: {ltv:.1%}, Max: {box.max_ltv:.0%})")
+    if box.max_ltc is not None and profile.purchase_price is not None and profile.rehab_budget is not None:
+        cost = profile.purchase_price + profile.rehab_budget
+        if cost > 0 and profile.loan_amount / cost > box.max_ltc:
+            ltc = profile.loan_amount / cost
+            breaches.append(f"{LEVERAGE_PREFIX}LTC (Requested: {ltc:.1%}, Max: {box.max_ltc:.0%})")
+    return breaches
+
+
+def primary_bypass_reason(lender: LenderRow, profile: FileProfile, at_cap: bool) -> str:
+    """Why the primary did not take a file it would have by amount (Chunk 1 Addendum 1.2.1).
+
+    SEAT_CAP when its monthly seats are used up; otherwise a box that failed only on leverage gives
+    LEVERAGE_EXCEEDED, only on state gives OUT_OF_FOOTPRINT, and anything else is BOX_FAIL.
+    """
+    if at_cap:
+        return BYPASS_SEAT_CAP
+    kinds: set[str] = set()
+    for box in lender.boxes:
+        matches, reasons = _box_matches(box, profile)
+        if matches or not reasons:
+            continue
+        if all(r.startswith(LEVERAGE_PREFIX) for r in reasons):
+            kinds.add(BYPASS_LEVERAGE_EXCEEDED)
+        elif all(r.startswith(STATE_PREFIX) for r in reasons):
+            kinds.add(BYPASS_OUT_OF_FOOTPRINT)
+    for kind in (BYPASS_LEVERAGE_EXCEEDED, BYPASS_OUT_OF_FOOTPRINT):
+        if kind in kinds:
+            return kind
+    return BYPASS_BOX_FAIL
 
 
 def lender_passes_box(lender: LenderRow, profile: FileProfile) -> bool:

@@ -184,6 +184,8 @@ DDL = [
         END IF;
     END $$
     """,
+    # Chunk 1 Addendum 1.2.1: why a file skipped the primary, e.g. {"overflow": true, "primary_bypass_reason": "SEAT_CAP"}.
+    "ALTER TABLE lending.file_routing_events ADD COLUMN IF NOT EXISTS metadata JSONB",
     # DELETE and non-Slack UPDATE on file_routing_events are forbidden.
     """
     CREATE OR REPLACE FUNCTION lending.fre_immutable()
@@ -202,6 +204,7 @@ DDL = [
         OR NEW.reason_code   IS DISTINCT FROM OLD.reason_code
         OR NEW.free_text     IS DISTINCT FROM OLD.free_text
         OR NEW.actor         IS DISTINCT FROM OLD.actor
+        OR NEW.metadata      IS DISTINCT FROM OLD.metadata
         OR NEW.created_at    IS DISTINCT FROM OLD.created_at
         THEN
             RAISE EXCEPTION 'file_routing_events is append-only: only slack_ts/slack_posted_at may be updated';

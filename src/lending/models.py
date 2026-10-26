@@ -886,6 +886,7 @@ class LendingFileRoutingEvent(LendingBase):
     actor: Mapped[str] = mapped_column(String(100), nullable=False, default="system", server_default=text("'system'"))
     slack_ts: Mapped[Optional[str]] = mapped_column(String(40))
     slack_posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    metadata_: Mapped[Optional[dict]] = mapped_column("metadata", JSONB)  # overflow + primary_bypass_reason (1.2.1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 
     __table_args__ = (
