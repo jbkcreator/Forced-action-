@@ -15,6 +15,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from pydantic import ValidationError
@@ -49,8 +50,13 @@ ACTIONS: tuple[tuple[str, str], ...] = (
     ("remove", "Remove the chosen lender for good (Value: type its name)"),
     ("reopen_held", "Re-route every file held with no lender match"),
     ("add_reason", "Add a decline reason (Value: its code, Label: the wording)"),
+    ("show_hold_queue", "Show the hold queue (files waiting for a lender)"),
 )
-_NEEDS_LENDER = {a for a, _ in ACTIONS} - {"add_lender", "reopen_held", "add_reason"}
+_NEEDS_LENDER = {a for a, _ in ACTIONS} - {"add_lender", "reopen_held", "add_reason", "show_hold_queue"}
+
+# A change that can let a held file match: the held no-match files are then re-run on their own.
+_REOPEN_LIMIT = 1000
+_RULE_CHANGES = frozenset({"resume", "add_box", "replace_boxes", "ground_up_min", "takes_ground_up"})
 _BOX_FIELDS = ("types_b", "states_b", "min_b", "max_b", "credit_b")
 
 
@@ -153,6 +159,7 @@ FIELDS: dict[str, _Fields] = {
     "remove": _Fields(lender=True, value=("Type the lender's name to confirm", "Spare",
                                            "Removing is for good. A lender that has routed a file cannot be removed.")),
     "reopen_held": _Fields(),
+    "show_hold_queue": _Fields(),
     "add_reason": _Fields(value=("Reason code", "appraisal_low", "Lowercase letters, numbers and underscores."), label=True),
 }
 
@@ -393,7 +400,31 @@ def _form_errors(exc: Exception, values: dict) -> dict[str, str]:
     return {block: str(exc)[:250]}
 
 
+def _may_unblock_held_files(values: dict, db: Session) -> bool:
+    """A lender was signed, or its rules or status changed, and it can now receive files (signed and active)."""
+    action = _value(values, "action_b")
+    changed = _value(values, "value_b") == "signed" if action == "agreement" else action in _RULE_CHANGES
+    lender = _value(values, "lender_b")
+    return changed and lender.isdigit() and lender_service.lender_can_receive(int(lender), db)
+
+
 def apply_change(values: dict, db: Session) -> str:
+    """Apply one submitted form, then send the held no-match files back to the router when the change lets a
+    lender receive files (the routing sweep routes them within 5 minutes). Returns the audit sentence."""
+    summary = _apply(values, db)
+    if not _may_unblock_held_files(values, db):
+        return summary
+    from src.lending.routing.router import reopen_held
+
+    try:
+        count = reopen_held(db, "no_match", _REOPEN_LIMIT)
+    except Exception as exc:  # class only: the change itself is already saved
+        logger.error("[routing-slack] re-running held files failed: %s", type(exc).__name__)
+        return f"{summary} (the held files could not be re-run: use Re-route)"
+    return f"{summary}; {count} held file(s) sent back to the router and will route within 5 minutes" if count else summary
+
+
+def _apply(values: dict, db: Session) -> str:
     """Apply one submitted form. Returns the audit sentence; raises ``ValueError``/``RoutingError`` with a clean message."""
     problems = collect_errors(values, db)
     if problems:
@@ -507,6 +538,31 @@ def _on_shown_fields(errors: dict[str, str], values: dict) -> dict[str, str]:
     return moved
 
 
+def _age(moment: datetime) -> str:
+    seconds = max(0, int((datetime.now(timezone.utc) - moment).total_seconds()))
+    days, rest = divmod(seconds, 86400)
+    hours = rest // 3600
+    return f"{days}d {hours}h" if days else f"{hours}h" if hours else f"{seconds // 60}m"
+
+
+def hold_queue_view(queue: dict) -> dict:
+    """The hold queue as a read-only modal: each file waiting for a lender, with why and for how long."""
+    lines = []
+    for f in queue["files"]:
+        label = f"Partner #{f['file_id']}" if f["source"] == "partner" else f"#{f['file_id']}"
+        amount = f"${int(f['loan_amount']):,}" if f["loan_amount"] else "no amount"
+        product = str(f["loan_type"] or "unknown").replace("_", " ").title()
+        lines.append(f"{label} {f['last_name'] or 'Unknown'} · {product} · {amount} · {f['status']} "
+                     f"({f['hold_reason'] or f['status']}) · {_age(f['updated_at'])}")
+    shown = f", showing the newest {len(lines)}" if queue["total"] > len(lines) else ""
+    body = "```" + "\n".join(lines)[:2700] + "```" if lines else "_Nothing is held._"
+    note = ("Sign a lender or change a box in /lenders and held files re-route on their own. "
+            "'Re-route every file held with no lender match' retries them now.")
+    return {"type": "modal", "title": {"type": "plain_text", "text": "Hold queue"}, "close": {"type": "plain_text", "text": "Close"},
+            "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": f"*{queue['total']} file(s) waiting for a lender*{shown}\n{body}"}},
+                       {"type": "context", "elements": [{"type": "mrkdwn", "text": note}]}]}
+
+
 def handle_submission(payload: dict) -> dict[str, Any]:
     """Slack ``view_submission`` for the lender modal. Returns the Slack response (errors keep the modal open)."""
     user = _user_id(payload)
@@ -514,6 +570,13 @@ def handle_submission(payload: dict) -> dict[str, Any]:
         logger.warning("[routing-slack] user %s is not allowed to edit lender rules", user or "unknown")
         return {"response_action": "errors", "errors": {"action_b": "You are not allowed to edit lender rules."}}
     values = (payload.get("view") or {}).get("state", {}).get("values") or {}
+    if _value(values, "action_b") == "show_hold_queue":  # a read-only view: shown in place, nothing saved or announced
+        try:
+            with lending_session() as db:
+                return {"response_action": "update", "view": hold_queue_view(lender_service.hold_queue(db))}
+        except Exception as exc:  # class only
+            logger.error("[routing-slack] reading the hold queue failed: %s", type(exc).__name__)
+            return {"response_action": "errors", "errors": {"action_b": "The hold queue could not be read; nothing was changed."}}
     try:
         with lending_session() as db:
             summary = apply_change(values, db)

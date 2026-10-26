@@ -412,6 +412,48 @@ def add_decline_reason(body: DeclineReasonIn, db: Session) -> dict:
     return {"code": body.code, "created": not existed}
 
 
+def lender_can_receive(lender_id: int, db: Session) -> bool:
+    """True for a lender that is signed and active: the only kind the router can send a file to."""
+    return bool(db.execute(
+        text("SELECT 1 FROM lending.lender_routing_rules WHERE id = :id AND agreement_status = 'signed' AND active"),
+        {"id": lender_id}).scalar())
+
+
+# ── The hold queue: files waiting for a lender ────────────────────────────────
+
+HOLD_QUEUE_SHOWN = 25
+_HELD = "fr.status IN ('held', 'exhausted')"
+_HELD_LEADS = (
+    "SELECT 'lendingflow' AS source, fr.lead_id AS file_id, ll.last_name, ll.loan_type, ll.loan_amount,"
+    "       fr.status, fr.hold_reason, fr.updated_at"
+    "  FROM lending.file_routing fr JOIN lending.lendingflow_leads ll ON ll.id = fr.lead_id"
+    f" WHERE {_HELD}"
+)
+_HELD_PARTNER_FILES = (
+    "SELECT 'partner' AS source, fr.loan_file_id AS file_id, lf.borrower_last_name AS last_name, lf.product AS loan_type,"
+    "       lf.loan_amount, fr.status, fr.hold_reason, fr.updated_at"
+    "  FROM lending.file_routing fr JOIN lending.loan_files lf ON lf.id = fr.loan_file_id"
+    f" WHERE {_HELD}"
+)
+
+
+def hold_queue(db: Session, limit: Optional[int] = None) -> dict:
+    """The files waiting for a lender (held with no match, or exhausted), newest first, and how many there are."""
+    limit = limit or HOLD_QUEUE_SHOWN
+    partner_files = db.execute(text("SELECT to_regclass('lending.loan_files') IS NOT NULL")).scalar() is True
+    union = " UNION ALL ".join([_HELD_LEADS] + ([_HELD_PARTNER_FILES] if partner_files else []))
+    rows = db.execute(text(f"SELECT * FROM ({union}) f ORDER BY f.updated_at DESC LIMIT :limit"), {"limit": limit}).mappings().all()
+    total = db.execute(text(f"SELECT COUNT(*) FROM ({union}) f")).scalar()
+    files = []
+    for row in rows:
+        item = dict(row)
+        if item["source"] == "partner":  # a partner file stores a product; show the lender-box loan type
+            product = PRODUCTS.get(item["loan_type"]) if item["loan_type"] else None
+            item["loan_type"] = product.value if product is not None else None
+        files.append(item)
+    return {"total": int(total or 0), "files": files}
+
+
 # ── The file record: where a file is, who is next, and its history ────────────
 
 _LEAD_FILE_ROW = (
