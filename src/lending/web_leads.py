@@ -2,7 +2,8 @@
 
 Order matters: the row (with its consent evidence) is committed before GHL is called, so a GHL
 outage never loses a lead. Delivery is one idempotent function used by both the request's
-background task and the retry sweep. Nothing here sends anything to the visitor.
+background task and the retry sweep. Nothing here sends anything to the visitor. A lead whose
+contact already had a GHL card is posted once to the ops channel (Chunk 1 Addendum 1.2.2).
 """
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ from typing import Any, Mapping, Optional, Protocol
 
 from sqlalchemy import text
 
+from config.lending_partners import CREDIT_BANDS
 from config.lending_web import (
     DEDUP_WINDOW_MINUTES,
     FIELD_MAX_LENGTHS,
@@ -22,7 +24,10 @@ from config.lending_web import (
     SMS_CONSENT_TEXT,
     SWEEP_BATCH_SIZE,
 )
+from config.settings import get_settings
 from src.lending.consent import record_consent
+from src.lending.lead_arrival_alert import ghl_contact_url
+from src.lending.ops_alerts import post_ops_alert
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
@@ -30,6 +35,7 @@ logger = logging.getLogger(__name__)
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _YES = {"yes", "true", "on", "1"}
+_NOT_DIGITS = re.compile(r"[^0-9]")
 
 
 class InvalidWebLead(ValueError):
@@ -50,6 +56,9 @@ class WebLeadInput:
     page_url: Optional[str]
     ip_address: Optional[str]
     user_agent: Optional[str]
+    property_address: Optional[str] = None
+    loan_amount: Optional[int] = None
+    credit_band: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -57,6 +66,8 @@ class PushResult:
     contact_id: str
     pipeline_card: bool  # False when no new-lead stage is configured: contact only
     intro_ready_tagged: bool = False  # T-09: the push added the tag that starts the GHL intro-SMS workflow
+    returning: bool = False  # 1.2.2: the contact already had a Booked Calls card
+    moved_to_new_lead: bool = False  # 1.2.2: that card was closed and is now back in the new-lead stage
 
 
 class LeadSink(Protocol):
@@ -87,6 +98,24 @@ def _ticked(value: Optional[str]) -> bool:
     return str(value or "").strip().lower() in _YES
 
 
+def _loan_amount(value: Optional[str]) -> Optional[int]:
+    if value is None or not str(value).strip():
+        return None
+    digits = _NOT_DIGITS.sub("", str(value).split(".")[0])
+    if not digits or int(digits) <= 0:
+        raise InvalidWebLead("Please check the loan amount.")
+    return int(digits)
+
+
+def _credit_band(value: Optional[str]) -> Optional[str]:
+    band = (value or "").strip()
+    if not band:
+        return None
+    if band not in CREDIT_BANDS:
+        raise InvalidWebLead("Please pick a credit range from the list.")
+    return band
+
+
 def build_input(form: Mapping[str, Optional[str]], *, ip_address: Optional[str], user_agent: Optional[str]) -> WebLeadInput:
     name = _clean(form.get("name"), "name")
     if not name:
@@ -112,6 +141,9 @@ def build_input(form: Mapping[str, Optional[str]], *, ip_address: Optional[str],
         page_url=_clean(form.get("page_url"), "page_url"),
         ip_address=(str(ip_address).strip()[:45] or None) if ip_address else None,
         user_agent=_clean(user_agent, "user_agent"),
+        property_address=_clean(form.get("property_address"), "property_address"),
+        loan_amount=_loan_amount(form.get("loan_amount")),
+        credit_band=_credit_band(form.get("credit_band")),
     )
 
 
@@ -152,8 +184,9 @@ def save_web_lead(db, data: WebLeadInput) -> tuple[int, bool]:
     lead_id = db.execute(
         text("INSERT INTO lending.web_leads (name, phone, email, property_city, deal_type, completed_projects_3y, "
              "sms_consent, deal_drop_optin, consent_text, consent_text_matches, page_url, ip_address, user_agent, "
-             "suppressed, suppression_reason) "
-             "VALUES (:name, :phone, :email, :city, :deal, :projects, :sms, :drop, :ctext, :cmatch, :url, :ip, :ua, :sup, :reason) "
+             "suppressed, suppression_reason, property_address, loan_amount, credit_band) "
+             "VALUES (:name, :phone, :email, :city, :deal, :projects, :sms, :drop, :ctext, :cmatch, :url, :ip, :ua, :sup, :reason, "
+             ":address, :amount, :band) "
              "RETURNING id"),
         {
             "name": data.name, "phone": data.phone, "email": data.email, "city": data.property_city,
@@ -161,7 +194,7 @@ def save_web_lead(db, data: WebLeadInput) -> tuple[int, bool]:
             "sms": data.sms_consent, "drop": data.deal_drop_optin, "ctext": data.consent_text,
             "cmatch": None if data.consent_text is None else data.consent_text == SMS_CONSENT_TEXT,
             "url": data.page_url, "ip": data.ip_address, "ua": data.user_agent, "sup": suppressed,
-            "reason": reason,
+            "reason": reason, "address": data.property_address, "amount": data.loan_amount, "band": data.credit_band,
         },
     ).scalar_one()
     if data.sms_consent and not suppressed:
@@ -190,15 +223,22 @@ def merge_into_existing(db, lead_id: int, data: WebLeadInput) -> bool:
              "property_city = COALESCE(property_city, CAST(:city AS text)), "
              "deal_type = COALESCE(deal_type, CAST(:deal AS text)), "
              "completed_projects_3y = COALESCE(completed_projects_3y, CAST(:projects AS text)), "
+             "property_address = COALESCE(property_address, CAST(:address AS text)), "
+             "loan_amount = COALESCE(loan_amount, CAST(:amount AS bigint)), "
+             "credit_band = COALESCE(credit_band, CAST(:band AS text)), "
              "ghl_status = 'pending', ghl_attempts = 0, ghl_last_error = NULL "
              "WHERE id = :id AND ("
              "(email IS NULL AND CAST(:email AS text) IS NOT NULL) OR "
              "(property_city IS NULL AND CAST(:city AS text) IS NOT NULL) OR "
              "(deal_type IS NULL AND CAST(:deal AS text) IS NOT NULL) OR "
-             "(completed_projects_3y IS NULL AND CAST(:projects AS text) IS NOT NULL)) "
+             "(completed_projects_3y IS NULL AND CAST(:projects AS text) IS NOT NULL) OR "
+             "(property_address IS NULL AND CAST(:address AS text) IS NOT NULL) OR "
+             "(loan_amount IS NULL AND CAST(:amount AS bigint) IS NOT NULL) OR "
+             "(credit_band IS NULL AND CAST(:band AS text) IS NOT NULL)) "
              "RETURNING id"),
         {"id": lead_id, "email": data.email, "city": data.property_city,
-         "deal": data.deal_type, "projects": data.completed_projects_3y},
+         "deal": data.deal_type, "projects": data.completed_projects_3y,
+         "address": data.property_address, "amount": data.loan_amount, "band": data.credit_band},
     ).first()
     if changed is not None:
         logger.info("[lending-web] repeat submission added details to lead id=%s", lead_id)
@@ -215,7 +255,8 @@ def _backoff_minutes_sql() -> str:
 
 _DELIVERABLE = (
     "SELECT id, name, phone, email, property_city, deal_type, completed_projects_3y, sms_consent, "
-    "deal_drop_optin, suppressed, received_at, ghl_attempts FROM lending.web_leads "
+    "deal_drop_optin, suppressed, received_at, ghl_attempts, property_address, loan_amount, credit_band "
+    "FROM lending.web_leads "
     "WHERE ghl_status IN ('pending', 'failed') AND received_at > :oldest {extra} "
     "ORDER BY received_at LIMIT :limit FOR UPDATE SKIP LOCKED"
 )
@@ -260,8 +301,35 @@ def _deliver_one(db, sink: LeadSink, lead: dict[str, Any], now: datetime) -> int
              "ghl_last_attempt_at = :now, ghl_synced_at = :now, ghl_last_error = NULL WHERE id = :id"),
         {"s": "synced" if result.pipeline_card else "contact_only", "c": result.contact_id, "now": now, "id": lead["id"]},
     )
-    logger.info("[lending-web] lead delivered id=%s pipeline_card=%s", lead["id"], result.pipeline_card)
+    logger.info("[lending-web] lead delivered id=%s pipeline_card=%s returning=%s",
+                lead["id"], result.pipeline_card, result.returning)
+    if result.returning:
+        _alert_returning(db, lead, result, now)
     return 1
+
+
+def returning_alert_text(name: str, lead_id: int, moved: bool, contact_url: Optional[str]) -> str:
+    """First name and last initial only: the full name stays in GHL."""
+    first, _, last = name.strip().partition(" ")
+    shown = f"{first} {last.strip()[0]}." if last.strip() else first
+    outcome = "Moved to New Lead" if moved else "Left in its current stage"
+    return (f":recycle: Returning Borrower Resubmitted Form: {shown} - {outcome}. Lead `{lead_id}`."
+            + (f" <{contact_url}|Open in GHL>" if contact_url else ""))
+
+
+def _alert_returning(db, lead: Mapping[str, Any], result: PushResult, now: datetime) -> None:
+    """Once per lead: a re-delivery of the same row (details merged in) is not a new submission."""
+    claimed = db.execute(
+        text("UPDATE lending.web_leads SET returning_alerted_at = :now "
+             "WHERE id = :id AND returning_alerted_at IS NULL RETURNING id"),
+        {"now": now, "id": lead["id"]},
+    ).first()
+    if claimed is None:
+        return
+    settings = get_settings()
+    url = ghl_contact_url(settings.lending_ghl_app_url, settings.lending_ghl_location_id, result.contact_id)
+    if not post_ops_alert(returning_alert_text(str(lead["name"]), int(lead["id"]), result.moved_to_new_lead, url)):
+        logger.warning("[lending-web] returning-contact alert not posted lead=%s", lead["id"])
 
 
 def _record_failure(db, lead: dict[str, Any], reason: str, now: datetime, *, config_error: bool = False) -> None:

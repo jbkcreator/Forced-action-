@@ -51,6 +51,7 @@ class FakeGhl:
 def _lead(**overrides):
     lead = {"id": 7, "name": "Dana Builder", "phone": "+18135550142", "email": "dana@example.com",
             "property_city": "Tampa", "deal_type": "Fix and flip", "completed_projects_3y": "1 to 2",
+            "property_address": None, "loan_amount": None, "credit_band": None,
             "sms_consent": False, "deal_drop_optin": False, "suppressed": False,
             "received_at": datetime(2026, 10, 5, 15, 30, tzinfo=timezone.utc), "ghl_attempts": 0}
     lead.update(overrides)
@@ -60,9 +61,11 @@ def _lead(**overrides):
 @pytest.fixture(autouse=True)
 def _unconfigured(monkeypatch):
     settings = get_settings()
-    for field in ("lending_ghl_pipeline_id", "lending_ghl_stage_new_lead",
-                  "lending_ghl_cf_sms_consent", "lending_ghl_cf_deal_drop_optin"):
+    for field in ("lending_ghl_pipeline_id", "lending_ghl_stage_new_lead", "lending_ghl_stage_nurture",
+                  "lending_ghl_cf_sms_consent", "lending_ghl_cf_deal_drop_optin", "lending_ghl_cf_property_address",
+                  "lending_ghl_cf_loan_amount", "lending_ghl_cf_credit_band"):
         monkeypatch.setattr(settings, field, None, raising=False)
+    monkeypatch.setattr(settings, "lending_ghl_reopen_stage_ids", "", raising=False)
 
 
 def _configure_pipeline(monkeypatch):
@@ -174,12 +177,94 @@ def test_a_pipeline_card_is_created_when_the_contact_has_none(monkeypatch):
     assert created["pipelineStageId"] == "stage_new" and created["contactId"] == "c_1" and created["status"] == "open"
 
 
-def test_an_existing_card_is_never_moved_or_duplicated(monkeypatch):
+def test_an_active_card_is_never_moved_or_duplicated(monkeypatch):
     _configure_pipeline(monkeypatch)
-    ghl = FakeGhl(monkeypatch, _routes(opportunities=[{"id": "o_9"}]))
+    ghl = FakeGhl(monkeypatch, _routes(opportunities=[{"id": "o_9", "pipelineStageId": "stage_booked", "status": "open"}]))
     result = GhlLeadSink(ACCOUNT).push(_lead())
-    assert result.pipeline_card is True
+    assert result.pipeline_card is True and result.returning is True and result.moved_to_new_lead is False
     assert not any(m in ("POST", "PUT") and p.startswith("/opportunities") for m, p in ghl.paths())
+
+
+@pytest.mark.parametrize("opportunity", [
+    {"id": "o_9", "pipelineStageId": "stage_nurture", "status": "open"},
+    {"id": "o_9", "pipelineStageId": "stage_dead", "status": "open"},
+    {"id": "o_9", "pipelineStageId": "stage_booked", "status": "lost"},
+    {"id": "o_9", "pipelineStageId": "stage_x", "status": "abandoned"},
+])
+def test_a_closed_card_is_moved_back_to_new_lead(monkeypatch, opportunity):
+    _configure_pipeline(monkeypatch)
+    monkeypatch.setattr(get_settings(), "lending_ghl_reopen_stage_ids", "stage_nurture, stage_dead", raising=False)
+    routes = _routes(opportunities=[opportunity])
+    routes[("PUT", "/opportunities/o_9")] = FakeResponse(200, {})
+    ghl = FakeGhl(monkeypatch, routes)
+    result = GhlLeadSink(ACCOUNT).push(_lead())
+    assert result.returning is True and result.moved_to_new_lead is True
+    assert ghl.body("PUT", "/opportunities/o_9")["json"] == {"pipelineStageId": "stage_new", "status": "open"}
+    assert not any(p == "/opportunities/" for _, p in ghl.paths())
+
+
+def test_without_reopen_stages_only_nurture_is_moved(monkeypatch):
+    _configure_pipeline(monkeypatch)
+    settings = get_settings()
+    monkeypatch.setattr(settings, "lending_ghl_reopen_stage_ids", "", raising=False)
+    monkeypatch.setattr(settings, "lending_ghl_stage_nurture", "stage_nurture", raising=False)
+    routes = _routes(opportunities=[{"id": "o_9", "pipelineStageId": "stage_nurture", "status": "open"}])
+    routes[("PUT", "/opportunities/o_9")] = FakeResponse(200, {})
+    FakeGhl(monkeypatch, routes)
+    assert GhlLeadSink(ACCOUNT).push(_lead()).moved_to_new_lead is True
+
+    FakeGhl(monkeypatch, _routes(opportunities=[{"id": "o_9", "pipelineStageId": "stage_dead", "status": "open"}]))
+    assert GhlLeadSink(ACCOUNT).push(_lead()).moved_to_new_lead is False
+
+
+def test_a_won_card_is_never_moved(monkeypatch):
+    _configure_pipeline(monkeypatch)
+    monkeypatch.setattr(get_settings(), "lending_ghl_reopen_stage_ids", "stage_nurture", raising=False)
+    ghl = FakeGhl(monkeypatch, _routes(opportunities=[{"id": "o_9", "pipelineStageId": "stage_nurture", "status": "won"}]))
+    assert GhlLeadSink(ACCOUNT).push(_lead()).moved_to_new_lead is False
+    assert not any(m == "PUT" for m, _ in ghl.paths())
+
+
+def test_a_failed_move_fails_the_delivery_so_it_is_retried(monkeypatch):
+    _configure_pipeline(monkeypatch)
+    monkeypatch.setattr(get_settings(), "lending_ghl_reopen_stage_ids", "stage_nurture", raising=False)
+    routes = _routes(opportunities=[{"id": "o_9", "pipelineStageId": "stage_nurture", "status": "open"}])
+    routes[("PUT", "/opportunities/o_9")] = FakeResponse(500)
+    FakeGhl(monkeypatch, routes)
+    with pytest.raises(DeliveryError, match="opportunity reopen: HTTP 500"):
+        GhlLeadSink(ACCOUNT).push(_lead())
+
+
+def test_a_returning_contact_gets_the_returning_tag(monkeypatch):
+    _configure_pipeline(monkeypatch)
+    ghl = FakeGhl(monkeypatch, _routes(opportunities=[{"id": "o_9", "pipelineStageId": "stage_booked", "status": "open"}]))
+    GhlLeadSink(ACCOUNT).push(_lead())
+    tag_calls = [k["json"]["tags"] for m, p, k in ghl.calls if (m, p) == ("POST", "/contacts/c_1/tags")]
+    assert ["web-lead-returning"] in tag_calls
+
+
+def test_a_first_time_contact_is_not_returning(monkeypatch):
+    _configure_pipeline(monkeypatch)
+    ghl = FakeGhl(monkeypatch, _routes())
+    result = GhlLeadSink(ACCOUNT).push(_lead())
+    assert result.returning is False
+    assert all("web-lead-returning" not in k["json"]["tags"] for m, p, k in ghl.calls if p == "/contacts/c_1/tags")
+
+
+def test_deal_facts_are_written_to_their_custom_fields_when_given(monkeypatch):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "lending_ghl_cf_property_address", "cf_addr", raising=False)
+    monkeypatch.setattr(settings, "lending_ghl_cf_loan_amount", "cf_amt", raising=False)
+    monkeypatch.setattr(settings, "lending_ghl_cf_credit_band", "cf_band", raising=False)
+    ghl = FakeGhl(monkeypatch, _routes())
+    GhlLeadSink(ACCOUNT).push(_lead(property_address="12 Elm St, Tampa FL", loan_amount=350000, credit_band="680-719"))
+    assert ghl.body("POST", "/contacts/upsert")["json"]["customFields"] == [
+        {"id": "cf_addr", "value": "12 Elm St, Tampa FL"}, {"id": "cf_amt", "value": "350000"},
+        {"id": "cf_band", "value": "680-719"}]
+
+    ghl = FakeGhl(monkeypatch, _routes())
+    GhlLeadSink(ACCOUNT).push(_lead())  # a blank fact never clears an earlier value
+    assert "customFields" not in ghl.body("POST", "/contacts/upsert")["json"]
 
 
 def test_the_note_records_the_ticked_values_and_the_utc_time(monkeypatch):

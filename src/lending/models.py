@@ -413,6 +413,10 @@ class LendingWebLead(LendingBase):
     ghl_last_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     ghl_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     ghl_alerted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # Slack warning sent: not in GHL after the alert wait
+    property_address: Mapped[Optional[str]] = mapped_column(String(200))  # 1.2.2 deal facts, optional on the form
+    loan_amount: Mapped[Optional[int]] = mapped_column(BigInteger)  # whole dollars
+    credit_band: Mapped[Optional[str]] = mapped_column(String(20))  # a config.lending_partners.CREDIT_BANDS label
+    returning_alerted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # 1.2.2 ops alert posted once
 
     __table_args__ = (
         CheckConstraint("ghl_status IN ('pending', 'synced', 'contact_only', 'failed')", name="ck_lending_web_leads_ghl_status"),

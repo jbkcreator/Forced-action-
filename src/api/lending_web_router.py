@@ -44,6 +44,9 @@ def create_web_lead(
     property_city: Optional[str] = Form(default=None),
     deal_type: Optional[str] = Form(default=None),
     completed_projects_3y: Optional[str] = Form(default=None),
+    property_address: Optional[str] = Form(default=None),
+    loan_amount: Optional[str] = Form(default=None),
+    credit_band: Optional[str] = Form(default=None),
     sms_consent: Optional[str] = Form(default=None),
     deal_drop_optin: Optional[str] = Form(default=None),
     consent_text: Optional[str] = Form(default=None),
@@ -60,6 +63,7 @@ def create_web_lead(
             {
                 "name": name, "phone": phone, "email": email, "property_city": property_city,
                 "deal_type": deal_type, "completed_projects_3y": completed_projects_3y,
+                "property_address": property_address, "loan_amount": loan_amount, "credit_band": credit_band,
                 "sms_consent": sms_consent, "deal_drop_optin": deal_drop_optin,
                 "consent_text": consent_text, "page_url": page_url,
             },

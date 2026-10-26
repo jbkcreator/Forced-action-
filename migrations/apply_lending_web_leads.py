@@ -25,6 +25,10 @@ logger = logging.getLogger(__name__)
 _ALTERS = [
     'ALTER TABLE "{t}".web_leads ADD COLUMN IF NOT EXISTS suppression_reason varchar(30)',
     'ALTER TABLE "{t}".web_leads ADD COLUMN IF NOT EXISTS ghl_alerted_at timestamptz',
+    'ALTER TABLE "{t}".web_leads ADD COLUMN IF NOT EXISTS property_address varchar(200)',
+    'ALTER TABLE "{t}".web_leads ADD COLUMN IF NOT EXISTS loan_amount bigint',
+    'ALTER TABLE "{t}".web_leads ADD COLUMN IF NOT EXISTS credit_band varchar(20)',
+    'ALTER TABLE "{t}".web_leads ADD COLUMN IF NOT EXISTS returning_alerted_at timestamptz',
 ]
 
 

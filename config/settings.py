@@ -937,6 +937,12 @@ class AppSettings(BaseSettings):
 	lending_ghl_stage_new_lead: Optional[str] = Field(default=None, env="LENDING_GHL_STAGE_NEW_LEAD")
 	lending_ghl_cf_sms_consent: Optional[str] = Field(default=None, env="LENDING_GHL_CF_SMS_CONSENT")
 	lending_ghl_cf_deal_drop_optin: Optional[str] = Field(default=None, env="LENDING_GHL_CF_DEAL_DROP_OPTIN")
+	# Chunk 1 Addendum 1.2.2: deal facts from the form, written only when given. Comma-separated Booked Calls stage ids a
+	# returning web contact's card is moved out of, back to the new-lead stage (Nurture/Dead/Lost); empty = Nurture only.
+	lending_ghl_cf_property_address: Optional[str] = Field(default=None, env="LENDING_GHL_CF_PROPERTY_ADDRESS")
+	lending_ghl_cf_loan_amount: Optional[str] = Field(default=None, env="LENDING_GHL_CF_LOAN_AMOUNT")
+	lending_ghl_cf_credit_band: Optional[str] = Field(default=None, env="LENDING_GHL_CF_CREDIT_BAND")
+	lending_ghl_reopen_stage_ids: str = Field(default="", env="LENDING_GHL_REOPEN_STAGE_IDS")
 	# T-11 LendingFlow intake. Off by default; the receiver is closed (503) until the flag is on AND the secret is set.
 	lending_lendingflow_enabled: bool = Field(default=False, env="LENDING_LENDINGFLOW_ENABLED")
 	lending_lendingflow_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_LENDINGFLOW_WEBHOOK_SECRET")

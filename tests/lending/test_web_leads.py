@@ -14,6 +14,8 @@ from src.lending.web_leads import (
     PushResult,
     build_input,
     deliver_pending,
+    merge_into_existing,
+    returning_alert_text,
     save_web_lead,
 )
 
@@ -243,3 +245,60 @@ def test_without_ghl_configured_leads_wait_and_no_attempt_is_burned(web_leads_db
     assert deliver_pending(web_leads_db, None, lead_id=lead_id) == 0
     row = _row(web_leads_db, lead_id)
     assert row["ghl_status"] == "pending" and row["ghl_attempts"] == 0
+
+
+def test_build_input_reads_the_optional_deal_facts():
+    data = _data(property_address=" 12 Elm St, Tampa FL ", loan_amount="$350,000", credit_band="680-719")
+    assert (data.property_address, data.loan_amount, data.credit_band) == ("12 Elm St, Tampa FL", 350000, "680-719")
+    blank = _data()
+    assert (blank.property_address, blank.loan_amount, blank.credit_band) == (None, None, None)
+
+
+@pytest.mark.parametrize("overrides,message", [
+    ({"loan_amount": "a lot"}, "loan amount"),
+    ({"loan_amount": "0"}, "loan amount"),
+    ({"credit_band": "800+"}, "credit"),
+])
+def test_build_input_rejects_unusable_deal_facts(overrides, message):
+    with pytest.raises(InvalidWebLead, match=message):
+        _data(**overrides)
+
+
+@pytest.mark.parametrize("name,moved,expected", [
+    ("Dana Builder", True, ":recycle: Returning Borrower Resubmitted Form: Dana B. - Moved to New Lead"),
+    ("Dana", False, ":recycle: Returning Borrower Resubmitted Form: Dana - Left in its current stage"),
+])
+def test_returning_alert_names_the_borrower_by_first_name_and_initial(name, moved, expected):
+    text_ = returning_alert_text(name, lead_id=7, moved=moved, contact_url=None)
+    assert text_.startswith(expected) and "Lead `7`" in text_ and "Builder" not in text_
+
+
+def test_returning_alert_links_the_ghl_contact():
+    assert "<https://ghl/c|Open in GHL>" in returning_alert_text("Dana Builder", 7, True, "https://ghl/c")
+
+
+def test_a_returning_lead_is_alerted_once(web_leads_db, monkeypatch):
+    posted = []
+    monkeypatch.setattr("src.lending.web_leads.post_ops_alert", lambda message: posted.append(message) or True)
+    lead_id, _ = save_web_lead(web_leads_db, _data())
+    sink = RecordingSink(PushResult("ghl_1", pipeline_card=True, returning=True, moved_to_new_lead=True))
+    deliver_pending(web_leads_db, sink, lead_id=lead_id)
+    web_leads_db.execute(text("UPDATE lending.web_leads SET ghl_status = 'pending' WHERE id = :i"), {"i": lead_id})
+    deliver_pending(web_leads_db, sink, lead_id=lead_id)  # a re-delivery (merged details) never re-alerts
+    assert len(posted) == 1 and "Moved to New Lead" in posted[0]
+    assert _row(web_leads_db, lead_id)["returning_alerted_at"] is not None
+
+
+def test_a_first_time_lead_is_not_alerted(web_leads_db, monkeypatch):
+    posted = []
+    monkeypatch.setattr("src.lending.web_leads.post_ops_alert", lambda message: posted.append(message) or True)
+    lead_id, _ = save_web_lead(web_leads_db, _data())
+    deliver_pending(web_leads_db, RecordingSink(), lead_id=lead_id)
+    assert posted == []
+
+
+def test_deal_facts_are_stored_and_filled_in_by_a_repeat(web_leads_db):
+    lead_id, _ = save_web_lead(web_leads_db, _data(loan_amount="350000"))
+    assert merge_into_existing(web_leads_db, lead_id, _data(property_address="12 Elm St", credit_band="760+"))
+    row = _row(web_leads_db, lead_id)
+    assert (row["loan_amount"], row["property_address"], row["credit_band"]) == (350000, "12 Elm St", "760+")

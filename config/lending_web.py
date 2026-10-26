@@ -38,6 +38,10 @@ GHL_TAG_WEB_LEAD = "web-lead"
 GHL_TAG_SMS_CONSENT_YES = "web-sms-consent-yes"
 GHL_TAG_SMS_CONSENT_NO = "web-sms-consent-no"
 GHL_TAG_DEAL_DROP_OPTIN = "web-deal-drop-optin"
+# Chunk 1 Addendum 1.2.2: the contact already had a Booked Calls card when the form came in.
+GHL_TAG_RETURNING = "web-lead-returning"
+# Opportunity statuses that count as closed, whatever the stage: a returning contact's card is reopened.
+GHL_REOPEN_STATUSES = frozenset({"lost", "abandoned"})
 
 FIELD_MAX_LENGTHS = {
     "name": 120,
@@ -45,6 +49,7 @@ FIELD_MAX_LENGTHS = {
     "property_city": 80,
     "deal_type": 60,
     "completed_projects_3y": 30,
+    "property_address": 200,
     "consent_text": 2000,
     "page_url": 300,
     "user_agent": 300,
