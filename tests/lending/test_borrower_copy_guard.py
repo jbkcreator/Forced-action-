@@ -67,6 +67,7 @@ def test_the_two_consent_boxes_are_separate():
     assert BRAND in sms and BRAND in call
     assert "text messages" in sms and "may call me" not in sms  # the text box does not also grant calls
     assert "transactional text messages" in sms  # GHL's opt-in review fails a consent text that names no message type
+    assert "(operated by HEU AI LLC)" in sms and "(operated by HEU AI LLC)" in call  # ...and one that omits the legal name
     assert "may call me" in call and "text message" not in call.lower()  # the call box does not also grant texts
     assert "To stop calls" in call and "optout@nextdeallending.com" in call  # a call box needs its own way to stop
     assert "STOP" in sms and "HELP" in sms and "Message and data rates may apply" in sms
