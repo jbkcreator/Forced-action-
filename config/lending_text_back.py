@@ -1,4 +1,8 @@
-"""WP-GL-9 text-back: client-approved wording and the rules around it (values only, no logic)."""
+"""WP-GL-9 text-back: client-approved wording and the rules around it (values only, no logic).
+
+The sender is named "Next Deal Lending", never a personal name (client, Engineering Pod Action List section 2,
+Q18). Any change to the wording needs a matching update of the 10DLC campaign sample messages.
+"""
 from __future__ import annotations
 
 from config.lending_queues import BUILDERS, NURTURE, TRANSACTION_READY, VERIFIED_MATURITY

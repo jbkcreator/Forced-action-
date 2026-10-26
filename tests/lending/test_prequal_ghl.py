@@ -167,5 +167,12 @@ def test_email_is_signed_next_deal_lending_with_no_personal_name():
     assert "Josh" not in text and "Loan Officer" not in text
 
 
+def test_email_is_signed_next_deal_lending_and_names_no_person():
+    text = prequal_ghl.EMAIL_SUBJECT + prequal_ghl.EMAIL_HTML
+    assert "Next Deal Lending" in prequal_ghl.EMAIL_HTML
+    assert "Josh" not in text and "Kantor" not in text and "(727)" not in text
+    assert "(656) 221-1100" in prequal_ghl.EMAIL_HTML
+
+
 def test_email_says_figures_are_subject_to_lender_confirmation():
     assert "subject to lender confirmation" in prequal_ghl.EMAIL_HTML

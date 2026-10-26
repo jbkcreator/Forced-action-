@@ -87,6 +87,14 @@ def test_letter_is_branded_next_deal_lending_only():
     footer = "Next Deal Lending &middot; Tampa, Florida &middot; (656) 221-1100 &middot; hello@nextdeallending.com"
     assert footer in re.sub(r"<[^>]+>", "", html)
     assert "Josh" not in html and "Loan Officer" not in html and "436-9951" not in html
+
+
+def test_letter_is_signed_next_deal_lending_and_names_no_person():
+    ctx = prequal.build_context(PrequalLead("680-719", 300_000, "FL", "FIX_AND_FLIP"), [FitLimits(75_000, 2_000_000)], 10)
+    html = render_html(prequal.TEMPLATE, ctx, watermark=NON_BINDING_PREQUAL_WATERMARK)
+    assert "Next Deal Lending" in html
+    assert "Josh" not in html and "Kantor" not in html and "(727)" not in html
+    assert "(656) 221-1100" in html
     assert "subject to lender confirmation" in html
 
 

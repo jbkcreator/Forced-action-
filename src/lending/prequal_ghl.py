@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 PDF_FILENAME = "Pre-Qualification-Estimate.pdf"
 EMAIL_SUBJECT = "Your pre-qualification estimate"
-# Signed "Next Deal Lending", no personal name (Q18, Oct 23). No rates or terms.
+# Signed "Next Deal Lending", never a personal name (client, Q18). No rates or terms.
 EMAIL_HTML = (
     "<p>Thanks for sending your request. Your pre-qualification estimate is attached.</p>"
     "<p>This is a non-binding estimate for informational purposes only. It is not a commitment "

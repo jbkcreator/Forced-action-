@@ -1,7 +1,9 @@
 """WP-GL-10 booking confirmation and reminder configuration (values only, no logic).
 
-Wording is verbatim from Josh's Oct 2 answers to B3, with his name replaced by "Next Deal Lending" (Q18, Oct 23).
-Any change needs his re-approval and a matching update of the 10DLC campaign sample messages.
+Wording is from Josh's Oct 2 answers to B3, with his name replaced by "Next Deal Lending" on his
+instruction that no personal name appears in anything the borrower sees (Engineering Pod Action List
+section 2, Q18). Any further change needs his re-approval and a matching update of the 10DLC campaign
+sample messages: the samples must reflect the texts actually sent.
 
 Open items (not yet answered by the client; defaults are developer choices, not decisions):
   - NIGHT_BEFORE_HOUR_ET: "the evening before" has no clock time.
@@ -113,9 +115,9 @@ NINETY_MIN_RESCHEDULE_EMAIL = "To reschedule: {url}"
 EMAIL_FROM = "hello@nextdeallending.com"
 EMAIL_FROM_NAME = "Next Deal Lending"
 
-EMAIL_SUBJECT_CONFIRMATION = "Your Next Deal Lending call is confirmed"
-EMAIL_SUBJECT_NIGHT_BEFORE = "Reminder: your Next Deal Lending call is tomorrow"
-EMAIL_SUBJECT_NINETY_MIN = "Your Next Deal Lending call starts in 90 minutes"
+EMAIL_SUBJECT_CONFIRMATION = "Your call with Next Deal Lending is confirmed"
+EMAIL_SUBJECT_NIGHT_BEFORE = "Reminder: your call with Next Deal Lending is tomorrow"
+EMAIL_SUBJECT_NINETY_MIN = "Your call with Next Deal Lending starts in 90 minutes"
 EMAIL_SUBJECT_GATE_FAIL = "Your call with Next Deal Lending"
 
 # Sent when the caller's check does not pass for a call the AI booked (client Oct 4, "approved as written"):

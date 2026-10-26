@@ -51,7 +51,8 @@ class FakeGhl:
 def _lead(**overrides):
     lead = {"id": 7, "name": "Dana Builder", "phone": "+18135550142", "email": "dana@example.com",
             "property_city": "Tampa", "deal_type": "Fix and flip", "completed_projects_3y": "1 to 2",
-            "sms_consent": False, "deal_drop_optin": False, "suppressed": False,
+            "loan_amount": None, "property_address": None, "property_state": None, "credit_band": None,
+            "sms_consent": False, "call_consent": False, "deal_drop_optin": False, "suppressed": False,
             "received_at": datetime(2026, 10, 5, 15, 30, tzinfo=timezone.utc), "ghl_attempts": 0}
     lead.update(overrides)
     return lead
@@ -61,7 +62,8 @@ def _lead(**overrides):
 def _unconfigured(monkeypatch):
     settings = get_settings()
     for field in ("lending_ghl_pipeline_id", "lending_ghl_stage_new_lead",
-                  "lending_ghl_cf_sms_consent", "lending_ghl_cf_deal_drop_optin"):
+                  "lending_ghl_cf_sms_consent", "lending_ghl_cf_deal_drop_optin",
+                  "lending_ghl_cf_call_consent", "lending_ghl_cf_loan_amount", "lending_ghl_cf_credit_band"):
         monkeypatch.setattr(settings, field, None, raising=False)
 
 
@@ -96,10 +98,15 @@ def test_contact_is_upserted_and_never_carries_dnd_tags_or_source(monkeypatch):
 
 
 @pytest.mark.parametrize("lead,is_new,expected", [
-    ({}, True, ["web-lead", "web-sms-consent-no"]),
-    ({"sms_consent": True}, True, ["web-lead", "web-sms-consent-yes"]),
-    ({"sms_consent": True, "deal_drop_optin": True}, True, ["web-lead", "web-sms-consent-yes", "web-deal-drop-optin"]),
-    ({"sms_consent": True, "suppressed": True, "deal_drop_optin": True}, True, ["web-lead", "web-sms-consent-no"]),
+    ({}, True, ["web-lead", "web-sms-consent-no", "web-call-consent-no"]),
+    ({"sms_consent": True}, True, ["web-lead", "web-sms-consent-yes", "web-call-consent-no"]),
+    ({"call_consent": True}, True, ["web-lead", "web-sms-consent-no", "web-call-consent-yes"]),
+    ({"sms_consent": True, "call_consent": True}, False, ["web-lead", "web-sms-consent-yes", "web-call-consent-yes"]),
+    ({"sms_consent": True, "deal_drop_optin": True}, True,
+     ["web-lead", "web-sms-consent-yes", "web-call-consent-no", "web-deal-drop-optin"]),
+    ({"sms_consent": True, "suppressed": True, "deal_drop_optin": True}, True,
+     ["web-lead", "web-sms-consent-no", "web-call-consent-no"]),
+    ({"call_consent": True, "suppressed": True}, True, ["web-lead", "web-sms-consent-no", "web-call-consent-no"]),
     ({"sms_consent": True}, False, ["web-lead", "web-sms-consent-yes"]),
     # an existing contact who leaves the boxes unticked must never gain a "no" tag next to an earlier "yes"
     ({}, False, ["web-lead"]),
@@ -115,6 +122,21 @@ def test_giving_consent_removes_only_our_own_stale_no_tag(monkeypatch):
     ghl = FakeGhl(monkeypatch, _routes(is_new=False))
     GhlLeadSink(ACCOUNT).push(_lead(sms_consent=True))
     assert ghl.body("DELETE", "/contacts/c_1/tags")["json"] == {"tags": ["web-sms-consent-no"]}
+
+
+def test_each_box_removes_only_its_own_stale_no_tag(monkeypatch):
+    ghl = FakeGhl(monkeypatch, _routes(is_new=False))
+    GhlLeadSink(ACCOUNT).push(_lead(call_consent=True))
+    assert ghl.body("DELETE", "/contacts/c_1/tags")["json"] == {"tags": ["web-call-consent-no"]}
+    ghl = FakeGhl(monkeypatch, _routes(is_new=False))
+    GhlLeadSink(ACCOUNT).push(_lead(sms_consent=True, call_consent=True))
+    assert ghl.body("DELETE", "/contacts/c_1/tags")["json"] == {"tags": ["web-sms-consent-no", "web-call-consent-no"]}
+
+
+def test_a_text_only_lead_is_never_tagged_as_call_consent(monkeypatch):
+    ghl = FakeGhl(monkeypatch, _routes())
+    GhlLeadSink(ACCOUNT).push(_lead(sms_consent=True))
+    assert "web-call-consent-yes" not in ghl.body("POST", "/contacts/c_1/tags")["json"]["tags"]
 
 
 def test_no_tag_is_removed_when_consent_was_not_given(monkeypatch):
@@ -156,6 +178,27 @@ def test_custom_fields_are_sent_only_when_their_ids_are_configured_and_only_for_
     assert "customFields" not in ghl.body("POST", "/contacts/upsert")["json"]
 
 
+def test_call_consent_loan_amount_and_credit_band_fields_are_written_only_when_configured(monkeypatch):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "lending_ghl_cf_call_consent", "cf_call", raising=False)
+    monkeypatch.setattr(settings, "lending_ghl_cf_loan_amount", "cf_amount", raising=False)
+    monkeypatch.setattr(settings, "lending_ghl_cf_credit_band", "cf_band", raising=False)
+    lead = _lead(call_consent=True, loan_amount=250_000, credit_band="680-719", property_state="FL",
+                 property_address="12 Oak Ave")
+    ghl = FakeGhl(monkeypatch, _routes())
+    GhlLeadSink(ACCOUNT).push(lead)
+    body = ghl.body("POST", "/contacts/upsert")["json"]
+    assert body["customFields"] == [{"id": "cf_call", "value": "Yes"},
+                                    {"id": "cf_amount", "value": "250000"},
+                                    {"id": "cf_band", "value": "680-719"}]
+    # the property is not where the contact lives: it is never written to the contact's own address fields
+    assert "address1" not in body and "state" not in body
+
+    ghl = FakeGhl(monkeypatch, _routes())
+    GhlLeadSink(ACCOUNT).push(_lead(call_consent=True, suppressed=True))  # opted out: no consent, and no details to write
+    assert "customFields" not in ghl.body("POST", "/contacts/upsert")["json"]
+
+
 def test_without_a_new_lead_stage_the_lead_is_contact_only(monkeypatch):
     ghl = FakeGhl(monkeypatch, _routes())
     result = GhlLeadSink(ACCOUNT).push(_lead())
@@ -184,9 +227,12 @@ def test_an_existing_card_is_never_moved_or_duplicated(monkeypatch):
 
 def test_the_note_records_the_ticked_values_and_the_utc_time(monkeypatch):
     ghl = FakeGhl(monkeypatch, _routes())
-    GhlLeadSink(ACCOUNT).push(_lead(sms_consent=True, deal_drop_optin=True))
+    GhlLeadSink(ACCOUNT).push(_lead(sms_consent=True, deal_drop_optin=True, loan_amount=250_000,
+                                    credit_band="680-719", property_state="FL", property_address="12 Oak Ave"))
     note = ghl.body("POST", "/contacts/c_1/notes")["json"]["body"]
-    assert "2026-10-05 15:30:00 UTC" in note and "consent box: ticked" in note and "Deal Drop opt-in box: ticked" in note
+    assert "2026-10-05 15:30:00 UTC" in note and "Text message consent box: ticked" in note
+    assert "Call consent box: not ticked" in note and "Deal Drop (weekly email) opt-in box: ticked" in note
+    assert "Loan amount: $250,000" in note and "Credit band: 680-719" in note and "12 Oak Ave, state FL" in note
     assert "dana@example.com" not in note and "+18135550142" not in note
 
 

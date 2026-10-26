@@ -475,7 +475,6 @@ class TestTemplate:
             assert forbidden not in body
 
     def test_b7_nothing_is_emailed_so_the_copy_never_says_reply_to_this_email(self):
-        # B2 (no company name, signed by Josh) is T-07's shared signer in base.html on dev; this PR does not repeat it.
         html = render_html("soft_approval.html", CONTEXT, watermark=self.WATERMARK)
         assert "reply to this email" not in html
 
@@ -489,6 +488,15 @@ class TestTemplate:
     def test_branding_is_next_deal_lending_only(self):
         html = render_html("soft_approval.html", CONTEXT, watermark=self.WATERMARK)
         assert FOOTER in re.sub(r"<[^>]+>", "", html) and "Josh" not in html and "436-9951" not in html
+
+    def test_the_pdf_is_signed_next_deal_lending_with_one_callback_number(self):
+        # The signer and callback number come from the shared base.html (config/lending_prequal.py): the client wants
+        # "Next Deal Lending" and (656) 221-1100 on every borrower-facing PDF, and no personal name.
+        html = render_html("soft_approval.html", CONTEXT, watermark=self.WATERMARK)
+        visible = re.sub(r"<style>.*?</style>|<[^>]+>", " ", html, flags=re.S)
+        assert "Next Deal Lending" in visible and "(656) 221-1100" in visible
+        for banned in ("Josh", "Kantor", "(727)", "436-9951"):
+            assert banned not in visible
 
     def test_omits_max_price_when_there_is_none(self):
         html = render_html("soft_approval.html", {**CONTEXT, "max_purchase_price": ""}, watermark=self.WATERMARK)
