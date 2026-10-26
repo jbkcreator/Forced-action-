@@ -27,7 +27,7 @@ Rule 1: ground-up AND amount >= primary.construction_min_amount
          AND primary.box passes AND primary not at cap → primary
 Rule 2: flip AND primary.box passes AND primary not at cap → primary
 Rule 3: ground-up AND (amount < primary.construction_min_amount, no primary,
-         or the primary cannot take it: box fail or at cap)
+         or the primary cannot take it: box fail, including LTV/LTC over its caps, or at cap)
          → overflow waterfall, lenders with takes_ground_up=TRUE
          (a file the primary could not take records why on its routed event)
 Rule 4: flip AND (primary box fail OR at cap)
@@ -63,6 +63,7 @@ from src.lending.routing.rules import (
     LenderRow,
     lender_passes_box,
     load_active_lenders,
+    missing_leverage_facts,
     primary_lender,
 )
 from src.lending.routing.seat import seat_at_cap
@@ -207,6 +208,9 @@ def _build_profile(file: dict) -> FileProfile:
         state=file.get("property_state") or "",
         credit_band_min_fico=file.get("credit_band_min_fico"),
         completed_projects=file.get("completed_projects"),  # a partner supplies it; LendingFlow does not
+        purchase_price=file.get("purchase_price"),  # the leverage figures likewise: partner files only
+        rehab_budget=file.get("rehab_budget"),
+        arv=file.get("arv"),
     )
 
 
@@ -224,12 +228,14 @@ def _load_file(key: FileKey, db: Session) -> dict:
         ).mappings().one_or_none()
         if row is None:
             raise ValueError(f"lendingflow_leads.id={key.id} not found")
-        return {**dict(row), "completed_projects": None, "label": key.label}
+        return {**dict(row), "completed_projects": None, "purchase_price": None, "rehab_budget": None, "arv": None,
+                "label": key.label}
 
     row = db.execute(
         text(
             "SELECT id, borrower_first_name AS first_name, borrower_last_name AS last_name, product,"
-            "       loan_amount, property_state, credit_band, completed_projects"
+            "       loan_amount, property_state, credit_band, completed_projects,"
+            "       purchase_price, rehab_budget, arv"
             "  FROM lending.loan_files"
             " WHERE id = :id"
         ),
@@ -443,6 +449,10 @@ def _route(key: FileKey, db: Session) -> None:
         return
 
     profile = _build_profile(file)
+    missing_facts = missing_leverage_facts(profile)
+    if missing_facts:
+        logger.info("route %s %d leverage pending_call_facts: missing %s, caps needing them are not applied",
+                    key.kind, key.id, ", ".join(missing_facts))
     signed = _signed(load_active_lenders(db))
 
     if not signed:
