@@ -54,12 +54,6 @@ _STEPS: tuple[tuple[str, str, str], ...] = (
 )
 
 
-def is_test_email(email: Optional[str]) -> bool:
-    """True for an address on a test domain: the same rule the cleanup uses, applied to rows as they are created."""
-    domain = (email or "").strip().lower().rpartition("@")[2]
-    return bool(domain) and domain in TEST_EMAIL_DOMAINS
-
-
 @dataclass
 class TagReport:
     run_id: str

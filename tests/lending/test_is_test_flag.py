@@ -4,8 +4,7 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import text
 
-from config.lending_test_data import TEST_EMAIL_DOMAINS
-from src.lending.test_data import is_test_email, tag_test_rows
+from src.lending.test_data import tag_test_rows
 
 
 @pytest.fixture
@@ -41,13 +40,6 @@ def _lead(db, suffix: str, email: str | None) -> int:
 
 def _flag(db, table: str, row_id: int) -> bool:
     return db.execute(text(f"SELECT is_test FROM {table} WHERE id = :i"), {"i": row_id}).scalar_one()
-
-
-def test_a_test_domain_address_is_a_test_email():
-    assert all(is_test_email(f"someone@{domain}") for domain in TEST_EMAIL_DOMAINS)
-    assert is_test_email("  Someone@EXAMPLE.com ")
-    assert not is_test_email("someone@acme.io") and not is_test_email("someone@notexample.com")
-    assert not is_test_email(None) and not is_test_email("") and not is_test_email("no-at-sign")
 
 
 def test_a_dry_run_reports_what_it_would_tag_and_changes_nothing(tdb):
