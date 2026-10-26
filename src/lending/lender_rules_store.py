@@ -184,3 +184,23 @@ def current_matrix() -> tuple[LenderRules, ...]:
     except Exception:
         logger.exception("[lender-rules] database unavailable; using config/lender_matrix.py")
         return LENDER_MATRIX
+
+
+def routing_priorities() -> dict[str, int]:
+    """T-05 lender key -> R-1 ``/lenders`` priority (lower first), the cost tie-break in ``evaluate_lender_fit``.
+
+    A key linked from several R-1 lenders takes the best priority. Empty when the database is unavailable,
+    so equal costs keep matrix order rather than failing the evaluation.
+    """
+    try:
+        from src.core.database import get_db_context
+
+        with get_db_context() as session:
+            rows = session.execute(text(
+                "SELECT key, MIN(priority) AS priority FROM lending.lender_routing_rules, unnest(rule_keys) AS key "
+                "GROUP BY key"
+            )).all()
+    except Exception:
+        logger.exception("[lender-rules] routing priorities unavailable; equal costs keep matrix order")
+        return {}
+    return {row.key: int(row.priority) for row in rows}
