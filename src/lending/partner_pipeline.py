@@ -102,6 +102,13 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def letters_switched_on() -> bool:
+    """Partner pre-qual letters share LENDING_PREQUAL_PDF_ENABLED with T-07 (Q21: off at intake until real numbers)."""
+    from config.settings import get_settings
+
+    return get_settings().lending_prequal_pdf_enabled
+
+
 def live_services() -> PipelineServices:
     from config.settings import get_settings
     from src.lending.ghl_email import get_email_sender
@@ -141,7 +148,7 @@ def live_services() -> PipelineServices:
         send_letter=(lambda partner, file, pdf: letters.send_letter(
             partner.email, partner.name, _place(file["property_address"], file["borrower_last_name"]), file["id"], pdf))
         if letters else None,
-        letters_enabled=settings.lending_prequal_pdf_enabled,
+        letters_enabled=letters_switched_on(),
     )
 
 
