@@ -4115,6 +4115,7 @@ class CheckoutProvisioningFailure(Base):
     resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     resolved_by: Mapped[Optional[str]] = mapped_column(String(100))
     notes: Mapped[Optional[str]] = mapped_column(Text)
+    is_test: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))  # test traffic: left out of reports and caps, never out of suppression or consent
 
     __table_args__ = (
         CheckConstraint("status IN ('open', 'resolved')", name="check_checkout_provisioning_status"),
