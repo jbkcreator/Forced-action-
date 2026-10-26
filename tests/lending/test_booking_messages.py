@@ -157,6 +157,25 @@ def test_a_redelivered_booking_event_changes_nothing(db):
     assert db.execute(text("SELECT count(*) FROM lending.confirmation_tasks")).scalar() == 1
 
 
+def test_a_booking_scheduled_before_the_ten_minute_reminder_is_not_given_one_by_a_redelivery(db):
+    person = add_person(db)
+    handle_booking_confirmed(db, payload(person), now=NOW)
+    db.execute(text("DELETE FROM lending.booking_messages WHERE kind = 'ten_min'"))  # as scheduled before this reminder
+    cancel_by_provider_event(db, "appt-1", "booking_cancelled")
+    again = handle_booking_confirmed(db, payload(person), now=NOW + timedelta(minutes=5))
+    assert again.inserted == 0
+    assert {r["kind"] for r in rows(db)} == {"confirmation", "night_before", "ninety_min"}
+
+
+def test_a_reschedule_gives_an_older_booking_the_ten_minute_reminder(db):
+    person = add_person(db)
+    handle_booking_confirmed(db, payload(person), now=NOW)
+    db.execute(text("DELETE FROM lending.booking_messages WHERE kind = 'ten_min'"))
+    handle_booking_confirmed(db, payload(person, slot_start_utc=SLOT + timedelta(days=1)), now=NOW + timedelta(minutes=5))
+    by_kind = {r["kind"]: r for r in rows(db)}
+    assert by_kind["ten_min"]["send_at"] == SLOT + timedelta(days=1) - timedelta(minutes=10)
+
+
 def test_a_booking_made_late_records_the_missed_reminders_as_skipped(db):
     late = payload(add_person(db), slot_start_utc=NOW + timedelta(minutes=60))  # 60 min away
     handle_booking_confirmed(db, late, now=NOW)

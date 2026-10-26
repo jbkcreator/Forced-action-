@@ -108,7 +108,9 @@ _INSERT = text("""
 
 _KNOWN_BOOKING = text("""
     SELECT count(*) AS n,
-           count(*) FILTER (WHERE contact_phone IS NULL AND contact_email IS NULL) AS without_contact
+           count(*) FILTER (WHERE contact_phone IS NULL AND contact_email IS NULL) AS without_contact,
+           count(*) FILTER (WHERE kind = 'ten_min') AS ten_min_rows,
+           count(*) FILTER (WHERE slot_start_utc IS DISTINCT FROM :slot) AS other_slot
       FROM lending.booking_messages WHERE booking_ref = :ref
 """)
 
@@ -189,16 +191,20 @@ def handle_booking_confirmed(db, payload: Mapping[str, Any], *, now: Optional[da
         "slot_start_utc": slot_start,
         "booked_by": payload.get("booked_by"),
     }
+    known = db.execute(_KNOWN_BOOKING, {"ref": booking_ref, "slot": slot_start}).mappings().one()
     rows = [
         _row(common, KIND_CONFIRMATION, now, skip_reason),
         _row(common, KIND_NIGHT_BEFORE, night_before_send_at(slot_start), skip_reason, now=now),
         _row(common, KIND_NINETY_MIN, slot_start - timedelta(seconds=NINETY_MIN_SECONDS), skip_reason, now=now),
         _row(common, KIND_TEN_MIN, slot_start - timedelta(seconds=TEN_MIN_SECONDS), skip_reason, now=now),
     ]
-    known = db.execute(_KNOWN_BOOKING, {"ref": booking_ref}).mappings().one()
+    # A booking scheduled before the 10-minute reminder existed is not given one by a redelivery (it may have been
+    # cancelled since, and the reminder would then reach a borrower with no call); a reschedule re-plans it with one.
+    if known["n"] and not known["ten_min_rows"] and not known["other_slot"]:
+        rows = [r for r in rows if r["kind"] != KIND_TEN_MIN]
     first_delivery = known["n"] == 0
     repairing = known["n"] > 0 and known["n"] == known["without_contact"]   # earlier delivery had no phone or email
-    inserted = sum(db.execute(_INSERT, row).rowcount for row in rows)  # 4 rows; per-statement rowcount is exact
+    inserted = sum(db.execute(_INSERT, row).rowcount for row in rows)  # up to 4 rows; per-statement rowcount is exact
     if skip_reason:
         logger.warning("[booking-messages] booking_ref=%s recorded as skipped (%s)", booking_ref, skip_reason)
     else:
