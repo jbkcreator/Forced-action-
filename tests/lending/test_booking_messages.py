@@ -29,7 +29,7 @@ SLOT = datetime(2026, 10, 7, 14, 0, tzinfo=timezone.utc)  # Wed 10:00 ET
 
 def test_confirmation_is_the_approved_wording_with_stop_language():
     body = render_text("confirmation", first_name="Jane", slot_start_utc=SLOT, property_address="412 Oak Ave, Tampa")
-    assert body == ("Hi Jane, this is Josh Kantor, Loan Officer, confirming our call on Wednesday, October 7 "
+    assert body == ("Hi Jane, this is Next Deal Lending, confirming our call on Wednesday, October 7 "
                     "at 10:00 am ET about 412 Oak Ave. Reply here if you need to reschedule. Reply STOP to opt out.")
 
 
@@ -41,11 +41,11 @@ def test_no_address_drops_the_phrase():
 
 def test_night_before_and_ninety_minute_wording():
     nb = render_text("night_before", first_name="Jane", slot_start_utc=SLOT, property_address="412 Oak Ave")
-    assert nb == ("Hi Jane, reminder from Josh Kantor, Loan Officer. Our call is tomorrow at 10:00 am ET "
+    assert nb == ("Hi Jane, reminder from Next Deal Lending. Our call is tomorrow at 10:00 am ET "
                   "about 412 Oak Ave. Talk soon.")
     ninety = render_text("ninety_min", first_name="Jane", slot_start_utc=SLOT, property_address="412 Oak Ave",
                          number="+18135550100")
-    assert ninety == ("Hi Jane, your call with Josh Kantor, Loan Officer, is in about 90 minutes, at 10:00 am ET. "
+    assert ninety == ("Hi Jane, your call with Next Deal Lending is in about 90 minutes, at 10:00 am ET. "
                       "Call us at (813) 555-0100 if anything's come up.")
 
 
@@ -240,7 +240,7 @@ def test_confirmation_call_due_dates_follow_the_client_rules(db):
 # ── Reminder timing + optional reschedule link ─────────────────
 
 URL = "https://link.nextdeallending.com/reschedule"
-NINETY_TODAY = ("Hi Jane, your call with Josh Kantor, Loan Officer, is in about 90 minutes, at 10:00 am ET. "
+NINETY_TODAY = ("Hi Jane, your call with Next Deal Lending is in about 90 minutes, at 10:00 am ET. "
                 "Call us at (813) 555-0100 if anything's come up.")
 
 
@@ -261,7 +261,7 @@ def test_reschedule_url_is_added_to_the_ninety_minute_text_with_callback_number(
 def test_reschedule_url_is_added_to_the_ninety_minute_email_before_the_signature():
     _, body = render_email("ninety_min", first_name="Jane", slot_start_utc=SLOT, number="+18135550100",
                            reschedule_url=URL)
-    assert f"To reschedule: {URL}\n\nJosh Kantor, Loan Officer" in body
+    assert f"To reschedule: {URL}\n\nNext Deal Lending" in body
     assert "Call us at (813) 555-0100" in body
 
 

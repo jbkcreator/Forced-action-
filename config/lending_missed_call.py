@@ -34,10 +34,10 @@ CDR_DISPOSITION_FIELDS = ("disposition",)
 DNC_DISPOSITIONS = frozenset({"dnc_request", "dnc request", "do not call", "dnc"})
 
 TEMPLATE_WITH_PROPERTY = (
-    "Hi, this is Josh Kantor, Loan Officer, calling about {property}. Sorry we missed you - "
+    "Hi, this is Next Deal Lending, calling about {property}. Sorry we missed you - "
     "reply here or call back anytime. Reply STOP to opt out."
 )
 TEMPLATE_NO_PROPERTY = (
-    "Hi, this is Josh Kantor, Loan Officer, about financing for your project. Sorry we missed you - "
+    "Hi, this is Next Deal Lending, about financing for your project. Sorry we missed you - "
     "reply here or call back anytime. Reply STOP to opt out."
 )

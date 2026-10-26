@@ -13,7 +13,9 @@ def test_apply_creates_web_leads_and_is_safe_to_rerun(lending_db):
     apply_to(conn)
     columns = {c["name"] for c in inspect(conn).get_columns("web_leads", schema="lending")}
     assert {"phone", "sms_consent", "deal_drop_optin", "consent_text", "ip_address", "page_url",
-            "ghl_status", "ghl_attempts", "ghl_contact_id"} <= columns
+            "ghl_status", "ghl_attempts", "ghl_contact_id", "call_consent", "call_consent_text",
+            "call_consent_text_matches", "loan_amount", "property_address", "property_state",
+            "credit_band"} <= columns
 
 
 def test_a_table_created_before_the_later_columns_gets_them(lending_db):
@@ -28,9 +30,26 @@ def test_a_table_created_before_the_later_columns_gets_them(lending_db):
     assert {"suppression_reason", "ghl_alerted_at"} <= names
 
 
+def test_a_table_created_before_the_a2p_columns_gets_them(lending_db):
+    conn = lending_db.get_bind()
+    apply_to(conn)
+    conn.execute(text("ALTER TABLE lending.web_leads DROP COLUMN call_consent, DROP COLUMN call_consent_text, "
+                      "DROP COLUMN call_consent_text_matches, DROP COLUMN loan_amount, DROP COLUMN property_address, "
+                      "DROP COLUMN property_state, DROP COLUMN credit_band"))
+    conn.execute(text("INSERT INTO lending.web_leads (name, phone) VALUES ('Old', '+18135550101')"))
+    apply_to(conn)
+    apply_to(conn)
+    names = {c["name"] for c in inspect(conn).get_columns("web_leads", schema="lending")}
+    assert {"call_consent", "call_consent_text", "call_consent_text_matches", "loan_amount", "property_address",
+            "property_state", "credit_band"} <= names
+    # a row stored before the call box existed never counts as call consent
+    assert conn.execute(text("SELECT call_consent FROM lending.web_leads WHERE name = 'Old'")).scalar() is False
+
+
 def test_consent_columns_default_to_false(web_leads_db):
     web_leads_db.execute(text("INSERT INTO lending.web_leads (name, phone) VALUES ('A', '+18135550100')"))
-    assert web_leads_db.execute(text("SELECT sms_consent, deal_drop_optin, ghl_status FROM lending.web_leads")).one() == (False, False, "pending")
+    assert web_leads_db.execute(text("SELECT sms_consent, call_consent, deal_drop_optin, ghl_status FROM lending.web_leads")).one() == (
+        False, False, False, "pending")
 
 
 def test_unknown_delivery_status_is_rejected(web_leads_db):

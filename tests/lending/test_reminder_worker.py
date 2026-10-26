@@ -76,7 +76,7 @@ def test_a_consented_contact_gets_the_confirmation_text_once(db):
     assert len(sender.calls) == 1
     call = sender.calls[0]
     assert call["phone"] == PHONE and call["first_name"] == "Jane" and call["deadline"] == SLOT
-    assert "confirming your call with Josh" in call["body"] and call["body"].endswith("Reply STOP to opt out.")
+    assert "confirming our call on" in call["body"] and "Josh" not in call["body"] and call["body"].endswith("Reply STOP to opt out.")
     done = row(db)
     assert (done["status"], done["channel"], done["provider_message_id"]) == ("sent", "text", "msg-1")
     assert done["sent_at"] is not None
