@@ -449,3 +449,73 @@ def test_ghl_calls_never_raise_the_missing_disposition_alert(ghl_call_row, lendi
     alerted = lending_db.execute(text("SELECT disposition_missing_alerted_at FROM lending.call_dispositions "
                                       "WHERE id = :id"), {"id": row_id}).scalar()
     assert alerted is None
+
+
+# ── callers who are not leads (Q66) ──────────────────────────────────────────
+
+def _search_http(conversations):
+    def get(url, **kwargs):
+        response = MagicMock()
+        response.json.return_value = {"conversations": conversations}
+        get.requests.append((url, kwargs.get("params")))
+        return response
+    get.requests = []
+    return get
+
+
+def test_the_recent_callers_reader_lists_call_conversations_newer_than_the_cutoff():
+    from src.lending.ghl_calls import recent_callers_reader
+
+    cutoff = datetime(2026, 10, 20, tzinfo=timezone.utc)
+    conversations = [
+        {"contactId": "new-1", "phone": "+18135550111", "lastMessageDate": int(cutoff.timestamp() * 1000) + 5000},
+        {"contactId": "old-1", "phone": "+18135550112", "lastMessageDate": int(cutoff.timestamp() * 1000) - 5000},
+        {"contactId": None, "phone": "+18135550113", "lastMessageDate": int(cutoff.timestamp() * 1000) + 9000},
+        {"contactId": "no-phone", "phone": None, "lastMessageDate": int(cutoff.timestamp() * 1000) + 9000},
+    ]
+    http = _search_http(conversations)
+    account = MagicMock(api_key="k", location_id="loc-1")
+    assert recent_callers_reader(account, http=http)(cutoff) == [("new-1", "+18135550111")]
+    url, params = http.requests[0]
+    assert url.endswith("/conversations/search")
+    assert params["lastMessageType"] == "TYPE_CALL" and params["sortBy"] == "last_message_date"
+
+
+def test_a_caller_who_is_not_a_lead_gets_only_their_inbound_calls_stored(lending_db):
+    phone, contact = _phone(), f"stranger-{uuid.uuid4().hex[:8]}"
+    messages = {contact: [_msg(f"{contact}-in", direction="inbound", added=NOW - timedelta(hours=3), status="completed"),
+                          _msg(f"{contact}-missed", direction="inbound", added=NOW - timedelta(hours=2)),
+                          _msg(f"{contact}-out", direction="outbound", added=NOW - timedelta(hours=1))]}
+    stats = import_calls(lending_db, lambda cid: messages.get(cid, []), now=NOW,
+                         recent_callers=lambda since: [(contact, phone)])
+    rows = _ghl_rows(lending_db, phone)
+    assert [r["dialer_call_id"] for r in rows] == [f"ghl:{contact}-in", f"ghl:{contact}-missed"]
+    assert {r["direction"] for r in rows} == {"inbound"}  # the outbound call to a non-lead is not a follow-up attempt
+    assert stats.other_callers >= 1
+
+
+def test_a_lead_who_calls_is_read_once_and_keeps_their_outbound_calls(lending_db):
+    phone, contact = _phone(), f"c-{uuid.uuid4().hex[:8]}"
+    _lendingflow_lead(lending_db, phone=phone, contact_id=contact)
+    reads = []
+
+    def read(cid):
+        reads.append(cid)
+        return [_msg(f"{contact}-out"), _msg(f"{contact}-in", direction="inbound", added=ARRIVED + timedelta(hours=2))] \
+            if cid == contact else []
+
+    import_calls(lending_db, read, now=NOW, recent_callers=lambda since: [(contact, phone)])
+    assert reads.count(contact) == 1
+    assert [r["direction"] for r in _ghl_rows(lending_db, phone)] == ["outbound", "inbound"]
+
+
+def test_a_failed_recent_callers_lookup_is_counted_and_the_leads_are_still_imported(lending_db):
+    phone, contact = _phone(), f"c-{uuid.uuid4().hex[:8]}"
+    _lendingflow_lead(lending_db, phone=phone, contact_id=contact)
+
+    def broken(since):
+        raise RuntimeError("GHL down")
+
+    stats = import_calls(lending_db, lambda cid: [_msg(f"{contact}-out")] if cid == contact else [], now=NOW,
+                         recent_callers=broken)
+    assert stats.lookup_failures >= 1 and len(_ghl_rows(lending_db, phone)) == 1
