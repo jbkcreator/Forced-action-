@@ -161,10 +161,6 @@ def test_send_accepted(monkeypatch):
     assert len(calls) == 1 and exc is None
 
 
-def test_email_is_signed_next_deal_lending_with_no_personal_name():
-    text = prequal_ghl.EMAIL_SUBJECT + prequal_ghl.EMAIL_HTML
-    assert "Next Deal Lending" in prequal_ghl.EMAIL_HTML and "(656) 221-1100" in prequal_ghl.EMAIL_HTML
-    assert "Josh" not in text and "Loan Officer" not in text
 
 
 def test_email_is_signed_next_deal_lending_and_names_no_person():

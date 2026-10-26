@@ -485,16 +485,13 @@ class TestTemplate:
             assert " ".join(DISCLAIMER.split()) in " ".join(html.split())
             assert "lender approval." not in html and "provided on the call" not in html
 
-    def test_branding_is_next_deal_lending_only(self):
-        html = render_html("soft_approval.html", CONTEXT, watermark=self.WATERMARK)
-        assert FOOTER in re.sub(r"<[^>]+>", "", html) and "Josh" not in html and "436-9951" not in html
-
     def test_the_pdf_is_signed_next_deal_lending_with_one_callback_number(self):
         # The signer and callback number come from the shared base.html (config/lending_prequal.py): the client wants
         # "Next Deal Lending" and (656) 221-1100 on every borrower-facing PDF, and no personal name.
         html = render_html("soft_approval.html", CONTEXT, watermark=self.WATERMARK)
         visible = re.sub(r"<style>.*?</style>|<[^>]+>", " ", html, flags=re.S)
         assert "Next Deal Lending" in visible and "(656) 221-1100" in visible
+        assert FOOTER in re.sub(r"<[^>]+>", "", html)
         for banned in ("Josh", "Kantor", "(727)", "436-9951"):
             assert banned not in visible
 
