@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
-from config.lending_web import SMS_CONSENT_TEXT
+from config.lending_web import CALL_CONSENT_TEXT, SMS_CONSENT_TEXT
 from src.lending.consent import has_text_consent
 
 PHONE = "+18135550142"
@@ -63,6 +63,31 @@ def test_a_ticked_box_saves_the_value_with_its_evidence(client, web_leads_db):
     row = web_leads_db.execute(text("SELECT sms_consent, consent_text_matches, ip_address, page_url, user_agent FROM lending.web_leads")).one()
     assert row == (True, True, "203.0.113.50", "https://nextdeallending.com/", "pytest-agent")
     assert has_text_consent(web_leads_db, PHONE) is True
+
+
+def test_the_new_fields_and_the_call_box_are_stored(client, web_leads_db):
+    response = client.post(URL, data={**FORM, "call_consent": "yes", "call_consent_text": CALL_CONSENT_TEXT,
+                                      "loan_amount": "$250,000", "property_address": "12 Oak Ave",
+                                      "property_state": "Florida", "credit_band": "680-719"})
+    assert response.status_code == 200 and response.json() == {"received": True, "will_contact": True}
+    row = web_leads_db.execute(text(
+        "SELECT sms_consent, call_consent, call_consent_text_matches, loan_amount, property_address, property_state, "
+        "credit_band FROM lending.web_leads")).one()
+    assert row == (False, True, True, 250_000, "12 Oak Ave", "FL", "680-719")
+    assert has_text_consent(web_leads_db, PHONE) is False
+
+
+def test_a_loan_amount_that_is_not_an_amount_is_a_422_and_stores_nothing(client, web_leads_db, delivered):
+    response = client.post(URL, data={**FORM, "loan_amount": "a lot"})
+    assert response.status_code == 422 and "loan amount" in response.json()["detail"].lower()
+    assert _count(web_leads_db) == 0 and delivered == []
+
+
+def test_deal_drop_without_an_email_is_a_422(client, web_leads_db, delivered):
+    no_email = {k: v for k, v in FORM.items() if k != "email"}
+    response = client.post(URL, data={**no_email, "deal_drop_optin": "yes"})
+    assert response.status_code == 422 and "email" in response.json()["detail"].lower()
+    assert _count(web_leads_db) == 0 and delivered == []
 
 
 @pytest.mark.parametrize("overrides", [{"phone": "123"}, {"phone": ""}, {"name": ""}, {"email": "nope"}])

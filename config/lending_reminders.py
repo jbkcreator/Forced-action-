@@ -1,7 +1,9 @@
 """WP-GL-10 booking confirmation and reminder configuration (values only, no logic).
 
-Wording is verbatim from Josh's Oct 2 answers to B3. Any change needs his re-approval and a
-matching update of the 10DLC campaign sample messages.
+Wording is from Josh's Oct 2 answers to B3, with his name replaced by "Next Deal Lending" on his
+instruction that no personal name appears in anything the borrower sees (Engineering Pod Action List
+section 2, Q18). Any further change needs his re-approval and a matching update of the 10DLC campaign
+sample messages: the samples must reflect the texts actually sent.
 
 Open items (not yet answered by the client; defaults are developer choices, not decisions):
   - NIGHT_BEFORE_HOUR_ET: "the evening before" has no clock time.
@@ -71,30 +73,30 @@ ALL_KINDS = (KIND_CONFIRMATION, KIND_NIGHT_BEFORE, KIND_NINETY_MIN, KIND_GATE_FA
 # dropped when no address is known (B3: "No address: drop that phrase").
 
 CONFIRMATION_WITH_ADDRESS = (
-    "Hi {first_name}, this is Josh Kantor, Loan Officer, confirming our call on "
+    "Hi {first_name}, this is Next Deal Lending, confirming our call on "
     "{date} at {time} about {property_address}. "
     "Reply here if you need to reschedule. Reply STOP to opt out."
 )
 
 CONFIRMATION_NO_ADDRESS = (
-    "Hi {first_name}, this is Josh Kantor, Loan Officer, confirming our call on "
+    "Hi {first_name}, this is Next Deal Lending, confirming our call on "
     "{date} at {time}. "
     "Reply here if you need to reschedule. Reply STOP to opt out."
 )
 
 NIGHT_BEFORE_WITH_ADDRESS = (
-    "Hi {first_name}, reminder from Josh Kantor, Loan Officer. "
+    "Hi {first_name}, reminder from Next Deal Lending. "
     "Our call is tomorrow at {time} about {property_address}. Talk soon."
 )
 
 NIGHT_BEFORE_NO_ADDRESS = (
-    "Hi {first_name}, reminder from Josh Kantor, Loan Officer. "
+    "Hi {first_name}, reminder from Next Deal Lending. "
     "Our call is tomorrow at {time}. Talk soon."
 )
 
 # The approved 90-minute wording carries no property address, so there is one variant.
 NINETY_MIN_NO_ADDRESS = (
-    "Hi {first_name}, your call with Josh Kantor, Loan Officer, is in about 90 minutes, "
+    "Hi {first_name}, your call with Next Deal Lending is in about 90 minutes, "
     "at {time}. "
     "Call us at {number} if anything's come up."
 )
@@ -111,69 +113,69 @@ NINETY_MIN_RESCHEDULE_EMAIL = "To reschedule: {url}"
 # Contacts without text consent receive the same messages by email instead.
 # Email is also used for all contacts if 10DLC is not yet approved.
 EMAIL_FROM = "hello@nextdeallending.com"
-EMAIL_FROM_NAME = "Josh Kantor"
+EMAIL_FROM_NAME = "Next Deal Lending"
 
-EMAIL_SUBJECT_CONFIRMATION = "Your call with Josh is confirmed"
-EMAIL_SUBJECT_NIGHT_BEFORE = "Reminder: your call with Josh is tomorrow"
-EMAIL_SUBJECT_NINETY_MIN = "Your call with Josh starts in 90 minutes"
-EMAIL_SUBJECT_GATE_FAIL = "Your call with Josh Kantor"
+EMAIL_SUBJECT_CONFIRMATION = "Your call with Next Deal Lending is confirmed"
+EMAIL_SUBJECT_NIGHT_BEFORE = "Reminder: your call with Next Deal Lending is tomorrow"
+EMAIL_SUBJECT_NINETY_MIN = "Your call with Next Deal Lending starts in 90 minutes"
+EMAIL_SUBJECT_GATE_FAIL = "Your call with Next Deal Lending"
 
 # Sent when the caller's check does not pass for a call the AI booked (client Oct 4, "approved as written"):
 # the contact already got "confirming your call", so they are told once, kindly, that no call is coming. The
 # slot is released and the contact moved to nurture by the booking flow (WP-GL-5); GL-10 cancels the reminders
 # and sends this. No STOP language: it is a service message, not a promotion.
 GATE_FAIL_TEXT = (
-    "Hi {first_name}, this is Josh Kantor, Loan Officer. We're not able to hold the call we mentioned. "
+    "Hi {first_name}, this is Next Deal Lending. We're not able to hold the call we mentioned. "
     "Thanks for your interest, and we'll be in touch if anything changes."
 )
 EMAIL_GATE_FAIL = (
     "Hi {first_name},\n\n"
-    "This is Josh Kantor, Loan Officer. We're not able to hold the call we mentioned. "
+    "This is Next Deal Lending. We're not able to hold the call we mentioned. "
     "Thanks for your interest, and we'll be in touch if anything changes.\n\n"
-    "Josh Kantor, Loan Officer\nhello@nextdeallending.com"
+    "Next Deal Lending\nhello@nextdeallending.com"
 )
 
 # Email bodies mirror the text templates; no STOP language (email uses
 # unsubscribe links per CAN-SPAM, handled by the email sender).
 EMAIL_CONFIRMATION_WITH_ADDRESS = (
     "Hi {first_name},\n\n"
-    "This is Josh Kantor, Loan Officer, confirming our call on {date} at {time} "
+    "This is Next Deal Lending, confirming our call on {date} at {time} "
     "about {property_address}.\n\n"
     "Reply to this email if you need to reschedule.\n\n"
-    "Josh Kantor, Loan Officer\nhello@nextdeallending.com"
+    "Next Deal Lending\nhello@nextdeallending.com"
 )
 
 EMAIL_CONFIRMATION_NO_ADDRESS = (
     "Hi {first_name},\n\n"
-    "This is Josh Kantor, Loan Officer, confirming our call on {date} at {time}.\n\n"
+    "This is Next Deal Lending, confirming our call on {date} at {time}.\n\n"
     "Reply to this email if you need to reschedule.\n\n"
-    "Josh Kantor, Loan Officer\nhello@nextdeallending.com"
+    "Next Deal Lending\nhello@nextdeallending.com"
 )
 
 EMAIL_NIGHT_BEFORE_WITH_ADDRESS = (
     "Hi {first_name},\n\n"
-    "Reminder from Josh Kantor, Loan Officer — our call is tomorrow at {time} "
+    "Reminder from Next Deal Lending — our call is tomorrow at {time} "
     "about {property_address}.\n\n"
-    "Talk soon,\nJosh Kantor, Loan Officer"
+    "Talk soon,\nNext Deal Lending"
 )
 
 EMAIL_NIGHT_BEFORE_NO_ADDRESS = (
     "Hi {first_name},\n\n"
-    "Reminder from Josh Kantor, Loan Officer — our call is tomorrow at {time}.\n\n"
-    "Talk soon,\nJosh Kantor, Loan Officer"
+    "Reminder from Next Deal Lending — our call is tomorrow at {time}.\n\n"
+    "Talk soon,\nNext Deal Lending"
 )
 
 EMAIL_NINETY_MIN_WITH_ADDRESS = (
     "Hi {first_name},\n\n"
-    "Your call with Josh Kantor, Loan Officer, is in about 90 minutes, at {time} "
+    "Your call with Next Deal Lending is in about 90 minutes, at {time} "
     "about {property_address}.\n\n"
     "Call us at {number} if anything's come up.\n\n"
-    "Josh Kantor, Loan Officer"
+    "Next Deal Lending"
 )
 
 EMAIL_NINETY_MIN_NO_ADDRESS = (
     "Hi {first_name},\n\n"
-    "Your call with Josh Kantor, Loan Officer, is in about 90 minutes, at {time}.\n\n"
+    "Your call with Next Deal Lending is in about 90 minutes, at {time}.\n\n"
     "Call us at {number} if anything's come up.\n\n"
-    "Josh Kantor, Loan Officer"
+    "Next Deal Lending"
 )
