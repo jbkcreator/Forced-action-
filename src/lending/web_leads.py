@@ -29,6 +29,7 @@ from config.lending_web import (
 from config.lending_occupancy import OWNER_OCCUPIED, UNKNOWN, occupancy_from_answer
 from config.settings import get_settings
 from src.lending.consent import record_consent
+from src.lending.cora_inbox import add_to_inbox_in_own_session
 from src.lending.lead_arrival_alert import ghl_contact_url
 from src.lending.ops_alerts import post_ops_alert
 from src.services.phone_utils import normalize
@@ -279,7 +280,24 @@ def merge_into_existing(db, lead_id: int, data: WebLeadInput) -> bool:
     ).first()
     if changed is not None:
         logger.info("[lending-web] repeat submission added details to lead id=%s", lead_id)
-    return changed is not None
+    return changed is not None or _merge_occupancy(db, lead_id, data.occupancy)
+
+
+def _merge_occupancy(db, lead_id: int, occupancy: str) -> bool:
+    """The latest answer wins (1.1.2): "yes" excludes a lead not yet in GHL, "no" releases an excluded one. An
+    unread answer changes nothing. Returns True when the lead was released, so it is delivered."""
+    if occupancy == UNKNOWN:
+        return False
+    row = db.execute(
+        text("UPDATE lending.web_leads SET occupancy = :occ, ghl_status = CASE "
+             "WHEN :occ = :owner AND ghl_status IN ('pending', 'failed') THEN 'excluded' "
+             "WHEN :occ <> :owner AND ghl_status = 'excluded' THEN 'pending' ELSE ghl_status END "
+             "WHERE id = :id AND occupancy IS DISTINCT FROM :occ RETURNING ghl_status"),
+        {"occ": occupancy, "owner": OWNER_OCCUPIED, "id": lead_id},
+    ).first()
+    if row is not None:
+        logger.info("[lending-web] repeat submission changed occupancy of lead id=%s to %s", lead_id, occupancy)
+    return row is not None and row.ghl_status == "pending"
 
 
 def _backoff_minutes_sql() -> str:
@@ -355,18 +373,26 @@ def returning_alert_text(name: str, lead_id: int, moved: bool, contact_url: Opti
 
 
 def _alert_returning(db, lead: Mapping[str, Any], result: PushResult, now: datetime) -> None:
-    """Once per lead: a re-delivery of the same row (details merged in) is not a new submission."""
-    claimed = db.execute(
-        text("UPDATE lending.web_leads SET returning_alerted_at = :now "
-             "WHERE id = :id AND returning_alerted_at IS NULL RETURNING id"),
-        {"now": now, "id": lead["id"]},
-    ).first()
-    if claimed is None:
+    """Once per lead: a re-delivery of the same row (details merged in) is not a new submission. The row is locked
+    by delivery (FOR UPDATE), so posting before stamping cannot double-post. A post Slack refuses is queued in
+    Cora's inbox for the ops channel instead of being lost ("duplicates beat silence")."""
+    already = db.execute(
+        text("SELECT returning_alerted_at IS NOT NULL FROM lending.web_leads WHERE id = :id"), {"id": lead["id"]},
+    ).scalar()
+    if already:
         return
     settings = get_settings()
     url = ghl_contact_url(settings.lending_ghl_app_url, settings.lending_ghl_location_id, result.contact_id)
     if not post_ops_alert(returning_alert_text(str(lead["name"]), int(lead["id"]), result.moved_to_new_lead, url)):
-        logger.warning("[lending-web] returning-contact alert not posted lead=%s", lead["id"])
+        logger.warning("[lending-web] returning-contact alert not posted lead=%s: queued in Cora's inbox", lead["id"])
+        add_to_inbox_in_own_session(
+            event_type="web_lead_returning_alert_failed", dedup_key=str(lead["id"]), target_channel="ops",
+            summary="Returning web borrower resubmitted the form: the ops alert did not post",
+            payload={"lead_id": str(lead["id"]), "ghl_contact_id": result.contact_id,
+                     "moved_to_new_lead": result.moved_to_new_lead},
+        )
+    db.execute(text("UPDATE lending.web_leads SET returning_alerted_at = :now WHERE id = :id"),
+               {"now": now, "id": lead["id"]})
 
 
 def _record_failure(db, lead: dict[str, Any], reason: str, now: datetime, *, config_error: bool = False) -> None:

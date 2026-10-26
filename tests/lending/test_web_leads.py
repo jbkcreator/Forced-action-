@@ -400,3 +400,20 @@ def test_an_owner_occupied_lead_is_saved_but_never_delivered(web_leads_db):
     assert _row(web_leads_db, lead_id)["ghl_status"] == "excluded"
     sink = RecordingSink()
     assert deliver_pending(web_leads_db, sink, lead_id=lead_id) == 0 and sink.pushed == []
+
+
+def test_a_returning_alert_slack_refuses_is_queued_in_coras_inbox(web_leads_db, monkeypatch):
+    queued = []
+    monkeypatch.setattr("src.lending.web_leads.post_ops_alert", lambda message: False)
+    monkeypatch.setattr("src.lending.web_leads.add_to_inbox_in_own_session", lambda **event: queued.append(event))
+    lead_id, _ = save_web_lead(web_leads_db, _data())
+    deliver_pending(web_leads_db, RecordingSink(PushResult("ghl_1", pipeline_card=True, returning=True)), lead_id=lead_id)
+    assert [e["event_type"] for e in queued] == ["web_lead_returning_alert_failed"]
+
+
+def test_the_latest_occupancy_answer_wins_inside_the_dedup_window(web_leads_db):
+    lead_id, _ = save_web_lead(web_leads_db, _data(occupancy="no"))
+    assert merge_into_existing(web_leads_db, lead_id, _data(occupancy="yes")) is False
+    assert _row(web_leads_db, lead_id)["ghl_status"] == "excluded"
+    assert merge_into_existing(web_leads_db, lead_id, _data(occupancy="no")) is True  # released: delivered again
+    assert _row(web_leads_db, lead_id)["ghl_status"] == "pending"
