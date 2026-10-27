@@ -30,7 +30,7 @@ workflow, built by hand (the GHL API cannot create workflows). The code side rec
 | Opt-out | A **"DND?"** If/Else at the start **and directly after every Wait step** (before the next task or message). The branch for "DND enabled channels is not empty" (or the fallback of an "is empty" condition) must contain **nothing: END**, never a Goto. GHL blocks texts and emails to DND contacts by itself, but not tasks, so without these checks Josh would keep getting call tasks for someone who opted out. Our opt-out handling sets GHL DND on every channel (`src/lending/ghl_dnd.py`); a STOP reply sets it as well. Tested 2026-10-19 with the real `set_ghl_dnd()`: no task or message after the opt-out. |
 | Replies | A reply alone does **not** stop the sequence (the Runbook stops only on booking or opt-out). |
 | Quiet hours | Texts only 8 AM–8 PM in the borrower's local time, the same rule as the intro text. |
-| Sender | Josh's Next Deal Lending number and email; signed "Josh Kantor, Loan Officer"; **no company name**. |
+| Sender | The Next Deal Lending number and email; signed "Next Deal Lending", never a personal name (client, Engineering Pod Action List section 2, Q18/Q56). |
 
 ### SMS steps stay paused until 10DLC clears
 Every **Send SMS** step sits behind an **If/Else: contact has tag `ndl-sms-enabled`**. No contact has that tag, so
@@ -78,39 +78,44 @@ LendingFlow leads with **5+ attempts over 5+ days** qualify for replacement cred
 
 ## 4. Message drafts (for Josh's approval)
 
-Rules for every message: signed "Josh Kantor, Loan Officer"; no company name; **no rate, term, point, fee, ratio,
+*Updated per the client's instruction that Josh's name appears on nothing the borrower sees (Q18/Q56): every
+message is signed "Next Deal Lending", and the first person ("I") became "we" so the voice matches the sender. This
+is a wording change, so Josh re-approves it, the GHL workflow text must be changed to match, and the 10DLC sample
+messages must reflect these texts.*
+
+Rules for every message: signed "Next Deal Lending", never a personal name; **no rate, term, point, fee, ratio,
 payment, amount or range** (the same rule Cora and the reply agent enforce); texts end "Reply STOP to opt out.";
 booking link `https://api.leadconnectorhq.com/widget/bookings/josh-kantor`.
 
-**SMS 0:** Hi {{contact.first_name}}, this is Josh Kantor, loan officer. I just tried calling about your loan
+**SMS 0:** Hi {{contact.first_name}}, this is Next Deal Lending. We just tried calling about your loan
 request. Grab a time that works for you here: [booking link]. Reply STOP to opt out.
 
-**SMS 1:** Hi {{contact.first_name}}, Josh Kantor again. Happy to walk through your project whenever it suits you:
+**SMS 1:** Hi {{contact.first_name}}, Next Deal Lending again. Happy to walk through your project whenever it suits you:
 [booking link]. Reply STOP to opt out.
 
-**SMS 2:** Hi {{contact.first_name}}, do you have a property under contract yet? If you do, I can move quickly. Book
+**SMS 2:** Hi {{contact.first_name}}, do you have a property under contract yet? If you do, we can move quickly. Book
 a short call here: [booking link]. Reply STOP to opt out.
 
-**SMS 5:** Hi {{contact.first_name}}, I'd still like to help get your deal funded. A short call is all it takes to
+**SMS 5:** Hi {{contact.first_name}}, we'd still like to help get your deal funded. A short call is all it takes to
 start: [booking link]. Reply STOP to opt out.
 
-**SMS 14:** Hi {{contact.first_name}}, should I close your file? If you'd still like help with your loan, reply here
+**SMS 14:** Hi {{contact.first_name}}, should we close your file? If you'd still like help with your loan, reply here
 or grab a time: [booking link]. Reply STOP to opt out.
 
-**Email 0, subject "Your loan request":** Hi {{contact.first_name}}, thanks for your loan request. I tried to reach
+**Email 0, subject "Your loan request":** Hi {{contact.first_name}}, thanks for your loan request. We tried to reach
 you by phone and would like to learn about your project and timeline. You can pick a time that suits you here:
-[booking link]. Josh Kantor, Loan Officer.
+[booking link]. Next Deal Lending.
 
-**Email 3, subject "Options for your project":** Hi {{contact.first_name}}, I work with several lenders and compare
-their options so the loan fits your deal. On a short call I can go through your project and what a
-pre-qualification would look like. Pick a time here: [booking link]. Josh Kantor, Loan Officer.
+**Email 3, subject "Options for your project":** Hi {{contact.first_name}}, We work with several lenders and compare
+their options so the loan fits your deal. On a short call we can go through your project and what a
+pre-qualification would look like. Pick a time here: [booking link]. Next Deal Lending.
 *Flag for Josh:* the Runbook asks this email to highlight "competitive rates and pre-approval offers". Rates and
 approval wording are left out on purpose: borrower messages never quote rates, and "pre-approval" can read as a
 commitment. Josh decides the final wording.
 
 **Email 10, subject "Still looking to fund your deal?":** Hi {{contact.first_name}}, checking in on your loan
-request. If your plans have changed, no problem. If you're still working on a deal, I'd be glad to help: [booking
-link]. Josh Kantor, Loan Officer.
+request. If your plans have changed, no problem. If you're still working on a deal, we'd be glad to help: [booking
+link]. Next Deal Lending.
 
 ## 5. Checks after building (evidence)
 
@@ -145,11 +150,11 @@ The pipeline-stage workflow **"NDL - Nurture"** (trigger: "Booked Calls" stage N
 **not** part of this track. It was left unchanged.
 
 **Email (draft), subject "Any deal under contract?":** Hi {{contact.first_name}}, checking in. Do you have a property
-under contract, or one you're looking at? Send me the details and I'll run a free deal analysis so you know where it
-stands before you commit. Reply here or pick a time that suits you: [booking link]. Josh Kantor, Loan Officer
+under contract, or one you're looking at? Send us the details and we'll run a free deal analysis so you know where it
+stands before you commit. Reply here or pick a time that suits you: [booking link]. Next Deal Lending
 
-**SMS (draft, behind `ndl-sms-enabled` until 10DLC clears):** Hi {{contact.first_name}}, Josh Kantor here. Got a
-property under contract or in your sights? I'll run a free deal analysis for you. Reply here or book a call:
+**SMS (draft, behind `ndl-sms-enabled` until 10DLC clears):** Hi {{contact.first_name}}, Next Deal Lending here. Got a
+property under contract or in your sights? We'll run a free deal analysis for you. Reply here or book a call:
 [booking link] Reply STOP to opt out.
 
 ### Tests (2026-10-20, test contact, 1-minute copy "NDL – Nurture TEST (delete after)")

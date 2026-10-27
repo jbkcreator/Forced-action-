@@ -32,6 +32,18 @@ CREATE TABLE IF NOT EXISTS lending.lendingflow_leads (
     ghl_contact_id VARCHAR(64)
 )"""
 
+# Used only when the real table is absent (the shared DB has it): the columns the alarms read.
+_WEB_LEADS = """
+CREATE TABLE IF NOT EXISTS lending.web_leads (
+    id SERIAL PRIMARY KEY,
+    received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    name VARCHAR(120) NOT NULL,
+    phone VARCHAR(20) NOT NULL,
+    property_state VARCHAR(40),
+    suppressed BOOLEAN NOT NULL DEFAULT false,
+    ghl_contact_id VARCHAR(64)
+)"""
+
 
 class Sms:
     def __init__(self, error: Exception | None = None):
@@ -58,6 +70,7 @@ class Slack:
 def db(lending_db):
     conn = lending_db.connection()
     conn.execute(text(_T11_LEADS))
+    conn.execute(text(_WEB_LEADS))
     apply_to(conn)  # existing shared-DB leads become 'preexisting' and never alarm in tests
     return lending_db
 
@@ -710,3 +723,86 @@ def test_a_failed_inbox_write_never_undoes_the_escalation(db, monkeypatch):
     row = alarm(db, lead_id)
     assert (row["sms_300_status"], row["slack_300_status"], row["resolved_reason"]) == ("sent", "sent", "escalated")
     assert len(slack.posts) == 1
+
+
+# --- website leads (client Q53): the same 2-minute / 5-minute stopwatch as LendingFlow leads ------------------------
+
+
+def web_lead(db, *, arrived=ARRIVED, phone=LEAD_PHONE, suppressed=False, ghl_contact_id=None,
+             name="Jane Smith", state="FL") -> int:
+    return db.execute(text(
+        "INSERT INTO lending.web_leads (received_at, name, phone, property_state, suppressed, ghl_contact_id) "
+        "VALUES (:r, :n, :p, :st, :s, :g) RETURNING id"),
+        {"r": arrived, "n": name, "p": phone, "st": state, "s": suppressed, "g": ghl_contact_id}).scalar()
+
+
+def web_alarm(db, web_lead_id):
+    return db.execute(text("SELECT * FROM lending.uncalled_alarms WHERE web_lead_id = :i"),
+                      {"i": web_lead_id}).mappings().first()
+
+
+def test_web_lead_is_picked_up_and_the_stopwatch_starts_at_received_at(db):
+    web_id = web_lead(db)
+    pick_up_new_leads(db)
+    pick_up_new_leads(db)
+    row = web_alarm(db, web_id)
+    assert row["arrived_at"] == ARRIVED and row["phone"] == LEAD_PHONE and row["lead_uuid"] == f"web-{web_id}"
+    assert row["lendingflow_lead_id"] is None
+    assert db.execute(text("SELECT count(*) FROM lending.uncalled_alarms WHERE web_lead_id = :i"),
+                      {"i": web_id}).scalar() == 1
+
+
+def test_suppressed_web_lead_is_never_picked_up(db):
+    web_id = web_lead(db, suppressed=True)
+    pick_up_new_leads(db)
+    assert web_alarm(db, web_id) is None
+
+
+def test_uncalled_web_lead_alarms_at_120_and_escalates_at_300_with_the_same_wording(db):
+    web_id = web_lead(db)
+    sms, slack = Sms(), Slack()
+    cycle(db, 119, sms=sms, slack=slack)
+    assert sms.sent == []
+    cycle(db, 120, sms=sms, slack=slack)
+    assert len(sms.sent) == 1 and slack.posts == []
+    assert "New website lead Jane (FL) came in 2 min ago and no call is logged yet" in sms.sent[0][1]
+    assert f"Ref web-{web_id}" in sms.sent[0][1] and "Smith" not in sms.sent[0][1]  # first name only, as for LendingFlow
+    cycle(db, 300, sms=sms, slack=slack)
+    cycle(db, 400, sms=sms, slack=slack)
+    assert len(sms.sent) == 2 and sms.sent[1][1].startswith("URGENT - NDL LEAD STILL UNCALLED: website lead")
+    assert len(slack.posts) == 1 and "URGENT: website lead still uncalled" in slack.posts[0][1]
+    assert web_alarm(db, web_id)["resolved_reason"] == "escalated"
+
+
+def test_a_connected_call_closes_a_web_lead_before_it_alarms(db):
+    web_id = web_lead(db)
+    call(db, started=ARRIVED + timedelta(seconds=30))
+    sms = Sms()
+    cycle(db, 120, sms=sms, slack=Slack())
+    assert sms.sent == [] and web_alarm(db, web_id)["resolved_reason"] == "connected"
+
+
+def test_web_lead_without_a_name_or_state_still_alarms(db):
+    web_lead(db, name="", state=None)
+    sms = Sms()
+    cycle(db, 120, sms=sms)
+    assert "website lead (no name) came in" in sms.sent[0][1]
+
+
+def test_each_alarm_row_has_exactly_one_lead_source(db):
+    with pytest.raises(Exception, match="ck_lending_uncalled_alarms_one_source"):
+        with db.begin_nested():
+            db.execute(text("INSERT INTO lending.uncalled_alarms (lead_uuid, phone, arrived_at) "
+                            "VALUES ('x', '+17275550100', now())"))
+
+
+def test_migration_closes_existing_web_leads_once_when_the_column_is_first_added(db):
+    old_id = web_lead(db)
+    db.execute(text("ALTER TABLE lending.uncalled_alarms DROP COLUMN web_lead_id CASCADE"))
+    apply_to(db.connection())  # first apply of the web-lead column: existing website leads never alarm
+    assert web_alarm(db, old_id)["resolved_reason"] == "preexisting"
+    new_id = web_lead(db)
+    apply_to(db.connection())  # a later re-run must not close a lead the worker has not picked up yet
+    assert web_alarm(db, new_id) is None
+    pick_up_new_leads(db)
+    assert web_alarm(db, new_id)["resolved_at"] is None

@@ -61,6 +61,7 @@ from src.lending.routing.rules import (
     LenderRow,
     lender_passes_box,
     load_active_lenders,
+    missing_leverage_facts,
     outside_footprint,
     BypassReason,
     primary_bypass_reason,
@@ -224,7 +225,8 @@ def _load_file(key: FileKey, db: Session) -> dict:
         ).mappings().one_or_none()
         if row is None:
             raise ValueError(f"lendingflow_leads.id={key.id} not found")
-        return {**dict(row), "completed_projects": None, "label": key.label}
+        return {**dict(row), "completed_projects": None, "purchase_price": None, "rehab_budget": None, "arv": None,
+                "label": key.label}
 
     row = db.execute(
         text(
@@ -447,6 +449,10 @@ def _route(key: FileKey, db: Session) -> None:
         return
 
     profile = _build_profile(file)
+    missing_facts = missing_leverage_facts(profile)
+    if missing_facts:
+        logger.info("route %s %d leverage pending_call_facts: missing %s, caps needing them are not applied",
+                    key.kind, key.id, ", ".join(missing_facts))
     signed = _signed(load_active_lenders(db))
 
     if not signed:
@@ -469,7 +475,8 @@ def _route(key: FileKey, db: Session) -> None:
 
     chosen = choice.lender
     logger.info(
-        "route %s %d -> lender_id=%d name=%r position=%d", key.kind, key.id, chosen.id, chosen.name, position,
+        "route %s %d -> lender_id=%d name=%r position=%d primary_bypass=%s",
+        key.kind, key.id, chosen.id, chosen.name, position, choice.bypass.value if choice.bypass else None,
     )
     overflow = {"overflow": True, "primary_bypass_reason": choice.bypass.value} if choice.bypass else None
     event_id = _set_routed(key, routing, chosen, position, db, overflow)

@@ -67,7 +67,7 @@ _SQL_FROM_LIST_END = re.compile(
 
 # Verbatim consent wording and certificates stay out of Slack: the yes/no consent fields answer
 # every operational question. Named in a query -> refused; picked up by SELECT * -> blanked.
-CONSENT_TEXT_COLUMNS = frozenset({"consent_text", "raw_certificate", "tcpa_disclosure_text"})
+CONSENT_TEXT_COLUMNS = frozenset({"consent_text", "call_consent_text", "raw_certificate", "tcpa_disclosure_text"})
 _CONSENT_TEXT = re.compile(r"\b(?:" + "|".join(sorted(CONSENT_TEXT_COLUMNS)) + r")\b", re.IGNORECASE)
 CONSENT_TEXT_HIDDEN = "[consent text not shown]"
 
@@ -106,7 +106,8 @@ LENDING_TABLES_HELP = (
     "call_source batchdialer or ghl; a LendingFlow lead qualifies for replacement with 5+ outbound attempts "
     "on its phone over 5+ Eastern days since it arrived), "
     "web_leads (website form: received_at, name, phone, email, property_city, deal_type, completed_projects_3y, "
-    "sms_consent, suppressed, ghl_status, ghl_contact_id), contacts (phone, email, do_not_contact, nurture), "
+    "loan_amount, property_state, credit_band, sms_consent (text box), call_consent (call box), "
+    "deal_drop_optin (weekly email), suppressed, ghl_status, ghl_contact_id), contacts (phone, email, do_not_contact, nurture), "
     "text_consents (phone, source, captured_at, revoked_at), suppression_list (phone, email, reason, created_at), "
     "ghl_stage_events (ghl_opportunity_id, stage_name, phone, booked_by, event_at), "
     "lendingflow_batches (one LendingFlow purchase: name, purchased_at, lead_count; leads fill batches in arrival "
@@ -305,7 +306,7 @@ def check_read_only_sql(sql: str) -> str:
         raise ToolInputError("the query uses a keyword or function that is not allowed in a read-only lookup")
     if _CONSENT_TEXT.search(statement):
         raise ToolInputError("consent wording and certificates are not shown in Slack; use the yes/no consent "
-                             "fields (web_leads.sms_consent, text_consents) instead")
+                             "fields (web_leads.sms_consent, web_leads.call_consent, text_consents) instead")
     cte_names = {name.lower() for name in re.findall(r"\b(\w+)\s+as\s*\(", statement, re.IGNORECASE)}
     for relation in _named_relations(statement):
         cleaned = relation.replace('"', "").lower()

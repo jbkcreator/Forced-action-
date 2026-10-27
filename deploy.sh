@@ -40,9 +40,10 @@ LENDING_CDR_UNIT_DST="/etc/systemd/system/fa-lending-cdr-poller.service"
 # The missed-call poller is not listed: it is retired by the GL-9 text-back work.
 # fa-lending-uncalled-alarm-worker (T-10) idles until LENDING_UNCALLED_ALARMS_ENABLED=true, so installing it is safe.
 # fa-lending-transcript-worker (T-12) idles until LENDING_TRANSCRIPT_INGEST_ENABLED=true, so installing it is safe.
+# fa-lending-reminder-worker (WP-GL-10) sends nothing until BOOKING_REMINDER_TEXT_ENABLED=true, so installing it is safe.
 # lending-api serves every /webhooks/lending/* route (nginx sends that prefix to 127.0.0.1:8010).
 # Unlike the others it IS a hard gate: deploy fails if nginx lacks the route or :8010/health is down.
-LENDING_UNITS=(fa-lending-opt-out-poller fa-lending-dialer-sweep fa-lending-uncalled-alarm-worker fa-lending-transcript-worker lending-api)
+LENDING_UNITS=(fa-lending-opt-out-poller fa-lending-dialer-sweep fa-lending-uncalled-alarm-worker fa-lending-transcript-worker fa-lending-reminder-worker lending-api)
 
 cd "$PROJECT_DIR"
 

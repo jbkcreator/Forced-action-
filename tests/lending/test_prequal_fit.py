@@ -75,3 +75,17 @@ def test_live_matrix_keeps_letters_waiting_today():
     from config.lender_matrix import LENDER_MATRIX
     if not any(rules.verified for rules in LENDER_MATRIX):
         assert get_fit_evaluator() is None
+
+
+def test_default_matrix_is_the_confirmed_rules_store(monkeypatch):
+    """With no matrix passed, the letter reads the rules the rest of the system reads (LENDING_RULES_FROM_DB)."""
+    monkeypatch.setattr("src.lending.prequal_fit.current_matrix", lambda: (PLACEHOLDER_BOX,))
+    assert evaluate_prequal_fit(_lead()) == [FitLimits(75_000, 2_000_000)]
+    evaluator = get_fit_evaluator()
+    assert evaluator is not None
+    assert evaluator(_lead()) == [FitLimits(75_000, 2_000_000)]
+
+
+def test_unverified_rules_store_keeps_letters_waiting(monkeypatch):
+    monkeypatch.setattr("src.lending.prequal_fit.current_matrix", lambda: (UNVERIFIED,))
+    assert get_fit_evaluator() is None

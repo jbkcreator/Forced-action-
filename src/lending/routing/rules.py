@@ -239,10 +239,10 @@ def _box_failures(box: ProductBox, profile: FileProfile) -> list[tuple[FailureKi
 
     deal_ltv = leverage.ltv(profile.loan_amount, profile.arv)
     if leverage.over_cap(deal_ltv, box.max_ltv):
-        failures.append((FailureKind.LEVERAGE, f"LTV ({leverage.requested_vs_max(deal_ltv, box.max_ltv)})"))
+        failures.append((FailureKind.LEVERAGE, f"LTV_LIMIT_EXCEEDED ({leverage.requested_vs_max(deal_ltv, box.max_ltv)})"))
     deal_ltc = leverage.ltc(profile.loan_amount, profile.purchase_price, profile.rehab_budget)
     if leverage.over_cap(deal_ltc, box.max_ltc):
-        failures.append((FailureKind.LEVERAGE, f"LTC ({leverage.requested_vs_max(deal_ltc, box.max_ltc)})"))
+        failures.append((FailureKind.LEVERAGE, f"LTC_LIMIT_EXCEEDED ({leverage.requested_vs_max(deal_ltc, box.max_ltc)})"))
     return failures
 
 
@@ -281,13 +281,27 @@ def outside_footprint(lenders: list[LenderRow], state: str) -> bool:
                    for lender in lenders for box in lender.boxes)
 
 
+def missing_leverage_facts(profile: FileProfile) -> list[str]:
+    """The figures a leverage check needs that this file does not carry (captured on the call)."""
+    figures = {"purchase_price": profile.purchase_price, "rehab_budget": profile.rehab_budget, "arv": profile.arv}
+    return [name for name, value in figures.items() if value is None]
+
+
 def lender_passes_box(lender: LenderRow, profile: FileProfile) -> bool:
     """True when the file passes at least one of the lender's product boxes.
 
     A lender with no boxes has no known rules, so it never matches: unknown eligibility must not mean
     "accepts everything" (the file goes on to the next lender or the hold queue instead).
     """
-    return any(_box_matches(box, profile)[0] for box in lender.boxes)
+    rejections: list[str] = []
+    for box in lender.boxes:
+        matches, reasons = _box_matches(box, profile)
+        if matches:
+            return True
+        rejections.extend(reasons)
+    if rejections:
+        logger.info("lender_id=%d skipped: %s", lender.id, "; ".join(rejections))
+    return False
 
 
 def primary_lender(lenders: list[LenderRow]) -> Optional[LenderRow]:

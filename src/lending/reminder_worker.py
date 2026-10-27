@@ -30,11 +30,13 @@ from config.lending_reminders import (
     CHANNEL_TEXT,
     KIND_NIGHT_BEFORE,
     KIND_NINETY_MIN,
+    KIND_TEN_MIN,
     MAX_SEND_ATTEMPTS,
     NINETY_MIN_MAX_LATE_SECONDS,
     POLL_SECONDS,
     RETRY_DELAY_SECONDS,
     STALE_SEND_SECONDS,
+    TEN_MIN_MAX_LATE_SECONDS,
     TIMEZONE,
 )
 from config.settings import get_settings
@@ -176,6 +178,8 @@ def _too_late(row: Mapping[str, Any], now: datetime) -> bool:
         return now.astimezone(TIMEZONE).date() >= row["slot_start_utc"].astimezone(TIMEZONE).date()
     if row["kind"] == KIND_NINETY_MIN:
         return (now - row["send_at"]).total_seconds() > NINETY_MIN_MAX_LATE_SECONDS
+    if row["kind"] == KIND_TEN_MIN:
+        return (now - row["send_at"]).total_seconds() > TEN_MIN_MAX_LATE_SECONDS
     return False
 
 
@@ -189,10 +193,10 @@ def _send_text(db, row: Mapping[str, Any], *, now: datetime, sender: Optional[Te
         _record(db, rid, "skipped", "not_configured", CHANNEL_TEXT)
         return "skipped_not_configured"
     if not text_window_open(now):
-        # The 90-minute text promises a timing, so it is never delayed; the others wait for the window.
+        # The 90-minute and 10-minute texts promise a timing, so they are never delayed; the others wait for the window.
         opens = next_text_window(now)
         same_day_as_call = opens.astimezone(TIMEZONE).date() >= slot.astimezone(TIMEZONE).date()
-        if kind == KIND_NINETY_MIN or opens >= slot or (kind == KIND_NIGHT_BEFORE and same_day_as_call):
+        if kind in (KIND_NINETY_MIN, KIND_TEN_MIN) or opens >= slot or (kind == KIND_NIGHT_BEFORE and same_day_as_call):
             _record(db, rid, "skipped", "quiet_hours", CHANNEL_TEXT)
             return "skipped_quiet_hours"
         _requeue(db, row, opens, "deferred_quiet_hours", count_attempt=False)
