@@ -48,6 +48,7 @@ def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
             created_by       varchar(80),
             token_hash       varchar(64)  NOT NULL UNIQUE,
             token_revoked_at timestamptz,
+            is_test          boolean      NOT NULL DEFAULT false,
             created_at       timestamptz  NOT NULL DEFAULT now(),
             updated_at       timestamptz  NOT NULL DEFAULT now()
         )""",
@@ -84,6 +85,7 @@ def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
             notice_emailed_at   timestamptz,
             notice_texted_at    timestamptz,
             notice_failed_at    timestamptz,
+            is_test             boolean      NOT NULL DEFAULT false,
             created_at          timestamptz  NOT NULL DEFAULT now(),
             updated_at          timestamptz  NOT NULL DEFAULT now()
         )""",

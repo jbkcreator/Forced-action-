@@ -2,6 +2,7 @@
 Shared pytest fixtures for Forced Action test suite.
 """
 
+from _database_guard import pytest_collection_modifyitems  # noqa: F401  (importing it also repoints DATABASE_URL at the throwaway test database, before settings are read)
 import pytest
 from unittest.mock import MagicMock
 from sqlalchemy import create_engine

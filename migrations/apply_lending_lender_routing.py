@@ -129,6 +129,7 @@ DDL = [
         route_position      INTEGER,
         lenders_tried       INTEGER[]    NOT NULL DEFAULT '{}',
         hold_reason         VARCHAR(30),
+        is_test             BOOLEAN      NOT NULL DEFAULT false,
         created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
         updated_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
         CONSTRAINT ck_file_routing_status CHECK (

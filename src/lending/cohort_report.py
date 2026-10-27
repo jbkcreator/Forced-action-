@@ -56,7 +56,8 @@ _COHORTS = text("""
     leads AS (
         SELECT id, phone, received_at, row_number() OVER (ORDER BY received_at, id) AS rank
           FROM lending.lendingflow_leads
-         WHERE received_at >= (SELECT min(purchased_at) FROM batches)::timestamp AT TIME ZONE :tz
+         WHERE NOT is_test
+           AND received_at >= (SELECT min(purchased_at) FROM batches)::timestamp AT TIME ZONE :tz
     ),
     placed AS (
         SELECT l.id, l.phone, l.received_at, b.id AS batch_id
@@ -99,7 +100,8 @@ _COHORTS = text("""
 
 _UNPLACED = text("""
     SELECT count(*) FROM lending.lendingflow_leads
-     WHERE received_at >= (SELECT min(purchased_at) FROM lending.lendingflow_batches)::timestamp AT TIME ZONE :tz
+     WHERE NOT is_test
+       AND received_at >= (SELECT min(purchased_at) FROM lending.lendingflow_batches)::timestamp AT TIME ZONE :tz
 """)
 
 

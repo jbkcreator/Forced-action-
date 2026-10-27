@@ -44,7 +44,7 @@ def test_an_outbound_call_after_arrival_becomes_one_ghl_row():
 
 
 @pytest.mark.parametrize("message", [
-    _msg(direction="inbound"),
+    _msg(direction="internal"),
     _msg(added=ARRIVED - timedelta(minutes=1)),
     {**_msg(), "id": None},
     {**_msg(), "dateAdded": "2026-10-12T13:05:00"},  # no timezone
@@ -52,6 +52,15 @@ def test_an_outbound_call_after_arrival_becomes_one_ghl_row():
 ])
 def test_calls_that_are_not_attempts_after_arrival_are_skipped(message):
     assert _call_row(message, "c-1", "+18135550101", ARRIVED) is None
+
+
+def test_an_inbound_call_becomes_an_inbound_ghl_row():
+    answered = _call_row(_msg("in-1", direction="inbound", status="completed", meta_extra={"call": {"duration": 40}}),
+                         "c-1", "+18135550101", ARRIVED)
+    missed = _call_row(_msg("in-2", direction="inbound", status="no-answer"), "c-1", "+18135550101", ARRIVED)
+    assert (answered["direction"], answered["raw_outcome"], answered["talk"]) == ("inbound", "ghl:completed", 40)
+    assert (missed["direction"], missed["raw_outcome"], missed["talk"]) == ("inbound", "ghl:no-answer", None)
+    assert _call_row(_msg(), "c-1", "+18135550101", ARRIVED)["direction"] == "outbound"
 
 
 def test_an_unknown_outcome_and_no_duration_are_kept_as_unknown():
@@ -229,7 +238,7 @@ def _bd_call(db, *, phone, started, talk=0) -> None:
 
 
 def _ghl_rows(db, phone):
-    return db.execute(text("SELECT dialer_call_id, call_source, caller_seat, campaign_tag, disposition, "
+    return db.execute(text("SELECT dialer_call_id, direction, call_source, caller_seat, campaign_tag, disposition, "
                            "disposition_raw, call_started_at FROM lending.call_dispositions "
                            "WHERE phone = :p AND call_source = 'ghl' ORDER BY call_started_at"),
                       {"p": phone}).mappings().all()
@@ -240,14 +249,29 @@ def test_ghl_calls_of_a_lead_in_its_window_are_stored_once(lending_db):
     _lendingflow_lead(lending_db, phone=phone, contact_id=contact)
     messages = {contact: [_msg(f"{contact}-1"), _msg(f"{contact}-2", added=ARRIVED + timedelta(days=1),
                                                        status="completed"),
-                          _msg(f"{contact}-in", direction="inbound")]}
+                          _msg(f"{contact}-in", direction="inbound", added=ARRIVED + timedelta(hours=2),
+                               status="completed")]}
     first = import_calls(lending_db, lambda cid: messages.get(cid, []), now=NOW)
     again = import_calls(lending_db, lambda cid: messages.get(cid, []), now=NOW)
     rows = _ghl_rows(lending_db, phone)
-    assert [r["dialer_call_id"] for r in rows] == [f"ghl:{contact}-1", f"ghl:{contact}-2"]
+    assert [r["dialer_call_id"] for r in rows] == [f"ghl:{contact}-1", f"ghl:{contact}-in", f"ghl:{contact}-2"]
+    assert [r["direction"] for r in rows] == ["outbound", "inbound", "outbound"]
     assert all(r["caller_seat"] == "ghl" and r["campaign_tag"] == "ghl" and r["disposition"] is None for r in rows)
-    assert rows[1]["disposition_raw"] == "ghl:completed"
-    assert first.imported >= 2 and again.imported == 0 and again.already_recorded >= 2
+    assert rows[2]["disposition_raw"] == "ghl:completed"
+    assert first.imported >= 3 and again.imported == 0 and again.already_recorded >= 3
+
+
+def test_inbound_calls_are_stored_but_never_count_as_outbound_attempts(lending_db):
+    from src.lending.compliance import MAX_ATTEMPTS_PER_PERIOD, _attempt_cap
+
+    phone, contact = _phone(), f"c-{uuid.uuid4().hex[:8]}"
+    _lendingflow_lead(lending_db, phone=phone, contact_id=contact)
+    calls = [_msg(f"{contact}-in{n}", direction="inbound", added=NOW - timedelta(hours=1, minutes=n),
+                  status="completed" if n % 2 else "no-answer") for n in range(MAX_ATTEMPTS_PER_PERIOD + 2)]
+    import_calls(lending_db, lambda cid: calls if cid == contact else [], now=NOW)
+    rows = _ghl_rows(lending_db, phone)
+    assert len(rows) == MAX_ATTEMPTS_PER_PERIOD + 2 and {r["direction"] for r in rows} == {"inbound"}
+    assert _attempt_cap(lending_db, phone, NOW).allowed  # more inbound calls than the cap, still dialable
 
 
 def test_a_contact_with_a_lendingflow_and_a_web_lead_is_read_once(lending_db):
@@ -425,3 +449,73 @@ def test_ghl_calls_never_raise_the_missing_disposition_alert(ghl_call_row, lendi
     alerted = lending_db.execute(text("SELECT disposition_missing_alerted_at FROM lending.call_dispositions "
                                       "WHERE id = :id"), {"id": row_id}).scalar()
     assert alerted is None
+
+
+# ── callers who are not leads (Q66) ──────────────────────────────────────────
+
+def _search_http(conversations):
+    def get(url, **kwargs):
+        response = MagicMock()
+        response.json.return_value = {"conversations": conversations}
+        get.requests.append((url, kwargs.get("params")))
+        return response
+    get.requests = []
+    return get
+
+
+def test_the_recent_callers_reader_lists_call_conversations_newer_than_the_cutoff():
+    from src.lending.ghl_calls import recent_callers_reader
+
+    cutoff = datetime(2026, 10, 20, tzinfo=timezone.utc)
+    conversations = [
+        {"contactId": "new-1", "phone": "+18135550111", "lastMessageDate": int(cutoff.timestamp() * 1000) + 5000},
+        {"contactId": "old-1", "phone": "+18135550112", "lastMessageDate": int(cutoff.timestamp() * 1000) - 5000},
+        {"contactId": None, "phone": "+18135550113", "lastMessageDate": int(cutoff.timestamp() * 1000) + 9000},
+        {"contactId": "no-phone", "phone": None, "lastMessageDate": int(cutoff.timestamp() * 1000) + 9000},
+    ]
+    http = _search_http(conversations)
+    account = MagicMock(api_key="k", location_id="loc-1")
+    assert recent_callers_reader(account, http=http)(cutoff) == [("new-1", "+18135550111")]
+    url, params = http.requests[0]
+    assert url.endswith("/conversations/search")
+    assert params["lastMessageType"] == "TYPE_CALL" and params["sortBy"] == "last_message_date"
+
+
+def test_a_caller_who_is_not_a_lead_gets_only_their_inbound_calls_stored(lending_db):
+    phone, contact = _phone(), f"stranger-{uuid.uuid4().hex[:8]}"
+    messages = {contact: [_msg(f"{contact}-in", direction="inbound", added=NOW - timedelta(hours=3), status="completed"),
+                          _msg(f"{contact}-missed", direction="inbound", added=NOW - timedelta(hours=2)),
+                          _msg(f"{contact}-out", direction="outbound", added=NOW - timedelta(hours=1))]}
+    stats = import_calls(lending_db, lambda cid: messages.get(cid, []), now=NOW,
+                         recent_callers=lambda since: [(contact, phone)])
+    rows = _ghl_rows(lending_db, phone)
+    assert [r["dialer_call_id"] for r in rows] == [f"ghl:{contact}-in", f"ghl:{contact}-missed"]
+    assert {r["direction"] for r in rows} == {"inbound"}  # the outbound call to a non-lead is not a follow-up attempt
+    assert stats.other_callers >= 1
+
+
+def test_a_lead_who_calls_is_read_once_and_keeps_their_outbound_calls(lending_db):
+    phone, contact = _phone(), f"c-{uuid.uuid4().hex[:8]}"
+    _lendingflow_lead(lending_db, phone=phone, contact_id=contact)
+    reads = []
+
+    def read(cid):
+        reads.append(cid)
+        return [_msg(f"{contact}-out"), _msg(f"{contact}-in", direction="inbound", added=ARRIVED + timedelta(hours=2))] \
+            if cid == contact else []
+
+    import_calls(lending_db, read, now=NOW, recent_callers=lambda since: [(contact, phone)])
+    assert reads.count(contact) == 1
+    assert [r["direction"] for r in _ghl_rows(lending_db, phone)] == ["outbound", "inbound"]
+
+
+def test_a_failed_recent_callers_lookup_is_counted_and_the_leads_are_still_imported(lending_db):
+    phone, contact = _phone(), f"c-{uuid.uuid4().hex[:8]}"
+    _lendingflow_lead(lending_db, phone=phone, contact_id=contact)
+
+    def broken(since):
+        raise RuntimeError("GHL down")
+
+    stats = import_calls(lending_db, lambda cid: [_msg(f"{contact}-out")] if cid == contact else [], now=NOW,
+                         recent_callers=broken)
+    assert stats.lookup_failures >= 1 and len(_ghl_rows(lending_db, phone)) == 1

@@ -57,6 +57,7 @@ class LendingSuppression(LendingBase):
     reason: Mapped[str] = mapped_column(String(30), nullable=False)  # SuppressionReason: OPT_OUT / LITIGATOR / WARM_NETWORK
     source_channel: Mapped[str] = mapped_column(String(30), nullable=False)  # sms / email / dialer / backfill:*
     source_ref: Mapped[Optional[str]] = mapped_column(String(100))
+    is_test: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))  # test row: left out of reports, never out of suppression or consent
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 
     __table_args__ = (
@@ -79,6 +80,7 @@ class LendingContact(LendingBase):
     nurture: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))  # phone blocked by DNC; email nurture only
     pinned_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # after-hours voicemail: call first next morning
     pinned_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # pin also ends at the first outbound attempt
+    is_test: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))  # test traffic: left out of reports and caps, never out of suppression or consent
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 
 
@@ -422,6 +424,7 @@ class LendingWebLead(LendingBase):
     ghl_last_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     ghl_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     ghl_alerted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # Slack warning sent: not in GHL after the alert wait
+    is_test: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))  # test traffic: left out of reports and caps, never out of suppression or consent
     returning_alerted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # 1.2.2 ops alert posted once
     occupancy: Mapped[str] = mapped_column(String(20), nullable=False, default="unknown", server_default=text("'unknown'"))  # config.lending_occupancy
 
@@ -668,6 +671,7 @@ class LendingLendingFlowLead(LendingBase):
     intro_sms_tagged_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # T-09: ready tag added (starts the GHL intro text); NULL = not yet, or held for the send window
     duplicate_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     last_duplicate_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    is_test: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))  # test traffic: left out of reports and caps, never out of suppression or consent
     raw_payload: Mapped[Any] = mapped_column(JSONB, nullable=False)
 
     __table_args__ = (
@@ -860,6 +864,7 @@ class LendingFileRouting(LendingBase):
     current_lender_name: Mapped[Optional[str]] = mapped_column(String(100))
     route_position: Mapped[Optional[int]] = mapped_column(Integer)
     lenders_tried: Mapped[list[int]] = mapped_column(ARRAY(Integer), nullable=False, default=list, server_default=text("'{}'"))
+    is_test: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))  # test traffic: left out of reports and caps, never out of suppression or consent
     hold_reason: Mapped[Optional[str]] = mapped_column(String(30))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
@@ -1122,6 +1127,42 @@ class LendingFlowReplacement(LendingBase):
     )
 
 
+class LendingTestDataCleanupLog(LendingBase):
+    """One row per row tagged ``is_test`` by src/lending/test_data.py (Q42): which table, which row id and which rule.
+    Ids and the rule only (no names, numbers or emails), so the log can be shown to anyone."""
+
+    __tablename__ = "test_data_cleanup_log"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(String(40), nullable=False)
+    table_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    row_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    rule: Mapped[str] = mapped_column(String(60), nullable=False)
+    tagged_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
+
+    __table_args__ = (
+        Index("idx_lending_test_data_cleanup_log_run", "run_id"),
+    )
+
+
+class LendingTestDataDeletedRow(LendingBase):
+    """A copy of every row src/lending/test_data.py deleted (Q42), so a deletion can be undone: ``row_data`` is the
+    whole row as JSON. Holds test rows only, and test rows can carry test emails and phones."""
+
+    __tablename__ = "test_data_deleted_rows"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(String(40), nullable=False)
+    table_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    row_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    row_data: Mapped[Any] = mapped_column(JSONB, nullable=False)
+    deleted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
+
+    __table_args__ = (
+        Index("idx_lending_test_data_deleted_rows_run", "run_id"),
+    )
+
+
 class LendingLoanFile(LendingBase):
     """One borrower file in the lending pipeline, whatever its source (P-1 creates partner files).
 
@@ -1139,6 +1180,7 @@ class LendingLoanFile(LendingBase):
     borrower_phone: Mapped[Optional[str]] = mapped_column(String(20))  # phone_utils.normalize
     borrower_email: Mapped[Optional[str]] = mapped_column(String(255))  # lower-cased
     product: Mapped[str] = mapped_column(String(20), nullable=False)  # flip / ground_up / dscr / other
+    is_test: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))  # test traffic: left out of reports and caps, never out of suppression or consent
     loan_amount: Mapped[int] = mapped_column(BigInteger, nullable=False)
     property_address: Mapped[Optional[str]] = mapped_column(String(200))
     property_city: Mapped[Optional[str]] = mapped_column(String(80))
@@ -1196,6 +1238,7 @@ class LendingPartner(LendingBase):
     created_by: Mapped[Optional[str]] = mapped_column(String(80))
     token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
     token_revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    is_test: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))  # test traffic: left out of reports and caps, never out of suppression or consent
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 

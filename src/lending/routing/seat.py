@@ -41,10 +41,12 @@ def seat_count(lender: LenderRow, db: Session) -> int:
     row = db.execute(
         text(
             "SELECT COUNT(*) AS cnt"
-            "  FROM lending.file_routing_events"
+            "  FROM lending.file_routing_events e"
             " WHERE lender_id = :lid"
             "   AND action = :action"
             "   AND created_at >= :month_start"
+            "   AND NOT EXISTS (SELECT 1 FROM lending.file_routing fr WHERE fr.is_test"
+            "                    AND (fr.lead_id = e.lead_id OR fr.loan_file_id = e.loan_file_id))"
         ),
         {"lid": lender.id, "action": SEAT_CAP_COUNTED_ACTION, "month_start": month_start},
     ).one()

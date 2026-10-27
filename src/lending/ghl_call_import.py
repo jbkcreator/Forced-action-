@@ -3,12 +3,15 @@
 The Runbook asks that every call attempt in the 14-day follow-up is written to lending.call_dispositions, so that
 LendingFlow leads with 5+ attempts over 5+ days can be claimed for replacement credit. BatchDialer calls already
 arrive through the CDR poller; LendingFlow leads go straight to Josh, who calls from GoHighLevel, and those calls
-were recorded nowhere. This import reads the outbound call messages of every LendingFlow and website lead still in
-its follow-up window and stores each one once. When more contacts are in the window than one run reads
+were recorded nowhere. This import reads the call messages (Josh's outbound attempts and the lead's inbound calls
+to the Next Deal Lending number, answered and missed) of every LendingFlow and website lead still in its follow-up
+window and stores each one once. When more contacts are in the window than one run reads
 (IMPORT_CONTACT_LIMIT), successive runs read successive slices, so every contact is covered.
 
 * ``dialer_call_id`` = ``ghl:<message id>`` (unique, so a re-run never duplicates a call); a call seen again with
   a new outcome or talk time (imported while it was still in progress) is updated in place
+* ``direction`` = ``outbound`` or ``inbound`` (Q66). Only outbound rows count as attempts (attempt caps, the replacement
+  rule, the scoreboard and the uncalled alarm all filter on direction); an inbound row is a record of the call
 * ``call_source`` = ``ghl``, ``caller_seat`` / ``campaign_tag`` = ``ghl`` (its own scoreboard line)
 * ``disposition`` stays NULL (GHL outcomes are not lending disposition codes); GHL's outcome is kept in
   ``disposition_raw`` as ``ghl:<callStatus>``, which also keeps it out of the missing-disposition alert
@@ -17,6 +20,10 @@ its follow-up window and stores each one once. When more contacts are in the win
 Dialer-only jobs (Slack/sheet delivery, missing-disposition alert, soft approval cards) skip ``call_source = 'ghl'``.
 Attempt caps, the scoreboard, Cora and the replacement rule (src/lending/replacement_eligibility.py) count GHL
 calls like any other.
+
+Callers who are not leads (Q66): the import also lists the GHL conversations whose last message is a call (newer than
+INBOUND_LOOKBACK_HOURS, one search page) and stores those callers' INBOUND calls only, so an outbound call to a
+non-lead is never counted as a follow-up attempt.
 
 A failed lookup for one contact is logged (class only) and the others carry on. Off until
 LENDING_GHL_CALL_IMPORT_ENABLED=true. Cron, every 15 minutes:
@@ -41,6 +48,7 @@ from config.lending_followup import (
     GHL_CALLER_SEAT,
     GHL_CAMPAIGN_TAG,
     IMPORT_CONTACT_LIMIT,
+    INBOUND_LOOKBACK_HOURS,
     IMPORT_RUN_INTERVAL_MINUTES,
     IMPORT_WINDOW_DAYS,
 )
@@ -50,6 +58,9 @@ from src.services.phone_utils import normalize
 logger = logging.getLogger(__name__)
 
 CallReader = Callable[[str], list[dict[str, Any]]]  # ghl_contact_id -> call messages
+CALL_DIRECTIONS = ("outbound", "inbound")
+INBOUND_ONLY = ("inbound",)
+RecentCallers = Callable[[datetime], list[tuple[str, str]]]  # since -> [(ghl_contact_id, phone)]
 
 # One row per GHL contact: a contact can hold both a LendingFlow and a website lead; calls count from the
 # earliest arrival, and the lead's own normalised phone is the one stored on the call.
@@ -74,7 +85,7 @@ _UPSERT = text("""
     INSERT INTO lending.call_dispositions AS d
         (dialer_call_id, call_source, direction, phone, caller_seat, campaign_tag, disposition_raw,
          talk_duration_sec, call_started_at, call_ended_at, raw_event)
-    VALUES (:call_id, :source, 'outbound', :phone, :seat, :tag, :raw_outcome,
+    VALUES (:call_id, :source, :direction, :phone, :seat, :tag, :raw_outcome,
             :talk, :started, :ended, CAST(:raw_event AS jsonb))
     ON CONFLICT (dialer_call_id) DO UPDATE SET
         disposition_raw = CASE WHEN EXCLUDED.disposition_raw = :unknown_outcome THEN d.disposition_raw
@@ -99,21 +110,25 @@ class ImportStats:
     updated: int = 0
     already_recorded: int = 0
     lookup_failures: int = 0
+    other_callers: int = 0  # callers who are not leads (their inbound calls only)
     eligible: int = 0
     offset: int = 0
 
 
-def _call_row(message: Mapping[str, Any], contact_id: str, phone: str, since: datetime) -> Optional[dict[str, Any]]:
-    """The insert parameters for one GHL call message, or None when it is not an outbound attempt to record."""
+def _call_row(message: Mapping[str, Any], contact_id: str, phone: str, since: datetime,
+              directions: tuple[str, ...] = CALL_DIRECTIONS) -> Optional[dict[str, Any]]:
+    """The insert parameters for one GHL call message, or None when it is not an outbound or inbound call to record."""
     message_id = message.get("id")
     started = message_time(message)
-    if not message_id or message.get("direction") != "outbound" or started is None or started < since:
+    direction = message.get("direction")
+    if not message_id or direction not in directions or started is None or started < since:
         return None
     outcome = call_state(message)
     talk = call_duration_seconds(message)
     return {
         "call_id": f"{GHL_CALL_ID_PREFIX}{message_id}"[:100],
         "source": CALL_SOURCE_GHL,
+        "direction": direction,
         "phone": phone,
         "seat": GHL_CALLER_SEAT,
         "tag": GHL_CAMPAIGN_TAG,
@@ -138,43 +153,68 @@ def rotation_offset(eligible: int, limit: int, now: datetime,
     return (run_number % slices) * limit
 
 
+def _store_contact(db, read_calls: CallReader, contact_id: str, phone: str, since: datetime, stats: ImportStats,
+                   directions: tuple[str, ...]) -> None:
+    """Read one contact's GHL calls and store the ones in ``directions`` newer than ``since``, in a savepoint. A
+    failed lookup or insert is logged (class only) and counted; it never stops the other contacts."""
+    try:
+        messages = read_calls(contact_id)
+    except Exception as exc:  # class only: GHL errors can echo request detail
+        stats.lookup_failures += 1
+        logger.warning("[ghl-call-import] contact %s: GHL call lookup failed (%s)", contact_id, type(exc).__name__)
+        return
+    rows = [row for row in (_call_row(m, contact_id, phone, since, directions) for m in messages) if row]
+    if not rows:
+        return
+    try:
+        with db.begin_nested():
+            for row in rows:
+                stored = db.execute(_UPSERT, {**row, "unknown_outcome": UNKNOWN_OUTCOME}).first()
+                if stored is None:
+                    stats.already_recorded += 1
+                elif stored.inserted:
+                    stats.imported += 1
+                else:
+                    stats.updated += 1
+    except Exception as exc:  # class only: SQL errors embed bound parameters
+        logger.error("[ghl-call-import] contact %s: calls not stored (%s)", contact_id, type(exc).__name__)
+
+
 def import_calls(db, read_calls: CallReader, *, now: Optional[datetime] = None,
-                 window_days: int = IMPORT_WINDOW_DAYS, limit: int = IMPORT_CONTACT_LIMIT) -> ImportStats:
-    """Store the outbound GHL calls of this run's slice of the leads in the window (see :func:`rotation_offset`).
-    Each contact runs in its own savepoint, so a failed lookup or insert never loses the calls already stored for
-    other contacts. Does not commit."""
+                 window_days: int = IMPORT_WINDOW_DAYS, limit: int = IMPORT_CONTACT_LIMIT,
+                 recent_callers: Optional[RecentCallers] = None) -> ImportStats:
+    """Store the GHL calls (outbound and inbound) of this run's slice of the leads in the window (see
+    :func:`rotation_offset`). With ``recent_callers``, also store the INBOUND calls of recent callers who are not
+    leads (Q66). Each contact runs in its own savepoint, so a failed lookup or insert never loses the calls already
+    stored for other contacts. Does not commit."""
     now = now or datetime.now(timezone.utc)
     stats = ImportStats()
     window = {"window_start": now - timedelta(days=window_days)}
     stats.eligible = db.execute(_ELIGIBLE_COUNT, window).scalar() or 0
     stats.offset = rotation_offset(stats.eligible, limit, now)
     contacts = db.execute(_CONTACTS, {**window, "limit": limit, "offset": stats.offset}).all()
+    seen = {contact_id for contact_id, _, _ in contacts}
     for contact_id, since, raw_phone in contacts:
         stats.contacts += 1
         phone = normalize(raw_phone) if raw_phone else None
-        if not phone:
-            continue
-        try:
-            messages = read_calls(contact_id)
-        except Exception as exc:  # class only: GHL errors can echo request detail
-            stats.lookup_failures += 1
-            logger.warning("[ghl-call-import] contact %s: GHL call lookup failed (%s)", contact_id, type(exc).__name__)
-            continue
-        rows = [row for row in (_call_row(m, contact_id, phone, since) for m in messages) if row]
-        if not rows:
-            continue
-        try:
-            with db.begin_nested():
-                for row in rows:
-                    stored = db.execute(_UPSERT, {**row, "unknown_outcome": UNKNOWN_OUTCOME}).first()
-                    if stored is None:
-                        stats.already_recorded += 1
-                    elif stored.inserted:
-                        stats.imported += 1
-                    else:
-                        stats.updated += 1
-        except Exception as exc:  # class only: SQL errors embed bound parameters
-            logger.error("[ghl-call-import] contact %s: calls not stored (%s)", contact_id, type(exc).__name__)
+        if phone:
+            _store_contact(db, read_calls, contact_id, phone, since, stats, CALL_DIRECTIONS)
+    if recent_callers is None:
+        return stats
+    since = now - timedelta(hours=INBOUND_LOOKBACK_HOURS)
+    try:
+        callers = recent_callers(since)
+    except Exception as exc:  # class only
+        stats.lookup_failures += 1
+        logger.warning("[ghl-call-import] recent callers lookup failed (%s)", type(exc).__name__)
+        return stats
+    for contact_id, raw_phone in callers:
+        phone = normalize(raw_phone) if raw_phone else None
+        if contact_id in seen or not phone:
+            continue  # a lead is already read in full above
+        seen.add(contact_id)
+        stats.other_callers += 1
+        _store_contact(db, read_calls, contact_id, phone, since, stats, INBOUND_ONLY)
     return stats
 
 
@@ -182,7 +222,7 @@ def main() -> int:
     from config.settings import get_settings
     from src.lending.db import lending_session
     from src.lending.ghl_account import lending_ghl_account
-    from src.lending.ghl_calls import call_messages_reader
+    from src.lending.ghl_calls import call_messages_reader, recent_callers_reader
 
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -194,10 +234,10 @@ def main() -> int:
         logger.error("[ghl-call-import] not run: the Next Deal Lending GHL account is not configured")
         return 1
     with lending_session() as db:
-        stats = import_calls(db, call_messages_reader(account))
-    logger.info("[ghl-call-import] eligible=%d offset=%d contacts=%d imported=%d updated=%d already_recorded=%d "
-                "lookup_failures=%d", stats.eligible, stats.offset, stats.contacts, stats.imported, stats.updated,
-                stats.already_recorded, stats.lookup_failures)
+        stats = import_calls(db, call_messages_reader(account), recent_callers=recent_callers_reader(account))
+    logger.info("[ghl-call-import] eligible=%d offset=%d contacts=%d other_callers=%d imported=%d updated=%d "
+                "already_recorded=%d lookup_failures=%d", stats.eligible, stats.offset, stats.contacts,
+                stats.other_callers, stats.imported, stats.updated, stats.already_recorded, stats.lookup_failures)
     return 0
 
 

@@ -61,3 +61,15 @@ def test_wrong_or_missing_secret_is_rejected(client, lending_db):
 def test_missing_stage_or_opportunity_is_422(client):
     assert client.post("/webhooks/lending/ghl-stage", headers=HEADERS, json={"opportunity_id": "x"}).status_code == 422
     assert client.post("/webhooks/lending/ghl-stage", headers=HEADERS, json={"stage_name": "Held"}).status_code == 422
+
+
+@pytest.mark.parametrize("body", [
+    {"opportunity_id": "opp-9", "stage_name": "null"},
+    {"opportunity_id": "opp-9", "stage_name": " None "},
+    {"opportunity_id": "undefined", "stage_name": "Funded"},
+    {"customData": {"opportunity_id": "opp-9", "stage_name": "null"}},
+])
+def test_a_merge_field_that_did_not_resolve_is_refused_not_saved(client, lending_db, body):
+    r = client.post("/webhooks/lending/ghl-stage", headers=HEADERS, json=body)
+    assert r.status_code == 422 and "did not resolve" in r.json()["detail"]
+    assert _rows(lending_db) == []

@@ -24,6 +24,11 @@ IMPORT_WINDOW_DAYS = 16
 IMPORT_CONTACT_LIMIT = 200
 # The cron interval of src.lending.ghl_call_import; it numbers the runs that pick the slice.
 IMPORT_RUN_INTERVAL_MINUTES = 15
+# Callers who are not leads (Q66): the import also reads the GHL conversations whose last message is a call and
+# stores their INBOUND calls only (never outbound ones: those are not follow-up attempts). Newest first, one
+# search page of at most RECENT_CALLERS_LIMIT conversations per run, looking back INBOUND_LOOKBACK_HOURS.
+INBOUND_LOOKBACK_HOURS = 48
+RECENT_CALLERS_LIMIT = 100
 
 # Runbook § 4.1: "leads with 5+ attempts over 5+ days are eligible for replacement credit".
 REPLACEMENT_MIN_ATTEMPTS = 5

@@ -61,14 +61,14 @@ _NEW_LENDINGFLOW_LEADS = text("""
     SELECT l.id, l.first_name, l.loan_type, l.loan_amount_range, l.property_city, e.routing_tag,
            coalesce(e.closer_priority, false) AS closer_priority, count(*) OVER () AS total
       FROM lending.lendingflow_leads l LEFT JOIN lending.lendingflow_enrichment e ON e.lead_id = l.id
-     WHERE l.received_at >= :since AND NOT l.suppressed
+     WHERE l.received_at >= :since AND NOT l.suppressed AND NOT l.is_test
      ORDER BY coalesce(e.closer_priority, false) DESC, coalesce(e.routing_tag = 'FULL_MACHINE', false) DESC,
               l.received_at DESC
      LIMIT :limit
 """)
 _WEB_LEADS = text("""
     SELECT count(*) AS total, count(*) FILTER (WHERE ghl_status IN ('pending', 'failed')) AS not_in_ghl
-      FROM lending.web_leads WHERE received_at >= :since
+      FROM lending.web_leads WHERE received_at >= :since AND NOT is_test
 """)
 _TODAYS_CALLS = text("""
     SELECT booking_ref, max(first_name) AS first_name, max(booked_by) AS booked_by,

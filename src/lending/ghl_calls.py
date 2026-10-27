@@ -16,6 +16,7 @@ from datetime import datetime
 from typing import Any, Callable, Mapping, Optional
 
 from config.lending_alarms import GHL_TIMEOUT_SECONDS
+from config.lending_followup import RECENT_CALLERS_LIMIT
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,39 @@ def call_duration_seconds(message: Mapping[str, Any]) -> Optional[int]:
     except (TypeError, ValueError):
         return None
     return seconds if seconds >= 0 else None
+
+
+def recent_callers_reader(account, *, http: Optional[Callable[..., Any]] = None,
+                          limit: int = RECENT_CALLERS_LIMIT) -> Callable[[datetime], list[tuple[str, str]]]:
+    """``read(since)`` returns ``(ghl_contact_id, phone)`` for the conversations whose last message is a call that
+    is newer than ``since``, newest first, one page of at most ``limit``. This is how callers who are not leads (so
+    have no lead row to look them up by) are found. Checked live on 2026-10-26: the search takes
+    ``lastMessageType=TYPE_CALL`` with ``sort=desc&sortBy=last_message_date`` and returns each conversation's
+    ``contactId``, ``phone``, ``lastMessageDate`` (epoch ms), ``lastMessageDirection`` and ``lastCallStatus``.
+    Raises on an HTTP error; the caller decides whether that is fatal."""
+    from src.lending.ghl_account import ghl_headers
+    from src.services.ghl_webhook import _GHL_BASE
+    from src.utils.http_helpers import requests_get_with_retry
+
+    get = http or (lambda url, **kw: requests_get_with_retry(url, max_retries=1, retry_delay=1,
+                                                             timeout=GHL_TIMEOUT_SECONDS, **kw))
+    headers = ghl_headers(account.api_key, GHL_CONVERSATIONS_VERSION)
+
+    def read(since: datetime) -> list[tuple[str, str]]:
+        found = get(f"{_GHL_BASE}/conversations/search", headers=headers,
+                    params={"locationId": account.location_id, "lastMessageType": "TYPE_CALL", "sort": "desc",
+                            "sortBy": "last_message_date", "limit": limit})
+        found.raise_for_status()
+        since_ms = since.timestamp() * 1000
+        callers: list[tuple[str, str]] = []
+        for conversation in (found.json() or {}).get("conversations") or []:
+            contact_id, phone = conversation.get("contactId"), conversation.get("phone")
+            last = conversation.get("lastMessageDate")
+            if contact_id and phone and isinstance(last, (int, float)) and last >= since_ms:
+                callers.append((contact_id, phone))
+        return callers
+
+    return read
 
 
 def call_messages_reader(account, *, http: Optional[Callable[..., Any]] = None
