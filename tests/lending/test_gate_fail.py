@@ -19,7 +19,7 @@ PHONE = "+18135550147"
 SLOT = datetime(2099, 10, 7, 14, 0, tzinfo=timezone.utc)
 BOOKED = datetime(2099, 10, 1, 15, 0, tzinfo=timezone.utc)      # 11:00 ET, window open
 NUMBER = "+18135550100"
-WORDING = ("Hi Marcus, this is Josh Kantor, Loan Officer. We're not able to hold the call we mentioned. "
+WORDING = ("Hi Marcus, this is Next Deal Lending. We're not able to hold the call we mentioned. "
            "Thanks for your interest, and we'll be in touch if anything changes.")
 
 
@@ -61,7 +61,7 @@ def test_the_wording_is_the_approved_text_with_no_stop_language_or_address():
     sms = render_text("gate_fail", first_name="Marcus", slot_start_utc=SLOT, property_address="412 Oak Ave, Tampa")
     assert sms == WORDING and "STOP" not in sms and "Oak" not in sms
     subject, body = render_email("gate_fail", first_name="Marcus", slot_start_utc=SLOT)
-    assert subject == "Your call with Josh Kantor" and "not able to hold the call we mentioned" in body
+    assert subject == "Your call with Next Deal Lending" and "not able to hold the call we mentioned" in body
 
 
 def test_a_failed_check_cancels_the_reminders_and_queues_one_message(db):
@@ -69,7 +69,7 @@ def test_a_failed_check_cancels_the_reminders_and_queues_one_message(db):
     mark_confirmation_sent(db)
     assert handle_booking_gate_failed(db, "r1", now=BOOKED) == "queued"
     assert statuses(db) == {"confirmation": "sent", "night_before": "cancelled", "ninety_min": "cancelled",
-                            "gate_fail": "pending"}
+                            "ten_min": "cancelled", "gate_fail": "pending"}
     assert db.execute(text("SELECT cancelled_at IS NOT NULL FROM lending.confirmation_tasks")).scalar() is True
 
 
@@ -84,7 +84,8 @@ def test_an_unknown_booking_and_a_caller_booked_call_send_nothing(db):
     assert handle_booking_gate_failed(db, "nope", now=BOOKED) == "unknown_booking"
     book(db, ref="r2", booked_by="dana@heu.ai")
     assert handle_booking_gate_failed(db, "r2", now=BOOKED) == "not_ai_booked"
-    assert statuses(db, "r2") == {"confirmation": "pending", "night_before": "pending", "ninety_min": "pending"}
+    assert statuses(db, "r2") == {"confirmation": "pending", "night_before": "pending", "ninety_min": "pending",
+                                "ten_min": "pending"}
 
 
 def test_a_consented_contact_is_texted_the_approved_wording(db):

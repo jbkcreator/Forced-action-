@@ -200,12 +200,12 @@ def test_record_style_upsert_still_works_for_the_rules_code():
     assert BatchDialerAdapter(http=http, endpoints=ENDPOINTS).upsert_contact({"phone": PHONE}) == "42"
 
 
-def test_pool_campaign_tags_name_the_four_ranked_queues_plus_nurture():
+def test_pool_campaign_tags_name_the_ranked_queues_plus_nurture():
     from config import lending_queues as q
     from config.lending_dialer import POOL_CAMPAIGN_TAGS
     assert POOL_CAMPAIGN_TAGS == {q.VERIFIED_MATURITY: "Verified maturity",
                                   q.TRANSACTION_READY: "Transaction ready", q.BUILDERS: "Builders",
-                                  q.PARTNERS: "Partners", q.NURTURE: "Nurture"}
+                                  q.PARTNERS: "Partners", q.WHOLESALERS: "Wholesalers", q.NURTURE: "Nurture"}
 
 
 # ── HTTP transport ──

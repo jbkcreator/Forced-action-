@@ -44,9 +44,16 @@ def create_web_lead(
     property_city: Optional[str] = Form(default=None),
     deal_type: Optional[str] = Form(default=None),
     completed_projects_3y: Optional[str] = Form(default=None),
-    sms_consent: Optional[str] = Form(default=None),
-    deal_drop_optin: Optional[str] = Form(default=None),
+    loan_amount: Optional[str] = Form(default=None),
+    property_address: Optional[str] = Form(default=None),
+    property_state: Optional[str] = Form(default=None),
+    credit_band: Optional[str] = Form(default=None),
+    occupancy: Optional[str] = Form(default=None),
+    sms_consent: Optional[str] = Form(default=None),  # box 1: text messages only
+    call_consent: Optional[str] = Form(default=None),  # box 2: calls only
+    deal_drop_optin: Optional[str] = Form(default=None),  # box 3: the weekly Deal Drop by email
     consent_text: Optional[str] = Form(default=None),
+    call_consent_text: Optional[str] = Form(default=None),
     page_url: Optional[str] = Form(default=None),
     company_website: Optional[str] = Form(default=None),  # honeypot: hidden on the page, bots fill it
     db: Session = Depends(get_db),
@@ -60,8 +67,10 @@ def create_web_lead(
             {
                 "name": name, "phone": phone, "email": email, "property_city": property_city,
                 "deal_type": deal_type, "completed_projects_3y": completed_projects_3y,
-                "sms_consent": sms_consent, "deal_drop_optin": deal_drop_optin,
-                "consent_text": consent_text, "page_url": page_url,
+                "loan_amount": loan_amount, "property_address": property_address,
+                "property_state": property_state, "credit_band": credit_band, "occupancy": occupancy,
+                "sms_consent": sms_consent, "call_consent": call_consent, "deal_drop_optin": deal_drop_optin,
+                "consent_text": consent_text, "call_consent_text": call_consent_text, "page_url": page_url,
             },
             ip_address=client_ip(request),
             user_agent=request.headers.get("user-agent"),

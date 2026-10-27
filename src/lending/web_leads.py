@@ -2,7 +2,9 @@
 
 Order matters: the row (with its consent evidence) is committed before GHL is called, so a GHL
 outage never loses a lead. Delivery is one idempotent function used by both the request's
-background task and the retry sweep. Nothing here sends anything to the visitor.
+background task and the retry sweep. Nothing here sends anything to the visitor. A lead whose
+contact already had a GHL card is posted once to the ops channel (Chunk 1 Addendum 1.2.2). An owner-occupied
+property (1.1.2: business-purpose loans only) is saved as ``excluded`` and never delivered.
 """
 from __future__ import annotations
 
@@ -19,10 +21,17 @@ from config.lending_web import (
     FIELD_MAX_LENGTHS,
     GHL_GIVE_UP_AFTER_HOURS,
     GHL_RETRY_BACKOFF_MINUTES,
+    CALL_CONSENT_TEXT,
+    MAX_LOAN_AMOUNT,
     SMS_CONSENT_TEXT,
     SWEEP_BATCH_SIZE,
 )
+from config.lending_occupancy import OWNER_OCCUPIED, UNKNOWN, occupancy_from_answer
+from config.settings import get_settings
 from src.lending.consent import record_consent
+from src.lending.cora_inbox import add_to_inbox_in_own_session, slack_safe
+from src.lending.lead_arrival_alert import ghl_contact_url
+from src.lending.ops_alerts import post_ops_alert
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
@@ -30,6 +39,9 @@ logger = logging.getLogger(__name__)
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _YES = {"yes", "true", "on", "1"}
+# "$250,000", "250000", "250k", "$1.5M": whole dollars, with an optional k or m suffix.
+_LOAN_AMOUNT = re.compile(r"^\$?\s*(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?\s*([km])?$", re.IGNORECASE)
+_AMOUNT_MULTIPLIER = {"k": 1_000, "m": 1_000_000}
 
 
 class InvalidWebLead(ValueError):
@@ -44,12 +56,19 @@ class WebLeadInput:
     property_city: Optional[str]
     deal_type: Optional[str]
     completed_projects_3y: Optional[str]
-    sms_consent: bool
-    deal_drop_optin: bool
-    consent_text: Optional[str]
+    loan_amount: Optional[int]  # whole dollars
+    property_address: Optional[str]
+    property_state: Optional[str]
+    credit_band: Optional[str]
+    sms_consent: bool  # box 1: text messages only
+    call_consent: bool  # box 2: calls only
+    deal_drop_optin: bool  # box 3: the weekly Deal Drop by email
+    consent_text: Optional[str]  # the text box's label
+    call_consent_text: Optional[str]
     page_url: Optional[str]
     ip_address: Optional[str]
     user_agent: Optional[str]
+    occupancy: str = UNKNOWN  # 1.1.2: config.lending_occupancy
 
 
 @dataclass(frozen=True)
@@ -57,6 +76,8 @@ class PushResult:
     contact_id: str
     pipeline_card: bool  # False when no new-lead stage is configured: contact only
     intro_ready_tagged: bool = False  # T-09: the push added the tag that starts the GHL intro-SMS workflow
+    returning: bool = False  # 1.2.2: the contact already had a Booked Calls card
+    moved_to_new_lead: bool = False  # 1.2.2: that card was closed and is now back in the new-lead stage
 
 
 class LeadSink(Protocol):
@@ -87,6 +108,30 @@ def _ticked(value: Optional[str]) -> bool:
     return str(value or "").strip().lower() in _YES
 
 
+def _loan_amount(value: Optional[str]) -> Optional[int]:
+    """Whole dollars from what the visitor typed. Blank is no answer; text that is not an amount, zero or an
+    absurd figure is a typo the visitor can fix, so it is refused rather than stored as nothing."""
+    cleaned = _clean(value, "loan_amount")
+    if not cleaned:
+        return None
+    match = _LOAN_AMOUNT.match(cleaned)
+    amount = 0
+    if match:
+        digits, fraction, suffix = match.groups()
+        amount = int(float(digits.replace(",", "") + (fraction or "")) * _AMOUNT_MULTIPLIER.get((suffix or "").lower(), 1))
+    if not 0 < amount <= MAX_LOAN_AMOUNT:
+        raise InvalidWebLead("Please check the loan amount.")
+    return amount
+
+
+def _state(value: Optional[str]) -> Optional[str]:
+    """The USPS code when the visitor typed or picked a recognisable state, else what they sent."""
+    from src.lending.lendingflow import state_code  # lendingflow imports this module: import at call time
+
+    cleaned = _clean(value, "property_state")
+    return (state_code(cleaned) or cleaned) if cleaned else None
+
+
 def build_input(form: Mapping[str, Optional[str]], *, ip_address: Optional[str], user_agent: Optional[str]) -> WebLeadInput:
     name = _clean(form.get("name"), "name")
     if not name:
@@ -99,6 +144,9 @@ def build_input(form: Mapping[str, Optional[str]], *, ip_address: Optional[str],
         email = email.lower()
         if not _EMAIL.match(email):
             raise InvalidWebLead("Please check your email address.")
+    deal_drop_optin = _ticked(form.get("deal_drop_optin"))
+    if deal_drop_optin and not email:
+        raise InvalidWebLead("Please add your email address to get the weekly Deal Drop.")
     return WebLeadInput(
         name=name,
         phone=phone,
@@ -106,12 +154,19 @@ def build_input(form: Mapping[str, Optional[str]], *, ip_address: Optional[str],
         property_city=_clean(form.get("property_city"), "property_city"),
         deal_type=_clean(form.get("deal_type"), "deal_type"),
         completed_projects_3y=_clean(form.get("completed_projects_3y"), "completed_projects_3y"),
+        loan_amount=_loan_amount(form.get("loan_amount")),
+        property_address=_clean(form.get("property_address"), "property_address"),
+        property_state=_state(form.get("property_state")),
+        credit_band=_clean(form.get("credit_band"), "credit_band"),
         sms_consent=_ticked(form.get("sms_consent")),
-        deal_drop_optin=_ticked(form.get("deal_drop_optin")),
+        call_consent=_ticked(form.get("call_consent")),
+        deal_drop_optin=deal_drop_optin,
         consent_text=_clean(form.get("consent_text"), "consent_text"),
+        call_consent_text=_clean(form.get("call_consent_text"), "call_consent_text"),
         page_url=_clean(form.get("page_url"), "page_url"),
         ip_address=(str(ip_address).strip()[:45] or None) if ip_address else None,
         user_agent=_clean(user_agent, "user_agent"),
+        occupancy=occupancy_from_answer(form.get("occupancy")),
     )
 
 
@@ -132,9 +187,10 @@ def _suppression_reason(db, phone: str, email: Optional[str]) -> Optional[str]:
 
 def _recent_duplicate(db, data: WebLeadInput) -> Optional[int]:
     return db.execute(
-        text("SELECT id FROM lending.web_leads WHERE phone = :p AND sms_consent = :c AND deal_drop_optin = :d "
-             "AND received_at > now() - make_interval(mins => :m) ORDER BY id DESC LIMIT 1"),
-        {"p": data.phone, "c": data.sms_consent, "d": data.deal_drop_optin, "m": DEDUP_WINDOW_MINUTES},
+        text("SELECT id FROM lending.web_leads WHERE phone = :p AND sms_consent = :c AND call_consent = :k "
+             "AND deal_drop_optin = :d AND received_at > now() - make_interval(mins => :m) ORDER BY id DESC LIMIT 1"),
+        {"p": data.phone, "c": data.sms_consent, "k": data.call_consent, "d": data.deal_drop_optin,
+         "m": DEDUP_WINDOW_MINUTES},
     ).scalar()
 
 
@@ -151,31 +207,43 @@ def save_web_lead(db, data: WebLeadInput) -> tuple[int, bool]:
     suppressed = reason is not None
     lead_id = db.execute(
         text("INSERT INTO lending.web_leads (name, phone, email, property_city, deal_type, completed_projects_3y, "
-             "sms_consent, deal_drop_optin, consent_text, consent_text_matches, page_url, ip_address, user_agent, "
-             "suppressed, suppression_reason) "
-             "VALUES (:name, :phone, :email, :city, :deal, :projects, :sms, :drop, :ctext, :cmatch, :url, :ip, :ua, :sup, :reason) "
+             "loan_amount, property_address, property_state, credit_band, "
+             "sms_consent, call_consent, deal_drop_optin, consent_text, consent_text_matches, "
+             "call_consent_text, call_consent_text_matches, page_url, ip_address, user_agent, "
+             "suppressed, suppression_reason, occupancy, ghl_status) "
+             "VALUES (:name, :phone, :email, :city, :deal, :projects, :amount, :address, :state, :band, "
+             ":sms, :call, :drop, :ctext, :cmatch, :ktext, :kmatch, :url, :ip, :ua, :sup, :reason, :occupancy, "
+             ":ghl_status) "
              "RETURNING id"),
         {
             "name": data.name, "phone": data.phone, "email": data.email, "city": data.property_city,
             "deal": data.deal_type, "projects": data.completed_projects_3y,
-            "sms": data.sms_consent, "drop": data.deal_drop_optin, "ctext": data.consent_text,
+            "amount": data.loan_amount, "address": data.property_address, "state": data.property_state,
+            "band": data.credit_band,
+            "sms": data.sms_consent, "call": data.call_consent, "drop": data.deal_drop_optin,
+            "ctext": data.consent_text,
             "cmatch": None if data.consent_text is None else data.consent_text == SMS_CONSENT_TEXT,
+            "ktext": data.call_consent_text,
+            "kmatch": None if data.call_consent_text is None else data.call_consent_text == CALL_CONSENT_TEXT,
             "url": data.page_url, "ip": data.ip_address, "ua": data.user_agent, "sup": suppressed,
-            "reason": reason,
+            "reason": reason, "occupancy": data.occupancy,
+            "ghl_status": "excluded" if data.occupancy == OWNER_OCCUPIED else "pending",
         },
     ).scalar_one()
     if data.sms_consent and not suppressed:
         record_consent(db, data.phone, "web_form")
-    logger.info("[lending-web] lead saved id=%s sms_consent=%s deal_drop=%s suppressed=%s",
-                lead_id, data.sms_consent, data.deal_drop_optin, suppressed)
+    logger.info("[lending-web] lead saved id=%s sms_consent=%s call_consent=%s deal_drop=%s suppressed=%s occupancy=%s",
+                lead_id, data.sms_consent, data.call_consent, data.deal_drop_optin, suppressed, data.occupancy)
     return int(lead_id), True
 
 
 def will_be_contacted(db, lead_id: int) -> bool:
-    """True when the visitor ticked the call/text box and the number is not suppressed, i.e. the team
-    may follow up. The form page shows its "we will call you back" line only for this case."""
+    """True when the visitor ticked the text box or the call box and the number is not suppressed, i.e. the
+    team may follow up by that channel. The form page shows its "we will call you back" line only for this case."""
     return bool(db.execute(
-        text("SELECT sms_consent AND NOT suppressed FROM lending.web_leads WHERE id = :id"), {"id": lead_id},
+        text("SELECT (sms_consent OR call_consent) AND NOT suppressed AND ghl_status <> 'excluded' "
+             "FROM lending.web_leads WHERE id = :id"),
+        {"id": lead_id},
     ).scalar())
 
 
@@ -183,26 +251,56 @@ def merge_into_existing(db, lead_id: int, data: WebLeadInput) -> bool:
     """A repeat submission inside the dedup window fills in details the stored lead lacks (an email
     added on the second try) and never overwrites one it has. Returns True when something was
     added; the lead is then queued for delivery again so GoHighLevel gets the new detail. Consent
-    values are never touched: they stay exactly what the first submission recorded."""
+    values are never touched: they stay exactly what the first submission recorded. The occupancy answer is applied
+    first and on its own, so it takes effect whether or not details were added in the same submission, and the
+    details update (which re-queues a delivered lead) cannot hide it or exclude a lead already in GoHighLevel."""
+    released = _merge_occupancy(db, lead_id, data.occupancy)
     changed = db.execute(
         text("UPDATE lending.web_leads SET "
              "email = COALESCE(email, CAST(:email AS text)), "
              "property_city = COALESCE(property_city, CAST(:city AS text)), "
              "deal_type = COALESCE(deal_type, CAST(:deal AS text)), "
              "completed_projects_3y = COALESCE(completed_projects_3y, CAST(:projects AS text)), "
-             "ghl_status = 'pending', ghl_attempts = 0, ghl_last_error = NULL "
+             "loan_amount = COALESCE(loan_amount, CAST(:amount AS bigint)), "
+             "property_address = COALESCE(property_address, CAST(:address AS text)), "
+             "property_state = COALESCE(property_state, CAST(:state AS text)), "
+             "credit_band = COALESCE(credit_band, CAST(:band AS text)), "
+             "ghl_status = CASE WHEN ghl_status = 'excluded' THEN 'excluded' ELSE 'pending' END, "
+             "ghl_attempts = 0, ghl_last_error = NULL "
              "WHERE id = :id AND ("
              "(email IS NULL AND CAST(:email AS text) IS NOT NULL) OR "
              "(property_city IS NULL AND CAST(:city AS text) IS NOT NULL) OR "
              "(deal_type IS NULL AND CAST(:deal AS text) IS NOT NULL) OR "
-             "(completed_projects_3y IS NULL AND CAST(:projects AS text) IS NOT NULL)) "
+             "(completed_projects_3y IS NULL AND CAST(:projects AS text) IS NOT NULL) OR "
+             "(loan_amount IS NULL AND CAST(:amount AS bigint) IS NOT NULL) OR "
+             "(property_address IS NULL AND CAST(:address AS text) IS NOT NULL) OR "
+             "(property_state IS NULL AND CAST(:state AS text) IS NOT NULL) OR "
+             "(credit_band IS NULL AND CAST(:band AS text) IS NOT NULL)) "
              "RETURNING id"),
         {"id": lead_id, "email": data.email, "city": data.property_city,
-         "deal": data.deal_type, "projects": data.completed_projects_3y},
+         "deal": data.deal_type, "projects": data.completed_projects_3y, "amount": data.loan_amount,
+         "address": data.property_address, "state": data.property_state, "band": data.credit_band},
     ).first()
     if changed is not None:
         logger.info("[lending-web] repeat submission added details to lead id=%s", lead_id)
-    return changed is not None
+    return changed is not None or released
+
+
+def _merge_occupancy(db, lead_id: int, occupancy: str) -> bool:
+    """The latest answer wins (1.1.2): "yes" excludes a lead not yet in GHL, "no" releases an excluded one. An
+    unread answer changes nothing. Returns True when the lead was released, so it is delivered."""
+    if occupancy == UNKNOWN:
+        return False
+    row = db.execute(
+        text("UPDATE lending.web_leads SET occupancy = :occ, ghl_status = CASE "
+             "WHEN :occ = :owner AND ghl_status IN ('pending', 'failed') THEN 'excluded' "
+             "WHEN :occ <> :owner AND ghl_status = 'excluded' THEN 'pending' ELSE ghl_status END "
+             "WHERE id = :id AND occupancy IS DISTINCT FROM :occ RETURNING ghl_status"),
+        {"occ": occupancy, "owner": OWNER_OCCUPIED, "id": lead_id},
+    ).first()
+    if row is not None:
+        logger.info("[lending-web] repeat submission changed occupancy of lead id=%s to %s", lead_id, occupancy)
+    return row is not None and row.ghl_status == "pending"
 
 
 def _backoff_minutes_sql() -> str:
@@ -214,7 +312,8 @@ def _backoff_minutes_sql() -> str:
 
 
 _DELIVERABLE = (
-    "SELECT id, name, phone, email, property_city, deal_type, completed_projects_3y, sms_consent, "
+    "SELECT id, name, phone, email, property_city, deal_type, completed_projects_3y, loan_amount, "
+    "property_address, property_state, credit_band, sms_consent, call_consent, "
     "deal_drop_optin, suppressed, received_at, ghl_attempts FROM lending.web_leads "
     "WHERE ghl_status IN ('pending', 'failed') AND received_at > :oldest {extra} "
     "ORDER BY received_at LIMIT :limit FOR UPDATE SKIP LOCKED"
@@ -260,8 +359,44 @@ def _deliver_one(db, sink: LeadSink, lead: dict[str, Any], now: datetime) -> int
              "ghl_last_attempt_at = :now, ghl_synced_at = :now, ghl_last_error = NULL WHERE id = :id"),
         {"s": "synced" if result.pipeline_card else "contact_only", "c": result.contact_id, "now": now, "id": lead["id"]},
     )
-    logger.info("[lending-web] lead delivered id=%s pipeline_card=%s", lead["id"], result.pipeline_card)
+    logger.info("[lending-web] lead delivered id=%s pipeline_card=%s returning=%s",
+                lead["id"], result.pipeline_card, result.returning)
+    if result.returning:
+        _alert_returning(db, lead, result, now)
     return 1
+
+
+def returning_alert_text(name: str, lead_id: int, moved: bool, contact_url: Optional[str]) -> str:
+    """First name and last initial only: the full name stays in GHL. The name is visitor-typed, so it is escaped:
+    Slack would otherwise act on <!channel> or <url|label> inside it."""
+    first, _, last = name.strip().partition(" ")
+    shown = slack_safe(f"{first} {last.strip()[0]}." if last.strip() else first)
+    outcome = "Moved to New Lead" if moved else "Left in its current stage"
+    return (f":recycle: Returning Borrower Resubmitted Form: {shown} - {outcome}. Lead `{lead_id}`."
+            + (f" <{contact_url}|Open in GHL>" if contact_url else ""))
+
+
+def _alert_returning(db, lead: Mapping[str, Any], result: PushResult, now: datetime) -> None:
+    """Once per lead: a re-delivery of the same row (details merged in) is not a new submission. The row is locked
+    by delivery (FOR UPDATE), so posting before stamping cannot double-post. A post Slack refuses is queued in
+    Cora's inbox for the ops channel instead of being lost ("duplicates beat silence")."""
+    already = db.execute(
+        text("SELECT returning_alerted_at IS NOT NULL FROM lending.web_leads WHERE id = :id"), {"id": lead["id"]},
+    ).scalar()
+    if already:
+        return
+    settings = get_settings()
+    url = ghl_contact_url(settings.lending_ghl_app_url, settings.lending_ghl_location_id, result.contact_id)
+    if not post_ops_alert(returning_alert_text(str(lead["name"]), int(lead["id"]), result.moved_to_new_lead, url)):
+        logger.warning("[lending-web] returning-contact alert not posted lead=%s: queued in Cora's inbox", lead["id"])
+        add_to_inbox_in_own_session(
+            event_type="web_lead_returning_alert_failed", dedup_key=str(lead["id"]), target_channel="ops",
+            summary="Returning web borrower resubmitted the form: the ops alert did not post",
+            payload={"lead_id": str(lead["id"]), "ghl_contact_id": result.contact_id,
+                     "moved_to_new_lead": result.moved_to_new_lead},
+        )
+    db.execute(text("UPDATE lending.web_leads SET returning_alerted_at = :now WHERE id = :id"),
+               {"now": now, "id": lead["id"]})
 
 
 def _record_failure(db, lead: dict[str, Any], reason: str, now: datetime, *, config_error: bool = False) -> None:

@@ -1,9 +1,10 @@
-"""T-10: alarm Josh when a LendingFlow lead has not been reached by phone 2 and 5 minutes after it arrived.
+"""T-10: alarm Josh when a LendingFlow or website lead has not been reached by phone 2 and 5 minutes after it arrived.
 
     python -m src.lending.uncalled_alarm_worker            # loop
     python -m src.lending.uncalled_alarm_worker --once     # one cycle and exit
 
-Each cycle copies every new, non-suppressed row of T-11's ``lending.lendingflow_leads`` into
+Each cycle copies every new, non-suppressed row of T-11's ``lending.lendingflow_leads`` and of
+``lending.web_leads`` (the nextdeallending.com form, client Q53) into
 ``lending.uncalled_alarms`` (the stopwatch starts at the lead's ``received_at``; no age limit), then decides the
 due ones. Outbound calls to the lead's phone since arrival are classified from BatchDialer CDRs
 (``lending.call_dispositions``) and the lead's GHL call messages: connected -> closed, nothing sent; attempted ->
@@ -68,13 +69,32 @@ _PICKUP = text("""
 """)
 
 
+_PICKUP_WEB = text("""
+    INSERT INTO lending.uncalled_alarms (web_lead_id, lead_uuid, phone, arrived_at)
+    SELECT w.id, 'web-' || w.id, w.phone, w.received_at FROM lending.web_leads w
+     WHERE NOT w.suppressed
+       AND NOT EXISTS (SELECT 1 FROM lending.uncalled_alarms a WHERE a.web_lead_id = w.id)
+    ON CONFLICT (web_lead_id) DO NOTHING
+""")
+
+# Lead facts for the message and the GHL call lookup, from whichever source the alarm was copied from.
+_LEAD_FIELDS = """
+           COALESCE(l.first_name, NULLIF(split_part(btrim(w.name), ' ', 1), '')) AS first_name,
+           COALESCE(l.property_state, w.property_state) AS property_state,
+           COALESCE(l.ghl_contact_id, w.ghl_contact_id) AS ghl_contact_id,
+           (a.web_lead_id IS NOT NULL) AS from_web"""
+_LEAD_JOINS = """
+      LEFT JOIN lending.lendingflow_leads l ON l.id = a.lendingflow_lead_id
+      LEFT JOIN lending.web_leads w ON w.id = a.web_lead_id"""
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
 def pick_up_new_leads(db) -> int:
-    """Start a stopwatch for every non-suppressed LendingFlow lead not yet watched (no age limit)."""
-    count = db.execute(_PICKUP).rowcount
+    """Start a stopwatch for every non-suppressed LendingFlow or website lead not yet watched (no age limit)."""
+    count = db.execute(_PICKUP).rowcount + db.execute(_PICKUP_WEB).rowcount
     db.commit()
     return count
 
@@ -140,10 +160,9 @@ _KIND_COLUMN = {"sms_120": "alarm_120_kind", "sms_300": "alarm_300_kind", "slack
 SENT, RETRY, SENDING, UNKNOWN, FAILED = "sent", "retry", "sending", "send_unknown", "failed"
 SUPERSEDED, NOT_CONFIGURED = "superseded", "not_configured"
 
-_DUE = text("""
-    SELECT a.id, a.lead_uuid, a.phone, a.arrived_at, a.fired_120_at, l.first_name, l.property_state, l.ghl_contact_id
-      FROM lending.uncalled_alarms a
-      LEFT JOIN lending.lendingflow_leads l ON l.id = a.lendingflow_lead_id
+_DUE = text(f"""
+    SELECT a.id, a.lead_uuid, a.phone, a.arrived_at, a.fired_120_at,{_LEAD_FIELDS}
+      FROM lending.uncalled_alarms a{_LEAD_JOINS}
      WHERE a.resolved_at IS NULL AND a.fired_300_at IS NULL AND a.arrived_at <= :first_due
        AND (a.fired_120_at IS NULL OR a.arrived_at <= :escalation_due)
      ORDER BY a.arrived_at LIMIT :limit
@@ -170,13 +189,11 @@ _CLAIM_ESCALATION = text("""
      WHERE id = :id AND fired_300_at IS NULL AND resolved_at IS NULL RETURNING id
 """)
 
-_RETRY_DUE = text("""
+_RETRY_DUE = text(f"""
     SELECT a.id, a.lead_uuid, a.phone, a.arrived_at, a.fired_120_at, a.fired_300_at, a.alarm_120_kind, a.alarm_300_kind,
            a.sms_120_status, a.sms_300_status, a.slack_300_status,
-           a.sms_120_attempts, a.sms_300_attempts, a.slack_300_attempts,
-           l.first_name, l.property_state, l.ghl_contact_id
-      FROM lending.uncalled_alarms a
-      LEFT JOIN lending.lendingflow_leads l ON l.id = a.lendingflow_lead_id
+           a.sms_120_attempts, a.sms_300_attempts, a.slack_300_attempts,{_LEAD_FIELDS}
+      FROM lending.uncalled_alarms a{_LEAD_JOINS}
      WHERE a.retry_at <= :now AND 'retry' IN (a.sms_120_status, a.sms_300_status, a.slack_300_status)
      ORDER BY a.retry_at LIMIT :limit
 """)
@@ -221,6 +238,7 @@ def _lead_label(row: Mapping[str, Any]) -> str:
 
 def _fields(row: Mapping[str, Any], now: datetime) -> dict[str, Any]:
     return {"lead": _lead_label(row), "ref": str(row["lead_uuid"])[:8],
+            "source": "website" if row["from_web"] else "LendingFlow",
             "minutes": int((now - row["arrived_at"]).total_seconds() // 60),
             "state": f" ({row['property_state']})" if row["property_state"] else ""}
 
@@ -296,7 +314,7 @@ def _queue_for_cora(db, row: Mapping[str, Any], kind: str, now: datetime, *, sla
     fields = _fields(row, now)
     add_to_inbox_safely(
         db, event_type="lead_uncalled", dedup_key=str(row["id"]), target_channel="ops", channel_posted=slack_sent,
-        summary=f"LendingFlow lead {fields['ref']}{fields['state']} still {kind.replace('_', ' ')} after "
+        summary=f"{fields['source']} lead {fields['ref']}{fields['state']} still {kind.replace('_', ' ')} after "
                 f"{fields['minutes']} min",
         payload={"kind": kind, "lead_ref": fields["ref"], "first_name": row["first_name"],
                  "property_state": row["property_state"], "minutes_since_arrival": fields["minutes"],

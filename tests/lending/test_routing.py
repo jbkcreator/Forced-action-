@@ -467,6 +467,19 @@ def test_no_signed_lenders_holds_with_no_match(rdb):
     assert fr["hold_reason"] == "no_match"
 
 
+def test_a_state_no_signed_lender_takes_is_held_out_of_footprint(rdb):
+    """Chunk 1 Addendum 1.1.2: an out-of-state file is accepted and held for broker placement, never rejected."""
+    lender = _add_lender(rdb, name="FL Only", priority=1)
+    _add_box(rdb, lender, loan_types=[LOAN_TYPE_FLIP], approved_states=["FL", "GA"])
+    texas = _make_lead(rdb, state="TX", phone_suffix="9202")
+    _route(rdb, texas)
+    assert _fr(rdb, texas)["status"] == "held" and _fr(rdb, texas)["hold_reason"] == "out_of_footprint"
+
+    too_big = _make_lead(rdb, state="FL", loan_amount=300_000, loan_type=LOAN_TYPE_GU, phone_suffix="9203")
+    _route(rdb, too_big)  # in the footprint, but no box takes it: an ordinary no-match
+    assert _fr(rdb, too_big)["hold_reason"] == "no_match"
+
+
 # ── Idempotency ───────────────────────────────────────────────────────────────
 
 def test_route_file_is_idempotent(rdb):
@@ -1243,6 +1256,21 @@ def test_a_partner_file_with_no_matching_lender_is_held_visibly_and_not_announce
     assert _pfr(rdb, other)["status"] == "held" and _pfr(rdb, other)["hold_reason"] == "no_match"
     assert _file_status(rdb, other)[:2] == ("held", "no_match")
     assert partner_mail == []  # a hold is internal; the partner dashboard simply keeps saying "in review"
+
+
+def test_an_owner_occupied_partner_file_is_held_and_never_routed(rdb, partner_mail):
+    """Chunk 1 Addendum 1.1.2: business-purpose loans only; the partner keeps seeing "in review"."""
+    from src.lending.routing.router import route_loan_file
+
+    lender = _add_lender(rdb, name="Takes Anything", priority=1)
+    _add_box(rdb, lender, loan_types=[LOAN_TYPE_FLIP])
+    home = _make_partner_file(rdb, _make_partner(rdb))
+    rdb.execute(text("UPDATE lending.loan_files SET occupancy = 'owner_occupied' WHERE id = :f"), {"f": home})
+    rdb.commit()
+    route_loan_file(home, rdb)
+
+    assert _pfr(rdb, home)["status"] == "held" and _pfr(rdb, home)["hold_reason"] == "consumer_homestead_excluded"
+    assert partner_mail == []
 
 
 def test_the_partners_credit_band_and_experience_are_read_by_the_boxes(rdb, partner_mail):
@@ -2516,3 +2544,236 @@ def test_the_repair_does_not_apply_an_outcome_a_decline_overtook_after_the_snaps
     assert partner_link.resync_outcomes(snapshot, session_factory=session_factory, services=services) == 0
     assert _file_status(rdb, fid)[0] == "routed"  # not pulled back to "approved"
     assert fid not in [f for f, _ in partner_link.lagging_outcomes(rdb, older_than_minutes=0, limit=500, now=later)]
+
+
+# ── Held files re-run on their own; the hold queue can be read in Slack ───────
+
+def test_signing_a_lender_sends_the_held_no_match_files_back_by_itself(rdb, slack_form):
+    from src.tasks.lending_routing_sweep import sweep
+
+    lender = _add_lender(rdb, name="Signs Soon", priority=1, agreement_status="pending")
+    _add_box(rdb, lender, loan_types=[LOAN_TYPE_FLIP])
+    held = [_make_lead(rdb, phone_suffix=f"720{i}") for i in (1, 2)]
+    for lead in held:
+        _route(rdb, lead)
+    assert {_fr(rdb, lead)["status"] for lead in held} == {"held"}
+
+    slack_form(_form("add_box", lender=lender, types=[LOAN_TYPE_GU]))  # still unsigned: it cannot receive anything yet
+    assert {_fr(rdb, lead)["status"] for lead in held} == {"held"}
+    assert "held file(s)" not in slack_form.posted[-1]
+
+    assert slack_form(_form("agreement", lender=lender, value="signed")) == {}
+    assert "2 held file(s) sent back to the router" in slack_form.posted[-1]
+    assert {_fr(rdb, lead)["status"] for lead in held} == {"unrouted"}
+    sweep(rdb)
+    assert {_fr(rdb, lead)["current_lender_name"] for lead in held} == {"Signs Soon"}
+
+
+def test_resuming_or_changing_the_boxes_of_a_signed_lender_also_re_runs_held_files(rdb, slack_form):
+    lender = _add_lender(rdb, name="Paused Signed", priority=1, active=False)  # signed but paused
+    _add_box(rdb, lender, loan_types=[LOAN_TYPE_FLIP])
+    first = _make_lead(rdb, phone_suffix="7301")
+    _route(rdb, first)
+    assert _fr(rdb, first)["status"] == "held"
+    slack_form(_form("resume", lender=lender))
+    assert "1 held file(s) sent back" in slack_form.posted[-1] and _fr(rdb, first)["status"] == "unrouted"
+
+    second = _make_lead(rdb, loan_type=LOAN_TYPE_GU, loan_amount=100_000, phone_suffix="7302")  # no ground-up box yet
+    _route(rdb, second)
+    assert _fr(rdb, second)["status"] == "held"
+    slack_form(_form("add_lender", value="Takes Ground Up", types=[LOAN_TYPE_GU]))  # pending: nothing reopens
+    assert _fr(rdb, second)["status"] == "held"
+    slack_form(_form("replace_boxes", lender=lender, types=[LOAN_TYPE_FLIP, LOAN_TYPE_GU]))
+    assert "held file(s) sent back" in slack_form.posted[-1] and _fr(rdb, second)["status"] == "unrouted"
+
+
+def test_raising_or_removing_a_full_lenders_seat_cap_re_runs_the_files_held_because_of_it(rdb, slack_form):
+    from src.tasks.lending_routing_sweep import sweep
+
+    primary = _add_lender(rdb, name="Capped Primary", priority=1, is_primary=True, monthly_cap=1)
+    _add_box(rdb, primary, loan_types=[LOAN_TYPE_FLIP])
+    funded = _make_lead(rdb, phone_suffix="7501")
+    rdb.execute(text("INSERT INTO lending.file_routing_events (lead_id, lender_id, lender_name, action)"
+                     " VALUES (:l, :lender, 'Capped Primary', 'funded')"), {"l": funded, "lender": primary})
+    rdb.commit()  # this month's cap of 1 is used up
+    waiting = _make_lead(rdb, phone_suffix="7502")
+    _route(rdb, waiting)
+    assert (_fr(rdb, waiting)["status"], _fr(rdb, waiting)["hold_reason"]) == ("held", "no_match")
+
+    slack_form(_form("seat_cap", lender=primary, value="5"))
+    assert "1 held file(s) sent back to the router" in slack_form.posted[-1]
+    assert _fr(rdb, waiting)["status"] == "unrouted"
+    sweep(rdb)
+    assert _fr(rdb, waiting)["current_lender_name"] == "Capped Primary"
+
+    again = _make_lead(rdb, phone_suffix="7503")  # the cap is full again at 2 funded
+    rdb.execute(text("INSERT INTO lending.file_routing_events (lead_id, lender_id, lender_name, action)"
+                     " VALUES (:l, :lender, 'Capped Primary', 'funded')"), {"l": waiting, "lender": primary})
+    slack_form(_form("seat_cap", lender=primary, value="2"))
+    rdb.commit()
+    _route(rdb, again)
+    assert _fr(rdb, again)["status"] == "held"
+    slack_form(_form("seat_cap", lender=primary, value="none"))  # no cap at all
+    assert "1 held file(s) sent back" in slack_form.posted[-1]
+    sweep(rdb)
+    assert _fr(rdb, again)["current_lender_name"] == "Capped Primary"
+
+
+def test_a_box_covering_the_state_re_runs_a_file_held_out_of_footprint(rdb, slack_form):
+    """The no-lender holds are no_match and out_of_footprint: a change that can widen eligibility reopens both."""
+    lender = _add_lender(rdb, name="Georgia Only", priority=1)
+    _add_box(rdb, lender, loan_types=[LOAN_TYPE_FLIP], approved_states=["GA"])
+    texas = _make_lead(rdb, state="TX", phone_suffix="7601")
+    _route(rdb, texas)
+    assert _fr(rdb, texas)["hold_reason"] == "out_of_footprint"
+
+    slack_form(_form("add_box", lender=lender, types=[LOAN_TYPE_FLIP], states="TX"))
+
+    assert "1 held file(s) sent back to the router" in slack_form.posted[-1]
+    assert _fr(rdb, texas)["status"] == "unrouted"
+
+
+def test_exhausted_files_and_unrelated_changes_are_left_alone(rdb, slack_form):
+    from src.lending.routing.decline import record_decline
+
+    a, b = _two_flip_lenders(rdb)
+    lead = _make_lead(rdb, phone_suffix="7401")
+    _route(rdb, lead)
+    record_decline(_routed_event_id(rdb, lead), reason_code="ltv_over_max", actor="josh", db=rdb)
+    record_decline(_routed_event_id(rdb, lead), reason_code="ltv_over_max", actor="josh", db=rdb)
+    assert _fr(rdb, lead)["status"] == "exhausted"
+    held = _make_lead(rdb, loan_type=LOAN_TYPE_GU, phone_suffix="7402")
+    _route(rdb, held)
+    slack_form(_form("pause", lender=b))  # a change that cannot let a held file match
+    slack_form(_form("agreement", lender=a, value="terminated"))
+    assert _fr(rdb, held)["status"] == "held" and _fr(rdb, lead)["status"] == "exhausted"
+    slack_form(_form("agreement", lender=a, value="signed"))  # a decline of its own is not a no-match hold
+    assert _fr(rdb, lead)["status"] == "exhausted"
+
+
+def test_the_hold_queue_view_lists_waiting_files_and_changes_nothing(rdb, slack_form, monkeypatch):
+    from src.lending.routing import lender_service
+
+    leads = [_make_lead(rdb, phone_suffix=f"750{i}", last_name=f"Waiting{i}") for i in (1, 2)]
+    for lead in leads:
+        _route(rdb, lead)  # no lenders: both are held
+    posted = len(slack_form.posted)
+    response = slack_form(_form("show_hold_queue"))
+    assert response["response_action"] == "update"
+    shown = response["view"]["blocks"][0]["text"]["text"]
+    assert "2 file(s) waiting for a lender" in shown and "Waiting1" in shown and "Waiting2" in shown and "no_match" in shown
+    assert len(slack_form.posted) == posted  # a read-only view: nothing is announced
+    assert {_fr(rdb, lead)["status"] for lead in leads} == {"held"}
+
+    monkeypatch.setattr(lender_service, "HOLD_QUEUE_SHOWN", 1)
+    assert "showing the newest 1" in slack_form(_form("show_hold_queue"))["view"]["blocks"][0]["text"]["text"]
+
+
+def test_the_hold_queue_view_says_when_nothing_is_waiting(rdb, slack_form):
+    response = slack_form(_form("show_hold_queue"))
+    assert "0 file(s) waiting" in response["view"]["blocks"][0]["text"]["text"]
+    assert "Nothing is held" in response["view"]["blocks"][0]["text"]["text"]
+
+
+def test_a_long_hold_queue_view_drops_whole_files_instead_of_cutting_one_in_half():
+    from datetime import datetime, timezone
+
+    from src.lending.routing import slack_admin
+
+    files = [{"source": "lendingflow", "file_id": n, "last_name": f"Waiting{n}", "loan_type": "FIX_AND_FLIP", "loan_amount": 250000,
+              "status": "held", "hold_reason": "no_match", "updated_at": datetime.now(timezone.utc)} for n in range(1, 60)]
+    view = slack_admin.hold_queue_view({"total": 59, "files": files})
+    text = view["blocks"][0]["text"]["text"]
+    shown = [line for line in text.splitlines() if line.startswith("#") or line.startswith("```#")]
+    assert 0 < len(shown) < 59 and f"showing the newest {len(shown)}" in text
+    assert all(line.rstrip("`").endswith("m") or line.rstrip("`").endswith("h") for line in shown)  # each file ends with its age: none cut off
+    assert len(text) < 3000
+
+
+def test_the_morning_summary_no_longer_points_at_the_removed_endpoint():
+    import inspect
+
+    from src.tasks import lending_routing_hold_summary
+
+    source = inspect.getsource(lending_routing_hold_summary)
+    assert "/api/lending/routing" not in source and "Show the hold queue" in source
+
+
+# ── Chunk 1 Addendum 1.2.1: ground-up >= $500k cascades instead of holding ────────────────────────────────
+
+def _routed_metadata(db: Session, lead_id: int) -> Optional[dict]:
+    return db.execute(text("SELECT metadata FROM lending.file_routing_events WHERE lead_id = :l AND action = 'routed'"
+                           " ORDER BY id DESC LIMIT 1"), {"l": lead_id}).scalar()
+
+
+def test_large_ground_up_cascades_when_the_primary_is_at_its_seat_cap(rdb):
+    primary = _add_lender(rdb, name="Capped Primary", is_primary=True, priority=1, monthly_cap=1,
+                          construction_min_amount=500_000)
+    _add_box(rdb, primary, loan_types=[LOAN_TYPE_GU])
+    overflow = _add_lender(rdb, name="GU Next", priority=2, takes_ground_up=True)
+    _add_box(rdb, overflow, loan_types=[LOAN_TYPE_GU])
+    used = _make_lead(rdb, loan_type=LOAN_TYPE_GU, loan_amount=700_000, phone_suffix="6001")
+    rdb.execute(text("INSERT INTO lending.file_routing_events (lead_id, lender_id, lender_name, action, actor)"
+                     " VALUES (:l, :lid, 'Capped Primary', 'funded', 'system')"), {"l": used, "lid": primary})
+    rdb.commit()
+
+    lead = _make_lead(rdb, loan_type=LOAN_TYPE_GU, loan_amount=650_000, phone_suffix="6002")
+    _route(rdb, lead)
+
+    assert _fr(rdb, lead)["status"] == "routed" and _fr(rdb, lead)["current_lender_name"] == "GU Next"
+    assert _routed_metadata(rdb, lead) == {"overflow": True, "primary_bypass_reason": "SEAT_CAP"}
+
+
+def test_large_ground_up_outside_the_primary_states_cascades_with_the_footprint_reason(rdb):
+    primary = _add_lender(rdb, name="GA Primary", is_primary=True, priority=1, construction_min_amount=500_000)
+    _add_box(rdb, primary, loan_types=[LOAN_TYPE_GU], approved_states=["GA"])
+    overflow = _add_lender(rdb, name="FL Builder Lender", priority=2, takes_ground_up=True)
+    _add_box(rdb, overflow, loan_types=[LOAN_TYPE_GU])
+    lead = _make_lead(rdb, loan_type=LOAN_TYPE_GU, loan_amount=900_000, phone_suffix="6011")
+    _route(rdb, lead)
+
+    assert _fr(rdb, lead)["current_lender_name"] == "FL Builder Lender"
+    assert _routed_metadata(rdb, lead)["primary_bypass_reason"] == "OUT_OF_FOOTPRINT"
+
+
+def test_large_ground_up_still_holds_when_no_ground_up_lender_qualifies(rdb):
+    primary = _add_lender(rdb, name="GA Only", is_primary=True, priority=1, construction_min_amount=500_000)
+    _add_box(rdb, primary, loan_types=[LOAN_TYPE_GU], approved_states=["GA"])
+    lead = _make_lead(rdb, loan_type=LOAN_TYPE_GU, loan_amount=900_000, phone_suffix="6021")
+    _route(rdb, lead)
+    assert _fr(rdb, lead)["status"] == "held" and _fr(rdb, lead)["hold_reason"] == "no_match"
+
+
+def test_a_primary_routed_file_carries_no_overflow_metadata(rdb):
+    primary = _add_lender(rdb, name="Open Primary", is_primary=True, priority=1, construction_min_amount=500_000)
+    _add_box(rdb, primary, loan_types=[LOAN_TYPE_GU])
+    lead = _make_lead(rdb, loan_type=LOAN_TYPE_GU, loan_amount=600_000, phone_suffix="6031")
+    _route(rdb, lead)
+    assert _fr(rdb, lead)["current_lender_name"] == "Open Primary" and _routed_metadata(rdb, lead) is None
+
+
+def test_pausing_a_lender_reopens_nothing(rdb, slack_form):
+    lender = _add_lender(rdb, name="Narrowing", priority=1)
+    _add_box(rdb, lender, loan_types=[LOAN_TYPE_DSCR])
+    lead = _make_lead(rdb, phone_suffix="6051")
+    _route(rdb, lead)
+    slack_form(_form("pause", lender=lender))
+    assert _fr(rdb, lead)["status"] == "held"
+
+
+def test_a_failed_re_route_never_undoes_the_lender_change(rdb, slack_form, monkeypatch):
+    from src.lending.routing import router
+
+    lender = _add_lender(rdb, name="Signed Anyway", priority=1, agreement_status="pending")
+    _add_box(rdb, lender, loan_types=[LOAN_TYPE_FLIP])
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("database went away")
+
+    monkeypatch.setattr(router, "reopen_held", broken)
+    slack_form(_form("agreement", lender=lender, value="signed"))
+
+    status = rdb.execute(text("SELECT agreement_status FROM lending.lender_routing_rules WHERE id = :i"),
+                         {"i": lender}).scalar()
+    assert status == "signed"
+    assert any("could not be re-run" in line for line in slack_form.posted)

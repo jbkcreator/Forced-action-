@@ -29,7 +29,7 @@ SLOT = datetime(2026, 10, 7, 14, 0, tzinfo=timezone.utc)  # Wed 10:00 ET
 
 def test_confirmation_is_the_approved_wording_with_stop_language():
     body = render_text("confirmation", first_name="Jane", slot_start_utc=SLOT, property_address="412 Oak Ave, Tampa")
-    assert body == ("Hi Jane, this is Josh Kantor, Loan Officer, confirming our call on Wednesday, October 7 "
+    assert body == ("Hi Jane, this is Next Deal Lending, confirming our call on Wednesday, October 7 "
                     "at 10:00 am ET about 412 Oak Ave. Reply here if you need to reschedule. Reply STOP to opt out.")
 
 
@@ -41,11 +41,11 @@ def test_no_address_drops_the_phrase():
 
 def test_night_before_and_ninety_minute_wording():
     nb = render_text("night_before", first_name="Jane", slot_start_utc=SLOT, property_address="412 Oak Ave")
-    assert nb == ("Hi Jane, reminder from Josh Kantor, Loan Officer. Our call is tomorrow at 10:00 am ET "
+    assert nb == ("Hi Jane, reminder from Next Deal Lending. Our call is tomorrow at 10:00 am ET "
                   "about 412 Oak Ave. Talk soon.")
     ninety = render_text("ninety_min", first_name="Jane", slot_start_utc=SLOT, property_address="412 Oak Ave",
                          number="+18135550100")
-    assert ninety == ("Hi Jane, your call with Josh Kantor, Loan Officer, is in about 90 minutes, at 10:00 am ET. "
+    assert ninety == ("Hi Jane, your call with Next Deal Lending is in about 90 minutes, at 10:00 am ET. "
                       "Call us at (813) 555-0100 if anything's come up.")
 
 
@@ -55,8 +55,27 @@ def test_the_ninety_minute_text_needs_the_number_and_formats_it():
     assert "(813) 555-0100" in render_text("ninety_min", first_name="Jane", slot_start_utc=SLOT, number="+18135550100")
 
 
+def test_ten_minute_wording_is_the_approved_text():
+    ten = render_text("ten_min", first_name="Jane", slot_start_utc=SLOT, property_address="412 Oak Ave", number="+18135550100")
+    assert ten == ("Hi Jane, this is Next Deal Lending. We'll be calling you shortly, at 10:00 am ET. "
+                   "Call us at (813) 555-0100 if anything's come up.")
+    subject, body = render_email("ten_min", first_name="Jane", slot_start_utc=SLOT, number="+18135550100")
+    assert subject == "Your call with Next Deal Lending starts shortly"
+    assert body == ("Hi Jane,\n\nYour call with Next Deal Lending is in about 10 minutes, at 10:00 am ET. "
+                    "We'll be calling you shortly.\n\nCall us at (813) 555-0100 if anything's come up.\n\n"
+                    "Next Deal Lending")
+
+
+def test_the_ten_minute_text_needs_the_number_and_carries_no_reschedule_link():
+    with pytest.raises(ValueError):
+        render_text("ten_min", first_name="Jane", slot_start_utc=SLOT)
+    body = render_text("ten_min", first_name="Jane", slot_start_utc=SLOT, number="+18135550100",
+                       reschedule_url="https://example.com/r")
+    assert "example.com" not in body
+
+
 def test_only_the_confirmation_carries_stop_language():
-    for kind in ("night_before", "ninety_min"):
+    for kind in ("night_before", "ninety_min", "ten_min"):
         assert "STOP" not in render_text(kind, first_name="J", slot_start_utc=SLOT, number="+18135550100")
 
 
@@ -119,11 +138,12 @@ def rows(db):
 
 def test_schedules_confirmation_and_both_reminders(db):
     result = handle_booking_confirmed(db, payload(add_person(db)), now=NOW)
-    assert result.inserted == 3 and result.skip_reason is None
+    assert result.inserted == 4 and result.skip_reason is None
     by_kind = {r["kind"]: r for r in rows(db)}
     assert by_kind["confirmation"]["send_at"] == NOW and by_kind["confirmation"]["status"] == "pending"
     assert by_kind["night_before"]["send_at"] == datetime(2026, 10, 6, 18, 0, tzinfo=ET)
     assert by_kind["ninety_min"]["send_at"] == SLOT - timedelta(minutes=90)
+    assert by_kind["ten_min"]["send_at"] == SLOT - timedelta(minutes=10)
     assert {r["status"] for r in by_kind.values()} == {"pending"}
     assert by_kind["confirmation"]["first_name"] == "Jane" and by_kind["confirmation"]["contact_phone"] == "+18135550111"
 
@@ -133,8 +153,27 @@ def test_a_redelivered_booking_event_changes_nothing(db):
     handle_booking_confirmed(db, payload(person), now=NOW)
     again = handle_booking_confirmed(db, payload(person), now=NOW + timedelta(minutes=5))
     assert again.inserted == 0
-    assert len(rows(db)) == 3
+    assert len(rows(db)) == 4
     assert db.execute(text("SELECT count(*) FROM lending.confirmation_tasks")).scalar() == 1
+
+
+def test_a_booking_scheduled_before_the_ten_minute_reminder_is_not_given_one_by_a_redelivery(db):
+    person = add_person(db)
+    handle_booking_confirmed(db, payload(person), now=NOW)
+    db.execute(text("DELETE FROM lending.booking_messages WHERE kind = 'ten_min'"))  # as scheduled before this reminder
+    cancel_by_provider_event(db, "appt-1", "booking_cancelled")
+    again = handle_booking_confirmed(db, payload(person), now=NOW + timedelta(minutes=5))
+    assert again.inserted == 0
+    assert {r["kind"] for r in rows(db)} == {"confirmation", "night_before", "ninety_min"}
+
+
+def test_a_reschedule_gives_an_older_booking_the_ten_minute_reminder(db):
+    person = add_person(db)
+    handle_booking_confirmed(db, payload(person), now=NOW)
+    db.execute(text("DELETE FROM lending.booking_messages WHERE kind = 'ten_min'"))
+    handle_booking_confirmed(db, payload(person, slot_start_utc=SLOT + timedelta(days=1)), now=NOW + timedelta(minutes=5))
+    by_kind = {r["kind"]: r for r in rows(db)}
+    assert by_kind["ten_min"]["send_at"] == SLOT + timedelta(days=1) - timedelta(minutes=10)
 
 
 def test_a_booking_made_late_records_the_missed_reminders_as_skipped(db):
@@ -144,6 +183,7 @@ def test_a_booking_made_late_records_the_missed_reminders_as_skipped(db):
     assert by_kind["confirmation"]["status"] == "pending"
     assert (by_kind["night_before"]["status"], by_kind["night_before"]["skip_reason"]) == ("skipped", "too_late")
     assert (by_kind["ninety_min"]["status"], by_kind["ninety_min"]["skip_reason"]) == ("skipped", "too_late")
+    assert by_kind["ten_min"]["status"] == "pending"  # 50 minutes away: still ahead
 
 
 def test_no_person_is_recorded_visibly_not_dropped(db):
@@ -183,23 +223,23 @@ def test_a_naive_slot_time_is_rejected(db):
 def test_cancel_by_appointment_id_cancels_only_pending_rows(db):
     handle_booking_confirmed(db, payload(add_person(db)), now=NOW)
     db.execute(text("UPDATE lending.booking_messages SET status = 'sent' WHERE kind = 'confirmation'"))
-    assert cancel_by_provider_event(db, "appt-1", "booking_cancelled") == 2
+    assert cancel_by_provider_event(db, "appt-1", "booking_cancelled") == 3
     statuses = {r["kind"]: r["status"] for r in rows(db)}
-    assert statuses == {"confirmation": "sent", "night_before": "cancelled", "ninety_min": "cancelled"}
+    assert statuses == {"confirmation": "sent", "night_before": "cancelled", "ninety_min": "cancelled", "ten_min": "cancelled"}
     assert cancel_by_provider_event(db, "appt-1", "booking_cancelled") == 0
     assert cancel_by_provider_event(db, "unknown", "booking_cancelled") == 0
 
 
 def test_cancel_by_booking_ref(db):
     handle_booking_confirmed(db, payload(add_person(db)), now=NOW)
-    assert cancel_by_booking_ref(db, "ref-1", "booking_rescheduled") == 3
+    assert cancel_by_booking_ref(db, "ref-1", "booking_rescheduled") == 4
 
 
 # ── lending contacts: phone-keyed, no fa_max_persons row ──────────────────────
 
 def test_a_lending_booking_uses_the_phone_and_name_it_carries_without_a_person(db):
     result = handle_booking_confirmed(db, payload(None, phone="(813) 555-0147", first_name="Marcus"), now=NOW)
-    assert result.skip_reason is None and result.inserted == 3
+    assert result.skip_reason is None and result.inserted == 4
     assert {(r["contact_phone"], r["first_name"], r["status"]) for r in rows(db)} == {("+18135550147", "Marcus", "pending")}
 
 
@@ -240,7 +280,7 @@ def test_confirmation_call_due_dates_follow_the_client_rules(db):
 # ── Reminder timing + optional reschedule link ─────────────────
 
 URL = "https://link.nextdeallending.com/reschedule"
-NINETY_TODAY = ("Hi Jane, your call with Josh Kantor, Loan Officer, is in about 90 minutes, at 10:00 am ET. "
+NINETY_TODAY = ("Hi Jane, your call with Next Deal Lending is in about 90 minutes, at 10:00 am ET. "
                 "Call us at (813) 555-0100 if anything's come up.")
 
 
@@ -261,7 +301,7 @@ def test_reschedule_url_is_added_to_the_ninety_minute_text_with_callback_number(
 def test_reschedule_url_is_added_to_the_ninety_minute_email_before_the_signature():
     _, body = render_email("ninety_min", first_name="Jane", slot_start_utc=SLOT, number="+18135550100",
                            reschedule_url=URL)
-    assert f"To reschedule: {URL}\n\nJosh Kantor, Loan Officer" in body
+    assert f"To reschedule: {URL}\n\nNext Deal Lending" in body
     assert "Call us at (813) 555-0100" in body
 
 

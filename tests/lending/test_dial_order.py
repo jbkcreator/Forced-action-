@@ -68,7 +68,7 @@ def test_queue_to_dial_now_is_first_non_empty_queue(remaining, expected):
 
 def test_line_rules_three_everywhere_five_only_on_cold_maturity():
     """Runbook P4: partner/wholesaler/landline max 3 lines; 5 reserved for cold maturity."""
-    assert q.MAX_LINES == {q.PARTNERS: 3, q.TRANSACTION_READY: 3, q.BUILDERS: 3, q.VERIFIED_MATURITY: 5}
+    assert q.MAX_LINES == {q.PARTNERS: 3, q.WHOLESALERS: 3, q.TRANSACTION_READY: 3, q.BUILDERS: 3, q.VERIFIED_MATURITY: 5}
 
 
 def test_validate_rejects_five_lines_outside_cold_maturity(monkeypatch):
@@ -84,8 +84,8 @@ def test_validate_rejects_dial_order_missing_a_queue(monkeypatch):
 
 
 @pytest.mark.parametrize("tag", ["wholesaler_sunbiz", "wholesaler_hunter"])
-def test_wholesaler_tags_land_in_partners(tag):
-    assert q.SOURCE_TAG_QUEUES[tag] == q.PARTNERS
+def test_wholesaler_tags_land_in_their_own_wholesalers_queue(tag):
+    assert q.SOURCE_TAG_QUEUES[tag] == q.WHOLESALERS and q.SOURCE_TAG_QUEUES["list_4"] == q.PARTNERS
 
 
 def test_sort_for_load_keeps_records_outside_launch_queues_at_the_end():

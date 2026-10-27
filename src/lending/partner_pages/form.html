@@ -64,6 +64,11 @@
       <div><label for="f-arv">ARV or completed value</label>
         <input id="f-arv" name="arv" class="money" inputmode="numeric" placeholder="$" value="{{ values.arv }}"></div>
     </div>
+    <fieldset class="choice">
+      <legend>{{ occupancy_question }}</legend>
+      <label><input type="radio" name="occupancy" value="yes" required {% if values.occupancy == 'yes' %}checked{% endif %}> Yes</label>
+      <label><input type="radio" name="occupancy" value="no" {% if values.occupancy == 'no' %}checked{% endif %}> No</label>
+    </fieldset>
     <label for="f-timeline">Timeline</label>
     <select id="f-timeline" name="timeline">
       <option value="">Choose…</option>

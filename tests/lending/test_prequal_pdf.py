@@ -80,12 +80,16 @@ def test_watermark_in_real_pdf():
     assert "FOR INFORMATIONAL PURPOSES ONLY" in text
 
 
-def test_letter_has_no_company_name_and_is_signed_by_josh():
+def test_letter_is_branded_next_deal_lending_only():
+    # Chunk 1 Addendum 1.1.3 (Q18): "Next Deal Lending" only, no personal name; footer verbatim.
     ctx = prequal.build_context(PrequalLead("680-719", 300_000, "FL", "FIX_AND_FLIP"), [FitLimits(75_000, 2_000_000)], 10)
     html = render_html(prequal.TEMPLATE, ctx, watermark=NON_BINDING_PREQUAL_WATERMARK)
-    assert "next deal lending" not in html.lower()
-    assert "Josh Kantor, Loan Officer" in html
-    assert "subject to lender confirmation" in html
+    footer = "Next Deal Lending &middot; Tampa, Florida &middot; (656) 221-1100 &middot; hello@nextdeallending.com"
+    assert footer in re.sub(r"<[^>]+>", "", html)
+    for banned in ("Josh", "Kantor", "Loan Officer", "(727)", "436-9951"):
+        assert banned not in html
+
+
 
 
 def test_range_has_no_upper_clamp_when_a_lender_states_no_maximum():

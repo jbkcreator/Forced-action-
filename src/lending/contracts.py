@@ -273,6 +273,10 @@ class LenderPossible(BaseModel):
     why_unknown: list[str]
 
 
+LEVERAGE_CHECKED = "checked"
+LEVERAGE_PENDING_CALL_FACTS = "pending_call_facts"
+
+
 class LenderFitResult(BaseModel):
     """Structured output of evaluate_lender_fit (SPEC §4.3).
 
@@ -302,6 +306,7 @@ class LenderFitResult(BaseModel):
     non_fitting: list[LenderMiss] = Field(default_factory=list)
     missing_fields: list[str] = Field(default_factory=list)
     lender_fit_score: Optional[Decimal] = None  # Q2; hidden when rules are partial
+    leverage_status: str = LEVERAGE_CHECKED  # LEVERAGE_PENDING_CALL_FACTS: LTV/LTC skipped, figures come on the call
 
 
 # ---------------------------------------------------------------------------

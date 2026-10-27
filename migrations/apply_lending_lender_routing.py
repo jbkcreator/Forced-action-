@@ -185,6 +185,8 @@ DDL = [
         END IF;
     END $$
     """,
+    # Chunk 1 Addendum 1.2.1: why a file skipped the primary, e.g. {"overflow": true, "primary_bypass_reason": "SEAT_CAP"}.
+    "ALTER TABLE lending.file_routing_events ADD COLUMN IF NOT EXISTS metadata JSONB",
     # DELETE and non-Slack UPDATE on file_routing_events are forbidden.
     """
     CREATE OR REPLACE FUNCTION lending.fre_immutable()
@@ -203,6 +205,7 @@ DDL = [
         OR NEW.reason_code   IS DISTINCT FROM OLD.reason_code
         OR NEW.free_text     IS DISTINCT FROM OLD.free_text
         OR NEW.actor         IS DISTINCT FROM OLD.actor
+        OR NEW.metadata      IS DISTINCT FROM OLD.metadata
         OR NEW.created_at    IS DISTINCT FROM OLD.created_at
         THEN
             RAISE EXCEPTION 'file_routing_events is append-only: only slack_ts/slack_posted_at may be updated';
@@ -256,9 +259,10 @@ DDL = [
                 ALTER TABLE lending.file_routing ADD CONSTRAINT fk_file_routing_loan_file
                     FOREIGN KEY (loan_file_id) REFERENCES lending.loan_files (id);
             END IF;
+            -- NOT VALID: the append-only log keeps events for loan files since deleted; new rows are still checked.
             IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_fre_loan_file') THEN
                 ALTER TABLE lending.file_routing_events ADD CONSTRAINT fk_fre_loan_file
-                    FOREIGN KEY (loan_file_id) REFERENCES lending.loan_files (id);
+                    FOREIGN KEY (loan_file_id) REFERENCES lending.loan_files (id) NOT VALID;
             END IF;
         END IF;
     END $$

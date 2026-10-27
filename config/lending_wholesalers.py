@@ -4,7 +4,7 @@
 label only, with no API pull. Pass condition: >= 1,500 dialable numbers loaded.
 """
 
-# CSV ``source`` value -> source tag (mapped to the Partners queue in config/lending_queues.py).
+# CSV ``source`` value -> source tag (mapped to the Wholesalers queue in config/lending_queues.py).
 WHOLESALER_SOURCE_TAGS: dict[str, str] = {
     "sunbiz": "wholesaler_sunbiz",
     "hunter": "wholesaler_hunter",

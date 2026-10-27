@@ -30,6 +30,7 @@ from typing import Any, Optional, Sequence
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import text
 
+from config.lending_occupancy import UNKNOWN, occupancy_from_answer
 from config.lending_partners import (
     AGREEMENT_STATUSES,
     CREDIT_BANDS,
@@ -192,6 +193,12 @@ class SubmissionInput(BaseModel):
     credit_band: str
     timeline: Optional[str] = None
     notes: Optional[str] = Field(None, max_length=2000)
+    occupancy: str = UNKNOWN
+
+    @field_validator("occupancy", mode="before")
+    @classmethod
+    def _occupancy(cls, value: Any) -> str:
+        return occupancy_from_answer(value)
 
     @field_validator("borrower_email", "property_city", "property_zip", "purchase_price", "rehab_budget", "arv",
                      "completed_projects", "timeline", "notes", mode="before")
@@ -299,16 +306,16 @@ def save_submission(db, partner: Partner, data: SubmissionInput, uploads: Sequen
         text("INSERT INTO lending.loan_files (source, partner_id, borrower_first_name, borrower_last_name, "
              "borrower_phone, borrower_email, product, loan_amount, property_address, property_city, property_state, "
              "property_zip, purchase_price, rehab_budget, arv, completed_projects, credit_band, timeline, notes, "
-             "status, status_at, created_at, updated_at) VALUES (:source, :partner_id, :first, :last, :phone, :email, "
-             ":product, :amount, :address, :city, :state, :zip, :price, :rehab, :arv, :projects, :band, :timeline, "
-             ":notes, 'received', :now, :now, :now) RETURNING id"),
+             "occupancy, status, status_at, created_at, updated_at) VALUES (:source, :partner_id, :first, :last, "
+             ":phone, :email, :product, :amount, :address, :city, :state, :zip, :price, :rehab, :arv, :projects, "
+             ":band, :timeline, :notes, :occupancy, 'received', :now, :now, :now) RETURNING id"),
         {"source": SOURCE_PARTNER, "partner_id": partner.id, "first": data.borrower_first_name,
          "last": data.borrower_last_name, "phone": data.borrower_phone, "email": data.borrower_email,
          "product": data.product, "amount": data.loan_amount, "address": data.property_address,
          "city": data.property_city, "state": data.property_state, "zip": data.property_zip,
          "price": data.purchase_price, "rehab": data.rehab_budget, "arv": data.arv,
          "projects": data.completed_projects, "band": data.credit_band, "timeline": data.timeline,
-         "notes": data.notes, "now": now},
+         "notes": data.notes, "occupancy": data.occupancy, "now": now},
     ).scalar_one())
     db.execute(
         text("INSERT INTO lending.partner_submissions (file_id, partner_id, consent_checked, consent_text, "

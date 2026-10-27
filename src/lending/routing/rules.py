@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Optional
 
 from sqlalchemy import text
@@ -26,12 +27,30 @@ from sqlalchemy.orm import Session
 
 from config.lender_matrix import LENDER_MATRIX, LenderRules
 from config.settings import get_settings
+from src.lending import leverage
 from src.lending.lender_rules_store import load_matrix
 
 logger = logging.getLogger(__name__)
 
 
 # ── Data structures ────────────────────────────────────────────────────────
+
+
+class FailureKind(StrEnum):
+    """What a broken box rule was about, so the primary's bypass reason never depends on message wording."""
+
+    STATE = "state"
+    LEVERAGE = "leverage"
+    OTHER = "other"
+
+
+class BypassReason(StrEnum):
+    """``file_routing_events.metadata.primary_bypass_reason`` (Chunk 1 Addendum 1.2.1)."""
+
+    SEAT_CAP = "SEAT_CAP"
+    BOX_FAIL = "BOX_FAIL"
+    LEVERAGE_EXCEEDED = "LEVERAGE_EXCEEDED"
+    OUT_OF_FOOTPRINT = "OUT_OF_FOOTPRINT"
 
 
 @dataclass(frozen=True)
@@ -74,7 +93,8 @@ class FileProfile:
 
     An unknown credit band or experience count (None) means that check is not applied, in line with
     "possible, confirm on the call": the router recommends a lender and Josh submits manually.  A box's
-    max_ltv / max_ltc are not applied here either, because the file facts carry no ARV, price or rehab figures.
+    max_ltv / max_ltc apply only when the file carries the figures (partner files do; LendingFlow leads do not,
+    so their leverage is checked on the call: PENDING_CALL_FACTS).
     """
 
     loan_type: str               # LoanType value, e.g. 'FIX_AND_FLIP'
@@ -82,6 +102,9 @@ class FileProfile:
     state: str                   # 2-letter USPS code
     credit_band_min_fico: Optional[int] = None
     completed_projects: Optional[int] = None
+    purchase_price: Optional[int] = None
+    rehab_budget: Optional[int] = None
+    arv: Optional[int] = None
 
 
 # ── T-05 rule values -> boxes ─────────────────────────────────────────────
@@ -191,43 +214,77 @@ def load_active_lenders(db: Session) -> list[LenderRow]:
 # ── Box evaluator ────────────────────────────────────────────────────────
 
 
-def _box_matches(box: ProductBox, profile: FileProfile) -> tuple[bool, list[str]]:
-    """Return (matches, rejection_reasons) for one product box.
-
-    A box with an unset limit does not enforce it.
-    """
-    reasons: list[str] = []
-
+def _box_failures(box: ProductBox, profile: FileProfile) -> list[tuple[FailureKind, str]]:
+    """Every rule of one box the file breaks, each with its kind. A box with an unset limit does not enforce it."""
     if box.loan_types and profile.loan_type not in box.loan_types:
-        reasons.append(f"loan_type {profile.loan_type!r} not accepted")
-        return False, reasons  # short-circuit: rest is moot
+        return [(FailureKind.OTHER, f"loan_type {profile.loan_type!r} not accepted")]  # the rest is moot
 
+    failures: list[tuple[FailureKind, str]] = []
     if box.approved_states and profile.state not in box.approved_states:
-        reasons.append(f"state {profile.state!r} not in approved states")
-
+        failures.append((FailureKind.STATE, f"state {profile.state!r} not in approved states"))
     if box.min_loan_amount is not None and profile.loan_amount < box.min_loan_amount:
-        reasons.append(
-            f"loan_amount ${profile.loan_amount:,} below ${box.min_loan_amount:,} minimum"
-        )
+        failures.append((FailureKind.OTHER,
+                         f"loan_amount ${profile.loan_amount:,} below ${box.min_loan_amount:,} minimum"))
     if box.max_loan_amount is not None and profile.loan_amount > box.max_loan_amount:
-        reasons.append(
-            f"loan_amount ${profile.loan_amount:,} exceeds ${box.max_loan_amount:,} maximum"
-        )
-
+        failures.append((FailureKind.OTHER,
+                         f"loan_amount ${profile.loan_amount:,} exceeds ${box.max_loan_amount:,} maximum"))
     if box.credit_floor is not None and profile.credit_band_min_fico is not None:
         if profile.credit_band_min_fico < box.credit_floor:
-            reasons.append(
-                f"credit {profile.credit_band_min_fico} below floor {box.credit_floor}"
-            )
-
+            failures.append((FailureKind.OTHER,
+                             f"credit {profile.credit_band_min_fico} below floor {box.credit_floor}"))
     if box.min_completed_projects > 0 and profile.completed_projects is not None:
         if profile.completed_projects < box.min_completed_projects:
-            reasons.append(
-                f"{profile.completed_projects} project(s) below "
-                f"{box.min_completed_projects}+ minimum"
-            )
+            failures.append((FailureKind.OTHER, f"{profile.completed_projects} project(s) below "
+                                                f"{box.min_completed_projects}+ minimum"))
 
-    return len(reasons) == 0, reasons
+    deal_ltv = leverage.ltv(profile.loan_amount, profile.arv)
+    if leverage.over_cap(deal_ltv, box.max_ltv):
+        failures.append((FailureKind.LEVERAGE, f"LTV_LIMIT_EXCEEDED ({leverage.requested_vs_max(deal_ltv, box.max_ltv)})"))
+    deal_ltc = leverage.ltc(profile.loan_amount, profile.purchase_price, profile.rehab_budget)
+    if leverage.over_cap(deal_ltc, box.max_ltc):
+        failures.append((FailureKind.LEVERAGE, f"LTC_LIMIT_EXCEEDED ({leverage.requested_vs_max(deal_ltc, box.max_ltc)})"))
+    return failures
+
+
+def _box_matches(box: ProductBox, profile: FileProfile) -> tuple[bool, list[str]]:
+    """Return (matches, rejection_reasons) for one product box."""
+    failures = _box_failures(box, profile)
+    return not failures, [reason for _, reason in failures]
+
+
+def primary_bypass_reason(lender: LenderRow, profile: FileProfile, at_cap: bool) -> BypassReason:
+    """Why the primary did not take a file it would have by amount (Chunk 1 Addendum 1.2.1).
+
+    SEAT_CAP when its monthly seats are used up. Otherwise, a box that failed on leverage alone gives
+    LEVERAGE_EXCEEDED, then one that failed on state alone gives OUT_OF_FOOTPRINT; any other mix is BOX_FAIL.
+    """
+    if at_cap:
+        return BypassReason.SEAT_CAP
+    only: set[FailureKind] = set()
+    for box in lender.boxes:
+        kinds = {kind for kind, _ in _box_failures(box, profile)}
+        if len(kinds) == 1:
+            only |= kinds
+    if FailureKind.LEVERAGE in only:
+        return BypassReason.LEVERAGE_EXCEEDED
+    if FailureKind.STATE in only:
+        return BypassReason.OUT_OF_FOOTPRINT
+    return BypassReason.BOX_FAIL
+
+
+def outside_footprint(lenders: list[LenderRow], state: str) -> bool:
+    """Chunk 1 Addendum 1.1.2: no box of these lenders takes the file's state (a box without states takes all).
+    False for a file without a state or with no lenders: those are an ordinary no-match."""
+    if not (state and lenders):
+        return False
+    return not any(box.approved_states is None or state in box.approved_states
+                   for lender in lenders for box in lender.boxes)
+
+
+def missing_leverage_facts(profile: FileProfile) -> list[str]:
+    """The figures a leverage check needs that this file does not carry (captured on the call)."""
+    figures = {"purchase_price": profile.purchase_price, "rehab_budget": profile.rehab_budget, "arv": profile.arv}
+    return [name for name, value in figures.items() if value is None]
 
 
 def lender_passes_box(lender: LenderRow, profile: FileProfile) -> bool:
@@ -236,7 +293,15 @@ def lender_passes_box(lender: LenderRow, profile: FileProfile) -> bool:
     A lender with no boxes has no known rules, so it never matches: unknown eligibility must not mean
     "accepts everything" (the file goes on to the next lender or the hold queue instead).
     """
-    return any(_box_matches(box, profile)[0] for box in lender.boxes)
+    rejections: list[str] = []
+    for box in lender.boxes:
+        matches, reasons = _box_matches(box, profile)
+        if matches:
+            return True
+        rejections.extend(reasons)
+    if rejections:
+        logger.info("lender_id=%d skipped: %s", lender.id, "; ".join(rejections))
+    return False
 
 
 def primary_lender(lenders: list[LenderRow]) -> Optional[LenderRow]:

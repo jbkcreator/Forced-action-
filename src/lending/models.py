@@ -383,10 +383,12 @@ class LendingMissedCallText(LendingBase):
 class LendingWebLead(LendingBase):
     """One nextdeallending.com form submission (WP-GL-11), stored before any GHL call.
 
-    ``sms_consent`` / ``deal_drop_optin`` hold exactly what the visitor ticked, with the label
+    ``sms_consent`` (text messages only), ``call_consent`` (calls only) and ``deal_drop_optin`` (the weekly
+    Deal Drop by email) are three separate boxes and hold exactly what the visitor ticked, with the label
     text, page URL, IP and timestamp that make it evidence. A later unticked submission never
     edits an earlier row; every submission is its own row. ``ghl_status`` is the delivery
-    state: pending -> synced / contact_only (no new-lead stage configured) / failed.
+    state: pending -> synced / contact_only (no new-lead stage configured) / failed; ``excluded`` = owner-occupied
+    (Chunk 1 Addendum 1.1.2), never delivered.
     """
 
     __tablename__ = "web_leads"
@@ -399,10 +401,17 @@ class LendingWebLead(LendingBase):
     property_city: Mapped[Optional[str]] = mapped_column(String(80))
     deal_type: Mapped[Optional[str]] = mapped_column(String(60))
     completed_projects_3y: Mapped[Optional[str]] = mapped_column(String(30))
+    loan_amount: Mapped[Optional[int]] = mapped_column(BigInteger)  # whole dollars; the form's text is parsed (web_leads._loan_amount)
+    property_address: Mapped[Optional[str]] = mapped_column(String(200))
+    property_state: Mapped[Optional[str]] = mapped_column(String(40))  # USPS code when recognised, else as sent
+    credit_band: Mapped[Optional[str]] = mapped_column(String(20))  # as the form sent it
     sms_consent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    call_consent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     deal_drop_optin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
-    consent_text: Mapped[Optional[str]] = mapped_column(Text)  # the label the visitor saw, verbatim
+    consent_text: Mapped[Optional[str]] = mapped_column(Text)  # the text box's label the visitor saw, verbatim
     consent_text_matches: Mapped[Optional[bool]] = mapped_column(Boolean)  # equals config.lending_web.SMS_CONSENT_TEXT
+    call_consent_text: Mapped[Optional[str]] = mapped_column(Text)  # the call box's label the visitor saw, verbatim
+    call_consent_text_matches: Mapped[Optional[bool]] = mapped_column(Boolean)  # equals config.lending_web.CALL_CONSENT_TEXT
     page_url: Mapped[Optional[str]] = mapped_column(String(300))
     ip_address: Mapped[Optional[str]] = mapped_column(String(45))
     user_agent: Mapped[Optional[str]] = mapped_column(String(300))
@@ -416,9 +425,11 @@ class LendingWebLead(LendingBase):
     ghl_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     ghl_alerted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # Slack warning sent: not in GHL after the alert wait
     is_test: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))  # test traffic: left out of reports and caps, never out of suppression or consent
+    returning_alerted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # 1.2.2 ops alert posted once
+    occupancy: Mapped[str] = mapped_column(String(20), nullable=False, default="unknown", server_default=text("'unknown'"))  # config.lending_occupancy
 
     __table_args__ = (
-        CheckConstraint("ghl_status IN ('pending', 'synced', 'contact_only', 'failed')", name="ck_lending_web_leads_ghl_status"),
+        CheckConstraint("ghl_status IN ('pending', 'synced', 'contact_only', 'failed', 'excluded')", name="ck_lending_web_leads_ghl_status"),
         Index("idx_lending_web_leads_delivery", "ghl_status", "received_at"),
         Index("idx_lending_web_leads_phone", "phone", "received_at"),
     )
@@ -839,7 +850,8 @@ class LendingFileRouting(LendingBase):
 
     ``lenders_tried``: ordered list of lender IDs already offered the file (so
     the decline cascade can skip them on the next pass).
-    ``hold_reason``: 'no_match' or 'exhausted'.
+    ``hold_reason``: 'no_match', 'out_of_footprint' (no signed lender takes the state), 'exhausted', 'suppressed'
+    or 'consumer_homestead_excluded'.
     """
 
     __tablename__ = "file_routing"
@@ -891,6 +903,7 @@ class LendingFileRoutingEvent(LendingBase):
     actor: Mapped[str] = mapped_column(String(100), nullable=False, default="system", server_default=text("'system'"))
     slack_ts: Mapped[Optional[str]] = mapped_column(String(40))
     slack_posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    metadata_: Mapped[Optional[dict]] = mapped_column("metadata", JSONB)  # overflow + primary_bypass_reason (1.2.1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 
     __table_args__ = (
@@ -901,9 +914,10 @@ class LendingFileRoutingEvent(LendingBase):
 
 
 class LendingUncalledAlarm(LendingBase):
-    """T-10: one stopwatch per LendingFlow lead, copied from T-11's ``lending.lendingflow_leads``.
+    """T-10: one stopwatch per lead, copied from T-11's ``lending.lendingflow_leads`` or from ``lending.web_leads``.
 
-    ``lendingflow_lead_id`` is deliberately not a foreign key, so this table does not depend on T-11's
+    Exactly one of ``lendingflow_lead_id`` / ``web_lead_id`` is set (a website lead has no ``lead_uuid`` of its
+    own, so it is stored as ``web-<id>``). Neither is a foreign key, so this table does not depend on T-11's
     migration order. ``fired_120_at`` / ``fired_300_at`` are claims committed before the send: an alarm fires
     at most once. ``*_status``: sent / retry (definitely not sent, will be retried) / sending (a retry is claimed) /
     send_unknown (may have been sent: never resent) / failed (retries used up) / superseded (no longer needed) /
@@ -913,7 +927,8 @@ class LendingUncalledAlarm(LendingBase):
     __tablename__ = "uncalled_alarms"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    lendingflow_lead_id: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
+    lendingflow_lead_id: Mapped[Optional[int]] = mapped_column(Integer, unique=True)
+    web_lead_id: Mapped[Optional[int]] = mapped_column(Integer)
     lead_uuid: Mapped[str] = mapped_column(String(36), nullable=False)
     phone: Mapped[str] = mapped_column(String(20), nullable=False)  # phone_utils.normalize (from T-11)
     arrived_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -937,6 +952,8 @@ class LendingUncalledAlarm(LendingBase):
     __table_args__ = (
         CheckConstraint("resolved_reason IN ('connected', 'escalated', 'preexisting')",
                         name="ck_lending_uncalled_alarms_reason"),
+        CheckConstraint("(lendingflow_lead_id IS NULL) <> (web_lead_id IS NULL)", name="ck_lending_uncalled_alarms_one_source"),
+        Index("uq_lending_uncalled_alarms_web_lead", "web_lead_id", unique=True),
         Index("idx_lending_uncalled_alarms_open", "arrived_at", postgresql_where=text("resolved_at IS NULL")),
     )
 
@@ -1175,6 +1192,7 @@ class LendingLoanFile(LendingBase):
     completed_projects: Mapped[Optional[int]] = mapped_column(Integer)
     credit_band: Mapped[Optional[str]] = mapped_column(String(20))
     timeline: Mapped[Optional[str]] = mapped_column(String(40))
+    occupancy: Mapped[str] = mapped_column(String(20), nullable=False, default="unknown", server_default=text("'unknown'"))  # config.lending_occupancy
     notes: Mapped[Optional[str]] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="received", server_default=text("'received'"))
     status_reason: Mapped[Optional[str]] = mapped_column(String(200))
@@ -1249,6 +1267,11 @@ class LendingPartnerSubmission(LendingBase):
     partner_texted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     josh_notified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     prequal_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # letter emailed to the partner
+    prequal_withheld_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # letters off: never sent
+    # Record only (Chunk 1 Addendum 1.1.1): nothing contacts a partner's borrower at intake; set once a live
+    # first contact is logged.
+    borrower_notified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    borrower_consent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # live first contact logged
     confirm_failed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # confirmation gave up; Slack alerted
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 

@@ -1239,7 +1239,7 @@ COUNTY_ID=hillsborough
 # Lending 7:20pm ET scoreboard to Slack (Part 5.6; dialer stops 7:15pm). Two lines because ET is UTC-4 until Nov 1 and UTC-5 after; the task posts only when it is 19:xx ET.
 20 23 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_daily_scoreboard
 20 0 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_daily_scoreboard
-# Lending hourly scoreboard (launch runbook Line 11): the day so far, posted at 10:00 through 18:00 ET (the 7:20pm closing board covers 7pm), and skipped when there are no dials yet. Runs every UTC hour; the task acts only when the ET hour is one of those, so daylight saving needs no second line.
+# Lending hourly scoreboard (launch runbook Line 11): the day so far, posted at 10:00 through 19:00 ET (the 7:20pm closing board follows the 7:00pm one), and skipped when there are no dials yet. Runs every UTC hour; the task acts only when the ET hour is one of those, so daylight saving needs no second line.
 0 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_daily_scoreboard --hourly
 
 # Lending 9am ET list of confirmation calls due (WP-GL-10, lending.confirmation_tasks). Two lines because ET is UTC-4 until Nov 1 and UTC-5 after; the task posts only when it is 9:xx ET.
