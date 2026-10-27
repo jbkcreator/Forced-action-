@@ -69,7 +69,7 @@ def run_hold_summary() -> None:
             lines.append(f"  • *Held (no lender matched)*: {total_held} file(s)")
         if total_exhausted:
             lines.append(f"  • *Exhausted (all lenders declined)*: {total_exhausted} file(s)")
-        lines.append("  Review via `GET /api/lending/routing/hold-queue`.")
+        lines.append("  See them with `/lenders`, then Action: Show the hold queue.")
         text_body = "\n".join(lines)
 
     try:

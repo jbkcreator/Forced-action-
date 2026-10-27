@@ -39,7 +39,7 @@ def test_points_at_partners_while_any_remain(monkeypatch, caplog):
     assert task.main([]) == 0
     assert task.dial_now_summary({q.PARTNERS: 4, q.VERIFIED_MATURITY: 500}) == {
         "queue": q.PARTNERS, "max_lines": 3,
-        "active_by_queue": {q.PARTNERS: 4, q.TRANSACTION_READY: 0, q.BUILDERS: 0, q.VERIFIED_MATURITY: 500},
+        "active_by_queue": {q.PARTNERS: 4, q.WHOLESALERS: 0, q.TRANSACTION_READY: 0, q.BUILDERS: 0, q.VERIFIED_MATURITY: 500},
     }
 
 

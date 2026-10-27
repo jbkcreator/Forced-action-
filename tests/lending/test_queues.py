@@ -51,7 +51,8 @@ def test_unknown_tags_get_no_queue(tag):
 
 def test_config_is_valid_and_dial_order_is_partners_first():
     q.validate_queue_config()
-    assert q.DIAL_ORDER == (q.PARTNERS, q.TRANSACTION_READY, q.BUILDERS, q.VERIFIED_MATURITY)
+    assert q.DIAL_ORDER == (q.PARTNERS, q.WHOLESALERS, q.TRANSACTION_READY, q.BUILDERS, q.VERIFIED_MATURITY)
+    assert q.WHOLESALERS in q.NEVER_BOOKABLE_QUEUES  # wholesalers get the partner script and are never booked as borrowers
     assert not hasattr(q, "DIAL_SHARE")
     assert not (q.NURTURE_ONLY_TAGS & set(q.SOURCE_TAG_QUEUES))
 

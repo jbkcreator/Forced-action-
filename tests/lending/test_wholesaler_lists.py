@@ -26,7 +26,7 @@ def test_parse_keeps_fl_known_sources_with_phone_and_tags_them():
     assert [r["phone"] for r in parsed.records] == ["+18135550101", "+18135550102"]
     first, second = parsed.records
     assert first["source_tag"] == "wholesaler_sunbiz" and second["source_tag"] == "wholesaler_hunter"
-    assert first["pool"] == q.PARTNERS and first["state"] == "FL"
+    assert first["pool"] == q.WHOLESALERS and first["state"] == "FL"
     assert first["borrower_name"] == "Ann Lee" and first["entity_name"] == "Lee Homes LLC"
     assert first["source_record_ref"] == wholesaler_ref("sunbiz", "+18135550101")
     assert all("8135550101" not in r["source_record_ref"] for r in parsed.records)
@@ -111,12 +111,12 @@ def test_live_refuses_without_matching_scrub_confirmation(csv_path, harness):
     assert all(load["dry_run"] for load in harness["loads"])
 
 
-def test_live_with_confirmation_loads_partners_and_tags_only_loaded_numbers_in_ghl(csv_path, harness):
+def test_live_with_confirmation_loads_wholesalers_and_tags_only_loaded_numbers_in_ghl(csv_path, harness):
     assert task.main(["--input", str(csv_path), "--live", "--confirm-scrub", "1"]) == 0
     dry, load = harness["loads"]
     assert dry["dry_run"] is True
     assert load["dry_run"] is False and load["scrubber"] is not None
-    assert {r["pool"] for r in load["records"]} == {q.PARTNERS}
+    assert {r["pool"] for r in load["records"]} == {q.WHOLESALERS}
     assert harness["sink"].pushed == [(wholesaler_ref("sunbiz", "+18135550101"),
                                        ["ndl-wholesaler", "ndl-src-sunbiz", "ndl-state-fl"])]
 
