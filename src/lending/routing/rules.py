@@ -73,8 +73,10 @@ class FileProfile:
     Josh to confirm whether min or max should be used for threshold checks.
 
     An unknown credit band or experience count (None) means that check is not applied, in line with
-    "possible, confirm on the call": the router recommends a lender and Josh submits manually.  A box's
-    max_ltv / max_ltc are not applied here either, because the file facts carry no ARV, price or rehab figures.
+    "possible, confirm on the call": the router recommends a lender and Josh submits manually.  The same
+    holds for the leverage caps: a box's max_ltv needs the ARV and its max_ltc needs both the purchase price
+    and the rehab budget.  A partner supplies them; a LendingFlow lead does not, so its leverage is checked
+    on the call (pending call facts), never assumed to fail.
     """
 
     loan_type: str               # LoanType value, e.g. 'FIX_AND_FLIP'
@@ -82,6 +84,9 @@ class FileProfile:
     state: str                   # 2-letter USPS code
     credit_band_min_fico: Optional[int] = None
     completed_projects: Optional[int] = None
+    purchase_price: Optional[int] = None
+    rehab_budget: Optional[int] = None
+    arv: Optional[int] = None
 
 
 # ── T-05 rule values -> boxes ─────────────────────────────────────────────
@@ -227,7 +232,35 @@ def _box_matches(box: ProductBox, profile: FileProfile) -> tuple[bool, list[str]
                 f"{box.min_completed_projects}+ minimum"
             )
 
+    reasons.extend(_leverage_breaches(box, profile))
+
     return len(reasons) == 0, reasons
+
+
+def _leverage_breaches(box: ProductBox, profile: FileProfile) -> list[str]:
+    """LTV (loan / ARV) and LTC (loan / (purchase + rehab)) over the box's caps.
+
+    Same rules as the fit card (``lender_fit``): a cap with a missing figure is not applied, and a deal
+    exactly at the cap passes.
+    """
+    breaches: list[str] = []
+    if box.max_ltv is not None and profile.arv:
+        ltv = profile.loan_amount / profile.arv
+        if ltv > box.max_ltv:
+            breaches.append(f"LTV_LIMIT_EXCEEDED (Requested: {ltv:.1%}, Max: {box.max_ltv:.0%})")
+    if box.max_ltc is not None and profile.purchase_price is not None and profile.rehab_budget is not None:
+        total_cost = profile.purchase_price + profile.rehab_budget
+        if total_cost > 0:
+            ltc = profile.loan_amount / total_cost
+            if ltc > box.max_ltc:
+                breaches.append(f"LTC_LIMIT_EXCEEDED (Requested: {ltc:.1%}, Max: {box.max_ltc:.0%})")
+    return breaches
+
+
+def missing_leverage_facts(profile: FileProfile) -> list[str]:
+    """The figures a leverage check needs that this file does not carry (captured on the call)."""
+    figures = {"purchase_price": profile.purchase_price, "rehab_budget": profile.rehab_budget, "arv": profile.arv}
+    return [name for name, value in figures.items() if value is None]
 
 
 def lender_passes_box(lender: LenderRow, profile: FileProfile) -> bool:
@@ -236,7 +269,15 @@ def lender_passes_box(lender: LenderRow, profile: FileProfile) -> bool:
     A lender with no boxes has no known rules, so it never matches: unknown eligibility must not mean
     "accepts everything" (the file goes on to the next lender or the hold queue instead).
     """
-    return any(_box_matches(box, profile)[0] for box in lender.boxes)
+    rejections: list[str] = []
+    for box in lender.boxes:
+        matches, reasons = _box_matches(box, profile)
+        if matches:
+            return True
+        rejections.extend(reasons)
+    if rejections:
+        logger.info("lender_id=%d skipped: %s", lender.id, "; ".join(rejections))
+    return False
 
 
 def primary_lender(lenders: list[LenderRow]) -> Optional[LenderRow]:
