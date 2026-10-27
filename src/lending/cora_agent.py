@@ -457,6 +457,8 @@ def main(stop: Optional[threading.Event] = None) -> int:
     """
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    # slack_sdk logs request bodies at DEBUG, and a /partners answer carries a partner link (a credential).
+    logging.getLogger("slack_sdk").setLevel(logging.INFO)
     stop = stop or threading.Event()
     # systemctl stop sends SIGTERM; Ctrl+C sends SIGINT. Both close the socket and end cleanly.
     for signum in (signal.SIGTERM, signal.SIGINT):
