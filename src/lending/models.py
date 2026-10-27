@@ -385,7 +385,8 @@ class LendingWebLead(LendingBase):
     Deal Drop by email) are three separate boxes and hold exactly what the visitor ticked, with the label
     text, page URL, IP and timestamp that make it evidence. A later unticked submission never
     edits an earlier row; every submission is its own row. ``ghl_status`` is the delivery
-    state: pending -> synced / contact_only (no new-lead stage configured) / failed.
+    state: pending -> synced / contact_only (no new-lead stage configured) / failed; ``excluded`` = owner-occupied
+    (Chunk 1 Addendum 1.1.2), never delivered.
     """
 
     __tablename__ = "web_leads"
@@ -421,9 +422,11 @@ class LendingWebLead(LendingBase):
     ghl_last_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     ghl_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     ghl_alerted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # Slack warning sent: not in GHL after the alert wait
+    returning_alerted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # 1.2.2 ops alert posted once
+    occupancy: Mapped[str] = mapped_column(String(20), nullable=False, default="unknown", server_default=text("'unknown'"))  # config.lending_occupancy
 
     __table_args__ = (
-        CheckConstraint("ghl_status IN ('pending', 'synced', 'contact_only', 'failed')", name="ck_lending_web_leads_ghl_status"),
+        CheckConstraint("ghl_status IN ('pending', 'synced', 'contact_only', 'failed', 'excluded')", name="ck_lending_web_leads_ghl_status"),
         Index("idx_lending_web_leads_delivery", "ghl_status", "received_at"),
         Index("idx_lending_web_leads_phone", "phone", "received_at"),
     )

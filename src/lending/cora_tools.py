@@ -138,7 +138,7 @@ class FindLeadInput(_Input):
 
 class WebLeadsInput(_Input):
     since_days: int = Field(7, ge=1, le=90, description="Look back this many days.")
-    ghl_status: Optional[Literal["pending", "synced", "contact_only", "failed"]] = None
+    ghl_status: Optional[Literal["pending", "synced", "contact_only", "failed", "excluded"]] = None
     limit: int = Field(25, ge=1, le=MAX_ROWS)
 
 

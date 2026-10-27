@@ -35,6 +35,12 @@ _ALTERS = [
     'ALTER TABLE "{t}".web_leads ADD COLUMN IF NOT EXISTS call_consent boolean NOT NULL DEFAULT false',
     'ALTER TABLE "{t}".web_leads ADD COLUMN IF NOT EXISTS call_consent_text text',
     'ALTER TABLE "{t}".web_leads ADD COLUMN IF NOT EXISTS call_consent_text_matches boolean',
+    # Chunk 1 Addendum 1.2.2 / 1.1.2
+    'ALTER TABLE "{t}".web_leads ADD COLUMN IF NOT EXISTS returning_alerted_at timestamptz',
+    """ALTER TABLE "{t}".web_leads ADD COLUMN IF NOT EXISTS occupancy varchar(20) NOT NULL DEFAULT 'unknown'""",
+    'ALTER TABLE "{t}".web_leads DROP CONSTRAINT IF EXISTS ck_lending_web_leads_ghl_status',
+    """ALTER TABLE "{t}".web_leads ADD CONSTRAINT ck_lending_web_leads_ghl_status """
+    """CHECK (ghl_status IN ('pending', 'synced', 'contact_only', 'failed', 'excluded'))""",
 ]
 
 

@@ -9,8 +9,10 @@ ticked; a "no" tag only on a brand-new contact, so a later unticked form never c
 earlier "yes". Custom fields (when their ids are configured) are written only for "yes" or a value.
 Deal Drop is the weekly email only: its tag and field say nothing about texts.
 Pipeline: a card is created only when none exists for the contact in the Booked Calls pipeline
-and a new-lead stage is configured; an existing card is never moved. Without that stage the lead
-is contact-only. Each submission also adds a timestamped note of what was ticked.
+and a new-lead stage is configured. A contact that already has a card is returning (Chunk 1
+Addendum 1.2.2): it is tagged, and a closed card (a reopen stage, or status lost/abandoned) is
+moved back to the new-lead stage; an active one (e.g. Booked) or a won one is never moved.
+Without that stage the lead is contact-only. Each submission also adds a timestamped note.
 """
 from __future__ import annotations
 
@@ -21,10 +23,12 @@ from typing import Any, Mapping, Optional
 from config.lending_web import (
     GHL_CONFIG_ERROR_STATUS_CODES,
     GHL_CUSTOM_FIELD_YES,
+    GHL_REOPEN_STATUSES,
     GHL_SOURCE,
     GHL_TAG_CALL_CONSENT_NO,
     GHL_TAG_CALL_CONSENT_YES,
     GHL_TAG_DEAL_DROP_OPTIN,
+    GHL_TAG_RETURNING,
     GHL_TAG_SMS_CONSENT_NO,
     GHL_TAG_SMS_CONSENT_YES,
     GHL_TAG_WEB_LEAD,
@@ -76,7 +80,24 @@ def _custom_fields(lead: Mapping[str, Any]) -> list[dict[str, str]]:
         fields.append({"id": settings.lending_ghl_cf_loan_amount, "value": str(lead["loan_amount"])})
     if settings.lending_ghl_cf_credit_band and lead["credit_band"]:
         fields.append({"id": settings.lending_ghl_cf_credit_band, "value": lead["credit_band"]})
+    if settings.lending_ghl_cf_property_address and lead["property_address"]:
+        fields.append({"id": settings.lending_ghl_cf_property_address, "value": lead["property_address"]})
     return fields
+
+
+def _reopen_stage_ids() -> frozenset[str]:
+    settings = get_settings()
+    configured = {s.strip() for s in settings.lending_ghl_reopen_stage_ids.split(",") if s.strip()}
+    if not configured and settings.lending_ghl_stage_nurture:
+        configured = {settings.lending_ghl_stage_nurture}
+    return frozenset(configured)
+
+
+def _is_closed(opportunity: Mapping[str, Any]) -> bool:
+    status = str(opportunity.get("status") or "").lower()
+    if status == "won":
+        return False
+    return status in GHL_REOPEN_STATUSES or opportunity.get("pipelineStageId") in _reopen_stage_ids()
 
 
 def _note(lead: Mapping[str, Any]) -> str:
@@ -126,9 +147,13 @@ class GhlLeadSink:
         if stale:
             # only our own earlier "no" tags are ever removed, so "no" and "yes" never sit side by side
             self._call("remove stale tag", "DELETE", f"/contacts/{contact_id}/tags", json={"tags": stale})
-        pipeline_card = self._ensure_pipeline_card(lead, contact_id)
+        pipeline_card, existing = self._ensure_pipeline_card(lead, contact_id)
+        moved = existing is not None and self._reopen_if_closed(existing)
+        if existing is not None:
+            self._call("add returning tag", "POST", f"/contacts/{contact_id}/tags", json={"tags": [GHL_TAG_RETURNING]})
         self._add_note(lead, contact_id)
-        return PushResult(contact_id=contact_id, pipeline_card=pipeline_card)
+        return PushResult(contact_id=contact_id, pipeline_card=pipeline_card,
+                          returning=existing is not None, moved_to_new_lead=moved)
 
     def _upsert_contact(self, lead: Mapping[str, Any]) -> tuple[str, bool]:
         first, _, last = str(lead["name"]).partition(" ")
@@ -149,17 +174,20 @@ class GhlLeadSink:
             raise DeliveryError("contact upsert: no contact id in response")
         return str(contact_id), bool(data.get("new"))
 
-    def _ensure_pipeline_card(self, lead: Mapping[str, Any], contact_id: str) -> bool:
+    def _ensure_pipeline_card(self, lead: Mapping[str, Any], contact_id: str) -> tuple[bool, Optional[Mapping[str, Any]]]:
+        """(has a card, the contact's existing card or None when this submission created it)."""
         settings = get_settings()
         pipeline_id, stage_id = settings.lending_ghl_pipeline_id, settings.lending_ghl_stage_new_lead
         if not (pipeline_id and stage_id):
-            return False
+            return False, None
         found = self._call(
             "opportunity search", "GET", "/opportunities/search",
             params={"location_id": self._account.location_id, "contact_id": contact_id, "pipeline_id": pipeline_id},
         )
-        if found.get("opportunities"):
-            return True  # already has a card in this pipeline: never move it
+        cards = found.get("opportunities") or []
+        if cards:
+            # an active card wins: a contact mid-deal (e.g. Booked) is never pulled back to New Lead
+            return True, next((c for c in cards if not _is_closed(c)), cards[0])
         self._call("opportunity create", "POST", "/opportunities/", json={
             "pipelineId": pipeline_id,
             "locationId": self._account.location_id,
@@ -169,6 +197,13 @@ class GhlLeadSink:
             "status": "open",
             "source": GHL_SOURCE,
         })
+        return True, None
+
+    def _reopen_if_closed(self, opportunity: Mapping[str, Any]) -> bool:
+        if not _is_closed(opportunity):
+            return False
+        self._call("opportunity reopen", "PUT", f"/opportunities/{opportunity['id']}",
+                   json={"pipelineStageId": get_settings().lending_ghl_stage_new_lead, "status": "open"})
         return True
 
     def _add_note(self, lead: Mapping[str, Any], contact_id: str) -> None:

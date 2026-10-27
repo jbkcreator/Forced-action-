@@ -61,6 +61,10 @@ GHL_TAG_SMS_CONSENT_NO = "web-sms-consent-no"
 GHL_TAG_CALL_CONSENT_YES = "web-call-consent-yes"
 GHL_TAG_CALL_CONSENT_NO = "web-call-consent-no"
 GHL_TAG_DEAL_DROP_OPTIN = "web-deal-drop-optin"  # the weekly Deal Drop by email only; never a text opt-in
+# Chunk 1 Addendum 1.2.2: the contact already had a Booked Calls card when the form came in.
+GHL_TAG_RETURNING = "web-lead-returning"
+# Opportunity statuses that count as closed, whatever the stage: a returning contact's card is reopened.
+GHL_REOPEN_STATUSES = frozenset({"lost", "abandoned"})
 
 FIELD_MAX_LENGTHS = {
     "name": 120,
@@ -78,4 +82,4 @@ FIELD_MAX_LENGTHS = {
     "user_agent": 300,
 }
 
-GHL_STATUSES = ("pending", "synced", "contact_only", "failed")
+GHL_STATUSES = ("pending", "synced", "contact_only", "failed", "excluded")

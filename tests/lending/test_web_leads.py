@@ -14,6 +14,7 @@ from src.lending.web_leads import (
     PushResult,
     build_input,
     deliver_pending,
+    returning_alert_text,
     merge_into_existing,
     save_web_lead,
     will_be_contacted,
@@ -352,3 +353,108 @@ def test_without_ghl_configured_leads_wait_and_no_attempt_is_burned(web_leads_db
     assert deliver_pending(web_leads_db, None, lead_id=lead_id) == 0
     row = _row(web_leads_db, lead_id)
     assert row["ghl_status"] == "pending" and row["ghl_attempts"] == 0
+
+
+# Chunk 1 Addendum 1.2.2 / 1.1.2
+
+@pytest.mark.parametrize("name,moved,expected", [
+    ("Dana Builder", True, ":recycle: Returning Borrower Resubmitted Form: Dana B. - Moved to New Lead"),
+    ("Dana", False, ":recycle: Returning Borrower Resubmitted Form: Dana - Left in its current stage"),
+])
+def test_returning_alert_names_the_borrower_by_first_name_and_initial(name, moved, expected):
+    text_ = returning_alert_text(name, lead_id=7, moved=moved, contact_url=None)
+    assert text_.startswith(expected) and "Lead `7`" in text_ and "Builder" not in text_
+
+
+def test_returning_alert_links_the_ghl_contact():
+    assert "<https://ghl/c|Open in GHL>" in returning_alert_text("Dana Builder", 7, True, "https://ghl/c")
+
+
+@pytest.mark.parametrize("answer,expected", [("yes", "owner_occupied"), ("no", "investment"), (None, "unknown")])
+def test_build_input_reads_the_occupancy_answer(answer, expected):
+    assert _data(occupancy=answer).occupancy == expected
+
+
+def test_a_returning_lead_is_alerted_once(web_leads_db, monkeypatch):
+    posted = []
+    monkeypatch.setattr("src.lending.web_leads.post_ops_alert", lambda message: posted.append(message) or True)
+    lead_id, _ = save_web_lead(web_leads_db, _data())
+    sink = RecordingSink(PushResult("ghl_1", pipeline_card=True, returning=True, moved_to_new_lead=True))
+    deliver_pending(web_leads_db, sink, lead_id=lead_id)
+    web_leads_db.execute(text("UPDATE lending.web_leads SET ghl_status = 'pending' WHERE id = :i"), {"i": lead_id})
+    deliver_pending(web_leads_db, sink, lead_id=lead_id)  # a re-delivery (merged details) never re-alerts
+    assert len(posted) == 1 and "Moved to New Lead" in posted[0]
+    assert _row(web_leads_db, lead_id)["returning_alerted_at"] is not None
+
+
+def test_a_first_time_lead_is_not_alerted(web_leads_db, monkeypatch):
+    posted = []
+    monkeypatch.setattr("src.lending.web_leads.post_ops_alert", lambda message: posted.append(message) or True)
+    lead_id, _ = save_web_lead(web_leads_db, _data())
+    deliver_pending(web_leads_db, RecordingSink(), lead_id=lead_id)
+    assert posted == []
+
+
+def test_an_owner_occupied_lead_is_saved_but_never_delivered(web_leads_db):
+    lead_id, _ = save_web_lead(web_leads_db, _data(occupancy="yes", sms_consent="yes"))
+    assert _row(web_leads_db, lead_id)["ghl_status"] == "excluded"
+    sink = RecordingSink()
+    assert deliver_pending(web_leads_db, sink, lead_id=lead_id) == 0 and sink.pushed == []
+
+
+def test_a_returning_alert_slack_refuses_is_queued_in_coras_inbox(web_leads_db, monkeypatch):
+    queued = []
+    monkeypatch.setattr("src.lending.web_leads.post_ops_alert", lambda message: False)
+    monkeypatch.setattr("src.lending.web_leads.add_to_inbox_in_own_session", lambda **event: queued.append(event))
+    lead_id, _ = save_web_lead(web_leads_db, _data())
+    deliver_pending(web_leads_db, RecordingSink(PushResult("ghl_1", pipeline_card=True, returning=True)), lead_id=lead_id)
+    assert [e["event_type"] for e in queued] == ["web_lead_returning_alert_failed"]
+
+
+def test_the_latest_occupancy_answer_wins_inside_the_dedup_window(web_leads_db):
+    lead_id, _ = save_web_lead(web_leads_db, _data(occupancy="no"))
+    assert merge_into_existing(web_leads_db, lead_id, _data(occupancy="yes")) is False
+    assert _row(web_leads_db, lead_id)["ghl_status"] == "excluded"
+    assert merge_into_existing(web_leads_db, lead_id, _data(occupancy="no")) is True  # released: delivered again
+    assert _row(web_leads_db, lead_id)["ghl_status"] == "pending"
+
+
+def test_a_yes_answer_is_applied_even_when_the_same_repeat_adds_a_detail(web_leads_db):
+    lead_id, _ = save_web_lead(web_leads_db, _data(email=None, occupancy="no"))
+    again = _data(email="dana@example.com", property_address="12 Oak Ave", occupancy="yes")
+    assert merge_into_existing(web_leads_db, lead_id, again) is True  # the detail was added
+    row = _row(web_leads_db, lead_id)
+    assert (row["ghl_status"], row["occupancy"], row["email"]) == ("excluded", "owner_occupied", "dana@example.com")
+    sink = RecordingSink()
+    assert deliver_pending(web_leads_db, sink, lead_id=lead_id) == 0 and sink.pushed == []
+
+
+def test_a_no_answer_releases_an_excluded_lead_even_when_the_same_repeat_adds_a_detail(web_leads_db):
+    lead_id, _ = save_web_lead(web_leads_db, _data(email=None, occupancy="yes"))
+    again = _data(email="dana@example.com", occupancy="no")
+    assert merge_into_existing(web_leads_db, lead_id, again) is True
+    row = _row(web_leads_db, lead_id)
+    assert (row["ghl_status"], row["occupancy"], row["email"]) == ("pending", "investment", "dana@example.com")
+    sink = RecordingSink()
+    assert deliver_pending(web_leads_db, sink, lead_id=lead_id) == 1 and len(sink.pushed) == 1
+
+
+def test_a_yes_answer_with_a_new_detail_does_not_exclude_a_lead_already_in_ghl(web_leads_db):
+    lead_id, _ = save_web_lead(web_leads_db, _data(email=None, occupancy="no"))
+    deliver_pending(web_leads_db, RecordingSink(), lead_id=lead_id)
+    assert merge_into_existing(web_leads_db, lead_id, _data(email="dana@example.com", occupancy="yes")) is True
+    row = _row(web_leads_db, lead_id)
+    assert row["occupancy"] == "owner_occupied" and row["ghl_status"] == "pending"  # re-queued, never excluded after delivery
+
+
+@pytest.mark.parametrize("name", ["<!channel>", "<!here> Smith", "<@U123ABC> Builder", "<https://attacker.example|Dana>", "A&B <b>"])
+def test_returning_alert_escapes_slack_markup_in_the_name(name):
+    text_ = returning_alert_text(name, lead_id=7, moved=True, contact_url=None)
+    body = text_.split(": ", 1)[1].split(" - ", 1)[0]
+    assert "<" not in body and ">" not in body
+    assert "<!channel>" not in text_ and "<!here>" not in text_ and "<@U123ABC>" not in text_ and "attacker.example|" not in text_
+
+
+def test_returning_alert_keeps_its_own_ghl_link_live():
+    text_ = returning_alert_text("<!channel>", 7, True, "https://ghl/c")
+    assert "&lt;!channel&gt;" in text_ and "<https://ghl/c|Open in GHL>" in text_

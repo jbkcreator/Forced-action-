@@ -48,6 +48,7 @@ def create_web_lead(
     property_address: Optional[str] = Form(default=None),
     property_state: Optional[str] = Form(default=None),
     credit_band: Optional[str] = Form(default=None),
+    occupancy: Optional[str] = Form(default=None),
     sms_consent: Optional[str] = Form(default=None),  # box 1: text messages only
     call_consent: Optional[str] = Form(default=None),  # box 2: calls only
     deal_drop_optin: Optional[str] = Form(default=None),  # box 3: the weekly Deal Drop by email
@@ -67,7 +68,7 @@ def create_web_lead(
                 "name": name, "phone": phone, "email": email, "property_city": property_city,
                 "deal_type": deal_type, "completed_projects_3y": completed_projects_3y,
                 "loan_amount": loan_amount, "property_address": property_address,
-                "property_state": property_state, "credit_band": credit_band,
+                "property_state": property_state, "credit_band": credit_band, "occupancy": occupancy,
                 "sms_consent": sms_consent, "call_consent": call_consent, "deal_drop_optin": deal_drop_optin,
                 "consent_text": consent_text, "call_consent_text": call_consent_text, "page_url": page_url,
             },
