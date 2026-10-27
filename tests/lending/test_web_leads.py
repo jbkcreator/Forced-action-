@@ -417,3 +417,44 @@ def test_the_latest_occupancy_answer_wins_inside_the_dedup_window(web_leads_db):
     assert _row(web_leads_db, lead_id)["ghl_status"] == "excluded"
     assert merge_into_existing(web_leads_db, lead_id, _data(occupancy="no")) is True  # released: delivered again
     assert _row(web_leads_db, lead_id)["ghl_status"] == "pending"
+
+
+def test_a_yes_answer_is_applied_even_when_the_same_repeat_adds_a_detail(web_leads_db):
+    lead_id, _ = save_web_lead(web_leads_db, _data(email=None, occupancy="no"))
+    again = _data(email="dana@example.com", property_address="12 Oak Ave", occupancy="yes")
+    assert merge_into_existing(web_leads_db, lead_id, again) is True  # the detail was added
+    row = _row(web_leads_db, lead_id)
+    assert (row["ghl_status"], row["occupancy"], row["email"]) == ("excluded", "owner_occupied", "dana@example.com")
+    sink = RecordingSink()
+    assert deliver_pending(web_leads_db, sink, lead_id=lead_id) == 0 and sink.pushed == []
+
+
+def test_a_no_answer_releases_an_excluded_lead_even_when_the_same_repeat_adds_a_detail(web_leads_db):
+    lead_id, _ = save_web_lead(web_leads_db, _data(email=None, occupancy="yes"))
+    again = _data(email="dana@example.com", occupancy="no")
+    assert merge_into_existing(web_leads_db, lead_id, again) is True
+    row = _row(web_leads_db, lead_id)
+    assert (row["ghl_status"], row["occupancy"], row["email"]) == ("pending", "investment", "dana@example.com")
+    sink = RecordingSink()
+    assert deliver_pending(web_leads_db, sink, lead_id=lead_id) == 1 and len(sink.pushed) == 1
+
+
+def test_a_yes_answer_with_a_new_detail_does_not_exclude_a_lead_already_in_ghl(web_leads_db):
+    lead_id, _ = save_web_lead(web_leads_db, _data(email=None, occupancy="no"))
+    deliver_pending(web_leads_db, RecordingSink(), lead_id=lead_id)
+    assert merge_into_existing(web_leads_db, lead_id, _data(email="dana@example.com", occupancy="yes")) is True
+    row = _row(web_leads_db, lead_id)
+    assert row["occupancy"] == "owner_occupied" and row["ghl_status"] == "pending"  # re-queued, never excluded after delivery
+
+
+@pytest.mark.parametrize("name", ["<!channel>", "<!here> Smith", "<@U123ABC> Builder", "<https://attacker.example|Dana>", "A&B <b>"])
+def test_returning_alert_escapes_slack_markup_in_the_name(name):
+    text_ = returning_alert_text(name, lead_id=7, moved=True, contact_url=None)
+    body = text_.split(": ", 1)[1].split(" - ", 1)[0]
+    assert "<" not in body and ">" not in body
+    assert "<!channel>" not in text_ and "<!here>" not in text_ and "<@U123ABC>" not in text_ and "attacker.example|" not in text_
+
+
+def test_returning_alert_keeps_its_own_ghl_link_live():
+    text_ = returning_alert_text("<!channel>", 7, True, "https://ghl/c")
+    assert "&lt;!channel&gt;" in text_ and "<https://ghl/c|Open in GHL>" in text_

@@ -29,7 +29,7 @@ from config.lending_web import (
 from config.lending_occupancy import OWNER_OCCUPIED, UNKNOWN, occupancy_from_answer
 from config.settings import get_settings
 from src.lending.consent import record_consent
-from src.lending.cora_inbox import add_to_inbox_in_own_session
+from src.lending.cora_inbox import add_to_inbox_in_own_session, slack_safe
 from src.lending.lead_arrival_alert import ghl_contact_url
 from src.lending.ops_alerts import post_ops_alert
 from src.services.phone_utils import normalize
@@ -251,7 +251,10 @@ def merge_into_existing(db, lead_id: int, data: WebLeadInput) -> bool:
     """A repeat submission inside the dedup window fills in details the stored lead lacks (an email
     added on the second try) and never overwrites one it has. Returns True when something was
     added; the lead is then queued for delivery again so GoHighLevel gets the new detail. Consent
-    values are never touched: they stay exactly what the first submission recorded."""
+    values are never touched: they stay exactly what the first submission recorded. The occupancy answer is applied
+    first and on its own, so it takes effect whether or not details were added in the same submission, and the
+    details update (which re-queues a delivered lead) cannot hide it or exclude a lead already in GoHighLevel."""
+    released = _merge_occupancy(db, lead_id, data.occupancy)
     changed = db.execute(
         text("UPDATE lending.web_leads SET "
              "email = COALESCE(email, CAST(:email AS text)), "
@@ -280,7 +283,7 @@ def merge_into_existing(db, lead_id: int, data: WebLeadInput) -> bool:
     ).first()
     if changed is not None:
         logger.info("[lending-web] repeat submission added details to lead id=%s", lead_id)
-    return changed is not None or _merge_occupancy(db, lead_id, data.occupancy)
+    return changed is not None or released
 
 
 def _merge_occupancy(db, lead_id: int, occupancy: str) -> bool:
@@ -364,9 +367,10 @@ def _deliver_one(db, sink: LeadSink, lead: dict[str, Any], now: datetime) -> int
 
 
 def returning_alert_text(name: str, lead_id: int, moved: bool, contact_url: Optional[str]) -> str:
-    """First name and last initial only: the full name stays in GHL."""
+    """First name and last initial only: the full name stays in GHL. The name is visitor-typed, so it is escaped:
+    Slack would otherwise act on <!channel> or <url|label> inside it."""
     first, _, last = name.strip().partition(" ")
-    shown = f"{first} {last.strip()[0]}." if last.strip() else first
+    shown = slack_safe(f"{first} {last.strip()[0]}." if last.strip() else first)
     outcome = "Moved to New Lead" if moved else "Left in its current stage"
     return (f":recycle: Returning Borrower Resubmitted Form: {shown} - {outcome}. Lead `{lead_id}`."
             + (f" <{contact_url}|Open in GHL>" if contact_url else ""))
