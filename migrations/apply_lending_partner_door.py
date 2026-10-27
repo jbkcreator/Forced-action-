@@ -104,6 +104,9 @@ def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
             josh_notified_at     timestamptz,
             prequal_sent_at      timestamptz,
             confirm_failed_at    timestamptz,
+            prequal_withheld_at  timestamptz,
+            borrower_notified    boolean      NOT NULL DEFAULT false,
+            borrower_consent_at  timestamptz,
             created_at           timestamptz  NOT NULL DEFAULT now()
         )""",
         f"""CREATE TABLE IF NOT EXISTS {uploads} (
