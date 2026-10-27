@@ -15,9 +15,9 @@ A dry run does the work inside a savepoint and rolls it back, so it reports exac
 Deleting (``--apply --delete`` only; the cron job never deletes) removes ONLY rows already tagged ``is_test``, one row
 at a time in its own savepoint, after copying the row into ``lending.test_data_deleted_rows``. The database decides what
 can go: a row something still points at, or an append-only record (routing events, consent certificates), refuses the
-delete and the row is kept and counted. Never deleted: subscribers (tag only), and a test contact that is on the
-do-not-contact list, the suppression list or has an opt-out, because deleting it could let a blocked number be
-contacted again.
+delete and the row is kept and counted. Never deleted: subscribers (tag only), email opt-outs and the suppression list
+(tag only: they are what blocks a send, see ``NEVER_DELETED``), and a test contact that is on the do-not-contact list,
+the suppression list or has an opt-out, because deleting it could let a blocked number be contacted again.
 """
 from __future__ import annotations
 
@@ -137,9 +137,11 @@ DELETE_ORDER: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     ("public.consent_acceptances", ()),
     ("public.non_buyer_nurture_sequences", ()),
     ("public.checkout_recovery", ()),
-    ("public.email_opt_outs", ()),
-    ("lending.suppression_list", ()),
 )
+# Tagged (so reports leave them out) but never deleted: these rows are the live send guards. is_email_suppressed()
+# reads email_opt_outs and the lending compliance checks read suppression_list, and the address may still belong to a
+# retained subscriber, so deleting the row would let it be contacted again. An archive copy does not block anything.
+NEVER_DELETED: tuple[str, ...] = ("public.email_opt_outs", "lending.suppression_list")
 # A test contact is only a candidate when none of these says the number must stay blocked.
 _CONTACT_PROTECTED = (
     "do_not_contact"

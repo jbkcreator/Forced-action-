@@ -4,7 +4,8 @@ Nothing new is stored: each event is already written by the job that handles it,
 instead of copying them (and never puts a view on ``call_dispositions``, which would block its migrations).
 
 * calls: ``lending.call_dispositions`` (BatchDialer and GHL, outbound and inbound, answered or not)
-* texts: ``lending.missed_call_texts`` (the missed-call text: sent, or why not)
+* texts: ``lending.missed_call_events`` (the missed-call text written by ``text_back.py``: its status is the decision,
+  sent or why not; ``lending.missed_call_texts`` is the superseded #320 table and is not read)
 * outcomes: ``lending.ghl_stage_events`` (pipeline stage entries such as Booked or Funded) and
   ``lending.file_routing_events`` (routed, declined, approved, funded) of the phone's LendingFlow leads
 
@@ -34,8 +35,8 @@ _TOUCHES = text("""
                COALESCE(disposition, disposition_raw) AS outcome, dialer_call_id AS ref
           FROM lending.call_dispositions WHERE phone = :phone
         UNION ALL
-        SELECT created_at, 'text', 'outbound', outcome, dialer_call_id
-          FROM lending.missed_call_texts WHERE phone = :phone
+        SELECT COALESCE(decided_at, created_at), 'text', 'outbound', status, dialer_call_id
+          FROM lending.missed_call_events WHERE phone = :phone
         UNION ALL
         SELECT event_at, 'stage', NULL, stage_name, ghl_opportunity_id
           FROM lending.ghl_stage_events WHERE phone = :phone
