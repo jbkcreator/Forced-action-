@@ -10,10 +10,9 @@ from typing import Optional
 
 import pytest
 
-from config.lending_routing import OVERFLOW_PRIMARY_AT_CAP, OVERFLOW_PRIMARY_BOX_FAIL
 from src.lending.contracts import LoanType
 from src.lending.routing import router
-from src.lending.routing.rules import FileProfile, LenderRow, ProductBox
+from src.lending.routing.rules import BypassReason, FileProfile, LenderRow, ProductBox
 
 GROUND_UP = LoanType.GROUND_UP_CONSTRUCTION.value
 FLIP = LoanType.FIX_AND_FLIP.value
@@ -47,7 +46,8 @@ def choose(monkeypatch):
     """Run the router's rules with the primary's seat cap set open or full."""
     def run(profile: FileProfile, lenders: list[LenderRow], *, at_cap: bool = False, tried: tuple[int, ...] = ()):
         monkeypatch.setattr(router, "seat_at_cap", lambda lender, db: at_cap)
-        return router._choose(profile, lenders, list(tried), db=None)
+        choice = router._choose(profile, lenders, list(tried), db=None)
+        return (choice.lender, choice.bypass) if choice else (None, None)
     return run
 
 
@@ -57,17 +57,17 @@ def _ground_up(amount: int, state: str = "FL") -> FileProfile:
 
 def test_at_the_primarys_cap_a_large_ground_up_file_goes_to_the_next_ground_up_lender(choose):
     assert choose(_ground_up(600_000), [PRIMARY, GROUND_UP_NEXT], at_cap=True) == (
-        GROUND_UP_NEXT, OVERFLOW_PRIMARY_AT_CAP)
+        GROUND_UP_NEXT, BypassReason.SEAT_CAP)
 
 
-def test_outside_the_primarys_box_a_large_ground_up_file_goes_to_the_next_ground_up_lender(choose):
+def test_outside_the_primarys_states_a_large_ground_up_file_goes_to_the_next_ground_up_lender(choose):
     assert choose(_ground_up(750_000, state="GA"), [PRIMARY, GROUND_UP_NEXT]) == (
-        GROUND_UP_NEXT, OVERFLOW_PRIMARY_BOX_FAIL)
+        GROUND_UP_NEXT, BypassReason.OUT_OF_FOOTPRINT)
 
 
-def test_the_box_is_reported_over_the_cap_when_both_stop_the_primary(choose):
+def test_the_seat_cap_is_reported_over_the_box_when_both_stop_the_primary(choose):
     assert choose(_ground_up(750_000, state="GA"), [PRIMARY, GROUND_UP_NEXT], at_cap=True) == (
-        GROUND_UP_NEXT, OVERFLOW_PRIMARY_BOX_FAIL)
+        GROUND_UP_NEXT, BypassReason.SEAT_CAP)
 
 
 def test_a_large_ground_up_file_the_primary_can_take_still_goes_to_the_primary(choose):
@@ -76,7 +76,7 @@ def test_a_large_ground_up_file_the_primary_can_take_still_goes_to_the_primary(c
 
 def test_the_minimum_is_inclusive_so_exactly_500000_at_cap_also_cascades(choose):
     assert choose(_ground_up(500_000), [PRIMARY, GROUND_UP_NEXT], at_cap=True) == (
-        GROUND_UP_NEXT, OVERFLOW_PRIMARY_AT_CAP)
+        GROUND_UP_NEXT, BypassReason.SEAT_CAP)
 
 
 def test_with_no_ground_up_lender_left_the_file_is_held(choose):

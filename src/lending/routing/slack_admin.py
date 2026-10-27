@@ -393,8 +393,37 @@ def _form_errors(exc: Exception, values: dict) -> dict[str, str]:
     return {block: str(exc)[:250]}
 
 
+# Changes that can let a lender take a file it could not before (Q31, Oct 23: "auto re-check held files").
+_WIDENING_ACTIONS = frozenset({"add_box", "replace_boxes", "resume", "seat_cap", "ground_up_min", "takes_ground_up",
+                               "make_primary"})
+REOPEN_LIMIT = 200
+
+
 def apply_change(values: dict, db: Session) -> str:
-    """Apply one submitted form. Returns the audit sentence; raises ``ValueError``/``RoutingError`` with a clean message."""
+    """Apply one submitted form, then send no-match holds back to the router when the change can widen eligibility.
+
+    Returns the audit sentence; raises ``ValueError``/``RoutingError`` with a clean message.
+    """
+    summary = _apply_change(values, db)
+    action = _value(values, "action_b")
+    signed = action == "agreement" and _value(values, "value_b").strip().lower() == "signed"
+    if action not in _WIDENING_ACTIONS and not signed:
+        return summary
+    db.commit()  # the lender change stands on its own: a failed re-route below must never undo it
+    from src.lending.routing.router import NO_LENDER_HOLD_REASONS, reopen_held
+
+    try:
+        count = sum(reopen_held(db, reason, REOPEN_LIMIT) for reason in NO_LENDER_HOLD_REASONS)
+    except Exception as exc:  # class only: SQL errors can embed bound values
+        db.rollback()
+        logger.error("[routing-slack] re-routing held files after a lender change failed: %s", type(exc).__name__)
+        return summary + "; held files were not re-routed (use 'Re-route every file held with no lender match')"
+    if count:
+        summary += f"; {count} held file(s) sent back to the router (routed within 5 minutes)"
+    return summary
+
+
+def _apply_change(values: dict, db: Session) -> str:
     problems = collect_errors(values, db)
     if problems:
         raise FormErrors(problems)
@@ -435,9 +464,9 @@ def apply_change(values: dict, db: Session) -> str:
             lender_service.DeclineReasonIn(code=value.strip(), label=_value(values, "label_b")), db)
         return f"{'added' if reason['created'] else 'updated'} decline reason *{reason['code']}* ({_value(values, 'label_b')})"
     if action == "reopen_held":
-        from src.lending.routing.router import reopen_held
+        from src.lending.routing.router import NO_LENDER_HOLD_REASONS, reopen_held
 
-        count = reopen_held(db, "no_match", 200)
+        count = sum(reopen_held(db, reason, 200) for reason in NO_LENDER_HOLD_REASONS)
         return f"sent {count} held file(s) back to the router; the routing sweep routes them within 5 minutes"
     if action == "replace_boxes":
         old_boxes = _box_ids(db, lender["id"])

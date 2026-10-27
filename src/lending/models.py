@@ -843,7 +843,8 @@ class LendingFileRouting(LendingBase):
 
     ``lenders_tried``: ordered list of lender IDs already offered the file (so
     the decline cascade can skip them on the next pass).
-    ``hold_reason``: 'no_match' or 'exhausted'.
+    ``hold_reason``: 'no_match', 'out_of_footprint' (no signed lender takes the state), 'exhausted', 'suppressed'
+    or 'consumer_homestead_excluded'.
     """
 
     __tablename__ = "file_routing"
@@ -894,6 +895,7 @@ class LendingFileRoutingEvent(LendingBase):
     actor: Mapped[str] = mapped_column(String(100), nullable=False, default="system", server_default=text("'system'"))
     slack_ts: Mapped[Optional[str]] = mapped_column(String(40))
     slack_posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    metadata_: Mapped[Optional[dict]] = mapped_column("metadata", JSONB)  # overflow + primary_bypass_reason (1.2.1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 
     __table_args__ = (
@@ -1145,6 +1147,7 @@ class LendingLoanFile(LendingBase):
     completed_projects: Mapped[Optional[int]] = mapped_column(Integer)
     credit_band: Mapped[Optional[str]] = mapped_column(String(20))
     timeline: Mapped[Optional[str]] = mapped_column(String(40))
+    occupancy: Mapped[str] = mapped_column(String(20), nullable=False, default="unknown", server_default=text("'unknown'"))  # config.lending_occupancy
     notes: Mapped[Optional[str]] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="received", server_default=text("'received'"))
     status_reason: Mapped[Optional[str]] = mapped_column(String(200))

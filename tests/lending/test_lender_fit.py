@@ -15,6 +15,7 @@ Q1–Q5 open items are noted inline where they affect expected values.
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
 
 import pytest
@@ -213,6 +214,7 @@ def test_s2_experienced_builder_qualifies_for_construction_lender() -> None:
     )
     assert construction_miss is not None
     assert any("LTC" in r for r in construction_miss.reasons)
+    assert any("Requested: 85.7%, Max: 85%" in r for r in construction_miss.reasons)
 
 
 def test_s2_experienced_builder_within_ltc_qualifies() -> None:
@@ -710,6 +712,51 @@ def test_cost_unknown_lender_sorted_last() -> None:
     assert len(result.fitting) == 2
     assert result.fitting[0].lender_key == "with_cost"
     assert result.fitting[1].lender_key == "no_cost"
+
+
+def _same_cost_lender(key: str) -> LenderRules:
+    return LenderRules(
+        key=key, name=key, verified=True,
+        loan_types=frozenset({LoanType.FIX_AND_FLIP}),
+        approved_states=frozenset({"FL"}),
+        origination_points=Decimal("0.02"),
+        rate_spread=Decimal("0.10"),
+        hold_months=12,
+    )
+
+
+def test_equal_costs_are_ordered_by_lenders_priority() -> None:
+    """Chunk 1 Addendum 1.2.3: a cost tie goes to the lower /lenders priority; no R-1 row sorts after."""
+    profile = BorrowerProfile(credit_band_min_fico=640, state="FL")
+    request = LoanRequest(loan_type=LoanType.FIX_AND_FLIP, loan_amount=Decimal("200_000"), state="FL")
+    matrix = (_same_cost_lender("lender_c"), _same_cost_lender("lender_none"), _same_cost_lender("lender_a"))
+
+    result = evaluate_lender_fit(profile, request, matrix=matrix, priorities={"lender_a": 2, "lender_c": 5})
+
+    assert [f.lender_key for f in result.fitting] == ["lender_a", "lender_c", "lender_none"]
+
+
+def test_no_cost_tie_never_reads_priorities(monkeypatch) -> None:
+    from src.lending import lender_fit
+
+    monkeypatch.setattr(lender_fit, "routing_priorities", lambda: pytest.fail("priorities read without a tie"))
+    profile = BorrowerProfile(credit_band_min_fico=640, state="FL")
+    request = LoanRequest(loan_type=LoanType.FIX_AND_FLIP, loan_amount=Decimal("200_000"), state="FL")
+    cheaper = replace(_same_cost_lender("cheaper"), origination_points=Decimal("0.01"))
+    result = evaluate_lender_fit(profile, request, matrix=(_same_cost_lender("dearer"), cheaper))
+    assert [f.lender_key for f in result.fitting] == ["cheaper", "dearer"]
+
+
+@pytest.mark.parametrize("figures, expected", [
+    ({"purchase_price": Decimal("200_000"), "rehab_budget": Decimal("50_000"), "arv": Decimal("400_000")}, "checked"),
+    ({"purchase_price": Decimal("200_000"), "rehab_budget": Decimal("50_000")}, "pending_call_facts"),
+    ({"arv": Decimal("400_000")}, "pending_call_facts"),
+])
+def test_leverage_status_says_when_figures_wait_for_the_call(figures, expected) -> None:
+    """Chunk 1 Addendum 1.2.4: no purchase price / ARV (raw LendingFlow) -> PENDING_CALL_FACTS."""
+    profile = BorrowerProfile(credit_band_min_fico=640, state="FL")
+    request = LoanRequest(loan_type=LoanType.FIX_AND_FLIP, loan_amount=Decimal("150_000"), state="FL", **figures)
+    assert evaluate_lender_fit(profile, request, matrix=FIXTURE_MATRIX).leverage_status == expected
 
 
 # ---------------------------------------------------------------------------

@@ -48,7 +48,7 @@ from __future__ import annotations
 
 import logging
 from decimal import Decimal
-from typing import Optional
+from typing import Mapping, Optional
 
 from config.lender_matrix import (
     LenderRules,
@@ -60,6 +60,8 @@ from config.lending_enrichment import BACKFLIP_KEY_PREFIX
 from src.lending.contracts import (
     BorrowerProfile,
     DeclineReason,
+    LEVERAGE_CHECKED,
+    LEVERAGE_PENDING_CALL_FACTS,
     FieldStatus,
     LenderFit,
     LenderFitResult,
@@ -68,7 +70,8 @@ from src.lending.contracts import (
     LoanRequest,
     LoanType,
 )
-from src.lending.lender_rules_store import current_matrix
+from src.lending import leverage
+from src.lending.lender_rules_store import current_matrix, routing_priorities
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +98,7 @@ def evaluate_lender_fit(
     loan_request: LoanRequest,
     *,
     matrix: Optional[tuple[LenderRules, ...]] = None,
+    priorities: Optional[Mapping[str, int]] = None,
 ) -> LenderFitResult:
     """Evaluate all active lenders against the borrower + loan.
 
@@ -103,6 +107,8 @@ def evaluate_lender_fit(
         loan_request: Loan and property details.
         matrix: Lender rules to evaluate against.  Defaults to
             ``current_matrix()`` (the config, or the table when LENDING_RULES_FROM_DB is on); tests inject fixtures.
+        priorities: T-05 lender key -> R-1 ``/lenders`` priority, the tie-break between equal costs.  Defaults to
+            ``routing_priorities()``, read only when two fitting lenders cost the same.
 
     Returns:
         LenderFitResult with:
@@ -149,11 +155,14 @@ def evaluate_lender_fit(
                 subject_to_confirmation=not fully_confirmed(source),
             ))
 
-    # Backflip first, then lowest total_borrower_cost; unknown cost last.
+    # Backflip first, then lowest total_borrower_cost, equal costs by /lenders priority; unknown cost last.
+    if priorities is None:
+        priorities = routing_priorities() if _has_cost_tie(fitting) else {}
     fitting.sort(key=lambda f: (
         not f.lender_key.startswith(BACKFLIP_KEY_PREFIX),
         f.total_borrower_cost is None,
         f.total_borrower_cost or 0,
+        priorities.get(f.lender_key, _NO_PRIORITY),
     ))
 
     all_confirmed = bool(matrix) and all(fully_confirmed(r) for r in matrix)
@@ -165,6 +174,7 @@ def evaluate_lender_fit(
         non_fitting=non_fitting,
         missing_fields=sorted(all_missing),
         lender_fit_score=fit_score,
+        leverage_status=_leverage_status(loan_request),
     )
 
     logger.info(
@@ -270,12 +280,12 @@ def _check_rules(
             unknowns.append(
                 f"ARV unknown — cannot verify LTV ≤ {rules.max_ltv:.0%} (capture on call)"
             )
-        elif request.arv > 0:
-            ltv = request.loan_amount / request.arv
-            if ltv > rules.max_ltv:
+        else:
+            deal_ltv = leverage.ltv(request.loan_amount, request.arv)
+            if leverage.over_cap(deal_ltv, rules.max_ltv):
                 declines.append((
-                    f"LTV {ltv:.1%} exceeds {rules.max_ltv:.0%} ARV cap "
-                    f"(loan ${request.loan_amount:,.0f} / ARV ${request.arv:,.0f})"
+                    f"LTV over the ARV cap ({leverage.requested_vs_max(deal_ltv, rules.max_ltv)}; "
+                    f"loan ${request.loan_amount:,.0f} / ARV ${request.arv:,.0f})"
                     f"{_unconfirmed(source, 'max_ltv')}",
                     DeclineReason.LTV_OVER_MAX,
                 ))
@@ -291,14 +301,14 @@ def _check_rules(
                 missing.append("rehab_budget")
             unknowns.append("LTC cannot be calculated — purchase price or rehab budget missing (capture on call)")
         else:
-            total_cost = purchase + rehab
-            if total_cost > 0:
-                ltc = request.loan_amount / total_cost
-                if ltc > rules.max_ltc:
-                    declines.append((
-                        f"LTC {ltc:.1%} exceeds {rules.max_ltc:.0%} limit{_unconfirmed(source, 'max_ltc')}",
-                        DeclineReason.LTC_OVER_MAX,
-                    ))
+            deal_ltc = leverage.ltc(request.loan_amount, purchase, rehab)
+            if leverage.over_cap(deal_ltc, rules.max_ltc):
+                declines.append((
+                    f"LTC over the limit ({leverage.requested_vs_max(deal_ltc, rules.max_ltc)}; "
+                    f"loan ${request.loan_amount:,.0f} / cost ${purchase + rehab:,.0f})"
+                    f"{_unconfirmed(source, 'max_ltc')}",
+                    DeclineReason.LTC_OVER_MAX,
+                ))
 
     # 6b. Property type
     if rules.allowed_property_types:
@@ -384,6 +394,21 @@ def _check_rules(
 # ---------------------------------------------------------------------------
 # Cost and score helpers
 # ---------------------------------------------------------------------------
+
+_NO_PRIORITY = 1 << 31  # a lender without an R-1 row sorts after every prioritised one
+
+
+def _has_cost_tie(fitting: list[LenderFit]) -> bool:
+    costs = [f.total_borrower_cost for f in fitting if f.total_borrower_cost is not None]
+    return len(costs) != len(set(costs))
+
+
+def _leverage_status(request: LoanRequest) -> str:
+    """``pending_call_facts`` when the file lacks a figure the LTV/LTC checks need (e.g. raw LendingFlow intake)."""
+    if request.arv is None or request.purchase_price is None or request.rehab_budget is None:
+        return LEVERAGE_PENDING_CALL_FACTS
+    return LEVERAGE_CHECKED
+
 
 def _total_borrower_cost(rules: LenderRules, loan_amount: Decimal) -> Optional[Decimal]:
     """Provisional total borrower cost over the assumed hold period.
