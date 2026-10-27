@@ -54,7 +54,7 @@ def test_a_same_slot_redelivery_after_a_cancel_does_not_revive_the_task(db):
 def test_a_new_slot_after_a_cancel_does_revive_it(db):
     book(db)
     cancel_by_provider_event(db, "appt-1", "booking_cancelled")
-    assert book(db, slot=SLOT_B).inserted == 3
+    assert book(db, slot=SLOT_B).inserted == 4
     assert db.execute(text("SELECT cancelled_at IS NULL FROM lending.confirmation_tasks")).scalar() is True
 
 
@@ -69,7 +69,7 @@ def test_a_rescheduled_cancel_that_arrives_after_the_replan_spares_the_new_rows(
 
 def test_a_rescheduled_cancel_that_arrives_first_still_works_and_the_replan_follows(db):
     book(db)
-    assert cancel_by_provider_event(db, "appt-1", "booking_rescheduled", spare_replanned_seconds=120) == 3
+    assert cancel_by_provider_event(db, "appt-1", "booking_rescheduled", spare_replanned_seconds=120) == 4
     book(db, slot=SLOT_B)
     assert set(statuses(db).values()) == {"pending"}
 
@@ -77,10 +77,10 @@ def test_a_rescheduled_cancel_that_arrives_first_still_works_and_the_replan_foll
 def test_the_grace_window_expires_and_a_real_cancel_is_never_spared(db):
     book(db)
     book(db, slot=SLOT_B)
-    assert cancel_by_provider_event(db, "appt-1", "booking_cancelled") == 3                  # no grace for a cancel
+    assert cancel_by_provider_event(db, "appt-1", "booking_cancelled") == 4                  # no grace for a cancel
     book(db, slot=datetime(2099, 10, 9, 15, 0, tzinfo=timezone.utc))
     db.execute(text("UPDATE lending.booking_messages SET replanned_at = now() - interval '10 minutes'"))
-    assert cancel_by_provider_event(db, "appt-1", "booking_rescheduled", spare_replanned_seconds=120) == 3
+    assert cancel_by_provider_event(db, "appt-1", "booking_rescheduled", spare_replanned_seconds=120) == 4
 
 
 @pytest.fixture
@@ -105,7 +105,7 @@ def test_through_the_webhook_a_late_rescheduled_event_is_spared_but_a_cancelled_
     book(db, slot=SLOT_B)
     assert appointment(client, "rescheduled").json() == {"status": "rescheduled", "cancelled": 0}
     assert set(statuses(db).values()) == {"pending"}
-    assert appointment(client, "cancelled").json() == {"status": "cancelled", "cancelled": 3}
+    assert appointment(client, "cancelled").json() == {"status": "cancelled", "cancelled": 4}
 
 
 # 3. a booking skipped for want of a phone or email can be completed
@@ -114,7 +114,7 @@ def test_a_corrected_redelivery_with_a_phone_completes_a_skipped_booking_and_rec
     assert first.skip_reason == "no_person" and set(statuses(db).values()) == {"skipped"}
     assert has_text_consent(db, PHONE) is False
     second = book(db)
-    assert second.skip_reason is None and second.inserted == 3
+    assert second.skip_reason is None and second.inserted == 4
     assert set(statuses(db).values()) == {"pending"}
     assert db.execute(text("SELECT DISTINCT contact_phone FROM lending.booking_messages")).scalar() == PHONE
     assert has_text_consent(db, PHONE) is True

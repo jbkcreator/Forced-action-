@@ -69,7 +69,7 @@ def test_a_failed_check_cancels_the_reminders_and_queues_one_message(db):
     mark_confirmation_sent(db)
     assert handle_booking_gate_failed(db, "r1", now=BOOKED) == "queued"
     assert statuses(db) == {"confirmation": "sent", "night_before": "cancelled", "ninety_min": "cancelled",
-                            "gate_fail": "pending"}
+                            "ten_min": "cancelled", "gate_fail": "pending"}
     assert db.execute(text("SELECT cancelled_at IS NOT NULL FROM lending.confirmation_tasks")).scalar() is True
 
 
@@ -84,7 +84,8 @@ def test_an_unknown_booking_and_a_caller_booked_call_send_nothing(db):
     assert handle_booking_gate_failed(db, "nope", now=BOOKED) == "unknown_booking"
     book(db, ref="r2", booked_by="dana@heu.ai")
     assert handle_booking_gate_failed(db, "r2", now=BOOKED) == "not_ai_booked"
-    assert statuses(db, "r2") == {"confirmation": "pending", "night_before": "pending", "ninety_min": "pending"}
+    assert statuses(db, "r2") == {"confirmation": "pending", "night_before": "pending", "ninety_min": "pending",
+                                "ten_min": "pending"}
 
 
 def test_a_consented_contact_is_texted_the_approved_wording(db):

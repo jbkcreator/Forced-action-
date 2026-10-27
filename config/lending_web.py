@@ -8,12 +8,16 @@ Nobody is named in the copy: the sender is "Next Deal Lending" (client, Q18).
 """
 from __future__ import annotations
 
-# Box 1: text messages only. The call consent is its own box (CALL_CONSENT_TEXT); the GHL 30896 rejection
-# was a single box covering calls and texts. Wording follows the 16 Oct resubmission draft without the
-# "(operated by HEU AI LLC)" clause, which the client has not yet approved: add it here and on the page together.
+# Box 1: text messages only, named "transactional". GHL's opt-in review fails a consent text that states no message
+# type ("Message type disclosure": promotional, transactional, alerts), and the client's own wording for this box is
+# "text-only transactional consent". The call consent is its own box (CALL_CONSENT_TEXT): the GHL 30896 rejection was
+# one box covering calls and texts. Both consent boxes name the registered legal entity, "HEU AI LLC": GHL's opt-in
+# review ("Business name displayed in consent text") asks for it, and the 16 Oct resubmission wording Josh approved
+# carried "(operated by HEU AI LLC)". Change a label here and on the page together.
 SMS_CONSENT_TEXT = (
-    "I agree to receive text messages from Next Deal Lending at the number above about my inquiry, "
-    "including replies, missed-call follow-ups, and call confirmations and reminders. "
+    "I agree to receive transactional text messages from Next Deal Lending (operated by HEU AI LLC) "
+    "at the number above about my inquiry, including replies, missed-call follow-ups, "
+    "and call confirmations and reminders. "
     "Message frequency varies. Message and data rates may apply. "
     "Reply STOP to opt out, HELP for help. Consent is not a condition of any financing."
 )
@@ -22,7 +26,7 @@ SMS_CONSENT_TEXT = (
 # separate call-only box but supplied no wording of their own. A page that shows other wording is stored verbatim and
 # flagged as not matching, so change this and the page together.
 CALL_CONSENT_TEXT = (
-    "I agree that Next Deal Lending may call me at the number above about my inquiry, "
+    "I agree that Next Deal Lending (operated by HEU AI LLC) may call me at the number above about my inquiry, "
     "including with automated technology. Calls are recorded. "
     "Consent is not a condition of any financing. "
     "To stop calls, tell us on any call or email optout@nextdeallending.com."

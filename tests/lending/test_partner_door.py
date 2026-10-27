@@ -41,7 +41,8 @@ SQLITE_DDL = (
         borrower_first_name TEXT NOT NULL, borrower_last_name TEXT NOT NULL, borrower_phone TEXT, borrower_email TEXT,
         product TEXT NOT NULL, loan_amount INTEGER NOT NULL, property_address TEXT, property_city TEXT,
         property_state TEXT NOT NULL, property_zip TEXT, purchase_price INTEGER, rehab_budget INTEGER, arv INTEGER,
-        completed_projects INTEGER, credit_band TEXT, timeline TEXT, notes TEXT, status TEXT NOT NULL DEFAULT 'received'
+        completed_projects INTEGER, credit_band TEXT, timeline TEXT, occupancy TEXT NOT NULL DEFAULT 'unknown',
+        notes TEXT, status TEXT NOT NULL DEFAULT 'received'
         CHECK (status IN ('received','held','routed','declined','approved','funded')), status_reason TEXT,
         status_at TIMESTAMP NOT NULL, lender_fit TEXT, prequal_pdf_path TEXT, funded_at TIMESTAMP,
         notice_status TEXT, notice_emailed_at TIMESTAMP, notice_texted_at TIMESTAMP, notice_failed_at TIMESTAMP,
@@ -50,7 +51,8 @@ SQLITE_DDL = (
         partner_id INTEGER NOT NULL, consent_checked BOOLEAN NOT NULL, consent_text TEXT NOT NULL,
         consented_at TIMESTAMP NOT NULL, ip_address TEXT, page_url TEXT, user_agent TEXT,
         partner_confirmed_at TIMESTAMP, partner_emailed_at TIMESTAMP, partner_texted_at TIMESTAMP,
-        josh_notified_at TIMESTAMP, prequal_sent_at TIMESTAMP, confirm_failed_at TIMESTAMP, created_at TIMESTAMP)""",
+        josh_notified_at TIMESTAMP, prequal_sent_at TIMESTAMP, confirm_failed_at TIMESTAMP, created_at TIMESTAMP,
+        prequal_withheld_at TIMESTAMP, borrower_notified BOOLEAN NOT NULL DEFAULT 0, borrower_consent_at TIMESTAMP)""",
     """CREATE TABLE lending.partner_file_uploads (id INTEGER PRIMARY KEY AUTOINCREMENT, file_id INTEGER NOT NULL,
         original_name TEXT NOT NULL, stored_path TEXT NOT NULL, content_type TEXT NOT NULL, size_bytes INTEGER NOT NULL,
         created_at TIMESTAMP)""",
@@ -706,6 +708,25 @@ def test_letter_with_unknown_outcome_is_never_sent_twice(engine, session_factory
     assert recorder.letters == [file_id] and _submission(engine)["prequal_sent_at"] is not None
 
 
+def test_letters_off_withholds_the_letter_for_good(engine, session_factory, tmp_path) -> None:
+    _, token = _partner(session_factory)
+    file_id = _submit(session_factory, token)
+    recorder = Recorder()
+    services = dataclasses.replace(_letter_services(recorder, tmp_path), letters_enabled=False)
+    partner_pipeline.process_new_file(file_id, services, session_factory)
+
+    row = _submission(engine)
+    assert recorder.letters == [] and row["prequal_sent_at"] is None and row["prequal_withheld_at"]
+    assert recorder.emails and recorder.slack, "the partner confirmation and Josh's note still go out"
+    assert not row["borrower_notified"] and row["borrower_consent_at"] is None
+
+    later = datetime.now(timezone.utc) + timedelta(minutes=30)
+    with session_factory() as db:  # turning letters on later never backfills a withheld one
+        assert file_id not in partner_pipeline.unnotified_file_ids(db, 10, 24, 20, now=later, letters=True)
+    partner_pipeline.send_pending_notices(file_id, _letter_services(recorder, tmp_path), session_factory)
+    assert recorder.letters == []
+
+
 class _FakeGhl:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, dict]] = []
@@ -902,3 +923,11 @@ def test_status_notice_with_unknown_outcome_is_not_resent(engine, session_factor
     partner_pipeline.retry_status_notice(file_id, dataclasses.replace(_services(recorder, tmp_path), email=flaky_email),
                                          session_factory)
     assert len(attempts) == (2 if retried else 1)
+
+
+@pytest.mark.parametrize("answer,expected", [
+    ("yes", "owner_occupied"), ("no", "investment"), ("", "unknown"), ("maybe", "unknown")])
+def test_the_occupancy_answer_is_stored_and_never_blocks_the_form(answer, expected):
+    data = partners.SubmissionInput.model_validate(
+        {k: v for k, v in {**FORM, "occupancy": answer}.items() if k != "consent"})
+    assert data.occupancy == expected

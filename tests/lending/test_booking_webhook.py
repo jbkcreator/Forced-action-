@@ -50,13 +50,13 @@ def post(client, body, secret=SECRET):
 
 def test_a_cancelled_appointment_cancels_all_pending_messages(client, db):
     response = post(client, {"appointmentId": "appt-1", "appointmentStatus": "cancelled"})
-    assert response.status_code == 200 and response.json() == {"status": "cancelled", "cancelled": 3}
+    assert response.status_code == 200 and response.json() == {"status": "cancelled", "cancelled": 4}
     assert set(statuses(db).values()) == {"cancelled"}
 
 
 def test_a_rescheduled_appointment_cancels_the_old_messages(client, db):
     response = post(client, {"appointment": {"id": "appt-1", "appointmentStatus": "rescheduled"}})
-    assert response.json()["cancelled"] == 3
+    assert response.json()["cancelled"] == 4
     assert db.execute(text("SELECT DISTINCT cancel_reason FROM lending.booking_messages")).scalar() == "booking_rescheduled"
 
 
@@ -88,8 +88,8 @@ def confirmed(client, secret=SECRET, **extra):
 
 def test_a_confirmed_booking_schedules_the_messages_and_the_task(client, db):
     response = confirmed(client)
-    assert response.status_code == 200 and response.json() == {"status": "scheduled", "inserted": 3, "skip_reason": None}
-    assert db.execute(text("SELECT count(*) FROM lending.booking_messages WHERE booking_ref = 'ref-new'")).scalar() == 3
+    assert response.status_code == 200 and response.json() == {"status": "scheduled", "inserted": 4, "skip_reason": None}
+    assert db.execute(text("SELECT count(*) FROM lending.booking_messages WHERE booking_ref = 'ref-new'")).scalar() == 4
     assert db.execute(text("SELECT assignee FROM lending.confirmation_tasks WHERE booking_ref = 'ref-new'")).scalar() == "dana@heu.ai"
     assert db.execute(text("SELECT count(*) FROM lending.text_consents WHERE source = 'on_call_yes'")).scalar() == 1
 
@@ -97,7 +97,7 @@ def test_a_confirmed_booking_schedules_the_messages_and_the_task(client, db):
 def test_a_redelivered_booking_is_a_duplicate(client, db):
     confirmed(client)
     assert confirmed(client).json()["status"] == "duplicate"
-    assert db.execute(text("SELECT count(*) FROM lending.booking_messages WHERE booking_ref = 'ref-new'")).scalar() == 3
+    assert db.execute(text("SELECT count(*) FROM lending.booking_messages WHERE booking_ref = 'ref-new'")).scalar() == 4
 
 
 def test_a_booking_with_no_contact_method_is_recorded_as_skipped(client, db):

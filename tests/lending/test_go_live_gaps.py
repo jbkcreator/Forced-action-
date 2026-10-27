@@ -51,8 +51,8 @@ def rows(db):
 
 def test_an_appointment_created_by_hand_schedules_the_messages_and_the_task(client, db):
     response = appointment(client)
-    assert response.json() == {"status": "scheduled", "inserted": 3, "skip_reason": None}
-    assert {(r[0], r[1]) for r in rows(db)} == {("ghl-appt-9", k) for k in ("confirmation", "night_before", "ninety_min")}
+    assert response.json() == {"status": "scheduled", "inserted": 4, "skip_reason": None}
+    assert {(r[0], r[1]) for r in rows(db)} == {("ghl-appt-9", k) for k in ("confirmation", "night_before", "ninety_min", "ten_min")}
     assert {r[3] for r in rows(db)} == {SLOT}
     assert db.execute(text("SELECT assignee FROM lending.confirmation_tasks")).scalar() == "jbkantor@gmail.com"
 
@@ -65,7 +65,7 @@ def test_a_ghl_appointment_never_grants_text_consent(client, db):
 def test_a_redelivered_appointment_event_changes_nothing(client, db):
     appointment(client)
     assert appointment(client, status="new").json()["status"] == "duplicate"
-    assert len(rows(db)) == 3
+    assert len(rows(db)) == 4
 
 
 def test_an_appointment_the_booking_flow_already_scheduled_is_not_scheduled_twice(client, db):
@@ -98,7 +98,7 @@ def test_an_appointment_with_no_contact_method_is_recorded_as_skipped(client, db
 
 def test_cancelling_the_appointment_still_cancels_what_the_fallback_scheduled(client, db):
     appointment(client)
-    assert appointment(client, status="cancelled").json() == {"status": "cancelled", "cancelled": 3}
+    assert appointment(client, status="cancelled").json() == {"status": "cancelled", "cancelled": 4}
 
 
 @pytest.mark.parametrize("message", ["Can we reschedule?", "I can't make it Thursday", "cant make it, another time?",

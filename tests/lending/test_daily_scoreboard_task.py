@@ -14,7 +14,7 @@ SEVEN_PM_UTC = datetime(2026, 10, 6, 23, 20, tzinfo=timezone.utc)  # 19:20 ET on
 NINE_AM_UTC = datetime(2026, 10, 6, 13, 0, tzinfo=timezone.utc)  # 09:00 ET: before the first hourly post
 TEN_AM_UTC = datetime(2026, 10, 6, 14, 0, tzinfo=timezone.utc)  # 10:00 ET
 SEVEN_PM_ET_ON_THE_HOUR = datetime(2026, 10, 6, 23, 0, tzinfo=timezone.utc)  # 19:00 ET
-EIGHT_PM_UTC_PLUS = datetime(2026, 10, 7, 0, 0, tzinfo=timezone.utc)  # 20:00 ET on Oct 6: after the last hourly post
+EIGHT_PM_UTC_PLUS = datetime(2026, 10, 7, 0, 0, tzinfo=timezone.utc)  # 20:00 ET on Oct 6: after the last (19:00) hourly post
 WINTER_TEN_AM_UTC = datetime(2026, 12, 1, 15, 0, tzinfo=timezone.utc)  # 10:00 ET in standard time (UTC-5)
 
 
@@ -58,16 +58,16 @@ def test_at_7_20pm_et_it_posts_once(wired):
     assert posted[0]["blocks"] == [{"type": "divider"}]
 
 
-@pytest.mark.parametrize("now", [TEN_AM_UTC, NOON_ET, WINTER_TEN_AM_UTC])
+@pytest.mark.parametrize("now", [TEN_AM_UTC, NOON_ET, WINTER_TEN_AM_UTC, SEVEN_PM_ET_ON_THE_HOUR])
 def test_hourly_mode_posts_the_day_so_far_inside_the_hourly_window(wired, now):
     posted, _ = wired
     assert task.main(["--hourly"], now=now) == 0
     assert len(posted) == 1 and posted[0]["text"].endswith(" hourly")
 
 
-@pytest.mark.parametrize("now", [NINE_AM_UTC, SEVEN_PM_ET_ON_THE_HOUR, EIGHT_PM_UTC_PLUS])
+@pytest.mark.parametrize("now", [NINE_AM_UTC, EIGHT_PM_UTC_PLUS])
 def test_hourly_mode_is_silent_outside_the_hourly_window(wired, now):
-    """7pm is left to the 7:20pm closing board, so the channel does not get two boards 20 minutes apart."""
+    """The hourly window is 10:00 through 19:00 ET (client Q48); the 7:20pm closing board follows the 7:00pm one."""
     posted, _ = wired
     assert task.main(["--hourly"], now=now) == 0 and posted == []
 

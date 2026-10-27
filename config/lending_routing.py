@@ -16,9 +16,11 @@ Q2  One-click decline records reason 'other' by default (Josh's enum has no
 Q3  'held' is a 5th action beyond the spec's routed/declined/approved/funded
     (used for the hold-queue and exhausted terminal states).  Josh to confirm
     what "all four events" in acceptance test 3 means.
-Q5  Rule gaps (ground-up >= $500k outside primary footprint, BRIDGE, "other")
-    fall through to rule 6 (hold queue).  Matches the spec's "never silently
-    dropped".
+Q5  Ground-up >= $500k the primary cannot take (seat cap, box, leverage or
+    outside its states) cascades to the next signed ground-up lender and holds
+    only when none qualifies (Chunk 1 Addendum 1.2.1, Oct 25); the event's
+    metadata records primary_bypass_reason.  BRIDGE and "other" still fall
+    through to rule 6 (hold queue), the spec's "never silently dropped".
 Q6  Loan amount for threshold checks uses loan_amount (= band minimum from
     LendingFlow).  Josh to confirm.
 Q7  Lender rules are edited from Slack (Josh's R1.4: a Slack form, not a web screen); there is no HTTP admin API.

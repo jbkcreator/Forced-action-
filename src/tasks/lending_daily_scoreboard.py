@@ -1,7 +1,7 @@
 """Post the lending scoreboard to Slack.
 
 Closing board: 7:20pm ET (the dialer stops at 7:15pm). Cron fires at 23:20 and 00:20 UTC; only the one that is 19:xx ET acts.
-Hourly board (``--hourly``): the day so far, at 10:00 through 18:00 ET (the closing board is the 7pm post). Cron fires
+Hourly board (``--hourly``): the day so far, at 10:00 through 19:00 ET (the 7:20pm closing board follows the 7:00pm one). Cron fires
 every UTC hour; only the hours in HOURLY_POST_HOURS_ET act, so daylight saving needs no second line. An hourly board
 with no dials yet (a weekend, a day off) is not posted."""
 from __future__ import annotations

@@ -69,8 +69,8 @@ def test_the_appointment_webhook_accepts_ghls_default_nested_calendar_body(clien
             "calendar": {"appointmentId": "appt-nested", "appoinmentStatus": "confirmed",
                          "startTime": "2099-10-07T10:00:00-04:00"}}
     response = client.post("/webhooks/lending/ghl-appointment", headers={"X-Webhook-Secret": SECRET}, json=body)
-    assert response.json() == {"status": "scheduled", "inserted": 3, "skip_reason": None}
+    assert response.json() == {"status": "scheduled", "inserted": 4, "skip_reason": None}
     row = db.execute(text("SELECT first_name, contact_phone, slot_start_utc FROM lending.booking_messages LIMIT 1")).one()
     assert row == ("Marcus", "+18135550147", datetime(2099, 10, 7, 14, 0, tzinfo=timezone.utc))
     cancel = {"calendar": {"appointmentId": "appt-nested", "status": "cancelled"}}
-    assert client.post("/webhooks/lending/ghl-appointment", headers={"X-Webhook-Secret": SECRET}, json=cancel).json()["cancelled"] == 3
+    assert client.post("/webhooks/lending/ghl-appointment", headers={"X-Webhook-Secret": SECRET}, json=cancel).json()["cancelled"] == 4

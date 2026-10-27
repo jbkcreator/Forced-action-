@@ -452,6 +452,12 @@ class TestLendingFlowLeadSource:
         assert out.status == "generated" and bytes(_row(soft_db)["pdf"]) == b"%PDF-test"
 
 
+DISCLAIMER = ("This is a non-binding estimate for informational purposes only. It is not a commitment to lend, "
+              "a loan approval, or an offer of specific terms. All figures are subject to lender confirmation. "
+              "Final eligibility and terms depend on a full review of your file.")
+FOOTER = "Next Deal Lending &middot; Tampa, Florida &middot; (656) 221-1100 &middot; hello@nextdeallending.com"
+
+
 class TestTemplate:
     WATERMARK = "NON-BINDING SOFT APPROVAL ESTIMATE — FOR INFORMATIONAL PURPOSES ONLY"
 
@@ -472,20 +478,22 @@ class TestTemplate:
         html = render_html("soft_approval.html", CONTEXT, watermark=self.WATERMARK)
         assert "reply to this email" not in html
 
+    def test_disclaimer_is_the_directive_wording_whether_or_not_flagged(self):
+        # Chunk 1 Addendum 1.1.3: one verbatim disclaimer, so "subject to lender confirmation" always prints.
+        for flagged in (True, False):
+            html = render_html("soft_approval.html", {**CONTEXT, "subject_to_confirmation": flagged}, watermark=self.WATERMARK)
+            assert " ".join(DISCLAIMER.split()) in " ".join(html.split())
+            assert "lender approval." not in html and "provided on the call" not in html
+
     def test_the_pdf_is_signed_next_deal_lending_with_one_callback_number(self):
         # The signer and callback number come from the shared base.html (config/lending_prequal.py): the client wants
         # "Next Deal Lending" and (656) 221-1100 on every borrower-facing PDF, and no personal name.
         html = render_html("soft_approval.html", CONTEXT, watermark=self.WATERMARK)
         visible = re.sub(r"<style>.*?</style>|<[^>]+>", " ", html, flags=re.S)
         assert "Next Deal Lending" in visible and "(656) 221-1100" in visible
+        assert FOOTER in re.sub(r"<[^>]+>", "", html)
         for banned in ("Josh", "Kantor", "(727)", "436-9951"):
             assert banned not in visible
-
-    def test_the_subject_to_confirmation_line_prints_only_when_flagged(self):
-        flagged = render_html("soft_approval.html", {**CONTEXT, "subject_to_confirmation": True}, watermark=self.WATERMARK)
-        plain = render_html("soft_approval.html", {**CONTEXT, "subject_to_confirmation": False}, watermark=self.WATERMARK)
-        assert "subject to lender confirmation" in flagged and "subject to lender confirmation" not in plain
-        assert "subject to lender confirmation" not in render_html("soft_approval.html", CONTEXT, watermark=self.WATERMARK)
 
     def test_omits_max_price_when_there_is_none(self):
         html = render_html("soft_approval.html", {**CONTEXT, "max_purchase_price": ""}, watermark=self.WATERMARK)

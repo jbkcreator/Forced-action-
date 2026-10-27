@@ -57,7 +57,8 @@ _NEEDS_LENDER = {a for a, _ in ACTIONS} - {"add_lender", "reopen_held", "add_rea
 # A change that can let a held file match: the held no-match files are then re-run on their own.
 _REOPEN_LIMIT = 1000
 _VIEW_CHARS = 2700
-_RULE_CHANGES = frozenset({"resume", "add_box", "replace_boxes", "ground_up_min", "takes_ground_up", "seat_cap"})
+_RULE_CHANGES = frozenset({"resume", "add_box", "replace_boxes", "ground_up_min", "takes_ground_up", "seat_cap",
+                           "make_primary"})
 _BOX_FIELDS = ("types_b", "states_b", "min_b", "max_b", "credit_b")
 
 
@@ -402,7 +403,7 @@ def _form_errors(exc: Exception, values: dict) -> dict[str, str]:
 
 
 def _may_unblock_held_files(values: dict, db: Session) -> bool:
-    """A lender was signed, or its rules or status changed, and it can now receive files (signed and active)."""
+    """A lender was signed, or its rules, seat cap or primary status changed, and it can now receive files (signed and active)."""
     action = _value(values, "action_b")
     changed = _value(values, "value_b") == "signed" if action == "agreement" else action in _RULE_CHANGES
     lender = _value(values, "lender_b")
@@ -410,16 +411,18 @@ def _may_unblock_held_files(values: dict, db: Session) -> bool:
 
 
 def apply_change(values: dict, db: Session) -> str:
-    """Apply one submitted form, then send the held no-match files back to the router when the change lets a
-    lender receive files (the routing sweep routes them within 5 minutes). Returns the audit sentence."""
+    """Apply one submitted form, then send the files held for want of a lender (no match, or outside every
+    lender's states) back to the router when the change lets a lender receive files (the routing sweep routes
+    them within 5 minutes). Returns the audit sentence."""
     summary = _apply(values, db)
     if not _may_unblock_held_files(values, db):
         return summary
-    from src.lending.routing.router import reopen_held
+    from src.lending.routing.router import NO_LENDER_HOLD_REASONS, reopen_held
 
     try:
-        count = reopen_held(db, "no_match", _REOPEN_LIMIT)
+        count = sum(reopen_held(db, reason, _REOPEN_LIMIT) for reason in NO_LENDER_HOLD_REASONS)
     except Exception as exc:  # class only: the change itself is already saved
+        db.rollback()
         logger.error("[routing-slack] re-running held files failed: %s", type(exc).__name__)
         return f"{summary} (the held files could not be re-run: use Re-route)"
     return f"{summary}; {count} held file(s) sent back to the router and will route within 5 minutes" if count else summary
@@ -467,9 +470,9 @@ def _apply(values: dict, db: Session) -> str:
             lender_service.DeclineReasonIn(code=value.strip(), label=_value(values, "label_b")), db)
         return f"{'added' if reason['created'] else 'updated'} decline reason *{reason['code']}* ({_value(values, 'label_b')})"
     if action == "reopen_held":
-        from src.lending.routing.router import reopen_held
+        from src.lending.routing.router import NO_LENDER_HOLD_REASONS, reopen_held
 
-        count = reopen_held(db, "no_match", 200)
+        count = sum(reopen_held(db, reason, 200) for reason in NO_LENDER_HOLD_REASONS)
         return f"sent {count} held file(s) back to the router; the routing sweep routes them within 5 minutes"
     if action == "replace_boxes":
         old_boxes = _box_ids(db, lender["id"])

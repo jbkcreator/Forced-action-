@@ -16,7 +16,7 @@ BANNED = ("Josh", "Kantor", "(727)", "436-9951", "4369951")
 _REMINDER_TEXTS = {
     name: value for name, value in vars(lending_reminders).items()
     if name.isupper() and isinstance(value, str)
-    and name.startswith(("CONFIRMATION_", "NIGHT_BEFORE_", "NINETY_MIN_", "GATE_FAIL_", "EMAIL_"))
+    and name.startswith(("CONFIRMATION_", "NIGHT_BEFORE_", "NINETY_MIN_", "TEN_MIN_", "GATE_FAIL_", "EMAIL_"))
 }
 _SMS_TEXTS = {
     **{name: value for name, value in _REMINDER_TEXTS.items()
@@ -55,7 +55,8 @@ def test_the_sender_and_signer_are_the_business():
     assert lending_prequal.BORROWER_SIGNER == BRAND
     assert all(BRAND in subject for subject in (
         lending_reminders.EMAIL_SUBJECT_CONFIRMATION, lending_reminders.EMAIL_SUBJECT_NIGHT_BEFORE,
-        lending_reminders.EMAIL_SUBJECT_NINETY_MIN, lending_reminders.EMAIL_SUBJECT_GATE_FAIL))
+        lending_reminders.EMAIL_SUBJECT_NINETY_MIN, lending_reminders.EMAIL_SUBJECT_TEN_MIN,
+        lending_reminders.EMAIL_SUBJECT_GATE_FAIL))
 
 
 def test_one_callback_number_everywhere():
@@ -66,6 +67,8 @@ def test_the_two_consent_boxes_are_separate():
     sms, call = lending_web.SMS_CONSENT_TEXT, lending_web.CALL_CONSENT_TEXT
     assert BRAND in sms and BRAND in call
     assert "text messages" in sms and "may call me" not in sms  # the text box does not also grant calls
+    assert "transactional text messages" in sms  # GHL's opt-in review fails a consent text that names no message type
+    assert "(operated by HEU AI LLC)" in sms and "(operated by HEU AI LLC)" in call  # ...and one that omits the legal name
     assert "may call me" in call and "text message" not in call.lower()  # the call box does not also grant texts
     assert "To stop calls" in call and "optout@nextdeallending.com" in call  # a call box needs its own way to stop
     assert "STOP" in sms and "HELP" in sms and "Message and data rates may apply" in sms

@@ -95,10 +95,18 @@ class PipelineServices:
     upload_dir: str
     prequal_pct: int
     send_letter: Optional[LetterSender] = None  # None = GHL account not configured
+    letters_enabled: bool = True  # LENDING_PREQUAL_PDF_ENABLED; off = the letter is withheld for good (no backfill)
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def letters_enabled() -> bool:
+    """Partner pre-qual letters share LENDING_PREQUAL_PDF_ENABLED with T-07 (Q21: off at intake until real numbers)."""
+    from config.settings import get_settings
+
+    return get_settings().lending_prequal_pdf_enabled
 
 
 def live_services() -> PipelineServices:
@@ -140,6 +148,7 @@ def live_services() -> PipelineServices:
         send_letter=(lambda partner, file, pdf: letters.send_letter(
             partner.email, partner.name, _place(file["property_address"], file["borrower_last_name"]), file["id"], pdf))
         if letters else None,
+        letters_enabled=letters_enabled(),
     )
 
 
@@ -365,7 +374,7 @@ def _after_routing(file: dict[str, Any], partner: Optional[Partner], fit: Option
     file_id = file["id"]
     with session_factory() as db:
         flags = db.execute(text("SELECT josh_notified_at, partner_confirmed_at, partner_emailed_at, partner_texted_at, "
-                                "prequal_sent_at FROM lending.partner_submissions WHERE file_id = :id"),
+                                "prequal_sent_at, prequal_withheld_at FROM lending.partner_submissions WHERE file_id = :id"),
                            {"id": file_id}).mappings().first() or {}
         state = db.execute(text("SELECT status, status_reason FROM lending.loan_files WHERE id = :id"),
                            {"id": file_id}).first()
@@ -383,7 +392,11 @@ def _after_routing(file: dict[str, Any], partner: Optional[Partner], fit: Option
         sent = _deliver(services, partner, f"We received your file for {place}", body,
                         emailed=bool(flags.get("partner_emailed_at")), texted=bool(flags.get("partner_texted_at")))
         _record_confirmation(session_factory, file_id, sent)
-    if not flags.get("prequal_sent_at") and file.get("prequal_pdf_path") and services.send_letter is not None:
+    if flags.get("prequal_sent_at") or flags.get("prequal_withheld_at") or not file.get("prequal_pdf_path"):
+        return
+    if not services.letters_enabled:
+        _stamp(session_factory, file_id, "prequal_withheld_at")
+    elif services.send_letter is not None:
         _send_letter(services, file, partner, session_factory)
 
 
@@ -434,7 +447,7 @@ def send_pending_notices(file_id: int, services: Optional[PipelineServices] = No
 
 
 def _stamp(session_factory: Callable[[], Any], file_id: int, column: str) -> None:
-    if column not in {"josh_notified_at", "prequal_sent_at"}:
+    if column not in {"josh_notified_at", "prequal_sent_at", "prequal_withheld_at"}:
         raise ValueError(column)
     with session_factory() as db:
         db.execute(text(f"UPDATE lending.partner_submissions SET {column} = :now WHERE file_id = :id"),
@@ -631,6 +644,7 @@ def unnotified_file_ids(db, older_than_minutes: int, max_age_hours: int, limit: 
              "WHERE f.source = :source AND f.status <> 'received' "
              "AND (s.josh_notified_at IS NULL OR s.partner_confirmed_at IS NULL "
              "     OR (:letters AND f.prequal_pdf_path IS NOT NULL AND s.prequal_sent_at IS NULL "
+             "         AND s.prequal_withheld_at IS NULL "
              "         AND p.email IS NOT NULL)) "
              "AND f.created_at < :cutoff AND f.created_at > :oldest ORDER BY f.created_at LIMIT :limit"),
         {"source": SOURCE_PARTNER, "cutoff": now - timedelta(minutes=older_than_minutes),
