@@ -6,7 +6,9 @@ token's SHA-256 is stored. A submission through that link creates one shared ``l
 transaction. Partner consent is never borrower consent: nothing here records consent for, or
 contacts, the borrower.
 
-CLI (Josh creates partners by hand in v1):
+Approvers create partners and issue or revoke their links with ``/partners`` in Cora's Slack app
+(``src/lending/partner_slack.py``). The CLI does the same for developers, through the same checks
+(``src/lending/partner_service.py``):
     PYTHONPATH=. python -m src.lending.partners create --name "Maria Lopez" --type wholesaler --email m@x.com
     PYTHONPATH=. python -m src.lending.partners new-link --partner-id 3
     PYTHONPATH=. python -m src.lending.partners revoke --partner-id 3
@@ -61,6 +63,14 @@ class InvalidSubmission(ValueError):
     def __init__(self, user_message: str) -> None:
         super().__init__(user_message)
         self.user_message = user_message
+
+
+def valid_email(value: str) -> Optional[str]:
+    """The address lower-cased, or None when it is not an email address."""
+    value = value.strip()
+    if "@" not in value or "." not in value.split("@")[-1]:
+        return None
+    return value.lower()
 
 
 def _utcnow() -> datetime:
@@ -227,9 +237,10 @@ class SubmissionInput(BaseModel):
     def _email(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
             return None
-        if "@" not in value or "." not in value.split("@")[-1]:
+        email = valid_email(value)
+        if email is None:
             raise ValueError("enter a valid email address")
-        return value.lower()
+        return email
 
     @field_validator("property_state")
     @classmethod
@@ -434,8 +445,14 @@ def _month_bounds(month: Optional[str], today: Optional[date] = None) -> tuple[d
 
 def _show_link_once(token: str) -> None:
     """The link is a credential: written to the terminal only, never to the logs, and not stored anywhere."""
-    sys.stdout.write(f"Partner link (shown once, keep it private): {LINK_PATH.format(token=token)}\n")
+    from src.lending.partner_service import PartnerLinkNotConfigured, partner_link
 
+    try:
+        link = partner_link(token)
+    except PartnerLinkNotConfigured:
+        logger.warning("LENDING_PARTNER_LINK_BASE_URL is not set: prefix the path below with the public host")
+        link = LINK_PATH.format(token=token)
+    sys.stdout.write(f"Partner link (shown once, keep it private): {link}\n")
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -467,13 +484,20 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "create":
-        with lending_session() as db:
-            partner_id, token = create_partner(
-                db, name=args.name, partner_type=args.type, company=args.company, phone=args.phone, email=args.email,
-                states=args.states, agreement_status=args.agreement, referral_terms=args.terms,
-                sms_consent=args.sms_consent, created_by=args.created_by)
-        logger.info("partner %s created", partner_id)
-        _show_link_once(token)
+        from src.lending.partner_service import PartnerError, PartnerIn, create
+
+        body = PartnerIn(name=args.name, partner_type=args.type, company=args.company, email=args.email,
+                         phone=args.phone, states=args.states, agreement_status=args.agreement,
+                         referral_terms=args.terms, sms_consent=args.sms_consent)
+        try:
+            with lending_session() as db:
+                issued = create(db, body, created_by=args.created_by)
+        except PartnerError as error:
+            for field, message in error.errors.items():
+                logger.error("%s: %s", field, message)
+            return 2
+        logger.info("partner %s created", issued.partner_id)
+        _show_link_once(issued.token)
         return 0
     if args.command == "new-link":
         with lending_session() as db:

@@ -926,6 +926,7 @@ class AppSettings(BaseSettings):
 	# P-1 Partner Door. The form will not open until Josh's consent wording is set here (shown verbatim, stored on each file).
 	lending_partner_consent_text: str = Field(default="", env="LENDING_PARTNER_CONSENT_TEXT")
 	lending_partner_upload_dir: str = Field(default="data/partner_uploads", env="LENDING_PARTNER_UPLOAD_DIR")  # uploads + generated pre-qual PDFs
+	lending_partner_link_base_url: str = Field(default="", env="LENDING_PARTNER_LINK_BASE_URL")  # public host of partner links, e.g. https://api.nextdeallending.com; unset = /partners creates no links
 	# Shared secret the GHL "DND changed" workflow sends in X-Webhook-Secret. Unset = endpoint closed.
 	lending_ghl_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_GHL_WEBHOOK_SECRET")
 	lending_ghl_sms_from_number: Optional[str] = Field(default=None, env="LENDING_GHL_SMS_FROM_NUMBER")  # E.164; the GHL SMS number (texting only). Calls run through BatchDialer on a different number

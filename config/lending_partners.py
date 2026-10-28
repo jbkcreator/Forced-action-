@@ -64,6 +64,9 @@ UPLOAD_TYPES = {  # extension -> accepted content types
 
 MAX_MONEY = 100_000_000
 TOKEN_BYTES = 24  # 192-bit link token; only its SHA-256 is stored
+# A create from the same person for the same name this soon after the last one is Slack redelivering the
+# submission: the partner just made gets a fresh link instead of a second row.
+RETRY_WINDOW_MINUTES = 10
 
 RATE_LIMIT_SCOPE = "lending_partner_submit"
 RATE_LIMIT_PER_WINDOW = 20
