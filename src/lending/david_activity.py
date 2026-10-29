@@ -12,7 +12,7 @@ when its ``userId`` is LENDING_DAVID_GHL_USER_ID; workflow and campaign messages
   does not say who booked the call. Show rate = Held today / Booked today, as on the scoreboard
 * flagged leads = contacts carrying LENDING_FLAGGED_TAG now (GHL keeps no date for a tag)
 
-UNVERIFIED (2026-10-29): ``userId`` on a hand-sent email and on a call, and the tag filter shape of the contact search.
+Verified live 2026-10-29: ``userId`` on a hand-sent SMS, email and call, and the tag filter shape of the contact search.
 """
 from __future__ import annotations
 
@@ -112,9 +112,11 @@ def _conversation_ms(conversation: Mapping[str, Any]) -> Optional[int]:
 
 def conversations_since(get: Get, base: str, headers: Mapping[str, str], location_id: str,
                         start: datetime) -> Iterator[str]:
-    """Ids of the conversations whose last message is at or after ``start``, newest first."""
+    """Ids of the conversations whose last message is at or after ``start``, newest first, each once (a page
+    boundary on a shared timestamp can return a conversation twice)."""
     start_ms = int(start.timestamp() * 1000)
     cursor: Optional[int] = None
+    seen: set[str] = set()
     for _ in range(MAX_CONVERSATION_PAGES):
         params = {"locationId": location_id, "limit": CONVERSATION_PAGE_SIZE, "sortBy": "last_message_date",
                   "sort": "desc", **({"startAfterDate": cursor} if cursor else {})}
@@ -125,7 +127,9 @@ def conversations_since(get: Get, base: str, headers: Mapping[str, str], locatio
             last = _conversation_ms(conversation)
             if last is not None and last < start_ms:
                 return
-            yield conversation["id"]
+            if conversation["id"] not in seen:
+                seen.add(conversation["id"])
+                yield conversation["id"]
         last_on_page = _conversation_ms(page[-1]) if page else None
         if len(page) < CONVERSATION_PAGE_SIZE or last_on_page is None or last_on_page == cursor:
             return
@@ -161,7 +165,7 @@ def messages_since(get: Get, base: str, headers: Mapping[str, str], conversation
 
 
 def flagged_leads(post: Post, base: str, headers: Mapping[str, str], location_id: str, tag: str) -> list[FlaggedLead]:
-    """Contacts carrying ``tag`` now. Filter shape per the GHL v2 contact search; confirm on first live run."""
+    """Contacts carrying ``tag`` now (GHL v2 contact search, tags ``contains`` filter)."""
     leads: list[FlaggedLead] = []
     for page in range(1, MAX_CONTACT_PAGES + 1):
         response = post(f"{base}/contacts/search", headers=headers,

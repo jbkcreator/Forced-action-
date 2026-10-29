@@ -78,6 +78,17 @@ def test_conversation_walk_follows_pages(monkeypatch):
     assert seen == [None, t - 1]
 
 
+def test_conversation_repeated_across_a_page_boundary_is_yielded_once(monkeypatch):
+    monkeypatch.setattr(da, "CONVERSATION_PAGE_SIZE", 2)
+    t = int(NOON.timestamp() * 1000)
+    pages = [[{"id": "a", "lastMessageDate": t}, {"id": "b", "lastMessageDate": t - 1}],
+             [{"id": "b", "lastMessageDate": t - 1}, {"id": "c", "lastMessageDate": t - 2}],
+             [{"id": "d", "lastMessageDate": t - 3}]]
+    calls = []
+    get = lambda url, **kw: calls.append(1) or _Resp({"conversations": pages[len(calls) - 1]})
+    assert list(da.conversations_since(get, "B", {}, "loc", START)) == ["a", "b", "c", "d"]
+
+
 def test_messages_stop_at_the_first_message_before_the_day():
     page = {"messages": {"messages": [_msg(da.SMS, mid="new"), _msg(da.SMS, mid="old", at=START - timedelta(hours=1)),
                                       _msg(da.SMS, mid="older", at=START - timedelta(days=1))],
@@ -110,8 +121,6 @@ class _Db:
         self.row, self.fail = row, fail
 
     def begin_nested(self):
-        db = self
-
         class _Ctx:
             def __enter__(self):
                 return None
