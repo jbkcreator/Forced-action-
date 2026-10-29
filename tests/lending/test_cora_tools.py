@@ -146,7 +146,7 @@ SAM = _Lead("web_lead:7", "Sam Smith", "+17275550100", "sam@example.com", "ghl-1
 
 def test_tool_set_and_safety_levels() -> None:
     tools = {tool.name: tool for tool in CoraToolkit(engine=None, memory=None).tools()}  # type: ignore[arg-type]
-    assert len(tools) == 18
+    assert len(tools) == 19
     egress = {name for name, tool in tools.items() if tool.safety is SafetyLevel.EXTERNAL_EGRESS}
     assert egress == {"draft_sms", "draft_email", "draft_pipeline_move"}
     assert {name for name, tool in tools.items() if tool.approver_only} == {

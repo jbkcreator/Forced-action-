@@ -35,3 +35,15 @@ REPLACEMENT_MIN_ATTEMPTS = 5
 REPLACEMENT_MIN_CALL_DAYS = 5
 # Call days are counted on the Eastern calendar date (the business runs on ET).
 REPLACEMENT_DAY_TIMEZONE = "America/New_York"
+
+# A GHL call's outcome (call_dispositions.disposition_raw = "ghl:<status>") in our disposition codes, for the attempt
+# log. A connected status (config.lending_alarms.GHL_CONNECTED_STATUSES) has no code: the lead answered.
+GHL_CALL_OUTCOME_CODES = {
+    "no-answer": "NO_ANSWER",
+    "busy": "NO_ANSWER",
+    "canceled": "NO_ANSWER",
+    "failed": "CALL_FAILED",
+    "voicemail": "LEFT_VOICEMAIL",
+}
+# GHL recordings checked per attempt-log request (one API call each, newest calls first).
+GHL_RECORDING_CHECK_LIMIT = 20
