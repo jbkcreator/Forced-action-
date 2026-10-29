@@ -1,4 +1,5 @@
-"""Post David's end-of-day activity to Slack (LENDING_DAILY_CHANNEL), with the leads he flagged for Josh.
+"""Post David's end-of-day activity to Slack (LENDING_DAVID_CHANNEL, #isa-daily),
+with the leads he flagged for Josh.
 
 Posted at 7:xx ET with the closing scoreboard. Cron fires at 23:25 and 00:25 UTC; only the one that is 19:xx ET acts,
 so daylight saving needs no change. Off until LENDING_DAVID_SUMMARY_ENABLED=true and LENDING_DAVID_GHL_USER_ID is set.
@@ -44,8 +45,9 @@ def main(argv=None, *, now: Optional[datetime] = None) -> int:
     if not user_id or account is None:
         logger.error("[lending-david] summary not built: LENDING_DAVID_GHL_USER_ID or the lending GHL account is not set")
         return 1
-    if not args.dry_run and not (s.lending_daily_channel and s.lending_slack_bot_token):
-        logger.error("[lending-david] summary not posted: Slack channel or token is not configured")
+    channel = s.lending_david_channel.strip()
+    if not args.dry_run and not (channel and s.lending_slack_bot_token):
+        logger.error("[lending-david] summary not posted: LENDING_DAVID_CHANNEL or the Slack token is not configured")
         return 1
     from src.services.ghl_webhook import _GHL_BASE
 
@@ -60,7 +62,7 @@ def main(argv=None, *, now: Optional[datetime] = None) -> int:
             logger.info("[lending-david] dry run for %s:\n%s", day, message)
             return 0
         from slack_sdk import WebClient
-        _post_with_retry(WebClient(token=s.lending_slack_bot_token.get_secret_value()), s.lending_daily_channel,
+        _post_with_retry(WebClient(token=s.lending_slack_bot_token.get_secret_value()), channel,
                          message, [{"type": "section", "text": {"type": "mrkdwn", "text": message}}])
     except Exception:
         logger.exception("[lending-david] summary post failed for %s", day)

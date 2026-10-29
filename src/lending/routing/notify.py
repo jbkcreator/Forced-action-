@@ -1,8 +1,9 @@
 """Slack notifications for R-1 routing events.
 
-Post target: Cora's channel (LENDING_CORA_CHANNEL), posted by Cora's bot (LENDING_CORA_SLACK_BOT_TOKEN), the
-app that already runs over Socket Mode. Nothing else is read: no other channel, no other bot token. Her listener
-receives the Decline / Approved / Funded clicks (see slack_extension.py).
+Post target: #deals (LENDING_DEALS_CHANNEL), posted by Cora's bot (LENDING_CORA_SLACK_BOT_TOKEN), the app that
+already runs over Socket Mode; her bot must be a member of #deals. Unset = not posted. Her listener receives the
+Decline / Approved / Funded clicks in any channel (see slack_extension.py). The /lenders and /partners audit posts
+go to Cora's own channel (LENDING_CORA_CHANNEL, ``audit_channel``).
 
 Spec: every route and every decline posts file ID, borrower last name, product, amount, lender
 and position in the waterfall.  One builder (``build_message``) serves the live post and the
@@ -45,6 +46,12 @@ def _client():
 
 
 def _channel() -> str:
+    """#deals: routing posts and their buttons."""
+    return get_settings().lending_deals_channel
+
+
+def audit_channel() -> str:
+    """#cora: who changed lenders or partners from Slack."""
     return get_settings().lending_cora_channel
 
 

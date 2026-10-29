@@ -977,20 +977,23 @@ class AppSettings(BaseSettings):
 	lending_seat_groups: str = Field(default="", env="LENDING_SEAT_GROUPS")  # "agentid:A,agentid:B" (BatchDialer agent id) -> shift group per seat
 	lending_disposition_missing_alert_minutes: int = Field(default=10, env="LENDING_DISPOSITION_MISSING_ALERT_MINUTES")
 	lending_slack_bot_token: Optional[SecretStr] = Field(default=None, env="LENDING_SLACK_BOT_TOKEN")
-	lending_dial_tasks_channel: str = Field(default="", env="LENDING_DIAL_TASKS_CHANNEL")
-	lending_replies_channel: str = Field(default="", env="LENDING_REPLIES_CHANNEL")  # WP-GL-10 rate/terms handoffs; channel ID, the Cora Lending bot must be a member
-	lending_daily_channel: str = Field(default="", env="LENDING_DAILY_CHANNEL")  # 7pm scoreboard; channel ID
-	lending_partner_channel: str = Field(default="", env="LENDING_PARTNER_CHANNEL")  # P-1 partner file cards (#ndl-partner-deals); Cora Lending bot must be a member; unset = no card
+	lending_dial_tasks_channel: str = Field(default="", env="LENDING_DIAL_TASKS_CHANNEL")  # #dial-tasks channel ID
+	lending_dnc_alert_channel: str = Field(default="", env="LENDING_DNC_ALERT_CHANNEL")  # DNC not propagated / removal pending; channel ID, unset = not posted
+	lending_replies_channel: str = Field(default="", env="LENDING_REPLIES_CHANNEL")  # #lead-alerts: rate/terms and reschedule handoffs, AI-quote alerts, reply SLA; channel ID, Cora's bot must be a member
+	lending_daily_channel: str = Field(default="", env="LENDING_DAILY_CHANNEL")  # #lending-daily: 7:20pm and hourly scoreboards; channel ID
+	lending_partner_channel: str = Field(default="", env="LENDING_PARTNER_CHANNEL")  # #deals: P-1 partner file cards; Cora's bot must be a member; unset = no card
 	# T-10 uncalled-lead alarms (src/lending/uncalled_alarm_worker.py)
 	lending_uncalled_alarms_enabled: bool = Field(default=False, env="LENDING_UNCALLED_ALARMS_ENABLED")
 	lending_ghl_app_url: str = Field(default="https://app.gohighlevel.com", env="LENDING_GHL_APP_URL")  # GHL web app base for contact links (white-label domain if any)
 	lending_lead_arrival_alert_enabled: bool = Field(default=False, env="LENDING_LEAD_ARRIVAL_ALERT_ENABLED")  # T-05: @-mention Josh in LENDING_OPS_CHANNEL when a LendingFlow lead arrives
 	lending_alarm_sms_to: Optional[str] = Field(default=None, env="LENDING_ALARM_SMS_TO")  # Josh's mobile; normalized before use
-	lending_ops_channel: str = Field(default="", env="LENDING_OPS_CHANNEL")  # #lendingops channel ID; 5-minute escalation post, opt-out alerts
+	lending_ops_channel: str = Field(default="", env="LENDING_OPS_CHANNEL")  # #lead-alerts channel ID: call-now alert, 5-minute flags, returning-borrower alert
+	lending_ops_notice_channel: str = Field(default="", env="LENDING_OPS_NOTICE_CHANNEL")  # opt-out mailbox and webhook-failure alerts; channel ID, unset = not posted
 	# 14-day follow-up (src/lending/ghl_call_import.py): record calls made in GoHighLevel in lending.call_dispositions
 	lending_ghl_call_import_enabled: bool = Field(default=False, env="LENDING_GHL_CALL_IMPORT_ENABLED")
-	# David's end-of-day activity post (src/tasks/lending_david_summary.py) to LENDING_DAILY_CHANNEL; off until enabled and the user id is set
+	# David's end-of-day activity post (src/tasks/lending_david_summary.py) to LENDING_DAVID_CHANNEL; off until enabled and the user id is set
 	lending_david_summary_enabled: bool = Field(default=False, env="LENDING_DAVID_SUMMARY_ENABLED")
+	lending_david_channel: str = Field(default="", env="LENDING_DAVID_CHANNEL")  # #isa-daily channel ID; unset = not posted
 	lending_david_ghl_user_id: str = Field(default="", env="LENDING_DAVID_GHL_USER_ID")  # David's GHL user id: his calls, texts and emails
 	lending_flagged_tag: str = Field(default="flag-for-josh", env="LENDING_FLAGGED_TAG")  # GHL tag David adds to a lead for Josh (name TBC by client)
 	# Retargeting audience export (src/tasks/lending_audience_export.py): nightly hashed files, written only when both are set
@@ -1019,7 +1022,9 @@ class AppSettings(BaseSettings):
 	# Approvers are the only users whose clicks release an external send, so keep that list to Josh's Slack user id.
 	lending_cora_slack_bot_token: Optional[SecretStr] = Field(default=None, env="LENDING_CORA_SLACK_BOT_TOKEN")  # xoxb- of Cora's own app
 	lending_cora_slack_app_token: Optional[SecretStr] = Field(default=None, env="LENDING_CORA_SLACK_APP_TOKEN")  # xapp- (connections:write) for Socket Mode
-	lending_cora_channel: str = Field(default="", env="LENDING_CORA_CHANNEL")  # channel ID for approval cards
+	lending_cora_channel: str = Field(default="", env="LENDING_CORA_CHANNEL")  # #cora: chat, digests, hold summary, halt, audit posts
+	lending_cora_approvals_channel: str = Field(default="", env="LENDING_CORA_APPROVALS_CHANNEL")  # #approvals: Approve/Revise/Reject cards; required for Cora
+	lending_deals_channel: str = Field(default="", env="LENDING_DEALS_CHANNEL")  # #deals: R-1 routing posts and buttons; unset = not posted
 	lending_cora_approver_user_ids: str = Field(default="", env="LENDING_CORA_APPROVER_USER_IDS")  # comma-separated Slack user ids
 	lending_cora_operator_user_ids: str = Field(default="", env="LENDING_CORA_OPERATOR_USER_IDS")  # may chat, may not approve
 	lending_cora_model: str = Field(default="claude-sonnet-5-5", env="LENDING_CORA_MODEL")

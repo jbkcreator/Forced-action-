@@ -9,7 +9,7 @@ Each cycle copies every new, non-suppressed row of T-11's ``lending.lendingflow_
 due ones. Outbound calls to the lead's phone since arrival are classified from BatchDialer CDRs
 (``lending.call_dispositions``) and the lead's GHL call messages: connected -> closed, nothing sent; attempted ->
 "NOT REACHED" alarms; none -> "no call" alarms. At 120 s an SMS to Josh; at 300 s an URGENT SMS plus a Slack post
-to #lendingops. SMS go through GoHighLevel (``ghl_sms.GhlSmsSender``, single attempt).
+to #lead-alerts. SMS go through GoHighLevel (``ghl_sms.GhlSmsSender``, single attempt).
 
 Calls are only visible once they END, so a long call that starts before 2:00 still alarms; the wording says so.
 A GHL lookup that fails counts as GHL finding nothing: a false alarm is better than a silent miss.

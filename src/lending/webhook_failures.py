@@ -34,7 +34,7 @@ from src.lending.ghl_consent_events import (
     record_ghl_opt_out,
     record_inbound_consent,
 )
-from src.lending.ops_alerts import post_ops_alert
+from src.lending.ops_alerts import post_ops_notice
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +87,7 @@ def save_failure(endpoint: str, body: dict[str, Any], error: str) -> int:
 
 def report_webhook_failure(endpoint: str, body: dict[str, Any], error: BaseException, *,
                            save: Callable[[str, dict[str, Any], str], int] = save_failure,
-                           notify: Callable[[str], bool] = post_ops_alert) -> Optional[int]:
+                           notify: Callable[[str], bool] = post_ops_notice) -> Optional[int]:
     """Save the failed event for retry and alert ops. Returns the saved id, or None when it could not be saved.
     Never raises: the webhook still answers GHL with its own error."""
     error_name = type(error).__name__
@@ -167,7 +167,7 @@ def _retry_one(db, row, result: RetryResult) -> None:
 
 
 def retry_pending(*, session_factory: Callable = lending_session,
-                  notify: Callable[[str], bool] = post_ops_alert) -> RetryResult:
+                  notify: Callable[[str], bool] = post_ops_notice) -> RetryResult:
     """Replay every open failure once, each in its own savepoint; alerts go out after the commit."""
     result = RetryResult()
     with session_factory() as db:
@@ -176,7 +176,7 @@ def retry_pending(*, session_factory: Callable = lending_session,
     for message, event in zip(result.alerts, result.gave_up_events):
         posted = notify(message)
         add_to_inbox_in_own_session(
-            event_type="consent_webhook_gave_up", dedup_key=str(event["webhook_failure_id"]), target_channel="ops",
+            event_type="consent_webhook_gave_up", dedup_key=str(event["webhook_failure_id"]), target_channel="ops_notice",
             channel_posted=bool(posted), payload=event,
             summary=f"GHL {_label(event['endpoint'])} webhook no longer retried: the change is NOT recorded",
         )

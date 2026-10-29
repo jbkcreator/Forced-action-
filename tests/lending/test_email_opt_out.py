@@ -296,7 +296,7 @@ def test_an_unreadable_message_is_raised_in_coras_inbox_once(monkeypatch, inbox_
     _sweep(mailbox, log, [])
     _sweep(mailbox, log, [])
     assert [e["event_type"] for e in inbox_writes] == ["opt_out_email_unreadable"]
-    assert inbox_writes[0]["target_channel"] == "ops"
+    assert inbox_writes[0]["target_channel"] == "ops_notice"
 
 
 def test_an_opt_out_given_up_is_raised_in_coras_inbox_without_the_address(monkeypatch, inbox_writes):

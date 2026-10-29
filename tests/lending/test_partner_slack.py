@@ -56,7 +56,7 @@ def slack(engine, monkeypatch):  # noqa: F811
     monkeypatch.setattr(partner_slack, "lending_session", session)
     monkeypatch.setattr(partner_slack, "allowed_user_ids", lambda: frozenset({"UJOSH"}))
     monkeypatch.setattr(partner_slack.notify, "_client", lambda: client)
-    monkeypatch.setattr(partner_slack.notify, "_channel", lambda: "C_CORA")
+    monkeypatch.setattr(partner_slack.notify, "audit_channel", lambda: "C_CORA")
     monkeypatch.setattr(settings, "lending_partner_link_base_url", BASE)
     monkeypatch.setattr(settings, "lending_partner_consent_text", "I have the borrower's permission.")
     client.engine = engine

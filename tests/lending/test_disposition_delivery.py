@@ -32,7 +32,7 @@ def _row(**over):
 def settings(monkeypatch):
     monkeypatch.setattr(dd, "get_settings", lambda: SimpleNamespace(
         lending_disposition_sheet_id="sheet-1", lending_disposition_sheet_tab="Dispositions",
-        lending_dial_tasks_channel="C123", lending_slack_bot_token=SecretStr("xoxb-test"),
+        lending_dial_tasks_channel="C123", lending_dnc_alert_channel="C_DNC", lending_slack_bot_token=SecretStr("xoxb-test"),
         lending_sheets_service_account_key_path="/key.json"))
 
 
@@ -244,7 +244,7 @@ def test_dnc_alert_posts_to_the_channel_without_a_phone_number():
     slack = MagicMock()
     dd.alert_unpropagated_dnc("c9", "7", client=slack)
     kwargs = slack.chat_postMessage.call_args.kwargs
-    assert kwargs["channel"] == "C123"
+    assert kwargs["channel"] == "C_DNC"  # LENDING_DNC_ALERT_CHANNEL, not #dial-tasks
     assert "c9" in kwargs["text"] and "manually" in kwargs["text"]
 
 
@@ -297,10 +297,10 @@ def test_dnc_alerts_are_raised_in_coras_inbox(inbox_writes, alert, event_type):
     failing.chat_postMessage.side_effect = RuntimeError("slack down")
     alert("c10", "7", client=failing)
     assert [(e["event_type"], e["dedup_key"], e["target_channel"], e["channel_posted"]) for e in inbox_writes] == [
-        (event_type, "c9", "dial_tasks", True), (event_type, "c10", "dial_tasks", False)]
+        (event_type, "c9", "dnc", True), (event_type, "c10", "dnc", False)]
 
 
 def test_a_dnc_alert_reaches_coras_inbox_when_slack_is_not_configured(inbox_writes, monkeypatch):
-    monkeypatch.setattr(dd, "_configured_slack", lambda: False)
+    monkeypatch.setattr(dd, "_configured_dnc_slack", lambda: False)
     dd.alert_unpropagated_dnc("c11", None)
     assert inbox_writes[0]["dedup_key"] == "c11" and inbox_writes[0]["channel_posted"] is False
