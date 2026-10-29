@@ -33,6 +33,7 @@ from src.lending.attempt_log import (
     LeadNotFound,
     MessageReader,
     attempt_log_for,
+    attempt_row,
     load_lead_calls,
     summary,
     to_csv,
@@ -515,8 +516,7 @@ class CoraToolkit:
         log, messages_read = attempt_log_for(lead_calls, self._attempt_messages)
         result = summary(log, messages_read)
         result["csv_attached"] = self._attach_csv(log, context)
-        result["attempt_rows"] = [{"at": _iso(a.at.astimezone(_TZ)), "channel": a.channel, "sent_by": a.sent_by,
-                                   "outcome": a.outcome, "recording": a.recording} for a in log.attempts[:MAX_ROWS]]
+        result["attempt_rows"] = [attempt_row(attempt) for attempt in log.attempts[:MAX_ROWS]]
         return result
 
     def _attach_csv(self, log: AttemptLog, context: ToolContext) -> bool:

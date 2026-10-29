@@ -101,6 +101,7 @@ def test_an_inbound_call_counts_as_a_reply_even_when_missed() -> None:
 def test_call_rows_carry_the_recording_state() -> None:
     log = build_attempt_log(LEAD, [call(5, recording_status="readable", recording_ref="rec-1"), call(9)], [])
     assert [a.recording for a in log.attempts] == ["readable", ""]
+    assert [a.recording_url for a in log.attempts] == ["rec-1", ""]
 
 
 def test_csv_has_one_row_per_attempt_and_no_full_phone() -> None:
@@ -112,6 +113,7 @@ def test_csv_has_one_row_per_attempt_and_no_full_phone() -> None:
     assert "8135550123" not in body
     assert "0123" in body
     assert rows[0]["attempted_at_et"].endswith("-04:00")
+    assert "recording_url" in rows[0]
 
 
 class _Channels:
@@ -184,3 +186,13 @@ def test_messages_are_read_outside_the_database_and_a_failed_read_leaves_calls_o
     assert read is False and [a.channel for a in log.attempts] == ["call"]
     log, read = attempt_log_for(LeadCalls(LEAD, [call(5)], None), lambda contact_id: [message(1)])
     assert read is True and len(log.attempts) == 2
+
+
+def test_bad_number_on_an_inbound_call_is_not_flagged() -> None:
+    log = build_attempt_log(LEAD, [call(5, direction="inbound", disposition="BAD_NUMBER")], [])
+    assert not log.bad_number
+
+
+def test_a_ghl_voicemail_drop_is_an_automated_voicemail_attempt() -> None:
+    log = build_attempt_log(LEAD, [], [message(3, kind="TYPE_VOICEMAIL")])
+    assert [(a.channel, a.sent_by) for a in log.attempts] == [("voicemail", AUTOMATED)]

@@ -22,7 +22,7 @@ import sys
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
@@ -33,6 +33,11 @@ from src.lending.ghl_calls import GHL_CONVERSATIONS_VERSION, conversation_messag
 from src.lending.replacement_eligibility import LeadAttempts, lead_attempts
 from src.services.phone_utils import normalize
 
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
+
+    from src.lending.ghl_account import GhlAccount
+
 logger = logging.getLogger(__name__)
 
 CALL, VOICEMAIL, TEXT, EMAIL = "call", "voicemail", "text", "email"
@@ -40,10 +45,11 @@ AUTOMATED, PERSON = "automated", "person"
 
 _TZ = ZoneInfo(DEFAULT_TZ)
 _VOICEMAIL_CODE, _BAD_NUMBER_CODE, _WRONG_PERSON_CODE = "LEFT_VOICEMAIL", "BAD_NUMBER", "WRONG_PERSON"
-_MESSAGE_CHANNELS = {"TYPE_SMS": TEXT, "TYPE_EMAIL": EMAIL}
+_MESSAGE_CHANNELS = {"TYPE_SMS": TEXT, "TYPE_EMAIL": EMAIL, "TYPE_VOICEMAIL": VOICEMAIL}
+OUTBOUND, INBOUND = "outbound", "inbound"
 _PERSON_SOURCES = frozenset({"app", "mobile_app"})
 CSV_COLUMNS = ("lead_id", "vendor_lead_id", "phone_last4", "attempted_at_et", "channel", "sent_by", "outcome",
-               "recording")
+               "recording", "recording_url")
 
 MessageReader = Callable[[str], list[dict[str, Any]]]
 
@@ -94,6 +100,7 @@ class Attempt:
     sent_by: str
     outcome: str
     recording: str
+    recording_url: str = ""
 
 
 @dataclass(frozen=True)
@@ -123,7 +130,7 @@ def _call_attempt(row: CallRow) -> Attempt:
     code = row.code
     channel = VOICEMAIL if code == _VOICEMAIL_CODE else CALL
     recording = (row.recording_status or "") if row.recording_ref else ""
-    return Attempt(row.at, channel, PERSON, code or "", recording)
+    return Attempt(row.at, channel, PERSON, code or "", recording, row.recording_ref or "")
 
 
 def _sent_by(message: Mapping[str, Any]) -> str:
@@ -141,25 +148,35 @@ def build_attempt_log(lead: LeadRef, calls: Sequence[CallRow], messages: Sequenc
     for row in calls:
         if row.at < lead.received_at:
             continue
-        if row.direction == "outbound":
+        if row.direction == OUTBOUND:
             attempts.append(_call_attempt(row))
             if row.answered:
                 replies.append(row.at)
-        elif row.direction == "inbound":
+        elif row.direction == INBOUND:
             replies.append(row.at)
     for message in messages:
         added = message_time(message)
         channel = _MESSAGE_CHANNELS.get(message.get("messageType") or "")
         if added is None or channel is None or added < lead.received_at:
             continue
-        if message.get("direction") == "inbound":
+        if message.get("direction") == INBOUND:
             replies.append(added)
-        elif message.get("direction") == "outbound":
+        elif message.get("direction") == OUTBOUND:
             attempts.append(Attempt(added, channel, _sent_by(message), message.get("status") or "", ""))
     attempts.sort(key=lambda attempt: attempt.at)
-    outcomes = {row.code for row in calls if row.at >= lead.received_at}
+    outcomes = {row.code for row in calls if row.at >= lead.received_at and row.direction == OUTBOUND}
     return AttemptLog(lead, attempts, min(replies, default=None), _BAD_NUMBER_CODE in outcomes,
                       _WRONG_PERSON_CODE in outcomes, replacement)
+
+
+def iso_et(value: Optional[datetime]) -> Optional[str]:
+    return value.astimezone(_TZ).isoformat() if value else None
+
+
+def attempt_row(attempt: Attempt) -> dict[str, Any]:
+    """One attempt as shown in Slack and the CSV (time in Eastern)."""
+    return {"attempted_at_et": iso_et(attempt.at), "channel": attempt.channel, "sent_by": attempt.sent_by,
+            "outcome": attempt.outcome, "recording": attempt.recording, "recording_url": attempt.recording_url}
 
 
 def to_csv(log: AttemptLog) -> str:
@@ -167,10 +184,9 @@ def to_csv(log: AttemptLog) -> str:
     out = io.StringIO()
     writer = csv.writer(out)
     writer.writerow(CSV_COLUMNS)
+    lead = (log.lead.lead_id, log.lead.vendor_lead_id or "", log.lead.phone_last4)
     for attempt in log.attempts:
-        writer.writerow((log.lead.lead_id, log.lead.vendor_lead_id or "", log.lead.phone_last4,
-                         attempt.at.astimezone(_TZ).isoformat(), attempt.channel, attempt.sent_by, attempt.outcome,
-                         attempt.recording))
+        writer.writerow((*lead, *attempt_row(attempt).values()))
     return out.getvalue()
 
 
@@ -189,7 +205,7 @@ _CALLS = text("""
 """)
 
 
-def messages_reader(account: Any, *, http: Optional[Callable[..., Any]] = None) -> MessageReader:
+def messages_reader(account: GhlAccount, *, http: Optional[Callable[..., Any]] = None) -> MessageReader:
     """``read(contact_id)`` returns every message in the contact's GHL conversations (all types). Raises on an HTTP
     error."""
     from config.lending_alarms import GHL_TIMEOUT_SECONDS
@@ -232,7 +248,7 @@ class LeadCalls:
     replacement: Optional[LeadAttempts]
 
 
-def load_lead_calls(db: Any, lead_id: int) -> LeadCalls:
+def load_lead_calls(db: Session, lead_id: int) -> LeadCalls:
     """The database half: the lead, its calls since it arrived, and the replacement-rule counts."""
     found = db.execute(_LEAD, {"lead_id": lead_id}).first()
     if found is None:
@@ -263,22 +279,18 @@ def attempt_log_for(lead_calls: LeadCalls, read_messages: Optional[MessageReader
     return log, messages is not None
 
 
-def _iso(value: Optional[datetime]) -> Optional[str]:
-    return value.astimezone(_TZ).isoformat() if value else None
-
-
 def summary(log: AttemptLog, messages_read: bool) -> dict[str, Any]:
     """The headline numbers for Slack and the CLI (ids and counts only, times in Eastern)."""
     sent_by = Counter(attempt.sent_by for attempt in log.attempts)
     replacement = log.replacement
     return {
         "lead_id": log.lead.lead_id, "vendor_lead_id": log.lead.vendor_lead_id,
-        "phone_last4": log.lead.phone_last4, "received_at": _iso(log.lead.received_at),
+        "phone_last4": log.lead.phone_last4, "received_at": iso_et(log.lead.received_at),
         "attempts": len(log.attempts), "by_channel": dict(Counter(attempt.channel for attempt in log.attempts)),
         "automated": sent_by[AUTOMATED], "by_person": sent_by[PERSON],
-        "first_attempt_at": _iso(log.first_attempt_at), "last_attempt_at": _iso(log.last_attempt_at),
+        "first_attempt_at": iso_et(log.first_attempt_at), "last_attempt_at": iso_et(log.last_attempt_at),
         "minutes_to_first_attempt": log.minutes_to_first_attempt,
-        "replied": log.first_reply_at is not None, "first_reply_at": _iso(log.first_reply_at),
+        "replied": log.first_reply_at is not None, "first_reply_at": iso_et(log.first_reply_at),
         "bad_number": log.bad_number, "wrong_person": log.wrong_person,
         "replacement_eligible": replacement.eligible if replacement else False,
         "replacement_call_attempts": replacement.attempts if replacement else 0,

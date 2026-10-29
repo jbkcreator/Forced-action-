@@ -140,5 +140,5 @@ def conversation_messages(get: Callable[..., Any], headers: Mapping[str, str], c
         if not (body.get("nextPage") and batch and next_cursor and next_cursor != cursor):
             return messages
         cursor = next_cursor
-    logger.warning("[ghl-calls] conversation %s: stopped after %d pages", conversation_id, MAX_MESSAGE_PAGES)
+    logger.warning("[ghl-messages] conversation %s: stopped after %d pages", conversation_id, MAX_MESSAGE_PAGES)
     return messages
