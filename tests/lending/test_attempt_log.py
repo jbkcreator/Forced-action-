@@ -5,12 +5,15 @@ import csv
 import io
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from src.lending.attempt_log import (
     AUTOMATED,
     PERSON,
     CallRow,
     LeadRef,
     build_attempt_log,
+    summary,
     to_csv,
 )
 
@@ -298,3 +301,11 @@ def test_an_unanswered_call_recording_422_is_missing() -> None:
 
     check = ghl_recording_checker(SimpleNamespace(api_key="k", location_id="loc"), http=lambda url, **kw: _Response(422))
     assert check("m1") == "missing"
+
+
+@pytest.mark.parametrize("status", ["completed", "answered", "Completed"])
+def test_an_answered_ghl_call_without_duration_is_a_reply(status: str) -> None:
+    log = build_attempt_log(LEAD, [ghl_call(5, status, talk=0)], [])
+    assert log.attempts[0].channel == "call"
+    assert log.first_reply_at == T0 + timedelta(minutes=5)
+    assert summary(log, True)["replied"] is True
