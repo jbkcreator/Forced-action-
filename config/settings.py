@@ -989,6 +989,10 @@ class AppSettings(BaseSettings):
 	lending_ops_channel: str = Field(default="", env="LENDING_OPS_CHANNEL")  # #lendingops channel ID; 5-minute escalation post, opt-out alerts
 	# 14-day follow-up (src/lending/ghl_call_import.py): record calls made in GoHighLevel in lending.call_dispositions
 	lending_ghl_call_import_enabled: bool = Field(default=False, env="LENDING_GHL_CALL_IMPORT_ENABLED")
+	# David's end-of-day activity post (src/tasks/lending_david_summary.py) to LENDING_DAILY_CHANNEL; off until enabled and the user id is set
+	lending_david_summary_enabled: bool = Field(default=False, env="LENDING_DAVID_SUMMARY_ENABLED")
+	lending_david_ghl_user_id: str = Field(default="", env="LENDING_DAVID_GHL_USER_ID")  # David's GHL user id: his calls, texts and emails
+	lending_flagged_tag: str = Field(default="flag-for-josh", env="LENDING_FLAGGED_TAG")  # GHL tag David adds to a lead for Josh (name TBC by client)
 	# Retargeting audience export (src/tasks/lending_audience_export.py): nightly hashed files, written only when both are set
 	lending_audience_export_enabled: bool = Field(default=False, env="LENDING_AUDIENCE_EXPORT_ENABLED")
 	lending_audience_export_dir: Optional[str] = Field(default=None, env="LENDING_AUDIENCE_EXPORT_DIR")
