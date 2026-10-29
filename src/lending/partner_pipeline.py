@@ -125,7 +125,7 @@ def live_services() -> PipelineServices:
     letters = get_partner_letter_sink()
 
     def slack(note: SlackNote) -> None:
-        channel, token = settings.lending_partner_channel, settings.lending_slack_bot_token  # #ndl-partner-deals
+        channel, token = settings.lending_partner_channel, settings.lending_slack_bot_token  # #deals
         if not (channel and token):
             logger.info("[partner-door] Slack note skipped: LENDING_PARTNER_CHANNEL or bot token not set")
             return

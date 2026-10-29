@@ -178,8 +178,9 @@ class SlackSession:
             return None
         is_direct = event.get("channel_type") == "im"
         channel, ts = event.get("channel") or "", event.get("ts") or ""
-        # The agent's own channel is a conversation with it: no mention needed there.
-        in_own_channel = bool(channel) and channel == self._config.slack_channel_id
+        # The agent's own channels (its channel and the approvals channel) are a conversation with it: no mention
+        # needed there, so a Revise instruction typed in the approvals channel reaches the agent.
+        in_own_channel = bool(channel) and channel in self._config.own_channel_ids
         if event["type"] == "message" and not (is_direct or in_own_channel or mentions_bot(event, self.bot_user_id)):
             return None
         # A mention arrives as both a message and an app_mention event with the same (channel, ts).

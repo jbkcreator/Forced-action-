@@ -46,7 +46,7 @@ from packages.agent_core.redaction import mask_emails
 from src.lending.compliance import propagate_opt_out
 from src.lending.cora_inbox import add_to_inbox_in_own_session
 from src.lending.db import lending_session
-from src.lending.ops_alerts import post_ops_alert
+from src.lending.ops_alerts import post_ops_notice
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
@@ -260,7 +260,7 @@ def _process_one(mailbox: Mailbox, log: MessageLog, message_number: bytes, key: 
         posted = notify(f":warning: An email to the opt-out address could not be read ({type(exc).__name__}, "
                         f"message {key}). Please check the opt-out mailbox and record the opt-out by hand if it is one.")
         add_to_inbox_in_own_session(
-            event_type="opt_out_email_unreadable", dedup_key=key, target_channel="ops", channel_posted=bool(posted),
+            event_type="opt_out_email_unreadable", dedup_key=key, target_channel="ops_notice", channel_posted=bool(posted),
             summary="An opt-out mailbox email could not be read: check it and record the opt-out by hand",
             payload={"message_key": key, "error": type(exc).__name__},
         )
@@ -282,7 +282,7 @@ def _process_one(mailbox: Mailbox, log: MessageLog, message_number: bytes, key: 
                             f"recorded after {attempts} attempts ({type(exc).__name__}, message {key}). It is NOT "
                             "recorded: record it by hand.")
             add_to_inbox_in_own_session(
-                event_type="opt_out_email_not_recorded", dedup_key=key, target_channel="ops",
+                event_type="opt_out_email_not_recorded", dedup_key=key, target_channel="ops_notice",
                 channel_posted=bool(posted),
                 summary="An opt-out email could not be recorded after every retry: record it by hand",
                 payload={"message_key": key, "sender_masked": mask_emails(opt_out.sender), "attempts": attempts,
@@ -301,7 +301,7 @@ def _process_one(mailbox: Mailbox, log: MessageLog, message_number: bytes, key: 
 
 
 def sweep(mailbox: Mailbox, log: MessageLog, *, since: date, optout_address: str, own_numbers: frozenset[str],
-          session_factory: Callable = lending_session, notify: Callable[[str], bool] = post_ops_alert,
+          session_factory: Callable = lending_session, notify: Callable[[str], bool] = post_ops_notice,
           limit: int = MAX_MESSAGES_PER_RUN) -> SweepResult:
     """Settle up to ``limit`` unsettled opt-out messages, oldest first. Settled messages are skipped before the
     limit is applied, so an unprocessed opt-out is always reached in a later sweep, however much mail follows it."""

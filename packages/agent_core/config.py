@@ -21,8 +21,10 @@ class AgentCoreConfig:
     slack_bot_token: str | None = None
     # App-level token (xapp-) for Socket Mode: an outbound WebSocket, so no public endpoint.
     slack_app_token: str | None = None
-    # Channel that receives approval cards and briefs.
+    # The agent's own channel: conversation, briefs and alerts.
     slack_channel_id: str | None = None
+    # Channel that receives the Approve / Revise / Reject cards; a conversation channel like slack_channel_id.
+    approval_channel_id: str | None = None
     # Only these Slack user ids may approve, reject, revise, halt or resume.
     approver_user_ids: frozenset[str] = field(default_factory=frozenset)
     # Users who may talk to the agent. Approvers are always included.
@@ -43,6 +45,11 @@ class AgentCoreConfig:
             raise ValueError("pending_action_ttl_hours must be at least 1")
 
     @property
+    def own_channel_ids(self) -> frozenset[str]:
+        """Channels where every message is addressed to the agent, with no mention needed."""
+        return frozenset(c for c in (self.slack_channel_id, self.approval_channel_id) if c)
+
+    @property
     def allowed_user_ids(self) -> frozenset[str]:
         return self.approver_user_ids | self.operator_user_ids
 
@@ -52,6 +59,7 @@ class AgentCoreConfig:
             "slack_bot_token": self.slack_bot_token,
             "slack_app_token": self.slack_app_token,
             "slack_channel_id": self.slack_channel_id,
+            "approval_channel_id": self.approval_channel_id,
             "approver_user_ids": self.approver_user_ids,
         }
         return [name for name, value in required.items() if not value]

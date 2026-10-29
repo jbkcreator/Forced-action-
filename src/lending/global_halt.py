@@ -2,7 +2,7 @@
 
 An approver types ``@Cora emergency halt`` in a channel Cora's bot is in. That sets the flag in
 ``lending.global_halt`` (with a row in ``lending.global_halt_events``), halts Cora's own sends, and posts an alert
-to Cora's channel ``#next-deal-lending-cora`` (``LENDING_CORA_CHANNEL``; client answer 12: use that channel for
+to Cora's channel ``#cora`` (``LENDING_CORA_CHANNEL``; client answer 12: use that channel for
 everything; the runbook's ``#next-deal-lending`` is not used). It arrives over Cora's Socket Mode session like any
 other message, with no HTTP endpoint. ``@Cora emergency resume`` clears the flag only; Cora's
 own halt still needs ``resume``.

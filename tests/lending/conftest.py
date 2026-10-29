@@ -80,7 +80,8 @@ def _no_live_slack(monkeypatch):
 
     settings = get_settings()
     for name, blank in (("lending_cora_slack_bot_token", None), ("lending_cora_slack_app_token", None),
-                        ("lending_cora_channel", ""), ("lending_cora_approver_user_ids", "")):
+                        ("lending_cora_channel", ""), ("lending_cora_approvals_channel", ""),
+                        ("lending_deals_channel", ""), ("lending_cora_approver_user_ids", "")):
         monkeypatch.setattr(settings, name, blank, raising=False)
 
 

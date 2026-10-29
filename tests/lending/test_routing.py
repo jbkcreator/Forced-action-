@@ -1801,6 +1801,7 @@ def slack_form(rdb, monkeypatch):
     monkeypatch.setattr(slack_admin, "lending_session", session)
     monkeypatch.setattr(slack_admin.notify, "_client", lambda: Client())
     monkeypatch.setattr(slack_admin.notify, "_channel", lambda: "C-TEST")
+    monkeypatch.setattr(slack_admin.notify, "audit_channel", lambda: "C-TEST")
     monkeypatch.setattr(slack_admin, "allowed_user_ids", lambda: frozenset({"UJOSH"}))
 
     def submit(values, user="UJOSH"):
@@ -1918,7 +1919,7 @@ def test_only_coras_approvers_may_edit_lenders_and_act_on_files(monkeypatch):
     assert not hasattr(settings, "lending_routing_editor_user_ids")  # there is no second list to fall back to
 
 
-def test_routing_posts_use_only_coras_bot_and_channel(monkeypatch):
+def test_routing_posts_use_only_coras_bot_and_the_deals_channel(monkeypatch):
     from pydantic import SecretStr
 
     from config.settings import get_settings
@@ -1927,9 +1928,13 @@ def test_routing_posts_use_only_coras_bot_and_channel(monkeypatch):
     settings = get_settings()
     assert not hasattr(settings, "lending_routing_channel")  # there is no other routing channel
     monkeypatch.setattr(settings, "lending_cora_channel", "C_CORA", raising=False)
+    monkeypatch.setattr(settings, "lending_deals_channel", "C_DEALS", raising=False)
     monkeypatch.setattr(settings, "lending_cora_slack_bot_token", SecretStr("xoxb-cora"), raising=False)
     monkeypatch.setattr(settings, "lending_slack_bot_token", SecretStr("xoxb-lending"), raising=False)
-    assert notify._channel() == "C_CORA" and notify._client().token == "xoxb-cora"
+    assert notify._channel() == "C_DEALS" and notify._client().token == "xoxb-cora"
+    assert notify.audit_channel() == "C_CORA"  # /lenders and /partners audit posts stay in Cora's channel
+    monkeypatch.setattr(settings, "lending_deals_channel", "", raising=False)
+    assert notify._channel() == ""  # no fallback to Cora's channel: unset means not posted
     monkeypatch.setattr(settings, "lending_cora_slack_bot_token", None, raising=False)
     assert notify._client() is None  # the lending bot is never a fallback
 

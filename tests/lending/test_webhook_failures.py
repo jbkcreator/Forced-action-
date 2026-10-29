@@ -211,7 +211,7 @@ def test_a_failure_given_up_is_raised_in_coras_inbox_without_the_phone(monkeypat
     _sweep(monkeypatch, [_row(failure_id=7, attempts=webhook_failures.MAX_RETRY_ATTEMPTS - 1)], still_down)
     assert len(inbox_writes) == 1
     event = inbox_writes[0]
-    assert (event["event_type"], event["dedup_key"], event["target_channel"]) == ("consent_webhook_gave_up", "7", "ops")
+    assert (event["event_type"], event["dedup_key"], event["target_channel"]) == ("consent_webhook_gave_up", "7", "ops_notice")
     assert "ghl-c-42" in event["payload"] and PHONE not in event["payload"]
 
 

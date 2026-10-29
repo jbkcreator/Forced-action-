@@ -23,6 +23,7 @@ def _settings(**overrides) -> SimpleNamespace:
         lending_cora_slack_app_token=SecretStr("xapp-test"),
         anthropic_api_key=SecretStr("sk-test"),
         lending_cora_channel="C_CORA",
+        lending_cora_approvals_channel="C_APPROVALS",
         lending_cora_approver_user_ids="U_JOSH",
         lending_cora_operator_user_ids="U_OPS1, U_OPS2,",
         lending_cora_model="claude-sonnet-5-5",
@@ -210,9 +211,10 @@ def test_main_exits_only_for_missing_settings(monkeypatch, socket_runs) -> None:
 
 def test_missing_settings_are_named() -> None:
     config = cora_agent.build_config(_settings(lending_cora_slack_bot_token=None, lending_cora_slack_app_token=None,
-                                               lending_cora_channel="", anthropic_api_key=None))
+                                               lending_cora_channel="", lending_cora_approvals_channel="",
+                                               anthropic_api_key=None))
     assert cora_agent.missing_settings(config) == ["slack_bot_token", "slack_app_token", "slack_channel_id",
-                                                   "anthropic_api_key"]
+                                                   "approval_channel_id", "anthropic_api_key"]
     assert cora_agent.build_live_services(_settings(lending_cora_approver_user_ids="")) is None
 
 
@@ -347,5 +349,7 @@ def test_a_failing_digest_never_stops_the_sends() -> None:
 
 def test_inbox_channel_ids_skip_unset_channels() -> None:
     settings = SimpleNamespace(lending_replies_channel="C_REPLIES", lending_ops_channel="",
-                               lending_dial_tasks_channel="C_DIAL", lending_daily_channel="")
-    assert cora_agent.lending_channel_ids(settings) == {"replies": "C_REPLIES", "dial_tasks": "C_DIAL"}
+                               lending_ops_notice_channel="C_NOTICE", lending_dnc_alert_channel="",
+                               lending_dial_tasks_channel="C_DIAL", lending_daily_channel="", lending_deals_channel="C_DEALS")
+    assert cora_agent.lending_channel_ids(settings) == {"replies": "C_REPLIES", "ops_notice": "C_NOTICE",
+                                                        "dial_tasks": "C_DIAL", "deals": "C_DEALS"}
