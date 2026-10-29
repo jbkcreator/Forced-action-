@@ -17,8 +17,8 @@ setting skips that post and logs it; it never lands in another channel.
 | #isa-daily | `LENDING_DAVID_CHANNEL` | Lending | David's end-of-day recap only |
 | #lending-daily | `LENDING_DAILY_CHANNEL` | Lending | 7:20pm closing scoreboard; hourly scoreboard 10am-6pm ET |
 | #dial-tasks | `LENDING_DIAL_TASKS_CHANNEL` | Lending | After-call results; 9am confirmation tasks; missing-disposition and unknown-code alerts; web-lead and LendingFlow sweep alerts; soft-approval cards and PDF; enrichment deal threads |
-| (Josh to confirm) | `LENDING_DNC_ALERT_CHANNEL` | Lending | "DNC not propagated" and "DNC removal pending" |
-| (Josh to confirm) | `LENDING_OPS_NOTICE_CHANNEL` | Lending | Opt-out mailbox alerts; GHL webhook-failure alerts |
+| #dial-tasks | `LENDING_DNC_ALERT_CHANNEL` | Lending | "DNC not propagated" and "DNC removal pending" |
+| #dial-tasks | `LENDING_OPS_NOTICE_CHANNEL` | Lending | Opt-out mailbox alerts; GHL webhook-failure alerts |
 
 Every alert above that Cora tracks is also raised in her inbox (key `ops`, `ops_notice`, `dnc`, `replies`,
 `dial_tasks`, `daily`, `deals`), so a post that is skipped or refused still reaches #cora's digest.
@@ -32,7 +32,7 @@ Every alert above that Cora tracks is also raised in her inbox (key `ops`, `ops_
 | Scopes | `chat:write`, `files:write` | `chat:write`, `commands`, `channels:read`, `groups:read`, `channels:history`, `groups:history` |
 | Events | none | `message.channels`, `message.groups` |
 | Slash commands | none | `/lenders`, `/partners` (approvers only) |
-| Invite the bot to | #lead-alerts, #dial-tasks, #isa-daily, #lending-daily, #deals, and the DNC / notice channels | #cora, #approvals, #deals, #lead-alerts, #dial-tasks, #isa-daily, #lending-daily |
+| Invite the bot to | #lead-alerts, #dial-tasks, #isa-daily, #lending-daily, #deals | #cora, #approvals, #deals, #lead-alerts, #dial-tasks, #isa-daily, #lending-daily |
 
 Cora's bot needs every channel her inbox routes to: she lists and reads only the channels her bot is in.
 
