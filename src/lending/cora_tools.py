@@ -32,6 +32,7 @@ from src.lending.attempt_log import (
     AttemptLog,
     LeadNotFound,
     MessageReader,
+    RecordingCheck,
     attempt_log_for,
     attempt_row,
     load_lead_calls,
@@ -353,16 +354,19 @@ class CoraToolkit:
                  campaign_names: Optional[Mapping[str, str]] = None, *,
                  channels: Optional[ChannelDirectory] = None,
                  inbox_session: Optional[Callable[[], AbstractContextManager[Session]]] = None,
-                 attempt_messages: Optional[MessageReader] = None) -> None:
+                 attempt_messages: Optional[MessageReader] = None,
+                 attempt_recordings: Optional[RecordingCheck] = None) -> None:
         """``channels`` is the channels Cora's bot is in: listed, read and routed to. ``inbox_session``
         overrides where the inbox tools read and write; tests pass their rolled-back session.
-        ``attempt_messages`` reads a lead's GHL messages for the attempt log (None: calls only)."""
+        ``attempt_messages`` reads a lead's GHL messages for the attempt log (None: calls only);
+        ``attempt_recordings`` checks whether GHL holds a call's recording."""
         self._engine = engine
         self._memory = memory
         self._campaign_names = dict(campaign_names or {})
         self._channels = channels
         self._inbox_session = inbox_session
         self._attempt_messages = attempt_messages
+        self._attempt_recordings = attempt_recordings
 
     @contextmanager
     def _inbox(self) -> Iterator[Session]:
@@ -513,7 +517,8 @@ class CoraToolkit:
                 lead_calls = load_lead_calls(session, args.lead_id)
             except LeadNotFound:
                 raise ToolInputError(f"no LendingFlow lead {args.lead_id}")
-        log, messages_read = attempt_log_for(lead_calls, self._attempt_messages)
+        log, messages_read = attempt_log_for(lead_calls, self._attempt_messages,
+                                             self._attempt_recordings)
         result = summary(log, messages_read)
         result["csv_attached"] = self._attach_csv(log, context)
         result["attempt_rows"] = [attempt_row(attempt) for attempt in log.attempts[:MAX_ROWS]]
