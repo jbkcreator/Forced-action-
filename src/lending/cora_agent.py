@@ -41,13 +41,12 @@ from packages.agent_core.slack_session import InboundMessage, SlackSession, run_
 from packages.agent_core.store import AgentStore
 from packages.agent_core.thread_history import build_history
 from packages.agent_core.tools import ToolContext, ToolRegistry
+from src.lending.attempt_log import lending_messages_reader
 from src.lending.compliance import text_window_open
 from src.lending.consent import has_text_consent
 from src.lending.cora_channels import ChannelDirectory
 from src.lending.cora_inbox import format_inbox_context, items_on_post, surface_new_items
 from src.lending.cora_prompt import CORA_BASE_PROMPT, REVISION_PROMPT
-from src.lending.attempt_log import messages_reader
-from src.lending.ghl_account import lending_ghl_account
 from src.lending.cora_tools import CoraToolkit, draft_content_check
 from src.lending.global_halt import EmergencyHalt
 from src.lending.ghl_email import GhlEmailSender, get_email_sender
@@ -416,8 +415,7 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
     # Cora's own bot lists, reads and routes to the channels it has been invited to.
     channels = ChannelDirectory(web, own_channel_id=config.slack_channel_id, key_ids=channel_ids)
 
-    account = lending_ghl_account()
-    attempt_messages = messages_reader(account) if account else None
+    attempt_messages = lending_messages_reader()
 
     def toolkit_factory(toolkit_engine: Engine, memory: AgentMemory) -> CoraToolkit:
         return CoraToolkit(toolkit_engine, memory, channels=channels, attempt_messages=attempt_messages)

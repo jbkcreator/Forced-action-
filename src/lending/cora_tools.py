@@ -28,7 +28,15 @@ from config.lending_reply_agent import QUOTED_NUMBER_PATTERNS
 from packages.agent_core.governance import SafetyLevel
 from packages.agent_core.memory import AgentMemory, MemoryFull
 from packages.agent_core.tools import EgressDraft, Tool, ToolContext, ToolInputError
-from src.lending.attempt_log import LeadNotFound, MessageReader, load_attempt_log, summary, to_csv
+from src.lending.attempt_log import (
+    AttemptLog,
+    LeadNotFound,
+    MessageReader,
+    attempt_log_for,
+    load_lead_calls,
+    summary,
+    to_csv,
+)
 from src.lending.contracts import BorrowerProfile, LoanRequest
 from src.lending.cora_channels import (
     MAX_READ_HOURS,
@@ -501,16 +509,17 @@ class CoraToolkit:
     def attempt_log(self, args: AttemptLogInput, context: ToolContext) -> dict[str, Any]:
         with self._read_only() as session:
             try:
-                log, messages_read = load_attempt_log(session, args.lead_id, self._attempt_messages)
+                lead_calls = load_lead_calls(session, args.lead_id)
             except LeadNotFound:
                 raise ToolInputError(f"no LendingFlow lead {args.lead_id}")
+        log, messages_read = attempt_log_for(lead_calls, self._attempt_messages)
         result = summary(log, messages_read)
         result["csv_attached"] = self._attach_csv(log, context)
         result["attempt_rows"] = [{"at": _iso(a.at.astimezone(_TZ)), "channel": a.channel, "sent_by": a.sent_by,
                                    "outcome": a.outcome, "recording": a.recording} for a in log.attempts[:MAX_ROWS]]
         return result
 
-    def _attach_csv(self, log, context: ToolContext) -> bool:
+    def _attach_csv(self, log: AttemptLog, context: ToolContext) -> bool:
         if self._channels is None:
             return False
         try:

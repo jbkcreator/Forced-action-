@@ -113,24 +113,32 @@ def call_messages_reader(account, *, http: Optional[Callable[..., Any]] = None
         return calls
 
     def _conversation_calls(conversation_id: str) -> list[dict[str, Any]]:
-        messages: list[dict[str, Any]] = []
-        cursor: Optional[str] = None
-        for _ in range(MAX_MESSAGE_PAGES):
-            params = {"type": "TYPE_CALL", **({"lastMessageId": cursor} if cursor else {})}
-            page = get(f"{_GHL_BASE}/conversations/{conversation_id}/messages", headers=headers, params=params)
-            page.raise_for_status()
-            body = page.json() or {}
-            listing = body.get("messages") or []
-            if isinstance(listing, dict):  # the spec nests the list: {"messages": {"messages": [...], "nextPage": ..}}
-                body, listing = listing, listing.get("messages") or []
-            batch = [message for message in listing if isinstance(message, dict)]
-            messages.extend(batch)
-            next_cursor = body.get("lastMessageId")
-            if not (body.get("nextPage") and batch and next_cursor and next_cursor != cursor):
-                return messages
-            cursor = next_cursor
-        logger.warning("[ghl-calls] conversation %s: stopped after %d pages of calls", conversation_id,
-                       MAX_MESSAGE_PAGES)
-        return messages
+        return conversation_messages(get, headers, conversation_id, "TYPE_CALL")
 
     return read
+
+
+def conversation_messages(get: Callable[..., Any], headers: Mapping[str, str], conversation_id: str,
+                          message_type: Optional[str] = None) -> list[dict[str, Any]]:
+    """Every message in one conversation (of ``message_type`` when given), following its pages to the end. Raises
+    on an HTTP error."""
+    from src.services.ghl_webhook import _GHL_BASE
+
+    messages: list[dict[str, Any]] = []
+    cursor: Optional[str] = None
+    for _ in range(MAX_MESSAGE_PAGES):
+        params = {**({"type": message_type} if message_type else {}), **({"lastMessageId": cursor} if cursor else {})}
+        page = get(f"{_GHL_BASE}/conversations/{conversation_id}/messages", headers=headers, params=params)
+        page.raise_for_status()
+        body = page.json() or {}
+        listing = body.get("messages") or []
+        if isinstance(listing, dict):  # the spec nests the list: {"messages": {"messages": [...], "nextPage": ..}}
+            body, listing = listing, listing.get("messages") or []
+        batch = [message for message in listing if isinstance(message, dict)]
+        messages.extend(batch)
+        next_cursor = body.get("lastMessageId")
+        if not (body.get("nextPage") and batch and next_cursor and next_cursor != cursor):
+            return messages
+        cursor = next_cursor
+    logger.warning("[ghl-calls] conversation %s: stopped after %d pages", conversation_id, MAX_MESSAGE_PAGES)
+    return messages

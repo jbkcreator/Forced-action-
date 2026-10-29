@@ -18,10 +18,11 @@ T0 = datetime(2026, 10, 20, 14, 0, tzinfo=timezone.utc)
 LEAD = LeadRef(lead_id=7, vendor_lead_id="LF-7", phone="+18135550123", received_at=T0, ghl_contact_id="c1")
 
 
-def call(minutes: int, *, direction: str = "outbound", disposition: str = "NO_ANSWER", talk: int = 0,
-         source: str = "batchdialer", recording_status: str | None = None, recording_ref: str | None = None) -> CallRow:
+def call(minutes: int, *, direction: str = "outbound", disposition: str | None = "NO_ANSWER", talk: int = 0,
+         source: str = "batchdialer", recording_status: str | None = None, recording_ref: str | None = None,
+         raw: str | None = None) -> CallRow:
     return CallRow(at=T0 + timedelta(minutes=minutes), direction=direction, disposition=disposition,
-                   talk_sec=talk, call_source=source, recording_status=recording_status, recording_ref=recording_ref)
+                   disposition_raw=raw, talk_sec=talk, call_source=source, recording_status=recording_status, recording_ref=recording_ref)
 
 
 def message(minutes: int, *, kind: str = "TYPE_SMS", direction: str = "outbound", source: str | None = "workflow",
@@ -80,6 +81,23 @@ def test_bad_number_and_wrong_person_are_flagged() -> None:
     assert log.bad_number and log.wrong_person
 
 
+def test_raw_dialer_results_are_mapped_to_our_codes() -> None:
+    log = build_attempt_log(LEAD, [call(5, disposition=None, raw="Answering Machine"),
+                                   call(9, disposition=None, raw="DISCONNECTED_NUMBER")], [])
+    assert [a.channel for a in log.attempts] == ["voicemail", "call"]
+    assert log.bad_number
+
+
+def test_a_voicemail_with_talk_time_is_not_a_reply() -> None:
+    log = build_attempt_log(LEAD, [call(5, disposition="LEFT_VOICEMAIL", talk=25)], [])
+    assert log.first_reply_at is None
+
+
+def test_an_inbound_call_counts_as_a_reply_even_when_missed() -> None:
+    log = build_attempt_log(LEAD, [call(5, direction="inbound", disposition="NO_ANSWER")], [])
+    assert log.attempts == [] and log.first_reply_at == T0 + timedelta(minutes=5)
+
+
 def test_call_rows_carry_the_recording_state() -> None:
     log = build_attempt_log(LEAD, [call(5, recording_status="readable", recording_ref="rec-1"), call(9)], [])
     assert [a.recording for a in log.attempts] == ["readable", ""]
@@ -93,6 +111,7 @@ def test_csv_has_one_row_per_attempt_and_no_full_phone() -> None:
     assert rows[0]["sent_by"] == AUTOMATED
     assert "8135550123" not in body
     assert "0123" in body
+    assert rows[0]["attempted_at_et"].endswith("-04:00")
 
 
 class _Channels:
@@ -111,7 +130,8 @@ def _toolkit(monkeypatch, channels):
     from src.lending import cora_tools
 
     log = build_attempt_log(LEAD, [call(5)], [message(1)])
-    monkeypatch.setattr(cora_tools, "load_attempt_log", lambda session, lead_id, reader: (log, True))
+    monkeypatch.setattr(cora_tools, "load_lead_calls", lambda session, lead_id: None)
+    monkeypatch.setattr(cora_tools, "attempt_log_for", lambda lead_calls, reader: (log, True))
     toolkit = cora_tools.CoraToolkit(engine=None, memory=None, channels=channels)
 
     @contextmanager
@@ -152,3 +172,15 @@ def test_cora_tool_is_registered_read_only() -> None:
 
     tool = next(t for t in CoraToolkit(engine=None, memory=None).tools() if t.name == "get_attempt_log")
     assert tool.safety == SafetyLevel.READ_ONLY
+
+
+def test_messages_are_read_outside_the_database_and_a_failed_read_leaves_calls_only() -> None:
+    from src.lending.attempt_log import LeadCalls, attempt_log_for
+
+    def broken(contact_id: str) -> list:
+        raise RuntimeError("ghl down")
+
+    log, read = attempt_log_for(LeadCalls(LEAD, [call(5)], None), broken)
+    assert read is False and [a.channel for a in log.attempts] == ["call"]
+    log, read = attempt_log_for(LeadCalls(LEAD, [call(5)], None), lambda contact_id: [message(1)])
+    assert read is True and len(log.attempts) == 2
