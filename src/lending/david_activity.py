@@ -8,8 +8,9 @@ when its ``userId`` is LENDING_DAVID_GHL_USER_ID; workflow and campaign messages
 * conversations are read newest first (``sortBy=last_message_date``) and the walk stops at the first one whose last
   message is before the day; each conversation's messages are read newest first until one is before the day
 * call outcome and talk time use ``ghl_calls.call_state`` / ``call_duration_seconds`` (the shapes seen live)
-* Booked / Held come from lending.ghl_stage_events (the GHL stage webhook) and cover every caller: a stage event
-  does not say who booked the call. Show rate = Held today / Booked today, as on the scoreboard
+* Booked = today's BOOKED dispositions in lending.call_dispositions (as the scoreboard counts it; no GHL workflow sends
+  the Booked stage); Held = today's Held stage entries in lending.ghl_stage_events. Both cover every caller.
+  Show rate = Held today / Booked today, as on the scoreboard
 * flagged leads = contacts carrying LENDING_FLAGGED_TAG now (GHL keeps no date for a tag)
 
 Verified live 2026-10-29: ``userId`` on a hand-sent SMS, email and call, and the tag filter shape of the contact search.
@@ -26,7 +27,7 @@ from sqlalchemy import text
 
 from config.lending_compliance import DEFAULT_TZ
 from config.lending_dispositions import (
-    BOOKED_STAGE_KEYS, GHL_CONNECTED_STATES, GHL_FAILED_STATUSES, GHL_VOICEMAIL_STATES, SHOWED_STAGE_KEYS,
+    BOOKED_CODE, GHL_CONNECTED_STATES, GHL_FAILED_STATUSES, GHL_VOICEMAIL_STATES, SHOWED_STAGE_KEYS,
 )
 from src.lending.ghl_calls import GHL_CONVERSATIONS_VERSION, call_duration_seconds, call_state, message_time
 
@@ -189,10 +190,11 @@ def stage_counts(db, day: date) -> tuple[int, int]:
     try:
         with db.begin_nested():
             row = db.execute(
-                text("SELECT count(*) FILTER (WHERE stage_key = ANY(:booked)), "
-                     "count(*) FILTER (WHERE stage_key = ANY(:held)) "
-                     "FROM lending.ghl_stage_events WHERE event_at >= :start AND event_at < :end"),
-                {"booked": sorted(BOOKED_STAGE_KEYS), "held": sorted(SHOWED_STAGE_KEYS), "start": start, "end": end},
+                text("SELECT (SELECT count(*) FROM lending.call_dispositions WHERE direction = 'outbound' "
+                     "AND disposition = :booked AND NOT booking_blocked AND call_ended_at >= :start AND call_ended_at < :end), "
+                     "(SELECT count(*) FROM lending.ghl_stage_events WHERE stage_key = ANY(:held) "
+                     "AND event_at >= :start AND event_at < :end)"),
+                {"booked": BOOKED_CODE, "held": sorted(SHOWED_STAGE_KEYS), "start": start, "end": end},
             ).one()
     except Exception as exc:
         logger.warning("[david-activity] stage query failed, reporting 0: %s", type(exc).__name__)
@@ -243,7 +245,7 @@ def format_slack(a: DavidActivity, contact_url: Callable[[str], Optional[str]] =
         f"Dials {a.dials} · Contacts reached {a.contacts_reached} · Voicemails {a.voicemails} · "
         f"Inbound answered {a.inbound_answered} · Talk time {_minutes(a.talk_seconds)}",
         f"Texts {a.texts} · Emails {a.emails}",
-        f"Booked {a.booked} · Held {a.held} · Show rate {show} _(all callers: GHL stage moves today)_",
+        f"Booked {a.booked} · Held {a.held} · Show rate {show} _(all callers today)_",
     ]
     if a.flagged:
         lines += ["", f"*Flagged for Josh ({len(a.flagged)})*"]

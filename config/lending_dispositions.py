@@ -79,8 +79,6 @@ NURTURE_SENT_CODES = frozenset({"GATE_FAILED_NURTURE"})
 ANSWERED_CODES = frozenset(DISPOSITIONS) - UNANSWERED_CODES - {"BAD_NUMBER"}
 # GHL pipeline stage names (lower-cased) that count as "showed": the client moves a lead there once the held call happens.
 SHOWED_STAGE_KEYS = frozenset({"held", "showed"})
-# GHL pipeline stage names (lower-cased) that count as "booked" for David's daily show rate.
-BOOKED_STAGE_KEYS = frozenset({"booked"})
 # GHL call outcomes (ghl_calls.call_state) for David's activity: a voicemail, and a call where someone talked.
 GHL_VOICEMAIL_STATES = frozenset({"voicemail"})
 GHL_CONNECTED_STATES = frozenset({"completed"})
