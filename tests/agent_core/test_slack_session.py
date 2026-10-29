@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import threading
 from datetime import timedelta
 from types import SimpleNamespace
@@ -86,6 +87,22 @@ def test_own_channel_needs_no_mention(harness: Harness) -> None:
         "type": "message", "channel_type": "channel", "channel": "C_CORA", "user": OPERATOR,
         "text": "how many leads today?", "ts": "3.1"}})
     assert [(message.text, message.is_direct) for message in harness.messages] == [("how many leads today?", False)]
+
+
+def test_approvals_channel_is_an_own_channel_so_a_revise_reply_needs_no_mention(config, queue, halt, relay) -> None:
+    harness = Harness(dataclasses.replace(config, approval_channel_id="C_APPROVALS"), queue, halt, relay)
+    action_id = enqueue_sms(queue)
+    queue.request_revision(action_id, APPROVER)
+    harness.session.handle_request("events_api", {"event": {
+        "type": "message", "channel_type": "channel", "channel": "C_APPROVALS", "user": APPROVER,
+        "text": "make it shorter", "ts": "3.2"}})
+    assert [(action.action_id, message.text) for action, message in harness.revisions] == [(action_id, "make it shorter")]
+
+
+def test_own_channels_are_the_agent_and_approvals_channels(config) -> None:
+    assert config.own_channel_ids == frozenset({"C_CORA"})
+    assert dataclasses.replace(config, approval_channel_id="C_APPROVALS").own_channel_ids == {"C_CORA", "C_APPROVALS"}
+    assert "approval_channel_id" in dataclasses.replace(config, approval_channel_id=None).missing_for_live_session()
 
 
 def test_own_channel_still_ignores_strangers_and_bots(harness: Harness) -> None:

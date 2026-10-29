@@ -93,7 +93,9 @@ class CoraServices(NamedTuple):
 def lending_channel_ids(settings: AppSettings) -> dict[str, str]:
     """Inbox channel keys -> Slack channel ids, for naming where an item was already posted."""
     channels = {"replies": settings.lending_replies_channel, "ops": settings.lending_ops_channel,
-                "dial_tasks": settings.lending_dial_tasks_channel, "daily": settings.lending_daily_channel}
+                "ops_notice": settings.lending_ops_notice_channel, "dnc": settings.lending_dnc_alert_channel,
+                "dial_tasks": settings.lending_dial_tasks_channel, "daily": settings.lending_daily_channel,
+                "deals": settings.lending_deals_channel}
     return {key: channel_id for key, channel_id in channels.items() if channel_id}
 
 
@@ -140,6 +142,7 @@ def build_config(settings: AppSettings) -> AgentCoreConfig:
         slack_bot_token=_secret(settings.lending_cora_slack_bot_token),
         slack_app_token=_secret(settings.lending_cora_slack_app_token),
         slack_channel_id=settings.lending_cora_channel or None,
+        approval_channel_id=settings.lending_cora_approvals_channel or None,
         approver_user_ids=parse_user_ids(settings.lending_cora_approver_user_ids),
         operator_user_ids=parse_user_ids(settings.lending_cora_operator_user_ids),
         db_schema=LENDING_SCHEMA,
@@ -323,7 +326,7 @@ def build_session(config: AgentCoreConfig, store: AgentStore, chat: ChatPort, bo
     halt = HaltSwitch(store, config.agent_name)
     relay = Relay(queue, halt, executors or {}, send_check=send_check)
     memory = AgentMemory(store)
-    gate = SendGate(queue, chat, config.slack_channel_id)
+    gate = SendGate(queue, chat, config.approval_channel_id)
     toolkit = toolkit_factory(store.engine, memory)
 
     def rules() -> list[str]:

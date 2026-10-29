@@ -214,7 +214,7 @@ def _errors(errors: dict[str, str], action: str) -> dict[str, Any]:
 
 
 def _post_audit(text: str) -> None:
-    client, channel = notify._client(), notify._channel()
+    client, channel = notify._client(), notify.audit_channel()
     if client is None or not channel:
         logger.warning("[partner-slack] change applied but LENDING_CORA_CHANNEL or LENDING_CORA_SLACK_BOT_TOKEN is not set")
         return

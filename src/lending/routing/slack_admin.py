@@ -523,7 +523,7 @@ def _apply(values: dict, db: Session) -> str:
 
 
 def _post_audit(user_id: str, summary: str) -> None:
-    client, channel = notify._client(), notify._channel()
+    client, channel = notify._client(), notify.audit_channel()
     if client is None or not channel:
         logger.warning("[routing-slack] change applied but LENDING_CORA_CHANNEL or LENDING_CORA_SLACK_BOT_TOKEN is not set")
         return
