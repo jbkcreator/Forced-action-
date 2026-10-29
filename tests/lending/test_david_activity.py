@@ -36,6 +36,8 @@ def test_counts_only_davids_messages_of_the_day():
         _msg(da.SMS), _msg(da.SMS, direction="inbound"),
         _msg(da.EMAIL),
         _msg(da.SMS, user=OTHER),                 # Josh's text
+        {**_msg(da.SMS), "status": "failed"},     # not sent (live case: number not A2P registered)
+        {**_msg(da.EMAIL), "status": "undelivered"},
         _msg(da.EMAIL, user=None),                # workflow email: no userId
         _msg(da.CALL, at=START - timedelta(minutes=1), status="completed"),  # yesterday
         _msg(da.CALL, at=END, status="completed"),                           # tomorrow
@@ -148,4 +150,4 @@ def test_slack_text_lists_numbers_and_flagged_leads():
 
 def test_slack_text_without_flags_or_bookings():
     out = da.format_slack(da.DavidActivity(DAY, ghl_read_failed=True))
-    assert "No leads flagged." in out and "Show rate –" in out and ":warning:" in out
+    assert "No leads flagged." in out and "Show rate –" in out and ":warning:" in out and "Talk time 0s" in out

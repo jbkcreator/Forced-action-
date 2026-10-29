@@ -26,7 +26,7 @@ from sqlalchemy import text
 
 from config.lending_compliance import DEFAULT_TZ
 from config.lending_dispositions import (
-    BOOKED_STAGE_KEYS, GHL_CONNECTED_STATES, GHL_VOICEMAIL_STATES, SHOWED_STAGE_KEYS,
+    BOOKED_STAGE_KEYS, GHL_CONNECTED_STATES, GHL_FAILED_STATUSES, GHL_VOICEMAIL_STATES, SHOWED_STAGE_KEYS,
 )
 from src.lending.ghl_calls import GHL_CONVERSATIONS_VERSION, call_duration_seconds, call_state, message_time
 
@@ -96,10 +96,11 @@ def count_messages(activity: DavidActivity, messages: list[Mapping[str, Any]], u
             else:
                 activity.inbound_answered += state in GHL_CONNECTED_STATES
             activity.talk_seconds += call_duration_seconds(message) or 0
-        elif outbound and kind == SMS:
-            activity.texts += 1
-        elif outbound and kind == EMAIL:
-            activity.emails += 1
+        elif outbound and kind in (SMS, EMAIL) and str(message.get("status") or "").lower() not in GHL_FAILED_STATUSES:
+            if kind == SMS:
+                activity.texts += 1
+            else:
+                activity.emails += 1
 
 
 def _conversation_ms(conversation: Mapping[str, Any]) -> Optional[int]:
@@ -226,6 +227,8 @@ def ghl_transport(api_key: str) -> tuple[Get, Post, Mapping[str, str]]:
 
 
 def _minutes(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}s"
     return f"{seconds // 60}m" if seconds < 3600 else f"{seconds // 3600}h {seconds % 3600 // 60}m"
 
 

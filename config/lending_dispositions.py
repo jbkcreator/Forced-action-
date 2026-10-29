@@ -84,6 +84,8 @@ BOOKED_STAGE_KEYS = frozenset({"booked"})
 # GHL call outcomes (ghl_calls.call_state) for David's activity: a voicemail, and a call where someone talked.
 GHL_VOICEMAIL_STATES = frozenset({"voicemail"})
 GHL_CONNECTED_STATES = frozenset({"completed"})
+# A text or email GHL could not send (e.g. "Number not A2P compliant", seen live 2026-10-29) is not counted as sent.
+GHL_FAILED_STATUSES = frozenset({"failed", "undelivered"})
 DAVID_SUMMARY_HOUR_ET = 19  # posted with the 7:20pm closing board (the dialer stops at 7:15pm)
 # Hourly scoreboard (launch runbook Line 11). Defaults: a client answer is a one-line change here.
 LONG_CONVERSATION_SECONDS = 120  # "2+ min conversations": talk time of at least this many seconds
