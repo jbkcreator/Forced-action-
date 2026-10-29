@@ -116,6 +116,11 @@ class ChannelDirectory:
         """Post as Cora's bot. Raises when Slack refuses."""
         self._client.chat_postMessage(channel=channel.id, text=text, unfurl_links=False, unfurl_media=False)
 
+    def upload(self, channel_id: str, thread_ts: str, content: bytes, filename: str, title: str) -> None:
+        """Attach a file to a thread as Cora's bot (needs the files:write scope). Raises when Slack refuses."""
+        self._client.files_upload_v2(channel=channel_id, thread_ts=thread_ts, content=content, filename=filename,
+                                     title=title)
+
 
 def _author(item: Mapping[str, Any]) -> str:
     """A person as a Slack mention; a bot by its name, since its posts carry no user to mention."""

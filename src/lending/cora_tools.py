@@ -9,6 +9,7 @@ number or address) and return an :class:`EgressDraft` for the send gate.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
@@ -27,6 +28,7 @@ from config.lending_reply_agent import QUOTED_NUMBER_PATTERNS
 from packages.agent_core.governance import SafetyLevel
 from packages.agent_core.memory import AgentMemory, MemoryFull
 from packages.agent_core.tools import EgressDraft, Tool, ToolContext, ToolInputError
+from src.lending.attempt_log import LeadNotFound, MessageReader, load_attempt_log, summary, to_csv
 from src.lending.contracts import BorrowerProfile, LoanRequest
 from src.lending.cora_channels import (
     MAX_READ_HOURS,
@@ -39,6 +41,8 @@ from src.lending.cora_inbox import OPEN_STATUSES, close_item, get_item, open_ite
 from src.lending.lender_fit import evaluate_lender_fit
 from src.lending.scoreboard import build_scoreboard
 from src.services.phone_utils import normalize
+
+logger = logging.getLogger(__name__)
 
 STATEMENT_TIMEOUT = "5s"
 MAX_ROWS = 50
@@ -149,6 +153,10 @@ class BookingsInput(_Input):
 class LenderFitInput(_Input):
     borrower: BorrowerProfile = Field(default_factory=BorrowerProfile)
     loan: LoanRequest
+
+
+class AttemptLogInput(_Input):
+    lead_id: int = Field(..., ge=1, description="The LendingFlow lead id (lendingflow_leads.id, e.g. 1424).")
 
 
 class QueryInput(_Input):
@@ -335,14 +343,17 @@ class CoraToolkit:
     def __init__(self, engine: Engine, memory: AgentMemory,
                  campaign_names: Optional[Mapping[str, str]] = None, *,
                  channels: Optional[ChannelDirectory] = None,
-                 inbox_session: Optional[Callable[[], AbstractContextManager[Session]]] = None) -> None:
+                 inbox_session: Optional[Callable[[], AbstractContextManager[Session]]] = None,
+                 attempt_messages: Optional[MessageReader] = None) -> None:
         """``channels`` is the channels Cora's bot is in: listed, read and routed to. ``inbox_session``
-        overrides where the inbox tools read and write; tests pass their rolled-back session."""
+        overrides where the inbox tools read and write; tests pass their rolled-back session.
+        ``attempt_messages`` reads a lead's GHL messages for the attempt log (None: calls only)."""
         self._engine = engine
         self._memory = memory
         self._campaign_names = dict(campaign_names or {})
         self._channels = channels
         self._inbox_session = inbox_session
+        self._attempt_messages = attempt_messages
 
     @contextmanager
     def _inbox(self) -> Iterator[Session]:
@@ -486,6 +497,31 @@ class CoraToolkit:
         result = evaluate_lender_fit(args.borrower, args.loan)
         return {"internal_only": "Never quote rates, terms or approval to a borrower from this.",
                 **result.model_dump(mode="json")}
+
+    def attempt_log(self, args: AttemptLogInput, context: ToolContext) -> dict[str, Any]:
+        with self._read_only() as session:
+            try:
+                log, messages_read = load_attempt_log(session, args.lead_id, self._attempt_messages)
+            except LeadNotFound:
+                raise ToolInputError(f"no LendingFlow lead {args.lead_id}")
+        result = summary(log, messages_read)
+        result["csv_attached"] = self._attach_csv(log, context)
+        result["attempt_rows"] = [{"at": _iso(a.at.astimezone(_TZ)), "channel": a.channel, "sent_by": a.sent_by,
+                                   "outcome": a.outcome, "recording": a.recording} for a in log.attempts[:MAX_ROWS]]
+        return result
+
+    def _attach_csv(self, log, context: ToolContext) -> bool:
+        if self._channels is None:
+            return False
+        try:
+            self._channels.upload(context.channel, context.thread_ts, to_csv(log).encode("utf-8"),
+                                  f"attempt-log-lead-{log.lead.lead_id}.csv",
+                                  f"Attempt log, LendingFlow lead {log.lead.lead_id}")
+        except Exception as exc:  # class only: Slack errors can echo request detail
+            logger.warning("[cora-tools] attempt-log CSV upload failed lead=%s: %s", log.lead.lead_id,
+                           type(exc).__name__)
+            return False
+        return True
 
     def query_lending_data(self, args: QueryInput, _: ToolContext) -> dict[str, Any]:
         statement = check_read_only_sql(args.sql)
@@ -664,6 +700,10 @@ class CoraToolkit:
             Tool("check_lender_fit", "Run a borrower and loan through the five-lender rules matrix. Internal "
                  "analysis only: never present it to a borrower as a rate, term or approval.", LenderFitInput, read,
                  self.lender_fit),
+            Tool("get_attempt_log", "Every outbound attempt (call, voicemail, text, email) on one LendingFlow lead "
+                 "since it arrived, automated or by a person, whether the lead ever replied, and the replacement "
+                 "rule result: refund evidence. Attaches the CSV to the thread.", AttemptLogInput, read,
+                 self.attempt_log),
             Tool("query_lending_data", "Fallback for questions the other tools cannot answer: one read-only SQL "
                  "SELECT over lending.* tables.", QueryInput, read, self.query_lending_data),
             Tool("save_standing_rule", "Save a standing rule an approver stated, so it applies to every future "
