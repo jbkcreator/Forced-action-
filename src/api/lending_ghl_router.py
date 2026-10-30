@@ -93,6 +93,12 @@ def ghl_text_consent(
 _UNRESOLVED_VALUES = frozenset({"null", "none", "undefined", "nan"})
 
 
+def _resolved(body: dict[str, Any], name: str) -> Optional[str]:
+    """An optional field, or None when GHL sent an unresolved merge field ("null") in its place."""
+    value = _field(body, name)
+    return None if value is None or value.strip().lower() in _UNRESOLVED_VALUES else value
+
+
 @router.post("/ghl-stage")
 def ghl_stage(
     body: dict[str, Any],
@@ -114,7 +120,7 @@ def ghl_stage(
                  "booked_by, raw_event) VALUES (:opp, :pipe, :stage, :key, :phone, :by, CAST(:raw AS jsonb)) "
                  "ON CONFLICT (ghl_opportunity_id, stage_key) DO NOTHING"),
             {"opp": opportunity_id, "pipe": _field(body, "pipeline_id"), "stage": stage, "key": stage.strip().lower(),
-             "phone": normalize(_field(body, "phone")), "by": _field(body, "booked_by"), "raw": json.dumps(body)},
+             "phone": normalize(_resolved(body, "phone")), "by": _resolved(body, "booked_by"), "raw": json.dumps(body)},
         ).rowcount
         db.commit()
     except Exception as exc:
