@@ -25,6 +25,7 @@ from src.lending.disposition_delivery import _configured_slack, _slack_client
 from src.lending.lendingflow import deliver_and_follow_up, release_held_and_commit
 from src.lending.lendingflow_ghl import get_live_sink
 from src.lending.slack_names import name_and_ref
+from src.lending.slack_test_filter import log_skipped, hidden_lendingflow_ids
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,10 @@ def alert_undelivered(slack_client: Any = None, minutes: Optional[int] = None) -
                      "NULLIF(btrim(concat_ws(' ', first_name, last_name)), '')"),
                 {"m": minutes, "limit": SWEEP_BATCH_SIZE},
             ).all()
+            test_ids = hidden_lendingflow_ids(db, [r[0] for r in rows])
+        for lead_id in sorted(test_ids):  # flagged with no post, so they are not picked up again
+            log_skipped("undelivered LendingFlow lead alert", f"lead {lead_id}")
+        rows = [r for r in rows if r[0] not in test_ids]
         if not rows:
             return 0
         ids = [r[0] for r in rows]

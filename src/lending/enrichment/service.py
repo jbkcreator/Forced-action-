@@ -46,6 +46,7 @@ from src.lending.enrichment.ports import (
 from src.lending.enrichment.property_facts import PropertyFacts, load_property_facts, match_property
 from src.lending.enrichment.routing import route_lead, today_et
 from src.lending.slack_names import name_and_ref, names_by_lendingflow_lead
+from src.lending.slack_test_filter import log_skipped, hidden_lendingflow_ids
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
@@ -285,6 +286,9 @@ def _post_if_needed(db, lead_id, tag, address, close, facts, fit, coverage, *, f
     card_done = signature == last_signature
     analysis_done = not wants_analysis or signature == last_analysis_signature
     if not (tag is RoutingTag.FULL_MACHINE or from_call) or (card_done and analysis_done):
+        return EnrichmentOutcome(lead_id, READY, tag.value)
+    if hidden_lendingflow_ids(db, [lead_id]):  # READY with no post: the sweep does not retry it
+        log_skipped("enrichment card", f"lead {lead_id}")
         return EnrichmentOutcome(lead_id, READY, tag.value)
     try:
         thread = thread or default_deal_thread()

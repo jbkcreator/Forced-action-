@@ -21,6 +21,7 @@ from config.settings import get_settings
 from src.lending.db import lending_session
 from src.lending.dispositions import last4
 from src.lending.slack_names import name_and_ref, names_by_phone
+from src.lending.slack_test_filter import log_skipped, hidden_phones
 from src.lending.slack_signature import SIGNATURE_TOLERANCE_SECONDS, verify_slack_signature  # noqa: F401 - re-exported
 from src.lending.soft_approval.facts import SoftApprovalFacts
 
@@ -167,6 +168,10 @@ def post_soft_approval_card(row_id: int, client: Any = None) -> None:
                 {"call_id": row.dialer_call_id, "phone": row.phone, "channel": channel},
             ).scalar()
             if claimed is None:
+                return
+            if row.phone in hidden_phones(db, [row.phone]):
+                # The claim stays (message_ts NULL), so the retry job does not pick the call up again.
+                log_skipped("soft approval card", f"call {row.dialer_call_id}")
                 return
             fallback, blocks = build_card_blocks(
                 call_id=row.dialer_call_id, phone=row.phone, caller=row.caller_name or row.caller_seat,

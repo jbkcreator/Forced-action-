@@ -977,6 +977,8 @@ class AppSettings(BaseSettings):
 	lending_seat_groups: str = Field(default="", env="LENDING_SEAT_GROUPS")  # "agentid:A,agentid:B" (BatchDialer agent id) -> shift group per seat
 	lending_disposition_missing_alert_minutes: int = Field(default=10, env="LENDING_DISPOSITION_MISSING_ALERT_MINUTES")
 	lending_slack_bot_token: Optional[SecretStr] = Field(default=None, env="LENDING_SLACK_BOT_TOKEN")
+	lending_slack_test_enabled: bool = Field(default=False, env="LENDING_SLACK_TEST_ENABLED")  # true while testing: posts about test records (config/lending_test_data.py rules) go to Slack; false (live) skips them
+	lending_test_ips: str = Field(default="", env="LENDING_TEST_IPS")  # comma-separated office IPs: website leads submitted from them are test leads (is_test, kept out of Slack on live)
 	lending_dial_tasks_channel: str = Field(default="", env="LENDING_DIAL_TASKS_CHANNEL")  # #dial-tasks channel ID
 	lending_dnc_alert_channel: str = Field(default="", env="LENDING_DNC_ALERT_CHANNEL")  # DNC not propagated / removal pending; channel ID, unset = not posted
 	lending_replies_channel: str = Field(default="", env="LENDING_REPLIES_CHANNEL")  # #lead-alerts: rate/terms and reschedule handoffs, AI-quote alerts, reply SLA; channel ID, Cora's bot must be a member

@@ -37,6 +37,7 @@ from src.lending.payload_shape import log_shape
 from src.lending.db import lending_session
 from src.lending.reply_guard import slack_poster
 from src.lending.slack_names import name_and_ref, names_by_phone
+from src.lending.slack_test_filter import log_skipped, hidden_phones
 
 logger = logging.getLogger(__name__)
 
@@ -253,6 +254,17 @@ def _appointment_person(appointment_id: str) -> Optional[str]:
         return None
 
 
+def _is_test_appointment(appointment_id: str) -> bool:
+    """The booked phone belongs only to test records. Never raises: a failed check posts as usual."""
+    try:
+        with lending_session() as db:
+            row = db.execute(_BOOKING_CONTACT, {"event_id": appointment_id}).first()
+            return bool(row and row[1] and hidden_phones(db, [row[1]]))
+    except Exception as exc:  # class only
+        logger.warning("[booking-webhook] appointment test check failed (%s)", type(exc).__name__)
+        return False
+
+
 def _release_slot(appointment_id: str) -> Optional[bool]:
     """Cancel the GHL appointment after the failed-check handling is committed. None when slot release is off.
     A refusal is posted to the replies channel so a held slot is never left unnoticed."""
@@ -260,7 +272,9 @@ def _release_slot(appointment_id: str) -> Optional[bool]:
     if canceller is None:
         return None
     released = canceller(appointment_id)
-    if not released:
+    if not released and _is_test_appointment(appointment_id):
+        log_skipped("unreleased slot alert", f"appointment {appointment_id}")
+    elif not released:
         person = _appointment_person(appointment_id)
         posted = False
         poster = slack_poster()

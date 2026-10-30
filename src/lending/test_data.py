@@ -1,6 +1,7 @@
 """Tag the identifiable test rows ``is_test`` and log every one (Q35, Q42).
 
-Rules (config/lending_test_data.py): a test email domain on the row, the test partner by name, and rows that belong to
+Rules (config/lending_test_data.py): a test email domain on the row, a name starting with the word "test", an office
+IP on a website lead (LENDING_TEST_IPS), the test partner by name, and rows that belong to
 a tagged lead, loan file or partner (a loan file of a test partner, the routing row of a test lead or file). Rows are
 tagged, never deleted, and nothing here touches suppression or consent. Every tagged row is written to
 ``lending.test_data_cleanup_log`` (table, row id, rule: no names, numbers or emails).
@@ -30,9 +31,17 @@ from typing import Optional
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
-from config.lending_test_data import TEST_EMAIL_DOMAINS, TEST_PARTNER_NAME_PREFIX
+from config.lending_test_data import TEST_EMAIL_DOMAINS, TEST_NAME_PATTERN, TEST_PARTNER_NAME_PREFIX
+from config.settings import get_settings
 
 logger = logging.getLogger(__name__)
+
+
+def rule_params() -> dict:
+    """Bind parameters of the test rules; shared with the Slack test filter so both always agree."""
+    ips = [ip.strip() for ip in get_settings().lending_test_ips.split(",") if ip.strip()]
+    return {"domains": list(TEST_EMAIL_DOMAINS), "partner_prefix": f"{TEST_PARTNER_NAME_PREFIX}%",
+            "name_pattern": TEST_NAME_PATTERN, "test_ips": ips}
 
 _DOMAIN = "split_part(lower({column}), '@', 2) = ANY(:domains)"
 # (table, rule, condition). Order matters: a row is tagged by its own data first, then what hangs off a tagged row.
@@ -52,6 +61,10 @@ _STEPS: tuple[tuple[str, str, str], ...] = (
     ("lending.loan_files", "email_domain", _DOMAIN.format(column="borrower_email")),
     ("lending.loan_files", "test_partner",
      "partner_id IN (SELECT id FROM lending.partners WHERE is_test)"),
+    ("lending.lendingflow_leads", "test_name", "concat_ws(' ', first_name, last_name) ~* :name_pattern"),
+    ("lending.web_leads", "test_name", "name ~* :name_pattern"),
+    ("lending.loan_files", "test_name", "concat_ws(' ', borrower_first_name, borrower_last_name) ~* :name_pattern"),
+    ("lending.web_leads", "office_ip", "ip_address = ANY(:test_ips)"),
     ("lending.file_routing", "test_lead",
      "lead_id IN (SELECT id FROM lending.lendingflow_leads WHERE is_test)"),
     ("lending.file_routing", "test_loan_file",
@@ -95,7 +108,7 @@ def tag_test_rows(db, *, apply: bool, lead_ids: Optional[list[int]] = None) -> T
     if len(lead_ids) > MAX_NAMED_LEADS:
         raise ValueError(f"name at most {MAX_NAMED_LEADS} leads at a time")
     report = TagReport(run_id=f"test-tag-{uuid.uuid4().hex[:12]}", applied=apply)
-    params = {"domains": list(TEST_EMAIL_DOMAINS), "partner_prefix": f"{TEST_PARTNER_NAME_PREFIX}%", "lead_ids": lead_ids}
+    params = {**rule_params(), "lead_ids": lead_ids}
     savepoint = db.begin_nested()
     try:
         for table, rule, condition in _steps_with_named_leads(lead_ids):

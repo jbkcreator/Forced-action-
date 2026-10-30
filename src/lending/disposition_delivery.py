@@ -26,6 +26,7 @@ from src.lending.cora_inbox import add_to_inbox_in_own_session
 from src.lending.db import lending_session
 from src.lending.dispositions import last4, lookup_load_record
 from src.lending.slack_names import name_and_ref, names_by_phone
+from src.lending.slack_test_filter import log_skipped, hidden_phones
 from packages.agent_core.redaction import slack_escape
 
 logger = logging.getLogger(__name__)
@@ -237,6 +238,13 @@ def _deliver_sheet(db, row: dict, service: Any) -> None:
 
 
 def _deliver_slack(db, row: dict, client: Any) -> None:
+    if row["phone"] in hidden_phones(db, [row["phone"]]):
+        # Marked delivered with no post (slack_ts stays NULL), so the retry job does not pick it up again.
+        db.execute(text("UPDATE lending.call_dispositions SET slack_posted_disposition = :d WHERE id = :id"),
+                   {"d": row["disposition"], "id": row["id"]})
+        db.commit()
+        log_skipped("disposition card", f"call {row['dialer_call_id']}")
+        return
     try:
         now = datetime.now(timezone.utc)
         record = lookup_load_record(db, row["dialer_contact_id"], row["phone"], row["call_started_at"])

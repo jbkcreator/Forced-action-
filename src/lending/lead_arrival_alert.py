@@ -28,6 +28,7 @@ from src.lending.contracts import LendingFlowLeadCreated
 from src.lending.cora_inbox import add_to_inbox_in_own_session
 from src.lending.db import lending_session
 from src.lending.slack_names import name_and_ref
+from src.lending.slack_test_filter import is_hidden_lendingflow_uuid, log_skipped
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,15 @@ def _lead_name(event: LendingFlowLeadCreated) -> Optional[str]:
         return None
 
 
+def _is_test_lead(event: LendingFlowLeadCreated) -> bool:
+    try:
+        with lending_session() as db:
+            return is_hidden_lendingflow_uuid(db, event.lead_id)
+    except Exception as exc:  # class only: a failed check posts as usual
+        logger.warning("[lead-arrival-alert] lead=%s test check failed (%s)", event.lead_id, type(exc).__name__)
+        return False
+
+
 def alert_text(event: LendingFlowLeadCreated, mention_ids: frozenset[str], contact_url: Optional[str] = None,
                name: Optional[str] = None) -> str:
     mentions = " ".join(f"<@{user_id}>" for user_id in sorted(mention_ids))
@@ -91,12 +101,16 @@ def alert_text(event: LendingFlowLeadCreated, mention_ids: frozenset[str], conta
 
 
 def alert_josh(event: LendingFlowLeadCreated) -> Optional[bool]:
-    """Post the arrival alert. True when posted, False when Slack refused it, None when switched off."""
+    """Post the arrival alert. True when posted, False when Slack refused it, None when switched off or the lead is a
+    test record while LENDING_SLACK_TEST_ENABLED is off."""
     settings = get_settings()
     channel = settings.lending_ops_channel
     mention_ids = parse_user_ids(settings.lending_cora_approver_user_ids)
     if not (settings.lending_lead_arrival_alert_enabled and settings.lending_slack_bot_token and channel
             and mention_ids):
+        return None
+    if _is_test_lead(event):
+        log_skipped("lead arrival alert", event.lead_id)
         return None
     contact_url = ghl_contact_url(settings.lending_ghl_app_url, settings.lending_ghl_location_id, event.ghl_contact_id)
     name = _lead_name(event)

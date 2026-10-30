@@ -42,6 +42,7 @@ from config.settings import get_settings
 from src.lending.compliance import phone_hash
 from src.lending.cora_inbox import add_to_inbox_safely
 from src.lending.slack_names import name_and_ref, names_by_ghl_contact
+from src.lending.slack_test_filter import log_skipped, hidden_ghl_contacts
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
@@ -224,7 +225,8 @@ def _queue_for_cora(db, kind: str, event: ReplyEvent) -> None:
 
 
 def handle_reply_event(db, event: ReplyEvent, *, poster: Optional[SlackPoster]) -> str:
-    """Returns "ignored", "duplicate", "posted" or "not_configured". Commits the claim before posting (so
+    """Returns "ignored", "duplicate", "posted", "not_configured" or "test_skipped" (a test contact while
+    LENDING_SLACK_TEST_ENABLED is off). Commits the claim before posting (so
     a failed post is retried on redelivery) and the post result after. Raises if the post itself fails."""
     if event.direction == "outbound" and event.from_user and event.contact_id:
         answered = db.execute(_RESPONDED, {"contact_id": event.contact_id}).rowcount
@@ -243,6 +245,10 @@ def handle_reply_event(db, event: ReplyEvent, *, poster: Optional[SlackPoster]) 
         logger.error("[reply-guard] %s for message %s not posted: Slack channel or token is not configured",
                      kind, event.message_id)
         return "not_configured"
+    if event.contact_id and event.contact_id in hidden_ghl_contacts(db, [event.contact_id]):
+        # posted_at stays NULL, so the reply SLA check never alerts on it either.
+        log_skipped(f"{kind} handoff", f"message {event.message_id}")
+        return "test_skipped"
     full_name = names_by_ghl_contact(db, [event.contact_id]).get(event.contact_id) if event.contact_id else None
     poster(format_slack(kind, event, full_name=full_name))
     db.execute(_POSTED, {"message_id": event.message_id})

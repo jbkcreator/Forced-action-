@@ -33,6 +33,7 @@ from src.lending.cora_inbox import add_to_inbox_in_own_session
 from src.lending.lead_arrival_alert import ghl_contact_url
 from src.lending.ops_alerts import post_ops_alert
 from src.lending.slack_names import name_and_ref
+from src.lending.slack_test_filter import log_skipped, hidden_web_lead_ids
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
@@ -384,6 +385,11 @@ def _alert_returning(db, lead: Mapping[str, Any], result: PushResult, now: datet
         text("SELECT returning_alerted_at IS NOT NULL FROM lending.web_leads WHERE id = :id"), {"id": lead["id"]},
     ).scalar()
     if already:
+        return
+    if int(lead["id"]) in hidden_web_lead_ids(db, [int(lead["id"])]):
+        log_skipped("returning borrower alert", f"web lead {lead['id']}")
+        db.execute(text("UPDATE lending.web_leads SET returning_alerted_at = :now WHERE id = :id"),
+                   {"now": now, "id": lead["id"]})
         return
     settings = get_settings()
     url = ghl_contact_url(settings.lending_ghl_app_url, settings.lending_ghl_location_id, result.contact_id)

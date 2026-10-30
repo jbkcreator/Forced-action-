@@ -31,6 +31,7 @@ from src.lending.cora_inbox import add_to_inbox_safely
 from src.lending.db import lending_session
 from src.lending.reply_guard import slack_poster
 from src.lending.slack_names import name_and_ref, names_by_ghl_contact
+from src.lending.slack_test_filter import log_skipped, hidden_ghl_contacts
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +110,14 @@ def main(*, now: Optional[datetime] = None) -> int:
     try:
         with lending_session() as db:
             rows = overdue_handoffs(db, now)
+            test_contacts = hidden_ghl_contacts(db, [r["contact_id"] for r in rows])
+            skipped = [r for r in rows if r["contact_id"] in test_contacts]
+            rows = [r for r in rows if r["contact_id"] not in test_contacts]
+            if skipped:  # marked alerted with no post, so they are not checked again
+                db.execute(_MARK_ALERTED, {"ids": [r["message_id"] for r in skipped]})
+                db.commit()
+                for row in skipped:
+                    log_skipped("reply SLA alert", f"message {row['message_id']}")
             if not rows:
                 return 0
             poster(format_alert(rows, names_by_ghl_contact(db, [r["contact_id"] for r in rows])))

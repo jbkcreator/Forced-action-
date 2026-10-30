@@ -41,6 +41,7 @@ from src.lending.partners import Partner, StatusChange, partner_by_id, record_st
 from src.lending.prequal import TEMPLATE, FitLimits, PrequalLead, build_context
 from src.lending.prequal_fit import fit_limits_from_result
 from src.lending.slack_names import full_name, name_and_ref
+from src.lending.slack_test_filter import log_skipped, hidden_loan_file_ids
 
 logger = logging.getLogger(__name__)
 
@@ -388,8 +389,12 @@ def _after_routing(file: dict[str, Any], partner: Optional[Partner], fit: Option
                            {"id": file_id}).mappings().first() or {}
         state = db.execute(text("SELECT status, status_reason FROM lending.loan_files WHERE id = :id"),
                            {"id": file_id}).first()
+        test_file = bool(hidden_loan_file_ids(db, [file_id]))
     status_text = (state[0] + (f" ({state[1]})" if state[1] else "")) if state else "unknown"
-    if not flags.get("josh_notified_at") and services.slack is not None:
+    if not flags.get("josh_notified_at") and test_file:  # stamped with no post, so the sweep does not retry it
+        log_skipped("partner file card", f"file {file_id}")
+        _stamp(session_factory, file_id, "josh_notified_at")
+    elif not flags.get("josh_notified_at") and services.slack is not None:
         try:
             services.slack(_josh_note(file, partner, fit, status_text))
             _stamp(session_factory, file_id, "josh_notified_at")
@@ -608,8 +613,11 @@ def flag_lapsed_notices(max_age_hours: int, services: Optional[PipelineServices]
                     bindparam("ids", expanding=True)),
                 {"ids": sorted({file_id for file_id, _ in kinds})},
             ).mappings().all()}
+            test_files = hidden_loan_file_ids(db, list(files))
+        for file_id in sorted(test_files):  # stamped above with no post, so they are not flagged again
+            log_skipped("lapsed partner notice alert", f"file {file_id}")
         lapsed = [LapsedNotice(file_id, files[file_id]["name"], _slack_place(files[file_id]), what)
-                  for file_id, what in kinds if file_id in files]
+                  for file_id, what in kinds if file_id in files and file_id not in test_files]
         for notice in lapsed:
             _post_lapsed_alert(services, notice, max_age_hours)
         return lapsed
