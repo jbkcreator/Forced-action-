@@ -50,6 +50,7 @@ from src.lending.cora_channels import (
 from src.lending.cora_inbox import OPEN_STATUSES, close_item, get_item, open_items, slack_safe
 from src.lending.lender_fit import evaluate_lender_fit
 from src.lending.scoreboard import build_scoreboard
+from src.lending.slack_names import name_and_ref, names_by_phone, readable_ref
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
@@ -276,6 +277,11 @@ def _routed_post(item: Mapping[str, Any], note: Optional[str], user_id: str) -> 
 
 def _last4(phone: Optional[str]) -> Optional[str]:
     return f"…{phone[-4:]}" if phone else None
+
+
+def _who(lead: _Lead) -> str:
+    """``Daniel Smith (contact 18008)`` for a draft summary; agent_core escapes the summary when it posts the card."""
+    return name_and_ref(lead.name, readable_ref(lead.ref), escape=False)
 
 
 def _today() -> date:
@@ -661,9 +667,13 @@ class CoraToolkit:
                else "SELECT NULL AS name, phone, email, NULL AS ghl_contact_id FROM lending.contacts WHERE id = :id")
         with self._read_only() as session:
             row = session.execute(text(sql), {"id": lead_id}).mappings().first()
+            # A contact row has no name: take it from the lead record that holds the same phone.
+            name = (row["name"] if row is not None and row["name"]
+                    else names_by_phone(session, [row["phone"]]).get(row["phone"]) if row is not None and row["phone"]
+                    else None)
         if row is None:
             raise ToolInputError(f"{lead_ref} does not exist; use find_lead first")
-        return _Lead(lead_ref, row["name"], normalize(row["phone"]) if row["phone"] else None,
+        return _Lead(lead_ref, name, normalize(row["phone"]) if row["phone"] else None,
                      (row["email"] or "").strip().lower() or None, row["ghl_contact_id"])
 
     def draft_sms(self, args: DraftSmsInput, _: ToolContext) -> EgressDraft:
@@ -673,7 +683,7 @@ class CoraToolkit:
         if not lead.phone:
             raise ToolInputError(f"{lead.ref} has no phone number on record")
         return EgressDraft(channel="ghl_sms", payload={"lead_ref": lead.ref, "to_phone": lead.phone, "body": args.body},
-                           summary=f"Text to {lead.name or 'lead'} ({_last4(lead.phone)})",
+                           summary=f"Text to {_who(lead)} ({_last4(lead.phone)})",
                            recipient_phone=lead.phone, recipient_email=lead.email, contact_ref=lead.ref)
 
     def draft_email(self, args: DraftEmailInput, _: ToolContext) -> EgressDraft:
@@ -685,7 +695,7 @@ class CoraToolkit:
         return EgressDraft(channel="ghl_email",
                            payload={"lead_ref": lead.ref, "to_email": lead.email, "to_phone": lead.phone,
                                     "subject": args.subject, "body": args.body},
-                           summary=f"Email to {lead.name or 'lead'} <{lead.email}>: {args.subject}",
+                           summary=f"Email to {_who(lead)} <{lead.email}>: {args.subject}",
                            recipient_phone=lead.phone, recipient_email=lead.email, contact_ref=lead.ref)
 
     def draft_pipeline_move(self, args: DraftPipelineMoveInput, _: ToolContext) -> EgressDraft:
@@ -694,7 +704,7 @@ class CoraToolkit:
             raise ToolInputError(f"{lead.ref} has not reached GoHighLevel yet, so it has no pipeline card to move")
         return EgressDraft(channel="ghl_stage",
                            payload={"lead_ref": lead.ref, "ghl_contact_id": lead.ghl_contact_id, "stage": args.stage},
-                           summary=f"Move {lead.name or 'lead'} to '{args.stage}' in GoHighLevel",
+                           summary=f"Move {_who(lead)} to '{args.stage}' in GoHighLevel",
                            recipient_phone=lead.phone, recipient_email=lead.email, contact_ref=lead.ref)
 
     def tools(self) -> list[Tool]:

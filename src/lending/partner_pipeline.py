@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 from sqlalchemy import bindparam, inspect, text
 
@@ -40,6 +40,7 @@ from src.lending.contracts import BorrowerProfile, LenderFitResult, LoanRequest
 from src.lending.partners import Partner, StatusChange, partner_by_id, record_status_change
 from src.lending.prequal import TEMPLATE, FitLimits, PrequalLead, build_context
 from src.lending.prequal_fit import fit_limits_from_result
+from src.lending.slack_names import full_name, name_and_ref
 
 logger = logging.getLogger(__name__)
 
@@ -243,14 +244,17 @@ def _josh_note(file: dict[str, Any], partner: Partner, fit: Optional[LenderFitRe
     who = partner.name + (f" · {partner.company}" if partner.company else "")
     loan = f"{PRODUCT_LABELS.get(file['product'], file['product'])} · ${int(file['loan_amount']):,}"
     lender_fit = f"{fitting} fit · {possible} possible" if fit is not None else "Not scored"
-    text = f"New partner file #{file['id']} from {who}: {loan}, {file['property_state']}, borrower {file['borrower_last_name']}"
+    borrower = full_name(file.get("borrower_first_name"), file.get("borrower_last_name"))
+    borrower_label = name_and_ref(borrower, f"file {file['id']}")
+    text = (f"New partner file #{file['id']} from {who}: {loan}, {file['property_state']}, "
+            f"borrower {borrower or 'unknown'}")
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn",
                                      "text": f"*New partner file  #{file['id']}*\n{_mrkdwn(who)}"}},
         {"type": "section", "fields": [
             {"type": "mrkdwn", "text": f"*Loan*\n{_mrkdwn(loan)}"},
             {"type": "mrkdwn", "text": f"*State*\n{_mrkdwn(file['property_state'])}"},
-            {"type": "mrkdwn", "text": f"*Borrower*\n{_mrkdwn(file['borrower_last_name'])}"},
+            {"type": "mrkdwn", "text": f"*Borrower*\n{borrower_label}"},
             {"type": "mrkdwn", "text": f"*Lender fit*\n{lender_fit}"},
         ]},
         {"type": "context", "elements": [{"type": "mrkdwn",
@@ -261,6 +265,12 @@ def _josh_note(file: dict[str, Any], partner: Partner, fit: Optional[LenderFitRe
 
 def _place(address: Optional[str], last_name: str) -> str:
     return address or f"the {last_name} file"
+
+
+def _slack_place(file: Mapping[str, Any]) -> str:
+    """For the team's Slack alert: the place plus the borrower's full name (the partner emails keep ``_place``)."""
+    borrower = full_name(file.get("borrower_first_name"), file.get("borrower_last_name")) or "unknown borrower"
+    return f"{_place(file['property_address'], file['borrower_last_name'])}, borrower {borrower}"
 
 
 @dataclass(frozen=True)
@@ -592,13 +602,13 @@ def flag_lapsed_notices(max_age_hours: int, services: Optional[PipelineServices]
             if not kinds:
                 return []
             files = {int(row["id"]): row for row in db.execute(
-                text("SELECT f.id, f.property_address, f.borrower_last_name, p.name FROM lending.loan_files f "
+                text("SELECT f.id, f.property_address, f.borrower_first_name, f.borrower_last_name, p.name "
+                     "FROM lending.loan_files f "
                      "JOIN lending.partners p ON p.id = f.partner_id WHERE f.id IN :ids").bindparams(
                     bindparam("ids", expanding=True)),
                 {"ids": sorted({file_id for file_id, _ in kinds})},
             ).mappings().all()}
-        lapsed = [LapsedNotice(file_id, files[file_id]["name"],
-                               _place(files[file_id]["property_address"], files[file_id]["borrower_last_name"]), what)
+        lapsed = [LapsedNotice(file_id, files[file_id]["name"], _slack_place(files[file_id]), what)
                   for file_id, what in kinds if file_id in files]
         for notice in lapsed:
             _post_lapsed_alert(services, notice, max_age_hours)

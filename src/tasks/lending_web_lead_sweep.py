@@ -4,7 +4,7 @@ Picks up leads still pending (GHL was down, or not configured when they arrived)
 longer between tries as failures pile up (config.lending_web.GHL_RETRY_BACKOFF_MINUTES) and giving up
 only when a lead is GHL_GIVE_UP_AFTER_HOURS old. A rejected key (HTTP 401/403) does not use up
 attempts. A lead still not in GHL GHL_ALERT_AFTER_MINUTES after it arrived is posted to Slack once,
-with ids and the last error only (no names or numbers). Cron: every 5 minutes.
+with each lead's full name + id and the last error (no phone numbers). Cron: every 5 minutes.
 
     python -m src.tasks.lending_web_lead_sweep
 """
@@ -19,6 +19,7 @@ from config.lending_web import GHL_ALERT_AFTER_MINUTES, GHL_GIVE_UP_AFTER_HOURS
 from config.settings import get_settings
 from src.lending.db import lending_session
 from src.lending.disposition_delivery import _configured_slack, _slack_client
+from src.lending.slack_names import name_and_ref
 from src.lending.web_lead_ghl import get_live_sink
 from src.lending.web_leads import deliver_pending
 
@@ -39,19 +40,20 @@ def alert_undelivered(slack_client: Any = None, minutes: Optional[int] = None) -
                      "SELECT id FROM lending.web_leads WHERE ghl_status IN ('pending', 'failed') "
                      "AND ghl_alerted_at IS NULL AND received_at < now() - make_interval(mins => :m) "
                      "ORDER BY received_at LIMIT 50 FOR UPDATE SKIP LOCKED) "
-                     "RETURNING id, ghl_last_error"),
+                     "RETURNING id, ghl_last_error, name"),
                 {"m": minutes},
             ).all()
         if not rows:
             return 0
         ids = [r[0] for r in rows]
         reasons = sorted({r[1] for r in rows if r[1]})
+        who = ", ".join(name_and_ref(r[2], f"web lead {r[0]}") for r in rows[:10])
         client = slack_client or _slack_client()
         try:
             client.chat_postMessage(
                 channel=get_settings().lending_dial_tasks_channel,
                 text=(f":warning: {len(ids)} website lead(s) are not in GoHighLevel {minutes} min after arriving "
-                      f"(lead ids {', '.join(map(str, ids[:10]))}{'…' if len(ids) > 10 else ''}). They are saved in "
+                      f"({who}{'…' if len(ids) > 10 else ''}). They are saved in "
                       f"lending.web_leads and keep retrying for {GHL_GIVE_UP_AFTER_HOURS}h. "
                       f"Last error: {'; '.join(reasons) or 'none (GHL not configured?)'}."),
             )

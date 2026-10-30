@@ -43,6 +43,18 @@ def test_email_card_shows_the_address_masked(queue: PendingActionQueue) -> None:
     assert "s***@example.com" in rendered
 
 
+def test_card_shows_the_draft_as_plain_text_not_json(queue: PendingActionQueue) -> None:
+    action_id = queue.enqueue(tool_name="after_hours_reply", channel="ghl_sms",
+                              payload={"body": "Hi TEST, we missed your call.\nWe will call back.",
+                                       "lead_ref": "contact:18008", "to_phone": "+19177303812"},
+                              summary="After-hours reply")
+    preview = render_action_card(queue.get(action_id))[2]["text"]["text"]
+    assert "```" not in preview and "{" not in preview and '"body"' not in preview
+    assert "*Lead:* contact:18008" in preview
+    assert "*To:* +[…3812]" in preview
+    assert preview.endswith("> Hi TEST, we missed your call.\n> We will call back.")
+
+
 def test_email_mask_keeps_first_letter_and_domain_only() -> None:
     assert mask_emails("write to Sam.Lee+loans@mail.example.co.uk today") == "write to S***@mail.example.co.uk today"
     assert mask_emails("no address here, just @mentions") == "no address here, just @mentions"

@@ -358,12 +358,12 @@ def test_without_ghl_configured_leads_wait_and_no_attempt_is_burned(web_leads_db
 # Chunk 1 Addendum 1.2.2 / 1.1.2
 
 @pytest.mark.parametrize("name,moved,expected", [
-    ("Dana Builder", True, ":recycle: Returning Borrower Resubmitted Form: Dana B. - Moved to New Lead"),
-    ("Dana", False, ":recycle: Returning Borrower Resubmitted Form: Dana - Left in its current stage"),
+    ("Dana Builder", True, ":recycle: Returning Borrower Resubmitted Form: Dana Builder (web lead 7) - Moved to New Lead"),
+    ("Dana", False, ":recycle: Returning Borrower Resubmitted Form: Dana (web lead 7) - Left in its current stage"),
 ])
-def test_returning_alert_names_the_borrower_by_first_name_and_initial(name, moved, expected):
+def test_returning_alert_names_the_borrower_by_full_name_and_id(name, moved, expected):
     text_ = returning_alert_text(name, lead_id=7, moved=moved, contact_url=None)
-    assert text_.startswith(expected) and "Lead `7`" in text_ and "Builder" not in text_
+    assert text_.startswith(expected)
 
 
 def test_returning_alert_links_the_ghl_contact():

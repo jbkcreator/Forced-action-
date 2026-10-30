@@ -41,6 +41,7 @@ from config.lending_reply_agent import (
 from config.settings import get_settings
 from src.lending.compliance import phone_hash
 from src.lending.cora_inbox import add_to_inbox_safely
+from src.lending.slack_names import name_and_ref, names_by_ghl_contact
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
@@ -169,8 +170,10 @@ def _slack_safe(value: str) -> str:
     return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def format_slack(kind: str, event: ReplyEvent, *, now: Optional[datetime] = None) -> str:
-    who = _slack_safe(event.first_name or "Unknown contact")
+def format_slack(kind: str, event: ReplyEvent, *, now: Optional[datetime] = None,
+                 full_name: Optional[str] = None) -> str:
+    """``full_name`` (looked up from the lead record) replaces the GHL first name when known."""
+    who = name_and_ref(full_name or event.first_name)
     tail = f" (…{event.phone[-4:]})" if event.phone else ""
     snippet = _slack_safe(redact_financial_digits(event.body)[:SNIPPET_CHARS]) + ("…" if len(event.body) > SNIPPET_CHARS else "")
     ref = f"\nGHL contact: {_slack_safe(event.contact_id)}" if event.contact_id else ""
@@ -240,7 +243,8 @@ def handle_reply_event(db, event: ReplyEvent, *, poster: Optional[SlackPoster]) 
         logger.error("[reply-guard] %s for message %s not posted: Slack channel or token is not configured",
                      kind, event.message_id)
         return "not_configured"
-    poster(format_slack(kind, event))
+    full_name = names_by_ghl_contact(db, [event.contact_id]).get(event.contact_id) if event.contact_id else None
+    poster(format_slack(kind, event, full_name=full_name))
     db.execute(_POSTED, {"message_id": event.message_id})
     _queue_for_cora(db, kind, event)
     db.commit()

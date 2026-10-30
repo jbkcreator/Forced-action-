@@ -13,6 +13,7 @@ from sqlalchemy import text
 from config.settings import get_settings
 from src.lending.db import lending_session
 from src.lending.disposition_delivery import _configured_slack, _slack_client
+from src.lending.slack_names import name_and_ref, names_by_phone
 
 logger = logging.getLogger(__name__)
 
@@ -33,16 +34,19 @@ def run(slack_client: Any = None, minutes: Optional[int] = None) -> int:
                 "  AND disposition_missing_alerted_at IS NULL "
                 "  AND call_ended_at IS NOT NULL AND coalesce(talk_duration_sec, 0) > 0 "
                 "  AND call_ended_at < now() - make_interval(mins => :m) FOR UPDATE SKIP LOCKED) "
-                "RETURNING dialer_call_id, caller_seat, caller_name"
+                "RETURNING dialer_call_id, caller_seat, caller_name, phone"
             ),
             {"m": minutes},
         ).all()
         db.commit()
+        borrowers = names_by_phone(db, [row[3] for row in rows]) if rows else {}
     if not rows:
         return 0
     by_seat: dict[str, list[str]] = {}
-    for call_id, seat, name in rows:
+    labels: dict[str, str] = {}
+    for call_id, seat, name, phone in rows:
         by_seat.setdefault(name or seat or "unknown seat", []).append(call_id)
+        labels[call_id] = name_and_ref(borrowers.get(phone), f"call {call_id}")
     client = slack_client or _slack_client()
     unsent: list[str] = []
     for seat, ids in by_seat.items():
@@ -50,7 +54,8 @@ def run(slack_client: Any = None, minutes: Optional[int] = None) -> int:
             client.chat_postMessage(
                 channel=settings.lending_dial_tasks_channel,
                 text=f":warning: {seat}: {len(ids)} connected call(s) have no disposition after {minutes} min "
-                     f"({', '.join(ids[:5])}{'…' if len(ids) > 5 else ''}). A skipped disposition is a missed shift.",
+                     f"({', '.join(labels[i] for i in ids[:5])}{'…' if len(ids) > 5 else ''}). "
+                     "A skipped disposition is a missed shift.",
             )
         except Exception as exc:
             logger.error("[lending] missing-disposition alert failed: %s", type(exc).__name__)

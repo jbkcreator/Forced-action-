@@ -29,9 +29,10 @@ from config.lending_web import (
 from config.lending_occupancy import OWNER_OCCUPIED, UNKNOWN, occupancy_from_answer
 from config.settings import get_settings
 from src.lending.consent import record_consent
-from src.lending.cora_inbox import add_to_inbox_in_own_session, slack_safe
+from src.lending.cora_inbox import add_to_inbox_in_own_session
 from src.lending.lead_arrival_alert import ghl_contact_url
 from src.lending.ops_alerts import post_ops_alert
+from src.lending.slack_names import name_and_ref
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
@@ -367,12 +368,11 @@ def _deliver_one(db, sink: LeadSink, lead: dict[str, Any], now: datetime) -> int
 
 
 def returning_alert_text(name: str, lead_id: int, moved: bool, contact_url: Optional[str]) -> str:
-    """First name and last initial only: the full name stays in GHL. The name is visitor-typed, so it is escaped:
-    Slack would otherwise act on <!channel> or <url|label> inside it."""
-    first, _, last = name.strip().partition(" ")
-    shown = slack_safe(f"{first} {last.strip()[0]}." if last.strip() else first)
+    """Full name next to the web lead id, so the team can tell who resubmitted. The name is visitor-typed, so it is
+    escaped: Slack would otherwise act on <!channel> or <url|label> inside it."""
+    shown = name_and_ref(name, f"web lead {lead_id}")
     outcome = "Moved to New Lead" if moved else "Left in its current stage"
-    return (f":recycle: Returning Borrower Resubmitted Form: {shown} - {outcome}. Lead `{lead_id}`."
+    return (f":recycle: Returning Borrower Resubmitted Form: {shown} - {outcome}."
             + (f" <{contact_url}|Open in GHL>" if contact_url else ""))
 
 

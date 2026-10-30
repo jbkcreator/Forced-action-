@@ -28,7 +28,7 @@ def book(db, ref, slot, booked_by="dana@heu.ai", name="Marcus", phone="+18135550
 def test_a_task_due_today_is_listed_with_the_last_four_digits_only(db):
     book(db, "r1", datetime(2026, 10, 7, 14, 0, tzinfo=timezone.utc))     # Wed call -> due Tue
     message = digest.format_slack(digest.open_tasks(db, TODAY, NOW), TODAY)
-    assert "dana@heu.ai" in message and "Marcus (…0147)" in message and "Wed Oct 7 at 10:00 am ET" in message
+    assert "dana@heu.ai" in message and "Marcus (booking r1) (…0147)" in message and "Wed Oct 7 at 10:00 am ET" in message
     assert "+1813" not in message and "OVERDUE" not in message
 
 

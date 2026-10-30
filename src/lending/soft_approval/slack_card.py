@@ -20,6 +20,7 @@ from config.lending_soft_approval import FORM_CALLBACK_ID, OPEN_FORM_ACTION_ID
 from config.settings import get_settings
 from src.lending.db import lending_session
 from src.lending.dispositions import last4
+from src.lending.slack_names import name_and_ref, names_by_phone
 from src.lending.slack_signature import SIGNATURE_TOLERANCE_SECONDS, verify_slack_signature  # noqa: F401 - re-exported
 from src.lending.soft_approval.facts import SoftApprovalFacts
 
@@ -69,9 +70,9 @@ def card_status(outcome_key: str, *, when: datetime) -> str:
 
 def build_card_blocks(
     *, call_id: str, phone: Optional[str], caller: Optional[str],
-    status: Optional[str] = None, button_label: str = "Enter deal facts",
+    status: Optional[str] = None, button_label: str = "Enter deal facts", borrower: Optional[str] = None,
 ) -> tuple[str, list[dict]]:
-    summary = f"Call {call_id} · {last4(phone)} · caller {caller or '—'}"
+    summary = f"{name_and_ref(borrower, f'call {call_id}')} · {last4(phone)} · caller {caller or '—'}"
     fallback = f"Enter deal facts for the soft approval — {summary}"
     blocks: list[dict] = [
         {"type": "section", "text": {"type": "mrkdwn", "text": f":house: *Enter deal facts after the call*\n{summary}"}},
@@ -168,7 +169,8 @@ def post_soft_approval_card(row_id: int, client: Any = None) -> None:
             if claimed is None:
                 return
             fallback, blocks = build_card_blocks(
-                call_id=row.dialer_call_id, phone=row.phone, caller=row.caller_name or row.caller_seat)
+                call_id=row.dialer_call_id, phone=row.phone, caller=row.caller_name or row.caller_seat,
+                borrower=names_by_phone(db, [row.phone]).get(row.phone))
             posted = (client or slack_client()).chat_postMessage(channel=channel, text=fallback, blocks=blocks)
             db.execute(text("UPDATE lending.soft_approval_cards SET message_ts = :ts WHERE id = :id"),
                        {"ts": posted["ts"], "id": claimed})

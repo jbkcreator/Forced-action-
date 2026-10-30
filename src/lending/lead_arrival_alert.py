@@ -20,11 +20,14 @@ import time
 from typing import Any, Callable, Optional
 
 from slack_sdk.errors import SlackApiError
+from sqlalchemy import text
 
 from config.settings import get_settings
 from packages.agent_core.config import parse_user_ids
 from src.lending.contracts import LendingFlowLeadCreated
 from src.lending.cora_inbox import add_to_inbox_in_own_session
+from src.lending.db import lending_session
+from src.lending.slack_names import name_and_ref
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +59,24 @@ def ghl_contact_url(app_url: str, location_id: Optional[str], contact_id: Option
     return f"{app_url.rstrip('/')}/v2/location/{location_id}/contacts/detail/{contact_id}"
 
 
-def alert_text(event: LendingFlowLeadCreated, mention_ids: frozenset[str], contact_url: Optional[str] = None) -> str:
+_LEAD_NAME = text("""
+    SELECT NULLIF(btrim(concat_ws(' ', first_name, last_name)), '') FROM lending.lendingflow_leads
+     WHERE lead_uuid::text = :lead_uuid
+""")
+
+
+def _lead_name(event: LendingFlowLeadCreated) -> Optional[str]:
+    """The lead's full name for the post; a failed lookup only drops the name, never the alert."""
+    try:
+        with lending_session() as db:
+            return db.execute(_LEAD_NAME, {"lead_uuid": str(event.lead_id)}).scalar()
+    except Exception as exc:  # class only
+        logger.warning("[lead-arrival-alert] lead=%s name lookup failed (%s)", event.lead_id, type(exc).__name__)
+        return None
+
+
+def alert_text(event: LendingFlowLeadCreated, mention_ids: frozenset[str], contact_url: Optional[str] = None,
+               name: Optional[str] = None) -> str:
     mentions = " ".join(f"<@{user_id}>" for user_id in sorted(mention_ids))
     details = ", ".join(part for part in (
         event.loan_type.value if event.loan_type else None,
@@ -64,8 +84,9 @@ def alert_text(event: LendingFlowLeadCreated, mention_ids: frozenset[str], conta
         event.state,
     ) if part)
     return (f":rotating_light: {mentions} *New LendingFlow lead: call now.*"
+            + f" {name_and_ref(name, 'lead ' + str(event.lead_id)[:8])}."
             + (f" {details}." if details else "")
-            + f" Phone ending {event.phone[-4:]}. Lead `{event.lead_id}`. "
+            + f" Phone ending {event.phone[-4:]}. "
             + (f"<{contact_url}|Open in GHL to call>" if contact_url else "Open it in GHL to call."))
 
 
@@ -78,10 +99,10 @@ def alert_josh(event: LendingFlowLeadCreated) -> Optional[bool]:
             and mention_ids):
         return None
     contact_url = ghl_contact_url(settings.lending_ghl_app_url, settings.lending_ghl_location_id, event.ghl_contact_id)
-    text = alert_text(event, mention_ids, contact_url)
+    body = alert_text(event, mention_ids, contact_url, _lead_name(event))
     for attempt in range(len(RETRY_DELAYS_SECONDS) + 1):
         try:
-            _client_factory().chat_postMessage(channel=channel, text=text)
+            _client_factory().chat_postMessage(channel=channel, text=body)
         except Exception as exc:  # class only: Slack errors can echo the message text
             if attempt < len(RETRY_DELAYS_SECONDS) and _provably_not_posted(exc):
                 _sleep(RETRY_DELAYS_SECONDS[attempt])

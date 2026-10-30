@@ -34,7 +34,9 @@ from src.lending.confirmation_tasks import AI_BOOKER, complete_confirmation_task
 from src.lending.cora_inbox import add_to_inbox_in_own_session
 from src.lending.ghl_appointments import get_appointment_canceller
 from src.lending.payload_shape import log_shape
+from src.lending.db import lending_session
 from src.lending.reply_guard import slack_poster
+from src.lending.slack_names import name_and_ref, names_by_phone
 
 logger = logging.getLogger(__name__)
 
@@ -235,6 +237,23 @@ def ghl_nurture(
     return response
 
 
+_BOOKING_CONTACT = text("""
+    SELECT max(first_name), max(contact_phone) FROM lending.booking_messages WHERE provider_event_id = :event_id
+""")
+
+
+def _appointment_label(appointment_id: str) -> str:
+    """``Daniel Smith (appointment abc123)`` for Slack; the name is best-effort and never blocks the alert."""
+    name = None
+    try:
+        with lending_session() as db:
+            first_name, phone = db.execute(_BOOKING_CONTACT, {"event_id": appointment_id}).one()
+            name = (names_by_phone(db, [phone]).get(phone) if phone else None) or first_name
+    except Exception as exc:  # class only
+        logger.warning("[booking-webhook] appointment name lookup failed (%s)", type(exc).__name__)
+    return name_and_ref(name, f"appointment {appointment_id}")
+
+
 def _release_slot(appointment_id: str) -> Optional[bool]:
     """Cancel the GHL appointment after the failed-check handling is committed. None when slot release is off.
     A refusal is posted to the replies channel so a held slot is never left unnoticed."""
@@ -247,7 +266,8 @@ def _release_slot(appointment_id: str) -> Optional[bool]:
         poster = slack_poster()
         if poster is not None:
             try:
-                poster(f"*Could not release a GHL slot after a failed check*\nAppointment {appointment_id}: cancel it by hand "
+                poster(f"*Could not release a GHL slot after a failed check*\n"
+                       f"{_appointment_label(appointment_id)}: cancel it by hand "
                        "in GHL (Calendars). The contact has already been messaged and the reminders cancelled.")
                 posted = True
             except Exception as exc:

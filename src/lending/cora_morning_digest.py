@@ -15,7 +15,7 @@ the post, so a restart or a second sweep never posts twice and a failed post is 
 started after noon skips that day rather than posting a stale morning digest.
 
 The digest goes to Cora's internal channel only and is posted while Cora is halted (the halt stops sends to
-borrowers). It shows references, first names and last-4 digits only: no emails, phone numbers or consent text.
+borrowers). It shows each person's full name next to their reference: no emails, phone numbers or consent text.
 """
 from __future__ import annotations
 
@@ -32,6 +32,7 @@ from sqlalchemy.orm import Session
 from packages.agent_core.briefing import BriefSection, render_brief_blocks
 from packages.agent_core.chatport import ChatPort
 from src.lending.cora_inbox import slack_safe
+from src.lending.slack_names import full_name, name_and_ref, names_by_lead_ref, names_by_phone, readable_ref
 
 logger = logging.getLogger(__name__)
 
@@ -53,12 +54,15 @@ _PENDING_DRAFTS = text("""
       FROM lending.pending_actions WHERE status = 'pending' ORDER BY created_at LIMIT :limit
 """)
 _DUE_CONFIRMATIONS = text("""
-    SELECT booking_ref, due_date, count(*) OVER () AS total FROM lending.confirmation_tasks
-     WHERE completed_at IS NULL AND cancelled_at IS NULL AND due_date <= :day ORDER BY due_date LIMIT :limit
+    SELECT t.booking_ref, t.due_date, count(*) OVER () AS total,
+           (SELECT max(m.first_name) FROM lending.booking_messages m WHERE m.booking_ref = t.booking_ref) AS first_name,
+           (SELECT max(m.contact_phone) FROM lending.booking_messages m WHERE m.booking_ref = t.booking_ref) AS phone
+      FROM lending.confirmation_tasks t
+     WHERE t.completed_at IS NULL AND t.cancelled_at IS NULL AND t.due_date <= :day ORDER BY t.due_date LIMIT :limit
 """)
 _OPEN_INBOX = text("SELECT count(*) FROM lending.cora_inbox WHERE status IN ('new', 'surfaced')")
 _NEW_LENDINGFLOW_LEADS = text("""
-    SELECT l.id, l.first_name, l.loan_type, l.loan_amount_range, l.property_city, e.routing_tag,
+    SELECT l.id, l.first_name, l.last_name, l.loan_type, l.loan_amount_range, l.property_city, e.routing_tag,
            coalesce(e.closer_priority, false) AS closer_priority, count(*) OVER () AS total
       FROM lending.lendingflow_leads l LEFT JOIN lending.lendingflow_enrichment e ON e.lead_id = l.id
      WHERE l.received_at >= :since AND NOT l.suppressed AND NOT l.is_test
@@ -72,7 +76,7 @@ _WEB_LEADS = text("""
 """)
 _TODAYS_CALLS = text("""
     SELECT booking_ref, max(first_name) AS first_name, max(booked_by) AS booked_by,
-           max(slot_start_utc) AS slot_start
+           max(slot_start_utc) AS slot_start, max(contact_phone) AS phone
       FROM lending.booking_messages
      WHERE slot_start_utc >= :start AND slot_start_utc < :end
      GROUP BY booking_ref ORDER BY slot_start LIMIT :limit
@@ -144,6 +148,7 @@ def gather(db: Session, day: date, now: datetime, *, halted: bool, halt_reason: 
     calls = _section(db, "booked calls", lambda: _rows(
         db, _TODAYS_CALLS, {"start": start, "end": start + timedelta(days=1), "limit": LIST_LIMIT}), [], missing)
     queues = _section(db, "dialer queues", lambda: _rows(db, _DIALER_QUEUES, {}), [], missing)
+    _add_full_names(db, drafts, confirmations, calls)
     return DigestData(
         halted=halted, halt_reason=halt_reason,
         pending_drafts=drafts, pending_total=_total(drafts),
@@ -152,6 +157,17 @@ def gather(db: Session, day: date, now: datetime, *, halted: bool, halt_reason: 
         web_leads=int(web["total"]), web_leads_not_in_ghl=int(web["not_in_ghl"]),
         todays_calls=calls, dialer_queues=queues, unavailable=tuple(missing),
     )
+
+
+def _add_full_names(db: Session, drafts: list[dict[str, Any]], confirmations: list[dict[str, Any]],
+                    calls: list[dict[str, Any]]) -> None:
+    """Put each person's full name on the rows (``full_name``) so the digest names them next to the id."""
+    by_ref = names_by_lead_ref(db, [d["contact_ref"] for d in drafts])
+    by_phone = names_by_phone(db, [row.get("phone") for row in (*confirmations, *calls)])
+    for d in drafts:
+        d["full_name"] = by_ref.get(d["contact_ref"])
+    for row in (*confirmations, *calls):
+        row["full_name"] = by_phone.get(row.get("phone")) or row.get("first_name")
 
 
 def _more(shown: int, total: int) -> list[str]:
@@ -163,8 +179,8 @@ def _lead_line(lead: dict[str, Any]) -> str:
     flag = ":fire: " if lead["closer_priority"] else (":star: " if lead["routing_tag"] == "FULL_MACHINE" else "")
     details = ", ".join(slack_safe(str(v)) for v in (lead["loan_type"], lead["loan_amount_range"],
                                                       lead["property_city"]) if v)
-    return (f"{flag}lendingflow_lead:{lead['id']} {slack_safe(lead['first_name'] or 'lead')}"
-            + (f" ({details})" if details else ""))
+    who = name_and_ref(full_name(lead["first_name"], lead.get("last_name")), f"lead {lead['id']}")
+    return f"{flag}{who}" + (f": {details}" if details else "")
 
 
 def render(day: date, data: DigestData) -> tuple[str, list[dict]]:
@@ -172,11 +188,12 @@ def render(day: date, data: DigestData) -> tuple[str, list[dict]]:
     status = (f":octagonal_sign: Halted ({data.halt_reason or 'no reason given'}). Approved drafts will not send "
               "until an approver says `resume`." if data.halted else ":large_green_circle: Running. Approved drafts send.")
     overdue = (
-        [f"Draft #{d['action_id']} {d['tool_name']}" + (f" for {d['contact_ref']}" if d["contact_ref"] else "")
+        [f"Draft #{d['action_id']} {d['tool_name']}"
+         + (f" for {name_and_ref(d.get('full_name'), readable_ref(d['contact_ref']))}" if d["contact_ref"] else "")
          + " waiting for approval" for d in data.pending_drafts]
         + _more(len(data.pending_drafts), data.pending_total)
-        + [f"Confirmation call for booking {slack_safe(str(c['booking_ref']))} due {c['due_date']}"
-           for c in data.due_confirmations]
+        + [f"Confirmation call for {name_and_ref(c.get('full_name'), 'booking ' + str(c['booking_ref']))} "
+           f"due {c['due_date']}" for c in data.due_confirmations]
         + _more(len(data.due_confirmations), data.due_confirmations_total)
         + ([f"{data.open_inbox} open inbox item(s); reply in the inbox digest thread to route or dismiss"]
            if data.open_inbox else [])
@@ -185,8 +202,9 @@ def render(day: date, data: DigestData) -> tuple[str, list[dict]]:
     if data.web_leads:
         leads.append(f"{data.web_leads} web lead(s)" + (
             f", {data.web_leads_not_in_ghl} not in GHL yet" if data.web_leads_not_in_ghl else ""))
-    calls = [f"{c['slot_start'].astimezone(ET):%I:%M %p} {slack_safe(c['first_name'] or 'lead')} "
-             f"({slack_safe(c['booked_by'] or 'unknown')})" for c in data.todays_calls]
+    calls = [f"{c['slot_start'].astimezone(ET):%I:%M %p} "
+             f"{name_and_ref(c.get('full_name') or c['first_name'], 'booking ' + str(c['booking_ref']))} "
+             f"(booked by {slack_safe(c['booked_by'] or 'unknown')})" for c in data.todays_calls]
     queues = [f"Booked calls today: {len(data.todays_calls)}"] + calls + [
         f"Dialer {q['campaign']}: {q['contacts']} contact(s) loaded" for q in data.dialer_queues]
     cora_lines = [status] + ([f":warning: Not available today: {', '.join(data.unavailable)}"]

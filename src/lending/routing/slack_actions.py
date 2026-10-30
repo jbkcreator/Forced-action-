@@ -26,6 +26,7 @@ from src.lending.routing import lender_service
 from src.lending.routing.file_key import key_from_row
 from src.lending.routing.notify import details_block
 from src.lending.routing.slack_admin import _input, _user_id, _value, allowed_user_ids
+from src.lending.slack_names import full_name, name_and_ref
 
 logger = logging.getLogger(__name__)
 
@@ -102,10 +103,11 @@ def _decline_view(event_id: int, lender: str, channel: str, ts: str, original: s
 def format_record(record: dict) -> str:
     """The file record as Slack text: where it is, who is next, and the route history (times in Eastern)."""
     file = record["file"]
-    head = (f"*File #{file['file_id']} · {file['last_name'] or 'Unknown'} · "
+    who = name_and_ref(full_name(file.get("first_name"), file.get("last_name")), f"File #{file['file_id']}")
+    head = (f"*{who} · "
             f"{str(file['loan_type'] or 'unknown').replace('_', ' ').title()} · "
             f"${int(file['loan_amount']):,}* · status: {file['status']}" if file.get("loan_amount") else
-            f"*File #{file['file_id']} · {file['last_name'] or 'Unknown'}* · status: {file['status']}")
+            f"*{who}* · status: {file['status']}")
     current, nxt = record.get("current"), record.get("next")
     lines = [head,
              f"Current lender: *{current['name']}* (position {current['position']})" if current else "Current lender: none",

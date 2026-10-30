@@ -25,6 +25,8 @@ from config.settings import get_settings
 from src.lending.cora_inbox import add_to_inbox_in_own_session
 from src.lending.db import lending_session
 from src.lending.dispositions import last4, lookup_load_record
+from src.lending.slack_names import name_and_ref, names_by_phone
+from packages.agent_core.redaction import slack_escape
 
 logger = logging.getLogger(__name__)
 
@@ -67,11 +69,12 @@ def build_slack_message(row: dict, record: Optional[dict]) -> tuple[str, list[di
     """(fallback text, Block Kit blocks) for one disposition."""
     disposition = row["disposition"]
     record = record or {}
-    who = record.get("borrower_name") or record.get("entity_name") or "—"
+    call_id = row.get("dialer_call_id")
+    who = name_and_ref(record.get("borrower_name") or record.get("entity_name"), f"call {call_id}" if call_id else None)
     lines = [
         f"*Borrower:* {who}",
-        f"*Entity:* {record.get('entity_name') or '—'}",
-        f"*Property:* {record.get('property_address') or '—'}",
+        f"*Entity:* {slack_escape(record.get('entity_name') or '—')}",
+        f"*Property:* {slack_escape(record.get('property_address') or '—')}",
         f"*Phone:* {row['phone'] or '—'}",
         f"*Queue:* {row['queue'] or row['campaign_tag'] or '—'}",
         f"*Caller:* {row['caller_name'] or row['caller_seat'] or '—'}",
@@ -251,6 +254,19 @@ def _deliver_slack(db, row: dict, client: Any) -> None:
                        row["dialer_call_id"], last4(row["phone"]), type(exc).__name__)
 
 
+def _call_label(call_id: str) -> str:
+    """``Daniel Smith (call 1222017054)``: the borrower behind a dialer call, for Slack. Never raises."""
+    name = None
+    try:
+        with lending_session() as db:
+            phone = db.execute(text("SELECT phone FROM lending.call_dispositions WHERE dialer_call_id = :c"),
+                               {"c": call_id}).scalar()
+            name = names_by_phone(db, [phone]).get(phone) if phone else None
+    except Exception as exc:  # class only: a failed lookup only drops the name
+        logger.warning("[lending] call %s: borrower name lookup failed (%s)", call_id, type(exc).__name__)
+    return name_and_ref(name, f"call {call_id}")
+
+
 def alert_unpropagated_dnc(call_id: str, caller_seat: Optional[str], client: Any = None) -> None:
     """Tell LENDING_DNC_ALERT_CHANNEL a DNC request could not be propagated (no usable phone number). Never raises."""
     posted = False
@@ -260,7 +276,8 @@ def alert_unpropagated_dnc(call_id: str, caller_seat: Optional[str], client: Any
         try:
             (client or _slack_client()).chat_postMessage(
                 channel=get_settings().lending_dnc_alert_channel,
-                text=(f":rotating_light: DNC request NOT propagated — call {call_id} (caller seat {caller_seat or 'unknown'}) "
+                text=(f":rotating_light: DNC request NOT propagated — {_call_label(call_id)} "
+                      f"(caller seat {caller_seat or 'unknown'}) "
                       "has no usable phone number. Add the contact to the suppression list manually."),
             )
             posted = True
@@ -281,7 +298,8 @@ def alert_unknown_code(call_id: str, raw_code: str, caller_seat: Optional[str], 
     try:
         (client or _slack_client()).chat_postMessage(
             channel=get_settings().lending_dial_tasks_channel,
-            text=(f":warning: Unknown disposition `{raw_code}` on call {call_id} (seat {caller_seat or 'unknown'}). "
+            text=(f":warning: Unknown disposition `{raw_code}` on {_call_label(call_id)} "
+                  f"(seat {caller_seat or 'unknown'}). "
                   "The dialer's Call Results do not match the lending list — check the setup."),
         )
     except Exception as exc:
@@ -298,7 +316,7 @@ def alert_dnc_removal_pending(call_id: str, caller_seat: Optional[str], client: 
         try:
             (client or _slack_client()).chat_postMessage(
                 channel=get_settings().lending_dnc_alert_channel,
-                text=(f":rotating_light: DNC request recorded but NOT yet removed from the dialer — call {call_id} "
+                text=(f":rotating_light: DNC request recorded but NOT yet removed from the dialer — {_call_label(call_id)} "
                       f"(caller seat {caller_seat or 'unknown'}). Remove the contact in the dialer manually until the "
                       "automatic removal is confirmed."),
             )

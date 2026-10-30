@@ -42,11 +42,30 @@ class ClickOutcome:
 _EXPIRED_TEXT = "This draft expired before it was approved; ask Cora to redraft it."
 
 
+_FIELD_LABELS = {"to": "To", "to_phone": "To", "to_email": "To", "subject": "Subject", "lead_ref": "Lead",
+                 "contact_ref": "Contact", "deal_ref": "Deal"}
+_BODY_FIELDS = ("body", "message", "text")
+
+
+def _field_text(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
+
+
 def _payload_preview(action: PendingAction) -> str:
-    rendered = json.dumps(dict(action.payload), indent=2, sort_keys=True, ensure_ascii=False)
-    if len(rendered) > _SECTION_TEXT_LIMIT:
-        rendered = rendered[:_SECTION_TEXT_LIMIT] + "\n…"
-    return f"```{slack_safe(rendered)}```"
+    """The draft as a person reads it: labelled fields, then the message itself as a quote."""
+    payload = dict(action.payload)
+    body_key = next((key for key in _BODY_FIELDS if isinstance(payload.get(key), str)), None)
+    lines = [f"*{_FIELD_LABELS.get(key, key.replace('_', ' ').capitalize())}:* {slack_safe(_field_text(value))}"
+             for key, value in sorted(payload.items()) if key != body_key and value not in (None, "")]
+    if body_key:
+        body = slack_safe(payload[body_key])
+        if len(body) > _SECTION_TEXT_LIMIT:
+            body = body[:_SECTION_TEXT_LIMIT] + "…"
+        lines.append("\n".join(f"> {line}" if line else ">" for line in body.splitlines() or [""]))
+    rendered = "\n".join(lines) or "_No draft content._"
+    return rendered[:_SECTION_TEXT_LIMIT] + "\n…" if len(rendered) > _SECTION_TEXT_LIMIT else rendered
 
 
 def render_action_card(action: PendingAction) -> list[dict]:

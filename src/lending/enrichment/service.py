@@ -45,6 +45,7 @@ from src.lending.enrichment.ports import (
 )
 from src.lending.enrichment.property_facts import PropertyFacts, load_property_facts, match_property
 from src.lending.enrichment.routing import route_lead, today_et
+from src.lending.slack_names import name_and_ref, names_by_lendingflow_lead
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
@@ -145,8 +146,9 @@ def _money(value: Any) -> str:
 
 
 def render_card_text(lead_id: int, address: Optional[str], tag: RoutingTag, facts: Optional[PropertyFacts],
-                     fit: FitView, *, coverage_note: Optional[str]) -> str:
-    lines = [f"*LendingFlow lead #{lead_id}*: {tag.value}" + (" (closer priority)" if tag is RoutingTag.FULL_MACHINE else ""),
+                     fit: FitView, *, coverage_note: Optional[str], borrower: Optional[str] = None) -> str:
+    who = name_and_ref(borrower, f"LendingFlow lead {lead_id}")
+    lines = [f"*{who}*: {tag.value}" + (" (closer priority)" if tag is RoutingTag.FULL_MACHINE else ""),
              f"Property: {address or NOT_AVAILABLE}"]
     if facts is None:
         lines.append(f"Forced Action facts: {coverage_note or NOT_AVAILABLE}")
@@ -291,7 +293,9 @@ def _post_if_needed(db, lead_id, tag, address, close, facts, fit, coverage, *, f
             return EnrichmentOutcome(lead_id, READY, tag.value)
         root = thread_ts
         if not card_done:
-            root = thread.post(render_card_text(lead_id, address, tag, facts, fit, coverage_note=coverage),
+            borrower = names_by_lendingflow_lead(db, lead_id)
+            root = thread.post(render_card_text(lead_id, address, tag, facts, fit, coverage_note=coverage,
+                                                borrower=borrower),
                                thread_ts=thread_ts)
             if root is None:
                 return _fail(db, lead_id, "deal_thread_unavailable")

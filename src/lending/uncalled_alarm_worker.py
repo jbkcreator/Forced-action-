@@ -52,6 +52,7 @@ from src.lending.cora_inbox import add_to_inbox_safely
 from src.lending.db import lending_session
 from src.lending.ghl_calls import call_messages_reader, call_state, message_time
 from src.lending.ghl_sms import GhlSmsError
+from src.lending.slack_names import name_and_ref
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
@@ -80,6 +81,7 @@ _PICKUP_WEB = text("""
 # Lead facts for the message and the GHL call lookup, from whichever source the alarm was copied from.
 _LEAD_FIELDS = """
            COALESCE(l.first_name, NULLIF(split_part(btrim(w.name), ' ', 1), '')) AS first_name,
+           COALESCE(NULLIF(btrim(concat_ws(' ', l.first_name, l.last_name)), ''), NULLIF(btrim(w.name), '')) AS full_name,
            COALESCE(l.property_state, w.property_state) AS property_state,
            COALESCE(l.ghl_contact_id, w.ghl_contact_id) AS ghl_contact_id,
            (a.web_lead_id IS NOT NULL) AS from_web"""
@@ -236,8 +238,15 @@ def _lead_label(row: Mapping[str, Any]) -> str:
     return f"{name} ({row['property_state']})" if row["property_state"] else name
 
 
+def _who(row: Mapping[str, Any]) -> str:
+    """``Daniel Smith (lead f0084183)`` / ``TEST Sonetel (web lead 333)`` for Slack."""
+    ref = str(row["lead_uuid"])
+    ref = f"web lead {ref[4:]}" if row["from_web"] and ref.startswith("web-") else f"lead {ref[:8]}"
+    return name_and_ref(row.get("full_name") or row["first_name"], ref)
+
+
 def _fields(row: Mapping[str, Any], now: datetime) -> dict[str, Any]:
-    return {"lead": _lead_label(row), "ref": str(row["lead_uuid"])[:8],
+    return {"lead": _lead_label(row), "who": _who(row), "ref": str(row["lead_uuid"])[:8],
             "source": "website" if row["from_web"] else "LendingFlow",
             "minutes": int((now - row["arrived_at"]).total_seconds() // 60),
             "state": f" ({row['property_state']})" if row["property_state"] else ""}
@@ -314,9 +323,10 @@ def _queue_for_cora(db, row: Mapping[str, Any], kind: str, now: datetime, *, sla
     fields = _fields(row, now)
     add_to_inbox_safely(
         db, event_type="lead_uncalled", dedup_key=str(row["id"]), target_channel="ops", channel_posted=slack_sent,
-        summary=f"{fields['source']} lead {fields['ref']}{fields['state']} still {kind.replace('_', ' ')} after "
+        summary=f"{fields['source']} lead {fields['who']}{fields['state']} still {kind.replace('_', ' ')} after "
                 f"{fields['minutes']} min",
         payload={"kind": kind, "lead_ref": fields["ref"], "first_name": row["first_name"],
+                 "name": row.get("full_name") or row["first_name"],
                  "property_state": row["property_state"], "minutes_since_arrival": fields["minutes"],
                  "ghl_contact_id": row["ghl_contact_id"]},
     )

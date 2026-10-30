@@ -23,13 +23,15 @@ _DDL = (
     " posted_at TIMESTAMP, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
     "CREATE TABLE lending.pending_actions (action_id INTEGER PRIMARY KEY, tool_name TEXT, contact_ref TEXT,"
     " status TEXT, created_at TIMESTAMP)",
-    "CREATE TABLE lending.booking_messages (booking_ref TEXT, first_name TEXT, booked_by TEXT, slot_start_utc TIMESTAMP)",
+    "CREATE TABLE lending.booking_messages (booking_ref TEXT, first_name TEXT, booked_by TEXT, slot_start_utc TIMESTAMP,"
+    " contact_phone TEXT)",
     "CREATE TABLE lending.web_leads (id INTEGER PRIMARY KEY, received_at TIMESTAMP, ghl_status TEXT, is_test BOOLEAN NOT NULL DEFAULT 0)",
     "CREATE TABLE lending.cora_inbox (id INTEGER PRIMARY KEY, status TEXT)",
     "CREATE TABLE lending.confirmation_tasks (booking_ref TEXT, due_date DATE, completed_at TIMESTAMP,"
     " cancelled_at TIMESTAMP)",
     "CREATE TABLE lending.lendingflow_leads (id INTEGER PRIMARY KEY, first_name TEXT, loan_type TEXT,"
-    " loan_amount_range TEXT, property_city TEXT, received_at TIMESTAMP, suppressed BOOLEAN, is_test BOOLEAN NOT NULL DEFAULT 0)",
+    " loan_amount_range TEXT, property_city TEXT, received_at TIMESTAMP, suppressed BOOLEAN, is_test BOOLEAN NOT NULL DEFAULT 0,"
+    " last_name TEXT)",
     "CREATE TABLE lending.lendingflow_enrichment (lead_id INTEGER, routing_tag TEXT, closer_priority BOOLEAN)",
     "CREATE TABLE lending.dialer_load_records (id INTEGER PRIMARY KEY, campaign_tag TEXT, active BOOLEAN)",
 )
@@ -113,11 +115,11 @@ def test_digest_follows_the_e5_morning_brief(engine) -> None:
                           " ('bk-2', '2026-10-20', NULL, NULL), ('bk-3', '2026-10-18', '2026-10-18 10:00:00', NULL)"))
         conn.execute(text("INSERT INTO lending.cora_inbox VALUES (1, 'new'), (2, 'dismissed')"))
         conn.execute(text("INSERT INTO lending.lendingflow_leads VALUES"
-                          " (10, 'Ana', 'Fix & Flip', '$250K - $500K', 'Tampa', '2026-10-19 02:00:00', 0, 0),"
-                          " (11, 'Ben', 'DSCR', NULL, NULL, '2026-10-19 03:00:00', 0, 0),"
-                          " (12, 'Cy', 'DSCR', NULL, NULL, '2026-10-19 04:00:00', 1, 0),"
-                          " (13, 'Old', 'DSCR', NULL, NULL, '2026-10-01 04:00:00', 0, 0),"
-                          " (14, 'Qa', 'DSCR', NULL, NULL, '2026-10-19 05:00:00', 0, 1)"))
+                          " (10, 'Ana', 'Fix & Flip', '$250K - $500K', 'Tampa', '2026-10-19 02:00:00', 0, 0, 'Lopez'),"
+                          " (11, 'Ben', 'DSCR', NULL, NULL, '2026-10-19 03:00:00', 0, 0, NULL),"
+                          " (12, 'Cy', 'DSCR', NULL, NULL, '2026-10-19 04:00:00', 1, 0, NULL),"
+                          " (13, 'Old', 'DSCR', NULL, NULL, '2026-10-01 04:00:00', 0, 0, NULL),"
+                          " (14, 'Qa', 'DSCR', NULL, NULL, '2026-10-19 05:00:00', 0, 1, NULL)"))
         conn.execute(text("INSERT INTO lending.lendingflow_enrichment VALUES (10, 'FULL_MACHINE', 0), (11, 'NURTURE', 1)"))
         conn.execute(text("INSERT INTO lending.web_leads VALUES (1, '2026-10-19 02:00:00', 'synced', 0),"
                           " (2, '2026-10-19 03:00:00', 'failed', 0), (3, '2026-10-01 03:00:00', 'synced', 0),"
@@ -128,13 +130,13 @@ def test_digest_follows_the_e5_morning_brief(engine) -> None:
     post_morning_digest(engine, chat, "C_CORA", halted=True, halt_reason="halted from Slack by U_JOSH", now=AT_7_30)
     body = _body(chat.posts[0]["blocks"])
     assert "Halted (halted from Slack by U_JOSH)" in body
-    assert "Draft #4 draft_email for web_lead:7 waiting for approval" in body and "#5" not in body
-    assert "Confirmation call for booking bk-1 due 2026-10-18" in body
+    assert "Draft #4 draft_email for Unknown caller (web lead 7) waiting for approval" in body and "#5" not in body
+    assert "Confirmation call for Unknown caller (booking bk-1) due 2026-10-18" in body
     assert "bk-2" not in body and "bk-3" not in body
     assert "1 open inbox item(s)" in body
     assert "New leads, last 24 hours (4)" in body  # 2 LendingFlow (suppressed and old ones left out) + 2 web
-    assert body.index("lendingflow_lead:11 Ben") < body.index("lendingflow_lead:10 Ana")  # closer priority first
-    assert ":star: lendingflow_lead:10 Ana (Fix &amp; Flip, $250K - $500K, Tampa)" in body  # Slack shows "&"
+    assert body.index("Ben (lead 11)") < body.index("Ana Lopez (lead 10)")  # closer priority first
+    assert ":star: Ana Lopez (lead 10): Fix &amp; Flip, $250K - $500K, Tampa" in body  # full name + id
     assert "Cy" not in body and "Old" not in body
     assert "2 web lead(s), 1 not in GHL yet" in body
     assert "Dialer maturity: 2 contact(s) loaded" in body and "Dialer permits: 1 contact(s) loaded" in body
@@ -154,7 +156,7 @@ def test_render_lists_todays_calls_in_et() -> None:
          "slot_start": datetime(2026, 10, 19, 14, 0, tzinfo=timezone.utc)}]))
     body = _body(blocks)
     assert header == "Good morning. Cora's digest for Monday October 19"
-    assert "Booked calls today: 1" in body and "10:00 AM Sam (ai)" in body and "Running" in body
+    assert "Booked calls today: 1" in body and "10:00 AM Sam (booking b1) (booked by ai)" in body and "Running" in body
 
 
 def test_lead_and_booking_fields_cannot_inject_slack_mentions_or_links() -> None:
@@ -167,7 +169,7 @@ def test_lead_and_booking_fields_cannot_inject_slack_mentions_or_links() -> None
                        "slot_start": datetime(2026, 10, 19, 14, 0, tzinfo=timezone.utc)}]))[1])
     for token in ("<!channel>", "<!here>", "<!everyone>", "<@U_JOSH>", "<https://evil.example"):
         assert token not in body
-    assert "lendingflow_lead:12 &lt;!channel&gt;" in body
+    assert "&lt;!channel&gt; (lead 12)" in body
     assert "&lt;https://evil.example|Fix &amp; Flip&gt;" in body
 
 
@@ -205,5 +207,5 @@ def test_a_missing_table_blanks_only_its_section(engine) -> None:
     assert post_morning_digest(engine, chat, "C_CORA", halted=False, now=AT_7_30)
     body = _body(chat.posts[0]["blocks"])
     assert "Not available today: LendingFlow leads" in body
-    assert "Draft #4 draft_email for web_lead:7 waiting for approval" in body
+    assert "Draft #4 draft_email for Unknown caller (web lead 7) waiting for approval" in body
     assert _rows(engine) == [("2026-10-19", chat.posts[0]["ts"])]

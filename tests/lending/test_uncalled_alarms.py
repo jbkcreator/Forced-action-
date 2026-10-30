@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS lending.lendingflow_leads (
     raw_payload JSONB NOT NULL,
     received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     first_name VARCHAR(80),
+    last_name VARCHAR(80),
     phone VARCHAR(20) NOT NULL,
     property_state VARCHAR(20),
     suppressed BOOLEAN NOT NULL DEFAULT false,
@@ -282,7 +283,7 @@ def test_uncalled_lead_alarms_once_at_120_then_escalates_once_at_300(db):
     assert "came in 5 min ago" in sms.sent[1][1]
     assert len(slack.posts) == 1 and slack.posts[0][0] == OPS
     assert slack.posts[0][1].startswith(":rotating_light: *URGENT: LendingFlow lead still uncalled*")
-    assert "Jane" not in slack.posts[0][1] and LEAD_PHONE not in slack.posts[0][1]
+    assert "Jane (lead " in slack.posts[0][1] and LEAD_PHONE not in slack.posts[0][1]  # name + id, phone never
     row = alarm(db, lead_id)
     assert (row["alarm_120_kind"], row["alarm_300_kind"]) == ("no_call", "no_call")
     assert (row["sms_120_status"], row["sms_300_status"], row["slack_300_status"]) == ("sent", "sent", "sent")
@@ -771,6 +772,7 @@ def test_uncalled_web_lead_alarms_at_120_and_escalates_at_300_with_the_same_word
     cycle(db, 400, sms=sms, slack=slack)
     assert len(sms.sent) == 2 and sms.sent[1][1].startswith("URGENT - NDL LEAD STILL UNCALLED: website lead")
     assert len(slack.posts) == 1 and "URGENT: website lead still uncalled" in slack.posts[0][1]
+    assert f"Jane Smith (web lead {web_id})" in slack.posts[0][1]  # Slack: full name + id (SMS stays first name)
     assert web_alarm(db, web_id)["resolved_reason"] == "escalated"
 
 
