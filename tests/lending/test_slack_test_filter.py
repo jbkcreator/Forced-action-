@@ -168,3 +168,33 @@ def test_the_tagger_tags_test_names_and_office_ips(lending_db, monkeypatch) -> N
     assert named in report.tagged["lending.web_leads (test_name)"]
     assert office in report.tagged["lending.web_leads (office_ip)"]
     assert not lending_db.execute(text("SELECT is_test FROM lending.web_leads WHERE id = :id"), {"id": real}).scalar()
+
+
+def _ingested(db, lead_id: str, first: str, last: str, phone: str, email: str):
+    from migrations.apply_lending_lendingflow import apply_to
+    from src.lending.lendingflow import parse_lendingflow, save_lead
+
+    apply_to(db.get_bind())
+    payload = {"lead_id": lead_id, "first_name": first, "last_name": last, "phone": phone, "email": email,
+               "credit_score": "740+", "loan_amount": "$500K - $1M", "loan_type": "DSCR", "state": "Florida"}
+    parsed = parse_lendingflow(payload)
+    return save_lead(db, parsed, payload), parsed.phone
+
+
+def test_an_ingested_test_name_lead_is_hidden_despite_its_contact_row(lending_db, live) -> None:
+    saved, phone = _ingested(lending_db, "stf-g", "TEST", "Sonetel", "(813) 555-0104", "sonetel.qa@gmail.com")
+    assert lending_db.execute(text("SELECT count(*) FROM lending.contacts WHERE phone = :p"), {"p": phone}).scalar() == 1
+    assert hidden_lendingflow_ids(lending_db, [saved.lead_id]) == {saved.lead_id}
+    assert hidden_phones(lending_db, [phone]) == {phone}
+
+
+def test_an_ingested_real_lead_on_a_test_name_phone_is_not_hidden(lending_db, live) -> None:
+    _, phone = _ingested(lending_db, "stf-h", "TEST", "Sonetel", "(813) 555-0105", "sonetel.qa@gmail.com")
+    _ingested(lending_db, "stf-i", "Dana", "Ruiz", "(813) 555-0105", "dana.ruiz@gmail.com")
+    assert hidden_phones(lending_db, [phone]) == set()
+
+
+def test_a_contact_with_no_lead_behind_it_still_counts_as_real(lending_db, live) -> None:
+    _, phone = _ingested(lending_db, "stf-j", "TEST", "Sonetel", "(813) 555-0106", "sonetel.qa@gmail.com")
+    lending_db.execute(text("UPDATE lending.lendingflow_leads SET contact_id = NULL WHERE phone = :p"), {"p": phone})
+    assert hidden_phones(lending_db, [phone]) == set()

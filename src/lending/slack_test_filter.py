@@ -9,7 +9,9 @@ loan file) it came from a test partner. The rules are checked here as well as th
 every 10 minutes and the first alerts for a new lead fire before it is tagged.
 
 A phone or GHL contact counts as test only when EVERY lead record holding it is a test record, so a real borrower who
-shares a number with a test entry still gets their posts. A failed lookup posts as usual: it never hides a real alert.
+shares a number with a test entry still gets their posts. A contact row that a LendingFlow lead points to (made by the
+same ingestion, without the name) is left to that lead; a contact with no lead behind it still counts on its own. A
+failed lookup posts as usual: it never hides a real alert.
 """
 from __future__ import annotations
 
@@ -44,7 +46,9 @@ _TEST_PHONES = text(f"""
         UNION ALL
         SELECT phone, {_WEB} FROM lending.web_leads WHERE phone = ANY(:keys)
         UNION ALL
-        SELECT phone, {_test("email")} FROM lending.contacts WHERE phone = ANY(:keys)
+        SELECT phone, {_test("email")} FROM lending.contacts c
+         WHERE phone = ANY(:keys)
+           AND NOT EXISTS (SELECT 1 FROM lending.lendingflow_leads l WHERE l.contact_id = c.id)
         UNION ALL
         SELECT borrower_phone, {_FILE} FROM lending.loan_files WHERE borrower_phone = ANY(:keys)
     ) s
