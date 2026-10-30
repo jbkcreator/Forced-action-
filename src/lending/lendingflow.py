@@ -319,7 +319,8 @@ def _record_duplicate(db, parsed: ParsedLendingFlowLead, digest: str, now: datet
     existing = db.execute(
         text("UPDATE lending.lendingflow_leads SET duplicate_count = duplicate_count + 1, last_duplicate_at = :now "
              "WHERE id = (SELECT id FROM lending.lendingflow_leads WHERE vendor_lead_id = :v OR dedupe_hash = :h "
-             "ORDER BY (vendor_lead_id = :v) DESC LIMIT 1) RETURNING id, lead_uuid, vendor_lead_id, dedupe_hash"),
+             "ORDER BY (vendor_lead_id = :v) DESC LIMIT 1) "
+             "RETURNING id, lead_uuid, vendor_lead_id, dedupe_hash, first_name"),
         {"v": parsed.vendor_lead_id, "h": digest, "now": now},
     ).one_or_none()
     if existing is None:
@@ -329,11 +330,13 @@ def _record_duplicate(db, parsed: ParsedLendingFlowLead, digest: str, now: datet
     logger.info("[lendingflow] duplicate delivery lead=%s vendor=%s", existing.id, parsed.vendor_lead_id)
     if existing.vendor_lead_id != parsed.vendor_lead_id or existing.dedupe_hash != digest:
         _raise_possible_duplicate(db, existing.id, parsed.vendor_lead_id, digest,
-                                  same_lead_id=existing.vendor_lead_id == parsed.vendor_lead_id)
+                                  same_lead_id=existing.vendor_lead_id == parsed.vendor_lead_id,
+                                  first_name=existing.first_name)
     return SaveResult(existing.id, str(existing.lead_uuid), created=False)
 
 
-def _raise_possible_duplicate(db, lead_id: int, vendor_lead_id: str, digest: str, *, same_lead_id: bool) -> None:
+def _raise_possible_duplicate(db, lead_id: int, vendor_lead_id: str, digest: str, *, same_lead_id: bool,
+                              first_name: Optional[str] = None) -> None:
     """Runbook § 1, Principle 3 ("duplicates beat silence"): a delivery that matches an existing lead on only one
     of its two keys may be a new request, so a person is told through Cora's inbox. Each distinct delivery is
     raised once; an exact re-send (both keys match) stays quiet. A failed inbox write never loses the lead."""
@@ -341,7 +344,8 @@ def _raise_possible_duplicate(db, lead_id: int, vendor_lead_id: str, digest: str
                else "the same phone and email but a different LendingFlow lead id")
     add_to_inbox_safely(
         db, event_type="lendingflow_possible_duplicate", dedup_key=f"{lead_id}:{vendor_lead_id}:{digest[:16]}",
-        summary=f"Possible duplicate LendingFlow lead: matches lendingflow_lead:{lead_id} with {matched}. "
+        summary=f"Possible duplicate LendingFlow lead: matches {(first_name or '').strip() or 'an existing lead'} "
+                f"with {matched}. "
                 "It was not created as a new lead; check whether it is a new request.",
         payload={"lead_ref": f"lendingflow_lead:{lead_id}", "vendor_lead_id": vendor_lead_id,
                  "matched_on": "vendor_lead_id" if same_lead_id else "phone_email_hash"},
