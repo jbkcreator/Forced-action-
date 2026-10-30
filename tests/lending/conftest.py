@@ -86,6 +86,13 @@ def _no_live_slack(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _slack_test_posts_on(monkeypatch):
+    """Test leads use @example.com addresses, which the Slack test filter hides on live. Posts are on here as on a
+    testing server (LENDING_SLACK_TEST_ENABLED=true); tests/lending/test_slack_test_filter.py turns them off."""
+    monkeypatch.setattr("src.lending.slack_test_filter.slack_test_posts_enabled", lambda: True)
+
+
+@pytest.fixture(autouse=True)
 def _no_live_web_lead_sink(monkeypatch):
     """A test must never push a website lead into the real Next Deal Lending GHL account."""
     monkeypatch.setattr("src.lending.web_lead_ghl.get_live_sink", lambda: None)

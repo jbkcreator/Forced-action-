@@ -22,6 +22,7 @@ from config.lending_reminders import TIMEZONE
 from config.settings import get_settings
 from src.lending.db import lending_session
 from src.lending.slack_names import name_and_ref, names_by_phone
+from src.lending.slack_test_filter import hidden_phones
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,8 @@ _OPEN_TASKS = text("""
 def open_tasks(db, today: date, now: datetime) -> list[Mapping[str, Any]]:
     rows = [dict(row) for row in db.execute(_OPEN_TASKS, {"today": today, "floor": today - timedelta(days=LOOKBACK_DAYS),
                                                           "now": now}).mappings()]
+    test = hidden_phones(db, [row["contact_phone"] for row in rows])
+    rows = [row for row in rows if row["contact_phone"] not in test]  # listed again once the switch is on
     names = names_by_phone(db, [row["contact_phone"] for row in rows])
     for row in rows:
         row["full_name"] = names.get(row["contact_phone"])

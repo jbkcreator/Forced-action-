@@ -14,6 +14,7 @@ from config.settings import get_settings
 from src.lending.db import lending_session
 from src.lending.disposition_delivery import _configured_slack, _slack_client
 from src.lending.slack_names import name_and_ref, names_by_phone
+from src.lending.slack_test_filter import log_skipped, hidden_phones
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,11 @@ def run(slack_client: Any = None, minutes: Optional[int] = None) -> int:
         ).all()
         db.commit()
         borrowers = names_by_phone(db, [row[3] for row in rows]) if rows else {}
+        test = hidden_phones(db, [row[3] for row in rows]) if rows else set()
+    for row in rows:  # claimed with no post, so they are not picked up again
+        if row[3] in test:
+            log_skipped("missing-disposition alert", f"call {row[0]}")
+    rows = [row for row in rows if row[3] not in test]
     if not rows:
         return 0
     by_seat: dict[str, list[str]] = {}

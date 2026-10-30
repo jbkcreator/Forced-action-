@@ -28,6 +28,7 @@ from src.lending.after_hours_intake import MorningReply, draft_morning_replies, 
 from src.lending.db import lending_session
 from src.lending.models import LENDING_SCHEMA
 from src.lending.slack_names import name_and_ref, names_by_phone, readable_ref
+from src.lending.slack_test_filter import hidden_phones
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,8 @@ def main(argv=None, *, now: Optional[datetime] = None) -> int:
     try:
         with lending_session() as db:
             pins = pins_to_call(db, now)
+            test = hidden_phones(db, [pin.event.phone for pin in pins])
+            pins = [pin for pin in pins if pin.event.phone not in test]  # no post and no draft card for test callers
             if not pins:
                 logger.info("[pinned-callbacks] no pinned callers")
                 return 0

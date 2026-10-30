@@ -20,6 +20,7 @@ from config.settings import get_settings
 from src.lending.db import lending_session
 from src.lending.disposition_delivery import _configured_slack, _slack_client
 from src.lending.slack_names import name_and_ref
+from src.lending.slack_test_filter import log_skipped, hidden_web_lead_ids
 from src.lending.web_lead_ghl import get_live_sink
 from src.lending.web_leads import deliver_pending
 
@@ -43,6 +44,10 @@ def alert_undelivered(slack_client: Any = None, minutes: Optional[int] = None) -
                      "RETURNING id, ghl_last_error, name"),
                 {"m": minutes},
             ).all()
+            test_ids = hidden_web_lead_ids(db, [r[0] for r in rows])
+        for lead_id in sorted(test_ids):  # flagged with no post, so they are not picked up again
+            log_skipped("undelivered web lead alert", f"web lead {lead_id}")
+        rows = [r for r in rows if r[0] not in test_ids]
         if not rows:
             return 0
         ids = [r[0] for r in rows]

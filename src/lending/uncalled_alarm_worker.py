@@ -53,6 +53,7 @@ from src.lending.db import lending_session
 from src.lending.ghl_calls import call_messages_reader, call_state, message_time
 from src.lending.ghl_sms import GhlSmsError
 from src.lending.slack_names import name_and_ref
+from src.lending.slack_test_filter import is_hidden_lendingflow_uuid, log_skipped, hidden_web_lead_ids
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
@@ -161,6 +162,7 @@ _KIND_COLUMN = {"sms_120": "alarm_120_kind", "sms_300": "alarm_300_kind", "slack
 # status that causes another send (the provider provably did not take it); UNKNOWN is never resent.
 SENT, RETRY, SENDING, UNKNOWN, FAILED = "sent", "retry", "sending", "send_unknown", "failed"
 SUPERSEDED, NOT_CONFIGURED = "superseded", "not_configured"
+TEST_SKIPPED = "test_skipped"  # Slack post not made: a test lead while LENDING_SLACK_TEST_ENABLED is off
 
 _DUE = text(f"""
     SELECT a.id, a.lead_uuid, a.phone, a.arrived_at, a.fired_120_at,{_LEAD_FIELDS}
@@ -250,6 +252,13 @@ def _inbox_label(row: Mapping[str, Any]) -> str:
     name = (row["full_name"] or row["first_name"] or "").strip()
     who = name or (f"(no name, …{row['phone'][-4:]})" if row["phone"] else "(no name)")
     return f"{who} ({row['property_state']})" if row["property_state"] else who
+
+
+def _is_test_lead(db, row: Mapping[str, Any]) -> bool:
+    ref = str(row["lead_uuid"])
+    if row["from_web"] and ref.startswith("web-"):
+        return bool(hidden_web_lead_ids(db, [int(ref[4:])]))
+    return is_hidden_lendingflow_uuid(db, ref)
 
 
 def _fields(row: Mapping[str, Any], now: datetime) -> dict[str, Any]:
@@ -362,10 +371,16 @@ def _decide(db, row: Mapping[str, Any], *, tick: Clock, sms: Optional[Callable[.
         db.commit()
         return f"first_{kind}_sms_{status}"
     outcomes = []
+    test_lead = _is_test_lead(db, row)
     for channel in ("sms_300", "slack_300"):
+        if channel == "slack_300" and test_lead:
+            log_skipped("5-minute alarm", row["lead_uuid"])
+            outcomes.append(_record(db, row, channel, TEST_SKIPPED, None, 0, tick()))
+            continue
         status, err = _send_channel(channel, row, kind, tick(), **send)
         outcomes.append(_record(db, row, channel, status, err, 0, tick()))
-    _queue_for_cora(db, row, kind, tick(), slack_sent=outcomes[1] == SENT)
+    if not test_lead:
+        _queue_for_cora(db, row, kind, tick(), slack_sent=outcomes[1] == SENT)
     db.commit()
     return f"escalation_{kind}_sms_{outcomes[0]}_slack_{outcomes[1]}"
 

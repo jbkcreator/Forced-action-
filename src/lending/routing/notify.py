@@ -30,6 +30,7 @@ from src.lending.routing.file_key import key_from_row
 from packages.agent_core.redaction import slack_safe
 from src.lending.routing.rules import LenderRow
 from src.lending.slack_names import full_name, name_and_ref
+from src.lending.slack_test_filter import log_skipped, hidden_lendingflow_ids, hidden_loan_file_ids
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +145,22 @@ def _mark_posted(event_id: int, ts: str, db: Session) -> None:
     db.commit()
 
 
+def _is_test_file(db: Session, lead_id: Optional[int], loan_file_id: Optional[int]) -> bool:
+    return bool(hidden_lendingflow_ids(db, [lead_id]) or hidden_loan_file_ids(db, [loan_file_id]))
+
+
+def _skip_test_event(db: Session, event_id: int, lead_id: Optional[int], loan_file_id: Optional[int]) -> bool:
+    """A test lead or file while LENDING_SLACK_TEST_ENABLED is off: stamped posted with no message (slack_ts NULL),
+    so the retry sweep does not pick it up again. The file has no Slack buttons; it is handled outside Slack."""
+    if not _is_test_file(db, lead_id, loan_file_id):
+        return False
+    db.execute(text("UPDATE lending.file_routing_events SET slack_posted_at = :now WHERE id = :eid"),
+               {"now": datetime.now(timezone.utc), "eid": event_id})
+    db.commit()
+    log_skipped("routing post", f"event {event_id}")
+    return True
+
+
 def _post(message: str, event_id: int, db: Session, *, what: str, lead_id, action: str = "") -> None:
     client = _client()
     channel = _channel()
@@ -151,6 +168,10 @@ def _post(message: str, event_id: int, db: Session, *, what: str, lead_id, actio
         logger.warning("notify.%s: Slack not configured — skipping", what)
         return
     try:
+        refs = db.execute(text("SELECT lead_id, loan_file_id FROM lending.file_routing_events WHERE id = :eid"),
+                          {"eid": event_id}).first()
+        if refs is not None and _skip_test_event(db, event_id, refs[0], refs[1]):
+            return
         blocks = _action_blocks(message, action, event_id)
         resp = (client.chat_postMessage(channel=channel, text=message, blocks=blocks) if blocks
                 else client.chat_postMessage(channel=channel, text=message))
@@ -270,6 +291,8 @@ def retry_unposted_events(db: Session) -> int:
         if message is None:
             continue
         try:
+            if _skip_test_event(db, row["id"], row["lead_id"], row["loan_file_id"]):
+                continue
             blocks = _action_blocks(message, row["action"], row["id"])
             resp = (client.chat_postMessage(channel=channel, text=message, blocks=blocks) if blocks
                     else client.chat_postMessage(channel=channel, text=message))
