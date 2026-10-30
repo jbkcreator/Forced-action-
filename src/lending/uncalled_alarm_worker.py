@@ -239,10 +239,17 @@ def _lead_label(row: Mapping[str, Any]) -> str:
 
 
 def _who(row: Mapping[str, Any]) -> str:
-    """``Daniel Smith (lead f0084183)`` / ``TEST Sonetel (web lead 333)`` for Slack."""
+    """``Daniel Smith (lead f0084183)`` / ``TEST Sonetel (web lead 333)`` for the Slack alarm post."""
     ref = str(row["lead_uuid"])
     ref = f"web lead {ref[4:]}" if row["from_web"] and ref.startswith("web-") else f"lead {ref[:8]}"
     return name_and_ref(row.get("full_name") or row["first_name"], ref)
+
+
+def _inbox_label(row: Mapping[str, Any]) -> str:
+    """Who the lead is for Cora's inbox: full name, else the last 4 digits of the phone. Never an id."""
+    name = (row["full_name"] or row["first_name"] or "").strip()
+    who = name or (f"(no name, …{row['phone'][-4:]})" if row["phone"] else "(no name)")
+    return f"{who} ({row['property_state']})" if row["property_state"] else who
 
 
 def _fields(row: Mapping[str, Any], now: datetime) -> dict[str, Any]:
@@ -323,7 +330,7 @@ def _queue_for_cora(db, row: Mapping[str, Any], kind: str, now: datetime, *, sla
     fields = _fields(row, now)
     add_to_inbox_safely(
         db, event_type="lead_uncalled", dedup_key=str(row["id"]), target_channel="ops", channel_posted=slack_sent,
-        summary=f"{fields['source']} lead {fields['who']}{fields['state']} still {kind.replace('_', ' ')} after "
+        summary=f"{fields['source']} lead {_inbox_label(row)} still {kind.replace('_', ' ')} after "
                 f"{fields['minutes']} min",
         payload={"kind": kind, "lead_ref": fields["ref"], "first_name": row["first_name"],
                  "name": row.get("full_name") or row["first_name"],

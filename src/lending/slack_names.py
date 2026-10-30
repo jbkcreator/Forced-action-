@@ -48,8 +48,6 @@ _NAMES_BY_GHL_CONTACT = text("""
      ORDER BY ghl_contact_id, rank, at DESC
 """)
 
-_CONTACT_PHONES = text("SELECT id, phone FROM lending.contacts WHERE id = ANY(:ids)")
-_WEB_LEAD_NAMES = text("SELECT id, NULLIF(btrim(name), '') FROM lending.web_leads WHERE id = ANY(:ids)")
 _LENDINGFLOW_NAMES = text("""
     SELECT id, NULLIF(btrim(concat_ws(' ', first_name, last_name)), '') FROM lending.lendingflow_leads WHERE id = ANY(:ids)
 """)
@@ -93,33 +91,6 @@ def names_by_phone(db, phones: Iterable[Optional[str]]) -> dict[str, str]:
 def names_by_ghl_contact(db, contact_ids: Iterable[Optional[str]]) -> dict[str, str]:
     wanted = sorted({contact_id for contact_id in contact_ids if contact_id})
     return _lookup(db, _NAMES_BY_GHL_CONTACT, {"ids": wanted}) if wanted else {}
-
-
-def _ref_ids(refs: Iterable[str], prefix: str) -> list[int]:
-    ids = []
-    for ref in refs:
-        head, _, tail = ref.partition(":")
-        if head == prefix and tail.isdigit():
-            ids.append(int(tail))
-    return ids
-
-
-def names_by_lead_ref(db, refs: Iterable[Optional[str]]) -> dict[str, str]:
-    """``contact:18008`` / ``web_lead:12`` / ``lendingflow_lead:5`` -> full name (refs with no name are left out)."""
-    refs = [ref for ref in refs if ref]
-    names: dict[str, str] = {}
-    web_ids, lf_ids, contact_ids = (_ref_ids(refs, "web_lead"), _ref_ids(refs, "lendingflow_lead"),
-                                    _ref_ids(refs, "contact"))
-    if web_ids:
-        names.update({f"web_lead:{k}": v for k, v in _lookup(db, _WEB_LEAD_NAMES, {"ids": web_ids}).items() if v})
-    if lf_ids:
-        names.update({f"lendingflow_lead:{k}": v
-                      for k, v in _lookup(db, _LENDINGFLOW_NAMES, {"ids": lf_ids}).items() if v})
-    if contact_ids:
-        phones = _lookup(db, _CONTACT_PHONES, {"ids": contact_ids})
-        by_phone = names_by_phone(db, phones.values())
-        names.update({f"contact:{cid}": by_phone[phone] for cid, phone in phones.items() if phone in by_phone})
-    return names
 
 
 def names_by_lendingflow_lead(db, lead_id: int) -> Optional[str]:

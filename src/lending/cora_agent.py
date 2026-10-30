@@ -105,7 +105,8 @@ def make_morning_digest(engine: Engine, store: AgentStore, chat: ChatPort, confi
 
     def digest() -> bool:
         return post_morning_digest(engine, chat, config.slack_channel_id, halted=halt.is_halted(),
-                                   halt_reason=halt.reason())
+                                   halt_reason=halt.reason(),
+                                   approvals_channel=config.approval_channel_id)
 
     return digest
 
