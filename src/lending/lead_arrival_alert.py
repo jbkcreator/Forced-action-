@@ -99,7 +99,8 @@ def alert_josh(event: LendingFlowLeadCreated) -> Optional[bool]:
             and mention_ids):
         return None
     contact_url = ghl_contact_url(settings.lending_ghl_app_url, settings.lending_ghl_location_id, event.ghl_contact_id)
-    body = alert_text(event, mention_ids, contact_url, _lead_name(event))
+    name = _lead_name(event)
+    body = alert_text(event, mention_ids, contact_url, name)
     for attempt in range(len(RETRY_DELAYS_SECONDS) + 1):
         try:
             _client_factory().chat_postMessage(channel=channel, text=body)
@@ -108,18 +109,20 @@ def alert_josh(event: LendingFlowLeadCreated) -> Optional[bool]:
                 _sleep(RETRY_DELAYS_SECONDS[attempt])
                 continue
             logger.error("[lead-arrival-alert] lead=%s alert not posted (%s)", event.lead_id, type(exc).__name__)
-            _queue_unposted(event)
+            _queue_unposted(event, name)
             return False
         logger.info("[lead-arrival-alert] lead=%s alert posted", event.lead_id)
         return True
     return False
 
 
-def _queue_unposted(event: LendingFlowLeadCreated) -> None:
-    """Cora surfaces it in her inbox digest. Ids and the last 4 digits only, per the inbox contract."""
+def _queue_unposted(event: LendingFlowLeadCreated, name: Optional[str] = None) -> None:
+    """Cora surfaces it in her inbox digest: the lead's name and id, and the last 4 digits only (never the full
+    phone). Cora's inbox escapes the summary when it posts it, so the name goes in unescaped here."""
+    who = name_and_ref(name, f"lead {str(event.lead_id)[:8]}", escape=False)
     add_to_inbox_in_own_session(
         event_type="lead_arrival_alert_failed", dedup_key=str(event.lead_id), target_channel="ops",
-        summary="New LendingFlow lead alert did not post to Slack: call the lead now",
-        payload={"lead_id": str(event.lead_id), "ghl_contact_id": event.ghl_contact_id,
+        summary=f"New LendingFlow lead alert for {who} did not post to Slack: call the lead now",
+        payload={"name": name, "lead_id": str(event.lead_id), "ghl_contact_id": event.ghl_contact_id,
                  "phone_last4": event.phone[-4:]},
     )

@@ -1,14 +1,14 @@
 """Every lending Slack post names the person next to the record id (src.lending.slack_names)."""
 from __future__ import annotations
 
-from src.lending.slack_names import UNKNOWN, full_name, name_and_ref, names_by_phone, readable_ref
+from src.lending.slack_names import UNKNOWN, full_name, name_and_ref, names_by_phone, readable_ref, shared_phone_label
 
 
 def test_name_comes_first_and_the_id_follows_in_brackets() -> None:
     assert name_and_ref("Daniel Smith", "lead 1424") == "Daniel Smith (lead 1424)"
 
 
-def test_a_missing_name_says_unknown_caller_and_keeps_the_id() -> None:
+def test_a_missing_name_says_name_not_on_file_and_keeps_the_id() -> None:
     assert name_and_ref(None, "call 1222017054") == f"{UNKNOWN} (call 1222017054)"
     assert name_and_ref("   ", "web lead 7") == f"{UNKNOWN} (web lead 7)"
 
@@ -44,3 +44,27 @@ def test_a_failed_lookup_drops_names_but_never_raises() -> None:
 
     assert names_by_phone(BrokenSession(), ["+18135550147"]) == {}
     assert names_by_phone(BrokenSession(), [None, ""]) == {}
+
+
+def test_the_fallback_wording_suits_files_and_callers_alike() -> None:
+    assert UNKNOWN == "Name not on file"
+    assert name_and_ref(None, "File #82") == "Name not on file (File #82)"
+
+
+def test_people_sharing_a_phone_are_all_named_never_guessed() -> None:
+    assert shared_phone_label(["Ana Lopez"]) == "Ana Lopez"
+    assert shared_phone_label(["Ana Lopez", "Ben Ray"]) == "Ana Lopez or Ben Ray"
+    assert shared_phone_label(["Ana Lopez", "ana lopez", "Ben Ray"]) == "Ana Lopez or Ben Ray"  # same person once
+    assert shared_phone_label(["A B", "C D", "E F", "G H"]) == "A B or C D (+2 more)"
+
+
+def test_a_shared_phone_lookup_returns_every_name_in_priority_order(lending_db) -> None:
+    from sqlalchemy import text
+
+    phone = "+18135550990"
+    lending_db.execute(text(
+        "INSERT INTO lending.lendingflow_leads (vendor_lead_id, dedupe_hash, raw_payload, first_name, last_name, phone)"
+        " VALUES ('sn-1', 'sn-hash-1', '{}', 'Ana', 'Lopez', :p)"), {"p": phone})
+    lending_db.execute(text(
+        "INSERT INTO lending.web_leads (name, phone) VALUES ('Ben Ray', :p)"), {"p": phone})
+    assert names_by_phone(lending_db, [phone]) == {phone: "Ana Lopez or Ben Ray"}

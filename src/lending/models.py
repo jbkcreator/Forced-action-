@@ -1212,6 +1212,7 @@ class LendingLoanFile(LendingBase):
                         name="ck_lending_loan_files_status"),
         Index("idx_lending_loan_files_partner", "partner_id", "created_at"),
         Index("idx_lending_loan_files_status", "status", "status_at"),
+        Index("idx_lending_loan_files_borrower_phone", "borrower_phone"),  # Slack name lookup by phone
     )
 
 

@@ -242,16 +242,15 @@ _BOOKING_CONTACT = text("""
 """)
 
 
-def _appointment_label(appointment_id: str) -> str:
-    """``Daniel Smith (appointment abc123)`` for Slack; the name is best-effort and never blocks the alert."""
-    name = None
+def _appointment_person(appointment_id: str) -> Optional[str]:
+    """The booked person's full name (first name when no lead record matches), or None. Never raises."""
     try:
         with lending_session() as db:
             first_name, phone = db.execute(_BOOKING_CONTACT, {"event_id": appointment_id}).one()
-            name = (names_by_phone(db, [phone]).get(phone) if phone else None) or first_name
+            return (names_by_phone(db, [phone]).get(phone) if phone else None) or first_name
     except Exception as exc:  # class only
         logger.warning("[booking-webhook] appointment name lookup failed (%s)", type(exc).__name__)
-    return name_and_ref(name, f"appointment {appointment_id}")
+        return None
 
 
 def _release_slot(appointment_id: str) -> Optional[bool]:
@@ -262,20 +261,24 @@ def _release_slot(appointment_id: str) -> Optional[bool]:
         return None
     released = canceller(appointment_id)
     if not released:
+        person = _appointment_person(appointment_id)
         posted = False
         poster = slack_poster()
         if poster is not None:
             try:
                 poster(f"*Could not release a GHL slot after a failed check*\n"
-                       f"{_appointment_label(appointment_id)}: cancel it by hand "
+                       f"{name_and_ref(person, f'appointment {appointment_id}')}: cancel it by hand "
                        "in GHL (Calendars). The contact has already been messaged and the reminders cancelled.")
                 posted = True
             except Exception as exc:
                 logger.error("[booking-webhook] could not post the unreleased-slot alert (%s)", type(exc).__name__)
+        # Cora's inbox escapes the summary when it posts it, so the name goes in unescaped here.
         add_to_inbox_in_own_session(
             event_type="slot_release_failed", dedup_key=appointment_id, target_channel="replies",
-            channel_posted=posted, summary="GHL slot not released after a failed check: cancel it by hand",
-            payload={"ghl_appointment_id": appointment_id},
+            channel_posted=posted,
+            summary=(f"GHL slot for {name_and_ref(person, f'appointment {appointment_id}', escape=False)} not "
+                     "released after a failed check: cancel it by hand"),
+            payload={"person": person, "ghl_appointment_id": appointment_id},
         )
     return released
 

@@ -1,8 +1,10 @@
 """Who a lending Slack post is about: the person's full name next to the record id.
 
 Josh's team reads these posts, so every person-facing post shows ``Full Name (ref)`` instead of a bare id. The name
-comes from the record the post already points at; a phone or contact with no lead record behind it falls back to
-``Unknown caller``. Phones and emails stay masked: only names are added, and every name is Slack-escaped.
+comes from the record the post already points at; a phone or contact with no lead record behind it shows
+``Name not on file``. When different people's records share one phone number, every name is shown
+(``Ana Lopez or Ben Ray``) rather than guessing one. Phones and emails stay masked: only names are added, and every
+name is Slack-escaped.
 
 Lookups batch one query per post (never one per row) and run on the caller's session.
 """
@@ -17,11 +19,13 @@ from packages.agent_core.redaction import slack_escape, slack_safe
 
 logger = logging.getLogger(__name__)
 
-UNKNOWN = "Unknown caller"
+UNKNOWN = "Name not on file"
+MAX_NAMES_PER_PHONE = 2
 
-# Newest record wins within a source; LendingFlow, then website, then partner files, then the dialer pool.
+# Every distinct name on the phone, the most relevant first: LendingFlow, then website, then partner files, then the
+# dialer pool, newest first within a source.
 _NAMES_BY_PHONE = text("""
-    SELECT DISTINCT ON (phone) phone, name FROM (
+    SELECT phone, name, min(rank) AS rank, max(at) AS at FROM (
         SELECT phone, NULLIF(btrim(concat_ws(' ', first_name, last_name)), '') AS name, 1 AS rank, received_at AS at
           FROM lending.lendingflow_leads WHERE phone = ANY(:phones)
         UNION ALL
@@ -34,6 +38,7 @@ _NAMES_BY_PHONE = text("""
           FROM lending.dialer_load_records WHERE phone = ANY(:phones)
     ) s
      WHERE name IS NOT NULL
+     GROUP BY phone, name
      ORDER BY phone, rank, at DESC
 """)
 
@@ -60,9 +65,9 @@ def full_name(*parts: Optional[str]) -> Optional[str]:
 
 
 def name_and_ref(name: Optional[str], ref: Optional[str] = None, *, escape: bool = True) -> str:
-    """``Daniel Smith (lead 1424)``; ``Unknown caller (lead 1424)`` without a name; the name alone without a ref.
-    ``escape=False`` for text that is escaped later (Cora's approval-card summary goes through agent_core's
-    ``slack_safe``), so it is not escaped twice."""
+    """``Daniel Smith (lead 1424)``; ``Name not on file (lead 1424)`` without a name; the name alone without a ref.
+    ``escape=False`` for text that is escaped later (Cora's approval-card summary and inbox items are escaped when
+    they are posted), so it is not escaped twice."""
     shown = name.strip() if name and name.strip() else UNKNOWN
     if escape:
         # The name is person-typed: masked (a phone typed into it) and escaped. The ref is our own id (a dialer
@@ -71,31 +76,47 @@ def name_and_ref(name: Optional[str], ref: Optional[str] = None, *, escape: bool
     return f"{shown} ({ref})" if ref else shown
 
 
-def _lookup(db, query, params: dict) -> dict:
+def shared_phone_label(names: list[str]) -> str:
+    """One name as is; people sharing a phone as ``Ana Lopez or Ben Ray`` (``… (+2 more)`` past two)."""
+    unique: list[str] = []
+    for name in names:
+        if name.casefold() not in {seen.casefold() for seen in unique}:
+            unique.append(name)
+    shown = " or ".join(unique[:MAX_NAMES_PER_PHONE])
+    extra = len(unique) - MAX_NAMES_PER_PHONE
+    return f"{shown} (+{extra} more)" if extra > 0 else shown
+
+
+def _rows(db, query, params: dict) -> list:
     """Run one name lookup in a savepoint: a failure (a table missing, a timeout) only drops the names, never the
     post or the caller's transaction."""
     try:
         with db.begin_nested():
-            return {row[0]: row[1] for row in db.execute(query, params)}
+            return list(db.execute(query, params))
     except Exception as exc:  # class only
         logger.warning("[slack-names] name lookup failed (%s); posting without names", type(exc).__name__)
-        return {}
+        return []
 
 
 def names_by_phone(db, phones: Iterable[Optional[str]]) -> dict[str, str]:
-    """Normalized phone -> full name, from whichever lead record holds that phone."""
+    """Normalized phone -> the name(s) on the lead records that hold that phone."""
     wanted = sorted({phone for phone in phones if phone})
-    return _lookup(db, _NAMES_BY_PHONE, {"phones": wanted}) if wanted else {}
+    if not wanted:
+        return {}
+    grouped: dict[str, list[str]] = {}
+    for row in _rows(db, _NAMES_BY_PHONE, {"phones": wanted}):
+        grouped.setdefault(row[0], []).append(row[1])
+    return {phone: shared_phone_label(names) for phone, names in grouped.items()}
 
 
 def names_by_ghl_contact(db, contact_ids: Iterable[Optional[str]]) -> dict[str, str]:
     wanted = sorted({contact_id for contact_id in contact_ids if contact_id})
-    return _lookup(db, _NAMES_BY_GHL_CONTACT, {"ids": wanted}) if wanted else {}
+    return {row[0]: row[1] for row in _rows(db, _NAMES_BY_GHL_CONTACT, {"ids": wanted})} if wanted else {}
 
 
 def names_by_lendingflow_lead(db, lead_id: int) -> Optional[str]:
     """One LendingFlow lead's full name, or None."""
-    return _lookup(db, _LENDINGFLOW_NAMES, {"ids": [lead_id]}).get(lead_id)
+    return {row[0]: row[1] for row in _rows(db, _LENDINGFLOW_NAMES, {"ids": [lead_id]})}.get(lead_id)
 
 
 def readable_ref(ref: str) -> str:
