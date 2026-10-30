@@ -256,7 +256,7 @@ def _totals(t: Row) -> list[tuple[str, str]]:
 
 def _headline(t: Row) -> str:
     return (f":telephone_receiver: *{t.dials}* dials   :speech_balloon: *{t.live}* contacts ({t.connect_rate:.0%} connect)   "
-            f":calendar: *{t.booked}* booked ({t.book_rate:.0%})")
+            f":white_check_mark: *{t.booked}* booked ({t.book_rate:.0%})")
 
 
 def _secondary(t: Row) -> str:
