@@ -14,6 +14,7 @@ from config.lending_dispositions import (
     ANSWERED_CODES, BOOKED_CODE, GATED_CODES, LIVE_CONVERSATION_CODES, LONG_CONVERSATION_SECONDS, NURTURE_SENT_CODES,
     SHOWED_STAGE_KEYS, TRANSFER_CODES,
 )
+from config.lending_followup import GHL_CALLER_SEAT
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +123,8 @@ def _by_number(db, day: date) -> list[NumberRow]:
 
 def _showed(db, key: str, day: date) -> dict[str, int]:
     """Opportunities that entered a "showed" GHL stage on ``day``, credited to the caller / campaign of the
-    latest BOOKED call to that phone (the event's own booked_by when no such call is logged).
+    latest BOOKED call to that phone (the event's own booked_by when no such call is logged; an unresolved GHL merge
+    field stored as "null" counts as no booked_by).
 
     Showed is additive: if its table is missing or the query fails, the report still posts with Showed 0
     rather than losing every other column. The savepoint keeps the outer transaction usable."""
@@ -131,7 +133,9 @@ def _showed(db, key: str, day: date) -> dict[str, int]:
         with db.begin_nested():
             rows = db.execute(
                 text(f"SELECT {_KEYS[key]} AS k, count(*) FROM ("
-                     "SELECT COALESCE(NULLIF(b.caller_name, ''), e.booked_by) AS caller_name, b.caller_seat, "
+                     "SELECT COALESCE(NULLIF(b.caller_name, ''), "
+                     "CASE WHEN lower(e.booked_by) IN ('null', 'none', 'undefined', 'nan') THEN NULL ELSE e.booked_by END) "
+                     "AS caller_name, b.caller_seat, "
                      "b.dialer_campaign_id, b.campaign_tag, b.source_tag FROM lending.ghl_stage_events e "
                      "LEFT JOIN LATERAL (SELECT caller_name, caller_seat, dialer_campaign_id, campaign_tag, source_tag "
                      "FROM lending.call_dispositions d WHERE d.phone = e.phone AND d.disposition = :booked "
@@ -166,18 +170,10 @@ def build_scoreboard(db, day: date, campaign_names: Optional[Mapping[str, str]] 
     return ScoreboardData(callers, campaigns, hooks, total, _by_number(db, day), seats, sources)
 
 
-_COLUMNS = ("Dials", "Contacts", "2m+", "Gated", "Booked", "Xfer", "Showed", "Show%", "Nurture", "Connect", "Book rate")
-_XFER = _COLUMNS.index("Xfer")
-_NUMBER_COLUMNS = ("Dials", "Answered", "Answer rate")
-MAX_TABLE_ROWS = 20  # a Slack section holds 3000 chars
-MAX_NAME_CHARS = 26
-LEGEND = ("Contacts = real conversation · 2m+ = calls with 2+ min of talk time, any result (incl. long voicemails) · "
-          "Gated = booked or failed the gate · "
-          "Xfer = transferred to Josh (in the totals only, n/a until the dialer records transfers) · Nurture = nurture sent · "
-          "Showed = moved to Held in GHL today, credited to the caller who booked it · "
-          "Show% = Held today ÷ Booked today (different calls, not a conversion rate) · "
-          "Connect = Contacts ÷ Dials · Book rate = Booked ÷ Contacts")
-TOTALS_PER_SECTION = 6  # a Slack section holds at most 10 fields
+MAX_TABLE_ROWS = 12  # a Slack section holds 3000 chars
+MAX_NAME_CHARS = 40
+UNKNOWN_CALLER = "(unknown)"
+DISPLAY_NAMES = {GHL_CALLER_SEAT: "GHL phone calls", UNKNOWN_CALLER: "No caller logged"}
 
 
 def _transfers(n: int) -> str:
@@ -188,57 +184,60 @@ def _show_rate(r: Row) -> str:
     return f"{r.show_rate:.0%}" if r.show_rate is not None else "–"
 
 
-def _table_columns() -> tuple[str, ...]:
-    """Xfer is left out of the per-section tables while it can only show n/a: it keeps them narrow on Slack mobile."""
-    return _COLUMNS if TRANSFER_CODES else _COLUMNS[:_XFER] + _COLUMNS[_XFER + 1:]
-
-
-def _cells(r: Row) -> list[str]:
-    cells = [str(r.dials), str(r.live), str(r.long_calls), str(r.gated), str(r.booked), _transfers(r.transfers),
-             str(r.showed), _show_rate(r), str(r.nurture), f"{r.connect_rate:.0%}", f"{r.book_rate:.0%}"]
-    return cells if TRANSFER_CODES else cells[:_XFER] + cells[_XFER + 1:]
-
-
-def _number_cells(r: NumberRow) -> list[str]:
-    return [str(r.dials), str(r.answered), f"{r.answer_rate:.0%}"]
-
-
 def _name(raw: str) -> str:
-    clean = raw.replace("`", "'")
+    clean = DISPLAY_NAMES.get(raw, raw).replace("*", "").replace("`", "'")
     return clean if len(clean) <= MAX_NAME_CHARS else clean[:MAX_NAME_CHARS - 1] + "…"
 
 
-def _render(label: str, columns: tuple[str, ...], raw_names: list[str], body: list[list[str]], total: int) -> str:
-    """Aligned monospace table in a code fence (Slack has no native tables)."""
-    names = [_name(n) for n in raw_names]
-    first = max(len(label), *map(len, names))
-    widths = [max(len(h), *(len(c[i]) for c in body)) for i, h in enumerate(columns)]
-    lines = [label.ljust(first) + "  " + "  ".join(h.rjust(w) for h, w in zip(columns, widths))]
-    lines.append("-" * len(lines[0]))
-    lines += [n.ljust(first) + "  " + "  ".join(c.rjust(w) for c, w in zip(cells, widths)) for n, cells in zip(names, body)]
-    if total > len(body):
-        lines.append(f"... and {total - len(body)} more")
-    return "```\n" + "\n".join(lines) + "\n```"
+def _extras(r: Row) -> list[str]:
+    """Secondary counts, shown only when non-zero: on most rows they are all 0 and only add noise."""
+    counts = [(r.long_calls, "over 2 min"), (r.gated, "gated"), (r.showed, "showed"), (r.nurture, "nurture")]
+    if TRANSFER_CODES:
+        counts.append((r.transfers, "transferred"))
+    return [f"{n} {label}" for n, label in counts if n]
 
 
-def _table(label: str, rows: list[Row]) -> str:
-    if not rows:
+def _row_line(r: Row) -> str:
+    core = [f"{r.dials} dials", f"{r.live} contacts", f"{r.booked} booked"]
+    return f"*{_name(r.name)}* — " + " · ".join(core + _extras(r))
+
+
+def _is_empty(r: Row) -> bool:
+    return not (r.dials or r.live or r.booked or r.showed or r.nurture or r.gated)
+
+
+def _ranked(rows: list[Row]) -> list[Row]:
+    return sorted((r for r in rows if not _is_empty(r)), key=lambda r: (-r.booked, -r.live, -r.dials, r.name))
+
+
+def _more(total: int, shown: int) -> list[str]:
+    return [f"_… and {total - shown} more_"] if total > shown else []
+
+
+def _table(rows: list[Row]) -> str:
+    ranked = _ranked(rows)
+    if not ranked:
         return "_no dials_"
-    shown = rows[:MAX_TABLE_ROWS]
-    return _render(label, _table_columns(), [r.name for r in shown], [_cells(r) for r in shown], len(rows))
+    shown = ranked[:MAX_TABLE_ROWS]
+    return "\n".join([_row_line(r) for r in shown] + _more(len(ranked), len(shown)))
+
+
+def _number_line(r: NumberRow) -> str:
+    return f"*{_name(r.number)}* — {r.dials} dials · {r.answered} answered · answer rate {r.answer_rate:.0%}"
 
 
 def _number_table(rows: list[NumberRow]) -> str:
     if not rows:
         return "_no dials_"
     shown = rows[:MAX_TABLE_ROWS]
-    return _render("Number", _NUMBER_COLUMNS, [r.number for r in shown], [_number_cells(r) for r in shown], len(rows))
+    return "\n".join([_number_line(r) for r in shown] + _more(len(rows), len(shown)))
 
 
-def _sections(data: ScoreboardData) -> list[tuple[str, str, list[Row]]]:
-    return [("By seat", "Seat", data.by_seat), ("By source", "Source", data.by_source),
-            ("By caller", "Caller", data.by_caller), ("By campaign", "Campaign", data.by_campaign),
-            ("By hook (campaign tag): which hook works", "Hook", data.by_hook)]
+def _breakdowns(data: ScoreboardData) -> list[tuple[str, list[Row]]]:
+    """Closing-board sections, each only when it splits the day two or more ways (one row repeats the totals)."""
+    candidates = [("By seat", data.by_seat), ("By source", data.by_source), ("By campaign", data.by_campaign),
+                  ("By hook (campaign tag): which hook works", data.by_hook)]
+    return [(title, rows) for title, rows in candidates if len(_ranked(rows)) >= 2]
 
 
 NUMBER_TITLE = "By caller-ID number: answer rate"
@@ -255,6 +254,19 @@ def _totals(t: Row) -> list[tuple[str, str]]:
             ("Book rate", f"{t.book_rate:.0%}")]
 
 
+def _headline(t: Row) -> str:
+    return (f":telephone_receiver: *{t.dials}* dials   :speech_balloon: *{t.live}* contacts ({t.connect_rate:.0%} connect)   "
+            f":spiral_calendar_pad: *{t.booked}* booked ({t.book_rate:.0%})")
+
+
+def _secondary(t: Row) -> str:
+    parts = [f"{t.long_calls} over 2 min", f"{t.gated} gated", f"{t.showed} showed (held ÷ booked {_show_rate(t)})",
+             f"{t.nurture} nurture"]
+    if TRANSFER_CODES:
+        parts.append(f"{t.transfers} transferred")
+    return " · ".join(parts)
+
+
 def _clock(moment: datetime) -> str:
     return f"{moment.hour % 12 or 12}:{moment.minute:02d} {'am' if moment.hour < 12 else 'pm'} ET"
 
@@ -264,26 +276,34 @@ def format_slack(data: ScoreboardData, day: date, as_of: Optional[datetime] = No
     ``as_of`` (Eastern) marks an hourly day-so-far board; without it this is the closing 7:20pm board."""
     totals = " | ".join(f"{k} {v}" for k, v in _totals(data.total))
     span = f"as of {_clock(as_of)}" if as_of else "through 7:15pm ET"
-    out = [f"*{_title(day)}* ({span})", f"TOTAL: {totals}"]
-    for title, label, rows in _sections(data):
-        out += ["", f"*{title}*", _table(label, rows)]
-    out += ["", f"*{NUMBER_TITLE}*", _number_table(data.by_number)]
+    out = [f"*{_title(day)}* ({span})", f"TOTAL: {totals}", "", "*By caller*", _table(data.by_caller)]
+    if as_of is None:
+        for title, rows in _breakdowns(data):
+            out += ["", f"*{title}*", _table(rows)]
+        out += ["", f"*{NUMBER_TITLE}*", _number_table(data.by_number)]
     return "\n".join(out)
 
 
+def _section(text_: str) -> dict:
+    return {"type": "section", "text": {"type": "mrkdwn", "text": text_}}
+
+
 def format_blocks(data: ScoreboardData, day: date, as_of: Optional[datetime] = None) -> list[dict]:
-    span = f"Outbound dials today, as of {_clock(as_of)}" if as_of else "Outbound dials through 7:15pm ET"
-    fields = [{"type": "mrkdwn", "text": f"*{k}*\n{v}"} for k, v in _totals(data.total)]
+    """Headline KPIs, then one line per caller. The hourly board stops there; the closing board adds the
+    breakdowns that split the day and the caller-ID answer rates."""
+    span = f"Day so far, as of {_clock(as_of)}" if as_of else "Closing board · outbound dials through 7:15pm ET"
     blocks: list[dict] = [
-        {"type": "header", "text": {"type": "plain_text", "text": f":telephone_receiver: {_title(day)}", "emoji": True}},
+        {"type": "header", "text": {"type": "plain_text", "text": _title(day), "emoji": True}},
         {"type": "context", "elements": [{"type": "mrkdwn", "text": span}]},
+        _section(_headline(data.total)),
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": _secondary(data.total)}]},
+        {"type": "divider"},
+        _section(f"*By caller*\n{_table(data.by_caller)}"),
     ]
-    blocks += [{"type": "section", "fields": fields[i:i + TOTALS_PER_SECTION]}
-               for i in range(0, len(fields), TOTALS_PER_SECTION)]
-    for title, label, rows in _sections(data):
-        blocks += [{"type": "divider"},
-                   {"type": "section", "text": {"type": "mrkdwn", "text": f"*{title}*\n{_table(label, rows)}"}}]
-    blocks += [{"type": "divider"},
-               {"type": "section", "text": {"type": "mrkdwn", "text": f"*{NUMBER_TITLE}*\n{_number_table(data.by_number)}"}}]
-    blocks += [{"type": "divider"}, {"type": "context", "elements": [{"type": "mrkdwn", "text": LEGEND}]}]
+    if as_of is not None:
+        return blocks
+    for title, rows in _breakdowns(data):
+        blocks.append(_section(f"*{title}*\n{_table(rows)}"))
+    if data.by_number:
+        blocks.append(_section(f"*{NUMBER_TITLE}*\n{_number_table(data.by_number)}"))
     return blocks

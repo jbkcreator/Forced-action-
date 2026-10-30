@@ -34,6 +34,12 @@ def test_records_the_stage_with_a_normalized_phone(client, lending_db):
     assert _rows(lending_db) == [("held", "+18135550142", "Dana", "pipe-1")]
 
 
+def test_an_unresolved_booked_by_or_phone_merge_field_is_stored_as_null(client, lending_db):
+    r = client.post("/webhooks/lending/ghl-stage", headers=HEADERS, json={**BODY, "booked_by": "null", "phone": "undefined"})
+    assert r.status_code == 200
+    assert _rows(lending_db) == [("held", None, None, "pipe-1")]
+
+
 def test_a_ghl_key_value_body_under_custom_data_is_recorded(client, lending_db):
     """A GHL webhook action sends its key/value rows under customData, next to GHL's own contact fields."""
     body = {"contact_id": "c-1", "first_name": "Test", "phone": "(813) 555-0142",
