@@ -704,6 +704,7 @@ def test_the_escalation_is_raised_in_coras_inbox_once_without_the_phone(db):
     row = rows[0]
     assert row["target_channel"] == "ops" and row["channel_posted_at"] is not None
     assert row["payload"]["kind"] == "no_call" and row["payload"]["first_name"] == "Jane"
+    assert row["summary"].startswith("LendingFlow lead Jane (FL) still no call after")
     assert LEAD_PHONE not in row["raw"] and "5550100" not in row["raw"]
 
 

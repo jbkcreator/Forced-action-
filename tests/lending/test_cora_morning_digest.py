@@ -25,7 +25,7 @@ _DDL = (
     " contact_ref TEXT, status TEXT, created_at TIMESTAMP)",
     "CREATE TABLE lending.booking_messages (booking_ref TEXT, first_name TEXT, booked_by TEXT, slot_start_utc TIMESTAMP)",
     "CREATE TABLE lending.web_leads (id INTEGER PRIMARY KEY, received_at TIMESTAMP, ghl_status TEXT, is_test BOOLEAN NOT NULL DEFAULT 0)",
-    "CREATE TABLE lending.cora_inbox (id INTEGER PRIMARY KEY, summary TEXT, status TEXT)",
+    "CREATE TABLE lending.cora_inbox (id INTEGER PRIMARY KEY, summary TEXT, payload TEXT, status TEXT)",
     "CREATE TABLE lending.file_routing (id INTEGER PRIMARY KEY, status TEXT, is_test BOOLEAN NOT NULL DEFAULT 0)",
     "CREATE TABLE lending.confirmation_tasks (booking_ref TEXT, due_date DATE, completed_at TIMESTAMP,"
     " cancelled_at TIMESTAMP)",
@@ -116,8 +116,10 @@ def test_digest_follows_the_e5_morning_brief(engine) -> None:
                           " ('bk-2', '2026-10-20', NULL, NULL), ('bk-3', '2026-10-18', '2026-10-18 10:00:00', NULL)"))
         conn.execute(text("INSERT INTO lending.booking_messages VALUES ('bk-1', 'Dana', 'ai', '2026-10-27 18:00:00'),"
                           " ('bk-1', 'Dana', 'ai', '2026-10-27 18:00:00')"))
-        conn.execute(text("INSERT INTO lending.cora_inbox VALUES (1, 'Lead did not reach GoHighLevel', 'new'),"
-                          " (2, 'Closed one', 'dismissed')"))
+        conn.execute(text("INSERT INTO lending.cora_inbox VALUES (1, 'Lead did not reach GoHighLevel', NULL, 'new'),"
+                          " (2, 'Closed one', NULL, 'dismissed'),"
+                          " (3, 'LendingFlow lead ebd43aa6 (FL) still no call after 5 min',"
+                          " '{\"lead_ref\": \"ebd43aa6\", \"first_name\": \"Jane\"}', 'new')"))
         conn.execute(text("INSERT INTO lending.lendingflow_leads VALUES"
                           " (10, 'Ana', 'Fix & Flip', '$250K - $500K', 'Tampa', '2026-10-19 02:00:00', 0, 0),"
                           " (11, 'Ben', 'DSCR', NULL, NULL, '2026-10-19 03:00:00', 0, 0),"
@@ -144,7 +146,8 @@ def test_digest_follows_the_e5_morning_brief(engine) -> None:
     assert "*Confirmation calls to make: 1*" in body
     assert "• Dana: call on Tue, Oct 27 at 2:00 PM. Late by 2 days." in body
     assert "bk-" not in body
-    assert "*Open items in Cora's inbox: 1*" in body and "• Lead did not reach GoHighLevel" in body
+    assert "*Open items in Cora's inbox: 2*" in body and "• Lead did not reach GoHighLevel" in body
+    assert "• LendingFlow lead Jane (FL) still no call after 5 min" in body and "ebd43aa6" not in body
     assert "New leads, last 24 hours: 4" in body  # 2 LendingFlow (suppressed and old ones left out) + 2 web
     assert body.index("Ben") < body.index("Ana")  # closer priority first
     assert ":star: Ana: Fix &amp; Flip, $250K - $500K, Tampa" in body  # Slack shows "&"
@@ -265,3 +268,19 @@ def test_a_missing_table_blanks_only_its_section(engine) -> None:
     assert "Not available today: LendingFlow leads" in body
     assert "• Draft email. Waiting" in body
     assert _rows(engine) == [("2026-10-19", chat.posts[0]["ts"])]
+
+
+def test_inbox_items_show_the_lead_name_not_its_reference() -> None:
+    items = [
+        {"summary": "LendingFlow lead ebd43aa6 (FL) still no call after 5 min",
+         "payload": {"lead_ref": "ebd43aa6", "first_name": " Jane "}, "total": 4},
+        {"summary": "LendingFlow lead 1fc4b076 (FL) still no call", "payload": {"lead_ref": "1fc4b076",
+                                                                               "first_name": None}, "total": 4},
+        {"summary": "Reply overdue", "payload": "not json", "total": 4},
+        {"summary": "Possible duplicate", "payload": '{"lead_ref": "lendingflow_lead:7"}', "total": 4},
+    ]
+    body = _body(render(date(2026, 10, 19), _empty(open_inbox=4, inbox_items=items))[1])
+    assert "• LendingFlow lead Jane (FL) still no call after 5 min" in body
+    assert "ebd43aa6" not in body
+    assert "1fc4b076" in body  # no name on file: left as written rather than blanked
+    assert "• Reply overdue" in body and "• Possible duplicate" in body

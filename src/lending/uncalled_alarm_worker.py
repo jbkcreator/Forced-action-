@@ -236,6 +236,13 @@ def _lead_label(row: Mapping[str, Any]) -> str:
     return f"{name} ({row['property_state']})" if row["property_state"] else name
 
 
+def _inbox_label(row: Mapping[str, Any]) -> str:
+    """Who the lead is for Cora's inbox: first name, else the last 4 digits of the phone. Never an id."""
+    name = (row["first_name"] or "").strip()
+    who = name or (f"(no name, …{row['phone'][-4:]})" if row["phone"] else "(no name)")
+    return f"{who} ({row['property_state']})" if row["property_state"] else who
+
+
 def _fields(row: Mapping[str, Any], now: datetime) -> dict[str, Any]:
     return {"lead": _lead_label(row), "ref": str(row["lead_uuid"])[:8],
             "source": "website" if row["from_web"] else "LendingFlow",
@@ -314,7 +321,7 @@ def _queue_for_cora(db, row: Mapping[str, Any], kind: str, now: datetime, *, sla
     fields = _fields(row, now)
     add_to_inbox_safely(
         db, event_type="lead_uncalled", dedup_key=str(row["id"]), target_channel="ops", channel_posted=slack_sent,
-        summary=f"{fields['source']} lead {fields['ref']}{fields['state']} still {kind.replace('_', ' ')} after "
+        summary=f"{fields['source']} lead {_inbox_label(row)} still {kind.replace('_', ' ')} after "
                 f"{fields['minutes']} min",
         payload={"kind": kind, "lead_ref": fields["ref"], "first_name": row["first_name"],
                  "property_state": row["property_state"], "minutes_since_arrival": fields["minutes"],

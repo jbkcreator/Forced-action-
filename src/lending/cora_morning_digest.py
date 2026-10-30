@@ -23,6 +23,7 @@ borrowers). It shows first names and last-4 digits only: no emails, phone number
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -68,7 +69,7 @@ _DUE_CONFIRMATIONS = text("""
      ORDER BY t.due_date LIMIT :limit
 """)
 _OPEN_INBOX = text("""
-    SELECT summary, count(*) OVER () AS total FROM lending.cora_inbox
+    SELECT summary, payload, count(*) OVER () AS total FROM lending.cora_inbox
      WHERE status IN ('new', 'surfaced') ORDER BY id LIMIT :limit
 """)
 _NEW_LENDINGFLOW_LEADS = text("""
@@ -253,6 +254,20 @@ def _booker(booked_by: Optional[str]) -> str:
     return "AI" if (booked_by or "").lower() == "ai" else slack_safe(booked_by or "unknown")
 
 
+def _inbox_text(item: dict[str, Any]) -> str:
+    """The item's summary, with a lead's short reference swapped for the first name kept in its payload. Items raised
+    before the alerts used names carry the reference in the summary."""
+    summary = str(item["summary"] or "Inbox item")
+    payload = item.get("payload")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            payload = None
+    ref, name = (payload.get("lead_ref"), payload.get("first_name")) if isinstance(payload, dict) else (None, None)
+    return summary.replace(str(ref), str(name).strip()) if ref and name and str(ref) in summary else summary
+
+
 def _action_lines(data: DigestData, day: date, now: datetime, approvals_channel: Optional[str]) -> list[str]:
     lines: list[str] = []
     if data.pending_drafts:
@@ -266,7 +281,7 @@ def _action_lines(data: DigestData, day: date, now: datetime, approvals_channel:
     if data.open_inbox:
         lines += ["", f":inbox_tray: *Open items in Cora's inbox: {data.open_inbox}*  → reply in the inbox thread "
                       "to route or dismiss"]
-        lines += [f"• {slack_safe(str(i['summary'] or 'Inbox item'))[:INBOX_SUMMARY_MAX]}" for i in data.inbox_items]
+        lines += [f"• {slack_safe(_inbox_text(i))[:INBOX_SUMMARY_MAX]}" for i in data.inbox_items]
         lines += _more(len(data.inbox_items), data.open_inbox)
     return lines[1:] if lines and lines[0] == "" else lines
 
