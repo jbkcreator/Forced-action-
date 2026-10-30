@@ -27,7 +27,9 @@ from sqlalchemy.orm import Session
 from config.lending_partners import PRODUCTS
 from config.settings import get_settings
 from src.lending.routing.file_key import key_from_row
+from packages.agent_core.redaction import slack_safe
 from src.lending.routing.rules import LenderRow
+from src.lending.slack_names import full_name, name_and_ref
 
 logger = logging.getLogger(__name__)
 
@@ -74,11 +76,12 @@ def build_message(
     reason_code: Optional[str] = None,
     hold_reason: Optional[str] = None,
     label: Optional[str] = None,
+    first_name: Optional[str] = None,
 ) -> Optional[str]:
-    """The Slack text for one routing event, or None for an action that is not posted."""
-    head = (
-        f"{label or f'File #{lead_id}'} · {last_name or 'Unknown'} · {loan_type or 'unknown'} · {_amount(loan_amount)}"
-    )
+    """The Slack text for one routing event, or None for an action that is not posted. The borrower's full name
+    leads, with the file id next to it (``Daniel Smith (File #82)``)."""
+    who = name_and_ref(full_name(first_name, last_name), label or f"File #{lead_id}")
+    head = f"{who} · {slack_safe(loan_type or 'unknown')} · {_amount(loan_amount)}"
     where = f"Lender: *{lender_name or 'unknown'}* (position {position if position else '?'} in waterfall)"
     if action == "routed":
         return f":arrow_right: *Routed* | {head}\n{where}"
@@ -167,7 +170,7 @@ def post_route_event(
 ) -> None:
     """Post a 'routed' notification (best-effort)."""
     message = build_message(
-        "routed", lead_id=lead.get("id"), last_name=lead.get("last_name"),
+        "routed", lead_id=lead.get("id"), last_name=lead.get("last_name"), first_name=lead.get("first_name"),
         loan_type=lead.get("loan_type"), loan_amount=lead.get("loan_amount"),
         lender_name=lender.name, position=position, label=lead.get("label"),
     )
@@ -185,7 +188,7 @@ def post_decline_event(
 ) -> None:
     """Post a 'declined' notification (best-effort)."""
     message = build_message(
-        "declined", lead_id=lead.get("id"), last_name=lead.get("last_name"),
+        "declined", lead_id=lead.get("id"), last_name=lead.get("last_name"), first_name=lead.get("first_name"),
         loan_type=lead.get("loan_type"), loan_amount=lead.get("loan_amount"),
         lender_name=lender_name, position=position, reason_code=reason_code, label=lead.get("label"),
     )
@@ -201,7 +204,7 @@ def post_hold_event(
 ) -> None:
     """Post a 'held' notification (best-effort)."""
     message = build_message(
-        "held", lead_id=lead.get("id"), last_name=lead.get("last_name"),
+        "held", lead_id=lead.get("id"), last_name=lead.get("last_name"), first_name=lead.get("first_name"),
         loan_type=lead.get("loan_type"), loan_amount=lead.get("loan_amount"),
         lender_name=None, position=None, hold_reason=reason, label=lead.get("label"),
     )
@@ -223,13 +226,14 @@ def retry_unposted_events(db: Session) -> int:
     # The Partner Door table may not be installed yet; the three fragments below are fixed literals.
     partner = db.execute(text("SELECT to_regclass('lending.loan_files') IS NOT NULL")).scalar() is True
     last_name_sql = "COALESCE(ll.last_name, lf.borrower_last_name)" if partner else "ll.last_name"
+    first_name_sql = "COALESCE(ll.first_name, lf.borrower_first_name)" if partner else "ll.first_name"
     product_sql = "lf.product" if partner else "CAST(NULL AS text)"
     amount_sql = "COALESCE(ll.loan_amount, lf.loan_amount)" if partner else "ll.loan_amount"
     partner_join = "  LEFT JOIN lending.loan_files lf ON lf.id = fre.loan_file_id" if partner else ""
     rows = db.execute(
         text(
             "SELECT fre.id, fre.lead_id, fre.loan_file_id, fre.lender_name, fre.action, fre.reason_code,"
-            f"       {last_name_sql} AS last_name,"
+            f"       {last_name_sql} AS last_name, {first_name_sql} AS first_name,"
             f"       ll.loan_type, {product_sql} AS product,"
             f"       {amount_sql} AS loan_amount,"
             "       (SELECT COUNT(*) FROM lending.file_routing_events r"
@@ -258,7 +262,7 @@ def retry_unposted_events(db: Session) -> int:
             product_type = PRODUCTS.get(row["product"])
             loan_type = product_type.value if product_type is not None else None
         message = build_message(
-            row["action"], lead_id=key.id, last_name=row["last_name"],
+            row["action"], lead_id=key.id, last_name=row["last_name"], first_name=row["first_name"],
             loan_type=loan_type, loan_amount=row["loan_amount"],
             lender_name=row["lender_name"], position=int(row["position"]) or None,
             reason_code=row["reason_code"], hold_reason=row["hold_reason"], label=key.label,

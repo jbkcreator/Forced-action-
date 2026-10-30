@@ -57,6 +57,12 @@ def test_a_new_lead_mentions_josh_in_the_ops_channel(slack) -> None:
     assert "$250,000" in post["text"] and "FL" in post["text"] and "Phone ending 0100" in post["text"]
 
 
+def test_the_alert_names_the_lead_next_to_its_id() -> None:
+    body = lead_arrival_alert.alert_text(_event(), frozenset({"U_JOSH"}), name="Sam <Lee>")
+    assert "Sam &lt;Lee&gt; (lead 7f6c1a2e)." in body
+    assert "Name not on file (lead 7f6c1a2e)." in lead_arrival_alert.alert_text(_event(), frozenset({"U_JOSH"}))
+
+
 def test_the_alert_links_to_the_ghl_contact(slack) -> None:
     lead_arrival_alert.alert_josh(_event())
     assert ("<https://app.gohighlevel.com/v2/location/loc-ndl/contacts/detail/ct-123|Open in GHL to call>"
@@ -216,3 +222,12 @@ def test_no_approvers_means_the_alarm_post_is_unchanged() -> None:
     inner = FakeSlack()
     MentioningSlack(inner, frozenset()).chat_postMessage(channel="C_OPS", text="URGENT")
     assert inner.posts[0]["text"] == "URGENT"
+
+
+def test_a_failed_alert_names_the_lead_in_coras_inbox(monkeypatch) -> None:
+    queued = []
+    monkeypatch.setattr(lead_arrival_alert, "add_to_inbox_in_own_session", lambda **event: queued.append(event))
+    lead_arrival_alert._queue_unposted(_event(), "Sam Lee")
+    assert queued[0]["summary"] == ("New LendingFlow lead alert for Sam Lee (lead 7f6c1a2e) did not post to Slack: "
+                                    "call the lead now")
+    assert queued[0]["payload"]["name"] == "Sam Lee" and "7275550100" not in str(queued[0])

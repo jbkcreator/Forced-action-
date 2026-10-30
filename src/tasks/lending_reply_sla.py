@@ -30,6 +30,7 @@ from config.lending_reply_agent import (
 from src.lending.cora_inbox import add_to_inbox_safely
 from src.lending.db import lending_session
 from src.lending.reply_guard import slack_poster
+from src.lending.slack_names import name_and_ref, names_by_ghl_contact
 
 logger = logging.getLogger(__name__)
 
@@ -78,9 +79,13 @@ def _posted_label(moment: datetime) -> str:
     return f"{local:%a %b} {local.day} {local.hour % 12 or 12}:{local:%M} {'am' if local.hour < 12 else 'pm'} ET"
 
 
-def format_alert(rows: Sequence[Mapping[str, Any]]) -> str:
-    lines = [f"• {r['kind'].replace('_', ' ')} (GHL contact {r['contact_id'] or 'unknown'}), posted "
-             f"{_posted_label(r['posted_at'])}" for r in rows]
+def format_alert(rows: Sequence[Mapping[str, Any]], names: Optional[Mapping[str, str]] = None) -> str:
+    names = names or {}
+    lines = []
+    for r in rows:
+        contact_id = r["contact_id"]
+        who = name_and_ref(names.get(contact_id), f"GHL contact {contact_id or 'unknown'}")
+        lines.append(f"• {r['kind'].replace('_', ' ')}: {who}, posted {_posted_label(r['posted_at'])}")
     head = f"*{len(rows)} handoff(s) unanswered after {REPLY_SLA_BUSINESS_MINUTES} business minutes*"
     return "\n".join([head, *lines])
 
@@ -106,7 +111,7 @@ def main(*, now: Optional[datetime] = None) -> int:
             rows = overdue_handoffs(db, now)
             if not rows:
                 return 0
-            poster(format_alert(rows))
+            poster(format_alert(rows, names_by_ghl_contact(db, [r["contact_id"] for r in rows])))
             db.execute(_MARK_ALERTED, {"ids": [r["message_id"] for r in rows]})
             for row in rows:
                 _queue_for_cora(db, row)

@@ -6,7 +6,7 @@ else surfaces it, so this posts, once a morning, every task that is due today or
 completed (``POST /webhooks/lending/confirmation-task-complete``), when its booking is cancelled or
 rescheduled, or once its call starts. Cron fires at 13:00 and 14:00 UTC; only the one that is 9:xx ET acts.
 
-Shows first name and the last four digits of the phone only, never the full number.
+Shows the contact's full name with the booking ref, and the last four digits of the phone only, never the full number.
 """
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from sqlalchemy import text
 from config.lending_reminders import TIMEZONE
 from config.settings import get_settings
 from src.lending.db import lending_session
+from src.lending.slack_names import name_and_ref, names_by_phone
 
 logger = logging.getLogger(__name__)
 
@@ -39,12 +40,16 @@ _OPEN_TASKS = text("""
 
 
 def open_tasks(db, today: date, now: datetime) -> list[Mapping[str, Any]]:
-    return list(db.execute(_OPEN_TASKS, {"today": today, "floor": today - timedelta(days=LOOKBACK_DAYS),
-                                         "now": now}).mappings())
+    rows = [dict(row) for row in db.execute(_OPEN_TASKS, {"today": today, "floor": today - timedelta(days=LOOKBACK_DAYS),
+                                                          "now": now}).mappings()]
+    names = names_by_phone(db, [row["contact_phone"] for row in rows])
+    for row in rows:
+        row["full_name"] = names.get(row["contact_phone"])
+    return rows
 
 
 def _line(row: Mapping[str, Any], today: date) -> str:
-    who = row["first_name"] or "Unknown contact"
+    who = name_and_ref(row.get("full_name") or row["first_name"], f"booking {row['booking_ref']}")
     tail = f" (…{row['contact_phone'][-4:]})" if row["contact_phone"] else ""
     slot = row["slot_start_utc"].astimezone(TIMEZONE)
     overdue = f" — OVERDUE since {row['due_date']:%a %b} {row['due_date'].day}" if row["due_date"] < today else ""

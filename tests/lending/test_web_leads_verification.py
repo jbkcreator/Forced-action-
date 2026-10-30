@@ -385,7 +385,7 @@ def test_a_lead_still_not_in_ghl_after_an_hour_is_posted_to_slack_once_without_p
     assert sweep.alert_undelivered(slack_client=slack) == 1
     message = slack.posts[0]["text"]
     assert f"{stale}" in message and "HTTP 401" in message and "1 website lead" in message
-    assert "8135550142" not in message and "dana" not in message.lower()
+    assert "8135550142" not in message and f"(web lead {stale})" in message and "dana" in message.lower()
     assert sweep.alert_undelivered(slack_client=slack) == 0 and len(slack.posts) == 1  # flagged once
 
 

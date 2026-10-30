@@ -61,9 +61,9 @@ SMS_TEXT = {
 SLACK_TEXT = {
     KIND_NO_CALL:
         ":rotating_light: *URGENT: {source} lead still uncalled*\n"
-        "Lead ref {ref}{state} came in {minutes} min ago and has no call logged. Please call now. "
+        "{who}{state} came in {minutes} min ago and has no call logged. Please call now. "
         "Ignore if a caller is already on the phone with them.",
     KIND_NOT_REACHED:
         ":warning: *URGENT: {source} lead not reached*\n"
-        "Lead ref {ref}{state} came in {minutes} min ago and was called but not reached. Please try again now.",
+        "{who}{state} came in {minutes} min ago and was called but not reached. Please try again now.",
 }

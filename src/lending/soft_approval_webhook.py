@@ -24,6 +24,7 @@ from sqlalchemy import text
 from config.lending_soft_approval import FORM_CALLBACK_ID, OPEN_FORM_ACTION_ID
 from config.settings import get_settings
 from src.lending.db import lending_session
+from src.lending.slack_names import names_by_phone
 from src.lending.soft_approval.enrichment_link import share_facts_with_enrichment
 from src.lending.soft_approval.facts import SoftApprovalFacts
 from src.lending.soft_approval.service import generate_soft_approval
@@ -144,8 +145,14 @@ def _refresh_card(client, *, channel: str, message_ts: str, call_id: str, phone:
                   caller: Optional[str], key: str) -> None:
     """The card itself shows the last result and offers the form again; best-effort (the thread reply and the
     stored PDF are the record)."""
+    borrower = None
+    try:
+        with lending_session() as db:
+            borrower = names_by_phone(db, [phone]).get(phone)
+    except Exception as exc:  # class only: a failed lookup only drops the name
+        logger.warning("[soft-approval] call %s borrower name lookup failed: %s", call_id, type(exc).__name__)
     fallback, blocks = build_card_blocks(
-        call_id=call_id, phone=phone, caller=caller,
+        call_id=call_id, phone=phone, caller=caller, borrower=borrower,
         status=card_status(key, when=datetime.now(timezone.utc)),
         button_label="Re-enter deal facts" if key.startswith("generated") else "Enter deal facts")
     try:

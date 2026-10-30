@@ -732,6 +732,14 @@ def test_slack_message_carries_all_spec_fields():
                          lender_name=None, position=None) is None
 
 
+def test_slack_message_leads_with_the_full_name_and_escapes_it():
+    from src.lending.routing.notify import build_message
+
+    msg = build_message("held", lead_id=42, last_name="<!here>", first_name="Ana", loan_type=None, loan_amount=None,
+                        lender_name=None, position=None)
+    assert "Ana &lt;!here&gt; (File #42)" in msg and "<!here>" not in msg
+
+
 def test_retry_posts_full_messages_and_skips_outcomes(rdb, fake_slack):
     """D: the retry path posts the same fields, with the real position, and never clogs on outcomes."""
     from src.lending.routing.decline import record_decline
@@ -1386,7 +1394,7 @@ def test_slack_posts_and_retries_say_partner_file_and_never_mix_ids_with_leads(r
     _route(rdb, lead)
     route_loan_file(fid, rdb)
     posted = "\n".join(fake_slack.sent)
-    assert f"File #{lead} " in posted and f"Partner file #{fid} " in posted
+    assert f"(File #{lead})" in posted and f"(Partner file #{fid})" in posted
     assert "Partnername" in posted and "Leadname" in posted
 
     rdb.execute(text("UPDATE lending.file_routing_events SET slack_ts = NULL, slack_posted_at = NULL"))
@@ -1394,7 +1402,7 @@ def test_slack_posts_and_retries_say_partner_file_and_never_mix_ids_with_leads(r
     fake_slack.sent.clear()
     assert retry_unposted_events(rdb) == 2
     retried = "\n".join(fake_slack.sent)
-    assert f"Partner file #{fid} " in retried and "position 1" in retried and "FIX_AND_FLIP" in retried
+    assert f"(Partner file #{fid})" in retried and "position 1" in retried and "FIX_AND_FLIP" in retried
 
 
 def test_a_file_has_exactly_one_key_and_the_event_log_stays_append_only(rdb):

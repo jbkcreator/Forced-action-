@@ -2,8 +2,8 @@
 
 Same shape as lending_web_lead_sweep: retries pending/failed leads with growing waits
 (config.lending_lendingflow.GHL_RETRY_BACKOFF_MINUTES) until a lead is GHL_GIVE_UP_AFTER_HOURS old,
-and posts a lead still not in GHL GHL_ALERT_AFTER_MINUTES after arriving to Slack once (ids and last
-error only). The event and pre-qual hand-off fire from here too when this path is the one that
+and posts a lead still not in GHL GHL_ALERT_AFTER_MINUTES after arriving to Slack once (full name + lead id,
+and the last error). The event and pre-qual hand-off fire from here too when this path is the one that
 gets the lead into GHL. Each run also tags delivered leads whose intro text was held for the borrower's 8am-8pm window
 (T-09, needs LENDING_INTRO_SMS_ENABLED). Off with LENDING_LENDINGFLOW_ENABLED=false. Cron: every 5 minutes.
 
@@ -24,6 +24,7 @@ from src.lending.lead_arrival_alert import alert_josh
 from src.lending.disposition_delivery import _configured_slack, _slack_client
 from src.lending.lendingflow import deliver_and_follow_up, release_held_and_commit
 from src.lending.lendingflow_ghl import get_live_sink
+from src.lending.slack_names import name_and_ref
 
 logger = logging.getLogger(__name__)
 
@@ -44,19 +45,21 @@ def alert_undelivered(slack_client: Any = None, minutes: Optional[int] = None) -
                 text("UPDATE lending.lendingflow_leads SET ghl_alerted_at = now() WHERE id IN ("
                      "SELECT id FROM lending.lendingflow_leads WHERE ghl_status IN ('pending', 'failed') "
                      "AND NOT suppressed AND ghl_alerted_at IS NULL AND received_at < now() - make_interval(mins => :m) "
-                     "ORDER BY received_at LIMIT :limit FOR UPDATE SKIP LOCKED) RETURNING id, ghl_last_error"),
+                     "ORDER BY received_at LIMIT :limit FOR UPDATE SKIP LOCKED) RETURNING id, ghl_last_error, "
+                     "NULLIF(btrim(concat_ws(' ', first_name, last_name)), '')"),
                 {"m": minutes, "limit": SWEEP_BATCH_SIZE},
             ).all()
         if not rows:
             return 0
         ids = [r[0] for r in rows]
         reasons = sorted({r[1] for r in rows if r[1]})
+        who = ", ".join(name_and_ref(r[2], f"lead {r[0]}") for r in rows[:10])
         client = slack_client or _slack_client()
         try:
             client.chat_postMessage(
                 channel=get_settings().lending_dial_tasks_channel,
                 text=(f":warning: {len(ids)} LendingFlow lead(s) are not in GoHighLevel {minutes} min after arriving "
-                      f"(lead ids {', '.join(map(str, ids[:10]))}{'…' if len(ids) > 10 else ''}). They are saved in "
+                      f"({who}{'…' if len(ids) > 10 else ''}). They are saved in "
                       f"lending.lendingflow_leads and keep retrying for {GHL_GIVE_UP_AFTER_HOURS}h. "
                       f"Last error: {'; '.join(reasons) or 'none (GHL not configured?)'}."),
             )

@@ -34,6 +34,7 @@ from config.lending_reminders import TIMEZONE
 from src.lending.consent import has_text_consent
 from src.lending.cora_tools import borrower_draft_problem
 from src.lending.ghl_consent_events import InvalidEvent
+from src.lending.slack_names import name_and_ref, names_by_phone, readable_ref
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
@@ -221,12 +222,14 @@ def reply_body(event: IntakeEvent, drafter: Drafter) -> str:
     return fallback_reply(event.first_name)
 
 
-def _queue_reply(queue: DraftQueue, pin: PinnedCall, drafter: Drafter) -> int:
+def _queue_reply(queue: DraftQueue, pin: PinnedCall, drafter: Drafter, full_name: Optional[str] = None) -> int:
     event = pin.event
+    # Not escaped here: agent_core escapes the summary when it posts the approval card.
+    who = name_and_ref(full_name or event.first_name, readable_ref(pin.lead_ref), escape=False)
     return queue.enqueue(
         tool_name=DRAFT_TOOL_NAME, channel="ghl_sms",
         payload={"lead_ref": pin.lead_ref, "to_phone": event.phone, "body": reply_body(event, drafter)},
-        summary=(f"After-hours voicemail reply to {event.first_name or 'caller'} (…{event.phone[-4:]}), drafted from "
+        summary=(f"After-hours voicemail reply to {who} (…{event.phone[-4:]}), drafted from "
                  "the caller's voicemail; sends 8am-8pm borrower time"),
         recipient_phone=event.phone, contact_ref=pin.lead_ref, idempotency_key=event.call_key)
 
@@ -235,12 +238,13 @@ def draft_morning_replies(db, pins: list[PinnedCall], queue: DraftQueue, drafter
     """Queue a reply for Approve for each pin with text consent; a voicemail already drafted keeps its draft (no
     second model call). The rest are call-only."""
     drafted = dict(db.execute(_DRAFTED, {"keys": [pin.event.call_key for pin in pins]}).all())
+    names = names_by_phone(db, [pin.event.phone for pin in pins if pin.event.call_key not in drafted])
     replies = []
     for pin in pins:
         if pin.event.call_key in drafted:
             replies.append(MorningReply(pin, drafted[pin.event.call_key]))
         elif has_text_consent(db, pin.event.phone):
-            replies.append(MorningReply(pin, _queue_reply(queue, pin, drafter)))
+            replies.append(MorningReply(pin, _queue_reply(queue, pin, drafter, names.get(pin.event.phone))))
         else:
             replies.append(MorningReply(pin, None))
     return replies

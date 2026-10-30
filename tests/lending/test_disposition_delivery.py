@@ -1,6 +1,7 @@
 """Sheet and Slack delivery for logged dispositions. Database-free."""
 from __future__ import annotations
 
+import json
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -304,3 +305,16 @@ def test_a_dnc_alert_reaches_coras_inbox_when_slack_is_not_configured(inbox_writ
     monkeypatch.setattr(dd, "_configured_dnc_slack", lambda: False)
     dd.alert_unpropagated_dnc("c11", None)
     assert inbox_writes[0]["dedup_key"] == "c11" and inbox_writes[0]["channel_posted"] is False
+
+
+@pytest.mark.parametrize("alert,starts", [(dd.alert_unpropagated_dnc, "DNC request not propagated for "),
+                                          (dd.alert_dnc_removal_pending, "DNC recorded for ")])
+def test_dnc_alerts_name_the_borrower_in_the_post_and_in_coras_inbox(inbox_writes, monkeypatch, alert, starts):
+    monkeypatch.setattr(dd, "_call_borrower", lambda call_id: "Pat <Doe>")
+    slack = MagicMock()
+    alert("c9", "7", client=slack)
+    assert "Pat &lt;Doe&gt; (call c9)" in slack.chat_postMessage.call_args.kwargs["text"]
+    event = inbox_writes[0]
+    # The inbox escapes summaries when it posts them, so the name is stored unescaped (no double escaping).
+    assert event["summary"].startswith(f"{starts}Pat <Doe> (call c9)")
+    assert json.loads(event["payload"])["borrower"] == "Pat <Doe>"

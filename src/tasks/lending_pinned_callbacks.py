@@ -9,42 +9,45 @@ call-only. Cron fires at 12:55 and 13:55 UTC Monday-Friday; only the one that is
 Drafts are idempotent per voicemail, so a rerun never drafts twice. The Slack post is not: ``--force`` reposts the
 list (use it by hand when the morning post failed; the drafts are already queued).
 
-Shows the last four digits of the phone only, never the full number.
+Shows each caller's full name with their contact ref, and the last four digits of the phone only, never the full
+number.
 """
 from __future__ import annotations
 
 import argparse
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
 from config.lending_after_hours import BUSINESS_DAYS, MORNING_POST_HOUR_ET
 from config.lending_reminders import TIMEZONE
 from config.settings import AppSettings, get_settings
 from packages.agent_core.pending_actions import PendingActionQueue
-from packages.agent_core.redaction import slack_escape
 from packages.agent_core.store import AgentStore
 from src.lending.after_hours_intake import MorningReply, draft_morning_replies, model_drafter, pins_to_call
 from src.lending.db import lending_session
 from src.lending.models import LENDING_SCHEMA
+from src.lending.slack_names import name_and_ref, names_by_phone, readable_ref
 
 logger = logging.getLogger(__name__)
 
 
-def _line(reply: MorningReply) -> str:
+def _line(reply: MorningReply, names: Mapping[str, str]) -> str:
     event = reply.pin.event
     left = event.received_at.astimezone(TIMEZONE)
     status = "reply draft waiting for Approve" if reply.action_id else "no text consent, call only"
-    name = slack_escape(event.first_name) if event.first_name else "Caller"  # caller-supplied: no live mentions
-    return (f"• {name} ({reply.pin.lead_ref}, …{event.phone[-4:]}): voicemail {left:%a} "
+    # Full name from the lead record when known, else the name the caller gave; escaped (caller-supplied).
+    who = name_and_ref(names.get(event.phone) or event.first_name, readable_ref(reply.pin.lead_ref))
+    return (f"• {who} (…{event.phone[-4:]}): voicemail {left:%a} "
             f"{left.hour % 12 or 12}:{left:%M} {'am' if left.hour < 12 else 'pm'} ET — {status}")
 
 
-def format_slack(replies: Sequence[MorningReply]) -> Optional[str]:
-    """The Slack message, or None when nobody is pinned."""
+def format_slack(replies: Sequence[MorningReply], names: Optional[Mapping[str, str]] = None) -> Optional[str]:
+    """The Slack message, or None when nobody is pinned. ``names`` maps a phone to the caller's full name."""
     if not replies:
         return None
-    return f"*Call these first ({len(replies)}): after-hours voicemails*\n" + "\n".join(map(_line, replies))
+    return (f"*Call these first ({len(replies)}): after-hours voicemails*\n"
+            + "\n".join(_line(reply, names or {}) for reply in replies))
 
 
 def is_post_time(now: datetime) -> bool:
@@ -80,7 +83,8 @@ def main(argv=None, *, now: Optional[datetime] = None) -> int:
                 return 0
             queue = PendingActionQueue(AgentStore(db.get_bind(), LENDING_SCHEMA),
                                        default_ttl=timedelta(hours=settings.lending_cora_pending_action_ttl_hours))
-            message = format_slack(draft_morning_replies(db, pins, queue, _drafter(settings)))
+            replies = draft_morning_replies(db, pins, queue, _drafter(settings))
+            message = format_slack(replies, names_by_phone(db, [pin.event.phone for pin in pins]))
         from slack_sdk import WebClient
         WebClient(token=token.get_secret_value()).chat_postMessage(channel=channel, text=message)
     except Exception as exc:  # class only: rows carry phone digits

@@ -144,3 +144,15 @@ def test_a_released_slot_raises_nothing(inbox_writes, monkeypatch):
     monkeypatch.setattr(booking_webhook, "get_appointment_canceller", lambda: (lambda appointment_id: True))
     assert booking_webhook._release_slot("appt-9") is True
     assert inbox_writes == []
+
+
+def test_an_unreleased_slot_names_the_booked_person_in_the_post_and_in_coras_inbox(inbox_writes, monkeypatch):
+    from src.lending import booking_webhook
+
+    posts: list[str] = []
+    monkeypatch.setattr(booking_webhook, "get_appointment_canceller", lambda: (lambda appointment_id: False))
+    monkeypatch.setattr(booking_webhook, "slack_poster", lambda: posts.append)
+    monkeypatch.setattr(booking_webhook, "_appointment_person", lambda appointment_id: "Sam Lee")
+    booking_webhook._release_slot("appt-9")
+    assert "Sam Lee (appointment appt-9)" in posts[0]
+    assert inbox_writes[0]["summary"].startswith("GHL slot for Sam Lee (appointment appt-9) not released")
