@@ -80,6 +80,7 @@ _PICKUP_WEB = text("""
 # Lead facts for the message and the GHL call lookup, from whichever source the alarm was copied from.
 _LEAD_FIELDS = """
            COALESCE(l.first_name, NULLIF(split_part(btrim(w.name), ' ', 1), '')) AS first_name,
+           COALESCE(NULLIF(btrim(concat_ws(' ', l.first_name, l.last_name)), ''), NULLIF(btrim(w.name), '')) AS full_name,
            COALESCE(l.property_state, w.property_state) AS property_state,
            COALESCE(l.ghl_contact_id, w.ghl_contact_id) AS ghl_contact_id,
            (a.web_lead_id IS NOT NULL) AS from_web"""
@@ -237,8 +238,8 @@ def _lead_label(row: Mapping[str, Any]) -> str:
 
 
 def _inbox_label(row: Mapping[str, Any]) -> str:
-    """Who the lead is for Cora's inbox: first name, else the last 4 digits of the phone. Never an id."""
-    name = (row["first_name"] or "").strip()
+    """Who the lead is for Cora's inbox: full name, else the last 4 digits of the phone. Never an id."""
+    name = (row["full_name"] or row["first_name"] or "").strip()
     who = name or (f"(no name, …{row['phone'][-4:]})" if row["phone"] else "(no name)")
     return f"{who} ({row['property_state']})" if row["property_state"] else who
 

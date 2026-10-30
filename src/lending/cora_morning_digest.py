@@ -31,7 +31,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Callable, Optional
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
@@ -60,20 +60,36 @@ _PENDING_DRAFTS = text("""
     SELECT action_id, tool_name, summary, created_at, count(*) OVER () AS total
       FROM lending.pending_actions WHERE status = 'pending' ORDER BY created_at LIMIT :limit
 """)
-_DUE_CONFIRMATIONS = text("""
-    SELECT t.booking_ref, t.due_date, b.first_name, b.slot_start, count(*) OVER () AS total
+# The booking tables hold a first name only: the full name is the one on the lead with the same phone.
+_NAME_BY_PHONE = """COALESCE(
+        (SELECT NULLIF(trim(coalesce(l.first_name, '') || ' ' || coalesce(l.last_name, '')), '')
+           FROM lending.lendingflow_leads l WHERE l.phone = {phone} ORDER BY l.received_at DESC LIMIT 1),
+        (SELECT NULLIF(trim(w.name), '') FROM lending.web_leads w WHERE w.phone = {phone}
+          ORDER BY w.received_at DESC LIMIT 1))"""
+_DUE_CONFIRMATIONS = text(f"""
+    SELECT t.booking_ref, t.due_date, b.first_name, b.slot_start, {_NAME_BY_PHONE.format(phone="b.phone")} AS full_name,
+           count(*) OVER () AS total
       FROM lending.confirmation_tasks t
-      LEFT JOIN (SELECT booking_ref, max(first_name) AS first_name, max(slot_start_utc) AS slot_start
+      LEFT JOIN (SELECT booking_ref, max(first_name) AS first_name, max(contact_phone) AS phone,
+                        max(slot_start_utc) AS slot_start
                    FROM lending.booking_messages GROUP BY booking_ref) b ON b.booking_ref = t.booking_ref
      WHERE t.completed_at IS NULL AND t.cancelled_at IS NULL AND t.due_date <= :day
      ORDER BY t.due_date LIMIT :limit
 """)
 _OPEN_INBOX = text("""
-    SELECT summary, payload, count(*) OVER () AS total FROM lending.cora_inbox
+    SELECT summary, payload, event_type, dedup_key, count(*) OVER () AS total FROM lending.cora_inbox
      WHERE status IN ('new', 'surfaced') ORDER BY id LIMIT :limit
 """)
+_UNCALLED_NAMES = text("""
+    SELECT a.id, COALESCE(NULLIF(trim(coalesce(l.first_name, '') || ' ' || coalesce(l.last_name, '')), ''),
+                          NULLIF(trim(w.name), '')) AS full_name
+      FROM lending.uncalled_alarms a
+      LEFT JOIN lending.lendingflow_leads l ON l.id = a.lendingflow_lead_id
+      LEFT JOIN lending.web_leads w ON w.id = a.web_lead_id
+     WHERE a.id IN :ids
+""").bindparams(bindparam("ids", expanding=True))
 _NEW_LENDINGFLOW_LEADS = text("""
-    SELECT l.id, l.first_name, l.loan_type, l.loan_amount_range, l.property_city, e.routing_tag,
+    SELECT l.id, l.first_name, l.last_name, l.loan_type, l.loan_amount_range, l.property_city, e.routing_tag,
            coalesce(e.closer_priority, false) AS closer_priority, count(*) OVER () AS total
       FROM lending.lendingflow_leads l LEFT JOIN lending.lendingflow_enrichment e ON e.lead_id = l.id
      WHERE l.received_at >= :since AND NOT l.suppressed AND NOT l.is_test
@@ -85,12 +101,14 @@ _WEB_LEADS = text("""
     SELECT count(*) AS total, count(*) FILTER (WHERE ghl_status IN ('pending', 'failed')) AS not_in_ghl
       FROM lending.web_leads WHERE received_at >= :since AND NOT is_test
 """)
-_TODAYS_CALLS = text("""
-    SELECT booking_ref, max(first_name) AS first_name, max(booked_by) AS booked_by,
-           max(slot_start_utc) AS slot_start
-      FROM lending.booking_messages
-     WHERE slot_start_utc >= :start AND slot_start_utc < :end
-     GROUP BY booking_ref ORDER BY slot_start LIMIT :limit
+_TODAYS_CALLS = text(f"""
+    SELECT c.booking_ref, c.first_name, c.booked_by, c.slot_start, {_NAME_BY_PHONE.format(phone="c.phone")} AS full_name
+      FROM (SELECT booking_ref, max(first_name) AS first_name, max(contact_phone) AS phone, max(booked_by) AS booked_by,
+                   max(slot_start_utc) AS slot_start
+              FROM lending.booking_messages
+             WHERE slot_start_utc >= :start AND slot_start_utc < :end
+             GROUP BY booking_ref) c
+     ORDER BY c.slot_start LIMIT :limit
 """)
 _HOLD_QUEUE = text("""
     SELECT count(*) FILTER (WHERE status = 'held') AS held, count(*) FILTER (WHERE status = 'exhausted') AS exhausted
@@ -176,6 +194,12 @@ def gather(db: Session, day: date, now: datetime, *, halted: bool, halt_reason: 
         for row in _rows(db, _DUE_CONFIRMATIONS, {"day": day, "limit": LIST_LIMIT})],
         [], missing)
     inbox = _section(db, "inbox", lambda: _rows(db, _OPEN_INBOX, {"limit": INBOX_PREVIEW}), [], missing)
+    alarm_ids = [int(item["dedup_key"]) for item in inbox
+                 if item["event_type"] == "lead_uncalled" and str(item["dedup_key"]).isdigit()]
+    names = _section(db, "lead names", lambda: {row["id"]: row["full_name"] for row in _rows(
+        db, _UNCALLED_NAMES, {"ids": alarm_ids})} if alarm_ids else {}, {}, missing)
+    inbox = [{**item, "full_name": names.get(int(item["dedup_key"])) if str(item["dedup_key"]).isdigit() else None}
+             for item in inbox]
     leads = _section(db, "LendingFlow leads", lambda: _rows(
         db, _NEW_LENDINGFLOW_LEADS, {"since": since, "limit": LIST_LIMIT}), [], missing)
     web = _section(db, "web leads", lambda: dict(db.execute(_WEB_LEADS, {"since": since}).mappings().one()),
@@ -235,7 +259,7 @@ def _draft_line(draft: dict[str, Any], now: datetime) -> str:
 
 
 def _confirmation_line(task: dict[str, Any], day: date) -> str:
-    who = slack_safe(task["first_name"] or "Booked caller")
+    who = slack_safe(task.get("full_name") or task["first_name"] or "Booked caller")
     slot = task["slot_start"].astimezone(ET) if task["slot_start"] else None
     when = f"call on {slot:%a, %b} {slot.day} at {_clock(slot)}" if slot else "confirmation call"
     late = (day - task["due_date"]).days
@@ -247,7 +271,8 @@ def _lead_line(lead: dict[str, Any]) -> str:
     flag = ":fire:" if lead["closer_priority"] else (":star:" if lead["routing_tag"] == "FULL_MACHINE" else "•")
     details = ", ".join(slack_safe(str(v)) for v in (lead["loan_type"], lead["loan_amount_range"],
                                                       lead["property_city"]) if v)
-    return f"{flag} {slack_safe(lead['first_name'] or 'Lead')}" + (f": {details}" if details else "")
+    name = " ".join(part.strip() for part in (lead["first_name"], lead.get("last_name")) if part and part.strip())
+    return f"{flag} {slack_safe(name or 'Lead')}" + (f": {details}" if details else "")
 
 
 def _booker(booked_by: Optional[str]) -> str:
@@ -255,8 +280,8 @@ def _booker(booked_by: Optional[str]) -> str:
 
 
 def _inbox_text(item: dict[str, Any]) -> str:
-    """The item's summary, with a lead's short reference swapped for the first name kept in its payload. Items raised
-    before the alerts used names carry the reference in the summary."""
+    """The item's summary, with a lead's short reference swapped for the lead's full name (first name from the item's
+    payload when the full one is not found). Items raised before the alerts used names carry the reference."""
     summary = str(item["summary"] or "Inbox item")
     payload = item.get("payload")
     if isinstance(payload, str):
@@ -264,7 +289,8 @@ def _inbox_text(item: dict[str, Any]) -> str:
             payload = json.loads(payload)
         except ValueError:
             payload = None
-    ref, name = (payload.get("lead_ref"), payload.get("first_name")) if isinstance(payload, dict) else (None, None)
+    ref = payload.get("lead_ref") if isinstance(payload, dict) else None
+    name = item.get("full_name") or (payload.get("first_name") if isinstance(payload, dict) else None)
     return summary.replace(str(ref), str(name).strip()) if ref and name and str(ref) in summary else summary
 
 
@@ -310,8 +336,8 @@ def render(day: date, data: DigestData, *, now: Optional[datetime] = None,
               else ":large_green_circle: Cora is running normally.")
     status_lines = [status, "_All times Eastern._"] + (
         [f":warning: Not available today: {', '.join(data.unavailable)}"] if data.unavailable else [])
-    calls = [f"• {_clock(c['slot_start'])}: {slack_safe(c['first_name'] or 'Lead')} (booked by {_booker(c['booked_by'])})"
-             for c in data.todays_calls]
+    calls = [f"• {_clock(c['slot_start'])}: {slack_safe(c.get('full_name') or c['first_name'] or 'Lead')} "
+             f"(booked by {_booker(c['booked_by'])})" for c in data.todays_calls]
     queues = [f"• {slack_safe(str(q['campaign']).replace('_', ' ').capitalize())}: {_plural(int(q['contacts']), 'contact')}"
               for q in data.dialer_queues]
     sections = [

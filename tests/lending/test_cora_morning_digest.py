@@ -23,13 +23,17 @@ _DDL = (
     " posted_at TIMESTAMP, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
     "CREATE TABLE lending.pending_actions (action_id INTEGER PRIMARY KEY, tool_name TEXT, summary TEXT,"
     " contact_ref TEXT, status TEXT, created_at TIMESTAMP)",
-    "CREATE TABLE lending.booking_messages (booking_ref TEXT, first_name TEXT, booked_by TEXT, slot_start_utc TIMESTAMP)",
-    "CREATE TABLE lending.web_leads (id INTEGER PRIMARY KEY, received_at TIMESTAMP, ghl_status TEXT, is_test BOOLEAN NOT NULL DEFAULT 0)",
-    "CREATE TABLE lending.cora_inbox (id INTEGER PRIMARY KEY, summary TEXT, payload TEXT, status TEXT)",
+    "CREATE TABLE lending.booking_messages (booking_ref TEXT, first_name TEXT, contact_phone TEXT, booked_by TEXT,"
+    " slot_start_utc TIMESTAMP)",
+    "CREATE TABLE lending.web_leads (id INTEGER PRIMARY KEY, received_at TIMESTAMP, ghl_status TEXT, is_test BOOLEAN NOT NULL DEFAULT 0,"
+    " name TEXT, phone TEXT)",
+    "CREATE TABLE lending.cora_inbox (id INTEGER PRIMARY KEY, summary TEXT, payload TEXT, event_type TEXT, dedup_key TEXT,"
+    " status TEXT)",
+    "CREATE TABLE lending.uncalled_alarms (id INTEGER PRIMARY KEY, lendingflow_lead_id INTEGER, web_lead_id INTEGER)",
     "CREATE TABLE lending.file_routing (id INTEGER PRIMARY KEY, status TEXT, is_test BOOLEAN NOT NULL DEFAULT 0)",
     "CREATE TABLE lending.confirmation_tasks (booking_ref TEXT, due_date DATE, completed_at TIMESTAMP,"
     " cancelled_at TIMESTAMP)",
-    "CREATE TABLE lending.lendingflow_leads (id INTEGER PRIMARY KEY, first_name TEXT, loan_type TEXT,"
+    "CREATE TABLE lending.lendingflow_leads (id INTEGER PRIMARY KEY, first_name TEXT, last_name TEXT, phone TEXT, loan_type TEXT,"
     " loan_amount_range TEXT, property_city TEXT, received_at TIMESTAMP, suppressed BOOLEAN, is_test BOOLEAN NOT NULL DEFAULT 0)",
     "CREATE TABLE lending.lendingflow_enrichment (lead_id INTEGER, routing_tag TEXT, closer_priority BOOLEAN)",
     "CREATE TABLE lending.dialer_load_records (id INTEGER PRIMARY KEY, campaign_tag TEXT, active BOOLEAN)",
@@ -114,22 +118,28 @@ def test_digest_follows_the_e5_morning_brief(engine) -> None:
                           " (5, 'draft_sms', 'Text to Sent (1111)', NULL, 'sent', '2026-10-19 01:00:00')"))
         conn.execute(text("INSERT INTO lending.confirmation_tasks VALUES ('bk-1', '2026-10-17', NULL, NULL),"
                           " ('bk-2', '2026-10-20', NULL, NULL), ('bk-3', '2026-10-18', '2026-10-18 10:00:00', NULL)"))
-        conn.execute(text("INSERT INTO lending.booking_messages VALUES ('bk-1', 'Dana', 'ai', '2026-10-27 18:00:00'),"
-                          " ('bk-1', 'Dana', 'ai', '2026-10-27 18:00:00')"))
-        conn.execute(text("INSERT INTO lending.cora_inbox VALUES (1, 'Lead did not reach GoHighLevel', NULL, 'new'),"
-                          " (2, 'Closed one', NULL, 'dismissed'),"
+        conn.execute(text("INSERT INTO lending.booking_messages VALUES"
+                          " ('bk-1', 'Dana', '+18135550111', 'ai', '2026-10-27 18:00:00'),"
+                          " ('bk-1', 'Dana', '+18135550111', 'ai', '2026-10-27 18:00:00')"))
+        conn.execute(text("INSERT INTO lending.cora_inbox VALUES"
+                          " (1, 'Lead did not reach GoHighLevel', NULL, 'lead_arrival_alert_failed', '9', 'new'),"
+                          " (2, 'Closed one', NULL, 'lead_uncalled', '2', 'dismissed'),"
                           " (3, 'LendingFlow lead ebd43aa6 (FL) still no call after 5 min',"
-                          " '{\"lead_ref\": \"ebd43aa6\", \"first_name\": \"Jane\"}', 'new')"))
+                          " '{\"lead_ref\": \"ebd43aa6\", \"first_name\": \"Jane\"}', 'lead_uncalled', '7', 'new')"))
+        conn.execute(text("INSERT INTO lending.uncalled_alarms VALUES (7, 15, NULL)"))
         conn.execute(text("INSERT INTO lending.lendingflow_leads VALUES"
-                          " (10, 'Ana', 'Fix & Flip', '$250K - $500K', 'Tampa', '2026-10-19 02:00:00', 0, 0),"
-                          " (11, 'Ben', 'DSCR', NULL, NULL, '2026-10-19 03:00:00', 0, 0),"
-                          " (12, 'Cy', 'DSCR', NULL, NULL, '2026-10-19 04:00:00', 1, 0),"
-                          " (13, 'Old', 'DSCR', NULL, NULL, '2026-10-01 04:00:00', 0, 0),"
-                          " (14, 'Qa', 'DSCR', NULL, NULL, '2026-10-19 05:00:00', 0, 1)"))
+                          " (10, 'Ana', 'Rivera', NULL, 'Fix & Flip', '$250K - $500K', 'Tampa', '2026-10-19 02:00:00', 0, 0),"
+                          " (11, 'Ben', NULL, NULL, 'DSCR', NULL, NULL, '2026-10-19 03:00:00', 0, 0),"
+                          " (12, 'Cy', NULL, NULL, 'DSCR', NULL, NULL, '2026-10-19 04:00:00', 1, 0),"
+                          " (13, 'Old', NULL, NULL, 'DSCR', NULL, NULL, '2026-10-01 04:00:00', 0, 0),"
+                          " (15, 'Jane', 'Smith', NULL, 'DSCR', NULL, NULL, '2026-10-01 04:00:00', 0, 0),"
+                          " (16, 'Dana', 'Lee', '+18135550111', 'DSCR', NULL, NULL, '2026-10-01 04:00:00', 0, 0),"
+                          " (14, 'Qa', NULL, NULL, 'DSCR', NULL, NULL, '2026-10-19 05:00:00', 0, 1)"))
         conn.execute(text("INSERT INTO lending.lendingflow_enrichment VALUES (10, 'FULL_MACHINE', 0), (11, 'NURTURE', 1)"))
-        conn.execute(text("INSERT INTO lending.web_leads VALUES (1, '2026-10-19 02:00:00', 'synced', 0),"
-                          " (2, '2026-10-19 03:00:00', 'failed', 0), (3, '2026-10-01 03:00:00', 'synced', 0),"
-                          " (4, '2026-10-19 04:00:00', 'synced', 1)"))
+        conn.execute(text("INSERT INTO lending.web_leads VALUES (1, '2026-10-19 02:00:00', 'synced', 0, NULL, NULL),"
+                          " (2, '2026-10-19 03:00:00', 'failed', 0, NULL, NULL),"
+                          " (3, '2026-10-01 03:00:00', 'synced', 0, NULL, NULL),"
+                          " (4, '2026-10-19 04:00:00', 'synced', 1, NULL, NULL)"))
         conn.execute(text("INSERT INTO lending.dialer_load_records VALUES (1, 'maturity', 1), (2, 'maturity', 1),"
                           " (3, 'permits', 1), (4, 'permits', 0)"))
         conn.execute(text("INSERT INTO lending.file_routing VALUES (1, 'held', 0), (2, 'held', 0), (3, 'exhausted', 0),"
@@ -144,14 +154,15 @@ def test_digest_follows_the_e5_morning_brief(engine) -> None:
     assert "• Email to Maria: Your loan. Waiting 1 day." in body
     assert "maria@example.com" not in body and "Text to Sent" not in body
     assert "*Confirmation calls to make: 1*" in body
-    assert "• Dana: call on Tue, Oct 27 at 2:00 PM. Late by 2 days." in body
+    assert "• Dana Lee: call on Tue, Oct 27 at 2:00 PM. Late by 2 days." in body
     assert "bk-" not in body
     assert "*Open items in Cora's inbox: 2*" in body and "• Lead did not reach GoHighLevel" in body
-    assert "• LendingFlow lead Jane (FL) still no call after 5 min" in body and "ebd43aa6" not in body
+    assert "• LendingFlow lead Jane Smith (FL) still no call after 5 min" in body and "ebd43aa6" not in body
     assert "New leads, last 24 hours: 4" in body  # 2 LendingFlow (suppressed and old ones left out) + 2 web
     assert body.index("Ben") < body.index("Ana")  # closer priority first
-    assert ":star: Ana: Fix &amp; Flip, $250K - $500K, Tampa" in body  # Slack shows "&"
-    assert "Cy" not in body and "Old" not in body and "lendingflow_lead" not in body
+    assert ":star: Ana Rivera: Fix &amp; Flip, $250K - $500K, Tampa" in body  # Slack shows "&"
+    assert "Cy" not in body and "Old" not in body and "Dana Lee" not in body.split("New leads")[1].split("Today")[0]
+    assert "lendingflow_lead" not in body
     assert "• 2 website leads, 1 not yet sent to GoHighLevel" in body
     assert "• Maturity: 2 contacts" in body and "• Permits: 1 contact" in body
     assert "Loan files with no lender yet: 2" in body and "1 more file where every lender declined." in body
@@ -273,14 +284,17 @@ def test_a_missing_table_blanks_only_its_section(engine) -> None:
 def test_inbox_items_show_the_lead_name_not_its_reference() -> None:
     items = [
         {"summary": "LendingFlow lead ebd43aa6 (FL) still no call after 5 min",
-         "payload": {"lead_ref": "ebd43aa6", "first_name": " Jane "}, "total": 4},
+         "payload": {"lead_ref": "ebd43aa6", "first_name": " Jane "}, "full_name": "Jane Smith", "total": 5},
+        {"summary": "LendingFlow lead 0cd355b1 (FL) still no call", "payload": {"lead_ref": "0cd355b1",
+                                                                              "first_name": "Ben"}, "total": 5},
         {"summary": "LendingFlow lead 1fc4b076 (FL) still no call", "payload": {"lead_ref": "1fc4b076",
-                                                                               "first_name": None}, "total": 4},
-        {"summary": "Reply overdue", "payload": "not json", "total": 4},
-        {"summary": "Possible duplicate", "payload": '{"lead_ref": "lendingflow_lead:7"}', "total": 4},
+                                                                               "first_name": None}, "total": 5},
+        {"summary": "Reply overdue", "payload": "not json", "total": 5},
+        {"summary": "Possible duplicate", "payload": '{"lead_ref": "lendingflow_lead:7"}', "total": 5},
     ]
-    body = _body(render(date(2026, 10, 19), _empty(open_inbox=4, inbox_items=items))[1])
-    assert "• LendingFlow lead Jane (FL) still no call after 5 min" in body
-    assert "ebd43aa6" not in body
+    body = _body(render(date(2026, 10, 19), _empty(open_inbox=5, inbox_items=items))[1])
+    assert "• LendingFlow lead Jane Smith (FL) still no call after 5 min" in body
+    assert "• LendingFlow lead Ben (FL) still no call" in body  # full name not found: the payload's first name
+    assert "ebd43aa6" not in body and "0cd355b1" not in body
     assert "1fc4b076" in body  # no name on file: left as written rather than blanked
     assert "• Reply overdue" in body and "• Possible duplicate" in body

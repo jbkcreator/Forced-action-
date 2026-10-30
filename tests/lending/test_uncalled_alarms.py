@@ -807,3 +807,13 @@ def test_migration_closes_existing_web_leads_once_when_the_column_is_first_added
     assert web_alarm(db, new_id) is None
     pick_up_new_leads(db)
     assert web_alarm(db, new_id)["resolved_at"] is None
+
+
+def test_the_inbox_label_is_the_full_name_then_the_phone_never_an_id():
+    from src.lending.uncalled_alarm_worker import _inbox_label
+
+    row = {"full_name": "Jane Smith", "first_name": "Jane", "phone": "+18135550100", "property_state": "FL"}
+    assert _inbox_label(row) == "Jane Smith (FL)"
+    assert _inbox_label({**row, "full_name": None}) == "Jane (FL)"
+    assert _inbox_label({**row, "full_name": None, "first_name": " "}) == "(no name, …0100) (FL)"
+    assert _inbox_label({**row, "full_name": None, "first_name": None, "phone": None, "property_state": None}) == "(no name)"
