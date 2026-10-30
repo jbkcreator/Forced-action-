@@ -113,8 +113,7 @@ def test_digest_follows_the_e5_morning_brief(engine) -> None:
                           " '2026-10-18 11:30:00'),"
                           " (5, 'draft_sms', 'Text to Sent (1111)', NULL, 'sent', '2026-10-19 01:00:00')"))
         conn.execute(text("INSERT INTO lending.confirmation_tasks VALUES ('bk-1', '2026-10-17', NULL, NULL),"
-                          " ('bk-2', '2026-10-20', NULL, NULL), ('bk-3', '2026-10-18', '2026-10-18 10:00:00', NULL),"
-                          " ('TEST-E2E-BOOK-1', '2026-10-17', NULL, NULL)"))
+                          " ('bk-2', '2026-10-20', NULL, NULL), ('bk-3', '2026-10-18', '2026-10-18 10:00:00', NULL)"))
         conn.execute(text("INSERT INTO lending.booking_messages VALUES ('bk-1', 'Dana', 'ai', '2026-10-27 18:00:00'),"
                           " ('bk-1', 'Dana', 'ai', '2026-10-27 18:00:00')"))
         conn.execute(text("INSERT INTO lending.cora_inbox VALUES (1, 'Lead did not reach GoHighLevel', 'new'),"
@@ -144,7 +143,7 @@ def test_digest_follows_the_e5_morning_brief(engine) -> None:
     assert "maria@example.com" not in body and "Text to Sent" not in body
     assert "*Confirmation calls to make: 1*" in body
     assert "• Dana: call on Tue, Oct 27 at 2:00 PM. Late by 2 days." in body
-    assert "bk-" not in body and "TEST-" not in body
+    assert "bk-" not in body
     assert "*Open items in Cora's inbox: 1*" in body and "• Lead did not reach GoHighLevel" in body
     assert "New leads, last 24 hours: 4" in body  # 2 LendingFlow (suppressed and old ones left out) + 2 web
     assert body.index("Ben") < body.index("Ana")  # closer priority first

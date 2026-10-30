@@ -12,8 +12,7 @@ overdue actions, new high-score leads, and today's calling queues". Cora's minut
   * Loan files with no lender yet: the routing hold queue.
 
 The digest is written for the client, not for a developer: first names, plain labels, how long something has waited
-and where to act. Row ids, tool names and booking references never appear. Test bookings (``TEST-`` references) are
-left out.
+and where to act. Row ids, tool names and booking references never appear.
 
  ``lending.cora_morning_digests`` holds one row per ET day, written in the same transaction as
 the post, so a restart or a second sweep never posts twice and a failed post is retried next minute. A Cora
@@ -35,7 +34,6 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
-from config.lending_test_data import TEST_BOOKING_REF_PREFIX
 from packages.agent_core.briefing import BriefSection, render_brief_blocks
 from packages.agent_core.chatport import ChatPort
 from src.lending.cora_inbox import slack_safe
@@ -67,7 +65,6 @@ _DUE_CONFIRMATIONS = text("""
       LEFT JOIN (SELECT booking_ref, max(first_name) AS first_name, max(slot_start_utc) AS slot_start
                    FROM lending.booking_messages GROUP BY booking_ref) b ON b.booking_ref = t.booking_ref
      WHERE t.completed_at IS NULL AND t.cancelled_at IS NULL AND t.due_date <= :day
-       AND upper(t.booking_ref) NOT LIKE :test_ref
      ORDER BY t.due_date LIMIT :limit
 """)
 _OPEN_INBOX = text("""
@@ -91,7 +88,7 @@ _TODAYS_CALLS = text("""
     SELECT booking_ref, max(first_name) AS first_name, max(booked_by) AS booked_by,
            max(slot_start_utc) AS slot_start
       FROM lending.booking_messages
-     WHERE slot_start_utc >= :start AND slot_start_utc < :end AND upper(booking_ref) NOT LIKE :test_ref
+     WHERE slot_start_utc >= :start AND slot_start_utc < :end
      GROUP BY booking_ref ORDER BY slot_start LIMIT :limit
 """)
 _HOLD_QUEUE = text("""
@@ -167,7 +164,6 @@ def _section(db: Session, name: str, read: Callable[[], Any], default: Any, unav
 def gather(db: Session, day: date, now: datetime, *, halted: bool, halt_reason: str) -> DigestData:
     start = datetime.combine(day, time.min, ET).astimezone(timezone.utc)
     since = now - timedelta(hours=24)
-    test_ref = f"{TEST_BOOKING_REF_PREFIX.upper()}%"
     missing: list[str] = []
     no_web = {"total": 0, "not_in_ghl": 0}
     no_hold = {"held": 0, "exhausted": 0}
@@ -176,7 +172,7 @@ def gather(db: Session, day: date, now: datetime, *, halted: bool, halt_reason: 
         for row in _rows(db, _PENDING_DRAFTS, {"limit": LIST_LIMIT})], [], missing)
     confirmations = _section(db, "confirmation calls", lambda: [
         {**row, "due_date": _as_date(row["due_date"]), "slot_start": _as_datetime(row["slot_start"])}
-        for row in _rows(db, _DUE_CONFIRMATIONS, {"day": day, "limit": LIST_LIMIT, "test_ref": test_ref})],
+        for row in _rows(db, _DUE_CONFIRMATIONS, {"day": day, "limit": LIST_LIMIT})],
         [], missing)
     inbox = _section(db, "inbox", lambda: _rows(db, _OPEN_INBOX, {"limit": INBOX_PREVIEW}), [], missing)
     leads = _section(db, "LendingFlow leads", lambda: _rows(
@@ -185,8 +181,7 @@ def gather(db: Session, day: date, now: datetime, *, halted: bool, halt_reason: 
                    no_web, missing)
     calls = _section(db, "booked calls", lambda: [
         {**row, "slot_start": _as_datetime(row["slot_start"])}
-        for row in _rows(db, _TODAYS_CALLS, {"start": start, "end": start + timedelta(days=1), "limit": LIST_LIMIT,
-                                             "test_ref": test_ref})], [], missing)
+        for row in _rows(db, _TODAYS_CALLS, {"start": start, "end": start + timedelta(days=1), "limit": LIST_LIMIT})], [], missing)
     queues = _section(db, "dialer queues", lambda: _rows(db, _DIALER_QUEUES, {}), [], missing)
     hold = _section(db, "loan files without a lender",
                     lambda: dict(db.execute(_HOLD_QUEUE).mappings().one()), no_hold, missing)

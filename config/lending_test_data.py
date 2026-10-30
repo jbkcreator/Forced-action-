@@ -12,7 +12,3 @@ TEST_EMAIL_DOMAINS: tuple[str, ...] = ("example.com", "example.org", "test.com")
 
 # A partner whose name starts with this (case-insensitive) is a test partner ("TEST R1 Partner", Q33).
 TEST_PARTNER_NAME_PREFIX = "test "
-
-# A booking whose reference starts with this (case-insensitive) is a test booking ("TEST-E2E-BOOK-1"). The bookings and
-# confirmation tables have no is_test column, so Cora's morning digest leaves these out by prefix.
-TEST_BOOKING_REF_PREFIX = "TEST-"
