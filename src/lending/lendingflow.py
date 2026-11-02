@@ -211,8 +211,22 @@ def _parse_time(value: Any) -> Optional[datetime]:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+def _is_blank(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, dict):
+        return all(_is_blank(v) for v in value.values())
+    if isinstance(value, list):
+        return all(_is_blank(v) for v in value)
+    return False
+
+
 def _parse_certificate(consent: Any) -> Optional[ParsedCertificate]:
-    if consent in (None, "", {}):
+    # A forwarder that fills a fixed body template (the GHL intake workflow) sends a consent object whose fields
+    # are all empty when the borrower gave none; that is no certificate, not consent.
+    if _is_blank(consent):
         return None
     if isinstance(consent, str):
         return ParsedCertificate(raw=consent)
