@@ -1,7 +1,7 @@
 """08:55 ET on business days: draft the after-hours voicemail replies and post who to call first.
 
 The list also carries the new LendingFlow and website leads that came in outside working hours since the previous
-business morning's list and are still not reached: uncalled-lead alarms are not sent outside 09:00-19:15 ET Mon-Fri
+business morning's list and are still not reached: uncalled-lead alarms are not sent outside working hours (LENDING_ALARM_HOURS_START / _END, default 09:00-19:15 ET Mon-Fri)
 (client list Nov 2, C1), so this list is where those leads surface (``uncalled_alarm_worker.after_hours_leads``).
 
 A caller who left an after-hours voicemail is pinned (``src.lending.after_hours_intake``). Once a business-day

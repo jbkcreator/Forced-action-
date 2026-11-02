@@ -18,10 +18,10 @@ sent (GHL contact/4xx rejection, Slack API rejection), retried up to MAX_SEND_AT
 'failed' with an ERROR log; and possibly sent (timeout, 5xx, unexpected error), which is never resent. A 2-minute
 retry is dropped when the escalation fires or the lead has been reached. Logs carry lead ids only.
 
-Alarms are sent only in working hours (Mon-Fri 09:00-19:15 ET, ``config.lending_alarms``). An alarm due outside
-them is not sent: the lead is closed 'after_hours' and :func:`after_hours_leads` puts it on the next business
-morning's 08:55 "call these first" list (``src.tasks.lending_pinned_callbacks``). Due between that post and 09:00
-it waits for the shift.
+Alarms are sent only in working hours on business days (LENDING_ALARM_HOURS_START / LENDING_ALARM_HOURS_END,
+Eastern, default 09:00-19:15). An alarm or retry due outside them is not sent: the lead is closed 'after_hours' and
+:func:`after_hours_leads` puts it on the next business morning's 08:55 "call these first" list
+(``src.tasks.lending_pinned_callbacks``). Due between that post and the start of working hours it waits.
 """
 from __future__ import annotations
 
@@ -30,6 +30,7 @@ import logging
 import signal
 import time
 from datetime import datetime, timedelta, timezone
+from datetime import time as dt_time
 from typing import Any, Callable, Mapping, Optional
 
 from slack_sdk.errors import SlackApiError
@@ -38,8 +39,6 @@ from sqlalchemy import text
 from config.lending_alarms import (
     ALARM_DAYS,
     ALARM_HOLD_FROM,
-    ALARM_HOURS_END,
-    ALARM_HOURS_START,
     BATCH_SIZE,
     ESCALATION_SECONDS,
     FIRST_ALARM_SECONDS,
@@ -108,15 +107,23 @@ def _utcnow() -> datetime:
 OPEN, HOLD, CLOSED = "open", "hold", "closed"
 
 
+def working_hours() -> tuple[dt_time, dt_time]:
+    """(start inclusive, end exclusive), Eastern, from LENDING_ALARM_HOURS_START / LENDING_ALARM_HOURS_END."""
+    settings = get_settings()
+    return (dt_time.fromisoformat(settings.lending_alarm_hours_start),
+            dt_time.fromisoformat(settings.lending_alarm_hours_end))
+
+
 def alarm_hours(moment: datetime) -> str:
-    """OPEN inside working hours; HOLD on a business-day morning after the 08:55 list and before the shift (the
-    alarm waits for 09:00); CLOSED otherwise (the lead goes on the next morning's list instead)."""
+    """OPEN inside working hours; HOLD on a business-day morning after the 08:55 list and before working hours start
+    (the alarm waits); CLOSED otherwise (the lead goes on the next morning's list instead)."""
+    start, end = working_hours()
     local = moment.astimezone(TIMEZONE)
     if local.weekday() not in ALARM_DAYS:
         return CLOSED
-    if ALARM_HOURS_START <= local.time() < ALARM_HOURS_END:
+    if start <= local.time() < end:
         return OPEN
-    return HOLD if ALARM_HOLD_FROM <= local.time() < ALARM_HOURS_START else CLOSED
+    return HOLD if ALARM_HOLD_FROM <= local.time() < start else CLOSED
 
 
 def pick_up_new_leads(db) -> int:

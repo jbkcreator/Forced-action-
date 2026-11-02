@@ -982,3 +982,47 @@ def test_a_retry_inside_working_hours_is_still_sent(db):
     process_due(db, now=ARRIVED + timedelta(seconds=140), sms=sms, slack=None, ghl_status=None,
                 sms_to=JOSH, ops_channel=OPS)
     assert len(sms.sent) == 1 and alarm(db, lead_id)["sms_120_status"] == "sent"
+
+
+# --- Working hours come from LENDING_ALARM_HOURS_START / LENDING_ALARM_HOURS_END ---
+
+def test_working_hours_follow_the_settings(monkeypatch):
+    from types import SimpleNamespace
+
+    from src.lending import uncalled_alarm_worker as worker
+
+    monkeypatch.setattr(worker, "get_settings",
+                        lambda: SimpleNamespace(lending_alarm_hours_start="10:00", lending_alarm_hours_end="18:00"))
+    friday = datetime(2026, 10, 9, tzinfo=timezone.utc)
+    at = lambda hh, mm: friday.replace(hour=hh + 4, minute=mm)  # EDT = UTC-4
+    assert alarm_hours(at(9, 30)) == HOLD      # after the 08:55 list, before 10:00
+    assert alarm_hours(at(10, 0)) == OPEN
+    assert alarm_hours(at(17, 59)) == OPEN
+    assert alarm_hours(at(18, 0)) == CLOSED
+
+
+def test_the_defaults_are_9_to_7_15():
+    from config.settings import AppSettings
+
+    fields = AppSettings.model_fields
+    assert fields["lending_alarm_hours_start"].default == "09:00"
+    assert fields["lending_alarm_hours_end"].default == "19:15"
+
+
+@pytest.mark.parametrize("start, end", [("9am", "19:15"), ("09:00", "25:00"), ("19:15", "09:00"), ("10:00", "10:00")])
+def test_bad_working_hours_are_refused_at_startup(monkeypatch, start, end):
+    from pydantic import ValidationError
+
+    from config.settings import AppSettings
+
+    monkeypatch.setenv("LENDING_ALARM_HOURS_START", start)
+    monkeypatch.setenv("LENDING_ALARM_HOURS_END", end)
+    with pytest.raises(ValidationError, match="LENDING_ALARM_HOURS"):
+        AppSettings()
+
+
+def test_a_single_digit_hour_is_normalized(monkeypatch):
+    from config.settings import AppSettings
+
+    monkeypatch.setenv("LENDING_ALARM_HOURS_START", "9:00")
+    assert AppSettings().lending_alarm_hours_start == "09:00"
