@@ -66,6 +66,7 @@ _PICKUP = text("""
     INSERT INTO lending.uncalled_alarms (lendingflow_lead_id, lead_uuid, phone, arrived_at)
     SELECT l.id, l.lead_uuid::text, l.phone, l.received_at FROM lending.lendingflow_leads l
      WHERE NOT l.suppressed
+       AND l.dnc_status IN ('clear', 'skipped')  -- not while the DNC check is pending, never for a DNC number
        AND NOT EXISTS (SELECT 1 FROM lending.uncalled_alarms a WHERE a.lendingflow_lead_id = l.id)
     ON CONFLICT (lendingflow_lead_id) DO NOTHING
 """)

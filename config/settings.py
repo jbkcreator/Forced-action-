@@ -956,6 +956,16 @@ class AppSettings(BaseSettings):
 	lending_lendingflow_intro_sms_enabled: bool = Field(default=False, env="LENDING_LENDINGFLOW_INTRO_SMS_ENABLED")
 	# Pipeline stage (in LENDING_GHL_PIPELINE_ID) for new LendingFlow leads; unset = contact only.
 	lending_ghl_stage_lendingflow_new: Optional[str] = Field(default=None, env="LENDING_GHL_STAGE_LENDINGFLOW_NEW")
+	# Tracerfy DNC / litigator check on every new LendingFlow lead BEFORE it goes to GHL (and so before BatchDialer). A DNC or
+	# litigator number is stored but pushed to neither; a failed scrub holds the lead and is retried. Off = pushed unchecked.
+	lending_lendingflow_dnc_check_enabled: bool = Field(default=False, env="LENDING_LENDINGFLOW_DNC_CHECK_ENABLED")
+	# LendingFlow -> BatchDialer campaign "LendingFlow" (src/lending/lendingflow_dialer.py). Off: nothing is loaded; leads
+	# already loaded are still removed once they are handled in GHL. The delay is Josh's first-call window (placeholder).
+	lending_lendingflow_dialer_enabled: bool = Field(default=False, env="LENDING_LENDINGFLOW_DIALER_ENABLED")
+	lending_lendingflow_dialer_delay_minutes: int = Field(default=15, env="LENDING_LENDINGFLOW_DIALER_DELAY_MINUTES")
+	# BatchDialer call results as tags + a "last BatchDialer call" field on the GHL contact (src/lending/bd_result_to_ghl.py).
+	lending_bd_result_to_ghl_enabled: bool = Field(default=False, env="LENDING_BD_RESULT_TO_GHL_ENABLED")
+	lending_ghl_cf_last_bd_call: Optional[str] = Field(default=None, env="LENDING_GHL_CF_LAST_BD_CALL")  # GHL custom field id; unset = tags only
 	# T-09 intro SMS. Off: the tag that starts the GHL intro workflow is never added, so nobody is texted. Turn on only after
 	# Josh confirms LendingFlow's consent and DNC check. Needs the id of the GHL contact custom field "intro_name".
 	lending_intro_sms_enabled: bool = Field(default=False, env="LENDING_INTRO_SMS_ENABLED")

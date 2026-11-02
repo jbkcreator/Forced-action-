@@ -19,6 +19,7 @@ from typing import Any, Mapping, Optional, Protocol
 from sqlalchemy import text
 
 from config.lending_lendingflow import (
+    DNC_CHECK_STALE_MINUTES,
     FOLLOWUP_RECOVERY_AFTER_MINUTES,
     GHL_GIVE_UP_AFTER_HOURS,
     GHL_RETRY_BACKOFF_MINUTES,
@@ -319,10 +320,10 @@ _INSERT_LEAD = (
     "INSERT INTO lending.lendingflow_leads (vendor_lead_id, dedupe_hash, contact_id, received_at, first_name, last_name, "
     "phone, email, credit_band, credit_band_min_fico, loan_amount, loan_amount_range, loan_amount_min, loan_amount_max, "
     "loan_type, property_state, property_address, property_city, property_zip, lead_source_campaign, submitted_at, "
-    "consent_status, suppressed, suppression_reason, ghl_status, raw_payload) "
+    "consent_status, suppressed, suppression_reason, ghl_status, dnc_status, raw_payload) "
     "VALUES (:vendor, :hash, :contact, :now, :first, :last, :phone, :email, :band, :fico, :amount, :arange, :amin, :amax, "
     ":ltype, :state, :addr, :city, :zip, :campaign, :submitted, "
-    ":consent, :suppressed, :reason, :ghl, CAST(:raw AS jsonb)) "
+    ":consent, :suppressed, :reason, :ghl, :dnc, CAST(:raw AS jsonb)) "
     "ON CONFLICT DO NOTHING RETURNING id, lead_uuid"
 )
 
@@ -388,6 +389,7 @@ def save_lead(db, parsed: ParsedLendingFlowLead, raw_payload: Any, *, now: Optio
         "campaign": parsed.lead_source_campaign, "submitted": parsed.submitted_at,
         "consent": "present" if parsed.certificate else "missing",
         "suppressed": reason is not None, "reason": reason, "ghl": "skipped" if reason else "pending",
+        "dnc": "pending" if reason is None and get_settings().lending_lendingflow_dnc_check_enabled else "skipped",
         "raw": json.dumps(raw_payload, ensure_ascii=False),
     }).one_or_none()
     if row is None:  # lost a concurrent race on one of the UNIQUE keys
@@ -406,6 +408,87 @@ def save_lead(db, parsed: ParsedLendingFlowLead, raw_payload: Any, *, now: Optio
     return SaveResult(row.id, str(row.lead_uuid), created=True, suppressed=reason is not None)
 
 
+# --------------------------------------------------------------------------- DNC check (before GHL and BatchDialer)
+
+_CLAIM_DNC = (
+    "UPDATE lending.lendingflow_leads SET dnc_status = 'checking', dnc_claimed_at = :now "
+    "WHERE id IN (SELECT id FROM lending.lendingflow_leads WHERE dnc_status = 'pending' AND NOT suppressed {extra} "
+    "ORDER BY received_at LIMIT :limit FOR UPDATE SKIP LOCKED) RETURNING id, phone, first_name"
+)
+
+
+def check_dnc_pending(db, scrubber: Any, *, lead_id: Optional[int] = None, now: Optional[datetime] = None) -> int:
+    """Scrub new leads against Tracerfy's DNC / litigator lists before they go to GHL (and so before BatchDialer).
+
+    Clear -> ``dnc_status='clear'`` and delivery goes ahead. DNC or litigator -> the lead is kept but suppressed
+    (``ghl_status='skipped'``), so it reaches neither GHL nor BatchDialer, and Cora's inbox is told. No result (Tracerfy
+    down) -> back to pending, retried by the next sweep; the lead is never pushed unchecked while the check is on.
+    The claim is committed before Tracerfy is called, so no row lock is held during the scrub and two runs never pay
+    for the same lead. With the check off, waiting leads are released unchecked. Returns how many were checked."""
+    from src.lending.compliance import dnc_verdicts
+
+    now = now or datetime.now(timezone.utc)
+    extra, params = ("AND id = :lead_id", {"lead_id": lead_id}) if lead_id is not None else ("", {})
+    if not get_settings().lending_lendingflow_dnc_check_enabled:
+        db.execute(text(f"UPDATE lending.lendingflow_leads SET dnc_status = 'skipped' "
+                        f"WHERE dnc_status IN ('pending', 'checking') {extra}"), params)
+        db.commit()
+        return 0
+    db.execute(text("UPDATE lending.lendingflow_leads SET dnc_status = 'pending' "
+                    "WHERE dnc_status = 'checking' AND dnc_claimed_at < :stale"),
+               {"stale": now - timedelta(minutes=DNC_CHECK_STALE_MINUTES)})
+    claimed = db.execute(text(_CLAIM_DNC.format(extra=extra)),
+                         {**params, "now": now, "limit": SWEEP_BATCH_SIZE}).mappings().all()
+    db.commit()
+    if not claimed:
+        return 0
+    verdicts = dnc_verdicts(db, [row["phone"] for row in claimed], scrubber=scrubber, now=now)
+    for row in claimed:
+        verdict = verdicts.get(row["phone"])
+        if verdict is None:
+            db.execute(text("UPDATE lending.lendingflow_leads SET dnc_status = 'pending', dnc_result = 'SCRUB_FAILED' "
+                            "WHERE id = :id"), {"id": row["id"]})
+            logger.warning("[lendingflow] DNC scrub gave no result lead=%s: held, retried by the sweep", row["id"])
+        elif verdict.allowed:
+            db.execute(text("UPDATE lending.lendingflow_leads SET dnc_status = 'clear', dnc_result = NULL, "
+                            "dnc_checked_at = :now WHERE id = :id"), {"now": now, "id": row["id"]})
+        else:
+            _hold_dnc_lead(db, row, verdict.reason.value, now)
+    db.commit()
+    return len(claimed)
+
+
+def _hold_dnc_lead(db, row: Mapping[str, Any], reason: str, now: datetime) -> None:
+    db.execute(text("UPDATE lending.lendingflow_leads SET dnc_status = 'dnc', dnc_result = :reason, dnc_checked_at = :now, "
+                    "suppressed = true, suppression_reason = :why, ghl_status = 'skipped' WHERE id = :id"),
+               {"reason": reason, "why": reason.lower()[:30], "now": now, "id": row["id"]})
+    logger.info("[lendingflow] lead=%s not pushed to GHL or the dialer: %s", row["id"], reason)
+    add_to_inbox_safely(
+        db, event_type="lendingflow_dnc_hold", dedup_key=str(row["id"]),
+        summary=(f"LendingFlow lead {(row['first_name'] or '').strip() or 'with no name'} is on the {reason.replace('_', ' ').lower()} "
+                 "list: kept in the database, not sent to GHL or BatchDialer. Decide whether to contact them."),
+        payload={"lead_ref": f"lendingflow_lead:{row['id']}", "dnc_result": reason},
+        target_channel="dial_tasks",
+    )
+
+
+def _check_dnc_and_commit(lead_id: Optional[int], scrubber: Any) -> None:
+    """Own session, committed. Never raises: a lead left pending is picked up by the sweep."""
+    from src.lending.db import lending_session
+
+    try:
+        with lending_session() as db:
+            check_dnc_pending(db, scrubber, lead_id=lead_id)
+    except Exception as exc:  # class only
+        logger.error("[lendingflow] DNC check crashed lead=%s: %s", lead_id, type(exc).__name__)
+
+
+def _live_scrubber() -> Any:
+    from src.lending.compliance import tracerfy_scrub
+
+    return tracerfy_scrub
+
+
 # --------------------------------------------------------------------------- delivery
 
 def _backoff_minutes_sql() -> str:
@@ -419,7 +502,8 @@ _DELIVERABLE = (
     "loan_amount, loan_type, property_state, property_zip, lead_source_campaign, consent_status, received_at, "
     "ghl_attempts, ghl_contact_id, event_emitted_at "
     "FROM lending.lendingflow_leads "
-    "WHERE ghl_status IN ('pending', 'failed') AND NOT suppressed AND received_at > :oldest {extra} "
+    "WHERE ghl_status IN ('pending', 'failed') AND NOT suppressed AND dnc_status IN ('clear', 'skipped') "
+    "AND received_at > :oldest {extra} "
     "ORDER BY received_at LIMIT :limit FOR UPDATE SKIP LOCKED"
 )
 
@@ -659,10 +743,13 @@ def run_followups(db, followups: list[FollowUp]) -> None:
                 logger.error("[lendingflow] follow-up mark failed lead=%s: %s", lead["id"], type(exc).__name__)
 
 
-def deliver_and_follow_up(sink: Optional[LeadSink], *, lead_id: Optional[int] = None) -> int:
-    """Background / sweep entry point: deliver (own session, committed), then follow up. Never raises."""
+def deliver_and_follow_up(sink: Optional[LeadSink], *, lead_id: Optional[int] = None,
+                          scrubber: Optional[Any] = None) -> int:
+    """Background / sweep entry point: DNC check (LENDING_LENDINGFLOW_DNC_CHECK_ENABLED), deliver (own session,
+    committed), then follow up. Never raises."""
     from src.lending.db import lending_session
 
+    _check_dnc_and_commit(lead_id, scrubber or _live_scrubber())
     try:
         with lending_session() as db:
             followups = deliver_pending(db, sink, lead_id=lead_id)

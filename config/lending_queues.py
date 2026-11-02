@@ -12,7 +12,8 @@ overrides the Oct 4 email's "Partners only when ranks 1 to 3 are empty" (open Q-
   4. Verified maturity = Lists 1, 5, 8: the 525-record FL maturity list, filler only,
      touched when the queues above are cleared.
 The relative order of 2 and 3 is unchanged from Oct 4 (the Runbook names only first and
-last). LendingFlow inbound is not a dialer queue: it routes to GHL and Josh (Principle 2).
+last). LendingFlow inbound is not a ranked queue: it routes to GHL and Josh first (Principle 2), and only leads he has
+not handled are loaded into their own "LendingFlow" campaign (src/lending/lendingflow_dialer.py, off by default).
 Each queue is its own BatchDialer campaign; MAX_LINES is the Principle 4 line rule.
 """
 from __future__ import annotations

@@ -94,6 +94,18 @@ def test_a_confirmed_booking_schedules_the_messages_and_the_task(client, db):
     assert db.execute(text("SELECT count(*) FROM lending.text_consents WHERE source = 'on_call_yes'")).scalar() == 1
 
 
+def test_a_booking_takes_the_lead_out_of_the_dialer(client, db, dialer_removals):
+    confirmed(client)
+    post(client, {"appointmentId": "appt-9", "appointmentStatus": "booked", "startTime": "2099-10-08T14:00:00Z",
+                  "contact": {"phone": "+18135550148"}})
+    assert dialer_removals == [("(813) 555-0147", "booked"), ("+18135550148", "booked")]
+
+
+def test_a_cancelled_appointment_does_not_touch_the_dialer(client, db, dialer_removals):
+    post(client, {"appointmentId": "appt-1", "appointmentStatus": "cancelled", "phone": "+18135550111"})
+    assert dialer_removals == []
+
+
 def test_a_redelivered_booking_is_a_duplicate(client, db):
     confirmed(client)
     assert confirmed(client).json()["status"] == "duplicate"

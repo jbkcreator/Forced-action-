@@ -55,7 +55,8 @@ from src.lending.dialer_port import (
     DialerRequestError,
 )
 from src.lending.dialer_removal import DialerRemovalUndecided
-from src.lending.context_card import NO_PRIOR_CONTACT, build_context_card
+from src.lending.context_card import NO_PRIOR_CONTACT, ContextCard, build_context_card
+from src.lending.dialer_display import NOT_AVAILABLE
 from src.lending.lead_facts import LeadFacts, load_lead_facts
 from src.lending.lead_scoring import LeadSignals, score_lead
 from src.services.phone_utils import normalize as normalize_phone
@@ -415,6 +416,11 @@ def _cards(db, loadable: Sequence["_Loadable"]) -> dict[str, dict[str, str]]:
     history = _prior_contacts(db, sorted({item.phone for item in loadable}))
     cards: dict[str, dict[str, str]] = {}
     for item in loadable:
+        if item.record.get("card"):  # a source with no property facts (LendingFlow) builds its own card
+            prior = None if history is None else history.get(item.phone, NO_PRIOR_CONTACT)
+            card = {**item.record["card"], "prior_contact": prior or NOT_AVAILABLE}
+            cards[item.record_ref] = ContextCard(fields=card).custom_fields
+            continue
         property_id = item.record.get("property_id")
         lead = facts.get(int(property_id)) if property_id is not None else None
         lead = lead or LeadFacts(property_id=int(property_id or 0), property_address=item.display.property_address,

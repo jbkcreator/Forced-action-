@@ -244,6 +244,23 @@ def filter_loadable(
     return results
 
 
+def dnc_verdicts(db, phones: Sequence[str], *, scrubber: Scrubber,
+                 now: Optional[datetime] = None) -> dict[str, Optional[GateResult]]:
+    """DNC / litigator verdict per phone: a stored scrub younger than DNC_SCRUB_MAX_AGE_DAYS is reused, the rest go to
+    the scrubber in one batch (stored like every other scrub, so a later dialer load does not pay again). ``None``
+    means no result (the scrub failed): the caller must not treat that number as clear. Does not commit."""
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=DNC_SCRUB_MAX_AGE_DAYS)
+    wanted = sorted({p for p in phones if p})
+    fresh = {p: s for p, s in _stored_scrubs(db, wanted).items() if s.checked_at >= cutoff} if wanted else {}
+    stale = [p for p in wanted if p not in fresh]
+    if stale:
+        scrubbed = _scrub(db, stale, scrubber)
+        _stamp_contacts(db, scrubbed)
+        fresh.update(scrubbed)
+    return {p: _verdict(p, fresh[p]) if p in fresh else None for p in wanted}
+
+
 def _scrub(db, phones: list[str], scrubber: Scrubber) -> dict[str, ScrubResult]:
     """One Tracerfy batch for every stale/missing phone. Unreturned phones are absent."""
     try:
