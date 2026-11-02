@@ -161,6 +161,27 @@ def test_bad_optional_field_is_dropped_not_rejected(field, value):
     assert getattr(parsed, field) is None
 
 
+_EMPTY_TEMPLATE_CONSENT = {"certificate_id": "", "certificate_url": "", "timestamp": "", "ip_address": "",
+                           "page_url": "", "disclosure_text": ""}
+
+
+@pytest.mark.parametrize("consent", [
+    _EMPTY_TEMPLATE_CONSENT,
+    {key: "  \n" for key in _EMPTY_TEMPLATE_CONSENT},
+    {"certificate_id": None, "timestamp": "", "extra": {"nested": " "}},
+    "   ",
+    [],
+])
+def test_blank_consent_is_no_certificate(consent):
+    assert parse_lendingflow({"lead_id": "1", "phone": "7275550100", "consent": consent}).certificate is None
+
+
+def test_consent_with_one_real_field_is_kept_verbatim():
+    consent = {**_EMPTY_TEMPLATE_CONSENT, "certificate_id": "cert-1"}
+    certificate = parse_lendingflow({"lead_id": "1", "phone": "7275550100", "consent": consent}).certificate
+    assert certificate.certificate_id == "cert-1" and certificate.raw == json.dumps(consent, ensure_ascii=False)
+
+
 def test_parse_error_never_echoes_values():
     with pytest.raises(ParseError) as exc:
         parse_lendingflow({"lead_id": "1", "phone": "555-SECRET-NUM"})
@@ -225,6 +246,12 @@ def test_no_certificate_marks_consent_missing(client, lf_db):
     assert _post(client, body).status_code == 200
     assert _select_added(lf_db, "lendingflow_leads", "consent_status").scalar_one() == "missing"
     assert _count(lf_db, "lead_consent_certificates") == 0 and len(client.scheduled) == 1
+
+
+def test_empty_template_consent_marks_consent_missing(client, lf_db):
+    assert _post(client, _payload(consent=_EMPTY_TEMPLATE_CONSENT)).status_code == 200
+    assert _select_added(lf_db, "lendingflow_leads", "consent_status").scalar_one() == "missing"
+    assert _count(lf_db, "lead_consent_certificates") == 0
 
 
 def test_auth(client, monkeypatch):
