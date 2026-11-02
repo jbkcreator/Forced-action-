@@ -426,10 +426,12 @@ def _decide(db, row: Mapping[str, Any], *, tick: Clock, sms: Optional[Callable[.
 
 def _retry_row(db, row: Mapping[str, Any], *, tick: Clock, sms, slack, ghl_status: Optional[GhlCallStatus],
                sms_to: Optional[str], ops_channel: str) -> list[str]:
-    """Retry every channel of this alarm that is waiting in 'retry'; each is claimed before it is sent."""
+    """Retry every channel of this alarm that is waiting in 'retry'; each is claimed before it is sent.
+    Outside working hours a retry is dropped, like a new alarm: the lead goes on the morning list instead."""
     outcomes: list[str] = []
     reached = call_status(db, row, ghl_status) == CONNECTED
     now = tick()
+    working_hours = alarm_hours(now) == OPEN
     for channel in CHANNELS:
         if row[f"{channel}_status"] != RETRY:
             continue
@@ -437,6 +439,10 @@ def _retry_row(db, row: Mapping[str, Any], *, tick: Clock, sms, slack, ghl_statu
         if reached:  # the lead has been called meanwhile: the alert is stale
             db.execute(_SET_FROM_RETRY[channel], {"id": row["id"], "status": SUPERSEDED})
             outcomes.append(f"retry_{channel}_{SUPERSEDED}")
+        elif not working_hours:
+            db.execute(_SET_FROM_RETRY[channel], {"id": row["id"], "status": SUPERSEDED})
+            logger.info("[uncalled-alarm] lead=%s %s retry dropped: outside working hours", row["lead_uuid"], channel)
+            outcomes.append(f"retry_{channel}_{SUPERSEDED}_after_hours")
         elif fired is None or now - fired > timedelta(seconds=RETRY_WINDOW_SECONDS):
             db.execute(_SET_FROM_RETRY[channel], {"id": row["id"], "status": FAILED})
             logger.error("[uncalled-alarm] lead=%s %s gave up: retry window over", row["lead_uuid"], channel)

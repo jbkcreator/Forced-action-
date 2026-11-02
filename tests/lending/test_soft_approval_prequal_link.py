@@ -118,3 +118,72 @@ def test_only_a_submission_whose_figures_fit_a_lender_sends_the_letter(link_db, 
     monkeypatch.setattr(webhook, "send_prequal_after_call", lambda *args: letters.append(args))
     webhook._process_submission("call-1", FACTS, "U1", "CDIAL", "1.1")
     assert letters == ([("call-1", PHONE)] if sent else [])
+
+
+# --- A hand-off that did not land is recovered by the pre-qual sweep, without resubmitting the form ---
+
+@pytest.fixture
+def sweep_db(link_db):
+    from migrations.apply_lending_prequal_letters import apply_to as apply_letters
+    from migrations.apply_lending_soft_approvals import apply_to as apply_soft
+
+    conn = link_db.get_bind()
+    apply_soft(conn)
+    apply_letters(conn)
+    return link_db
+
+
+def _approval(db, *, status="generated", updated="now()"):
+    db.execute(text(
+        "INSERT INTO lending.soft_approvals (phone, dialer_call_id, status, facts, updated_at) "
+        f"VALUES (:p, 'call-1', :s, '{{}}'::jsonb, {updated})"), {"p": PHONE, "s": status})
+
+
+def _letters(db):
+    return db.execute(text("SELECT lead_ref, ghl_contact_id FROM lending.prequal_letters "
+                           "WHERE lead_source = 'lendingflow' AND lead_ref IN ('v1', 'old', 'new')")).all()
+
+
+def test_a_failed_hand_off_is_queued_by_the_sweep_once(sweep_db, monkeypatch):
+    from datetime import datetime, timezone
+
+    from src.lending.soft_approval.prequal_link import queue_missed_letters
+
+    _lead(sweep_db, vendor="v1", received="2026-10-01 10:00:00+00")
+    _approval(sweep_db)
+    monkeypatch.setattr(prequal_link, "lending_session", lambda: _session_over(sweep_db))
+    monkeypatch.setattr(prequal_link, "get_settings", lambda: SimpleNamespace(lending_prequal_pdf_enabled=True))
+
+    def failing_queue(**kwargs):
+        raise RuntimeError("database blip")
+
+    monkeypatch.setattr("src.lending.prequal_letters.queue_and_send_in_background", failing_queue)
+    send_prequal_after_call("call-1", PHONE)  # the immediate hand-off fails: no letter row
+    assert _letters(sweep_db) == []
+
+    now = datetime.now(timezone.utc)
+    assert queue_missed_letters(sweep_db, now) == 1
+    assert _letters(sweep_db) == [("v1", "ghl_9")]
+    assert queue_missed_letters(sweep_db, now) == 0 and len(_letters(sweep_db)) == 1  # never a second letter
+
+
+@pytest.mark.parametrize("status, updated", [("no_fit", "now()"), ("generated", "now() - interval '25 hours'")])
+def test_the_sweep_skips_approvals_that_did_not_fit_or_are_too_old(sweep_db, status, updated):
+    from datetime import datetime, timezone
+
+    from src.lending.soft_approval.prequal_link import queue_missed_letters
+
+    _lead(sweep_db, vendor="v1", received="2026-10-01 10:00:00+00")
+    _approval(sweep_db, status=status, updated=updated)
+    assert queue_missed_letters(sweep_db, datetime.now(timezone.utc)) == 0 and _letters(sweep_db) == []
+
+
+def test_the_sweep_skips_a_suppressed_latest_lead(sweep_db):
+    from datetime import datetime, timezone
+
+    from src.lending.soft_approval.prequal_link import queue_missed_letters
+
+    _lead(sweep_db, vendor="old", received="2026-10-01 10:00:00+00")
+    _lead(sweep_db, vendor="new", received="2026-10-02 10:00:00+00", suppressed=True)
+    _approval(sweep_db)
+    assert queue_missed_letters(sweep_db, datetime.now(timezone.utc)) == 0 and _letters(sweep_db) == []

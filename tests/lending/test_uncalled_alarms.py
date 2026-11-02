@@ -943,3 +943,42 @@ def test_morning_post_lists_after_hours_leads_with_last_four_only():
     web = format_slack([], leads=[{**row, "lead_uuid": "web-12", "from_web": True}])
     assert "(web lead 12)" in web and "website lead" in web
     assert format_slack([], leads=[]) is None
+
+
+def test_a_first_alarm_retry_due_after_7_15_is_dropped_not_sent(db):
+    first_due = datetime(2026, 10, 9, 23, 14, 55, tzinfo=timezone.utc)  # Fri 19:14:55 ET
+    lead_id = lead(db, arrived=first_due - timedelta(seconds=120), phone="+17275550177")
+    process_due(db, now=first_due, sms=Sms(GhlSmsError("rejected", ambiguous=False)), slack=None, ghl_status=None,
+                sms_to=JOSH, ops_channel=OPS)
+    assert alarm(db, lead_id)["sms_120_status"] == "retry"
+    sms = Sms()
+    process_due(db, now=first_due + timedelta(seconds=20), sms=sms, slack=None, ghl_status=None,
+                sms_to=JOSH, ops_channel=OPS)  # 19:15:15 ET: the retry is due, outside working hours
+    assert sms.sent == [] and alarm(db, lead_id)["sms_120_status"] == "superseded"
+
+
+def test_an_escalation_retry_due_after_7_15_is_dropped_not_sent(db):
+    escalation_due = datetime(2026, 10, 9, 23, 14, 50, tzinfo=timezone.utc)  # Fri 19:14:50 ET
+    lead_id = lead(db, arrived=escalation_due - timedelta(seconds=300), phone="+17275550188")
+    rejected = SlackApiError("rejected", {"ok": False, "error": "not_in_channel"})
+    process_due(db, now=escalation_due, sms=Sms(GhlSmsError("rejected", ambiguous=False)), slack=Slack(rejected),
+                ghl_status=None, sms_to=JOSH, ops_channel=OPS)
+    row = alarm(db, lead_id)
+    assert row["sms_300_status"] == "retry" and row["slack_300_status"] == "retry"
+    sms, slack = Sms(), Slack()
+    process_due(db, now=escalation_due + timedelta(seconds=15), sms=sms, slack=slack, ghl_status=None,
+                sms_to=JOSH, ops_channel=OPS)  # 19:15:05 ET
+    row = alarm(db, lead_id)
+    assert sms.sent == [] and slack.posts == []
+    assert row["sms_300_status"] == "superseded" and row["slack_300_status"] == "superseded"
+    assert row["resolved_reason"] == "escalated"  # nothing left in flight: the row settles
+
+
+def test_a_retry_inside_working_hours_is_still_sent(db):
+    lead_id = lead(db, phone="+17275550199")
+    process_due(db, now=ARRIVED + timedelta(seconds=120), sms=Sms(GhlSmsError("rejected", ambiguous=False)),
+                slack=None, ghl_status=None, sms_to=JOSH, ops_channel=OPS)
+    sms = Sms()
+    process_due(db, now=ARRIVED + timedelta(seconds=140), sms=sms, slack=None, ghl_status=None,
+                sms_to=JOSH, ops_channel=OPS)
+    assert len(sms.sent) == 1 and alarm(db, lead_id)["sms_120_status"] == "sent"
