@@ -921,7 +921,7 @@ class LendingUncalledAlarm(LendingBase):
     migration order. ``fired_120_at`` / ``fired_300_at`` are claims committed before the send: an alarm fires
     at most once. ``*_status``: sent / retry (definitely not sent, will be retried) / sending (a retry is claimed) /
     send_unknown (may have been sent: never resent) / failed (retries used up) / superseded (no longer needed) /
-    not_configured / skipped_late. ``alarm_*_kind``: no_call / not_reached. ``resolved_reason``: connected / escalated / preexisting (existed before T-10 was switched on).
+    not_configured / skipped_late. ``alarm_*_kind``: no_call / not_reached. ``resolved_reason``: connected / escalated / preexisting (existed before T-10 was switched on) / after_hours (due outside working hours: no alarm, on the 08:55 morning list instead).
     """
 
     __tablename__ = "uncalled_alarms"
@@ -950,7 +950,7 @@ class LendingUncalledAlarm(LendingBase):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 
     __table_args__ = (
-        CheckConstraint("resolved_reason IN ('connected', 'escalated', 'preexisting')",
+        CheckConstraint("resolved_reason IN ('connected', 'escalated', 'preexisting', 'after_hours')",
                         name="ck_lending_uncalled_alarms_reason"),
         CheckConstraint("(lendingflow_lead_id IS NULL) <> (web_lead_id IS NULL)", name="ck_lending_uncalled_alarms_one_source"),
         Index("uq_lending_uncalled_alarms_web_lead", "web_lead_id", unique=True),

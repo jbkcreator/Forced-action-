@@ -65,7 +65,7 @@ def soft_db(lending_db):
     return lending_db
 
 
-def _flow_lead(db, *, vendor="v1", phone=PHONE, fico=640, amount=290000, loan_type="FIX_AND_FLIP", state="FL",
+def _flow_lead(db, *, vendor="v1", phone=PHONE, fico=700, amount=290000, loan_type="FIX_AND_FLIP", state="FL",
                suppressed=False, received="2026-10-01 10:00:00+00"):
     db.execute(
         text("INSERT INTO lending.lendingflow_leads (vendor_lead_id, dedupe_hash, phone, credit_band_min_fico, loan_amount, "
@@ -401,7 +401,7 @@ class TestLendingFlowLeadSource:
         _flow_lead(soft_db)
         lead = self.SOURCE.for_phone(soft_db, PHONE)
         assert lead.loan_type is LoanType.FIX_AND_FLIP and lead.loan_amount == D(290000) and lead.state == "FL"
-        assert lead.borrower.credit_band_min_fico == 640 and lead.has_core_fields()
+        assert lead.borrower.credit_band_min_fico == 700 and lead.has_core_fields()
 
     def test_a_closed_band_carries_its_upper_bound_so_a_higher_floor_is_a_decline(self, soft_db):
         """Review on #363: "680-719" must reach the evaluator as 680 to 719, never as an open-ended 680+."""

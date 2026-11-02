@@ -17,6 +17,11 @@ Each alarm is claimed (committed) before it is sent. Delivery has three outcomes
 sent (GHL contact/4xx rejection, Slack API rejection), retried up to MAX_SEND_ATTEMPTS times with short waits, then
 'failed' with an ERROR log; and possibly sent (timeout, 5xx, unexpected error), which is never resent. A 2-minute
 retry is dropped when the escalation fires or the lead has been reached. Logs carry lead ids only.
+
+Alarms are sent only in working hours (Mon-Fri 09:00-19:15 ET, ``config.lending_alarms``). An alarm due outside
+them is not sent: the lead is closed 'after_hours' and :func:`after_hours_leads` puts it on the next business
+morning's 08:55 "call these first" list (``src.tasks.lending_pinned_callbacks``). Due between that post and 09:00
+it waits for the shift.
 """
 from __future__ import annotations
 
@@ -31,6 +36,10 @@ from slack_sdk.errors import SlackApiError
 from sqlalchemy import text
 
 from config.lending_alarms import (
+    ALARM_DAYS,
+    ALARM_HOLD_FROM,
+    ALARM_HOURS_END,
+    ALARM_HOURS_START,
     BATCH_SIZE,
     ESCALATION_SECONDS,
     FIRST_ALARM_SECONDS,
@@ -47,6 +56,7 @@ from config.lending_alarms import (
     SMS_TEXT,
     STALE_SEND_SECONDS,
 )
+from config.lending_reminders import TIMEZONE
 from config.settings import get_settings
 from src.lending.cora_inbox import add_to_inbox_safely
 from src.lending.db import lending_session
@@ -93,6 +103,20 @@ _LEAD_JOINS = """
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+OPEN, HOLD, CLOSED = "open", "hold", "closed"
+
+
+def alarm_hours(moment: datetime) -> str:
+    """OPEN inside working hours; HOLD on a business-day morning after the 08:55 list and before the shift (the
+    alarm waits for 09:00); CLOSED otherwise (the lead goes on the next morning's list instead)."""
+    local = moment.astimezone(TIMEZONE)
+    if local.weekday() not in ALARM_DAYS:
+        return CLOSED
+    if ALARM_HOURS_START <= local.time() < ALARM_HOURS_END:
+        return OPEN
+    return HOLD if ALARM_HOLD_FROM <= local.time() < ALARM_HOURS_START else CLOSED
 
 
 def pick_up_new_leads(db) -> int:
@@ -177,6 +201,14 @@ _RESOLVE_CONNECTED = text("""
      WHERE id = :id AND resolved_at IS NULL
 """)
 
+# Outside working hours: no alarm. A pending 2-minute retry is dropped with it (the lead goes on the morning list).
+_RESOLVE_AFTER_HOURS = text("""
+    UPDATE lending.uncalled_alarms
+       SET resolved_at = :now, resolved_reason = 'after_hours',
+           sms_120_status = CASE WHEN sms_120_status = 'retry' THEN 'superseded' ELSE sms_120_status END
+     WHERE id = :id AND resolved_at IS NULL AND fired_300_at IS NULL
+""")
+
 _CLAIM_FIRST = text("""
     UPDATE lending.uncalled_alarms SET fired_120_at = :now, alarm_120_kind = :kind
      WHERE id = :id AND fired_120_at IS NULL AND resolved_at IS NULL RETURNING id
@@ -240,7 +272,7 @@ def _lead_label(row: Mapping[str, Any]) -> str:
     return f"{name} ({row['property_state']})" if row["property_state"] else name
 
 
-def _who(row: Mapping[str, Any]) -> str:
+def lead_who(row: Mapping[str, Any]) -> str:
     """``Daniel Smith (lead f0084183)`` / ``TEST Sonetel (web lead 333)`` for the Slack alarm post."""
     ref = str(row["lead_uuid"])
     ref = f"web lead {ref[4:]}" if row["from_web"] and ref.startswith("web-") else f"lead {ref[:8]}"
@@ -262,7 +294,7 @@ def _is_test_lead(db, row: Mapping[str, Any]) -> bool:
 
 
 def _fields(row: Mapping[str, Any], now: datetime) -> dict[str, Any]:
-    return {"lead": _lead_label(row), "who": _who(row), "ref": str(row["lead_uuid"])[:8],
+    return {"lead": _lead_label(row), "who": lead_who(row), "ref": str(row["lead_uuid"])[:8],
             "source": "website" if row["from_web"] else "LendingFlow",
             "minutes": int((now - row["arrived_at"]).total_seconds() // 60),
             "state": f" ({row['property_state']})" if row["property_state"] else ""}
@@ -356,6 +388,13 @@ def _decide(db, row: Mapping[str, Any], *, tick: Clock, sms: Optional[Callable[.
         db.execute(_RESOLVE_CONNECTED, {"id": row["id"], "now": now})
         db.commit()
         return "connected"
+    hours = alarm_hours(now)
+    if hours == HOLD:
+        return "held_until_shift"
+    if hours == CLOSED:
+        db.execute(_RESOLVE_AFTER_HOURS, {"id": row["id"], "now": now})
+        db.commit()
+        return "after_hours"
     kind = KIND_NOT_REACHED if calls == ATTEMPTED else KIND_NO_CALL
     escalate = row["arrived_at"] <= now - timedelta(seconds=ESCALATION_SECONDS)
     claim = _CLAIM_ESCALATION if escalate else _CLAIM_FIRST
@@ -413,6 +452,37 @@ def _retry_row(db, row: Mapping[str, Any], *, tick: Clock, sms, slack, ghl_statu
             outcomes.append(f"retry_{channel}_{recorded}")
         db.commit()
     return outcomes
+
+
+# Leads closed 'after_hours' that arrived since the previous business morning's list and have had no connected
+# outbound call since they arrived.
+_AFTER_HOURS_LEADS = text(f"""
+    SELECT a.id, a.lead_uuid, a.phone, a.arrived_at,{_LEAD_FIELDS}
+      FROM lending.uncalled_alarms a{_LEAD_JOINS}
+     WHERE a.resolved_reason = 'after_hours' AND a.arrived_at >= :since AND a.arrived_at < :until
+       AND NOT EXISTS (
+           SELECT 1 FROM lending.call_dispositions c
+            WHERE c.phone = a.phone AND c.direction = 'outbound'
+              AND COALESCE(c.call_started_at, c.call_ended_at) >= a.arrived_at
+              AND CASE WHEN c.disposition IS NOT NULL THEN NOT (c.disposition = ANY(:not_connected))
+                       ELSE COALESCE(c.talk_duration_sec, 0) > 0 END)
+     ORDER BY a.arrived_at
+""")
+
+
+def previous_morning_list(now: datetime) -> datetime:
+    """The 08:55 ET list of the last business day before today (Friday's for a Monday list)."""
+    day = now.astimezone(TIMEZONE).date() - timedelta(days=1)
+    while day.weekday() not in ALARM_DAYS:
+        day -= timedelta(days=1)
+    return datetime.combine(day, ALARM_HOLD_FROM, tzinfo=TIMEZONE)
+
+
+def after_hours_leads(db, now: datetime) -> list[Mapping[str, Any]]:
+    """Leads that came in since the previous business morning's list, got no alarm (outside working hours) and are
+    still not reached by phone (BatchDialer CDRs): today's "call these first" list."""
+    return list(db.execute(_AFTER_HOURS_LEADS, {"since": previous_morning_list(now), "until": now,
+                                                "not_connected": list(NOT_CONNECTED_CODES)}).mappings().all())
 
 
 class MentioningSlack:
