@@ -393,7 +393,7 @@ def _saved(db, **overrides):
     return save_lead(db, parse_lendingflow(payload), payload)
 
 
-def test_delivery_emits_event_once_and_queues_prequal(lf_db, seen):
+def test_delivery_emits_event_once_and_queues_no_prequal_at_intake(lf_db, seen):
     events, prequal = seen
     _saved(lf_db)
     sink = RecordingSink()
@@ -402,8 +402,8 @@ def test_delivery_emits_event_once_and_queues_prequal(lf_db, seen):
     assert len(sink.pushed) == 1 and sink.pushed[0]["phone"] == "+17275550100"
     assert len(events) == 1 and events[0].loan_type is LoanType.DSCR_RENTAL and events[0].credit_band_min_fico == 740
     assert events[0].phone == "+17275550100" and events[0].loan_amount == 500_000
-    assert len(prequal) == 1 and prequal[0]["lead_source"] == "lendingflow" and prequal[0]["lead_ref"] == "LF-1"
-    assert prequal[0]["contact_id"] == "ghl_1" and prequal[0]["lead"].property_state == "FL"
+    assert prequal == []  # Q2 (client list Nov 2): the letter waits for the call figures
+    assert _row(lf_db).followup_done_at is not None
     assert deliver_pending(lf_db, sink) == [] and len(sink.pushed) == 1  # nothing left to deliver
 
 
@@ -419,14 +419,7 @@ def test_failed_push_then_sweep_emits_exactly_once(lf_db, seen):
     assert len(events) == 1
 
 
-def test_missing_prequal_field_still_emits_but_skips_prequal(lf_db, seen):
-    events, prequal = seen
-    _saved(lf_db, loan_amount=None)
-    run_followups(lf_db, deliver_pending(lf_db, RecordingSink()))
-    assert len(events) == 1 and prequal == []
-
-
-def test_event_handler_failure_does_not_stop_prequal(lf_db, seen):
+def test_event_handler_failure_still_finishes_the_follow_up(lf_db, seen):
     events, prequal = seen
 
     def boom(event):
@@ -435,7 +428,7 @@ def test_event_handler_failure_does_not_stop_prequal(lf_db, seen):
     lendingflow_events._handlers.insert(0, boom)
     _saved(lf_db)
     run_followups(lf_db, deliver_pending(lf_db, RecordingSink()))
-    assert len(events) == 1 and len(prequal) == 1
+    assert len(events) == 1 and prequal == []
 
 
 def test_no_sink_leaves_lead_pending(lf_db):
@@ -491,27 +484,6 @@ def _row(db):
     return _select_added(db, "lendingflow_leads", "ghl_status, event_emitted_at, followup_done_at").one()
 
 
-def test_failed_prequal_handoff_is_retried_by_the_sweep(lf_db, seen, monkeypatch):
-    events, prequal = seen
-    calls = []
-
-    def flaky(**kw):
-        calls.append(kw)
-        if len(calls) == 1:
-            raise RuntimeError("connection blip")
-        prequal.append(kw)
-
-    monkeypatch.setattr("src.lending.prequal_letters.queue_and_send_in_background", flaky)
-    _saved(lf_db)
-    run_followups(lf_db, deliver_pending(lf_db, RecordingSink()))
-    row = _row(lf_db)
-    assert row.ghl_status == "contact_only" and row.event_emitted_at is not None and row.followup_done_at is None
-    later = datetime.now(timezone.utc) + timedelta(minutes=10)
-    run_followups(lf_db, deliver_pending(lf_db, RecordingSink(), now=later))
-    assert _row(lf_db).followup_done_at is not None
-    assert len(events) == 1 and len(prequal) == 1  # event not re-emitted, letter handed off once
-
-
 def test_failed_event_emit_is_retried_by_the_sweep(lf_db, seen, monkeypatch):
     events, prequal = seen
     real_build = lendingflow_events.build_event
@@ -542,10 +514,10 @@ def test_crash_after_delivery_commit_is_recovered(lf_db, seen):
     assert events == []
     later = datetime.now(timezone.utc) + timedelta(minutes=10)
     run_followups(lf_db, deliver_pending(lf_db, sink, now=later))
-    assert len(events) == 1 and len(prequal) == 1 and sink.pushed == []  # recovery never re-pushes to GHL
+    assert len(events) == 1 and prequal == [] and sink.pushed == []  # recovery never re-pushes to GHL
     assert _row(lf_db).followup_done_at is not None
     run_followups(lf_db, deliver_pending(lf_db, sink, now=later))
-    assert len(events) == 1 and len(prequal) == 1  # done leads are never picked up again
+    assert len(events) == 1 and prequal == []  # done leads are never picked up again
 
 
 def test_migration_rerun_keeps_unfinished_followup_pending(lf_db):

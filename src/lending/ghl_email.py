@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from config.settings import get_settings
+from src.lending.cold_leads import SendChannel
 from src.lending.ghl_sms import GhlAccount, GhlSmsError, GhlSmsSender, Request, lending_ghl_account
 
 logger = logging.getLogger(__name__)
@@ -47,7 +48,8 @@ class GhlEmailSender(GhlSmsSender):
                  first_name: Optional[str] = None, deadline: Optional[datetime] = None) -> str:
         """Upsert the contact by email (and phone when known, so it stays one GHL contact), then send.
         Past ``deadline`` (UTC) nothing is sent and a non-ambiguous GhlSmsError is raised."""
-        contact = {"locationId": self._account.location_id, "email": to}
+        decision = self._cold_lead_check(phone, SendChannel.EMAIL, email=to)
+        contact: dict = {"locationId": self._account.location_id, "email": to}
         if phone:
             contact["phone"] = phone
         if first_name:
@@ -55,6 +57,9 @@ class GhlEmailSender(GhlSmsSender):
         contact_id = (self._post(self._http(), "/contacts/upsert", contact, "contact upsert").get("contact") or {}).get("id")
         if not contact_id:
             raise GhlSmsError("GHL contact upsert returned no contact id")
+        if decision.lift_dnd:  # a warm lead first reached cold: lift only the email do-not-disturb the cold push set
+            identity = {"locationId": self._account.location_id, "email": to, **({"phone": phone} if phone else {})}
+            self._lift_cold_dnd(contact_id, identity, decision.lift_dnd)
         if deadline is not None and datetime.now(timezone.utc) > deadline:
             raise GhlSmsError("deadline passed before send")
         sent = self._post(self._http(), "/conversations/messages",

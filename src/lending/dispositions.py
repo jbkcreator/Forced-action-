@@ -31,6 +31,7 @@ from config.lending_dispositions import (
     DISPOSITIONS,
     DNC_CODE,
     EVENT_FIELD_CANDIDATES,
+    LEGACY_DISPOSITION_ALIASES,
     SYSTEM_DISPOSITION_ALIASES,
     UNANSWERED_CODES,
 )
@@ -179,13 +180,15 @@ def parse_event(raw: Any) -> Optional[DialerCallEvent]:
 
 def normalize_code(raw: Optional[str]) -> tuple[Optional[str], bool]:
     """(our code or None, known). Case and spacing are forgiven; the dialer's built-in
-    results map through SYSTEM_DISPOSITION_ALIASES; anything else is unknown."""
+    results map through SYSTEM_DISPOSITION_ALIASES; anything else is unknown. A code of the old list (a dialer whose
+    Call Results are not switched yet) is kept as sent: the reporting sets still count it, and GATE_FAILED_NURTURE
+    keeps its gate signal, which NURTURE alone would lose."""
     if not raw:
         return None, True
     key = re.sub(r"[^A-Z0-9]+", "_", raw.upper()).strip("_")
     if key in CDR_ANSWERED_STATUSES:
         return None, True
-    if key in DISPOSITIONS:
+    if key in DISPOSITIONS or key in LEGACY_DISPOSITION_ALIASES:
         return key, True
     if key in SYSTEM_DISPOSITION_ALIASES:
         return SYSTEM_DISPOSITION_ALIASES[key], True

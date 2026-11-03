@@ -804,19 +804,19 @@ def test_route_file_holds_suppressed_lead(rdb):
     assert not any(e["lender_name"] == "Would Match" for e in _events(rdb, lead))
 
 
-def test_seed_from_t05_matrix_is_inert_idempotent_and_correct(rdb):
-    """B: the six T-05 rows seed the table as pending lenders; nothing routes until they are signed."""
+def test_seed_from_t05_matrix_is_inert_idempotent_and_correct(rdb, monkeypatch):
+    """B: the seven T-05 rows seed the table as pending lenders; nothing routes until they are signed and verified."""
     from migrations.apply_lending_lender_routing_seed import apply_to as seed
 
     conn = rdb.get_bind()
-    assert seed(conn) == 5  # six matrix rows, two of which share the primary lender
+    assert seed(conn) == 6  # seven matrix rows, two of which share the primary lender
     assert seed(conn) == 0  # idempotent
 
     lenders = rdb.execute(text(
         "SELECT id, name, is_primary, agreement_status, monthly_cap, construction_min_amount"
         "  FROM lending.lender_routing_rules ORDER BY priority"
     )).mappings().all()
-    assert len(lenders) == 5
+    assert len(lenders) == 6
     assert all(r["agreement_status"] == "pending" for r in lenders)
     primaries = [r for r in lenders if r["is_primary"]]
     assert len(primaries) == 1
@@ -824,16 +824,23 @@ def test_seed_from_t05_matrix_is_inert_idempotent_and_correct(rdb):
     assert rdb.execute(text("SELECT COUNT(*) FROM lending.lender_product_boxes")).scalar() == 0  # numbers live in T-05
     keyed = {r["name"]: r["rule_keys"] for r in rdb.execute(text(
         "SELECT name, rule_keys FROM lending.lender_routing_rules")).mappings()}
-    assert all(keyed.values()) and sum(len(v) for v in keyed.values()) == 6  # six T-05 rows, five lenders
+    assert all(keyed.values()) and sum(len(v) for v in keyed.values()) == 7  # seven T-05 rows, six lenders
+    assert keyed["Central Lending"] == ["central_lending"]
 
     flip = _make_lead(rdb, phone_suffix="1701")
     _route(rdb, flip)
     assert _fr(rdb, flip)["status"] == "held" and _fr(rdb, flip)["hold_reason"] == "no_match"
 
-    # Once signed, the seeded boxes route real files: primary first for flips and for $650k ground-up,
-    # the first signed ground-up overflow lender for $450k ground-up.
+    # L1: signed is not enough while the rules are placeholders.
     rdb.execute(text("UPDATE lending.lender_routing_rules SET agreement_status = 'signed'"))
     rdb.commit()
+    unverified = _make_lead(rdb, phone_suffix="1705")
+    _route(rdb, unverified)
+    assert _fr(rdb, unverified)["status"] == "held" and _fr(rdb, unverified)["hold_reason"] == "no_match"
+
+    # Once signed and verified, the seeded boxes route real files: primary first for flips and for $650k
+    # ground-up, the first signed ground-up overflow lender for $450k ground-up.
+    _verify_config_rules(monkeypatch)
     primary_name = primaries[0]["name"]
     flip2 = _make_lead(rdb, phone_suffix="1702")
     gu_650 = _make_lead(rdb, loan_type=LOAN_TYPE_GU, loan_amount=650_000, phone_suffix="1703")
@@ -971,12 +978,28 @@ def test_a_failing_route_hook_does_not_poison_the_enrichment_session(rdb, monkey
 FLIP_KEY = "generic_backflip_flip"  # a T-05 lender key (config/lender_matrix.py): flip, min loan $100,000
 
 
-def test_a_lender_with_rule_keys_is_judged_by_the_t05_values_not_by_its_own_boxes(rdb):
+def _verify_config_rules(monkeypatch) -> None:
+    """Every T-05 config lender marked confirmed (switch off), so routing tests are not held by the L1 gate."""
+    from dataclasses import replace
+
+    from config.lender_matrix import LENDER_MATRIX
+
+    monkeypatch.setattr("src.lending.routing.rules.LENDER_MATRIX",
+                        tuple(replace(r, verified=True, field_status={}) for r in LENDER_MATRIX))
+
+
+def _confirm_rule_rows(db: Session, lender_key: str) -> None:
+    db.execute(text("UPDATE lending.lender_rule_values SET status = 'confirmed' WHERE lender_key = :k"),
+               {"k": lender_key})
+
+
+def test_a_lender_with_rule_keys_is_judged_by_the_t05_values_not_by_its_own_boxes(rdb, monkeypatch):
     """T-05's numbers win. A box added directly on the lender (which the API forbids) is ignored."""
+    _verify_config_rules(monkeypatch)
     lender = _add_lender(rdb, name="T05 Lender", priority=1, rule_keys=[FLIP_KEY])
     _add_box(rdb, lender, loan_types=[LOAN_TYPE_FLIP])  # would accept anything; must be ignored
 
-    small = _make_lead(rdb, loan_amount=50_000, phone_suffix="3001")  # below the T-05 flip minimum of $100,000
+    small = _make_lead(rdb, loan_amount=50_000, phone_suffix="3001")  # below the safe-set minimum of $75,000 (Q1)
     fits = _make_lead(rdb, loan_amount=300_000, phone_suffix="3002")
     _route(rdb, small)
     _route(rdb, fits)
@@ -988,20 +1011,59 @@ def test_routing_follows_edits_to_the_t05_rule_values_when_the_switch_is_on(rdb,
     """Same switch as the fit card: LENDING_RULES_FROM_DB reads lending.lender_rule_values for routing too."""
     from config.settings import get_settings
 
+    _verify_config_rules(monkeypatch)
     _add_lender(rdb, name="Edited In Table", priority=1, rule_keys=[FLIP_KEY])
+    _confirm_rule_rows(rdb, FLIP_KEY)
     rdb.execute(text(
         "UPDATE lending.lender_rule_values SET value = '400000'::jsonb, status = 'confirmed'"
         " WHERE lender_key = :k AND field = 'min_loan_amount'"), {"k": FLIP_KEY})
     rdb.commit()
 
     switch_off = _make_lead(rdb, loan_amount=300_000, phone_suffix="3101")
-    _route(rdb, switch_off)  # switch off: the config value ($100,000) applies, the edit is not read
+    _route(rdb, switch_off)  # switch off: the config value (safe set, $75,000) applies, the edit is not read
     assert _fr(rdb, switch_off)["current_lender_name"] == "Edited In Table"
 
     monkeypatch.setattr(get_settings(), "lending_rules_from_db", True)
     switch_on = _make_lead(rdb, loan_amount=300_000, phone_suffix="3102")
     _route(rdb, switch_on)  # switch on: the edited minimum ($400,000) applies
     assert _fr(rdb, switch_on)["status"] == "held"
+    above = _make_lead(rdb, loan_amount=450_000, phone_suffix="3103")
+    _route(rdb, above)  # held above for the minimum, not for verification
+    assert _fr(rdb, above)["current_lender_name"] == "Edited In Table"
+
+
+def test_a_signed_lender_with_a_placeholder_rule_is_never_routed_to(rdb, monkeypatch):
+    """L1: nothing routes to an unverified lender. One placeholder field is enough to keep it out."""
+    from config.settings import get_settings
+
+    monkeypatch.setattr(get_settings(), "lending_rules_from_db", True)
+    _add_lender(rdb, name="Placeholder Lender", priority=1, rule_keys=[FLIP_KEY])
+    _confirm_rule_rows(rdb, FLIP_KEY)
+    rdb.execute(text("UPDATE lending.lender_rule_values SET status = 'placeholder'"
+                     " WHERE lender_key = :k AND field = 'credit_floor'"), {"k": FLIP_KEY})
+    rdb.commit()
+    lead = _make_lead(rdb, loan_amount=300_000, phone_suffix="3401")
+    _route(rdb, lead)
+    assert _fr(rdb, lead)["status"] == "held" and _fr(rdb, lead)["hold_reason"] == "no_match"
+    assert not any(e["lender_name"] == "Placeholder Lender" for e in _events(rdb, lead))
+
+    rdb.execute(text("UPDATE lending.lender_rule_values SET status = 'confirm_at_submission'"
+                     " WHERE lender_key = :k AND field = 'credit_floor'"), {"k": FLIP_KEY})
+    rdb.commit()
+    later = _make_lead(rdb, loan_amount=300_000, phone_suffix="3402")
+    _route(rdb, later)  # confirm_at_submission is Josh's decision, not a placeholder
+    assert _fr(rdb, later)["current_lender_name"] == "Placeholder Lender"
+
+
+def test_an_unverified_lender_is_skipped_for_the_next_verified_one(rdb):
+    """A seeded placeholder lender ahead in the waterfall never takes the file; Josh's own boxes still route."""
+    _add_lender(rdb, name="RCN Capital", priority=1, rule_keys=["rcn_capital"])
+    own = _add_lender(rdb, name="Own Box", priority=2)
+    _add_box(rdb, own, loan_types=[LOAN_TYPE_FLIP])
+    lead = _make_lead(rdb, phone_suffix="3501")
+    _route(rdb, lead)
+    assert _fr(rdb, lead)["current_lender_name"] == "Own Box"
+    assert not any(e["lender_name"] == "RCN Capital" for e in _events(rdb, lead))
 
 
 def test_a_lender_with_no_rules_at_all_is_never_routed_to(rdb):
@@ -1763,11 +1825,11 @@ def test_reseeding_never_adds_a_duplicate_of_a_renamed_lender(rdb):
     from migrations.apply_lending_lender_routing_seed import apply_to as seed
 
     conn = rdb.get_bind()
-    assert seed(conn) == 5
+    assert seed(conn) == 6
     rdb.execute(text("UPDATE lending.lender_routing_rules SET name = 'Renamed Primary' WHERE is_primary"))
     rdb.commit()
     assert seed(conn) == 0
-    assert rdb.execute(text("SELECT COUNT(*) FROM lending.lender_routing_rules")).scalar() == 5
+    assert rdb.execute(text("SELECT COUNT(*) FROM lending.lender_routing_rules")).scalar() == 6
 
 
 # ── Slack lender form (R1.4: edit the rules from Slack, not a web screen) ─────

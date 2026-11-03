@@ -43,6 +43,15 @@ OPT_OUT_POLL_SECONDS = 15        # FA opt-out poller interval; worst case well i
 # GoHighLevel opt-out sync: every lending opt-out becomes DND on the GHL contact.
 GHL_DND_CHANNELS = ("SMS", "Email", "GMB", "FB", "WhatsApp", "Call")
 GHL_OPT_OUT_TAG = "lending-opt-out"
+# Cold leads in GHL (client rule: no texts or emails unless they agree to texts on a call): every
+# messaging channel is do-not-disturb, calls stay open. The SMS sender lifts SMS once consent is recorded.
+COLD_LEAD_DND_CHANNELS = tuple(channel for channel in GHL_DND_CHANNELS if channel != "Call")
+GHL_TAG_COLD_LEAD = "ndl-cold"
+# The do-not-disturb message set on a cold push. Warming up lifts only do-not-disturb carrying this message, so a
+# genuine opt-out (set with another message) is never lifted.
+COLD_LEAD_DND_MESSAGE = "Cold lead: calls only"
+# A phone called from GHL inside this window belongs to GHL calling (matches the 14-day follow-up cycle).
+GHL_CALLING_LOOKBACK_DAYS = 14
 GHL_DND_BATCH = 50               # GHL updates per poll cycle (GHL client throttles ~2 req/s)
 GHL_BACKSTOP_PAGE_SIZE = 100     # GHL contact search page size (DND backstop)
 GHL_BACKSTOP_MAX_PAGES = 50      # bound per backstop run (~5,000 DND contacts)
@@ -154,6 +163,8 @@ class ReasonCode(str, Enum):
     BACKFLIP_CONFLICT = "BACKFLIP_CONFLICT"
     BACKFLIP_FEED_STALE = "BACKFLIP_FEED_STALE"
     BACKFLIP_FEED_UNAVAILABLE = "BACKFLIP_FEED_UNAVAILABLE"
+    # Worked from GHL (warm lead, or called from GHL recently): never dialed by BatchDialer too.
+    GHL_CALLING = "GHL_CALLING"
 
 
 class RemovalReason(str, Enum):
@@ -165,8 +176,18 @@ class RemovalReason(str, Enum):
     ATTEMPT_CAP = "attempt_cap"
     SCRUB_STALE = "scrub_stale"
     ATTEMPT_HISTORY = "attempt_history"
+    # The phone is worked from GHL (a LendingFlow / website lead, or called from GHL recently): deleted from the
+    # dialer by the sweep, never restored.
+    GHL_CALLING = "ghl_calling"
     # The lead was booked or reached by a person in GHL: deleted from the dialer, never restored.
     HANDLED_IN_GHL = "handled_in_ghl"
+
+
+# Removals that delete the dialer contact for good (never restored): an opt-out, a phone handed to GHL
+# calling, and a lead handled in GHL. Every other reason only leaves the campaign and can be restored.
+PERMANENT_REMOVAL_REASONS: frozenset[RemovalReason] = frozenset({
+    RemovalReason.OPT_OUT, RemovalReason.GHL_CALLING, RemovalReason.HANDLED_IN_GHL,
+})
 
 
 def validate_lending_compliance_config() -> None:

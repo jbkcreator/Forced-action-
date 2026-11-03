@@ -196,3 +196,10 @@ def global_halt_off(monkeypatch):
     """The lending emergency halt reads Postgres before every GHL send and dialer load; tests run with it off.
     Tests of the halt itself swap in their own session factory."""
     monkeypatch.setattr("src.lending.global_halt._session_factory", _NotHalted)
+
+
+@pytest.fixture(autouse=True)
+def no_cold_leads(monkeypatch):
+    """The cold-lead check reads Postgres before every GHL text and email; tests see no cold leads by default.
+    Tests of the check itself swap in their own session factory."""
+    monkeypatch.setattr("src.lending.cold_leads._session_factory", _NotHalted)
