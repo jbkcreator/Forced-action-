@@ -43,7 +43,7 @@ _CLAIM_UNMATCHED = text(
 
 
 def _claim_missing(minutes: int) -> list[tuple]:
-    ghl_since = get_settings().lending_ghl_outcomes_live_since
+    ghl_since = getattr(get_settings(), "lending_ghl_outcomes_live_since", None)
     sources = f"({_BATCHDIALER} OR {_GHL})" if ghl_since else _BATCHDIALER
     params: dict[str, Any] = {"m": minutes}
     if ghl_since:
@@ -103,7 +103,8 @@ def _alert_unmatched(client: Any, channel: str) -> int:
     """One post listing GHL outcomes that never found their call. Phones are shown as the last 4 digits only."""
     try:
         with lending_session() as db:
-            rows = db.execute(_CLAIM_UNMATCHED, {"h": GHL_DISPOSITION_UNMATCHED_ALERT_HOURS}).all()
+            with db.begin_nested():  # savepoint: a missing table must not abort the caller's transaction
+                rows = db.execute(_CLAIM_UNMATCHED, {"h": GHL_DISPOSITION_UNMATCHED_ALERT_HOURS}).all()
             db.commit()
     except Exception as exc:  # the table may not be migrated yet; class only
         logger.warning("[lending] unmatched GHL outcome check skipped: %s", type(exc).__name__)
