@@ -29,8 +29,8 @@ def env(monkeypatch):
     from src.api.deps import get_db
 
     monkeypatch.setattr(get_settings(), "lending_ghl_webhook_secret", SecretStr(SECRET), raising=False)
-    calls = {"recorded": [], "delivered": [], "matched": [7]}
-    monkeypatch.setattr(r, "record_disposition_event", lambda db, ev, body: calls["recorded"].append(ev) or 11)
+    calls = {"recorded": [], "delivered": [], "matched": [7], "duplicate": False}
+    monkeypatch.setattr(r, "record_disposition_event", lambda db, ev, body: calls["recorded"].append(ev) or (11, calls["duplicate"]))
     monkeypatch.setattr(r, "attach_pending", lambda db, now: list(calls["matched"]))
     monkeypatch.setattr(r, "deliver_matched", lambda ids: calls["delivered"].extend(ids))
     db = _Db()
@@ -43,7 +43,7 @@ def env(monkeypatch):
 def test_records_matches_commits_then_delivers(env):
     client, db, calls = env
     resp = client.post("/webhooks/lending/ghl-disposition", headers=HEADERS, json=BODY)
-    assert resp.status_code == 200 and resp.json() == {"recorded": True, "matched": 1}
+    assert resp.status_code == 200 and resp.json() == {"recorded": True, "duplicate": False, "matched": 1}
     assert calls["recorded"][0].code == "BOOKED" and db.commits == 1
     assert calls["delivered"] == [7]
 
@@ -52,7 +52,14 @@ def test_waits_for_the_call_when_nothing_matches(env):
     client, _, calls = env
     calls["matched"] = []
     resp = client.post("/webhooks/lending/ghl-disposition", headers=HEADERS, json=BODY)
-    assert resp.json() == {"recorded": True, "matched": 0} and calls["delivered"] == []
+    assert resp.json() == {"recorded": True, "duplicate": False, "matched": 0} and calls["delivered"] == []
+
+
+def test_a_repeated_delivery_is_acknowledged_as_a_duplicate(env):
+    client, _, calls = env
+    calls["duplicate"], calls["matched"] = True, []
+    resp = client.post("/webhooks/lending/ghl-disposition", headers=HEADERS, json=BODY)
+    assert resp.status_code == 200 and resp.json() == {"recorded": True, "duplicate": True, "matched": 0}
 
 
 def test_wrong_secret_is_refused(env):

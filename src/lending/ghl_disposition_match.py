@@ -41,6 +41,7 @@ from config.lending_dispositions import (
     DNC_CODE,
     GHL_DISPOSITION_FIELD_CANDIDATES,
     GHL_DISPOSITION_LABELS,
+    GHL_DISPOSITION_DEDUPE_MINUTES,
     GHL_DISPOSITION_MATCH_BATCH,
     GHL_DISPOSITION_MATCH_WINDOW_MINUTES,
     GHL_DISPOSITION_PENDING_DAYS,
@@ -56,6 +57,19 @@ logger = logging.getLogger(__name__)
 _UNRESOLVED = frozenset({"null", "none", "undefined", "nan"})
 _TRUE = frozenset({"true", "yes", "y", "1", "gate_failed"})
 _FALSE = frozenset({"false", "no", "n", "0"})
+
+REASON_NO_DISPOSITION = "disposition is required (check the GHL merge field)"
+REASON_UNKNOWN_DISPOSITION = "disposition is not one of the call outcomes"
+REASON_NO_KEY = "phone or call_id is required"
+INVALID_EVENT_REASONS = frozenset({REASON_NO_DISPOSITION, REASON_UNKNOWN_DISPOSITION, REASON_NO_KEY})
+
+
+class InvalidDispositionEvent(InvalidEvent):
+    """An event that can never be used. ``reason`` is a fixed, client-safe message (one of INVALID_EVENT_REASONS)."""
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -104,19 +118,19 @@ def _gate_failed(raw: Optional[str]) -> Optional[bool]:
 
 
 def parse_event(body: Mapping[str, Any]) -> GhlDispositionEvent:
-    """The event, or InvalidEvent when it can never be used (no outcome, an outcome outside the 10, or nothing to
+    """The event, or InvalidDispositionEvent when it can never be used (no outcome, an outcome outside the 10, or nothing to
     match it on)."""
     raw = _value(body, "disposition")
     if not raw:
-        raise InvalidEvent("disposition is required (check the GHL merge field)")
+        raise InvalidDispositionEvent(REASON_NO_DISPOSITION, reason=REASON_NO_DISPOSITION)
     code = ghl_code(raw)
     if code is None:
-        raise InvalidEvent("disposition is not one of the call outcomes")
+        raise InvalidDispositionEvent(REASON_UNKNOWN_DISPOSITION, reason=REASON_UNKNOWN_DISPOSITION)
     raw_phone = _value(body, "phone")
     phone = normalize(raw_phone) if raw_phone else None
     call_id = _value(body, "call_id")
     if not phone and not call_id:
-        raise InvalidEvent("phone or call_id is required")
+        raise InvalidDispositionEvent(REASON_NO_KEY, reason=REASON_NO_KEY)
     return GhlDispositionEvent(
         contact_id=_value(body, "contact_id"), phone=phone, disposition_raw=raw[:100], code=code,
         ghl_call_id=call_id[:90] if call_id else None, caller_name=(_value(body, "user") or "")[:200] or None,
@@ -132,14 +146,36 @@ _INSERT = text("""
 """)
 
 
-def record_event(db, ev: GhlDispositionEvent, body: Mapping[str, Any]) -> int:
-    """Store the event (one row per delivery: a repeat is harmless, the second match finds the call already set)."""
-    return db.execute(_INSERT, {
+# A GHL webhook retry repeats the same body: an identical event received within GHL_DISPOSITION_DEDUPE_MINUTES is that
+# retry, not a second outcome. The advisory lock (released at commit) makes two concurrent retries wait for each other.
+_LOCK_DELIVERY = text("SELECT pg_advisory_xact_lock(hashtext(:key))")
+_FIND_REPEAT = text("""
+    SELECT id FROM lending.ghl_disposition_events
+     WHERE code = :code AND phone IS NOT DISTINCT FROM :phone AND ghl_call_id IS NOT DISTINCT FROM :call_id
+       AND called_at IS NOT DISTINCT FROM :called_at AND caller_name IS NOT DISTINCT FROM :caller
+       AND received_at > now() - make_interval(mins => :minutes)
+     ORDER BY id LIMIT 1
+""")
+
+
+def record_event(db, ev: GhlDispositionEvent, body: Mapping[str, Any]) -> tuple[int, bool]:
+    """Store the event once: returns ``(event id, duplicate)``; a repeated delivery returns the stored event's id."""
+    key = "|".join(str(v) for v in ("ghl-disposition", ev.phone, ev.code, ev.ghl_call_id, ev.called_at,
+                                    ev.caller_name))
+    db.execute(_LOCK_DELIVERY, {"key": key})
+    existing = db.execute(_FIND_REPEAT, {
+        "code": ev.code, "phone": ev.phone, "call_id": ev.ghl_call_id, "called_at": ev.called_at,
+        "caller": ev.caller_name, "minutes": GHL_DISPOSITION_DEDUPE_MINUTES,
+    }).scalar()
+    if existing is not None:
+        return existing, True
+    event_id = db.execute(_INSERT, {
         "contact_id": ev.contact_id, "phone": ev.phone, "raw": ev.disposition_raw, "code": ev.code,
         "gate_failed": ev.gate_failed, "call_id": ev.ghl_call_id, "caller": ev.caller_name, "called_at": ev.called_at,
         "raw_event": json.dumps({k: body.get(k) for k in ("contact_id", "disposition", "call_id", "called_at")},
                                 default=str),
     }).scalar_one()
+    return event_id, False
 
 
 def choose_call(event: Mapping[str, Any], calls: Iterable[Mapping[str, Any]],
@@ -158,19 +194,34 @@ def choose_call(event: Mapping[str, Any], calls: Iterable[Mapping[str, Any]],
     return max(open_calls, key=lambda c: c["call_started_at"], default=None)
 
 
+# Only events that have a call to land on are read, so outcomes that cannot match yet never fill the batch and hold
+# back newer ones. Mirrors choose_call: the exact call (unless it is DNC and the event is not), else an open outbound
+# GHL call to the phone within the window.
 _PENDING = text("""
-    SELECT id, phone, code, ghl_call_id, called_at, received_at, caller_name, gate_failed
-      FROM lending.ghl_disposition_events
-     WHERE matched_call_id IS NULL AND received_at >= :since
-     ORDER BY received_at, id LIMIT :limit FOR UPDATE SKIP LOCKED
+    SELECT e.id, e.phone, e.code, e.ghl_call_id, e.called_at, e.received_at, e.caller_name, e.gate_failed
+      FROM lending.ghl_disposition_events e
+     WHERE e.matched_call_id IS NULL AND e.received_at >= :since
+       AND EXISTS (SELECT 1 FROM lending.call_dispositions d
+                    WHERE d.call_source = :source AND d.direction = 'outbound'
+                      AND ((e.ghl_call_id IS NOT NULL AND d.dialer_call_id = :prefix || e.ghl_call_id
+                            AND (d.disposition IS DISTINCT FROM :dnc OR e.code = :dnc))
+                        OR (e.ghl_call_id IS NULL AND d.phone = e.phone AND d.disposition IS NULL
+                            AND d.call_started_at BETWEEN COALESCE(e.called_at, e.received_at) - make_interval(mins => :w)
+                                                      AND COALESCE(e.called_at, e.received_at) + make_interval(mins => :w))))
+     ORDER BY e.received_at, e.id LIMIT :limit FOR UPDATE OF e SKIP LOCKED
 """)
 # One read for every pending event: its exact call, or the open outbound GHL calls to its phone around its time.
+# Locked in id order (two matchers never deadlock): a concurrent writer waits, and Postgres re-checks the WHERE on the
+# latest row version, so the rows read here stay current until commit.
 _CANDIDATES = text("""
     SELECT id, dialer_call_id, phone, call_started_at, disposition, unfunded_cause FROM lending.call_dispositions
      WHERE call_source = :source AND direction = 'outbound'
        AND (dialer_call_id = ANY(:call_ids)
             OR (phone = ANY(:phones) AND disposition IS NULL AND call_started_at BETWEEN :lo AND :hi))
+     ORDER BY id FOR UPDATE
 """)
+# The write repeats choose_call's rule: only an open call or the exact call the event names, and a DNC is never
+# replaced by another outcome.
 _SET_CALL = text("""
     UPDATE lending.call_dispositions SET disposition = :d, disposition_at = clock_timestamp(),
            disposition_list_version = :v, unfunded_cause = COALESCE(unfunded_cause, :cause), gate_failed = :gate,
@@ -178,7 +229,8 @@ _SET_CALL = text("""
                               THEN COALESCE(:caller, caller_name) ELSE caller_name END,
            unfunded_cause_provisional = CASE WHEN unfunded_cause IS NULL AND :cause IS NOT NULL THEN true
                                              ELSE unfunded_cause_provisional END
-     WHERE id = :id
+     WHERE id = :id AND (disposition IS NULL OR dialer_call_id = :exact)
+       AND (disposition IS DISTINCT FROM :dnc OR :d = :dnc)
 """)
 _SET_EVENT = text("UPDATE lending.ghl_disposition_events SET matched_call_id = :call, matched_at = :at WHERE id = :id")
 
@@ -206,8 +258,10 @@ def attach_pending(db, now: datetime, *, window_minutes: int = GHL_DISPOSITION_M
 
 
 def _attach(db, now: datetime, window: timedelta, window_minutes: int) -> list[int]:
-    events = [dict(e) for e in db.execute(_PENDING, {"since": now - timedelta(days=GHL_DISPOSITION_PENDING_DAYS),
-                                                      "limit": GHL_DISPOSITION_MATCH_BATCH}).mappings().all()]
+    events = [dict(e) for e in db.execute(_PENDING, {
+        "since": now - timedelta(days=GHL_DISPOSITION_PENDING_DAYS), "limit": GHL_DISPOSITION_MATCH_BATCH,
+        "source": CALL_SOURCE_GHL, "prefix": GHL_CALL_ID_PREFIX, "dnc": DNC_CODE, "w": window_minutes,
+    }).mappings().all()]
     if not events:
         return []
     calls = _candidates(db, events, window)
@@ -216,20 +270,25 @@ def _attach(db, now: datetime, window: timedelta, window_minutes: int) -> list[i
     for c in calls:
         by_phone.setdefault(c["phone"], []).append(c)
     matched: list[int] = []
+    call_writes: list[dict[str, Any]] = []
+    event_writes: list[dict[str, Any]] = []
     for event in events:
-        pool = ([by_id[k]] if (k := f"{GHL_CALL_ID_PREFIX}{event['ghl_call_id']}") in by_id else []) \
-            if event.get("ghl_call_id") else by_phone.get(event.get("phone"), [])
+        exact = f"{GHL_CALL_ID_PREFIX}{event['ghl_call_id']}" if event.get("ghl_call_id") else None
+        pool = ([by_id[exact]] if exact in by_id else []) if exact else by_phone.get(event.get("phone"), [])
         call = choose_call(event, pool, window_minutes)
         if call is None:
             continue
         cause = DEFAULT_CAUSE.get(event["code"]) if not call.get("unfunded_cause") else None
-        db.execute(_SET_CALL, {"d": event["code"], "v": DISPOSITION_LIST_VERSION, "cause": cause, "id": call["id"],
-                             "gate": event.get("gate_failed"), "caller": event.get("caller_name"),
-                             "unknown_caller": GHL_UNKNOWN_CALLER})
-        db.execute(_SET_EVENT, {"call": call["id"], "at": now, "id": event["id"]})
+        call_writes.append({"d": event["code"], "v": DISPOSITION_LIST_VERSION, "cause": cause, "id": call["id"],
+                            "gate": event.get("gate_failed"), "caller": event.get("caller_name"),
+                            "unknown_caller": GHL_UNKNOWN_CALLER, "exact": exact, "dnc": DNC_CODE})
+        event_writes.append({"call": call["id"], "at": now, "id": event["id"]})
         call["disposition"] = event["code"]  # taken: a second outcome for the same phone needs another call
         if call["id"] not in matched:
             matched.append(call["id"])
+    if call_writes:
+        db.execute(_SET_CALL, call_writes)
+        db.execute(_SET_EVENT, event_writes)
     if matched:
         logger.info("[ghl-disposition] matched %d outcome(s) onto GHL calls", len(matched))
     return matched

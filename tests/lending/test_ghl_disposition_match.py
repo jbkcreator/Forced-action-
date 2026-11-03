@@ -155,9 +155,10 @@ def test_attach_sets_the_outcome_and_links_the_event():
     assert m.attach_pending(db, NOW) == [7]
     call_sql, call_params = db.updates[0]
     assert "lending.call_dispositions" in call_sql and "gate_failed = :gate" in call_sql
+    (call_params,) = call_params  # one batched statement: a list of rows
     assert call_params["d"] == "CALLBACK_REQUESTED" and call_params["id"] == 7 and call_params["cause"] == "timing"
     event_sql, event_params = db.updates[1]
-    assert "lending.ghl_disposition_events" in event_sql and event_params == {"call": 7, "at": NOW, "id": 1}
+    assert "lending.ghl_disposition_events" in event_sql and event_params == [{"call": 7, "at": NOW, "id": 1}]
 
 
 def test_unmatched_event_is_left_pending():

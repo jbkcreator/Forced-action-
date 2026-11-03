@@ -6,7 +6,8 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from typing import Callable, Optional
+from collections.abc import Mapping
+from typing import Any, Callable, Optional
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -47,32 +48,49 @@ def _propagate_dnc(db: Session, *, row_id, phone: str, call_id: str, seat) -> bo
     ).scalar() == "dialer_pending")
 
 
+def read_contact_fields(ev: DialerCallEvent, dialer) -> Optional[Mapping[str, Any]]:
+    """The caller-set contact custom fields of an outbound call (one quick dialer read), or None when it failed."""
+    try:
+        return dialer.get_contact_customfields(ev.contact_id, quick=True)
+    except Exception as exc:  # class only: the message may carry request detail
+        logger.warning("[lending] call %s: could not read contact custom fields: %s", ev.call_id, type(exc).__name__)
+        return None
+
+
+def _reads_contact_fields(ev: DialerCallEvent, row_phone: Optional[str], dialer) -> bool:
+    return bool(row_phone) and ev.direction == "outbound" and bool(ev.contact_id) and dialer is not None
+
+
 def capture_consent(db: Session, ev: DialerCallEvent, row_phone: Optional[str], caller_name: Optional[str], dialer,
-                    *, row_id: Optional[int] = None) -> bool:
-    """Answered inbound call = consent; outbound = the caller-set ``text_consent`` contact field. The same read sets
-    the call's ``gate_failed`` when the caller ticked the ``gate_failed`` contact field (needs ``row_id``).
-    Returns False only when the dialer read failed, so the caller can retry instead of marking it checked."""
+                    *, fields: Optional[Mapping[str, Any]] = None) -> bool:
+    """Answered inbound call = consent; outbound = the caller-set ``text_consent`` contact field (``fields`` when the
+    caller already read them, else read here). Returns False only when the dialer read failed, so the caller can
+    retry instead of marking it checked."""
     if not row_phone:
         return True
     if ev.direction == "inbound" and (ev.duration or 0) > 0:
         record_consent(db, row_phone, "inbound_call", call_id=ev.call_id)
         return True
-    if ev.direction == "outbound" and ev.contact_id and dialer is not None:
-        try:
-            fields = dialer.get_contact_customfields(ev.contact_id, quick=True)
-        except Exception as exc:  # class only: the message may carry request detail
-            logger.warning("[lending] call %s: could not read contact custom fields: %s", ev.call_id, type(exc).__name__)
-            return False
+    if _reads_contact_fields(ev, row_phone, dialer):
+        if fields is None:
+            fields = read_contact_fields(ev, dialer)
+            if fields is None:
+                return False
         if str(fields.get(TEXT_CONSENT_FIELD, "")).strip().lower() == TEXT_CONSENT_YES:
             record_consent(db, row_phone, "on_call_yes", call_id=ev.call_id, captured_by=caller_name)
-        if row_id is not None and str(fields.get(GATE_FAILED_FIELD, "")).strip().lower() in GATE_FAILED_TRUE:
-            db.execute(text("UPDATE lending.call_dispositions SET gate_failed = true WHERE id = :id"), {"id": row_id})
     return True
+
+
+def capture_gate_flag(db: Session, row_id: int, fields: Optional[Mapping[str, Any]]) -> None:
+    """Sets the call's ``gate_failed`` when the caller ticked the ``gate_failed`` contact field."""
+    if fields and str(fields.get(GATE_FAILED_FIELD, "")).strip().lower() in GATE_FAILED_TRUE:
+        db.execute(text("UPDATE lending.call_dispositions SET gate_failed = true WHERE id = :id"), {"id": row_id})
 
 
 def _check_consent(db: Session, ev: DialerCallEvent, row_id: int, dialer) -> None:
     """Once per connected, recently ended call, and again when a disposition lands after the last check
-    (callers often set the field during wrap-up, after the hang-up). A failed dialer read is not stamped."""
+    (callers often set the field during wrap-up, after the hang-up). The contact fields are read once and feed both
+    consent and the gate flag. A failed dialer read is not stamped."""
     row = db.execute(
         text("SELECT phone, caller_name, direction, dialer_contact_id, talk_duration_sec "
              "FROM lending.call_dispositions WHERE id = :id AND talk_duration_sec > 0 "
@@ -85,10 +103,15 @@ def _check_consent(db: Session, ev: DialerCallEvent, row_id: int, dialer) -> Non
     phone, caller_name, direction, contact_id, duration = row
     if dialer is None:
         dialer = get_dialer()
-    checked = capture_consent(db, dataclasses.replace(ev, direction=direction, contact_id=contact_id, duration=duration),
-                              phone, caller_name, dialer, row_id=row_id)
-    if checked:
-        db.execute(text("UPDATE lending.call_dispositions SET consent_checked_at = clock_timestamp() WHERE id = :id"), {"id": row_id})
+    call = dataclasses.replace(ev, direction=direction, contact_id=contact_id, duration=duration)
+    fields: Optional[Mapping[str, Any]] = None
+    if _reads_contact_fields(call, phone, dialer):
+        fields = read_contact_fields(call, dialer)
+        if fields is None:
+            return
+    capture_consent(db, call, phone, caller_name, dialer, fields=fields if fields is not None else {})
+    capture_gate_flag(db, row_id, fields)
+    db.execute(text("UPDATE lending.call_dispositions SET consent_checked_at = clock_timestamp() WHERE id = :id"), {"id": row_id})
 
 
 def process_event(db: Session, ev: DialerCallEvent, dialer=None) -> RecordedCall:

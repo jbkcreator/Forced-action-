@@ -129,6 +129,7 @@ GHL_DISPOSITION_FIELD_CANDIDATES: dict[str, tuple[str, ...]] = {
 GHL_DISPOSITION_MATCH_WINDOW_MINUTES = 30  # a call started this close to the outcome's time is its call
 GHL_DISPOSITION_PENDING_DAYS = 2           # an outcome still unmatched after this is no longer retried
 GHL_DISPOSITION_MATCH_BATCH = 200
+GHL_DISPOSITION_DEDUPE_MINUTES = 10      # an identical delivery within this is a webhook retry, stored once
 GHL_DISPOSITION_UNMATCHED_ALERT_HOURS = 2  # an outcome with no call after this is posted once to #dial-tasks
 GHL_MISSING_DISPOSITION_GRACE_MINUTES = 30  # a connected outbound GHL call with no outcome after this is flagged
 # GHL call outcomes (ghl_calls.call_state) for David's activity: a voicemail, and a call where someone talked.

@@ -29,7 +29,12 @@ from sqlalchemy import text
 from config.settings import get_settings
 from src.api.deps import get_db
 from src.lending.after_hours_intake import record_intake
-from src.lending.ghl_disposition_match import attach_pending, deliver_matched, parse_event as parse_disposition_event
+from src.lending.ghl_disposition_match import (
+    InvalidDispositionEvent,
+    attach_pending,
+    deliver_matched,
+    parse_event as parse_disposition_event,
+)
 from src.lending.ghl_disposition_match import record_event as record_disposition_event
 from src.lending.ghl_consent_events import InvalidEvent, field as _field, record_ghl_opt_out, record_inbound_consent
 from src.lending.webhook_failures import AFTER_HOURS_INTAKE, GHL_OPT_OUT, GHL_TEXT_CONSENT, report_webhook_failure
@@ -149,11 +154,11 @@ def ghl_disposition(
     _verify_secret(x_webhook_secret)
     try:
         event = parse_disposition_event(body)
-    except InvalidEvent as exc:
-        logger.warning("[lending-ghl] disposition webhook refused: %s", exc)
-        raise HTTPException(status_code=422, detail=str(exc)) from None
+    except InvalidDispositionEvent as exc:
+        logger.warning("[lending-ghl] disposition webhook refused: %s", exc.reason)
+        raise HTTPException(status_code=422, detail=exc.reason) from None
     try:
-        record_disposition_event(db, event, body)
+        _, duplicate = record_disposition_event(db, event, body)
         matched = attach_pending(db, datetime.now(timezone.utc))
         db.commit()
     except Exception as exc:
@@ -162,7 +167,7 @@ def ghl_disposition(
         raise HTTPException(status_code=500, detail="Call outcome could not be recorded") from exc
     if matched:
         background.add_task(deliver_matched, matched)
-    return {"recorded": True, "matched": len(matched)}
+    return {"recorded": True, "duplicate": duplicate, "matched": len(matched)}
 
 
 @router.post("/after-hours-intake")

@@ -115,7 +115,7 @@ def test_pending_query_reads_caller_and_gate():
 def test_match_writes_gate_failed_and_fills_unknown_caller():
     db = _MatchDb([_ev()], [_call()])
     assert m.attach_pending(db, NOW) == [7]
-    sql, params = db.updates[0]
+    sql, (params,) = db.updates[0]
     assert "gate_failed = :gate" in sql
     assert "caller_name = CASE WHEN caller_name IS NULL OR caller_name = :unknown_caller" in sql
     assert params["gate"] is True and params["caller"] == "David Willis" and params["unknown_caller"] == "GHL (unknown)"
@@ -124,7 +124,7 @@ def test_match_writes_gate_failed_and_fills_unknown_caller():
 def test_match_without_gate_or_user_passes_nulls():
     db = _MatchDb([_ev(gate_failed=None, caller_name=None)], [_call()])
     m.attach_pending(db, NOW)
-    _, params = db.updates[0]
+    _, (params,) = db.updates[0]
     assert params["gate"] is None and params["caller"] is None
 
 
@@ -188,12 +188,12 @@ def _bd_event():
 def test_bd_gate_failed_field_sets_the_column():
     assert cfg.GATE_FAILED_FIELD == "gate_failed"
     db = _PipeDb()
-    assert cp.capture_consent(db, _bd_event(), "+18135550142", "x", _Dialer({"gate_failed": "Yes"}), row_id=5)
+    cp.capture_gate_flag(db, 5, {"gate_failed": "Yes"})
     gate = [p for s, p in db.sql if "SET gate_failed = true" in s]
     assert gate == [{"id": 5}]
 
 
 def test_bd_without_gate_field_leaves_the_column():
     db = _PipeDb()
-    cp.capture_consent(db, _bd_event(), "+18135550142", "x", _Dialer({"gate_failed": "no"}), row_id=5)
+    cp.capture_gate_flag(db, 5, {"gate_failed": "no"})
     assert not [s for s, _ in db.sql if "gate_failed" in s]
