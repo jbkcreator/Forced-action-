@@ -23,6 +23,7 @@ from config.lending_lendingflow import (
     is_missing_lead_id,
 )
 from config.settings import get_settings
+from src.lending.cold_leads import reconcile_warm_contact
 from src.lending.global_halt import is_globally_halted
 from src.lending.ghl_account import GhlAccount, ghl_headers, lending_ghl_account
 from src.lending.web_leads import DeliveryError, PushResult
@@ -81,6 +82,10 @@ class LendingFlowGhlSink:
     def push(self, lead: Mapping[str, Any]) -> PushResult:
         contact_id = self._upsert_contact(lead)
         self._call("add tags", "POST", f"/contacts/{contact_id}/tags", json={"tags": _tags(lead)})
+        if not lead.get("suppressed"):  # an opted-out lead keeps every do-not-disturb
+            reconcile_warm_contact(self._call, self._account.location_id, contact_id, lead["phone"],
+                                   text_consent=lead["consent_status"] == "present", log_prefix="[lendingflow-ghl]",
+                                   email=lead.get("email"))
         ready = _intro_ready_tags(lead)
         if ready:  # its own call, after the other tags are in place; a failure fails the push and the sweep retries it
             self.add_intro_ready_tag(contact_id)

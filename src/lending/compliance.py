@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import text
 
 from src.lending.dialer_removal import DialerRemovalUndecided
+from src.lending.ghl_calling import ghl_calling_phones
 from config.lending_compliance import (
     AREA_CODE_TZ,
     ATTEMPT_HISTORY_BUSINESS_DAYS,
@@ -229,6 +230,11 @@ def filter_loadable(
     exhausted = _attempt_history_exhausted_phones(db, candidates, now) if candidates else set()
     by_phone.update({p: _blocked(p, ReasonCode.ATTEMPT_HISTORY_EXCEEDED) for p in exhausted})
     candidates = [p for p in candidates if p not in exhausted]
+
+    # Before the scrub: a phone worked from GHL is never loaded, so it is never paid for.
+    ghl_owned = ghl_calling_phones(db, candidates, now=now)
+    by_phone.update({p: _blocked(p, ReasonCode.GHL_CALLING) for p in ghl_owned})
+    candidates = [p for p in candidates if p not in ghl_owned]
 
     if dnc_scrub:
         scrubs = _stored_scrubs(db, candidates) if candidates else {}
@@ -672,6 +678,7 @@ class SweepResult:
     pulled: int
     restored: int
     skipped_locked: bool = False
+    moved_to_ghl: int = 0
 
 
 SWEEP_LOCK_KEY = DIALER_SWEEP_LOCK_KEY
@@ -825,6 +832,9 @@ def sweep_dialer_pool(
 
     held = {r[0] for r in db.execute(text("SELECT phone FROM lending.dialer_holds WHERE released_at IS NULL"))}
     loaded = sorted({p for p in (normalize_phone(x) for x in (loaded_phones or _default_loaded_phones)(db)) if p})
+    moved = _move_to_ghl_calling(db, loaded, now, dialer_remover)
+    held -= moved
+    loaded = [p for p in loaded if p not in moved]
     active = [p for p in loaded if p not in held]
     counts = _attempt_counts(db, active, now) if active else {}
     stale = _stale_scrub_phones(db, active, now) if active else set()
@@ -849,9 +859,36 @@ def sweep_dialer_pool(
             pulled += len(done)
 
     restored = _release_holds(db, sorted(held), now, dialer_restorer)
-    if pulled or restored:
-        logger.info("[lending-compliance] dialer sweep pulled=%d restored=%d", pulled, restored)
-    return SweepResult(pulled=pulled, restored=restored)
+    if pulled or restored or moved:
+        logger.info("[lending-compliance] dialer sweep pulled=%d restored=%d moved_to_ghl=%d",
+                    pulled, restored, len(moved))
+    return SweepResult(pulled=pulled, restored=restored, moved_to_ghl=len(moved))
+
+
+def _move_to_ghl_calling(db, loaded: list[str], now: datetime,
+                         dialer_remover: Optional[DialerRemover]) -> set[str]:
+    """Delete from the dialer every loaded phone GHL now works, then close its load row and any open hold.
+
+    A row is closed only after the dialer confirmed the delete, so a failed removal stays active and the
+    next cycle retries it. Permanent: a later load skips the phone while GHL still owns it.
+    """
+    owned = sorted(ghl_calling_phones(db, loaded, now=now))
+    if not owned:
+        return set()
+    removed = set(_remove_from_dialer(owned, dialer_remover, RemovalReason.GHL_CALLING))
+    if removed:
+        params = [{"phone": p, "now": now, "why": RemovalReason.GHL_CALLING.value} for p in sorted(removed)]
+        db.execute(
+            text("UPDATE lending.dialer_load_records SET active = false, deactivated_at = :now, "
+                 "deactivation_reason = :why WHERE active AND phone = :phone"),
+            params,
+        )
+        db.execute(
+            text("UPDATE lending.dialer_holds SET released_at = :now, release_reason = :why "
+                 "WHERE phone = :phone AND released_at IS NULL"),
+            params,
+        )
+    return removed
 
 
 def _release_holds(db, held: list[str], now: datetime, dialer_restorer: Optional[DialerRestorer]) -> int:

@@ -239,3 +239,28 @@ def test_second_sweep_skips_while_the_first_holds_the_lock(db):
     finally:
         other.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": SWEEP_LOCK_KEY})
         other.close()
+
+
+def _ghl_call(db, phone, ended_at):
+    db.execute(text("INSERT INTO lending.call_dispositions "
+                    "(dialer_call_id, call_source, phone, direction, call_ended_at, raw_event) "
+                    "VALUES (:cid, 'ghl', :p, 'outbound', :t, '{}')"),
+               {"cid": f"ghl-test-{uuid.uuid4().hex}", "p": phone, "t": ended_at})
+
+
+def test_a_loaded_phone_called_from_ghl_is_deleted_from_the_dialer_and_not_held(db):
+    _fresh_scrub(db, PHONE, NOON_LOCAL)
+    _ghl_call(db, PHONE, NOON_LOCAL - timedelta(days=1))
+    aircall = FakeAircall()
+    result = _sweep(db, NOON_LOCAL, aircall)
+    assert result.moved_to_ghl == 1 and result.pulled == 0
+    assert aircall.removed == [(PHONE, "ghl_calling")]
+    assert _hold(db) is None  # a permanent handover, never a hold the sweep would restore
+
+
+def test_a_ghl_call_older_than_14_days_leaves_the_phone_in_the_dialer(db):
+    _fresh_scrub(db, PHONE, NOON_LOCAL)
+    _ghl_call(db, PHONE, NOON_LOCAL - timedelta(days=15))
+    aircall = FakeAircall()
+    assert _sweep(db, NOON_LOCAL, aircall).moved_to_ghl == 0
+    assert aircall.removed == []
