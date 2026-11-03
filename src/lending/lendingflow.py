@@ -613,7 +613,7 @@ def _hand_off_prequal(lead: Mapping[str, Any]) -> bool:
 
 _HELD_FOR_WINDOW = (
     "SELECT id, phone, email, property_state, property_zip, ghl_contact_id FROM lending.lendingflow_leads "
-    "WHERE consent_status = 'present' AND NOT suppressed AND ghl_status IN ('synced', 'contact_only') "
+    "WHERE NOT suppressed AND ghl_status IN ('synced', 'contact_only') "
     "AND ghl_contact_id IS NOT NULL AND intro_sms_tagged_at IS NULL AND received_at > :cutoff "
     "ORDER BY received_at LIMIT :limit FOR UPDATE SKIP LOCKED"
 )
