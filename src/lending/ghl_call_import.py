@@ -13,11 +13,15 @@ window and stores each one once. When more contacts are in the window than one r
 * ``direction`` = ``outbound`` or ``inbound`` (Q66). Only outbound rows count as attempts (attempt caps, the replacement
   rule, the scoreboard and the uncalled alarm all filter on direction); an inbound row is a record of the call
 * ``call_source`` = ``ghl``, ``caller_seat`` / ``campaign_tag`` = ``ghl`` (its own scoreboard line)
-* ``disposition`` stays NULL (GHL outcomes are not lending disposition codes); GHL's outcome is kept in
-  ``disposition_raw`` as ``ghl:<callStatus>``, which also keeps it out of the missing-disposition alert
+* ``disposition`` is NULL on import: GHL's call API has no disposition. GHL's own call status is kept in
+  ``disposition_raw`` as ``ghl:<callStatus>``. The outcome the caller picked arrives separately (GHL workflow ->
+  POST /webhooks/lending/ghl-disposition) and is attached by src.lending.ghl_disposition_match, which every run
+  calls after storing the calls; matched calls are then delivered to the Sheet and Slack
 * ``raw_event`` holds ids, the outcome and the time only: no message body, names or numbers
 
-Dialer-only jobs (Slack/sheet delivery, missing-disposition alert, soft approval cards) skip ``call_source = 'ghl'``.
+Sheet/Slack delivery (and its retry) and the missing-disposition alert cover GHL calls (G3, 2026-11-03: outbound,
+connected, no outcome after GHL_MISSING_DISPOSITION_GRACE_MINUTES); only soft approval cards skip
+``call_source = 'ghl'`` (they need a dialer transcript).
 Attempt caps, the scoreboard, Cora and the replacement rule (src/lending/replacement_eligibility.py) count GHL
 calls like any other.
 
@@ -233,8 +237,12 @@ def main() -> int:
     if account is None:
         logger.error("[ghl-call-import] not run: the Next Deal Lending GHL account is not configured")
         return 1
+    from src.lending import ghl_disposition_match
+
     with lending_session() as db:
         stats = import_calls(db, call_messages_reader(account), recent_callers=recent_callers_reader(account))
+        matched = ghl_disposition_match.attach_pending(db, datetime.now(timezone.utc))
+    ghl_disposition_match.deliver_matched(matched)  # after the session's commit: delivery reads the stored outcome
     logger.info("[ghl-call-import] eligible=%d offset=%d contacts=%d other_callers=%d imported=%d updated=%d "
                 "already_recorded=%d lookup_failures=%d", stats.eligible, stats.offset, stats.contacts,
                 stats.other_callers, stats.imported, stats.updated, stats.already_recorded, stats.lookup_failures)
