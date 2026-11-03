@@ -167,6 +167,7 @@ def _process_submission(call_id: str, facts: SoftApprovalFacts, user_id: str, ch
     phone = None
     card: Optional[tuple[str, Optional[str], str]] = None  # (phone, caller, outcome key)
     lender_fits = False
+    assessed_lead_ref: Optional[str] = None
     client = slack_client()
     try:
         with lending_session() as db:
@@ -183,6 +184,7 @@ def _process_submission(call_id: str, facts: SoftApprovalFacts, user_id: str, ch
                 status_text = _status_text(outcome) or status_text
                 card = (phone, call[1], _outcome_key(outcome))
                 lender_fits = outcome.status == "generated"
+                assessed_lead_ref = outcome.lead_ref
                 if lender_fits and outcome.approval_id and channel and message_ts:
                     _upload_pdf(client, db, approval_id=outcome.approval_id, phone=phone,
                                 channel=channel, message_ts=message_ts)
@@ -199,7 +201,7 @@ def _process_submission(call_id: str, facts: SoftApprovalFacts, user_id: str, ch
     if phone:
         share_facts_with_enrichment(call_id, phone, facts)
     if phone and lender_fits:
-        send_prequal_after_call(call_id, phone)  # Q2: the letter waits for the call figures
+        send_prequal_after_call(call_id, phone, assessed_lead_ref)  # Q2: the letter waits for the call figures
 
 
 def _handle_submission(payload: dict, background: BackgroundTasks) -> dict[str, Any]:

@@ -45,18 +45,19 @@ def queued(link_db, monkeypatch):
     return calls
 
 
-def _lead(db, *, vendor, received, suppressed=False, contact="ghl_9"):
-    db.execute(
+def _lead(db, *, vendor, received, suppressed=False, contact="ghl_9") -> str:
+    """Insert a LendingFlow lead; returns its ``lead_uuid`` (what a soft approval stores as ``lead_ref``)."""
+    return str(db.execute(
         text("INSERT INTO lending.lendingflow_leads (vendor_lead_id, dedupe_hash, phone, suppressed, received_at, "
              "raw_payload, ghl_contact_id, credit_band, loan_amount, property_state, loan_type) "
-             "VALUES (:v, :v, :p, :s, :r, '{}'::jsonb, :c, '700+', 300000, 'FL', 'FIX_AND_FLIP')"),
-        {"v": vendor, "p": PHONE, "s": suppressed, "r": received, "c": contact})
+             "VALUES (:v, :v, :p, :s, :r, '{}'::jsonb, :c, '700+', 300000, 'FL', 'FIX_AND_FLIP') RETURNING lead_uuid"),
+        {"v": vendor, "p": PHONE, "s": suppressed, "r": received, "c": contact}).scalar_one())
 
 
-def test_the_latest_leads_letter_is_queued_with_its_four_core_fields(link_db, queued):
+def test_the_assessed_leads_letter_is_queued_with_its_four_core_fields(link_db, queued):
     _lead(link_db, vendor="old", received="2026-10-01 10:00:00+00")
-    _lead(link_db, vendor="new", received="2026-10-02 10:00:00+00")
-    send_prequal_after_call("call-1", PHONE)
+    new = _lead(link_db, vendor="new", received="2026-10-02 10:00:00+00")
+    send_prequal_after_call("call-1", PHONE, new)
     (call,) = queued
     assert (call["lead_source"], call["lead_ref"], call["contact_id"]) == ("lendingflow", "new", "ghl_9")
     lead = call["lead"]
@@ -66,21 +67,28 @@ def test_the_latest_leads_letter_is_queued_with_its_four_core_fields(link_db, qu
 
 @pytest.mark.parametrize("suppressed, contact", [(True, "ghl_9"), (False, None)])
 def test_a_suppressed_lead_or_one_not_in_ghl_gets_no_letter(link_db, queued, suppressed, contact):
-    _lead(link_db, vendor="v1", received="2026-10-01 10:00:00+00", suppressed=suppressed, contact=contact)
-    send_prequal_after_call("call-1", PHONE)
+    v1 = _lead(link_db, vendor="v1", received="2026-10-01 10:00:00+00", suppressed=suppressed, contact=contact)
+    send_prequal_after_call("call-1", PHONE, v1)
+    assert queued == []
+
+
+def test_the_hand_off_skips_a_lead_after_which_a_suppressed_lead_arrived(link_db, queued):
+    old = _lead(link_db, vendor="old", received="2026-10-01 10:00:00+00")
+    _lead(link_db, vendor="new", received="2026-10-02 10:00:00+00", suppressed=True)
+    send_prequal_after_call("call-1", PHONE, old)
     assert queued == []
 
 
 def test_no_lead_and_letters_off_queue_nothing(link_db, queued, monkeypatch):
-    send_prequal_after_call("call-1", PHONE)
-    _lead(link_db, vendor="v1", received="2026-10-01 10:00:00+00")
+    send_prequal_after_call("call-1", PHONE, None)
+    v1 = _lead(link_db, vendor="v1", received="2026-10-01 10:00:00+00")
     monkeypatch.setattr(prequal_link, "get_settings", lambda: SimpleNamespace(lending_prequal_pdf_enabled=False))
-    send_prequal_after_call("call-1", PHONE)
+    send_prequal_after_call("call-1", PHONE, v1)
     assert queued == []
 
 
 def test_a_queue_failure_is_swallowed(link_db, monkeypatch):
-    _lead(link_db, vendor="v1", received="2026-10-01 10:00:00+00")
+    v1 = _lead(link_db, vendor="v1", received="2026-10-01 10:00:00+00")
     monkeypatch.setattr(prequal_link, "lending_session", lambda: _session_over(link_db))
     monkeypatch.setattr(prequal_link, "get_settings", lambda: SimpleNamespace(lending_prequal_pdf_enabled=True))
 
@@ -88,7 +96,7 @@ def test_a_queue_failure_is_swallowed(link_db, monkeypatch):
         raise RuntimeError("queue down")
 
     monkeypatch.setattr("src.lending.prequal_letters.queue_and_send_in_background", boom)
-    send_prequal_after_call("call-1", PHONE)  # must not raise: the soft approval never depends on it
+    send_prequal_after_call("call-1", PHONE, v1)  # must not raise: the soft approval never depends on it
 
 
 class _FakeSlack:
@@ -110,14 +118,15 @@ def test_only_a_submission_whose_figures_fit_a_lender_sends_the_letter(link_db, 
     monkeypatch.setattr(webhook, "lending_session", lambda: _session_over(link_db))
     monkeypatch.setattr(webhook, "slack_client", lambda: _FakeSlack())
     monkeypatch.setattr(webhook, "generate_soft_approval",
-                        lambda db, **kw: SimpleNamespace(status=status, reason=None, approval_id=None))
+                        lambda db, **kw: SimpleNamespace(status=status, reason=None, approval_id=None,
+                                                         lead_ref="lead-uuid-1"))
     monkeypatch.setattr(webhook, "_status_text", lambda outcome: "ok")
     monkeypatch.setattr(webhook, "_outcome_key", lambda outcome: "generated")
     monkeypatch.setattr(webhook, "_refresh_card", lambda *a, **kw: None)
     monkeypatch.setattr(webhook, "share_facts_with_enrichment", lambda *args: None)
     monkeypatch.setattr(webhook, "send_prequal_after_call", lambda *args: letters.append(args))
     webhook._process_submission("call-1", FACTS, "U1", "CDIAL", "1.1")
-    assert letters == ([("call-1", PHONE)] if sent else [])
+    assert letters == ([("call-1", PHONE, "lead-uuid-1")] if sent else [])
 
 
 # --- A hand-off that did not land is recovered by the pre-qual sweep, without resubmitting the form ---
@@ -133,10 +142,10 @@ def sweep_db(link_db):
     return link_db
 
 
-def _approval(db, *, status="generated", updated="now()"):
+def _approval(db, *, lead_ref, status="generated", updated="now()"):
     db.execute(text(
-        "INSERT INTO lending.soft_approvals (phone, dialer_call_id, status, facts, updated_at) "
-        f"VALUES (:p, 'call-1', :s, '{{}}'::jsonb, {updated})"), {"p": PHONE, "s": status})
+        "INSERT INTO lending.soft_approvals (phone, dialer_call_id, lead_ref, status, facts, updated_at) "
+        f"VALUES (:p, 'call-1', :ref, :s, '{{}}'::jsonb, {updated})"), {"p": PHONE, "ref": lead_ref, "s": status})
 
 
 def _letters(db):
@@ -149,8 +158,8 @@ def test_a_failed_hand_off_is_queued_by_the_sweep_once(sweep_db, monkeypatch):
 
     from src.lending.soft_approval.prequal_link import queue_missed_letters
 
-    _lead(sweep_db, vendor="v1", received="2026-10-01 10:00:00+00")
-    _approval(sweep_db)
+    v1 = _lead(sweep_db, vendor="v1", received="2026-10-01 10:00:00+00")
+    _approval(sweep_db, lead_ref=v1)
     monkeypatch.setattr(prequal_link, "lending_session", lambda: _session_over(sweep_db))
     monkeypatch.setattr(prequal_link, "get_settings", lambda: SimpleNamespace(lending_prequal_pdf_enabled=True))
 
@@ -158,7 +167,7 @@ def test_a_failed_hand_off_is_queued_by_the_sweep_once(sweep_db, monkeypatch):
         raise RuntimeError("database blip")
 
     monkeypatch.setattr("src.lending.prequal_letters.queue_and_send_in_background", failing_queue)
-    send_prequal_after_call("call-1", PHONE)  # the immediate hand-off fails: no letter row
+    send_prequal_after_call("call-1", PHONE, v1)  # the immediate hand-off fails: no letter row
     assert _letters(sweep_db) == []
 
     now = datetime.now(timezone.utc)
@@ -173,8 +182,8 @@ def test_the_sweep_skips_approvals_that_did_not_fit_or_are_too_old(sweep_db, sta
 
     from src.lending.soft_approval.prequal_link import queue_missed_letters
 
-    _lead(sweep_db, vendor="v1", received="2026-10-01 10:00:00+00")
-    _approval(sweep_db, status=status, updated=updated)
+    v1 = _lead(sweep_db, vendor="v1", received="2026-10-01 10:00:00+00")
+    _approval(sweep_db, lead_ref=v1, status=status, updated=updated)
     assert queue_missed_letters(sweep_db, datetime.now(timezone.utc)) == 0 and _letters(sweep_db) == []
 
 
@@ -183,7 +192,35 @@ def test_the_sweep_skips_a_suppressed_latest_lead(sweep_db):
 
     from src.lending.soft_approval.prequal_link import queue_missed_letters
 
-    _lead(sweep_db, vendor="old", received="2026-10-01 10:00:00+00")
+    old = _lead(sweep_db, vendor="old", received="2026-10-01 10:00:00+00")
     _lead(sweep_db, vendor="new", received="2026-10-02 10:00:00+00", suppressed=True)
-    _approval(sweep_db)
+    _approval(sweep_db, lead_ref=old)
+    assert queue_missed_letters(sweep_db, datetime.now(timezone.utc)) == 0 and _letters(sweep_db) == []
+
+
+def test_the_sweep_never_gives_a_newer_unassessed_lead_an_earlier_approval(sweep_db):
+    """Review finding (PR 398): lead A is approved and has its letter; lead B arrives for the same phone. The
+    sweep must not queue B's letter on A's approval, since no call has assessed B."""
+    from datetime import datetime, timezone
+
+    from src.lending.prequal_letters import enqueue
+    from src.lending.prequal import PrequalLead
+    from src.lending.soft_approval.prequal_link import queue_missed_letters
+
+    old = _lead(sweep_db, vendor="old", received="2026-10-01 10:00:00+00")
+    _approval(sweep_db, lead_ref=old)
+    enqueue(sweep_db, lead_source="lendingflow", lead_ref="old", contact_id="ghl_9",
+            lead=PrequalLead(credit_band="700+", loan_amount=300000, property_state="FL", loan_type="FIX_AND_FLIP"))
+    _lead(sweep_db, vendor="new", received="2026-10-02 10:00:00+00")
+    assert queue_missed_letters(sweep_db, datetime.now(timezone.utc)) == 0
+    assert _letters(sweep_db) == [("old", "ghl_9")]
+
+
+def test_the_sweep_skips_an_approval_saved_without_a_lead_ref(sweep_db):
+    from datetime import datetime, timezone
+
+    from src.lending.soft_approval.prequal_link import queue_missed_letters
+
+    _lead(sweep_db, vendor="v1", received="2026-10-01 10:00:00+00")
+    _approval(sweep_db, lead_ref=None)
     assert queue_missed_letters(sweep_db, datetime.now(timezone.utc)) == 0 and _letters(sweep_db) == []

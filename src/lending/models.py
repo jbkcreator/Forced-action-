@@ -458,6 +458,8 @@ class LendingSoftApproval(LendingBase):
     Interim "deal record": the Person/Property/Deal tables arrive with T-11. One row per lead; a
     resubmission with changed figures updates it in place and appends the replaced values to ``history``.
     ``pdf`` is NULL unless ``status`` is ``generated``. ``lender_key`` is internal; the PDF never names it.
+    ``lead_ref`` is the ``lendingflow_leads.lead_uuid`` the submission assessed (NULL when no lead was found); the
+    pre-qual letter is sent for that lead only, never for a newer lead on the same phone.
     """
 
     __tablename__ = "soft_approvals"
@@ -465,6 +467,7 @@ class LendingSoftApproval(LendingBase):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     phone: Mapped[str] = mapped_column(String(20), nullable=False, unique=True)  # phone_utils.normalize
     dialer_call_id: Mapped[str] = mapped_column(String(100), nullable=False)  # call of the latest submission
+    lead_ref: Mapped[Optional[str]] = mapped_column(String(36))
     status: Mapped[str] = mapped_column(String(30), nullable=False)
     reason: Mapped[Optional[str]] = mapped_column(String(60))
     lender_key: Mapped[Optional[str]] = mapped_column(String(60))

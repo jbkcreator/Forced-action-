@@ -10,8 +10,9 @@ re-submitted form never sends a second one.
 The hand-off right after the submission is best-effort: a failure is logged by call id and exception class only
 and never changes the soft approval outcome. It is never lost: the committed ``generated`` soft approval is the
 durable marker, and :func:`queue_missed_letters` (run by the pre-qual sweep, every 5 minutes) queues the letter
-for any such approval of the last ``GIVE_UP_AFTER_HOURS`` whose lead still has none. The lead is resolved as the soft approval resolves it: the phone's most recent
-LendingFlow lead, never past a suppressed one.
+for any such approval of the last ``GIVE_UP_AFTER_HOURS`` whose lead still has none. Both send the letter only for the
+lead the call assessed (``soft_approvals.lead_ref``, stored with the approval), never for a newer lead on the same phone
+that no call has assessed, and never past a suppressed lead.
 """
 from __future__ import annotations
 
@@ -31,51 +32,60 @@ from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
 
-_LATEST_LEAD = text(
-    "SELECT vendor_lead_id, ghl_contact_id, credit_band, loan_amount, property_state, loan_type, suppressed "
-    "FROM lending.lendingflow_leads WHERE phone = :phone ORDER BY received_at DESC LIMIT 1"
+# The assessed lead is usable while it and every later lead on its phone are unsuppressed and it is in GHL.
+_USABLE = """
+    NOT l.suppressed AND l.ghl_contact_id IS NOT NULL
+    AND NOT EXISTS (SELECT 1 FROM lending.lendingflow_leads later WHERE later.phone = l.phone
+                     AND later.received_at > l.received_at AND later.suppressed)
+"""
+
+_ASSESSED_LEAD = text(
+    "SELECT l.vendor_lead_id, l.ghl_contact_id, l.credit_band, l.loan_amount, l.property_state, l.loan_type "
+    "FROM lending.lendingflow_leads l WHERE l.phone = :phone AND CAST(l.lead_uuid AS text) = :lead_ref AND "
+    + _USABLE
 )
 
 
-def _latest_lead(db: Session, phone: str) -> Optional[tuple[str, str, PrequalLead]]:
-    """(lead ref, GHL contact id, letter inputs) of the phone's latest usable LendingFlow lead, or None."""
+def _assessed_lead(db: Session, phone: str, lead_ref: str) -> Optional[tuple[str, str, PrequalLead]]:
+    """(lead ref, GHL contact id, letter inputs) of the assessed LendingFlow lead while usable, or None."""
     normalized = normalize(phone)
-    if not normalized:
+    if not normalized or not lead_ref:
         return None
-    row = db.execute(_LATEST_LEAD, {"phone": normalized}).first()
-    if row is None or row.suppressed or not row.ghl_contact_id:
+    row = db.execute(_ASSESSED_LEAD, {"phone": normalized, "lead_ref": lead_ref}).first()
+    if row is None:
         return None
     lead = PrequalLead(credit_band=row.credit_band, loan_amount=row.loan_amount,
                        property_state=row.property_state, loan_type=row.loan_type)
     return row.vendor_lead_id, row.ghl_contact_id, lead
 
 
-def send_prequal_after_call(call_id: str, phone: str) -> None:
-    """Queue and send the letter for the call's lead. Call only after a ``generated`` soft approval."""
+def send_prequal_after_call(call_id: str, phone: str, lead_ref: Optional[str]) -> None:
+    """Queue and send the letter for the lead the call assessed (``SoftApprovalOutcome.lead_ref``). Call only after
+    a ``generated`` soft approval."""
     if not get_settings().lending_prequal_pdf_enabled:
         return
     from src.lending.prequal_letters import queue_and_send_in_background
 
     try:
         with lending_session() as db:
-            found = _latest_lead(db, phone)
+            found = _assessed_lead(db, phone, lead_ref)
         if found is None:
             logger.info("[soft-approval] call %s: no usable LendingFlow lead, no pre-qual letter", call_id)
             return
-        lead_ref, contact_id, lead = found
-        queue_and_send_in_background(lead_source=LEAD_SOURCE, lead_ref=lead_ref, contact_id=contact_id, lead=lead)
+        vendor_lead_id, contact_id, lead = found
+        queue_and_send_in_background(lead_source=LEAD_SOURCE, lead_ref=vendor_lead_id, contact_id=contact_id,
+                                     lead=lead)
     except Exception as exc:  # class only: SQL errors embed bound params (phones)
         logger.error("[soft-approval] call %s pre-qual hand-off failed: %s", call_id, type(exc).__name__)
 
 
-# ``generated`` soft approvals whose phone's latest LendingFlow lead is usable and has no letter row yet.
+# ``generated`` soft approvals whose assessed lead is usable and has no letter row yet. An approval without a
+# ``lead_ref`` (saved before it was stored) is skipped: it names no assessed lead.
 _MISSED = text("""
     SELECT l.vendor_lead_id, l.ghl_contact_id, l.credit_band, l.loan_amount, l.property_state, l.loan_type
       FROM lending.soft_approvals s
-      JOIN LATERAL (SELECT * FROM lending.lendingflow_leads f WHERE f.phone = s.phone
-                     ORDER BY f.received_at DESC LIMIT 1) l ON true
-     WHERE s.status = 'generated' AND s.updated_at >= :since
-       AND NOT l.suppressed AND l.ghl_contact_id IS NOT NULL
+      JOIN lending.lendingflow_leads l ON l.phone = s.phone AND CAST(l.lead_uuid AS text) = s.lead_ref
+     WHERE s.status = 'generated' AND s.updated_at >= :since AND""" + _USABLE + """
        AND NOT EXISTS (SELECT 1 FROM lending.prequal_letters p WHERE p.lead_source = :src AND p.lead_ref = l.vendor_lead_id)
      ORDER BY s.updated_at LIMIT :limit
 """)

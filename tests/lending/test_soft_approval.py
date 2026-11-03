@@ -7,6 +7,7 @@ import json
 import re
 import time
 from contextlib import contextmanager
+from dataclasses import replace
 from decimal import Decimal as D
 from types import SimpleNamespace
 from urllib.parse import urlencode
@@ -363,6 +364,18 @@ class TestService:
         assert row["figures"]["net_loan"] == "300000" and row["dialer_call_id"] == "call-2"
         assert len(row["history"]) == 1 and row["history"][0]["figures"]["net_loan"] == "290000"
 
+    def test_the_assessed_lead_is_stored_and_a_new_lead_with_identical_facts_replaces_it(self, soft_db):
+        first = _generate(soft_db)
+        assert first.lead_ref == "lf-1" and _row(soft_db)["lead_ref"] == "lf-1"
+        newer = replace(LEAD, lead_ref="lf-2")
+        second = _generate(soft_db, lead=newer, call_id="call-2")
+        row = _row(soft_db)
+        assert second.lead_ref == "lf-2" and row["lead_ref"] == "lf-2" and row["history"][0]["lead_ref"] == "lf-1"
+
+    def test_no_lead_stores_no_lead_ref(self, soft_db):
+        out = _generate(soft_db, lead=None)
+        assert out.status == "no_lead" and out.lead_ref is None and _row(soft_db)["lead_ref"] is None
+
     def test_production_defaults_produce_a_flagged_pdf_on_the_placeholder_inputs(self, soft_db):
         """Real lead source + real evaluator (T-05) + real matrix: every lender is unconfirmed, so the PDF is made
         on Josh's placeholder box and flagged subject to lender confirmation (A1). The feature itself stays closed
@@ -382,6 +395,17 @@ class TestService:
     def test_migration_is_idempotent(self, soft_db):
         apply_soft_approvals(soft_db.get_bind())
         apply_soft_approvals(soft_db.get_bind())
+
+    def test_lead_ref_migration_adds_the_column_to_an_existing_table_and_is_idempotent(self, soft_db):
+        from migrations.apply_lending_soft_approvals_lead_ref import apply_to as apply_lead_ref
+
+        conn = soft_db.get_bind()
+        conn.execute(text("ALTER TABLE lending.soft_approvals DROP COLUMN lead_ref"))
+        apply_lead_ref(conn)
+        apply_lead_ref(conn)
+        assert conn.execute(text(
+            "SELECT count(*) FROM information_schema.columns WHERE table_schema = 'lending' "
+            "AND table_name = 'soft_approvals' AND column_name = 'lead_ref'")).scalar() == 1
 
 
 # ---- template ----------------------------------------------------------------------------------

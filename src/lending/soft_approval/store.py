@@ -14,6 +14,7 @@ def save_soft_approval(
     *,
     phone: str,
     dialer_call_id: str,
+    lead_ref: Optional[str],
     status: str,
     reason: Optional[str],
     facts: SoftApprovalFacts,
@@ -25,33 +26,36 @@ def save_soft_approval(
 ) -> int:
     """Insert, or quietly update the lead's row when anything changed. Returns the row id. Does not commit.
 
-    A resubmission with identical facts, figures and status changes nothing. A changed one overwrites
+    A resubmission with identical lead, facts, figures and status changes nothing. A changed one overwrites
     the row and appends the replaced values to ``history``.
     """
     facts_json = facts.snapshot()
     existing = db.execute(
-        text("SELECT id, status, facts, figures FROM lending.soft_approvals WHERE phone = :phone FOR UPDATE"),
+        text("SELECT id, lead_ref, status, facts, figures FROM lending.soft_approvals WHERE phone = :phone FOR UPDATE"),
         {"phone": phone},
     ).first()
-    if existing and existing.status == status and existing.facts == facts_json and existing.figures == figures:
+    if (existing and existing.lead_ref == lead_ref and existing.status == status and existing.facts == facts_json
+            and existing.figures == figures):
         return existing.id
     return db.execute(
         text(
             """
             INSERT INTO lending.soft_approvals
-                (phone, dialer_call_id, status, reason, lender_key, facts, figures, pdf,
+                (phone, dialer_call_id, lead_ref, status, reason, lender_key, facts, figures, pdf,
                  template_version, submitted_by)
-            VALUES (:phone, :call_id, :status, :reason, :lender_key, CAST(:facts AS jsonb),
+            VALUES (:phone, :call_id, :lead_ref, :status, :reason, :lender_key, CAST(:facts AS jsonb),
                     CAST(:figures AS jsonb), :pdf, :template_version, :submitted_by)
             ON CONFLICT (phone) DO UPDATE SET
                 history = lending.soft_approvals.history || jsonb_build_array(jsonb_build_object(
                     'replaced_at', to_jsonb(now()),
                     'dialer_call_id', lending.soft_approvals.dialer_call_id,
+                    'lead_ref', lending.soft_approvals.lead_ref,
                     'status', lending.soft_approvals.status,
                     'facts', lending.soft_approvals.facts,
                     'figures', lending.soft_approvals.figures,
                     'submitted_by', lending.soft_approvals.submitted_by)),
                 dialer_call_id = EXCLUDED.dialer_call_id,
+                lead_ref = EXCLUDED.lead_ref,
                 status = EXCLUDED.status,
                 reason = EXCLUDED.reason,
                 lender_key = EXCLUDED.lender_key,
@@ -65,7 +69,7 @@ def save_soft_approval(
             """
         ),
         {
-            "phone": phone, "call_id": dialer_call_id, "status": status, "reason": reason,
+            "phone": phone, "call_id": dialer_call_id, "lead_ref": lead_ref, "status": status, "reason": reason,
             "lender_key": lender_key, "facts": json.dumps(facts_json),
             "figures": json.dumps(figures) if figures is not None else None,
             "pdf": pdf, "template_version": template_version, "submitted_by": submitted_by,
