@@ -99,7 +99,8 @@ def last_call_text(ended: datetime, disposition: Optional[str], calls: int) -> s
 
 
 # Due calls, locked so the follow-up thread and the sweep never write the same call at once. The GHL contact is the
-# newest LendingFlow or website lead on the phone that has one.
+# newest LendingFlow or website lead on the phone that has one. Phones with no contact are left out before the LIMIT:
+# they are never updated, so otherwise the oldest of them would fill every sweep batch until they age out.
 _DUE = """
     WITH due AS (
         SELECT d.id, d.phone, d.disposition, d.call_ended_at
@@ -107,6 +108,10 @@ _DUE = """
          WHERE d.call_source = :source AND d.call_ended_at IS NOT NULL AND d.phone IS NOT NULL
            AND d.call_ended_at > :since AND d.ghl_note_attempts < :max_attempts
            AND (d.ghl_note_at IS NULL OR d.disposition IS DISTINCT FROM d.ghl_note_disposition)
+           AND (EXISTS (SELECT 1 FROM lending.lendingflow_leads l
+                         WHERE l.phone = d.phone AND l.ghl_contact_id IS NOT NULL)
+                OR EXISTS (SELECT 1 FROM lending.web_leads w
+                            WHERE w.phone = d.phone AND w.ghl_contact_id IS NOT NULL))
            {row_filter}
          ORDER BY d.call_ended_at LIMIT :limit
            FOR UPDATE OF d SKIP LOCKED)

@@ -98,6 +98,16 @@ def test_phones_without_a_ghl_contact_ghl_calls_and_old_calls_are_skipped(db):
     assert notes.write_due_notes(db, FakeWriter(), now=NOW) == 0
 
 
+def test_calls_without_a_ghl_contact_do_not_fill_the_sweep_batch(db):
+    for minutes in range(notes.SWEEP_LIMIT):
+        _call(db, f"+1727555{minutes:04d}", ended=NOW - timedelta(hours=2, minutes=minutes))
+    phone = _lead(db)
+    _call(db, phone)
+    writer = FakeWriter()
+    assert notes.write_due_notes(db, writer, now=NOW) == 1
+    assert writer.tags == [("ghl-9", ["called-in-batchdialer"])]
+
+
 @pytest.mark.parametrize("code, tags", [
     ("NO_ANSWER", ["called-in-batchdialer"]),
     ("CONNECTED_NOT_INTERESTED", ["called-in-batchdialer", "bd-connected"]),
