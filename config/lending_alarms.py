@@ -45,7 +45,7 @@ RETRY_WINDOW_SECONDS = 15 * 60    # a retry still pending this long after its al
 STALE_SEND_SECONDS = 120          # a claimed send with no recorded outcome after this long is 'send_unknown'
 
 # A CDR with one of these dispositions is an attempt that did not reach the lead.
-NOT_CONNECTED_CODES = tuple(sorted(UNANSWERED_CODES | {"BAD_NUMBER"}))
+NOT_CONNECTED_CODES = tuple(sorted(UNANSWERED_CODES | {"BAD_NUMBER", "CALL_FAILED"}))  # CALL_FAILED: old-list rows
 # GHL call message meta.callStatus values that mean the lead was reached (GHL OpenAPI; unverified live).
 GHL_CONNECTED_STATUSES = frozenset({"completed", "answered"})
 

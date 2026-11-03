@@ -5,27 +5,35 @@ match what the dialer sends. Changing the list means bumping DISPOSITION_LIST_VE
 """
 from __future__ import annotations
 
-DISPOSITION_LIST_VERSION = "2026-10-01"
+DISPOSITION_LIST_VERSION = "2026-11-03"
 
-# Final list, approved by the client 2026-09-30. WRONG_PERSON, NOT_DECISION_MAKER and REFERRED stay separate.
+# The 10 results shared by BatchDialer and GHL (GHL allows at most 10 call dispositions). Client-approved 2026-11-03,
+# replacing the 13-code list of 2026-09-30.
 DISPOSITIONS = (
     "NO_ANSWER",
     "LEFT_VOICEMAIL",
     "BAD_NUMBER",
-    "CALL_FAILED",
     "WRONG_PERSON",
-    "NOT_DECISION_MAKER",
     "REFERRED",
     "DNC_REQUEST",
     "CONNECTED_NOT_INTERESTED",
     "CALLBACK_REQUESTED",
-    "DATA_NURTURE_ONLY",
-    "GATE_FAILED_NURTURE",
+    "NURTURE",
     "BOOKED",
 )
 
+# Codes of the 2026-09-30 list merged away. Stored rows are never rewritten: they stay readable and keep counting
+# through the sets below, and a dialer still sending one (before its Call Results are switched) is mapped.
+# A gate failure is now NURTURE with call_dispositions.gate_failed set.
+LEGACY_DISPOSITION_ALIASES: dict[str, str] = {
+    "CALL_FAILED": "NO_ANSWER",
+    "NOT_DECISION_MAKER": "WRONG_PERSON",
+    "DATA_NURTURE_ONLY": "NURTURE",
+    "GATE_FAILED_NURTURE": "NURTURE",
+}
+
 # Calls nobody answered: these feed the missed-call text (voicemail counts).
-UNANSWERED_CODES = frozenset({"NO_ANSWER", "LEFT_VOICEMAIL", "CALL_FAILED"})
+UNANSWERED_CODES = frozenset({"NO_ANSWER", "LEFT_VOICEMAIL"})
 
 # The dialer's built-in Call Results, mapped onto our codes (names from BatchDialer's
 # published default results; confirm against the account's Call Results screen).
@@ -38,8 +46,9 @@ SYSTEM_DISPOSITION_ALIASES: dict[str, str] = {
     "DO_NOT_CALL": "DNC_REQUEST",
     "NOT_INTERESTED": "CONNECTED_NOT_INTERESTED",
     "CALL_BACK": "CALLBACK_REQUESTED",
-    "FAILED": "CALL_FAILED",
-    "CONGESTION": "CALL_FAILED",
+    # A carrier failure is not a bad number (client 2026-11-03): retried like an unanswered call.
+    "FAILED": "NO_ANSWER",
+    "CONGESTION": "NO_ANSWER",
     # Client-approved 2026-10-02. Abandoned is a multi-line drop (the person picked up, no caller was free):
     # logged as NO_ANSWER and counted as an attempt, but never queued for the missed-call text.
     "ABANDONED": "NO_ANSWER",
@@ -57,11 +66,13 @@ DEFAULT_CAUSE: dict[str, str] = {
     "NO_ANSWER": "contactability",
     "LEFT_VOICEMAIL": "contactability",
     "BAD_NUMBER": "contactability",
-    "CALL_FAILED": "contactability",
     "WRONG_PERSON": "contactability",
-    "NOT_DECISION_MAKER": "contactability",
     "CALLBACK_REQUESTED": "timing",
     "CONNECTED_NOT_INTERESTED": "fit",
+    "NURTURE": "fit",
+    # legacy codes (stored rows)
+    "CALL_FAILED": "contactability",
+    "NOT_DECISION_MAKER": "contactability",
     "GATE_FAILED_NURTURE": "fit",
 }
 
@@ -69,16 +80,64 @@ BOOKED_CODE = "BOOKED"
 DNC_CODE = "DNC_REQUEST"
 
 # Scoreboard definitions (client Part 5.6). Defaults: a client answer is a one-line change here.
+# Legacy codes are listed too, so history keeps counting. NURTURE is gated / nurture-sent only with gate_failed set:
+# the scoreboard adds that row check (NURTURE_CODE AND gate_failed IS TRUE) on top of these sets.
 LIVE_CONVERSATION_CODES = frozenset({
-    "CONNECTED_NOT_INTERESTED", "CALLBACK_REQUESTED", "DNC_REQUEST",
-    "DATA_NURTURE_ONLY", "GATE_FAILED_NURTURE", "BOOKED",
+    "CONNECTED_NOT_INTERESTED", "CALLBACK_REQUESTED", "DNC_REQUEST", "NURTURE", "BOOKED",
+    "DATA_NURTURE_ONLY", "GATE_FAILED_NURTURE",
 })
 GATED_CODES = frozenset({"BOOKED", "GATE_FAILED_NURTURE"})  # proxy for "all four captures"
 NURTURE_SENT_CODES = frozenset({"GATE_FAILED_NURTURE"})
-# A person picked up: everything except no-answer, voicemail, failed and bad-number results (answer rate per caller-ID number).
-ANSWERED_CODES = frozenset(DISPOSITIONS) - UNANSWERED_CODES - {"BAD_NUMBER"}
+NURTURE_CODE = "NURTURE"
+# A person picked up: everything except no-answer, voicemail and bad-number results (answer rate per caller-ID
+# number), plus the answered legacy codes.
+ANSWERED_CODES = (frozenset(DISPOSITIONS) | {"NOT_DECISION_MAKER", "DATA_NURTURE_ONLY", "GATE_FAILED_NURTURE"}) \
+    - UNANSWERED_CODES - {"BAD_NUMBER"}
 # GHL pipeline stage names (lower-cased) that count as "showed": the client moves a lead there once the held call happens.
 SHOWED_STAGE_KEYS = frozenset({"held", "showed"})
+# GHL pipeline stage names (lower-cased) that count as "booked" for David's numbers and the scoreboard's Booked (stage):
+# the Requested Appointment workflow moves the opportunity there. UNVERIFIED spelling: Dev A confirms the stage name.
+BOOKED_STAGE_KEYS = frozenset({"booked"})
+
+# GHL call outcomes (G3). GHL's call API carries no disposition (checked 2026-11-03), so a GHL workflow posts the
+# chosen outcome to /webhooks/lending/ghl-disposition; it waits in lending.ghl_disposition_events until the GHL call
+# import has stored the call, then is matched onto it. GHL label (as the caller sees it, upper-cased, non-alphanumerics
+# to "_") -> our code; a body that already sends our code, or a "disp:<CODE>" tag, needs no entry.
+GHL_DISPOSITION_LABELS: dict[str, str] = {
+    "NO_ANSWER": "NO_ANSWER",
+    "VOICEMAIL": "LEFT_VOICEMAIL",
+    "FOLLOW_UP": "CALLBACK_REQUESTED",
+    "REQUESTED_APPOINTMENT": "BOOKED",
+    "NOT_INTERESTED": "CONNECTED_NOT_INTERESTED",
+    "INCORRECT_NUMBER": "BAD_NUMBER",
+    "WRONG_CONTACT": "WRONG_PERSON",
+    "REFERRED": "REFERRED",
+    "DNC_REQUEST": "DNC_REQUEST",
+    "NURTURE": "NURTURE",
+}
+# UNVERIFIED webhook body keys (Dev A builds the workflow): candidates tried in order, at the top level or under
+# GHL's customData.
+GHL_DISPOSITION_FIELD_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "contact_id": ("contact_id", "contactId"),
+    "phone": ("phone", "contact_phone"),
+    "disposition": ("disposition", "lending_disposition", "call_disposition", "call_outcome"),
+    "call_id": ("call_id", "call_message_id", "message_id", "callId"),
+    "user": ("user", "user_name", "called_by", "caller"),
+    "called_at": ("called_at", "call_time", "call_date"),
+    "gate_failed": ("gate_failed",),
+    "text_consent": ("text_consent", "textConsent"),  # {{contact.text_consent}} (Yes/No); passed to Dev C's hooks
+}
+GHL_DISPOSITION_MATCH_WINDOW_MINUTES = 30  # a call started this close to the outcome's time is its call
+GHL_DISPOSITION_PENDING_DAYS = 2           # an outcome still unmatched after this is no longer retried
+GHL_DISPOSITION_MATCH_BATCH = 200
+GHL_DISPOSITION_DEDUPE_MINUTES = 10      # an identical delivery within this is a webhook retry, stored once
+GHL_DISPOSITION_CLOCK_SKEW_MINUTES = 2   # a call may start this much after the outcome's time (clock drift)
+GHL_DISPOSITION_ALERT_BATCH = 200        # unmatched outcomes claimed per alert run
+# True once Dev A confirms the GHL workflow sends call_id or called_at: without one, a webhook retry and a second
+# call with the same outcome cannot be told apart, so such an event is refused (422).
+GHL_DISPOSITION_REQUIRE_CALL_IDENTITY = False
+GHL_DISPOSITION_UNMATCHED_ALERT_HOURS = 2  # an outcome with no call after this is posted once to #dial-tasks
+GHL_MISSING_DISPOSITION_GRACE_MINUTES = 30  # a connected outbound GHL call with no outcome after this is flagged
 # GHL call outcomes (ghl_calls.call_state) for David's activity: a voicemail, and a call where someone talked.
 GHL_VOICEMAIL_STATES = frozenset({"voicemail"})
 GHL_CONNECTED_STATES = frozenset({"completed"})
@@ -142,25 +201,57 @@ CDR_POLL_LOCK_KEY = 7_302_020_803  # one poller at a time: the /last watermark i
 
 
 def validate_dispositions_config() -> None:
-    codes = set(DISPOSITIONS)
-    if len(codes) != len(DISPOSITIONS):
+    if not set(GHL_DISPOSITION_LABELS.values()) <= set(DISPOSITIONS):
+        raise ValueError("GHL_DISPOSITION_LABELS maps to a code missing from DISPOSITIONS")
+    current = set(DISPOSITIONS)
+    if len(current) != len(DISPOSITIONS):
         raise ValueError("DISPOSITIONS must not repeat a code")
-    for name, group in (("UNANSWERED_CODES", UNANSWERED_CODES), ("DEFAULT_CAUSE", set(DEFAULT_CAUSE)),
-                        ("SYSTEM_DISPOSITION_ALIASES", set(SYSTEM_DISPOSITION_ALIASES.values())),
-                        ("LIVE_CONVERSATION_CODES", LIVE_CONVERSATION_CODES), ("GATED_CODES", GATED_CODES),
-                        ("NURTURE_SENT_CODES", NURTURE_SENT_CODES), ("ANSWERED_CODES", ANSWERED_CODES),
-                        ("TRANSFER_CODES", TRANSFER_CODES)):
-        if not group <= codes:
-            raise ValueError(f"{name} names a code missing from DISPOSITIONS: {sorted(group - codes)}")
+    if set(LEGACY_DISPOSITION_ALIASES) & current:
+        raise ValueError("LEGACY_DISPOSITION_ALIASES must not name a current code")
+    if not set(LEGACY_DISPOSITION_ALIASES.values()) <= current:
+        raise ValueError("LEGACY_DISPOSITION_ALIASES must map onto current codes")
+    stored = current | set(LEGACY_DISPOSITION_ALIASES)  # reporting sets may name legacy codes: stored rows still count
+    for name, group, allowed in (
+            ("UNANSWERED_CODES", UNANSWERED_CODES, current),
+            ("SYSTEM_DISPOSITION_ALIASES", set(SYSTEM_DISPOSITION_ALIASES.values()), current),
+            ("DEFAULT_CAUSE", set(DEFAULT_CAUSE), stored),
+            ("LIVE_CONVERSATION_CODES", LIVE_CONVERSATION_CODES, stored), ("GATED_CODES", GATED_CODES, stored),
+            ("NURTURE_SENT_CODES", NURTURE_SENT_CODES, stored), ("ANSWERED_CODES", ANSWERED_CODES, stored),
+            ("TRANSFER_CODES", TRANSFER_CODES, current)):
+        if not group <= allowed:
+            raise ValueError(f"{name} names a code missing from DISPOSITIONS: {sorted(group - allowed)}")
     if not set(DEFAULT_CAUSE.values()) <= CAUSE_TAGS:
         raise ValueError("DEFAULT_CAUSE uses a value outside CAUSE_TAGS")
-    if not {BOOKED_CODE, DNC_CODE} <= codes:
-        raise ValueError("BOOKED and DNC_REQUEST must be in DISPOSITIONS")
+    if not {BOOKED_CODE, DNC_CODE, NURTURE_CODE} <= current:
+        raise ValueError("BOOKED, DNC_REQUEST and NURTURE must be in DISPOSITIONS")
 
 
 # BatchDialer contact custom field the caller sets during the call ("OK if I text you?" -> yes).
 TEXT_CONSENT_FIELD = "text_consent"
 TEXT_CONSENT_YES = "yes"
+# BatchDialer contact custom field the caller sets when the gate failed (the call is NURTURE + gate_failed).
+# UNVERIFIED: field name to be created by Dev A in BatchDialer; a truthy value marks the call.
+GATE_FAILED_FIELD = "gate_failed"
+GATE_FAILED_TRUE = frozenset({"yes", "true", "y", "1"})
+
+# GHL user id (call message ``userId``) -> caller name (GHL /users API, read 2026-11-03). Outbound GHL call messages
+# often carry no userId; the outcome webhook's {{user.name}} fills the name in when it matches the call.
+GHL_USER_NAMES: dict[str, str] = {
+    "3W4lyuTpPSgBjgiJMzJk": "Josh Kantor",
+    "57m9LlZrO1rV2A5cTKxI": "David Willis",
+    "YoBwFUwHL1fylqvqjzA1": "Hari K",
+    "0mboWYLanQkMz4RG3IbL": "Hari K",
+}
+GHL_UNKNOWN_CALLER = "GHL (unknown)"
+
+
+def ghl_caller_name(user_id: str | None) -> str:
+    return GHL_USER_NAMES.get(user_id or "", GHL_UNKNOWN_CALLER)
+
+
+# BatchDialer seats shared by several people: the scoreboard shows this label, never the login owner's name, so no
+# one is credited with another person's calls. Stored rows are not changed.
+SHARED_SEAT_LABELS: dict[str, str] = {"118131": "BatchDialer (shared seat)"}
 
 
 # T-12 audio fallback. BatchDialer has no live audio stream; the poller fetches each answered

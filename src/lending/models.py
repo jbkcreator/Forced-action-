@@ -280,6 +280,8 @@ class LendingCallDisposition(LendingBase):
     # jobs (delivery, missing-disposition alert, soft approval cards) act on batchdialer rows only.
     call_source: Mapped[str] = mapped_column(String(20), nullable=False, default="batchdialer",
                                              server_default=text("'batchdialer'"))
+    # A NURTURE call whose gate check failed (G2: replaces the old GATE_FAILED_NURTURE code); NULL = not reported.
+    gate_failed: Mapped[Optional[bool]] = mapped_column(Boolean)
     # BatchDialer result written to the GHL contact (src/lending/bd_result_to_ghl.py); rewritten when the code changes.
     ghl_note_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     ghl_note_disposition: Mapped[Optional[str]] = mapped_column(String(50))
@@ -363,6 +365,34 @@ class LendingGhlStageEvent(LendingBase):
     __table_args__ = (
         Index("uq_lending_ghl_stage_events_opp_stage", "ghl_opportunity_id", "stage_key", unique=True),
         Index("idx_lending_ghl_stage_events_stage_at", "stage_key", "event_at"),
+    )
+
+
+class LendingGhlDispositionEvent(LendingBase):
+    """A GHL call outcome posted by the disposition workflow (G3), held until the GHL call import has stored its
+    call and src.lending.ghl_disposition_match attaches it (matched_call_id). One row per delivery."""
+
+    __tablename__ = "ghl_disposition_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now,
+                                                  server_default=text("now()"))
+    contact_id: Mapped[Optional[str]] = mapped_column(String(100))  # GHL contact id
+    phone: Mapped[Optional[str]] = mapped_column(String(20))  # phone_utils.normalize
+    disposition_raw: Mapped[str] = mapped_column(String(100), nullable=False)  # as GHL sent it
+    code: Mapped[str] = mapped_column(String(50), nullable=False)  # a config DISPOSITIONS code
+    gate_failed: Mapped[Optional[bool]] = mapped_column(Boolean)
+    ghl_call_id: Mapped[Optional[str]] = mapped_column(String(100))  # GHL call message id, when the workflow sends it
+    caller_name: Mapped[Optional[str]] = mapped_column(String(200))
+    called_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    matched_call_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("lending.call_dispositions.id"))
+    matched_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    alerted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # unmatched alert posted
+    raw_event: Mapped[dict] = mapped_column(JSONB, nullable=False)
+
+    __table_args__ = (
+        Index("idx_lending_ghl_disposition_events_pending", "received_at",
+              postgresql_where=text("matched_call_id IS NULL")),
     )
 
 
