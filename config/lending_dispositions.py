@@ -95,6 +95,42 @@ ANSWERED_CODES = (frozenset(DISPOSITIONS) | {"NOT_DECISION_MAKER", "DATA_NURTURE
     - UNANSWERED_CODES - {"BAD_NUMBER"}
 # GHL pipeline stage names (lower-cased) that count as "showed": the client moves a lead there once the held call happens.
 SHOWED_STAGE_KEYS = frozenset({"held", "showed"})
+# GHL pipeline stage names (lower-cased) that count as "booked" for David's numbers and the scoreboard's Booked (stage):
+# the Requested Appointment workflow moves the opportunity there. UNVERIFIED spelling: Dev A confirms the stage name.
+BOOKED_STAGE_KEYS = frozenset({"booked"})
+
+# GHL call outcomes (G3). GHL's call API carries no disposition (checked 2026-11-03), so a GHL workflow posts the
+# chosen outcome to /webhooks/lending/ghl-disposition; it waits in lending.ghl_disposition_events until the GHL call
+# import has stored the call, then is matched onto it. GHL label (as the caller sees it, upper-cased, non-alphanumerics
+# to "_") -> our code; a body that already sends our code, or a "disp:<CODE>" tag, needs no entry.
+GHL_DISPOSITION_LABELS: dict[str, str] = {
+    "NO_ANSWER": "NO_ANSWER",
+    "VOICEMAIL": "LEFT_VOICEMAIL",
+    "FOLLOW_UP": "CALLBACK_REQUESTED",
+    "REQUESTED_APPOINTMENT": "BOOKED",
+    "NOT_INTERESTED": "CONNECTED_NOT_INTERESTED",
+    "INCORRECT_NUMBER": "BAD_NUMBER",
+    "WRONG_CONTACT": "WRONG_PERSON",
+    "REFERRED": "REFERRED",
+    "DNC_REQUEST": "DNC_REQUEST",
+    "NURTURE": "NURTURE",
+}
+# UNVERIFIED webhook body keys (Dev A builds the workflow): candidates tried in order, at the top level or under
+# GHL's customData.
+GHL_DISPOSITION_FIELD_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "contact_id": ("contact_id", "contactId"),
+    "phone": ("phone", "contact_phone"),
+    "disposition": ("disposition", "lending_disposition", "call_disposition", "call_outcome"),
+    "call_id": ("call_id", "call_message_id", "message_id", "callId"),
+    "user": ("user", "user_name", "called_by", "caller"),
+    "called_at": ("called_at", "call_time", "call_date"),
+    "gate_failed": ("gate_failed",),
+}
+GHL_DISPOSITION_MATCH_WINDOW_MINUTES = 30  # a call started this close to the outcome's time is its call
+GHL_DISPOSITION_PENDING_DAYS = 2           # an outcome still unmatched after this is no longer retried
+GHL_DISPOSITION_MATCH_BATCH = 200
+GHL_DISPOSITION_UNMATCHED_ALERT_HOURS = 2  # an outcome with no call after this is posted once to #dial-tasks
+GHL_MISSING_DISPOSITION_GRACE_MINUTES = 30  # a connected outbound GHL call with no outcome after this is flagged
 # GHL call outcomes (ghl_calls.call_state) for David's activity: a voicemail, and a call where someone talked.
 GHL_VOICEMAIL_STATES = frozenset({"voicemail"})
 GHL_CONNECTED_STATES = frozenset({"completed"})
@@ -158,6 +194,8 @@ CDR_POLL_LOCK_KEY = 7_302_020_803  # one poller at a time: the /last watermark i
 
 
 def validate_dispositions_config() -> None:
+    if not set(GHL_DISPOSITION_LABELS.values()) <= set(DISPOSITIONS):
+        raise ValueError("GHL_DISPOSITION_LABELS maps to a code missing from DISPOSITIONS")
     current = set(DISPOSITIONS)
     if len(current) != len(DISPOSITIONS):
         raise ValueError("DISPOSITIONS must not repeat a code")

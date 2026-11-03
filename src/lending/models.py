@@ -364,6 +364,34 @@ class LendingGhlStageEvent(LendingBase):
     )
 
 
+class LendingGhlDispositionEvent(LendingBase):
+    """A GHL call outcome posted by the disposition workflow (G3), held until the GHL call import has stored its
+    call and src.lending.ghl_disposition_match attaches it (matched_call_id). One row per delivery."""
+
+    __tablename__ = "ghl_disposition_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now,
+                                                  server_default=text("now()"))
+    contact_id: Mapped[Optional[str]] = mapped_column(String(100))  # GHL contact id
+    phone: Mapped[Optional[str]] = mapped_column(String(20))  # phone_utils.normalize
+    disposition_raw: Mapped[str] = mapped_column(String(100), nullable=False)  # as GHL sent it
+    code: Mapped[str] = mapped_column(String(50), nullable=False)  # a config DISPOSITIONS code
+    gate_failed: Mapped[Optional[bool]] = mapped_column(Boolean)
+    ghl_call_id: Mapped[Optional[str]] = mapped_column(String(100))  # GHL call message id, when the workflow sends it
+    caller_name: Mapped[Optional[str]] = mapped_column(String(200))
+    called_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    matched_call_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("lending.call_dispositions.id"))
+    matched_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    alerted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # unmatched alert posted
+    raw_event: Mapped[dict] = mapped_column(JSONB, nullable=False)
+
+    __table_args__ = (
+        Index("idx_lending_ghl_disposition_events_pending", "received_at",
+              postgresql_where=text("matched_call_id IS NULL")),
+    )
+
+
 class LendingMissedCallText(LendingBase):
     """One decision per unanswered call for the missed-call text (WP-GL-9): sent or why not."""
 
