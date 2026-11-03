@@ -41,10 +41,12 @@ from config.lending_dispositions import (
     DNC_CODE,
     GHL_DISPOSITION_FIELD_CANDIDATES,
     GHL_DISPOSITION_LABELS,
+    GHL_DISPOSITION_CLOCK_SKEW_MINUTES,
     GHL_DISPOSITION_DEDUPE_MINUTES,
     GHL_DISPOSITION_MATCH_BATCH,
     GHL_DISPOSITION_MATCH_WINDOW_MINUTES,
     GHL_DISPOSITION_PENDING_DAYS,
+    GHL_DISPOSITION_REQUIRE_CALL_IDENTITY,
 )
 from config.lending_followup import CALL_SOURCE_GHL, GHL_CALL_ID_PREFIX
 from src.lending.dispositions import _to_dt, normalize_code
@@ -61,7 +63,9 @@ _FALSE = frozenset({"false", "no", "n", "0"})
 REASON_NO_DISPOSITION = "disposition is required (check the GHL merge field)"
 REASON_UNKNOWN_DISPOSITION = "disposition is not one of the call outcomes"
 REASON_NO_KEY = "phone or call_id is required"
-INVALID_EVENT_REASONS = frozenset({REASON_NO_DISPOSITION, REASON_UNKNOWN_DISPOSITION, REASON_NO_KEY})
+REASON_NO_CALL_IDENTITY = "call_id or called_at is required (check the GHL merge field)"
+INVALID_EVENT_REASONS = frozenset({REASON_NO_DISPOSITION, REASON_UNKNOWN_DISPOSITION, REASON_NO_KEY,
+                                   REASON_NO_CALL_IDENTITY})
 
 
 class InvalidDispositionEvent(InvalidEvent):
@@ -131,10 +135,13 @@ def parse_event(body: Mapping[str, Any]) -> GhlDispositionEvent:
     call_id = _value(body, "call_id")
     if not phone and not call_id:
         raise InvalidDispositionEvent(REASON_NO_KEY, reason=REASON_NO_KEY)
+    called_at = _to_dt(_value(body, "called_at"))
+    if GHL_DISPOSITION_REQUIRE_CALL_IDENTITY and not call_id and called_at is None:
+        raise InvalidDispositionEvent(REASON_NO_CALL_IDENTITY, reason=REASON_NO_CALL_IDENTITY)
     return GhlDispositionEvent(
         contact_id=_value(body, "contact_id"), phone=phone, disposition_raw=raw[:100], code=code,
         ghl_call_id=call_id[:90] if call_id else None, caller_name=(_value(body, "user") or "")[:200] or None,
-        called_at=_to_dt(_value(body, "called_at")), gate_failed=_gate_failed(_value(body, "gate_failed")),
+        called_at=called_at, gate_failed=_gate_failed(_value(body, "gate_failed")),
     )
 
 
@@ -153,6 +160,7 @@ _FIND_REPEAT = text("""
     SELECT id FROM lending.ghl_disposition_events
      WHERE code = :code AND phone IS NOT DISTINCT FROM :phone AND ghl_call_id IS NOT DISTINCT FROM :call_id
        AND called_at IS NOT DISTINCT FROM :called_at AND caller_name IS NOT DISTINCT FROM :caller
+       AND gate_failed IS NOT DISTINCT FROM :gate AND contact_id IS NOT DISTINCT FROM :contact
        AND received_at > now() - make_interval(mins => :minutes)
      ORDER BY id LIMIT 1
 """)
@@ -161,11 +169,12 @@ _FIND_REPEAT = text("""
 def record_event(db, ev: GhlDispositionEvent, body: Mapping[str, Any]) -> tuple[int, bool]:
     """Store the event once: returns ``(event id, duplicate)``; a repeated delivery returns the stored event's id."""
     key = "|".join(str(v) for v in ("ghl-disposition", ev.phone, ev.code, ev.ghl_call_id, ev.called_at,
-                                    ev.caller_name))
+                                    ev.caller_name, ev.gate_failed, ev.contact_id))
     db.execute(_LOCK_DELIVERY, {"key": key})
     existing = db.execute(_FIND_REPEAT, {
         "code": ev.code, "phone": ev.phone, "call_id": ev.ghl_call_id, "called_at": ev.called_at,
-        "caller": ev.caller_name, "minutes": GHL_DISPOSITION_DEDUPE_MINUTES,
+        "caller": ev.caller_name, "gate": ev.gate_failed, "contact": ev.contact_id,
+        "minutes": GHL_DISPOSITION_DEDUPE_MINUTES,
     }).scalar()
     if existing is not None:
         return existing, True
@@ -189,8 +198,10 @@ def choose_call(event: Mapping[str, Any], calls: Iterable[Mapping[str, Any]],
         return call
     ref = event.get("called_at") or event["received_at"]
     window = timedelta(minutes=window_minutes)
+    skew = timedelta(minutes=GHL_DISPOSITION_CLOCK_SKEW_MINUTES)
+    # An outcome is picked after its call: a call started after the outcome's time (beyond clock skew) is not its call.
     open_calls = [c for c in calls if c["disposition"] is None and c["call_started_at"] is not None
-                  and abs(c["call_started_at"] - ref) <= window]
+                  and ref - window <= c["call_started_at"] <= ref + skew]
     return max(open_calls, key=lambda c: c["call_started_at"], default=None)
 
 
@@ -207,7 +218,7 @@ _PENDING = text("""
                             AND (d.disposition IS DISTINCT FROM :dnc OR e.code = :dnc))
                         OR (e.ghl_call_id IS NULL AND d.phone = e.phone AND d.disposition IS NULL
                             AND d.call_started_at BETWEEN COALESCE(e.called_at, e.received_at) - make_interval(mins => :w)
-                                                      AND COALESCE(e.called_at, e.received_at) + make_interval(mins => :w))))
+                                                      AND COALESCE(e.called_at, e.received_at) + make_interval(mins => :skew))))
      ORDER BY e.received_at, e.id LIMIT :limit FOR UPDATE OF e SKIP LOCKED
 """)
 # One read for every pending event: its exact call, or the open outbound GHL calls to its phone around its time.
@@ -241,7 +252,7 @@ def _candidates(db, events: list[Mapping[str, Any]], window: timedelta) -> list[
         "source": CALL_SOURCE_GHL,
         "call_ids": [f"{GHL_CALL_ID_PREFIX}{e['ghl_call_id']}" for e in events if e.get("ghl_call_id")],
         "phones": sorted({e["phone"] for e in events if e.get("phone") and not e.get("ghl_call_id")}),
-        "lo": min(refs) - window, "hi": max(refs) + window,
+        "lo": min(refs) - window, "hi": max(refs) + timedelta(minutes=GHL_DISPOSITION_CLOCK_SKEW_MINUTES),
     }).mappings().all()
     return [dict(r) for r in rows]
 
@@ -261,6 +272,7 @@ def _attach(db, now: datetime, window: timedelta, window_minutes: int) -> list[i
     events = [dict(e) for e in db.execute(_PENDING, {
         "since": now - timedelta(days=GHL_DISPOSITION_PENDING_DAYS), "limit": GHL_DISPOSITION_MATCH_BATCH,
         "source": CALL_SOURCE_GHL, "prefix": GHL_CALL_ID_PREFIX, "dnc": DNC_CODE, "w": window_minutes,
+        "skew": GHL_DISPOSITION_CLOCK_SKEW_MINUTES,
     }).mappings().all()]
     if not events:
         return []
@@ -270,6 +282,7 @@ def _attach(db, now: datetime, window: timedelta, window_minutes: int) -> list[i
     for c in calls:
         by_phone.setdefault(c["phone"], []).append(c)
     matched: list[int] = []
+    matched_set: set[int] = set()
     call_writes: list[dict[str, Any]] = []
     event_writes: list[dict[str, Any]] = []
     for event in events:
@@ -284,7 +297,8 @@ def _attach(db, now: datetime, window: timedelta, window_minutes: int) -> list[i
                             "unknown_caller": GHL_UNKNOWN_CALLER, "exact": exact, "dnc": DNC_CODE})
         event_writes.append({"call": call["id"], "at": now, "id": event["id"]})
         call["disposition"] = event["code"]  # taken: a second outcome for the same phone needs another call
-        if call["id"] not in matched:
+        if call["id"] not in matched_set:
+            matched_set.add(call["id"])
             matched.append(call["id"])
     if call_writes:
         db.execute(_SET_CALL, call_writes)

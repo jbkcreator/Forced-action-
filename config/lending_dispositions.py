@@ -130,6 +130,11 @@ GHL_DISPOSITION_MATCH_WINDOW_MINUTES = 30  # a call started this close to the ou
 GHL_DISPOSITION_PENDING_DAYS = 2           # an outcome still unmatched after this is no longer retried
 GHL_DISPOSITION_MATCH_BATCH = 200
 GHL_DISPOSITION_DEDUPE_MINUTES = 10      # an identical delivery within this is a webhook retry, stored once
+GHL_DISPOSITION_CLOCK_SKEW_MINUTES = 2   # a call may start this much after the outcome's time (clock drift)
+GHL_DISPOSITION_ALERT_BATCH = 200        # unmatched outcomes claimed per alert run
+# True once Dev A confirms the GHL workflow sends call_id or called_at: without one, a webhook retry and a second
+# call with the same outcome cannot be told apart, so such an event is refused (422).
+GHL_DISPOSITION_REQUIRE_CALL_IDENTITY = False
 GHL_DISPOSITION_UNMATCHED_ALERT_HOURS = 2  # an outcome with no call after this is posted once to #dial-tasks
 GHL_MISSING_DISPOSITION_GRACE_MINUTES = 30  # a connected outbound GHL call with no outcome after this is flagged
 # GHL call outcomes (ghl_calls.call_state) for David's activity: a voicemail, and a call where someone talked.

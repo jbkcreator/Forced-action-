@@ -18,7 +18,11 @@ from typing import Any, Optional
 
 from sqlalchemy import text
 
-from config.lending_dispositions import GHL_DISPOSITION_UNMATCHED_ALERT_HOURS, GHL_MISSING_DISPOSITION_GRACE_MINUTES
+from config.lending_dispositions import (
+    GHL_DISPOSITION_ALERT_BATCH,
+    GHL_DISPOSITION_UNMATCHED_ALERT_HOURS,
+    GHL_MISSING_DISPOSITION_GRACE_MINUTES,
+)
 from config.settings import get_settings
 from src.lending.db import lending_session
 from src.lending.disposition_delivery import _configured_slack, _slack_client
@@ -37,7 +41,8 @@ _CLAIM_UNMATCHED = text(
     "UPDATE lending.ghl_disposition_events SET alerted_at = now() "
     "WHERE id IN (SELECT id FROM lending.ghl_disposition_events "
     "  WHERE matched_call_id IS NULL AND alerted_at IS NULL "
-    "  AND received_at < now() - make_interval(hours => :h) FOR UPDATE SKIP LOCKED) "
+    "  AND received_at < now() - make_interval(hours => :h) "
+    "  ORDER BY received_at LIMIT :limit FOR UPDATE SKIP LOCKED) "
     "RETURNING id, phone, code, caller_name"
 )
 
@@ -104,7 +109,8 @@ def _alert_unmatched(client: Any, channel: str) -> int:
     try:
         with lending_session() as db:
             with db.begin_nested():  # savepoint: a missing table must not abort the caller's transaction
-                rows = db.execute(_CLAIM_UNMATCHED, {"h": GHL_DISPOSITION_UNMATCHED_ALERT_HOURS}).all()
+                rows = db.execute(_CLAIM_UNMATCHED, {"h": GHL_DISPOSITION_UNMATCHED_ALERT_HOURS,
+                                                       "limit": GHL_DISPOSITION_ALERT_BATCH}).all()
             db.commit()
     except Exception as exc:  # the table may not be migrated yet; class only
         logger.warning("[lending] unmatched GHL outcome check skipped: %s", type(exc).__name__)
