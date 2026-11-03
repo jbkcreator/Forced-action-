@@ -33,6 +33,8 @@ Endpoint = Optional[tuple[str, str]]
 # A retried create after a server-side success would create a second, untracked contact.
 _NO_RETRY_POSTS = frozenset({"/contacts"})
 LOAD_ENDPOINTS = ("contacts_add_to_campaign", "contact_update")
+# Removals that delete the contact (no remove-from-campaign endpoint exists); never restored.
+_DELETING_REASONS = frozenset({RemovalReason.OPT_OUT.value, RemovalReason.HANDLED_IN_GHL.value})
 Http = Callable[..., Mapping[str, Any]]
 
 
@@ -220,9 +222,10 @@ class BatchDialerAdapter:
 
     def remove(self, phone: str, *, reason: str) -> None:
         # The public API has no DNC endpoint, so a permanent opt-out deletes every contact we
-        # loaded for the number (our suppression list blocks any reload). Window/cap holds only
-        # leave the campaign and never delete, so restore() can never undo an opt-out.
-        if reason != RemovalReason.OPT_OUT.value:
+        # loaded for the number (our suppression list blocks any reload). A lead handled in GHL
+        # is deleted the same way (its lead row blocks any reload). Window/cap holds only
+        # leave the campaign and never delete, so restore() can never undo either.
+        if reason not in _DELETING_REASONS:
             self._call("campaign_remove", {"phone": phone})
             return
         if self._contact_ids is None:

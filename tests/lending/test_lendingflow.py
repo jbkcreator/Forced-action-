@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from sqlalchemy import text
 
+from config.lending_lendingflow import is_missing_lead_id
 from src.lending import lendingflow, lendingflow_events
 from src.lending.contracts import LoanType
 from src.lending.db import get_lending_db
@@ -176,6 +177,65 @@ def test_blank_consent_is_no_certificate(consent):
     assert parse_lendingflow({"lead_id": "1", "phone": "7275550100", "consent": consent}).certificate is None
 
 
+# What the GHL intake workflow forwarded for a lead LendingFlow sent without consent or address (test lead LF-TEST-5).
+_GHL_NULL_TEXT_PAYLOAD = {
+    "email": "test.borrower5@example.com", "phone": "(727) 555-0105", "state": "Florida",
+    "source": "60 Second Loan Match", "lead_id": "LF-TEST-5", "last_name": "Borrower5", "loan_type": "DSCR",
+    "first_name": "Test", "loan_amount": "$500K - $1M", "credit_score": "740+", "property_zip": "null",
+    "submitted_at": "2026-11-02T16:34:36+05:30", "property_city": "null", "property_address": "null",
+    "consent": {"page_url": "null", "timestamp": "null", "ip_address": "null", "certificate_id": "null",
+                "certificate_url": "null", "disclosure_text": "null"},
+}
+
+
+def test_ghl_null_text_fields_are_missing():
+    parsed = parse_lendingflow(_GHL_NULL_TEXT_PAYLOAD)
+    assert parsed.certificate is None
+    assert (parsed.property_address, parsed.property_city, parsed.property_zip) == (None, None, None)
+    assert parsed.vendor_lead_id == "LF-TEST-5" and parsed.first_name == "Test" and parsed.property_state == "FL"
+
+
+@pytest.mark.parametrize("null_text", ["null", "NULL", " Null ", "undefined"])
+def test_null_text_lead_id_gets_the_missing_id_not_a_shared_one(null_text):
+    parsed = parse_lendingflow({"lead_id": null_text, "phone": "7275550100", "first_name": null_text})
+    assert is_missing_lead_id(parsed.vendor_lead_id) and parsed.first_name is None
+
+
+def test_real_certificate_with_one_null_text_field_is_kept_verbatim():
+    consent = {"certificate_id": "cert-1", "certificate_url": "null", "timestamp": "2026-10-14T15:42:17Z"}
+    certificate = parse_lendingflow({"lead_id": "1", "phone": "7275550100", "consent": consent}).certificate
+    assert certificate.certificate_id == "cert-1" and certificate.url is None
+    assert certificate.raw == json.dumps(consent, ensure_ascii=False)
+
+
+@pytest.mark.parametrize("consent", [
+    {"certificate_id": "{{inboundWebhookRequest.consent.certificate_id}}", "timestamp": "{{ x }}"},
+    {"ip_address": "203.0.113.7", "page_url": "https://lendingflow.example/apply",
+     "disclosure_text": "By clicking Submit you agree"},
+    {"timestamp": "not a time", "ip_address": "203.0.113.7"},
+    "{{inboundWebhookRequest.consent}}",
+])
+def test_consent_without_certificate_evidence_is_no_certificate(consent):
+    assert parse_lendingflow({"lead_id": "1", "phone": "7275550100", "consent": consent}).certificate is None
+
+
+@pytest.mark.parametrize("consent", [{"certificate_id": "cert-1"}, {"certificate_url": "https://cert.example/1"},
+                                     {"timestamp": "2026-10-14T15:42:17Z"}, {"raw": "abc"}, "-----CERT-----"])
+def test_any_one_piece_of_certificate_evidence_is_a_certificate(consent):
+    assert parse_lendingflow({"lead_id": "1", "phone": "7275550100", "consent": consent}).certificate is not None
+
+
+def test_unfilled_merge_field_is_missing_for_any_field():
+    parsed = parse_lendingflow({"lead_id": "{{inboundWebhookRequest.lead_id}}", "phone": "7275550100",
+                                "property_address": "{{inboundWebhookRequest.property_address}}"})
+    assert is_missing_lead_id(parsed.vendor_lead_id) and parsed.property_address is None
+
+
+def test_null_as_a_word_inside_a_value_is_kept():
+    parsed = parse_lendingflow({"lead_id": "1", "phone": "7275550100", "property_address": "1 Null Island Rd"})
+    assert parsed.property_address == "1 Null Island Rd"
+
+
 def test_consent_with_one_real_field_is_kept_verbatim():
     consent = {**_EMPTY_TEMPLATE_CONSENT, "certificate_id": "cert-1"}
     certificate = parse_lendingflow({"lead_id": "1", "phone": "7275550100", "consent": consent}).certificate
@@ -333,7 +393,7 @@ def _saved(db, **overrides):
     return save_lead(db, parse_lendingflow(payload), payload)
 
 
-def test_delivery_emits_event_once_and_queues_prequal(lf_db, seen):
+def test_delivery_emits_event_once_and_queues_no_prequal_at_intake(lf_db, seen):
     events, prequal = seen
     _saved(lf_db)
     sink = RecordingSink()
@@ -342,8 +402,8 @@ def test_delivery_emits_event_once_and_queues_prequal(lf_db, seen):
     assert len(sink.pushed) == 1 and sink.pushed[0]["phone"] == "+17275550100"
     assert len(events) == 1 and events[0].loan_type is LoanType.DSCR_RENTAL and events[0].credit_band_min_fico == 740
     assert events[0].phone == "+17275550100" and events[0].loan_amount == 500_000
-    assert len(prequal) == 1 and prequal[0]["lead_source"] == "lendingflow" and prequal[0]["lead_ref"] == "LF-1"
-    assert prequal[0]["contact_id"] == "ghl_1" and prequal[0]["lead"].property_state == "FL"
+    assert prequal == []  # Q2 (client list Nov 2): the letter waits for the call figures
+    assert _row(lf_db).followup_done_at is not None
     assert deliver_pending(lf_db, sink) == [] and len(sink.pushed) == 1  # nothing left to deliver
 
 
@@ -359,14 +419,7 @@ def test_failed_push_then_sweep_emits_exactly_once(lf_db, seen):
     assert len(events) == 1
 
 
-def test_missing_prequal_field_still_emits_but_skips_prequal(lf_db, seen):
-    events, prequal = seen
-    _saved(lf_db, loan_amount=None)
-    run_followups(lf_db, deliver_pending(lf_db, RecordingSink()))
-    assert len(events) == 1 and prequal == []
-
-
-def test_event_handler_failure_does_not_stop_prequal(lf_db, seen):
+def test_event_handler_failure_still_finishes_the_follow_up(lf_db, seen):
     events, prequal = seen
 
     def boom(event):
@@ -375,7 +428,7 @@ def test_event_handler_failure_does_not_stop_prequal(lf_db, seen):
     lendingflow_events._handlers.insert(0, boom)
     _saved(lf_db)
     run_followups(lf_db, deliver_pending(lf_db, RecordingSink()))
-    assert len(events) == 1 and len(prequal) == 1
+    assert len(events) == 1 and prequal == []
 
 
 def test_no_sink_leaves_lead_pending(lf_db):
@@ -431,27 +484,6 @@ def _row(db):
     return _select_added(db, "lendingflow_leads", "ghl_status, event_emitted_at, followup_done_at").one()
 
 
-def test_failed_prequal_handoff_is_retried_by_the_sweep(lf_db, seen, monkeypatch):
-    events, prequal = seen
-    calls = []
-
-    def flaky(**kw):
-        calls.append(kw)
-        if len(calls) == 1:
-            raise RuntimeError("connection blip")
-        prequal.append(kw)
-
-    monkeypatch.setattr("src.lending.prequal_letters.queue_and_send_in_background", flaky)
-    _saved(lf_db)
-    run_followups(lf_db, deliver_pending(lf_db, RecordingSink()))
-    row = _row(lf_db)
-    assert row.ghl_status == "contact_only" and row.event_emitted_at is not None and row.followup_done_at is None
-    later = datetime.now(timezone.utc) + timedelta(minutes=10)
-    run_followups(lf_db, deliver_pending(lf_db, RecordingSink(), now=later))
-    assert _row(lf_db).followup_done_at is not None
-    assert len(events) == 1 and len(prequal) == 1  # event not re-emitted, letter handed off once
-
-
 def test_failed_event_emit_is_retried_by_the_sweep(lf_db, seen, monkeypatch):
     events, prequal = seen
     real_build = lendingflow_events.build_event
@@ -482,10 +514,10 @@ def test_crash_after_delivery_commit_is_recovered(lf_db, seen):
     assert events == []
     later = datetime.now(timezone.utc) + timedelta(minutes=10)
     run_followups(lf_db, deliver_pending(lf_db, sink, now=later))
-    assert len(events) == 1 and len(prequal) == 1 and sink.pushed == []  # recovery never re-pushes to GHL
+    assert len(events) == 1 and prequal == [] and sink.pushed == []  # recovery never re-pushes to GHL
     assert _row(lf_db).followup_done_at is not None
     run_followups(lf_db, deliver_pending(lf_db, sink, now=later))
-    assert len(events) == 1 and len(prequal) == 1  # done leads are never picked up again
+    assert len(events) == 1 and prequal == []  # done leads are never picked up again
 
 
 def test_migration_rerun_keeps_unfinished_followup_pending(lf_db):

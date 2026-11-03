@@ -5,7 +5,7 @@ from datetime import date, datetime
 
 from typing import Literal, Optional
 
-from pydantic import AliasChoices, AnyUrl, Field, SecretStr, PostgresDsn, field_validator
+from pydantic import AliasChoices, AnyUrl, Field, SecretStr, PostgresDsn, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -956,6 +956,13 @@ class AppSettings(BaseSettings):
 	lending_lendingflow_intro_sms_enabled: bool = Field(default=False, env="LENDING_LENDINGFLOW_INTRO_SMS_ENABLED")
 	# Pipeline stage (in LENDING_GHL_PIPELINE_ID) for new LendingFlow leads; unset = contact only.
 	lending_ghl_stage_lendingflow_new: Optional[str] = Field(default=None, env="LENDING_GHL_STAGE_LENDINGFLOW_NEW")
+	# LendingFlow -> BatchDialer campaign "LendingFlow" (src/lending/lendingflow_dialer.py). Off: nothing is loaded; leads
+	# already loaded are still removed once they are handled in GHL. The delay is Josh's first-call window (placeholder).
+	lending_lendingflow_dialer_enabled: bool = Field(default=False, env="LENDING_LENDINGFLOW_DIALER_ENABLED")
+	lending_lendingflow_dialer_delay_minutes: int = Field(default=15, env="LENDING_LENDINGFLOW_DIALER_DELAY_MINUTES")
+	# BatchDialer call results as tags + a "last BatchDialer call" field on the GHL contact (src/lending/bd_result_to_ghl.py).
+	lending_bd_result_to_ghl_enabled: bool = Field(default=False, env="LENDING_BD_RESULT_TO_GHL_ENABLED")
+	lending_ghl_cf_last_bd_call: Optional[str] = Field(default=None, env="LENDING_GHL_CF_LAST_BD_CALL")  # GHL custom field id; unset = tags only
 	# T-09 intro SMS. Off: the tag that starts the GHL intro workflow is never added, so nobody is texted. Turn on only after
 	# Josh confirms LendingFlow's consent and DNC check. Needs the id of the GHL contact custom field "intro_name".
 	lending_intro_sms_enabled: bool = Field(default=False, env="LENDING_INTRO_SMS_ENABLED")
@@ -989,6 +996,10 @@ class AppSettings(BaseSettings):
 	lending_ghl_app_url: str = Field(default="https://app.gohighlevel.com", env="LENDING_GHL_APP_URL")  # GHL web app base for contact links (white-label domain if any)
 	lending_lead_arrival_alert_enabled: bool = Field(default=False, env="LENDING_LEAD_ARRIVAL_ALERT_ENABLED")  # T-05: @-mention Josh in LENDING_OPS_CHANNEL when a LendingFlow lead arrives
 	lending_alarm_sms_to: Optional[str] = Field(default=None, env="LENDING_ALARM_SMS_TO")  # Josh's mobile; normalized before use
+	# Uncalled-lead alarm working hours, Eastern, HH:MM 24h, Mon-Fri. No alarm or retry outside them; those leads go
+	# on the 08:55 "call these first" list. Start inclusive, end exclusive.
+	lending_alarm_hours_start: str = Field(default="09:00", env="LENDING_ALARM_HOURS_START")
+	lending_alarm_hours_end: str = Field(default="19:15", env="LENDING_ALARM_HOURS_END")
 	lending_ops_channel: str = Field(default="", env="LENDING_OPS_CHANNEL")  # #lead-alerts channel ID: call-now alert, 5-minute flags, returning-borrower alert
 	lending_ops_notice_channel: str = Field(default="", env="LENDING_OPS_NOTICE_CHANNEL")  # opt-out mailbox and webhook-failure alerts; channel ID, unset = not posted
 	# 14-day follow-up (src/lending/ghl_call_import.py): record calls made in GoHighLevel in lending.call_dispositions
@@ -1196,6 +1207,22 @@ class AppSettings(BaseSettings):
 		if not url.startswith("https://") or any(c.isspace() for c in url):
 			raise ValueError("LENDING_RESCHEDULE_URL must be a single https:// URL")
 		return url
+
+	@field_validator("lending_alarm_hours_start", "lending_alarm_hours_end", mode="before")
+	@classmethod
+	def _alarm_hours_hhmm(cls, value):
+		raw = str(value).strip()
+		try:
+			parsed = datetime.strptime(raw, "%H:%M")
+		except ValueError as exc:
+			raise ValueError("LENDING_ALARM_HOURS_START / _END must be HH:MM (24h), e.g. 09:00 or 19:15") from exc
+		return parsed.strftime("%H:%M")
+
+	@model_validator(mode="after")
+	def _alarm_hours_order(self):
+		if self.lending_alarm_hours_start >= self.lending_alarm_hours_end:
+			raise ValueError("LENDING_ALARM_HOURS_START must be before LENDING_ALARM_HOURS_END")
+		return self
 	# Verified GHL sending address for those emails (hello@nextdeallending.com). Unset = no email sender.
 	lending_ghl_email_from: Optional[str] = Field(default=None, env="LENDING_GHL_EMAIL_FROM")
 	# Logs the key paths (never values) of each incoming lending GHL webhook, to confirm the real field names.

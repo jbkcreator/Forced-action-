@@ -282,6 +282,10 @@ class LendingCallDisposition(LendingBase):
                                              server_default=text("'batchdialer'"))
     # A NURTURE call whose gate check failed (G2: replaces the old GATE_FAILED_NURTURE code); NULL = not reported.
     gate_failed: Mapped[Optional[bool]] = mapped_column(Boolean)
+    # BatchDialer result written to the GHL contact (src/lending/bd_result_to_ghl.py); rewritten when the code changes.
+    ghl_note_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    ghl_note_disposition: Mapped[Optional[str]] = mapped_column(String(50))
+    ghl_note_attempts: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=0, server_default=text("0"))
 
     __table_args__ = (
         Index("idx_lending_call_dispositions_phone_ended", "phone", "call_ended_at"),
@@ -484,6 +488,8 @@ class LendingSoftApproval(LendingBase):
     Interim "deal record": the Person/Property/Deal tables arrive with T-11. One row per lead; a
     resubmission with changed figures updates it in place and appends the replaced values to ``history``.
     ``pdf`` is NULL unless ``status`` is ``generated``. ``lender_key`` is internal; the PDF never names it.
+    ``lead_ref`` is the ``lendingflow_leads.lead_uuid`` the submission assessed (NULL when no lead was found); the
+    pre-qual letter is sent for that lead only, never for a newer lead on the same phone.
     """
 
     __tablename__ = "soft_approvals"
@@ -491,6 +497,7 @@ class LendingSoftApproval(LendingBase):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     phone: Mapped[str] = mapped_column(String(20), nullable=False, unique=True)  # phone_utils.normalize
     dialer_call_id: Mapped[str] = mapped_column(String(100), nullable=False)  # call of the latest submission
+    lead_ref: Mapped[Optional[str]] = mapped_column(String(36))
     status: Mapped[str] = mapped_column(String(30), nullable=False)
     reason: Mapped[Optional[str]] = mapped_column(String(60))
     lender_key: Mapped[Optional[str]] = mapped_column(String(60))
@@ -703,9 +710,30 @@ class LendingLendingFlowLead(LendingBase):
     last_duplicate_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     is_test: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))  # test traffic: left out of reports and caps, never out of suppression or consent
     raw_payload: Mapped[Any] = mapped_column(JSONB, nullable=False)
+    # LendingFlow -> BatchDialer (src/lending/lendingflow_dialer.py). Leads that existed before the migration are
+    # 'preexisting' and never loaded.
+    dialer_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending", server_default=text("'pending'"))
+    dialer_block_reason: Mapped[Optional[str]] = mapped_column(String(40))
+    dialer_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    dialer_failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    dialer_last_error: Mapped[Optional[str]] = mapped_column(String(200))
+    dialer_claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    dialer_next_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    dialer_loaded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    dialer_removed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    dialer_ghl_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    duplicate_of: Mapped[Optional[int]] = mapped_column(ForeignKey("lending.lendingflow_leads.id"))
+    handled_in_ghl_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # booked / connected in GHL
+    handled_in_ghl_reason: Mapped[Optional[str]] = mapped_column(String(30))
 
     __table_args__ = (
         CheckConstraint("consent_status IN ('present', 'missing')", name="ck_lending_lendingflow_leads_consent"),
+        CheckConstraint(
+            "dialer_status IN ('pending', 'loading', 'loaded', 'blocked', 'unconfirmed', 'remove_pending', "
+            "'removed', 'duplicate', 'expired', 'failed', 'preexisting')",
+            name="ck_lending_lendingflow_leads_dialer_status"),
+        Index("idx_lending_lendingflow_leads_dialer_pending", "received_at",
+              postgresql_where=text("dialer_status = 'pending'")),
         CheckConstraint("ghl_status IN ('pending', 'synced', 'contact_only', 'failed', 'skipped')",
                         name="ck_lending_lendingflow_leads_ghl_status"),
         Index("uq_lending_lendingflow_leads_vendor", "vendor_lead_id", unique=True),
@@ -951,7 +979,7 @@ class LendingUncalledAlarm(LendingBase):
     migration order. ``fired_120_at`` / ``fired_300_at`` are claims committed before the send: an alarm fires
     at most once. ``*_status``: sent / retry (definitely not sent, will be retried) / sending (a retry is claimed) /
     send_unknown (may have been sent: never resent) / failed (retries used up) / superseded (no longer needed) /
-    not_configured / skipped_late. ``alarm_*_kind``: no_call / not_reached. ``resolved_reason``: connected / escalated / preexisting (existed before T-10 was switched on).
+    not_configured / skipped_late. ``alarm_*_kind``: no_call / not_reached. ``resolved_reason``: connected / escalated / preexisting (existed before T-10 was switched on) / after_hours (due outside working hours: no alarm, on the 08:55 morning list instead).
     """
 
     __tablename__ = "uncalled_alarms"
@@ -980,7 +1008,7 @@ class LendingUncalledAlarm(LendingBase):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 
     __table_args__ = (
-        CheckConstraint("resolved_reason IN ('connected', 'escalated', 'preexisting')",
+        CheckConstraint("resolved_reason IN ('connected', 'escalated', 'preexisting', 'after_hours')",
                         name="ck_lending_uncalled_alarms_reason"),
         CheckConstraint("(lendingflow_lead_id IS NULL) <> (web_lead_id IS NULL)", name="ck_lending_uncalled_alarms_one_source"),
         Index("uq_lending_uncalled_alarms_web_lead", "web_lead_id", unique=True),
