@@ -130,9 +130,9 @@ class GhlSmsSender:
         contact: dict[str, Any] = {"locationId": self._account.location_id, "phone": phone}
         if first_name:
             contact["firstName"] = first_name
-        if decision.cold:
-            # A consented cold lead: lift only the SMS do-not-disturb set when the contact was pushed cold.
-            contact["dndSettings"] = {"SMS": {"status": "inactive"}}
+        if decision.lift_dnd:
+            # A consented cold lead, or a warm lead first reached cold: lift only the SMS do-not-disturb.
+            contact["dndSettings"] = {channel: {"status": "inactive"} for channel in decision.lift_dnd}
         contact_id = (self._post(self._http(), "/contacts/upsert", contact, "contact upsert").get("contact") or {}).get("id")
         if not contact_id:
             raise GhlSmsError("GHL contact upsert returned no contact id")

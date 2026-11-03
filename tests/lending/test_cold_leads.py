@@ -87,7 +87,7 @@ def test_a_cold_lead_without_text_consent_gets_no_text(lead_db):
 
 def test_a_cold_lead_with_text_consent_may_be_texted_and_is_marked_cold(lead_db):
     lead_db(cold=True, consent=True)
-    assert cold_send_decision(PHONE, SendChannel.SMS) == cold_leads.ColdSendDecision(cold=True)
+    assert cold_send_decision(PHONE, SendChannel.SMS) == cold_leads.ColdSendDecision(cold=True, lift_dnd=("SMS",))
 
 
 def test_a_cold_lead_is_never_emailed_even_with_text_consent(lead_db):

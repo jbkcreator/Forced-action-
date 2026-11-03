@@ -34,6 +34,7 @@ from config.lending_web import (
     GHL_TAG_WEB_LEAD,
 )
 from config.settings import get_settings
+from src.lending.cold_leads import reconcile_warm_contact
 from src.lending.ghl_account import GhlAccount, ghl_headers, lending_ghl_account
 from src.lending.web_leads import DeliveryError, LeadSink, PushResult
 
@@ -147,6 +148,8 @@ class GhlLeadSink:
         if stale:
             # only our own earlier "no" tags are ever removed, so "no" and "yes" never sit side by side
             self._call("remove stale tag", "DELETE", f"/contacts/{contact_id}/tags", json={"tags": stale})
+        reconcile_warm_contact(self._call, self._account.location_id, contact_id, lead["phone"],
+                               text_consent=_consent_effective(lead), log_prefix="[web-lead-ghl]")
         pipeline_card, existing = self._ensure_pipeline_card(lead, contact_id)
         moved = existing is not None and self._reopen_if_closed(existing)
         if existing is not None:

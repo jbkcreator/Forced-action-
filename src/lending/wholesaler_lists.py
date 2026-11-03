@@ -13,7 +13,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional, Protocol, Sequence
 
-from config.lending_compliance import COLD_LEAD_DND_CHANNELS, GHL_TAG_COLD_LEAD
+from config.lending_compliance import COLD_LEAD_DND_CHANNELS, COLD_LEAD_DND_MESSAGE, GHL_TAG_COLD_LEAD
 from config.lending_wholesalers import (
     GHL_TAG_SOURCE_PREFIX,
     GHL_TAG_STATE_PREFIX,
@@ -29,7 +29,6 @@ from src.services.phone_utils import normalize as normalize_phone
 
 logger = logging.getLogger(__name__)
 
-COLD_LEAD_DND_MESSAGE = "Cold lead: calls only"
 
 
 @dataclass
