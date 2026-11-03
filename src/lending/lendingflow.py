@@ -3,8 +3,9 @@
 Order matters, as for web leads: the lead and its consent certificate are committed before GHL is
 called, so a GHL outage never loses a paid lead. ``parse_lendingflow`` is the only function that
 knows LendingFlow's payload shape. After the GHL contact exists the lead's
-``LendingFlowLeadCreated`` event is emitted and the T-07 pre-qual letter is queued; a lead is marked
-done only when both succeeded, so a crash or a failed hand-off is redone by the sweep.
+``LendingFlowLeadCreated`` event is emitted; a lead is marked done only when it succeeded, so a crash or a
+failed hand-off is redone by the sweep. No pre-qual letter is queued at intake (client list Nov 2, Q2): the
+letter waits for the call figures and is queued from the Call-One form (``soft_approval/prequal_link.py``).
 """
 from __future__ import annotations
 
@@ -593,24 +594,6 @@ def _emit_event(db, lead: Mapping[str, Any]) -> bool:
     return True
 
 
-def _hand_off_prequal(lead: Mapping[str, Any]) -> bool:
-    from src.lending.prequal import PrequalLead
-    from src.lending.prequal_letters import queue_and_send_in_background
-
-    prequal = PrequalLead(credit_band=lead["credit_band"], loan_amount=lead["loan_amount"],
-                          property_state=lead["property_state"], loan_type=lead["loan_type"])
-    if not all((prequal.credit_band, prequal.loan_amount, prequal.property_state, prequal.loan_type)):
-        logger.info("[lendingflow] prequal_skipped_missing_fields lead=%s", lead["id"])
-        return True
-    try:
-        queue_and_send_in_background(lead_source=LEAD_SOURCE, lead_ref=lead["vendor_lead_id"],
-                                     contact_id=lead["ghl_contact_id"], lead=prequal, strict=True)
-    except Exception as exc:
-        logger.error("[lendingflow] prequal hand-off failed lead=%s: %s", lead["id"], type(exc).__name__)
-        return False
-    return True
-
-
 _HELD_FOR_WINDOW = (
     "SELECT id, phone, email, property_state, property_zip, ghl_contact_id FROM lending.lendingflow_leads "
     "WHERE consent_status = 'present' AND NOT suppressed AND ghl_status IN ('synced', 'contact_only') "
@@ -667,15 +650,12 @@ def release_held_and_commit(sink: Optional[Any]) -> int:
 
 
 def run_followups(db, followups: list[FollowUp]) -> None:
-    """After the delivery commit: emit the event, then queue the pre-qual letter when the 4 core fields are
-    present. A lead is marked done only when both succeeded; otherwise the sweep redoes the missing step
-    (the event is skipped once ``event_emitted_at`` is set; the letter is idempotent on its lead ref).
-    Never raises; logs lead id only."""
+    """After the delivery commit: emit the event. A lead is marked done only when it succeeded; otherwise the
+    sweep redoes it (skipped once ``event_emitted_at`` is set). No pre-qual letter here: it waits for the call
+    figures (Q2). Never raises; logs lead id only."""
     for item in followups:
         lead = item.lead
-        event_ok = _emit_event(db, lead)
-        prequal_ok = _hand_off_prequal(lead)
-        if event_ok and prequal_ok:
+        if _emit_event(db, lead):
             try:
                 _mark(db, lead["id"], "followup_done_at", datetime.now(timezone.utc))
             except Exception as exc:

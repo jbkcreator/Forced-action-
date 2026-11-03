@@ -458,6 +458,8 @@ class LendingSoftApproval(LendingBase):
     Interim "deal record": the Person/Property/Deal tables arrive with T-11. One row per lead; a
     resubmission with changed figures updates it in place and appends the replaced values to ``history``.
     ``pdf`` is NULL unless ``status`` is ``generated``. ``lender_key`` is internal; the PDF never names it.
+    ``lead_ref`` is the ``lendingflow_leads.lead_uuid`` the submission assessed (NULL when no lead was found); the
+    pre-qual letter is sent for that lead only, never for a newer lead on the same phone.
     """
 
     __tablename__ = "soft_approvals"
@@ -465,6 +467,7 @@ class LendingSoftApproval(LendingBase):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     phone: Mapped[str] = mapped_column(String(20), nullable=False, unique=True)  # phone_utils.normalize
     dialer_call_id: Mapped[str] = mapped_column(String(100), nullable=False)  # call of the latest submission
+    lead_ref: Mapped[Optional[str]] = mapped_column(String(36))
     status: Mapped[str] = mapped_column(String(30), nullable=False)
     reason: Mapped[Optional[str]] = mapped_column(String(60))
     lender_key: Mapped[Optional[str]] = mapped_column(String(60))
@@ -946,7 +949,7 @@ class LendingUncalledAlarm(LendingBase):
     migration order. ``fired_120_at`` / ``fired_300_at`` are claims committed before the send: an alarm fires
     at most once. ``*_status``: sent / retry (definitely not sent, will be retried) / sending (a retry is claimed) /
     send_unknown (may have been sent: never resent) / failed (retries used up) / superseded (no longer needed) /
-    not_configured / skipped_late. ``alarm_*_kind``: no_call / not_reached. ``resolved_reason``: connected / escalated / preexisting (existed before T-10 was switched on).
+    not_configured / skipped_late. ``alarm_*_kind``: no_call / not_reached. ``resolved_reason``: connected / escalated / preexisting (existed before T-10 was switched on) / after_hours (due outside working hours: no alarm, on the 08:55 morning list instead).
     """
 
     __tablename__ = "uncalled_alarms"
@@ -975,7 +978,7 @@ class LendingUncalledAlarm(LendingBase):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 
     __table_args__ = (
-        CheckConstraint("resolved_reason IN ('connected', 'escalated', 'preexisting')",
+        CheckConstraint("resolved_reason IN ('connected', 'escalated', 'preexisting', 'after_hours')",
                         name="ck_lending_uncalled_alarms_reason"),
         CheckConstraint("(lendingflow_lead_id IS NULL) <> (web_lead_id IS NULL)", name="ck_lending_uncalled_alarms_one_source"),
         Index("uq_lending_uncalled_alarms_web_lead", "web_lead_id", unique=True),

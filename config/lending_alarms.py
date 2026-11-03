@@ -10,9 +10,18 @@ segment size. Slack texts carry no name or phone.
 """
 from __future__ import annotations
 
+from config.lending_after_hours import BUSINESS_DAYS, MORNING_POST_ET
 from config.lending_dispositions import UNANSWERED_CODES
 
 FIRST_ALARM_SECONDS = 120
+
+# Alarms are sent only in working hours on business days. The hours are settings, LENDING_ALARM_HOURS_START /
+# LENDING_ALARM_HOURS_END (Eastern, HH:MM, default 09:00-19:15). An alarm that falls due outside them is not sent:
+# the lead is closed 'after_hours' and goes on the next business morning's 08:55 "call these first" list. Due
+# between that post and the start of working hours on a business day, it waits instead (that morning's list has
+# gone already). Holidays are not skipped, like the after-hours pins.
+ALARM_DAYS = BUSINESS_DAYS
+ALARM_HOLD_FROM = MORNING_POST_ET    # business-day mornings from here until the start of working hours: wait
 ESCALATION_SECONDS = 300
 POLL_SECONDS = 5
 BATCH_SIZE = 50

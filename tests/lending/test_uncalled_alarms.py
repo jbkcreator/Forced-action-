@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import text
 
 from migrations.apply_lending_uncalled_alarms import apply_to
+from migrations.apply_lending_uncalled_alarms_after_hours import apply_to as apply_after_hours
 
 ARRIVED = datetime(2026, 10, 9, 15, 0, tzinfo=timezone.utc)
 LEAD_PHONE = "+17275550100"
@@ -73,6 +74,7 @@ def db(lending_db):
     conn.execute(text(_T11_LEADS))
     conn.execute(text(_WEB_LEADS))
     apply_to(conn)  # existing shared-DB leads become 'preexisting' and never alarm in tests
+    apply_after_hours(conn)  # a table created before 'after_hours' keeps the old reason CHECK otherwise
     return lending_db
 
 
@@ -819,3 +821,208 @@ def test_the_inbox_label_is_the_full_name_then_the_phone_never_an_id():
     assert _inbox_label({**row, "full_name": None}) == "Jane (FL)"
     assert _inbox_label({**row, "full_name": None, "first_name": " "}) == "(no name, …0100) (FL)"
     assert _inbox_label({**row, "full_name": None, "first_name": None, "phone": None, "property_state": None}) == "(no name)"
+
+
+# --- Working hours only (client list Nov 2, C1): Mon-Fri 09:00-19:15 ET; after-hours leads go on the 08:55 list ---
+
+from src.lending.uncalled_alarm_worker import (  # noqa: E402
+    CLOSED,
+    HOLD,
+    OPEN,
+    after_hours_leads,
+    alarm_hours,
+    previous_morning_list,
+)
+
+SATURDAY_NOON = datetime(2026, 10, 10, 16, 0, tzinfo=timezone.utc)      # 12:00 EDT
+FRIDAY_LATE = datetime(2026, 10, 9, 23, 12, tzinfo=timezone.utc)         # 19:12 EDT
+MONDAY_BEFORE_SHIFT = datetime(2026, 10, 12, 12, 56, tzinfo=timezone.utc)  # 08:56 EDT
+MONDAY_LIST = datetime(2026, 10, 12, 12, 55, tzinfo=timezone.utc)        # 08:55 EDT
+
+
+@pytest.mark.parametrize("utc, expected", [
+    (ARRIVED, OPEN),                                                     # Fri 11:00 ET
+    (datetime(2026, 10, 9, 13, 0, tzinfo=timezone.utc), OPEN),           # Fri 09:00 ET
+    (datetime(2026, 10, 9, 23, 14, 59, tzinfo=timezone.utc), OPEN),      # Fri 19:14:59 ET
+    (datetime(2026, 10, 9, 23, 15, tzinfo=timezone.utc), CLOSED),        # Fri 19:15 ET
+    (SATURDAY_NOON, CLOSED),
+    (datetime(2026, 10, 12, 12, 50, tzinfo=timezone.utc), CLOSED),       # Mon 08:50 ET, before the 08:55 list
+    (MONDAY_BEFORE_SHIFT, HOLD),                                         # Mon 08:56 ET, list posted, shift not open
+    (datetime(2026, 11, 2, 14, 0, tzinfo=timezone.utc), OPEN),           # Mon 09:00 EST (after the clock change)
+])
+def test_alarm_hours(utc, expected):
+    assert alarm_hours(utc) == expected
+
+
+def test_a_lead_that_arrives_after_hours_never_alarms_and_is_closed_after_hours(db):
+    lead_id = lead(db, arrived=SATURDAY_NOON)
+    sms, slack = Sms(), Slack()
+    for seconds in (120, 300, 600):
+        process_due(db, now=SATURDAY_NOON + timedelta(seconds=seconds), sms=sms, slack=slack, ghl_status=None,
+                    sms_to=JOSH, ops_channel=OPS)
+    row = alarm(db, lead_id)
+    assert sms.sent == [] and slack.posts == []
+    assert row["resolved_reason"] == "after_hours" and row["fired_120_at"] is None and row["fired_300_at"] is None
+
+
+def test_the_escalation_due_after_7_15_is_not_sent(db):
+    lead_id = lead(db, arrived=FRIDAY_LATE)
+    sms, slack = Sms(), Slack()
+    process_due(db, now=FRIDAY_LATE + timedelta(seconds=120), sms=sms, slack=slack, ghl_status=None,
+                sms_to=JOSH, ops_channel=OPS)
+    assert len(sms.sent) == 1  # 19:14 ET: the 2-minute alarm still goes out
+    process_due(db, now=FRIDAY_LATE + timedelta(seconds=300), sms=sms, slack=slack, ghl_status=None,
+                sms_to=JOSH, ops_channel=OPS)
+    assert len(sms.sent) == 1 and slack.posts == []
+    assert alarm(db, lead_id)["resolved_reason"] == "after_hours"
+
+
+def test_a_pending_first_alarm_retry_is_dropped_when_the_lead_is_closed_after_hours(db):
+    lead_id = lead(db, arrived=FRIDAY_LATE)
+    process_due(db, now=FRIDAY_LATE + timedelta(seconds=120), sms=Sms(GhlSmsError("rejected", ambiguous=False)),
+                slack=None, ghl_status=None, sms_to=JOSH, ops_channel=OPS)
+    assert alarm(db, lead_id)["sms_120_status"] == "retry"
+    process_due(db, now=FRIDAY_LATE + timedelta(seconds=300), sms=Sms(), slack=None, ghl_status=None,
+                sms_to=JOSH, ops_channel=OPS)
+    row = alarm(db, lead_id)
+    assert row["resolved_reason"] == "after_hours" and row["sms_120_status"] == "superseded"
+
+
+def test_between_the_morning_list_and_9_the_alarm_waits_for_the_shift(db):
+    lead_id = lead(db, arrived=MONDAY_BEFORE_SHIFT)
+    sms = Sms()
+    process_due(db, now=MONDAY_BEFORE_SHIFT + timedelta(seconds=120), sms=sms, slack=None, ghl_status=None,
+                sms_to=JOSH, ops_channel=OPS)  # 08:58 ET
+    assert sms.sent == [] and alarm(db, lead_id)["resolved_at"] is None
+    process_due(db, now=MONDAY_BEFORE_SHIFT + timedelta(seconds=240), sms=sms, slack=None, ghl_status=None,
+                sms_to=JOSH, ops_channel=OPS)  # 09:00 ET
+    assert len(sms.sent) == 1 and "came in 4 min ago" in sms.sent[0][1]
+
+
+def test_previous_morning_list_skips_the_weekend():
+    assert previous_morning_list(MONDAY_LIST) == datetime(2026, 10, 9, 12, 55, tzinfo=timezone.utc)   # Fri 08:55 ET
+    tuesday = datetime(2026, 10, 13, 12, 55, tzinfo=timezone.utc)
+    assert previous_morning_list(tuesday) == MONDAY_LIST
+
+
+def _close_after_hours(db, arrived) -> int:
+    lead_id = lead(db, arrived=arrived, phone=f"+1727555{uuid.uuid4().int % 10000:04d}")
+    process_due(db, now=arrived + timedelta(seconds=300), sms=Sms(), slack=None, ghl_status=None,
+                sms_to=JOSH, ops_channel=OPS)
+    assert alarm(db, lead_id)["resolved_reason"] == "after_hours"
+    return alarm(db, lead_id)["id"]
+
+
+def test_morning_list_shows_after_hours_leads_since_the_previous_list_not_yet_reached(db):
+    weekend = _close_after_hours(db, SATURDAY_NOON)
+    friday_night = _close_after_hours(db, FRIDAY_LATE + timedelta(minutes=10))  # 19:22 ET
+    reached_id = _close_after_hours(db, SATURDAY_NOON + timedelta(hours=1))
+    reached_phone = db.execute(text("SELECT phone FROM lending.uncalled_alarms WHERE id = :i"),
+                               {"i": reached_id}).scalar()
+    call(db, started=SATURDAY_NOON + timedelta(hours=2), phone=reached_phone)
+    unreached_attempt = _close_after_hours(db, SATURDAY_NOON + timedelta(hours=3))
+    attempt_phone = db.execute(text("SELECT phone FROM lending.uncalled_alarms WHERE id = :i"),
+                               {"i": unreached_attempt}).scalar()
+    call(db, started=SATURDAY_NOON + timedelta(hours=4), phone=attempt_phone, disposition="NO_ANSWER", talk_seconds=0)
+    too_old = _close_after_hours(db, datetime(2026, 10, 8, 23, 30, tzinfo=timezone.utc))  # Thu 19:30 ET
+    ids = [row["id"] for row in after_hours_leads(db, MONDAY_LIST)]
+    assert friday_night in ids and weekend in ids and unreached_attempt in ids
+    assert reached_id not in ids and too_old not in ids
+    assert ids.index(friday_night) < ids.index(weekend)  # oldest first
+
+
+def test_morning_post_lists_after_hours_leads_with_last_four_only():
+    from src.tasks.lending_pinned_callbacks import format_slack
+
+    row = {"lead_uuid": "f0084183-aaaa-bbbb-cccc-000000000000", "phone": "+17275550123", "arrived_at": SATURDAY_NOON,
+           "first_name": "Jane", "full_name": "Jane <!channel> Smith", "property_state": "FL", "from_web": False}
+    message = format_slack([], leads=[row])
+    assert message.startswith("*Call these first (1): new leads that came in after hours*")
+    assert "(lead f0084183)" in message and "LendingFlow lead, came in Sat 12:00 pm ET" in message
+    assert "0123" in message and "7275550123" not in message and "<!channel>" not in message
+    web = format_slack([], leads=[{**row, "lead_uuid": "web-12", "from_web": True}])
+    assert "(web lead 12)" in web and "website lead" in web
+    assert format_slack([], leads=[]) is None
+
+
+def test_a_first_alarm_retry_due_after_7_15_is_dropped_not_sent(db):
+    first_due = datetime(2026, 10, 9, 23, 14, 55, tzinfo=timezone.utc)  # Fri 19:14:55 ET
+    lead_id = lead(db, arrived=first_due - timedelta(seconds=120), phone="+17275550177")
+    process_due(db, now=first_due, sms=Sms(GhlSmsError("rejected", ambiguous=False)), slack=None, ghl_status=None,
+                sms_to=JOSH, ops_channel=OPS)
+    assert alarm(db, lead_id)["sms_120_status"] == "retry"
+    sms = Sms()
+    process_due(db, now=first_due + timedelta(seconds=20), sms=sms, slack=None, ghl_status=None,
+                sms_to=JOSH, ops_channel=OPS)  # 19:15:15 ET: the retry is due, outside working hours
+    assert sms.sent == [] and alarm(db, lead_id)["sms_120_status"] == "superseded"
+
+
+def test_an_escalation_retry_due_after_7_15_is_dropped_not_sent(db):
+    escalation_due = datetime(2026, 10, 9, 23, 14, 50, tzinfo=timezone.utc)  # Fri 19:14:50 ET
+    lead_id = lead(db, arrived=escalation_due - timedelta(seconds=300), phone="+17275550188")
+    rejected = SlackApiError("rejected", {"ok": False, "error": "not_in_channel"})
+    process_due(db, now=escalation_due, sms=Sms(GhlSmsError("rejected", ambiguous=False)), slack=Slack(rejected),
+                ghl_status=None, sms_to=JOSH, ops_channel=OPS)
+    row = alarm(db, lead_id)
+    assert row["sms_300_status"] == "retry" and row["slack_300_status"] == "retry"
+    sms, slack = Sms(), Slack()
+    process_due(db, now=escalation_due + timedelta(seconds=15), sms=sms, slack=slack, ghl_status=None,
+                sms_to=JOSH, ops_channel=OPS)  # 19:15:05 ET
+    row = alarm(db, lead_id)
+    assert sms.sent == [] and slack.posts == []
+    assert row["sms_300_status"] == "superseded" and row["slack_300_status"] == "superseded"
+    assert row["resolved_reason"] == "escalated"  # nothing left in flight: the row settles
+
+
+def test_a_retry_inside_working_hours_is_still_sent(db):
+    lead_id = lead(db, phone="+17275550199")
+    process_due(db, now=ARRIVED + timedelta(seconds=120), sms=Sms(GhlSmsError("rejected", ambiguous=False)),
+                slack=None, ghl_status=None, sms_to=JOSH, ops_channel=OPS)
+    sms = Sms()
+    process_due(db, now=ARRIVED + timedelta(seconds=140), sms=sms, slack=None, ghl_status=None,
+                sms_to=JOSH, ops_channel=OPS)
+    assert len(sms.sent) == 1 and alarm(db, lead_id)["sms_120_status"] == "sent"
+
+
+# --- Working hours come from LENDING_ALARM_HOURS_START / LENDING_ALARM_HOURS_END ---
+
+def test_working_hours_follow_the_settings(monkeypatch):
+    from types import SimpleNamespace
+
+    from src.lending import uncalled_alarm_worker as worker
+
+    monkeypatch.setattr(worker, "get_settings",
+                        lambda: SimpleNamespace(lending_alarm_hours_start="10:00", lending_alarm_hours_end="18:00"))
+    friday = datetime(2026, 10, 9, tzinfo=timezone.utc)
+    at = lambda hh, mm: friday.replace(hour=hh + 4, minute=mm)  # EDT = UTC-4
+    assert alarm_hours(at(9, 30)) == HOLD      # after the 08:55 list, before 10:00
+    assert alarm_hours(at(10, 0)) == OPEN
+    assert alarm_hours(at(17, 59)) == OPEN
+    assert alarm_hours(at(18, 0)) == CLOSED
+
+
+def test_the_defaults_are_9_to_7_15():
+    from config.settings import AppSettings
+
+    fields = AppSettings.model_fields
+    assert fields["lending_alarm_hours_start"].default == "09:00"
+    assert fields["lending_alarm_hours_end"].default == "19:15"
+
+
+@pytest.mark.parametrize("start, end", [("9am", "19:15"), ("09:00", "25:00"), ("19:15", "09:00"), ("10:00", "10:00")])
+def test_bad_working_hours_are_refused_at_startup(monkeypatch, start, end):
+    from pydantic import ValidationError
+
+    from config.settings import AppSettings
+
+    monkeypatch.setenv("LENDING_ALARM_HOURS_START", start)
+    monkeypatch.setenv("LENDING_ALARM_HOURS_END", end)
+    with pytest.raises(ValidationError, match="LENDING_ALARM_HOURS"):
+        AppSettings()
+
+
+def test_a_single_digit_hour_is_normalized(monkeypatch):
+    from config.settings import AppSettings
+
+    monkeypatch.setenv("LENDING_ALARM_HOURS_START", "9:00")
+    assert AppSettings().lending_alarm_hours_start == "09:00"
