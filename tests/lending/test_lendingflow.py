@@ -465,7 +465,7 @@ def test_ghl_sink_tags_missing_consent_and_skips_card_without_stage(monkeypatch)
     upsert = next(c for c in calls if c[1] == "upsert")
     assert "dnd" not in upsert[2] and "tags" not in upsert[2] and "email" not in upsert[2]
     tags = next(c for c in calls if c[1] == "tags")
-    assert tags[2]["tags"] == ["lendingflow", "lendingflow-consent-missing"]
+    assert tags[2]["tags"] == ["lendingflow"]  # no consent-missing tag: LendingFlow needs no certificate
     note = next(c for c in calls if c[1] == "notes")
     assert note[2]["body"] == "LendingFlow lead u-1 (vendor id LF-1). Source: 60 Second Loan Match."
 
