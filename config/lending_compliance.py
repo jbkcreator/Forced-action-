@@ -43,6 +43,12 @@ OPT_OUT_POLL_SECONDS = 15        # FA opt-out poller interval; worst case well i
 # GoHighLevel opt-out sync: every lending opt-out becomes DND on the GHL contact.
 GHL_DND_CHANNELS = ("SMS", "Email", "GMB", "FB", "WhatsApp", "Call")
 GHL_OPT_OUT_TAG = "lending-opt-out"
+# Cold leads in GHL (client rule: no texts or emails unless they agree to texts on a call): every
+# messaging channel is do-not-disturb, calls stay open. The SMS sender lifts SMS once consent is recorded.
+COLD_LEAD_DND_CHANNELS = tuple(channel for channel in GHL_DND_CHANNELS if channel != "Call")
+GHL_TAG_COLD_LEAD = "ndl-cold"
+# A phone called from GHL inside this window belongs to GHL calling (matches the 14-day follow-up cycle).
+GHL_CALLING_LOOKBACK_DAYS = 14
 GHL_DND_BATCH = 50               # GHL updates per poll cycle (GHL client throttles ~2 req/s)
 GHL_BACKSTOP_PAGE_SIZE = 100     # GHL contact search page size (DND backstop)
 GHL_BACKSTOP_MAX_PAGES = 50      # bound per backstop run (~5,000 DND contacts)
@@ -154,6 +160,8 @@ class ReasonCode(str, Enum):
     BACKFLIP_CONFLICT = "BACKFLIP_CONFLICT"
     BACKFLIP_FEED_STALE = "BACKFLIP_FEED_STALE"
     BACKFLIP_FEED_UNAVAILABLE = "BACKFLIP_FEED_UNAVAILABLE"
+    # Worked from GHL (warm lead, or called from GHL recently): never dialed by BatchDialer too.
+    GHL_CALLING = "GHL_CALLING"
 
 
 class RemovalReason(str, Enum):
@@ -165,6 +173,12 @@ class RemovalReason(str, Enum):
     ATTEMPT_CAP = "attempt_cap"
     SCRUB_STALE = "scrub_stale"
     ATTEMPT_HISTORY = "attempt_history"
+    GHL_CALLING = "ghl_calling"
+
+
+# Removals that delete the dialer contact for good (never restored): an opt-out, and a phone
+# handed to GHL calling. Every other reason only leaves the campaign and can be restored.
+PERMANENT_REMOVAL_REASONS: frozenset[RemovalReason] = frozenset({RemovalReason.OPT_OUT, RemovalReason.GHL_CALLING})
 
 
 def validate_lending_compliance_config() -> None:

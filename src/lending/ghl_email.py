@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from config.settings import get_settings
+from src.lending.cold_leads import SendChannel
 from src.lending.ghl_sms import GhlAccount, GhlSmsError, GhlSmsSender, Request, lending_ghl_account
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,7 @@ class GhlEmailSender(GhlSmsSender):
                  first_name: Optional[str] = None, deadline: Optional[datetime] = None) -> str:
         """Upsert the contact by email (and phone when known, so it stays one GHL contact), then send.
         Past ``deadline`` (UTC) nothing is sent and a non-ambiguous GhlSmsError is raised."""
+        self._cold_lead_check(phone, SendChannel.EMAIL)
         contact = {"locationId": self._account.location_id, "email": to}
         if phone:
             contact["phone"] = phone

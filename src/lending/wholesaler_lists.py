@@ -13,6 +13,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional, Protocol, Sequence
 
+from config.lending_compliance import COLD_LEAD_DND_CHANNELS, GHL_TAG_COLD_LEAD
 from config.lending_wholesalers import (
     GHL_TAG_SOURCE_PREFIX,
     GHL_TAG_STATE_PREFIX,
@@ -27,6 +28,8 @@ from src.lending.queues import assign_queue
 from src.services.phone_utils import normalize as normalize_phone
 
 logger = logging.getLogger(__name__)
+
+COLD_LEAD_DND_MESSAGE = "Cold lead: calls only"
 
 
 @dataclass
@@ -83,7 +86,7 @@ def parse_wholesaler_csv(text: str) -> ParsedList:
 
 
 def ghl_tags(record: Mapping[str, Any]) -> list[str]:
-    return [GHL_TAG_WHOLESALER,
+    return [GHL_TAG_WHOLESALER, GHL_TAG_COLD_LEAD,
             f"{GHL_TAG_SOURCE_PREFIX}{record['wholesaler_source']}",
             f"{GHL_TAG_STATE_PREFIX}{str(record['state']).lower()}"]
 
@@ -149,6 +152,8 @@ class GhlWholesalerSink:
             body["companyName"] = record["entity_name"]
         if record.get("email"):
             body["email"] = record["email"]
+        body["dndSettings"] = {channel: {"status": "active", "message": COLD_LEAD_DND_MESSAGE}
+                               for channel in COLD_LEAD_DND_CHANNELS}
         data = self._call("contact upsert", "POST", "/contacts/upsert", json=body)
         contact_id = (data.get("contact") or {}).get("id")
         if not contact_id:

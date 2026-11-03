@@ -280,3 +280,22 @@ def test_fresh_lending_scrub_is_reused_without_tracerfy(db):
     )
     out = _run(db, [{"phone": P_CLEAN}])
     assert out[P_CLEAN].allowed
+
+
+def _ghl_call(db, phone, ended_at):
+    db.execute(text("INSERT INTO lending.call_dispositions "
+                    "(dialer_call_id, call_source, phone, direction, call_ended_at, raw_event) "
+                    "VALUES (:cid, 'ghl', :p, 'outbound', :t, '{}')"),
+               {"cid": f"ghl-test-{phone}-{ended_at.isoformat()}", "p": phone, "t": ended_at})
+
+
+def test_a_phone_called_from_ghl_in_the_last_14_days_is_blocked_without_scrub(db):
+    _ghl_call(db, P_CLEAN, NOW - timedelta(days=3))
+    out = _run(db, [{"phone": P_CLEAN}])
+    assert not out[P_CLEAN].allowed and out[P_CLEAN].reason is ReasonCode.GHL_CALLING
+
+
+def test_a_ghl_call_older_than_14_days_no_longer_blocks_the_load(db):
+    _dnc(db, P_CLEAN, age_days=1)
+    _ghl_call(db, P_CLEAN, NOW - timedelta(days=15))
+    assert _run(db, [{"phone": P_CLEAN}])[P_CLEAN].allowed

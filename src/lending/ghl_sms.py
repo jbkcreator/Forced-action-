@@ -28,6 +28,7 @@ from typing import Any, Callable, Optional
 import requests
 
 from config.settings import get_settings
+from src.lending.cold_leads import ColdSendDecision, SendChannel, cold_send_decision
 from src.lending.global_halt import is_globally_halted
 from src.lending.ghl_account import GhlAccount, ghl_headers, lending_ghl_account
 from src.services import ghl_webhook
@@ -51,6 +52,14 @@ class GhlSmsError(RuntimeError):
     def __init__(self, message: str, *, ambiguous: bool = False) -> None:
         super().__init__(message)
         self.ambiguous = ambiguous
+
+
+class GhlSendRefused(GhlSmsError):
+    """Nothing was sent or upserted: the recipient is a cold lead this channel may not reach."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"refused: {reason}")
+        self.reason = reason
 
 
 def texting_number() -> Optional[str]:
@@ -83,6 +92,16 @@ class GhlSmsSender:
     def _http(self) -> Request:
         return self._request or _single_attempt
 
+    def _cold_lead_check(self, phone: Optional[str], channel: SendChannel) -> ColdSendDecision:
+        """Raise GhlSendRefused for a cold lead this channel may not reach. Alerts to the team's own phone skip it."""
+        if self._internal_alert:
+            return ColdSendDecision()
+        decision = cold_send_decision(phone, channel)
+        if decision.block is not None:
+            logger.warning("%s send refused: %s", self._log_prefix, decision.block.value)
+            raise GhlSendRefused(decision.block.value)
+        return decision
+
     def _post(self, request: Request, path: str, body: dict, what: str, version: str = "2021-07-28",
               is_send: bool = False) -> dict:
         if is_send and not self._internal_alert and is_globally_halted():
@@ -107,9 +126,13 @@ class GhlSmsSender:
                  deadline: Optional[datetime] = None) -> str:
         """Upsert the contact, then send. ``deadline`` (UTC) is the latest moment a send may still start;
         past it nothing is sent and a non-ambiguous GhlSmsError is raised."""
-        contact = {"locationId": self._account.location_id, "phone": phone}
+        decision = self._cold_lead_check(phone, SendChannel.SMS)
+        contact: dict[str, Any] = {"locationId": self._account.location_id, "phone": phone}
         if first_name:
             contact["firstName"] = first_name
+        if decision.cold:
+            # A consented cold lead: lift only the SMS do-not-disturb set when the contact was pushed cold.
+            contact["dndSettings"] = {"SMS": {"status": "inactive"}}
         contact_id = (self._post(self._http(), "/contacts/upsert", contact, "contact upsert").get("contact") or {}).get("id")
         if not contact_id:
             raise GhlSmsError("GHL contact upsert returned no contact id")

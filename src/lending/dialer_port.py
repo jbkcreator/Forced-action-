@@ -15,7 +15,7 @@ from typing import Any, Callable, Mapping, Optional, Protocol, Union
 import requests
 from sqlalchemy import text
 
-from config.lending_compliance import RemovalReason
+from config.lending_compliance import PERMANENT_REMOVAL_REASONS
 from config.lending_dialer import (
     BATCHDIALER_BASE_URL,
     BATCHDIALER_QUICK_TIMEOUT_SECONDS,
@@ -219,10 +219,11 @@ class BatchDialerAdapter:
         return self._campaign_ids[name]
 
     def remove(self, phone: str, *, reason: str) -> None:
-        # The public API has no DNC endpoint, so a permanent opt-out deletes every contact we
-        # loaded for the number (our suppression list blocks any reload). Window/cap holds only
-        # leave the campaign and never delete, so restore() can never undo an opt-out.
-        if reason != RemovalReason.OPT_OUT.value:
+        # The public API has no DNC endpoint, so a permanent removal (opt-out, or the phone handed
+        # to GHL calling) deletes every contact we loaded for the number; the load gates block any
+        # reload. Window/cap holds only leave the campaign and never delete, so restore() can never
+        # undo a permanent removal.
+        if reason not in {r.value for r in PERMANENT_REMOVAL_REASONS}:
             self._call("campaign_remove", {"phone": phone})
             return
         if self._contact_ids is None:
