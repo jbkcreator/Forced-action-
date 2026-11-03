@@ -11,16 +11,35 @@ from sqlalchemy import text
 
 from config.lending_compliance import DEFAULT_TZ
 from config.lending_dispositions import (
-    ANSWERED_CODES, BOOKED_CODE, BOOKED_STAGE_KEYS, GATED_CODES, LIVE_CONVERSATION_CODES, LONG_CONVERSATION_SECONDS, NURTURE_SENT_CODES,
-    SHOWED_STAGE_KEYS, TRANSFER_CODES,
+    ANSWERED_CODES, BOOKED_CODE, BOOKED_STAGE_KEYS, GATED_CODES, LIVE_CONVERSATION_CODES, LONG_CONVERSATION_SECONDS, NURTURE_CODE,
+    NURTURE_SENT_CODES, SHARED_SEAT_LABELS, SHOWED_STAGE_KEYS, TRANSFER_CODES,
 )
 from config.lending_followup import GHL_CALLER_SEAT
 
 logger = logging.getLogger(__name__)
 
 UNATTRIBUTED = "(unattributed)"
+
+
+def _sql_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _caller_key() -> str:
+    """Caller name, except a shared BatchDialer seat (SHARED_SEAT_LABELS) shows its label: the seat's login owner
+    did not make every call on it. Config literals only, never user input."""
+    name = "COALESCE(NULLIF(caller_name, ''), NULLIF(caller_seat, ''), '(unknown)')"
+    if not SHARED_SEAT_LABELS:
+        return name
+    whens = " ".join(f"WHEN caller_seat = {_sql_literal(seat)} THEN {_sql_literal(label)}"
+                     for seat, label in sorted(SHARED_SEAT_LABELS.items()))
+    return f"CASE {whens} ELSE {name} END"
+
+
+# NURTURE counts as Gated / Nurture sent only when the gate failed; legacy GATE_FAILED_NURTURE rows count as before.
+_GATE_FAILED_NURTURE = "(disposition = :nurture_code AND gate_failed IS TRUE)"
 _KEYS = {  # SQL literals, never user input
-    "caller": "COALESCE(NULLIF(caller_name, ''), NULLIF(caller_seat, ''), '(unknown)')",
+    "caller": _caller_key(),
     "campaign": "COALESCE(NULLIF(dialer_campaign_id, ''), '')",
     "hook": "COALESCE(NULLIF(campaign_tag, ''), '')",
     "seat": "COALESCE(NULLIF(caller_seat, ''), '(unknown)')",
@@ -88,7 +107,7 @@ def _bounds(day: date) -> tuple[datetime, datetime]:
 def _query(db, key: str, day: date) -> list[tuple[str, int, int, int, int, int, int, int]]:
     start, end = _bounds(day)
     params = {"live": sorted(LIVE_CONVERSATION_CODES), "gated": sorted(GATED_CODES), "nurture": sorted(NURTURE_SENT_CODES),
-              "booked": BOOKED_CODE, "long": LONG_CONVERSATION_SECONDS, "start": start, "end": end}
+              "nurture_code": NURTURE_CODE, "booked": BOOKED_CODE, "long": LONG_CONVERSATION_SECONDS, "start": start, "end": end}
     if TRANSFER_CODES:
         transfers = "count(*) FILTER (WHERE disposition = ANY(:transfer))"
         params["transfer"] = sorted(TRANSFER_CODES)
@@ -97,9 +116,9 @@ def _query(db, key: str, day: date) -> list[tuple[str, int, int, int, int, int, 
     rows = db.execute(
         text(f"SELECT {_KEYS[key]} AS k, count(*) AS dials, "
              "count(*) FILTER (WHERE disposition = ANY(:live)) AS live, "
-             "count(*) FILTER (WHERE disposition = ANY(:gated)) AS gated, "
+             f"count(*) FILTER (WHERE disposition = ANY(:gated) OR {_GATE_FAILED_NURTURE}) AS gated, "
              "count(*) FILTER (WHERE disposition = :booked AND NOT booking_blocked) AS booked, "
-             "count(*) FILTER (WHERE disposition = ANY(:nurture)) AS nurture, "
+             f"count(*) FILTER (WHERE disposition = ANY(:nurture) OR {_GATE_FAILED_NURTURE}) AS nurture, "
              "count(*) FILTER (WHERE talk_duration_sec >= :long) AS long_calls, "
              f"{transfers} AS transfers "
              "FROM lending.call_dispositions "

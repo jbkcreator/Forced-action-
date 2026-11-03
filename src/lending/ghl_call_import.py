@@ -12,7 +12,8 @@ window and stores each one once. When more contacts are in the window than one r
   a new outcome or talk time (imported while it was still in progress) is updated in place
 * ``direction`` = ``outbound`` or ``inbound`` (Q66). Only outbound rows count as attempts (attempt caps, the replacement
   rule, the scoreboard and the uncalled alarm all filter on direction); an inbound row is a record of the call
-* ``call_source`` = ``ghl``, ``caller_seat`` / ``campaign_tag`` = ``ghl`` (its own scoreboard line)
+* ``call_source`` = ``ghl``, ``caller_seat`` / ``campaign_tag`` = ``ghl``; ``caller_name`` from the message ``userId``
+  (GHL_USER_NAMES), else "GHL (unknown)" until the outcome webhook's user name fills it in on match
 * ``disposition`` is NULL on import: GHL's call API has no disposition. GHL's own call status is kept in
   ``disposition_raw`` as ``ghl:<callStatus>``. The outcome the caller picked arrives separately (GHL workflow ->
   POST /webhooks/lending/ghl-disposition) and is attached by src.lending.ghl_disposition_match, which every run
@@ -56,6 +57,7 @@ from config.lending_followup import (
     IMPORT_RUN_INTERVAL_MINUTES,
     IMPORT_WINDOW_DAYS,
 )
+from config.lending_dispositions import GHL_UNKNOWN_CALLER, ghl_caller_name
 from src.lending.ghl_calls import call_duration_seconds, call_state, message_time
 from src.services.phone_utils import normalize
 
@@ -87,11 +89,13 @@ _CONTACTS = text(_ELIGIBLE + " ORDER BY min(received_at) DESC, ghl_contact_id LI
 # call returns no row.
 _UPSERT = text("""
     INSERT INTO lending.call_dispositions AS d
-        (dialer_call_id, call_source, direction, phone, caller_seat, campaign_tag, disposition_raw,
+        (dialer_call_id, call_source, direction, phone, caller_seat, caller_name, campaign_tag, disposition_raw,
          talk_duration_sec, call_started_at, call_ended_at, raw_event)
-    VALUES (:call_id, :source, :direction, :phone, :seat, :tag, :raw_outcome,
+    VALUES (:call_id, :source, :direction, :phone, :seat, :caller_name, :tag, :raw_outcome,
             :talk, :started, :ended, CAST(:raw_event AS jsonb))
     ON CONFLICT (dialer_call_id) DO UPDATE SET
+        caller_name = CASE WHEN d.caller_name IS NULL OR d.caller_name = :unknown_caller THEN EXCLUDED.caller_name
+                           ELSE d.caller_name END,
         disposition_raw = CASE WHEN EXCLUDED.disposition_raw = :unknown_outcome THEN d.disposition_raw
                                ELSE EXCLUDED.disposition_raw END,
         talk_duration_sec = COALESCE(EXCLUDED.talk_duration_sec, d.talk_duration_sec),
@@ -135,6 +139,7 @@ def _call_row(message: Mapping[str, Any], contact_id: str, phone: str, since: da
         "direction": direction,
         "phone": phone,
         "seat": GHL_CALLER_SEAT,
+        "caller_name": ghl_caller_name(message.get("userId")),
         "tag": GHL_CAMPAIGN_TAG,
         "raw_outcome": f"ghl:{outcome}"[:100] if outcome else UNKNOWN_OUTCOME,
         "talk": talk,
@@ -173,7 +178,7 @@ def _store_contact(db, read_calls: CallReader, contact_id: str, phone: str, sinc
     try:
         with db.begin_nested():
             for row in rows:
-                stored = db.execute(_UPSERT, {**row, "unknown_outcome": UNKNOWN_OUTCOME}).first()
+                stored = db.execute(_UPSERT, {**row, "unknown_outcome": UNKNOWN_OUTCOME, "unknown_caller": GHL_UNKNOWN_CALLER}).first()
                 if stored is None:
                     stats.already_recorded += 1
                 elif stored.inserted:

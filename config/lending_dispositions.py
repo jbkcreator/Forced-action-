@@ -81,7 +81,7 @@ DNC_CODE = "DNC_REQUEST"
 
 # Scoreboard definitions (client Part 5.6). Defaults: a client answer is a one-line change here.
 # Legacy codes are listed too, so history keeps counting. NURTURE is gated / nurture-sent only with gate_failed set:
-# the scoreboard adds that row check (NURTURE_CODE) on top of these sets once the column exists.
+# the scoreboard adds that row check (NURTURE_CODE AND gate_failed IS TRUE) on top of these sets.
 LIVE_CONVERSATION_CODES = frozenset({
     "CONNECTED_NOT_INTERESTED", "CALLBACK_REQUESTED", "DNC_REQUEST", "NURTURE", "BOOKED",
     "DATA_NURTURE_ONLY", "GATE_FAILED_NURTURE",
@@ -222,6 +222,29 @@ def validate_dispositions_config() -> None:
 # BatchDialer contact custom field the caller sets during the call ("OK if I text you?" -> yes).
 TEXT_CONSENT_FIELD = "text_consent"
 TEXT_CONSENT_YES = "yes"
+# BatchDialer contact custom field the caller sets when the gate failed (the call is NURTURE + gate_failed).
+# UNVERIFIED: field name to be created by Dev A in BatchDialer; a truthy value marks the call.
+GATE_FAILED_FIELD = "gate_failed"
+GATE_FAILED_TRUE = frozenset({"yes", "true", "y", "1"})
+
+# GHL user id (call message ``userId``) -> caller name (GHL /users API, read 2026-11-03). Outbound GHL call messages
+# often carry no userId; the outcome webhook's {{user.name}} fills the name in when it matches the call.
+GHL_USER_NAMES: dict[str, str] = {
+    "3W4lyuTpPSgBjgiJMzJk": "Josh Kantor",
+    "57m9LlZrO1rV2A5cTKxI": "David Willis",
+    "YoBwFUwHL1fylqvqjzA1": "Hari K",
+    "0mboWYLanQkMz4RG3IbL": "Hari K",
+}
+GHL_UNKNOWN_CALLER = "GHL (unknown)"
+
+
+def ghl_caller_name(user_id: str | None) -> str:
+    return GHL_USER_NAMES.get(user_id or "", GHL_UNKNOWN_CALLER)
+
+
+# BatchDialer seats shared by several people: the scoreboard shows this label, never the login owner's name, so no
+# one is credited with another person's calls. Stored rows are not changed.
+SHARED_SEAT_LABELS: dict[str, str] = {"118131": "BatchDialer (shared seat)"}
 
 
 # T-12 audio fallback. BatchDialer has no live audio stream; the poller fetches each answered

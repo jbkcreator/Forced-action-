@@ -14,8 +14,9 @@ Matching (:func:`choose_call`):
 
 A matched call gets the code, the list version and the default unfunded cause, and is then delivered to the Sheet and
 Slack like a BatchDialer call (the caller commits first; :func:`deliver_matched`). Acting on the outcome (DNC opt-out,
-consent) is Dev C's lane and is not done here. ``gate_failed`` is kept on the event only: the call_dispositions column
-is written once migrations/apply_lending_call_gate_failed.py has run (TODO).
+consent) is Dev C's lane and is not done here. The event's ``gate_failed`` is written onto the call (NURTURE + gate
+failed counts as Gated / Nurture sent), and its user name ({{user.name}}) fills the call's caller only when the import
+could not name one (no ``userId`` on the call message: caller_name NULL or "GHL (unknown)").
 
 The event table may not exist yet (the code can deploy before migrations/apply_lending_ghl_disposition_events.py
 runs): :func:`attach_pending` then logs and matches nothing, inside a savepoint so the caller's transaction is kept.
@@ -33,6 +34,7 @@ from typing import Any, Optional
 from sqlalchemy import text
 
 from config.lending_dispositions import (
+    GHL_UNKNOWN_CALLER,
     DEFAULT_CAUSE,
     DISPOSITIONS,
     DISPOSITION_LIST_VERSION,
@@ -157,7 +159,8 @@ def choose_call(event: Mapping[str, Any], calls: Iterable[Mapping[str, Any]],
 
 
 _PENDING = text("""
-    SELECT id, phone, code, ghl_call_id, called_at, received_at FROM lending.ghl_disposition_events
+    SELECT id, phone, code, ghl_call_id, called_at, received_at, caller_name, gate_failed
+      FROM lending.ghl_disposition_events
      WHERE matched_call_id IS NULL AND received_at >= :since
      ORDER BY received_at, id LIMIT :limit FOR UPDATE SKIP LOCKED
 """)
@@ -170,7 +173,9 @@ _CANDIDATES = text("""
 """)
 _SET_CALL = text("""
     UPDATE lending.call_dispositions SET disposition = :d, disposition_at = clock_timestamp(),
-           disposition_list_version = :v, unfunded_cause = COALESCE(unfunded_cause, :cause),
+           disposition_list_version = :v, unfunded_cause = COALESCE(unfunded_cause, :cause), gate_failed = :gate,
+           caller_name = CASE WHEN caller_name IS NULL OR caller_name = :unknown_caller
+                              THEN COALESCE(:caller, caller_name) ELSE caller_name END,
            unfunded_cause_provisional = CASE WHEN unfunded_cause IS NULL AND :cause IS NOT NULL THEN true
                                              ELSE unfunded_cause_provisional END
      WHERE id = :id
@@ -218,7 +223,9 @@ def _attach(db, now: datetime, window: timedelta, window_minutes: int) -> list[i
         if call is None:
             continue
         cause = DEFAULT_CAUSE.get(event["code"]) if not call.get("unfunded_cause") else None
-        db.execute(_SET_CALL, {"d": event["code"], "v": DISPOSITION_LIST_VERSION, "cause": cause, "id": call["id"]})
+        db.execute(_SET_CALL, {"d": event["code"], "v": DISPOSITION_LIST_VERSION, "cause": cause, "id": call["id"],
+                             "gate": event.get("gate_failed"), "caller": event.get("caller_name"),
+                             "unknown_caller": GHL_UNKNOWN_CALLER})
         db.execute(_SET_EVENT, {"call": call["id"], "at": now, "id": event["id"]})
         call["disposition"] = event["code"]  # taken: a second outcome for the same phone needs another call
         if call["id"] not in matched:

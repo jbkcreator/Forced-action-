@@ -11,7 +11,7 @@ from typing import Callable, Optional
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from config.lending_dispositions import DNC_CODE, TEXT_CONSENT_FIELD, TEXT_CONSENT_YES
+from config.lending_dispositions import DNC_CODE, GATE_FAILED_FIELD, GATE_FAILED_TRUE, TEXT_CONSENT_FIELD, TEXT_CONSENT_YES
 from config.settings import get_settings
 from src.lending.compliance import on_attempt_recorded, propagate_opt_out
 from src.lending.disposition_delivery import (
@@ -47,8 +47,10 @@ def _propagate_dnc(db: Session, *, row_id, phone: str, call_id: str, seat) -> bo
     ).scalar() == "dialer_pending")
 
 
-def capture_consent(db: Session, ev: DialerCallEvent, row_phone: Optional[str], caller_name: Optional[str], dialer) -> bool:
-    """Answered inbound call = consent; outbound = the caller-set ``text_consent`` contact field.
+def capture_consent(db: Session, ev: DialerCallEvent, row_phone: Optional[str], caller_name: Optional[str], dialer,
+                    *, row_id: Optional[int] = None) -> bool:
+    """Answered inbound call = consent; outbound = the caller-set ``text_consent`` contact field. The same read sets
+    the call's ``gate_failed`` when the caller ticked the ``gate_failed`` contact field (needs ``row_id``).
     Returns False only when the dialer read failed, so the caller can retry instead of marking it checked."""
     if not row_phone:
         return True
@@ -63,6 +65,8 @@ def capture_consent(db: Session, ev: DialerCallEvent, row_phone: Optional[str], 
             return False
         if str(fields.get(TEXT_CONSENT_FIELD, "")).strip().lower() == TEXT_CONSENT_YES:
             record_consent(db, row_phone, "on_call_yes", call_id=ev.call_id, captured_by=caller_name)
+        if row_id is not None and str(fields.get(GATE_FAILED_FIELD, "")).strip().lower() in GATE_FAILED_TRUE:
+            db.execute(text("UPDATE lending.call_dispositions SET gate_failed = true WHERE id = :id"), {"id": row_id})
     return True
 
 
@@ -82,7 +86,7 @@ def _check_consent(db: Session, ev: DialerCallEvent, row_id: int, dialer) -> Non
     if dialer is None:
         dialer = get_dialer()
     checked = capture_consent(db, dataclasses.replace(ev, direction=direction, contact_id=contact_id, duration=duration),
-                              phone, caller_name, dialer)
+                              phone, caller_name, dialer, row_id=row_id)
     if checked:
         db.execute(text("UPDATE lending.call_dispositions SET consent_checked_at = clock_timestamp() WHERE id = :id"), {"id": row_id})
 
