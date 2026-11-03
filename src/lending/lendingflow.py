@@ -25,6 +25,7 @@ from config.lending_lendingflow import (
     INTRO_SMS_HOLD_MAX_HOURS,
     LEAD_SOURCE,
     MISSING_LEAD_ID_PREFIX,
+    NULL_TEXT_VALUES,
     is_missing_lead_id,
     SWEEP_BATCH_SIZE,
 )
@@ -38,6 +39,7 @@ from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
 
+_UNFILLED_MERGE_FIELD = re.compile(r"\{\{.*\}\}", re.DOTALL)
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _BAND_RANGE = re.compile(r"^\s*(\d{3})\s*(?:-|to|–)\s*\d{3}\s*$", re.IGNORECASE)
 _BAND_PLUS = re.compile(r"^\s*(\d{3})\s*\+\s*$")
@@ -211,6 +213,20 @@ def _parse_time(value: Any) -> Optional[datetime]:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+def _without_null_text(value: Any) -> Any:
+    """The GHL intake workflow fills its fixed body template with the text "null" for every field LendingFlow
+    did not send (or leaves a ``{{...}}`` merge field unfilled); that text is a missing value, never data
+    (a lead id, an address, a first name, consent)."""
+    if isinstance(value, str):
+        cleaned = value.strip()
+        return None if cleaned.lower() in NULL_TEXT_VALUES or _UNFILLED_MERGE_FIELD.fullmatch(cleaned) else value
+    if isinstance(value, dict):
+        return {key: _without_null_text(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_without_null_text(item) for item in value]
+    return value
+
+
 def _is_blank(value: Any) -> bool:
     if value is None:
         return True
@@ -225,31 +241,39 @@ def _is_blank(value: Any) -> bool:
 
 def _parse_certificate(consent: Any) -> Optional[ParsedCertificate]:
     # A forwarder that fills a fixed body template (the GHL intake workflow) sends a consent object whose fields
-    # are all empty when the borrower gave none; that is no certificate, not consent.
-    if _is_blank(consent):
+    # are all empty or "null" when the borrower gave none; that is no certificate, not consent.
+    fields = _without_null_text(consent)
+    if _is_blank(fields):
         return None
     if isinstance(consent, str):
         return ParsedCertificate(raw=consent)
     if not isinstance(consent, dict):
         raise ParseError("consent must be an object or a string")
-    raw = consent.get("raw")
-    if not isinstance(raw, str) or not raw:
-        raw = json.dumps(consent, ensure_ascii=False)
-    return ParsedCertificate(
-        raw=raw,  # verbatim: never stripped or re-encoded
-        certificate_id=_str(consent, "certificate_id", limit=200),
-        url=_str(consent, "certificate_url", limit=500),
-        consented_at=_parse_time(consent.get("timestamp")),
-        client_ip=_str(consent, "ip_address", limit=45),
-        source_url=_str(consent, "page_url", limit=500),
-        disclosure_text=consent.get("disclosure_text") if isinstance(consent.get("disclosure_text"), str) else None,
+    own_raw = fields.get("raw") if isinstance(fields.get("raw"), str) and fields["raw"].strip() else None
+    certificate = ParsedCertificate(
+        raw=own_raw or json.dumps(consent, ensure_ascii=False),  # verbatim: never stripped or re-encoded
+        certificate_id=_str(fields, "certificate_id", limit=200),
+        url=_str(fields, "certificate_url", limit=500),
+        consented_at=_parse_time(fields.get("timestamp")),
+        client_ip=_str(fields, "ip_address", limit=45),
+        source_url=_str(fields, "page_url", limit=500),
+        disclosure_text=fields.get("disclosure_text") if isinstance(fields.get("disclosure_text"), str) else None,
     )
+    # Consent needs something that identifies the certificate. An IP, page or disclosure text alone (or any junk a
+    # template fills in) is not proof that this borrower agreed, and counting it would open the intro-SMS gate.
+    if not (own_raw or certificate.certificate_id or certificate.url or certificate.consented_at):
+        logger.warning("[lendingflow] consent block without a certificate id, url, timestamp or raw text: "
+                       "treated as no consent")
+        return None
+    return certificate
 
 
 def parse_lendingflow(payload: Any) -> ParsedLendingFlowLead:
     """The only function that knows LendingFlow's payload shape (Fake shape until David's schema lands)."""
     if not isinstance(payload, dict):
         raise ParseError("payload must be a JSON object")
+    consent = payload.get("consent")  # kept as received: the certificate is stored verbatim
+    payload = _without_null_text(payload)
     phone = normalize(_str(payload, "phone", limit=40))
     if not phone:
         raise ParseError("a valid US phone number is required")
@@ -283,7 +307,7 @@ def parse_lendingflow(payload: Any) -> ParsedLendingFlowLead:
         property_zip=_str(payload, "property_zip", limit=10),
         lead_source_campaign=_str(payload, "source", "lead_source", limit=100),
         submitted_at=_parse_time(payload.get("submitted_at")),
-        certificate=_parse_certificate(payload.get("consent")),
+        certificate=_parse_certificate(consent),
     )
 
 

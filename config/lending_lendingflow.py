@@ -13,6 +13,9 @@ GHL_SOURCE = "LendingFlow"
 # A lead that arrives without a LendingFlow lead id is stored, not rejected (client, Oct 2026): its vendor id is this
 # prefix + the phone/email dedupe hash, and GHL gets this tag so the missing id is visible.
 MISSING_LEAD_ID_PREFIX = "missing:"
+# The GHL intake workflow fills its fixed body template with this text for every field LendingFlow did not send;
+# any field holding it (any case, surrounding spaces ignored) is read as missing.
+NULL_TEXT_VALUES = frozenset({"null", "undefined"})
 
 
 def is_missing_lead_id(vendor_lead_id: str) -> bool:
