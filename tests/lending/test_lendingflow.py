@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from sqlalchemy import text
 
+from config.lending_lendingflow import is_missing_lead_id
 from src.lending import lendingflow, lendingflow_events
 from src.lending.contracts import LoanType
 from src.lending.db import get_lending_db
@@ -174,6 +175,65 @@ _EMPTY_TEMPLATE_CONSENT = {"certificate_id": "", "certificate_url": "", "timesta
 ])
 def test_blank_consent_is_no_certificate(consent):
     assert parse_lendingflow({"lead_id": "1", "phone": "7275550100", "consent": consent}).certificate is None
+
+
+# What the GHL intake workflow forwarded for a lead LendingFlow sent without consent or address (test lead LF-TEST-5).
+_GHL_NULL_TEXT_PAYLOAD = {
+    "email": "test.borrower5@example.com", "phone": "(727) 555-0105", "state": "Florida",
+    "source": "60 Second Loan Match", "lead_id": "LF-TEST-5", "last_name": "Borrower5", "loan_type": "DSCR",
+    "first_name": "Test", "loan_amount": "$500K - $1M", "credit_score": "740+", "property_zip": "null",
+    "submitted_at": "2026-11-02T16:34:36+05:30", "property_city": "null", "property_address": "null",
+    "consent": {"page_url": "null", "timestamp": "null", "ip_address": "null", "certificate_id": "null",
+                "certificate_url": "null", "disclosure_text": "null"},
+}
+
+
+def test_ghl_null_text_fields_are_missing():
+    parsed = parse_lendingflow(_GHL_NULL_TEXT_PAYLOAD)
+    assert parsed.certificate is None
+    assert (parsed.property_address, parsed.property_city, parsed.property_zip) == (None, None, None)
+    assert parsed.vendor_lead_id == "LF-TEST-5" and parsed.first_name == "Test" and parsed.property_state == "FL"
+
+
+@pytest.mark.parametrize("null_text", ["null", "NULL", " Null ", "undefined"])
+def test_null_text_lead_id_gets_the_missing_id_not_a_shared_one(null_text):
+    parsed = parse_lendingflow({"lead_id": null_text, "phone": "7275550100", "first_name": null_text})
+    assert is_missing_lead_id(parsed.vendor_lead_id) and parsed.first_name is None
+
+
+def test_real_certificate_with_one_null_text_field_is_kept_verbatim():
+    consent = {"certificate_id": "cert-1", "certificate_url": "null", "timestamp": "2026-10-14T15:42:17Z"}
+    certificate = parse_lendingflow({"lead_id": "1", "phone": "7275550100", "consent": consent}).certificate
+    assert certificate.certificate_id == "cert-1" and certificate.url is None
+    assert certificate.raw == json.dumps(consent, ensure_ascii=False)
+
+
+@pytest.mark.parametrize("consent", [
+    {"certificate_id": "{{inboundWebhookRequest.consent.certificate_id}}", "timestamp": "{{ x }}"},
+    {"ip_address": "203.0.113.7", "page_url": "https://lendingflow.example/apply",
+     "disclosure_text": "By clicking Submit you agree"},
+    {"timestamp": "not a time", "ip_address": "203.0.113.7"},
+    "{{inboundWebhookRequest.consent}}",
+])
+def test_consent_without_certificate_evidence_is_no_certificate(consent):
+    assert parse_lendingflow({"lead_id": "1", "phone": "7275550100", "consent": consent}).certificate is None
+
+
+@pytest.mark.parametrize("consent", [{"certificate_id": "cert-1"}, {"certificate_url": "https://cert.example/1"},
+                                     {"timestamp": "2026-10-14T15:42:17Z"}, {"raw": "abc"}, "-----CERT-----"])
+def test_any_one_piece_of_certificate_evidence_is_a_certificate(consent):
+    assert parse_lendingflow({"lead_id": "1", "phone": "7275550100", "consent": consent}).certificate is not None
+
+
+def test_unfilled_merge_field_is_missing_for_any_field():
+    parsed = parse_lendingflow({"lead_id": "{{inboundWebhookRequest.lead_id}}", "phone": "7275550100",
+                                "property_address": "{{inboundWebhookRequest.property_address}}"})
+    assert is_missing_lead_id(parsed.vendor_lead_id) and parsed.property_address is None
+
+
+def test_null_as_a_word_inside_a_value_is_kept():
+    parsed = parse_lendingflow({"lead_id": "1", "phone": "7275550100", "property_address": "1 Null Island Rd"})
+    assert parsed.property_address == "1 Null Island Rd"
 
 
 def test_consent_with_one_real_field_is_kept_verbatim():

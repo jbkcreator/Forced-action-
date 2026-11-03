@@ -9,6 +9,8 @@ POOL_CAMPAIGN_TAGS: dict[str, str] = {
     "partners": "Partners",  # List 4: dialed as a real queue, partner script only, never bookable
     "wholesalers": "Wholesalers",  # the wholesaler lists (Sunbiz, Hunter): their own campaign, same partner script
     "nurture": "Nurture",    # fallback for any future list with no rank of its own
+    # Inbound LendingFlow leads Josh did not reach in GHL (src/lending/lendingflow_dialer.py); not a ranked launch queue.
+    "lendingflow": "LendingFlow",
 }
 
 # Hook line per campaign, shown on the caller's card. Seeded from the client's voicemail
@@ -19,6 +21,8 @@ CAMPAIGN_HOOKS: dict[str, str] = {
     "Builders": "Saw your project; we fund builders and investors in your county.",
     "Partners": "You move deals, we fund buyers; let's connect our pipelines.",
     "Wholesalers": "You move deals, we fund buyers; let's connect our pipelines.",  # the partner script until the client sends one
+    # Placeholder until Josh approves the wording: the borrower asked us for a loan, so this is a follow-up, not a pitch.
+    "LendingFlow": "You requested a loan through LendingFlow; calling about your request.",
 }
 
 

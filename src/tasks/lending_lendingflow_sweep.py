@@ -7,6 +7,10 @@ and the last error). The event and pre-qual hand-off fire from here too when thi
 gets the lead into GHL. Each run also tags delivered leads whose intro text was held for the borrower's 8am-8pm window
 (T-09, needs LENDING_INTRO_SMS_ENABLED). Off with LENDING_LENDINGFLOW_ENABLED=false. Cron: every 5 minutes.
 
+Each run first does the LendingFlow -> BatchDialer step (src/lending/lendingflow_dialer.py: removals of leads handled
+in GHL always, loading only with LENDING_LENDINGFLOW_DIALER_ENABLED) and retries the BatchDialer results not yet
+written to GHL (src/lending/bd_result_to_ghl.py, LENDING_BD_RESULT_TO_GHL_ENABLED); both run whatever the intake switch.
+
     python -m src.tasks.lending_lendingflow_sweep
 """
 from __future__ import annotations
@@ -18,7 +22,7 @@ from sqlalchemy import text
 
 from config.lending_lendingflow import GHL_ALERT_AFTER_MINUTES, GHL_GIVE_UP_AFTER_HOURS, SWEEP_BATCH_SIZE
 from config.settings import get_settings
-from src.lending import lendingflow_events
+from src.lending import bd_result_to_ghl, lendingflow_dialer, lendingflow_events
 from src.lending.db import lending_session
 from src.lending.lead_arrival_alert import alert_josh
 from src.lending.disposition_delivery import _configured_slack, _slack_client
@@ -80,6 +84,11 @@ def alert_undelivered(slack_client: Any = None, minutes: Optional[int] = None) -
 
 
 def run() -> int:
+    # Before the intake switch: a lead already in BatchDialer must still be removed once it is handled in GHL.
+    lendingflow_dialer.run_from_settings()
+    notes = bd_result_to_ghl.write_notes()
+    if notes:
+        logger.info("[lendingflow] sweep wrote %d BatchDialer result(s) to GHL", notes)
     if not get_settings().lending_lendingflow_enabled:
         return 0
     sink = get_live_sink()
