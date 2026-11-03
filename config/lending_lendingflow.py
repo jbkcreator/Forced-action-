@@ -40,10 +40,6 @@ SWEEP_BATCH_SIZE = 50
 # hand-off, not to the background task that is still running; the sweep redoes them.
 FOLLOWUP_RECOVERY_AFTER_MINUTES = 5
 
-# --- DNC check before the GHL push (LENDING_LENDINGFLOW_DNC_CHECK_ENABLED) ------------------------------------------
-# A Tracerfy batch can poll for up to 10 minutes: a lead left 'checking' longer than this was lost to a crash.
-DNC_CHECK_STALE_MINUTES = 15
-
 # --- LendingFlow -> BatchDialer (src/lending/lendingflow_dialer.py) -------------------------------------------------
 DIALER_POOL = "lendingflow"  # config.lending_dialer.POOL_CAMPAIGN_TAGS key -> BatchDialer campaign "LendingFlow"
 DIALER_REF_PREFIX = "lendingflow:"  # dialer_load_records.source_record_ref = prefix + lead_uuid
@@ -67,7 +63,7 @@ DIALER_TEMPORARY_REASONS = frozenset({
 })
 DIALER_PERMANENT_REASONS = frozenset({
     "INVALID_PHONE", "NATIONAL_DNC", "STATE_DNC", "LITIGATOR", "SUPPRESSED", "GA_NATURAL_PERSON",
-    "HOMESTEAD_OWNER_OCCUPIED", "ATTEMPT_HISTORY_EXCEEDED", "BACKFLIP_CONFLICT", "NO_CONSENT", "HANDLED_IN_GHL",
+    "HOMESTEAD_OWNER_OCCUPIED", "ATTEMPT_HISTORY_EXCEEDED", "BACKFLIP_CONFLICT", "HANDLED_IN_GHL",
     "IN_OTHER_CAMPAIGN",
 })
 

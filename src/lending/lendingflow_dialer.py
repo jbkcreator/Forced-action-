@@ -1,10 +1,12 @@
 """LendingFlow leads into the BatchDialer "LendingFlow" campaign, and out again once they are handled in GHL.
 
 Loading runs from the 5-minute LendingFlow sweep, never inside the GHL delivery. A lead is loaded once it is in GHL,
-has a consent certificate, is not suppressed, is older than Josh's first-call window
-(LENDING_LENDINGFLOW_DIALER_DELAY_MINUTES) and has not been handled in GHL. Each lead goes through ``run_dialer_load``
-on its own, so it passes every dialer gate (suppression, Georgia, Backflip, the Tracerfy DNC scrub, the attempt caps,
-the calling window), and a refused or shared-phone batch can never hold back another lead. Right before the load the
+is not suppressed, is older than Josh's first-call window (LENDING_LENDINGFLOW_DIALER_DELAY_MINUTES) and has not been
+handled in GHL. Client decision: LendingFlow leads need no consent certificate and get no Tracerfy DNC scrub
+(``dnc_scrub=False``; the dialer sweep and the weekly rescrub skip them too, ``compliance.scrub_exempt_phones``).
+Each lead goes through ``run_dialer_load`` on its own, so every other gate still applies (opt-out / suppression,
+Georgia, Backflip, the attempt caps, the calling window), and a refused or shared-phone batch can never hold back
+another lead. Right before the load the
 lead's GHL calls are re-read live; if that read fails the lead is not loaded (fail closed).
 
 ``dialer_status``: pending -> loading -> loaded -> remove_pending -> removed. Off that path: blocked (a permanent
@@ -295,9 +297,8 @@ def _housekeeping(db: Session, now: datetime) -> None:
     db.execute(text("""
         UPDATE lending.lendingflow_leads
            SET dialer_status = CASE WHEN received_at < :oldest THEN 'expired' ELSE 'blocked' END,
-               dialer_block_reason = CASE WHEN received_at < :oldest THEN dialer_block_reason
-                                          WHEN suppressed THEN 'SUPPRESSED' ELSE 'NO_CONSENT' END
-         WHERE dialer_status = 'pending' AND (suppressed OR consent_status <> 'present' OR received_at < :oldest)
+               dialer_block_reason = CASE WHEN received_at < :oldest THEN dialer_block_reason ELSE 'SUPPRESSED' END
+         WHERE dialer_status = 'pending' AND (suppressed OR received_at < :oldest)
     """), {"oldest": now - timedelta(days=DIALER_MAX_LEAD_AGE_DAYS)})
     # One BatchDialer contact per phone: a pending lead is a duplicate when another lead on the phone is already in the
     # dialer path, or is an older loadable pending lead.
@@ -316,8 +317,7 @@ _CLAIM = text("""
     UPDATE lending.lendingflow_leads SET dialer_status = 'loading', dialer_claimed_at = :now,
            dialer_attempts = dialer_attempts + 1
      WHERE id IN (SELECT id FROM lending.lendingflow_leads
-                   WHERE dialer_status = 'pending' AND handled_in_ghl_at IS NULL AND consent_status = 'present'
-                     AND NOT suppressed AND ghl_status IN ('synced', 'contact_only') AND ghl_contact_id IS NOT NULL
+                   WHERE dialer_status = 'pending' AND handled_in_ghl_at IS NULL AND NOT suppressed AND ghl_status IN ('synced', 'contact_only') AND ghl_contact_id IS NOT NULL
                      AND received_at <= :ready_before
                      AND (dialer_next_attempt_at IS NULL OR dialer_next_attempt_at <= :now)
                    ORDER BY received_at LIMIT :limit FOR UPDATE SKIP LOCKED)
@@ -425,7 +425,7 @@ def _load_one(db: Session, lead: dict[str, Any], *, dialer: DialerContacts, scru
     run_id = f"lendingflow-{lead['id']}-{now:%Y%m%dT%H%M%S}"
     try:
         report = run_dialer_load([lendingflow_pool_record(lead)], db, run_id=run_id, dry_run=False,
-                                 scrubber=scrubber, dialer=dialer, commit=db.commit, now=now)
+                                 scrubber=scrubber, dialer=dialer, commit=db.commit, now=now, dnc_scrub=False)
     except LoadRefused:
         db.rollback()
         _count(stats, _finish(db, lead, PENDING, "LOAD_REFUSED", now))

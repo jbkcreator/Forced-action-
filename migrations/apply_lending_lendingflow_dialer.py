@@ -48,14 +48,6 @@ _STATEMENTS: list[str] = [
     'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS handled_in_ghl_reason varchar(30)',
     'CREATE INDEX IF NOT EXISTS idx_lending_lendingflow_leads_dialer_pending ON "{t}".lendingflow_leads (received_at) '
     "WHERE dialer_status = 'pending'",
-    # DNC check before the GHL push. Existing leads (and every lead while the check is off) are 'skipped'.
-    'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS dnc_status varchar(12) NOT NULL DEFAULT \'skipped\'',
-    'ALTER TABLE "{t}".lendingflow_leads DROP CONSTRAINT IF EXISTS ck_lending_lendingflow_leads_dnc_status',
-    'ALTER TABLE "{t}".lendingflow_leads ADD CONSTRAINT ck_lending_lendingflow_leads_dnc_status '
-    "CHECK (dnc_status IN ('pending', 'checking', 'clear', 'dnc', 'skipped'))",
-    'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS dnc_result varchar(30)',
-    'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS dnc_claimed_at timestamptz',
-    'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS dnc_checked_at timestamptz',
 ]
 _CALL_DISPOSITION_STATEMENTS: list[str] = [
     'ALTER TABLE "{t}".call_dispositions ADD COLUMN IF NOT EXISTS ghl_note_at timestamptz',

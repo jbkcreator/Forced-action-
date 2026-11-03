@@ -8,7 +8,6 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from sqlalchemy import text
 
-from migrations.apply_lending_lendingflow_dialer import apply_to as apply_lendingflow_dialer
 from migrations.apply_lending_uncalled_alarms import apply_to
 
 ARRIVED = datetime(2026, 10, 9, 15, 0, tzinfo=timezone.utc)
@@ -73,7 +72,6 @@ def db(lending_db):
     conn = lending_db.connection()
     conn.execute(text(_T11_LEADS))
     conn.execute(text(_WEB_LEADS))
-    apply_lendingflow_dialer(conn)  # dnc_status: the pickup waits for the DNC check
     apply_to(conn)  # existing shared-DB leads become 'preexisting' and never alarm in tests
     return lending_db
 
@@ -136,17 +134,6 @@ def test_suppressed_lead_is_never_picked_up(db):
     lead_id = lead(db, suppressed=True)
     pick_up_new_leads(db)
     assert alarm(db, lead_id) is None
-
-
-def test_a_lead_waits_for_its_dnc_check_and_a_dnc_lead_never_alarms(db):
-    waiting, on_dnc = lead(db), lead(db, phone="+18135550177")
-    db.execute(text("UPDATE lending.lendingflow_leads SET dnc_status = 'pending' WHERE id = :i"), {"i": waiting})
-    db.execute(text("UPDATE lending.lendingflow_leads SET dnc_status = 'dnc' WHERE id = :i"), {"i": on_dnc})
-    pick_up_new_leads(db)
-    assert alarm(db, waiting) is None and alarm(db, on_dnc) is None
-    db.execute(text("UPDATE lending.lendingflow_leads SET dnc_status = 'clear' WHERE id = :i"), {"i": waiting})
-    pick_up_new_leads(db)
-    assert alarm(db, waiting)["arrived_at"] == ARRIVED
 
 
 def test_old_lead_is_still_picked_up(db):

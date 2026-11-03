@@ -90,7 +90,8 @@ def db(lending_db, monkeypatch):
     return lending_db
 
 
-def _lead(db, phone=None, *, received=NOON_ET - timedelta(hours=1), consent="present", contact="ghl-1", **extra):
+def _lead(db, phone=None, *, received=NOON_ET - timedelta(hours=1), consent="present", contact="ghl-1", scrub=True,
+          **extra):
     phone = phone or _phone()
     row = db.execute(text("""
         INSERT INTO lending.lendingflow_leads (vendor_lead_id, dedupe_hash, phone, first_name, last_name,
@@ -101,9 +102,10 @@ def _lead(db, phone=None, *, received=NOON_ET - timedelta(hours=1), consent="pre
         RETURNING id, lead_uuid
     """), {"v": f"lf-{uuid.uuid4().hex}", "h": uuid.uuid4().hex, "p": phone, "r": received, "c": consent,
            "s": extra.get("suppressed", False), "g": contact, "state": extra.get("state", "FL")}).one()
-    db.execute(text("INSERT INTO dnc_phone_checks (phone, national_dnc, litigator, checked_at, source) "
-                    "VALUES (:p, false, false, :at, 'test') ON CONFLICT (phone) DO NOTHING"),
-               {"p": phone, "at": NOON_ET - timedelta(days=1)})
+    if scrub:
+        db.execute(text("INSERT INTO dnc_phone_checks (phone, national_dnc, litigator, checked_at, source) "
+                        "VALUES (:p, false, false, :at, 'test') ON CONFLICT (phone) DO NOTHING"),
+                   {"p": phone, "at": NOON_ET - timedelta(days=1)})
     return row.id, phone
 
 
@@ -123,10 +125,18 @@ def _same_session(db):
     yield db
 
 
+SCRUBBED: list[list[str]] = []
+
+
+def _scrubber(phones):
+    SCRUBBED.append(list(phones))
+    return []
+
+
 def _run(db, *, dialer=None, calls=None, now=NOON_ET):
     with patch.object(dialer_load, "load_backflip_identifier_index",
                       return_value=BackflipIdentifierIndex(block_reason=None)):
-        return lfd.run_dialer_step(dialer=dialer, scrubber=lambda phones: [], read_calls=calls, now=now,
+        return lfd.run_dialer_step(dialer=dialer, scrubber=_scrubber, read_calls=calls, now=now,
                                    sessions=lambda: _same_session(db), single_run=lambda: nullcontext(True))
 
 
@@ -164,8 +174,7 @@ def test_a_lead_that_arrives_after_hours_stays_pending_and_loads_next_morning(db
     assert _lead_row(db, lead_id)["dialer_status"] == "loaded" and len(dialer.upserts) == 1
 
 
-@pytest.mark.parametrize("kwargs, reason", [({"consent": "missing"}, "NO_CONSENT"),
-                                            ({"suppressed": True}, "SUPPRESSED"),
+@pytest.mark.parametrize("kwargs, reason", [({"suppressed": True}, "SUPPRESSED"),
                                             ({"state": "GA"}, "GA_NATURAL_PERSON")])
 def test_permanent_reasons_block_the_lead_for_good(db, kwargs, reason):
     lead_id, _ = _lead(db, **kwargs)
@@ -174,6 +183,40 @@ def test_permanent_reasons_block_the_lead_for_good(db, kwargs, reason):
     _run(db, dialer=dialer, calls=Calls(), now=NEXT_MORNING)
     row = _lead_row(db, lead_id)
     assert dialer.upserts == [] and (row["dialer_status"], row["dialer_block_reason"]) == ("blocked", reason)
+
+
+def test_no_consent_certificate_and_no_dnc_scrub_are_needed(db):
+    """Client decision: LendingFlow leads load without a certificate, and Tracerfy is never called for them."""
+    SCRUBBED.clear()
+    lead_id, phone = _lead(db, consent="missing", scrub=False)
+    dialer = FakeDialer()
+    _run(db, dialer=dialer, calls=Calls())
+    assert dialer.upserts == [(phone, "LendingFlow")] and SCRUBBED == []
+    assert _lead_row(db, lead_id)["dialer_status"] == "loaded"
+
+
+def test_a_stored_dnc_hit_does_not_block_a_lendingflow_lead_but_an_opt_out_does(db):
+    lead_id, phone = _lead(db, scrub=False)
+    db.execute(text("INSERT INTO dnc_phone_checks (phone, national_dnc, litigator, checked_at, source) "
+                    "VALUES (:p, true, true, :at, 'test') ON CONFLICT (phone) DO UPDATE SET national_dnc = true"),
+               {"p": phone, "at": NOON_ET - timedelta(days=1)})
+    opted_out, other = _lead(db, scrub=False)
+    db.execute(text("INSERT INTO lending.suppression_list (phone, reason, source_channel) VALUES (:p, 'OPT_OUT', 'sms') "
+                    "ON CONFLICT (phone) DO NOTHING"), {"p": other})
+    dialer = FakeDialer()
+    _run(db, dialer=dialer, calls=Calls())
+    assert dialer.upserts == [(phone, "LendingFlow")]
+    assert (_lead_row(db, opted_out)["dialer_status"], _lead_row(db, opted_out)["dialer_block_reason"]) ==         ("blocked", "SUPPRESSED")
+
+
+def test_a_loaded_lendingflow_number_is_never_held_or_rescrubbed_for_a_missing_scrub(db):
+    from src.lending import compliance, weekly_scrub
+
+    _, phone = _lead(db, scrub=False)
+    _run(db, dialer=FakeDialer(), calls=Calls())
+    assert compliance.dial_blocks(db, [phone], now=NOON_ET) == {}
+    assert phone not in compliance.blocked_from_dialing(db, [phone], NOON_ET)
+    assert phone not in weekly_scrub.stale_loaded_phones(db, now=NOON_ET)
 
 
 def test_two_leads_on_one_phone_become_one_dialer_contact(db):

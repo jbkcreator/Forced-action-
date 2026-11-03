@@ -6,23 +6,15 @@ Code: `src/lending/lendingflow_dialer.py` (load + removal) and `src/lending/bd_r
 
 ## How a lead moves
 
-0. **DNC check first** (`LENDING_LENDINGFLOW_DNC_CHECK_ENABLED`). Right after intake, `check_dnc_pending` scrubs the number through Tracerfy; a stored scrub from the last 7 days is reused. The result decides what happens next:
-   - **Clear:** the lead goes to GHL, and later to BatchDialer.
-   - **DNC or litigator:** the lead is kept but suppressed (`dnc_status='dnc'`), sent to neither GHL nor BatchDialer, and Cora's inbox is told.
-   - **Scrub failed:** the lead is held and retried by the sweep; it is never pushed unchecked.
-
-   The uncalled-lead alarm starts only after the check passes. A Tracerfy batch can take seconds to minutes, so a lead's arrival in GHL is delayed by that much.
 1. The lead is delivered to GHL, as before.
 2. After `LENDING_LENDINGFLOW_DIALER_DELAY_MINUTES` (Josh's first-call window), the sweep re-reads the lead's GHL calls live. If that read fails, the lead is not loaded and is retried later.
 3. If Josh already had a connected call with the lead, it is never loaded (`blocked` / `HANDLED_IN_GHL`).
-4. Otherwise it goes through `run_dialer_load` alone. That covers suppression, Georgia, Backflip, the Tracerfy DNC scrub, the attempt caps and the calling window. Its card shows name, loan amount, loan type, state, request date and prior contact.
-5. A lead stays `pending` for temporary reasons and is retried after 15 minutes: outside calling hours, attempt cap, scrub, halt, a failed GHL read, or a refused load. A lead that arrives at 8:30pm loads the next morning.
+4. Otherwise it goes through `run_dialer_load` alone with `dnc_scrub=False`. **Client decision: LendingFlow leads need no consent certificate and get no Tracerfy DNC scrub.** Still applied: opt-out / suppression, Georgia, Backflip, the attempt caps and the calling window. Loaded LendingFlow numbers are also skipped by the dialer sweep's stale-scrub hold and by the weekly rescrub (`compliance.scrub_exempt_phones`). Its card shows name, loan amount, loan type, state, request date and prior contact.
+5. A lead stays `pending` for temporary reasons and is retried after 15 minutes: outside calling hours, attempt cap, halt, a failed GHL read, or a refused load. A lead that arrives at 8:30pm loads the next morning.
 6. A lead is `blocked` for good for any of these reasons:
    - opt-out or suppression;
-   - no consent certificate;
    - Georgia;
    - Backflip conflict;
-   - DNC or litigator;
    - attempt history exhausted;
    - already in another campaign;
    - handled in GHL.
@@ -57,8 +49,7 @@ Code: `src/lending/lendingflow_dialer.py` (load + removal) and `src/lending/bd_r
 
 - His GHL calls count toward the dialer's attempt limit: 3 in 24 h, 6 in 10 business days. After 3 calls by Josh, the lead waits 24 h before loading. After 6, it is never loaded.
 - The LendingFlow leads in the dialer reverse the launch rule "LendingFlow → GHL + Josh only".
-- Whether LendingFlow consent covers an auto-dialer. This is for counsel to answer, not a dev decision.
-- DNC: what a DNC hit should do. Today the lead is sent to neither GHL nor BatchDialer and Cora's inbox is told. The alternative is to push it to GHL with DND set. The check costs one Tracerfy lookup per new phone.
+- No consent certificate and no DNC / litigator scrub for LendingFlow leads (client decision, Nov 3). The legal basis for auto-dialing these leads is the client's and their counsel's call.
 
 ## Checking a lead
 

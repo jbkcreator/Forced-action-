@@ -956,9 +956,6 @@ class AppSettings(BaseSettings):
 	lending_lendingflow_intro_sms_enabled: bool = Field(default=False, env="LENDING_LENDINGFLOW_INTRO_SMS_ENABLED")
 	# Pipeline stage (in LENDING_GHL_PIPELINE_ID) for new LendingFlow leads; unset = contact only.
 	lending_ghl_stage_lendingflow_new: Optional[str] = Field(default=None, env="LENDING_GHL_STAGE_LENDINGFLOW_NEW")
-	# Tracerfy DNC / litigator check on every new LendingFlow lead BEFORE it goes to GHL (and so before BatchDialer). A DNC or
-	# litigator number is stored but pushed to neither; a failed scrub holds the lead and is retried. Off = pushed unchecked.
-	lending_lendingflow_dnc_check_enabled: bool = Field(default=False, env="LENDING_LENDINGFLOW_DNC_CHECK_ENABLED")
 	# LendingFlow -> BatchDialer campaign "LendingFlow" (src/lending/lendingflow_dialer.py). Off: nothing is loaded; leads
 	# already loaded are still removed once they are handled in GHL. The delay is Josh's first-call window (placeholder).
 	lending_lendingflow_dialer_enabled: bool = Field(default=False, env="LENDING_LENDINGFLOW_DIALER_ENABLED")

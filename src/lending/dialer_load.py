@@ -473,6 +473,7 @@ def run_dialer_load(
     commit: Optional[Callable[[], None]] = None,
     now: Optional[datetime] = None,
     backflip_check: Optional[bool] = None,
+    dnc_scrub: bool = True,
 ) -> LoadReport:
     """Gate every record, then (live only) load the survivors into dialer.
 
@@ -480,6 +481,8 @@ def run_dialer_load(
     back afterwards. Live requires ``scrubber`` and ``dialer`` and commits
     through ``commit`` (default ``db.commit``) after each chunk of loads.
     ``backflip_check`` defaults to the ``LENDING_BACKFLIP_CHECK_ENABLED`` setting.
+    ``dnc_scrub=False`` skips the Tracerfy DNC / litigator scrub and its freshness check
+    (LendingFlow leads only, client decision); every other gate still runs.
     """
     if backflip_check is None:
         backflip_check = get_settings().lending_backflip_check_enabled
@@ -494,7 +497,7 @@ def run_dialer_load(
 
     gate_results = filter_loadable(
         list(records), db, scrubber=no_scrub if dry_run else scrubber,
-        run_id=None if dry_run else run_id,
+        run_id=None if dry_run else run_id, dnc_scrub=dnc_scrub,
     )
     blocks = _gate_blocks(records, gate_results)
     # A dry run scrubs nothing, so unscrubbed numbers still go through the
@@ -512,7 +515,7 @@ def run_dialer_load(
     # eligibility, not dial time, so they skip it.
     if not dry_run:
         rail_candidates = [i for i in range(len(records)) if i not in blocks and phones[i]]
-        rail = dial_blocks(db, sorted({phones[i] for i in rail_candidates}), now=now)
+        rail = dial_blocks(db, sorted({phones[i] for i in rail_candidates}), now=now, check_scrub=dnc_scrub)
         blocks.update({i: rail[phones[i]].value for i in rail_candidates if phones[i] in rail})
     blocks.update({i: REASON_NEEDS_SCRUB for i in pending_scrub if i not in conflict_blocks})
     report.needs_scrub_backflip_blocked = sum(1 for i in pending_scrub if i in conflict_blocks)

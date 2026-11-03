@@ -692,11 +692,6 @@ class LendingLendingFlowLead(LendingBase):
     duplicate_of: Mapped[Optional[int]] = mapped_column(ForeignKey("lending.lendingflow_leads.id"))
     handled_in_ghl_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # booked / connected in GHL
     handled_in_ghl_reason: Mapped[Optional[str]] = mapped_column(String(30))
-    # DNC check before the GHL push: pending -> checking -> clear | dnc; skipped = check off (and every older lead).
-    dnc_status: Mapped[str] = mapped_column(String(12), nullable=False, default="skipped", server_default=text("'skipped'"))
-    dnc_result: Mapped[Optional[str]] = mapped_column(String(30))  # NATIONAL_DNC / STATE_DNC / LITIGATOR / SCRUB_FAILED
-    dnc_claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
-    dnc_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (
         CheckConstraint("consent_status IN ('present', 'missing')", name="ck_lending_lendingflow_leads_consent"),
@@ -704,8 +699,6 @@ class LendingLendingFlowLead(LendingBase):
             "dialer_status IN ('pending', 'loading', 'loaded', 'blocked', 'unconfirmed', 'remove_pending', "
             "'removed', 'duplicate', 'expired', 'failed', 'preexisting')",
             name="ck_lending_lendingflow_leads_dialer_status"),
-        CheckConstraint("dnc_status IN ('pending', 'checking', 'clear', 'dnc', 'skipped')",
-                        name="ck_lending_lendingflow_leads_dnc_status"),
         Index("idx_lending_lendingflow_leads_dialer_pending", "received_at",
               postgresql_where=text("dialer_status = 'pending'")),
         CheckConstraint("ghl_status IN ('pending', 'synced', 'contact_only', 'failed', 'skipped')",
