@@ -280,6 +280,8 @@ class LendingCallDisposition(LendingBase):
     # jobs (delivery, missing-disposition alert, soft approval cards) act on batchdialer rows only.
     call_source: Mapped[str] = mapped_column(String(20), nullable=False, default="batchdialer",
                                              server_default=text("'batchdialer'"))
+    # A NURTURE call whose gate check failed (G2: replaces the old GATE_FAILED_NURTURE code); NULL = not reported.
+    gate_failed: Mapped[Optional[bool]] = mapped_column(Boolean)
 
     __table_args__ = (
         Index("idx_lending_call_dispositions_phone_ended", "phone", "call_ended_at"),

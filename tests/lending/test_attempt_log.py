@@ -209,7 +209,7 @@ def test_ghl_call_outcomes_map_to_our_codes() -> None:
     log = build_attempt_log(LEAD, [ghl_call(1, "no-answer", message_id="a"), ghl_call(2, "voicemail", message_id="b"),
                                    ghl_call(3, "busy", message_id="c"), ghl_call(4, "failed", message_id="d")], [])
     assert [(a.channel, a.outcome) for a in log.attempts] == [
-        ("call", "NO_ANSWER"), ("voicemail", "LEFT_VOICEMAIL"), ("call", "NO_ANSWER"), ("call", "CALL_FAILED")]
+        ("call", "NO_ANSWER"), ("voicemail", "LEFT_VOICEMAIL"), ("call", "NO_ANSWER"), ("call", "NO_ANSWER")]
     assert log.first_reply_at is None
 
 
