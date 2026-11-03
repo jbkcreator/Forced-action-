@@ -77,7 +77,8 @@ class _RecordDb:
 
 
 def test_dedupe_compares_gate_flag_and_contact():
-    ev = m.parse_event({"disposition": "Nurture", "phone": "8135550142", "contact_id": "c1", "gate_failed": "yes"})
+    ev = m.parse_event({"disposition": "Nurture", "phone": "8135550142", "contact_id": "c1", "gate_failed": "yes",
+                       "called_at": "2026-11-03T14:05:00Z"})
     db = _RecordDb()
     m.record_event(db, ev, {})
     lock, find = db.executed[0], db.executed[1]

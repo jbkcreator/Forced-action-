@@ -167,7 +167,12 @@ _FIND_REPEAT = text("""
 
 
 def record_event(db, ev: GhlDispositionEvent, body: Mapping[str, Any]) -> tuple[int, bool]:
-    """Store the event once: returns ``(event id, duplicate)``; a repeated delivery returns the stored event's id."""
+    """Store the event: returns ``(event id, duplicate)``; a repeated delivery returns the stored event's id.
+
+    Only an event with a call identity (call id or call time) is de-duplicated: without one, a webhook retry and a
+    second real call with the same outcome look identical, so every delivery is stored rather than one discarded."""
+    if ev.ghl_call_id is None and ev.called_at is None:
+        return _insert(db, ev, body), False
     key = "|".join(str(v) for v in ("ghl-disposition", ev.phone, ev.code, ev.ghl_call_id, ev.called_at,
                                     ev.caller_name, ev.gate_failed, ev.contact_id))
     db.execute(_LOCK_DELIVERY, {"key": key})
@@ -178,13 +183,16 @@ def record_event(db, ev: GhlDispositionEvent, body: Mapping[str, Any]) -> tuple[
     }).scalar()
     if existing is not None:
         return existing, True
-    event_id = db.execute(_INSERT, {
+    return _insert(db, ev, body), False
+
+
+def _insert(db, ev: GhlDispositionEvent, body: Mapping[str, Any]) -> int:
+    return db.execute(_INSERT, {
         "contact_id": ev.contact_id, "phone": ev.phone, "raw": ev.disposition_raw, "code": ev.code,
         "gate_failed": ev.gate_failed, "call_id": ev.ghl_call_id, "caller": ev.caller_name, "called_at": ev.called_at,
         "raw_event": json.dumps({k: body.get(k) for k in ("contact_id", "disposition", "call_id", "called_at")},
                                 default=str),
     }).scalar_one()
-    return event_id, False
 
 
 def choose_call(event: Mapping[str, Any], calls: Iterable[Mapping[str, Any]],
@@ -233,16 +241,22 @@ _CANDIDATES = text("""
 """)
 # The write repeats choose_call's rule: only an open call or the exact call the event names, and a DNC is never
 # replaced by another outcome.
+# The call's caller is named for the first time: the delivered Sheet row and Slack card still say unknown, so the
+# delivery markers are cleared and the next delivery (the matcher's, else the retry job) updates both in place.
+_CALLER_NAMED = ("(caller_name IS NULL OR caller_name = :unknown_caller) "
+                 "AND CAST(:caller AS text) IS NOT NULL AND CAST(:caller AS text) <> :unknown_caller")
 _SET_CALL = text("""
     UPDATE lending.call_dispositions SET disposition = :d, disposition_at = clock_timestamp(),
            disposition_list_version = :v, unfunded_cause = COALESCE(unfunded_cause, :cause), gate_failed = :gate,
            caller_name = CASE WHEN caller_name IS NULL OR caller_name = :unknown_caller
                               THEN COALESCE(:caller, caller_name) ELSE caller_name END,
+           sheet_synced_disposition = CASE WHEN {named} THEN NULL ELSE sheet_synced_disposition END,
+           slack_posted_disposition = CASE WHEN {named} THEN NULL ELSE slack_posted_disposition END,
            unfunded_cause_provisional = CASE WHEN unfunded_cause IS NULL AND :cause IS NOT NULL THEN true
                                              ELSE unfunded_cause_provisional END
      WHERE id = :id AND (disposition IS NULL OR dialer_call_id = :exact)
        AND (disposition IS DISTINCT FROM :dnc OR :d = :dnc)
-""")
+""".replace("{named}", _CALLER_NAMED))
 _SET_EVENT = text("UPDATE lending.ghl_disposition_events SET matched_call_id = :call, matched_at = :at WHERE id = :id")
 
 

@@ -121,8 +121,11 @@ class _RecordDb:
         return _Result(scalar=99)
 
 
-def _parsed():
-    return m.parse_event({"disposition": "Requested Appointment", "phone": "8135550142", "user": "Josh Kantor"})
+def _parsed(**extra):
+    return m.parse_event({"disposition": "Requested Appointment", "phone": "8135550142", "user": "Josh Kantor", **extra})
+
+
+CALLED = "2026-11-03T14:05:00Z"
 
 
 def test_a_first_delivery_is_inserted():
@@ -133,7 +136,7 @@ def test_a_first_delivery_is_inserted():
 
 def test_a_repeated_delivery_returns_the_stored_event_without_inserting():
     db = _RecordDb(existing=42)
-    assert m.record_event(db, _parsed(), {}) == (42, True)
+    assert m.record_event(db, _parsed(called_at=CALLED), {}) == (42, True)
     assert not any(s.startswith("INSERT") for s, _ in db.executed)
     lock, find = db.executed[0], db.executed[1]
     assert "pg_advisory_xact_lock" in lock[0]  # serialises concurrent retries of the same delivery
@@ -243,3 +246,11 @@ def test_a_failed_field_read_stamps_nothing():
     db = _PipeDb(("+18135550142", "x", "outbound", "k-1", 60))
     cp._check_consent(db, _bd_event(), 5, _Broken({}))
     assert not any("consent_checked_at" in s and s.startswith("UPDATE") for s, _ in db.sql)
+
+
+def test_without_a_call_identity_every_delivery_is_stored():
+    """No call id and no call time: a retry and a second real call look the same, so nothing is discarded."""
+    db = _RecordDb(existing=42)
+    assert m.record_event(db, _parsed(), {}) == (99, False)
+    assert not any("pg_advisory_xact_lock" in s or s.startswith("SELECT id FROM") for s, _ in db.executed)
+    assert any(s.startswith("INSERT INTO lending.ghl_disposition_events") for s, _ in db.executed)

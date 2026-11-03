@@ -84,9 +84,14 @@ _ELIGIBLE_COUNT = text(f"SELECT count(*) FROM ({_ELIGIBLE}) eligible")
 _CONTACTS = text(_ELIGIBLE + " ORDER BY min(received_at) DESC, ghl_contact_id LIMIT :limit OFFSET :offset")
 
 # A call already stored is updated only when GHL now reports something new (a call imported while in progress
-# gains its final outcome and talk time); an unknown outcome or a missing duration never erases a known one.
+# gains its final outcome and talk time, or its caller is named); an unknown outcome or a missing duration never erases a known one.
 # Only rows this import owns (call_source 'ghl') are touched. ``inserted`` is false for an update; an unchanged
 # call returns no row.
+# A caller named for the first time (the call's userId resolves now, or was missing before) upgrades the stored
+# unknown name even when outcome and talk time are unchanged; a known name is never replaced. The delivery markers
+# are cleared with it, so the retry job updates the Sheet row and the Slack card in place.
+_CALLER_NAMED = ("(d.caller_name IS NULL OR d.caller_name = :unknown_caller) "
+                 "AND EXCLUDED.caller_name IS NOT NULL AND EXCLUDED.caller_name <> :unknown_caller")
 _UPSERT = text("""
     INSERT INTO lending.call_dispositions AS d
         (dialer_call_id, call_source, direction, phone, caller_seat, caller_name, campaign_tag, disposition_raw,
@@ -96,6 +101,8 @@ _UPSERT = text("""
     ON CONFLICT (dialer_call_id) DO UPDATE SET
         caller_name = CASE WHEN d.caller_name IS NULL OR d.caller_name = :unknown_caller THEN EXCLUDED.caller_name
                            ELSE d.caller_name END,
+        sheet_synced_disposition = CASE WHEN {named} THEN NULL ELSE d.sheet_synced_disposition END,
+        slack_posted_disposition = CASE WHEN {named} THEN NULL ELSE d.slack_posted_disposition END,
         disposition_raw = CASE WHEN EXCLUDED.disposition_raw = :unknown_outcome THEN d.disposition_raw
                                ELSE EXCLUDED.disposition_raw END,
         talk_duration_sec = COALESCE(EXCLUDED.talk_duration_sec, d.talk_duration_sec),
@@ -105,9 +112,10 @@ _UPSERT = text("""
      WHERE d.call_source = :source
        AND ((EXCLUDED.disposition_raw <> :unknown_outcome AND EXCLUDED.disposition_raw IS DISTINCT FROM d.disposition_raw)
             OR (EXCLUDED.talk_duration_sec IS NOT NULL
-                AND EXCLUDED.talk_duration_sec IS DISTINCT FROM d.talk_duration_sec))
+                AND EXCLUDED.talk_duration_sec IS DISTINCT FROM d.talk_duration_sec)
+            OR ({named}))
     RETURNING (xmax = 0) AS inserted
-""")
+""".replace("{named}", _CALLER_NAMED))
 UNKNOWN_OUTCOME = "ghl:unknown"
 
 
