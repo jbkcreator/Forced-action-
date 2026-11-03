@@ -165,6 +165,8 @@ class RemovalReason(str, Enum):
     ATTEMPT_CAP = "attempt_cap"
     SCRUB_STALE = "scrub_stale"
     ATTEMPT_HISTORY = "attempt_history"
+    # The lead was booked or reached by a person in GHL: deleted from the dialer, never restored.
+    HANDLED_IN_GHL = "handled_in_ghl"
 
 
 def validate_lending_compliance_config() -> None:

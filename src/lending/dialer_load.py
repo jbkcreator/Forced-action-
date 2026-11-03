@@ -55,7 +55,8 @@ from src.lending.dialer_port import (
     DialerRequestError,
 )
 from src.lending.dialer_removal import DialerRemovalUndecided
-from src.lending.context_card import NO_PRIOR_CONTACT, build_context_card
+from src.lending.context_card import NO_PRIOR_CONTACT, ContextCard, build_context_card
+from src.lending.dialer_display import NOT_AVAILABLE
 from src.lending.lead_facts import LeadFacts, load_lead_facts
 from src.lending.lead_scoring import LeadSignals, score_lead
 from src.services.phone_utils import normalize as normalize_phone
@@ -415,6 +416,11 @@ def _cards(db, loadable: Sequence["_Loadable"]) -> dict[str, dict[str, str]]:
     history = _prior_contacts(db, sorted({item.phone for item in loadable}))
     cards: dict[str, dict[str, str]] = {}
     for item in loadable:
+        if item.record.get("card"):  # a source with no property facts (LendingFlow) builds its own card
+            prior = None if history is None else history.get(item.phone, NO_PRIOR_CONTACT)
+            card = {**item.record["card"], "prior_contact": prior or NOT_AVAILABLE}
+            cards[item.record_ref] = ContextCard(fields=card).custom_fields
+            continue
         property_id = item.record.get("property_id")
         lead = facts.get(int(property_id)) if property_id is not None else None
         lead = lead or LeadFacts(property_id=int(property_id or 0), property_address=item.display.property_address,
@@ -467,6 +473,7 @@ def run_dialer_load(
     commit: Optional[Callable[[], None]] = None,
     now: Optional[datetime] = None,
     backflip_check: Optional[bool] = None,
+    dnc_scrub: bool = True,
 ) -> LoadReport:
     """Gate every record, then (live only) load the survivors into dialer.
 
@@ -474,6 +481,8 @@ def run_dialer_load(
     back afterwards. Live requires ``scrubber`` and ``dialer`` and commits
     through ``commit`` (default ``db.commit``) after each chunk of loads.
     ``backflip_check`` defaults to the ``LENDING_BACKFLIP_CHECK_ENABLED`` setting.
+    ``dnc_scrub=False`` skips the Tracerfy DNC / litigator scrub and its freshness check
+    (LendingFlow leads only, client decision); every other gate still runs.
     """
     if backflip_check is None:
         backflip_check = get_settings().lending_backflip_check_enabled
@@ -488,7 +497,7 @@ def run_dialer_load(
 
     gate_results = filter_loadable(
         list(records), db, scrubber=no_scrub if dry_run else scrubber,
-        run_id=None if dry_run else run_id,
+        run_id=None if dry_run else run_id, dnc_scrub=dnc_scrub,
     )
     blocks = _gate_blocks(records, gate_results)
     # A dry run scrubs nothing, so unscrubbed numbers still go through the
@@ -506,7 +515,7 @@ def run_dialer_load(
     # eligibility, not dial time, so they skip it.
     if not dry_run:
         rail_candidates = [i for i in range(len(records)) if i not in blocks and phones[i]]
-        rail = dial_blocks(db, sorted({phones[i] for i in rail_candidates}), now=now)
+        rail = dial_blocks(db, sorted({phones[i] for i in rail_candidates}), now=now, check_scrub=dnc_scrub)
         blocks.update({i: rail[phones[i]].value for i in rail_candidates if phones[i] in rail})
     blocks.update({i: REASON_NEEDS_SCRUB for i in pending_scrub if i not in conflict_blocks})
     report.needs_scrub_backflip_blocked = sum(1 for i in pending_scrub if i in conflict_blocks)

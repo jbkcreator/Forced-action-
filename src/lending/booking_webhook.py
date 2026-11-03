@@ -22,7 +22,7 @@ import logging
 from datetime import datetime
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -33,6 +33,7 @@ from src.lending.booking_messages import cancel_by_provider_event, find_ai_booki
 from src.lending.confirmation_tasks import AI_BOOKER, complete_confirmation_task
 from src.lending.cora_inbox import add_to_inbox_in_own_session
 from src.lending.ghl_appointments import get_appointment_canceller
+from src.lending.lendingflow_dialer import HANDLED_BOOKED, handle_handled_in_ghl
 from src.lending.payload_shape import log_shape
 from src.lending.db import lending_session
 from src.lending.reply_guard import slack_poster
@@ -80,6 +81,7 @@ def _is_ai_source(body: dict[str, Any]) -> bool:
 @router.post("/ghl-appointment")
 def ghl_appointment(
     body: dict[str, Any],
+    background_tasks: BackgroundTasks,
     x_webhook_secret: Optional[str] = Header(default=None),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
@@ -91,7 +93,9 @@ def ghl_appointment(
     if not appointment_id:
         return {"status": "noop", "reason": "no_appointment_id"}
     if status in SCHEDULING_STATUSES or (status == "rescheduled" and _start_time(body) is not None):
-        return _schedule_from_appointment(db, body, appointment_id)
+        response = _schedule_from_appointment(db, body, appointment_id)
+        _take_out_of_dialer(background_tasks, _first(body, ("phone",), ("contact", "phone")))
+        return response
     reason = CANCELLING_STATUSES.get(status)
     if reason is None:
         return {"status": "noop", "reason": "status_not_handled"}
@@ -162,9 +166,17 @@ def _parse_booking(body: dict[str, Any]) -> dict[str, Any]:
     return {**body, "booking_ref": booking_ref, "slot_start_utc": slot}
 
 
+def _take_out_of_dialer(background_tasks: BackgroundTasks, phone: Optional[str]) -> None:
+    """A booked lead is handled in GHL: after the response, stamp its LendingFlow leads and delete it from BatchDialer
+    (src/lending/lendingflow_dialer.py). Runs whatever the scheduling outcome: the booking itself is the signal."""
+    if phone:
+        background_tasks.add_task(handle_handled_in_ghl, phone, reason=HANDLED_BOOKED)
+
+
 @router.post("/booking-confirmed")
 def booking_confirmed(
     body: dict[str, Any],
+    background_tasks: BackgroundTasks,
     x_webhook_secret: Optional[str] = Header(default=None),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
@@ -182,6 +194,7 @@ def booking_confirmed(
         logger.error("[booking-webhook] booking_ref=%s scheduling failed (%s)", payload["booking_ref"], type(exc).__name__)
         db.rollback()
         raise HTTPException(status_code=500, detail="Could not schedule the booking messages") from None
+    _take_out_of_dialer(background_tasks, payload.get("phone"))
     outcome = "skipped" if result.skip_reason else "scheduled" if result.inserted else "duplicate"
     return {"status": outcome, "inserted": result.inserted, "skip_reason": result.skip_reason}
 
