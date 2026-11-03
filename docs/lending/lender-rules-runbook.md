@@ -5,23 +5,32 @@ Josh's A1 answer: a lender field edit or a "confirmed" mark is a data edit, not 
 ## How it works
 - `config/lender_matrix.py` still defines the lenders, the field names and the defaults.
 - `lending.lender_rule_values` holds one row per lender key and field: `value` (JSON), `status`
-  (`confirmed` / `placeholder` / `confirm_at_submission`), `note`, `updated_by`, `updated_at`.
+  (`confirmed` / `placeholder` / `confirm_at_submission`), `note`, `updated_by`, `updated_at`, and
+  `effective_from` (L1: the ET date the row takes effect; a row dated later is not applied until that day,
+  and the field keeps its config value meanwhile). Seed rows take the date in `RULES_EFFECTIVE_FROM`.
 - With `LENDING_RULES_FROM_DB=true`, `evaluate_lender_fit`, the lead card and the soft approval read the
   table; each row overrides that field for that lender. Anything not in the table keeps its config value.
   With the flag off (default), or if the table is missing or unreadable, the config alone is used.
 - A lender counts as confirmed only when all its fields are confirmed. The fit score stays hidden until
-  all five lenders are confirmed.
+  all six lenders are confirmed.
+- **L1: nothing routes to an unverified lender.** R-1 never routes to a lender while any of its fields is
+  `placeholder`, even when it is signed (`confirm_at_submission` does not block). Backflip and Central Lending
+  are the real lenders; RCN, Easy Street, Kiavi and ABL are kept as unverified placeholders (dated 2026-11-03).
+  Central Lending (`central_lending`) is a shell until the client's credit box arrives.
 
 ## Set up (once)
 1. Check the target DB (print host and database first).
 2. `PYTHONPATH=. python migrations/apply_lending_lender_rule_values.py` (creates the table and seeds one row
-   per lender and field from the config; re-running never overwrites an edit).
+   per lender and field from the config; re-running never overwrites an edit). Re-run it for L1: it adds
+   `effective_from` (existing rows take their `updated_at` date) and seeds `central_lending`. Then re-run
+   `migrations/apply_lending_lender_routing_seed.py` to add Central Lending to routing as `pending`.
 3. Set `LENDING_RULES_FROM_DB=true` and restart `lending-api`.
 
 ## Edit a value or mark it confirmed
 ```sql
 UPDATE lending.lender_rule_values
-SET value = '0.80'::jsonb, status = 'confirmed', updated_by = 'josh', updated_at = now()
+SET value = '0.80'::jsonb, status = 'confirmed', updated_by = 'josh', updated_at = now(),
+    effective_from = (now() AT TIME ZONE 'America/New_York')::date
 WHERE lender_key = 'rcn_capital' AND field = 'max_ltc';
 ```
 Value formats: numbers as `700` or `0.85` (percentages 0 to 1); lists as `["FL","GA"]`; loan types as
@@ -29,7 +38,7 @@ Value formats: numbers as `700` or `0.85` (percentages 0 to 1); lists as `["FL",
 Fields: `loan_types, min_loan_amount, max_loan_amount, max_ltc, max_ltv, min_purchase_price, credit_floor,
 min_completed_projects, requires_ground_up_build, approved_states, allowed_property_types,
 origination_points, rate_spread, hold_months`. Lender keys: `generic_backflip_flip,
-generic_backflip_construction, rcn_capital, easy_street, kiavi_affiliate, abl`.
+generic_backflip_construction, rcn_capital, easy_street, kiavi_affiliate, abl, central_lending`.
 
 A row that fails validation is skipped and logged at ERROR (`[lender-rules] row skipped`), and that field
 keeps its config value. Watch the log after an edit.

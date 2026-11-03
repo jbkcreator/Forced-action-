@@ -8,6 +8,9 @@ missing table behaves exactly like the config alone.
 A row that fails validation is skipped and logged at ERROR, so a typo in an edit never silently turns a
 cap off; if the merged matrix is itself invalid the whole table is ignored. A lender key the config does
 not know is ignored (adding a lender is still a code change).
+
+A row whose ``effective_from`` is after today (ET) is not applied yet; until then that field keeps its config
+value and status.
 """
 from __future__ import annotations
 
@@ -41,7 +44,10 @@ _INT_FIELDS = {"min_completed_projects": 0, "hold_months": 1}  # field -> minimu
 _SET_FIELDS = frozenset({"loan_types", "approved_states", "allowed_property_types"})
 _BOOL_FIELDS = frozenset({"requires_ground_up_build"})
 
-_SELECT_SQL = f"SELECT lender_key, field, value, status FROM {LENDING_SCHEMA}.lender_rule_values"
+_SELECT_SQL = (
+    f"SELECT lender_key, field, value, status FROM {LENDING_SCHEMA}.lender_rule_values"
+    " WHERE effective_from <= (now() AT TIME ZONE 'America/New_York')::date"
+)
 
 
 class RuleValueError(ValueError):

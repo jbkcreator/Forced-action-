@@ -223,3 +223,68 @@ def test_a_missing_table_falls_back_to_the_config(lending_db, caplog):
     with caplog.at_level(logging.ERROR):
         assert store.load_matrix(lending_db) == LENDER_MATRIX
     assert "could not read" in caplog.text
+
+
+# ── L1: Central Lending, unverified placeholders, effective dates ─────────────
+
+PLACEHOLDER_LENDERS = ("rcn_capital", "easy_street", "kiavi_affiliate", "abl", "central_lending")
+
+
+@pytest.mark.parametrize("key", PLACEHOLDER_LENDERS)
+def test_the_placeholder_lenders_are_unverified_and_dated(key):
+    from config.lender_matrix import RULES_EFFECTIVE_FROM, has_placeholder_rules
+
+    rules = _by_key(LENDER_MATRIX, key)
+    assert not rules.verified and has_placeholder_rules(rules)
+    assert all(field_status_of(rules, name) is FieldStatus.PLACEHOLDER for name in PARAMETER_FIELDS)
+    assert RULES_EFFECTIVE_FROM[key].isoformat() == "2026-11-03"
+
+
+def test_every_seed_row_carries_its_lenders_effective_date():
+    from config.lender_matrix import RULES_EFFECTIVE_FROM
+
+    assert all(row["effective_from"] == RULES_EFFECTIVE_FROM[row["lender_key"]] for row in seed_rows())
+    assert {row["lender_key"] for row in seed_rows()} >= {"central_lending"}
+
+
+def test_a_row_dated_in_the_future_is_not_applied_until_then(lending_db):
+    conn = lending_db.connection()
+    apply_to(conn)
+    conn.execute(text(
+        "UPDATE lending.lender_rule_values SET value = '700'::jsonb, status = 'confirmed',"
+        " effective_from = CURRENT_DATE + 30 WHERE lender_key = :k AND field = 'credit_floor'"), {"k": FLIP})
+    flip = _by_key(store.load_matrix(lending_db), FLIP)
+    assert flip.credit_floor == 640 and field_status_of(flip, "credit_floor") is FieldStatus.PLACEHOLDER
+
+    conn.execute(text(
+        "UPDATE lending.lender_rule_values SET effective_from = CURRENT_DATE - 1"
+        " WHERE lender_key = :k AND field = 'credit_floor'"), {"k": FLIP})
+    assert _by_key(store.load_matrix(lending_db), FLIP).credit_floor == 700
+
+
+def test_a_table_from_before_l1_gains_the_date_column_from_its_last_change(lending_db):
+    conn = lending_db.connection()
+    apply_to(conn)
+    conn.execute(text("ALTER TABLE lending.lender_rule_values DROP COLUMN effective_from"))
+    conn.execute(text("UPDATE lending.lender_rule_values SET updated_at = '2026-10-10 15:00+00'"))
+    assert apply_to(conn) == 0
+    dates = conn.execute(text("SELECT DISTINCT effective_from FROM lending.lender_rule_values")).scalars().all()
+    assert [d.isoformat() for d in dates] == ["2026-10-10"]
+    assert apply_to(conn) == 0  # re-run leaves the dates alone
+
+
+def test_a_new_row_defaults_to_todays_et_date_the_day_the_reader_compares(lending_db):
+    conn = lending_db.connection()
+    apply_to(conn)
+    conn.execute(text("ALTER TABLE lending.lender_rule_values ALTER COLUMN effective_from SET DEFAULT CURRENT_DATE"))
+    apply_to(conn)  # a re-run resets an older default
+    default = conn.execute(text(
+        "SELECT column_default FROM information_schema.columns WHERE table_schema = 'lending'"
+        " AND table_name = 'lender_rule_values' AND column_name = 'effective_from'")).scalar_one()
+    assert "America/New_York" in default
+    conn.execute(text("DELETE FROM lending.lender_rule_values WHERE lender_key = :k AND field = 'credit_floor'"),
+                 {"k": FLIP})
+    conn.execute(text(
+        "INSERT INTO lending.lender_rule_values (lender_key, field, value, status)"
+        " VALUES (:k, 'credit_floor', '700'::jsonb, 'confirmed')"), {"k": FLIP})
+    assert _by_key(store.load_matrix(lending_db), FLIP).credit_floor == 700
