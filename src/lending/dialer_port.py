@@ -290,6 +290,8 @@ def _contact_body(phone: Optional[str], fields: DialerContactFields) -> dict:
     body: dict[str, Any] = {
         "firstname": fields.first_name or "",
         "lastname": fields.last_name or "",
+        # The update is a full PUT: a contact email left out here is cleared, undoing the import's.
+        "email": fields.email or "",
         "address": fields.address or "",
         "city": fields.city or "",
         "state": fields.state or "",

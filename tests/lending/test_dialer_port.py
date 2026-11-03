@@ -168,6 +168,12 @@ def test_update_is_a_full_put_that_keeps_the_phone():
     assert (method, path) == ("PUT", "/contact/55") and body["phonenumbers"] == [{"phonenumber": PHONE_10}]
 
 
+def test_the_full_put_keeps_the_contact_email_the_import_set():
+    http = FakeHttp(body={})
+    BatchDialerAdapter(http=http, endpoints=ENDPOINTS).update_contact("55", FIELDS, phone=PHONE)
+    assert http.calls[-1][2]["email"] == "j@example.com"
+
+
 def test_missing_for_load_names_every_unconfirmed_load_endpoint():
     adapter = BatchDialerAdapter(http=FakeHttp(), endpoints={**ENDPOINTS, "contacts_add_to_campaign": None})
     assert adapter.missing_for_load() == ["contacts_add_to_campaign"]
