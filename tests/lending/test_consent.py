@@ -34,6 +34,29 @@ def test_unknown_source_is_rejected(lending_db):
         record_consent(lending_db, PHONE, "cold_list")
 
 
+def _lendingflow_lead(db, phone=PHONE):
+    db.execute(text("INSERT INTO lending.lendingflow_leads (vendor_lead_id, dedupe_hash, raw_payload, phone) "
+                    "VALUES ('v-consent', 'h-consent', '{}'::jsonb, :p)"), {"p": phone})
+
+
+def test_a_lendingflow_lead_has_consent_without_a_consent_row(lending_db):
+    _lendingflow_lead(lending_db)
+    assert has_text_consent(lending_db, PHONE) is True
+
+
+def test_a_lendingflow_lead_that_revoked_consent_has_none(lending_db):
+    _lendingflow_lead(lending_db)
+    record_consent(lending_db, PHONE, "inbound_text")
+    revoke_consent(lending_db, PHONE)
+    assert has_text_consent(lending_db, PHONE) is False
+
+
+def test_a_suppressed_lendingflow_lead_has_no_consent(lending_db):
+    _lendingflow_lead(lending_db)
+    lending_db.execute(text("INSERT INTO lending.suppression_list (phone, reason, source_channel) VALUES (:p, 'OPT_OUT', 'sms')"), {"p": PHONE})
+    assert has_text_consent(lending_db, PHONE) is False
+
+
 def test_do_not_contact_flag_blocks_consent(lending_db):
     record_consent(lending_db, PHONE, "on_call_yes")
     lending_db.execute(text("INSERT INTO lending.contacts (phone, do_not_contact) VALUES (:p, true)"), {"p": PHONE})

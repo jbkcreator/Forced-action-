@@ -1264,6 +1264,17 @@ COUNTY_ID=hillsborough
 # Dry check first: PYTHONPATH=. python -m src.lending.weekly_scrub --dry-run
 0 6 * * 1 $PROJECT/scripts/cron/run.sh src.lending.weekly_scrub --max-credits 1000
 
+# Lending GHL call-list gate (G5): tags ndl-do-not-call-now on contacts on Josh's 8 GHL smart lists that cannot be
+# called now (attempt limit, calling hours, DNC result, emergency stop) and removes it when they can. Idle until
+# LENDING_GHL_CALL_GATE_ENABLED=true. Dry check first: PYTHONPATH=. python -m src.lending.ghl_call_gate --dry-run
+* * * * * $PROJECT/scripts/cron/run.sh src.lending.ghl_call_gate
+
+# Lending DNC scrub of numbers on Josh's GHL lists (website and cold leads, never LendingFlow): scrubbed within the
+# hour, rescrubbed before the 7-day window ends. 1 Tracerfy credit per number, capped per run by
+# LENDING_GHL_LIST_SCRUB_MAX_CREDITS; exit 4 = cap reached. Idle until LENDING_GHL_LIST_SCRUB_ENABLED=true.
+# Dry check first: PYTHONPATH=. python -m src.lending.ghl_list_scrub --dry-run
+20 * * * * $PROJECT/scripts/cron/run.sh src.lending.ghl_list_scrub
+
 # Lending GHL opt-out backstop: every GHL contact with do-not-disturb on is suppressed in
 # lending, in case the GHL "DND changed" workflow webhook is missing or down. Idempotent.
 */15 * * * * $PROJECT/scripts/cron/run.sh src.lending.ghl_dnd_backstop

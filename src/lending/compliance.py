@@ -141,6 +141,12 @@ def is_phone_suppressed(db, phone: str) -> bool:
     return bool(_suppressed_phones(db, [phone]))
 
 
+def suppressed_phones(db, phones: Sequence[str]) -> set[str]:
+    """``is_phone_suppressed`` for many phones in one query: the subset that is suppressed."""
+    phones = list(phones)
+    return _suppressed_phones(db, phones) if phones else set()
+
+
 def suppress_warm_network_phones(db, phones: list[str], *, source_ref: Optional[str] = None) -> int:
     """Permanently suppress Josh's warm network from the cold dialer queue (Oct 4
     §2: "not in my warm network, permanently suppressed from the cold queue"). Not
@@ -721,6 +727,18 @@ def scrub_exempt_phones(db, phones: Sequence[str]) -> set[str]:
     ).scalars().all())
 
 
+def lendingflow_lead_phones(db, phones: Sequence[str]) -> set[str]:
+    """Phones of a LendingFlow lead, wherever it is worked. Every LendingFlow lead counts as having agreed
+    to calls and texts (client decision), so it needs no DNC scrub; an opt-out still wins."""
+    phones = list(phones)
+    if not phones:
+        return set()
+    return set(db.execute(
+        text("SELECT DISTINCT phone FROM lending.lendingflow_leads WHERE phone = ANY(:phones)"),
+        {"phones": phones},
+    ).scalars().all())
+
+
 def _stale_scrub_phones(db, phones: list[str], now: datetime) -> set[str]:
     """Phones with no scrub, or one older than the freshness window — the weekly job's
     README says these are "blocked from dialing until rescrubbed"; this is what
@@ -762,6 +780,19 @@ def dial_blocks(db, phones: list[str], *, now: Optional[datetime] = None,
             blocks[phone] = ReasonCode.OUTSIDE_CALL_WINDOW
         elif phone in stale:
             blocks[phone] = ReasonCode.NO_FRESH_SCRUB
+    return blocks
+
+
+def scrub_verdict_blocks(db, phones: list[str]) -> dict[str, ReasonCode]:
+    """phone -> reason for each phone whose newest stored scrub found it on a DNC or litigator list.
+    ``dial_blocks`` checks only a scrub's age; this checks what it found (the load gate's ``_verdict``)."""
+    if not phones:
+        return {}
+    blocks: dict[str, ReasonCode] = {}
+    for phone, scrub in _stored_scrubs(db, phones).items():
+        verdict = _verdict(phone, scrub)
+        if not verdict.allowed:
+            blocks[phone] = verdict.reason
     return blocks
 
 
