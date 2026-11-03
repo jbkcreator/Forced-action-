@@ -4,7 +4,8 @@ Same rules as ``web_lead_ghl``: the upsert never carries ``dnd``, ``tags`` or ``
 upsert REPLACES tags), tags go through the add-tags call, and a pipeline card is created only when
 a LendingFlow stage is configured and the contact has no card yet (never moved). The note carries
 the lead id and vendor id only, no phone or email.
-A lead with a consent certificate that may be texted now (switch on, inside the send window, not suppressed) also gets the
+A lead that may be texted now (switch on, inside the send window, not suppressed; no consent certificate needed, client
+decision Nov 3) also gets the
 tag that starts the intro-SMS workflow, in a second add-tags call; the others get it later from the sweep's release step.
 """
 from __future__ import annotations
@@ -15,7 +16,6 @@ from typing import Any, Mapping, Optional
 from config.lending_lendingflow import (
     GHL_CONFIG_ERROR_STATUS_CODES,
     GHL_SOURCE,
-    GHL_TAG_CONSENT_MISSING,
     GHL_TAG_INTRO_READY,
     GHL_TAG_LENDINGFLOW,
     INTRO_NAME_FALLBACK,
@@ -23,6 +23,7 @@ from config.lending_lendingflow import (
     is_missing_lead_id,
 )
 from config.settings import get_settings
+from src.lending.cold_leads import reconcile_warm_contact
 from src.lending.global_halt import is_globally_halted
 from src.lending.ghl_account import GhlAccount, ghl_headers, lending_ghl_account
 from src.lending.web_leads import DeliveryError, PushResult
@@ -32,21 +33,20 @@ logger = logging.getLogger(__name__)
 
 def _tags(lead: Mapping[str, Any]) -> list[str]:
     tags = [GHL_TAG_LENDINGFLOW]
-    if lead["consent_status"] != "present":
-        tags.append(GHL_TAG_CONSENT_MISSING)
     if is_missing_lead_id(lead.get("vendor_lead_id") or ""):
         tags.append(GHL_TAG_NO_LEAD_ID)
     return tags
 
 
 def _intro_ready_tags(lead: Mapping[str, Any]) -> list[str]:
-    """The tag that starts the GHL intro-SMS workflow. Only for a lead with a consent certificate AND an explicit
-    ``sms_clear`` flag, which ``deliver_pending`` sets after re-checking the current suppression list and
-    do-not-contact flag at push time. A lead without that flag is never tagged (fail closed). Nothing is tagged
-    while ``LENDING_LENDINGFLOW_INTRO_SMS_ENABLED`` is off."""
+    """The tag that starts the GHL intro-SMS workflow. Client decision (Nov 3): LendingFlow leads need no consent
+    certificate, so the only per-lead condition is an explicit ``sms_clear`` flag, which ``deliver_pending`` sets
+    after re-checking the current suppression list and do-not-contact flag at push time (an opt-out still blocks the
+    text). A lead without that flag is never tagged (fail closed). Nothing is tagged while
+    ``LENDING_LENDINGFLOW_INTRO_SMS_ENABLED`` is off."""
     if not get_settings().lending_lendingflow_intro_sms_enabled or is_globally_halted():
         return []
-    if lead["consent_status"] == "present" and lead.get("sms_clear") is True:
+    if lead.get("sms_clear") is True:
         return [GHL_TAG_INTRO_READY]
     return []
 
@@ -81,6 +81,10 @@ class LendingFlowGhlSink:
     def push(self, lead: Mapping[str, Any]) -> PushResult:
         contact_id = self._upsert_contact(lead)
         self._call("add tags", "POST", f"/contacts/{contact_id}/tags", json={"tags": _tags(lead)})
+        if not lead.get("suppressed"):  # an opted-out lead keeps every do-not-disturb
+            reconcile_warm_contact(self._call, self._account.location_id, contact_id, lead["phone"],
+                                   text_consent=lead["consent_status"] == "present", log_prefix="[lendingflow-ghl]",
+                                   email=lead.get("email"))
         ready = _intro_ready_tags(lead)
         if ready:  # its own call, after the other tags are in place; a failure fails the push and the sweep retries it
             self.add_intro_ready_tag(contact_id)

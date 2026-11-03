@@ -1,8 +1,8 @@
 """T-09: the intro SMS is a GHL workflow that starts on the tag T-11's push adds for a lead we may text.
 
 The decision is made here, in code, at push time: a lead gets ``lendingflow-intro-ready`` in a second add-tags call
-only when it has a consent certificate AND ``deliver_pending`` has just re-checked the current suppression list and
-do-not-contact flag (``sms_clear``). Re-checking matters because a lead can sit in retry for up to 72 hours and an
+only when ``deliver_pending`` has just re-checked the current suppression list and do-not-contact flag
+(``sms_clear``). No consent certificate is needed (client decision, Nov 3). Re-checking matters because a lead can sit in retry for up to 72 hours and an
 opt-out after intake does not change its stored ``suppressed`` flag. Renaming a tag, or adding the ready tag for a
 lead that must not be texted, would break or bypass the workflow (docs/lending/intro-sms.md), so these assertions fail
 loudly instead.
@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy import text
 
-from config.lending_lendingflow import GHL_TAG_CONSENT_MISSING, GHL_TAG_INTRO_READY, GHL_TAG_LENDINGFLOW
+from config.lending_lendingflow import GHL_TAG_INTRO_READY, GHL_TAG_LENDINGFLOW
 from config.settings import get_settings
 from src.lending import lendingflow
 from src.lending.ghl_account import GhlAccount
@@ -93,13 +93,12 @@ def _tag_calls(calls):
 
 def test_workflow_trigger_and_guard_tag_names_are_stable():
     assert GHL_TAG_LENDINGFLOW == "lendingflow"
-    assert GHL_TAG_CONSENT_MISSING == "lendingflow-consent-missing"
     assert GHL_TAG_INTRO_READY == "lendingflow-intro-ready"
 
 
-def test_tags_list_is_unchanged_by_the_ready_tag():
+def test_tags_list_is_unchanged_by_the_ready_tag_and_never_marks_missing_consent():
     assert _tags({"consent_status": "present"}) == ["lendingflow"]
-    assert _tags({"consent_status": "missing"}) == ["lendingflow", "lendingflow-consent-missing"]
+    assert _tags({"consent_status": "missing"}) == ["lendingflow"]
 
 
 @pytest.mark.parametrize("lead, expected", [
@@ -107,11 +106,10 @@ def test_tags_list_is_unchanged_by_the_ready_tag():
     ({"consent_status": "present", "sms_clear": False}, []),  # suppressed since intake
     ({"consent_status": "present"}, []),  # no re-check happened: fail closed
     ({"consent_status": "present", "sms_clear": "yes"}, []),  # only an explicit True counts
-    ({"consent_status": "missing", "sms_clear": True}, []),
-    ({"consent_status": "", "sms_clear": True}, []),
-    ({"consent_status": "anything-else", "sms_clear": True}, []),
+    ({"consent_status": "missing", "sms_clear": True}, ["lendingflow-intro-ready"]),  # no certificate needed
+    ({"consent_status": "missing", "sms_clear": False}, []),  # an opt-out still blocks it
 ])
-def test_ready_tag_needs_a_consent_certificate_and_an_explicit_clear(lead, expected):
+def test_ready_tag_needs_only_an_explicit_clear(lead, expected):
     assert _intro_ready_tags(lead) == expected
 
 
@@ -129,10 +127,9 @@ def test_switch_off_push_adds_no_ready_tag_call(ghl_calls, monkeypatch):
     assert _tag_calls(ghl_calls) == [["lendingflow"]]
 
 
-def test_lead_without_consent_never_gets_the_ready_tag(ghl_calls):
+def test_lead_without_consent_also_gets_the_ready_tag(ghl_calls):
     LendingFlowGhlSink(GhlAccount("k", "loc")).push(_lead("missing"))
-    assert _tag_calls(ghl_calls) == [["lendingflow", "lendingflow-consent-missing"]]
-    assert all(GHL_TAG_INTRO_READY not in (c[2] or {}).get("tags", []) for c in ghl_calls)
+    assert _tag_calls(ghl_calls) == [["lendingflow"], ["lendingflow-intro-ready"]]
 
 
 def test_a_lead_that_is_no_longer_clear_is_pushed_without_the_ready_tag(ghl_calls):
@@ -288,7 +285,7 @@ def test_push_reports_whether_it_added_the_ready_tag(ghl_calls):
     sink = LendingFlowGhlSink(GhlAccount("k", "loc"))
     assert sink.push(_lead("present")).intro_ready_tagged is True
     assert sink.push(_lead("present", sms_clear=False)).intro_ready_tagged is False
-    assert sink.push(_lead("missing")).intro_ready_tagged is False
+    assert sink.push(_lead("missing")).intro_ready_tagged is True  # no certificate needed (client decision, Nov 3)
 
 
 # ------------------------------------------------------------------ off switch, send window, hold and release (database)

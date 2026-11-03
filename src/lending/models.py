@@ -537,6 +537,8 @@ class LendingLenderRuleValue(LendingBase):
     note: Mapped[Optional[str]] = mapped_column(Text)
     updated_by: Mapped[Optional[str]] = mapped_column(String(60))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    # L1: the ET date this value and status take effect; a row dated later is not applied until then.
+    effective_from: Mapped[date] = mapped_column(Date, nullable=False, server_default=text("(now() AT TIME ZONE 'America/New_York')::date"))
 
     __table_args__ = (
         CheckConstraint(

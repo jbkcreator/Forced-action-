@@ -14,6 +14,8 @@ Where a lender's eligibility comes from (one source of truth, no copies of the s
     statuses the lead card's fit score reads.
   - a lender without ``rule_keys`` (one T-05 does not define) uses its own ``lending.lender_product_boxes``.
   - a lender with neither has no known rules and is never routed to; the file goes to the hold queue.
+  - L1: a lender whose T-05 rules still hold a placeholder field (or name an unknown key) is unverified
+    (``rules_verified=False``) and is never routed to, even when signed.  Its own boxes are Josh's entries.
 """
 from __future__ import annotations
 
@@ -25,7 +27,7 @@ from typing import Optional
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from config.lender_matrix import LENDER_MATRIX, LenderRules, effective_rules
+from config.lender_matrix import LENDER_MATRIX, LenderRules, effective_rules, has_placeholder_rules
 from config.settings import get_settings
 from src.lending import leverage
 from src.lending.lender_rules_store import load_matrix
@@ -82,6 +84,7 @@ class LenderRow:
     construction_min_amount: Optional[int]
     takes_ground_up: bool
     boxes: tuple[ProductBox, ...]
+    rules_verified: bool = False  # L1: an unverified lender is never routed to
 
 
 @dataclass(frozen=True)
@@ -127,23 +130,28 @@ def _box_from_t05(rules: LenderRules) -> ProductBox:
     )
 
 
-def _t05_boxes(db: Session, keys_by_lender: dict[int, list[str]]) -> dict[int, list[ProductBox]]:
-    """Boxes for every lender that names T-05 ``rule_keys``, read once per load.
+def _t05_boxes(
+    db: Session, keys_by_lender: dict[int, list[str]],
+) -> tuple[dict[int, list[ProductBox]], dict[int, bool]]:
+    """Boxes for every lender that names T-05 ``rule_keys``, read once per load, and whether each is verified.
 
     Uses the same switch as the fit card: the rule-values table when ``LENDING_RULES_FROM_DB`` is on, else the
     config.  A key T-05 does not define yields no box for it (so, with no other key, the lender is never routed).
+    A lender is verified only when every key is known and none has a placeholder field (L1).
     """
     if not keys_by_lender:
-        return {}
+        return {}, {}
     matrix = load_matrix(db) if get_settings().lending_rules_from_db else LENDER_MATRIX
     by_key = {rules.key: rules for rules in matrix}
     boxes: dict[int, list[ProductBox]] = {}
+    verified: dict[int, bool] = {}
     for lender_id, keys in keys_by_lender.items():
         found = [by_key[k] for k in keys if k in by_key]
         for missing in (k for k in keys if k not in by_key):
             logger.error("lender_routing_rules id=%d names unknown T-05 rule key %r; it adds no box", lender_id, missing)
         boxes[lender_id] = [_box_from_t05(r) for r in found]
-    return boxes
+        verified[lender_id] = len(found) == len(keys) and not any(has_placeholder_rules(r) for r in found)
+    return boxes, verified
 
 
 # ── Loader ────────────────────────────────────────────────────────────────
@@ -195,7 +203,7 @@ def load_active_lenders(db: Session) -> list[LenderRow]:
         )
         boxes_by_lender.setdefault(b["lender_id"], []).append(box)
 
-    t05_boxes = _t05_boxes(db, {r["id"]: r["rule_keys"] for r in lender_rows if r["rule_keys"]})
+    t05_boxes, t05_verified = _t05_boxes(db, {r["id"]: r["rule_keys"] for r in lender_rows if r["rule_keys"]})
     return [
         LenderRow(
             id=r["id"],
@@ -208,6 +216,7 @@ def load_active_lenders(db: Session) -> list[LenderRow]:
             construction_min_amount=r["construction_min_amount"],
             takes_ground_up=r["takes_ground_up"],
             boxes=tuple(t05_boxes[r["id"]] if r["rule_keys"] else boxes_by_lender.get(r["id"], [])),
+            rules_verified=t05_verified[r["id"]] if r["rule_keys"] else True,
         )
         for r in lender_rows
     ]

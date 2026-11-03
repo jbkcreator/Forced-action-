@@ -38,9 +38,9 @@ def test_parse_rejects_csv_without_required_columns():
         parse_wholesaler_csv("name,phone\nA,8135550101\n")
 
 
-def test_ghl_tags_are_source_and_state():
+def test_ghl_tags_are_cold_source_and_state():
     record = parse_wholesaler_csv(CSV).records[0]
-    assert ghl_tags(record) == ["ndl-wholesaler", "ndl-src-sunbiz", "ndl-state-fl"]
+    assert ghl_tags(record) == ["ndl-wholesaler", "ndl-cold", "ndl-src-sunbiz", "ndl-state-fl"]
 
 
 class FakeSink:
@@ -118,7 +118,7 @@ def test_live_with_confirmation_loads_wholesalers_and_tags_only_loaded_numbers_i
     assert load["dry_run"] is False and load["scrubber"] is not None
     assert {r["pool"] for r in load["records"]} == {q.WHOLESALERS}
     assert harness["sink"].pushed == [(wholesaler_ref("sunbiz", "+18135550101"),
-                                       ["ndl-wholesaler", "ndl-src-sunbiz", "ndl-state-fl"])]
+                                       ["ndl-wholesaler", "ndl-cold", "ndl-src-sunbiz", "ndl-state-fl"])]
 
 
 def test_live_refuses_without_ghl_account(csv_path, harness, monkeypatch):
@@ -146,3 +146,34 @@ def test_live_run_below_cumulative_target_exits_with_below_target(csv_path, harn
     harness["total"] = 900
     assert task.main(["--input", str(csv_path), "--live", "--confirm-scrub", "1"]) == task.EXIT_BELOW_TARGET
 
+
+
+def test_ghl_contact_is_pushed_with_every_messaging_channel_do_not_disturb_and_calls_open(monkeypatch):
+    """Cold leads get no texts or emails from GHL workflows either; Josh can still call them."""
+    from src.lending.ghl_account import GhlAccount
+    from src.lending.wholesaler_lists import GhlWholesalerSink
+    from src.services import ghl_webhook
+
+    calls = []
+
+    class Resp:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"contact": {"id": "ct1"}}
+
+    def record_request(method, url, **kwargs):
+        calls.append((url, kwargs.get("json")))
+        return Resp()
+
+    monkeypatch.setattr(ghl_webhook, "_ghl_request", record_request)
+    record = parse_wholesaler_csv(CSV).records[0]
+    GhlWholesalerSink(GhlAccount("k", "loc")).push(record, ghl_tags(record))
+    (upsert_url, upsert), (tags_url, tags) = calls
+    assert upsert_url.endswith("/contacts/upsert") and tags_url.endswith("/contacts/ct1/tags")
+    dnd = upsert["dndSettings"]
+    assert set(dnd) == {"SMS", "Email", "GMB", "FB", "WhatsApp"}
+    assert all(setting["status"] == "active" for setting in dnd.values())
+    assert "Call" not in dnd and "dnd" not in upsert and "tags" not in upsert
+    assert "ndl-cold" in tags["tags"]
