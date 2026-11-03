@@ -16,7 +16,7 @@ from decimal import Decimal
 from functools import partial
 from typing import Callable, Optional, Sequence
 
-from config.lender_matrix import LenderRules
+from config.lender_matrix import LenderRules, effective_rules
 from src.lending.contracts import BorrowerProfile, LenderFitResult, LoanRequest, LoanType
 from src.lending.lender_fit import evaluate_lender_fit
 from src.lending.lender_rules_store import current_matrix
@@ -28,7 +28,8 @@ FitEvaluator = Callable[[PrequalLead], Optional[Sequence[FitLimits]]]
 
 
 def _limits(rules: LenderRules) -> FitLimits:
-    """Loan bounds of one lender; a side the lender does not state does not limit the range."""
+    """Loan bounds of one lender, the safe placeholder set filled in (Q1); a side still unset does not limit."""
+    rules = effective_rules(rules)
     return FitLimits(
         min_amount=int(rules.min_loan_amount) if rules.min_loan_amount is not None else 0,
         max_amount=int(rules.max_loan_amount) if rules.max_loan_amount is not None else None,

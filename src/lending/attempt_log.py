@@ -28,7 +28,9 @@ from sqlalchemy import text
 
 from config.lending_alarms import GHL_CONNECTED_STATUSES
 from config.lending_compliance import DEFAULT_TZ
-from config.lending_dispositions import ANSWERED_CODES, SYSTEM_DISPOSITION_ALIASES, UNANSWERED_CODES
+from config.lending_dispositions import (
+    ANSWERED_CODES, LEGACY_DISPOSITION_ALIASES, SYSTEM_DISPOSITION_ALIASES, UNANSWERED_CODES,
+)
 from config.lending_followup import (
     CALL_SOURCE_GHL,
     GHL_CALL_ID_PREFIX,
@@ -105,9 +107,9 @@ class CallRow:
     @property
     def code(self) -> Optional[str]:
         """Our disposition code; a raw dialer result (e.g. ANSWERING_MACHINE) or GHL outcome (e.g. no-answer) is
-        mapped. A connected GHL call has no code."""
+        mapped; a stored old-list code reads as the code it merged into. A connected GHL call has no code."""
         if self.disposition:
-            return self.disposition
+            return LEGACY_DISPOSITION_ALIASES.get(self.disposition, self.disposition)
         ghl = self.ghl_status
         if ghl is not None:
             return GHL_CALL_OUTCOME_CODES.get(ghl)

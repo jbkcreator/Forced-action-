@@ -9,6 +9,7 @@ The event handling lives in ``src.lending.ghl_consent_events``. A call that fail
 alerted by ``src.lending.webhook_failures`` and replayed until it succeeds, so an opt-out is never lost.
 
 Endpoints: POST /webhooks/lending/ghl-opt-out, POST /webhooks/lending/ghl-text-consent, POST /webhooks/lending/ghl-stage (scoreboard "showed"),
+POST /webhooks/lending/ghl-disposition (GHL call outcome; see src.lending.ghl_disposition_match),
 POST /webhooks/lending/after-hours-intake (after-hours voicemail / answering service; see src.lending.after_hours_intake)
 """
 from __future__ import annotations
@@ -18,7 +19,9 @@ import json
 import logging
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException
 from sqlalchemy.orm import Session
 
 from sqlalchemy import text
@@ -26,6 +29,13 @@ from sqlalchemy import text
 from config.settings import get_settings
 from src.api.deps import get_db
 from src.lending.after_hours_intake import record_intake
+from src.lending.ghl_disposition_match import (
+    InvalidDispositionEvent,
+    attach_pending,
+    deliver_matched,
+    parse_event as parse_disposition_event,
+)
+from src.lending.ghl_disposition_match import record_event as record_disposition_event
 from src.lending.ghl_consent_events import InvalidEvent, field as _field, record_ghl_opt_out, record_inbound_consent
 from src.lending.webhook_failures import AFTER_HOURS_INTAKE, GHL_OPT_OUT, GHL_TEXT_CONSENT, report_webhook_failure
 from src.services.phone_utils import normalize
@@ -129,6 +139,35 @@ def ghl_stage(
         raise HTTPException(status_code=500, detail="Stage event could not be recorded") from exc
     return {"recorded": bool(inserted)}
 
+
+@router.post("/ghl-disposition")
+def ghl_disposition(
+    body: dict[str, Any],
+    background: BackgroundTasks,
+    x_webhook_secret: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """A GHL workflow reports the outcome a caller picked for a GHL call. The outcome is stored, matched onto the
+    imported call when it is already there (else by the next GHL call import), and a matched call is delivered to
+    the Sheet and Slack after the response. UNVERIFIED body (Dev A builds the workflow): contact_id, phone,
+    disposition (GHL label, our code or a disp:<CODE> tag), optional call_id, user, called_at, gate_failed."""
+    _verify_secret(x_webhook_secret)
+    try:
+        event = parse_disposition_event(body)
+    except InvalidDispositionEvent as exc:
+        logger.warning("[lending-ghl] disposition webhook refused: %s", exc.reason)
+        raise HTTPException(status_code=422, detail=exc.reason) from None
+    try:
+        _, duplicate = record_disposition_event(db, event, body)
+        matched = attach_pending(db, datetime.now(timezone.utc))
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.error("[lending-ghl] disposition webhook failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=500, detail="Call outcome could not be recorded") from exc
+    if matched:
+        background.add_task(deliver_matched, matched)
+    return {"recorded": True, "duplicate": duplicate, "matched": len(matched)}
 
 
 @router.post("/after-hours-intake")

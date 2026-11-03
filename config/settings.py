@@ -1,11 +1,11 @@
 """Application configuration powered by Pydantic settings."""
 
 from functools import lru_cache
-from datetime import date
+from datetime import date, datetime
 
 from typing import Literal, Optional
 
-from pydantic import AliasChoices, AnyUrl, Field, SecretStr, PostgresDsn, field_validator
+from pydantic import AliasChoices, AnyUrl, Field, SecretStr, PostgresDsn, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -996,10 +996,17 @@ class AppSettings(BaseSettings):
 	lending_ghl_app_url: str = Field(default="https://app.gohighlevel.com", env="LENDING_GHL_APP_URL")  # GHL web app base for contact links (white-label domain if any)
 	lending_lead_arrival_alert_enabled: bool = Field(default=False, env="LENDING_LEAD_ARRIVAL_ALERT_ENABLED")  # T-05: @-mention Josh in LENDING_OPS_CHANNEL when a LendingFlow lead arrives
 	lending_alarm_sms_to: Optional[str] = Field(default=None, env="LENDING_ALARM_SMS_TO")  # Josh's mobile; normalized before use
+	# Uncalled-lead alarm working hours, Eastern, HH:MM 24h, Mon-Fri. No alarm or retry outside them; those leads go
+	# on the 08:55 "call these first" list. Start inclusive, end exclusive.
+	lending_alarm_hours_start: str = Field(default="09:00", env="LENDING_ALARM_HOURS_START")
+	lending_alarm_hours_end: str = Field(default="19:15", env="LENDING_ALARM_HOURS_END")
 	lending_ops_channel: str = Field(default="", env="LENDING_OPS_CHANNEL")  # #lead-alerts channel ID: call-now alert, 5-minute flags, returning-borrower alert
 	lending_ops_notice_channel: str = Field(default="", env="LENDING_OPS_NOTICE_CHANNEL")  # opt-out mailbox and webhook-failure alerts; channel ID, unset = not posted
 	# 14-day follow-up (src/lending/ghl_call_import.py): record calls made in GoHighLevel in lending.call_dispositions
 	lending_ghl_call_import_enabled: bool = Field(default=False, env="LENDING_GHL_CALL_IMPORT_ENABLED")
+	# G3: GHL calls ended at/after this (ISO time) are flagged by the missing-disposition alert; unset = GHL calls are not
+	# flagged (set it once the GHL disposition workflow is live, so calls from before it are not reported)
+	lending_ghl_outcomes_live_since: Optional[datetime] = Field(default=None, env="LENDING_GHL_OUTCOMES_LIVE_SINCE")
 	# G5 (src/lending/ghl_call_gate.py): tag ndl-do-not-call-now on listed GHL contacts that cannot be called now; off until Dev A's smart lists exclude the tag
 	lending_ghl_call_gate_enabled: bool = Field(default=False, env="LENDING_GHL_CALL_GATE_ENABLED")
 	# DNC scrub of numbers on Josh's GHL call lists (src/lending/ghl_list_scrub.py): website and cold leads, never LendingFlow
@@ -1205,6 +1212,22 @@ class AppSettings(BaseSettings):
 		if not url.startswith("https://") or any(c.isspace() for c in url):
 			raise ValueError("LENDING_RESCHEDULE_URL must be a single https:// URL")
 		return url
+
+	@field_validator("lending_alarm_hours_start", "lending_alarm_hours_end", mode="before")
+	@classmethod
+	def _alarm_hours_hhmm(cls, value):
+		raw = str(value).strip()
+		try:
+			parsed = datetime.strptime(raw, "%H:%M")
+		except ValueError as exc:
+			raise ValueError("LENDING_ALARM_HOURS_START / _END must be HH:MM (24h), e.g. 09:00 or 19:15") from exc
+		return parsed.strftime("%H:%M")
+
+	@model_validator(mode="after")
+	def _alarm_hours_order(self):
+		if self.lending_alarm_hours_start >= self.lending_alarm_hours_end:
+			raise ValueError("LENDING_ALARM_HOURS_START must be before LENDING_ALARM_HOURS_END")
+		return self
 	# Verified GHL sending address for those emails (hello@nextdeallending.com). Unset = no email sender.
 	lending_ghl_email_from: Optional[str] = Field(default=None, env="LENDING_GHL_EMAIL_FROM")
 	# Logs the key paths (never values) of each incoming lending GHL webhook, to confirm the real field names.

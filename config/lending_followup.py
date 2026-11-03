@@ -42,7 +42,7 @@ GHL_CALL_OUTCOME_CODES = {
     "no-answer": "NO_ANSWER",
     "busy": "NO_ANSWER",
     "canceled": "NO_ANSWER",
-    "failed": "CALL_FAILED",
+    "failed": "NO_ANSWER",  # a carrier failure, not a bad number (client 2026-11-03)
     "voicemail": "LEFT_VOICEMAIL",
 }
 # GHL recordings checked per attempt-log request (one API call each, newest calls first).

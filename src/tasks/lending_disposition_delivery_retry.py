@@ -1,7 +1,8 @@
 """Retry Sheet / Slack delivery for logged dispositions that are still behind.
 
 A row is behind while its synced disposition differs from its disposition
-(first delivery failed, or the caller changed the result). Cron: every 5 minutes.
+(first delivery failed, or the caller changed the result). BatchDialer and GHL calls (G3: a GHL call gets its
+disposition when its GHL outcome is matched). Cron: every 5 minutes.
 
     python -m src.tasks.lending_disposition_delivery_retry
 """
@@ -23,7 +24,7 @@ def behind_row_ids() -> list[int]:
         rows = db.execute(
             text(
                 "SELECT id FROM lending.call_dispositions "
-                "WHERE call_source = 'batchdialer' "
+                "WHERE call_source IN ('batchdialer', 'ghl') "
                 "AND (sheet_synced_disposition IS DISTINCT FROM disposition "
                 "       OR slack_posted_disposition IS DISTINCT FROM disposition) "
                 "AND disposition_at < now() - make_interval(secs => :age) "
