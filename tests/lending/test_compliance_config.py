@@ -33,7 +33,7 @@ def test_reason_codes_are_stable_strings():
 
 def test_removal_reasons_are_stable_strings():
     assert {r.value for r in cfg.RemovalReason} == {
-        "opt_out", "call_window", "attempt_cap", "scrub_stale", "attempt_history",
+        "opt_out", "call_window", "attempt_cap", "scrub_stale", "attempt_history", "handled_in_ghl",
     }
 
 

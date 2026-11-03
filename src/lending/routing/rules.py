@@ -27,7 +27,7 @@ from typing import Optional
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from config.lender_matrix import LENDER_MATRIX, LenderRules, has_placeholder_rules
+from config.lender_matrix import LENDER_MATRIX, LenderRules, effective_rules, has_placeholder_rules
 from config.settings import get_settings
 from src.lending import leverage
 from src.lending.lender_rules_store import load_matrix
@@ -114,7 +114,9 @@ class FileProfile:
 
 
 def _box_from_t05(rules: LenderRules) -> ProductBox:
-    """A routing box from one T-05 rule row.  An unset limit means "not enforced", exactly as in T-05."""
+    """A routing box from one T-05 rule row, read as the fit card reads it: an unconfirmed, unset limit takes the
+    safe placeholder value (client list Nov 2, Q1); a confirmed, unset limit means "not enforced"."""
+    rules = effective_rules(rules)
     return ProductBox(
         loan_types=frozenset(t.value for t in rules.loan_types),
         min_loan_amount=int(rules.min_loan_amount) if rules.min_loan_amount is not None else None,

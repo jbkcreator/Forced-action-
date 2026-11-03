@@ -14,13 +14,14 @@ for takes ``PLACEHOLDER_BOX`` (Josh, A1, Oct 8).  The evaluator still evaluates
 such a lender; a pass is flagged ``subject_to_confirmation`` and the fit score
 stays hidden until every lender is confirmed.
 
-Current status (2026-11-03, L1: Backflip and Central Lending are the two real lenders):
-  generic_backflip_* — CLIENT-STATED, NOT YET CONFIRMED (verified=False):
-      values copied by hand from Josh's Oct 1 email ("context on the Backflip
-      box") and Consolidated §1.1.  Josh must confirm before they count.  Open
-      items: (Q2) confirm 7.75–8% is a rate spread and 12-month hold is the
-      correct cost basis; (Q3) confirm whether the 36-month window on the
-      ground-up build rule must be tracked separately in the profile.
+Current status (2026-11-03, L1: Backflip and Central Lending are the two real
+lenders): all seven lenders run on the same safe placeholder set
+(``PLACEHOLDER_BOX``) until Josh sends the real rules.
+  generic_backflip_* — NOT VERIFIED: loan types only; Josh's Oct 1 values are
+      kept in a comment above the entries and are not applied.  Open items:
+      (Q2) confirm 7.75–8% is a rate spread and 12-month hold is the correct
+      cost basis; (Q3) confirm whether the 36-month window on the ground-up
+      build rule must be tracked separately in the profile.
   rcn_capital       — NOT VERIFIED: shell only, awaiting values from Josh.
   easy_street       — NOT VERIFIED: shell only.
   kiavi_affiliate   — NOT VERIFIED: shell only.
@@ -196,37 +197,25 @@ def effective_rules(rules: LenderRules) -> LenderRules:
 # NOTE: "Generic Backflip" means these values come from Josh's description
 # of Backflip's box, not from any direct Backflip API or sync (SPEC §2).
 # Josh places the actual product himself; the evaluator is a decision aid.
+#
+# Client list Nov 2 (Q1): until Josh sends the real rules, all five lenders run on the same safe set
+# (PLACEHOLDER_BOX: credit 680, LTC 85%, ARV 70%, FL/GA/TX, $75K-$2M), Backflip included. The Oct 1
+# Backflip values above (flip: floor 640, ARV 75%, $100K min loan, ~$85K min purchase; ground-up: floor
+# 680, $500K min, 3+ projects incl. 1 ground-up, 7.75% spread) are NOT applied: set them here, with their
+# field status confirmed, once Josh confirms them. The $500K ground-up routing minimum is R-1 routing
+# (config/lending_routing.py), not a fit rule, and is unchanged.
 _BACKFLIP_FLIP = LenderRules(
     key="generic_backflip_flip",
     name="Backflip (Fix & Flip)",
-    verified=False,                     # client-stated (Josh Oct 1); awaiting his confirmation
+    verified=False,
     loan_types=frozenset({LoanType.FIX_AND_FLIP, LoanType.BRIDGE}),
-    min_loan_amount=Decimal("100_000"),  # Consolidated intake diagram: "$100K for flip"
-    max_loan_amount=None,               # not stated; no cap modelled
-    max_ltv=Decimal("0.75"),            # ARV cap 75% == max LTV of 75% of ARV
-    # "100% of rehab funded" (Josh Oct 1) is not modelled: LoanRequest has no
-    # input for how much of the rehab the loan covers, so it cannot be checked.
-    min_purchase_price=Decimal("85_000"),   # ~$85K per Josh Oct 1
-    credit_floor=640,
-    min_completed_projects=0,
-    origination_points=None,            # Q2: not confirmed
-    rate_spread=None,                   # Q2: Josh to confirm spread for flip product
-    hold_months=12,
 )
 
 _BACKFLIP_CONSTRUCTION = LenderRules(
     key="generic_backflip_construction",
     name="Backflip (Ground-Up Construction)",
-    verified=False,                     # client-stated (Josh Oct 1, Consolidated §1.1); awaiting confirmation
+    verified=False,
     loan_types=frozenset({LoanType.GROUND_UP_CONSTRUCTION}),
-    min_loan_amount=Decimal("500_000"),  # $500K min per Josh Oct 1 / Consolidated §1.1
-    max_loan_amount=None,
-    credit_floor=680,                   # Josh Oct 1 — "credit floor 680"
-    min_completed_projects=3,           # "3+ completed projects"
-    requires_ground_up_build=True,      # "including ≥1 ground-up build" per Josh Oct 1
-    origination_points=None,
-    rate_spread=Decimal("0.0775"),      # 7.75% (lower bound of 7.75–8.00% stated by Consolidated §1.1; Q2)
-    hold_months=12,
 )
 
 # RCN Capital — NOT VERIFIED, shell only (awaiting values from Josh: Q5)

@@ -40,6 +40,11 @@ min_completed_projects, requires_ground_up_build, approved_states, allowed_prope
 origination_points, rate_spread, hold_months`. Lender keys: `generic_backflip_flip,
 generic_backflip_construction, rcn_capital, easy_street, kiavi_affiliate, abl, central_lending`.
 
+Until Josh sends the real rules (client list Nov 2, Q1), every lender, Backflip included, runs on the safe
+placeholder set: credit 680, LTC 85%, ARV 70%, FL/GA/TX, $75K-$2M. A database seeded before that change
+still holds Backflip's Oct 1 values; `PYTHONPATH=. python migrations/apply_lending_lender_rules_safe_set.py`
+resets the Backflip rows still owned by the seed and leaves any hand edit alone (logged).
+
 A row that fails validation is skipped and logged at ERROR (`[lender-rules] row skipped`), and that field
 keeps its config value. Watch the log after an edit.
 

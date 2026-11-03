@@ -999,7 +999,7 @@ def test_a_lender_with_rule_keys_is_judged_by_the_t05_values_not_by_its_own_boxe
     lender = _add_lender(rdb, name="T05 Lender", priority=1, rule_keys=[FLIP_KEY])
     _add_box(rdb, lender, loan_types=[LOAN_TYPE_FLIP])  # would accept anything; must be ignored
 
-    small = _make_lead(rdb, loan_amount=50_000, phone_suffix="3001")  # below the T-05 flip minimum of $100,000
+    small = _make_lead(rdb, loan_amount=50_000, phone_suffix="3001")  # below the safe-set minimum of $75,000 (Q1)
     fits = _make_lead(rdb, loan_amount=300_000, phone_suffix="3002")
     _route(rdb, small)
     _route(rdb, fits)
@@ -1020,7 +1020,7 @@ def test_routing_follows_edits_to_the_t05_rule_values_when_the_switch_is_on(rdb,
     rdb.commit()
 
     switch_off = _make_lead(rdb, loan_amount=300_000, phone_suffix="3101")
-    _route(rdb, switch_off)  # switch off: the config value ($100,000) applies, the edit is not read
+    _route(rdb, switch_off)  # switch off: the config value (safe set, $75,000) applies, the edit is not read
     assert _fr(rdb, switch_off)["current_lender_name"] == "Edited In Table"
 
     monkeypatch.setattr(get_settings(), "lending_rules_from_db", True)

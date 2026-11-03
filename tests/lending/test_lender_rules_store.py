@@ -126,7 +126,7 @@ def test_seed_has_one_row_per_lender_and_field_all_with_a_status():
 def test_evaluator_uses_an_edited_value_end_to_end():
     request = LoanRequest(loan_type=LoanType.FIX_AND_FLIP, loan_amount=Decimal("300_000"), state="FL",
                           purchase_price=Decimal("300_000"), rehab_budget=Decimal("100_000"), arv=Decimal("600_000"))
-    borrower = BorrowerProfile(credit_band_min_fico=660, state="FL")
+    borrower = BorrowerProfile(credit_band_min_fico=700, state="FL")  # above the 680 safe-set floor (Q1)
 
     before = evaluate_lender_fit(borrower, request, matrix=LENDER_MATRIX)
     assert FLIP in [fit.lender_key for fit in before.fitting]
@@ -202,7 +202,7 @@ def test_a_bad_edit_in_the_database_is_skipped(lending_db, caplog):
         "UPDATE lending.lender_rule_values SET value = '\"high\"'::jsonb WHERE lender_key = :k AND field = 'credit_floor'"),
         {"k": FLIP})
     with caplog.at_level(logging.ERROR):
-        assert _by_key(store.load_matrix(lending_db), FLIP).credit_floor == 640
+        assert _by_key(store.load_matrix(lending_db), FLIP).credit_floor is None  # config value: safe set fills it
     assert "row skipped" in caplog.text
 
 
@@ -288,3 +288,24 @@ def test_a_new_row_defaults_to_todays_et_date_the_day_the_reader_compares(lendin
         "INSERT INTO lending.lender_rule_values (lender_key, field, value, status)"
         " VALUES (:k, 'credit_floor', '700'::jsonb, 'confirmed')"), {"k": FLIP})
     assert _by_key(store.load_matrix(lending_db), FLIP).credit_floor == 700
+
+
+def test_the_safe_set_migration_resets_seeded_backflip_rows_but_keeps_hand_edits(lending_db):
+    """Client list Nov 2 (Q1): a database seeded with Backflip's Oct 1 values is put on the safe set."""
+    from migrations.apply_lending_lender_rules_safe_set import apply_to as reset_to_safe_set
+
+    conn = lending_db.connection()
+    lending_db.execute(text("DELETE FROM lending.lender_rule_values WHERE lender_key LIKE 'generic_backflip%'"))
+    apply_to(conn)
+    old = {"credit_floor": "640", "max_ltv": "0.75", "min_loan_amount": "100000"}
+    for field, value in old.items():  # what the old seed wrote
+        conn.execute(text("UPDATE lending.lender_rule_values SET value = CAST(:v AS jsonb) "
+                          "WHERE lender_key = :k AND field = :f"), {"v": value, "k": FLIP, "f": field})
+    conn.execute(text("UPDATE lending.lender_rule_values SET value = '0.6'::jsonb, status = 'confirmed', "
+                      "updated_by = 'josh' WHERE lender_key = :k AND field = 'max_ltc'"), {"k": FLIP})
+
+    assert reset_to_safe_set(conn) == len(old)
+    assert reset_to_safe_set(conn) == 0
+    flip = _by_key(store.load_matrix(lending_db), FLIP)
+    assert flip.credit_floor is None and flip.max_ltv is None and flip.min_loan_amount is None
+    assert flip.max_ltc == Decimal("0.6")  # edited by hand: left as is

@@ -8,9 +8,9 @@ when its ``userId`` is LENDING_DAVID_GHL_USER_ID; workflow and campaign messages
 * conversations are read newest first (``sortBy=last_message_date``) and the walk stops at the first one whose last
   message is before the day; each conversation's messages are read newest first until one is before the day
 * call outcome and talk time use ``ghl_calls.call_state`` / ``call_duration_seconds`` (the shapes seen live)
-* Booked = today's BOOKED dispositions in lending.call_dispositions (as the scoreboard counts it; no GHL workflow sends
-  the Booked stage); Held = today's Held stage entries in lending.ghl_stage_events. Both cover every caller.
-  Show rate = Held today / Booked today, as on the scoreboard
+* Booked = today's Booked stage entries in lending.ghl_stage_events (BOOKED_STAGE_KEYS; B1, 2026-11-03: the stage is
+  the count David's bonus uses, not the caller-reported BOOKED disposition); Held = today's Held stage entries. Both
+  cover every caller. Show rate = Held today / Booked today, as on the scoreboard's Held ÷ Booked (stage)
 * flagged leads = contacts carrying LENDING_FLAGGED_TAG now (GHL keeps no date for a tag)
 
 Verified live 2026-10-29: ``userId`` on a hand-sent SMS, email and call, and the tag filter shape of the contact search.
@@ -27,7 +27,7 @@ from sqlalchemy import text
 
 from config.lending_compliance import DEFAULT_TZ
 from config.lending_dispositions import (
-    BOOKED_CODE, GHL_CONNECTED_STATES, GHL_FAILED_STATUSES, GHL_VOICEMAIL_STATES, SHOWED_STAGE_KEYS,
+    BOOKED_STAGE_KEYS, GHL_CONNECTED_STATES, GHL_FAILED_STATUSES, GHL_VOICEMAIL_STATES, SHOWED_STAGE_KEYS,
 )
 from src.lending.ghl_calls import GHL_CONVERSATIONS_VERSION, call_duration_seconds, call_state, message_time
 
@@ -190,11 +190,11 @@ def stage_counts(db, day: date) -> tuple[int, int]:
     try:
         with db.begin_nested():
             row = db.execute(
-                text("SELECT (SELECT count(*) FROM lending.call_dispositions WHERE direction = 'outbound' "
-                     "AND disposition = :booked AND NOT booking_blocked AND call_ended_at >= :start AND call_ended_at < :end), "
+                text("SELECT (SELECT count(*) FROM lending.ghl_stage_events WHERE stage_key = ANY(:booked) "
+                     "AND event_at >= :start AND event_at < :end), "
                      "(SELECT count(*) FROM lending.ghl_stage_events WHERE stage_key = ANY(:held) "
                      "AND event_at >= :start AND event_at < :end)"),
-                {"booked": BOOKED_CODE, "held": sorted(SHOWED_STAGE_KEYS), "start": start, "end": end},
+                {"booked": sorted(BOOKED_STAGE_KEYS), "held": sorted(SHOWED_STAGE_KEYS), "start": start, "end": end},
             ).one()
     except Exception as exc:
         logger.warning("[david-activity] stage query failed, reporting 0: %s", type(exc).__name__)

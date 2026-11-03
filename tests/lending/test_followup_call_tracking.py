@@ -439,12 +439,12 @@ def test_ghl_calls_get_no_soft_approval_card_or_delivery_retry(ghl_call_row, len
     assert row_id not in behind_row_ids()
 
 
-def test_ghl_calls_never_raise_the_missing_disposition_alert(ghl_call_row, lending_db):
+def test_ghl_calls_raise_no_missing_disposition_alert_before_ghl_outcomes_go_live(ghl_call_row, lending_db):
     from src.tasks.lending_missing_disposition_alert import run
 
     row_id, _ = ghl_call_row
     lending_db.execute(text("UPDATE lending.call_dispositions SET disposition_raw = NULL WHERE id = :id"),
-                       {"id": row_id})  # even without GHL's outcome, the source alone keeps it out
+                       {"id": row_id})  # LENDING_GHL_OUTCOMES_LIVE_SINCE unset: GHL calls stay out
     run(slack_client=MagicMock(), minutes=1)
     alerted = lending_db.execute(text("SELECT disposition_missing_alerted_at FROM lending.call_dispositions "
                                       "WHERE id = :id"), {"id": row_id}).scalar()

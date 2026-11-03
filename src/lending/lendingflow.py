@@ -3,8 +3,9 @@
 Order matters, as for web leads: the lead and its consent certificate are committed before GHL is
 called, so a GHL outage never loses a paid lead. ``parse_lendingflow`` is the only function that
 knows LendingFlow's payload shape. After the GHL contact exists the lead's
-``LendingFlowLeadCreated`` event is emitted and the T-07 pre-qual letter is queued; a lead is marked
-done only when both succeeded, so a crash or a failed hand-off is redone by the sweep.
+``LendingFlowLeadCreated`` event is emitted; a lead is marked done only when it succeeded, so a crash or a
+failed hand-off is redone by the sweep. No pre-qual letter is queued at intake (client list Nov 2, Q2): the
+letter waits for the call figures and is queued from the Call-One form (``soft_approval/prequal_link.py``).
 """
 from __future__ import annotations
 
@@ -25,6 +26,7 @@ from config.lending_lendingflow import (
     INTRO_SMS_HOLD_MAX_HOURS,
     LEAD_SOURCE,
     MISSING_LEAD_ID_PREFIX,
+    NULL_TEXT_VALUES,
     is_missing_lead_id,
     SWEEP_BATCH_SIZE,
 )
@@ -38,6 +40,7 @@ from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
 
+_UNFILLED_MERGE_FIELD = re.compile(r"\{\{.*\}\}", re.DOTALL)
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _BAND_RANGE = re.compile(r"^\s*(\d{3})\s*(?:-|to|–)\s*\d{3}\s*$", re.IGNORECASE)
 _BAND_PLUS = re.compile(r"^\s*(\d{3})\s*\+\s*$")
@@ -211,6 +214,20 @@ def _parse_time(value: Any) -> Optional[datetime]:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+def _without_null_text(value: Any) -> Any:
+    """The GHL intake workflow fills its fixed body template with the text "null" for every field LendingFlow
+    did not send (or leaves a ``{{...}}`` merge field unfilled); that text is a missing value, never data
+    (a lead id, an address, a first name, consent)."""
+    if isinstance(value, str):
+        cleaned = value.strip()
+        return None if cleaned.lower() in NULL_TEXT_VALUES or _UNFILLED_MERGE_FIELD.fullmatch(cleaned) else value
+    if isinstance(value, dict):
+        return {key: _without_null_text(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_without_null_text(item) for item in value]
+    return value
+
+
 def _is_blank(value: Any) -> bool:
     if value is None:
         return True
@@ -225,31 +242,39 @@ def _is_blank(value: Any) -> bool:
 
 def _parse_certificate(consent: Any) -> Optional[ParsedCertificate]:
     # A forwarder that fills a fixed body template (the GHL intake workflow) sends a consent object whose fields
-    # are all empty when the borrower gave none; that is no certificate, not consent.
-    if _is_blank(consent):
+    # are all empty or "null" when the borrower gave none; that is no certificate, not consent.
+    fields = _without_null_text(consent)
+    if _is_blank(fields):
         return None
     if isinstance(consent, str):
         return ParsedCertificate(raw=consent)
     if not isinstance(consent, dict):
         raise ParseError("consent must be an object or a string")
-    raw = consent.get("raw")
-    if not isinstance(raw, str) or not raw:
-        raw = json.dumps(consent, ensure_ascii=False)
-    return ParsedCertificate(
-        raw=raw,  # verbatim: never stripped or re-encoded
-        certificate_id=_str(consent, "certificate_id", limit=200),
-        url=_str(consent, "certificate_url", limit=500),
-        consented_at=_parse_time(consent.get("timestamp")),
-        client_ip=_str(consent, "ip_address", limit=45),
-        source_url=_str(consent, "page_url", limit=500),
-        disclosure_text=consent.get("disclosure_text") if isinstance(consent.get("disclosure_text"), str) else None,
+    own_raw = fields.get("raw") if isinstance(fields.get("raw"), str) and fields["raw"].strip() else None
+    certificate = ParsedCertificate(
+        raw=own_raw or json.dumps(consent, ensure_ascii=False),  # verbatim: never stripped or re-encoded
+        certificate_id=_str(fields, "certificate_id", limit=200),
+        url=_str(fields, "certificate_url", limit=500),
+        consented_at=_parse_time(fields.get("timestamp")),
+        client_ip=_str(fields, "ip_address", limit=45),
+        source_url=_str(fields, "page_url", limit=500),
+        disclosure_text=fields.get("disclosure_text") if isinstance(fields.get("disclosure_text"), str) else None,
     )
+    # Consent needs something that identifies the certificate. An IP, page or disclosure text alone (or any junk a
+    # template fills in) is not proof that this borrower agreed, and counting it would open the intro-SMS gate.
+    if not (own_raw or certificate.certificate_id or certificate.url or certificate.consented_at):
+        logger.warning("[lendingflow] consent block without a certificate id, url, timestamp or raw text: "
+                       "treated as no consent")
+        return None
+    return certificate
 
 
 def parse_lendingflow(payload: Any) -> ParsedLendingFlowLead:
     """The only function that knows LendingFlow's payload shape (Fake shape until David's schema lands)."""
     if not isinstance(payload, dict):
         raise ParseError("payload must be a JSON object")
+    consent = payload.get("consent")  # kept as received: the certificate is stored verbatim
+    payload = _without_null_text(payload)
     phone = normalize(_str(payload, "phone", limit=40))
     if not phone:
         raise ParseError("a valid US phone number is required")
@@ -283,7 +308,7 @@ def parse_lendingflow(payload: Any) -> ParsedLendingFlowLead:
         property_zip=_str(payload, "property_zip", limit=10),
         lead_source_campaign=_str(payload, "source", "lead_source", limit=100),
         submitted_at=_parse_time(payload.get("submitted_at")),
-        certificate=_parse_certificate(payload.get("consent")),
+        certificate=_parse_certificate(consent),
     )
 
 
@@ -569,24 +594,6 @@ def _emit_event(db, lead: Mapping[str, Any]) -> bool:
     return True
 
 
-def _hand_off_prequal(lead: Mapping[str, Any]) -> bool:
-    from src.lending.prequal import PrequalLead
-    from src.lending.prequal_letters import queue_and_send_in_background
-
-    prequal = PrequalLead(credit_band=lead["credit_band"], loan_amount=lead["loan_amount"],
-                          property_state=lead["property_state"], loan_type=lead["loan_type"])
-    if not all((prequal.credit_band, prequal.loan_amount, prequal.property_state, prequal.loan_type)):
-        logger.info("[lendingflow] prequal_skipped_missing_fields lead=%s", lead["id"])
-        return True
-    try:
-        queue_and_send_in_background(lead_source=LEAD_SOURCE, lead_ref=lead["vendor_lead_id"],
-                                     contact_id=lead["ghl_contact_id"], lead=prequal, strict=True)
-    except Exception as exc:
-        logger.error("[lendingflow] prequal hand-off failed lead=%s: %s", lead["id"], type(exc).__name__)
-        return False
-    return True
-
-
 _HELD_FOR_WINDOW = (
     "SELECT id, phone, email, property_state, property_zip, ghl_contact_id FROM lending.lendingflow_leads "
     "WHERE consent_status = 'present' AND NOT suppressed AND ghl_status IN ('synced', 'contact_only') "
@@ -643,15 +650,12 @@ def release_held_and_commit(sink: Optional[Any]) -> int:
 
 
 def run_followups(db, followups: list[FollowUp]) -> None:
-    """After the delivery commit: emit the event, then queue the pre-qual letter when the 4 core fields are
-    present. A lead is marked done only when both succeeded; otherwise the sweep redoes the missing step
-    (the event is skipped once ``event_emitted_at`` is set; the letter is idempotent on its lead ref).
-    Never raises; logs lead id only."""
+    """After the delivery commit: emit the event. A lead is marked done only when it succeeded; otherwise the
+    sweep redoes it (skipped once ``event_emitted_at`` is set). No pre-qual letter here: it waits for the call
+    figures (Q2). Never raises; logs lead id only."""
     for item in followups:
         lead = item.lead
-        event_ok = _emit_event(db, lead)
-        prequal_ok = _hand_off_prequal(lead)
-        if event_ok and prequal_ok:
+        if _emit_event(db, lead):
             try:
                 _mark(db, lead["id"], "followup_done_at", datetime.now(timezone.utc))
             except Exception as exc:
