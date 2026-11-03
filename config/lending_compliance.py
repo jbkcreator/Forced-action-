@@ -118,6 +118,30 @@ OPT_OUT_EXCLUDED_SOURCES = frozenset(NON_OPT_OUT_SOURCES | {TRACERFY_DNC_SOURCE,
 # Postgres advisory-lock key: one poller cycle at a time across all processes.
 OPT_OUT_POLL_LOCK_KEY = 7_302_020_801
 DIALER_SWEEP_LOCK_KEY = 7_302_020_802
+GHL_CALL_GATE_LOCK_KEY = 7_302_020_805
+GHL_LIST_SCRUB_LOCK_KEY = 7_302_020_806
+
+# Josh's GHL call lists (G5): one smart list per lead-type tag, each excluding GHL_DO_NOT_CALL_NOW_TAG.
+# src.lending.ghl_call_gate adds that tag to a listed contact that cannot be called now and removes it
+# when calling is allowed again. Lead-type tags are never added or removed: removing and re-adding
+# "lendingflow" re-fires the Speed to Lead and API Catch workflows (re-entry on).
+GHL_DO_NOT_CALL_NOW_TAG = "ndl-do-not-call-now"
+GHL_CALL_LIST_TAGS = (
+    "ndl-verified-maturity",
+    "ndl-builder",
+    "ndl-nurture",
+    "lendingflow",
+    "web-lead",
+    "ndl-wholesaler",
+    "ndl-partner",
+    "ndl-transaction-ready",
+)
+GHL_CALL_GATE_PAGE_SIZE = 100
+GHL_CALL_GATE_MAX_PAGES = 20             # per tag per run (2,000 contacts a list)
+GHL_CALL_GATE_ALERT_AFTER_MINUTES = 10   # ops alert once no run has succeeded for this long
+# Listed numbers are rescrubbed (src.lending.ghl_list_scrub, hourly) once their newest scrub is this old,
+# so none reaches DNC_SCRUB_MAX_AGE_DAYS and drops off Josh's lists. LendingFlow numbers are never scrubbed.
+GHL_LIST_RESCRUB_AFTER_DAYS = 6
 
 # FA suppress_contact() source → opt-out channel. Anything unlisted is email-origin.
 SMS_OPT_OUT_SOURCES = frozenset({"inbound_sms", "twilio_inbound", "cascaded_from_sms"})
@@ -208,3 +232,7 @@ def validate_lending_compliance_config() -> None:
         raise ValueError("WEEKLY_SCRUB_PERIOD_DAYS must not exceed DNC_SCRUB_MAX_AGE_DAYS")
     if not 0 < SCRUB_STALE_BREAKER_PCT <= 100 or SCRUB_STALE_BREAKER_MIN_POOL < 1:
         raise ValueError("scrub-stale breaker thresholds must be positive (pct <= 100)")
+    if not 0 < GHL_LIST_RESCRUB_AFTER_DAYS < DNC_SCRUB_MAX_AGE_DAYS:
+        raise ValueError("GHL_LIST_RESCRUB_AFTER_DAYS must be positive and below DNC_SCRUB_MAX_AGE_DAYS")
+    if GHL_DO_NOT_CALL_NOW_TAG in GHL_CALL_LIST_TAGS or len(set(GHL_CALL_LIST_TAGS)) != len(GHL_CALL_LIST_TAGS):
+        raise ValueError("GHL_CALL_LIST_TAGS must be distinct and must not contain GHL_DO_NOT_CALL_NOW_TAG")

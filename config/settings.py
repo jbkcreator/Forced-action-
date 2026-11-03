@@ -1007,6 +1007,11 @@ class AppSettings(BaseSettings):
 	# G3: GHL calls ended at/after this (ISO time) are flagged by the missing-disposition alert; unset = GHL calls are not
 	# flagged (set it once the GHL disposition workflow is live, so calls from before it are not reported)
 	lending_ghl_outcomes_live_since: Optional[datetime] = Field(default=None, env="LENDING_GHL_OUTCOMES_LIVE_SINCE")
+	# G5 (src/lending/ghl_call_gate.py): tag ndl-do-not-call-now on listed GHL contacts that cannot be called now; off until Dev A's smart lists exclude the tag
+	lending_ghl_call_gate_enabled: bool = Field(default=False, env="LENDING_GHL_CALL_GATE_ENABLED")
+	# DNC scrub of numbers on Josh's GHL call lists (src/lending/ghl_list_scrub.py): website and cold leads, never LendingFlow
+	lending_ghl_list_scrub_enabled: bool = Field(default=False, env="LENDING_GHL_LIST_SCRUB_ENABLED")
+	lending_ghl_list_scrub_max_credits: int = Field(default=100, env="LENDING_GHL_LIST_SCRUB_MAX_CREDITS")  # hard Tracerfy credit cap per hourly run (1 credit per number)
 	# David's end-of-day activity post (src/tasks/lending_david_summary.py) to LENDING_DAVID_CHANNEL; off until enabled and the user id is set
 	lending_david_summary_enabled: bool = Field(default=False, env="LENDING_DAVID_SUMMARY_ENABLED")
 	lending_david_channel: str = Field(default="", env="LENDING_DAVID_CHANNEL")  # #isa-daily channel ID; unset = not posted

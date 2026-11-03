@@ -1111,6 +1111,21 @@ class LendingGlobalHalt(LendingBase):
     __table_args__ = (CheckConstraint("id = 1", name="ck_global_halt_single_row"),)
 
 
+class LendingGhlCallGateState(LendingBase):
+    """One row (id 1): when the GHL call-list gate (``src.lending.ghl_call_gate``) last succeeded and since when it
+    has been failing. A gate that stops running freezes the do-not-call-now tags, so ops is alerted once
+    (``alerted_at``) after GHL_CALL_GATE_ALERT_AFTER_MINUTES of failing; the next success clears both."""
+
+    __tablename__ = "ghl_call_gate_state"
+
+    id: Mapped[int] = mapped_column(SmallInteger, primary_key=True)
+    last_success_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    failing_since: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    alerted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (CheckConstraint("id = 1", name="ck_ghl_call_gate_state_single_row"),)
+
+
 class LendingGlobalHaltEvent(LendingBase):
     """Every set or clear of the emergency halt, oldest first: who, when, why."""
 
