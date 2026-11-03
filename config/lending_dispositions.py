@@ -125,6 +125,7 @@ GHL_DISPOSITION_FIELD_CANDIDATES: dict[str, tuple[str, ...]] = {
     "user": ("user", "user_name", "called_by", "caller"),
     "called_at": ("called_at", "call_time", "call_date"),
     "gate_failed": ("gate_failed",),
+    "text_consent": ("text_consent", "textConsent"),  # {{contact.text_consent}} (Yes/No); passed to Dev C's hooks
 }
 GHL_DISPOSITION_MATCH_WINDOW_MINUTES = 30  # a call started this close to the outcome's time is its call
 GHL_DISPOSITION_PENDING_DAYS = 2           # an outcome still unmatched after this is no longer retried

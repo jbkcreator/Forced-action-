@@ -137,3 +137,45 @@ def test_a_reimport_names_an_unknown_caller_and_redelivers_it(db):
     # a known name is never replaced, and an unchanged call is not touched
     assert db.execute(imp._UPSERT, _import_row(call_id, phone, now, "David Willis")).first() is None
     assert _markers(db, row_id)[0] == "Josh Kantor"
+
+
+# ---- Dev C hooks -----------------------------------------------------------------------------------------------------
+
+def test_the_received_hook_fires_once_per_stored_outcome(db, monkeypatch):
+    from src.lending import ghl_outcome_hooks as hooks
+    got = []
+    monkeypatch.setattr(hooks, "on_ghl_outcome_received", lambda db_, ev: got.append(ev))
+    phone, called = _phone(), datetime.now(timezone.utc).isoformat()
+    first = m.record_event(db, _event(phone, "DNC Request", called_at=called, text_consent="No"), {})
+    m.record_event(db, _event(phone, "DNC Request", called_at=called, text_consent="No"), {})  # GHL retry
+    assert [(e.event_id, e.phone, e.code, e.text_consent) for e in got] == [(first[0], phone, "DNC_REQUEST", False)]
+
+
+def test_the_matched_hook_gets_the_call_row_phone_code_and_consent(db, monkeypatch):
+    from src.lending import ghl_outcome_hooks as hooks
+    got = []
+    monkeypatch.setattr(hooks, "on_ghl_outcome_matched", lambda db_, items: got.extend(items))
+    now = datetime.now(timezone.utc)
+    phone = _phone()
+    call = _call(db, phone, now - timedelta(minutes=3))
+    event_id, _ = m.record_event(db, _event(phone, "DNC Request", called_at=(now - timedelta(minutes=3)).isoformat(),
+                                            contact_id="c-77", text_consent="yes"), {})
+    assert m.attach_pending(db, now) == [call]
+    [item] = got
+    assert (item.call_row_id, item.event_id, item.phone, item.code, item.contact_id, item.text_consent) == (
+        call, event_id, phone, "DNC_REQUEST", "c-77", True)
+    assert item.dialer_call_id.startswith("ghl:")
+
+
+def test_a_failing_matched_hook_keeps_the_match_in_the_database(db, monkeypatch):
+    from src.lending import ghl_outcome_hooks as hooks
+
+    def boom(db_, items):
+        db_.execute(text("SELECT 1/0"))  # a SQL error inside the hook's savepoint
+    monkeypatch.setattr(hooks, "on_ghl_outcome_matched", boom)
+    now = datetime.now(timezone.utc)
+    phone = _phone()
+    call = _call(db, phone, now - timedelta(minutes=3))
+    m.record_event(db, _event(phone, called_at=(now - timedelta(minutes=3)).isoformat()), {})
+    assert m.attach_pending(db, now) == [call]
+    assert _disposition(db, call) == "BOOKED"

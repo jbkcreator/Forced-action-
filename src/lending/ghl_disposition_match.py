@@ -14,7 +14,8 @@ Matching (:func:`choose_call`):
 
 A matched call gets the code, the list version and the default unfunded cause, and is then delivered to the Sheet and
 Slack like a BatchDialer call (the caller commits first; :func:`deliver_matched`). Acting on the outcome (DNC opt-out,
-consent) is Dev C's lane and is not done here. The event's ``gate_failed`` is written onto the call (NURTURE + gate
+consent) is Dev C's lane and is not done here: src/lending/ghl_outcome_hooks.py is called for every new outcome and for
+every matched batch. The event's ``gate_failed`` is written onto the call (NURTURE + gate
 failed counts as Gated / Nurture sent), and its user name ({{user.name}}) fills the call's caller only when the import
 could not name one (no ``userId`` on the call message: caller_name NULL or "GHL (unknown)").
 
@@ -28,7 +29,7 @@ import logging
 import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from sqlalchemy import text
@@ -49,6 +50,7 @@ from config.lending_dispositions import (
     GHL_DISPOSITION_REQUIRE_CALL_IDENTITY,
 )
 from config.lending_followup import CALL_SOURCE_GHL, GHL_CALL_ID_PREFIX
+from src.lending import ghl_outcome_hooks
 from src.lending.dispositions import _to_dt, normalize_code
 from src.lending.ghl_consent_events import InvalidEvent, _sources
 from src.services.phone_utils import normalize
@@ -59,6 +61,7 @@ logger = logging.getLogger(__name__)
 _UNRESOLVED = frozenset({"null", "none", "undefined", "nan"})
 _TRUE = frozenset({"true", "yes", "y", "1", "gate_failed"})
 _FALSE = frozenset({"false", "no", "n", "0"})
+_CONSENT_YES = frozenset({"true", "yes", "y", "1"})
 
 REASON_NO_DISPOSITION = "disposition is required (check the GHL merge field)"
 REASON_UNKNOWN_DISPOSITION = "disposition is not one of the call outcomes"
@@ -86,6 +89,7 @@ class GhlDispositionEvent:
     caller_name: Optional[str]
     called_at: Optional[datetime]
     gate_failed: Optional[bool]
+    text_consent: Optional[bool] = None
 
 
 def _value(body: Mapping[str, Any], name: str) -> Optional[str]:
@@ -121,6 +125,15 @@ def _gate_failed(raw: Optional[str]) -> Optional[bool]:
     return False if lowered in _FALSE else None
 
 
+def _text_consent(raw: Optional[str]) -> Optional[bool]:
+    if raw is None:
+        return None
+    lowered = raw.lower()
+    if lowered in _CONSENT_YES:
+        return True
+    return False if lowered in _FALSE else None
+
+
 def parse_event(body: Mapping[str, Any]) -> GhlDispositionEvent:
     """The event, or InvalidDispositionEvent when it can never be used (no outcome, an outcome outside the 10, or nothing to
     match it on)."""
@@ -142,6 +155,7 @@ def parse_event(body: Mapping[str, Any]) -> GhlDispositionEvent:
         contact_id=_value(body, "contact_id"), phone=phone, disposition_raw=raw[:100], code=code,
         ghl_call_id=call_id[:90] if call_id else None, caller_name=(_value(body, "user") or "")[:200] or None,
         called_at=called_at, gate_failed=_gate_failed(_value(body, "gate_failed")),
+        text_consent=_text_consent(_value(body, "text_consent")),
     )
 
 
@@ -172,7 +186,7 @@ def record_event(db, ev: GhlDispositionEvent, body: Mapping[str, Any]) -> tuple[
     Only an event with a call identity (call id or call time) is de-duplicated: without one, a webhook retry and a
     second real call with the same outcome look identical, so every delivery is stored rather than one discarded."""
     if ev.ghl_call_id is None and ev.called_at is None:
-        return _insert(db, ev, body), False
+        return _store_new(db, ev, body), False
     key = "|".join(str(v) for v in ("ghl-disposition", ev.phone, ev.code, ev.ghl_call_id, ev.called_at,
                                     ev.caller_name, ev.gate_failed, ev.contact_id))
     db.execute(_LOCK_DELIVERY, {"key": key})
@@ -183,15 +197,36 @@ def record_event(db, ev: GhlDispositionEvent, body: Mapping[str, Any]) -> tuple[
     }).scalar()
     if existing is not None:
         return existing, True
-    return _insert(db, ev, body), False
+    return _store_new(db, ev, body), False
+
+
+def _store_new(db, ev: GhlDispositionEvent, body: Mapping[str, Any]) -> int:
+    event_id = _insert(db, ev, body)
+    received = ghl_outcome_hooks.ReceivedOutcome(
+        event_id=event_id, contact_id=ev.contact_id, phone=ev.phone, code=ev.code, caller_name=ev.caller_name,
+        called_at=ev.called_at, received_at=datetime.now(timezone.utc), gate_failed=ev.gate_failed,
+        text_consent=ev.text_consent,
+    )
+    _run_hook("on_ghl_outcome_received", db, received)
+    return event_id
+
+
+def _run_hook(name: str, db, payload: Any) -> None:
+    """Call a Dev C hook (looked up at call time) in its own savepoint: a failure rolls back only the hook's work and
+    is logged by class (the message may carry phone numbers), never raised."""
+    try:
+        with db.begin_nested():
+            getattr(ghl_outcome_hooks, name)(db, payload)
+    except Exception as exc:
+        logger.error("[ghl-disposition] %s failed: %s", name, type(exc).__name__)
 
 
 def _insert(db, ev: GhlDispositionEvent, body: Mapping[str, Any]) -> int:
     return db.execute(_INSERT, {
         "contact_id": ev.contact_id, "phone": ev.phone, "raw": ev.disposition_raw, "code": ev.code,
         "gate_failed": ev.gate_failed, "call_id": ev.ghl_call_id, "caller": ev.caller_name, "called_at": ev.called_at,
-        "raw_event": json.dumps({k: body.get(k) for k in ("contact_id", "disposition", "call_id", "called_at")},
-                                default=str),
+        "raw_event": json.dumps({**{k: body.get(k) for k in ("contact_id", "disposition", "call_id", "called_at")},
+                                 "text_consent": ev.text_consent}, default=str),
     }).scalar_one()
 
 
@@ -217,7 +252,8 @@ def choose_call(event: Mapping[str, Any], calls: Iterable[Mapping[str, Any]],
 # back newer ones. Mirrors choose_call: the exact call (unless it is DNC and the event is not), else an open outbound
 # GHL call to the phone within the window.
 _PENDING = text("""
-    SELECT e.id, e.phone, e.code, e.ghl_call_id, e.called_at, e.received_at, e.caller_name, e.gate_failed
+    SELECT e.id, e.phone, e.code, e.ghl_call_id, e.called_at, e.received_at, e.caller_name, e.gate_failed,
+           e.contact_id, CASE e.raw_event->>'text_consent' WHEN 'true' THEN true WHEN 'false' THEN false END AS text_consent
       FROM lending.ghl_disposition_events e
      WHERE e.matched_call_id IS NULL AND e.received_at >= :since
        AND EXISTS (SELECT 1 FROM lending.call_dispositions d
@@ -299,6 +335,7 @@ def _attach(db, now: datetime, window: timedelta, window_minutes: int) -> list[i
     matched_set: set[int] = set()
     call_writes: list[dict[str, Any]] = []
     event_writes: list[dict[str, Any]] = []
+    outcomes: list[ghl_outcome_hooks.MatchedOutcome] = []
     for event in events:
         exact = f"{GHL_CALL_ID_PREFIX}{event['ghl_call_id']}" if event.get("ghl_call_id") else None
         pool = ([by_id[exact]] if exact in by_id else []) if exact else by_phone.get(event.get("phone"), [])
@@ -310,6 +347,12 @@ def _attach(db, now: datetime, window: timedelta, window_minutes: int) -> list[i
                             "gate": event.get("gate_failed"), "caller": event.get("caller_name"),
                             "unknown_caller": GHL_UNKNOWN_CALLER, "exact": exact, "dnc": DNC_CODE})
         event_writes.append({"call": call["id"], "at": now, "id": event["id"]})
+        outcomes.append(ghl_outcome_hooks.MatchedOutcome(
+            call_row_id=call["id"], dialer_call_id=call["dialer_call_id"], event_id=event["id"],
+            contact_id=event.get("contact_id"), phone=call.get("phone") or event.get("phone"), code=event["code"],
+            caller_name=event.get("caller_name"), gate_failed=event.get("gate_failed"),
+            text_consent=event.get("text_consent"),
+        ))
         call["disposition"] = event["code"]  # taken: a second outcome for the same phone needs another call
         if call["id"] not in matched_set:
             matched_set.add(call["id"])
@@ -317,6 +360,7 @@ def _attach(db, now: datetime, window: timedelta, window_minutes: int) -> list[i
     if call_writes:
         db.execute(_SET_CALL, call_writes)
         db.execute(_SET_EVENT, event_writes)
+        _run_hook("on_ghl_outcome_matched", db, outcomes)
     if matched:
         logger.info("[ghl-disposition] matched %d outcome(s) onto GHL calls", len(matched))
     return matched
