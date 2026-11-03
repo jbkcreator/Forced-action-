@@ -20,6 +20,7 @@ from src.lending.disposition_delivery import (
     alert_unpropagated_dnc,
     deliver_disposition,
 )
+from src.lending.bd_result_to_ghl import write_note_in_background
 from src.lending.consent import record_consent
 from src.lending.dialer_port import get_dialer
 from src.lending.dispositions import DialerCallEvent, RecordedCall, record_dialer_event
@@ -133,6 +134,7 @@ def follow_up(recorded: RecordedCall, add_task: Callable[..., None]) -> None:
     add_task(deliver_disposition, recorded.row_id)
     if recorded.call_ended:
         add_task(post_soft_approval_card, recorded.row_id)
+        add_task(write_note_in_background, recorded.row_id)
     if recorded.unknown_code:
         add_task(alert_unknown_code, recorded.call_id, recorded.unknown_code, recorded.caller_seat)
     if recorded.dnc_requested and not recorded.phone:

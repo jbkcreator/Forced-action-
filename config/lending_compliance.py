@@ -176,12 +176,18 @@ class RemovalReason(str, Enum):
     ATTEMPT_CAP = "attempt_cap"
     SCRUB_STALE = "scrub_stale"
     ATTEMPT_HISTORY = "attempt_history"
+    # The phone is worked from GHL (a LendingFlow / website lead, or called from GHL recently): deleted from the
+    # dialer by the sweep, never restored.
     GHL_CALLING = "ghl_calling"
+    # The lead was booked or reached by a person in GHL: deleted from the dialer, never restored.
+    HANDLED_IN_GHL = "handled_in_ghl"
 
 
-# Removals that delete the dialer contact for good (never restored): an opt-out, and a phone
-# handed to GHL calling. Every other reason only leaves the campaign and can be restored.
-PERMANENT_REMOVAL_REASONS: frozenset[RemovalReason] = frozenset({RemovalReason.OPT_OUT, RemovalReason.GHL_CALLING})
+# Removals that delete the dialer contact for good (never restored): an opt-out, a phone handed to GHL
+# calling, and a lead handled in GHL. Every other reason only leaves the campaign and can be restored.
+PERMANENT_REMOVAL_REASONS: frozenset[RemovalReason] = frozenset({
+    RemovalReason.OPT_OUT, RemovalReason.GHL_CALLING, RemovalReason.HANDLED_IN_GHL,
+})
 
 
 def validate_lending_compliance_config() -> None:

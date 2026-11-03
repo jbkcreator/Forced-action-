@@ -1,9 +1,13 @@
 """Phones being worked from GoHighLevel, which must never also be dialed by BatchDialer.
 
-A phone is GHL's when it is a warm inbound lead (LendingFlow or the website form; Josh works those
-in GHL), or when it was called from GHL inside the lookback window (GHL calls reach
-``lending.call_dispositions`` through the GHL call import, ``call_source = 'ghl'``). The dialer load
-skips these phones and the dialer sweep takes any already loaded out of BatchDialer.
+A phone is GHL's when it is a website lead (Josh works those in GHL), or when it was called from GHL
+inside the lookback window (GHL calls reach ``lending.call_dispositions`` through the GHL call import,
+``call_source = 'ghl'``). The dialer load skips these phones and the dialer sweep takes any already
+loaded out of BatchDialer.
+
+A LendingFlow lead's phone is never GHL's here: its dialer membership belongs to the LendingFlow dialer
+flow (``src/lending/lendingflow_dialer.py``), which loads it into the "LendingFlow" campaign after Josh's
+first-call window and deletes it once it is handled in GHL (RemovalReason.HANDLED_IN_GHL).
 """
 from __future__ import annotations
 
@@ -17,12 +21,12 @@ from config.lending_compliance import GHL_CALLING_LOOKBACK_DAYS
 
 _GHL_CALLING = text(
     "SELECT p FROM unnest(CAST(:phones AS text[])) AS p "
-    "WHERE EXISTS (SELECT 1 FROM lending.lendingflow_leads l WHERE l.phone = p) "
-    "   OR EXISTS (SELECT 1 FROM lending.web_leads w WHERE w.phone = p) "
-    "   OR EXISTS (SELECT 1 FROM lending.call_dispositions d "
-    "              WHERE d.phone = p AND d.call_source = 'ghl' "
-    "                AND (d.direction = 'outbound' OR d.direction IS NULL) "
-    "                AND d.call_ended_at > :since)"
+    "WHERE NOT EXISTS (SELECT 1 FROM lending.lendingflow_leads l WHERE l.phone = p) "
+    "  AND (EXISTS (SELECT 1 FROM lending.web_leads w WHERE w.phone = p) "
+    "       OR EXISTS (SELECT 1 FROM lending.call_dispositions d "
+    "                  WHERE d.phone = p AND d.call_source = 'ghl' "
+    "                    AND (d.direction = 'outbound' OR d.direction IS NULL) "
+    "                    AND d.call_ended_at > :since))"
 )
 
 

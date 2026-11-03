@@ -182,6 +182,16 @@ class _NotHalted:
 
 
 @pytest.fixture(autouse=True)
+def dialer_removals(monkeypatch):
+    """A booking webhook takes the lead out of BatchDialer in a background task on its own session: in tests it is
+    recorded, never run against the database or the dialer. Tests of the removal call the real function directly."""
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr("src.lending.booking_webhook.handle_handled_in_ghl",
+                        lambda phone, *, reason: calls.append((phone, reason)))
+    return calls
+
+
+@pytest.fixture(autouse=True)
 def global_halt_off(monkeypatch):
     """The lending emergency halt reads Postgres before every GHL send and dialer load; tests run with it off.
     Tests of the halt itself swap in their own session factory."""

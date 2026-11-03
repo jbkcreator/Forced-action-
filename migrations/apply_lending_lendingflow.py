@@ -79,6 +79,10 @@ def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
     conn.execute(text(_APPEND_ONLY_FUNCTION.format(t=schema)))
     for stmt in _APPEND_ONLY_TRIGGERS:
         conn.execute(text(stmt.format(t=schema)))
+    # The dialer + DNC-check columns the intake code writes (idempotent; also its own script).
+    from migrations.apply_lending_lendingflow_dialer import apply_to as apply_dialer_columns
+
+    apply_dialer_columns(conn, schema)
 
 
 def apply(engine: Engine | None = None, schema: str = LENDING_SCHEMA) -> None:

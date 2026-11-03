@@ -198,9 +198,12 @@ def filter_loadable(
     now: Optional[datetime] = None,
     scrubber: Scrubber,
     run_id: Optional[str] = None,
+    dnc_scrub: bool = True,
 ) -> list[GateResult]:
     """One result per input record, same order. With ``run_id``, every block is
-    written to lending.load_exclusions (A2 evidence)."""
+    written to lending.load_exclusions (A2 evidence). ``dnc_scrub=False`` (LendingFlow
+    leads, client decision) skips the Tracerfy DNC / litigator scrub only; phone,
+    Georgia, suppression and attempt history still apply."""
     now = now or datetime.now(timezone.utc)
     cutoff = now - timedelta(days=DNC_SCRUB_MAX_AGE_DAYS)
 
@@ -233,16 +236,19 @@ def filter_loadable(
     by_phone.update({p: _blocked(p, ReasonCode.GHL_CALLING) for p in ghl_owned})
     candidates = [p for p in candidates if p not in ghl_owned]
 
-    scrubs = _stored_scrubs(db, candidates) if candidates else {}
-    fresh = {p: s for p, s in scrubs.items() if s.checked_at >= cutoff}
-    stale = [p for p in candidates if p not in fresh]
-    if stale:
-        fresh.update(_scrub(db, stale, scrubber))
-    for phone in candidates:
-        scrub = fresh.get(phone)
-        by_phone[phone] = _verdict(phone, scrub) if scrub else _blocked(phone, ReasonCode.SCRUB_FAILED)
+    if dnc_scrub:
+        scrubs = _stored_scrubs(db, candidates) if candidates else {}
+        fresh = {p: s for p, s in scrubs.items() if s.checked_at >= cutoff}
+        stale = [p for p in candidates if p not in fresh]
+        if stale:
+            fresh.update(_scrub(db, stale, scrubber))
+        for phone in candidates:
+            scrub = fresh.get(phone)
+            by_phone[phone] = _verdict(phone, scrub) if scrub else _blocked(phone, ReasonCode.SCRUB_FAILED)
+        _stamp_contacts(db, fresh)
+    else:
+        by_phone.update({p: GateResult(phone=p, allowed=True) for p in candidates})
 
-    _stamp_contacts(db, fresh)
     _flag_nurture(db, [p for p, g in by_phone.items() if g.reason in NURTURE_REASONS])
     results = [early.get(i) or by_phone[phones[i]] for i in range(len(records))]
     if run_id:
@@ -706,16 +712,33 @@ def _attempt_counts(db, phones: list[str], now: datetime) -> dict[str, int]:
     return {r[0]: r[1] for r in rows}
 
 
+def scrub_exempt_phones(db, phones: Sequence[str]) -> set[str]:
+    """Phones loaded for a LendingFlow lead: no Tracerfy DNC scrub is required for them (client
+    decision), so they are never held or removed for a missing or stale scrub, and the weekly
+    rescrub skips them. Suppression, calling hours and attempt caps still apply."""
+    from config.lending_lendingflow import DIALER_REF_PREFIX
+
+    phones = list(phones)
+    if not phones or db.execute(text("SELECT to_regclass('lending.dialer_load_records')")).scalar() is None:
+        return set()
+    return set(db.execute(
+        text("SELECT DISTINCT phone FROM lending.dialer_load_records "
+             "WHERE active AND phone = ANY(:phones) AND source_record_ref LIKE :prefix"),
+        {"phones": phones, "prefix": f"{DIALER_REF_PREFIX}%"},
+    ).scalars().all())
+
+
 def _stale_scrub_phones(db, phones: list[str], now: datetime) -> set[str]:
     """Phones with no scrub, or one older than the freshness window — the weekly job's
     README says these are "blocked from dialing until rescrubbed"; this is what
     actually enforces that, since the weekly job itself only checks freshness at load
-    time, not at every dial."""
+    time, not at every dial. LendingFlow numbers (``scrub_exempt_phones``) are never stale."""
     if not phones:
         return set()
     cutoff = now - timedelta(days=DNC_SCRUB_MAX_AGE_DAYS)
     scrubs = _stored_scrubs(db, phones)
-    return {p for p in phones if p not in scrubs or scrubs[p].checked_at < cutoff}
+    exempt = scrub_exempt_phones(db, phones)
+    return {p for p in phones if p not in exempt and (p not in scrubs or scrubs[p].checked_at < cutoff)}
 
 
 def _scrub_stale_breaker_tripped(*, stale: int, pool: int) -> bool:
@@ -725,15 +748,16 @@ def _scrub_stale_breaker_tripped(*, stale: int, pool: int) -> bool:
     return pool >= SCRUB_STALE_BREAKER_MIN_POOL and stale * 100 > pool * SCRUB_STALE_BREAKER_PCT
 
 
-def dial_blocks(db, phones: list[str], *, now: Optional[datetime] = None) -> dict[str, ReasonCode]:
+def dial_blocks(db, phones: list[str], *, now: Optional[datetime] = None,
+                check_scrub: bool = True) -> dict[str, ReasonCode]:
     """``can_dial_now`` for many phones in one query: phone -> reason for each one that
     cannot be dialed now (attempt cap, total attempt history, the calling window, then
-    scrub freshness)."""
+    scrub freshness unless ``check_scrub`` is off)."""
     if not phones:
         return {}
     now = now or datetime.now(timezone.utc)
     counts = _attempt_counts(db, phones, now)
-    stale = _stale_scrub_phones(db, phones, now)
+    stale = _stale_scrub_phones(db, phones, now) if check_scrub else set()
     exhausted = _attempt_history_exhausted_phones(db, phones, now)
     blocks: dict[str, ReasonCode] = {}
     for phone in phones:

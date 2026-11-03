@@ -49,6 +49,22 @@ def test_lookup_returns_the_phones_ghl_owns_and_looks_back_fourteen_days():
         assert source in sql
 
 
+def test_a_lendingflow_lead_is_left_to_the_lendingflow_dialer_flow():
+    """LendingFlow leads are loaded into the LendingFlow campaign and removed once handled in GHL
+    (src/lending/lendingflow_dialer.py), so the GHL-ownership rule excludes them outright."""
+    db = RecordingDb()
+    ghl_calling.ghl_calling_phones(db, [GHL_PHONE], now=NOW)
+    sql, _ = db.statements[0]
+    assert "NOT EXISTS (SELECT 1 FROM lending.lendingflow_leads" in sql
+
+
+def test_both_permanent_ghl_reasons_delete_the_dialer_contact():
+    from config.lending_compliance import PERMANENT_REMOVAL_REASONS, RemovalReason
+    from src.lending import dialer_port
+    assert {RemovalReason.OPT_OUT, RemovalReason.GHL_CALLING, RemovalReason.HANDLED_IN_GHL} == PERMANENT_REMOVAL_REASONS
+    assert dialer_port._DELETING_REASONS == {r.value for r in PERMANENT_REMOVAL_REASONS}
+
+
 def test_lookup_with_no_phones_runs_no_query():
     db = RecordingDb()
     assert ghl_calling.ghl_calling_phones(db, []) == set()

@@ -35,6 +35,7 @@ from src.lending.compliance import (
     _stamp_contacts,
     _stored_scrubs,
     _verdict,
+    scrub_exempt_phones,
     tracerfy_scrub,
 )
 
@@ -76,7 +77,9 @@ def blocked_loaded_phones(db) -> list[str]:
         text("SELECT phone FROM lending.suppression_list WHERE phone = ANY(:phones)"),
         {"phones": loaded},
     ).scalars().all())
-    blocked = {p for p, scrub in _stored_scrubs(db, loaded).items() if not _verdict(p, scrub).allowed}
+    exempt = scrub_exempt_phones(db, loaded)  # LendingFlow numbers: no DNC verdict applies (client decision)
+    scrubbed_pool = [p for p in loaded if p not in exempt]
+    blocked = {p for p, scrub in _stored_scrubs(db, scrubbed_pool).items() if not _verdict(p, scrub).allowed}
     return sorted(suppressed | blocked)
 
 
@@ -86,8 +89,9 @@ def stale_loaded_phones(db, *, now: Optional[datetime] = None) -> list[str]:
     if not loaded:
         return []
     cutoff = now - timedelta(days=WEEKLY_RESCRUB_AFTER_DAYS)
+    exempt = scrub_exempt_phones(db, loaded)  # LendingFlow numbers: never rescrubbed (client decision)
     stored = _stored_scrubs(db, loaded)
-    return [p for p in loaded if p not in stored or stored[p].checked_at < cutoff]
+    return [p for p in loaded if p not in exempt and (p not in stored or stored[p].checked_at < cutoff)]
 
 
 def _close_load_rows(db, phones: list[str]) -> None:
