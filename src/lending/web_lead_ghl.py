@@ -148,8 +148,10 @@ class GhlLeadSink:
         if stale:
             # only our own earlier "no" tags are ever removed, so "no" and "yes" never sit side by side
             self._call("remove stale tag", "DELETE", f"/contacts/{contact_id}/tags", json={"tags": stale})
-        reconcile_warm_contact(self._call, self._account.location_id, contact_id, lead["phone"],
-                               text_consent=_consent_effective(lead), log_prefix="[web-lead-ghl]")
+        if not lead["suppressed"]:  # an opted-out submission keeps every do-not-disturb
+            reconcile_warm_contact(self._call, self._account.location_id, contact_id, lead["phone"],
+                                   text_consent=_consent_effective(lead), log_prefix="[web-lead-ghl]",
+                                   email=lead["email"])
         pipeline_card, existing = self._ensure_pipeline_card(lead, contact_id)
         moved = existing is not None and self._reopen_if_closed(existing)
         if existing is not None:

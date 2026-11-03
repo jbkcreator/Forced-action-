@@ -48,17 +48,18 @@ class GhlEmailSender(GhlSmsSender):
                  first_name: Optional[str] = None, deadline: Optional[datetime] = None) -> str:
         """Upsert the contact by email (and phone when known, so it stays one GHL contact), then send.
         Past ``deadline`` (UTC) nothing is sent and a non-ambiguous GhlSmsError is raised."""
-        decision = self._cold_lead_check(phone, SendChannel.EMAIL)
+        decision = self._cold_lead_check(phone, SendChannel.EMAIL, email=to)
         contact: dict = {"locationId": self._account.location_id, "email": to}
         if phone:
             contact["phone"] = phone
-        if decision.lift_dnd:  # a warm lead first reached cold: lift only the email do-not-disturb
-            contact["dndSettings"] = {channel: {"status": "inactive"} for channel in decision.lift_dnd}
         if first_name:
             contact["firstName"] = first_name
         contact_id = (self._post(self._http(), "/contacts/upsert", contact, "contact upsert").get("contact") or {}).get("id")
         if not contact_id:
             raise GhlSmsError("GHL contact upsert returned no contact id")
+        if decision.lift_dnd:  # a warm lead first reached cold: lift only the email do-not-disturb the cold push set
+            identity = {"locationId": self._account.location_id, "email": to, **({"phone": phone} if phone else {})}
+            self._lift_cold_dnd(contact_id, identity, decision.lift_dnd)
         if deadline is not None and datetime.now(timezone.utc) > deadline:
             raise GhlSmsError("deadline passed before send")
         sent = self._post(self._http(), "/conversations/messages",

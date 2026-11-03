@@ -128,10 +128,14 @@ def test_sms_to_a_cold_lead_without_consent_is_refused_before_anything_reaches_g
 
 def test_sms_to_a_consented_cold_lead_lifts_only_the_sms_do_not_disturb(lead_db):
     lead_db(cold=True, consent=True)
-    request = _sent_ok()
+    from config.lending_compliance import COLD_LEAD_DND_MESSAGE
+    request = Recorder(Resp(200, {"contact": {"id": "ct1"}}),
+                       Resp(200, {"contact": {"id": "ct1", "dndSettings": {
+                           "SMS": {"status": "active", "message": COLD_LEAD_DND_MESSAGE}}}}),
+                       Resp(200, {"contact": {"id": "ct1"}}), Resp(201, {"messageId": "m1"}))
     assert GhlSmsSender(ACCOUNT, "+18135550100", request=request)(PHONE, "hello", "Sam") == "m1"
-    upsert = request.calls[0][2]["json"]
-    assert upsert["dndSettings"] == {"SMS": {"status": "inactive"}}
+    assert "dndSettings" not in request.calls[0][2]["json"]
+    assert request.calls[2][2]["json"]["dndSettings"] == {"SMS": {"status": "inactive"}}
 
 
 def test_sms_to_a_warm_lead_leaves_do_not_disturb_untouched(lead_db):

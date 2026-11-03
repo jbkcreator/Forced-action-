@@ -14,7 +14,7 @@ when the lookup cannot be read, the send is refused.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional
@@ -39,7 +39,8 @@ _IS_COLD = text(
 )
 
 # warm_state: one read for a number we first reached cold and that has since come in as an inbound lead.
-# 0 = leave its do-not-disturb as it is (never loaded cold, still cold, or opted out: an opt-out always wins),
+# 0 = leave its do-not-disturb as it is (never loaded cold, still cold, or opted out by phone or by the lead's email:
+#     an opt-out always wins),
 # 1 = lift every messaging channel except SMS, 2 = lift every messaging channel (recorded text consent).
 _WARM_STATE = text("""
     SELECT /* warm_state */ CASE
@@ -49,6 +50,10 @@ _WARM_STATE = text("""
           OR EXISTS (SELECT 1 FROM lending.suppression_list WHERE phone = :p)
           OR EXISTS (SELECT 1 FROM sms_opt_outs WHERE phone = :p AND source <> :tracerfy)
           OR EXISTS (SELECT 1 FROM lending.contacts WHERE phone = :p AND do_not_contact)
+          OR (CAST(:e AS text) IS NOT NULL AND (
+                 EXISTS (SELECT 1 FROM lending.suppression_list WHERE lower(email) = :e)
+              OR EXISTS (SELECT 1 FROM lending.contacts WHERE lower(email) = :e AND do_not_contact)
+              OR EXISTS (SELECT 1 FROM email_opt_outs WHERE lower(email) = :e)))
         THEN 0
         WHEN EXISTS (SELECT 1 FROM lending.text_consents WHERE phone = :p AND revoked_at IS NULL) THEN 2
         ELSE 1
@@ -68,6 +73,10 @@ class ColdSendBlock(str, Enum):
     COLD_LEAD_NO_TEXT_CONSENT = "cold_lead_no_text_consent"
     COLD_LEAD_NO_EMAIL = "cold_lead_no_email"
     COLD_CHECK_UNAVAILABLE = "cold_check_unavailable"
+    # The GHL contact carries do-not-disturb the cold push did not set (an opt-out made in GHL that has not reached
+    # our suppression list yet): never lifted, the send is refused.
+    GHL_DND_NOT_COLD_PUSH = "ghl_dnd_not_cold_push"
+    DND_OWNERSHIP_UNREADABLE = "dnd_ownership_unreadable"
 
 
 def _default_session():
@@ -100,27 +109,43 @@ class ColdSendDecision:
 ALLOWED = ColdSendDecision()
 
 
-def warm_dnd_reconciliation(db, phone: Optional[str], *, text_consent: bool) -> tuple[str, ...]:
+def warm_dnd_reconciliation(db, phone: Optional[str], *, text_consent: bool,
+                            email: Optional[str] = None) -> tuple[str, ...]:
     """The messaging channels whose cold-lead do-not-disturb may be lifted for ``phone`` (empty: leave it).
     ``text_consent`` is consent given with the inbound lead itself (the form's text box); recorded consent counts
-    too. SMS is lifted only with consent; a number that opted out gets nothing lifted."""
+    too. SMS is lifted only with consent; a number that opted out, or whose lead email opted out, gets nothing."""
     norm = normalize(phone) if phone else None
     if not norm:
         return ()
-    state = db.execute(_WARM_STATE, {"p": norm, "tracerfy": TRACERFY_DNC_SOURCE}).scalar() or 0
+    mail = email.strip().lower() if email and email.strip() else None
+    state = db.execute(_WARM_STATE, {"p": norm, "e": mail, "tracerfy": TRACERFY_DNC_SOURCE}).scalar() or 0
     if not state:
         return ()
     sms_ok = state == 2 or text_consent
     return tuple(channel for channel in COLD_LEAD_DND_CHANNELS if channel != _SMS or sms_ok)
 
 
-def _send_lift(db, phone: str, channel: SendChannel) -> tuple[str, ...]:
-    """At send time, for a warm lead first reached cold: the one channel this send needs lifted, if allowed."""
+def _send_lift(db, phone: str, channel: SendChannel, email: Optional[str]) -> tuple[str, ...]:
+    """At send time, for a warm lead first reached cold: the one channel this send may lift. The sender still
+    checks in GHL that the do-not-disturb there is the cold push's own (``split_cold_dnd``) before lifting it."""
     wanted = _SMS if channel is SendChannel.SMS else "Email"
-    return (wanted,) if wanted in warm_dnd_reconciliation(db, phone, text_consent=False) else ()
+    return (wanted,) if wanted in warm_dnd_reconciliation(db, phone, text_consent=False, email=email) else ()
 
 
-def cold_send_decision(phone: Optional[str], channel: SendChannel) -> ColdSendDecision:
+def split_cold_dnd(dnd_settings: Optional[Mapping[str, Any]],
+                   channels: Sequence[str]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """``(ours, foreign)`` among ``channels`` with active do-not-disturb on the GHL contact: ours carry the cold
+    push's message and may be lifted; foreign ones were set some other way (an opt-out in GHL) and must stay."""
+    ours, foreign = [], []
+    for channel in channels:
+        entry = (dnd_settings or {}).get(channel) or {}
+        if entry.get("status") != "active":
+            continue
+        (ours if entry.get("message") == COLD_LEAD_DND_MESSAGE else foreign).append(channel)
+    return tuple(ours), tuple(foreign)
+
+
+def cold_send_decision(phone: Optional[str], channel: SendChannel, *, email: Optional[str] = None) -> ColdSendDecision:
     """Whether a lending text or email to ``phone`` may go out.
 
     An email with no phone cannot be matched to a dialer record and is allowed; cold numbers in GHL
@@ -132,7 +157,7 @@ def cold_send_decision(phone: Optional[str], channel: SendChannel) -> ColdSendDe
     try:
         with _session_factory() as db:
             if not is_cold_lead(db, phone):
-                lift = _send_lift(db, phone, channel)
+                lift = _send_lift(db, phone, channel, email)
                 return ColdSendDecision(lift_dnd=lift) if lift else ALLOWED
             consented = channel is SendChannel.SMS and has_text_consent(db, phone)
     except Exception as exc:  # class only: SQL errors embed bound parameters
@@ -149,21 +174,18 @@ GhlCall = Callable[..., dict]  # a sink's ``_call(step, method, path, **kwargs)`
 
 
 def reconcile_warm_contact(call: GhlCall, location_id: str, contact_id: str, phone: Optional[str], *,
-                           text_consent: bool, log_prefix: str) -> None:
+                           text_consent: bool, log_prefix: str, email: Optional[str] = None) -> None:
     """After an inbound push: lift the cold-lead do-not-disturb the GHL contact still carries and drop the
     ndl-cold tag. Only do-not-disturb set by the cold push (its message) is lifted, so one GHL set for an opt-out
     stays. Best effort and never raises: on a failure messaging stays blocked (the safe side), and the senders lift
     their own channel again at send time."""
     try:
         with _session_factory() as db:
-            channels = warm_dnd_reconciliation(db, phone, text_consent=text_consent)
+            channels = warm_dnd_reconciliation(db, phone, text_consent=text_consent, email=email)
         if not channels:
             return
         contact = (call("read contact", "GET", f"/contacts/{contact_id}") or {}).get("contact") or {}
-        current = contact.get("dndSettings") or {}
-        ours = [channel for channel in channels
-                if (current.get(channel) or {}).get("status") == "active"
-                and (current.get(channel) or {}).get("message") == COLD_LEAD_DND_MESSAGE]
+        ours, _ = split_cold_dnd(contact.get("dndSettings"), channels)
         if ours:
             call("lift cold do-not-disturb", "POST", "/contacts/upsert",
                  json={"locationId": location_id, "phone": phone,

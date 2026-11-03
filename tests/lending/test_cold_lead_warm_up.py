@@ -22,8 +22,9 @@ class LeadState:
     """One phone's history. ``inbound``: it came in through the form or LendingFlow; ``loaded``: it was loaded into
     the dialer cold; ``opted_out``: suppression list, STOP or do-not-contact; ``consent``: recorded text consent."""
 
-    def __init__(self, *, loaded=True, inbound=True, opted_out=False, consent=False, fail=False):
+    def __init__(self, *, loaded=True, inbound=True, opted_out=False, consent=False, fail=False, opted_out_email=None):
         self.loaded, self.inbound, self.opted_out, self.consent, self.fail = loaded, inbound, opted_out, consent, fail
+        self.opted_out_email = opted_out_email  # an email-only opt-out (suppression row with no phone)
 
     def __call__(self):
         return self
@@ -39,7 +40,8 @@ class LeadState:
             raise RuntimeError("connection lost")
         sql = str(statement)
         if "warm_state" in sql:  # 0 = leave as is, 1 = lift messaging except SMS, 2 = lift every messaging channel
-            if not (self.loaded and self.inbound) or self.opted_out:
+            email_out = self.opted_out_email is not None and (params or {}).get("e") == self.opted_out_email
+            if not (self.loaded and self.inbound) or self.opted_out or email_out:
                 answer = 0
             else:
                 answer = 2 if self.consent else 1
@@ -80,6 +82,12 @@ def _sent_ok():
     return Recorder(Resp(200, {"contact": {"id": "ct1"}}), Resp(201, {"messageId": "m1"}))
 
 
+def _lift_then_send(dnd):
+    """upsert -> read the contact's do-not-disturb -> lift -> send."""
+    return Recorder(Resp(200, {"contact": {"id": "ct1"}}), Resp(200, {"contact": {"id": "ct1", "dndSettings": dnd}}),
+                    Resp(200, {"contact": {"id": "ct1"}}), Resp(201, {"messageId": "m1"}))
+
+
 # Which channels may be lifted
 
 def test_a_warm_lead_first_reached_cold_gets_every_messaging_channel_back_with_text_consent(state):
@@ -107,9 +115,11 @@ def test_an_opt_out_a_number_never_loaded_cold_or_a_still_cold_lead_gets_nothing
 
 def test_sms_to_a_warmed_up_lead_with_consent_lifts_the_sms_do_not_disturb(state):
     state(consent=True)
-    request = _sent_ok()
+    request = _lift_then_send(_cold_dnd())
     assert GhlSmsSender(ACCOUNT, "+18135550100", request=request)(PHONE, "hello", "Sam") == "m1"
-    assert request.calls[0][2]["json"]["dndSettings"] == {"SMS": {"status": "inactive"}}
+    assert "dndSettings" not in request.calls[0][2]["json"]
+    assert request.calls[1][0] == "GET" and request.calls[1][1].endswith("/contacts/ct1")
+    assert request.calls[2][2]["json"]["dndSettings"] == {"SMS": {"status": "inactive"}}
 
 
 def test_sms_to_a_warmed_up_lead_that_opted_out_lifts_nothing(state):
@@ -119,10 +129,10 @@ def test_sms_to_a_warmed_up_lead_that_opted_out_lifts_nothing(state):
 
 def test_email_to_a_warmed_up_lead_lifts_the_email_do_not_disturb(state):
     state(consent=False)
-    request = _sent_ok()
+    request = _lift_then_send(_cold_dnd())
     assert GhlEmailSender(ACCOUNT, "hello@nextdeallending.com", request=request)(
         "jane@example.com", "s", "b", phone=PHONE) == "m1"
-    assert request.calls[0][2]["json"]["dndSettings"] == {"Email": {"status": "inactive"}}
+    assert request.calls[2][2]["json"]["dndSettings"] == {"Email": {"status": "inactive"}}
 
 
 def test_a_lead_never_loaded_cold_sends_without_touching_do_not_disturb(state):
@@ -235,3 +245,73 @@ def test_lendingflow_lead_after_a_cold_import_reopens_messaging(state, monkeypat
     lifts = [c for c in calls if c[0] == "POST" and c[1].endswith("/contacts/upsert") and c[2].get("dndSettings")]
     assert lifts and "SMS" in lifts[0][2]["dndSettings"]
     assert any(c[0] == "DELETE" and c[2] == {"tags": [GHL_TAG_COLD_LEAD]} for c in calls)
+
+
+# Finding 1: an opt-out made in GHL that has not reached our suppression list yet
+
+@pytest.mark.parametrize("sender, args, channel", [
+    ("sms", (PHONE, "hello", "Sam"), "SMS"),
+    ("email", ("jane@example.com", "s", "b"), "Email"),
+])
+def test_a_genuine_ghl_do_not_disturb_awaiting_local_sync_is_never_lifted_and_nothing_is_sent(
+        state, sender, args, channel):
+    from src.lending.ghl_sms import GhlSendRefused
+    state(consent=True)
+    request = Recorder(Resp(200, {"contact": {"id": "ct1"}}),
+                       Resp(200, {"contact": {"id": "ct1", "dndSettings": _cold_dnd(**{
+                           channel: {"status": "active", "message": "Opted out by reply"}})}}))
+    send = (GhlSmsSender(ACCOUNT, "+18135550100", request=request) if sender == "sms"
+            else GhlEmailSender(ACCOUNT, "hello@nextdeallending.com", request=request))
+    kwargs = {} if sender == "sms" else {"phone": PHONE}
+    with pytest.raises(GhlSendRefused, match="ghl_dnd_not_cold_push"):
+        send(*args, **kwargs)
+    assert [c[0] for c in request.calls] == ["POST", "GET"]  # no lift, no send
+    assert not any("dndSettings" in (c[2].get("json") or {}) for c in request.calls)
+
+
+def test_an_unreadable_ghl_contact_refuses_the_send(state):
+    from src.lending.ghl_sms import GhlSendRefused
+    state(consent=True)
+    request = Recorder(Resp(200, {"contact": {"id": "ct1"}}), Resp(500))
+    with pytest.raises(GhlSendRefused, match="dnd_ownership_unreadable"):
+        GhlSmsSender(ACCOUNT, "+18135550100", request=request)(PHONE, "hello", "Sam")
+    assert len(request.calls) == 2
+
+
+def test_a_channel_without_active_do_not_disturb_sends_with_no_lift(state):
+    state(consent=True)
+    request = Recorder(Resp(200, {"contact": {"id": "ct1"}}), Resp(200, {"contact": {"id": "ct1", "dndSettings": {}}}),
+                       Resp(201, {"messageId": "m1"}))
+    assert GhlSmsSender(ACCOUNT, "+18135550100", request=request)(PHONE, "hello", "Sam") == "m1"
+    assert [c[0] for c in request.calls] == ["POST", "GET", "POST"]
+
+
+# Finding 2: an email-only opt-out
+
+def test_an_email_only_opt_out_gets_nothing_lifted(state):
+    db = state(consent=True, opted_out_email="jane@example.com")
+    assert warm_dnd_reconciliation(db, PHONE, text_consent=True, email="Jane@Example.com ") == ()
+    assert warm_dnd_reconciliation(db, PHONE, text_consent=True, email=None) == MESSAGING
+
+
+def test_reconciliation_checks_the_email_as_well_as_the_phone(state):
+    state(consent=True, opted_out_email="jane@example.com")
+    call = FakeCall(_cold_dnd())
+    reconcile_warm_contact(call, ACCOUNT.location_id, "ct1", PHONE, text_consent=True, log_prefix="[t]",
+                           email="jane@example.com")
+    assert call.calls == []
+
+
+def test_an_email_suppressed_contact_submitting_the_website_form_has_nothing_lifted(
+        state, monkeypatch, quiet_settings):
+    from src.lending.web_lead_ghl import GhlLeadSink
+    state(consent=True, opted_out_email="jane@example.com")
+    calls = _ghl(monkeypatch, _cold_dnd())
+    lead = {"name": "Jane Roe", "phone": PHONE, "email": "jane@example.com", "sms_consent": True,
+            "call_consent": True, "deal_drop_optin": False, "suppressed": True}
+    try:
+        GhlLeadSink(ACCOUNT).push(lead)
+    except Exception:
+        pass
+    assert not [c for c in calls if (c[2] or {}).get("dndSettings")]
+    assert not any(c[0] == "DELETE" and c[2] == {"tags": [GHL_TAG_COLD_LEAD]} for c in calls)

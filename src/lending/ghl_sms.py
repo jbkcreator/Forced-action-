@@ -28,7 +28,7 @@ from typing import Any, Callable, Optional
 import requests
 
 from config.settings import get_settings
-from src.lending.cold_leads import ColdSendDecision, SendChannel, cold_send_decision
+from src.lending.cold_leads import ColdSendBlock, ColdSendDecision, SendChannel, cold_send_decision, split_cold_dnd
 from src.lending.global_halt import is_globally_halted
 from src.lending.ghl_account import GhlAccount, ghl_headers, lending_ghl_account
 from src.services import ghl_webhook
@@ -55,7 +55,8 @@ class GhlSmsError(RuntimeError):
 
 
 class GhlSendRefused(GhlSmsError):
-    """Nothing was sent or upserted: the recipient is a cold lead this channel may not reach."""
+    """Nothing was sent: the recipient is a cold lead this channel may not reach, or the GHL contact carries
+    do-not-disturb the cold push did not set (an opt-out made in GHL, not yet in our suppression list)."""
 
     def __init__(self, reason: str) -> None:
         super().__init__(f"refused: {reason}")
@@ -92,15 +93,38 @@ class GhlSmsSender:
     def _http(self) -> Request:
         return self._request or _single_attempt
 
-    def _cold_lead_check(self, phone: Optional[str], channel: SendChannel) -> ColdSendDecision:
+    def _cold_lead_check(self, phone: Optional[str], channel: SendChannel, *,
+                         email: Optional[str] = None) -> ColdSendDecision:
         """Raise GhlSendRefused for a cold lead this channel may not reach. Alerts to the team's own phone skip it."""
         if self._internal_alert:
             return ColdSendDecision()
-        decision = cold_send_decision(phone, channel)
+        decision = cold_send_decision(phone, channel, email=email)
         if decision.block is not None:
             logger.warning("%s send refused: %s", self._log_prefix, decision.block.value)
             raise GhlSendRefused(decision.block.value)
         return decision
+
+    def _lift_cold_dnd(self, contact_id: str, identity: dict, channels: tuple[str, ...]) -> None:
+        """Lift ``channels`` only where the GHL contact's do-not-disturb is the cold push's own. Do-not-disturb set
+        any other way (an opt-out made in GHL that has not reached our suppression list) refuses the send, and so
+        does an unreadable contact: both fail closed, nothing is lifted or sent."""
+        try:
+            response = self._http()("GET", f"{ghl_webhook._GHL_BASE}/contacts/{contact_id}",
+                                    headers=ghl_headers(self._account.api_key, "2021-07-28"))
+            if response.status_code >= 400:
+                raise GhlSmsError(f"HTTP {response.status_code}")
+            dnd = ((response.json() or {}).get("contact") or {}).get("dndSettings")
+        except Exception as exc:  # class only: the message can carry request detail
+            logger.warning("%s do-not-disturb read failed (%s); send refused", self._log_prefix, type(exc).__name__)
+            raise GhlSendRefused(ColdSendBlock.DND_OWNERSHIP_UNREADABLE.value) from None
+        ours, foreign = split_cold_dnd(dnd, channels)
+        if foreign:
+            logger.warning("%s send refused: %s", self._log_prefix, ColdSendBlock.GHL_DND_NOT_COLD_PUSH.value)
+            raise GhlSendRefused(ColdSendBlock.GHL_DND_NOT_COLD_PUSH.value)
+        if ours:
+            self._post(self._http(), "/contacts/upsert",
+                       {**identity, "dndSettings": {channel: {"status": "inactive"} for channel in ours}},
+                       "lift cold do-not-disturb")
 
     def _post(self, request: Request, path: str, body: dict, what: str, version: str = "2021-07-28",
               is_send: bool = False) -> dict:
@@ -130,12 +154,14 @@ class GhlSmsSender:
         contact: dict[str, Any] = {"locationId": self._account.location_id, "phone": phone}
         if first_name:
             contact["firstName"] = first_name
-        if decision.lift_dnd:
-            # A consented cold lead, or a warm lead first reached cold: lift only the SMS do-not-disturb.
-            contact["dndSettings"] = {channel: {"status": "inactive"} for channel in decision.lift_dnd}
         contact_id = (self._post(self._http(), "/contacts/upsert", contact, "contact upsert").get("contact") or {}).get("id")
         if not contact_id:
             raise GhlSmsError("GHL contact upsert returned no contact id")
+        if decision.lift_dnd:
+            # A consented cold lead, or a warm lead first reached cold: lift only the SMS do-not-disturb the cold
+            # push set (checked on the GHL contact first).
+            self._lift_cold_dnd(contact_id, {"locationId": self._account.location_id, "phone": phone},
+                                decision.lift_dnd)
         if deadline is not None and datetime.now(timezone.utc) > deadline:
             raise GhlSmsError("deadline passed before send")
         sent = self._post(self._http(), "/conversations/messages",
