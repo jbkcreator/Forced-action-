@@ -21,7 +21,7 @@ RULE LOGIC (generic — no lender name in code)
 The primary lender is whichever row has ``is_primary=TRUE`` and
 ``agreement_status='signed'``.  Its ``construction_min_amount`` is the
 threshold for rule 1 vs rule 3.  Only ``agreement_status='signed'`` lenders
-participate in routing; the rest are invisible.
+whose rules are verified (no placeholder field, L1) participate in routing; the rest are invisible.
 
 Rule 1: ground-up AND amount >= primary.construction_min_amount
          AND primary.box passes AND primary not at cap → primary
@@ -86,8 +86,11 @@ _DSCR_TYPES = frozenset({LoanType.DSCR_RENTAL.value})
 
 
 def _signed(lenders: list[LenderRow]) -> list[LenderRow]:
-    """Filter to only signed, active lenders."""
-    return [lr for lr in lenders if lr.agreement_status in ROUTABLE_AGREEMENT_STATUSES and lr.active]
+    """Filter to only signed, active lenders whose rules are verified (L1: nothing routes to an unverified lender)."""
+    return [
+        lr for lr in lenders
+        if lr.agreement_status in ROUTABLE_AGREEMENT_STATUSES and lr.active and lr.rules_verified
+    ]
 
 
 def _waterfall(
@@ -456,7 +459,7 @@ def _route(key: FileKey, db: Session) -> None:
     signed = _signed(load_active_lenders(db))
 
     if not signed:
-        logger.warning("route %s %d: no signed lenders — holding (no_match)", key.kind, key.id)
+        logger.warning("route %s %d: no signed, verified lenders — holding (no_match)", key.kind, key.id)
         _hold(key, file, "no_match", db)
         return
 
