@@ -7,7 +7,7 @@ Code: `src/lending/lendingflow_dialer.py` (load + removal) and `src/lending/bd_r
 ## How a lead moves
 
 1. The lead is delivered to GHL, as before.
-2. After `LENDING_LENDINGFLOW_DIALER_DELAY_MINUTES` (Josh's first-call window), the sweep re-reads the lead's GHL calls live. If that read fails, the lead is not loaded and is retried later.
+2. After `LENDING_LENDINGFLOW_DIALER_DELAY_MINUTES` (default **0**: the next 5-minute sweep; set minutes to give Josh a head start in GHL), the sweep re-reads the lead's GHL calls live. If that read fails, the lead is not loaded and is retried later.
 3. If Josh already had a connected call with the lead, it is never loaded (`blocked` / `HANDLED_IN_GHL`).
 4. Otherwise it goes through `run_dialer_load` alone with `dnc_scrub=False`. **Client decision: LendingFlow leads need no consent certificate and get no Tracerfy DNC scrub.** Still applied: opt-out / suppression, Georgia, Backflip, the attempt caps and the calling window. Loaded LendingFlow numbers are also skipped by the dialer sweep's stale-scrub hold and by the weekly rescrub (`compliance.scrub_exempt_phones`). Its card shows name, loan amount, loan type, state, request date and prior contact.
 5. A lead stays `pending` for temporary reasons and is retried after 15 minutes: outside calling hours, attempt cap, halt, a failed GHL read, or a refused load. A lead that arrives at 8:30pm loads the next morning.

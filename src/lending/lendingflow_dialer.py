@@ -1,7 +1,7 @@
 """LendingFlow leads into the BatchDialer "LendingFlow" campaign, and out again once they are handled in GHL.
 
 Loading runs from the 5-minute LendingFlow sweep, never inside the GHL delivery. A lead is loaded once it is in GHL,
-is not suppressed, is older than Josh's first-call window (LENDING_LENDINGFLOW_DIALER_DELAY_MINUTES) and has not been
+is not suppressed, is older than LENDING_LENDINGFLOW_DIALER_DELAY_MINUTES (default 0: the next sweep) and has not been
 handled in GHL. Client decision: LendingFlow leads need no consent certificate and get no Tracerfy DNC scrub
 (``dnc_scrub=False``; the dialer sweep and the weekly rescrub skip them too, ``compliance.scrub_exempt_phones``).
 Each lead goes through ``run_dialer_load`` on its own, so every other gate still applies (opt-out / suppression,

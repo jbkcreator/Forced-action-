@@ -957,9 +957,10 @@ class AppSettings(BaseSettings):
 	# Pipeline stage (in LENDING_GHL_PIPELINE_ID) for new LendingFlow leads; unset = contact only.
 	lending_ghl_stage_lendingflow_new: Optional[str] = Field(default=None, env="LENDING_GHL_STAGE_LENDINGFLOW_NEW")
 	# LendingFlow -> BatchDialer campaign "LendingFlow" (src/lending/lendingflow_dialer.py). Off: nothing is loaded; leads
-	# already loaded are still removed once they are handled in GHL. The delay is Josh's first-call window (placeholder).
+	# already loaded are still removed once they are handled in GHL. Delay before a new lead is loaded: 0 = on the next sweep
+	# (no head start for GHL; a GHL booking or connected call still removes the lead). Set minutes to give GHL a head start.
 	lending_lendingflow_dialer_enabled: bool = Field(default=False, env="LENDING_LENDINGFLOW_DIALER_ENABLED")
-	lending_lendingflow_dialer_delay_minutes: int = Field(default=15, env="LENDING_LENDINGFLOW_DIALER_DELAY_MINUTES")
+	lending_lendingflow_dialer_delay_minutes: int = Field(default=0, env="LENDING_LENDINGFLOW_DIALER_DELAY_MINUTES")
 	# BatchDialer call results as tags + a "last BatchDialer call" field on the GHL contact (src/lending/bd_result_to_ghl.py).
 	lending_bd_result_to_ghl_enabled: bool = Field(default=False, env="LENDING_BD_RESULT_TO_GHL_ENABLED")
 	lending_ghl_cf_last_bd_call: Optional[str] = Field(default=None, env="LENDING_GHL_CF_LAST_BD_CALL")  # GHL custom field id; unset = tags only

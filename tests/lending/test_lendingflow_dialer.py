@@ -164,6 +164,19 @@ def test_a_lead_inside_josh_first_call_window_is_not_loaded_yet(db):
     assert dialer.upserts == [] and _lead_row(db, lead_id)["dialer_status"] == "pending"
 
 
+def test_with_no_delay_a_new_lead_loads_on_the_next_sweep(db, monkeypatch):
+    monkeypatch.setattr(lfd.get_settings(), "lending_lendingflow_dialer_delay_minutes", 0)
+    lead_id, _ = _lead(db, received=NOON_ET - timedelta(minutes=1))
+    dialer = FakeDialer()
+    _run(db, dialer=dialer, calls=Calls())
+    assert len(dialer.upserts) == 1 and _lead_row(db, lead_id)["dialer_status"] == "loaded"
+
+
+def test_the_default_delay_is_zero():
+    from config.settings import AppSettings
+    assert AppSettings.model_fields["lending_lendingflow_dialer_delay_minutes"].default == 0
+
+
 def test_a_lead_that_arrives_after_hours_stays_pending_and_loads_next_morning(db):
     lead_id, _ = _lead(db, received=LATE_ET - timedelta(minutes=30))
     dialer = FakeDialer()
