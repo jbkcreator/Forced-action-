@@ -957,12 +957,19 @@ class AppSettings(BaseSettings):
 	# Pipeline stage (in LENDING_GHL_PIPELINE_ID) for new LendingFlow leads; unset = contact only.
 	lending_ghl_stage_lendingflow_new: Optional[str] = Field(default=None, env="LENDING_GHL_STAGE_LENDINGFLOW_NEW")
 	# LendingFlow -> BatchDialer campaign "LendingFlow" (src/lending/lendingflow_dialer.py). Off: nothing is loaded; leads
-	# already loaded are still removed once they are handled in GHL. The delay is Josh's first-call window (placeholder).
+	# already loaded are still removed once they are handled in GHL. Delay before a new lead is loaded: 0 = on the next sweep
+	# (no head start for GHL; a GHL booking or connected call still removes the lead). Set minutes to give GHL a head start.
 	lending_lendingflow_dialer_enabled: bool = Field(default=False, env="LENDING_LENDINGFLOW_DIALER_ENABLED")
-	lending_lendingflow_dialer_delay_minutes: int = Field(default=15, env="LENDING_LENDINGFLOW_DIALER_DELAY_MINUTES")
+	# Website leads into the BatchDialer campaign "Website" (same dialer step; call-consent tick + DNC scrub required).
+	lending_web_lead_dialer_enabled: bool = Field(default=False, env="LENDING_WEB_LEAD_DIALER_ENABLED")
+	lending_lendingflow_dialer_delay_minutes: int = Field(default=0, env="LENDING_LENDINGFLOW_DIALER_DELAY_MINUTES")
 	# BatchDialer call results as tags + a "last BatchDialer call" field on the GHL contact (src/lending/bd_result_to_ghl.py).
 	lending_bd_result_to_ghl_enabled: bool = Field(default=False, env="LENDING_BD_RESULT_TO_GHL_ENABLED")
 	lending_ghl_cf_last_bd_call: Optional[str] = Field(default=None, env="LENDING_GHL_CF_LAST_BD_CALL")  # GHL custom field id; unset = tags only
+	# GHL dropdown custom field "Last BatchDialer result" (options = the 10 result codes); unset = not written
+	lending_ghl_cf_last_bd_result: Optional[str] = Field(default=None, env="LENDING_GHL_CF_LAST_BD_RESULT")
+	# GHL call results on the BatchDialer contact card (custom field card_ghl_call; src/lending/ghl_result_to_bd.py).
+	lending_ghl_result_to_bd_enabled: bool = Field(default=False, env="LENDING_GHL_RESULT_TO_BD_ENABLED")
 	# T-09 intro SMS. Off: the tag that starts the GHL intro workflow is never added, so nobody is texted. Turn on only after
 	# Josh confirms LendingFlow's consent and DNC check. Needs the id of the GHL contact custom field "intro_name".
 	lending_intro_sms_enabled: bool = Field(default=False, env="LENDING_INTRO_SMS_ENABLED")

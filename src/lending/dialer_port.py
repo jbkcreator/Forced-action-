@@ -202,6 +202,23 @@ class BatchDialerAdapter:
         body["customfields"] = {**existing, **body.get("customfields", {}), **(fields.customfields or {})}
         return dict(self._call("contact_update", body, id=contact_id))
 
+    def set_custom_fields(self, contact_id: Any, values: Mapping[str, str]) -> dict:
+        """Change only ``values`` among the contact's custom fields. BatchDialer's update is a full PUT that clears
+        whatever it is not sent, so the contact is read first and every field we write elsewhere (names, email,
+        address, phone, our vendor id, the other custom fields) is sent back as it was. If the read fails, or the
+        contact has no phone number, nothing is sent."""
+        endpoint = self._endpoints.get("contact_get")
+        if endpoint is None or self._endpoints.get("contact_update") is None:
+            raise UnconfirmedCapability("BatchDialer contact read/update endpoints are not confirmed")
+        contact = dict(self._http("GET", endpoint[1].format(id=contact_id), json=None) or {})
+        numbers = _phone_numbers(contact)
+        if not numbers:
+            raise DialerRequestError("BatchDialer contact has no phone number; custom fields not updated")
+        body: dict[str, Any] = {key: contact.get(key) or "" for key in _KEPT_ON_FULL_PUT}
+        body["phonenumbers"] = [{"phonenumber": _ten_digit(number)} for number in numbers]
+        body["customfields"] = {**(contact.get("customfields") or {}), **values}
+        return dict(self._call("contact_update", body, id=contact_id))
+
     def get_contact_customfields(self, contact_id: Any, *, quick: bool = False) -> dict:
         """``quick``: one short attempt, no retries (the on-call consent read must not stall ingestion)."""
         endpoint = self._endpoints.get("contact_get")
@@ -265,6 +282,20 @@ class BatchDialerAdapter:
 
 def _contact_id(body: Mapping[str, Any]) -> Any:
     return body.get("id") if body.get("id") is not None else body.get("contactId")
+
+
+# Top-level contact fields our loads write; a custom-field-only update sends them back unchanged.
+_KEPT_ON_FULL_PUT = ("firstname", "lastname", "email", "address", "city", "state", "postalcode", "vendorcontactid")
+
+
+def _phone_numbers(contact: Mapping[str, Any]) -> list[str]:
+    """The contact's numbers as BatchDialer returns them (``phonenumbers`` entries, else ``phonenumber1``)."""
+    numbers = [str(entry.get("phonenumber") or entry.get("number") or "")
+               for entry in contact.get("phonenumbers") or [] if isinstance(entry, Mapping)]
+    numbers = [n for n in numbers if n]
+    if not numbers and contact.get("phonenumber1"):
+        numbers = [str(contact["phonenumber1"])]
+    return numbers
 
 
 def _ten_digit(phone: str) -> str:

@@ -436,7 +436,7 @@ def test_a_ghl_dnc_result_suppresses_before_the_call_is_imported(db):
     assert _scalar(db, "SELECT 1 FROM lending.suppression_list WHERE phone = :p", p=PHONE) == 1
     assert _scalar(db, "SELECT do_not_contact FROM lending.contacts WHERE phone = :p", p=PHONE) is True
     [ev] = _events(db, PHONE)
-    assert (ev.channel, ev.source_ref) == ("dialer", f"ghl_outcome:{event_id}")
+    assert (ev.channel, ev.source_ref) == ("dialer", f"ghl-disposition:{event_id}")
     assert _scalar(db, "SELECT matched_call_id FROM lending.ghl_disposition_events WHERE id = :i", i=event_id) is None
 
     assert ev.status == "dialer_pending" and ev.dialer_removed_at is None

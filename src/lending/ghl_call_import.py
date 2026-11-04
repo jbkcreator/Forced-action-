@@ -59,6 +59,7 @@ from config.lending_followup import (
 )
 from config.lending_dispositions import GHL_UNKNOWN_CALLER, ghl_caller_name
 from src.lending.ghl_calls import call_duration_seconds, call_state, message_time
+from src.lending.ghl_missed_call import adopt_missed_call
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
@@ -186,6 +187,8 @@ def _store_contact(db, read_calls: CallReader, contact_id: str, phone: str, sinc
     try:
         with db.begin_nested():
             for row in rows:
+                if row["direction"] == "outbound":
+                    adopt_missed_call(db, row["call_id"], row["phone"], row["started"], row["raw_outcome"])
                 stored = db.execute(_UPSERT, {**row, "unknown_outcome": UNKNOWN_OUTCOME, "unknown_caller": GHL_UNKNOWN_CALLER}).first()
                 if stored is None:
                     stats.already_recorded += 1

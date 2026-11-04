@@ -31,6 +31,7 @@ A contact cannot be called now when:
 - it has had 3 outbound calls in 24 hours, or 6 in 10 business days (GHL and BatchDialer calls count together);
 - it is outside 8am-8pm in the recipient's timezone or outside 9:00-19:15 ET;
 - for a number that is not a LendingFlow lead: its DNC scrub is missing or older than 7 days, or the scrub found it on a DNC or litigator list.
+- the ISA already got through to it in BatchDialer in the last 14 days (`REACHED_IN_BATCHDIALER`: connected, callback, DNC request, nurture or booked). One calling rule for every lead (Nov 4): both platforms dial until someone gets through, then the other stops. The other half lives in `src/lending/ghl_calling.py`: a number reached in GHL (same results, or GHL answered with 60+ s of talk when no result was posted) leaves BatchDialer; an unanswered GHL call no longer does.
 
 LendingFlow leads need no scrub: every LendingFlow lead counts as having agreed to calls and texts.
 

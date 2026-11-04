@@ -203,37 +203,89 @@ def test_the_pending_read_selects_contact_and_text_consent():
     assert "e.contact_id" in pending and "raw_event->>'text_consent'" in pending
 
 
-def _received(code: str, phone: str | None = "+18135550123") -> hooks.ReceivedOutcome:
-    return hooks.ReceivedOutcome(event_id=42, contact_id="c1", phone=phone, code=code, caller_name="Hari K",
-                                 called_at=NOW, received_at=NOW, gate_failed=None, text_consent=None)
-
+# ---- G4: what the hooks do -----------------------------------------------------------------------------------------
 
 @pytest.fixture
-def opt_outs(monkeypatch):
-    from src.lending import compliance
-    calls = []
-    monkeypatch.setattr(compliance, "propagate_opt_out", lambda db, **kw: calls.append(kw) or 1)
-    return calls
+def acted(monkeypatch):
+    got = {"opt_out": [], "consent": [], "missed": []}
+    monkeypatch.setattr(hooks, "propagate_opt_out", lambda db, **kw: got["opt_out"].append(kw) or 5)
+    monkeypatch.setattr(hooks, "record_consent", lambda db, phone, source, **kw: got["consent"].append((phone, source, kw)))
+    monkeypatch.setattr(hooks, "queue_missed_call",
+                        lambda db, call_id, phone, did, record, ended: got["missed"].append((call_id, phone, did, ended)))
+    return got
 
 
-def test_a_dnc_outcome_opts_the_number_out_at_once(opt_outs):
-    from config.lending_compliance import OptOutChannel
+class _HookDb:
+    def __init__(self, rows=()):
+        self.rows, self.executed = list(rows), []
+
+    def execute(self, sql, params=None):
+        self.executed.append((" ".join(str(sql).split()), params))
+        return _Result(self.rows)
+
+
+def _received(code="DNC_REQUEST", phone="+18135550142", **kw):
+    return hooks.ReceivedOutcome(event_id=11, contact_id="c-1", phone=phone, code=code, caller_name="Josh Kantor",
+                                 called_at=None, received_at=NOW, gate_failed=None, text_consent=None, **kw)
+
+
+def _matched(i, code, *, phone="+18135550142", consent=None):
+    return hooks.MatchedOutcome(call_row_id=i, dialer_call_id=f"ghl:m{i}", event_id=100 + i, contact_id="c-1",
+                                phone=phone, code=code, caller_name="Josh Kantor", gate_failed=None,
+                                text_consent=consent)
+
+
+def test_a_dnc_outcome_opts_the_number_out_as_soon_as_it_arrives(acted):
+    hooks.on_ghl_outcome_received(_HookDb(), _received())
+    assert acted["opt_out"] == [{"phone": "+18135550142", "source_ref": "ghl-disposition:11", "actor": "Josh Kantor",
+                                 "dialer_remover": hooks._remove_on_next_poll}]
+
+
+def test_the_dialer_removal_is_left_to_the_opt_out_poller():
     from src.lending.dialer_removal import DialerRemovalUndecided
-    hooks.on_ghl_outcome_received(object(), _received("DNC_REQUEST"))
-    [kw] = opt_outs
-    remover = kw.pop("dialer_remover")
-    assert kw == {"phone": "+18135550123", "source_ref": "ghl_outcome:42", "actor": "Hari K",
-                  "channel": OptOutChannel.DIALER}
-    with pytest.raises(DialerRemovalUndecided):  # removal left to the opt-out poller
-        remover("+18135550123", reason="opt_out")
+    with pytest.raises(DialerRemovalUndecided):
+        hooks._remove_on_next_poll("+18135550142", reason="opt_out")
 
 
-@pytest.mark.parametrize("code,phone", [("NO_ANSWER", "+18135550123"), ("CONNECTED_NOT_INTERESTED", "+18135550123"),
-                                        ("DNC_REQUEST", None)])
-def test_other_outcomes_and_a_dnc_without_phone_do_nothing(opt_outs, code, phone):
-    hooks.on_ghl_outcome_received(object(), _received(code, phone))
-    assert opt_outs == []
+@pytest.mark.parametrize("code, phone", [("BOOKED", "+18135550142"), ("DNC_REQUEST", None)])
+def test_other_outcomes_or_no_phone_opt_nothing_out_on_arrival(acted, code, phone):
+    hooks.on_ghl_outcome_received(_HookDb(), _received(code, phone))
+    assert acted["opt_out"] == []
 
 
-def test_the_matched_hook_is_a_no_op():
-    assert hooks.on_ghl_outcome_matched(object(), []) is None
+def test_a_matched_dnc_uses_the_same_opt_out_and_stamps_the_call_so_the_sweep_skips_it(acted):
+    db = _HookDb()
+    hooks.on_ghl_outcome_matched(db, [_matched(7, "DNC_REQUEST", consent=True)])
+    assert acted["opt_out"] == [{"phone": "+18135550142", "source_ref": "ghl-disposition:107", "actor": "Josh Kantor",
+                                 "dialer_remover": hooks._remove_on_next_poll}]
+    stamp = next(p for s, p in db.executed if s.startswith("UPDATE lending.call_dispositions SET opt_out_propagated_at"))
+    assert stamp == {"ids": [7]}
+    assert acted["consent"] == []  # a DNC never records consent
+
+
+def test_text_consent_yes_on_an_answered_call_is_saved(acted):
+    hooks.on_ghl_outcome_matched(_HookDb(), [_matched(7, "CALLBACK_REQUESTED", consent=True)])
+    assert acted["consent"] == [("+18135550142", "on_call_yes", {"call_id": "ghl:m7", "captured_by": "Josh Kantor"})]
+
+
+@pytest.mark.parametrize("code, consent", [
+    ("CALLBACK_REQUESTED", False), ("CALLBACK_REQUESTED", None), ("NO_ANSWER", True), ("LEFT_VOICEMAIL", True),
+    ("BAD_NUMBER", True),
+])
+def test_consent_needs_a_yes_and_someone_who_picked_up(acted, code, consent):
+    hooks.on_ghl_outcome_matched(_HookDb(), [_matched(7, code, consent=consent)])
+    assert acted["consent"] == []
+
+
+def test_an_unanswered_outcome_queues_the_missed_call_event_with_the_call_end(acted):
+    ended = NOW - timedelta(minutes=14)
+    db = _HookDb(rows=[(7, ended, "+16562211100"), (8, ended, None)])
+    hooks.on_ghl_outcome_matched(db, [_matched(7, "NO_ANSWER"), _matched(8, "LEFT_VOICEMAIL"), _matched(9, "BOOKED")])
+    assert acted["missed"] == [("ghl:m7", "+18135550142", "+16562211100", ended), ("ghl:m8", "+18135550142", None, ended)]
+    assert sum(1 for s, _ in db.executed if s.startswith("SELECT id, call_ended_at")) == 1  # one read per batch
+
+
+def test_an_unanswered_call_with_no_end_time_or_phone_is_not_queued(acted):
+    hooks.on_ghl_outcome_matched(_HookDb(rows=[(7, None, None)]),
+                                 [_matched(7, "NO_ANSWER"), _matched(8, "NO_ANSWER", phone=None)])
+    assert acted["missed"] == []

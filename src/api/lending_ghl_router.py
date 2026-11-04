@@ -36,6 +36,8 @@ from src.lending.ghl_disposition_match import (
     parse_event as parse_disposition_event,
 )
 from src.lending.ghl_disposition_match import record_event as record_disposition_event
+from src.lending.ghl_missed_call import InvalidMissedCall, parse_missed_call, record_missed_call, run_text_back_now
+from src.lending.payload_shape import log_shape
 from src.lending.ghl_consent_events import InvalidEvent, field as _field, record_ghl_opt_out, record_inbound_consent
 from src.lending.webhook_failures import AFTER_HOURS_INTAKE, GHL_OPT_OUT, GHL_TEXT_CONSENT, report_webhook_failure
 from src.services.phone_utils import normalize
@@ -168,6 +170,38 @@ def ghl_disposition(
     if matched:
         background.add_task(deliver_matched, matched)
     return {"recorded": True, "duplicate": duplicate, "matched": len(matched)}
+
+
+@router.post("/ghl-missed-call")
+def ghl_missed_call(
+    body: dict[str, Any],
+    background: BackgroundTasks,
+    x_webhook_secret: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """G4: a GHL workflow posts a call nobody picked up the moment it ends; its missed-call text is queued and decided
+    right after the response, with every BatchDialer gate (src/lending/ghl_missed_call.py). Answered or inbound calls
+    are ignored. UNVERIFIED body (Dev A builds the workflow): call_id, phone, call_status, contact_id, direction,
+    user, called_at, ended_at."""
+    _verify_secret(x_webhook_secret)
+    log_shape("ghl-missed-call", body)
+    try:
+        call = parse_missed_call(body, datetime.now(timezone.utc))
+    except InvalidMissedCall as exc:
+        logger.warning("[lending-ghl] missed-call webhook refused: %s", exc.reason)
+        raise HTTPException(status_code=422, detail=exc.reason) from None
+    if call is None:
+        return {"queued": False, "ignored": True}
+    try:
+        status = record_missed_call(db, call)
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.error("[lending-ghl] missed-call webhook failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=500, detail="Missed call could not be recorded") from exc
+    if status == "pending":
+        background.add_task(run_text_back_now)
+    return {"queued": status == "pending", "status": status}
 
 
 @router.post("/after-hours-intake")

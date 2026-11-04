@@ -17,6 +17,22 @@ MAX_LATE_SECONDS = 60             # brief rule: text within 60 s; an older misse
 MAX_CALLS_PER_CYCLE = 500         # bound on call records decided per poll cycle
 TIMEZONE = "America/New_York"     # "one text per person per day" is an Eastern calendar day
 SMS_CAMPAIGN = "lending_missed_call"
+# G4: GHL call statuses (lower-cased, "_"/" " -> "-") that mean nobody picked up. The GHL "call status" workflow posts
+# them to POST /webhooks/lending/ghl-missed-call the moment the call ends; voicemail is texted, as for BatchDialer.
+# Checked in the GHL "Call details" trigger (2026-11-04): busy, canceled, completed, no-answer, voicemail; "canceled"
+# (the caller hung up before an answer) is deliberately not texted.
+GHL_MISSED_CALL_STATUSES = frozenset({"no-answer", "noanswer", "busy", "failed", "undelivered", "voicemail"})
+# {{phoneCall.direction}}: the trigger's filter says "Outgoing"; the call API says "outbound".
+GHL_OUTBOUND_DIRECTIONS = frozenset({"out", "outbound", "outgoing"})
+# GHL workflows have no call / message id merge field (checked 2026-11-04), so a missed call posted without one is
+# stored as "ghl-missed:<phone hash>:<call time>" and the GHL call import takes that row over (gives it the real
+# "ghl:<message id>") when it stores a MISSED call (a status in GHL_MISSED_CALL_STATUSES) to the same phone that
+# started within this many seconds; the webhook reuses an imported call only on the same evidence. Both times are
+# GHL's own clock for one call, so they differ by seconds; a redial starts at least a ring later (PR #407 re-review:
+# an answered call at 10:00 must never absorb a missed redial at 10:02).
+GHL_MISSED_CALL_KEY_PREFIX = "ghl-missed:"
+GHL_MISSED_CALL_MATCH_SECONDS = 30
+GHL_MISSED_CALL_RAW_OUTCOMES = tuple(sorted(f"ghl:{status}" for status in GHL_MISSED_CALL_STATUSES))
 MAX_TEXT_CHARS = 320
 
 # Documented CDR fields (first match wins).

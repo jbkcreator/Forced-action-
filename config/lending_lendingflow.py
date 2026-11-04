@@ -54,6 +54,14 @@ DIALER_MAX_FAILURES = 5
 DIALER_BATCH_SIZE = 25
 # One dialer step at a time (transaction advisory lock held for the whole run, next to the other lending lock keys).
 DIALER_LOCK_KEY = 7_302_020_810
+# Website leads use the same dialer step (LeadSource WEBSITE): their own campaign "Website", only leads who ticked the
+# call-consent box, and the Tracerfy DNC scrub (unlike LendingFlow).
+WEB_DIALER_POOL = "website"
+WEB_DIALER_REF_PREFIX = "web:"
+# The website loader shares DIALER_LOCK_KEY with LendingFlow (one inbound loader at a time, never one phone twice). A
+# run waits this long for the other source's run before giving up for the cycle (well inside the 5-minute cron).
+DIALER_LOCK_WAIT_SECONDS = 240
+DIALER_LOCK_POLL_SECONDS = 5
 # Loaded leads whose GHL calls are re-read live per sweep (one GHL lookup each), least recently checked first.
 DIALER_GHL_RECHECK_BATCH = 50
 
@@ -65,14 +73,12 @@ DIALER_TEMPORARY_REASONS = frozenset({
 })
 DIALER_PERMANENT_REASONS = frozenset({
     "INVALID_PHONE", "NATIONAL_DNC", "STATE_DNC", "LITIGATOR", "SUPPRESSED", "GA_NATURAL_PERSON",
-    "HOMESTEAD_OWNER_OCCUPIED", "ATTEMPT_HISTORY_EXCEEDED", "BACKFLIP_CONFLICT", "HANDLED_IN_GHL",
+    "HOMESTEAD_OWNER_OCCUPIED", "ATTEMPT_HISTORY_EXCEEDED", "BACKFLIP_CONFLICT", "HANDLED_IN_GHL", "NO_CALL_CONSENT",
     "IN_OTHER_CAMPAIGN",
 })
 
-# "Handled in GHL" = booked (GHL appointment webhook) or a connected GHL call with at least this much talk time.
-# PLACEHOLDER until Josh defines "connected" (plan item 5).
-HANDLED_MIN_TALK_SECONDS = 60
-GHL_CONNECTED_OUTCOMES = ("ghl:completed", "ghl:answered")  # call_dispositions.disposition_raw of a GHL call
+# "Handled in GHL" = booked (GHL appointment webhook) or got through in GHL by the one rule shared by every lead:
+# config.lending_compliance REACHED_CODES / REACHED_GHL_STATUSES / REACHED_MIN_TALK_SECONDS.
 
 # --- BatchDialer call results on the GHL contact (src/lending/bd_result_to_ghl.py) ----------------------------------
 GHL_TAG_CALLED_IN_BATCHDIALER = "called-in-batchdialer"
@@ -81,3 +87,9 @@ GHL_TAG_BD_CALLBACK = "bd-callback"
 GHL_TAG_BD_BOOKED = "bd-booked"
 BD_NOTE_LOOKBACK_HOURS = 24  # calls older than this are no longer written to GHL
 BD_NOTE_MAX_ATTEMPTS = 5
+
+# --- GHL call results on the BatchDialer contact card (src/lending/ghl_result_to_bd.py) -----------------------------
+# BatchDialer contacts have no tags: the marker is this card custom field (create it in BatchDialer to show it).
+BD_CARD_FIELD_GHL_CALL = "card_ghl_call"
+GHL_NOTE_LOOKBACK_HOURS = 24  # GHL calls older than this are no longer written to BatchDialer
+GHL_NOTE_MAX_ATTEMPTS = 5

@@ -14,7 +14,9 @@ from src.lending import ghl_disposition_match as m
 
 
 @pytest.fixture
-def db(lending_db):
+def db(lending_db, monkeypatch):
+    # G4: a DNC outcome now opts the number out; the real BatchDialer remover must never run from a test.
+    monkeypatch.setattr("src.lending.compliance._default_dialer_remover", lambda: None)
     conn = lending_db.connection()
     apply_gate_failed(conn)
     apply_events(conn)
