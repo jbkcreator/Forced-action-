@@ -367,3 +367,83 @@ def test_a_failed_ghl_update_is_retried_on_the_next_poll(db):
     ghl = FakeGhl()
     poll_fa_opt_outs(db, dialer_remover=FakeDialer(), ghl_dnd=ghl)
     assert ghl.calls == [PHONE]
+
+
+# ── Email-only opt-out blocks every linked phone (ADR 0028) ─────────────────
+
+
+PHONE_2 = "+18135559002"
+
+
+class _Recorder:
+    """Removal / DND recorder for the two test phones; ``fail`` makes those phones fail (real DB rows ignored)."""
+
+    def __init__(self, fail=()):
+        self.calls, self.fail = [], set(fail)
+
+    def remove(self, phone, *, reason):
+        if phone in (PHONE, PHONE_2):
+            if phone in self.fail:
+                raise RuntimeError("dialer 500")
+            self.calls.append(phone)
+
+    def dnd(self, phone):
+        if phone in (PHONE, PHONE_2):
+            self.calls.append(phone)
+        return True
+
+
+def test_email_only_opt_out_retries_and_dnds_every_linked_phone(db):
+    from src.lending.compliance import phone_hash, poll_fa_opt_outs
+    from src.services.email_suppression import suppress_contact
+
+    _ghl_column(db)
+    for p in (PHONE, PHONE_2):
+        db.execute(text("INSERT INTO lending.contacts (phone, phone_hash, email) VALUES (:p, :h, :e) "
+                        "ON CONFLICT (phone) DO UPDATE SET email = EXCLUDED.email"), {"p": p, "h": phone_hash(p), "e": EMAIL})
+    suppress_contact(db, email=EMAIL, source="unsubscribe_link")
+
+    first = _Recorder(fail={PHONE_2})
+    poll_fa_opt_outs(db, dialer_remover=first.remove, sync_ghl=False)
+    assert first.calls == [PHONE]
+    for p in (PHONE, PHONE_2):
+        assert _scalar(db, "SELECT do_not_contact FROM lending.contacts WHERE phone = :p", p=p) is True
+        assert _scalar(db, "SELECT 1 FROM lending.suppression_list WHERE phone = :p", p=p) == 1
+    [ev2] = _events(db, PHONE_2)
+    assert ev2.status == "dialer_pending"
+
+    retry, ghl = _Recorder(), _Recorder()
+    poll_fa_opt_outs(db, dialer_remover=retry.remove, ghl_dnd=ghl.dnd)
+    assert retry.calls == [PHONE_2]
+    assert sorted(ghl.calls) == [PHONE, PHONE_2]
+    assert _events(db, PHONE_2)[0].status == "complete"
+    assert _scalar(db, "SELECT count(*) FROM lending.opt_out_events WHERE fa_table = 'email_opt_outs' "
+                       "AND fa_row_id = (SELECT id FROM email_opt_outs WHERE email = :e)", e=EMAIL) == 1
+
+
+# ── GHL "DNC Request" call result: opted out at once, not after the call import ─
+
+
+def test_a_ghl_dnc_result_suppresses_before_the_call_is_imported(db):
+    from src.lending.compliance import poll_fa_opt_outs
+    from src.lending.ghl_disposition_match import parse_event, record_event
+
+    body = {"contact_id": "c-dnc", "phone": PHONE, "disposition": "DNC Request",
+            "called_at": "2026-11-04T10:00:00Z", "user": "Hari K"}
+    event_id, duplicate = record_event(db, parse_event(body), body)
+
+    assert not duplicate
+    assert _scalar(db, "SELECT 1 FROM lending.suppression_list WHERE phone = :p", p=PHONE) == 1
+    assert _scalar(db, "SELECT do_not_contact FROM lending.contacts WHERE phone = :p", p=PHONE) is True
+    [ev] = _events(db, PHONE)
+    assert (ev.channel, ev.source_ref) == ("dialer", f"ghl-disposition:{event_id}")
+    assert _scalar(db, "SELECT matched_call_id FROM lending.ghl_disposition_events WHERE id = :i", i=event_id) is None
+
+    assert ev.status == "dialer_pending" and ev.dialer_removed_at is None
+
+    dialer = FakeDialer()
+    poll_fa_opt_outs(db, dialer_remover=dialer)
+    assert dialer.removed == [PHONE] and _events(db, PHONE)[0].status == "complete"
+
+    record_event(db, parse_event(body), body)
+    assert len(_events(db, PHONE)) == 1

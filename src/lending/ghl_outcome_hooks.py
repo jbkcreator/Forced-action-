@@ -17,6 +17,9 @@ G4 (act on the result Josh picks in GHL, as for BatchDialer):
 * DNC_REQUEST: the number is opted out everywhere (``propagate_opt_out``: suppression list, do-not-contact,
   BatchDialer removal, GHL DND sync) as soon as the outcome arrives; the match stamps the call row so the CDR
   poller's DNC sweep never opts it out a second time. One opt-out per outcome (source_ref ``ghl-disposition:<id>``).
+  The stores are written in the caller's transaction, so every send and dial gate blocks the number on commit; the
+  BatchDialer removal and the GHL DND follow on the next opt-out poll (<= OPT_OUT_POLL_SECONDS), so the hook makes
+  no BatchDialer call and opens no second database connection while the caller's transaction is open.
 * Text consent: Text Consent = yes on an answered call is saved as ``on_call_yes`` (the BatchDialer rule: only a
   yes, only when someone picked up).
 * No answer / voicemail: the missed-call event is queued for the call (idempotent per call). The text itself comes
@@ -34,6 +37,7 @@ from sqlalchemy import text
 from config.lending_dispositions import ANSWERED_CODES, DNC_CODE, UNANSWERED_CODES
 from src.lending.compliance import propagate_opt_out
 from src.lending.consent import record_consent
+from src.lending.dialer_removal import DialerRemovalUndecided
 from src.lending.dispositions import queue_missed_call
 
 GHL_DNC_ACTOR = "ghl"
@@ -72,8 +76,14 @@ def dnc_source_ref(event_id: int) -> str:
     return f"ghl-disposition:{event_id}"
 
 
+def _remove_on_next_poll(phone: str, *, reason: str) -> None:
+    """Leaves the dialer removal pending for the opt-out poller's retry."""
+    raise DialerRemovalUndecided("removal runs on the next opt-out poll")
+
+
 def _opt_out(db: Any, phone: str, event_id: int, caller_name: Optional[str]) -> None:
-    propagate_opt_out(db, phone=phone, source_ref=dnc_source_ref(event_id), actor=caller_name or GHL_DNC_ACTOR)
+    propagate_opt_out(db, phone=phone, source_ref=dnc_source_ref(event_id), actor=caller_name or GHL_DNC_ACTOR,
+                      dialer_remover=_remove_on_next_poll)
 
 
 def on_ghl_outcome_received(db: Any, event: ReceivedOutcome) -> None:

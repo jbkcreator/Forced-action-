@@ -237,7 +237,14 @@ def _matched(i, code, *, phone="+18135550142", consent=None):
 
 def test_a_dnc_outcome_opts_the_number_out_as_soon_as_it_arrives(acted):
     hooks.on_ghl_outcome_received(_HookDb(), _received())
-    assert acted["opt_out"] == [{"phone": "+18135550142", "source_ref": "ghl-disposition:11", "actor": "Josh Kantor"}]
+    assert acted["opt_out"] == [{"phone": "+18135550142", "source_ref": "ghl-disposition:11", "actor": "Josh Kantor",
+                                 "dialer_remover": hooks._remove_on_next_poll}]
+
+
+def test_the_dialer_removal_is_left_to_the_opt_out_poller():
+    from src.lending.dialer_removal import DialerRemovalUndecided
+    with pytest.raises(DialerRemovalUndecided):
+        hooks._remove_on_next_poll("+18135550142", reason="opt_out")
 
 
 @pytest.mark.parametrize("code, phone", [("BOOKED", "+18135550142"), ("DNC_REQUEST", None)])
@@ -249,7 +256,8 @@ def test_other_outcomes_or_no_phone_opt_nothing_out_on_arrival(acted, code, phon
 def test_a_matched_dnc_uses_the_same_opt_out_and_stamps_the_call_so_the_sweep_skips_it(acted):
     db = _HookDb()
     hooks.on_ghl_outcome_matched(db, [_matched(7, "DNC_REQUEST", consent=True)])
-    assert acted["opt_out"] == [{"phone": "+18135550142", "source_ref": "ghl-disposition:107", "actor": "Josh Kantor"}]
+    assert acted["opt_out"] == [{"phone": "+18135550142", "source_ref": "ghl-disposition:107", "actor": "Josh Kantor",
+                                 "dialer_remover": hooks._remove_on_next_poll}]
     stamp = next(p for s, p in db.executed if s.startswith("UPDATE lending.call_dispositions SET opt_out_propagated_at"))
     assert stamp == {"ids": [7]}
     assert acted["consent"] == []  # a DNC never records consent

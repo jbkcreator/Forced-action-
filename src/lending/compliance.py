@@ -15,7 +15,7 @@ from __future__ import annotations
 import hashlib
 from collections import defaultdict
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional, Sequence
 from zoneinfo import ZoneInfo
@@ -1100,7 +1100,7 @@ def poll_fa_opt_outs(db, *, dialer_remover: Optional[DialerRemover] = None,
     return PollResult(new_opt_outs=len(opt_outs), dialer_retried=retried)
 
 
-def sync_ghl_dnd(db, ghl_dnd: Optional[Callable[[str], bool]]) -> int:
+def sync_ghl_dnd(db, ghl_dnd: Optional[Callable[[str], bool]] = None) -> int:
     """Write every opt-out not yet in GHL as do-not-disturb (new ones and retries alike),
     a bounded batch per poll. Returns how many GHL accepted."""
     if ghl_dnd is None:
@@ -1130,8 +1130,47 @@ def sync_ghl_dnd(db, ghl_dnd: Optional[Callable[[str], bool]]) -> int:
     return len(done)
 
 
+_LINKED_PHONES = text(
+    "SELECT lower(email), phone FROM lending.contacts WHERE lower(email) = ANY(:emails) AND phone IS NOT NULL "
+    "UNION SELECT lower(email), phone FROM lending.web_leads WHERE lower(email) = ANY(:emails) AND phone IS NOT NULL "
+    "UNION SELECT lower(email), phone FROM lending.lendingflow_leads "
+    "WHERE lower(email) = ANY(:emails) AND phone IS NOT NULL "
+    "UNION SELECT lower(email), phone FROM lending.partners WHERE lower(email) = ANY(:emails) AND phone IS NOT NULL"
+)
+
+
+def _with_linked_phones(db, opt_outs: list[_OptOut]) -> list[_OptOut]:
+    """An email-only opt-out also blocks every phone that email is on file with in lending (ADR 0028: an opt-out
+    blocks every channel; the web form tells leads to email optout@ to stop calls). Every linked phone gets its own
+    event, so the dialer-removal retry and the GHL DND sync (both keyed on the event's phone) cover each one. Only
+    the first keeps the FA row id (one event per FA row: the poller's dedup key). FA's stores get the phones too
+    (source DIALER_OPT_OUT_SOURCE, which the poller skips, so nothing loops)."""
+    from src.services.email_suppression import suppress_contact
+
+    emails = sorted({o.email for o in opt_outs if o.email and not o.phone})
+    if not emails:
+        return opt_outs
+    by_email: dict[str, set[str]] = defaultdict(set)
+    for email, raw in db.execute(_LINKED_PHONES, {"emails": emails}).fetchall():
+        phone = normalize_phone(raw)
+        if phone:
+            by_email[email].add(phone)
+    resolved: list[_OptOut] = []
+    for o in opt_outs:
+        linked = sorted(by_email.get(o.email, ())) if o.email and not o.phone else []
+        if not linked:
+            resolved.append(o)
+            continue
+        for i, phone in enumerate(linked):
+            suppress_contact(db, email=o.email, phone=phone, source=DIALER_OPT_OUT_SOURCE)
+            resolved.append(replace(o, phone=phone) if i == 0
+                            else replace(o, phone=phone, fa_table=None, fa_row_id=None))
+    return resolved
+
+
 def _propagate(db, opt_outs: list[_OptOut], dialer_remover: Optional[DialerRemover]) -> list[int]:
     """Batch: one statement per lending table, then one dialer call per phone."""
+    opt_outs = _with_linked_phones(db, opt_outs)
     event_ids = [
         r[0]
         for r in db.execute(

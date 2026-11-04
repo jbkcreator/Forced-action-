@@ -46,3 +46,13 @@ def test_no_ghl_sync_when_another_poller_holds_the_lock(monkeypatch, events):
     monkeypatch.setattr(poller, "sync_ghl_dnd", lambda db: events.append("ghl"))
     poller.run_once()
     assert "ghl" not in events
+
+
+def test_the_poller_calls_the_real_ghl_sync_with_its_own_arguments(monkeypatch, events, caplog):
+    """Regression: run_once called sync_ghl_dnd(db) while ghl_dnd had no default, so every cycle raised TypeError
+    and no opt-out reached GHL as DND. The real function runs here; only the GHL writer is unset."""
+    import src.lending.ghl_dnd as ghl_dnd
+    monkeypatch.setattr(poller, "poll_fa_opt_outs", lambda db, sync_ghl: PollResult(new_opt_outs=0, dialer_retried=0))
+    monkeypatch.setattr(ghl_dnd, "get_ghl_dnd", lambda: None)
+    poller.run_once()
+    assert "GHL DND sync failed" not in caplog.text
