@@ -1,10 +1,11 @@
 """BatchDialer call results on the GHL contact, so Josh sees the ISA's calls before he calls (one direction only).
 
-When a BatchDialer call ends, the GHL contact of the lead on that phone (the newest LendingFlow or website lead with a
-GHL contact id) gets the tag ``called-in-batchdialer``, plus ``bd-connected`` (someone picked up), ``bd-callback`` or
+When a BatchDialer call ends, the GHL contact on that phone gets the tag ``called-in-batchdialer``, plus ``bd-connected`` (someone picked up), ``bd-callback`` or
 ``bd-booked`` by result. With LENDING_GHL_CF_LAST_BD_CALL set, the contact's "last BatchDialer call" field is set too,
-e.g. "2026-11-02 10:14 ET, no answer, 2 BatchDialer calls". Phones with no GHL contact id in our lead tables are
-skipped. With LENDING_GHL_CF_LAST_BD_RESULT set, the GHL dropdown field "Last BatchDialer result" (options = the 10
+e.g. "2026-11-02 10:14 ET, no answer, 2 BatchDialer calls". Every lead is covered: the GHL contact id stored on the
+newest LendingFlow or website lead is used when there is one; any other loaded number (a cold list lead, pushed to GHL by
+the dialer-load sync) is found in GHL by phone (contact search), once per run. A phone with no GHL contact yet counts an
+attempt and is retried, so a contact the sync creates a few minutes later still gets the result. With LENDING_GHL_CF_LAST_BD_RESULT set, the GHL dropdown field "Last BatchDialer result" (options = the 10
 result codes) holds the latest result code, so Josh's smart lists can filter on it and a contact never shows two
 results at once; the tags stay yes/no facts. Tags go through the add-tags call only (GHL's upsert REPLACES tags) and the field through a contact update
 that carries no tags; tags are only ever added, never removed.
@@ -52,6 +53,7 @@ SessionFactory = Callable[[], AbstractContextManager[Session]]
 class GhlNoteWriter(Protocol):
     def add_tags(self, contact_id: str, tags: list[str]) -> None: ...
     def set_field(self, contact_id: str, field_id: str, value: str) -> None: ...
+    def find_contact_id(self, phone: str) -> Optional[str]: ...
 
 
 class GhlWriteError(RuntimeError):
@@ -62,7 +64,7 @@ class LendingGhlNoteWriter:
     def __init__(self, account: Any) -> None:
         self._account = account
 
-    def _call(self, step: str, method: str, path: str, body: Mapping[str, Any]) -> None:
+    def _call(self, step: str, method: str, path: str, body: Mapping[str, Any]) -> dict[str, Any]:
         from src.lending.ghl_account import ghl_headers
         from src.services import ghl_webhook
 
@@ -75,6 +77,19 @@ class LendingGhlNoteWriter:
             level = logging.ERROR if response.status_code in GHL_CONFIG_ERROR_STATUS_CODES else logging.WARNING
             logger.log(level, "[bd-result-to-ghl] %s refused: HTTP %s", step, response.status_code)
             raise GhlWriteError(f"{step}: HTTP {response.status_code}")
+        try:
+            return dict(response.json() or {})
+        except ValueError:
+            return {}
+
+    def find_contact_id(self, phone: str) -> Optional[str]:
+        """The GHL contact on this phone in the Next Deal Lending sub-account, or None."""
+        found = self._call("search contact", "POST", "/contacts/search", {
+            "locationId": self._account.location_id, "page": 1, "pageLimit": 1,
+            "filters": [{"field": "phone", "operator": "eq", "value": phone}],
+        })
+        contacts = found.get("contacts") or []
+        return str(contacts[0]["id"]) if contacts and contacts[0].get("id") else None
 
     def add_tags(self, contact_id: str, tags: list[str]) -> None:
         self._call("add tags", "POST", f"/contacts/{contact_id}/tags", {"tags": tags})
@@ -109,9 +124,9 @@ def last_call_text(ended: datetime, disposition: Optional[str], calls: int) -> s
             f"{calls} BatchDialer call{'s' if calls != 1 else ''}")
 
 
-# Due calls, locked so the follow-up thread and the sweep never write the same call at once. The GHL contact is the
-# newest LendingFlow or website lead on the phone that has one. Phones with no contact are left out before the LIMIT:
-# they are never updated, so otherwise the oldest of them would fill every sweep batch until they age out.
+# Due calls, locked so the follow-up thread and the sweep never write the same call at once. A call qualifies when its
+# phone has a lead GHL contact id or was loaded into BatchDialer (every lead we dial); anything else is left out before
+# the LIMIT so it can never fill a batch. ``ghl_contact_id`` is the newest lead's, else NULL (found by phone).
 _DUE = """
     WITH due AS (
         SELECT d.id, d.phone, d.disposition, d.call_ended_at
@@ -122,16 +137,17 @@ _DUE = """
            AND (EXISTS (SELECT 1 FROM lending.lendingflow_leads l
                          WHERE l.phone = d.phone AND l.ghl_contact_id IS NOT NULL)
                 OR EXISTS (SELECT 1 FROM lending.web_leads w
-                            WHERE w.phone = d.phone AND w.ghl_contact_id IS NOT NULL))
+                            WHERE w.phone = d.phone AND w.ghl_contact_id IS NOT NULL)
+                OR EXISTS (SELECT 1 FROM lending.dialer_load_records r WHERE r.phone = d.phone))
            {row_filter}
          ORDER BY d.call_ended_at LIMIT :limit
            FOR UPDATE OF d SKIP LOCKED)
-    SELECT due.id, due.disposition, due.call_ended_at, c.ghl_contact_id,
+    SELECT due.id, due.phone, due.disposition, due.call_ended_at, c.ghl_contact_id,
            (SELECT count(*) FROM lending.call_dispositions x
              WHERE x.phone = due.phone AND x.call_source = :source
                AND (x.direction = 'outbound' OR x.direction IS NULL)) AS calls
       FROM due
-      JOIN LATERAL (
+      LEFT JOIN LATERAL (
             SELECT ghl_contact_id FROM (
                 SELECT ghl_contact_id, received_at FROM lending.lendingflow_leads
                  WHERE phone = due.phone AND ghl_contact_id IS NOT NULL
@@ -140,6 +156,13 @@ _DUE = """
                  WHERE phone = due.phone AND ghl_contact_id IS NOT NULL) leads
              ORDER BY received_at DESC LIMIT 1) c ON true
 """
+
+
+def _contact_by_phone(writer: GhlNoteWriter, phone: str, cache: dict[str, Optional[str]]) -> Optional[str]:
+    """One GHL search per phone per run (a phone often has several due calls)."""
+    if phone not in cache:
+        cache[phone] = writer.find_contact_id(phone)
+    return cache[phone]
 
 
 def write_due_notes(db: Session, writer: GhlNoteWriter, *, row_id: Optional[int] = None,
@@ -156,15 +179,19 @@ def write_due_notes(db: Session, writer: GhlNoteWriter, *, row_id: Optional[int]
     settings = get_settings()
     field_id, result_field_id = settings.lending_ghl_cf_last_bd_call, settings.lending_ghl_cf_last_bd_result
     written = 0
+    found_by_phone: dict[str, Optional[str]] = {}
     for row in rows:
         result = result_code(row["disposition"])
         try:
-            writer.add_tags(row["ghl_contact_id"], result_tags(row["disposition"]))
+            contact_id = row["ghl_contact_id"] or _contact_by_phone(writer, row["phone"], found_by_phone)
+            if contact_id is None:
+                raise GhlWriteError("no GHL contact on this phone yet")
+            writer.add_tags(contact_id, result_tags(row["disposition"]))
             if field_id:
-                writer.set_field(row["ghl_contact_id"], field_id,
+                writer.set_field(contact_id, field_id,
                                  last_call_text(row["call_ended_at"], row["disposition"], int(row["calls"])))
             if result_field_id and result:
-                writer.set_field(row["ghl_contact_id"], result_field_id, result)
+                writer.set_field(contact_id, result_field_id, result)
         except Exception as exc:  # class only
             logger.warning("[bd-result-to-ghl] call row %s not written to GHL: %s", row["id"], type(exc).__name__)
             db.execute(text("UPDATE lending.call_dispositions SET ghl_note_attempts = ghl_note_attempts + 1 "

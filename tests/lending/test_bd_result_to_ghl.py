@@ -17,10 +17,16 @@ ENDED = NOW - timedelta(minutes=2)  # 11:58 ET
 
 
 class FakeWriter:
-    def __init__(self, fail=False):
+    def __init__(self, fail=False, by_phone=None):
         self.tags: list[tuple[str, list[str]]] = []
         self.fields: list[tuple[str, str, str]] = []
         self.fail = fail
+        self.by_phone = dict(by_phone or {})
+        self.searches: list[str] = []
+
+    def find_contact_id(self, phone):
+        self.searches.append(phone)
+        return self.by_phone.get(phone)
 
     def add_tags(self, contact_id, tags):
         if self.fail:
@@ -39,6 +45,8 @@ def db(web_leads_db, monkeypatch):
     conn = web_leads_db.connection()
     apply_lendingflow(conn)
     apply_dialer(conn)
+    from src.lending.models import LendingDialerLoadRecord
+    LendingDialerLoadRecord.__table__.create(conn, checkfirst=True)
     monkeypatch.setattr(notes.get_settings(), "lending_ghl_cf_last_bd_call", "cf-last-call")
     return web_leads_db
 
@@ -175,3 +183,44 @@ def test_no_result_yet_leaves_the_dropdown_alone(db, monkeypatch):
                                             ("DATA_NURTURE_ONLY", "NURTURE"), (None, None), ("SOMETHING_ELSE", None)])
 def test_result_code_maps_legacy_codes_and_drops_unknown_ones(code, expected):
     assert notes.result_code(code) == expected
+
+
+def _cold(db, pool="partners"):
+    """A list lead: loaded into BatchDialer, no LendingFlow or website lead (its GHL contact came from the load sync)."""
+    phone = f"+1813555{uuid.uuid4().int % 10_000:04d}"
+    db.execute(text("INSERT INTO lending.dialer_load_records (run_id, pool, source_record_ref, phone, phone_hash, "
+                    "campaign_tag, dialer_contact_id) VALUES ('t', :pool, :ref, :p, 'h', 'Partners', '77')"),
+               {"pool": pool, "ref": f"list4:{uuid.uuid4().hex}", "p": phone})
+    return phone
+
+
+def test_a_cold_lead_is_found_in_ghl_by_phone_and_tagged(db):
+    phone = _cold(db)
+    _call(db, phone, disposition="CONNECTED_NOT_INTERESTED")
+    writer = FakeWriter(by_phone={phone: "ghl-cold-1"})
+    assert notes.write_due_notes(db, writer, now=NOW) == 1
+    assert writer.tags == [("ghl-cold-1", ["called-in-batchdialer", "bd-connected"])]
+
+
+def test_a_cold_lead_not_yet_in_ghl_is_retried_until_the_sync_creates_it(db):
+    phone = _cold(db)
+    _call(db, phone)
+    assert notes.write_due_notes(db, FakeWriter(), now=NOW) == 0
+    assert notes.write_due_notes(db, FakeWriter(by_phone={phone: "ghl-cold-2"}), now=NOW) == 1
+
+
+def test_one_ghl_search_per_phone_per_run(db):
+    phone = _cold(db)
+    _call(db, phone)
+    _call(db, phone, ended=ENDED - timedelta(minutes=10))
+    writer = FakeWriter(by_phone={phone: "ghl-cold-3"})
+    assert notes.write_due_notes(db, writer, now=NOW) == 2
+    assert writer.searches == [phone]
+
+
+def test_a_lead_contact_id_is_used_without_a_search(db):
+    phone = _lead(db)
+    _call(db, phone)
+    writer = FakeWriter()
+    notes.write_due_notes(db, writer, now=NOW)
+    assert writer.searches == [] and writer.tags[0][0] == "ghl-9"
