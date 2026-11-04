@@ -470,3 +470,24 @@ def test_the_migration_marks_existing_leads_preexisting_and_reruns_cleanly(lendi
     statuses = dict(conn.execute(text("SELECT id, dialer_status FROM lending.lendingflow_leads WHERE id IN (:a, :b)"),
                                  {"a": lead, "b": new}).all())
     assert statuses == {lead: "preexisting", new: "pending"}
+
+
+@pytest.mark.parametrize("code, handled", [("CALLBACK_REQUESTED", True), ("BOOKED", True), ("NURTURE", True),
+                                           ("CONNECTED_NOT_INTERESTED", True), ("NO_ANSWER", False),
+                                           ("LEFT_VOICEMAIL", False)])
+def test_a_ghl_result_code_counts_by_the_same_rule_as_every_lead(db, code, handled):
+    """One rule for all leads: a short GHL call whose result says Josh got through (callback, booked...) hands the
+    LendingFlow lead to GHL, exactly as for a cold lead; a no-answer or voicemail result does not."""
+    lead_id, phone = _lead(db, contact="ghl-r")
+    db.execute(text("INSERT INTO lending.call_dispositions (dialer_call_id, call_source, direction, phone, "
+                    "disposition, disposition_raw, talk_duration_sec, call_started_at, call_ended_at, raw_event) "
+                    "VALUES (:id, 'ghl', 'outbound', :p, :d, 'ghl:completed', 20, :s, :s, CAST('{}' AS jsonb))"),
+               {"id": f"ghl:{uuid.uuid4().hex}", "p": phone, "d": code, "s": NOON_ET - timedelta(minutes=20)})
+    dialer = FakeDialer()
+    _run(db, dialer=dialer, calls=Calls())
+    status = _lead_row(db, lead_id)
+    if handled:
+        assert dialer.upserts == [] and (status["dialer_status"], status["dialer_block_reason"]) == \
+            ("blocked", "HANDLED_IN_GHL")
+    else:
+        assert status["dialer_status"] == "loaded"

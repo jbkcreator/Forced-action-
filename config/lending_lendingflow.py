@@ -74,10 +74,8 @@ DIALER_PERMANENT_REASONS = frozenset({
     "IN_OTHER_CAMPAIGN",
 })
 
-# "Handled in GHL" = booked (GHL appointment webhook) or a connected GHL call with at least this much talk time.
-# PLACEHOLDER until Josh defines "connected" (plan item 5).
-HANDLED_MIN_TALK_SECONDS = 60
-GHL_CONNECTED_OUTCOMES = ("ghl:completed", "ghl:answered")  # call_dispositions.disposition_raw of a GHL call
+# "Handled in GHL" = booked (GHL appointment webhook) or got through in GHL by the one rule shared by every lead:
+# config.lending_compliance REACHED_CODES / REACHED_GHL_STATUSES / REACHED_MIN_TALK_SECONDS.
 
 # --- BatchDialer call results on the GHL contact (src/lending/bd_result_to_ghl.py) ----------------------------------
 GHL_TAG_CALLED_IN_BATCHDIALER = "called-in-batchdialer"

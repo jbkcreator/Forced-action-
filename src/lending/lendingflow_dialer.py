@@ -21,7 +21,9 @@ temporary reason (calling hours, attempt cap, scrub, halt) keeps the lead pendin
 DIALER_RETRY_MINUTES, so a lead that arrives at 8:30pm is loaded the next morning.
 
 Handled in GHL = booked (``POST /webhooks/lending/ghl-appointment`` / ``booking-confirmed``) or a connected GHL call
-(GHL_CONNECTED_OUTCOMES with at least HANDLED_MIN_TALK_SECONDS of talk). The BatchDialer contact is deleted
+the same "got through" rule as every lead (``src/lending/ghl_calling.py``): a live-conversation result (REACHED_CODES:
+connected, callback, DNC request, nurture, booked) or, with no result posted, GHL's answered status with
+REACHED_MIN_TALK_SECONDS of talk. The BatchDialer contact is deleted
 (RemovalReason.HANDLED_IN_GHL) and its load row deactivated. No ``dialer_holds`` row is opened, so the dialer sweep
 never restores it. The loader and the webhook share no lock, and both orders end with the contact removed: the loader
 commits the load row and only then re-reads ``handled_in_ghl_at``; the webhook commits the stamp and only then looks
@@ -41,7 +43,7 @@ from typing import Any, Callable, Iterator, Mapping, Optional
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from config.lending_compliance import RemovalReason
+from config.lending_compliance import REACHED_CODES, REACHED_GHL_STATUSES, REACHED_MIN_TALK_SECONDS, RemovalReason
 from config.lending_dialer import CAMPAIGN_HOOKS, POOL_CAMPAIGN_TAGS
 from config.lending_followup import CALL_SOURCE_GHL
 from config.lending_lendingflow import (
@@ -55,8 +57,6 @@ from config.lending_lendingflow import (
     DIALER_REF_PREFIX,
     DIALER_RETRY_MINUTES,
     DIALER_TEMPORARY_REASONS,
-    GHL_CONNECTED_OUTCOMES,
-    HANDLED_MIN_TALK_SECONDS,
     WEB_DIALER_LOCK_KEY,
     WEB_DIALER_POOL,
     WEB_DIALER_REF_PREFIX,
@@ -243,8 +243,10 @@ _CONNECTED_IN_GHL = """
      WHERE l.handled_in_ghl_at IS NULL AND l.dialer_status IN ('pending', 'loading', 'loaded', 'unconfirmed')
        {phone_filter}
        AND EXISTS (SELECT 1 FROM lending.call_dispositions d
-                    WHERE d.phone = l.phone AND d.call_source = :ghl AND d.disposition_raw = ANY(:connected)
-                      AND COALESCE(d.talk_duration_sec, 0) >= :min_talk AND d.call_started_at >= l.received_at)
+                    WHERE d.phone = l.phone AND d.call_source = :ghl AND d.call_started_at >= l.received_at
+                      AND (d.disposition = ANY(:codes)
+                           OR (d.disposition IS NULL AND d.disposition_raw = ANY(:connected)
+                               AND COALESCE(d.talk_duration_sec, 0) >= :min_talk)))
 """
 
 _ACTIVE_SOURCE_ROW = text(
@@ -265,8 +267,8 @@ def mark_handled_in_ghl(db: Session, phone: str, *, reason: str, now: Optional[d
 
 def _connected_phones(db: Session, source: LeadSource, phone: Optional[str] = None) -> list[str]:
     sql = _CONNECTED_IN_GHL.format(t=source.table, phone_filter="AND l.phone = :phone" if phone else "")
-    params: dict[str, Any] = {"ghl": CALL_SOURCE_GHL, "connected": list(GHL_CONNECTED_OUTCOMES),
-                              "min_talk": HANDLED_MIN_TALK_SECONDS}
+    params: dict[str, Any] = {"ghl": CALL_SOURCE_GHL, "codes": list(REACHED_CODES),
+                              "connected": list(REACHED_GHL_STATUSES), "min_talk": REACHED_MIN_TALK_SECONDS}
     if phone:
         params["phone"] = phone
     return [row[0] for row in db.execute(text(sql), params)]
