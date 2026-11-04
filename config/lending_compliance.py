@@ -149,6 +149,7 @@ GHL_LOAD_SYNC_POOL_TAGS: dict[str, str] = {
 }
 GHL_LOAD_SYNC_BATCH_SIZE = 200       # rows per run
 GHL_LOAD_SYNC_MAX_ATTEMPTS = 5       # then status 'failed' and one ops notice
+GHL_LOAD_SYNC_HALT_CHECK_EVERY = 10  # rows between emergency-halt rechecks inside a run
 GHL_LOAD_SYNC_LOCK_KEY = 7_302_020_807
 GHL_CALL_GATE_PAGE_SIZE = 100
 GHL_CALL_GATE_MAX_PAGES = 20             # per tag per run (2,000 contacts a list)
@@ -252,5 +253,5 @@ def validate_lending_compliance_config() -> None:
         raise ValueError("GHL_CALL_LIST_TAGS must be distinct and must not contain GHL_DO_NOT_CALL_NOW_TAG")
     if not set(GHL_LOAD_SYNC_POOL_TAGS.values()) <= set(GHL_CALL_LIST_TAGS):
         raise ValueError("GHL_LOAD_SYNC_POOL_TAGS must map pools to tags in GHL_CALL_LIST_TAGS")
-    if GHL_LOAD_SYNC_BATCH_SIZE < 1 or GHL_LOAD_SYNC_MAX_ATTEMPTS < 1:
-        raise ValueError("GHL load sync batch size and max attempts must be positive")
+    if min(GHL_LOAD_SYNC_BATCH_SIZE, GHL_LOAD_SYNC_MAX_ATTEMPTS, GHL_LOAD_SYNC_HALT_CHECK_EVERY) < 1:
+        raise ValueError("GHL load sync batch size, max attempts and halt check interval must be positive")

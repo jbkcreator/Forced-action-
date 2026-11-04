@@ -1,9 +1,9 @@
 """GHL sync columns on ``lending.dialer_load_records`` (src/lending/ghl_load_sync.py).
 
 Adds ``ghl_sync_status`` / ``ghl_sync_attempts`` / ``ghl_synced_at`` / ``ghl_sync_error`` and a partial index on
-the rows still to sync. Backfill: active ``verified_maturity`` and ``wholesalers`` rows are already in GHL (one-off
-push 2026-11-04 and the wholesaler load's own push), so they are marked ``pushed`` and never pushed again; every
-other active row is left NULL and the sync pushes it once enabled.
+the rows still to sync. Backfill: active ``verified_maturity`` and ``wholesalers`` rows loaded before 2026-11-04 are already in GHL
+(one-off push 2026-11-04 and the wholesaler load's own push), so they are marked ``pushed``; the cutoff keeps a
+rerun from marking any later load. Every other active row is left NULL and the sync pushes it once enabled.
 
 Idempotent: ``ADD COLUMN IF NOT EXISTS``, ``CREATE INDEX IF NOT EXISTS``, backfill only touches NULL rows.
 Run BEFORE deploying the code (the dialer load ORM model reads the new columns).
@@ -25,6 +25,8 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 ALREADY_IN_GHL_POOLS = ("verified_maturity", "wholesalers")
+# Only loads from before the sync existed were pushed by hand; a rerun must never mark a later load as pushed.
+ALREADY_IN_GHL_LOADED_BEFORE = "2026-11-04T00:00:00+00:00"
 
 
 def apply(engine: Engine | None = None, schema: str = LENDING_SCHEMA) -> None:
@@ -46,8 +48,8 @@ def apply(engine: Engine | None = None, schema: str = LENDING_SCHEMA) -> None:
         ))
         backfilled = conn.execute(text(
             f"UPDATE {table} SET ghl_sync_status = 'pushed', ghl_synced_at = now() "
-            "WHERE active AND ghl_sync_status IS NULL AND pool = ANY(:pools)"
-        ), {"pools": list(ALREADY_IN_GHL_POOLS)}).rowcount
+            "WHERE active AND ghl_sync_status IS NULL AND pool = ANY(:pools) AND loaded_at < CAST(:before AS timestamptz)"
+        ), {"pools": list(ALREADY_IN_GHL_POOLS), "before": ALREADY_IN_GHL_LOADED_BEFORE}).rowcount
     logger.info("apply_lending_dialer_load_ghl_sync complete (schema=%s, backfilled=%d).", schema, backfilled)
 
 

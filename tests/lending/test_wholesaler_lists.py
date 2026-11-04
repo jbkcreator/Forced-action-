@@ -8,7 +8,7 @@ import pytest
 
 from config import lending_queues as q
 from src.lending.dialer_load import LoadReport
-from src.lending.wholesaler_lists import ghl_tags, parse_wholesaler_csv, push_to_ghl, wholesaler_ref
+from src.lending.wholesaler_lists import parse_wholesaler_csv, wholesaler_ref
 from src.tasks import lending_wholesaler_load as task
 
 CSV = """source,name,entity_name,phone,state,email
@@ -38,29 +38,6 @@ def test_parse_rejects_csv_without_required_columns():
         parse_wholesaler_csv("name,phone\nA,8135550101\n")
 
 
-def test_ghl_tags_are_cold_source_and_state():
-    record = parse_wholesaler_csv(CSV).records[0]
-    assert ghl_tags(record) == ["ndl-wholesaler", "ndl-cold", "ndl-src-sunbiz", "ndl-state-fl"]
-
-
-class FakeSink:
-    def __init__(self, fail_refs=()):
-        self.pushed, self.fail_refs = [], set(fail_refs)
-
-    def push(self, record, tags):
-        if record["source_record_ref"] in self.fail_refs:
-            raise RuntimeError("boom")
-        self.pushed.append((record["source_record_ref"], tags))
-
-
-def test_push_to_ghl_counts_failures_and_keeps_going():
-    records = parse_wholesaler_csv(CSV).records
-    sink = FakeSink(fail_refs={records[0]["source_record_ref"]})
-    result = push_to_ghl(records, sink)
-    assert result.pushed == 1 and result.failed == [records[0]["source_record_ref"]]
-    assert sink.pushed[0][0] == records[1]["source_record_ref"]
-
-
 # --- task ---------------------------------------------------------------------
 
 @pytest.fixture
@@ -72,7 +49,7 @@ def csv_path(tmp_path):
 
 @pytest.fixture
 def harness(monkeypatch):
-    calls = {"loads": [], "sink": FakeSink()}
+    calls = {"loads": []}
 
     def fake_load(records, session, *, run_id, dry_run, **kw):
         calls["loads"].append({"dry_run": dry_run, "records": list(records), **kw})
@@ -93,9 +70,7 @@ def harness(monkeypatch):
     monkeypatch.setattr(task, "run_dialer_load", fake_load)
     monkeypatch.setattr(task, "get_db_context", fake_db)
     monkeypatch.setattr(task.dialer_port, "get_dialer", lambda: object())
-    monkeypatch.setattr(task, "ghl_sink", lambda: calls["sink"])
     monkeypatch.setattr(task, "active_wholesaler_total", lambda db: calls.get("total", 1500))
-    monkeypatch.setattr(task, "mark_pushed", lambda db, refs: calls.setdefault("marked", []).extend(refs))
     return calls
 
 
@@ -103,7 +78,7 @@ def test_dry_run_is_default_scrubs_nothing_and_pushes_nothing(csv_path, harness)
     assert task.main(["--input", str(csv_path)]) == 0
     (load,) = harness["loads"]
     assert load["dry_run"] is True and "scrubber" not in load
-    assert harness["rolled_back"] and harness["sink"].pushed == []
+    assert harness["rolled_back"]
 
 
 def test_live_refuses_without_matching_scrub_confirmation(csv_path, harness):
@@ -112,19 +87,16 @@ def test_live_refuses_without_matching_scrub_confirmation(csv_path, harness):
     assert all(load["dry_run"] for load in harness["loads"])
 
 
-def test_live_with_confirmation_loads_wholesalers_and_tags_only_loaded_numbers_in_ghl(csv_path, harness):
+def test_live_with_confirmation_loads_wholesalers(csv_path, harness):
     assert task.main(["--input", str(csv_path), "--live", "--confirm-scrub", "1"]) == 0
     dry, load = harness["loads"]
     assert dry["dry_run"] is True
     assert load["dry_run"] is False and load["scrubber"] is not None
     assert {r["pool"] for r in load["records"]} == {q.WHOLESALERS}
-    assert harness["sink"].pushed == [(wholesaler_ref("sunbiz", "+18135550101"),
-                                       ["ndl-wholesaler", "ndl-cold", "ndl-src-sunbiz", "ndl-state-fl"])]
-    assert harness["marked"] == [wholesaler_ref("sunbiz", "+18135550101")]
 
 
-def test_live_refuses_without_ghl_account(csv_path, harness, monkeypatch):
-    monkeypatch.setattr(task, "ghl_sink", lambda: None)
+def test_live_refuses_without_dialer(csv_path, harness, monkeypatch):
+    monkeypatch.setattr(task.dialer_port, "get_dialer", lambda: None)
     assert task.main(["--input", str(csv_path), "--live", "--confirm-scrub", "1"]) == task.EXIT_REFUSED
     assert all(load["dry_run"] for load in harness["loads"])
 
@@ -140,7 +112,7 @@ def test_ghl_transport_error_names_the_step(monkeypatch):
     monkeypatch.setattr(ghl_webhook, "_ghl_request", boom)
     record = parse_wholesaler_csv(CSV).records[0]
     with pytest.raises(RuntimeError, match="contact upsert: ConnectionError"):
-        GhlWholesalerSink(GhlAccount("k", "loc")).push(record, ghl_tags(record))
+        GhlWholesalerSink(GhlAccount("k", "loc")).push(record, ["ndl-wholesaler", "ndl-cold"])
 
 
 def test_live_run_below_cumulative_target_exits_with_below_target(csv_path, harness):
@@ -171,7 +143,7 @@ def test_ghl_contact_is_pushed_with_every_messaging_channel_do_not_disturb_and_c
 
     monkeypatch.setattr(ghl_webhook, "_ghl_request", record_request)
     record = parse_wholesaler_csv(CSV).records[0]
-    GhlWholesalerSink(GhlAccount("k", "loc")).push(record, ghl_tags(record))
+    GhlWholesalerSink(GhlAccount("k", "loc")).push(record, ["ndl-wholesaler", "ndl-cold"])
     (upsert_url, upsert), (tags_url, tags) = calls
     assert upsert_url.endswith("/contacts/upsert") and tags_url.endswith("/contacts/ct1/tags")
     dnd = upsert["dndSettings"]
