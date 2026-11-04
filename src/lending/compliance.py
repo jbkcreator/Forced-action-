@@ -1100,7 +1100,7 @@ def poll_fa_opt_outs(db, *, dialer_remover: Optional[DialerRemover] = None,
     return PollResult(new_opt_outs=len(opt_outs), dialer_retried=retried)
 
 
-def sync_ghl_dnd(db, ghl_dnd: Optional[Callable[[str], bool]]) -> int:
+def sync_ghl_dnd(db, ghl_dnd: Optional[Callable[[str], bool]] = None) -> int:
     """Write every opt-out not yet in GHL as do-not-disturb (new ones and retries alike),
     a bounded batch per poll. Returns how many GHL accepted."""
     if ghl_dnd is None:
