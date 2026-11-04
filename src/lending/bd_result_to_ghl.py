@@ -7,7 +7,8 @@ newest LendingFlow or website lead is used when there is one; any other loaded n
 the dialer-load sync) is found in GHL by phone (contact search), once per run. A phone with no GHL contact yet counts an
 attempt and is retried, so a contact the sync creates a few minutes later still gets the result. With LENDING_GHL_CF_LAST_BD_RESULT set, the GHL dropdown field "Last BatchDialer result" (options = the 10
 result codes) holds the latest result code, so Josh's smart lists can filter on it and a contact never shows two
-results at once; the tags stay yes/no facts. Tags go through the add-tags call only (GHL's upsert REPLACES tags) and the field through a contact update
+results at once; the tags stay yes/no facts. Both "last" fields are written only from the phone's latest
+BatchDialer call, so a retried older call (its first write failed) adds its tags but never overwrites a newer result. Tags go through the add-tags call only (GHL's upsert REPLACES tags) and the field through a contact update
 that carries no tags; tags are only ever added, never removed.
 
 A call is written once, and again when its result code changes (callers often set the code during wrap-up, after the
@@ -143,6 +144,9 @@ _DUE = """
          ORDER BY d.call_ended_at LIMIT :limit
            FOR UPDATE OF d SKIP LOCKED)
     SELECT due.id, due.phone, due.disposition, due.call_ended_at, c.ghl_contact_id,
+           due.id = (SELECT x.id FROM lending.call_dispositions x
+                      WHERE x.phone = due.phone AND x.call_source = :source AND x.call_ended_at IS NOT NULL
+                      ORDER BY x.call_ended_at DESC, x.id DESC LIMIT 1) AS is_latest,
            (SELECT count(*) FROM lending.call_dispositions x
              WHERE x.phone = due.phone AND x.call_source = :source
                AND (x.direction = 'outbound' OR x.direction IS NULL)) AS calls
@@ -187,10 +191,11 @@ def write_due_notes(db: Session, writer: GhlNoteWriter, *, row_id: Optional[int]
             if contact_id is None:
                 raise GhlWriteError("no GHL contact on this phone yet")
             writer.add_tags(contact_id, result_tags(row["disposition"]))
-            if field_id:
+            # The "last" fields come only from the phone's latest call: a retried older call never overwrites them.
+            if field_id and row["is_latest"]:
                 writer.set_field(contact_id, field_id,
                                  last_call_text(row["call_ended_at"], row["disposition"], int(row["calls"])))
-            if result_field_id and result:
+            if result_field_id and result and row["is_latest"]:
                 writer.set_field(contact_id, result_field_id, result)
         except Exception as exc:  # class only
             logger.warning("[bd-result-to-ghl] call row %s not written to GHL: %s", row["id"], type(exc).__name__)

@@ -169,3 +169,51 @@ def test_the_migration_marks_existing_website_leads_preexisting(web_leads_db):
     statuses = dict(conn.execute(text("SELECT id, dialer_status FROM lending.web_leads WHERE id IN (:a, :b)"),
                                  {"a": old, "b": new}).all())
     assert statuses == {old: "preexisting", new: "pending"}
+
+
+def test_both_inbound_loaders_share_one_lock():
+    """Review finding: separate locks let the LendingFlow and website sweeps push one phone at once."""
+    assert lfd.LENDINGFLOW.lock_key == lfd.WEBSITE.lock_key
+
+
+def test_a_phone_already_loaded_by_lendingflow_is_not_pushed_again_by_the_website_loader(db):
+    _, phone = _web_lead(db)
+    db.execute(text("INSERT INTO lending.dialer_load_records (run_id, pool, source_record_ref, phone, phone_hash, "
+                    "campaign_tag, dialer_contact_id) VALUES ('lf', 'lendingflow', 'lendingflow:x', :p, 'h', "
+                    "'LendingFlow', '55')"), {"p": phone})
+    dialer = FakeDialer()
+    _run(db, dialer=dialer, scrubber=Scrubber())
+    assert dialer.upserts == []  # one external contact per phone
+
+
+class _LockDb:
+    """Answers pg_try_advisory_xact_lock from a script: busy, busy, then free."""
+
+    def __init__(self, answers):
+        self.answers, self.tries, self.rolled_back = list(answers), 0, False
+
+    def execute(self, statement, params=None):
+        self.tries += 1
+        value = self.answers.pop(0) if self.answers else True
+        return type("R", (), {"scalar": lambda _self: value})()
+
+    def rollback(self):
+        self.rolled_back = True
+
+
+def test_a_run_waits_for_the_other_source_then_takes_the_lock(monkeypatch):
+    monkeypatch.setattr(lfd.time, "sleep", lambda seconds: None)
+    lock_db = _LockDb([False, False, True])
+    with lfd._single_run(lambda: _same(lock_db), wait_seconds=60) as held:
+        assert held is True
+    assert lock_db.tries == 3 and lock_db.rolled_back
+
+
+def test_a_run_gives_up_for_the_cycle_after_the_wait(monkeypatch):
+    clock = iter([0.0, 0.0, 100.0])
+    monkeypatch.setattr(lfd.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(lfd.time, "sleep", lambda seconds: None)
+    lock_db = _LockDb([False, False, False])
+    with lfd._single_run(lambda: _same(lock_db), wait_seconds=60) as held:
+        assert held is False
+    assert lock_db.rolled_back

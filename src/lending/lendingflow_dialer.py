@@ -35,6 +35,7 @@ One dialer step at a time: a transaction advisory lock (DIALER_LOCK_KEY) is held
 from __future__ import annotations
 
 import logging
+import time
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -50,6 +51,8 @@ from config.lending_lendingflow import (
     DIALER_BATCH_SIZE,
     DIALER_GHL_RECHECK_BATCH,
     DIALER_LOCK_KEY,
+    DIALER_LOCK_POLL_SECONDS,
+    DIALER_LOCK_WAIT_SECONDS,
     DIALER_MAX_FAILURES,
     DIALER_MAX_LEAD_AGE_DAYS,
     DIALER_PERMANENT_REASONS,
@@ -57,7 +60,6 @@ from config.lending_lendingflow import (
     DIALER_REF_PREFIX,
     DIALER_RETRY_MINUTES,
     DIALER_TEMPORARY_REASONS,
-    WEB_DIALER_LOCK_KEY,
     WEB_DIALER_POOL,
     WEB_DIALER_REF_PREFIX,
 )
@@ -215,7 +217,9 @@ LENDINGFLOW = LeadSource(
 )
 WEBSITE = LeadSource(
     label="web-lead-dialer", table="lending.web_leads", ref_prefix=WEB_DIALER_REF_PREFIX, ref_key="id",
-    pool=WEB_DIALER_POOL, campaign=WEB_CAMPAIGN, lock_key=WEB_DIALER_LOCK_KEY, dnc_scrub=True,
+    # The same lock as LendingFlow: the two loaders must never push one phone at once (each checks for an active load
+    # row of another campaign, then pushes; run concurrently, both could pass the check and both create a contact).
+    pool=WEB_DIALER_POOL, campaign=WEB_CAMPAIGN, lock_key=DIALER_LOCK_KEY, dnc_scrub=True,
     claim_filter="AND call_consent", blocked_filter="(suppressed OR NOT call_consent)",
     blocked_reason="NO_CALL_CONSENT",
     returning=("id, phone, email, name, loan_amount, deal_type, property_state, property_address, received_at, "
@@ -593,12 +597,23 @@ def _recheck_loaded_in_ghl(db: Session, read_calls: CallReader, now: datetime, s
 # --------------------------------------------------------------------------- the sweep step
 
 @contextmanager
-def _single_run(sessions: SessionFactory, lock_key: int = DIALER_LOCK_KEY) -> Iterator[bool]:
-    """Yields whether this run holds the dialer-step lock. The lock lives in its own never-committed transaction, so
-    the work session's commits do not release it; leaving rolls it back and frees the lock."""
+def _single_run(sessions: SessionFactory, lock_key: int = DIALER_LOCK_KEY,
+                wait_seconds: float = DIALER_LOCK_WAIT_SECONDS) -> Iterator[bool]:
+    """Yields whether this run holds the inbound-dialer lock, shared by every source. The lock lives in its own
+    never-committed transaction, so the work session's commits do not release it; leaving rolls it back and frees it.
+    A run waits up to ``wait_seconds`` for another source's run to finish (both sweeps start on the same minute, so
+    skipping straight away would starve one of them), then gives up for this cycle."""
+    deadline = time.monotonic() + wait_seconds
     with sessions() as lock_db:
         try:
-            yield bool(lock_db.execute(text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": lock_key}).scalar())
+            while True:
+                if lock_db.execute(text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": lock_key}).scalar():
+                    yield True
+                    break
+                if time.monotonic() >= deadline:
+                    yield False
+                    break
+                time.sleep(DIALER_LOCK_POLL_SECONDS)
         finally:
             lock_db.rollback()
 

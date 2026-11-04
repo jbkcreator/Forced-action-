@@ -58,7 +58,10 @@ DIALER_LOCK_KEY = 7_302_020_810
 # call-consent box, and the Tracerfy DNC scrub (unlike LendingFlow).
 WEB_DIALER_POOL = "website"
 WEB_DIALER_REF_PREFIX = "web:"
-WEB_DIALER_LOCK_KEY = 7_302_020_811
+# The website loader shares DIALER_LOCK_KEY with LendingFlow (one inbound loader at a time, never one phone twice). A
+# run waits this long for the other source's run before giving up for the cycle (well inside the 5-minute cron).
+DIALER_LOCK_WAIT_SECONDS = 240
+DIALER_LOCK_POLL_SECONDS = 5
 # Loaded leads whose GHL calls are re-read live per sweep (one GHL lookup each), least recently checked first.
 DIALER_GHL_RECHECK_BATCH = 50
 

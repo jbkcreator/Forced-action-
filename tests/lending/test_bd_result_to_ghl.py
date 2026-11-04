@@ -224,3 +224,19 @@ def test_a_lead_contact_id_is_used_without_a_search(db):
     writer = FakeWriter()
     notes.write_due_notes(db, writer, now=NOW)
     assert writer.searches == [] and writer.tags[0][0] == "ghl-9"
+
+
+def test_a_retried_older_call_never_overwrites_the_newer_result(db, monkeypatch):
+    """Review finding: the older call's first write failed, the newer one succeeded; retrying the older call adds its
+    tags but leaves "Last BatchDialer result" and "Last BatchDialer call" on the newer call."""
+    monkeypatch.setattr(notes.get_settings(), "lending_ghl_cf_last_bd_result", "cf-last-result")
+    phone = _lead(db)
+    older = _call(db, phone, disposition="NO_ANSWER", ended=ENDED - timedelta(minutes=30))
+    newer = _call(db, phone, disposition="CALLBACK_REQUESTED", ended=ENDED)
+    db.execute(text("UPDATE lending.call_dispositions SET ghl_note_attempts = 1 WHERE id = :id"), {"id": older})
+    db.execute(text("UPDATE lending.call_dispositions SET ghl_note_at = :t, ghl_note_disposition = 'CALLBACK_REQUESTED' "
+                    "WHERE id = :id"), {"t": NOW, "id": newer})
+    writer = FakeWriter()
+    assert notes.write_due_notes(db, writer, now=NOW) == 1
+    assert writer.tags == [("ghl-9", ["called-in-batchdialer"])]  # the older call's tags still land
+    assert writer.fields == []  # neither "last" field is touched by the older call

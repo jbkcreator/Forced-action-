@@ -5,7 +5,8 @@ BatchDialer contacts have no tags, so the marker is the card custom field ``card
 e.g. "2026-11-04 10:15 ET, no answer, 2 GHL calls". It is written on the phone's active BatchDialer contact (an active
 ``lending.dialer_load_records`` row) when a GHL call for that phone is stored in ``lending.call_dispositions``
 (``call_source = 'ghl'``: the 15-minute GHL call import, and the GHL outcome webhook that adds its result code). A call is
-written once, and again when its result code changes. Only that one custom field changes: ``set_custom_fields`` reads
+written once, and again when its result code changes; only the phone's latest GHL call is written, so a retried
+older call never overwrites a newer one. Only that one custom field changes: ``set_custom_fields`` reads
 the contact and sends every other field back as it was (BatchDialer's update is a full replace).
 
 Runs from the LendingFlow sweep (every 5 minutes); a failed write is retried up to GHL_NOTE_MAX_ATTEMPTS times within
@@ -66,6 +67,9 @@ _DUE = text("""
          ORDER BY d.call_ended_at LIMIT :limit
            FOR UPDATE OF d SKIP LOCKED)
     SELECT due.id, due.disposition, due.disposition_raw, due.call_ended_at, r.dialer_contact_id,
+           due.id = (SELECT x.id FROM lending.call_dispositions x
+                      WHERE x.phone = due.phone AND x.call_source = :source AND x.call_ended_at IS NOT NULL
+                      ORDER BY x.call_ended_at DESC, x.id DESC LIMIT 1) AS is_latest,
            (SELECT count(*) FROM lending.call_dispositions x
              WHERE x.phone = due.phone AND x.call_source = :source) AS calls
       FROM due
@@ -85,7 +89,9 @@ def write_due_card_notes(db: Session, writer: CardFieldWriter, *, now: Optional[
     for row in rows:
         line = ghl_call_text(row["call_ended_at"], row["disposition"], row["disposition_raw"], int(row["calls"]))
         try:
-            writer.set_custom_fields(row["dialer_contact_id"], {BD_CARD_FIELD_GHL_CALL: line})
+            # Only the phone's latest GHL call writes the card: a retried older call is marked done without a write.
+            if row["is_latest"]:
+                writer.set_custom_fields(row["dialer_contact_id"], {BD_CARD_FIELD_GHL_CALL: line})
         except Exception as exc:  # class only: dialer errors can carry request detail
             logger.warning("[ghl-result-to-bd] call row %s not written to BatchDialer: %s", row["id"],
                            type(exc).__name__)

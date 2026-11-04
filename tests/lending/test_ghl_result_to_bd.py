@@ -129,3 +129,19 @@ def test_the_sweep_entry_point_uses_its_own_session(db, monkeypatch):
         yield db
 
     assert cards.write_card_notes(sessions=same, writer_factory=lambda: writer) == 1
+
+
+def test_a_retried_older_ghl_call_never_overwrites_the_card(db):
+    """Review finding, the other direction: only the phone's latest GHL call writes card_ghl_call."""
+    phone = _phone()
+    _loaded(db, phone, "903")
+    older = _ghl_call(db, phone, disposition="NO_ANSWER", ended=ENDED - timedelta(minutes=30))
+    newer = _ghl_call(db, phone, disposition="CALLBACK_REQUESTED", ended=ENDED)
+    db.execute(text("UPDATE lending.call_dispositions SET bd_note_attempts = 1 WHERE id = :id"), {"id": older})
+    db.execute(text("UPDATE lending.call_dispositions SET bd_note_at = :t, bd_note_disposition = 'CALLBACK_REQUESTED' "
+                    "WHERE id = :id"), {"t": NOW, "id": newer})
+    writer = FakeWriter()
+    cards.write_due_card_notes(db, writer, now=NOW)
+    assert writer.writes == []
+    assert db.execute(text("SELECT bd_note_at IS NOT NULL FROM lending.call_dispositions WHERE id = :id"),
+                      {"id": older}).scalar()  # settled, so it is not retried again
