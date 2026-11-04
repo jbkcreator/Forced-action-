@@ -190,12 +190,19 @@ class LendingDialerLoadRecord(LendingBase):
     loaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
     deactivated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     deactivation_reason: Mapped[Optional[str]] = mapped_column(String(40))
+    # GHL contact sync (src/lending/ghl_load_sync.py): NULL status = not yet handled.
+    ghl_sync_status: Mapped[Optional[str]] = mapped_column(String(20))  # pushed|skipped_warm|skipped_suppressed|skipped_unmapped|failed
+    ghl_sync_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    ghl_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    ghl_sync_error: Mapped[Optional[str]] = mapped_column(String(200))
 
     __table_args__ = (
         Index("uq_lending_dialer_load_records_active_phone", "phone", unique=True,
               postgresql_where=text("active")),
         Index("idx_lending_dialer_load_records_phone_loaded", "phone", "loaded_at"),
         Index("idx_lending_dialer_load_records_run", "run_id"),
+        Index("idx_lending_dialer_load_records_ghl_pending", "id",
+              postgresql_where=text("active AND ghl_sync_status IS NULL")),
         Index("idx_lending_dialer_load_records_contact", "dialer_contact_id",
               postgresql_where=text("dialer_contact_id IS NOT NULL")),
         CheckConstraint("active OR deactivated_at IS NOT NULL", name="ck_lending_dialer_load_deactivated_at"),

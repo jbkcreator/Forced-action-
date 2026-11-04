@@ -95,6 +95,7 @@ def harness(monkeypatch):
     monkeypatch.setattr(task.dialer_port, "get_dialer", lambda: object())
     monkeypatch.setattr(task, "ghl_sink", lambda: calls["sink"])
     monkeypatch.setattr(task, "active_wholesaler_total", lambda db: calls.get("total", 1500))
+    monkeypatch.setattr(task, "mark_pushed", lambda db, refs: calls.setdefault("marked", []).extend(refs))
     return calls
 
 
@@ -119,6 +120,7 @@ def test_live_with_confirmation_loads_wholesalers_and_tags_only_loaded_numbers_i
     assert {r["pool"] for r in load["records"]} == {q.WHOLESALERS}
     assert harness["sink"].pushed == [(wholesaler_ref("sunbiz", "+18135550101"),
                                        ["ndl-wholesaler", "ndl-cold", "ndl-src-sunbiz", "ndl-state-fl"])]
+    assert harness["marked"] == [wholesaler_ref("sunbiz", "+18135550101")]
 
 
 def test_live_refuses_without_ghl_account(csv_path, harness, monkeypatch):

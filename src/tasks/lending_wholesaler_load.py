@@ -31,6 +31,7 @@ from src.lending import dialer_port
 from src.lending.compliance import tracerfy_scrub
 from src.lending.dial_order import sort_for_load
 from src.lending.dialer_load import LoadRefused, run_dialer_load
+from src.lending.ghl_load_sync import mark_pushed
 from src.lending.wholesaler_lists import ghl_sink, parse_wholesaler_csv, push_to_ghl
 
 logger = logging.getLogger(__name__)
@@ -102,7 +103,12 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_REFUSED
         total = active_wholesaler_total(session)
     loaded = set(report.loaded_refs)
-    ghl = push_to_ghl([r for r in records if r["source_record_ref"] in loaded], sink)
+    to_push = [r for r in records if r["source_record_ref"] in loaded]
+    ghl = push_to_ghl(to_push, sink)
+    failed = set(ghl.failed)
+    with get_db_context() as session:
+        mark_pushed(session, [r["source_record_ref"] for r in to_push if r["source_record_ref"] not in failed])
+        session.commit()
     logger.info("[wholesaler-load] report: %s", json.dumps(report.as_dict(), indent=2))
     logger.info("[wholesaler-load] dialer loaded %d this run; GHL tagged %d, failed %d; wholesaler total live %d",
                 report.loaded, ghl.pushed, len(ghl.failed), total)

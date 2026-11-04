@@ -136,6 +136,20 @@ GHL_CALL_LIST_TAGS = (
     "ndl-partner",
     "ndl-transaction-ready",
 )
+# BatchDialer load -> GHL sync (src/lending/ghl_load_sync.py): dialer pool -> the call-list tag its contacts get.
+# A pool missing here is never pushed (logged), so a new pool cannot reach GHL unmapped.
+GHL_LOAD_SYNC_POOL_TAGS: dict[str, str] = {
+    "verified_maturity": "ndl-verified-maturity",
+    "transaction_ready": "ndl-transaction-ready",
+    "builders": "ndl-builder",
+    "partners": "ndl-partner",
+    "wholesalers": "ndl-wholesaler",
+    "nurture": "ndl-nurture",
+    "lendingflow": "lendingflow",  # LendingFlow phones are warm, so the sync skips them; mapped for completeness
+}
+GHL_LOAD_SYNC_BATCH_SIZE = 200       # rows per run
+GHL_LOAD_SYNC_MAX_ATTEMPTS = 5       # then status 'failed' and one ops notice
+GHL_LOAD_SYNC_LOCK_KEY = 7_302_020_807
 GHL_CALL_GATE_PAGE_SIZE = 100
 GHL_CALL_GATE_MAX_PAGES = 20             # per tag per run (2,000 contacts a list)
 GHL_CALL_GATE_ALERT_AFTER_MINUTES = 10   # ops alert once no run has succeeded for this long
@@ -236,3 +250,7 @@ def validate_lending_compliance_config() -> None:
         raise ValueError("GHL_LIST_RESCRUB_AFTER_DAYS must be positive and below DNC_SCRUB_MAX_AGE_DAYS")
     if GHL_DO_NOT_CALL_NOW_TAG in GHL_CALL_LIST_TAGS or len(set(GHL_CALL_LIST_TAGS)) != len(GHL_CALL_LIST_TAGS):
         raise ValueError("GHL_CALL_LIST_TAGS must be distinct and must not contain GHL_DO_NOT_CALL_NOW_TAG")
+    if not set(GHL_LOAD_SYNC_POOL_TAGS.values()) <= set(GHL_CALL_LIST_TAGS):
+        raise ValueError("GHL_LOAD_SYNC_POOL_TAGS must map pools to tags in GHL_CALL_LIST_TAGS")
+    if GHL_LOAD_SYNC_BATCH_SIZE < 1 or GHL_LOAD_SYNC_MAX_ATTEMPTS < 1:
+        raise ValueError("GHL load sync batch size and max attempts must be positive")
