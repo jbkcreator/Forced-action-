@@ -1139,37 +1139,38 @@ _LINKED_PHONES = text(
 )
 
 
-def _with_linked_phones(db, opt_outs: list[_OptOut]) -> tuple[list[_OptOut], set[str]]:
+def _with_linked_phones(db, opt_outs: list[_OptOut]) -> list[_OptOut]:
     """An email-only opt-out also blocks every phone that email is on file with in lending (ADR 0028: an opt-out
-    blocks every channel; the web form tells leads to email optout@ to stop calls). The event takes the first
-    linked phone; the rest come back as extra phones to suppress. FA's stores get the phones too (source
-    DIALER_OPT_OUT_SOURCE, which the poller skips, so nothing loops)."""
+    blocks every channel; the web form tells leads to email optout@ to stop calls). Every linked phone gets its own
+    event, so the dialer-removal retry and the GHL DND sync (both keyed on the event's phone) cover each one. Only
+    the first keeps the FA row id (one event per FA row: the poller's dedup key). FA's stores get the phones too
+    (source DIALER_OPT_OUT_SOURCE, which the poller skips, so nothing loops)."""
     from src.services.email_suppression import suppress_contact
 
     emails = sorted({o.email for o in opt_outs if o.email and not o.phone})
     if not emails:
-        return opt_outs, set()
+        return opt_outs
     by_email: dict[str, set[str]] = defaultdict(set)
     for email, raw in db.execute(_LINKED_PHONES, {"emails": emails}).fetchall():
         phone = normalize_phone(raw)
         if phone:
             by_email[email].add(phone)
     resolved: list[_OptOut] = []
-    extra: set[str] = set()
     for o in opt_outs:
         linked = sorted(by_email.get(o.email, ())) if o.email and not o.phone else []
-        for phone in linked:
+        if not linked:
+            resolved.append(o)
+            continue
+        for i, phone in enumerate(linked):
             suppress_contact(db, email=o.email, phone=phone, source=DIALER_OPT_OUT_SOURCE)
-        if linked:
-            o = replace(o, phone=linked[0])
-            extra.update(linked[1:])
-        resolved.append(o)
-    return resolved, extra
+            resolved.append(replace(o, phone=phone) if i == 0
+                            else replace(o, phone=phone, fa_table=None, fa_row_id=None))
+    return resolved
 
 
 def _propagate(db, opt_outs: list[_OptOut], dialer_remover: Optional[DialerRemover]) -> list[int]:
     """Batch: one statement per lending table, then one dialer call per phone."""
-    opt_outs, extra_phones = _with_linked_phones(db, opt_outs)
+    opt_outs = _with_linked_phones(db, opt_outs)
     event_ids = [
         r[0]
         for r in db.execute(
@@ -1212,13 +1213,9 @@ def _propagate(db, opt_outs: list[_OptOut], dialer_remover: Optional[DialerRemov
             for o in opt_outs
             for kind, value in (("phone", o.phone), ("email", o.email))
             if value
-        ] + [
-            {"phone": p, "email": None, "reason": SuppressionReason.OPT_OUT.value,
-             "channel": OptOutChannel.EMAIL.value, "source_ref": None}
-            for p in sorted(extra_phones)
         ],
     )
-    phones = sorted({o.phone for o in opt_outs if o.phone} | extra_phones)
+    phones = sorted({o.phone for o in opt_outs if o.phone})
     if phones:
         db.execute(
             text(

@@ -57,7 +57,8 @@ def test_email_only_opt_out_suppresses_and_removes_every_linked_phone(fa_writes)
     compliance._propagate(db, [_email_opt_out()], lambda phone, reason: removed.append(phone))
 
     (event,) = db.params_for("INSERT INTO lending.opt_out_events")
-    assert event["hashes"] == [compliance.phone_hash(PHONE)]
+    assert event["hashes"] == [compliance.phone_hash(PHONE), compliance.phone_hash(OTHER)]
+    assert event["fa_tables"] == [None, None] and event["refs"] == ["email:abc", "email:abc"]
     (suppression,) = db.params_for("INSERT INTO lending.suppression_list")
     assert {r["phone"] for r in suppression if r["phone"]} == {PHONE, OTHER}
     assert {r["email"] for r in suppression if r["email"]} == {EMAIL}
@@ -81,3 +82,12 @@ def test_opt_out_with_a_phone_skips_the_lookup(fa_writes):
     compliance._propagate(db, [opt_out], lambda phone, reason: None)
     assert not any("lending.partners" in sql for sql, _ in db.calls)
     assert db.params_for("INSERT INTO lending.contacts")[0]["phones"] == [PHONE]
+
+
+def test_only_the_first_linked_phone_keeps_the_fa_row_id(fa_writes):
+    db = FakeDb([(EMAIL, PHONE), (EMAIL, OTHER)])
+    polled = compliance._OptOut(OptOutChannel.EMAIL, None, EMAIL, "unsubscribe_link", None,
+                                datetime.now(timezone.utc), "email_opt_outs", 7)
+    compliance._propagate(db, [polled], lambda phone, reason: None)
+    (event,) = db.params_for("INSERT INTO lending.opt_out_events")
+    assert event["fa_tables"] == ["email_opt_outs", None] and event["fa_ids"] == [7, None]
