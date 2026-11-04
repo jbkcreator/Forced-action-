@@ -240,3 +240,79 @@ def test_a_retried_older_call_never_overwrites_the_newer_result(db, monkeypatch)
     assert notes.write_due_notes(db, writer, now=NOW) == 1
     assert writer.tags == [("ghl-9", ["called-in-batchdialer"])]  # the older call's tags still land
     assert writer.fields == []  # neither "last" field is touched by the older call
+
+
+def test_two_concurrent_writes_for_one_phone_always_leave_the_newer_result_on_top(monkeypatch):
+    """Review finding (race): the older call's save checks "latest", then stalls in GHL; meanwhile a newer call is
+    saved. Without the per-phone lock the newer write lands first and the older one overwrites it. With the lock, the
+    newer writer waits for the older one's commit, re-checks, and writes last. Two real connections, committed rows
+    (cleaned up), on the throwaway test database."""
+    import os
+    import threading
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+
+    url = os.environ.get("DATABASE_URL", "")
+    try:
+        engine = create_engine(url, pool_size=4)
+        with engine.begin() as conn:
+            from migrations.apply_lending_lendingflow import apply_to as apply_lendingflow
+            from migrations.apply_lending_web_leads import apply_to as apply_web
+            from src.lending.models import LendingDialerLoadRecord
+            apply_web(conn)
+            apply_lendingflow(conn)
+            LendingDialerLoadRecord.__table__.create(conn, checkfirst=True)
+    except Exception:
+        pytest.skip("needs a reachable throwaway Postgres")
+    monkeypatch.setattr(notes.get_settings(), "lending_ghl_cf_last_bd_result", "cf-last-result")
+    monkeypatch.setattr(notes.get_settings(), "lending_ghl_cf_last_bd_call", None)
+    phone = f"+1813556{uuid.uuid4().int % 10_000:04d}"
+    now = datetime.now(timezone.utc)
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO lending.lendingflow_leads (vendor_lead_id, dedupe_hash, phone, ghl_status, "
+                          "ghl_contact_id, raw_payload) VALUES (:v, :h, :p, 'synced', 'ghl-race', CAST('{}' AS jsonb))"),
+                     {"v": f"race-{uuid.uuid4().hex}", "h": uuid.uuid4().hex, "p": phone})
+        older = conn.execute(text(
+            "INSERT INTO lending.call_dispositions (dialer_call_id, call_source, direction, phone, disposition, "
+            "call_ended_at, raw_event) VALUES (:id, 'batchdialer', 'outbound', :p, 'NO_ANSWER', :e, CAST('{}' AS jsonb)) "
+            "RETURNING id"), {"id": f"race-{uuid.uuid4().hex}", "p": phone, "e": now - timedelta(minutes=10)}).scalar()
+
+    writes: list[str] = []
+    older_checked, release_older = threading.Event(), threading.Event()
+
+    class SlowWriter(FakeWriter):
+        def set_field(self, contact_id, field_id, value):
+            if value == "NO_ANSWER":  # the older save: it has passed the check and holds the lock; stall "in GHL"
+                older_checked.set()
+                release_older.wait(10)
+            writes.append(value)
+
+    def save(row_id):
+        with Session(bind=engine) as session:
+            notes.write_due_notes(session, SlowWriter(), row_id=row_id, now=datetime.now(timezone.utc))
+
+    newer = None
+    try:
+        a = threading.Thread(target=save, args=(older,))
+        a.start()
+        assert older_checked.wait(10)
+        with engine.begin() as conn:  # the newer call arrives while the older save is still in flight
+            newer = conn.execute(text(
+                "INSERT INTO lending.call_dispositions (dialer_call_id, call_source, direction, phone, disposition, "
+                "call_ended_at, raw_event) VALUES (:id, 'batchdialer', 'outbound', :p, 'CALLBACK_REQUESTED', :e, "
+                "CAST('{}' AS jsonb)) RETURNING id"), {"id": f"race-{uuid.uuid4().hex}", "p": phone, "e": now}).scalar()
+        b = threading.Thread(target=save, args=(newer,))
+        b.start()
+        b.join(1.5)
+        assert b.is_alive()  # the newer save waits on the phone's write lock
+        release_older.set()
+        a.join(10)
+        b.join(10)
+        assert writes == ["NO_ANSWER", "CALLBACK_REQUESTED"]  # the newer result lands last, so it stays on top
+    finally:
+        release_older.set()
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM lending.call_dispositions WHERE phone = :p"), {"p": phone})
+            conn.execute(text("DELETE FROM lending.lendingflow_leads WHERE phone = :p"), {"p": phone})
+        engine.dispose()

@@ -8,7 +8,8 @@ the dialer-load sync) is found in GHL by phone (contact search), once per run. A
 attempt and is retried, so a contact the sync creates a few minutes later still gets the result. With LENDING_GHL_CF_LAST_BD_RESULT set, the GHL dropdown field "Last BatchDialer result" (options = the 10
 result codes) holds the latest result code, so Josh's smart lists can filter on it and a contact never shows two
 results at once; the tags stay yes/no facts. Both "last" fields are written only from the phone's latest
-BatchDialer call, so a retried older call (its first write failed) adds its tags but never overwrites a newer result. Tags go through the add-tags call only (GHL's upsert REPLACES tags) and the field through a contact update
+BatchDialer call, checked under a per-phone write lock (``call_note_lock``), so neither a retried older call nor one
+written at the same moment as a newer call can leave an older result on top; the older call's tags still land. Tags go through the add-tags call only (GHL's upsert REPLACES tags) and the field through a contact update
 that carries no tags; tags are only ever added, never removed.
 
 A call is written once, and again when its result code changes (callers often set the code during wrap-up, after the
@@ -40,6 +41,7 @@ from config.lending_lendingflow import (
     GHL_TAG_CALLED_IN_BATCHDIALER,
 )
 from config.settings import get_settings
+from src.lending.call_note_lock import BD_TO_GHL_LOCK_SPACE, lock_phone_and_check_latest
 from src.lending.global_halt import is_globally_halted
 
 logger = logging.getLogger(__name__)
@@ -144,9 +146,6 @@ _DUE = """
          ORDER BY d.call_ended_at LIMIT :limit
            FOR UPDATE OF d SKIP LOCKED)
     SELECT due.id, due.phone, due.disposition, due.call_ended_at, c.ghl_contact_id,
-           due.id = (SELECT x.id FROM lending.call_dispositions x
-                      WHERE x.phone = due.phone AND x.call_source = :source AND x.call_ended_at IS NOT NULL
-                      ORDER BY x.call_ended_at DESC, x.id DESC LIMIT 1) AS is_latest,
            (SELECT count(*) FROM lending.call_dispositions x
              WHERE x.phone = due.phone AND x.call_source = :source
                AND (x.direction = 'outbound' OR x.direction IS NULL)) AS calls
@@ -171,15 +170,16 @@ def _contact_by_phone(writer: GhlNoteWriter, phone: str, cache: dict[str, Option
 
 def write_due_notes(db: Session, writer: GhlNoteWriter, *, row_id: Optional[int] = None,
                     now: Optional[datetime] = None) -> int:
-    """Write the due BatchDialer results (one call with ``row_id``, else a sweep batch) to GHL. Each call is
-    committed on its own. Returns how many were written. Never raises per call."""
+    """Write the due BatchDialer results (one call with ``row_id``, else a sweep batch) to GHL, committed once at the
+    end (which also releases the per-phone write locks). Returns how many were written. Never raises per call."""
     now = now or datetime.now(timezone.utc)
     params: dict[str, Any] = {"source": CALL_SOURCE_BATCHDIALER, "since": now - timedelta(hours=BD_NOTE_LOOKBACK_HOURS),
                               "max_attempts": BD_NOTE_MAX_ATTEMPTS, "limit": 1 if row_id is not None else SWEEP_LIMIT}
     if row_id is not None:
         params["row_id"] = row_id
     sql = text(_DUE.format(row_filter="AND d.id = :row_id" if row_id is not None else ""))
-    rows = db.execute(sql, params).mappings().all()
+    # Phone order: per-phone write locks are always taken in the same order, so two batches never deadlock.
+    rows = sorted(db.execute(sql, params).mappings().all(), key=lambda r: (r["phone"], r["call_ended_at"], r["id"]))
     settings = get_settings()
     field_id, result_field_id = settings.lending_ghl_cf_last_bd_call, settings.lending_ghl_cf_last_bd_result
     written = 0
@@ -191,11 +191,14 @@ def write_due_notes(db: Session, writer: GhlNoteWriter, *, row_id: Optional[int]
             if contact_id is None:
                 raise GhlWriteError("no GHL contact on this phone yet")
             writer.add_tags(contact_id, result_tags(row["disposition"]))
-            # The "last" fields come only from the phone's latest call: a retried older call never overwrites them.
-            if field_id and row["is_latest"]:
+            # The "last" fields come only from the phone's latest call, checked under the phone's write lock (held
+            # until the commit below), so a concurrent older write can never land after a newer one (call_note_lock).
+            latest = (field_id or result_field_id) and lock_phone_and_check_latest(
+                db, space=BD_TO_GHL_LOCK_SPACE, phone=row["phone"], source=CALL_SOURCE_BATCHDIALER, row_id=row["id"])
+            if field_id and latest:
                 writer.set_field(contact_id, field_id,
                                  last_call_text(row["call_ended_at"], row["disposition"], int(row["calls"])))
-            if result_field_id and result and row["is_latest"]:
+            if result_field_id and result and latest:
                 writer.set_field(contact_id, result_field_id, result)
         except Exception as exc:  # class only
             logger.warning("[bd-result-to-ghl] call row %s not written to GHL: %s", row["id"], type(exc).__name__)

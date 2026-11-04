@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 from config.lending_followup import CALL_SOURCE_GHL
 from config.lending_lendingflow import BD_CARD_FIELD_GHL_CALL, GHL_NOTE_LOOKBACK_HOURS, GHL_NOTE_MAX_ATTEMPTS
 from config.settings import get_settings
+from src.lending.call_note_lock import GHL_TO_BD_LOCK_SPACE, lock_phone_and_check_latest
 from src.lending.global_halt import is_globally_halted
 
 logger = logging.getLogger(__name__)
@@ -66,10 +67,7 @@ _DUE = text("""
                         WHERE r.active AND r.phone = d.phone AND r.dialer_contact_id IS NOT NULL)
          ORDER BY d.call_ended_at LIMIT :limit
            FOR UPDATE OF d SKIP LOCKED)
-    SELECT due.id, due.disposition, due.disposition_raw, due.call_ended_at, r.dialer_contact_id,
-           due.id = (SELECT x.id FROM lending.call_dispositions x
-                      WHERE x.phone = due.phone AND x.call_source = :source AND x.call_ended_at IS NOT NULL
-                      ORDER BY x.call_ended_at DESC, x.id DESC LIMIT 1) AS is_latest,
+    SELECT due.id, due.phone, due.disposition, due.disposition_raw, due.call_ended_at, r.dialer_contact_id,
            (SELECT count(*) FROM lending.call_dispositions x
              WHERE x.phone = due.phone AND x.call_source = :source) AS calls
       FROM due
@@ -85,12 +83,16 @@ def write_due_card_notes(db: Session, writer: CardFieldWriter, *, now: Optional[
     now = now or datetime.now(timezone.utc)
     rows = db.execute(_DUE, {"source": CALL_SOURCE_GHL, "since": now - timedelta(hours=GHL_NOTE_LOOKBACK_HOURS),
                              "max_attempts": GHL_NOTE_MAX_ATTEMPTS, "limit": SWEEP_LIMIT}).mappings().all()
+    # Phone order: per-phone write locks are always taken in the same order, so two batches never deadlock.
+    rows = sorted(rows, key=lambda r: (r["phone"], r["call_ended_at"], r["id"]))
     written = 0
     for row in rows:
         line = ghl_call_text(row["call_ended_at"], row["disposition"], row["disposition_raw"], int(row["calls"]))
         try:
-            # Only the phone's latest GHL call writes the card: a retried older call is marked done without a write.
-            if row["is_latest"]:
+            # Only the phone's latest GHL call writes the card, checked under the phone's write lock (held until the
+            # commit below): an older call, retried or concurrent, is marked done without overwriting a newer one.
+            if lock_phone_and_check_latest(db, space=GHL_TO_BD_LOCK_SPACE, phone=row["phone"],
+                                           source=CALL_SOURCE_GHL, row_id=row["id"]):
                 writer.set_custom_fields(row["dialer_contact_id"], {BD_CARD_FIELD_GHL_CALL: line})
         except Exception as exc:  # class only: dialer errors can carry request detail
             logger.warning("[ghl-result-to-bd] call row %s not written to BatchDialer: %s", row["id"],
