@@ -10,7 +10,7 @@ Two calls, both made inside the caller's database transaction and inside a savep
 
 Rules for an implementation: never commit or roll back (the caller commits; a hook error rolls back only the hook's
 savepoint and is logged by class, so the outcome and the match are always kept); keep it fast (the webhook waits on
-it); never log phone numbers. The defaults do nothing. The matcher looks the functions up on this module at call
+it); never log phone numbers. on_ghl_outcome_received opts a DNC_REQUEST out at once; on_ghl_outcome_matched does nothing. The matcher looks the functions up on this module at call
 time, so replacing them here (or monkeypatching them in tests) is enough.
 """
 from __future__ import annotations
@@ -18,6 +18,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
+
+from config.lending_compliance import OptOutChannel
+from config.lending_dispositions import DNC_CODE
+from src.lending.dialer_removal import DialerRemovalUndecided
 
 
 @dataclass(frozen=True)
@@ -46,9 +50,28 @@ class MatchedOutcome:
     text_consent: Optional[bool]
 
 
+GHL_OUTCOME_REF_PREFIX = "ghl_outcome:"
+
+
+def _remove_on_next_poll(phone: str, *, reason: str) -> None:
+    """Leaves the dialer removal pending: the opt-out poller retries it within OPT_OUT_POLL_SECONDS, so the webhook
+    makes no BatchDialer call and opens no second database connection while its transaction is open."""
+    raise DialerRemovalUndecided("removal runs on the next opt-out poll")
+
+
 def on_ghl_outcome_received(db: Any, event: ReceivedOutcome) -> None:
-    """A new GHL call outcome was stored (not yet matched to its call). Default: nothing."""
-    return None
+    """A new GHL call outcome was stored (not yet matched to its call). A DNC_REQUEST opts the number out at once:
+    suppression list, do-not-contact and FA stores in this transaction, so every send and dial gate blocks the number
+    as soon as the webhook commits; the dialer removal and GHL DND follow on the next opt-out poll (channel DIALER, a
+    verbal decline, so the DND is written; channel GHL would assume GHL already holds it). Idempotent per stored
+    outcome. The call import still matches the outcome later and the DNC retry sweep opts the number out again;
+    every store is keyed on the number, so that second pass adds nothing new."""
+    if event.code != DNC_CODE or not event.phone:
+        return
+    from src.lending.compliance import propagate_opt_out
+
+    propagate_opt_out(db, phone=event.phone, source_ref=f"{GHL_OUTCOME_REF_PREFIX}{event.event_id}",
+                      actor=event.caller_name, dialer_remover=_remove_on_next_poll, channel=OptOutChannel.DIALER)
 
 
 def on_ghl_outcome_matched(db: Any, matched: list[MatchedOutcome]) -> None:

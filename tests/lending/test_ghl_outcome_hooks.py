@@ -203,6 +203,37 @@ def test_the_pending_read_selects_contact_and_text_consent():
     assert "e.contact_id" in pending and "raw_event->>'text_consent'" in pending
 
 
-def test_default_hooks_are_no_ops():
-    assert hooks.on_ghl_outcome_received(object(), None) is None
+def _received(code: str, phone: str | None = "+18135550123") -> hooks.ReceivedOutcome:
+    return hooks.ReceivedOutcome(event_id=42, contact_id="c1", phone=phone, code=code, caller_name="Hari K",
+                                 called_at=NOW, received_at=NOW, gate_failed=None, text_consent=None)
+
+
+@pytest.fixture
+def opt_outs(monkeypatch):
+    from src.lending import compliance
+    calls = []
+    monkeypatch.setattr(compliance, "propagate_opt_out", lambda db, **kw: calls.append(kw) or 1)
+    return calls
+
+
+def test_a_dnc_outcome_opts_the_number_out_at_once(opt_outs):
+    from config.lending_compliance import OptOutChannel
+    from src.lending.dialer_removal import DialerRemovalUndecided
+    hooks.on_ghl_outcome_received(object(), _received("DNC_REQUEST"))
+    [kw] = opt_outs
+    remover = kw.pop("dialer_remover")
+    assert kw == {"phone": "+18135550123", "source_ref": "ghl_outcome:42", "actor": "Hari K",
+                  "channel": OptOutChannel.DIALER}
+    with pytest.raises(DialerRemovalUndecided):  # removal left to the opt-out poller
+        remover("+18135550123", reason="opt_out")
+
+
+@pytest.mark.parametrize("code,phone", [("NO_ANSWER", "+18135550123"), ("CONNECTED_NOT_INTERESTED", "+18135550123"),
+                                        ("DNC_REQUEST", None)])
+def test_other_outcomes_and_a_dnc_without_phone_do_nothing(opt_outs, code, phone):
+    hooks.on_ghl_outcome_received(object(), _received(code, phone))
+    assert opt_outs == []
+
+
+def test_the_matched_hook_is_a_no_op():
     assert hooks.on_ghl_outcome_matched(object(), []) is None
