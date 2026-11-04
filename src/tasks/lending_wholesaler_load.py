@@ -1,10 +1,10 @@
-"""Split T-11: load FL wholesaler lists into the Wholesalers queue (BatchDialer campaign "Wholesalers") and tag them in GHL.
+"""Split T-11: load FL wholesaler lists into the Wholesalers queue (BatchDialer campaign "Wholesalers") (GHL contacts and tags come from src.lending.ghl_load_sync).
 
 Dry run by default: the CSV is parsed and every dialer-load gate runs, but nothing is
-sent to Tracerfy, BatchDialer or GHL and the transaction is rolled back. A live run
+sent to Tracerfy or BatchDialer and the transaction is rolled back. A live run
 needs ``--confirm-scrub N`` where N is the number of phones the run would send to the
 Tracerfy DNC scrub (the dry run prints it), so no credits are spent unconfirmed.
-Numbers failing the DNC or suppression scrub are never loaded or pushed to GHL.
+Numbers failing the DNC or suppression scrub are never loaded, so never reach GHL.
 
 Usage:
     python -m src.tasks.lending_wholesaler_load --input wholesalers.csv
@@ -12,7 +12,7 @@ Usage:
 
 CSV columns: source (sunbiz|hunter), phone, state; optional name, entity_name, email.
 
-Exit codes: 0 ok, 1 some pushes failed, 2 bad CSV, 3 refused (no dialer/GHL, load refused),
+Exit codes: 0 ok, 1 some dialer loads failed, 2 bad CSV, 3 refused (no dialer, load refused),
 4 scrub count not confirmed, 6 loaded fine but wholesaler total still below the 1,500 target.
 """
 from __future__ import annotations
@@ -31,7 +31,7 @@ from src.lending import dialer_port
 from src.lending.compliance import tracerfy_scrub
 from src.lending.dial_order import sort_for_load
 from src.lending.dialer_load import LoadRefused, run_dialer_load
-from src.lending.wholesaler_lists import ghl_sink, parse_wholesaler_csv, push_to_ghl
+from src.lending.wholesaler_lists import parse_wholesaler_csv
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +54,7 @@ def active_wholesaler_total(db) -> int:
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Load FL wholesaler lists into the Wholesalers queue.")
     parser.add_argument("--input", type=Path, required=True, help="wholesaler CSV")
-    parser.add_argument("--live", action="store_true", help="scrub, load the dialer, push to GHL (default: dry run)")
+    parser.add_argument("--live", action="store_true", help="scrub and load the dialer (default: dry run)")
     parser.add_argument("--confirm-scrub", type=int, help="phones you approve sending to the Tracerfy DNC scrub")
     parser.add_argument("--run-id", help="identifier for this run (default: timestamped)")
     return parser.parse_args(argv)
@@ -87,9 +87,8 @@ def main(argv: list[str] | None = None) -> int:
                      "re-run with --confirm-scrub %d once approved", scrub_count, scrub_count)
         return EXIT_SCRUB_NOT_CONFIRMED
     dialer = dialer_port.get_dialer()
-    sink = ghl_sink()
-    if dialer is None or sink is None:
-        logger.error("[wholesaler-load] refused: dialer (BATCHDIALER_API_KEY) or lending GHL account not configured")
+    if dialer is None:
+        logger.error("[wholesaler-load] refused: dialer (BATCHDIALER_API_KEY) not configured")
         return EXIT_REFUSED
 
     with get_db_context() as session:
@@ -101,12 +100,10 @@ def main(argv: list[str] | None = None) -> int:
             logger.error("[wholesaler-load] refused: %s", exc)
             return EXIT_REFUSED
         total = active_wholesaler_total(session)
-    loaded = set(report.loaded_refs)
-    ghl = push_to_ghl([r for r in records if r["source_record_ref"] in loaded], sink)
     logger.info("[wholesaler-load] report: %s", json.dumps(report.as_dict(), indent=2))
-    logger.info("[wholesaler-load] dialer loaded %d this run; GHL tagged %d, failed %d; wholesaler total live %d",
-                report.loaded, ghl.pushed, len(ghl.failed), total)
-    if report.failed or ghl.failed:
+    logger.info("[wholesaler-load] dialer loaded %d this run (GHL via src.lending.ghl_load_sync); "
+                "wholesaler total live %d", report.loaded, total)
+    if report.failed:
         return EXIT_PUSH_FAILED
     if total < DIALABLE_TARGET:
         logger.warning("[wholesaler-load] %d wholesaler numbers live, below the %d target (Section 0)",

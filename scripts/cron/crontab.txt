@@ -1269,6 +1269,11 @@ COUNTY_ID=hillsborough
 # LENDING_GHL_CALL_GATE_ENABLED=true. Dry check first: PYTHONPATH=. python -m src.lending.ghl_call_gate --dry-run
 * * * * * $PROJECT/scripts/cron/run.sh src.lending.ghl_call_gate
 
+# Lending BatchDialer load -> GHL sync: every active dialer load (any pool, any loader) is upserted into the NDL GHL
+# account as a cold contact tagged with its call-list tag; warm/suppressed/unmapped skipped. Idle until
+# LENDING_GHL_LOAD_SYNC_ENABLED=true. Dry check first: PYTHONPATH=. python -m src.lending.ghl_load_sync --dry-run
+*/5 * * * * $PROJECT/scripts/cron/run.sh src.lending.ghl_load_sync
+
 # Lending DNC scrub of numbers on Josh's GHL lists (website and cold leads, never LendingFlow): scrubbed within the
 # hour, rescrubbed before the 7-day window ends. 1 Tracerfy credit per number, capped per run by
 # LENDING_GHL_LIST_SCRUB_MAX_CREDITS; exit 4 = cap reached. Idle until LENDING_GHL_LIST_SCRUB_ENABLED=true.

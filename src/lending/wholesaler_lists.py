@@ -1,8 +1,8 @@
-"""Split T-11: parse FL wholesaler pulls into Partners pool records and tag them in GHL.
+"""Split T-11: parse FL wholesaler pulls into Partners pool records; the NDL GHL contact sink.
 
 Scrubbing (National/State DNC via Tracerfy, internal suppression) and the dialer load
-belong to ``run_dialer_load``; this module only builds the records and pushes the numbers
-that load actually reached to GHL, tagged by source and state.
+belong to ``run_dialer_load``; GHL contacts for every loaded number (tagged by pool, source
+and state) are pushed by ``src.lending.ghl_load_sync`` through ``GhlWholesalerSink``.
 """
 from __future__ import annotations
 
@@ -11,13 +11,10 @@ import io
 import logging
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional, Protocol, Sequence
+from typing import Any, Mapping, Optional, Protocol
 
-from config.lending_compliance import COLD_LEAD_DND_CHANNELS, COLD_LEAD_DND_MESSAGE, GHL_TAG_COLD_LEAD
+from config.lending_compliance import COLD_LEAD_DND_CHANNELS, COLD_LEAD_DND_MESSAGE
 from config.lending_wholesalers import (
-    GHL_TAG_SOURCE_PREFIX,
-    GHL_TAG_STATE_PREFIX,
-    GHL_TAG_WHOLESALER,
     REQUIRED_COLUMNS,
     WHOLESALER_SOURCE_TAGS,
     WHOLESALER_STATES,
@@ -84,40 +81,8 @@ def parse_wholesaler_csv(text: str) -> ParsedList:
     return parsed
 
 
-def ghl_tags(record: Mapping[str, Any]) -> list[str]:
-    return [GHL_TAG_WHOLESALER, GHL_TAG_COLD_LEAD,
-            f"{GHL_TAG_SOURCE_PREFIX}{record['wholesaler_source']}",
-            f"{GHL_TAG_STATE_PREFIX}{str(record['state']).lower()}"]
-
-
 class GhlTagSink(Protocol):
     def push(self, record: Mapping[str, Any], tags: list[str]) -> None: ...
-
-
-@dataclass
-class GhlPushResult:
-    pushed: int = 0
-    failed: list[str] = field(default_factory=list)
-
-
-def push_to_ghl(records: Sequence[Mapping[str, Any]], sink: GhlTagSink) -> GhlPushResult:
-    """Upsert + tag each record; a failure is logged (source only, no phone) and the rest still go.
-
-    One record at a time on purpose (exception to "batch I/O"): GHL has no bulk contact
-    upsert, and tags must go through the separate add-tags call because the upsert
-    REPLACES tags. About 2 calls per number, ~3,000 for the 1,500 target, one-off.
-    """
-    result = GhlPushResult()
-    for record in records:
-        try:
-            sink.push(record, ghl_tags(record))
-        except Exception as exc:
-            logger.warning("[wholesaler-ghl] push failed for a %s record: %s",
-                           record.get("wholesaler_source"), type(exc).__name__)
-            result.failed.append(str(record["source_record_ref"]))
-        else:
-            result.pushed += 1
-    return result
 
 
 class GhlWholesalerSink:
