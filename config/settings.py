@@ -964,6 +964,8 @@ class AppSettings(BaseSettings):
 	# BatchDialer call results as tags + a "last BatchDialer call" field on the GHL contact (src/lending/bd_result_to_ghl.py).
 	lending_bd_result_to_ghl_enabled: bool = Field(default=False, env="LENDING_BD_RESULT_TO_GHL_ENABLED")
 	lending_ghl_cf_last_bd_call: Optional[str] = Field(default=None, env="LENDING_GHL_CF_LAST_BD_CALL")  # GHL custom field id; unset = tags only
+	# GHL dropdown custom field "Last BatchDialer result" (options = the 10 result codes); unset = not written
+	lending_ghl_cf_last_bd_result: Optional[str] = Field(default=None, env="LENDING_GHL_CF_LAST_BD_RESULT")
 	# GHL call results on the BatchDialer contact card (custom field card_ghl_call; src/lending/ghl_result_to_bd.py).
 	lending_ghl_result_to_bd_enabled: bool = Field(default=False, env="LENDING_GHL_RESULT_TO_BD_ENABLED")
 	# T-09 intro SMS. Off: the tag that starts the GHL intro workflow is never added, so nobody is texted. Turn on only after

@@ -4,7 +4,9 @@ When a BatchDialer call ends, the GHL contact of the lead on that phone (the new
 GHL contact id) gets the tag ``called-in-batchdialer``, plus ``bd-connected`` (someone picked up), ``bd-callback`` or
 ``bd-booked`` by result. With LENDING_GHL_CF_LAST_BD_CALL set, the contact's "last BatchDialer call" field is set too,
 e.g. "2026-11-02 10:14 ET, no answer, 2 BatchDialer calls". Phones with no GHL contact id in our lead tables are
-skipped. Tags go through the add-tags call only (GHL's upsert REPLACES tags) and the field through a contact update
+skipped. With LENDING_GHL_CF_LAST_BD_RESULT set, the GHL dropdown field "Last BatchDialer result" (options = the 10
+result codes) holds the latest result code, so Josh's smart lists can filter on it and a contact never shows two
+results at once; the tags stay yes/no facts. Tags go through the add-tags call only (GHL's upsert REPLACES tags) and the field through a contact update
 that carries no tags; tags are only ever added, never removed.
 
 A call is written once, and again when its result code changes (callers often set the code during wrap-up, after the
@@ -24,7 +26,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from config.lending_dispositions import ANSWERED_CODES, BOOKED_CODE
+from config.lending_dispositions import ANSWERED_CODES, BOOKED_CODE, DISPOSITIONS, LEGACY_DISPOSITION_ALIASES
 from config.lending_followup import CALL_SOURCE_BATCHDIALER
 from config.lending_lendingflow import (
     BD_NOTE_LOOKBACK_HOURS,
@@ -92,6 +94,15 @@ def result_tags(disposition: Optional[str]) -> list[str]:
     return tags
 
 
+def result_code(disposition: Optional[str]) -> Optional[str]:
+    """The value for the GHL dropdown "Last BatchDialer result": one of the current DISPOSITIONS (a legacy code is
+    read through LEGACY_DISPOSITION_ALIASES), or None when there is no result yet or it is not a known code."""
+    if not disposition:
+        return None
+    code = LEGACY_DISPOSITION_ALIASES.get(disposition, disposition)
+    return code if code in DISPOSITIONS else None
+
+
 def last_call_text(ended: datetime, disposition: Optional[str], calls: int) -> str:
     result = disposition.replace("_", " ").lower() if disposition else "no result yet"
     return (f"{ended.astimezone(NOTE_TIMEZONE):%Y-%m-%d %H:%M} ET, {result}, "
@@ -142,14 +153,18 @@ def write_due_notes(db: Session, writer: GhlNoteWriter, *, row_id: Optional[int]
         params["row_id"] = row_id
     sql = text(_DUE.format(row_filter="AND d.id = :row_id" if row_id is not None else ""))
     rows = db.execute(sql, params).mappings().all()
-    field_id = get_settings().lending_ghl_cf_last_bd_call
+    settings = get_settings()
+    field_id, result_field_id = settings.lending_ghl_cf_last_bd_call, settings.lending_ghl_cf_last_bd_result
     written = 0
     for row in rows:
+        result = result_code(row["disposition"])
         try:
             writer.add_tags(row["ghl_contact_id"], result_tags(row["disposition"]))
             if field_id:
                 writer.set_field(row["ghl_contact_id"], field_id,
                                  last_call_text(row["call_ended_at"], row["disposition"], int(row["calls"])))
+            if result_field_id and result:
+                writer.set_field(row["ghl_contact_id"], result_field_id, result)
         except Exception as exc:  # class only
             logger.warning("[bd-result-to-ghl] call row %s not written to GHL: %s", row["id"], type(exc).__name__)
             db.execute(text("UPDATE lending.call_dispositions SET ghl_note_attempts = ghl_note_attempts + 1 "

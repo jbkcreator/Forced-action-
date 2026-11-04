@@ -149,3 +149,29 @@ def test_follow_up_schedules_the_ghl_note_for_a_finished_call():
     tasks.clear()
     follow_up(RecordedCall(call_ended=False, **base), lambda fn, *a: tasks.append(fn.__name__))
     assert "write_note_in_background" not in tasks
+
+
+def test_the_dropdown_field_holds_only_the_latest_result_code(db, monkeypatch):
+    monkeypatch.setattr(notes.get_settings(), "lending_ghl_cf_last_bd_result", "cf-last-result")
+    phone = _lead(db)
+    row = _call(db, phone, disposition="NO_ANSWER")
+    writer = FakeWriter()
+    notes.write_due_notes(db, writer, now=NOW)
+    db.execute(text("UPDATE lending.call_dispositions SET disposition = 'BOOKED' WHERE id = :id"), {"id": row})
+    notes.write_due_notes(db, writer, now=NOW)
+    assert [f for f in writer.fields if f[1] == "cf-last-result"] == [("ghl-9", "cf-last-result", "NO_ANSWER"),
+                                                                       ("ghl-9", "cf-last-result", "BOOKED")]
+
+
+def test_no_result_yet_leaves_the_dropdown_alone(db, monkeypatch):
+    monkeypatch.setattr(notes.get_settings(), "lending_ghl_cf_last_bd_result", "cf-last-result")
+    _call(db, _lead(db), disposition=None)
+    writer = FakeWriter()
+    notes.write_due_notes(db, writer, now=NOW)
+    assert all(f[1] != "cf-last-result" for f in writer.fields)
+
+
+@pytest.mark.parametrize("code, expected", [("BOOKED", "BOOKED"), ("CALL_FAILED", "NO_ANSWER"),
+                                            ("DATA_NURTURE_ONLY", "NURTURE"), (None, None), ("SOMETHING_ELSE", None)])
+def test_result_code_maps_legacy_codes_and_drops_unknown_ones(code, expected):
+    assert notes.result_code(code) == expected
