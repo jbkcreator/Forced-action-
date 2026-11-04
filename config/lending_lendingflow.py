@@ -81,3 +81,9 @@ GHL_TAG_BD_CALLBACK = "bd-callback"
 GHL_TAG_BD_BOOKED = "bd-booked"
 BD_NOTE_LOOKBACK_HOURS = 24  # calls older than this are no longer written to GHL
 BD_NOTE_MAX_ATTEMPTS = 5
+
+# --- GHL call results on the BatchDialer contact card (src/lending/ghl_result_to_bd.py) -----------------------------
+# BatchDialer contacts have no tags: the marker is this card custom field (create it in BatchDialer to show it).
+BD_CARD_FIELD_GHL_CALL = "card_ghl_call"
+GHL_NOTE_LOOKBACK_HOURS = 24  # GHL calls older than this are no longer written to BatchDialer
+GHL_NOTE_MAX_ATTEMPTS = 5

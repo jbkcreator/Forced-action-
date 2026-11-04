@@ -286,6 +286,10 @@ class LendingCallDisposition(LendingBase):
     ghl_note_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     ghl_note_disposition: Mapped[Optional[str]] = mapped_column(String(50))
     ghl_note_attempts: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=0, server_default=text("0"))
+    # A GHL call's result written to the BatchDialer contact card (src/lending/ghl_result_to_bd.py).
+    bd_note_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    bd_note_disposition: Mapped[Optional[str]] = mapped_column(String(50))
+    bd_note_attempts: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=0, server_default=text("0"))
 
     __table_args__ = (
         Index("idx_lending_call_dispositions_phone_ended", "phone", "call_ended_at"),

@@ -53,6 +53,10 @@ _CALL_DISPOSITION_STATEMENTS: list[str] = [
     'ALTER TABLE "{t}".call_dispositions ADD COLUMN IF NOT EXISTS ghl_note_at timestamptz',
     'ALTER TABLE "{t}".call_dispositions ADD COLUMN IF NOT EXISTS ghl_note_disposition varchar(50)',
     'ALTER TABLE "{t}".call_dispositions ADD COLUMN IF NOT EXISTS ghl_note_attempts smallint NOT NULL DEFAULT 0',
+    # GHL call results on the BatchDialer contact card (src/lending/ghl_result_to_bd.py).
+    'ALTER TABLE "{t}".call_dispositions ADD COLUMN IF NOT EXISTS bd_note_at timestamptz',
+    'ALTER TABLE "{t}".call_dispositions ADD COLUMN IF NOT EXISTS bd_note_disposition varchar(50)',
+    'ALTER TABLE "{t}".call_dispositions ADD COLUMN IF NOT EXISTS bd_note_attempts smallint NOT NULL DEFAULT 0',
 ]
 
 
