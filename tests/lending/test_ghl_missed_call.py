@@ -160,6 +160,21 @@ def test_the_ghl_workflow_body_without_call_id_is_accepted(route):
     assert resp.status_code == 200 and got["recorded"][0].dialer_call_id.startswith("ghl-missed:")
 
 
+def test_the_ghl_workflow_body_with_outgoing_direction_is_queued(route):
+    """Review #407: GHL's Call details trigger says "Outgoing"; the call must be queued, not ignored."""
+    client, db, got = route
+    resp = client.post("/webhooks/lending/ghl-missed-call", headers=HEADERS, json={**GHL_BODY, "direction": "Outgoing"})
+    assert resp.status_code == 200 and resp.json() == {"queued": True, "status": "pending"}
+    assert len(got["recorded"]) == 1 and db.commits == 1 and got["ran"] == 1
+
+
+@pytest.mark.parametrize("direction", ["Incoming", "inbound"])
+def test_an_incoming_call_from_the_workflow_is_still_ignored(route, direction):
+    client, db, got = route
+    resp = client.post("/webhooks/lending/ghl-missed-call", headers=HEADERS, json={**GHL_BODY, "direction": direction})
+    assert resp.json() == {"queued": False, "ignored": True} and got["recorded"] == [] and db.commits == 0
+
+
 def test_a_wrong_secret_is_refused(route):
     client, _, got = route
     assert client.post("/webhooks/lending/ghl-missed-call", headers={"X-Webhook-Secret": "x"}, json=BODY).status_code == 401
