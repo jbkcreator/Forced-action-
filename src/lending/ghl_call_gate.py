@@ -10,7 +10,9 @@ A listed contact cannot be called now when:
 * its number is suppressed (opt-out, STOP, litigator);
 * ``dial_blocks``: the 24-hour attempt limit, the 10-business-day attempt history or the calling window (8am-8pm
   recipient local and 9:00-19:15 ET); for a number that is not a LendingFlow lead, also a missing or stale DNC scrub;
-* a non-LendingFlow number's newest scrub found it on a DNC or litigator list.
+* a non-LendingFlow number's newest scrub found it on a DNC or litigator list;
+* the ISA already got through to it in BatchDialer (REACHED_IN_BATCHDIALER: a live-conversation result inside
+  GHL_CALLING_LOOKBACK_DAYS; one calling rule for every lead, ``src/lending/ghl_calling.py``).
 LendingFlow numbers need no scrub: every LendingFlow lead counts as having agreed to calls and texts (client decision).
 
 Fails safe: a run that cannot read the rules writes nothing, so a blocked contact never comes back early; a contact
@@ -57,11 +59,13 @@ from src.lending.compliance import (
     suppressed_phones,
 )
 from src.lending.ghl_account import GhlAccount, ghl_headers, lending_ghl_account
+from src.lending.ghl_calling import reached_in_batchdialer_phones
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
 
 EMERGENCY_STOP = "EMERGENCY_STOP"
+REACHED_IN_BATCHDIALER = "REACHED_IN_BATCHDIALER"
 EXIT_FAILED = 1
 
 
@@ -184,12 +188,14 @@ def read_listed_contacts(client: CallListClient,
 
 
 def blocked_reasons(db, phones: Sequence[str], *, now: datetime, halted: bool) -> dict[str, str]:
-    """phone -> why it cannot be called now, for each blocked phone (see the module docstring). Three batched
+    """phone -> why it cannot be called now, for each blocked phone (see the module docstring). Four batched
     reads plus ``dial_blocks``; never one query per phone. While halted, no database read at all."""
     phones = sorted(set(phones))
     if halted:
         return dict.fromkeys(phones, EMERGENCY_STOP)
     reasons: dict[str, str] = dict.fromkeys(suppressed_phones(db, phones), ReasonCode.SUPPRESSED.value)
+    reasons.update(dict.fromkeys(reached_in_batchdialer_phones(db, [p for p in phones if p not in reasons], now=now),
+                                 REACHED_IN_BATCHDIALER))
     open_phones = [p for p in phones if p not in reasons]
     lendingflow = lendingflow_lead_phones(db, open_phones)
     scrubbed = [p for p in open_phones if p not in lendingflow]
