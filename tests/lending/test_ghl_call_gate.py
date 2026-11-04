@@ -115,6 +115,7 @@ def test_rules_order_suppression_then_dial_blocks_then_dnc_result_and_lendingflo
         return {PHONE_B: ReasonCode.NO_FRESH_SCRUB} if PHONE_B in phones and check_scrub else {}
 
     monkeypatch.setattr(gate, "suppressed_phones", lambda db, phones: {PHONE_C})
+    monkeypatch.setattr(gate, "reached_in_batchdialer_phones", lambda db, phones, *, now: set())
     monkeypatch.setattr(gate, "lendingflow_lead_phones", lambda db, phones: {PHONE_A})
     monkeypatch.setattr(gate, "dial_blocks", dial_blocks)
     verdict_inputs = []
@@ -131,10 +132,24 @@ def test_rules_order_suppression_then_dial_blocks_then_dnc_result_and_lendingflo
 
 def test_a_fresh_scrub_that_found_the_number_on_a_dnc_list_blocks_it(monkeypatch):
     monkeypatch.setattr(gate, "suppressed_phones", lambda db, phones: set())
+    monkeypatch.setattr(gate, "reached_in_batchdialer_phones", lambda db, phones, *, now: set())
     monkeypatch.setattr(gate, "lendingflow_lead_phones", lambda db, phones: set())
     monkeypatch.setattr(gate, "dial_blocks", lambda db, phones, *, now, check_scrub=True: {})
     monkeypatch.setattr(gate, "scrub_verdict_blocks", lambda db, phones: {PHONE_A: ReasonCode.NATIONAL_DNC})
     assert blocked_reasons(object(), [PHONE_A], now=NOW, halted=False) == {PHONE_A: "NATIONAL_DNC"}
+
+
+def test_a_number_the_isa_reached_in_batchdialer_is_held_off_joshs_lists(monkeypatch):
+    """One calling rule: once the ISA gets through in BatchDialer, the GHL lists stop showing the number,
+    whatever its lead type (LendingFlow included); suppression still wins as the reason."""
+    monkeypatch.setattr(gate, "suppressed_phones", lambda db, phones: {PHONE_C})
+    monkeypatch.setattr(gate, "reached_in_batchdialer_phones",
+                        lambda db, phones, *, now: {PHONE_A, PHONE_B} & set(phones))
+    monkeypatch.setattr(gate, "lendingflow_lead_phones", lambda db, phones: {PHONE_A} & set(phones))
+    monkeypatch.setattr(gate, "dial_blocks", lambda db, phones, *, now, check_scrub=True: {})
+    monkeypatch.setattr(gate, "scrub_verdict_blocks", lambda db, phones: {})
+    assert blocked_reasons(object(), [PHONE_A, PHONE_B, PHONE_C], now=NOW, halted=False) == {
+        PHONE_A: "REACHED_IN_BATCHDIALER", PHONE_B: "REACHED_IN_BATCHDIALER", PHONE_C: "SUPPRESSED"}
 
 
 # ── a run ────────────────────────────────────────────────────────────────────

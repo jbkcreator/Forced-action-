@@ -17,6 +17,7 @@ from sqlalchemy import text
 
 from config.lending_web import GHL_ALERT_AFTER_MINUTES, GHL_GIVE_UP_AFTER_HOURS
 from config.settings import get_settings
+from src.lending import lendingflow_dialer
 from src.lending.db import lending_session
 from src.lending.disposition_delivery import _configured_slack, _slack_client
 from src.lending.slack_names import name_and_ref
@@ -78,6 +79,8 @@ def run() -> int:
     with lending_session() as db:
         delivered = deliver_pending(db, get_live_sink())
     logger.info("[lending-web] sweep delivered=%d", delivered)
+    # Website leads into the BatchDialer "Website" campaign (call-consent tick + DNC scrub; removals always run).
+    lendingflow_dialer.run_from_settings(lendingflow_dialer.WEBSITE)
     alert_undelivered()
     return delivered
 

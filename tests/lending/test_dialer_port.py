@@ -212,7 +212,7 @@ def test_pool_campaign_tags_name_the_ranked_queues_plus_nurture_and_lendingflow(
     assert POOL_CAMPAIGN_TAGS == {q.VERIFIED_MATURITY: "Verified maturity",
                                   q.TRANSACTION_READY: "Transaction ready", q.BUILDERS: "Builders",
                                   q.PARTNERS: "Partners", q.WHOLESALERS: "Wholesalers", q.NURTURE: "Nurture",
-                                  "lendingflow": "LendingFlow"}
+                                  "lendingflow": "LendingFlow", "website": "Website"}
 
 
 # ── HTTP transport ──
@@ -465,3 +465,47 @@ def test_the_campaign_create_is_never_auto_retried(monkeypatch):
     with pytest.raises(DialerRequestError):
         http("POST", "/contacts", json={})
     assert len(attempts) == 1
+
+
+# ── set_custom_fields: one card field changed, the rest of the contact sent back as it was ──
+
+STORED_CONTACT = {
+    "id": 55, "firstname": "Jane", "lastname": "Roe", "email": "j@example.com", "address": "1 Main St",
+    "city": "Tampa", "state": "FL", "postalcode": "33602", "vendorcontactid": "lendingflow:abc",
+    "phonenumbers": [{"phonenumber": "8135558201", "type": None}], "phonenumber1": "8135558201",
+    "customfields": {"card_loan": "$500K", "text_consent": "yes"}, "score": 0, "lists": [],
+}
+
+
+def test_set_custom_fields_changes_only_the_given_field_and_keeps_the_rest():
+    http = FakeHttp(body=STORED_CONTACT)
+    BatchDialerAdapter(http=http, endpoints=ENDPOINTS).set_custom_fields(55, {"card_ghl_call": "10:15 ET, no answer"})
+    (get_method, get_path, _), (put_method, put_path, body) = http.calls
+    assert (get_method, get_path, put_method, put_path) == ("GET", "/contact/55", "PUT", "/contact/55")
+    assert body["customfields"] == {"card_loan": "$500K", "text_consent": "yes", "card_ghl_call": "10:15 ET, no answer"}
+    assert {k: body[k] for k in ("firstname", "lastname", "email", "address", "city", "state", "postalcode",
+                                 "vendorcontactid")} == {k: STORED_CONTACT[k] for k in ("firstname", "lastname",
+                                 "email", "address", "city", "state", "postalcode", "vendorcontactid")}
+    assert body["phonenumbers"] == [{"phonenumber": PHONE_10}]
+    assert "lists" not in body and "score" not in body  # read-only fields are never sent back
+
+
+def test_set_custom_fields_falls_back_to_phonenumber1():
+    http = FakeHttp(body={**STORED_CONTACT, "phonenumbers": None})
+    BatchDialerAdapter(http=http, endpoints=ENDPOINTS).set_custom_fields(55, {"card_ghl_call": "x"})
+    assert http.calls[-1][2]["phonenumbers"] == [{"phonenumber": PHONE_10}]
+
+
+def test_set_custom_fields_sends_nothing_for_a_contact_without_a_phone():
+    http = FakeHttp(body={**STORED_CONTACT, "phonenumbers": [], "phonenumber1": None})
+    with pytest.raises(DialerRequestError):
+        BatchDialerAdapter(http=http, endpoints=ENDPOINTS).set_custom_fields(55, {"card_ghl_call": "x"})
+    assert [c[0] for c in http.calls] == ["GET"]
+
+
+def test_set_custom_fields_sends_nothing_when_the_read_fails():
+    def failing(method, path, *, json=None):
+        raise DialerRequestError("GET /contact/55", status=500)
+
+    with pytest.raises(DialerRequestError):
+        BatchDialerAdapter(http=failing, endpoints=ENDPOINTS).set_custom_fields(55, {"card_ghl_call": "x"})

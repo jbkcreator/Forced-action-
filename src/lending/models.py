@@ -293,6 +293,10 @@ class LendingCallDisposition(LendingBase):
     ghl_note_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     ghl_note_disposition: Mapped[Optional[str]] = mapped_column(String(50))
     ghl_note_attempts: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=0, server_default=text("0"))
+    # A GHL call's result written to the BatchDialer contact card (src/lending/ghl_result_to_bd.py).
+    bd_note_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    bd_note_disposition: Mapped[Optional[str]] = mapped_column(String(50))
+    bd_note_attempts: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=0, server_default=text("0"))
 
     __table_args__ = (
         Index("idx_lending_call_dispositions_phone_ended", "phone", "call_ended_at"),
@@ -468,6 +472,21 @@ class LendingWebLead(LendingBase):
     is_test: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))  # test traffic: left out of reports and caps, never out of suppression or consent
     returning_alerted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # 1.2.2 ops alert posted once
     occupancy: Mapped[str] = mapped_column(String(20), nullable=False, default="unknown", server_default=text("'unknown'"))  # config.lending_occupancy
+    # Website lead -> BatchDialer "Website" campaign (src/lending/lendingflow_dialer.py, source WEBSITE); same columns
+    # and statuses as lendingflow_leads. Leads stored before the migration are 'preexisting' and never loaded.
+    dialer_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending", server_default=text("'pending'"))
+    dialer_block_reason: Mapped[Optional[str]] = mapped_column(String(40))
+    dialer_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    dialer_failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    dialer_last_error: Mapped[Optional[str]] = mapped_column(String(200))
+    dialer_claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    dialer_next_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    dialer_loaded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    dialer_removed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    dialer_ghl_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    duplicate_of: Mapped[Optional[int]] = mapped_column(ForeignKey("lending.web_leads.id"))
+    handled_in_ghl_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    handled_in_ghl_reason: Mapped[Optional[str]] = mapped_column(String(30))
 
     __table_args__ = (
         CheckConstraint("ghl_status IN ('pending', 'synced', 'contact_only', 'failed', 'excluded')", name="ck_lending_web_leads_ghl_status"),

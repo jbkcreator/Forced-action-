@@ -23,47 +23,54 @@ logger = logging.getLogger(__name__)
 _STATUSES = ("pending", "loading", "loaded", "blocked", "unconfirmed", "remove_pending", "removed", "duplicate",
              "expired", "failed", "preexisting")
 
-# dialer_status is added without a default first, so existing rows can be told apart and marked preexisting.
-_ADD_STATUS = 'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS dialer_status varchar(20)'
-_BACKFILL = 'UPDATE "{t}".lendingflow_leads SET dialer_status = \'preexisting\' WHERE dialer_status IS NULL'
+# Lead tables that load into BatchDialer (src/lending/lendingflow_dialer.py: LendingFlow and website leads), each with
+# the same dialer columns. dialer_status is added without a default first, so existing rows can be told apart and
+# marked preexisting (never loaded).
+_LEAD_TABLES = ("lendingflow_leads", "web_leads")
+_ADD_STATUS = 'ALTER TABLE "{t}".{table} ADD COLUMN IF NOT EXISTS dialer_status varchar(20)'
+_BACKFILL = """UPDATE "{t}".{table} SET dialer_status = 'preexisting' WHERE dialer_status IS NULL"""
 
 _STATEMENTS: list[str] = [
-    'ALTER TABLE "{t}".lendingflow_leads ALTER COLUMN dialer_status SET DEFAULT \'pending\'',
-    'ALTER TABLE "{t}".lendingflow_leads ALTER COLUMN dialer_status SET NOT NULL',
-    'ALTER TABLE "{t}".lendingflow_leads DROP CONSTRAINT IF EXISTS ck_lending_lendingflow_leads_dialer_status',
-    'ALTER TABLE "{t}".lendingflow_leads ADD CONSTRAINT ck_lending_lendingflow_leads_dialer_status '
+    """ALTER TABLE "{t}".{table} ALTER COLUMN dialer_status SET DEFAULT 'pending'""",
+    'ALTER TABLE "{t}".{table} ALTER COLUMN dialer_status SET NOT NULL',
+    'ALTER TABLE "{t}".{table} DROP CONSTRAINT IF EXISTS ck_lending_{table}_dialer_status',
+    'ALTER TABLE "{t}".{table} ADD CONSTRAINT ck_lending_{table}_dialer_status '
     "CHECK (dialer_status IN (" + ", ".join(f"'{s}'" for s in _STATUSES) + "))",
-    'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS dialer_block_reason varchar(40)',
-    'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS dialer_attempts integer NOT NULL DEFAULT 0',
-    'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS dialer_failures integer NOT NULL DEFAULT 0',
-    'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS dialer_last_error varchar(200)',
-    'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS dialer_claimed_at timestamptz',
-    'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS dialer_next_attempt_at timestamptz',
-    'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS dialer_loaded_at timestamptz',
-    'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS dialer_removed_at timestamptz',
-    'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS dialer_ghl_checked_at timestamptz',
-    'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS duplicate_of bigint '
-    'REFERENCES "{t}".lendingflow_leads(id)',
-    'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS handled_in_ghl_at timestamptz',
-    'ALTER TABLE "{t}".lendingflow_leads ADD COLUMN IF NOT EXISTS handled_in_ghl_reason varchar(30)',
-    'CREATE INDEX IF NOT EXISTS idx_lending_lendingflow_leads_dialer_pending ON "{t}".lendingflow_leads (received_at) '
+    'ALTER TABLE "{t}".{table} ADD COLUMN IF NOT EXISTS dialer_block_reason varchar(40)',
+    'ALTER TABLE "{t}".{table} ADD COLUMN IF NOT EXISTS dialer_attempts integer NOT NULL DEFAULT 0',
+    'ALTER TABLE "{t}".{table} ADD COLUMN IF NOT EXISTS dialer_failures integer NOT NULL DEFAULT 0',
+    'ALTER TABLE "{t}".{table} ADD COLUMN IF NOT EXISTS dialer_last_error varchar(200)',
+    'ALTER TABLE "{t}".{table} ADD COLUMN IF NOT EXISTS dialer_claimed_at timestamptz',
+    'ALTER TABLE "{t}".{table} ADD COLUMN IF NOT EXISTS dialer_next_attempt_at timestamptz',
+    'ALTER TABLE "{t}".{table} ADD COLUMN IF NOT EXISTS dialer_loaded_at timestamptz',
+    'ALTER TABLE "{t}".{table} ADD COLUMN IF NOT EXISTS dialer_removed_at timestamptz',
+    'ALTER TABLE "{t}".{table} ADD COLUMN IF NOT EXISTS dialer_ghl_checked_at timestamptz',
+    'ALTER TABLE "{t}".{table} ADD COLUMN IF NOT EXISTS duplicate_of bigint REFERENCES "{t}".{table}(id)',
+    'ALTER TABLE "{t}".{table} ADD COLUMN IF NOT EXISTS handled_in_ghl_at timestamptz',
+    'ALTER TABLE "{t}".{table} ADD COLUMN IF NOT EXISTS handled_in_ghl_reason varchar(30)',
+    'CREATE INDEX IF NOT EXISTS idx_lending_{table}_dialer_pending ON "{t}".{table} (received_at) '
     "WHERE dialer_status = 'pending'",
 ]
 _CALL_DISPOSITION_STATEMENTS: list[str] = [
     'ALTER TABLE "{t}".call_dispositions ADD COLUMN IF NOT EXISTS ghl_note_at timestamptz',
     'ALTER TABLE "{t}".call_dispositions ADD COLUMN IF NOT EXISTS ghl_note_disposition varchar(50)',
     'ALTER TABLE "{t}".call_dispositions ADD COLUMN IF NOT EXISTS ghl_note_attempts smallint NOT NULL DEFAULT 0',
+    # GHL call results on the BatchDialer contact card (src/lending/ghl_result_to_bd.py).
+    'ALTER TABLE "{t}".call_dispositions ADD COLUMN IF NOT EXISTS bd_note_at timestamptz',
+    'ALTER TABLE "{t}".call_dispositions ADD COLUMN IF NOT EXISTS bd_note_disposition varchar(50)',
+    'ALTER TABLE "{t}".call_dispositions ADD COLUMN IF NOT EXISTS bd_note_attempts smallint NOT NULL DEFAULT 0',
 ]
 
 
 def apply_to(conn: Connection, schema: str = LENDING_SCHEMA) -> None:
     """Also called at the end of apply_lending_lendingflow.apply_to, so the lead table never exists without these
-    columns. call_dispositions is altered only when it exists."""
+    columns. Each lead table and call_dispositions is altered only when it exists."""
     conn.execute(text("SET LOCAL lock_timeout = '5s'"))
-    conn.execute(text(_ADD_STATUS.format(t=schema)))
-    conn.execute(text(_BACKFILL.format(t=schema)))
-    for stmt in _STATEMENTS:
-        conn.execute(text(stmt.format(t=schema)))
+    for table in _LEAD_TABLES:
+        if conn.execute(text("SELECT to_regclass(:t)"), {"t": f'"{schema}".{table}'}).scalar() is None:
+            continue
+        for stmt in (_ADD_STATUS, _BACKFILL, *_STATEMENTS):
+            conn.execute(text(stmt.format(t=schema, table=table)))
     if conn.execute(text("SELECT to_regclass(:t)"), {"t": f'"{schema}".call_dispositions'}).scalar() is not None:
         for stmt in _CALL_DISPOSITION_STATEMENTS:
             conn.execute(text(stmt.format(t=schema)))
