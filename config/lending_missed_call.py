@@ -17,6 +17,9 @@ MAX_LATE_SECONDS = 60             # brief rule: text within 60 s; an older misse
 MAX_CALLS_PER_CYCLE = 500         # bound on call records decided per poll cycle
 TIMEZONE = "America/New_York"     # "one text per person per day" is an Eastern calendar day
 SMS_CAMPAIGN = "lending_missed_call"
+# G4: GHL call statuses (lower-cased, "_"/" " -> "-") that mean nobody picked up. The GHL "call status" workflow posts
+# them to POST /webhooks/lending/ghl-missed-call the moment the call ends; voicemail is texted, as for BatchDialer.
+GHL_MISSED_CALL_STATUSES = frozenset({"no-answer", "noanswer", "busy", "failed", "undelivered", "voicemail"})
 MAX_TEXT_CHARS = 320
 
 # Documented CDR fields (first match wins).
