@@ -43,11 +43,43 @@ def test_answered_inbound_or_unknown_calls_are_ignored(extra):
     assert mc.parse_missed_call({**BODY, **extra}, NOW) is None
 
 
-@pytest.mark.parametrize("missing, reason", [("call_id", mc.REASON_NO_CALL_ID), ("phone", mc.REASON_NO_PHONE)])
-def test_a_missed_call_needs_its_call_id_and_phone(missing, reason):
+def test_a_missed_call_needs_a_phone():
     with pytest.raises(mc.InvalidMissedCall) as exc:
-        mc.parse_missed_call({k: v for k, v in BODY.items() if k != missing}, NOW)
-    assert exc.value.reason == reason
+        mc.parse_missed_call({k: v for k, v in BODY.items() if k != "phone"}, NOW)
+    assert exc.value.reason == mc.REASON_NO_PHONE
+
+
+# The body exactly as built in the GHL workflow (no call id: GHL has no merge field for it).
+GHL_BODY = {"phone": "+18135550142", "contact_phone": "+18135550142", "contact_id": "c-1",
+            "call_status": "no-answer", "user": "Josh Kantor", "called_at": "2026-11-04T14:59:20.000Z",
+            "ended_at": "2026-11-04T14:59:50.000Z", "duration": "30"}
+
+
+def test_without_a_call_id_the_call_is_keyed_by_phone_and_start_time():
+    call = mc.parse_missed_call(GHL_BODY, NOW)
+    assert call.dialer_call_id == mc.missed_call_key("+18135550142", datetime(2026, 11, 4, 14, 59, 20, tzinfo=timezone.utc))
+    assert call.dialer_call_id.startswith("ghl-missed:") and "8135550142" not in call.dialer_call_id
+    assert mc.parse_missed_call(GHL_BODY, NOW + timedelta(seconds=30)).dialer_call_id == call.dialer_call_id  # a retry
+
+
+def test_without_any_time_retries_in_the_same_minute_share_a_key():
+    body = {k: v for k, v in GHL_BODY.items() if k not in ("called_at", "ended_at")}
+    first = mc.parse_missed_call(body, NOW.replace(second=5))
+    assert first.dialer_call_id == mc.parse_missed_call(body, NOW.replace(second=40)).dialer_call_id
+    assert first.ended_at == NOW.replace(second=5)
+
+
+def test_contact_phone_is_the_fallback_and_outgoing_is_outbound():
+    body = {**GHL_BODY, "phone": "{{phoneCall.to}}", "direction": "Outgoing"}
+    assert mc.parse_missed_call(body, NOW).phone == "+18135550142"
+    assert mc.parse_missed_call({**GHL_BODY, "direction": "Incoming"}, NOW) is None
+
+
+def test_an_unreadable_time_is_logged_without_the_phone_and_arrival_is_used(caplog):
+    call = mc.parse_missed_call({**GHL_BODY, "called_at": "Nov 4 2026 at 10:59 AM", "ended_at": "Nov 4 2026 at 10:59 AM"},
+                                NOW)
+    assert call.ended_at == NOW
+    assert "Nov 4 2026 at 10:59 AM" in caplog.text and "8135550142" not in caplog.text
 
 
 def test_the_call_end_is_ghl_time_else_arrival_and_never_after_arrival():
@@ -116,10 +148,16 @@ def test_an_answered_call_is_acknowledged_and_ignored(route):
     assert resp.json() == {"queued": False, "ignored": True} and got["recorded"] == [] and db.commits == 0
 
 
-def test_a_missing_call_id_is_refused_without_detail(route):
+def test_a_missing_phone_is_refused_without_detail(route):
     client, _, _ = route
-    resp = client.post("/webhooks/lending/ghl-missed-call", headers=HEADERS, json={**BODY, "call_id": ""})
-    assert resp.status_code == 422 and resp.json() == {"detail": mc.REASON_NO_CALL_ID}
+    resp = client.post("/webhooks/lending/ghl-missed-call", headers=HEADERS, json={**BODY, "phone": ""})
+    assert resp.status_code == 422 and resp.json() == {"detail": mc.REASON_NO_PHONE}
+
+
+def test_the_ghl_workflow_body_without_call_id_is_accepted(route):
+    client, _, got = route
+    resp = client.post("/webhooks/lending/ghl-missed-call", headers=HEADERS, json=GHL_BODY)
+    assert resp.status_code == 200 and got["recorded"][0].dialer_call_id.startswith("ghl-missed:")
 
 
 def test_a_wrong_secret_is_refused(route):
@@ -298,3 +336,57 @@ def test_text_consent_yes_on_a_ghl_call_is_saved(db):
     row = db.execute(text("SELECT source, call_id, captured_by FROM lending.text_consents WHERE phone = :p"),
                      {"p": phone}).one()
     assert tuple(row) == ("on_call_yes", call_id, "Josh Kantor") and has_text_consent(db, phone) is True
+
+
+def _ghl_body(phone, started, **extra):
+    return {"phone": phone, "call_status": "no-answer", "called_at": started.isoformat(),
+            "ended_at": (started + timedelta(seconds=25)).isoformat(), **extra}
+
+
+def _import_call(db, message_id, phone, started):
+    db.execute(_UPSERT, {
+        "call_id": f"ghl:{message_id}", "source": "ghl", "direction": "outbound", "phone": phone, "seat": "ghl",
+        "caller_name": "Josh Kantor", "tag": "ghl", "raw_outcome": "ghl:no-answer", "talk": None,
+        "started": started, "ended": started, "raw_event": json.dumps({}),
+        "unknown_outcome": UNKNOWN_OUTCOME, "unknown_caller": GHL_UNKNOWN_CALLER,
+    })
+
+
+def test_the_import_takes_over_the_missed_call_row_and_its_event(db):
+    phone, started = _phone(), NOW - timedelta(seconds=40)
+    record_consent(db, phone, "on_call_yes")
+    call = mc.parse_missed_call(_ghl_body(phone, started), NOW)
+    assert mc.record_missed_call(db, call) == "pending"
+    sender = Sender()
+    assert process_pending(db, sender=sender, enabled=True, number="+16562211100", now=NOW) == {"sent": 1}
+    # 15 minutes later the import stores the same call under GHL's message id
+    assert mc.adopt_missed_call(db, "ghl:realmsg01", phone, started + timedelta(seconds=2)) is True
+    _import_call(db, "realmsg01", phone, started + timedelta(seconds=2))
+    rows = db.execute(text("SELECT dialer_call_id FROM lending.call_dispositions WHERE phone = :p"), {"p": phone}).all()
+    assert [r[0] for r in rows] == ["ghl:realmsg01"]  # one call, one attempt
+    assert _event_status(db, "ghl:realmsg01") == "sent" and _event_status(db, call.dialer_call_id) is None
+    assert mc.adopt_missed_call(db, "ghl:realmsg01", phone, started) is False  # nothing left to take over
+
+
+def test_the_import_never_takes_over_a_call_far_apart_or_to_another_phone(db):
+    phone, started = _phone(), NOW - timedelta(minutes=30)
+    mc.record_missed_call(db, mc.parse_missed_call(_ghl_body(phone, started), NOW))
+    assert mc.adopt_missed_call(db, "ghl:other01", phone, started + timedelta(minutes=10)) is False
+    assert mc.adopt_missed_call(db, "ghl:other02", _phone(), started) is False
+
+
+def test_a_webhook_after_the_import_reuses_the_imported_call(db):
+    phone, started = _phone(), NOW - timedelta(seconds=40)
+    _import_call(db, "early01", phone, started)
+    call = mc.parse_missed_call(_ghl_body(phone, started + timedelta(seconds=1)), NOW)
+    assert mc.record_missed_call(db, call) == "pending"
+    assert db.execute(text("SELECT count(*) FROM lending.call_dispositions WHERE phone = :p"), {"p": phone}).scalar() == 1
+    assert _event_status(db, "ghl:early01") == "pending"
+
+
+def test_a_retried_ghl_post_without_call_id_queues_one_event(db):
+    phone, started = _phone(), NOW - timedelta(seconds=40)
+    first = mc.record_missed_call(db, mc.parse_missed_call(_ghl_body(phone, started), NOW))
+    again = mc.record_missed_call(db, mc.parse_missed_call(_ghl_body(phone, started), NOW + timedelta(seconds=5)))
+    assert (first, again) == ("pending", "pending")
+    assert db.execute(text("SELECT count(*) FROM lending.missed_call_events WHERE phone = :p"), {"p": phone}).scalar() == 1

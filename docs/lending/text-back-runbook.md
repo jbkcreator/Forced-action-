@@ -166,21 +166,24 @@ Results Josh picks in GHL are acted on like BatchDialer results (`src/lending/gh
 - **Text Consent = Yes** on an answered call (any result except No Answer, Left Voicemail or Bad Number) is saved to
   `lending.text_consents` as `on_call_yes`, with the GHL call id and the caller.
 - **Missed call**: the text must go out within 60 s, and the GHL call import runs every 15 minutes, so GHL has to
-  report the call itself. **GHL workflow (Dev A):** trigger on the call status (No Answer, Busy, Failed, Voicemail)
-  -> Webhook `POST /webhooks/lending/ghl-missed-call`, header `X-Webhook-Secret` = `LENDING_GHL_WEBHOOK_SECRET`, body:
+  report the call itself. **GHL workflow "NDL – Missed call to backend"** (built as a Draft 2026-11-04; publish only
+  after this code is deployed): trigger **Call details**, Call status = busy / voicemail / no-answer, Call direction =
+  Outgoing (`canceled` is deliberately not texted) -> Custom Webhook POST `/webhooks/lending/ghl-missed-call`, header
+  `X-Webhook-Secret` = `LENDING_GHL_WEBHOOK_SECRET`, Allow re-entry ON, raw JSON body:
 
-  | key | value |
-  |---|---|
-  | `call_id` | the GHL call message id (required: the same id the import stores as `ghl:<id>`) |
-  | `phone` | `{{contact.phone}}` (required) |
-  | `call_status` | the call status (`no-answer`, `busy`, `failed`, `voicemail`; anything else is ignored) |
-  | `contact_id` | `{{contact.id}}` |
-  | `direction` | optional; `inbound` is ignored |
-  | `user` | the GHL user who called |
-  | `called_at` / `ended_at` | optional call times (ISO 8601); the arrival time is used when missing |
+  ```json
+  {"phone": "{{phoneCall.to}}", "contact_phone": "{{contact.phone}}", "contact_id": "{{contact.id}}",
+   "call_status": "{{phoneCall.callStatus}}", "user": "{{phoneCall.user.name}}",
+   "called_at": "{{phoneCall.startTime}}", "ended_at": "{{phoneCall.endTime}}", "duration": "{{phoneCall.duration}}"}
+  ```
 
-  The field names are UNVERIFIED until the first real post: set `LENDING_GHL_LOG_PAYLOAD_SHAPE=true` to log the keys.
-  The call is stored under `ghl:<call_id>` (the import updates the same row later), the event is queued once per call
+  GHL has **no call id / message id** merge field, so `call_id` is optional: without it the call is keyed by phone and
+  start time (`ghl-missed:<phone hash>:<epoch>`), and the 15-minute GHL call import takes that row over (gives it
+  `ghl:<message id>`) when it stores a call to the same phone started within 5 minutes, so a call is one row and one
+  attempt. A webhook that arrives after the import reuses the imported call.
+  The time format GHL sends is not confirmed: a time that cannot be read is logged once per post (the raw time text,
+  never a phone) and the arrival time is used. `LENDING_GHL_LOG_PAYLOAD_SHAPE=true` logs the body keys.
+  The event is queued once per call
   and once per number per Eastern day, and text_back decides it at once and on every CDR poller step with the same
   gates as BatchDialer: 60 s, text consent (LendingFlow leads count as consented), 8am-8pm ET, suppression,
   `MISSED_CALL_TEXT_ENABLED` (off until A2P is approved) and the emergency stop. A call whose webhook never came is
