@@ -153,6 +153,7 @@ GHL_LOAD_SYNC_POOL_TAGS: dict[str, str] = {
     "wholesalers": "ndl-wholesaler",
     "nurture": "ndl-nurture",
     "lendingflow": "lendingflow",  # LendingFlow phones are warm, so the sync skips them; mapped for completeness
+    "website": "web-lead",  # website phones are warm too (skipped); mapped for completeness
 }
 GHL_LOAD_SYNC_BATCH_SIZE = 200       # rows per run
 GHL_LOAD_SYNC_MAX_ATTEMPTS = 5       # then status 'failed' and one ops notice
