@@ -183,3 +183,10 @@ def test_live_run_reads_commits_then_pushes_then_records(monkeypatch):
     result = sync._live_run(10, LoggingSink())
     assert events == ["read", "commit", "push", "record", "commit"]
     assert dict(result.counts) == {"pushed": 1}
+
+
+def test_every_status_fits_the_status_column():
+    from src.lending.models import LendingDialerLoadRecord
+
+    width = LendingDialerLoadRecord.__table__.c.ghl_sync_status.type.length
+    assert max(len(s.value) for s in SyncStatus) <= width

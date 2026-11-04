@@ -191,7 +191,7 @@ class LendingDialerLoadRecord(LendingBase):
     deactivated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     deactivation_reason: Mapped[Optional[str]] = mapped_column(String(40))
     # GHL contact sync (src/lending/ghl_load_sync.py): NULL status = not yet handled.
-    ghl_sync_status: Mapped[Optional[str]] = mapped_column(String(20))  # pushed|skipped_warm|skipped_suppressed|skipped_unmapped|failed
+    ghl_sync_status: Mapped[Optional[str]] = mapped_column(String(40))  # a ghl_load_sync.SyncStatus value
     ghl_sync_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
     ghl_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     ghl_sync_error: Mapped[Optional[str]] = mapped_column(String(200))

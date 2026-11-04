@@ -37,11 +37,13 @@ def apply(engine: Engine | None = None, schema: str = LENDING_SCHEMA) -> None:
         conn.execute(text("SET LOCAL lock_timeout = '5s'"))
         conn.execute(text(
             f"ALTER TABLE {table} "
-            "ADD COLUMN IF NOT EXISTS ghl_sync_status VARCHAR(20), "
+            "ADD COLUMN IF NOT EXISTS ghl_sync_status VARCHAR(40), "
             "ADD COLUMN IF NOT EXISTS ghl_sync_attempts INTEGER NOT NULL DEFAULT 0, "
             "ADD COLUMN IF NOT EXISTS ghl_synced_at TIMESTAMPTZ, "
             "ADD COLUMN IF NOT EXISTS ghl_sync_error VARCHAR(200)"
         ))
+        # A first run created VARCHAR(20), too short for skipped_already_in_ghl; widening a varchar is metadata-only.
+        conn.execute(text(f"ALTER TABLE {table} ALTER COLUMN ghl_sync_status TYPE VARCHAR(40)"))
         conn.execute(text(
             "CREATE INDEX IF NOT EXISTS idx_lending_dialer_load_records_ghl_pending "
             f"ON {table} (id) WHERE active AND ghl_sync_status IS NULL"
