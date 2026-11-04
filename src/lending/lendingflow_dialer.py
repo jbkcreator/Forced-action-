@@ -1,4 +1,8 @@
-"""LendingFlow leads into the BatchDialer "LendingFlow" campaign, and out again once they are handled in GHL.
+"""Inbound leads into their BatchDialer campaign, and out again once they are handled in GHL.
+
+Two sources share this code (``LeadSource``): LendingFlow leads -> campaign "LendingFlow" (no consent check, no Tracerfy
+scrub: client decision), and website leads -> campaign "Website" (only leads who ticked the call-consent box, with the
+Tracerfy DNC scrub like every other list). What follows is written for LendingFlow and applies to both.
 
 Loading runs from the 5-minute LendingFlow sweep, never inside the GHL delivery. A lead is loaded once it is in GHL,
 is not suppressed, is older than LENDING_LENDINGFLOW_DIALER_DELAY_MINUTES (default 0: the next sweep) and has not been
@@ -53,6 +57,9 @@ from config.lending_lendingflow import (
     DIALER_TEMPORARY_REASONS,
     GHL_CONNECTED_OUTCOMES,
     HANDLED_MIN_TALK_SECONDS,
+    WEB_DIALER_LOCK_KEY,
+    WEB_DIALER_POOL,
+    WEB_DIALER_REF_PREFIX,
 )
 from config.settings import get_settings
 from src.lending.compliance import Scrubber, phone_hash
@@ -77,8 +84,28 @@ _PUSH_FAILED = "push_failed"  # an outcome, not a status: pending again, or fail
 HANDLED_BOOKED = "booked"
 HANDLED_CONNECTED = "ghl_call_connected"
 CAMPAIGN = POOL_CAMPAIGN_TAGS[DIALER_POOL]
+WEB_CAMPAIGN = POOL_CAMPAIGN_TAGS[WEB_DIALER_POOL]
 
 SessionFactory = Callable[[], AbstractContextManager[Session]]
+
+
+@dataclass(frozen=True)
+class LeadSource:
+    """One inbound lead table loaded into its own BatchDialer campaign."""
+    label: str
+    table: str                      # lending.<table>, with the dialer_* / handled_in_ghl_* columns
+    ref_prefix: str                 # dialer_load_records.source_record_ref = prefix + the lead's ref key
+    ref_key: str                    # lead column that makes the ref (lead_uuid / id)
+    pool: str
+    campaign: str
+    lock_key: int
+    dnc_scrub: bool                 # Tracerfy DNC / litigator scrub at load
+    claim_filter: str               # extra SQL on the claim (e.g. the call-consent tick)
+    blocked_filter: str             # SQL for a pending lead that can never load (reason in blocked_reason)
+    blocked_reason: str
+    returning: str                  # claim RETURNING columns
+    enabled: Callable[[], bool]
+    record: Callable[[Mapping[str, Any]], dict[str, Any]]
 
 
 @dataclass
@@ -102,8 +129,9 @@ def _default_sessions() -> AbstractContextManager[Session]:
     return lending_session()
 
 
-def _ref(lead: Mapping[str, Any]) -> str:
-    return f"{DIALER_REF_PREFIX}{lead['lead_uuid']}"
+def _ref(lead: Mapping[str, Any], source: Optional[LeadSource] = None) -> str:
+    source = source or LENDINGFLOW
+    return f"{source.ref_prefix}{lead[source.ref_key]}"
 
 
 # --------------------------------------------------------------------------- the record the loader sees
@@ -145,20 +173,73 @@ def lendingflow_pool_record(lead: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def web_lead_card(lead: Mapping[str, Any]) -> dict[str, str]:
+    """The ISA's call card for a website lead: who asked, for what, and when."""
+    name = (lead.get("name") or "").split()
+    amount = f"${lead['loan_amount']:,}" if lead.get("loan_amount") else None
+    return {
+        "first_name": _card_text(name[0] if name else None),
+        "campaign": WEB_CAMPAIGN,
+        "hook": _card_text(CAMPAIGN_HOOKS.get(WEB_CAMPAIGN)),
+        "loan": _card_text(amount),
+        "loan_type": _card_text(lead.get("deal_type")),
+        "state": _card_text(lead.get("property_state")),
+        "requested": f"{lead['received_at'].astimezone(CARD_TIMEZONE):%Y-%m-%d}",
+    }
+
+
+def web_lead_pool_record(lead: Mapping[str, Any]) -> dict[str, Any]:
+    """A stored website lead as a ``run_dialer_load`` record in the ``website`` pool."""
+    return {
+        "source_record_ref": _ref(lead, WEBSITE),
+        "pool": WEB_DIALER_POOL,
+        "phone": lead["phone"],
+        "email": lead.get("email"),
+        "borrower_name": lead.get("name"),
+        "property_address": lead.get("property_address"),
+        "estimated_loan_value": lead.get("loan_amount"),
+        "state": lead.get("property_state"),
+        "card": web_lead_card(lead),
+    }
+
+
+LENDINGFLOW = LeadSource(
+    label="lendingflow-dialer", table="lending.lendingflow_leads", ref_prefix=DIALER_REF_PREFIX, ref_key="lead_uuid",
+    pool=DIALER_POOL, campaign=CAMPAIGN, lock_key=DIALER_LOCK_KEY, dnc_scrub=False, claim_filter="",
+    blocked_filter="suppressed", blocked_reason="SUPPRESSED",
+    returning=("id, lead_uuid, phone, email, first_name, last_name, loan_amount, loan_amount_range, loan_type, "
+               "property_state, property_zip, property_address, submitted_at, received_at, ghl_contact_id, "
+               "dialer_failures"),
+    enabled=lambda: get_settings().lending_lendingflow_dialer_enabled,
+    record=lendingflow_pool_record,
+)
+WEBSITE = LeadSource(
+    label="web-lead-dialer", table="lending.web_leads", ref_prefix=WEB_DIALER_REF_PREFIX, ref_key="id",
+    pool=WEB_DIALER_POOL, campaign=WEB_CAMPAIGN, lock_key=WEB_DIALER_LOCK_KEY, dnc_scrub=True,
+    claim_filter="AND call_consent", blocked_filter="(suppressed OR NOT call_consent)",
+    blocked_reason="NO_CALL_CONSENT",
+    returning=("id, phone, email, name, loan_amount, deal_type, property_state, property_address, received_at, "
+               "ghl_contact_id, dialer_failures"),
+    enabled=lambda: get_settings().lending_web_lead_dialer_enabled,
+    record=web_lead_pool_record,
+)
+SOURCES: tuple[LeadSource, ...] = (LENDINGFLOW, WEBSITE)
+
+
 # --------------------------------------------------------------------------- handled in GHL
 
-_STAMP_HANDLED = text("""
-    UPDATE lending.lendingflow_leads
+_STAMP_HANDLED = """
+    UPDATE {t}
        SET handled_in_ghl_at = :now, handled_in_ghl_reason = :why,
            dialer_status = CASE WHEN dialer_status = 'pending' THEN 'blocked'
                                 WHEN dialer_status IN ('loaded', 'unconfirmed') THEN 'remove_pending'
                                 ELSE dialer_status END,
            dialer_block_reason = CASE WHEN dialer_status = 'pending' THEN 'HANDLED_IN_GHL' ELSE dialer_block_reason END
      WHERE phone = :phone AND handled_in_ghl_at IS NULL
-""")
+"""
 
 _CONNECTED_IN_GHL = """
-    SELECT DISTINCT l.phone FROM lending.lendingflow_leads l
+    SELECT DISTINCT l.phone FROM {t} l
      WHERE l.handled_in_ghl_at IS NULL AND l.dialer_status IN ('pending', 'loading', 'loaded', 'unconfirmed')
        {phone_filter}
        AND EXISTS (SELECT 1 FROM lending.call_dispositions d
@@ -166,22 +247,24 @@ _CONNECTED_IN_GHL = """
                       AND COALESCE(d.talk_duration_sec, 0) >= :min_talk AND d.call_started_at >= l.received_at)
 """
 
-_ACTIVE_LENDINGFLOW_ROW = text(
+_ACTIVE_SOURCE_ROW = text(
     "SELECT EXISTS (SELECT 1 FROM lending.dialer_load_records "
     "WHERE active AND phone = :phone AND source_record_ref LIKE :prefix)"
 )
 
 
-def mark_handled_in_ghl(db: Session, phone: str, *, reason: str, now: Optional[datetime] = None) -> int:
-    """Stamp every unstamped lead on this phone as handled in GHL. A pending lead is blocked; a loaded (or
-    unconfirmed) one becomes remove_pending; a lead being loaded keeps ``loading`` (its loader re-reads the stamp).
+def mark_handled_in_ghl(db: Session, phone: str, *, reason: str, now: Optional[datetime] = None,
+                        sources: Optional[tuple[LeadSource, ...]] = None) -> int:
+    """Stamp every unstamped lead on this phone (every source) as handled in GHL. A pending lead is blocked; a loaded
+    (or unconfirmed) one becomes remove_pending; a lead being loaded keeps ``loading`` (its loader re-reads the stamp).
     Returns how many leads were stamped. Does not commit."""
     now = now or datetime.now(timezone.utc)
-    return db.execute(_STAMP_HANDLED, {"phone": phone, "why": reason, "now": now}).rowcount
+    return sum(db.execute(text(_STAMP_HANDLED.format(t=source.table)),
+                          {"phone": phone, "why": reason, "now": now}).rowcount for source in sources or SOURCES)
 
 
-def _connected_phones(db: Session, phone: Optional[str] = None) -> list[str]:
-    sql = _CONNECTED_IN_GHL.format(phone_filter="AND l.phone = :phone" if phone else "")
+def _connected_phones(db: Session, source: LeadSource, phone: Optional[str] = None) -> list[str]:
+    sql = _CONNECTED_IN_GHL.format(t=source.table, phone_filter="AND l.phone = :phone" if phone else "")
     params: dict[str, Any] = {"ghl": CALL_SOURCE_GHL, "connected": list(GHL_CONNECTED_OUTCOMES),
                               "min_talk": HANDLED_MIN_TALK_SECONDS}
     if phone:
@@ -189,10 +272,12 @@ def _connected_phones(db: Session, phone: Optional[str] = None) -> list[str]:
     return [row[0] for row in db.execute(text(sql), params)]
 
 
-def stamp_handled_from_calls(db: Session, now: datetime, *, phone: Optional[str] = None) -> int:
+def stamp_handled_from_calls(db: Session, now: datetime, *, phone: Optional[str] = None,
+                             source: Optional[LeadSource] = None) -> int:
     """Leads with a connected GHL call stored since they arrived (by the 15-minute import or this module's live
     re-read) are stamped handled. Returns the number of leads stamped. Does not commit."""
-    return sum(mark_handled_in_ghl(db, p, reason=HANDLED_CONNECTED, now=now) for p in _connected_phones(db, phone))
+    return sum(mark_handled_in_ghl(db, p, reason=HANDLED_CONNECTED, now=now)
+               for p in _connected_phones(db, source or LENDINGFLOW, phone))
 
 
 def remove_handled_phone(db: Session, dialer: DialerContacts, phone: str, now: Optional[datetime] = None) -> bool:
@@ -202,29 +287,33 @@ def remove_handled_phone(db: Session, dialer: DialerContacts, phone: str, now: O
     try:
         dialer.remove(phone, reason=RemovalReason.HANDLED_IN_GHL.value)
     except Exception as exc:  # class only: dialer errors can carry request detail
-        db.execute(text("UPDATE lending.lendingflow_leads SET dialer_last_error = :err "
-                        "WHERE phone = :phone AND dialer_status = 'remove_pending'"),
-                   {"err": f"remove: {type(exc).__name__}", "phone": phone})
+        for source in SOURCES:
+            db.execute(text(f"UPDATE {source.table} SET dialer_last_error = :err "
+                            "WHERE phone = :phone AND dialer_status = 'remove_pending'"),
+                       {"err": f"remove: {type(exc).__name__}", "phone": phone})
         logger.error("[lendingflow-dialer] handled-in-GHL removal failed lead_phone_hash=%s: %s",
                      _hash(phone), type(exc).__name__)
         return False
     db.execute(text("UPDATE lending.dialer_load_records SET active = false, deactivated_at = :now, "
                     "deactivation_reason = :reason WHERE active AND phone = :phone"),
                {"now": now, "reason": RemovalReason.HANDLED_IN_GHL.value, "phone": phone})
-    db.execute(text("UPDATE lending.lendingflow_leads SET dialer_status = 'removed', dialer_removed_at = :now, "
-                    "dialer_last_error = NULL WHERE phone = :phone AND handled_in_ghl_at IS NOT NULL "
-                    "AND dialer_status IN ('remove_pending', 'loaded')"),
-               {"now": now, "phone": phone})
+    for source in SOURCES:
+        db.execute(text(f"UPDATE {source.table} SET dialer_status = 'removed', dialer_removed_at = :now, "
+                        "dialer_last_error = NULL WHERE phone = :phone AND handled_in_ghl_at IS NOT NULL "
+                        "AND dialer_status IN ('remove_pending', 'loaded')"),
+                   {"now": now, "phone": phone})
     logger.info("[lendingflow-dialer] removed a lead handled in GHL from the dialer phone_hash=%s", _hash(phone))
     return True
 
 
 def _needs_removal(db: Session, phone: str) -> bool:
-    if db.execute(_ACTIVE_LENDINGFLOW_ROW, {"phone": phone, "prefix": f"{DIALER_REF_PREFIX}%"}).scalar():
-        return True
-    return bool(db.execute(text("SELECT EXISTS (SELECT 1 FROM lending.lendingflow_leads "
-                                "WHERE phone = :phone AND dialer_status = 'remove_pending')"),
-                           {"phone": phone}).scalar())
+    for source in SOURCES:
+        if db.execute(_ACTIVE_SOURCE_ROW, {"phone": phone, "prefix": f"{source.ref_prefix}%"}).scalar():
+            return True
+        if db.execute(text(f"SELECT EXISTS (SELECT 1 FROM {source.table} "
+                           "WHERE phone = :phone AND dialer_status = 'remove_pending')"), {"phone": phone}).scalar():
+            return True
+    return False
 
 
 def handle_handled_in_ghl(phone: Optional[str], *, reason: str,
@@ -251,14 +340,15 @@ def handle_handled_in_ghl(phone: Optional[str], *, reason: str,
         logger.error("[lendingflow-dialer] handled-in-GHL processing failed: %s", type(exc).__name__)
 
 
-def _remove_all_handled(db: Session, dialer: Optional[DialerContacts], now: datetime, stats: DialerStepStats) -> None:
-    phones = [row[0] for row in db.execute(text("""
-        SELECT DISTINCT l.phone FROM lending.lendingflow_leads l
+def _remove_all_handled(db: Session, dialer: Optional[DialerContacts], now: datetime, stats: DialerStepStats,
+                        source: LeadSource) -> None:
+    phones = [row[0] for row in db.execute(text(f"""
+        SELECT DISTINCT l.phone FROM {source.table} l
          WHERE l.handled_in_ghl_at IS NOT NULL
            AND (l.dialer_status = 'remove_pending'
                 OR EXISTS (SELECT 1 FROM lending.dialer_load_records r
                             WHERE r.active AND r.phone = l.phone AND r.source_record_ref LIKE :prefix))
-    """), {"prefix": f"{DIALER_REF_PREFIX}%"})]
+    """), {"prefix": f"{source.ref_prefix}%"})]
     if phones and dialer is None:
         logger.warning("[lendingflow-dialer] %d lead(s) handled in GHL wait for removal: dialer not configured",
                        len(phones))
@@ -273,38 +363,40 @@ def _remove_all_handled(db: Session, dialer: Optional[DialerContacts], now: date
 
 # --------------------------------------------------------------------------- housekeeping
 
-def _housekeeping(db: Session, now: datetime) -> None:
+def _housekeeping(db: Session, now: datetime, source: Optional[LeadSource] = None) -> None:
     """Recover leads a crashed run left ``loading`` (no run is live: we hold the lock), release unconfirmed leads whose
     create was reconciled, block leads that can never load, expire stale ones, then mark same-phone duplicates."""
-    prefix = DIALER_REF_PREFIX
-    db.execute(text("""
-        UPDATE lending.lendingflow_leads l
+    source = source or LENDINGFLOW
+    t, ref, prefix = source.table, f"l.{source.ref_key}::text", source.ref_prefix
+    db.execute(text(f"""
+        UPDATE {t} l
            SET dialer_status = CASE
                  WHEN EXISTS (SELECT 1 FROM lending.dialer_unconfirmed_creates u
-                               WHERE u.source_record_ref = :prefix || l.lead_uuid::text AND u.resolved_at IS NULL)
+                               WHERE u.source_record_ref = :prefix || {ref} AND u.resolved_at IS NULL)
                    THEN 'unconfirmed'
                  WHEN EXISTS (SELECT 1 FROM lending.dialer_load_records r
-                               WHERE r.active AND r.source_record_ref = :prefix || l.lead_uuid::text) THEN 'loaded'
+                               WHERE r.active AND r.source_record_ref = :prefix || {ref}) THEN 'loaded'
                  ELSE 'pending' END
          WHERE dialer_status = 'loading'
     """), {"prefix": prefix})
-    db.execute(text("""
-        UPDATE lending.lendingflow_leads l SET dialer_status = 'pending'
+    db.execute(text(f"""
+        UPDATE {t} l SET dialer_status = 'pending'
          WHERE dialer_status = 'unconfirmed' AND NOT EXISTS (
                SELECT 1 FROM lending.dialer_unconfirmed_creates u
-                WHERE u.source_record_ref = :prefix || l.lead_uuid::text AND u.resolved_at IS NULL)
+                WHERE u.source_record_ref = :prefix || {ref} AND u.resolved_at IS NULL)
     """), {"prefix": prefix})
-    db.execute(text("""
-        UPDATE lending.lendingflow_leads
+    db.execute(text(f"""
+        UPDATE {t}
            SET dialer_status = CASE WHEN received_at < :oldest THEN 'expired' ELSE 'blocked' END,
-               dialer_block_reason = CASE WHEN received_at < :oldest THEN dialer_block_reason ELSE 'SUPPRESSED' END
-         WHERE dialer_status = 'pending' AND (suppressed OR received_at < :oldest)
-    """), {"oldest": now - timedelta(days=DIALER_MAX_LEAD_AGE_DAYS)})
+               dialer_block_reason = CASE WHEN received_at < :oldest THEN dialer_block_reason
+                                          WHEN suppressed THEN 'SUPPRESSED' ELSE :reason END
+         WHERE dialer_status = 'pending' AND ({source.blocked_filter} OR received_at < :oldest)
+    """), {"oldest": now - timedelta(days=DIALER_MAX_LEAD_AGE_DAYS), "reason": source.blocked_reason})
     # One BatchDialer contact per phone: a pending lead is a duplicate when another lead on the phone is already in the
     # dialer path, or is an older loadable pending lead.
-    db.execute(text("""
-        UPDATE lending.lendingflow_leads l SET dialer_status = 'duplicate', duplicate_of = o.id
-          FROM lending.lendingflow_leads o
+    db.execute(text(f"""
+        UPDATE {t} l SET dialer_status = 'duplicate', duplicate_of = o.id
+          FROM {t} o
          WHERE l.dialer_status = 'pending' AND o.phone = l.phone AND o.id <> l.id
            AND (o.dialer_status IN ('loading', 'loaded', 'unconfirmed', 'remove_pending', 'removed')
                 OR (o.dialer_status = 'pending' AND (o.received_at, o.id) < (l.received_at, l.id)))
@@ -313,23 +405,24 @@ def _housekeeping(db: Session, now: datetime) -> None:
 
 # --------------------------------------------------------------------------- loading
 
-_CLAIM = text("""
-    UPDATE lending.lendingflow_leads SET dialer_status = 'loading', dialer_claimed_at = :now,
+_CLAIM = """
+    UPDATE {t} SET dialer_status = 'loading', dialer_claimed_at = :now,
            dialer_attempts = dialer_attempts + 1
-     WHERE id IN (SELECT id FROM lending.lendingflow_leads
-                   WHERE dialer_status = 'pending' AND handled_in_ghl_at IS NULL AND NOT suppressed AND ghl_status IN ('synced', 'contact_only') AND ghl_contact_id IS NOT NULL
+     WHERE id IN (SELECT id FROM {t}
+                   WHERE dialer_status = 'pending' AND handled_in_ghl_at IS NULL AND NOT suppressed
+                     AND ghl_status IN ('synced', 'contact_only') AND ghl_contact_id IS NOT NULL {claim_filter}
                      AND received_at <= :ready_before
                      AND (dialer_next_attempt_at IS NULL OR dialer_next_attempt_at <= :now)
                    ORDER BY received_at LIMIT :limit FOR UPDATE SKIP LOCKED)
-    RETURNING id, lead_uuid, phone, email, first_name, last_name, loan_amount, loan_amount_range, loan_type,
-              property_state, property_zip, property_address, submitted_at, received_at, ghl_contact_id,
-              dialer_failures
-""")
+    RETURNING {returning}
+"""
 
 
-def _claim(db: Session, now: datetime) -> list[dict[str, Any]]:
+def _claim(db: Session, now: datetime, source: Optional[LeadSource] = None) -> list[dict[str, Any]]:
+    source = source or LENDINGFLOW
     delay = timedelta(minutes=get_settings().lending_lendingflow_dialer_delay_minutes)
-    rows = db.execute(_CLAIM, {"now": now, "ready_before": now - delay, "limit": DIALER_BATCH_SIZE}).mappings().all()
+    sql = text(_CLAIM.format(t=source.table, claim_filter=source.claim_filter, returning=source.returning))
+    rows = db.execute(sql, {"now": now, "ready_before": now - delay, "limit": DIALER_BATCH_SIZE}).mappings().all()
     return [dict(row) for row in rows]
 
 
@@ -367,25 +460,27 @@ def _outcome(db: Session, report: LoadReport, ref: str) -> tuple[str, Optional[s
     return _classify("NOT_LOADED"), "NOT_LOADED"
 
 
-def _finish(db: Session, lead: Mapping[str, Any], status: str, reason: Optional[str], now: datetime) -> str:
+def _finish(db: Session, lead: Mapping[str, Any], status: str, reason: Optional[str], now: datetime,
+            source: Optional[LeadSource] = None) -> str:
     """Write the lead's outcome (only while it is still ``loading``, ours) and commit. Returns the stored status."""
+    t = (source or LENDINGFLOW).table
     params: dict[str, Any] = {"id": lead["id"], "now": now, "reason": reason}
     if status == _PUSH_FAILED:
         status = FAILED if int(lead["dialer_failures"]) + 1 >= DIALER_MAX_FAILURES else PENDING
         params["err"] = (reason or "")[:200]
-        db.execute(text("UPDATE lending.lendingflow_leads SET dialer_status = :status, dialer_failures = dialer_failures + 1, "
+        db.execute(text(f"UPDATE {t} SET dialer_status = :status, dialer_failures = dialer_failures + 1, "
                         "dialer_last_error = :err, dialer_next_attempt_at = :retry WHERE id = :id AND dialer_status = 'loading'"),
                    {**params, "status": status, "retry": now + timedelta(minutes=DIALER_RETRY_MINUTES)})
     elif status == LOADED:
-        db.execute(text("UPDATE lending.lendingflow_leads SET dialer_status = 'loaded', dialer_loaded_at = :now, "
+        db.execute(text(f"UPDATE {t} SET dialer_status = 'loaded', dialer_loaded_at = :now, "
                         "dialer_block_reason = NULL, dialer_last_error = NULL WHERE id = :id AND dialer_status = 'loading'"),
                    params)
     elif status == PENDING:
-        db.execute(text("UPDATE lending.lendingflow_leads SET dialer_status = 'pending', dialer_block_reason = :reason, "
+        db.execute(text(f"UPDATE {t} SET dialer_status = 'pending', dialer_block_reason = :reason, "
                         "dialer_next_attempt_at = :retry WHERE id = :id AND dialer_status = 'loading'"),
                    {**params, "retry": now + timedelta(minutes=DIALER_RETRY_MINUTES)})
     else:  # BLOCKED / UNCONFIRMED
-        db.execute(text("UPDATE lending.lendingflow_leads SET dialer_status = :status, dialer_block_reason = :reason "
+        db.execute(text(f"UPDATE {t} SET dialer_status = :status, dialer_block_reason = :reason "
                         "WHERE id = :id AND dialer_status = 'loading'"), {**params, "status": status})
     db.commit()
     return status
@@ -400,56 +495,60 @@ def _refresh_ghl_calls(db: Session, read_calls: CallReader, lead: Mapping[str, A
     return stats.ghl.lookup_failures == before
 
 
-def _in_other_campaign(db: Session, phone: str) -> bool:
+def _in_other_campaign(db: Session, phone: str, source: LeadSource) -> bool:
     return bool(db.execute(text("SELECT EXISTS (SELECT 1 FROM lending.dialer_load_records "
                                 "WHERE active AND phone = :phone AND campaign_tag IS DISTINCT FROM :campaign)"),
-                           {"phone": phone, "campaign": CAMPAIGN}).scalar())
+                           {"phone": phone, "campaign": source.campaign}).scalar())
 
 
 def _load_one(db: Session, lead: dict[str, Any], *, dialer: DialerContacts, scrubber: Scrubber,
-              read_calls: CallReader, now: datetime, stats: DialerStepStats) -> None:
-    ref = _ref(lead)
+              read_calls: CallReader, now: datetime, stats: DialerStepStats, source: LeadSource) -> None:
+    ref = _ref(lead, source)
+
+    def finish(status: str, reason: Optional[str]) -> None:
+        _count(stats, _finish(db, lead, status, reason, now, source))
+
     if not _refresh_ghl_calls(db, read_calls, lead, stats):
-        _count(stats, _finish(db, lead, PENDING, "GHL_CHECK_FAILED", now))
+        finish(PENDING, "GHL_CHECK_FAILED")
         return
-    if stamp_handled_from_calls(db, now, phone=lead["phone"]):
+    if stamp_handled_from_calls(db, now, phone=lead["phone"], source=source):
         stats.handled += 1
-        _count(stats, _finish(db, lead, BLOCKED, "HANDLED_IN_GHL", now))
+        finish(BLOCKED, "HANDLED_IN_GHL")
         return
-    if _in_other_campaign(db, lead["phone"]):
-        _count(stats, _finish(db, lead, BLOCKED, "IN_OTHER_CAMPAIGN", now))
+    if _in_other_campaign(db, lead["phone"], source):
+        finish(BLOCKED, "IN_OTHER_CAMPAIGN")
         return
     if _unconfirmed(db, ref):
-        _count(stats, _finish(db, lead, UNCONFIRMED, "CREATE_OUTCOME_UNKNOWN", now))
+        finish(UNCONFIRMED, "CREATE_OUTCOME_UNKNOWN")
         return
-    run_id = f"lendingflow-{lead['id']}-{now:%Y%m%dT%H%M%S}"
+    run_id = f"{source.pool}-{lead['id']}-{now:%Y%m%dT%H%M%S}"
     try:
-        report = run_dialer_load([lendingflow_pool_record(lead)], db, run_id=run_id, dry_run=False,
-                                 scrubber=scrubber, dialer=dialer, commit=db.commit, now=now, dnc_scrub=False)
+        report = run_dialer_load([source.record(lead)], db, run_id=run_id, dry_run=False, scrubber=scrubber,
+                                 dialer=dialer, commit=db.commit, now=now, dnc_scrub=source.dnc_scrub)
     except LoadRefused:
         db.rollback()
-        _count(stats, _finish(db, lead, PENDING, "LOAD_REFUSED", now))
+        finish(PENDING, "LOAD_REFUSED")
         return
     except Exception as exc:  # class only: SQL / HTTP errors can carry phone numbers
         db.rollback()
-        logger.error("[lendingflow-dialer] load crashed lead=%s: %s", lead["id"], type(exc).__name__)
-        _count(stats, _finish(db, lead, _PUSH_FAILED, type(exc).__name__, now))
+        logger.error("[%s] load crashed lead=%s: %s", source.label, lead["id"], type(exc).__name__)
+        finish(_PUSH_FAILED, type(exc).__name__)
         return
     status, reason = _outcome(db, report, ref)
-    stored = _finish(db, lead, status, reason, now)
+    stored = _finish(db, lead, status, reason, now, source)
     _count(stats, stored)
     if stored == LOADED:
-        _remove_if_handled_meanwhile(db, dialer, lead, now, stats)
+        _remove_if_handled_meanwhile(db, dialer, lead, now, stats, source)
 
 
 def _remove_if_handled_meanwhile(db: Session, dialer: DialerContacts, lead: Mapping[str, Any], now: datetime,
-                                 stats: DialerStepStats) -> None:
+                                 stats: DialerStepStats, source: LeadSource) -> None:
     """The load row is committed; a stamp written while we were pushing is visible now (module docstring)."""
-    handled = db.execute(text("SELECT handled_in_ghl_at FROM lending.lendingflow_leads WHERE id = :id"),
+    handled = db.execute(text(f"SELECT handled_in_ghl_at FROM {source.table} WHERE id = :id"),
                          {"id": lead["id"]}).scalar()
     if handled is None:
         return
-    db.execute(text("UPDATE lending.lendingflow_leads SET dialer_status = 'remove_pending' "
+    db.execute(text(f"UPDATE {source.table} SET dialer_status = 'remove_pending' "
                     "WHERE id = :id AND dialer_status = 'loaded'"), {"id": lead["id"]})
     db.commit()
     if remove_handled_phone(db, dialer, lead["phone"], now):
@@ -472,18 +571,19 @@ def _count(stats: DialerStepStats, status: str) -> None:
         stats.failed += 1
 
 
-def _recheck_loaded_in_ghl(db: Session, read_calls: CallReader, now: datetime, stats: DialerStepStats) -> None:
+def _recheck_loaded_in_ghl(db: Session, read_calls: CallReader, now: datetime, stats: DialerStepStats,
+                           source: LeadSource) -> None:
     """Re-read the GHL calls of loaded leads (least recently checked first), so a connected call reaches us within
     one sweep instead of the 15-minute import."""
-    leads = db.execute(text("""
-        SELECT id, phone, ghl_contact_id, received_at FROM lending.lendingflow_leads
+    leads = db.execute(text(f"""
+        SELECT id, phone, ghl_contact_id, received_at FROM {source.table}
          WHERE dialer_status = 'loaded' AND handled_in_ghl_at IS NULL AND ghl_contact_id IS NOT NULL
          ORDER BY dialer_ghl_checked_at NULLS FIRST, id LIMIT :limit
     """), {"limit": DIALER_GHL_RECHECK_BATCH}).mappings().all()
     for lead in leads:
         _store_contact(db, read_calls, lead["ghl_contact_id"], lead["phone"], lead["received_at"], stats.ghl,
                        CALL_DIRECTIONS)
-        db.execute(text("UPDATE lending.lendingflow_leads SET dialer_ghl_checked_at = :now WHERE id = :id"),
+        db.execute(text(f"UPDATE {source.table} SET dialer_ghl_checked_at = :now WHERE id = :id"),
                    {"now": now, "id": lead["id"]})
         db.commit()
 
@@ -491,12 +591,12 @@ def _recheck_loaded_in_ghl(db: Session, read_calls: CallReader, now: datetime, s
 # --------------------------------------------------------------------------- the sweep step
 
 @contextmanager
-def _single_run(sessions: SessionFactory) -> Iterator[bool]:
+def _single_run(sessions: SessionFactory, lock_key: int = DIALER_LOCK_KEY) -> Iterator[bool]:
     """Yields whether this run holds the dialer-step lock. The lock lives in its own never-committed transaction, so
     the work session's commits do not release it; leaving rolls it back and frees the lock."""
     with sessions() as lock_db:
         try:
-            yield bool(lock_db.execute(text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": DIALER_LOCK_KEY}).scalar())
+            yield bool(lock_db.execute(text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": lock_key}).scalar())
         finally:
             lock_db.rollback()
 
@@ -504,36 +604,40 @@ def _single_run(sessions: SessionFactory) -> Iterator[bool]:
 def run_dialer_step(*, dialer: Optional[DialerContacts], scrubber: Optional[Scrubber],
                     read_calls: Optional[CallReader], now: Optional[datetime] = None,
                     sessions: SessionFactory = _default_sessions,
-                    single_run: Optional[Callable[[], AbstractContextManager[bool]]] = None) -> DialerStepStats:
+                    single_run: Optional[Callable[[], AbstractContextManager[bool]]] = None,
+                    source: Optional[LeadSource] = None) -> DialerStepStats:
     """One pass: housekeeping, handled-in-GHL detection and removals (always, so turning loading off never strands a
     lead that Josh has since handled), then loading (only with LENDING_LENDINGFLOW_DIALER_ENABLED, a dialer, a
     scrubber and a GHL call reader, and not while the emergency halt is on). Commits as it goes."""
     now = now or datetime.now(timezone.utc)
+    source = source or LENDINGFLOW
     stats = DialerStepStats()
-    with (single_run or (lambda: _single_run(sessions)))() as holds_lock:
+    with (single_run or (lambda: _single_run(sessions, source.lock_key)))() as holds_lock:
         if not holds_lock:
             stats.skipped_locked = True
             return stats
         with sessions() as db:
-            _housekeeping(db, now)
+            _housekeeping(db, now, source)
             db.commit()
             if read_calls is not None:
-                _recheck_loaded_in_ghl(db, read_calls, now, stats)
-            stats.handled += stamp_handled_from_calls(db, now)
+                _recheck_loaded_in_ghl(db, read_calls, now, stats, source)
+            stats.handled += stamp_handled_from_calls(db, now, source=source)
             db.commit()
-            _remove_all_handled(db, dialer, now, stats)
-            if not _may_load(dialer, scrubber, read_calls):
+            _remove_all_handled(db, dialer, now, stats, source)
+            if not _may_load(dialer, scrubber, read_calls, source):
                 return stats
-            claimed = _claim(db, now)
+            claimed = _claim(db, now, source)
             db.commit()
             stats.claimed = len(claimed)
             for lead in claimed:
-                _load_one(db, lead, dialer=dialer, scrubber=scrubber, read_calls=read_calls, now=now, stats=stats)
+                _load_one(db, lead, dialer=dialer, scrubber=scrubber, read_calls=read_calls, now=now, stats=stats,
+                          source=source)
     return stats
 
 
-def _may_load(dialer: Optional[DialerContacts], scrubber: Optional[Scrubber], read_calls: Optional[CallReader]) -> bool:
-    if not get_settings().lending_lendingflow_dialer_enabled:
+def _may_load(dialer: Optional[DialerContacts], scrubber: Optional[Scrubber], read_calls: Optional[CallReader],
+              source: Optional[LeadSource] = None) -> bool:
+    if not (source or LENDINGFLOW).enabled():
         return False
     if dialer is None or scrubber is None or read_calls is None:
         logger.warning("[lendingflow-dialer] loading is on but the dialer, the scrubber or the GHL call reader is not "
@@ -551,8 +655,9 @@ def _live_dialer() -> Optional[DialerContacts]:
     return get_dialer()
 
 
-def run_from_settings() -> DialerStepStats:
+def run_from_settings(source: Optional[LeadSource] = None) -> DialerStepStats:
     """Sweep entry point with the live dialer, Tracerfy and GHL reader. Never raises."""
+    source = source or LENDINGFLOW
     from src.lending.compliance import tracerfy_scrub
     from src.lending.ghl_account import lending_ghl_account
     from src.lending.ghl_calls import call_messages_reader
@@ -560,13 +665,14 @@ def run_from_settings() -> DialerStepStats:
     try:
         account = lending_ghl_account()
         stats = run_dialer_step(dialer=_live_dialer(), scrubber=tracerfy_scrub,
-                                read_calls=call_messages_reader(account) if account is not None else None)
+                                read_calls=call_messages_reader(account) if account is not None else None,
+                                source=source)
     except Exception as exc:  # class only
-        logger.error("[lendingflow-dialer] step crashed: %s", type(exc).__name__)
+        logger.error("[%s] step crashed: %s", source.label, type(exc).__name__)
         return DialerStepStats()
-    logger.info("[lendingflow-dialer] claimed=%d loaded=%d retry_later=%d blocked=%d unconfirmed=%d failed=%d "
+    logger.info("[%s] claimed=%d loaded=%d retry_later=%d blocked=%d unconfirmed=%d failed=%d "
                 "handled=%d removed=%d remove_failed=%d ghl_lookup_failures=%d skipped_locked=%s",
-                stats.claimed, stats.loaded, stats.retry_later, stats.blocked, stats.unconfirmed, stats.failed,
+                source.label, stats.claimed, stats.loaded, stats.retry_later, stats.blocked, stats.unconfirmed, stats.failed,
                 stats.handled, stats.removed, stats.remove_failed, stats.ghl.lookup_failures, stats.skipped_locked)
     return stats
 

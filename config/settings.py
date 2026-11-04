@@ -960,6 +960,8 @@ class AppSettings(BaseSettings):
 	# already loaded are still removed once they are handled in GHL. Delay before a new lead is loaded: 0 = on the next sweep
 	# (no head start for GHL; a GHL booking or connected call still removes the lead). Set minutes to give GHL a head start.
 	lending_lendingflow_dialer_enabled: bool = Field(default=False, env="LENDING_LENDINGFLOW_DIALER_ENABLED")
+	# Website leads into the BatchDialer campaign "Website" (same dialer step; call-consent tick + DNC scrub required).
+	lending_web_lead_dialer_enabled: bool = Field(default=False, env="LENDING_WEB_LEAD_DIALER_ENABLED")
 	lending_lendingflow_dialer_delay_minutes: int = Field(default=0, env="LENDING_LENDINGFLOW_DIALER_DELAY_MINUTES")
 	# BatchDialer call results as tags + a "last BatchDialer call" field on the GHL contact (src/lending/bd_result_to_ghl.py).
 	lending_bd_result_to_ghl_enabled: bool = Field(default=False, env="LENDING_BD_RESULT_TO_GHL_ENABLED")

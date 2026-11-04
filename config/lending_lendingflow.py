@@ -54,6 +54,11 @@ DIALER_MAX_FAILURES = 5
 DIALER_BATCH_SIZE = 25
 # One dialer step at a time (transaction advisory lock held for the whole run, next to the other lending lock keys).
 DIALER_LOCK_KEY = 7_302_020_810
+# Website leads use the same dialer step (LeadSource WEBSITE): their own campaign "Website", only leads who ticked the
+# call-consent box, and the Tracerfy DNC scrub (unlike LendingFlow).
+WEB_DIALER_POOL = "website"
+WEB_DIALER_REF_PREFIX = "web:"
+WEB_DIALER_LOCK_KEY = 7_302_020_811
 # Loaded leads whose GHL calls are re-read live per sweep (one GHL lookup each), least recently checked first.
 DIALER_GHL_RECHECK_BATCH = 50
 
@@ -65,7 +70,7 @@ DIALER_TEMPORARY_REASONS = frozenset({
 })
 DIALER_PERMANENT_REASONS = frozenset({
     "INVALID_PHONE", "NATIONAL_DNC", "STATE_DNC", "LITIGATOR", "SUPPRESSED", "GA_NATURAL_PERSON",
-    "HOMESTEAD_OWNER_OCCUPIED", "ATTEMPT_HISTORY_EXCEEDED", "BACKFLIP_CONFLICT", "HANDLED_IN_GHL",
+    "HOMESTEAD_OWNER_OCCUPIED", "ATTEMPT_HISTORY_EXCEEDED", "BACKFLIP_CONFLICT", "HANDLED_IN_GHL", "NO_CALL_CONSENT",
     "IN_OTHER_CAMPAIGN",
 })
 

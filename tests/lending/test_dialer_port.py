@@ -212,7 +212,7 @@ def test_pool_campaign_tags_name_the_ranked_queues_plus_nurture_and_lendingflow(
     assert POOL_CAMPAIGN_TAGS == {q.VERIFIED_MATURITY: "Verified maturity",
                                   q.TRANSACTION_READY: "Transaction ready", q.BUILDERS: "Builders",
                                   q.PARTNERS: "Partners", q.WHOLESALERS: "Wholesalers", q.NURTURE: "Nurture",
-                                  "lendingflow": "LendingFlow"}
+                                  "lendingflow": "LendingFlow", "website": "Website"}
 
 
 # ── HTTP transport ──

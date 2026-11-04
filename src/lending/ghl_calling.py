@@ -6,13 +6,13 @@ callback, DNC request, nurture, booked) or, for a GHL call whose result was neve
 toward the shared attempt limits and show on the other platform (tags / card field).
 
 - ``ghl_calling_phones``: phones GHL owns, which BatchDialer must not dial. The dialer load skips them and the dialer
-  sweep deletes any already loaded. A website lead is always GHL's (Josh works those in GHL); any other phone becomes
-  GHL's once it was reached in GHL.
+  sweep deletes any already loaded. A phone becomes GHL's once it was reached in GHL.
 - ``reached_in_batchdialer_phones``: phones the ISA reached in BatchDialer; the GHL call gate holds them off Josh's call
   lists (``ndl-do-not-call-now``).
 
-A LendingFlow lead's phone is never GHL's here: its dialer membership belongs to the LendingFlow dialer flow
-(``src/lending/lendingflow_dialer.py``), which deletes it once it is booked or connected in GHL (the same rule).
+A LendingFlow or website lead's phone is never GHL's here: its dialer membership belongs to the inbound dialer flow
+(``src/lending/lendingflow_dialer.py``, campaigns "LendingFlow" / "Website"), which deletes it once it is booked or
+connected in GHL (the same rule).
 """
 from __future__ import annotations
 
@@ -39,8 +39,8 @@ _REACHED_CALL = (
 _GHL_CALLING = text(
     "SELECT p FROM unnest(CAST(:phones AS text[])) AS p "
     "WHERE NOT EXISTS (SELECT 1 FROM lending.lendingflow_leads l WHERE l.phone = p) "
-    "  AND (EXISTS (SELECT 1 FROM lending.web_leads w WHERE w.phone = p) "
-    f"      OR EXISTS (SELECT 1 FROM lending.call_dispositions d WHERE {_REACHED_CALL}))"
+    "  AND NOT EXISTS (SELECT 1 FROM lending.web_leads w WHERE w.phone = p) "
+    f"  AND EXISTS (SELECT 1 FROM lending.call_dispositions d WHERE {_REACHED_CALL})"
 )
 
 _REACHED_IN_BATCHDIALER = text(

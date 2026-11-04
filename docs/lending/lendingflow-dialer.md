@@ -58,3 +58,14 @@ Code: `src/lending/lendingflow_dialer.py` (load + removal) and `src/lending/bd_r
 SELECT id, dialer_status, dialer_block_reason, handled_in_ghl_reason, dialer_last_error
   FROM lending.lendingflow_leads WHERE phone = '+1XXXXXXXXXX';
 ```
+
+## Website leads (same code, campaign "Website")
+
+Website leads go through the same dialer step (`LeadSource` `WEBSITE` in `src/lending/lendingflow_dialer.py`), run by the website-lead sweep (`lending_web_lead_sweep`, every 5 minutes). Differences from LendingFlow:
+
+- **Call consent:** only leads who ticked the call-consent box (`web_leads.call_consent`) are loaded; the rest are `blocked` / `NO_CALL_CONSENT`.
+- **DNC:** the Tracerfy DNC / litigator scrub runs (`dnc_scrub=True`), like every list except LendingFlow.
+- **Campaign:** "Website", with its own hook line (placeholder until Josh approves).
+- **Ownership:** website phones are no longer always "GHL's"; like LendingFlow, they leave BatchDialer once booked or connected in GHL.
+
+Setup: create the BatchDialer campaign **Website** (copy LendingFlow's settings) and add its ID to `LENDING_DIALER_CAMPAIGN_IDS`; re-run `migrations/apply_lending_lendingflow_dialer.py` (adds the dialer columns to `web_leads`; existing website leads become `preexisting`); set `LENDING_WEB_LEAD_DIALER_ENABLED=true`.
