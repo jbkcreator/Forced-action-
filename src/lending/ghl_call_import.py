@@ -188,7 +188,7 @@ def _store_contact(db, read_calls: CallReader, contact_id: str, phone: str, sinc
         with db.begin_nested():
             for row in rows:
                 if row["direction"] == "outbound":
-                    adopt_missed_call(db, row["call_id"], row["phone"], row["started"])
+                    adopt_missed_call(db, row["call_id"], row["phone"], row["started"], row["raw_outcome"])
                 stored = db.execute(_UPSERT, {**row, "unknown_outcome": UNKNOWN_OUTCOME, "unknown_caller": GHL_UNKNOWN_CALLER}).first()
                 if stored is None:
                     stats.already_recorded += 1

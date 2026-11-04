@@ -358,11 +358,11 @@ def _ghl_body(phone, started, **extra):
             "ended_at": (started + timedelta(seconds=25)).isoformat(), **extra}
 
 
-def _import_call(db, message_id, phone, started):
+def _import_call(db, message_id, phone, started, *, status="no-answer", talk=None, ended=None):
     db.execute(_UPSERT, {
         "call_id": f"ghl:{message_id}", "source": "ghl", "direction": "outbound", "phone": phone, "seat": "ghl",
-        "caller_name": "Josh Kantor", "tag": "ghl", "raw_outcome": "ghl:no-answer", "talk": None,
-        "started": started, "ended": started, "raw_event": json.dumps({}),
+        "caller_name": "Josh Kantor", "tag": "ghl", "raw_outcome": f"ghl:{status}", "talk": talk,
+        "started": started, "ended": ended or started, "raw_event": json.dumps({}),
         "unknown_outcome": UNKNOWN_OUTCOME, "unknown_caller": GHL_UNKNOWN_CALLER,
     })
 
@@ -375,19 +375,19 @@ def test_the_import_takes_over_the_missed_call_row_and_its_event(db):
     sender = Sender()
     assert process_pending(db, sender=sender, enabled=True, number="+16562211100", now=NOW) == {"sent": 1}
     # 15 minutes later the import stores the same call under GHL's message id
-    assert mc.adopt_missed_call(db, "ghl:realmsg01", phone, started + timedelta(seconds=2)) is True
+    assert mc.adopt_missed_call(db, "ghl:realmsg01", phone, started + timedelta(seconds=2), "ghl:no-answer") is True
     _import_call(db, "realmsg01", phone, started + timedelta(seconds=2))
     rows = db.execute(text("SELECT dialer_call_id FROM lending.call_dispositions WHERE phone = :p"), {"p": phone}).all()
     assert [r[0] for r in rows] == ["ghl:realmsg01"]  # one call, one attempt
     assert _event_status(db, "ghl:realmsg01") == "sent" and _event_status(db, call.dialer_call_id) is None
-    assert mc.adopt_missed_call(db, "ghl:realmsg01", phone, started) is False  # nothing left to take over
+    assert mc.adopt_missed_call(db, "ghl:realmsg01", phone, started, "ghl:no-answer") is False  # nothing left
 
 
 def test_the_import_never_takes_over_a_call_far_apart_or_to_another_phone(db):
     phone, started = _phone(), NOW - timedelta(minutes=30)
     mc.record_missed_call(db, mc.parse_missed_call(_ghl_body(phone, started), NOW))
-    assert mc.adopt_missed_call(db, "ghl:other01", phone, started + timedelta(minutes=10)) is False
-    assert mc.adopt_missed_call(db, "ghl:other02", _phone(), started) is False
+    assert mc.adopt_missed_call(db, "ghl:other01", phone, started + timedelta(minutes=10), "ghl:no-answer") is False
+    assert mc.adopt_missed_call(db, "ghl:other02", _phone(), started, "ghl:no-answer") is False
 
 
 def test_a_webhook_after_the_import_reuses_the_imported_call(db):
@@ -405,3 +405,52 @@ def test_a_retried_ghl_post_without_call_id_queues_one_event(db):
     again = mc.record_missed_call(db, mc.parse_missed_call(_ghl_body(phone, started), NOW + timedelta(seconds=5)))
     assert (first, again) == ("pending", "pending")
     assert db.execute(text("SELECT count(*) FROM lending.missed_call_events WHERE phone = :p"), {"p": phone}).scalar() == 1
+
+
+# ---- PR #407 re-review: a redial is a separate attempt ------------------------------------------------------------------
+
+def test_a_missed_redial_after_an_answered_imported_call_keeps_its_own_identity_and_gets_its_text(db):
+    """Answered call 09:58-10:00 (imported); Josh redials 10:02, no answer; GHL reports it at once."""
+    phone = _phone()
+    record_consent(db, phone, "on_call_yes")
+    answered_start = NOW - timedelta(minutes=4)
+    _import_call(db, "answered01", phone, answered_start, status="completed", talk=120,
+                 ended=answered_start + timedelta(minutes=2))
+    redial = NOW - timedelta(seconds=30)
+    call = mc.parse_missed_call(_ghl_body(phone, redial), NOW)
+    assert mc.record_missed_call(db, call) == "pending"
+    assert call.dialer_call_id.startswith("ghl-missed:")  # not the answered call's id
+    ids = {r[0] for r in db.execute(text("SELECT dialer_call_id FROM lending.call_dispositions WHERE phone = :p"),
+                                    {"p": phone}).all()}
+    assert ids == {"ghl:answered01", call.dialer_call_id}  # two attempts, two rows
+    sender = Sender()
+    assert process_pending(db, sender=sender, enabled=True, number="+16562211100", now=NOW) == {"sent": 1}
+    assert sender.sent == [phone]
+
+
+def test_a_missed_redial_within_five_minutes_of_an_imported_missed_call_stays_separate(db):
+    phone = _phone()
+    first_start = NOW - timedelta(minutes=3)
+    _import_call(db, "missed01", phone, first_start)
+    call = mc.parse_missed_call(_ghl_body(phone, NOW - timedelta(seconds=30)), NOW)
+    mc.record_missed_call(db, call)
+    assert call.dialer_call_id.startswith("ghl-missed:")
+    assert db.execute(text("SELECT count(*) FROM lending.call_dispositions WHERE phone = :p"), {"p": phone}).scalar() == 2
+
+
+def test_the_import_of_an_answered_or_unknown_call_never_takes_over_a_missed_call_row(db):
+    phone, started = _phone(), NOW - timedelta(seconds=40)
+    call = mc.parse_missed_call(_ghl_body(phone, started), NOW)
+    mc.record_missed_call(db, call)
+    for raw in ("ghl:completed", "ghl:unknown", None):
+        assert mc.adopt_missed_call(db, "ghl:answered02", phone, started, raw) is False
+    assert _event_status(db, call.dialer_call_id) == "pending"
+
+
+def test_the_same_missed_call_seconds_apart_is_still_joined(db):
+    phone, started = _phone(), NOW - timedelta(seconds=40)
+    _import_call(db, "same01", phone, started)
+    call = mc.parse_missed_call(_ghl_body(phone, started + timedelta(seconds=3)), NOW)
+    mc.record_missed_call(db, call)
+    assert db.execute(text("SELECT count(*) FROM lending.call_dispositions WHERE phone = :p"), {"p": phone}).scalar() == 1
+    assert _event_status(db, "ghl:same01") == "pending"

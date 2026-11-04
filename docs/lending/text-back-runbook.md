@@ -179,8 +179,9 @@ Results Josh picks in GHL are acted on like BatchDialer results (`src/lending/gh
 
   GHL has **no call id / message id** merge field, so `call_id` is optional: without it the call is keyed by phone and
   start time (`ghl-missed:<phone hash>:<epoch>`), and the 15-minute GHL call import takes that row over (gives it
-  `ghl:<message id>`) when it stores a call to the same phone started within 5 minutes, so a call is one row and one
-  attempt. A webhook that arrives after the import reuses the imported call.
+  `ghl:<message id>`) when it stores the same missed call (no-answer / busy / voicemail, same phone, started within 30 seconds), so a call is one row and one
+  attempt. A webhook that arrives after the import reuses that imported missed call; an answered call or a redial
+  is always a separate attempt.
   The time format GHL sends is not confirmed: a time that cannot be read is logged once per post (the raw time text,
   never a phone) and the arrival time is used. `LENDING_GHL_LOG_PAYLOAD_SHAPE=true` logs the body keys.
   The event is queued once per call

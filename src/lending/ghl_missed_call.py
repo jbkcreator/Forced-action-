@@ -8,9 +8,10 @@ contact_id, call_status ({{phoneCall.callStatus}}), user ({{phoneCall.user.name}
 ({{phoneCall.startTime}}), ended_at ({{phoneCall.endTime}}), duration; call_id and direction are optional.
 
 GHL workflows have no call / message id merge field (checked 2026-11-04), so without a call_id the call is keyed by
-phone and call time (``ghl-missed:<phone hash>:<epoch>``): a GHL call already imported for the same phone and time is
-reused, and otherwise the GHL call import takes the row over later (``adopt_missed_call``), so one call stays one
-row and one attempt. A time GHL sends in a format that cannot be read is logged (the raw time text, never a phone)
+phone and call time (``ghl-missed:<phone hash>:<epoch>``). Only the same MISSED call is ever joined to it: an
+imported missed call to the same phone that started within GHL_MISSED_CALL_MATCH_SECONDS is reused, and otherwise
+the GHL call import takes the row over when it stores that missed call (``adopt_missed_call``), so one call stays
+one row and one attempt. An answered call, or a call further apart, stays a separate attempt. A time GHL sends in a format that cannot be read is logged (the raw time text, never a phone)
 and the arrival time is used.
 
 The missed-call event is queued for the call (``queue_missed_call``: one text per
@@ -38,6 +39,7 @@ from config.lending_followup import CALL_SOURCE_GHL, GHL_CALL_ID_PREFIX, GHL_CAL
 from config.lending_missed_call import (
     GHL_MISSED_CALL_KEY_PREFIX,
     GHL_MISSED_CALL_MATCH_SECONDS,
+    GHL_MISSED_CALL_RAW_OUTCOMES,
     GHL_MISSED_CALL_STATUSES,
     GHL_OUTBOUND_DIRECTIONS,
 )
@@ -60,10 +62,12 @@ _INSERT_CALL = text("""
             0, :started, :ended, CAST(:raw_event AS jsonb))
     ON CONFLICT (dialer_call_id) DO NOTHING
 """)
-# A GHL call the import already stored for this phone, started near this call (the webhook came after the import).
+# The same missed call, already stored by the import (the webhook came after it): a missed call to this phone that
+# started within seconds of this one. An answered or other call is a different attempt and is never reused.
 _FIND_IMPORTED = text("""
     SELECT dialer_call_id FROM lending.call_dispositions
      WHERE call_source = :source AND direction = 'outbound' AND phone = :phone AND dialer_call_id LIKE :prefix
+       AND disposition_raw = ANY(:missed_raw) AND COALESCE(talk_duration_sec, 0) = 0
        AND call_started_at BETWEEN :lo AND :hi
      ORDER BY abs(extract(epoch FROM call_started_at - CAST(:at AS timestamptz))) LIMIT 1
 """)
@@ -164,10 +168,14 @@ def _window(at: datetime) -> dict[str, Any]:
     return {"lo": at - span, "hi": at + span, "at": at}
 
 
-def adopt_missed_call(db, call_id: str, phone: str, started_at: datetime) -> bool:
-    """The GHL call import is storing ``call_id`` (``ghl:<message id>``): a missed-call row posted for the same phone
-    and time takes that key, with its missed-call event, so the import updates it instead of adding a second row.
-    Returns True when a row was taken over. Does not commit."""
+def adopt_missed_call(db, call_id: str, phone: str, started_at: datetime, raw_outcome: Optional[str]) -> bool:
+    """The GHL call import is storing ``call_id`` (``ghl:<message id>``) with GHL status ``raw_outcome``: when that call
+    is itself a missed call, a missed-call row posted for the same phone and time takes that key, with its missed-call
+    event, so the import updates it instead of adding a second row. An answered or still-unknown call is a different
+    attempt (or not yet known to be this one) and never takes a row over. Returns True when a row was taken over.
+    Does not commit."""
+    if raw_outcome not in GHL_MISSED_CALL_RAW_OUTCOMES:
+        return False
     return db.execute(_ADOPT, {"missed_prefix": f"{GHL_MISSED_CALL_KEY_PREFIX}%", "source": CALL_SOURCE_GHL,
                                "phone": phone, "call_id": call_id, **_window(started_at)}).first() is not None
 
@@ -178,7 +186,9 @@ def record_missed_call(db, call: GhlMissedCall) -> Optional[str]:
     or None when the stored call is not an outbound GHL call to this number. Does not commit."""
     if call.dialer_call_id.startswith(GHL_MISSED_CALL_KEY_PREFIX):
         imported = db.execute(_FIND_IMPORTED, {"source": CALL_SOURCE_GHL, "phone": call.phone,
-                                               "prefix": f"{GHL_CALL_ID_PREFIX}%", **_window(call.started_at)}).scalar()
+                                               "prefix": f"{GHL_CALL_ID_PREFIX}%",
+                                               "missed_raw": list(GHL_MISSED_CALL_RAW_OUTCOMES),
+                                               **_window(call.started_at)}).scalar()
         if imported:
             call = replace(call, dialer_call_id=imported)
     db.execute(_INSERT_CALL, {
