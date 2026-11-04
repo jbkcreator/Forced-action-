@@ -155,3 +155,38 @@ f. Run the verification in section 6.
 Confirmation/reminder texts, reply agent, Conversation AI, email fallback for non-consenters (WP-GL-10); website and consent checkbox
 (WP-GL-11); Deal Drop marketing opt-in checkbox (first drop Oct 12, week-two scope); counsel sign-off on cold-number texting
 (client/counsel).
+
+## G4: GHL calls (Josh's calls from (656) 221-1100)
+
+Results Josh picks in GHL are acted on like BatchDialer results (`src/lending/ghl_outcome_hooks.py`):
+
+- **DNC Request**: the number is opted out everywhere (suppression list, do-not-contact, BatchDialer removal, GHL DND
+  sync) as soon as `POST /webhooks/lending/ghl-disposition` arrives. The call row is stamped when it is matched, so the
+  CDR poller's DNC sweep never records a second opt-out.
+- **Text Consent = Yes** on an answered call (any result except No Answer, Left Voicemail or Bad Number) is saved to
+  `lending.text_consents` as `on_call_yes`, with the GHL call id and the caller.
+- **Missed call**: the text must go out within 60 s, and the GHL call import runs every 15 minutes, so GHL has to
+  report the call itself. **GHL workflow "NDL – Missed call to backend"** (built as a Draft 2026-11-04; publish only
+  after this code is deployed): trigger **Call details**, Call status = busy / voicemail / no-answer, Call direction =
+  Outgoing (`canceled` is deliberately not texted) -> Custom Webhook POST `/webhooks/lending/ghl-missed-call`, header
+  `X-Webhook-Secret` = `LENDING_GHL_WEBHOOK_SECRET`, Allow re-entry ON, raw JSON body:
+
+  ```json
+  {"phone": "{{phoneCall.to}}", "contact_phone": "{{contact.phone}}", "contact_id": "{{contact.id}}",
+   "call_status": "{{phoneCall.callStatus}}", "user": "{{phoneCall.user.name}}",
+   "called_at": "{{phoneCall.startTime}}", "ended_at": "{{phoneCall.endTime}}", "duration": "{{phoneCall.duration}}"}
+  ```
+
+  GHL has **no call id / message id** merge field, so `call_id` is optional: without it the call is keyed by phone and
+  start time (`ghl-missed:<phone hash>:<epoch>`), and the 15-minute GHL call import takes that row over (gives it
+  `ghl:<message id>`) when it stores the same missed call (no-answer / busy / voicemail, same phone, started within 30 seconds), so a call is one row and one
+  attempt. A webhook that arrives after the import reuses that imported missed call; an answered call or a redial
+  is always a separate attempt.
+  The time format GHL sends is not confirmed: a time that cannot be read is logged once per post (the raw time text,
+  never a phone) and the arrival time is used. `LENDING_GHL_LOG_PAYLOAD_SHAPE=true` logs the body keys.
+  The event is queued once per call
+  and once per number per Eastern day, and text_back decides it at once and on every CDR poller step with the same
+  gates as BatchDialer: 60 s, text consent (LendingFlow leads count as consented), 8am-8pm ET, suppression,
+  `MISSED_CALL_TEXT_ENABLED` (off until A2P is approved) and the emergency stop. A call whose webhook never came is
+  never texted late: its No Answer result, matched after the import, is logged `skipped_late`.
+  Do **not** use GHL's own missed-call text-back: it would skip our consent, suppression and once-per-day rules.

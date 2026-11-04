@@ -126,6 +126,9 @@ GHL_DISPOSITION_FIELD_CANDIDATES: dict[str, tuple[str, ...]] = {
     "called_at": ("called_at", "call_time", "call_date"),
     "gate_failed": ("gate_failed",),
     "text_consent": ("text_consent", "textConsent"),  # {{contact.text_consent}} (Yes/No); passed to Dev C's hooks
+    "call_status": ("call_status", "callStatus", "status"),  # G4 missed-call webhook: GHL call status (no-answer, ...)
+    "direction": ("direction", "call_direction"),
+    "ended_at": ("ended_at", "call_ended_at", "end_time"),
 }
 GHL_DISPOSITION_MATCH_WINDOW_MINUTES = 30  # a call started this close to the outcome's time is its call
 GHL_DISPOSITION_PENDING_DAYS = 2           # an outcome still unmatched after this is no longer retried
