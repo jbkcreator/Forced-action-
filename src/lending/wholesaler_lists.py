@@ -11,7 +11,7 @@ import io
 import logging
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional, Protocol, Sequence
+from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
 from config.lending_compliance import COLD_LEAD_DND_CHANNELS, COLD_LEAD_DND_MESSAGE, GHL_TAG_COLD_LEAD
 from config.lending_wholesalers import (
@@ -100,7 +100,8 @@ class GhlPushResult:
     failed: list[str] = field(default_factory=list)
 
 
-def push_to_ghl(records: Sequence[Mapping[str, Any]], sink: GhlTagSink) -> GhlPushResult:
+def push_to_ghl(records: Sequence[Mapping[str, Any]], sink: GhlTagSink,
+                tags_for: Callable[[Mapping[str, Any]], list[str]] = ghl_tags) -> GhlPushResult:
     """Upsert + tag each record; a failure is logged (source only, no phone) and the rest still go.
 
     One record at a time on purpose (exception to "batch I/O"): GHL has no bulk contact
@@ -110,10 +111,10 @@ def push_to_ghl(records: Sequence[Mapping[str, Any]], sink: GhlTagSink) -> GhlPu
     result = GhlPushResult()
     for record in records:
         try:
-            sink.push(record, ghl_tags(record))
+            sink.push(record, tags_for(record))
         except Exception as exc:
             logger.warning("[wholesaler-ghl] push failed for a %s record: %s",
-                           record.get("wholesaler_source"), type(exc).__name__)
+                           record.get("wholesaler_source") or record.get("pool"), type(exc).__name__)
             result.failed.append(str(record["source_record_ref"]))
         else:
             result.pushed += 1
