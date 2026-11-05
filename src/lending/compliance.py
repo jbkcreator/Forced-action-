@@ -16,7 +16,7 @@ import hashlib
 from collections import defaultdict
 import json
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as dt_time, timedelta, timezone
 from typing import Callable, Optional, Sequence
 from zoneinfo import ZoneInfo
 
@@ -531,6 +531,33 @@ def can_dial_now(
     return cap_result
 
 
+@dataclass(frozen=True)
+class DialWindow:
+    local_start: dt_time
+    local_end: dt_time
+    et_start: dt_time
+    et_end: dt_time
+
+
+def dial_window() -> DialWindow:
+    """The dialer calling window from settings (LENDING_CALL_WINDOW_*), defaulting to the shipped values. The
+    local window is clamped to the legal CALL_WINDOW_START/_END floor even if settings validation were bypassed,
+    and an unreadable setting falls back to the shipped values, so a bad value can only narrow calling."""
+    try:
+        from config.settings import get_settings
+
+        s = get_settings()
+        local_start, local_end = dt_time.fromisoformat(s.lending_call_window_local_start), dt_time.fromisoformat(
+            s.lending_call_window_local_end)
+        et_start, et_end = dt_time.fromisoformat(s.lending_call_window_et_start), dt_time.fromisoformat(
+            s.lending_call_window_et_end)
+    except Exception as exc:  # class only
+        logger.warning("[lending-compliance] call window settings unreadable (%s); shipped window used",
+                       type(exc).__name__)
+        return DialWindow(CALL_WINDOW_START, CALL_WINDOW_END, ET_WINDOW_START, ET_WINDOW_END)
+    return DialWindow(max(local_start, CALL_WINDOW_START), min(local_end, CALL_WINDOW_END), et_start, et_end)
+
+
 def _outside_call_window(
     phone: str, now: datetime, zip_code: Optional[str] = None, seat_group: Optional[str] = None
 ) -> bool:
@@ -539,11 +566,14 @@ def _outside_call_window(
         logger.warning("[lending-compliance] no timezone for phone_hash=%s; call window fails closed",
                        phone_hash(phone)[:12])
         return True
+    window = dial_window()
     local = now.astimezone(tz).time()
-    if not (CALL_WINDOW_START <= local < CALL_WINDOW_END):
+    if not (window.local_start <= local < window.local_end):
         return True
-    start, end = SHIFT_GROUPS.get(seat_group, (ET_WINDOW_START, ET_WINDOW_END)) if seat_group else (
-        ET_WINDOW_START, ET_WINDOW_END)
+    start, end = window.et_start, window.et_end
+    if seat_group in SHIFT_GROUPS:
+        group_start, group_end = SHIFT_GROUPS[seat_group]
+        start, end = max(start, group_start), min(end, group_end)
     eastern = now.astimezone(ZoneInfo(DEFAULT_TZ)).time()
     return not (start <= eastern < end)
 
