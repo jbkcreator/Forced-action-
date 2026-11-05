@@ -1005,8 +1005,9 @@ class AppSettings(BaseSettings):
 	lending_alarm_hours_start: str = Field(default="09:00", env="LENDING_ALARM_HOURS_START")
 	lending_alarm_hours_end: str = Field(default="19:15", env="LENDING_ALARM_HOURS_END")
 	# Dialer calling window, HH:MM 24h, start inclusive, end exclusive. A dial needs BOTH windows open.
-	# LOCAL = the borrower's own timezone; it can only narrow the legal 08:00-20:00 floor
-	# (config.lending_compliance.CALL_WINDOW_START/_END), never widen it. ET = Josh's hours, Eastern.
+	# LOCAL = the borrower's own timezone (legal floor 08:00-20:00, config.lending_compliance.CALL_WINDOW_START/_END).
+	# ET = Josh's hours, Eastern. Any HH:MM is accepted so the team can test out of hours, but a window wider than
+	# the legal floor applies to EVERY lead: set it back right after the test. A wider window is logged as a warning.
 	# Texts keep the fixed 08:00-20:00 local window and are not affected by these.
 	lending_call_window_local_start: str = Field(default="08:00", env="LENDING_CALL_WINDOW_LOCAL_START")
 	lending_call_window_local_end: str = Field(default="20:00", env="LENDING_CALL_WINDOW_LOCAL_END")
@@ -1257,20 +1258,11 @@ class AppSettings(BaseSettings):
 		return parsed.strftime("%H:%M")
 
 	@model_validator(mode="after")
-	def _call_window_safe(self):
-		from config.lending_compliance import CALL_WINDOW_END, CALL_WINDOW_START
-
-		floor_start, floor_end = CALL_WINDOW_START.strftime("%H:%M"), CALL_WINDOW_END.strftime("%H:%M")
-		local = (self.lending_call_window_local_start, self.lending_call_window_local_end)
-		eastern = (self.lending_call_window_et_start, self.lending_call_window_et_end)
-		if not local[0] < local[1]:
+	def _call_window_order(self):
+		if not self.lending_call_window_local_start < self.lending_call_window_local_end:
 			raise ValueError("LENDING_CALL_WINDOW_LOCAL_START must be before LENDING_CALL_WINDOW_LOCAL_END")
-		if not eastern[0] < eastern[1]:
+		if not self.lending_call_window_et_start < self.lending_call_window_et_end:
 			raise ValueError("LENDING_CALL_WINDOW_ET_START must be before LENDING_CALL_WINDOW_ET_END")
-		if local[0] < floor_start or local[1] > floor_end:
-			raise ValueError(f"LENDING_CALL_WINDOW_LOCAL_* must stay inside the legal {floor_start}-{floor_end} window")
-		if eastern[0] < floor_start or eastern[1] > floor_end:
-			raise ValueError(f"LENDING_CALL_WINDOW_ET_* must stay inside {floor_start}-{floor_end}")
 		return self
 	# Verified GHL sending address for those emails (hello@nextdeallending.com). Unset = no email sender.
 	lending_ghl_email_from: Optional[str] = Field(default=None, env="LENDING_GHL_EMAIL_FROM")

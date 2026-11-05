@@ -1,5 +1,5 @@
-"""Dialer calling window from env (LENDING_CALL_WINDOW_*): defaults equal the shipped window, values can only
-narrow the legal 08:00-20:00 recipient-local floor, and texts keep their fixed window."""
+"""Dialer calling window from env (LENDING_CALL_WINDOW_*): defaults equal the shipped window, a wider window is
+allowed for out-of-hours testing and logged, and texts keep their fixed window."""
 from __future__ import annotations
 
 from datetime import datetime, time, timedelta, timezone
@@ -41,20 +41,27 @@ def test_defaults_equal_the_shipped_window(monkeypatch):
 
 
 @pytest.mark.parametrize("env, value", [
-    ("LENDING_CALL_WINDOW_LOCAL_START", "07:59"),   # earlier than the legal floor
-    ("LENDING_CALL_WINDOW_LOCAL_END", "20:01"),     # later than the legal floor
-    ("LENDING_CALL_WINDOW_ET_START", "06:00"),
-    ("LENDING_CALL_WINDOW_ET_END", "21:00"),
     ("LENDING_CALL_WINDOW_ET_START", "20:00"),      # start after end
+    ("LENDING_CALL_WINDOW_LOCAL_START", "20:00"),   # start equal to end
     ("LENDING_CALL_WINDOW_LOCAL_START", "9am"),     # not HH:MM
     ("LENDING_CALL_WINDOW_ET_END", "25:00"),
 ])
-def test_unsafe_or_malformed_values_are_refused_at_startup(monkeypatch, env, value):
+def test_malformed_or_reversed_values_are_refused_at_startup(monkeypatch, env, value):
     from config.settings import AppSettings
 
     monkeypatch.setenv(env, value)
     with pytest.raises(ValidationError, match="LENDING_CALL_WINDOW"):
         AppSettings()
+
+
+def test_a_wider_window_is_accepted_for_testing(monkeypatch):
+    from config.settings import AppSettings
+
+    monkeypatch.setenv("LENDING_CALL_WINDOW_LOCAL_START", "00:00")
+    monkeypatch.setenv("LENDING_CALL_WINDOW_ET_START", "00:00")
+    monkeypatch.setenv("LENDING_CALL_WINDOW_LOCAL_END", "23:59")
+    s = AppSettings()
+    assert (s.lending_call_window_local_start, s.lending_call_window_et_start) == ("00:00", "00:00")
 
 
 def test_a_narrower_window_and_single_digit_hours_are_accepted(monkeypatch):
@@ -87,12 +94,18 @@ def test_local_window_still_applies_to_other_timezones(monkeypatch):
     assert compliance._outside_call_window(LA, _at_et(11, 0)) is False    # 08:00 in Los Angeles
 
 
-def test_the_legal_floor_holds_even_if_validation_is_bypassed(monkeypatch):
-    _use_window(monkeypatch, local=("06:00", "23:00"), et=("06:00", "23:00"))
-    window = compliance.dial_window()
-    assert (window.local_start, window.local_end) == (cfg.CALL_WINDOW_START, cfg.CALL_WINDOW_END)
-    assert compliance._outside_call_window(NY, _at_et(7, 30)) is True
-    assert compliance._outside_call_window(NY, _at_et(20, 30)) is True
+def test_a_wider_test_window_opens_out_of_hours_and_is_logged(monkeypatch, caplog):
+    _use_window(monkeypatch, local=("00:00", "23:59"), et=("00:00", "23:59"))
+    with caplog.at_level("WARNING"):
+        assert compliance._outside_call_window(NY, _at_et(1, 30)) is False
+    assert "WIDER than the legal/shipped window" in caplog.text
+
+
+def test_the_shipped_window_logs_no_warning(monkeypatch, caplog):
+    _use_window(monkeypatch)
+    with caplog.at_level("WARNING"):
+        compliance.dial_window()
+    assert "WIDER" not in caplog.text
 
 
 def test_unreadable_settings_fall_back_to_the_shipped_window(monkeypatch):
