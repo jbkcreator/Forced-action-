@@ -540,22 +540,29 @@ class DialWindow:
 
 
 def dial_window() -> DialWindow:
-    """The dialer calling window from settings (LENDING_CALL_WINDOW_*), defaulting to the shipped values. The
-    local window is clamped to the legal CALL_WINDOW_START/_END floor even if settings validation were bypassed,
-    and an unreadable setting falls back to the shipped values, so a bad value can only narrow calling."""
+    """The dialer calling window from settings (LENDING_CALL_WINDOW_*), defaulting to the shipped values. An
+    unreadable setting falls back to the shipped window. A window wider than the legal recipient-local floor
+    (CALL_WINDOW_START/_END) or the shipped ET window is allowed for out-of-hours testing and logged as a warning,
+    because it applies to every lead."""
+    shipped = DialWindow(CALL_WINDOW_START, CALL_WINDOW_END, ET_WINDOW_START, ET_WINDOW_END)
     try:
         from config.settings import get_settings
 
         s = get_settings()
-        local_start, local_end = dt_time.fromisoformat(s.lending_call_window_local_start), dt_time.fromisoformat(
-            s.lending_call_window_local_end)
-        et_start, et_end = dt_time.fromisoformat(s.lending_call_window_et_start), dt_time.fromisoformat(
-            s.lending_call_window_et_end)
+        window = DialWindow(
+            dt_time.fromisoformat(s.lending_call_window_local_start), dt_time.fromisoformat(s.lending_call_window_local_end),
+            dt_time.fromisoformat(s.lending_call_window_et_start), dt_time.fromisoformat(s.lending_call_window_et_end),
+        )
     except Exception as exc:  # class only
         logger.warning("[lending-compliance] call window settings unreadable (%s); shipped window used",
                        type(exc).__name__)
-        return DialWindow(CALL_WINDOW_START, CALL_WINDOW_END, ET_WINDOW_START, ET_WINDOW_END)
-    return DialWindow(max(local_start, CALL_WINDOW_START), min(local_end, CALL_WINDOW_END), et_start, et_end)
+        return shipped
+    if (window.local_start < CALL_WINDOW_START or window.local_end > CALL_WINDOW_END
+            or window.et_start < ET_WINDOW_START or window.et_end > ET_WINDOW_END):
+        logger.warning("[lending-compliance] call window WIDER than the legal/shipped window (local %s-%s, ET %s-%s); "
+                       "applies to every lead, set LENDING_CALL_WINDOW_* back after testing",
+                       window.local_start, window.local_end, window.et_start, window.et_end)
+    return window
 
 
 def _outside_call_window(
