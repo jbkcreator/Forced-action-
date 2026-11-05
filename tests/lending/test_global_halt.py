@@ -213,6 +213,7 @@ def test_prequal_email_is_sent_when_not_halted(halt_db, monkeypatch) -> None:
 
 
 def test_intro_sms_tag_is_not_added_while_halted(halt_db, monkeypatch) -> None:
+    monkeypatch.setattr(lendingflow_ghl, "get_settings", lambda: SimpleNamespace(lending_intro_sms_enabled=True))
     lead = {"consent_status": "present", "sms_clear": True}
     assert lendingflow_ghl._intro_ready_tags(lead) == [lendingflow_ghl.GHL_TAG_INTRO_READY]
     set_global_halt(True, reason="test", set_by=JOSH)

@@ -43,8 +43,8 @@ def _intro_ready_tags(lead: Mapping[str, Any]) -> list[str]:
     certificate, so the only per-lead condition is an explicit ``sms_clear`` flag, which ``deliver_pending`` sets
     after re-checking the current suppression list and do-not-contact flag at push time (an opt-out still blocks the
     text). A lead without that flag is never tagged (fail closed). ``sms_clear`` is only ever True while
-    ``LENDING_INTRO_SMS_ENABLED`` is on (``lendingflow._intro_sms_on``), the single off switch for the intro text."""
-    if is_globally_halted():
+    ``LENDING_INTRO_SMS_ENABLED`` is on; the switch is re-checked here so no caller can skip it."""
+    if not get_settings().lending_intro_sms_enabled or is_globally_halted():
         return []
     if lead.get("sms_clear") is True:
         return [GHL_TAG_INTRO_READY]
