@@ -44,17 +44,40 @@ class _Calls(list):
 @pytest.fixture(autouse=True)
 def intro_sms_on(monkeypatch):
     """These tests pin the tag logic with the intro text switched on; the off switch has its own tests."""
-    monkeypatch.setattr(get_settings(), "lending_lendingflow_intro_sms_enabled", True)
+    monkeypatch.setattr(get_settings(), "lending_intro_sms_enabled", True)
+    monkeypatch.setattr(get_settings(), "lending_ghl_cf_intro_name", "cf1")
+
+
+def test_switch_off_no_ready_tag_even_when_caller_says_sms_clear(ghl_calls, monkeypatch):
+    monkeypatch.setattr(get_settings(), "lending_intro_sms_enabled", False)
+    assert _intro_ready_tags({"consent_status": "present", "sms_clear": True}) == []
+    LendingFlowGhlSink(GhlAccount("k", "loc")).push(_lead("present", sms_clear=True))
+    assert _tag_calls(ghl_calls) == [["lendingflow"]]
+
+
+def test_switch_off_push_path_never_marks_a_lead_clear(monkeypatch):
+    monkeypatch.setattr(get_settings(), "lending_intro_sms_enabled", False)
+    assert lendingflow._may_text_now(None, _lead("present"), datetime(2026, 10, 9, 15, tzinfo=timezone.utc)) is False
+
+
+def test_switch_off_sweep_releases_nothing(monkeypatch):
+    monkeypatch.setattr(get_settings(), "lending_intro_sms_enabled", False)
+    assert release_held_intro_sms(db=None, sink=object()) == 0
 
 
 def test_intro_sms_switch_defaults_off():
     from config.settings import AppSettings
-    assert AppSettings.model_fields["lending_lendingflow_intro_sms_enabled"].default is False
+    assert AppSettings.model_fields["lending_intro_sms_enabled"].default is False
+    assert "lending_lendingflow_intro_sms_enabled" not in AppSettings.model_fields
 
 
-def test_switch_off_means_no_ready_tag_even_for_a_clear_consented_lead(monkeypatch):
-    monkeypatch.setattr(get_settings(), "lending_lendingflow_intro_sms_enabled", False)
-    assert _intro_ready_tags({"consent_status": "present", "sms_clear": True}) == []
+def test_switch_off_means_no_lead_is_sms_clear(monkeypatch):
+    monkeypatch.setattr(get_settings(), "lending_intro_sms_enabled", False)
+    assert lendingflow._intro_sms_on() is False
+
+
+def test_switch_on_with_intro_name_field_lets_leads_be_cleared(monkeypatch):
+    assert lendingflow._intro_sms_on() is True
 
 
 @pytest.fixture
@@ -121,9 +144,8 @@ def test_lead_with_consent_gets_the_ready_tag_in_a_second_call_after_the_first(g
     assert steps[-1] == "notes"  # the rest of the push is unchanged and still runs after the ready tag
 
 
-def test_switch_off_push_adds_no_ready_tag_call(ghl_calls, monkeypatch):
-    monkeypatch.setattr(get_settings(), "lending_lendingflow_intro_sms_enabled", False)
-    LendingFlowGhlSink(GhlAccount("k", "loc")).push(_lead("present"))
+def test_lead_not_cleared_push_adds_no_ready_tag_call(ghl_calls):
+    LendingFlowGhlSink(GhlAccount("k", "loc")).push(_lead("present", sms_clear=False))
     assert _tag_calls(ghl_calls) == [["lendingflow"]]
 
 
