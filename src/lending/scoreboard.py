@@ -11,7 +11,7 @@ from sqlalchemy import text
 
 from config.lending_compliance import DEFAULT_TZ
 from config.lending_dispositions import (
-    ANSWERED_CODES, BOOKED_CODE, BOOKED_STAGE_KEYS, GATED_CODES, LIVE_CONVERSATION_CODES, LONG_CONVERSATION_SECONDS, NURTURE_CODE,
+    ANSWERED_CODES, AUTO_DIALER_LABEL, AUTO_DIALER_UNKNOWN_CAMPAIGN, BOOKED_CODE, BOOKED_STAGE_KEYS, GATED_CODES, LIVE_CONVERSATION_CODES, LONG_CONVERSATION_SECONDS, NURTURE_CODE,
     NURTURE_SENT_CODES, SHARED_SEAT_LABELS, SHOWED_STAGE_KEYS, TRANSFER_CODES,
 )
 from config.lending_followup import GHL_CALLER_SEAT
@@ -28,7 +28,11 @@ def _sql_literal(value: str) -> str:
 def _caller_key() -> str:
     """Caller name, except a shared BatchDialer seat (SHARED_SEAT_LABELS) shows its label: the seat's login owner
     did not make every call on it. Config literals only, never user input."""
-    name = "COALESCE(NULLIF(caller_name, ''), NULLIF(caller_seat, ''), '(unknown)')"
+    prefix, suffix = AUTO_DIALER_LABEL.split("{campaign}")
+    auto = (f"{_sql_literal(prefix)} || COALESCE(NULLIF(raw_event->'campaign'->>'name', ''), "
+            f"NULLIF(dialer_campaign_id, ''), {_sql_literal(AUTO_DIALER_UNKNOWN_CAMPAIGN)}) || {_sql_literal(suffix)}")
+    name = (f"COALESCE(NULLIF(caller_name, ''), NULLIF(caller_seat, ''), "
+            f"CASE WHEN call_source = 'batchdialer' THEN {auto} ELSE '(unknown)' END)")
     if not SHARED_SEAT_LABELS:
         return name
     whens = " ".join(f"WHEN caller_seat = {_sql_literal(seat)} THEN {_sql_literal(label)}"
@@ -158,8 +162,10 @@ def _showed(db, key: str, day: date) -> dict[str, int]:
                      "SELECT COALESCE(NULLIF(b.caller_name, ''), "
                      "CASE WHEN lower(e.booked_by) IN ('null', 'none', 'undefined', 'nan') THEN NULL ELSE e.booked_by END) "
                      "AS caller_name, b.caller_seat, "
-                     "b.dialer_campaign_id, b.campaign_tag, b.source_tag FROM lending.ghl_stage_events e "
-                     "LEFT JOIN LATERAL (SELECT caller_name, caller_seat, dialer_campaign_id, campaign_tag, source_tag "
+                     "b.dialer_campaign_id, b.campaign_tag, b.source_tag, b.call_source, b.raw_event "
+                     "FROM lending.ghl_stage_events e "
+                     "LEFT JOIN LATERAL (SELECT caller_name, caller_seat, dialer_campaign_id, campaign_tag, source_tag, "
+                     "call_source, raw_event "
                      "FROM lending.call_dispositions d WHERE d.phone = e.phone AND d.disposition = :booked "
                      "ORDER BY d.call_ended_at DESC NULLS LAST LIMIT 1) b ON true "
                      "WHERE e.stage_key = ANY(:showed) AND e.event_at >= :start AND e.event_at < :end) s GROUP BY 1"),

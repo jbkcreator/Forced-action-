@@ -407,3 +407,28 @@ def test_retry_picks_up_only_recent_no_result_calls(monkeypatch):
     sql, params = seen[0]
     assert "upper(btrim(disposition_raw)) = :no_result" in sql and "make_interval(hours => :max_age_h)" in sql
     assert params["no_result"] == "UNKNOWN" and params["max_age_h"] == 24
+
+
+# ── Caller label for dials no caller was on ─────────────────────────────────
+
+def test_caller_label_names_the_campaign_for_a_dial_with_no_agent():
+    row = _row(caller_name=None, caller_seat=None, call_source="batchdialer",
+               raw_event={"campaign": {"id": 384315, "name": "Verified maturity"}})
+    assert dd.caller_label(row) == "Auto-dialer (Verified maturity)"
+    assert dd.caller_label({**row, "raw_event": json.dumps(row["raw_event"])}) == "Auto-dialer (Verified maturity)"
+    assert dd.build_sheet_row(row, NOW)[2] == "Auto-dialer (Verified maturity)"
+    assert "*Caller:* Auto-dialer (Verified maturity)" in _section_text(row)
+
+
+def test_caller_label_prefers_the_agent():
+    assert dd.caller_label(_row(caller_name="David Willis")) == "David Willis"
+
+
+def test_caller_label_falls_back_to_the_campaign_id_then_unknown():
+    assert dd.caller_label(_row(caller_name=None, caller_seat=None, raw_event=None,
+                                dialer_campaign_id="384315")) == "Auto-dialer (384315)"
+    assert dd.caller_label(_row(caller_name=None, caller_seat=None)) == "Auto-dialer (unknown campaign)"
+
+
+def test_caller_label_for_a_ghl_call_with_no_user_is_a_dash():
+    assert dd.caller_label(_row(caller_name=None, caller_seat=None, call_source="ghl")) == "—"

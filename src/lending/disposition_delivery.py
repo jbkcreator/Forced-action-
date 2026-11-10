@@ -7,9 +7,10 @@ a caller changes the result, so a call is never counted twice.
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
@@ -17,6 +18,8 @@ from sqlalchemy import text
 from config.lending_dispositions import (
     BOOKED_CODE,
     DELIVERY_LATENCY_TARGET_SECONDS,
+    AUTO_DIALER_LABEL,
+    AUTO_DIALER_UNKNOWN_CAMPAIGN,
     DNC_CODE,
     NO_RESULT_YET_LABEL,
     RECORDING_RECORDED,
@@ -55,6 +58,27 @@ def _recording_line(row: dict) -> Optional[str]:
     return f"*Recording:* <{url}|Open in BatchDialer>" + (f" (call at {at})" if at else "")
 
 
+def _campaign_name(row: Mapping[str, Any]) -> Optional[str]:
+    raw = row.get("raw_event")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raw = None
+    campaign = raw.get("campaign") if isinstance(raw, dict) else None
+    return (campaign.get("name") if isinstance(campaign, dict) else None) or row.get("dialer_campaign_id") or None
+
+
+def caller_label(row: Mapping[str, Any]) -> str:
+    """The caller, or for a BatchDialer dial nobody was on, its campaign ("Auto-dialer (Verified maturity)")."""
+    who = row.get("caller_name") or row.get("caller_seat")
+    if who:
+        return str(who)
+    if row.get("call_source", "batchdialer") == "batchdialer":
+        return AUTO_DIALER_LABEL.format(campaign=_campaign_name(row) or AUTO_DIALER_UNKNOWN_CAMPAIGN)
+    return "—"
+
+
 def awaiting_result(row: dict) -> bool:
     """A connected call the caller left as "Unknown": shown as "No result yet" until a real result arrives."""
     return row.get("disposition") is None and is_no_result(row.get("disposition_raw")) \
@@ -73,7 +97,7 @@ def build_sheet_row(row: dict, now: datetime) -> list[str]:
     return [
         row["dialer_call_id"],
         _et(row["call_started_at"] or row["call_ended_at"]),
-        row["caller_name"] or "",
+        row["caller_name"] or ("" if row["caller_seat"] else caller_label(row).replace("—", "")),
         row["caller_seat"] or "",
         row["queue"] or row["campaign_tag"] or "",
         row["phone"] or "",
@@ -100,7 +124,7 @@ def build_slack_message(row: dict, record: Optional[dict]) -> tuple[str, list[di
         f"*Property:* {slack_escape(record.get('property_address') or '—')}",
         f"*Phone:* {row['phone'] or '—'}",
         f"*Queue:* {row['queue'] or row['campaign_tag'] or '—'}",
-        f"*Caller:* {row['caller_name'] or row['caller_seat'] or '—'}",
+        f"*Caller:* {slack_escape(caller_label(row))}",
         f"*Talk time:* {row['talk_duration_sec'] if row['talk_duration_sec'] is not None else '—'} s",
     ]
     recording = _recording_line(row)

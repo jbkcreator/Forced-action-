@@ -62,6 +62,10 @@ ABANDONED_RESULT = "ABANDONED"
 DIALER_NO_RESULT = "UNKNOWN"
 NO_ANSWER_CODE = "NO_ANSWER"
 NO_RESULT_YET_LABEL = "No result yet"
+# A BatchDialer dial no caller was on (predictive mode attaches an agent only to a bridged call): shown under its
+# campaign, never credited to a person.
+AUTO_DIALER_LABEL = "Auto-dialer ({campaign})"
+AUTO_DIALER_UNKNOWN_CAMPAIGN = "unknown campaign"
 # A connected "Unknown" call is posted as "No result yet" only while this recent, so a deploy never posts old calls.
 NO_RESULT_POST_MAX_AGE_HOURS = 24
 
