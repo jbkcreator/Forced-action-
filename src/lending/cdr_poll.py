@@ -120,17 +120,48 @@ def _grant_inbound_consent(db, ev: DialerCallEvent) -> None:
     db.commit()
 
 
+def known_lead_phones(db, phones: list[str]) -> set[str]:
+    """The phones (normalized) that belong to one of our leads: loaded into the dialer, or a lending contact."""
+    if not phones:
+        return set()
+    rows = db.execute(
+        text("SELECT phone FROM lending.dialer_load_records WHERE phone = ANY(:p) "
+             "UNION SELECT phone FROM lending.contacts WHERE phone = ANY(:p)"),
+        {"p": phones},
+    ).all()
+    return {row[0] for row in rows}
+
+
+def _outside_dnc_events(db, parsed: list[DialerCallEvent], campaigns: frozenset[str]) -> list[DialerCallEvent]:
+    """DNC results on calls outside the lending campaigns (a lead calling back has no campaign). One from one of our
+    leads is kept so the opt-out is honoured; any other number is only logged."""
+    outside = [ev for ev in parsed if ev.campaign_id not in campaigns
+               and normalize_code(ev.disposition_raw)[0] == DNC_CODE]
+    if not outside:
+        return []
+    phones = {ev.call_id: normalize(ev.phone) if ev.phone else None for ev in outside}
+    try:
+        known = known_lead_phones(db, sorted({p for p in phones.values() if p}))
+    except Exception as exc:  # class only: SQL errors embed bound params (phones)
+        db.rollback()
+        logger.error("[lending] lead lookup for outside-campaign DNC failed: %s", type(exc).__name__)
+        known = set()
+    kept = [ev for ev in outside if phones[ev.call_id] in known]
+    for ev in outside:
+        if ev not in kept:
+            logger.warning("[lending] DNC request on CDR %s ignored: campaign %s is not a lending campaign "
+                           "and the number is not one of our leads", ev.call_id, ev.campaign_id)
+    return kept
+
+
 def ingest(db, items: list[dict], *, only_changed: bool) -> IngestStats:
     stats = IngestStats(seen=len(items))
     campaigns = lending_campaign_ids()
     parsed = [ev for ev in (parse_event(i) for i in items) if ev]
-    for ev in parsed:
-        if ev.campaign_id not in campaigns and normalize_code(ev.disposition_raw)[0] == DNC_CODE:
-            logger.warning("[lending] DNC request on CDR %s ignored: campaign %s is not a lending campaign",
-                           ev.call_id, ev.campaign_id)
     events = [ev for ev in parsed
               if ev.campaign_id in campaigns
               and (ev.direction != "inbound" or normalize_code(ev.disposition_raw)[0] == DNC_CODE)]
+    events += _outside_dnc_events(db, parsed, campaigns)
     recorded_ids = {ev.call_id for ev in events}
     for ev in parsed:
         if (ev.campaign_id in campaigns and ev.direction == "inbound" and (ev.duration or 0) > 0
