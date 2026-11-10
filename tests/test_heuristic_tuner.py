@@ -73,6 +73,27 @@ def test_load_overrides_returns_mapping():
     assert result[("fix_flip", "foreclosures")] == 3.0
 
 
+@pytest.mark.parametrize("seconds_since_boot", [10.0, 299.0])
+def test_invalidated_cache_is_reread_on_a_freshly_booted_machine(seconds_since_boot):
+    """time.monotonic() counts from boot on Linux: on a machine up for less than the 5-minute TTL (a fresh CI
+    runner, a server just after a reboot) an invalidated cache must still be re-read, never served stale."""
+    import src.services.heuristic_loader as loader
+
+    with patch.object(loader.time, "monotonic", return_value=seconds_since_boot):
+        invalidate_cache()
+        assert load_overrides(_mock_db(rows=[("wholesalers", "probate", 1.0)])) == {("wholesalers", "probate"): 1.0}
+        invalidate_cache()
+        assert load_overrides(_mock_db(rows=[("wholesalers", "probate", 7.0)])) == {("wholesalers", "probate"): 7.0}
+
+
+def test_the_first_call_reads_the_db_even_right_after_boot():
+    import src.services.heuristic_loader as loader
+
+    with patch.object(loader, "_cache", {}), patch.object(loader, "_cache_ts", loader._NEVER_LOADED), \
+            patch.object(loader.time, "monotonic", return_value=5.0):
+        assert load_overrides(_mock_db(rows=[("fix_flip", "probate", 2.0)])) == {("fix_flip", "probate"): 2.0}
+
+
 # ---------------------------------------------------------------------------
 # seed_from_json
 # ---------------------------------------------------------------------------
