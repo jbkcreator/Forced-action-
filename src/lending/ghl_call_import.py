@@ -170,7 +170,13 @@ def _snapshot_if_reached(db, row: Mapping[str, Any]) -> None:
     outcome = row["raw_outcome"].removeprefix("ghl:")
     if row["direction"] != "outbound" or outcome not in GHL_CONNECTED_STATES or not (row["talk"] or 0) > 0:
         return
-    pool = LENDINGFLOW_POOL if db.execute(_IS_LENDINGFLOW, {"p": row["phone"]}).scalar() else WEBSITE_POOL
+    try:
+        with db.begin_nested():
+            pool = LENDINGFLOW_POOL if db.execute(_IS_LENDINGFLOW, {"p": row["phone"]}).scalar() else WEBSITE_POOL
+    except Exception as exc:  # class only: a snapshot problem must never stop the calls being stored
+        logger.error("[ghl-call-import] call %s: lead lookup for the snapshot failed (%s)", row["call_id"],
+                     type(exc).__name__)
+        return
     snapshot_reached_call(db, phone=row["phone"], contacted_at=row["started"], caller_seat=row["caller_name"],
                           queue=pool, source_tag=row["tag"], call_ref=row["call_id"])
 

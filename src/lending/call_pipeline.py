@@ -128,7 +128,6 @@ def process_event(db: Session, ev: DialerCallEvent, dialer=None) -> RecordedCall
 
     if recorded.call_ended and recorded.phone and ev.direction != "inbound":
         on_attempt_recorded(db, recorded.phone)
-    _snapshot_first_contact(db, ev, recorded)
     if recorded.dnc_requested and not recorded.opt_out_propagated:
         if recorded.phone:
             if _propagate_dnc(db, row_id=recorded.row_id, phone=recorded.phone,
@@ -137,6 +136,7 @@ def process_event(db: Session, ev: DialerCallEvent, dialer=None) -> RecordedCall
         else:
             logger.error("[lending] call %s: DNC_REQUEST without a usable phone number", recorded.call_id)
     db.commit()
+    _snapshot_first_contact(db, ev, recorded)  # after the commit: a snapshot problem can never undo the call's writes
     return recorded
 
 
@@ -145,9 +145,9 @@ def _snapshot_first_contact(db: Session, ev: DialerCallEvent, recorded: Recorded
     if ev.direction == "inbound" or not recorded.phone or not (ev.duration or 0) > 0:
         return
     try:
-        record = lookup_load_record(db, ev.contact_id, recorded.phone, ev.started_at) or {}
+        with db.begin_nested():
+            record = lookup_load_record(db, ev.contact_id, recorded.phone, ev.started_at) or {}
     except Exception as exc:  # class only
-        db.rollback()
         logger.error("[lending] call %s: load record lookup for the snapshot failed: %s", ev.call_id, type(exc).__name__)
         record = {}
     if snapshot_reached_call(db, phone=recorded.phone, contacted_at=ev.started_at or ev.ended_at,

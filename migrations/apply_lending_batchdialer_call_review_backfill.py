@@ -8,8 +8,8 @@ Steps (BatchDialer rows only, each idempotent):
 4. "Answering Machine" stored as ``LEFT_VOICEMAIL`` with no talk time -> ``NO_ANSWER`` (no voicemail was left)
 5. extractions marked ``failed`` -> ``deferred`` so the transcript worker extracts them again (an empty answer is
    now a done extraction)
-6. connected "Unknown" calls not yet alerted are marked alerted, so the new missing-result alert posts nothing
-   about calls from before the fix
+6. connected "Unknown" calls not yet alerted are marked alerted, so neither the new missing-result alert nor the
+   "No result yet" post (which only posts a call not yet alerted) ever posts about calls from before the fix
 
 Nothing is posted: steps 3-4 also move ``slack_posted_disposition`` / ``sheet_synced_disposition`` to the new value
 where they held the old one, so the delivery retry job finds nothing behind. Old Slack posts, Sheet rows and GHL
@@ -27,7 +27,7 @@ import logging
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
 
-from config.lending_dispositions import DIALER_CONTACT_VIEW_URL, NO_ANSWER_CODE
+from config.lending_dispositions import DEFAULT_CAUSE, DIALER_CONTACT_VIEW_URL, NO_ANSWER_CODE
 from config.settings import get_settings
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -45,6 +45,8 @@ def _relabel(where: str) -> str:
         "  THEN :no_answer ELSE slack_posted_disposition END, "
         "sheet_synced_disposition = CASE WHEN sheet_synced_disposition IS NOT DISTINCT FROM disposition "
         "  THEN :no_answer ELSE sheet_synced_disposition END, "
+        "unfunded_cause_provisional = CASE WHEN unfunded_cause IS NULL THEN true ELSE unfunded_cause_provisional END, "
+        "unfunded_cause = COALESCE(unfunded_cause, :no_answer_cause), "
         "disposition = :no_answer, updated_at = now() "
         f"WHERE {_BD} AND {where}"
     )
@@ -55,7 +57,8 @@ STEPS: tuple[tuple[str, str], ...] = (
                            f"WHERE {_BD} AND recording_view_url IS NULL AND coalesce(dialer_contact_id, '') <> ''"),
     ("recording_status", "UPDATE lending.call_dispositions SET recording_status = s.v FROM ("
                          "  SELECT id, CASE WHEN coalesce(talk_duration_sec, 0) > 0 "
-                         "    AND coalesce(raw_event->>'recordingenabled', '1') <> '0' THEN 'recorded' ELSE 'none' END AS v "
+                         "    AND lower(coalesce(raw_event->>'recordingenabled', '1')) NOT IN ('0', 'false', 'no', 'n') "
+                         "  THEN 'recorded' ELSE 'none' END AS v "
                          f"  FROM lending.call_dispositions WHERE {_BD}) s "
                          "WHERE call_dispositions.id = s.id AND call_dispositions.recording_status IS DISTINCT FROM s.v"),
     ("unknown_no_talk", _relabel(f"disposition IS NULL AND upper(btrim(disposition_raw)) = 'UNKNOWN' AND {_NO_TALK}")),
@@ -72,7 +75,8 @@ STEPS: tuple[tuple[str, str], ...] = (
 def run_steps(conn: Connection) -> dict[str, int]:
     """Run every step on ``conn`` (the caller commits or rolls back); returns rows changed per step."""
     conn.execute(text("SET LOCAL lock_timeout = '5s'"))
-    params = {"view_prefix": DIALER_CONTACT_VIEW_URL.format(contact_id=""), "no_answer": NO_ANSWER_CODE}
+    params = {"view_prefix": DIALER_CONTACT_VIEW_URL.format(contact_id=""), "no_answer": NO_ANSWER_CODE,
+              "no_answer_cause": DEFAULT_CAUSE[NO_ANSWER_CODE]}
     return {name: int(conn.execute(text(sql), params).rowcount or 0) for name, sql in STEPS}
 
 

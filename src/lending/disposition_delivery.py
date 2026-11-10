@@ -85,6 +85,12 @@ def awaiting_result(row: dict) -> bool:
         and (row.get("talk_duration_sec") or 0) > 0
 
 
+def _may_post_awaiting(row: dict) -> bool:
+    """Post "No result yet" only before the missing-result alert has handled the call. The data fix marks every
+    call from before the fix as alerted, so no old call is ever posted."""
+    return awaiting_result(row) and row.get("disposition_missing_alerted_at") is None
+
+
 def _yn(flag: bool) -> str:
     return "Y" if flag else "N"
 
@@ -263,7 +269,7 @@ def _deliver_locked(row_id: int, session_factory: Callable, slack_client: Any, s
         if not row:
             return
         row = dict(row)
-        awaiting = awaiting_result(row)
+        awaiting = _may_post_awaiting(row)
         sheet_behind = row["sheet_synced_disposition"] != row["disposition"] or (awaiting and not row.get("sheet_synced_at"))
         if sheet_behind and (sheets_service or _configured_sheet()):
             _deliver_sheet(db, row, sheets_service)

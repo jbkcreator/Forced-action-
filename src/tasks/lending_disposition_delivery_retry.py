@@ -33,9 +33,10 @@ def behind_row_ids() -> list[int]:
                 # a recent connected "Unknown" call whose "No result yet" post or Sheet row failed
                 "  OR (disposition IS NULL AND upper(btrim(disposition_raw)) = :no_result "
                 "      AND coalesce(talk_duration_sec, 0) > 0 AND (slack_ts IS NULL OR sheet_synced_at IS NULL) "
+                "      AND disposition_missing_alerted_at IS NULL "
                 "      AND call_ended_at < now() - make_interval(secs => :age) "
                 "      AND call_ended_at > now() - make_interval(hours => :max_age_h))) "
-                "ORDER BY disposition_at LIMIT :limit"
+                "ORDER BY coalesce(disposition_at, call_ended_at) LIMIT :limit"
             ),
             {"age": RETRY_MIN_AGE_SECONDS, "limit": RETRY_BATCH_LIMIT, "no_result": DIALER_NO_RESULT,
              "max_age_h": NO_RESULT_POST_MAX_AGE_HOURS},

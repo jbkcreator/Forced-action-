@@ -407,6 +407,7 @@ def test_retry_picks_up_only_recent_no_result_calls(monkeypatch):
     sql, params = seen[0]
     assert "upper(btrim(disposition_raw)) = :no_result" in sql and "make_interval(hours => :max_age_h)" in sql
     assert params["no_result"] == "UNKNOWN" and params["max_age_h"] == 24
+    assert "disposition_missing_alerted_at IS NULL" in sql  # an alerted (or pre-fix) call is never posted
 
 
 # ── Caller label for dials no caller was on ─────────────────────────────────
@@ -432,3 +433,14 @@ def test_caller_label_falls_back_to_the_campaign_id_then_unknown():
 
 def test_caller_label_for_a_ghl_call_with_no_user_is_a_dash():
     assert dd.caller_label(_row(caller_name=None, caller_seat=None, call_source="ghl")) == "—"
+
+
+def test_unknown_call_already_alerted_is_never_posted(monkeypatch):
+    """Calls from before the fix are marked alerted by the data fix: none of them is posted as "No result yet"."""
+    monkeypatch.setattr(dd, "lookup_load_record", lambda *a, **k: None)
+    sheets, values = _sheets([])
+    slack = MagicMock()
+    factory, _ = _factory(_awaiting(sheet_synced_at=None, disposition_missing_alerted_at=NOW))
+    dd.deliver_disposition(1, session_factory=factory, slack_client=slack, sheets_service=sheets)
+    slack.chat_postMessage.assert_not_called()
+    values.append.assert_not_called()

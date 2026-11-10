@@ -82,3 +82,25 @@ def test_first_connected_ghl_call_is_snapshotted(snapshots):
 def test_missed_ghl_call_is_not_snapshotted(snapshots, outcome, talk, direction):
     ghl_call_import._snapshot_if_reached(MagicMock(), _ghl_row(outcome, talk, direction))
     assert snapshots == []
+
+
+def test_snapshot_runs_after_the_call_is_committed(monkeypatch):
+    """A snapshot problem can never undo the call row or the attempt-cap writes: it runs after the final commit."""
+    order = []
+    db = MagicMock()
+    db.commit.side_effect = lambda: order.append("commit")
+    recorded = SimpleNamespace(row_id=1, call_id="1223346777", phone="+13057905210", caller_seat="118924",
+                               call_ended=True, dnc_requested=False, opt_out_propagated=False)
+    monkeypatch.setattr(call_pipeline, "record_dialer_event", lambda db, ev: recorded)
+    monkeypatch.setattr(call_pipeline, "_check_consent", lambda *a, **k: None)
+    monkeypatch.setattr(call_pipeline, "on_attempt_recorded", lambda *a, **k: order.append("attempt"))
+    monkeypatch.setattr(call_pipeline, "_snapshot_first_contact", lambda *a, **k: order.append("snapshot"))
+    call_pipeline.process_event(db, _event(48))
+    assert order[-2:] == ["commit", "snapshot"] and order.index("attempt") < order.index("snapshot")
+
+
+def test_ghl_lead_lookup_failure_never_stops_the_import(snapshots):
+    db = MagicMock()
+    db.execute.side_effect = RuntimeError("db")
+    ghl_call_import._snapshot_if_reached(db, _ghl_row("completed", 120))
+    assert snapshots == []
