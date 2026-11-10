@@ -45,8 +45,8 @@ They change in the new workspace: `LENDING_CORA_APPROVER_USER_IDS` (Josh; also t
 
 1. Create the channels, install both apps, add the slash commands, invite the bots.
 2. Set every channel ID, token and user ID above. Leaving one unset silences those posts.
-3. Deploy, then restart `lending-api`, `fa-lending-cora`, `fa-lending-cdr-poller`, `fa-lending-uncalled-alarm-worker`
-   and `fa-lending-reminder-worker` (cron jobs read the settings on their next run).
+3. Deploy (it restarts `lending-api`, `fa-lending-cora`, `fa-lending-cdr-poller`, `fa-lending-uncalled-alarm-worker`
+   and `fa-lending-reminder-worker`; cron jobs read the settings on their next run).
 4. Smoke test one post per channel: a 5-minute flag, a digest, an approval card plus a Revise reply in #approvals,
    a routing post plus a button click in #deals, a partner card, the scoreboard, David's recap, an after-call
    result. Run `/lenders` and `/partners` as Josh (audit posts land in #cora).
