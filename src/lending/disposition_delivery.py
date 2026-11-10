@@ -18,6 +18,7 @@ from config.lending_dispositions import (
     BOOKED_CODE,
     DELIVERY_LATENCY_TARGET_SECONDS,
     DNC_CODE,
+    RECORDING_RECORDED,
     SHEET_COLUMNS,
     SHEET_TIMEZONE,
 )
@@ -38,6 +39,19 @@ SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 
 def _et(dt: Optional[datetime]) -> str:
     return dt.astimezone(ZoneInfo(SHEET_TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S") if dt else ""
+
+
+def _clock_et(dt: Optional[datetime]) -> str:
+    return dt.astimezone(ZoneInfo(SHEET_TIMEZONE)).strftime("%-I:%M %p ET") if dt else ""
+
+
+def _recording_line(row: dict) -> Optional[str]:
+    """The BatchDialer contact link for a recorded call, with the call time (a contact page lists all its calls)."""
+    url = row.get("recording_view_url")
+    if row.get("recording_status") != RECORDING_RECORDED or not url:
+        return None
+    at = _clock_et(row.get("call_started_at") or row.get("call_ended_at"))
+    return f"*Recording:* <{url}|Open in BatchDialer>" + (f" (call at {at})" if at else "")
 
 
 def _yn(flag: bool) -> str:
@@ -63,6 +77,7 @@ def build_sheet_row(row: dict, now: datetime) -> list[str]:
         cause,
         row.get("disposition_list_version") or "",
         _et(now),
+        row.get("recording_view_url") or "",
     ]
 
 
@@ -81,6 +96,9 @@ def build_slack_message(row: dict, record: Optional[dict]) -> tuple[str, list[di
         f"*Caller:* {row['caller_name'] or row['caller_seat'] or '—'}",
         f"*Talk time:* {row['talk_duration_sec'] if row['talk_duration_sec'] is not None else '—'} s",
     ]
+    recording = _recording_line(row)
+    if recording:
+        lines.append(recording)
     if disposition is None:
         title = ":arrows_counterclockwise: Result removed — waiting for a new result"
     elif disposition == BOOKED_CODE and row.get("booking_blocked"):

@@ -167,14 +167,24 @@ def test_recording_reference_and_disclosure_are_stored_only_when_sent(lending_db
     assert _row(lending_db, "c2")["recording_disclosure_logged"] is False
 
 
-def test_new_recording_enters_the_check_and_no_recording_stays_null(lending_db):
-    d.record_dialer_event(lending_db, _ev(recording_ref="https://x/rec"))
-    d.record_dialer_event(lending_db, _ev("c2"))
-    assert _row(lending_db)["recording_status"] == "pending"
-    assert _row(lending_db, "c2")["recording_status"] is None
-    lending_db.execute(text("UPDATE lending.call_dispositions SET recording_status = 'readable' WHERE dialer_call_id = 'c1'"))
-    d.record_dialer_event(lending_db, _ev(recording_ref="https://x/rec"))
-    assert _row(lending_db)["recording_status"] == "readable"
+def test_recording_status_follows_talk_time_and_the_dialer_flag(lending_db):
+    d.record_dialer_event(lending_db, _ev(recording_ref="https://x/rec", recording_enabled=True, contact_id="559662160"))
+    d.record_dialer_event(lending_db, _ev("c2", duration=0, recording_enabled=True))
+    d.record_dialer_event(lending_db, _ev("c3", recording_enabled=False))
+    row = _row(lending_db)
+    assert row["recording_status"] == "recorded"
+    assert row["recording_view_url"] == "https://app.batchdialer.com/contacts/view/559662160"
+    assert _row(lending_db, "c2")["recording_status"] == "none" and _row(lending_db, "c2")["recording_view_url"] is None
+    assert _row(lending_db, "c3")["recording_status"] == "none"
+
+
+def test_rescan_keeps_the_view_url_and_upgrades_none_to_recorded(lending_db):
+    d.record_dialer_event(lending_db, _ev(duration=0, contact_id="559662160"))
+    assert _row(lending_db)["recording_status"] == "none"
+    d.record_dialer_event(lending_db, _ev(duration=48, contact_id=None))
+    row = _row(lending_db)
+    assert row["recording_status"] == "recorded"
+    assert row["recording_view_url"] == "https://app.batchdialer.com/contacts/view/559662160"
 
 
 def test_campaign_id_is_stored_and_a_later_event_without_one_keeps_it(lending_db):

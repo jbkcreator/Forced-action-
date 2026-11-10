@@ -26,12 +26,15 @@ from config.lending_dispositions import (
     BOOKED_CODE,
     DEFAULT_CAUSE,
     DISPOSITION_LIST_VERSION,
+    DIALER_CONTACT_VIEW_URL,
     DIALER_ORIGIN,
     DIRECTION_ALIASES,
     DISPOSITIONS,
     DNC_CODE,
     EVENT_FIELD_CANDIDATES,
     LEGACY_DISPOSITION_ALIASES,
+    RECORDING_NONE,
+    RECORDING_RECORDED,
     SYSTEM_DISPOSITION_ALIASES,
     UNANSWERED_CODES,
 )
@@ -60,6 +63,7 @@ class DialerCallEvent:
     recording_ref: Optional[str]
     disclosure_logged: Optional[bool]
     raw: dict
+    recording_enabled: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -151,6 +155,16 @@ def _recording(value: Any) -> Optional[str]:
     return DIALER_ORIGIN + ref if ref and ref.startswith("/") else ref
 
 
+def contact_view_url(contact_id: Optional[str]) -> Optional[str]:
+    """The BatchDialer contact page (where the call recordings play), or None without a contact id."""
+    return DIALER_CONTACT_VIEW_URL.format(contact_id=contact_id) if contact_id else None
+
+
+def recording_status_for(talk_seconds: Optional[int], recording_enabled: Optional[bool]) -> str:
+    """Recorded when the call had talk time and the campaign records; a CDR without the flag counts as recording."""
+    return RECORDING_RECORDED if (talk_seconds or 0) > 0 and recording_enabled is not False else RECORDING_NONE
+
+
 def parse_event(raw: Any) -> Optional[DialerCallEvent]:
     """Normalize one webhook / poll record. None when it carries no call id."""
     if not isinstance(raw, dict):
@@ -175,6 +189,7 @@ def parse_event(raw: Any) -> Optional[DialerCallEvent]:
         recording_ref=_recording(_pick(data, "recording")),
         disclosure_logged=_to_bool(_pick(data, "disclosure")),
         raw=raw,
+        recording_enabled=_to_bool(_pick(data, "recording_enabled")),
     )
 
 
@@ -275,10 +290,9 @@ def record_dialer_event(db, ev: DialerCallEvent) -> RecordedCall:
         text(
             "INSERT INTO lending.call_dispositions (dialer_call_id, direction, phone, caller_seat, caller_name, "
             "caller_id_number, dialer_contact_id, seat_group, talk_duration_sec, call_started_at, call_ended_at, "
-            "recording_ref, recording_status, dialer_campaign_id, raw_event) "
+            "recording_ref, recording_status, recording_view_url, dialer_campaign_id, raw_event) "
             "VALUES (:call_id, :direction, :phone, :seat, :name, :did, :contact_id, :group, :duration, :started, "
-            ":ended, :recording, CASE WHEN CAST(:recording AS text) IS NOT NULL THEN 'pending' END, "
-            ":campaign_id, CAST(:raw AS jsonb)) "
+            ":ended, :recording, :rec_status, :view_url, :campaign_id, CAST(:raw AS jsonb)) "
             "ON CONFLICT (dialer_call_id) DO UPDATE SET "
             "direction = COALESCE(EXCLUDED.direction, lending.call_dispositions.direction), "
             "phone = COALESCE(EXCLUDED.phone, lending.call_dispositions.phone), "
@@ -292,9 +306,9 @@ def record_dialer_event(db, ev: DialerCallEvent) -> RecordedCall:
             "call_ended_at = CASE WHEN :real_end THEN EXCLUDED.call_ended_at "
             "ELSE COALESCE(lending.call_dispositions.call_ended_at, EXCLUDED.call_ended_at) END, "
             "recording_ref = COALESCE(EXCLUDED.recording_ref, lending.call_dispositions.recording_ref), "
-            "recording_status = CASE WHEN EXCLUDED.recording_ref IS NOT NULL "
-            "AND lending.call_dispositions.recording_status IS NULL THEN 'pending' "
+            "recording_status = CASE WHEN EXCLUDED.talk_duration_sec IS NOT NULL THEN EXCLUDED.recording_status "
             "ELSE lending.call_dispositions.recording_status END, "
+            "recording_view_url = COALESCE(EXCLUDED.recording_view_url, lending.call_dispositions.recording_view_url), "
             "dialer_campaign_id = COALESCE(EXCLUDED.dialer_campaign_id, lending.call_dispositions.dialer_campaign_id), "
             "raw_event = EXCLUDED.raw_event, updated_at = now() "
             "RETURNING id, phone, caller_seat, disposition, campaign_tag, queue, dialer_contact_id, "
@@ -305,7 +319,9 @@ def record_dialer_event(db, ev: DialerCallEvent) -> RecordedCall:
             "seat": ev.seat_id, "name": ev.seat_name, "did": ev.caller_id_number,
             "contact_id": ev.contact_id, "group": seat_group_for(ev.seat_id),
             "duration": ev.duration, "started": ev.started_at, "ended": ended_at, "real_end": ev.ended_at is not None,
-            "recording": ev.recording_ref, "campaign_id": ev.campaign_id, "raw": json.dumps(ev.raw, default=str),
+            "recording": ev.recording_ref, "campaign_id": ev.campaign_id,
+            "rec_status": recording_status_for(ev.duration, ev.recording_enabled),
+            "view_url": contact_view_url(ev.contact_id), "raw": json.dumps(ev.raw, default=str),
         },
     ).mappings().one()
 

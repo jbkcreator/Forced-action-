@@ -90,6 +90,7 @@ class CallRow:
     recording_status: Optional[str]
     recording_ref: Optional[str]
     call_id: Optional[str] = None
+    recording_view_url: Optional[str] = None
 
     @property
     def ghl_status(self) -> Optional[str]:
@@ -167,8 +168,8 @@ def _call_attempt(row: CallRow, ghl_recordings: Mapping[str, str]) -> Attempt:
     if row.ghl_message_id:
         recording = ghl_recordings.get(row.ghl_message_id, "")
     else:
-        recording = (row.recording_status or "") if row.recording_ref else ""
-    return Attempt(row.at, channel, PERSON, row.outcome, recording, row.recording_ref or "")
+        recording = row.recording_status or ""
+    return Attempt(row.at, channel, PERSON, row.outcome, recording, row.recording_view_url or "")
 
 
 def _sent_by(message: Mapping[str, Any]) -> str:
@@ -236,7 +237,7 @@ _LEAD = text("""
 
 _CALLS = text("""
     SELECT COALESCE(call_started_at, call_ended_at) AS at, direction, disposition, disposition_raw,
-           talk_duration_sec, call_source, recording_status, recording_ref, dialer_call_id
+           talk_duration_sec, call_source, recording_status, recording_ref, dialer_call_id, recording_view_url
       FROM lending.call_dispositions
      WHERE phone = :phone AND COALESCE(call_started_at, call_ended_at) >= :since
      ORDER BY 1

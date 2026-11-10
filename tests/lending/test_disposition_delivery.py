@@ -79,7 +79,7 @@ def test_changed_result_updates_the_same_row_in_place():
     service, values = _sheets([["Call ID"], ["other"], ["c1"]])
     dd.sync_sheet(_row(disposition="DNC_REQUEST"), service, NOW)
     values.append.assert_not_called()
-    assert values.update.call_args.kwargs["range"] == "Dispositions!A3:M3"
+    assert values.update.call_args.kwargs["range"] == "Dispositions!A3:N3"
 
 
 def test_empty_sheet_gets_a_header_first():
@@ -318,3 +318,28 @@ def test_dnc_alerts_name_the_borrower_in_the_post_and_in_coras_inbox(inbox_write
     # The inbox escapes summaries when it posts them, so the name is stored unescaped (no double escaping).
     assert event["summary"].startswith(f"{starts}Pat <Doe> (call c9)")
     assert json.loads(event["payload"])["borrower"] == "Pat <Doe>"
+
+
+# ── Recording link ──────────────────────────────────────────────────────────
+
+VIEW = "https://app.batchdialer.com/contacts/view/559662160"
+
+
+def _section_text(row):
+    _text, blocks = dd.build_slack_message(row, None)
+    return blocks[1]["text"]["text"]
+
+
+def test_slack_post_links_the_recording_when_recorded():
+    text = _section_text(_row(recording_status="recorded", recording_view_url=VIEW,
+                              call_started_at=datetime(2026, 11, 4, 14, 34, tzinfo=timezone.utc)))
+    assert f"<{VIEW}|Open in BatchDialer>" in text and "(call at 9:34 AM ET)" in text
+
+
+def test_slack_post_has_no_recording_line_without_talk_time():
+    assert "Recording" not in _section_text(_row(recording_status="none", recording_view_url=VIEW, talk_duration_sec=0))
+
+
+def test_sheet_row_ends_with_the_view_url():
+    line = dd.build_sheet_row(_row(recording_view_url=VIEW), NOW)
+    assert line[-1] == VIEW and len(line) == len(SHEET_COLUMNS) and SHEET_COLUMNS[-1] == "Recording (BatchDialer)"

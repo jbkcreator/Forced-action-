@@ -1225,8 +1225,8 @@ COUNTY_ID=hillsborough
 # Lending: warn once per call when a connected call has no disposition after N minutes.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_missing_disposition_alert
 
-# Lending: is each call recording readable with our key? forbidden (permission off) ones are rechecked every 30 min.
-*/10 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_recording_check
+# Lending: recording status is set when a call is stored (recorded / none); the old recording check
+# (src.tasks.lending_recording_check) was removed 2026-11: BatchDialer's recording link answers 404 for every call.
 
 # Lending 14-day follow-up (Runbook §4.1) — record calls made in GoHighLevel in lending.call_dispositions so every
 # attempt counts toward the LendingFlow replacement rule. No-op while LENDING_GHL_CALL_IMPORT_ENABLED=false.
