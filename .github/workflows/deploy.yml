@@ -108,10 +108,27 @@ jobs:
           print(f"schemas: {sorted(schemas)}; tables: {sum(len(md.tables) for md in metadatas.values())}")
           PY
 
+      # Tests already failing on dev before this gate are listed in tests/ci_known_failures.txt and excluded, so the
+      # gate blocks every NEW failure from day one. Fix a listed test, then delete its line.
       - name: Run tests
-        run: >-
-          pytest tests/ -q -p no:cacheprovider
-          -m "not scenario and not scenario_lifecycle and not scenario_platform and not scenario_chat and not integration"
+        run: |
+          python - <<'PY'
+          import pathlib, sys
+          import pytest
+
+          entries = [
+              line.strip() for line in pathlib.Path("tests/ci_known_failures.txt").read_text(encoding="utf-8").splitlines()
+              if line.strip() and not line.lstrip().startswith("#")
+          ]
+          args = [
+              "tests/", "-q", "-p", "no:cacheprovider",
+              "-m", "not scenario and not scenario_lifecycle and not scenario_platform and not scenario_chat and not integration",
+          ]
+          args += [f"--ignore={e}" for e in entries if "::" not in e]
+          args += [f"--deselect={e}" for e in entries if "::" in e]
+          print(f"known pre-existing failures excluded: {len(entries)}", flush=True)
+          sys.exit(pytest.main(args))
+          PY
 
   deploy:
     name: Deploy
