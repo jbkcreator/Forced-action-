@@ -195,6 +195,17 @@ def test_db_store_saves_inside_a_savepoint_after_the_claude_call():
     assert saved[0]["phone"] == "+18135550101" and saved[0]["extraction"] == {"fields": "agent: hi"}
 
 
+def test_empty_extraction_is_marked_done():
+    """A voicemail or short call Claude finds nothing in is stored as done with an empty extraction, never failed."""
+    from src.lending.call_extraction import CallExtraction
+
+    db, saved = FakeSession(), []
+    _store(db, extract=lambda transcript, *, today, db: CallExtraction(), saved=saved).extract_and_mark_done(
+        _call(), "agent: hi, this is David, call me back", now=NOW)
+    assert ("sql", "UPDATE", cfg.TRANSCRIPT_DONE) in db.events
+    assert saved[0]["extraction"] == CallExtraction()
+
+
 @pytest.mark.parametrize("ended_at, processed_at, expected_deadline", [
     (datetime(2026, 10, 19, 15, tzinfo=timezone.utc), datetime(2026, 10, 21, 15, tzinfo=timezone.utc),
      date(2026, 10, 20)),
