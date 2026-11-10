@@ -15,6 +15,12 @@ from src.utils.logger import get_logger
 logger = get_logger(__name__)
 
 _ready: Optional[bool] = None
+# Upper bound a process waits at exit for queued Sentry events (a cron task must not hang on a slow network).
+SHUTDOWN_FLUSH_SECONDS = 2
+
+
+def _quiet_exit(pending: int, timeout: float) -> None:
+    """The SDK's default exit callback prints to stderr; cron output stays clean."""
 
 
 def _sentry_ready() -> bool:
@@ -29,12 +35,17 @@ def _sentry_ready() -> bool:
         return _ready
     try:
         import sentry_sdk
+        from sentry_sdk.integrations.atexit import AtexitIntegration
 
+        # Default integrations stay off (no automatic capture of error logs or exceptions), except the exit flush:
+        # cron tasks report and exit at once, and without it the queued event is dropped at interpreter shutdown.
         sentry_sdk.init(
             dsn=dsn,
             environment=settings.sentry_environment,
             default_integrations=False,
+            integrations=[AtexitIntegration(callback=_quiet_exit)],
             send_default_pii=False,
+            shutdown_timeout=SHUTDOWN_FLUSH_SECONDS,
         )
         _ready = True
     except Exception as exc:  # class only: an SDK error can echo the DSN
