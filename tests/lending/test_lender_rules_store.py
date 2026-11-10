@@ -254,7 +254,9 @@ def test_a_row_dated_in_the_future_is_not_applied_until_then(lending_db):
         "UPDATE lending.lender_rule_values SET value = '700'::jsonb, status = 'confirmed',"
         " effective_from = CURRENT_DATE + 30 WHERE lender_key = :k AND field = 'credit_floor'"), {"k": FLIP})
     flip = _by_key(store.load_matrix(lending_db), FLIP)
-    assert flip.credit_floor == 640 and field_status_of(flip, "credit_floor") is FieldStatus.PLACEHOLDER
+    # Not applied yet: the config value stands. Since Q1 (Nov 2) the flip lender has no floor of its own (it runs on
+    # the shared placeholder set), so the config value is unset and still a placeholder.
+    assert flip.credit_floor is None and field_status_of(flip, "credit_floor") is FieldStatus.PLACEHOLDER
 
     conn.execute(text(
         "UPDATE lending.lender_rule_values SET effective_from = CURRENT_DATE - 1"

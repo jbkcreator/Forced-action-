@@ -184,7 +184,9 @@ def test_a_failed_dialer_removal_is_retried_on_the_next_run_at_no_credit_cost(db
     ).scalar()
     assert still_active is True, "removal failed: the load row must stay active, not close"
 
-    second = weekly_scrub(db, scrubber=scrubber, max_credits=10, now=NOW, phones=[], dialer_remover=remover)
+    # The next scheduled run (no phone list, as main() calls it): the verdict is stored and fresh, so nothing is
+    # due for a scrub, and the retry pass takes the flagged number out of the dialer again.
+    second = weekly_scrub(db, scrubber=scrubber, max_credits=10, now=NOW, dialer_remover=remover)
     assert remover.calls == [phone, phone]          # retried
     assert scrubber.calls == [[phone]]              # no second scrub: no credit spent on the retry
     assert second.blocked == 1
@@ -240,7 +242,7 @@ def test_a_flagged_number_whose_removal_failed_is_retried_on_the_next_run_withou
     first = weekly_scrub(db, scrubber=Scrubber(dnc={PHONES[0]}), max_credits=10, now=NOW, phones=[PHONES[0]],
                          dialer_remover=FailingRemover())
     assert first.removal_failed == 1 and _active(db, PHONES[0]) is True
-    _dnc_scrub(db, PHONES[0])                        # the verdict is stored and fresh: no longer "due"
+    # The first run stored the verdict, fresh: the number is no longer "due" for a scrub.
     scrubber, remover = Scrubber(), Remover()
     second = weekly_scrub(db, scrubber=scrubber, max_credits=10, now=NOW, dialer_remover=remover)
     assert scrubber.calls == [] and second.credits_used == 0     # no credit spent on the retry
