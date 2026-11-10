@@ -44,6 +44,8 @@ phonenumbers>=8.13
 
 # Slack SDK — county-launch interactive buttons (admin_router._update_slack_message)
 slack-sdk>=3.33.0
+# Sentry — error events sent explicitly by src/utils/sentry.py (no-op until SENTRY_DSN is set)
+sentry-sdk>=2.0.0
 
 # FA Max voice-note transcription — self-hosted Whisper (fa_max_transcriber="local")
 faster-whisper>=1.1.0

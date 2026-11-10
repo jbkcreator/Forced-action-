@@ -24,6 +24,7 @@ from config.lending_dispositions import (
     GHL_MISSING_DISPOSITION_GRACE_MINUTES,
 )
 from config.settings import get_settings
+from src.lending.slack_channels import BOT_TOKEN, report_unset
 from src.lending.db import lending_session
 from src.lending.disposition_delivery import _configured_slack, _slack_client
 from src.lending.dispositions import last4
@@ -139,7 +140,7 @@ def run(slack_client: Any = None, minutes: Optional[int] = None) -> int:
     settings = get_settings()
     minutes = minutes if minutes is not None else settings.lending_disposition_missing_alert_minutes
     if not (slack_client or _configured_slack()):
-        logger.error("[lending] missing-disposition alert skipped: Slack is not configured")
+        report_unset("missing-disposition alert", ("LENDING_DIAL_TASKS_CHANNEL", BOT_TOKEN))
         return 0
     client = slack_client or _slack_client()
     channel = settings.lending_dial_tasks_channel
