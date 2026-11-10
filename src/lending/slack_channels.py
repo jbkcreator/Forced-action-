@@ -7,6 +7,7 @@ Sentry event grouped per post and setting. Setting names only: never a channel I
 """
 from __future__ import annotations
 
+import time
 from typing import Iterable
 
 from config.settings import get_settings
@@ -18,6 +19,10 @@ logger = get_logger(__name__)
 EVENT = "lending_slack_channel_unset"
 BOT_TOKEN = "LENDING_SLACK_BOT_TOKEN"
 CORA_BOT_TOKEN = "LENDING_CORA_SLACK_BOT_TOKEN"
+# Sweeps hit the same unset channel for every row they process; Sentry gets one event per post and setting per
+# window (the log line still fires every time), so one misconfiguration cannot use up the Sentry quota.
+SENTRY_REPEAT_SECONDS = 15 * 60
+_last_sentry_event: dict[tuple[str, str], float] = {}
 
 
 def missing_settings(names: Iterable[str]) -> list[str]:
@@ -42,7 +47,11 @@ def report_unset(post: str, needed: Iterable[str]) -> list[str]:
     names = ", ".join(missing)
     logger.error("[lending-slack] %s not posted: %s not set", post, names,
                  extra={"event": EVENT, "post": post, "missing_settings": missing})
-    capture_error(f"Lending Slack post dropped: {names} not set",
-                  tags={"event": EVENT, "post": post, "missing_settings": names},
-                  fingerprint=[EVENT, post, names])
+    key, now = (post, names), time.monotonic()
+    last = _last_sentry_event.get(key)
+    if last is None or now - last >= SENTRY_REPEAT_SECONDS:
+        if capture_error(f"Lending Slack post dropped: {names} not set",
+                         tags={"event": EVENT, "post": post, "missing_settings": names},
+                         fingerprint=[EVENT, post, names]):
+            _last_sentry_event[key] = now
     return missing

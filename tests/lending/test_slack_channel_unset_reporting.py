@@ -18,8 +18,10 @@ TOKEN = "xoxb-secret-token"
 @pytest.fixture(autouse=True)
 def _no_sentry_state():
     sentry.reset_for_tests()
+    slack_channels._last_sentry_event.clear()
     yield
     sentry.reset_for_tests()
+    slack_channels._last_sentry_event.clear()
 
 
 def _settings(monkeypatch, *modules, **values):
@@ -120,14 +122,26 @@ def test_with_a_dsn_the_unset_channel_is_one_grouped_sentry_error(monkeypatch, f
     _settings(monkeypatch, sentry_dsn=SecretStr("https://key@sentry.example/1"))
     slack_channels.report_unset("scoreboard", ("LENDING_DAILY_CHANNEL", slack_channels.BOT_TOKEN))
     slack_channels.report_unset("scoreboard", ("LENDING_DAILY_CHANNEL", slack_channels.BOT_TOKEN))
-    assert len(fake_sentry.events) == 2
+    assert len(fake_sentry.events) == 1  # the repeat inside the window is logged, not sent again
     event = fake_sentry.events[0]
     assert event["level"] == "error"
     assert event["message"] == "Lending Slack post dropped: LENDING_DAILY_CHANNEL not set"
     assert event["tags"] == {"event": slack_channels.EVENT, "post": "scoreboard",
                              "missing_settings": "LENDING_DAILY_CHANNEL"}
     assert event["fingerprint"] == [slack_channels.EVENT, "scoreboard", "LENDING_DAILY_CHANNEL"]
-    assert fake_sentry.events[1]["fingerprint"] == event["fingerprint"]  # repeats group into one issue
+
+
+def test_a_sweep_hitting_an_unset_channel_sends_sentry_once_per_window_but_logs_every_time(monkeypatch, fake_sentry,
+                                                                                          caplog):
+    _settings(monkeypatch, sentry_dsn=SecretStr("https://key@sentry.example/1"))
+    clock = [1000.0]
+    monkeypatch.setattr(slack_channels.time, "monotonic", lambda: clock[0])
+    with caplog.at_level(logging.ERROR, logger="src.lending.slack_channels"):
+        for _ in range(300):  # one after-call result per row in a delivery sweep
+            slack_channels.report_unset("after-call result", ("LENDING_DIAL_TASKS_CHANNEL",))
+        clock[0] += slack_channels.SENTRY_REPEAT_SECONDS
+        slack_channels.report_unset("after-call result", ("LENDING_DIAL_TASKS_CHANNEL",))
+    assert len(fake_sentry.events) == 2 and len(caplog.records) == 301
 
 
 def test_sentry_starts_once_without_its_automatic_capture_or_personal_data(monkeypatch, fake_sentry):
