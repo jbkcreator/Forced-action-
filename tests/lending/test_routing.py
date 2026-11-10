@@ -995,7 +995,16 @@ def _confirm_rule_rows(db: Session, lender_key: str) -> None:
 
 def test_a_lender_with_rule_keys_is_judged_by_the_t05_values_not_by_its_own_boxes(rdb, monkeypatch):
     """T-05's numbers win. A box added directly on the lender (which the API forbids) is ignored."""
-    _verify_config_rules(monkeypatch)
+    from dataclasses import replace
+    from decimal import Decimal
+
+    from config.lender_matrix import LENDER_MATRIX
+
+    # Confirmed config lenders, with the flip lender carrying the safe-set $75,000 minimum as a confirmed value:
+    # since Q1 (Nov 2) it has no minimum of its own, and a confirmed but unset field means "no limit".
+    monkeypatch.setattr("src.lending.routing.rules.LENDER_MATRIX", tuple(
+        replace(r, verified=True, field_status={}, **({"min_loan_amount": Decimal("75000")} if r.key == FLIP_KEY else {}))
+        for r in LENDER_MATRIX))
     lender = _add_lender(rdb, name="T05 Lender", priority=1, rule_keys=[FLIP_KEY])
     _add_box(rdb, lender, loan_types=[LOAN_TYPE_FLIP])  # would accept anything; must be ignored
 
@@ -2814,9 +2823,10 @@ def test_large_ground_up_outside_the_primary_states_cascades_with_the_footprint_
 def test_large_ground_up_still_holds_when_no_ground_up_lender_qualifies(rdb):
     primary = _add_lender(rdb, name="GA Only", is_primary=True, priority=1, construction_min_amount=500_000)
     _add_box(rdb, primary, loan_types=[LOAN_TYPE_GU], approved_states=["GA"])
-    lead = _make_lead(rdb, loan_type=LOAN_TYPE_GU, loan_amount=900_000, phone_suffix="6021")
+    lead = _make_lead(rdb, loan_type=LOAN_TYPE_GU, loan_amount=900_000, phone_suffix="6021")  # FL file
     _route(rdb, lead)
-    assert _fr(rdb, lead)["status"] == "held" and _fr(rdb, lead)["hold_reason"] == "no_match"
+    # The only signed lender takes GA only, so the FL file is out of footprint (Addendum 1.1.2), not a plain no-match.
+    assert _fr(rdb, lead)["status"] == "held" and _fr(rdb, lead)["hold_reason"] == "out_of_footprint"
 
 
 def test_a_primary_routed_file_carries_no_overflow_metadata(rdb):

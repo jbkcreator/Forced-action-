@@ -250,7 +250,8 @@ def test_a_deferral_that_would_pass_the_call_is_skipped(db):
 def test_a_call_that_already_started_is_not_texted_about(db):
     book(db)
     record_consent(db, PHONE, "on_call_yes")
-    assert cycle(db, text_sender=TextSender(), now=SLOT + timedelta(minutes=1)) == {"skipped_call_started": 3}
+    # All four texts (confirmation, night-before, 90-minute and, since Oct 26, 10-minute) are skipped.
+    assert cycle(db, text_sender=TextSender(), now=SLOT + timedelta(minutes=1)) == {"skipped_call_started": 4}
 
 
 def test_an_ambiguous_ghl_error_is_never_resent(db):

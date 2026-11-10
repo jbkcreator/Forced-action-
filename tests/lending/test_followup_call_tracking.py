@@ -427,16 +427,17 @@ def ghl_call_row(lending_db, monkeypatch):
     return row_id, call_id
 
 
-def test_ghl_calls_get_no_soft_approval_card_or_delivery_retry(ghl_call_row, lending_db):
+def test_ghl_calls_get_no_soft_approval_card_but_are_retried_for_sheet_and_slack(ghl_call_row, lending_db):
     from src.tasks.lending_disposition_delivery_retry import behind_row_ids
     from src.tasks.lending_soft_approval_card_retry import cards_missing_row_ids
 
     row_id, _ = ghl_call_row
     assert row_id not in cards_missing_row_ids()
-    # A coded disposition never delivered to the sheet or Slack would be retried, if it were a BatchDialer call.
+    # Since G3 (Nov 3) a GHL call's coded disposition not yet delivered to the sheet or Slack is retried, like a
+    # BatchDialer call's.
     lending_db.execute(text("UPDATE lending.call_dispositions SET disposition = 'NO_ANSWER' WHERE id = :id"),
                        {"id": row_id})
-    assert row_id not in behind_row_ids()
+    assert row_id in behind_row_ids()
 
 
 def test_ghl_calls_raise_no_missing_disposition_alert_before_ghl_outcomes_go_live(ghl_call_row, lending_db):
