@@ -68,7 +68,29 @@ jobs:
       - name: Prepare test database
         env:
           PGPASSWORD: postgres
-        run: psql -h localhost -U postgres -d fa_ci_test -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
+        run: |
+          psql -h localhost -U postgres -d fa_ci_test -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
+          # Build every table the ORM models define (src/core/models.py is the tests' schema source of truth),
+          # including the lending schema, so database tests run against real tables instead of an empty DB.
+          python - <<'PY'
+          from sqlalchemy import create_engine, text
+          from src.core.models import Base as CoreBase
+          import src.lending.models as lending_models
+
+          metadatas = {id(CoreBase.metadata): CoreBase.metadata}
+          for obj in vars(lending_models).values():
+              md = getattr(obj, "metadata", None)
+              if md is not None and hasattr(md, "tables"):
+                  metadatas[id(md)] = md
+          engine = create_engine("postgresql+psycopg://postgres:postgres@localhost:5432/fa_ci_test")
+          schemas = {t.schema for md in metadatas.values() for t in md.tables.values() if t.schema}
+          with engine.begin() as conn:
+              for schema in sorted(schemas):
+                  conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+          for md in metadatas.values():
+              md.create_all(engine)
+          print(f"schemas: {sorted(schemas)}; tables: {sum(len(md.tables) for md in metadatas.values())}")
+          PY
 
       - name: Run tests
         run: >-
