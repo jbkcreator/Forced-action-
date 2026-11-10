@@ -171,4 +171,14 @@ jobs:
           host: ${{ secrets.VM_HOST }}
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.SSH_KEY }}
-          script: bash /root/Forced-action-/deploy.sh
+          # Deploy exactly the commit the Tests job passed, with that commit's own deploy scripts: a newer commit
+          # merged while the tests ran is not deployed by this run (it gets its own tested run).
+          script: |
+            set -euo pipefail
+            sha="${{ github.sha }}"
+            cd /root/Forced-action-
+            git fetch -q origin dev
+            tmp="$(mktemp -d)"
+            trap 'rm -rf "$tmp"' EXIT
+            git archive "$sha" deploy.sh scripts/deploy/sync_dev.sh | tar -x -C "$tmp"
+            bash "$tmp/deploy.sh" "$sha"
