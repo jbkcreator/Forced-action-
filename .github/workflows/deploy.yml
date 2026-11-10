@@ -127,7 +127,33 @@ jobs:
           args += [f"--ignore={e}" for e in entries if "::" not in e]
           args += [f"--deselect={e}" for e in entries if "::" in e]
           print(f"known pre-existing failures excluded: {len(entries)}", flush=True)
-          sys.exit(pytest.main(args))
+
+
+          class FailedTests:
+              """Collects the node ids of tests that fail in setup, call or teardown."""
+
+              def __init__(self):
+                  self.ids = []
+
+              def pytest_runtest_logreport(self, report):
+                  if report.failed and report.nodeid not in self.ids:
+                      self.ids.append(report.nodeid)
+
+
+          first = FailedTests()
+          code = pytest.main(args, plugins=[first])
+          if code != 1 or not first.ids or len(first.ids) > 20:
+              sys.exit(code)  # passed, a collection/usage error, or too many failures to be chance: no rerun
+
+          # A test that fails only by chance (random data, timing) passes when run again; a real break fails twice.
+          print(f"\nre-running the {len(first.ids)} failed test(s) once to tell a random failure from a real one",
+                flush=True)
+          second = FailedTests()
+          code = pytest.main(["-q", "-p", "no:cacheprovider", *first.ids], plugins=[second])
+          passed_on_rerun = [t for t in first.ids if t not in second.ids]
+          if passed_on_rerun:
+              print("::warning title=Random test failure::passed on rerun, fix or list it: " + ", ".join(passed_on_rerun))
+          sys.exit(code)
           PY
 
   deploy:

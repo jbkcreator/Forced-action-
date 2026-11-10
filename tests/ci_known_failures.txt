@@ -1,7 +1,9 @@
 # Tests that already failed on dev before the CI test gate (P0.2, Cora Activation).
 # Source: GitHub Actions run 42777395958 on 2026-11-10, dev @ 6d44a1f8 + PR #414, installed with production's
-# exact package versions (.github/ci-constraints.txt): 10,776 passed, 906 failed, 148 errors. Plus one test that
-# fail at random (test_heuristic_tuner, test_attribution_rollout). These are old test problems, not production failures.
+# exact package versions (.github/ci-constraints.txt): 10,776 passed, 906 failed, 148 errors.
+#
+# These are old test problems, not production failures. Tests that fail only by chance are not listed:
+# CI re-runs failed tests once, and a test that passes on the rerun does not block.
 #
 # CI excludes these so the gate blocks every NEW failure. When you fix one, delete its line.
 # A line without "::" is a whole file that cannot be collected (passed to pytest as --ignore).
@@ -191,7 +193,6 @@ tests/test_ap_lite.py::TestApLiteSweep::test_dry_run_no_events
 tests/test_ap_lite.py::TestCountActionsWeek::test_none_count_returns_zero
 tests/test_ap_lite.py::TestCountActionsWeek::test_returns_correct_count
 tests/test_attribution_rollout.py::test_clear_loser_triggers_rollback
-tests/test_attribution_rollout.py::test_ten_pct_split_shape
 tests/test_auto_mode_entitlement.py::TestAddonWebhookActivation::test_addon_purchase_idempotent
 tests/test_auto_mode_entitlement.py::TestAddonWebhookActivation::test_addon_purchase_sets_flag
 tests/test_auto_mode_entitlement.py::TestAddonWebhookActivation::test_missing_subscriber_id_is_safe_noop
@@ -500,7 +501,6 @@ tests/test_freemium_toggle.py::test_flash_scarcity_noop_when_off
 tests/test_freemium_toggle.py::test_status_endpoint_off
 tests/test_guarantee_shortfall_sweep.py::TestGuaranteeSweep::test_quota_met_no_stripe_call
 tests/test_guarantee_shortfall_sweep.py::TestGuaranteeSweep::test_shortfall_issues_prorated_credit_with_idempotency_key_and_email
-tests/test_heuristic_tuner.py::test_load_overrides_returns_mapping
 tests/test_icp_channels.py::TestIcpApiStateMachine::test_contractor_cannot_be_killed_via_api
 tests/test_icp_channels.py::TestIcpApiStateMachine::test_force_activate_without_reason_returns_400
 tests/test_icp_launch_gate.py::test_blocked_by_both_gate_and_mrr
