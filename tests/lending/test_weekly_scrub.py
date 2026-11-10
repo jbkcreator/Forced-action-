@@ -189,7 +189,8 @@ def test_a_failed_dialer_removal_is_retried_on_the_next_run_at_no_credit_cost(db
     second = weekly_scrub(db, scrubber=scrubber, max_credits=10, now=NOW, dialer_remover=remover)
     assert remover.calls == [phone, phone]          # retried
     assert scrubber.calls == [[phone]]              # no second scrub: no credit spent on the retry
-    assert second.blocked == 1
+    # blocked counts numbers a scrub flagged in this run; the retry run scrubs nothing, it only retries the removal.
+    assert second.blocked == 0 and second.removal_failed == 0
     now_active = db.execute(
         text("SELECT active FROM lending.dialer_load_records WHERE phone = :p"), {"p": phone}
     ).scalar()
