@@ -61,6 +61,11 @@ Source: *Cora Activation: Developer Build Brief* (Nov 10, 2026). One PR per item
   - `deploy` job now `needs: test` and is skipped for pull requests: a push to `dev` deploys only when every test passes.
   - Test job uses no production secret (placeholder `ANTHROPIC_API_KEY`, CI-only database URLs that satisfy `tests/_database_guard.py`).
 - `tests/test_price_escalation_founder.py`: deleted (tests a module removed in `6dfcab6a`; cannot be collected).
+- `tests/test_lien_engine.py`: removed the import of `_ORI_TO_LEGAL_COLS_FALLBACK` and section 6 (`TestOriToLegalColsFallback`), which test a constant removed from `lien_engine.py` in `7c7000f3`. The rest of the file is unchanged.
+- Workflow env: placeholder `FIRECRAWL_API_KEY` and `COURT_LISTENER_API_KEY` added (required by `AppSettings`, never called by tests).
+
+### CI runs
+- Run 1 (`42771067513`, draft PR #414): failed at collection, 61 errors, 0 tests ran. 60 = `AppSettings` missing `firecrawl_api_key` / `court_listener_api_key`; 1 = `tests/test_lien_engine.py` importing the removed `_ORI_TO_LEGAL_COLS_FALLBACK`. `Deploy` was skipped (pull request).
 
 ### Decisions
 - One workflow file, as the brief names `deploy.yml`; the gate is `needs: test`, so there is no way to deploy around a failing test from this workflow.

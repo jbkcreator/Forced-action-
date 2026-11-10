@@ -46,7 +46,10 @@ jobs:
       TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/fa_ci_test
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/fa_ci_unused
       REDIS_URL: redis://localhost:6379/0
+      # AppSettings requires these three; tests never call the real services.
       ANTHROPIC_API_KEY: ci-placeholder-not-a-key
+      FIRECRAWL_API_KEY: ci-placeholder-not-a-key
+      COURT_LISTENER_API_KEY: ci-placeholder-not-a-key
       PYTHONPATH: ${{ github.workspace }}
 
     steps:
