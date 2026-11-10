@@ -1,5 +1,11 @@
-"""David's activity for one ET day: calls, voicemails, texts and emails he made in GoHighLevel, the day's bookings
-and show rate, and the leads he flagged for Josh.
+"""David's activity for one ET day: calls, voicemails, texts and emails he made in GoHighLevel, his BatchDialer
+calls, the day's bookings and show rate, and the leads he flagged for Josh.
+
+BatchDialer calls come from lending.call_dispositions (``call_source = 'batchdialer'``), credited to him by his
+BatchDialer agent id (LENDING_DAVID_BD_AGENT_ID, stored as ``caller_seat``). A predictive dial nobody answered has no
+agent, so "dials in his campaigns" counts every dial of the campaigns he worked that day; connected calls, talk
+time and results are his own. A voicemail a lead left him (inbound GHL call, status voicemail) is a voicemail
+received, not talk time.
 
 Calls, texts and emails come from the GHL conversations API (Version 2021-04-15), not lending.call_dispositions:
 the GHL call import stores no GHL user, so a GHL call there cannot be credited to David. A message counts as his
@@ -27,7 +33,7 @@ from sqlalchemy import text
 
 from config.lending_compliance import DEFAULT_TZ
 from config.lending_dispositions import (
-    BOOKED_STAGE_KEYS, GHL_CONNECTED_STATES, GHL_FAILED_STATUSES, GHL_VOICEMAIL_STATES, SHOWED_STAGE_KEYS,
+    BOOKED_CODE, BOOKED_STAGE_KEYS, GHL_CONNECTED_STATES, GHL_FAILED_STATUSES, GHL_VOICEMAIL_STATES, SHOWED_STAGE_KEYS,
 )
 from src.lending.ghl_calls import GHL_CONVERSATIONS_VERSION, call_duration_seconds, call_state, message_time
 
@@ -64,8 +70,17 @@ class DavidActivity:
     emails: int = 0
     booked: int = 0
     held: int = 0
+    voicemails_received: int = 0
     flagged: list[FlaggedLead] = field(default_factory=list)
     ghl_read_failed: bool = False
+    bd_included: bool = False
+    bd_dials: int = 0
+    bd_connected: int = 0
+    bd_talk_seconds: int = 0
+    bd_voicemails_left: int = 0
+    bd_callbacks: int = 0
+    bd_booked_reported: int = 0
+    bd_read_failed: bool = False
 
     @property
     def show_rate(self) -> Optional[float]:
@@ -94,6 +109,9 @@ def count_messages(activity: DavidActivity, messages: list[Mapping[str, Any]], u
                 activity.dials += 1
                 activity.voicemails += state in GHL_VOICEMAIL_STATES
                 activity.contacts_reached += state in GHL_CONNECTED_STATES
+            elif state in GHL_VOICEMAIL_STATES:  # a lead left him a voicemail: a callback to return, not talk time
+                activity.voicemails_received += 1
+                continue
             else:
                 activity.inbound_answered += state in GHL_CONNECTED_STATES
             activity.talk_seconds += call_duration_seconds(message) or 0
@@ -202,11 +220,50 @@ def stage_counts(db, day: date) -> tuple[int, int]:
     return int(row[0] or 0), int(row[1] or 0)
 
 
+_BD_COUNTS = text("""
+    WITH day_calls AS (
+        SELECT dialer_campaign_id, caller_seat, talk_duration_sec, disposition FROM lending.call_dispositions
+         WHERE call_source = 'batchdialer' AND direction = 'outbound' AND call_ended_at >= :start AND call_ended_at < :end
+    ), mine AS (SELECT * FROM day_calls WHERE caller_seat = :agent_id)
+    SELECT (SELECT count(*) FROM day_calls WHERE dialer_campaign_id IN (SELECT dialer_campaign_id FROM mine)),
+           count(*) FILTER (WHERE coalesce(talk_duration_sec, 0) > 0),
+           coalesce(sum(talk_duration_sec), 0),
+           count(*) FILTER (WHERE disposition = :voicemail),
+           count(*) FILTER (WHERE disposition = :callback),
+           count(*) FILTER (WHERE disposition = :booked)
+      FROM mine
+""")
+
+
+def batchdialer_counts(db, day: date, agent_id: str) -> dict[str, int]:
+    """His BatchDialer numbers for ``day`` in one query (keys = the ``bd_*`` fields of DavidActivity)."""
+    start, end = day_bounds(day)
+    row = db.execute(_BD_COUNTS, {"start": start, "end": end, "agent_id": agent_id, "voicemail": "LEFT_VOICEMAIL",
+                                  "callback": "CALLBACK_REQUESTED", "booked": BOOKED_CODE}).one()
+    keys = ("bd_dials", "bd_connected", "bd_talk_seconds", "bd_voicemails_left", "bd_callbacks", "bd_booked_reported")
+    return {key: int(value or 0) for key, value in zip(keys, row)}
+
+
+def _add_batchdialer(db, activity: DavidActivity, agent_id: str) -> None:
+    """A failed query marks ``bd_read_failed`` and keeps zeros; the savepoint keeps the outer transaction usable."""
+    activity.bd_included = True
+    try:
+        with db.begin_nested():
+            for key, value in batchdialer_counts(db, activity.day, agent_id).items():
+                setattr(activity, key, value)
+    except Exception as exc:
+        activity.bd_read_failed = True
+        logger.warning("[david-activity] BatchDialer query failed for %s: %s", activity.day, type(exc).__name__)
+
+
 def build_activity(db, day: date, *, user_id: str, flagged_tag: str, get: Get, post: Post, base: str,
-                   headers: Mapping[str, str], location_id: str) -> DavidActivity:
-    """The day's numbers. A failed GHL read marks ``ghl_read_failed`` and keeps whatever was counted."""
+                   headers: Mapping[str, str], location_id: str, bd_agent_id: str = "") -> DavidActivity:
+    """The day's numbers. A failed GHL read marks ``ghl_read_failed`` and keeps whatever was counted. No BatchDialer
+    agent id = no BatchDialer section."""
     activity = DavidActivity(day)
     activity.booked, activity.held = stage_counts(db, day)
+    if bd_agent_id:
+        _add_batchdialer(db, activity, bd_agent_id)
     start, end = day_bounds(day)
     try:
         for conversation_id in conversations_since(get, base, headers, location_id, start):
@@ -242,8 +299,17 @@ def format_slack(a: DavidActivity, contact_url: Callable[[str], Optional[str]] =
     show = f"{a.show_rate:.0%}" if a.show_rate is not None else "–"
     lines = [
         f"*David · end of day · {a.day:%a %b} {a.day.day}, {a.day.year}*",
-        f"Dials {a.dials} · Contacts reached {a.contacts_reached} · Voicemails {a.voicemails} · "
+        f"GHL · Dials {a.dials} · Contacts reached {a.contacts_reached} · Voicemails {a.voicemails} · "
         f"Inbound answered {a.inbound_answered} · Talk time {_minutes(a.talk_seconds)}",
+    ]
+    if a.bd_included:
+        lines.append(
+            f"BatchDialer · Dials in his campaigns {a.bd_dials} · Connected {a.bd_connected} · "
+            f"Talk time {_minutes(a.bd_talk_seconds)} · Voicemails left {a.bd_voicemails_left} · "
+            f"Callbacks {a.bd_callbacks} · Booked (caller-reported) {a.bd_booked_reported}")
+    if a.voicemails_received:
+        lines.append(f"Voicemails received {a.voicemails_received} _(leads calling back: return these)_")
+    lines += [
         f"Texts {a.texts} · Emails {a.emails}",
         f"Booked {a.booked} · Held {a.held} · Show rate {show} _(all callers today)_",
     ]
@@ -259,4 +325,6 @@ def format_slack(a: DavidActivity, contact_url: Callable[[str], Optional[str]] =
         lines += ["", "No leads flagged."]
     if a.ghl_read_failed:
         lines += ["", ":warning: GoHighLevel could not be read in full: the GHL numbers may be low."]
+    if a.bd_read_failed:
+        lines += ["", ":warning: BatchDialer calls could not be read: the BatchDialer numbers show 0."]
     return "\n".join(lines)

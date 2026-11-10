@@ -15,7 +15,7 @@ NOON_ET = datetime(2026, 10, 28, 16, 0, tzinfo=timezone.utc)
 
 
 def _settings(**over):
-    base = dict(lending_david_summary_enabled=True, lending_david_ghl_user_id="u-david",
+    base = dict(lending_david_summary_enabled=True, lending_david_ghl_user_id="u-david", lending_david_bd_agent_id=" 118924 ",
                 lending_flagged_tag="flag-for-josh", lending_daily_channel="C_DAILY", lending_david_channel="C1",
                 lending_slack_bot_token=SecretStr("xoxb-t"), lending_ghl_app_url="https://app")
     return SimpleNamespace(**{**base, **over})
@@ -41,7 +41,8 @@ def wired(monkeypatch):
     monkeypatch.setattr(task, "lending_session", fake_session)
     monkeypatch.setattr(task, "ghl_transport", lambda key: (None, None, {}))
     monkeypatch.setattr(task, "build_activity",
-                        lambda db, day, **kw: builds.append((day, kw["user_id"], kw["flagged_tag"])) or DavidActivity(day))
+                        lambda db, day, **kw: builds.append((day, kw["user_id"], kw["flagged_tag"], kw["bd_agent_id"]))
+                        or DavidActivity(day))
     monkeypatch.setattr("slack_sdk.WebClient", FakeClient)
     return posted, builds
 
@@ -56,7 +57,7 @@ def test_posts_once_at_7pm_et_in_both_seasons(wired, now, day):
     posted, builds = wired
     assert task.main([], now=now) == 0
     assert len(posted) == 1 and posted[0]["channel"] == "C1" and "David · end of day" in posted[0]["text"]
-    assert str(builds[0][0]) == day and builds[0][1:] == ("u-david", "flag-for-josh")
+    assert str(builds[0][0]) == day and builds[0][1:] == ("u-david", "flag-for-josh", "118924")
 
 
 def test_off_switch_posts_nothing(wired, monkeypatch):
