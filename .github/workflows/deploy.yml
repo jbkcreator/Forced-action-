@@ -63,7 +63,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pytest
+          pip install -r requirements.txt pytest -c .github/ci-constraints.txt
 
       - name: Prepare test database
         env:
@@ -82,7 +82,7 @@ jobs:
               md = getattr(obj, "metadata", None)
               if md is not None and hasattr(md, "tables"):
                   metadatas[id(md)] = md
-          engine = create_engine("postgresql+psycopg://postgres:postgres@localhost:5432/fa_ci_test")
+          engine = create_engine("postgresql://postgres:postgres@localhost:5432/fa_ci_test")
           schemas = {t.schema for md in metadatas.values() for t in md.tables.values() if t.schema}
           # Model server defaults call generate_uuidv7(); same definition as scripts/apply_fa087_m1_shared_backbone.py.
           uuidv7 = """
