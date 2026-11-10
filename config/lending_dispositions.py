@@ -55,6 +55,9 @@ SYSTEM_DISPOSITION_ALIASES: dict[str, str] = {
     "VOICEMAIL": "LEFT_VOICEMAIL",
 }
 ABANDONED_RESULT = "ABANDONED"
+# BatchDialer's placeholder Call Result when the caller picked none: stored raw, but it is no disposition, so a
+# connected call carrying it still gets the missing-disposition alert.
+DIALER_NO_RESULT = "UNKNOWN"
 
 # Unfunded-cause tags (brief §2.7). Required values for every unfunded outcome.
 CAUSE_TAGS = frozenset({
