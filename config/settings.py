@@ -27,6 +27,10 @@ class AppSettings(BaseSettings):
 	fred_api_key: Optional[SecretStr] = Field(default=None, env="FRED_API_KEY")
 	# Census Bureau ACS API — free key at https://api.census.gov/data/key_signup.html
 	census_api_key: Optional[SecretStr] = Field(default=None, env="CENSUS_API_KEY")
+	# Sentry error tracking (src/utils/sentry.py). Unset = nothing is sent; the error is still logged. Only the
+	# errors code sends explicitly go to Sentry (e.g. an unset lending Slack channel), never every error log line.
+	sentry_dsn: Optional[SecretStr] = Field(default=None, env="SENTRY_DSN")
+	sentry_environment: str = Field(default="production", env="SENTRY_ENVIRONMENT")
 
 	# Property-matching LLM tiebreak. When False, borderline name matches
 	# (rapidfuzz 80-94) are NOT sent to Claude; matching falls back to pure

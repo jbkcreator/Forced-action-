@@ -64,6 +64,7 @@ from src.lending.ghl_sms import GhlSmsError
 from src.lending.slack_names import name_and_ref
 from src.lending.slack_test_filter import is_hidden_lendingflow_uuid, log_skipped, hidden_web_lead_ids
 from src.services.phone_utils import normalize
+from src.lending.slack_channels import BOT_TOKEN, report_unset
 
 logger = logging.getLogger(__name__)
 
@@ -339,6 +340,7 @@ def _send_sms(sms: Optional[Callable[..., str]], to: Optional[str], body: str) -
 
 def _post_slack(slack: Any, channel: str, body: str) -> tuple[str, Optional[str]]:
     if slack is None or not channel:
+        report_unset("uncalled-lead alarm", ("LENDING_OPS_CHANNEL", BOT_TOKEN))
         return NOT_CONFIGURED, None
     try:
         slack.chat_postMessage(channel=channel, text=body)

@@ -19,6 +19,7 @@ from config.lending_dispositions import DNC_CODE
 from config.lending_soft_approval import FORM_CALLBACK_ID, OPEN_FORM_ACTION_ID
 from config.settings import get_settings
 from src.lending.db import lending_session
+from src.lending.slack_channels import BOT_TOKEN, report_unset
 from src.lending.dispositions import last4
 from src.lending.slack_names import name_and_ref, names_by_phone
 from src.lending.slack_test_filter import log_skipped, hidden_phones
@@ -151,7 +152,7 @@ def post_soft_approval_card(row_id: int, client: Any = None) -> None:
         return
     channel = settings.lending_dial_tasks_channel
     if not channel or not settings.lending_slack_bot_token:
-        logger.warning("[soft-approval] card not posted: LENDING_DIAL_TASKS_CHANNEL or LENDING_SLACK_BOT_TOKEN is not set")
+        report_unset("soft-approval card", ("LENDING_DIAL_TASKS_CHANNEL", BOT_TOKEN))
         return
     try:
         with lending_session() as db:

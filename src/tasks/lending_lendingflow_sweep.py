@@ -24,6 +24,7 @@ from sqlalchemy import text
 
 from config.lending_lendingflow import GHL_ALERT_AFTER_MINUTES, GHL_GIVE_UP_AFTER_HOURS, SWEEP_BATCH_SIZE
 from config.settings import get_settings
+from src.lending.slack_channels import BOT_TOKEN, report_unset
 from src.lending import bd_result_to_ghl, ghl_result_to_bd, lendingflow_dialer, lendingflow_events
 from src.lending.db import lending_session
 from src.lending.lead_arrival_alert import alert_josh
@@ -44,7 +45,7 @@ def alert_undelivered(slack_client: Any = None, minutes: Optional[int] = None) -
     Never raises: an alert problem must not stop the sweep."""
     minutes = GHL_ALERT_AFTER_MINUTES if minutes is None else minutes
     if not (slack_client or _configured_slack()):
-        logger.error("[lendingflow] undelivered-lead alert skipped: Slack is not configured")
+        report_unset("LendingFlow undelivered-lead alert", ("LENDING_DIAL_TASKS_CHANNEL", BOT_TOKEN))
         return 0
     try:
         with lending_session() as db:

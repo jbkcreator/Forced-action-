@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 
 from config.settings import get_settings
+from src.lending.slack_channels import BOT_TOKEN, report_unset
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,7 @@ def post_ops_notice(message: str) -> bool:
 def _post(channel: str, setting: str, message: str) -> bool:
     settings = get_settings()
     if not (channel and settings.lending_slack_bot_token):
-        logger.warning("[lending-ops-alert] not posted: %s or LENDING_SLACK_BOT_TOKEN is not set", setting)
+        report_unset("ops alert" if setting == "LENDING_OPS_CHANNEL" else "ops notice", (setting, BOT_TOKEN))
         return False
     try:
         from slack_sdk import WebClient
