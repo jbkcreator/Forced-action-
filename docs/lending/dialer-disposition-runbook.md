@@ -37,8 +37,9 @@ CDR, and how a contact is held. Confirm them before go-live.
      the running poller's rescan will then recover. Prefer stopping the service first.
    - UNVERIFIED (Task 0, needs a live account check): the pagination parameter name `next_page` and the CDR
      status strings (`ANSWER` etc. in `CDR_ANSWERED_STATUSES`).
-4. Install the crontab: delivery retry and missing-disposition alert (every 5 minutes), plus the two new lines
-   `src.tasks.lending_recording_check` (every 10 minutes) and `src.tasks.lending_daily_scoreboard` (7:20pm ET).
+4. Install the crontab: delivery retry and missing-disposition alert (every 5 minutes), plus
+   `src.tasks.lending_daily_scoreboard` (7:20pm ET). The old `src.tasks.lending_recording_check` line is removed
+   (2026-11): delete it from a server crontab that still has it.
 
 ## 2. What the dialer admin configures in the app (BatchDialer: Akrash)
 
@@ -62,7 +63,11 @@ CDR, and how a contact is held. Confirm them before go-live.
 - **Unknown code:** stored in `disposition_raw`, `disposition` stays empty, one Slack warning.
 - **Built-in dialer results** (No Answer, Busy, Answering Machine, Disconnected Number, Do Not Call, …)
   map to our codes without an alert (`SYSTEM_DISPOSITION_ALIASES`).
-  Client-approved 2026-10-02: Abandoned -> `NO_ANSWER` (an attempt, but never queued in `missed_call_events`: the person picked up and was dropped, so "sorry we missed you" would be wrong) and Voicemail -> `LEFT_VOICEMAIL`. Successful Sale and Unknown stay unmapped on purpose, so they alert.
+  Client-approved 2026-10-02: Abandoned -> `NO_ANSWER` (an attempt, but never queued in `missed_call_events`: the person picked up and was dropped, so "sorry we missed you" would be wrong) and Voicemail -> `LEFT_VOICEMAIL`. Successful Sale stays unmapped on purpose, so it alerts.
+  2026-11-10: Answering Machine -> `NO_ANSWER` (the dialer detected a machine and hung up: 0 s, no voicemail left;
+  the raw "Answering Machine" stays in `disposition_raw`). Unknown (the caller picked no result): with no talk time
+  -> `NO_ANSWER`; with talk time it keeps no code, is posted once to Slack and the Sheet as "No result yet" (updated
+  in place when the result arrives) and gets the missing-result alert.
 
 #### BatchDialer result names (as created)
 
@@ -113,13 +118,16 @@ All 13 results exist in BatchDialer (group "Lending", created). Only the three b
 
 - The disclosure plays at the start of every call (Florida requires everyone's consent). `recording_disclosure_logged`
   is the evidence; Akrash saves a screenshot of the in-app disclosure setting.
-- BatchDialer holds the audio; the call row holds the link (`recording_ref`), shown in the Sheet-adjacent Slack post
-  with the borrower and property.
-- `recording_status`: `pending` (not checked yet or a 5xx), `readable`, `forbidden` (key lacks permission, rechecked every
-  30 min, never given up), `missing` (404). Cron: `src.tasks.lending_recording_check` every 10 min.
-- The permission fix is an account setting in BatchDialer (name it only after reading it off the Integrations screen).
-  Once enabled, `forbidden` rows flip to `readable` within about 40 minutes with no code change.
-- Audio download and S3 storage are not built here. For the week-two call-analysis owner, `readable` is the go signal.
+- BatchDialer holds the audio. Its own link (`recording_ref`, `callRecordUrl`) answers 404 to an API key for every
+  call, recorded or not (checked 2026-11-10), and every CDR carries `recordingenabled = 1`, so neither tells which
+  calls have a recording.
+- `recording_status` is set when the call is stored: `recorded` = talk time on a campaign that records, else `none`.
+  Rows from before 2026-11 may still hold `pending/readable/forbidden/missing` until the data fix
+  (`migrations/apply_lending_batchdialer_call_review_backfill.py`) runs.
+- `recording_view_url` = `https://app.batchdialer.com/contacts/view/{dialer_contact_id}`: the contact page, where the
+  contact's calls and recordings play (pick the call by its time). Shown in the Slack call post ("Open in
+  BatchDialer", with the call time), the Sheet's last column `Recording (BatchDialer)` and Cora's call history.
+- Audio download and S3 storage are not built here: BatchDialer exposes no download endpoint to an API key.
 
 ### Daily scoreboard
 
