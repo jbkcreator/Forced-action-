@@ -25,6 +25,8 @@ from config.lending_dispositions import (
     CDR_ANSWERED_STATUSES,
     BOOKED_CODE,
     DEFAULT_CAUSE,
+    DIALER_NO_RESULT,
+    NO_ANSWER_CODE,
     DISPOSITION_LIST_VERSION,
     DIALER_CONTACT_VIEW_URL,
     DIALER_ORIGIN,
@@ -210,6 +212,20 @@ def normalize_code(raw: Optional[str]) -> tuple[Optional[str], bool]:
     return None, False
 
 
+def is_no_result(raw: Optional[str]) -> bool:
+    """BatchDialer's placeholder "Unknown": the caller picked no result."""
+    return bool(raw) and re.sub(r"[^A-Z0-9]+", "_", raw.upper()).strip("_") == DIALER_NO_RESULT
+
+
+def resolve_dialer_code(raw: Optional[str], talk_seconds: Optional[int]) -> tuple[Optional[str], bool]:
+    """``normalize_code`` plus BatchDialer's "Unknown" (the caller picked no result): a call nobody talked on is a
+    NO_ANSWER; one with talk time has no code but is known, so it gets the missing-result alert, never the
+    unknown-code alert."""
+    if is_no_result(raw):
+        return (NO_ANSWER_CODE, True) if not (talk_seconds or 0) else (None, True)
+    return normalize_code(raw)
+
+
 def is_abandoned(raw: Optional[str]) -> bool:
     return bool(raw) and re.sub(r"[^A-Z0-9]+", "_", raw.upper()).strip("_") == ABANDONED_RESULT
 
@@ -279,7 +295,7 @@ def record_dialer_event(db, ev: DialerCallEvent) -> RecordedCall:
     if ev.phone and not phone:
         logger.warning("[lending] call %s: dialed number could not be normalized", ev.call_id)
     ended_at = _effective_end(ev)
-    code, known = normalize_code(ev.disposition_raw)
+    code, known = resolve_dialer_code(ev.disposition_raw, ev.duration)
 
     previous = db.execute(
         text("SELECT disposition_raw FROM lending.call_dispositions WHERE dialer_call_id = :id"),
@@ -337,6 +353,13 @@ def record_dialer_event(db, ev: DialerCallEvent) -> RecordedCall:
                 logger.warning("[lending] call %s: unknown disposition code %r", ev.call_id, ev.disposition_raw)
             db.execute(
                 text("UPDATE lending.call_dispositions SET disposition_raw = :raw, disposition_at = clock_timestamp() WHERE id = :id"),
+                {"raw": ev.disposition_raw, "id": row["id"]},
+            )
+        elif code is None and disposition is None and is_no_result(ev.disposition_raw):
+            # "Unknown" with talk time: keep the raw result so delivery shows "No result yet" and the alert fires
+            db.execute(
+                text("UPDATE lending.call_dispositions SET disposition_raw = :raw WHERE id = :id "
+                     "AND disposition_raw IS DISTINCT FROM :raw"),
                 {"raw": ev.disposition_raw, "id": row["id"]},
             )
         elif code is not None and code != disposition and disposition == DNC_CODE and row["opt_out_propagated_at"] is None:

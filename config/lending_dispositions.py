@@ -41,7 +41,9 @@ UNANSWERED_CODES = frozenset({"NO_ANSWER", "LEFT_VOICEMAIL"})
 SYSTEM_DISPOSITION_ALIASES: dict[str, str] = {
     "NO_ANSWER": "NO_ANSWER",
     "BUSY": "NO_ANSWER",
-    "ANSWERING_MACHINE": "LEFT_VOICEMAIL",
+    # The dialer detected a machine and hung up: nobody left a voicemail (0 s, no voicemailid on every such CDR,
+    # checked 2026-11-10). NO_ANSWER keeps the 10-result list; disposition_raw keeps "Answering Machine".
+    "ANSWERING_MACHINE": "NO_ANSWER",
     "DISCONNECTED_NUMBER": "BAD_NUMBER",
     "DO_NOT_CALL": "DNC_REQUEST",
     "NOT_INTERESTED": "CONNECTED_NOT_INTERESTED",
@@ -58,6 +60,10 @@ ABANDONED_RESULT = "ABANDONED"
 # BatchDialer's placeholder Call Result when the caller picked none: stored raw, but it is no disposition, so a
 # connected call carrying it still gets the missing-disposition alert.
 DIALER_NO_RESULT = "UNKNOWN"
+NO_ANSWER_CODE = "NO_ANSWER"
+NO_RESULT_YET_LABEL = "No result yet"
+# A connected "Unknown" call is posted as "No result yet" only while this recent, so a deploy never posts old calls.
+NO_RESULT_POST_MAX_AGE_HOURS = 24
 
 # Unfunded-cause tags (brief §2.7). Required values for every unfunded outcome.
 CAUSE_TAGS = frozenset({

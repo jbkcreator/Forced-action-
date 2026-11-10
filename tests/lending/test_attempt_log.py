@@ -88,7 +88,7 @@ def test_bad_number_and_wrong_person_are_flagged() -> None:
 def test_raw_dialer_results_are_mapped_to_our_codes() -> None:
     log = build_attempt_log(LEAD, [call(5, disposition=None, raw="Answering Machine"),
                                    call(9, disposition=None, raw="DISCONNECTED_NUMBER")], [])
-    assert [a.channel for a in log.attempts] == ["voicemail", "call"]
+    assert [a.channel for a in log.attempts] == ["call", "call"]  # a machine hang-up left no voicemail
     assert log.bad_number
 
 

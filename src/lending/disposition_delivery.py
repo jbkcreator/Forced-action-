@@ -18,6 +18,7 @@ from config.lending_dispositions import (
     BOOKED_CODE,
     DELIVERY_LATENCY_TARGET_SECONDS,
     DNC_CODE,
+    NO_RESULT_YET_LABEL,
     RECORDING_RECORDED,
     SHEET_COLUMNS,
     SHEET_TIMEZONE,
@@ -25,7 +26,7 @@ from config.lending_dispositions import (
 from config.settings import get_settings
 from src.lending.cora_inbox import add_to_inbox_in_own_session
 from src.lending.db import lending_session
-from src.lending.dispositions import last4, lookup_load_record
+from src.lending.dispositions import is_no_result, last4, lookup_load_record
 from src.lending.slack_names import name_and_ref, names_by_phone
 from src.lending.slack_test_filter import log_skipped, hidden_phones
 from packages.agent_core.redaction import slack_escape
@@ -54,6 +55,12 @@ def _recording_line(row: dict) -> Optional[str]:
     return f"*Recording:* <{url}|Open in BatchDialer>" + (f" (call at {at})" if at else "")
 
 
+def awaiting_result(row: dict) -> bool:
+    """A connected call the caller left as "Unknown": shown as "No result yet" until a real result arrives."""
+    return row.get("disposition") is None and is_no_result(row.get("disposition_raw")) \
+        and (row.get("talk_duration_sec") or 0) > 0
+
+
 def _yn(flag: bool) -> str:
     return "Y" if flag else "N"
 
@@ -70,7 +77,7 @@ def build_sheet_row(row: dict, now: datetime) -> list[str]:
         row["caller_seat"] or "",
         row["queue"] or row["campaign_tag"] or "",
         row["phone"] or "",
-        disposition or row.get("disposition_raw") or "",
+        disposition or (NO_RESULT_YET_LABEL if awaiting_result(row) else row.get("disposition_raw")) or "",
         str(row["talk_duration_sec"] if row["talk_duration_sec"] is not None else ""),
         _yn(booked),
         _yn(disposition == DNC_CODE),
@@ -99,7 +106,9 @@ def build_slack_message(row: dict, record: Optional[dict]) -> tuple[str, list[di
     recording = _recording_line(row)
     if recording:
         lines.append(recording)
-    if disposition is None:
+    if disposition is None and awaiting_result(row):
+        title = f":grey_question: {NO_RESULT_YET_LABEL} — set the call result in BatchDialer"
+    elif disposition is None:
         title = ":arrows_counterclockwise: Result removed — waiting for a new result"
     elif disposition == BOOKED_CODE and row.get("booking_blocked"):
         title = ":warning: BOOKED on a nurture-only list — not counted as a booking"
@@ -230,11 +239,14 @@ def _deliver_locked(row_id: int, session_factory: Callable, slack_client: Any, s
         if not row:
             return
         row = dict(row)
-        if row["sheet_synced_disposition"] != row["disposition"] and (sheets_service or _configured_sheet()):
+        awaiting = awaiting_result(row)
+        sheet_behind = row["sheet_synced_disposition"] != row["disposition"] or (awaiting and not row.get("sheet_synced_at"))
+        if sheet_behind and (sheets_service or _configured_sheet()):
             _deliver_sheet(db, row, sheets_service)
-        # A removed result only needs Slack when an earlier post exists to update.
+        # A removed result only needs Slack when an earlier post exists to update; a call awaiting its result is
+        # posted once as "No result yet" and that post is updated when the result arrives.
         slack_behind = row["slack_posted_disposition"] != row["disposition"]
-        slack_needed = slack_behind and (row["disposition"] or row["slack_ts"])
+        slack_needed = (slack_behind and (row["disposition"] or row["slack_ts"])) or (awaiting and not row["slack_ts"])
         if slack_needed and (slack_client or _configured_slack()):
             _deliver_slack(db, row, slack_client)
 

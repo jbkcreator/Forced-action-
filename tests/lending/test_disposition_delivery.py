@@ -343,3 +343,67 @@ def test_slack_post_has_no_recording_line_without_talk_time():
 def test_sheet_row_ends_with_the_view_url():
     line = dd.build_sheet_row(_row(recording_view_url=VIEW), NOW)
     assert line[-1] == VIEW and len(line) == len(SHEET_COLUMNS) and SHEET_COLUMNS[-1] == "Recording (BatchDialer)"
+
+
+# ── Connected call left as "Unknown" ────────────────────────────────────────
+
+def _awaiting(**over):
+    return _row(disposition=None, disposition_raw="Unknown", talk_duration_sec=288, **over)
+
+
+def test_unknown_connected_call_is_posted_once_as_no_result_yet(monkeypatch):
+    monkeypatch.setattr(dd, "lookup_load_record", lambda *a, **k: None)
+    sheets, values = _sheets([])
+    slack = MagicMock()
+    slack.chat_postMessage.return_value = {"ts": "1.1"}
+    factory, _ = _factory(_awaiting(sheet_synced_at=None))
+
+    dd.deliver_disposition(1, session_factory=factory, slack_client=slack, sheets_service=sheets)
+
+    assert "No result yet" in slack.chat_postMessage.call_args.kwargs["text"]
+    assert values.append.call_args.kwargs["body"]["values"][0][6] == "No result yet"
+
+    slack.reset_mock()
+    values.reset_mock()
+    factory, _ = _factory(_awaiting(slack_ts="1.1", sheet_synced_at=NOW))
+    dd.deliver_disposition(1, session_factory=factory, slack_client=slack, sheets_service=sheets)
+    slack.chat_postMessage.assert_not_called()
+    slack.chat_update.assert_not_called()
+    values.append.assert_not_called()
+
+
+def test_real_result_updates_the_no_result_yet_post(monkeypatch):
+    monkeypatch.setattr(dd, "lookup_load_record", lambda *a, **k: None)
+    sheets, _ = _sheets([])
+    slack = MagicMock()
+    factory, _ = _factory(_row(disposition="CALLBACK_REQUESTED", disposition_raw="Call Back", slack_ts="1.1",
+                               sheet_synced_at=NOW))
+    dd.deliver_disposition(1, session_factory=factory, slack_client=slack, sheets_service=sheets)
+    slack.chat_postMessage.assert_not_called()
+    assert slack.chat_update.call_args.kwargs["ts"] == "1.1"
+
+
+def test_unknown_call_with_no_talk_time_is_not_awaiting_a_result():
+    assert not dd.awaiting_result(_row(disposition=None, disposition_raw="Unknown", talk_duration_sec=0))
+    assert dd.awaiting_result(_awaiting())
+
+
+def test_retry_picks_up_only_recent_no_result_calls(monkeypatch):
+    from src.tasks import lending_disposition_delivery_retry as task
+
+    seen = []
+
+    class _Db:
+        def execute(self, sql, params):
+            seen.append((" ".join(str(sql).split()), params))
+            return MagicMock(all=lambda: [])
+
+    @contextmanager
+    def session():
+        yield _Db()
+
+    monkeypatch.setattr(task, "lending_session", session)
+    task.behind_row_ids()
+    sql, params = seen[0]
+    assert "upper(btrim(disposition_raw)) = :no_result" in sql and "make_interval(hours => :max_age_h)" in sql
+    assert params["no_result"] == "UNKNOWN" and params["max_age_h"] == 24

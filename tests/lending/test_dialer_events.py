@@ -94,7 +94,7 @@ def test_unanswered_call_queues_one_text_signal_per_contact_per_day(lending_db):
     d.record_dialer_event(lending_db, _ev("c1", duration=0, disposition_raw="No Answer"))  # replay
     rows = lending_db.execute(text("SELECT dialer_call_id, status FROM lending.missed_call_events ORDER BY 1")).all()
     assert [tuple(r) for r in rows] == [("c1", "pending"), ("c2", "duplicate_day")]
-    assert _row(lending_db, "c2")["disposition"] == "LEFT_VOICEMAIL"
+    assert _row(lending_db, "c2")["disposition"] == "NO_ANSWER"  # a machine hang-up left no voicemail
 
 
 def test_unanswered_without_any_disposition_still_counts(lending_db):
@@ -336,3 +336,23 @@ def test_abandoned_call_is_logged_as_no_answer_but_never_queued_for_the_missed_c
     assert _row(lending_db, "ab1")["disposition"] == "NO_ANSWER"
     queued = lending_db.execute(text("SELECT dialer_call_id FROM lending.missed_call_events")).scalars().all()
     assert queued == ["na1"]
+
+
+def test_unknown_with_talk_time_keeps_the_raw_result(lending_db):
+    recorded = d.record_dialer_event(lending_db, _ev(duration=288, disposition_raw="Unknown"))
+    row = _row(lending_db)
+    assert row["disposition"] is None and row["disposition_raw"] == "Unknown" and recorded.unknown_code is None
+
+
+def test_unknown_then_real_result_replaces_no_answer(lending_db):
+    d.record_dialer_event(lending_db, _ev(duration=0, disposition_raw="Unknown"))
+    assert _row(lending_db)["disposition"] == "NO_ANSWER"
+    d.record_dialer_event(lending_db, _ev(duration=0, disposition_raw="CALLBACK_REQUESTED"))
+    assert _row(lending_db)["disposition"] == "CALLBACK_REQUESTED"
+
+
+def test_rescan_keeps_no_answer_for_unknown(lending_db):
+    d.record_dialer_event(lending_db, _ev(duration=0, disposition_raw="Unknown"))
+    d.record_dialer_event(lending_db, _ev(duration=0, disposition_raw="Unknown"))
+    rows = lending_db.execute(text("SELECT disposition FROM lending.call_dispositions WHERE dialer_call_id = 'c1'")).all()
+    assert [r[0] for r in rows] == ["NO_ANSWER"]
