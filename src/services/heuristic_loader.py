@@ -19,9 +19,11 @@ logger = logging.getLogger(__name__)
 _HEURISTICS_PATH = Path(__file__).resolve().parent.parent.parent / "config" / "heuristics.json"
 _CACHE_TTL = 300  # seconds
 
-# Module-level cache
+# Module-level cache. "Never loaded" is -inf, not 0.0: time.monotonic() counts from boot on Linux, so on a
+# machine up for less than _CACHE_TTL a 0.0 timestamp still looked fresh and the DB was never read.
+_NEVER_LOADED = float("-inf")
 _cache: dict[tuple[str, str], float] = {}
-_cache_ts: float = 0.0
+_cache_ts: float = _NEVER_LOADED
 
 
 def _load_heuristics_json() -> dict:
@@ -68,7 +70,7 @@ def load_overrides(db: Optional[Session] = None) -> dict[tuple[str, str], float]
 def invalidate_cache() -> None:
     """Force next load_overrides() call to re-query the DB."""
     global _cache_ts
-    _cache_ts = 0.0
+    _cache_ts = _NEVER_LOADED
 
 
 def seed_from_json(db: Session, json_path: Optional[str] = None) -> int:
