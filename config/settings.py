@@ -1006,8 +1006,8 @@ class AppSettings(BaseSettings):
 	lending_alarm_hours_end: str = Field(default="19:15", env="LENDING_ALARM_HOURS_END")
 	# Dialer calling window, HH:MM 24h, start inclusive, end exclusive. A dial needs BOTH windows open.
 	# LOCAL = the borrower's own timezone (legal floor 08:00-20:00, config.lending_compliance.CALL_WINDOW_START/_END).
-	# ET = Josh's hours, Eastern. Any HH:MM is accepted so the team can test out of hours, but a window wider than
-	# the legal floor applies to EVERY lead: set it back right after the test. A wider window is logged as a warning.
+	# ET = Josh's hours, Eastern. Values can only NARROW calling: compliance.dial_window() clamps both windows to
+	# the legal 08:00-20:00 floor (P0.1) and logs an ERROR when a configured value is wider.
 	# Texts keep the fixed 08:00-20:00 local window and are not affected by these.
 	lending_call_window_local_start: str = Field(default="08:00", env="LENDING_CALL_WINDOW_LOCAL_START")
 	lending_call_window_local_end: str = Field(default="20:00", env="LENDING_CALL_WINDOW_LOCAL_END")

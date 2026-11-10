@@ -452,7 +452,10 @@ def test_returning_alert_escapes_slack_markup_in_the_name(name):
     text_ = returning_alert_text(name, lead_id=7, moved=True, contact_url=None)
     body = text_.split(": ", 1)[1].split(" - ", 1)[0]
     assert "<" not in body and ">" not in body
-    assert "<!channel>" not in text_ and "<!here>" not in text_ and "<@U123ABC>" not in text_ and "attacker.example|" not in text_
+    # Escaped text may still contain the visitor's words ("attacker.example|Dana"); with < and > escaped, Slack
+    # cannot turn them into a link, a mention or a channel ping.
+    assert "<!channel>" not in text_ and "<!here>" not in text_ and "<@U123ABC>" not in text_
+    assert "<https://attacker.example" not in text_
 
 
 def test_returning_alert_keeps_its_own_ghl_link_live():

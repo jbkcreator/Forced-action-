@@ -285,11 +285,12 @@ def primary_bypass_reason(lender: LenderRow, profile: FileProfile, at_cap: bool)
 
 def outside_footprint(lenders: list[LenderRow], state: str) -> bool:
     """Chunk 1 Addendum 1.1.2: no box of these lenders takes the file's state (a box without states takes all).
-    False for a file without a state or with no lenders: those are an ordinary no-match."""
-    if not (state and lenders):
+    False for a file without a state, or when these lenders have no boxes at all (nothing says which states they
+    take): those are an ordinary no-match."""
+    boxes = [box for lender in lenders for box in lender.boxes]
+    if not (state and boxes):
         return False
-    return not any(box.approved_states is None or state in box.approved_states
-                   for lender in lenders for box in lender.boxes)
+    return not any(box.approved_states is None or state in box.approved_states for box in boxes)
 
 
 def missing_leverage_facts(profile: FileProfile) -> list[str]:

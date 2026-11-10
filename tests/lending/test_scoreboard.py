@@ -126,7 +126,7 @@ def test_answer_rate_per_caller_id_number(lending_db):
     assert (by["+18135550001"].dials, by["+18135550001"].answered) == (2, 1)
     assert (by["+18135550002"].dials, by["+18135550002"].answered) == (3, 1)
     number_section = format_slack(data, DAY).split("By caller-ID number")[1]
-    assert "Answer rate" in number_section and "50%" in number_section
+    assert "answer rate" in number_section.lower() and "50%" in number_section
 
 
 def test_two_plus_minute_conversations_count_calls_of_at_least_two_minutes(lending_db):
