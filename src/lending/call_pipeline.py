@@ -24,7 +24,8 @@ from src.lending.disposition_delivery import (
 from src.lending.bd_result_to_ghl import write_note_in_background
 from src.lending.consent import record_consent
 from src.lending.dialer_port import get_dialer
-from src.lending.dispositions import DialerCallEvent, RecordedCall, record_dialer_event
+from src.lending.dispositions import DialerCallEvent, RecordedCall, lookup_load_record, record_dialer_event
+from src.lending.first_contact import snapshot_reached_call
 from src.lending.soft_approval.slack_card import post_soft_approval_card
 
 logger = logging.getLogger(__name__)
@@ -127,6 +128,7 @@ def process_event(db: Session, ev: DialerCallEvent, dialer=None) -> RecordedCall
 
     if recorded.call_ended and recorded.phone and ev.direction != "inbound":
         on_attempt_recorded(db, recorded.phone)
+    _snapshot_first_contact(db, ev, recorded)
     if recorded.dnc_requested and not recorded.opt_out_propagated:
         if recorded.phone:
             if _propagate_dnc(db, row_id=recorded.row_id, phone=recorded.phone,
@@ -136,6 +138,22 @@ def process_event(db: Session, ev: DialerCallEvent, dialer=None) -> RecordedCall
             logger.error("[lending] call %s: DNC_REQUEST without a usable phone number", recorded.call_id)
     db.commit()
     return recorded
+
+
+def _snapshot_first_contact(db: Session, ev: DialerCallEvent, recorded: RecordedCall) -> None:
+    """The lead's first-contact snapshot, on the first outbound call that reached someone (talk time)."""
+    if ev.direction == "inbound" or not recorded.phone or not (ev.duration or 0) > 0:
+        return
+    try:
+        record = lookup_load_record(db, ev.contact_id, recorded.phone, ev.started_at) or {}
+    except Exception as exc:  # class only
+        db.rollback()
+        logger.error("[lending] call %s: load record lookup for the snapshot failed: %s", ev.call_id, type(exc).__name__)
+        record = {}
+    if snapshot_reached_call(db, phone=recorded.phone, contacted_at=ev.started_at or ev.ended_at,
+                             caller_seat=recorded.caller_seat, queue=record.get("pool"),
+                             source_tag=record.get("campaign_tag"), call_ref=ev.call_id):
+        db.commit()
 
 
 def retry_unpropagated_dnc(db: Session) -> int:

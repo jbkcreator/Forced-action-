@@ -57,7 +57,9 @@ from config.lending_followup import (
     IMPORT_RUN_INTERVAL_MINUTES,
     IMPORT_WINDOW_DAYS,
 )
-from config.lending_dispositions import GHL_UNKNOWN_CALLER, ghl_caller_name
+from config.lending_dispositions import GHL_CONNECTED_STATES, GHL_UNKNOWN_CALLER, ghl_caller_name
+from config.lending_queues import LENDINGFLOW_POOL, WEBSITE_POOL
+from src.lending.first_contact import snapshot_reached_call
 from src.lending.ghl_calls import call_duration_seconds, call_state, message_time
 from src.lending.ghl_missed_call import adopt_missed_call
 from src.services.phone_utils import normalize
@@ -160,6 +162,19 @@ def _call_row(message: Mapping[str, Any], contact_id: str, phone: str, since: da
     }
 
 
+_IS_LENDINGFLOW = text("SELECT EXISTS (SELECT 1 FROM lending.lendingflow_leads WHERE phone = :p)")
+
+
+def _snapshot_if_reached(db, row: Mapping[str, Any]) -> None:
+    """First-contact snapshot on an outbound GHL call that connected (the snapshot keeps only the first per phone)."""
+    outcome = row["raw_outcome"].removeprefix("ghl:")
+    if row["direction"] != "outbound" or outcome not in GHL_CONNECTED_STATES or not (row["talk"] or 0) > 0:
+        return
+    pool = LENDINGFLOW_POOL if db.execute(_IS_LENDINGFLOW, {"p": row["phone"]}).scalar() else WEBSITE_POOL
+    snapshot_reached_call(db, phone=row["phone"], contacted_at=row["started"], caller_seat=row["caller_name"],
+                          queue=pool, source_tag=row["tag"], call_ref=row["call_id"])
+
+
 def rotation_offset(eligible: int, limit: int, now: datetime,
                     interval_minutes: int = IMPORT_RUN_INTERVAL_MINUTES) -> int:
     """The first contact this run reads: run N (numbered by the cron interval) takes slice N mod the slice count,
@@ -192,10 +207,12 @@ def _store_contact(db, read_calls: CallReader, contact_id: str, phone: str, sinc
                 stored = db.execute(_UPSERT, {**row, "unknown_outcome": UNKNOWN_OUTCOME, "unknown_caller": GHL_UNKNOWN_CALLER}).first()
                 if stored is None:
                     stats.already_recorded += 1
-                elif stored.inserted:
+                    continue
+                if stored.inserted:
                     stats.imported += 1
                 else:
                     stats.updated += 1
+                _snapshot_if_reached(db, row)  # new or changed calls only: an unchanged call was seen before
     except Exception as exc:  # class only: SQL errors embed bound parameters
         logger.error("[ghl-call-import] contact %s: calls not stored (%s)", contact_id, type(exc).__name__)
 
