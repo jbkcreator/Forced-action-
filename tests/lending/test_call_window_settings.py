@@ -11,6 +11,13 @@ from pydantic import ValidationError
 from config import lending_compliance as cfg
 from src.lending import compliance
 
+@pytest.fixture(autouse=True)
+def _fresh_hours_log_state():
+    compliance.reset_hours_log_state()
+    yield
+    compliance.reset_hours_log_state()
+
+
 NY = "+19175550123"        # Eastern area code
 LA = "+13105550123"        # Pacific area code
 # 2026-11-05 is EST (UTC-5).
@@ -118,6 +125,39 @@ def test_a_window_entirely_after_8pm_blocks_every_call(monkeypatch):
     _use_window(monkeypatch, local=("21:00", "23:00"), et=("21:00", "23:00"))
     for hour in (8, 12, 19, 21, 22):
         assert compliance._outside_call_window(NY, _at_et(hour)) is True
+
+
+def test_the_clamp_error_is_logged_once_not_per_phone(monkeypatch, caplog):
+    _use_window(monkeypatch, local=("00:00", "23:59"), et=("00:00", "23:59"))
+    with caplog.at_level("ERROR"):
+        for _ in range(500):
+            compliance._outside_call_window(NY, _at_et(21, 0))
+    assert caplog.text.count("wider than the legal") == 1
+
+
+def test_a_new_wide_value_is_logged_again(monkeypatch, caplog):
+    _use_window(monkeypatch, local=("00:00", "23:59"))
+    with caplog.at_level("ERROR"):
+        compliance.dial_window()
+        compliance.dial_window()
+        _use_window(monkeypatch, local=("06:00", "22:00"))
+        compliance.dial_window()
+    assert caplog.text.count("wider than the legal") == 2
+
+
+def test_blocked_hours_text_is_logged_once_per_phone_per_day(caplog):
+    with caplog.at_level("INFO"):
+        for minute in range(0, 60, 5):                                  # a sweep re-checking every 5 minutes
+            assert compliance.text_window_open(NY, now=_at_et(21, minute)) is False
+        assert compliance.text_window_open(LA, now=_at_et(23, 30)) is False   # another phone: logged
+    assert caplog.text.count("BLOCKED_HOURS text refused") == 2
+
+
+def test_blocked_hours_is_logged_again_the_next_day(caplog):
+    with caplog.at_level("INFO"):
+        compliance.text_window_open(NY, now=_at_et(21, 0))
+        compliance.text_window_open(NY, now=_at_et(21, 0) + timedelta(days=1))
+    assert caplog.text.count("BLOCKED_HOURS text refused") == 2
 
 
 def test_the_shipped_window_logs_no_error(monkeypatch, caplog):

@@ -96,6 +96,33 @@ def phone_hash(phone: str) -> str:
     return hashlib.sha256(phone.encode()).hexdigest()
 
 
+# Log de-duplication for the hours checks (P0.1). Sweeps re-check the same window and the same deferred lead
+# many times; each distinct event is logged once, so the log stays readable without hiding a new one.
+_BLOCKED_HOURS_LOG_MAX = 10_000
+_blocked_hours_logged: set[tuple[str, str, str]] = set()
+_clamp_logged_for: Optional["DialWindow"] = None
+
+
+def _log_blocked_hours(kind: str, phone: str, moment: datetime, detail: str = "") -> None:
+    """Logs ``BLOCKED_HOURS <kind> refused`` once per phone per Eastern day."""
+    digest = phone_hash(phone)[:12]
+    key = (kind, digest, moment.astimezone(ZoneInfo(DEFAULT_TZ)).date().isoformat())
+    if key in _blocked_hours_logged:
+        return
+    if len(_blocked_hours_logged) >= _BLOCKED_HOURS_LOG_MAX:
+        _blocked_hours_logged.clear()
+    _blocked_hours_logged.add(key)
+    logger.info("[lending-compliance] BLOCKED_HOURS %s refused phone_hash=%s at=%s%s",
+                kind, digest, moment.isoformat(), detail)
+
+
+def reset_hours_log_state() -> None:
+    """Forget which hours events were already logged (tests)."""
+    global _clamp_logged_for
+    _blocked_hours_logged.clear()
+    _clamp_logged_for = None
+
+
 # ── List-build filter (WP-W0-2 + Georgia stop) ───────────────────────────────
 
 
@@ -521,8 +548,7 @@ def can_dial_now(
         return _blocked(phone, ReasonCode.INVALID_PHONE)
 
     if _outside_call_window(normalized, now, zip_code, seat_group):
-        logger.info("[lending-compliance] BLOCKED_HOURS call refused phone_hash=%s at=%s",
-                    phone_hash(normalized)[:12], now.isoformat())
+        _log_blocked_hours("call", normalized, now)
         return _blocked(normalized, ReasonCode.OUTSIDE_CALL_WINDOW)
 
     cap_result = _attempt_cap(db, normalized, now)
@@ -564,7 +590,9 @@ def dial_window() -> DialWindow:
         max(configured.local_start, CALL_WINDOW_START), min(configured.local_end, CALL_WINDOW_END),
         max(configured.et_start, CALL_WINDOW_START), min(configured.et_end, CALL_WINDOW_END),
     )
-    if clamped != configured:
+    global _clamp_logged_for
+    if clamped != configured and configured != _clamp_logged_for:
+        _clamp_logged_for = configured
         logger.error("[lending-compliance] LENDING_CALL_WINDOW_* wider than the legal %s-%s window "
                      "(local %s-%s, ET %s-%s); clamped to local %s-%s, ET %s-%s",
                      CALL_WINDOW_START, CALL_WINDOW_END,
@@ -616,8 +644,7 @@ def text_window_open(
         return False
     moment = now or datetime.now(timezone.utc)
     if not _zones_inside_window(zones, moment):
-        logger.info("[lending-compliance] BLOCKED_HOURS text refused phone_hash=%s at=%s zones=%s",
-                    phone_hash(phone)[:12], moment.isoformat(), ",".join(sorted(zones)))
+        _log_blocked_hours("text", phone, moment, f" zones={','.join(sorted(zones))}")
         return False
     return True
 

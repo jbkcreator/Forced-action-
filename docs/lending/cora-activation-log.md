@@ -32,11 +32,12 @@ Source: *Cora Activation: Developer Build Brief* (Nov 10, 2026). Branch: `feat/c
 - ET window is clamped to the legal 08:00-20:00 floor (as #410 did), not to the shipped 09:00-19:15, so Josh's hours can still be tuned from env inside the legal limit.
 - No startup refusal of wide values (#410 had one). `AppSettings` is shared by every service (fa-api, Stripe webhooks…), so a lending typo would take them all down. The runtime clamp alone guarantees no out-of-hours dial.
 - Batch `dial_blocks()` is not logged per phone (sweeps check thousands of numbers overnight).
+- Log de-duplication (code-review follow-up): the clamp ERROR is logged once per distinct wide value per process (not once per phone in a sweep), and `BLOCKED_HOURS` is logged once per phone per Eastern day for calls and for texts (not on every sweep re-check). The de-dup set is capped at 10,000 entries and cleared when full.
 
 ### Tests
 - `py -m pytest tests/lending/test_call_window_settings.py tests/lending/test_can_dial_now.py tests/lending/test_text_window.py tests/lending/test_dialer_events.py tests/lending/test_booking_messages.py tests/lending/test_partner_door.py tests/lending/test_routing.py`
-  → **161 passed, 191 skipped** (skips = Postgres tests, no `TEST_DATABASE_URL` locally), 0 failed.
-- `test_call_window_settings.py`: 28/28 passed.
+  → **165 passed, 191 skipped** (skips = Postgres tests, no `TEST_DATABASE_URL` locally), 0 failed.
+- `test_call_window_settings.py`: 32/32 passed (adds: clamp ERROR once for 500 checks, logged again for a new wide value, BLOCKED_HOURS once per phone per day, logged again next day).
 
 ### Still to do (deliver to Josh)
 - [ ] Post the production `LENDING_CALL_WINDOW_*` values to #lending-ops (by the team; not sent by Claude).
