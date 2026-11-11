@@ -330,3 +330,18 @@ def test_stalled_main_run_alerts_unless_the_day_is_done(monkeypatch, uploader, a
     monkeypatch.setattr(task, "_alert", lambda day, problem: sent.append(problem))
     assert task._alert_if_unfinished(uploader, "F", DAY) == 0
     assert bool(sent) is alerted
+
+
+# ── P1.1 alignment: GHL id per row, Cora sends ──────────────────────────────
+
+def test_a_rows_own_ghl_id_wins_and_keys_an_email_only_send():
+    k = le.ContactKey(contact_id=7, ghl_contact_id="from-lead")
+    assert le.key_columns("+18135550123", {"+18135550123": k}, "from-draft")["ghl_contact_id"] == "from-draft"
+    assert le.key_columns(None, {}, "g9") == {"ghl_contact_id": "g9", "contact_id": "", "phone_last4": ""}
+
+
+def test_cora_send_touch_is_keyed_by_its_ghl_id():
+    data = le.LedgerData(touches=[{"phone": None, "ghl_contact_id": "g9", "at": AT, "kind": "cora_ghl_email",
+                                   "direction": "outbound", "outcome": "sent"}])
+    row = parse(le.build_files(data)["touches.csv"])[0]
+    assert row["ghl_contact_id"] == "g9" and row["kind"] == "cora_ghl_email" and "ghl_contact_id" not in le.TABLES["touches"]

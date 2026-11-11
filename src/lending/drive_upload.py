@@ -17,12 +17,17 @@ DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
 FOLDER_MIME = "application/vnd.google-apps.folder"
 
 
+def key_path() -> str:
+    """The Drive key (shared with the P1.1 job queue), else the lending Sheets key: today the same account."""
+    settings = get_settings()
+    return settings.lending_drive_service_account_key_path or settings.lending_sheets_service_account_key_path
+
+
 def drive_service():
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
 
-    creds = service_account.Credentials.from_service_account_file(
-        get_settings().lending_sheets_service_account_key_path, scopes=[DRIVE_SCOPE])
+    creds = service_account.Credentials.from_service_account_file(key_path(), scopes=[DRIVE_SCOPE])
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 

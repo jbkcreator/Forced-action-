@@ -1042,9 +1042,11 @@ class AppSettings(BaseSettings):
 	lending_audience_export_enabled: bool = Field(default=False, env="LENDING_AUDIENCE_EXPORT_ENABLED")
 	lending_audience_export_dir: Optional[str] = Field(default=None, env="LENDING_AUDIENCE_EXPORT_DIR")
 	# Nightly ledger export to Drive (src/tasks/lending_ledger_export.py, Cora brief P1.2): off until both are set; uses
-	# LENDING_SHEETS_SERVICE_ACCOUNT_KEY_PATH with the drive scope; the folder is "NDL Ledger Exports", shared with that account
+	# LENDING_DRIVE_SERVICE_ACCOUNT_KEY_PATH (else the Sheets key) with the drive scope; the folder is "NDL Ledger Exports", shared with that account
 	lending_ledger_export_enabled: bool = Field(default=False, env="LENDING_LEDGER_EXPORT_ENABLED")
 	lending_ledger_export_folder_id: str = Field(default="", env="LENDING_LEDGER_EXPORT_FOLDER_ID")
+	# Drive service account (shared with the P1.1 job queue); blank = LENDING_SHEETS_SERVICE_ACCOUNT_KEY_PATH
+	lending_drive_service_account_key_path: str = Field(default="", env="LENDING_DRIVE_SERVICE_ACCOUNT_KEY_PATH")
 	# Opt-out mailbox listener (src/lending/email_opt_out.py): reads mail sent to LENDING_OPTOUT_ADDRESS over IMAP.
 	# The mailbox is either a dedicated optout@ mailbox or the one optout@ forwards into; off while user or password is unset.
 	lending_optout_imap_host: str = Field(default="imap.porkbun.com", env="LENDING_OPTOUT_IMAP_HOST")

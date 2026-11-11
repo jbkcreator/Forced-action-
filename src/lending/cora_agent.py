@@ -457,7 +457,9 @@ def build_live_services(settings: AppSettings) -> Optional[CoraServices]:
     attempt_messages, attempt_recordings = lending_ghl_readers()
 
     ledger_manifest = None
-    if settings.lending_ledger_export_folder_id and settings.lending_sheets_service_account_key_path:
+    from src.lending.drive_upload import key_path
+
+    if settings.lending_ledger_export_folder_id and key_path():
         from src.lending.drive_upload import latest_manifest
 
         folder_id = settings.lending_ledger_export_folder_id

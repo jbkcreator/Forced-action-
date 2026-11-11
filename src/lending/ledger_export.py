@@ -8,6 +8,9 @@ lead carries one), the internal ``contact_id`` and the last 4 digits of the phon
 * touches, dispositions, outcomes: the ET calendar day being exported (yesterday, run after midnight ET).
 * scores: the borrower score (``borrower_score.py``) worked out at export time per LendingFlow / website lead, with
   the inputs it was missing. ``lead_scoring.score_lead`` is not wired to stored inputs, so it is not exported.
+* touches include Cora's own sends (``pending_actions`` sent / failed: SMS, email, GHL actions), keyed by the GHL
+  id the draft names when there is no phone (an email-only send).
+* GHL ids come from website and LendingFlow leads and from dialer loads the GHL sync pushed.
 * Test rows are left out: an ``is_test`` row, and on tables with no such flag (calls, texts, consents, stage events)
   any row whose phone belongs to a test contact or test lead.
 
@@ -78,12 +81,14 @@ def day_window(day: date) -> tuple[datetime, datetime]:
     return start.astimezone(timezone.utc), (start + timedelta(days=1)).astimezone(timezone.utc)
 
 
-def key_columns(phone: Optional[str], keys: Mapping[str, ContactKey]) -> dict[str, Any]:
+def key_columns(phone: Optional[str], keys: Mapping[str, ContactKey], ghl_contact_id: Optional[str] = None
+                ) -> dict[str, Any]:
+    """``ghl_contact_id`` is the row's own GHL id (a Cora send names its contact), else the phone's."""
     if not phone:
-        return {"ghl_contact_id": "", "contact_id": "", "phone_last4": ""}
+        return {"ghl_contact_id": ghl_contact_id or "", "contact_id": "", "phone_last4": ""}
     key = keys.get(phone)
     return {
-        "ghl_contact_id": (key.ghl_contact_id or "") if key else "",
+        "ghl_contact_id": ghl_contact_id or ((key.ghl_contact_id or "") if key else ""),
         "contact_id": key.contact_id if key and key.contact_id is not None else "",
         "phone_last4": phone[-4:],
     }
@@ -112,7 +117,7 @@ def _csv(columns: Sequence[str], rows: Iterable[Mapping[str, Any]], keys: Mappin
     writer = csv.writer(out, lineterminator="\n")
     writer.writerow((*KEY_COLUMNS, *columns))
     for row in rows:
-        ids = key_columns(row.get("phone"), keys)
+        ids = key_columns(row.get("phone"), keys, row.get("ghl_contact_id"))
         writer.writerow([*(ids[c] for c in KEY_COLUMNS), *(_cell(redact(row.get(c)) if c in FREE_TEXT_COLUMNS else row.get(c))
                                                        for c in columns)])
     return out.getvalue().encode("utf-8")
@@ -140,6 +145,9 @@ _LEAD_GHL = text("""
         UNION ALL
         SELECT phone, ghl_contact_id, received_at FROM lending.lendingflow_leads
          WHERE ghl_contact_id IS NOT NULL AND NOT is_test
+        UNION ALL
+        SELECT phone, ghl_contact_id, COALESCE(ghl_synced_at, loaded_at) FROM lending.dialer_load_records
+         WHERE ghl_contact_id IS NOT NULL
     ) x ORDER BY received_at
 """)
 _TEST_PHONES = text("""
@@ -160,13 +168,18 @@ _CONSENTS = text("""
     ORDER BY 4
 """)
 _TOUCHES = text("""
-    SELECT phone, at, kind, direction, outcome FROM (
+    SELECT phone, at, kind, direction, outcome, ghl_contact_id FROM (
         SELECT phone, COALESCE(call_started_at, call_ended_at, created_at) AS at, 'call' AS kind, direction,
-               COALESCE(disposition, disposition_raw) AS outcome
+               COALESCE(disposition, disposition_raw) AS outcome, NULL::text AS ghl_contact_id
           FROM lending.call_dispositions
         UNION ALL
-        SELECT phone, COALESCE(decided_at, created_at), 'text', 'outbound', status
+        SELECT phone, COALESCE(decided_at, created_at), 'text', 'outbound', status, NULL
           FROM lending.missed_call_events
+        UNION ALL
+        SELECT recipient_phone, COALESCE(executed_at, updated_at), 'cora_' || channel, 'outbound', status,
+               COALESCE(payload->>'ghl_contact_id',
+                        CASE WHEN contact_ref LIKE 'ghl:%' THEN substr(contact_ref, 5) END)
+          FROM lending.pending_actions WHERE status IN ('sent', 'failed')
     ) t WHERE at >= :start AND at < :end ORDER BY at
 """)
 _DISPOSITIONS = text("""
