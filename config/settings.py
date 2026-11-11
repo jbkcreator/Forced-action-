@@ -1017,6 +1017,10 @@ class AppSettings(BaseSettings):
 	lending_call_window_local_end: str = Field(default="20:00", env="LENDING_CALL_WINDOW_LOCAL_END")
 	lending_call_window_et_start: str = Field(default="09:00", env="LENDING_CALL_WINDOW_ET_START")
 	lending_call_window_et_end: str = Field(default="19:15", env="LENDING_CALL_WINDOW_ET_END")
+	# Team-owned test phones (comma-separated, E.164) that may receive lending TEXTS outside the 8am-8pm borrower
+	# window, for an end-to-end test at night. Empty by default; never a borrower's number. Each use is logged as a
+	# WARNING. Calls are never affected. Clear it and restart the lending services right after the test.
+	lending_text_window_test_phones: str = Field(default="", env="LENDING_TEXT_WINDOW_TEST_PHONES")
 	lending_ops_channel: str = Field(default="", env="LENDING_OPS_CHANNEL")  # #lead-alerts channel ID: call-now alert, 5-minute flags, returning-borrower alert
 	lending_ops_notice_channel: str = Field(default="", env="LENDING_OPS_NOTICE_CHANNEL")  # opt-out mailbox and webhook-failure alerts; channel ID, unset = not posted
 	# 14-day follow-up (src/lending/ghl_call_import.py): record calls made in GoHighLevel in lending.call_dispositions
