@@ -37,7 +37,7 @@ TABLES: dict[str, tuple[str, ...]] = {
     "dispositions": ("dialer_call_id", "direction", "disposition", "disposition_raw", "talk_duration_sec",
                      "call_source", "queue", "call_started_at"),
     "outcomes": ("at", "kind", "outcome", "ref"),
-    "scores": ("lead_source", "lead_id", "borrower_score", "missing", "created_at"),
+    "scores": ("lead_source", "lead_id", "borrower_score", "missing", "received_at"),
 }
 
 Uploader = Callable[[str, str, str, bytes], None]  # (parent folder id, dated subfolder, file name, bytes)
@@ -119,11 +119,11 @@ def publish(files: Mapping[str, bytes], *, day: date, folder_id: str, upload: Up
 _KEYS = text("SELECT phone, id FROM lending.contacts WHERE NOT is_test")
 _LEAD_GHL = text("""
     SELECT phone, ghl_contact_id FROM (
-        SELECT phone, ghl_contact_id, created_at FROM lending.web_leads WHERE ghl_contact_id IS NOT NULL AND NOT is_test
+        SELECT phone, ghl_contact_id, received_at FROM lending.web_leads WHERE ghl_contact_id IS NOT NULL AND NOT is_test
         UNION ALL
-        SELECT phone, ghl_contact_id, created_at FROM lending.lendingflow_leads
+        SELECT phone, ghl_contact_id, received_at FROM lending.lendingflow_leads
          WHERE ghl_contact_id IS NOT NULL AND NOT is_test
-    ) x ORDER BY created_at
+    ) x ORDER BY received_at
 """)
 _TEST_PHONES = text("""
     SELECT phone FROM lending.contacts WHERE is_test
@@ -171,10 +171,10 @@ _OUTCOMES = text("""
 """)
 _SCORE_LEADS = text("""
     SELECT 'lendingflow' AS lead_source, id AS lead_id, phone, property_state, loan_amount,
-           NULL AS completed_projects_3y, created_at
+           NULL AS completed_projects_3y, received_at
       FROM lending.lendingflow_leads WHERE NOT is_test
     UNION ALL
-    SELECT 'web', id, phone, property_state, loan_amount, completed_projects_3y, created_at
+    SELECT 'web', id, phone, property_state, loan_amount, completed_projects_3y, received_at
       FROM lending.web_leads WHERE NOT is_test
     ORDER BY 1, 2
 """)
@@ -208,7 +208,7 @@ def _score(lead: dict) -> dict:
     facts = facts_from_lendingflow_lead(lead) if lead["lead_source"] == "lendingflow" else facts_from_web_lead(lead)
     result = score_borrower(facts)
     return {"phone": lead["phone"], "lead_source": lead["lead_source"], "lead_id": lead["lead_id"],
-            "borrower_score": result.score, "missing": list(result.missing), "created_at": lead["created_at"]}
+            "borrower_score": result.score, "missing": list(result.missing), "received_at": lead["received_at"]}
 
 
 def collect(db, day: date) -> LedgerData:

@@ -61,7 +61,7 @@ def test_no_full_phone_or_email_appears_in_any_file():
                        "queue": "q", "call_started_at": AT}],
         outcomes=[{"phone": phone, "at": AT, "kind": "stage", "outcome": "Funded", "ref": "opp1"}],
         scores=[{"phone": phone, "lead_source": "web", "lead_id": 3, "borrower_score": 4,
-                 "missing": ["loan_amount"], "created_at": AT}],
+                 "missing": ["loan_amount"], "received_at": AT}],
     )
     blob = b"".join(le.build_files(data).values()).decode()
     assert "8135550123" not in blob and email not in blob and "0123" in blob
@@ -69,7 +69,7 @@ def test_no_full_phone_or_email_appears_in_any_file():
 
 def test_score_row_lists_missing_inputs():
     data = le.LedgerData(scores=[{"phone": "+18135550123", "lead_source": "lendingflow", "lead_id": 9,
-                                  "borrower_score": 2, "missing": ["contract", "experience"], "created_at": AT}])
+                                  "borrower_score": 2, "missing": ["contract", "experience"], "received_at": AT}])
     row = parse(le.build_files(data)["scores.csv"])[0]
     assert row["borrower_score"] == "2" and row["missing"] == "contract;experience"
 
