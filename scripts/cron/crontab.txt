@@ -1236,6 +1236,14 @@ COUNTY_ID=hillsborough
 # staged in LENDING_AUDIENCE_EXPORT_DIR, never uploaded. No-op until LENDING_AUDIENCE_EXPORT_ENABLED=true and the dir is set.
 15 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_audience_export
 
+# Lending nightly ledger export to Drive (Cora brief P1.2) — one CSV per table (contacts, consents, touches,
+# dispositions, outcomes, scores; no full phone/email) + manifest.json into NDL Ledger Exports/{yesterday ET}/, due by
+# 2:00 AM ET. 05:00 UTC = midnight EST / 1:00 AM EDT (run.sh retries at +15/+30 min). The 05:55 --retry run is the last
+# try: it skips a finished day, else exports once more and alerts #cora if that fails (exit 0, so run.sh adds no
+# repeats). No-op until LENDING_LEDGER_EXPORT_ENABLED=true and LENDING_LEDGER_EXPORT_FOLDER_ID is set.
+0 5 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_ledger_export
+55 5 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_ledger_export --retry
+
 # Lending 7:20pm ET scoreboard to Slack (Part 5.6; dialer stops 7:15pm). Two lines because ET is UTC-4 until Nov 1 and UTC-5 after; the task posts only when it is 19:xx ET.
 20 23 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_daily_scoreboard
 20 0 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_daily_scoreboard
