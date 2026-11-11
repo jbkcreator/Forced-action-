@@ -9,7 +9,7 @@ import pytest
 
 from src.lending import compliance
 
-TEST_PHONE = "+19177303812"      # team test number (Eastern area code)
+TEST_PHONE = "+19175550199"      # team test number (Eastern area code)
 BORROWER = "+19175550123"        # any other number
 NINE_PM_ET = datetime(2026, 11, 11, 2, 0, tzinfo=timezone.utc)  # 21:00 EST on Nov 10
 
@@ -32,7 +32,7 @@ def test_a_listed_test_number_may_be_texted_at_9pm_and_it_is_logged(monkeypatch,
     _allow(monkeypatch, TEST_PHONE)
     with caplog.at_level("WARNING"):
         assert compliance.text_window_open(TEST_PHONE, now=NINE_PM_ET) is True
-    assert "TEXT WINDOW TEST BYPASS" in caplog.text and "7303812" not in caplog.text
+    assert "TEXT WINDOW TEST BYPASS" in caplog.text and "5550199" not in caplog.text
 
 
 def test_every_other_number_is_still_blocked_at_9pm(monkeypatch, caplog):
@@ -48,9 +48,9 @@ def test_the_default_empty_setting_changes_nothing(monkeypatch):
 
 
 def test_numbers_are_matched_in_any_format_and_junk_is_ignored(monkeypatch):
-    _allow(monkeypatch, " not-a-phone , (917) 730-3812 ,, 123 ")
+    _allow(monkeypatch, " not-a-phone , (917) 555-0199 ,, 123 ")
     assert compliance.text_window_test_phones() == frozenset({TEST_PHONE})
-    assert compliance.text_window_open("917-730-3812", now=NINE_PM_ET) is True
+    assert compliance.text_window_open("917-555-0199", now=NINE_PM_ET) is True
 
 
 def test_an_unreadable_setting_means_no_exceptions(monkeypatch):
