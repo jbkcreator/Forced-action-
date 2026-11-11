@@ -104,4 +104,12 @@ def apply(engine: Engine | None = None, *, commit: bool = False) -> dict[str, in
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--apply", action="store_true", help="commit the changes (default: dry run, rolled back)")
-    apply(commit=parser.parse_args().apply)
+    commit = parser.parse_args().apply
+    try:
+        apply(commit=commit)
+    except Exception as exc:
+        if commit:
+            raise
+        # deploy.sh runs every new migration file without --apply: a dry run changes nothing, so a busy table
+        # (lock timeout) must not abort the deploy
+        logger.warning("dry run skipped (%s); nothing was changed", type(exc).__name__)
