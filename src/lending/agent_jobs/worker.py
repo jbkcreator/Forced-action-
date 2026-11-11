@@ -31,7 +31,7 @@ from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
-from config.lending_agent_jobs import MAX_JOBS_PER_SWEEP, REQUESTED_BY, STUCK_SENDING_AFTER
+from config.lending_agent_jobs import COLD_EMAIL_CHANNEL, MAX_JOBS_PER_SWEEP, REQUESTED_BY, STUCK_SENDING_AFTER
 from packages.agent_core.pending_actions import ActionStatus, PendingActionQueue
 from packages.agent_core.send_gate import SendGate
 from packages.agent_core.store import utc_now
@@ -69,6 +69,10 @@ def _load_time(raw: Any) -> Optional[datetime]:
     return datetime.fromisoformat(str(raw))
 
 
+def _draft_key(job: AgentJob) -> str:
+    return f"agent_job:{job.job_id}"
+
+
 def make_check(engine: Engine, *, instantly_ready: bool) -> Check:
     """``check_job`` on a short read-only session of its own."""
 
@@ -86,7 +90,8 @@ class JobQueueWorker:
     def __init__(self, engine: Engine, folders: JobFolders, gate: SendGate, queue: PendingActionQueue,
                  read_contact: ReadContact, *, approval_channel: str, check: Check,
                  is_graduated: Callable[[str], bool] = lambda _: False,
-                 clock: Callable[[], datetime] = utc_now, jobs_table: str = "lending.agent_jobs") -> None:
+                 clock: Callable[[], datetime] = utc_now, jobs_table: str = "lending.agent_jobs",
+                 raise_alert: Optional[Callable[..., Any]] = None) -> None:
         self._engine = engine
         self._folders = folders
         self._gate = gate
@@ -98,6 +103,7 @@ class JobQueueWorker:
         self._clock = clock
         self._table = jobs_table
         self._postgres = engine.dialect.name == "postgresql"
+        self._raise_alert = raise_alert or _inbox_alert
         self._sending_since: dict[int, datetime] = {}
         self._stuck_logged: set[int] = set()
         self._counts: dict[str, int] = {}
@@ -112,9 +118,10 @@ class JobQueueWorker:
     def _json(self, name: str) -> str:
         return f"CAST(:{name} AS jsonb)" if self._postgres else f":{name}"
 
-    def _rows(self, where: str, params: Mapping[str, Any]) -> list[dict[str, Any]]:
+    def _rows(self, where: str, params: Mapping[str, Any], *, limited: bool = True) -> list[dict[str, Any]]:
+        limit = " LIMIT :limit" if limited else ""
         with self._tx() as conn:
-            rows = conn.execute(text(f"SELECT * FROM {self._table} WHERE {where} ORDER BY received_at LIMIT :limit"),
+            rows = conn.execute(text(f"SELECT * FROM {self._table} WHERE {where} ORDER BY received_at{limit}"),
                                 {**params, "limit": MAX_JOBS_PER_SWEEP}).mappings().all()
         return [dict(row) for row in rows]
 
@@ -211,6 +218,15 @@ class JobQueueWorker:
 
     def _evaluate(self, row: Mapping[str, Any]) -> None:
         job = AgentJob.model_validate(_load_json(row["job"]))
+        existing = self._queue.find_by_idempotency_key(_draft_key(job))
+        if existing is not None:
+            # A sweep died after the card posted: adopt the live draft. Re-running the checks could finish the job
+            # with a different status (the cold cap counts this very draft) while its card is still approvable.
+            rail = "instantly" if existing.channel == COLD_EMAIL_CHANNEL else "ghl"
+            self._update(row["job_id"], ("held",), state="carded", action_id=existing.action_id, rail=rail,
+                         release_at=None)
+            self._count("carded")
+            return
         now = self._clock()
         contact = self._read_contact(job.ghl_contact_id)
         verdict = self._check(job, contact, now)
@@ -228,7 +244,7 @@ class JobQueueWorker:
             return
         draft = build_draft(job, contact, verdict.rail or "ghl")
         context = ToolContext(user_id=REQUESTED_BY, is_approver=False, channel=self._approval_channel, thread_ts="",
-                              tool_use_id=f"agent_job:{job.job_id}")
+                              tool_use_id=_draft_key(job))
         queued = self._gate.submit(draft, tool_name=f"agent_job:{job.type}", context=context,
                                    ttl=job.expires_at - now)
         if not job.requires_approval and self._is_graduated(job.template_version):
@@ -250,9 +266,10 @@ class JobQueueWorker:
 
     def _finish(self) -> None:
         now = self._clock()
-        for row in self._rows("state = 'carded'", {}):
+        # Every carded job, not the oldest 50: undecided cards must never hide a newer job Josh has decided.
+        for row in self._rows("state = 'carded'", {}, limited=False):
             action = self._queue.get(row["action_id"]) if row["action_id"] is not None else None
-            self._watch_sending(action, now)
+            self._watch_sending(action, row["job_id"], now)
             receipt = receipt_for(row, action, now=now)
             if receipt is not None:
                 self._finish_row(row["job_id"], ("carded",), receipt["status"], receipt=receipt)
@@ -267,16 +284,28 @@ class JobQueueWorker:
             self._update(row["job_id"], ("done",), result_written_at=self._clock())
             self._count("finished")
 
-    def _watch_sending(self, action: Any, now: datetime) -> None:
-        """An approved send still 'sending' after STUCK_SENDING_AFTER has an unknown outcome: never retried
-        (a duplicate send is worse than a missing one), so a person must check GHL. Logged once."""
+    def _watch_sending(self, action: Any, job_id: str, now: datetime) -> None:
+        """An approved send still 'sending' after STUCK_SENDING_AFTER has an unknown outcome: never retried (a
+        duplicate send is worse than a missing one), so a person must check GHL or Instantly. Raised once in Cora's
+        inbox (deduplicated by action id, so a restart never raises it twice) and logged."""
         if action is None or action.status is not ActionStatus.SENDING:
             return
         since = self._sending_since.setdefault(action.action_id, now)
-        if now - since >= STUCK_SENDING_AFTER and action.action_id not in self._stuck_logged:
-            self._stuck_logged.add(action.action_id)
-            logger.error("[agent-jobs] action %s has been sending for %s; outcome unknown, check GHL or Instantly",
-                         action.action_id, now - since)
+        if now - since < STUCK_SENDING_AFTER or action.action_id in self._stuck_logged:
+            return
+        self._stuck_logged.add(action.action_id)
+        logger.error("[agent-jobs] action %s has been sending for %s; outcome unknown, check GHL or Instantly",
+                     action.action_id, now - since)
+        self._raise_alert(event_type="agent_job_send_unknown", dedup_key=str(action.action_id),
+                          summary=(f"Agent job send outcome unknown: action {action.action_id} stopped mid-send. "
+                                   "Check GHL or Instantly before re-sending; it is never retried."),
+                          payload={"action_id": action.action_id, "job_id": job_id})
+
+
+def _inbox_alert(**event: Any) -> None:
+    from src.lending.cora_inbox import add_to_inbox_in_own_session
+
+    add_to_inbox_in_own_session(**event)
 
 
 def dry_run(directory: Path) -> WorkerStats:

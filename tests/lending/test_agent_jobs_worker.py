@@ -353,3 +353,63 @@ def test_worker_sql_runs_on_postgres(lending_db) -> None:
     stored = conn.execute(text("SELECT state, result->>'status' FROM lending.agent_jobs WHERE job_id = :j"),
                           {"j": JOB_ID}).one()
     assert tuple(stored) == ("done", "rejected")
+
+
+def test_crash_after_card_adopts_the_draft_instead_of_rechecking(h: Harness) -> None:
+    """The card posted but the row update failed: the next evaluation must adopt the live draft, not re-run the
+    checks (the cold cap would count the job's own draft and finish it as blocked_cap while its card is live)."""
+    real_update = h.worker._update
+    calls = {"n": 0}
+
+    def crash_once(job_id, from_states, **values):
+        if values.get("state") == "carded" and calls["n"] == 0:
+            calls["n"] += 1
+            raise RuntimeError("database blip")
+        return real_update(job_id, from_states, **values)
+
+    h.worker._update = crash_once
+    h.verdicts.append(Verdict("go", rail="instantly"))
+    h.verdicts.append(Verdict("block", status="blocked_cap", reason="cold email cap"))
+    h.drop(type="send_email", subject="Hi")
+    h.worker.run_once()
+    h.clock.now = START + timedelta(minutes=20)
+    h.worker.run_once()
+    row = h.row()
+    assert (row["state"], row["rail"]) == ("carded", "instantly")
+    assert row["action_id"] == h.action_ids()[0]
+    assert JOB_ID not in h.folders.results
+
+
+def test_decided_job_gets_receipt_behind_many_undecided_cards(h: Harness) -> None:
+    import uuid
+
+    from config.lending_agent_jobs import MAX_JOBS_PER_SWEEP
+
+    for _ in range(MAX_JOBS_PER_SWEEP + 1):  # Josh away: older cards stay open
+        h.drop(job_id=str(uuid.uuid4()))
+    h.worker.run_once()
+    h.clock.now = START + timedelta(minutes=1)
+    h.drop()
+    h.worker.run_once()
+    h.send(h.row()["action_id"])
+    h.worker.run_once()
+    assert h.folders.results[JOB_ID]["status"] == "sent"
+
+
+def test_stuck_sending_raises_one_inbox_alert(h: Harness) -> None:
+    alerts: list[dict] = []
+    h.worker._raise_alert = lambda **event: alerts.append(event)
+    h.drop()
+    h.worker.run_once()
+    action_id = h.row()["action_id"]
+    assert h.queue.approve(action_id, "U_JOSH") and h.queue.claim_for_send(action_id)  # the process died mid-send
+    h.worker.run_once()
+    assert alerts == []
+    h.clock.now = START + timedelta(minutes=16)
+    h.worker.run_once()
+    h.clock.now = START + timedelta(minutes=17)
+    h.worker.run_once()
+    assert len(alerts) == 1
+    assert alerts[0]["event_type"] == "agent_job_send_unknown"
+    assert alerts[0]["dedup_key"] == str(action_id)
+    assert alerts[0]["payload"] == {"action_id": action_id, "job_id": JOB_ID}

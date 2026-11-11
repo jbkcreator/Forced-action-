@@ -38,7 +38,7 @@ class AgentJob(BaseModel):
     created_by: str = Field(min_length=1, max_length=120)
     created_at: AwareDatetime
     type: Literal["send_sms", "send_email", "create_task", "add_tag", "move_stage", "add_note"]
-    ghl_contact_id: str = Field(min_length=1, max_length=64)
+    ghl_contact_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,60}$")  # goes into GHL URL paths and contact_ref
     contact_label: str = Field(default="", max_length=120)
     template_version: str = Field(min_length=1, max_length=80)
     body: str = Field(min_length=1, max_length=2000)

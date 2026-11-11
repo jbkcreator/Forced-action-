@@ -203,6 +203,11 @@ class PendingActionQueue:
                 ).scalar_one()
         return int(action_id)
 
+    def find_by_idempotency_key(self, key: str) -> PendingAction | None:
+        """The action queued under ``key``, whatever its status (a host's own retry looks it up)."""
+        with self._store.transaction() as conn:
+            return self._select_one(conn, "idempotency_key = :key", {"key": key})
+
     def get(self, action_id: int) -> PendingAction | None:
         with self._store.transaction() as conn:
             return self._select_one(conn, "action_id = :action_id", {"action_id": action_id})

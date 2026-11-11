@@ -66,8 +66,12 @@ def _single_attempt(method: str, url: str, **kwargs: Any) -> requests.Response:
     return requests.request(method, url, timeout=_TIMEOUT, **kwargs)
 
 
-def _headers(api_key: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+def _headers(api_key: str, *, has_body: bool) -> dict[str, str]:
+    # Instantly (Fastify) rejects a JSON content-type with an empty body (FST_ERR_CTP_EMPTY_JSON_BODY).
+    headers = {"Authorization": f"Bearer {api_key}"}
+    if has_body:
+        headers["Content-Type"] = "application/json"
+    return headers
 
 
 _warned_missing: Optional[tuple[str, ...]] = None
@@ -104,7 +108,7 @@ class NdlInstantlySender:
     def _call(self, what: str, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         try:
             response = self._request(method, f"{self._account.base_url}{path}",
-                                     headers=_headers(self._account.api_key), **kwargs)
+                                     headers=_headers(self._account.api_key, has_body="json" in kwargs), **kwargs)
         except Exception as exc:  # class only: the message can carry request detail
             logger.warning("%s %s request error: %s", self._log_prefix, what, type(exc).__name__)
             raise InstantlySendError(f"Instantly {what} request error ({type(exc).__name__})") from None
@@ -179,12 +183,14 @@ def get_ndl_instantly_sender() -> Optional[NdlInstantlySender]:
 
 
 def setup_campaign(api_key: str, base_url: str, sender_email: str, request: Optional[Request] = None) -> str:
-    """Find or create (and activate) the "NDL Cora Passthrough" campaign; returns its id."""
+    """Find or create the "NDL Cora Passthrough" campaign, make sure it is active, and return its id."""
     sender = NdlInstantlySender(NdlInstantly(api_key, base_url.rstrip("/"), "", sender_email, "", "", ""), request)
     listed = sender._call("campaign list", "GET", "/api/v2/campaigns")
     campaigns = listed if isinstance(listed, list) else listed.get("items") or listed.get("data") or []
     existing = next((c for c in campaigns if c.get("name") == CAMPAIGN_NAME), None)
     if existing:
+        # A run that died between create and activate left it inactive, and an inactive campaign sends nothing.
+        sender._call("campaign activate", "POST", f"/api/v2/campaigns/{existing['id']}/activate")
         return str(existing["id"])
     created = sender._call("campaign create", "POST", "/api/v2/campaigns", json={
         "name": CAMPAIGN_NAME,

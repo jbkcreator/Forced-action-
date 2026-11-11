@@ -96,3 +96,15 @@ def test_error_reason_has_no_body_text() -> None:
         parse_job(raw, FILE_NAME)
     assert "555" not in err.value.reason
     assert "send_fax" not in err.value.reason
+
+
+@pytest.mark.parametrize("contact_id", ["abc/../locations", "abc?x=1", "a" * 61, "abc 123", ""])
+def test_rejects_unsafe_ghl_contact_id(contact_id: str) -> None:
+    """The id goes into GHL URL paths and into pending_actions.contact_ref (varchar(64), "ghl:" + id)."""
+    with pytest.raises(JobFormatError) as err:
+        parse_job(_raw(_spec_example(ghl_contact_id=contact_id)), FILE_NAME)
+    assert "ghl_contact_id" in err.value.reason
+
+
+def test_accepts_a_real_looking_ghl_contact_id() -> None:
+    assert parse_job(_raw(_spec_example(ghl_contact_id="h7Gk2LmQ9xYz0AbCdEfG")), FILE_NAME).ghl_contact_id

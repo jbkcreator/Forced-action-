@@ -161,7 +161,22 @@ def test_setup_campaign_schedule_is_9_to_20_detroit() -> None:
     assert created["email_list"] == ["josh@ndl-mail.com"]
 
 
-def test_setup_campaign_reuses_existing() -> None:
-    fake = FakeInstantly({("GET", "/api/v2/campaigns"): (200, {"items": [{"id": "camp-1", "name": "NDL Cora Passthrough"}]})})
+
+
+def test_bodyless_calls_send_no_json_content_type() -> None:
+    """Instantly (Fastify) rejects a JSON content-type with an empty body (FST_ERR_CTP_EMPTY_JSON_BODY)."""
+    fake = FakeInstantly({**_routes(existing=[{"id": "lead-old", "email": "m@example.com"}]),
+                          ("POST", "/api/v2/campaigns/camp-ndl/pause"): (200, {})})
+    sender = NdlInstantlySender(ACCOUNT, fake)
+    sender.send("m@example.com", "S", "B")
+    sender.pause_campaign()
+    for method, path, kwargs in fake.calls:
+        has_body = "json" in kwargs
+        assert ("Content-Type" in kwargs["headers"]) is has_body, (method, path)
+
+
+def test_setup_campaign_activates_an_existing_campaign() -> None:
+    fake = FakeInstantly({("GET", "/api/v2/campaigns"): (200, {"items": [{"id": "camp-1", "name": "NDL Cora Passthrough"}]}),
+                          ("POST", "/api/v2/campaigns/camp-1/activate"): (200, {})})
     assert instantly_email.setup_campaign("ndl-key", "https://api.instantly.ai", "josh@ndl-mail.com", fake) == "camp-1"
-    assert [method for method, _, _ in fake.calls] == ["GET"]
+    assert [(m, p) for m, p, _ in fake.calls] == [("GET", "/api/v2/campaigns"), ("POST", "/api/v2/campaigns/camp-1/activate")]

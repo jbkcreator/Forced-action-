@@ -160,3 +160,10 @@ def test_approved_ids_lists_only_approved(queue: PendingActionQueue) -> None:
     queue.approve(approved, APPROVER)
     assert queue.approved_ids() == [approved]
     assert pending not in queue.approved_ids()
+
+
+def test_find_by_idempotency_key(queue) -> None:
+    action_id = queue.enqueue(tool_name="t", channel="ghl_sms", payload={"body": "Hi"}, summary="s",
+                              idempotency_key="agent_job:abc")
+    assert queue.find_by_idempotency_key("agent_job:abc").action_id == action_id
+    assert queue.find_by_idempotency_key("agent_job:missing") is None
