@@ -351,6 +351,29 @@ def test_unknown_then_real_result_replaces_no_answer(lending_db):
     assert _row(lending_db)["disposition"] == "CALLBACK_REQUESTED"
 
 
+def test_unknown_gaining_talk_time_clears_the_automatic_no_answer(lending_db):
+    """0 s "Unknown" -> NO_ANSWER; the corrected CDR with talk time is a connected call awaiting its result."""
+    d.record_dialer_event(lending_db, _ev(duration=0, disposition_raw="Unknown"))
+    assert _row(lending_db)["disposition"] == "NO_ANSWER"
+    d.record_dialer_event(lending_db, _ev(duration=48, disposition_raw="Unknown"))
+    row = _row(lending_db)
+    assert row["disposition"] is None and row["disposition_raw"] == "Unknown" and row["disposition_at"] is not None
+
+
+def test_sparse_event_after_a_connected_unknown_call_keeps_it_awaiting(lending_db):
+    """A later event with no duration must not turn a connected "Unknown" call into NO_ANSWER."""
+    d.record_dialer_event(lending_db, _ev(duration=48, disposition_raw="Unknown"))
+    d.record_dialer_event(lending_db, _ev(duration=None, disposition_raw="Unknown"))
+    row = _row(lending_db)
+    assert row["disposition"] is None and row["talk_duration_sec"] == 48
+
+
+def test_caller_picked_no_answer_is_never_cleared(lending_db):
+    d.record_dialer_event(lending_db, _ev(duration=0, disposition_raw="No Answer"))
+    d.record_dialer_event(lending_db, _ev(duration=48, disposition_raw="Unknown"))
+    assert _row(lending_db)["disposition"] == "NO_ANSWER"
+
+
 def test_rescan_keeps_no_answer_for_unknown(lending_db):
     d.record_dialer_event(lending_db, _ev(duration=0, disposition_raw="Unknown"))
     d.record_dialer_event(lending_db, _ev(duration=0, disposition_raw="Unknown"))

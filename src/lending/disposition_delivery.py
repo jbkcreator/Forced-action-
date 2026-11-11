@@ -85,12 +85,6 @@ def awaiting_result(row: dict) -> bool:
         and (row.get("talk_duration_sec") or 0) > 0
 
 
-def _may_post_awaiting(row: dict) -> bool:
-    """Post "No result yet" only before the missing-result alert has handled the call. The data fix marks every
-    call from before the fix as alerted, so no old call is ever posted."""
-    return awaiting_result(row) and row.get("disposition_missing_alerted_at") is None
-
-
 def _yn(flag: bool) -> str:
     return "Y" if flag else "N"
 
@@ -269,14 +263,17 @@ def _deliver_locked(row_id: int, session_factory: Callable, slack_client: Any, s
         if not row:
             return
         row = dict(row)
-        awaiting = _may_post_awaiting(row)
+        # Delivered (or deliberately skipped) = its *_at marker is set. The data fix sets both on calls from before
+        # the fix, so no old call is posted; a failed delivery keeps retrying whether or not the alert has run.
+        awaiting = awaiting_result(row)
         sheet_behind = row["sheet_synced_disposition"] != row["disposition"] or (awaiting and not row.get("sheet_synced_at"))
         if sheet_behind and (sheets_service or _configured_sheet()):
             _deliver_sheet(db, row, sheets_service)
         # A removed result only needs Slack when an earlier post exists to update; a call awaiting its result is
         # posted once as "No result yet" and that post is updated when the result arrives.
         slack_behind = row["slack_posted_disposition"] != row["disposition"]
-        slack_needed = (slack_behind and (row["disposition"] or row["slack_ts"])) or (awaiting and not row["slack_ts"])
+        slack_needed = ((slack_behind and (row["disposition"] or row["slack_ts"]))
+                        or (awaiting and not row["slack_ts"] and not row.get("slack_posted_at")))
         if slack_needed and (slack_client or _configured_slack()):
             _deliver_slack(db, row, slack_client)
 
@@ -300,7 +297,8 @@ def _deliver_sheet(db, row: dict, service: Any) -> None:
 def _deliver_slack(db, row: dict, client: Any) -> None:
     if row["phone"] in hidden_phones(db, [row["phone"]]):
         # Marked delivered with no post (slack_ts stays NULL), so the retry job does not pick it up again.
-        db.execute(text("UPDATE lending.call_dispositions SET slack_posted_disposition = :d WHERE id = :id"),
+        db.execute(text("UPDATE lending.call_dispositions SET slack_posted_disposition = :d, "
+                        "slack_posted_at = COALESCE(slack_posted_at, now()) WHERE id = :id"),
                    {"d": row["disposition"], "id": row["id"]})
         db.commit()
         log_skipped("disposition card", f"call {row['dialer_call_id']}")

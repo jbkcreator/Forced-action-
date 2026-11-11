@@ -407,7 +407,9 @@ def test_retry_picks_up_only_recent_no_result_calls(monkeypatch):
     sql, params = seen[0]
     assert "upper(btrim(disposition_raw)) = :no_result" in sql and "make_interval(hours => :max_age_h)" in sql
     assert params["no_result"] == "UNKNOWN" and params["max_age_h"] == 24
-    assert "disposition_missing_alerted_at IS NULL" in sql  # an alerted (or pre-fix) call is never posted
+    # retries continue after the alert; only the delivery markers say a destination is done
+    assert "disposition_missing_alerted_at" not in sql
+    assert "(slack_ts IS NULL AND slack_posted_at IS NULL) OR sheet_synced_at IS NULL" in sql
 
 
 # ── Caller label for dials no caller was on ─────────────────────────────────
@@ -435,12 +437,32 @@ def test_caller_label_for_a_ghl_call_with_no_user_is_a_dash():
     assert dd.caller_label(_row(caller_name=None, caller_seat=None, call_source="ghl")) == "—"
 
 
-def test_unknown_call_already_alerted_is_never_posted(monkeypatch):
-    """Calls from before the fix are marked alerted by the data fix: none of them is posted as "No result yet"."""
+def test_call_from_before_the_fix_is_never_posted(monkeypatch):
+    """The data fix marks old connected "Unknown" calls handled (slack_posted_at / sheet_synced_at, no slack_ts)."""
     monkeypatch.setattr(dd, "lookup_load_record", lambda *a, **k: None)
     sheets, values = _sheets([])
     slack = MagicMock()
-    factory, _ = _factory(_awaiting(sheet_synced_at=None, disposition_missing_alerted_at=NOW))
+    factory, _ = _factory(_awaiting(sheet_synced_at=NOW, slack_posted_at=NOW, disposition_missing_alerted_at=NOW))
     dd.deliver_disposition(1, session_factory=factory, slack_client=slack, sheets_service=sheets)
     slack.chat_postMessage.assert_not_called()
     values.append.assert_not_called()
+
+
+def test_failed_delivery_still_retries_after_the_missing_result_alert(monkeypatch):
+    """Slack and the Sheet fail, the alert runs, then both recover: the "No result yet" entry is still delivered."""
+    monkeypatch.setattr(dd, "lookup_load_record", lambda *a, **k: None)
+    sheets, values = _sheets([])
+    values.append.side_effect = RuntimeError("quota")
+    slack = MagicMock()
+    slack.chat_postMessage.side_effect = RuntimeError("slack down")
+    factory, _ = _factory(_awaiting(sheet_synced_at=None, slack_posted_at=None))
+    dd.deliver_disposition(1, session_factory=factory, slack_client=slack, sheets_service=sheets)
+
+    values.append.side_effect, slack.chat_postMessage.side_effect = None, None
+    slack.chat_postMessage.return_value = {"ts": "1.1"}
+    factory, db = _factory(_awaiting(sheet_synced_at=None, slack_posted_at=None, disposition_missing_alerted_at=NOW))
+    dd.deliver_disposition(1, session_factory=factory, slack_client=slack, sheets_service=sheets)
+    assert "No result yet" in slack.chat_postMessage.call_args.kwargs["text"]
+    assert values.append.call_args.kwargs["body"]["values"][0][6] == "No result yet"
+    updates = [str(c.args[0]) for c in db.execute.call_args_list if "UPDATE" in str(c.args[0])]
+    assert any("sheet_synced_at" in u for u in updates) and any("slack_posted_at" in u for u in updates)

@@ -47,7 +47,11 @@ def test_backfill_changes_each_kind_once_and_is_idempotent(lending_db):
         # nothing left for the delivery retry: no Slack post, no Sheet write
         assert row["slack_posted_disposition"] == "NO_ANSWER" and row["sheet_synced_disposition"] == "NO_ANSWER"
         assert row["unfunded_cause"] is not None  # same provisional cause the live path gives NO_ANSWER
-    assert _row(conn, "unk288")["disposition_missing_alerted_at"] is not None
+    old = _row(conn, "unk288")
+    assert old["disposition_missing_alerted_at"] is not None
+    # handled with no post: "No result yet" delivery and its retry skip it
+    assert old["slack_posted_at"] is not None and old["sheet_synced_at"] is not None and old["slack_ts"] is None
+    assert first["old_unknown_posts"] == 1
 
     assert set(run_steps(conn).values()) == {0}
 

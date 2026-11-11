@@ -8,8 +8,10 @@ Steps (BatchDialer rows only, each idempotent):
 4. "Answering Machine" stored as ``LEFT_VOICEMAIL`` with no talk time -> ``NO_ANSWER`` (no voicemail was left)
 5. extractions marked ``failed`` -> ``deferred`` so the transcript worker extracts them again (an empty answer is
    now a done extraction)
-6. connected "Unknown" calls not yet alerted are marked alerted, so neither the new missing-result alert nor the
-   "No result yet" post (which only posts a call not yet alerted) ever posts about calls from before the fix
+6. connected "Unknown" calls not yet alerted are marked alerted, so the new missing-result alert posts nothing
+   about calls from before the fix
+7. connected "Unknown" calls get ``slack_posted_at`` / ``sheet_synced_at`` set (handled, nothing posted), so the
+   "No result yet" delivery never posts a call from before the fix
 
 Nothing is posted: steps 3-4 also move ``slack_posted_disposition`` / ``sheet_synced_disposition`` to the new value
 where they held the old one, so the delivery retry job finds nothing behind. Old Slack posts, Sheet rows and GHL
@@ -69,6 +71,11 @@ STEPS: tuple[tuple[str, str], ...] = (
     ("old_unknown_alerts", "UPDATE lending.call_dispositions SET disposition_missing_alerted_at = now() "
                            f"WHERE {_BD} AND disposition IS NULL AND upper(btrim(disposition_raw)) = 'UNKNOWN' "
                            "AND coalesce(talk_duration_sec, 0) > 0 AND disposition_missing_alerted_at IS NULL"),
+    ("old_unknown_posts", "UPDATE lending.call_dispositions SET slack_posted_at = COALESCE(slack_posted_at, now()), "
+                          "sheet_synced_at = COALESCE(sheet_synced_at, now()) "
+                          f"WHERE {_BD} AND disposition IS NULL AND upper(btrim(disposition_raw)) = 'UNKNOWN' "
+                          "AND coalesce(talk_duration_sec, 0) > 0 "
+                          "AND (slack_posted_at IS NULL OR sheet_synced_at IS NULL)"),
 )
 
 

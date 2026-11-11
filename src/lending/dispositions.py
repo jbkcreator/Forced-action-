@@ -295,8 +295,6 @@ def record_dialer_event(db, ev: DialerCallEvent) -> RecordedCall:
     if ev.phone and not phone:
         logger.warning("[lending] call %s: dialed number could not be normalized", ev.call_id)
     ended_at = _effective_end(ev)
-    code, known = resolve_dialer_code(ev.disposition_raw, ev.duration)
-
     previous = db.execute(
         text("SELECT disposition_raw FROM lending.call_dispositions WHERE dialer_call_id = :id"),
         {"id": ev.call_id},
@@ -327,7 +325,7 @@ def record_dialer_event(db, ev: DialerCallEvent) -> RecordedCall:
             "recording_view_url = COALESCE(EXCLUDED.recording_view_url, lending.call_dispositions.recording_view_url), "
             "dialer_campaign_id = COALESCE(EXCLUDED.dialer_campaign_id, lending.call_dispositions.dialer_campaign_id), "
             "raw_event = EXCLUDED.raw_event, updated_at = now() "
-            "RETURNING id, phone, caller_seat, disposition, campaign_tag, queue, dialer_contact_id, "
+            "RETURNING id, phone, caller_seat, disposition, campaign_tag, queue, dialer_contact_id, talk_duration_sec, "
             "call_started_at, call_ended_at, unfunded_cause, opt_out_propagated_at"
         ),
         {
@@ -344,7 +342,11 @@ def record_dialer_event(db, ev: DialerCallEvent) -> RecordedCall:
     if ev.seat_id and not seat_group_for(ev.seat_id):
         logger.warning("[lending] call %s: seat %s has no shift group (LENDING_SEAT_GROUPS)", ev.call_id, ev.seat_id)
 
+    # the stored talk time (the upsert keeps the last known one): a later event with no duration must not
+    # turn a connected "Unknown" call into NO_ANSWER
+    code, known = resolve_dialer_code(ev.disposition_raw, row["talk_duration_sec"])
     disposition = row["disposition"]
+    auto_no_answer = disposition == NO_ANSWER_CODE and bool(previous) and is_no_result(previous[0])
     unknown_code = None
     if ev.disposition_raw:
         if not known:
@@ -355,13 +357,16 @@ def record_dialer_event(db, ev: DialerCallEvent) -> RecordedCall:
                 text("UPDATE lending.call_dispositions SET disposition_raw = :raw, disposition_at = clock_timestamp() WHERE id = :id"),
                 {"raw": ev.disposition_raw, "id": row["id"]},
             )
-        elif code is None and disposition is None and is_no_result(ev.disposition_raw):
-            # "Unknown" with talk time: keep the raw result so delivery shows "No result yet" and the alert fires
+        elif code is None and is_no_result(ev.disposition_raw) and (disposition is None or auto_no_answer):
+            # "Unknown" with talk time: keep the raw result so delivery shows "No result yet" and the alert fires.
+            # A NO_ANSWER we set from an earlier 0 s "Unknown" is cleared; one the caller picked is never touched.
             db.execute(
-                text("UPDATE lending.call_dispositions SET disposition_raw = :raw WHERE id = :id "
-                     "AND disposition_raw IS DISTINCT FROM :raw"),
+                text("UPDATE lending.call_dispositions SET disposition = NULL, disposition_raw = :raw, "
+                     "disposition_at = CASE WHEN disposition IS NULL THEN disposition_at ELSE clock_timestamp() END "
+                     "WHERE id = :id AND (disposition IS NOT NULL OR disposition_raw IS DISTINCT FROM :raw)"),
                 {"raw": ev.disposition_raw, "id": row["id"]},
             )
+            disposition = None
         elif code is not None and code != disposition and disposition == DNC_CODE and row["opt_out_propagated_at"] is None:
             logger.warning("[lending] call %s: kept DNC_REQUEST over a later %s until the opt-out is propagated",
                            ev.call_id, code)
