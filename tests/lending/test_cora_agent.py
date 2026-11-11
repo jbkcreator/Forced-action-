@@ -308,6 +308,9 @@ class ScriptedEngine:
         yield self
 
     def execute(self, statement, params):
+        sql = str(statement)
+        if "call_dispositions" in sql and "text_consents" not in sql:  # the "said not interested" lookup
+            return SimpleNamespace(scalar=lambda: False)
         self.queries.append(dict(params))
         return SimpleNamespace(scalar=lambda: self._answers.pop(0))
 
