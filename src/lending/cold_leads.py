@@ -41,7 +41,8 @@ _IS_COLD = text(
 # warm_state: one read for a number we first reached cold and that has since come in as an inbound lead.
 # 0 = leave its do-not-disturb as it is (never loaded cold, still cold, or opted out by phone or by the lead's email:
 #     an opt-out always wins),
-# 1 = lift every messaging channel except SMS, 2 = lift every messaging channel (recorded text consent).
+# 1 = lift every messaging channel except SMS, 2 = lift every messaging channel (recorded text consent, or a
+#     LendingFlow lead with no revoked consent: the same rule as consent.has_text_consent, client decision Nov 3).
 _WARM_STATE = text("""
     SELECT /* warm_state */ CASE
         WHEN NOT EXISTS (SELECT 1 FROM lending.dialer_load_records WHERE phone = :p)
@@ -55,7 +56,10 @@ _WARM_STATE = text("""
               OR EXISTS (SELECT 1 FROM lending.contacts WHERE lower(email) = :e AND do_not_contact)
               OR EXISTS (SELECT 1 FROM email_opt_outs WHERE lower(email) = :e)))
         THEN 0
-        WHEN EXISTS (SELECT 1 FROM lending.text_consents WHERE phone = :p AND revoked_at IS NULL) THEN 2
+        WHEN EXISTS (SELECT 1 FROM lending.text_consents WHERE phone = :p AND revoked_at IS NULL)
+          OR (EXISTS (SELECT 1 FROM lending.lendingflow_leads WHERE phone = :p)
+              AND NOT EXISTS (SELECT 1 FROM lending.text_consents WHERE phone = :p AND revoked_at IS NOT NULL))
+        THEN 2
         ELSE 1
     END
 """)

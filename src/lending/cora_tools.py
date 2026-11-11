@@ -58,7 +58,13 @@ logger = logging.getLogger(__name__)
 STATEMENT_TIMEOUT = "5s"
 MAX_ROWS = 50
 _TZ = ZoneInfo(DEFAULT_TZ)
-_LEAD_REF = re.compile(r"^(web_lead|contact):(\d+)$")
+_LEAD_REF = re.compile(r"^(web_lead|lendingflow_lead|contact):(\d+)$")
+_LEAD_SQL = {
+    "web_lead": "SELECT name, phone, email, ghl_contact_id FROM lending.web_leads WHERE id = :id",
+    "lendingflow_lead": ("SELECT NULLIF(concat_ws(' ', first_name, last_name), '') AS name, phone, email, "
+                         "ghl_contact_id FROM lending.lendingflow_leads WHERE id = :id"),
+    "contact": "SELECT NULL AS name, phone, email, NULL AS ghl_contact_id FROM lending.contacts WHERE id = :id",
+}
 
 # Free-form SQL guard. The READ ONLY transaction is the hard stop for writes; these checks keep the
 # query inside the lending schema and away from server functions.
@@ -206,7 +212,7 @@ class DeactivateRuleInput(_Input):
 
 
 class DraftSmsInput(_Input):
-    lead_ref: str = Field(..., pattern=_LEAD_REF.pattern, description="From find_lead, e.g. web_lead:12.")
+    lead_ref: str = Field(..., pattern=_LEAD_REF.pattern, description="From find_lead, e.g. web_lead:12 or lendingflow_lead:56.")
     body: str = Field(..., min_length=1, max_length=600)
 
 
@@ -479,6 +485,13 @@ class CoraToolkit:
                     OR (CAST(:email AS text) IS NOT NULL AND w.email = :email)
                     OR (CAST(:name AS text) IS NOT NULL AND w.name ILIKE :name)
                 UNION ALL
+                SELECT 'lendingflow_lead:' || l.id, NULLIF(concat_ws(' ', l.first_name, l.last_name), ''), l.phone,
+                       l.email, l.received_at, l.loan_type, l.property_city, NULL, l.ghl_contact_id IS NOT NULL
+                  FROM lending.lendingflow_leads l
+                 WHERE (CAST(:phone AS text) IS NOT NULL AND l.phone = :phone)
+                    OR (CAST(:email AS text) IS NOT NULL AND lower(l.email) = :email)
+                    OR (CAST(:name AS text) IS NOT NULL AND concat_ws(' ', l.first_name, l.last_name) ILIKE :name)
+                UNION ALL
                 SELECT 'contact:' || c.id, NULL, c.phone, c.email, c.created_at, NULL, NULL, NULL, false
                   FROM lending.contacts c
                  WHERE (CAST(:phone AS text) IS NOT NULL AND c.phone = :phone)
@@ -488,7 +501,15 @@ class CoraToolkit:
             phones = sorted({lead["phone"] for lead in leads if lead["phone"]})
             status = {row["phone"]: row for row in session.execute(text("""
                 SELECT p.phone,
-                       EXISTS (SELECT 1 FROM lending.text_consents t WHERE t.phone = p.phone AND t.revoked_at IS NULL) AS text_consent,
+                       -- the send check's rule (consent.has_text_consent): recorded consent, or a LendingFlow lead
+                       -- with no revoked consent (client decision Nov 3); never while suppressed or do-not-contact
+                       ((EXISTS (SELECT 1 FROM lending.text_consents t WHERE t.phone = p.phone AND t.revoked_at IS NULL)
+                         OR (EXISTS (SELECT 1 FROM lending.lendingflow_leads l WHERE l.phone = p.phone)
+                             AND NOT EXISTS (SELECT 1 FROM lending.text_consents t
+                                              WHERE t.phone = p.phone AND t.revoked_at IS NOT NULL)))
+                        AND NOT EXISTS (SELECT 1 FROM lending.suppression_list s WHERE s.phone = p.phone)
+                        AND NOT EXISTS (SELECT 1 FROM lending.contacts c WHERE c.phone = p.phone AND c.do_not_contact))
+                         AS text_consent,
                        EXISTS (SELECT 1 FROM lending.suppression_list s WHERE s.phone = p.phone) AS suppressed,
                        EXISTS (SELECT 1 FROM lending.contacts c WHERE c.phone = p.phone AND c.do_not_contact) AS do_not_contact,
                        (SELECT json_build_object('ended_at', d.call_ended_at, 'caller', d.caller_name,
@@ -694,10 +715,9 @@ class CoraToolkit:
     def _lead(self, lead_ref: str) -> _Lead:
         match = _LEAD_REF.match(lead_ref)
         if not match:
-            raise ToolInputError("lead_ref must look like web_lead:12 or contact:34")
+            raise ToolInputError("lead_ref must look like web_lead:12, lendingflow_lead:56 or contact:34")
         kind, lead_id = match.group(1), int(match.group(2))
-        sql = ("SELECT name, phone, email, ghl_contact_id FROM lending.web_leads WHERE id = :id" if kind == "web_lead"
-               else "SELECT NULL AS name, phone, email, NULL AS ghl_contact_id FROM lending.contacts WHERE id = :id")
+        sql = _LEAD_SQL[kind]
         with self._read_only() as session:
             row = session.execute(text(sql), {"id": lead_id}).mappings().first()
             # A contact row has no name: take it from the lead record that holds the same phone.
