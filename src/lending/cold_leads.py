@@ -27,7 +27,7 @@ from config.lending_compliance import (
     GHL_TAG_COLD_LEAD,
     TRACERFY_DNC_SOURCE,
 )
-from src.lending.consent import SAID_NOT_INTERESTED_SQL, has_text_consent, said_not_interested
+from src.lending.consent import has_text_consent
 from src.services.phone_utils import normalize
 
 logger = logging.getLogger(__name__)
@@ -43,10 +43,9 @@ _IS_COLD = text(
 #     an opt-out always wins),
 # 1 = lift every messaging channel except SMS, 2 = lift every messaging channel (recorded text consent, or a
 #     LendingFlow lead with no revoked consent: the same rule as consent.has_text_consent, client decision Nov 3).
-_WARM_STATE = text(f"""
+_WARM_STATE = text("""
     SELECT /* warm_state */ CASE
         WHEN NOT EXISTS (SELECT 1 FROM lending.dialer_load_records WHERE phone = :p)
-          OR {SAID_NOT_INTERESTED_SQL}
           OR NOT (EXISTS (SELECT 1 FROM lending.web_leads WHERE phone = :p)
                   OR EXISTS (SELECT 1 FROM lending.lendingflow_leads WHERE phone = :p))
           OR EXISTS (SELECT 1 FROM lending.suppression_list WHERE phone = :p)
@@ -78,8 +77,6 @@ class ColdSendBlock(str, Enum):
     COLD_LEAD_NO_TEXT_CONSENT = "cold_lead_no_text_consent"
     COLD_LEAD_NO_EMAIL = "cold_lead_no_email"
     COLD_CHECK_UNAVAILABLE = "cold_check_unavailable"
-    # Universal rule, any lead source: the number said "not interested" on a call, so no text or email ever again.
-    SAID_NOT_INTERESTED = "said_not_interested"
     # The GHL contact carries do-not-disturb the cold push did not set (an opt-out made in GHL that has not reached
     # our suppression list yet): never lifted, the send is refused.
     GHL_DND_NOT_COLD_PUSH = "ghl_dnd_not_cold_push"
@@ -163,8 +160,6 @@ def cold_send_decision(phone: Optional[str], channel: SendChannel, *, email: Opt
         return ALLOWED
     try:
         with _session_factory() as db:
-            if said_not_interested(db, phone):
-                return ColdSendDecision(block=ColdSendBlock.SAID_NOT_INTERESTED)
             if not is_cold_lead(db, phone):
                 lift = _send_lift(db, phone, channel, email)
                 return ColdSendDecision(lift_dnd=lift) if lift else ALLOWED

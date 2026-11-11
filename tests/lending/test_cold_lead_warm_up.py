@@ -39,8 +39,6 @@ class LeadState:
         if self.fail:
             raise RuntimeError("connection lost")
         sql = str(statement)
-        if "call_dispositions" in sql and "warm_state" not in sql:  # the "said not interested" lookup
-            return SimpleNamespace(scalar=lambda: False)
         if "warm_state" in sql:  # 0 = leave as is, 1 = lift messaging except SMS, 2 = lift every messaging channel
             email_out = self.opted_out_email is not None and (params or {}).get("e") == self.opted_out_email
             if not (self.loaded and self.inbound) or self.opted_out or email_out:

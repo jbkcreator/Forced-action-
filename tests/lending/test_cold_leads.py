@@ -36,8 +36,6 @@ class FakeLeadDb:
             raise RuntimeError(f"connection lost {PHONE}")
         sql = str(statement)
         self.asked.append(params["p"])
-        if "call_dispositions" in sql and "text_consents" not in sql:  # the "said not interested" lookup
-            return SimpleNamespace(scalar=lambda: False)
         answer = self.cold if "dialer_load_records" in sql else self.consent if "text_consents" in sql else None
         assert answer is not None, sql
         return SimpleNamespace(scalar=lambda: answer)

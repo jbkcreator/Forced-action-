@@ -91,9 +91,6 @@ DEFAULT_CAUSE: dict[str, str] = {
 
 BOOKED_CODE = "BOOKED"
 DNC_CODE = "DNC_REQUEST"
-# Universal rule (client, Nov 11): a lead who said "not interested" on any call is never messaged again (no text,
-# no email), for every lead source. Opt-outs (DNC_REQUEST, STOP) already go through the suppression list.
-NOT_INTERESTED_CODES = frozenset({"CONNECTED_NOT_INTERESTED"})
 
 # Scoreboard definitions (client Part 5.6). Defaults: a client answer is a one-line change here.
 # Legacy codes are listed too, so history keeps counting. NURTURE is gated / nurture-sent only with gate_failed set:

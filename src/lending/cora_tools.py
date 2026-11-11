@@ -39,7 +39,6 @@ from src.lending.attempt_log import (
     summary,
     to_csv,
 )
-from src.lending.consent import SAID_NOT_INTERESTED_SQL
 from src.lending.contracts import BorrowerProfile, LoanRequest
 from src.lending.cora_channels import (
     MAX_READ_HOURS,
@@ -60,8 +59,6 @@ STATEMENT_TIMEOUT = "5s"
 MAX_ROWS = 50
 _TZ = ZoneInfo(DEFAULT_TZ)
 _LEAD_REF = re.compile(r"^(web_lead|lendingflow_lead|contact):(\d+)$")
-# consent.SAID_NOT_INTERESTED_SQL for the phone column ``p.phone`` of find_lead's status query.
-_NOT_INTERESTED = SAID_NOT_INTERESTED_SQL.replace(":p", "p.phone")
 _LEAD_SQL = {
     "web_lead": "SELECT name, phone, email, ghl_contact_id FROM lending.web_leads WHERE id = :id",
     "lendingflow_lead": ("SELECT NULLIF(concat_ws(' ', first_name, last_name), '') AS name, phone, email, "
@@ -502,13 +499,11 @@ class CoraToolkit:
                  ORDER BY 5 DESC NULLS LAST LIMIT 5
             """), {"phone": phone, "email": email, "name": name}).mappings().all()
             phones = sorted({lead["phone"] for lead in leads if lead["phone"]})
-            status = {row["phone"]: row for row in session.execute(text(f"""
+            status = {row["phone"]: row for row in session.execute(text("""
                 SELECT p.phone,
-                       {_NOT_INTERESTED} AS not_interested,
                        -- the send check's rule (consent.has_text_consent): recorded consent, or a LendingFlow lead
-                       -- with no revoked consent (client decision Nov 3); never while suppressed, do-not-contact or
-                       -- after a "not interested" call (universal rule)
-                       (NOT {_NOT_INTERESTED} AND (EXISTS (SELECT 1 FROM lending.text_consents t WHERE t.phone = p.phone AND t.revoked_at IS NULL)
+                       -- with no revoked consent (client decision Nov 3); never while suppressed or do-not-contact
+                       ((EXISTS (SELECT 1 FROM lending.text_consents t WHERE t.phone = p.phone AND t.revoked_at IS NULL)
                          OR (EXISTS (SELECT 1 FROM lending.lendingflow_leads l WHERE l.phone = p.phone)
                              AND NOT EXISTS (SELECT 1 FROM lending.text_consents t
                                               WHERE t.phone = p.phone AND t.revoked_at IS NOT NULL)))
@@ -531,8 +526,7 @@ class CoraToolkit:
                 "email": lead["email"], "first_seen": _iso(lead["received_at"]), "deal_type": lead["deal_type"],
                 "property_city": lead["property_city"], "ghl_status": lead["ghl_status"], "in_ghl": lead["in_ghl"],
                 "text_consent": flags.get("text_consent", False), "suppressed": flags.get("suppressed", False),
-                "do_not_contact": flags.get("do_not_contact", False),
-                "not_interested": flags.get("not_interested", False), "last_call": flags.get("last_call"),
+                "do_not_contact": flags.get("do_not_contact", False), "last_call": flags.get("last_call"),
             })
         return {"matches": results} if results else {"matches": [], "note": "no lead matched"}
 

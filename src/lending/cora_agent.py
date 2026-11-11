@@ -43,7 +43,7 @@ from packages.agent_core.thread_history import build_history
 from packages.agent_core.tools import ToolContext, ToolRegistry
 from src.lending.attempt_log import lending_ghl_readers
 from src.lending.compliance import text_window_open
-from src.lending.consent import has_text_consent, said_not_interested
+from src.lending.consent import has_text_consent
 from src.lending.cora_channels import ChannelDirectory
 from src.lending.cora_inbox import format_inbox_context, items_on_post, surface_new_items
 from src.lending.cora_prompt import CORA_BASE_PROMPT, REVISION_PROMPT
@@ -173,8 +173,6 @@ def make_send_check(engine: Engine, *, carrier_approved: bool = False,
         with engine.connect() as conn:
             if conn.execute(_SUPPRESSED, {"p": phone, "e": email}).scalar():
                 return "recipient is suppressed or marked do-not-contact"
-            if phone and said_not_interested(conn, phone):
-                return "recipient said not interested on a call, so is never messaged again"
             if action.channel in SMS_CHANNELS and not (phone and has_text_consent(conn, phone)):
                 return "no text consent on record for this number"
         if action.channel in SMS_CHANNELS:
