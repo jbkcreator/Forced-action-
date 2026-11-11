@@ -49,6 +49,7 @@ from src.lending.cora_inbox import format_inbox_context, items_on_post, surface_
 from src.lending.cora_prompt import CORA_BASE_PROMPT, REVISION_PROMPT
 from src.lending.cora_tools import CoraToolkit, draft_content_check
 from src.lending.global_halt import EmergencyHalt
+from src.lending.ghl_crm import GhlCrmWriter, get_crm_writer
 from src.lending.ghl_email import GhlEmailSender, get_email_sender
 from src.lending.ghl_sms import GhlSmsSender, get_sender
 from src.lending.cora_morning_digest import post_morning_digest
@@ -70,7 +71,7 @@ PLACEHOLDER_TEXT = "Working on it…"
 SMS_CHANNELS = frozenset({"ghl_sms"})
 # What a revision may change, per draft channel. Recipient fields are never editable.
 EDITABLE_FIELDS: dict[str, tuple[str, ...]] = {"ghl_sms": ("body",), "ghl_email": ("subject", "body"),
-                                               "ghl_stage": ("stage",)}
+                                               "ghl_stage": ("stage",), "ghl_tag": ("tag",), "ghl_note": ("body",)}
 
 # Same suppression rule the booking reminder worker applies before every send.
 _SUPPRESSED = text("""
@@ -205,11 +206,20 @@ def sms_executor(sender: GhlSmsSender) -> EgressExecutor:
     return send
 
 
+def crm_executors(crm: GhlCrmWriter) -> dict[str, EgressExecutor]:
+    """Approved CRM drafts, applied exactly as approved to the GHL contact the draft carries."""
+    return {
+        "ghl_stage": lambda payload: crm.move_stage(payload["ghl_contact_id"], payload["stage"]),
+        "ghl_tag": lambda payload: crm.add_tag(payload["ghl_contact_id"], payload["tag"]),
+        "ghl_note": lambda payload: crm.add_note(payload["ghl_contact_id"], payload["body"]),
+    }
+
+
 def build_egress_executors() -> dict[str, EgressExecutor]:
     """Channels Cora may send through once approved: ``ghl_email`` (needs the GHL account and
     ``LENDING_GHL_EMAIL_FROM``) and ``ghl_sms`` (needs the GHL account and ``LENDING_GHL_SMS_FROM_NUMBER``; texts
-    also wait for LENDING_SMS_CARRIER_APPROVED in the send check). ``ghl_stage`` stays unregistered, so an
-    approved draft there is marked failed with "not switched on yet"."""
+    also wait for LENDING_SMS_CARRIER_APPROVED in the send check), and the CRM writes ``ghl_stage``, ``ghl_tag``
+    and ``ghl_note`` (need the GHL account; a stage move also needs LENDING_GHL_PIPELINE_ID)."""
     executors: dict[str, EgressExecutor] = {}
     email_sender = get_email_sender()
     if email_sender is None:
@@ -221,6 +231,11 @@ def build_egress_executors() -> dict[str, EgressExecutor]:
         logger.warning("[cora] GHL SMS sender not configured; approved texts will not be sent")
     else:
         executors["ghl_sms"] = sms_executor(sms_sender)
+    crm = get_crm_writer()
+    if crm is None:
+        logger.warning("[cora] GHL account not configured; approved stage moves, tags and notes will not apply")
+    else:
+        executors.update(crm_executors(crm))
     return executors
 
 

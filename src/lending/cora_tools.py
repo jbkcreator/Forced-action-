@@ -110,9 +110,23 @@ def borrower_draft_problem(fields: Mapping[str, str]) -> Optional[str]:
             "messages never quote numbers, even when a standing rule asks for it. Redraft without them")
 
 
+# The longest value each revisable GHL CRM field may hold, the same limits the draft tools' inputs enforce.
+CRM_FIELD_LIMITS: dict[str, tuple[str, int, str]] = {
+    "ghl_stage": ("stage", 100, "a stage name"),
+    "ghl_tag": ("tag", 60, "a tag"),
+    "ghl_note": ("body", 2000, "a note"),
+}
+
+
 def draft_content_check(channel: str, fields: Mapping[str, str]) -> Optional[str]:
-    """The same rule for a revised draft (``DraftReviser.content_check``)."""
-    return borrower_draft_problem(fields) if channel in BORROWER_MESSAGE_CHANNELS else None
+    """The same rules for a revised draft (``DraftReviser.content_check``)."""
+    if channel in BORROWER_MESSAGE_CHANNELS:
+        return borrower_draft_problem(fields)
+    if limit := CRM_FIELD_LIMITS.get(channel):
+        field, max_length, label = limit
+        if len((fields.get(field) or "").strip()) > max_length:
+            return f"{label} is at most {max_length} characters"
+    return None
 
 
 LENDING_TABLES_HELP = (
@@ -204,7 +218,20 @@ class DraftEmailInput(_Input):
 
 class DraftPipelineMoveInput(_Input):
     lead_ref: str = Field(..., pattern=r"^web_lead:\d+$", description="Only website leads are in GHL today.")
-    stage: str = Field(..., min_length=2, max_length=100, description="Target stage name in the Booked Calls pipeline.")
+    stage: str = Field(..., min_length=2, max_length=CRM_FIELD_LIMITS["ghl_stage"][1],
+                       description="Target stage name in the Booked Calls pipeline.")
+
+
+class DraftAddTagInput(_Input):
+    lead_ref: str = Field(..., pattern=r"^web_lead:\d+$", description="Only website leads are in GHL today.")
+    tag: str = Field(..., min_length=1, max_length=CRM_FIELD_LIMITS["ghl_tag"][1], pattern=r"\S",
+                     description="One GoHighLevel tag.")
+
+
+class DraftAddNoteInput(_Input):
+    lead_ref: str = Field(..., pattern=r"^web_lead:\d+$", description="Only website leads are in GHL today.")
+    body: str = Field(..., min_length=1, max_length=CRM_FIELD_LIMITS["ghl_note"][1], pattern=r"\S",
+                      description="Internal note text.")
 
 
 class InboxListInput(_Input):
@@ -353,6 +380,12 @@ def relations_outside_schema(plan: Any, schema: str = "lending") -> set[str]:
         elif isinstance(node, list):
             stack.extend(node)
     return found
+
+
+def _crm_draft(lead: _Lead, channel: str, fields: dict[str, str], summary: str) -> EgressDraft:
+    """A GHL CRM write held for approval, aimed at the lead's GHL contact."""
+    return EgressDraft(channel=channel, payload={"lead_ref": lead.ref, "ghl_contact_id": lead.ghl_contact_id, **fields},
+                       summary=summary, recipient_phone=lead.phone, recipient_email=lead.email, contact_ref=lead.ref)
 
 
 class CoraToolkit:
@@ -699,13 +732,22 @@ class CoraToolkit:
                            recipient_phone=lead.phone, recipient_email=lead.email, contact_ref=lead.ref)
 
     def draft_pipeline_move(self, args: DraftPipelineMoveInput, _: ToolContext) -> EgressDraft:
-        lead = self._lead(args.lead_ref)
+        lead = self._lead_in_ghl(args.lead_ref)
+        return _crm_draft(lead, "ghl_stage", {"stage": args.stage}, f"Move {_who(lead)} to '{args.stage}' in GoHighLevel")
+
+    def _lead_in_ghl(self, lead_ref: str) -> _Lead:
+        lead = self._lead(lead_ref)
         if not lead.ghl_contact_id:
-            raise ToolInputError(f"{lead.ref} has not reached GoHighLevel yet, so it has no pipeline card to move")
-        return EgressDraft(channel="ghl_stage",
-                           payload={"lead_ref": lead.ref, "ghl_contact_id": lead.ghl_contact_id, "stage": args.stage},
-                           summary=f"Move {_who(lead)} to '{args.stage}' in GoHighLevel",
-                           recipient_phone=lead.phone, recipient_email=lead.email, contact_ref=lead.ref)
+            raise ToolInputError(f"{lead.ref} has not reached GoHighLevel yet, so there is no contact to update")
+        return lead
+
+    def draft_add_tag(self, args: DraftAddTagInput, _: ToolContext) -> EgressDraft:
+        lead, tag = self._lead_in_ghl(args.lead_ref), args.tag.strip()
+        return _crm_draft(lead, "ghl_tag", {"tag": tag}, f"Tag {_who(lead)} with '{tag}' in GoHighLevel")
+
+    def draft_add_note(self, args: DraftAddNoteInput, _: ToolContext) -> EgressDraft:
+        lead = self._lead_in_ghl(args.lead_ref)
+        return _crm_draft(lead, "ghl_note", {"body": args.body.strip()}, f"Add a note to {_who(lead)} in GoHighLevel")
 
     def tools(self) -> list[Tool]:
         read, write, egress = SafetyLevel.READ_ONLY, SafetyLevel.INTERNAL_WRITE, SafetyLevel.EXTERNAL_EGRESS
@@ -754,4 +796,9 @@ class CoraToolkit:
                  DraftEmailInput, egress, self.draft_email),
             Tool("draft_pipeline_move", "Draft moving a website lead to another GoHighLevel pipeline stage. Held for "
                  "approval; nothing changes until approved.", DraftPipelineMoveInput, egress, self.draft_pipeline_move),
+            Tool("draft_add_tag", "Draft adding one tag to a website lead's GoHighLevel contact (existing tags are "
+                 "kept). Held for approval; nothing changes until approved.", DraftAddTagInput, egress,
+                 self.draft_add_tag),
+            Tool("draft_add_note", "Draft adding an internal note to a website lead's GoHighLevel contact. Held "
+                 "for approval; nothing changes until approved.", DraftAddNoteInput, egress, self.draft_add_note),
         ]
