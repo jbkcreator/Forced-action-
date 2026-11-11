@@ -30,6 +30,7 @@ from packages.agent_core.pending_actions import PendingActionQueue
 from packages.agent_core.store import AgentStore
 from src.lending.after_hours_intake import MorningReply, draft_morning_replies, model_drafter, pins_to_call
 from src.lending.db import lending_session
+from src.lending.slack_channels import CORA_BOT_TOKEN, report_unset
 from src.lending.models import LENDING_SCHEMA
 from src.lending.slack_names import name_and_ref, names_by_phone, readable_ref
 from src.lending.slack_test_filter import hidden_phones
@@ -92,7 +93,7 @@ def main(argv=None, *, now: Optional[datetime] = None) -> int:
     settings = get_settings()
     channel, token = settings.lending_cora_channel, settings.lending_cora_slack_bot_token
     if not (channel and token):
-        logger.error("[pinned-callbacks] not run: LENDING_CORA_CHANNEL or LENDING_CORA_SLACK_BOT_TOKEN is not set")
+        report_unset("pinned callbacks", ("LENDING_CORA_CHANNEL", CORA_BOT_TOKEN))
         return 1
     try:
         with lending_session() as db:

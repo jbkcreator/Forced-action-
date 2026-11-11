@@ -34,13 +34,14 @@ def run_hold_summary() -> None:
         return
 
     from config.settings import get_settings
+    from src.lending.slack_channels import CORA_BOT_TOKEN, report_unset
     from src.lending.db import lending_session
 
     settings = get_settings()
     token = settings.lending_cora_slack_bot_token
     channel = settings.lending_cora_channel
     if not token or not channel:
-        logger.warning("lending_routing_hold_summary: Slack not configured — skipping")
+        report_unset("routing hold summary", ("LENDING_CORA_CHANNEL", CORA_BOT_TOKEN))
         return
 
     from slack_sdk import WebClient

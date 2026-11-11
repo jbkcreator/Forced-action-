@@ -1,9 +1,14 @@
 #!/bin/bash
 # Single-command prod deploy. Safe to run twice — a no-op pull means no
 # migrations re-run and services just restart clean.
-# Usage (on the prod server): bash /root/Forced-action-/deploy.sh
+# Usage (on the prod server): bash /root/Forced-action-/deploy.sh [<commit_sha>]
+# CI passes the commit its Tests job passed and runs this script as extracted from that same commit, so the
+# server deploys exactly the tested code (never a newer commit merged while the tests ran). Without a SHA
+# (manual run) dev is pulled as before.
 set -euo pipefail
 
+TARGET_SHA="${1:-}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="/root/Forced-action-"
 VENV="$PROJECT_DIR/.venv/bin"
 LAST_GOOD_FILE="$PROJECT_DIR/.last-good-deploy"
@@ -43,7 +48,10 @@ LENDING_CDR_UNIT_DST="/etc/systemd/system/fa-lending-cdr-poller.service"
 # fa-lending-reminder-worker (WP-GL-10) sends nothing until BOOKING_REMINDER_TEXT_ENABLED=true, so installing it is safe.
 # lending-api serves every /webhooks/lending/* route (nginx sends that prefix to 127.0.0.1:8010).
 # Unlike the others it IS a hard gate: deploy fails if nginx lacks the route or :8010/health is down.
-LENDING_UNITS=(fa-lending-opt-out-poller fa-lending-dialer-sweep fa-lending-uncalled-alarm-worker fa-lending-transcript-worker fa-lending-reminder-worker lending-api)
+# fa-lending-cora is Cora (Slack Socket Mode session + minute sweep; exactly one instance, Restart=always). Left out
+# until P0.4, so deploys never cycled her and she kept running stale code. Warn-only like the workers: a Cora problem
+# never rolls back the FA platform; check journalctl -u fa-lending-cora.
+LENDING_UNITS=(fa-lending-opt-out-poller fa-lending-dialer-sweep fa-lending-uncalled-alarm-worker fa-lending-transcript-worker fa-lending-reminder-worker lending-api fa-lending-cora)
 
 cd "$PROJECT_DIR"
 
@@ -131,10 +139,10 @@ fail() {
     exit 1
 }
 
-echo "== 1/7 pull dev =="
+echo "== 1/7 sync dev to ${TARGET_SHA:-origin/dev} =="
 git checkout dev || fail "git checkout dev"
 BEFORE=$(git rev-parse HEAD)
-git pull origin dev || fail "git pull origin dev"
+bash "$SCRIPT_DIR/scripts/deploy/sync_dev.sh" "$PROJECT_DIR" $TARGET_SHA || fail "sync dev to ${TARGET_SHA:-origin/dev}"
 AFTER=$(git rev-parse HEAD)
 
 echo "== 2/7 install deps =="

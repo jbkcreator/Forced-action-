@@ -81,6 +81,60 @@ def test_dnd_upsert_uses_the_lending_credentials_only(monkeypatch):
     assert PLATFORM_KEY not in str(call) and "platform-loc" not in str(call)
 
 
+def _ghl_upsert_then_tags(monkeypatch, *, contact=None, tag_status=200, tag_raises=None):
+    """Fake GHL: the upsert answers with ``contact``; the add-tags call answers ``tag_status`` or raises."""
+    calls = []
+
+    def fake(method, url, **kwargs):
+        calls.append({"method": method, "url": url, **kwargs})
+        if url.endswith("/tags"):
+            if tag_raises:
+                raise tag_raises
+            return MagicMock(status_code=tag_status)
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"contact": contact} if contact else {}
+        return response
+
+    monkeypatch.setattr("src.services.ghl_webhook._ghl_request", fake)
+    return calls
+
+
+def test_dnd_upsert_never_sends_tags_because_ghl_upsert_replaces_the_tag_list(monkeypatch):
+    _creds(monkeypatch, lending_key=LENDING_KEY, lending_location="lending-loc")
+    calls = _ghl_upsert_then_tags(monkeypatch, contact={"id": "c9"})
+    assert ghl_dnd.set_ghl_dnd(PHONE) is True
+    upsert = calls[0]
+    assert upsert["url"].endswith("/contacts/upsert") and "tags" not in upsert["json"]
+
+
+def test_the_opt_out_tag_is_added_without_touching_the_contacts_other_tags(monkeypatch):
+    _creds(monkeypatch, lending_key=LENDING_KEY, lending_location="lending-loc")
+    calls = _ghl_upsert_then_tags(monkeypatch, contact={"id": "c9"})
+    assert ghl_dnd.set_ghl_dnd(PHONE) is True
+    add = calls[1]
+    assert (add["method"], add["url"].rsplit("/", 3)[-3:]) == ("POST", ["contacts", "c9", "tags"])
+    assert add["json"] == {"tags": ["lending-opt-out"]}
+    assert add["headers"]["Authorization"] == f"Bearer {LENDING_KEY}"
+    assert len(calls) == 2  # no remove-tags call, no tag-list overwrite
+
+
+@pytest.mark.parametrize("kwargs", [{"tag_status": 500}, {"tag_raises": RuntimeError("down")}])
+def test_a_failed_tag_call_does_not_undo_the_dnd(monkeypatch, caplog, kwargs):
+    _creds(monkeypatch, lending_key=LENDING_KEY, lending_location="lending-loc")
+    _ghl_upsert_then_tags(monkeypatch, contact={"id": "c9"}, **kwargs)
+    with caplog.at_level("WARNING"):
+        assert ghl_dnd.set_ghl_dnd(PHONE) is True
+    assert "opt-out tag not added" in caplog.text and PHONE not in caplog.text
+
+
+def test_dnd_without_a_contact_id_in_the_reply_still_counts_and_skips_the_tag(monkeypatch, caplog):
+    _creds(monkeypatch, lending_key=LENDING_KEY, lending_location="lending-loc")
+    calls = _ghl_upsert_then_tags(monkeypatch, contact=None)
+    with caplog.at_level("WARNING"):
+        assert ghl_dnd.set_ghl_dnd(PHONE) is True
+    assert len(calls) == 1 and "no contact id" in caplog.text
+
+
 @pytest.mark.parametrize("kwargs", [{"status": 400}, {"raises": RuntimeError("down")}])
 def test_dnd_upsert_reports_failure_without_raising(monkeypatch, kwargs):
     _creds(monkeypatch, lending_key=LENDING_KEY, lending_location="lending-loc")

@@ -25,6 +25,7 @@ from config.settings import get_settings
 from src.lending.cora_inbox import add_to_inbox_in_own_session
 from src.lending.db import lending_session
 from src.lending.dispositions import last4, lookup_load_record
+from src.lending.slack_channels import BOT_TOKEN, report_unset
 from src.lending.slack_names import name_and_ref, names_by_phone
 from src.lending.slack_test_filter import log_skipped, hidden_phones
 from packages.agent_core.redaction import slack_escape
@@ -157,6 +158,9 @@ def _configured_sheet() -> bool:
     return bool(s.lending_sheets_service_account_key_path and s.lending_disposition_sheet_id)
 
 
+DIAL_TASKS, DNC_ALERT = "LENDING_DIAL_TASKS_CHANNEL", "LENDING_DNC_ALERT_CHANNEL"
+
+
 def _configured_slack() -> bool:
     s = get_settings()
     return bool(s.lending_slack_bot_token and s.lending_dial_tasks_channel)
@@ -219,6 +223,8 @@ def _deliver_locked(row_id: int, session_factory: Callable, slack_client: Any, s
         slack_needed = slack_behind and (row["disposition"] or row["slack_ts"])
         if slack_needed and (slack_client or _configured_slack()):
             _deliver_slack(db, row, slack_client)
+        elif slack_needed:
+            report_unset("after-call result", (DIAL_TASKS, BOT_TOKEN))
 
 
 def _deliver_sheet(db, row: dict, service: Any) -> None:
@@ -279,6 +285,7 @@ def alert_unpropagated_dnc(call_id: str, caller_seat: Optional[str], client: Any
     borrower = _call_borrower(call_id)
     posted = False
     if not (client or _configured_dnc_slack()):
+        report_unset("DNC not propagated alert", (DNC_ALERT, BOT_TOKEN))
         logger.error("[lending] call %s: DNC request could not be propagated and Slack is not configured", call_id)
     else:
         try:
@@ -303,6 +310,7 @@ def alert_unpropagated_dnc(call_id: str, caller_seat: Optional[str], client: Any
 def alert_unknown_code(call_id: str, raw_code: str, caller_seat: Optional[str], client: Any = None) -> None:
     """Tell #dial-tasks the dialer sent a disposition our list does not know. Never raises."""
     if not (client or _configured_slack()):
+        report_unset("unknown disposition alert", (DIAL_TASKS, BOT_TOKEN))
         logger.error("[lending] call %s: unknown disposition %r and Slack is not configured", call_id, raw_code)
         return
     try:
@@ -323,6 +331,7 @@ def alert_dnc_removal_pending(call_id: str, caller_seat: Optional[str], client: 
     borrower = _call_borrower(call_id)
     posted = False
     if not (client or _configured_dnc_slack()):
+        report_unset("DNC removal pending alert", (DNC_ALERT, BOT_TOKEN))
         logger.error("[lending] call %s: DNC removal from the dialer is pending and Slack is not configured", call_id)
     else:
         try:

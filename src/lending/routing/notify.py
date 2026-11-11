@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 from config.lending_partners import PRODUCTS
 from config.settings import get_settings
 from src.lending.routing.file_key import key_from_row
+from src.lending.slack_channels import CORA_BOT_TOKEN, report_unset
 from packages.agent_core.redaction import slack_safe
 from src.lending.routing.rules import LenderRow
 from src.lending.slack_names import full_name, name_and_ref
@@ -165,7 +166,7 @@ def _post(message: str, event_id: int, db: Session, *, what: str, lead_id, actio
     client = _client()
     channel = _channel()
     if not client or not channel:
-        logger.warning("notify.%s: Slack not configured — skipping", what)
+        report_unset(f"routing {what}", ("LENDING_DEALS_CHANNEL", CORA_BOT_TOKEN))
         return
     try:
         refs = db.execute(text("SELECT lead_id, loan_file_id FROM lending.file_routing_events WHERE id = :eid"),
