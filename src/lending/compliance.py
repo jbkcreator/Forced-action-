@@ -644,9 +644,27 @@ def text_window_open(
         return False
     moment = now or datetime.now(timezone.utc)
     if not _zones_inside_window(zones, moment):
+        if normalize_phone(phone) in text_window_test_phones():
+            logger.warning("[lending-compliance] TEXT WINDOW TEST BYPASS phone_hash=%s at=%s: number is on "
+                           "LENDING_TEXT_WINDOW_TEST_PHONES (team test numbers only; clear it after the test)",
+                           phone_hash(phone)[:12], moment.isoformat())
+            return True
         _log_blocked_hours("text", phone, moment, f" zones={','.join(sorted(zones))}")
         return False
     return True
+
+
+def text_window_test_phones() -> frozenset[str]:
+    """Team-owned test numbers (LENDING_TEXT_WINDOW_TEST_PHONES, comma-separated) that may be texted outside
+    8:00-20:00 for an end-to-end test. Empty by default; never put a borrower's number here. Invalid entries
+    are ignored, and an unreadable setting means no exceptions (fails closed)."""
+    try:
+        from config.settings import get_settings
+
+        raw = get_settings().lending_text_window_test_phones or ""
+    except Exception:  # class only
+        return frozenset()
+    return frozenset(p for p in (normalize_phone(part.strip()) for part in raw.split(",") if part.strip()) if p)
 
 
 def _zones_inside_window(zones: set[str], now: datetime) -> bool:
