@@ -219,6 +219,7 @@ def test_missing_settings_are_named() -> None:
 
 
 def test_email_is_registered_when_the_ghl_email_sender_is_configured(monkeypatch) -> None:
+    monkeypatch.setattr(cora_agent, "get_crm_writer", lambda: None)
     calls = []
     monkeypatch.setattr(cora_agent, "get_email_sender",
                         lambda: lambda *args, **kwargs: calls.append((args, kwargs)) or "m1")
@@ -231,6 +232,7 @@ def test_email_is_registered_when_the_ghl_email_sender_is_configured(monkeypatch
 
 
 def test_sms_is_registered_and_sends_exactly_the_approved_text(monkeypatch) -> None:
+    monkeypatch.setattr(cora_agent, "get_crm_writer", lambda: None)
     calls = []
     monkeypatch.setattr(cora_agent, "get_email_sender", lambda: None)
     monkeypatch.setattr(cora_agent, "get_sender", lambda: lambda *args, **kwargs: calls.append((args, kwargs)) or "s1")
@@ -242,18 +244,52 @@ def test_sms_is_registered_and_sends_exactly_the_approved_text(monkeypatch) -> N
 
 
 def test_both_channels_are_registered_when_both_senders_are_configured(monkeypatch) -> None:
+    monkeypatch.setattr(cora_agent, "get_crm_writer", lambda: None)
     monkeypatch.setattr(cora_agent, "get_email_sender", lambda: lambda *a, **k: "m1")
     monkeypatch.setattr(cora_agent, "get_sender", lambda: lambda *a, **k: "s1")
     assert set(cora_agent.build_egress_executors()) == {"ghl_email", "ghl_sms"}
 
 
-def test_stage_moves_stay_unregistered(monkeypatch) -> None:
+class _RecordingCrm:
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def move_stage(self, contact_id, stage):
+        self.calls.append(("move_stage", contact_id, stage))
+        return "opp-1"
+
+    def add_tag(self, contact_id, tag):
+        self.calls.append(("add_tag", contact_id, tag))
+        return "tag-ref"
+
+    def add_note(self, contact_id, body):
+        self.calls.append(("add_note", contact_id, body))
+        return "note-9"
+
+
+def test_crm_writes_are_registered_and_apply_exactly_the_approved_payload(monkeypatch) -> None:
+    crm = _RecordingCrm()
+    monkeypatch.setattr(cora_agent, "get_email_sender", lambda: None)
+    monkeypatch.setattr(cora_agent, "get_sender", lambda: None)
+    monkeypatch.setattr(cora_agent, "get_crm_writer", lambda: crm)
+    executors = cora_agent.build_egress_executors()
+    assert set(executors) == {"ghl_stage", "ghl_tag", "ghl_note"}
+    assert executors["ghl_stage"]({"lead_ref": "web_lead:7", "ghl_contact_id": "ghl-123", "stage": "Application"}) == "opp-1"
+    assert executors["ghl_tag"]({"lead_ref": "web_lead:7", "ghl_contact_id": "ghl-123", "tag": "hot lead"}) == "tag-ref"
+    assert executors["ghl_note"]({"lead_ref": "web_lead:7", "ghl_contact_id": "ghl-123", "body": "Call Friday"}) == "note-9"
+    assert crm.calls == [("move_stage", "ghl-123", "Application"), ("add_tag", "ghl-123", "hot lead"),
+                         ("add_note", "ghl-123", "Call Friday")]
+
+
+def test_crm_writes_stay_unregistered_without_a_ghl_account(monkeypatch) -> None:
     monkeypatch.setattr(cora_agent, "get_email_sender", lambda: lambda *a, **k: "m1")
-    monkeypatch.setattr(cora_agent, "get_sender", lambda: lambda *a, **k: "s1")
-    assert "ghl_stage" not in cora_agent.build_egress_executors()
+    monkeypatch.setattr(cora_agent, "get_sender", lambda: None)
+    monkeypatch.setattr(cora_agent, "get_crm_writer", lambda: None)
+    assert set(cora_agent.build_egress_executors()) == {"ghl_email"}
 
 
 def test_nothing_is_registered_without_a_configured_ghl_sender(monkeypatch) -> None:
+    monkeypatch.setattr(cora_agent, "get_crm_writer", lambda: None)
     monkeypatch.setattr(cora_agent, "get_email_sender", lambda: None)
     monkeypatch.setattr(cora_agent, "get_sender", lambda: None)
     assert cora_agent.build_egress_executors() == {}

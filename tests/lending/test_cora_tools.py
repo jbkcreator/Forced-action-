@@ -10,6 +10,8 @@ from src.lending import cora_tools
 from src.lending.cora_tools import (
     CoraToolkit,
     DraftEmailInput,
+    DraftAddNoteInput,
+    DraftAddTagInput,
     DraftPipelineMoveInput,
     DraftSmsInput,
     _Lead,
@@ -146,9 +148,9 @@ SAM = _Lead("web_lead:7", "Sam Smith", "+17275550100", "sam@example.com", "ghl-1
 
 def test_tool_set_and_safety_levels() -> None:
     tools = {tool.name: tool for tool in CoraToolkit(engine=None, memory=None).tools()}  # type: ignore[arg-type]
-    assert len(tools) == 19
+    assert len(tools) == 21
     egress = {name for name, tool in tools.items() if tool.safety is SafetyLevel.EXTERNAL_EGRESS}
-    assert egress == {"draft_sms", "draft_email", "draft_pipeline_move"}
+    assert egress == {"draft_sms", "draft_email", "draft_pipeline_move", "draft_add_tag", "draft_add_note"}
     assert {name for name, tool in tools.items() if tool.approver_only} == {
         "save_standing_rule", "deactivate_standing_rule", "dismiss_inbox_item", "route_inbox_item"}
     assert tools["query_lending_data"].safety is SafetyLevel.READ_ONLY
@@ -248,3 +250,32 @@ def test_lender_fit_is_marked_internal(monkeypatch) -> None:
     result = CoraToolkit(engine=None, memory=None).lender_fit(args, CONTEXT)  # type: ignore[arg-type]
     assert "Never quote" in result["internal_only"]
     assert {"fitting", "non_fitting", "missing_fields"} <= set(result)
+
+
+def test_tag_and_note_drafts_carry_the_ghl_contact(monkeypatch) -> None:
+    toolkit = _toolkit(monkeypatch, SAM)
+    tag = toolkit.draft_add_tag(DraftAddTagInput(lead_ref="web_lead:7", tag=" hot lead "), CONTEXT)
+    assert tag.channel == "ghl_tag"
+    assert tag.payload == {"lead_ref": "web_lead:7", "ghl_contact_id": "ghl-123", "tag": "hot lead"}
+    assert "hot lead" in tag.summary and tag.recipient_phone == "+17275550100"
+    note = toolkit.draft_add_note(DraftAddNoteInput(lead_ref="web_lead:7", body="Wants 250k, call Friday"), CONTEXT)
+    assert note.channel == "ghl_note"
+    assert note.payload == {"lead_ref": "web_lead:7", "ghl_contact_id": "ghl-123", "body": "Wants 250k, call Friday"}
+
+
+def test_tag_and_note_need_a_lead_already_in_ghl(monkeypatch) -> None:
+    not_in_ghl = _Lead("web_lead:8", "Al", "+17275550122", None, None)
+    toolkit = _toolkit(monkeypatch, not_in_ghl)
+    with pytest.raises(ToolInputError, match="GoHighLevel"):
+        toolkit.draft_add_tag(DraftAddTagInput(lead_ref="web_lead:8", tag="hot"), CONTEXT)
+    with pytest.raises(ToolInputError, match="GoHighLevel"):
+        toolkit.draft_add_note(DraftAddNoteInput(lead_ref="web_lead:8", body="x"), CONTEXT)
+
+
+def test_tag_input_rejects_contact_refs_and_blank_tags() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        DraftAddTagInput(lead_ref="contact:3", tag="hot")
+    with pytest.raises(ValidationError):
+        DraftAddTagInput(lead_ref="web_lead:7", tag="   ")

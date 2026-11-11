@@ -207,6 +207,16 @@ class DraftPipelineMoveInput(_Input):
     stage: str = Field(..., min_length=2, max_length=100, description="Target stage name in the Booked Calls pipeline.")
 
 
+class DraftAddTagInput(_Input):
+    lead_ref: str = Field(..., pattern=r"^web_lead:\d+$", description="Only website leads are in GHL today.")
+    tag: str = Field(..., min_length=1, max_length=60, pattern=r"\S", description="One GoHighLevel tag.")
+
+
+class DraftAddNoteInput(_Input):
+    lead_ref: str = Field(..., pattern=r"^web_lead:\d+$", description="Only website leads are in GHL today.")
+    body: str = Field(..., min_length=1, max_length=2000, pattern=r"\S", description="Internal note text.")
+
+
 class InboxListInput(_Input):
     item_id: Optional[int] = Field(None, ge=1, description="One item by its number (the #41 in a digest). "
                                                            "Omit to list the open items.")
@@ -707,6 +717,25 @@ class CoraToolkit:
                            summary=f"Move {_who(lead)} to '{args.stage}' in GoHighLevel",
                            recipient_phone=lead.phone, recipient_email=lead.email, contact_ref=lead.ref)
 
+    def _lead_in_ghl(self, lead_ref: str) -> _Lead:
+        lead = self._lead(lead_ref)
+        if not lead.ghl_contact_id:
+            raise ToolInputError(f"{lead.ref} has not reached GoHighLevel yet, so there is no contact to update")
+        return lead
+
+    def draft_add_tag(self, args: DraftAddTagInput, _: ToolContext) -> EgressDraft:
+        lead, tag = self._lead_in_ghl(args.lead_ref), args.tag.strip()
+        return EgressDraft(channel="ghl_tag", payload={"lead_ref": lead.ref, "ghl_contact_id": lead.ghl_contact_id, "tag": tag},
+                           summary=f"Tag {_who(lead)} with '{tag}' in GoHighLevel",
+                           recipient_phone=lead.phone, recipient_email=lead.email, contact_ref=lead.ref)
+
+    def draft_add_note(self, args: DraftAddNoteInput, _: ToolContext) -> EgressDraft:
+        lead = self._lead_in_ghl(args.lead_ref)
+        return EgressDraft(channel="ghl_note",
+                           payload={"lead_ref": lead.ref, "ghl_contact_id": lead.ghl_contact_id, "body": args.body},
+                           summary=f"Add a note to {_who(lead)} in GoHighLevel",
+                           recipient_phone=lead.phone, recipient_email=lead.email, contact_ref=lead.ref)
+
     def tools(self) -> list[Tool]:
         read, write, egress = SafetyLevel.READ_ONLY, SafetyLevel.INTERNAL_WRITE, SafetyLevel.EXTERNAL_EGRESS
         return [
@@ -754,4 +783,9 @@ class CoraToolkit:
                  DraftEmailInput, egress, self.draft_email),
             Tool("draft_pipeline_move", "Draft moving a website lead to another GoHighLevel pipeline stage. Held for "
                  "approval; nothing changes until approved.", DraftPipelineMoveInput, egress, self.draft_pipeline_move),
+            Tool("draft_add_tag", "Draft adding one tag to a website lead's GoHighLevel contact (existing tags are "
+                 "kept). Held for approval; nothing changes until approved.", DraftAddTagInput, egress,
+                 self.draft_add_tag),
+            Tool("draft_add_note", "Draft adding an internal note to a website lead's GoHighLevel contact. Held "
+                 "for approval; nothing changes until approved.", DraftAddNoteInput, egress, self.draft_add_note),
         ]
