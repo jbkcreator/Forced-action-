@@ -233,3 +233,20 @@ def test_cora_tool_reports_missing_and_failing_reads():
     def boom():
         raise RuntimeError("x")
     assert _toolkit(boom).ledger_export_status(None, None)["status"] == "unreadable"
+
+
+def test_a_failed_drive_step_is_logged_by_name_and_re_raised(caplog):
+    from src.lending.drive_upload import upload_bytes
+
+    class Failing:
+        def execute(self):
+            raise TimeoutError()
+
+    class Broken(FakeDrive):
+        def files(self):
+            self.f.list = lambda **_: Failing()
+            return self.f
+
+    with pytest.raises(TimeoutError):
+        upload_bytes(Broken(), "F", "a.csv", b"x")
+    assert "find file failed (TimeoutError)" in caplog.text

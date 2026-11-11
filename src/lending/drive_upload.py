@@ -26,6 +26,15 @@ def drive_service():
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
+def _run(step: str, request: Any) -> Any:
+    """Execute one Drive request, logging which step failed (class only: Drive errors can embed ids)."""
+    try:
+        return request.execute()
+    except Exception as exc:
+        logger.error("[drive] %s failed (%s)", step, type(exc).__name__)
+        raise
+
+
 def _quote(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "\\'")
 
@@ -33,8 +42,10 @@ def _quote(value: str) -> str:
 def _find(service: Any, parent_id: str, name: str, *, folder: bool) -> Optional[str]:
     mime = f"mimeType = '{FOLDER_MIME}'" if folder else f"mimeType != '{FOLDER_MIME}'"
     query = f"'{_quote(parent_id)}' in parents and name = '{_quote(name)}' and {mime} and trashed = false"
-    found = service.files().list(q=query, fields="files(id)", pageSize=1, supportsAllDrives=True,
-                                 includeItemsFromAllDrives=True).execute().get("files", [])
+    # oldest first: if two runs ever created the same folder, both keep writing into the first one
+    found = _run("find " + ("folder" if folder else "file"), service.files().list(
+        q=query, fields="files(id)", orderBy="createdTime", pageSize=1, supportsAllDrives=True,
+        includeItemsFromAllDrives=True)).get("files", [])
     return found[0]["id"] if found else None
 
 
@@ -42,8 +53,8 @@ def ensure_folder(service: Any, parent_id: str, name: str) -> str:
     existing = _find(service, parent_id, name, folder=True)
     if existing:
         return existing
-    created = service.files().create(body={"name": name, "mimeType": FOLDER_MIME, "parents": [parent_id]},
-                                     fields="id", supportsAllDrives=True).execute()
+    created = _run("create folder", service.files().create(
+        body={"name": name, "mimeType": FOLDER_MIME, "parents": [parent_id]}, fields="id", supportsAllDrives=True))
     return created["id"]
 
 
@@ -53,10 +64,10 @@ def upload_bytes(service: Any, folder_id: str, name: str, data: bytes, mime: str
     media = MediaInMemoryUpload(data, mimetype=mime, resumable=False)
     existing = _find(service, folder_id, name, folder=False)
     if existing:
-        service.files().update(fileId=existing, media_body=media, supportsAllDrives=True).execute()
+        _run("replace file", service.files().update(fileId=existing, media_body=media, supportsAllDrives=True))
         return existing
-    created = service.files().create(body={"name": name, "parents": [folder_id]}, media_body=media, fields="id",
-                                     supportsAllDrives=True).execute()
+    created = _run("upload file", service.files().create(
+        body={"name": name, "parents": [folder_id]}, media_body=media, fields="id", supportsAllDrives=True))
     return created["id"]
 
 
@@ -85,13 +96,13 @@ def latest_manifest(parent_id: str, name: str = "manifest.json", service: Any = 
     import json
 
     service = service or drive_service()
-    folders = service.files().list(
+    folders = _run("list day folders", service.files().list(
         q=f"'{_quote(parent_id)}' in parents and mimeType = '{FOLDER_MIME}' and trashed = false",
         orderBy="name desc", fields="files(id,name)", pageSize=10, supportsAllDrives=True,
-        includeItemsFromAllDrives=True).execute().get("files", [])
+        includeItemsFromAllDrives=True)).get("files", [])
     for folder in folders:
         file_id = _find(service, folder["id"], name, folder=False)
         if file_id:
-            data = service.files().get_media(fileId=file_id, supportsAllDrives=True).execute()
+            data = _run("read manifest", service.files().get_media(fileId=file_id, supportsAllDrives=True))
             return {"folder": folder["name"], **json.loads(data)}
     return None
