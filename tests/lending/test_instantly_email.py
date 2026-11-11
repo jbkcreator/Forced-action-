@@ -115,19 +115,26 @@ def _settings(**overrides) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
 
+def _use(monkeypatch, settings) -> None:
+    from src.lending import instantly_client
+
+    monkeypatch.setattr(instantly_email, "get_settings", lambda: settings)
+    monkeypatch.setattr(instantly_client, "get_settings", lambda: settings)
+
+
 def test_configured_account(monkeypatch) -> None:
-    monkeypatch.setattr(instantly_email, "get_settings", lambda: _settings())
+    _use(monkeypatch, _settings())
     assert instantly_email.ndl_instantly() == ACCOUNT
 
 
 def test_not_configured_without_postal_address(monkeypatch) -> None:
-    monkeypatch.setattr(instantly_email, "get_settings", lambda: _settings(lending_email_footer_postal_address=""))
+    _use(monkeypatch, _settings(lending_email_footer_postal_address=""))
     assert instantly_email.ndl_instantly() is None
     assert instantly_email.get_ndl_instantly_sender() is None
 
 
 def test_never_uses_fa_instantly_key(monkeypatch) -> None:
-    monkeypatch.setattr(instantly_email, "get_settings", lambda: _settings(lending_instantly_api_key=None))
+    _use(monkeypatch, _settings(lending_instantly_api_key=None))
     assert instantly_email.ndl_instantly() is None
 
 

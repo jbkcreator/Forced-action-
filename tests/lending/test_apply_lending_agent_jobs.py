@@ -23,6 +23,6 @@ def test_apply_creates_agent_jobs_table(lending_db):
 def test_job_types_map_to_cora_channels():
     assert set(JOB_TYPES) == {"send_sms", "send_email", "create_task", "add_tag", "move_stage", "add_note"}
     assert set(JOB_TYPES.values()) == {"ghl_sms", "ghl_email", "ghl_task", "ghl_tag", "ghl_stage", "ghl_note"}
-    assert COLD_EMAIL_CHANNEL == "instantly_email"
+    assert COLD_EMAIL_CHANNEL == "instantly_cold_email"  # "instantly_email" is P1.3's thread answer
     assert RESULT_STATUSES == ("sent", "edited_sent", "rejected", "blocked_consent", "blocked_hours",
                                "blocked_lane", "blocked_cap", "expired", "error")

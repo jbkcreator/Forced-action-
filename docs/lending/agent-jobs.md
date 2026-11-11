@@ -29,7 +29,7 @@ Code: `src/lending/agent_jobs/` (`job.py` parse, `checks.py` rules and rail, `dr
 | `LENDING_JOBS_INBOX_FOLDER_ID` | Drive folder id of `NDL Jobs/inbox` |
 | `LENDING_JOBS_PROCESSED_FOLDER_ID` | Drive folder id of `NDL Jobs/inbox/processed` (Cora moves each file there once taken) |
 | `LENDING_JOBS_DONE_FOLDER_ID` | Drive folder id of `NDL Jobs/done` |
-| `LENDING_INSTANTLY_API_KEY` | NDL's own Instantly workspace key (never Forced Action's `INSTANTLY_API_KEY`) |
+| `LENDING_INSTANTLY_API_KEY` | NDL's Instantly workspace key, shared with P1.3 (Instantly replies); never Forced Action's `INSTANTLY_API_KEY` |
 | `LENDING_INSTANTLY_SENDER_EMAIL` | NDL's cold sending inbox in Instantly |
 | `LENDING_INSTANTLY_CAMPAIGN_ID` | Printed by the setup command below |
 | `LENDING_EMAIL_FOOTER_POSTAL_ADDRESS` | NDL's postal address for the CAN-SPAM footer (**required**: cold email stays off without it) |

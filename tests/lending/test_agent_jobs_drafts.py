@@ -41,7 +41,7 @@ def test_warm_email_payload_has_subject() -> None:
 
 def test_cold_email_uses_instantly_channel_without_footer() -> None:
     draft = build_draft(_job(type="send_email", subject="Your loan"), CONTACT, "instantly")
-    assert draft.channel == "instantly_email"
+    assert draft.channel == "instantly_cold_email"
     assert draft.payload["body"] == "Hi Mark, any questions?"
     assert "unsubscribe" not in draft.payload["body"].lower()
     assert "to_phone" not in draft.payload

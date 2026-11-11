@@ -288,7 +288,7 @@ def test_cold_email_receipt_has_rail_instantly(h: Harness) -> None:
     h.drop(type="send_email", subject="Your refinance")
     h.worker.run_once()
     action = h.queue.get(h.row()["action_id"])
-    assert action.channel == "instantly_email"
+    assert action.channel == "instantly_cold_email"
     h.send(action.action_id, provider_ref="lead-9")
     h.worker.run_once()
     receipt = h.folders.results[JOB_ID]

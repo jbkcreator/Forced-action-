@@ -1020,6 +1020,12 @@ class AppSettings(BaseSettings):
 	lending_call_window_et_end: str = Field(default="19:15", env="LENDING_CALL_WINDOW_ET_END")
 	lending_ops_channel: str = Field(default="", env="LENDING_OPS_CHANNEL")  # #lead-alerts channel ID: call-now alert, 5-minute flags, returning-borrower alert
 	lending_ops_notice_channel: str = Field(default="", env="LENDING_OPS_NOTICE_CHANNEL")  # opt-out mailbox and webhook-failure alerts; channel ID, unset = not posted
+	# P1.3 Instantly replies (src/lending/instantly_replies.py): NDL's own Instantly workspace, separate from FA's
+	# INSTANTLY_* settings. POST /webhooks/lending/instantly is closed (503) while the secret is unset; approved answers
+	# go back in the Instantly thread only when the API key is set.
+	lending_instantly_webhook_secret: Optional[SecretStr] = Field(default=None, env="LENDING_INSTANTLY_WEBHOOK_SECRET")
+	lending_instantly_api_key: Optional[SecretStr] = Field(default=None, env="LENDING_INSTANTLY_API_KEY")
+	lending_instantly_base_url: str = Field(default="https://api.instantly.ai", env="LENDING_INSTANTLY_BASE_URL")
 	# 14-day follow-up (src/lending/ghl_call_import.py): record calls made in GoHighLevel in lending.call_dispositions
 	lending_ghl_call_import_enabled: bool = Field(default=False, env="LENDING_GHL_CALL_IMPORT_ENABLED")
 	# G3: GHL calls ended at/after this (ISO time) are flagged by the missing-disposition alert; unset = GHL calls are not
@@ -1081,10 +1087,9 @@ class AppSettings(BaseSettings):
 	lending_jobs_inbox_folder_id: str = Field(default="", env="LENDING_JOBS_INBOX_FOLDER_ID")
 	lending_jobs_processed_folder_id: str = Field(default="", env="LENDING_JOBS_PROCESSED_FOLDER_ID")
 	lending_jobs_done_folder_id: str = Field(default="", env="LENDING_JOBS_DONE_FOLDER_ID")
-	# NDL's own Instantly workspace for cold email (never INSTANTLY_API_KEY, which is Forced Action's). Cold email
-	# stays off until the key, the passthrough campaign id and the footer postal address (CAN-SPAM) are all set.
-	lending_instantly_api_key: Optional[SecretStr] = Field(default=None, env="LENDING_INSTANTLY_API_KEY")
-	lending_instantly_base_url: str = Field(default="https://api.instantly.ai", env="LENDING_INSTANTLY_BASE_URL")
+	# P1.1 cold email through NDL's Instantly workspace, with the same LENDING_INSTANTLY_API_KEY / _BASE_URL as P1.3
+	# (defined above). Cold email stays off until the key, the passthrough campaign id and the footer postal address
+	# (CAN-SPAM) are all set.
 	lending_instantly_campaign_id: str = Field(default="", env="LENDING_INSTANTLY_CAMPAIGN_ID")
 	lending_instantly_sender_email: str = Field(default="", env="LENDING_INSTANTLY_SENDER_EMAIL")
 	lending_email_footer_brand: str = Field(default="Next Deal Lending", env="LENDING_EMAIL_FOOTER_BRAND")

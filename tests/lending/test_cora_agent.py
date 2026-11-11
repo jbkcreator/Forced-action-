@@ -451,17 +451,18 @@ class _RecordingInstantly:
 def test_instantly_executor_registered_only_when_configured(monkeypatch) -> None:
     monkeypatch.setattr(cora_agent, "get_email_sender", lambda: None)
     monkeypatch.setattr(cora_agent, "get_sender", lambda: None)
-    assert "instantly_email" not in cora_agent.build_egress_executors()
+    assert "instantly_cold_email" not in cora_agent.build_egress_executors()
     sender = _RecordingInstantly()
     monkeypatch.setattr(cora_agent, "get_ndl_instantly_sender", lambda: sender)
     executors = cora_agent.build_egress_executors()
-    assert executors["instantly_email"]({"to_email": "m@example.com", "subject": "S", "body": "B"}) == "lead-1"
+    assert executors["instantly_cold_email"]({"to_email": "m@example.com", "subject": "S", "body": "B"}) == "lead-1"
     assert sender.sent == [("m@example.com", "S", "B")]
 
 
-@pytest.mark.parametrize("channel", ["ghl_email", "instantly_email"])
+@pytest.mark.parametrize("channel", ["ghl_email", "instantly_email", "instantly_cold_email"])
 def test_email_deferred_outside_window(channel: str) -> None:
-    check = cora_agent.make_send_check(ScriptedEngine(False), email_window=lambda phone: False)
+    answers = (False, False) if channel.startswith("instantly") else (False,)  # Instantly also checks email_opt_outs
+    check = cora_agent.make_send_check(ScriptedEngine(*answers), email_window=lambda phone: False)
     reason = check(_action(channel, phone="(727) 555-0100", email="sam@example.com"))
     assert reason == "outside the recipient's 8am-8pm window" and isinstance(reason, SendDeferred)
 
@@ -479,7 +480,7 @@ def test_email_window_uses_the_phone_when_known(monkeypatch) -> None:
 
 def test_instantly_send_check_blocks_opted_out_email() -> None:
     reason = cora_agent.make_send_check(ScriptedEngine(True), email_window=lambda phone: True)(
-        _action("instantly_email", phone=None, email="sam@example.com"))
+        _action("instantly_cold_email", phone=None, email="sam@example.com"))
     assert reason == "recipient is suppressed or marked do-not-contact"
 
 
@@ -516,3 +517,12 @@ def test_agent_jobs_off_without_drive_folders(monkeypatch) -> None:
     worker = cora_agent.build_agent_jobs(SimpleNamespace(lending_agent_jobs_enabled=True), engine=None, gate=None,
                                          queue=None, approval_channel="C_APPROVALS")
     assert worker is None
+
+
+def test_cold_email_checks_fa_email_opt_outs_too() -> None:
+    """Like P1.3's thread answers, a cold email honours an unsubscribe recorded in email_opt_outs before the
+    opt-out poller copies it to the lending list."""
+    engine = ScriptedEngine(False, True)
+    reason = cora_agent.make_send_check(engine, email_window=lambda phone: True)(
+        _action("instantly_cold_email", phone=None, email="sam@example.com"))
+    assert reason == "recipient is suppressed or marked do-not-contact"

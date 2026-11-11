@@ -54,7 +54,7 @@ def _consent(db) -> None:
 def _sent_cold_email(db, at: datetime) -> None:
     db.execute(text(
         "INSERT INTO lending.pending_actions (tool_name, channel, payload, status, recipient_email, executed_at, "
-        "created_at, updated_at) VALUES ('agent_job:send_email', 'instantly_email', :payload, 'sent', :e, :at, :at, :at)"),
+        "created_at, updated_at) VALUES ('agent_job:send_email', 'instantly_cold_email', :payload, 'sent', :e, :at, :at, :at)"),
         {"payload": json.dumps({}), "e": EMAIL, "at": at})
 
 
@@ -202,7 +202,7 @@ def test_rail_for() -> None:
 def test_cold_email_awaiting_approval_counts_toward_cap(db) -> None:
     db.execute(text(
         "INSERT INTO lending.pending_actions (tool_name, channel, payload, status, recipient_email, created_at, "
-        "updated_at) VALUES ('agent_job:send_email', 'instantly_email', '{}', 'pending', :e, :at, :at)"),
+        "updated_at) VALUES ('agent_job:send_email', 'instantly_cold_email', '{}', 'pending', :e, :at, :at)"),
         {"e": EMAIL, "at": NOW - timedelta(hours=1)})
     cold = _contact(tags=frozenset({"ndl-cold"}))
     assert _check(db, _job(type="send_email", subject="Hi"), cold).status == "blocked_cap"

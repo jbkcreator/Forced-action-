@@ -16,7 +16,8 @@ JOB_TYPES: dict[str, str] = {
     "move_stage": "ghl_stage",
     "add_note": "ghl_note",
 }
-COLD_EMAIL_CHANNEL = "instantly_email"
+# Not "instantly_email": that is P1.3's channel for answers inside an Instantly reply thread.
+COLD_EMAIL_CHANNEL = "instantly_cold_email"
 MESSAGE_JOB_TYPES = frozenset({"send_sms", "send_email"})
 
 RESULT_STATUSES = ("sent", "edited_sent", "rejected", "blocked_consent", "blocked_hours",

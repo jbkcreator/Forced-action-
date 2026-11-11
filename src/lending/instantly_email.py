@@ -7,8 +7,9 @@ footer (NDL brand, postal address, phone, one-click unsubscribe) added here at s
 the campaign's next slot; its schedule is 09:00-20:00 America/Detroit (Eastern), which keeps every send inside
 8am-8pm for Eastern and Central recipients.
 
-Credentials are LENDING_INSTANTLY_API_KEY / LENDING_INSTANTLY_CAMPAIGN_ID only, never Forced Action's
-INSTANTLY_API_KEY: like GHL (src/lending/ghl_account.py), lending never touches FA's accounts. The sender is off
+The key is P1.3's (LENDING_INSTANTLY_API_KEY, src/lending/instantly_client.py: the same NDL workspace that receives
+the replies), never Forced Action's INSTANTLY_API_KEY: like GHL (src/lending/ghl_account.py), lending never touches
+FA's accounts. Drafts use the channel ``instantly_cold_email``; P1.3's ``instantly_email`` answers inside a thread. The sender is off
 (``get_ndl_instantly_sender()`` is None) until the key, the campaign and the footer postal address are all set.
 
 Instantly skips a lead already in the campaign, so a repeat email to the same address first removes the earlier
@@ -36,6 +37,7 @@ import requests
 
 from config.settings import get_settings
 from src.lending.global_halt import is_globally_halted
+from src.lending.instantly_client import lending_instantly_account
 
 logger = logging.getLogger(__name__)
 
@@ -78,11 +80,13 @@ _warned_missing: Optional[tuple[str, ...]] = None
 
 
 def ndl_instantly() -> Optional[NdlInstantly]:
-    """NDL's Instantly settings, or None (logged once) unless key, campaign and footer postal address are set."""
+    """NDL's Instantly account for cold email, or None (logged once) unless the key (P1.3's
+    LENDING_INSTANTLY_API_KEY, read through ``lending_instantly_account``), the campaign and the footer postal address
+    are all set."""
     global _warned_missing
     s = get_settings()
-    api_key = s.lending_instantly_api_key.get_secret_value() if s.lending_instantly_api_key else ""
-    missing = tuple(name for name, value in (("LENDING_INSTANTLY_API_KEY", api_key),
+    account = lending_instantly_account()
+    missing = tuple(name for name, value in (("LENDING_INSTANTLY_API_KEY", account),
                                              ("LENDING_INSTANTLY_CAMPAIGN_ID", s.lending_instantly_campaign_id),
                                              ("LENDING_EMAIL_FOOTER_POSTAL_ADDRESS",
                                               s.lending_email_footer_postal_address)) if not value)
@@ -91,7 +95,7 @@ def ndl_instantly() -> Optional[NdlInstantly]:
             logger.warning("[lending-instantly] cold email is off; missing settings: %s", ", ".join(missing))
             _warned_missing = missing
         return None
-    return NdlInstantly(api_key=api_key, base_url=s.lending_instantly_base_url.rstrip("/"),
+    return NdlInstantly(api_key=account.api_key, base_url=account.base_url,
                         campaign_id=s.lending_instantly_campaign_id, sender_email=s.lending_instantly_sender_email,
                         footer_brand=s.lending_email_footer_brand,
                         footer_postal_address=s.lending_email_footer_postal_address,
