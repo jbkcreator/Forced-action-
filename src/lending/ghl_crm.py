@@ -75,6 +75,14 @@ class GhlCrmWriter:
         pipeline_id = _pipeline_id()
         if not pipeline_id:
             raise GhlCrmError("LENDING_GHL_PIPELINE_ID is not set; no pipeline to move cards in")
+        stage_id = self._resolve_stage(pipeline_id, stage_name)
+        card_id = self._open_card(pipeline_id, contact_id)
+        self._call("stage move", "PUT", f"/opportunities/{card_id}", json={"pipelineStageId": stage_id})
+        logger.info("%s moved opportunity %s to stage %s", self._log_prefix, card_id, stage_id)
+        return card_id
+
+    def _resolve_stage(self, pipeline_id: str, stage_name: str) -> str:
+        """The id of the pipeline stage named ``stage_name`` (case-insensitive, exact), read live from GHL."""
         pipelines = self._call("pipeline list", "GET", "/opportunities/pipelines",
                                params={"locationId": self._account.location_id}).get("pipelines") or []
         pipeline = next((p for p in pipelines if p.get("id") == pipeline_id), None)
@@ -87,18 +95,21 @@ class GhlCrmWriter:
             names = ", ".join(s.get("name") or "?" for s in stages)
             raise GhlCrmError(f"no stage named '{stage_name.strip()}' in {pipeline.get('name') or 'the pipeline'}; "
                               f"stages are: {names}")
+        return str(stage["id"])
+
+    def _open_card(self, pipeline_id: str, contact_id: str) -> str:
+        """The id of the contact's open card in the pipeline. Closed cards (won, lost, abandoned) are not moved."""
         cards = self._call("opportunity search", "GET", "/opportunities/search",
                            params={"location_id": self._account.location_id, "contact_id": contact_id,
                                    "pipeline_id": pipeline_id}).get("opportunities") or []
         card = next((c for c in cards if (c.get("status") or "open").lower() not in _CLOSED_STATUSES), None)
         if card is None:
             raise GhlCrmError("the contact has no card in the lending pipeline to move")
-        self._call("stage move", "PUT", f"/opportunities/{card['id']}", json={"pipelineStageId": stage["id"]})
-        logger.info("%s moved opportunity %s to stage %s", self._log_prefix, card["id"], stage["id"])
         return str(card["id"])
 
     def add_tag(self, contact_id: str, tag: str) -> str:
-        """Add one tag (GHL's add-tags endpoint keeps the contact's other tags); returns a receipt reference."""
+        """Add one tag (GHL's add-tags endpoint keeps the contact's other tags). GHL returns no id for a tag, so the
+        receipt stored on the action is ``<contact id>:tag:<tag>``."""
         self._refuse_if_halted("tag add")
         tag = tag.strip()
         self._call("tag add", "POST", f"/contacts/{contact_id}/tags", json={"tags": [tag]})
@@ -106,7 +117,7 @@ class GhlCrmWriter:
         return f"{contact_id}:tag:{tag}"
 
     def add_note(self, contact_id: str, body: str) -> str:
-        """Add a note to the contact; returns the GHL note id (or a receipt reference when none is returned)."""
+        """Add a note to the contact; returns the GHL note id, or ``<contact id>:note`` when GHL returns none."""
         self._refuse_if_halted("note add")
         data = self._call("note add", "POST", f"/contacts/{contact_id}/notes", json={"body": body})
         note_id = (data.get("note") or {}).get("id") or data.get("id")

@@ -279,3 +279,15 @@ def test_tag_input_rejects_contact_refs_and_blank_tags() -> None:
         DraftAddTagInput(lead_ref="contact:3", tag="hot")
     with pytest.raises(ValidationError):
         DraftAddTagInput(lead_ref="web_lead:7", tag="   ")
+
+
+def test_revised_crm_drafts_keep_the_draft_length_limits() -> None:
+    assert cora_tools.draft_content_check("ghl_tag", {"tag": "x" * 61}) == "a tag is at most 60 characters"
+    assert cora_tools.draft_content_check("ghl_tag", {"tag": "application sent"}) is None
+    assert cora_tools.draft_content_check("ghl_note", {"body": "x" * 2001}) == "a note is at most 2000 characters"
+    assert cora_tools.draft_content_check("ghl_stage", {"stage": "x" * 101}) == "a stage name is at most 100 characters"
+
+
+def test_note_body_is_stripped(monkeypatch) -> None:
+    note = _toolkit(monkeypatch, SAM).draft_add_note(DraftAddNoteInput(lead_ref="web_lead:7", body="  Call Friday \n"), CONTEXT)
+    assert note.payload["body"] == "Call Friday"
