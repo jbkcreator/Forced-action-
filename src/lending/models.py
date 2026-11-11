@@ -1394,3 +1394,49 @@ class LendingPartnerFileUpload(LendingBase):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
 
     __table_args__ = (Index("idx_lending_partner_file_uploads_file", "file_id"),)
+
+
+
+class LendingInstantlyReply(LendingBase):
+    """One reply to an NDL Instantly cold email (P1.3), from ``POST /webhooks/lending/instantly``.
+
+    ``status``: new (waiting for Cora's sweep to classify it, draft an answer and post the triage) -> done, or
+    suppressed (a STOP or unsubscribe: no answer is ever drafted; ``suppressed_at`` is set once the opt-out is
+    recorded, and the sweep retries one that failed) or failed (gave up after ``attempts``). ``reply_text`` is kept
+    so the answer can be drafted; it is never logged or put in the inbox payload. ``action_id`` is the approval card
+    in ``pending_actions``; ``triage_posted_at`` the post in the replies channel."""
+
+    __tablename__ = "instantly_replies"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    dedup_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    lead_email: Mapped[str] = mapped_column(String(320), nullable=False)  # lower-cased
+    first_name: Mapped[Optional[str]] = mapped_column(String(100))
+    campaign_id: Mapped[Optional[str]] = mapped_column(String(100))
+    campaign_name: Mapped[Optional[str]] = mapped_column(String(200))
+    email_account: Mapped[Optional[str]] = mapped_column(String(320))  # our Instantly inbox that received the reply
+    reply_to_uuid: Mapped[Optional[str]] = mapped_column(String(100))  # Instantly's id of the reply email
+    reply_subject: Mapped[Optional[str]] = mapped_column(String(500))
+    reply_text: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    stop_request: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="new", server_default=text("'new'"))
+    intent: Mapped[Optional[str]] = mapped_column(String(16))
+    summary: Mapped[Optional[str]] = mapped_column(String(300))  # one line, no numbers, no contact details
+    action_id: Mapped[Optional[int]] = mapped_column(BigInteger)
+    opt_out_event_id: Mapped[Optional[int]] = mapped_column(BigInteger)
+    suppressed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    triage_posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    last_error: Mapped[Optional[str]] = mapped_column(String(200))  # exception class or a fixed reason only
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("now()"))
+    processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint("status IN ('new', 'suppressed', 'done', 'failed')", name="ck_instantly_replies_status"),
+        CheckConstraint("intent IS NULL OR intent IN ('deal', 'objection', 'dead', 'unsubscribe', 'unclassified')",
+                        name="ck_instantly_replies_intent"),
+        Index("uq_instantly_replies_dedup", "dedup_key", unique=True),
+        Index("ix_instantly_replies_open", "received_at",
+              postgresql_where=text("status = 'new' OR (status = 'suppressed' AND suppressed_at IS NULL)")),
+    )
