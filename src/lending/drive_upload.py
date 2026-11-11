@@ -85,6 +85,14 @@ class DriveUploader:
             self._folders[key] = ensure_folder(service, parent_id, subfolder)
         upload_bytes(service, self._folders[key], name, data)
 
+    def remove(self, parent_id: str, subfolder: str, name: str) -> None:
+        """Delete the file if it is there (the day's manifest, before a re-run replaces the CSVs)."""
+        service = self._service = self._service or drive_service()
+        folder = _find(service, parent_id, subfolder, folder=True)
+        file_id = folder and _find(service, folder, name, folder=False)
+        if file_id:
+            _run("remove file", service.files().delete(fileId=file_id, supportsAllDrives=True))
+
     def has_file(self, parent_id: str, subfolder: str, name: str) -> bool:
         service = self._service = self._service or drive_service()
         folder = _find(service, parent_id, subfolder, folder=True)

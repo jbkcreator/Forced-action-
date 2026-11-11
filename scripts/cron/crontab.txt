@@ -1241,9 +1241,10 @@ COUNTY_ID=hillsborough
 # 2:00 AM ET. 05:00 UTC = midnight EST / 1:00 AM EDT (run.sh retries ~05:15 / ~05:45). The 05:55 --retry run is the
 # last try: it shares the flock, so it waits for the main run and its retries to finish (no two runs at once), then
 # skips a finished day, else exports once more and alerts #cora if that fails (exit 0, so run.sh adds no repeats).
+# If the lock wait (50 min) runs out, --alert-stalled posts to #cora unless the day's manifest is in Drive.
 # No-op until LENDING_LEDGER_EXPORT_ENABLED=true and LENDING_LEDGER_EXPORT_FOLDER_ID is set.
 0 5 * * * flock /tmp/lending_ledger_export.lock $PROJECT/scripts/cron/run.sh src.tasks.lending_ledger_export
-55 5 * * * flock -w 3000 /tmp/lending_ledger_export.lock $PROJECT/scripts/cron/run.sh src.tasks.lending_ledger_export --retry
+55 5 * * * flock -w 3000 /tmp/lending_ledger_export.lock $PROJECT/scripts/cron/run.sh src.tasks.lending_ledger_export --retry || $PROJECT/scripts/cron/run.sh src.tasks.lending_ledger_export --alert-stalled
 
 # Lending 7:20pm ET scoreboard to Slack (Part 5.6; dialer stops 7:15pm). Two lines because ET is UTC-4 until Nov 1 and UTC-5 after; the task posts only when it is 19:xx ET.
 20 23 * * * $PROJECT/scripts/cron/run.sh src.tasks.lending_daily_scoreboard

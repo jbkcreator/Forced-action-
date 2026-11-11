@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
@@ -39,6 +40,13 @@ TABLES: dict[str, tuple[str, ...]] = {
     "outcomes": ("at", "kind", "outcome", "ref"),
     "scores": ("lead_source", "lead_id", "borrower_score", "missing", "received_at"),
 }
+
+# Columns that hold text a dialer, GHL or a person typed (not our own codes or ids): phone-like digit runs and email
+# addresses in them are redacted, since nothing upstream whitelists these values.
+FREE_TEXT_COLUMNS = frozenset({"disposition_raw", "outcome", "detail"})
+_EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+_PHONE_LIKE = re.compile(r"\+?\d[\d\s().-]{5,}\d")
+REDACTED = "[redacted]"
 
 Uploader = Callable[[str, str, str, bytes], None]  # (parent folder id, dated subfolder, file name, bytes)
 
@@ -91,13 +99,22 @@ def _cell(value: Any) -> Any:
     return value
 
 
+def redact(value: Any) -> Any:
+    """Free text with emails and runs of 7+ digits (phone numbers, however formatted) replaced."""
+    if not isinstance(value, str):
+        return value
+    text_ = _EMAIL.sub(REDACTED, value)
+    return _PHONE_LIKE.sub(lambda m: REDACTED if sum(c.isdigit() for c in m.group()) >= 7 else m.group(), text_)
+
+
 def _csv(columns: Sequence[str], rows: Iterable[Mapping[str, Any]], keys: Mapping[str, ContactKey]) -> bytes:
     out = io.StringIO()
     writer = csv.writer(out, lineterminator="\n")
     writer.writerow((*KEY_COLUMNS, *columns))
     for row in rows:
         ids = key_columns(row.get("phone"), keys)
-        writer.writerow([*(ids[c] for c in KEY_COLUMNS), *(_cell(row.get(c)) for c in columns)])
+        writer.writerow([*(ids[c] for c in KEY_COLUMNS), *(_cell(redact(row.get(c)) if c in FREE_TEXT_COLUMNS else row.get(c))
+                                                       for c in columns)])
     return out.getvalue().encode("utf-8")
 
 

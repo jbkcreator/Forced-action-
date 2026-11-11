@@ -250,3 +250,83 @@ def test_a_failed_drive_step_is_logged_by_name_and_re_raised(caplog):
     with pytest.raises(TimeoutError):
         upload_bytes(Broken(), "F", "a.csv", b"x")
     assert "find file failed (TimeoutError)" in caplog.text
+
+
+# ── review fixes: free text, partial re-run, stalled main run ───────────────
+
+@pytest.mark.parametrize("raw, expected", [
+    ("Booked", "Booked"),
+    ("ghl:no-answer", "ghl:no-answer"),
+    ("call 813-555-0123 or a.b@example.com", "call [redacted] or [redacted]"),
+    ("+18135550123", "[redacted]"),
+    ("Funded 2026", "Funded 2026"),
+])
+def test_free_text_is_redacted(raw, expected):
+    assert le.redact(raw) == expected
+
+
+def test_disposition_text_with_a_phone_and_email_is_not_exported():
+    data = le.LedgerData(dispositions=[{"phone": "+18135550123", "dialer_call_id": "1234567890",
+                                        "disposition_raw": "cb 813 555 0199 x@y.com"}])
+    out = le.build_files(data)["dispositions.csv"].decode()
+    assert "0199" not in out and "x@y.com" not in out
+    assert "1234567890" in out  # our own call id is kept
+
+
+def test_rerun_removes_the_old_manifest_before_replacing_any_csv(monkeypatch):
+    from src.tasks import lending_ledger_export as task
+
+    monkeypatch.setattr(le, "collect", lambda db, day: le.LedgerData())
+    events = []
+
+    def failing_upload(folder_id, sub, name, data):
+        events.append(("upload", name))
+        if name == "touches.csv":
+            raise TimeoutError()
+
+    with pytest.raises(TimeoutError):
+        task.run(None, day=DAY, folder_id="F", upload=failing_upload, now=AT,
+                 remove=lambda f, sub, name: events.append(("remove", name)))
+    assert events[0] == ("remove", "manifest.json")
+    assert ("upload", "manifest.json") not in events
+
+
+def test_partial_rerun_leaves_no_manifest_so_retry_redoes_the_day(monkeypatch):
+    from src.lending.drive_upload import DriveUploader
+    from src.tasks import lending_ledger_export as task
+
+    monkeypatch.setattr(le, "collect", lambda db, day: le.LedgerData())
+    drive = FakeDrive()
+    drive.f.delete = lambda fileId, **_: _Req(drive.f.items.pop(fileId))
+    up = DriveUploader(drive)
+    task.run(None, day=DAY, folder_id="F", upload=up, now=AT, remove=up.remove)
+    assert up.has_file("F", DAY.isoformat(), "manifest.json")
+
+    def fail_on_touches(folder_id, sub, name, data):
+        if name == "touches.csv":
+            raise TimeoutError()
+        up(folder_id, sub, name, data)
+
+    with pytest.raises(TimeoutError):
+        task.run(None, day=DAY, folder_id="F", upload=fail_on_touches, now=AT, remove=up.remove)
+    assert not up.has_file("F", DAY.isoformat(), "manifest.json")
+
+
+class _Done:
+    def __init__(self, done=False, broken=False):
+        self.done, self.broken = done, broken
+
+    def has_file(self, *_):
+        if self.broken:
+            raise TimeoutError()
+        return self.done
+
+
+@pytest.mark.parametrize("uploader, alerted", [(_Done(done=True), False), (_Done(), True), (_Done(broken=True), True)])
+def test_stalled_main_run_alerts_unless_the_day_is_done(monkeypatch, uploader, alerted):
+    from src.tasks import lending_ledger_export as task
+
+    sent = []
+    monkeypatch.setattr(task, "_alert", lambda day, problem: sent.append(problem))
+    assert task._alert_if_unfinished(uploader, "F", DAY) == 0
+    assert bool(sent) is alerted
