@@ -1073,6 +1073,23 @@ class AppSettings(BaseSettings):
 	lending_cora_pending_action_ttl_hours: int = Field(default=72, env="LENDING_CORA_PENDING_ACTION_TTL_HOURS")  # unapproved drafts expire after this
 	lending_cora_calendar_id: str = Field(default="", env="LENDING_CORA_CALENDAR_ID")
 	lending_cora_calendar_service_account_key_path: str = Field(default="", env="LENDING_CORA_CALENDAR_SERVICE_ACCOUNT_KEY_PATH")
+	# P1.1 agent job queue (src/lending/agent_jobs): agents drop job files in Drive "NDL Jobs/inbox", Cora cards them
+	# and writes receipts to "NDL Jobs/done". Off until enabled; the folders must sit in a Shared Drive (a service
+	# account cannot create files in a personal My Drive). The key may be the same file as the Sheets one.
+	lending_agent_jobs_enabled: bool = Field(default=False, env="LENDING_AGENT_JOBS_ENABLED")
+	lending_drive_service_account_key_path: str = Field(default="", env="LENDING_DRIVE_SERVICE_ACCOUNT_KEY_PATH")
+	lending_jobs_inbox_folder_id: str = Field(default="", env="LENDING_JOBS_INBOX_FOLDER_ID")
+	lending_jobs_processed_folder_id: str = Field(default="", env="LENDING_JOBS_PROCESSED_FOLDER_ID")
+	lending_jobs_done_folder_id: str = Field(default="", env="LENDING_JOBS_DONE_FOLDER_ID")
+	# NDL's own Instantly workspace for cold email (never INSTANTLY_API_KEY, which is Forced Action's). Cold email
+	# stays off until the key, the passthrough campaign id and the footer postal address (CAN-SPAM) are all set.
+	lending_instantly_api_key: Optional[SecretStr] = Field(default=None, env="LENDING_INSTANTLY_API_KEY")
+	lending_instantly_base_url: str = Field(default="https://api.instantly.ai", env="LENDING_INSTANTLY_BASE_URL")
+	lending_instantly_campaign_id: str = Field(default="", env="LENDING_INSTANTLY_CAMPAIGN_ID")
+	lending_instantly_sender_email: str = Field(default="", env="LENDING_INSTANTLY_SENDER_EMAIL")
+	lending_email_footer_brand: str = Field(default="Next Deal Lending", env="LENDING_EMAIL_FOOTER_BRAND")
+	lending_email_footer_postal_address: str = Field(default="", env="LENDING_EMAIL_FOOTER_POSTAL_ADDRESS")
+	lending_email_footer_phone: str = Field(default="(656) 221-1100", env="LENDING_EMAIL_FOOTER_PHONE")
 	# ── Meta Conversions API (CAPI) — S2 ────────────────────────────────────
 	# Server-side Purchase reporting for closed-loop Meta ad attribution.
 	# Feature-gated and OFF by default — when disabled, or when pixel_id /
