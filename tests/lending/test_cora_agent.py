@@ -218,10 +218,11 @@ def test_missing_settings_are_named() -> None:
     assert cora_agent.build_live_services(_settings(lending_cora_approver_user_ids="")) is None
 
 
-def test_only_email_is_registered_when_the_ghl_sender_is_configured(monkeypatch) -> None:
+def test_email_is_registered_when_the_ghl_email_sender_is_configured(monkeypatch) -> None:
     calls = []
     monkeypatch.setattr(cora_agent, "get_email_sender",
                         lambda: lambda *args, **kwargs: calls.append((args, kwargs)) or "m1")
+    monkeypatch.setattr(cora_agent, "get_sender", lambda: None)
     executors = cora_agent.build_egress_executors()
     assert set(executors) == {"ghl_email"}
     assert executors["ghl_email"]({"lead_ref": "web_lead:7", "to_email": "sam@example.com",
@@ -229,8 +230,32 @@ def test_only_email_is_registered_when_the_ghl_sender_is_configured(monkeypatch)
     assert calls == [(("sam@example.com", "Hello", "Hi Sam"), {"phone": None})]
 
 
+def test_sms_is_registered_and_sends_exactly_the_approved_text(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(cora_agent, "get_email_sender", lambda: None)
+    monkeypatch.setattr(cora_agent, "get_sender", lambda: lambda *args, **kwargs: calls.append((args, kwargs)) or "s1")
+    executors = cora_agent.build_egress_executors()
+    assert set(executors) == {"ghl_sms"}
+    assert executors["ghl_sms"]({"lead_ref": "web_lead:7", "to_phone": "+17275550100",
+                                 "body": "Hi Sam, Josh here. Reply STOP to opt out."}) == "s1"
+    assert calls == [(("+17275550100", "Hi Sam, Josh here. Reply STOP to opt out."), {})]
+
+
+def test_both_channels_are_registered_when_both_senders_are_configured(monkeypatch) -> None:
+    monkeypatch.setattr(cora_agent, "get_email_sender", lambda: lambda *a, **k: "m1")
+    monkeypatch.setattr(cora_agent, "get_sender", lambda: lambda *a, **k: "s1")
+    assert set(cora_agent.build_egress_executors()) == {"ghl_email", "ghl_sms"}
+
+
+def test_stage_moves_stay_unregistered(monkeypatch) -> None:
+    monkeypatch.setattr(cora_agent, "get_email_sender", lambda: lambda *a, **k: "m1")
+    monkeypatch.setattr(cora_agent, "get_sender", lambda: lambda *a, **k: "s1")
+    assert "ghl_stage" not in cora_agent.build_egress_executors()
+
+
 def test_nothing_is_registered_without_a_configured_ghl_sender(monkeypatch) -> None:
     monkeypatch.setattr(cora_agent, "get_email_sender", lambda: None)
+    monkeypatch.setattr(cora_agent, "get_sender", lambda: None)
     assert cora_agent.build_egress_executors() == {}
 
 

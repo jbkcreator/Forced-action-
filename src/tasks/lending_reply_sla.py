@@ -104,8 +104,7 @@ def _queue_for_cora(db, row: Mapping[str, Any]) -> None:
 def main(*, now: Optional[datetime] = None) -> int:
     now = now or datetime.now(timezone.utc)
     poster = slack_poster()
-    if poster is None:
-        logger.error("[reply-sla] not checked: LENDING_REPLIES_CHANNEL or the Slack token is not configured")
+    if poster is None:  # slack_poster() reported the unset setting
         return 1
     try:
         with lending_session() as db:

@@ -50,6 +50,7 @@ from src.lending.cora_prompt import CORA_BASE_PROMPT, REVISION_PROMPT
 from src.lending.cora_tools import CoraToolkit, draft_content_check
 from src.lending.global_halt import EmergencyHalt
 from src.lending.ghl_email import GhlEmailSender, get_email_sender
+from src.lending.ghl_sms import GhlSmsSender, get_sender
 from src.lending.cora_morning_digest import post_morning_digest
 from src.lending.models import LENDING_SCHEMA
 from src.lending.routing.slack_extension import RoutingSlack
@@ -193,15 +194,34 @@ def email_executor(sender: GhlEmailSender) -> EgressExecutor:
     return send
 
 
+def sms_executor(sender: GhlSmsSender) -> EgressExecutor:
+    """Sends an approved ``draft_sms`` payload exactly as approved; returns the GHL message id. The relay's send
+    check runs first (opt-out, text consent, LENDING_SMS_CARRIER_APPROVED, the borrower's 8am-8pm window), and
+    the relay never retries, so an ambiguous GHL failure is never sent twice."""
+
+    def send(payload: Mapping[str, Any]) -> str:
+        return sender(payload["to_phone"], payload["body"])
+
+    return send
+
+
 def build_egress_executors() -> dict[str, EgressExecutor]:
-    """Channels Cora may send through once approved. Only email (``ghl_email``) is switched on, and only
-    when the GHL account and ``LENDING_GHL_EMAIL_FROM`` are configured. ``ghl_sms`` and ``ghl_stage`` stay
-    unregistered, so an approved draft there is marked failed with "not switched on yet"."""
-    sender = get_email_sender()
-    if sender is None:
+    """Channels Cora may send through once approved: ``ghl_email`` (needs the GHL account and
+    ``LENDING_GHL_EMAIL_FROM``) and ``ghl_sms`` (needs the GHL account and ``LENDING_GHL_SMS_FROM_NUMBER``; texts
+    also wait for LENDING_SMS_CARRIER_APPROVED in the send check). ``ghl_stage`` stays unregistered, so an
+    approved draft there is marked failed with "not switched on yet"."""
+    executors: dict[str, EgressExecutor] = {}
+    email_sender = get_email_sender()
+    if email_sender is None:
         logger.warning("[cora] GHL email sender not configured; approved emails will not be sent")
-        return {}
-    return {"ghl_email": email_executor(sender)}
+    else:
+        executors["ghl_email"] = email_executor(email_sender)
+    sms_sender = get_sender()
+    if sms_sender is None:
+        logger.warning("[cora] GHL SMS sender not configured; approved texts will not be sent")
+    else:
+        executors["ghl_sms"] = sms_executor(sms_sender)
+    return executors
 
 
 def _ts_seconds(ts: Optional[str]) -> float:
