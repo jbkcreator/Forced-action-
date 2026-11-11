@@ -115,3 +115,12 @@ def test_tag_and_note_failures_and_halt_write_nothing(monkeypatch) -> None:
         with pytest.raises(GhlCrmError, match="halt"):
             write()
     assert len(ghl.calls) == calls_before
+
+
+@pytest.mark.parametrize("halt_after_calls", [1, 2])
+def test_a_halt_set_during_the_lookups_stops_the_stage_move(monkeypatch, halt_after_calls: int) -> None:
+    ghl = FakeGhl(_routes([{"id": "opp-1", "status": "open"}]))
+    monkeypatch.setattr(ghl_crm, "is_globally_halted", lambda: len(ghl.calls) >= halt_after_calls)
+    with pytest.raises(GhlCrmError, match="halt"):
+        GhlCrmWriter(ACCOUNT, ghl).move_stage("ghl-123", "Application")
+    assert all(method == "GET" for method, _, _ in ghl.calls)

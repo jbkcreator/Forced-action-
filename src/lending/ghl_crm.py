@@ -77,6 +77,7 @@ class GhlCrmWriter:
             raise GhlCrmError("LENDING_GHL_PIPELINE_ID is not set; no pipeline to move cards in")
         stage_id = self._resolve_stage(pipeline_id, stage_name)
         card_id = self._open_card(pipeline_id, contact_id)
+        self._refuse_if_halted("stage move")  # again: a halt can be set while the lookups run
         self._call("stage move", "PUT", f"/opportunities/{card_id}", json={"pipelineStageId": stage_id})
         logger.info("%s moved opportunity %s to stage %s", self._log_prefix, card_id, stage_id)
         return card_id
