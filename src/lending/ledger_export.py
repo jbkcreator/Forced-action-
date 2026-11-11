@@ -8,7 +8,8 @@ lead carries one), the internal ``contact_id`` and the last 4 digits of the phon
 * touches, dispositions, outcomes: the ET calendar day being exported (yesterday, run after midnight ET).
 * scores: the borrower score (``borrower_score.py``) worked out at export time per LendingFlow / website lead, with
   the inputs it was missing. ``lead_scoring.score_lead`` is not wired to stored inputs, so it is not exported.
-* Test rows (``is_test``) are left out.
+* Test rows are left out: an ``is_test`` row, and on tables with no such flag (calls, texts, consents, stage events)
+  any row whose phone belongs to a test contact or test lead.
 
 Read-only on the database. The Drive upload is a seam (``Uploader``); ``src/lending/drive_upload.py`` is the default.
 """
@@ -115,19 +116,7 @@ def publish(files: Mapping[str, bytes], *, day: date, folder_id: str, upload: Up
 
 # ── database reads ──────────────────────────────────────────────────────────
 
-_KEYS = text("""
-    SELECT c.phone, c.id, g.ghl_contact_id
-      FROM lending.contacts c
-      LEFT JOIN LATERAL (
-          SELECT ghl_contact_id FROM (
-              SELECT ghl_contact_id, created_at FROM lending.web_leads
-               WHERE phone = c.phone AND ghl_contact_id IS NOT NULL
-              UNION ALL
-              SELECT ghl_contact_id, created_at FROM lending.lendingflow_leads
-               WHERE phone = c.phone AND ghl_contact_id IS NOT NULL
-          ) x ORDER BY created_at DESC LIMIT 1) g ON true
-     WHERE NOT c.is_test
-""")
+_KEYS = text("SELECT phone, id FROM lending.contacts WHERE NOT is_test")
 _LEAD_GHL = text("""
     SELECT phone, ghl_contact_id FROM (
         SELECT phone, ghl_contact_id, created_at FROM lending.web_leads WHERE ghl_contact_id IS NOT NULL AND NOT is_test
@@ -135,6 +124,11 @@ _LEAD_GHL = text("""
         SELECT phone, ghl_contact_id, created_at FROM lending.lendingflow_leads
          WHERE ghl_contact_id IS NOT NULL AND NOT is_test
     ) x ORDER BY created_at
+""")
+_TEST_PHONES = text("""
+    SELECT phone FROM lending.contacts WHERE is_test
+    UNION SELECT phone FROM lending.web_leads WHERE is_test
+    UNION SELECT phone FROM lending.lendingflow_leads WHERE is_test
 """)
 _CONTACTS = text("""
     SELECT phone, do_not_contact, nurture, line_type, last_dnc_scrub, created_at
@@ -186,25 +180,28 @@ _SCORE_LEADS = text("""
 """)
 
 
-def _rows(db, query, **params) -> list[dict]:
+def _rows(db, query, test_phones: frozenset[str] = frozenset(), **params) -> list[dict]:
     rows = []
     for row in db.execute(query, params).mappings():
         item = dict(row)
         item["phone"] = normalize(item["phone"]) if item.get("phone") else None
-        rows.append(item)
+        if item["phone"] not in test_phones:
+            rows.append(item)
     return rows
 
 
+def _test_phones(db) -> frozenset[str]:
+    return frozenset(p for (raw,) in db.execute(_TEST_PHONES) if raw and (p := normalize(raw)))
+
+
 def _keys(db) -> dict[str, ContactKey]:
-    keys: dict[str, ContactKey] = {}
-    for phone, ghl in db.execute(_LEAD_GHL):  # leads with no contacts row still get their GHL id
+    """Phone -> contact id and the newest non-test lead's GHL id (a lead with no contacts row still gets its id)."""
+    ghl: dict[str, str] = {}
+    for phone, ghl_id in db.execute(_LEAD_GHL):  # oldest first: the newest lead wins
         if phone and (p := normalize(phone)):
-            keys[p] = ContactKey(contact_id=None, ghl_contact_id=ghl)
-    for phone, contact_id, ghl in db.execute(_KEYS):
-        if phone and (p := normalize(phone)):
-            keys[p] = ContactKey(contact_id=contact_id, ghl_contact_id=ghl or (keys[p].ghl_contact_id if p in keys
-                                                                               else None))
-    return keys
+            ghl[p] = ghl_id
+    ids = {p: cid for phone, cid in db.execute(_KEYS) if phone and (p := normalize(phone))}
+    return {p: ContactKey(contact_id=ids.get(p), ghl_contact_id=ghl.get(p)) for p in ghl.keys() | ids.keys()}
 
 
 def _score(lead: dict) -> dict:
@@ -216,12 +213,13 @@ def _score(lead: dict) -> dict:
 
 def collect(db, day: date) -> LedgerData:
     start, end = day_window(day)
+    test = _test_phones(db)
     return LedgerData(
         keys=_keys(db),
-        contacts=_rows(db, _CONTACTS),
-        consents=_rows(db, _CONSENTS),
-        touches=_rows(db, _TOUCHES, start=start, end=end),
-        dispositions=_rows(db, _DISPOSITIONS, start=start, end=end),
-        outcomes=_rows(db, _OUTCOMES, start=start, end=end),
-        scores=[_score(lead) for lead in _rows(db, _SCORE_LEADS)],
+        contacts=_rows(db, _CONTACTS, test),
+        consents=_rows(db, _CONSENTS, test),
+        touches=_rows(db, _TOUCHES, test, start=start, end=end),
+        dispositions=_rows(db, _DISPOSITIONS, test, start=start, end=end),
+        outcomes=_rows(db, _OUTCOMES, test, start=start, end=end),
+        scores=[_score(lead) for lead in _rows(db, _SCORE_LEADS, test)],
     )
