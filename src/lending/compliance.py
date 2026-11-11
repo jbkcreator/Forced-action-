@@ -638,30 +638,31 @@ def text_window_open(
         if tz is not None:
             zones.add(tz.key)
     zones.update(STATE_TZ.get((property_state or "").strip().upper(), ()))
+    moment = now or datetime.now(timezone.utc)
+    if zones and _zones_inside_window(zones, moment):
+        return True
+    if normalize_phone(phone) in text_window_test_phones():
+        logger.warning("[lending-compliance] TEXT WINDOW TEST BYPASS phone_hash=%s at=%s: number is on "
+                       "QA_TEST_PHONE_ALLOWLIST (team test numbers only; clear it after the test)",
+                       phone_hash(phone)[:12], moment.isoformat())
+        return True
     if not zones:
         logger.warning("[lending-compliance] no timezone for phone_hash=%s; text window fails closed",
                        phone_hash(phone)[:12])
         return False
-    moment = now or datetime.now(timezone.utc)
-    if not _zones_inside_window(zones, moment):
-        if normalize_phone(phone) in text_window_test_phones():
-            logger.warning("[lending-compliance] TEXT WINDOW TEST BYPASS phone_hash=%s at=%s: number is on "
-                           "LENDING_TEXT_WINDOW_TEST_PHONES (team test numbers only; clear it after the test)",
-                           phone_hash(phone)[:12], moment.isoformat())
-            return True
-        _log_blocked_hours("text", phone, moment, f" zones={','.join(sorted(zones))}")
-        return False
-    return True
+    _log_blocked_hours("text", phone, moment, f" zones={','.join(sorted(zones))}")
+    return False
 
 
 def text_window_test_phones() -> frozenset[str]:
-    """Team-owned test numbers (LENDING_TEXT_WINDOW_TEST_PHONES, comma-separated) that may be texted outside
-    8:00-20:00 for an end-to-end test. Empty by default; never put a borrower's number here. Invalid entries
-    are ignored, and an unreadable setting means no exceptions (fails closed)."""
+    """Team-owned test numbers (QA_TEST_PHONE_ALLOWLIST, comma-separated) that may be texted outside 8:00-20:00 for
+    an end-to-end test; the same list also lets a non-US test number pass ``phone_utils.normalize``. Empty by
+    default; never put a borrower's number here. Invalid entries are ignored, and an unreadable setting means no
+    exceptions (fails closed)."""
     try:
         from config.settings import get_settings
 
-        raw = get_settings().lending_text_window_test_phones or ""
+        raw = get_settings().qa_test_phone_allowlist or ""
     except Exception:  # class only
         return frozenset()
     return frozenset(p for p in (normalize_phone(part.strip()) for part in raw.split(",") if part.strip()) if p)

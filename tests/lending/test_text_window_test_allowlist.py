@@ -1,4 +1,4 @@
-"""LENDING_TEXT_WINDOW_TEST_PHONES: only listed team test numbers may be texted outside 8am-8pm; every other number
+"""QA_TEST_PHONE_ALLOWLIST: only listed team test numbers may be texted outside 8am-8pm; every other number
 stays blocked, calls are never affected, and the default (empty) changes nothing."""
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import pytest
 from src.lending import compliance
 
 TEST_PHONE = "+19175550199"      # team test number (Eastern area code)
+INDIA_TEST_PHONE = "+917736533119"  # non-US team test number: no area-code timezone
 BORROWER = "+19175550123"        # any other number
 NINE_PM_ET = datetime(2026, 11, 11, 2, 0, tzinfo=timezone.utc)  # 21:00 EST on Nov 10
 
@@ -22,7 +23,7 @@ def _fresh_log_state():
 
 
 def _allow(monkeypatch, value: str) -> None:
-    fake = SimpleNamespace(lending_text_window_test_phones=value,
+    fake = SimpleNamespace(qa_test_phone_allowlist=value,
                            lending_call_window_local_start="08:00", lending_call_window_local_end="20:00",
                            lending_call_window_et_start="09:00", lending_call_window_et_end="19:15")
     monkeypatch.setattr("config.settings.get_settings", lambda: fake)
@@ -73,3 +74,17 @@ def test_inside_the_window_nothing_changes(monkeypatch):
     noon_et = NINE_PM_ET - timedelta(hours=9)
     assert compliance.text_window_open(BORROWER, now=noon_et) is True
     assert compliance.text_window_open(TEST_PHONE, now=noon_et) is True
+
+
+def test_a_listed_non_us_number_passes_the_us_check_and_the_window(monkeypatch, caplog):
+    _allow(monkeypatch, INDIA_TEST_PHONE)
+    with caplog.at_level("WARNING"):
+        assert compliance.text_window_open(INDIA_TEST_PHONE, now=NINE_PM_ET) is True
+        assert compliance.text_window_open(INDIA_TEST_PHONE, property_state="FL", now=NINE_PM_ET) is True
+    assert "TEXT WINDOW TEST BYPASS" in caplog.text and "6533119" not in caplog.text
+
+
+def test_an_unlisted_non_us_number_still_fails_closed(monkeypatch):
+    _allow(monkeypatch, TEST_PHONE)
+    noon_et = NINE_PM_ET - timedelta(hours=9)
+    assert compliance.text_window_open(INDIA_TEST_PHONE, now=noon_et) is False
